@@ -1,0 +1,50 @@
+[node]
+id = "auto"
+hostname = "mgr-1"
+data_dir = "/var/lib/dtfs/manager"
+
+[location]
+region = "eu"
+datacenter = "frankfurt"
+rack = "rack-a1"
+host = "mgr-1"
+
+[cluster]
+name = "dtfs-dev"
+shared_secret = "dev-cluster-secret-change-me"
+bootstrap = true
+
+[raft]
+listen_addr = "0.0.0.0:9400"
+
+[grpc]
+listen_addr = "0.0.0.0:9401"
+
+[api]
+listen_addr = "0.0.0.0:9402"
+
+[tls]
+mode = "auto"
+
+[defaults]
+chunk_size_mb = 128
+
+[defaults.write_safety]
+min_replicas_before_ack = 2
+write_timeout_secs = 30
+
+[defaults.replication]
+hot = 3
+warm = 2
+cold = 1
+
+[tiering]
+enabled = true
+hot_threshold_reads_per_hour = 5
+cold_threshold_days = 14
+migration_bandwidth_limit_mbps = 200
+
+[monitoring]
+heartbeat_interval_secs = 5
+suspect_after_missed = 3
+down_after_missed = 6

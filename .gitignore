@@ -1,0 +1,31 @@
+/target
+**/*.rs.bk
+*.swp
+*.swo
+.env
+*.pem
+*.key
+*.crt
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# WebUI
+webui/node_modules/
+webui/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation build
+docs/book/
+
+# RocksDB data
+*.sst
+*.log
+LOCK
+CURRENT
+MANIFEST-*

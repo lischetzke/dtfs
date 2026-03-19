@@ -1,0 +1,101 @@
+syntax = "proto3";
+package dtfs.data;
+
+import "common.proto";
+
+service DataService {
+  // Store a chunk (client streaming: sends data in pieces)
+  rpc PutChunk(stream PutChunkRequest) returns (PutChunkResponse);
+
+  // Retrieve a chunk (server streaming: returns data in pieces)
+  rpc GetChunk(GetChunkRequest) returns (stream GetChunkResponse);
+
+  // Delete a chunk
+  rpc DeleteChunk(DeleteChunkRequest) returns (DeleteChunkResponse);
+
+  // Replicate a chunk from this node to another
+  rpc ReplicateChunk(ReplicateChunkRequest) returns (ReplicateChunkResponse);
+
+  // Verify chunk integrity
+  rpc VerifyChunk(VerifyChunkRequest) returns (VerifyChunkResponse);
+
+  // Get disk status for all disks on this node
+  rpc GetDiskStatus(DiskStatusRequest) returns (DiskStatusResponse);
+
+  // Report I/O statistics
+  rpc ReportStats(StatsRequest) returns (StatsResponse);
+}
+
+// --- PutChunk ---
+message PutChunkRequest {
+  string chunk_id = 1;    // Hex-encoded chunk ID (set in first message)
+  string volume_id = 2;   // Volume ID (set in first message)
+  string tier = 3;        // Target tier (set in first message)
+  bytes data = 4;         // Chunk data payload
+}
+
+message PutChunkResponse {
+  string chunk_id = 1;
+  uint64 size = 2;
+  string checksum = 3;    // Hex-encoded BLAKE3 checksum
+  bool success = 4;
+}
+
+// --- GetChunk ---
+message GetChunkRequest {
+  string chunk_id = 1;    // Hex-encoded chunk ID
+}
+
+message GetChunkResponse {
+  bytes data = 1;         // Chunk data payload
+  uint64 offset = 2;      // Offset in the full chunk
+  uint64 total_size = 3;  // Total size of the chunk
+}
+
+// --- DeleteChunk ---
+message DeleteChunkRequest {
+  string chunk_id = 1;
+}
+
+message DeleteChunkResponse {
+  bool success = 1;
+}
+
+// --- ReplicateChunk ---
+message ReplicateChunkRequest {
+  string chunk_id = 1;
+  string target_address = 2;  // Address of the target data node
+}
+
+message ReplicateChunkResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// --- VerifyChunk ---
+message VerifyChunkRequest {
+  string chunk_id = 1;
+}
+
+message VerifyChunkResponse {
+  bool valid = 1;
+  string error = 2;
+}
+
+// --- DiskStatus ---
+message DiskStatusRequest {}
+
+message DiskStatusResponse {
+  string hostname = 1;
+  repeated dtfs.common.DiskInfo disks = 2;
+}
+
+// --- Stats ---
+message StatsRequest {}
+
+message StatsResponse {
+  uint64 total_chunks = 1;
+  uint64 total_bytes = 2;
+  uint64 cache_hits = 3;
+  uint64 cache_misses = 4;
+}

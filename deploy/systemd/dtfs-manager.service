@@ -1,0 +1,28 @@
+[Unit]
+Description=DTFS Manager Node
+Documentation=https://github.com/lischetzke/dtfs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dtfs
+Group=dtfs
+ExecStart=/usr/local/bin/dtfs-manager --config /etc/dtfs/manager.toml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+LimitMEMLOCK=infinity
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/dtfs/manager
+PrivateTmp=yes
+
+# Environment
+Environment=RUST_LOG=dtfs=info
+
+[Install]
+WantedBy=multi-user.target
