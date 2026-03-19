@@ -1,0 +1,27 @@
+# DTFS Manager Node - Multi-stage build
+FROM rust:1.85-bookworm AS builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY proto/ proto/
+
+RUN cargo build --release --bin dtfs-manager
+
+# Runtime image
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd --system --create-home --shell /bin/false dtfs
+
+COPY --from=builder /build/target/release/dtfs-manager /usr/local/bin/dtfs-manager
+
+USER dtfs
+WORKDIR /var/lib/dtfs/manager
+
+EXPOSE 9400 9401 9402
+
+ENTRYPOINT ["dtfs-manager"]
+CMD ["--config", "/etc/dtfs/manager.toml"]

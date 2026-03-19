@@ -1,0 +1,19 @@
+[package]
+name = "dtfs-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dtfs-common = { workspace = true }
+dtfs-proto = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+rand = { workspace = true }

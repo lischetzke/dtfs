@@ -1,0 +1,32 @@
+[Unit]
+Description=DTFS Data Node
+Documentation=https://github.com/leduc/dtfs2
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dtfs
+Group=dtfs
+ExecStart=/usr/local/bin/dtfs-data --config /etc/dtfs/data.toml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+LimitMEMLOCK=infinity
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/dtfs/data
+PrivateTmp=yes
+
+# Allow access to configured disk mount paths
+# Add ReadWritePaths= for each managed disk, e.g.:
+# ReadWritePaths=/mnt/ssd-a /mnt/ssd-b /mnt/hdd-a /mnt/hdd-b
+
+# Environment
+Environment=RUST_LOG=dtfs=info
+
+[Install]
+WantedBy=multi-user.target

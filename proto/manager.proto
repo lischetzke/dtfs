@@ -1,0 +1,157 @@
+syntax = "proto3";
+package dtfs.manager;
+
+import "common.proto";
+
+service ManagerService {
+  // --- Client-facing RPCs ---
+
+  // Create a new file in the namespace
+  rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
+
+  // Get chunk locations for a file
+  rpc GetFileLocations(GetFileLocationsRequest) returns (GetFileLocationsResponse);
+
+  // Delete a file
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
+
+  // List directory contents
+  rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
+
+  // Allocate chunk placements for writing
+  rpc AllocateChunks(AllocateChunksRequest) returns (AllocateChunksResponse);
+
+  // --- Data node facing RPCs ---
+
+  // Register a data node with the cluster
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+
+  // Periodic heartbeat from data nodes
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Report chunk status from data nodes
+  rpc ReportChunkStatus(ChunkStatusReport) returns (ChunkStatusAck);
+}
+
+// --- CreateFile ---
+message CreateFileRequest {
+  string path = 1;
+  optional string volume_id = 2;
+}
+
+message CreateFileResponse {
+  bool success = 1;
+  uint64 chunk_size = 2;
+  string volume_id = 3;
+}
+
+// --- GetFileLocations ---
+message GetFileLocationsRequest {
+  string path = 1;
+}
+
+message ChunkLocationInfo {
+  string chunk_id = 1;
+  uint64 size = 2;
+  repeated string node_addresses = 3; // All replica addresses
+}
+
+message GetFileLocationsResponse {
+  string path = 1;
+  uint64 total_size = 2;
+  repeated ChunkLocationInfo chunks = 3;
+}
+
+// --- DeleteFile ---
+message DeleteFileRequest {
+  string path = 1;
+}
+
+message DeleteFileResponse {
+  bool success = 1;
+}
+
+// --- ListDirectory ---
+message ListDirectoryRequest {
+  string path = 1;
+}
+
+message DirectoryEntry {
+  string name = 1;
+  uint64 size = 2;
+  bool is_directory = 3;
+  int64 created_at = 4;
+  int64 modified_at = 5;
+}
+
+message ListDirectoryResponse {
+  repeated DirectoryEntry entries = 1;
+}
+
+// --- AllocateChunks ---
+message AllocateChunksRequest {
+  string path = 1;
+  uint32 num_chunks = 2;
+  string volume_id = 3;
+}
+
+message ChunkPlacement {
+  uint32 chunk_index = 1;
+  string primary_address = 2;
+  repeated string replica_addresses = 3;
+}
+
+message AllocateChunksResponse {
+  repeated ChunkPlacement placements = 1;
+}
+
+// --- RegisterNode ---
+message RegisterNodeRequest {
+  string hostname = 1;
+  string role = 2;
+  uint32 grpc_port = 3;
+  dtfs.common.Location location = 4;
+  repeated dtfs.common.DiskInfo disks = 5;
+}
+
+message RegisterNodeResponse {
+  bool accepted = 1;
+  string node_id = 2;
+  uint64 config_version = 3;
+}
+
+// --- Heartbeat ---
+message HeartbeatRequest {
+  string node_id = 1;
+  uint64 uptime_secs = 2;
+  uint64 total_chunks = 3;
+  uint64 total_bytes_used = 4;
+  uint64 config_version = 5;
+}
+
+message ConfigUpdate {
+  uint64 version = 1;
+  string config_json = 2; // Full cluster config as JSON
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;
+  uint64 config_version = 2;
+  optional ConfigUpdate config_update = 3;
+}
+
+// --- ChunkStatus ---
+message ChunkStatus {
+  string chunk_id = 1;
+  uint64 size = 2;
+  string status = 3; // "healthy", "corrupt", "missing"
+}
+
+message ChunkStatusReport {
+  string node_id = 1;
+  repeated ChunkStatus chunks = 2;
+}
+
+message ChunkStatusAck {
+  bool accepted = 1;
+}

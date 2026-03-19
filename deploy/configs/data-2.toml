@@ -1,0 +1,37 @@
+[node]
+id = "auto"
+hostname = "data-2"
+data_dir = "/var/lib/dtfs/data"
+
+[location]
+region = "eu"
+datacenter = "frankfurt"
+rack = "rack-a2"
+host = "data-2"
+
+[cluster]
+manager_addr = "10.10.1.10:9401"
+shared_secret = "dev-cluster-secret-change-me"
+
+[grpc]
+listen_addr = "0.0.0.0:9500"
+
+[tls]
+mode = "auto"
+
+[[disks]]
+path = "/mnt/ssd-a"
+tier = "hot"
+
+[[disks]]
+path = "/mnt/hdd-a"
+tier = "cold"
+
+[cache]
+max_memory_mb = 2048
+policy = "arc"
+
+[scrub]
+quick_interval_hours = 6
+deep_interval_hours = 168
+max_io_percent = 10

@@ -1,0 +1,24 @@
+[Unit]
+Description=DTFS FUSE Mount (%i)
+Documentation=https://github.com/leduc/dtfs2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/dtfs-fuse --config /etc/dtfs/fuse.toml --mountpoint %i
+ExecStop=/bin/fusermount3 -u %i
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+# FUSE requires certain capabilities
+AmbientCapabilities=CAP_SYS_ADMIN
+PrivateTmp=yes
+
+# Environment
+Environment=RUST_LOG=dtfs=info
+
+[Install]
+WantedBy=multi-user.target

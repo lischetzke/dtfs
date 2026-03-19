@@ -1,0 +1,362 @@
+//! Hot/cold data classification and migration decisions.
+//!
+//! The `TieringEngine` periodically evaluates chunk access patterns and
+//! classifies data as hot, warm, cold, or frozen. It then schedules tier
+//! migration tasks via the [`TaskScheduler`] to move chunks between tiers.
+//!
+//! Location-aware migration: data is also moved toward DCs where it is
+//! actively accessed, ensuring low-latency reads for hot/warm data.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use dtfs_common::config::TieringConfig;
+use dtfs_common::types::{DataTemperature, DiskTier};
+use dtfs_raft::state_machine::StateMachineData;
+use dtfs_raft::DtfsRaft;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+
+use crate::audit::AuditLog;
+use crate::scheduler::TaskScheduler;
+
+/// Per-chunk access profile used for tiering decisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkAccessProfile {
+    pub chunk_id: String,
+    pub file_path: String,
+    pub total_reads_1h: u32,
+    pub total_reads_24h: u32,
+    /// Read counts broken down by datacenter name.
+    pub reads_by_dc: HashMap<String, u32>,
+    pub last_access_ms: u64,
+    pub current_temperature: DataTemperature,
+    /// Which tier the chunk currently lives on.
+    pub current_tier: DiskTier,
+    /// Which node currently hosts this chunk.
+    pub current_node: u64,
+}
+
+/// Tiering engine that evaluates access patterns and triggers tier migrations.
+pub struct TieringEngine {
+    config: RwLock<TieringConfig>,
+    scheduler: Arc<TaskScheduler>,
+    audit: Arc<AuditLog>,
+    state_data: Arc<RwLock<StateMachineData>>,
+    /// Per-chunk access statistics, reported by data nodes via heartbeats.
+    access_stats: RwLock<HashMap<String, ChunkAccessProfile>>,
+}
+
+impl TieringEngine {
+    pub fn new(
+        config: TieringConfig,
+        scheduler: Arc<TaskScheduler>,
+        audit: Arc<AuditLog>,
+        state_data: Arc<RwLock<StateMachineData>>,
+    ) -> Self {
+        Self {
+            config: RwLock::new(config),
+            scheduler,
+            audit,
+            state_data,
+            access_stats: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Run the tiering evaluation loop. Spawned as a background task.
+    pub async fn run(&self) {
+        let interval_secs = {
+            let cfg = self.config.read().await;
+            cfg.evaluation_interval_secs
+        };
+
+        info!(
+            "Tiering engine started (evaluation interval: {}s)",
+            interval_secs
+        );
+
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            interval.tick().await;
+
+            let cfg = self.config.read().await;
+            if !cfg.enabled {
+                debug!("Tiering disabled, skipping evaluation");
+                continue;
+            }
+            drop(cfg);
+
+            if let Err(e) = self.evaluate().await {
+                warn!("Tiering evaluation failed: {}", e);
+            }
+        }
+    }
+
+    /// Update access stats for a chunk (called from heartbeat processing).
+    pub async fn report_access(
+        &self,
+        chunk_id: &str,
+        file_path: &str,
+        reads_1h: u32,
+        reads_24h: u32,
+        reads_by_dc: HashMap<String, u32>,
+        current_tier: DiskTier,
+        current_node: u64,
+    ) {
+        let now_ms = now_millis();
+        let mut stats = self.access_stats.write().await;
+
+        let profile = stats.entry(chunk_id.to_string()).or_insert_with(|| {
+            ChunkAccessProfile {
+                chunk_id: chunk_id.to_string(),
+                file_path: file_path.to_string(),
+                total_reads_1h: 0,
+                total_reads_24h: 0,
+                reads_by_dc: HashMap::new(),
+                last_access_ms: 0,
+                current_temperature: DataTemperature::Cold,
+                current_tier,
+                current_node,
+            }
+        });
+
+        profile.total_reads_1h = reads_1h;
+        profile.total_reads_24h = reads_24h;
+        profile.reads_by_dc = reads_by_dc;
+        if reads_1h > 0 || reads_24h > 0 {
+            profile.last_access_ms = now_ms;
+        }
+        profile.current_tier = current_tier;
+        profile.current_node = current_node;
+    }
+
+    /// Evaluate all tracked chunks and classify their temperature.
+    /// Schedules tier migration tasks for chunks whose temperature doesn't
+    /// match their current tier.
+    async fn evaluate(&self) -> anyhow::Result<()> {
+        let cfg = self.config.read().await;
+        let mut stats = self.access_stats.write().await;
+        let now_ms = now_millis();
+
+        let mut tier_up = 0u32;
+        let mut tier_down = 0u32;
+
+        for (_chunk_id, profile) in stats.iter_mut() {
+            let old_temp = profile.current_temperature;
+
+            // Classify temperature based on access patterns.
+            let new_temp = classify_temperature(
+                profile.total_reads_1h,
+                profile.total_reads_24h,
+                profile.last_access_ms,
+                now_ms,
+                cfg.hot_threshold_reads_per_hour,
+                cfg.cold_threshold_days,
+                cfg.frozen_threshold_days,
+            );
+
+            profile.current_temperature = new_temp;
+
+            if old_temp == new_temp {
+                continue;
+            }
+
+            let target_tier = temperature_to_tier(new_temp);
+
+            if target_tier == profile.current_tier {
+                continue;
+            }
+
+            // Need to migrate this chunk to a different tier.
+            let direction = if tier_rank(target_tier) > tier_rank(profile.current_tier) {
+                tier_down += 1;
+                "demote"
+            } else {
+                tier_up += 1;
+                "promote"
+            };
+
+            info!(
+                "Tiering {}: chunk {} ({:?} -> {:?}, tier {:?} -> {:?})",
+                direction,
+                profile.chunk_id,
+                old_temp,
+                new_temp,
+                profile.current_tier,
+                target_tier,
+            );
+
+            // Find a target node with the right tier.
+            let target_node = self
+                .find_target_node(target_tier, profile.current_node)
+                .await;
+
+            if let Some(target) = target_node {
+                self.scheduler
+                    .schedule_replication(
+                        &profile.chunk_id,
+                        profile.current_node,
+                        target,
+                        target_tier,
+                    )
+                    .await;
+
+                self.audit.log(
+                    "tiering",
+                    &format!("tier.{direction}"),
+                    &format!(
+                        "chunk={} {:?}->{:?}",
+                        profile.chunk_id, profile.current_tier, target_tier
+                    ),
+                    "scheduled",
+                );
+            } else {
+                warn!(
+                    "No suitable target node found for tier {:?} migration of chunk {}",
+                    target_tier, profile.chunk_id
+                );
+            }
+        }
+
+        if tier_up > 0 || tier_down > 0 {
+            info!(
+                "Tiering evaluation complete: {} promotions, {} demotions",
+                tier_up, tier_down
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Find a target node that has disks of the specified tier,
+    /// excluding the given source node.
+    async fn find_target_node(&self, target_tier: DiskTier, exclude_node: u64) -> Option<u64> {
+        let sm = self.state_data.read().await;
+
+        sm.nodes
+            .iter()
+            .filter(|(id, info)| {
+                **id != exclude_node
+                    && info.health == dtfs_common::types::HealthStatus::Healthy
+                    && info.disks.iter().any(|d| d.tier == target_tier)
+            })
+            .min_by_key(|(_, info)| {
+                // Prefer nodes with the most free capacity.
+                info.used_capacity
+            })
+            .map(|(id, _)| *id)
+    }
+
+    /// Update the tiering configuration at runtime (live reload).
+    pub async fn update_config(&self, new_config: TieringConfig) {
+        let mut cfg = self.config.write().await;
+        *cfg = new_config;
+        info!("Tiering configuration updated (live reload)");
+    }
+
+    /// Get current access statistics (for WebUI / API).
+    pub async fn get_access_stats(&self) -> Vec<ChunkAccessProfile> {
+        let stats = self.access_stats.read().await;
+        stats.values().cloned().collect()
+    }
+}
+
+/// Classify data temperature based on access patterns.
+fn classify_temperature(
+    reads_1h: u32,
+    reads_24h: u32,
+    last_access_ms: u64,
+    now_ms: u64,
+    hot_threshold: u32,
+    cold_days: u32,
+    frozen_days: u32,
+) -> DataTemperature {
+    if reads_1h >= hot_threshold {
+        return DataTemperature::Hot;
+    }
+
+    if reads_24h >= 2 {
+        return DataTemperature::Warm;
+    }
+
+    let ms_per_day: u64 = 86_400_000;
+    let age_ms = now_ms.saturating_sub(last_access_ms);
+
+    if age_ms > frozen_days as u64 * ms_per_day {
+        DataTemperature::Frozen
+    } else if age_ms > cold_days as u64 * ms_per_day {
+        DataTemperature::Cold
+    } else {
+        DataTemperature::Warm
+    }
+}
+
+/// Map a data temperature to the target storage tier.
+fn temperature_to_tier(temp: DataTemperature) -> DiskTier {
+    match temp {
+        DataTemperature::Hot => DiskTier::Hot,
+        DataTemperature::Warm => DiskTier::Warm,
+        DataTemperature::Cold | DataTemperature::Frozen => DiskTier::Cold,
+    }
+}
+
+/// Numeric rank for tier comparison (lower = hotter).
+fn tier_rank(tier: DiskTier) -> u8 {
+    match tier {
+        DiskTier::Hot => 0,
+        DiskTier::Warm => 1,
+        DiskTier::Cold => 2,
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_hot() {
+        let temp = classify_temperature(10, 50, 1000, 2000, 5, 14, 60);
+        assert_eq!(temp, DataTemperature::Hot);
+    }
+
+    #[test]
+    fn test_classify_warm() {
+        let temp = classify_temperature(2, 5, 1000, 2000, 5, 14, 60);
+        assert_eq!(temp, DataTemperature::Warm);
+    }
+
+    #[test]
+    fn test_classify_cold() {
+        let ms_per_day: u64 = 86_400_000;
+        let now = 100 * ms_per_day;
+        let last_access = now - 20 * ms_per_day; // 20 days ago
+        let temp = classify_temperature(0, 0, last_access, now, 5, 14, 60);
+        assert_eq!(temp, DataTemperature::Cold);
+    }
+
+    #[test]
+    fn test_classify_frozen() {
+        let ms_per_day: u64 = 86_400_000;
+        let now = 200 * ms_per_day;
+        let last_access = now - 90 * ms_per_day; // 90 days ago
+        let temp = classify_temperature(0, 0, last_access, now, 5, 14, 60);
+        assert_eq!(temp, DataTemperature::Frozen);
+    }
+
+    #[test]
+    fn test_temperature_to_tier() {
+        assert_eq!(temperature_to_tier(DataTemperature::Hot), DiskTier::Hot);
+        assert_eq!(temperature_to_tier(DataTemperature::Warm), DiskTier::Warm);
+        assert_eq!(temperature_to_tier(DataTemperature::Cold), DiskTier::Cold);
+        assert_eq!(temperature_to_tier(DataTemperature::Frozen), DiskTier::Cold);
+    }
+}

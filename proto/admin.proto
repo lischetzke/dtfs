@@ -1,0 +1,79 @@
+syntax = "proto3";
+package dtfs.admin;
+
+import "common.proto";
+
+// Admin service for internal operations (not exposed to clients directly).
+// Most admin operations go through the REST API, but some are available via gRPC
+// for programmatic use by dtfs-cli.
+
+service AdminService {
+  // Trigger a scrub on a data node
+  rpc TriggerScrub(TriggerScrubRequest) returns (TriggerScrubResponse);
+
+  // Get scrub results
+  rpc GetScrubResults(GetScrubResultsRequest) returns (GetScrubResultsResponse);
+
+  // Set maintenance mode on a node
+  rpc SetMaintenanceMode(MaintenanceModeRequest) returns (MaintenanceModeResponse);
+
+  // Get audit log entries
+  rpc GetAuditLog(AuditLogRequest) returns (AuditLogResponse);
+}
+
+// --- Scrub ---
+message TriggerScrubRequest {
+  string target_type = 1;  // "disk", "file", "chunk", "all"
+  string target_id = 2;    // Disk path, file path, or chunk ID
+  string level = 3;        // "quick" or "deep"
+}
+
+message TriggerScrubResponse {
+  bool accepted = 1;
+  string task_id = 2;
+}
+
+message GetScrubResultsRequest {
+  string task_id = 1;
+}
+
+message GetScrubResultsResponse {
+  string status = 1;       // "running", "completed", "failed"
+  uint64 chunks_checked = 2;
+  uint64 chunks_healthy = 3;
+  uint64 chunks_corrupt = 4;
+  uint64 chunks_missing = 5;
+  uint64 chunks_size_mismatch = 6;
+  double duration_secs = 7;
+}
+
+// --- Maintenance ---
+message MaintenanceModeRequest {
+  string node_id = 1;
+  bool enable = 2;
+}
+
+message MaintenanceModeResponse {
+  bool success = 1;
+  string status = 2;       // "draining", "maintenance", "active"
+}
+
+// --- Audit Log ---
+message AuditLogEntry {
+  int64 timestamp = 1;
+  string actor = 2;        // User or "system"
+  string action = 3;       // "file.create", "node.join", "config.update", etc.
+  string target = 4;       // What was acted upon
+  string result = 5;       // "success" or error message
+  string source_location = 6;
+}
+
+message AuditLogRequest {
+  int64 since_timestamp = 1;
+  uint32 limit = 2;
+  string action_filter = 3; // Optional: filter by action type
+}
+
+message AuditLogResponse {
+  repeated AuditLogEntry entries = 1;
+}
