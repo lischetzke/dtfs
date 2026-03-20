@@ -127,6 +127,7 @@ async fn manager_lifecycle(config: DataNodeConfig) -> anyhow::Result<()> {
                 DiskTier::Hot => "hot".to_string(),
                 DiskTier::Warm => "warm".to_string(),
                 DiskTier::Cold => "cold".to_string(),
+                DiskTier::Tape => "tape".to_string(),
             },
             total_bytes: 0,
             used_bytes: 0,

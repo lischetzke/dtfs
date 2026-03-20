@@ -1,0 +1,205 @@
+---
+# DTFS environment teardown playbook
+# Usage: ansible-playbook playbooks/teardown.yml
+# Options:
+#   -e "wipe_data=true"        also remove all data directories (DESTRUCTIVE!)
+#   -e "remove_binaries=true"  also remove installed binaries
+
+- name: Stop FUSE clients and unmount
+  hosts: clients
+  gather_facts: false
+  tasks:
+    - name: Stop dtfs-fuse service for all volumes
+      ansible.builtin.systemd:
+        name: "dtfs-fuse@{{ dtfs_volume }}.service"
+        state: stopped
+      failed_when: false
+
+    - name: Force unmount DTFS if still mounted
+      ansible.builtin.command: "fusermount3 -uz {{ dtfs_mount_point }}"
+      changed_when: true
+      failed_when: false
+      register: umount_result
+
+    - name: Fallback: lazy unmount with umount -l
+      ansible.builtin.command: "umount -l {{ dtfs_mount_point }}"
+      when: umount_result.rc != 0
+      changed_when: true
+      failed_when: false
+
+    - name: Verify mount is gone
+      ansible.builtin.command: mountpoint -q "{{ dtfs_mount_point }}"
+      register: mountpoint_check
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if mount still active
+      ansible.builtin.debug:
+        msg: "WARNING: {{ dtfs_mount_point }} may still be mounted on {{ inventory_hostname }}"
+      when: mountpoint_check.rc == 0
+
+    - name: Disable dtfs-fuse service
+      ansible.builtin.systemd:
+        name: "dtfs-fuse@{{ dtfs_volume }}.service"
+        enabled: false
+      failed_when: false
+
+    - name: Remove dtfs-fuse systemd unit
+      ansible.builtin.file:
+        path: /etc/systemd/system/dtfs-fuse@.service
+        state: absent
+      notify: reload systemd
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+- name: Stop data node services
+  hosts: data_nodes
+  gather_facts: false
+  tasks:
+    - name: Stop dtfs-data service
+      ansible.builtin.systemd:
+        name: dtfs-data
+        state: stopped
+      failed_when: false
+
+    - name: Disable dtfs-data service
+      ansible.builtin.systemd:
+        name: dtfs-data
+        enabled: false
+      failed_when: false
+
+    - name: Remove dtfs-data systemd unit
+      ansible.builtin.file:
+        path: /etc/systemd/system/dtfs-data.service
+        state: absent
+      notify: reload systemd
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+- name: Stop manager services
+  hosts: managers
+  gather_facts: false
+  tasks:
+    - name: Stop dtfs-manager service
+      ansible.builtin.systemd:
+        name: dtfs-manager
+        state: stopped
+      failed_when: false
+
+    - name: Disable dtfs-manager service
+      ansible.builtin.systemd:
+        name: dtfs-manager
+        enabled: false
+      failed_when: false
+
+    - name: Remove dtfs-manager systemd unit
+      ansible.builtin.file:
+        path: /etc/systemd/system/dtfs-manager.service
+        state: absent
+      notify: reload systemd
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+- name: Remove configuration files from all nodes
+  hosts: dtfs_all
+  gather_facts: false
+  tasks:
+    - name: Reload systemd after unit removal
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Remove DTFS config files
+      ansible.builtin.file:
+        path: "{{ dtfs_config_dir }}"
+        state: absent
+
+    - name: Remove DTFS run directory
+      ansible.builtin.file:
+        path: "{{ dtfs_run_dir }}"
+        state: absent
+
+    - name: Remove sysctl tuning file
+      ansible.builtin.file:
+        path: /etc/sysctl.d/99-dtfs.conf
+        state: absent
+
+    - name: Remove ulimits file
+      ansible.builtin.file:
+        path: /etc/security/limits.d/dtfs.conf
+        state: absent
+
+    - name: Remove systemd LimitNOFILE override
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/system.conf
+        regexp: '^DefaultLimitNOFILE=1048576'
+        state: absent
+      failed_when: false
+
+    - name: Remove DTFS profile.d script
+      ansible.builtin.file:
+        path: /etc/profile.d/dtfs.sh
+        state: absent
+
+- name: Wipe data directories (only if wipe_data=true)
+  hosts: dtfs_all
+  gather_facts: false
+  when: wipe_data | default(false) | bool
+  tasks:
+    - name: Confirm wipe operation
+      ansible.builtin.debug:
+        msg: "WIPING all DTFS data on {{ inventory_hostname }}"
+
+    - name: Remove DTFS data directory
+      ansible.builtin.file:
+        path: "{{ dtfs_data_dir }}"
+        state: absent
+
+    - name: Remove DTFS log directory
+      ansible.builtin.file:
+        path: "{{ dtfs_log_dir }}"
+        state: absent
+
+    - name: Wipe disk paths on data nodes
+      ansible.builtin.shell: "rm -rf {{ item.path }}/*"
+      loop: "{{ dtfs_disks | default([]) }}"
+      when: dtfs_disks is defined
+      changed_when: true
+
+- name: Remove binaries (only if remove_binaries=true)
+  hosts: dtfs_all
+  gather_facts: false
+  when: remove_binaries | default(false) | bool
+  tasks:
+    - name: Remove DTFS binaries
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ dtfs_manager_bin }}"
+        - "{{ dtfs_data_bin }}"
+        - "{{ dtfs_fuse_bin }}"
+        - "{{ dtfs_cli_bin }}"
+
+- name: Verify teardown complete
+  hosts: dtfs_all
+  gather_facts: false
+  tasks:
+    - name: Check no DTFS processes are running
+      ansible.builtin.shell: "pgrep -x 'dtfs-manager|dtfs-data|dtfs-fuse' | wc -l"
+      register: dtfs_procs
+      changed_when: false
+
+    - name: Report if any DTFS processes remain
+      ansible.builtin.debug:
+        msg: "WARNING: {{ dtfs_procs.stdout }} DTFS process(es) still running on {{ inventory_hostname }}"
+      when: dtfs_procs.stdout | int > 0
+
+    - name: Confirm teardown summary
+      ansible.builtin.debug:
+        msg: "Teardown complete on {{ inventory_hostname }}"

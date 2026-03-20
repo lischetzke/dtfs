@@ -308,6 +308,7 @@ fn tier_rank(tier: DiskTier) -> u8 {
         DiskTier::Hot => 0,
         DiskTier::Warm => 1,
         DiskTier::Cold => 2,
+        DiskTier::Tape => 3,  // Coldest / archival tier
     }
 }
 

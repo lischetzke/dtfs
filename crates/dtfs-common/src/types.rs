@@ -75,12 +75,23 @@ impl fmt::Display for VolumeId {
 }
 
 /// Storage tier classification for disks.
+///
+/// Tiers form a performance/cost hierarchy:
+/// - `Hot`  — fast SSD, highest cost, highest IOPS/throughput
+/// - `Warm` — mid-tier (SSD or fast HDD)
+/// - `Cold` — bulk HDD, low cost, lower throughput
+/// - `Tape` — LTFS-backed tape storage for frozen/archival data (write-once,
+///            very high latency, very low cost per TB, LTO-9 ≈ 300-400 MB/s sequential)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DiskTier {
     Hot,
     Warm,
     Cold,
+    /// LTFS (Linear Tape File System) backed storage.  Chunks on this tier
+    /// are write-once; migration is append-only.  No in-place scrubbing —
+    /// LTFS provides its own checksum/integrity layer.
+    Tape,
 }
 
 impl fmt::Display for DiskTier {
@@ -89,6 +100,7 @@ impl fmt::Display for DiskTier {
             DiskTier::Hot => write!(f, "hot"),
             DiskTier::Warm => write!(f, "warm"),
             DiskTier::Cold => write!(f, "cold"),
+            DiskTier::Tape => write!(f, "tape"),
         }
     }
 }
@@ -162,11 +174,29 @@ pub struct NodeInfo {
 }
 
 /// Per-tier replication configuration.
+///
+/// Each tier can have a different replication factor reflecting the
+/// cost/durability trade-off of that tier's media:
+///
+/// - `hot`  — 3 copies across hot SSDs (high durability, low latency)
+/// - `warm` — 2 copies (balanced)
+/// - `cold` — 1 copy on cold HDDs (cost-optimised; tape backup adds durability)
+/// - `tape` — 1 copy; tape cartridges provide inherent sequential redundancy
+///            and tape libraries typically use multiple drives for availability
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TierReplication {
     pub hot: u32,
     pub warm: u32,
     pub cold: u32,
+    /// Replication factor for tape-tier chunks.  Usually 1 — the tape library
+    /// itself provides durability.  Set to 2 if you have two independent tape
+    /// libraries and want a second copy on each.
+    #[serde(default = "TierReplication::default_tape")]
+    pub tape: u32,
+}
+
+impl TierReplication {
+    fn default_tape() -> u32 { 1 }
 }
 
 impl Default for TierReplication {
@@ -175,6 +205,7 @@ impl Default for TierReplication {
             hot: 3,
             warm: 2,
             cold: 1,
+            tape: 1,
         }
     }
 }

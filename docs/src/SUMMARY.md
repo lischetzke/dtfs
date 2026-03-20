@@ -32,6 +32,7 @@
 - [Monitoring](./operations/monitoring.md)
 - [Alerting](./operations/alerting.md)
 - [Backup & Recovery](./operations/backup-recovery.md)
+- [Time Synchronisation](./operations/time-sync.md)
 - [Troubleshooting](./operations/troubleshooting.md)
 
 # Storage
@@ -41,6 +42,7 @@
 - [Scrubbing](./storage/scrubbing.md)
 - [Caching](./storage/caching.md)
 - [Migration](./storage/migration.md)
+- [Tape Storage (Frozen Tier)](./storage/tape.md)
 
 # Access
 

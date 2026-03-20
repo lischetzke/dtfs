@@ -142,6 +142,27 @@ pub enum ClientRequest {
         config_json: String,
         version: u64,
     },
+
+    // ---- Observability operations ----
+    /// Record the result of a completed scrub operation.
+    ///
+    /// Data nodes report this after each quick or deep scrub cycle, and the
+    /// CLI can inject a result after a manually-triggered scrub.  The most
+    /// recent result (by `completed_at_ms`) is kept in the state machine and
+    /// surfaced by `/api/v1/stats` and the WebUI home page.
+    ReportScrubResult {
+        node_id: u64,
+        disk_path: String,
+        /// `"quick"` or `"deep"`
+        level: String,
+        /// Unix timestamp in milliseconds when the scrub completed.
+        completed_at_ms: u64,
+        chunks_checked: u64,
+        chunks_healthy: u64,
+        chunks_corrupt: u64,
+        chunks_missing: u64,
+        duration_secs: f64,
+    },
 }
 
 impl fmt::Display for ClientRequest {
@@ -160,6 +181,9 @@ impl fmt::Display for ClientRequest {
                 write!(f, "UpdateNodeStatus({node_id}, {status})")
             }
             Self::UpdateConfig { version, .. } => write!(f, "UpdateConfig(v{version})"),
+            Self::ReportScrubResult { node_id, level, chunks_checked, chunks_corrupt, .. } => {
+                write!(f, "ReportScrubResult(node={node_id}, {level}, checked={chunks_checked}, corrupt={chunks_corrupt})")
+            }
         }
     }
 }

@@ -1,0 +1,69 @@
+---
+# FUSE mount configuration
+dtfs_mount_point: /mnt/dtfs
+dtfs_volume: default
+dtfs_fuse_options: "allow_other,default_permissions,auto_unmount"
+dtfs_fuse_uid: 0
+dtfs_fuse_gid: 0
+dtfs_fuse_umask: "022"
+
+# Read-ahead configuration
+dtfs_readahead_enabled: true
+dtfs_readahead_mode: adaptive
+dtfs_readahead_min_kb: 128
+dtfs_readahead_max_mb: 32
+dtfs_readahead_window_ms: 100
+
+# Local cache (client-side)
+dtfs_client_cache_enabled: true
+dtfs_client_cache_dir: /var/lib/dtfs/client-cache
+dtfs_client_cache_size_mb: 1024
+dtfs_client_cache_ttl_s: 60
+dtfs_client_cache_eviction: lru
+dtfs_client_write_cache_enabled: true
+dtfs_client_write_cache_size_mb: 256
+dtfs_client_write_behind: true
+
+# Metadata cache
+dtfs_meta_cache_enabled: true
+dtfs_meta_cache_size_entries: 65536
+dtfs_meta_cache_ttl_s: 5
+dtfs_meta_negative_cache_ttl_s: 1
+
+# Connection to managers
+dtfs_client_manager_endpoints:
+  - "{{ hostvars['mgr-01']['ansible_host'] }}:8080"
+  - "{{ hostvars['mgr-02']['ansible_host'] }}:8080"
+  - "{{ hostvars['mgr-03']['ansible_host'] }}:8080"
+dtfs_client_manager_timeout_s: 10
+dtfs_client_manager_retry_count: 3
+dtfs_client_manager_retry_delay_ms: 500
+
+# Consistency / safety settings
+dtfs_partition_safety: strict
+dtfs_read_consistency: session
+dtfs_write_consistency: quorum
+
+# Direct I/O
+dtfs_direct_io_enabled: false
+dtfs_kernel_cache_enabled: true
+dtfs_kernel_cache_ttl_s: 1
+
+# FUSE daemon settings
+dtfs_fuse_threads: 8
+dtfs_fuse_max_background: 64
+dtfs_fuse_congestion_threshold: 48
+dtfs_fuse_max_write: 134217728
+dtfs_fuse_max_read: 134217728
+
+# Prometheus metrics
+dtfs_client_metrics_enabled: true
+dtfs_client_metrics_port: "{{ dtfs_metrics_port }}"
+dtfs_client_metrics_path: /metrics
+
+# Reconnect behavior
+dtfs_client_reconnect_enabled: true
+dtfs_client_reconnect_interval_s: 5
+dtfs_client_reconnect_max_attempts: 0
+dtfs_client_offline_read_enabled: true
+dtfs_client_offline_write_queue_mb: 512

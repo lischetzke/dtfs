@@ -27,6 +27,24 @@ type StoredMembership = crate::StoredMembership;
 // Domain types stored inside the state machine
 // ---------------------------------------------------------------------------
 
+/// A completed scrub operation result, stored in the state machine so the
+/// WebUI and `/api/v1/stats` can surface the most recent scrub without
+/// querying individual data nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScrubRecord {
+    pub node_id: u64,
+    pub disk_path: String,
+    /// `"quick"` or `"deep"`
+    pub level: String,
+    /// Unix timestamp in milliseconds when the scrub finished.
+    pub completed_at_ms: u64,
+    pub chunks_checked: u64,
+    pub chunks_healthy: u64,
+    pub chunks_corrupt: u64,
+    pub chunks_missing: u64,
+    pub duration_secs: f64,
+}
+
 /// Metadata for a single file managed by the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileMetadata {
@@ -68,6 +86,14 @@ pub struct StateMachineData {
     pub nodes: BTreeMap<u64, crate::NodeInfo>,
     pub cluster_config: ClusterConfig,
     pub audit_log: Vec<AuditEntry>,
+
+    // ---- observability state ----
+    /// The most recent scrub result reported by any data node.
+    /// Updated by `ClientRequest::ReportScrubResult`; surfaced by
+    /// `GET /api/v1/stats` and the WebUI home page.
+    pub last_scrub: Option<ScrubRecord>,
+    /// Number of registered FUSE clients (updated by client heartbeats).
+    pub client_count: u64,
 }
 
 impl Default for StateMachineData {
@@ -79,6 +105,8 @@ impl Default for StateMachineData {
             nodes: BTreeMap::new(),
             cluster_config: ClusterConfig::default(),
             audit_log: Vec::new(),
+            last_scrub: None,
+            client_count: 0,
         }
     }
 }
@@ -146,6 +174,8 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
             nodes: sm.nodes.clone(),
             cluster_config: sm.cluster_config.clone(),
             audit_log: sm.audit_log.clone(),
+            last_scrub: sm.last_scrub.clone(),
+            client_count: sm.client_count,
         };
 
         let cursor = snapshot::serialize_snapshot(&snap)?;
@@ -248,6 +278,8 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             sm.nodes = snap_data.nodes;
             sm.cluster_config = snap_data.cluster_config;
             sm.audit_log = snap_data.audit_log;
+            sm.last_scrub = snap_data.last_scrub;
+            sm.client_count = snap_data.client_count;
         }
 
         // Store the snapshot blob for later retrieval.
@@ -396,6 +428,43 @@ fn apply_request(
             };
             sm.audit_log
                 .push(audit(format!("UpdateConfig: v{version}")));
+            ClientResponse::Success
+        }
+
+        ClientRequest::ReportScrubResult {
+            node_id,
+            disk_path,
+            level,
+            completed_at_ms,
+            chunks_checked,
+            chunks_healthy,
+            chunks_corrupt,
+            chunks_missing,
+            duration_secs,
+        } => {
+            let record = ScrubRecord {
+                node_id: *node_id,
+                disk_path: disk_path.clone(),
+                level: level.clone(),
+                completed_at_ms: *completed_at_ms,
+                chunks_checked: *chunks_checked,
+                chunks_healthy: *chunks_healthy,
+                chunks_corrupt: *chunks_corrupt,
+                chunks_missing: *chunks_missing,
+                duration_secs: *duration_secs,
+            };
+            // Keep only the most recent scrub result cluster-wide.
+            let is_newer = sm
+                .last_scrub
+                .as_ref()
+                .map_or(true, |prev| *completed_at_ms > prev.completed_at_ms);
+            if is_newer {
+                sm.last_scrub = Some(record);
+            }
+            sm.audit_log.push(audit(format!(
+                "ScrubResult: node={node_id} disk={disk_path} level={level} \
+                 checked={chunks_checked} corrupt={chunks_corrupt} missing={chunks_missing}"
+            )));
             ClientResponse::Success
         }
     }

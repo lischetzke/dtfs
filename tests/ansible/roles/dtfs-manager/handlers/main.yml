@@ -1,0 +1,14 @@
+---
+- name: restart dtfs-manager
+  ansible.builtin.systemd:
+    name: dtfs-manager
+    state: restarted
+    daemon_reload: true
+
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: reload dtfs-manager config
+  ansible.builtin.command: systemctl kill -s HUP dtfs-manager
+  changed_when: true

@@ -1,0 +1,283 @@
+---
+# Collect logs from all DTFS nodes
+# Usage: ansible-playbook playbooks/collect-logs.yml
+# Options:
+#   -e "log_since='1 hour ago'"   timeframe for journalctl (default: 24h)
+#   -e "log_dir=/tmp/dtfs-logs"   local destination (default: /tmp/dtfs-logs-TIMESTAMP)
+#   -e "include_core_dumps=true"  also collect core dumps if present
+
+- name: Set log collection timestamp
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Generate timestamp for log directory
+      ansible.builtin.set_fact:
+        log_collection_ts: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+        effective_log_dir: "{{ log_dir | default('/tmp/dtfs-logs-' + lookup('pipe', 'date +%Y%m%d_%H%M%S')) }}"
+
+    - name: Create local log collection directory
+      ansible.builtin.file:
+        path: "{{ effective_log_dir }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - managers
+        - data_nodes
+        - clients
+
+    - name: Print collection info
+      ansible.builtin.debug:
+        msg: "Collecting logs since '{{ log_since | default('24 hours ago') }}' into {{ effective_log_dir }}"
+
+- name: Collect manager logs
+  hosts: managers
+  gather_facts: false
+  tasks:
+    - name: Export dtfs-manager journal to file
+      ansible.builtin.command: >
+        journalctl -u dtfs-manager
+        --since "{{ log_since | default('24 hours ago') }}"
+        --no-pager
+        -o json
+      register: manager_journal
+      changed_when: false
+
+    - name: Write manager journal to temp file
+      ansible.builtin.copy:
+        content: "{{ manager_journal.stdout }}"
+        dest: "/tmp/dtfs-manager-journal-{{ inventory_hostname }}.json"
+        mode: "0644"
+
+    - name: Export dtfs-manager journal (text format for readability)
+      ansible.builtin.command: >
+        journalctl -u dtfs-manager
+        --since "{{ log_since | default('24 hours ago') }}"
+        --no-pager
+      register: manager_journal_text
+      changed_when: false
+
+    - name: Write manager journal text
+      ansible.builtin.copy:
+        content: "{{ manager_journal_text.stdout }}"
+        dest: "/tmp/dtfs-manager-journal-{{ inventory_hostname }}.log"
+        mode: "0644"
+
+    - name: Collect DTFS audit logs
+      ansible.builtin.shell: >
+        find {{ dtfs_audit_dir }} -name "*.log" -newer /tmp/.dtfs-log-marker 2>/dev/null |
+        head -20 | xargs cat 2>/dev/null || echo "No audit logs found"
+      register: audit_logs
+      changed_when: false
+      failed_when: false
+
+    - name: Write audit logs
+      ansible.builtin.copy:
+        content: "{{ audit_logs.stdout }}"
+        dest: "/tmp/dtfs-audit-{{ inventory_hostname }}.log"
+        mode: "0644"
+
+    - name: Collect cluster status snapshot
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/cluster/status"
+        method: GET
+        status_code: [200, 503]
+        timeout: 10
+      register: cluster_status_snap
+      failed_when: false
+
+    - name: Write cluster status
+      ansible.builtin.copy:
+        content: "{{ cluster_status_snap.json | default({}) | to_nice_json }}"
+        dest: "/tmp/dtfs-cluster-status-{{ inventory_hostname }}.json"
+        mode: "0644"
+
+    - name: Fetch manager journal log (JSON)
+      ansible.builtin.fetch:
+        src: "/tmp/dtfs-manager-journal-{{ inventory_hostname }}.json"
+        dest: "{{ hostvars['localhost']['effective_log_dir'] }}/managers/"
+        flat: true
+
+    - name: Fetch manager journal log (text)
+      ansible.builtin.fetch:
+        src: "/tmp/dtfs-manager-journal-{{ inventory_hostname }}.log"
+        dest: "{{ hostvars['localhost']['effective_log_dir'] }}/managers/"
+        flat: true
+
+    - name: Fetch audit log
+      ansible.builtin.fetch:
+        src: "/tmp/dtfs-audit-{{ inventory_hostname }}.log"
+        dest: "{{ hostvars['localhost']['effective_log_dir'] }}/managers/"
+        flat: true
+
+    - name: Fetch cluster status
+      ansible.builtin.fetch:
+        src: "/tmp/dtfs-cluster-status-{{ inventory_hostname }}.json"
+        dest: "{{ hostvars['localhost']['effective_log_dir'] }}/managers/"
+        flat: true
+
+    - name: Clean up temp files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/dtfs-manager-journal-{{ inventory_hostname }}.json"
+        - "/tmp/dtfs-manager-journal-{{ inventory_hostname }}.log"
+        - "/tmp/dtfs-audit-{{ inventory_hostname }}.log"
+        - "/tmp/dtfs-cluster-status-{{ inventory_hostname }}.json"
+
+- name: Collect data node logs
+  hosts: data_nodes
+  gather_facts: false
+  tasks:
+    - name: Export dtfs-data journal to file
+      ansible.builtin.command: >
+        journalctl -u dtfs-data
+        --since "{{ log_since | default('24 hours ago') }}"
+        --no-pager
+        -o json
+      register: data_journal
+      changed_when: false
+
+    - name: Write data journal
+      ansible.builtin.copy:
+        content: "{{ data_journal.stdout }}"
+        dest: "/tmp/dtfs-data-journal-{{ inventory_hostname }}.json"
+        mode: "0644"
+
+    - name: Export dtfs-data journal (text format)
+      ansible.builtin.command: >
+        journalctl -u dtfs-data
+        --since "{{ log_since | default('24 hours ago') }}"
+        --no-pager
+      register: data_journal_text
+      changed_when: false
+
+    - name: Write data journal text
+      ansible.builtin.copy:
+        content: "{{ data_journal_text.stdout }}"
+        dest: "/tmp/dtfs-data-journal-{{ inventory_hostname }}.log"
+        mode: "0644"
+
+    - name: Collect node health/stats snapshot
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_data_health_check_port }}/health"
+        method: GET
+        status_code: [200, 503]
+        timeout: 5
+      register: data_health_snap
+      failed_when: false
+
+    - name: Write node health
+      ansible.builtin.copy:
+        content: "{{ data_health_snap.json | default({}) | to_nice_json }}"
+        dest: "/tmp/dtfs-data-health-{{ inventory_hostname }}.json"
+        mode: "0644"
+
+    - name: Collect disk utilization
+      ansible.builtin.shell: df -h {{ dtfs_disks | default([]) | map(attribute='path') | join(' ') }} 2>/dev/null || echo "No disks configured"
+      register: disk_util
+      changed_when: false
+
+    - name: Write disk utilization
+      ansible.builtin.copy:
+        content: "{{ disk_util.stdout }}"
+        dest: "/tmp/dtfs-disk-util-{{ inventory_hostname }}.txt"
+        mode: "0644"
+
+    - name: Fetch data node logs
+      ansible.builtin.fetch:
+        src: "{{ item }}"
+        dest: "{{ hostvars['localhost']['effective_log_dir'] }}/data_nodes/"
+        flat: true
+      loop:
+        - "/tmp/dtfs-data-journal-{{ inventory_hostname }}.json"
+        - "/tmp/dtfs-data-journal-{{ inventory_hostname }}.log"
+        - "/tmp/dtfs-data-health-{{ inventory_hostname }}.json"
+        - "/tmp/dtfs-disk-util-{{ inventory_hostname }}.txt"
+
+    - name: Clean up temp files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/dtfs-data-journal-{{ inventory_hostname }}.json"
+        - "/tmp/dtfs-data-journal-{{ inventory_hostname }}.log"
+        - "/tmp/dtfs-data-health-{{ inventory_hostname }}.json"
+        - "/tmp/dtfs-disk-util-{{ inventory_hostname }}.txt"
+
+- name: Collect client logs
+  hosts: clients
+  gather_facts: false
+  tasks:
+    - name: Export dtfs-fuse journal to file
+      ansible.builtin.command: >
+        journalctl -u "dtfs-fuse@{{ dtfs_volume }}"
+        --since "{{ log_since | default('24 hours ago') }}"
+        --no-pager
+      register: fuse_journal
+      changed_when: false
+
+    - name: Write FUSE journal
+      ansible.builtin.copy:
+        content: "{{ fuse_journal.stdout }}"
+        dest: "/tmp/dtfs-fuse-journal-{{ inventory_hostname }}.log"
+        mode: "0644"
+
+    - name: Collect mount status
+      ansible.builtin.shell: "mount | grep dtfs || echo 'No dtfs mounts found'"
+      register: mount_status
+      changed_when: false
+
+    - name: Write mount status
+      ansible.builtin.copy:
+        content: "{{ mount_status.stdout }}"
+        dest: "/tmp/dtfs-mounts-{{ inventory_hostname }}.txt"
+        mode: "0644"
+
+    - name: Fetch client logs
+      ansible.builtin.fetch:
+        src: "{{ item }}"
+        dest: "{{ hostvars['localhost']['effective_log_dir'] }}/clients/"
+        flat: true
+      loop:
+        - "/tmp/dtfs-fuse-journal-{{ inventory_hostname }}.log"
+        - "/tmp/dtfs-mounts-{{ inventory_hostname }}.txt"
+
+    - name: Clean up temp files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/dtfs-fuse-journal-{{ inventory_hostname }}.log"
+        - "/tmp/dtfs-mounts-{{ inventory_hostname }}.txt"
+
+- name: Generate summary report
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Create summary file
+      ansible.builtin.copy:
+        dest: "{{ effective_log_dir }}/SUMMARY.txt"
+        content: |
+          DTFS Log Collection Summary
+          ============================
+          Collected at: {{ lookup('pipe', 'date -u') }}
+          Time range: {{ log_since | default('24 hours ago') }} to now
+          Collection directory: {{ effective_log_dir }}
+
+          Files collected:
+          - managers/: Journal logs and cluster status for mgr-01, mgr-02, mgr-03
+          - data_nodes/: Journal logs and health for mgr-01, mgr-02, data-01, data-02
+          - clients/: FUSE journal logs for client-01
+
+          To view logs:
+            less {{ effective_log_dir }}/managers/dtfs-manager-journal-mgr-01.log
+            jq '.' {{ effective_log_dir }}/managers/dtfs-cluster-status-mgr-01.json
+        mode: "0644"
+
+    - name: Print collection complete message
+      ansible.builtin.debug:
+        msg:
+          - "Log collection complete!"
+          - "Logs saved to: {{ effective_log_dir }}"
+          - "View summary: cat {{ effective_log_dir }}/SUMMARY.txt"

@@ -1,0 +1,89 @@
+# DTFS Data Node Configuration
+# Node: {{ inventory_hostname }} (node_id={{ dtfs_node_id }})
+# Managed by Ansible — do not edit manually
+
+[node]
+id = {{ dtfs_node_id }}
+name = "{{ inventory_hostname }}"
+cluster = "{{ dtfs_cluster_name }}"
+location = "{{ dtfs_location }}"
+
+[cluster]
+shared_secret = "{{ dtfs_shared_secret }}"
+
+[network]
+listen_addr = "{{ dtfs_data_listen_addr }}:{{ dtfs_data_port }}"
+grpc_listen_addr = "{{ dtfs_data_listen_addr }}:{{ dtfs_data_grpc_port }}"
+replication_listen_addr = "{{ dtfs_data_listen_addr }}:{{ dtfs_data_replication_port }}"
+max_connections = {{ dtfs_data_max_connections }}
+io_threads = {{ dtfs_data_io_threads }}
+network_threads = {{ dtfs_data_network_threads }}
+
+[manager]
+endpoints = [
+{% for ep in dtfs_data_manager_endpoints %}
+  "{{ ep }}",
+{% endfor %}
+]
+heartbeat_interval_s = {{ dtfs_data_manager_heartbeat_s }}
+reconnect_interval_s = {{ dtfs_data_manager_reconnect_interval_s }}
+registration_retry_count = {{ dtfs_data_registration_retry_count }}
+registration_retry_delay_s = {{ dtfs_data_registration_retry_delay_s }}
+
+{% for disk in dtfs_disks | default([]) %}
+[[storage]]
+path = "{{ disk.path }}"
+tier = "{{ disk.tier }}"
+{% if disk.tier == 'hot' %}
+cache_size_bytes = {{ dtfs_hot_tier_cache_size_mb | int * 1024 * 1024 }}
+max_utilization_pct = {{ dtfs_hot_tier_max_util_pct }}
+{% else %}
+cache_size_bytes = {{ dtfs_cold_tier_cache_size_mb | int * 1024 * 1024 }}
+max_utilization_pct = {{ dtfs_cold_tier_max_util_pct }}
+{% endif %}
+
+{% endfor %}
+
+[chunks]
+dir_depth = {{ dtfs_chunk_dir_depth }}
+dir_width = {{ dtfs_chunk_dir_width }}
+write_mode = "{{ dtfs_chunk_write_mode }}"
+fsync_on_write = {{ dtfs_chunk_fsync_on_write | lower }}
+
+[cache]
+enabled = {{ dtfs_cache_enabled | lower }}
+size_bytes = {{ dtfs_cache_size_mb | int * 1024 * 1024 }}
+eviction_policy = "{{ dtfs_cache_eviction_policy }}"
+ttl_s = {{ dtfs_cache_ttl_s }}
+
+[replication]
+receive_threads = {{ dtfs_data_replication_threads }}
+bandwidth_limit_mb = {{ dtfs_data_replication_bandwidth_mb }}
+
+[scrub]
+io_priority = "{{ dtfs_data_scrub_io_priority }}"
+bandwidth_limit_mb = {{ dtfs_data_scrub_bandwidth_limit_mb }}
+thread_count = {{ dtfs_data_scrub_thread_count }}
+
+[health]
+listen_addr = "0.0.0.0:{{ dtfs_data_health_check_port }}"
+stats_interval_s = {{ dtfs_data_stats_interval_s }}
+
+[smart]
+enabled = {{ dtfs_smart_check_enabled | lower }}
+check_interval_hours = {{ dtfs_smart_check_interval_hours }}
+disk_full_threshold_pct = {{ dtfs_disk_full_threshold_pct }}
+disk_warn_threshold_pct = {{ dtfs_disk_warn_threshold_pct }}
+
+[metrics]
+enabled = {{ dtfs_metrics_enabled | lower }}
+listen_addr = "0.0.0.0:{{ dtfs_data_metrics_port }}"
+path = "{{ dtfs_data_metrics_path }}"
+
+[tls]
+enabled = {{ dtfs_tls_enabled | lower }}
+
+[logging]
+level = "{{ dtfs_log_level }}"
+format = "{{ dtfs_log_format }}"
+dir = "{{ dtfs_log_dir }}/data"

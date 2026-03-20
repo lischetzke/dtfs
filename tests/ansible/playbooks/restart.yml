@@ -1,0 +1,223 @@
+---
+# Rolling restart of all DTFS services
+# Usage: ansible-playbook playbooks/restart.yml
+# Options:
+#   -e "restart_managers=false"   skip manager restart
+#   -e "restart_data=false"       skip data node restart
+#   -e "restart_clients=false"    skip client restart
+#   --tags managers|data|clients  restart specific component only
+
+- name: Rolling restart of FUSE clients
+  hosts: clients
+  gather_facts: false
+  serial: 1
+  when: restart_clients | default(true) | bool
+  tags: [clients]
+  tasks:
+    - name: Restart dtfs-fuse service
+      ansible.builtin.systemd:
+        name: "dtfs-fuse@{{ dtfs_volume }}.service"
+        state: restarted
+
+    - name: Wait for FUSE mount to be available after restart
+      ansible.builtin.command: mountpoint -q "{{ dtfs_mount_point }}"
+      register: mount_check
+      retries: 15
+      delay: 2
+      until: mount_check.rc == 0
+      changed_when: false
+
+    - name: Quick write/read test after restart
+      ansible.builtin.shell: >
+        echo "restart-check-$(hostname)-$(date +%s)" > {{ dtfs_mount_point }}/.restart-check &&
+        cat {{ dtfs_mount_point }}/.restart-check &&
+        rm -f {{ dtfs_mount_point }}/.restart-check
+      changed_when: false
+      register: post_restart_test
+
+    - name: Report FUSE restart result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} FUSE restart OK - mount verified"
+
+- name: Rolling restart of data nodes
+  hosts: data_nodes
+  gather_facts: false
+  serial: 1
+  when: restart_data | default(true) | bool
+  tags: [data]
+  tasks:
+    - name: Set node to maintenance mode
+      ansible.builtin.uri:
+        url: "{{ dtfs_manager_api_url }}/api/v1/nodes/{{ dtfs_node_id }}/maintenance"
+        method: PUT
+        body_format: json
+        body: '{"enabled": true, "reason": "rolling restart"}'
+        status_code: 200
+        timeout: 10
+      delegate_to: localhost
+      become: false
+
+    - name: Wait for active transfers to drain
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: Restart dtfs-data service
+      ansible.builtin.systemd:
+        name: dtfs-data
+        state: restarted
+
+    - name: Wait for data node health endpoint
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_data_health_check_port }}/health"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: data_health
+      retries: 20
+      delay: 3
+      until: data_health.status == 200
+
+    - name: Exit maintenance mode
+      ansible.builtin.uri:
+        url: "{{ dtfs_manager_api_url }}/api/v1/nodes/{{ dtfs_node_id }}/maintenance"
+        method: PUT
+        body_format: json
+        body: '{"enabled": false}'
+        status_code: 200
+        timeout: 10
+      delegate_to: localhost
+      become: false
+
+    - name: Verify node is back in healthy state from manager perspective
+      ansible.builtin.uri:
+        url: "{{ dtfs_manager_api_url }}/api/v1/nodes/{{ dtfs_node_id }}"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: node_status
+      retries: 15
+      delay: 2
+      until:
+        - node_status.status == 200
+        - node_status.json.status == 'healthy'
+      delegate_to: localhost
+      become: false
+
+    - name: Report data node restart result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} data node restart OK - status: {{ node_status.json.status }}"
+
+- name: Rolling restart of managers (followers first, then leader)
+  hosts: managers
+  gather_facts: false
+  serial: 1
+  when: restart_managers | default(true) | bool
+  tags: [managers]
+  tasks:
+    - name: Fetch current cluster status
+      ansible.builtin.uri:
+        url: "{{ dtfs_manager_api_url }}/api/v1/cluster/status"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: cluster_status
+      delegate_to: localhost
+      become: false
+
+    - name: Skip if this is the current leader (handle last)
+      ansible.builtin.meta: end_host
+      when: cluster_status.json.raft.leader_id | string == dtfs_node_id | string
+
+    - name: Restart follower manager
+      ansible.builtin.systemd:
+        name: dtfs-manager
+        state: restarted
+
+    - name: Wait for follower to rejoin cluster
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/health"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: mgr_health
+      retries: 30
+      delay: 2
+      until: mgr_health.status == 200
+
+    - name: Verify cluster still has quorum after follower restart
+      ansible.builtin.uri:
+        url: "{{ dtfs_manager_api_url }}/api/v1/cluster/status"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: cluster_after_restart
+      retries: 10
+      delay: 2
+      until:
+        - cluster_after_restart.status == 200
+        - cluster_after_restart.json.raft.leader_id is defined
+      delegate_to: localhost
+      become: false
+
+    - name: Report follower manager restart result
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} manager restart OK (follower) - leader is {{ cluster_after_restart.json.raft.leader_id }}"
+
+- name: Restart leader manager last
+  hosts: managers
+  gather_facts: false
+  serial: 1
+  when: restart_managers | default(true) | bool
+  tags: [managers, leader]
+  tasks:
+    - name: Get current leader
+      ansible.builtin.uri:
+        url: "{{ dtfs_manager_api_url }}/api/v1/cluster/status"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: cluster_status
+      delegate_to: localhost
+      become: false
+
+    - name: Only restart if this is the current leader
+      ansible.builtin.meta: end_host
+      when: cluster_status.json.raft.leader_id | string != dtfs_node_id | string
+
+    - name: Restart leader manager (will trigger re-election)
+      ansible.builtin.systemd:
+        name: dtfs-manager
+        state: restarted
+
+    - name: Wait for new leader to be elected
+      ansible.builtin.uri:
+        url: "{{ dtfs_manager_api_url }}/api/v1/cluster/status"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: new_leader
+      retries: 20
+      delay: 2
+      until:
+        - new_leader.status == 200
+        - new_leader.json.raft.leader_id is defined
+      delegate_to: localhost
+      become: false
+
+    - name: Wait for former leader to rejoin as follower
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/health"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: leader_rejoin
+      retries: 30
+      delay: 2
+      until: leader_rejoin.status == 200
+
+    - name: Report leader restart result
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }} leader manager restarted"
+          - "New leader: {{ new_leader.json.raft.leader_id }}"
+          - "Cluster status: {{ new_leader.json.status }}"
