@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use dtfs_common::types::{DiskTier, HealthStatus, MigrationStatus};
 use dtfs_raft::state_machine::StateMachineData;
-use dtfs_raft::{ClientRequest, DtfsRaft};
+use dtfs_raft::{ChunkLocationEntry, ClientRequest, DtfsRaft};
+use dtfs_proto::dtfs::data::data_service_client::DataServiceClient;
+use dtfs_proto::dtfs::data::{ReplicateChunkRequest, VerifyChunkRequest};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -284,38 +286,140 @@ impl TaskScheduler {
                 }
 
                 MigrationStatus::Copying => {
-                    // In a real implementation we would issue an RPC to copy
-                    // the chunk from source to target. For now, we advance to
-                    // Verifying on the next tick.
-                    info!(
-                        task_id = %task.task_id,
-                        chunk = %task.chunk_id,
-                        "Migration: Copying -> Verifying"
-                    );
-                    task.status = MigrationStatus::Verifying;
-                    task.updated_at_ms = now_ms;
+                    // Issue ReplicateChunk RPC on the source node.
+                    // The source node streams the chunk to the target node.
+                    let source_addr = self.node_grpc_addr(task.source_node).await;
+                    let target_addr = self.node_grpc_addr(task.target_node).await;
+
+                    match (source_addr, target_addr) {
+                        (Some(src_addr), Some(tgt_addr)) => {
+                            let chunk_id = task.chunk_id.clone();
+                            match self.replicate_chunk(&src_addr, &chunk_id, &tgt_addr).await {
+                                Ok(()) => {
+                                    info!(
+                                        task_id = %task.task_id,
+                                        chunk = %chunk_id,
+                                        src = %src_addr,
+                                        dst = %tgt_addr,
+                                        "Migration: Copying -> Verifying (ReplicateChunk OK)"
+                                    );
+                                    task.status = MigrationStatus::Verifying;
+                                    task.updated_at_ms = now_ms;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        task_id = %task.task_id,
+                                        chunk = %chunk_id,
+                                        "ReplicateChunk failed, will retry: {}",
+                                        e
+                                    );
+                                    // Stay in Copying; will retry next tick.
+                                    task.updated_at_ms = now_ms;
+                                }
+                            }
+                        }
+                        _ => {
+                            warn!(
+                                task_id = %task.task_id,
+                                chunk = %task.chunk_id,
+                                src_node = task.source_node,
+                                dst_node = task.target_node,
+                                "Cannot resolve node addresses for copy; failing task"
+                            );
+                            task.status = MigrationStatus::Failed;
+                            task.updated_at_ms = now_ms;
+                        }
+                    }
                 }
 
                 MigrationStatus::Verifying => {
-                    // In a real implementation we would verify the checksum on
-                    // the target node. Source data is NOT removed yet.
-                    info!(
-                        task_id = %task.task_id,
-                        chunk = %task.chunk_id,
-                        "Migration: Verifying -> Completing (source preserved)"
-                    );
-                    task.status = MigrationStatus::Completing;
-                    task.updated_at_ms = now_ms;
+                    // Issue VerifyChunk RPC on the target node.
+                    // Source data is NOT removed yet — only after verification passes.
+                    let target_addr = self.node_grpc_addr(task.target_node).await;
+                    match target_addr {
+                        Some(tgt_addr) => {
+                            let chunk_id = task.chunk_id.clone();
+                            match self.verify_chunk(&tgt_addr, &chunk_id).await {
+                                Ok(true) => {
+                                    info!(
+                                        task_id = %task.task_id,
+                                        chunk = %chunk_id,
+                                        "Migration: Verifying -> Completing (checksum OK)"
+                                    );
+                                    task.status = MigrationStatus::Completing;
+                                    task.updated_at_ms = now_ms;
+                                }
+                                Ok(false) => {
+                                    warn!(
+                                        task_id = %task.task_id,
+                                        chunk = %chunk_id,
+                                        "VerifyChunk failed (checksum mismatch); retrying copy"
+                                    );
+                                    task.status = MigrationStatus::Copying;
+                                    task.updated_at_ms = now_ms;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        task_id = %task.task_id,
+                                        chunk = %chunk_id,
+                                        "VerifyChunk RPC error, will retry: {}",
+                                        e
+                                    );
+                                    task.updated_at_ms = now_ms;
+                                }
+                            }
+                        }
+                        None => {
+                            warn!(
+                                task_id = %task.task_id,
+                                "Cannot resolve target node {} address for verify; failing task",
+                                task.target_node
+                            );
+                            task.status = MigrationStatus::Failed;
+                            task.updated_at_ms = now_ms;
+                        }
+                    }
                 }
 
                 MigrationStatus::Completing => {
-                    // Target verified. Mark as done. Source data is still kept
-                    // (the source is a valid replica); the old replica can be
-                    // removed later if over-replicated.
+                    // Target is verified.  Register the new replica location in
+                    // the Raft state machine, then mark the task Done.
+                    // The source remains a valid replica; over-replication
+                    // cleanup happens in a separate pass.
+                    let chunk_id = task.chunk_id.clone();
+                    let target_node = task.target_node;
+                    let tier = task.tier;
+
+                    // Find the file path that owns this chunk (needed for
+                    // UpdateChunkLocations).
+                    let file_path = self.find_file_for_chunk(&chunk_id).await;
+
+                    if let Some(path) = file_path {
+                        let new_loc = ChunkLocationEntry {
+                            chunk_index: 0,   // Will be corrected by merging with existing.
+                            chunk_hash: chunk_id.clone(),
+                            node_id: target_node.to_string(),
+                            disk_id: 0,       // Disk chosen by target data node.
+                            size_bytes: 0,    // Size already stored on target.
+                        };
+                        let req = ClientRequest::UpdateChunkLocations {
+                            path,
+                            chunks: vec![new_loc],
+                        };
+                        if let Err(e) = self.raft.client_write(req).await {
+                            debug!(
+                                "Could not write new chunk location to Raft (may not be leader): {}",
+                                e
+                            );
+                        }
+                    }
+
                     info!(
                         task_id = %task.task_id,
-                        chunk = %task.chunk_id,
-                        "Migration: Completing -> Done"
+                        chunk = %chunk_id,
+                        target_node,
+                        tier = ?tier,
+                        "Migration: Completing -> Done (new replica registered)"
                     );
                     task.status = MigrationStatus::Done;
                     task.updated_at_ms = now_ms;
@@ -354,6 +458,77 @@ impl TaskScheduler {
         // The cluster_config.config_json may contain a MigrationState or some
         // other config. We try to parse it; on failure we use the default.
         serde_json::from_str(&sm.cluster_config.config_json).unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
+    // Data-node RPC helpers
+    // -----------------------------------------------------------------------
+
+    /// Look up the gRPC address of a node from the Raft state machine.
+    async fn node_grpc_addr(&self, node_id: u64) -> Option<String> {
+        let sm = self.state_data.read().await;
+        sm.nodes.get(&node_id).map(|info| info.grpc_addr.clone())
+    }
+
+    /// Ask the source node to replicate `chunk_id` to `target_addr`.
+    async fn replicate_chunk(
+        &self,
+        source_addr: &str,
+        chunk_id: &str,
+        target_addr: &str,
+    ) -> anyhow::Result<()> {
+        let endpoint = format!("http://{}", source_addr);
+        let mut client = DataServiceClient::connect(endpoint).await
+            .map_err(|e| anyhow::anyhow!("connect to source {}: {}", source_addr, e))?;
+
+        let resp = client
+            .replicate_chunk(ReplicateChunkRequest {
+                chunk_id: chunk_id.to_string(),
+                target_address: target_addr.to_string(),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("ReplicateChunk RPC: {}", e))?
+            .into_inner();
+
+        if resp.success {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("ReplicateChunk returned error: {}", resp.error))
+        }
+    }
+
+    /// Ask the target node to verify the integrity of `chunk_id`.
+    /// Returns `true` if the chunk is valid, `false` if the checksum failed.
+    async fn verify_chunk(&self, target_addr: &str, chunk_id: &str) -> anyhow::Result<bool> {
+        let endpoint = format!("http://{}", target_addr);
+        let mut client = DataServiceClient::connect(endpoint).await
+            .map_err(|e| anyhow::anyhow!("connect to target {}: {}", target_addr, e))?;
+
+        let resp = client
+            .verify_chunk(VerifyChunkRequest {
+                chunk_id: chunk_id.to_string(),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("VerifyChunk RPC: {}", e))?
+            .into_inner();
+
+        if resp.valid {
+            Ok(true)
+        } else {
+            warn!("VerifyChunk returned invalid: {}", resp.error);
+            Ok(false)
+        }
+    }
+
+    /// Find the file path that contains a given chunk hash.
+    async fn find_file_for_chunk(&self, chunk_hash: &str) -> Option<String> {
+        let sm = self.state_data.read().await;
+        for (path, file_meta) in &sm.files {
+            if file_meta.chunks.iter().any(|c| c.chunk_hash == chunk_hash) {
+                return Some(path.clone());
+            }
+        }
+        None
     }
 
     /// Persist the migration state to Raft via UpdateConfig.

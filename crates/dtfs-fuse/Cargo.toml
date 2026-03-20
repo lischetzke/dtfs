@@ -19,3 +19,9 @@ thiserror = { workspace = true }
 clap = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
+
+# fuse3 requires libfuse3 and is Linux-only.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuse3 = { version = "0.7", features = ["tokio-runtime"] }
+libc = "0.2"
+futures-util = "0.3"

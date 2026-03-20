@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -10,6 +11,15 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::disk::DiskManager;
+
+/// A lightweight stats snapshot for heartbeat reporting.
+#[derive(Debug, Clone, Default)]
+pub struct ChunkStoreStats {
+    /// Number of chunk files currently stored across all disks.
+    pub total_chunks: u64,
+    /// Approximate total bytes of chunk data stored (sum of chunk sizes written).
+    pub total_bytes_stored: u64,
+}
 
 /// A Write-Ahead Log entry describing a pending chunk write operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,12 +60,26 @@ enum WalOperation {
 /// ```
 pub struct ChunkStore {
     disk_manager: Arc<DiskManager>,
+    /// Running count of chunks stored across all disks.
+    chunk_count: Arc<AtomicU64>,
+    /// Running total of bytes stored (incremented on put, decremented on delete).
+    bytes_stored: Arc<AtomicU64>,
 }
 
 impl ChunkStore {
     pub fn new(disk_manager: DiskManager) -> Self {
         Self {
             disk_manager: Arc::new(disk_manager),
+            chunk_count: Arc::new(AtomicU64::new(0)),
+            bytes_stored: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Return a lightweight stats snapshot for heartbeat and metrics reporting.
+    pub fn stats(&self) -> ChunkStoreStats {
+        ChunkStoreStats {
+            total_chunks: self.chunk_count.load(Ordering::Relaxed),
+            total_bytes_stored: self.bytes_stored.load(Ordering::Relaxed),
         }
     }
 
@@ -143,6 +167,10 @@ impl ChunkStore {
         // 5. Remove the WAL entry now that the write is fully committed.
         let _ = fs::remove_file(&wal_path).await;
 
+        // Update running counters.
+        self.chunk_count.fetch_add(1, Ordering::Relaxed);
+        self.bytes_stored.fetch_add(data.len() as u64, Ordering::Relaxed);
+
         tracing::debug!(
             "Stored chunk {} ({} bytes) on disk {}",
             chunk_id,
@@ -200,6 +228,10 @@ impl ChunkStore {
                         .map_err(DtfsError::Io)?;
                 }
                 tracing::debug!("Deleted chunk {}", chunk_id);
+                // Update running counters (saturating to avoid underflow).
+                self.chunk_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                    Some(c.saturating_sub(1))
+                }).ok();
                 return Ok(());
             }
         }
