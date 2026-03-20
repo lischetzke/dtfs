@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use dtfs_common::types::{DiskTier, HealthStatus};
 use dtfs_raft::state_machine::StateMachineData;
+use dtfs_raft::{ClientRequest, DtfsRaft};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cluster::{ClusterManager, NodeStatus};
 use crate::scheduler::TaskScheduler;
@@ -22,6 +23,8 @@ pub struct HealthMonitor {
     check_interval: Duration,
     scheduler: Arc<TaskScheduler>,
     state_data: Arc<RwLock<StateMachineData>>,
+    /// Raft handle used to commit node-status changes to the cluster state machine.
+    raft: Arc<DtfsRaft>,
 }
 
 impl HealthMonitor {
@@ -30,12 +33,14 @@ impl HealthMonitor {
         check_interval: Duration,
         scheduler: Arc<TaskScheduler>,
         state_data: Arc<RwLock<StateMachineData>>,
+        raft: Arc<DtfsRaft>,
     ) -> Self {
         Self {
             cluster,
             check_interval,
             scheduler,
             state_data,
+            raft,
         }
     }
 
@@ -60,21 +65,28 @@ impl HealthMonitor {
                             "Node {} is SUSPECT -- heartbeat overdue",
                             node_id
                         );
+                        // Commit the suspect status to the cluster state machine so
+                        // placement can avoid new writes to this node.
+                        self.update_node_status_in_raft(*node_id, "suspect").await;
                     }
                     NodeStatus::Down => {
                         warn!(
                             "Node {} is DOWN -- triggering re-replication check",
                             node_id
                         );
+                        // Mark in Raft so placement and tiering stop using this node.
+                        self.update_node_status_in_raft(*node_id, "down").await;
                         self.handle_node_down(*node_id).await;
                     }
                     NodeStatus::Healthy => {
-                        // No action needed.
+                        // Node recovered — restore healthy status in Raft.
+                        self.update_node_status_in_raft(*node_id, "healthy").await;
                     }
                 }
             }
 
-            // Check for SMART-like disk health warnings in heartbeat reports.
+            // Check for SMART-like disk health warnings in heartbeat reports and
+            // schedule re-replication for any newly-failed disks.
             self.check_disk_health().await;
         }
     }
@@ -183,33 +195,138 @@ impl HealthMonitor {
         }
     }
 
+    /// Write a `UpdateNodeStatus` entry to the Raft log, committing the health
+    /// transition cluster-wide.  Errors are only at debug level because this
+    /// node may not be the Raft leader; the leader's own monitor will issue the
+    /// same write.
+    async fn update_node_status_in_raft(&self, node_id: u64, status: &str) {
+        let req = ClientRequest::UpdateNodeStatus {
+            node_id,
+            status: status.to_string(),
+        };
+        match self.raft.client_write(req).await {
+            Ok(_) => info!("Committed UpdateNodeStatus({}, {}) to Raft", node_id, status),
+            Err(e) => debug!(
+                "Could not write UpdateNodeStatus to Raft (may not be leader): {}",
+                e
+            ),
+        }
+    }
+
     /// Check for SMART-like disk health indicators from heartbeat data.
     ///
-    /// This inspects the node info stored in Raft state for disks that are
-    /// degraded or failing, and logs warnings for operator attention.
+    /// Logs warnings for degraded disks and schedules re-replication for any
+    /// disk whose status has transitioned to `Failed`.
     async fn check_disk_health(&self) {
-        let sm = self.state_data.read().await;
-
-        for (node_id, info) in &sm.nodes {
-            for disk in &info.disks {
-                match disk.status {
-                    dtfs_common::types::DiskStatus::Degraded => {
-                        warn!(
-                            "SMART warning: Disk {} on node {} ({}) is DEGRADED -- \
-                             consider proactive replacement",
-                            disk.disk_id, node_id, disk.mount_path
-                        );
+        // Collect failed-disk info without holding the read-lock across awaits.
+        let failed_disks: Vec<(u64, u32, String)> = {
+            let sm = self.state_data.read().await;
+            let mut out = Vec::new();
+            for (node_id, info) in &sm.nodes {
+                for disk in &info.disks {
+                    match disk.status {
+                        dtfs_common::types::DiskStatus::Degraded => {
+                            warn!(
+                                "SMART warning: Disk {} on node {} ({}) is DEGRADED -- \
+                                 consider proactive replacement",
+                                disk.disk_id, node_id, disk.mount_path
+                            );
+                        }
+                        dtfs_common::types::DiskStatus::Failed => {
+                            warn!(
+                                "SMART alert: Disk {} on node {} ({}) has FAILED -- \
+                                 scheduling re-replication for chunks on this disk",
+                                disk.disk_id, node_id, disk.mount_path
+                            );
+                            out.push((*node_id, disk.disk_id, disk.mount_path.clone()));
+                        }
+                        _ => {}
                     }
-                    dtfs_common::types::DiskStatus::Failed => {
-                        warn!(
-                            "SMART alert: Disk {} on node {} ({}) has FAILED -- \
-                             data on this disk may be at risk",
-                            disk.disk_id, node_id, disk.mount_path
-                        );
-                    }
-                    _ => {}
                 }
             }
+            out
+        };
+
+        // For each failed disk, find chunks on it and schedule re-replication.
+        for (failed_node_id, failed_disk_id, _mount_path) in failed_disks {
+            self.handle_disk_failed(failed_node_id, failed_disk_id).await;
+        }
+    }
+
+    /// Schedule re-replication for all chunks that were on a disk that has
+    /// been reported as failed.
+    async fn handle_disk_failed(&self, node_id: u64, disk_id: u32) {
+        let sm = self.state_data.read().await;
+        let node_id_str = node_id.to_string();
+
+        let healthy_nodes: Vec<u64> = sm
+            .nodes
+            .iter()
+            .filter(|(id, info)| **id != node_id && info.health == HealthStatus::Healthy)
+            .map(|(id, _)| *id)
+            .collect();
+
+        if healthy_nodes.is_empty() {
+            warn!(
+                "No healthy nodes available for re-replication after disk {} on node {} failed",
+                disk_id, node_id
+            );
+            return;
+        }
+
+        let mut count = 0u64;
+
+        for (_path, file_meta) in &sm.files {
+            for chunk_loc in &file_meta.chunks {
+                // Only process chunks hosted on this specific failed disk.
+                if chunk_loc.node_id != node_id_str || chunk_loc.disk_id != disk_id {
+                    continue;
+                }
+
+                // Find an alternate healthy source replica for this chunk.
+                let alt_source = file_meta.chunks.iter().find(|c| {
+                    c.chunk_index == chunk_loc.chunk_index
+                        && c.node_id != node_id_str
+                });
+
+                let source_node: u64 = match alt_source {
+                    Some(s) => match s.node_id.parse() {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    },
+                    None => {
+                        warn!(
+                            "Chunk {} (disk {}, node {}) has no surviving replica!",
+                            chunk_loc.chunk_hash, disk_id, node_id
+                        );
+                        continue;
+                    }
+                };
+
+                let target = healthy_nodes[count as usize % healthy_nodes.len()];
+                let chunk_id = chunk_loc.chunk_hash.clone();
+
+                drop(sm);
+
+                self.scheduler
+                    .schedule_replication(&chunk_id, source_node, target, DiskTier::Hot)
+                    .await;
+
+                count += 1;
+                info!(
+                    "Scheduled re-replication for chunk {} (disk {} on node {} failed)",
+                    chunk_id, disk_id, node_id
+                );
+                // Re-acquire and break: handle one chunk per tick to avoid long lock-hold.
+                return;
+            }
+        }
+
+        if count == 0 {
+            debug!(
+                "No chunks found on failed disk {} of node {} requiring re-replication",
+                disk_id, node_id
+            );
         }
     }
 }

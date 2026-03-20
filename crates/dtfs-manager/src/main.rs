@@ -153,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(10),
         task_scheduler.clone(),
         sm_data.clone(),
+        raft.clone(),
     );
     let monitor_handle = tokio::spawn(async move {
         health_monitor.run().await;

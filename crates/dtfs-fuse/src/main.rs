@@ -1,8 +1,8 @@
-// DTFS FUSE Client Mount — Phase 2.
+// DTFS FUSE Client Mount — Phase 2 (Linux: fuse3 mount).
 //
 // Entry point for the FUSE client binary. Loads configuration, connects
 // to the DTFS cluster manager, initialises the filesystem abstraction
-// layer, and (on Linux) would mount via fuse3.
+// layer, and mounts via fuse3 (Linux) or exits gracefully on other platforms.
 
 use std::path::Path;
 
@@ -14,6 +14,7 @@ use dtfs_client::client::DtfsClient;
 use dtfs_common::config::{self, FuseConfig};
 
 mod filesystem;
+mod fuse_adapter;
 mod migration;
 mod readahead;
 mod writebuf;
@@ -81,9 +82,12 @@ async fn main() -> Result<()> {
 
     info!("connected to manager successfully");
 
+    // Save fields needed after fuse_config is moved into DtfsFilesystem.
+    let manager_addr_display = fuse_config.client.manager_addr.clone();
+
     // Initialise the filesystem abstraction.
     let client_location = fuse_config.location.clone();
-    let _fs = DtfsFilesystem::new(
+    let fs = DtfsFilesystem::new(
         client,
         client_location,
         fuse_config,
@@ -91,27 +95,56 @@ async fn main() -> Result<()> {
 
     info!(mountpoint, "filesystem initialised");
 
-    // FUSE3 mount is Linux-only. On other platforms we print a message
-    // and exit gracefully.
-    if cfg!(target_os = "linux") {
+    // FUSE3 mount is Linux-only.
+    #[cfg(target_os = "linux")]
+    {
+        use fuse3::MountOptions;
+        use fuse_adapter::DtfsFuse3Adapter;
+        #[allow(unused_imports)]
+        use libc;
+
+        let adapter = DtfsFuse3Adapter::new(fs);
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
+        let mut opts = MountOptions::default();
+        opts.uid(uid)
+            .gid(gid)
+            .read_only(false)
+            .allow_other(false)
+            .fs_name("dtfs");
+
         info!(
             mountpoint,
-            "FUSE3 mount support will be enabled on Linux builds"
+            uid,
+            gid,
+            manager = %manager_addr_display,
+            "mounting DTFS via fuse3"
         );
-        // TODO: Phase 2 Linux — call fuse3::Session::new() and mount.
-        // For now, wait for a signal to keep the process alive.
+
+        let handle = fuse3::raw::Session::<DtfsFuse3Adapter>::new(opts)
+            .mount(adapter, std::path::Path::new(&mountpoint))
+            .await
+            .context("fuse3 mount failed")?;
+
+        // Block until the filesystem is unmounted (e.g., via `fusermount -u`
+        // or process signal).
+        handle.await.context("fuse3 session error")?;
+
+        info!("DTFS unmounted from {}", mountpoint);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        info!(
+            "FUSE3 mount is Linux-only (running on {}). \
+             Filesystem abstraction is ready but FUSE mount is not available.",
+            std::env::consts::OS
+        );
         info!("waiting for shutdown signal (Ctrl+C)");
         tokio::signal::ctrl_c()
             .await
             .context("failed to listen for Ctrl+C")?;
-        info!("received shutdown signal, unmounting");
-    } else {
-        info!(
-            "FUSE3 mount is Linux-only. Running on {}, filesystem abstraction \
-             is ready but FUSE mount is not available. Use the gRPC client \
-             API or run on Linux for FUSE access.",
-            std::env::consts::OS
-        );
     }
 
     info!("DTFS FUSE client exiting");
