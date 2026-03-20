@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use dtfs_common::types::VolumeConfig;
+
 use crate::snapshot::{self, StateMachineSnapshot};
 use crate::{
     ChunkLocationEntry, ClientRequest, ClientResponse, TypeConfig,
@@ -94,6 +96,10 @@ pub struct StateMachineData {
     pub last_scrub: Option<ScrubRecord>,
     /// Number of registered FUSE clients (updated by client heartbeats).
     pub client_count: u64,
+
+    /// Volume configurations, keyed by volume_id string.
+    #[serde(default)]
+    pub volumes: BTreeMap<String, VolumeConfig>,
 }
 
 impl Default for StateMachineData {
@@ -107,6 +113,7 @@ impl Default for StateMachineData {
             audit_log: Vec::new(),
             last_scrub: None,
             client_count: 0,
+            volumes: BTreeMap::new(),
         }
     }
 }
@@ -176,6 +183,7 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
             audit_log: sm.audit_log.clone(),
             last_scrub: sm.last_scrub.clone(),
             client_count: sm.client_count,
+            volumes: sm.volumes.clone(),
         };
 
         let cursor = snapshot::serialize_snapshot(&snap)?;
@@ -280,6 +288,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             sm.audit_log = snap_data.audit_log;
             sm.last_scrub = snap_data.last_scrub;
             sm.client_count = snap_data.client_count;
+            sm.volumes = snap_data.volumes;
         }
 
         // Store the snapshot blob for later retrieval.
@@ -428,6 +437,19 @@ fn apply_request(
             };
             sm.audit_log
                 .push(audit(format!("UpdateConfig: v{version}")));
+            ClientResponse::Success
+        }
+
+        ClientRequest::UpsertVolume { config } => {
+            let vol_id = config.id.0.clone();
+            sm.audit_log.push(audit(format!("UpsertVolume: {vol_id}")));
+            sm.volumes.insert(vol_id, config.clone());
+            ClientResponse::Success
+        }
+
+        ClientRequest::DeleteVolume { volume_id } => {
+            sm.volumes.remove(volume_id);
+            sm.audit_log.push(audit(format!("DeleteVolume: {volume_id}")));
             ClientResponse::Success
         }
 

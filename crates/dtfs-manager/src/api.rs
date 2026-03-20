@@ -3,6 +3,7 @@
 //! Provides cluster management endpoints consumed by the WebUI, CLI,
 //! and external integrations.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::{
@@ -53,7 +54,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Files
         .route("/api/v1/files", get(list_files))
         // Volumes
-        .route("/api/v1/volumes", get(list_volumes))
+        .route("/api/v1/volumes", get(list_volumes).post(create_volume))
         // Audit
         .route("/api/v1/audit", get(get_audit_log))
         // Config
@@ -302,23 +303,50 @@ async fn list_files(State(state): State<Arc<AppState>>) -> Json<Value> {
 async fn list_volumes(State(state): State<Arc<AppState>>) -> Json<Value> {
     let sm = state.sm_data.read().await;
 
-    // Aggregate volumes from file metadata.
-    let mut volumes: std::collections::HashMap<String, (usize, u64)> =
+    // Aggregate file counts and sizes per volume from the files map.
+    let mut usage: std::collections::HashMap<String, (usize, u64)> =
         std::collections::HashMap::new();
     for meta in sm.files.values() {
-        let entry = volumes.entry(meta.volume_id.clone()).or_insert((0, 0));
-        entry.0 += 1; // file count
-        entry.1 += meta.chunks.iter().map(|c| c.size_bytes).sum::<u64>(); // total size
+        let entry = usage.entry(meta.volume_id.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += meta.chunks.iter().map(|c| c.size_bytes).sum::<u64>();
     }
 
-    let volume_list: Vec<Value> = volumes
+    // Merge with the volume configs stored in Raft state, falling back to
+    // usage-only entries for volumes that haven't been formally configured.
+    let mut volume_ids: std::collections::BTreeSet<String> =
+        sm.volumes.keys().cloned().collect();
+    volume_ids.extend(usage.keys().cloned());
+
+    let volume_list: Vec<Value> = volume_ids
         .iter()
-        .map(|(vid, (file_count, total_size))| {
-            json!({
-                "volume_id": vid,
-                "file_count": file_count,
-                "total_size": total_size,
-            })
+        .map(|vid| {
+            let (file_count, total_size) = usage.get(vid).copied().unwrap_or((0, 0));
+            if let Some(cfg) = sm.volumes.get(vid) {
+                json!({
+                    "volume_id": vid,
+                    "name": cfg.name,
+                    "chunk_size_bytes": cfg.chunk_size_bytes,
+                    "replication": {
+                        "hot": cfg.replication.hot,
+                        "warm": cfg.replication.warm,
+                        "cold": cfg.replication.cold,
+                        "tape": cfg.replication.tape,
+                    },
+                    "write_safety": {
+                        "min_replicas_before_ack": cfg.write_safety.min_replicas_before_ack,
+                        "write_timeout_secs": cfg.write_safety.write_timeout_secs,
+                    },
+                    "file_count": file_count,
+                    "total_size": total_size,
+                })
+            } else {
+                json!({
+                    "volume_id": vid,
+                    "file_count": file_count,
+                    "total_size": total_size,
+                })
+            }
         })
         .collect();
 
@@ -326,6 +354,54 @@ async fn list_volumes(State(state): State<Arc<AppState>>) -> Json<Value> {
         "count": volume_list.len(),
         "volumes": volume_list,
     }))
+}
+
+#[derive(Deserialize)]
+struct CreateVolumeRequest {
+    name: String,
+    #[serde(default)]
+    chunk_size_mb: Option<u32>,
+    #[serde(default)]
+    replication_hot: Option<u32>,
+    #[serde(default)]
+    replication_warm: Option<u32>,
+    #[serde(default)]
+    replication_cold: Option<u32>,
+}
+
+async fn create_volume(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateVolumeRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    use dtfs_common::types::{TierReplication, VolumeConfig, VolumeId, WriteSafety};
+
+    let vol_id = body.name.to_lowercase().replace(' ', "-");
+    let config = VolumeConfig {
+        id: VolumeId::new(vol_id.clone()),
+        name: body.name.clone(),
+        chunk_size_bytes: body.chunk_size_mb
+            .unwrap_or(state.config.defaults.chunk_size_mb) as u64
+            * 1024 * 1024,
+        replication: TierReplication {
+            hot:  body.replication_hot.unwrap_or(state.config.defaults.replication.hot),
+            warm: body.replication_warm.unwrap_or(state.config.defaults.replication.warm),
+            cold: body.replication_cold.unwrap_or(state.config.defaults.replication.cold),
+            tape: 1,
+        },
+        write_safety: WriteSafety {
+            min_replicas_before_ack: state.config.defaults.write_safety.min_replicas_before_ack,
+            write_timeout_secs:      state.config.defaults.write_safety.write_timeout_secs,
+        },
+    };
+
+    let req = ClientRequest::UpsertVolume { config };
+    state.raft.client_write(req).await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    state.audit_log.log("api", "volume.create", &vol_id, "success");
+    info!("Volume created: {}", vol_id);
+
+    Ok(Json(json!({ "volume_id": vol_id, "name": body.name, "status": "created" })))
 }
 
 // ---------------------------------------------------------------------------

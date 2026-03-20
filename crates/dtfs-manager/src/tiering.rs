@@ -190,7 +190,7 @@ impl TieringEngine {
 
             // Find a target node with the right tier.
             let target_node = self
-                .find_target_node(target_tier, profile.current_node)
+                .find_target_node(target_tier, profile.current_node, &profile.reads_by_dc)
                 .await;
 
             if let Some(target) = target_node {
@@ -232,9 +232,17 @@ impl TieringEngine {
 
     /// Find a target node that has disks of the specified tier,
     /// excluding the given source node.
-    async fn find_target_node(&self, target_tier: DiskTier, exclude_node: u64) -> Option<u64> {
+    async fn find_target_node(
+        &self,
+        target_tier: DiskTier,
+        exclude_node: u64,
+        reads_by_dc: &HashMap<String, u32>,
+    ) -> Option<u64> {
         let sm = self.state_data.read().await;
 
+        // Score each candidate node: prefer nodes in DCs where the chunk is
+        // actively being read (higher read count = higher score).  Among
+        // equal-score nodes, prefer the one with more free capacity.
         sm.nodes
             .iter()
             .filter(|(id, info)| {
@@ -242,9 +250,15 @@ impl TieringEngine {
                     && info.health == dtfs_common::types::HealthStatus::Healthy
                     && info.disks.iter().any(|d| d.tier == target_tier)
             })
-            .min_by_key(|(_, info)| {
-                // Prefer nodes with the most free capacity.
-                info.used_capacity
+            .max_by_key(|(_, info)| {
+                let dc_reads = reads_by_dc
+                    .get(&info.location.datacenter)
+                    .copied()
+                    .unwrap_or(0) as u64;
+                let free_capacity = info.total_capacity.saturating_sub(info.used_capacity);
+                // Primary sort key: DC read activity (scaled to outweigh capacity);
+                // secondary: free capacity.
+                (dc_reads * 1_000_000_000, free_capacity)
             })
             .map(|(id, _)| *id)
     }

@@ -9,6 +9,8 @@ use std::io::{self, Cursor, Read};
 
 use serde::{Deserialize, Serialize};
 
+use dtfs_common::types::VolumeConfig;
+
 use crate::state_machine::{AuditEntry, ClusterConfig, FileMetadata, ScrubRecord};
 use crate::NodeInfo;
 
@@ -35,6 +37,10 @@ pub struct StateMachineSnapshot {
     /// Number of registered FUSE clients (updated by client heartbeats).
     #[serde(default)]
     pub client_count: u64,
+
+    /// Volume configurations.
+    #[serde(default)]
+    pub volumes: BTreeMap<String, VolumeConfig>,
 }
 
 /// Serialize a `StateMachineSnapshot` into a `Cursor<Vec<u8>>`.
@@ -80,6 +86,7 @@ mod tests {
             audit_log: Vec::new(),
             last_scrub: None,
             client_count: 0,
+            volumes: BTreeMap::new(),
         };
 
         let cursor = serialize_snapshot(&snap).unwrap();

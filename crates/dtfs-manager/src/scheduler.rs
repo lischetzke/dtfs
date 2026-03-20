@@ -187,8 +187,23 @@ impl TaskScheduler {
                     .filter(|c| c.chunk_index == chunk_loc.chunk_index)
                     .count() as u32;
 
-                // Default replication factor is 3 for hot tier.
-                let desired_replicas = 3u32;
+                // Look up the per-volume replication factor, falling back to
+                // the cluster-wide default of 3 for the hot tier.
+                let chunk_tier = {
+                    // Try to determine the actual tier from the source node's
+                    // disk matching the stored disk_id.
+                    let source_node_id_for_tier: u64 =
+                        chunk_loc.node_id.parse().unwrap_or(0);
+                    sm.nodes
+                        .get(&source_node_id_for_tier)
+                        .and_then(|n| n.disks.get(chunk_loc.disk_id as usize))
+                        .map(|d| d.tier)
+                        .unwrap_or(DiskTier::Hot)
+                };
+                let desired_replicas = sm.volumes
+                    .get(&file_meta.volume_id)
+                    .map(|v| v.replication.for_tier(chunk_tier))
+                    .unwrap_or(3u32);
 
                 if replica_count < desired_replicas {
                     // Find the node this chunk is on.
@@ -209,7 +224,7 @@ impl TaskScheduler {
                         .filter_map(|c| c.node_id.parse().ok())
                         .collect();
 
-                    let tier = DiskTier::Hot; // Simplified: assume hot tier.
+                    let tier = chunk_tier;
 
                     if let Some((target, _)) = healthy_nodes
                         .iter()
