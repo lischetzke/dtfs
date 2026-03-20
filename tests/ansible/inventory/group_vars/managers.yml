@@ -1,0 +1,84 @@
+---
+# Raft consensus configuration
+dtfs_raft_listen_addr: "0.0.0.0"
+dtfs_raft_port: 7000
+dtfs_raft_election_timeout_min_ms: 150
+dtfs_raft_election_timeout_max_ms: 300
+dtfs_raft_heartbeat_interval_ms: 50
+dtfs_raft_snapshot_threshold: 10000
+dtfs_raft_snapshot_interval_s: 300
+dtfs_raft_log_max_entries: 50000
+dtfs_raft_data_dir: "{{ dtfs_data_dir }}/raft"
+
+# gRPC inter-manager communication
+dtfs_grpc_listen_addr: "0.0.0.0"
+dtfs_grpc_port: 7001
+dtfs_grpc_max_message_size_mb: 64
+dtfs_grpc_keepalive_time_s: 30
+dtfs_grpc_keepalive_timeout_s: 10
+dtfs_grpc_max_concurrent_streams: 1000
+
+# HTTP API
+dtfs_api_listen_addr: "0.0.0.0"
+dtfs_api_port: 8080
+dtfs_api_read_timeout_s: 30
+dtfs_api_write_timeout_s: 60
+dtfs_api_max_body_size_mb: 16
+
+# Replication policy defaults
+dtfs_replication_hot_factor: 3
+dtfs_replication_cold_factor: 1
+dtfs_replication_min_ack: 2
+dtfs_replication_placement: spread_racks
+dtfs_replication_cross_dc: false
+
+# Tiering configuration
+dtfs_tiering_enabled: true
+dtfs_tiering_hot_threshold_accesses: 10
+dtfs_tiering_hot_window_hours: 24
+dtfs_tiering_cold_after_hours: 72
+dtfs_tiering_evaluation_interval_s: 300
+dtfs_tiering_migration_bandwidth_mb: 100
+
+# Chunk management
+dtfs_chunk_size_mb: 128
+dtfs_chunk_checksum_algorithm: xxh3
+dtfs_chunk_placement_strategy: spread
+
+# Node health monitoring
+dtfs_health_check_interval_s: 5
+dtfs_health_check_timeout_s: 3
+dtfs_node_dead_after_s: 30
+dtfs_node_suspect_after_s: 10
+dtfs_replication_trigger_delay_s: 15
+
+# Metadata store
+dtfs_metadata_dir: "{{ dtfs_data_dir }}/metadata"
+dtfs_metadata_sync_interval_s: 1
+dtfs_metadata_checkpoint_interval_s: 60
+
+# Leader lease
+dtfs_leader_lease_duration_ms: 500
+dtfs_leader_renew_deadline_ms: 400
+
+# Audit log
+dtfs_audit_enabled: true
+dtfs_audit_dir: "{{ dtfs_log_dir }}/audit"
+dtfs_audit_rotation_size_mb: 100
+dtfs_audit_retention_days: 30
+
+# Scrub scheduler (run by managers)
+dtfs_scrub_quick_interval_hours: 24
+dtfs_scrub_deep_interval_hours: 168
+dtfs_scrub_concurrency: 4
+dtfs_scrub_bandwidth_limit_mb: 200
+
+# Prometheus metrics
+dtfs_manager_metrics_path: /metrics
+dtfs_manager_metrics_port: "{{ dtfs_metrics_port }}"
+
+# WebUI
+dtfs_webui_enabled: true
+dtfs_webui_path: /ui
+dtfs_webui_listen_addr: "0.0.0.0"
+dtfs_webui_port: 8080

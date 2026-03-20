@@ -1,0 +1,294 @@
+---
+# Rolling binary update playbook
+# Usage: ansible-playbook playbooks/deploy.yml
+# Options:
+#   -e "dtfs_version=0.2.0"      override version
+#   -e "rolling=false"            update all at once (faster, causes downtime)
+#   -e "update_managers=false"   skip manager updates
+#   -e "update_data=false"       skip data node updates
+#   -e "update_clients=false"    skip client updates
+
+- name: Validate new binaries exist locally
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Check dtfs-manager binary exists
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../../target/release/dtfs-manager"
+      register: manager_bin
+      when: update_managers | default(true) | bool
+
+    - name: Check dtfs-data binary exists
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../../target/release/dtfs-data"
+      register: data_bin
+      when: update_data | default(true) | bool
+
+    - name: Check dtfs-fuse binary exists
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../../target/release/dtfs-fuse"
+      register: fuse_bin
+      when: update_clients | default(true) | bool
+
+    - name: Check dtfs-cli binary exists
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../../target/release/dtfs-cli"
+      register: cli_bin
+
+    - name: Fail if required binaries are missing
+      ansible.builtin.fail:
+        msg: "Binary {{ item.item }} not found at expected path"
+      when:
+        - item.stat is defined
+        - not item.stat.exists
+      loop:
+        - "{{ manager_bin | default({}) }}"
+        - "{{ data_bin | default({}) }}"
+        - "{{ fuse_bin | default({}) }}"
+        - "{{ cli_bin | default({}) }}"
+      loop_control:
+        label: "{{ item.stat.path | default('N/A') }}"
+
+- name: Rolling update of FUSE clients (unmount, update, remount)
+  hosts: clients
+  gather_facts: false
+  serial: 1
+  when: update_clients | default(true) | bool
+  tasks:
+    - name: Stop FUSE client service
+      ansible.builtin.systemd:
+        name: "dtfs-fuse@{{ dtfs_volume }}.service"
+        state: stopped
+
+    - name: Force unmount if still mounted
+      ansible.builtin.command: "fusermount3 -uz {{ dtfs_mount_point }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Update dtfs-fuse binary
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../../target/release/dtfs-fuse"
+        dest: "{{ dtfs_fuse_bin }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Update dtfs-cli binary
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../../target/release/dtfs-cli"
+        dest: "{{ dtfs_cli_bin }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start FUSE client service
+      ansible.builtin.systemd:
+        name: "dtfs-fuse@{{ dtfs_volume }}.service"
+        state: started
+
+    - name: Wait for mount to be available
+      ansible.builtin.command: mountpoint -q "{{ dtfs_mount_point }}"
+      register: mount_check
+      retries: 15
+      delay: 2
+      until: mount_check.rc == 0
+      changed_when: false
+
+- name: Rolling update of data nodes
+  hosts: data_nodes
+  gather_facts: false
+  serial: 1
+  when: update_data | default(true) | bool
+  tasks:
+    - name: Set data node to maintenance mode via manager API
+      ansible.builtin.uri:
+        url: "{{ dtfs_manager_api_url }}/api/v1/nodes/{{ dtfs_node_id }}/maintenance"
+        method: PUT
+        body_format: json
+        body: '{"enabled": true, "reason": "binary update"}'
+        status_code: 200
+        timeout: 10
+      delegate_to: localhost
+      become: false
+
+    - name: Wait for in-flight operations to drain (15s)
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: Stop dtfs-data service
+      ansible.builtin.systemd:
+        name: dtfs-data
+        state: stopped
+
+    - name: Update dtfs-data binary
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../../target/release/dtfs-data"
+        dest: "{{ dtfs_data_bin }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start dtfs-data service
+      ansible.builtin.systemd:
+        name: dtfs-data
+        state: started
+
+    - name: Wait for data node to be healthy
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_data_health_check_port }}/health"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: data_health
+      retries: 20
+      delay: 3
+      until: data_health.status == 200
+
+    - name: Remove maintenance mode
+      ansible.builtin.uri:
+        url: "{{ dtfs_manager_api_url }}/api/v1/nodes/{{ dtfs_node_id }}/maintenance"
+        method: PUT
+        body_format: json
+        body: '{"enabled": false}'
+        status_code: 200
+        timeout: 10
+      delegate_to: localhost
+      become: false
+
+- name: Rolling update of managers (non-leaders first)
+  hosts: managers
+  gather_facts: false
+  serial: 1
+  when: update_managers | default(true) | bool
+  tasks:
+    - name: Get current leader from API
+      ansible.builtin.uri:
+        url: "{{ dtfs_manager_api_url }}/api/v1/cluster/status"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: cluster_status
+      delegate_to: localhost
+      become: false
+
+    - name: Skip update if this is the leader (will be done last)
+      ansible.builtin.meta: end_host
+      when: cluster_status.json.raft.leader_id | string == dtfs_node_id | string
+
+    - name: Stop dtfs-manager service
+      ansible.builtin.systemd:
+        name: dtfs-manager
+        state: stopped
+
+    - name: Update dtfs-manager binary
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../../target/release/dtfs-manager"
+        dest: "{{ dtfs_manager_bin }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Update dtfs-cli binary
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../../target/release/dtfs-cli"
+        dest: "{{ dtfs_cli_bin }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start dtfs-manager service
+      ansible.builtin.systemd:
+        name: dtfs-manager
+        state: started
+
+    - name: Wait for manager to rejoin cluster
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/health"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: mgr_health
+      retries: 30
+      delay: 2
+      until: mgr_health.status == 200
+
+- name: Update leader manager last (triggers leader re-election)
+  hosts: managers
+  gather_facts: false
+  serial: 1
+  when: update_managers | default(true) | bool
+  tasks:
+    - name: Get current leader
+      ansible.builtin.uri:
+        url: "{{ dtfs_manager_api_url }}/api/v1/cluster/status"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: cluster_status
+      delegate_to: localhost
+      become: false
+
+    - name: Only proceed if this is the current leader
+      ansible.builtin.meta: end_host
+      when: cluster_status.json.raft.leader_id | string != dtfs_node_id | string
+
+    - name: Stop leader dtfs-manager (triggers election)
+      ansible.builtin.systemd:
+        name: dtfs-manager
+        state: stopped
+
+    - name: Wait for new leader to be elected (30s max)
+      ansible.builtin.uri:
+        url: "{{ dtfs_manager_api_url }}/api/v1/cluster/status"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: new_leader_status
+      retries: 15
+      delay: 2
+      until:
+        - new_leader_status.status == 200
+        - new_leader_status.json.raft.leader_id is defined
+        - new_leader_status.json.raft.leader_id | string != dtfs_node_id | string
+      delegate_to: localhost
+      become: false
+
+    - name: Update former leader binary
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../../target/release/dtfs-manager"
+        dest: "{{ dtfs_manager_bin }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start former leader (rejoins as follower)
+      ansible.builtin.systemd:
+        name: dtfs-manager
+        state: started
+
+    - name: Wait for former leader to rejoin
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/health"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: rejoin_health
+      retries: 30
+      delay: 2
+      until: rejoin_health.status == 200

@@ -1,0 +1,206 @@
+---
+# Full DTFS environment setup playbook
+# Usage: ansible-playbook playbooks/setup.yml
+# Optional: -e "skip_bootstrap=true" to skip cluster init if already initialized
+
+- name: Apply base configuration to all nodes
+  hosts: dtfs_all
+  gather_facts: true
+  roles:
+    - role: dtfs-common
+  tags: [common, base]
+
+- name: Deploy and start DTFS managers
+  hosts: managers
+  gather_facts: true
+  serial: 1
+  roles:
+    - role: dtfs-manager
+  tags: [managers]
+
+- name: Bootstrap cluster on first manager (mgr-01)
+  hosts: mgr-01
+  gather_facts: false
+  vars:
+    bootstrap_done: false
+  tasks:
+    - name: Check if cluster is already initialized
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/cluster/status"
+        method: GET
+        status_code: [200, 503]
+        timeout: 5
+      register: cluster_status_check
+      ignore_errors: true
+
+    - name: Initialize cluster on bootstrap node (mgr-01)
+      ansible.builtin.command: >
+        {{ dtfs_manager_bin }} init-cluster
+        --node-id {{ dtfs_node_id }}
+        --cluster-name {{ dtfs_cluster_name }}
+        --config {{ dtfs_config_dir }}/manager.toml
+      when:
+        - not (skip_bootstrap | default(false) | bool)
+        - cluster_status_check.status | default(503) == 503 or
+          (cluster_status_check.json.initialized | default(false)) == false
+      register: cluster_init
+      changed_when: cluster_init.rc == 0
+
+    - name: Wait for bootstrap manager to be ready
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/health"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: mgr_health
+      retries: 30
+      delay: 2
+      until: mgr_health.status == 200
+  tags: [bootstrap]
+
+- name: Join remaining managers to cluster
+  hosts: managers:!mgr-01
+  gather_facts: false
+  serial: 1
+  tasks:
+    - name: Wait for mgr-01 to be healthy before joining
+      ansible.builtin.uri:
+        url: "http://{{ hostvars['mgr-01']['ansible_host'] }}:{{ dtfs_api_port }}/api/v1/health"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: bootstrap_health
+      retries: 30
+      delay: 2
+      until: bootstrap_health.status == 200
+      delegate_to: localhost
+      become: false
+
+    - name: Join manager to cluster via mgr-01
+      ansible.builtin.command: >
+        {{ dtfs_manager_bin }} join-cluster
+        --join-addr {{ hostvars['mgr-01']['ansible_host'] }}:{{ dtfs_grpc_port }}
+        --node-id {{ dtfs_node_id }}
+        --config {{ dtfs_config_dir }}/manager.toml
+      when: not (skip_bootstrap | default(false) | bool)
+      register: join_result
+      changed_when: join_result.rc == 0
+      failed_when:
+        - join_result.rc != 0
+        - "'already a member' not in join_result.stderr"
+
+    - name: Restart manager service after join
+      ansible.builtin.systemd:
+        name: dtfs-manager
+        state: restarted
+      when: join_result is changed
+
+    - name: Wait for this manager to become healthy
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/health"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: this_mgr_health
+      retries: 30
+      delay: 2
+      until: this_mgr_health.status == 200
+  tags: [bootstrap, join]
+
+- name: Verify manager cluster quorum
+  hosts: mgr-01
+  gather_facts: false
+  tasks:
+    - name: Check cluster has quorum (all 3 managers)
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/cluster/status"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: cluster_status
+      retries: 15
+      delay: 3
+      until:
+        - cluster_status.status == 200
+        - cluster_status.json.raft.leader_id is defined
+        - cluster_status.json.raft.members | length == 3
+
+    - name: Display cluster status
+      ansible.builtin.debug:
+        msg:
+          - "Leader: {{ cluster_status.json.raft.leader_id }}"
+          - "Members: {{ cluster_status.json.raft.members | map(attribute='id') | list }}"
+          - "Commit index: {{ cluster_status.json.raft.commit_index }}"
+  tags: [verify, quorum]
+
+- name: Deploy and start DTFS data nodes
+  hosts: data_nodes
+  gather_facts: true
+  roles:
+    - role: dtfs-data
+  tags: [data_nodes]
+
+- name: Wait for all data nodes to register with manager
+  hosts: mgr-01
+  gather_facts: false
+  tasks:
+    - name: Poll until all 4 data nodes are registered
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/nodes"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: nodes_status
+      retries: 30
+      delay: 3
+      until:
+        - nodes_status.status == 200
+        - (nodes_status.json | selectattr('status', 'equalto', 'healthy') | list | length) >= 4
+
+    - name: Show registered data nodes
+      ansible.builtin.debug:
+        msg: "Healthy data nodes: {{ nodes_status.json | selectattr('status', 'equalto', 'healthy') | map(attribute='name') | list }}"
+  tags: [verify, data_nodes]
+
+- name: Deploy DTFS FUSE clients
+  hosts: clients
+  gather_facts: true
+  roles:
+    - role: dtfs-client
+  tags: [clients]
+
+- name: Final cluster health verification
+  hosts: mgr-01
+  gather_facts: false
+  tasks:
+    - name: Wait for cluster to reach fully healthy state
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/health"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: final_health
+      retries: 30
+      delay: 3
+      until:
+        - final_health.status == 200
+        - final_health.json.status == 'healthy'
+
+    - name: Get full cluster status
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/cluster/status"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: full_status
+
+    - name: Display final cluster status
+      ansible.builtin.debug:
+        msg:
+          - "=== DTFS Cluster Setup Complete ==="
+          - "Status: {{ full_status.json.status }}"
+          - "Leader: {{ full_status.json.raft.leader_id }}"
+          - "Managers: {{ full_status.json.raft.members | length }}"
+          - "Data nodes: {{ full_status.json.data_nodes | default([]) | length }}"
+          - "Volumes: {{ full_status.json.volumes | default([]) | map(attribute='name') | list }}"
+  tags: [verify, final]

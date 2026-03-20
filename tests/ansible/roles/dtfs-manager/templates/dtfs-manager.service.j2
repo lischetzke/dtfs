@@ -1,0 +1,50 @@
+[Unit]
+Description=DTFS Manager Node ({{ inventory_hostname }})
+Documentation=https://github.com/dtfs/dtfs
+After=network-online.target chrony.service
+Wants=network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+User={{ dtfs_user }}
+Group={{ dtfs_group }}
+ExecStart={{ dtfs_manager_bin }} --config {{ dtfs_config_dir }}/manager.toml
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -SIGTERM $MAINPID
+TimeoutStartSec=90
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5s
+RestartPreventExitStatus=1
+KillMode=process
+KillSignal=SIGTERM
+SendSIGKILL=yes
+
+# Resource limits
+LimitNOFILE=1048576
+LimitNPROC=65536
+LimitMEMLOCK=infinity
+LimitCORE=infinity
+
+# Security hardening
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths={{ dtfs_data_dir }} {{ dtfs_log_dir }} {{ dtfs_run_dir }} {{ dtfs_config_dir }}
+NoNewPrivileges=true
+
+# Environment
+Environment="DTFS_CONFIG={{ dtfs_config_dir }}/manager.toml"
+Environment="RUST_LOG={{ dtfs_log_level }}"
+Environment="RUST_BACKTRACE=1"
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dtfs-manager
+
+# Watchdog (2 * health check interval)
+WatchdogSec={{ (dtfs_health_check_interval_s | int * 2) }}s
+
+[Install]
+WantedBy=multi-user.target

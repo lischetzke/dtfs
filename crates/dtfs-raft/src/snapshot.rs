@@ -9,7 +9,7 @@ use std::io::{self, Cursor, Read};
 
 use serde::{Deserialize, Serialize};
 
-use crate::state_machine::{AuditEntry, ClusterConfig, FileMetadata};
+use crate::state_machine::{AuditEntry, ClusterConfig, FileMetadata, ScrubRecord};
 use crate::NodeInfo;
 
 /// The complete serializable snapshot of the cluster state machine.
@@ -27,6 +27,14 @@ pub struct StateMachineSnapshot {
     pub nodes: BTreeMap<u64, NodeInfo>,
     pub cluster_config: ClusterConfig,
     pub audit_log: Vec<AuditEntry>,
+
+    // ---- observability state ----
+    /// Most recent completed scrub result reported by any data node.
+    #[serde(default)]
+    pub last_scrub: Option<ScrubRecord>,
+    /// Number of registered FUSE clients (updated by client heartbeats).
+    #[serde(default)]
+    pub client_count: u64,
 }
 
 /// Serialize a `StateMachineSnapshot` into a `Cursor<Vec<u8>>`.
@@ -70,6 +78,8 @@ mod tests {
             nodes: BTreeMap::new(),
             cluster_config: ClusterConfig::default(),
             audit_log: Vec::new(),
+            last_scrub: None,
+            client_count: 0,
         };
 
         let cursor = serialize_snapshot(&snap).unwrap();

@@ -1,0 +1,125 @@
+---
+# dtfs-data role: install and configure DTFS data node service
+
+- name: Copy dtfs-data binary
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../../target/release/dtfs-data"
+    dest: "{{ dtfs_data_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart dtfs-data
+
+- name: Create data node directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ dtfs_user }}"
+    group: "{{ dtfs_group }}"
+    mode: "0750"
+  loop:
+    - "{{ dtfs_data_dir }}/data"
+    - "{{ dtfs_log_dir }}/data"
+
+- name: Check which disk paths exist and need formatting
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+  register: disk_stat
+  loop: "{{ dtfs_disks | default([]) }}"
+
+- name: Ensure disk mount points exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ dtfs_user }}"
+    group: "{{ dtfs_group }}"
+    mode: "0750"
+  loop: "{{ dtfs_disks | default([]) }}"
+
+- name: Check if disk paths have XFS filesystem
+  ansible.builtin.command: "xfs_info {{ item.path }}"
+  register: xfs_check
+  loop: "{{ dtfs_disks | default([]) }}"
+  changed_when: false
+  failed_when: false
+
+- name: Format block devices as XFS if configured (dry-run safe — only runs if device exists and not mounted)
+  ansible.builtin.command: >
+    mkfs.xfs {{ dtfs_disk_xfs_options }} {{ item.item.device }}
+  when:
+    - item.rc != 0
+    - dtfs_disk_format_if_empty | bool
+    - item.item.device is defined
+  loop: "{{ xfs_check.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  notify: restart dtfs-data
+
+- name: Set correct ownership on disk paths
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: "{{ dtfs_user }}"
+    group: "{{ dtfs_group }}"
+    recurse: false
+  loop: "{{ dtfs_disks | default([]) }}"
+
+- name: Deploy data node configuration
+  ansible.builtin.template:
+    src: data.toml.j2
+    dest: "{{ dtfs_config_dir }}/data.toml"
+    owner: "{{ dtfs_user }}"
+    group: "{{ dtfs_group }}"
+    mode: "0640"
+    validate: "{{ dtfs_data_bin }} --config %s --validate"
+  notify: restart dtfs-data
+
+- name: Deploy dtfs-data systemd unit
+  ansible.builtin.template:
+    src: dtfs-data.service.j2
+    dest: /etc/systemd/system/dtfs-data.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart dtfs-data
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable dtfs-data service
+  ansible.builtin.systemd:
+    name: dtfs-data
+    enabled: true
+
+- name: Start dtfs-data service
+  ansible.builtin.systemd:
+    name: dtfs-data
+    state: started
+
+- name: Wait for data node health endpoint
+  ansible.builtin.uri:
+    url: "http://{{ ansible_host }}:{{ dtfs_data_health_check_port }}/health"
+    method: GET
+    status_code: 200
+    timeout: 5
+  register: data_health
+  retries: 20
+  delay: 3
+  until: data_health.status == 200
+
+- name: Verify data node registered with manager
+  ansible.builtin.uri:
+    url: "{{ dtfs_manager_api_url }}/api/v1/nodes"
+    method: GET
+    status_code: 200
+    timeout: 10
+  register: nodes_response
+  retries: 10
+  delay: 3
+  until: >
+    nodes_response.status == 200 and
+    (nodes_response.json | selectattr('hostname', 'equalto', inventory_hostname) | list | length > 0)
+  delegate_to: localhost
+  become: false

@@ -1,0 +1,84 @@
+---
+# dtfs-manager role: install and configure DTFS manager service
+
+- name: Copy dtfs-manager binary
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../../target/release/dtfs-manager"
+    dest: "{{ dtfs_manager_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart dtfs-manager
+
+- name: Copy dtfs-cli binary
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../../target/release/dtfs-cli"
+    dest: "{{ dtfs_cli_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create manager-specific directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ dtfs_user }}"
+    group: "{{ dtfs_group }}"
+    mode: "0750"
+  loop:
+    - "{{ dtfs_raft_data_dir }}"
+    - "{{ dtfs_metadata_dir }}"
+    - "{{ dtfs_audit_dir }}"
+    - "{{ dtfs_log_dir }}/manager"
+
+- name: Deploy manager configuration
+  ansible.builtin.template:
+    src: manager.toml.j2
+    dest: "{{ dtfs_config_dir }}/manager.toml"
+    owner: "{{ dtfs_user }}"
+    group: "{{ dtfs_group }}"
+    mode: "0640"
+    validate: "{{ dtfs_manager_bin }} --config %s --validate"
+  notify: restart dtfs-manager
+
+- name: Deploy dtfs-manager systemd unit
+  ansible.builtin.template:
+    src: dtfs-manager.service.j2
+    dest: /etc/systemd/system/dtfs-manager.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart dtfs-manager
+
+- name: Reload systemd to pick up new unit file
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable dtfs-manager service
+  ansible.builtin.systemd:
+    name: dtfs-manager
+    enabled: true
+
+- name: Start dtfs-manager service
+  ansible.builtin.systemd:
+    name: dtfs-manager
+    state: started
+
+- name: Wait for manager API to be reachable
+  ansible.builtin.uri:
+    url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/health"
+    method: GET
+    status_code: 200
+    timeout: 5
+  register: manager_health
+  retries: 30
+  delay: 2
+  until: manager_health.status == 200
+
+- name: Verify manager is reporting healthy
+  ansible.builtin.assert:
+    that:
+      - manager_health.status == 200
+    msg: "Manager on {{ inventory_hostname }} did not become healthy within timeout"

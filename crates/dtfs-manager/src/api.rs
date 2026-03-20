@@ -60,6 +60,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/config", get(get_config).post(update_config))
         // Scrub
         .route("/api/v1/scrub", post(trigger_scrub))
+        // Stats (aggregate cluster metrics for WebUI home page)
+        .route("/api/v1/stats", get(get_stats))
         .with_state(state);
 
     // Merge API routes (higher priority) with WebUI (fallback).
@@ -433,6 +435,102 @@ async fn update_config(
         "version": version,
         "status": "applied",
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate stats endpoint (consumed by WebUI home page)
+// ---------------------------------------------------------------------------
+
+async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
+    use dtfs_common::types::{HealthStatus, NodeRole};
+
+    let sm = state.sm_data.read().await;
+
+    // Count nodes by role.
+    let manager_count = sm
+        .nodes
+        .values()
+        .filter(|n| n.role == NodeRole::Manager)
+        .count();
+    let data_node_count = sm
+        .nodes
+        .values()
+        .filter(|n| n.role == NodeRole::Data)
+        .count();
+    let disk_count: usize = sm.nodes.values().map(|n| n.disks.len()).sum();
+
+    // Capacity aggregates.
+    let raw_total: u64 = sm.nodes.values().map(|n| n.total_capacity).sum();
+    let raw_used: u64 = sm.nodes.values().map(|n| n.used_capacity).sum();
+
+    // Net usable = raw_total / hot_replication_factor (conservative estimate).
+    let hot_rf = state.config.defaults.replication.hot.max(1) as u64;
+    let net_usable = raw_total / hot_rf;
+    let net_used = raw_used / hot_rf;
+
+    // Overall cluster health.
+    let total_nodes = sm.nodes.len();
+    let healthy_nodes = sm
+        .nodes
+        .values()
+        .filter(|n| n.health == HealthStatus::Healthy)
+        .count();
+    let degraded_nodes = sm
+        .nodes
+        .values()
+        .filter(|n| {
+            matches!(
+                n.health,
+                HealthStatus::Suspect | HealthStatus::Degraded
+            )
+        })
+        .count();
+    let health = if total_nodes == 0 {
+        "unknown"
+    } else if degraded_nodes > 0 || healthy_nodes < total_nodes {
+        if healthy_nodes == 0 {
+            "critical"
+        } else {
+            "degraded"
+        }
+    } else {
+        "healthy"
+    };
+
+    // Last scrub result (if any).
+    let last_scrub = sm.last_scrub.as_ref().map(|s| {
+        json!({
+            "node_id":         s.node_id,
+            "disk_path":       s.disk_path,
+            "level":           s.level,
+            "completed_at_ms": s.completed_at_ms,
+            "chunks_checked":  s.chunks_checked,
+            "chunks_healthy":  s.chunks_healthy,
+            "chunks_corrupt":  s.chunks_corrupt,
+            "chunks_missing":  s.chunks_missing,
+            "duration_secs":   s.duration_secs,
+        })
+    });
+
+    Json(json!({
+        "health":                health,
+        "healthy_nodes":         healthy_nodes,
+        "total_nodes":           total_nodes,
+        "manager_count":         manager_count,
+        "data_node_count":       data_node_count,
+        "disk_count":            disk_count,
+        "client_count":          sm.client_count,
+        "file_count":            sm.files.len(),
+        "raw_total_bytes":       raw_total,
+        "raw_used_bytes":        raw_used,
+        "net_usable_bytes":      net_usable,
+        "net_used_bytes":        net_used,
+        // I/O stats are aggregated from data node heartbeats in a future phase.
+        "io_read_bytes_per_sec":  0u64,
+        "io_write_bytes_per_sec": 0u64,
+        "last_scrub":            last_scrub,
+        "config_version":        sm.cluster_config.version,
+    }))
 }
 
 // ---------------------------------------------------------------------------
