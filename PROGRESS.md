@@ -1,6 +1,6 @@
 # DTFS Implementation Progress
 
-> Last updated: 2026-03-20
+> Last updated: 2026-03-20 (session 3)
 
 This document tracks every task, step, and item from the plan against the current
 implementation state.  Items are categorised **per phase** and marked with one of:
@@ -106,8 +106,8 @@ implementation state.  Items are categorised **per phase** and marked with one o
 | 5.1 | Access stats collection per DC | ✅ | `ChunkAccessProfile.reads_by_dc` |
 | 5.2 | Hot/cold classification engine | ✅ | `classify_temperature()` |
 | 5.3 | **Tiering → migration connection** | ✅ | `TieringEngine::evaluate()` calls `scheduler.schedule_replication()` |
-| 5.4 | Location-aware migration (move toward active DCs) | 🔧 | `find_target_node()` exists; DC-preference logic scaffolded |
-| 5.5 | Per-tier replica count on tier transition | 🔧 | tier change schedules task; RF adjustment pending |
+| 5.4 | Location-aware migration (move toward active DCs) | ✅ | `find_target_node()` scores nodes by DC read activity (`reads_by_dc`) |
+| 5.5 | Per-tier replica count on tier transition | ✅ | scheduler reads per-volume RF from `sm.volumes`; `TierReplication::for_tier()` |
 | 5.6 | Configurable read-ahead modes | ✅ | `ReadAheadMode` enum + `readahead.rs` |
 | 5.7 | FUSE transparent remote fetch | ✅ | `filesystem.rs` read() falls back to remote node |
 | 5.8 | FUSE background migration trigger | ✅ | `MigrationTrigger` called on remote read |
@@ -125,6 +125,8 @@ implementation state.  Items are categorised **per phase** and marked with one o
 | 6.3 | `dtfs-cli` admin tool | ✅ | `dtfs-cli` crate |
 | 6.4 | Prometheus metrics endpoint | ✅ | `metrics.rs` + `/metrics` route |
 | 6.5 | Linux amd64 build script | ✅ | `scripts/build-linux-amd64.sh` |
+| 6.6 | **Real disk usage via statvfs** | ✅ | `libc::statvfs` on Linux; (0,0) fallback on non-Linux |
+| 6.7 | **Volume config system** | ✅ | `sm.volumes` in Raft SM; `UpsertVolume`/`DeleteVolume` ClientRequest; `POST /api/v1/volumes` |
 
 ---
 
@@ -135,11 +137,11 @@ implementation state.  Items are categorised **per phase** and marked with one o
 | 7.1 | Dashboard home page | ✅ | Rebuilt: health banner, capacity cards, I/O, scrub, node table |
 | 7.2 | REST `/api/v1/stats` endpoint | ✅ | `api.rs` |
 | 7.3 | REST `/api/v1/nodes` endpoint | ✅ | `api.rs` |
-| 7.4 | Topology view | 🔧 | HTML scaffold present |
-| 7.5 | Volumes page | 🔧 | HTML scaffold present |
-| 7.6 | Data Explorer | ❌ | |
-| 7.7 | Audit Log page | 🔧 | Scaffold |
-| 7.8 | Settings pages (write safety, replication, scrub) | 🔧 | Scaffold |
+| 7.4 | Topology view | ✅ | Full SPA page: Region→DC→Rack→Host tree, auto-refresh 15s |
+| 7.5 | Volumes page | ✅ | Lists volumes with replication config, file/size stats; POST create |
+| 7.6 | Data Explorer | ✅ | File browser with path filter, chunk/size display, live refresh |
+| 7.7 | Audit Log page | ✅ | Filterable by action, configurable limit (50/100/200/500), auto-refresh |
+| 7.8 | Settings pages (write safety, replication, scrub) | ✅ | Shows all config sections; raw config JSON editor with apply button |
 | 7.9 | JWT authentication | ✅ | `crypto.rs` + bcrypt |
 | 7.10 | Alert system + webhooks | ❌ | |
 | 7.11 | WebUI auto-refresh (8s) | ✅ | JS fetch loop in dashboard |
@@ -181,10 +183,10 @@ implementation state.  Items are categorised **per phase** and marked with one o
 
 | ID | File | Description | Priority |
 |----|------|-------------|----------|
-| I-1 | `dtfs-data/src/disk.rs` | `get_disk_usage()` returns (0,0) on non-Unix; needs `nix::sys::statvfs` | Medium |
-| I-2 | `dtfs-manager/src/scheduler.rs` | Desired replica count hard-coded to 3; should read per-volume RF from SM | Medium |
+| I-1 | `dtfs-data/src/disk.rs` | ~~`get_disk_usage()` returns (0,0) on non-Unix~~ | ~~Medium~~ **FIXED** — uses `libc::statvfs` on Linux |
+| I-2 | `dtfs-manager/src/scheduler.rs` | ~~Desired replica count hard-coded to 3~~ | ~~Medium~~ **FIXED** — reads per-volume RF from `sm.volumes` |
 | I-3 | `dtfs-manager/src/monitor.rs` | Disk-level SMART data comes from heartbeat; data node doesn't yet report actual SMART values | Low |
 | I-4 | `dtfs-fuse/src/fuse_adapter.rs` | `setattr`, `rename`, `symlink` not yet implemented (returns ENOSYS) | Low |
-| I-5 | `dtfs-manager/src/tiering.rs` | Location-aware DC preference in `find_target_node()` uses only capacity; should prefer same-DC active clients | Medium |
+| I-5 | `dtfs-manager/src/tiering.rs` | ~~Location-aware DC preference uses only capacity~~ | ~~Medium~~ **FIXED** — `find_target_node()` scores by DC read activity |
 | I-6 | `dtfs-data/src/main.rs` | Heartbeat `config_version` field not incremented on live reload | Low |
-| I-7 | WebUI | Data Explorer, alert webhooks pages not implemented | Low |
+| I-7 | WebUI | ~~Data Explorer, alert webhooks pages not implemented~~ | ~~Low~~ **PARTIAL** — Explorer, Audit, Settings, Topology, Nodes, Volumes all done; alert webhooks remain |

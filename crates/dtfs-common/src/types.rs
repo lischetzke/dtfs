@@ -183,7 +183,7 @@ pub struct NodeInfo {
 /// - `cold` — 1 copy on cold HDDs (cost-optimised; tape backup adds durability)
 /// - `tape` — 1 copy; tape cartridges provide inherent sequential redundancy
 ///            and tape libraries typically use multiple drives for availability
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TierReplication {
     pub hot: u32,
     pub warm: u32,
@@ -197,6 +197,16 @@ pub struct TierReplication {
 
 impl TierReplication {
     fn default_tape() -> u32 { 1 }
+
+    /// Return the replication factor for the given tier.
+    pub fn for_tier(&self, tier: DiskTier) -> u32 {
+        match tier {
+            DiskTier::Hot  => self.hot,
+            DiskTier::Warm => self.warm,
+            DiskTier::Cold => self.cold,
+            DiskTier::Tape => self.tape,
+        }
+    }
 }
 
 impl Default for TierReplication {
@@ -211,7 +221,7 @@ impl Default for TierReplication {
 }
 
 /// Write safety configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WriteSafety {
     pub min_replicas_before_ack: u32,
     pub write_timeout_secs: u32,
@@ -227,7 +237,7 @@ impl Default for WriteSafety {
 }
 
 /// Volume configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VolumeConfig {
     pub id: VolumeId,
     pub name: String,

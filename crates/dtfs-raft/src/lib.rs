@@ -9,7 +9,7 @@ use std::io::Cursor;
 use serde::{Deserialize, Serialize};
 
 use dtfs_common::topology::Location;
-use dtfs_common::types::{DiskInfo, HealthStatus, NodeRole};
+use dtfs_common::types::{DiskInfo, HealthStatus, NodeRole, VolumeConfig};
 
 // ---------------------------------------------------------------------------
 // TypeConfig — wires our application types into OpenRaft
@@ -143,6 +143,15 @@ pub enum ClientRequest {
         version: u64,
     },
 
+    /// Create or update a volume configuration.
+    UpsertVolume {
+        config: VolumeConfig,
+    },
+    /// Remove a volume configuration.
+    DeleteVolume {
+        volume_id: String,
+    },
+
     // ---- Observability operations ----
     /// Record the result of a completed scrub operation.
     ///
@@ -181,6 +190,8 @@ impl fmt::Display for ClientRequest {
                 write!(f, "UpdateNodeStatus({node_id}, {status})")
             }
             Self::UpdateConfig { version, .. } => write!(f, "UpdateConfig(v{version})"),
+            Self::UpsertVolume { config } => write!(f, "UpsertVolume({})", config.id),
+            Self::DeleteVolume { volume_id } => write!(f, "DeleteVolume({volume_id})"),
             Self::ReportScrubResult { node_id, level, chunks_checked, chunks_corrupt, .. } => {
                 write!(f, "ReportScrubResult(node={node_id}, {level}, checked={chunks_checked}, corrupt={chunks_corrupt})")
             }

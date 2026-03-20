@@ -102,18 +102,29 @@ impl DiskManager {
 
 /// Get disk usage for a path. Returns (total_bytes, used_bytes).
 fn get_disk_usage(path: &PathBuf) -> (u64, u64) {
-    // On Linux, we'd use statvfs. For now, return a reasonable default.
-    // In production, this would be platform-specific.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        use std::os::unix::fs::MetadataExt;
-        // Try to get filesystem stats
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let _ = metadata.dev();
-            // Would use nix::sys::statvfs here in production
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = match CString::new(path.as_os_str().as_bytes()) {
+            Ok(p) => p,
+            Err(_) => return (0, 0),
+        };
+
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+
+        if rc == 0 {
+            let block_size = stat.f_frsize as u64;
+            let total = block_size * stat.f_blocks;
+            let free  = block_size * stat.f_bfree;
+            let used  = total.saturating_sub(free);
+            return (total, used);
         }
     }
 
-    // Default fallback
+    // Non-Linux or statvfs failure: return zeros (best effort).
+    let _ = path;
     (0, 0)
 }

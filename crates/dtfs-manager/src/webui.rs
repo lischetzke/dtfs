@@ -276,6 +276,68 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             padding: 2.5rem; font-style: italic; font-size: .85rem;
         }}
 
+        /* ── Page header ── */
+        .page-header {{ margin-bottom: 1.5rem; }}
+        .page-header h2 {{ font-size: 1.25rem; font-weight: 700; margin-bottom: .25rem; }}
+        .page-desc {{ font-size: .85rem; color: var(--text-muted); }}
+
+        /* ── Topology ── */
+        .topo-root {{ display: flex; flex-direction: column; gap: 1rem; }}
+        .topo-region {{ background: var(--surface); border: 1px solid var(--border); border-radius: .625rem; padding: 1rem 1.25rem; }}
+        .topo-region-label {{ font-size: .9rem; font-weight: 700; margin-bottom: .75rem; }}
+        .topo-dc {{ background: var(--surface2); border: 1px solid var(--border); border-radius: .5rem; padding: .875rem 1rem; margin-bottom: .75rem; }}
+        .topo-dc-label {{ font-size: .85rem; font-weight: 600; margin-bottom: .5rem; color: var(--primary); }}
+        .topo-rack {{ margin: .5rem 0; }}
+        .topo-rack-label {{ font-size: .78rem; color: var(--text-muted); margin-bottom: .4rem; text-transform: uppercase; letter-spacing: .04em; }}
+        .topo-nodes {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: .75rem; }}
+        .topo-node {{ background: var(--surface); border: 1px solid var(--border); border-radius: .5rem; padding: .75rem 1rem; font-size: .83rem; }}
+
+        /* ── Node cards ── */
+        .node-card {{ background: var(--surface); border: 1px solid var(--border); border-radius: .625rem; margin-bottom: 1rem; overflow: hidden; }}
+        .node-card-header {{ padding: .875rem 1.25rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); background: var(--surface2); }}
+        .node-card-body {{ padding: .875rem 1.25rem; }}
+        .node-meta {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: .4rem .75rem; margin-bottom: .5rem; }}
+        .node-meta-item {{ font-size: .8rem; }}
+        .node-meta-item span {{ color: var(--text-muted); margin-right: .3rem; font-size: .75rem; }}
+        .btn-maint {{
+            background: transparent; border: 1px solid var(--border); color: var(--text-muted);
+            padding: .25rem .75rem; border-radius: .375rem; font-size: .75rem; cursor: pointer;
+            transition: all .15s;
+        }}
+        .btn-maint:hover {{ border-color: var(--primary); color: var(--primary); }}
+
+        /* ── Settings ── */
+        .settings-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1rem; }}
+        .settings-section {{
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: .625rem; padding: 1.25rem;
+        }}
+        .settings-section h3 {{
+            font-size: .8rem; font-weight: 700; text-transform: uppercase;
+            letter-spacing: .06em; margin-bottom: .5rem; color: var(--text-muted);
+        }}
+        .settings-desc {{ font-size: .8rem; color: var(--text-muted); margin-bottom: .875rem; }}
+        .settings-row {{ display: flex; justify-content: space-between; align-items: center; padding: .35rem 0; border-bottom: 1px solid var(--border); }}
+        .settings-row:last-of-type {{ border-bottom: none; }}
+        .settings-row label {{ font-size: .82rem; color: var(--text-muted); }}
+        .settings-val {{ font-size: .9rem; font-weight: 600; }}
+        .settings-note {{ font-size: .73rem; color: var(--text-muted); margin-top: .75rem; font-style: italic; }}
+        .form-input {{
+            background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+            padding: .4rem .7rem; border-radius: .375rem; font-size: .85rem; width: 100%;
+        }}
+        .form-textarea {{
+            background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+            padding: .5rem .75rem; border-radius: .375rem; font-size: .78rem;
+            width: 100%; font-family: monospace; resize: vertical;
+        }}
+        .btn-primary {{
+            background: var(--primary); border: none; color: white;
+            padding: .4rem 1rem; border-radius: .375rem; font-size: .85rem; cursor: pointer;
+            transition: opacity .15s; white-space: nowrap;
+        }}
+        .btn-primary:hover {{ opacity: .85; }}
+
         /* ── Footer ── */
         .footer {{
             text-align: center; color: var(--text-muted);
@@ -324,157 +386,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     <div class="health-right" id="health-right">Fetching cluster status…</div>
 </div>
 
-<div class="container">
-
-    <!-- Count cards -->
-    <div class="counts-row">
-        <div class="count-card">
-            <div class="count-icon managers">⬡</div>
-            <div class="count-body">
-                <h4 id="cnt-managers">—</h4>
-                <p>Manager nodes</p>
-            </div>
-        </div>
-        <div class="count-card">
-            <div class="count-icon datanodes">◈</div>
-            <div class="count-body">
-                <h4 id="cnt-datanodes">—</h4>
-                <p>Data nodes</p>
-            </div>
-        </div>
-        <div class="count-card">
-            <div class="count-icon disks">▨</div>
-            <div class="count-body">
-                <h4 id="cnt-disks">—</h4>
-                <p>Disks registered</p>
-            </div>
-        </div>
-        <div class="count-card">
-            <div class="count-icon clients">⌗</div>
-            <div class="count-body">
-                <h4 id="cnt-clients">—</h4>
-                <p>FUSE clients</p>
-            </div>
-        </div>
-    </div>
-
-    <!-- Capacity + I/O metrics -->
-    <div class="metrics-row">
-        <div class="metric-card">
-            <h3>Raw Capacity</h3>
-            <div class="metric-row">
-                <span class="metric-label">Total</span>
-                <span class="metric-value" id="raw-total">—</span>
-            </div>
-            <div class="metric-row">
-                <span class="metric-label">Used</span>
-                <span class="metric-value" id="raw-used">—</span>
-            </div>
-            <div class="progress-wrap">
-                <div style="display:flex;justify-content:space-between;margin-bottom:.3rem">
-                    <span style="font-size:.75rem;color:var(--text-muted)">Utilisation</span>
-                    <span style="font-size:.75rem;color:var(--text-muted)" id="raw-pct">—</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill primary" id="raw-bar" style="width:0%"></div>
-                </div>
-            </div>
-            <div class="metric-row" style="margin-top:.25rem">
-                <span class="metric-label">Free</span>
-                <span class="metric-value" id="raw-free" style="color:var(--success)">—</span>
-            </div>
-        </div>
-
-        <div class="metric-card">
-            <h3>Net Usable Capacity</h3>
-            <div style="font-size:.72rem;color:var(--text-muted);margin-bottom:.75rem">
-                After replication factor (÷ hot RF)
-            </div>
-            <div class="metric-row">
-                <span class="metric-label">Usable</span>
-                <span class="metric-value" id="net-usable">—</span>
-            </div>
-            <div class="metric-row">
-                <span class="metric-label">Used</span>
-                <span class="metric-value" id="net-used">—</span>
-            </div>
-            <div class="progress-wrap">
-                <div style="display:flex;justify-content:space-between;margin-bottom:.3rem">
-                    <span style="font-size:.75rem;color:var(--text-muted)">Utilisation</span>
-                    <span style="font-size:.75rem;color:var(--text-muted)" id="net-pct">—</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill success" id="net-bar" style="width:0%"></div>
-                </div>
-            </div>
-            <div class="metric-row" style="margin-top:.25rem">
-                <span class="metric-label">Free</span>
-                <span class="metric-value" id="net-free" style="color:var(--success)">—</span>
-            </div>
-        </div>
-
-        <div class="metric-card">
-            <h3>I/O Throughput</h3>
-            <div class="io-row">
-                <div class="io-item">
-                    <div class="io-dir">↓ Read</div>
-                    <div>
-                        <span class="io-val" id="io-read">0</span>
-                        <span class="io-unit" id="io-read-unit">B/s</span>
-                    </div>
-                </div>
-                <div class="io-item">
-                    <div class="io-dir">↑ Write</div>
-                    <div>
-                        <span class="io-val" id="io-write">0</span>
-                        <span class="io-unit" id="io-write-unit">B/s</span>
-                    </div>
-                </div>
-            </div>
-            <div style="margin-top:1.25rem;font-size:.72rem;color:var(--text-muted)">
-                Files tracked
-            </div>
-            <div style="font-size:1.4rem;font-weight:700;margin-top:.15rem" id="file-count">—</div>
-            <div style="font-size:.72rem;color:var(--text-muted);margin-top:.1rem">
-                across all volumes
-            </div>
-        </div>
-    </div>
-
-    <!-- Last scrub -->
-    <div class="scrub-card">
-        <h3>Last Scrub</h3>
-        <div id="scrub-content">
-            <div class="scrub-placeholder">No scrub result recorded yet. Run
-                <code>dtfs-cli scrub --level deep</code> to trigger one.</div>
-        </div>
-    </div>
-
-    <!-- Nodes table -->
-    <div class="table-card">
-        <div class="table-card-header">
-            <h3>Data &amp; Manager Nodes</h3>
-            <span style="font-size:.75rem;color:var(--text-muted)" id="nodes-summary"></span>
-        </div>
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Hostname</th>
-                    <th>Role</th>
-                    <th>Location</th>
-                    <th>Disks</th>
-                    <th>Capacity</th>
-                    <th>Used</th>
-                    <th>Health</th>
-                </tr>
-            </thead>
-            <tbody id="nodes-table">
-                <tr><td colspan="8" class="placeholder">Fetching node list…</td></tr>
-            </tbody>
-        </table>
-    </div>
-
+<div class="container" id="page-content">
+    <!-- Populated by SPA router -->
 </div>
 
 <div class="footer">
@@ -699,9 +612,509 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         }}).join('');
     }}
 
+    // ── SPA Router ───────────────────────────────────────────────────────────
+
+    const ROUTES = {{
+        '/ui':          renderHome,
+        '/ui/':         renderHome,
+        '/ui/topology': renderTopology,
+        '/ui/nodes':    renderNodesList,
+        '/ui/volumes':  renderVolumes,
+        '/ui/explorer': renderExplorer,
+        '/ui/audit':    renderAudit,
+        '/ui/settings': renderSettings,
+    }};
+
+    let refreshTimer = null;
+
+    function navigate(path) {{
+        history.pushState({{}}, '', path);
+        route();
+    }}
+
+    function route() {{
+        const path = window.location.pathname.replace(/\/$/, '') || '/ui';
+        const normPath = path === '' ? '/ui' : path;
+
+        // Update active nav link
+        document.querySelectorAll('.nav a').forEach(a => {{
+            const href = a.getAttribute('href').replace(/\/$/, '');
+            a.classList.toggle('active', href === normPath);
+        }});
+
+        // Clear existing auto-refresh
+        if (refreshTimer) {{ clearInterval(refreshTimer); refreshTimer = null; }}
+
+        const renderFn = ROUTES[normPath] || renderHome;
+        renderFn();
+    }}
+
+    // Intercept nav clicks for SPA navigation
+    document.querySelectorAll('.nav a[href^="/ui"]').forEach(a => {{
+        a.addEventListener('click', e => {{
+            e.preventDefault();
+            navigate(a.getAttribute('href'));
+        }});
+    }});
+
+    window.addEventListener('popstate', () => route());
+
+    // ── Home page ─────────────────────────────────────────────────────────────
+
+    function renderHome() {{
+        document.getElementById('page-content').innerHTML = `
+        <div class="counts-row">
+            <div class="count-card">
+                <div class="count-icon managers">⬡</div>
+                <div class="count-body"><h4 id="cnt-managers">—</h4><p>Manager nodes</p></div>
+            </div>
+            <div class="count-card">
+                <div class="count-icon datanodes">◈</div>
+                <div class="count-body"><h4 id="cnt-datanodes">—</h4><p>Data nodes</p></div>
+            </div>
+            <div class="count-card">
+                <div class="count-icon disks">▨</div>
+                <div class="count-body"><h4 id="cnt-disks">—</h4><p>Disks registered</p></div>
+            </div>
+            <div class="count-card">
+                <div class="count-icon clients">⌗</div>
+                <div class="count-body"><h4 id="cnt-clients">—</h4><p>FUSE clients</p></div>
+            </div>
+        </div>
+        <div class="metrics-row">
+            <div class="metric-card">
+                <h3>Raw Capacity</h3>
+                <div class="metric-row"><span class="metric-label">Total</span><span class="metric-value" id="raw-total">—</span></div>
+                <div class="metric-row"><span class="metric-label">Used</span><span class="metric-value" id="raw-used">—</span></div>
+                <div class="progress-wrap">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:.3rem">
+                        <span style="font-size:.75rem;color:var(--text-muted)">Utilisation</span>
+                        <span style="font-size:.75rem;color:var(--text-muted)" id="raw-pct">—</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill primary" id="raw-bar" style="width:0%"></div></div>
+                </div>
+                <div class="metric-row" style="margin-top:.25rem"><span class="metric-label">Free</span><span class="metric-value" id="raw-free" style="color:var(--success)">—</span></div>
+            </div>
+            <div class="metric-card">
+                <h3>Net Usable Capacity</h3>
+                <div style="font-size:.72rem;color:var(--text-muted);margin-bottom:.75rem">After replication factor (÷ hot RF)</div>
+                <div class="metric-row"><span class="metric-label">Usable</span><span class="metric-value" id="net-usable">—</span></div>
+                <div class="metric-row"><span class="metric-label">Used</span><span class="metric-value" id="net-used">—</span></div>
+                <div class="progress-wrap">
+                    <div style="display:flex;justify-content:space-between;margin-bottom:.3rem">
+                        <span style="font-size:.75rem;color:var(--text-muted)">Utilisation</span>
+                        <span style="font-size:.75rem;color:var(--text-muted)" id="net-pct">—</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill success" id="net-bar" style="width:0%"></div></div>
+                </div>
+                <div class="metric-row" style="margin-top:.25rem"><span class="metric-label">Free</span><span class="metric-value" id="net-free" style="color:var(--success)">—</span></div>
+            </div>
+            <div class="metric-card">
+                <h3>I/O Throughput</h3>
+                <div class="io-row">
+                    <div class="io-item">
+                        <div class="io-dir">↓ Read</div>
+                        <div><span class="io-val" id="io-read">0</span><span class="io-unit" id="io-read-unit">B/s</span></div>
+                    </div>
+                    <div class="io-item">
+                        <div class="io-dir">↑ Write</div>
+                        <div><span class="io-val" id="io-write">0</span><span class="io-unit" id="io-write-unit">B/s</span></div>
+                    </div>
+                </div>
+                <div style="margin-top:1.25rem;font-size:.72rem;color:var(--text-muted)">Files tracked</div>
+                <div style="font-size:1.4rem;font-weight:700;margin-top:.15rem" id="file-count">—</div>
+                <div style="font-size:.72rem;color:var(--text-muted);margin-top:.1rem">across all volumes</div>
+            </div>
+        </div>
+        <div class="scrub-card"><h3>Last Scrub</h3><div id="scrub-content"><div class="scrub-placeholder">No scrub result recorded yet.</div></div></div>
+        <div class="table-card">
+            <div class="table-card-header">
+                <h3>Data &amp; Manager Nodes</h3>
+                <span style="font-size:.75rem;color:var(--text-muted)" id="nodes-summary"></span>
+            </div>
+            <table><thead><tr><th>ID</th><th>Hostname</th><th>Role</th><th>Location</th><th>Disks</th><th>Capacity</th><th>Used</th><th>Health</th></tr></thead>
+            <tbody id="nodes-table"><tr><td colspan="8" class="placeholder">Fetching node list…</td></tr></tbody></table>
+        </div>`;
+        fetchStats();
+        refreshTimer = setInterval(fetchStats, 8000);
+    }}
+
+    // ── Topology page ─────────────────────────────────────────────────────────
+
+    async function renderTopology() {{
+        document.getElementById('page-content').innerHTML =
+            '<div class="page-header"><h2>Topology</h2><p class="page-desc">Region → DC → Rack → Host hierarchy</p></div>' +
+            '<div id="topo-tree" class="topo-root"><div class="placeholder">Loading topology…</div></div>';
+
+        const nodes = await fetch('/api/v1/nodes').then(r => r.json()).catch(() => []);
+
+        // Group nodes: region → dc → rack → [nodes]
+        const tree = {{}};
+        for (const n of nodes) {{
+            const loc = n.location || '—/—/—/—';
+            const [region, dc, rack] = loc.split('/');
+            if (!tree[region]) tree[region] = {{}};
+            if (!tree[region][dc]) tree[region][dc] = {{}};
+            if (!tree[region][dc][rack]) tree[region][dc][rack] = [];
+            tree[region][dc][rack].push(n);
+        }}
+
+        const topo = document.getElementById('topo-tree');
+        if (nodes.length === 0) {{
+            topo.innerHTML = '<div class="placeholder">No nodes registered yet.</div>';
+            return;
+        }}
+
+        let html = '';
+        for (const [region, dcs] of Object.entries(tree)) {{
+            html += `<div class="topo-region"><div class="topo-region-label">🌐 Region: <b>${{region}}</b></div>`;
+            for (const [dc, racks] of Object.entries(dcs)) {{
+                html += `<div class="topo-dc"><div class="topo-dc-label">🏢 Datacenter: <b>${{dc}}</b></div>`;
+                for (const [rack, rnodes] of Object.entries(racks)) {{
+                    html += `<div class="topo-rack"><div class="topo-rack-label">🗄 Rack: <b>${{rack}}</b></div><div class="topo-nodes">`;
+                    for (const n of rnodes) {{
+                        const h = (n.health||'unknown').toLowerCase();
+                        const role = (n.role||'data').toLowerCase();
+                        html += `<div class="topo-node">
+                            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.4rem">
+                                <b>${{n.hostname||'—'}}</b>
+                                <span class="badge badge-${{h}}">${{n.health||'unknown'}}</span>
+                            </div>
+                            <div style="font-size:.75rem;color:var(--text-muted);margin-bottom:.3rem">
+                                <span class="badge badge-${{role}}">${{role}}</span>
+                                &nbsp; ${{n.disk_count||0}} disk${{n.disk_count!==1?'s':''}}
+                            </div>
+                            <div style="font-size:.75rem;color:var(--text-muted)">
+                                Cap: ${{fmtBytes(n.total_capacity||0)}} · Used: ${{fmtBytes(n.used_capacity||0)}}
+                            </div>
+                        </div>`;
+                    }}
+                    html += '</div></div>';
+                }}
+                html += '</div>';
+            }}
+            html += '</div>';
+        }}
+        topo.innerHTML = html;
+        refreshTimer = setInterval(renderTopology, 15000);
+    }}
+
+    // ── Nodes list page ────────────────────────────────────────────────────────
+
+    async function renderNodesList() {{
+        document.getElementById('page-content').innerHTML =
+            '<div class="page-header"><h2>Nodes</h2><p class="page-desc">All cluster nodes with disk detail</p></div>' +
+            '<div id="nodes-detail-list"><div class="placeholder">Loading…</div></div>';
+        await refreshNodesList();
+        refreshTimer = setInterval(refreshNodesList, 10000);
+    }}
+
+    async function refreshNodesList() {{
+        const nodes = await fetch('/api/v1/nodes').then(r => r.json()).catch(() => []);
+        const el = document.getElementById('nodes-detail-list');
+        if (!el) return;
+        if (!nodes || nodes.length === 0) {{
+            el.innerHTML = '<div class="placeholder">No nodes registered.</div>';
+            return;
+        }}
+        el.innerHTML = nodes.map(n => {{
+            const h = (n.health||'unknown').toLowerCase();
+            const role = (n.role||'data').toLowerCase();
+            const pct = n.total_capacity ? Math.round(n.used_capacity/n.total_capacity*100) : 0;
+            const barCol = pct>90?'var(--danger)':pct>75?'var(--warning)':'var(--primary)';
+            const isMaintenance = h === 'maintenance';
+            return `<div class="node-card">
+                <div class="node-card-header">
+                    <div>
+                        <span class="badge badge-${{role}}" style="margin-right:.4rem">${{role}}</span>
+                        <b style="font-size:1rem">${{n.hostname||'—'}}</b>
+                        <span style="font-size:.78rem;color:var(--text-muted);margin-left:.5rem;font-family:monospace">
+                            id:${{(n.node_id||'').slice(0,12)}}…
+                        </span>
+                    </div>
+                    <div style="display:flex;gap:.5rem;align-items:center">
+                        <span class="badge badge-${{h}}">${{n.health||'unknown'}}</span>
+                        <button class="btn-maint" onclick="toggleMaintenance('${{n.node_id}}', ${{!isMaintenance}})">
+                            ${{isMaintenance ? 'Exit Maintenance' : 'Set Maintenance'}}
+                        </button>
+                    </div>
+                </div>
+                <div class="node-card-body">
+                    <div class="node-meta">
+                        <div class="node-meta-item"><span>gRPC</span>${{n.grpc_addr||'—'}}</div>
+                        <div class="node-meta-item"><span>Location</span>${{n.location||'—'}}</div>
+                        <div class="node-meta-item"><span>Total</span>${{fmtBytes(n.total_capacity||0)}}</div>
+                        <div class="node-meta-item"><span>Used</span>${{fmtBytes(n.used_capacity||0)}} (${{pct}}%)</div>
+                    </div>
+                    <div style="margin:.5rem 0">
+                        <div class="progress-bar" style="height:8px">
+                            <div style="height:100%;border-radius:4px;background:${{barCol}};width:${{pct}}%"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }}).join('');
+    }}
+
+    async function toggleMaintenance(nodeId, enable) {{
+        await fetch('/api/v1/nodes/' + nodeId + '/maintenance', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ enable }}),
+        }}).catch(() => {{}});
+        await refreshNodesList();
+    }}
+
+    // ── Volumes page ──────────────────────────────────────────────────────────
+
+    async function renderVolumes() {{
+        document.getElementById('page-content').innerHTML =
+            '<div class="page-header"><h2>Volumes</h2><p class="page-desc">Storage volumes and their file distribution</p></div>' +
+            '<div id="volumes-list"><div class="placeholder">Loading…</div></div>';
+        const data = await fetch('/api/v1/volumes').then(r => r.json()).catch(() => ({{count:0, volumes:[]}}));
+        const el = document.getElementById('volumes-list');
+        if (!el) return;
+        const vols = data.volumes || [];
+        if (vols.length === 0) {{
+            el.innerHTML = '<div class="placeholder">No volumes yet. Create one with <code>dtfs-cli volume create</code>.</div>';
+            return;
+        }}
+        el.innerHTML = '<div class="table-card"><table>' +
+            '<thead><tr><th>Volume ID</th><th>Files</th><th>Total Size</th><th>Avg File Size</th></tr></thead><tbody>' +
+            vols.map(v => `<tr>
+                <td><b style="font-family:monospace">${{v.volume_id||'—'}}</b></td>
+                <td>${{(v.file_count||0).toLocaleString()}}</td>
+                <td>${{fmtBytes(v.total_size||0)}}</td>
+                <td>${{v.file_count ? fmtBytes(Math.round((v.total_size||0)/v.file_count)) : '—'}}</td>
+            </tr>`).join('') +
+            '</tbody></table></div>';
+    }}
+
+    // ── Data Explorer page ────────────────────────────────────────────────────
+
+    async function renderExplorer() {{
+        document.getElementById('page-content').innerHTML =
+            `<div class="page-header">
+                <h2>Data Explorer</h2>
+                <p class="page-desc">Browse files across all volumes</p>
+            </div>
+            <div style="display:flex;gap:.75rem;margin-bottom:1rem">
+                <input id="explorer-filter" type="text" class="form-input" placeholder="Filter by path…" style="max-width:320px">
+                <button class="btn-primary" onclick="loadExplorer()">Refresh</button>
+            </div>
+            <div id="explorer-list"><div class="placeholder">Loading…</div></div>`;
+        document.getElementById('explorer-filter').addEventListener('input', () => loadExplorer());
+        await loadExplorer();
+    }}
+
+    async function loadExplorer() {{
+        const filter = (document.getElementById('explorer-filter')?.value || '').toLowerCase();
+        const data = await fetch('/api/v1/files').then(r => r.json()).catch(() => ({{count:0,files:[]}}));
+        const el = document.getElementById('explorer-list');
+        if (!el) return;
+        let files = data.files || [];
+        if (filter) files = files.filter(f => (f.path||'').toLowerCase().includes(filter));
+        if (files.length === 0) {{
+            el.innerHTML = '<div class="placeholder">' + (filter ? 'No files match "' + filter + '".' : 'No files stored yet.') + '</div>';
+            return;
+        }}
+        el.innerHTML = '<div class="table-card"><table>' +
+            '<thead><tr><th>Path</th><th>Volume</th><th>Chunks</th><th>Size</th><th>Created</th></tr></thead><tbody>' +
+            files.map(f => `<tr>
+                <td style="font-family:monospace;font-size:.8rem;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{f.path||''}}">
+                    ${{f.path||'—'}}
+                </td>
+                <td style="font-family:monospace;font-size:.78rem;color:var(--text-muted)">${{f.volume_id||'—'}}</td>
+                <td>${{f.chunk_count||0}}</td>
+                <td>${{fmtBytes(f.total_size||0)}}</td>
+                <td style="font-size:.78rem;color:var(--text-muted)">${{f.created_at ? timeAgo(f.created_at) : '—'}}</td>
+            </tr>`).join('') +
+            `</tbody></table>` +
+            `<div style="padding:.75rem 1.25rem;font-size:.78rem;color:var(--text-muted);border-top:1px solid var(--border)">
+                Showing ${{files.length}} of ${{data.count||0}} files
+            </div></div>`;
+    }}
+
+    // ── Audit Log page ────────────────────────────────────────────────────────
+
+    async function renderAudit() {{
+        document.getElementById('page-content').innerHTML =
+            `<div class="page-header">
+                <h2>Audit Log</h2>
+                <p class="page-desc">All mutating operations recorded cluster-wide</p>
+            </div>
+            <div style="display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap">
+                <input id="audit-action-filter" type="text" class="form-input" placeholder="Filter by action (e.g. tier, scrub)…" style="max-width:260px">
+                <select id="audit-limit" class="form-input" style="max-width:120px">
+                    <option value="50">Last 50</option>
+                    <option value="100">Last 100</option>
+                    <option value="200">Last 200</option>
+                    <option value="500">Last 500</option>
+                </select>
+                <button class="btn-primary" onclick="loadAudit()">Refresh</button>
+            </div>
+            <div id="audit-list"><div class="placeholder">Loading…</div></div>`;
+        document.getElementById('audit-action-filter').addEventListener('input', () => loadAudit());
+        document.getElementById('audit-limit').addEventListener('change', () => loadAudit());
+        await loadAudit();
+        refreshTimer = setInterval(loadAudit, 15000);
+    }}
+
+    async function loadAudit() {{
+        const action = document.getElementById('audit-action-filter')?.value || '';
+        const limit  = document.getElementById('audit-limit')?.value || '50';
+        let url = '/api/v1/audit?limit=' + limit;
+        if (action) url += '&action=' + encodeURIComponent(action);
+        const entries = await fetch(url).then(r => r.json()).catch(() => []);
+        const el = document.getElementById('audit-list');
+        if (!el) return;
+        if (!entries || entries.length === 0) {{
+            el.innerHTML = '<div class="placeholder">No audit entries found.</div>';
+            return;
+        }}
+        el.innerHTML = '<div class="table-card"><table>' +
+            '<thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Result</th></tr></thead><tbody>' +
+            entries.map(e => {{
+                const ok = (e.result||'').toLowerCase() === 'success' || (e.result||'').toLowerCase() === 'ok';
+                const resultColor = ok ? 'var(--success)' : e.result === 'pending' ? 'var(--warning)' : 'var(--text-muted)';
+                return `<tr>
+                    <td style="font-size:.78rem;color:var(--text-muted);white-space:nowrap">
+                        ${{e.timestamp ? new Date(e.timestamp).toLocaleString() : '—'}}
+                    </td>
+                    <td style="font-size:.8rem">${{e.actor||'—'}}</td>
+                    <td style="font-family:monospace;font-size:.78rem">${{e.action||'—'}}</td>
+                    <td style="font-size:.78rem;color:var(--text-muted);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{e.target||''}}">
+                        ${{e.target||'—'}}
+                    </td>
+                    <td style="font-size:.78rem;color:${{resultColor}}">${{e.result||'—'}}</td>
+                </tr>`;
+            }}).join('') +
+            '</tbody></table></div>';
+    }}
+
+    // ── Settings page ─────────────────────────────────────────────────────────
+
+    async function renderSettings() {{
+        document.getElementById('page-content').innerHTML =
+            '<div class="page-header"><h2>Settings</h2><p class="page-desc">Cluster-wide configuration (live reload)</p></div>' +
+            '<div id="settings-body"><div class="placeholder">Loading…</div></div>';
+        await loadSettings();
+    }}
+
+    async function loadSettings() {{
+        const cfg = await fetch('/api/v1/config').then(r => r.json()).catch(() => null);
+        const el = document.getElementById('settings-body');
+        if (!el) return;
+        if (!cfg) {{
+            el.innerHTML = '<div class="placeholder">Could not load configuration.</div>';
+            return;
+        }}
+        const d = cfg.defaults || {{}};
+        const ws = d.write_safety || {{}};
+        const rep = d.replication || {{}};
+        const tier = cfg.tiering || {{}};
+
+        el.innerHTML = `
+        <div class="settings-grid">
+            <div class="settings-section">
+                <h3>Write Safety</h3>
+                <p class="settings-desc">Controls how many replicas must confirm a write before the client is acknowledged.</p>
+                <div class="settings-row">
+                    <label>Min replicas before ack</label>
+                    <span class="settings-val">${{ws.min_replicas_before_ack ?? '—'}}</span>
+                </div>
+                <div class="settings-row">
+                    <label>Write timeout (secs)</label>
+                    <span class="settings-val">${{ws.write_timeout_secs ?? '—'}}</span>
+                </div>
+                <p class="settings-note">Config version: <b>v${{cfg.version ?? 0}}</b> · Change via <code>dtfs-cli config set</code> or POST /api/v1/config</p>
+            </div>
+
+            <div class="settings-section">
+                <h3>Default Replication</h3>
+                <p class="settings-desc">Per-tier replication factors applied to new volumes unless overridden.</p>
+                <div class="settings-row">
+                    <label><span class="badge badge-hot">hot</span> RF</label>
+                    <span class="settings-val">${{rep.hot ?? '—'}}</span>
+                </div>
+                <div class="settings-row">
+                    <label><span class="badge badge-warm">warm</span> RF</label>
+                    <span class="settings-val">${{rep.warm ?? '—'}}</span>
+                </div>
+                <div class="settings-row">
+                    <label><span class="badge badge-cold">cold</span> RF</label>
+                    <span class="settings-val">${{rep.cold ?? '—'}}</span>
+                </div>
+            </div>
+
+            <div class="settings-section">
+                <h3>Tiering Engine</h3>
+                <p class="settings-desc">Automatic hot/cold data classification and migration settings.</p>
+                <div class="settings-row">
+                    <label>Enabled</label>
+                    <span class="settings-val">${{tier.enabled ? '✅ Yes' : '❌ No'}}</span>
+                </div>
+                <div class="settings-row">
+                    <label>Hot threshold (reads/hr)</label>
+                    <span class="settings-val">${{tier.hot_threshold_reads_per_hour ?? '—'}}</span>
+                </div>
+                <div class="settings-row">
+                    <label>Cold threshold (days)</label>
+                    <span class="settings-val">${{tier.cold_threshold_days ?? '—'}}</span>
+                </div>
+                <div class="settings-row">
+                    <label>Migration bandwidth (MB/s)</label>
+                    <span class="settings-val">${{tier.migration_bandwidth_limit_mbps ?? '—'}}</span>
+                </div>
+            </div>
+
+            <div class="settings-section">
+                <h3>Chunk Size</h3>
+                <p class="settings-desc">Default chunk size for new volumes.</p>
+                <div class="settings-row">
+                    <label>Chunk size</label>
+                    <span class="settings-val">${{d.chunk_size_mb ?? 128}} MB</span>
+                </div>
+                <p class="settings-note">Per-volume overrides available via <code>dtfs-cli volume create --chunk-size</code></p>
+            </div>
+        </div>
+
+        <div class="settings-section" style="margin-top:1.25rem">
+            <h3>Raw Config JSON</h3>
+            <p class="settings-desc">Current cluster config blob stored in Raft state. Edit carefully.</p>
+            <textarea id="cfg-json" class="form-textarea" rows="6">${{
+                cfg.config ? JSON.stringify(cfg.config, null, 2) : '(empty)'
+            }}</textarea>
+            <div style="margin-top:.75rem;display:flex;gap:.75rem;align-items:center">
+                <button class="btn-primary" onclick="saveConfigJson()">Apply Config JSON</button>
+                <span id="cfg-save-status" style="font-size:.8rem;color:var(--text-muted)"></span>
+            </div>
+        </div>`;
+    }}
+
+    async function saveConfigJson() {{
+        const json = document.getElementById('cfg-json')?.value || '';
+        const status = document.getElementById('cfg-save-status');
+        if (status) status.textContent = 'Saving…';
+        try {{
+            // Validate JSON first
+            JSON.parse(json === '(empty)' ? '{{}}' : json);
+            const resp = await fetch('/api/v1/config', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ config_json: json === '(empty)' ? '' : json }}),
+            }});
+            const result = await resp.json();
+            if (status) status.textContent = resp.ok
+                ? '✅ Applied (v' + result.version + ')'
+                : '❌ Error: ' + JSON.stringify(result);
+        }} catch(e) {{
+            if (status) status.textContent = '❌ ' + e.message;
+        }}
+    }}
+
     // ── Bootstrap ────────────────────────────────────────────────────────────
-    fetchStats();
-    setInterval(fetchStats, 8000);
+    route();
 </script>
 </body>
 </html>"##,
