@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use dtfs_raft::{ClientRequest, DtfsRaft, NodeInfo};
-use tracing::{info, warn};
+use dtfs_raft::NodeInfo;
+use tracing::info;
 
 /// Per-node health status as seen by the manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +20,6 @@ pub enum NodeStatus {
 
 /// Manages cluster membership and heartbeat tracking.
 pub struct ClusterManager {
-    raft: Arc<DtfsRaft>,
     /// node_id -> last heartbeat received time
     node_heartbeats: DashMap<u64, Instant>,
     /// Duration after which a node is considered suspect.
@@ -30,9 +29,8 @@ pub struct ClusterManager {
 }
 
 impl ClusterManager {
-    pub fn new(raft: Arc<DtfsRaft>) -> Self {
+    pub fn new() -> Self {
         Self {
-            raft,
             node_heartbeats: DashMap::new(),
             suspect_threshold: Duration::from_secs(15),
             down_threshold: Duration::from_secs(30),
@@ -47,11 +45,9 @@ impl ClusterManager {
     }
 
     /// Process an incoming heartbeat from a data node.
-    /// Returns a config version the node should be at (for config push).
-    pub fn process_heartbeat(&self, node_id: u64) -> u64 {
+    /// Updates the last-seen timestamp used for health monitoring.
+    pub fn process_heartbeat(&self, node_id: u64) {
         self.node_heartbeats.insert(node_id, Instant::now());
-        // Config version is tracked in Raft state; for now return 0.
-        0
     }
 
     /// Get the health status of a specific node.
@@ -67,13 +63,22 @@ impl ClusterManager {
                     NodeStatus::Healthy
                 }
             }
+            // A node that has never sent a heartbeat is considered down.
             None => NodeStatus::Down,
         }
     }
 
     /// Periodic check of all tracked nodes.
-    /// Returns lists of (node_id, new_status) for nodes whose status changed
-    /// from Healthy to Suspect or Down so the caller can react.
+    ///
+    /// Returns `(node_id, new_status)` pairs for every node whose heartbeat
+    /// is overdue. Healthy nodes (recent heartbeat) are omitted — their
+    /// recovery is handled directly in the heartbeat RPC handler via
+    /// `UpdateNodeStatus { status: "healthy" }`.
+    ///
+    /// **No Raft writes are performed here.** All status transitions are
+    /// committed to Raft by `HealthMonitor::run()`, which is the single
+    /// owner of that responsibility (fix for issue #4 — duplicate Raft
+    /// writes that flooded the log on every monitor tick).
     pub async fn check_nodes(&self) -> Vec<(u64, NodeStatus)> {
         let mut status_changes = Vec::new();
 
@@ -86,27 +91,7 @@ impl ClusterManager {
             } else if elapsed > self.suspect_threshold {
                 status_changes.push((node_id, NodeStatus::Suspect));
             }
-        }
-
-        // Try to update Raft state for status changes.
-        for (node_id, status) in &status_changes {
-            let status_str = match status {
-                NodeStatus::Healthy => "healthy",
-                NodeStatus::Suspect => "suspect",
-                NodeStatus::Down => "down",
-            };
-            let req = ClientRequest::UpdateNodeStatus {
-                node_id: *node_id,
-                status: status_str.to_string(),
-            };
-            if let Err(e) = self.raft.client_write(req).await {
-                warn!(
-                    "Failed to update Raft status for node {}: {} (may not be leader)",
-                    node_id, e
-                );
-            } else {
-                info!("Node {} marked as {:?}", node_id, status);
-            }
+            // Healthy nodes are intentionally omitted.
         }
 
         status_changes
@@ -128,3 +113,14 @@ impl ClusterManager {
         self.node_heartbeats.contains_key(&node_id)
     }
 }
+
+impl Default for ClusterManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ClusterManager no longer holds a DtfsRaft reference. The one place that
+// used to write Raft status here (check_nodes) was causing duplicate writes
+// since HealthMonitor::update_node_status_in_raft does the same thing.
+// Removing the dependency makes the ownership clear.

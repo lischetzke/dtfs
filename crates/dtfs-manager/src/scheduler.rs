@@ -410,12 +410,27 @@ impl TaskScheduler {
                     let file_path = self.find_file_for_chunk(&chunk_id).await;
 
                     if let Some(path) = file_path {
+                        let chunk_index = {
+                            let sm = self.state_data.read().await;
+                            sm.files
+                                .get(&path)
+                                .and_then(|f| {
+                                    f.chunks
+                                        .iter()
+                                        .find(|c| c.chunk_hash == chunk_id)
+                                        .map(|c| c.chunk_index)
+                                })
+                                .unwrap_or(0)
+                        };
                         let new_loc = ChunkLocationEntry {
-                            chunk_index: 0,   // Will be corrected by merging with existing.
+                            chunk_index,
                             chunk_hash: chunk_id.clone(),
+                            // Store the numeric node ID (not the gRPC address)
+                            // so that `chunk_loc.node_id.parse::<u64>()` succeeds
+                            // in the scheduler's under-replication checks (fix #7).
                             node_id: target_node.to_string(),
-                            disk_id: 0,       // Disk chosen by target data node.
-                            size_bytes: 0,    // Size already stored on target.
+                            disk_id: 0, // Disk chosen by target data node.
+                            size_bytes: 0,
                         };
                         let req = ClientRequest::UpdateChunkLocations {
                             path,
@@ -463,16 +478,17 @@ impl TaskScheduler {
         });
     }
 
-    /// Load the migration state from the Raft cluster config JSON.
+    /// Load the migration state from the dedicated Raft field.
+    ///
+    /// Uses `migration_state_json` instead of `cluster_config.config_json` so
+    /// that scheduler bookkeeping never clobbers user-visible cluster
+    /// configuration (fix for issue #3).
     async fn load_migration_state(&self) -> MigrationState {
         let sm = self.state_data.read().await;
-        if sm.cluster_config.config_json.is_empty() {
+        if sm.migration_state_json.is_empty() {
             return MigrationState::default();
         }
-
-        // The cluster_config.config_json may contain a MigrationState or some
-        // other config. We try to parse it; on failure we use the default.
-        serde_json::from_str(&sm.cluster_config.config_json).unwrap_or_default()
+        serde_json::from_str(&sm.migration_state_json).unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------
@@ -546,28 +562,21 @@ impl TaskScheduler {
         None
     }
 
-    /// Persist the migration state to Raft via UpdateConfig.
+    /// Persist the migration state via the dedicated `UpdateMigrationState`
+    /// Raft command so that it never overwrites `cluster_config` (fix #3).
     async fn save_migration_state(&self, state: &MigrationState) {
-        let config_json = match serde_json::to_string(state) {
-            Ok(json) => json,
+        let json = match serde_json::to_string(state) {
+            Ok(j) => j,
             Err(e) => {
                 error!("Failed to serialize migration state: {}", e);
                 return;
             }
         };
 
-        let version = {
-            let sm = self.state_data.read().await;
-            sm.cluster_config.version + 1
-        };
-
-        let req = ClientRequest::UpdateConfig {
-            config_json,
-            version,
-        };
+        let req = ClientRequest::UpdateMigrationState { json };
 
         if let Err(e) = self.raft.client_write(req).await {
-            // Not being leader is expected on followers; only warn.
+            // Not being leader is expected on followers.
             debug!("Failed to persist migration state: {} (may not be leader)", e);
         }
     }

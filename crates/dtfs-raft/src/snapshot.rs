@@ -31,9 +31,14 @@ pub struct StateMachineSnapshot {
     pub audit_log: Vec<AuditEntry>,
 
     // ---- observability state ----
-    /// Most recent completed scrub result reported by any data node.
+    /// Per-node scrub results, keyed by node_id.
+    ///
+    /// Replaces the old `last_scrub: Option<ScrubRecord>` single-value field
+    /// so that every data node's latest scrub result survives snapshot
+    /// install/restore (fix for issue #8).
     #[serde(default)]
-    pub last_scrub: Option<ScrubRecord>,
+    pub scrub_results: BTreeMap<u64, ScrubRecord>,
+
     /// Number of registered FUSE clients (updated by client heartbeats).
     #[serde(default)]
     pub client_count: u64,
@@ -41,6 +46,11 @@ pub struct StateMachineSnapshot {
     /// Volume configurations.
     #[serde(default)]
     pub volumes: BTreeMap<String, VolumeConfig>,
+
+    /// Migration-scheduler state JSON.  Kept separate from `cluster_config`
+    /// so that scheduler bookkeeping never overwrites user config (fix #3).
+    #[serde(default)]
+    pub migration_state_json: String,
 }
 
 /// Serialize a `StateMachineSnapshot` into a `Cursor<Vec<u8>>`.
@@ -84,13 +94,16 @@ mod tests {
             nodes: BTreeMap::new(),
             cluster_config: ClusterConfig::default(),
             audit_log: Vec::new(),
-            last_scrub: None,
+            scrub_results: BTreeMap::new(),
             client_count: 0,
             volumes: BTreeMap::new(),
+            migration_state_json: String::new(),
         };
 
         let cursor = serialize_snapshot(&snap).unwrap();
         let restored = deserialize_snapshot(cursor).unwrap();
         assert_eq!(snap.last_applied_log, restored.last_applied_log);
+        assert_eq!(snap.scrub_results.len(), restored.scrub_results.len());
+        assert_eq!(snap.migration_state_json, restored.migration_state_json);
     }
 }

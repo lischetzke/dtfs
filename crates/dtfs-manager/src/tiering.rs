@@ -308,11 +308,16 @@ fn classify_temperature(
 }
 
 /// Map a data temperature to the target storage tier.
+///
+/// Frozen data is sent to Tape (archival / LTFS) rather than Cold (fix #14).
+/// The Tape tier exists precisely for long-term, write-once archival of data
+/// that has not been accessed in `frozen_threshold_days`.
 fn temperature_to_tier(temp: DataTemperature) -> DiskTier {
     match temp {
         DataTemperature::Hot => DiskTier::Hot,
         DataTemperature::Warm => DiskTier::Warm,
-        DataTemperature::Cold | DataTemperature::Frozen => DiskTier::Cold,
+        DataTemperature::Cold => DiskTier::Cold,
+        DataTemperature::Frozen => DiskTier::Tape,
     }
 }
 
@@ -372,6 +377,7 @@ mod tests {
         assert_eq!(temperature_to_tier(DataTemperature::Hot), DiskTier::Hot);
         assert_eq!(temperature_to_tier(DataTemperature::Warm), DiskTier::Warm);
         assert_eq!(temperature_to_tier(DataTemperature::Cold), DiskTier::Cold);
-        assert_eq!(temperature_to_tier(DataTemperature::Frozen), DiskTier::Cold);
+        // Frozen -> Tape (archival), not Cold (fix for issue #14).
+        assert_eq!(temperature_to_tier(DataTemperature::Frozen), DiskTier::Tape);
     }
 }

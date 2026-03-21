@@ -93,44 +93,48 @@ impl HealthMonitor {
 
     /// Handle a node that has been detected as down.
     ///
-    /// Enumerates all chunks that had replicas on the down node and schedules
-    /// re-replication tasks for each under-replicated chunk.
+    /// Collects ALL chunk replication tasks while holding the state-machine
+    /// lock, then releases the lock before scheduling them. This ensures every
+    /// chunk on the failed node is handled in a single monitor tick instead of
+    /// one chunk per tick (fix for issue #1).
     async fn handle_node_down(&self, node_id: u64) {
-        let sm = self.state_data.read().await;
-        let node_id_str = node_id.to_string();
+        // Collect (chunk_hash, source_node, target_node) triples while holding
+        // the read lock. We never await with the lock held.
+        let tasks: Vec<(String, u64, u64)> = {
+            let sm = self.state_data.read().await;
+            let node_id_str = node_id.to_string();
 
-        // Find all healthy nodes we could replicate to.
-        let healthy_nodes: Vec<u64> = sm
-            .nodes
-            .iter()
-            .filter(|(id, info)| {
-                **id != node_id && info.health == HealthStatus::Healthy
-            })
-            .map(|(id, _)| *id)
-            .collect();
+            let healthy_nodes: Vec<u64> = sm
+                .nodes
+                .iter()
+                .filter(|(id, info)| {
+                    **id != node_id && info.health == HealthStatus::Healthy
+                })
+                .map(|(id, _)| *id)
+                .collect();
 
-        if healthy_nodes.is_empty() {
-            warn!(
-                "No healthy nodes available for re-replication of node {} chunks",
-                node_id
-            );
-            return;
-        }
+            if healthy_nodes.is_empty() {
+                warn!(
+                    "No healthy nodes available for re-replication of node {} chunks",
+                    node_id
+                );
+                return;
+            }
 
-        let mut scheduled_count = 0u64;
+            let mut out = Vec::new();
+            let mut round_robin: usize = 0;
 
-        // Walk all files to find chunks hosted on the down node.
-        for (_path, file_meta) in &sm.files {
-            for chunk_loc in &file_meta.chunks {
-                if chunk_loc.node_id == node_id_str {
+            for (_path, file_meta) in &sm.files {
+                for chunk_loc in &file_meta.chunks {
+                    if chunk_loc.node_id != node_id_str {
+                        continue;
+                    }
+
                     // Find another node that already has this chunk (as source).
-                    let source = file_meta
-                        .chunks
-                        .iter()
-                        .find(|c| {
-                            c.chunk_index == chunk_loc.chunk_index
-                                && c.node_id != node_id_str
-                        });
+                    let source = file_meta.chunks.iter().find(|c| {
+                        c.chunk_index == chunk_loc.chunk_index
+                            && c.node_id != node_id_str
+                    });
 
                     let source_node: u64 = match source {
                         Some(s) => s.node_id.parse().unwrap_or(0),
@@ -147,45 +151,29 @@ impl HealthMonitor {
                         continue;
                     }
 
-                    // Pick a target from healthy nodes, round-robin style.
-                    let target = healthy_nodes[scheduled_count as usize % healthy_nodes.len()];
+                    // Pick a target from healthy nodes, round-robin.
+                    let target = healthy_nodes[round_robin % healthy_nodes.len()];
+                    round_robin += 1;
 
-                    // Drop the state-machine read lock before calling the
-                    // scheduler which will need to read it too. We clone the
-                    // data we need first.
-                    let chunk_id = chunk_loc.chunk_hash.clone();
-
-                    // We cannot hold `sm` across an await, so we collect tasks
-                    // and schedule them after the loop. For simplicity in this
-                    // implementation we use a fire-and-forget approach.
-                    drop(sm);
-
-                    self.scheduler
-                        .schedule_replication(&chunk_id, source_node, target, DiskTier::Hot)
-                        .await;
-
-                    scheduled_count += 1;
-
-                    // Re-acquire the lock for the next iteration.
-                    // This is safe because we are iterating file metadata
-                    // which does not change underneath us (Raft serialises
-                    // mutations).
-                    //
-                    // Note: to avoid borrow-checker issues with the loop, we
-                    // break out and let the next monitor tick continue the work.
-                    info!(
-                        "Scheduled re-replication for chunk {} (node {} down), task count: {}",
-                        chunk_id, node_id, scheduled_count
-                    );
-                    return;
+                    out.push((chunk_loc.chunk_hash.clone(), source_node, target));
                 }
             }
+            out
+        }; // read lock released here
+
+        let count = tasks.len();
+
+        // Schedule all collected tasks without holding the state lock.
+        for (chunk_id, source_node, target_node) in tasks {
+            self.scheduler
+                .schedule_replication(&chunk_id, source_node, target_node, DiskTier::Hot)
+                .await;
         }
 
-        if scheduled_count > 0 {
+        if count > 0 {
             info!(
                 "Scheduled {} re-replication tasks for chunks on down node {}",
-                scheduled_count, node_id
+                count, node_id
             );
         } else {
             info!(
@@ -255,71 +243,78 @@ impl HealthMonitor {
 
     /// Schedule re-replication for all chunks that were on a disk that has
     /// been reported as failed.
+    ///
+    /// Like `handle_node_down`, collects all tasks while holding the lock,
+    /// then releases it before scheduling (fix for issue #1).
     async fn handle_disk_failed(&self, node_id: u64, disk_id: u32) {
-        let sm = self.state_data.read().await;
-        let node_id_str = node_id.to_string();
+        let tasks: Vec<(String, u64, u64)> = {
+            let sm = self.state_data.read().await;
+            let node_id_str = node_id.to_string();
 
-        let healthy_nodes: Vec<u64> = sm
-            .nodes
-            .iter()
-            .filter(|(id, info)| **id != node_id && info.health == HealthStatus::Healthy)
-            .map(|(id, _)| *id)
-            .collect();
+            let healthy_nodes: Vec<u64> = sm
+                .nodes
+                .iter()
+                .filter(|(id, info)| **id != node_id && info.health == HealthStatus::Healthy)
+                .map(|(id, _)| *id)
+                .collect();
 
-        if healthy_nodes.is_empty() {
-            warn!(
-                "No healthy nodes available for re-replication after disk {} on node {} failed",
-                disk_id, node_id
-            );
-            return;
-        }
-
-        let mut count = 0u64;
-
-        for (_path, file_meta) in &sm.files {
-            for chunk_loc in &file_meta.chunks {
-                // Only process chunks hosted on this specific failed disk.
-                if chunk_loc.node_id != node_id_str || chunk_loc.disk_id != disk_id {
-                    continue;
-                }
-
-                // Find an alternate healthy source replica for this chunk.
-                let alt_source = file_meta.chunks.iter().find(|c| {
-                    c.chunk_index == chunk_loc.chunk_index
-                        && c.node_id != node_id_str
-                });
-
-                let source_node: u64 = match alt_source {
-                    Some(s) => match s.node_id.parse() {
-                        Ok(id) => id,
-                        Err(_) => continue,
-                    },
-                    None => {
-                        warn!(
-                            "Chunk {} (disk {}, node {}) has no surviving replica!",
-                            chunk_loc.chunk_hash, disk_id, node_id
-                        );
-                        continue;
-                    }
-                };
-
-                let target = healthy_nodes[count as usize % healthy_nodes.len()];
-                let chunk_id = chunk_loc.chunk_hash.clone();
-
-                drop(sm);
-
-                self.scheduler
-                    .schedule_replication(&chunk_id, source_node, target, DiskTier::Hot)
-                    .await;
-
-                count += 1;
-                info!(
-                    "Scheduled re-replication for chunk {} (disk {} on node {} failed)",
-                    chunk_id, disk_id, node_id
+            if healthy_nodes.is_empty() {
+                warn!(
+                    "No healthy nodes available for re-replication after disk {} on node {} failed",
+                    disk_id, node_id
                 );
-                // Re-acquire and break: handle one chunk per tick to avoid long lock-hold.
                 return;
             }
+
+            let mut out = Vec::new();
+            let mut round_robin: usize = 0;
+
+            for (_path, file_meta) in &sm.files {
+                for chunk_loc in &file_meta.chunks {
+                    // Only process chunks hosted on this specific failed disk.
+                    if chunk_loc.node_id != node_id_str || chunk_loc.disk_id != disk_id {
+                        continue;
+                    }
+
+                    // Find an alternate healthy source replica for this chunk.
+                    let alt_source = file_meta.chunks.iter().find(|c| {
+                        c.chunk_index == chunk_loc.chunk_index
+                            && c.node_id != node_id_str
+                    });
+
+                    let source_node: u64 = match alt_source {
+                        Some(s) => match s.node_id.parse() {
+                            Ok(id) => id,
+                            Err(_) => continue,
+                        },
+                        None => {
+                            warn!(
+                                "Chunk {} (disk {}, node {}) has no surviving replica!",
+                                chunk_loc.chunk_hash, disk_id, node_id
+                            );
+                            continue;
+                        }
+                    };
+
+                    let target = healthy_nodes[round_robin % healthy_nodes.len()];
+                    round_robin += 1;
+
+                    out.push((chunk_loc.chunk_hash.clone(), source_node, target));
+                }
+            }
+            out
+        }; // read lock released here
+
+        let count = tasks.len();
+
+        for (chunk_id, source_node, target_node) in tasks {
+            self.scheduler
+                .schedule_replication(&chunk_id, source_node, target_node, DiskTier::Hot)
+                .await;
+            info!(
+                "Scheduled re-replication for chunk {} (disk {} on node {} failed)",
+                chunk_id, disk_id, node_id
+            );
         }
 
         if count == 0 {

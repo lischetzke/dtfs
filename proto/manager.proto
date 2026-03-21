@@ -21,6 +21,9 @@ service ManagerService {
   // Allocate chunk placements for writing
   rpc AllocateChunks(AllocateChunksRequest) returns (AllocateChunksResponse);
 
+  // Merge chunk location entries for a file (after successful data-node writes)
+  rpc CommitChunkLocations(CommitChunkLocationsRequest) returns (CommitChunkLocationsResponse);
+
   // --- Data node facing RPCs ---
 
   // Register a data node with the cluster
@@ -60,6 +63,9 @@ message GetFileLocationsResponse {
   string path = 1;
   uint64 total_size = 2;
   repeated ChunkLocationInfo chunks = 3;
+  // Logical chunk size for this file (bytes). Used by clients to map byte
+  // offsets to chunk indices. Added in fix #13.
+  uint64 chunk_size = 4;
 }
 
 // --- DeleteFile ---
@@ -105,6 +111,25 @@ message AllocateChunksResponse {
   repeated ChunkPlacement placements = 1;
 }
 
+// --- CommitChunkLocations ---
+message ChunkLocationCommit {
+  uint32 chunk_index = 1;
+  string chunk_id = 2; // hex BLAKE3 id from PutChunkResponse
+  string primary_address = 3; // e.g. http://host:9500
+  uint64 size_bytes = 4;
+  uint32 disk_id = 5;
+}
+
+message CommitChunkLocationsRequest {
+  string path = 1;
+  string volume_id = 2;
+  repeated ChunkLocationCommit chunks = 3;
+}
+
+message CommitChunkLocationsResponse {
+  bool success = 1;
+}
+
 // --- RegisterNode ---
 message RegisterNodeRequest {
   string hostname = 1;
@@ -112,6 +137,8 @@ message RegisterNodeRequest {
   uint32 grpc_port = 3;
   dtfs.common.Location location = 4;
   repeated dtfs.common.DiskInfo disks = 5;
+  // Must match manager cluster.shared_secret when the cluster secret is non-empty.
+  optional string shared_secret = 6;
 }
 
 message RegisterNodeResponse {

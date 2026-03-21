@@ -19,6 +19,7 @@ use dashmap::DashMap;
 use tracing::{debug, info, instrument, warn};
 
 use dtfs_client::client::DtfsClient;
+use dtfs_proto::dtfs::manager::ChunkLocationCommit;
 use dtfs_common::config::FuseConfig;
 use dtfs_common::topology::Location;
 
@@ -41,6 +42,11 @@ pub struct FileLocations {
     pub chunks: Vec<ChunkInfo>,
     /// Volume ID this file belongs to.
     pub volume_id: String,
+    /// Logical chunk size for this file in bytes.
+    ///
+    /// Used to map byte offsets to chunk indices. Populated from the manager's
+    /// `GetFileLocationsResponse.chunk_size` field (fix for issue #13).
+    pub chunk_size: u64,
 }
 
 /// Information about a single chunk within a file.
@@ -477,6 +483,7 @@ impl DtfsFilesystem {
                     total_size: 0,
                     chunks: Vec::new(),
                     volume_id: response.volume_id,
+                    chunk_size: response.chunk_size,
                 }),
                 chunk_size: response.chunk_size,
             },
@@ -557,6 +564,14 @@ impl DtfsFilesystem {
             })
             .collect();
 
+        // Use the chunk_size the manager returned; fall back to 128 MiB only
+        // when the field is absent (e.g. talking to an older manager build).
+        let chunk_size = if response.chunk_size > 0 {
+            response.chunk_size
+        } else {
+            128 * 1024 * 1024
+        };
+
         Ok(FileLocations {
             path: response.path,
             total_size: response.total_size,
@@ -566,6 +581,7 @@ impl DtfsFilesystem {
             // gets overridden when the file is created or opened with
             // a known volume.
             volume_id: "default".to_string(),
+            chunk_size,
         })
     }
 
@@ -589,11 +605,19 @@ impl DtfsFilesystem {
             .insert(path.to_string(), (locations, Instant::now()));
     }
 
-    /// Resolve chunk size for a file. Falls back to 128 MB default.
-    fn resolve_chunk_size(&self, _locations: &FileLocations) -> u64 {
-        // In a full implementation this would come from the volume config
-        // cached during file open. For now, use the default.
-        128 * 1024 * 1024
+    /// Resolve the logical chunk size for a file.
+    ///
+    /// Uses the value returned by the manager in `GetFileLocationsResponse`
+    /// (now stored in `FileLocations.chunk_size`). Falls back to 128 MiB only
+    /// when the field was absent (fix for issue #13 — previously always
+    /// returned 128 MiB, making byte-offset → chunk-index mapping wrong for
+    /// any volume configured with a different chunk size).
+    fn resolve_chunk_size(&self, locations: &FileLocations) -> u64 {
+        if locations.chunk_size > 0 {
+            locations.chunk_size
+        } else {
+            128 * 1024 * 1024
+        }
     }
 
     /// Select the nearest data node from a list of addresses.
@@ -646,7 +670,9 @@ impl DtfsFilesystem {
             .await
             .with_context(|| format!("allocate_chunks failed for {path}"))?;
 
-        // Write each segment to its assigned primary node.
+        let mut commits: Vec<ChunkLocationCommit> = Vec::with_capacity(segments.len());
+
+        // Write each segment to its assigned primary node; chunk ids are content-defined by the data node.
         for (i, segment) in segments.iter().enumerate() {
             let placement = alloc_response
                 .placements
@@ -659,12 +685,11 @@ impl DtfsFilesystem {
                     )
                 })?;
 
-            let chunk_id = format!("{path}:chunk-{}", segment.chunk_index);
-
-            self.client
+            let put_resp = self
+                .client
                 .write_chunk(
                     &placement.primary_address,
-                    &chunk_id,
+                    "",
                     &volume_id,
                     "hot", // New writes go to hot tier.
                     &segment.data,
@@ -672,10 +697,18 @@ impl DtfsFilesystem {
                 .await
                 .with_context(|| {
                     format!(
-                        "write_chunk failed for {} on {}",
-                        chunk_id, placement.primary_address
+                        "write_chunk failed for chunk_index {} on {}",
+                        segment.chunk_index, placement.primary_address
                     )
                 })?;
+
+            commits.push(ChunkLocationCommit {
+                chunk_index: segment.chunk_index,
+                chunk_id: put_resp.chunk_id,
+                primary_address: placement.primary_address.clone(),
+                size_bytes: put_resp.size,
+                disk_id: 0,
+            });
 
             debug!(
                 path,
@@ -685,6 +718,11 @@ impl DtfsFilesystem {
                 "chunk written to cluster"
             );
         }
+
+        self.client
+            .commit_chunk_locations(path, &volume_id, commits)
+            .await
+            .with_context(|| format!("commit_chunk_locations failed for {path}"))?;
 
         Ok(())
     }
@@ -756,6 +794,7 @@ mod tests {
             total_size: 42,
             chunks: Vec::new(),
             volume_id: "default".to_string(),
+            chunk_size: 128 * 1024 * 1024,
         };
         let attr = file_attr_from_locations(&loc);
         assert_eq!(attr.size, 42);

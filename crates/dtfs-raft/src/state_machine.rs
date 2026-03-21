@@ -18,7 +18,7 @@ use dtfs_common::types::VolumeConfig;
 
 use crate::snapshot::{self, StateMachineSnapshot};
 use crate::{
-    ChunkLocationEntry, ClientRequest, ClientResponse, TypeConfig,
+    merge_chunk_location_entries, ChunkLocationEntry, ClientRequest, ClientResponse, TypeConfig,
 };
 
 // Re-export type aliases for convenience.
@@ -26,12 +26,19 @@ type LogId = crate::LogId;
 type StoredMembership = crate::StoredMembership;
 
 // ---------------------------------------------------------------------------
+// Audit log cap — prevents unbounded memory growth
+// ---------------------------------------------------------------------------
+
+/// Maximum number of audit entries retained in the state machine.
+/// Oldest entries are evicted once this limit is exceeded.
+const MAX_AUDIT_LOG_ENTRIES: usize = 10_000;
+
+// ---------------------------------------------------------------------------
 // Domain types stored inside the state machine
 // ---------------------------------------------------------------------------
 
-/// A completed scrub operation result, stored in the state machine so the
-/// WebUI and `/api/v1/stats` can surface the most recent scrub without
-/// querying individual data nodes.
+/// A completed scrub operation result, stored per data-node in the state
+/// machine so the WebUI and `/api/v1/stats` can surface health per node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScrubRecord {
     pub node_id: u64,
@@ -90,16 +97,28 @@ pub struct StateMachineData {
     pub audit_log: Vec<AuditEntry>,
 
     // ---- observability state ----
-    /// The most recent scrub result reported by any data node.
-    /// Updated by `ClientRequest::ReportScrubResult`; surfaced by
-    /// `GET /api/v1/stats` and the WebUI home page.
-    pub last_scrub: Option<ScrubRecord>,
+    /// Per-node scrub results, keyed by `node_id`.
+    ///
+    /// Storing one record per node ensures that a fast scrub on node B does
+    /// not silently discard the result from node A (fix for issue #8 —
+    /// previously only the cluster-wide "most recent" single result was kept).
+    #[serde(default)]
+    pub scrub_results: BTreeMap<u64, ScrubRecord>,
+
     /// Number of registered FUSE clients (updated by client heartbeats).
     pub client_count: u64,
 
     /// Volume configurations, keyed by volume_id string.
     #[serde(default)]
     pub volumes: BTreeMap<String, VolumeConfig>,
+
+    /// Migration-scheduler state, serialised as JSON.
+    ///
+    /// Kept in its own field instead of `cluster_config.config_json` so that
+    /// the scheduler's internal bookkeeping never clobbers user-visible
+    /// cluster configuration (fix for issue #3).
+    #[serde(default)]
+    pub migration_state_json: String,
 }
 
 impl Default for StateMachineData {
@@ -111,9 +130,10 @@ impl Default for StateMachineData {
             nodes: BTreeMap::new(),
             cluster_config: ClusterConfig::default(),
             audit_log: Vec::new(),
-            last_scrub: None,
+            scrub_results: BTreeMap::new(),
             client_count: 0,
             volumes: BTreeMap::new(),
+            migration_state_json: String::new(),
         }
     }
 }
@@ -181,9 +201,10 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
             nodes: sm.nodes.clone(),
             cluster_config: sm.cluster_config.clone(),
             audit_log: sm.audit_log.clone(),
-            last_scrub: sm.last_scrub.clone(),
+            scrub_results: sm.scrub_results.clone(),
             client_count: sm.client_count,
             volumes: sm.volumes.clone(),
+            migration_state_json: sm.migration_state_json.clone(),
         };
 
         let cursor = snapshot::serialize_snapshot(&snap)?;
@@ -286,9 +307,10 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             sm.nodes = snap_data.nodes;
             sm.cluster_config = snap_data.cluster_config;
             sm.audit_log = snap_data.audit_log;
-            sm.last_scrub = snap_data.last_scrub;
+            sm.scrub_results = snap_data.scrub_results;
             sm.client_count = snap_data.client_count;
             sm.volumes = snap_data.volumes;
+            sm.migration_state_json = snap_data.migration_state_json;
         }
 
         // Store the snapshot blob for later retrieval.
@@ -323,6 +345,18 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 // Business logic for applying a single ClientRequest
 // ---------------------------------------------------------------------------
 
+/// Push an audit entry and cap the log at `MAX_AUDIT_LOG_ENTRIES`.
+///
+/// Oldest entries are drained from the front when the cap is exceeded,
+/// preventing unbounded memory growth (fix for issue #5).
+fn push_audit_capped(log: &mut Vec<AuditEntry>, entry: AuditEntry) {
+    log.push(entry);
+    if log.len() > MAX_AUDIT_LOG_ENTRIES {
+        let excess = log.len() - MAX_AUDIT_LOG_ENTRIES;
+        log.drain(..excess);
+    }
+}
+
 fn apply_request(
     sm: &mut StateMachineData,
     log_id: &LogId,
@@ -356,8 +390,7 @@ fn apply_request(
                     updated_at_ms: now_ms,
                 },
             );
-            sm.audit_log
-                .push(audit(format!("CreateFile: {path}")));
+            push_audit_capped(&mut sm.audit_log, audit(format!("CreateFile: {path}")));
             ClientResponse::FileCreated {
                 path: path.clone(),
                 volume_id: volume_id.clone(),
@@ -366,18 +399,18 @@ fn apply_request(
 
         ClientRequest::DeleteFile { path } => {
             sm.files.remove(path);
-            sm.audit_log
-                .push(audit(format!("DeleteFile: {path}")));
+            push_audit_capped(&mut sm.audit_log, audit(format!("DeleteFile: {path}")));
             ClientResponse::Success
         }
 
         ClientRequest::UpdateChunkLocations { path, chunks } => {
             if let Some(file) = sm.files.get_mut(path) {
-                file.chunks.clone_from(chunks);
+                file.chunks = merge_chunk_location_entries(&file.chunks, chunks);
                 file.updated_at_ms = now_ms;
-                sm.audit_log.push(audit(format!(
-                    "UpdateChunks: {path} ({} chunks)",
-                    chunks.len()
+                push_audit_capped(&mut sm.audit_log, audit(format!(
+                    "UpdateChunks: {path} (merged {} incoming -> {} total)",
+                    chunks.len(),
+                    file.chunks.len()
                 )));
                 ClientResponse::Success
             } else {
@@ -390,15 +423,13 @@ fn apply_request(
 
         ClientRequest::RegisterNode { node_id, info } => {
             sm.nodes.insert(*node_id, info.clone());
-            sm.audit_log
-                .push(audit(format!("RegisterNode: {node_id}")));
+            push_audit_capped(&mut sm.audit_log, audit(format!("RegisterNode: {node_id}")));
             ClientResponse::Success
         }
 
         ClientRequest::DeregisterNode { node_id } => {
             sm.nodes.remove(node_id);
-            sm.audit_log
-                .push(audit(format!("DeregisterNode: {node_id}")));
+            push_audit_capped(&mut sm.audit_log, audit(format!("DeregisterNode: {node_id}")));
             ClientResponse::Success
         }
 
@@ -417,8 +448,29 @@ fn apply_request(
                         warn!("unknown node status: {other}");
                     }
                 }
-                sm.audit_log
-                    .push(audit(format!("UpdateNodeStatus: {node_id} -> {status}")));
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit(format!("UpdateNodeStatus: {node_id} -> {status}")),
+                );
+                ClientResponse::Success
+            } else {
+                ClientResponse::Error {
+                    message: format!("node not found: {node_id}"),
+                }
+            }
+        }
+
+        ClientRequest::UpdateNodeUsage {
+            node_id,
+            used_capacity,
+            chunk_count: _chunk_count,
+        } => {
+            if let Some(node) = sm.nodes.get_mut(node_id) {
+                node.used_capacity = *used_capacity;
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit(format!("UpdateNodeUsage: {node_id} used={used_capacity}")),
+                );
                 ClientResponse::Success
             } else {
                 ClientResponse::Error {
@@ -435,21 +487,20 @@ fn apply_request(
                 config_json: config_json.clone(),
                 version: *version,
             };
-            sm.audit_log
-                .push(audit(format!("UpdateConfig: v{version}")));
+            push_audit_capped(&mut sm.audit_log, audit(format!("UpdateConfig: v{version}")));
             ClientResponse::Success
         }
 
         ClientRequest::UpsertVolume { config } => {
             let vol_id = config.id.0.clone();
-            sm.audit_log.push(audit(format!("UpsertVolume: {vol_id}")));
+            push_audit_capped(&mut sm.audit_log, audit(format!("UpsertVolume: {vol_id}")));
             sm.volumes.insert(vol_id, config.clone());
             ClientResponse::Success
         }
 
         ClientRequest::DeleteVolume { volume_id } => {
             sm.volumes.remove(volume_id);
-            sm.audit_log.push(audit(format!("DeleteVolume: {volume_id}")));
+            push_audit_capped(&mut sm.audit_log, audit(format!("DeleteVolume: {volume_id}")));
             ClientResponse::Success
         }
 
@@ -475,18 +526,22 @@ fn apply_request(
                 chunks_missing: *chunks_missing,
                 duration_secs: *duration_secs,
             };
-            // Keep only the most recent scrub result cluster-wide.
-            let is_newer = sm
-                .last_scrub
-                .as_ref()
-                .map_or(true, |prev| *completed_at_ms > prev.completed_at_ms);
-            if is_newer {
-                sm.last_scrub = Some(record);
-            }
-            sm.audit_log.push(audit(format!(
+            // Store per-node: each data node maintains its own latest result.
+            // Previously only the single most-recent cluster-wide result was
+            // kept, which caused a fast scrub on node B to silently drop node
+            // A's result (fix for issue #8).
+            sm.scrub_results.insert(*node_id, record);
+            push_audit_capped(&mut sm.audit_log, audit(format!(
                 "ScrubResult: node={node_id} disk={disk_path} level={level} \
                  checked={chunks_checked} corrupt={chunks_corrupt} missing={chunks_missing}"
             )));
+            ClientResponse::Success
+        }
+
+        ClientRequest::UpdateMigrationState { json } => {
+            // Dedicated field — never touches cluster_config.config_json
+            // (fix for issue #3: migration state used to clobber cluster config).
+            sm.migration_state_json = json.clone();
             ClientResponse::Success
         }
     }
