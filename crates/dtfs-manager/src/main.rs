@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+// Mitigate rustc 1.94.x ICE in dead_code / join module analysis (see ISSUES_TO_FIX.md).
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,11 +14,9 @@ mod api;
 mod audit;
 #[allow(dead_code)]
 mod cluster;
-#[allow(dead_code)]
 mod join;
 mod metadata;
 mod monitor;
-#[allow(dead_code)]
 mod placement;
 mod scheduler;
 mod server;
@@ -84,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
     let network_factory = dtfs_raft::network::NetworkFactory;
     let raft = openraft::Raft::new(
         // Use a deterministic node id derived from the hostname hash.
-        node_id_from_hostname(&config.node.hostname),
+        dtfs_common::node_id_from_hostname(&config.node.hostname),
         raft_config,
         network_factory,
         log_store,
@@ -95,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 5. Bootstrap if this is the initial cluster node.
     if config.cluster.bootstrap {
-        let node_id = node_id_from_hostname(&config.node.hostname);
+        let node_id = dtfs_common::node_id_from_hostname(&config.node.hostname);
         let node = dtfs_raft::DtfsNode {
             addr: config.grpc.listen_addr.clone(),
             hostname: config.node.hostname.clone(),
@@ -116,8 +118,16 @@ async fn main() -> anyhow::Result<()> {
     // --- Shared services ---
 
     let audit_log = Arc::new(AuditLog::default());
-    let cluster_mgr = Arc::new(ClusterManager::new(raft.clone()));
-    let _placement_engine = Arc::new(PlacementEngine::new());
+    // ClusterManager no longer holds a Raft reference; heartbeat tracking is
+    // its only responsibility. Raft writes are performed by HealthMonitor.
+    let cluster_mgr = Arc::new(ClusterManager::new());
+    let placement_engine = Arc::new(PlacementEngine::new());
+    let join_handler = Arc::new(join::JoinHandler::new(
+        config.cluster.shared_secret.clone(),
+        config.cluster.name.clone(),
+        raft.clone(),
+        audit_log.clone(),
+    ));
 
     // --- Task scheduler background task ---
 
@@ -165,6 +175,8 @@ async fn main() -> anyhow::Result<()> {
         config.clone(),
         raft.clone(),
         sm_data.clone(),
+        placement_engine.clone(),
+        cluster_mgr.clone(), // Fix #2: wire heartbeat tracking into the gRPC handler
     );
 
     // --- Start servers ---
@@ -176,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
         raft.clone(),
         sm_data.clone(),
         audit_log.clone(),
+        join_handler.clone(),
     ));
 
     audit_log.log(
@@ -204,11 +217,4 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Derive a deterministic u64 node id from a hostname string.
-fn node_id_from_hostname(hostname: &str) -> u64 {
-    let hash = xxhash_rust::xxh3::xxh3_64(hostname.as_bytes());
-    // Ensure non-zero (OpenRaft may treat 0 specially).
-    if hash == 0 { 1 } else { hash }
 }

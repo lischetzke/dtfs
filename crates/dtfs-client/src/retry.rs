@@ -7,6 +7,9 @@ use std::time::Duration;
 use rand::Rng;
 use tracing::{debug, warn};
 
+/// Hard cap so `max_retries` cannot lock the runtime forever.
+const MAX_RETRIES_CAP: u32 = 4096;
+
 /// Configuration for retry with exponential backoff.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -31,28 +34,37 @@ impl Default for RetryConfig {
 impl RetryConfig {
     pub fn new(max_retries: u32, base_delay: Duration, max_delay: Duration) -> Self {
         Self {
-            max_retries,
+            max_retries: max_retries.min(MAX_RETRIES_CAP),
             base_delay,
             max_delay,
         }
     }
 
-    /// Compute the delay for a given attempt (0-indexed), with jitter.
+    /// Compute the delay for a given attempt (0-indexed), with additive jitter.
+    ///
+    /// The previous implementation returned a random value in `[0, capped]`,
+    /// which could produce a delay of 0 ms on any attempt — defeating the
+    /// purpose of exponential backoff entirely (fix for issue #9).
+    ///
+    /// The corrected approach: wait the full exponential delay, then add a
+    /// random jitter of up to 25 % of that delay to spread retries and avoid
+    /// thundering-herd effects.
     fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        // Exponential: base_delay * 2^attempt
+        // Exponential: base_delay * 2^attempt, capped at max_delay.
         let exp_delay = self
             .base_delay
             .saturating_mul(1u32.wrapping_shl(attempt));
         let capped = exp_delay.min(self.max_delay);
 
-        // Add jitter: random value in [0, capped]
-        let jitter_ms = if capped.as_millis() > 0 {
-            rand::thread_rng().gen_range(0..=capped.as_millis() as u64)
+        // Jitter: up to 25 % of the capped delay (minimum 1 ms when non-zero).
+        let jitter_range = ((capped.as_millis() / 4) as u64).max(if capped.is_zero() { 0 } else { 1 });
+        let jitter_ms = if jitter_range > 0 {
+            rand::thread_rng().gen_range(0..=jitter_range)
         } else {
             0
         };
 
-        Duration::from_millis(jitter_ms)
+        capped + Duration::from_millis(jitter_ms)
     }
 }
 

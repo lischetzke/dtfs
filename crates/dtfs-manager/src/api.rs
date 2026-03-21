@@ -7,21 +7,23 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{Json, Query, State},
     http::StatusCode,
-    response::Json,
     routing::{get, post},
     Router,
 };
 use dtfs_common::config::ManagerConfig;
+use dtfs_common::topology::Location;
+use dtfs_common::types::{DiskStatus, DiskTier, HealthStatus, NodeRole};
 use dtfs_raft::state_machine::StateMachineData;
-use dtfs_raft::{ClientRequest, DtfsRaft};
+use dtfs_raft::{ClientRequest, DtfsRaft, NodeInfo as RaftNodeInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::audit::AuditLog;
+use crate::join::JoinHandler;
 use crate::webui;
 
 /// Shared application state for API handlers.
@@ -31,6 +33,7 @@ pub struct AppState {
     pub raft: Arc<DtfsRaft>,
     pub sm_data: Arc<RwLock<StateMachineData>>,
     pub audit_log: Arc<AuditLog>,
+    pub join: Arc<JoinHandler>,
 }
 
 /// Build the full API router (REST endpoints + WebUI).
@@ -63,6 +66,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/scrub", post(trigger_scrub))
         // Stats (aggregate cluster metrics for WebUI home page)
         .route("/api/v1/stats", get(get_stats))
+        // HMAC join (phase 1: challenge, phase 2: Raft register)
+        .route("/api/v1/join/request", post(join_request_api))
+        .route("/api/v1/join/complete", post(join_complete_api))
         .with_state(state);
 
     // Merge API routes (higher priority) with WebUI (fallback).
@@ -75,12 +81,14 @@ pub async fn run_api_server(
     raft: Arc<DtfsRaft>,
     sm_data: Arc<RwLock<StateMachineData>>,
     audit_log: Arc<AuditLog>,
+    join: Arc<JoinHandler>,
 ) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         config: config.clone(),
         raft,
         sm_data,
         audit_log,
+        join,
     });
 
     let app = build_router(state);
@@ -124,6 +132,142 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> Json<Value> {
 
 async fn health_check() -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(json!({"status": "healthy"})))
+}
+
+// ---------------------------------------------------------------------------
+// Join (HMAC handshake — `join::JoinHandler`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct JoinRequestApi {
+    nonce: String,
+    hmac_hex: String,
+    hostname: String,
+}
+
+async fn join_request_api(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<JoinRequestApi>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let hmac = hex::decode(body.hmac_hex.trim()).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid hmac_hex: {e}")})),
+        )
+    })?;
+    let r = state
+        .join
+        .handle_join_request(&body.nonce, &hmac, &body.hostname);
+    Ok(Json(json!({
+        "accepted": r.accepted,
+        "challenge": r.challenge,
+        "ca_cert_pem": String::from_utf8_lossy(&r.ca_cert_pem),
+        "rejection_reason": r.rejection_reason,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinDiskApi {
+    disk_id: u32,
+    uuid: String,
+    mount_path: String,
+    tier: String,
+    #[serde(default)]
+    total_bytes: u64,
+    #[serde(default)]
+    used_bytes: u64,
+    #[serde(default)]
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinCompleteApi {
+    node_id: u64,
+    hostname: String,
+    grpc_addr: String,
+    #[serde(default)]
+    region: String,
+    #[serde(default)]
+    datacenter: String,
+    #[serde(default)]
+    rack: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    disks: Vec<JoinDiskApi>,
+}
+
+fn tier_join(s: &str) -> DiskTier {
+    match s.to_ascii_lowercase().as_str() {
+        "warm" => DiskTier::Warm,
+        "cold" => DiskTier::Cold,
+        "tape" => DiskTier::Tape,
+        _ => DiskTier::Hot,
+    }
+}
+
+fn disk_status_join(s: &str) -> DiskStatus {
+    match s.to_ascii_lowercase().as_str() {
+        "degraded" => DiskStatus::Degraded,
+        "draining" => DiskStatus::Draining,
+        "failed" => DiskStatus::Failed,
+        "removed" => DiskStatus::Removed,
+        _ => DiskStatus::Healthy,
+    }
+}
+
+async fn join_complete_api(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<JoinCompleteApi>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let disks: Vec<dtfs_common::types::DiskInfo> = body
+        .disks
+        .iter()
+        .map(|d| dtfs_common::types::DiskInfo {
+            disk_id: d.disk_id,
+            uuid: d.uuid.clone(),
+            mount_path: d.mount_path.clone(),
+            tier: tier_join(&d.tier),
+            total_bytes: d.total_bytes,
+            used_bytes: d.used_bytes,
+            status: disk_status_join(&d.status),
+        })
+        .collect();
+    let total_capacity: u64 = disks.iter().map(|d| d.total_bytes).sum();
+    let used_capacity: u64 = disks.iter().map(|d| d.used_bytes).sum();
+
+    let info = RaftNodeInfo {
+        role: NodeRole::Data,
+        hostname: body.hostname.clone(),
+        grpc_addr: body.grpc_addr.clone(),
+        location: Location::new(
+            &body.region,
+            &body.datacenter,
+            &body.rack,
+            &body.host,
+        ),
+        disks,
+        total_capacity,
+        used_capacity,
+        health: HealthStatus::Healthy,
+    };
+
+    let completion = state
+        .join
+        .complete_join(body.node_id, info)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+
+    Ok(Json(json!({
+        "success": completion.success,
+        "config_version": completion.config_version,
+        "config_json": completion.config_json,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -573,20 +717,45 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         "healthy"
     };
 
-    // Last scrub result (if any).
-    let last_scrub = sm.last_scrub.as_ref().map(|s| {
-        json!({
-            "node_id":         s.node_id,
-            "disk_path":       s.disk_path,
-            "level":           s.level,
-            "completed_at_ms": s.completed_at_ms,
-            "chunks_checked":  s.chunks_checked,
-            "chunks_healthy":  s.chunks_healthy,
-            "chunks_corrupt":  s.chunks_corrupt,
-            "chunks_missing":  s.chunks_missing,
-            "duration_secs":   s.duration_secs,
+    // Per-node scrub results (fix for issue #8 — previously only the single
+    // most-recent cluster-wide result was kept, silently dropping all others).
+    let scrub_results_by_node: Vec<Value> = sm
+        .scrub_results
+        .values()
+        .map(|s| {
+            json!({
+                "node_id":         s.node_id,
+                "disk_path":       s.disk_path,
+                "level":           s.level,
+                "completed_at_ms": s.completed_at_ms,
+                "chunks_checked":  s.chunks_checked,
+                "chunks_healthy":  s.chunks_healthy,
+                "chunks_corrupt":  s.chunks_corrupt,
+                "chunks_missing":  s.chunks_missing,
+                "duration_secs":   s.duration_secs,
+            })
         })
-    });
+        .collect();
+
+    // Backward-compatible `last_scrub` field: the most recent result across
+    // all nodes, or null when no scrubs have run yet.
+    let last_scrub = sm
+        .scrub_results
+        .values()
+        .max_by_key(|s| s.completed_at_ms)
+        .map(|s| {
+            json!({
+                "node_id":         s.node_id,
+                "disk_path":       s.disk_path,
+                "level":           s.level,
+                "completed_at_ms": s.completed_at_ms,
+                "chunks_checked":  s.chunks_checked,
+                "chunks_healthy":  s.chunks_healthy,
+                "chunks_corrupt":  s.chunks_corrupt,
+                "chunks_missing":  s.chunks_missing,
+                "duration_secs":   s.duration_secs,
+            })
+        });
 
     Json(json!({
         "health":                health,
@@ -605,6 +774,7 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         "io_read_bytes_per_sec":  0u64,
         "io_write_bytes_per_sec": 0u64,
         "last_scrub":            last_scrub,
+        "scrub_results_by_node": scrub_results_by_node,
         "config_version":        sm.cluster_config.version,
     }))
 }

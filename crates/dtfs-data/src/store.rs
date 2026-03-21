@@ -83,6 +83,11 @@ impl ChunkStore {
         }
     }
 
+    /// Access the disk manager (e.g. for `GetDiskStatus` RPC).
+    pub fn disk_manager(&self) -> &Arc<DiskManager> {
+        &self.disk_manager
+    }
+
     /// Write a chunk to disk with fsync guarantee.
     /// Returns the ChunkMeta on success.
     ///
@@ -221,17 +226,36 @@ impl ChunkStore {
             let meta_path = chunk_meta_path(&disk.mount_path, chunk_id);
 
             if dat_path.exists() {
+                // Read the on-disk file size *before* deleting so we can
+                // accurately decrement bytes_stored. Previously this counter
+                // was never decremented on delete, causing it to grow
+                // monotonically and report inflated storage usage (fix #6).
+                let file_size = fs::metadata(&dat_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
                 fs::remove_file(&dat_path).await.map_err(DtfsError::Io)?;
                 if meta_path.exists() {
                     fs::remove_file(&meta_path)
                         .await
                         .map_err(DtfsError::Io)?;
                 }
-                tracing::debug!("Deleted chunk {}", chunk_id);
+
+                tracing::debug!("Deleted chunk {} ({} bytes)", chunk_id, file_size);
+
                 // Update running counters (saturating to avoid underflow).
-                self.chunk_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                    Some(c.saturating_sub(1))
-                }).ok();
+                self.chunk_count
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                        Some(c.saturating_sub(1))
+                    })
+                    .ok();
+                self.bytes_stored
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                        Some(b.saturating_sub(file_size))
+                    })
+                    .ok();
+
                 return Ok(());
             }
         }

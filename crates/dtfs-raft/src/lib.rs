@@ -88,6 +88,32 @@ impl fmt::Display for ChunkLocationEntry {
     }
 }
 
+/// Merge `incoming` into `existing` without dropping unrelated replicas or chunk indices.
+///
+/// Entries are keyed by `(chunk_index, chunk_hash, node_id)`; a matching triple is replaced
+/// by the incoming row (e.g. updated `size_bytes`).
+pub fn merge_chunk_location_entries(
+    existing: &[ChunkLocationEntry],
+    incoming: &[ChunkLocationEntry],
+) -> Vec<ChunkLocationEntry> {
+    let mut out: Vec<ChunkLocationEntry> = existing.to_vec();
+    for inc in incoming {
+        out.retain(|e| {
+            !(e.chunk_index == inc.chunk_index
+                && e.chunk_hash == inc.chunk_hash
+                && e.node_id == inc.node_id)
+        });
+        out.push(inc.clone());
+    }
+    out.sort_by(|a, b| {
+        a.chunk_index
+            .cmp(&b.chunk_index)
+            .then_with(|| a.chunk_hash.cmp(&b.chunk_hash))
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    out
+}
+
 /// Node information stored in the Raft state machine (richer than `DtfsNode`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeInfo {
@@ -137,6 +163,13 @@ pub enum ClientRequest {
         status: String,
     },
 
+    /// Heartbeat-derived usage counters for a data node (best-effort).
+    UpdateNodeUsage {
+        node_id: u64,
+        used_capacity: u64,
+        chunk_count: u64,
+    },
+
     // ---- Config operations ----
     UpdateConfig {
         config_json: String,
@@ -156,9 +189,9 @@ pub enum ClientRequest {
     /// Record the result of a completed scrub operation.
     ///
     /// Data nodes report this after each quick or deep scrub cycle, and the
-    /// CLI can inject a result after a manually-triggered scrub.  The most
-    /// recent result (by `completed_at_ms`) is kept in the state machine and
-    /// surfaced by `/api/v1/stats` and the WebUI home page.
+    /// CLI can inject a result after a manually-triggered scrub.  The result
+    /// is stored per data-node in `scrub_results` and surfaced by
+    /// `/api/v1/stats` and the WebUI home page.
     ReportScrubResult {
         node_id: u64,
         disk_path: String,
@@ -171,6 +204,15 @@ pub enum ClientRequest {
         chunks_corrupt: u64,
         chunks_missing: u64,
         duration_secs: f64,
+    },
+
+    /// Persist migration-scheduler state as a dedicated Raft entry.
+    ///
+    /// Kept separate from `UpdateConfig` so that the scheduler's internal
+    /// bookkeeping never clobbers user-visible cluster configuration.
+    UpdateMigrationState {
+        /// JSON-serialised `MigrationState` struct from `dtfs-manager`.
+        json: String,
     },
 }
 
@@ -189,12 +231,23 @@ impl fmt::Display for ClientRequest {
             Self::UpdateNodeStatus { node_id, status } => {
                 write!(f, "UpdateNodeStatus({node_id}, {status})")
             }
+            Self::UpdateNodeUsage {
+                node_id,
+                used_capacity,
+                chunk_count,
+            } => {
+                write!(
+                    f,
+                    "UpdateNodeUsage({node_id}, used={used_capacity}, chunks={chunk_count})"
+                )
+            }
             Self::UpdateConfig { version, .. } => write!(f, "UpdateConfig(v{version})"),
             Self::UpsertVolume { config } => write!(f, "UpsertVolume({})", config.id),
             Self::DeleteVolume { volume_id } => write!(f, "DeleteVolume({volume_id})"),
             Self::ReportScrubResult { node_id, level, chunks_checked, chunks_corrupt, .. } => {
                 write!(f, "ReportScrubResult(node={node_id}, {level}, checked={chunks_checked}, corrupt={chunks_corrupt})")
             }
+            Self::UpdateMigrationState { .. } => write!(f, "UpdateMigrationState"),
         }
     }
 }
@@ -225,5 +278,54 @@ impl fmt::Display for ClientResponse {
             }
             Self::Error { message } => write!(f, "error({message})"),
         }
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::{merge_chunk_location_entries, ChunkLocationEntry};
+
+    #[test]
+    fn merge_adds_replica_same_chunk_distinct_node_replaces_identical_triple() {
+        let a = ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: "aa".into(),
+            node_id: "http://n1:1".into(),
+            disk_id: 0,
+            size_bytes: 10,
+        };
+        let b = ChunkLocationEntry {
+            chunk_index: 1,
+            chunk_hash: "bb".into(),
+            node_id: "http://n2:1".into(),
+            disk_id: 0,
+            size_bytes: 20,
+        };
+        // Second replica for chunk "aa" on another node — keep both.
+        let inc = ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: "aa".into(),
+            node_id: "http://n3:1".into(),
+            disk_id: 0,
+            size_bytes: 11,
+        };
+        let merged = merge_chunk_location_entries(&[a.clone(), b.clone()], &[inc.clone()]);
+        assert_eq!(merged.len(), 3);
+        assert!(merged.contains(&a));
+        assert!(merged.contains(&b));
+        assert!(merged.contains(&inc));
+
+        // Same triple updates size (replaces prior row).
+        let inc2 = ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: "aa".into(),
+            node_id: "http://n3:1".into(),
+            disk_id: 0,
+            size_bytes: 99,
+        };
+        let merged2 = merge_chunk_location_entries(&merged, &[inc2.clone()]);
+        assert_eq!(merged2.len(), 3);
+        assert!(merged2.contains(&inc2));
+        assert!(!merged2.contains(&inc));
     }
 }
