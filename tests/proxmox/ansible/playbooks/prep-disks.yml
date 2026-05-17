@@ -1,0 +1,77 @@
+---
+# Format & mount data-node disks before main DTFS setup
+# Virtual disks attached as scsi1/scsi2 appear as /dev/sdb /dev/sdc in guest.
+# Cloud-init will not have touched them; we own the format here.
+
+- name: Prepare data-node disks (XFS + mount)
+  hosts: data_nodes
+  become: true
+  gather_facts: false
+  vars:
+    disk_map:
+      - { dev: /dev/sdb, path: /mnt/disk-a, label: dtfs-hot }
+      - { dev: /dev/sdc, path: /mnt/disk-b, label: dtfs-cold }
+  tasks:
+    - name: Wait for disks to enumerate
+      ansible.builtin.wait_for:
+        path: "{{ item.dev }}"
+        timeout: 30
+      loop: "{{ disk_map }}"
+      loop_control:
+        label: "{{ item.dev }}"
+
+    - name: Install xfsprogs
+      ansible.builtin.apt:
+        name: xfsprogs
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Check existing filesystem on each disk
+      ansible.builtin.command: "blkid -o value -s TYPE {{ item.dev }}"
+      register: blkid_check
+      loop: "{{ disk_map }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Format empty disks as XFS
+      ansible.builtin.command: "mkfs.xfs -f -L {{ item.item.label }} {{ item.item.dev }}"
+      when: item.rc != 0 or item.stdout == ""
+      loop: "{{ blkid_check.results }}"
+      loop_control:
+        label: "{{ item.item.dev }}"
+
+    - name: Create mount points
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ disk_map }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Mount and add to fstab
+      ansible.posix.mount:
+        src: "LABEL={{ item.label }}"
+        path: "{{ item.path }}"
+        fstype: xfs
+        opts: defaults,nofail
+        state: mounted
+      loop: "{{ disk_map }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Verify mounted
+      ansible.builtin.command: "df -h {{ item.path }}"
+      register: df_out
+      changed_when: false
+      loop: "{{ disk_map }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Show mount summary
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines | last }}"
+      loop: "{{ df_out.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"

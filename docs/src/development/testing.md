@@ -43,26 +43,27 @@ cargo test -p dtfs-common test_hmac_roundtrip
 | `dtfs-data` | `cache` | ARC cache eviction, hit/miss tracking |
 | `dtfs-data` | `scrub` | Quick and deep scrub correctness |
 | `dtfs-raft` | `state_machine` | Raft state machine apply, snapshot, restore |
+| `dtfs-raft` | `lib` (`merge_tests`) | Chunk location merge semantics for `UpdateChunkLocations` |
 
 ## Integration Tests
 
-Integration tests verify interactions between multiple components. They are located in the `tests/` directory of each crate or at the workspace root.
+End-to-end checks use **Docker Compose** (see `deploy/`) plus **shell scripts** under `tests/integration/` (and related `tests/performance/`, `tests/chaos/`). There is **no** workspace-root `tests/*.rs` harness yet.
 
-### Running Integration Tests
+### Running Shell / Docker Integration Flow
 
 ```bash
-cargo test --test '*'
+cd deploy && docker compose build && docker compose up -d
+# Then run scripts from tests/integration/ (e.g. ./run_all.sh when available)
+docker compose down -v
 ```
 
-Integration tests typically spin up in-process instances of the manager and data nodes to test end-to-end flows without requiring external infrastructure.
+### Key scenarios (targets for scripts / manual QA)
 
-### Key Integration Test Scenarios
-
-- **Node join flow** -- A data node joins a manager cluster using the shared secret handshake, receives a CA certificate, and completes registration.
-- **File write/read roundtrip** -- A file is created via the manager, chunks are allocated and written to data nodes, then read back and verified.
-- **Replication** -- A chunk is written with replication factor 2, and both replicas are verified for correctness.
-- **Scrub detection** -- A chunk is intentionally corrupted on disk, a deep scrub detects the corruption, and the system re-replicates from a healthy replica.
-- **Configuration propagation** -- A cluster configuration update is applied via the REST API and verified to propagate to data nodes through heartbeat responses.
+- **Node join flow** — gRPC `RegisterNode` with `shared_secret`, or REST `POST /api/v1/join/*` HMAC flow.
+- **File write/read roundtrip** — create file, allocate chunks, write to data nodes, `CommitChunkLocations`, read back.
+- **Replication** — multiple placements / scheduler-driven copies.
+- **Scrub detection** — corrupt chunk, deep scrub, re-replication.
+- **Configuration propagation** — REST config updates and heartbeat-driven data-node config.
 
 ## Chaos Tests
 

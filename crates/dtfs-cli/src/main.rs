@@ -44,7 +44,8 @@ enum Commands {
     },
 
     /// Manage volumes
-    Volumes,
+    #[command(subcommand)]
+    Volumes(VolumesCmd),
 
     /// List files in the cluster
     Files {
@@ -98,6 +99,23 @@ enum Commands {
 
     /// Check manager health
     Health,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum VolumesCmd {
+    /// List all volumes
+    List,
+    /// Create a new volume
+    Create {
+        /// Volume name (used as both name and id)
+        name: String,
+        /// Per-tier replication factor (hot)
+        #[arg(long)]
+        replication_factor: Option<u32>,
+        /// Tier policy hint (currently informational)
+        #[arg(long)]
+        tier_policy: Option<String>,
+    },
 }
 
 struct ApiClient {
@@ -155,7 +173,14 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Commands::Status => cmd_status(&api, &args.format).await?,
         Commands::Nodes { id } => cmd_nodes(&api, &args.format, id).await?,
-        Commands::Volumes => cmd_volumes(&api, &args.format).await?,
+        Commands::Volumes(sub) => match sub {
+            VolumesCmd::List => cmd_volumes(&api, &args.format).await?,
+            VolumesCmd::Create {
+                name,
+                replication_factor,
+                tier_policy,
+            } => cmd_volumes_create(&api, &args.format, &name, replication_factor, tier_policy.as_deref()).await?,
+        },
         Commands::Files { limit } => cmd_files(&api, &args.format, limit).await?,
         Commands::Scrub {
             disk,
@@ -301,6 +326,32 @@ async fn cmd_nodes(
                 }
                 println!("\nTotal: {} nodes", nodes.len());
             }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_volumes_create(
+    api: &ApiClient,
+    format: &OutputFormat,
+    name: &str,
+    replication_factor: Option<u32>,
+    tier_policy: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut body = serde_json::json!({ "name": name });
+    if let Some(rf) = replication_factor {
+        body["replication_factor"] = serde_json::json!(rf);
+    }
+    if let Some(t) = tier_policy {
+        body["tier_policy"] = serde_json::json!(t);
+    }
+    let resp = api.post("/api/v1/volumes", &body).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => {
+            let status = resp["status"].as_str().unwrap_or("");
+            let id = resp["volume_id"].as_str().unwrap_or(name);
+            println!("Volume '{}' {}.", id, if status.is_empty() { "created" } else { status });
         }
     }
     Ok(())

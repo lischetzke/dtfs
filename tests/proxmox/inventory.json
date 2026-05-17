@@ -1,0 +1,173 @@
+{
+  "pve": {
+    "host": "10.150.0.121",
+    "node": "i-pve01",
+    "api_base": "https://10.150.0.121:8006/api2/json",
+    "bridge": "vmbr0",
+    "subnet": "10.150.0.0/24",
+    "gateway": "10.150.0.1",
+    "dns": ["10.150.0.2", "10.150.0.3"],
+    "storage_vm_disks": "pve01_ssd01",
+    "storage_data_disks": "pve01_ssd02",
+    "storage_iso": "local"
+  },
+  "ssh": {
+    "user": "debian",
+    "key_path": "C:/Users/leduc/.ssh/dtfs-lab/id_ed25519",
+    "pub_key_path": "C:/Users/leduc/.ssh/dtfs-lab/id_ed25519.pub"
+  },
+  "template": {
+    "vmid": 9000,
+    "name": "debian-13-cloudinit-tpl",
+    "source_image": "debian-13-generic-amd64.qcow2"
+  },
+  "vms": [
+    {
+      "role": "builder",
+      "vmid": 9001,
+      "name": "dtfs-builder",
+      "ip": "10.150.0.150",
+      "cores": 4,
+      "memory_mb": 8192,
+      "os_disk_gb": 32,
+      "extra_disks_gb": [],
+      "transient": true,
+      "notes": "Builds DTFS binaries; destroyed after Phase 0"
+    },
+    {
+      "role": "manager",
+      "vmid": 101,
+      "name": "mgr-01",
+      "ip": "10.150.0.151",
+      "cores": 2,
+      "memory_mb": 2048,
+      "os_disk_gb": 16,
+      "extra_disks_gb": [],
+      "rack": "rack-A",
+      "bootstrap": true
+    },
+    {
+      "role": "manager",
+      "vmid": 102,
+      "name": "mgr-02",
+      "ip": "10.150.0.152",
+      "cores": 2,
+      "memory_mb": 2048,
+      "os_disk_gb": 16,
+      "extra_disks_gb": [],
+      "rack": "rack-A"
+    },
+    {
+      "role": "manager",
+      "vmid": 103,
+      "name": "mgr-03",
+      "ip": "10.150.0.153",
+      "cores": 2,
+      "memory_mb": 2048,
+      "os_disk_gb": 16,
+      "extra_disks_gb": [],
+      "rack": "rack-B"
+    },
+    {
+      "role": "data",
+      "vmid": 104,
+      "name": "data-01",
+      "ip": "10.150.0.154",
+      "cores": 2,
+      "memory_mb": 3072,
+      "os_disk_gb": 16,
+      "extra_disks_gb": [16, 16],
+      "tiers": ["hot", "cold"],
+      "rack": "rack-A"
+    },
+    {
+      "role": "data",
+      "vmid": 105,
+      "name": "data-02",
+      "ip": "10.150.0.155",
+      "cores": 2,
+      "memory_mb": 3072,
+      "os_disk_gb": 16,
+      "extra_disks_gb": [16, 16],
+      "tiers": ["hot", "cold"],
+      "rack": "rack-A"
+    },
+    {
+      "role": "data",
+      "vmid": 106,
+      "name": "data-03",
+      "ip": "10.150.0.156",
+      "cores": 2,
+      "memory_mb": 3072,
+      "os_disk_gb": 16,
+      "extra_disks_gb": [16, 16],
+      "tiers": ["hot", "cold"],
+      "rack": "rack-B"
+    },
+    {
+      "role": "data",
+      "vmid": 107,
+      "name": "data-04",
+      "ip": "10.150.0.157",
+      "cores": 2,
+      "memory_mb": 3072,
+      "os_disk_gb": 16,
+      "extra_disks_gb": [16, 16],
+      "tiers": ["hot", "cold"],
+      "rack": "rack-B"
+    },
+    {
+      "role": "client",
+      "vmid": 108,
+      "name": "client-01",
+      "ip": "10.150.0.158",
+      "cores": 1,
+      "memory_mb": 1024,
+      "os_disk_gb": 16,
+      "extra_disks_gb": []
+    },
+    {
+      "role": "client",
+      "vmid": 109,
+      "name": "client-02",
+      "ip": "10.150.0.159",
+      "cores": 1,
+      "memory_mb": 1024,
+      "os_disk_gb": 16,
+      "extra_disks_gb": []
+    },
+    {
+      "role": "data_spare",
+      "vmid": 110,
+      "name": "data-05",
+      "ip": "10.150.0.160",
+      "cores": 2,
+      "memory_mb": 3072,
+      "os_disk_gb": 16,
+      "extra_disks_gb": [16, 16, 16],
+      "tiers": ["hot", "warm", "cold"],
+      "rack": "rack-A",
+      "notes": "Held in reserve for concurrent-join chaos test (Phase 4)"
+    },
+    {
+      "role": "data_spare",
+      "vmid": 111,
+      "name": "data-06",
+      "ip": "10.150.0.161",
+      "cores": 2,
+      "memory_mb": 3072,
+      "os_disk_gb": 16,
+      "extra_disks_gb": [16, 16, 16],
+      "tiers": ["hot", "warm", "cold"],
+      "rack": "rack-B",
+      "notes": "Held in reserve for concurrent-join chaos test (Phase 4)"
+    }
+  ],
+  "ram_budget": {
+    "host_total_gb": 30,
+    "host_reserved_gb": 4,
+    "cluster_active_gb": 20,
+    "builder_transient_gb": 8,
+    "spares_offline_until_phase4": true
+  }
+}

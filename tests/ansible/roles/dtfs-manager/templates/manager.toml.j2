@@ -1,105 +1,62 @@
-# DTFS Manager Configuration
-# Node: {{ inventory_hostname }} (node_id={{ dtfs_node_id }})
-# Managed by Ansible — do not edit manually
+# DTFS Manager Configuration — {{ inventory_hostname }}
+# Schema matches crates/dtfs-common/src/config.rs::ManagerConfig
 
 [node]
-id = {{ dtfs_node_id }}
-name = "{{ inventory_hostname }}"
-cluster = "{{ dtfs_cluster_name }}"
-location = "{{ dtfs_location }}"
+id = "auto"
+hostname = "{{ inventory_hostname }}"
+data_dir = "{{ dtfs_data_dir }}/manager"
+
+[location]
+region = "{{ dtfs_region | default('lab') }}"
+datacenter = "{{ dtfs_location }}"
+rack = "{{ dtfs_rack | default(dtfs_location ~ '-rack-default') }}"
+host = "{{ inventory_hostname }}"
 
 [cluster]
+name = "{{ dtfs_cluster_name }}"
 shared_secret = "{{ dtfs_shared_secret }}"
-peers = [
-{% for mgr in dtfs_managers %}
-{% if mgr.node_id != dtfs_node_id %}
-  { node_id = {{ mgr.node_id }}, addr = "{{ mgr.host }}:{{ mgr.port }}" },
-{% endif %}
+bootstrap = {{ 'true' if (dtfs_is_bootstrap | default(false)) else 'false' }}
+{% if dtfs_is_bootstrap | default(false) %}
+{% for h in groups['managers'] | sort %}
+[[cluster.initial_voters]]
+hostname = "{{ h }}"
+addr = "{{ hostvars[h].ansible_host }}:{{ dtfs_grpc_port | default(9401) }}"
 {% endfor %}
-]
+{% endif %}
 
 [raft]
-listen_addr = "{{ dtfs_raft_listen_addr }}:{{ dtfs_raft_port }}"
-data_dir = "{{ dtfs_raft_data_dir }}"
-election_timeout_min_ms = {{ dtfs_raft_election_timeout_min_ms }}
-election_timeout_max_ms = {{ dtfs_raft_election_timeout_max_ms }}
-heartbeat_interval_ms = {{ dtfs_raft_heartbeat_interval_ms }}
-snapshot_threshold = {{ dtfs_raft_snapshot_threshold }}
-snapshot_interval_s = {{ dtfs_raft_snapshot_interval_s }}
-log_max_entries = {{ dtfs_raft_log_max_entries }}
-leader_lease_duration_ms = {{ dtfs_leader_lease_duration_ms }}
-leader_renew_deadline_ms = {{ dtfs_leader_renew_deadline_ms }}
+listen_addr = "0.0.0.0:{{ dtfs_raft_port | default(9400) }}"
 
 [grpc]
-listen_addr = "{{ dtfs_grpc_listen_addr }}:{{ dtfs_grpc_port }}"
-max_message_size_bytes = {{ dtfs_grpc_max_message_size_mb | int * 1024 * 1024 }}
-keepalive_time_s = {{ dtfs_grpc_keepalive_time_s }}
-keepalive_timeout_s = {{ dtfs_grpc_keepalive_timeout_s }}
-max_concurrent_streams = {{ dtfs_grpc_max_concurrent_streams }}
+listen_addr = "0.0.0.0:{{ dtfs_grpc_port | default(9401) }}"
 
 [api]
-listen_addr = "{{ dtfs_api_listen_addr }}:{{ dtfs_api_port }}"
-read_timeout_s = {{ dtfs_api_read_timeout_s }}
-write_timeout_s = {{ dtfs_api_write_timeout_s }}
-max_body_size_bytes = {{ dtfs_api_max_body_size_mb | int * 1024 * 1024 }}
-
-[webui]
-enabled = {{ dtfs_webui_enabled | lower }}
-path = "{{ dtfs_webui_path }}"
-
-[metadata]
-dir = "{{ dtfs_metadata_dir }}"
-sync_interval_s = {{ dtfs_metadata_sync_interval_s }}
-checkpoint_interval_s = {{ dtfs_metadata_checkpoint_interval_s }}
-
-[replication]
-default_hot_factor = {{ dtfs_replication_hot_factor }}
-default_cold_factor = {{ dtfs_replication_cold_factor }}
-min_ack_replicas = {{ dtfs_replication_min_ack }}
-placement_strategy = "{{ dtfs_replication_placement }}"
-cross_dc = {{ dtfs_replication_cross_dc | lower }}
-trigger_delay_s = {{ dtfs_node_dead_after_s }}
-
-[chunks]
-size_bytes = {{ dtfs_chunk_size_mb | int * 1024 * 1024 }}
-checksum_algorithm = "{{ dtfs_chunk_checksum_algorithm }}"
-placement_strategy = "{{ dtfs_chunk_placement_strategy }}"
-
-[tiering]
-enabled = {{ dtfs_tiering_enabled | lower }}
-hot_threshold_accesses = {{ dtfs_tiering_hot_threshold_accesses }}
-hot_window_hours = {{ dtfs_tiering_hot_window_hours }}
-cold_after_hours = {{ dtfs_tiering_cold_after_hours }}
-evaluation_interval_s = {{ dtfs_tiering_evaluation_interval_s }}
-migration_bandwidth_mb = {{ dtfs_tiering_migration_bandwidth_mb }}
-
-[health]
-check_interval_s = {{ dtfs_health_check_interval_s }}
-check_timeout_s = {{ dtfs_health_check_timeout_s }}
-node_dead_after_s = {{ dtfs_node_dead_after_s }}
-node_suspect_after_s = {{ dtfs_node_suspect_after_s }}
-
-[scrub]
-quick_interval_hours = {{ dtfs_scrub_quick_interval_hours }}
-deep_interval_hours = {{ dtfs_scrub_deep_interval_hours }}
-concurrency = {{ dtfs_scrub_concurrency }}
-bandwidth_limit_mb = {{ dtfs_scrub_bandwidth_limit_mb }}
-
-[audit]
-enabled = {{ dtfs_audit_enabled | lower }}
-dir = "{{ dtfs_audit_dir }}"
-rotation_size_bytes = {{ dtfs_audit_rotation_size_mb | int * 1024 * 1024 }}
-retention_days = {{ dtfs_audit_retention_days }}
-
-[metrics]
-enabled = {{ dtfs_metrics_enabled | lower }}
-listen_addr = "0.0.0.0:{{ dtfs_manager_metrics_port }}"
-path = "{{ dtfs_manager_metrics_path }}"
+listen_addr = "0.0.0.0:{{ dtfs_api_port | default(9402) }}"
 
 [tls]
-enabled = {{ dtfs_tls_enabled | lower }}
+mode = "{{ dtfs_tls_mode | default('off') }}"
 
-[logging]
-level = "{{ dtfs_log_level }}"
-format = "{{ dtfs_log_format }}"
-dir = "{{ dtfs_log_dir }}/manager"
+[defaults]
+chunk_size_mb = {{ dtfs_chunk_size_mb | default(128) }}
+
+[defaults.write_safety]
+min_replicas_before_ack = {{ dtfs_replication_min_ack | default(2) }}
+write_timeout_secs = {{ dtfs_write_timeout_secs | default(30) }}
+
+[defaults.replication]
+hot = {{ dtfs_replication_hot_factor | default(3) }}
+warm = {{ dtfs_replication_warm_factor | default(2) }}
+cold = {{ dtfs_replication_cold_factor | default(1) }}
+
+[tiering]
+enabled = {{ dtfs_tiering_enabled | default(true) | lower }}
+hot_threshold_reads_per_hour = {{ dtfs_tiering_hot_threshold_reads_per_hour | default(5) }}
+cold_threshold_days = {{ dtfs_tiering_cold_threshold_days | default(14) }}
+frozen_threshold_days = {{ dtfs_tiering_frozen_threshold_days | default(90) }}
+evaluation_interval_secs = {{ dtfs_tiering_evaluation_interval_secs | default(3600) }}
+migration_bandwidth_limit_mbps = {{ dtfs_tiering_migration_bandwidth_mbps | default(200) }}
+
+[monitoring]
+heartbeat_interval_secs = {{ dtfs_heartbeat_interval_secs | default(5) }}
+suspect_after_missed = {{ dtfs_suspect_after_missed | default(3) }}
+down_after_missed = {{ dtfs_down_after_missed | default(6) }}

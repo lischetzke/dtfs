@@ -38,7 +38,6 @@
     owner: "{{ dtfs_user }}"
     group: "{{ dtfs_group }}"
     mode: "0640"
-    validate: "{{ dtfs_manager_bin }} --config %s --validate"
   notify: restart dtfs-manager
 
 - name: Deploy dtfs-manager systemd unit

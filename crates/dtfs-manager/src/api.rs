@@ -44,6 +44,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     });
 
     let api_routes = Router::new()
+        // P1-7 Prometheus scrape endpoint
+        .route("/metrics", get(prometheus_metrics))
+        // P1-10 K8s/systemd health probes
+        .route("/healthz", get(healthz_probe))
+        .route("/readyz", get(readyz_probe))
         // Cluster
         .route("/api/v1/cluster/status", get(cluster_status))
         .route("/api/v1/health", get(health_check))
@@ -422,11 +427,20 @@ async fn list_files(State(state): State<Arc<AppState>>) -> Json<Value> {
         .iter()
         .take(1000) // Limit response size
         .map(|(path, meta)| {
-            let total_size: u64 = meta.chunks.iter().map(|c| c.size_bytes).sum();
+            // Replica entries (one per node holding a copy) all share a
+            // chunk_index. Sum size per unique chunk_index, not per row.
+            let mut sizes_by_index: std::collections::BTreeMap<u64, u64> =
+                std::collections::BTreeMap::new();
+            for c in &meta.chunks {
+                let e = sizes_by_index.entry(c.chunk_index).or_insert(0);
+                *e = (*e).max(c.size_bytes);
+            }
+            let total_size: u64 = sizes_by_index.values().sum();
+            let chunk_count = sizes_by_index.len();
             json!({
                 "path": path,
                 "volume_id": meta.volume_id,
-                "chunk_count": meta.chunks.len(),
+                "chunk_count": chunk_count,
                 "total_size": total_size,
                 "created_at": meta.created_at_ms,
                 "updated_at": meta.updated_at_ms,
@@ -453,7 +467,14 @@ async fn list_volumes(State(state): State<Arc<AppState>>) -> Json<Value> {
     for meta in sm.files.values() {
         let entry = usage.entry(meta.volume_id.clone()).or_insert((0, 0));
         entry.0 += 1;
-        entry.1 += meta.chunks.iter().map(|c| c.size_bytes).sum::<u64>();
+        // Group by chunk_index so replicas don't multiply the reported size.
+        let mut by_index: std::collections::BTreeMap<u64, u64> =
+            std::collections::BTreeMap::new();
+        for c in &meta.chunks {
+            let e = by_index.entry(c.chunk_index).or_insert(0);
+            *e = (*e).max(c.size_bytes);
+        }
+        entry.1 += by_index.values().sum::<u64>();
     }
 
     // Merge with the volume configs stored in Raft state, falling back to
@@ -511,6 +532,11 @@ struct CreateVolumeRequest {
     replication_warm: Option<u32>,
     #[serde(default)]
     replication_cold: Option<u32>,
+    /// P0-10: optional anchor DC. When set, all chunks on this volume keep
+    /// at least one replica in this DC (and tiering refuses to migrate the
+    /// last anchor copy).
+    #[serde(default)]
+    anchor_datacenter: Option<String>,
 }
 
 async fn create_volume(
@@ -536,6 +562,7 @@ async fn create_volume(
             min_replicas_before_ack: state.config.defaults.write_safety.min_replicas_before_ack,
             write_timeout_secs:      state.config.defaults.write_safety.write_timeout_secs,
         },
+        anchor_datacenter: body.anchor_datacenter.clone(),
     };
 
     let req = ClientRequest::UpsertVolume { config };
@@ -816,4 +843,132 @@ async fn trigger_scrub(
         "target": target,
         "level": level,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// P1-7 + P1-10: Prometheus /metrics + health probes
+// ---------------------------------------------------------------------------
+
+/// `GET /metrics` — Prometheus text-format scrape.
+async fn prometheus_metrics(
+    State(state): State<Arc<AppState>>,
+) -> (axum::http::StatusCode, [(&'static str, &'static str); 1], String) {
+    let sm = state.sm_data.read().await;
+
+    let total_files = sm.files.len() as u64;
+    let total_volumes = sm.volumes.len() as u64;
+    let total_chunks: u64 = sm.files.values().map(|f| f.chunks.len() as u64).sum();
+    let active_leases = sm.write_leases.len() as u64;
+
+    let mut healthy = 0u64;
+    let mut suspect = 0u64;
+    let mut down = 0u64;
+    let mut total_capacity: u64 = 0;
+    let mut used_capacity: u64 = 0;
+    for info in sm.nodes.values() {
+        match info.health {
+            dtfs_common::types::HealthStatus::Healthy => healthy += 1,
+            dtfs_common::types::HealthStatus::Suspect => suspect += 1,
+            dtfs_common::types::HealthStatus::Down => down += 1,
+            _ => {}
+        }
+        total_capacity = total_capacity.saturating_add(info.total_capacity);
+        used_capacity = used_capacity.saturating_add(info.used_capacity);
+    }
+
+    let mut anchor_protected: u64 = 0;
+    let mut migration_failed: u64 = 0;
+    let mut migration_completed: u64 = 0;
+    for entry in &sm.audit_log {
+        let s = entry.summary.as_str();
+        if s.contains("tier.anchor_protected") {
+            anchor_protected += 1;
+        }
+        if s.contains("migration.failed") {
+            migration_failed += 1;
+        }
+        if s.contains("tier.promote") || s.contains("tier.demote") {
+            migration_completed += 1;
+        }
+    }
+
+    let raft_log_size = sm.audit_log.len() as u64;
+
+    let body = format!(
+        "# HELP dtfs_files_total Number of files tracked by the cluster.\n\
+         # TYPE dtfs_files_total gauge\n\
+         dtfs_files_total {total_files}\n\
+         # HELP dtfs_chunks_total Total chunk-location entries.\n\
+         # TYPE dtfs_chunks_total gauge\n\
+         dtfs_chunks_total {total_chunks}\n\
+         # HELP dtfs_volumes_total Number of configured volumes.\n\
+         # TYPE dtfs_volumes_total gauge\n\
+         dtfs_volumes_total {total_volumes}\n\
+         # HELP dtfs_nodes_healthy Number of nodes in Healthy state.\n\
+         # TYPE dtfs_nodes_healthy gauge\n\
+         dtfs_nodes_healthy {healthy}\n\
+         # HELP dtfs_nodes_suspect Number of nodes in Suspect state.\n\
+         # TYPE dtfs_nodes_suspect gauge\n\
+         dtfs_nodes_suspect {suspect}\n\
+         # HELP dtfs_nodes_down Number of nodes in Down state.\n\
+         # TYPE dtfs_nodes_down gauge\n\
+         dtfs_nodes_down {down}\n\
+         # HELP dtfs_cluster_capacity_bytes Total cluster capacity in bytes.\n\
+         # TYPE dtfs_cluster_capacity_bytes gauge\n\
+         dtfs_cluster_capacity_bytes {total_capacity}\n\
+         # HELP dtfs_cluster_used_bytes Used cluster capacity in bytes.\n\
+         # TYPE dtfs_cluster_used_bytes gauge\n\
+         dtfs_cluster_used_bytes {used_capacity}\n\
+         # HELP dtfs_write_leases_active Currently held single-writer leases.\n\
+         # TYPE dtfs_write_leases_active gauge\n\
+         dtfs_write_leases_active {active_leases}\n\
+         # HELP dtfs_anchor_protected_total Tiering decisions refused to protect anchor DC.\n\
+         # TYPE dtfs_anchor_protected_total counter\n\
+         dtfs_anchor_protected_total {anchor_protected}\n\
+         # HELP dtfs_tier_migrations_completed_total Completed tier migrations (promote+demote).\n\
+         # TYPE dtfs_tier_migrations_completed_total counter\n\
+         dtfs_tier_migrations_completed_total {migration_completed}\n\
+         # HELP dtfs_migration_failed_total Migration tasks that exhausted retries.\n\
+         # TYPE dtfs_migration_failed_total counter\n\
+         dtfs_migration_failed_total {migration_failed}\n\
+         # HELP dtfs_audit_log_in_memory Audit log entries held in the FSM (ring-buffered).\n\
+         # TYPE dtfs_audit_log_in_memory gauge\n\
+         dtfs_audit_log_in_memory {raft_log_size}\n",
+    );
+
+    (
+        axum::http::StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        body,
+    )
+}
+
+/// `GET /healthz` — liveness probe. Always 200 if the process responds.
+async fn healthz_probe() -> (axum::http::StatusCode, &'static str) {
+    (axum::http::StatusCode::OK, "ok\n")
+}
+
+/// `GET /readyz` — readiness probe. 200 only when at least one data node is
+/// healthy AND the state machine has applied at least one log entry (so the
+/// manager has finished its Raft warmup); 503 otherwise so K8s/systemd can
+/// route around an in-recovery manager.
+async fn readyz_probe(State(state): State<Arc<AppState>>) -> (axum::http::StatusCode, String) {
+    let sm = state.sm_data.read().await;
+    let any_healthy = sm
+        .nodes
+        .values()
+        .any(|n| n.health == dtfs_common::types::HealthStatus::Healthy);
+    let fsm_initialised = sm.last_applied_log.is_some();
+    drop(sm);
+
+    if fsm_initialised && any_healthy {
+        (axum::http::StatusCode::OK, "ready\n".to_string())
+    } else {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "not ready: fsm_initialised={fsm_initialised} any_healthy={any_healthy}\n"
+            ),
+        )
+    }
 }

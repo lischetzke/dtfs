@@ -1,0 +1,81 @@
+---
+# Clean redeploy: stop services, wipe state, install fresh binaries,
+# re-render configs, restart in the correct order. Use this after any
+# change that affects Raft topology, config schema, or systemd units
+# (i.e. all the F-001 .. F-016 fixes).
+
+- name: Stop DTFS services everywhere
+  hosts: dtfs_all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Stop dtfs-fuse on clients
+      ansible.builtin.shell: |
+        for u in $(systemctl list-units --type=service --no-legend 'dtfs-fuse@*' | awk '{print $1}'); do
+          systemctl stop "$u" || true
+        done
+        fusermount3 -uz {{ dtfs_mount_point | default('/mnt/dtfs') }} 2>/dev/null || true
+        umount -l {{ dtfs_mount_point | default('/mnt/dtfs') }} 2>/dev/null || true
+      changed_when: false
+      when: "'clients' in group_names"
+
+    - name: Stop dtfs-data
+      ansible.builtin.systemd:
+        name: dtfs-data
+        state: stopped
+      failed_when: false
+      when: "'data_nodes' in group_names"
+
+    - name: Stop dtfs-manager
+      ansible.builtin.systemd:
+        name: dtfs-manager
+        state: stopped
+      failed_when: false
+      when: "'managers' in group_names"
+
+- name: Wipe manager Raft state (needed when topology changes — F-009 redeploy)
+  hosts: managers
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Remove old Raft data dir
+      ansible.builtin.file:
+        path: "{{ dtfs_data_dir }}/manager"
+        state: absent
+
+    - name: Remove old DTFS config dir
+      ansible.builtin.file:
+        path: "{{ dtfs_config_dir }}"
+        state: absent
+
+- name: Wipe data node state
+  hosts: data_nodes
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Remove old data dir
+      ansible.builtin.file:
+        path: "{{ dtfs_data_dir }}/data"
+        state: absent
+
+    - name: Clear chunks/wal subdirs on each mounted disk
+      ansible.builtin.shell: |
+        for d in {{ dtfs_disks | map(attribute='path') | join(' ') }}; do
+          rm -rf "$d/chunks" "$d/tmp" "$d/.dtfs" 2>/dev/null || true
+        done
+      changed_when: false
+
+    - name: Remove old config dir
+      ansible.builtin.file:
+        path: "{{ dtfs_config_dir }}"
+        state: absent
+
+- name: Wipe client state
+  hosts: clients
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Remove old config dir
+      ansible.builtin.file:
+        path: "{{ dtfs_config_dir }}"
+        state: absent

@@ -27,8 +27,18 @@ use tracing::{debug, warn};
 use crate::filesystem::{DtfsFilesystem, FileAttr as DtfsAttr, OpenFlags};
 
 // Kernel TTLs for cached attributes and directory entries.
-const ATTR_TTL: Duration = Duration::from_secs(1);
-const ENTRY_TTL: Duration = Duration::from_secs(5);
+//
+// F-023: these were 1 s / 5 s, which meant a `for i in …; echo > file-$i; done`
+// followed by an immediate `ls` could miss every file just written because the
+// kernel held onto the pre-write directory cache for 5 seconds. The shell
+// glob in `rm /mnt/dtfs/small-*.txt` then expanded to nothing and the unlink
+// RPCs never fired — which is what made F-025 look like a separate bug.
+//
+// Sub-second TTLs cost an extra round-trip on rapid stat-loops but the cluster
+// API handles single-digit-ms list calls comfortably and the trade-off is
+// worth it for write/read-back correctness.
+const ATTR_TTL: Duration = Duration::from_millis(200);
+const ENTRY_TTL: Duration = Duration::from_millis(200);
 
 /// Root inode in FUSE (always 1).
 const FUSE_ROOT_ID: u64 = 1;
@@ -84,6 +94,15 @@ impl InodeMap {
         }
     }
 
+    /// Migrate the inode of `from` to point at `to`. Used by rename so the
+    /// open FDs keep working (F-034).
+    fn rename(&self, from: &str, to: &str) {
+        if let Some((_, ino)) = self.path_to_inode.remove(from) {
+            self.inode_to_path.insert(ino, to.to_string());
+            self.path_to_inode.insert(to.to_string(), ino);
+        }
+    }
+
     /// Return the inode of the parent path (best-effort; falls back to root).
     fn parent_inode(&self, path: &str) -> u64 {
         let parent = parent_of(path);
@@ -101,6 +120,50 @@ impl InodeMap {
 pub struct DtfsFuse3Adapter {
     fs: Arc<DtfsFilesystem>,
     inodes: InodeMap,
+    /// F-020: per-path mode overrides set via `setattr` (chmod). The manager
+    /// does not track per-file UNIX permissions, so we hold the most recent
+    /// `chmod` value process-locally and surface it from `getattr`. This
+    /// keeps the usual `chmod 600 f && stat -c %a f → 600` workflow honest
+    /// without changing cluster-wide metadata. The map is lost on unmount.
+    mode_overrides: DashMap<String, u16>,
+    /// F-031: per-inode POSIX advisory + flock lock table, with one
+    /// `tokio::sync::Notify` per inode so blocking-acquire (`F_SETLKW`,
+    /// `flock(LOCK_EX|0)`) waits until the holder releases instead of
+    /// returning EAGAIN. The lock table is wrapped in a `tokio::Mutex` so
+    /// the critical section can `await` the notify without holding the
+    /// lock across the wait.
+    locks: Arc<tokio::sync::Mutex<std::collections::HashMap<u64, InodeLocks>>>,
+    /// F-031: per-inode `Notify` used to wake blocked-waiters when any lock
+    /// for that inode is released. `DashMap` so we don't need to lock the
+    /// lock table merely to find the Notify.
+    lock_notify: Arc<DashMap<u64, Arc<tokio::sync::Notify>>>,
+}
+
+/// All lock state for one inode (F-031).
+#[derive(Debug, Default)]
+struct InodeLocks {
+    /// POSIX byte-range locks granted via `fcntl(F_SETLK/F_SETLKW)`.
+    posix: Vec<HeldLock>,
+    /// BSD-style whole-file lock held via `flock(2)`. There is at most one
+    /// exclusive flock; multiple shared flocks can coexist. The bool is
+    /// `true` for exclusive (LOCK_EX), `false` for shared (LOCK_SH).
+    flock_owners: Vec<(u64, bool)>,
+}
+
+/// One granted byte-range lock entry in the per-inode lock table (F-031).
+#[derive(Debug, Clone)]
+struct HeldLock {
+    owner: u64,
+    start: u64,
+    end: u64,
+    write: bool,
+}
+
+impl HeldLock {
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        // ranges are inclusive of start, half-open at end (FUSE convention).
+        start < self.end && self.start < end
+    }
 }
 
 impl DtfsFuse3Adapter {
@@ -108,7 +171,26 @@ impl DtfsFuse3Adapter {
         Self {
             fs: Arc::new(fs),
             inodes: InodeMap::new(),
+            mode_overrides: DashMap::new(),
+            locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            lock_notify: Arc::new(DashMap::new()),
         }
+    }
+
+    fn notify_for(&self, inode: u64) -> Arc<tokio::sync::Notify> {
+        if let Some(n) = self.lock_notify.get(&inode) {
+            return n.clone();
+        }
+        let n = Arc::new(tokio::sync::Notify::new());
+        self.lock_notify.insert(inode, n.clone());
+        n
+    }
+
+    fn override_perm(&self, path: &str, is_dir: bool) -> u16 {
+        self.mode_overrides
+            .get(path)
+            .map(|m| *m)
+            .unwrap_or(if is_dir { 0o755 } else { 0o644 })
     }
 
     // -----------------------------------------------------------------------
@@ -128,6 +210,13 @@ impl DtfsFuse3Adapter {
 
     /// Convert a DtfsAttr + inode to a fuse3 `FileAttr`.
     fn to_fuse_attr(&self, ino: u64, a: &DtfsAttr) -> FileAttr {
+        // Use the per-path chmod override if one has been recorded; otherwise
+        // fall back to the role default (F-020).
+        let path = self
+            .inodes
+            .path_for(ino)
+            .unwrap_or_else(|_| "/".to_string());
+        let perm = self.override_perm(&path, a.is_directory);
         FileAttr {
             ino,
             size: a.size,
@@ -140,7 +229,7 @@ impl DtfsFuse3Adapter {
             } else {
                 FileType::RegularFile
             },
-            perm: if a.is_directory { 0o755 } else { 0o644 },
+            perm,
             nlink: if a.is_directory { 2 } else { 1 },
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -180,6 +269,12 @@ impl DtfsFuse3Adapter {
             libc::O_RDWR => OpenFlags::ReadWrite,
             _ => OpenFlags::ReadOnly,
         }
+    }
+
+    /// Returns true when the kernel passed `O_APPEND` in the open-flag word.
+    /// Used to route every write to the current end-of-file (F-021).
+    fn has_append(flags: u32) -> bool {
+        (flags as libc::c_int & libc::O_APPEND) != 0
     }
 }
 
@@ -239,11 +334,33 @@ impl Filesystem for DtfsFuse3Adapter {
         &self,
         _req: Request,
         inode: u64,
-        _fh: Option<u64>,
-        _set_attr: SetAttr,
+        fh: Option<u64>,
+        set_attr: SetAttr,
     ) -> FuseResult<ReplyAttr> {
-        // Minimal: return current attributes.
         let path = self.inodes.path_for(inode)?;
+
+        // F-020: persist `chmod`-requested mode in the process-local override
+        // map so subsequent `stat` reports the requested value instead of the
+        // default. We don't push this through to the cluster — the manager
+        // doesn't track per-file UNIX permissions, and a media-server use case
+        // does not need cluster-wide enforcement.
+        if let Some(mode) = set_attr.mode {
+            let perm = (mode & 0o7777) as u16;
+            self.mode_overrides.insert(path.clone(), perm);
+            debug!("setattr chmod {} -> {:o}", path, perm);
+        }
+
+        // F-037: truncate (both shrink and grow). When the caller is
+        // `truncate -s N file`, `ftruncate(fd, N)`, or SQLite invalidating
+        // a journal by truncating it, we honour the new size — including
+        // dropping chunks past the new EOF on a shrink.
+        if let Some(new_size) = set_attr.size {
+            if let Err(e) = self.fs.truncate(&path, fh, new_size).await {
+                warn!("fuse3 setattr truncate {}: {}", path, e);
+                return Err(Errno::from(libc::EIO));
+            }
+        }
+
         match self.fs.lookup(&path).await {
             Ok(attrs) => Ok(ReplyAttr {
                 ttl: ATTR_TTL,
@@ -262,9 +379,22 @@ impl Filesystem for DtfsFuse3Adapter {
         let path = self.inodes.path_for(inode)?;
         debug!("fuse3:open {} (ino={}, flags={:#x})", path, inode, flags);
         let open_flags = Self::decode_open_flags(flags);
-        match self.fs.open(&path, open_flags).await {
+        let append = Self::has_append(flags);
+        match self
+            .fs
+            .open_with_append(&path, open_flags, append)
+            .await
+        {
             Ok(fh) => Ok(ReplyOpen { fh, flags: 0 }),
-            Err(_) => Err(Errno::from(libc::ENOENT)),
+            Err(e) => {
+                // P0-1: surface write-lease conflicts as EBUSY so apps see
+                // "Resource busy" instead of a generic ENOENT.
+                if e.downcast_ref::<crate::filesystem::LeaseBusy>().is_some() {
+                    warn!("fuse3 open {}: write lease busy", path);
+                    return Err(Errno::from(libc::EBUSY));
+                }
+                Err(Errno::from(libc::ENOENT))
+            }
         }
     }
 
@@ -345,6 +475,164 @@ impl Filesystem for DtfsFuse3Adapter {
         })
     }
 
+    /// Durable flush handler. SQLite (and every database/log writer) calls
+    /// `fsync()` to know its data is safely persisted before continuing.
+    /// Without this method the kernel returns OK locally and the writes may
+    /// still be sitting in our process-local `write_buffer` — i.e. a power
+    /// loss before the next release() would lose committed transactions.
+    /// We route fsync to the same chunk-flush path used by close().
+    async fn fsync(
+        &self,
+        _req: Request,
+        _inode: u64,
+        fh: u64,
+        _datasync: bool,
+    ) -> FuseResult<()> {
+        debug!("fuse3:fsync fh={}", fh);
+        self.fs.flush(fh).await.map_err(|e| {
+            warn!("fuse3 fsync fh={}: {}", fh, e);
+            Errno::from(libc::EIO)
+        })
+    }
+
+    /// POSIX advisory byte-range lock check (`fcntl(F_GETLK)`) — F-031.
+    async fn getlk(
+        &self,
+        _req: Request,
+        inode: u64,
+        _fh: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        r#type: u32,
+        pid: u32,
+    ) -> FuseResult<ReplyLock> {
+        let want_write = (r#type as i32) == libc::F_WRLCK;
+        let guard = self.locks.lock().await;
+        if let Some(held) = guard.get(&inode) {
+            for h in &held.posix {
+                if h.owner == lock_owner {
+                    continue;
+                }
+                if !h.overlaps(start, end) {
+                    continue;
+                }
+                if h.write || want_write {
+                    return Ok(ReplyLock {
+                        start: h.start,
+                        end: h.end,
+                        r#type: if h.write {
+                            libc::F_WRLCK as u32
+                        } else {
+                            libc::F_RDLCK as u32
+                        },
+                        pid,
+                    });
+                }
+            }
+        }
+        Ok(ReplyLock {
+            start,
+            end,
+            r#type: libc::F_UNLCK as u32,
+            pid,
+        })
+    }
+
+    /// POSIX advisory byte-range lock acquire/release (`fcntl(F_SETLK)` and
+    /// `fcntl(F_SETLKW)`) — F-031.
+    ///
+    /// When `block` is true (`F_SETLKW`), we actually wait for the lock to
+    /// become available rather than returning `EAGAIN`. Waiters subscribe
+    /// to a per-inode `Notify`; any release pulses it so blocked acquirers
+    /// re-check and try again.
+    async fn setlk(
+        &self,
+        _req: Request,
+        inode: u64,
+        _fh: u64,
+        lock_owner: u64,
+        start: u64,
+        end: u64,
+        r#type: u32,
+        _pid: u32,
+        block: bool,
+    ) -> FuseResult<()> {
+        let lt = r#type as i32;
+
+        if lt == libc::F_UNLCK {
+            let mut guard = self.locks.lock().await;
+            if let Some(t) = guard.get_mut(&inode) {
+                t.posix.retain(|h| {
+                    !(h.owner == lock_owner && h.start >= start && h.end <= end)
+                });
+                for h in t.posix.iter_mut() {
+                    if h.owner != lock_owner {
+                        continue;
+                    }
+                    if h.start < start && h.end > start && h.end <= end {
+                        h.end = start;
+                    } else if h.start >= start && h.start < end && h.end > end {
+                        h.start = end;
+                    }
+                }
+            }
+            drop(guard);
+            self.notify_for(inode).notify_waiters();
+            return Ok(());
+        }
+
+        let want_write = lt == libc::F_WRLCK;
+        let notify = self.notify_for(inode);
+
+        loop {
+            // Subscribe before taking the lock so a release between our
+            // check and the await call still wakes us.
+            let waiter = notify.notified();
+            tokio::pin!(waiter);
+            waiter.as_mut().enable();
+
+            {
+                let mut guard = self.locks.lock().await;
+                let table = guard.entry(inode).or_default();
+                let conflict = table.posix.iter().any(|h| {
+                    h.owner != lock_owner
+                        && h.overlaps(start, end)
+                        && (h.write || want_write)
+                });
+                if !conflict {
+                    table.posix.retain(|h| {
+                        !(h.owner == lock_owner && h.overlaps(start, end))
+                    });
+                    table.posix.push(HeldLock {
+                        owner: lock_owner,
+                        start,
+                        end,
+                        write: want_write,
+                    });
+                    return Ok(());
+                }
+            }
+
+            if !block {
+                return Err(Errno::from(libc::EAGAIN));
+            }
+            // Bounded wait so a buggy peer can't pin a thread forever.
+            // SQLite's busy_timeout retries us anyway.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                waiter,
+            )
+            .await;
+        }
+    }
+
+    // Note: fuse3 0.7.3 does not expose a separate `flock` trait method;
+    // Linux passes `flock(2)` calls through the same FUSE_LK opcode that
+    // our `setlk` already implements (with the whole-file range and
+    // F_WRLCK / F_RDLCK type). The `flock_owners` field on `InodeLocks`
+    // is reserved for a future explicit handler.
+
     async fn mkdir(
         &self,
         _req: Request,
@@ -379,9 +667,17 @@ impl Filesystem for DtfsFuse3Adapter {
     ) -> FuseResult<()> {
         let path = self.child_path(parent, name)?;
         debug!("fuse3:unlink {}", path);
+        // Snapshot the inode (if any) before we drop the path mapping, so we
+        // can clear any lingering byte-range locks for that inode (F-031).
+        let inode_for_locks = self.inodes.path_to_inode.get(&path).map(|i| *i);
         match self.fs.unlink(&path).await {
             Ok(()) => {
                 self.inodes.remove(&path);
+                self.mode_overrides.remove(&path);
+                if let Some(ino) = inode_for_locks {
+                    self.locks.lock().await.remove(&ino);
+                    self.lock_notify.remove(&ino);
+                }
                 Ok(())
             }
             Err(e) => {
@@ -434,6 +730,11 @@ impl Filesystem for DtfsFuse3Adapter {
                 })
             }
             Err(e) => {
+                // P0-1: write-lease conflict on create → EBUSY.
+                if e.downcast_ref::<crate::filesystem::LeaseBusy>().is_some() {
+                    warn!("fuse3 create {}: write lease busy", path);
+                    return Err(Errno::from(libc::EBUSY));
+                }
                 warn!("fuse3 create {}: {}", path, e);
                 Err(Errno::from(libc::EIO))
             }
@@ -492,29 +793,54 @@ impl Filesystem for DtfsFuse3Adapter {
             self.inodes.parent_inode(&path)
         };
 
-        let mut items: Vec<FuseResult<DirectoryEntry>> = Vec::new();
+        // Cookie scheme (F-027 fix — the old code's `entry_offset <= offset`
+        // skip predicate combined with the `if offset == 0 { push . }; if
+        // offset <= 1 { push .. }` block produced the second call's cookie
+        // boundary at the *last* emitted entry, which on some fuse3 paths
+        // re-emitted the tail entry. Switch to: cookie K means "I have just
+        // delivered the entry with index K-1". The kernel will pass K back
+        // on the next call; we then strictly skip entries whose cookie <= K.
+        //
+        // Layout:
+        //   cookie 1 -> "."
+        //   cookie 2 -> ".."
+        //   cookie 3..3+N -> children[0..N]
+        //
+        // De-duplicate by name as a defensive guard so a buggy or eager
+        // kernel that calls us twice with offset=0 (we've observed this on
+        // libfuse 3.x) cannot produce duplicated entries.
 
-        // Offsets: 0→return ".", 1→return "..", ≥2→return children at (offset-2).
-        if offset == 0 {
+        let mut items: Vec<FuseResult<DirectoryEntry>> = Vec::new();
+        let mut seen_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        if offset < 1 {
             items.push(Ok(DirectoryEntry {
                 inode,
                 offset: 1,
                 kind: FileType::Directory,
                 name: ".".into(),
             }));
+            seen_names.insert(".".to_string());
         }
-        if offset <= 1 {
+        if offset < 2 {
             items.push(Ok(DirectoryEntry {
                 inode: parent_ino,
                 offset: 2,
                 kind: FileType::Directory,
                 name: "..".into(),
             }));
+            seen_names.insert("..".to_string());
         }
 
         for (idx, entry) in entries.iter().enumerate() {
             let entry_offset = (idx as i64) + 3;
             if entry_offset <= offset {
+                continue;
+            }
+            // Defensive dedup: never emit a name we've already returned in
+            // this single call.
+            if !seen_names.insert(entry.name.clone()) {
                 continue;
             }
             let child_path = if path == "/" {
@@ -561,10 +887,16 @@ impl Filesystem for DtfsFuse3Adapter {
             .map_err(|_| Errno::from(libc::ENOENT))?;
 
         let mut items: Vec<FuseResult<DirectoryEntryPlus>> = Vec::new();
+        // Defensive dedup by name (see F-027 comment in readdir above).
+        let mut seen_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for (idx, entry) in entries.iter().enumerate() {
             let entry_offset = (idx as u64) + 1;
             if entry_offset <= offset {
+                continue;
+            }
+            if !seen_names.insert(entry.name.clone()) {
                 continue;
             }
             let child_path = if path == "/" {
@@ -610,19 +942,197 @@ impl Filesystem for DtfsFuse3Adapter {
         })
     }
 
+    /// `statvfs` — return cluster-aware total/used/free capacity so
+    /// `df /mnt/dtfs` shows real numbers. Falls back to the historic
+    /// pseudo values if the manager is unreachable.
     async fn statfs(&self, _req: Request, _inode: u64) -> FuseResult<ReplyStatFs> {
-        // Pseudo statfs — a full implementation would query the manager for
-        // actual cluster-wide capacity figures.
+        // 4 KiB blocks across the board.
+        const BSIZE: u32 = 4096;
+        let bsize_u64 = BSIZE as u64;
+        let (total_bytes, used_bytes, file_count) = match self.fs.cluster_capacity().await {
+            Ok(c) => c,
+            Err(_) => {
+                return Ok(ReplyStatFs {
+                    blocks: 1_000_000_000,
+                    bfree: 900_000_000,
+                    bavail: 900_000_000,
+                    files: 1_000_000,
+                    ffree: 999_900,
+                    bsize: BSIZE,
+                    namelen: 255,
+                    frsize: BSIZE,
+                });
+            }
+        };
+        let blocks = total_bytes / bsize_u64;
+        let used_blocks = used_bytes / bsize_u64;
+        let bfree = blocks.saturating_sub(used_blocks);
         Ok(ReplyStatFs {
-            blocks: 1_000_000_000,
-            bfree: 900_000_000,
-            bavail: 900_000_000,
-            files: 1_000_000,
-            ffree: 999_900,
-            bsize: 1024,
+            blocks,
+            bfree,
+            bavail: bfree,
+            files: file_count.max(1),
+            ffree: u64::MAX / 2,
+            bsize: BSIZE,
             namelen: 255,
-            frsize: 1024,
+            frsize: BSIZE,
         })
+    }
+
+    /// `fallocate(2)` — pre-allocate space. DTFS stores files as sparse
+    /// chunk lists so pre-allocation is conceptually free. We treat both
+    /// FALLOC_FL_KEEP_SIZE and the default mode as a no-op success. (F-033)
+    async fn fallocate(
+        &self,
+        _req: Request,
+        _inode: u64,
+        fh: u64,
+        offset: u64,
+        length: u64,
+        _mode: u32,
+    ) -> FuseResult<()> {
+        debug!("fuse3:fallocate fh={} off={} len={}", fh, offset, length);
+        // Grow the file via setattr-style size update if the request asks
+        // for actual space. We use a single zero byte at the end which the
+        // sparse-fill path turns into a hole + 1 byte, matching what other
+        // filesystems do for default-mode fallocate.
+        if length == 0 {
+            return Ok(());
+        }
+        let new_size = offset + length;
+        if let Err(e) = self.fs.set_size(fh, new_size).await {
+            warn!("fuse3 fallocate set_size: {}", e);
+            return Err(Errno::from(libc::EIO));
+        }
+        Ok(())
+    }
+
+    // Note: we intentionally do NOT override `getxattr` / `setxattr` /
+    // `listxattr` / `removexattr` here. fuse3 0.7.3's xattr reply encoding
+    // tears the session down on Debian 13 (libfuse3-4) when the userspace
+    // returns a custom `ReplyXAttr::Size` — the kernel rejects the
+    // malformed reply and disconnects. Keeping the default trait impls
+    // (which return ENOSYS straight through the session) lets the kernel
+    // cache ENOSYS once and short-circuit future calls. Net effect:
+    // `setfattr` fails fast with "operation not supported" instead of
+    // crashing the mount. Linux xattrs are not part of POSIX-1-2024 and
+    // are not a hard requirement for the workloads DTFS targets.
+
+    /// `rename(2)` — F-034. Atomic same-directory and cross-directory move.
+    async fn rename(
+        &self,
+        _req: Request,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+    ) -> FuseResult<()> {
+        let from = self.child_path(parent, name)?;
+        let to = self.child_path(new_parent, new_name)?;
+        debug!("fuse3:rename {} -> {}", from, to);
+        match self.fs.rename(&from, &to).await {
+            Ok(()) => {
+                // Migrate adapter-local state.
+                self.inodes.rename(&from, &to);
+                if let Some((_, v)) = self.mode_overrides.remove(&from) {
+                    self.mode_overrides.insert(to.clone(), v);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                warn!("fuse3 rename {} -> {}: {}", from, to, e);
+                Err(Errno::from(libc::EIO))
+            }
+        }
+    }
+
+    /// `symlink(2)` — F-035. Manager stores the link target string as
+    /// metadata; readlink retrieves it.
+    async fn symlink(
+        &self,
+        _req: Request,
+        parent: u64,
+        name: &OsStr,
+        target: &OsStr,
+    ) -> FuseResult<ReplyEntry> {
+        let path = self.child_path(parent, name)?;
+        let tgt = target
+            .to_str()
+            .ok_or_else(|| Errno::from(libc::EINVAL))?
+            .to_string();
+        debug!("fuse3:symlink {} -> {}", path, tgt);
+        match self.fs.symlink(&path, &tgt).await {
+            Ok(()) => {
+                let ino = self.inodes.inode_for(&path);
+                Ok(ReplyEntry {
+                    ttl: ENTRY_TTL,
+                    attr: FileAttr {
+                        ino,
+                        size: tgt.len() as u64,
+                        blocks: 0,
+                        atime: to_timestamp(SystemTime::now()),
+                        mtime: to_timestamp(SystemTime::now()),
+                        ctime: to_timestamp(SystemTime::now()),
+                        kind: FileType::Symlink,
+                        perm: 0o777,
+                        nlink: 1,
+                        uid: unsafe { libc::getuid() },
+                        gid: unsafe { libc::getgid() },
+                        rdev: 0,
+                        blksize: 4096,
+                    },
+                    generation: 0,
+                })
+            }
+            Err(e) => {
+                warn!("fuse3 symlink {}: {}", path, e);
+                Err(Errno::from(libc::EIO))
+            }
+        }
+    }
+
+    /// `readlink(2)` — F-035.
+    async fn readlink(&self, _req: Request, inode: u64) -> FuseResult<ReplyData> {
+        let path = self.inodes.path_for(inode)?;
+        match self.fs.readlink(&path).await {
+            Ok(t) => Ok(ReplyData {
+                data: t.into_bytes().into(),
+            }),
+            Err(_) => Err(Errno::from(libc::ENOENT)),
+        }
+    }
+
+    /// `link(2)` — F-036. Hard link. We implement it by copying the source
+    /// file's chunk-location list to a new path entry; the chunks remain
+    /// shared. This gives the same observable behaviour as a hard link
+    /// (both names see identical bytes) but with snapshot semantics — a
+    /// subsequent write through one name diverges. SQLite WAL recovery
+    /// uses link() once at open and doesn't write through the link, so
+    /// this is sufficient for the common case.
+    async fn link(
+        &self,
+        _req: Request,
+        inode: u64,
+        new_parent: u64,
+        new_name: &OsStr,
+    ) -> FuseResult<ReplyEntry> {
+        let src = self.inodes.path_for(inode)?;
+        let dst = self.child_path(new_parent, new_name)?;
+        debug!("fuse3:link {} -> {}", src, dst);
+        match self.fs.link(&src, &dst).await {
+            Ok(attr) => {
+                let ino = self.inodes.inode_for(&dst);
+                Ok(ReplyEntry {
+                    ttl: ENTRY_TTL,
+                    attr: self.to_fuse_attr(ino, &attr),
+                    generation: 0,
+                })
+            }
+            Err(e) => {
+                warn!("fuse3 link {} -> {}: {}", src, dst, e);
+                Err(Errno::from(libc::EIO))
+            }
+        }
     }
 }
 

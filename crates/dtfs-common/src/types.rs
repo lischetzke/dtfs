@@ -244,6 +244,14 @@ pub struct VolumeConfig {
     pub chunk_size_bytes: u64,
     pub replication: TierReplication,
     pub write_safety: WriteSafety,
+    /// P0-10: if set, every chunk placement on this volume guarantees at
+    /// least one replica lives in the named datacenter. The tiering engine
+    /// also refuses migrations that would strand the last anchor copy
+    /// (preserves "DC-A has all data once" invariant in 3-DC topologies).
+    ///
+    /// `#[serde(default)]` keeps existing volume snapshots loadable.
+    #[serde(default)]
+    pub anchor_datacenter: Option<String>,
 }
 
 impl Default for VolumeConfig {
@@ -254,6 +262,7 @@ impl Default for VolumeConfig {
             chunk_size_bytes: 128 * 1024 * 1024, // 128MB
             replication: TierReplication::default(),
             write_safety: WriteSafety::default(),
+            anchor_datacenter: None,
         }
     }
 }

@@ -1,0 +1,35 @@
+---
+# Lab overrides — inherits most settings from tests/ansible/inventory/group_vars/all.yml
+# Only override what's different for the Proxmox lab.
+
+# Manager API host (mgr-01 IP)
+dtfs_manager_api_host: 10.150.0.151
+dtfs_manager_api_port: 8080
+dtfs_manager_api_url: "http://10.150.0.151:8080"
+
+# Manager list — used by clients and data nodes
+dtfs_managers:
+  - host: 10.150.0.151
+    port: 7001
+    api_port: 8080
+    node_id: 1
+  - host: 10.150.0.152
+    port: 7001
+    api_port: 8080
+    node_id: 2
+  - host: 10.150.0.153
+    port: 7001
+    api_port: 8080
+    node_id: 3
+
+# Time sync — use the lab DNS servers as NTP fallback (they may not run NTP, so add Debian pool)
+ntp_servers:
+  - 0.debian.pool.ntp.org
+  - 1.debian.pool.ntp.org
+  - 2.debian.pool.ntp.org
+  - 3.debian.pool.ntp.org
+
+# Reduce hot-tier cache size to fit 3 GB RAM data nodes (original was 4 GB cache alone)
+dtfs_hot_tier_cache_size_mb: 768
+dtfs_cold_tier_cache_size_mb: 256
+dtfs_cache_size_mb: 512

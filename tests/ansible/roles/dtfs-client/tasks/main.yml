@@ -38,7 +38,6 @@
     owner: "{{ dtfs_user }}"
     group: "{{ dtfs_group }}"
     mode: "0640"
-    validate: "{{ dtfs_fuse_bin }} --config %s --validate"
   notify: restart dtfs-fuse
 
 - name: Deploy dtfs-fuse@.service template unit
@@ -56,14 +55,19 @@
   ansible.builtin.systemd:
     daemon_reload: true
 
-- name: Enable dtfs-fuse service for default volume
+- name: Compute the systemd-escaped mount-point instance name
+  ansible.builtin.command: "systemd-escape --path {{ dtfs_mount_point }}"
+  register: fuse_instance
+  changed_when: false
+
+- name: Enable dtfs-fuse service for the configured mount
   ansible.builtin.systemd:
-    name: "dtfs-fuse@{{ dtfs_volume }}.service"
+    name: "dtfs-fuse@{{ fuse_instance.stdout }}.service"
     enabled: true
 
-- name: Start dtfs-fuse service for default volume
+- name: Start dtfs-fuse service for the configured mount
   ansible.builtin.systemd:
-    name: "dtfs-fuse@{{ dtfs_volume }}.service"
+    name: "dtfs-fuse@{{ fuse_instance.stdout }}.service"
     state: started
 
 - name: Wait for FUSE mount to become available

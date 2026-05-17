@@ -125,6 +125,14 @@ impl ReplicationManager {
 
         let request = GetChunkRequest {
             chunk_id: chunk_id.as_hex(),
+            // P0-9: replication is an internal data-node-to-data-node copy,
+            // not a user read. Tag with a sentinel DC so the tiering engine
+            // can filter these out of its access-pattern bucketing if it
+            // chooses; for now, the empty string falls into the "unknown"
+            // bucket and is correctly ignored by tier scoring (it doesn't
+            // match any real DC name in `reads_by_dc`).
+            requester_dc: String::new(),
+            requester_host: "dtfs-data-replication".to_string(),
         };
 
         let response = client.get_chunk(request).await?;

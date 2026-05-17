@@ -9,6 +9,8 @@ Integration tests for DTFS use a multi-node cluster spun up via docker-compose.
 
 ## Running
 
+There is **no** Cargo integration test binary named `integration` in this workspace. Tests are the **shell scripts** under this directory (see numbered `*.sh` files and `run_all.sh` where present).
+
 ```bash
 # Build the docker images
 cd deploy && docker compose build
@@ -16,11 +18,11 @@ cd deploy && docker compose build
 # Start the test cluster
 docker compose up -d
 
-# Run integration tests
-cargo test --test integration
+# Run shell integration scripts (example — see scripts for exact usage)
+cd tests/integration && ./run_all.sh
 
 # Tear down
-docker compose down -v
+cd ../../deploy && docker compose down -v
 ```
 
 ## Test Categories

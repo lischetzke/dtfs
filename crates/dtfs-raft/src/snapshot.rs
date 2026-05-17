@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use dtfs_common::types::VolumeConfig;
 
-use crate::state_machine::{AuditEntry, ClusterConfig, FileMetadata, ScrubRecord};
+use crate::state_machine::{
+    AuditEntry, ClusterConfig, DistributedLock, FileMetadata, ScrubRecord, WriteLease,
+};
 use crate::NodeInfo;
 
 /// The complete serializable snapshot of the cluster state machine.
@@ -51,6 +53,15 @@ pub struct StateMachineSnapshot {
     /// so that scheduler bookkeeping never overwrites user config (fix #3).
     #[serde(default)]
     pub migration_state_json: String,
+
+    /// F-039: distributed POSIX byte-range locks held by clients.
+    #[serde(default)]
+    pub posix_locks: BTreeMap<String, Vec<DistributedLock>>,
+
+    /// P0-1: single-writer leases keyed by path. `#[serde(default)]` keeps
+    /// pre-existing snapshots loadable.
+    #[serde(default)]
+    pub write_leases: BTreeMap<String, WriteLease>,
 }
 
 /// Serialize a `StateMachineSnapshot` into a `Cursor<Vec<u8>>`.
@@ -98,6 +109,8 @@ mod tests {
             client_count: 0,
             volumes: BTreeMap::new(),
             migration_state_json: String::new(),
+            posix_locks: BTreeMap::new(),
+            write_leases: BTreeMap::new(),
         };
 
         let cursor = serialize_snapshot(&snap).unwrap();

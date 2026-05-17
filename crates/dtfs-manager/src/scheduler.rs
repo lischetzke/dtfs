@@ -22,6 +22,11 @@ use crate::audit::AuditLog;
 /// Interval between scheduler ticks.
 const SCHEDULER_TICK: Duration = Duration::from_secs(30);
 
+/// Maximum number of consecutive failures (per task per state) before the task
+/// is marked Failed. With a 30s tick, 6 attempts ≈ 3 minutes of trying. After
+/// exhaustion the task is moved to Failed and an audit entry recorded (P0-4).
+const MAX_MIGRATION_ATTEMPTS: u32 = 6;
+
 /// A replication task tracked by the scheduler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationTask {
@@ -33,6 +38,15 @@ pub struct ReplicationTask {
     pub status: MigrationStatus,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// Number of consecutive failed attempts in the current state (P0-4).
+    /// Reset to 0 on each successful state transition; once it hits
+    /// `MAX_MIGRATION_ATTEMPTS` the task is marked `Failed`.
+    /// `#[serde(default)]` keeps existing snapshots loadable.
+    #[serde(default)]
+    pub attempts: u32,
+    /// Last error message — kept for audit logging on failure.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 /// Serializable collection of active migration tasks, stored in Raft state
@@ -74,6 +88,27 @@ impl TaskScheduler {
 
             if let Err(e) = self.tick().await {
                 warn!("Scheduler tick failed: {}", e);
+            }
+        }
+    }
+
+    /// P0-1: lease garbage-collection loop. Sweeps expired write leases
+    /// every second by proposing `SweepExpiredLeases` through Raft. Without
+    /// this, an orphan lease (FUSE crashed, network partition, kill -9)
+    /// blocks all writers to that path until the lease's lease_ms elapses.
+    pub async fn run_lease_gc(raft: Arc<DtfsRaft>) {
+        info!("Lease GC started (1s tick)");
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let now_ms = now_millis();
+            if let Err(e) = raft
+                .client_write(dtfs_raft::ClientRequest::SweepExpiredLeases { now_ms })
+                .await
+            {
+                // Non-leader managers will get a forward error; that's fine
+                // — only the leader needs to drive GC.
+                tracing::trace!("SweepExpiredLeases write failed (non-leader?): {e}");
             }
         }
     }
@@ -137,6 +172,8 @@ impl TaskScheduler {
             status: MigrationStatus::Pending,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            attempts: 0,
+            last_error: None,
         };
 
         info!(
@@ -206,23 +243,35 @@ impl TaskScheduler {
                     .unwrap_or(3u32);
 
                 if replica_count < desired_replicas {
-                    // Find the node this chunk is on.
-                    let source_node_id: u64 =
-                        chunk_loc.node_id.parse().unwrap_or(0);
-
-                    // Skip if source is down.
-                    if source_node_id == 0 {
-                        continue;
-                    }
-
-                    // Find a healthy target node that does NOT already host
-                    // this chunk.
-                    let existing_nodes: Vec<u64> = file_meta
+                    // Pick a HEALTHY source from the chunk's current replicas
+                    // rather than blindly using `chunk_loc.node_id` (which may
+                    // be the Down node that caused the under-replication in
+                    // the first place). The Copying-state retry logic will
+                    // re-resolve too (F-015), but scheduling with a healthy
+                    // source up-front avoids a wasted retry cycle (F-016).
+                    let existing_node_ids: Vec<u64> = file_meta
                         .chunks
                         .iter()
                         .filter(|c| c.chunk_index == chunk_loc.chunk_index)
                         .filter_map(|c| c.node_id.parse().ok())
                         .collect();
+
+                    let source_node_id: u64 = existing_node_ids
+                        .iter()
+                        .copied()
+                        .find(|nid| {
+                            sm.nodes
+                                .get(nid)
+                                .map(|n| n.health == HealthStatus::Healthy)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or_else(|| chunk_loc.node_id.parse().unwrap_or(0));
+
+                    if source_node_id == 0 {
+                        continue;
+                    }
+
+                    let existing_nodes: Vec<u64> = existing_node_ids;
 
                     let tier = chunk_tier;
 
@@ -253,6 +302,8 @@ impl TaskScheduler {
                                 status: MigrationStatus::Pending,
                                 created_at_ms: now_ms,
                                 updated_at_ms: now_ms,
+                                attempts: 0,
+                                last_error: None,
                             };
 
                             info!(
@@ -290,24 +341,48 @@ impl TaskScheduler {
 
             match task.status {
                 MigrationStatus::Pending => {
-                    // Transition to Copying.
+                    // Transition to Copying — reset the attempt counter for
+                    // the new state.
                     info!(
                         task_id = %task.task_id,
                         chunk = %task.chunk_id,
                         "Migration: Pending -> Copying"
                     );
                     task.status = MigrationStatus::Copying;
+                    task.attempts = 0;
+                    task.last_error = None;
                     task.updated_at_ms = now_ms;
                 }
 
                 MigrationStatus::Copying => {
-                    // Issue ReplicateChunk RPC on the source node.
-                    // The source node streams the chunk to the target node.
-                    let source_addr = self.node_grpc_addr(task.source_node).await;
+                    // Each tick, re-resolve the source live: pick any healthy
+                    // node that currently has this chunk. This unsticks tasks
+                    // that were scheduled against a node that has since gone
+                    // Down (fix for F-015 — the previous code retried the
+                    // originally-pinned source forever, even when other
+                    // replicas were healthier).
+                    //
+                    // P0-4: after MAX_MIGRATION_ATTEMPTS failed ticks (≈ 3 min
+                    // at 30s tick), give up and mark Failed so an operator
+                    // gets paged via the audit log + alerting pipeline rather
+                    // than the task lingering forever.
                     let target_addr = self.node_grpc_addr(task.target_node).await;
+                    let resolved_source = self
+                        .resolve_healthy_source(&task.chunk_id, task.target_node)
+                        .await;
 
-                    match (source_addr, target_addr) {
-                        (Some(src_addr), Some(tgt_addr)) => {
+                    let outcome: Result<(), String> = match (resolved_source, target_addr) {
+                        (Some((src_node, src_addr)), Some(tgt_addr)) => {
+                            if src_node != task.source_node {
+                                info!(
+                                    task_id = %task.task_id,
+                                    chunk = %task.chunk_id,
+                                    old_src = task.source_node,
+                                    new_src = src_node,
+                                    "Re-replication: source moved to a healthier replica",
+                                );
+                                task.source_node = src_node;
+                            }
                             let chunk_id = task.chunk_id.clone();
                             match self.replicate_chunk(&src_addr, &chunk_id, &tgt_addr).await {
                                 Ok(()) => {
@@ -319,30 +394,52 @@ impl TaskScheduler {
                                         "Migration: Copying -> Verifying (ReplicateChunk OK)"
                                     );
                                     task.status = MigrationStatus::Verifying;
+                                    task.attempts = 0;
+                                    task.last_error = None;
                                     task.updated_at_ms = now_ms;
+                                    continue;
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        task_id = %task.task_id,
-                                        chunk = %chunk_id,
-                                        "ReplicateChunk failed, will retry: {}",
-                                        e
-                                    );
-                                    // Stay in Copying; will retry next tick.
-                                    task.updated_at_ms = now_ms;
-                                }
+                                Err(e) => Err(format!("ReplicateChunk error: {e}")),
                             }
                         }
-                        _ => {
+                        (None, _) => Err("no healthy source replica".to_string()),
+                        (_, None) => Err(format!(
+                            "target node {} unresolvable",
+                            task.target_node
+                        )),
+                    };
+
+                    if let Err(reason) = outcome {
+                        task.attempts = task.attempts.saturating_add(1);
+                        task.last_error = Some(reason.clone());
+                        task.updated_at_ms = now_ms;
+                        if task.attempts >= MAX_MIGRATION_ATTEMPTS {
                             warn!(
                                 task_id = %task.task_id,
                                 chunk = %task.chunk_id,
-                                src_node = task.source_node,
-                                dst_node = task.target_node,
-                                "Cannot resolve node addresses for copy; failing task"
+                                attempts = task.attempts,
+                                reason = %reason,
+                                "Migration: Copying -> Failed (max attempts exhausted)"
                             );
                             task.status = MigrationStatus::Failed;
-                            task.updated_at_ms = now_ms;
+                            self.audit.log(
+                                "scheduler",
+                                "migration.failed",
+                                &format!(
+                                    "task={} chunk={} attempts={}",
+                                    task.task_id, task.chunk_id, task.attempts
+                                ),
+                                &reason,
+                            );
+                        } else {
+                            warn!(
+                                task_id = %task.task_id,
+                                chunk = %task.chunk_id,
+                                attempt = task.attempts,
+                                max = MAX_MIGRATION_ATTEMPTS,
+                                reason = %reason,
+                                "Copying retry queued",
+                            );
                         }
                     }
                 }
@@ -499,6 +596,38 @@ impl TaskScheduler {
     async fn node_grpc_addr(&self, node_id: u64) -> Option<String> {
         let sm = self.state_data.read().await;
         sm.nodes.get(&node_id).map(|info| info.grpc_addr.clone())
+    }
+
+    /// Pick any healthy node that currently has a copy of `chunk_id`,
+    /// excluding `exclude` (the migration target). Returns `(node_id,
+    /// grpc_addr)` for the chosen source, or `None` if no healthy replica
+    /// exists. (Helper for F-015.)
+    async fn resolve_healthy_source(
+        &self,
+        chunk_id: &str,
+        exclude: u64,
+    ) -> Option<(u64, String)> {
+        let sm = self.state_data.read().await;
+        let mut candidates: Vec<u64> = Vec::new();
+        for file in sm.files.values() {
+            for c in &file.chunks {
+                if c.chunk_hash == chunk_id {
+                    if let Ok(nid) = c.node_id.parse::<u64>() {
+                        if nid != exclude && !candidates.contains(&nid) {
+                            candidates.push(nid);
+                        }
+                    }
+                }
+            }
+        }
+        for nid in candidates {
+            if let Some(info) = sm.nodes.get(&nid) {
+                if info.health == HealthStatus::Healthy {
+                    return Some((nid, info.grpc_addr.clone()));
+                }
+            }
+        }
+        None
     }
 
     /// Ask the source node to replicate `chunk_id` to `target_addr`.

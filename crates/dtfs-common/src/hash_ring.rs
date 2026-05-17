@@ -31,6 +31,17 @@ pub struct PlacementRule {
     pub replica_count: u32,
     pub failure_domain: FailureDomain,
     pub prefer_client_locations: bool,
+    /// P0-10: when set, at least one chosen replica MUST live in this DC.
+    /// Used to keep a durable copy of every chunk in the "anchor" DC (e.g.
+    /// DC-A in a 3-DC topology), so tiering never strands the last anchor
+    /// copy by migrating it elsewhere.
+    ///
+    /// If no node in the required DC has matching tier capacity, the rule
+    /// falls back to the relaxed pass (which may produce a placement that
+    /// doesn't satisfy the anchor); callers should check the result against
+    /// the anchor DC and emit a `placement_anchor_unsatisfiable` metric.
+    #[serde(default)]
+    pub required_datacenter: Option<String>,
 }
 
 /// Consistent hash ring with location-aware, tier-aware placement.
@@ -191,6 +202,70 @@ impl ConsistentHashRing {
                 }
                 selected.push(vn.physical_node.clone());
                 selected_hosts.push(vn.location.host.clone());
+            }
+        }
+
+        // P0-10: enforce the anchor-DC constraint. If a `required_datacenter`
+        // is set and none of the selected replicas live there, attempt to
+        // swap in a candidate from the required DC. We replace the LAST
+        // (lowest-priority) selected node so the primary remains stable.
+        if let Some(anchor) = &rule.required_datacenter {
+            let already_in_anchor = selected
+                .iter()
+                .zip(selected_dcs.iter())
+                .any(|(_, dc)| dc == anchor);
+            if !already_in_anchor {
+                // Find a candidate in the anchor DC matching tier+host rules.
+                let iter = self
+                    .ring
+                    .range(start_position..)
+                    .chain(self.ring.range(..start_position));
+                let mut anchor_candidate: Option<NodeId> = None;
+                let mut anchor_host: Option<String> = None;
+                for (_, vn) in iter {
+                    if vn.tier != rule.tier {
+                        continue;
+                    }
+                    if vn.location.datacenter != *anchor {
+                        continue;
+                    }
+                    // Anchor candidate must not collide with any *retained*
+                    // selected host. We're going to drop the last slot, so
+                    // ignore the last selected_hosts entry for this check.
+                    let retained_hosts: &[String] = if !selected_hosts.is_empty() {
+                        &selected_hosts[..selected_hosts.len() - 1]
+                    } else {
+                        &selected_hosts
+                    };
+                    if retained_hosts.contains(&vn.location.host) {
+                        continue;
+                    }
+                    anchor_candidate = Some(vn.physical_node.clone());
+                    anchor_host = Some(vn.location.host.clone());
+                    break;
+                }
+                if let (Some(node), Some(host)) = (anchor_candidate, anchor_host) {
+                    if selected.len() == rule.replica_count as usize {
+                        // Replace the last slot with the anchor candidate.
+                        if let Some(last) = selected.last_mut() {
+                            *last = node;
+                        }
+                        if let Some(last) = selected_hosts.last_mut() {
+                            *last = host;
+                        }
+                        if let Some(last) = selected_dcs.last_mut() {
+                            *last = anchor.clone();
+                        }
+                    } else if selected.len() < rule.replica_count as usize {
+                        selected.push(node);
+                        selected_hosts.push(host);
+                        selected_dcs.push(anchor.clone());
+                    }
+                }
+                // If still no anchor candidate exists, the placement is
+                // "anchor-unsatisfiable". Caller should detect via:
+                //   !selected_dcs.iter().any(|d| d == anchor)
+                // and emit a metric / audit entry.
             }
         }
 

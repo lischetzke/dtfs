@@ -194,6 +194,25 @@ impl TieringEngine {
                 .await;
 
             if let Some(target) = target_node {
+                // P0-10: anchor-protect. If the volume has an anchor DC set,
+                // refuse migrations that would leave 0 replicas in that DC.
+                let anchor_violated = self
+                    .would_violate_anchor(profile, target)
+                    .await;
+                if anchor_violated {
+                    self.audit.log(
+                        "tiering",
+                        "tier.anchor_protected",
+                        &format!(
+                            "chunk={} path={} refused {:?}->{:?}",
+                            profile.chunk_id, profile.file_path,
+                            profile.current_tier, target_tier
+                        ),
+                        "refused",
+                    );
+                    continue;
+                }
+
                 self.scheduler
                     .schedule_replication(
                         &profile.chunk_id,
@@ -228,6 +247,77 @@ impl TieringEngine {
         }
 
         Ok(())
+    }
+
+    /// P0-10: return `true` if moving `profile`'s chunk to `target_node`
+    /// would leave the volume's anchor DC with zero replicas of this chunk.
+    ///
+    /// Logic:
+    /// 1. Look up the file's `volume_id` from `sm.files[profile.file_path]`.
+    /// 2. Look up the volume's `anchor_datacenter`.
+    /// 3. If anchor is None → never violated (no constraint).
+    /// 4. Count current replicas of `profile.chunk_id` whose node lives in
+    ///    the anchor DC. Subtract 1 if the source node is in anchor DC
+    ///    (it's the one being moved). Add 1 if the target node is in anchor.
+    /// 5. If the resulting count would be 0 → violation.
+    async fn would_violate_anchor(
+        &self,
+        profile: &ChunkAccessProfile,
+        target_node: u64,
+    ) -> bool {
+        let sm = self.state_data.read().await;
+        let volume_id = match sm.files.get(&profile.file_path) {
+            Some(meta) => meta.volume_id.clone(),
+            None => return false,
+        };
+        let anchor = match sm.volumes.get(&volume_id).and_then(|v| v.anchor_datacenter.clone()) {
+            Some(a) if !a.is_empty() => a,
+            _ => return false,
+        };
+        let file_meta = match sm.files.get(&profile.file_path) {
+            Some(m) => m,
+            None => return false,
+        };
+
+        // Build a quick lookup: grpc_addr → datacenter.
+        let mut grpc_to_dc: HashMap<String, String> = HashMap::new();
+        let mut id_to_dc: HashMap<u64, String> = HashMap::new();
+        for (id, info) in sm.nodes.iter() {
+            grpc_to_dc.insert(info.grpc_addr.clone(), info.location.datacenter.clone());
+            id_to_dc.insert(*id, info.location.datacenter.clone());
+        }
+
+        // Count anchor-DC replicas of this chunk.
+        let mut anchor_count: i64 = 0;
+        for ent in file_meta.chunks.iter() {
+            if ent.chunk_hash != profile.chunk_id {
+                continue;
+            }
+            // node_id is sometimes a u64 string, sometimes a "http://..." URL.
+            // Try both lookups.
+            let dc = if let Some(d) = grpc_to_dc.get(&ent.node_id) {
+                Some(d.clone())
+            } else if let Ok(num) = ent.node_id.parse::<u64>() {
+                id_to_dc.get(&num).cloned()
+            } else {
+                None
+            };
+            if dc.as_deref() == Some(anchor.as_str()) {
+                anchor_count += 1;
+            }
+        }
+
+        // Adjust for the move.
+        let source_dc = id_to_dc.get(&profile.current_node).cloned();
+        let target_dc = id_to_dc.get(&target_node).cloned();
+        if source_dc.as_deref() == Some(anchor.as_str()) {
+            anchor_count -= 1;
+        }
+        if target_dc.as_deref() == Some(anchor.as_str()) {
+            anchor_count += 1;
+        }
+
+        anchor_count <= 0
     }
 
     /// Find a target node that has disks of the specified tier,

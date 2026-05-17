@@ -1,0 +1,404 @@
+---
+# Full DTFS lab deploy using REAL config schema (deploy/configs/*.toml).
+# Replaces the broken tests/ansible/playbooks/setup.yml whose config templates
+# do not match the binary. See FINDINGS.md F-003.
+#
+# Order: base → managers (bootstrap first, then followers) → data nodes → clients.
+
+- name: "Base setup: dtfs user/group, packages, kernel knobs, FUSE module"
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install system packages
+      ansible.builtin.apt:
+        name:
+          - fuse3
+          - libfuse3-4
+          - chrony
+          - xfsprogs
+          - smartmontools
+          - iproute2
+          - iperf3
+          - fio
+          - bc
+          - jq
+          - curl
+          - htop
+          - sysstat
+          - tcpdump
+          - nftables
+          - python3-toml
+        state: present
+
+    - name: Create dtfs group
+      ansible.builtin.group:
+        name: dtfs
+        gid: 980
+        system: true
+        state: present
+
+    - name: Create dtfs user
+      ansible.builtin.user:
+        name: dtfs
+        uid: 980
+        group: dtfs
+        system: true
+        shell: /usr/sbin/nologin
+        home: /var/lib/dtfs
+        create_home: false
+        state: present
+
+    - name: Create base directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: dtfs
+        group: dtfs
+        mode: "0750"
+      loop:
+        - /etc/dtfs
+        - /var/lib/dtfs
+        - /var/log/dtfs
+
+    - name: Kernel tuning for DTFS
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: true
+        sysctl_file: /etc/sysctl.d/99-dtfs.conf
+      loop:
+        - { key: vm.swappiness, value: "10" }
+        - { key: net.core.rmem_max, value: "134217728" }
+        - { key: net.core.wmem_max, value: "134217728" }
+        - { key: fs.file-max, value: "2097152" }
+
+    - name: Allow user_allow_other in /etc/fuse.conf
+      ansible.builtin.lineinfile:
+        path: /etc/fuse.conf
+        regexp: '^#?user_allow_other'
+        line: 'user_allow_other'
+        create: true
+        mode: "0644"
+
+    - name: Load fuse kernel module
+      community.general.modprobe:
+        name: fuse
+        state: present
+
+- name: "Manager bootstrap - mgr-01 first to seed Raft cluster"
+  hosts: mgr-01
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Copy dtfs-manager binary
+      ansible.builtin.copy:
+        src: "/home/debian/dtfs2/target/release/dtfs-manager"
+        dest: /usr/local/bin/dtfs-manager
+        owner: root
+        group: root
+        mode: "0755"
+        remote_src: true
+
+    - name: Copy dtfs-cli binary
+      ansible.builtin.copy:
+        src: "/home/debian/dtfs2/target/release/dtfs-cli"
+        dest: /usr/local/bin/dtfs-cli
+        owner: root
+        group: root
+        mode: "0755"
+        remote_src: true
+
+    - name: Manager data directory
+      ansible.builtin.file:
+        path: /var/lib/dtfs/manager
+        state: directory
+        owner: dtfs
+        group: dtfs
+        mode: "0750"
+
+    - name: Render manager.toml with bootstrap=true
+      ansible.builtin.template:
+        src: ../templates/manager.toml.j2
+        dest: /etc/dtfs/manager.toml
+        owner: dtfs
+        group: dtfs
+        mode: "0640"
+
+    - name: Install dtfs-manager systemd unit
+      ansible.builtin.copy:
+        src: "/home/debian/dtfs2/deploy/systemd/dtfs-manager.service"
+        dest: /etc/systemd/system/dtfs-manager.service
+        owner: root
+        group: root
+        mode: "0644"
+        remote_src: true
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start & enable dtfs-manager
+      ansible.builtin.systemd:
+        name: dtfs-manager
+        enabled: true
+        state: started
+
+    - name: Wait for manager API on port 9402
+      ansible.builtin.wait_for:
+        port: 9402
+        host: "{{ ansible_host }}"
+        timeout: 60
+
+    - name: Probe /api/v1/health
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:9402/api/v1/health"
+        return_content: true
+        status_code: [200, 503]
+      register: health
+
+    - name: Show mgr-01 health
+      ansible.builtin.debug:
+        var: health.json
+
+- name: "Follower managers - mgr-02 and mgr-03 with bootstrap=false"
+  hosts: managers:!mgr-01
+  become: true
+  gather_facts: false
+  serial: 1
+  tasks:
+    - name: Copy dtfs-manager binary
+      ansible.builtin.copy:
+        src: "/home/debian/dtfs2/target/release/dtfs-manager"
+        dest: /usr/local/bin/dtfs-manager
+        owner: root
+        group: root
+        mode: "0755"
+        remote_src: true
+
+    - name: Copy dtfs-cli binary
+      ansible.builtin.copy:
+        src: "/home/debian/dtfs2/target/release/dtfs-cli"
+        dest: /usr/local/bin/dtfs-cli
+        owner: root
+        group: root
+        mode: "0755"
+        remote_src: true
+
+    - name: Manager data directory
+      ansible.builtin.file:
+        path: /var/lib/dtfs/manager
+        state: directory
+        owner: dtfs
+        group: dtfs
+        mode: "0750"
+
+    - name: Render manager.toml with bootstrap=false
+      ansible.builtin.template:
+        src: ../templates/manager.toml.j2
+        dest: /etc/dtfs/manager.toml
+        owner: dtfs
+        group: dtfs
+        mode: "0640"
+
+    - name: Install dtfs-manager systemd unit
+      ansible.builtin.copy:
+        src: "/home/debian/dtfs2/deploy/systemd/dtfs-manager.service"
+        dest: /etc/systemd/system/dtfs-manager.service
+        owner: root
+        group: root
+        mode: "0644"
+        remote_src: true
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start & enable dtfs-manager
+      ansible.builtin.systemd:
+        name: dtfs-manager
+        enabled: true
+        state: started
+
+    - name: Wait for manager API
+      ansible.builtin.wait_for:
+        port: 9402
+        host: "{{ ansible_host }}"
+        timeout: 60
+
+- name: Data nodes
+  hosts: data_nodes
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Copy dtfs-data binary
+      ansible.builtin.copy:
+        src: "/home/debian/dtfs2/target/release/dtfs-data"
+        dest: /usr/local/bin/dtfs-data
+        owner: root
+        group: root
+        mode: "0755"
+        remote_src: true
+
+    - name: Copy dtfs-cli binary
+      ansible.builtin.copy:
+        src: "/home/debian/dtfs2/target/release/dtfs-cli"
+        dest: /usr/local/bin/dtfs-cli
+        owner: root
+        group: root
+        mode: "0755"
+        remote_src: true
+
+    - name: Data directory
+      ansible.builtin.file:
+        path: /var/lib/dtfs/data
+        state: directory
+        owner: dtfs
+        group: dtfs
+        mode: "0750"
+
+    - name: Ensure disk mount paths owned by dtfs
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: dtfs
+        group: dtfs
+        mode: "0750"
+      loop: "{{ dtfs_disks }}"
+
+    - name: Render data.toml
+      ansible.builtin.template:
+        src: ../templates/data.toml.j2
+        dest: /etc/dtfs/data.toml
+        owner: dtfs
+        group: dtfs
+        mode: "0640"
+
+    - name: Install dtfs-data systemd unit with proper ReadWritePaths
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/dtfs-data.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=DTFS Data Node
+          After=network-online.target local-fs.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=dtfs
+          Group=dtfs
+          ExecStart=/usr/local/bin/dtfs-data --config /etc/dtfs/data.toml
+          Restart=on-failure
+          RestartSec=5
+          LimitNOFILE=65535
+          LimitMEMLOCK=infinity
+
+          NoNewPrivileges=yes
+          ProtectSystem=strict
+          ProtectHome=yes
+          ReadWritePaths=/var/lib/dtfs/data {% for d in dtfs_disks %}{{ d.path }} {% endfor %}
+          PrivateTmp=yes
+
+          Environment=RUST_LOG=dtfs=info
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start & enable dtfs-data
+      ansible.builtin.systemd:
+        name: dtfs-data
+        enabled: true
+        state: started
+
+    - name: Wait briefly for registration
+      ansible.builtin.pause:
+        seconds: 8
+
+- name: FUSE clients
+  hosts: clients
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Copy dtfs-fuse binary
+      ansible.builtin.copy:
+        src: "/home/debian/dtfs2/target/release/dtfs-fuse"
+        dest: /usr/local/bin/dtfs-fuse
+        owner: root
+        group: root
+        mode: "0755"
+        remote_src: true
+
+    - name: Copy dtfs-cli binary
+      ansible.builtin.copy:
+        src: "/home/debian/dtfs2/target/release/dtfs-cli"
+        dest: /usr/local/bin/dtfs-cli
+        owner: root
+        group: root
+        mode: "0755"
+        remote_src: true
+
+    - name: Mount directory
+      ansible.builtin.file:
+        path: "{{ dtfs_mount_point }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render fuse.toml
+      ansible.builtin.template:
+        src: ../templates/fuse.toml.j2
+        dest: /etc/dtfs/fuse.toml
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install dtfs-fuse@.service template
+      ansible.builtin.copy:
+        src: "/home/debian/dtfs2/deploy/systemd/dtfs-fuse@.service"
+        dest: /etc/systemd/system/dtfs-fuse@.service
+        owner: root
+        group: root
+        mode: "0644"
+        remote_src: true
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+- name: Verify cluster
+  hosts: mgr-01
+  become: false
+  gather_facts: false
+  tasks:
+    - name: GET /api/v1/nodes
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:9402/api/v1/nodes"
+        return_content: true
+      register: nodes
+
+    - name: Show node list
+      ansible.builtin.debug:
+        var: nodes.json
+
+    - name: GET /api/v1/cluster/status (if exposed)
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:9402/api/v1/cluster/status"
+        return_content: true
+        status_code: [200, 404, 503]
+      register: cluster
+
+    - name: Show cluster status
+      ansible.builtin.debug:
+        var: cluster.json

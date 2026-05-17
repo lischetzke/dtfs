@@ -674,6 +674,7 @@ dependencies = [
  "rand 0.8.5",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
 ]
@@ -719,6 +720,7 @@ dependencies = [
  "dtfs-common",
  "dtfs-proto",
  "futures",
+ "hex",
  "libc",
  "parking_lot",
  "prometheus-client",
@@ -745,14 +747,18 @@ dependencies = [
  "dashmap",
  "dtfs-client",
  "dtfs-common",
+ "dtfs-proto",
+ "filetime",
  "fuse3",
  "futures-util",
  "libc",
  "parking_lot",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -771,6 +777,7 @@ dependencies = [
  "dtfs-proto",
  "dtfs-raft",
  "futures",
+ "hex",
  "http-body",
  "http-body-util",
  "jsonwebtoken",
@@ -781,6 +788,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tonic",
@@ -819,6 +827,7 @@ dependencies = [
  "rocksdb",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tonic",
@@ -875,6 +884,16 @@ name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+
+[[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -1133,6 +1152,12 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hmac"

@@ -1,0 +1,32 @@
+---
+# Populate /etc/hosts on every VM so integration test scripts and
+# operators can resolve mgr-01..03, data-01..04, client-01..02 by name
+# without needing real DNS records.
+
+- name: Populate /etc/hosts on all nodes
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    lab_hosts:
+      mgr-01: 10.150.0.151
+      mgr-02: 10.150.0.152
+      mgr-03: 10.150.0.153
+      data-01: 10.150.0.154
+      data-02: 10.150.0.155
+      data-03: 10.150.0.156
+      data-04: 10.150.0.157
+      client-01: 10.150.0.158
+      client-02: 10.150.0.159
+      data-05: 10.150.0.160
+      data-06: 10.150.0.161
+  tasks:
+    - name: Add lab host entries
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "^[0-9.]+\\s+{{ item.key }}\\b"
+        line: "{{ item.value }} {{ item.key }} {{ item.key }}.lab"
+        state: present
+      loop: "{{ lab_hosts | dict2items }}"
+      loop_control:
+        label: "{{ item.value }} {{ item.key }}"

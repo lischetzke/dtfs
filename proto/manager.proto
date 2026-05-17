@@ -24,6 +24,55 @@ service ManagerService {
   // Merge chunk location entries for a file (after successful data-node writes)
   rpc CommitChunkLocations(CommitChunkLocationsRequest) returns (CommitChunkLocationsResponse);
 
+  // --- Extended POSIX surface (F-034 .. F-038) ---
+
+  // Atomic rename (mv) within the namespace
+  rpc RenameFile(RenameFileRequest) returns (RenameFileResponse);
+
+  // Set the file's logical size (truncate + fallocate paths)
+  rpc SetFileSize(SetFileSizeRequest) returns (SetFileSizeResponse);
+
+  // Create a symbolic link (path -> target string)
+  rpc CreateSymlink(CreateSymlinkRequest) returns (CreateSymlinkResponse);
+
+  // Resolve a symbolic link to its target
+  rpc ReadSymlink(ReadSymlinkRequest) returns (ReadSymlinkResponse);
+
+  // Create a hard link (chunks shared with the source)
+  rpc CreateLink(CreateLinkRequest) returns (CreateLinkResponse);
+
+  // Total/used cluster capacity (statvfs backing)
+  rpc ClusterCapacity(ClusterCapacityRequest) returns (ClusterCapacityResponse);
+
+  // --- Cross-host fcntl coordination (F-039) ---
+
+  // Acquire a POSIX byte-range lock through the cluster
+  rpc AcquireLock(AcquireLockRequest) returns (AcquireLockResponse);
+
+  // Release a previously-acquired byte-range lock
+  rpc ReleaseLock(ReleaseLockRequest) returns (ReleaseLockResponse);
+
+  // Probe whether a lock would block (F_GETLK)
+  rpc ProbeLock(ProbeLockRequest) returns (ProbeLockResponse);
+
+  // --- Single-writer leases (P0-1) ---
+  // Prevent two FUSE clients from concurrently writing the same path; the
+  // last-writer-wins race was a HIGH severity silent-data-loss bug.
+
+  // Acquire exclusive write lease on a path
+  rpc AcquireWriteLease(AcquireWriteLeaseRequest) returns (AcquireWriteLeaseResponse);
+
+  // Renew an active lease before expiry (called at half-life during flush)
+  rpc RenewWriteLease(RenewWriteLeaseRequest) returns (RenewWriteLeaseResponse);
+
+  // Release a held write lease (on close)
+  rpc ReleaseWriteLease(ReleaseWriteLeaseRequest) returns (ReleaseWriteLeaseResponse);
+
+  // Clear all write leases owned by a hostname except those held by a
+  // specified PID. Called at FUSE startup to clean orphan leases left by a
+  // previous crashed FUSE process (P0-6 crash recovery).
+  rpc ReleaseLeasesByHost(ReleaseLeasesByHostRequest) returns (ReleaseLeasesByHostResponse);
+
   // --- Data node facing RPCs ---
 
   // Register a data node with the cluster
@@ -34,6 +83,158 @@ service ManagerService {
 
   // Report chunk status from data nodes
   rpc ReportChunkStatus(ChunkStatusReport) returns (ChunkStatusAck);
+}
+
+// --- Extended POSIX message types ---
+
+message RenameFileRequest {
+  string from = 1;
+  string to = 2;
+}
+message RenameFileResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message SetFileSizeRequest {
+  string path = 1;
+  uint64 new_size = 2;
+}
+message SetFileSizeResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message CreateSymlinkRequest {
+  string path = 1;
+  string target = 2;
+}
+message CreateSymlinkResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ReadSymlinkRequest {
+  string path = 1;
+}
+message ReadSymlinkResponse {
+  string target = 1;
+  bool found = 2;
+}
+
+message CreateLinkRequest {
+  string source = 1;
+  string dest = 2;
+}
+message CreateLinkResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ClusterCapacityRequest {}
+message ClusterCapacityResponse {
+  uint64 total_bytes = 1;
+  uint64 used_bytes = 2;
+  uint64 file_count = 3;
+}
+
+// --- Distributed fcntl lock messages ---
+
+message AcquireLockRequest {
+  string path = 1;
+  string owner_id = 2;  // unique per (host, FUSE process, kernel lock_owner)
+  uint64 start = 3;
+  uint64 end = 4;
+  bool write = 5;       // false = shared (read), true = exclusive (write)
+  bool blocking = 6;    // true = caller can wait, false = non-blocking
+  uint64 lease_ms = 7;  // lock validity; manager evicts after this without renew
+}
+message AcquireLockResponse {
+  bool granted = 1;
+  // If not granted: who currently holds a conflicting lock.
+  string conflict_owner = 2;
+  uint64 conflict_start = 3;
+  uint64 conflict_end = 4;
+  bool conflict_write = 5;
+}
+
+message ReleaseLockRequest {
+  string path = 1;
+  string owner_id = 2;
+  uint64 start = 3;
+  uint64 end = 4;
+}
+message ReleaseLockResponse {
+  bool ok = 1;
+}
+
+message ProbeLockRequest {
+  string path = 1;
+  string owner_id = 2;
+  uint64 start = 3;
+  uint64 end = 4;
+  bool write = 5;
+}
+message ProbeLockResponse {
+  // True if this owner could acquire right now.
+  bool would_grant = 1;
+  string conflict_owner = 2;
+  uint64 conflict_start = 3;
+  uint64 conflict_end = 4;
+  bool conflict_write = 5;
+}
+
+// --- Single-writer lease messages (P0-1) ---
+
+message AcquireWriteLeaseRequest {
+  string path = 1;
+  // Caller-supplied owner id; the recommended format is "<hostname>:<pid>:<fh>"
+  // so the GC can attribute orphan leases to a crashed FUSE process.
+  string owner_id = 2;
+  // Requested lease duration in milliseconds (manager-side bounded).
+  uint64 lease_ms = 3;
+}
+message AcquireWriteLeaseResponse {
+  bool granted = 1;
+  // If granted: opaque token used for renew/release.
+  string lease_id = 2;
+  // If granted: absolute expiry time (UTC milliseconds since epoch).
+  uint64 expires_at_ms = 3;
+  // If NOT granted: who currently holds the lease, and when it expires.
+  string conflict_owner = 4;
+  uint64 conflict_expires_at_ms = 5;
+}
+
+message RenewWriteLeaseRequest {
+  string path = 1;
+  string lease_id = 2;
+  // Additional time to add to the lease, in milliseconds. The manager
+  // computes the new expiry as `now + extension_ms` (not appended to the
+  // old expiry) to give a predictable budget under load.
+  uint64 extension_ms = 3;
+}
+message RenewWriteLeaseResponse {
+  bool granted = 1;
+  uint64 new_expires_at_ms = 2;
+}
+
+message ReleaseWriteLeaseRequest {
+  string path = 1;
+  string lease_id = 2;
+}
+message ReleaseWriteLeaseResponse {
+  bool ok = 1;
+}
+
+message ReleaseLeasesByHostRequest {
+  // Hostname prefix to match against owner_id ("hostname:" prefix match).
+  string hostname = 1;
+  // PID of the current FUSE process; leases whose owner contains this PID
+  // are preserved (since they belong to the *current*, healthy process).
+  uint32 except_pid = 2;
+}
+message ReleaseLeasesByHostResponse {
+  uint32 released_count = 1;
 }
 
 // --- CreateFile ---
@@ -66,6 +267,10 @@ message GetFileLocationsResponse {
   // Logical chunk size for this file (bytes). Used by clients to map byte
   // offsets to chunk indices. Added in fix #13.
   uint64 chunk_size = 4;
+  // Epoch milliseconds, propagated from the manager's FileMetadata so the
+  // FUSE client can return real mtime/ctime via getattr (fix for F-014).
+  int64 created_at_ms = 5;
+  int64 modified_at_ms = 6;
 }
 
 // --- DeleteFile ---
@@ -154,6 +359,22 @@ message HeartbeatRequest {
   uint64 total_chunks = 3;
   uint64 total_bytes_used = 4;
   uint64 config_version = 5;
+  // P0-9: per-chunk read counters bucketed by requester DC. Top-N chunks
+  // by recent activity are reported each heartbeat (capped to keep payload
+  // bounded). Drives the tiering engine's auto-move-replica decisions.
+  repeated PerChunkReadCounter chunk_reads = 6;
+}
+
+// P0-9: per-chunk read counter, one entry per (chunk, DC) cell, packed
+// into per-chunk records to amortise the map overhead.
+message PerChunkReadCounter {
+  string chunk_id = 1;
+  // 1-hour window: DC name -> read count.
+  map<string, uint32> reads_by_dc_1h = 2;
+  // 24-hour window: DC name -> read count.
+  map<string, uint32> reads_by_dc_24h = 3;
+  // Last access wall-clock ms (UTC).
+  uint64 last_access_ms = 4;
 }
 
 message ConfigUpdate {

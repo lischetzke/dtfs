@@ -47,6 +47,11 @@ pub struct FileLocations {
     /// Used to map byte offsets to chunk indices. Populated from the manager's
     /// `GetFileLocationsResponse.chunk_size` field (fix for issue #13).
     pub chunk_size: u64,
+    /// File creation time, epoch milliseconds. Comes from the manager's
+    /// `FileMetadata.created_at_ms` (fix for F-014).
+    pub created_at_ms: i64,
+    /// File last-modified time, epoch milliseconds (fix for F-014).
+    pub modified_at_ms: i64,
 }
 
 /// Information about a single chunk within a file.
@@ -84,14 +89,59 @@ pub enum OpenFlags {
     ReadWrite,
 }
 
+impl OpenFlags {
+    /// Whether this open mode permits writes (and therefore needs a
+    /// single-writer lease — P0-1).
+    pub fn is_writable(self) -> bool {
+        matches!(self, Self::WriteOnly | Self::ReadWrite)
+    }
+}
+
+/// Sentinel error returned when an open-for-write fails because another
+/// process already holds the write lease on the same path. The fuse adapter
+/// downcasts this to libc::EBUSY so applications see `Resource busy` rather
+/// than a generic I/O error.
+#[derive(Debug)]
+pub struct LeaseBusy {
+    pub path: String,
+    pub conflict_owner: String,
+    pub expires_at_ms: u64,
+}
+
+impl std::fmt::Display for LeaseBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "write lease busy for {} (owner={}, expires_at_ms={})",
+            self.path, self.conflict_owner, self.expires_at_ms
+        )
+    }
+}
+
+impl std::error::Error for LeaseBusy {}
+
+/// Lease parameters (P0-1).
+/// Default lease is 15s; FUSE renews at half-life (7.5s elapsed).
+pub(crate) const WRITE_LEASE_MS: u64 = 15_000;
+pub(crate) const WRITE_LEASE_RENEW_AFTER_MS: u64 = 7_000;
+
 /// An open file handle with its associated state.
 struct OpenFile {
     path: String,
     flags: OpenFlags,
+    /// `O_APPEND` semantics — every write goes to the *current* end of file,
+    /// regardless of the offset the kernel hands us. (F-021)
+    append: bool,
     /// Cached locations (refreshed on open).
     locations: Option<FileLocations>,
     /// Chunk size in bytes for this file's volume.
     chunk_size: u64,
+    /// P0-1: write lease token for this file handle. None for read-only opens.
+    lease_id: Option<String>,
+    /// P0-1: absolute Unix-ms expiry of the lease (renew at half-life).
+    lease_expires_at_ms: Option<u64>,
+    /// P0-1: owner_id used to acquire the lease (for renew/release).
+    lease_owner_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +184,13 @@ pub struct DtfsFilesystem {
     /// Known node locations for nearest-node selection.
     /// Populated as we discover node addresses from metadata responses.
     known_locations: DashMap<String, Location>,
+    /// P0-1: prefix used for write-lease `owner_id` values. Format:
+    /// `<hostname>:<pid>:`. The per-open `:<fh>` suffix is appended at
+    /// open-time to make each owner_id unique within the process.
+    lease_owner_prefix: String,
+    /// P0-11: disk-backed chunk cache. Sits between the in-memory readahead
+    /// and the network. None when `local_cache_dir` is not configured.
+    pub(crate) local_cache: Option<std::sync::Arc<crate::local_cache::LocalChunkCache>>,
 }
 
 impl DtfsFilesystem {
@@ -167,6 +224,14 @@ impl DtfsFilesystem {
             client_location.clone(),
         );
 
+        // P0-1: lease owner = "<topology host>:<pid>:". Using the topology
+        // host (set via fuse.toml) keeps the identity stable across PID
+        // changes and avoids a new system-dep on the `hostname` crate.
+        let lease_owner_prefix = format!(
+            "{}:{}:",
+            client_location.host, std::process::id()
+        );
+
         Self {
             client,
             client_location,
@@ -179,7 +244,30 @@ impl DtfsFilesystem {
             write_buffer,
             migration,
             known_locations: DashMap::new(),
+            lease_owner_prefix,
+            local_cache: None,
         }
+    }
+
+    /// P0-11: install the disk-backed local chunk cache. Called from fuse
+    /// main.rs after building the filesystem when `local_cache_dir` is set.
+    pub fn set_local_cache(
+        &mut self,
+        cache: std::sync::Arc<crate::local_cache::LocalChunkCache>,
+    ) {
+        self.local_cache = Some(cache);
+    }
+
+    /// P0-1: hostname (without PID/fh) used for the orphan-lease cleanup
+    /// call at FUSE startup. Returns just the hostname segment.
+    pub fn lease_hostname(&self) -> String {
+        // Strip the trailing ":pid:" — release_leases_by_host takes the
+        // hostname only (it appends ":" itself when matching prefixes).
+        self.lease_owner_prefix
+            .split(':')
+            .next()
+            .unwrap_or("unknown-host")
+            .to_string()
     }
 
     /// Override the metadata cache TTL.
@@ -196,14 +284,49 @@ impl DtfsFilesystem {
     /// First checks the metadata cache, then falls back to the manager.
     #[instrument(skip(self), fields(path = %path))]
     pub async fn lookup(&self, path: &str) -> Result<FileAttr> {
+        // The manager has no metadata entry for "/" — files are stored at
+        // "/foo", "/bar", etc. Return a synthetic directory attribute for the
+        // root so getattr(ino=1) succeeds. Without this, every `ls`/`stat` on
+        // the mount returns ENOENT even though writes through paths like
+        // "/mnt/dtfs/foo" still succeed. (Fix for the ls/stat regression
+        // surfaced after the F-001..F-016 rebuild.)
+        if path == "/" {
+            // F-023: return SystemTime::now() as mtime so the kernel
+            // treats the root directory as freshly modified after every
+            // lookup. Combined with a sub-second ENTRY_TTL this prevents
+            // the kernel from serving stale getdents() out of its dcache
+            // immediately after a bulk file-creation loop.
+            let now = SystemTime::now();
+            return Ok(FileAttr {
+                size: 4096,
+                is_directory: true,
+                created_at: now,
+                modified_at: now,
+            });
+        }
+
         // Try the metadata cache first.
         if let Some(cached) = self.get_cached_metadata(path) {
-            return Ok(file_attr_from_locations(&cached));
+            let mut attr = file_attr_from_locations(&cached);
+            // F-029: if writes are still buffered locally, the cluster-side
+            // size is stale — fold in the buffered logical size so `stat`
+            // reports what the user can actually `read()`.
+            if let Some(buffered_eof) = self.write_buffer.logical_size(path) {
+                if buffered_eof > attr.size {
+                    attr.size = buffered_eof;
+                }
+            }
+            return Ok(attr);
         }
 
         // Fetch from the manager.
         let locations = self.fetch_file_locations(path).await?;
-        let attr = file_attr_from_locations(&locations);
+        let mut attr = file_attr_from_locations(&locations);
+        if let Some(buffered_eof) = self.write_buffer.logical_size(path) {
+            if buffered_eof > attr.size {
+                attr.size = buffered_eof;
+            }
+        }
         self.cache_metadata(path, locations);
         Ok(attr)
     }
@@ -220,6 +343,10 @@ impl DtfsFilesystem {
         let proto_entries = response.entries;
         let count = proto_entries.len();
 
+        // NB: the manager's ListDirectory handler populates `created_at` /
+        // `modified_at` with FileMetadata's millisecond values (despite the
+        // proto field names not having `_ms`). Convert as milliseconds so ls
+        // doesn't show year 58344. (Aligned with F-014's _ms convention.)
         let entries = proto_entries
             .into_iter()
             .map(|e| {
@@ -227,8 +354,8 @@ impl DtfsFilesystem {
                     name: e.name,
                     size: e.size,
                     is_directory: e.is_directory,
-                    created_at: system_time_from_epoch_secs(e.created_at),
-                    modified_at: system_time_from_epoch_secs(e.modified_at),
+                    created_at: system_time_from_epoch_ms(e.created_at),
+                    modified_at: system_time_from_epoch_ms(e.modified_at),
                 }
             })
             .collect();
@@ -240,26 +367,105 @@ impl DtfsFilesystem {
     /// Open a file and return a file handle.
     #[instrument(skip(self), fields(path = %path, ?flags))]
     pub async fn open(&self, path: &str, flags: OpenFlags) -> Result<u64> {
+        self.open_with_append(path, flags, false).await
+    }
+
+    /// Same as [`open`] but lets the caller signal `O_APPEND`. Used by the
+    /// fuse3 adapter when the kernel passes the open-flag bitmask, so every
+    /// subsequent write lands at the current end-of-file (F-021).
+    pub async fn open_with_append(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        append: bool,
+    ) -> Result<u64> {
         // Fetch (or refresh) file locations from the manager.
         let locations = self.fetch_file_locations(path).await?;
         let chunk_size = self.resolve_chunk_size(&locations);
 
+        // F-021: when opened with O_APPEND, pre-seed the write buffer with
+        // the file's existing tail chunk so the subsequent write(s) extend
+        // it instead of replacing the chunk wholesale. Without this, the
+        // next flush emits a chunk-0 segment containing ONLY the appended
+        // bytes, which silently truncates the file at the append offset.
+        //
+        // For media-server workloads we expect append to be small and rare;
+        // the memory cost (= size of the last chunk, capped at chunk_size)
+        // is acceptable.
+        if append && !locations.chunks.is_empty() {
+            let last_idx = locations.chunks.len() - 1;
+            let last_chunk = &locations.chunks[last_idx];
+            if !last_chunk.node_addresses.is_empty() {
+                let node = self.select_nearest_node(&last_chunk.node_addresses);
+                match self.client.read_chunk(&node, &last_chunk.chunk_id).await {
+                    Ok(existing) => {
+                        let offset_in_file = (last_idx as u64) * chunk_size;
+                        self.write_buffer.write(path, offset_in_file, &existing);
+                        debug!(
+                            path,
+                            offset_in_file,
+                            len = existing.len(),
+                            "O_APPEND: pre-seeded tail chunk into write buffer"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            path,
+                            error = %e,
+                            "O_APPEND: failed to pre-seed tail chunk; append may truncate"
+                        );
+                    }
+                }
+            }
+        }
+
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+
+        // P0-1: for writable opens, acquire the single-writer lease BEFORE
+        // inserting the OpenFile entry, so a busy condition leaves no
+        // dangling fh. A returned LeaseBusy error surfaces as EBUSY to the
+        // caller via the fuse adapter's downcast.
+        let (lease_id, lease_expires_at_ms, lease_owner_id) = if flags.is_writable() {
+            let owner_id = format!("{}{}", self.lease_owner_prefix, fh);
+            let resp = self
+                .client
+                .acquire_write_lease(path, &owner_id, WRITE_LEASE_MS)
+                .await
+                .with_context(|| format!("acquire_write_lease({path})"))?;
+            if !resp.granted {
+                return Err(anyhow::Error::new(LeaseBusy {
+                    path: path.to_string(),
+                    conflict_owner: resp.conflict_owner,
+                    expires_at_ms: resp.conflict_expires_at_ms,
+                }));
+            }
+            (
+                Some(resp.lease_id),
+                Some(resp.expires_at_ms),
+                Some(owner_id),
+            )
+        } else {
+            (None, None, None)
+        };
 
         self.open_files.insert(
             fh,
             OpenFile {
                 path: path.to_string(),
                 flags,
+                append,
                 locations: Some(locations.clone()),
                 chunk_size,
+                lease_id,
+                lease_expires_at_ms,
+                lease_owner_id,
             },
         );
 
         // Cache metadata.
         self.cache_metadata(path, locations);
 
-        debug!(path, fh, "file opened");
+        debug!(path, fh, append, "file opened");
         Ok(fh)
     }
 
@@ -283,8 +489,12 @@ impl DtfsFilesystem {
         let file_path = file.path.clone();
         let volume_id = locations.volume_id.clone();
 
-        // Clamp read to file size.
-        let file_size = locations.total_size;
+        // F-029: effective file size = max(persisted size, buffered logical
+        // size). Without this, every read of bytes that have only been
+        // *buffered* (not yet flushed to a chunk) returns Bytes::new() and
+        // SQLite / any DB engine sees an empty database after `CREATE TABLE`.
+        let buffered_eof = self.write_buffer.logical_size(&file_path).unwrap_or(0);
+        let file_size = locations.total_size.max(buffered_eof);
         if offset >= file_size {
             return Ok(Bytes::new());
         }
@@ -310,52 +520,115 @@ impl DtfsFilesystem {
                 bail!("no data nodes available for chunk {}", chunk.chunk_id);
             }
 
-            // Select nearest node.
-            let node_addr = self.select_nearest_node(&chunk.node_addresses);
+            // P0-2: build candidate list sorted by distance (nearest first),
+            // try each on failure until one succeeds. Single-replica clusters
+            // and single-address chunks degenerate to one attempt.
+            let candidates = self.sort_candidates(&chunk.node_addresses);
 
-            // Try read-ahead cache first.
-            let chunk_data =
-                if let Some(cached) = self.readahead.get_cached(&node_addr, &chunk.chunk_id) {
-                    debug!(chunk_id = %chunk.chunk_id, "readahead cache hit");
-                    cached
-                } else {
-                    // Fetch from data node.
-                    let data = self
-                        .client
-                        .read_chunk(&node_addr, &chunk.chunk_id)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to read chunk {} from {}",
-                                chunk.chunk_id, node_addr
-                            )
-                        })?;
+            // Try read-ahead in-memory cache first: any candidate's cache
+            // key works because chunks are content-addressed by chunk_id.
+            let mut chunk_data: Option<bytes::Bytes> = None;
+            for cand in &candidates {
+                if let Some(cached) = self.readahead.get_cached(cand, &chunk.chunk_id) {
+                    debug!(chunk_id = %chunk.chunk_id, node = %cand, "readahead cache hit");
+                    chunk_data = Some(cached);
+                    break;
+                }
+            }
 
-                    // Trigger readahead for upcoming chunks.
-                    self.readahead.on_chunk_read(
-                        &file_path,
-                        chunk_idx as u32,
-                        locations.chunks.len() as u32,
-                        &chunk_locs,
-                    );
-
-                    // Trigger migration check if the read was remote.
-                    // We use a simple heuristic: if the node address contains
-                    // a known location, check distance.
-                    if let Some(node_loc) = self.known_locations.get(&node_addr) {
-                        let node_loc = node_loc.clone();
-                        let chunk_id = chunk.chunk_id.clone();
-                        let file_path = file_path.clone();
-                        let volume_id = volume_id.clone();
-                        // Fire-and-forget async migration check.
-                        let migration = &self.migration;
-                        migration
-                            .on_remote_read(&chunk_id, &node_loc, &file_path, &volume_id)
-                            .await;
+            // P0-11: fall through to the disk-backed local cache. This
+            // survives FUSE restarts and is governed by `max_age_days` for
+            // per-DC retention policies (the warm DC keeps only files
+            // accessed in the last 90 days).
+            if chunk_data.is_none() {
+                if let Some(lc) = &self.local_cache {
+                    if let Some(cached) = lc.get(&chunk.chunk_id).await {
+                        debug!(chunk_id = %chunk.chunk_id, "local-disk cache hit");
+                        chunk_data = Some(cached);
                     }
+                }
+            }
 
-                    data
-                };
+            let chunk_data = if let Some(d) = chunk_data {
+                d
+            } else {
+                // Cache miss: fetch from data node, falling back through
+                // candidates on transport / not-found errors.
+                let mut last_err: Option<anyhow::Error> = None;
+                let mut fetched: Option<(String, bytes::Bytes)> = None;
+                for cand in &candidates {
+                    match self.client.read_chunk(cand, &chunk.chunk_id).await {
+                        Ok(d) => {
+                            fetched = Some((cand.clone(), d));
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                chunk_id = %chunk.chunk_id,
+                                node = %cand,
+                                error = %e,
+                                "replica read failed, trying next"
+                            );
+                            last_err = Some(e);
+                        }
+                    }
+                }
+                let (node_addr, data) = fetched.ok_or_else(|| {
+                    last_err.unwrap_or_else(|| {
+                        anyhow::anyhow!(
+                            "no replicas available for chunk {} (candidates exhausted)",
+                            chunk.chunk_id
+                        )
+                    })
+                })?;
+
+                // CRITICAL: store the just-fetched chunk in the cache so
+                // subsequent FUSE reads (which arrive in 128 KB pieces
+                // for a 128 MB chunk = ~1024 reads per chunk) hit the
+                // cache instead of re-issuing the full fetch. Without
+                // this the readahead cache only ever contained chunks
+                // fetched by `on_chunk_read` prefetch, and cold reads
+                // ran at ~1.2 MB/s because every kernel page read
+                // triggered a fresh 128 MB chunk fetch.
+                self.readahead
+                    .insert_cached(&node_addr, &chunk.chunk_id, data.clone());
+
+                // P0-11: also write to the disk cache so the chunk
+                // survives readahead-cache eviction + FUSE restarts.
+                if let Some(lc) = &self.local_cache {
+                    if let Err(e) = lc.put(&chunk.chunk_id, &data).await {
+                        tracing::warn!(
+                            chunk_id = %chunk.chunk_id,
+                            error = %e,
+                            "local disk cache put failed"
+                        );
+                    }
+                }
+
+                // Trigger readahead for upcoming chunks.
+                self.readahead.on_chunk_read(
+                    &file_path,
+                    chunk_idx as u32,
+                    locations.chunks.len() as u32,
+                    &chunk_locs,
+                );
+
+                // Trigger migration check using the actually-served node so
+                // tiering sees the real cross-DC traffic, not the nearest
+                // candidate we wished we'd used.
+                if let Some(node_loc) = self.known_locations.get(&node_addr) {
+                    let node_loc = node_loc.clone();
+                    let chunk_id = chunk.chunk_id.clone();
+                    let file_path = file_path.clone();
+                    let volume_id = volume_id.clone();
+                    let migration = &self.migration;
+                    migration
+                        .on_remote_read(&chunk_id, &node_loc, &file_path, &volume_id)
+                        .await;
+                }
+
+                data
+            };
 
             // Extract the relevant byte range from this chunk.
             let chunk_start_byte = chunk_idx as u64 * chunk_size;
@@ -374,6 +647,24 @@ impl DtfsFilesystem {
             if slice_start < slice_end {
                 result.extend_from_slice(&chunk_data[slice_start..slice_end]);
             }
+        }
+
+        // F-029: overlay any buffered (not-yet-flushed) writes for this
+        // path on top of the cluster-fetched bytes. The buffer may also
+        // extend beyond the cluster-known size, so first pad `result` up to
+        // the read's actual_size so the overlay has somewhere to land.
+        if (result.len() as u32) < actual_size {
+            result.resize(actual_size as usize, 0);
+        }
+        let overlaid = self.write_buffer.overlay(&file_path, offset, &mut result);
+        if overlaid > 0 {
+            debug!(
+                path = %file_path,
+                offset,
+                size = actual_size,
+                overlaid,
+                "overlaid buffered writes on read"
+            );
         }
 
         Ok(Bytes::from(result))
@@ -395,9 +686,101 @@ impl DtfsFilesystem {
         }
 
         let path = file.path.clone();
+        let append = file.append;
+        // For O_APPEND we ignore the kernel-supplied offset and target the
+        // *current* end of file. Use the cached file size; the buffer may
+        // already have unflushed data, in which case the buffer reports a
+        // larger logical end than `locations.total_size`. (F-021)
+        let cached_eof = file
+            .locations
+            .as_ref()
+            .map(|l| l.total_size)
+            .unwrap_or(0);
+        let chunk_size = file.chunk_size;
+        let locations_snapshot = file.locations.clone();
         drop(file); // Release the lock before writing.
 
-        let written = self.write_buffer.write(&path, offset, data);
+        let effective_offset = if append {
+            let buffered = self.write_buffer.logical_size(&path).unwrap_or(0);
+            cached_eof.max(buffered)
+        } else {
+            offset
+        };
+
+        // Read-modify-write for partial-chunk writes (F-021).
+        //
+        // The kernel masks O_APPEND in the open-flag word it passes to FUSE
+        // and instead issues write() at offset=current_eof. So even if the
+        // application opened with O_APPEND, we only see a write at offset N.
+        // For our chunked storage, if the existing chunk at that offset has
+        // earlier bytes that we don't have in the local write buffer, the
+        // subsequent flush would emit a partial chunk segment and the data
+        // node would *replace* the whole chunk — silently dropping the
+        // earlier content (bash `echo line1 > f; echo line2 >> f`).
+        //
+        // To prevent that, seed the buffer with the existing chunk content
+        // when we're about to write at a position that isn't already covered
+        // by buffered data.
+        if chunk_size > 0 && effective_offset > 0 {
+            let chunk_idx = effective_offset / chunk_size;
+            let chunk_start = chunk_idx * chunk_size;
+            let need_seed = match self.write_buffer.logical_size(&path) {
+                Some(end_in_buffer) => end_in_buffer <= chunk_start,
+                None => true,
+            };
+            if need_seed {
+                if let Some(loc) = &locations_snapshot {
+                    if let Some(chunk) = loc.chunks.get(chunk_idx as usize) {
+                        if !chunk.node_addresses.is_empty() {
+                            let node = self.select_nearest_node(&chunk.node_addresses);
+                            match self.client.read_chunk(&node, &chunk.chunk_id).await {
+                                Ok(existing) if !existing.is_empty() => {
+                                    self.write_buffer
+                                        .write(&path, chunk_start, &existing);
+                                    debug!(
+                                        path = %path,
+                                        chunk_idx,
+                                        len = existing.len(),
+                                        "RMW: seeded existing chunk before partial write"
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(e) => warn!(
+                                    path = %path,
+                                    chunk_idx,
+                                    error = %e,
+                                    "RMW: failed to read existing chunk — partial write may truncate"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sparse-file semantics (F-022): if the write lands past the current
+        // logical end, zero-fill the gap so `stat` reports the right size and
+        // subsequent reads of the hole return zeros rather than ENOENT.
+        let buffered_size = self.write_buffer.logical_size(&path).unwrap_or(0);
+        let logical_size = cached_eof.max(buffered_size);
+        if effective_offset > logical_size {
+            let hole = (effective_offset - logical_size) as usize;
+            // Cap the zero-fill at 64 MiB per call to keep memory bounded;
+            // larger holes are handled by chunking the fill internally.
+            const FILL_CHUNK: usize = 64 * 1024 * 1024;
+            let mut remaining = hole;
+            let mut at = logical_size;
+            while remaining > 0 {
+                let n = remaining.min(FILL_CHUNK);
+                let zeros = vec![0u8; n];
+                self.write_buffer.write(&path, at, &zeros);
+                at += n as u64;
+                remaining -= n;
+            }
+            debug!(path = %path, hole, "zero-filled sparse gap");
+        }
+
+        let written = self.write_buffer.write(&path, effective_offset, data);
 
         // Check if any complete chunks are ready to flush.
         let segments = self.write_buffer.flush(&path);
@@ -405,11 +788,25 @@ impl DtfsFilesystem {
             self.flush_segments_to_cluster(&path, &segments).await?;
         }
 
-        debug!(path = %path, written, "write buffered");
+        debug!(
+            path = %path,
+            written,
+            offset = effective_offset,
+            append,
+            "write buffered"
+        );
         Ok(written as u32)
     }
 
     /// Flush all buffered writes for an open file to the cluster.
+    ///
+    /// On failure (e.g. a chunk write fails because a target node is down),
+    /// a brand-new file — one that has never had any chunks committed — is
+    /// unlinked from the manager so it doesn't survive as a 0-byte ghost.
+    /// Returning the error to the caller is necessary but not sufficient: the
+    /// Linux kernel may suppress close()-time errors, so leaving an orphan
+    /// metadata entry creates the appearance of silent data loss. (Fix for
+    /// F-013.)
     #[instrument(skip(self), fields(fh))]
     pub async fn flush(&self, fh: u64) -> Result<()> {
         let file = self
@@ -418,15 +815,100 @@ impl DtfsFilesystem {
             .context("invalid file handle")?;
 
         let path = file.path.clone();
+        let was_fresh = file
+            .locations
+            .as_ref()
+            .map(|l| l.total_size == 0 && l.chunks.is_empty())
+            .unwrap_or(true);
+        // P0-1: capture lease state for renewal-before-flush.
+        let lease_id = file.lease_id.clone();
+        let lease_expires_at_ms = file.lease_expires_at_ms;
         drop(file);
 
+        // P0-1: if a lease is held and is past the renewal threshold,
+        // renew BEFORE issuing the cluster writes. Otherwise a large flush
+        // could exceed the lease lifetime and another writer would acquire
+        // the path mid-flush.
+        if let (Some(lease_id), Some(expires_at_ms)) = (lease_id.as_ref(), lease_expires_at_ms) {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let elapsed = expires_at_ms.saturating_sub(now_ms);
+            // If less than half the lease remains, refresh proactively.
+            if elapsed < (WRITE_LEASE_MS - WRITE_LEASE_RENEW_AFTER_MS) {
+                match self
+                    .client
+                    .renew_write_lease(&path, lease_id, WRITE_LEASE_MS)
+                    .await
+                {
+                    Ok(resp) if resp.granted => {
+                        if let Some(mut entry) = self.open_files.get_mut(&fh) {
+                            entry.value_mut().lease_expires_at_ms = Some(resp.new_expires_at_ms);
+                        }
+                    }
+                    Ok(_) => {
+                        // Lease lost (someone else took it). Abort the flush
+                        // so we don't write past another writer's data.
+                        return Err(anyhow::anyhow!(
+                            "write lease lost for {path} during flush — aborting"
+                        ));
+                    }
+                    Err(e) => {
+                        // Manager unreachable. Continue best-effort: the
+                        // existing lease may still be valid until GC.
+                        tracing::warn!(
+                            path = %path,
+                            error = %e,
+                            "lease renew failed; proceeding with existing lease until expiry"
+                        );
+                    }
+                }
+            }
+        }
+
         let segments = self.write_buffer.flush_all(&path);
-        if !segments.is_empty() {
-            self.flush_segments_to_cluster(&path, &segments).await?;
+        let had_segments = !segments.is_empty();
+        if had_segments {
+            if let Err(e) = self.flush_segments_to_cluster(&path, &segments).await {
+                if was_fresh {
+                    warn!(
+                        path = %path,
+                        error = %e,
+                        "flush of fresh file failed; unlinking ghost entry to surface error",
+                    );
+                    if let Err(unlink_err) = self.client.delete_file(&path).await {
+                        warn!(
+                            path = %path,
+                            error = %unlink_err,
+                            "failed to unlink ghost file after flush failure",
+                        );
+                    }
+                    self.metadata_cache.remove(&path);
+                }
+                return Err(e);
+            }
         }
 
         // Invalidate metadata cache since the file may have changed.
         self.metadata_cache.remove(&path);
+
+        // F-029: after a successful flush, refresh the OpenFile's locations
+        // so subsequent reads on the same fd see the freshly committed
+        // chunks. Without this, the in-memory `OpenFile.locations` keeps the
+        // pre-flush state (often total_size=0 + empty chunks for a new file)
+        // and read() returns Bytes::new() because it thinks the file is
+        // empty — which is what makes SQLite see no rows after an fsync.
+        if had_segments {
+            if let Ok(fresh) = self.fetch_file_locations(&path).await {
+                for mut entry in self.open_files.iter_mut() {
+                    if entry.value().path == path {
+                        entry.value_mut().locations = Some(fresh.clone());
+                    }
+                }
+                self.cache_metadata(&path, fresh);
+            }
+        }
 
         debug!(path = %path, "flush complete");
         Ok(())
@@ -443,6 +925,22 @@ impl DtfsFilesystem {
         }
 
         if let Some((_, file)) = self.open_files.remove(&fh) {
+            // P0-1: release the write lease (if held). Best-effort: a
+            // network error here is logged, not propagated, since the lease
+            // GC will reap it on expiry anyway.
+            if let Some(lease_id) = &file.lease_id {
+                if let Err(e) = self
+                    .client
+                    .release_write_lease(&file.path, lease_id)
+                    .await
+                {
+                    tracing::warn!(
+                        path = %file.path,
+                        error = %e,
+                        "release_write_lease failed; lease will expire naturally"
+                    );
+                }
+            }
             // Clean up write buffer for this path.
             self.write_buffer.remove(&file.path);
             debug!(path = %file.path, fh, "file released");
@@ -471,21 +969,46 @@ impl DtfsFilesystem {
             "file created"
         );
 
-        // Open the newly created file for read-write.
+        // Open the newly created file for read-write. P0-1: acquire the
+        // single-writer lease so a second create() against the same path
+        // (race between two clients) returns EBUSY.
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        let owner_id = format!("{}{}", self.lease_owner_prefix, fh);
+        let lease_resp = self
+            .client
+            .acquire_write_lease(path, &owner_id, WRITE_LEASE_MS)
+            .await
+            .with_context(|| format!("acquire_write_lease({path}) on create"))?;
+        if !lease_resp.granted {
+            return Err(anyhow::Error::new(LeaseBusy {
+                path: path.to_string(),
+                conflict_owner: lease_resp.conflict_owner,
+                expires_at_ms: lease_resp.conflict_expires_at_ms,
+            }));
+        }
+
         self.open_files.insert(
             fh,
             OpenFile {
                 path: path.to_string(),
                 flags: OpenFlags::ReadWrite,
+                append: false,
                 locations: Some(FileLocations {
                     path: path.to_string(),
                     total_size: 0,
                     chunks: Vec::new(),
                     volume_id: response.volume_id,
                     chunk_size: response.chunk_size,
+                    // Newly-created file: timestamps will be filled in on the
+                    // next getattr/lookup once metadata round-trips back from
+                    // the manager. 0 means "use UNIX_EPOCH for now".
+                    created_at_ms: 0,
+                    modified_at_ms: 0,
                 }),
                 chunk_size: response.chunk_size,
+                lease_id: Some(lease_resp.lease_id),
+                lease_expires_at_ms: Some(lease_resp.expires_at_ms),
+                lease_owner_id: Some(owner_id),
             },
         );
 
@@ -542,6 +1065,129 @@ impl DtfsFilesystem {
         Ok(())
     }
 
+    /// Return cluster-wide (total_bytes, used_bytes, file_count) for
+    /// `statvfs` (F-038). Falls back to an error if the manager is down.
+    pub async fn cluster_capacity(&self) -> Result<(u64, u64, u64)> {
+        self.client.cluster_capacity().await
+    }
+
+    /// Update the manager-side logical size (F-033 fallocate / F-037
+    /// truncate-grow helper). Drops the on-disk write buffer if the new
+    /// size shrinks below buffered EOF.
+    pub async fn set_size(&self, fh: u64, new_size: u64) -> Result<()> {
+        let path = self
+            .open_files
+            .get(&fh)
+            .map(|f| f.path.clone())
+            .context("invalid fh")?;
+        self.client
+            .set_file_size(&path, new_size)
+            .await
+            .with_context(|| format!("set_size failed for {path}"))?;
+        self.metadata_cache.remove(&path);
+        Ok(())
+    }
+
+    /// F-037 — truncate. `new_size = 0` is the SQLite journal-recycle case.
+    /// Shrink drops trailing chunks; grow extends sparsely.
+    #[instrument(skip(self), fields(path = %path, new_size))]
+    pub async fn truncate(
+        &self,
+        path: &str,
+        fh: Option<u64>,
+        new_size: u64,
+    ) -> Result<()> {
+        self.client
+            .set_file_size(path, new_size)
+            .await
+            .with_context(|| format!("truncate failed for {path}"))?;
+        // Clear any buffered writes past the new EOF.
+        if let Some(buffered_eof) = self.write_buffer.logical_size(path) {
+            if buffered_eof > new_size {
+                self.write_buffer.remove(path);
+            }
+        }
+        // Refresh cached locations.
+        self.metadata_cache.remove(path);
+        if let Some(fh) = fh {
+            if let Ok(fresh) = self.fetch_file_locations(path).await {
+                if let Some(mut entry) = self.open_files.get_mut(&fh) {
+                    entry.value_mut().locations = Some(fresh.clone());
+                }
+                self.cache_metadata(path, fresh);
+            }
+        }
+        Ok(())
+    }
+
+    /// F-034 — rename a file (atomic) in the manager namespace.
+    #[instrument(skip(self), fields(from = %from, to = %to))]
+    pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        self.client.rename_file(from, to).await
+            .with_context(|| format!("rename {from} -> {to}"))?;
+        self.metadata_cache.remove(from);
+        self.metadata_cache.remove(to);
+        self.write_buffer.remove(from);
+        // Update any open files pointing at the old path.
+        for mut entry in self.open_files.iter_mut() {
+            if entry.value().path == from {
+                entry.value_mut().path = to.to_string();
+            }
+        }
+        Ok(())
+    }
+
+    /// F-035 — create a symbolic link.
+    pub async fn symlink(&self, path: &str, target: &str) -> Result<()> {
+        self.client.symlink(path, target).await
+            .with_context(|| format!("symlink {path} -> {target}"))?;
+        Ok(())
+    }
+
+    /// F-035 — read a symbolic link's target.
+    pub async fn readlink(&self, path: &str) -> Result<String> {
+        self.client.readlink(path).await
+            .with_context(|| format!("readlink {path}"))
+    }
+
+    /// F-036 — create a hard link from src to dst.
+    pub async fn link(&self, src: &str, dst: &str) -> Result<FileAttr> {
+        self.client.link_file(src, dst).await
+            .with_context(|| format!("link {src} -> {dst}"))?;
+        let locs = self.fetch_file_locations(dst).await?;
+        let attr = file_attr_from_locations(&locs);
+        self.cache_metadata(dst, locs);
+        Ok(attr)
+    }
+
+    /// F-039 — try to acquire a byte-range lock through the cluster manager.
+    /// Returns `Ok(true)` on grant, `Ok(false)` on conflict, `Err(_)` on RPC failure.
+    pub async fn try_acquire_lock(
+        &self,
+        path: &str,
+        owner_id: &str,
+        start: u64,
+        end: u64,
+        write: bool,
+        lease_ms: u64,
+    ) -> Result<bool> {
+        let resp = self.client
+            .acquire_lock(path, owner_id, start, end, write, false, lease_ms)
+            .await?;
+        Ok(resp.granted)
+    }
+
+    /// F-039 — release a previously-granted byte-range lock.
+    pub async fn release_cluster_lock(
+        &self,
+        path: &str,
+        owner_id: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<()> {
+        self.client.release_lock(path, owner_id, start, end).await
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -582,6 +1228,8 @@ impl DtfsFilesystem {
             // a known volume.
             volume_id: "default".to_string(),
             chunk_size,
+            created_at_ms: response.created_at_ms,
+            modified_at_ms: response.modified_at_ms,
         })
     }
 
@@ -644,6 +1292,29 @@ impl DtfsFilesystem {
         .unwrap_or_else(|| addresses[0].clone())
     }
 
+    /// Sort candidate addresses by distance, nearest first.
+    /// Used for replica fallback on read failure (P0-2).
+    fn sort_candidates(&self, addresses: &[String]) -> Vec<String> {
+        if addresses.len() <= 1 {
+            return addresses.to_vec();
+        }
+
+        let known: HashMap<String, Location> = addresses
+            .iter()
+            .filter_map(|addr| {
+                self.known_locations
+                    .get(addr)
+                    .map(|loc| (addr.clone(), loc.clone()))
+            })
+            .collect();
+
+        dtfs_client::location::sort_nodes_by_distance(
+            Some(&self.client_location),
+            addresses,
+            &known,
+        )
+    }
+
     /// Flush chunk segments to the cluster.
     ///
     /// Allocates placements from the manager and writes each segment to
@@ -672,7 +1343,12 @@ impl DtfsFilesystem {
 
         let mut commits: Vec<ChunkLocationCommit> = Vec::with_capacity(segments.len());
 
-        // Write each segment to its assigned primary node; chunk ids are content-defined by the data node.
+        // For each segment: write the chunk to the primary AND every replica
+        // target the manager assigned. Wait for all writes in parallel; require
+        // at least quorum (ceil(N/2)) to succeed before acking.  Each
+        // successful target produces a `ChunkLocationCommit` so the manager
+        // ends up with N location entries — that's what actually makes
+        // replication-factor=N real (fix for F-010).
         for (i, segment) in segments.iter().enumerate() {
             let placement = alloc_response
                 .placements
@@ -685,37 +1361,84 @@ impl DtfsFilesystem {
                     )
                 })?;
 
-            let put_resp = self
-                .client
-                .write_chunk(
-                    &placement.primary_address,
-                    "",
-                    &volume_id,
-                    "hot", // New writes go to hot tier.
-                    &segment.data,
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "write_chunk failed for chunk_index {} on {}",
-                        segment.chunk_index, placement.primary_address
-                    )
-                })?;
+            let mut targets: Vec<String> = Vec::with_capacity(1 + placement.replica_addresses.len());
+            targets.push(placement.primary_address.clone());
+            for r in &placement.replica_addresses {
+                if !targets.contains(r) {
+                    targets.push(r.clone());
+                }
+            }
+            let rf = targets.len();
+            let min_ok = ((rf + 1) / 2).max(1);
 
-            commits.push(ChunkLocationCommit {
-                chunk_index: segment.chunk_index,
-                chunk_id: put_resp.chunk_id,
-                primary_address: placement.primary_address.clone(),
-                size_bytes: put_resp.size,
-                disk_id: 0,
+            // Issue writes in parallel — Bytes is refcounted so cloning is
+            // cheap (zero-copy). Use the Bytes overload so the data buffer is
+            // shared across all N replica writers instead of being copied N
+            // times.
+            let writes = targets.iter().map(|addr| {
+                let client = self.client.clone();
+                let addr = addr.clone();
+                let volume_id = volume_id.clone();
+                let data = segment.data.clone();
+                async move {
+                    let res = client
+                        .write_chunk_bytes(&addr, "", &volume_id, "hot", data)
+                        .await;
+                    (addr, res)
+                }
             });
+            let results = futures_util::future::join_all(writes).await;
+
+            let mut successes: Vec<(String, _)> = Vec::with_capacity(rf);
+            let mut last_err: Option<anyhow::Error> = None;
+            for (addr, res) in results {
+                match res {
+                    Ok(put_resp) => successes.push((addr, put_resp)),
+                    Err(e) => {
+                        warn!(
+                            chunk_index = segment.chunk_index,
+                            node = %addr,
+                            error = %e,
+                            "write_chunk failed on replica",
+                        );
+                        last_err = Some(anyhow::anyhow!(e));
+                    }
+                }
+            }
+
+            if successes.len() < min_ok {
+                return Err(last_err.unwrap_or_else(|| {
+                    anyhow::anyhow!(
+                        "write_chunk failed for chunk_index {}: 0/{} replicas succeeded",
+                        segment.chunk_index,
+                        rf
+                    )
+                })
+                .context(format!(
+                    "write_chunk failed for chunk_index {}: only {}/{} replicas succeeded (need {})",
+                    segment.chunk_index,
+                    successes.len(),
+                    rf,
+                    min_ok
+                )));
+            }
+
+            for (addr, put_resp) in successes {
+                commits.push(ChunkLocationCommit {
+                    chunk_index: segment.chunk_index,
+                    chunk_id: put_resp.chunk_id.clone(),
+                    primary_address: addr,
+                    size_bytes: put_resp.size,
+                    disk_id: 0,
+                });
+            }
 
             debug!(
                 path,
                 chunk_index = segment.chunk_index,
-                node = %placement.primary_address,
+                replicas = rf,
                 size = segment.data.len(),
-                "chunk written to cluster"
+                "chunk written to cluster",
             );
         }
 
@@ -754,13 +1477,24 @@ fn system_time_from_epoch_secs(secs: i64) -> SystemTime {
     }
 }
 
-/// Build a `FileAttr` from `FileLocations`.
+/// Build a `FileAttr` from `FileLocations`. Timestamps come from the manager's
+/// `FileMetadata` and are exposed to the FUSE kernel via getattr (fix for F-014).
 fn file_attr_from_locations(locations: &FileLocations) -> FileAttr {
     FileAttr {
         size: locations.total_size,
         is_directory: false,
-        created_at: SystemTime::UNIX_EPOCH,
-        modified_at: SystemTime::UNIX_EPOCH,
+        created_at: system_time_from_epoch_ms(locations.created_at_ms),
+        modified_at: system_time_from_epoch_ms(locations.modified_at_ms),
+    }
+}
+
+/// Convert epoch milliseconds (i64) to `SystemTime`. Returns `UNIX_EPOCH` when
+/// the input is zero or negative — those are sentinels for "not known yet".
+fn system_time_from_epoch_ms(ms: i64) -> SystemTime {
+    if ms > 0 {
+        SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64)
+    } else {
+        SystemTime::UNIX_EPOCH
     }
 }
 
@@ -795,6 +1529,8 @@ mod tests {
             chunks: Vec::new(),
             volume_id: "default".to_string(),
             chunk_size: 128 * 1024 * 1024,
+            created_at_ms: 0,
+            modified_at_ms: 0,
         };
         let attr = file_attr_from_locations(&loc);
         assert_eq!(attr.size, 42);

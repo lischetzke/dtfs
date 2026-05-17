@@ -1,52 +1,38 @@
 [Unit]
 Description=DTFS Data Node ({{ inventory_hostname }})
-Documentation=https://github.com/dtfs/dtfs
-After=network-online.target chrony.service local-fs.target
+Documentation=https://github.com/leduc/dtfs2
+After=network-online.target local-fs.target
 Wants=network-online.target
-Requires=network-online.target local-fs.target
 
 [Service]
-Type=notify
+# dtfs-data does NOT call sd_notify; Type=notify would hang. Use Type=simple
+# to match deploy/systemd/dtfs-data.service.
+Type=simple
 User={{ dtfs_user }}
 Group={{ dtfs_group }}
 ExecStart={{ dtfs_data_bin }} --config {{ dtfs_config_dir }}/data.toml
-ExecReload=/bin/kill -HUP $MAINPID
-ExecStop=/bin/kill -SIGTERM $MAINPID
-TimeoutStartSec=120
-TimeoutStopSec=90
 Restart=on-failure
-RestartSec=5s
-KillMode=process
-KillSignal=SIGTERM
-SendSIGKILL=yes
-
-# Resource limits
-LimitNOFILE=1048576
-LimitNPROC=65536
+RestartSec=5
+LimitNOFILE=65535
 LimitMEMLOCK=infinity
-LimitCORE=infinity
 
-# Security
-PrivateTmp=true
-ProtectSystem=full
+# Security hardening — must include every disk mount path as ReadWritePaths
+# so the data node can actually write under ProtectSystem=strict.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
 ReadWritePaths={{ dtfs_data_dir }} {{ dtfs_log_dir }}
 {% for disk in dtfs_disks | default([]) %}
 ReadWritePaths={{ disk.path }}
 {% endfor %}
-NoNewPrivileges=true
+PrivateTmp=yes
 
-# Environment
-Environment="DTFS_CONFIG={{ dtfs_config_dir }}/data.toml"
-Environment="RUST_LOG={{ dtfs_log_level }}"
+Environment="RUST_LOG={{ dtfs_log_level | default('info') }}"
 Environment="RUST_BACKTRACE=1"
 
-# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=dtfs-data
-
-# Watchdog (2 * health check interval)
-WatchdogSec=30s
 
 [Install]
 WantedBy=multi-user.target
