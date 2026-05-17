@@ -222,14 +222,94 @@ impl tower::Service<tonic::codegen::http::Request<tonic::body::Body>> for RaftTr
                 }
             };
 
-            match handler.handle_rpc(body_bytes).await {
+            // The client uses tonic::client::Grpc::unary() with
+            // ProstCodec<Bytes, Bytes>; prost wraps each top-level `bytes`
+            // field as a length-prefixed entry (`tag<<3|wire=2`, then varint
+            // length, then payload). Then gRPC additionally wraps the whole
+            // protobuf message in its own length-prefix frame:
+            //   [1 byte compressed flag][4 byte big-endian length][prost message]
+            // So to recover the JSON payload we have to peel BOTH layers.
+            // (Without this the JSON parser sees framing bytes and fails with
+            // "bad raft msg: expected value at line 1 column 1" — breaking
+            // multi-voter Raft elections, F-009 v2.)
+            let payload_bytes = if body_bytes.len() >= 5 {
+                let outer_len = u32::from_be_bytes([
+                    body_bytes[1],
+                    body_bytes[2],
+                    body_bytes[3],
+                    body_bytes[4],
+                ]) as usize;
+                let outer_end = (5 + outer_len).min(body_bytes.len());
+                let inner = body_bytes.slice(5..outer_end);
+                // The first byte of the prost-encoded payload is the field
+                // tag (0x0A for field 1, wire type 2 = LEN). Skip it, then
+                // read a varint for the length, then take the rest.
+                if !inner.is_empty() && inner[0] == 0x0A {
+                    let (varlen, varbytes_consumed) = {
+                        let mut value: u64 = 0;
+                        let mut shift = 0;
+                        let mut consumed = 0;
+                        for (i, b) in inner[1..].iter().enumerate() {
+                            consumed = i + 1;
+                            value |= ((b & 0x7F) as u64) << shift;
+                            if b & 0x80 == 0 {
+                                break;
+                            }
+                            shift += 7;
+                            if shift > 63 {
+                                break;
+                            }
+                        }
+                        (value as usize, consumed)
+                    };
+                    let start = 1 + varbytes_consumed;
+                    let end = (start + varlen).min(inner.len());
+                    inner.slice(start..end)
+                } else {
+                    inner
+                }
+            } else {
+                body_bytes
+            };
+
+            tracing::debug!(
+                len = payload_bytes.len(),
+                head = ?payload_bytes.iter().take(40).collect::<Vec<_>>(),
+                "RaftTransport: decoded request payload",
+            );
+
+            match handler.handle_rpc(payload_bytes).await {
                 Ok(resp_bytes) => {
+                    // Frame the response symmetrically: prost-encode the
+                    // `bytes` field (tag 0x0A + varint length + payload),
+                    // then gRPC-frame that with the 5-byte length prefix.
+                    let mut prost = bytes::BytesMut::with_capacity(1 + 10 + resp_bytes.len());
+                    prost.extend_from_slice(&[0x0A]); // field 1, wire type 2
+                    let mut val = resp_bytes.len() as u64;
+                    loop {
+                        let mut b = (val & 0x7F) as u8;
+                        val >>= 7;
+                        if val != 0 {
+                            b |= 0x80;
+                            prost.extend_from_slice(&[b]);
+                        } else {
+                            prost.extend_from_slice(&[b]);
+                            break;
+                        }
+                    }
+                    prost.extend_from_slice(&resp_bytes);
+                    let prost = prost.freeze();
+
+                    let mut framed = bytes::BytesMut::with_capacity(5 + prost.len());
+                    framed.extend_from_slice(&[0u8]); // not compressed
+                    framed.extend_from_slice(&(prost.len() as u32).to_be_bytes());
+                    framed.extend_from_slice(&prost);
                     let resp = tonic::codegen::http::Response::builder()
                         .status(200)
                         .header("content-type", "application/grpc")
                         .header("grpc-status", "0")
                         .body(tonic::body::Body::new(
-                            http_body_util::Full::new(resp_bytes),
+                            http_body_util::Full::new(framed.freeze()),
                         ))
                         .unwrap();
                     Ok(resp)
@@ -260,6 +340,15 @@ pub async fn run_grpc_server(
     raft: Arc<DtfsRaft>,
 ) -> anyhow::Result<()> {
     let addr = config.grpc.listen_addr.parse()?;
+
+    if !config.tls.mode.eq_ignore_ascii_case("disabled")
+        && !config.tls.mode.eq_ignore_ascii_case("off")
+    {
+        tracing::warn!(
+            "TLS mode '{}' is set but manager gRPC still listens in plaintext; see ISSUES_TO_FIX.md §10",
+            config.tls.mode
+        );
+    }
 
     let raft_svc = RaftTransportSvc {
         handler: RaftTransportHandler::new(raft),

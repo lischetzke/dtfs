@@ -1,55 +1,28 @@
 [Unit]
-Description=DTFS FUSE Client - Volume %i ({{ inventory_hostname }})
-Documentation=https://github.com/dtfs/dtfs
-After=network-online.target dtfs-manager.service
+Description=DTFS FUSE Mount (/%I)
+Documentation=https://github.com/lischetzke/dtfs
+After=network-online.target
 Wants=network-online.target
-# Prevent auto-start if network is not up
-Requires=network-online.target
 
 [Service]
-Type=forking
-User={{ dtfs_user }}
-Group={{ dtfs_group }}
-# %i is the volume name (the part after the @ in the service name)
-ExecStartPre=/bin/mkdir -p {{ dtfs_mount_point }}
-ExecStart={{ dtfs_fuse_bin }} \
-    --config {{ dtfs_config_dir }}/fuse.toml \
-    --volume %i \
-    --mountpoint {{ dtfs_mount_point }} \
-    --foreground=false
-ExecStop=/bin/fusermount3 -u {{ dtfs_mount_point }}
-ExecStopPost=-/bin/umount -l {{ dtfs_mount_point }}
-TimeoutStartSec=60
-TimeoutStopSec=30
+Type=simple
+User=root
+# Instantiate with a systemd-escaped absolute path, e.g.
+#   systemctl start dtfs-fuse@$(systemd-escape --path {{ dtfs_mount_point }}).service
+ExecStart={{ dtfs_fuse_bin }} --config {{ dtfs_config_dir }}/fuse.toml --mountpoint /%I
+ExecStop=/bin/fusermount3 -u /%I
 Restart=on-failure
-RestartSec=10s
-# Don't restart too aggressively — mount failures should be investigated
-StartLimitIntervalSec=120
-StartLimitBurst=3
-KillMode=process
-KillSignal=SIGTERM
-SendSIGKILL=yes
+RestartSec=5
+LimitNOFILE=65535
 
-# Resource limits
-LimitNOFILE=1048576
-LimitNPROC=65536
-
-# Security
-PrivateTmp=false
-NoNewPrivileges=false
-# FUSE needs these capabilities
 AmbientCapabilities=CAP_SYS_ADMIN
-CapabilityBoundingSet=CAP_SYS_ADMIN
 
-# Environment
-Environment="DTFS_CONFIG={{ dtfs_config_dir }}/fuse.toml"
-Environment="RUST_LOG={{ dtfs_log_level }}"
-Environment="RUST_BACKTRACE=1"
+# Mount propagation back to host (without this the FUSE mount would be
+# hidden in a private namespace and writes would silently land on local disk).
+MountFlags=shared
 
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=dtfs-fuse-%i
+Environment=RUST_LOG=dtfs={{ dtfs_log_level | default('info') }}
+Environment=RUST_BACKTRACE=1
 
 [Install]
 WantedBy=multi-user.target

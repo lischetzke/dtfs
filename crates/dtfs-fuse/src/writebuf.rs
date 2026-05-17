@@ -143,6 +143,54 @@ impl WriteBuffer {
             .unwrap_or(false)
     }
 
+    /// Logical end of the file as seen by the buffer (i.e. the highest
+    /// `offset + data.len()` of any write merged so far). Returns `None` if
+    /// the buffer has never seen a write for this path.
+    ///
+    /// Used by the F-021/F-022 fix to decide where O_APPEND writes land and
+    /// to size sparse-hole zero fills.
+    pub fn logical_size(&self, path: &str) -> Option<u64> {
+        self.buffers
+            .get(path)
+            .map(|e| e.value().dirty_offset + e.value().data.len() as u64)
+    }
+
+    /// Overlay any buffered data for `path` that overlaps the byte range
+    /// `[abs_offset, abs_offset + dst.len())` onto `dst`.
+    ///
+    /// F-029 — without this, a read on an open fd that follows a write on
+    /// the same fd returns the *pre-write* chunk content (or empty for a
+    /// brand-new file), because writes only live in this buffer until they
+    /// flush at chunk-boundary or release-time. SQLite (and every database)
+    /// breaks on the very first `CREATE TABLE` because the schema page is
+    /// written, then read back, then nothing is there.
+    ///
+    /// Returns the number of bytes the buffer covered. Callers can use this
+    /// to decide whether to short-circuit cluster fetches (when buffered
+    /// data fully covers the request, no chunk read is needed).
+    pub fn overlay(&self, path: &str, abs_offset: u64, dst: &mut [u8]) -> usize {
+        let Some(entry) = self.buffers.get(path) else { return 0 };
+        let buf = entry.value();
+        if buf.data.is_empty() {
+            return 0;
+        }
+        let buf_start = buf.dirty_offset;
+        let buf_end = buf_start + buf.data.len() as u64;
+        let req_start = abs_offset;
+        let req_end = abs_offset + dst.len() as u64;
+        let overlap_start = req_start.max(buf_start);
+        let overlap_end = req_end.min(buf_end);
+        if overlap_end <= overlap_start {
+            return 0;
+        }
+        let src_off = (overlap_start - buf_start) as usize;
+        let dst_off = (overlap_start - req_start) as usize;
+        let n = (overlap_end - overlap_start) as usize;
+        dst[dst_off..dst_off + n]
+            .copy_from_slice(&buf.data[src_off..src_off + n]);
+        n
+    }
+
     /// Get the current chunk size.
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
@@ -443,5 +491,61 @@ mod tests {
         assert!(wb.has_dirty_data("file1"));
         wb.remove("file1");
         assert!(!wb.has_dirty_data("file1"));
+    }
+
+    /// Regression for F-029: writes that haven't flushed yet must be visible
+    /// to reads on the same fd, otherwise SQLite (and every DB engine) sees
+    /// an empty file after `CREATE TABLE`.
+    #[test]
+    fn overlay_returns_buffered_bytes_to_reader() {
+        let wb = WriteBuffer::new(4096);
+        wb.write("db", 0, b"PAGE1-000");
+        wb.write("db", 4096, b"PAGE2-000");
+
+        // Read a window covering both pages with a fresh dst buffer.
+        let mut dst = vec![0u8; 9]; // first 9 bytes of file
+        let n = wb.overlay("db", 0, &mut dst);
+        assert_eq!(n, 9);
+        assert_eq!(&dst, b"PAGE1-000");
+
+        // Read at offset 4096 — should see the second write.
+        let mut dst = vec![0u8; 9];
+        let n = wb.overlay("db", 4096, &mut dst);
+        assert_eq!(n, 9);
+        assert_eq!(&dst, b"PAGE2-000");
+
+        // Read past the buffered region returns zero coverage.
+        let mut dst = vec![0u8; 9];
+        let n = wb.overlay("db", 8192, &mut dst);
+        assert_eq!(n, 0);
+        assert_eq!(&dst, &[0u8; 9]);
+
+        // Partial overlap with a SEPARATE buffer (no zero-fill artefact):
+        // single 9-byte write at offset 0, then ask for [4..12) — buffer
+        // covers [0..9), so 5 bytes overlap.
+        let wb2 = WriteBuffer::new(4096);
+        wb2.write("x", 0, b"PAGE1-000");
+        let mut dst = vec![0u8; 8];
+        let n = wb2.overlay("x", 4, &mut dst);
+        assert_eq!(n, 5, "5 buffered bytes overlap the request");
+        assert_eq!(&dst[..5], b"1-000", "the trailing 5 bytes of PAGE1-000");
+    }
+
+    /// Regression for F-021/F-022: `logical_size` must report `offset + len`
+    /// so the filesystem layer knows where to append and where to zero-fill.
+    #[test]
+    fn logical_size_tracks_end_of_buffered_writes() {
+        let wb = WriteBuffer::new(1024);
+        assert_eq!(wb.logical_size("x"), None, "no buffer yet");
+        wb.write("x", 0, &[0u8; 50]);
+        assert_eq!(wb.logical_size("x"), Some(50), "initial write");
+        wb.write("x", 50, &[0u8; 10]);
+        assert_eq!(wb.logical_size("x"), Some(60), "appended write extends size");
+        wb.write("x", 0, &[0u8; 5]);
+        assert_eq!(
+            wb.logical_size("x"),
+            Some(60),
+            "overlapping write does not shrink logical end"
+        );
     }
 }

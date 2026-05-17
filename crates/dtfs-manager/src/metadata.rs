@@ -29,6 +29,10 @@ pub struct MetadataService {
     /// Used to record heartbeat timestamps so `HealthMonitor` can detect
     /// missed heartbeats (fix for issue #2).
     pub cluster: Arc<ClusterManager>,
+    /// P0-9: tiering engine; receives per-chunk-per-DC reads from
+    /// heartbeats so the auto-move-replica-toward-active-DC decisions
+    /// are driven by real access patterns.
+    pub tiering: Option<Arc<crate::tiering::TieringEngine>>,
 }
 
 impl MetadataService {
@@ -45,7 +49,16 @@ impl MetadataService {
             sm_data,
             placement,
             cluster,
+            tiering: None,
         }
+    }
+
+    /// Inject the tiering engine after construction (avoids circular Arc
+    /// initialisation; the engine itself takes references that originate
+    /// from the same Arcs used by the metadata service).
+    pub fn with_tiering(mut self, tiering: Arc<crate::tiering::TieringEngine>) -> Self {
+        self.tiering = Some(tiering);
+        self
     }
 
     /// Helper: propose a write through Raft and return the response.
@@ -205,7 +218,12 @@ impl ManagerService for MetadataService {
         }
 
         let chunk_locations: Vec<ChunkLocationInfo> = by_chunk.into_values().collect();
-        let total_size: u64 = chunk_locations.iter().map(|c| c.size).sum();
+        // F-037 / F-033: if the file has an explicit logical size (set via
+        // truncate or fallocate), honour it; otherwise derive from the
+        // chunk sizes.
+        let total_size: u64 = file
+            .logical_size
+            .unwrap_or_else(|| chunk_locations.iter().map(|c| c.size).sum());
 
         Ok(Response::new(GetFileLocationsResponse {
             path: req.path,
@@ -214,6 +232,10 @@ impl ManagerService for MetadataService {
             // Expose the logical chunk size so clients can correctly compute
             // chunk indices from byte offsets (fix for issue #13).
             chunk_size: file.chunk_size,
+            // Propagate timestamps so the FUSE client can return real
+            // mtime/ctime via getattr (fix for F-014).
+            created_at_ms: file.created_at_ms as i64,
+            modified_at_ms: file.updated_at_ms as i64,
         }))
     }
 
@@ -312,6 +334,37 @@ impl ManagerService for MetadataService {
             })
             .await;
 
+        // P0-9: fan out per-chunk read counters into the tiering engine.
+        // The TieringEngine aggregates by chunk_id and uses `reads_by_dc`
+        // to score migration target nodes (find_target_node).
+        if !req.chunk_reads.is_empty() {
+            if let Some(tiering) = &self.tiering {
+                // Map proto → engine call. The tiering engine wants the
+                // *current* tier and *current* node for the chunk; we leave
+                // those zeroed since the engine looks them up from the
+                // state machine when evaluating.
+                for entry in &req.chunk_reads {
+                    let reads_1h = entry.reads_by_dc_1h.values().sum::<u32>();
+                    let reads_24h = entry.reads_by_dc_24h.values().sum::<u32>();
+                    tiering
+                        .report_access(
+                            &entry.chunk_id,
+                            "", // file_path unknown at heartbeat time; engine fills via SM lookup
+                            reads_1h,
+                            reads_24h,
+                            entry.reads_by_dc_1h.clone(),
+                            dtfs_common::types::DiskTier::Hot, // placeholder; engine recomputes
+                            node_id,
+                        )
+                        .await;
+                }
+                tracing::debug!(
+                    "tiering: ingested {} chunk-read entries from heartbeat",
+                    req.chunk_reads.len()
+                );
+            }
+        }
+
         Ok(Response::new(HeartbeatResponse {
             accepted: true,
             config_version: cfg_version,
@@ -409,7 +462,18 @@ impl ManagerService for MetadataService {
                 continue;
             }
 
-            let chunk_size: u64 = meta.chunks.iter().map(|c| c.size_bytes).sum();
+            // Each chunk_index has N replica entries in `meta.chunks` (one
+            // per data-node copy). Summing them raw would multiply the file
+            // size by the replication factor (so a 245 MB file at RF=3 would
+            // show as ~735 MB in `ls`). Group by chunk_index first, then sum
+            // the per-chunk size.
+            let mut sizes_by_index: std::collections::BTreeMap<u64, u64> =
+                std::collections::BTreeMap::new();
+            for c in &meta.chunks {
+                let e = sizes_by_index.entry(c.chunk_index).or_insert(0);
+                *e = (*e).max(c.size_bytes);
+            }
+            let chunk_size: u64 = sizes_by_index.values().sum();
             let entry = seen
                 .entry(entry_name)
                 .or_insert((is_dir, meta.created_at_ms as i64, meta.updated_at_ms as i64, 0));
@@ -494,13 +558,20 @@ impl ManagerService for MetadataService {
         }
 
         if placements.len() != req.num_chunks as usize {
-            // Fallback: round-robin across all nodes. Include replica addresses
-            // so that the replication factor is still respected (fix #10 — the
-            // old fallback emitted empty replica_addresses, silently dropping
-            // replication guarantees).
+            // Fallback: round-robin across all HEALTHY nodes. Includes replica
+            // addresses so that the replication factor is still respected and
+            // skips nodes that aren't Healthy so writes don't target Down hosts
+            // (fix for F-010 + F-012).
             placements.clear();
-            let node_list: Vec<_> = data.nodes.values().collect();
-            let rf = replication as usize;
+            let node_list: Vec<_> = data
+                .nodes
+                .values()
+                .filter(|n| n.health == dtfs_common::types::HealthStatus::Healthy)
+                .collect();
+            if node_list.is_empty() {
+                return Err(Status::unavailable("No healthy data nodes available"));
+            }
+            let rf = (replication as usize).min(node_list.len());
 
             for i in 0..req.num_chunks {
                 let primary_idx = i as usize % node_list.len();
@@ -564,5 +635,367 @@ impl ManagerService for MetadataService {
             ClientResponse::Error { message } => Err(Status::failed_precondition(message)),
             _ => Ok(Response::new(CommitChunkLocationsResponse { success: true })),
         }
+    }
+
+    // ---- Extended POSIX surface (F-034 .. F-038) ----
+
+    async fn rename_file(
+        &self,
+        request: Request<RenameFileRequest>,
+    ) -> Result<Response<RenameFileResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!("RenameFile: {} -> {}", req.from, req.to);
+        let resp = self
+            .raft_write(ClientRequest::RenameFile {
+                from: req.from.clone(),
+                to: req.to.clone(),
+            })
+            .await?;
+        match resp {
+            ClientResponse::Success => Ok(Response::new(RenameFileResponse {
+                success: true,
+                error: String::new(),
+            })),
+            ClientResponse::Error { message } => Ok(Response::new(RenameFileResponse {
+                success: false,
+                error: message,
+            })),
+            _ => Ok(Response::new(RenameFileResponse {
+                success: false,
+                error: "unexpected response".into(),
+            })),
+        }
+    }
+
+    async fn set_file_size(
+        &self,
+        request: Request<SetFileSizeRequest>,
+    ) -> Result<Response<SetFileSizeResponse>, Status> {
+        let req = request.into_inner();
+        tracing::debug!("SetFileSize: {} -> {}", req.path, req.new_size);
+        let resp = self
+            .raft_write(ClientRequest::SetFileSize {
+                path: req.path,
+                new_size: req.new_size,
+            })
+            .await?;
+        match resp {
+            ClientResponse::Success => Ok(Response::new(SetFileSizeResponse {
+                success: true,
+                error: String::new(),
+            })),
+            ClientResponse::Error { message } => Ok(Response::new(SetFileSizeResponse {
+                success: false,
+                error: message,
+            })),
+            _ => Ok(Response::new(SetFileSizeResponse {
+                success: false,
+                error: "unexpected response".into(),
+            })),
+        }
+    }
+
+    async fn create_symlink(
+        &self,
+        request: Request<CreateSymlinkRequest>,
+    ) -> Result<Response<CreateSymlinkResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!("Symlink: {} -> {}", req.path, req.target);
+        let resp = self
+            .raft_write(ClientRequest::CreateSymlink {
+                path: req.path,
+                target: req.target,
+            })
+            .await?;
+        match resp {
+            ClientResponse::Success => Ok(Response::new(CreateSymlinkResponse {
+                success: true,
+                error: String::new(),
+            })),
+            ClientResponse::Error { message } => Ok(Response::new(CreateSymlinkResponse {
+                success: false,
+                error: message,
+            })),
+            _ => Ok(Response::new(CreateSymlinkResponse {
+                success: false,
+                error: "unexpected response".into(),
+            })),
+        }
+    }
+
+    async fn read_symlink(
+        &self,
+        request: Request<ReadSymlinkRequest>,
+    ) -> Result<Response<ReadSymlinkResponse>, Status> {
+        let req = request.into_inner();
+        let data = self.sm_data.read().await;
+        if let Some(meta) = data.files.get(&req.path) {
+            if let Some(t) = &meta.symlink_target {
+                return Ok(Response::new(ReadSymlinkResponse {
+                    target: t.clone(),
+                    found: true,
+                }));
+            }
+        }
+        Ok(Response::new(ReadSymlinkResponse {
+            target: String::new(),
+            found: false,
+        }))
+    }
+
+    async fn create_link(
+        &self,
+        request: Request<CreateLinkRequest>,
+    ) -> Result<Response<CreateLinkResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!("Link: {} -> {}", req.source, req.dest);
+        let resp = self
+            .raft_write(ClientRequest::CreateLink {
+                source: req.source,
+                dest: req.dest,
+            })
+            .await?;
+        match resp {
+            ClientResponse::Success => Ok(Response::new(CreateLinkResponse {
+                success: true,
+                error: String::new(),
+            })),
+            ClientResponse::Error { message } => Ok(Response::new(CreateLinkResponse {
+                success: false,
+                error: message,
+            })),
+            _ => Ok(Response::new(CreateLinkResponse {
+                success: false,
+                error: "unexpected response".into(),
+            })),
+        }
+    }
+
+    async fn cluster_capacity(
+        &self,
+        _request: Request<ClusterCapacityRequest>,
+    ) -> Result<Response<ClusterCapacityResponse>, Status> {
+        let data = self.sm_data.read().await;
+        let total: u64 = data.nodes.values().map(|n| n.total_capacity).sum();
+        let used: u64 = data.nodes.values().map(|n| n.used_capacity).sum();
+        let files = data
+            .files
+            .values()
+            .filter(|f| f.symlink_target.is_none())
+            .count() as u64;
+        Ok(Response::new(ClusterCapacityResponse {
+            total_bytes: total,
+            used_bytes: used,
+            file_count: files,
+        }))
+    }
+
+    // ---- Distributed POSIX byte-range locks (F-039) ----
+
+    async fn acquire_lock(
+        &self,
+        request: Request<AcquireLockRequest>,
+    ) -> Result<Response<AcquireLockResponse>, Status> {
+        let req = request.into_inner();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let resp = self
+            .raft_write(ClientRequest::AcquireLock {
+                path: req.path,
+                owner_id: req.owner_id,
+                start: req.start,
+                end: req.end,
+                write: req.write,
+                lease_ms: req.lease_ms.max(1000),
+                now_ms,
+            })
+            .await?;
+        match resp {
+            ClientResponse::LockGranted => Ok(Response::new(AcquireLockResponse {
+                granted: true,
+                ..Default::default()
+            })),
+            ClientResponse::LockConflict {
+                owner_id,
+                start,
+                end,
+                write,
+            } => Ok(Response::new(AcquireLockResponse {
+                granted: false,
+                conflict_owner: owner_id,
+                conflict_start: start,
+                conflict_end: end,
+                conflict_write: write,
+            })),
+            ClientResponse::Error { message } => Err(Status::internal(message)),
+            _ => Err(Status::internal("unexpected AcquireLock response")),
+        }
+    }
+
+    async fn release_lock(
+        &self,
+        request: Request<ReleaseLockRequest>,
+    ) -> Result<Response<ReleaseLockResponse>, Status> {
+        let req = request.into_inner();
+        let _ = self
+            .raft_write(ClientRequest::ReleaseLock {
+                path: req.path,
+                owner_id: req.owner_id,
+                start: req.start,
+                end: req.end,
+            })
+            .await?;
+        Ok(Response::new(ReleaseLockResponse { ok: true }))
+    }
+
+    async fn probe_lock(
+        &self,
+        request: Request<ProbeLockRequest>,
+    ) -> Result<Response<ProbeLockResponse>, Status> {
+        let req = request.into_inner();
+        let data = self.sm_data.read().await;
+        if let Some(locks) = data.posix_locks.get(&req.path) {
+            for l in locks {
+                if l.owner_id == req.owner_id {
+                    continue;
+                }
+                if req.start >= l.end || req.end <= l.start {
+                    continue;
+                }
+                if l.write || req.write {
+                    return Ok(Response::new(ProbeLockResponse {
+                        would_grant: false,
+                        conflict_owner: l.owner_id.clone(),
+                        conflict_start: l.start,
+                        conflict_end: l.end,
+                        conflict_write: l.write,
+                    }));
+                }
+            }
+        }
+        Ok(Response::new(ProbeLockResponse {
+            would_grant: true,
+            ..Default::default()
+        }))
+    }
+
+    // ---- P0-1: single-writer leases ----
+
+    async fn acquire_write_lease(
+        &self,
+        request: Request<AcquireWriteLeaseRequest>,
+    ) -> Result<Response<AcquireWriteLeaseResponse>, Status> {
+        let req = request.into_inner();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        // The proposed_lease_id is computed once on the leader so every Raft
+        // replica applies the same UUID deterministically.
+        let proposed_lease_id = uuid::Uuid::new_v4().to_string();
+        let resp = self
+            .raft_write(ClientRequest::AcquireWriteLease {
+                path: req.path,
+                owner_id: req.owner_id,
+                lease_ms: req.lease_ms.max(1_000).min(300_000),
+                now_ms,
+                proposed_lease_id,
+            })
+            .await?;
+        match resp {
+            ClientResponse::WriteLeaseGranted {
+                lease_id,
+                expires_at_ms,
+            } => Ok(Response::new(AcquireWriteLeaseResponse {
+                granted: true,
+                lease_id,
+                expires_at_ms,
+                conflict_owner: String::new(),
+                conflict_expires_at_ms: 0,
+            })),
+            ClientResponse::WriteLeaseConflict {
+                owner_id,
+                expires_at_ms,
+            } => Ok(Response::new(AcquireWriteLeaseResponse {
+                granted: false,
+                lease_id: String::new(),
+                expires_at_ms: 0,
+                conflict_owner: owner_id,
+                conflict_expires_at_ms: expires_at_ms,
+            })),
+            ClientResponse::Error { message } => Err(Status::internal(message)),
+            _ => Err(Status::internal("unexpected AcquireWriteLease response")),
+        }
+    }
+
+    async fn renew_write_lease(
+        &self,
+        request: Request<RenewWriteLeaseRequest>,
+    ) -> Result<Response<RenewWriteLeaseResponse>, Status> {
+        let req = request.into_inner();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let resp = self
+            .raft_write(ClientRequest::RenewWriteLease {
+                path: req.path,
+                lease_id: req.lease_id,
+                extension_ms: req.extension_ms.max(1_000).min(300_000),
+                now_ms,
+            })
+            .await?;
+        match resp {
+            ClientResponse::WriteLeaseGranted {
+                expires_at_ms, ..
+            } => Ok(Response::new(RenewWriteLeaseResponse {
+                granted: true,
+                new_expires_at_ms: expires_at_ms,
+            })),
+            ClientResponse::WriteLeaseConflict { .. } => {
+                Ok(Response::new(RenewWriteLeaseResponse {
+                    granted: false,
+                    new_expires_at_ms: 0,
+                }))
+            }
+            ClientResponse::Error { message } => Err(Status::internal(message)),
+            _ => Err(Status::internal("unexpected RenewWriteLease response")),
+        }
+    }
+
+    async fn release_write_lease(
+        &self,
+        request: Request<ReleaseWriteLeaseRequest>,
+    ) -> Result<Response<ReleaseWriteLeaseResponse>, Status> {
+        let req = request.into_inner();
+        let _ = self
+            .raft_write(ClientRequest::ReleaseWriteLease {
+                path: req.path,
+                lease_id: req.lease_id,
+            })
+            .await?;
+        Ok(Response::new(ReleaseWriteLeaseResponse { ok: true }))
+    }
+
+    async fn release_leases_by_host(
+        &self,
+        request: Request<ReleaseLeasesByHostRequest>,
+    ) -> Result<Response<ReleaseLeasesByHostResponse>, Status> {
+        let req = request.into_inner();
+        let resp = self
+            .raft_write(ClientRequest::ReleaseLeasesByHost {
+                hostname_prefix: req.hostname,
+                except_pid: req.except_pid,
+            })
+            .await?;
+        let count = match resp {
+            ClientResponse::WriteLeasesReleased { count } => count,
+            _ => 0,
+        };
+        Ok(Response::new(ReleaseLeasesByHostResponse {
+            released_count: count,
+        }))
     }
 }

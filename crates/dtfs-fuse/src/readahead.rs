@@ -164,6 +164,23 @@ impl ReadAheadEngine {
         self.cache.get(&key).map(|entry| entry.value().clone())
     }
 
+    /// Insert a chunk that the foreground read path just fetched. Without
+    /// this, every FUSE read of a fresh chunk (128 KB at a time across a
+    /// 128 MB chunk) re-issues a full chunk fetch — observed ~1.2 MB/s.
+    /// Storing the chunk here lets the next FUSE read hit the cache.
+    pub fn insert_cached(&self, node_addr: &str, chunk_id: &str, data: Bytes) {
+        if self.cache.len() >= self.max_cache_entries {
+            // Simple eviction: drop a single old entry to make room.
+            if let Some(entry) = self.cache.iter().next() {
+                let k = entry.key().clone();
+                drop(entry);
+                self.cache.remove(&k);
+            }
+        }
+        let key = cache_key(node_addr, chunk_id);
+        self.cache.insert(key, data);
+    }
+
     /// Remove a cached entry (e.g., after it has been consumed).
     pub fn evict(&self, node_addr: &str, chunk_id: &str) {
         let key = cache_key(node_addr, chunk_id);

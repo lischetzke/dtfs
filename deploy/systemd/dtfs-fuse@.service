@@ -1,5 +1,5 @@
 [Unit]
-Description=DTFS FUSE Mount (%i)
+Description=DTFS FUSE Mount (/%I)
 Documentation=https://github.com/lischetzke/dtfs
 After=network-online.target
 Wants=network-online.target
@@ -7,15 +7,22 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/dtfs-fuse --config /etc/dtfs/fuse.toml --mountpoint %i
-ExecStop=/bin/fusermount3 -u %i
+# Instantiate with a systemd-escaped absolute path, e.g.
+#   systemctl start dtfs-fuse@$(systemd-escape --path /mnt/dtfs).service
+# %I decodes the escape back to "mnt/dtfs"; we prefix "/" to restore the absolute path.
+ExecStart=/usr/local/bin/dtfs-fuse --config /etc/dtfs/fuse.toml --mountpoint /%I
+ExecStop=/bin/fusermount3 -u /%I
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
 
-# FUSE requires certain capabilities
+# FUSE requires CAP_SYS_ADMIN.
 AmbientCapabilities=CAP_SYS_ADMIN
-PrivateTmp=yes
+
+# Do NOT use PrivateTmp=yes here: it puts the unit in its own mount namespace,
+# which hides the FUSE mount from the host. MountFlags=shared propagates any
+# mounts performed by the service back to the host mount table.
+MountFlags=shared
 
 # Environment
 Environment=RUST_LOG=dtfs=info

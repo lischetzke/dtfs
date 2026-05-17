@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use dtfs_common::hash_ring::{ConsistentHashRing, PlacementRule};
 use dtfs_common::topology::Location;
-use dtfs_common::types::{DiskTier, FailureDomain, NodeId};
+use dtfs_common::types::{DiskTier, FailureDomain, HealthStatus, NodeId};
 use dtfs_raft::state_machine::StateMachineData;
 use parking_lot::RwLock;
 use tokio::sync::RwLock as TokioRwLock;
@@ -35,11 +35,24 @@ impl PlacementEngine {
     }
 
     /// Rebuild the hash ring from the current Raft state machine data.
+    ///
+    /// Skips nodes that aren't `Healthy`: assigning chunks to a `Down` or
+    /// `Suspect` node guarantees the write will fail at the data plane while
+    /// the metadata plane has already created the file entry. (Fix for F-012.)
     pub async fn rebuild_ring(&self, sm: &Arc<TokioRwLock<StateMachineData>>) {
         let data = sm.read().await;
         let mut new_ring = ConsistentHashRing::new(256);
 
         for (node_id, info) in &data.nodes {
+            if info.health != HealthStatus::Healthy {
+                tracing::debug!(
+                    node_id = %node_id,
+                    hostname = %info.hostname,
+                    health = ?info.health,
+                    "skipping non-healthy node when rebuilding placement ring",
+                );
+                continue;
+            }
             let nid = NodeId::from_string(node_id.to_string());
             for disk in &info.disks {
                 let weight = if disk.total_bytes > 0 {
@@ -78,6 +91,11 @@ impl PlacementEngine {
             replica_count: replication_factor,
             failure_domain: FailureDomain::Rack,
             prefer_client_locations: false,
+            // P0-10 — anchor enforced via a higher-level wrapper that
+            // accepts the volume; for the basic placement path we leave
+            // None. Callers wanting anchor enforcement should call the
+            // explicit `place_chunks_with_anchor` variant added below.
+            required_datacenter: None,
         };
 
         let mut placements = Vec::with_capacity(num_chunks as usize);
@@ -115,9 +133,55 @@ impl PlacementEngine {
             replica_count: replication_factor,
             failure_domain: FailureDomain::Rack,
             prefer_client_locations: !client_locations.is_empty(),
+            required_datacenter: None,
         };
         let pg_id = ring.chunk_to_pg(chunk_key);
         ring.find_nodes_for_pg(pg_id, &rule, client_locations)
+    }
+
+    /// P0-10: place chunks for a volume that may have a `required_datacenter`
+    /// anchor. Returns one placement per chunk; if the anchor is set but no
+    /// candidate exists, the placement may be missing the anchor — the caller
+    /// should verify and audit-log the `placement_anchor_unsatisfiable`
+    /// condition.
+    pub fn place_chunks_with_anchor(
+        &self,
+        volume_id: &str,
+        num_chunks: u32,
+        tier: DiskTier,
+        replication_factor: u32,
+        anchor_datacenter: Option<String>,
+    ) -> Vec<ChunkPlacement> {
+        let ring = self.ring.read();
+
+        if ring.is_empty() {
+            tracing::warn!("Placement engine: hash ring is empty, no nodes available");
+            return Vec::new();
+        }
+
+        let rule = PlacementRule {
+            tier,
+            replica_count: replication_factor,
+            failure_domain: FailureDomain::Rack,
+            prefer_client_locations: false,
+            required_datacenter: anchor_datacenter,
+        };
+
+        let mut placements = Vec::with_capacity(num_chunks as usize);
+        for i in 0..num_chunks {
+            let key = format!("{}:chunk:{}", volume_id, i);
+            let hash = xxhash_rust::xxh3::xxh3_128(key.as_bytes());
+            let mut chunk_id = [0u8; 32];
+            chunk_id[..16].copy_from_slice(&hash.to_be_bytes());
+
+            let pg_id = ring.chunk_to_pg(&chunk_id);
+            let nodes = ring.find_nodes_for_pg(pg_id, &rule, &[]);
+            placements.push(ChunkPlacement {
+                chunk_index: i,
+                node_ids: nodes,
+            });
+        }
+        placements
     }
 }
 

@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 dtfs-common = { workspace = true }
 dtfs-client = { workspace = true }
+dtfs-proto = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
@@ -19,9 +20,15 @@ thiserror = { workspace = true }
 clap = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
+# P0-11: disk-cache atime updates + xxhash for stable LRU jitter
+filetime = "0.2"
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 # fuse3 requires libfuse3 and is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
-fuse3 = { version = "0.7", features = ["tokio-runtime"] }
+fuse3 = { version = "0.7", features = ["tokio-runtime", "file-lock"] }
 libc = "0.2"
 futures-util = "0.3"

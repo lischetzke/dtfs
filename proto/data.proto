@@ -44,6 +44,13 @@ message PutChunkResponse {
 // --- GetChunk ---
 message GetChunkRequest {
   string chunk_id = 1;    // Hex-encoded chunk ID
+  // P0-9: requester DC for `reads_by_dc` telemetry. Drives the
+  // tiering engine's "move replica toward active DC" decisions.
+  // Empty string means "unknown DC" and is accepted (counter not
+  // bucketed) so older clients without the field still work.
+  string requester_dc = 2;
+  // Optional: requester host (for debugging hot/cold reads).
+  string requester_host = 3;
 }
 
 message GetChunkResponse {

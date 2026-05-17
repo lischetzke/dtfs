@@ -1,87 +1,38 @@
-# DTFS FUSE Client Configuration
-# Node: {{ inventory_hostname }}
-# Managed by Ansible — do not edit manually
+# DTFS FUSE Client Configuration — {{ inventory_hostname }}
+# Schema matches crates/dtfs-common/src/config.rs::FuseConfig
 
-[node]
-name = "{{ inventory_hostname }}"
-cluster = "{{ dtfs_cluster_name }}"
-location = "{{ dtfs_location }}"
-
-[cluster]
-shared_secret = "{{ dtfs_shared_secret }}"
-
-[managers]
-endpoints = [
-{% for ep in dtfs_client_manager_endpoints %}
-  "{{ ep }}",
+[client]
+manager_addr = "{{ hostvars['mgr-01'].ansible_host }}:{{ dtfs_grpc_port | default(9401) }}"
+# F-024 hardening: list all managers so the FUSE client can fall back when
+# the primary is restarted or isolated.
+manager_addrs = [
+{% for h in groups['managers'] %}
+    "{{ hostvars[h].ansible_host }}:{{ dtfs_grpc_port | default(9401) }}",
 {% endfor %}
 ]
-timeout_s = {{ dtfs_client_manager_timeout_s }}
-retry_count = {{ dtfs_client_manager_retry_count }}
-retry_delay_ms = {{ dtfs_client_manager_retry_delay_ms }}
+
+[location]
+region = "{{ dtfs_region | default('lab') }}"
+datacenter = "{{ dtfs_location }}"
+rack = "{{ dtfs_rack | default(dtfs_location ~ '-rack-default') }}"
+host = "{{ inventory_hostname }}"
 
 [mount]
 mountpoint = "{{ dtfs_mount_point }}"
-volume = "{{ dtfs_volume }}"
-options = "{{ dtfs_fuse_options }}"
-uid = {{ dtfs_fuse_uid }}
-gid = {{ dtfs_fuse_gid }}
-umask = "{{ dtfs_fuse_umask }}"
-
-[fuse]
-threads = {{ dtfs_fuse_threads }}
-max_background = {{ dtfs_fuse_max_background }}
-congestion_threshold = {{ dtfs_fuse_congestion_threshold }}
-max_write_bytes = {{ dtfs_fuse_max_write }}
-max_read_bytes = {{ dtfs_fuse_max_read }}
-kernel_cache = {{ dtfs_kernel_cache_enabled | lower }}
-kernel_cache_ttl_s = {{ dtfs_kernel_cache_ttl_s }}
-direct_io = {{ dtfs_direct_io_enabled | lower }}
+allow_other = {{ dtfs_fuse_allow_other | default(true) | lower }}
 
 [readahead]
-enabled = {{ dtfs_readahead_enabled | lower }}
-mode = "{{ dtfs_readahead_mode }}"
-min_bytes = {{ dtfs_readahead_min_kb | int * 1024 }}
-max_bytes = {{ dtfs_readahead_max_mb | int * 1024 * 1024 }}
-window_ms = {{ dtfs_readahead_window_ms }}
+enabled = {{ dtfs_readahead_enabled | default(true) | lower }}
+min_kb = {{ dtfs_readahead_min_kb | default(128) }}
+max_mb = {{ dtfs_readahead_max_mb | default(32) }}
 
 [cache]
-enabled = {{ dtfs_client_cache_enabled | lower }}
-dir = "{{ dtfs_client_cache_dir }}"
-size_bytes = {{ dtfs_client_cache_size_mb | int * 1024 * 1024 }}
-ttl_s = {{ dtfs_client_cache_ttl_s }}
-eviction_policy = "{{ dtfs_client_cache_eviction }}"
-write_cache_enabled = {{ dtfs_client_write_cache_enabled | lower }}
-write_cache_size_bytes = {{ dtfs_client_write_cache_size_mb | int * 1024 * 1024 }}
-write_behind = {{ dtfs_client_write_behind | lower }}
+enabled = {{ dtfs_client_cache_enabled | default(true) | lower }}
+max_size_mb = {{ dtfs_client_cache_size_mb | default(512) }}
+ttl_secs = {{ dtfs_client_cache_ttl_s | default(60) }}
 
-[metadata_cache]
-enabled = {{ dtfs_meta_cache_enabled | lower }}
-max_entries = {{ dtfs_meta_cache_size_entries }}
-ttl_s = {{ dtfs_meta_cache_ttl_s }}
-negative_ttl_s = {{ dtfs_meta_negative_cache_ttl_s }}
-
-[consistency]
-partition_safety = "{{ dtfs_partition_safety }}"
-read_consistency = "{{ dtfs_read_consistency }}"
-write_consistency = "{{ dtfs_write_consistency }}"
-
-[reconnect]
-enabled = {{ dtfs_client_reconnect_enabled | lower }}
-interval_s = {{ dtfs_client_reconnect_interval_s }}
-max_attempts = {{ dtfs_client_reconnect_max_attempts }}
-offline_read_enabled = {{ dtfs_client_offline_read_enabled | lower }}
-offline_write_queue_bytes = {{ dtfs_client_offline_write_queue_mb | int * 1024 * 1024 }}
-
-[metrics]
-enabled = {{ dtfs_client_metrics_enabled | lower }}
-listen_addr = "0.0.0.0:{{ dtfs_client_metrics_port }}"
-path = "{{ dtfs_client_metrics_path }}"
-
-[tls]
-enabled = {{ dtfs_tls_enabled | lower }}
-
-[logging]
-level = "{{ dtfs_log_level }}"
-format = "{{ dtfs_log_format }}"
-dir = "{{ dtfs_log_dir }}/client"
+[partition_safety]
+# Valid values: "strict", "localreadonly", "fulllock"
+mode = "{{ dtfs_partition_safety | default('localreadonly') }}"
+quorum_loss_timeout_secs = {{ dtfs_partition_quorum_loss_timeout_secs | default(30) }}
+show_warning = {{ dtfs_partition_show_warning | default(true) | lower }}

@@ -4,6 +4,7 @@
 
 # Getting Started
 
+- [System Requirements](./getting-started/system-requirements.md)
 - [Installation](./getting-started/installation.md)
 - [Quick Start](./getting-started/quickstart.md)
 - [First Cluster](./getting-started/first-cluster.md)

@@ -1,4 +1,8 @@
 ---
+# Pin the Python interpreter so Ansible doesn't reroll on every play if another
+# python is installed; matches the python that ships with the Debian 13 image.
+ansible_python_interpreter: /usr/bin/python3
+
 # DTFS version and binary paths
 dtfs_version: "0.1.0"
 dtfs_bin_dir: /usr/local/bin
@@ -20,22 +24,22 @@ dtfs_cluster_id: "test-cluster-001"
 
 # Manager API (primary)
 dtfs_manager_api_host: 10.0.1.1
-dtfs_manager_api_port: 8080
+dtfs_manager_api_port: 9402
 dtfs_manager_api_url: "http://{{ dtfs_manager_api_host }}:{{ dtfs_manager_api_port }}"
 
-# Manager list (for clients and data nodes)
+# Manager list (for clients and data nodes) — ports match the real binary schema.
 dtfs_managers:
   - host: 10.0.1.1
-    port: 7001
-    api_port: 8080
+    port: 9401
+    api_port: 9402
     node_id: 1
   - host: 10.0.1.2
-    port: 7001
-    api_port: 8080
+    port: 9401
+    api_port: 9402
     node_id: 2
   - host: 10.0.1.3
-    port: 7001
-    api_port: 8080
+    port: 9401
+    api_port: 9402
     node_id: 3
 
 # NTP / time sync
@@ -51,7 +55,7 @@ chrony_max_distance: 1.0
 # System requirements
 dtfs_system_packages:
   - fuse3
-  - libfuse3-3
+  - libfuse3-4
   - chrony
   - xfsprogs
   - smartmontools
@@ -84,10 +88,11 @@ dtfs_kernel_params:
   fs.nr_open: 2097152
 
 # DTFS user/group
+# UIDs 990-999 are reserved by systemd-* services on Debian 13 — use 980.
 dtfs_user: dtfs
 dtfs_group: dtfs
-dtfs_uid: 990
-dtfs_gid: 990
+dtfs_uid: 980
+dtfs_gid: 980
 
 # Chunk and replication defaults (overridden per tier in group_vars)
 dtfs_default_chunk_size_mb: 128

@@ -164,6 +164,14 @@
     state: present
   ignore_errors: true
 
+- name: Ensure /etc/systemd/journald.conf.d exists
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
 - name: Configure journald for persistent logging
   ansible.builtin.copy:
     dest: /etc/systemd/journald.conf.d/dtfs.conf

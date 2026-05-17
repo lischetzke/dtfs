@@ -173,6 +173,18 @@ impl JoinHandler {
                             config_json: message,
                         })
                     }
+                    // F-039 + P0-1 — RegisterNode never produces these, but exhaustive match required.
+                    ClientResponse::LockGranted
+                    | ClientResponse::LockConflict { .. }
+                    | ClientResponse::WriteLeaseGranted { .. }
+                    | ClientResponse::WriteLeaseConflict { .. }
+                    | ClientResponse::WriteLeasesReleased { .. } => {
+                        Ok(JoinCompletion {
+                            success: false,
+                            config_version: 0,
+                            config_json: "unexpected non-membership response from RegisterNode".into(),
+                        })
+                    }
                 }
             }
             Err(e) => {

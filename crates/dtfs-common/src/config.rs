@@ -64,12 +64,60 @@ pub struct ClusterConfig {
     pub shared_secret: String,
     #[serde(default)]
     pub bootstrap: bool,
+    /// Optional list of manager peers to seed the Raft cluster with.
+    ///
+    /// Set this on the bootstrap node so that `raft.initialize(...)` opens
+    /// the cluster with all expected voters at once. Each entry is the
+    /// peer's gRPC `host:port` (as advertised in that peer's
+    /// `grpc.listen_addr`). The bootstrap node's own address may be
+    /// included or omitted — it is always added.
+    ///
+    /// Followers (`bootstrap = false`) do not need to set this; they wait to
+    /// be enrolled by the bootstrap node's `raft.initialize(...)` call.
+    ///
+    /// Without this list, the bootstrap node initialises a single-voter
+    /// cluster and no follower ever joins (see FINDINGS.md F-009).
+    #[serde(default)]
+    pub initial_voters: Vec<InitialVoter>,
+}
+
+/// Pre-bootstrap description of a manager peer for `[cluster].initial_voters`.
+///
+/// `hostname` is used to derive the same `NodeId` the peer will compute on
+/// its own startup (`node_id_from_hostname`). `addr` is the gRPC `host:port`
+/// the peer listens on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InitialVoter {
+    pub hostname: String,
+    pub addr: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataClusterConfig {
+    /// Primary manager endpoint (`host:port`). Always required.
     pub manager_addr: String,
     pub shared_secret: String,
+    /// Optional additional manager endpoints. When the primary becomes
+    /// unreachable (e.g. after a rolling manager restart, F-024) the data
+    /// node walks through this list to find another manager and re-register.
+    /// Endpoints are formatted the same way as `manager_addr` (`host:port`).
+    #[serde(default)]
+    pub manager_addrs: Vec<String>,
+}
+
+impl DataClusterConfig {
+    /// All manager endpoints in priority order: the primary first, followed
+    /// by any extras. Duplicates are removed but order is preserved.
+    pub fn all_manager_addrs(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(1 + self.manager_addrs.len());
+        out.push(self.manager_addr.clone());
+        for a in &self.manager_addrs {
+            if !out.contains(a) {
+                out.push(a.clone());
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,11 +265,34 @@ pub struct ScrubConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FuseClientConfig {
     pub manager_addr: String,
+    /// Optional additional manager endpoints used when `manager_addr`
+    /// becomes unreachable (F-024 hardening).
+    #[serde(default)]
+    pub manager_addrs: Vec<String>,
+}
+
+impl FuseClientConfig {
+    pub fn all_manager_addrs(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(1 + self.manager_addrs.len());
+        out.push(self.manager_addr.clone());
+        for a in &self.manager_addrs {
+            if !out.contains(a) {
+                out.push(a.clone());
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MountConfig {
     pub mountpoint: PathBuf,
+    /// F-028: when true, mount with FUSE `allow_other` so non-root users
+    /// (e.g. a media-server service running under its own UID) can read and
+    /// write through `/mnt/dtfs`. Defaults to false to keep the historic
+    /// behaviour and avoid a permissive default.
+    #[serde(default)]
+    pub allow_other: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +310,17 @@ pub struct FuseCacheConfig {
     pub local_cache_dir: Option<PathBuf>,
     #[serde(default = "default_local_cache_gb")]
     pub local_cache_max_gb: u64,
+    /// P0-11: maximum age of a cached chunk before the pruner evicts it.
+    /// `None` = no age-based eviction (size-only). Used to implement
+    /// per-DC retention policies, e.g. "DC B keeps only files accessed in
+    /// the last 90 days". Eviction respects the file's atime so chunks
+    /// re-read recently are kept.
+    #[serde(default)]
+    pub max_age_days: Option<u32>,
+    /// P0-11: interval (in seconds) between background pruner sweeps.
+    /// Defaults to 1 hour.
+    #[serde(default = "default_prune_interval")]
+    pub prune_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +421,9 @@ fn default_prefetch_files() -> u32 {
 }
 fn default_local_cache_gb() -> u64 {
     50
+}
+fn default_prune_interval() -> u64 {
+    3600 // 1 hour
 }
 fn default_quorum_timeout() -> u64 {
     10

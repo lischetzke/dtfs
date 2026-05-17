@@ -65,8 +65,13 @@ async fn main() -> anyhow::Result<()> {
     let log_store = dtfs_raft::log_store::LogStore::new(&log_store_path)?;
     tracing::info!("Raft log store opened at {:?}", log_store_path);
 
-    // 2. Create the in-memory state machine.
-    let state_machine = dtfs_raft::state_machine::StateMachineStore::new();
+    // 2. Create the state machine. Snapshots are persisted under
+    //    `<data_dir>/raft-sm/` so that a manager restart can restore Raft
+    //    membership before any log replay starts (F-024 — without this,
+    //    membership is lost as soon as the membership log entry is purged).
+    let sm_dir = config.node.data_dir.join("raft-sm");
+    let state_machine = dtfs_raft::state_machine::StateMachineStore::open_at(&sm_dir)?;
+    tracing::info!("Raft state machine snapshot dir: {:?}", sm_dir);
     let sm_data = state_machine.data().clone();
 
     // 3. Build the OpenRaft config.
@@ -97,27 +102,68 @@ async fn main() -> anyhow::Result<()> {
 
     // 5. Bootstrap if this is the initial cluster node.
     if config.cluster.bootstrap {
-        let node_id = dtfs_common::node_id_from_hostname(&config.node.hostname);
-        let node = dtfs_raft::DtfsNode {
+        let self_id = dtfs_common::node_id_from_hostname(&config.node.hostname);
+        let self_node = dtfs_raft::DtfsNode {
             addr: config.grpc.listen_addr.clone(),
             hostname: config.node.hostname.clone(),
         };
 
         let mut members = BTreeMap::new();
-        members.insert(node_id, node);
+        members.insert(self_id, self_node);
 
+        // Add the configured initial voters so the cluster opens with all
+        // expected managers at once rather than as a single-voter group with
+        // no way for followers to join (fix for F-009).
+        for voter in &config.cluster.initial_voters {
+            let id = dtfs_common::node_id_from_hostname(&voter.hostname);
+            if id == self_id {
+                continue;
+            }
+            members.insert(
+                id,
+                dtfs_raft::DtfsNode {
+                    addr: voter.addr.clone(),
+                    hostname: voter.hostname.clone(),
+                },
+            );
+        }
+
+        let voter_count = members.len();
         match raft.initialize(members).await {
-            Ok(_) => tracing::info!("Raft cluster bootstrapped with node {}", node_id),
+            Ok(_) => tracing::info!(
+                "Raft cluster bootstrapped with {} voter(s), self={}",
+                voter_count,
+                self_id,
+            ),
             Err(e) => {
                 // Already initialised is fine (idempotent restart).
                 tracing::warn!("Raft init: {} (may already be initialised)", e);
             }
         }
+
+        // F-024: trigger an early snapshot after a short warm-up so the
+        // membership change at log index 0 lands in a persistent on-disk
+        // snapshot before the threshold is naturally reached. Without this,
+        // a brand-new cluster that restarts before `snapshot_threshold`
+        // logs accumulate has no snapshot to load and the FSM (including
+        // membership) comes back empty.
+        let raft_for_snap = raft.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            if let Err(e) = raft_for_snap.trigger().snapshot().await {
+                tracing::warn!("post-bootstrap trigger_snapshot failed: {}", e);
+            } else {
+                tracing::info!("post-bootstrap snapshot triggered");
+            }
+        });
     }
 
     // --- Shared services ---
 
-    let audit_log = Arc::new(AuditLog::default());
+    // P0-8: persist audit entries to a daily-rotated JSONL archive so the
+    // 10k-entry ring buffer doesn't silently drop history.
+    let audit_archive_dir = config.node.data_dir.join("audit");
+    let audit_log = Arc::new(AuditLog::new_with_archive(10_000, audit_archive_dir));
     // ClusterManager no longer holds a Raft reference; heartbeat tracking is
     // its only responsibility. Raft writes are performed by HealthMonitor.
     let cluster_mgr = Arc::new(ClusterManager::new());
@@ -140,6 +186,12 @@ async fn main() -> anyhow::Result<()> {
     let scheduler_ref = task_scheduler.clone();
     let scheduler_handle = tokio::spawn(async move {
         scheduler_ref.run().await;
+    });
+
+    // P0-1: Lease GC — sweeps expired write leases every 1s through Raft.
+    let lease_gc_raft = raft.clone();
+    let _lease_gc_handle = tokio::spawn(async move {
+        TaskScheduler::run_lease_gc(lease_gc_raft).await;
     });
 
     // --- Tiering engine background task ---
@@ -177,7 +229,8 @@ async fn main() -> anyhow::Result<()> {
         sm_data.clone(),
         placement_engine.clone(),
         cluster_mgr.clone(), // Fix #2: wire heartbeat tracking into the gRPC handler
-    );
+    )
+    .with_tiering(tiering_engine.clone()); // P0-9: receive per-chunk-per-DC reads
 
     // --- Start servers ---
 

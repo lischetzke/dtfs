@@ -1,7 +1,12 @@
 ---
-# Full DTFS environment setup playbook
+# DTFS environment setup playbook
 # Usage: ansible-playbook playbooks/setup.yml
-# Optional: -e "skip_bootstrap=true" to skip cluster init if already initialized
+#
+# Cluster bootstrap is config-driven: the manager whose inventory entry has
+#   dtfs_is_bootstrap: true
+# starts with `bootstrap = true` in /etc/dtfs/manager.toml and initialises the
+# single-voter Raft group; the other managers start with `bootstrap = false`
+# and are added as voters via the admin API.
 
 - name: Apply base configuration to all nodes
   hosts: dtfs_all
@@ -10,45 +15,84 @@
     - role: dtfs-common
   tags: [common, base]
 
-- name: Deploy and start DTFS managers
+- name: Format and mount data-node disks (XFS, LABEL=dtfs-<tier>)
+  hosts: data_nodes
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Wait for the configured block devices to appear
+      ansible.builtin.wait_for:
+        path: "{{ item.device }}"
+        timeout: 60
+      loop: "{{ dtfs_disks | default([]) }}"
+      loop_control:
+        label: "{{ item.device | default(item.path) }}"
+      when: item.device is defined
+
+    - name: Ensure mount points exist
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ dtfs_user }}"
+        group: "{{ dtfs_group }}"
+        mode: "0750"
+      loop: "{{ dtfs_disks | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Detect existing filesystem on each block device
+      ansible.builtin.command: "blkid -o value -s TYPE {{ item.device }}"
+      register: blkid_check
+      changed_when: false
+      failed_when: false
+      loop: "{{ dtfs_disks | default([]) }}"
+      loop_control:
+        label: "{{ item.device | default('(no device)') }}"
+      when: item.device is defined
+
+    - name: Format empty disks as XFS
+      ansible.builtin.command: >
+        mkfs.xfs -f -L dtfs-{{ item.item.tier }} {{ item.item.device }}
+      when:
+        - item.item.device is defined
+        - dtfs_disk_format_if_empty | default(true) | bool
+        - (item.rc | default(0)) != 0 or (item.stdout | default('')) == ""
+      loop: "{{ blkid_check.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.path | default('(skipped)') }}"
+
+    - name: Mount disks and persist in /etc/fstab
+      ansible.posix.mount:
+        src: "LABEL=dtfs-{{ item.tier }}"
+        path: "{{ item.path }}"
+        fstype: xfs
+        opts: defaults,nofail
+        state: mounted
+      loop: "{{ dtfs_disks | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: item.device is defined
+  tags: [data, disks]
+
+- name: Deploy bootstrap manager (mgr with dtfs_is_bootstrap=true)
   hosts: managers
   gather_facts: true
   serial: 1
   roles:
     - role: dtfs-manager
   tags: [managers]
+  # The dtfs-manager role itself starts the service; the bootstrap node will
+  # initialise the Raft cluster via config.cluster.bootstrap=true and the
+  # followers will start as standalone voters that must be added via the
+  # admin API (see ops docs for `dtfs-cli managers add` once available).
 
-- name: Bootstrap cluster on first manager (mgr-01)
-  hosts: mgr-01
+- name: Wait for bootstrap manager to be healthy
+  hosts: managers
   gather_facts: false
-  vars:
-    bootstrap_done: false
   tasks:
-    - name: Check if cluster is already initialized
+    - name: Probe /api/v1/health on the bootstrap manager
       ansible.builtin.uri:
-        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/cluster/status"
-        method: GET
-        status_code: [200, 503]
-        timeout: 5
-      register: cluster_status_check
-      ignore_errors: true
-
-    - name: Initialize cluster on bootstrap node (mgr-01)
-      ansible.builtin.command: >
-        {{ dtfs_manager_bin }} init-cluster
-        --node-id {{ dtfs_node_id }}
-        --cluster-name {{ dtfs_cluster_name }}
-        --config {{ dtfs_config_dir }}/manager.toml
-      when:
-        - not (skip_bootstrap | default(false) | bool)
-        - cluster_status_check.status | default(503) == 503 or
-          (cluster_status_check.json.initialized | default(false)) == false
-      register: cluster_init
-      changed_when: cluster_init.rc == 0
-
-    - name: Wait for bootstrap manager to be ready
-      ansible.builtin.uri:
-        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/health"
+        url: "http://{{ hostvars[item].ansible_host }}:{{ dtfs_api_port }}/api/v1/health"
         method: GET
         status_code: 200
         timeout: 5
@@ -56,113 +100,59 @@
       retries: 30
       delay: 2
       until: mgr_health.status == 200
-  tags: [bootstrap]
-
-- name: Join remaining managers to cluster
-  hosts: managers:!mgr-01
-  gather_facts: false
-  serial: 1
-  tasks:
-    - name: Wait for mgr-01 to be healthy before joining
-      ansible.builtin.uri:
-        url: "http://{{ hostvars['mgr-01']['ansible_host'] }}:{{ dtfs_api_port }}/api/v1/health"
-        method: GET
-        status_code: 200
-        timeout: 5
-      register: bootstrap_health
-      retries: 30
-      delay: 2
-      until: bootstrap_health.status == 200
       delegate_to: localhost
       become: false
+      run_once: true
+      loop: "{{ groups['managers'] | select('match', '.*') | list }}"
+      loop_control:
+        label: "{{ item }}"
+      when: hostvars[item].dtfs_is_bootstrap | default(false)
+  tags: [verify, managers]
 
-    - name: Join manager to cluster via mgr-01
-      ansible.builtin.command: >
-        {{ dtfs_manager_bin }} join-cluster
-        --join-addr {{ hostvars['mgr-01']['ansible_host'] }}:{{ dtfs_grpc_port }}
-        --node-id {{ dtfs_node_id }}
-        --config {{ dtfs_config_dir }}/manager.toml
-      when: not (skip_bootstrap | default(false) | bool)
-      register: join_result
-      changed_when: join_result.rc == 0
-      failed_when:
-        - join_result.rc != 0
-        - "'already a member' not in join_result.stderr"
-
-    - name: Restart manager service after join
-      ansible.builtin.systemd:
-        name: dtfs-manager
-        state: restarted
-      when: join_result is changed
-
-    - name: Wait for this manager to become healthy
-      ansible.builtin.uri:
-        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/health"
-        method: GET
-        status_code: 200
-        timeout: 5
-      register: this_mgr_health
-      retries: 30
-      delay: 2
-      until: this_mgr_health.status == 200
-  tags: [bootstrap, join]
-
-- name: Verify manager cluster quorum
-  hosts: mgr-01
-  gather_facts: false
-  tasks:
-    - name: Check cluster has quorum (all 3 managers)
-      ansible.builtin.uri:
-        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/cluster/status"
-        method: GET
-        status_code: 200
-        timeout: 10
-      register: cluster_status
-      retries: 15
-      delay: 3
-      until:
-        - cluster_status.status == 200
-        - cluster_status.json.raft.leader_id is defined
-        - cluster_status.json.raft.members | length == 3
-
-    - name: Display cluster status
-      ansible.builtin.debug:
-        msg:
-          - "Leader: {{ cluster_status.json.raft.leader_id }}"
-          - "Members: {{ cluster_status.json.raft.members | map(attribute='id') | list }}"
-          - "Commit index: {{ cluster_status.json.raft.commit_index }}"
-  tags: [verify, quorum]
-
-- name: Deploy and start DTFS data nodes
+- name: Deploy and start data nodes
   hosts: data_nodes
   gather_facts: true
   roles:
     - role: dtfs-data
   tags: [data_nodes]
 
-- name: Wait for all data nodes to register with manager
-  hosts: mgr-01
+- name: Wait for data nodes to register with the manager
+  hosts: managers
   gather_facts: false
+  run_once: true
   tasks:
-    - name: Poll until all 4 data nodes are registered
+    - name: Pick the bootstrap manager
+      ansible.builtin.set_fact:
+        bootstrap_mgr_host: >-
+          {%- for h in groups['managers'] -%}
+            {%- if hostvars[h].dtfs_is_bootstrap | default(false) -%}
+              {{ hostvars[h].ansible_host }}
+            {%- endif -%}
+          {%- endfor -%}
+
+    - name: Poll until all data nodes are healthy
       ansible.builtin.uri:
-        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/nodes"
+        url: "http://{{ bootstrap_mgr_host }}:{{ dtfs_api_port }}/api/v1/nodes"
         method: GET
         status_code: 200
         timeout: 10
+        return_content: true
       register: nodes_status
       retries: 30
       delay: 3
-      until:
-        - nodes_status.status == 200
-        - (nodes_status.json | selectattr('status', 'equalto', 'healthy') | list | length) >= 4
+      until: >-
+        nodes_status.status == 200 and
+        (nodes_status.json | selectattr('health', 'equalto', 'Healthy') | list | length)
+          >= (groups['data_nodes'] | length)
+      delegate_to: localhost
+      become: false
 
     - name: Show registered data nodes
       ansible.builtin.debug:
-        msg: "Healthy data nodes: {{ nodes_status.json | selectattr('status', 'equalto', 'healthy') | map(attribute='name') | list }}"
+        msg: "Healthy data nodes: {{ nodes_status.json | selectattr('health', 'equalto', 'Healthy') | map(attribute='hostname') | list }}"
   tags: [verify, data_nodes]
 
-- name: Deploy DTFS FUSE clients
+- name: Deploy FUSE clients
   hosts: clients
   gather_facts: true
   roles:
@@ -170,37 +160,38 @@
   tags: [clients]
 
 - name: Final cluster health verification
-  hosts: mgr-01
+  hosts: managers
   gather_facts: false
+  run_once: true
   tasks:
-    - name: Wait for cluster to reach fully healthy state
+    - name: Pick the bootstrap manager
+      ansible.builtin.set_fact:
+        bootstrap_mgr_host: >-
+          {%- for h in groups['managers'] -%}
+            {%- if hostvars[h].dtfs_is_bootstrap | default(false) -%}
+              {{ hostvars[h].ansible_host }}
+            {%- endif -%}
+          {%- endfor -%}
+
+    - name: Final /api/v1/cluster/status check
       ansible.builtin.uri:
-        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/health"
+        url: "http://{{ bootstrap_mgr_host }}:{{ dtfs_api_port }}/api/v1/cluster/status"
         method: GET
         status_code: 200
         timeout: 10
-      register: final_health
-      retries: 30
+        return_content: true
+      register: final_status
+      retries: 10
       delay: 3
-      until:
-        - final_health.status == 200
-        - final_health.json.status == 'healthy'
+      until: final_status.status == 200 and final_status.json.status == 'ok'
+      delegate_to: localhost
+      become: false
 
-    - name: Get full cluster status
-      ansible.builtin.uri:
-        url: "http://{{ ansible_host }}:{{ dtfs_api_port }}/api/v1/cluster/status"
-        method: GET
-        status_code: 200
-        timeout: 10
-      register: full_status
-
-    - name: Display final cluster status
+    - name: Display cluster status
       ansible.builtin.debug:
         msg:
           - "=== DTFS Cluster Setup Complete ==="
-          - "Status: {{ full_status.json.status }}"
-          - "Leader: {{ full_status.json.raft.leader_id }}"
-          - "Managers: {{ full_status.json.raft.members | length }}"
-          - "Data nodes: {{ full_status.json.data_nodes | default([]) | length }}"
-          - "Volumes: {{ full_status.json.volumes | default([]) | map(attribute='name') | list }}"
+          - "Status: {{ final_status.json.status }}"
+          - "Files: {{ final_status.json.files }}"
+          - "Data nodes (healthy/total): {{ final_status.json.data_nodes_healthy }}/{{ final_status.json.data_nodes }}"
   tags: [verify, final]

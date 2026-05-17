@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Cursor};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -63,6 +64,42 @@ pub struct FileMetadata {
     pub chunks: Vec<ChunkLocationEntry>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// F-035 — when set, this entry is a symbolic link whose target is the
+    /// stored string. `chunks` is empty for symlinks.
+    #[serde(default)]
+    pub symlink_target: Option<String>,
+    /// F-037 — explicit logical size override. Some flows (sparse files via
+    /// truncate-grow, fallocate) need a size that isn't derived from the
+    /// chunk list. `None` falls back to the sum of chunk sizes.
+    #[serde(default)]
+    pub logical_size: Option<u64>,
+}
+
+/// F-039 — One distributed POSIX byte-range lock held in the cluster FSM.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DistributedLock {
+    pub owner_id: String,
+    pub start: u64,
+    pub end: u64,
+    pub write: bool,
+    /// Wall-clock ms when this lock expires unless the owner renews.
+    pub expires_at_ms: u64,
+}
+
+/// P0-1 — One single-writer lease on a path. Exclusive; one per path.
+///
+/// Prevents two FUSE clients writing the same file concurrently (the
+/// last-flush-wins race that silently overwrote interleaved chunks).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WriteLease {
+    /// Caller-supplied owner id, recommended format `<hostname>:<pid>:<fh>`.
+    pub owner_id: String,
+    /// Opaque token returned to the FUSE client; must be presented on
+    /// renew/release. Pre-computed by the manager so the apply is
+    /// deterministic across Raft replicas.
+    pub lease_id: String,
+    /// Absolute expiry, Unix ms.
+    pub expires_at_ms: u64,
 }
 
 /// Cluster-wide configuration (versioned).
@@ -119,6 +156,19 @@ pub struct StateMachineData {
     /// cluster configuration (fix for issue #3).
     #[serde(default)]
     pub migration_state_json: String,
+
+    /// F-039: per-path distributed POSIX byte-range locks. Each entry is
+    /// the live lock set for one file. Expired entries are evicted lazily
+    /// on the next AcquireLock/ReleaseLock call referencing that path.
+    #[serde(default)]
+    pub posix_locks: BTreeMap<String, Vec<DistributedLock>>,
+
+    /// P0-1: exclusive single-writer leases. One entry per path; presence
+    /// blocks other writers from opening for write. Expired entries are
+    /// reaped by a manager-side GC task that proposes `SweepExpiredLeases`
+    /// every 1s; FUSE clients renew at half-life during flush.
+    #[serde(default)]
+    pub write_leases: BTreeMap<String, WriteLease>,
 }
 
 impl Default for StateMachineData {
@@ -134,6 +184,8 @@ impl Default for StateMachineData {
             client_count: 0,
             volumes: BTreeMap::new(),
             migration_state_json: String::new(),
+            posix_locks: BTreeMap::new(),
+            write_leases: BTreeMap::new(),
         }
     }
 }
@@ -149,12 +201,28 @@ pub struct StateMachineStore {
     pub data: Arc<RwLock<StateMachineData>>,
     /// The last snapshot that was built/installed.
     snapshot: Arc<RwLock<Option<StoredSnapshot>>>,
+    /// Directory used to persist snapshots (so membership + FSM survive restart).
+    /// `None` means in-memory only (tests).
+    snapshot_dir: Option<PathBuf>,
 }
 
-/// A snapshot that has been persisted (kept in memory for simplicity).
+/// A snapshot that has been persisted (kept in memory for fast retrieval).
 #[derive(Debug, Clone)]
 struct StoredSnapshot {
     meta: crate::SnapshotMeta,
+    data: Vec<u8>,
+}
+
+/// File-on-disk format that pairs the snapshot meta with the raw bytes.
+/// Stored as bincode inside `<snapshot_dir>/snapshot.bin`. Used to recover
+/// the FSM (especially the Raft membership) across manager restarts —
+/// without this, a manager that loses the last membership log entry to
+/// compaction comes back as a member-less Learner with no leader (root
+/// cause of F-024).
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedSnapshot {
+    meta: crate::SnapshotMeta,
+    /// Raw bytes — the same payload `install_snapshot` produces / consumes.
     data: Vec<u8>,
 }
 
@@ -163,12 +231,97 @@ impl StateMachineStore {
         Self {
             data: Arc::new(RwLock::new(StateMachineData::default())),
             snapshot: Arc::new(RwLock::new(None)),
+            snapshot_dir: None,
         }
+    }
+
+    /// Open (or create) a state machine that persists snapshots under `dir`.
+    /// If a previous snapshot exists at `<dir>/snapshot.json` it is restored
+    /// into the FSM immediately so that membership and metadata survive
+    /// process restart.
+    pub fn open_at(dir: impl AsRef<Path>) -> Result<Self, io::Error> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
+        let store = Self {
+            data: Arc::new(RwLock::new(StateMachineData::default())),
+            snapshot: Arc::new(RwLock::new(None)),
+            snapshot_dir: Some(dir.clone()),
+        };
+
+        let path = dir.join("snapshot.bin");
+        if path.exists() {
+            let bytes = std::fs::read(&path)?;
+            let persisted: PersistedSnapshot = bincode::deserialize(&bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            // Replay the snapshot contents into the in-memory FSM.
+            let snap: StateMachineSnapshot = serde_json::from_slice(&persisted.data)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let mut sm = store
+                .data
+                .try_write()
+                .expect("fresh store, no contention");
+            sm.last_applied_log = persisted.meta.last_log_id.clone();
+            sm.last_membership = persisted.meta.last_membership.clone();
+            sm.files = snap.files;
+            sm.nodes = snap.nodes;
+            sm.cluster_config = snap.cluster_config;
+            sm.audit_log = snap.audit_log;
+            sm.scrub_results = snap.scrub_results;
+            sm.client_count = snap.client_count;
+            sm.volumes = snap.volumes;
+            sm.migration_state_json = snap.migration_state_json;
+            sm.posix_locks = snap.posix_locks;
+            sm.write_leases = snap.write_leases;
+            drop(sm);
+            let mut slot = store
+                .snapshot
+                .try_write()
+                .expect("fresh store, no contention");
+            *slot = Some(StoredSnapshot {
+                meta: persisted.meta.clone(),
+                data: persisted.data,
+            });
+            drop(slot);
+            info!(
+                "loaded persisted snapshot: {} (last_log_id={:?}, voters={})",
+                persisted.meta.snapshot_id,
+                persisted.meta.last_log_id,
+                persisted.meta.last_membership.voter_ids().count(),
+            );
+        }
+
+        Ok(store)
     }
 
     /// Read-only access to the current state (useful for queries).
     pub fn data(&self) -> &Arc<RwLock<StateMachineData>> {
         &self.data
+    }
+
+    /// Atomically write the latest snapshot (meta + bytes) to disk so the FSM
+    /// survives manager restart (F-024).
+    fn persist_snapshot_to_disk(
+        dir: &Path,
+        meta: &crate::SnapshotMeta,
+        bytes: &[u8],
+    ) -> Result<(), io::Error> {
+        let persisted = PersistedSnapshot {
+            meta: meta.clone(),
+            data: bytes.to_vec(),
+        };
+        let buf = bincode::serialize(&persisted)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp = dir.join("snapshot.bin.tmp");
+        let final_path = dir.join("snapshot.bin");
+        std::fs::write(&tmp, &buf)?;
+        std::fs::rename(&tmp, &final_path)?;
+        debug!(
+            "persisted snapshot to {:?}: id={} bytes={}",
+            final_path,
+            meta.snapshot_id,
+            buf.len()
+        );
+        Ok(())
     }
 }
 
@@ -185,6 +338,8 @@ impl Default for StateMachineStore {
 /// Builds a snapshot from a frozen copy of the state machine data.
 pub struct DtfsSnapshotBuilder {
     data: StateMachineData,
+    snapshot_dir: Option<PathBuf>,
+    last_snapshot: Arc<RwLock<Option<StoredSnapshot>>>,
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
@@ -205,6 +360,8 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
             client_count: sm.client_count,
             volumes: sm.volumes.clone(),
             migration_state_json: sm.migration_state_json.clone(),
+            posix_locks: sm.posix_locks.clone(),
+            write_leases: sm.write_leases.clone(),
         };
 
         let cursor = snapshot::serialize_snapshot(&snap)?;
@@ -221,6 +378,24 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
             last_membership: sm.last_membership.clone(),
             snapshot_id,
         };
+
+        // Cache the freshly built snapshot in memory so `get_current_snapshot`
+        // returns the up-to-date blob (leader needs this to send to followers).
+        {
+            let mut slot = self.last_snapshot.write().await;
+            *slot = Some(StoredSnapshot {
+                meta: meta.clone(),
+                data: data_bytes.clone(),
+            });
+        }
+
+        // Persist to disk so a manager restart can reload membership + state
+        // before the Raft log replay starts (F-024).
+        if let Some(dir) = &self.snapshot_dir {
+            if let Err(e) = StateMachineStore::persist_snapshot_to_disk(dir, &meta, &data_bytes) {
+                warn!("failed to persist snapshot to disk: {}", e);
+            }
+        }
 
         Ok(openraft::storage::Snapshot {
             meta,
@@ -282,7 +457,11 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         let data = self.data.read().await.clone();
-        DtfsSnapshotBuilder { data }
+        DtfsSnapshotBuilder {
+            data,
+            snapshot_dir: self.snapshot_dir.clone(),
+            last_snapshot: self.snapshot.clone(),
+        }
     }
 
     async fn begin_receiving_snapshot(&mut self) -> Result<Cursor<Vec<u8>>, io::Error> {
@@ -311,6 +490,8 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             sm.client_count = snap_data.client_count;
             sm.volumes = snap_data.volumes;
             sm.migration_state_json = snap_data.migration_state_json;
+            sm.posix_locks = snap_data.posix_locks;
+            sm.write_leases = snap_data.write_leases;
         }
 
         // Store the snapshot blob for later retrieval.
@@ -318,8 +499,15 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             let mut stored = self.snapshot.write().await;
             *stored = Some(StoredSnapshot {
                 meta: meta.clone(),
-                data: raw,
+                data: raw.clone(),
             });
+        }
+
+        // Persist to disk so this follower can restart cleanly (F-024).
+        if let Some(dir) = &self.snapshot_dir {
+            if let Err(e) = Self::persist_snapshot_to_disk(dir, meta, &raw) {
+                warn!("failed to persist installed snapshot: {}", e);
+            }
         }
 
         info!(
@@ -388,6 +576,8 @@ fn apply_request(
                     chunks: Vec::new(),
                     created_at_ms: now_ms,
                     updated_at_ms: now_ms,
+                    symlink_target: None,
+                    logical_size: None,
                 },
             );
             push_audit_capped(&mut sm.audit_log, audit(format!("CreateFile: {path}")));
@@ -544,5 +734,462 @@ fn apply_request(
             sm.migration_state_json = json.clone();
             ClientResponse::Success
         }
+
+        // ---- Extended POSIX surface (F-034 .. F-038) ----
+
+        ClientRequest::RenameFile { from, to } => {
+            if from == to {
+                return ClientResponse::Success;
+            }
+            // Remove the source's metadata, rewrite its path, re-insert under the new key.
+            if let Some(mut meta) = sm.files.remove(from) {
+                meta.path = to.clone();
+                meta.updated_at_ms = now_ms;
+                sm.files.insert(to.clone(), meta);
+                // Migrate any active locks on the path too.
+                if let Some(locks) = sm.posix_locks.remove(from) {
+                    sm.posix_locks.insert(to.clone(), locks);
+                }
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit(format!("RenameFile: {from} -> {to}")),
+                );
+                ClientResponse::Success
+            } else {
+                ClientResponse::Error {
+                    message: format!("RenameFile: source '{from}' not found"),
+                }
+            }
+        }
+
+        ClientRequest::SetFileSize { path, new_size } => {
+            if let Some(meta) = sm.files.get_mut(path) {
+                meta.logical_size = Some(*new_size);
+                meta.updated_at_ms = now_ms;
+                // Truncate-shrink: drop chunks fully past the new EOF.
+                let chunk_size = meta.chunk_size.max(1);
+                let keep_idx = ((*new_size).div_ceil(chunk_size)).saturating_sub(0);
+                meta.chunks
+                    .retain(|c| (c.chunk_index as u64) < keep_idx || *new_size == 0 && false);
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit(format!("SetFileSize: {path} -> {new_size}")),
+                );
+                ClientResponse::Success
+            } else {
+                ClientResponse::Error {
+                    message: format!("SetFileSize: '{path}' not found"),
+                }
+            }
+        }
+
+        ClientRequest::CreateSymlink { path, target } => {
+            sm.files.insert(
+                path.clone(),
+                FileMetadata {
+                    path: path.clone(),
+                    volume_id: "default".to_string(),
+                    chunk_size: 0,
+                    chunks: Vec::new(),
+                    created_at_ms: now_ms,
+                    updated_at_ms: now_ms,
+                    symlink_target: Some(target.clone()),
+                    logical_size: Some(target.len() as u64),
+                },
+            );
+            push_audit_capped(
+                &mut sm.audit_log,
+                audit(format!("Symlink: {path} -> {target}")),
+            );
+            ClientResponse::Success
+        }
+
+        ClientRequest::CreateLink { source, dest } => {
+            // Hard link: clone the source metadata under the dest path.
+            // The chunk list is shared by value (chunk_ids are content-addressed
+            // so the same bytes remain accessible from both names).
+            if let Some(src_meta) = sm.files.get(source).cloned() {
+                let mut new_meta = src_meta;
+                new_meta.path = dest.clone();
+                new_meta.created_at_ms = now_ms;
+                new_meta.updated_at_ms = now_ms;
+                sm.files.insert(dest.clone(), new_meta);
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit(format!("Link: {source} -> {dest}")),
+                );
+                ClientResponse::Success
+            } else {
+                ClientResponse::Error {
+                    message: format!("Link: source '{source}' not found"),
+                }
+            }
+        }
+
+        // ---- Distributed POSIX byte-range locks (F-039) ----
+
+        ClientRequest::AcquireLock {
+            path,
+            owner_id,
+            start,
+            end,
+            write,
+            lease_ms,
+            now_ms,
+        } => {
+            let table = sm.posix_locks.entry(path.clone()).or_default();
+            // Evict expired entries first.
+            table.retain(|l| l.expires_at_ms > *now_ms);
+            // Check conflict.
+            for l in table.iter() {
+                if &l.owner_id == owner_id {
+                    continue;
+                }
+                if *start >= l.end || *end <= l.start {
+                    continue;
+                }
+                if l.write || *write {
+                    return ClientResponse::LockConflict {
+                        owner_id: l.owner_id.clone(),
+                        start: l.start,
+                        end: l.end,
+                        write: l.write,
+                    };
+                }
+            }
+            // Drop any overlapping locks owned by the same owner so we
+            // upgrade/extend cleanly.
+            table.retain(|l| {
+                !(l.owner_id == *owner_id && *start < l.end && l.start < *end)
+            });
+            table.push(DistributedLock {
+                owner_id: owner_id.clone(),
+                start: *start,
+                end: *end,
+                write: *write,
+                expires_at_ms: *now_ms + *lease_ms,
+            });
+            ClientResponse::LockGranted
+        }
+
+        ClientRequest::ReleaseLock {
+            path,
+            owner_id,
+            start,
+            end,
+        } => {
+            if let Some(table) = sm.posix_locks.get_mut(path) {
+                table.retain(|l| {
+                    !(l.owner_id == *owner_id && l.start >= *start && l.end <= *end)
+                });
+                if table.is_empty() {
+                    sm.posix_locks.remove(path);
+                }
+            }
+            ClientResponse::Success
+        }
+
+        // ---- P0-1: single-writer leases ----
+        ClientRequest::AcquireWriteLease {
+            path,
+            owner_id,
+            lease_ms,
+            now_ms,
+            proposed_lease_id,
+        } => {
+            // Evict expired entries (lazy GC; the manager also runs a 1s
+            // ticker that proposes SweepExpiredLeases for active reaping).
+            if let Some(existing) = sm.write_leases.get(path) {
+                if existing.expires_at_ms <= *now_ms {
+                    sm.write_leases.remove(path);
+                }
+            }
+
+            // Check for live conflict.
+            if let Some(existing) = sm.write_leases.get(path) {
+                if existing.owner_id != *owner_id {
+                    return ClientResponse::WriteLeaseConflict {
+                        owner_id: existing.owner_id.clone(),
+                        expires_at_ms: existing.expires_at_ms,
+                    };
+                }
+                // Same owner re-acquiring: replace with refreshed expiry but
+                // keep the existing lease_id so the caller's prior token
+                // still validates (idempotency).
+                let lease_id = existing.lease_id.clone();
+                let new_expires = *now_ms + *lease_ms;
+                sm.write_leases.insert(
+                    path.clone(),
+                    WriteLease {
+                        owner_id: owner_id.clone(),
+                        lease_id: lease_id.clone(),
+                        expires_at_ms: new_expires,
+                    },
+                );
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit(format!(
+                        "AcquireWriteLease (re-acquire): {path} owner={owner_id}"
+                    )),
+                );
+                return ClientResponse::WriteLeaseGranted {
+                    lease_id,
+                    expires_at_ms: new_expires,
+                };
+            }
+
+            // No conflict — grant fresh.
+            let expires_at_ms = *now_ms + *lease_ms;
+            sm.write_leases.insert(
+                path.clone(),
+                WriteLease {
+                    owner_id: owner_id.clone(),
+                    lease_id: proposed_lease_id.clone(),
+                    expires_at_ms,
+                },
+            );
+            push_audit_capped(
+                &mut sm.audit_log,
+                audit(format!("AcquireWriteLease: {path} owner={owner_id}")),
+            );
+            ClientResponse::WriteLeaseGranted {
+                lease_id: proposed_lease_id.clone(),
+                expires_at_ms,
+            }
+        }
+
+        ClientRequest::RenewWriteLease {
+            path,
+            lease_id,
+            extension_ms,
+            now_ms,
+        } => {
+            if let Some(existing) = sm.write_leases.get_mut(path) {
+                if existing.lease_id != *lease_id {
+                    return ClientResponse::WriteLeaseConflict {
+                        owner_id: existing.owner_id.clone(),
+                        expires_at_ms: existing.expires_at_ms,
+                    };
+                }
+                if existing.expires_at_ms <= *now_ms {
+                    // Lease already expired and was about to be GC'd; the
+                    // GC may have already run. Treat as conflict so the
+                    // caller re-acquires cleanly.
+                    return ClientResponse::WriteLeaseConflict {
+                        owner_id: existing.owner_id.clone(),
+                        expires_at_ms: existing.expires_at_ms,
+                    };
+                }
+                let new_expires = *now_ms + *extension_ms;
+                existing.expires_at_ms = new_expires;
+                return ClientResponse::WriteLeaseGranted {
+                    lease_id: lease_id.clone(),
+                    expires_at_ms: new_expires,
+                };
+            }
+            ClientResponse::WriteLeaseConflict {
+                owner_id: String::new(),
+                expires_at_ms: 0,
+            }
+        }
+
+        ClientRequest::ReleaseWriteLease { path, lease_id } => {
+            if let Some(existing) = sm.write_leases.get(path) {
+                if existing.lease_id == *lease_id {
+                    sm.write_leases.remove(path);
+                    push_audit_capped(
+                        &mut sm.audit_log,
+                        audit(format!("ReleaseWriteLease: {path}")),
+                    );
+                    return ClientResponse::WriteLeasesReleased { count: 1 };
+                }
+            }
+            ClientResponse::WriteLeasesReleased { count: 0 }
+        }
+
+        ClientRequest::ReleaseLeasesByHost {
+            hostname_prefix,
+            except_pid,
+        } => {
+            // Recommended owner_id format is `<hostname>:<pid>:<fh>`; match
+            // the hostname prefix and ensure the PID segment differs from
+            // `except_pid` (the live FUSE process). This drops orphan leases
+            // left by a crashed previous FUSE process while keeping leases
+            // from healthy concurrent mounts on the same host.
+            let prefix = format!("{hostname_prefix}:");
+            let except_segment = format!(":{except_pid}:");
+            let to_drop: Vec<String> = sm
+                .write_leases
+                .iter()
+                .filter(|(_, l)| {
+                    l.owner_id.starts_with(&prefix) && !l.owner_id.contains(&except_segment)
+                })
+                .map(|(p, _)| p.clone())
+                .collect();
+            let count = to_drop.len() as u32;
+            for p in &to_drop {
+                sm.write_leases.remove(p);
+            }
+            if count > 0 {
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit(format!(
+                        "ReleaseLeasesByHost: host={hostname_prefix} except_pid={except_pid} count={count}"
+                    )),
+                );
+            }
+            ClientResponse::WriteLeasesReleased { count }
+        }
+
+        ClientRequest::SweepExpiredLeases { now_ms } => {
+            let to_drop: Vec<String> = sm
+                .write_leases
+                .iter()
+                .filter(|(_, l)| l.expires_at_ms <= *now_ms)
+                .map(|(p, _)| p.clone())
+                .collect();
+            let count = to_drop.len() as u32;
+            for p in &to_drop {
+                sm.write_leases.remove(p);
+            }
+            if count > 0 {
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit(format!("SweepExpiredLeases: count={count}")),
+                );
+            }
+            ClientResponse::WriteLeasesReleased { count }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — snapshot persistence (regression test for F-024)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod snapshot_persistence_tests {
+    use super::*;
+    use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+
+    fn tmp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("create tempdir")
+    }
+
+    /// Build a tiny FSM populated with some files + nodes and a synthetic
+    /// `last_applied_log` so we can detect that a restart restores it.
+    fn populate_sample_state(data: &mut StateMachineData) {
+        use openraft::vote::RaftLeaderId;
+        let leader_id =
+            openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        let log_id = openraft::LogId::new(leader_id, 100);
+        data.last_applied_log = Some(log_id);
+        data.files.insert(
+            "/a.bin".into(),
+            FileMetadata {
+                path: "/a.bin".into(),
+                volume_id: "default".into(),
+                chunk_size: 1024,
+                chunks: vec![],
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                symlink_target: None,
+                logical_size: None,
+            },
+        );
+        data.cluster_config.version = 7;
+        data.cluster_config.config_json = "{\"v\":7}".into();
+    }
+
+    #[tokio::test]
+    async fn build_snapshot_persists_and_reopen_restores_state() {
+        let dir = tmp_dir();
+        let path = dir.path().to_path_buf();
+
+        // Build a state machine, populate it, and produce a snapshot.
+        {
+            let mut sm = StateMachineStore::open_at(&path).expect("open");
+            {
+                let mut data = sm.data.write().await;
+                populate_sample_state(&mut data);
+            }
+            let mut builder = sm.get_snapshot_builder().await;
+            let snap = builder.build_snapshot().await.expect("build");
+            assert!(snap.meta.last_log_id.is_some());
+        }
+
+        // Disk file should now exist.
+        let on_disk = path.join("snapshot.bin");
+        assert!(
+            on_disk.exists(),
+            "snapshot.bin must be written to disk so restart can restore FSM"
+        );
+
+        // Reopen with a fresh store at the same path — should recover state.
+        let restored = StateMachineStore::open_at(&path).expect("reopen");
+        let data = restored.data.read().await;
+        assert_eq!(
+            data.files.len(),
+            1,
+            "files BTreeMap restored from snapshot"
+        );
+        assert!(
+            data.files.contains_key("/a.bin"),
+            "the specific file we created is back"
+        );
+        assert_eq!(data.cluster_config.version, 7, "cluster config restored");
+        assert!(
+            data.last_applied_log.is_some(),
+            "last_applied_log restored — without this Raft skips log replay and stays empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_at_empty_dir_is_blank_state_machine() {
+        let dir = tmp_dir();
+        let sm = StateMachineStore::open_at(dir.path()).expect("open empty");
+        let data = sm.data.read().await;
+        assert!(data.files.is_empty());
+        assert!(data.last_applied_log.is_none());
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_persists_to_disk() {
+        let dir = tmp_dir();
+
+        // Source SM produces a snapshot.
+        let snapshot_bytes;
+        let snapshot_meta;
+        {
+            let mut src = StateMachineStore::open_at(dir.path()).expect("open src");
+            {
+                let mut data = src.data.write().await;
+                populate_sample_state(&mut data);
+            }
+            let mut builder = src.get_snapshot_builder().await;
+            let snap = builder.build_snapshot().await.expect("build");
+            snapshot_meta = snap.meta.clone();
+            snapshot_bytes = snap.snapshot.into_inner();
+        }
+
+        // A fresh SM in a different dir simulates a follower receiving the snapshot.
+        let follower_dir = tmp_dir();
+        let mut follower = StateMachineStore::open_at(follower_dir.path()).expect("open follower");
+        follower
+            .install_snapshot(&snapshot_meta, Cursor::new(snapshot_bytes))
+            .await
+            .expect("install");
+
+        // The follower must now have the file *and* must have written
+        // snapshot.bin so its own restart works.
+        let path = follower_dir.path().join("snapshot.bin");
+        assert!(path.exists(), "install_snapshot must persist to disk");
+
+        // Closing and reopening the follower restores the state.
+        drop(follower);
+        let reopened = StateMachineStore::open_at(follower_dir.path()).expect("reopen follower");
+        let data = reopened.data.read().await;
+        assert_eq!(data.files.len(), 1);
+        assert_eq!(data.cluster_config.version, 7);
     }
 }

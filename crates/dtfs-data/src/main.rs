@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+// Work around rustc ICE on stable when dead_code diagnostics hit `metrics` (see ISSUES_TO_FIX.md).
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     // Estimate max entries from max_memory_mb assuming ~128KB average chunk size.
     let avg_chunk_kb = 128;
     let max_entries = ((config.cache.max_memory_mb * 1024) / avg_chunk_kb) as usize;
-    let _cache = Arc::new(cache::ArcCache::new(max_entries.max(64)));
+    let cache = Arc::new(cache::ArcCache::new(max_entries.max(64)));
     tracing::info!(
         "Initialized ARC cache: max_memory={}MB, max_entries={}",
         config.cache.max_memory_mb,
@@ -78,15 +81,19 @@ async fn main() -> anyhow::Result<()> {
     // Clone Arcs so they can be shared between the heartbeat task and the gRPC server.
     let heartbeat_config = config.clone();
     let heartbeat_store = chunk_store.clone();
+    let heartbeat_metrics = data_metrics.clone();
     let process_start = Instant::now();
     tokio::spawn(async move {
-        if let Err(e) = manager_lifecycle(heartbeat_config, heartbeat_store, process_start).await {
+        if let Err(e) =
+            manager_lifecycle(heartbeat_config, heartbeat_store, heartbeat_metrics, process_start)
+                .await
+        {
             tracing::error!("Manager lifecycle task failed: {}", e);
         }
     });
 
     // Start gRPC server (blocks until shutdown)
-    server::run_grpc_server(config, chunk_store, data_metrics).await?;
+    server::run_grpc_server(config, chunk_store, data_metrics, cache).await?;
 
     Ok(())
 }
@@ -99,51 +106,74 @@ async fn main() -> anyhow::Result<()> {
 async fn manager_lifecycle(
     config: DataNodeConfig,
     chunk_store: Arc<ChunkStore>,
+    data_metrics: Arc<metrics::DataMetrics>,
     process_start: Instant,
 ) -> anyhow::Result<()> {
-    let manager_addr = format!("http://{}", config.cluster.manager_addr);
+    // F-024 hardening: walk through every configured manager endpoint when the
+    // primary is down (e.g. after a rolling restart). The list is built from
+    // `manager_addr` + `manager_addrs` in priority order.
+    let manager_endpoints: Vec<String> = config
+        .cluster
+        .all_manager_addrs()
+        .into_iter()
+        .map(|a| format!("http://{}", a))
+        .collect();
 
-    // Retry connecting to the manager with backoff.
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
 
-    let mut client = loop {
-        match ManagerServiceClient::connect(manager_addr.clone()).await {
-            Ok(c) => {
-                tracing::info!("Connected to manager at {}", config.cluster.manager_addr);
-                break c;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to connect to manager at {}: {} (retrying in {:?})",
-                    config.cluster.manager_addr,
-                    e,
-                    backoff
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(max_backoff);
+    let (mut client, mut current_endpoint_idx) = loop {
+        let mut connected = None;
+        for (idx, ep) in manager_endpoints.iter().enumerate() {
+            match ManagerServiceClient::connect(ep.clone()).await {
+                Ok(c) => {
+                    tracing::info!("Connected to manager at {}", ep);
+                    connected = Some((c, idx));
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!("manager {} unreachable: {}", ep, e);
+                }
             }
         }
+        if let Some(pair) = connected {
+            break pair;
+        }
+        tracing::warn!(
+            "no manager reachable in {:?}; retrying in {:?}",
+            manager_endpoints,
+            backoff
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(max_backoff);
     };
 
-    // Build disk info for registration.
+    // Build disk info for registration. Pull total/used bytes from the live
+    // ManagedDisk records (populated via statvfs at startup) so the manager
+    // sees real capacity (fix for F-006).
+    let managed = chunk_store.disk_manager();
     let disk_infos: Vec<dtfs_proto::dtfs::common::DiskInfo> = config
         .disks
         .iter()
         .enumerate()
-        .map(|(i, d)| dtfs_proto::dtfs::common::DiskInfo {
-            disk_id: i as u32,
-            uuid: uuid::Uuid::new_v4().to_string(),
-            mount_path: d.path.display().to_string(),
-            tier: match d.tier {
-                DiskTier::Hot => "hot".to_string(),
-                DiskTier::Warm => "warm".to_string(),
-                DiskTier::Cold => "cold".to_string(),
-                DiskTier::Tape => "tape".to_string(),
-            },
-            total_bytes: 0,
-            used_bytes: 0,
-            status: "healthy".to_string(),
+        .map(|(i, d)| {
+            let live = managed.all_disks().iter().find(|md| md.disk_id == i as u32);
+            let total_bytes = live.map(|m| m.total_bytes).unwrap_or(0);
+            let used_bytes = live.map(|m| m.used_bytes).unwrap_or(0);
+            dtfs_proto::dtfs::common::DiskInfo {
+                disk_id: i as u32,
+                uuid: uuid::Uuid::new_v4().to_string(),
+                mount_path: d.path.display().to_string(),
+                tier: match d.tier {
+                    DiskTier::Hot => "hot".to_string(),
+                    DiskTier::Warm => "warm".to_string(),
+                    DiskTier::Cold => "cold".to_string(),
+                    DiskTier::Tape => "tape".to_string(),
+                },
+                total_bytes,
+                used_bytes,
+                status: "healthy".to_string(),
+            }
         })
         .collect();
 
@@ -156,8 +186,11 @@ async fn manager_lifecycle(
         .and_then(|p| p.parse().ok())
         .unwrap_or(9500);
 
-    // Register this node with the manager.
-    let register_req = RegisterNodeRequest {
+    // Register this node with the manager. Retried with backoff + endpoint
+    // rotation so that a transient cluster outage (e.g. rolling manager
+    // restart immediately after this data node started — F-024) doesn't
+    // crash the data node lifecycle.
+    let build_register_req = || RegisterNodeRequest {
         hostname: config.node.hostname.clone(),
         role: "data".to_string(),
         grpc_port,
@@ -167,25 +200,57 @@ async fn manager_lifecycle(
             rack: config.location.rack.clone(),
             host: config.location.host.clone(),
         }),
-        disks: disk_infos,
+        disks: disk_infos.clone(),
+        shared_secret: Some(config.cluster.shared_secret.clone()),
     };
 
-    let register_resp = client
-        .register_node(tonic::Request::new(register_req))
-        .await?;
-    let resp = register_resp.into_inner();
-
-    if resp.accepted {
-        tracing::info!(
-            "Registered with manager, assigned node_id: {}",
-            resp.node_id
-        );
-    } else {
-        tracing::error!("Manager rejected registration");
-        return Err(anyhow::anyhow!("Registration rejected"));
-    }
-
-    let node_id = resp.node_id;
+    let mut reg_backoff = Duration::from_secs(1);
+    let node_id = loop {
+        let req = build_register_req();
+        match client.register_node(tonic::Request::new(req)).await {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                if resp.accepted {
+                    tracing::info!(
+                        "Registered with manager, assigned node_id: {}",
+                        resp.node_id
+                    );
+                    break resp.node_id;
+                } else {
+                    tracing::warn!(
+                        "Manager rejected registration; retrying in {:?}",
+                        reg_backoff
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "RegisterNode RPC failed: {} — walking manager list in {:?}",
+                    e,
+                    reg_backoff
+                );
+                // Try the other endpoints before backing off.
+                let n = manager_endpoints.len();
+                let mut switched = false;
+                for offset in 1..=n {
+                    let idx = (current_endpoint_idx + offset) % n;
+                    let ep = &manager_endpoints[idx];
+                    if let Ok(c) = ManagerServiceClient::connect(ep.clone()).await {
+                        client = c;
+                        current_endpoint_idx = idx;
+                        tracing::info!("Switched to manager at {}", ep);
+                        switched = true;
+                        break;
+                    }
+                }
+                if !switched {
+                    tracing::debug!("no alternate manager reachable yet");
+                }
+            }
+        }
+        tokio::time::sleep(reg_backoff).await;
+        reg_backoff = (reg_backoff * 2).min(max_backoff);
+    };
 
     // Heartbeat loop.
     let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -200,12 +265,27 @@ async fn manager_lifecycle(
         let store_stats = chunk_store.stats();
         let uptime = process_start.elapsed().as_secs();
 
+        // P0-9: harvest per-chunk-per-DC counters for the heartbeat payload.
+        // Cap to 1000 entries to keep the payload bounded; manager-side
+        // tiering tolerates a partial view (it ages-out old chunks anyway).
+        let per_chunk = data_metrics.harvest_per_chunk(1000);
+        let chunk_reads: Vec<dtfs_proto::dtfs::manager::PerChunkReadCounter> = per_chunk
+            .into_iter()
+            .map(|h| dtfs_proto::dtfs::manager::PerChunkReadCounter {
+                chunk_id: h.chunk_id,
+                reads_by_dc_1h: h.reads_by_dc.clone(),
+                reads_by_dc_24h: h.reads_by_dc,
+                last_access_ms: h.last_access_ms,
+            })
+            .collect();
+
         let heartbeat = HeartbeatRequest {
             node_id: node_id.clone(),
             uptime_secs: uptime,
             total_chunks: store_stats.total_chunks,
             total_bytes_used: store_stats.total_bytes_stored,
             config_version: current_config_version,
+            chunk_reads,
         };
 
         match client
@@ -259,19 +339,36 @@ async fn manager_lifecycle(
                     );
                 } else {
                     tracing::error!(
-                        "Heartbeat failed {} times, attempting reconnect...",
+                        "Heartbeat failed {} times, walking manager list for reconnect...",
                         consecutive_failures
                     );
-                    // Try to reconnect.
-                    match ManagerServiceClient::connect(manager_addr.clone()).await {
-                        Ok(new_client) => {
-                            client = new_client;
-                            consecutive_failures = 0;
-                            tracing::info!("Reconnected to manager");
+                    // F-024 hardening: try every configured manager endpoint
+                    // (starting after the one we last used) so a rolling
+                    // restart of the primary doesn't strand this data node.
+                    let n = manager_endpoints.len();
+                    let mut reconnected = false;
+                    for offset in 1..=n {
+                        let idx = (current_endpoint_idx + offset) % n;
+                        let ep = &manager_endpoints[idx];
+                        match ManagerServiceClient::connect(ep.clone()).await {
+                            Ok(new_client) => {
+                                client = new_client;
+                                current_endpoint_idx = idx;
+                                consecutive_failures = 0;
+                                tracing::info!("Reconnected to manager at {}", ep);
+                                reconnected = true;
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::debug!("reconnect to {} failed: {}", ep, e);
+                            }
                         }
-                        Err(e) => {
-                            tracing::error!("Reconnect failed: {}", e);
-                        }
+                    }
+                    if !reconnected {
+                        tracing::error!(
+                            "Reconnect failed across all {} managers; will retry next heartbeat",
+                            n
+                        );
                     }
                 }
             }

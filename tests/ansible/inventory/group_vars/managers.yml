@@ -1,18 +1,23 @@
 ---
-# Raft consensus configuration
+# Ports must match deploy/configs/mgr-*.toml (real schema).
+# Earlier defaults of 7000/7001/8080 do NOT match the binary (fix for F-003).
 dtfs_raft_listen_addr: "0.0.0.0"
-dtfs_raft_port: 7000
+dtfs_raft_port: 9400
 dtfs_raft_election_timeout_min_ms: 150
 dtfs_raft_election_timeout_max_ms: 300
 dtfs_raft_heartbeat_interval_ms: 50
-dtfs_raft_snapshot_threshold: 10000
+dtfs_raft_snapshot_threshold: 200
+# Lower threshold (was 10000) so an FSM snapshot is built — and persisted to
+# disk via the F-024 fix in dtfs-raft — early in the cluster lifetime. Without
+# a persisted snapshot, a manager restart that occurs before threshold logs
+# have accumulated finds nothing to load and comes back with empty membership.
 dtfs_raft_snapshot_interval_s: 300
 dtfs_raft_log_max_entries: 50000
 dtfs_raft_data_dir: "{{ dtfs_data_dir }}/raft"
 
 # gRPC inter-manager communication
 dtfs_grpc_listen_addr: "0.0.0.0"
-dtfs_grpc_port: 7001
+dtfs_grpc_port: 9401
 dtfs_grpc_max_message_size_mb: 64
 dtfs_grpc_keepalive_time_s: 30
 dtfs_grpc_keepalive_timeout_s: 10
@@ -20,7 +25,7 @@ dtfs_grpc_max_concurrent_streams: 1000
 
 # HTTP API
 dtfs_api_listen_addr: "0.0.0.0"
-dtfs_api_port: 8080
+dtfs_api_port: 9402
 dtfs_api_read_timeout_s: 30
 dtfs_api_write_timeout_s: 60
 dtfs_api_max_body_size_mb: 16
