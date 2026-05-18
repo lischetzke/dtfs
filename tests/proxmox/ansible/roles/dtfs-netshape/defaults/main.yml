@@ -1,0 +1,31 @@
+---
+# DC-class shaping defaults. Per-host overrides are set in inventory
+# group_vars/<dc>.yml (e.g. group_vars/dc-a.yml).
+
+# Egress rate cap (Mbps). Applied via HTB on eth0.
+dtfs_shape_up_mbps: 1000
+
+# Ingress rate cap (Mbps). Applied via IFB mirror.
+dtfs_shape_down_mbps: 1000
+
+# Netem jitter on the egress path (ms ± half-jitter, correlated).
+dtfs_shape_delay_ms: 1
+dtfs_shape_jitter_ms: 0
+
+# Interface to shape. Cloud-init networks bring up eth0 on Proxmox by default.
+dtfs_shape_iface: eth0
+
+# IFB module + interface for ingress shaping. Single ifb0 is sufficient.
+dtfs_shape_ifb: ifb0
+
+# Ports exempted from shaping so management traffic isn't bottlenecked.
+# Always include 22 (SSH), 9402/9403 (Prometheus scrape), 123 (NTP).
+dtfs_shape_exempt_ports:
+  - 22       # SSH
+  - 123      # NTP
+  - 9402     # Manager metrics/REST
+  - 9403     # Data node metrics
+
+# Marker file path; the apply task touches it after success so the revert
+# task can detect a half-installed state.
+dtfs_shape_marker: /var/lib/dtfs/netshape.applied

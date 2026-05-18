@@ -1,0 +1,7 @@
+---
+# DC-B: mid-class business uplink. 800 Mbps down / 400 Mbps up + 5ms jitter.
+# Hosts: mgr-02, data-b1, data-b2, client-b.
+dtfs_shape_up_mbps: 400
+dtfs_shape_down_mbps: 800
+dtfs_shape_delay_ms: 5
+dtfs_shape_jitter_ms: 1

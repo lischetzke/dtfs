@@ -1,0 +1,247 @@
+{
+  "_doc": "3-DC topology for prod-readiness campaign. dc-a anchors the corpus (DSL-class uplink); dc-b is warm+cache (mid-class) with 90-day TTL; dc-c is the fastest, warm-only. Storage A:B:C ratio ≈ 16:4:1 mapped onto pve01_ssd02 (hot+DC-C warm) and pve01_usb01..04 (DC-A cold + DC-B warm). PVE host is off-limits; only the 10.150.0.150-162 IP pool is in scope.",
+  "pve": {
+    "host": "10.150.0.121",
+    "node": "i-pve01",
+    "api_base": "https://10.150.0.121:8006/api2/json",
+    "bridge": "vmbr0",
+    "subnet": "10.150.0.0/24",
+    "gateway": "10.150.0.1",
+    "dns": ["10.150.0.2", "10.150.0.3"],
+    "storage_vm_disks": "pve01_ssd01",
+    "storage_hot": "pve01_ssd02",
+    "storage_warm_dcb_1": "pve01_usb03",
+    "storage_warm_dcb_2": "pve01_usb04",
+    "storage_cold_dca_1": "pve01_usb01",
+    "storage_cold_dca_2": "pve01_usb02",
+    "storage_iso": "local"
+  },
+  "ssh": {
+    "user": "debian",
+    "key_path": "C:/Users/leduc/.ssh/dtfs-lab/id_ed25519",
+    "pub_key_path": "C:/Users/leduc/.ssh/dtfs-lab/id_ed25519.pub"
+  },
+  "template": {
+    "vmid": 9000,
+    "name": "debian-13-cloudinit-tpl",
+    "source_image": "debian-13-generic-amd64.qcow2"
+  },
+  "topology": {
+    "cluster_name": "Lab",
+    "datacenters": [
+      {
+        "name": "dc-a",
+        "role": "anchor",
+        "bandwidth_mbps": { "down": 400, "up": 40, "jitter_ms": 25 },
+        "notes": "DSL-class uplink; holds at least one replica of every chunk"
+      },
+      {
+        "name": "dc-b",
+        "role": "warm-cache",
+        "bandwidth_mbps": { "down": 800, "up": 400, "jitter_ms": 5 },
+        "max_age_days": 90,
+        "readahead": "folder-sequential",
+        "notes": "Warm + 90-day cache only"
+      },
+      {
+        "name": "dc-c",
+        "role": "warm-only",
+        "bandwidth_mbps": { "down": 1000, "up": 1000, "jitter_ms": 1 },
+        "notes": "1G symmetric; no cache, fast burst path"
+      }
+    ]
+  },
+  "vms": [
+    {
+      "role": "builder",
+      "vmid": 9001,
+      "name": "dtfs-builder",
+      "ip": "10.150.0.150",
+      "cores": 4,
+      "memory_mb": 8192,
+      "os_disk_gb": 32,
+      "extra_disks": [],
+      "persistent_through_soak": true,
+      "notes": "Kept alive through the soak so hotfix rebuilds don't re-pay cold-build cost"
+    },
+    {
+      "role": "manager",
+      "vmid": 101,
+      "name": "mgr-01",
+      "ip": "10.150.0.151",
+      "cores": 2,
+      "memory_mb": 2048,
+      "os_disk_gb": 16,
+      "extra_disks": [],
+      "dc": "dc-a",
+      "rack": "dc-a-rack-1",
+      "bootstrap": true
+    },
+    {
+      "role": "manager",
+      "vmid": 102,
+      "name": "mgr-02",
+      "ip": "10.150.0.152",
+      "cores": 2,
+      "memory_mb": 2048,
+      "os_disk_gb": 16,
+      "extra_disks": [],
+      "dc": "dc-b",
+      "rack": "dc-b-rack-1"
+    },
+    {
+      "role": "manager",
+      "vmid": 103,
+      "name": "mgr-03",
+      "ip": "10.150.0.153",
+      "cores": 2,
+      "memory_mb": 2048,
+      "os_disk_gb": 16,
+      "extra_disks": [],
+      "dc": "dc-c",
+      "rack": "dc-c-rack-1"
+    },
+    {
+      "role": "data",
+      "vmid": 104,
+      "name": "data-a1",
+      "ip": "10.150.0.154",
+      "cores": 2,
+      "memory_mb": 4096,
+      "os_disk_gb": 16,
+      "extra_disks": [
+        { "size_gb": 250, "tier": "hot",  "storage": "pve01_ssd02" },
+        { "size_gb": 150, "tier": "cold", "storage": "pve01_usb01" }
+      ],
+      "dc": "dc-a",
+      "rack": "dc-a-rack-1"
+    },
+    {
+      "role": "data",
+      "vmid": 105,
+      "name": "data-a2",
+      "ip": "10.150.0.155",
+      "cores": 2,
+      "memory_mb": 4096,
+      "os_disk_gb": 16,
+      "extra_disks": [
+        { "size_gb": 250, "tier": "hot",  "storage": "pve01_ssd02" },
+        { "size_gb": 150, "tier": "cold", "storage": "pve01_usb02" }
+      ],
+      "dc": "dc-a",
+      "rack": "dc-a-rack-2"
+    },
+    {
+      "role": "data",
+      "vmid": 106,
+      "name": "data-b1",
+      "ip": "10.150.0.156",
+      "cores": 2,
+      "memory_mb": 4096,
+      "os_disk_gb": 16,
+      "extra_disks": [
+        { "size_gb": 100, "tier": "warm", "storage": "pve01_usb03" }
+      ],
+      "dc": "dc-b",
+      "rack": "dc-b-rack-1"
+    },
+    {
+      "role": "data",
+      "vmid": 107,
+      "name": "data-b2",
+      "ip": "10.150.0.157",
+      "cores": 2,
+      "memory_mb": 4096,
+      "os_disk_gb": 16,
+      "extra_disks": [
+        { "size_gb": 100, "tier": "warm", "storage": "pve01_usb04" }
+      ],
+      "dc": "dc-b",
+      "rack": "dc-b-rack-2"
+    },
+    {
+      "role": "data",
+      "vmid": 108,
+      "name": "data-c1",
+      "ip": "10.150.0.158",
+      "cores": 2,
+      "memory_mb": 4096,
+      "os_disk_gb": 16,
+      "extra_disks": [
+        { "size_gb": 25, "tier": "warm", "storage": "pve01_ssd02" }
+      ],
+      "dc": "dc-c",
+      "rack": "dc-c-rack-1"
+    },
+    {
+      "role": "data",
+      "vmid": 109,
+      "name": "data-c2",
+      "ip": "10.150.0.159",
+      "cores": 2,
+      "memory_mb": 4096,
+      "os_disk_gb": 16,
+      "extra_disks": [
+        { "size_gb": 25, "tier": "warm", "storage": "pve01_ssd02" }
+      ],
+      "dc": "dc-c",
+      "rack": "dc-c-rack-2"
+    },
+    {
+      "role": "client",
+      "vmid": 110,
+      "name": "client-a",
+      "ip": "10.150.0.160",
+      "cores": 2,
+      "memory_mb": 2048,
+      "os_disk_gb": 16,
+      "extra_disks": [],
+      "dc": "dc-a",
+      "rack": "dc-a-client",
+      "cache": { "type": "tmpfs", "size_gb": 5, "max_age_days": null }
+    },
+    {
+      "role": "client",
+      "vmid": 111,
+      "name": "client-b",
+      "ip": "10.150.0.161",
+      "cores": 2,
+      "memory_mb": 4096,
+      "os_disk_gb": 16,
+      "extra_disks": [
+        { "size_gb": 80, "tier": "cache", "storage": "pve01_ssd01", "mount": "/var/cache/dtfs" }
+      ],
+      "dc": "dc-b",
+      "rack": "dc-b-client",
+      "cache": { "type": "disk", "size_gb": 80, "max_age_days": 90, "readahead": "folder-sequential" }
+    },
+    {
+      "role": "client",
+      "vmid": 112,
+      "name": "client-c",
+      "ip": "10.150.0.162",
+      "cores": 2,
+      "memory_mb": 2048,
+      "os_disk_gb": 16,
+      "extra_disks": [],
+      "dc": "dc-c",
+      "rack": "dc-c-client",
+      "cache": { "type": "tmpfs", "size_gb": 5, "max_age_days": null }
+    }
+  ],
+  "volume_defaults": {
+    "name": "default",
+    "chunk_size_mb": 128,
+    "anchor_datacenter": "dc-a",
+    "replication": { "hot": 2, "warm": 2, "cold": 1 },
+    "write_safety": { "min_replicas_before_ack": 1, "write_timeout_secs": 30 },
+    "_note": "hot rf=2 because DC-A has only 2 hot-tier data nodes; rf=3 would be infeasible. anchor_datacenter=dc-a enforces P0-10 invariant."
+  },
+  "ram_budget": {
+    "host_total_gb": 64,
+    "host_reserved_gb": 6,
+    "cluster_active_gb": 46,
+    "builder_persistent_gb": 8,
+    "_note": "13 VMs × avg 3 GB ≈ 39 GB plus 8 GB builder. Disable PVE balloon to avoid swap surprises."
+  }
+}

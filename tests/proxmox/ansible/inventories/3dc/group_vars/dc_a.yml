@@ -1,0 +1,7 @@
+---
+# DC-A: DSL-class uplink. 400 Mbps down / 40 Mbps up + 25ms jitter.
+# Hosts: mgr-01, data-a1, data-a2, client-a.
+dtfs_shape_up_mbps: 40
+dtfs_shape_down_mbps: 400
+dtfs_shape_delay_ms: 25
+dtfs_shape_jitter_ms: 5

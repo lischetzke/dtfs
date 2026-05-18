@@ -1,0 +1,17 @@
+---
+# Apply DC-class bandwidth shaping across the lab.
+# Per-host shaping values come from `host_vars/<host>.yml` (or inventory
+# group_vars). Run from the Ansible control host:
+#
+#   ansible-playbook -i inventories/3dc/hosts.yml playbooks/apply-shaping.yml
+#
+# Idempotent: re-running applies the latest values; revert-shaping.yml
+# drops everything.
+- name: Apply per-DC bandwidth shaping
+  hosts: dtfs_all
+  become: true
+  gather_facts: true
+  vars:
+    tc_action: apply
+  roles:
+    - dtfs-netshape

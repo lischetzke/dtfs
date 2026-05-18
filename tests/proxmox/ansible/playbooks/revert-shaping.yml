@@ -1,0 +1,11 @@
+---
+# Revert all bandwidth shaping. Safe to run at any time; drops all qdiscs
+# and ifb interfaces. Used between soak runs to restore wire-speed.
+- name: Revert bandwidth shaping
+  hosts: dtfs_all
+  become: true
+  gather_facts: true
+  vars:
+    tc_action: revert
+  roles:
+    - dtfs-netshape

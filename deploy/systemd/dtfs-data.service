@@ -25,8 +25,12 @@ PrivateTmp=yes
 # Add ReadWritePaths= for each managed disk, e.g.:
 # ReadWritePaths=/mnt/ssd-a /mnt/ssd-b /mnt/hdd-a /mnt/hdd-b
 
-# Environment
-Environment=RUST_LOG=dtfs=info
+# Environment — P1-11: tonic/openraft chatter suppressed at info-default.
+Environment=RUST_LOG=dtfs=info,tonic=warn,h2=warn
+
+# P1-11: cap per-service journal usage; relevant during multi-day soaks.
+LogRateLimitIntervalSec=10
+LogRateLimitBurst=2000
 
 [Install]
 WantedBy=multi-user.target

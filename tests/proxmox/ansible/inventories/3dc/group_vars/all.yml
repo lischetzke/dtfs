@@ -1,0 +1,42 @@
+---
+# Cluster-wide defaults for the 3-DC topology.
+dtfs_cluster_name: Lab
+dtfs_cluster_secret: "lab-shared-secret-rotate-before-prod"
+
+# Manager pool — used by data nodes and clients to discover managers.
+dtfs_manager_addrs:
+  - "10.150.0.151:9100"
+  - "10.150.0.152:9100"
+  - "10.150.0.153:9100"
+
+# Per-tier replication defaults (anchor enforced via P0-10 on the volume).
+dtfs_replication_hot: 2
+dtfs_replication_warm: 2
+dtfs_replication_cold: 1
+
+# Volume defaults
+dtfs_anchor_datacenter: dc-a
+dtfs_chunk_size_mb: 128
+
+# Tiering thresholds (live-reloadable via /api/v1/config). The soak
+# overrides these to shorter windows for visible behaviour in 48h.
+dtfs_tiering_hot_reads_per_hour: 5
+dtfs_tiering_cold_days: 14
+dtfs_tiering_frozen_days: 90
+dtfs_tiering_eval_interval_secs: 60      # soak override: was 3600
+
+# Scrub schedule
+dtfs_scrub_quick_hours: 6
+dtfs_scrub_deep_hours: 24
+dtfs_scrub_max_io_percent: 10
+
+# Alert webhook sink (per soak): a file-sink endpoint on the control host
+# captures every alert for the final report.
+dtfs_alert_webhooks:
+  - url: "http://10.150.0.121:18081/alerts"
+    secret: "lab-webhook-secret-rotate-before-prod"
+    kinds: []          # empty = all kinds
+    dedup_secs: 60     # tighter than prod default (300s) for soak signal
+
+# Logging — production defaults; lab overrides debug for specific runs.
+dtfs_rust_log: "dtfs=info,openraft=warn,tonic=warn,h2=warn"

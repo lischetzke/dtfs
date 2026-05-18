@@ -1,0 +1,7 @@
+---
+# DC-C: 1 Gbps symmetric. Minimal jitter — this is the fast path.
+# Hosts: mgr-03, data-c1, data-c2, client-c.
+dtfs_shape_up_mbps: 1000
+dtfs_shape_down_mbps: 1000
+dtfs_shape_delay_ms: 1
+dtfs_shape_jitter_ms: 0

@@ -1,0 +1,134 @@
+---
+# P1-lab — DC-class bandwidth shaping via tc/HTB + netem (egress) and
+# IFB-mirrored HTB (ingress). Idempotent: revert task removes everything;
+# apply task is called with `tc_action=apply` and revert with `tc_action=revert`.
+#
+# Per-VM caps come from dtfs_shape_{up,down,delay,jitter}_mbps, set by
+# group_vars/<dc>.yml so each DC class has its own profile.
+
+- name: dtfs-netshape — ensure marker dir exists
+  ansible.builtin.file:
+    path: /var/lib/dtfs
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: dtfs-netshape — install tc + iproute2 (Debian)
+  ansible.builtin.apt:
+    name:
+      - iproute2
+    state: present
+    update_cache: true
+  when: ansible_pkg_mgr == 'apt'
+
+- name: dtfs-netshape — load ifb kernel module
+  community.general.modprobe:
+    name: ifb
+    state: present
+    params: "numifbs=2"
+  when: tc_action | default('apply') == 'apply'
+
+- name: dtfs-netshape — drop existing qdiscs (clean slate)
+  ansible.builtin.shell: |
+    set +e
+    tc qdisc del dev {{ dtfs_shape_iface }} root 2>/dev/null
+    tc qdisc del dev {{ dtfs_shape_iface }} ingress 2>/dev/null
+    ip link set dev {{ dtfs_shape_ifb }} down 2>/dev/null
+    tc qdisc del dev {{ dtfs_shape_ifb }} root 2>/dev/null
+    true
+  changed_when: false
+  failed_when: false
+
+- name: dtfs-netshape — remove marker after revert
+  ansible.builtin.file:
+    path: "{{ dtfs_shape_marker }}"
+    state: absent
+  when: tc_action | default('apply') == 'revert'
+
+- name: dtfs-netshape — bring up ifb and apply shaping
+  when: tc_action | default('apply') == 'apply'
+  block:
+    - name: ifb up
+      ansible.builtin.shell: "ip link set dev {{ dtfs_shape_ifb }} up"
+      changed_when: false
+
+    - name: egress HTB root
+      ansible.builtin.shell: |
+        tc qdisc add dev {{ dtfs_shape_iface }} root handle 1: htb default 10
+        tc class add dev {{ dtfs_shape_iface }} parent 1: classid 1:1 \
+            htb rate {{ dtfs_shape_up_mbps }}mbit ceil {{ dtfs_shape_up_mbps }}mbit
+        tc class add dev {{ dtfs_shape_iface }} parent 1:1 classid 1:10 \
+            htb rate {{ dtfs_shape_up_mbps }}mbit ceil {{ dtfs_shape_up_mbps }}mbit burst 64k
+        tc class add dev {{ dtfs_shape_iface }} parent 1:1 classid 1:20 \
+            htb rate 1000mbit ceil 1000mbit burst 64k
+      changed_when: true
+
+    - name: egress netem (jitter) on shaped class
+      ansible.builtin.shell: |
+        tc qdisc add dev {{ dtfs_shape_iface }} parent 1:10 handle 10: netem \
+            delay {{ dtfs_shape_delay_ms }}ms {{ dtfs_shape_jitter_ms }}ms 25%
+      changed_when: true
+      when: dtfs_shape_jitter_ms | int > 0
+
+    - name: egress filter — route exempt ports to class 1:20 (unshaped)
+      ansible.builtin.shell: |
+        {% for p in dtfs_shape_exempt_ports %}
+        tc filter add dev {{ dtfs_shape_iface }} protocol ip parent 1: prio 1 \
+            u32 match ip dport {{ p }} 0xffff flowid 1:20
+        tc filter add dev {{ dtfs_shape_iface }} protocol ip parent 1: prio 1 \
+            u32 match ip sport {{ p }} 0xffff flowid 1:20
+        {% endfor %}
+      changed_when: true
+
+    - name: ingress redirect to ifb
+      ansible.builtin.shell: |
+        tc qdisc add dev {{ dtfs_shape_iface }} handle ffff: ingress
+        tc filter add dev {{ dtfs_shape_iface }} parent ffff: protocol ip u32 \
+            match u32 0 0 action mirred egress redirect dev {{ dtfs_shape_ifb }}
+      changed_when: true
+
+    - name: ifb HTB root (ingress shaping)
+      ansible.builtin.shell: |
+        tc qdisc add dev {{ dtfs_shape_ifb }} root handle 1: htb default 10
+        tc class add dev {{ dtfs_shape_ifb }} parent 1: classid 1:1 \
+            htb rate {{ dtfs_shape_down_mbps }}mbit ceil {{ dtfs_shape_down_mbps }}mbit
+        tc class add dev {{ dtfs_shape_ifb }} parent 1:1 classid 1:10 \
+            htb rate {{ dtfs_shape_down_mbps }}mbit ceil {{ dtfs_shape_down_mbps }}mbit burst 256k
+        tc class add dev {{ dtfs_shape_ifb }} parent 1:1 classid 1:20 \
+            htb rate 1000mbit ceil 1000mbit burst 64k
+      changed_when: true
+
+    - name: ingress filter — exempt ports on ifb
+      ansible.builtin.shell: |
+        {% for p in dtfs_shape_exempt_ports %}
+        tc filter add dev {{ dtfs_shape_ifb }} protocol ip parent 1: prio 1 \
+            u32 match ip dport {{ p }} 0xffff flowid 1:20
+        tc filter add dev {{ dtfs_shape_ifb }} protocol ip parent 1: prio 1 \
+            u32 match ip sport {{ p }} 0xffff flowid 1:20
+        {% endfor %}
+      changed_when: true
+
+    - name: touch marker
+      ansible.builtin.copy:
+        dest: "{{ dtfs_shape_marker }}"
+        content: |
+          dtfs-netshape applied {{ ansible_date_time.iso8601 }}
+          up_mbps={{ dtfs_shape_up_mbps }}
+          down_mbps={{ dtfs_shape_down_mbps }}
+          delay_ms={{ dtfs_shape_delay_ms }}
+          jitter_ms={{ dtfs_shape_jitter_ms }}
+        owner: root
+        group: root
+        mode: "0644"
+
+- name: dtfs-netshape — verify (apply only)
+  when: tc_action | default('apply') == 'apply'
+  ansible.builtin.shell: tc -s qdisc show dev {{ dtfs_shape_iface }}
+  register: tc_show
+  changed_when: false
+
+- name: dtfs-netshape — print verification
+  when: tc_action | default('apply') == 'apply'
+  ansible.builtin.debug:
+    var: tc_show.stdout_lines
