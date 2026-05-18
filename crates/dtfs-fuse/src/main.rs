@@ -116,13 +116,19 @@ async fn main() -> Result<()> {
     // orphan lease blocks all writers until the 15s lease_ms elapses.
     // We pass our own PID as `except_pid` so any healthy concurrent FUSE
     // process on this host keeps its leases.
+    //
+    // Bug J — wrap this call in a hard timeout. The release_leases_by_host
+    // RPC goes through Raft; if the cluster is busy (rolling restart,
+    // Bug G shedding event, network partition) the call can take many
+    // seconds, during which FUSE startup hangs and the systemd unit looks
+    // permanently "active but not mounted". A 5 s ceiling lets startup
+    // proceed; leftover leases will expire via the 15 s lease_ms anyway.
     let hostname_for_cleanup = fuse_config.location.host.clone();
     let current_pid = std::process::id();
-    match client
-        .release_leases_by_host(&hostname_for_cleanup, current_pid)
-        .await
-    {
-        Ok(resp) => {
+    let cleanup_fut =
+        client.release_leases_by_host(&hostname_for_cleanup, current_pid);
+    match tokio::time::timeout(std::time::Duration::from_secs(5), cleanup_fut).await {
+        Ok(Ok(resp)) => {
             if resp.released_count > 0 {
                 info!(
                     host = %hostname_for_cleanup,
@@ -132,10 +138,17 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(
                 error = %e,
                 "orphan lease cleanup failed; proceeding anyway"
+            );
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                host = %hostname_for_cleanup,
+                "orphan lease cleanup timed out after 5s; proceeding — orphans \
+                 will expire via lease_ms"
             );
         }
     }
