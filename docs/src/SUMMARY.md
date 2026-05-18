@@ -27,6 +27,7 @@
 
 # Operations
 
+- [Production Deployment Runbook](./operations/production-deployment.md)
 - [Cluster Management](./operations/cluster-management.md)
 - [Disk Management](./operations/disk-management.md)
 - [Maintenance Mode](./operations/maintenance-mode.md)

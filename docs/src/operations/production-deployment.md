@@ -1,0 +1,211 @@
+# DTFS Production Deployment & Soak Runbook
+
+Operator-facing playbook for the first DTFS prod-ish deployment. Covers
+provisioning, smoke validation, the 48h soak campaign, and the explicit
+gaps that ship in this build.
+
+## What ships in this build
+
+**Closed P0 (silent-data-loss class)**
+
+- P0-1/P0-6 single-writer lease (manager Raft + FUSE EBUSY + crash recovery)
+- P0-2 replica fallback on read failure (try every replica before erroring)
+- P0-3 multi-manager runtime failover on the client
+- P0-4 migration alternate-source retry with circuit breaker
+- P0-5 scrub skips chunks with outstanding WAL entries
+- P0-7 serde-default on every new state-machine field
+- P0-8 audit log JSONL archive (`<data_dir>/audit/audit-YYYYMMDD.jsonl`)
+
+**Distinctive features (now functional, not just configured)**
+
+- P0-9 `reads_by_dc` end-to-end → auto-move-replica-to-active-DC works
+- P0-10 DC-A anchor placement (tiering refuses to strand the last anchor copy)
+- P0-11 FUSE disk-backed cache with 90-day `max_age_days` eviction
+
+**Operations**
+
+- P1-7 Prometheus `/metrics` scrape on the manager REST listener
+- P1-8 alert webhooks (HMAC-signed POSTs, per-kind dedup)
+- P1-10 `/healthz` (liveness) + `/readyz` (FSM-init + ≥1 healthy node)
+- P1-11 RUST_LOG + systemd journald rate-limit defaults
+
+**Known gaps that ship with caveats**
+
+| ID | Item | Mitigation for first deploy |
+|----|------|------------------------------|
+| P1-1 | No TLS on gRPC / REST / Raft | Restrict to a private LAN; firewall everything that's not SSH/9402/9403. |
+| P1-2 | No authentication (REST + WebUI fully open) | Same as above. Bind REST/WebUI to a management VLAN. |
+| P1-9 | SMART data is best-effort (heartbeat enum only) | Monitor SMART externally (e.g. Prometheus node-exporter on each data node). |
+| P1-12 | No graceful node decommission RPC | To remove a node: drain manually via `nftables` block, then `dtfs-cli node remove`. |
+| P1-14 | No metadata backup CLI | `tar -czf metadata.tgz <data_dir>/raft-{log,sm}` on the leader. |
+
+These are documented in the plan at `~/.claude/plans/are-all-function-relevant-eventual-bubble.md` and tracked as Phase D/E follow-ups.
+
+## Lab campaign — 3-DC topology
+
+Cluster name: `Lab`. Topology:
+
+| DC | Bandwidth (down/up) | Role | Storage |
+|----|---------------------|------|---------|
+| dc-a | 400 / 40 Mbps (DSL) | Anchor — full corpus | 500 GB hot (SSD) + 300 GB cold (USB) |
+| dc-b | 800 / 400 Mbps | Warm + cache, 90-day TTL | 200 GB warm (USB) |
+| dc-c | 1 G / 1 G | Warm-only, fastest path | 50 GB warm (SSD partition) |
+
+Volume `default`: `anchor_datacenter=dc-a`, `rf hot=2, warm=2, cold=1`,
+`chunk_size_mb=128`.
+
+## Provisioning (Proxmox)
+
+```powershell
+# From the Windows control host with PVE API token in env.
+pwsh tests/proxmox/pve.ps1 -ConfigJson tests/proxmox/inventory-3dc.json -CreateAll
+```
+
+This clones the Debian 13 cloud-init template into 13 VMs at
+10.20.0.150-162 with the right disk topology.
+
+## Build & deploy
+
+```bash
+# On the builder VM (10.20.0.150 — kept alive across the soak):
+ssh debian@10.20.0.150
+cd ~/dtfs2 && git pull
+cargo build --release --workspace
+# Releases at target/release/dtfs-{manager,data,fuse,cli}
+
+# Push binaries from builder to the Ansible control host, then deploy.
+ansible-playbook -i tests/proxmox/ansible/inventories/3dc/hosts.yml \
+    tests/proxmox/ansible/playbooks/full-deploy.yml
+
+# Apply bandwidth shaping LAST (so deploy traffic isn't slowed).
+ansible-playbook -i tests/proxmox/ansible/inventories/3dc/hosts.yml \
+    tests/proxmox/ansible/playbooks/apply-shaping.yml
+```
+
+## Cluster bootstrap & volume
+
+```bash
+# From any host that can reach the managers:
+dtfs-cli cluster status
+dtfs-cli volume update default \
+    --anchor-dc dc-a \
+    --replication hot=2,warm=2,cold=1 \
+    --chunk-size-mb 128
+```
+
+## Smoke checks
+
+```bash
+# Liveness / readiness probes
+curl -fsS http://10.20.0.151:9402/healthz
+curl -fsS http://10.20.0.151:9402/readyz
+curl -fsS http://10.20.0.151:9402/metrics | grep dtfs_
+
+# All 6 data nodes registered + healthy
+curl -fsS http://10.20.0.151:9402/api/v1/nodes | jq '.[] | {hostname,health,dc}'
+
+# Sentinel write + cross-DC read
+ssh debian@10.20.0.162 'dd if=/dev/urandom of=/mnt/dtfs/sentinel.dat bs=1M count=64'
+ssh debian@10.20.0.160 'cat /mnt/dtfs/sentinel.dat | b3sum'  # over DSL
+ssh debian@10.20.0.162 'cat /mnt/dtfs/sentinel.dat | b3sum'  # over 1G
+# Verify the two BLAKE3 hashes match.
+
+# Anchor invariant — chunks of `sentinel.dat` should include a DC-A replica
+curl -fsS 'http://10.20.0.151:9402/api/v1/files?path=/sentinel.dat' \
+    | jq '.chunks[].node_addresses'
+
+# Write-lease busy
+ssh debian@10.20.0.160 'dd if=/dev/urandom of=/mnt/dtfs/lease-test.dat bs=1M count=1 &'
+ssh debian@10.20.0.162 'dd if=/dev/urandom of=/mnt/dtfs/lease-test.dat bs=1M count=1'
+# One of the two writes should produce "Device or resource busy".
+```
+
+## Preload corpus
+
+```bash
+# Copy the 641 GB / 290-file dummy_files corpus from Windows host via
+# client-c (fastest DC, bypasses DC-A's DSL cap).
+rsync -aP /mnt/c/Users/<user>/git_github.com/dtfs2/dummy_files/ \
+    debian@10.20.0.162:/mnt/dtfs/
+# Expected ~3h at 80 MB/s sustained.
+
+# Baseline BLAKE3 of source
+find /mnt/c/Users/<user>/git_github.com/dtfs2/dummy_files \
+    -type f \( -name '*.mkv' -o -name '*.mp4' \) -print0 \
+    | xargs -0 b3sum > corpus-source.blake3
+```
+
+## Run the 48h soak
+
+```bash
+# From the Ansible control host:
+./tests/proxmox/soak/run-soak.sh \
+    --duration 48h \
+    --corpus /mnt/c/Users/<user>/git_github.com/dtfs2/dummy_files \
+    --results-dir ./tests/proxmox/soak/results/$(date +%Y%m%dT%H%M)
+```
+
+Workloads run continuously on each client; the driver injects scheduled
+failures (S13 partition at 8h, S14 disk-full at 16h, S15 corruption at
+20h, S17 rolling-restart at 30h, etc.). Metrics are scraped every 30s.
+
+## Final verification
+
+```bash
+# Post-soak BLAKE3 of every file in the corpus.
+bash tests/proxmox/soak/scenarios/post-verify-blake3.sh \
+    /mnt/c/Users/<user>/git_github.com/dtfs2/dummy_files \
+    ./tests/proxmox/soak/results/<ts>
+
+# Sign-off report
+cat ./tests/proxmox/soak/results/<ts>/REPORT.md
+```
+
+## Pass / fail
+
+PASS iff:
+
+- corpus BLAKE3 100% match end-to-end
+- anchor invariant held throughout (`dtfs_anchor_protected_total` does
+  NOT include violations — only refusals; check that no `anchor.violated`
+  events fired)
+- lease invariant held (no observed simultaneous double-writer commit)
+- `/readyz` was 200 for ≥98% of the run
+- all S01-S03 + S08-S10 + S13 + S15 + S17 scenarios PASS in the report
+
+FAIL on any:
+
+- unrecovered corrupt chunk
+- silent data loss observed by sentinel checks
+- BLAKE3 mismatch on any source file
+
+## Operator dial-ins after a problem
+
+Common knobs you might tune mid-soak (live-reloaded via REST):
+
+```bash
+# Quieter or louder logging without a restart
+ssh debian@10.20.0.151 'sudo systemctl set-environment RUST_LOG=dtfs=debug && \
+    sudo systemctl reload dtfs-manager'
+
+# Drop a single sink that's misbehaving (e.g. flooding Slack):
+# edit /etc/dtfs/manager.toml, remove the offending [[alerts.webhooks]],
+# then sudo systemctl reload dtfs-manager.
+
+# Tighten or relax tiering thresholds
+curl -fsS -X POST http://10.20.0.151:9402/api/v1/config \
+    -d '{"tiering": {"evaluation_interval_secs": 30}}'
+```
+
+## When you're done
+
+```bash
+# Save the report off-cluster
+rsync -avz debian@10.20.0.121:tests/proxmox/soak/results/ ./local-results/
+
+# Drop bandwidth shaping (returns full wire speed for fast teardown)
+ansible-playbook tests/proxmox/ansible/playbooks/revert-shaping.yml
+
+# Teardown
+ansible-playbook tests/proxmox/ansible/playbooks/teardown.yml
+```
