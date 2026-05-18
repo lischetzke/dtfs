@@ -206,6 +206,24 @@ run_stage() {
     esac
 
     END_TS=$(( $(date +%s) + hours * 3600 ))
+    # Plexmedia-specific scenario env vars. The shipped S01..S28 scenarios
+    # default to 3-DC inventory IPs (CLIENT_A=10.150.0.160 etc.); we
+    # override here so each scenario hits the right Plexmedia host.
+    export MGR="http://${MGR01}:9402"
+    export CLIENT_A="${CLIENT_LELI}"   # LELI viewer
+    export CLIENT_B="${CLIENT_TORO}"   # TORO viewer (cached)
+    export CLIENT_C="${CLIENT_NRB}"    # NRB ingest path
+    export DATA_A1="${DATA_PRIMARY}"   # anchor
+    export DATA_A2="${DATA_PRIMARY}"   # same node — Plexmedia has one anchor data
+    export DATA_B1="${DATA_WARM_TORO}"
+    export DATA_B2="${DATA_WARM_TORO}"
+    export DATA_C1="${DATA_WARM_NRB}"
+    export DATA_C2="${DATA_WARM_NRB}"
+    export MGR_01="${MGR01}"
+    export MGR_02="${MGR02}"
+    export MGR_03="${MGR03}"
+    export SSH_USER
+
     for entry in "${SCHEDULE[@]}"; do
         scenario="${entry%%:*}"
         delay_hr="${entry##*:}"
