@@ -56,6 +56,17 @@ async fn main() -> anyhow::Result<()> {
     // Initialize chunk store
     let chunk_store = Arc::new(store::ChunkStore::new(disk_manager));
 
+    // Bug M — replay the WAL FIRST so any tmp/wal residue from a crashed
+    // previous instance gets reconciled before the rescan walks the
+    // chunks directory. Without this, orphan tmp files leak disk forever
+    // and partially-written chunks confuse rescan_existing_chunks.
+    if let Err(e) = chunk_store.recover_from_wal().await {
+        tracing::warn!(
+            error = %e,
+            "recover_from_wal failed at startup; orphan tmp/wal files may remain"
+        );
+    }
+
     // Rebuild on-disk chunk count + bytes_stored. Without this, a daemon
     // restart drops back to 0/0 even though all chunks remain on disk
     // (heartbeats then under-report used_capacity to the manager, which
@@ -319,6 +330,42 @@ async fn manager_lifecycle(
             config_version: current_config_version,
             chunk_reads,
         };
+
+        // Bug O — after each heartbeat tick, drain any locally-quarantined
+        // chunks the scrub scheduler has flagged and report them to the
+        // manager via the existing ChunkStatusReport RPC. The manager's
+        // handler issues a RemoveCorruptChunkReplicas Raft command which
+        // drops the (this-node, chunk_hash) entries from sm.files and
+        // wakes the scheduler's under-replication check.
+        let corrupt_ids = chunk_store.drain_pending_corruption();
+        if !corrupt_ids.is_empty() {
+            let report = dtfs_proto::dtfs::manager::ChunkStatusReport {
+                node_id: node_id.clone(),
+                chunks: corrupt_ids
+                    .iter()
+                    .map(|id| dtfs_proto::dtfs::manager::ChunkStatus {
+                        chunk_id: id.clone(),
+                        status: "corrupt".into(),
+                        size: 0,
+                    })
+                    .collect(),
+            };
+            match client.report_chunk_status(tonic::Request::new(report)).await {
+                Ok(_) => tracing::info!(
+                    count = corrupt_ids.len(),
+                    "Bug O reported quarantined chunks to manager"
+                ),
+                Err(e) => {
+                    // Re-enqueue on RPC failure so we try again next heartbeat.
+                    chunk_store.enqueue_pending_corruption(corrupt_ids.iter().cloned());
+                    tracing::warn!(
+                        error = %e,
+                        count = corrupt_ids.len(),
+                        "Bug O ChunkStatusReport failed — will retry next heartbeat"
+                    );
+                }
+            }
+        }
 
         match client
             .heartbeat(tonic::Request::new(heartbeat))

@@ -30,4 +30,4 @@ LOCK
 CURRENT
 MANIFEST-*
 
-dummy_files/
+dummy_files/.claude/
