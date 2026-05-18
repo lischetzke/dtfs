@@ -10,6 +10,14 @@ User=root
 # Instantiate with a systemd-escaped absolute path, e.g.
 #   systemctl start dtfs-fuse@$(systemd-escape --path /mnt/dtfs).service
 # %I decodes the escape back to "mnt/dtfs"; we prefix "/" to restore the absolute path.
+#
+# Bug H — when dtfs-fuse exits unexpectedly (OOM, panic, kernel signal)
+# the mountpoint is left in the "Transport endpoint is not connected"
+# state. systemd's Restart=on-failure relaunches the binary, but the
+# subsequent mount(2) fails because the inode still references the
+# dead session. ExecStartPre clears any such stale mount; the `-` means
+# "ignore failure" so the first-ever launch (no stale mount) also works.
+ExecStartPre=-/bin/fusermount3 -u /%I
 ExecStart=/usr/local/bin/dtfs-fuse --config /etc/dtfs/fuse.toml --mountpoint /%I
 ExecStop=/bin/fusermount3 -u /%I
 Restart=on-failure
