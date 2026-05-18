@@ -52,6 +52,11 @@ pub struct FileLocations {
     pub created_at_ms: i64,
     /// File last-modified time, epoch milliseconds (fix for F-014).
     pub modified_at_ms: i64,
+    /// True iff this path is a directory (explicit mkdir or synthetic).
+    /// Set by the manager's `GetFileLocationsResponse.is_directory`. Fixes
+    /// the SOAK-RECOVERY-2026-05-18 bugs A & B where `getattr` on a
+    /// freshly-mkdir'd folder returned ENOENT.
+    pub is_directory: bool,
 }
 
 /// Information about a single chunk within a file.
@@ -1078,6 +1083,7 @@ impl DtfsFilesystem {
                     // the manager. 0 means "use UNIX_EPOCH for now".
                     created_at_ms: 0,
                     modified_at_ms: 0,
+                    is_directory: false,
                 }),
                 chunk_size: response.chunk_size,
                 lease_id: Some(lease_resp.lease_id),
@@ -1304,6 +1310,7 @@ impl DtfsFilesystem {
             chunk_size,
             created_at_ms: response.created_at_ms,
             modified_at_ms: response.modified_at_ms,
+            is_directory: response.is_directory,
         })
     }
 
@@ -1553,10 +1560,13 @@ fn system_time_from_epoch_secs(secs: i64) -> SystemTime {
 
 /// Build a `FileAttr` from `FileLocations`. Timestamps come from the manager's
 /// `FileMetadata` and are exposed to the FUSE kernel via getattr (fix for F-014).
+/// `is_directory` is propagated from the manager so empty-mkdir directories
+/// and synthetic ones (implied by child paths) both report as directories —
+/// SOAK-RECOVERY-2026-05-18 bugs A & B.
 fn file_attr_from_locations(locations: &FileLocations) -> FileAttr {
     FileAttr {
-        size: locations.total_size,
-        is_directory: false,
+        size: if locations.is_directory { 4096 } else { locations.total_size },
+        is_directory: locations.is_directory,
         created_at: system_time_from_epoch_ms(locations.created_at_ms),
         modified_at: system_time_from_epoch_ms(locations.modified_at_ms),
     }
@@ -1605,9 +1615,36 @@ mod tests {
             chunk_size: 128 * 1024 * 1024,
             created_at_ms: 0,
             modified_at_ms: 0,
+            is_directory: false,
         };
         let attr = file_attr_from_locations(&loc);
         assert_eq!(attr.size, 42);
         assert!(!attr.is_directory);
+    }
+
+    /// SOAK-RECOVERY-2026-05-18 bugs A+B (FUSE side): when the manager
+    /// reports `is_directory=true` (either an explicit mkdir entry or a
+    /// synthetic directory implied by a child file path), `file_attr_from_
+    /// locations` must propagate that flag through to the FUSE FileAttr.
+    /// Before the fix, `is_directory` was hardcoded `false`, so every
+    /// `getattr` returned "regular file" and `ls`/`stat` lost the
+    /// directory-ness.
+    #[test]
+    fn bug_a_b_directory_is_directory_propagates_through_attrs() {
+        let loc = FileLocations {
+            path: "/corpus".to_string(),
+            total_size: 0,
+            chunks: Vec::new(),
+            volume_id: "default".to_string(),
+            chunk_size: 0,
+            created_at_ms: 1,
+            modified_at_ms: 1,
+            is_directory: true,
+        };
+        let attr = file_attr_from_locations(&loc);
+        assert!(attr.is_directory, "directory bit must round-trip into FileAttr");
+        // A directory's logical size is moot — we report a placeholder
+        // (4096 — one filesystem block) so `stat` doesn't say 0 bytes.
+        assert_eq!(attr.size, 4096);
     }
 }
