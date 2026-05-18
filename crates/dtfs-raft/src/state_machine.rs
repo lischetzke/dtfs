@@ -73,6 +73,13 @@ pub struct FileMetadata {
     /// chunk list. `None` falls back to the sum of chunk sizes.
     #[serde(default)]
     pub logical_size: Option<u64>,
+    /// Marker that this entry represents an empty directory rather than a
+    /// regular file. Set by `mkdir` (CreateFile with a trailing slash).
+    /// Synthetic directories implied by child file paths are computed at
+    /// lookup time via [`StateMachineData::lookup_path`].
+    /// `#[serde(default)]` keeps older snapshots loadable.
+    #[serde(default)]
+    pub is_directory: bool,
 }
 
 /// F-039 — One distributed POSIX byte-range lock held in the cluster FSM.
@@ -187,6 +194,71 @@ impl Default for StateMachineData {
             posix_locks: BTreeMap::new(),
             write_leases: BTreeMap::new(),
         }
+    }
+}
+
+impl StateMachineData {
+    /// Look up a path, returning either the canonical FileMetadata or a
+    /// synthesised one for directories that are *implied* by child paths.
+    ///
+    /// Canonical hits: `sm.files.get(path)` is `Some`.
+    ///
+    /// Synthetic hits: there is no entry at `path` itself, but there *is*
+    /// at least one entry under the prefix `path + "/"`. In that case we
+    /// return a synthesised `FileMetadata` with `is_directory = true` and
+    /// `chunks = []` so the caller can reply with directory attributes.
+    ///
+    /// This is the canonical "does this path exist for posix purposes"
+    /// helper — used by the manager's `get_file_locations` handler and
+    /// the rest of the metadata RPCs to fix bugs A and B from
+    /// `tests/proxmox/SOAK-RECOVERY-2026-05-18.md`.
+    pub fn lookup_path(&self, path: &str) -> Option<FileMetadata> {
+        // 1. Direct hit.
+        if let Some(meta) = self.files.get(path) {
+            return Some(meta.clone());
+        }
+        // 2. mkdir-style entry stored at `path + "/"`. mkdir historically
+        //    appends a trailing slash to signal directory semantics; the
+        //    fix in `apply_request` normalises away the slash on insert,
+        //    but we keep this fallback for snapshots taken before the
+        //    fix landed.
+        let with_slash = format!("{}/", path);
+        if let Some(meta) = self.files.get(&with_slash) {
+            return Some(FileMetadata {
+                is_directory: true,
+                ..meta.clone()
+            });
+        }
+        // 3. Synthetic: any entry exists below this prefix → directory.
+        let prefix = if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/", path)
+        };
+        if self
+            .files
+            .range(prefix.clone()..)
+            .next()
+            .map(|(k, _)| k.starts_with(&prefix))
+            .unwrap_or(false)
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            return Some(FileMetadata {
+                path: path.to_string(),
+                volume_id: String::new(),
+                chunk_size: 0,
+                chunks: Vec::new(),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                symlink_target: None,
+                logical_size: None,
+                is_directory: true,
+            });
+        }
+        None
     }
 }
 
@@ -567,10 +639,26 @@ fn apply_request(
             volume_id,
             chunk_size,
         } => {
+            // Bug A — normalize the storage key. FUSE's `mkdir` historically
+            // signals "create a directory entry" by appending a trailing
+            // slash. The SM used to store that verbatim under "/foo/", which
+            // then made `getattr("/foo")` (the canonical lookup) return
+            // ENOENT. We now strip the slash and set `is_directory = true`,
+            // so the canonical key matches subsequent lookups while the
+            // semantic intent is preserved on the entry.
+            //
+            // Regression test: posix_path_regression::
+            //   bug_a_mkdir_trailing_slash_is_lookup_able_without_slash.
+            let is_dir = path.ends_with('/') && path != "/";
+            let canonical = if is_dir {
+                path.trim_end_matches('/').to_string()
+            } else {
+                path.clone()
+            };
             sm.files.insert(
-                path.clone(),
+                canonical.clone(),
                 FileMetadata {
-                    path: path.clone(),
+                    path: canonical.clone(),
                     volume_id: volume_id.clone(),
                     chunk_size: *chunk_size,
                     chunks: Vec::new(),
@@ -578,11 +666,18 @@ fn apply_request(
                     updated_at_ms: now_ms,
                     symlink_target: None,
                     logical_size: None,
+                    is_directory: is_dir,
                 },
             );
-            push_audit_capped(&mut sm.audit_log, audit(format!("CreateFile: {path}")));
+            push_audit_capped(
+                &mut sm.audit_log,
+                audit(format!(
+                    "CreateFile: {canonical}{}",
+                    if is_dir { " (directory)" } else { "" }
+                )),
+            );
             ClientResponse::FileCreated {
-                path: path.clone(),
+                path: canonical,
                 volume_id: volume_id.clone(),
             }
         }
@@ -795,6 +890,7 @@ fn apply_request(
                     updated_at_ms: now_ms,
                     symlink_target: Some(target.clone()),
                     logical_size: Some(target.len() as u64),
+                    is_directory: false,
                 },
             );
             push_audit_capped(
@@ -1095,6 +1191,7 @@ mod snapshot_persistence_tests {
                 updated_at_ms: 1,
                 symlink_target: None,
                 logical_size: None,
+                is_directory: false,
             },
         );
         data.cluster_config.version = 7;
@@ -1191,5 +1288,221 @@ mod snapshot_persistence_tests {
         let data = reopened.data.read().await;
         assert_eq!(data.files.len(), 1);
         assert_eq!(data.cluster_config.version, 7);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for three live-lab bugs uncovered during the 2026-05-18
+// soak recovery (see tests/proxmox/SOAK-RECOVERY-2026-05-18.md):
+//
+//   Bug A — empty `mkdir` doesn't persist as a lookup-able directory. FUSE
+//           sends `CreateFile("/foo/")` (with a trailing slash to signal
+//           "directory") but the state machine stores the entry verbatim
+//           under key `"/foo/"`. Subsequent `getattr("/foo")` (no slash)
+//           returns ENOENT because the canonical lookup key doesn't match.
+//
+//   Bug B — synthetic directories from existing file paths are not
+//           lookup-able. `readdir("/")` correctly shows "foo" as a directory
+//           when `sm.files` contains "/foo/bar.txt", but `lookup("/foo")`
+//           returns ENOENT because no entry literally exists at "/foo".
+//           Symptom: rsync mkdirs a folder, writes a file, then mkstemp()
+//           in the same folder fails because the parent dir "disappears".
+//
+//   Bug C — rename of a freshly-created (chunkless) file is lost. FUSE
+//           creates "/dir/.tmp" via `CreateFile`, writes data through
+//           `UpdateChunkLocations`, then `RenameFile("/dir/.tmp",
+//           "/dir/final")`. Without bug A's fix, the directory the file
+//           lives in is fragile; the rename has been observed to leave the
+//           cluster in a state where neither the old nor the new key is
+//           lookup-able. The fix is verifiable with a pure state-machine
+//           round-trip.
+//
+// All three tests are written to FAIL against the current code so the fix
+// is verifiable. They are kept in their own module so the existing
+// snapshot tests are unaffected.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod posix_path_regression {
+    use super::*;
+
+    fn mk_log_id(idx: u64) -> LogId {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        openraft::LogId::new(leader, idx)
+    }
+
+    /// Bug A — `mkdir("/foo")` arrives at the state machine as
+    /// `CreateFile { path: "/foo/" }`. After apply, the directory MUST be
+    /// looked-up-able under the canonical key `"/foo"` and MUST advertise
+    /// itself as a directory.
+    #[test]
+    fn bug_a_mkdir_trailing_slash_is_lookup_able_without_slash() {
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::CreateFile {
+                path: "/corpus/".into(),
+                volume_id: "default".into(),
+                chunk_size: 128 * 1024 * 1024,
+            },
+        );
+
+        // Canonical lookup key must exist (no trailing slash).
+        assert!(
+            sm.files.contains_key("/corpus"),
+            "directory must be findable by canonical path /corpus (got keys: {:?})",
+            sm.files.keys().collect::<Vec<_>>(),
+        );
+        let meta = sm.files.get("/corpus").expect("just asserted");
+        assert!(
+            meta.is_directory,
+            "FileMetadata for an empty mkdir must set is_directory=true"
+        );
+        assert!(
+            meta.chunks.is_empty(),
+            "directory entry has no chunks"
+        );
+    }
+
+    /// Bug A (corollary) — a regular file create must NOT be marked as a
+    /// directory, even though it also has empty chunks at create time.
+    #[test]
+    fn bug_a_regular_create_is_not_a_directory() {
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::CreateFile {
+                path: "/foo/bar.txt".into(),
+                volume_id: "default".into(),
+                chunk_size: 1024,
+            },
+        );
+        let meta = sm
+            .files
+            .get("/foo/bar.txt")
+            .expect("file must exist at its canonical path");
+        assert!(
+            !meta.is_directory,
+            "regular file must not be tagged as a directory"
+        );
+    }
+
+    /// Bug B — readdir on "/foo" should be lookup-able once any file
+    /// exists under that prefix, even if no explicit mkdir was ever done.
+    /// This models rsync's pattern: it writes ".plexmatch" directly under
+    /// "/series/" without an mkdir, then tries to mkstemp another file in
+    /// the same "directory" and the parent lookup fails.
+    ///
+    /// The state machine exposes a `lookup_path` helper (added by the fix)
+    /// that returns Some(...) for canonical paths AND for synthetic
+    /// directories implied by existing file paths.
+    #[test]
+    fn bug_b_synthetic_directory_is_lookup_able() {
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(3),
+            &ClientRequest::CreateFile {
+                path: "/series/episode-01.mkv".into(),
+                volume_id: "default".into(),
+                chunk_size: 128 * 1024 * 1024,
+            },
+        );
+
+        // The episode file itself looks up fine.
+        let f = sm
+            .lookup_path("/series/episode-01.mkv")
+            .expect("explicit file path looks up");
+        assert!(!f.is_directory);
+
+        // The implicit parent directory MUST also be lookup-able.
+        let dir = sm
+            .lookup_path("/series")
+            .expect("synthetic parent directory must lookup, but it returned None");
+        assert!(
+            dir.is_directory,
+            "synthetic parent must report is_directory=true"
+        );
+    }
+
+    /// Bug C — rename of a freshly-created file (with chunks already
+    /// recorded via UpdateChunkLocations) must atomically move the
+    /// metadata to the new key, and the old key must no longer be present.
+    #[test]
+    fn bug_c_rename_after_create_moves_metadata_to_new_key() {
+        let mut sm = StateMachineData::default();
+        // Step 1: rsync mkstemp -- create the temp file.
+        apply_request(
+            &mut sm,
+            &mk_log_id(4),
+            &ClientRequest::CreateFile {
+                path: "/movies/.foo.GQhlto".into(),
+                volume_id: "default".into(),
+                chunk_size: 128 * 1024 * 1024,
+            },
+        );
+        // Step 2: rsync writes data; chunk locations land via UpdateChunkLocations.
+        apply_request(
+            &mut sm,
+            &mk_log_id(5),
+            &ClientRequest::UpdateChunkLocations {
+                path: "/movies/.foo.GQhlto".into(),
+                chunks: vec![ChunkLocationEntry {
+                    chunk_index: 0,
+                    chunk_hash: "abc123".into(),
+                    node_id: "10".into(),
+                    disk_id: 0,
+                    size_bytes: 4096,
+                }],
+            },
+        );
+        // Sanity: the temp file is fully formed.
+        let before = sm
+            .files
+            .get("/movies/.foo.GQhlto")
+            .expect("temp file present before rename");
+        assert_eq!(before.chunks.len(), 1);
+
+        // Step 3: rsync renames temp -> final.
+        let resp = apply_request(
+            &mut sm,
+            &mk_log_id(6),
+            &ClientRequest::RenameFile {
+                from: "/movies/.foo.GQhlto".into(),
+                to: "/movies/foo.mkv".into(),
+            },
+        );
+        assert!(
+            matches!(resp, ClientResponse::Success),
+            "rename must succeed for a freshly-created+written file"
+        );
+
+        // Old key is gone; new key exists with the same chunks; the
+        // FileMetadata.path field reflects the new name.
+        assert!(
+            !sm.files.contains_key("/movies/.foo.GQhlto"),
+            "old key must be removed after rename"
+        );
+        let after = sm
+            .files
+            .get("/movies/foo.mkv")
+            .expect("new key must exist after rename");
+        assert_eq!(after.path, "/movies/foo.mkv");
+        assert_eq!(
+            after.chunks.len(),
+            1,
+            "chunk locations carried over by rename"
+        );
+        assert_eq!(after.chunks[0].chunk_hash, "abc123");
+
+        // And the parent directory is still lookup-able (Bug B linkage —
+        // synthetic dirs survive a rename of any child).
+        let parent = sm
+            .lookup_path("/movies")
+            .expect("parent dir lookup after rename");
+        assert!(parent.is_directory);
     }
 }

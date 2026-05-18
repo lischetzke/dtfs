@@ -271,6 +271,11 @@ message GetFileLocationsResponse {
   // FUSE client can return real mtime/ctime via getattr (fix for F-014).
   int64 created_at_ms = 5;
   int64 modified_at_ms = 6;
+  // Whether this path is a directory (either an explicit mkdir entry or a
+  // synthetic one inferred from existing files under the prefix). Fixes
+  // the "mkdir then stat returns ENOENT" bug seen during the 2026-05-18
+  // soak recovery (SOAK-RECOVERY-2026-05-18.md, bugs A & B).
+  bool is_directory = 7;
 }
 
 // --- DeleteFile ---

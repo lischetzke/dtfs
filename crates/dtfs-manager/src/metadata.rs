@@ -192,9 +192,13 @@ impl ManagerService for MetadataService {
         let req = request.into_inner();
 
         let data = self.sm_data.read().await;
+        // Use the canonical lookup helper so empty `mkdir` entries and
+        // synthetic directories (paths implied by existing children) both
+        // resolve. Without this, `getattr("/foo")` returned ENOENT even
+        // when files existed under `/foo/`, breaking rsync mkstemp inside
+        // freshly-written directories.
         let file = data
-            .files
-            .get(&req.path)
+            .lookup_path(&req.path)
             .ok_or_else(|| Status::not_found("File not found"))?;
 
         // Group replicas by chunk_index (not chunk_hash) so that two distinct
@@ -236,6 +240,7 @@ impl ManagerService for MetadataService {
             // mtime/ctime via getattr (fix for F-014).
             created_at_ms: file.created_at_ms as i64,
             modified_at_ms: file.updated_at_ms as i64,
+            is_directory: file.is_directory,
         }))
     }
 
