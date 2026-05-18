@@ -121,9 +121,17 @@ impl std::fmt::Display for LeaseBusy {
 impl std::error::Error for LeaseBusy {}
 
 /// Lease parameters (P0-1).
-/// Default lease is 15s; FUSE renews at half-life (7.5s elapsed).
-pub(crate) const WRITE_LEASE_MS: u64 = 15_000;
-pub(crate) const WRITE_LEASE_RENEW_AFTER_MS: u64 = 7_000;
+///
+/// 15s was too tight in practice: a multi-GB streaming write through FUSE
+/// only renews the lease on `flush`, so the lease expires mid-flush on
+/// files larger than ~1 GB at ~100 MB/s. We bump to 120s so a single
+/// chunk write (128 MB) plus any FUSE buffering latency can never burn the
+/// whole budget. Renewal at half-life (60s) gives ample headroom even with
+/// network jitter and slow data nodes. P2-x: replace this with a per-fh
+/// background renewer task so the lease is held as long as the handle is
+/// open, regardless of write tempo.
+pub(crate) const WRITE_LEASE_MS: u64 = 120_000;
+pub(crate) const WRITE_LEASE_RENEW_AFTER_MS: u64 = 60_000;
 
 /// An open file handle with its associated state.
 struct OpenFile {
@@ -698,6 +706,15 @@ impl DtfsFilesystem {
 
         let path = file.path.clone();
         let append = file.append;
+        // P0-1 follow-up: a streaming write of a multi-GB file can hold the
+        // file open for longer than WRITE_LEASE_MS without ever calling
+        // flush — and the original flush-only renewal then sees the lease
+        // already swept by manager GC and aborts the close with
+        // "write lease lost". Renew proactively from here too: cheap because
+        // the renewal only fires once per half-life window, and the manager
+        // dedups same-token renewals.
+        let lease_id_for_renew = file.lease_id.clone();
+        let lease_expires_for_renew = file.lease_expires_at_ms;
         // For O_APPEND we ignore the kernel-supplied offset and target the
         // *current* end of file. Use the cached file size; the buffer may
         // already have unflushed data, in which case the buffer reports a
@@ -797,6 +814,52 @@ impl DtfsFilesystem {
         let segments = self.write_buffer.flush(&path);
         if !segments.is_empty() {
             self.flush_segments_to_cluster(&path, &segments).await?;
+        }
+
+        // Renew the write lease mid-stream so a long-running streaming
+        // write (multi-GB file, rsync over slow uplink) doesn't lose its
+        // lease before flush has a chance to renew it. Renews at most once
+        // per half-life window — manager dedups same-token renewals.
+        if let (Some(lease_id), Some(expires_at_ms)) =
+            (lease_id_for_renew, lease_expires_for_renew)
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let remaining = expires_at_ms.saturating_sub(now_ms);
+            if remaining < (WRITE_LEASE_MS - WRITE_LEASE_RENEW_AFTER_MS) {
+                match self
+                    .client
+                    .renew_write_lease(&path, &lease_id, WRITE_LEASE_MS)
+                    .await
+                {
+                    Ok(resp) if resp.granted => {
+                        if let Some(mut entry) = self.open_files.get_mut(&fh) {
+                            entry.value_mut().lease_expires_at_ms =
+                                Some(resp.new_expires_at_ms);
+                        }
+                    }
+                    Ok(_) => {
+                        // Lease lost — abort writes so we don't corrupt
+                        // another writer's data. The buffered bytes from
+                        // this call have already been accepted, but the
+                        // caller will see the error and stop pushing more.
+                        bail!(
+                            "write lease lost for {path} during streaming write"
+                        );
+                    }
+                    Err(e) => {
+                        // Manager unreachable. Continue best-effort; the
+                        // existing lease may still be valid until GC.
+                        tracing::debug!(
+                            path = %path,
+                            error = %e,
+                            "lease renew during write failed (non-fatal until expiry)"
+                        );
+                    }
+                }
+            }
         }
 
         debug!(
