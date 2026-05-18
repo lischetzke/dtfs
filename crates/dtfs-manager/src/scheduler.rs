@@ -123,7 +123,36 @@ impl TaskScheduler {
 
     /// A single scheduler tick: find under-replicated chunks and advance
     /// in-progress migration tasks.
+    ///
+    /// Bug AC — leader-gated. Followers' Raft writes silently forward to
+    /// the leader (or fail entirely when leader is unknown). Running the
+    /// scheduler on every manager wastes effort: 3 managers all
+    /// independently call `ReplicateChunk` on the source data node for
+    /// the same chunk, all observe success, all try to write
+    /// UpdateChunkLocations — only the leader's write commits, the
+    /// others silently fail. This caused the per-task 3x amplification
+    /// during Bug AB diagnosis. Skipping on followers also means a
+    /// leader-loss event freezes scheduler work cleanly (no
+    /// half-finished state on stale followers) until the next election.
     async fn tick(&self) -> anyhow::Result<()> {
+        // Skip on followers — only the current leader drives migrations.
+        // openraft's metrics watch is a Receiver — borrow_watched gives
+        // a borrow without consuming the receiver.
+        use openraft::async_runtime::watch::WatchReceiver;
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        let self_id = metrics.id;
+        let is_leader = metrics
+            .current_leader
+            .map(|leader| leader == self_id)
+            .unwrap_or(false);
+        if !is_leader {
+            tracing::trace!(
+                "Scheduler tick skipped: not leader (current_leader={:?})",
+                metrics.current_leader
+            );
+            return Ok(());
+        }
+
         let mut migration_state = self.load_migration_state().await;
 
         // 1. Check for under-replicated chunks and schedule new tasks.

@@ -56,6 +56,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Cluster
         .route("/api/v1/cluster/status", get(cluster_status))
         .route("/api/v1/health", get(health_check))
+        // Bug AC — Raft state introspection. Surfaces openraft's own
+        // view of leadership/term/replication so operators can diagnose
+        // split-brain or stuck-follower conditions WITHOUT having to
+        // grep journald for "ForwardToLeader: None, None". Critical for
+        // multi-DC clusters where Raft can silently lose quorum.
+        .route("/api/v1/raft/state", get(raft_state))
         // Nodes
         .route("/api/v1/nodes", get(list_nodes))
         .route("/api/v1/nodes/{node_id}", get(get_node))
@@ -124,6 +130,89 @@ pub async fn run_api_server(
 // ---------------------------------------------------------------------------
 // Cluster endpoints
 // ---------------------------------------------------------------------------
+
+/// Bug AC — Raft state introspection endpoint.
+///
+/// Returns openraft's view of the cluster's consensus state so that
+/// operators can answer "who's the leader?" and "is this manager
+/// caught up?" without parsing log lines. Mirrors what the openraft
+/// Watch<RaftMetrics> publishes internally.
+///
+/// Output (example for a healthy follower):
+/// ```json
+/// {
+///   "node_id": "12709699821947187762",
+///   "hostname": "mgr01",
+///   "running_state": "ok",
+///   "state": "Follower",
+///   "is_leader": false,
+///   "current_term": 18,
+///   "current_leader": "15786580940693171021",
+///   "vote_term": 18,
+///   "vote_committed": true,
+///   "last_log_index": 4521,
+///   "last_applied_index": 4521,
+///   "applied_log_lag": 0,
+///   "snapshot_index": 4000,
+///   "voters": ["12709...", "15786...", "5766..."],
+///   "millis_since_quorum_ack": null
+/// }
+/// ```
+///
+/// Critical fields for diagnostics:
+/// - `current_leader = null` means quorum is currently lost.
+/// - `applied_log_lag > 0` on a follower means it's behind the leader.
+/// - `is_leader = false && current_leader != null` is the healthy
+///   follower state.
+async fn raft_state(State(state): State<Arc<AppState>>) -> Json<Value> {
+    use openraft::async_runtime::watch::WatchReceiver;
+    let metrics = state.raft.metrics().borrow_watched().clone();
+    let running_state = match &metrics.running_state {
+        Ok(()) => "ok".to_string(),
+        Err(e) => format!("fatal: {e}"),
+    };
+    let last_log_index = metrics.last_log_index.unwrap_or(0);
+    let last_applied_index = metrics
+        .last_applied
+        .as_ref()
+        .map(|l| l.index)
+        .unwrap_or(0);
+    let applied_log_lag = last_log_index.saturating_sub(last_applied_index);
+    let voters: Vec<String> = metrics
+        .membership_config
+        .membership()
+        .voter_ids()
+        .map(|id| id.to_string())
+        .collect();
+    let self_node_id = metrics.id;
+    let is_leader = metrics
+        .current_leader
+        .map(|leader| leader == self_node_id)
+        .unwrap_or(false);
+    Json(json!({
+        "node_id": self_node_id.to_string(),
+        "hostname": state.config.node.hostname,
+        "running_state": running_state,
+        "state": format!("{:?}", metrics.state),
+        "is_leader": is_leader,
+        "current_term": metrics.current_term,
+        "current_leader": metrics
+            .current_leader
+            .map(|l| l.to_string()),
+        "vote_term": format!("{:?}", metrics.vote.leader_id()),
+        "vote_committed": metrics.vote.is_committed(),
+        "last_log_index": last_log_index,
+        "last_applied_index": last_applied_index,
+        "applied_log_lag": applied_log_lag,
+        "snapshot_index": metrics
+            .snapshot
+            .as_ref()
+            .map(|l| l.index)
+            .unwrap_or(0),
+        "voters": voters,
+        "millis_since_quorum_ack": metrics.millis_since_quorum_ack,
+    }))
+}
 
 async fn cluster_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let sm = state.sm_data.read().await;
