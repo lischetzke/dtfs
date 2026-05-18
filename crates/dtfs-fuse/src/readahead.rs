@@ -87,6 +87,12 @@ pub struct ReadAheadEngine {
     cache: Arc<DashMap<String, Bytes>>,
     /// Maximum number of cached entries before eviction starts.
     max_cache_entries: usize,
+    /// P0-11 / "next episode survives" — when set, prefetched chunks are
+    /// also mirrored into the persistent disk cache so they survive
+    /// in-memory eviction, FUSE restart, and scanner storms. Setting an
+    /// initial atime on the disk-cache entry keeps the next-episode
+    /// chunks near the top of the size-LRU.
+    local_cache: parking_lot::RwLock<Option<Arc<crate::local_cache::LocalChunkCache>>>,
 }
 
 impl ReadAheadEngine {
@@ -98,7 +104,14 @@ impl ReadAheadEngine {
             pending: Arc::new(DashMap::new()),
             cache: Arc::new(DashMap::new()),
             max_cache_entries,
+            local_cache: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Attach a disk-backed cache. Prefetched chunks will be mirrored to
+    /// it after a successful fetch.
+    pub fn set_local_cache(&self, cache: Arc<crate::local_cache::LocalChunkCache>) {
+        *self.local_cache.write() = Some(cache);
     }
 
     /// Called when a chunk is read. Triggers background prefetch of upcoming
@@ -217,6 +230,7 @@ impl ReadAheadEngine {
         let cache = Arc::clone(&self.cache);
         let pending_key = key.clone();
         let pending_ref = Arc::clone(&self.pending);
+        let local_cache = self.local_cache.read().clone();
 
         let handle = tokio::spawn(async move {
             match client.read_chunk(&node_addr, &chunk_id).await {
@@ -227,7 +241,19 @@ impl ReadAheadEngine {
                         size = data.len(),
                         "readahead prefetch complete"
                     );
-                    cache.insert(pending_key.clone(), data);
+                    cache.insert(pending_key.clone(), data.clone());
+                    // Mirror to disk cache so the prefetched chunk
+                    // survives in-mem eviction + FUSE restart. Best-
+                    // effort; disk-cache failures are logged, not fatal.
+                    if let Some(lc) = local_cache {
+                        if let Err(e) = lc.put(&chunk_id, &data).await {
+                            debug!(
+                                chunk_id = %chunk_id,
+                                error = %e,
+                                "readahead disk-cache mirror failed (non-fatal)"
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     // Prefetch failures are non-fatal — the read path will
