@@ -255,6 +255,11 @@ impl DtfsFilesystem {
         &mut self,
         cache: std::sync::Arc<crate::local_cache::LocalChunkCache>,
     ) {
+        // Also wire the disk cache into the readahead engine so its
+        // prefetched chunks (e.g. next-episode warm-up in folder mode)
+        // mirror into persistent storage. Without this, the prefetch's
+        // benefit dies the moment the in-memory ring evicts the entry.
+        self.readahead.set_local_cache(cache.clone());
         self.local_cache = Some(cache);
     }
 
@@ -542,7 +547,13 @@ impl DtfsFilesystem {
             // accessed in the last 90 days).
             if chunk_data.is_none() {
                 if let Some(lc) = &self.local_cache {
-                    if let Some(cached) = lc.get(&chunk.chunk_id).await {
+                    // `size` is the kernel's requested read length for this
+                    // call. Pass it as bytes_hint so the cache can
+                    // distinguish viewer reads (refresh atime) from scanner
+                    // reads (preserve last-viewer atime for LRU).
+                    if let Some(cached) =
+                        lc.get(&chunk.chunk_id, size as usize).await
+                    {
                         debug!(chunk_id = %chunk.chunk_id, "local-disk cache hit");
                         chunk_data = Some(cached);
                     }

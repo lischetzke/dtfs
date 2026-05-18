@@ -1,24 +1,23 @@
-// P0-11: disk-backed FUSE chunk cache with size + age eviction.
+// P0-11: disk-backed FUSE chunk cache with size + (optional) age eviction.
 //
-// Sits between the in-memory readahead and the network fetch. Chunks are
-// stored in `<dir>/aa/bb/<chunk_id>.dat` (mirroring the data-node sharding)
-// and an in-memory index tracks total size + per-entry mtime so eviction
-// is O(log N) by either dimension.
+// Design intent for media workloads:
+//   * Primary eviction is SIZE-based, oldest-atime-first (LRU).
+//   * Age TTL is a SAFETY UPPER BOUND, defaulting to 90 days. Operators
+//     can set it to None to disable time-based eviction entirely.
+//   * Scanner-style reads (Plex library scan: stat + tiny header read)
+//     must NOT refresh the LRU position of a chunk, or they'd make every
+//     touched chunk look "recently used" and defeat eviction. We only
+//     bump atime when the caller is reading a substantial slice of the
+//     chunk (>= `ATIME_UPDATE_MIN_BYTES`); small reads return the cached
+//     bytes without touching atime so the next eviction sees the true
+//     last-viewer access time.
+//   * Readahead-mirrored chunks (next-episode prefetches) DO get a fresh
+//     atime via `put` so they sit near the top of the LRU and survive
+//     scanner activity in between viewings.
 //
 // Atomic writes: a torn write would poison the cache, so each entry is
 // written to `<...>.partial`, fsynced, and renamed. Reads only look at
 // `.dat` files so partial writes are never observed.
-//
-// Eviction:
-//   * Size: when total bytes exceeds `max_bytes`, drop entries by oldest
-//     mtime until under threshold.
-//   * Age: a background pruner walks the cache periodically and deletes
-//     entries whose `atime` is older than `max_age` (None = no TTL).
-//
-// Atime tracking: on every cache hit we set the file's atime via
-// `filetime::set_file_atime`. The age pruner reads each file's atime to
-// decide eviction so chunks that are actively being read are NEVER evicted
-// even if their original write time is past max_age.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +28,12 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use tokio::fs as tfs;
 use tokio::io::AsyncWriteExt;
+
+/// Reads below this byte count don't refresh the cached chunk's atime
+/// (scanner/header-only access). Set to 1 MiB by default: a Plex library
+/// scanner typically reads just the file header (a few hundred KB) while
+/// a media playback session pulls megabytes of contiguous data.
+pub const ATIME_UPDATE_MIN_BYTES: usize = 1024 * 1024;
 
 /// One disk-backed chunk cache.
 pub struct LocalChunkCache {
@@ -126,20 +131,61 @@ impl LocalChunkCache {
         self.dir.join(aa).join(bb).join(format!("{chunk_id}.dat"))
     }
 
-    /// Retrieve a cached chunk. Updates the file's atime so the age-pruner
-    /// keeps actively-read chunks even past the TTL.
-    pub async fn get(&self, chunk_id: &str) -> Option<Bytes> {
+    /// Retrieve a cached chunk WITHOUT updating its LRU position.
+    /// Use this for scanner-style accesses (header reads, stat-walks).
+    ///
+    /// Note: `tokio::fs::read()` triggers an OS-level atime update on
+    /// most filesystems. We capture the pre-read atime + restore it
+    /// after, so scanner reads truly leave the LRU position alone.
+    pub async fn peek(&self, chunk_id: &str) -> Option<Bytes> {
         let path = self.path_for(chunk_id);
         if !path.exists() {
             return None;
         }
+        let pre = tfs::metadata(&path).await.ok().and_then(|m| m.accessed().ok());
         let data = match tfs::read(&path).await {
             Ok(d) => d,
             Err(_) => return None,
         };
-        // Update atime on success.
-        let now = SystemTime::now();
-        let _ = filetime::set_file_atime(&path, filetime::FileTime::from_system_time(now));
+        if let Some(t) = pre {
+            // Restore the pre-read atime so the OS read-side update
+            // doesn't leak into LRU ordering.
+            let _ = filetime::set_file_atime(&path, filetime::FileTime::from_system_time(t));
+        }
+        Some(Bytes::from(data))
+    }
+
+    /// Retrieve a cached chunk and (conditionally) refresh its atime so
+    /// the size-based LRU eviction sees it as recently used.
+    ///
+    /// `bytes_hint` is the byte count the caller intends to consume from
+    /// this fetch. If `bytes_hint >= ATIME_UPDATE_MIN_BYTES` we treat the
+    /// read as a "view" event and bump atime to now. Otherwise it's a
+    /// scanner read and we explicitly RESTORE the pre-read atime — the
+    /// OS auto-updates atime on read() so without the restore even
+    /// scanner reads would refresh LRU position and defeat the design.
+    pub async fn get(&self, chunk_id: &str, bytes_hint: usize) -> Option<Bytes> {
+        let path = self.path_for(chunk_id);
+        if !path.exists() {
+            return None;
+        }
+        let pre = tfs::metadata(&path).await.ok().and_then(|m| m.accessed().ok());
+        let data = match tfs::read(&path).await {
+            Ok(d) => d,
+            Err(_) => return None,
+        };
+        if bytes_hint >= ATIME_UPDATE_MIN_BYTES {
+            // Viewer read — set atime to now.
+            let now = SystemTime::now();
+            let _ = filetime::set_file_atime(
+                &path,
+                filetime::FileTime::from_system_time(now),
+            );
+        } else if let Some(t) = pre {
+            // Scanner read — restore pre-read atime so LRU position
+            // stays anchored to last VIEWER access.
+            let _ = filetime::set_file_atime(&path, filetime::FileTime::from_system_time(t));
+        }
         Some(Bytes::from(data))
     }
 
@@ -185,23 +231,63 @@ impl LocalChunkCache {
         Ok(())
     }
 
-    /// Evict entries (oldest first) until total_bytes ≤ max_bytes.
+    /// Evict entries until total_bytes ≤ max_bytes, oldest atime first.
+    ///
+    /// We deliberately query each candidate's actual file atime rather
+    /// than rely on the in-memory `lru` BTreeMap's insertion order:
+    /// atime is what `get()` updates on viewer reads (and intentionally
+    /// does NOT update on scanner reads), so the on-disk atime is the
+    /// authoritative source of truth for "most recently viewed". This
+    /// makes LRU robust to scanner storms — a Plex library walk doesn't
+    /// move recently-viewed chunks toward eviction.
     async fn evict_to_size(&self) {
         while self.total_bytes.load(Ordering::Relaxed) > self.max_bytes {
-            // Pop the oldest entry.
-            let (key, chunk_id) = {
-                let mut lru = self.lru.write();
-                match lru.pop_first() {
-                    Some((k, v)) => (k, v),
-                    None => break,
+            // Build a snapshot of (atime, chunk_id) for everything we
+            // know about, pick the oldest, and drop it.
+            let ids: Vec<String> = self.sizes.iter().map(|e| e.key().clone()).collect();
+            if ids.is_empty() {
+                break;
+            }
+            let mut oldest: Option<(SystemTime, String, u64)> = None;
+            for id in &ids {
+                let path = self.path_for(id);
+                let meta = match tfs::metadata(&path).await {
+                    Ok(m) => m,
+                    Err(_) => {
+                        // File missing under our tracking; drop from index.
+                        self.sizes.remove(id);
+                        continue;
+                    }
+                };
+                let atime = meta.accessed().unwrap_or(UNIX_EPOCH);
+                let len = meta.len();
+                if oldest.as_ref().map_or(true, |(ta, _, _)| atime < *ta) {
+                    oldest = Some((atime, id.clone(), len));
                 }
+            }
+            let (_, chunk_id, len) = match oldest {
+                Some(v) => v,
+                None => break,
             };
-            let _ = key;
             let path = self.path_for(&chunk_id);
-            if let Ok(meta) = tfs::metadata(&path).await {
-                let _ = tfs::remove_file(&path).await;
-                self.total_bytes.fetch_sub(meta.len(), Ordering::Relaxed);
+            if tfs::remove_file(&path).await.is_ok() {
+                self.total_bytes.fetch_sub(len, Ordering::Relaxed);
                 self.sizes.remove(&chunk_id);
+                // Also drop any matching entry from the in-memory `lru`
+                // map (best-effort housekeeping; the map is no longer
+                // authoritative but we keep it tidy).
+                let mut lru = self.lru.write();
+                let stale: Vec<u64> = lru
+                    .iter()
+                    .filter(|(_, v)| **v == chunk_id)
+                    .map(|(k, _)| *k)
+                    .collect();
+                for k in stale {
+                    lru.remove(&k);
+                }
+            } else {
+                // Couldn't remove; bail to avoid an infinite loop.
+                break;
             }
         }
     }
@@ -290,10 +376,147 @@ mod tests {
         let id = chunk_id(1);
         let data = vec![42u8; 4096];
         cache.put(&id, &data).await.unwrap();
-        let got = cache.get(&id).await.unwrap();
+        let got = cache.get(&id, data.len()).await.unwrap();
         assert_eq!(got.as_ref(), &data[..]);
         assert_eq!(cache.current_bytes(), 4096);
         assert_eq!(cache.entry_count(), 1);
+    }
+
+    /// Regression: scanner-style reads (small bytes_hint) MUST NOT
+    /// refresh the cached chunk's atime — otherwise a Plex library walk
+    /// would make every chunk look recently accessed and the size LRU
+    /// would evict the wrong things.
+    #[tokio::test]
+    async fn scanner_read_does_not_update_atime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = LocalChunkCache::new(
+            tmp.path().to_path_buf(),
+            10 * 1024 * 1024,
+            None,
+        )
+        .await
+        .unwrap();
+        let id = chunk_id(1);
+        cache.put(&id, &vec![1u8; 4096]).await.unwrap();
+
+        // Read the atime right after put.
+        let path = cache.path_for(&id);
+        let atime_before = tfs::metadata(&path)
+            .await
+            .unwrap()
+            .accessed()
+            .unwrap();
+
+        // Wait so the comparison is meaningful, then do a "scanner" read.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = cache
+            .get(&id, /* bytes_hint */ 64 * 1024)
+            .await
+            .expect("scanner read still returns data");
+
+        let atime_after = tfs::metadata(&path)
+            .await
+            .unwrap()
+            .accessed()
+            .unwrap();
+        assert_eq!(
+            atime_before, atime_after,
+            "scanner-sized read (< ATIME_UPDATE_MIN_BYTES) must not bump atime"
+        );
+    }
+
+    /// Viewer-style reads (>= ATIME_UPDATE_MIN_BYTES) DO refresh atime so
+    /// the chunk stays at the top of the size-LRU.
+    #[tokio::test]
+    async fn viewer_read_updates_atime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = LocalChunkCache::new(
+            tmp.path().to_path_buf(),
+            10 * 1024 * 1024,
+            None,
+        )
+        .await
+        .unwrap();
+        let id = chunk_id(1);
+        cache.put(&id, &vec![1u8; 4096]).await.unwrap();
+
+        let path = cache.path_for(&id);
+        let atime_before = tfs::metadata(&path).await.unwrap().accessed().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let _ = cache
+            .get(&id, /* bytes_hint */ ATIME_UPDATE_MIN_BYTES + 1)
+            .await
+            .expect("viewer read returns data");
+
+        let atime_after = tfs::metadata(&path).await.unwrap().accessed().unwrap();
+        assert!(
+            atime_after > atime_before,
+            "viewer-sized read should bump atime"
+        );
+    }
+
+    /// peek() never updates atime, regardless of bytes_hint.
+    #[tokio::test]
+    async fn peek_never_updates_atime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = LocalChunkCache::new(
+            tmp.path().to_path_buf(),
+            10 * 1024 * 1024,
+            None,
+        )
+        .await
+        .unwrap();
+        let id = chunk_id(1);
+        cache.put(&id, &vec![1u8; 4096]).await.unwrap();
+        let path = cache.path_for(&id);
+        let atime_before = tfs::metadata(&path).await.unwrap().accessed().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = cache.peek(&id).await.unwrap();
+        let atime_after = tfs::metadata(&path).await.unwrap().accessed().unwrap();
+        assert_eq!(atime_before, atime_after);
+    }
+
+    /// Size-eviction LRU uses atime, not insertion order. After a scanner
+    /// reads a chunk, it must still be the eviction candidate if it was
+    /// the oldest VIEWER access — i.e. scanner reads on chunk-1 don't
+    /// save it from eviction when chunk-2/3/4 are real viewer reads.
+    #[tokio::test]
+    async fn size_eviction_uses_viewer_atime_not_scanner() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Cap at 10 KB — first put fills it. Fifth put evicts oldest.
+        let cache = LocalChunkCache::new(tmp.path().to_path_buf(), 10_000, None)
+            .await
+            .unwrap();
+
+        cache.put(&chunk_id(1), &vec![1u8; 2500]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cache.put(&chunk_id(2), &vec![2u8; 2500]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cache.put(&chunk_id(3), &vec![3u8; 2500]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cache.put(&chunk_id(4), &vec![4u8; 2500]).await.unwrap();
+
+        // Scanner reads chunk 1 (smallest read). atime stays old.
+        let _ = cache.get(&chunk_id(1), 32 * 1024).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Real viewer reads chunk 2 (refreshes atime).
+        let _ = cache
+            .get(&chunk_id(2), ATIME_UPDATE_MIN_BYTES + 1)
+            .await
+            .unwrap();
+
+        // Now put chunk 5 → eviction must drop the OLDEST viewer atime,
+        // which is chunk 1 (despite the scanner having "touched" it just
+        // before the viewer read of chunk 2).
+        cache.put(&chunk_id(5), &vec![5u8; 2500]).await.unwrap();
+
+        assert!(cache.current_bytes() <= 10_000);
+        // The viewer-warm chunk 2 must survive; the scanner-only chunk 1
+        // must be the one evicted.
+        assert!(cache.peek(&chunk_id(2)).await.is_some(), "viewer-warm chunk must stay");
+        assert!(cache.peek(&chunk_id(1)).await.is_none(), "scanner-only chunk should be evicted");
     }
 
     #[tokio::test]

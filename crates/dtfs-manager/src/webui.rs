@@ -512,11 +512,50 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         document.getElementById('io-write-unit').textContent = wr.unit;
         document.getElementById('file-count').textContent   = stats.file_count ?? 0;
 
+        // ── Tier breakdown
+        renderTierBreakdown(stats.tier_breakdown || []);
+
         // ── Last scrub
         renderScrub(stats.last_scrub);
 
         // ── Nodes table
         renderNodes(nodes);
+    }}
+
+    function renderTierBreakdown(tiers) {{
+        const tbody = document.getElementById('tier-table');
+        if (!tbody) return;
+        if (!tiers.length) {{
+            tbody.innerHTML = '<tr><td colspan="5" class="placeholder">No tier data</td></tr>';
+            return;
+        }}
+        // Order: hot → warm → cold → tape (display order, not alphabetical).
+        const order = {{hot:0, warm:1, cold:2, tape:3}};
+        const sorted = [...tiers].sort((a, b) =>
+            (order[a.tier] ?? 99) - (order[b.tier] ?? 99));
+        let html = '';
+        for (const t of sorted) {{
+            const total = t.total_bytes || 0;
+            const used  = t.used_bytes  || 0;
+            const pct   = total ? Math.round(used / total * 100) : 0;
+            const color = barColor(pct) || 'var(--primary)';
+            const badge = `<span class="badge badge-${{t.tier}}" style="text-transform:capitalize">${{t.tier}}</span>`;
+            html += `<tr>
+                <td style="padding:.4rem">${{badge}}</td>
+                <td style="padding:.4rem">${{t.disks||0}}</td>
+                <td style="padding:.4rem">${{fmtBytes(total)}}</td>
+                <td style="padding:.4rem">${{fmtBytes(used)}}</td>
+                <td style="padding:.4rem">
+                    <div style="display:flex;align-items:center;gap:.5rem">
+                        <div class="progress-bar" style="flex:1">
+                            <div class="progress-fill" style="width:${{pct}}%;background:${{color}}"></div>
+                        </div>
+                        <span style="font-size:.75rem;color:var(--text-muted);min-width:3em;text-align:right">${{pct}}%</span>
+                    </div>
+                </td>
+            </tr>`;
+        }}
+        tbody.innerHTML = html;
     }}
 
     function setHealthBanner(cls, label, detail, right) {{
@@ -726,6 +765,24 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <div style="font-size:.72rem;color:var(--text-muted);margin-top:.1rem">across all volumes</div>
             </div>
         </div>
+        <div class="metric-card" style="margin-top:1rem">
+            <h3>Tier Distribution</h3>
+            <div style="font-size:.72rem;color:var(--text-muted);margin-bottom:.75rem">
+                Capacity and usage per storage tier across all data nodes
+            </div>
+            <table style="width:100%;font-size:.85rem">
+                <thead>
+                    <tr style="text-align:left;border-bottom:1px solid var(--border)">
+                        <th style="padding:.4rem">Tier</th>
+                        <th style="padding:.4rem">Disks</th>
+                        <th style="padding:.4rem">Total</th>
+                        <th style="padding:.4rem">Used</th>
+                        <th style="padding:.4rem;width:40%">Utilisation</th>
+                    </tr>
+                </thead>
+                <tbody id="tier-table"><tr><td colspan="5" class="placeholder">Loading…</td></tr></tbody>
+            </table>
+        </div>
         <div class="scrub-card"><h3>Last Scrub</h3><div id="scrub-content"><div class="scrub-placeholder">No scrub result recorded yet.</div></div></div>
         <div class="table-card">
             <div class="table-card-header">
@@ -765,14 +822,25 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             return;
         }}
 
+        // Helper: sorted entries with locale-aware ASC ordering. Used to
+        // render Region → DC → Rack → Host predictably regardless of the
+        // order nodes happen to register in.
+        const sortedEntries = (obj) =>
+            Object.entries(obj).sort(([a], [b]) =>
+                a.localeCompare(b, undefined, {{sensitivity: 'base', numeric: true}}));
+
         let html = '';
-        for (const [region, dcs] of Object.entries(tree)) {{
+        for (const [region, dcs] of sortedEntries(tree)) {{
             html += `<div class="topo-region"><div class="topo-region-label">🌐 Region: <b>${{region}}</b></div>`;
-            for (const [dc, racks] of Object.entries(dcs)) {{
+            for (const [dc, racks] of sortedEntries(dcs)) {{
                 html += `<div class="topo-dc"><div class="topo-dc-label">🏢 Datacenter: <b>${{dc}}</b></div>`;
-                for (const [rack, rnodes] of Object.entries(racks)) {{
+                for (const [rack, rnodes] of sortedEntries(racks)) {{
                     html += `<div class="topo-rack"><div class="topo-rack-label">🗄 Rack: <b>${{rack}}</b></div><div class="topo-nodes">`;
-                    for (const n of rnodes) {{
+                    // Sort hosts (nodes) inside the rack by hostname ASC.
+                    const sortedNodes = [...rnodes].sort((a, b) =>
+                        (a.hostname || '').localeCompare(b.hostname || '', undefined,
+                            {{sensitivity: 'base', numeric: true}}));
+                    for (const n of sortedNodes) {{
                         const h = (n.health||'unknown').toLowerCase();
                         const role = (n.role||'data').toLowerCase();
                         html += `<div class="topo-node">

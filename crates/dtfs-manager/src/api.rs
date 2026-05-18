@@ -689,16 +689,19 @@ async fn update_config(
 // ---------------------------------------------------------------------------
 
 async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
-    use dtfs_common::types::{HealthStatus, NodeRole};
+    use dtfs_common::types::{DiskTier, HealthStatus, NodeRole};
 
     let sm = state.sm_data.read().await;
 
-    // Count nodes by role.
-    let manager_count = sm
-        .nodes
-        .values()
-        .filter(|n| n.role == NodeRole::Manager)
-        .count();
+    // ---- Node counts -----------------------------------------------------
+    // Managers never register through the data-node heartbeat path so
+    // `sm.nodes` only contains data nodes. The authoritative manager set
+    // is the initial voters list (operator-supplied at bootstrap; matches
+    // the Raft membership after any subsequent add/remove). Using it here
+    // makes `manager_count` consistent with the WebUI's expectation even
+    // though `sm.nodes.values().filter(role==Manager)` is always 0.
+    let manager_count = state.config.cluster.initial_voters.len();
+
     let data_node_count = sm
         .nodes
         .values()
@@ -706,9 +709,76 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         .count();
     let disk_count: usize = sm.nodes.values().map(|n| n.disks.len()).sum();
 
-    // Capacity aggregates.
+    // FUSE clients don't have a registration RPC yet (no client heartbeats);
+    // approximate active clients via the unique hostnames of currently-held
+    // write leases (owner_id format = "<hostname>:<pid>:<fh>"). A read-only
+    // client without an open writer won't appear, but for the soak the
+    // workload generators always have a writer open somewhere. Treat as a
+    // lower bound; sm.client_count remains for forward compatibility when
+    // an explicit client RPC lands.
+    let client_count = {
+        let mut hosts = std::collections::HashSet::new();
+        for lease in sm.write_leases.values() {
+            if let Some(host) = lease.owner_id.split(':').next() {
+                if !host.is_empty() {
+                    hosts.insert(host.to_string());
+                }
+            }
+        }
+        hosts.len() as u64
+    };
+
+    // ---- Capacity aggregates --------------------------------------------
     let raw_total: u64 = sm.nodes.values().map(|n| n.total_capacity).sum();
     let raw_used: u64 = sm.nodes.values().map(|n| n.used_capacity).sum();
+
+    // Per-tier breakdown of capacity + used so the WebUI can show how data
+    // is distributed across hot/warm/cold/tape. Used is currently computed
+    // per-node (not per-disk), so per-tier used is best-effort: we
+    // proportionally split a node's `used_capacity` across its disks by
+    // their capacity share within the node.
+    let mut tier_total: std::collections::HashMap<DiskTier, u64> = Default::default();
+    let mut tier_used: std::collections::HashMap<DiskTier, u64> = Default::default();
+    let mut tier_disks: std::collections::HashMap<DiskTier, u32> = Default::default();
+    for n in sm.nodes.values() {
+        let node_cap: u64 = n.disks.iter().map(|d| d.total_bytes).sum();
+        if node_cap == 0 {
+            continue;
+        }
+        for d in &n.disks {
+            *tier_total.entry(d.tier).or_default() += d.total_bytes;
+            *tier_disks.entry(d.tier).or_default() += 1;
+            // Apportion the node's used_capacity by this disk's share of
+            // the node's total. Loses precision on multi-tier nodes if
+            // usage is uneven across tiers — best signal available until
+            // data nodes start reporting per-disk used in heartbeats.
+            let share = d.total_bytes as f64 / node_cap as f64;
+            *tier_used.entry(d.tier).or_default() +=
+                (n.used_capacity as f64 * share) as u64;
+        }
+    }
+    let tier_breakdown: Vec<Value> = [
+        DiskTier::Hot,
+        DiskTier::Warm,
+        DiskTier::Cold,
+        DiskTier::Tape,
+    ]
+    .iter()
+    .map(|t| {
+        let label = match t {
+            DiskTier::Hot => "hot",
+            DiskTier::Warm => "warm",
+            DiskTier::Cold => "cold",
+            DiskTier::Tape => "tape",
+        };
+        json!({
+            "tier":  label,
+            "disks": tier_disks.get(t).copied().unwrap_or(0),
+            "total_bytes": tier_total.get(t).copied().unwrap_or(0),
+            "used_bytes":  tier_used.get(t).copied().unwrap_or(0),
+        })
+    })
+    .collect();
 
     // Net usable = raw_total / hot_replication_factor (conservative estimate).
     let hot_rf = state.config.defaults.replication.hot.max(1) as u64;
@@ -791,12 +861,16 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         "manager_count":         manager_count,
         "data_node_count":       data_node_count,
         "disk_count":            disk_count,
-        "client_count":          sm.client_count,
+        "client_count":          client_count,
+        // Legacy field kept so older WebUI builds don't break; matches
+        // sm.client_count for forward compat when client heartbeats land.
+        "registered_clients":    sm.client_count,
         "file_count":            sm.files.len(),
         "raw_total_bytes":       raw_total,
         "raw_used_bytes":        raw_used,
         "net_usable_bytes":      net_usable,
         "net_used_bytes":        net_used,
+        "tier_breakdown":        tier_breakdown,
         // I/O stats are aggregated from data node heartbeats in a future phase.
         "io_read_bytes_per_sec":  0u64,
         "io_write_bytes_per_sec": 0u64,
