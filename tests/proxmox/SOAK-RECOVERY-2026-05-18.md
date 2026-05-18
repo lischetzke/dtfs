@@ -263,12 +263,87 @@ client-a$ find /mnt/dtfs -name '*.mkv' | wc -l         # 6 (was 8)
 ```
 All three clients see the same numbers.
 
+### Bug G — hard memory cap with proactive backpressure
+
+**Motivation.** Bug D bounded `put_chunk` concurrency with a static
+semaphore, but that's only safe if every contributor to RSS — ARC
+cache, raft state machine, RocksDB block cache, tonic buffers — fits
+under the operator's actual RAM budget. Real workloads (rsync + scrub
++ inbound replication concurrently) still OOM-killed the data node at
+8 GB RAM because RSS climbed past 7.5 GB. We needed a runtime guard,
+not just a static one.
+
+**Design.**
+1. `DataNodeConfig.memory` (`MemoryConfig`) lets the operator set
+   `hard_cap_mb` per data-node process. `0` = unbounded
+   (backward-compat default).
+2. At startup the data node turns the cap into a safe `put_chunk` slot
+   count via the pure helper
+   `MemoryBudget::recommend_chunk_write_slots(cap, chunk_size, overhead)`.
+   Guaranteed `slots * chunk + overhead ≤ cap`.
+3. A tokio background task samples `/proc/self/status` (VmRSS) every
+   `sample_interval_secs`. Once RSS crosses `shed_threshold_pct` of
+   the cap (default 92%), a `shedding` flag flips and `put_chunk`
+   returns `RESOURCE_EXHAUSTED`. Hysteresis: the flag stays latched
+   until RSS drops below `warn_threshold_pct` (default 80%), so it
+   doesn't flap on small fluctuations.
+4. The FUSE client retries `RESOURCE_EXHAUSTED` (and `Unavailable`)
+   with exponential backoff (250 ms → 8 s, up to 6 attempts), so an
+   end-to-end write doesn't fail just because *one* data node is
+   briefly shedding — the cluster keeps making progress on the
+   un-capped data nodes while the capped one drains.
+
+**Tests** (`dtfs-data::memory::tests`, 11 cases):
+* `bug_g_recommend_slots_fits_under_2gb_cap` — locks the math:
+  cap=2 GB, overhead=600 MB, chunk=128 MB → exactly 11 slots,
+  `11 * 128 MB + 600 MB ≤ 2 GB`.
+* `bug_g_recommend_slots_zero_cap_returns_fallback` — `hard_cap=0`
+  preserves the static `grpc.max_concurrent_chunk_writes` fallback.
+* `bug_g_recommend_slots_floor_is_one`, `…_overhead_exceeds_cap`,
+  `…_ceiling_is_256` — bounds.
+* `bug_g_threshold_calculation`, `bug_g_unbounded_never_sheds`.
+* `bug_g_shedding_flag_hysteresis` — drives a sequence of synthetic
+  RSS samples through `record_sample` and asserts the flag tracks the
+  warn↔shed transition exactly.
+* `bug_g_parse_proc_self_status_vmrss` (+ missing + unknown unit) —
+  parser is pure and unit-tested against synthetic input.
+
+Plus `dtfs-client::put_chunk_retry_tests` (4 cases) verifying the
+backoff schedule, retry ceiling, retryable-codes set, and that
+non-transient codes are NOT auto-retried.
+
+**Live-cluster verification (3-DC lab, data-a1 with `hard_cap_mb =
+2048`, all other data nodes unbounded).**
+
+```
+data-a1 dtfs-data startup:
+  INFO  Bug G memory budget configured cap_mb=2048 warn_pct=80
+        shed_pct=92 sample_secs=5
+  INFO  Bug G memory budget engaged: sized put_chunk slots from hard
+        cap cap_mb=2048 chunk_mb=128 overhead_mb=768 slots=10
+
+Under rsync streaming load (~80 MB/s sustained from WSL → client-c →
+cluster):
+  WARN  memory budget: SHEDDING new put_chunk writes
+        rss_mb=1917 shed_threshold_mb=1884 cap_mb=2048
+  WARN  put_chunk rejected: memory budget shedding rss_mb=1917 (×37)
+```
+
+data-a1's RSS stabilised at 1917 MB ≈ 93.6 % of the configured cap and
+**never OOM-killed**. The cluster as a whole kept absorbing writes
+(landed 38 GB during the test), with the load shifting to data-a2 and
+other un-capped nodes while data-a1 drained.
+
 ## Open known issues (not blocking, tracked for follow-up)
 
 - **Orphan chunk GC**. After per-file `unlink`, the data nodes still
   hold the chunks until the scheduler (or a deep scrub) reclaims them.
   Reported as raw_used_bytes that lags file_count → 0 by 7+ GB right
   after a cleanup. Not a correctness issue, just visibility.
+- **Per-DC memory cap config**. Bug G is per-data-node; we don't yet
+  templatize it in the Ansible inventory. Operators must edit
+  `/etc/dtfs/data.toml` directly. Inventory templating is a one-line
+  follow-up.
 
 ## Next steps (this session)
 
