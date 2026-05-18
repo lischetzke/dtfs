@@ -197,7 +197,98 @@ impl Default for StateMachineData {
     }
 }
 
+/// One entry returned by [`StateMachineData::list_directory_entries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedEntry {
+    pub name: String,
+    pub is_directory: bool,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub size_bytes: u64,
+}
+
 impl StateMachineData {
+    /// List the entries in a directory.
+    ///
+    /// `prefix_path` is the directory path with or without a trailing slash;
+    /// the helper normalises it. Three behaviours that fix Bug E from
+    /// `tests/proxmox/SOAK-RECOVERY-2026-05-18.md`:
+    ///
+    /// 1. If both an explicit mkdir entry (`/foo`) AND child files
+    ///    (`/foo/bar.mkv`) exist, the returned entry is always reported as
+    ///    `is_directory = true` — independent of BTreeMap iteration order.
+    /// 2. Directory entries report a placeholder size (4096) rather than
+    ///    the sum of their children, so `ls -l` doesn't show a directory
+    ///    as a 7.9 GB regular file.
+    /// 3. Synthetic directories (no mkdir entry, only child paths) are
+    ///    still listed correctly.
+    pub fn list_directory_entries(&self, prefix_path: &str) -> Vec<ListedEntry> {
+        let prefix = if prefix_path.ends_with('/') {
+            prefix_path.to_string()
+        } else {
+            format!("{}/", prefix_path)
+        };
+        // Aggregate by first-path-component within the prefix.
+        let mut by_name: BTreeMap<String, ListedEntry> = BTreeMap::new();
+
+        for (path, meta) in self.files.range(prefix.clone()..) {
+            if !path.starts_with(&prefix) {
+                break;
+            }
+            let relative = &path[prefix.len()..];
+            if relative.is_empty() {
+                continue;
+            }
+            // Two flavours of "directory" contribution:
+            //   (a) The relative has a `/` → this entry sits BELOW a
+            //       subdirectory named by everything before the slash.
+            //   (b) The relative has no `/` → this entry IS the named
+            //       child; its `is_directory` field determines the type.
+            let (name, is_dir, file_size) = match relative.find('/') {
+                Some(slash) => (relative[..slash].to_string(), true, 0u64),
+                None => {
+                    // Sum child sizes by chunk_index so replicas don't
+                    // multiply the reported size.
+                    let mut sizes_by_index: BTreeMap<u64, u64> = BTreeMap::new();
+                    for c in &meta.chunks {
+                        let e = sizes_by_index.entry(c.chunk_index).or_insert(0);
+                        *e = (*e).max(c.size_bytes);
+                    }
+                    let logical_size: u64 = meta
+                        .logical_size
+                        .unwrap_or_else(|| sizes_by_index.values().sum());
+                    (relative.to_string(), meta.is_directory, logical_size)
+                }
+            };
+
+            let updated = by_name.entry(name.clone()).or_insert(ListedEntry {
+                name: name.clone(),
+                is_directory: false,
+                created_at_ms: meta.created_at_ms,
+                updated_at_ms: meta.updated_at_ms,
+                size_bytes: 0,
+            });
+            // OR semantics — once any contributor says it's a directory,
+            // the aggregate is a directory.
+            updated.is_directory = updated.is_directory || is_dir;
+            updated.updated_at_ms = updated.updated_at_ms.max(meta.updated_at_ms);
+            // Files: take the largest size we've seen for this name
+            // (handles the case where children get aggregated).
+            // Directories: leave size as 0, we override on the way out.
+            if !is_dir {
+                updated.size_bytes = updated.size_bytes.max(file_size);
+            }
+        }
+        // Directories report a single-block placeholder so `ls -l` doesn't
+        // claim the dir is a giant file.
+        for entry in by_name.values_mut() {
+            if entry.is_directory {
+                entry.size_bytes = 4096;
+            }
+        }
+        by_name.into_values().collect()
+    }
+
     /// Look up a path, returning either the canonical FileMetadata or a
     /// synthesised one for directories that are *implied* by child paths.
     ///
@@ -1504,5 +1595,108 @@ mod posix_path_regression {
             .lookup_path("/movies")
             .expect("parent dir lookup after rename");
         assert!(parent.is_directory);
+    }
+
+    /// Bug E — `list_directory_entries` must report a path as a directory
+    /// when EITHER an explicit mkdir entry OR a child file path exists,
+    /// independent of BTreeMap iteration order.
+    ///
+    /// Symptom on the lab: after mkdir + writing files inside, `ls -l`
+    /// showed the directory as a regular file with size equal to the sum
+    /// of children — `find` saw it as a non-directory and never recursed.
+    #[test]
+    fn bug_e_dir_with_mkdir_marker_and_children_is_a_directory_with_4k_size() {
+        let mut sm = StateMachineData::default();
+        // 1. mkdir /series  (FUSE sends with trailing slash)
+        apply_request(
+            &mut sm,
+            &mk_log_id(10),
+            &ClientRequest::CreateFile {
+                path: "/series/".into(),
+                volume_id: "default".into(),
+                chunk_size: 128 * 1024 * 1024,
+            },
+        );
+        // 2. write /series/episode-01.mkv (10 GB worth of "chunks")
+        apply_request(
+            &mut sm,
+            &mk_log_id(11),
+            &ClientRequest::CreateFile {
+                path: "/series/episode-01.mkv".into(),
+                volume_id: "default".into(),
+                chunk_size: 128 * 1024 * 1024,
+            },
+        );
+        apply_request(
+            &mut sm,
+            &mk_log_id(12),
+            &ClientRequest::UpdateChunkLocations {
+                path: "/series/episode-01.mkv".into(),
+                chunks: vec![ChunkLocationEntry {
+                    chunk_index: 0,
+                    chunk_hash: "h".into(),
+                    node_id: "10".into(),
+                    disk_id: 0,
+                    // 10 GB single chunk for the test
+                    size_bytes: 10 * 1024 * 1024 * 1024,
+                }],
+            },
+        );
+
+        // List from `/`: expect ONE entry named "series" that's a
+        // directory with size 4096.
+        let entries = sm.list_directory_entries("/");
+        assert_eq!(
+            entries.len(),
+            1,
+            "ls / should return a single entry, got {:?}",
+            entries
+        );
+        let e = &entries[0];
+        assert_eq!(e.name, "series");
+        assert!(
+            e.is_directory,
+            "directory must be reported as is_directory=true, got {:?}",
+            e
+        );
+        assert_eq!(
+            e.size_bytes, 4096,
+            "directory size must be 4096 (one block), not the sum of children — got {} (= {} MB)",
+            e.size_bytes,
+            e.size_bytes / 1_048_576
+        );
+
+        // And `ls /series/` should return the episode as a regular file
+        // with its real size.
+        let inside = sm.list_directory_entries("/series");
+        let episode = inside
+            .iter()
+            .find(|x| x.name == "episode-01.mkv")
+            .expect("episode must be present in /series listing");
+        assert!(!episode.is_directory);
+        assert_eq!(episode.size_bytes, 10 * 1024 * 1024 * 1024);
+    }
+
+    /// Bug E (synthetic dir variant) — even without an explicit mkdir,
+    /// a directory implied by a child file path must list as a directory
+    /// from its parent. (Catches the case where rsync writes files
+    /// straight into a folder without ever calling mkdir.)
+    #[test]
+    fn bug_e_synthetic_dir_lists_as_directory() {
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(20),
+            &ClientRequest::CreateFile {
+                path: "/movies/foo.mkv".into(),
+                volume_id: "default".into(),
+                chunk_size: 1024,
+            },
+        );
+        let entries = sm.list_directory_entries("/");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "movies");
+        assert!(entries[0].is_directory);
+        assert_eq!(entries[0].size_bytes, 4096);
     }
 }

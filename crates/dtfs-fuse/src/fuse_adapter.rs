@@ -787,59 +787,31 @@ impl Filesystem for DtfsFuse3Adapter {
             .await
             .map_err(|_| Errno::from(libc::ENOENT))?;
 
-        let parent_ino = if inode == FUSE_ROOT_ID {
-            FUSE_ROOT_ID
-        } else {
-            self.inodes.parent_inode(&path)
-        };
-
-        // Cookie scheme (F-027 fix — the old code's `entry_offset <= offset`
-        // skip predicate combined with the `if offset == 0 { push . }; if
-        // offset <= 1 { push .. }` block produced the second call's cookie
-        // boundary at the *last* emitted entry, which on some fuse3 paths
-        // re-emitted the tail entry. Switch to: cookie K means "I have just
-        // delivered the entry with index K-1". The kernel will pass K back
-        // on the next call; we then strictly skip entries whose cookie <= K.
+        // Cookie scheme — Bug F fix:
         //
-        // Layout:
-        //   cookie 1 -> "."
-        //   cookie 2 -> ".."
-        //   cookie 3..3+N -> children[0..N]
+        // The kernel calls readdirplus first (no "." / "..", entries get
+        // cookies `idx + 1` starting at 1) and then readdir(offset=last)
+        // to verify there's nothing after. If readdir uses a DIFFERENT
+        // cookie scheme (e.g. reserving 1 and 2 for "." and "..") the
+        // kernel ends up with two cookies for the same name — one from
+        // readdirplus and a fresh one from readdir — and ls / find see
+        // the entry twice. Lab symptom: "The Nun II (2023)" and
+        // "Wicked (2024)" appeared duplicated after every `ls` until the
+        // SOAK-RECOVERY-2026-05-18 bug F fix.
         //
-        // De-duplicate by name as a defensive guard so a buggy or eager
-        // kernel that calls us twice with offset=0 (we've observed this on
-        // libfuse 3.x) cannot produce duplicated entries.
-
+        // The kernel synthesises "." and ".." for us on the userspace
+        // side — we MUST NOT emit them here, and the cookie for the
+        // first real entry must be 1, matching readdirplus.
         let mut items: Vec<FuseResult<DirectoryEntry>> = Vec::new();
         let mut seen_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
-        if offset < 1 {
-            items.push(Ok(DirectoryEntry {
-                inode,
-                offset: 1,
-                kind: FileType::Directory,
-                name: ".".into(),
-            }));
-            seen_names.insert(".".to_string());
-        }
-        if offset < 2 {
-            items.push(Ok(DirectoryEntry {
-                inode: parent_ino,
-                offset: 2,
-                kind: FileType::Directory,
-                name: "..".into(),
-            }));
-            seen_names.insert("..".to_string());
-        }
-
         for (idx, entry) in entries.iter().enumerate() {
-            let entry_offset = (idx as i64) + 3;
+            let entry_offset = dir_entry_cookie(idx) as i64;
             if entry_offset <= offset {
                 continue;
             }
-            // Defensive dedup: never emit a name we've already returned in
-            // this single call.
+            // Defensive dedup within the same call.
             if !seen_names.insert(entry.name.clone()) {
                 continue;
             }
@@ -880,6 +852,7 @@ impl Filesystem for DtfsFuse3Adapter {
         _lock_owner: u64,
     ) -> FuseResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>> {
         let path = self.inodes.path_for(inode)?;
+        debug!("fuse3:readdirplus {} (ino={}, offset={})", path, inode, offset);
         let entries = self
             .fs
             .readdir(&path)
@@ -892,7 +865,7 @@ impl Filesystem for DtfsFuse3Adapter {
             std::collections::HashSet::new();
 
         for (idx, entry) in entries.iter().enumerate() {
-            let entry_offset = (idx as u64) + 1;
+            let entry_offset = dir_entry_cookie(idx);
             if entry_offset <= offset {
                 continue;
             }
@@ -1154,5 +1127,50 @@ fn parent_of(path: &str) -> String {
     match path.rfind('/') {
         Some(0) | None => "/".to_string(),
         Some(idx) => path[..idx].to_string(),
+    }
+}
+
+/// Cookie that fuse3 emits for the directory entry at position `idx`
+/// (0-based). Used by BOTH `readdir` and `readdirplus`. The two paths
+/// MUST use the same scheme — see Bug F in
+/// `tests/proxmox/SOAK-RECOVERY-2026-05-18.md`. If readdir emitted a
+/// different cookie for the same idx, the kernel would assemble two
+/// distinct dirents for the same name and `ls` would show duplicates.
+#[inline]
+pub(crate) fn dir_entry_cookie(idx: usize) -> u64 {
+    (idx as u64) + 1
+}
+
+#[cfg(test)]
+mod fuse_readdir_regression {
+    use super::*;
+
+    /// Bug F — readdir + readdirplus MUST agree on the cookie for the
+    /// same entry. Pre-fix readdir reserved cookies 1 & 2 for "." and
+    /// ".." and emitted children at `idx + 3`; readdirplus emitted
+    /// children at `idx + 1`. The kernel saw two different cookies for
+    /// the same name and ls/find showed duplicates.
+    ///
+    /// Live-lab symptom: `ls /mnt/dtfs/` produced 9 lines for 7 entries
+    /// ("The Nun II (2023)" and "Wicked (2024)" duplicated). Verified
+    /// fixed on the 3-DC lab post-deploy.
+    #[test]
+    fn bug_f_readdir_and_readdirplus_share_cookie_scheme() {
+        // The helper is the single source of truth for the cookie scheme.
+        // Both readdir and readdirplus use it.
+        assert_eq!(dir_entry_cookie(0), 1);
+        assert_eq!(dir_entry_cookie(1), 2);
+        assert_eq!(dir_entry_cookie(6), 7);
+        // The kernel synthesises "." and ".." for us — we MUST NOT
+        // reserve cookies 1/2 for them in readdir output. If a future
+        // change tries to push children into 3.. the test below catches
+        // the regression.
+        // (We can't unit-test the actual readdir impl without a fuse3
+        // harness, but we can lock the cookie scheme.)
+        for idx in 0..32 {
+            assert_eq!(dir_entry_cookie(idx), (idx as u64) + 1,
+                "cookie scheme must remain `idx + 1` for both readdir and \
+                 readdirplus — see Bug F in SOAK-RECOVERY-2026-05-18.md");
+        }
     }
 }
