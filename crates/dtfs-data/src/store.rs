@@ -64,6 +64,11 @@ pub struct ChunkStore {
     chunk_count: Arc<AtomicU64>,
     /// Running total of bytes stored (incremented on put, decremented on delete).
     bytes_stored: Arc<AtomicU64>,
+    /// Bug O — chunks the scrub scheduler has quarantined locally,
+    /// waiting to be reported to the manager on the next heartbeat so
+    /// the Raft state machine can drop the matching replica entries
+    /// and trigger re-replication from a healthy peer.
+    pending_corruption: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
 impl ChunkStore {
@@ -72,7 +77,26 @@ impl ChunkStore {
             disk_manager: Arc::new(disk_manager),
             chunk_count: Arc::new(AtomicU64::new(0)),
             bytes_stored: Arc::new(AtomicU64::new(0)),
+            pending_corruption: Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Bug O — append chunk_ids that have been quarantined locally
+    /// (failed checksum or missing meta) so the next heartbeat can
+    /// report them to the manager. Called by the scrub scheduler.
+    pub fn enqueue_pending_corruption(&self, chunk_ids: impl IntoIterator<Item = String>) {
+        let mut q = self.pending_corruption.lock();
+        for id in chunk_ids {
+            q.push(id);
+        }
+    }
+
+    /// Bug O — drain the pending-corruption queue. Called by the
+    /// heartbeat loop so each report is sent to the manager exactly
+    /// once.
+    pub fn drain_pending_corruption(&self) -> Vec<String> {
+        let mut q = self.pending_corruption.lock();
+        std::mem::take(&mut *q)
     }
 
     /// Return a lightweight stats snapshot for heartbeat and metrics reporting.
@@ -209,6 +233,9 @@ impl ChunkStore {
         fs::rename(&tmp_path, &final_dat_path)
             .await
             .map_err(DtfsError::Io)?;
+        // Bug L — fsync parent directory after rename so the directory
+        // entry survives a crash.
+        fsync_dir(&chunk_dir).await?;
 
         // 4. Write metadata
         let meta = ChunkMeta {
@@ -232,9 +259,12 @@ impl ChunkStore {
                 .map_err(DtfsError::Io)?;
             file.sync_all().await.map_err(DtfsError::Io)?;
         }
+        // Bug L — fsync parent dir after .meta create.
+        fsync_dir(&chunk_dir).await?;
 
         // 5. Remove the WAL entry now that the write is fully committed.
         let _ = fs::remove_file(&wal_path).await;
+        let _ = fsync_dir(&wal_dir).await;
 
         // Update running counters.
         self.chunk_count.fetch_add(1, Ordering::Relaxed);
@@ -350,6 +380,16 @@ impl ChunkStore {
         fs::create_dir_all(&chunk_dir).await.map_err(DtfsError::Io)?;
         fs::create_dir_all(&wal_dir_path).await.map_err(DtfsError::Io)?;
 
+        // Bug K — fsync the tmp .dat *before* the rename. The streaming
+        // put_chunk path in server.rs only flushed (not sync_all'd) so
+        // on a power loss after a successful gRPC response the chunk
+        // metadata could be durable while the bytes were lost. Open
+        // O_RDONLY here just to sync the data pages without re-buffering.
+        {
+            let f = fs::File::open(tmp_path).await.map_err(DtfsError::Io)?;
+            f.sync_all().await.map_err(DtfsError::Io)?;
+        }
+
         // 1. WAL entry first.
         let wal_entry = WalEntry {
             operation: WalOperation::PutChunk,
@@ -366,6 +406,13 @@ impl ChunkStore {
         fs::rename(tmp_path, &final_dat_path)
             .await
             .map_err(DtfsError::Io)?;
+
+        // Bug L — fsync the parent directory after the rename so the
+        // directory-entry pointing at the renamed inode survives a crash.
+        // On XFS / ext4 a rename's directory update can be lost even
+        // though the inode itself is durable, leaving an orphan inode and
+        // a missing chunk from the manager's perspective.
+        fsync_dir(&chunk_dir).await?;
 
         // 3. Write the meta sidecar.
         let meta = ChunkMeta {
@@ -387,9 +434,15 @@ impl ChunkStore {
                 .map_err(DtfsError::Io)?;
             file.sync_all().await.map_err(DtfsError::Io)?;
         }
+        // Bug L — fsync the parent directory after .meta creation too.
+        fsync_dir(&chunk_dir).await?;
 
         // 4. Clear WAL.
         let _ = fs::remove_file(&wal_path).await;
+        // Best-effort fsync of WAL dir so the removal is durable; if
+        // we crash after this point the (now-absent) WAL is a "no-op"
+        // for recover_from_wal.
+        let _ = fsync_dir(&wal_dir_path).await;
 
         // 5. Counters.
         self.chunk_count.fetch_add(1, Ordering::Relaxed);
@@ -655,6 +708,7 @@ impl ChunkStore {
             chunks_missing: 0,
             chunks_size_mismatch: 0,
             duration_secs: 0.0,
+            corrupt_chunk_ids: Vec::new(),
         };
         let mut skipped_in_flight: u64 = 0;
 
@@ -704,9 +758,19 @@ impl ChunkStore {
 
                         result.chunks_checked += 1;
 
+                        // Stem of the .dat file is the chunk_id hex.
+                        let chunk_hex = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_default()
+                            .to_string();
+
                         let meta_path = path.with_extension("meta");
                         if !meta_path.exists() {
                             result.chunks_missing += 1;
+                            if !chunk_hex.is_empty() {
+                                result.corrupt_chunk_ids.push(chunk_hex.clone());
+                            }
                             continue;
                         }
 
@@ -722,6 +786,9 @@ impl ChunkStore {
 
                         if file_meta.len() != chunk_meta.size {
                             result.chunks_size_mismatch += 1;
+                            if !chunk_hex.is_empty() {
+                                result.corrupt_chunk_ids.push(chunk_hex.clone());
+                            }
                             continue;
                         }
 
@@ -730,6 +797,9 @@ impl ChunkStore {
                             let data = fs::read(&path).await.map_err(DtfsError::Io)?;
                             if !checksum::verify(&data, &chunk_meta.checksum) {
                                 result.chunks_corrupt += 1;
+                                if !chunk_hex.is_empty() {
+                                    result.corrupt_chunk_ids.push(chunk_hex.clone());
+                                }
                                 continue;
                             }
                         }
@@ -781,7 +851,8 @@ fn wal_dir(disk_path: &Path) -> PathBuf {
     disk_path.join(".dtfs").join("wal")
 }
 
-/// Write a WAL entry to disk with fsync.
+/// Write a WAL entry to disk with fsync. Also fsyncs the parent
+/// directory so the entry-creation is durable (Bug L).
 async fn write_wal_entry(path: &Path, entry: &WalEntry) -> DtfsResult<()> {
     let json = serde_json::to_string(entry)
         .map_err(|e| DtfsError::Serialization(e.to_string()))?;
@@ -795,7 +866,71 @@ async fn write_wal_entry(path: &Path, entry: &WalEntry) -> DtfsResult<()> {
         .await
         .map_err(DtfsError::Io)?;
     file.sync_all().await.map_err(DtfsError::Io)?;
+    if let Some(parent) = path.parent() {
+        let _ = fsync_dir(parent).await;
+    }
     Ok(())
+}
+
+/// Bug O — quarantine a chunk whose on-disk bytes have failed scrub
+/// verification. We delete the `.dat` so future reads naturally fall
+/// back to other replicas (the FUSE client's replica-fallback loop is
+/// already correct). We KEEP the `.meta` for forensics under the
+/// disk's `.dtfs/quarantine/` directory so an operator can investigate.
+pub async fn quarantine_chunk_on_disk(
+    disk_mount: &Path,
+    chunk_id_hex: &str,
+) -> DtfsResult<()> {
+    let chunk_id = ChunkId::from_hex(chunk_id_hex)
+        .map_err(|e| DtfsError::Serialization(format!("bad chunk_id {chunk_id_hex}: {e}")))?;
+    let chunk_dir = chunk_data_dir(disk_mount, &chunk_id);
+    let dat = chunk_dir.join(format!("{}.dat", chunk_id_hex));
+    let meta = chunk_dir.join(format!("{}.meta", chunk_id_hex));
+
+    let q_root = disk_mount.join(".dtfs").join("quarantine");
+    fs::create_dir_all(&q_root).await.map_err(DtfsError::Io)?;
+    let q_meta = q_root.join(format!("{}.meta.bad", chunk_id_hex));
+
+    // Move the .meta as a breadcrumb (operators can correlate with logs).
+    if meta.exists() {
+        let _ = fs::rename(&meta, &q_meta).await;
+    }
+    // Drop the .dat outright — it failed checksum, there's no point keeping it.
+    if dat.exists() {
+        let _ = fs::remove_file(&dat).await;
+    }
+    let _ = fsync_dir(&chunk_dir).await;
+    Ok(())
+}
+
+/// Bug L — fsync a directory so any rename/create inside it is durable
+/// across a power loss. POSIX requires the parent-dir to be fsynced
+/// separately from the inode itself; tokio's `File::open` + `sync_all`
+/// works for directories on Linux when opened with read-only access.
+async fn fsync_dir(dir: &Path) -> DtfsResult<()> {
+    // `fs::File::open` on a directory yields a handle whose `sync_all`
+    // syncs the directory metadata. On Linux this is the canonical
+    // dir-fsync. On non-Linux it's a no-op cost.
+    match fs::File::open(dir).await {
+        Ok(f) => match f.sync_all().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Some filesystems (overlayfs, tmpfs) return EINVAL on
+                // directory sync. Log + accept — the rename itself is
+                // still observed by the inode; the durability
+                // guarantee weakens to whatever the underlying FS
+                // gives us, which is at least no worse than the
+                // pre-fix behaviour.
+                tracing::debug!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "fsync_dir failed (non-fatal — falling back to pre-fix durability)"
+                );
+                Ok(())
+            }
+        },
+        Err(e) => Err(DtfsError::Io(e)),
+    }
 }
 
 /// Parse a hex-encoded chunk ID string back into a ChunkId.
@@ -1295,6 +1430,86 @@ mod tests {
         assert!(
             !tmp_path.exists(),
             "tmp file must be removed even when commit fails"
+        );
+    }
+
+    /// Bug K — the streaming commit MUST fsync the tmp .dat before
+    /// the rename. We can't directly observe fsync from outside the
+    /// kernel, but we can prove the function returns successfully
+    /// after writing bytes that aren't tied to an open writer handle.
+    /// (The fsync_dir helper is exercised via the integration tests
+    /// + ChunkStore tests that follow.)
+    #[tokio::test]
+    async fn bug_k_commit_succeeds_when_tmp_is_already_closed() {
+        use tokio::io::AsyncWriteExt;
+        let (store, _tmp) = make_test_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+
+        let (tmp_path, _disk_mount) = store.allocate_streaming_tmp(DiskTier::Hot).unwrap();
+        let payload = b"closed-then-committed";
+        {
+            let mut f = tokio::fs::File::create(&tmp_path).await.unwrap();
+            f.write_all(payload).await.unwrap();
+            f.flush().await.unwrap();
+            // NOTE: drop without sync_all — Bug K means commit must
+            // sync the tmp itself before renaming.
+        }
+        let hash = dtfs_common::checksum::compute(payload);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let meta = store
+            .commit_chunk_from_tmp(
+                &chunk_id,
+                &tmp_path,
+                &volume_id,
+                DiskTier::Hot,
+                payload.len() as u64,
+                hash,
+            )
+            .await
+            .expect("commit must succeed even if caller didn't sync");
+        assert_eq!(meta.size, payload.len() as u64);
+        let got = store.get_chunk(&chunk_id).await.unwrap();
+        assert_eq!(got.as_ref(), payload);
+    }
+
+    /// Bug M — `recover_from_wal` must be safe to call on a clean
+    /// store (no WAL entries). Returns 0 recovered, no error.
+    #[tokio::test]
+    async fn bug_m_recover_from_wal_safe_on_empty_store() {
+        let (store, _tmp) = make_test_store().await;
+        let n = store.recover_from_wal().await.expect("clean recover ok");
+        assert_eq!(n, 0);
+    }
+
+    /// Bug M — when a previous instance crashed leaving a tmp file
+    /// + a WAL entry pointing at it, the next startup must reclaim
+    /// the tmp. Without `recover_from_wal` at boot, orphan tmps
+    /// leaked disk forever (audit finding #1c).
+    #[tokio::test]
+    async fn bug_m_recover_from_wal_reclaims_orphan_tmp() {
+        let (store, tmp) = make_test_store().await;
+        let disk_path = tmp.path().to_path_buf();
+
+        // Hand-craft a tmp + WAL entry as if a prior writer crashed
+        // mid-commit_chunk_from_tmp.
+        let tmp_dir_path = disk_path.join("tmp");
+        tokio::fs::create_dir_all(&tmp_dir_path).await.unwrap();
+        let leftover_tmp = tmp_dir_path.join("streaming-9999.dat.tmp");
+        tokio::fs::write(&leftover_tmp, b"orphan").await.unwrap();
+        assert!(leftover_tmp.exists());
+
+        // Run recovery.
+        store.recover_from_wal().await.expect("recover ok");
+
+        // The orphan tmp must be gone. Whether by recover_from_wal
+        // or by the tmp-sweep pass; we don't care which, just that
+        // the leak is closed.
+        // NB: current recover_from_wal sweeps tmp at the end (see
+        // store.rs:594-607). If a future refactor removes that
+        // sweep this assertion catches it.
+        assert!(
+            !leftover_tmp.exists(),
+            "orphan tmp from a crashed prior writer must be reclaimed at startup"
         );
     }
 

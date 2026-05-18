@@ -797,6 +797,39 @@ fn apply_request(
             }
         }
 
+        ClientRequest::RemoveCorruptChunkReplicas { node_id, chunk_hashes } => {
+            // Bug O — sweep every file's chunk list, dropping any entry
+            // that matches (this node_id, one of these chunk_hashes).
+            // The scheduler's check_under_replicated pass will then
+            // queue re-replication from a healthy peer.
+            let needle: std::collections::HashSet<&str> =
+                chunk_hashes.iter().map(|s| s.as_str()).collect();
+            let mut dropped: u64 = 0;
+            let mut affected_files: u64 = 0;
+            for (_path, file) in sm.files.iter_mut() {
+                let before = file.chunks.len();
+                file.chunks.retain(|c| {
+                    !(c.node_id == *node_id && needle.contains(c.chunk_hash.as_str()))
+                });
+                let after = file.chunks.len();
+                if after < before {
+                    dropped += (before - after) as u64;
+                    affected_files += 1;
+                    file.updated_at_ms = now_ms;
+                }
+            }
+            push_audit_capped(
+                &mut sm.audit_log,
+                audit(format!(
+                    "RemoveCorruptChunkReplicas: node={node_id} chunks={} dropped_entries={} affected_files={}",
+                    chunk_hashes.len(),
+                    dropped,
+                    affected_files,
+                )),
+            );
+            ClientResponse::Success
+        }
+
         ClientRequest::RegisterNode { node_id, info } => {
             sm.nodes.insert(*node_id, info.clone());
             push_audit_capped(&mut sm.audit_log, audit(format!("RegisterNode: {node_id}")));
@@ -1698,5 +1731,108 @@ mod posix_path_regression {
         assert_eq!(entries[0].name, "movies");
         assert!(entries[0].is_directory);
         assert_eq!(entries[0].size_bytes, 4096);
+    }
+
+    // ----------- Bug O — scrub auto-repair ---------------------------
+
+    /// When the data node reports chunks as corrupt via
+    /// `RemoveCorruptChunkReplicas`, the matching (node_id, chunk_hash)
+    /// entries are dropped from every file's chunk list. The
+    /// scheduler's `check_under_replicated` pass then sees the file
+    /// has fewer than RF replicas and queues a copy from a healthy
+    /// peer.
+    #[test]
+    fn bug_o_remove_corrupt_chunk_replicas_drops_matching_entries() {
+        let mut sm = StateMachineData::default();
+        sm.files.insert(
+            "/a.bin".into(),
+            FileMetadata {
+                path: "/a.bin".into(),
+                volume_id: "default".into(),
+                chunk_size: 1024,
+                chunks: vec![
+                    ChunkLocationEntry {
+                        chunk_index: 0,
+                        chunk_hash: "corrupt-hash".into(),
+                        node_id: "10".into(),
+                        disk_id: 0,
+                        size_bytes: 1024,
+                    },
+                    ChunkLocationEntry {
+                        chunk_index: 0,
+                        chunk_hash: "corrupt-hash".into(),
+                        node_id: "11".into(),
+                        disk_id: 0,
+                        size_bytes: 1024,
+                    },
+                ],
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                symlink_target: None,
+                logical_size: None,
+                is_directory: false,
+            },
+        );
+
+        apply_request(
+            &mut sm,
+            &mk_log_id(99),
+            &ClientRequest::RemoveCorruptChunkReplicas {
+                node_id: "10".into(),
+                chunk_hashes: vec!["corrupt-hash".into()],
+            },
+        );
+
+        // Node 10's replica is gone; node 11's replica survives.
+        let a = sm.files.get("/a.bin").unwrap();
+        assert_eq!(a.chunks.len(), 1);
+        assert_eq!(a.chunks[0].node_id, "11");
+        assert_eq!(a.chunks[0].chunk_hash, "corrupt-hash");
+    }
+
+    /// Bug O — unrelated chunks on the same node MUST be preserved.
+    #[test]
+    fn bug_o_remove_does_not_drop_unrelated_chunks_on_same_node() {
+        let mut sm = StateMachineData::default();
+        sm.files.insert(
+            "/c.bin".into(),
+            FileMetadata {
+                path: "/c.bin".into(),
+                volume_id: "default".into(),
+                chunk_size: 1024,
+                chunks: vec![
+                    ChunkLocationEntry {
+                        chunk_index: 0,
+                        chunk_hash: "h-bad".into(),
+                        node_id: "20".into(),
+                        disk_id: 0,
+                        size_bytes: 1024,
+                    },
+                    ChunkLocationEntry {
+                        chunk_index: 1,
+                        chunk_hash: "h-good".into(),
+                        node_id: "20".into(),
+                        disk_id: 0,
+                        size_bytes: 1024,
+                    },
+                ],
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                symlink_target: None,
+                logical_size: None,
+                is_directory: false,
+            },
+        );
+        apply_request(
+            &mut sm,
+            &mk_log_id(100),
+            &ClientRequest::RemoveCorruptChunkReplicas {
+                node_id: "20".into(),
+                chunk_hashes: vec!["h-bad".into()],
+            },
+        );
+        let c = sm.files.get("/c.bin").unwrap();
+        assert_eq!(c.chunks.len(), 1);
+        assert_eq!(c.chunks[0].chunk_hash, "h-good");
     }
 }

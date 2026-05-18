@@ -384,28 +384,52 @@ impl ManagerService for MetadataService {
         let req = request.into_inner();
         tracing::debug!("ChunkStatusReport: {} chunks", req.chunks.len());
 
-        let node_id: u64 = req
+        let node_id_u64: u64 = req
             .node_id
             .parse()
             .map_err(|_| Status::invalid_argument("node_id must be a u64 from registration"))?;
 
-        let mut unhealthy = false;
+        // Bug O — partition the reported chunks into corrupt/missing
+        // (which need replica entries dropped + re-replication queued)
+        // vs healthy (which keep their entries).
+        let mut corrupt_ids: Vec<String> = Vec::new();
         for ch in &req.chunks {
             if ch.status.eq_ignore_ascii_case("corrupt")
                 || ch.status.eq_ignore_ascii_case("missing")
             {
-                unhealthy = true;
-                break;
+                corrupt_ids.push(ch.chunk_id.clone());
             }
         }
 
-        let status = if unhealthy { "degraded" } else { "healthy" };
+        let status = if !corrupt_ids.is_empty() {
+            "degraded"
+        } else {
+            "healthy"
+        };
         let _ = self
             .raft_write(ClientRequest::UpdateNodeStatus {
-                node_id,
+                node_id: node_id_u64,
                 status: status.to_string(),
             })
             .await;
+
+        // Bug O — drop the (this-node, chunk_hash) replica entries so
+        // the scheduler's under-replication pass queues a copy from a
+        // healthy peer. node_id is the stringified form the data-node
+        // uses in `ChunkLocationEntry.node_id`.
+        if !corrupt_ids.is_empty() {
+            tracing::warn!(
+                node_id = %req.node_id,
+                count = corrupt_ids.len(),
+                "Bug O dropping corrupt-replica entries + queueing re-replication"
+            );
+            let _ = self
+                .raft_write(ClientRequest::RemoveCorruptChunkReplicas {
+                    node_id: req.node_id.clone(),
+                    chunk_hashes: corrupt_ids,
+                })
+                .await;
+        }
 
         Ok(Response::new(ChunkStatusAck { accepted: true }))
     }
@@ -417,11 +441,104 @@ impl ManagerService for MetadataService {
         let req = request.into_inner();
         info!("DeleteFile: {}", req.path);
 
+        // Bug N — collect the chunk locations BEFORE the Raft delete
+        // commits so we know which data nodes need to reclaim disk
+        // space. After the commit `sm.files` will no longer have the
+        // entry. We dedup (chunk_hash, node_id) to avoid sending the
+        // same DeleteChunk twice for replicated chunks.
+        let chunk_targets: Vec<(String, String)> = {
+            let data = self.sm_data.read().await;
+            if let Some(meta) = data.files.get(&req.path) {
+                let mut seen: std::collections::HashSet<(String, String)> =
+                    Default::default();
+                let mut out = Vec::new();
+                for c in &meta.chunks {
+                    let key = (c.chunk_hash.clone(), c.node_id.clone());
+                    if seen.insert(key.clone()) {
+                        out.push(key);
+                    }
+                }
+                out
+            } else {
+                Vec::new()
+            }
+        };
+
+        // Resolve node_id → grpc_addr so we can talk to each data node
+        // without re-locking the state machine per chunk.
+        let node_addrs: std::collections::HashMap<String, String> = {
+            let data = self.sm_data.read().await;
+            data.nodes
+                .iter()
+                .map(|(id, info)| (id.to_string(), info.grpc_addr.clone()))
+                .collect()
+        };
+
+        // Commit the Raft-side delete first. The chunk fan-out is
+        // best-effort: a failure to reach a data node leaves an orphan
+        // that the scheduler's reconciler picks up later. We
+        // INTENTIONALLY commit the metadata removal first because
+        // a half-deleted file (metadata gone, chunks remain) is the
+        // correct failure mode — a dangling-pointer file (metadata
+        // remains, chunks gone) would be worse.
         let resp = self
             .raft_write(ClientRequest::DeleteFile {
                 path: req.path.clone(),
             })
             .await?;
+
+        // Now best-effort fan-out chunk deletes. Group by node so we
+        // open one connection per target.
+        let mut by_node: std::collections::HashMap<String, Vec<String>> =
+            Default::default();
+        for (chunk_hash, node_id) in chunk_targets {
+            if let Some(addr) = node_addrs.get(&node_id) {
+                by_node.entry(addr.clone()).or_default().push(chunk_hash);
+            }
+        }
+
+        let path_for_log = req.path.clone();
+        tokio::spawn(async move {
+            for (addr, chunks) in by_node {
+                let endpoint = format!("http://{}", addr);
+                let mut client = match dtfs_proto::dtfs::data::data_service_client::DataServiceClient::connect(endpoint.clone()).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path_for_log,
+                            node_addr = %addr,
+                            error = %e,
+                            "Bug N delete fan-out: connect failed, leaving orphan chunks for reconciler"
+                        );
+                        continue;
+                    }
+                };
+                for chunk_id in chunks {
+                    let req = dtfs_proto::dtfs::data::DeleteChunkRequest {
+                        chunk_id: chunk_id.clone(),
+                    };
+                    match client.delete_chunk(req).await {
+                        Ok(_) => {
+                            tracing::debug!(
+                                path = %path_for_log,
+                                node_addr = %addr,
+                                chunk_id = %chunk_id,
+                                "Bug N delete fan-out: chunk reclaimed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path_for_log,
+                                node_addr = %addr,
+                                chunk_id = %chunk_id,
+                                error = %e,
+                                "Bug N delete fan-out: RPC failed, orphan remains for reconciler"
+                            );
+                        }
+                    }
+                }
+            }
+        });
 
         match resp {
             ClientResponse::Success => Ok(Response::new(DeleteFileResponse { success: true })),

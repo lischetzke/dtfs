@@ -95,13 +95,31 @@ impl ScrubScheduler {
                         result.duration_secs,
                     );
 
-                    if result.chunks_corrupt > 0 || result.chunks_missing > 0 {
+                    // Bug O — quarantine the offending local chunks
+                    // and enqueue them so the next heartbeat can tell
+                    // the manager. The manager's Raft state machine
+                    // drops these (node_id, chunk_hash) entries, the
+                    // scheduler's check_under_replicated then queues
+                    // a re-replicate from a healthy peer.
+                    if !result.corrupt_chunk_ids.is_empty() {
                         tracing::warn!(
-                            "Scrub found issues on {}: {} corrupt, {} missing",
-                            disk_path.display(),
-                            result.chunks_corrupt,
-                            result.chunks_missing,
+                            disk = %disk_path.display(),
+                            count = result.corrupt_chunk_ids.len(),
+                            "Bug O scrub quarantining locally-corrupt chunks + enqueuing for manager report"
                         );
+                        for cid in &result.corrupt_chunk_ids {
+                            if let Err(e) =
+                                crate::store::quarantine_chunk_on_disk(disk_path, cid).await
+                            {
+                                tracing::warn!(
+                                    chunk_id = %cid,
+                                    error = %e,
+                                    "Bug O quarantine failed (non-fatal; entry still reported)"
+                                );
+                            }
+                        }
+                        self.store
+                            .enqueue_pending_corruption(result.corrupt_chunk_ids.iter().cloned());
                     }
                 }
                 Err(e) => {

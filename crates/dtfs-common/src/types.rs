@@ -37,6 +37,21 @@ impl ChunkId {
         Self(bytes)
     }
 
+    /// Parse a 64-hex-char string into a ChunkId. Returns an error
+    /// string on bad length or non-hex characters.
+    pub fn from_hex(s: &str) -> Result<Self, String> {
+        if s.len() != 64 {
+            return Err(format!("expected 64 hex chars, got {}", s.len()));
+        }
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            let byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+                .map_err(|e| format!("bad hex at byte {}: {}", i, e))?;
+            out[i] = byte;
+        }
+        Ok(Self(out))
+    }
+
     pub fn as_hex(&self) -> String {
         hex_encode(&self.0)
     }
@@ -312,6 +327,14 @@ pub struct ScrubResult {
     pub chunks_missing: u64,
     pub chunks_size_mismatch: u64,
     pub duration_secs: f64,
+    /// Bug O — chunk hashes (hex) flagged as corrupt or missing during
+    /// the scrub. The data node's scrub scheduler quarantines these
+    /// locally then sends them to the manager so the Raft state-machine
+    /// drops the matching replica entries from `sm.files` and the
+    /// scheduler can queue re-replication. `#[serde(default)]` so older
+    /// snapshots / heartbeat payloads load.
+    #[serde(default)]
+    pub corrupt_chunk_ids: Vec<String>,
 }
 
 /// Migration task status.

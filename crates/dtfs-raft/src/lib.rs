@@ -164,6 +164,23 @@ pub enum ClientRequest {
         chunks: Vec<ChunkLocationEntry>,
     },
 
+    /// Bug O — remove every (node_id, chunk_hash) entry the data node
+    /// has flagged as corrupt or missing during scrub. The scheduler's
+    /// `check_under_replicated` pass then notices the file is below its
+    /// configured replication factor and queues a re-replication task
+    /// from a healthy peer.
+    ///
+    /// `#[serde(default)]` on the new variant is unnecessary at the
+    /// enum level (variants are tagged); the contained fields are
+    /// always present, no compat concern.
+    RemoveCorruptChunkReplicas {
+        /// Stringified u64 node id (matches `ChunkLocationEntry.node_id`).
+        node_id: String,
+        /// BLAKE3 hex chunk hashes that the data node confirmed are
+        /// corrupt or missing on its disks.
+        chunk_hashes: Vec<String>,
+    },
+
     // ---- Cluster operations ----
     RegisterNode {
         node_id: u64,
@@ -312,6 +329,11 @@ impl fmt::Display for ClientRequest {
             Self::UpdateChunkLocations { path, chunks } => {
                 write!(f, "UpdateChunks({path}, {} chunks)", chunks.len())
             }
+            Self::RemoveCorruptChunkReplicas { node_id, chunk_hashes } => write!(
+                f,
+                "RemoveCorruptChunkReplicas(node={node_id}, {} chunks)",
+                chunk_hashes.len()
+            ),
             Self::RegisterNode { node_id, .. } => write!(f, "RegisterNode({node_id})"),
             Self::DeregisterNode { node_id } => write!(f, "DeregisterNode({node_id})"),
             Self::UpdateNodeStatus { node_id, status } => {
