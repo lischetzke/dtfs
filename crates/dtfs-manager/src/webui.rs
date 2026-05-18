@@ -337,6 +337,36 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             transition: opacity .15s; white-space: nowrap;
         }}
         .btn-primary:hover {{ opacity: .85; }}
+        .btn-secondary {{
+            background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+            padding: .35rem .75rem; border-radius: .375rem; font-size: .78rem; cursor: pointer;
+            transition: background .15s; white-space: nowrap;
+        }}
+        .btn-secondary:hover {{ background: var(--border); }}
+
+        /* ── Modal (Migrate dialog) ── */
+        .modal-backdrop {{
+            position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 99;
+            display: flex; align-items: center; justify-content: center;
+        }}
+        .modal-backdrop.hidden {{ display: none; }}
+        .modal-card {{
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: .5rem; padding: 1.25rem 1.5rem; min-width: 460px;
+            max-width: 640px; box-shadow: 0 10px 40px rgba(0,0,0,.4);
+        }}
+        .modal-card h3 {{ margin: 0 0 1rem; font-size: 1.05rem; }}
+        .modal-row {{ display: flex; flex-direction: column; gap: .25rem; margin-bottom: .85rem; }}
+        .modal-row label {{ font-size: .78rem; color: var(--text-muted); }}
+        .modal-actions {{ display: flex; gap: .5rem; justify-content: flex-end; margin-top: .25rem; }}
+        .modal-result {{
+            margin-top: .85rem; padding: .65rem .8rem; border-radius: .375rem;
+            background: var(--surface2); border: 1px solid var(--border);
+            font-family: monospace; font-size: .78rem; white-space: pre-wrap;
+            max-height: 240px; overflow: auto;
+        }}
+        .modal-result.success {{ border-color: var(--success); }}
+        .modal-result.error   {{ border-color: var(--danger); color: var(--danger); }}
 
         /* ── Footer ── */
         .footer {{
@@ -372,6 +402,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     <a href="/ui/nodes">Nodes</a>
     <a href="/ui/volumes">Volumes</a>
     <a href="/ui/explorer">Data Explorer</a>
+    <a href="/ui/migrations">Migrations</a>
     <a href="/ui/audit">Audit Log</a>
     <a href="/ui/settings">Settings</a>
     <a href="/docs/" target="_blank">Docs ↗</a>
@@ -388,6 +419,47 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
 <div class="container" id="page-content">
     <!-- Populated by SPA router -->
+</div>
+
+<!-- ── Migrate dialog (operator-driven tier/DC moves) ── -->
+<div id="migrate-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeMigrate()">
+    <div class="modal-card">
+        <h3>Migrate data to another tier / datacenter</h3>
+        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:1rem">
+            Adds a replica satisfying the chosen tier (and, when set, datacenter) for every chunk
+            whose file path begins with the prefix. Existing replicas are left in place — this
+            is additive and never deletes data.
+        </div>
+        <div class="modal-row">
+            <label>Path prefix</label>
+            <input id="m-path" class="form-input" placeholder="/movies/Season 1/">
+        </div>
+        <div class="modal-row">
+            <label>Target tier</label>
+            <select id="m-tier" class="form-input">
+                <option value="hot">hot</option>
+                <option value="warm" selected>warm</option>
+                <option value="cold">cold</option>
+                <option value="tape">tape</option>
+            </select>
+        </div>
+        <div class="modal-row">
+            <label>Target datacenter (optional)</label>
+            <select id="m-dc" class="form-input">
+                <option value="">Any datacenter</option>
+            </select>
+        </div>
+        <div class="modal-row" id="m-empty-row" style="display:none">
+            <label style="color:var(--warning)">
+                <input id="m-allow-empty" type="checkbox"> Allow empty prefix (matches every file — destructive on big clusters!)
+            </label>
+        </div>
+        <div class="modal-actions">
+            <button class="btn-secondary" onclick="closeMigrate()">Cancel</button>
+            <button class="btn-primary"  onclick="submitMigrate()" id="m-submit">Schedule migration</button>
+        </div>
+        <div id="m-result" class="modal-result" style="display:none"></div>
+    </div>
 </div>
 
 <div class="footer">
@@ -654,14 +726,15 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     // ── SPA Router ───────────────────────────────────────────────────────────
 
     const ROUTES = {{
-        '/ui':          renderHome,
-        '/ui/':         renderHome,
-        '/ui/topology': renderTopology,
-        '/ui/nodes':    renderNodesList,
-        '/ui/volumes':  renderVolumes,
-        '/ui/explorer': renderExplorer,
-        '/ui/audit':    renderAudit,
-        '/ui/settings': renderSettings,
+        '/ui':            renderHome,
+        '/ui/':           renderHome,
+        '/ui/topology':   renderTopology,
+        '/ui/nodes':      renderNodesList,
+        '/ui/volumes':    renderVolumes,
+        '/ui/explorer':   renderExplorer,
+        '/ui/migrations': renderMigrations,
+        '/ui/audit':      renderAudit,
+        '/ui/settings':   renderSettings,
     }};
 
     let refreshTimer = null;
@@ -966,9 +1039,10 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <h2>Data Explorer</h2>
                 <p class="page-desc">Browse files across all volumes</p>
             </div>
-            <div style="display:flex;gap:.75rem;margin-bottom:1rem">
+            <div style="display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap">
                 <input id="explorer-filter" type="text" class="form-input" placeholder="Filter by path…" style="max-width:320px">
-                <button class="btn-primary" onclick="loadExplorer()">Refresh</button>
+                <button class="btn-primary"   onclick="loadExplorer()">Refresh</button>
+                <button class="btn-secondary" onclick="openMigrate('')" title="Schedule migration for any path prefix">Migrate path…</button>
             </div>
             <div id="explorer-list"><div class="placeholder">Loading…</div></div>`;
         document.getElementById('explorer-filter').addEventListener('input', () => loadExplorer());
@@ -987,8 +1061,11 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             return;
         }}
         el.innerHTML = '<div class="table-card"><table>' +
-            '<thead><tr><th>Path</th><th>Volume</th><th>Chunks</th><th>Size</th><th>Created</th></tr></thead><tbody>' +
-            files.map(f => `<tr>
+            '<thead><tr><th>Path</th><th>Volume</th><th>Chunks</th><th>Size</th><th>Created</th><th></th></tr></thead><tbody>' +
+            files.map(f => {{
+                const safePath  = (f.path || '').replace(/'/g, "&#39;");
+                const parentDir = (f.path || '').replace(/[^/]*$/, '');
+                return `<tr>
                 <td style="font-family:monospace;font-size:.8rem;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{f.path||''}}">
                     ${{f.path||'—'}}
                 </td>
@@ -996,10 +1073,150 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <td>${{f.chunk_count||0}}</td>
                 <td>${{fmtBytes(f.total_size||0)}}</td>
                 <td style="font-size:.78rem;color:var(--text-muted)">${{f.created_at ? timeAgo(f.created_at) : '—'}}</td>
+                <td style="white-space:nowrap">
+                    <button class="btn-secondary" style="font-size:.72rem;padding:.2rem .5rem"
+                            onclick="openMigrate('${{safePath}}')" title="Migrate just this file">file</button>
+                    <button class="btn-secondary" style="font-size:.72rem;padding:.2rem .5rem"
+                            onclick="openMigrate('${{parentDir.replace(/'/g, "&#39;")}}')" title="Migrate parent folder">folder</button>
+                </td>
+            </tr>`;
+            }}).join('') +
+            `</tbody></table>` +
+            `<div style="padding:.75rem 1.25rem;font-size:.78rem;color:var(--text-muted);border-top:1px solid var(--border)">
+                Showing ${{files.length}} of ${{data.count||0}} files · use the buttons on the right to migrate a single file or the whole folder
+            </div></div>`;
+    }}
+
+    // ── Migrate dialog (operator-driven path migration) ──────────────────────
+
+    async function openMigrate(prefix) {{
+        // Populate the DC picker from the live node list so the user only sees
+        // datacenters that actually exist.
+        const nodes = await fetch('/api/v1/nodes').then(r => r.json()).catch(() => []);
+        const dcs = Array.from(new Set(nodes
+            .map(n => (n.location || '').split('/')[1])
+            .filter(Boolean)
+        )).sort();
+        const dcSel = document.getElementById('m-dc');
+        dcSel.innerHTML = '<option value="">Any datacenter</option>' +
+            dcs.map(dc => `<option value="${{dc}}">${{dc}}</option>`).join('');
+
+        document.getElementById('m-path').value = prefix || '';
+        document.getElementById('m-result').style.display = 'none';
+        document.getElementById('m-result').textContent = '';
+        document.getElementById('m-empty-row').style.display = (prefix === '') ? 'block' : 'none';
+        document.getElementById('m-allow-empty').checked = false;
+        document.getElementById('m-submit').disabled = false;
+        document.getElementById('migrate-modal').classList.remove('hidden');
+        document.getElementById('m-path').focus();
+    }}
+
+    function closeMigrate() {{
+        document.getElementById('migrate-modal').classList.add('hidden');
+    }}
+
+    async function submitMigrate() {{
+        const path        = document.getElementById('m-path').value;
+        const tier        = document.getElementById('m-tier').value;
+        const dcRaw       = document.getElementById('m-dc').value;
+        const allowEmpty  = document.getElementById('m-allow-empty').checked;
+        const result      = document.getElementById('m-result');
+        const submitBtn   = document.getElementById('m-submit');
+
+        submitBtn.disabled = true;
+        result.style.display = 'block';
+        result.className = 'modal-result';
+        result.textContent = 'Scheduling…';
+
+        const body = {{
+            path_prefix: path,
+            target_tier: tier,
+            allow_empty_prefix: allowEmpty,
+        }};
+        if (dcRaw) body.target_dc = dcRaw;
+
+        try {{
+            const resp = await fetch('/api/v1/migrations', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify(body),
+            }});
+            const data = await resp.json();
+            if (!resp.ok) {{
+                result.className = 'modal-result error';
+                result.textContent = (data && data.error) ? data.error : ('HTTP ' + resp.status);
+                submitBtn.disabled = false;
+                return;
+            }}
+            result.className = 'modal-result success';
+            result.textContent =
+                'Files matched: '       + (data.files_matched     ?? 0) + '\n' +
+                'Chunks total: '        + (data.chunks_total      ?? 0) + '\n' +
+                'Already satisfied: '   + (data.already_satisfied ?? 0) + '\n' +
+                'Tasks scheduled: '     + (data.tasks_scheduled   ?? 0) + '\n' +
+                'No healthy source: '   + (data.no_source         ?? 0) + '\n' +
+                'No matching target: '  + (data.no_target         ?? 0) +
+                (data.truncated_chunks ? ('\nTruncated (re-run): ' + data.truncated_chunks) : '') +
+                ((data.examples && data.examples.length)
+                    ? '\n\nExamples:\n' + data.examples.map(e =>
+                        '  · ' + e.path + ' [chunk ' + e.chunk_index + '] → ' + e.reason
+                      ).join('\n')
+                    : ''
+                );
+        }} catch (e) {{
+            result.className = 'modal-result error';
+            result.textContent = 'Request failed: ' + e;
+            submitBtn.disabled = false;
+        }}
+    }}
+
+    // ── Migrations page ──────────────────────────────────────────────────────
+
+    async function renderMigrations() {{
+        document.getElementById('page-content').innerHTML =
+            `<div class="page-header">
+                <h2>Migrations</h2>
+                <p class="page-desc">Manual + automatic chunk migration tasks (refreshed every 5s)</p>
+            </div>
+            <div style="display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap">
+                <button class="btn-primary"   onclick="loadMigrations()">Refresh</button>
+                <button class="btn-secondary" onclick="openMigrate('')">+ New migration</button>
+            </div>
+            <div id="migrations-list"><div class="placeholder">Loading…</div></div>`;
+        await loadMigrations();
+        refreshTimer = setInterval(loadMigrations, 5000);
+    }}
+
+    async function loadMigrations() {{
+        const data = await fetch('/api/v1/migrations').then(r => r.json()).catch(() => ({{count:0,tasks:[]}}));
+        const el = document.getElementById('migrations-list');
+        if (!el) return;
+        const tasks = data.tasks || [];
+        if (tasks.length === 0) {{
+            el.innerHTML = '<div class="placeholder">No migration tasks. Schedule one from Data Explorer or the “+ New migration” button.</div>';
+            return;
+        }}
+        const statusColor = (s) => {{
+            if (s === 'done')      return 'var(--success)';
+            if (s === 'failed')    return 'var(--danger)';
+            if (s === 'pending')   return 'var(--text-muted)';
+            return 'var(--warning)'; // copying/verifying/completing
+        }};
+        el.innerHTML = '<div class="table-card"><table>' +
+            '<thead><tr><th>Task</th><th>Chunk</th><th>Src → Tgt</th><th>Tier</th><th>Status</th><th>Attempts</th><th>Updated</th><th>Last error</th></tr></thead><tbody>' +
+            tasks.map(t => `<tr>
+                <td style="font-family:monospace;font-size:.75rem">${{t.task_id||'—'}}</td>
+                <td style="font-family:monospace;font-size:.75rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{t.chunk_id||''}}">${{(t.chunk_id||'').slice(0,16)}}…</td>
+                <td style="font-family:monospace;font-size:.78rem">${{t.source_node||'?'}} → ${{t.target_node||'?'}}</td>
+                <td><span class="badge badge-${{(t.tier||'').toLowerCase()}}">${{t.tier||'—'}}</span></td>
+                <td style="color:${{statusColor((t.status||'').toLowerCase())}};font-weight:600">${{t.status||'—'}}</td>
+                <td>${{t.attempts ?? 0}}</td>
+                <td style="font-size:.75rem;color:var(--text-muted)">${{t.updated_at_ms ? timeAgo(t.updated_at_ms) : '—'}}</td>
+                <td style="font-size:.75rem;color:var(--text-muted);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{t.last_error||''}}">${{t.last_error||'—'}}</td>
             </tr>`).join('') +
             `</tbody></table>` +
             `<div style="padding:.75rem 1.25rem;font-size:.78rem;color:var(--text-muted);border-top:1px solid var(--border)">
-                Showing ${{files.length}} of ${{data.count||0}} files
+                ${{data.count}} task(s) tracked
             </div></div>`;
     }}
 
