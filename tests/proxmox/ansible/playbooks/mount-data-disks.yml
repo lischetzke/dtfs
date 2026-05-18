@@ -1,0 +1,92 @@
+---
+# One-time: format + mount the per-tier data disks attached by pve.ps1.
+# Robust to device-name variance: discovers unmounted blank disks via
+# lsblk, sorts by size desc, and assigns to dtfs_disks in order
+# (largest → first tier, e.g. hot before cold).
+- name: Format + mount per-tier data disks
+  hosts: data_nodes
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Stop dtfs-data so we can re-mount underneath it
+      ansible.builtin.systemd:
+        name: dtfs-data
+        state: stopped
+      ignore_errors: true
+
+    - name: Unmount any previously mounted tier paths (clean slate)
+      ansible.posix.mount:
+        path: "{{ item.path }}"
+        state: unmounted
+      loop: "{{ dtfs_disks }}"
+      ignore_errors: true
+
+    - name: Discover unmounted blank disks (sorted by size DESC)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        # List all `disk` type devices, exclude any with children
+        # (i.e. partitions or holders) and any already mounted.
+        lsblk -dnb -o NAME,SIZE,TYPE,MOUNTPOINTS \
+          | awk '$3=="disk" && $4=="" { print $2, $1 }' \
+          | while read size name; do
+              # Skip if the disk has any partitions / children.
+              if lsblk -n /dev/$name 2>/dev/null | tail -n +2 | grep -q .; then
+                continue
+              fi
+              echo "$size /dev/$name"
+            done \
+          | sort -k1,1nr
+      register: blank_disks_raw
+      changed_when: false
+
+    - name: Parse blank disks into ordered device list
+      ansible.builtin.set_fact:
+        blank_devices: "{{ blank_disks_raw.stdout_lines | map('split') | map('last') | list }}"
+
+    - name: Show planned device → tier mapping
+      ansible.builtin.debug:
+        msg: |
+          tiers (in inventory order):
+          {% for d in dtfs_disks %}
+            - {{ d.tier }} → {{ blank_devices[loop.index0] | default('NONE') }}
+          {% endfor %}
+
+    - name: Fail if we don't have enough blank devices
+      ansible.builtin.fail:
+        msg: "Need {{ dtfs_disks | length }} blank disks; found {{ blank_devices | length }}"
+      when: blank_devices | length < dtfs_disks | length
+
+    - name: Format each data disk as XFS (idempotent)
+      community.general.filesystem:
+        fstype: xfs
+        dev: "{{ blank_devices[ansible_loop.index0] }}"
+        force: false
+      loop: "{{ dtfs_disks }}"
+      loop_control:
+        extended: true
+
+    - name: Mount each data disk to its tier path
+      ansible.posix.mount:
+        path: "{{ item.path }}"
+        src: "{{ blank_devices[ansible_loop.index0] }}"
+        fstype: xfs
+        opts: noatime,nodiratime
+        state: mounted
+      loop: "{{ dtfs_disks }}"
+      loop_control:
+        extended: true
+
+    - name: Ensure ownership of tier mount points
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        owner: dtfs
+        group: dtfs
+        mode: '0755'
+        state: directory
+      loop: "{{ dtfs_disks }}"
+
+    - name: Restart dtfs-data so it picks up the mounted disks
+      ansible.builtin.systemd:
+        name: dtfs-data
+        state: restarted
+        enabled: true
