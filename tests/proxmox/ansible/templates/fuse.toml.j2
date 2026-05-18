@@ -3,8 +3,10 @@
 
 [client]
 # P0-3: multi-manager failover. The client connects to manager_addr first;
-# on transport errors it walks manager_addrs in order.
-manager_addr = "{{ hostvars['mgr-01'].ansible_host }}:9401"
+# on transport errors it walks manager_addrs in order. The primary is the
+# first manager in the inventory group (Plexmedia: mgr01 in LELI;
+# 3-DC: mgr-01 in dc-a).
+manager_addr = "{{ hostvars[groups['managers'][0]].ansible_host }}:9401"
 manager_addrs = [
 {% for mgr in groups['managers'] %}
   "{{ hostvars[mgr].ansible_host }}:9401",
