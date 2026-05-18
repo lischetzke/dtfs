@@ -27,7 +27,7 @@ listen_addr = "0.0.0.0:9402"
 mode = "auto"
 
 [defaults]
-chunk_size_mb = 128
+chunk_size_mb = 4
 
 [defaults.write_safety]
 min_replicas_before_ack = 2

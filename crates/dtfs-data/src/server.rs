@@ -49,8 +49,13 @@ pub async fn run_grpc_server(
     // alongside the ARC cache + tonic + raft overhead. Otherwise fall
     // back to whatever they configured in `grpc.max_concurrent_chunk_writes`
     // (default 8). The data node doesn't have per-volume chunk size
-    // visibility here, so we estimate at 128 MB (the cluster default).
-    let chunk_size_bytes: u64 = 128 * 1024 * 1024;
+    // visibility here, so we use a conservative worst-case estimate of
+    // 16 MB: 4× the workspace default chunk size (4 MB) so larger
+    // volumes still get a sensible (smaller) slot count rather than
+    // over-allocating slots that would breach the memory budget.
+    // Streaming put_chunk (Bug I) means the actual in-memory cost per
+    // slot is ~1 MB, so this estimate is mostly defensive.
+    let chunk_size_bytes: u64 = 16 * 1024 * 1024;
     // Overhead estimate: ARC cache + 256 MB for tonic/raft/kernel pages.
     let static_overhead_bytes =
         (config.cache.max_memory_mb as u64) * 1024 * 1024 + 256 * 1024 * 1024;
