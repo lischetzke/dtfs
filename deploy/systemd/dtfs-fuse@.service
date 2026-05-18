@@ -19,10 +19,28 @@ User=root
 # "ignore failure" so the first-ever launch (no stale mount) also works.
 ExecStartPre=-/bin/fusermount3 -u /%I
 ExecStart=/usr/local/bin/dtfs-fuse --config /etc/dtfs/fuse.toml --mountpoint /%I
+# Bug U — on `systemctl stop` we deliver SIGTERM, which our signal handler
+# uses to drive a clean MountHandle::unmount() (lets the kernel flush
+# every open handle via FUSE flush+release ops) and release this PID's
+# write leases on the manager. The fusermount3 -u on ExecStop is the
+# fallback in case our handler hung up; it forces the kernel-level
+# unmount regardless.
 ExecStop=/bin/fusermount3 -u /%I
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+SendSIGKILL=yes
 LimitNOFILE=65535
+
+# Bug V — cooperative memory budget for composite hosts. The FUSE client
+# holds writebuf segments (≤ chunk_size_mb per open writer), readahead
+# pages, and the local-cache index. 1 GB is a sane default for a Plex
+# client. Drop-in to enable:
+#   /etc/systemd/system/dtfs-fuse@.service.d/memory.conf
+#     [Service]
+#     MemoryHigh=800M
+#     MemoryMax=1024M
 
 # FUSE requires CAP_SYS_ADMIN.
 AmbientCapabilities=CAP_SYS_ADMIN

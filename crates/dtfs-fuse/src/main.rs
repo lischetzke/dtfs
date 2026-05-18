@@ -157,6 +157,10 @@ async fn main() -> Result<()> {
     // moving fuse_config into DtfsFilesystem.
     let local_cache_cfg = fuse_config.cache.clone();
     let client_location = fuse_config.location.clone();
+    // Bug U — keep a handle to the client (cheap Arc clone) so we can
+    // release this PID's leases on the way out, after DtfsFilesystem has
+    // taken ownership of its own copy.
+    let shutdown_client = client.clone();
     let mut fs = DtfsFilesystem::new(
         client,
         client_location,
@@ -231,9 +235,85 @@ async fn main() -> Result<()> {
             .await
             .context("fuse3 mount failed")?;
 
-        // Block until the filesystem is unmounted (e.g., via `fusermount -u`
-        // or process signal).
-        handle.await.context("fuse3 session error")?;
+        // Bug U — graceful shutdown for the FUSE client.
+        //
+        // Data integrity is the prime directive: if systemd sends SIGTERM
+        // (`systemctl stop dtfs-fuse`) we MUST
+        //   1. Tell the kernel to unmount the filesystem cleanly so that
+        //      any cached writes flush out via FUSE flush/release ops,
+        //   2. Release this PID's outstanding write leases on the manager
+        //      so the next acquirer doesn't have to wait `lease_ms` for
+        //      them to expire.
+        // Without step 1 a SIGKILL on us would leave the mount in a
+        // half-dead state ("Transport endpoint is not connected") that
+        // requires manual `fusermount -uz` to clean up.
+        let mut handle = handle;
+        let signal_fut = wait_for_terminate_signal();
+        tokio::pin!(signal_fut);
+
+        let session_result = tokio::select! {
+            res = &mut handle => {
+                // External unmount (fusermount -u, or kernel umount).
+                info!("FUSE session exited externally");
+                res
+            }
+            _ = &mut signal_fut => {
+                info!("Bug U signal received — calling MountHandle::unmount() for clean teardown");
+                // Move the handle out of the select! borrow scope and
+                // request a synchronous unmount. The kernel will issue
+                // flush()/release() ops on every open inode before this
+                // returns, giving writebuf a chance to push final segments.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    handle.unmount(),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        info!("Bug U FUSE unmount completed cleanly");
+                        Ok(())
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "Bug U FUSE unmount returned error — kernel may have already dropped the mount");
+                        Ok(())
+                    }
+                    Err(_) => {
+                        tracing::warn!("Bug U FUSE unmount timed out after 30s — orphan mount may require `fusermount -uz`");
+                        Ok(())
+                    }
+                }
+            }
+        };
+        session_result.context("fuse3 session error")?;
+
+        // Bug U step 2: release this process's leases before exiting.
+        // The kernel unmount above released local FDs but the *manager-side*
+        // lease state still names this PID. Without this call, a write to
+        // the same path right after we exit would block on the lease GC
+        // tick (1s) plus lease_ms (15s) before a new writer could acquire.
+        //
+        // Bounded by 5s — same reasoning as the startup cleanup: don't
+        // hold systemd hostage. Use the same hostname/PID as startup so
+        // we exactly undo our own footprint.
+        let exit_release = shutdown_client.release_leases_by_host(&hostname_for_cleanup, current_pid);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), exit_release).await {
+            Ok(Ok(resp)) => {
+                if resp.released_count > 0 {
+                    info!(
+                        host = %hostname_for_cleanup,
+                        pid = current_pid,
+                        released = resp.released_count,
+                        "Bug U released own write leases on exit"
+                    );
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "Bug U exit-time lease release failed");
+            }
+            Err(_) => {
+                tracing::warn!("Bug U exit-time lease release timed out");
+            }
+        }
 
         info!("DTFS unmounted from {}", mountpoint);
     }
@@ -253,4 +333,37 @@ async fn main() -> Result<()> {
 
     info!("DTFS FUSE client exiting");
     Ok(())
+}
+
+/// Bug U — block until SIGTERM (systemd stop) or SIGINT (Ctrl+C). Logs which
+/// signal woke us. The kernel sends SIGTERM on `systemctl stop`, SIGINT on
+/// foreground Ctrl+C — handling both keeps dev and prod behaviour identical.
+async fn wait_for_terminate_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "failed to install SIGTERM handler");
+                return;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "failed to install SIGINT handler");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => info!("SIGTERM received"),
+            _ = sigint.recv() => info!("SIGINT received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Ctrl+C received");
+    }
 }

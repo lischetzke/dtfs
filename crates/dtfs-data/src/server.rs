@@ -34,12 +34,24 @@ pub struct DataServiceImpl {
     memory: Arc<MemoryBudget>,
 }
 
+/// Handle that main can use to drive Bug U graceful shutdown after the
+/// gRPC server has finished accepting new connections.
+pub struct ServerContext {
+    /// Bug D / Bug G semaphore that bounds in-flight put_chunk operations.
+    /// On SIGTERM we wait for every permit to come back before exiting.
+    pub write_slots: Arc<Semaphore>,
+    /// Initial permit count — Semaphore doesn't expose this.
+    pub max_writes: usize,
+}
+
 pub async fn run_grpc_server(
     config: DataNodeConfig,
     store: Arc<ChunkStore>,
     metrics: Arc<DataMetrics>,
     cache: Arc<ArcCache>,
     memory: Arc<MemoryBudget>,
+    shutdown: impl std::future::Future<Output = ()>,
+    ctx_tx: Option<tokio::sync::oneshot::Sender<ServerContext>>,
 ) -> anyhow::Result<()> {
     let addr = config.grpc.listen_addr.parse()?;
     let replication = Arc::new(ReplicationManager::new(store.clone(), config.clone()));
@@ -76,18 +88,31 @@ pub async fn run_grpc_server(
             max_writes
         );
     }
+    let write_slots = Arc::new(Semaphore::new(max_writes));
+    // Bug U — hand the slot semaphore back to main so it can wait for the
+    // in-flight writes to drain when SIGTERM arrives.
+    if let Some(tx) = ctx_tx {
+        let _ = tx.send(ServerContext {
+            write_slots: write_slots.clone(),
+            max_writes,
+        });
+    }
+
     let service = DataServiceImpl {
         config: config.clone(),
         store,
         replication,
         metrics,
         cache,
-        write_slots: Arc::new(Semaphore::new(max_writes)),
+        write_slots,
         memory,
     };
 
     tracing::info!("Data node gRPC server listening on {}", addr);
 
+    // Bug U — `serve_with_shutdown` lets tonic stop accepting new connections
+    // when the signal fires, but in-flight requests keep running until they
+    // complete (or until we abandon them in main).
     tonic::transport::Server::builder()
         .add_service(
             DataServiceServer::new(service)
@@ -96,7 +121,7 @@ pub async fn run_grpc_server(
                 .max_decoding_message_size(32 * 1024 * 1024)
                 .max_encoding_message_size(32 * 1024 * 1024),
         )
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown)
         .await?;
 
     Ok(())

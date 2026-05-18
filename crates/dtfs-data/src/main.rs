@@ -14,6 +14,7 @@ mod metrics;
 mod replication;
 mod scrub;
 mod server;
+mod shutdown;
 mod store;
 
 use dtfs_common::config::DataNodeConfig;
@@ -130,15 +131,132 @@ async fn main() -> anyhow::Result<()> {
             "Bug G memory budget configured"
         );
     }
+    // Bug V — drive the cooperative strategy ladder: under memory
+    // pressure shrink the ARC cache (level 1) before refusing writes
+    // (level 2 — Bug G's existing reject behavior). Matches Ceph OSD's
+    // best-effort autotuner pattern: give back RAM without making the
+    // client see errors.
     let mon = memory.clone();
+    let mon_cache = cache.clone();
+    let mon_cache_max = max_entries.max(64);
     tokio::spawn(async move {
-        mon.run_monitor().await;
+        mon.run_monitor_with_cache(mon_cache, mon_cache_max).await;
     });
 
-    // Start gRPC server (blocks until shutdown)
-    server::run_grpc_server(config, chunk_store, data_metrics, cache, memory).await?;
+    // Bug U — graceful shutdown wiring.
+    //
+    // Data integrity is the prime directive. On SIGTERM (systemd stop) or
+    // SIGINT (Ctrl+C) we must:
+    //   1. Stop accepting new connections (tonic serve_with_shutdown does this).
+    //   2. Wait for in-flight writes to drain via the put_chunk semaphore
+    //      (Bug D / Bug G slot count).
+    //   3. Flush the pending_corruption queue so the manager learns about
+    //      quarantines we discovered just before stopping.
+    // The drain is bounded by a 30s timeout — long enough for a typical
+    // 128 MB chunk write to finish on slow disks, short enough to beat
+    // systemd's default TimeoutStopSec.
+    let (ctx_tx, ctx_rx) = tokio::sync::oneshot::channel::<server::ServerContext>();
+    let shutdown_signal = async {
+        wait_for_terminate_signal().await;
+        tracing::info!("Bug U graceful shutdown signal received — stopping accept");
+    };
 
+    // Spawn the server task so we can also drive the drain after it exits.
+    let server_handle = {
+        let config = config.clone();
+        let store = chunk_store.clone();
+        let metrics = data_metrics.clone();
+        let cache = cache.clone();
+        let memory = memory.clone();
+        tokio::spawn(async move {
+            server::run_grpc_server(
+                config,
+                store,
+                metrics,
+                cache,
+                memory,
+                shutdown_signal,
+                Some(ctx_tx),
+            )
+            .await
+        })
+    };
+
+    // Pick up the server context (write_slots + max_writes) so we can drain.
+    let server_ctx = ctx_rx
+        .await
+        .map_err(|e| anyhow::anyhow!("server never published its context: {e}"))?;
+
+    // Wait for the server to stop accepting connections.
+    match server_handle.await {
+        Ok(Ok(())) => tracing::info!("gRPC server stopped cleanly"),
+        Ok(Err(e)) => tracing::error!(error = %e, "gRPC server returned error on shutdown"),
+        Err(e) => tracing::error!(error = %e, "server task join failed"),
+    }
+
+    // Drain in-flight writes. Bounded by 30s; if a write is stuck longer
+    // than that we accept the loss and exit so systemd doesn't SIGKILL us.
+    tracing::info!(
+        max_writes = server_ctx.max_writes,
+        "Bug U waiting for in-flight chunk writes to drain (max 30s)"
+    );
+    let drain_outcome = crate::shutdown::wait_for_drain(
+        server_ctx.write_slots,
+        server_ctx.max_writes,
+        Duration::from_secs(30),
+    )
+    .await;
+    match drain_outcome {
+        crate::shutdown::DrainOutcome::Drained => {
+            tracing::info!("Bug U all in-flight writes drained cleanly");
+        }
+        crate::shutdown::DrainOutcome::Timeout {
+            permits_outstanding,
+        } => {
+            tracing::warn!(
+                stuck_writes = permits_outstanding,
+                "Bug U drain timeout — exiting with writes still in flight"
+            );
+        }
+    }
+
+    // Drain any pending corruption reports one last time. We can't send to
+    // the manager from here (the heartbeat task owns the client), but we
+    // re-enqueue them so the next startup picks them up via WAL+rescan.
+    let last_corrupt = chunk_store.drain_pending_corruption();
+    if !last_corrupt.is_empty() {
+        tracing::warn!(
+            count = last_corrupt.len(),
+            "Bug U undelivered corruption reports at shutdown — next start will rediscover via scrub"
+        );
+    }
+
+    tracing::info!("DTFS data node exited cleanly");
     Ok(())
+}
+
+/// Bug U — block until SIGTERM (systemd stop) or SIGINT (Ctrl+C).
+///
+/// On Linux we listen for both. On other platforms we only get SIGINT —
+/// which is fine for dev work; production is Linux-only.
+async fn wait_for_terminate_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut sigint =
+            signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+            _ = sigint.recv() => tracing::info!("SIGINT received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Ctrl+C received");
+    }
 }
 
 /// Register with the manager and send periodic heartbeats.
