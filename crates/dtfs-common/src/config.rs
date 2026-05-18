@@ -166,6 +166,21 @@ pub struct GrpcConfig {
     pub listen_addr: String,
     #[serde(default = "default_max_message_size")]
     pub max_message_size_mb: u32,
+    /// Max in-flight `PutChunk` operations on a data node. Bounds peak
+    /// memory: each in-flight write buffers ≤ one chunk (~128 MB by
+    /// default). Without this cap, sustained 100 MB/s rsync to a data
+    /// node OOM-kills it on 4–8 GB VMs because every concurrent gRPC
+    /// stream holds a fresh chunk in memory. SOAK-RECOVERY-2026-05-18
+    /// bug D.
+    #[serde(default = "default_max_concurrent_chunk_writes")]
+    pub max_concurrent_chunk_writes: usize,
+}
+
+fn default_max_concurrent_chunk_writes() -> usize {
+    // 8 concurrent × 128 MB chunks = ~1 GB buffer ceiling. Leaves
+    // plenty of headroom on an 8 GB data-node VM after the 512 MB ARC
+    // cache and tonic/raft overhead.
+    8
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,5 +531,101 @@ max_io_percent = 10
         assert_eq!(config.disks[1].tier, DiskTier::Cold);
         assert_eq!(config.location.datacenter, "frankfurt");
         assert_eq!(config.scrub.quick_interval_hours, 6);
+    }
+
+    /// Bug D — the data-node config MUST default
+    /// `max_concurrent_chunk_writes` to a finite value. Without a bound,
+    /// sustained streaming writes to a data node accumulate one
+    /// `chunk_size` buffer per concurrent gRPC stream and OOM-kill the
+    /// process on small VMs. Lab evidence (4 GB then 8 GB RAM data
+    /// nodes both OOM'd under rsync); SOAK-RECOVERY-2026-05-18.md bug D.
+    #[test]
+    fn bug_d_default_max_concurrent_chunk_writes_is_bounded() {
+        // Parse a minimal data-node config without a [grpc.max_concurrent_chunk_writes]
+        // line and verify the default kicks in.
+        let toml_str = r#"
+[node]
+hostname = "data-x"
+
+[location]
+region = "lab"
+datacenter = "dc-x"
+rack = "r-x"
+host = "data-x"
+
+[cluster]
+manager_addr = "mgr-01:9401"
+shared_secret = "s"
+
+[grpc]
+listen_addr = "0.0.0.0:9500"
+
+[tls]
+mode = "off"
+
+[[disks]]
+path = "/mnt/hot"
+tier = "hot"
+
+[cache]
+max_memory_mb = 512
+policy = "arc"
+
+[scrub]
+quick_interval_hours = 6
+deep_interval_hours = 168
+max_io_percent = 10
+"#;
+        let config: DataNodeConfig = toml::from_str(toml_str).unwrap();
+        let limit = config.grpc.max_concurrent_chunk_writes;
+        assert!(limit > 0, "limit must be > 0 (got {limit})");
+        // Sanity ceiling: 8 chunks × 128 MB = 1 GB; the default should
+        // sit well below the smallest VM size we plan to support
+        // (4 GB) leaving room for ARC + tonic + raft.
+        assert!(
+            limit <= 32,
+            "default max_concurrent_chunk_writes too high ({limit}) — risks OOM on small data-node VMs"
+        );
+    }
+
+    /// And operators MUST be able to override the cap from data.toml.
+    #[test]
+    fn bug_d_max_concurrent_chunk_writes_is_overridable() {
+        let toml_str = r#"
+[node]
+hostname = "data-x"
+
+[location]
+region = "lab"
+datacenter = "dc-x"
+rack = "r-x"
+host = "data-x"
+
+[cluster]
+manager_addr = "mgr-01:9401"
+shared_secret = "s"
+
+[grpc]
+listen_addr = "0.0.0.0:9500"
+max_concurrent_chunk_writes = 4
+
+[tls]
+mode = "off"
+
+[[disks]]
+path = "/mnt/hot"
+tier = "hot"
+
+[cache]
+max_memory_mb = 512
+policy = "arc"
+
+[scrub]
+quick_interval_hours = 6
+deep_interval_hours = 168
+max_io_percent = 10
+"#;
+        let config: DataNodeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.grpc.max_concurrent_chunk_writes, 4);
     }
 }

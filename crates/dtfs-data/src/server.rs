@@ -5,7 +5,7 @@ use dtfs_common::config::DataNodeConfig;
 use dtfs_common::types::{ChunkId, DiskStatus, DiskTier, VolumeId};
 use dtfs_proto::dtfs::data::data_service_server::{DataService, DataServiceServer};
 use dtfs_proto::dtfs::data::*;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -20,6 +20,12 @@ pub struct DataServiceImpl {
     replication: Arc<ReplicationManager>,
     metrics: Arc<DataMetrics>,
     cache: Arc<ArcCache>,
+    /// Bug D — caps in-flight `put_chunk` operations so peak memory is
+    /// bounded. Each in-flight write buffers up to one chunk
+    /// (~128 MB by default), so an unbounded gRPC stream count is fatal
+    /// on small VMs (4–8 GB RAM). Default 8 via
+    /// `config.grpc.max_concurrent_chunk_writes`.
+    write_slots: Arc<Semaphore>,
 }
 
 pub async fn run_grpc_server(
@@ -30,12 +36,18 @@ pub async fn run_grpc_server(
 ) -> anyhow::Result<()> {
     let addr = config.grpc.listen_addr.parse()?;
     let replication = Arc::new(ReplicationManager::new(store.clone(), config.clone()));
+    let max_writes = config.grpc.max_concurrent_chunk_writes.max(1);
+    tracing::info!(
+        "Data node put_chunk concurrency limit: {} in-flight writes (Bug D)",
+        max_writes
+    );
     let service = DataServiceImpl {
         config: config.clone(),
         store,
         replication,
         metrics,
         cache,
+        write_slots: Arc::new(Semaphore::new(max_writes)),
     };
 
     tracing::info!("Data node gRPC server listening on {}", addr);
@@ -73,6 +85,18 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<Streaming<PutChunkRequest>>,
     ) -> Result<Response<PutChunkResponse>, Status> {
+        // Bug D — acquire one of the bounded concurrency slots before we
+        // start buffering this chunk's bytes. Without this gate every
+        // concurrent gRPC stream holds ~128 MB in memory and a few dozen
+        // writers under sustained streaming load OOM-kill the data node.
+        // Waiting here gives the kernel TCP backpressure to the writer
+        // instead — slower, but never crashes.
+        let _slot = self
+            .write_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| Status::internal(format!("put_chunk slot acquire: {e}")))?;
         let mut stream = request.into_inner();
         let mut data = Vec::new();
         let mut volume_id = String::new();
