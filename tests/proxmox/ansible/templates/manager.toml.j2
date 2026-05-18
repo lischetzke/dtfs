@@ -48,14 +48,22 @@ listen_addr = "0.0.0.0:9402"
 mode = "off"
 
 [defaults]
-chunk_size_mb = 4
+chunk_size_mb = {{ dtfs_chunk_size_mb | default(4) }}
+# Bug Z — auto-create the "default" volume with this anchor at
+# bootstrap, so every chunk lands in at least one replica in this DC.
+# Plexmedia: "leli" (so data-primary01 holds every file).
+{% if dtfs_anchor_datacenter is defined and dtfs_anchor_datacenter %}
+anchor_datacenter = "{{ dtfs_anchor_datacenter }}"
+{% endif %}
 
 [defaults.write_safety]
 min_replicas_before_ack = 2
 write_timeout_secs = 30
 
 [defaults.replication]
-# hot=2 because DC-A has only 2 hot-tier data nodes (hot rf=3 infeasible).
+# Plexmedia ships hot=0, warm=2, cold=1 (no hot tier). The first
+# tier with rf > 0 is the effective allocation tier; anchor DC adds
+# the cold-tier copy on data-primary01.
 hot = {{ dtfs_replication_hot | default(2) }}
 warm = {{ dtfs_replication_warm | default(2) }}
 cold = {{ dtfs_replication_cold | default(1) }}

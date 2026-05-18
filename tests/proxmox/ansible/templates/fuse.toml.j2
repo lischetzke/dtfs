@@ -12,6 +12,10 @@ manager_addrs = [
   "{{ hostvars[mgr].ansible_host }}:9401",
 {% endfor %}
 ]
+# Bug AA — shared_secret enables client self-registration so this
+# FUSE client appears in /api/v1/nodes with its full Location even
+# when it never writes a file.
+shared_secret = "{{ dtfs_cluster_secret | default(dtfs_shared_secret | default('rotate-me')) }}"
 
 [location]
 region = "lab"

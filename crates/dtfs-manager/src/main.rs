@@ -158,6 +158,44 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("post-bootstrap snapshot triggered");
             }
         });
+
+        // Bug Z — upsert the "default" volume so anchor enforcement and
+        // per-tier replication actually apply. Without this, allocate_chunks
+        // can't read a `VolumeConfig` and the auto-implicit volume has
+        // `anchor_datacenter = None`, so every chunk lands on whichever
+        // node round-robin happens to pick. Plexmedia operator sets
+        // `defaults.anchor_datacenter = "leli"` so data-primary01 holds a
+        // copy of every chunk.
+        let raft_for_volume = raft.clone();
+        let default_volume_replication = config.defaults.replication.clone();
+        let default_chunk_size_bytes =
+            (config.defaults.chunk_size_mb as u64).saturating_mul(1024 * 1024);
+        let default_write_safety = config.defaults.write_safety.clone();
+        let default_anchor = config.defaults.anchor_datacenter.clone();
+        tokio::spawn(async move {
+            // Wait for raft to elect a leader before proposing.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let vol_cfg = dtfs_common::types::VolumeConfig {
+                id: dtfs_common::types::VolumeId::new("default".to_string()),
+                name: "default".to_string(),
+                chunk_size_bytes: default_chunk_size_bytes,
+                replication: default_volume_replication,
+                write_safety: default_write_safety,
+                anchor_datacenter: default_anchor.clone(),
+            };
+            match raft_for_volume
+                .client_write(dtfs_raft::ClientRequest::UpsertVolume { config: vol_cfg })
+                .await
+            {
+                Ok(_) => tracing::info!(
+                    anchor = ?default_anchor,
+                    "Bug Z default volume upserted with anchor enforcement"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Bug Z default volume upsert failed at bootstrap")
+                }
+            }
+        });
     }
 
     // --- Shared services ---

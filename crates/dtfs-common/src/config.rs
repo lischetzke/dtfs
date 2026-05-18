@@ -274,6 +274,12 @@ pub struct DefaultsConfig {
     pub write_safety: WriteSafety,
     #[serde(default)]
     pub replication: TierReplication,
+    /// Bug Z — anchor datacenter for the auto-created "default" volume.
+    /// When set, every chunk placement guarantees at least one replica
+    /// lives in this DC. Plexmedia: `"leli"` so data-primary01 always
+    /// holds a copy of every file. `None` = no anchor enforcement.
+    #[serde(default)]
+    pub anchor_datacenter: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +385,13 @@ pub struct FuseClientConfig {
     /// becomes unreachable (F-024 hardening).
     #[serde(default)]
     pub manager_addrs: Vec<String>,
+    /// Bug AA — cluster shared secret. Required for client
+    /// self-registration via RegisterNode(role="client"). Same secret
+    /// that data nodes + manager peers use; missing/empty means the
+    /// client doesn't self-register and only appears in the topology
+    /// when it holds an active write lease (legacy behavior).
+    #[serde(default)]
+    pub shared_secret: String,
 }
 
 impl FuseClientConfig {

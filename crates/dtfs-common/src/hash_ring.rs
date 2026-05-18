@@ -215,7 +215,14 @@ impl ConsistentHashRing {
                 .zip(selected_dcs.iter())
                 .any(|(_, dc)| dc == anchor);
             if !already_in_anchor {
-                // Find a candidate in the anchor DC matching tier+host rules.
+                // Find a candidate in the anchor DC. Bug Z — relax the tier
+                // constraint for the anchor swap: in Plexmedia the warm tier
+                // (rf=2) has no node in LELI, but the cold-tier
+                // `data-primary01` lives there. Without this relaxation
+                // the anchor invariant is "unsatisfiable" for every chunk
+                // because no warm node exists in LELI. The anchor copy
+                // landing on a different tier is acceptable — its role is
+                // durability, not access latency.
                 let iter = self
                     .ring
                     .range(start_position..)
@@ -223,9 +230,6 @@ impl ConsistentHashRing {
                 let mut anchor_candidate: Option<NodeId> = None;
                 let mut anchor_host: Option<String> = None;
                 for (_, vn) in iter {
-                    if vn.tier != rule.tier {
-                        continue;
-                    }
                     if vn.location.datacenter != *anchor {
                         continue;
                     }

@@ -153,6 +153,32 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Bug AA — self-register with the manager so the topology view
+    // shows this FUSE client even when it never writes (read-only Plex
+    // viewers). Best-effort with a 5s timeout; failure doesn't block
+    // mount because the user-visible filesystem still works.
+    let register_loc = dtfs_proto::dtfs::common::Location {
+        region: fuse_config.location.region.clone(),
+        datacenter: fuse_config.location.datacenter.clone(),
+        rack: fuse_config.location.rack.clone(),
+        host: fuse_config.location.host.clone(),
+    };
+    let register_hostname = fuse_config.location.host.clone();
+    let register_secret = Some(fuse_config.client.shared_secret.clone());
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.register_self_as_client(&register_hostname, register_loc, register_secret),
+    )
+    .await
+    {
+        Ok(Ok(())) => info!(
+            host = %register_hostname,
+            "Bug AA self-registered as client"
+        ),
+        Ok(Err(e)) => tracing::warn!(error = %e, "Bug AA self-register failed; proceeding"),
+        Err(_) => tracing::warn!("Bug AA self-register timed out; proceeding"),
+    }
+
     // P0-11: set up the disk-backed local cache (if configured) before
     // moving fuse_config into DtfsFilesystem.
     let local_cache_cfg = fuse_config.cache.clone();

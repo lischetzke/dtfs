@@ -136,6 +136,12 @@ pub enum DataTemperature {
 pub enum NodeRole {
     Manager,
     Data,
+    /// Bug AA — FUSE client self-registers via RegisterNode so its
+    /// location is visible in the topology view even when it has no
+    /// active leases. Treated like a non-storage node by the placement
+    /// engine (excluded from chunk placement) but appears in the
+    /// `/api/v1/nodes` listing.
+    Client,
 }
 
 /// Health status of a node or disk.

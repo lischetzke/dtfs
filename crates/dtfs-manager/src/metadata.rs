@@ -285,14 +285,29 @@ impl ManagerService for MetadataService {
         }
 
         let node_id = dtfs_common::node_id_from_hostname(&req.hostname);
-        let grpc_addr = build_data_grpc_addr(peer_addr, &req.hostname, req.grpc_port);
+        // Bug AA — clients have no gRPC listener; storing a sentinel
+        // 0-port URL would invite the scheduler to dial it on the
+        // failover path. Use empty string for clients; data + manager
+        // entries use the proper peer-derived URL (Bug W).
+        let is_client = req.role.eq_ignore_ascii_case("client");
+        let grpc_addr = if is_client {
+            String::new()
+        } else {
+            build_data_grpc_addr(peer_addr, &req.hostname, req.grpc_port)
+        };
         let disks = disks_from_register_req(&req.disks);
         let total_capacity: u64 = disks.iter().map(|d| d.total_bytes).sum();
         let used_capacity: u64 = disks.iter().map(|d| d.used_bytes).sum();
 
         let info = RaftNodeInfo {
+            // Bug AA — accept "client" role for FUSE self-registration.
+            // Clients appear in /api/v1/nodes with their location but
+            // are excluded from chunk placement (PlacementEngine filters
+            // by NodeRole::Data).
             role: if req.role.eq_ignore_ascii_case("manager") {
                 NodeRole::Manager
+            } else if is_client {
+                NodeRole::Client
             } else {
                 NodeRole::Data
             },
@@ -623,19 +638,34 @@ impl ManagerService for MetadataService {
             return Err(Status::unavailable("No data nodes available"));
         }
 
-        let replication = self
-            .config
-            .defaults
-            .replication
-            .hot
-            .max(1)
-            .min(data.nodes.len() as u32);
+        // Bug Z — look up the volume's anchor_datacenter and effective
+        // tier+replication. Falls back to manager-config defaults when
+        // the volume isn't registered yet (e.g. very early after bootstrap
+        // before the UpsertVolume Raft entry has applied). The effective
+        // tier is the first one with rf > 0 in (hot, warm, cold) order;
+        // this lets Plexmedia (hot=0, warm=2, cold=1) work without
+        // hard-coding Hot. The anchor enforcement happens in
+        // `place_chunks_with_anchor` via the hash-ring rule.
+        let volume_cfg = data.volumes.get(&req.volume_id).cloned();
+        let (effective_tier, effective_rf, anchor_dc) = match &volume_cfg {
+            Some(v) => {
+                let (tier, rf) = pick_effective_tier(&v.replication);
+                (tier, rf, v.anchor_datacenter.clone())
+            }
+            None => (
+                DiskTier::Hot,
+                self.config.defaults.replication.hot.max(1),
+                self.config.defaults.anchor_datacenter.clone(),
+            ),
+        };
+        let replication = effective_rf.max(1).min(data.nodes.len() as u32);
 
-        let placed = self.placement.place_chunks(
+        let placed = self.placement.place_chunks_with_anchor(
             &req.volume_id,
             req.num_chunks,
-            DiskTier::Hot,
+            effective_tier,
             replication,
+            anchor_dc.clone(),
         );
 
         let mut placements = Vec::new();
@@ -1123,6 +1153,71 @@ impl ManagerService for MetadataService {
         Ok(Response::new(ReleaseLeasesByHostResponse {
             released_count: count,
         }))
+    }
+}
+
+/// Bug Z — pick the first tier with rf > 0 from a `TierReplication`,
+/// returning the tier and its replication factor. Plexmedia ships
+/// `hot=0, warm=2, cold=1` so the right tier for new allocations is
+/// `Warm` with rf=2 (anchor handling adds the cold copy via the hash-ring
+/// rule). Tier preference order is hot → warm → cold so existing
+/// deployments with rf hot > 0 keep their old behavior.
+pub(crate) fn pick_effective_tier(
+    rep: &dtfs_common::types::TierReplication,
+) -> (dtfs_common::types::DiskTier, u32) {
+    use dtfs_common::types::DiskTier;
+    if rep.hot > 0 {
+        (DiskTier::Hot, rep.hot)
+    } else if rep.warm > 0 {
+        (DiskTier::Warm, rep.warm)
+    } else if rep.cold > 0 {
+        (DiskTier::Cold, rep.cold)
+    } else {
+        // Fully zero — caller will fall back through the round-robin path.
+        (DiskTier::Hot, 1)
+    }
+}
+
+#[cfg(test)]
+#[allow(unused_imports)]
+mod bug_z_tier_tests {
+    use super::*;
+    use dtfs_common::types::{DiskTier, TierReplication};
+
+    /// Bug Z — Plexmedia config (hot=0, warm=2, cold=1) picks Warm.
+    #[test]
+    fn bug_z_plexmedia_picks_warm() {
+        let rep = TierReplication {
+            hot: 0,
+            warm: 2,
+            cold: 1,
+            tape: 0,
+        };
+        assert_eq!(pick_effective_tier(&rep), (DiskTier::Warm, 2));
+    }
+
+    /// Bug Z — legacy hot-only config still picks Hot.
+    #[test]
+    fn bug_z_legacy_hot_picks_hot() {
+        let rep = TierReplication {
+            hot: 3,
+            warm: 0,
+            cold: 0,
+            tape: 0,
+        };
+        assert_eq!(pick_effective_tier(&rep), (DiskTier::Hot, 3));
+    }
+
+    /// Bug Z — cold-only deep-archive config picks Cold.
+    #[test]
+    fn bug_z_cold_only_picks_cold() {
+        let rep = TierReplication {
+            hot: 0,
+            warm: 0,
+            cold: 2,
+            tape: 0,
+        };
+        assert_eq!(pick_effective_tier(&rep), (DiskTier::Cold, 2));
     }
 }
 
