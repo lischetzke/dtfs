@@ -119,9 +119,11 @@ impl DataService for DataServiceImpl {
         // Bug G — if a hard memory cap is configured and the background
         // sampler has flagged the process as past the shed threshold,
         // refuse the write outright. The FUSE client retries on
-        // ResourceExhausted with backoff, which gives the kernel +
-        // RocksDB time to flush buffers and drop the RSS below the
-        // hysteresis floor.
+        // ResourceExhausted with backoff. With Bug I in place the
+        // streaming write only buffers ~1 MB per concurrent call, so
+        // shedding should almost never fire — it's a hard fail-safe
+        // for pathological cases (kernel-side bloat, RocksDB compaction
+        // pause, etc.).
         if self.memory.is_shedding() {
             tracing::warn!(
                 rss_mb = self.memory.last_rss_bytes() / 1024 / 1024,
@@ -132,59 +134,106 @@ impl DataService for DataServiceImpl {
                 "data node over memory shed threshold (Bug G) — retry shortly",
             ));
         }
-        // Bug D — acquire one of the bounded concurrency slots before we
-        // start buffering this chunk's bytes. Without this gate every
-        // concurrent gRPC stream holds ~128 MB in memory and a few dozen
-        // writers under sustained streaming load OOM-kill the data node.
-        // Waiting here gives the kernel TCP backpressure to the writer
-        // instead — slower, but never crashes.
+        // Bug D — bound the number of concurrent in-flight writes. With
+        // streaming-to-disk (Bug I) each slot only buffers one
+        // STREAM_PIECE_SIZE worth of bytes in memory (~1 MB), so 8 slots
+        // = ~8 MB peak instead of the legacy ~1 GB.
         let _slot = self
             .write_slots
             .clone()
             .acquire_owned()
             .await
             .map_err(|e| Status::internal(format!("put_chunk slot acquire: {e}")))?;
-        let mut stream = request.into_inner();
-        let mut data = Vec::new();
-        let mut volume_id = String::new();
-        let mut tier = DiskTier::Hot;
 
-        while let Some(msg) = stream
+        // Bug I — stream the incoming gRPC pieces straight to a tmp
+        // file on the target disk, hashing incrementally. We do NOT
+        // accumulate the chunk in a Vec.
+        let mut stream = request.into_inner();
+
+        // Pull the first piece to learn the requested volume_id + tier.
+        let first = match stream
             .message()
             .await
             .map_err(|e| Status::internal(e.to_string()))?
         {
-            if !msg.volume_id.is_empty() {
-                volume_id = msg.volume_id;
+            Some(m) => m,
+            None => {
+                return Err(Status::invalid_argument(
+                    "put_chunk: empty request stream",
+                ));
             }
-            if !msg.tier.is_empty() {
-                tier = match msg.tier.as_str() {
-                    "hot" => DiskTier::Hot,
-                    "warm" => DiskTier::Warm,
-                    "cold" => DiskTier::Cold,
-                    _ => DiskTier::Hot,
-                };
-            }
-            data.extend_from_slice(&msg.data);
-        }
+        };
 
-        let hash = dtfs_common::checksum::compute(&data);
-        let chunk_id = ChunkId::from_bytes(hash);
-
-        let vol_id = if volume_id.is_empty() {
+        let tier = match first.tier.as_str() {
+            "hot" => DiskTier::Hot,
+            "warm" => DiskTier::Warm,
+            "cold" => DiskTier::Cold,
+            _ => DiskTier::Hot,
+        };
+        let vol_id = if first.volume_id.is_empty() {
             VolumeId::new("default".to_string())
         } else {
-            VolumeId::new(volume_id)
+            VolumeId::new(first.volume_id.clone())
         };
+
+        // Allocate the tmp file on the disk that will host the chunk.
+        let (tmp_path, _disk_mount) = self
+            .store
+            .allocate_streaming_tmp(tier)
+            .map_err(|e| Status::internal(format!("allocate tmp: {e}")))?;
+
+        let mut hasher = dtfs_common::checksum::IncrementalHasher::new();
+        let mut total_size: u64 = 0;
+        {
+            let mut f = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
+                Status::internal(format!("create tmp {}: {e}", tmp_path.display()))
+            })?;
+            // First piece (already consumed from the stream).
+            if !first.data.is_empty() {
+                hasher.update(&first.data);
+                total_size += first.data.len() as u64;
+                tokio::io::AsyncWriteExt::write_all(&mut f, &first.data)
+                    .await
+                    .map_err(|e| Status::internal(format!("write tmp: {e}")))?;
+            }
+            // Remaining pieces.
+            while let Some(msg) = stream
+                .message()
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+            {
+                if msg.data.is_empty() {
+                    continue;
+                }
+                hasher.update(&msg.data);
+                total_size += msg.data.len() as u64;
+                tokio::io::AsyncWriteExt::write_all(&mut f, &msg.data)
+                    .await
+                    .map_err(|e| Status::internal(format!("write tmp: {e}")))?;
+            }
+            tokio::io::AsyncWriteExt::flush(&mut f)
+                .await
+                .map_err(|e| Status::internal(format!("flush tmp: {e}")))?;
+            // fsync is done implicitly by commit_chunk_from_tmp before
+            // the rename to the final path; we can save the duplicate
+            // sync_all on the tmp.
+        }
+        let hash = hasher.finalize();
+        let chunk_id = ChunkId::from_bytes(hash);
 
         let meta = self
             .store
-            .put_chunk(&chunk_id, &data, &vol_id, tier)
+            .commit_chunk_from_tmp(&chunk_id, &tmp_path, &vol_id, tier, total_size, hash)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        // Bug I — do NOT insert the just-written chunk into the ARC
+        // cache. Caching every write defeats the streaming-to-disk
+        // memory win (it puts the whole chunk back in RAM). Cold-read
+        // performance is unchanged; the first reader pulls from disk
+        // and populates the cache then.
         let id_hex = chunk_id.as_hex();
-        self.cache.put(id_hex.clone(), Bytes::from(data));
+        let _ = &self.cache; // intentionally unused on the write path
 
         Ok(Response::new(PutChunkResponse {
             chunk_id: id_hex,

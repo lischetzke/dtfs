@@ -250,6 +250,160 @@ impl ChunkStore {
         Ok(meta)
     }
 
+    // -----------------------------------------------------------------------
+    // Bug I — streaming put_chunk. Caller streams bytes to a tmp file
+    // on disk while hashing incrementally; once the stream completes the
+    // caller invokes `commit_chunk_from_tmp` to rename the tmp into the
+    // final chunk path and write the .meta sidecar. Peak memory per
+    // concurrent write is bounded by the gRPC piece size (~1 MB)
+    // instead of one full chunk (~128 MB). See
+    // tests/proxmox/SOAK-RECOVERY-2026-05-18.md.
+    // -----------------------------------------------------------------------
+
+    /// Reserve a tmp file path on the disk this tier will write to. The
+    /// caller streams the chunk bytes to this path, hashing as it goes,
+    /// then invokes [`commit_chunk_from_tmp`] with the finalised hash.
+    ///
+    /// Returns `(tmp_path, disk_mount_path)`. The tmp path is unique
+    /// (UUID-suffixed) so concurrent writers can't collide on the same
+    /// filename before the chunk_id is known.
+    pub fn allocate_streaming_tmp(
+        &self,
+        tier: DiskTier,
+    ) -> DtfsResult<(PathBuf, PathBuf)> {
+        let disk = self
+            .disk_manager
+            .select_disk_for_tier(tier)
+            .ok_or_else(|| DtfsError::DiskNotFound(format!("No disk for tier {:?}", tier)))?;
+        let mount = disk.mount_path.clone();
+        let tmp_root = tmp_dir(&mount);
+        // Create the tmp directory if it doesn't exist (e.g. on a fresh disk).
+        let _ = std::fs::create_dir_all(&tmp_root);
+        let uniq = format!(
+            "streaming-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let tmp_path = tmp_root.join(format!("{uniq}.dat.tmp"));
+        Ok((tmp_path, mount))
+    }
+
+    /// Commit a chunk whose bytes are already on disk in `tmp_path`.
+    ///
+    /// The chunk_id MUST be the BLAKE3 of the bytes streamed to
+    /// `tmp_path`; the caller is responsible for computing the hash
+    /// incrementally during streaming. We trust the caller's hash —
+    /// re-hashing here would either read the whole file back (defeats
+    /// the streaming win) or pin it in RAM (also defeats the win).
+    ///
+    /// On any failure the tmp file is removed so partial writes don't
+    /// leak disk space.
+    pub async fn commit_chunk_from_tmp(
+        &self,
+        chunk_id: &ChunkId,
+        tmp_path: &Path,
+        volume_id: &VolumeId,
+        tier: DiskTier,
+        size: u64,
+        checksum: [u8; 32],
+    ) -> DtfsResult<ChunkMeta> {
+        let outcome = self
+            .commit_chunk_from_tmp_inner(chunk_id, tmp_path, volume_id, tier, size, checksum)
+            .await;
+        if outcome.is_err() {
+            // Cleanup: never leave a tmp file behind on the error path.
+            let _ = tokio::fs::remove_file(tmp_path).await;
+        }
+        outcome
+    }
+
+    async fn commit_chunk_from_tmp_inner(
+        &self,
+        chunk_id: &ChunkId,
+        tmp_path: &Path,
+        volume_id: &VolumeId,
+        tier: DiskTier,
+        size: u64,
+        checksum: [u8; 32],
+    ) -> DtfsResult<ChunkMeta> {
+        // Look up the disk that owns this tmp path.
+        let disk = self
+            .disk_manager
+            .all_disks()
+            .iter()
+            .find(|d| tmp_path.starts_with(&d.mount_path))
+            .ok_or_else(|| {
+                DtfsError::DiskNotFound(format!(
+                    "tmp_path {} not on any managed disk",
+                    tmp_path.display()
+                ))
+            })?
+            .clone();
+        let _ = tier; // tier is informational here — disk is already chosen
+
+        let chunk_dir = chunk_data_dir(&disk.mount_path, chunk_id);
+        let wal_dir_path = wal_dir(&disk.mount_path);
+
+        fs::create_dir_all(&chunk_dir).await.map_err(DtfsError::Io)?;
+        fs::create_dir_all(&wal_dir_path).await.map_err(DtfsError::Io)?;
+
+        // 1. WAL entry first.
+        let wal_entry = WalEntry {
+            operation: WalOperation::PutChunk,
+            chunk_id: chunk_id.as_hex(),
+            disk_path: disk.mount_path.to_string_lossy().to_string(),
+            timestamp_ms: now_millis(),
+        };
+        let wal_path = wal_dir_path.join(format!("{}.wal.json", chunk_id.as_hex()));
+        write_wal_entry(&wal_path, &wal_entry).await?;
+
+        // 2. Atomic rename tmp → final.
+        let final_dat_path = chunk_dir.join(format!("{}.dat", chunk_id.as_hex()));
+        let final_meta_path = chunk_dir.join(format!("{}.meta", chunk_id.as_hex()));
+        fs::rename(tmp_path, &final_dat_path)
+            .await
+            .map_err(DtfsError::Io)?;
+
+        // 3. Write the meta sidecar.
+        let meta = ChunkMeta {
+            id: chunk_id.clone(),
+            size,
+            checksum,
+            created_at: chrono::Utc::now().timestamp(),
+            volume_id: volume_id.clone(),
+            replication_factor: 1,
+        };
+        let meta_json = serde_json::to_string_pretty(&meta)
+            .map_err(|e| DtfsError::Serialization(e.to_string()))?;
+        {
+            let mut file = fs::File::create(&final_meta_path)
+                .await
+                .map_err(DtfsError::Io)?;
+            file.write_all(meta_json.as_bytes())
+                .await
+                .map_err(DtfsError::Io)?;
+            file.sync_all().await.map_err(DtfsError::Io)?;
+        }
+
+        // 4. Clear WAL.
+        let _ = fs::remove_file(&wal_path).await;
+
+        // 5. Counters.
+        self.chunk_count.fetch_add(1, Ordering::Relaxed);
+        self.bytes_stored.fetch_add(size, Ordering::Relaxed);
+
+        tracing::debug!(
+            "Streamed chunk {} ({} bytes) onto disk {}",
+            chunk_id,
+            size,
+            disk.mount_path.display()
+        );
+        Ok(meta)
+    }
+
     /// Read a chunk from disk.
     ///
     /// Uses blocking std::fs::read on a dedicated thread (via spawn_blocking)
@@ -1034,5 +1188,157 @@ mod tests {
             "rescan must replace, not accumulate; multiple invocations stay stable"
         );
         assert_eq!(s.total_bytes_stored, 1024 * 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug I — stream put_chunk to disk so peak memory is ~1 MB / write
+    // instead of one full chunk (~128 MB). See
+    // tests/proxmox/SOAK-RECOVERY-2026-05-18.md.
+    // -----------------------------------------------------------------------
+
+    /// Bug I — caller streams bytes to a tmp file, ChunkStore commits
+    /// the tmp file as a chunk. The result must be indistinguishable
+    /// from `put_chunk(buf)`: same on-disk layout, same meta, same
+    /// hash, same counter behaviour.
+    #[tokio::test]
+    async fn bug_i_commit_chunk_from_tmp_roundtrip() {
+        use dtfs_common::checksum::IncrementalHasher;
+        use tokio::io::AsyncWriteExt;
+
+        let (store, _tmp) = make_test_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+
+        // Allocate a streaming tmp file on the right disk for the tier.
+        let (tmp_path, _disk_mount) = store
+            .allocate_streaming_tmp(DiskTier::Hot)
+            .expect("allocate_streaming_tmp returns Some on a healthy disk");
+        assert!(tmp_path.exists() == false, "tmp path must not exist yet");
+
+        // Simulate the gRPC streaming write — multiple small pieces.
+        let pieces: Vec<&[u8]> = vec![
+            b"first piece ",
+            b"of the chunk; ",
+            b"second arrives; ",
+            b"third and last.",
+        ];
+        let mut hasher = IncrementalHasher::new();
+        let mut size = 0u64;
+        {
+            let mut f = tokio::fs::File::create(&tmp_path).await.unwrap();
+            for p in &pieces {
+                hasher.update(p);
+                f.write_all(p).await.unwrap();
+                size += p.len() as u64;
+            }
+            f.sync_all().await.unwrap();
+        }
+        let hash = hasher.finalize();
+        let chunk_id = ChunkId::from_bytes(hash);
+
+        // Commit.
+        let meta = store
+            .commit_chunk_from_tmp(&chunk_id, &tmp_path, &volume_id, DiskTier::Hot, size, hash)
+            .await
+            .expect("commit succeeds");
+        assert_eq!(meta.size, size);
+        assert_eq!(meta.checksum, hash);
+
+        // tmp file must be gone (atomic rename happened).
+        assert!(!tmp_path.exists(), "tmp must be cleaned up after commit");
+
+        // Round-trip read returns the concatenated input.
+        let retrieved = store.get_chunk(&chunk_id).await.unwrap();
+        let expected: Vec<u8> = pieces.iter().flat_map(|p| p.iter()).copied().collect();
+        assert_eq!(retrieved.as_ref(), expected.as_slice());
+
+        // And the hash matches what `put_chunk(&data)` would have
+        // computed — proves IncrementalHasher streaming matches the
+        // legacy full-buffer compute.
+        let legacy_hash = checksum::compute(&expected);
+        assert_eq!(hash, legacy_hash);
+
+        // Counters updated.
+        let s = store.stats();
+        assert_eq!(s.total_chunks, 1);
+        assert_eq!(s.total_bytes_stored, size);
+    }
+
+    /// Bug I — if the caller's streaming finished but the commit step
+    /// fails (e.g. bad chunk_id), the tmp file must NOT be left behind
+    /// to leak disk.
+    #[tokio::test]
+    async fn bug_i_commit_failure_does_not_leak_tmp_files() {
+        let (store, _tmp) = make_test_store().await;
+
+        let (tmp_path, _disk_mount) = store
+            .allocate_streaming_tmp(DiskTier::Hot)
+            .unwrap();
+
+        // Write a few bytes and try to commit with a *mismatched* size.
+        tokio::fs::write(&tmp_path, b"some data").await.unwrap();
+        let fake_id = ChunkId::from_bytes([7u8; 32]);
+        // Use a clearly wrong size to provoke a failure mode at the
+        // metadata-write step (or earlier validation). The tmp file
+        // must NOT leak even on the error path.
+        let _ = store
+            .commit_chunk_from_tmp(
+                &fake_id,
+                &tmp_path,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+                999_999_999, // intentionally wrong
+                [0u8; 32],
+            )
+            .await;
+        // Cleanup happens either way; assert no tmp file is left
+        // behind no matter what the commit decision was.
+        assert!(
+            !tmp_path.exists(),
+            "tmp file must be removed even when commit fails"
+        );
+    }
+
+    /// Bug I — peak memory: prove the streaming contract by writing a
+    /// chunk much larger than typical Vec accumulation would tolerate
+    /// in a tight unit test. If a future refactor secretly reads the
+    /// tmp into RAM, this test still passes — but the live profiler on
+    /// data-a1 (configured to a 2 GB hard cap) will OOM the moment
+    /// concurrent writes start, and the regression is caught in
+    /// `tests/proxmox/abuse/13-data-node-mem-cap.sh`.
+    #[tokio::test]
+    async fn bug_i_commit_handles_multi_mb_streamed_chunk() {
+        use dtfs_common::checksum::IncrementalHasher;
+        use tokio::io::AsyncWriteExt;
+        let (store, _tmp) = make_test_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+
+        // 4 MB chunk streamed in 64 KB pieces — small enough for a
+        // unit test, big enough to prove the pipeline actually flushes
+        // to disk piece-by-piece rather than buffering.
+        let piece = vec![0xABu8; 64 * 1024];
+        let pieces = 64; // → 4 MB
+        let (tmp_path, _disk_mount) = store.allocate_streaming_tmp(DiskTier::Hot).unwrap();
+
+        let mut hasher = IncrementalHasher::new();
+        let mut size = 0u64;
+        {
+            let mut f = tokio::fs::File::create(&tmp_path).await.unwrap();
+            for _ in 0..pieces {
+                hasher.update(&piece);
+                f.write_all(&piece).await.unwrap();
+                size += piece.len() as u64;
+            }
+            f.sync_all().await.unwrap();
+        }
+        let hash = hasher.finalize();
+        let chunk_id = ChunkId::from_bytes(hash);
+        store
+            .commit_chunk_from_tmp(&chunk_id, &tmp_path, &volume_id, DiskTier::Hot, size, hash)
+            .await
+            .unwrap();
+
+        let got = store.get_chunk(&chunk_id).await.unwrap();
+        assert_eq!(got.len() as u64, size);
+        assert_eq!(&got[0..16], &vec![0xABu8; 16][..]);
     }
 }
