@@ -9,6 +9,11 @@ Type=simple
 User=root
 # Instantiate with a systemd-escaped absolute path, e.g.
 #   systemctl start dtfs-fuse@$(systemd-escape --path {{ dtfs_mount_point }}).service
+#
+# Bug H — clear any stale mount left by a previous crashed instance so
+# the new dtfs-fuse can re-mount. `-` ignores failure (first-ever launch
+# has no stale mount).
+ExecStartPre=-/bin/fusermount3 -u /%I
 ExecStart={{ dtfs_fuse_bin }} --config {{ dtfs_config_dir }}/fuse.toml --mountpoint /%I
 ExecStop=/bin/fusermount3 -u /%I
 Restart=on-failure
