@@ -209,3 +209,152 @@ ansible-playbook tests/proxmox/ansible/playbooks/revert-shaping.yml
 # Teardown
 ansible-playbook tests/proxmox/ansible/playbooks/teardown.yml
 ```
+
+---
+
+## Plexmedia — real-world prod target
+
+The Plexmedia inventory (`tests/proxmox/inventory-plexmedia.json`) is the
+deployment shape closest to actual production. Three DCs:
+
+| DC   | Link    | Role            | Storage                                |
+|------|---------|-----------------|----------------------------------------|
+| LELI | 40 Mbps | Anchor (DSL)    | data-primary01: 4×150 GB cold (~50 TB at real scale) |
+| TORO | 400 Mbps| SSD warm+cache  | data-warm01: 180 GB SSD                |
+| NRB  | 1 Gbps  | Ingest          | data-warm02: 180 GB                    |
+
+5 managers: 3 voters in LELI (so quorum can never partition without
+LELI), 2 observers in TORO + NRB for local dashboard fast-path.
+
+3 clients: Plex viewer in LELI (LAN to primary), Plex viewer in TORO
+(40 GB disk cache + folder readahead, 90-day TTL), download ingest in
+NRB.
+
+Plex workload constants: each viewer ≤ 5 streams × 60 Mbps = 300 Mbps.
+This is why TORO at 400 Mbps is the highest sustained sink and why LELI
+viewers MUST hit the local primary — LELI's 40 Mbps uplink can't
+sustain even one cross-DC Plex stream.
+
+### Provision + deploy
+
+```powershell
+# Windows host
+pwsh tests/proxmox/provision-plexmedia.ps1
+```
+
+```bash
+# On the builder (10.20.0.150)
+cd /home/debian/dtfs2 && cargo build --release --workspace
+# Stage binaries under /home/debian/dtfs2-deploy/bin/
+cp target/release/{dtfs-manager,dtfs-data,dtfs-fuse,dtfs-cli} \
+   /home/debian/dtfs2-deploy/bin/
+
+# Run the Plexmedia deploy
+cd tests/proxmox/ansible
+ANSIBLE_ROLES_PATH=./roles \
+  ansible-playbook -i inventories/plexmedia/hosts.yml \
+  playbooks/mount-data-disks.yml \
+  playbooks/full-deploy-plexmedia.yml \
+  playbooks/apply-shaping.yml
+```
+
+### Soak chain — 1h → 4h → 8h
+
+```bash
+ssh debian@10.20.0.150 \
+  'bash /home/debian/dtfs2/tests/proxmox/soak/run-plexmedia.sh chain'
+```
+
+Chain aborts on first stage FAIL. Each stage's results dir holds the
+metrics + scenario logs for forensic review.
+
+---
+
+## Bug U — graceful shutdown
+
+All three daemons now drain on SIGTERM (systemd `stop`) instead of
+losing in-flight work to SIGKILL:
+
+- **dtfs-data**: waits up to 30s for in-flight `put_chunk` slots to
+  drain, then flushes the pending-corruption queue.
+- **dtfs-manager**: triggers a final Raft snapshot (5s budget) so the
+  on-disk state captures every committed entry; emits a "manager.stop"
+  audit event.
+- **dtfs-fuse**: calls `MountHandle::unmount()` so the kernel issues
+  flush+release on every open inode, then releases this PID's write
+  leases on the manager.
+
+systemd units now declare `TimeoutStopSec=30s` (mgr) / `45s` (data,fuse)
+with `KillSignal=SIGTERM`. Verify on a running service:
+
+```bash
+systemctl show dtfs-data | grep -E 'TimeoutStop|KillSignal'
+# Should show TimeoutStopUSec=45s, KillSignal=SIGTERM.
+
+# Verify a clean stop completes within budget:
+time sudo systemctl stop dtfs-data
+# Expect <30s; if you hit TimeoutStop the drain helper is stuck and
+# logs at WARN level — investigate before relying on graceful shutdown.
+```
+
+## Bug V — cooperative memory ladder
+
+In addition to Bug G's "shed at threshold → reject new put_chunk", the
+data node now also runs a Ceph OSD–style cooperative ladder:
+
+| Pressure | RSS                       | Action                                |
+|----------|---------------------------|---------------------------------------|
+| Normal   | < warn_threshold          | Full ARC cache                        |
+| Warn     | [warn, shed)              | Shrink ARC to 50% (LRU first)         |
+| Shed     | >= shed_threshold         | Shrink ARC to 10%, refuse put_chunk   |
+
+The shrink demotes evicted keys to ARC's B1/B2 ghost lists so the
+adaptive `p` parameter recovers once pressure subsides. No client sees
+errors until the Shed rung — clients first observe the cache shrink as
+slightly higher read latency.
+
+### Composite-host budgeting
+
+Hosts like `toro-plex` (running mgr + data + client + Plex) need
+per-role caps so Plex isn't starved. Drop-in templates under
+`/etc/systemd/system/<service>.service.d/memory.conf`:
+
+```ini
+# dtfs-data.service.d/memory.conf
+[Service]
+MemoryHigh=1800M
+MemoryMax=2048M
+```
+
+```ini
+# dtfs-manager.service.d/memory.conf
+[Service]
+MemoryHigh=400M
+MemoryMax=512M
+```
+
+```ini
+# dtfs-fuse@.service.d/memory.conf
+[Service]
+MemoryHigh=800M
+MemoryMax=1024M
+```
+
+The `data.toml` `[memory]` block independently configures the in-process
+ladder; set `hard_cap_mb` to the same value as `MemoryMax` so both
+defenses fire at the same point.
+
+---
+
+## Known operational gaps to plumb after first prod
+
+- Anchor placement is enforced per-volume (`VolumeConfig.anchor_datacenter`)
+  but `dtfs-cli volumes create` doesn't yet accept `--anchor-datacenter`.
+  Workaround: pre-create the volume with the manager API directly.
+- `manager_count` in `/api/v1/stats` only counts voters (Plexmedia: 3,
+  not 5). Non-voting observers are intentional, so this is correct —
+  but the "WARN node_count=5 expected ≥3" alert in the runbook needs
+  adjusting for inventories with observers.
+- The dtfs2-deploy staging dir on the builder (`/home/debian/dtfs2-deploy/`)
+  isn't auto-populated by `cargo build`; the runbook above includes the
+  cp step but a `scripts/stage-deploy.sh` would be a nice ergonomic.
