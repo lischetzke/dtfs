@@ -43,11 +43,25 @@ cold = 1
 
 [tiering]
 enabled = true
-hot_threshold_reads_per_hour = 5
-cold_threshold_days = 14
+hot_threshold_reads_per_hour = {{ dtfs_tiering_hot_reads_per_hour | default(5) }}
+cold_threshold_days = {{ dtfs_tiering_cold_days | default(14) }}
+frozen_threshold_days = {{ dtfs_tiering_frozen_days | default(90) }}
+evaluation_interval_secs = {{ dtfs_tiering_eval_interval_secs | default(3600) }}
 migration_bandwidth_limit_mbps = 200
 
 [monitoring]
 heartbeat_interval_secs = 5
 suspect_after_missed = 3
 down_after_missed = 6
+
+# P1-8 alert webhooks. Per-soak, a file-sink endpoint at
+# http://10.150.0.121:18081/alerts captures every fired event; the
+# post-soak report counts events per kind.
+[alerts]
+{% for w in dtfs_alert_webhooks | default([]) %}
+[[alerts.webhooks]]
+url = "{{ w.url }}"
+secret = "{{ w.secret }}"
+kinds = {{ w.kinds | default([]) | to_json }}
+dedup_secs = {{ w.dedup_secs | default(300) }}
+{% endfor %}

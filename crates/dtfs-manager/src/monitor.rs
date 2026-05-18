@@ -25,6 +25,8 @@ pub struct HealthMonitor {
     state_data: Arc<RwLock<StateMachineData>>,
     /// Raft handle used to commit node-status changes to the cluster state machine.
     raft: Arc<DtfsRaft>,
+    /// P1-8: optional alert dispatcher. NodeDown / DiskFailed fire here.
+    alerts: Option<Arc<crate::alerts::AlertDispatcher>>,
 }
 
 impl HealthMonitor {
@@ -41,7 +43,14 @@ impl HealthMonitor {
             scheduler,
             state_data,
             raft,
+            alerts: None,
         }
+    }
+
+    /// Inject the alert dispatcher after construction.
+    pub fn with_alerts(mut self, alerts: Arc<crate::alerts::AlertDispatcher>) -> Self {
+        self.alerts = Some(alerts);
+        self
     }
 
     /// Run the monitoring loop. This is intended to be spawned as a background
@@ -76,6 +85,13 @@ impl HealthMonitor {
                         );
                         // Mark in Raft so placement and tiering stop using this node.
                         self.update_node_status_in_raft(*node_id, "down").await;
+                        if let Some(alerts) = &self.alerts {
+                            alerts.fire(
+                                crate::alerts::AlertKind::NodeDown,
+                                "data node missed heartbeats",
+                                serde_json::json!({ "node_id": node_id }),
+                            );
+                        }
                         self.handle_node_down(*node_id).await;
                     }
                     NodeStatus::Healthy => {

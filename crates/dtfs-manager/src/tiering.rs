@@ -47,6 +47,8 @@ pub struct TieringEngine {
     state_data: Arc<RwLock<StateMachineData>>,
     /// Per-chunk access statistics, reported by data nodes via heartbeats.
     access_stats: RwLock<HashMap<String, ChunkAccessProfile>>,
+    /// P1-8: optional alert dispatcher. Anchor refusals fire here.
+    alerts: Option<Arc<crate::alerts::AlertDispatcher>>,
 }
 
 impl TieringEngine {
@@ -62,7 +64,14 @@ impl TieringEngine {
             audit,
             state_data,
             access_stats: RwLock::new(HashMap::new()),
+            alerts: None,
         }
+    }
+
+    /// Inject the alert dispatcher after construction.
+    pub fn with_alerts(mut self, alerts: Arc<crate::alerts::AlertDispatcher>) -> Self {
+        self.alerts = Some(alerts);
+        self
     }
 
     /// Run the tiering evaluation loop. Spawned as a background task.
@@ -210,6 +219,19 @@ impl TieringEngine {
                         ),
                         "refused",
                     );
+                    if let Some(alerts) = &self.alerts {
+                        alerts.fire(
+                            crate::alerts::AlertKind::AnchorViolated,
+                            "tier migration refused — would strand anchor DC",
+                            serde_json::json!({
+                                "chunk_id": profile.chunk_id,
+                                "file_path": profile.file_path,
+                                "source_tier": format!("{:?}", profile.current_tier),
+                                "target_tier": format!("{:?}", target_tier),
+                                "target_node": target,
+                            }),
+                        );
+                    }
                     continue;
                 }
 
