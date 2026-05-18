@@ -10,6 +10,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::cache::ArcCache;
+use crate::memory::MemoryBudget;
 use crate::metrics::DataMetrics;
 use crate::replication::ReplicationManager;
 use crate::store::ChunkStore;
@@ -24,8 +25,13 @@ pub struct DataServiceImpl {
     /// bounded. Each in-flight write buffers up to one chunk
     /// (~128 MB by default), so an unbounded gRPC stream count is fatal
     /// on small VMs (4–8 GB RAM). Default 8 via
-    /// `config.grpc.max_concurrent_chunk_writes`.
+    /// `config.grpc.max_concurrent_chunk_writes`. Bug G now sizes this
+    /// from the hard memory cap when one is configured.
     write_slots: Arc<Semaphore>,
+    /// Bug G — runtime memory-pressure observer. When `is_shedding()`
+    /// flips true, new `put_chunk` calls return `RESOURCE_EXHAUSTED`
+    /// instead of accumulating more chunks into RAM.
+    memory: Arc<MemoryBudget>,
 }
 
 pub async fn run_grpc_server(
@@ -33,14 +39,38 @@ pub async fn run_grpc_server(
     store: Arc<ChunkStore>,
     metrics: Arc<DataMetrics>,
     cache: Arc<ArcCache>,
+    memory: Arc<MemoryBudget>,
 ) -> anyhow::Result<()> {
     let addr = config.grpc.listen_addr.parse()?;
     let replication = Arc::new(ReplicationManager::new(store.clone(), config.clone()));
-    let max_writes = config.grpc.max_concurrent_chunk_writes.max(1);
-    tracing::info!(
-        "Data node put_chunk concurrency limit: {} in-flight writes (Bug D)",
-        max_writes
-    );
+
+    // Bug D / Bug G — derive the put_chunk concurrency limit. If the
+    // operator set a hard memory cap, recommend a slot count that fits
+    // alongside the ARC cache + tonic + raft overhead. Otherwise fall
+    // back to whatever they configured in `grpc.max_concurrent_chunk_writes`
+    // (default 8). The data node doesn't have per-volume chunk size
+    // visibility here, so we estimate at 128 MB (the cluster default).
+    let chunk_size_bytes: u64 = 128 * 1024 * 1024;
+    // Overhead estimate: ARC cache + 256 MB for tonic/raft/kernel pages.
+    let static_overhead_bytes =
+        (config.cache.max_memory_mb as u64) * 1024 * 1024 + 256 * 1024 * 1024;
+    let fallback_slots = config.grpc.max_concurrent_chunk_writes.max(1);
+    let max_writes =
+        memory.recommend_chunk_write_slots(chunk_size_bytes, static_overhead_bytes, fallback_slots);
+    if memory.hard_cap_bytes() > 0 {
+        tracing::info!(
+            cap_mb = memory.hard_cap_bytes() / 1024 / 1024,
+            chunk_mb = chunk_size_bytes / 1024 / 1024,
+            overhead_mb = static_overhead_bytes / 1024 / 1024,
+            slots = max_writes,
+            "Bug G memory budget engaged: sized put_chunk slots from hard cap"
+        );
+    } else {
+        tracing::info!(
+            "Bug D put_chunk concurrency limit: {} in-flight writes (no hard memory cap configured)",
+            max_writes
+        );
+    }
     let service = DataServiceImpl {
         config: config.clone(),
         store,
@@ -48,6 +78,7 @@ pub async fn run_grpc_server(
         metrics,
         cache,
         write_slots: Arc::new(Semaphore::new(max_writes)),
+        memory,
     };
 
     tracing::info!("Data node gRPC server listening on {}", addr);
@@ -85,6 +116,22 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<Streaming<PutChunkRequest>>,
     ) -> Result<Response<PutChunkResponse>, Status> {
+        // Bug G — if a hard memory cap is configured and the background
+        // sampler has flagged the process as past the shed threshold,
+        // refuse the write outright. The FUSE client retries on
+        // ResourceExhausted with backoff, which gives the kernel +
+        // RocksDB time to flush buffers and drop the RSS below the
+        // hysteresis floor.
+        if self.memory.is_shedding() {
+            tracing::warn!(
+                rss_mb = self.memory.last_rss_bytes() / 1024 / 1024,
+                cap_mb = self.memory.hard_cap_bytes() / 1024 / 1024,
+                "put_chunk rejected: memory budget shedding"
+            );
+            return Err(Status::resource_exhausted(
+                "data node over memory shed threshold (Bug G) — retry shortly",
+            ));
+        }
         // Bug D — acquire one of the bounded concurrency slots before we
         // start buffering this chunk's bytes. Without this gate every
         // concurrent gRPC stream holds ~128 MB in memory and a few dozen
