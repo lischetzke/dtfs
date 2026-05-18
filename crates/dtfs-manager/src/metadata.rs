@@ -64,11 +64,34 @@ impl MetadataService {
     /// Helper: propose a write through Raft and return the response.
     async fn raft_write(&self, req: ClientRequest) -> Result<ClientResponse, Status> {
         // Bug Y diagnostic — log the actual openraft error before
-        // wrapping it as a generic Status::internal. Previously the
-        // manager log lines for failing creates showed only "CreateFile:
-        // <path>" without any indication that the Raft proposal had
-        // failed, making it impossible to tell whether the cluster was
-        // healthy or jammed.
+        // wrapping it as a generic Status::internal.
+        //
+        // Bug AC — when the local view reports `current_leader=None`
+        // (election in progress, just restarted, transient partition),
+        // a naive `client_write` returns `ForwardToLeader(None, None)`
+        // immediately. The caller (FUSE, CLI) gets EIO even though the
+        // cluster as a whole is fine and would converge in a few hundred
+        // ms. Wait up to 3 s for a leader to emerge before failing.
+        use openraft::async_runtime::watch::WatchReceiver;
+        let mut metrics_rx = self.raft.metrics();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let has_leader = metrics_rx.borrow_watched().current_leader.is_some();
+            if has_leader {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!("Raft write: no leader after 3s wait, will attempt anyway");
+                break;
+            }
+            // Wait for metrics change or remaining timeout, whichever first.
+            tokio::select! {
+                _ = metrics_rx.changed() => continue,
+                _ = tokio::time::sleep(remaining) => break,
+            }
+        }
+
         match self.raft.client_write(req).await {
             Ok(resp) => Ok(resp.data),
             Err(e) => {
