@@ -99,21 +99,21 @@
   tasks:
     - name: Copy dtfs-manager binary
       ansible.builtin.copy:
-        src: "/home/debian/dtfs2/target/release/dtfs-manager"
+        src: "/home/debian/dtfs2-deploy/bin/dtfs-manager"
         dest: /usr/local/bin/dtfs-manager
         owner: root
         group: root
         mode: "0755"
-        remote_src: true
+        remote_src: false
 
     - name: Copy dtfs-cli binary
       ansible.builtin.copy:
-        src: "/home/debian/dtfs2/target/release/dtfs-cli"
+        src: "/home/debian/dtfs2-deploy/bin/dtfs-cli"
         dest: /usr/local/bin/dtfs-cli
         owner: root
         group: root
         mode: "0755"
-        remote_src: true
+        remote_src: false
 
     - name: Manager data directory
       ansible.builtin.file:
@@ -133,12 +133,12 @@
 
     - name: Install dtfs-manager systemd unit
       ansible.builtin.copy:
-        src: "/home/debian/dtfs2/deploy/systemd/dtfs-manager.service"
+        src: "/home/debian/dtfs2-deploy/deploy/systemd/dtfs-manager.service"
         dest: /etc/systemd/system/dtfs-manager.service
         owner: root
         group: root
         mode: "0644"
-        remote_src: true
+        remote_src: false
 
     - name: Reload systemd
       ansible.builtin.systemd:
@@ -175,21 +175,21 @@
   tasks:
     - name: Copy dtfs-manager binary
       ansible.builtin.copy:
-        src: "/home/debian/dtfs2/target/release/dtfs-manager"
+        src: "/home/debian/dtfs2-deploy/bin/dtfs-manager"
         dest: /usr/local/bin/dtfs-manager
         owner: root
         group: root
         mode: "0755"
-        remote_src: true
+        remote_src: false
 
     - name: Copy dtfs-cli binary
       ansible.builtin.copy:
-        src: "/home/debian/dtfs2/target/release/dtfs-cli"
+        src: "/home/debian/dtfs2-deploy/bin/dtfs-cli"
         dest: /usr/local/bin/dtfs-cli
         owner: root
         group: root
         mode: "0755"
-        remote_src: true
+        remote_src: false
 
     - name: Manager data directory
       ansible.builtin.file:
@@ -209,12 +209,12 @@
 
     - name: Install dtfs-manager systemd unit
       ansible.builtin.copy:
-        src: "/home/debian/dtfs2/deploy/systemd/dtfs-manager.service"
+        src: "/home/debian/dtfs2-deploy/deploy/systemd/dtfs-manager.service"
         dest: /etc/systemd/system/dtfs-manager.service
         owner: root
         group: root
         mode: "0644"
-        remote_src: true
+        remote_src: false
 
     - name: Reload systemd
       ansible.builtin.systemd:
@@ -239,21 +239,21 @@
   tasks:
     - name: Copy dtfs-data binary
       ansible.builtin.copy:
-        src: "/home/debian/dtfs2/target/release/dtfs-data"
+        src: "/home/debian/dtfs2-deploy/bin/dtfs-data"
         dest: /usr/local/bin/dtfs-data
         owner: root
         group: root
         mode: "0755"
-        remote_src: true
+        remote_src: false
 
     - name: Copy dtfs-cli binary
       ansible.builtin.copy:
-        src: "/home/debian/dtfs2/target/release/dtfs-cli"
+        src: "/home/debian/dtfs2-deploy/bin/dtfs-cli"
         dest: /usr/local/bin/dtfs-cli
         owner: root
         group: root
         mode: "0755"
-        remote_src: true
+        remote_src: false
 
     - name: Data directory
       ansible.builtin.file:
@@ -334,21 +334,21 @@
   tasks:
     - name: Copy dtfs-fuse binary
       ansible.builtin.copy:
-        src: "/home/debian/dtfs2/target/release/dtfs-fuse"
+        src: "/home/debian/dtfs2-deploy/bin/dtfs-fuse"
         dest: /usr/local/bin/dtfs-fuse
         owner: root
         group: root
         mode: "0755"
-        remote_src: true
+        remote_src: false
 
     - name: Copy dtfs-cli binary
       ansible.builtin.copy:
-        src: "/home/debian/dtfs2/target/release/dtfs-cli"
+        src: "/home/debian/dtfs2-deploy/bin/dtfs-cli"
         dest: /usr/local/bin/dtfs-cli
         owner: root
         group: root
         mode: "0755"
-        remote_src: true
+        remote_src: false
 
     - name: Mount directory
       ansible.builtin.file:
@@ -366,12 +366,12 @@
 
     - name: Install dtfs-fuse@.service template
       ansible.builtin.copy:
-        src: "/home/debian/dtfs2/deploy/systemd/dtfs-fuse@.service"
+        src: "/home/debian/dtfs2-deploy/deploy/systemd/dtfs-fuse@.service"
         dest: /etc/systemd/system/dtfs-fuse@.service
         owner: root
         group: root
         mode: "0644"
-        remote_src: true
+        remote_src: false
 
     - name: Reload systemd
       ansible.builtin.systemd:

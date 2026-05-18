@@ -8,14 +8,23 @@ data_dir = "/var/lib/dtfs/manager"
 
 [location]
 region = "lab"
-datacenter = "{{ dtfs_location }}"
-rack = "{{ 'rack-A' if dtfs_location == 'dc1' else 'rack-B' }}"
+datacenter = "{{ dtfs_dc | default(dtfs_location | default('dc-a')) }}"
+rack = "{{ dtfs_rack | default('rack-default') }}"
 host = "{{ inventory_hostname }}"
 
 [cluster]
 name = "{{ dtfs_cluster_name }}"
-shared_secret = "{{ dtfs_shared_secret }}"
+shared_secret = "{{ dtfs_cluster_secret | default(dtfs_shared_secret | default('rotate-me')) }}"
 bootstrap = {{ 'true' if dtfs_is_bootstrap | default(false) else 'false' }}
+
+# Raft initial voters — all managers must enumerate every peer so the
+# bootstrap node forms a multi-voter cluster (FINDINGS.md F-009).
+{% for mgr in groups['managers'] %}
+[[cluster.initial_voters]]
+hostname = "{{ mgr }}"
+addr = "{{ hostvars[mgr].ansible_host }}:9401"
+
+{% endfor %}
 
 [raft]
 listen_addr = "0.0.0.0:9400"
@@ -37,9 +46,10 @@ min_replicas_before_ack = 2
 write_timeout_secs = 30
 
 [defaults.replication]
-hot = 3
-warm = 2
-cold = 1
+# hot=2 because DC-A has only 2 hot-tier data nodes (hot rf=3 infeasible).
+hot = {{ dtfs_replication_hot | default(2) }}
+warm = {{ dtfs_replication_warm | default(2) }}
+cold = {{ dtfs_replication_cold | default(1) }}
 
 [tiering]
 enabled = true

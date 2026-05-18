@@ -2,26 +2,43 @@
 # Schema matches crates/dtfs-common/src/config.rs FuseConfig.
 
 [client]
+# P0-3: multi-manager failover. The client connects to manager_addr first;
+# on transport errors it walks manager_addrs in order.
 manager_addr = "{{ hostvars['mgr-01'].ansible_host }}:9401"
+manager_addrs = [
+{% for mgr in groups['managers'] %}
+  "{{ hostvars[mgr].ansible_host }}:9401",
+{% endfor %}
+]
 
 [location]
 region = "lab"
-datacenter = "{{ dtfs_location }}"
-rack = "{{ 'rack-A' if dtfs_location == 'dc1' else 'rack-B' }}"
+datacenter = "{{ dtfs_dc | default(dtfs_location | default('dc-a')) }}"
+rack = "{{ dtfs_rack | default('rack-default') }}"
 host = "{{ inventory_hostname }}"
 
 [mount]
 mountpoint = "{{ dtfs_mount_point }}"
+allow_other = true
 
 [readahead]
-enabled = true
-min_kb = 128
-max_mb = 32
+mode = "{{ dtfs_readahead_mode | default('file-sequential') }}"
+prefetch_chunks = 4
+prefetch_next_files = 4
 
 [cache]
-enabled = true
-max_size_mb = 512
-ttl_secs = 60
+{% if dtfs_cache_type | default('tmpfs') == 'disk' %}
+local_cache_dir = "{{ dtfs_cache_dir | default('/var/cache/dtfs') }}"
+local_cache_max_gb = {{ dtfs_cache_max_gb | default(10) }}
+{% if dtfs_cache_max_age_days is defined and dtfs_cache_max_age_days %}
+max_age_days = {{ dtfs_cache_max_age_days }}
+{% endif %}
+prune_interval_secs = 3600
+{% else %}
+# tmpfs/in-memory only — no disk cache configured
+local_cache_max_gb = 0
+prune_interval_secs = 3600
+{% endif %}
 
 [partition_safety]
 mode = "localreadonly"

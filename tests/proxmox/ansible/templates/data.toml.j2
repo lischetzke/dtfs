@@ -8,13 +8,18 @@ data_dir = "/var/lib/dtfs/data"
 
 [location]
 region = "lab"
-datacenter = "{{ dtfs_location }}"
-rack = "{{ 'rack-A' if dtfs_location == 'dc1' else 'rack-B' }}"
+datacenter = "{{ dtfs_dc | default(dtfs_location | default('dc-a')) }}"
+rack = "{{ dtfs_rack | default('rack-default') }}"
 host = "{{ inventory_hostname }}"
 
 [cluster]
 manager_addr = "{{ hostvars['mgr-01'].ansible_host }}:9401"
-shared_secret = "{{ dtfs_shared_secret }}"
+manager_addrs = [
+{% for mgr in groups['managers'] %}
+  "{{ hostvars[mgr].ansible_host }}:9401",
+{% endfor %}
+]
+shared_secret = "{{ dtfs_cluster_secret | default(dtfs_shared_secret | default('rotate-me')) }}"
 
 [grpc]
 listen_addr = "0.0.0.0:9500"
