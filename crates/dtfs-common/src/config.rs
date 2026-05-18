@@ -63,6 +63,58 @@ pub struct DataNodeConfig {
     /// Leave empty (or omit) if this node has no tape drives.
     #[serde(default)]
     pub tape_devices: Vec<TapeDeviceConfig>,
+    /// Bug G — per-process RAM cap with proactive backpressure. When
+    /// `hard_cap_mb > 0` the data node uses it to size the put_chunk
+    /// concurrency and ARC cache, and a background sampler flips a
+    /// shedding flag once RSS crosses the configured threshold so new
+    /// writes get RESOURCE_EXHAUSTED instead of OOM-killing the process.
+    /// `#[serde(default)]` so old config files keep working.
+    #[serde(default)]
+    pub memory: MemoryConfig,
+}
+
+/// Hard memory budget for the data node process.
+///
+/// `hard_cap_mb = 0` (the default) → unbounded, no backpressure, no
+/// recommendation. Existing deployments that don't have a `[memory]`
+/// section in data.toml keep their previous behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// Total RAM budget for this data-node process, in MB. 0 disables.
+    #[serde(default)]
+    pub hard_cap_mb: u64,
+    /// Log a warning once RSS climbs above this fraction of the cap.
+    #[serde(default = "default_warn_pct")]
+    pub warn_threshold_pct: u8,
+    /// Start refusing new `put_chunk` writes once RSS climbs above this
+    /// fraction of the cap. Should be higher than `warn_threshold_pct`.
+    #[serde(default = "default_shed_pct")]
+    pub shed_threshold_pct: u8,
+    /// How often the background sampler reads `/proc/self/status`, in
+    /// seconds. 0 is treated as 1.
+    #[serde(default = "default_memory_sample_secs")]
+    pub sample_interval_secs: u64,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            hard_cap_mb: 0,
+            warn_threshold_pct: default_warn_pct(),
+            shed_threshold_pct: default_shed_pct(),
+            sample_interval_secs: default_memory_sample_secs(),
+        }
+    }
+}
+
+fn default_warn_pct() -> u8 {
+    80
+}
+fn default_shed_pct() -> u8 {
+    92
+}
+fn default_memory_sample_secs() -> u64 {
+    5
 }
 
 /// FUSE client configuration (loaded from /etc/dtfs/fuse.toml).

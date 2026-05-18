@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 mod cache;
 mod disk;
+mod memory;
 mod metrics;
 mod replication;
 mod scrub;
@@ -104,8 +105,27 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Bug G — build the memory budget and spawn the background RSS
+    // sampler before the gRPC server starts. Even when no hard cap is
+    // configured the sampler still runs (it just keeps `is_shedding`
+    // pinned at false) so we always have an RSS gauge for diagnostics.
+    let memory = std::sync::Arc::new(crate::memory::MemoryBudget::from_config(&config.memory));
+    if config.memory.hard_cap_mb > 0 {
+        tracing::info!(
+            cap_mb = config.memory.hard_cap_mb,
+            warn_pct = config.memory.warn_threshold_pct,
+            shed_pct = config.memory.shed_threshold_pct,
+            sample_secs = config.memory.sample_interval_secs,
+            "Bug G memory budget configured"
+        );
+    }
+    let mon = memory.clone();
+    tokio::spawn(async move {
+        mon.run_monitor().await;
+    });
+
     // Start gRPC server (blocks until shutdown)
-    server::run_grpc_server(config, chunk_store, data_metrics, cache).await?;
+    server::run_grpc_server(config, chunk_store, data_metrics, cache, memory).await?;
 
     Ok(())
 }

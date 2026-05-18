@@ -26,6 +26,38 @@ use dtfs_proto::dtfs::manager::{
 /// Size of each streaming piece for chunk I/O (1 MB).
 const STREAM_PIECE_SIZE: usize = 1024 * 1024;
 
+/// Bug G — retry policy for `RESOURCE_EXHAUSTED` from put_chunk. The
+/// data node returns this status while its memory budget is in the
+/// "shedding" state. Client backs off exponentially and retries — this
+/// is the cooperative half of the hard-cap design.
+const PUT_CHUNK_MAX_RETRIES: u32 = 6;
+const PUT_CHUNK_BASE_BACKOFF_MS: u64 = 250;
+const PUT_CHUNK_MAX_BACKOFF_MS: u64 = 8_000;
+
+/// Decide how long to back off before retry on a put_chunk failure.
+/// Returns `None` when the caller should give up (non-retryable status
+/// or attempts exhausted).
+///
+/// Pure function so we can unit-test the policy without running gRPC.
+pub(crate) fn put_chunk_retry_backoff(
+    code: tonic::Code,
+    attempt_zero_based: u32,
+) -> Option<std::time::Duration> {
+    if attempt_zero_based >= PUT_CHUNK_MAX_RETRIES {
+        return None;
+    }
+    // Only retry on transient/cooperative-overload codes.
+    match code {
+        tonic::Code::ResourceExhausted | tonic::Code::Unavailable => {
+            let ms = PUT_CHUNK_BASE_BACKOFF_MS
+                .saturating_mul(1 << attempt_zero_based)
+                .min(PUT_CHUNK_MAX_BACKOFF_MS);
+            Some(std::time::Duration::from_millis(ms))
+        }
+        _ => None,
+    }
+}
+
 /// Inner shared state for the client, wrapped in Arc for cheap cloning.
 struct DtfsClientInner {
     /// Cached manager gRPC channels, keyed by address.
@@ -345,7 +377,61 @@ impl DtfsClient {
         tier: &str,
         data: bytes::Bytes,
     ) -> Result<dtfs_proto::dtfs::data::PutChunkResponse> {
-        let mut client = self.data_client(node_addr).await?;
+        // Bug G — retry on RESOURCE_EXHAUSTED with exponential backoff
+        // so the FUSE client cooperates with data-node memory shedding
+        // instead of bubbling errors up to userspace immediately.
+        let mut attempt: u32 = 0;
+        loop {
+            match self
+                .write_chunk_bytes_once(
+                    node_addr,
+                    chunk_id,
+                    volume_id,
+                    tier,
+                    data.clone(),
+                )
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(status) => {
+                    if let Some(delay) = put_chunk_retry_backoff(status.code(), attempt) {
+                        debug!(
+                            chunk_id = %chunk_id,
+                            node = %node_addr,
+                            attempt,
+                            backoff_ms = delay.as_millis() as u64,
+                            code = ?status.code(),
+                            "put_chunk transient error, retrying after backoff"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "put_chunk RPC failed (code={:?}, attempts={}): {}",
+                        status.code(),
+                        attempt + 1,
+                        status.message()
+                    ));
+                }
+            }
+        }
+    }
+
+    /// One pass of the put_chunk streaming RPC. Returns the gRPC
+    /// `Status` on failure so the retry wrapper can inspect the code.
+    async fn write_chunk_bytes_once(
+        &self,
+        node_addr: &str,
+        chunk_id: &str,
+        volume_id: &str,
+        tier: &str,
+        data: bytes::Bytes,
+    ) -> std::result::Result<dtfs_proto::dtfs::data::PutChunkResponse, tonic::Status> {
+        let mut client = self
+            .data_client(node_addr)
+            .await
+            .map_err(|e| tonic::Status::unavailable(format!("connect: {e}")))?;
 
         let chunk_id_owned = chunk_id.to_string();
         let volume_id_owned = volume_id.to_string();
@@ -397,11 +483,7 @@ impl DtfsClient {
         });
 
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let response = client
-            .put_chunk(stream)
-            .await
-            .context("put_chunk RPC failed")?;
-
+        let response = client.put_chunk(stream).await?;
         let put_resp = response.into_inner();
         debug!(
             chunk_id = chunk_id_owned,
@@ -820,5 +902,73 @@ impl DtfsClient {
 impl Default for DtfsClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod put_chunk_retry_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Bug G — RESOURCE_EXHAUSTED is the data node saying "memory budget
+    /// shedding, retry later". Client MUST back off and retry, with
+    /// exponential growth and a per-attempt cap.
+    #[test]
+    fn bug_g_resource_exhausted_first_attempts_back_off_exponentially() {
+        // attempt 0 → 250 ms
+        assert_eq!(
+            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, 0),
+            Some(Duration::from_millis(250))
+        );
+        // attempt 1 → 500 ms
+        assert_eq!(
+            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, 1),
+            Some(Duration::from_millis(500))
+        );
+        // attempt 2 → 1000 ms
+        assert_eq!(
+            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, 2),
+            Some(Duration::from_millis(1000))
+        );
+        // attempt 5 → 8000 ms (capped at PUT_CHUNK_MAX_BACKOFF_MS)
+        assert_eq!(
+            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, 5),
+            Some(Duration::from_millis(8000))
+        );
+    }
+
+    /// After PUT_CHUNK_MAX_RETRIES attempts, give up.
+    #[test]
+    fn bug_g_resource_exhausted_eventually_gives_up() {
+        assert_eq!(
+            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, PUT_CHUNK_MAX_RETRIES),
+            None,
+            "after max retries the wrapper must surface the error to the caller"
+        );
+    }
+
+    /// Unavailable (channel closed, server restarting) is also retryable.
+    #[test]
+    fn bug_g_unavailable_is_retryable() {
+        assert!(put_chunk_retry_backoff(tonic::Code::Unavailable, 0).is_some());
+    }
+
+    /// Anything else (InvalidArgument, InternalError, …) must NOT retry —
+    /// retrying a bad request just amplifies the failure.
+    #[test]
+    fn bug_g_non_retryable_codes_return_none() {
+        for code in [
+            tonic::Code::InvalidArgument,
+            tonic::Code::NotFound,
+            tonic::Code::PermissionDenied,
+            tonic::Code::Internal,
+            tonic::Code::DataLoss,
+        ] {
+            assert!(
+                put_chunk_retry_backoff(code, 0).is_none(),
+                "code {:?} must not be auto-retried",
+                code
+            );
+        }
     }
 }
