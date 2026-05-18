@@ -11,11 +11,14 @@ SSH_OPTS="-o StrictHostKeyChecking=no -o LogLevel=ERROR"
 
 echo "=== S15 scrub corruption ==="
 
-# Find a chunk to corrupt.
+# Find a chunk to corrupt. Different inventories mount disks under
+# different paths (3-DC: /mnt/warm; Plexmedia: /mnt/toro-warm,
+# /mnt/nrb-warm, /mnt/primary-cold-N). Search across /mnt/* to be
+# inventory-agnostic.
 target=$(ssh $SSH_OPTS "$SSH_USER@$DATA_B1" \
-    "find /mnt/warm/chunks -name '*.dat' 2>/dev/null | head -1")
+    "find /mnt -maxdepth 4 -name '*.dat' -path '*/chunks/*' 2>/dev/null | head -1")
 if [ -z "$target" ]; then
-    echo "verdict=warn: no chunks on data-b1 yet"
+    echo "verdict=warn: no chunks on $DATA_B1 yet"
     exit 0
 fi
 echo "corrupting $target"
