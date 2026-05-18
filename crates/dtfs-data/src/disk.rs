@@ -66,10 +66,29 @@ impl DiskManager {
     }
 
     /// Select a healthy disk of the given tier with the most free space.
+    ///
+    /// If this node has no disk of the requested tier (common in 3-DC
+    /// topologies where DC-B/C nodes are warm-only and DC-A nodes are
+    /// hot+cold), fall back to whichever healthy disk has the most free
+    /// space. The placement engine has already decided this node should
+    /// hold a replica; we honour that decision rather than rejecting the
+    /// write. Tier semantics still drive cluster-wide placement, just not
+    /// per-disk on each node.
     pub fn select_disk_for_tier(&self, tier: DiskTier) -> Option<&ManagedDisk> {
-        self.disks
+        let exact = self
+            .disks
             .iter()
             .filter(|d| d.tier == tier && d.status == DiskStatus::Healthy)
+            .max_by_key(|d| d.total_bytes.saturating_sub(d.used_bytes));
+        if exact.is_some() {
+            return exact;
+        }
+        // Fallback: the placement engine picked this node for tier T but
+        // we have no tier-T disk. Use any healthy disk so the chunk lands
+        // rather than failing the whole replica set.
+        self.disks
+            .iter()
+            .filter(|d| d.status == DiskStatus::Healthy)
             .max_by_key(|d| d.total_bytes.saturating_sub(d.used_bytes))
     }
 

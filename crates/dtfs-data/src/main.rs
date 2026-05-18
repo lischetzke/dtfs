@@ -55,6 +55,18 @@ async fn main() -> anyhow::Result<()> {
     // Initialize chunk store
     let chunk_store = Arc::new(store::ChunkStore::new(disk_manager));
 
+    // Rebuild on-disk chunk count + bytes_stored. Without this, a daemon
+    // restart drops back to 0/0 even though all chunks remain on disk
+    // (heartbeats then under-report used_capacity to the manager, which
+    // diverges from df). Runs in startup so the first heartbeat carries
+    // accurate numbers.
+    if let Err(e) = chunk_store.rescan_existing_chunks().await {
+        tracing::warn!(
+            error = %e,
+            "rescan_existing_chunks failed; bytes_stored counter starts at 0"
+        );
+    }
+
     // Initialize ARC cache with configured memory limit.
     // Estimate max entries from max_memory_mb assuming ~128KB average chunk size.
     let avg_chunk_kb = 128;
