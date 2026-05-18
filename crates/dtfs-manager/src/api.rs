@@ -404,7 +404,12 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
         });
     }
 
-    // 3. FUSE clients — approximate from active write_leases.
+    // 3. FUSE clients — Bug AA now self-register via RegisterNode with
+    //    role="client", so they appear in step 1 (sm.nodes) with their
+    //    full Location. Fall back to lease-derived synthesis for any
+    //    lease whose owner host isn't already registered (defends
+    //    against older FUSE binaries that don't self-register yet).
+    //
     //    owner_id format (Bug X compatible):
     //      legacy: "<host>:<pid>:<fh>"
     //      Bug X:  "<host>:<pid>:<fh>:<dc>"

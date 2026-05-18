@@ -912,6 +912,37 @@ impl DtfsClient {
             .into_inner();
         Ok(resp)
     }
+
+    /// Bug AA — register this FUSE client with the manager so its full
+    /// `Location` (region/dc/rack/host) appears in `/api/v1/nodes` even
+    /// when the client never acquires a write lease (read-only Plex
+    /// viewers, dormant download clients, etc.).
+    ///
+    /// Re-uses the existing `RegisterNode` RPC with `role="client"`.
+    /// `shared_secret` matches the cluster secret so the manager
+    /// accepts the registration; data nodes use the same gate.
+    pub async fn register_self_as_client(
+        &self,
+        hostname: &str,
+        location: dtfs_proto::dtfs::common::Location,
+        shared_secret: Option<String>,
+    ) -> Result<()> {
+        let request = dtfs_proto::dtfs::manager::RegisterNodeRequest {
+            hostname: hostname.to_string(),
+            role: "client".to_string(),
+            grpc_port: 0,
+            location: Some(location),
+            disks: Vec::new(),
+            shared_secret,
+        };
+        let _ = self
+            .call_manager("register_node", |mut c| {
+                let r = request.clone();
+                async move { c.register_node(r).await }
+            })
+            .await?;
+        Ok(())
+    }
 }
 
 impl Default for DtfsClient {
