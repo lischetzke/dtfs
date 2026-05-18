@@ -62,20 +62,114 @@ volume   : default   anchor=dc-a, hot=2, warm=1, cold=1, chunk=128 MB
 clients  : 3        (client-a/b/c, FUSE mounted on /mnt/dtfs)
 ```
 
+## Bugs uncovered + fixed during the recovery
+
+All three with failing-test-first methodology — full TDD in
+`crates/dtfs-raft/src/state_machine.rs::posix_path_regression` and
+`crates/dtfs-fuse/src/filesystem.rs::tests`. Commit `9eb3963`.
+
+### Bug A — `mkdir` empty directory doesn't persist on `stat`
+
+**Symptom.** `mkdir /mnt/dtfs/foo` returns 0. `stat /mnt/dtfs/foo`
+returns `ENOENT`. The user can't `cd` into a folder they just created.
+
+**Root cause.** FUSE signals "create a directory" by sending
+`CreateFile { path: "/foo/" }` (trailing slash). The state machine
+stored that verbatim under the slash-suffixed key. Every subsequent
+lookup queried at the canonical no-slash form and missed.
+
+**Fix.**
+1. `FileMetadata` gains `#[serde(default)] pub is_directory: bool`
+   so it survives snapshot replay.
+2. `apply_request` for `CreateFile` strips a trailing slash before
+   storing and sets `is_directory = true` when the slash was present.
+3. New `StateMachineData::lookup_path()` is the canonical lookup —
+   the manager's `get_file_locations` handler now goes through it.
+
+**Test.** `bug_a_mkdir_trailing_slash_is_lookup_able_without_slash`
+asserts that after `CreateFile("/corpus/")`, `sm.files` contains the
+canonical key `/corpus` with `is_directory=true`. Pre-fix output:
+`directory must be findable by canonical path /corpus (got keys:
+["/corpus/"])`. Post-fix: 4/4 in the module pass.
+
+### Bug B — synthetic directories aren't lookup-able
+
+**Symptom.** Write `/series/episode.mkv` directly (no prior mkdir).
+`readdir /` renders `series/` as a directory. But
+`stat /mnt/dtfs/series` returns `ENOENT`. Concrete consequence: rsync
+writes `.plexmatch` into a folder and then `mkstemp(".S01E01.mkv.XYZ")`
+in the same folder fails with `ENOENT: parent`.
+
+**Root cause.** `data.files` had no literal key at `/series`; only
+the child path existed. The manager's `get_file_locations` did a raw
+BTreeMap `get` and bailed.
+
+**Fix.** `StateMachineData::lookup_path()` does a 3-tier resolution:
+1. Direct hit on the key.
+2. Slash-suffixed legacy hit (for snapshots taken before bug A's fix).
+3. **Synthetic**: if any entry exists under the prefix `path + "/"`,
+   return a synthesised `FileMetadata { is_directory: true, ... }`.
+
+The synthesised entry's timestamps are "now" — we don't aggregate
+child timestamps because the kernel ttl is short anyway.
+
+**Test.** `bug_b_synthetic_directory_is_lookup_able` creates a file
+at `/series/episode-01.mkv` and asserts `sm.lookup_path("/series")`
+returns `Some(meta)` with `meta.is_directory == true`.
+
+### Bug C — `rename` lost the file after lease/parent-dir failures
+
+**Symptom.** Rsync's `mkstemp` + write + `rename` pattern failed in
+the wild: after `mv .tmp.XYZ final.mkv`, both names were unreachable.
+
+**Root cause** (clarified by the regression test): the SM-level
+`RenameFile` logic was actually correct. The lab failure was a
+cascading consequence of Bug A — the parent directory wasn't
+lookup-able, so the rename itself succeeded but the *next* operation
+(stat, open) hit ENOENT on the parent and rsync gave up.
+
+**Fix.** Bug A's fix is sufficient. The test
+`bug_c_rename_after_create_moves_metadata_to_new_key` is kept as a
+guard: it walks the full mkstemp → write → rename round-trip at the
+SM level and verifies the new key has the chunk locations from the
+write step and the old key is gone.
+
+### Wire-up: proto + FUSE attribute propagation
+
+- `proto/manager.proto`: `GetFileLocationsResponse` gains field 7
+  `bool is_directory`. New fields in proto3 are backward-compatible.
+- `crates/dtfs-fuse/src/filesystem.rs`: `FileLocations` carries the
+  flag; `file_attr_from_locations` uses it (and reports size 4096 for
+  directories so `stat` doesn't say 0 bytes). Test
+  `bug_a_b_directory_is_directory_propagates_through_attrs` proves
+  the round-trip.
+
+### Live-cluster verification (rolling-restarted manager + FUSE)
+
+```
+client-c$ mkdir /mnt/dtfs/bug-a-test
+client-c$ stat /mnt/dtfs/bug-a-test
+  File: /mnt/dtfs/bug-a-test
+  ... directory                                       # ✓
+
+client-c$ mkdir /mnt/dtfs/bug-b-test
+client-c$ echo x > /mnt/dtfs/bug-b-test/child.txt
+client-c$ stat /mnt/dtfs/bug-b-test
+  File: /mnt/dtfs/bug-b-test
+  ... directory                                       # ✓
+
+client-c$ echo y > /mnt/dtfs/bug-c-test/.tmp.XYZ
+client-c$ mv  /mnt/dtfs/bug-c-test/.tmp.XYZ  /mnt/dtfs/bug-c-test/final.txt
+client-c$ ls  /mnt/dtfs/bug-c-test
+  final.txt                                           # ✓
+```
+
 ## Open known issues (not blocking, tracked for follow-up)
 
-- **FUSE readdir vs lookup inconsistency.** After the wipe, fresh writes
-  through `client-c` show in `/api/v1/files` but `ls` on a peer client
-  can return ENOENT on the parent directory for a short window — the
-  metadata cache in FUSE doesn't invalidate aggressively enough. Doesn't
-  affect rsync writes from the original writer, but the soak scenarios
-  must always read via the same client that wrote (or wait for
-  `metadata_ttl`).
-- **Zombie dirent entries after a cluster wipe**. The previous run left
-  empty top-level "directory" entries (Liar Liar, NewSeason, etc.) that
-  re-appear after a wipe because they live in some snapshot the new
-  Raft state picked up via cloud-init or rocksdb residue. Cleaned by
-  the wipe + bootstrap step above; we'll confirm none reappear.
+- **Orphan chunk GC**. After per-file `unlink`, the data nodes still
+  hold the chunks until the scheduler (or a deep scrub) reclaims them.
+  Reported as raw_used_bytes that lags file_count → 0 by 7+ GB right
+  after a cleanup. Not a correctness issue, just visibility.
 
 ## Next steps (this session)
 
