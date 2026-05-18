@@ -271,17 +271,25 @@ impl DtfsClient {
     }
 
     /// Persist chunk locations to the manager metadata (Raft) after successful writes.
+    ///
+    /// Bug P — `lease_id` is the writer's current write-lease token.
+    /// When non-empty, the manager rejects the commit if it doesn't
+    /// match the held lease — protecting against interleaved bytes
+    /// when a stale writer's flush races a fresh writer's. Empty
+    /// `lease_id` preserves legacy (no-verification) behaviour.
     #[instrument(skip(self, commits))]
     pub async fn commit_chunk_locations(
         &self,
         path: &str,
         volume_id: &str,
         commits: Vec<ChunkLocationCommit>,
+        lease_id: &str,
     ) -> Result<bool> {
         let request = CommitChunkLocationsRequest {
             path: path.to_string(),
             volume_id: volume_id.to_string(),
             chunks: commits,
+            lease_id: lease_id.to_string(),
         };
         let response = self
             .call_manager("commit_chunk_locations", |mut c| {
@@ -289,7 +297,14 @@ impl DtfsClient {
                 async move { c.commit_chunk_locations(r).await }
             })
             .await?;
-        Ok(response.into_inner().success)
+        let inner = response.into_inner();
+        if inner.lease_conflict {
+            anyhow::bail!(
+                "commit_chunk_locations rejected: write lease no longer held ({})",
+                inner.error
+            );
+        }
+        Ok(inner.success)
     }
 
     /// Read a chunk from a data node.

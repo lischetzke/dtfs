@@ -779,7 +779,39 @@ fn apply_request(
             ClientResponse::Success
         }
 
-        ClientRequest::UpdateChunkLocations { path, chunks } => {
+        ClientRequest::UpdateChunkLocations { path, chunks, lease_id } => {
+            // Bug P — when the writer carries a lease_id, the manager
+            // verifies it matches the currently-held lease. Pre-fix a
+            // stale writer whose lease had been GC'd could still commit
+            // chunks alongside a fresh writer's, interleaving bytes.
+            // Empty lease_id preserves legacy callers' behaviour.
+            if !lease_id.is_empty() {
+                match sm.write_leases.get(path) {
+                    Some(held) if held.lease_id == *lease_id => {
+                        // OK — same writer.
+                    }
+                    Some(held) => {
+                        warn!(
+                            "UpdateChunkLocations REJECTED for {path}: stale lease_id={lease_id} (current={})",
+                            held.lease_id
+                        );
+                        return ClientResponse::WriteLeaseConflict {
+                            owner_id: held.owner_id.clone(),
+                            expires_at_ms: held.expires_at_ms,
+                        };
+                    }
+                    None => {
+                        warn!(
+                            "UpdateChunkLocations REJECTED for {path}: lease_id={lease_id} but no lease currently held"
+                        );
+                        return ClientResponse::WriteLeaseConflict {
+                            owner_id: String::new(),
+                            expires_at_ms: 0,
+                        };
+                    }
+                }
+            }
+
             if let Some(file) = sm.files.get_mut(path) {
                 file.chunks = merge_chunk_location_entries(&file.chunks, chunks);
                 file.updated_at_ms = now_ms;
@@ -1581,6 +1613,7 @@ mod posix_path_regression {
                     disk_id: 0,
                     size_bytes: 4096,
                 }],
+                lease_id: String::new(),
             },
         );
         // Sanity: the temp file is fully formed.
@@ -1673,6 +1706,7 @@ mod posix_path_regression {
                     // 10 GB single chunk for the test
                     size_bytes: 10 * 1024 * 1024 * 1024,
                 }],
+                lease_id: String::new(),
             },
         );
 
@@ -1788,6 +1822,157 @@ mod posix_path_regression {
         assert_eq!(a.chunks.len(), 1);
         assert_eq!(a.chunks[0].node_id, "11");
         assert_eq!(a.chunks[0].chunk_hash, "corrupt-hash");
+    }
+
+    /// Bug P — `UpdateChunkLocations` MUST reject a commit whose
+    /// `lease_id` doesn't match the currently-held lease for the
+    /// path. Pre-fix a stale writer (whose lease the manager had
+    /// already GC'd) could still commit its chunks alongside a fresh
+    /// writer's, interleaving the file's bytes per chunk_index.
+    #[test]
+    fn bug_p_update_chunk_locations_rejects_stale_lease_id() {
+        let mut sm = StateMachineData::default();
+        // 1. Create the file.
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::CreateFile {
+                path: "/x.bin".into(),
+                volume_id: "default".into(),
+                chunk_size: 1024,
+            },
+        );
+        // 2. Writer-A acquires the lease.
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::AcquireWriteLease {
+                path: "/x.bin".into(),
+                owner_id: "host-a:pid-1:fh-9".into(),
+                lease_ms: 15_000,
+                now_ms: 1_000_000,
+                proposed_lease_id: "lease-a-uuid".into(),
+            },
+        );
+        let lease_a = sm
+            .write_leases
+            .get("/x.bin")
+            .map(|l| l.lease_id.clone())
+            .expect("writer-A holds the lease");
+
+        // 3. Writer-A's lease is reaped (simulate GC sweep at lease+1).
+        apply_request(
+            &mut sm,
+            &mk_log_id(3),
+            &ClientRequest::SweepExpiredLeases {
+                now_ms: 1_000_000 + 16_000,
+            },
+        );
+        assert!(sm.write_leases.get("/x.bin").is_none());
+
+        // 4. Writer-B acquires fresh.
+        apply_request(
+            &mut sm,
+            &mk_log_id(4),
+            &ClientRequest::AcquireWriteLease {
+                path: "/x.bin".into(),
+                owner_id: "host-b:pid-2:fh-1".into(),
+                lease_ms: 15_000,
+                now_ms: 1_000_000 + 20_000,
+                proposed_lease_id: "lease-b-uuid".into(),
+            },
+        );
+        let lease_b = sm
+            .write_leases
+            .get("/x.bin")
+            .map(|l| l.lease_id.clone())
+            .expect("writer-B holds the lease now");
+        assert_ne!(lease_a, lease_b);
+
+        // 5. Writer-A's belated commit must be REJECTED.
+        let resp = apply_request(
+            &mut sm,
+            &mk_log_id(5),
+            &ClientRequest::UpdateChunkLocations {
+                path: "/x.bin".into(),
+                chunks: vec![ChunkLocationEntry {
+                    chunk_index: 0,
+                    chunk_hash: "stale-bytes".into(),
+                    node_id: "10".into(),
+                    disk_id: 0,
+                    size_bytes: 4096,
+                }],
+                lease_id: lease_a.clone(),
+            },
+        );
+        assert!(
+            matches!(resp, ClientResponse::WriteLeaseConflict { .. }),
+            "stale lease must be rejected with WriteLeaseConflict; got {:?}",
+            resp
+        );
+        // And the file's chunks must NOT have been mutated by A's stale commit.
+        let f = sm.files.get("/x.bin").unwrap();
+        assert!(
+            f.chunks.is_empty(),
+            "file must have no chunks committed by the stale writer"
+        );
+
+        // 6. Writer-B's commit with the right lease_id succeeds.
+        let resp = apply_request(
+            &mut sm,
+            &mk_log_id(6),
+            &ClientRequest::UpdateChunkLocations {
+                path: "/x.bin".into(),
+                chunks: vec![ChunkLocationEntry {
+                    chunk_index: 0,
+                    chunk_hash: "fresh-bytes".into(),
+                    node_id: "10".into(),
+                    disk_id: 0,
+                    size_bytes: 4096,
+                }],
+                lease_id: lease_b,
+            },
+        );
+        assert!(matches!(resp, ClientResponse::Success));
+        let f = sm.files.get("/x.bin").unwrap();
+        assert_eq!(f.chunks.len(), 1);
+        assert_eq!(f.chunks[0].chunk_hash, "fresh-bytes");
+    }
+
+    /// Bug P — empty lease_id preserves legacy callers (system-driven
+    /// re-replication, older clients). The commit succeeds without
+    /// lease verification.
+    #[test]
+    fn bug_p_empty_lease_id_skips_verification_legacy_compat() {
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::CreateFile {
+                path: "/y.bin".into(),
+                volume_id: "default".into(),
+                chunk_size: 1024,
+            },
+        );
+        let resp = apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::UpdateChunkLocations {
+                path: "/y.bin".into(),
+                chunks: vec![ChunkLocationEntry {
+                    chunk_index: 0,
+                    chunk_hash: "legacy".into(),
+                    node_id: "10".into(),
+                    disk_id: 0,
+                    size_bytes: 1024,
+                }],
+                lease_id: String::new(),
+            },
+        );
+        assert!(
+            matches!(resp, ClientResponse::Success),
+            "empty lease_id must skip verification (legacy compat)"
+        );
     }
 
     /// Bug O — unrelated chunks on the same node MUST be preserved.
