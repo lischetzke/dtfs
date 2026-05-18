@@ -66,45 +66,57 @@ preflight_cluster() {
 
 # Plex-shape playback generator. Spawns 5 concurrent dd-from-FUSE streams
 # at 60 Mbps each (7.5 MB/s). Total per-client: 300 Mbps.
+#
+# Discovery is in an outer retry loop: while ingest hasn't yet produced
+# any files large enough to "stream", the playback sleeps for 30s and
+# rescans. That way client01/client02 don't quit immediately at bootstrap
+# (when the cluster is empty) — they wait for client03 to start writing.
 plex_playback_script() {
     cat <<'SCRIPT'
-set -euo pipefail
+set -uo pipefail
 MOUNT=/mnt/dtfs
 STREAM_MBPS=60
 NUM_STREAMS=5
+MIN_FILE_MB=10   # smaller floor so we pick up newer ingest files quickly
 
 mkdir -p /tmp/plex-stats
 LOG=/tmp/plex-stats/playback.log
 echo "[$(date -Iseconds)] plex playback start: ${NUM_STREAMS}×${STREAM_MBPS}Mbps" >> "$LOG"
 
-# Compute IO rate per stream: 60 Mbps = 7.5 MB/s = 7864320 B/s.
 RATE_BPS=$(( STREAM_MBPS * 1024 * 1024 / 8 ))
 
-# Discover viewable files: anything > 50 MB under the mount, max 50 files.
-mapfile -t FILES < <(find "$MOUNT" -type f -size +50M 2>/dev/null | head -50)
-if [ "${#FILES[@]}" -eq 0 ]; then
-    echo "[$(date -Iseconds)] no files to stream yet (corpus not preloaded?)" >> "$LOG"
-    sleep 30
-    exit 0
-fi
+# Outer loop: rescan corpus every 60s so newly-ingested files get
+# included in playback. Important for the soak's anchor-migration story:
+# files written via client03 (NRB) appear on the cluster within seconds.
+while true; do
+    mapfile -t FILES < <(find "$MOUNT" -type f -size +${MIN_FILE_MB}M 2>/dev/null | head -100)
+    if [ "${#FILES[@]}" -eq 0 ]; then
+        echo "[$(date -Iseconds)] no files yet — sleeping 30s before rescan" >> "$LOG"
+        sleep 30
+        continue
+    fi
 
-# Spawn NUM_STREAMS concurrent readers; each picks a random file, reads
-# at ~RATE_BPS using pv-style throttling (dd + sleep loop).
-for i in $(seq 1 $NUM_STREAMS); do
-    (
-        while true; do
-            FILE="${FILES[$((RANDOM % ${#FILES[@]}))]}"
-            # 5 MB chunk reads with delay to hit RATE_BPS/sec average.
-            CHUNK=5242880
-            DELAY=$(awk "BEGIN {printf \"%.3f\", $CHUNK / $RATE_BPS}")
-            dd if="$FILE" of=/dev/null bs=$CHUNK count=1 status=none 2>/dev/null || true
-            sleep "$DELAY"
-        done
-    ) &
+    echo "[$(date -Iseconds)] playback: ${#FILES[@]} files visible — starting ${NUM_STREAMS} streams" >> "$LOG"
+    # Spawn NUM_STREAMS concurrent readers in a sub-shell so we can
+    # rescan once they've all read some files. Each iteration of the
+    # inner while-true reads ~60 seconds worth then re-discovers.
+    pids=()
+    for i in $(seq 1 $NUM_STREAMS); do
+        (
+            END=$(( $(date +%s) + 60 ))
+            while [ "$(date +%s)" -lt "$END" ]; do
+                FILE="${FILES[$((RANDOM % ${#FILES[@]}))]}"
+                # 5 MB chunk reads with delay to hit RATE_BPS/sec average.
+                CHUNK=5242880
+                DELAY=$(awk "BEGIN {printf \"%.3f\", $CHUNK / $RATE_BPS}")
+                dd if="$FILE" of=/dev/null bs=$CHUNK count=1 status=none 2>/dev/null || true
+                sleep "$DELAY"
+            done
+        ) &
+        pids+=($!)
+    done
+    for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
 done
-
-# Run until parent kills us.
-wait
 SCRIPT
 }
 
@@ -150,14 +162,25 @@ run_stage() {
     preflight_cluster || return 1
 
     # ----- spawn workloads -----
+    # Write the scripts to /tmp locally, scp to each client, then exec via
+    # `setsid nohup`. The previous pipe-through-ssh pattern raced with the
+    # SSH channel close and left the script file empty.
+    local playback_local="${results_dir}/playback.sh"
+    local ingest_local="${results_dir}/ingest.sh"
+    plex_playback_script > "${playback_local}"
+    ingest_script > "${ingest_local}"
+
     log "spawning Plex playback on client01 (LELI) — should hit LOCAL data-primary"
-    plex_playback_script | ssh $SSH_OPTS "${SSH_USER}@${CLIENT_LELI}" "cat > /tmp/playback.sh && nohup bash /tmp/playback.sh > /tmp/playback.out 2>&1 &" || log "WARN client01 playback spawn failed"
+    scp $SSH_OPTS "${playback_local}" "${SSH_USER}@${CLIENT_LELI}:/tmp/playback.sh" > /dev/null && \
+    ssh $SSH_OPTS "${SSH_USER}@${CLIENT_LELI}" "setsid nohup bash /tmp/playback.sh > /tmp/playback.out 2>&1 < /dev/null &" || log "WARN client01 playback spawn failed"
 
     log "spawning Plex playback on client02 (TORO) — verifies disk cache + folder readahead"
-    plex_playback_script | ssh $SSH_OPTS "${SSH_USER}@${CLIENT_TORO}" "cat > /tmp/playback.sh && nohup bash /tmp/playback.sh > /tmp/playback.out 2>&1 &" || log "WARN client02 playback spawn failed"
+    scp $SSH_OPTS "${playback_local}" "${SSH_USER}@${CLIENT_TORO}:/tmp/playback.sh" > /dev/null && \
+    ssh $SSH_OPTS "${SSH_USER}@${CLIENT_TORO}" "setsid nohup bash /tmp/playback.sh > /tmp/playback.out 2>&1 < /dev/null &" || log "WARN client02 playback spawn failed"
 
     log "spawning ingest on client03 (NRB) — verifies anchor migration"
-    ingest_script | ssh $SSH_OPTS "${SSH_USER}@${CLIENT_NRB}" "cat > /tmp/ingest.sh && nohup bash /tmp/ingest.sh > /tmp/ingest.out 2>&1 &" || log "WARN client03 ingest spawn failed"
+    scp $SSH_OPTS "${ingest_local}" "${SSH_USER}@${CLIENT_NRB}:/tmp/ingest.sh" > /dev/null && \
+    ssh $SSH_OPTS "${SSH_USER}@${CLIENT_NRB}" "setsid nohup bash /tmp/ingest.sh > /tmp/ingest.out 2>&1 < /dev/null &" || log "WARN client03 ingest spawn failed"
 
     # ----- spawn metrics collector -----
     log "spawning metrics collector"
