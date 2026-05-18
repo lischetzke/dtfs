@@ -18,13 +18,22 @@ dtfs_shape_iface: eth0
 # IFB module + interface for ingress shaping. Single ifb0 is sufficient.
 dtfs_shape_ifb: ifb0
 
-# Ports exempted from shaping so management traffic isn't bottlenecked.
-# Always include 22 (SSH), 9402/9403 (Prometheus scrape), 123 (NTP).
+# Ports exempted from shaping so management/Raft traffic isn't
+# bottlenecked. CLAUDE.md §9 lists the required exemptions explicitly:
+# without exempting Raft ports, heartbeats are throttled by the shaped
+# link and the cluster suffers election storms (Bug Y, observed on
+# Plexmedia: all-LELI voters churn through 800+ Raft terms in minutes
+# under load because heartbeats compete with chunk traffic on the
+# 40 Mbps shaped link).
 dtfs_shape_exempt_ports:
   - 22       # SSH
   - 123      # NTP
+  - 9400     # Raft transport listen port (Bug Y)
+  - 9401     # Manager gRPC (carries RaftTransport RPCs) (Bug Y)
   - 9402     # Manager metrics/REST
   - 9403     # Data node metrics
+  - 9500     # Data gRPC (chunk read/replicate; not exempting causes
+             # repeated migration backoffs under shaping) (Bug Y)
 
 # Marker file path; the apply task touches it after success so the revert
 # task can detect a half-installed state.

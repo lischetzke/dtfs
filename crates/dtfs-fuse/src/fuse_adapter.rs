@@ -735,7 +735,11 @@ impl Filesystem for DtfsFuse3Adapter {
                     warn!("fuse3 create {}: write lease busy", path);
                     return Err(Errno::from(libc::EBUSY));
                 }
-                warn!("fuse3 create {}: {}", path, e);
+                // Bug Y diagnostic — include the anyhow error chain so we
+                // see the actual manager-side reject (e.g. Raft proposal
+                // failure, no eligible data node, etc.) instead of just
+                // "create_file failed".
+                warn!("fuse3 create {}: {:#}", path, e);
                 Err(Errno::from(libc::EIO))
             }
         }

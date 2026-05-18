@@ -63,11 +63,19 @@ impl MetadataService {
 
     /// Helper: propose a write through Raft and return the response.
     async fn raft_write(&self, req: ClientRequest) -> Result<ClientResponse, Status> {
-        self.raft
-            .client_write(req)
-            .await
-            .map(|resp| resp.data)
-            .map_err(|e| Status::internal(format!("Raft write failed: {}", e)))
+        // Bug Y diagnostic — log the actual openraft error before
+        // wrapping it as a generic Status::internal. Previously the
+        // manager log lines for failing creates showed only "CreateFile:
+        // <path>" without any indication that the Raft proposal had
+        // failed, making it impossible to tell whether the cluster was
+        // healthy or jammed.
+        match self.raft.client_write(req).await {
+            Ok(resp) => Ok(resp.data),
+            Err(e) => {
+                tracing::warn!(error = %e, "Raft write failed");
+                Err(Status::internal(format!("Raft write failed: {}", e)))
+            }
+        }
     }
 }
 
