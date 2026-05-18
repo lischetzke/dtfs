@@ -437,66 +437,22 @@ impl ManagerService for MetadataService {
         let req = request.into_inner();
 
         let data = self.sm_data.read().await;
+        // Delegate the actual aggregation to the canonical helper. It
+        // handles three cases atomically (Bug E):
+        //   - explicit mkdir entry + child files at the same name → dir
+        //   - synthetic directory implied by child paths → dir
+        //   - regular file → not a dir, size from chunks/logical_size
+        // Iteration order of `data.files` no longer affects the type bit.
+        let listed = data.list_directory_entries(&req.path);
 
-        let prefix = if req.path.ends_with('/') {
-            req.path.clone()
-        } else {
-            format!("{}/", req.path)
-        };
-
-        // Group files by their first path component after the prefix so that
-        // subdirectory entries are emitted correctly instead of every entry
-        // showing is_directory=false (fix for issue #11).
-        //
-        // key   -> (is_dir, earliest_created_at, latest_modified_at, total_size)
-        let mut seen: BTreeMap<String, (bool, i64, i64, u64)> = BTreeMap::new();
-
-        for (path, meta) in data.files.range(prefix.clone()..) {
-            if !path.starts_with(&prefix) {
-                break;
-            }
-            let relative = &path[prefix.len()..];
-
-            // First path component determines the entry type.
-            let (entry_name, is_dir) = match relative.find('/') {
-                Some(slash) => (relative[..slash].to_string(), true),
-                None => (relative.to_string(), false),
-            };
-
-            if entry_name.is_empty() {
-                continue;
-            }
-
-            // Each chunk_index has N replica entries in `meta.chunks` (one
-            // per data-node copy). Summing them raw would multiply the file
-            // size by the replication factor (so a 245 MB file at RF=3 would
-            // show as ~735 MB in `ls`). Group by chunk_index first, then sum
-            // the per-chunk size.
-            let mut sizes_by_index: std::collections::BTreeMap<u64, u64> =
-                std::collections::BTreeMap::new();
-            for c in &meta.chunks {
-                let e = sizes_by_index.entry(c.chunk_index).or_insert(0);
-                *e = (*e).max(c.size_bytes);
-            }
-            let chunk_size: u64 = sizes_by_index.values().sum();
-            let entry = seen
-                .entry(entry_name)
-                .or_insert((is_dir, meta.created_at_ms as i64, meta.updated_at_ms as i64, 0));
-            entry.3 += chunk_size;
-            // For directories, track the most recent modification time.
-            if meta.updated_at_ms as i64 > entry.2 {
-                entry.2 = meta.updated_at_ms as i64;
-            }
-        }
-
-        let entries: Vec<DirectoryEntry> = seen
+        let entries: Vec<DirectoryEntry> = listed
             .into_iter()
-            .map(|(name, (is_dir, created_at, modified_at, size))| DirectoryEntry {
-                name,
-                size,
-                is_directory: is_dir,
-                created_at,
-                modified_at,
+            .map(|e| DirectoryEntry {
+                name: e.name,
+                size: e.size_bytes,
+                is_directory: e.is_directory,
+                created_at: e.created_at_ms as i64,
+                modified_at: e.updated_at_ms as i64,
             })
             .collect();
 
