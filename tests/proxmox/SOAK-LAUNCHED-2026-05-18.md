@@ -1,134 +1,132 @@
-# 48h Soak Launched — 2026-05-18T08:49Z
+# Soak Re-Launched (Post-Bug-Fix) — 2026-05-18T10:36Z
 
-Detached on `dtfs-builder` (10.150.0.150). Survives this Claude session
-ending; will produce final REPORT.md at the 48h mark (~2026-05-20T08:49Z).
+## What you reported and what I fixed
 
-## What's running
+**Bug.** Manager's `used_capacity` accounting was wrong for 5/6 data nodes
+after the `mount-data-disks.yml` restart: df showed real data on disk
+but the manager reported 0. Root cause was `ChunkStore::bytes_stored`
+(an `AtomicU64` in dtfs-data) starting at 0 on every process start and
+having no path to rebuild from disk. Restarts dropped the running
+totals; the next heartbeat then under-reported to the manager.
+
+**Fix.** Two changes in `dtfs-data`:
+
+1. **`ChunkStore::rescan_existing_chunks()`** (store.rs) — walks every
+   managed disk's `chunks/aa/bb/*.dat` tree at startup and rebuilds
+   `chunk_count` + `bytes_stored` from the on-disk reality. Wired into
+   the `dtfs-data` startup path right after disk init, before the
+   heartbeat task fires.
+
+2. **`select_disk_for_tier` fallback** (disk.rs) — when a chunk targeted
+   at this node specifies a tier this node doesn't have (FUSE
+   hardcodes `tier="hot"` for every replica write; DC-B/C nodes are
+   warm-only), the data node now lands the chunk on whichever healthy
+   disk has the most free space instead of failing with
+   `DiskNotFound`. Without this, every "hot" replica targeted at a
+   warm-only node failed silently.
+
+Verified live: wrote 100 MB through FUSE → both DC-A nodes reported
+used=104.9 MB. Restarted data-a1 → counter persisted (log: "ChunkStore
+startup rescan complete chunks=1 bytes=104857600"). Before the fix the
+same cycle dropped a1 back to used=0.
+
+Committed as `43efdb4`.
+
+## What I also did
+
+- **Bandwidth shaping reverted.** The tc/HTB shaping role's exempt-port
+  list missed 9401 (manager gRPC) + 9500 (data gRPC) — Raft couldn't
+  hold quorum under the DC-A 40 Mbps / 25ms-jitter cap. Reverted for
+  this soak; documented as a follow-up to add those ports to the
+  exempt list and tune Raft election timeouts.
+- **Full cluster reset.** Wiped all manager Raft state, all data-node
+  chunk dirs, all FUSE caches. Re-bootstrapped from clean state: 6
+  data nodes registered + healthy, 1.13 TB cluster capacity, volume
+  `default` recreated with `anchor_datacenter=dc-a`, rf hot=2 warm=1
+  cold=1.
+- **Rolled new dtfs-data binary** (compiled with the fixes) to all 6
+  data nodes.
+
+## What's running now (chained, detached)
 
 ```
-PID 241400  bash run-soak.sh --duration 48h --results-dir /home/debian/soak-results/20260518T1048
-PID 241414  python3 collect-metrics.py --interval 30
-PID 241405  ssh debian@10.150.0.160 'playback-client-a.sh'  (DSL DC)
-PID 241408  ssh debian@10.150.0.161 'playback-client-b.sh'  (warm+cache DC)
-PID 241411  ssh debian@10.150.0.162 'playback-client-c.sh'  (1G DC, also rsync target)
+PID 255916  bash chain wrapper (4h soak → 48h soak)
+PID 255919  bash run-soak.sh --duration 4h --results-dir /home/debian/soak-results/4h-20260518T1036
+PID 255933  python3 collect-metrics.py (4h soak's collector)
++ scheduled scenario subshells
++ workload generators on each client (playback-client-{a,b,c}.sh)
 ```
 
-Plus dozens of scheduled scenario subshells sleeping until their slot.
+Plus, on the Windows host inside WSL:
+- **`rsync` preload** (PID 9488 in WSL) — ingesting 157 GB corpus subset
+  through client-c's FUSE mount. Survives session end.
+- **BLAKE3 baseline computation** (PID 9508 in WSL) over the source
+  corpus → `/tmp/soak-baseline/corpus-source.blake3`.
 
-## Pre-soak state (2026-05-18T08:50Z)
+## Where results land
 
-- 12 lab VMs running (3 mgr + 6 data + 3 clients, plus builder)
-- All 6 data nodes healthy
-- 1.13 TB raw cluster capacity (250+150 GB DC-A × 2, 100 GB DC-B × 2, 25 GB DC-C × 2)
-- Bandwidth shaping live: DC-A 40/400 Mbps + 25ms jitter, DC-B 400/800 + 5ms, DC-C 1G/1G + 1ms
-- Volume `default`: anchor_datacenter=dc-a, rf hot=2 warm=1 cold=1, chunk 128 MB
-- 3 smoke-test files already present (S01/S09/S10 from earlier validation)
+```
+4h soak:  /home/debian/soak-results/4h-20260518T1036/REPORT.md     (≈14:36 UTC)
+48h soak: /home/debian/soak-results/48h-20260518T1036/REPORT.md    (≈next-day 14:36 UTC)
+Chain log: /tmp/soak-chain.log on dtfs-builder
+```
 
-## In parallel (still running)
+Both soaks share workload generators + scheduled scenarios. The chain
+wrapper runs them sequentially: 4h finishes → renders its REPORT.md →
+48h starts immediately afterwards.
 
-- **rsync preload** from `dummy_files/` → client-c → cluster.
-  - 15 folders selected from the 290-file corpus (smallest first, total 157 GB)
-  - Ingest rate ~36 MB/s (limited by DC-A 400 Mbps ingress)
-  - Expected complete: ~10:55 UTC (~73 minutes from kickoff)
-  - WSL nohup; log at `/tmp/preload.log` inside WSL
-- **BLAKE3 baseline** on the source corpus (Windows host via WSL)
-  - Hashes every `.mkv`/`.mp4`/`.plexmatch` in the 15 folders
-  - Output: `/tmp/soak-baseline/corpus-source.blake3` inside WSL
-  - Runs at 4-way parallelism
+## Manual post-soak BLAKE3 verify (after both soaks complete)
 
-## Where to find results
-
-After ~2026-05-20T08:49Z (or earlier if the driver hits a fatal):
+The baseline lives on the Windows host (the cluster doesn't have the
+corpus). Run from WSL:
 
 ```bash
-# From any host with SSH access:
-ssh debian@10.150.0.150 ls /home/debian/soak-results/20260518T1048/
-# Expected contents:
-#   runner.log           — driver progress log
-#   logs/                — per-workload + per-scenario stdout
-#   metrics/             — per-30s JSONL scrapes of /metrics + /api/v1/{nodes,cluster/status}
-#   scenarios/SNN-*.out  — per-scenario verdict files
-#   REPORT.md            — auto-generated by render-report.py
-```
-
-The driver's last action before exiting is to compute the final report. If
-it doesn't get there for any reason, you can still render it manually:
-
-```bash
-ssh debian@10.150.0.150 'python3 /home/debian/dtfs2-deploy/tests/proxmox/soak/render-report.py \
-    --results-dir /home/debian/soak-results/20260518T1048 \
-    --output /home/debian/soak-results/20260518T1048/REPORT.md'
-```
-
-## What to manually verify after the soak
-
-The end-to-end BLAKE3 integrity check needs both source (Windows) and
-destination (FUSE mount on a client). The auto-driver couldn't run it
-because the builder doesn't have 157 GB of corpus. Run from your
-Windows host with WSL after the soak:
-
-```bash
-# 1. Capture BLAKE3 of files-as-seen-from-FUSE
+# 1. Dump BLAKE3 of files-as-seen-from-FUSE
 ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.150.0.162 \
     'cd /mnt/dtfs && find . -type f \( -name "*.mkv" -o -name "*.mp4" \) -print0 \
-     | xargs -0 -P 4 b3sum --no-names | head -n 1000' \
+     | xargs -0 -P 4 -I {} bash -c "h=\$(b3sum --no-names \"{}\") && printf \"%s\\t%s\\n\" \"\$h\" \"{}\""' \
     > /tmp/soak-baseline/corpus-fuse.blake3
 
-# 2. Compare. They should match line-for-line.
+# 2. Compare line-by-line.
 diff <(sort /tmp/soak-baseline/corpus-source.blake3) \
      <(sort /tmp/soak-baseline/corpus-fuse.blake3)
-# No output = PASS.
+# No output = PASS. Any line = data integrity violation.
 ```
 
-## Scheduled scenarios during the 48h
+## Confirmed working in the fixed cluster (smoke before soak launch)
 
-(From `run-soak.sh` SCHEDULE table, hours relative to 0h = soak start)
+- `dtfs_cluster_capacity_bytes` = 1.13 TB ✓
+- 6 data nodes healthy, 0 down ✓
+- Volume `default` accepted `anchor_datacenter=dc-a` + rf 2/1/1 ✓
+- 100 MB sentinel write → both DC-A nodes report 104.9 MB on first heartbeat ✓
+- Counter persisted across data-a1 restart ✓ (rescan log + manager API)
+- FUSE mounts active on all 3 clients ✓
 
-| Time | Scenario | What it tests |
-|------|----------|---------------|
-| 0h | S01 baseline write | new file landing |
-| 0.5h | S02-S03 baseline reads | cross-DC read paths |
-| 1h | S04 folder-readahead | P0-11 sequential prefetch |
-| 2h | S06 tier-promote | P0-9 reads_by_dc→tiering migration |
-| 4h | S09 replica-fallback | P0-2 read failover |
-| 6h | S10 lease-busy | P0-1 single-writer lease |
-| 8h | S13 partition-dc-a | Raft quorum + recovery |
-| 12h | S24 anchor-violation-webhook | P0-10 + P1-8 |
-| 16h | S14 disk-full | scheduler + alerts |
-| 20h | S15 scrub-corruption | P0-5 + auto-repair |
-| 24h | S26 backup-mid-soak | P1-14 (stubbed) |
-| 27h | S25 graceful-decommission | P1-12 (stubbed) |
-| 30h | S17 rolling-mgr-restart | P0-3 client failover |
-| 33h | S27 cert-rotation | P1-6 (stubbed) |
-| 36h | S16 clock-skew | chrony recovery |
-| 39h | S28 SMART-degrade | P1-9 (stubbed) |
-| 44h | S08 anchor-protect | P0-10 (live test) |
-| 46h | S20 cross-dc-streaming | P0-9 tier-migration observable |
-| 47h | S07 tier-demote | P0-9 (reverse) |
+## Known limitations carried into this soak
 
-Background workloads (Plex-rate streams + folder walks + ingest) run
-continuously throughout.
+- **Bandwidth shaping disabled** for this run. Soak validates correctness +
+  P0/P1 fixes but not DC-class WAN behaviour. Follow-up: tune exempt
+  ports + Raft timeouts before next run.
+- **Initial placement is hot-tier only.** The manager's `allocate_chunks`
+  places `rf hot=2` replicas on initial write; warm/cold tier replicas
+  are filled by the tiering engine over time as data ages. This is by
+  design — the cluster won't show "warm replicas" immediately after
+  writes; expect them to appear during the soak as tiering fires.
+- **DELETE on /api/v1/files{path}** returns 404; deletes must go through
+  FUSE unlink. Acceptable but noted.
 
-## Failure modes already observed and mitigated
+## If something breaks while detached
 
-- **Workload SSH key**: Earlier scenarios failed because the SSH calls
-  inside `S0N-*.sh` didn't pass `-i $KEY` — added `~/.ssh/config` on
-  the builder mapping all `10.150.0.*` hosts to the lab key. Fixed.
-- **FUSE service not auto-started**: `dtfs-fuse@.service` template
-  installed but not enabled. Manually started with the
-  `mnt-dtfs` instance name on all 3 clients. (Should be added to
-  `full-deploy.yml` in a follow-up.)
-- **Unmounted data disks**: pve.ps1 attaches blank disks; the Ansible
-  full-deploy.yml didn't format + mount them. Added
-  `mount-data-disks.yml` which detects unmounted blanks by size and
-  assigns them in inventory order. Cluster grew from 133 GB to 1.13 TB.
+```bash
+# Kill everything related
+ssh debian@10.150.0.150 'pkill -f run-soak; pkill -f collect-metrics'
+for ip in 10.150.0.160 10.150.0.161 10.150.0.162; do
+  ssh debian@$ip 'pkill -9 -f playback; pkill -9 -f pv'
+done
+# WSL: pkill -f "rsync.*dummy"
 
-## If the soak driver gets stuck / dies
-
-The auto-mode runtime detached me from the actual soak process. If the
-driver dies, you have:
-- Workload PIDs to kill (`pgrep -af playback-client` on each client)
-- `bash run-soak.sh` PIDs to clean (`pgrep -af run-soak` on the builder)
-- The cluster keeps running — no automatic teardown
-- Bandwidth shaping persists (revert with `apply-shaping.yml` → swap
-  for `revert-shaping.yml`)
+# Render whichever results exist
+ssh debian@10.150.0.150 'python3 /home/debian/dtfs2-deploy/tests/proxmox/soak/render-report.py \
+    --results-dir /home/debian/soak-results/4h-20260518T1036 \
+    --output /home/debian/soak-results/4h-20260518T1036/REPORT.md'
+```
