@@ -21,8 +21,14 @@ ProtectHome=yes
 ReadWritePaths=/var/lib/dtfs/manager
 PrivateTmp=yes
 
-# Environment
-Environment=RUST_LOG=dtfs=info
+# Environment — P1-11: keep openraft/tonic quiet so 48h soaks don't fill
+# /var/log/journal at debug. Override with `systemctl set-environment` for
+# focused debugging.
+Environment=RUST_LOG=dtfs=info,openraft=warn,tonic=warn,h2=warn
+
+# P1-11: cap per-service journal usage so a chatty bug can't fill disk.
+LogRateLimitIntervalSec=10
+LogRateLimitBurst=2000
 
 [Install]
 WantedBy=multi-user.target

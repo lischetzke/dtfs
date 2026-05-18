@@ -9,6 +9,7 @@ use std::time::Duration;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+mod alerts;
 mod api;
 #[allow(dead_code)]
 mod audit;
