@@ -139,6 +139,22 @@ pub struct NodeInfo {
     pub total_capacity: u64,
     pub used_capacity: u64,
     pub health: HealthStatus,
+    /// Unix milliseconds when the manager last observed this node alive
+    /// (heartbeat received, RPC succeeded, etc.). Persisted via Raft so
+    /// every manager surfaces the same "last seen" timestamp in the
+    /// WebUI, even if the operator switches between mgr-01/02/03.
+    /// `#[serde(default)]` keeps older snapshots loadable.
+    #[serde(default)]
+    pub last_seen_ms: u64,
+    /// Cumulative bytes this node has served via read RPCs since the
+    /// data-node process started. The manager diffs across heartbeats
+    /// to compute a per-second rate for the WebUI I/O card.
+    #[serde(default)]
+    pub total_bytes_read: u64,
+    /// Cumulative bytes written into this node via `put_chunk` since
+    /// the data-node process started.
+    #[serde(default)]
+    pub total_bytes_written: u64,
 }
 
 impl fmt::Display for NodeInfo {
@@ -207,6 +223,19 @@ pub enum ClientRequest {
         node_id: u64,
         used_capacity: u64,
         chunk_count: u64,
+        /// WebUI bug: cumulative byte counters carried up from the
+        /// data-node heartbeat. The manager stores them in NodeInfo
+        /// so /api/v1/stats can compute a per-second rate. New fields
+        /// are `#[serde(default)]` so older Raft log entries replay.
+        #[serde(default)]
+        total_bytes_read: u64,
+        #[serde(default)]
+        total_bytes_written: u64,
+        /// Unix milliseconds; manager-side wall-clock at heartbeat
+        /// receipt. Used to compute the bytes/sec rate AND to populate
+        /// NodeInfo.last_seen_ms for the WebUI.
+        #[serde(default)]
+        observed_at_ms: u64,
     },
 
     // ---- Config operations ----
@@ -356,10 +385,13 @@ impl fmt::Display for ClientRequest {
                 node_id,
                 used_capacity,
                 chunk_count,
+                total_bytes_read,
+                total_bytes_written,
+                observed_at_ms: _,
             } => {
                 write!(
                     f,
-                    "UpdateNodeUsage({node_id}, used={used_capacity}, chunks={chunk_count})"
+                    "UpdateNodeUsage({node_id}, used={used_capacity}, chunks={chunk_count}, read={total_bytes_read}, written={total_bytes_written})"
                 )
             }
             Self::UpdateConfig { version, .. } => write!(f, "UpdateConfig(v{version})"),

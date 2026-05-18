@@ -380,6 +380,12 @@ message HeartbeatRequest {
   // by recent activity are reported each heartbeat (capped to keep payload
   // bounded). Drives the tiering engine's auto-move-replica decisions.
   repeated PerChunkReadCounter chunk_reads = 6;
+  // Cumulative bytes this data node has read/written since process
+  // start. The manager computes per-second rates by diffing across
+  // heartbeats. Surfaced in /api/v1/stats so the WebUI's I/O
+  // throughput card shows real numbers.
+  uint64 total_bytes_read = 7;
+  uint64 total_bytes_written = 8;
 }
 
 // P0-9: per-chunk read counter, one entry per (chunk, DC) cell, packed

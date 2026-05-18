@@ -206,6 +206,9 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .scrub-card {{
             background: var(--surface); border: 1px solid var(--border);
             border-radius: .625rem; padding: 1.25rem;
+            /* WebUI bug — was missing the top margin so the card
+               sat flush against Tier Distribution above. */
+            margin-top: 1rem;
             margin-bottom: 1.25rem;
         }}
         .scrub-card h3 {{
@@ -405,7 +408,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     <a href="/ui/migrations">Migrations</a>
     <a href="/ui/audit">Audit Log</a>
     <a href="/ui/settings">Settings</a>
-    <a href="/docs/" target="_blank">Docs ↗</a>
+    <a href="https://github.com/leduc/dtfs2/tree/master/docs" target="_blank">Docs ↗</a>
 </nav>
 
 <div class="health-banner unknown" id="health-banner">
@@ -465,7 +468,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 <div class="footer">
     DTFS — Distributed Tiered Filesystem &nbsp;·&nbsp;
     <a href="/api/v1/cluster/status" style="color:var(--primary)">API</a> &nbsp;·&nbsp;
-    <a href="/docs/" style="color:var(--primary)">Docs</a>
+    <a href="https://github.com/leduc/dtfs2/tree/master/docs" style="color:var(--primary)" target="_blank">Docs</a>
 </div>
 
 <script>
