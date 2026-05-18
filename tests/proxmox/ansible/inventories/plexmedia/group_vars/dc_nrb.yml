@@ -1,0 +1,7 @@
+---
+# DC NRB — 1 Gbps symmetric, 1 ms jitter.
+# Hosts: mgr05, data-warm02, client03.
+dtfs_shape_up_mbps: 1000
+dtfs_shape_down_mbps: 1000
+dtfs_shape_delay_ms: 1
+dtfs_shape_jitter_ms: 1

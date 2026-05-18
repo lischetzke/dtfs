@@ -17,9 +17,12 @@ name = "{{ dtfs_cluster_name }}"
 shared_secret = "{{ dtfs_cluster_secret | default(dtfs_shared_secret | default('rotate-me')) }}"
 bootstrap = {{ 'true' if dtfs_is_bootstrap | default(false) else 'false' }}
 
-# Raft initial voters — all managers must enumerate every peer so the
-# bootstrap node forms a multi-voter cluster (FINDINGS.md F-009).
-{% for mgr in groups['managers'] %}
+# Raft initial voters — all managers with `dtfs_is_voter != false` are
+# enumerated. Plexmedia uses this to keep the 3 LELI managers as voters
+# and mgr04/mgr05 as non-voting observers (FINDINGS.md F-009 covers the
+# multi-voter bootstrap requirement; observer support requires the
+# manager binary to skip self-addition when `dtfs_is_voter == false`).
+{% for mgr in groups['managers'] if hostvars[mgr].dtfs_is_voter | default(true) %}
 [[cluster.initial_voters]]
 hostname = "{{ mgr }}"
 addr = "{{ hostvars[mgr].ansible_host }}:9401"

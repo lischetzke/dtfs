@@ -1,0 +1,254 @@
+{
+  "_doc": "Cluster Plexmedia — production topology for DTFS soak. DC LELI is the storage anchor (40 Mbps DSL-class) with all 3 quorum managers + primary storage + a Plex viewer. DC TORO (400 Mbps) holds an SSD warm tier + Plex viewer. DC NRB (1 Gbps) is the ingest path: fresh downloads land here on HDD and replicate to LELI. All storage on LVM-Thin pools pve01_ssd01..02 + pve01_usb01..04. Scaled-down from real (50 TB primary → 600 GB; 1 TB warms → 200 GB) so the soak fits the 14-disk pve01 host.",
+  "pve": {
+    "host": "10.150.0.121",
+    "node": "i-pve01",
+    "api_base": "https://10.150.0.121:8006/api2/json",
+    "bridge": "vmbr0",
+    "subnet": "10.150.0.0/24",
+    "gateway": "10.150.0.1",
+    "dns": ["10.150.0.2", "10.150.0.3"],
+    "storage_vm_disks": "pve01_ssd01",
+    "storage_primary_1": "pve01_usb01",
+    "storage_primary_2": "pve01_usb02",
+    "storage_primary_3": "pve01_usb03",
+    "storage_primary_4": "pve01_usb04",
+    "storage_warm_toro": "pve01_ssd02",
+    "storage_warm_nrb": "pve01_ssd02",
+    "storage_iso": "local"
+  },
+  "ssh": {
+    "user": "debian",
+    "key_path": "C:/Users/leduc/.ssh/dtfs-lab/id_ed25519",
+    "pub_key_path": "C:/Users/leduc/.ssh/dtfs-lab/id_ed25519.pub"
+  },
+  "template": {
+    "vmid": 9000,
+    "name": "debian-13-cloudinit-tpl",
+    "source_image": "debian-13-generic-amd64.qcow2"
+  },
+  "topology": {
+    "cluster_name": "Plexmedia",
+    "datacenters": [
+      {
+        "name": "leli",
+        "role": "anchor",
+        "bandwidth_mbps": { "down": 40, "up": 40, "jitter_ms": 25 },
+        "notes": "DSL-class anchor — holds at least one replica of every file. All quorum managers live here so the cluster can't form a partition that excludes LELI."
+      },
+      {
+        "name": "toro",
+        "role": "warm-cache-ssd",
+        "bandwidth_mbps": { "down": 400, "up": 400, "jitter_ms": 5 },
+        "max_age_days": 90,
+        "readahead": "folder-sequential",
+        "notes": "SSD warm + folder readahead for Plex client streams. Empty at bootstrap; promoted by reads_by_dc."
+      },
+      {
+        "name": "nrb",
+        "role": "ingest-warm",
+        "bandwidth_mbps": { "down": 1000, "up": 1000, "jitter_ms": 1 },
+        "notes": "1G symmetric. Fresh downloads land on HDD here; replicate to LELI per anchor invariant."
+      }
+    ]
+  },
+  "vms": [
+    {
+      "role": "builder",
+      "vmid": 9001,
+      "name": "dtfs-builder",
+      "ip": "10.150.0.150",
+      "cores": 4,
+      "memory_mb": 8192,
+      "os_disk_gb": 32,
+      "extra_disks": [],
+      "persistent_through_soak": true,
+      "notes": "Existing builder VM; rebuilds happen here so soak iteration is fast."
+    },
+    {
+      "role": "manager",
+      "vmid": 201,
+      "name": "mgr01",
+      "ip": "10.150.0.151",
+      "cores": 2,
+      "memory_mb": 1024,
+      "os_disk_gb": 16,
+      "extra_disks": [],
+      "dc": "leli",
+      "rack": "leli-rack-1",
+      "bootstrap": true,
+      "memory_budget": { "hard_cap_mb": 768, "warn_pct": 80, "shed_pct": 92 }
+    },
+    {
+      "role": "manager",
+      "vmid": 202,
+      "name": "mgr02",
+      "ip": "10.150.0.152",
+      "cores": 2,
+      "memory_mb": 1024,
+      "os_disk_gb": 16,
+      "extra_disks": [],
+      "dc": "leli",
+      "rack": "leli-rack-2",
+      "memory_budget": { "hard_cap_mb": 768, "warn_pct": 80, "shed_pct": 92 }
+    },
+    {
+      "role": "manager",
+      "vmid": 203,
+      "name": "mgr03",
+      "ip": "10.150.0.153",
+      "cores": 2,
+      "memory_mb": 1024,
+      "os_disk_gb": 16,
+      "extra_disks": [],
+      "dc": "leli",
+      "rack": "leli-rack-3",
+      "memory_budget": { "hard_cap_mb": 768, "warn_pct": 80, "shed_pct": 92 }
+    },
+    {
+      "role": "manager",
+      "vmid": 204,
+      "name": "mgr04",
+      "ip": "10.150.0.154",
+      "cores": 2,
+      "memory_mb": 1024,
+      "os_disk_gb": 16,
+      "extra_disks": [],
+      "dc": "toro",
+      "rack": "toro-rack-1",
+      "memory_budget": { "hard_cap_mb": 768, "warn_pct": 80, "shed_pct": 92 },
+      "notes": "Non-voter observer; lives in TORO so the dashboard there has a local fast path."
+    },
+    {
+      "role": "manager",
+      "vmid": 205,
+      "name": "mgr05",
+      "ip": "10.150.0.155",
+      "cores": 2,
+      "memory_mb": 1024,
+      "os_disk_gb": 16,
+      "extra_disks": [],
+      "dc": "nrb",
+      "rack": "nrb-rack-1",
+      "memory_budget": { "hard_cap_mb": 768, "warn_pct": 80, "shed_pct": 92 },
+      "notes": "Non-voter observer in NRB. Ingest scripts query this manager."
+    },
+    {
+      "role": "data",
+      "vmid": 206,
+      "name": "data-primary01",
+      "ip": "10.150.0.156",
+      "cores": 4,
+      "memory_mb": 4096,
+      "os_disk_gb": 16,
+      "extra_disks": [
+        { "size_gb": 150, "tier": "cold", "storage": "pve01_usb01", "label": "primary-cold-1" },
+        { "size_gb": 150, "tier": "cold", "storage": "pve01_usb02", "label": "primary-cold-2" },
+        { "size_gb": 150, "tier": "cold", "storage": "pve01_usb03", "label": "primary-cold-3" },
+        { "size_gb": 150, "tier": "cold", "storage": "pve01_usb04", "label": "primary-cold-4" }
+      ],
+      "dc": "leli",
+      "rack": "leli-rack-1",
+      "memory_budget": { "hard_cap_mb": 3072, "warn_pct": 80, "shed_pct": 92 },
+      "notes": "Anchor storage: ~600 GB across 4 USB HDDs (4×150 GB → ~50 TB at real scale). Holds every file's authoritative copy."
+    },
+    {
+      "role": "data",
+      "vmid": 207,
+      "name": "data-warm01",
+      "ip": "10.150.0.157",
+      "cores": 2,
+      "memory_mb": 3072,
+      "os_disk_gb": 16,
+      "extra_disks": [
+        { "size_gb": 180, "tier": "warm", "storage": "pve01_ssd02", "label": "toro-warm-ssd" }
+      ],
+      "dc": "toro",
+      "rack": "toro-rack-1",
+      "memory_budget": { "hard_cap_mb": 2304, "warn_pct": 80, "shed_pct": 92 },
+      "notes": "TORO SSD warm. Empty at bootstrap; auto-populated by reads_by_dc promotions (P0-9)."
+    },
+    {
+      "role": "data",
+      "vmid": 208,
+      "name": "data-warm02",
+      "ip": "10.150.0.158",
+      "cores": 2,
+      "memory_mb": 3072,
+      "os_disk_gb": 16,
+      "extra_disks": [
+        { "size_gb": 180, "tier": "warm", "storage": "pve01_ssd02", "label": "nrb-warm-hdd" }
+      ],
+      "dc": "nrb",
+      "rack": "nrb-rack-1",
+      "memory_budget": { "hard_cap_mb": 2304, "warn_pct": 80, "shed_pct": 92 },
+      "notes": "NRB warm. Ingest path: fresh downloads land here and auto-replicate to data-primary01 per anchor rule."
+    },
+    {
+      "role": "client",
+      "vmid": 209,
+      "name": "client01",
+      "ip": "10.150.0.159",
+      "cores": 2,
+      "memory_mb": 1536,
+      "os_disk_gb": 16,
+      "extra_disks": [],
+      "dc": "leli",
+      "rack": "leli-client",
+      "cache": { "type": "tmpfs", "size_gb": 2, "max_age_days": null },
+      "memory_budget": { "hard_cap_mb": 1024, "warn_pct": 80, "shed_pct": 92 },
+      "notes": "Plex viewer in LELI — local primary serves all bytes."
+    },
+    {
+      "role": "client",
+      "vmid": 210,
+      "name": "client02",
+      "ip": "10.150.0.160",
+      "cores": 2,
+      "memory_mb": 2048,
+      "os_disk_gb": 16,
+      "extra_disks": [
+        { "size_gb": 40, "tier": "cache", "storage": "pve01_ssd01", "mount": "/var/cache/dtfs", "label": "client02-cache" }
+      ],
+      "dc": "toro",
+      "rack": "toro-client",
+      "cache": { "type": "disk", "size_gb": 40, "max_age_days": 90, "readahead": "folder-sequential" },
+      "memory_budget": { "hard_cap_mb": 1536, "warn_pct": 80, "shed_pct": 92 },
+      "notes": "Plex viewer in TORO with 40 GB disk cache + folder readahead. Most aggressive test of P0-11 (90d TTL)."
+    },
+    {
+      "role": "client",
+      "vmid": 211,
+      "name": "client03",
+      "ip": "10.150.0.161",
+      "cores": 2,
+      "memory_mb": 1536,
+      "os_disk_gb": 16,
+      "extra_disks": [],
+      "dc": "nrb",
+      "rack": "nrb-client",
+      "cache": { "type": "tmpfs", "size_gb": 2, "max_age_days": null },
+      "memory_budget": { "hard_cap_mb": 1024, "warn_pct": 80, "shed_pct": 92 },
+      "notes": "Download ingest. New media writes flow through this client → data-warm02 → anchor."
+    }
+  ],
+  "volume_defaults": {
+    "name": "media",
+    "chunk_size_mb": 64,
+    "anchor_datacenter": "leli",
+    "replication": { "hot": 0, "warm": 2, "cold": 1 },
+    "write_safety": { "min_replicas_before_ack": 1, "write_timeout_secs": 60 },
+    "_note": "anchor_datacenter=leli enforces P0-10: primary always has ≥1 cold copy. warm rf=2 spreads across TORO and NRB so Plex streams can fail over."
+  },
+  "plex": {
+    "max_stream_mbps": 60,
+    "streams_per_client": 5,
+    "_note": "Real-world Plex peak: 5×60=300 Mbps. LELI's 40 Mbps uplink cannot saturate even one stream from outside — verifies that Plex viewers in LELI rely on the local data-primary01 copy. TORO at 400 Mbps can sustain 5 streams from anywhere. NRB at 1G has zero stream constraints."
+  },
+  "ram_budget": {
+    "host_total_gb": 64,
+    "host_reserved_gb": 6,
+    "cluster_total_mb": 23552,
+    "_note": "5 mgr × 1024 + data-primary 4096 + 2×warm × 3072 + 3 client × 1536-2048 + builder 8192 = ~26 GB allocated. Disable PVE balloon to avoid swap surprises."
+  }
+}

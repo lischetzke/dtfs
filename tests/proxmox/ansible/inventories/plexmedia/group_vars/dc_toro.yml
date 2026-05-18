@@ -1,0 +1,7 @@
+---
+# DC TORO — 400 Mbps symmetric, 5 ms ± 1 ms jitter.
+# Hosts: mgr04, data-warm01, client02.
+dtfs_shape_up_mbps: 400
+dtfs_shape_down_mbps: 400
+dtfs_shape_delay_ms: 5
+dtfs_shape_jitter_ms: 1

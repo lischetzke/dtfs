@@ -1,0 +1,9 @@
+---
+# DC LELI — 40 Mbps DSL-class link, 25 ms ± 5 ms jitter.
+# The 40 Mbps applies to BOTH ingress and egress (DSL up == down).
+# Cross-DC reads to LELI primary therefore saturate at one Plex stream.
+# Hosts: mgr01, mgr02, mgr03, data-primary01, client01.
+dtfs_shape_up_mbps: 40
+dtfs_shape_down_mbps: 40
+dtfs_shape_delay_ms: 25
+dtfs_shape_jitter_ms: 5

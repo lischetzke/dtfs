@@ -1,0 +1,46 @@
+---
+# Cluster-wide defaults for the Plexmedia real-world topology.
+dtfs_cluster_name: Plexmedia
+dtfs_cluster_secret: "plexmedia-shared-secret-rotate-before-prod"
+
+# Manager pool — only voting LELI managers serve as the canonical Raft
+# endpoint set. mgr04/mgr05 are observers (read-only fast path for their
+# local DCs) and are configured at the per-host level to NOT bootstrap.
+dtfs_manager_addrs:
+  - "10.150.0.151:9100"
+  - "10.150.0.152:9100"
+  - "10.150.0.153:9100"
+
+# Plexmedia volume defaults — anchor in LELI, no hot tier (cold = HDD,
+# warm = SSD; primary lives on cold-rated drives in LELI).
+dtfs_replication_hot: 0
+dtfs_replication_warm: 2
+dtfs_replication_cold: 1
+dtfs_anchor_datacenter: leli
+dtfs_volume_name: media
+dtfs_chunk_size_mb: 64
+
+# Tiering thresholds — aggressive for soak observability. In production
+# these defaults move to weeks/months; soak compresses them to hours.
+dtfs_tiering_hot_reads_per_hour: 3
+dtfs_tiering_cold_days: 7
+dtfs_tiering_frozen_days: 90
+dtfs_tiering_eval_interval_secs: 60
+
+# Scrub schedule — once a day deep, twice an hour quick.
+dtfs_scrub_quick_hours: 6
+dtfs_scrub_deep_hours: 24
+dtfs_scrub_max_io_percent: 10
+
+# Alert webhook — file sink on the PVE host for soak audit.
+dtfs_alert_webhooks:
+  - url: "http://10.150.0.121:18081/alerts"
+    secret: "plexmedia-webhook-secret-rotate-before-prod"
+    kinds: []
+    dedup_secs: 60
+
+# Logging — production-shape defaults; soak overrides per-test.
+dtfs_rust_log: "dtfs=info,openraft=warn,tonic=warn,h2=warn"
+
+# Bug U — graceful shutdown TimeoutStopSec applied by systemd template.
+dtfs_systemd_timeout_stop: "45s"
