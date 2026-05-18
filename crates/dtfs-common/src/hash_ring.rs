@@ -365,6 +365,7 @@ mod tests {
             replica_count: 3,
             failure_domain: FailureDomain::Host,
             prefer_client_locations: false,
+            required_datacenter: None,
         };
 
         let nodes = ring.find_nodes_for_pg(0, &rule, &[]);
@@ -392,6 +393,7 @@ mod tests {
             replica_count: 1,
             failure_domain: FailureDomain::Host,
             prefer_client_locations: false,
+            required_datacenter: None,
         };
 
         let nodes = ring.find_nodes_for_pg(0, &rule, &[]);
