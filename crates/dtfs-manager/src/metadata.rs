@@ -95,6 +95,24 @@ impl MetadataService {
         match self.raft.client_write(req).await {
             Ok(resp) => Ok(resp.data),
             Err(e) => {
+                // Bug AC — distinguish "should retry on another manager"
+                // from "real error". ForwardToLeader (or "we don't know
+                // the leader") must return Status::Unavailable so the
+                // FUSE client's `call_manager` retry-on-transport-error
+                // walks to another manager. Without this distinction
+                // every failover during a leader kill returned
+                // Status::Internal which the client did NOT retry,
+                // causing user-visible EIO during ~10s of every leader
+                // election (~30% of stress-test write attempts).
+                let msg = format!("{}", e);
+                if msg.contains("forward request to")
+                    || msg.contains("ForwardToLeader")
+                {
+                    tracing::warn!(error = %e, "Raft write deferred — not leader, client should retry");
+                    return Err(Status::unavailable(format!(
+                        "manager is not the leader: {msg}"
+                    )));
+                }
                 tracing::warn!(error = %e, "Raft write failed");
                 Err(Status::internal(format!("Raft write failed: {}", e)))
             }
