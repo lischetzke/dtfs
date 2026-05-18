@@ -263,6 +263,7 @@ async fn main() -> anyhow::Result<()> {
         sm_data.clone(),
         audit_log.clone(),
         join_handler.clone(),
+        task_scheduler.clone(),
     ));
 
     audit_log.log(

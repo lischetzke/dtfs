@@ -24,6 +24,7 @@ use tracing::info;
 
 use crate::audit::AuditLog;
 use crate::join::JoinHandler;
+use crate::scheduler::TaskScheduler;
 use crate::webui;
 
 /// Shared application state for API handlers.
@@ -34,6 +35,9 @@ pub struct AppState {
     pub sm_data: Arc<RwLock<StateMachineData>>,
     pub audit_log: Arc<AuditLog>,
     pub join: Arc<JoinHandler>,
+    /// Scheduler used to enqueue manual path-prefix tier/DC migrations
+    /// triggered from the WebUI / CLI (`POST /api/v1/migrations`).
+    pub scheduler: Arc<TaskScheduler>,
 }
 
 /// Build the full API router (REST endpoints + WebUI).
@@ -69,6 +73,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/config", get(get_config).post(update_config))
         // Scrub
         .route("/api/v1/scrub", post(trigger_scrub))
+        // Manual data migration (operator-triggered tier/DC moves of a path
+        // prefix). GET lists pending+recent tasks; POST enqueues new ones.
+        .route(
+            "/api/v1/migrations",
+            get(list_migrations).post(start_path_migration),
+        )
         // Stats (aggregate cluster metrics for WebUI home page)
         .route("/api/v1/stats", get(get_stats))
         // HMAC join (phase 1: challenge, phase 2: Raft register)
@@ -87,6 +97,7 @@ pub async fn run_api_server(
     sm_data: Arc<RwLock<StateMachineData>>,
     audit_log: Arc<AuditLog>,
     join: Arc<JoinHandler>,
+    scheduler: Arc<TaskScheduler>,
 ) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -94,6 +105,7 @@ pub async fn run_api_server(
         sm_data,
         audit_log,
         join,
+        scheduler,
     });
 
     let app = build_router(state);
@@ -916,6 +928,140 @@ async fn trigger_scrub(
         "target_type": target_type,
         "target": target,
         "level": level,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Manual data migration — POST /api/v1/migrations, GET /api/v1/migrations
+//
+// Operators can ask the cluster to move every chunk under a path prefix to a
+// chosen tier and (optionally) a chosen datacenter. The endpoint enqueues
+// replication tasks via the existing scheduler — the tasks then ride the
+// normal Pending → Copying → Verifying → Done lifecycle, so they show up in
+// the migration_state_json snapshot like any auto-scheduled task.
+//
+// Semantics: "at least one replica satisfies target_tier (and target_dc when
+// set)". Existing replicas are kept; the request is additive. If a chunk
+// already has a satisfying replica, it's counted as `already_satisfied` and
+// no task is scheduled.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct StartMigrationRequest {
+    /// Path prefix to match. Empty string means "every file" — guarded by
+    /// requiring `allow_empty_prefix=true` so an operator cannot accidentally
+    /// stampede the whole cluster.
+    path_prefix: String,
+    /// Target tier — one of "hot", "warm", "cold", "tape".
+    target_tier: String,
+    /// Optional target datacenter. When set, the chosen target node must be
+    /// in this DC (e.g. "dc-c").
+    #[serde(default)]
+    target_dc: Option<String>,
+    /// Required when `path_prefix` is empty to avoid a footgun where a
+    /// trailing slash typo migrates the entire volume.
+    #[serde(default)]
+    allow_empty_prefix: bool,
+    /// Soft cap on tasks scheduled in a single call. Defaults to 10 000;
+    /// extra chunks are reported under `truncated_chunks` and a follow-up
+    /// call can pick them up.
+    #[serde(default)]
+    max_tasks: Option<usize>,
+}
+
+fn parse_tier(s: &str) -> Option<DiskTier> {
+    match s.to_ascii_lowercase().as_str() {
+        "hot" => Some(DiskTier::Hot),
+        "warm" => Some(DiskTier::Warm),
+        "cold" => Some(DiskTier::Cold),
+        "tape" => Some(DiskTier::Tape),
+        _ => None,
+    }
+}
+
+async fn start_path_migration(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<StartMigrationRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let target_tier = parse_tier(&body.target_tier).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "invalid target_tier '{}': expected one of hot|warm|cold|tape",
+                    body.target_tier
+                ),
+            })),
+        )
+    })?;
+
+    if body.path_prefix.is_empty() && !body.allow_empty_prefix {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "empty path_prefix would match every file — set allow_empty_prefix=true to confirm",
+            })),
+        ));
+    }
+
+    let max_tasks = body.max_tasks.unwrap_or(10_000);
+
+    let report = state
+        .scheduler
+        .schedule_path_migration(
+            &body.path_prefix,
+            target_tier,
+            body.target_dc.as_deref(),
+            max_tasks,
+        )
+        .await;
+
+    state.audit_log.log(
+        "api",
+        "migration.path",
+        &format!(
+            "prefix={} tier={:?} dc={:?}",
+            body.path_prefix, target_tier, body.target_dc
+        ),
+        &format!(
+            "matched={} satisfied={} scheduled={} no_source={} no_target={}",
+            report.files_matched,
+            report.already_satisfied,
+            report.tasks_scheduled,
+            report.no_source,
+            report.no_target,
+        ),
+    );
+
+    info!(
+        prefix = %body.path_prefix,
+        tier = ?target_tier,
+        dc = ?body.target_dc,
+        scheduled = report.tasks_scheduled,
+        "Manual path migration accepted"
+    );
+
+    Ok(Json(json!({
+        "status": "accepted",
+        "path_prefix": body.path_prefix,
+        "target_tier": format!("{:?}", target_tier).to_lowercase(),
+        "target_dc": body.target_dc,
+        "files_matched": report.files_matched,
+        "chunks_total": report.chunks_total,
+        "already_satisfied": report.already_satisfied,
+        "tasks_scheduled": report.tasks_scheduled,
+        "no_source": report.no_source,
+        "no_target": report.no_target,
+        "truncated_chunks": report.truncated_chunks,
+        "examples": report.examples,
+    })))
+}
+
+async fn list_migrations(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let snapshot = state.scheduler.migration_snapshot().await;
+    Json(json!({
+        "count": snapshot.len(),
+        "tasks": snapshot,
     }))
 }
 
