@@ -83,6 +83,70 @@ impl ChunkStore {
         }
     }
 
+    /// Rebuild `chunk_count` and `bytes_stored` from what is actually on disk.
+    ///
+    /// `put_chunk` increments these counters in-process, so a daemon restart
+    /// loses the running total — the next heartbeat would report 0/0 even
+    /// though disk has every chunk from the previous run. Without this
+    /// rescan the manager's `used_capacity` accounting diverges from reality
+    /// (observed: manager reports 0 GB used while df shows multi-GB on
+    /// every restarted data node).
+    ///
+    /// Walks each managed disk's `chunks/<aa>/<bb>/*.dat` and replaces the
+    /// counters with the totals found. Safe to call any time; intended at
+    /// process startup right after disk init, before the heartbeat loop
+    /// fires.
+    pub async fn rescan_existing_chunks(&self) -> DtfsResult<()> {
+        let mut total_count: u64 = 0;
+        let mut total_bytes: u64 = 0;
+
+        for disk in self.disk_manager.all_disks() {
+            let chunks_dir = disk.mount_path.join("chunks");
+            if !chunks_dir.exists() {
+                continue;
+            }
+
+            let mut dir1 = match fs::read_dir(&chunks_dir).await {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            while let Some(d1) = dir1.next_entry().await.map_err(DtfsError::Io)? {
+                if !d1.file_type().await.map_err(DtfsError::Io)?.is_dir() {
+                    continue;
+                }
+                let mut dir2 = fs::read_dir(d1.path()).await.map_err(DtfsError::Io)?;
+                while let Some(d2) = dir2.next_entry().await.map_err(DtfsError::Io)? {
+                    if !d2.file_type().await.map_err(DtfsError::Io)?.is_dir() {
+                        continue;
+                    }
+                    let mut entries = fs::read_dir(d2.path()).await.map_err(DtfsError::Io)?;
+                    while let Some(e) =
+                        entries.next_entry().await.map_err(DtfsError::Io)?
+                    {
+                        let p = e.path();
+                        if p.extension().map_or(false, |x| x == "dat") {
+                            let meta = match fs::metadata(&p).await {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            total_count += 1;
+                            total_bytes += meta.len();
+                        }
+                    }
+                }
+            }
+        }
+
+        self.chunk_count.store(total_count, Ordering::Relaxed);
+        self.bytes_stored.store(total_bytes, Ordering::Relaxed);
+        tracing::info!(
+            chunks = total_count,
+            bytes = total_bytes,
+            "ChunkStore startup rescan complete"
+        );
+        Ok(())
+    }
+
     /// Access the disk manager (e.g. for `GetDiskStatus` RPC).
     pub fn disk_manager(&self) -> &Arc<DiskManager> {
         &self.disk_manager
