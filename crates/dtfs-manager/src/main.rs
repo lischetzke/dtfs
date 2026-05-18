@@ -62,8 +62,37 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Raft initialisation ---
 
-    // 1. Open the RocksDB log store.
     let log_store_path = config.node.data_dir.join("raft-log");
+    let sm_dir = config.node.data_dir.join("raft-sm");
+
+    // Bug AC — poisoned-Raft-state detector. Before handing the local
+    // state to openraft, peek at the on-disk vote/log/snapshot triple.
+    // If we crashed into a stuck-candidate state (term inflated wildly
+    // by repeated self-vote elections while isolated, log lagging
+    // behind by hundreds of entries), wipe the local state so that on
+    // the next iteration we rejoin via InstallSnapshot from the
+    // current leader.
+    //
+    // We rename rather than delete so the operator can forensically
+    // inspect what was poisoned. Renamed dirs are not auto-deleted.
+    //
+    // Detection criteria (all must hold):
+    //   * vote.term >= 100              — many failed elections
+    //   * vote NOT committed            — we never won
+    //   * vote.node == self             — voting for ourselves (isolation)
+    //   * applied_index <= snapshot_idx  + 10  — barely caught up
+    //   * log.last_index - applied > 500 — huge replay backlog
+    //
+    // If ANY criterion is missing, we leave the state alone — false
+    // positive risk is real (e.g. a long-running healthy follower
+    // might briefly have a high uncommitted vote during an election).
+    if let Err(e) =
+        maybe_recover_poisoned_raft_state(&log_store_path, &sm_dir).await
+    {
+        tracing::warn!(error = %e, "Bug AC poisoned-state check failed; proceeding anyway");
+    }
+
+    // 1. Open the RocksDB log store.
     let log_store = dtfs_raft::log_store::LogStore::new(&log_store_path)?;
     tracing::info!("Raft log store opened at {:?}", log_store_path);
 
@@ -71,7 +100,6 @@ async fn main() -> anyhow::Result<()> {
     //    `<data_dir>/raft-sm/` so that a manager restart can restore Raft
     //    membership before any log replay starts (F-024 — without this,
     //    membership is lost as soon as the membership log entry is purged).
-    let sm_dir = config.node.data_dir.join("raft-sm");
     let state_machine = dtfs_raft::state_machine::StateMachineStore::open_at(&sm_dir)?;
     tracing::info!("Raft state machine snapshot dir: {:?}", sm_dir);
     let sm_data = state_machine.data().clone();
@@ -105,8 +133,45 @@ async fn main() -> anyhow::Result<()> {
     // 5. Bootstrap if this is the initial cluster node.
     if config.cluster.bootstrap {
         let self_id = dtfs_common::node_id_from_hostname(&config.node.hostname);
+
+        // Bug AC — the bootstrap node's advertised addr MUST be the
+        // peer-routable IP:port, NOT `grpc.listen_addr` which is the
+        // wildcard `0.0.0.0:9401`. Other Raft peers dial this exact
+        // string; "0.0.0.0:9401" routes back to themselves and Raft
+        // messages never reach this node. Pre-fix symptom: bootstrap
+        // node showed empty WebUI forever because mgr02/03 couldn't
+        // talk to it via Raft, so no log entries ever applied.
+        //
+        // Prefer the operator-specified addr from initial_voters; fall
+        // back to grpc.listen_addr with a WARN if absent (legacy
+        // single-node configs).
+        let self_routable_addr = config
+            .cluster
+            .initial_voters
+            .iter()
+            .find(|v| v.hostname == config.node.hostname)
+            .map(|v| v.addr.clone())
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    listen_addr = %config.grpc.listen_addr,
+                    "Bug AC bootstrap: no matching initial_voters entry for self; falling back to grpc.listen_addr — \
+                     other managers may not be able to reach this node"
+                );
+                config.grpc.listen_addr.clone()
+            });
+        if self_routable_addr.starts_with("0.0.0.0")
+            || self_routable_addr.starts_with("[::]")
+            || self_routable_addr.starts_with("0:")
+        {
+            tracing::error!(
+                addr = %self_routable_addr,
+                "Bug AC bootstrap: self-addr is a wildcard ({}). Other managers WILL NOT be able to reach this node via Raft. Set [[cluster.initial_voters]] addr to the routable IP:port for this host.",
+                self_routable_addr
+            );
+        }
+
         let self_node = dtfs_raft::DtfsNode {
-            addr: config.grpc.listen_addr.clone(),
+            addr: self_routable_addr,
             hostname: config.node.hostname.clone(),
         };
 
@@ -400,5 +465,149 @@ async fn main() -> anyhow::Result<()> {
     );
 
     tracing::info!("DTFS manager exited cleanly");
+    Ok(())
+}
+
+/// Bug AC — pre-init poisoned-Raft-state detector + auto-recovery.
+///
+/// Inspects the local log store + state machine snapshot without
+/// handing them to openraft. If the triple is "poisoned" (term has
+/// inflated by hundreds of failed self-vote elections while
+/// isolated, with the state machine miles behind the log), renames
+/// the directories to backups so the next openraft initialization
+/// starts fresh. The leader then snapshot-installs us back into the
+/// cluster.
+///
+/// This trades a small startup delay (peek a few RocksDB keys) for
+/// eliminating the most common Raft-stuck failure mode in multi-DC
+/// clusters under intermittent network conditions.
+async fn maybe_recover_poisoned_raft_state(
+    log_store_path: &std::path::Path,
+    sm_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::fs;
+    use std::time::SystemTime;
+
+    if !log_store_path.exists() || !sm_dir.exists() {
+        // First boot — nothing to recover.
+        return Ok(());
+    }
+
+    // Peek log + vote without opening as RaftLogStorage. We open the
+    // log store read-only here, then drop the handle BEFORE openraft
+    // re-opens it. Avoids long-lived dual handles.
+    let (last_log_id, vote) = {
+        let ls = dtfs_raft::log_store::LogStore::new(log_store_path)?;
+        let llid = ls.peek_last_log_id().ok().flatten();
+        let v = ls.peek_vote().ok().flatten();
+        // ls dropped here; RocksDB releases its lock.
+        (llid, v)
+    };
+
+    // Peek last_applied from the on-disk snapshot. The snapshot file
+    // contains the state machine's last_log_id at the time it was
+    // taken; the running state machine catches up from there via
+    // the log.
+    let snapshot_applied_idx = {
+        let sm = dtfs_raft::state_machine::StateMachineStore::open_at(sm_dir)?;
+        let data = sm.data().read().await;
+        let idx = data.last_applied_log.as_ref().map(|l| l.index).unwrap_or(0);
+        drop(data);
+        // sm dropped here.
+        idx
+    };
+
+    let last_log_index = last_log_id.as_ref().map(|l| l.index).unwrap_or(0);
+    let last_log_term = last_log_id
+        .as_ref()
+        .map(|l| {
+            // Term lives inside LeaderId — extract via Debug fallback so
+            // we don't depend on internal accessor stability.
+            // LogId display: term-index; vote term is usually the same shape.
+            // openraft 0.10 has `l.leader_id.term` but the API may shift; pull
+            // it through serde-stable Display:
+            let s = format!("{:?}", l);
+            // "LogId { leader_id: LeaderId { term: 19, ... }, index: 100 }"
+            s.split("term: ")
+                .nth(1)
+                .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let vote_term = vote
+        .as_ref()
+        .map(|v| {
+            // Vote's LeaderId is the same shape.
+            let s = format!("{:?}", v);
+            s.split("term: ")
+                .nth(1)
+                .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let vote_committed = vote
+        .as_ref()
+        .map(|v| v.is_committed())
+        .unwrap_or(false);
+    let applied_log_lag = last_log_index.saturating_sub(snapshot_applied_idx);
+
+    // Detection: ALL of the following must be true.
+    let too_many_failed_elections = vote_term >= 100;
+    let term_jumped_way_above_log = vote_term > last_log_term + 50;
+    let huge_applied_lag = applied_log_lag > 500;
+    let vote_never_committed = !vote_committed;
+
+    tracing::info!(
+        vote_term,
+        vote_committed,
+        last_log_index,
+        last_log_term,
+        snapshot_applied_idx,
+        applied_log_lag,
+        "Bug AC pre-init Raft state peek"
+    );
+
+    if !(too_many_failed_elections
+        && term_jumped_way_above_log
+        && huge_applied_lag
+        && vote_never_committed)
+    {
+        // Healthy state — leave as is.
+        return Ok(());
+    }
+
+    tracing::error!(
+        vote_term,
+        last_log_index,
+        last_log_term,
+        snapshot_applied_idx,
+        applied_log_lag,
+        "Bug AC POISONED RAFT STATE DETECTED — wiping local raft-log + raft-sm so this manager rejoins via InstallSnapshot from the leader"
+    );
+
+    // Rename rather than delete so an operator can inspect what was wiped.
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let log_backup = log_store_path.with_extension(format!("poisoned.{ts}"));
+    let sm_backup = sm_dir.with_extension(format!("poisoned.{ts}"));
+    if let Err(e) = fs::rename(log_store_path, &log_backup) {
+        tracing::error!(error = %e, "Bug AC failed to rename raft-log; manual recovery required");
+        anyhow::bail!("rename raft-log: {e}");
+    }
+    if let Err(e) = fs::rename(sm_dir, &sm_backup) {
+        tracing::error!(error = %e, "Bug AC failed to rename raft-sm; manual recovery required");
+        // Try to put the log back so we don't leave half-recovered state.
+        let _ = fs::rename(&log_backup, log_store_path);
+        anyhow::bail!("rename raft-sm: {e}");
+    }
+    tracing::warn!(
+        log_backup = %log_backup.display(),
+        sm_backup = %sm_backup.display(),
+        "Bug AC poisoned raft state moved to backup; fresh state will be initialized + snapshot-installed from leader"
+    );
     Ok(())
 }

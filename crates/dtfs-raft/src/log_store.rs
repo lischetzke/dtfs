@@ -82,6 +82,37 @@ impl LogStore {
         }
     }
 
+    /// Bug AC — peek at the persisted vote without acquiring `&mut self`
+    /// or going through the full RaftLogStorage trait. Used by the
+    /// pre-init poisoned-state detector in main.rs.
+    pub fn peek_vote(&self) -> Result<Option<Vote>, io::Error> {
+        let cf = self.db.cf_handle(CF_META).expect("meta CF");
+        match self.db.get_cf(&cf, META_KEY_VOTE) {
+            Ok(Some(bytes)) => {
+                let vote: Vote = bincode::deserialize(&bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(Some(vote))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+        }
+    }
+
+    /// Bug AC — peek the last log entry's `LogId` without consuming
+    /// any iterator state. Used for poisoned-state detection.
+    pub fn peek_last_log_id(&self) -> Result<Option<LogId>, io::Error> {
+        let cf = self.db.cf_handle(CF_LOGS).expect("logs CF");
+        let mut iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::End);
+        match iter.next() {
+            Some(Ok((_key, value))) => {
+                let entry: Entry = bincode::deserialize(&value)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(Some(entry.log_id.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn persist_last_purged(&self, lid: &Option<LogId>) -> Result<(), io::Error> {
         let cf = self.db.cf_handle(CF_META).expect("meta CF");
         let bytes = bincode::serialize(lid)

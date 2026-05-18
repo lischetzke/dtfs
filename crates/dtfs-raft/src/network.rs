@@ -82,6 +82,21 @@ pub struct DtfsNetwork {
 }
 
 impl DtfsNetwork {
+    /// Bug AC — connection and request timeouts. With the previous
+    /// "no timeout" config, a tonic Channel could hang indefinitely
+    /// when the peer was DOWN but TCP SYN timeouts were long. Under
+    /// election storms this monopolized the openraft tick budget
+    /// and prevented vote responses from being processed.
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// HTTP/2 keep-alive — pokes the peer every 30s with a ping. If
+    /// the peer doesn't respond, the connection is dropped and the
+    /// next RPC reopens it. Without keep-alive, a TCP half-open
+    /// connection (peer crashed, NAT timeout) lingers and every
+    /// AppendEntries hangs to its full timeout.
+    const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    const KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     async fn ensure_channel(&mut self) -> Result<Channel, RPCError<TypeConfig>> {
         if let Some(ref ch) = self.channel {
             return Ok(ch.clone());
@@ -90,6 +105,13 @@ impl DtfsNetwork {
         let endpoint = format!("http://{}", self.addr);
         let channel = Channel::from_shared(endpoint.clone())
             .map_err(|e| unreachable_err(format!("invalid endpoint {endpoint}: {e}")))?
+            .connect_timeout(Self::CONNECT_TIMEOUT)
+            .timeout(Self::RPC_TIMEOUT)
+            .http2_keep_alive_interval(Self::KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(Self::KEEPALIVE_TIMEOUT)
+            .keep_alive_while_idle(true)
+            .tcp_keepalive(Some(Self::KEEPALIVE_INTERVAL))
+            .tcp_nodelay(true)
             .connect()
             .await
             .map_err(|e| unreachable_err(format!("connect to {endpoint} failed: {e}")))?;
