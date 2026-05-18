@@ -22,10 +22,16 @@ bootstrap = {{ 'true' if dtfs_is_bootstrap | default(false) else 'false' }}
 # and mgr04/mgr05 as non-voting observers (FINDINGS.md F-009 covers the
 # multi-voter bootstrap requirement; observer support requires the
 # manager binary to skip self-addition when `dtfs_is_voter == false`).
+#
+# Bug X — emit region/datacenter/rack per voter so the API and WebUI
+# render real topology instead of "?/?/?/{hostname}" placeholders.
 {% for mgr in groups['managers'] if hostvars[mgr].dtfs_is_voter | default(true) %}
 [[cluster.initial_voters]]
 hostname = "{{ mgr }}"
 addr = "{{ hostvars[mgr].ansible_host }}:9401"
+region = "lab"
+datacenter = "{{ hostvars[mgr].dtfs_dc | default('') }}"
+rack = "{{ hostvars[mgr].dtfs_rack | default('') }}"
 
 {% endfor %}
 

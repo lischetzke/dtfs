@@ -663,7 +663,12 @@ impl TaskScheduler {
         chunk_id: &str,
         target_addr: &str,
     ) -> anyhow::Result<()> {
-        let endpoint = format!("http://{}", source_addr);
+        // Bug W (part 2) — `source_addr` is `NodeInfo.grpc_addr`, which the
+        // RegisterNode path stores already as a full URL ("http://ip:port").
+        // The old code prepended "http://" unconditionally and produced
+        // `http://http://...:9500` — tonic rejected this with a generic
+        // "transport error" that silenced every migration in Plexmedia.
+        let endpoint = normalize_endpoint(source_addr);
         let mut client = DataServiceClient::connect(endpoint).await
             .map_err(|e| anyhow::anyhow!("connect to source {}: {}", source_addr, e))?;
 
@@ -686,7 +691,9 @@ impl TaskScheduler {
     /// Ask the target node to verify the integrity of `chunk_id`.
     /// Returns `true` if the chunk is valid, `false` if the checksum failed.
     async fn verify_chunk(&self, target_addr: &str, chunk_id: &str) -> anyhow::Result<bool> {
-        let endpoint = format!("http://{}", target_addr);
+        // Bug W (part 2) — same fix as `replicate_chunk`: NodeInfo.grpc_addr
+        // already carries the scheme. Don't double-prefix.
+        let endpoint = normalize_endpoint(target_addr);
         let mut client = DataServiceClient::connect(endpoint).await
             .map_err(|e| anyhow::anyhow!("connect to target {}: {}", target_addr, e))?;
 
@@ -1062,6 +1069,49 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Bug W (part 2) — return a tonic-ready endpoint URL given a stored
+/// `NodeInfo.grpc_addr`. New deployments store a fully-formed URL
+/// (`http://10.150.0.157:9500`); pre-Bug-W deployments may have stored a
+/// bare `host:port`. This helper accepts both and never produces the
+/// `http://http://...` form that broke every migration.
+#[inline]
+pub(crate) fn normalize_endpoint(stored_addr: &str) -> String {
+    if stored_addr.starts_with("http://") || stored_addr.starts_with("https://") {
+        stored_addr.to_string()
+    } else {
+        format!("http://{}", stored_addr)
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    /// Bug W (part 2) — a URL-formatted stored address passes through
+    /// unchanged. Prior bug double-prefixed `http://` and tonic returned
+    /// `transport error` for every migration RPC.
+    #[test]
+    fn bug_w_endpoint_url_passthrough() {
+        let stored = "http://10.150.0.157:9500";
+        assert_eq!(normalize_endpoint(stored), "http://10.150.0.157:9500");
+    }
+
+    /// Pre-Bug-W stored addresses (bare host:port) still get the http://
+    /// prefix so we don't break older clusters during an upgrade.
+    #[test]
+    fn bug_w_endpoint_bare_host_gets_scheme() {
+        let stored = "10.150.0.157:9500";
+        assert_eq!(normalize_endpoint(stored), "http://10.150.0.157:9500");
+    }
+
+    /// HTTPS is also passed through (future-proofing for TLS rollout).
+    #[test]
+    fn bug_w_endpoint_https_passthrough() {
+        let stored = "https://data-warm01:9500";
+        assert_eq!(normalize_endpoint(stored), "https://data-warm01:9500");
+    }
 }
 
 #[cfg(test)]
