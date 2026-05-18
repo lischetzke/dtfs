@@ -376,11 +376,22 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             continue;
         }
         let id = dtfs_common::node_id_from_hostname(&v.hostname);
+        // Bug X — render real location when the operator configured it;
+        // fall back to the `?` placeholder otherwise so legacy
+        // (location-less) initial_voters keep working.
+        let render_seg = |s: &str| if s.is_empty() { "?".to_string() } else { s.to_string() };
+        let location = format!(
+            "{}/{}/{}/{}",
+            render_seg(&v.region),
+            render_seg(&v.datacenter),
+            render_seg(&v.rack),
+            v.hostname,
+        );
         nodes.push(NodeResponse {
             node_id: id.to_string(),
             hostname: v.hostname.clone(),
             grpc_addr: format!("http://{}", v.addr),
-            location: format!("?/?/?/{}", v.hostname),
+            location,
             disk_count: 0,
             total_capacity: 0,
             used_capacity: 0,
@@ -393,32 +404,40 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
         });
     }
 
-    // 3. FUSE clients — approximate from active write_leases. The
-    //    `owner_id` format is "<hostname>:<pid>:<fh>"; the hostname
-    //    is the FUSE client. We surface one entry per unique
-    //    hostname, with last_seen = latest lease updated_at_ms.
-    let mut client_last_seen: std::collections::HashMap<String, u64> = Default::default();
+    // 3. FUSE clients — approximate from active write_leases.
+    //    owner_id format (Bug X compatible):
+    //      legacy: "<host>:<pid>:<fh>"
+    //      Bug X:  "<host>:<pid>:<fh>:<dc>"
+    //    Existing prefix-match logic (Bug J) ignores the trailing fields,
+    //    so this is backward-compatible with old leases.
+    let mut client_seen: std::collections::HashMap<String, (u64, String)> = Default::default();
     for lease in sm.write_leases.values() {
-        if let Some(host) = lease.owner_id.split(':').next() {
-            if host.is_empty() {
-                continue;
-            }
-            let e = client_last_seen.entry(host.to_string()).or_insert(0);
-            if lease.expires_at_ms > *e {
-                *e = lease.expires_at_ms;
-            }
+        let parts: Vec<&str> = lease.owner_id.split(':').collect();
+        let host = match parts.first() {
+            Some(h) if !h.is_empty() => h.to_string(),
+            _ => continue,
+        };
+        // 4th field (index 3) is Bug X's optional DC.
+        let dc = parts.get(3).map(|s| s.to_string()).unwrap_or_default();
+        let e = client_seen.entry(host).or_insert((0, dc.clone()));
+        if lease.expires_at_ms > e.0 {
+            e.0 = lease.expires_at_ms;
+        }
+        if e.1.is_empty() && !dc.is_empty() {
+            e.1 = dc;
         }
     }
-    for (host, last_seen) in client_last_seen {
+    for (host, (last_seen, dc)) in client_seen {
         if known_hostnames.contains(host.as_str()) {
             continue;
         }
         let id = dtfs_common::node_id_from_hostname(&host);
+        let dc_seg = if dc.is_empty() { "?".to_string() } else { dc };
         nodes.push(NodeResponse {
             node_id: id.to_string(),
             hostname: host.clone(),
             grpc_addr: String::new(),
-            location: format!("?/?/?/{}", host),
+            location: format!("?/{}/?/{}", dc_seg, host),
             disk_count: 0,
             total_capacity: 0,
             used_capacity: 0,

@@ -41,8 +41,15 @@ impl ReplicationManager {
         // Read chunk from local store.
         let data = self.store.get_chunk(chunk_id).await?;
 
-        // Connect to target data node.
-        let endpoint = format!("http://{}", target_addr);
+        // Bug W (part 2) — `target_addr` comes from `NodeInfo.grpc_addr` via
+        // the manager-relayed `ReplicateChunkRequest.target_address`. The
+        // manager stores grpc_addr already URL-formatted ("http://ip:port"),
+        // so prefixing "http://" again would produce `http://http://...`.
+        let endpoint = if target_addr.starts_with("http://") || target_addr.starts_with("https://") {
+            target_addr.to_string()
+        } else {
+            format!("http://{}", target_addr)
+        };
         let mut client = DataServiceClient::connect(endpoint).await?;
 
         // Stream the chunk data in 1MB pieces via PutChunk.
@@ -119,8 +126,13 @@ impl ReplicationManager {
             source_addr,
         );
 
-        // Connect to source data node.
-        let endpoint = format!("http://{}", source_addr);
+        // Bug W (part 2) — same fix as `replicate_to`: source_addr is
+        // pre-formatted with the scheme.
+        let endpoint = if source_addr.starts_with("http://") || source_addr.starts_with("https://") {
+            source_addr.to_string()
+        } else {
+            format!("http://{}", source_addr)
+        };
         let mut client = DataServiceClient::connect(endpoint).await?;
 
         let request = GetChunkRequest {

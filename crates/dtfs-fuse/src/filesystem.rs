@@ -444,7 +444,19 @@ impl DtfsFilesystem {
         // dangling fh. A returned LeaseBusy error surfaces as EBUSY to the
         // caller via the fuse adapter's downcast.
         let (lease_id, lease_expires_at_ms, lease_owner_id) = if flags.is_writable() {
-            let owner_id = format!("{}{}", self.lease_owner_prefix, fh);
+            // Bug X — append the client's DC as a 4th field. Existing
+            // parsers (starts_with("host:"), split(':').next()) ignore
+            // trailing fields, so this is backward-compatible. The
+            // manager API uses the DC to render the right location for
+            // this client in the topology view.
+            let owner_id = if self.client_location.datacenter.is_empty() {
+                format!("{}{}", self.lease_owner_prefix, fh)
+            } else {
+                format!(
+                    "{}{}:{}",
+                    self.lease_owner_prefix, fh, self.client_location.datacenter
+                )
+            };
             let resp = self
                 .client
                 .acquire_write_lease(path, &owner_id, WRITE_LEASE_MS)
@@ -1052,7 +1064,15 @@ impl DtfsFilesystem {
         // single-writer lease so a second create() against the same path
         // (race between two clients) returns EBUSY.
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        let owner_id = format!("{}{}", self.lease_owner_prefix, fh);
+        // Bug X — owner_id carries DC as a 4th field for the topology view.
+        let owner_id = if self.client_location.datacenter.is_empty() {
+            format!("{}{}", self.lease_owner_prefix, fh)
+        } else {
+            format!(
+                "{}{}:{}",
+                self.lease_owner_prefix, fh, self.client_location.datacenter
+            )
+        };
         let lease_resp = self
             .client
             .acquire_write_lease(path, &owner_id, WRITE_LEASE_MS)

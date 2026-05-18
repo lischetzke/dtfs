@@ -248,8 +248,17 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<RegisterNodeRequest>,
     ) -> Result<Response<RegisterNodeResponse>, Status> {
+        // Bug W — capture the peer address BEFORE consuming the request,
+        // so we can build a routable grpc_addr from the actual source IP
+        // instead of relying on the data node's hostname (which may
+        // resolve to IPv6 link-local on some networks, breaking all
+        // cross-node migration / replication).
+        let peer_addr = request.remote_addr();
         let req = request.into_inner();
-        info!("RegisterNode: {}", req.hostname);
+        info!(
+            "RegisterNode: hostname={} peer={:?}",
+            req.hostname, peer_addr
+        );
 
         let secret_required = !self.config.cluster.shared_secret.is_empty();
         if secret_required {
@@ -268,7 +277,7 @@ impl ManagerService for MetadataService {
         }
 
         let node_id = dtfs_common::node_id_from_hostname(&req.hostname);
-        let grpc_addr = format!("http://{}:{}", req.hostname, req.grpc_port);
+        let grpc_addr = build_data_grpc_addr(peer_addr, &req.hostname, req.grpc_port);
         let disks = disks_from_register_req(&req.disks);
         let total_capacity: u64 = disks.iter().map(|d| d.total_bytes).sum();
         let used_capacity: u64 = disks.iter().map(|d| d.used_bytes).sum();
@@ -1106,5 +1115,96 @@ impl ManagerService for MetadataService {
         Ok(Response::new(ReleaseLeasesByHostResponse {
             released_count: count,
         }))
+    }
+}
+
+/// Bug W — build the data node's reachable gRPC address.
+///
+/// The original code was:
+/// ```ignore
+/// let grpc_addr = format!("http://{}:{}", req.hostname, req.grpc_port);
+/// ```
+/// which assumed the data node's hostname resolves to a routable IPv4
+/// address from every other node in the cluster. On the Plexmedia lab
+/// the systemd-resolved stub returns IPv6 link-local (fe80::) addresses
+/// for unqualified hostnames; tonic's HTTP/2 connector can't dial those
+/// without a scope and the scheduler logs:
+///
+///   `connect to source http://data-warm01:9500: transport error`
+///
+/// All cross-node replication, migration, and read-fallback hits this
+/// path, so it manifests as: writes succeed locally but never replicate;
+/// data piles up on the first-chosen node; the cluster looks broken
+/// even though every daemon is "healthy".
+///
+/// Fix: prefer the tonic peer address (the actual IP that opened the
+/// RegisterNode gRPC connection). Fall back to the reported hostname
+/// only when remote_addr isn't available (unit-test path, or a transport
+/// that doesn't surface a peer — UDS etc.).
+pub(crate) fn build_data_grpc_addr(
+    peer: Option<std::net::SocketAddr>,
+    reported_hostname: &str,
+    reported_port: u32,
+) -> String {
+    if let Some(peer) = peer {
+        // Use only the IP from the peer; the *port* comes from the
+        // registration payload because the client's source port is
+        // ephemeral, not the gRPC listen port. IPv6 addresses must be
+        // bracketed for the URL to parse (`http://[2001:db8::1]:9500`),
+        // matching RFC 3986 §3.2.2.
+        let ip = peer.ip();
+        if ip.is_ipv6() {
+            return format!("http://[{}]:{}", ip, reported_port);
+        }
+        return format!("http://{}:{}", ip, reported_port);
+    }
+    format!("http://{}:{}", reported_hostname, reported_port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    /// Bug W regression — peer IP wins over reported hostname.
+    /// This is the actual prod bug from Plexmedia: data-warm01 resolves
+    /// to fe80::… IPv6 link-local, but the peer IP is 10.20.0.157.
+    #[test]
+    fn bug_w_peer_ipv4_overrides_hostname() {
+        let peer = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 20, 0, 157)),
+            33421,
+        ));
+        let addr = build_data_grpc_addr(peer, "data-warm01", 9500);
+        // Peer IP, registration port (NOT 33421).
+        assert_eq!(addr, "http://10.20.0.157:9500");
+    }
+
+    /// Bug W regression — IPv6 peer address is wrapped properly. Without
+    /// `[...]` wrapping, tonic's URL parser breaks on the colons.
+    #[test]
+    fn bug_w_peer_ipv6_address_wraps_brackets() {
+        // Tonic's SocketAddr Display does wrap IPv6 with [...] already, so
+        // SocketAddr::ip() Display omits brackets. We need to verify the
+        // resulting URL is parseable.
+        let peer = Some(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            33421,
+        ));
+        let addr = build_data_grpc_addr(peer, "data-warm01", 9500);
+        // IpAddr::V6 Display gives "2001:db8::1" without brackets; we
+        // must add brackets ourselves so the resulting URL parses.
+        // This test will fail if we don't — driving the fix.
+        let _: tonic::transport::Endpoint = addr
+            .parse()
+            .expect("addr must parse as a tonic endpoint");
+    }
+
+    /// Bug W regression — fall back to hostname when peer is absent
+    /// (UDS transport, in-process test, etc.).
+    #[test]
+    fn bug_w_no_peer_falls_back_to_hostname() {
+        let addr = build_data_grpc_addr(None, "data-warm01", 9500);
+        assert_eq!(addr, "http://data-warm01:9500");
     }
 }

@@ -167,10 +167,24 @@ pub struct ClusterConfig {
 /// `hostname` is used to derive the same `NodeId` the peer will compute on
 /// its own startup (`node_id_from_hostname`). `addr` is the gRPC `host:port`
 /// the peer listens on.
+///
+/// Bug X — optional location fields. Pre-bootstrap voters used to render
+/// in the WebUI / API node list with placeholder `?/?/?/<hostname>` because
+/// managers never call `RegisterNode` and the initial-voters config had no
+/// location data. Operators can now pin region/datacenter/rack here so the
+/// rendered topology reflects reality. All four fields default to empty
+/// strings so existing configs keep loading without changes; the API
+/// synthesizer treats empty as "unknown" and renders `?` as before.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InitialVoter {
     pub hostname: String,
     pub addr: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub datacenter: String,
+    #[serde(default)]
+    pub rack: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
