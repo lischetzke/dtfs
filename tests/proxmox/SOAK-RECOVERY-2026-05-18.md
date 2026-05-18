@@ -164,6 +164,105 @@ client-c$ ls  /mnt/dtfs/bug-c-test
   final.txt                                           # ✓
 ```
 
+### Bug D — data-node OOM under sustained streaming writes
+
+**Symptom.** rsync streaming through FUSE at ~100 MB/s OOM-killed
+`dtfs-data` on data-a1/a2 even after bumping the VMs from 4 GB to 8 GB.
+Peak memory 7.5 GB; data on disk ~9 GB written + however much was
+buffered when the kernel pulled the trigger.
+
+**Root cause.** Tonic accepts unbounded concurrent gRPC streams. Each
+in-flight `put_chunk` accumulates one chunk (~128 MB by default) in a
+`Vec<u8>` before flushing to disk. A few dozen concurrent writers
+exceed RAM faster than the disk can drain.
+
+**Fix.**
+1. New config knob `DataNodeConfig.grpc.max_concurrent_chunk_writes:
+   usize` (default 8) with `#[serde(default)]` for backward-compat.
+2. `DataServiceImpl` holds an `Arc<Semaphore>` sized to that limit;
+   `put_chunk` acquires one slot before reading the request stream.
+   When at capacity the kernel applies TCP backpressure to the writer —
+   slower under burst, never OOMs.
+3. Operators can raise it via data.toml when running on bigger VMs.
+
+**Tests** (`crates/dtfs-common/src/config.rs::tests`):
+- `bug_d_default_max_concurrent_chunk_writes_is_bounded`
+- `bug_d_max_concurrent_chunk_writes_is_overridable`
+
+**Verification.** Rolling-restart of all 6 data nodes shows the log
+line `"Data node put_chunk concurrency limit: 8 in-flight writes
+(Bug D)"` at startup. Cluster reports 6/6 healthy and the rsync
+preload no longer trips OOM. Memory headroom is now bounded by the
+semaphore + the 512 MB ARC cache + tonic overhead ≈ 2 GB worst-case,
+comfortable on a 4 GB VM.
+
+### Bug E — `list_directory` mis-labels directory entries
+
+**Symptom.** After bugs A/B/C: `mkdir /foo; echo x > /foo/bar; ls -la /`
+shows `/foo` as a regular file (`-rw-r--r--`) with size equal to the
+sum of its children (7.9 GB for a single series). `find` therefore
+treats it as a file and never recurses — workload generators see 0
+.mkv files even though they exist on disk.
+
+**Root cause.** Two distinct contributors to the entry named `foo`
+under prefix `/`:
+1. Explicit canonical entry at `/foo` (the mkdir marker) with
+   `is_directory = true`.
+2. Child files at `/foo/<name>`.
+
+The legacy code grouped them with `seen.entry(name).or_insert(...)`,
+which means the first contributor wins. BTreeMap iteration order put
+the canonical entry first → its relative path has no slash →
+`is_dir = false` (the per-file path computed a separate `is_dir`
+without consulting `meta.is_directory`).
+
+**Fix.** New `StateMachineData::list_directory_entries()` helper:
+* OR-merges `is_directory` across all contributors — once any says
+  it's a dir, the entry is a dir.
+* Reports a 4096-byte placeholder for directories instead of summing
+  children's bytes.
+* Sums child sizes per `chunk_index` so replicas don't multiply the
+  reported file size.
+
+The manager's gRPC `list_directory` is now a thin wrapper over the
+helper.
+
+**Tests** (`posix_path_regression`):
+- `bug_e_dir_with_mkdir_marker_and_children_is_a_directory_with_4k_size`
+- `bug_e_synthetic_dir_lists_as_directory`
+
+### Bug F — `readdir` / `readdirplus` cookie mismatch ⇒ duplicate entries
+
+**Symptom.** `ls /mnt/dtfs/` returned 9 lines for 7 unique entries;
+"The Nun II (2023)" and "Wicked (2024)" appeared twice. `find`
+followed both copies.
+
+**Root cause.** The kernel called `readdirplus` first (cookies
+`idx + 1`, 7 entries at cookies 1..=7), then `readdir(offset=7)` to
+verify no more entries existed. Legacy `readdir` reserved cookies 1
+and 2 for "." and ".." and emitted children at `idx + 3` — so the
+last two entries got fresh cookies 8 and 9. The kernel saw cookies
+{1..7} from readdirplus PLUS {8, 9} from readdir as nine distinct
+dirents; the two extras shared *names* with cookies 6 and 7 from
+readdirplus, hence the visible duplication.
+
+**Fix.** Introduce `dir_entry_cookie(idx) = idx + 1` as a single
+source of truth and call it from both `readdir` and `readdirplus`.
+The kernel synthesises "." and ".." for us — we do NOT emit them, and
+we do NOT reserve cookies for them. Cookies are now consistent across
+both protocol paths.
+
+**Test** (`fuse_adapter::fuse_readdir_regression`):
+- `bug_f_readdir_and_readdirplus_share_cookie_scheme` locks the
+  cookie helper so a future change can't silently regress the scheme.
+
+**Live-cluster verification.**
+```
+client-a$ ls /mnt/dtfs/                                # 7 lines (was 9)
+client-a$ find /mnt/dtfs -name '*.mkv' | wc -l         # 6 (was 8)
+```
+All three clients see the same numbers.
+
 ## Open known issues (not blocking, tracked for follow-up)
 
 - **Orphan chunk GC**. After per-file `unlink`, the data nodes still
