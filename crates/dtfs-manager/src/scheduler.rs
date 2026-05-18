@@ -529,40 +529,72 @@ impl TaskScheduler {
                     let file_path = self.find_file_for_chunk(&chunk_id).await;
 
                     if let Some(path) = file_path {
-                        let chunk_index = {
+                        // Bug AB — `merge_chunk_location_entries` REPLACES
+                        // all existing entries for a chunk_index with the
+                        // incoming set (this matches FUSE flush_segments
+                        // semantics, where the client builds the full
+                        // replica set). The scheduler was passing only
+                        // the new replica entry → previous replicas were
+                        // wiped → under-replication check immediately
+                        // re-fired → infinite Copying → Verifying → Done
+                        // loop on the same chunk. Fix: read the existing
+                        // entries for this chunk_index, ADD the new
+                        // target, dedupe by node_id, pass the full set.
+                        let (chunk_index, full_chunks) = {
                             let sm = self.state_data.read().await;
-                            sm.files
-                                .get(&path)
+                            let file = sm.files.get(&path);
+                            let chunk_index = file
                                 .and_then(|f| {
                                     f.chunks
                                         .iter()
                                         .find(|c| c.chunk_hash == chunk_id)
                                         .map(|c| c.chunk_index)
                                 })
-                                .unwrap_or(0)
+                                .unwrap_or(0);
+                            // Collect every existing entry for this chunk_index
+                            // (i.e. all current replicas).
+                            let mut entries: Vec<ChunkLocationEntry> = file
+                                .map(|f| {
+                                    f.chunks
+                                        .iter()
+                                        .filter(|c| c.chunk_index == chunk_index)
+                                        .cloned()
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            // Add the new target if it's not already present.
+                            let target_str = target_node.to_string();
+                            let already_present = entries
+                                .iter()
+                                .any(|c| c.node_id == target_str);
+                            if !already_present {
+                                entries.push(ChunkLocationEntry {
+                                    chunk_index,
+                                    chunk_hash: chunk_id.clone(),
+                                    node_id: target_str,
+                                    disk_id: 0,
+                                    size_bytes: 0,
+                                });
+                            }
+                            (chunk_index, entries)
                         };
-                        let new_loc = ChunkLocationEntry {
-                            chunk_index,
-                            chunk_hash: chunk_id.clone(),
-                            // Store the numeric node ID (not the gRPC address)
-                            // so that `chunk_loc.node_id.parse::<u64>()` succeeds
-                            // in the scheduler's under-replication checks (fix #7).
-                            node_id: target_node.to_string(),
-                            disk_id: 0, // Disk chosen by target data node.
-                            size_bytes: 0,
-                        };
+                        let _ = chunk_index; // bound below if needed
                         let req = ClientRequest::UpdateChunkLocations {
                             path,
-                            chunks: vec![new_loc],
+                            chunks: full_chunks,
                             // Bug P — re-replication is system-driven,
                             // not user-driven, so no client lease applies.
                             // Empty lease_id skips the verification path.
                             lease_id: String::new(),
                         };
+                        // Bug AB diagnostic — promote the silent debug
+                        // log to WARN so a stuck-in-loop scheduler is
+                        // visible without per-tick instrumentation.
                         if let Err(e) = self.raft.client_write(req).await {
-                            debug!(
-                                "Could not write new chunk location to Raft (may not be leader): {}",
-                                e
+                            warn!(
+                                task_id = %task.task_id,
+                                error = %e,
+                                "Bug AB UpdateChunkLocations Raft write failed; new replica not registered yet"
                             );
                         }
                     }
@@ -738,8 +770,17 @@ impl TaskScheduler {
         let req = ClientRequest::UpdateMigrationState { json };
 
         if let Err(e) = self.raft.client_write(req).await {
-            // Not being leader is expected on followers.
-            debug!("Failed to persist migration state: {} (may not be leader)", e);
+            // Bug AB diagnostic — followers will see this often (expected
+            // because they forward to leader and the call returns
+            // ForwardToLeader rather than committing locally). But when
+            // EVERY save fails for an extended period the cluster is
+            // leaderless and migration tasks loop infinitely re-running
+            // ReplicateChunk for the same chunk every tick. Promoted from
+            // debug to warn so the symptom is visible in standard log
+            // levels — operators should investigate when this is the
+            // only manager logging "Migration: Copying -> Verifying"
+            // for the same task_id every 30s.
+            warn!("Bug AB save_migration_state failed: {} (may not be leader)", e);
         }
     }
 
