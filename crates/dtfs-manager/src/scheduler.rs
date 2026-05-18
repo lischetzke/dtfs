@@ -554,6 +554,10 @@ impl TaskScheduler {
                         let req = ClientRequest::UpdateChunkLocations {
                             path,
                             chunks: vec![new_loc],
+                            // Bug P — re-replication is system-driven,
+                            // not user-driven, so no client lease applies.
+                            // Empty lease_id skips the verification path.
+                            lease_id: String::new(),
                         };
                         if let Err(e) = self.raft.client_write(req).await {
                             debug!(

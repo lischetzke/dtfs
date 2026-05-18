@@ -1523,8 +1523,16 @@ impl DtfsFilesystem {
             );
         }
 
+        // Bug P — find the lease_id for this path so the manager can
+        // verify it before applying the commit. If no open file handle
+        // has a lease (system flow, e.g. read-only path), an empty
+        // string preserves the legacy no-verification behaviour.
+        let lease_id = self
+            .find_lease_id_for_path(path)
+            .unwrap_or_default();
+
         self.client
-            .commit_chunk_locations(path, &volume_id, commits)
+            .commit_chunk_locations(path, &volume_id, commits, &lease_id)
             .await
             .with_context(|| format!("commit_chunk_locations failed for {path}"))?;
 
@@ -1538,6 +1546,21 @@ impl DtfsFilesystem {
             if file.path == path {
                 if let Some(loc) = &file.locations {
                     return Some(loc.volume_id.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Bug P — find the current write-lease id for an open file handle
+    /// on `path`. Returns the first matching writer's lease_id; empty
+    /// `None` if no writer holds a lease.
+    fn find_lease_id_for_path(&self, path: &str) -> Option<String> {
+        for entry in self.open_files.iter() {
+            let file = entry.value();
+            if file.path == path {
+                if let Some(lid) = &file.lease_id {
+                    return Some(lid.clone());
                 }
             }
         }

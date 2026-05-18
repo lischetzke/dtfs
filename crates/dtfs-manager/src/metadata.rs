@@ -701,17 +701,36 @@ impl ManagerService for MetadataService {
 
         let resp = self
             .raft_write(ClientRequest::UpdateChunkLocations {
-                path: req.path,
+                path: req.path.clone(),
                 chunks,
+                lease_id: req.lease_id.clone(),
             })
             .await?;
 
         match resp {
             ClientResponse::Success => Ok(Response::new(CommitChunkLocationsResponse {
                 success: true,
+                lease_conflict: false,
+                error: String::new(),
             })),
+            // Bug P — lease_id didn't match the currently-held lease.
+            // FUSE client must surface this so the writer aborts.
+            ClientResponse::WriteLeaseConflict { owner_id, .. } => {
+                Ok(Response::new(CommitChunkLocationsResponse {
+                    success: false,
+                    lease_conflict: true,
+                    error: format!(
+                        "write lease for {} no longer held by this writer (current owner: {})",
+                        req.path, owner_id
+                    ),
+                }))
+            }
             ClientResponse::Error { message } => Err(Status::failed_precondition(message)),
-            _ => Ok(Response::new(CommitChunkLocationsResponse { success: true })),
+            _ => Ok(Response::new(CommitChunkLocationsResponse {
+                success: true,
+                lease_conflict: false,
+                error: String::new(),
+            })),
         }
     }
 

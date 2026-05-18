@@ -334,10 +334,22 @@ message CommitChunkLocationsRequest {
   string path = 1;
   string volume_id = 2;
   repeated ChunkLocationCommit chunks = 3;
+  // Bug P — the lease_id the writer currently holds for `path`. The
+  // manager rejects the commit if this doesn't match
+  // `sm.write_leases[path].lease_id`. Empty string preserves legacy
+  // behaviour for callers that haven't been updated yet (best-effort:
+  // if the writer doesn't carry the lease forward, the manager can't
+  // protect against concurrent-writer interleaving for this commit).
+  string lease_id = 4;
 }
 
 message CommitChunkLocationsResponse {
   bool success = 1;
+  // Bug P — set when the commit was rejected because lease_id didn't
+  // match the currently-held lease. Client should abort and surface
+  // an EIO-like error to userspace.
+  bool lease_conflict = 2;
+  string error = 3;
 }
 
 // --- RegisterNode ---

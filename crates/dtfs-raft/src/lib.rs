@@ -162,6 +162,14 @@ pub enum ClientRequest {
     UpdateChunkLocations {
         path: String,
         chunks: Vec<ChunkLocationEntry>,
+        /// Bug P — the lease_id the writer is committing under. When
+        /// non-empty, the apply path verifies it matches
+        /// `sm.write_leases[path].lease_id` and rejects with
+        /// `WriteLeaseConflict` otherwise. Empty string preserves the
+        /// pre-fix behaviour (no lease verification) so existing
+        /// snapshots / older clients continue to work.
+        #[serde(default)]
+        lease_id: String,
     },
 
     /// Bug O — remove every (node_id, chunk_hash) entry the data node
@@ -326,8 +334,13 @@ impl fmt::Display for ClientRequest {
                 write!(f, "CreateFile({path}, vol={volume_id})")
             }
             Self::DeleteFile { path } => write!(f, "DeleteFile({path})"),
-            Self::UpdateChunkLocations { path, chunks } => {
-                write!(f, "UpdateChunks({path}, {} chunks)", chunks.len())
+            Self::UpdateChunkLocations { path, chunks, lease_id } => {
+                let lease_marker = if lease_id.is_empty() {
+                    "no-lease".to_string()
+                } else {
+                    format!("lease={lease_id}")
+                };
+                write!(f, "UpdateChunks({path}, {} chunks, {lease_marker})", chunks.len())
             }
             Self::RemoveCorruptChunkReplicas { node_id, chunk_hashes } => write!(
                 f,
