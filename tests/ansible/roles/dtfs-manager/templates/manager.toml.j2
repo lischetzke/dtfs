@@ -37,7 +37,7 @@ listen_addr = "0.0.0.0:{{ dtfs_api_port | default(9402) }}"
 mode = "{{ dtfs_tls_mode | default('off') }}"
 
 [defaults]
-chunk_size_mb = {{ dtfs_chunk_size_mb | default(128) }}
+chunk_size_mb = {{ dtfs_chunk_size_mb | default(4) }}
 
 [defaults.write_safety]
 min_replicas_before_ack = {{ dtfs_replication_min_ack | default(2) }}

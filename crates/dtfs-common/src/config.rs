@@ -462,7 +462,25 @@ fn default_tls_mode() -> String {
     "auto".to_string()
 }
 fn default_chunk_size() -> u32 {
-    128
+    // Workspace default — see the regression test
+    // `workspace_default_chunk_size_is_4_mb`.
+    //
+    // Pre-Bug-I we used 128 MB to amortise the cost of allocating a full
+    // chunk's worth of memory per put_chunk. Now that put_chunk streams
+    // directly to disk (Bug I) and the memory budget is enforced (Bug G),
+    // 4 MB is the better default:
+    //
+    //   * Faster migrations  : 4 MB at 1 Gbps ≈ 50 ms / chunk (vs 1 s)
+    //   * Smaller retries    : a RESOURCE_EXHAUSTED retry redoes 4 MB
+    //   * Plex friendliness  : 4 MB ≈ 1 second of 32 Mbps video — natural
+    //                          unit for a streaming reader
+    //   * Finer ARC cache    : 32× more independent entries per MB budget
+    //   * Better hash ring   : more chunks → finer disk distribution
+    //
+    // Tradeoff is more Raft state per file and more `UpdateChunkLocations`
+    // commits; both are modest at lab scale and the cluster handles them
+    // comfortably.
+    4
 }
 fn default_true() -> bool {
     true
@@ -679,5 +697,32 @@ max_io_percent = 10
 "#;
         let config: DataNodeConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.grpc.max_concurrent_chunk_writes, 4);
+    }
+
+    /// The workspace default chunk size MUST be 4 MB. The original 128 MB
+    /// choice predated Bug I's streaming put_chunk and was sized to
+    /// amortise per-write allocation cost. With streaming-to-disk and
+    /// Bug G's runtime memory cap, smaller chunks win on every axis that
+    /// matters in the lab: faster migrations, granular retries on
+    /// `RESOURCE_EXHAUSTED`, better Plex playback granularity, more
+    /// independent ARC cache entries, and finer hash-ring distribution.
+    ///
+    /// Locking this here so a careless edit doesn't quietly revert
+    /// freshly-deployed clusters back to the old default. We assert
+    /// both the pure helper AND the serde default on `DefaultsConfig`.
+    #[test]
+    fn workspace_default_chunk_size_is_4_mb() {
+        // 1. The pure helper.
+        assert_eq!(default_chunk_size(), 4);
+
+        // 2. Serde default through `DefaultsConfig` — when an operator
+        //    writes an empty `[defaults]` block in manager.toml the
+        //    serde-default kicks in.
+        let cfg: DefaultsConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.chunk_size_mb, 4,
+            "DefaultsConfig.chunk_size_mb must default to 4; got {}",
+            cfg.chunk_size_mb
+        );
     }
 }
