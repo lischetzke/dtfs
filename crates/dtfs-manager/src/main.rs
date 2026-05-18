@@ -165,6 +165,19 @@ async fn main() -> anyhow::Result<()> {
     // 10k-entry ring buffer doesn't silently drop history.
     let audit_archive_dir = config.node.data_dir.join("audit");
     let audit_log = Arc::new(AuditLog::new_with_archive(10_000, audit_archive_dir));
+
+    // P1-8: alert dispatcher (webhook sinks from config).
+    let alert_dispatcher = Arc::new(alerts::AlertDispatcher::new(
+        config.cluster.name.clone(),
+        config.node.hostname.clone(),
+        config.alerts.webhooks.clone(),
+    ));
+    if alert_dispatcher.sink_count() > 0 {
+        tracing::info!(
+            sinks = alert_dispatcher.sink_count(),
+            "alert dispatcher armed"
+        );
+    }
     // ClusterManager no longer holds a Raft reference; heartbeat tracking is
     // its only responsibility. Raft writes are performed by HealthMonitor.
     let cluster_mgr = Arc::new(ClusterManager::new());
@@ -197,12 +210,18 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Tiering engine background task ---
 
-    let tiering_engine = Arc::new(TieringEngine::new(
-        config.tiering.clone(),
-        task_scheduler.clone(),
-        audit_log.clone(),
-        sm_data.clone(),
-    ));
+    // P1-8: wire the alert dispatcher into the scheduler before any work starts.
+    task_scheduler.set_alerts(alert_dispatcher.clone());
+
+    let tiering_engine = Arc::new(
+        TieringEngine::new(
+            config.tiering.clone(),
+            task_scheduler.clone(),
+            audit_log.clone(),
+            sm_data.clone(),
+        )
+        .with_alerts(alert_dispatcher.clone()),
+    );
 
     let tiering_ref = tiering_engine.clone();
     let tiering_handle = tokio::spawn(async move {
@@ -217,7 +236,8 @@ async fn main() -> anyhow::Result<()> {
         task_scheduler.clone(),
         sm_data.clone(),
         raft.clone(),
-    );
+    )
+    .with_alerts(alert_dispatcher.clone()); // P1-8
     let monitor_handle = tokio::spawn(async move {
         health_monitor.run().await;
     });

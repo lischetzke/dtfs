@@ -62,6 +62,8 @@ pub struct TaskScheduler {
     raft: Arc<DtfsRaft>,
     state_data: Arc<RwLock<StateMachineData>>,
     audit: Arc<AuditLog>,
+    /// P1-8: optional alert dispatcher. MigrationFailed fires here.
+    alerts: parking_lot::RwLock<Option<Arc<crate::alerts::AlertDispatcher>>>,
 }
 
 impl TaskScheduler {
@@ -75,7 +77,13 @@ impl TaskScheduler {
             raft,
             state_data,
             audit,
+            alerts: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Inject the alert dispatcher (called after main.rs has wired one).
+    pub fn set_alerts(&self, alerts: Arc<crate::alerts::AlertDispatcher>) {
+        *self.alerts.write() = Some(alerts);
     }
 
     /// Run the scheduler background loop. Intended to be spawned as a tokio task.
@@ -431,6 +439,20 @@ impl TaskScheduler {
                                 ),
                                 &reason,
                             );
+                            if let Some(alerts) = self.alerts.read().clone() {
+                                alerts.fire(
+                                    crate::alerts::AlertKind::MigrationFailed,
+                                    "migration task exhausted retries",
+                                    serde_json::json!({
+                                        "task_id": task.task_id,
+                                        "chunk_id": task.chunk_id,
+                                        "attempts": task.attempts,
+                                        "reason": reason,
+                                        "source_node": task.source_node,
+                                        "target_node": task.target_node,
+                                    }),
+                                );
+                            }
                         } else {
                             warn!(
                                 task_id = %task.task_id,

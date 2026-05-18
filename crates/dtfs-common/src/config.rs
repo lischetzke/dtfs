@@ -17,6 +17,35 @@ pub struct ManagerConfig {
     pub defaults: DefaultsConfig,
     pub tiering: TieringConfig,
     pub monitoring: MonitoringConfig,
+    /// P1-8: alert webhook sinks (operator-configured HTTP receivers).
+    /// `#[serde(default)]` keeps existing configs loadable.
+    #[serde(default)]
+    pub alerts: AlertsConfig,
+}
+
+/// P1-8 alerts config.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AlertsConfig {
+    /// Webhook URLs and per-sink shared secrets.
+    #[serde(default)]
+    pub webhooks: Vec<AlertWebhook>,
+}
+
+/// One alert webhook sink.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertWebhook {
+    pub url: String,
+    #[serde(default)]
+    pub secret: String,
+    /// Restrict the kinds this sink receives. Empty = all.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    #[serde(default = "default_dedup_secs")]
+    pub dedup_secs: u64,
+}
+
+fn default_dedup_secs() -> u64 {
+    300
 }
 
 /// Data node configuration (loaded from /etc/dtfs/data.toml).

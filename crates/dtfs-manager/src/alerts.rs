@@ -47,24 +47,9 @@ impl AlertKind {
     }
 }
 
-/// Configured webhook sink.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebhookSink {
-    pub url: String,
-    /// HMAC-SHA256 secret for the `X-DTFS-Signature` header.
-    #[serde(default)]
-    pub secret: String,
-    /// Restrict the kinds this sink receives. Empty = all kinds.
-    #[serde(default)]
-    pub kinds: Vec<String>,
-    /// Per-kind dedup window in seconds (default 300s).
-    #[serde(default = "default_dedup_secs")]
-    pub dedup_secs: u64,
-}
-
-fn default_dedup_secs() -> u64 {
-    300
-}
+/// Re-export of the common config webhook type so manager-side code can
+/// use a stable name even if the config struct moves later.
+pub use dtfs_common::config::AlertWebhook as WebhookSink;
 
 /// JSON payload sent to each sink.
 #[derive(Debug, Clone, Serialize)]
