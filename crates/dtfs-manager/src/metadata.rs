@@ -286,6 +286,12 @@ impl ManagerService for MetadataService {
             total_capacity,
             used_capacity,
             health: HealthStatus::Healthy,
+            last_seen_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            total_bytes_read: 0,
+            total_bytes_written: 0,
         };
 
         let resp = self
@@ -329,6 +335,12 @@ impl ManagerService for MetadataService {
                 node_id,
                 used_capacity: req.total_bytes_used,
                 chunk_count: req.total_chunks,
+                total_bytes_read: req.total_bytes_read,
+                total_bytes_written: req.total_bytes_written,
+                observed_at_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
             })
             .await;
 

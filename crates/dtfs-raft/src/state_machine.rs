@@ -905,9 +905,17 @@ fn apply_request(
             node_id,
             used_capacity,
             chunk_count: _chunk_count,
+            total_bytes_read,
+            total_bytes_written,
+            observed_at_ms,
         } => {
             if let Some(node) = sm.nodes.get_mut(node_id) {
                 node.used_capacity = *used_capacity;
+                node.total_bytes_read = *total_bytes_read;
+                node.total_bytes_written = *total_bytes_written;
+                if *observed_at_ms > 0 {
+                    node.last_seen_ms = *observed_at_ms;
+                }
                 push_audit_capped(
                     &mut sm.audit_log,
                     audit(format!("UpdateNodeUsage: {node_id} used={used_capacity}")),

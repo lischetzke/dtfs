@@ -322,6 +322,7 @@ async fn manager_lifecycle(
             })
             .collect();
 
+        let io_snapshot = data_metrics.snapshot();
         let heartbeat = HeartbeatRequest {
             node_id: node_id.clone(),
             uptime_secs: uptime,
@@ -329,6 +330,8 @@ async fn manager_lifecycle(
             total_bytes_used: store_stats.total_bytes_stored,
             config_version: current_config_version,
             chunk_reads,
+            total_bytes_read: io_snapshot.total_bytes_read,
+            total_bytes_written: io_snapshot.total_bytes_written,
         };
 
         // Bug O — after each heartbeat tick, drain any locally-quarantined

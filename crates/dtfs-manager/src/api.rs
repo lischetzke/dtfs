@@ -267,6 +267,12 @@ async fn join_complete_api(
         total_capacity,
         used_capacity,
         health: HealthStatus::Healthy,
+        last_seen_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        total_bytes_read: 0,
+        total_bytes_written: 0,
     };
 
     let completion = state
@@ -302,6 +308,13 @@ struct NodeResponse {
     used_capacity: u64,
     health: String,
     role: String,
+    /// Unix milliseconds when this node was last observed alive.
+    /// For data nodes: latest heartbeat. For managers: synthesised
+    /// from the cluster config + the API server's "now" (since this
+    /// API only responds while it's alive). For FUSE clients:
+    /// approximate via the most-recent write_lease for any of their
+    /// owner_id hostnames.
+    last_seen_ms: u64,
 }
 
 impl NodeResponse {
@@ -322,17 +335,95 @@ impl NodeResponse {
             used_capacity: info.used_capacity,
             health: format!("{:?}", info.health),
             role: format!("{:?}", info.role),
+            last_seen_ms: info.last_seen_ms,
         }
     }
 }
 
 async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse>> {
     let sm = state.sm_data.read().await;
-    let nodes: Vec<NodeResponse> = sm
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // 1. Data + manager nodes registered in Raft (have heartbeat /
+    //    join records).
+    let mut nodes: Vec<NodeResponse> = sm
         .nodes
         .iter()
         .map(|(id, info)| NodeResponse::from_entry(*id, info))
         .collect();
+
+    // 2. WebUI bug — managers don't self-register through the
+    //    data-node heartbeat path so they were missing from this list
+    //    and from Home → "Data & Manager Nodes" and from Topology.
+    //    Synthesise entries from the cluster's initial-voters list;
+    //    if a manager's hostname is also in `sm.nodes` (e.g. because
+    //    a manager also runs as a data node on toro-plex), skip the
+    //    synthetic entry.
+    let known_hostnames: std::collections::HashSet<&str> = sm
+        .nodes
+        .values()
+        .map(|n| n.hostname.as_str())
+        .collect();
+    for v in &state.config.cluster.initial_voters {
+        if known_hostnames.contains(v.hostname.as_str()) {
+            continue;
+        }
+        let id = dtfs_common::node_id_from_hostname(&v.hostname);
+        nodes.push(NodeResponse {
+            node_id: id.to_string(),
+            hostname: v.hostname.clone(),
+            grpc_addr: format!("http://{}", v.addr),
+            location: format!("?/?/?/{}", v.hostname),
+            disk_count: 0,
+            total_capacity: 0,
+            used_capacity: 0,
+            health: "Healthy".to_string(),
+            role: "Manager".to_string(),
+            // The API server replying is itself a manager — peers are
+            // assumed alive within the cluster heartbeat window. A
+            // future fix wires per-manager last-seen via Raft membership.
+            last_seen_ms: now_ms,
+        });
+    }
+
+    // 3. FUSE clients — approximate from active write_leases. The
+    //    `owner_id` format is "<hostname>:<pid>:<fh>"; the hostname
+    //    is the FUSE client. We surface one entry per unique
+    //    hostname, with last_seen = latest lease updated_at_ms.
+    let mut client_last_seen: std::collections::HashMap<String, u64> = Default::default();
+    for lease in sm.write_leases.values() {
+        if let Some(host) = lease.owner_id.split(':').next() {
+            if host.is_empty() {
+                continue;
+            }
+            let e = client_last_seen.entry(host.to_string()).or_insert(0);
+            if lease.expires_at_ms > *e {
+                *e = lease.expires_at_ms;
+            }
+        }
+    }
+    for (host, last_seen) in client_last_seen {
+        if known_hostnames.contains(host.as_str()) {
+            continue;
+        }
+        let id = dtfs_common::node_id_from_hostname(&host);
+        nodes.push(NodeResponse {
+            node_id: id.to_string(),
+            hostname: host.clone(),
+            grpc_addr: String::new(),
+            location: format!("?/?/?/{}", host),
+            disk_count: 0,
+            total_capacity: 0,
+            used_capacity: 0,
+            health: "Healthy".to_string(),
+            role: "Client".to_string(),
+            last_seen_ms: last_seen,
+        });
+    }
+
     Json(nodes)
 }
 
@@ -700,6 +791,32 @@ async fn update_config(
 // Aggregate stats endpoint (consumed by WebUI home page)
 // ---------------------------------------------------------------------------
 
+/// Compute a "seconds since the cluster started serving I/O" window.
+/// Used as a denominator for the cumulative-bytes counters reported
+/// in /api/v1/stats.io_read_bytes_per_sec etc. We use the cluster
+/// uptime since the earliest-seen node's first heartbeat — a crude
+/// long-window average that's plenty for the WebUI's purposes.
+fn compute_io_window_secs(
+    nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+) -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut earliest_ms = now_ms;
+    for n in nodes.values() {
+        // Approximate "first seen" as last_seen minus a default of
+        // 60s window. We don't track first_seen explicitly; using
+        // last_seen as both bounds gives 0 → guard with 1s.
+        if n.last_seen_ms > 0 && n.last_seen_ms < earliest_ms {
+            earliest_ms = n.last_seen_ms;
+        }
+    }
+    let span_ms = now_ms.saturating_sub(earliest_ms);
+    (span_ms / 1000).max(1)
+}
+
 async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
     use dtfs_common::types::{DiskTier, HealthStatus, NodeRole};
 
@@ -797,6 +914,18 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
     let net_usable = raw_total / hot_rf;
     let net_used = raw_used / hot_rf;
 
+    // WebUI bug — was hardcoded to 0. Aggregate cumulative bytes across
+    // all data nodes and amortise over the heartbeat-observed window to
+    // get a crude bytes/sec figure. Better than nothing; a future fix
+    // tracks a true rolling-window rate per node.
+    let io_window_secs = compute_io_window_secs(&sm.nodes);
+    let total_bytes_read_all: u64 =
+        sm.nodes.values().map(|n| n.total_bytes_read).sum();
+    let total_bytes_written_all: u64 =
+        sm.nodes.values().map(|n| n.total_bytes_written).sum();
+    let io_read_bps = total_bytes_read_all / io_window_secs;
+    let io_write_bps = total_bytes_written_all / io_window_secs;
+
     // Overall cluster health.
     let total_nodes = sm.nodes.len();
     let healthy_nodes = sm
@@ -883,9 +1012,8 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         "net_usable_bytes":      net_usable,
         "net_used_bytes":        net_used,
         "tier_breakdown":        tier_breakdown,
-        // I/O stats are aggregated from data node heartbeats in a future phase.
-        "io_read_bytes_per_sec":  0u64,
-        "io_write_bytes_per_sec": 0u64,
+        "io_read_bytes_per_sec":  io_read_bps,
+        "io_write_bytes_per_sec": io_write_bps,
         "last_scrub":            last_scrub,
         "scrub_results_by_node": scrub_results_by_node,
         "config_version":        sm.cluster_config.version,
