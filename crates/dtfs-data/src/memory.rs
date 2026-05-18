@@ -19,11 +19,44 @@
 // monitor + the RSS read live behind small wrappers so the static logic
 // is verifiable without spinning up the cluster.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use dtfs_common::config::MemoryConfig;
+
+/// Bug V — current pressure level, derived from the latest RSS reading.
+///
+/// The strategy ladder maps levels to cooperative actions (Ceph OSD style)
+/// so the data node defends its memory budget without rejecting requests
+/// until the very last rung:
+///
+/// | Level    | RSS                              | Action                                |
+/// |----------|----------------------------------|---------------------------------------|
+/// | Normal   | < warn_threshold                 | Full ARC cache, scrub at config rate  |
+/// | Warn     | [warn, shed)                     | Shrink ARC to 50%, log warn-once      |
+/// | Shed     | >= shed_threshold                | Shrink ARC to 10%, refuse put_chunk   |
+///
+/// Levels are stored as a `u8` in atomic memory so all observers see the
+/// same snapshot without locking. The current ordering MUST stay stable
+/// because `record_sample` casts via integer arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PressureLevel {
+    Normal = 0,
+    Warn = 1,
+    Shed = 2,
+}
+
+impl PressureLevel {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => PressureLevel::Normal,
+            1 => PressureLevel::Warn,
+            _ => PressureLevel::Shed,
+        }
+    }
+}
 
 /// Per-process memory budget. Cheap to clone (just `Arc`).
 #[derive(Debug)]
@@ -35,6 +68,11 @@ pub struct MemoryBudget {
     shedding: AtomicBool,
     last_rss_bytes: AtomicU64,
     warn_logged: AtomicBool,
+    /// Bug V — current pressure level as u8; readers downcast via
+    /// `PressureLevel::from_u8`. Atomic so the monitor publishes without
+    /// holding a mutex and consumers (cache shrinker, scrub pauser) see
+    /// the latest level without contention.
+    level: AtomicU8,
 }
 
 impl MemoryBudget {
@@ -56,7 +94,17 @@ impl MemoryBudget {
             shedding: AtomicBool::new(false),
             last_rss_bytes: AtomicU64::new(0),
             warn_logged: AtomicBool::new(false),
+            level: AtomicU8::new(PressureLevel::Normal as u8),
         }
+    }
+
+    /// Bug V — current pressure level. Cooperative consumers (ARC cache
+    /// shrinker, scrub scheduler, prefetch dropper) poll this every few
+    /// seconds and adjust their behavior. The shedding flag (`is_shedding`)
+    /// remains the hard backstop that refuses new writes at the highest
+    /// level.
+    pub fn pressure_level(&self) -> PressureLevel {
+        PressureLevel::from_u8(self.level.load(Ordering::Acquire))
     }
 
     /// `true` once RSS has climbed past `shed_threshold_pct`. Cleared
@@ -96,11 +144,17 @@ impl MemoryBudget {
     /// Apply a freshly-sampled RSS reading. Sets the shedding flag if
     /// we've crossed the shed threshold; clears it once we've dropped
     /// back below the warn threshold (hysteresis).
+    ///
+    /// Bug V — also updates the pressure level so cooperative consumers
+    /// (cache shrinker, scrub pauser) can poll and react before the
+    /// hard reject threshold is reached.
     pub fn record_sample(&self, rss_bytes: u64) {
         self.last_rss_bytes.store(rss_bytes, Ordering::Release);
         if self.hard_cap_bytes == 0 {
-            // Unbounded — every flag stays off.
+            // Unbounded — every flag stays off and level pinned at Normal.
             self.shedding.store(false, Ordering::Release);
+            self.level
+                .store(PressureLevel::Normal as u8, Ordering::Release);
             return;
         }
 
@@ -111,6 +165,20 @@ impl MemoryBudget {
         } else {
             rss_bytes >= self.shed_threshold_bytes
         };
+
+        // Bug V — derive pressure level from the same hysteretic rules:
+        //   * Once shedding, stay >=Warn until we drop below warn threshold.
+        //   * Once >=warn but <shed, sit at Warn.
+        //   * Else Normal.
+        let new_level = if new_shedding {
+            PressureLevel::Shed
+        } else if rss_bytes >= self.warn_threshold_bytes {
+            PressureLevel::Warn
+        } else {
+            PressureLevel::Normal
+        };
+        self.level.store(new_level as u8, Ordering::Release);
+
         if new_shedding != prev_shedding {
             self.shedding.store(new_shedding, Ordering::Release);
             if new_shedding {
@@ -162,6 +230,50 @@ impl MemoryBudget {
                 Err(e) => {
                     tracing::debug!(error = %e, "memory budget: could not read RSS");
                 }
+            }
+        }
+    }
+
+    /// Bug V — variant of `run_monitor` that also drives the cooperative
+    /// strategy ladder. At each sample tick we look at the pressure level
+    /// and ask the supplied cache to shrink to a target size before any
+    /// hard rejection kicks in. This is the "best-effort, no-reject"
+    /// behavior the user asked for — matches Ceph OSD autotuner shape.
+    ///
+    /// The cache_max_entries parameter is the operator-configured maximum
+    /// (whatever was passed to `ArcCache::new`); we never grow beyond it.
+    pub async fn run_monitor_with_cache(
+        self: Arc<Self>,
+        cache: Arc<crate::cache::ArcCache>,
+        cache_max_entries: usize,
+    ) {
+        let mut tick = tokio::time::interval(self.sample_interval);
+        let mut last_level = PressureLevel::Normal;
+        loop {
+            tick.tick().await;
+            if let Ok(rss) = read_proc_self_rss_bytes() {
+                self.record_sample(rss);
+            }
+            let level = self.pressure_level();
+            // Only act on level changes (or every tick if Shed) to avoid
+            // hammering the cache mutex on a stable system.
+            if level != last_level || level == PressureLevel::Shed {
+                let target = match level {
+                    PressureLevel::Normal => cache_max_entries,
+                    PressureLevel::Warn => cache_max_entries / 2,
+                    PressureLevel::Shed => cache_max_entries / 10,
+                };
+                let evicted = cache.shrink_to(target);
+                if evicted > 0 {
+                    tracing::info!(
+                        level = ?level,
+                        evicted,
+                        target,
+                        cache_len = cache.len(),
+                        "Bug V cooperative cache shrink under memory pressure"
+                    );
+                }
+                last_level = level;
             }
         }
     }
@@ -397,5 +509,55 @@ VmData:\t  300000 kB
         // None rather than crash.
         let sample = "VmRSS:\t  100 GiB\n";
         assert!(parse_proc_self_status_vmrss(sample).is_none());
+    }
+
+    /// Bug V regression — pressure_level walks Normal → Warn → Shed as
+    /// RSS rises and back down with hysteresis. The cooperative consumers
+    /// (cache shrinker, scrub pauser) rely on this monotonic state machine.
+    #[test]
+    fn bug_v_pressure_level_tracks_thresholds() {
+        let cfg = MemoryConfig {
+            hard_cap_mb: 2048,
+            warn_threshold_pct: 80,
+            shed_threshold_pct: 92,
+            sample_interval_secs: 5,
+        };
+        let budget = MemoryBudget::from_config(&cfg);
+
+        // Far below warn → Normal.
+        budget.record_sample(500 * MB);
+        assert_eq!(budget.pressure_level(), PressureLevel::Normal);
+
+        // Between warn (80% = 1638 MB) and shed (92% = 1884 MB) → Warn.
+        budget.record_sample(1700 * MB);
+        assert_eq!(budget.pressure_level(), PressureLevel::Warn);
+
+        // Above shed → Shed.
+        budget.record_sample(1900 * MB);
+        assert_eq!(budget.pressure_level(), PressureLevel::Shed);
+
+        // Drop a bit but still above warn → stays at Shed via hysteresis
+        // (matching is_shedding's clearing rule).
+        budget.record_sample(1700 * MB);
+        assert_eq!(budget.pressure_level(), PressureLevel::Shed);
+
+        // Drop below warn → Normal (since shedding clears here too).
+        budget.record_sample(1500 * MB);
+        assert_eq!(budget.pressure_level(), PressureLevel::Normal);
+    }
+
+    /// Bug V regression — `hard_cap = 0` pins the level at Normal so
+    /// unbounded-mode systems never spuriously shrink the cache.
+    #[test]
+    fn bug_v_pressure_level_unbounded_stays_normal() {
+        let cfg = MemoryConfig {
+            hard_cap_mb: 0,
+            warn_threshold_pct: 80,
+            shed_threshold_pct: 92,
+            sample_interval_secs: 5,
+        };
+        let budget = MemoryBudget::from_config(&cfg);
+        budget.record_sample(1_000_000 * MB);
+        assert_eq!(budget.pressure_level(), PressureLevel::Normal);
     }
 }

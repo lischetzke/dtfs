@@ -338,6 +338,7 @@ pub async fn run_grpc_server(
     config: ManagerConfig,
     metadata_service: MetadataService,
     raft: Arc<DtfsRaft>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let addr = config.grpc.listen_addr.parse()?;
 
@@ -356,10 +357,13 @@ pub async fn run_grpc_server(
 
     tracing::info!("Manager gRPC server listening on {}", addr);
 
+    // Bug U — stop accepting new connections when the shutdown signal fires.
+    // In-flight requests continue until they complete; main is responsible
+    // for any post-server cleanup (Raft snapshot, audit flush).
     Server::builder()
         .add_service(ManagerServiceServer::new(metadata_service))
         .add_service(raft_svc)
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown)
         .await?;
 
     Ok(())

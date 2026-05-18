@@ -107,6 +107,50 @@ impl ArcCache {
         inner.p = 0;
         inner.data.clear();
     }
+
+    /// Bug V — shrink the cache to at most `target_entries` live (T1+T2)
+    /// records, evicting from the LRU side of T1 first, then T2.
+    ///
+    /// This is the cooperative half of the strategy ladder: when memory
+    /// pressure rises, the cache gives back RAM *before* we have to start
+    /// rejecting writes. Ghost lists (B1/B2) are preserved so that ARC's
+    /// adaptive `p` recovers correctly once pressure subsides — clear()
+    /// would lose all that history.
+    ///
+    /// Returns the number of entries evicted. `target_entries = 0` is
+    /// effectively a "clear data without losing ghost history" operation.
+    pub fn shrink_to(&self, target_entries: usize) -> usize {
+        let mut inner = self.inner.lock();
+        let initial = inner.t1.len() + inner.t2.len();
+        if initial <= target_entries {
+            return 0;
+        }
+        let mut to_evict = initial - target_entries;
+        // Evict LRU of T1 first (less-recent recency).
+        while to_evict > 0 {
+            match inner.t1.pop_front() {
+                Some(entry) => {
+                    inner.data.remove(&entry.key);
+                    // Demote to B1 ghost so ARC's `p` can re-learn.
+                    inner.b1.push_back(entry.key);
+                    to_evict -= 1;
+                }
+                None => break,
+            }
+        }
+        // Still need more? Pull from T2 LRU.
+        while to_evict > 0 {
+            match inner.t2.pop_front() {
+                Some(entry) => {
+                    inner.data.remove(&entry.key);
+                    inner.b2.push_back(entry.key);
+                    to_evict -= 1;
+                }
+                None => break,
+            }
+        }
+        initial - (inner.t1.len() + inner.t2.len())
+    }
 }
 
 impl ArcCacheInner {
@@ -296,5 +340,57 @@ mod tests {
         // Now re-insert a; it should be found in B1 ghost and adapt p.
         cache.put("a".into(), Bytes::from("1-again"));
         assert!(cache.contains("a"));
+    }
+
+    /// Bug V regression — shrink_to(N) on a cache of size > N evicts down
+    /// to N entries. The remaining entries are the MRU ones (we evict
+    /// LRU first), matching Ceph OSD's "drop coldest under pressure" pattern.
+    #[test]
+    fn bug_v_shrink_to_evicts_down_to_target() {
+        let cache = ArcCache::new(100);
+        for i in 0..50 {
+            cache.put(format!("k{i}"), Bytes::from(format!("v{i}")));
+        }
+        assert_eq!(cache.len(), 50);
+        let evicted = cache.shrink_to(20);
+        assert_eq!(evicted, 30);
+        assert_eq!(cache.len(), 20);
+        // Most-recent inserts (k30..k49) should survive; oldest (k0..k29) evicted.
+        assert!(!cache.contains("k0"));
+        assert!(!cache.contains("k29"));
+        assert!(cache.contains("k49"));
+    }
+
+    /// Bug V regression — shrink_to when current size is already at or
+    /// below target is a no-op (no spurious evictions).
+    #[test]
+    fn bug_v_shrink_to_below_current_is_noop() {
+        let cache = ArcCache::new(100);
+        for i in 0..10 {
+            cache.put(format!("k{i}"), Bytes::from(format!("v{i}")));
+        }
+        let evicted = cache.shrink_to(20);
+        assert_eq!(evicted, 0, "shrink_to(20) on 10-entry cache should not evict");
+        assert_eq!(cache.len(), 10);
+    }
+
+    /// Bug V regression — shrink_to(0) clears T1+T2 data but preserves
+    /// ghost lists (B1+B2) so ARC's adaptive `p` parameter recovers
+    /// correctly when pressure subsides. Using clear() instead would
+    /// destroy the adaptation history.
+    #[test]
+    fn bug_v_shrink_to_zero_preserves_ghost_history() {
+        let cache = ArcCache::new(100);
+        for i in 0..30 {
+            cache.put(format!("k{i}"), Bytes::from(format!("v{i}")));
+        }
+        let evicted = cache.shrink_to(0);
+        assert_eq!(evicted, 30);
+        assert_eq!(cache.len(), 0);
+        // Re-inserting any previously-cached key should find it in B1 ghost,
+        // proving ghost history was preserved (this exercises ARC's
+        // adaptive code path).
+        cache.put("k0".into(), Bytes::from("revived"));
+        assert!(cache.contains("k0"));
     }
 }

@@ -21,6 +21,7 @@ mod monitor;
 mod placement;
 mod scheduler;
 mod server;
+mod shutdown;
 mod tiering;
 mod webui;
 
@@ -255,8 +256,18 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Start servers ---
 
-    let grpc_handle =
-        tokio::spawn(server::run_grpc_server(config.clone(), metadata_service, raft.clone()));
+    // Bug U — broadcast shutdown signal: SIGTERM/SIGINT fires it once, every
+    // server task observes it and stops accepting new connections.
+    let shutdown_signal = crate::shutdown::ShutdownSignal::new();
+    let grpc_shutdown = shutdown_signal.clone();
+    let api_shutdown = shutdown_signal.clone();
+
+    let grpc_handle = tokio::spawn(server::run_grpc_server(
+        config.clone(),
+        metadata_service,
+        raft.clone(),
+        async move { grpc_shutdown.wait_for_shutdown().await },
+    ));
     let api_handle = tokio::spawn(api::run_api_server(
         config.clone(),
         raft.clone(),
@@ -264,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
         audit_log.clone(),
         join_handler.clone(),
         task_scheduler.clone(),
+        async move { api_shutdown.wait_for_shutdown().await },
     ));
 
     audit_log.log(
@@ -273,12 +285,35 @@ async fn main() -> anyhow::Result<()> {
         "success",
     );
 
+    // Bug U — spawn a dedicated signal watcher that flips the shutdown
+    // signal. We don't put the signal future inside `select!` directly
+    // because we want ALL of (gRPC, API, monitors) to run to graceful
+    // completion together, not racing.
+    let sig_signal = shutdown_signal.clone();
+    let sig_handle = tokio::spawn(async move {
+        crate::shutdown::wait_for_terminate_signal().await;
+        tracing::info!("Bug U shutdown signal received — broadcasting to servers");
+        sig_signal.trigger();
+    });
+
+    // Wait for either:
+    //   - SIGTERM/SIGINT triggers shutdown → both servers exit via graceful
+    //     shutdown → we proceed to cleanup.
+    //   - A background task panics → log and bail.
     tokio::select! {
         result = grpc_handle => {
-            tracing::error!("gRPC server exited: {:?}", result);
+            match result {
+                Ok(Ok(())) => tracing::info!("gRPC server stopped"),
+                Ok(Err(e)) => tracing::error!(error = %e, "gRPC server returned error"),
+                Err(e) => tracing::error!(error = %e, "gRPC server task panicked"),
+            }
         }
         result = api_handle => {
-            tracing::error!("API server exited: {:?}", result);
+            match result {
+                Ok(Ok(())) => tracing::info!("API server stopped"),
+                Ok(Err(e)) => tracing::error!(error = %e, "API server returned error"),
+                Err(e) => tracing::error!(error = %e, "API server task panicked"),
+            }
         }
         _ = monitor_handle => {
             tracing::error!("Health monitor exited unexpectedly");
@@ -291,5 +326,41 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Make sure the signal was at least triggered (covers the
+    // "background task died" path → we still want a clean exit).
+    if !shutdown_signal.is_fired() {
+        shutdown_signal.trigger();
+    }
+    sig_handle.abort();
+
+    // Bug U cleanup steps. Each is best-effort and short-circuited on
+    // failure so that a stuck Raft snapshot doesn't hold the manager
+    // hostage forever — systemd's TimeoutStopSec would SIGKILL us anyway.
+
+    // 1. Trigger final Raft snapshot. Without this, an idle cluster
+    //    accumulates log entries between snapshot thresholds; if the next
+    //    start fails to read the log we lose everything since the last
+    //    snapshot. 5s timeout is plenty for an in-memory state machine.
+    let snap_raft = raft.clone();
+    let snap_result = tokio::time::timeout(Duration::from_secs(5), async move {
+        snap_raft.trigger().snapshot().await
+    })
+    .await;
+    match snap_result {
+        Ok(Ok(())) => tracing::info!("Bug U final Raft snapshot triggered cleanly"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "Bug U final snapshot trigger failed"),
+        Err(_) => tracing::warn!("Bug U final snapshot trigger timed out (5s)"),
+    }
+
+    // 2. Flush + record clean-shutdown audit event. AuditLog persists to
+    //    daily-rotated JSONL so this is durable across restarts.
+    audit_log.log(
+        "system",
+        "manager.stop",
+        &config.node.hostname,
+        "clean",
+    );
+
+    tracing::info!("DTFS manager exited cleanly");
     Ok(())
 }

@@ -98,6 +98,7 @@ pub async fn run_api_server(
     audit_log: Arc<AuditLog>,
     join: Arc<JoinHandler>,
     scheduler: Arc<TaskScheduler>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -113,7 +114,10 @@ pub async fn run_api_server(
     let listener = tokio::net::TcpListener::bind(&config.api.listen_addr).await?;
     tracing::info!("Manager REST API listening on {}", config.api.listen_addr);
 
-    axum::serve(listener, app).await?;
+    // Bug U — graceful shutdown: existing connections finish, no new ones accepted.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 

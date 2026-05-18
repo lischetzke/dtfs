@@ -14,6 +14,27 @@ RestartSec=5
 LimitNOFILE=65535
 LimitMEMLOCK=infinity
 
+# Bug U — graceful shutdown window. On `systemctl stop` we SIGTERM the
+# process; the dtfs-data signal handler then drains the in-flight write
+# semaphore (up to 30s) before exiting. Give systemd 45s of slack on top
+# so a chunk write to a slow USB disk doesn't get SIGKILL'd. After the
+# timeout systemd does send SIGKILL — that's the safety valve.
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+SendSIGKILL=yes
+
+# Bug G/V — cooperative memory budget. cgroup v2 MemoryHigh asks the
+# kernel to reclaim pages cooperatively (slow down the process to give
+# it time to free RAM) before MemoryMax hard-caps and risks OOM. The
+# operator should set MemoryHigh = 90% of MemoryMax = data.toml's
+# hard_cap_mb. Operators can override via a drop-in:
+#   /etc/systemd/system/dtfs-data.service.d/memory.conf
+# Default unset — composite-host operators must opt in.
+# Example for a 2 GB data role on toro-plex:
+#   [Service]
+#   MemoryHigh=1800M
+#   MemoryMax=2048M
+
 # Security hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
