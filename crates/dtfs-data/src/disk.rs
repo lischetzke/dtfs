@@ -70,16 +70,33 @@ impl DiskManager {
     /// If this node has no disk of the requested tier (common in 3-DC
     /// topologies where DC-B/C nodes are warm-only and DC-A nodes are
     /// hot+cold), fall back to whichever healthy disk has the most free
-    /// space. The placement engine has already decided this node should
-    /// hold a replica; we honour that decision rather than rejecting the
-    /// write. Tier semantics still drive cluster-wide placement, just not
-    /// per-disk on each node.
+    /// space.
+    ///
+    /// Bug AD — re-stat each candidate disk's free space at selection
+    /// time. `used_bytes` is only set at startup via `DiskManager::new`,
+    /// so once a disk fills up, manager view never updates and selection
+    /// keeps picking the same full disk. Symptom: `data-primary01`'s
+    /// cold-4 disk filled to 100% while cold-1/2/3 stayed at 2%. Every
+    /// subsequent put_chunk failed with ENOSPC, FUSE unlinked the file,
+    /// and the cluster appeared "broken" with no migrations running.
+    /// `statvfs` is cheap (~1 µs); calling it 1–4 times per put_chunk
+    /// is acceptable.
     pub fn select_disk_for_tier(&self, tier: DiskTier) -> Option<&ManagedDisk> {
+        let live_free = |d: &ManagedDisk| -> u64 {
+            let (total, used) = get_disk_usage(&d.mount_path);
+            if total == 0 {
+                // statvfs failed — fall back to cached value
+                d.total_bytes.saturating_sub(d.used_bytes)
+            } else {
+                total.saturating_sub(used)
+            }
+        };
+
         let exact = self
             .disks
             .iter()
             .filter(|d| d.tier == tier && d.status == DiskStatus::Healthy)
-            .max_by_key(|d| d.total_bytes.saturating_sub(d.used_bytes));
+            .max_by_key(|d| live_free(d));
         if exact.is_some() {
             return exact;
         }
@@ -89,7 +106,7 @@ impl DiskManager {
         self.disks
             .iter()
             .filter(|d| d.status == DiskStatus::Healthy)
-            .max_by_key(|d| d.total_bytes.saturating_sub(d.used_bytes))
+            .max_by_key(|d| live_free(d))
     }
 
     /// Get all managed disks.
