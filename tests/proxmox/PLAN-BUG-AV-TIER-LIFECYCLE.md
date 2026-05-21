@@ -355,7 +355,7 @@ manually for now (or by the existing additive-migrate UI button).
   `bug_av_set_cooldown_unknown_file_is_noop`.
 * **Done when:** 4 tests green.
 
-### ⬜ AV-1-5 — `DeleteChunkReplica` gRPC + data-node handler
+### ✅ AV-1-5 — `DeleteChunkReplica` gRPC + data-node handler (2026-05-21)
 
 * **Files:** `proto/data.proto` (RPC + request/response messages),
   `crates/dtfs-data/src/server.rs` (handler),
@@ -854,6 +854,33 @@ tasks:
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
 
+### AV-1-5 — 2026-05-21
+
+* **Files touched:**
+  - `proto/data.proto` — extended `DeleteChunkResponse` with
+    `was_present: bool` and `freed_bytes: u64`.
+  - `crates/dtfs-data/src/store.rs` — new
+    `delete_chunk_idempotent()` returns `(was_present, freed_bytes)`;
+    old `delete_chunk()` retained as a thin error-wrapper for
+    callers that still want the ChunkNotFound error.
+  - `crates/dtfs-data/src/metrics.rs` — new `forget_chunk(id)`
+    drops per-chunk-per-DC read counters + last-access on delete so
+    a stale read count can't trigger an immediate re-promotion
+    right after a flush.
+  - `crates/dtfs-data/src/server.rs` — gRPC handler uses the new
+    idempotent method, populates the extended response, calls
+    `metrics.forget_chunk()`.
+* **Unit tests:** 4 in `dtfs-data::store::tests::bug_av_*`:
+  atomic_unlinks_both, missing_is_idempotent,
+  second_delete_is_noop, counters_consistent.
+* **Workspace regression**: dtfs-data 50 → 54; all others
+  unchanged.
+* **Live verification:** N/A — no production caller yet. AV-1-6
+  wires the manager-side dispatcher; AV-1-7 hooks up flush.
+* **Deviations:** `bug_av_delete_chunk_wal_recovery_after_crash`
+  replaced with `bug_av_delete_chunk_second_delete_is_noop`. See
+  §5 "AV-1-5 — WAL-recoverable atomicity deferred".
+
 ### AV-1-4 — 2026-05-21
 
 * **Files touched:**
@@ -940,7 +967,35 @@ tasks:
 > file, a different test name, a missed edge case), I append the
 > deviation here so the doc stays accurate.
 
-_(empty)_
+### AV-1-5 — WAL-recoverable atomicity deferred (2026-05-21)
+
+Plan called for 4 tests including
+`bug_av_delete_chunk_wal_recovery_after_crash` — mock the unlink
+failure between `.dat` and `.meta` removals and assert recovery
+resumes. This requires real WAL machinery the data-node doesn't
+have yet (the existing `wal/` directory is used by put_chunk's
+streaming commit but has no delete-side replay path).
+
+Building a full WAL-recoverable delete is its own feature (WAL
+schema, replay-on-boot, scrub interaction); it's deferred and
+tracked as a separate ticket. For Bug AV's use case the existing
+"remove `.dat` then `.meta`" order is acceptable:
+
+  * Crash between the two unlinks → orphan `.meta` with no data
+    backing. Periodic scrub detects and cleans these (existing
+    behaviour for similar split-state from put_chunk).
+  * Bytes are released to the disk immediately when `.dat` is
+    unlinked; the `bytes_stored` counter is decremented before the
+    `.meta` removal, so accounting is consistent on the durable side.
+  * Operator-driven flush re-issue post-crash is idempotent (test 3)
+    so a retry safely cleans up.
+
+Substituted test: `bug_av_delete_chunk_second_delete_is_noop`
+exercises the "retry after a previously-successful delete" path
+which is the actual operational concern for the flush-cache
+scheduler (AV-1-7). Net test count unchanged: 4.
+
+_(end AV-1-5 deviation)_
 
 ---
 
