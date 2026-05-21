@@ -95,6 +95,35 @@ local_cache_max_gb = 100
 
 ---
 
+## `[write]` -- Write-Path Preferences (Bug AV)
+
+Controls how the FUSE client requests chunk placement at write time. Combined with the manager's anchor-lag-repair pass (AV-3-3), this lets operators trade durability latency for throughput on slow uplinks.
+
+| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
+|--------|-----------|------|---------|-------------|-------------|-------------|
+| `first_write_tier` | `write.first_write_tier` | `string` | `"cold"` | `"cold"`, `"nearest-warm"` | No (restart FUSE) | Tier preference for first-chunk placement. `"cold"` (default) blocks the ACK on the mandatory cold (anchor) copy — slower in DCs with slow uplinks to the anchor DC but no anchor-lag window. `"nearest-warm"` places the first chunk on a warm-tier node in the client's own DC and ACKs immediately; the manager's anchor-lag-repair pass (AV-3-3) schedules the mandatory cold copy asynchronously within one tiering tick (default 5 min). Any unrecognised value falls back to `"cold"` for forward-compat safety. |
+
+### Example
+
+```toml
+[write]
+first_write_tier = "nearest-warm"
+```
+
+### When to use `"nearest-warm"`
+
+* **Fresh-download landing zones** — the NRB Plexmedia DC has a 1 Gbps uplink and the operator wants torrent finishes to ACK in seconds, not block on the 40 Mbps LELI anchor link. The anchor copy lands asynchronously.
+* **Office writes** — small frequent edits where the warm-tier SSD in the user's own DC is the fastest target; the cold anchor copy can lag by a tick.
+
+### When to keep the default `"cold"`
+
+* **Compliance / DR workloads** — the write must be durably on the anchor before the application sees ACK. The anchor-lag window is a real durability gap; `"cold"` closes it.
+* **Tiny clusters without a fast warm tier** — picking the wrong tier just adds a hop.
+
+> See [Tiering → Promotion math](../storage/tiering.md#promotion-math) for what happens *after* the first chunk lands. The anchor-lag repair fires from the manager's normal tiering tick, so the cold copy typically lands within one tick interval.
+
+---
+
 ## `[partition_safety]` -- Network Partition Behavior
 
 Controls how the FUSE client behaves when it loses contact with the manager cluster (network partition or quorum loss).

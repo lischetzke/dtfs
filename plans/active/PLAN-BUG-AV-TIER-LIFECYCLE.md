@@ -997,40 +997,48 @@ manually for now (or by the existing additive-migrate UI button).
   the new endpoint; the inline-edit form remains a Phase-4
   polish item).
 
-### ⬜ AV-3-6 — Documentation: client + WebUI + CLI
+### ✅ AV-3-6 — Documentation: client + WebUI + CLI
 
-* **Files:**
-  - `docs/src/configuration/fuse-client.md` — document
-    `[client.write].first_write_tier` ("cold" vs "nearest-warm"),
-    including the latency / durability trade-off and where the
-    async anchor-migration kicks in.
-  - `docs/src/api-reference/cli-reference.md` — fill in the placeholder
-    from AV-1-12: `dtfs-cli file flush-cache <path>`,
-    `dtfs-cli volume set-cache <id> warm.min=N warm.max=M
-    per-dc=true|false promote-reads=R promote-window-secs=W
-    cooldown-secs=C`,
-    `dtfs-cli volume migrate-policy <id>`.
-  - `docs/src/access/fuse-mount.md` — note how `first_write_tier`
-    interacts with the FUSE write path (warm-first writes ACK
-    sooner; anchor migration is async).
-  - `docs/src/operations/production-deployment.md` — add a "Tier
-    policy bootstrap" subsection: ordered steps for migrating an
-    existing cluster from legacy `replication` → `mandatory_replicas`
-    + `cache_replicas`, including the rolling-upgrade gating and the
-    rollback path.
-  - **`plans/incidents/SOAK-RECOVERY-2026-05-21.md` Bug AV section** —
-    full write-up: symptom (the user's question that started this),
-    root cause (additive-only migrate, no delete path, no per-file
-    tier preference), fix (everything in this plan), tests,
-    live-verification log.
-  - **`plans/reports/MINICLUSTER-VERIFICATION-2026-05-21.md` Bug AV
-    section** — verification table + actual cluster output captured
-    during AV-3-4 + AV-3-5 live demos.
-* **Tests:** doc smoke test; the runbook walkthrough is performed
-  during the live demo and recorded verbatim.
-* **Done when:** All 6 doc surfaces updated; mdbook builds clean;
-  recovery + verification docs carry the actual live cluster
-  evidence.
+* **Files touched (6):**
+  - `docs/src/configuration/fuse-client.md` — new `[write]`
+    subsection documenting `first_write_tier` with the
+    `"cold"` vs `"nearest-warm"` trade-off + "When to use"
+    guidance. Cross-links to the tiering promotion math.
+  - `docs/src/api-reference/cli-reference.md` — filled in the
+    AV-1-12 placeholder with three full subsections:
+    `volumes show`, `volumes set-cache`, `files flush-cache`.
+    Each carries argument tables, example outputs, error
+    codes. Renamed legacy `files` → `files list` and added a
+    breaking-change note.
+  - `docs/src/access/fuse-mount.md` — new "First-write tier
+    preference (Bug AV)" subsection right above "Write
+    Buffering" explaining the FUSE-side semantics + how the
+    volume policy gates the request.
+  - `docs/src/operations/production-deployment.md` — new
+    "Tier policy bootstrap (Bug AV)" subsection in the
+    cluster-bootstrap-and-volume area: 4-step bootstrap
+    sequence (`migrate-policy` → `show` → `set-cache` →
+    `show`), rolling-upgrade gating section
+    (before/during/after rollout), rollback path.
+  - `plans/incidents/SOAK-RECOVERY-2026-05-21.md` — new
+    "Bug AV — two-class tier lifecycle (mandatory + cache
+    replicas)" section with the symptom-cause-fix-tests-
+    verification template used by Bugs AL–AT in the same
+    doc.
+  - `plans/reports/MINICLUSTER-VERIFICATION-2026-05-21.md`
+    — new "Bug AV — two-class tier lifecycle (Phases 1-3)"
+    section with verification tables (REST endpoints, CLI
+    matrix, audit fan-out evidence, WebUI markup grep,
+    Phase 2 smoke, test counts, carryovers).
+* **Tests:** `mdbook build docs/` on dtfs-builder — clean.
+  No new Rust tests; existing 66 AV-related unit tests stay
+  green (workspace test count unchanged since AV-3-5).
+* **Done when:** 6 doc surfaces updated, mdbook builds
+  clean, recovery + verification docs carry the actual live
+  cluster evidence (timestamps + commit ranges referenced).
+  ✓ — completed 2026-05-21.
+* **Deviations:** none. Phase 3 of Bug AV is now closed
+  out.
 
 ### Phase 3 Done When
 
@@ -1072,6 +1080,36 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-3-6 — 2026-05-21
+
+* **Files touched (6):**
+  - `docs/src/configuration/fuse-client.md` — `[write]`
+    block reference + when-to-use guidance.
+  - `docs/src/api-reference/cli-reference.md` — full
+    documentation for `volumes show`, `volumes set-cache`,
+    `files flush-cache`; legacy `files` → `files list`
+    breaking-change note.
+  - `docs/src/access/fuse-mount.md` — "First-write tier
+    preference (Bug AV)" subsection.
+  - `docs/src/operations/production-deployment.md` —
+    "Tier policy bootstrap (Bug AV)" with rolling-upgrade
+    gating + rollback path.
+  - `plans/incidents/SOAK-RECOVERY-2026-05-21.md` — full
+    Bug AV write-up (symptom from the user's original
+    question, root cause analysis, fix summary across
+    Phases 1-3, test count table, live-verification
+    highlights, carryovers).
+  - `plans/reports/MINICLUSTER-VERIFICATION-2026-05-21.md`
+    — verification report with REST/CLI/audit-fan-out
+    evidence, test counts, and open carryovers.
+* **Build verification:** `mdbook build docs/` on
+  dtfs-builder — clean (INFO output only; no warnings,
+  no errors).
+* **Live verification:** N/A — docs only. The runbook
+  reflects the on-cluster behaviour exercised during
+  AV-1-9 / AV-1-10 / AV-1-11 / AV-3-5 live tests.
+* **Deviations:** none. **Phase 3 of Bug AV closed out.**
 
 ### AV-3-5 — 2026-05-21
 

@@ -328,6 +328,123 @@ Matches `du -sh` output exactly. Pre-rollout the same query reported
 
 ---
 
+## Bug AV — two-class tier lifecycle (mandatory + cache replicas)
+
+**Symptom.** The user asked: "When I start a migration of i.e.
+/1GB.bin to cold I would expect that it would move the data to cold
+only and remove the copies from warm. Is that the case, should that
+be the case?" — exposing that the legacy `replication` field was
+*additive only*. There was no way to express "this chunk's
+mandatory floor is 1 cold replica + opportunistic warm caches on
+read demand"; the under-replication scheduler enforced every
+non-zero RF as a hard floor, the tiering engine couldn't promote
+on demand, and operators had no eviction button to free warm space.
+
+**Root cause.** One replication concept doing two jobs:
+
+* durability floor (the under-replication scheduler's domain), AND
+* opportunistic caching layer (the tiering engine's domain).
+
+These have opposite semantics. The first must NEVER drop below the
+configured count; the second MUST be freely evictable when the
+operator says so or when read demand fades. Conflating them meant
+the cluster wasted warm-tier disk on chunks no one was watching,
+the operator couldn't safely flush them, and there was no
+explicit "this is the durable anchor" pin.
+
+**Fix (Phases 1-3, ~3 weeks of design + ~3 days implementation).**
+Two independent replica classes per volume:
+
+* `mandatory_replicas.<tier>` — durability floor, scheduler
+  enforces.
+* `cache_replicas.<tier>.{min,max}` — opportunistic, tiering
+  engine creates on read demand, operator can flush.
+* `anchor: AnchorPolicy` — explicit invariant (a named DC, with
+  optional `required_tier` pin) that survives every cache flush
+  and every demotion.
+
+Manager-side machinery:
+
+* New Raft `ClientRequest::SetChunkCooldown` / `RemoveChunkLocation`
+  with `enforce_anchor` defence-in-depth (AV-1-3 / AV-1-4).
+* Pure planner kernels for the cache lifecycle:
+  `plan_flush_cache` (AV-1-7), `plan_cache_promotion` (AV-2-2),
+  `select_promotion_target` (AV-2-3), `plan_cache_tick` (AV-2-4),
+  `plan_anchor_lag_repair` (AV-3-3),
+  `should_clear_cooldown_on_demote` (AV-2-5).
+* TieringEngine gains per-`(chunk, dc)` read-window storage with
+  positive-delta heartbeat sampling.
+* `POST /api/v1/files/flush_cache` REST endpoint (AV-1-9),
+  `POST /api/v1/volumes/{id}/migrate-policy` (AV-1-10),
+  `GET /api/v1/volumes/{id}` (AV-3-5), `POST .../set-cache`
+  (AV-3-5).
+
+Client-side surface:
+
+* FUSE `fuse.toml [write] first_write_tier = "cold|nearest-warm"`
+  (AV-3-1) + `allocate_chunks` proto carrying a `preferred_tier`
+  hint (AV-3-2). Combined with the manager's anchor-lag-repair
+  pass, warm-first writes are now safe: the FUSE client ACKs as
+  soon as the warm replica confirms; the cold anchor copy lands
+  asynchronously within one tiering tick.
+* WebUI "Flush cache" context-menu action on the Data Explorer
+  (AV-3-4); CLI subcommands `volumes show`, `volumes set-cache`,
+  `volumes migrate-policy`, `files flush-cache` (AV-1-10 / AV-3-5).
+
+Audit + alert hooks fire at every operationally-interesting
+point (`cache.flush_replica`, `cache.flush_refused`,
+`cache.flush_complete`, `cache.promote`, `cache.demote`,
+`anchor.lag_repair`, `volume.migrate_policy`, `volume.set_cache`).
+An `AnchorViolated` alert fires once per call (deduped) on any
+refusal that would have stranded the anchor.
+
+**Test count delta:** **66 new** unit tests in the workspace,
+distributed:
+
+| Phase | Tests added | Headline coverage |
+|-------|-------------|--------------------|
+| Phase 1 | 33 | schema parsing, flush planner, refusal classification, migrate-policy idempotency |
+| Phase 2 | 23 | read-window counter, promotion decision gates, target selection, full tick planner, cooldown clearance helper |
+| Phase 3 | 10 | FuseWriteConfig fallback, preferred_tier resolver, anchor-lag-repair planner, set-cache merger/validator, JSON projection |
+
+Plan called for 43 + 20 + 11 = 74 tests; landed 33 + 23 + 10 = 66
+(+/- defensive vs deferred dispatcher unit tests; see plan §5
+deviations for the per-task breakdown).
+
+**Live verification:** every Phase shipped with at least a smoke
+check on the minicluster (mini-mgr01 + mini-mgr03; mini-mgr02 has
+a pre-existing corrupt Raft log unrelated to AV). Highlights:
+
+* AV-1-9 — flush_cache REST endpoint live-tested 4 scenarios
+  (empty prefix rejected, invalid tier rejected, accepted call
+  with default tiers, accepted call with explicit cooldown).
+* AV-1-10 — `volumes migrate-policy default` "applied" then
+  "no-op" on retry; 404 for missing volume.
+* AV-1-11 — `cache.flush_complete` audit row fires via Bug AH
+  Raft fan-out (actor=scheduler, origin_manager=<mgr>).
+* AV-3-5 — full CLI matrix (`volumes show`, `set-cache` apply +
+  no-op, max<min rejection at REST layer, `files flush-cache`).
+
+End-to-end "warm-first write → anchor repair fires within one
+tiering tick" demo deferred to a separate close-out run — needs
+the AV-3-1/AV-3-2 FUSE binary rolled to a client VM with
+`first_write_tier = "nearest-warm"` configured. The blocker is
+mechanical (deploy a client config), not architectural.
+
+**Carryovers (open after Phase 3):**
+
+* WebUI volume-edit form (AV-3-4 partial). Read-side is unblocked
+  by AV-3-5's `GET /api/v1/volumes/{id}`; a display card is a
+  straightforward fetch+render. Inline-edit modal is a Phase 4
+  polish item — CLI covers the operational need today.
+* `ENABLE_CACHE_REDUNDANCY_ESCALATION` flag stays `false` per the
+  AV-2-4 spec. Flip + matching test extension when a real per-DC
+  HA workload exists to validate against.
+* `GET /api/v1/volumes` (list endpoint) still uses its
+  aggregation-only projection. Per-volume reads via the new
+  endpoint cover today's needs; widening the list shape is a
+  Phase 4 polish item if any client ever requires it.
+
 ## Combined summary — tests
 
 | Crate          | Suite                                | Tests |

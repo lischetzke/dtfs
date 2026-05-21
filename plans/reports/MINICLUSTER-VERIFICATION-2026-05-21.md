@@ -149,6 +149,136 @@ correct via `/api/v1/files` + `/api/v1/nodes` queries:
 
 **PASS** on all five WebUI fixes.
 
+## Bug AV — two-class tier lifecycle (Phases 1-3)
+
+Verified live during the AV implementation push on 2026-05-21
+(commits c939625…a650113, AV-1-8 through AV-3-5). Manager binaries
+rolled to mini-mgr01 and mini-mgr03 between each Phase; mini-mgr02
+remained on a corrupt Raft log throughout (pre-existing,
+unrelated). Quorum of 2/3 sufficient for every test.
+
+### REST endpoints (Phases 1 + 3)
+
+| Endpoint | Status | Live evidence |
+|----------|--------|---------------|
+| `POST /api/v1/files/flush_cache` (AV-1-9) | ✅ | 4 scenarios: empty prefix → 400; invalid tier → 400; default tiers/cooldown → 200 with replicas_dropped=0 (legacy default volume has warm-as-mandatory, planner skips correctly); explicit cooldown_secs=300 → 200, echo confirms. |
+| `POST /api/v1/volumes/{id}/migrate-policy` (AV-1-10) | ✅ | "applied" first run; "no-op (already migrated)" on retry; HTTP 404 for missing volume. |
+| `GET /api/v1/volumes/{id}` (AV-3-5) | ✅ | Returns full JSON projection: mandatory_replicas, cache_replicas (all subfields), anchor with required_tier. |
+| `POST /api/v1/volumes/{id}/set-cache` (AV-3-5) | ✅ | Partial update merges correctly; idempotent re-apply → "no-op"; `--warm-min 5 --warm-max 1` → HTTP 400 "warm tier: max < min". |
+
+### CLI (AV-1-10 + AV-3-5)
+
+```
+$ dtfs-cli --manager http://mini-mgr01:9402 volumes show default
+Volume: default
+Name:   default
+Chunk size:  4194304 bytes
+Legacy replication:  hot=0 warm=2 cold=1 tape=1
+Mandatory replicas:  hot=0 warm=2 cold=1 tape=1
+Cache replicas:
+  warm: min=1 max=1
+  hot:  min=0 max=0
+  per_dc:               true
+  promote_reads:        2
+  promote_window_secs:  60
+  cooldown_secs:        300
+Anchor:  dc=dc-a required_tier=any
+
+$ dtfs-cli ... volumes set-cache default --warm-min 1 --warm-max 1 \
+    --per-dc true --promote-reads 2 --promote-window-secs 60 --cooldown-secs 300
+Volume 'default' set-cache: applied
+  warm: min=1 max=1
+  …
+
+$ dtfs-cli ... files flush-cache /movies/ --cooldown-secs 60
+flush-cache prefix=/movies/ tiers=["warm"] cooldown=60s
+  files_matched     = 7
+  chunks_examined   = 4
+  replicas_dropped  = 0
+  mandatory_refusals = 0
+  unreachable_nodes = 0
+  rpc_failures      = 0
+  raft_failures     = 0
+```
+
+### Audit fan-out (AV-1-11)
+
+Triggered `POST /api/v1/files/flush_cache` and queried the audit
+log on a different manager (mini-mgr03) via the AV-1-9-completed
+Bug AH replicated audit path:
+
+```
+$ curl -s "http://mini-mgr03:9402/api/v1/audit?action=cache.flush_complete&limit=5"
+[
+  {
+    "action": "cache.flush_complete",
+    "actor": "scheduler",
+    "origin_manager": "mini-mgr01",
+    "result": "success",
+    "summary": "cache.flush_complete: prefix=/movies/ replicas_dropped=0 mandatory_refusals=0 [mini-mgr01]",
+    "target": "prefix=/movies/ replicas_dropped=0 mandatory_refusals=0",
+    "timestamp": 1779362733
+  }
+]
+```
+
+Proves the new dispatcher audit code path actually fires, traverses
+Raft fan-out, and is queryable from any manager.
+
+### WebUI (AV-3-4)
+
+* `GET /ui/explorer` rendered with the new "Flush cache" context-
+  menu entries (4 occurrences for folder + file + parent + modal
+  labels) and the `submitFlushCache` JS handler (2 occurrences:
+  function definition + `onclick`).
+* `flush-modal` HTML present with the expected form fields
+  (path_prefix, cache_tiers select, cooldown_secs numeric,
+  allow_empty_prefix safety gate).
+* Volume-edit form was deferred (see plan § 5 deviations); the
+  read-side endpoint added by AV-3-5 unblocks a follow-up
+  display card.
+
+### Phases 2 + 3 dispatcher smoke (AV-2-4, AV-2-5, AV-3-3)
+
+Binaries rolled cleanly after every commit; tiering engine logs
+`Tiering engine started (evaluation interval: 3600s)`; no panics
+across mini-mgr01 and mini-mgr03 over ~1 h of monitoring. Full
+write-→-promote and idle-→-demote end-to-end demo deferred to a
+later run because exercising it requires AV-3-1/3-2-aware FUSE
+binaries on a client VM (the manager-side machinery is verified
+in unit tests + smoke).
+
+### Workspace test count (cumulative across Bug AV)
+
+| Phase | Tests added | Crate landings |
+|-------|-------------|----------------|
+| Phase 1 (AV-1-1 to AV-1-12) | 33 | dtfs-common +2, dtfs-data +4, dtfs-raft +12, dtfs-manager +15 |
+| Phase 2 (AV-2-1 to AV-2-6) | 23 | dtfs-manager +23 |
+| Phase 3 (AV-3-1 to AV-3-5) | 10 | dtfs-common +3, dtfs-manager +6, ad-hoc +1 |
+
+Total: **66 net new tests**. Plan estimated 43 + 20 + 11 = 74; the
+delta is recorded per-task in the plan's verification log under §
+4, with deferred dispatcher-unit tests substituted by pure planner
+tests (per the AV-1-6 / AV-1-7 convention).
+
+### Carryovers from Bug AV after Phase 3
+
+* WebUI volume-edit form (AV-3-4 partial). Read-side is unblocked
+  by AV-3-5's `GET /api/v1/volumes/{id}`; a display card is a
+  straightforward fetch+render. Inline-edit modal is Phase 4
+  polish.
+* `ENABLE_CACHE_REDUNDANCY_ESCALATION` flag stays `false` per the
+  AV-2-4 spec. Flip is Phase 4 follow-up.
+* End-to-end write-→-promote demo deferred until the
+  AV-3-1/AV-3-2 FUSE binary is deployed to a client VM in the
+  minicluster (next session).
+
+**PASS** on all REST + CLI + audit fan-out + WebUI markup
+verifications. The two end-to-end demos remaining (Phase 2
+promotion+demotion + Phase 3 warm-first write+anchor repair) are
+gated on rolling the new FUSE client binary, which is a
+mechanical follow-up.
+
 ## Summary
 
 All 9 bug fixes from 2026-05-21 (AL–AT) verified live + 1 follow-up
