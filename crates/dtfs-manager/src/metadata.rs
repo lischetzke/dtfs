@@ -703,17 +703,46 @@ impl ManagerService for MetadataService {
         // this lets Plexmedia (hot=0, warm=2, cold=1) work without
         // hard-coding Hot. The anchor enforcement happens in
         // `place_chunks_with_anchor` via the hash-ring rule.
+        //
+        // Bug AV (AV-3-2) — if the client provided a `preferred_tier`
+        // hint AND a healthy node with that tier exists in the
+        // cluster, honour the hint and place a single first-chunk
+        // replica on that tier. The anchor migration to cold (if
+        // needed) happens asynchronously via AV-3-3's
+        // `check_anchor_lag` pass.
         let volume_cfg = data.volumes.get(&req.volume_id).cloned();
+        let available_tiers: Vec<DiskTier> = {
+            // DiskTier doesn't impl Ord (and adding it ripples through
+            // the workspace), so dedup via HashSet then collect.
+            let set: std::collections::HashSet<DiskTier> = data
+                .nodes
+                .values()
+                .filter(|n| n.health == dtfs_common::types::HealthStatus::Healthy)
+                .flat_map(|n| n.disks.iter().map(|d| d.tier))
+                .collect();
+            set.into_iter().collect()
+        };
         let (effective_tier, effective_rf, anchor_dc) = match &volume_cfg {
             Some(v) => {
-                let (tier, rf) = pick_effective_tier(&v.replication);
+                let (tier, rf) = resolve_preferred_tier(
+                    &req.preferred_tier,
+                    &v.replication,
+                    &available_tiers,
+                );
                 (tier, rf, v.anchor_datacenter.clone())
             }
-            None => (
-                DiskTier::Hot,
-                self.config.defaults.replication.hot.max(1),
-                self.config.defaults.anchor_datacenter.clone(),
-            ),
+            None => {
+                let (tier, rf) = resolve_preferred_tier(
+                    &req.preferred_tier,
+                    &self.config.defaults.replication,
+                    &available_tiers,
+                );
+                (
+                    tier,
+                    rf.max(self.config.defaults.replication.hot.max(1)),
+                    self.config.defaults.anchor_datacenter.clone(),
+                )
+            }
         };
         let replication = effective_rf.max(1).min(data.nodes.len() as u32);
 
@@ -1235,6 +1264,54 @@ pub(crate) fn pick_effective_tier(
     }
 }
 
+/// Bug AV (AV-3-2) — parse the client-supplied `preferred_tier`
+/// hint string to a `DiskTier`. Returns `None` for the empty
+/// string (legacy clients) or any unrecognised value (forward-
+/// compat: a future client adds a new tier name).
+pub(crate) fn parse_preferred_tier_hint(
+    hint: &str,
+) -> Option<dtfs_common::types::DiskTier> {
+    use dtfs_common::types::DiskTier;
+    match hint {
+        "" => None,
+        "hot" => Some(DiskTier::Hot),
+        "warm" => Some(DiskTier::Warm),
+        "cold" => Some(DiskTier::Cold),
+        "tape" => Some(DiskTier::Tape),
+        _ => None,
+    }
+}
+
+/// Bug AV (AV-3-2) — pure-function resolution of the
+/// `preferred_tier` hint into a concrete `(tier, replication)`
+/// pair. The placement engine uses this output instead of
+/// `pick_effective_tier` for the first-chunk allocation.
+///
+/// Resolution rules:
+/// 1. Empty or unknown hint → `pick_effective_tier(legacy_replication)`
+///    (existing behaviour).
+/// 2. Hint matches a tier that's actually available on a healthy
+///    node in the cluster (per `available_tiers`) → honour the
+///    hint and return `(tier, 1)`. RF is 1 because the
+///    first-chunk placement on a non-mandatory tier is a single
+///    cache replica; the volume's anchor-lag-repair (AV-3-3) +
+///    under-replication scheduler add any further replicas
+///    asynchronously.
+/// 3. Hint refers to a tier with no healthy nodes → fall back
+///    to `pick_effective_tier` so the write doesn't fail.
+pub(crate) fn resolve_preferred_tier(
+    hint: &str,
+    legacy_replication: &dtfs_common::types::TierReplication,
+    available_tiers: &[dtfs_common::types::DiskTier],
+) -> (dtfs_common::types::DiskTier, u32) {
+    if let Some(tier) = parse_preferred_tier_hint(hint) {
+        if available_tiers.contains(&tier) {
+            return (tier, 1);
+        }
+    }
+    pick_effective_tier(legacy_replication)
+}
+
 #[cfg(test)]
 #[allow(unused_imports)]
 mod bug_z_tier_tests {
@@ -1275,6 +1352,82 @@ mod bug_z_tier_tests {
             tape: 0,
         };
         assert_eq!(pick_effective_tier(&rep), (DiskTier::Cold, 2));
+    }
+}
+
+#[cfg(test)]
+mod bug_av_preferred_tier_tests {
+    //! AV-3-2 — pure tests for `resolve_preferred_tier`. Verifies
+    //! the hint resolution gates: honour-when-available, fall-
+    //! back-when-not-available, empty-hint uses pick_effective_tier.
+    use super::*;
+    use dtfs_common::types::{DiskTier, TierReplication};
+
+    fn plex_rep() -> TierReplication {
+        // Plexmedia-shape: cold mandatory, warm/hot 0.
+        TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 }
+    }
+
+    /// AV-3-2 test 1 — hint="warm" + a healthy warm node exists →
+    /// honour the hint, return `(Warm, 1)`.
+    #[test]
+    fn bug_av_allocate_chunks_honours_preferred_tier() {
+        let avail = vec![DiskTier::Cold, DiskTier::Warm];
+        let (tier, rf) = resolve_preferred_tier("warm", &plex_rep(), &avail);
+        assert_eq!(tier, DiskTier::Warm);
+        assert_eq!(rf, 1, "first-chunk on cache tier places exactly 1 replica");
+    }
+
+    /// AV-3-2 test 2 — hint="warm" but no healthy warm node →
+    /// fall back to `pick_effective_tier` (Cold for Plexmedia).
+    #[test]
+    fn bug_av_allocate_chunks_falls_back_when_tier_full() {
+        // "tier full" in the operator sense = no node has that tier
+        // available (the placement-engine handles per-disk fullness;
+        // resolver only sees tier availability).
+        let avail = vec![DiskTier::Cold];
+        let (tier, rf) = resolve_preferred_tier("warm", &plex_rep(), &avail);
+        assert_eq!(tier, DiskTier::Cold);
+        assert_eq!(rf, 1, "Plexmedia cold rf=1");
+    }
+
+    /// AV-3-2 test 3 — empty hint → legacy behaviour
+    /// (pick_effective_tier).
+    #[test]
+    fn bug_av_allocate_chunks_empty_hint_uses_default() {
+        let avail = vec![DiskTier::Cold, DiskTier::Warm, DiskTier::Hot];
+        let (tier, rf) = resolve_preferred_tier("", &plex_rep(), &avail);
+        assert_eq!(tier, DiskTier::Cold,
+            "Plexmedia (hot=0, warm=0, cold=1) picks Cold by default");
+        assert_eq!(rf, 1);
+    }
+
+    /// AV-3-2 defensive — unknown hint string falls back to
+    /// volume default (forward-compat: a future client adds
+    /// a new tier name).
+    #[test]
+    fn bug_av_allocate_chunks_unknown_hint_falls_back() {
+        let avail = vec![DiskTier::Cold, DiskTier::Warm];
+        let (tier, rf) = resolve_preferred_tier("nearest-warm", &plex_rep(), &avail);
+        // "nearest-warm" is what `fuse.toml` carries but the proto
+        // protocol uses the bare tier names — sending the raw config
+        // string here is treated as unknown.
+        assert_eq!(tier, DiskTier::Cold, "unknown hint → pick_effective_tier");
+        assert_eq!(rf, 1);
+    }
+
+    /// AV-3-2 defensive — parse_preferred_tier_hint covers every
+    /// recognised tier + empty + unknown.
+    #[test]
+    fn bug_av_parse_preferred_tier_hint_coverage() {
+        assert_eq!(parse_preferred_tier_hint(""), None);
+        assert_eq!(parse_preferred_tier_hint("hot"), Some(DiskTier::Hot));
+        assert_eq!(parse_preferred_tier_hint("warm"), Some(DiskTier::Warm));
+        assert_eq!(parse_preferred_tier_hint("cold"), Some(DiskTier::Cold));
+        assert_eq!(parse_preferred_tier_hint("tape"), Some(DiskTier::Tape));
+        assert_eq!(parse_preferred_tier_hint("banana"), None);
+        assert_eq!(parse_preferred_tier_hint("Hot"), None,
+            "case-sensitive: protocol values are lowercase");
     }
 }
 

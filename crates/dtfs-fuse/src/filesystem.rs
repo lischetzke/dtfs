@@ -1435,10 +1435,26 @@ impl DtfsFilesystem {
             .find_volume_id_for_path(path)
             .unwrap_or_else(|| "default".to_string());
 
+        // Bug AV (AV-3-2) — translate the FUSE write config to a
+        // proto-friendly tier hint. `Cold` keeps the legacy
+        // behaviour (empty string = "no preference, use volume
+        // default"); `NearestWarm` sends `"warm"` so the manager
+        // honours the hint if a healthy warm node exists in the
+        // client's DC.
+        let preferred_tier: &str = match self.config.write.effective_first_write_tier() {
+            dtfs_common::config::FirstWriteTier::Cold => "",
+            dtfs_common::config::FirstWriteTier::NearestWarm => "warm",
+        };
+
         // Request placements from the manager.
         let alloc_response = self
             .client
-            .allocate_chunks(path, segments.len() as u32, &volume_id)
+            .allocate_chunks_with_hint(
+                path,
+                segments.len() as u32,
+                &volume_id,
+                preferred_tier,
+            )
             .await
             .with_context(|| format!("allocate_chunks failed for {path}"))?;
 
