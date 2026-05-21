@@ -915,4 +915,32 @@ mod bug_av_types_tests {
         let v = vc_base();
         assert!(v.effective_anchor().is_none());
     }
+
+    /// AV-1-8 — under-replication scheduler uses
+    /// `effective_mandatory_replicas()`. When the operator sets
+    /// `mandatory_replicas` to the typical AV pattern (cold=1, warm=0,
+    /// hot=0), the effective RF for warm is 0 — meaning the
+    /// under-replication scheduler will NOT try to maintain warm
+    /// replicas. Warm replicas are instead owned by the tiering
+    /// engine (cache_replicas in Phase 2).
+    ///
+    /// This test guards the integration point: same volume queried
+    /// for both warm and cold returns the new-mandatory values, NOT
+    /// the legacy `replication.warm=2`.
+    #[test]
+    fn bug_av_under_replication_ignores_cache_tiers() {
+        let mut v = vc_base();
+        // Legacy replication says warm=2 — pre-AV scheduler would
+        // try to maintain 2 warm copies.
+        v.replication = TierReplication { hot: 0, warm: 2, cold: 1, tape: 0 };
+        // New mandatory says cold=1 only — warm is a cache tier
+        // and shouldn't be auto-filled by under-replication.
+        v.mandatory_replicas = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+        let eff = v.effective_mandatory_replicas();
+        assert_eq!(eff.for_tier(DiskTier::Cold), 1, "cold mandatory");
+        assert_eq!(eff.for_tier(DiskTier::Warm), 0,
+            "warm not mandatory → under-replication scheduler stays out");
+        assert_eq!(eff.for_tier(DiskTier::Hot),  0);
+        assert_eq!(eff.for_tier(DiskTier::Tape), 0);
+    }
 }

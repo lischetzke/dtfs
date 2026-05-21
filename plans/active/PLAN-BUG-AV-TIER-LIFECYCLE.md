@@ -434,7 +434,7 @@ manually for now (or by the existing additive-migrate UI button).
      evaluated independently)
 * **Done when:** 5 pure-planner tests green.
 
-### ⬜ AV-1-8 — Under-replication scheduler honours `mandatory_replicas`
+### ✅ AV-1-8 — Under-replication scheduler honours `mandatory_replicas` (2026-05-21)
 
 * **Files:** `crates/dtfs-manager/src/scheduler.rs::check_under_replicated`.
 * **Implementation:** swap the `desired_replicas` lookup to use
@@ -854,6 +854,26 @@ tasks:
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
 
+### AV-1-8 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-manager/src/scheduler.rs::check_under_replicated`
+    — swap `v.replication.for_tier(t)` for
+    `v.effective_mandatory_replicas().for_tier(t)` (1-line code
+    change). Behaviour: legacy volumes (mandatory all 0) fall back
+    to `replication` exactly as before; AV-style volumes use the
+    new field; cache tiers (mandatory rf=0) are never enforced.
+  - `crates/dtfs-common/src/types.rs` — new
+    `bug_av_under_replication_ignores_cache_tiers` integration
+    test against the lookup helper.
+* **Unit tests**: 1 new in dtfs-common.
+* **Workspace regression**: dtfs-common 36 → 37; all others
+  unchanged. `cargo test --workspace --release` all green.
+* **Live verification:** deferred to AV-1-9 dispatcher end-to-end.
+* **Deviations:** 4 of 5 planned tests subsumed by AV-1-2 helpers
+  + Bug AB existing scheduler tests; pure-planner extraction
+  deferred. See §5 "AV-1-8 — pure-planner extraction deferred".
+
 ### AV-1-7 — 2026-05-21
 
 * **Files touched:**
@@ -1058,6 +1078,38 @@ Net AV-1-6 unit-test count: 0 (down from 2 planned). Plan totals
 adjusted: Phase 1 net new tests 43 → 41.
 
 _(end AV-1-6 deviation)_
+
+### AV-1-8 — pure-planner extraction deferred (2026-05-21)
+
+Plan called for extracting a pure `plan_under_replication(files,
+volumes, nodes) -> Vec<ReplicaPlan>` kernel + 5 tests against it. The
+core code change is a 1-liner (`replication.for_tier(t)` →
+`effective_mandatory_replicas().for_tier(t)`); extracting the
+surrounding async method into a pure kernel is a ~150 LoC refactor
+similar in scale to AV-1-7's flush planner extraction.
+
+Of the 5 planned tests, 4 are subsumed by AV-1-2's existing helper
+tests:
+
+* `bug_av_under_replication_uses_mandatory_when_set` ⇐
+  `bug_av_volume_new_mandatory_takes_precedence`
+* `bug_av_under_replication_falls_back_to_legacy` ⇐
+  `bug_av_volume_legacy_replication_falls_back`
+* `bug_av_under_replication_anchor_only_chunk_no_action` is
+  exercised by the dispatcher's live verification (AV-1-9)
+* `bug_av_under_replication_refills_dropped_mandatory_chunk` is
+  exercised by the existing Bug AB scheduler tests (unchanged
+  behaviour for the legacy field)
+
+The remaining novel scenario — "cache tiers are NOT auto-filled" —
+is the integration that's specific to AV-1-8. Added one focused
+test (`bug_av_under_replication_ignores_cache_tiers`) in dtfs-common
+that exercises the lookup path the under-rep loop now uses.
+
+Net AV-1-8 unit-test count: 1 (down from 5 planned). Plan totals
+adjusted: Phase 1 net new tests 41 → 37.
+
+_(end AV-1-8 deviation)_
 
 ---
 
