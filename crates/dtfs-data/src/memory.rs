@@ -8,7 +8,7 @@
 // `put_chunk` refuses new writes with `RESOURCE_EXHAUSTED` so the kernel
 // pushes back through TCP instead of letting the buffer keep growing.
 //
-// Design summary (see also `tests/proxmox/SOAK-RECOVERY-2026-05-18.md`
+// Design summary (see also `plans/incidents/SOAK-RECOVERY-2026-05-18.md`
 // bug G):
 //
 //  * `hard_cap_mb = 0` → unbounded (no backpressure, no recommendation).

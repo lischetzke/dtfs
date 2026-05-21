@@ -14,8 +14,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
-repository = "https://github.com/leduc/dtfs2"
+license = "AGPL-3.0"
+repository = "https://github.com/lischetzke/dtfs"
 
 [workspace.dependencies]
 # Async runtime

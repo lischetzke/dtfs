@@ -287,7 +287,7 @@ impl ChunkStore {
     // final chunk path and write the .meta sidecar. Peak memory per
     // concurrent write is bounded by the gRPC piece size (~1 MB)
     // instead of one full chunk (~128 MB). See
-    // tests/proxmox/SOAK-RECOVERY-2026-05-18.md.
+    // plans/incidents/SOAK-RECOVERY-2026-05-18.md.
     // -----------------------------------------------------------------------
 
     /// Reserve a tmp file path on the disk this tier will write to. The
@@ -1355,7 +1355,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // Bug I — stream put_chunk to disk so peak memory is ~1 MB / write
     // instead of one full chunk (~128 MB). See
-    // tests/proxmox/SOAK-RECOVERY-2026-05-18.md.
+    // plans/incidents/SOAK-RECOVERY-2026-05-18.md.
     // -----------------------------------------------------------------------
 
     /// Bug I — caller streams bytes to a tmp file, ChunkStore commits

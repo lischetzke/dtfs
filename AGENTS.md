@@ -1,4 +1,4 @@
-# AGENTS.md — Operating Discipline for AI Agents on DTFS2
+# AGENTS.md — Operating Discipline for AI Agents on DTFS
 
 This file complements [CLAUDE.md](./CLAUDE.md). CLAUDE.md tells an
 agent **what** to know about this codebase (target workload,
@@ -15,12 +15,140 @@ AGENTS.md is mandatory.
 
 ---
 
+## Fixing Procedure
+
+Every bug fix — no matter how small — follows this three-step
+procedure. It is the contract every contributor (human or AI) agrees
+to when working on DTFS, and it is referenced from [README.md](./README.md#contribution).
+
+1. **Write a test that fails because of the issue.** Put the test in
+   the purest layer that demonstrates the bug — see
+   [§ 4](#4-test-discipline) for where each kind of test lives. If
+   the surface only manifests on a live cluster, the failing
+   "test" is a shell regression script under
+   `tests/proxmox/abuse/NN-name.sh`. Either way, **run it and
+   observe the failure** before writing any fix code.
+2. **Implement the fix.** Make the smallest change that turns the
+   failing test green; do not bundle unrelated cleanup or scope
+   creep.
+3. **Verify the fix works.** Run the new test (must now pass), the
+   surrounding crate's test suite (no regressions), and — if the
+   bug is operational — live-verify on the lab cluster per
+   [CLAUDE.md § 4](./CLAUDE.md#4-test-first-workflow-non-negotiable).
+   Quote the failing-then-passing run in the commit body.
+
+Skipping any step makes the fix unverifiable; landing it anyway is
+a contract violation. This procedure applies to all contributors,
+AI or human — see [Use of AI](#use-of-ai) below.
+
+---
+
+## Use of AI
+
+AI is allowed and encouraged on this project. DTFS is **primarily
+authored by Claude Opus**. Any AI agent — and any human using one —
+contributing code or documentation **must follow every rule defined
+in this file**, including:
+
+- The [Fixing Procedure](#fixing-procedure) above for every bug fix.
+- The [plan-driven workflow](#1-plan-driven-workflow) (§ 1) for
+  every non-trivial change.
+- The [commit discipline](#3-commit-discipline) (§ 3), including
+  the `Co-Authored-By:` trailer naming the model used.
+- The [test discipline](#4-test-discipline) (§ 4).
+
+If a tool's default behaviour conflicts with a rule in this file,
+this file wins. If the user issues an instruction in the current
+session that conflicts with a rule, the user wins — but flag the
+conflict so AGENTS.md can be updated (see [§ 8](#8-updating-agentsmd))
+rather than silently drifting. AI-generated commits that bypass the
+fixing procedure or the plan-driven workflow will be reverted.
+
+---
+
+## Structure Discipline
+
+Where a file lives is part of its meaning. The repository layout
+encodes who reads each artefact, when, and against which acceptance
+bar. Drift on this is corrosive — it is why work in flight ends up
+indistinguishable from a fix landed six months ago. These rules are
+mandatory:
+
+| Artefact | Canonical location | Notes |
+|---|---|---|
+| In-flight work plan | `plans/active/PLAN-<id>-<name>.md` | One per non-trivial change. See [§ 1](#1-plan-driven-workflow). |
+| Finished plan | `plans/completed/<YYYY-MM-DD>-PLAN-<id>-<name>.md` | `git mv` when every task is ✅ verified. |
+| Post-mortem (SOAK-RECOVERY, INTEGRITY-AUDIT, …) | `plans/incidents/` | Write-once; documents what we did and why. |
+| Lab campaign / fix-report artefact | `plans/reports/` | Historical record only — no live state. |
+| User-visible release note | `changelog/UNRELEASED.md` | One line per change, **same commit** as the code. See [`changelog/README.md`](./changelog/README.md). |
+| Architecture / config / ops reference | `docs/src/...` (mdBook) | Update in the same commit as behaviour changes (CLAUDE.md § 11). |
+| Code | `crates/<crate>/src/...` | New crates require a `Cargo.toml` workspace member entry. |
+| Protobuf | `proto/<file>.proto` | Rebuild `dtfs-proto` after every edit. |
+| Unit tests | inline `#[cfg(test)]` modules | Pure helpers, state-machine apply paths, aggregators. |
+| Integration / shell tests | `tests/integration/`, `tests/proxmox/abuse/NN-name.sh` | Cluster-level behaviour, numbered. |
+| Test inventories / provisioning scripts | `tests/proxmox/{ansible,soak,*.json,*.sh,*.ps1}` | Test infrastructure. |
+| Operator scripts | `scripts/` | Repeatable operator-facing tooling. |
+| Deployment surface | `deploy/` | Docker Compose, sample configs, systemd units. |
+| Open-issue tracker | `ISSUES_TO_FIX.md` (repo root) | Status of known gaps. Linked from CLAUDE.md. |
+| Agent operating discipline | `AGENTS.md` (this file) | Updated alongside discipline changes (§ 8). |
+| Codebase knowledge for agents | `CLAUDE.md` | Architecture, invariants, file map, bug catalog. |
+
+What **does not** belong anywhere except these paths:
+
+- A new plan placed under `tests/proxmox/PLAN-*.md` or similar.
+  That layout is historical; all new plans go to `plans/active/`.
+- A "Project status / PROGRESS" file checked in at the repo root.
+  `git log`, the changelog, and the plans are the status sources.
+  Historical snapshot reports live under `plans/reports/`.
+- Loose `*.md` notes scattered through `crates/` or `tests/`. If
+  the note describes work, it belongs in `plans/`; if it describes
+  a user-visible change, in `changelog/`; if it documents a
+  subsystem, in `docs/`.
+- A new top-level directory invented to host an artefact that
+  already has a home in the table above.
+
+Edge cases:
+
+- **A doc that is both a plan *and* a post-mortem** (a plan that
+  morphed into a recovery write-up): keep it in `plans/active/`
+  while the work is in flight, then move it to `plans/incidents/`
+  on completion. Leave a one-line breadcrumb in `plans/completed/`
+  if downstream readers expect to find it there.
+- **A code comment that points to a plan or incident**: use the
+  full `plans/active/...` or `plans/incidents/...` path. Update
+  these in the same commit that moves the file (`git grep` is
+  the tool of last resort, not first).
+- **A new artefact type that doesn't fit the table**: update this
+  table in the same commit that introduces the artefact. Adding a
+  row is cheaper than letting a one-off live somewhere ambiguous.
+
+When in doubt, prefer `plans/reports/` for historical artefacts and
+`docs/` for forward-looking reference. Never invent a new top-level
+directory without first updating this table.
+
+---
+
 ## 1. Plan-driven workflow
 
 Before writing code for a non-trivial change, **write a plan
-document**. Default location: `tests/proxmox/PLAN-<id>-<short-name>.md`
-(matches the existing `Bug A`-prefixed-ID convention; can be relocated
-when the bug catalog moves).
+document**. **All plans live under `plans/`** — this is the canonical
+location and is mandatory for new plans:
+
+- `plans/active/PLAN-<id>-<short-name>.md` — in-progress plans.
+- `plans/completed/<completion-date>-PLAN-<id>-<short-name>.md` —
+  finished plans, moved here once every task is ✅ verified.
+- `plans/incidents/` — post-mortem write-ups (SOAK-RECOVERY,
+  INTEGRITY-AUDIT style).
+- `plans/reports/` — historical lab / fix-campaign reports.
+
+See [`plans/README.md`](./plans/README.md) for the directory's
+naming and lifecycle rules. Legacy plans previously under
+`tests/proxmox/PLAN-*.md`, `tests/proxmox/SOAK-RECOVERY-*.md`,
+`tests/proxmox/INTEGRITY-AUDIT-*.md`, `tests/proxmox/FIX-REPORT-*.md`,
+etc. have been migrated into `plans/`; **do not put plans, reports,
+or post-mortems under `tests/` again** — that tree is for test
+infrastructure only (`abuse/`, `ansible/`, `soak/`, inventories,
+provisioning scripts).
 
 The plan **must** include:
 
@@ -176,7 +304,7 @@ For Bug AV (the in-flight feature at time of writing), the
 discipline produces:
 
 ```
-tests/proxmox/PLAN-BUG-AV-TIER-LIFECYCLE.md  (the plan)
+plans/active/PLAN-BUG-AV-TIER-LIFECYCLE.md  (the plan)
   ├─ § 0 Background, decisions
   ├─ § 1 Data-model schema
   ├─ § 2 Phase plan + 24 tasks (AV-1-1 .. AV-3-6)
@@ -202,19 +330,29 @@ order.
 
 ## 7. Cross-reference
 
+* **[README.md](./README.md)** — project overview, deployment
+  warning, contribution rules, AI-use policy. Points back here for
+  the procedural details.
 * **[CLAUDE.md](./CLAUDE.md)** — codebase-specific knowledge: target
   workload, architecture, file map, integrity invariants, memory
   model, bug catalog.
-* **`tests/proxmox/PLAN-<id>-*.md`** — feature-specific plan
-  documents. One per non-trivial work item.
-* **`tests/proxmox/SOAK-RECOVERY-*.md`** — incident-style write-ups
-  after the fact (symptom → root cause → fix → verification). The
-  plan covers *what we're about to do*; the recovery doc covers
-  *what we just did and why*.
+* **`plans/active/PLAN-<id>-*.md`** — feature-specific plan
+  documents currently in flight. One per non-trivial work item.
+* **`plans/completed/`** — finished plans, archived once every task
+  is ✅ verified.
+* **`plans/incidents/SOAK-RECOVERY-*.md`**, **`plans/incidents/INTEGRITY-AUDIT-*.md`** —
+  incident-style write-ups after the fact (symptom → root cause →
+  fix → verification). The plan covers *what we're about to do*;
+  the incident doc covers *what we just did and why*.
+* **`plans/reports/`** — historical lab-campaign and fix-report
+  artefacts.
+* **`changelog/UNRELEASED.md`** — accumulator for the next release.
+  Add a one-line entry per user-visible change in the same commit;
+  see [`changelog/README.md`](./changelog/README.md).
 * **AGENTS.md** (this file) — the operating discipline that ties the
   above together.
 
-All four are read together by any AI agent starting work on a
+All of these are read together by any AI agent starting work on a
 non-trivial change. The user is the final arbiter when AGENTS.md
 and the plan conflict; the plan is the arbiter when the plan and
 the code conflict.

@@ -1137,7 +1137,7 @@ fn parent_of(path: &str) -> String {
 /// Cookie that fuse3 emits for the directory entry at position `idx`
 /// (0-based). Used by BOTH `readdir` and `readdirplus`. The two paths
 /// MUST use the same scheme — see Bug F in
-/// `tests/proxmox/SOAK-RECOVERY-2026-05-18.md`. If readdir emitted a
+/// `plans/incidents/SOAK-RECOVERY-2026-05-18.md`. If readdir emitted a
 /// different cookie for the same idx, the kernel would assemble two
 /// distinct dirents for the same name and `ls` would show duplicates.
 #[inline]
