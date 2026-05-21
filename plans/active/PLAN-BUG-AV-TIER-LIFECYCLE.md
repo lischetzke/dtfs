@@ -950,16 +950,52 @@ manually for now (or by the existing additive-migrate UI button).
   gap is closed (likely in AV-3-5 to share the same JSON
   shape work), the WebUI form lands as a follow-up to AV-3-5.
 
-### ⬜ AV-3-5 — CLI: `dtfs-cli file flush-cache <path>` + `dtfs-cli volume set-cache <id>`
+### ✅ AV-3-5 — CLI: `files flush-cache` + `volumes set-cache` + `volumes show` (+ AV-1-10 projection)
 
-* **Files:** `crates/dtfs-cli/src/main.rs`.
-* **Implementation:** thin wrappers over the new API endpoints.
-* **Tests:** `bug_av_cli_file_flush_cache_invokes_api` (mock-http
-  unit), `bug_av_cli_volume_set_cache_parses_args`.
-* **Done when:** 2 tests + minicluster: `dtfs-cli volume set-cache
-  default warm=1 per-dc=true promote-reads=2 promote-window-secs=60
-  cooldown-secs=300` succeeds; `dtfs-cli file flush-cache
-  /movies/Season-1/` succeeds.
+* **Files:** `crates/dtfs-manager/src/api.rs`,
+  `crates/dtfs-cli/src/main.rs`. Two new REST endpoints + three
+  new CLI subcommands; the CLI changes the legacy `dtfs-cli
+  files` → `dtfs-cli files list` (breaking) to make room for
+  `files flush-cache`. **Closes the AV-1-10 carryover** by
+  adding `GET /api/v1/volumes/{id}` returning the full
+  VolumeConfig JSON projection (mandatory_replicas +
+  cache_replicas + anchor).
+* **Implementation:**
+  - REST: `GET /api/v1/volumes/{id}` returns
+    `volume_config_to_json(cfg)` — the new pure helper that
+    projects every AV field. `POST .../set-cache` accepts a
+    partial `SetCacheRequest` (every field `Option<_>`); the
+    pure `apply_set_cache(current, req)` helper merges the
+    update, validates `max >= min` per tier, and returns the
+    new VolumeConfig for the dispatcher to Raft-write.
+    No-op when current == new.
+  - CLI: `dtfs-cli volumes show <id>` renders a table of every
+    new field; `dtfs-cli volumes set-cache <id> [--warm-min N
+    ...]` patches the policy with one-flag-per-field clap
+    arguments; `dtfs-cli files flush-cache <path>
+    [--cache-tiers warm,hot] [--cooldown-secs N]` posts to the
+    AV-1-9 endpoint. Both honour `--format json` for scripting.
+* **Tests (5 green, dtfs-manager):**
+  - `bug_av_set_cache_merges_partial_update`
+  - `bug_av_set_cache_rejects_max_less_than_min`
+  - `bug_av_set_cache_empty_request_is_noop`
+  - `bug_av_volume_config_json_includes_av_fields`
+  - `bug_av_volume_config_json_anchor_none_is_null` (defensive)
+* **Done when:** 5 tests + live verification (all 6 scenarios
+  green): volumes show, set-cache apply, re-show confirms,
+  idempotent re-apply returns no-op, max<min returns 400, and
+  files flush-cache returns a clean report. ✓
+* **Deviations:** the plan called for `bug_av_cli_file_flush_
+  cache_invokes_api` / `bug_av_cli_volume_set_cache_parses_args`
+  unit tests against a mock HTTP backend. Per the convention
+  established by AV-1-6 / AV-1-9, axum handler + CLI HTTP
+  client are live-only in this crate. Pure helpers
+  (`apply_set_cache`, `volume_config_to_json`) carry the
+  unit-test load. **Closes AV-1-10 carryover** (REST
+  projection of the new fields). **Closes AV-3-4 carryover**
+  partially (the WebUI can now `fetch` per-volume policy via
+  the new endpoint; the inline-edit form remains a Phase-4
+  polish item).
 
 ### ⬜ AV-3-6 — Documentation: client + WebUI + CLI
 
@@ -1036,6 +1072,65 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-3-5 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-manager/src/api.rs` — new routes
+    `GET /api/v1/volumes/{id}` (full projection) and
+    `POST .../set-cache` (partial update); two new pure
+    helpers `volume_config_to_json(cfg)` and
+    `apply_set_cache(current, req)`; new
+    `SetCacheRequest` body type with every field optional.
+  - `crates/dtfs-cli/src/main.rs` — `Files` command promoted
+    to subcommand enum (`FilesCmd::List` / `FlushCache`);
+    `VolumesCmd` gains `Show` and `SetCache`. New helpers
+    `cmd_volumes_show`, `cmd_volumes_set_cache`,
+    `cmd_files_flush_cache`. **Breaking change:** the
+    legacy `dtfs-cli files --limit 50` is now `dtfs-cli
+    files list --limit 50`.
+* **Unit tests** (`cargo test -p dtfs-manager bug_av_set_cache`):
+  5 green:
+  - `bug_av_set_cache_merges_partial_update`
+  - `bug_av_set_cache_rejects_max_less_than_min`
+  - `bug_av_set_cache_empty_request_is_noop`
+  - `bug_av_volume_config_json_includes_av_fields`
+  - `bug_av_volume_config_json_anchor_none_is_null` (defensive)
+* **Workspace regression**: dtfs-manager 99 → 104; all
+  other crates unchanged. `cargo test --workspace --release`
+  all green.
+* **Build hiccup:** initial test factory included a
+  `tiering: None` field on `VolumeConfig` that doesn't
+  exist. Removed; `mandatory_replicas: {0,0,0,0}` exercises
+  the legacy-fallback path in the helper.
+* **Live verification** on minicluster (binaries rolled
+  2026-05-21 ~12:18 UTC), 6 scenarios all pass:
+  1. `volumes show default` renders every AV field
+     (mandatory cold=1, no cache yet, anchor `dc-a`).
+  2. `volumes set-cache default --warm-min 1 --warm-max 1
+     --per-dc true --promote-reads 2 --promote-window-secs
+     60 --cooldown-secs 300` → "applied" + dump of the new
+     cache_replicas.
+  3. Re-show confirms the policy is applied.
+  4. `volumes set-cache --warm-min 1 --warm-max 1` again →
+     "no-op".
+  5. `volumes set-cache --warm-min 5 --warm-max 1` → HTTP
+     400 (max < min rejected at REST layer).
+  6. `files flush-cache /movies/ --cooldown-secs 60` →
+     dispatcher report (files_matched=7,
+     replicas_dropped=0 — current minicluster has every
+     warm replica as mandatory under the AV-1-10 migrate,
+     so the planner correctly skips).
+* **Carryovers closed by this commit:**
+  - **AV-1-10** — `/api/v1/volumes/{id}` projection now
+    exposes the AV fields. The list endpoint
+    (`GET /api/v1/volumes`) still uses its
+    aggregation-only shape (breaking the list shape would
+    require a coordinated WebUI/CLI update; deferred).
+  - **AV-3-4** — partially closed: the WebUI can now
+    `fetch` per-volume policy via the new endpoint, so a
+    follow-up display card is straightforward. The
+    inline-edit form remains a Phase 4 polish item.
 
 ### AV-3-4 — 2026-05-21
 
@@ -1785,67 +1880,50 @@ adjusted: Phase 1 net new tests 37 → 33.
 
 _(end AV-1-9 deviation)_
 
-### AV-1-10 — `/api/v1/volumes` JSON projection gap (carryover) (2026-05-21)
+### AV-1-10 — `/api/v1/volumes` JSON projection gap (✅ RESOLVED in AV-3-5, 2026-05-21)
 
 AV-1-10's migrate-policy helper correctly populates
-`mandatory_replicas` on the state machine (proven by Test B's
-idempotent re-run returning `no-op (already migrated)`), but the
+`mandatory_replicas` on the state machine, but the
 `GET /api/v1/volumes` list endpoint still serialises only the
-legacy `replication` block. The new `mandatory_replicas`,
-`cache_replicas`, and `anchor` fields are stored but not
-projected on the read side.
+legacy `replication` block.
 
-Folded into AV-1-12 (REST API doc), but the doc only **flagged**
-the gap — the actual `list_volumes_handler` projection was not
-broadened in this Phase. The REST API doc carries an inline
-"Bug AV note" pointing at this plan as the tracked follow-up.
+**Resolved by AV-3-5**: new `GET /api/v1/volumes/{id}` endpoint
+projects the full VolumeConfig including `mandatory_replicas`,
+`cache_replicas`, and `anchor`. Driven by the pure helper
+`volume_config_to_json(&VolumeConfig)` (5 unit tests cover the
+shape). The list endpoint
+(`GET /api/v1/volumes`) intentionally still uses its
+aggregation-only shape — broadening it would require a
+coordinated WebUI/CLI bump; per-volume reads through the new
+endpoint cover the operator's need.
 
-Three reasons to track centrally:
-* future agents reading the plan must know the projection is
-  incomplete before treating list endpoint output as canonical;
-* WebUI rendering of cache/anchor state needs this endpoint to
-  carry the data;
-* a Phase 3 CLI command (`dtfs-cli volumes show <id>`) will
-  surface the same gap and is the natural place to broaden the
-  projection at the same time.
+A residual sub-task — "broaden the list-endpoint JSON to match
+the per-volume shape" — is a Phase 4 polish item if any client
+ever needs it; today the CLI (`dtfs-cli volumes show <id>`)
+and WebUI (planned card) both prefer the per-volume endpoint.
 
-**Disposition:** carryover to Phase 3 (folded into AV-3-5 CLI
-surface work, since the CLI consumes this endpoint). If the JSON
-shape change becomes risky to bundle with AV-3-5, split into a
-standalone AV-1-13 ticket.
+_(end AV-1-10 deviation — resolved)_
 
-_(end AV-1-10 deviation)_
-
-### AV-3-4 — WebUI volume-edit form deferred (2026-05-21)
+### AV-3-4 — WebUI volume-edit form (PARTIALLY RESOLVED in AV-3-5, 2026-05-21)
 
 AV-3-4's plan called for both a "Flush cache" context-menu
-button on the Data Explorer AND a volume-edit card on the
-Volumes page (showing `mandatory_replicas` / `cache_replicas`
-/ `anchor` with an "Edit" button that posts to
-`PUT /api/v1/volumes/{id}`).
+button (shipped) and a volume-edit card on the Volumes page.
+The card was deferred pending the AV-1-10 projection gap.
 
-The flush button shipped. The volume-edit form is deferred
-for two reasons:
+**Partially resolved by AV-3-5**: the
+`GET /api/v1/volumes/{id}` endpoint added by AV-3-5 returns
+the full policy, so a WebUI read-only card is now a
+straightforward `fetch + render` follow-up. The inline-edit
+form (posting back to `PUT /api/v1/volumes/{id}`) is still
+outstanding — and the operator-facing alternative (CLI
+`volumes set-cache`) now exists, so the WebUI form is no
+longer on the critical path.
 
-1. **Read-side gap** — the `GET /api/v1/volumes` projection
-   still emits only the legacy `replication` block (AV-1-10
-   carryover above). Rendering a card around fields the
-   endpoint doesn't return would show all empty values.
-2. **Surface duplication** — the operator-facing channel for
-   setting cache policy in this codebase has historically
-   been the CLI (`dtfs-cli volume create`, AV-1-10's
-   `volume migrate-policy`, the planned AV-3-5 `volume
-   set-cache`). Most operators reach for the CLI first; the
-   WebUI's value-add for these settings is "show what's
-   configured", not "edit it inline".
+**Residual deferral:** WebUI volume detail card (read-only,
+~30 min of HTML/JS) + inline-edit modal (~2 h). Both are
+Phase 4 polish items; the CLI covers the operational need.
 
-**Disposition:** folded forward into AV-3-5. When that task
-broadens the `/api/v1/volumes` JSON projection to expose
-the AV fields (closing the AV-1-10 carryover), the WebUI
-read-only display card lands at the same time. The
-inline-edit form remains a Phase 4 polish item.
-
-_(end AV-3-4 deviation)_
+_(end AV-3-4 deviation — partially resolved)_
 
 ### AV-2-4 / AV-2-5 — Phase 2 live end-to-end demo deferred (2026-05-21)
 
