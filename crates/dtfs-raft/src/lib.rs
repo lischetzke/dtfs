@@ -354,6 +354,45 @@ pub enum ClientRequest {
     SweepExpiredLeases {
         now_ms: u64,
     },
+
+    // ---- Bug AU — refresh per-disk usage on each heartbeat ----
+
+    /// Bug AU — apply the live per-disk usage snapshot from a data
+    /// node heartbeat. Replaces `NodeInfo.disks[i].total_bytes` and
+    /// `used_bytes` for any disk_id present in the snapshot, leaving
+    /// other fields (uuid, mount_path, tier, status) untouched.
+    /// Snapshots that reference an unknown disk_id are dropped (the
+    /// disk may have been removed since the heartbeat was sent).
+    /// Without this command the per-disk view stayed at the
+    /// register-time values; aggregate node-level totals were updated
+    /// via `UpdateNodeUsage` but the per-disk breakdown surfaced by
+    /// `/api/v1/nodes` (Bug AR) was stale.
+    UpdateNodeDiskUsage {
+        node_id: u64,
+        per_disk: Vec<(u32, u64, u64)>, // (disk_id, total_bytes, used_bytes)
+    },
+
+    // ---- Bug AH — replicated audit log fan-out ----
+
+    /// Bug AH — append a per-manager local audit event into the cluster-wide
+    /// replicated audit log. Every manager's local `AuditLog::log()` call
+    /// submits one of these so `/api/v1/audit` returns the same view from
+    /// every voter (previously each manager only saw the events its own
+    /// process generated).
+    ///
+    /// `timestamp_ms` is supplied by the originator (NOT regenerated at
+    /// apply time) so the rendered ordering matches wall-clock at the
+    /// source. The state machine apply path stores both the structured
+    /// fields and a `summary` derived from `"{action}: {target}"` for
+    /// display in tools that only understand the legacy summary shape.
+    AppendAudit {
+        actor: String,
+        action: String,
+        target: String,
+        result: String,
+        origin_manager: String,
+        timestamp_ms: u64,
+    },
 }
 
 impl fmt::Display for ClientRequest {
@@ -435,6 +474,12 @@ impl fmt::Display for ClientRequest {
             ),
             Self::SweepExpiredLeases { now_ms } => {
                 write!(f, "SweepExpiredLeases(now_ms={now_ms})")
+            }
+            Self::AppendAudit { actor, action, target, .. } => {
+                write!(f, "AppendAudit({actor}, {action}, {target})")
+            }
+            Self::UpdateNodeDiskUsage { node_id, per_disk } => {
+                write!(f, "UpdateNodeDiskUsage(node={node_id}, {} disks)", per_disk.len())
             }
         }
     }

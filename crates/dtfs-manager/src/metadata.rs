@@ -417,6 +417,22 @@ impl ManagerService for MetadataService {
             })
             .await;
 
+        // Bug AU — refresh per-disk usage from the heartbeat so the
+        // Nodes-page disk table (Bug AR) tracks reality across the
+        // life of the data node. Drops cleanly when the data binary
+        // hasn't been upgraded yet (req.disk_usage empty → manager
+        // keeps the boot snapshot).
+        if !req.disk_usage.is_empty() {
+            let per_disk: Vec<(u32, u64, u64)> = req
+                .disk_usage
+                .iter()
+                .map(|d| (d.disk_id, d.total_bytes, d.used_bytes))
+                .collect();
+            let _ = self
+                .raft_write(ClientRequest::UpdateNodeDiskUsage { node_id, per_disk })
+                .await;
+        }
+
         let _ = self
             .raft_write(ClientRequest::UpdateNodeStatus {
                 node_id,

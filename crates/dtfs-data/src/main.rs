@@ -441,6 +441,18 @@ async fn manager_lifecycle(
             .collect();
 
         let io_snapshot = data_metrics.snapshot();
+        // Bug AU — live per-disk usage so the manager's per-disk view
+        // (Bug AR) tracks reality across heartbeats, not just at-boot.
+        let disk_usage: Vec<dtfs_proto::dtfs::manager::DiskUsageSnapshot> = chunk_store
+            .disk_manager()
+            .live_disk_usage()
+            .into_iter()
+            .map(|(id, total, used)| dtfs_proto::dtfs::manager::DiskUsageSnapshot {
+                disk_id: id,
+                total_bytes: total,
+                used_bytes: used,
+            })
+            .collect();
         let heartbeat = HeartbeatRequest {
             node_id: node_id.clone(),
             uptime_secs: uptime,
@@ -450,6 +462,7 @@ async fn manager_lifecycle(
             chunk_reads,
             total_bytes_read: io_snapshot.total_bytes_read,
             total_bytes_written: io_snapshot.total_bytes_written,
+            disk_usage,
         };
 
         // Bug O — after each heartbeat tick, drain any locally-quarantined

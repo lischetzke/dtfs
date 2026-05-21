@@ -267,8 +267,33 @@ async fn main() -> anyhow::Result<()> {
 
     // P0-8: persist audit entries to a daily-rotated JSONL archive so the
     // 10k-entry ring buffer doesn't silently drop history.
+    //
+    // Bug AH — opt-in fan-out: when `audit.replicate_via_raft = true` in
+    // manager.toml, every audit event ALSO gets proposed as a
+    // `ClientRequest::AppendAudit` Raft write so all managers see the
+    // same `/api/v1/audit` view. Default is OFF to make the initial
+    // rolling deploy safe: an older follower can't deserialize the new
+    // `AppendAudit` variant, so we wait until every voter is upgraded
+    // before flipping the flag. The local ring + JSONL archive always
+    // capture events for forensics regardless of the fan-out state.
     let audit_archive_dir = config.node.data_dir.join("audit");
-    let audit_log = Arc::new(AuditLog::new_with_archive(10_000, audit_archive_dir));
+    let audit_log = if config.audit.replicate_via_raft {
+        tracing::info!(
+            origin_manager = %config.node.hostname,
+            "Bug AH audit Raft fan-out ENABLED (replicate_via_raft=true)"
+        );
+        Arc::new(AuditLog::new_with_archive_and_fanout(
+            10_000,
+            audit_archive_dir,
+            raft.clone(),
+            config.node.hostname.clone(),
+        ))
+    } else {
+        tracing::info!(
+            "Bug AH audit Raft fan-out DISABLED (set [audit] replicate_via_raft=true after upgrading all voters)"
+        );
+        Arc::new(AuditLog::new_with_archive(10_000, audit_archive_dir))
+    };
 
     // P1-8: alert dispatcher (webhook sinks from config).
     let alert_dispatcher = Arc::new(alerts::AlertDispatcher::new(

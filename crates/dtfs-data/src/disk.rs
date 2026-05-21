@@ -114,6 +114,33 @@ impl DiskManager {
         &self.disks
     }
 
+    /// Bug AU — live (disk_id, total_bytes, used_bytes) snapshot per
+    /// configured disk. Each call statvfs's every disk independently of
+    /// the cached `ManagedDisk` record. The heartbeat loop pulls this
+    /// once per tick and ships the result to the manager so the per-disk
+    /// usage shown on the Nodes page (Bug AR) tracks reality instead of
+    /// the at-boot snapshot.
+    ///
+    /// Cheap: a single statvfs() per disk = ~1µs each, called at the
+    /// heartbeat interval (default 5s). statvfs failure → returns the
+    /// cached values so the API stays populated rather than reporting 0.
+    pub fn live_disk_usage(&self) -> Vec<(u32, u64, u64)> {
+        self.disks
+            .iter()
+            .map(|d| {
+                let (total, used) = get_disk_usage(&d.mount_path);
+                if total == 0 {
+                    // statvfs failed (umounted, permission denied, …);
+                    // fall back to the cached boot-time values so the
+                    // dashboard doesn't go to 0 on a transient glitch.
+                    (d.disk_id, d.total_bytes, d.used_bytes)
+                } else {
+                    (d.disk_id, total, used)
+                }
+            })
+            .collect()
+    }
+
     /// Get disks of a specific tier.
     pub fn disks_for_tier(&self, tier: DiskTier) -> Vec<&ManagedDisk> {
         self.disks.iter().filter(|d| d.tier == tier).collect()

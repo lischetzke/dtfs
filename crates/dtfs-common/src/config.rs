@@ -21,6 +21,47 @@ pub struct ManagerConfig {
     /// `#[serde(default)]` keeps existing configs loadable.
     #[serde(default)]
     pub alerts: AlertsConfig,
+    /// Bug AH — audit log replication settings.
+    #[serde(default)]
+    pub audit: AuditConfig,
+}
+
+/// Bug AH — audit log replication configuration.
+///
+/// The cluster's audit events default to local-per-manager storage to avoid
+/// breaking rolling upgrades: a leader on a new binary would propose
+/// `ClientRequest::AppendAudit` Raft entries that older follower binaries
+/// can't deserialize, leaving them stuck. Operator opt-in via
+/// `replicate_via_raft = true` should happen AFTER every manager is on
+/// the new code.
+///
+/// Deployment recipe:
+///   1. Rolling-deploy the new dtfs-manager binary to all voters with
+///      `replicate_via_raft = false` (the default). Each restart is safe.
+///   2. Verify every voter reports the new binary via /api/v1/raft/state.
+///   3. Edit /etc/dtfs/manager.toml on each voter to set
+///      `[audit] replicate_via_raft = true`.
+///   4. Rolling-restart again (or send SIGHUP if hot-reload is wired).
+///   5. Confirm `/api/v1/audit` returns the same view from any manager.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// When true, every `audit.log()` call also proposes a
+    /// `ClientRequest::AppendAudit` Raft write so the entry replicates
+    /// to every manager's state-machine `audit_log`. When false (the
+    /// default during the rolling-upgrade window), entries stay in the
+    /// per-manager local ring + JSONL archive.
+    #[serde(default)]
+    pub replicate_via_raft: bool,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            // SAFE DEFAULT: don't propose AppendAudit until operator
+            // confirms all managers are upgraded.
+            replicate_via_raft: false,
+        }
+    }
 }
 
 /// P1-8 alerts config.
