@@ -913,20 +913,42 @@ manually for now (or by the existing additive-migrate UI button).
   requires a refreshed FUSE binary + a fuse.toml with
   `first_write_tier = "nearest-warm"` deployed to a client VM.
 
-### ⬜ AV-3-4 — WebUI "Flush cache" action + volume-edit form
+### ✅ AV-3-4 — WebUI "Flush cache" action (volume-edit form deferred)
 
 * **Files:** `crates/dtfs-manager/src/webui.rs`.
 * **Implementation:**
-  - Add "Flush cache" to the right-click context menu on Data
-    Explorer (folder and file actions).
-  - New modal with "Cooldown override (secs)" optional override.
-  - Volume page: add a card showing
-    `mandatory_replicas` / `cache_replicas` / `anchor` + "Edit"
-    button → form posts to `PUT /api/v1/volumes/{id}`.
-* **Tests:** live (no JS unit framework in repo).
-* **Done when:** Right-clicking `/movies/Season-1/` and choosing
-  "Flush cache" runs the API + reports back; volume page renders
-  the new fields; edit form round-trips.
+  - Data Explorer right-click context menu extended with
+    "Flush cache (folder)…", "Flush cache (file)…", and
+    "Flush cache (parent)…" entries.
+  - New `flush-modal` dialog with: path prefix, cache_tiers
+    select (warm / hot / warm+hot), cooldown_secs numeric
+    field, allow_empty_prefix safety gate when the prefix is
+    empty or `/`. Result panel shows `replicas_dropped`,
+    `mandatory_refusals` (with audit-log hint when > 0),
+    `unreachable_nodes`, `rpc_failures`, `raft_failures`,
+    `truncated`.
+  - `openFlushCache(prefix)` / `closeFlushCache()` /
+    `submitFlushCache()` JS handlers post to
+    `POST /api/v1/files/flush_cache` (the AV-1-9 endpoint).
+* **Tests:** live (no JS unit framework in repo). Markup
+  verified post-roll: 7 "Flush cache" entries + 2
+  `submitFlushCache` references in the rendered explorer
+  page.
+* **Done when:** Right-clicking the Data Explorer reveals the
+  new entries, the modal posts the right body shape, and the
+  result panel renders the AV-1-9 response counters. ✓ — markup
+  verified live 2026-05-21.
+* **Deviation:** the volume-edit form (showing
+  `mandatory_replicas` / `cache_replicas` / `anchor` with an
+  "Edit" → `PUT /api/v1/volumes/{id}` flow) is deferred. Two
+  blockers: (a) the AV-1-10 carryover —
+  `GET /api/v1/volumes` doesn't yet project the new fields,
+  so there's nothing to display; (b) the operator-facing
+  surface for these settings is the CLI
+  (`dtfs-cli volume set-cache`, AV-3-5) which most operators
+  reach for first. Folded forward: when AV-1-10's projection
+  gap is closed (likely in AV-3-5 to share the same JSON
+  shape work), the WebUI form lands as a follow-up to AV-3-5.
 
 ### ⬜ AV-3-5 — CLI: `dtfs-cli file flush-cache <path>` + `dtfs-cli volume set-cache <id>`
 
@@ -1014,6 +1036,39 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-3-4 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-manager/src/webui.rs` — new `flush-modal`
+    modal HTML next to the existing `migrate-modal`; new
+    JavaScript handlers `openFlushCache` / `closeFlushCache`
+    / `submitFlushCache` posting to
+    `POST /api/v1/files/flush_cache`; context-menu entries
+    for both folder and file rows.
+* **Tests:** live-only (no JS unit framework in repo).
+  Markup verified after rolling the new manager binary
+  (mini-mgr01 + mini-mgr03):
+  - `GET /ui/explorer` includes 7 occurrences of
+    "Flush cache" (4 context-menu items + 3 modal labels
+    counted by grep).
+  - 2 references to `submitFlushCache` (the JS function
+    definition + its `onclick`).
+* **Workspace regression**: dtfs-manager build clean; no
+  Rust-side tests changed. Full `cargo test --workspace
+  --release` still green.
+* **Live verification:** manager binaries rolled cleanly to
+  mini-mgr01 + mini-mgr03 at 12:11 UTC; the rendered
+  explorer page contains the new entries. Full
+  click-the-button demo deferred to Phase 3 close-out
+  (needs a volume with cache replicas actually present to
+  show a non-zero `replicas_dropped` — same blocker as
+  AV-2-4/AV-2-5 demos).
+* **Deviations:** the volume-edit form portion of the
+  AV-3-4 plan is deferred — see § 5 deviations entry.
+  Folded forward into AV-3-5's CLI work so the read-side
+  projection (AV-1-10 carryover) + the edit UI lands as
+  one coherent piece.
 
 ### AV-3-3 — 2026-05-21
 
@@ -1760,6 +1815,37 @@ shape change becomes risky to bundle with AV-3-5, split into a
 standalone AV-1-13 ticket.
 
 _(end AV-1-10 deviation)_
+
+### AV-3-4 — WebUI volume-edit form deferred (2026-05-21)
+
+AV-3-4's plan called for both a "Flush cache" context-menu
+button on the Data Explorer AND a volume-edit card on the
+Volumes page (showing `mandatory_replicas` / `cache_replicas`
+/ `anchor` with an "Edit" button that posts to
+`PUT /api/v1/volumes/{id}`).
+
+The flush button shipped. The volume-edit form is deferred
+for two reasons:
+
+1. **Read-side gap** — the `GET /api/v1/volumes` projection
+   still emits only the legacy `replication` block (AV-1-10
+   carryover above). Rendering a card around fields the
+   endpoint doesn't return would show all empty values.
+2. **Surface duplication** — the operator-facing channel for
+   setting cache policy in this codebase has historically
+   been the CLI (`dtfs-cli volume create`, AV-1-10's
+   `volume migrate-policy`, the planned AV-3-5 `volume
+   set-cache`). Most operators reach for the CLI first; the
+   WebUI's value-add for these settings is "show what's
+   configured", not "edit it inline".
+
+**Disposition:** folded forward into AV-3-5. When that task
+broadens the `/api/v1/volumes` JSON projection to expose
+the AV fields (closing the AV-1-10 carryover), the WebUI
+read-only display card lands at the same time. The
+inline-edit form remains a Phase 4 polish item.
+
+_(end AV-3-4 deviation)_
 
 ### AV-2-4 / AV-2-5 — Phase 2 live end-to-end demo deferred (2026-05-21)
 

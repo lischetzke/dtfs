@@ -485,6 +485,45 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     </div>
 </div>
 
+<!-- ── Flush cache dialog (Bug AV — operator-driven cache eviction) ── -->
+<div id="flush-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeFlushCache()">
+    <div class="modal-card">
+        <h3>Flush cache replicas</h3>
+        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:1rem">
+            Drops every <em>cache</em>-class replica (warm/hot, depending on the volume policy)
+            for files under the path prefix and sets a per-chunk cooldown to prevent immediate
+            re-promotion. Mandatory replicas (the durable anchor) are preserved — any chunk
+            whose flush would strand the anchor is refused and audited.
+        </div>
+        <div class="modal-row">
+            <label>Path prefix</label>
+            <input id="fc-path" class="form-input" placeholder="/movies/Season 1/">
+        </div>
+        <div class="modal-row">
+            <label>Cache tiers to flush</label>
+            <select id="fc-tiers" class="form-input">
+                <option value="warm" selected>warm</option>
+                <option value="hot">hot</option>
+                <option value="warm,hot">warm + hot</option>
+            </select>
+        </div>
+        <div class="modal-row">
+            <label>Cooldown (seconds)</label>
+            <input id="fc-cooldown" class="form-input" type="number" min="0" step="60" value="300">
+        </div>
+        <div class="modal-row" id="fc-empty-row" style="display:none">
+            <label style="color:var(--warning)">
+                <input id="fc-allow-empty" type="checkbox"> Allow empty prefix (matches every file — destructive!)
+            </label>
+        </div>
+        <div class="modal-actions">
+            <button class="btn-secondary" onclick="closeFlushCache()">Cancel</button>
+            <button class="btn-primary"  onclick="submitFlushCache()" id="fc-submit">Flush cache</button>
+        </div>
+        <div id="fc-result" class="modal-result" style="display:none"></div>
+    </div>
+</div>
+
 <div class="footer">
     DTFS — Distributed Tiered Filesystem &nbsp;·&nbsp;
     <a href="/api/v1/cluster/status" style="color:var(--primary)">API</a> &nbsp;·&nbsp;
@@ -1411,11 +1450,14 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             ? [
                 {{ label: 'Open folder',           onClick: `explorerNavigate('${{safe}}')` }},
                 {{ label: 'Migrate this folder…',  onClick: `openMigrate('${{safe}}')` }},
+                {{ label: 'Flush cache (folder)…', onClick: `openFlushCache('${{safe}}')` }},
                 {{ label: 'Copy path',             onClick: `navigator.clipboard&&navigator.clipboard.writeText('${{safe}}')` }},
               ]
             : [
                 {{ label: 'Migrate this file…',    onClick: `openMigrate('${{safe}}')` }},
                 {{ label: 'Migrate parent folder…',onClick: `openMigrate('${{safeParent}}')` }},
+                {{ label: 'Flush cache (file)…',   onClick: `openFlushCache('${{safe}}')` }},
+                {{ label: 'Flush cache (parent)…', onClick: `openFlushCache('${{safeParent}}')` }},
                 {{ label: 'Copy path',             onClick: `navigator.clipboard&&navigator.clipboard.writeText('${{safe}}')` }},
               ];
         menu.innerHTML = items.map(it =>
@@ -1507,6 +1549,79 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                       ).join('\n')
                     : ''
                 );
+        }} catch (e) {{
+            result.className = 'modal-result error';
+            result.textContent = 'Request failed: ' + e;
+            submitBtn.disabled = false;
+        }}
+    }}
+
+    // ── Bug AV (AV-3-4) — Flush cache modal ──────────────────────────────────
+
+    function openFlushCache(prefix) {{
+        document.getElementById('fc-path').value = prefix || '';
+        document.getElementById('fc-tiers').value = 'warm';
+        document.getElementById('fc-cooldown').value = 300;
+        document.getElementById('fc-result').style.display = 'none';
+        document.getElementById('fc-result').textContent = '';
+        document.getElementById('fc-empty-row').style.display =
+            (prefix === '' || prefix === '/') ? 'block' : 'none';
+        document.getElementById('fc-allow-empty').checked = false;
+        document.getElementById('fc-submit').disabled = false;
+        document.getElementById('flush-modal').classList.remove('hidden');
+        document.getElementById('fc-path').focus();
+    }}
+
+    function closeFlushCache() {{
+        document.getElementById('flush-modal').classList.add('hidden');
+    }}
+
+    async function submitFlushCache() {{
+        const path        = document.getElementById('fc-path').value;
+        const tiersRaw    = document.getElementById('fc-tiers').value;
+        const cooldown    = parseInt(document.getElementById('fc-cooldown').value, 10);
+        const allowEmpty  = document.getElementById('fc-allow-empty').checked;
+        const result      = document.getElementById('fc-result');
+        const submitBtn   = document.getElementById('fc-submit');
+
+        submitBtn.disabled = true;
+        result.style.display = 'block';
+        result.className = 'modal-result';
+        result.textContent = 'Flushing…';
+
+        const body = {{
+            path_prefix: path,
+            cache_tiers: tiersRaw.split(','),
+            cooldown_secs: Number.isFinite(cooldown) ? cooldown : 300,
+            allow_empty_prefix: allowEmpty,
+        }};
+
+        try {{
+            const resp = await fetch('/api/v1/files/flush_cache', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify(body),
+            }});
+            const data = await resp.json();
+            if (!resp.ok) {{
+                result.className = 'modal-result error';
+                result.textContent = (data && data.error) ? data.error : ('HTTP ' + resp.status);
+                submitBtn.disabled = false;
+                return;
+            }}
+            result.className = 'modal-result success';
+            result.textContent =
+                'Files matched: '       + (data.files_matched      ?? 0) + '\n' +
+                'Chunks examined: '     + (data.chunks_examined    ?? 0) + '\n' +
+                'Replicas dropped: '    + (data.replicas_dropped   ?? 0) + '\n' +
+                'Mandatory refusals: '  + (data.mandatory_refusals ?? 0) +
+                ((data.mandatory_refusals > 0)
+                    ? '  ⚠ check audit log: action=cache.flush_refused'
+                    : '') + '\n' +
+                'Unreachable nodes: '   + (data.unreachable_nodes  ?? 0) + '\n' +
+                'RPC failures: '        + (data.rpc_failures       ?? 0) + '\n' +
+                'Raft failures: '       + (data.raft_failures      ?? 0) +
+                (data.truncated ? ('\nTruncated (re-run): ' + data.truncated) : '');
         }} catch (e) {{
             result.className = 'modal-result error';
             result.textContent = 'Request failed: ' + e;
