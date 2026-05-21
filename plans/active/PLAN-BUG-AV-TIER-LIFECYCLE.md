@@ -1565,6 +1565,80 @@ adjusted: Phase 1 net new tests 37 → 33.
 
 _(end AV-1-9 deviation)_
 
+### AV-1-10 — `/api/v1/volumes` JSON projection gap (carryover) (2026-05-21)
+
+AV-1-10's migrate-policy helper correctly populates
+`mandatory_replicas` on the state machine (proven by Test B's
+idempotent re-run returning `no-op (already migrated)`), but the
+`GET /api/v1/volumes` list endpoint still serialises only the
+legacy `replication` block. The new `mandatory_replicas`,
+`cache_replicas`, and `anchor` fields are stored but not
+projected on the read side.
+
+Folded into AV-1-12 (REST API doc), but the doc only **flagged**
+the gap — the actual `list_volumes_handler` projection was not
+broadened in this Phase. The REST API doc carries an inline
+"Bug AV note" pointing at this plan as the tracked follow-up.
+
+Three reasons to track centrally:
+* future agents reading the plan must know the projection is
+  incomplete before treating list endpoint output as canonical;
+* WebUI rendering of cache/anchor state needs this endpoint to
+  carry the data;
+* a Phase 3 CLI command (`dtfs-cli volumes show <id>`) will
+  surface the same gap and is the natural place to broaden the
+  projection at the same time.
+
+**Disposition:** carryover to Phase 3 (folded into AV-3-5 CLI
+surface work, since the CLI consumes this endpoint). If the JSON
+shape change becomes risky to bundle with AV-3-5, split into a
+standalone AV-1-13 ticket.
+
+_(end AV-1-10 deviation)_
+
+### AV-2-4 / AV-2-5 — Phase 2 live end-to-end demo deferred (2026-05-21)
+
+The Phase 2 "Done when" criteria for AV-2-4 / AV-2-5 each call
+for a live demo:
+* AV-2-4: "write a file, read it twice from data01's DC over
+  4h (simulate by shortening the window to 60s for the test),
+  observe warm replica appears in that DC."
+* AV-2-5: "cluster behaviour shows that demote followed by an
+  immediate read can re-promote (demote ≠ flush)."
+
+Both demos require a volume with `cache_replicas` configured.
+Today only the REST `UpsertVolume` endpoint accepts that schema
+— there is no operator-friendly CLI (`dtfs-cli volume
+set-cache`) until AV-3-5 lands. Manually crafting an
+`UpsertVolume` body to flip the `default` volume into
+cache-enabled mode is possible but risks corrupting the
+minicluster's persistent state for the rest of Phase 3
+development.
+
+What WAS verified on the minicluster:
+* AV-2-1/2/3 pure helpers: 17 unit tests green.
+* AV-2-4 wiring: planner + engine compiles; binaries roll
+  cleanly; tiering engine `Tiering engine started
+  (evaluation interval: 3600s)` log appears; no panics.
+* AV-2-5 cooldown clearance: 3 unit tests green covering the
+  past/future cooldown decision boundary; binaries roll
+  cleanly.
+
+**Disposition:** bundle into the Phase 2 close-out demo that
+runs *after* AV-3-5 ships. The Phase 2 binaries are already
+deployed to the minicluster, so the demo is purely a "create
+the right volume + watch the tick fire" check. Plan's
+"Phase 2 Done When" section already calls for this final demo
+as a separate item; expanded here so future agents understand
+the sequencing.
+
+**Risk if left undemoed:** very low. The full code path is
+unit-tested at every junction; the only unverified step is the
+async dispatcher's network behaviour, which mirrors the
+already-live AV-1-7 flush dispatcher exactly in shape.
+
+_(end AV-2-4 / AV-2-5 deviation)_
+
 ---
 
 ## Appendix A — Full configuration examples
