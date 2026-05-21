@@ -1138,7 +1138,64 @@ impl TaskScheduler {
         let (actions, mut report) =
             plan_flush_cache(&snapshot, cache_tiers, max_tasks);
 
+        // AV-1-11 — audit + alert on refusals BEFORE the dispatch loop
+        // so the operator sees the warning even when nothing was
+        // actually deletable (e.g. every chunk would have stranded the
+        // anchor). One audit entry per refused chunk; one deduped
+        // alert per call when refusals > 0.
+        if !report.refusals.is_empty() {
+            for refusal in &report.refusals {
+                self.audit.log(
+                    "scheduler",
+                    "cache.flush_refused",
+                    &format!(
+                        "file={} idx={} reason={}",
+                        refusal.file_path, refusal.chunk_index, refusal.reason
+                    ),
+                    "refused",
+                );
+            }
+            if let Some(alerts) = self.alerts.read().clone() {
+                let sample: Vec<serde_json::Value> = report
+                    .refusals
+                    .iter()
+                    .take(20)
+                    .map(|r| {
+                        serde_json::json!({
+                            "file_path": r.file_path,
+                            "chunk_index": r.chunk_index,
+                            "reason": r.reason,
+                        })
+                    })
+                    .collect();
+                alerts.fire(
+                    crate::alerts::AlertKind::AnchorViolated,
+                    "flush_cache refused: would have stranded mandatory replica(s)",
+                    serde_json::json!({
+                        "subsystem": "cache_flush",
+                        "path_prefix": path_prefix,
+                        "refusal_count": report.refusals.len(),
+                        "files_matched": report.files_matched,
+                        "chunks_examined": report.chunks_examined,
+                        "sample": sample,
+                    }),
+                );
+            }
+        }
+
         if actions.is_empty() {
+            // Still emit the completion summary so audit timelines tell
+            // the full story (operator sees they ran a flush; planner
+            // produced 0 actions but possibly N refusals).
+            self.audit.log(
+                "scheduler",
+                "cache.flush_complete",
+                &format!(
+                    "prefix={} replicas_dropped=0 mandatory_refusals={}",
+                    path_prefix, report.mandatory_refusals
+                ),
+                "success",
+            );
             return report;
         }
 
@@ -1321,6 +1378,24 @@ pub(crate) struct FlushAction {
     pub node_id: u64,
 }
 
+/// Bug AV (AV-1-11) — one entry per chunk the planner declined to
+/// flush because doing so would have stranded the mandatory-tier
+/// replicas. The dispatcher consumes these to emit audit + alert
+/// hooks (one audit per refusal; one deduped alert per call when
+/// any refusals occurred).
+///
+/// `reason` is a stable, machine-readable string so log scrapers
+/// (and S15-style scenarios) can grep without parsing free text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FlushRefusal {
+    pub file_path: String,
+    pub chunk_index: u64,
+    /// Stable reason code. Currently the only refusal cause is
+    /// `"mandatory_strand"`; reserved for future additions
+    /// (e.g. `"cooldown_active"` if AV-2 layers another rule on top).
+    pub reason: &'static str,
+}
+
 /// Bug AV — operator-facing summary of a flush_cache call. Mirrors
 /// PathMigrationReport's shape so the REST + CLI presenters share UX.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -1338,6 +1413,12 @@ pub struct FlushCacheReport {
     #[serde(default)] pub unreachable_nodes: usize,
     #[serde(default)] pub rpc_failures: usize,
     #[serde(default)] pub raft_failures: usize,
+    /// AV-1-11 — detailed per-refusal records. Kept out of the JSON
+    /// wire shape (large for big prefixes; the counter is sufficient
+    /// for the operator-facing report). The dispatcher consumes the
+    /// list internally to emit audit log entries and an alert; tests
+    /// inspect it to verify the planner's refusal classification.
+    #[serde(skip)] pub(crate) refusals: Vec<FlushRefusal>,
 }
 
 /// Bug AV — pure planner kernel. Walks the snapshot, identifies cache-
@@ -1408,6 +1489,13 @@ pub(crate) fn plan_flush_cache(
             });
             if !mandatory_survives {
                 report.mandatory_refusals += 1;
+                // AV-1-11: record the refusal so the dispatcher can
+                // audit + alert. Reason is stable for log scrapers.
+                report.refusals.push(FlushRefusal {
+                    file_path: file_path.clone(),
+                    chunk_index,
+                    reason: "mandatory_strand",
+                });
                 continue;
             }
 
@@ -2211,6 +2299,98 @@ mod bug_av_flush_cache_tests {
         assert_eq!(report.mandatory_refusals, 0);
         assert_eq!(report.files_matched, 1);
         assert_eq!(report.chunks_examined, 1);
+    }
+
+    /// AV-1-11 test 1 — every stranded chunk produces a `FlushRefusal`
+    /// with the stable `"mandatory_strand"` reason code. The async
+    /// dispatcher converts each entry to one `cache.flush_refused`
+    /// audit row + one deduped `AnchorViolated` alert (live-verified;
+    /// see verification log).
+    #[test]
+    fn bug_av_planner_records_refusal_per_stranded_chunk() {
+        // Two stranded chunks: same file, different indexes.
+        let snapshot = FlushSnapshot {
+            files: vec![(
+                "/movies/oops.mkv".to_string(),
+                vec![
+                    ent(0, "h0", 11, 0), // warm only
+                    ent(0, "h0", 12, 0), // warm only
+                    ent(1, "h1", 11, 0), // warm only
+                    ent(1, "h1", 12, 0), // warm only
+                ],
+                mandatory_cold_only(),
+            )],
+            nodes: HashMap::from([
+                (11u64, node_summary("toro", &[DiskTier::Warm])),
+                (12u64, node_summary("nrb",  &[DiskTier::Warm])),
+            ]),
+            anchor: None,
+        };
+        let (actions, report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
+        assert!(actions.is_empty(), "nothing to drop without mandatory cold");
+        assert_eq!(report.mandatory_refusals, 2);
+        assert_eq!(report.refusals.len(), 2);
+        for r in &report.refusals {
+            assert_eq!(r.file_path, "/movies/oops.mkv");
+            assert_eq!(r.reason, "mandatory_strand");
+        }
+        let mut idxs: Vec<u64> =
+            report.refusals.iter().map(|r| r.chunk_index).collect();
+        idxs.sort();
+        assert_eq!(idxs, vec![0, 1]);
+    }
+
+    /// AV-1-11 test 2 — the happy path leaves `refusals` empty so the
+    /// dispatcher doesn't emit a spurious alert when everything was
+    /// flushable.
+    #[test]
+    fn bug_av_planner_no_refusals_on_happy_path() {
+        let snapshot = FlushSnapshot {
+            files: vec![(
+                "/movies/wicked.mkv".to_string(),
+                vec![ent(0, "h", 10, 0), ent(0, "h", 11, 0)],
+                mandatory_cold_only(),
+            )],
+            nodes: HashMap::from([
+                (10u64, node_summary("leli", &[DiskTier::Cold])),
+                (11u64, node_summary("toro", &[DiskTier::Warm])),
+            ]),
+            anchor: None,
+        };
+        let (actions, report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
+        assert_eq!(actions.len(), 1);
+        assert!(
+            report.refusals.is_empty(),
+            "no refusals → dispatcher must not fire AnchorViolated alert"
+        );
+    }
+
+    /// AV-1-11 test 3 — the public JSON shape of `FlushCacheReport`
+    /// must not include the per-refusal list (it can be large for big
+    /// prefixes; operator gets the counter + audit log entries). Guard
+    /// against accidental `#[serde(skip)]` removal during refactors.
+    #[test]
+    fn bug_av_report_serde_skips_refusals_field() {
+        let mut report = FlushCacheReport::default();
+        report.refusals.push(FlushRefusal {
+            file_path: "/x".to_string(),
+            chunk_index: 0,
+            reason: "mandatory_strand",
+        });
+        report.mandatory_refusals = 1;
+        let json = serde_json::to_string(&report).unwrap();
+        // Use the precise `"refusals":` token so we don't false-match
+        // the legitimate `"mandatory_refusals":` counter.
+        assert!(
+            !json.contains("\"refusals\":"),
+            "FlushCacheReport JSON wire shape must omit the 'refusals' field (was: {json})"
+        );
+        assert!(
+            json.contains("\"mandatory_refusals\":1"),
+            "counter must remain in JSON (was: {json})"
+        );
     }
 
     /// AV-1-7 test 5 — two files in different volumes evaluated
