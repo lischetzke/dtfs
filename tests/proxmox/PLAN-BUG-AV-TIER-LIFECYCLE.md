@@ -914,7 +914,13 @@ datacenter   = "leli"
 required_tier = "cold"        # anchor MUST be cold (not just any tier)
 
 [defaults]
-chunk_size_mb = 128
+# 16 MB strikes a balance for the 40 Mbps DSL anchor link:
+#   * ~3 s per chunk transfer at line rate — small enough that a
+#     mid-transfer failure isn't catastrophic, large enough that
+#     per-chunk overhead (proto framing, fsync) doesn't dominate.
+#   * A 2 GB movie = ~128 chunks; per-chunk replication retries are
+#     fine-grained failure units.
+chunk_size_mb = 16
 
 [defaults.write_safety]
 min_replicas_before_ack = 1   # anchor (cold) replica suffices to ACK
@@ -969,7 +975,13 @@ datacenter   = "primary-dc"
 required_tier = "cold"
 
 [defaults]
-chunk_size_mb = 32            # smaller chunks suit JPEG / RAW files
+# 4 MB chunks for photo workloads:
+#   * Most JPEGs (2-8 MB) fit in 1-2 chunks → minimal overhead.
+#   * RAW files (20-60 MB) span 5-15 chunks → parallelisable
+#     read/replicate when batched.
+#   * Small enough that an interrupted upload only loses the last
+#     in-flight chunk, not 30 MB of the next photo.
+chunk_size_mb = 4
 
 [defaults.write_safety]
 min_replicas_before_ack = 2   # both cold replicas before ACK (durable)
@@ -1010,7 +1022,15 @@ datacenter = "hq-dc"
 # required_tier omitted → any-tier match in hq-dc counts as the anchor
 
 [defaults]
-chunk_size_mb = 4             # docs are small; small chunks lower latency
+# 1 MB chunks for office-document workloads:
+#   * Tiny files (<1 MB Word/Excel) are exactly 1 chunk → minimal
+#     metadata overhead.
+#   * Medium docs (5-20 MB pptx, pdf) span 5-20 chunks → partial
+#     reads (cell jumps in xlsx, page seeks in pdf) only fault
+#     the chunks the reader actually touches.
+#   * Small enough to keep FUSE write_lease latency below human
+#     perception even on the slowest WAN link.
+chunk_size_mb = 1
 ```
 
 Behaviour: each chunk has 1 mandatory warm + 1 mandatory cold + up to
@@ -1222,57 +1242,40 @@ When the docs page lists fields, this is the canonical order. Used in
 
 ## 6. Procedure recap
 
-> Per user's spec (2026-05-21 chat). Repeats here so it stays close to
-> the plan.
+The per-task procedure and commit discipline used by this plan are
+defined once in [AGENTS.md](../../AGENTS.md). Read that file first.
+This section captures the **AV-specific** bits not already in
+AGENTS.md.
 
-For each ⬜ task in order:
+### 6.1 AV-specific deploy targets
 
-1. Mark task 🟦 in this doc.
-2. Implement (smallest change that satisfies the listed tests + done-when).
-3. Run `cargo test -p <relevant-crate> --release` until green.
-4. Sync to builder, run full crate test suite.
-5. Deploy affected binary to minicluster (rolling restart for
-   manager; restart-in-place for data + FUSE).
-6. Run the live verification described in "Done when".
-7. Add a `verification log` entry.
-8. **Commit.** Stage the task's files + the plan update (status flip
-   + verification-log entry) and commit with the message format:
+* **Build host:** the `dtfs-builder` VM (10.150.0.150). Source +
+  cargo cache live there.
+* **Verification environment:** the 6-VM minicluster
+  (`mini-mgr01`..03, `mini-data01`..02, `mini-client01`) provisioned
+  by `tests/proxmox/provision-mini.sh` and deployed by
+  `tests/proxmox/deploy-mini.sh`.
+* **Rolling-deploy order:** managers leader-last (peek
+  `/api/v1/raft/state` to find the current leader), data nodes any
+  order, FUSE clients last. `deploy-mini.sh` documents the recipe.
 
-   ```
-   Bug AV-<phase>-<n>: <one-line summary>
+### 6.2 AV-specific commit-message `Plan:` trailer
 
-   <2-3 sentence body: what changed, what tests cover it, any
-   deviation from plan>
+Format (per AGENTS.md § 3, with concrete plan path):
 
-   Plan: tests/proxmox/PLAN-BUG-AV-TIER-LIFECYCLE.md (AV-<phase>-<n> ✅)
-   ```
+```
+AV-<phase>-<n>: <one-line summary>
 
-   One commit per task. Doc-only tasks (AV-1-12, AV-2-6, AV-3-6) get
-   their own commit. The plan-status update is part of the same
-   commit so the doc never drifts from the code.
+<2-3 sentence body.>
 
-9. Mark task ✅ with date in the plan.
-10. Move to next ⬜.
+Plan: tests/proxmox/PLAN-BUG-AV-TIER-LIFECYCLE.md (AV-<phase>-<n> ✅)
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+```
 
-Plan stays the source of truth — if reality diverges, the plan is
-updated first (Deviations section), then the work continues.
+The three doc-only tasks (`AV-1-12`, `AV-2-6`, `AV-3-6`) get their
+own commits because they aggregate doc edits across the whole phase.
 
-### 6.1 Commit hygiene
+### 6.3 Phase boundaries
 
-* **Never `--no-verify`**. Pre-commit hooks (when added) must pass.
-* **Never `--amend`** a pushed commit; create a new commit instead.
-* **Never push to master** during AV work — keep on local until the
-  user reviews each phase boundary. If/when a feature branch is
-  warranted, it gets created at the start of a phase and merged
-  after the phase's "Done when" is met.
-* **Trailers required** on every commit (per CLAUDE.md / repo
-  convention):
-
-  ```
-  Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-  ```
-
-* **Co-locate** docs with code: when a code change has a
-  corresponding doc update, both go in the same commit. The 3 doc
-  tasks (AV-1-12 / AV-2-6 / AV-3-6) are their own commits because
-  they aggregate doc edits across the phase.
+After each phase's "Done when" is met, **pause for user review**
+before starting the next phase. No automatic phase-rollover.
