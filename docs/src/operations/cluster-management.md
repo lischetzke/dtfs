@@ -216,6 +216,116 @@ dtfs-cli health          # Quick manager health check
 | `Draining` | Active chunk evacuation underway. |
 | `Failed` | Permanent failure recorded. Node will not recover. |
 
+## Reclaiming warm cache space (Bug AV flush)
+
+When the operator needs to free space on warm-tier disks ahead of
+the natural idle-decay window — for example, before a large
+import campaign, or to evict stale media that's no longer being
+watched — the cache-flush primitive drops opportunistic cache
+replicas while preserving the mandatory anchor.
+
+### When to use it
+
+| Situation | Action |
+|-----------|--------|
+| "I want to free 200 GB on toro's warm disk before tonight's import" | `flush_cache` on the relevant prefix |
+| "I deleted a season from Plex and want the cache disks cleaned" | `flush_cache` on the prefix the season lived under |
+| "I want to permanently archive — never warm again" | Not this. Change the volume's `cache_replicas.warm = { min: 0, max: 0 }` instead. The flush is a *temporary* eviction; the tiering engine will re-promote on the next 2 reads within 4 h. |
+
+### Procedure
+
+```bash
+# Drop every warm cache replica under /movies/Season-1/, with the
+# default 5-minute cooldown to prevent immediate re-promotion.
+curl -X POST http://mgr-01:9402/api/v1/files/flush_cache \
+     -H 'content-type: application/json' \
+     -d '{"path_prefix":"/movies/Season-1/","cache_tiers":["warm"]}'
+```
+
+Response shape:
+
+```json
+{
+  "status": "accepted",
+  "files_matched": 12,
+  "chunks_examined": 482,
+  "replicas_dropped": 482,
+  "mandatory_refusals": 0,
+  "truncated": 0,
+  ...
+}
+```
+
+* `replicas_dropped` is the count of per-replica delete RPCs that
+  succeeded.
+* `mandatory_refusals` is the count of chunks where the planner
+  *refused* to flush because doing so would have stranded the
+  mandatory copy — **this should be 0** on a healthy volume. Any
+  non-zero value means the planner protected against data loss
+  AND fired an `AnchorViolated` alert; investigate the audit log
+  (`cache.flush_refused` entries) to understand which chunks
+  were affected.
+
+### What to expect in the audit log
+
+After a flush you should see, in order:
+
+1. One `cache.flush` row (the API-level call entry).
+2. N × `cache.flush_replica` rows (one per successful per-replica
+   delete; N = `replicas_dropped`).
+3. Optional `cache.flush_refused` rows (one per refusal; if you
+   see these, also expect an `AnchorViolated` alert via the
+   configured webhook sinks).
+4. One `cache.flush_complete` row (the per-call summary).
+
+```bash
+# Pull the recent flush audit entries:
+curl -s "http://mgr-01:9402/api/v1/audit?action=cache.&limit=20" \
+  | jq .
+```
+
+### Cooldown — why immediate re-reads don't re-promote
+
+After a flush, the engine sets each affected chunk's
+`cache_cooldown_until_ms[chunk_index]` to `now + cooldown_secs`
+(default 5 min). Within that window, even reads that would
+normally meet the `promote_reads` threshold are refused, so a
+playback that started immediately after a flush continues
+serving from the cold (mandatory) replica.
+
+The cooldown is **automatically cleared** when the engine itself
+demotes an idle cache replica (the natural decay path). This
+preserves the asymmetry:
+
+| Eviction cause | Cooldown after eviction | First read re-promotes? |
+|----------------|--------------------------|-------------------------|
+| Operator flush | yes (5 min by default) | no, until cooldown expires |
+| Engine idle-demote | no | yes, immediately on next read |
+
+### Anchor-aware refusals
+
+A flush refusal indicates the planner detected a chunk where
+dropping the cache replicas would leave the mandatory tier with
+0 copies. This **should never happen** on a healthy volume —
+it means either (a) the chunk's mandatory placement is
+genuinely missing (a data-node failure not yet recovered), or
+(b) the volume's `mandatory_replicas` is misconfigured.
+
+Investigate by:
+
+```bash
+# Find the audited refusals:
+curl -s "http://mgr-01:9402/api/v1/audit?action=cache.flush_refused&limit=20" | jq .
+
+# Cross-check the chunk's placements:
+dtfs-cli files | grep <path>
+# Or via REST:
+curl -s http://mgr-01:9402/api/v1/files | jq '.files[] | select(.path == "<path>")'
+```
+
+For details on the planner's refusal logic, see
+[Tiering → Anchor-aware demotion](../storage/tiering.md#anchor-aware-demotion).
+
 ## Rolling Upgrades
 
 To upgrade the cluster with zero downtime:

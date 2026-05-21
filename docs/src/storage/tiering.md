@@ -4,16 +4,13 @@ DTFS automatically classifies data into temperature tiers based on access patter
 
 ## Cache tier semantics (Bug AV)
 
-> **Status (2026-05):** Phase-1 of Bug AV is complete (schema,
-> flush, audit, alert, migration helpers); the demand-driven
-> promotion engine described below lands in Phase 2.
-> Until then, this section is a forward-reference: the volume
-> schema *carries* `cache_replicas` and the operator can
-> *manually* drop cache replicas via
-> [`POST /api/v1/files/flush_cache`](../api-reference/rest-api.md#post-apiv1filesflush_cache),
-> but the tiering engine still uses the legacy promotion rules
-> below for actual replica creation. Cache promotion driven by
-> `promote_reads` / `promote_window_secs` is gated on Phase 2.
+> **Status (2026-05):** Phase 1 (schema, flush, audit, alert,
+> migration helpers) and Phase 2 (demand-driven promotion +
+> idle-window demotion + cooldown clearance) are complete. The
+> legacy temperature path below still runs alongside the new
+> engine for backward compatibility with volumes that don't have
+> `cache_replicas` configured. New AV-style volumes use the
+> rules described here.
 
 Cache replicas are **opportunistic** copies created by the tiering
 engine in response to read demand. Unlike mandatory replicas they
@@ -26,25 +23,157 @@ are:
   is the default; set `false` to scope the cache pool globally).
 
 See [Volume Configuration → Replication classes](../configuration/volume-config.md#replication-classes)
-for the full schema. The lifecycle is:
+for the full schema reference.
+
+### Promotion math
+
+For each `(chunk, DC, cache-tier)` triple, the engine evaluates on
+every tick (default 5 min, configurable via
+`tiering.evaluation_interval_secs`):
+
+1. **Window count** — sum of reads from this DC in the last
+   `cache_replicas.promote_window_secs` (default 4 h).
+2. **Cooldown check** — if the chunk's
+   `cache_cooldown_until_ms[idx]` is in the future, refuse this
+   tier this tick.
+3. **Threshold check** — refuse if window count <
+   `cache_replicas.promote_reads` (default 2).
+4. **Target count** — basic promotion path schedules
+   `min(min, max) - current_in_dc` new replicas. Always 0 once
+   `min` is reached (the redundancy-escalation pass that ramps
+   toward `max` is `ENABLE_CACHE_REDUNDANCY_ESCALATION = false`
+   in Phase 2; Phase 4 follow-up flips it).
+5. **Target selection** — pick a healthy non-draining node in the
+   requesting DC that has a disk of the target tier and doesn't
+   already hold this chunk. Tie-break by highest free capacity,
+   then lowest `node_id` (deterministic audit output).
+
+When `per_dc = false`, all DC reads contribute to one global
+pool and the engine places the cache copy in the DC that
+generated the most reads (best locality).
+
+### Demotion math
+
+For each existing cache-tier placement:
+
+1. **Tier check** — must be a *cache* tier (i.e., the volume's
+   `cache_replicas.<tier>.max > 0` AND
+   `mandatory_replicas.<tier> == 0`).
+2. **Window check** — `reads_in_window_by_dc[placement.dc]` must
+   be 0 (no reads from this DC inside `promote_window_secs`).
+3. **Anchor safety** — at least one mandatory-tier replica must
+   survive the drop (the planner refuses any demotion that would
+   strand the mandatory copy; defence-in-depth: the apply path
+   also re-checks via `enforce_anchor` on `RemoveChunkLocation`).
+
+A surviving demotion triggers the full sequence:
+
+* `DeleteChunkReplica` RPC on the data node (idempotent
+  `was_present`/`freed_bytes` shape).
+* `RemoveChunkLocation` Raft write removes the SM entry.
+* Conditional `SetChunkCooldown(expires_at_ms = 0)` — clears
+  the chunk's cooldown entry **only if** the snapshot cooldown
+  was 0 or in the past. A future operator-flush cooldown is
+  left intact so the operator's intent ("no immediate
+  re-promotion") wins.
+
+Demotion does NOT consult the cooldown when *deciding*. The
+cooldown only protects against immediate re-promotion; demotion
+itself is allowed because the cache replica is already eligible
+for eviction.
+
+### Cooldown semantics
+
+`cache_replicas.cooldown_secs` (default 300 s = 5 min) is the
+window after an operator flush during which the engine refuses
+to re-promote. Stored per `(file, chunk_index)` in
+`FileMetadata.cache_cooldown_until_ms` as the absolute
+millisecond-since-epoch expiry. Lifecycle:
+
+* **Operator flush** sets `cooldown_until_ms = now +
+  cooldown_secs`.
+* **Promotion path** in the planner checks `now <
+  cooldown_until_ms` and refuses.
+* **Engine-driven demote** clears the entry via
+  `SetChunkCooldown(0)` IFF the snapshot cooldown was past or
+  absent. Future operator cooldowns are preserved.
+* **State-machine apply**: `expires_at_ms = 0` removes the
+  entry; any other value is `max()`-merged with the existing
+  one (monotonic — concurrent flushes never regress).
+
+This produces the user-visible behaviour `flush → no
+re-promote for 5 min → operator-decay clears it → next read
+re-promotes`, versus the engine-driven decay path `idle →
+demote → immediate read re-promotes` (no cooldown set, no
+wait).
+
+### Anchor-aware demotion
+
+The planner never emits a demotion that would leave 0
+mandatory-tier replicas. This invariant lives in two places:
+
+* `plan_chunk_demotions` filters before emitting the action.
+* `RemoveChunkLocation`'s state-machine apply path re-checks
+  via `enforce_anchor` (defence-in-depth against any future
+  planner regression).
+
+If a tier-aware anchor is configured
+(`anchor.required_tier = "cold"`), the engine treats it as the
+mandatory floor for demotion decisions.
+
+### Worked example — `/movies/Wicked.mkv` lifecycle
+
+Volume: cold mandatory, warm cache per-DC with `min=1, max=1`,
+`promote_reads=2`, `promote_window_secs=14400` (4 h),
+`cooldown_secs=300` (5 min). Anchor: `leli` DC, cold tier.
 
 ```
-read demand   →   promote_reads counter in promote_window_secs
-              ↘
-                tiering engine creates 1..max cache replicas (Phase 2)
-                  ↘
-                    operator flushes      ↘
-                                          chunk enters cooldown_secs
-                                          ↘ no re-promotion until
-                                            cooldown expires
-                  ↗
-read again →  counter restarts in the new window
+t=0:        Write of /movies/Wicked.mkv.
+            Placement engine schedules 1 cold replica on
+            LELI/data-primary01 (anchor-satisfying).
+            State: {LELI cold}.
+
+t=10:       Plex on TORO opens the file. 1 read from TORO.
+            Window count for (chunk, toro) = 1.
+            Below threshold (2); planner emits no promotion.
+
+t=120:      Same TORO Plex session continues. 2nd read.
+            Window count for (chunk, toro) = 2 ≥ threshold.
+            Planner emits promotion → schedule warm replica on
+            TORO/data-warm01 (no cooldown, no existing warm).
+            State: {LELI cold, TORO warm}.
+
+t=300:      Operator clicks "Flush cache" on /movies/Wicked.mkv.
+            scheduler.flush_cache_for_path drops the warm
+            replica and sets cooldown_until_ms = t=600s.
+            State: {LELI cold} + cooldown active.
+
+t=305:      TORO Plex re-opens. 1 read. Window count = 1.
+            Below threshold AND below cooldown — no promotion.
+
+t=400:      2nd read. Window count = 2. ≥ threshold BUT cooldown
+            still active (t=400 < 600). No promotion.
+
+t=610:      3rd read after cooldown expired. Window count
+            depends on what the window saw (the t=305/t=400
+            reads remain inside the 4h window). ≥ threshold.
+            Planner promotes again → warm replica appears.
+
+t=14_500:   No reads for 4 hours. Engine tick: window for TORO
+            now empty. Planner emits demotion of the TORO warm
+            replica. Dispatcher: DeleteChunkReplica →
+            RemoveChunkLocation → SetChunkCooldown(0) (the
+            snapshot cooldown is 0/past, so clear succeeds).
+            State: {LELI cold}, no cooldown.
+
+t=14_600:   Plex opens the file again. 1 read.
+            (subsequent reads continue the new window — no
+            cooldown blocks anything.)
 ```
 
-Phase-2 of Bug AV will wire `reads_by_dc` heartbeat telemetry
-end-to-end (currently the data node tracks per-chunk reads but does
-not bucket them by requester DC). Until then, cache replica
-creation falls back to the legacy temperature-based promotion below.
+The legacy temperature path runs in parallel for volumes
+without a `cache_replicas` policy (back-compat); volumes WITH
+one drive the engine described here.
 
 ## Temperature Classification
 
