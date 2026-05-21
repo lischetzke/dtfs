@@ -277,9 +277,19 @@ impl TaskScheduler {
                         .map(|d| d.tier)
                         .unwrap_or(DiskTier::Hot)
                 };
+                // Bug AV (AV-1-8) — under-replication enforces ONLY
+                // mandatory tiers. `effective_mandatory_replicas()`
+                // returns the new `mandatory_replicas` field when any
+                // of its tiers > 0, otherwise falls back to the legacy
+                // `replication` field (pre-AV behaviour). Cache tiers
+                // are NEVER auto-filled by this scheduler — that's
+                // the tiering engine's job (Phase 2). Pre-fix every
+                // tier with rf > 0 in `replication` got enforced
+                // including warm, which is incompatible with the
+                // cache-tier semantics.
                 let desired_replicas = sm.volumes
                     .get(&file_meta.volume_id)
-                    .map(|v| v.replication.for_tier(chunk_tier))
+                    .map(|v| v.effective_mandatory_replicas().for_tier(chunk_tier))
                     .unwrap_or(3u32);
 
                 if replica_count < desired_replicas {
