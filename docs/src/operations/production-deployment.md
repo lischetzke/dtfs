@@ -93,6 +93,66 @@ dtfs-cli volume update default \
     --chunk-size-mb 128
 ```
 
+### Tier policy bootstrap (Bug AV)
+
+After a fresh deploy or when upgrading an existing cluster from the
+pre-Bug-AV schema, apply the two-class tier lifecycle policy in this
+order. Each step is idempotent and safe to re-run.
+
+```bash
+# 1. (Upgrades only) Migrate the legacy `replication` field into
+#    `mandatory_replicas`. Idempotent; preserves the legacy field as a
+#    rollback path.
+dtfs-cli volumes migrate-policy default
+
+# 2. Inspect what landed — the new fields should now be populated.
+dtfs-cli volumes show default
+
+# 3. Set the cache policy. Plexmedia-style: 1 warm cache replica per DC,
+#    promoted after 2 reads in 4 h, with a 5-min cooldown after operator
+#    flushes.
+dtfs-cli volumes set-cache default \
+    --warm-min 1 --warm-max 1 --per-dc true \
+    --promote-reads 2 --promote-window-secs 14400 --cooldown-secs 300
+
+# 4. (Optional) Verify the round-trip.
+dtfs-cli volumes show default
+```
+
+If `step 3` returns a `400 Bad Request` complaining about `max < min`,
+fix the offending tier and re-run. The validator catches the
+misconfiguration at the REST boundary so a malformed policy can't
+land on the Raft state.
+
+#### Rolling-upgrade gating
+
+* **Before rollout** — the new manager binary safely loads pre-AV
+  snapshots (`#[serde(default)]` on every new field). Old managers
+  cannot load AV-written snapshots cleanly; complete the rolling
+  upgrade *before* running `migrate-policy`.
+* **During rollout** — leave volumes on the legacy `replication`
+  field. The under-replication scheduler falls back to it when
+  `mandatory_replicas` is all-zero. New writes work either way.
+* **After rollout** — run `migrate-policy` once the leader is on the
+  new binary. The Raft commit replicates the new schema to every
+  follower, including any node still on a slightly older binary
+  (they'll apply the new fields blindly; reads use the new code
+  paths only on follower-elections, which happen post-rollout).
+
+#### Rollback path
+
+`migrate-policy` is additive: it never clears `replication`. Reverting
+to pre-AV behaviour is "stop using `mandatory_replicas`", which
+operationally means: don't run `migrate-policy` again on rolled-back
+binaries (a downgrade is rare in this codebase and isn't a supported
+flow — see § Operator dial-ins after a problem). If a downgrade
+becomes necessary, deploy old binaries, then manually edit each
+volume's `mandatory_replicas` back to zero via the REST UpsertVolume
+path; legacy `replication` then drives the scheduler.
+
+See [Storage → Tiering → Cache tier semantics (Bug AV)](../storage/tiering.md#cache-tier-semantics-bug-av)
+for the runtime semantics that this bootstrap enables.
+
 ## Smoke checks
 
 ```bash

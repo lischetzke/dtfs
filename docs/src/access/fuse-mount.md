@@ -120,6 +120,24 @@ max_entries = 100000
 
 Lower TTL values provide stronger consistency but increase metadata traffic. For workloads where files are rarely modified, increasing the TTL reduces latency.
 
+### First-write tier preference (Bug AV)
+
+The FUSE client can request a specific tier for the first chunk of a write via the `[write] first_write_tier` config option. Two modes:
+
+* **`"cold"` (default)** — first-chunk placement targets the volume's effective cold tier (the mandatory anchor). The write ACK blocks until the cold replica confirms. Safer and no anchor-lag window, but slower when the client's DC has a slow uplink to the anchor DC.
+* **`"nearest-warm"`** — first-chunk placement targets a warm-tier node in the client's own DC. The write ACK comes back as soon as the warm replica confirms; the manager's anchor-lag-repair pass (Bug AV AV-3-3) schedules the mandatory cold copy asynchronously within one tiering tick (default 5 min).
+
+Configure in `fuse.toml`:
+
+```toml
+[write]
+first_write_tier = "nearest-warm"
+```
+
+See [FUSE Client Configuration → `[write]`](../configuration/fuse-client.md#write----write-path-preferences-bug-av) for the full reference and trade-off discussion.
+
+> The mode interacts with the volume's `cache_replicas` policy at the manager. A volume that doesn't enable warm caching (`cache_replicas.warm.max = 0`) ignores the `nearest-warm` request — the manager falls back to the volume default tier. This is intentional so a client misconfiguration can't bypass a volume's durability requirements.
+
 ### Write Buffering
 
 Writes are buffered on the client and flushed to data nodes in chunk-sized batches (default 128 MB). This converts many small writes into fewer large sequential writes:

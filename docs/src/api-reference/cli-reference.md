@@ -149,23 +149,141 @@ for the underlying request.
 
 ---
 
-#### files flush-cache (planned)
+#### volumes show
 
-Bug AV — operator-facing wrapper for `POST /api/v1/files/flush_cache`.
-Currently exposed only via the REST endpoint; CLI surface lands
-with AV-3-5. See
-[REST API → POST /api/v1/files/flush_cache](./rest-api.md#post-apiv1filesflush_cache)
-for the request/response schema and audit/alert semantics that
-will be plumbed through the CLI.
+Bug AV (AV-3-5) — render a volume's full configuration including
+the AV `mandatory_replicas` / `cache_replicas` / `anchor` fields.
+
+```bash
+dtfs-cli volumes show <volume_id>
+```
+
+**Example:**
+
+```
+$ dtfs-cli volumes show default
+Volume: default
+Name:   default
+Chunk size:  4194304 bytes
+Legacy replication:  hot=0 warm=2 cold=1 tape=1
+Mandatory replicas:  hot=0 warm=2 cold=1 tape=1
+Cache replicas:
+  warm: min=1 max=1
+  hot:  min=0 max=0
+  per_dc:               true
+  promote_reads:        2
+  promote_window_secs:  14400
+  cooldown_secs:        300
+Anchor:  dc=leli required_tier=cold
+```
+
+Use `--format json` for scripted consumption (returns the same JSON
+shape as `GET /api/v1/volumes/{id}`).
+
+---
+
+#### volumes set-cache
+
+Bug AV (AV-3-5) — set or update a volume's `cache_replicas` policy.
+Every flag is optional; omitted flags keep the current value.
+Validates `max >= min` per tier at the REST layer.
+
+```bash
+dtfs-cli volumes set-cache <volume_id> \
+    [--warm-min N] [--warm-max N] [--hot-min N] [--hot-max N] \
+    [--per-dc true|false] \
+    [--promote-reads N] [--promote-window-secs N] [--cooldown-secs N]
+```
+
+**Example — Plexmedia-style warm cache:**
+
+```
+$ dtfs-cli volumes set-cache default \
+    --warm-min 1 --warm-max 1 --per-dc true \
+    --promote-reads 2 --promote-window-secs 14400 \
+    --cooldown-secs 300
+Volume 'default' set-cache: applied
+  warm: min=1 max=1
+  hot:  min=0 max=0
+  per_dc:               true
+  promote_reads:        2
+  promote_window_secs:  14400
+  cooldown_secs:        300
+```
+
+Idempotent: re-running with the same flags reports `no-op`.
+
+**Errors:**
+
+| Status | Reason |
+|--------|--------|
+| HTTP 400 | `max < min` for a tier (e.g. `--warm-min 2 --warm-max 1`). |
+| HTTP 404 | Volume not found. |
+
+---
+
+#### files flush-cache
+
+Bug AV (AV-3-5) — drop cache replicas under a path prefix. Mandatory
+(anchor) replicas are always preserved; a chunk whose flush would
+strand the anchor is refused and audited (`cache.flush_refused`).
+
+```bash
+dtfs-cli files flush-cache <path> \
+    [--cache-tiers warm[,hot]] \
+    [--cooldown-secs N] \
+    [--max-tasks N] \
+    [--allow-empty-prefix]
+```
+
+**Defaults:** `--cache-tiers warm`, `--cooldown-secs 300`,
+`--max-tasks 10000`.
+
+**Example:**
+
+```
+$ dtfs-cli files flush-cache /movies/Season-1/ --cooldown-secs 60
+flush-cache prefix=/movies/Season-1/ tiers=["warm"] cooldown=60s
+  files_matched     = 12
+  chunks_examined   = 482
+  replicas_dropped  = 482
+  mandatory_refusals = 0
+  unreachable_nodes = 0
+  rpc_failures      = 0
+  raft_failures     = 0
+```
+
+A non-zero `mandatory_refusals` indicates the planner protected
+against data loss for those chunks AND fired an `AnchorViolated`
+alert; investigate via the audit log:
+
+```bash
+dtfs-cli audit --action cache.flush_refused
+```
+
+See [REST API → POST /api/v1/files/flush_cache](./rest-api.md#post-apiv1filesflush_cache)
+for the underlying request body and audit semantics.
+
+> **Breaking change:** the legacy `dtfs-cli files --limit N`
+> moved to `dtfs-cli files list --limit N` to make room for the
+> `files flush-cache` subcommand. Both share the noun-verb
+> hierarchy used by `volumes`, `nodes`, etc.
 
 ---
 
 ### files
 
-List files tracked in the cluster.
+File-level operations. Two subcommands:
 
 ```bash
-dtfs-cli files
+dtfs-cli files list [--limit N]      # List files (default 50)
+dtfs-cli files flush-cache <path> …  # Bug AV — see above
+```
+
+#### files list
+
+```bash
+dtfs-cli files list [--limit N]
 ```
 
 | Option | Default | Description |
