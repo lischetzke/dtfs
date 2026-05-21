@@ -462,16 +462,86 @@ pub struct VolumeConfig {
     pub id: VolumeId,
     pub name: String,
     pub chunk_size_bytes: u64,
+    /// **Legacy**. The pre-Bug-AV single replication policy. Still
+    /// the read fallback when `mandatory_replicas` is empty (i.e.
+    /// all fields are 0). Operators on the new policy should set
+    /// `mandatory_replicas` and leave this alone for rollback safety.
     pub replication: TierReplication,
     pub write_safety: WriteSafety,
-    /// P0-10: if set, every chunk placement on this volume guarantees at
-    /// least one replica lives in the named datacenter. The tiering engine
-    /// also refuses migrations that would strand the last anchor copy
-    /// (preserves "DC-A has all data once" invariant in 3-DC topologies).
+    /// P0-10 / **Legacy**. If set, every chunk placement on this
+    /// volume guarantees at least one replica lives in the named
+    /// datacenter. The new tier-aware `anchor` field below
+    /// supersedes this when both are set.
     ///
     /// `#[serde(default)]` keeps existing volume snapshots loadable.
     #[serde(default)]
     pub anchor_datacenter: Option<String>,
+
+    // ── Bug AV — two-class tier lifecycle ──────────────────────────
+
+    /// Bug AV — required (always-on) per-tier replication factors.
+    /// Enforced by the under-replication scheduler. When every field
+    /// is 0 (the back-compat default), the scheduler falls back to
+    /// the legacy `replication` field via
+    /// `effective_mandatory_replicas()`.
+    ///
+    /// Uses a custom serde-default of `(0, 0, 0, 0)` rather than
+    /// `TierReplication::default()` (which is `(3, 2, 1, 1)`) — when
+    /// an old snapshot is loaded that doesn't carry this field, we
+    /// MUST land in the "all zero, defer to legacy" state, not in a
+    /// surprise "double-replicate everything" state.
+    #[serde(default = "VolumeConfig::default_mandatory_replicas")]
+    pub mandatory_replicas: TierReplication,
+    /// Bug AV — opportunistic per-DC cache per tier. Populated only
+    /// when the operator opts in; default is "all disabled" so legacy
+    /// volumes get exactly the pre-Bug-AV behaviour.
+    #[serde(default)]
+    pub cache_replicas: CacheReplication,
+    /// Bug AV — tier-aware anchor policy. Supersedes
+    /// `anchor_datacenter` when set; `effective_anchor()` does the
+    /// resolution.
+    #[serde(default)]
+    pub anchor: Option<AnchorPolicy>,
+}
+
+impl VolumeConfig {
+    /// Bug AV — serde-default for `mandatory_replicas`. See the
+    /// field-level comment for why this isn't `TierReplication::default()`.
+    fn default_mandatory_replicas() -> TierReplication {
+        TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 }
+    }
+
+    /// Bug AV — return the effective mandatory replication policy:
+    /// `mandatory_replicas` when it has any positive RF, otherwise the
+    /// legacy `replication` field. Lets the under-replication scheduler
+    /// honour the new schema while still working unchanged for legacy
+    /// volumes that haven't been migrated.
+    pub fn effective_mandatory_replicas(&self) -> &TierReplication {
+        let m = &self.mandatory_replicas;
+        if m.hot > 0 || m.warm > 0 || m.cold > 0 || m.tape > 0 {
+            m
+        } else {
+            &self.replication
+        }
+    }
+
+    /// Bug AV — return the effective anchor policy:
+    /// 1. `anchor` if `Some` (new tier-aware shape wins).
+    /// 2. else `anchor_datacenter` as an any-tier policy
+    ///    (`required_tier = None`).
+    /// 3. else `None` — no anchor enforcement.
+    ///
+    /// Returns a owned `AnchorPolicy` because the legacy fallback has
+    /// to construct one on the fly. Cheap: small struct, allocates a
+    /// single String clone.
+    pub fn effective_anchor(&self) -> Option<AnchorPolicy> {
+        if let Some(a) = &self.anchor {
+            return Some(a.clone());
+        }
+        self.anchor_datacenter
+            .as_ref()
+            .map(|dc| AnchorPolicy::from_legacy(dc.clone()))
+    }
 }
 
 impl Default for VolumeConfig {
@@ -483,6 +553,9 @@ impl Default for VolumeConfig {
             replication: TierReplication::default(),
             write_safety: WriteSafety::default(),
             anchor_datacenter: None,
+            mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 },
+            cache_replicas: CacheReplication::default(),
+            anchor: None,
         }
     }
 }
@@ -765,5 +838,81 @@ mod bug_av_types_tests {
         assert!(!round_tripped.is_satisfied_by("leli", None));
         // Wrong DC is rejected regardless of tier.
         assert!(!round_tripped.is_satisfied_by("toro", Some(DiskTier::Cold)));
+    }
+
+    // ---- AV-1-2 — VolumeConfig extension tests --------------------
+
+    /// Build a default-ish VolumeConfig and tweak via the helper.
+    /// Tests use this so future field additions on VolumeConfig don't
+    /// force every test to be rewritten.
+    fn vc_base() -> VolumeConfig {
+        VolumeConfig::default()
+    }
+
+    /// AV-1-2 test 1 — when `mandatory_replicas` is all-zero (the
+    /// back-compat shape applied to legacy snapshots), the helper
+    /// returns the legacy `replication` field. This is the
+    /// guarantee that lets us land the new schema dark without
+    /// behaviour change.
+    #[test]
+    fn bug_av_volume_legacy_replication_falls_back() {
+        let mut v = vc_base();
+        v.replication = TierReplication { hot: 3, warm: 2, cold: 1, tape: 1 };
+        // mandatory all 0 — the default-from-VolumeConfig::default()
+        v.mandatory_replicas = TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 };
+        let eff = v.effective_mandatory_replicas();
+        assert_eq!(eff.hot,  3);
+        assert_eq!(eff.warm, 2);
+        assert_eq!(eff.cold, 1);
+        assert_eq!(eff.tape, 1);
+    }
+
+    /// AV-1-2 test 2 — once the operator sets any positive
+    /// mandatory RF, the helper returns the new field. The legacy
+    /// `replication` is preserved untouched (rollback path).
+    #[test]
+    fn bug_av_volume_new_mandatory_takes_precedence() {
+        let mut v = vc_base();
+        v.replication = TierReplication { hot: 3, warm: 2, cold: 1, tape: 1 };
+        v.mandatory_replicas = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+        let eff = v.effective_mandatory_replicas();
+        assert_eq!(eff.cold, 1);
+        assert_eq!(eff.warm, 0); // mandatory's warm wins (=0), not legacy's (=2)
+    }
+
+    /// AV-1-2 test 3 — legacy `anchor_datacenter` (the old Option<String>)
+    /// resolves into an any-tier AnchorPolicy via the
+    /// `effective_anchor()` helper.
+    #[test]
+    fn bug_av_anchor_legacy_string_promoted() {
+        let mut v = vc_base();
+        v.anchor_datacenter = Some("leli".to_string());
+        v.anchor = None;
+        let p = v.effective_anchor().expect("anchor present");
+        assert_eq!(p.datacenter, "leli");
+        assert_eq!(p.required_tier, None);
+    }
+
+    /// AV-1-2 test 4 — the new struct form supersedes the legacy
+    /// string when both are present (the migration window: operator
+    /// has set `anchor` but hasn't cleaned up `anchor_datacenter`).
+    #[test]
+    fn bug_av_anchor_struct_overrides_legacy_string() {
+        let mut v = vc_base();
+        v.anchor_datacenter = Some("leli".into());
+        v.anchor = Some(AnchorPolicy {
+            datacenter: "leli".into(),
+            required_tier: Some(DiskTier::Cold),
+        });
+        let p = v.effective_anchor().expect("anchor present");
+        assert_eq!(p.required_tier, Some(DiskTier::Cold));
+    }
+
+    /// AV-1-2 test 5 — both legacy and new anchor unset → no anchor
+    /// enforcement.
+    #[test]
+    fn bug_av_anchor_neither_returns_none() {
+        let v = vc_base();
+        assert!(v.effective_anchor().is_none());
     }
 }

@@ -300,7 +300,7 @@ manually for now (or by the existing additive-migrate UI button).
     "leli", required_tier = "cold"` serde round-trip.
 * **Done when:** 7 tests green via `cargo test -p dtfs-common --release`.
 
-### ⬜ AV-1-2 — `VolumeConfig` + `FileMetadata` extension
+### ✅ AV-1-2 — `VolumeConfig` + `FileMetadata` extension (2026-05-21)
 
 * **Files:** `crates/dtfs-common/src/types.rs` (`VolumeConfig`),
   `crates/dtfs-raft/src/state_machine.rs` (`FileMetadata`,
@@ -853,6 +853,32 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-1-2 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-common/src/types.rs` (+148 lines — 3 fields on
+    VolumeConfig, 3 helper methods, 5 unit tests).
+  - `crates/dtfs-raft/src/state_machine.rs` (+14 lines on
+    FileMetadata + 7 call-site updates + 2 unit tests).
+  - `crates/dtfs-manager/src/api.rs` (1 construction site,
+    `create_volume` handler).
+  - `crates/dtfs-manager/src/main.rs` (1 construction site,
+    bootstrap-default volume).
+  - `crates/dtfs-manager/src/scheduler.rs` (1 construction site,
+    test helper).
+* **Unit tests** (`cargo test --workspace --release` filtered):
+  - dtfs-common: 7 AV-1-1 + 5 AV-1-2 = 12 AV tests; 36 total in
+    crate (24 pre-existing + 12 AV).
+  - dtfs-raft: 2 AV-1-2 tests; 22 total in crate (20 + 2 AV).
+* **Workspace regression**: all suites green (16/36/50/27/54/22).
+* **Live verification:** N/A — schema-only change, no on-cluster
+  behaviour shift until later tasks wire it.
+* **Deviations:** added 1 bonus test
+  `bug_av_anchor_neither_returns_none` — defensive check that
+  `effective_anchor()` returns `None` when both legacy and new
+  anchor fields are unset. Worth keeping; plan budget was 6 tests,
+  delivered 7.
 
 ### AV-1-1 — 2026-05-21
 

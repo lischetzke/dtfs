@@ -849,6 +849,13 @@ async fn create_volume(
             write_timeout_secs:      state.config.defaults.write_safety.write_timeout_secs,
         },
         anchor_datacenter: body.anchor_datacenter.clone(),
+        // Bug AV — new fields default to empty so the legacy
+        // construction path lands a back-compat volume. Operators on the
+        // new policy upgrade via `dtfs-cli volume migrate-policy`
+        // (AV-1-10) and `volume set-cache` (AV-3-5).
+        mandatory_replicas: dtfs_common::types::TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 },
+        cache_replicas: dtfs_common::types::CacheReplication::default(),
+        anchor: None,
     };
 
     let req = ClientRequest::UpsertVolume { config };
