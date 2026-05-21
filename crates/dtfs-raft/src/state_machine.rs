@@ -117,11 +117,41 @@ pub struct ClusterConfig {
 }
 
 /// A single entry in the audit log.
+///
+/// The historical shape was `{log_index, summary, timestamp_ms}` — populated
+/// only by Raft state-mutating commands themselves (via `apply_request`'s
+/// `audit(...)` helper). Bug AH extends the shape with structured fields so
+/// the per-manager local audit ring (`crates/dtfs-manager/src/audit.rs`) can
+/// fan its events out through Raft and have all voters see the same view via
+/// `/api/v1/audit`. All new fields are `#[serde(default)]` so older snapshots
+/// load unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AuditEntry {
     pub log_index: u64,
     pub summary: String,
     pub timestamp_ms: u64,
+    /// Bug AH — who initiated the event ("scheduler", "api", "system", or
+    /// the user/principal name once auth lands). Empty for legacy entries.
+    #[serde(default)]
+    pub actor: String,
+    /// Bug AH — dotted action category, e.g. `"replication.complete"`,
+    /// `"migration.failed"`, `"volume.create"`. Empty for legacy entries.
+    #[serde(default)]
+    pub action: String,
+    /// Bug AH — free-form target/subject, e.g. a chunk id, file path,
+    /// task id, node id. Empty for legacy entries.
+    #[serde(default)]
+    pub target: String,
+    /// Bug AH — outcome marker: `"success"`, `"pending"`, or a short
+    /// reason string for failures. Empty for legacy entries.
+    #[serde(default)]
+    pub result: String,
+    /// Bug AH — hostname of the manager that originated the event. Helps
+    /// operators understand which manager's scheduler / API handler
+    /// produced an entry; mirrored into `summary` for display. Empty for
+    /// legacy entries (where the originating manager is unrecoverable).
+    #[serde(default)]
+    pub origin_manager: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +752,15 @@ fn apply_request(
         log_index: log_id.index,
         summary,
         timestamp_ms: now_ms,
+        // Bug AH — Raft state-machine-internal entries don't carry the
+        // structured fields; the summary IS the description. Fan-out
+        // entries from manager-local AuditLog populate these via the
+        // `AppendAudit` variant below.
+        actor: String::new(),
+        action: String::new(),
+        target: String::new(),
+        result: String::new(),
+        origin_manager: String::new(),
     };
 
     match req {
@@ -1319,6 +1358,61 @@ fn apply_request(
                 );
             }
             ClientResponse::WriteLeasesReleased { count }
+        }
+
+        ClientRequest::UpdateNodeDiskUsage { node_id, per_disk } => {
+            // Bug AU — refresh per-disk total_bytes + used_bytes from
+            // the heartbeat. Snapshots referencing an unknown disk_id
+            // are dropped (the operator may have removed a disk since
+            // the heartbeat was sent). Aggregate node-level totals are
+            // recomputed from the updated disks so /api/v1/stats
+            // tier_breakdown reflects fresh per-tier usage too.
+            if let Some(info) = sm.nodes.get_mut(node_id) {
+                for (disk_id, total, used) in per_disk {
+                    if let Some(disk) = info.disks.iter_mut().find(|d| d.disk_id == *disk_id) {
+                        disk.total_bytes = *total;
+                        disk.used_bytes = *used;
+                    }
+                }
+                info.total_capacity = info.disks.iter().map(|d| d.total_bytes).sum();
+                info.used_capacity  = info.disks.iter().map(|d| d.used_bytes ).sum();
+            }
+            ClientResponse::Success
+        }
+
+        ClientRequest::AppendAudit {
+            actor,
+            action,
+            target,
+            result,
+            origin_manager,
+            timestamp_ms,
+        } => {
+            // Bug AH — fan-out from manager-local AuditLog. Build the
+            // entry from the originator's structured fields; synthesise a
+            // `summary` so legacy display paths (CLI's `dtfs-cli audit`,
+            // raft-internal logs) keep working without code changes.
+            let summary = if target.is_empty() {
+                format!("{action} [{origin_manager}]")
+            } else {
+                format!("{action}: {target} [{origin_manager}]")
+            };
+            let entry = AuditEntry {
+                log_index: log_id.index,
+                summary,
+                // Preserve the originator's wall-clock; Raft apply time is
+                // typically very close but can lag by network RTT, and
+                // operators want events ordered by when they happened at
+                // the source.
+                timestamp_ms: *timestamp_ms,
+                actor: actor.clone(),
+                action: action.clone(),
+                target: target.clone(),
+                result: result.clone(),
+                origin_manager: origin_manager.clone(),
+            };
+            push_audit_capped(&mut sm.audit_log, entry);
+            ClientResponse::Success
         }
     }
 }
@@ -2027,5 +2121,132 @@ mod posix_path_regression {
         let c = sm.files.get("/c.bin").unwrap();
         assert_eq!(c.chunks.len(), 1);
         assert_eq!(c.chunks[0].chunk_hash, "h-good");
+    }
+
+    // ---- Bug AH — replicated audit log fan-out ----
+
+    /// `AppendAudit` must push a fully-populated entry onto `sm.audit_log`
+    /// with structured fields preserved and a synthesised `summary` for
+    /// legacy display.
+    #[test]
+    fn bug_ah_append_audit_pushes_entry_with_structured_fields() {
+        let mut sm = StateMachineData::default();
+        let before = sm.audit_log.len();
+
+        let resp = apply_request(
+            &mut sm,
+            &mk_log_id(7),
+            &ClientRequest::AppendAudit {
+                actor: "scheduler".into(),
+                action: "replication.complete".into(),
+                target: "chunk=abc src=10 dst=11".into(),
+                result: "success".into(),
+                origin_manager: "mgr02".into(),
+                timestamp_ms: 1_779_000_000_000,
+            },
+        );
+        assert!(matches!(resp, ClientResponse::Success));
+        assert_eq!(sm.audit_log.len(), before + 1);
+
+        let entry = sm.audit_log.last().unwrap();
+        assert_eq!(entry.actor, "scheduler");
+        assert_eq!(entry.action, "replication.complete");
+        assert_eq!(entry.target, "chunk=abc src=10 dst=11");
+        assert_eq!(entry.result, "success");
+        assert_eq!(entry.origin_manager, "mgr02");
+        assert_eq!(entry.timestamp_ms, 1_779_000_000_000);
+        // Synthesised summary preserves the legacy display path.
+        assert!(entry.summary.contains("replication.complete"));
+        assert!(entry.summary.contains("chunk=abc src=10 dst=11"));
+        assert!(entry.summary.contains("mgr02"));
+        // log_index is the Raft log index at apply time.
+        assert_eq!(entry.log_index, 7);
+    }
+
+    /// `AppendAudit` with an empty target must still produce a sensible
+    /// summary (no trailing `": "`). Covers system events like
+    /// `manager.start` which carry only an actor/action/result.
+    #[test]
+    fn bug_ah_append_audit_targetless_summary_is_clean() {
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(8),
+            &ClientRequest::AppendAudit {
+                actor: "system".into(),
+                action: "manager.start".into(),
+                target: String::new(),
+                result: "success".into(),
+                origin_manager: "mgr01".into(),
+                timestamp_ms: 100,
+            },
+        );
+        let entry = sm.audit_log.last().unwrap();
+        assert_eq!(entry.summary, "manager.start [mgr01]");
+        assert!(entry.target.is_empty());
+    }
+
+    /// Bug AH compat — an `AuditEntry` serialised before the structured
+    /// fields existed (only `log_index` + `summary` + `timestamp_ms`)
+    /// must deserialise cleanly via `#[serde(default)]` on the new fields.
+    /// This guards every existing snapshot on disk.
+    #[test]
+    fn bug_ah_audit_entry_backward_compat_deserialise() {
+        let legacy = r#"{"log_index":42,"summary":"DeleteFile: /x","timestamp_ms":1234}"#;
+        let entry: AuditEntry = serde_json::from_str(legacy).expect("legacy shape must deserialise");
+        assert_eq!(entry.log_index, 42);
+        assert_eq!(entry.summary, "DeleteFile: /x");
+        assert_eq!(entry.timestamp_ms, 1234);
+        // New fields default to empty strings — safe for the API
+        // serializer to surface unchanged.
+        assert!(entry.actor.is_empty());
+        assert!(entry.action.is_empty());
+        assert!(entry.target.is_empty());
+        assert!(entry.result.is_empty());
+        assert!(entry.origin_manager.is_empty());
+    }
+
+    /// `AppendAudit` is subject to the same `MAX_AUDIT_LOG_ENTRIES` cap
+    /// as native audit pushes (CreateFile, RegisterNode, etc.) — both
+    /// paths flow through `push_audit_capped`. Verifies the cap holds
+    /// under a flood from the fan-out path.
+    #[test]
+    fn bug_ah_append_audit_respects_global_cap() {
+        let mut sm = StateMachineData::default();
+        // Fill close to the cap with native audit events first.
+        for i in 0..(MAX_AUDIT_LOG_ENTRIES as u64) {
+            apply_request(
+                &mut sm,
+                &mk_log_id(i + 1),
+                &ClientRequest::CreateFile {
+                    path: format!("/seed/{i}"),
+                    volume_id: "default".into(),
+                    chunk_size: 1024,
+                },
+            );
+        }
+        assert_eq!(sm.audit_log.len(), MAX_AUDIT_LOG_ENTRIES);
+
+        // Now flood with AppendAudit — the cap must still hold.
+        for i in 0..50 {
+            apply_request(
+                &mut sm,
+                &mk_log_id(MAX_AUDIT_LOG_ENTRIES as u64 + i + 1),
+                &ClientRequest::AppendAudit {
+                    actor: "scheduler".into(),
+                    action: "flood".into(),
+                    target: format!("evt={i}"),
+                    result: "success".into(),
+                    origin_manager: "mgr03".into(),
+                    timestamp_ms: 0,
+                },
+            );
+        }
+        assert_eq!(sm.audit_log.len(), MAX_AUDIT_LOG_ENTRIES);
+        // The newest entries should be the fan-out ones (FIFO eviction
+        // by `push_audit_capped`).
+        let last = sm.audit_log.last().unwrap();
+        assert_eq!(last.action, "flood");
+        assert_eq!(last.origin_manager, "mgr03");
     }
 }

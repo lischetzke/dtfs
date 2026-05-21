@@ -386,6 +386,25 @@ message HeartbeatRequest {
   // throughput card shows real numbers.
   uint64 total_bytes_read = 7;
   uint64 total_bytes_written = 8;
+  // Bug AU — per-disk live usage snapshot. The manager previously only
+  // received aggregate `total_bytes_used` and never refreshed
+  // NodeInfo.disks[*].used_bytes after the initial RegisterNode call,
+  // so the Bug AR per-disk view (Nodes page disk table) always showed
+  // the at-boot value. With this field the manager replaces
+  // disks[i].used_bytes on every heartbeat and the table tracks reality.
+  // Optional: older data nodes that don't emit this still register
+  // successfully (the manager keeps the boot snapshot in that case).
+  repeated DiskUsageSnapshot disk_usage = 9;
+}
+
+// Bug AU — per-disk live usage delivered with each heartbeat. The data
+// node statvfs's each configured disk and ships the result so the
+// manager's NodeInfo.disks[*].{total_bytes, used_bytes} reflect current
+// reality rather than the at-boot snapshot.
+message DiskUsageSnapshot {
+  uint32 disk_id = 1;
+  uint64 total_bytes = 2;
+  uint64 used_bytes = 3;
 }
 
 // P0-9: per-chunk read counter, one entry per (chunk, DC) cell, packed

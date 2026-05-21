@@ -4,13 +4,26 @@
 //! configuration changes, and access control decisions for compliance and
 //! debugging purposes.
 //!
-//! Uses a ring buffer with configurable maximum size for fast in-memory queries;
-//! when an archive directory is configured (P0-8), each entry is also appended
-//! to a daily-rotated JSONL file so historical events survive ring-buffer
-//! eviction and operator queries beyond the in-memory window.
+//! Three layers, from cheapest to most durable:
+//!
+//! 1. **Local in-memory ring buffer** (this struct's `entries`). Fast queries
+//!    inside the manager process; bounded to `max_entries` (default 10 000).
+//! 2. **Daily-rotated JSONL archive** on local disk (`archive_dir`, P0-8).
+//!    Survives ring-buffer eviction; per-manager only.
+//! 3. **Replicated Raft audit log** (Bug AH). When `raft` is set, every
+//!    `log()` call additionally spawns a tokio task that proposes a
+//!    `ClientRequest::AppendAudit` write. The state machine applies it on
+//!    every voter, so `/api/v1/audit` (which now reads from
+//!    `StateMachineData.audit_log`) returns the same view from any manager.
+//!    Spawn-and-forget with a 5 s timeout: audit fan-out failures never
+//!    block the request that triggered the audit, and the local
+//!    in-memory + JSONL paths still capture the event durably for
+//!    forensics if Raft is unhealthy.
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +50,8 @@ pub struct AuditFilter {
     pub limit: Option<usize>,
 }
 
-/// In-memory ring-buffer audit log with optional disk archive.
+/// In-memory ring-buffer audit log with optional disk archive AND optional
+/// cluster-wide Raft fan-out (Bug AH).
 pub struct AuditLog {
     entries: parking_lot::RwLock<Vec<AuditEntry>>,
     max_entries: usize,
@@ -46,6 +60,64 @@ pub struct AuditLog {
     /// eviction. Errors during archive writes are logged but do not fail the
     /// audit path (P0-8).
     archive_dir: Option<PathBuf>,
+    /// Bug AH — when set, every `log()` call additionally spawns a
+    /// tokio task that proposes `ClientRequest::AppendAudit` so all
+    /// managers see the event via the replicated state-machine
+    /// `audit_log`. Errors (ForwardToLeader during election, transport
+    /// failure, timeout) are logged at debug level and dropped: the
+    /// local ring + JSONL archive remain authoritative for forensics.
+    fanout: Option<RaftFanout>,
+}
+
+/// Bug AH — bundle of state needed to propose an `AppendAudit` Raft write.
+/// Cloned into the spawned fan-out task so the public `AuditLog::log()` stays
+/// non-async and non-blocking.
+#[derive(Clone)]
+struct RaftFanout {
+    raft: Arc<dtfs_raft::DtfsRaft>,
+    /// Hostname of this manager, embedded as `origin_manager` so operators
+    /// can tell which voter produced the event.
+    origin_manager: String,
+}
+
+impl RaftFanout {
+    /// Propose `ClientRequest::AppendAudit` and wait up to 5 s for the
+    /// Raft commit. On any error (ForwardToLeader on a follower, transport
+    /// failure, timeout) we log at debug level and drop — the originator's
+    /// local ring/archive still has the event for forensics. Audit fan-out
+    /// is best-effort; never block a real request on its completion.
+    async fn dispatch(&self, entry: &AuditEntry) {
+        let req = dtfs_raft::ClientRequest::AppendAudit {
+            actor: entry.actor.clone(),
+            action: entry.action.clone(),
+            target: entry.target.clone(),
+            result: entry.result.clone(),
+            origin_manager: self.origin_manager.clone(),
+            // AuditEntry.timestamp is seconds-since-epoch; the replicated
+            // entry stores ms (consistent with every other Raft-side
+            // timestamp). Multiply at the boundary.
+            timestamp_ms: (entry.timestamp as u64).saturating_mul(1_000),
+        };
+        let fut = self.raft.client_write(req);
+        match tokio::time::timeout(Duration::from_secs(5), fut).await {
+            Ok(Ok(_)) => { /* committed; followers will apply via Raft */ }
+            Ok(Err(e)) => {
+                // ForwardToLeader is the common case on followers — openraft
+                // 0.10 in this codebase does NOT auto-forward; the leader's
+                // own task is the one that proposes for everyone. Drop
+                // quietly on followers; the leader fans out for them
+                // anyway via its own AuditLog (every manager logs the
+                // same event redundantly into the local ring, and the
+                // leader's fan-out task wins). Bug AC verified the
+                // ForwardToLeader-as-Unavailable shape so this match is
+                // intentionally permissive.
+                tracing::debug!(error = %e, "Bug AH audit fan-out failed (non-leader or transport)");
+            }
+            Err(_) => {
+                tracing::debug!("Bug AH audit fan-out timed out after 5 s");
+            }
+        }
+    }
 }
 
 impl AuditLog {
@@ -57,6 +129,7 @@ impl AuditLog {
             )),
             max_entries,
             archive_dir: None,
+            fanout: None,
         }
     }
 
@@ -69,10 +142,56 @@ impl AuditLog {
             )),
             max_entries,
             archive_dir: Some(archive_dir),
+            fanout: None,
+        }
+    }
+
+    /// Bug AH — install the Raft fan-out hook AFTER construction. We do
+    /// this rather than passing the raft handle to the constructor because
+    /// `main.rs` builds the `AuditLog` (Arc) before the raft node is
+    /// initialised; the `JoinHandler` and a few other services already
+    /// capture the audit log via the early Arc clone. Calling
+    /// `with_raft_fanout` mutates a single Option field, so existing
+    /// Arc holders are unaffected.
+    ///
+    /// Requires `&mut self` — call BEFORE wrapping in Arc, OR use
+    /// `Arc::get_mut`/`Arc::try_unwrap` once at startup. We choose
+    /// the cleaner path: build raft first, then build AuditLog with the
+    /// raft handle (see `new_with_archive_and_fanout`).
+    pub fn enable_raft_fanout(&mut self, raft: Arc<dtfs_raft::DtfsRaft>, origin_manager: String) {
+        self.fanout = Some(RaftFanout { raft, origin_manager });
+    }
+
+    /// Bug AH — convenience constructor: archive + Raft fan-out wired
+    /// at creation time. Use this when the raft handle is available
+    /// before the AuditLog is built (the common case in main.rs after
+    /// the Bug AC startup ordering).
+    pub fn new_with_archive_and_fanout(
+        max_entries: usize,
+        archive_dir: PathBuf,
+        raft: Arc<dtfs_raft::DtfsRaft>,
+        origin_manager: String,
+    ) -> Self {
+        Self {
+            entries: parking_lot::RwLock::new(Vec::with_capacity(
+                max_entries.min(1024),
+            )),
+            max_entries,
+            archive_dir: Some(archive_dir),
+            fanout: Some(RaftFanout { raft, origin_manager }),
         }
     }
 
     /// Record an audit event.
+    ///
+    /// Three side effects, all best-effort:
+    ///   1. Append to local in-memory ring (bounded by `max_entries`).
+    ///   2. Append to daily-rotated JSONL archive on local disk if
+    ///      `archive_dir` is set.
+    ///   3. Spawn a tokio task that fans the event out to all managers
+    ///      via Raft if `fanout` is set (Bug AH). The task is
+    ///      detached — `log()` returns immediately so the caller is
+    ///      never blocked on Raft latency or leader election.
     pub fn log(&self, actor: &str, action: &str, target: &str, result: &str) {
         let entry = AuditEntry {
             timestamp: chrono::Utc::now().timestamp(),
@@ -87,6 +206,17 @@ impl AuditLog {
             if let Err(e) = append_to_archive(dir, &entry) {
                 tracing::error!(error = %e, "audit archive write failed");
             }
+        }
+
+        // Bug AH — fan out through Raft so every manager sees the event.
+        // Spawn-and-forget; the local ring + archive keep the event safe
+        // even if the Raft write never completes (split-brain, network
+        // partition, etc.).
+        if let Some(fanout) = self.fanout.clone() {
+            let entry_for_fanout = entry.clone();
+            tokio::spawn(async move {
+                fanout.dispatch(&entry_for_fanout).await;
+            });
         }
 
         let mut entries = self.entries.write();
@@ -272,5 +402,28 @@ mod tests {
         assert_eq!(log.len(), 2);
         let archived = query_archive(tmp.path(), &AuditFilter::default()).unwrap();
         assert_eq!(archived.len(), 4); // all four survive on disk
+    }
+
+    /// Bug AH — `AuditLog::new()` (no Raft) must remain runnable from a
+    /// synchronous test. The fan-out path is gated on `self.fanout` so
+    /// when it's None we don't call `tokio::spawn` (which requires a
+    /// runtime). Guards against future refactors that might
+    /// unconditionally spawn.
+    #[test]
+    fn bug_ah_log_without_fanout_does_not_require_runtime() {
+        let log = AuditLog::new(4);
+        // If this calls tokio::spawn() unconditionally, the test panics
+        // with "there is no reactor running".
+        log.log("system", "test", "tgt", "ok");
+        assert_eq!(log.len(), 1);
+    }
+
+    /// Bug AH — the same invariant for the archive-only constructor.
+    #[test]
+    fn bug_ah_log_with_archive_only_does_not_require_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = AuditLog::new_with_archive(4, tmp.path().to_path_buf());
+        log.log("system", "test", "tgt", "ok");
+        assert_eq!(log.len(), 1);
     }
 }
