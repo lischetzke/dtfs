@@ -525,6 +525,31 @@ impl VolumeConfig {
         }
     }
 
+    /// Bug AV (AV-1-10) — produce a new VolumeConfig where the
+    /// legacy `replication` field has been copied into
+    /// `mandatory_replicas` so the under-replication scheduler reads
+    /// the new field. Idempotent: if `mandatory_replicas` already
+    /// has any positive RF, the original config is returned
+    /// unchanged (the operator has already migrated or hand-tuned
+    /// the new shape).
+    ///
+    /// The legacy `replication` field is left untouched — keeps
+    /// rollback available (an operator who wants to revert just
+    /// zeros mandatory_replicas and the fallback kicks in).
+    /// `anchor_datacenter` legacy field is similarly preserved.
+    pub fn migrated_to_mandatory_schema(&self) -> Self {
+        let m = &self.mandatory_replicas;
+        let already_migrated =
+            m.hot > 0 || m.warm > 0 || m.cold > 0 || m.tape > 0;
+        if already_migrated {
+            return self.clone();
+        }
+        Self {
+            mandatory_replicas: self.replication.clone(),
+            ..self.clone()
+        }
+    }
+
     /// Bug AV — return the effective anchor policy:
     /// 1. `anchor` if `Some` (new tier-aware shape wins).
     /// 2. else `anchor_datacenter` as an any-tier policy
@@ -914,6 +939,42 @@ mod bug_av_types_tests {
     fn bug_av_anchor_neither_returns_none() {
         let v = vc_base();
         assert!(v.effective_anchor().is_none());
+    }
+
+    /// AV-1-10 — first migration call clones `replication` into
+    /// `mandatory_replicas`, leaving the legacy field intact for
+    /// rollback. After migration, `effective_mandatory_replicas()`
+    /// returns the new field (which equals the old field's value).
+    #[test]
+    fn bug_av_migrate_legacy_replication_clones_to_mandatory() {
+        let mut v = vc_base();
+        v.replication = TierReplication { hot: 3, warm: 2, cold: 1, tape: 1 };
+        v.mandatory_replicas = TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 };
+        let m = v.migrated_to_mandatory_schema();
+        assert_eq!(m.mandatory_replicas, TierReplication { hot: 3, warm: 2, cold: 1, tape: 1 });
+        // Legacy field preserved for rollback.
+        assert_eq!(m.replication,        TierReplication { hot: 3, warm: 2, cold: 1, tape: 1 });
+        // effective_* now picks the new field.
+        assert_eq!(m.effective_mandatory_replicas().for_tier(DiskTier::Cold), 1);
+    }
+
+    /// AV-1-10 — migration is idempotent. Running it twice (or
+    /// running it against a volume the operator has already
+    /// hand-tuned the new shape on) is a no-op and doesn't clobber
+    /// the post-migration values with the pre-migration legacy
+    /// field.
+    #[test]
+    fn bug_av_migrate_idempotent_when_both_present() {
+        let mut v = vc_base();
+        v.replication = TierReplication { hot: 3, warm: 2, cold: 1, tape: 1 };
+        // Operator already hand-tuned mandatory to a NEW shape
+        // (e.g. cold-only AV style):
+        v.mandatory_replicas = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+        let m = v.migrated_to_mandatory_schema();
+        // Mandatory preserved exactly — the migration MUST NOT
+        // overwrite with the pre-AV legacy values.
+        assert_eq!(m.mandatory_replicas, TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 });
+        assert_eq!(m.replication,        TierReplication { hot: 3, warm: 2, cold: 1, tape: 1 });
     }
 
     /// AV-1-8 — under-replication scheduler uses
