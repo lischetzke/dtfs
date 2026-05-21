@@ -799,12 +799,12 @@ manually for now (or by the existing additive-migrate UI button).
     existing cluster from legacy `replication` → `mandatory_replicas`
     + `cache_replicas`, including the rolling-upgrade gating and the
     rollback path.
-  - **`tests/proxmox/SOAK-RECOVERY-2026-05-21.md` Bug AV section** —
+  - **`plans/incidents/SOAK-RECOVERY-2026-05-21.md` Bug AV section** —
     full write-up: symptom (the user's question that started this),
     root cause (additive-only migrate, no delete path, no per-file
     tier preference), fix (everything in this plan), tests,
     live-verification log.
-  - **`tests/proxmox/MINICLUSTER-VERIFICATION-2026-05-21.md` Bug AV
+  - **`plans/reports/MINICLUSTER-VERIFICATION-2026-05-21.md` Bug AV
     section** — verification table + actual cluster output captured
     during AV-3-4 + AV-3-5 live demos.
 * **Tests:** doc smoke test; the runbook walkthrough is performed
@@ -1442,7 +1442,7 @@ AV-<phase>-<n>: <one-line summary>
 
 <2-3 sentence body.>
 
-Plan: tests/proxmox/PLAN-BUG-AV-TIER-LIFECYCLE.md (AV-<phase>-<n> ✅)
+Plan: plans/active/PLAN-BUG-AV-TIER-LIFECYCLE.md (AV-<phase>-<n> ✅)
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 ```
 

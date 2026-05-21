@@ -30,4 +30,6 @@ LOCK
 CURRENT
 MANIFEST-*
 
-dummy_files/.claude/
+# Local test corpus and Claude Code session state
+dummy_files/
+.claude/
