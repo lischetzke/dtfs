@@ -167,6 +167,11 @@ pub struct FuseConfig {
     pub readahead: ReadAheadConfig,
     pub cache: FuseCacheConfig,
     pub partition_safety: PartitionSafetyConfig,
+    /// Bug AV (AV-3-1) — write-path preferences. Optional; absent
+    /// block falls through to the safe default (`first_write_tier
+    /// = "cold"`) so a legacy `fuse.toml` keeps working.
+    #[serde(default)]
+    pub write: FuseWriteConfig,
 }
 
 // --- Sub-configs ---
@@ -467,6 +472,72 @@ pub struct ReadAheadConfig {
     pub prefetch_chunks: u32,
     #[serde(default = "default_prefetch_files")]
     pub prefetch_next_files: u32,
+}
+
+/// Bug AV (AV-3-1) — FUSE write-path preference for first-write
+/// chunk placement.
+///
+/// Two modes:
+///
+/// * **`"cold"`** (default): the FUSE client requests that the
+///   manager place the first chunk on the cold (mandatory anchor)
+///   tier. Write ACK waits for the cold replica to acknowledge —
+///   safer, slower in DCs with slow uplinks to the anchor DC.
+/// * **`"nearest-warm"`**: FUSE requests warm placement, ACKs the
+///   write as soon as a warm replica confirms, and the
+///   manager's anchor-lag-repair pass (AV-3-3) schedules a cold
+///   copy asynchronously. Faster ACKs at the cost of a short
+///   window where the chunk lives only on cache-class storage.
+///
+/// Any unrecognised string falls back to `"cold"` via
+/// `effective_first_write_tier`; we deliberately do NOT reject
+/// unknown values at parse time so a forward-compat addition
+/// (e.g. a future `"nearest-hot"`) doesn't brick existing
+/// clients during a rolling upgrade.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FuseWriteConfig {
+    #[serde(default = "default_first_write_tier")]
+    pub first_write_tier: String,
+}
+
+impl Default for FuseWriteConfig {
+    fn default() -> Self {
+        Self {
+            first_write_tier: default_first_write_tier(),
+        }
+    }
+}
+
+/// Resolved write-tier preference. Returned by
+/// `FuseWriteConfig::effective_first_write_tier`; consumers
+/// (`crates/dtfs-fuse/src/filesystem.rs`'s allocate_chunks call)
+/// match on this rather than parsing the raw string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstWriteTier {
+    /// Pin the first chunk to the cold (mandatory) tier — slower
+    /// ACK, no anchor-lag window.
+    Cold,
+    /// Place on nearest warm-tier node; anchor migration happens
+    /// asynchronously via AV-3-3.
+    NearestWarm,
+}
+
+impl FuseWriteConfig {
+    /// Normalise the configured string to a `FirstWriteTier`.
+    /// Any unrecognised value (typo, future tier name not yet
+    /// supported by this client) falls back to `Cold` — the safe
+    /// default that never breaks durability invariants.
+    pub fn effective_first_write_tier(&self) -> FirstWriteTier {
+        match self.first_write_tier.as_str() {
+            "nearest-warm" => FirstWriteTier::NearestWarm,
+            // "cold" + any other string — the safe fallback.
+            _ => FirstWriteTier::Cold,
+        }
+    }
+}
+
+fn default_first_write_tier() -> String {
+    "cold".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -791,6 +862,61 @@ max_io_percent = 10
             cfg.chunk_size_mb, 4,
             "DefaultsConfig.chunk_size_mb must default to 4; got {}",
             cfg.chunk_size_mb
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Bug AV (AV-3-1) — FuseWriteConfig parsing + safe fallback
+    // ---------------------------------------------------------------
+
+    /// AV-3-1 test 1 — when `fuse.toml` omits the `[write]` block
+    /// entirely (legacy config), `serde(default)` produces a
+    /// `FuseWriteConfig { first_write_tier: "cold" }` and
+    /// `effective_first_write_tier()` returns `Cold`.
+    #[test]
+    fn bug_av_fuse_write_config_default() {
+        let cfg: FuseWriteConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.first_write_tier, "cold");
+        assert_eq!(
+            cfg.effective_first_write_tier(),
+            FirstWriteTier::Cold
+        );
+        // Also via the struct's Default impl (used by serde on the
+        // parent FuseConfig).
+        let dflt = FuseWriteConfig::default();
+        assert_eq!(dflt.first_write_tier, "cold");
+    }
+
+    /// AV-3-1 test 2 — explicit `first_write_tier = "nearest-warm"`
+    /// parses and resolves to `FirstWriteTier::NearestWarm`.
+    #[test]
+    fn bug_av_fuse_write_config_nearest_warm_parsed() {
+        let cfg: FuseWriteConfig =
+            toml::from_str("first_write_tier = \"nearest-warm\"").unwrap();
+        assert_eq!(cfg.first_write_tier, "nearest-warm");
+        assert_eq!(
+            cfg.effective_first_write_tier(),
+            FirstWriteTier::NearestWarm
+        );
+    }
+
+    /// AV-3-1 test 3 — an unrecognised string falls back to `Cold`
+    /// at use-time. We deliberately do NOT reject at parse time so
+    /// a forward-compat addition (e.g. a future `"nearest-hot"`)
+    /// doesn't brick an older client during a rolling upgrade —
+    /// they just write cold instead.
+    #[test]
+    fn bug_av_fuse_write_config_invalid_value_falls_back_to_cold() {
+        let cfg: FuseWriteConfig =
+            toml::from_str("first_write_tier = \"banana\"").unwrap();
+        assert_eq!(
+            cfg.first_write_tier, "banana",
+            "raw string preserved for diagnostic logs"
+        );
+        assert_eq!(
+            cfg.effective_first_write_tier(),
+            FirstWriteTier::Cold,
+            "unknown values must fall back to the safe default"
         );
     }
 }
