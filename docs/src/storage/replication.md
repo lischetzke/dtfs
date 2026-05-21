@@ -2,6 +2,37 @@
 
 DTFS replicates chunks across multiple data nodes to tolerate hardware failures without data loss. Replication factors are configured independently per tier, allowing operators to balance durability against storage cost.
 
+## Two replication classes: mandatory vs cache
+
+Bug AV (2026-05) introduced two independent replication classes per
+volume. Conceptually:
+
+| Class | Source of truth | Who creates them | Who removes them |
+|-------|-----------------|------------------|-------------------|
+| **Mandatory** | `mandatory_replicas.{hot,warm,cold,tape}` | The under-replication scheduler — re-creates lost mandatory replicas continuously | Nobody, except operator-driven volume reconfiguration or `unlink` |
+| **Cache** | `cache_replicas.<tier>.{min,max}` | The tiering engine, on demand-driven read promotion | Operator (`POST /api/v1/files/flush_cache`), or tiering engine when the chunk goes cold again |
+
+The two classes coexist on the same chunk record — a `/movies/x.mkv`
+chunk on `data-primary01` (mandatory cold) and `data-warm01` (cache
+warm) sees both replicas listed in `chunk.node_addresses`; the
+distinction is virtual, derived from the volume's policy plus each
+replica's storage tier.
+
+See [Volume Configuration → Replication classes](../configuration/volume-config.md#replication-classes)
+for the configuration surface, [`Tiering`](./tiering.md#cache-tier-semantics-bug-av)
+for the promotion + cooldown rules that drive cache replica
+creation, and `cache.flush_replica` / `cache.flush_refused` audit
+events for the operator-visible lifecycle.
+
+### Anchor invariant
+
+Volumes additionally carry an `anchor.datacenter` setting (optionally
+pinned to a specific `anchor.required_tier`). The scheduler refuses
+any migration that would leave the volume with no mandatory replica
+in the anchor DC, and the cache-flush planner refuses any flush that
+would strand the anchor (an `AnchorViolated` alert fires when a
+flush attempt produces refusals — see the AV-1-11 hooks for details).
+
 ## Per-Tier Replication Factors
 
 Each temperature tier has its own default replication factor:

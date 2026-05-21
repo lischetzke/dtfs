@@ -2,6 +2,50 @@
 
 DTFS automatically classifies data into temperature tiers based on access patterns and migrates chunks to the appropriate storage media. The tiering engine runs on the manager leader node and periodically evaluates every chunk in the cluster.
 
+## Cache tier semantics (Bug AV)
+
+> **Status (2026-05):** Phase-1 of Bug AV is complete (schema,
+> flush, audit, alert, migration helpers); the demand-driven
+> promotion engine described below lands in Phase 2.
+> Until then, this section is a forward-reference: the volume
+> schema *carries* `cache_replicas` and the operator can
+> *manually* drop cache replicas via
+> [`POST /api/v1/files/flush_cache`](../api-reference/rest-api.md#post-apiv1filesflush_cache),
+> but the tiering engine still uses the legacy promotion rules
+> below for actual replica creation. Cache promotion driven by
+> `promote_reads` / `promote_window_secs` is gated on Phase 2.
+
+Cache replicas are **opportunistic** copies created by the tiering
+engine in response to read demand. Unlike mandatory replicas they
+are:
+
+* Freely evictable (operator flush; tiering-engine demotion).
+* Not counted toward write-safety thresholds (mandatory replicas
+  only).
+* Allowed to differ in count per DC (`cache_replicas.per_dc = true`
+  is the default; set `false` to scope the cache pool globally).
+
+See [Volume Configuration → Replication classes](../configuration/volume-config.md#replication-classes)
+for the full schema. The lifecycle is:
+
+```
+read demand   →   promote_reads counter in promote_window_secs
+              ↘
+                tiering engine creates 1..max cache replicas (Phase 2)
+                  ↘
+                    operator flushes      ↘
+                                          chunk enters cooldown_secs
+                                          ↘ no re-promotion until
+                                            cooldown expires
+                  ↗
+read again →  counter restarts in the new window
+```
+
+Phase-2 of Bug AV will wire `reads_by_dc` heartbeat telemetry
+end-to-end (currently the data node tracks per-chunk reads but does
+not bucket them by requester DC). Until then, cache replica
+creation falls back to the legacy temperature-based promotion below.
+
 ## Temperature Classification
 
 Each chunk maintains an access counter that the data nodes report to the manager via periodic heartbeats. The manager uses these counters to assign one of four temperature levels:
