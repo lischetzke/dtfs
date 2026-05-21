@@ -450,6 +450,195 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
+// ---------------------------------------------------------------------------
+// Bug AV (AV-2-1) — per-DC rolling read-window store
+// ---------------------------------------------------------------------------
+//
+// The legacy tiering path uses absolute counters (reads_1h, reads_24h)
+// computed by the data nodes. AV needs a per-(chunk, DC) sliding
+// window so the promotion engine can answer "how many reads from
+// THIS DC in the last `promote_window_secs`?". We carry one ring of
+// (timestamp_ms, count) samples per (chunk_id, dc); each heartbeat
+// converts the observed counter delta into one new sample.
+//
+// Memory bound: a sample is 12 bytes; promote_window_secs default 4h;
+// in the worst case the manager retains every heartbeat in that
+// window. With a 30 s heartbeat that's 480 samples = ~6 KB per
+// (chunk, dc). 10 000 chunks × 3 DCs = ~180 MB worst case; the
+// window prune below keeps this in practice well under 50 MB.
+//
+// All public helpers in this section are **pure** so the
+// promotion-decision tests (AV-2-2) can call them without spinning
+// up a runtime.
+
+/// One sample in the per-DC read window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadSample {
+    pub ts_ms: u64,
+    pub count: u32,
+}
+
+/// AV-2-1 pure kernel — count the total reads in
+/// `[now_ms - window_secs*1000, now_ms]`.
+///
+/// `samples` may be unsorted; the helper iterates exhaustively
+/// because the per-(chunk, dc) ring is small and the sort cost
+/// would dominate. Counts are saturated at `u32::MAX` so a runaway
+/// counter never wraps.
+pub(crate) fn count_reads_in_window(
+    samples: &[ReadSample],
+    now_ms: u64,
+    window_secs: u64,
+) -> u32 {
+    if samples.is_empty() || window_secs == 0 {
+        return 0;
+    }
+    let window_ms = window_secs.saturating_mul(1_000);
+    let lower = now_ms.saturating_sub(window_ms);
+    let mut total: u32 = 0;
+    for s in samples {
+        if s.ts_ms >= lower && s.ts_ms <= now_ms {
+            total = total.saturating_add(s.count);
+        }
+    }
+    total
+}
+
+/// AV-2-1 housekeeping helper — drop samples older than the window.
+/// Intended for in-place pruning of the ring-buffer that the engine
+/// keeps in its `read_windows` map. Not a hot-path operation; called
+/// once per heartbeat per affected (chunk, dc) pair.
+#[allow(dead_code)] // used by AV-2-4 wiring; kept here so the helpers stay co-located.
+pub(crate) fn prune_read_window(
+    samples: &mut Vec<ReadSample>,
+    now_ms: u64,
+    window_secs: u64,
+) {
+    if window_secs == 0 {
+        samples.clear();
+        return;
+    }
+    let window_ms = window_secs.saturating_mul(1_000);
+    let lower = now_ms.saturating_sub(window_ms);
+    samples.retain(|s| s.ts_ms >= lower);
+}
+
+// ---------------------------------------------------------------------------
+// Bug AV (AV-2-2) — pure cache-promotion decision kernel
+// ---------------------------------------------------------------------------
+
+/// AV-2-2 pure kernel — decide how many new cache replicas to
+/// create for `(chunk, dc, tier)`.
+///
+/// Inputs:
+/// * `read_count_in_window` — total reads from this DC within
+///   `promote_window_secs` (output of [`count_reads_in_window`]).
+/// * `tier_cfg` — the volume's `cache_replicas.<tier>` policy. A
+///   `max == 0` config disables the tier entirely.
+/// * `current_cache_replicas_in_dc` — existing cache replicas of
+///   this chunk already present in the DC. The result is bounded so
+///   we never over-create.
+/// * `cooldown_until_ms` — chunk's per-index cooldown set by
+///   operator flush (AV-1-4 `SetChunkCooldown`). `0` means no
+///   cooldown active.
+/// * `promote_reads_threshold` — `cache_replicas.promote_reads`.
+///   We refuse to promote unless `read_count_in_window` reaches this.
+/// * `now_ms` — caller-supplied current wall-clock (testable).
+///
+/// Returns the number of replicas to schedule. `0` means "do
+/// nothing" (every gate path returns `0`).
+///
+/// The basic-promotion path caps at `min` — the redundancy
+/// escalation pass that ramps toward `max` is opt-in
+/// (`ENABLE_CACHE_REDUNDANCY_ESCALATION = false` in Phase 2; see
+/// AV-2-4 wiring).
+pub(crate) fn plan_cache_promotion(
+    read_count_in_window: u32,
+    tier_cfg: &dtfs_common::types::CacheTierConfig,
+    current_cache_replicas_in_dc: u32,
+    cooldown_until_ms: u64,
+    promote_reads_threshold: u32,
+    now_ms: u64,
+) -> u32 {
+    // Gate 1 — tier disabled.
+    if tier_cfg.max == 0 {
+        return 0;
+    }
+    // Gate 2 — chunk in cooldown (set by operator flush).
+    if cooldown_until_ms > 0 && now_ms < cooldown_until_ms {
+        return 0;
+    }
+    // Gate 3 — promotion threshold not met.
+    if read_count_in_window < promote_reads_threshold {
+        return 0;
+    }
+    // Gate 4 — already at or above the basic-promotion floor.
+    // `target` is `min(min, max)` to defend against a config where
+    // the operator set `min > max` (validate() would have caught it,
+    // but be paranoid in the planner anyway).
+    let target = tier_cfg.min.min(tier_cfg.max);
+    target.saturating_sub(current_cache_replicas_in_dc)
+}
+
+// ---------------------------------------------------------------------------
+// Bug AV (AV-2-3) — pure cache-promotion target selection
+// ---------------------------------------------------------------------------
+
+/// Minimal projection of a node's state needed to score it as a
+/// cache-promotion target. Built by the engine from a single
+/// state-machine snapshot; the pure selector below operates only on
+/// this view so it's deterministically testable.
+#[derive(Debug, Clone)]
+pub(crate) struct NodeSelectionView {
+    pub node_id: u64,
+    pub datacenter: String,
+    /// Set true when the engine has confirmed the node hosts at
+    /// least one disk of the desired tier and that disk is healthy.
+    pub has_target_tier_disk: bool,
+    /// Free-capacity proxy, in bytes. Larger = preferred. The
+    /// engine derives this as
+    /// `node.total_capacity - node.used_capacity`.
+    pub free_capacity: u64,
+    /// True when the node is in `Draining` health state (operator
+    /// asked it to evacuate; never schedule new replicas there).
+    pub draining: bool,
+    /// True when the node already holds a replica of the chunk we'd
+    /// be promoting. The selector skips these so we don't duplicate
+    /// a replica on the same node.
+    pub already_holds_chunk: bool,
+}
+
+/// AV-2-3 pure kernel — pick the best cache-promotion target in
+/// `dc` for a chunk that currently doesn't have a cache replica
+/// there.
+///
+/// Selection rules (in this order):
+/// 1. Filter to nodes in `dc` only.
+/// 2. Exclude `draining = true`.
+/// 3. Exclude `already_holds_chunk = true`.
+/// 4. Exclude `has_target_tier_disk = false`.
+/// 5. Of the remainder, pick the highest `free_capacity`. Ties
+///    broken by lowest `node_id` (deterministic for tests + audit).
+///
+/// Returns the chosen `node_id`, or `None` if no candidate qualifies.
+pub(crate) fn select_promotion_target(
+    candidates: &[NodeSelectionView],
+    dc: &str,
+) -> Option<u64> {
+    candidates
+        .iter()
+        .filter(|n| n.datacenter == dc)
+        .filter(|n| !n.draining)
+        .filter(|n| !n.already_holds_chunk)
+        .filter(|n| n.has_target_tier_disk)
+        // max_by_key wants Ord; pack (free_capacity, -node_id) so the
+        // higher free_capacity wins, then the lower node_id wins.
+        // (We invert by mapping to `u64::MAX - node_id` so larger
+        // means "smaller original".)
+        .max_by_key(|n| (n.free_capacity, u64::MAX - n.node_id))
+        .map(|n| n.node_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,5 +680,261 @@ mod tests {
         assert_eq!(temperature_to_tier(DataTemperature::Cold), DiskTier::Cold);
         // Frozen -> Tape (archival), not Cold (fix for issue #14).
         assert_eq!(temperature_to_tier(DataTemperature::Frozen), DiskTier::Tape);
+    }
+}
+
+#[cfg(test)]
+mod bug_av_read_window_tests {
+    //! AV-2-1 — pure tests for `count_reads_in_window` /
+    //! `prune_read_window`. These run without a runtime because the
+    //! helpers are stateless.
+    use super::*;
+
+    fn s(ts_ms: u64, count: u32) -> ReadSample {
+        ReadSample { ts_ms, count }
+    }
+
+    /// AV-2-1 test 1 — samples inside the window contribute.
+    #[test]
+    fn bug_av_read_window_counts_inside_window() {
+        let now = 1_000_000;
+        // window = 60 s ⇒ lower bound = now - 60_000 = 940_000.
+        let samples = vec![s(940_000, 1), s(960_000, 2), s(1_000_000, 4)];
+        assert_eq!(count_reads_in_window(&samples, now, 60), 7);
+    }
+
+    /// AV-2-1 test 2 — samples older than the window are dropped from
+    /// the count, and `prune_read_window` actually removes them.
+    #[test]
+    fn bug_av_read_window_drops_outside() {
+        let now = 1_000_000;
+        // The 800_000 sample is 200 s old, outside a 60-s window.
+        let mut samples = vec![s(800_000, 99), s(960_000, 2), s(1_000_000, 4)];
+        assert_eq!(count_reads_in_window(&samples, now, 60), 6);
+        prune_read_window(&mut samples, now, 60);
+        assert_eq!(samples.len(), 2, "pruned ring drops the 800_000 sample");
+        assert!(samples.iter().all(|s| s.ts_ms >= 940_000));
+    }
+
+    /// AV-2-1 test 3 — empty input returns 0 (and doesn't underflow
+    /// the saturating-sub on `now_ms - window`).
+    #[test]
+    fn bug_av_read_window_handles_empty() {
+        assert_eq!(count_reads_in_window(&[], 1_000_000, 60), 0);
+        assert_eq!(count_reads_in_window(&[], 0, 60), 0);
+        // Pruning an empty ring is a no-op.
+        let mut empty: Vec<ReadSample> = Vec::new();
+        prune_read_window(&mut empty, 1_000_000, 60);
+        assert!(empty.is_empty());
+    }
+
+    /// AV-2-1 test 4 — unsorted input is handled correctly. The
+    /// helper must not assume monotonic timestamps (heartbeat
+    /// dedup, clock skew, etc.).
+    #[test]
+    fn bug_av_read_window_handles_unsorted_input() {
+        let now = 1_000_000;
+        // Interleaved old + recent samples.
+        let samples = vec![
+            s(1_000_000, 1),
+            s(500_000, 99), // older than the 60-s window
+            s(960_000, 3),
+            s(800_000, 50), // older
+            s(950_000, 2),
+        ];
+        // Only 1 + 3 + 2 = 6 are inside the 60-s window.
+        assert_eq!(count_reads_in_window(&samples, now, 60), 6);
+    }
+
+    /// AV-2-1 defensive — `window_secs = 0` returns 0 (every sample
+    /// is "older than" a 0-second window). Edge case caught early
+    /// because the type allows it.
+    #[test]
+    fn bug_av_read_window_zero_window_returns_zero() {
+        let samples = vec![s(1_000_000, 5), s(999_999, 5)];
+        assert_eq!(count_reads_in_window(&samples, 1_000_000, 0), 0);
+        let mut s2 = samples.clone();
+        prune_read_window(&mut s2, 1_000_000, 0);
+        assert!(s2.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bug_av_promotion_decision_tests {
+    //! AV-2-2 — pure tests for `plan_cache_promotion`. Each test
+    //! exercises one gate in the decision tree (disable, cooldown,
+    //! threshold, already-at-target).
+    use super::*;
+    use dtfs_common::types::CacheTierConfig;
+
+    fn cfg(min: u32, max: u32) -> CacheTierConfig {
+        CacheTierConfig { min, max }
+    }
+
+    /// AV-2-2 test 1 — read count below threshold → do nothing.
+    #[test]
+    fn bug_av_promote_first_read_below_threshold_does_nothing() {
+        let n = plan_cache_promotion(
+            /* read_count_in_window */ 1,
+            /* tier_cfg */ &cfg(1, 1),
+            /* current_cache_replicas_in_dc */ 0,
+            /* cooldown_until_ms */ 0,
+            /* promote_reads_threshold */ 2,
+            /* now_ms */ 1_000_000,
+        );
+        assert_eq!(n, 0);
+    }
+
+    /// AV-2-2 test 2 — threshold met, no current replicas →
+    /// returns `min`.
+    #[test]
+    fn bug_av_promote_threshold_met_returns_min_target_minus_current() {
+        let n = plan_cache_promotion(2, &cfg(1, 1), 0, 0, 2, 1_000_000);
+        assert_eq!(n, 1);
+    }
+
+    /// AV-2-2 test 3 — already at `min` → returns 0 (basic-promotion
+    /// path doesn't ramp into `max`).
+    #[test]
+    fn bug_av_promote_already_at_min_returns_zero() {
+        let n = plan_cache_promotion(10, &cfg(1, 2), 1, 0, 2, 1_000_000);
+        assert_eq!(n, 0, "current already at min=1; ramp to max=2 is reserved for the redundancy-escalation pass");
+    }
+
+    /// AV-2-2 test 4 — `max == 0` disables the tier entirely.
+    #[test]
+    fn bug_av_promote_max_zero_disables_promotion() {
+        let n = plan_cache_promotion(999, &cfg(0, 0), 0, 0, 1, 1_000_000);
+        assert_eq!(n, 0);
+    }
+
+    /// AV-2-2 test 5 — chunk in cooldown blocks promotion until the
+    /// cooldown expires.
+    #[test]
+    fn bug_av_promote_cooldown_blocks_until_expiry() {
+        // 2 reads in window, threshold 2, target 1 — would promote if
+        // not for the cooldown set 100 ms in the future.
+        let blocked = plan_cache_promotion(2, &cfg(1, 1), 0,
+            /* cooldown_until_ms */ 1_000_100,
+            /* threshold */ 2,
+            /* now_ms */ 1_000_000);
+        assert_eq!(blocked, 0);
+
+        // Same call after the cooldown expires unblocks the
+        // promotion.
+        let allowed = plan_cache_promotion(2, &cfg(1, 1), 0,
+            /* cooldown_until_ms */ 1_000_100,
+            /* threshold */ 2,
+            /* now_ms */ 1_000_200);
+        assert_eq!(allowed, 1);
+    }
+
+    /// AV-2-2 test 6 — when `min = 2` (per-DC HA), threshold met
+    /// returns 2 in a single decision so the engine schedules both
+    /// replicas at once.
+    #[test]
+    fn bug_av_promote_min_two_creates_two_at_once() {
+        let n = plan_cache_promotion(5, &cfg(2, 2), 0, 0, 2, 1_000_000);
+        assert_eq!(n, 2);
+    }
+
+    /// AV-2-2 defensive — a misconfigured `min > max` (validate()
+    /// would normally catch this at load) is clamped to `max` by the
+    /// planner so we never schedule more than the operator allowed.
+    #[test]
+    fn bug_av_promote_min_greater_than_max_clamps_to_max() {
+        let n = plan_cache_promotion(5, &cfg(3, 1), 0, 0, 2, 1_000_000);
+        assert_eq!(n, 1, "min=3 clamps to max=1");
+    }
+}
+
+#[cfg(test)]
+mod bug_av_target_selection_tests {
+    //! AV-2-3 — pure tests for `select_promotion_target`. Each test
+    //! exercises one filter clause + the free-capacity tiebreaker.
+    use super::*;
+
+    fn node(
+        id: u64,
+        dc: &str,
+        free: u64,
+        has_tier: bool,
+        draining: bool,
+        holds: bool,
+    ) -> NodeSelectionView {
+        NodeSelectionView {
+            node_id: id,
+            datacenter: dc.to_string(),
+            has_target_tier_disk: has_tier,
+            free_capacity: free,
+            draining,
+            already_holds_chunk: holds,
+        }
+    }
+
+    /// AV-2-3 test 1 — same DC, free-capacity tiebreak picks the
+    /// node with the most free space.
+    #[test]
+    fn bug_av_target_selects_most_free_in_dc() {
+        let candidates = vec![
+            node(10, "toro", 100, true, false, false),
+            node(11, "toro", 500, true, false, false), // winner
+            node(12, "toro", 200, true, false, false),
+        ];
+        let pick = select_promotion_target(&candidates, "toro");
+        assert_eq!(pick, Some(11));
+    }
+
+    /// AV-2-3 test 2 — `Draining` nodes never win even when their
+    /// free capacity beats everyone else's.
+    #[test]
+    fn bug_av_target_excludes_draining_nodes() {
+        let candidates = vec![
+            node(10, "toro", 9_999_999, true, /* draining */ true, false),
+            node(11, "toro", 100, true, false, false), // only legitimate option
+        ];
+        let pick = select_promotion_target(&candidates, "toro");
+        assert_eq!(pick, Some(11));
+    }
+
+    /// AV-2-3 test 3 — nodes already holding a replica of the chunk
+    /// are skipped.
+    #[test]
+    fn bug_av_target_excludes_existing_replica_holders() {
+        let candidates = vec![
+            node(10, "toro", 9_999_999, true, false, /* holds */ true),
+            node(11, "toro", 100, true, false, false), // only legitimate
+        ];
+        let pick = select_promotion_target(&candidates, "toro");
+        assert_eq!(pick, Some(11));
+    }
+
+    /// AV-2-3 test 4 — no warm/target-tier node in the DC → `None`.
+    /// The engine logs and gives up; the chunk is read straight from
+    /// the cold copy until the policy can be satisfied.
+    #[test]
+    fn bug_av_target_returns_none_when_no_dc_warm_node() {
+        let candidates = vec![
+            // Same DC but lacks the target tier.
+            node(10, "toro", 999_999, /* has_tier */ false, false, false),
+            // Right tier but wrong DC.
+            node(11, "nrb",  999_999, true, false, false),
+        ];
+        let pick = select_promotion_target(&candidates, "toro");
+        assert!(pick.is_none());
+    }
+
+    /// AV-2-3 defensive — when two nodes have *identical* free
+    /// capacity, the lower `node_id` wins (so the choice is
+    /// deterministic across runs / audit reviews).
+    #[test]
+    fn bug_av_target_ties_resolve_by_lower_node_id() {
+        let candidates = vec![
+            node(20, "toro", 100, true, false, false),
+            node(10, "toro", 100, true, false, false), // winner
+            node(30, "toro", 100, true, false, false),
+        ];
+        let pick = select_promotion_target(&candidates, "toro");
+        assert_eq!(pick, Some(10));
     }
 }
