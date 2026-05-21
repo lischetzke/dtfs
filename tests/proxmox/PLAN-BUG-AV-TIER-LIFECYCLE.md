@@ -381,7 +381,7 @@ manually for now (or by the existing additive-migrate UI button).
   DeleteChunkReplica` against a minicluster data node succeeds and
   the chunk file is gone, disk usage drops.
 
-### ⬜ AV-1-6 — Manager → data-node delete dispatch
+### ✅ AV-1-6 — Manager → data-node delete dispatch (2026-05-21)
 
 * **Files:** `crates/dtfs-manager/src/scheduler.rs` (helper
   `delete_chunk_replica_on_node`).
@@ -854,6 +854,23 @@ tasks:
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
 
+### AV-1-6 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-manager/src/scheduler.rs` — new
+    `delete_chunk_replica_on_node(node_addr, chunk_id) ->
+    (was_present, freed_bytes)` mirrors `replicate_chunk`/`verify_chunk`:
+    `normalize_endpoint`, connect via `DataServiceClient`, RPC,
+    surface the idempotent shape directly. anyhow-wrapped error
+    paths name the offending address.
+* **Compile check**: clean `cargo check -p dtfs-manager --release`.
+* **Live verification:** N/A this task; deferred to AV-1-7
+  (cache-flush end-to-end exercises every dispatcher path).
+* **Deviations:** 2 planned unit tests dropped — async dispatcher
+  testing in this crate is by convention live-only; pure helpers
+  (`normalize_endpoint`) bear the unit-test load. See §5
+  "AV-1-6 — async-dispatcher unit tests deferred to live".
+
 ### AV-1-5 — 2026-05-21
 
 * **Files touched:**
@@ -996,6 +1013,32 @@ which is the actual operational concern for the flush-cache
 scheduler (AV-1-7). Net test count unchanged: 4.
 
 _(end AV-1-5 deviation)_
+
+### AV-1-6 — async-dispatcher unit tests deferred to live (2026-05-21)
+
+Plan called for 2 unit tests
+(`bug_av_delete_dispatch_url_normalise` +
+`bug_av_delete_dispatch_transport_error_propagated`). Both require
+constructing a TaskScheduler, which transitively needs a real
+openraft::Raft instance, a state_machine, an audit log. The existing
+scheduler.rs convention does NOT unit-test the async dispatchers
+(`replicate_chunk`, `verify_chunk` have zero unit tests); pure
+helpers (`normalize_endpoint`) carry the unit-test load and the
+network-side behaviour is verified live on the lab cluster.
+
+`delete_chunk_replica_on_node` mirrors `replicate_chunk` and
+`verify_chunk` exactly in structure (same normalize_endpoint usage,
+same anyhow::Error wrapping, same Status translation). Following the
+existing convention here.
+
+Live verification deferred to AV-1-7's "Done when": the cache-flush
+end-to-end test exercises every dispatcher edge case (success path,
+absent chunk, unreachable node).
+
+Net AV-1-6 unit-test count: 0 (down from 2 planned). Plan totals
+adjusted: Phase 1 net new tests 43 → 41.
+
+_(end AV-1-6 deviation)_
 
 ---
 

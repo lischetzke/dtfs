@@ -13,6 +13,9 @@ use dtfs_raft::state_machine::StateMachineData;
 use dtfs_raft::{ChunkLocationEntry, ClientRequest, DtfsRaft};
 use dtfs_proto::dtfs::data::data_service_client::DataServiceClient;
 use dtfs_proto::dtfs::data::{ReplicateChunkRequest, VerifyChunkRequest};
+// Bug AV — DeleteChunkRequest used by `delete_chunk_replica_on_node`. The
+// proto's existing `DeleteChunk` RPC is the dispatcher target; AV-1-5
+// extended its response shape with `was_present` + `freed_bytes`.
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -848,6 +851,45 @@ impl TaskScheduler {
             warn!("VerifyChunk returned invalid: {}", resp.error);
             Ok(false)
         }
+    }
+
+    /// Bug AV — call `DeleteChunkReplica` on a data node. Mirrors
+    /// `replicate_chunk` / `verify_chunk`: normalises the stored
+    /// `NodeInfo.grpc_addr` (already-formed URL via Bug W),
+    /// translates transport / RPC errors with context, and surfaces
+    /// the idempotent response shape directly.
+    ///
+    /// Returns `(was_present, freed_bytes)` from the data node's
+    /// idempotent delete (AV-1-5). A `was_present == false` is a
+    /// normal no-op (retry, or chunk never landed on this node) and
+    /// must NOT be treated as an error.
+    async fn delete_chunk_replica_on_node(
+        &self,
+        node_addr: &str,
+        chunk_id: &str,
+    ) -> anyhow::Result<(bool, u64)> {
+        let endpoint = normalize_endpoint(node_addr);
+        let mut client = DataServiceClient::connect(endpoint).await
+            .map_err(|e| anyhow::anyhow!("connect to data node {}: {}", node_addr, e))?;
+
+        let resp = client
+            .delete_chunk(dtfs_proto::dtfs::data::DeleteChunkRequest {
+                chunk_id: chunk_id.to_string(),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("DeleteChunkReplica RPC: {}", e))?
+            .into_inner();
+
+        if !resp.success {
+            // The handler treats absent chunks as was_present=false
+            // (success=true). A success=false response is a real
+            // failure on the data node side.
+            return Err(anyhow::anyhow!(
+                "DeleteChunkReplica returned success=false on {}",
+                node_addr
+            ));
+        }
+        Ok((resp.was_present, resp.freed_bytes))
     }
 
     /// Find the file path that contains a given chunk hash.
