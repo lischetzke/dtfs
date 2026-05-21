@@ -721,18 +721,45 @@ manually for now (or by the existing additive-migrate UI button).
   hooks + heartbeat-delta sample push, all running on the
   minicluster.
 
-### ⬜ AV-2-5 — Cooldown clearance on demote
+### ✅ AV-2-5 — Cooldown clearance on demote
 
-* **Files:** `crates/dtfs-manager/src/tiering.rs`.
-* **Implementation:** when the engine demotes a chunk (cache replica
-  removed because idle), also clear that chunk's
-  `cache_cooldown_until_ms[idx]` via `SetChunkCooldown { ...,
-  expires_at_ms: 0 }`. Pre-existing operator flushes' cooldowns
-  remain because they were set with future timestamps.
-* **Tests:** `bug_av_demote_clears_cooldown`,
-  `bug_av_demote_does_not_clear_future_operator_cooldown`.
-* **Done when:** 2 tests + cluster behaviour shows that demote
-  followed by an immediate read can re-promote (demote ≠ flush).
+* **Files:** `crates/dtfs-manager/src/tiering.rs` +
+  `crates/dtfs-manager/src/scheduler.rs` (visibility bumps).
+* **Implementation:**
+  - New pure helper
+    `should_clear_cooldown_on_demote(cooldown_until_ms, now_ms)
+    -> bool` returning `true` for past/absent cooldowns, `false`
+    for future operator cooldowns. The dispatcher honours the
+    operator's intent on race-with-flush.
+  - `TickDemotion.cooldown_until_ms_at_snapshot: u64` carries
+    the planner-time cooldown through to the dispatcher (no
+    re-fetch from SM, deterministic in tests).
+  - Dispatcher in `tick_av_cache` now actually executes
+    demotion: resolve grpc addr → `DeleteChunkReplica` RPC →
+    `RemoveChunkLocation` Raft write → conditional
+    `SetChunkCooldown(expires_at_ms = 0)` clear via
+    `should_clear_cooldown_on_demote`. Each step audited with
+    the right reason code (`idle_window`,
+    `noop_already_absent`, `rpc_failed`,
+    `skipped_unreachable`).
+  - `TaskScheduler::node_grpc_addr`,
+    `delete_chunk_replica_on_node` bumped to `pub(crate)`; new
+    `raft()` accessor so the tiering engine can issue the two
+    additional Raft writes without re-implementing them.
+* **Tests (3 green):**
+  - `bug_av_demote_clears_cooldown`
+  - `bug_av_demote_does_not_clear_future_operator_cooldown`
+  - `bug_av_demote_carries_cooldown_through_planner` (defensive:
+    guards against future refactors stripping the snapshot
+    cooldown from `TickDemotion`).
+* **Done when:** 3 tests + smoke check on minicluster (binary
+  rolls cleanly; tiering engine starts). ✓ — verified 11:55 UTC.
+* **Deviation:** the cluster-behaviour demo
+  (demote → immediate read → re-promote without waiting for
+  cooldown) bundles into Phase 2 close-out alongside AV-2-4's
+  full live demo, because both need a `cache_replicas` volume
+  that needs the AV-3-5 CLI (or manual REST UpsertVolume) to
+  set up.
 
 ### ⬜ AV-2-6 — Documentation: tiering engine + promotion rules
 
@@ -936,6 +963,38 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-2-5 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-manager/src/tiering.rs` — new pure
+    `should_clear_cooldown_on_demote` helper, `TickDemotion`
+    extended with `cooldown_until_ms_at_snapshot`, dispatcher
+    in `tick_av_cache` now executes the full demote sequence
+    (DeleteChunkReplica → RemoveChunkLocation → conditional
+    SetChunkCooldown(0)) with per-step audit hooks.
+  - `crates/dtfs-manager/src/scheduler.rs` — `node_grpc_addr` +
+    `delete_chunk_replica_on_node` bumped to `pub(crate)`; new
+    `raft()` accessor so the tiering engine can propose
+    `RemoveChunkLocation` + `SetChunkCooldown` directly.
+* **Unit tests** (`cargo test -p dtfs-manager bug_av_demote`):
+  3 green:
+  - `bug_av_demote_clears_cooldown`
+  - `bug_av_demote_does_not_clear_future_operator_cooldown`
+  - `bug_av_demote_carries_cooldown_through_planner` (defensive)
+* **Workspace regression**: dtfs-manager 85 → 88; all other
+  crates unchanged. `cargo test --workspace --release` all green.
+* **Live verification** on minicluster (binaries rolled
+  2026-05-21 11:55 UTC):
+  - Smoke check: mini-mgr01 + mini-mgr03 came back up cleanly,
+    cluster info endpoints respond, no panics.
+  - Full demote → immediate-read → re-promote demo deferred to
+    Phase 2 close-out (same blocker as AV-2-4: needs a
+    cache_replicas-configured volume).
+* **Deviations:** none from plan structure; one extra
+  defensive test added because the snapshot-cooldown-carry
+  through `TickDemotion` was the single point where a refactor
+  could silently break operator-flush precedence.
 
 ### AV-2-4 — 2026-05-21
 
