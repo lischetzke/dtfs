@@ -241,6 +241,205 @@ impl Default for TierReplication {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bug AV — two-class tier lifecycle (mandatory anchor + opportunistic cache)
+//
+// `TierReplication` above is reused as `mandatory_replicas` (enforced by the
+// under-replication scheduler). The opportunistic cache class is expressed
+// by `CacheReplication` below — per-DC `(min, max)` caps with a promotion
+// trigger and a flush cooldown.
+//
+// See: tests/proxmox/PLAN-BUG-AV-TIER-LIFECYCLE.md for the full design.
+// ---------------------------------------------------------------------------
+
+/// Bug AV — per-tier cache configuration. `min` is the per-DC promotion
+/// target (when the read threshold fires, the tiering engine ramps the
+/// DC's cache replica count to `min`). `max` is the per-DC absolute cap;
+/// it equals `min` for the typical "1 cache replica per DC" use case but
+/// can be set higher to permit a future redundancy-escalation pass for
+/// fault tolerance within a DC.
+///
+/// **Two defaults at play.**
+///
+/// * `CacheTierConfig::default()` returns `(0, 0)` — the tier is
+///   disabled. This is what serde resolves to when the TOML parent
+///   doesn't mention this tier at all (so an empty
+///   `[cache_replicas]` block disables every tier).
+/// * The `#[serde(default = …)]` attributes on the individual fields
+///   make missing fields within a present struct default to `1, 1`.
+///   So `[cache_replicas.warm]` with no inner keys deserialises to
+///   `(1, 1)` — "tier explicitly enabled, default per-DC cap of 1".
+///
+/// This dual-default lets operators express "warm enabled" with a
+/// single-line subsection without having to spell out `min = 1 max = 1`,
+/// while still keeping the implicit-disabled behaviour when the tier
+/// section is absent entirely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheTierConfig {
+    #[serde(default = "CacheTierConfig::default_min")]
+    pub min: u32,
+    #[serde(default = "CacheTierConfig::default_max")]
+    pub max: u32,
+}
+
+impl CacheTierConfig {
+    fn default_min() -> u32 { 1 }
+    fn default_max() -> u32 { 1 }
+
+    /// Bug AV — validate the invariant `max >= min`. Called by the config
+    /// loader so a misconfigured volume is rejected with a clear error at
+    /// load time rather than producing surprising tiering behaviour at
+    /// runtime. Tier-disabled state `(0, 0)` is valid.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max < self.min {
+            return Err(format!(
+                "cache tier config: max ({}) must be >= min ({})",
+                self.max, self.min
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns true when this tier is disabled (no opportunistic
+    /// promotion will ever happen here).
+    pub fn is_disabled(&self) -> bool {
+        self.max == 0
+    }
+}
+
+impl Default for CacheTierConfig {
+    fn default() -> Self {
+        // Disabled when the parent doesn't mention this tier.
+        Self { min: 0, max: 0 }
+    }
+}
+
+/// Bug AV — opportunistic cache replication policy for a volume. Cache
+/// replicas are created by the tiering engine in response to read
+/// activity (`promote_reads` reads within `promote_window_secs` from a
+/// single DC), bounded by per-tier `min`/`max`, with a cooldown after
+/// operator-driven flushes to prevent immediate re-promotion.
+///
+/// All fields are `#[serde(default)]` so an empty `[cache_replicas]`
+/// block parses successfully and leaves every tier disabled (the safe
+/// back-compat path for pre-AV volumes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CacheReplication {
+    /// Hot-tier cache. Atypical (hot is usually mandatory) but legal.
+    #[serde(default)] pub hot:  CacheTierConfig,
+    /// Warm-tier cache. The most common use case (warm SSDs as
+    /// read-through cache for cold archive).
+    #[serde(default)] pub warm: CacheTierConfig,
+    /// Cold-tier cache. Almost always 0 — cold is normally mandatory.
+    #[serde(default)] pub cold: CacheTierConfig,
+    /// Tape-tier cache. Reserved as 0; tape doesn't make sense as a
+    /// cache target.
+    #[serde(default)] pub tape: CacheTierConfig,
+
+    /// When true, `min`/`max` are applied **per DC** where reads
+    /// originate. When false, they are cluster-wide caps. Default
+    /// true — matches the typical multi-DC locality intent.
+    #[serde(default = "CacheReplication::default_per_dc")]
+    pub per_dc: bool,
+
+    /// Promotion threshold: a chunk is eligible for promotion in a DC
+    /// when it has seen at least this many reads from that DC within
+    /// `promote_window_secs`. Default 2.
+    #[serde(default = "CacheReplication::default_promote_reads")]
+    pub promote_reads: u32,
+
+    /// Rolling read window for `promote_reads`, in seconds. Default
+    /// 14 400 (= 4 hours).
+    #[serde(default = "CacheReplication::default_promote_window_secs")]
+    pub promote_window_secs: u64,
+
+    /// After an operator-driven `flush_cache`, the tiering engine
+    /// refuses to re-promote affected chunks for this many seconds.
+    /// Default 300 (= 5 minutes).
+    #[serde(default = "CacheReplication::default_cooldown_secs")]
+    pub cooldown_secs: u64,
+}
+
+impl CacheReplication {
+    fn default_per_dc()            -> bool { true }
+    fn default_promote_reads()     -> u32  { 2 }
+    fn default_promote_window_secs() -> u64 { 4 * 3600 }
+    fn default_cooldown_secs()     -> u64  { 5 * 60 }
+
+    /// Per-tier accessor mirroring `TierReplication::for_tier`.
+    pub fn for_tier(&self, tier: DiskTier) -> &CacheTierConfig {
+        match tier {
+            DiskTier::Hot  => &self.hot,
+            DiskTier::Warm => &self.warm,
+            DiskTier::Cold => &self.cold,
+            DiskTier::Tape => &self.tape,
+        }
+    }
+
+    /// Validate every tier's `(min, max)` pair. Returns the first error
+    /// encountered with a tier prefix so the operator can find the
+    /// offending stanza.
+    pub fn validate(&self) -> Result<(), String> {
+        for (label, cfg) in [
+            ("hot",  &self.hot),
+            ("warm", &self.warm),
+            ("cold", &self.cold),
+            ("tape", &self.tape),
+        ] {
+            cfg.validate().map_err(|e| format!("{label}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// True when no tier permits any cache replica (i.e. all
+    /// `(min, max)` pairs are `(0, 0)`). Used by the scheduler to
+    /// short-circuit cache evaluation for legacy volumes.
+    pub fn all_disabled(&self) -> bool {
+        self.hot.is_disabled() && self.warm.is_disabled()
+            && self.cold.is_disabled() && self.tape.is_disabled()
+    }
+}
+
+/// Bug AV — anchor policy. Replaces the legacy
+/// `VolumeConfig.anchor_datacenter: Option<String>` with a tier-aware
+/// variant: `required_tier` constrains the anchor to a specific tier
+/// (e.g. "the cold copy in LELI is the anchor"). When `required_tier`
+/// is `None`, any tier in `datacenter` satisfies the invariant — that
+/// matches the legacy string behaviour and is the implicit conversion
+/// target for the back-compat helper below.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorPolicy {
+    pub datacenter: String,
+    /// When `None`: any replica in `datacenter` satisfies the anchor.
+    /// When `Some(t)`: the anchor replica MUST be in tier `t`.
+    #[serde(default)]
+    pub required_tier: Option<DiskTier>,
+}
+
+impl AnchorPolicy {
+    /// Bug AV — construct an AnchorPolicy from the legacy
+    /// `anchor_datacenter: Option<String>` field. Used by
+    /// `VolumeConfig::effective_anchor()` (AV-1-2) to give a single
+    /// resolved view to the scheduler/tiering engine regardless of
+    /// which schema version produced the volume.
+    pub fn from_legacy(datacenter: String) -> Self {
+        Self { datacenter, required_tier: None }
+    }
+
+    /// Returns true when `tier` and `datacenter` would together satisfy
+    /// this anchor policy. `tier=None` is treated as "tier unknown" and
+    /// fails any policy that requires a specific tier.
+    pub fn is_satisfied_by(&self, dc: &str, tier: Option<DiskTier>) -> bool {
+        if dc != self.datacenter {
+            return false;
+        }
+        match self.required_tier {
+            None => true,                  // any-tier match
+            Some(req) => tier == Some(req), // tier must match
+        }
+    }
+}
+
 /// Write safety configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WriteSafety {
@@ -409,5 +608,162 @@ mod tests {
         assert_eq!(tr.hot, 3);
         assert_eq!(tr.warm, 2);
         assert_eq!(tr.cold, 1);
+    }
+}
+
+#[cfg(test)]
+mod bug_av_types_tests {
+    //! Bug AV (AV-1-1) — tests for the new two-class tier lifecycle
+    //! types: CacheTierConfig, CacheReplication, AnchorPolicy.
+    //!
+    //! These tests use real TOML deserialisation because the configs
+    //! these types come from are TOML files (manager.toml's
+    //! `[defaults.cache_replicas]` block) — testing the actual format
+    //! is more informative than serde_json round-tripping.
+    use super::*;
+
+    /// AV-1-1 test 1 — when a TOML config has `[cache_replicas]` present
+    /// but doesn't mention any tier subsection, every tier defaults to
+    /// disabled `(0, 0)`. This is the safe back-compat path: a legacy
+    /// volume with the new struct serialised as `Default::default()`
+    /// produces no cache promotion.
+    #[test]
+    fn bug_av_cache_tier_disabled_when_not_mentioned() {
+        let toml_str = r#"
+            promote_reads = 2
+        "#;
+        let parsed: CacheReplication = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.hot,  CacheTierConfig { min: 0, max: 0 });
+        assert_eq!(parsed.warm, CacheTierConfig { min: 0, max: 0 });
+        assert_eq!(parsed.cold, CacheTierConfig { min: 0, max: 0 });
+        assert_eq!(parsed.tape, CacheTierConfig { min: 0, max: 0 });
+        // ... but non-tier defaults still come through.
+        assert_eq!(parsed.promote_reads, 2);
+        assert!(parsed.per_dc); // default true
+        // all_disabled() reports correctly.
+        assert!(parsed.all_disabled());
+    }
+
+    /// AV-1-1 test 2 — when an operator writes `[warm]` (an empty
+    /// subsection), the warm tier deserialises to `(1, 1)`: the field
+    /// `#[serde(default = …)]` attributes default the missing `min` and
+    /// `max` keys to 1, NOT 0. This matters because operators commonly
+    /// want to express "enable warm cache with the defaults" in one
+    /// line without spelling out `min = 1 max = 1`.
+    #[test]
+    fn bug_av_cache_tier_explicit_defaults_to_one_one() {
+        let toml_str = r#"
+            [warm]
+        "#;
+        let parsed: CacheReplication = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.warm, CacheTierConfig { min: 1, max: 1 });
+        // Other tiers remain disabled.
+        assert_eq!(parsed.hot,  CacheTierConfig { min: 0, max: 0 });
+        assert_eq!(parsed.cold, CacheTierConfig { min: 0, max: 0 });
+        assert_eq!(parsed.tape, CacheTierConfig { min: 0, max: 0 });
+        // is_disabled() reflects the new state.
+        assert!(!parsed.warm.is_disabled());
+        assert!(parsed.hot.is_disabled());
+    }
+
+    /// AV-1-1 test 3 — explicit `min`/`max` survives a ser→de round
+    /// trip with the values intact.
+    #[test]
+    fn bug_av_cache_tier_explicit_min_max_round_trip() {
+        let original = CacheTierConfig { min: 1, max: 2 };
+        let toml_str = toml::to_string(&original).unwrap();
+        let round_tripped: CacheTierConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(round_tripped, original);
+    }
+
+    /// AV-1-1 test 4 — a fully populated `CacheReplication` (every
+    /// tier mentioned, non-default scheduling parameters) survives
+    /// ser→de cleanly. Guards against accidental serde-attribute
+    /// regressions on any of the named fields.
+    #[test]
+    fn bug_av_cache_replication_full_serde_round_trip() {
+        let original = CacheReplication {
+            hot:  CacheTierConfig { min: 0, max: 0 },
+            warm: CacheTierConfig { min: 1, max: 2 },
+            cold: CacheTierConfig { min: 0, max: 0 },
+            tape: CacheTierConfig { min: 0, max: 0 },
+            per_dc: false,
+            promote_reads: 5,
+            promote_window_secs: 7200,
+            cooldown_secs: 600,
+        };
+        let toml_str = toml::to_string(&original).unwrap();
+        let round_tripped: CacheReplication = toml::from_str(&toml_str).unwrap();
+        assert_eq!(round_tripped, original);
+    }
+
+    /// AV-1-1 test 5 — the `validate()` helper rejects `max < min`.
+    /// Serde itself is permissive (it'll happily deserialise the bad
+    /// values); the config loader is expected to call `validate()` and
+    /// surface a meaningful error so the operator sees the problem at
+    /// load time rather than as confusing runtime behaviour.
+    #[test]
+    fn bug_av_cache_tier_rejects_max_less_than_min() {
+        let bad = CacheTierConfig { min: 3, max: 1 };
+        let err = bad.validate().unwrap_err();
+        assert!(err.contains("max (1)"),  "error mentions max: {err}");
+        assert!(err.contains("min (3)"),  "error mentions min: {err}");
+
+        // Tier-disabled (0, 0) is valid.
+        assert!(CacheTierConfig { min: 0, max: 0 }.validate().is_ok());
+        // min == max is valid (the typical case).
+        assert!(CacheTierConfig { min: 1, max: 1 }.validate().is_ok());
+        // max > min is valid (redundancy headroom).
+        assert!(CacheTierConfig { min: 1, max: 4 }.validate().is_ok());
+
+        // CacheReplication::validate() prefixes the error with the tier
+        // label so the operator can find the offending stanza.
+        let rep = CacheReplication {
+            warm: CacheTierConfig { min: 2, max: 1 },
+            ..Default::default()
+        };
+        let err = rep.validate().unwrap_err();
+        assert!(err.starts_with("warm:"), "error labels the tier: {err}");
+    }
+
+    /// AV-1-1 test 6 — `AnchorPolicy::from_legacy` converts the legacy
+    /// `anchor_datacenter: Option<String>` shape into a tier-agnostic
+    /// AnchorPolicy. Required by AV-1-2's
+    /// `VolumeConfig::effective_anchor()` so the scheduler sees a
+    /// uniform policy view regardless of which schema produced the
+    /// volume.
+    #[test]
+    fn bug_av_anchor_policy_legacy_string_compat() {
+        let p = AnchorPolicy::from_legacy("leli".to_string());
+        assert_eq!(p.datacenter, "leli");
+        assert_eq!(p.required_tier, None);
+        // The any-tier match accepts any tier in the named DC.
+        assert!(p.is_satisfied_by("leli", Some(DiskTier::Warm)));
+        assert!(p.is_satisfied_by("leli", Some(DiskTier::Cold)));
+        assert!(p.is_satisfied_by("leli", None));   // tier-unknown ok
+        // But not other DCs.
+        assert!(!p.is_satisfied_by("toro", Some(DiskTier::Warm)));
+    }
+
+    /// AV-1-1 test 7 — the new struct form round-trips through TOML
+    /// and `is_satisfied_by` enforces the tier constraint.
+    #[test]
+    fn bug_av_anchor_policy_struct_round_trip() {
+        let original = AnchorPolicy {
+            datacenter: "leli".into(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        let toml_str = toml::to_string(&original).unwrap();
+        let round_tripped: AnchorPolicy = toml::from_str(&toml_str).unwrap();
+        assert_eq!(round_tripped, original);
+
+        // Tier-pinned policy: only cold-in-leli satisfies.
+        assert!(round_tripped.is_satisfied_by("leli", Some(DiskTier::Cold)));
+        // Warm in the right DC is rejected — tier doesn't match.
+        assert!(!round_tripped.is_satisfied_by("leli", Some(DiskTier::Warm)));
+        // Right DC but tier unknown is rejected when required_tier is Some.
+        assert!(!round_tripped.is_satisfied_by("leli", None));
+        // Wrong DC is rejected regardless of tier.
+        assert!(!round_tripped.is_satisfied_by("toro", Some(DiskTier::Cold)));
     }
 }
