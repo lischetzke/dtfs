@@ -342,7 +342,7 @@ manually for now (or by the existing additive-migrate UI button).
   two paths share `FileMetadata.chunks` mutation but are
   semantically distinct).
 
-### ⬜ AV-1-4 — `SetChunkCooldown` Raft command
+### ✅ AV-1-4 — `SetChunkCooldown` Raft command (2026-05-21)
 
 * **Files:** `crates/dtfs-raft/src/lib.rs`, `state_machine.rs`.
 * **Implementation:** apply arm: walks `chunk_indexes`, sets
@@ -853,6 +853,19 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-1-4 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-raft/src/lib.rs` — `SetChunkCooldown` variant +
+    Display arm.
+  - `crates/dtfs-raft/src/state_machine.rs` — apply arm +
+    `apply_set_chunk_cooldown` helper + 4 unit tests.
+* **Unit tests:** 4 AV-1-4 (`bug_av_set_cooldown_*`) all green.
+* **Workspace regression**: dtfs-raft 28 → 32; all others unchanged.
+* **Live verification:** N/A — no production caller yet (AV-1-7
+  will use it; AV-2-5 clears via `expires_at_ms = 0`).
+* **Deviations:** none.
 
 ### AV-1-3 — 2026-05-21
 
