@@ -610,59 +610,67 @@ manually for now (or by the existing additive-migrate UI button).
 
 ## Phase 2 — Tiering engine: read-driven cache promotion (~2.5 d)
 
-### ⬜ AV-2-1 — Per-DC rolling read-window store
+### ✅ AV-2-1 — Per-DC rolling read-window store
 
 * **Files:** `crates/dtfs-manager/src/tiering.rs`.
-* **Implementation:** existing `report_access` already takes
-  `reads_by_dc: HashMap<String, u32>`. Today's engine sums across DCs
-  and uses fixed thresholds. New: a per-`(chunk_id, dc)` ring-buffer
-  of timestamps trimmed to `promote_window_secs`. Pure-function
-  helper `count_reads_in_window(samples, now_ms, window_secs) ->
-  u32`.
-* **Tests:**
+* **Implementation:** new `ReadSample { ts_ms, count }` struct
+  (each sample carries the heartbeat-delta count, so a single
+  bursty heartbeat doesn't bloat the ring). Pure helpers
+  `count_reads_in_window(samples, now_ms, window_secs)` and
+  `prune_read_window(samples, now_ms, window_secs)` for
+  ring-buffer housekeeping. The samples may be unsorted; the
+  count helper iterates exhaustively because the per-(chunk, dc)
+  ring is small.
+* **Tests (5 green):**
   - `bug_av_read_window_counts_inside_window`
   - `bug_av_read_window_drops_outside`
   - `bug_av_read_window_handles_empty`
   - `bug_av_read_window_handles_unsorted_input`
-* **Done when:** 4 tests green.
+  - `bug_av_read_window_zero_window_returns_zero` (defensive
+    edge case: 0-second window returns 0 / clears the ring).
+* **Done when:** 5 tests green. ✓
 
-### ⬜ AV-2-2 — Promotion decision (pure)
+### ✅ AV-2-2 — Promotion decision (pure)
 
 * **Files:** `crates/dtfs-manager/src/tiering.rs`.
 * **Implementation:** pure function `plan_cache_promotion(
-  read_count_in_window, tier_cfg: &CacheTierConfig,
-  current_cache_replicas_in_dc: u32, cooldown_until_ms: u64,
-  promote_reads_threshold: u32, now_ms: u64) -> u32`.
-  Returns the **number of new replicas to schedule** in this DC for
-  this tier. Logic:
-  - If `tier_cfg.max == 0` → cache tier disabled, return 0.
-  - If `now_ms < cooldown_until_ms` → return 0.
-  - If `read_count_in_window < promote_reads_threshold` → return 0.
-  - Otherwise: `min(tier_cfg.min, tier_cfg.max).saturating_sub(
-    current_cache_replicas_in_dc)`. (Caps at `min` for the basic
-    promotion path; the optional redundancy escalation pass below
-    can ramp further toward `max`.)
-* **Tests:**
+  read_count_in_window, tier_cfg, current_cache_replicas_in_dc,
+  cooldown_until_ms, promote_reads_threshold, now_ms) -> u32`.
+  Four gate paths each return early with 0; basic-promotion
+  branch returns `min(tier_cfg.min, tier_cfg.max).saturating_sub(
+  current_cache_replicas_in_dc)`. Caps at `min` for the basic
+  path; redundancy-escalation pass deferred to AV-2-4 wiring
+  with `ENABLE_CACHE_REDUNDANCY_ESCALATION = false`.
+* **Tests (7 green):**
   - `bug_av_promote_first_read_below_threshold_does_nothing`
   - `bug_av_promote_threshold_met_returns_min_target_minus_current`
   - `bug_av_promote_already_at_min_returns_zero`
   - `bug_av_promote_max_zero_disables_promotion`
   - `bug_av_promote_cooldown_blocks_until_expiry`
   - `bug_av_promote_min_two_creates_two_at_once`
-* **Done when:** 6 tests green.
+  - `bug_av_promote_min_greater_than_max_clamps_to_max`
+    (defensive: validate() would normally catch this at load,
+    but the planner clamps anyway).
+* **Done when:** 7 tests green. ✓
 
-### ⬜ AV-2-3 — Promotion target selection
+### ✅ AV-2-3 — Promotion target selection
 
 * **Files:** `crates/dtfs-manager/src/tiering.rs`.
-* **Implementation:** pick a warm-tier node in the requesting DC with
-  the most free space, excluding `Draining` nodes and nodes that
-  already hold this chunk. Returns `None` if no candidate.
-* **Tests:**
+* **Implementation:** new `NodeSelectionView` projection (the
+  pure-selector's input contract) + pure
+  `select_promotion_target(candidates, dc) -> Option<u64>`.
+  Filter order: DC match → not `draining` → not
+  `already_holds_chunk` → has target-tier disk. Pick highest
+  `free_capacity`, tie-break by **lowest** `node_id` for
+  deterministic audit output.
+* **Tests (5 green):**
   - `bug_av_target_selects_most_free_in_dc`
   - `bug_av_target_excludes_draining_nodes`
   - `bug_av_target_excludes_existing_replica_holders`
   - `bug_av_target_returns_none_when_no_dc_warm_node`
-* **Done when:** 4 tests green.
+  - `bug_av_target_ties_resolve_by_lower_node_id` (defensive:
+    deterministic tie-break is what audit logs depend on).
+* **Done when:** 5 tests green. ✓
 
 ### ⬜ AV-2-4 — `tiering::tick` wires AV-2-1..3 + schedules replication
 
@@ -904,6 +912,40 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-2-1 / AV-2-2 / AV-2-3 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-manager/src/tiering.rs` — three new private
+    sections at the bottom of the file (after `now_millis`):
+    1. AV-2-1 read-window store: `ReadSample` struct +
+       `count_reads_in_window` + `prune_read_window` pure
+       helpers.
+    2. AV-2-2 promotion decision: `plan_cache_promotion` pure
+       function with four gate paths + basic-promotion branch.
+    3. AV-2-3 target selection: `NodeSelectionView` projection +
+       `select_promotion_target` pure selector.
+  - All helpers are crate-private (`pub(crate)`) so AV-2-4
+    wiring can use them but external callers see only the
+    `TieringEngine` async API.
+* **Unit tests** (`cargo test -p dtfs-manager bug_av_`):
+  - AV-2-1: 5 green (`bug_av_read_window_*` × 5).
+  - AV-2-2: 7 green (`bug_av_promote_*` × 7).
+  - AV-2-3: 5 green (`bug_av_target_*` × 5).
+  - **17 total new tests; plan called for 4 + 6 + 4 = 14; 3
+    defensive edge-case tests added (zero-window, min>max,
+    tie-break determinism).**
+* **Workspace regression**: dtfs-manager 62 → 79; all other
+  crates unchanged. `cargo test --workspace --release` all
+  green.
+* **Live verification:** N/A — pure helpers; the wiring
+  (AV-2-4) is where live verification happens.
+* **Deviations:** none from the plan's "Done when" criteria;
+  3 extra defensive tests added because the boundary conditions
+  (zero window, misconfigured min/max, tie-break ordering) had
+  obvious risk paths and the cost of testing them was a few
+  lines each. Plan total adjustment: Phase 2 net new tests
+  20 → 23 once AV-2-4/5 land.
 
 ### AV-1-12 — 2026-05-21
 
