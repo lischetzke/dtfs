@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use dtfs_common::types::VolumeConfig;
+use dtfs_common::types::{AnchorPolicy, VolumeConfig};
 
 use crate::snapshot::{self, StateMachineSnapshot};
 use crate::{
@@ -1431,7 +1431,99 @@ fn apply_request(
             push_audit_capped(&mut sm.audit_log, entry);
             ClientResponse::Success
         }
+
+        ClientRequest::RemoveChunkLocation {
+            path,
+            chunk_index,
+            node_id,
+            enforce_anchor,
+        } => {
+            // Bug AV — operator-driven cache replica removal. Mutates
+            // `FileMetadata.chunks` to drop a single entry, with an
+            // optional anchor-strand check.
+            apply_remove_chunk_location(sm, path, *chunk_index, node_id, enforce_anchor.as_ref())
+        }
     }
+}
+
+/// Bug AV — apply path for `RemoveChunkLocation`, factored out for
+/// testability + readability. Returns the same ClientResponse the
+/// inline arm would.
+fn apply_remove_chunk_location(
+    sm: &mut StateMachineData,
+    path: &str,
+    chunk_index: u64,
+    node_id: &str,
+    enforce_anchor: Option<&AnchorPolicy>,
+) -> ClientResponse {
+    let file = match sm.files.get(path) {
+        Some(f) => f,
+        // Idempotent: unknown file → success no-op so a retry after
+        // a CrashRestart doesn't spam errors.
+        None => return ClientResponse::Success,
+    };
+
+    // Check the entry is even present. Idempotent on absent.
+    let entry_present = file.chunks.iter().any(|c| {
+        c.chunk_index == chunk_index && c.node_id == node_id
+    });
+    if !entry_present {
+        return ClientResponse::Success;
+    }
+
+    // Anchor safety: compute the post-removal state for this
+    // chunk_index and verify the anchor would still be satisfied by
+    // at least one remaining replica.
+    if let Some(policy) = enforce_anchor {
+        let survives_anchor = file.chunks.iter().any(|c| {
+            // The entry we're about to drop doesn't count.
+            if c.chunk_index == chunk_index && c.node_id == node_id {
+                return false;
+            }
+            // Only same chunk_index entries are relevant — different
+            // chunks aren't affected by removing this one.
+            if c.chunk_index != chunk_index {
+                return false;
+            }
+            // Resolve dc + tier via the node table.
+            let nid: u64 = match c.node_id.parse() {
+                Ok(n) => n,
+                Err(_) => return false,
+            };
+            let Some(ninfo) = sm.nodes.get(&nid) else { return false };
+            let dc = ninfo.location.datacenter.as_str();
+            let tier = ninfo
+                .disks
+                .get(c.disk_id as usize)
+                .map(|d| d.tier);
+            policy.is_satisfied_by(dc, tier)
+        });
+        if !survives_anchor {
+            return ClientResponse::Error {
+                message: format!(
+                    "RemoveChunkLocation refused: would strand anchor for {path}#{chunk_index} \
+                     (policy: dc={}{})",
+                    policy.datacenter,
+                    match policy.required_tier {
+                        Some(t) => format!(", required_tier={t}"),
+                        None => String::new(),
+                    },
+                ),
+            };
+        }
+    }
+
+    // Safe to drop. Mutate.
+    let file_mut = sm.files.get_mut(path).expect("checked above");
+    let before = file_mut.chunks.len();
+    file_mut.chunks.retain(|c| !(c.chunk_index == chunk_index && c.node_id == node_id));
+    let after = file_mut.chunks.len();
+    debug_assert_eq!(before.saturating_sub(after), 1, "drop exactly one entry");
+    file_mut.updated_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    ClientResponse::Success
 }
 
 // ---------------------------------------------------------------------------
@@ -2268,6 +2360,223 @@ mod posix_path_regression {
         let last = sm.audit_log.last().unwrap();
         assert_eq!(last.action, "flood");
         assert_eq!(last.origin_manager, "mgr03");
+    }
+
+    // ---- AV-1-3 — RemoveChunkLocation tests -----------------------
+
+    /// Build a minimal SM with one file + one chunk and the named
+    /// nodes pre-registered. Each node gets a single disk of the
+    /// requested tier in the requested DC. Used by the AV-1-3 tests.
+    fn sm_with_chunk(
+        file_path: &str,
+        chunk_index: u64,
+        chunk_hash: &str,
+        replicas: &[(u64, &str, dtfs_common::types::DiskTier)],
+    ) -> StateMachineData {
+        use dtfs_common::topology::Location;
+        use dtfs_common::types::DiskStatus;
+
+        let mut sm = StateMachineData::default();
+        for (nid, dc, tier) in replicas {
+            sm.nodes.insert(*nid, crate::NodeInfo {
+                role: dtfs_common::types::NodeRole::Data,
+                hostname: format!("node-{nid}"),
+                grpc_addr: String::new(),
+                location: Location::new("lab", dc, "rack-1", &format!("node-{nid}")),
+                disks: vec![dtfs_common::types::DiskInfo {
+                    disk_id: 0,
+                    uuid: String::new(),
+                    mount_path: String::new(),
+                    tier: *tier,
+                    total_bytes: 0,
+                    used_bytes: 0,
+                    status: DiskStatus::Healthy,
+                }],
+                total_capacity: 0,
+                used_capacity: 0,
+                health: dtfs_common::types::HealthStatus::Healthy,
+                last_seen_ms: 0,
+                total_bytes_read: 0,
+                total_bytes_written: 0,
+            });
+        }
+        sm.files.insert(file_path.to_string(), FileMetadata {
+            path: file_path.to_string(),
+            volume_id: "default".to_string(),
+            chunk_size: 1024,
+            chunks: replicas
+                .iter()
+                .map(|(nid, _, _)| ChunkLocationEntry {
+                    chunk_index,
+                    chunk_hash: chunk_hash.to_string(),
+                    node_id: nid.to_string(),
+                    disk_id: 0,
+                    size_bytes: 1024,
+                })
+                .collect(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+        });
+        sm
+    }
+
+    /// AV-1-3 test 1 — happy path: drop one entry, others survive.
+    #[test]
+    fn bug_av_remove_chunk_location_drops_entry() {
+        use dtfs_common::types::DiskTier;
+        let mut sm = sm_with_chunk("/x", 0, "h", &[
+            (10, "dc-a", DiskTier::Cold),
+            (11, "dc-b", DiskTier::Warm),
+        ]);
+        let resp = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "11".into(),
+                enforce_anchor: None,
+            });
+        assert!(matches!(resp, ClientResponse::Success));
+        let f = sm.files.get("/x").unwrap();
+        assert_eq!(f.chunks.len(), 1);
+        assert_eq!(f.chunks[0].node_id, "10");
+    }
+
+    /// AV-1-3 test 2 — unknown file → idempotent no-op success.
+    #[test]
+    fn bug_av_remove_chunk_location_unknown_file_is_noop() {
+        let mut sm = StateMachineData::default();
+        let resp = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/nope".into(),
+                chunk_index: 0,
+                node_id: "10".into(),
+                enforce_anchor: None,
+            });
+        assert!(matches!(resp, ClientResponse::Success));
+        assert!(sm.files.is_empty());
+    }
+
+    /// AV-1-3 test 3 — unknown (chunk_index, node) → idempotent no-op.
+    #[test]
+    fn bug_av_remove_chunk_location_unknown_node_is_noop() {
+        use dtfs_common::types::DiskTier;
+        let mut sm = sm_with_chunk("/x", 0, "h", &[(10, "dc-a", DiskTier::Cold)]);
+        let resp = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "99".into(),  // not present
+                enforce_anchor: None,
+            });
+        assert!(matches!(resp, ClientResponse::Success));
+        let f = sm.files.get("/x").unwrap();
+        assert_eq!(f.chunks.len(), 1, "no entry dropped");
+    }
+
+    /// AV-1-3 test 4 — anchor-strand protection: refuse to drop the
+    /// last anchor-satisfying replica.
+    #[test]
+    fn bug_av_remove_chunk_location_refuses_to_strand_anchor() {
+        use dtfs_common::types::{AnchorPolicy, DiskTier};
+        let mut sm = sm_with_chunk("/x", 0, "h", &[
+            (10, "leli", DiskTier::Cold),
+            (11, "toro", DiskTier::Warm),
+        ]);
+        // Attempt to drop the only leli-resident replica — last anchor copy.
+        let resp = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "10".into(),
+                enforce_anchor: Some(AnchorPolicy {
+                    datacenter: "leli".into(),
+                    required_tier: None,  // any-tier-in-leli policy
+                }),
+            });
+        match resp {
+            ClientResponse::Error { message } => {
+                assert!(message.contains("strand anchor"), "msg: {message}");
+                assert!(message.contains("leli"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // SM unchanged.
+        let f = sm.files.get("/x").unwrap();
+        assert_eq!(f.chunks.len(), 2);
+    }
+
+    /// AV-1-3 test 5 — tier-aware anchor: with `required_tier=Cold`,
+    /// dropping a warm replica in the anchor DC is fine (cold replica
+    /// elsewhere satisfies); but dropping the only cold replica IS
+    /// stranded (because the remaining warm-in-leli doesn't match the
+    /// required tier).
+    #[test]
+    fn bug_av_remove_chunk_location_anchor_tier_required_check() {
+        use dtfs_common::types::{AnchorPolicy, DiskTier};
+        let policy = AnchorPolicy {
+            datacenter: "leli".into(),
+            required_tier: Some(DiskTier::Cold),
+        };
+
+        // (a) Setup: one cold-in-leli + one warm-in-leli.
+        //     Drop the warm replica → still 1 cold-in-leli → OK.
+        let mut sm = sm_with_chunk("/x", 0, "h", &[
+            (10, "leli", DiskTier::Cold),
+            (11, "leli", DiskTier::Warm),
+        ]);
+        let resp = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "11".into(), // warm
+                enforce_anchor: Some(policy.clone()),
+            });
+        assert!(matches!(resp, ClientResponse::Success));
+        assert_eq!(sm.files.get("/x").unwrap().chunks.len(), 1);
+
+        // (b) Same setup; drop the cold replica → only warm-in-leli
+        //     remains, which doesn't satisfy required_tier=Cold → REFUSE.
+        let mut sm = sm_with_chunk("/x", 0, "h", &[
+            (10, "leli", DiskTier::Cold),
+            (11, "leli", DiskTier::Warm),
+        ]);
+        let resp = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "10".into(),  // cold
+                enforce_anchor: Some(policy),
+            });
+        assert!(matches!(resp, ClientResponse::Error { .. }));
+        assert_eq!(sm.files.get("/x").unwrap().chunks.len(), 2, "unchanged");
+    }
+
+    /// AV-1-3 test 6 — any-tier anchor policy allows dropping a
+    /// warm-in-anchor-DC replica as long as another replica in the
+    /// anchor DC survives (any tier).
+    #[test]
+    fn bug_av_remove_chunk_location_anchor_any_tier_allowed() {
+        use dtfs_common::types::{AnchorPolicy, DiskTier};
+        let mut sm = sm_with_chunk("/x", 0, "h", &[
+            (10, "leli", DiskTier::Cold),  // anchor survivor
+            (11, "leli", DiskTier::Warm),  // dropping this
+        ]);
+        let resp = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "11".into(),
+                enforce_anchor: Some(AnchorPolicy {
+                    datacenter: "leli".into(),
+                    required_tier: None,  // any tier
+                }),
+            });
+        assert!(matches!(resp, ClientResponse::Success));
+        assert_eq!(sm.files.get("/x").unwrap().chunks.len(), 1);
     }
 
     // ---- AV-1-2 — FileMetadata.cache_cooldown_until_ms tests ------

@@ -322,7 +322,7 @@ manually for now (or by the existing additive-migrate UI button).
 * **Done when:** All 6 tests green. Existing
   `state_machine_tests::snapshot_roundtrip` still passes.
 
-### ⬜ AV-1-3 — `RemoveChunkLocation` Raft command
+### ✅ AV-1-3 — `RemoveChunkLocation` Raft command (2026-05-21)
 
 * **Files:** `crates/dtfs-raft/src/lib.rs` (variant + Display arm),
   `crates/dtfs-raft/src/state_machine.rs` (apply arm).
@@ -853,6 +853,22 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-1-3 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-raft/src/lib.rs` — `RemoveChunkLocation` enum
+    variant + Display arm + `AnchorPolicy` import.
+  - `crates/dtfs-raft/src/state_machine.rs` — apply arm
+    (delegates to pure helper `apply_remove_chunk_location` for
+    testability) + 6 unit tests + `sm_with_chunk` test factory.
+* **Unit tests** (`cargo test -p dtfs-raft --release bug_av`):
+  8 AV tests (2 AV-1-2 + 6 AV-1-3) all green.
+* **Workspace regression**: dtfs-raft 22 → 28, all other crates
+  unchanged. `cargo test --workspace --release` all green.
+* **Live verification:** N/A — Raft variant + apply path only;
+  no production caller yet (AV-1-7 will wire flush_cache to it).
+* **Deviations:** none.
 
 ### AV-1-2 — 2026-05-21
 
