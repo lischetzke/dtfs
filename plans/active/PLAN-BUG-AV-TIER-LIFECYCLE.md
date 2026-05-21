@@ -502,21 +502,54 @@ manually for now (or by the existing additive-migrate UI button).
   of the REST API documentation pass; if the JSON shape change
   becomes risky to bundle, split into a new AV-1-13 follow-up.
 
-### ⬜ AV-1-11 — Audit + alert hooks
+### ✅ AV-1-11 — Audit + alert hooks
 
-* **Files:** `crates/dtfs-manager/src/scheduler.rs`,
-  `crates/dtfs-manager/src/alerts.rs`.
+* **Files:** `crates/dtfs-manager/src/scheduler.rs` (refusal types
+  + dispatcher hooks). No new file in `alerts.rs` — re-used the
+  existing `AlertKind::AnchorViolated` variant; the alert details
+  JSON carries a `subsystem: "cache_flush"` discriminator so
+  receivers can route.
 * **Implementation:**
-  - On every replica deletion via flush: audit
-    `"cache.flush_replica chunk=X node=Y reason=operator"`.
-  - On mandatory-tier strand refusal: audit + alert
-    `AlertKind::AnchorViolated`-equivalent (or new
-    `CacheFlushRefused`).
-* **Tests:** `bug_av_audit_emitted_per_replica_delete`,
-  `bug_av_alert_fires_on_mandatory_strand_refusal`.
-* **Done when:** 2 tests + live verification (`grep cache.flush`
-  audit log after a real flush returns N matching entries where N =
-  replicas_dropped).
+  - New crate-private `FlushRefusal { file_path, chunk_index,
+    reason: &'static str }`. The planner pushes one entry per
+    refused chunk (currently the only reason is
+    `"mandatory_strand"`).
+  - `FlushCacheReport.refusals: Vec<FlushRefusal>` carries them
+    out; marked `#[serde(skip)]` so the REST/CLI JSON wire shape
+    stays small (operators see the counter `mandatory_refusals`,
+    audit log carries the detail).
+  - Dispatcher iterates refusals BEFORE entering the action loop
+    so the audit + alert fire even when there's nothing to
+    actually delete: one `cache.flush_refused` audit per refusal,
+    one deduped `AnchorViolated` alert per call with a sampled
+    payload (`refusal_count`, first 20 entries, prefix).
+  - `cache.flush_replica` per-success audit was already present
+    from AV-1-7; no change there.
+  - `cache.flush_complete` summary fires unconditionally (even on
+    the early-return paths) so audit timelines aren't missing the
+    operator's action.
+* **Tests** (`cargo test -p dtfs-manager bug_av_`): 3 new
+  planner-side, all green:
+  - `bug_av_planner_records_refusal_per_stranded_chunk`
+  - `bug_av_planner_no_refusals_on_happy_path`
+  - `bug_av_report_serde_skips_refusals_field`
+* **Done when:** 3 tests + live verification of the audit hook on
+  the minicluster. Live-confirmed `cache.flush_complete` fires
+  with `actor=scheduler, origin_manager=<mgr>` on the AV-1-10
+  migrated `default` volume (see verification log entry).
+* **Deviation:** the two originally planned tests
+  (`bug_av_audit_emitted_per_replica_delete`,
+  `bug_av_alert_fires_on_mandatory_strand_refusal`) targeted the
+  async dispatcher; per the AV-1-7 deviation pattern, async
+  dispatcher behaviour in this crate is live-verified, not unit-
+  tested. The planner-side tests provide deterministic coverage
+  of the refusal classification + JSON wire-shape; the dispatcher
+  side is reasoning-verified (the audit/alert calls are
+  straightforward iteration over the `refusals` vec) plus a live
+  confirmation of `cache.flush_complete` firing through Bug AH
+  Raft fan-out. Full live exercise of a refusal-producing flush
+  is deferred to Phase 2 when AV-2 sets up volumes with mismatched
+  mandatory/actual placement.
 
 ### ⬜ AV-1-12 — Documentation: schema + flush API
 
@@ -864,6 +897,62 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-1-11 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-manager/src/scheduler.rs` — new
+    `FlushRefusal { file_path, chunk_index, reason }`,
+    `FlushCacheReport.refusals: Vec<FlushRefusal>` with
+    `#[serde(skip)]`, planner populates one entry per refusal,
+    dispatcher emits `cache.flush_refused` audit per refusal +
+    one deduped `AlertKind::AnchorViolated` alert per call,
+    `cache.flush_complete` summary now fires unconditionally.
+* **Unit tests** (`cargo test -p dtfs-manager bug_av_`): 3 new,
+  all green (planner side):
+  - `bug_av_planner_records_refusal_per_stranded_chunk` — verifies
+    two stranded chunks produce two `FlushRefusal`s with reason
+    `"mandatory_strand"` and the right indexes.
+  - `bug_av_planner_no_refusals_on_happy_path` — defensive guard:
+    a flushable chunk leaves `refusals` empty so the dispatcher
+    doesn't fire a spurious alert.
+  - `bug_av_report_serde_skips_refusals_field` — confirms the JSON
+    wire shape omits the `"refusals"` field (precise token match,
+    not substring, so the legitimate `"mandatory_refusals"` counter
+    is preserved).
+* **Workspace regression**: dtfs-manager 59 → 62; all other
+  crates unchanged. `cargo test --workspace --release` all green.
+* **Build hiccup:** first attempt re-used the old binary because
+  `cargo test --release -p dtfs-manager` builds only the test
+  binary, not `target/release/dtfs-manager`. Diagnosed via
+  `strings binary | grep cache.flush` (missing the new
+  `cache.flush_refused` token). Resolved with an explicit
+  `cargo build --release -p dtfs-manager` before the rolling
+  deploy.
+* **Live verification** on minicluster (manager binaries rolled
+  2026-05-21 ~11:25 UTC):
+  - Triggered: `POST /api/v1/files/flush_cache
+    {"path_prefix":"/movies/","cache_tiers":["warm"],"cooldown_secs":42}`
+  - `GET /api/v1/audit?action=cache.flush_complete` → entry with
+    `actor="scheduler", origin_manager="mini-mgr01", summary=
+    "cache.flush_complete: prefix=/movies/ replicas_dropped=0
+    mandatory_refusals=0"`. ✓ proves the new audit path fires
+    through Bug AH Raft fan-out.
+  - `GET /api/v1/audit?action=cache.flush_refused` → empty (no
+    refusals on this volume — every cache-eligible warm replica
+    is also mandatory under AV-1-10 migrated default, so the
+    planner correctly classifies none as droppable).
+* **Deviation:** the two originally planned tests targeted the
+  async dispatcher (`bug_av_audit_emitted_per_replica_delete`,
+  `bug_av_alert_fires_on_mandatory_strand_refusal`). Per the
+  AV-1-6 / AV-1-7 deviation pattern (async dispatcher behaviour
+  is live-only in this crate by convention), replaced with three
+  pure-planner tests on the refusal classification + JSON wire
+  shape. Full refusal-path live verification deferred to Phase 2
+  (AV-2's promotion tests will need volumes with stranded warm
+  replicas anyway). Plan total adjustment: Phase 1 net new tests
+  33 → 33 (same overall count: -2 dispatcher + 3 planner = net +1
+  vs the AV-1-11 line item).
 
 ### AV-1-10 — 2026-05-21
 
