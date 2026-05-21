@@ -252,7 +252,7 @@ counters.
 
 ## 2. Phase plan + task list
 
-Three phases. Each task has a stable ID (`AV-<phase>-<n>`) so I can
+Four phases. Each task has a stable ID (`AV-<phase>-<n>`) so I can
 reference it from commits and the recovery doc. Each task lists:
 
 * **Files** changed
@@ -264,6 +264,15 @@ reference it from commits and the recovery doc. Each task lists:
 The plan is updated **in place** as I work: status flips, deviations
 from the original sketch get appended under each task as
 `Implementation notes`.
+
+**Phase overview:**
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| 1 | Schema + flush API (~4.5 d) | ✅ closed 2026-05-21 |
+| 2 | Tiering engine: read-driven cache promotion (~2.5 d) | ✅ closed 2026-05-21 |
+| 3 | Client first-write tier + UX (~2 d) | ✅ closed 2026-05-21 |
+| 4 | Polish + verification close-out (~3.5 d) | ⬜ in progress |
 
 ---
 
@@ -1053,6 +1062,308 @@ manually for now (or by the existing additive-migrate UI button).
 * `CLAUDE.md` updated in the same commit that lands the final Phase 3
   code (per § 11 of CLAUDE.md itself — "update CLAUDE.md in the SAME
   commit as the code change").
+
+---
+
+## Phase 4 — Polish + verification close-out (~3.5 d)
+
+Closes out the three carryovers recorded in § 5 deviations after
+Phase 3 + the deferred end-to-end live demos. **Phase 4 ships no
+new operator-visible features** — it tightens up what Phases 1-3
+delivered:
+
+1. The Phase-2 read→promote and Phase-3 warm-first→anchor-repair
+   demos were deferred to a separate run that needs the new FUSE
+   binary on a client VM. Phase 4 runs them.
+2. `GET /api/v1/volumes` (list) still uses its aggregation-only
+   projection; AV-3-5 added the per-volume projection but not the
+   list one. Phase 4 broadens the list endpoint so a single fetch
+   surfaces every volume's policy.
+3. The WebUI shows the flush-cache button (AV-3-4) but not the
+   volume policy itself. Phase 4 adds a read-only display card +
+   an inline-edit modal posting to `/set-cache`.
+4. `ENABLE_CACHE_REDUNDANCY_ESCALATION: bool = false` (a Phase-2
+   compile-time const) is promoted to a runtime config option +
+   the redundancy-escalation path gets its own test.
+
+Plus the standard close-out: docs sweep, plan archival, CLAUDE.md
+update, PROGRESS.md / ISSUES_TO_FIX.md tightening.
+
+### ⬜ AV-4-1 — End-to-end Phase 2 + Phase 3 live demos (~1 d)
+
+The minicluster has the new manager binaries (Phase 1-3); it
+does NOT yet have a FUSE client built from the AV-3-1/3-2 code
+or configured with `first_write_tier = "nearest-warm"`. Three
+demos are gated on that:
+
+* **AV-2-4 / AV-2-5 demo** — write a fresh file, read it twice
+  from one DC within the configured `promote_window_secs` (set
+  to 60 s for the test), observe the warm cache replica appear
+  in that DC, then leave it idle for the window and observe
+  the demote.
+* **AV-3-3 demo** — write a file from a client with
+  `first_write_tier = "nearest-warm"`, observe the warm
+  replica appears immediately, observe the cold (anchor) copy
+  scheduled by `check_anchor_lag` within one tiering tick.
+* **Operator-flush vs engine-demote cooldown asymmetry**
+  (AV-2-5) — flush a chunk, immediately read it twice within
+  60 s, confirm the cooldown blocks re-promotion. Wait for
+  cooldown to expire, read twice, confirm re-promotion.
+
+* **Files:** `tests/proxmox/abuse/15-bug-av-cache-lifecycle.sh`
+  (new shell regression test that drives all three scenarios
+  against the minicluster). Optional updates to
+  `tests/proxmox/ansible/templates/fuse.toml.j2` /
+  `inventory.json` for a `nearest-warm` client.
+* **Implementation:**
+  - Build a fresh FUSE binary from current `master`.
+  - Roll to mini-client01 (or stand up `mini-client02` with
+    `first_write_tier = "nearest-warm"` if needed; the
+    minicluster spec from `MINICLUSTER-VERIFICATION-2026-05-
+    21.md` is 6 VMs → may need one more).
+  - Apply a Plexmedia-style policy to `default`:
+    `dtfs-cli volumes set-cache default --warm-min 1
+    --warm-max 1 --per-dc true --promote-reads 2
+    --promote-window-secs 60 --cooldown-secs 60`.
+  - Lower `tiering.evaluation_interval_secs` to 10 s so the
+    demo finishes in minutes, not hours.
+  - Run the shell script; collect stdout + audit-log
+    snapshots; write the results into the existing
+    `MINICLUSTER-VERIFICATION-2026-05-21.md` Bug AV section.
+* **Tests:** shell-script `tests/proxmox/abuse/15-bug-av-
+  cache-lifecycle.sh` exits 0; output asserts:
+  - Warm replica appeared within 60 s of the 2nd read
+    (matching reason `promote_threshold_met`).
+  - Warm replica disappeared within 2 tiering ticks after the
+    60-s idle window (matching reason `idle_window`).
+  - Operator flush leaves cooldown > 0 in the SM; the
+    immediately-following 2nd read does NOT promote.
+  - After cooldown expiry, the next 2-reads-in-window
+    promotes again.
+  - For the warm-first demo: a new file lands on warm first
+    (chunk_location entry has `disk_id` pointing to a warm
+    disk); within one tick a `anchor.lag_repair` audit entry
+    + a successful migration to cold land.
+* **Done when:** shell script green; live verification text
+  added to `MINICLUSTER-VERIFICATION-2026-05-21.md`; all four
+  AV-2-4 / AV-2-5 / AV-3-3 carryover bullets in § 5
+  deviations marked ✅ RESOLVED.
+
+### ⬜ AV-4-2 — `GET /api/v1/volumes` list-endpoint projection (~0.5 d)
+
+The list endpoint currently emits only `{ volume_id, file_count,
+total_size, replication, chunk_size_bytes, name, write_safety }`
+per volume. AV-3-5 added the per-volume projection
+(`GET /api/v1/volumes/{id}`) but the list endpoint stayed
+aggregation-only.
+
+The breaking-change risk identified in AV-3-5 (existing WebUI /
+CLI clients reading `replication` from the list endpoint) is
+manageable in Phase 4: today's two consumers
+(`crates/dtfs-cli/src/main.rs::cmd_volumes`,
+`crates/dtfs-manager/src/webui.rs::renderVolumes`) both read
+only a fixed subset of fields and tolerate extra ones. The new
+fields will appear; no existing key is removed.
+
+* **Files:** `crates/dtfs-manager/src/api.rs` — extend
+  `list_volumes_handler` to embed the per-volume policy view
+  from `volume_config_to_json(&cfg)` (the AV-3-5 helper) under
+  each volume entry.
+* **Implementation:** for every volume in the list, include
+  the AV-3-5 helper output spread into the existing list row.
+  Keep `file_count` / `total_size` aggregation as today.
+  Pure-helper unit test confirms the merged JSON contains all
+  AV fields + aggregation fields.
+* **Tests:**
+  - `bug_av_list_volumes_row_includes_av_fields` — assert the
+    merged row JSON contains both aggregation fields
+    (`file_count`, `total_size`) AND AV fields
+    (`mandatory_replicas`, `cache_replicas`, `anchor`).
+  - `bug_av_list_volumes_legacy_volume_renders_correctly` —
+    volume without `mandatory_replicas`/`cache_replicas` set
+    must render with default-zero values (no crash on
+    legacy snapshots).
+* **Done when:** 2 tests + live verification on the
+  minicluster: `curl -s http://mini-mgr01:9402/api/v1/volumes
+  | jq '.volumes[0]'` returns all AV fields. Update the
+  AV-1-10 deviation in § 5 to mark the list-endpoint sub-task
+  as ✅ RESOLVED.
+
+### ⬜ AV-4-3 — WebUI volume detail read-only card (~0.5 d)
+
+The WebUI Volumes page (line ~1219 in `webui.rs`) currently
+renders a 4-column table (`Volume ID / Files / Total Size /
+Avg File Size`). Operators have no way to see what cache
+policy is configured.
+
+* **Files:** `crates/dtfs-manager/src/webui.rs` — extend
+  `renderVolumes()` to fetch per-volume detail
+  (`/api/v1/volumes/{id}` from AV-3-5) and render a card
+  below each row showing mandatory / cache / anchor.
+* **Implementation:** keep the existing table; add an
+  expand-on-click toggle (`onclick` handler that opens a
+  detail card under the row). The card uses the same JSON
+  shape as AV-3-5's `volumes show` CLI command. Reuse the
+  CSS card styles from existing pages.
+* **Tests:** live (no JS unit framework in repo). Markup
+  smoke test verifies the rendered page contains the
+  expected field labels (`Mandatory replicas:`, `Cache
+  replicas:`, `Anchor:`).
+* **Done when:** clicking a row reveals the policy card with
+  the live values; legacy volumes (no AV fields set) render
+  with "(none)" / default-zero rather than crashing. Update
+  the AV-3-4 deviation in § 5 to mark the display-card
+  sub-task ✅ RESOLVED.
+
+### ⬜ AV-4-4 — WebUI volume inline-edit modal (~1 d)
+
+Operators today use `dtfs-cli volumes set-cache` (AV-3-5) for
+every policy change. A WebUI button that opens an edit modal
+posting to `/set-cache` is the operator-friendliness payoff.
+
+* **Files:** `crates/dtfs-manager/src/webui.rs` — new
+  `volume-edit-modal` HTML next to the migrate + flush-cache
+  modals; new JS handlers `openVolumeEdit(volumeId)` /
+  `closeVolumeEdit()` / `submitVolumeEdit()` that POST to
+  `/api/v1/volumes/{id}/set-cache`. New "Edit policy" button
+  on each row in the Volumes page (or inside the detail card
+  from AV-4-3).
+* **Implementation:** the modal mirrors the AV-3-5 CLI flags:
+  - `warm.min` / `warm.max` numeric inputs (0-9).
+  - `hot.min` / `hot.max` numeric inputs (rare; show only
+    when `hot_max > 0` already or when an "Advanced" toggle
+    is set).
+  - `per_dc` checkbox.
+  - `promote_reads` numeric.
+  - `promote_window_secs` numeric.
+  - `cooldown_secs` numeric.
+  - Initial values prefilled from `GET /api/v1/volumes/{id}`.
+  - On submit, send only the changed fields (otherwise the
+    "no-op" path is misleading on the UI side).
+  - Validation: warm.min ≤ warm.max client-side, with a
+    server-side 400 fallback rendered in the result panel.
+  - Show the post-update policy in the result panel
+    (mirror AV-3-5 CLI's output format).
+* **Tests:** live (no JS unit framework). Markup smoke:
+  modal HTML present, JS handlers wired. Live verification:
+  open the modal, change `warm_max` from 1 to 2, submit,
+  verify the volume's `cache_replicas.warm.max` is 2 via
+  `dtfs-cli volumes show default`.
+* **Done when:** modal opens with prefilled values; submit
+  applies the diff via `POST /set-cache`; result panel shows
+  the new policy; markup verified on minicluster after
+  binary roll. Update the AV-3-4 deviation in § 5 to mark
+  the inline-edit form ✅ RESOLVED.
+
+### ⬜ AV-4-5 — `ENABLE_CACHE_REDUNDANCY_ESCALATION` runtime flag + test (~0.5 d)
+
+AV-2-4 left the redundancy-escalation path behind a
+compile-time const `ENABLE_CACHE_REDUNDANCY_ESCALATION: bool
+= false`. Promotes it to a runtime config option so operators
+can opt in without rebuilding, and adds the matching
+test that exercises the ramp from `min` to `max`.
+
+* **Files:**
+  - `crates/dtfs-common/src/config.rs::TieringConfig` — add
+    `enable_cache_redundancy_escalation: bool = false`
+    field.
+  - `crates/dtfs-manager/src/tiering.rs` — replace the const
+    with a parameter on `plan_cache_tick` /
+    `plan_chunk_promotions`. The engine reads
+    `cfg.enable_cache_redundancy_escalation` and threads it
+    through. Pure planner tests can now pass either value.
+* **Implementation:**
+  - Add the bool to `TieringConfig` with
+    `#[serde(default)]` returning `false` (back-compat
+    safe — legacy configs keep current behaviour).
+  - Update `tiering.toml.j2` Ansible template with a
+    commented-out `enable_cache_redundancy_escalation =
+    false` line for discoverability.
+  - The const itself stays as a documentation anchor
+    pointing to the runtime option, with a comment like
+    "deprecated — use TieringConfig.enable_cache_
+    redundancy_escalation instead". Or remove it; decide
+    during implementation.
+* **Tests:**
+  - Rename
+    `bug_av_tiering_tick_redundancy_escalation_off_by_default`
+    to `bug_av_tiering_tick_redundancy_escalation_off`
+    + add `bug_av_tiering_tick_redundancy_escalation_on`:
+    same scenario, flag set to `true`, assert the planner
+    schedules the 2nd warm replica.
+  - `bug_av_tiering_redundancy_escalation_respects_anchor`
+    — a volume with `cache_replicas.warm.max = 2` and the
+    flag on must STILL refuse if the 2nd warm replica
+    would strand the anchor.
+* **Done when:** 3 tests (1 rename, 2 new) + smoke: roll
+  the new manager binary, set the new config flag via
+  `manager.toml` reload, observe the engine respects it.
+  Update the AV-2-4 deviation in § 5 to mark the flag-flip
+  ✅ RESOLVED (and reword the docs that called it a
+  "deferred follow-up").
+
+### ⬜ AV-4-6 — Documentation: Phase 4 close-out + plan archival (~0.5 d)
+
+Wraps up Bug AV. The plan moves from `plans/active/` to
+`plans/completed/` once every Phase 4 task is ✅.
+
+* **Files:**
+  - `docs/src/storage/tiering.md` — flip the
+    "redundancy-escalation deferred" language to its new
+    runtime-config presentation. Document the
+    `tiering.enable_cache_redundancy_escalation` option.
+  - `docs/src/configuration/cluster-config.md` (or
+    wherever the existing tiering knobs live) — add the
+    new field with the same table format as the other
+    `[tiering]` keys.
+  - `docs/src/api-reference/rest-api.md` — note that
+    `GET /api/v1/volumes` now includes the AV per-volume
+    policy fields (the AV-3-5 "Bug AV note" can be
+    removed entirely since both endpoints now return the
+    same shape).
+  - `docs/src/operations/cluster-management.md` — extend
+    the "Reclaiming warm cache space" runbook with a
+    "WebUI alternative" subsection covering the
+    AV-4-3 / AV-4-4 modal.
+  - `CLAUDE.md` § 3.4 — drop the "deferred follow-up"
+    language for the redundancy-escalation flag; it's
+    now operator-configurable.
+  - `PROGRESS.md` — add a single line "Bug AV closed
+    2026-MM-DD" under the appropriate section.
+  - `ISSUES_TO_FIX.md` — remove any Bug AV TODOs.
+  - `plans/active/PLAN-BUG-AV-TIER-LIFECYCLE.md` →
+    `plans/completed/2026-MM-DD-PLAN-BUG-AV-TIER-
+    LIFECYCLE.md` via `git mv`. Update `plans/README.md`
+    listings to reflect the move.
+  - `plans/incidents/SOAK-RECOVERY-2026-05-21.md` Bug AV
+    section — append "Phase 4 close-out" subsection with
+    the resolved-carryover summary.
+* **Tests:** `mdbook build docs/` clean. `git mv` of the
+  plan file preserves history (`git log --follow` works).
+* **Done when:** 8 files updated; mdbook builds clean;
+  plan lives in `plans/completed/` with the date prefix;
+  § 5 deviations of the moved plan shows all carryovers
+  ✅ RESOLVED.
+
+### Phase 4 Done When
+
+* AV-4-1 … AV-4-6 all ✅. **~5 new tests green** (2 list-
+  endpoint + ~3 redundancy escalation; UI work is
+  live-only per the WebUI testing convention).
+* End-to-end live demos for AV-2-4 / AV-2-5 / AV-3-3
+  recorded in
+  `MINICLUSTER-VERIFICATION-2026-05-21.md`.
+* All three § 5 deviation entries marked ✅ RESOLVED:
+  - AV-2-4 / AV-2-5 — Phase 2 live end-to-end demo.
+  - AV-3-4 — WebUI volume-edit form.
+  - List-endpoint projection sub-task under the
+    AV-1-10-resolved entry.
+* `mdbook build docs/` green.
+* Plan file moved to `plans/completed/`; `git log --follow`
+  preserves history.
+* No "Phase 4 follow-up" / "deferred polish" language
+  remains in tracked sources (`grep -r "Phase 4" plans/
+  docs/ CLAUDE.md` returns empty).
 
 ---
 
