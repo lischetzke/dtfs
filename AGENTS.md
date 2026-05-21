@@ -80,7 +80,7 @@ mandatory:
 | Finished plan | `plans/completed/<YYYY-MM-DD>-PLAN-<id>-<name>.md` | `git mv` when every task is ✅ verified. |
 | Post-mortem (SOAK-RECOVERY, INTEGRITY-AUDIT, …) | `plans/incidents/` | Write-once; documents what we did and why. |
 | Lab campaign / fix-report artefact | `plans/reports/` | Historical record only — no live state. |
-| User-visible release note | `changelog/UNRELEASED.md` | One line per change, **same commit** as the code. See [`changelog/README.md`](./changelog/README.md). |
+| Release note (bug fix, new feature, known issue, breaking change, special update requirement) | `changelog/UNRELEASED.md` | One entry per user-visible change, **same commit** as the code. Internal restructures, doc edits, refactors, and test/CI tweaks do **not** go here. See [`changelog/README.md`](./changelog/README.md). |
 | Architecture / config / ops reference | `docs/src/...` (mdBook) | Update in the same commit as behaviour changes (CLAUDE.md § 11). |
 | Code | `crates/<crate>/src/...` | New crates require a `Cargo.toml` workspace member entry. |
 | Protobuf | `proto/<file>.proto` | Rebuild `dtfs-proto` after every edit. |
