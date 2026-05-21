@@ -1443,7 +1443,44 @@ fn apply_request(
             // optional anchor-strand check.
             apply_remove_chunk_location(sm, path, *chunk_index, node_id, enforce_anchor.as_ref())
         }
+
+        ClientRequest::SetChunkCooldown {
+            path,
+            chunk_indexes,
+            expires_at_ms,
+        } => {
+            // Bug AV — set/clear cache cooldown timestamps. Monotonic
+            // (max of existing and new); 0 clears.
+            apply_set_chunk_cooldown(sm, path, chunk_indexes, *expires_at_ms)
+        }
     }
+}
+
+/// Bug AV — apply path for `SetChunkCooldown`. Factored out for testing.
+/// `expires_at_ms == 0` clears the cooldown entry; any other value is
+/// merged via max() so concurrent flushes monotonically extend.
+fn apply_set_chunk_cooldown(
+    sm: &mut StateMachineData,
+    path: &str,
+    chunk_indexes: &[u64],
+    expires_at_ms: u64,
+) -> ClientResponse {
+    let Some(file) = sm.files.get_mut(path) else {
+        // Idempotent: unknown file is a no-op success.
+        return ClientResponse::Success;
+    };
+    for &idx in chunk_indexes {
+        if expires_at_ms == 0 {
+            file.cache_cooldown_until_ms.remove(&idx);
+        } else {
+            let existing = file.cache_cooldown_until_ms.get(&idx).copied().unwrap_or(0);
+            // Monotonic: take the later expiry. An operator flush at
+            // T+100 followed by another at T+50 must leave T+100,
+            // not regress to T+50.
+            file.cache_cooldown_until_ms.insert(idx, existing.max(expires_at_ms));
+        }
+    }
+    ClientResponse::Success
 }
 
 /// Bug AV — apply path for `RemoveChunkLocation`, factored out for
@@ -2553,6 +2590,95 @@ mod posix_path_regression {
             });
         assert!(matches!(resp, ClientResponse::Error { .. }));
         assert_eq!(sm.files.get("/x").unwrap().chunks.len(), 2, "unchanged");
+    }
+
+    // ---- AV-1-4 — SetChunkCooldown tests --------------------------
+
+    /// AV-1-4 test 1 — single-chunk cooldown set on a file with no
+    /// prior cooldown.
+    #[test]
+    fn bug_av_set_cooldown_single_chunk() {
+        use dtfs_common::types::DiskTier;
+        let mut sm = sm_with_chunk("/x", 0, "h", &[(10, "dc-a", DiskTier::Cold)]);
+        apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::SetChunkCooldown {
+                path: "/x".into(),
+                chunk_indexes: vec![0],
+                expires_at_ms: 1_000_000,
+            });
+        let f = sm.files.get("/x").unwrap();
+        assert_eq!(f.cache_cooldown_until_ms.get(&0), Some(&1_000_000));
+    }
+
+    /// AV-1-4 test 2 — multiple chunk_indexes in one apply call.
+    #[test]
+    fn bug_av_set_cooldown_multi_chunk() {
+        use dtfs_common::types::DiskTier;
+        let mut sm = sm_with_chunk("/x", 0, "h", &[(10, "dc-a", DiskTier::Cold)]);
+        apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::SetChunkCooldown {
+                path: "/x".into(),
+                chunk_indexes: vec![0, 1, 2, 7],
+                expires_at_ms: 5_000_000,
+            });
+        let f = sm.files.get("/x").unwrap();
+        assert_eq!(f.cache_cooldown_until_ms.len(), 4);
+        for idx in [0u64, 1, 2, 7] {
+            assert_eq!(f.cache_cooldown_until_ms.get(&idx), Some(&5_000_000));
+        }
+    }
+
+    /// AV-1-4 test 3 — monotonic merge: a later flush with an
+    /// earlier expiry does NOT regress; a later flush with a later
+    /// expiry extends.
+    #[test]
+    fn bug_av_set_cooldown_monotonic() {
+        use dtfs_common::types::DiskTier;
+        let mut sm = sm_with_chunk("/x", 0, "h", &[(10, "dc-a", DiskTier::Cold)]);
+        // First flush sets t=1000
+        apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::SetChunkCooldown {
+                path: "/x".into(),
+                chunk_indexes: vec![0],
+                expires_at_ms: 1000,
+            });
+        // Second flush with EARLIER expiry must NOT regress
+        apply_request(&mut sm, &mk_log_id(2),
+            &ClientRequest::SetChunkCooldown {
+                path: "/x".into(),
+                chunk_indexes: vec![0],
+                expires_at_ms: 500,
+            });
+        assert_eq!(sm.files.get("/x").unwrap().cache_cooldown_until_ms.get(&0), Some(&1000));
+        // Third flush with later expiry extends
+        apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::SetChunkCooldown {
+                path: "/x".into(),
+                chunk_indexes: vec![0],
+                expires_at_ms: 2000,
+            });
+        assert_eq!(sm.files.get("/x").unwrap().cache_cooldown_until_ms.get(&0), Some(&2000));
+        // expires_at_ms = 0 clears.
+        apply_request(&mut sm, &mk_log_id(4),
+            &ClientRequest::SetChunkCooldown {
+                path: "/x".into(),
+                chunk_indexes: vec![0],
+                expires_at_ms: 0,
+            });
+        assert!(sm.files.get("/x").unwrap().cache_cooldown_until_ms.is_empty());
+    }
+
+    /// AV-1-4 test 4 — unknown file → idempotent no-op success.
+    #[test]
+    fn bug_av_set_cooldown_unknown_file_is_noop() {
+        let mut sm = StateMachineData::default();
+        let resp = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::SetChunkCooldown {
+                path: "/nope".into(),
+                chunk_indexes: vec![0],
+                expires_at_ms: 1000,
+            });
+        assert!(matches!(resp, ClientResponse::Success));
     }
 
     /// AV-1-3 test 6 — any-tier anchor policy allows dropping a

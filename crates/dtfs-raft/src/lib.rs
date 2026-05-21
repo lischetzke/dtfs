@@ -424,6 +424,27 @@ pub enum ClientRequest {
         /// (apply is meant to be a pure function of `req + state`).
         enforce_anchor: Option<AnchorPolicy>,
     },
+
+    /// Bug AV — set or extend cache cooldown for one or more
+    /// chunk_indexes of a file. Called by the cache-flush path
+    /// (`flush_cache_for_path`, AV-1-7) after a flush completes so the
+    /// tiering engine refuses to re-promote the freshly-dropped
+    /// replicas for `cache_replicas.cooldown_secs` seconds. The set
+    /// operation is **monotonic**: a concurrent flush + tiering demote
+    /// can race, and we always want the FURTHER-out timestamp to win
+    /// (operator's flush intent dominates).
+    ///
+    /// Setting `expires_at_ms = 0` is the convention for "clear the
+    /// cooldown" — used by the tiering-engine demote path (AV-2-5)
+    /// so a natural idle→demote→read cycle re-promotes immediately,
+    /// while operator-driven flushes set future timestamps.
+    /// Specifically: the apply path clears the entry when
+    /// `expires_at_ms == 0`, otherwise takes `max(current, new)`.
+    SetChunkCooldown {
+        path: String,
+        chunk_indexes: Vec<u64>,
+        expires_at_ms: u64,
+    },
 }
 
 impl fmt::Display for ClientRequest {
@@ -521,6 +542,10 @@ impl fmt::Display for ClientRequest {
                     None => String::new(),
                 };
                 write!(f, "RemoveChunkLocation({path}, idx={chunk_index}, node={node_id}{anchor_marker})")
+            }
+            Self::SetChunkCooldown { path, chunk_indexes, expires_at_ms } => {
+                write!(f, "SetChunkCooldown({path}, {} chunks, until={expires_at_ms}ms)",
+                    chunk_indexes.len())
             }
         }
     }
