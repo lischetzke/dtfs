@@ -177,6 +177,22 @@ class**:
   The async dispatcher path additionally records
   `cache.flush_replica` per successful drop and
   `cache.flush_complete` per call (unconditional).
+- **Every cache promotion and demotion must check
+  `would_violate_anchor` against the destination state.** The
+  AV-2-4 planner already filters demotions where the mandatory
+  copy wouldn't survive; the apply path (`RemoveChunkLocation`
+  with `enforce_anchor`) re-checks as defence-in-depth. Don't
+  add a new code path that schedules replication or removal
+  without consulting one of these checks.
+- **Engine-driven demote ≠ operator flush.** The asymmetry is
+  intentional: idle-decay demote clears the cooldown (next read
+  re-promotes immediately); operator flush sets a future
+  cooldown (no immediate re-promote). The
+  `should_clear_cooldown_on_demote(cooldown_until_ms, now_ms)`
+  helper is the boundary — past/absent → clear; future →
+  preserve. Any new demote-like path must route through that
+  helper rather than unconditionally calling
+  `SetChunkCooldown(0)`.
 
 When you add a new code path that creates replicas, decide which
 class it produces and make the boundary explicit in the function

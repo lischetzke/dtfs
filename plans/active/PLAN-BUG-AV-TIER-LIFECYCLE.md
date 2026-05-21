@@ -761,35 +761,37 @@ manually for now (or by the existing additive-migrate UI button).
   that needs the AV-3-5 CLI (or manual REST UpsertVolume) to
   set up.
 
-### ⬜ AV-2-6 — Documentation: tiering engine + promotion rules
+### ✅ AV-2-6 — Documentation: tiering engine + promotion rules
 
-* **Files:**
-  - `docs/src/storage/tiering.md` — replace the placeholder from
-    AV-1-12 with the full Bug AV write-up:
-    * Mandatory vs cache invariants.
-    * Promotion math (`promote_reads`, `promote_window_secs`, per-DC
-      counting, `min`/`max` semantics).
-    * Cooldown semantics (5-min default, why operator flushes set it,
-      why idle demote clears it).
-    * Anchor-aware demotion (the engine never strands the anchor).
-    * Worked example: a chunk's life cycle across promotion, idle
-      demote, operator flush.
-  - `docs/src/storage/caching.md` — cross-reference cache_replicas
-    here; note this is the volume-policy view of caching (the
-    page also covers data-node ARC cache + FUSE local cache, which
-    are different things).
-  - `docs/src/operations/cluster-management.md` — operator runbook
-    for "I want to free warm space across all of /movies/Season-1/":
-    explain the `dtfs-cli file flush-cache` and webui equivalent,
-    note the audit log entries to expect, note that cooldown protects
-    against accidental immediate re-promotion.
-  - `CLAUDE.md` — § 3 (Conventions): add invariant "every cache
-    promotion / demotion must check `would_violate_anchor` against
-    the destination state; never strand the anchor".
-* **Tests:** doc smoke test (`mdbook build`); manual eyeball pass.
-* **Done when:** files updated; mdbook builds clean; the runbook
-  exactly matches the on-cluster behaviour from the Phase 2 live
-  verification.
+* **Files touched (4):**
+  - `docs/src/storage/tiering.md` — Phase 2 status banner +
+    "Promotion math", "Demotion math", "Cooldown semantics",
+    "Anchor-aware demotion", and "Worked example" subsections.
+    The worked example walks `/movies/Wicked.mkv` through write
+    → promote → operator flush → cooldown → idle demote.
+  - `docs/src/storage/caching.md` — opening callout explicitly
+    separating data-node ARC + FUSE local-disk caches (covered
+    here) from the AV `cache_replicas` placement layer (covered
+    in tiering.md). Avoids the recurring operator confusion of
+    "which cache am I reading about".
+  - `docs/src/operations/cluster-management.md` — new
+    "Reclaiming warm cache space" runbook with the procedure
+    (curl example), expected audit-log shape, cooldown
+    semantics, anchor-refusal investigation steps. Operator-
+    facing; matches the on-cluster behaviour verified during
+    AV-1-9 / AV-1-11 live runs.
+  - `CLAUDE.md` — § 3.4 extended with two new invariants:
+    (a) every cache promotion/demotion must check
+    `would_violate_anchor`; (b) the engine-demote-vs-operator-
+    flush asymmetry is enforced via
+    `should_clear_cooldown_on_demote` — never bypass that
+    helper.
+* **Tests:** `mdbook build docs/` clean on dtfs-builder (INFO
+  output only; no warnings, no errors).
+* **Done when:** all 4 doc files updated, mdbook builds clean.
+  The runbook reflects the on-cluster behaviour exercised in
+  AV-1-9 / AV-1-11; the full Phase 2 read→promote demo bundles
+  into the Phase 2 close-out check.
 
 ### Phase 2 Done When
 
@@ -963,6 +965,42 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-2-6 — 2026-05-21
+
+* **Files touched (4):**
+  - `docs/src/storage/tiering.md` — replaced the Phase-1
+    forward-reference with the full Phase 2 write-up:
+    Promotion math (window count → cooldown → threshold →
+    target → selection), Demotion math (tier filter → window
+    check → anchor safety, full sequence: DeleteChunkReplica →
+    RemoveChunkLocation → conditional SetChunkCooldown),
+    Cooldown semantics (operator-flush vs engine-demote
+    asymmetry), Anchor-aware demotion (planner refusal +
+    apply-path defence-in-depth), Worked example
+    (`/movies/Wicked.mkv` t=0 through t=14_600).
+  - `docs/src/storage/caching.md` — opening callout to
+    disambiguate the data-node ARC + FUSE local-disk caches
+    (covered here) from the AV `cache_replicas` placement
+    layer (covered in tiering.md).
+  - `docs/src/operations/cluster-management.md` — new
+    "Reclaiming warm cache space (Bug AV flush)" runbook
+    covering: when to use it (vs editing volume policy), curl
+    procedure, expected audit-log shape (cache.flush →
+    flush_replica × N → flush_complete; optional
+    flush_refused), cooldown semantics, anchor-refusal
+    investigation steps.
+  - `CLAUDE.md` — § 3.4 extended with two new bullet points:
+    every cache promotion/demotion must check
+    `would_violate_anchor`; never bypass
+    `should_clear_cooldown_on_demote` when implementing a new
+    demote-like path.
+* **Build verification:** `mdbook build docs/` on dtfs-builder
+  succeeds with only `INFO` output (no warnings, no errors).
+* **Live verification:** N/A — docs only. The runbook reflects
+  the on-cluster behaviour exercised during AV-1-9 / AV-1-11
+  live runs.
+* **Deviations:** none.
 
 ### AV-2-5 — 2026-05-21
 

@@ -2,6 +2,14 @@
 
 DTFS uses two layers of caching to reduce read latency and network traffic: an in-memory cache on each data node and an optional local disk cache on each FUSE client.
 
+> **Not on this page:** the volume-policy cache layer (Bug AV
+> `cache_replicas` — opportunistic full-replica copies on warm/hot
+> disks, created on read demand). That is a different system — it
+> lives at the *placement* layer (which nodes hold replicas of a
+> chunk), not the *data-node* layer (whose bytes are kept hot in
+> RAM). See [Tiering → Cache tier semantics (Bug AV)](./tiering.md#cache-tier-semantics-bug-av)
+> and [Volume Configuration → Replication classes](../configuration/volume-config.md#replication-classes).
+
 ## Data Node ARC Cache
 
 Each data node maintains an in-memory Adaptive Replacement Cache (ARC) that stores recently and frequently accessed chunk data. ARC automatically balances between recency and frequency, adapting to workload patterns without manual tuning.
