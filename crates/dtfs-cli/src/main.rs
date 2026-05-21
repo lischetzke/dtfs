@@ -47,12 +47,9 @@ enum Commands {
     #[command(subcommand)]
     Volumes(VolumesCmd),
 
-    /// List files in the cluster
-    Files {
-        /// Maximum number of files to list
-        #[arg(long, default_value = "50")]
-        limit: usize,
-    },
+    /// File operations (list, flush cache)
+    #[command(subcommand)]
+    Files(FilesCmd),
 
     /// Trigger or view scrub operations
     Scrub {
@@ -124,6 +121,82 @@ enum VolumesCmd {
         /// Volume id to migrate.
         volume_id: String,
     },
+    /// Bug AV (AV-3-5) — show a volume's full configuration
+    /// including the AV-introduced mandatory_replicas /
+    /// cache_replicas / anchor fields.
+    Show {
+        /// Volume id to show.
+        volume_id: String,
+    },
+    /// Bug AV (AV-3-5) — set or update the volume's
+    /// `cache_replicas` policy. Every flag is optional; omitted
+    /// flags keep the current value.
+    SetCache {
+        /// Volume id to update.
+        volume_id: String,
+        /// Minimum warm cache replicas per scope.
+        #[arg(long)]
+        warm_min: Option<u32>,
+        /// Maximum warm cache replicas per scope (must be >= min).
+        #[arg(long)]
+        warm_max: Option<u32>,
+        /// Minimum hot cache replicas per scope.
+        #[arg(long)]
+        hot_min: Option<u32>,
+        /// Maximum hot cache replicas per scope.
+        #[arg(long)]
+        hot_max: Option<u32>,
+        /// Per-DC scope when true (default); global pool when false.
+        #[arg(long)]
+        per_dc: Option<bool>,
+        /// Read count threshold for promotion within
+        /// `promote_window_secs`.
+        #[arg(long)]
+        promote_reads: Option<u32>,
+        /// Sliding-window length (seconds) over which
+        /// `promote_reads` is counted.
+        #[arg(long)]
+        promote_window_secs: Option<u64>,
+        /// Cooldown applied to a chunk after operator flush
+        /// (seconds). Engine-driven idle demote clears this.
+        #[arg(long)]
+        cooldown_secs: Option<u64>,
+    },
+}
+
+/// Bug AV (AV-3-5) — file-level commands. The legacy
+/// `dtfs-cli files --limit N` is now `dtfs-cli files list
+/// --limit N`; the breaking shape change is intentional so the
+/// new `dtfs-cli files flush-cache` shares the same noun
+/// hierarchy as the other `<noun> <verb>` subcommands.
+#[derive(clap::Subcommand, Debug)]
+enum FilesCmd {
+    /// List files in the cluster (legacy `dtfs-cli files`
+    /// behaviour preserved here).
+    List {
+        /// Maximum number of files to list.
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Drop cache replicas under a path prefix. Mandatory
+    /// (anchor) replicas are always preserved.
+    FlushCache {
+        /// Path prefix to flush. Required.
+        path: String,
+        /// Cache tiers to flush. Comma-separated.
+        #[arg(long, default_value = "warm")]
+        cache_tiers: String,
+        /// Cooldown (seconds) before the tiering engine may
+        /// re-promote a flushed chunk.
+        #[arg(long, default_value = "300")]
+        cooldown_secs: u64,
+        /// Maximum delete tasks to enqueue in one call.
+        #[arg(long, default_value = "10000")]
+        max_tasks: u32,
+        /// Safety gate: must be set to flush an empty prefix.
+        #[arg(long)]
+        allow_empty_prefix: bool,
+    },
 }
 
 struct ApiClient {
@@ -191,8 +264,30 @@ async fn main() -> anyhow::Result<()> {
             VolumesCmd::MigratePolicy { volume_id } => {
                 cmd_volumes_migrate_policy(&api, &args.format, &volume_id).await?
             }
+            VolumesCmd::Show { volume_id } => {
+                cmd_volumes_show(&api, &args.format, &volume_id).await?
+            }
+            VolumesCmd::SetCache {
+                volume_id,
+                warm_min, warm_max, hot_min, hot_max,
+                per_dc, promote_reads, promote_window_secs, cooldown_secs,
+            } => {
+                cmd_volumes_set_cache(
+                    &api, &args.format, &volume_id,
+                    warm_min, warm_max, hot_min, hot_max,
+                    per_dc, promote_reads, promote_window_secs, cooldown_secs,
+                ).await?
+            }
         },
-        Commands::Files { limit } => cmd_files(&api, &args.format, limit).await?,
+        Commands::Files(sub) => match sub {
+            FilesCmd::List { limit } => cmd_files(&api, &args.format, limit).await?,
+            FilesCmd::FlushCache {
+                path, cache_tiers, cooldown_secs, max_tasks, allow_empty_prefix,
+            } => cmd_files_flush_cache(
+                &api, &args.format, &path, &cache_tiers,
+                cooldown_secs, max_tasks, allow_empty_prefix,
+            ).await?,
+        },
         Commands::Scrub {
             disk,
             file,
@@ -392,6 +487,207 @@ async fn cmd_volumes_migrate_policy(
                 m["cold"].as_u64().unwrap_or(0),
                 m["tape"].as_u64().unwrap_or(0),
             );
+        }
+    }
+    Ok(())
+}
+
+/// AV-3-5 — `dtfs-cli volumes show <id>`: render the full volume
+/// config (including AV-introduced mandatory/cache/anchor fields).
+async fn cmd_volumes_show(
+    api: &ApiClient,
+    format: &OutputFormat,
+    volume_id: &str,
+) -> anyhow::Result<()> {
+    let url = format!("/api/v1/volumes/{}", volume_id);
+    let v = api.get(&url).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&v)?),
+        OutputFormat::Table => {
+            println!("Volume: {}", v["volume_id"].as_str().unwrap_or("—"));
+            println!("Name:   {}", v["name"].as_str().unwrap_or("—"));
+            println!(
+                "Chunk size:  {} bytes",
+                v["chunk_size_bytes"].as_u64().unwrap_or(0)
+            );
+            let r = &v["replication"];
+            println!(
+                "Legacy replication:  hot={} warm={} cold={} tape={}",
+                r["hot"].as_u64().unwrap_or(0),
+                r["warm"].as_u64().unwrap_or(0),
+                r["cold"].as_u64().unwrap_or(0),
+                r["tape"].as_u64().unwrap_or(0),
+            );
+            let m = &v["mandatory_replicas"];
+            println!(
+                "Mandatory replicas:  hot={} warm={} cold={} tape={}",
+                m["hot"].as_u64().unwrap_or(0),
+                m["warm"].as_u64().unwrap_or(0),
+                m["cold"].as_u64().unwrap_or(0),
+                m["tape"].as_u64().unwrap_or(0),
+            );
+            let c = &v["cache_replicas"];
+            println!("Cache replicas:");
+            println!(
+                "  warm: min={} max={}",
+                c["warm"]["min"].as_u64().unwrap_or(0),
+                c["warm"]["max"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "  hot:  min={} max={}",
+                c["hot"]["min"].as_u64().unwrap_or(0),
+                c["hot"]["max"].as_u64().unwrap_or(0)
+            );
+            println!("  per_dc:               {}", c["per_dc"].as_bool().unwrap_or(true));
+            println!("  promote_reads:        {}", c["promote_reads"].as_u64().unwrap_or(2));
+            println!("  promote_window_secs:  {}", c["promote_window_secs"].as_u64().unwrap_or(14_400));
+            println!("  cooldown_secs:        {}", c["cooldown_secs"].as_u64().unwrap_or(300));
+            if v["anchor"].is_null() {
+                println!("Anchor:  (none)");
+            } else {
+                let a = &v["anchor"];
+                println!(
+                    "Anchor:  dc={} required_tier={}",
+                    a["datacenter"].as_str().unwrap_or("—"),
+                    a["required_tier"].as_str().unwrap_or("any"),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// AV-3-5 — `dtfs-cli volumes set-cache <id> [--warm-min N ...]`:
+/// patch the volume's `cache_replicas` policy. Only the supplied
+/// flags are merged; others keep their current value.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_volumes_set_cache(
+    api: &ApiClient,
+    format: &OutputFormat,
+    volume_id: &str,
+    warm_min: Option<u32>,
+    warm_max: Option<u32>,
+    hot_min: Option<u32>,
+    hot_max: Option<u32>,
+    per_dc: Option<bool>,
+    promote_reads: Option<u32>,
+    promote_window_secs: Option<u64>,
+    cooldown_secs: Option<u64>,
+) -> anyhow::Result<()> {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = warm_min { body.insert("warm_min".into(), v.into()); }
+    if let Some(v) = warm_max { body.insert("warm_max".into(), v.into()); }
+    if let Some(v) = hot_min  { body.insert("hot_min".into(),  v.into()); }
+    if let Some(v) = hot_max  { body.insert("hot_max".into(),  v.into()); }
+    if let Some(v) = per_dc   { body.insert("per_dc".into(),   v.into()); }
+    if let Some(v) = promote_reads
+        { body.insert("promote_reads".into(), v.into()); }
+    if let Some(v) = promote_window_secs
+        { body.insert("promote_window_secs".into(), v.into()); }
+    if let Some(v) = cooldown_secs
+        { body.insert("cooldown_secs".into(), v.into()); }
+    let body = serde_json::Value::Object(body);
+
+    let url = format!("/api/v1/volumes/{}/set-cache", volume_id);
+    let resp = api.post(&url, &body).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => {
+            let changed = resp["changed"].as_bool().unwrap_or(false);
+            let c = &resp["config"]["cache_replicas"];
+            println!(
+                "Volume '{}' set-cache: {}",
+                volume_id,
+                if changed { "applied" } else { "no-op" },
+            );
+            println!(
+                "  warm: min={} max={}",
+                c["warm"]["min"].as_u64().unwrap_or(0),
+                c["warm"]["max"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "  hot:  min={} max={}",
+                c["hot"]["min"].as_u64().unwrap_or(0),
+                c["hot"]["max"].as_u64().unwrap_or(0)
+            );
+            println!("  per_dc:               {}", c["per_dc"].as_bool().unwrap_or(true));
+            println!("  promote_reads:        {}", c["promote_reads"].as_u64().unwrap_or(2));
+            println!("  promote_window_secs:  {}", c["promote_window_secs"].as_u64().unwrap_or(14_400));
+            println!("  cooldown_secs:        {}", c["cooldown_secs"].as_u64().unwrap_or(300));
+        }
+    }
+    Ok(())
+}
+
+/// AV-3-5 — `dtfs-cli files flush-cache <path> [--cache-tiers warm,hot]`:
+/// drop cache replicas under a path prefix. Thin wrapper over
+/// `POST /api/v1/files/flush_cache` (AV-1-9).
+#[allow(clippy::too_many_arguments)]
+async fn cmd_files_flush_cache(
+    api: &ApiClient,
+    format: &OutputFormat,
+    path: &str,
+    cache_tiers_csv: &str,
+    cooldown_secs: u64,
+    max_tasks: u32,
+    allow_empty_prefix: bool,
+) -> anyhow::Result<()> {
+    let tiers: Vec<String> = cache_tiers_csv
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if tiers.is_empty() {
+        anyhow::bail!("--cache-tiers must list at least one tier (e.g. warm or hot,warm)");
+    }
+    let body = serde_json::json!({
+        "path_prefix": path,
+        "cache_tiers": tiers,
+        "cooldown_secs": cooldown_secs,
+        "max_tasks": max_tasks,
+        "allow_empty_prefix": allow_empty_prefix,
+    });
+    let resp = api.post("/api/v1/files/flush_cache", &body).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => {
+            let dropped = resp["replicas_dropped"].as_u64().unwrap_or(0);
+            let refusals = resp["mandatory_refusals"].as_u64().unwrap_or(0);
+            println!(
+                "flush-cache prefix={} tiers={:?} cooldown={}s",
+                path, tiers, cooldown_secs
+            );
+            println!(
+                "  files_matched     = {}",
+                resp["files_matched"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "  chunks_examined   = {}",
+                resp["chunks_examined"].as_u64().unwrap_or(0)
+            );
+            println!("  replicas_dropped  = {}", dropped);
+            println!("  mandatory_refusals = {}{}",
+                refusals,
+                if refusals > 0 {
+                    "  ⚠  check audit: action=cache.flush_refused"
+                } else { "" },
+            );
+            println!(
+                "  unreachable_nodes = {}",
+                resp["unreachable_nodes"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "  rpc_failures      = {}",
+                resp["rpc_failures"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "  raft_failures     = {}",
+                resp["raft_failures"].as_u64().unwrap_or(0)
+            );
+            let truncated = resp["truncated"].as_u64().unwrap_or(0);
+            if truncated > 0 {
+                println!("  truncated (re-run): {}", truncated);
+            }
         }
     }
     Ok(())

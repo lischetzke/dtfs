@@ -123,6 +123,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Bug AV — one-shot policy migration: clone legacy
         // `replication` into `mandatory_replicas` for a volume.
         .route("/api/v1/volumes/{id}/migrate-policy", post(migrate_volume_policy_endpoint))
+        // Bug AV (AV-3-5) — read the full volume config including
+        // the new mandatory_replicas / cache_replicas / anchor
+        // fields (closes the AV-1-10 carryover for single-volume
+        // reads).
+        .route("/api/v1/volumes/{id}", get(get_volume_endpoint))
+        // Bug AV (AV-3-5) — operator-friendly cache-policy editor.
+        // Merges the supplied fields into the volume's
+        // `cache_replicas`; omitted fields keep their current
+        // values. Atomic via Raft UpsertVolume.
+        .route("/api/v1/volumes/{id}/set-cache", post(set_volume_cache_endpoint))
         // Stats (aggregate cluster metrics for WebUI home page)
         .route("/api/v1/stats", get(get_stats))
         // HMAC join (phase 1: challenge, phase 2: Raft register)
@@ -943,6 +953,180 @@ async fn migrate_volume_policy_endpoint(
             "cold": migrated.mandatory_replicas.cold,
             "tape": migrated.mandatory_replicas.tape,
         },
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Bug AV (AV-3-5) — GET /api/v1/volumes/{id} + POST .../set-cache
+// ---------------------------------------------------------------------------
+
+/// AV-3-5 — return the full VolumeConfig including the new
+/// mandatory_replicas / cache_replicas / anchor fields. Closes
+/// the AV-1-10 carryover for single-volume reads. The list
+/// endpoint (`GET /api/v1/volumes`) still uses its
+/// aggregation-only projection because broadening it risks
+/// breaking existing WebUI/CLI clients that assume the legacy
+/// shape; consumers wanting the full policy should call this
+/// endpoint per-volume.
+async fn get_volume_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(volume_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    use axum::http::StatusCode;
+    let sm = state.sm_data.read().await;
+    let Some(cfg) = sm.volumes.get(&volume_id) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("volume not found: {volume_id}")})),
+        ));
+    };
+    Ok(Json(volume_config_to_json(cfg)))
+}
+
+/// AV-3-5 pure helper — render a `VolumeConfig` to the JSON shape
+/// the GET and set-cache endpoints return. Pulled out so the
+/// shape can be unit-tested without spinning an axum runtime.
+pub(crate) fn volume_config_to_json(
+    cfg: &dtfs_common::types::VolumeConfig,
+) -> serde_json::Value {
+    let eff_mandatory = cfg.effective_mandatory_replicas();
+    let anchor = cfg.effective_anchor();
+    json!({
+        "volume_id": cfg.id,
+        "name": cfg.name,
+        "chunk_size_bytes": cfg.chunk_size_bytes,
+        "replication": {
+            "hot":  cfg.replication.hot,
+            "warm": cfg.replication.warm,
+            "cold": cfg.replication.cold,
+            "tape": cfg.replication.tape,
+        },
+        "mandatory_replicas": {
+            "hot":  eff_mandatory.hot,
+            "warm": eff_mandatory.warm,
+            "cold": eff_mandatory.cold,
+            "tape": eff_mandatory.tape,
+        },
+        "cache_replicas": {
+            "hot":  { "min": cfg.cache_replicas.hot.min,  "max": cfg.cache_replicas.hot.max  },
+            "warm": { "min": cfg.cache_replicas.warm.min, "max": cfg.cache_replicas.warm.max },
+            "cold": { "min": cfg.cache_replicas.cold.min, "max": cfg.cache_replicas.cold.max },
+            "tape": { "min": cfg.cache_replicas.tape.min, "max": cfg.cache_replicas.tape.max },
+            "per_dc": cfg.cache_replicas.per_dc,
+            "promote_reads": cfg.cache_replicas.promote_reads,
+            "promote_window_secs": cfg.cache_replicas.promote_window_secs,
+            "cooldown_secs": cfg.cache_replicas.cooldown_secs,
+        },
+        "anchor": anchor.as_ref().map(|a| json!({
+            "datacenter": a.datacenter,
+            "required_tier": a.required_tier.map(|t| format!("{:?}", t).to_lowercase()),
+        })),
+        "write_safety": {
+            "min_replicas_before_ack": cfg.write_safety.min_replicas_before_ack,
+            "write_timeout_secs":      cfg.write_safety.write_timeout_secs,
+        },
+    })
+}
+
+/// AV-3-5 — request body for `POST /api/v1/volumes/{id}/set-cache`.
+/// Every field is optional; only the supplied ones are merged.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetCacheRequest {
+    pub warm_min: Option<u32>,
+    pub warm_max: Option<u32>,
+    pub hot_min: Option<u32>,
+    pub hot_max: Option<u32>,
+    pub per_dc: Option<bool>,
+    pub promote_reads: Option<u32>,
+    pub promote_window_secs: Option<u64>,
+    pub cooldown_secs: Option<u64>,
+}
+
+/// AV-3-5 pure helper — apply the partial update onto a clone of
+/// the current volume config. Returns the updated config; the
+/// caller decides whether to Raft-write it (skip if no change).
+/// Validates `max >= min` per tier; rejects with an error string
+/// describing the offending tier.
+pub(crate) fn apply_set_cache(
+    current: &dtfs_common::types::VolumeConfig,
+    req: &SetCacheRequest,
+) -> Result<dtfs_common::types::VolumeConfig, String> {
+    let mut next = current.clone();
+
+    if let Some(m) = req.warm_min { next.cache_replicas.warm.min = m; }
+    if let Some(m) = req.warm_max { next.cache_replicas.warm.max = m; }
+    if let Some(m) = req.hot_min  { next.cache_replicas.hot.min  = m; }
+    if let Some(m) = req.hot_max  { next.cache_replicas.hot.max  = m; }
+    if let Some(v) = req.per_dc   { next.cache_replicas.per_dc   = v; }
+    if let Some(v) = req.promote_reads
+        { next.cache_replicas.promote_reads = v; }
+    if let Some(v) = req.promote_window_secs
+        { next.cache_replicas.promote_window_secs = v; }
+    if let Some(v) = req.cooldown_secs
+        { next.cache_replicas.cooldown_secs = v; }
+
+    // Validate min<=max per tier — `validate()` lives on
+    // CacheTierConfig already.
+    next.cache_replicas.hot.validate()
+        .map_err(|e| format!("hot tier: {e}"))?;
+    next.cache_replicas.warm.validate()
+        .map_err(|e| format!("warm tier: {e}"))?;
+    next.cache_replicas.cold.validate()
+        .map_err(|e| format!("cold tier: {e}"))?;
+    next.cache_replicas.tape.validate()
+        .map_err(|e| format!("tape tier: {e}"))?;
+
+    Ok(next)
+}
+
+async fn set_volume_cache_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(volume_id): axum::extract::Path<String>,
+    Json(body): Json<SetCacheRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    use axum::http::StatusCode;
+
+    let current = {
+        let sm = state.sm_data.read().await;
+        sm.volumes.get(&volume_id).cloned()
+    };
+    let Some(current) = current else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("volume not found: {volume_id}")})),
+        ));
+    };
+
+    let next = apply_set_cache(&current, &body)
+        .map_err(|e| (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e})),
+        ))?;
+
+    let changed = current != next;
+    if changed {
+        let req = ClientRequest::UpsertVolume { config: next.clone() };
+        if let Err(e) = state.raft.client_write(req).await {
+            warn!(volume = %volume_id, error = %e,
+                "set_volume_cache Raft write failed");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("raft write failed: {e}")})),
+            ));
+        }
+        state.audit_log.log(
+            "api", "volume.set_cache", &volume_id, "success",
+        );
+    } else {
+        state.audit_log.log(
+            "api", "volume.set_cache", &volume_id, "noop",
+        );
+    }
+
+    Ok(Json(json!({
+        "volume_id": volume_id,
+        "changed": changed,
+        "config": volume_config_to_json(&next),
     })))
 }
 
@@ -2152,5 +2336,140 @@ mod bug_al_io_rate_tests {
         let (r, w) = compute_io_rate_at(&mut tracker, &nodes, 1_000_200);
         assert_eq!(r, 12_345);
         assert_eq!(w, 6_789);
+    }
+}
+
+#[cfg(test)]
+mod bug_av_set_cache_tests {
+    //! AV-3-5 — pure tests for `apply_set_cache` and the
+    //! `volume_config_to_json` projection. The async axum
+    //! handlers wrap these helpers; per the AV-1-7 / AV-2-4
+    //! convention, the handler-level paths are live-verified on
+    //! the minicluster.
+    use super::*;
+    use dtfs_common::types::{
+        AnchorPolicy, CacheReplication, CacheTierConfig, DiskTier,
+        TierReplication, VolumeConfig, VolumeId, WriteSafety,
+    };
+
+    fn legacy_volume() -> VolumeConfig {
+        VolumeConfig {
+            id: VolumeId("default".to_string()),
+            name: "default".to_string(),
+            chunk_size_bytes: 16 * 1024 * 1024,
+            replication: TierReplication {
+                hot: 0, warm: 2, cold: 1, tape: 0,
+            },
+            // Default to all-zero so legacy fallback path is exercised.
+            mandatory_replicas: TierReplication {
+                hot: 0, warm: 0, cold: 0, tape: 0,
+            },
+            cache_replicas: CacheReplication::default(),
+            anchor: None,
+            anchor_datacenter: None,
+            write_safety: WriteSafety {
+                min_replicas_before_ack: 2,
+                write_timeout_secs: 30,
+            },
+        }
+    }
+
+    /// AV-3-5 test 1 — supplied fields overwrite, omitted fields
+    /// keep their current value.
+    #[test]
+    fn bug_av_set_cache_merges_partial_update() {
+        let current = legacy_volume();
+        let req = SetCacheRequest {
+            warm_min: Some(1),
+            warm_max: Some(1),
+            per_dc: Some(true),
+            promote_reads: Some(2),
+            promote_window_secs: Some(60),
+            cooldown_secs: Some(300),
+            ..Default::default()
+        };
+        let next = apply_set_cache(&current, &req).expect("valid update");
+        assert_eq!(next.cache_replicas.warm.min, 1);
+        assert_eq!(next.cache_replicas.warm.max, 1);
+        assert!(next.cache_replicas.per_dc);
+        assert_eq!(next.cache_replicas.promote_reads, 2);
+        assert_eq!(next.cache_replicas.promote_window_secs, 60);
+        assert_eq!(next.cache_replicas.cooldown_secs, 300);
+        // Hot tier untouched → still disabled (max=0).
+        assert_eq!(next.cache_replicas.hot.max, 0);
+        // Legacy `replication` untouched (rollback safety).
+        assert_eq!(next.replication.warm, 2);
+    }
+
+    /// AV-3-5 test 2 — `max < min` is rejected at apply time.
+    /// The state-machine apply path would also reject via
+    /// `CacheTierConfig::validate`, but rejecting at the REST
+    /// boundary gives the operator a clearer error.
+    #[test]
+    fn bug_av_set_cache_rejects_max_less_than_min() {
+        let current = legacy_volume();
+        let req = SetCacheRequest {
+            warm_min: Some(2),
+            warm_max: Some(1),
+            ..Default::default()
+        };
+        let err = apply_set_cache(&current, &req).unwrap_err();
+        assert!(err.contains("warm"), "error names the tier: {err}");
+        assert!(err.contains("max") && err.contains("min"),
+                "error explains why: {err}");
+    }
+
+    /// AV-3-5 test 3 — empty request body produces an unchanged
+    /// clone (so the dispatcher detects no-op and skips Raft).
+    #[test]
+    fn bug_av_set_cache_empty_request_is_noop() {
+        let current = legacy_volume();
+        let req = SetCacheRequest::default();
+        let next = apply_set_cache(&current, &req).expect("empty req is valid");
+        assert_eq!(current, next);
+    }
+
+    /// AV-3-5 test 4 — the JSON projection includes the new AV
+    /// fields (mandatory_replicas, cache_replicas, anchor) so
+    /// the CLI / WebUI can render them.
+    #[test]
+    fn bug_av_volume_config_json_includes_av_fields() {
+        let mut cfg = legacy_volume();
+        cfg.mandatory_replicas = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+        cfg.cache_replicas.warm = CacheTierConfig { min: 1, max: 1 };
+        cfg.cache_replicas.per_dc = true;
+        cfg.cache_replicas.promote_reads = 2;
+        cfg.cache_replicas.promote_window_secs = 14400;
+        cfg.cache_replicas.cooldown_secs = 300;
+        cfg.anchor = Some(AnchorPolicy {
+            datacenter: "leli".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        });
+
+        let v = volume_config_to_json(&cfg);
+        assert_eq!(v["mandatory_replicas"]["cold"], 1);
+        assert_eq!(v["cache_replicas"]["warm"]["min"], 1);
+        assert_eq!(v["cache_replicas"]["warm"]["max"], 1);
+        assert_eq!(v["cache_replicas"]["per_dc"], true);
+        assert_eq!(v["cache_replicas"]["promote_reads"], 2);
+        assert_eq!(v["cache_replicas"]["promote_window_secs"], 14400);
+        assert_eq!(v["cache_replicas"]["cooldown_secs"], 300);
+        assert_eq!(v["anchor"]["datacenter"], "leli");
+        assert_eq!(v["anchor"]["required_tier"], "cold");
+        // Legacy `replication` block still present (back-compat).
+        assert_eq!(v["replication"]["warm"], 2);
+    }
+
+    /// AV-3-5 defensive — anchor=None projects null/omitted, not
+    /// a stale stub object.
+    #[test]
+    fn bug_av_volume_config_json_anchor_none_is_null() {
+        let cfg = legacy_volume();
+        let v = volume_config_to_json(&cfg);
+        assert!(
+            v["anchor"].is_null(),
+            "anchor is None → null, not an empty object (got {})",
+            v["anchor"]
+        );
     }
 }
