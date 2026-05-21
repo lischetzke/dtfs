@@ -484,8 +484,35 @@ impl ChunkStore {
         Err(DtfsError::ChunkNotFound(chunk_id.to_string()))
     }
 
-    /// Delete a chunk from disk.
+    /// Delete a chunk from disk. **Errors** with `ChunkNotFound` when
+    /// the chunk is absent — call `delete_chunk_idempotent` instead
+    /// if you want a silent no-op on absent.
     pub async fn delete_chunk(&self, chunk_id: &ChunkId) -> DtfsResult<()> {
+        let (was_present, _bytes) = self.delete_chunk_idempotent(chunk_id).await?;
+        if !was_present {
+            return Err(DtfsError::ChunkNotFound(chunk_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Bug AV — idempotent chunk delete. Returns `(was_present,
+    /// freed_bytes)`:
+    /// * `was_present = true, freed_bytes = N` — file was removed,
+    ///   counters decremented by N.
+    /// * `was_present = false, freed_bytes = 0` — chunk not found on
+    ///   any disk; this is the operation's natural no-op state, not
+    ///   an error.
+    ///
+    /// On-disk order: remove `.dat` first (releases bytes immediately
+    /// even on crash before `.meta` removal), then `.meta`. A crash
+    /// in between leaves an orphan `.meta` with no data; periodic
+    /// scrub detects + cleans these. Full WAL-recoverable atomicity
+    /// is a separate feature (see Deviations in
+    /// PLAN-BUG-AV-TIER-LIFECYCLE.md §5).
+    pub async fn delete_chunk_idempotent(
+        &self,
+        chunk_id: &ChunkId,
+    ) -> DtfsResult<(bool, u64)> {
         for disk in self.disk_manager.all_disks() {
             let dat_path = chunk_data_path(&disk.mount_path, chunk_id);
             let meta_path = chunk_meta_path(&disk.mount_path, chunk_id);
@@ -521,11 +548,11 @@ impl ChunkStore {
                     })
                     .ok();
 
-                return Ok(());
+                return Ok((true, file_size));
             }
         }
 
-        Err(DtfsError::ChunkNotFound(chunk_id.to_string()))
+        Ok((false, 0))
     }
 
     /// Check if a chunk exists on any disk.
@@ -1555,5 +1582,103 @@ mod tests {
         let got = store.get_chunk(&chunk_id).await.unwrap();
         assert_eq!(got.len() as u64, size);
         assert_eq!(&got[0..16], &vec![0xABu8; 16][..]);
+    }
+
+    // ---- AV-1-5 — DeleteChunkReplica idempotent delete tests ------
+
+    /// AV-1-5 test 1 — atomic-on-success: delete_chunk_idempotent
+    /// unlinks BOTH the `.dat` and the `.meta` and reports the file
+    /// size that was freed.
+    #[tokio::test]
+    async fn bug_av_delete_chunk_atomic_unlinks_both() {
+        let (store, tmp) = make_test_store().await;
+        let data = b"unlink-both";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+
+        store
+            .put_chunk(&chunk_id, data, &volume_id, DiskTier::Hot)
+            .await
+            .unwrap();
+
+        let dat = chunk_data_path(tmp.path(), &chunk_id);
+        let meta = chunk_meta_path(tmp.path(), &chunk_id);
+        assert!(dat.exists(), "pre-delete dat present");
+        assert!(meta.exists(), "pre-delete meta present");
+
+        let (was_present, freed) = store.delete_chunk_idempotent(&chunk_id).await.unwrap();
+        assert!(was_present, "first delete sees the chunk");
+        assert_eq!(freed, data.len() as u64, "freed_bytes = data size");
+        assert!(!dat.exists(),  "dat unlinked");
+        assert!(!meta.exists(), "meta unlinked");
+    }
+
+    /// AV-1-5 test 2 — delete on an absent chunk returns
+    /// `was_present=false, freed_bytes=0` and does NOT error. A retry
+    /// of a previously-successful delete (e.g. the manager's
+    /// flush-cache scheduler retrying after a transient network error)
+    /// won't tear down the batch.
+    #[tokio::test]
+    async fn bug_av_delete_chunk_missing_is_idempotent() {
+        let (store, _tmp) = make_test_store().await;
+        let hash = checksum::compute(b"never-stored");
+        let chunk_id = ChunkId::from_bytes(hash);
+        let (was_present, freed) = store.delete_chunk_idempotent(&chunk_id).await.unwrap();
+        assert!(!was_present, "missing chunk → was_present=false");
+        assert_eq!(freed, 0, "no bytes freed");
+    }
+
+    /// AV-1-5 test 3 — second delete after a successful first delete
+    /// also returns was_present=false (the "retry after I already
+    /// deleted" path). Same shape as test 2 but exercises the
+    /// state-after-success path explicitly.
+    #[tokio::test]
+    async fn bug_av_delete_chunk_second_delete_is_noop() {
+        let (store, _tmp) = make_test_store().await;
+        let data = b"twice-removed";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+
+        store
+            .put_chunk(&chunk_id, data, &volume_id, DiskTier::Hot)
+            .await
+            .unwrap();
+        let (was_present_1, _) = store.delete_chunk_idempotent(&chunk_id).await.unwrap();
+        let (was_present_2, freed_2) = store.delete_chunk_idempotent(&chunk_id).await.unwrap();
+        assert!(was_present_1, "first delete sees chunk");
+        assert!(!was_present_2, "second delete: gone");
+        assert_eq!(freed_2, 0);
+    }
+
+    /// AV-1-5 test 4 — sequential put followed by delete leaves
+    /// consistent counters. Tests that bytes_stored decrements
+    /// correctly through the new idempotent path (regression on the
+    /// fix #6 counter behaviour from the legacy `delete_chunk`).
+    #[tokio::test]
+    async fn bug_av_delete_chunk_counters_consistent() {
+        let (store, _tmp) = make_test_store().await;
+        let data = b"counter-check-data-with-known-size";
+        let n = data.len() as u64;
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+
+        let stats_before = store.stats();
+        assert_eq!(stats_before.total_chunks, 0);
+        assert_eq!(stats_before.total_bytes_stored, 0);
+
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Hot).await.unwrap();
+        let after_put = store.stats();
+        assert_eq!(after_put.total_chunks, 1);
+        assert_eq!(after_put.total_bytes_stored, n);
+
+        let (was, freed) = store.delete_chunk_idempotent(&chunk_id).await.unwrap();
+        assert!(was);
+        assert_eq!(freed, n);
+        let after_del = store.stats();
+        assert_eq!(after_del.total_chunks, 0);
+        assert_eq!(after_del.total_bytes_stored, 0);
     }
 }

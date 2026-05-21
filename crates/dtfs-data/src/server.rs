@@ -371,12 +371,27 @@ impl DataService for DataServiceImpl {
         id_array.copy_from_slice(&chunk_id_bytes);
         let chunk_id = ChunkId::from_bytes(id_array);
 
-        self.store
-            .delete_chunk(&chunk_id)
+        // Bug AV — idempotent delete. The cache-flush scheduler routine
+        // (AV-1-7) calls this directly; missing chunks (e.g. a retry
+        // after a previously-successful delete) return success with
+        // was_present=false rather than tearing down the whole flush
+        // batch with an error.
+        let (was_present, freed_bytes) = self
+            .store
+            .delete_chunk_idempotent(&chunk_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(DeleteChunkResponse { success: true }))
+        // Bug AL — keep the read-counter machinery consistent; a
+        // deleted chunk is no longer eligible for serving so its
+        // per-DC read counter (if any) is dropped.
+        self.metrics.forget_chunk(&req.chunk_id);
+
+        Ok(Response::new(DeleteChunkResponse {
+            success: true,
+            was_present,
+            freed_bytes,
+        }))
     }
 
     async fn verify_chunk(

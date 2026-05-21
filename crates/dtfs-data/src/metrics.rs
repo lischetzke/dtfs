@@ -68,6 +68,17 @@ impl DataMetrics {
         self.total_bytes_read.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Bug AV — drop per-chunk-per-DC read counters and last-access
+    /// when a chunk is deleted on this node. The tiering engine should
+    /// not see "this chunk has 5 reads from DC X" for a chunk that no
+    /// longer exists here; that would let a stale read count drive a
+    /// promotion right after a flush. Idempotent — calling on an
+    /// untracked chunk is a no-op.
+    pub fn forget_chunk(&self, chunk_id: &str) {
+        self.per_chunk_reads.remove(chunk_id);
+        self.per_chunk_last_access.remove(chunk_id);
+    }
+
     /// P0-9: record a per-chunk read attributed to a requester DC.
     /// Empty `requester_dc` is recorded under the `"unknown"` bucket so the
     /// counter is never lost (server-side TieringEngine can ignore it).

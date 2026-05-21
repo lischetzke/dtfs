@@ -66,6 +66,18 @@ message DeleteChunkRequest {
 
 message DeleteChunkResponse {
   bool success = 1;
+  // Bug AV — true when the chunk existed on this data node before
+  // the delete; false when the operation was a no-op (chunk wasn't
+  // present, e.g. a retry after a previous successful delete, or a
+  // race with another delete path). Callers (notably the cache-flush
+  // scheduler routine) use this to distinguish "I freed a replica"
+  // from "no work to do" without forcing the operation to error on
+  // the latter.
+  bool was_present = 2;
+  // Bug AV — bytes released by this delete. 0 when was_present=false
+  // or when the file size couldn't be stat'd. Lets the caller drive
+  // per-node accounting without re-querying disk usage.
+  uint64 freed_bytes = 3;
 }
 
 // --- ReplicateChunk ---
