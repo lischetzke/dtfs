@@ -80,6 +80,20 @@ pub struct FileMetadata {
     /// `#[serde(default)]` keeps older snapshots loadable.
     #[serde(default)]
     pub is_directory: bool,
+
+    /// Bug AV — per-chunk-index cache cooldown timestamps in
+    /// milliseconds-since-epoch. When `cache_cooldown_until_ms[idx]`
+    /// is in the future, the tiering engine refuses to re-promote that
+    /// chunk's cache replicas (suppresses immediate re-promotion after
+    /// an operator-driven flush). Entries are cleared on tiering-engine
+    /// demote so a natural idle→demote→read cycle promotes immediately;
+    /// operator flushes set future timestamps that the engine respects.
+    /// `BTreeMap` (not HashMap) so the serialised form is deterministic
+    /// across snapshots.
+    /// `#[serde(default)]` keeps older snapshots loadable — empty map
+    /// for pre-AV files.
+    #[serde(default)]
+    pub cache_cooldown_until_ms: std::collections::BTreeMap<u64, u64>,
 }
 
 /// F-039 — One distributed POSIX byte-range lock held in the cluster FSM.
@@ -377,6 +391,7 @@ impl StateMachineData {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: true,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
             });
         }
         None
@@ -797,6 +812,7 @@ fn apply_request(
                     symlink_target: None,
                     logical_size: None,
                     is_directory: is_dir,
+                    cache_cooldown_until_ms: std::collections::BTreeMap::new(),
                 },
             );
             push_audit_capped(
@@ -1094,6 +1110,7 @@ fn apply_request(
                     symlink_target: Some(target.clone()),
                     logical_size: Some(target.len() as u64),
                     is_directory: false,
+                    cache_cooldown_until_ms: std::collections::BTreeMap::new(),
                 },
             );
             push_audit_capped(
@@ -1450,6 +1467,7 @@ mod snapshot_persistence_tests {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
             },
         );
         data.cluster_config.version = 7;
@@ -1907,6 +1925,7 @@ mod posix_path_regression {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
             },
         );
 
@@ -2108,6 +2127,7 @@ mod posix_path_regression {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
             },
         );
         apply_request(
@@ -2248,5 +2268,54 @@ mod posix_path_regression {
         let last = sm.audit_log.last().unwrap();
         assert_eq!(last.action, "flood");
         assert_eq!(last.origin_manager, "mgr03");
+    }
+
+    // ---- AV-1-2 — FileMetadata.cache_cooldown_until_ms tests ------
+
+    /// AV-1-2 test 6 — `FileMetadata::cache_cooldown_until_ms` is
+    /// `#[serde(default)]` so old snapshots (from before AV) load
+    /// cleanly with an empty BTreeMap and no behaviour change.
+    #[test]
+    fn bug_av_filemeta_cooldown_serde_default() {
+        // Old-snapshot JSON (no `cache_cooldown_until_ms` field).
+        let legacy_json = r#"{
+            "path": "/old.bin",
+            "volume_id": "default",
+            "chunk_size": 1024,
+            "chunks": [],
+            "created_at_ms": 100,
+            "updated_at_ms": 200
+        }"#;
+        let f: FileMetadata = serde_json::from_str(legacy_json).expect("loads");
+        assert_eq!(f.path, "/old.bin");
+        assert!(f.cache_cooldown_until_ms.is_empty(),
+            "missing field defaults to empty map");
+    }
+
+    /// AV-1-2 test 7 — a populated cooldown map survives ser→de
+    /// round-trip with deterministic key ordering.
+    #[test]
+    fn bug_av_filemeta_old_snapshot_loads() {
+        let mut original = FileMetadata {
+            path: "/new.bin".into(),
+            volume_id: "default".into(),
+            chunk_size: 1024,
+            chunks: Vec::new(),
+            created_at_ms: 100,
+            updated_at_ms: 200,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+        };
+        original.cache_cooldown_until_ms.insert(0, 1_000_000);
+        original.cache_cooldown_until_ms.insert(2, 2_000_000);
+
+        let json = serde_json::to_string(&original).unwrap();
+        let round_tripped: FileMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, original);
+        // BTreeMap iteration order is by key — deterministic across runs.
+        let keys: Vec<_> = round_tripped.cache_cooldown_until_ms.keys().copied().collect();
+        assert_eq!(keys, vec![0, 2]);
     }
 }

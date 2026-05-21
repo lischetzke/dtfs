@@ -247,6 +247,13 @@ async fn main() -> anyhow::Result<()> {
                 replication: default_volume_replication,
                 write_safety: default_write_safety,
                 anchor_datacenter: default_anchor.clone(),
+                // Bug AV — new fields default to empty/disabled so the
+                // bootstrap-default volume stays on the legacy policy.
+                // Operators upgrade explicitly via
+                // `dtfs-cli volume migrate-policy default`.
+                mandatory_replicas: dtfs_common::types::TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 },
+                cache_replicas: dtfs_common::types::CacheReplication::default(),
+                anchor: None,
             };
             match raft_for_volume
                 .client_write(dtfs_raft::ClientRequest::UpsertVolume { config: vol_cfg })
