@@ -875,20 +875,43 @@ manually for now (or by the existing additive-migrate UI button).
   desirable. Both pieces are needed to demo the full
   Plexmedia-style "warm-first → async-cold" pattern.
 
-### ⬜ AV-3-3 — Auto-anchor-migration on warm-first writes
+### ✅ AV-3-3 — Auto-anchor-migration on warm-first writes
 
 * **Files:** `crates/dtfs-manager/src/scheduler.rs`.
-* **Implementation:** new pass in `check_under_replicated` (or
-  separate `check_anchor_lag` running at the same cadence): for
-  every chunk with no replica in the anchor's required tier, enqueue
-  a normal `ReplicationTask` targeting a cold node in the anchor DC.
-  Audit: `"anchor.lag_repair chunk=X target=Y"`.
-* **Tests:**
+* **Implementation:** new pure planner
+  `plan_anchor_lag_repair(anchor, placements, nodes, chunk_id,
+  existing_tasks) -> Option<AnchorRepairAction>`. Decision tree:
+  - Gate 1: anchor invariant already satisfied → `None`.
+  - Gate 2: pick candidate tier (`required_tier` if set,
+    else default to `Cold`).
+  - Gate 3: filter healthy nodes in anchor DC with the
+    candidate tier, exclude existing holders, pick lowest
+    node_id for deterministic audit output.
+  - Gate 4: skip if `(chunk_id, target_node)` already
+    in-flight as a migration task.
+  - Source = lowest-id existing placement (cross-tier reads
+    handled by the data-node `ReplicateChunk` RPC).
+  - New async `check_anchor_lag` method runs alongside
+    `check_under_replicated` at the same cadence. Audits each
+    scheduled repair with `anchor.lag_repair` reason code +
+    target/tier/dc details.
+* **Tests (6 green):**
   - `bug_av_anchor_lag_repair_picks_anchor_dc_node`
   - `bug_av_anchor_lag_repair_picks_required_tier`
   - `bug_av_anchor_lag_repair_no_op_when_satisfied`
-* **Done when:** 3 tests + live: a warm-first write reaches anchor
-  tier within ~scheduler tick + replication time (~30-60 s).
+  - `bug_av_anchor_lag_repair_required_tier_none_defaults_to_cold`
+    (defensive)
+  - `bug_av_anchor_lag_repair_skips_already_scheduled`
+    (defensive)
+  - `bug_av_anchor_lag_repair_skips_unhealthy_target`
+    (defensive)
+* **Done when:** 6 tests + smoke check on minicluster (binary
+  rolls cleanly). ✓
+* **Deviation:** the live demo for AV-3-1 / AV-3-2 / AV-3-3
+  end-to-end ("warm-first write → anchor repair within ~30s")
+  bundles into the Phase 3 close-out, since exercising it
+  requires a refreshed FUSE binary + a fuse.toml with
+  `first_write_tier = "nearest-warm"` deployed to a client VM.
 
 ### ⬜ AV-3-4 — WebUI "Flush cache" action + volume-edit form
 
@@ -991,6 +1014,42 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-3-3 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-manager/src/scheduler.rs` — new
+    `AnchorRepairNode`, `AnchorRepairPlacement`,
+    `AnchorRepairAction` types + pure
+    `plan_anchor_lag_repair`; new async `check_anchor_lag`
+    method called from `evaluate()` alongside
+    `check_under_replicated`. Audit hook fires
+    `anchor.lag_repair` with `target=N tier=T dc=D` details.
+* **Unit tests** (`cargo test -p dtfs-manager bug_av_anchor_lag`):
+  6 green:
+  - `bug_av_anchor_lag_repair_picks_anchor_dc_node`
+  - `bug_av_anchor_lag_repair_picks_required_tier`
+  - `bug_av_anchor_lag_repair_no_op_when_satisfied`
+  - `bug_av_anchor_lag_repair_required_tier_none_defaults_to_cold`
+    (defensive)
+  - `bug_av_anchor_lag_repair_skips_already_scheduled`
+    (defensive)
+  - `bug_av_anchor_lag_repair_skips_unhealthy_target`
+    (defensive)
+* **Workspace regression**: dtfs-manager 93 → 99; all other
+  crates unchanged. `cargo test --workspace --release` all
+  green.
+* **Live verification:** smoke check (binary rolls cleanly
+  on mini-mgr01 + mini-mgr03; no panics, cluster info
+  responds). End-to-end "warm-first write → anchor repair
+  scheduled within ~30s" deferred to Phase 3 close-out
+  (requires a refreshed FUSE client binary + a fuse.toml
+  with `first_write_tier = "nearest-warm"`).
+* **Deviations:** 3 extra defensive tests added covering
+  `required_tier = None` fallback, already-scheduled
+  deduplication, and unhealthy-target filtering. Each
+  corresponds to a real production failure mode worth
+  guarding.
 
 ### AV-3-2 — 2026-05-21
 

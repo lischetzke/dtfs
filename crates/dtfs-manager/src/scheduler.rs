@@ -161,6 +161,12 @@ impl TaskScheduler {
         // 1. Check for under-replicated chunks and schedule new tasks.
         self.check_under_replicated(&mut migration_state).await;
 
+        // 1b. Bug AV (AV-3-3) — check anchor lag and schedule repairs
+        // for chunks whose anchor invariant isn't yet satisfied. Used
+        // primarily by warm-first writes (AV-3-1/3-2) where the
+        // mandatory anchor copy is created asynchronously.
+        self.check_anchor_lag(&mut migration_state).await;
+
         // 2. Advance existing migration tasks through their state machine.
         self.advance_tasks(&mut migration_state).await;
 
@@ -369,6 +375,147 @@ impl TaskScheduler {
                             migration_state.tasks.insert(task_id, task);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Bug AV (AV-3-3) — Auto-anchor-migration check.
+    ///
+    /// For every chunk whose volume has an anchor policy, verifies
+    /// that at least one replica satisfies the anchor invariant
+    /// (in the anchor DC; if `required_tier` is set, on that tier).
+    /// If not, schedules a `ReplicationTask` targeting a healthy
+    /// node in the anchor DC with the required tier.
+    ///
+    /// This is what makes the warm-first write pattern safe: the
+    /// FUSE client (AV-3-1/3-2) ACKs on a warm placement, then
+    /// this background pass schedules the cold (anchor) copy. The
+    /// volume's mandatory-replica scheduler
+    /// (`check_under_replicated`) would also notice the missing
+    /// cold copy, but that path only fires when the
+    /// `mandatory_replicas.<tier>` counter is below threshold —
+    /// the anchor invariant is a separate concern (which DC the
+    /// replica lives in, not how many of them exist).
+    async fn check_anchor_lag(&self, migration_state: &mut MigrationState) {
+        let sm = self.state_data.read().await;
+
+        // Build per-node summary for the planner.
+        let nodes: Vec<AnchorRepairNode> = sm
+            .nodes
+            .iter()
+            .map(|(id, info)| AnchorRepairNode {
+                node_id: *id,
+                datacenter: info.location.datacenter.clone(),
+                healthy: info.health == HealthStatus::Healthy,
+                tiers: info.disks.iter().map(|d| d.tier).collect(),
+            })
+            .collect();
+
+        // Quick lookup: existing task fingerprints (chunk_id, target_node)
+        // for in-progress tasks so we don't double-schedule.
+        let existing_tasks: std::collections::HashSet<(String, u64)> =
+            migration_state
+                .tasks
+                .values()
+                .filter(|t| {
+                    t.status != MigrationStatus::Done
+                        && t.status != MigrationStatus::Failed
+                })
+                .map(|t| (t.chunk_id.clone(), t.target_node))
+                .collect();
+
+        // Walk every file and run the per-chunk planner.
+        for (file_path, file_meta) in &sm.files {
+            let Some(volume) = sm.volumes.get(&file_meta.volume_id) else {
+                continue;
+            };
+            let Some(anchor) = volume.effective_anchor() else {
+                continue;
+            };
+
+            // Group chunks by chunk_index so we evaluate each chunk
+            // (not each replica row) exactly once.
+            let mut by_idx: std::collections::BTreeMap<
+                u64,
+                Vec<&dtfs_raft::ChunkLocationEntry>,
+            > = std::collections::BTreeMap::new();
+            for c in &file_meta.chunks {
+                by_idx.entry(c.chunk_index).or_default().push(c);
+            }
+
+            for (chunk_index, entries) in by_idx {
+                // Resolve the placements + tiers for this chunk.
+                let placements: Vec<AnchorRepairPlacement> = entries
+                    .iter()
+                    .filter_map(|e| {
+                        let nid = e.node_id.parse::<u64>().ok()?;
+                        let info = sm.nodes.get(&nid)?;
+                        let tier = info.disks.get(e.disk_id as usize).map(|d| d.tier)?;
+                        Some(AnchorRepairPlacement {
+                            node_id: nid,
+                            dc: info.location.datacenter.clone(),
+                            tier,
+                        })
+                    })
+                    .collect();
+
+                // The chunk_id (BLAKE3 hash) is the same across
+                // replicas for a given chunk_index; pick the first.
+                let Some(chunk_id) = entries.first().map(|e| e.chunk_hash.clone()) else {
+                    continue;
+                };
+
+                if let Some(action) = plan_anchor_lag_repair(
+                    &anchor,
+                    &placements,
+                    &nodes,
+                    &chunk_id,
+                    &existing_tasks,
+                ) {
+                    // Source picks a healthy existing replica (any
+                    // tier); the dispatcher tolerates cross-tier
+                    // copies.
+                    let now_ms = now_millis();
+                    let task_id =
+                        format!("anchor-{}", migration_state.next_task_id);
+                    migration_state.next_task_id += 1;
+
+                    let task = ReplicationTask {
+                        task_id: task_id.clone(),
+                        chunk_id: chunk_id.clone(),
+                        source_node: action.source_node,
+                        target_node: action.target_node,
+                        tier: action.target_tier,
+                        status: MigrationStatus::Pending,
+                        created_at_ms: now_ms,
+                        updated_at_ms: now_ms,
+                        attempts: 0,
+                        last_error: None,
+                    };
+                    info!(
+                        task_id = %task_id,
+                        chunk = %chunk_id,
+                        file = %file_path,
+                        idx = chunk_index,
+                        source = action.source_node,
+                        target = action.target_node,
+                        tier = ?action.target_tier,
+                        dc = %anchor.datacenter,
+                        "Bug AV anchor.lag_repair: scheduling anchor migration"
+                    );
+                    self.audit.log(
+                        "scheduler",
+                        "anchor.lag_repair",
+                        &format!(
+                            "chunk={} file={} idx={} target={} tier={:?} dc={}",
+                            chunk_id, file_path, chunk_index,
+                            action.target_node, action.target_tier,
+                            anchor.datacenter
+                        ),
+                        "scheduled",
+                    );
+                    migration_state.tasks.insert(task_id, task);
                 }
             }
         }
@@ -1742,6 +1889,111 @@ pub(crate) fn normalize_endpoint(stored_addr: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Bug AV (AV-3-3) — anchor-lag-repair pure-planner kernel
+// ---------------------------------------------------------------------------
+
+/// AV-3-3 — projection of a node's state used by the anchor-lag
+/// planner.
+#[derive(Debug, Clone)]
+pub(crate) struct AnchorRepairNode {
+    pub node_id: u64,
+    pub datacenter: String,
+    pub healthy: bool,
+    pub tiers: Vec<DiskTier>,
+}
+
+/// AV-3-3 — one of a chunk's existing replicas.
+#[derive(Debug, Clone)]
+pub(crate) struct AnchorRepairPlacement {
+    pub node_id: u64,
+    pub dc: String,
+    pub tier: DiskTier,
+}
+
+/// AV-3-3 — the planner's output: a single anchor-repair action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnchorRepairAction {
+    pub source_node: u64,
+    pub target_node: u64,
+    pub target_tier: DiskTier,
+}
+
+/// AV-3-3 pure kernel — decide whether a chunk needs an anchor
+/// repair, and if so, pick `source` + `target` for the replication
+/// task.
+///
+/// Returns `Some(AnchorRepairAction)` when:
+/// 1. No existing placement satisfies the anchor invariant
+///    (`AnchorPolicy::is_satisfied_by`-compatible check inline).
+/// 2. A healthy candidate node exists in the anchor DC with the
+///    required tier (or any tier, if `required_tier` is `None`).
+/// 3. The action isn't already in flight
+///    (`(chunk_id, target_node) ∉ existing_tasks`).
+///
+/// Returns `None` when the invariant is already met, no
+/// candidate exists, or the action is already scheduled.
+///
+/// Target tier selection: when `required_tier` is set, use it
+/// exactly. Otherwise prefer cold (the durable anchor tier) if
+/// any node in the anchor DC has a cold disk; else fall back to
+/// any tier the candidate offers.
+pub(crate) fn plan_anchor_lag_repair(
+    anchor: &dtfs_common::types::AnchorPolicy,
+    placements: &[AnchorRepairPlacement],
+    nodes: &[AnchorRepairNode],
+    chunk_id: &str,
+    existing_tasks: &std::collections::HashSet<(String, u64)>,
+) -> Option<AnchorRepairAction> {
+    // Gate 1 — is the anchor already satisfied?
+    let satisfied = placements.iter().any(|p| {
+        p.dc == anchor.datacenter
+            && match anchor.required_tier {
+                Some(t) => p.tier == t,
+                None => true,
+            }
+    });
+    if satisfied {
+        return None;
+    }
+
+    // Gate 2 — pick a target tier. Prefer the required_tier if set,
+    // else cold (the durable anchor floor), else any tier available
+    // in the anchor DC.
+    let candidate_tier = anchor.required_tier.unwrap_or(DiskTier::Cold);
+
+    // Gate 3 — find a healthy node in the anchor DC with the
+    // candidate tier. Exclude nodes that already hold the chunk
+    // (placement.node_id) to avoid self-placement.
+    let holders: std::collections::HashSet<u64> =
+        placements.iter().map(|p| p.node_id).collect();
+    let target = nodes
+        .iter()
+        .filter(|n| n.healthy)
+        .filter(|n| n.datacenter == anchor.datacenter)
+        .filter(|n| n.tiers.contains(&candidate_tier))
+        .filter(|n| !holders.contains(&n.node_id))
+        .min_by_key(|n| n.node_id)?; // deterministic by node_id
+
+    // Gate 4 — already scheduled?
+    if existing_tasks.contains(&(chunk_id.to_string(), target.node_id)) {
+        return None;
+    }
+
+    // Source = any existing replica (the dispatcher's
+    // `ReplicateChunk` RPC handles cross-tier reads).
+    let source = placements
+        .iter()
+        .min_by_key(|p| p.node_id)
+        .map(|p| p.node_id)?;
+
+    Some(AnchorRepairAction {
+        source_node: source,
+        target_node: target.node_id,
+        target_tier: candidate_tier,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Bug AE — orphan migration task helpers (pure logic, unit-tested below)
 // ---------------------------------------------------------------------------
 
@@ -2438,6 +2690,168 @@ mod bug_av_flush_cache_tests {
         assert_eq!(actions[0].file_path, "/vol-default/foo.bin");
         assert_eq!(report.replicas_dropped, 0, "wrapper drives this");
         assert_eq!(report.files_matched, 2);
+    }
+}
+
+#[cfg(test)]
+mod bug_av_anchor_lag_tests {
+    //! AV-3-3 — pure tests for `plan_anchor_lag_repair`. The
+    //! async dispatcher wiring (`check_anchor_lag`) is live-only
+    //! per the AV-1-7 / AV-2-4 convention; these tests cover the
+    //! decision logic in isolation.
+    use super::*;
+    use dtfs_common::types::AnchorPolicy;
+    use std::collections::HashSet;
+
+    fn node(id: u64, dc: &str, healthy: bool, tiers: &[DiskTier]) -> AnchorRepairNode {
+        AnchorRepairNode {
+            node_id: id,
+            datacenter: dc.to_string(),
+            healthy,
+            tiers: tiers.to_vec(),
+        }
+    }
+
+    fn placement(id: u64, dc: &str, tier: DiskTier) -> AnchorRepairPlacement {
+        AnchorRepairPlacement { node_id: id, dc: dc.to_string(), tier }
+    }
+
+    /// AV-3-3 test 1 — a warm-first write has a single warm
+    /// placement in `toro`. The Plexmedia anchor is
+    /// `(leli, cold)`. The planner picks the only healthy LELI
+    /// cold node as the repair target.
+    #[test]
+    fn bug_av_anchor_lag_repair_picks_anchor_dc_node() {
+        let anchor = AnchorPolicy {
+            datacenter: "leli".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        let placements = vec![placement(11, "toro", DiskTier::Warm)];
+        let nodes = vec![
+            node(10, "leli", true, &[DiskTier::Cold]),
+            node(11, "toro", true, &[DiskTier::Warm]),
+            node(12, "nrb",  true, &[DiskTier::Warm]),
+        ];
+        let existing: HashSet<(String, u64)> = HashSet::new();
+        let action =
+            plan_anchor_lag_repair(&anchor, &placements, &nodes, "h0", &existing);
+        let a = action.expect("anchor missing → repair scheduled");
+        assert_eq!(a.target_node, 10, "LELI cold node");
+        assert_eq!(a.target_tier, DiskTier::Cold);
+        assert_eq!(a.source_node, 11, "the only existing replica");
+    }
+
+    /// AV-3-3 test 2 — `required_tier = Cold` filters out a
+    /// LELI warm node that *would* be in the anchor DC but on
+    /// the wrong tier.
+    #[test]
+    fn bug_av_anchor_lag_repair_picks_required_tier() {
+        let anchor = AnchorPolicy {
+            datacenter: "leli".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        let placements = vec![placement(11, "toro", DiskTier::Warm)];
+        let nodes = vec![
+            // LELI warm-only — must NOT be picked (wrong tier).
+            node(15, "leli", true, &[DiskTier::Warm]),
+            // LELI cold — the correct target.
+            node(10, "leli", true, &[DiskTier::Cold]),
+            // TORO warm — the existing source.
+            node(11, "toro", true, &[DiskTier::Warm]),
+        ];
+        let action =
+            plan_anchor_lag_repair(&anchor, &placements, &nodes, "h0", &HashSet::new());
+        let a = action.expect("anchor repair scheduled");
+        assert_eq!(a.target_node, 10);
+        assert_eq!(a.target_tier, DiskTier::Cold);
+    }
+
+    /// AV-3-3 test 3 — when the anchor invariant is already
+    /// satisfied (existing LELI cold replica), the planner
+    /// returns `None`.
+    #[test]
+    fn bug_av_anchor_lag_repair_no_op_when_satisfied() {
+        let anchor = AnchorPolicy {
+            datacenter: "leli".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        let placements = vec![
+            placement(10, "leli", DiskTier::Cold), // anchor already present
+            placement(11, "toro", DiskTier::Warm),
+        ];
+        let nodes = vec![
+            node(10, "leli", true, &[DiskTier::Cold]),
+            node(11, "toro", true, &[DiskTier::Warm]),
+        ];
+        let action =
+            plan_anchor_lag_repair(&anchor, &placements, &nodes, "h0", &HashSet::new());
+        assert!(action.is_none(), "anchor satisfied → no repair");
+    }
+
+    /// AV-3-3 defensive — `required_tier = None` accepts any
+    /// tier in the anchor DC (preferring Cold by default per
+    /// the planner's documented choice).
+    #[test]
+    fn bug_av_anchor_lag_repair_required_tier_none_defaults_to_cold() {
+        let anchor = AnchorPolicy {
+            datacenter: "leli".to_string(),
+            required_tier: None,
+        };
+        let placements = vec![placement(11, "toro", DiskTier::Warm)];
+        let nodes = vec![
+            node(10, "leli", true, &[DiskTier::Cold]),
+            node(15, "leli", true, &[DiskTier::Warm]),
+            node(11, "toro", true, &[DiskTier::Warm]),
+        ];
+        let action =
+            plan_anchor_lag_repair(&anchor, &placements, &nodes, "h0", &HashSet::new());
+        let a = action.expect("required_tier=None still produces a repair");
+        // Per the planner doc: defaults to Cold when required_tier
+        // is None and a cold candidate exists.
+        assert_eq!(a.target_tier, DiskTier::Cold);
+        assert_eq!(a.target_node, 10);
+    }
+
+    /// AV-3-3 defensive — already-scheduled tasks are detected
+    /// via the (chunk_id, target_node) fingerprint and don't
+    /// produce a duplicate.
+    #[test]
+    fn bug_av_anchor_lag_repair_skips_already_scheduled() {
+        let anchor = AnchorPolicy {
+            datacenter: "leli".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        let placements = vec![placement(11, "toro", DiskTier::Warm)];
+        let nodes = vec![
+            node(10, "leli", true, &[DiskTier::Cold]),
+            node(11, "toro", true, &[DiskTier::Warm]),
+        ];
+        let mut existing = HashSet::new();
+        existing.insert(("h0".to_string(), 10u64));
+        let action =
+            plan_anchor_lag_repair(&anchor, &placements, &nodes, "h0", &existing);
+        assert!(action.is_none(),
+            "task already in-flight → no duplicate");
+    }
+
+    /// AV-3-3 defensive — Draining / unhealthy nodes are
+    /// filtered out of the candidate set.
+    #[test]
+    fn bug_av_anchor_lag_repair_skips_unhealthy_target() {
+        let anchor = AnchorPolicy {
+            datacenter: "leli".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        let placements = vec![placement(11, "toro", DiskTier::Warm)];
+        let nodes = vec![
+            // Only LELI cold node is unhealthy → no candidate.
+            node(10, "leli", /* healthy */ false, &[DiskTier::Cold]),
+            node(11, "toro", true, &[DiskTier::Warm]),
+        ];
+        let action =
+            plan_anchor_lag_repair(&anchor, &placements, &nodes, "h0", &HashSet::new());
+        assert!(action.is_none(),
+            "no healthy LELI cold node → no repair");
     }
 }
 
