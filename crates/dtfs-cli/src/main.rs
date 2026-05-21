@@ -116,6 +116,14 @@ enum VolumesCmd {
         #[arg(long)]
         tier_policy: Option<String>,
     },
+    /// Bug AV — migrate a legacy volume to the mandatory/cache split
+    /// schema. Clones the volume's `replication` field into
+    /// `mandatory_replicas`; legacy field preserved. Idempotent.
+    /// Operators typically follow this with `set-cache` (AV-3-5).
+    MigratePolicy {
+        /// Volume id to migrate.
+        volume_id: String,
+    },
 }
 
 struct ApiClient {
@@ -180,6 +188,9 @@ async fn main() -> anyhow::Result<()> {
                 replication_factor,
                 tier_policy,
             } => cmd_volumes_create(&api, &args.format, &name, replication_factor, tier_policy.as_deref()).await?,
+            VolumesCmd::MigratePolicy { volume_id } => {
+                cmd_volumes_migrate_policy(&api, &args.format, &volume_id).await?
+            }
         },
         Commands::Files { limit } => cmd_files(&api, &args.format, limit).await?,
         Commands::Scrub {
@@ -352,6 +363,35 @@ async fn cmd_volumes_create(
             let status = resp["status"].as_str().unwrap_or("");
             let id = resp["volume_id"].as_str().unwrap_or(name);
             println!("Volume '{}' {}.", id, if status.is_empty() { "created" } else { status });
+        }
+    }
+    Ok(())
+}
+
+/// Bug AV (AV-1-10) — `dtfs-cli volumes migrate-policy <id>`.
+/// Calls the manager-side endpoint that clones the legacy
+/// `replication` field into `mandatory_replicas`. Idempotent.
+async fn cmd_volumes_migrate_policy(
+    api: &ApiClient,
+    format: &OutputFormat,
+    volume_id: &str,
+) -> anyhow::Result<()> {
+    let url = format!("/api/v1/volumes/{}/migrate-policy", volume_id);
+    let resp = api.post(&url, &serde_json::json!({})).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => {
+            let changed = resp["changed"].as_bool().unwrap_or(false);
+            let m = &resp["mandatory_replicas"];
+            println!(
+                "Volume '{}' migrate-policy: {} (mandatory hot={} warm={} cold={} tape={})",
+                volume_id,
+                if changed { "applied" } else { "no-op (already migrated)" },
+                m["hot"].as_u64().unwrap_or(0),
+                m["warm"].as_u64().unwrap_or(0),
+                m["cold"].as_u64().unwrap_or(0),
+                m["tape"].as_u64().unwrap_or(0),
+            );
         }
     }
     Ok(())

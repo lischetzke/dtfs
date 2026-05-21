@@ -20,7 +20,7 @@ use dtfs_raft::{ClientRequest, DtfsRaft, NodeInfo as RaftNodeInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::audit::AuditLog;
 use crate::join::JoinHandler;
@@ -120,6 +120,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // anchor and setting a cooldown that blocks immediate
         // re-promotion by the tiering engine.
         .route("/api/v1/files/flush_cache", post(flush_cache_endpoint))
+        // Bug AV — one-shot policy migration: clone legacy
+        // `replication` into `mandatory_replicas` for a volume.
+        .route("/api/v1/volumes/{id}/migrate-policy", post(migrate_volume_policy_endpoint))
         // Stats (aggregate cluster metrics for WebUI home page)
         .route("/api/v1/stats", get(get_stats))
         // HMAC join (phase 1: challenge, phase 2: Raft register)
@@ -871,6 +874,76 @@ async fn create_volume(
     info!("Volume created: {}", vol_id);
 
     Ok(Json(json!({ "volume_id": vol_id, "name": body.name, "status": "created" })))
+}
+
+// ---------------------------------------------------------------------------
+// Bug AV (AV-1-10) — POST /api/v1/volumes/{id}/migrate-policy
+// ---------------------------------------------------------------------------
+
+/// Bug AV — clone the legacy `replication` field into the new
+/// `mandatory_replicas` field for the named volume. Idempotent:
+/// running it twice (or against a volume that's already been
+/// hand-tuned to the new schema) is a no-op. Legacy `replication`
+/// is preserved as a rollback path.
+async fn migrate_volume_policy_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(volume_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    use axum::http::StatusCode;
+
+    // Resolve current config under one read lock.
+    let current = {
+        let sm = state.sm_data.read().await;
+        sm.volumes.get(&volume_id).cloned()
+    };
+    let Some(current) = current else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("volume not found: {volume_id}")})),
+        ));
+    };
+
+    let migrated = current.migrated_to_mandatory_schema();
+
+    // Detect a no-op so we can tell the operator whether anything
+    // changed (handy in scripts).
+    let changed = current != migrated;
+
+    if changed {
+        let req = ClientRequest::UpsertVolume { config: migrated.clone() };
+        if let Err(e) = state.raft.client_write(req).await {
+            warn!(volume = %volume_id, error = %e,
+                "migrate_volume_policy Raft write failed");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("raft write failed: {e}")})),
+            ));
+        }
+        state.audit_log.log(
+            "api",
+            "volume.migrate_policy",
+            &volume_id,
+            "success",
+        );
+    } else {
+        state.audit_log.log(
+            "api",
+            "volume.migrate_policy",
+            &volume_id,
+            "noop",
+        );
+    }
+
+    Ok(Json(json!({
+        "volume_id": volume_id,
+        "changed":   changed,
+        "mandatory_replicas": {
+            "hot":  migrated.mandatory_replicas.hot,
+            "warm": migrated.mandatory_replicas.warm,
+            "cold": migrated.mandatory_replicas.cold,
+            "tape": migrated.mandatory_replicas.tape,
+        },
+    })))
 }
 
 // ---------------------------------------------------------------------------

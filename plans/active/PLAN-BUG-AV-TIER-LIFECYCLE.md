@@ -476,10 +476,13 @@ manually for now (or by the existing additive-migrate UI button).
 * **Done when:** 4 tests + live curl against minicluster returns a
   sensible report (replicas_dropped > 0 on a populated cache).
 
-### ⬜ AV-1-10 — Boot-time policy migration helper
+### ✅ AV-1-10 — Boot-time policy migration helper
 
-* **Files:** `crates/dtfs-manager/src/main.rs` (one-shot helper),
-  `crates/dtfs-cli/src/main.rs` (`volume migrate-policy <vol>`).
+* **Files:** `crates/dtfs-common/src/types.rs`
+  (`VolumeConfig::migrated_to_mandatory_schema()`),
+  `crates/dtfs-manager/src/api.rs`
+  (`POST /api/v1/volumes/{id}/migrate-policy`),
+  `crates/dtfs-cli/src/main.rs` (`volumes migrate-policy <vol>`).
 * **Implementation:** CLI command reads current volume's
   `replication` (legacy), writes a new `mandatory_replicas` set to
   the same values, leaves `replication` untouched (read fallback
@@ -487,9 +490,17 @@ manually for now (or by the existing additive-migrate UI button).
   follow up with `dtfs-cli volume set-cache <vol> warm=1 per-dc=true`.
 * **Tests:** unit on the legacy→new helper:
   `bug_av_migrate_legacy_replication_clones_to_mandatory`,
-  `bug_av_migrate_idempotent_when_both_present`.
+  `bug_av_migrate_idempotent_when_both_present` — both green.
 * **Done when:** 2 tests green + minicluster's `default` volume
-  successfully migrated.
+  successfully migrated. **Live-verified on minicluster 2026-05-21**
+  (see Verification Log entry below).
+* **Deviation:** `/api/v1/volumes` JSON listing still only emits the
+  legacy `replication` block (no `mandatory_replicas` /
+  `cache_replicas` keys exposed). The state machine is correct (the
+  idempotent re-run returns `no-op (already migrated)`), but the
+  read-side projection needs broadening. Folded into AV-1-12 as part
+  of the REST API documentation pass; if the JSON shape change
+  becomes risky to bundle, split into a new AV-1-13 follow-up.
 
 ### ⬜ AV-1-11 — Audit + alert hooks
 
@@ -853,6 +864,52 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-1-10 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-common/src/types.rs` — new
+    `VolumeConfig::migrated_to_mandatory_schema()` returns a clone
+    where `mandatory_replicas` is populated from legacy
+    `replication` only when currently all-zero (idempotent).
+  - `crates/dtfs-manager/src/api.rs` — new
+    `migrate_volume_policy_endpoint` registered at
+    `POST /api/v1/volumes/{id}/migrate-policy`; emits 404 for
+    unknown volume, calls `client_write(UpsertVolume{...})` on
+    diff, audit-logs success/no-op, returns JSON
+    `{volume_id, changed, mandatory_replicas}`.
+  - `crates/dtfs-cli/src/main.rs` — new `VolumesCmd::MigratePolicy
+    { volume_id }` subcommand + `cmd_volumes_migrate_policy`
+    function; CLI prints `applied (mandatory ...)` or
+    `no-op (already migrated) (mandatory ...)`.
+* **Unit tests**: 2 new in dtfs-common
+  (`bug_av_migrate_legacy_replication_clones_to_mandatory`,
+  `bug_av_migrate_idempotent_when_both_present`) — both green.
+* **Workspace regression**: dtfs-common 37 → 39; all others
+  unchanged. `cargo test --workspace --release` all green.
+* **Build hiccup:** initial sync compiled-broken because
+  `migrate_volume_policy_endpoint` referenced `warn!` without
+  importing it; fixed by widening `use tracing::info;` to
+  `use tracing::{info, warn};` before re-sync.
+* **Live verification** on minicluster (manager binaries rolled at
+  2026-05-21 ~11:14 UTC):
+  - Test A — initial migration via leader:
+    `dtfs-cli --manager http://mini-mgr01:9402 volumes migrate-policy default`
+    → `Volume 'default' migrate-policy: applied (mandatory hot=0 warm=2 cold=1 tape=1)`. ✓
+  - Test B — idempotent re-run:
+    second invocation →
+    `no-op (already migrated) (mandatory hot=0 warm=2 cold=1 tape=1)`. ✓
+  - Test C — against follower (`mini-mgr03`): same no-op
+    response; raft write proxied/forwarded as expected. ✓
+  - Test D — 404 for nonexistent volume: returns
+    `HTTP 404 Not Found` and non-zero CLI exit code. ✓
+* **Deviations:** the `/api/v1/volumes` list endpoint still
+  serialises only the legacy `replication` block — the state
+  machine has the new `mandatory_replicas` populated (proven by
+  Test B's idempotent path), but the read projection in
+  `api.rs::list_volumes_handler` needs broadening. Wrapped into
+  AV-1-12 (REST API doc + projection); may split into AV-1-13 if
+  the JSON shape change is risky to bundle.
 
 ### AV-1-9 — 2026-05-21
 
