@@ -403,6 +403,39 @@ impl TaskScheduler {
                     // at 30s tick), give up and mark Failed so an operator
                     // gets paged via the audit log + alerting pipeline rather
                     // than the task lingering forever.
+                    //
+                    // Bug AE — before any retry, verify the chunk_id still
+                    // exists in some file's chunks list. After a data-node
+                    // disk wipe (or operator unlink + GC), the original
+                    // file is gone but the migration task lingers in
+                    // migration_state_json forever. resolve_healthy_source
+                    // returns None → "no healthy source replica" → 6
+                    // retries over 3 min → Failed. With 125+ such orphans
+                    // every 30s tick spams the logs AND hammers data nodes
+                    // with ReplicateChunk("Chunk not found") that's pure
+                    // load. Drop these immediately (no retries) and let
+                    // the prune step below garbage-collect them.
+                    if !self.chunk_exists_anywhere(&task.chunk_id).await {
+                        let reason = "chunk no longer exists (orphan task from \
+                                      pre-wipe or unlinked file)";
+                        warn!(
+                            task_id = %task.task_id,
+                            chunk = %task.chunk_id,
+                            "Bug AE: dropping orphan migration task — {}",
+                            reason
+                        );
+                        task.status = MigrationStatus::Failed;
+                        task.last_error = Some(reason.to_string());
+                        task.updated_at_ms = now_ms;
+                        self.audit.log(
+                            "scheduler",
+                            "migration.orphan_dropped",
+                            &format!("task={} chunk={}", task.task_id, task.chunk_id),
+                            reason,
+                        );
+                        continue;
+                    }
+
                     let target_addr = self.node_grpc_addr(task.target_node).await;
                     let resolved_source = self
                         .resolve_healthy_source(&task.chunk_id, task.target_node)
@@ -450,6 +483,33 @@ impl TaskScheduler {
                         task.attempts = task.attempts.saturating_add(1);
                         task.last_error = Some(reason.clone());
                         task.updated_at_ms = now_ms;
+
+                        // Bug AF — when the source data node specifically
+                        // reports "Chunk not found", the bytes are gone
+                        // from THAT node (disk wipe, fs reset, manual rm,
+                        // etc.). resolve_healthy_source still returns the
+                        // same node next tick because the file metadata
+                        // hasn't been updated to remove it as a replica.
+                        // Without a fast-fail, the scheduler retries this
+                        // identical RPC every 30s × MAX_MIGRATION_ATTEMPTS
+                        // (= 3 min), and each RPC opens a streaming gRPC
+                        // to the source — which hammers the data node and
+                        // contends with foreground put_chunk traffic from
+                        // FUSE clients. On Plexmedia 4h soak v2 (verified
+                        // 2026-05-19 07:30 UTC) this contention pushed the
+                        // 60s put_chunk RPC timeout, causing every write
+                        // to fail and FUSE to "unlink ghost entry" all
+                        // newly-created files.
+                        //
+                        // Promote "Chunk not found" to instant-Failed.
+                        // The 30-min Failed retention window keeps the
+                        // task visible for operator inspection; the prune
+                        // step clears it once an audit-driven action is
+                        // taken (manual unlink, scrub, or restore from
+                        // off-cluster backup).
+                        if rpc_error_indicates_chunk_missing(&reason) {
+                            task.attempts = MAX_MIGRATION_ATTEMPTS;
+                        }
                         if task.attempts >= MAX_MIGRATION_ATTEMPTS {
                             warn!(
                                 task_id = %task.task_id,
@@ -656,10 +716,26 @@ impl TaskScheduler {
         }
 
         // Prune completed tasks older than 5 minutes.
-        let cutoff = now_ms.saturating_sub(5 * 60 * 1000);
-        state.tasks.retain(|_, t| {
-            !(t.status == MigrationStatus::Done && t.updated_at_ms < cutoff)
-        });
+        //
+        // Bug AE — also prune Failed tasks older than 30 minutes. Before
+        // this fix, Failed tasks lived in migration_state_json forever
+        // (only Done was retained==false). After a disk wipe or other
+        // mass-orphan event, 100+ Failed tasks accumulated and bloated
+        // the Raft snapshot + cluttered the /api/v1/migrations UI. 30
+        // min is long enough for an operator alerted on
+        // `migration.failed` to inspect the task before it disappears
+        // and short enough to clear historical garbage within one snapshot
+        // interval (1 h default).
+        let before = state.tasks.len();
+        state.tasks.retain(|_, t| should_retain_task(t.status, t.updated_at_ms, now_ms));
+        let pruned = before.saturating_sub(state.tasks.len());
+        if pruned > 0 {
+            info!(
+                pruned,
+                remaining = state.tasks.len(),
+                "Bug AE: pruned terminal migration tasks"
+            );
+        }
     }
 
     /// Load the migration state from the dedicated Raft field.
@@ -783,6 +859,18 @@ impl TaskScheduler {
             }
         }
         None
+    }
+
+    /// Bug AE — quick existence check for a chunk hash across every file in
+    /// the metadata tree. Returns true iff at least one `FileMetadata`
+    /// references the chunk. Used to detect orphan migration tasks: when
+    /// the underlying file has been unlinked or the source disk wiped, the
+    /// task's chunk_id is no longer reachable from any live file and we
+    /// should stop retrying it. Delegates to the pure helper
+    /// `chunk_in_any_file` so the predicate logic is unit-testable.
+    async fn chunk_exists_anywhere(&self, chunk_hash: &str) -> bool {
+        let sm = self.state_data.read().await;
+        chunk_in_any_file(chunk_hash, &sm.files)
     }
 
     /// Persist the migration state via the dedicated `UpdateMigrationState`
@@ -939,12 +1027,23 @@ impl TaskScheduler {
                 })
             })
             .collect();
-        // Most recently updated first.
+        // Bug AM — most recently updated first, then by task_id ascending
+        // for stable ordering on refresh. The previous sort used only
+        // updated_at_ms which is shared by every task touched in the same
+        // 30s scheduler tick; HashMap iteration order then randomised the
+        // display each refresh and made the page unreadable when a burst
+        // of migrations all completed simultaneously.
         out.sort_by(|a, b| {
-            b.get("updated_at_ms")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0)
-                .cmp(&a.get("updated_at_ms").and_then(|v| v.as_u64()).unwrap_or(0))
+            let bts = b.get("updated_at_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            let ats = a.get("updated_at_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            bts.cmp(&ats).then_with(|| {
+                // task_id is "repl-<N>" — natural ordering on the trailing
+                // integer would be nicer but lexicographic is consistent
+                // and stable, which is all we need.
+                let aid = a.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+                let bid = b.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+                aid.cmp(bid)
+            })
         });
         out
     }
@@ -1153,6 +1252,75 @@ pub(crate) fn normalize_endpoint(stored_addr: &str) -> String {
     } else {
         format!("http://{}", stored_addr)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bug AE — orphan migration task helpers (pure logic, unit-tested below)
+// ---------------------------------------------------------------------------
+
+/// How long a `Failed` task lingers in `migration_state_json` before the
+/// scheduler garbage-collects it. 30 minutes is long enough for an operator
+/// alerted on `migration.failed` to inspect the task in the UI before it
+/// disappears, and short enough that a mass-orphan event (e.g. a data-node
+/// disk wipe) doesn't bloat the Raft snapshot for hours.
+const FAILED_TASK_RETENTION_MS: u64 = 30 * 60 * 1000;
+
+/// How long a `Done` task lingers — kept short because the new replica is
+/// already visible in the file's chunk list and the historical task entry
+/// is operationally uninteresting beyond a few minutes.
+const DONE_TASK_RETENTION_MS: u64 = 5 * 60 * 1000;
+
+/// Pure predicate for the scheduler's task-prune retain block. Returns true
+/// when the task should stay in the migration state, false when it should
+/// be dropped.
+///
+/// Terminal tasks (`Done`, `Failed`) are dropped once their age exceeds the
+/// per-status retention window. Non-terminal tasks (`Pending`, `Copying`,
+/// `Verifying`, `Completing`) are always kept — the state machine in
+/// `advance_tasks` is responsible for transitioning them onward, including
+/// the Bug AE orphan check that fast-forwards orphan tasks to `Failed`.
+#[inline]
+pub(crate) fn should_retain_task(
+    status: MigrationStatus,
+    updated_at_ms: u64,
+    now_ms: u64,
+) -> bool {
+    match status {
+        MigrationStatus::Done => {
+            now_ms.saturating_sub(updated_at_ms) < DONE_TASK_RETENTION_MS
+        }
+        MigrationStatus::Failed => {
+            now_ms.saturating_sub(updated_at_ms) < FAILED_TASK_RETENTION_MS
+        }
+        _ => true,
+    }
+}
+
+/// Bug AF — pure predicate: does this RPC error string indicate the source
+/// data node specifically said "Chunk not found"? When true, the scheduler
+/// fast-fails the migration task (bypasses MAX_MIGRATION_ATTEMPTS) so we
+/// don't burn 6 × 30s of data-node load on a chunk that's gone.
+///
+/// Matches both shapes seen in the wild:
+///   - "ReplicateChunk error: ReplicateChunk returned error: Chunk not found: <hash>"
+///   - "Chunk not found"
+#[inline]
+pub(crate) fn rpc_error_indicates_chunk_missing(error_message: &str) -> bool {
+    error_message.contains("Chunk not found")
+}
+
+/// Pure helper for `chunk_exists_anywhere`. Returns true iff `chunk_hash`
+/// appears in any `FileMetadata.chunks` entry across the supplied `files`
+/// map. The async caller pulls the state-machine read lock; this function
+/// stays sync so it's trivially unit-testable without a tokio runtime.
+#[inline]
+pub(crate) fn chunk_in_any_file(
+    chunk_hash: &str,
+    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
+) -> bool {
+    files
+        .values()
+        .any(|f| f.chunks.iter().any(|c| c.chunk_hash == chunk_hash))
 }
 
 #[cfg(test)]
@@ -1513,5 +1681,206 @@ mod path_migration_tests {
         );
         assert_eq!(report.chunks_total, 2); // chunk_index 0 + 1, not 3 rows
         assert_eq!(plan.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod bug_ae_orphan_tests {
+    //! Bug AE — orphan migration tasks and Failed-task retention.
+    //!
+    //! Symptom (verified on Plexmedia 4h soak v1, 2026-05-19): 125 failed +
+    //! 32 stuck-Copying migration tasks all carrying `"Chunk not found"`
+    //! errors. The chunks referenced no longer existed in any
+    //! `FileMetadata.chunks` list — they were leftovers from a data-node
+    //! disk wipe but `migration_state_json` retained the tasks across the
+    //! wipe.
+    //!
+    //! Root cause: the prune step at the end of `advance_tasks` retained
+    //! `Failed` tasks forever (only `Done` was time-bounded), AND the
+    //! `Copying` branch had no fast-path for "chunk no longer exists" —
+    //! it ran the full 6-retry × 30s cycle, hammering data nodes with
+    //! ReplicateChunk RPCs that all returned `Chunk not found`.
+    //!
+    //! Fix verified by:
+    //! - `bug_ae_*` tests below for the pure helpers,
+    //! - live-cluster observation that the 125 Failed tasks drain within
+    //!   30 minutes of the new manager binary rolling out,
+    //! - 4h soak v2 expected to maintain `failed_tasks < 5` throughout.
+
+    use super::*;
+    use dtfs_raft::state_machine::FileMetadata;
+    use dtfs_raft::ChunkLocationEntry;
+    use std::collections::BTreeMap;
+
+    fn file_with_chunks(path: &str, chunk_hashes: &[&str]) -> FileMetadata {
+        FileMetadata {
+            path: path.to_string(),
+            volume_id: "default".to_string(),
+            chunk_size: 128 * 1024 * 1024,
+            chunks: chunk_hashes
+                .iter()
+                .enumerate()
+                .map(|(i, h)| ChunkLocationEntry {
+                    chunk_index: i as u64,
+                    chunk_hash: (*h).to_string(),
+                    node_id: "10".to_string(),
+                    disk_id: 0,
+                    size_bytes: 128 * 1024 * 1024,
+                })
+                .collect(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+        }
+    }
+
+    /// Pending / Copying / Verifying / Completing must NEVER be pruned —
+    /// the state machine in `advance_tasks` owns their progression.
+    #[test]
+    fn non_terminal_tasks_are_always_retained() {
+        let now = 10 * 60 * 60 * 1000; // 10h
+        for status in [
+            MigrationStatus::Pending,
+            MigrationStatus::Copying,
+            MigrationStatus::Verifying,
+            MigrationStatus::Completing,
+        ] {
+            // Even one full hour old — keep it.
+            assert!(
+                should_retain_task(status, now - 60 * 60 * 1000, now),
+                "non-terminal task ({status:?}) must be retained regardless of age",
+            );
+        }
+    }
+
+    /// `Done` task within the 5-minute window stays; older one is pruned.
+    #[test]
+    fn done_tasks_pruned_after_five_minutes() {
+        let now = 60 * 60 * 1000; // 1h
+        let just_completed = now - 30 * 1000; // 30s ago
+        let stale = now - 6 * 60 * 1000;       // 6min ago — past cutoff
+
+        assert!(should_retain_task(MigrationStatus::Done, just_completed, now));
+        assert!(!should_retain_task(MigrationStatus::Done, stale, now));
+    }
+
+    /// `Failed` task within the 30-minute window stays so operators can
+    /// inspect; older one is pruned to bound state size.
+    #[test]
+    fn failed_tasks_pruned_after_thirty_minutes() {
+        let now = 60 * 60 * 1000; // 1h
+        let recent_failure = now - 5 * 60 * 1000;  // 5min ago — keep
+        let stale_failure  = now - 31 * 60 * 1000; // 31min ago — prune
+
+        assert!(should_retain_task(MigrationStatus::Failed, recent_failure, now));
+        assert!(!should_retain_task(MigrationStatus::Failed, stale_failure, now));
+    }
+
+    /// Sanity: `updated_at_ms > now_ms` (clock drift / startup race) must
+    /// NOT cause underflow; the task should be retained.
+    #[test]
+    fn updated_after_now_does_not_underflow() {
+        let now = 1000;
+        let future = 5000;
+        // saturating_sub returns 0, < retention windows, so retained.
+        assert!(should_retain_task(MigrationStatus::Done, future, now));
+        assert!(should_retain_task(MigrationStatus::Failed, future, now));
+    }
+
+    /// chunk_in_any_file returns true when a chunk hash matches any file.
+    #[test]
+    fn chunk_in_any_file_finds_existing_chunk() {
+        let mut files: BTreeMap<String, FileMetadata> = BTreeMap::new();
+        files.insert(
+            "/movies/a.mkv".to_string(),
+            file_with_chunks("/movies/a.mkv", &["hash_a0", "hash_a1"]),
+        );
+        files.insert(
+            "/movies/b.mkv".to_string(),
+            file_with_chunks("/movies/b.mkv", &["hash_b0"]),
+        );
+
+        assert!(chunk_in_any_file("hash_a0", &files));
+        assert!(chunk_in_any_file("hash_a1", &files));
+        assert!(chunk_in_any_file("hash_b0", &files));
+    }
+
+    /// Returns false when no file references the chunk — this is the
+    /// orphan condition that fast-paths the task to Failed.
+    #[test]
+    fn chunk_in_any_file_returns_false_for_orphan() {
+        let mut files: BTreeMap<String, FileMetadata> = BTreeMap::new();
+        files.insert(
+            "/movies/a.mkv".to_string(),
+            file_with_chunks("/movies/a.mkv", &["hash_a0"]),
+        );
+
+        assert!(!chunk_in_any_file("hash_orphan", &files));
+        assert!(!chunk_in_any_file("", &files));
+    }
+
+    /// Empty file map — every chunk lookup is orphan. Common at
+    /// fresh-cluster boot before any file is created.
+    #[test]
+    fn chunk_in_any_file_handles_empty_map() {
+        let files: BTreeMap<String, FileMetadata> = BTreeMap::new();
+        assert!(!chunk_in_any_file("any_hash", &files));
+    }
+
+    /// File present but with no chunks (e.g. truncated to zero, or symlink
+    /// placeholder). Chunk lookup must return false, not panic.
+    #[test]
+    fn chunk_in_any_file_skips_chunkless_files() {
+        let mut files: BTreeMap<String, FileMetadata> = BTreeMap::new();
+        files.insert(
+            "/empty.bin".to_string(),
+            file_with_chunks("/empty.bin", &[]),
+        );
+        assert!(!chunk_in_any_file("anything", &files));
+    }
+
+    /// Bug AF — the exact error string produced when a source data node
+    /// reports "Chunk not found" must be classified as fast-fail. This is
+    /// the live shape observed on Plexmedia 4h soak v2 at 07:30 UTC.
+    #[test]
+    fn bug_af_chunk_not_found_classified_for_fast_fail() {
+        let live = "ReplicateChunk error: ReplicateChunk returned error: \
+                    Chunk not found: 6bea15d90aa05f7f445d5136c49618c7aa720ca13bf0f902d8518732ca2a4e46";
+        assert!(rpc_error_indicates_chunk_missing(live));
+
+        // Bare form (defensive — if the inner wrapping ever changes).
+        assert!(rpc_error_indicates_chunk_missing("Chunk not found"));
+    }
+
+    /// Generic transport / network / target-resolution failures must NOT
+    /// trigger the fast-fail path — those are transient and should be
+    /// retried up to MAX_MIGRATION_ATTEMPTS as normal.
+    #[test]
+    fn bug_af_transient_errors_not_classified_for_fast_fail() {
+        assert!(!rpc_error_indicates_chunk_missing("connect to source 10.0.0.1: timeout"));
+        assert!(!rpc_error_indicates_chunk_missing("ReplicateChunk RPC: tonic transport error"));
+        assert!(!rpc_error_indicates_chunk_missing("target node 999 unresolvable"));
+        assert!(!rpc_error_indicates_chunk_missing("no healthy source replica"));
+        assert!(!rpc_error_indicates_chunk_missing(""));
+    }
+
+    /// Regression-shape test against the live-cluster scenario: a Failed
+    /// task that fired 31 min ago AND references a chunk that's no longer
+    /// in any file is pruned (because Failed + stale).  A separate
+    /// Copying-state task with the same orphan chunk is retained by the
+    /// retain block (the advance_tasks branch is responsible for fast-
+    /// pathing it to Failed on the next tick).
+    #[test]
+    fn live_scenario_125_failed_orphans_drain() {
+        let now = 60 * 60 * 1000; // 1h
+        let stale_failed = now - 31 * 60 * 1000;
+        let stuck_copying = now - 31 * 60 * 1000;
+
+        // Failed + stale → pruned.
+        assert!(!should_retain_task(MigrationStatus::Failed, stale_failed, now));
+        // Copying + stale → retained; advance_tasks owns the fast-path.
+        assert!(should_retain_task(MigrationStatus::Copying, stuck_copying, now));
     }
 }
