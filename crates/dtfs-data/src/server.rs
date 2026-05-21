@@ -257,6 +257,13 @@ impl DataService for DataServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        // Bug AL — record the write so the manager-side I/O Throughput
+        // card can compute bytes/sec. Pre-fix `record_write` was
+        // declared in metrics.rs but never called from server.rs, so
+        // every data node's `total_bytes_written` stayed at 0 forever
+        // and the dashboard "↑ Write" showed 0 B/s under any load.
+        self.metrics.record_write(total_size);
+
         // Bug I — do NOT insert the just-written chunk into the ARC
         // cache. Caching every write defeats the streaming-to-disk
         // memory win (it puts the whole chunk back in RAM). Cold-read
@@ -311,6 +318,11 @@ impl DataService for DataServiceImpl {
             self.cache.put(key, loaded.clone());
             loaded
         };
+
+        // Bug AL — record the read for the manager-side I/O Throughput
+        // rolling-rate. Cache hits are still real read traffic to the
+        // requesting FUSE client, so count them too.
+        self.metrics.record_read(data.len() as u64);
 
         // Stream pieces of 8 MB each through a 64-slot channel — gives
         // tonic enough room to keep the HTTP/2 send window full on a
