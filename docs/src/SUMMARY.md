@@ -32,6 +32,7 @@
 - [Disk Management](./operations/disk-management.md)
 - [Maintenance Mode](./operations/maintenance-mode.md)
 - [Monitoring](./operations/monitoring.md)
+- [Log Shipping (Filebeat → Elastic)](./operations/log-shipping.md)
 - [Alerting](./operations/alerting.md)
 - [Backup & Recovery](./operations/backup-recovery.md)
 - [Time Synchronisation](./operations/time-sync.md)
