@@ -274,7 +274,7 @@ operator can call (via curl or CLI) to flush cache tiers. Tiering
 engine improvements wait for Phase 2; cache replicas are only created
 manually for now (or by the existing additive-migrate UI button).
 
-### ⬜ AV-1-1 — `CacheReplication` + `AnchorPolicy` types
+### ✅ AV-1-1 — `CacheReplication` + `AnchorPolicy` types (2026-05-21)
 
 * **Files:** `crates/dtfs-common/src/types.rs`
 * **Implementation:** add `CacheTierConfig` and `CacheReplication`
@@ -854,7 +854,28 @@ tasks:
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
 
-_(empty)_
+### AV-1-1 — 2026-05-21
+
+* **Files touched:** `crates/dtfs-common/src/types.rs` (+261 lines —
+  3 new structs, 9 helper methods, 7 unit tests).
+* **Unit tests** (`cargo test -p dtfs-common --release bug_av`):
+  ```
+  running 7 tests
+  test bug_av_anchor_policy_legacy_string_compat ... ok
+  test bug_av_anchor_policy_struct_round_trip ... ok
+  test bug_av_cache_replication_full_serde_round_trip ... ok
+  test bug_av_cache_tier_disabled_when_not_mentioned ... ok
+  test bug_av_cache_tier_explicit_defaults_to_one_one ... ok
+  test bug_av_cache_tier_explicit_min_max_round_trip ... ok
+  test bug_av_cache_tier_rejects_max_less_than_min ... ok
+  test result: ok. 7 passed; 0 failed
+  ```
+* **Crate regression suite** (`cargo test -p dtfs-common --release`):
+  `31 passed; 0 failed` (24 pre-existing + 7 new).
+* **Workspace compile-check** (`cargo check --workspace --release`):
+  clean, no downstream breakage.
+* **Live verification:** N/A — types-only change; nothing to deploy.
+* **Deviations:** none.
 
 ---
 
