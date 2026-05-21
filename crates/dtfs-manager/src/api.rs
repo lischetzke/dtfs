@@ -38,6 +38,36 @@ pub struct AppState {
     /// Scheduler used to enqueue manual path-prefix tier/DC migrations
     /// triggered from the WebUI / CLI (`POST /api/v1/migrations`).
     pub scheduler: Arc<TaskScheduler>,
+    /// Bug AL — rolling-rate tracker for the dashboard's I/O Throughput
+    /// card. The data nodes report cumulative `total_bytes_read` /
+    /// `total_bytes_written` in every heartbeat; on each `/api/v1/stats`
+    /// call we delta the current cumulative against this in-process
+    /// snapshot to produce a true bytes/sec rate. Process-local (NOT
+    /// state-machine state) because rate is per-manager, not a cluster
+    /// invariant.
+    pub io_rate: Arc<parking_lot::RwLock<IoRateTracker>>,
+}
+
+/// Bug AL — per-node cumulative-byte snapshots, used to derive a rolling
+/// I/O rate at request time. `previous` holds the last-observed values
+/// keyed by node_id; `last_query_ms` is when we computed the previous
+/// rate (so successive /stats calls only count bytes seen since the
+/// last visit).
+#[derive(Debug, Default, Clone)]
+pub struct IoRateTracker {
+    pub previous: std::collections::HashMap<u64, IoSnapshot>,
+    /// Last computed rate (cached so very fast successive calls return
+    /// stable values rather than 0).
+    pub last_read_bps: u64,
+    pub last_write_bps: u64,
+    pub last_query_ms: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IoSnapshot {
+    pub total_bytes_read: u64,
+    pub total_bytes_written: u64,
+    pub observed_at_ms: u64,
 }
 
 /// Build the full API router (REST endpoints + WebUI).
@@ -113,6 +143,10 @@ pub async fn run_api_server(
         audit_log,
         join,
         scheduler,
+        // Bug AL — process-local rolling rate; starts empty so the very
+        // first /api/v1/stats hit returns (0, 0) then subsequent calls
+        // produce real bytes/sec deltas.
+        io_rate: Arc::new(parking_lot::RwLock::new(IoRateTracker::default())),
     });
 
     let app = build_router(state);
@@ -391,6 +425,17 @@ async fn join_complete_api(
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
+struct DiskResponse {
+    disk_id: u32,
+    uuid: String,
+    mount_path: String,
+    tier: String,
+    total_bytes: u64,
+    used_bytes: u64,
+    status: String,
+}
+
+#[derive(Serialize)]
 struct NodeResponse {
     node_id: String,
     hostname: String,
@@ -408,6 +453,12 @@ struct NodeResponse {
     /// approximate via the most-recent write_lease for any of their
     /// owner_id hostnames.
     last_seen_ms: u64,
+    /// Bug AR — per-disk detail so the Nodes page can render a row per
+    /// disk (tier, mount_path, individual utilisation). The list was
+    /// previously hidden behind `disk_count`, making it impossible for
+    /// the WebUI to show which disk in a multi-disk data node was
+    /// filling up. Empty for manager/client roles.
+    disks: Vec<DiskResponse>,
 }
 
 impl NodeResponse {
@@ -429,6 +480,19 @@ impl NodeResponse {
             health: format!("{:?}", info.health),
             role: format!("{:?}", info.role),
             last_seen_ms: info.last_seen_ms,
+            disks: info
+                .disks
+                .iter()
+                .map(|d| DiskResponse {
+                    disk_id: d.disk_id,
+                    uuid: d.uuid.clone(),
+                    mount_path: d.mount_path.clone(),
+                    tier: format!("{:?}", d.tier).to_ascii_lowercase(),
+                    total_bytes: d.total_bytes,
+                    used_bytes: d.used_bytes,
+                    status: format!("{:?}", d.status).to_ascii_lowercase(),
+                })
+                .collect(),
         }
     }
 }
@@ -490,6 +554,7 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             // assumed alive within the cluster heartbeat window. A
             // future fix wires per-manager last-seen via Raft membership.
             last_seen_ms: now_ms,
+            disks: Vec::new(),
         });
     }
 
@@ -538,6 +603,7 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             health: "Healthy".to_string(),
             role: "Client".to_string(),
             last_seen_ms: last_seen,
+            disks: Vec::new(),
         });
     }
 
@@ -809,27 +875,81 @@ async fn get_audit_log(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AuditQuery>,
 ) -> Json<Vec<Value>> {
-    let filter = crate::audit::AuditFilter {
-        limit: Some(query.limit.unwrap_or(50)),
-        action: query.action,
-        ..Default::default()
-    };
+    // Bug AH — when Raft audit fan-out is enabled, read from the REPLICATED
+    // state-machine audit_log so every manager returns the same view. When
+    // disabled (the safe default during rolling upgrades), fall back to the
+    // per-manager local ring as before. Both branches emit the same wire
+    // shape: `timestamp` in SECONDS-since-epoch (preserves WebUI Bug AG
+    // `*1000` fix and CLI's `from_timestamp(ts, 0)` consumer); `summary`
+    // and `origin_manager` are surfaced as new fields, empty when reading
+    // from the local ring (which has no notion of either).
+    let limit = query.limit.unwrap_or(50);
+    let action_filter = query.action.as_deref();
 
-    let entries = state.audit_log.query(&filter);
-    let result: Vec<Value> = entries
-        .into_iter()
-        .map(|e| {
-            json!({
-                "timestamp": e.timestamp,
-                "actor": e.actor,
-                "action": e.action,
-                "target": e.target,
-                "result": e.result,
+    if state.config.audit.replicate_via_raft {
+        let sm = state.sm_data.read().await;
+        // Newest-first: replicated log appends in Raft commit order (≈
+        // wall-clock). Reverse, filter, limit.
+        let entries: Vec<Value> = sm
+            .audit_log
+            .iter()
+            .rev()
+            .filter(|e| match action_filter {
+                Some(prefix) => {
+                    e.action.starts_with(prefix)
+                        // Legacy entries (pre-Bug-AH) only have
+                        // `summary`; match against that too.
+                        || e.summary.starts_with(prefix)
+                }
+                None => true,
             })
-        })
-        .collect();
-
-    Json(result)
+            .take(limit)
+            .map(|e| {
+                // Bug AI — `apply_request`'s own `audit()` helper produces
+                // entries with empty structured fields and a summary like
+                // "CreateFile: /foo (directory)". Without backfill, the
+                // WebUI Audit page renders these as four em-dashes
+                // because the table draws from actor/action/target/result
+                // and never surfaces the summary. Delegate to the pure
+                // helper so the parse is unit-tested.
+                let (actor, action, target, result) =
+                    backfill_audit_fields(&e.actor, &e.action, &e.target, &e.result, &e.summary);
+                json!({
+                    "timestamp": e.timestamp_ms / 1_000,
+                    "actor": actor,
+                    "action": action,
+                    "target": target,
+                    "result": result,
+                    "summary": e.summary,
+                    "origin_manager": e.origin_manager,
+                })
+            })
+            .collect();
+        Json(entries)
+    } else {
+        // Pre-Bug-AH behaviour — local per-manager view.
+        let filter = crate::audit::AuditFilter {
+            limit: Some(limit),
+            action: query.action,
+            ..Default::default()
+        };
+        let entries = state.audit_log.query(&filter);
+        let result: Vec<Value> = entries
+            .into_iter()
+            .map(|e| {
+                json!({
+                    "timestamp": e.timestamp,
+                    "actor": e.actor,
+                    "action": e.action,
+                    "target": e.target,
+                    "result": e.result,
+                    "summary": "",
+                    "origin_manager": "",
+                })
+            })
+            .collect();
+        Json(result)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -908,30 +1028,95 @@ async fn update_config(
 // Aggregate stats endpoint (consumed by WebUI home page)
 // ---------------------------------------------------------------------------
 
-/// Compute a "seconds since the cluster started serving I/O" window.
-/// Used as a denominator for the cumulative-bytes counters reported
-/// in /api/v1/stats.io_read_bytes_per_sec etc. We use the cluster
-/// uptime since the earliest-seen node's first heartbeat — a crude
-/// long-window average that's plenty for the WebUI's purposes.
-fn compute_io_window_secs(
+/// Bug AL — compute true rolling I/O rate by diffing cumulative counters
+/// against a process-local previous snapshot. Returns (read_bps,
+/// write_bps). The pre-fix code divided cumulative bytes by
+/// `now - min(last_seen_ms)` which was nonsensical (the staleness of
+/// the slowest-updated node, NOT a time window). With record_read /
+/// record_write now actually wired up in the data-node `put_chunk` /
+/// `get_chunk` handlers (also Bug AL), the cumulative counters
+/// finally grow under load.
+///
+/// Semantics:
+/// * First call after manager start (or after a restart) returns
+///   `(0, 0)` because there's no previous snapshot to diff against.
+/// * Subsequent calls return `(bytes_since_last_call / seconds_since_last_call)`,
+///   summed across all data nodes.
+/// * If a node disappears between calls (decommission, network split),
+///   its bytes are simply dropped from the next delta — the rate
+///   doesn't go negative.
+/// * If the manager's `/api/v1/stats` is hit very rapidly (e.g.
+///   prometheus + WebUI both scraping at ~5s), the cached
+///   `last_read_bps` / `last_write_bps` are returned for any call
+///   whose window is < 1s, so the rate is stable instead of jumping
+///   to a 100×-spiky number.
+fn compute_io_rate(
+    tracker: &mut IoRateTracker,
     nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
-) -> u64 {
+) -> (u64, u64) {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let mut earliest_ms = now_ms;
-    for n in nodes.values() {
-        // Approximate "first seen" as last_seen minus a default of
-        // 60s window. We don't track first_seen explicitly; using
-        // last_seen as both bounds gives 0 → guard with 1s.
-        if n.last_seen_ms > 0 && n.last_seen_ms < earliest_ms {
-            earliest_ms = n.last_seen_ms;
-        }
+    compute_io_rate_at(tracker, nodes, now_ms)
+}
+
+/// Bug AL — pure helper accepting an explicit `now_ms` so the rate logic
+/// is unit-testable without mocking `SystemTime::now()`. See
+/// `compute_io_rate` for the production wrapper.
+pub(crate) fn compute_io_rate_at(
+    tracker: &mut IoRateTracker,
+    nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+    now_ms: u64,
+) -> (u64, u64) {
+    let window_ms = now_ms.saturating_sub(tracker.last_query_ms);
+    // Sub-second back-to-back call: return the cached rate to avoid
+    // dividing by tiny numbers (spiky display).
+    if tracker.last_query_ms != 0 && window_ms < 1_000 {
+        return (tracker.last_read_bps, tracker.last_write_bps);
     }
-    let span_ms = now_ms.saturating_sub(earliest_ms);
-    (span_ms / 1000).max(1)
+
+    let mut delta_read: u64 = 0;
+    let mut delta_written: u64 = 0;
+    let mut new_snapshot: std::collections::HashMap<u64, IoSnapshot> =
+        std::collections::HashMap::with_capacity(nodes.len());
+
+    for (node_id, info) in nodes {
+        let snap = IoSnapshot {
+            total_bytes_read: info.total_bytes_read,
+            total_bytes_written: info.total_bytes_written,
+            observed_at_ms: now_ms,
+        };
+        if let Some(prev) = tracker.previous.get(node_id) {
+            // Cumulative counters only grow; if they appear to have
+            // gone backwards (process restart, host clock jump), the
+            // saturating_sub yields 0 and we just skip the delta.
+            delta_read = delta_read
+                .saturating_add(info.total_bytes_read.saturating_sub(prev.total_bytes_read));
+            delta_written = delta_written
+                .saturating_add(info.total_bytes_written.saturating_sub(prev.total_bytes_written));
+        }
+        new_snapshot.insert(*node_id, snap);
+    }
+
+    let read_bps;
+    let write_bps;
+    if tracker.last_query_ms == 0 {
+        // First call ever — no baseline, can't divide.
+        read_bps = 0;
+        write_bps = 0;
+    } else {
+        let window_secs = (window_ms / 1_000).max(1);
+        read_bps = delta_read / window_secs;
+        write_bps = delta_written / window_secs;
+    }
+
+    tracker.previous = new_snapshot;
+    tracker.last_query_ms = now_ms;
+    tracker.last_read_bps = read_bps;
+    tracker.last_write_bps = write_bps;
+    (read_bps, write_bps)
 }
 
 async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -955,15 +1140,20 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         .count();
     let disk_count: usize = sm.nodes.values().map(|n| n.disks.len()).sum();
 
-    // FUSE clients don't have a registration RPC yet (no client heartbeats);
-    // approximate active clients via the unique hostnames of currently-held
-    // write leases (owner_id format = "<hostname>:<pid>:<fh>"). A read-only
-    // client without an open writer won't appear, but for the soak the
-    // workload generators always have a writer open somewhere. Treat as a
-    // lower bound; sm.client_count remains for forward compatibility when
-    // an explicit client RPC lands.
-    let client_count = {
-        let mut hosts = std::collections::HashSet::new();
+    // Bug AQ — count unique FUSE clients via the SAME merge logic the
+    // /api/v1/nodes endpoint uses for the Nodes table: clients
+    // self-registered as `sm.nodes` entries with role=Client (Bug AA)
+    // PLUS any lease-derived host that isn't already represented.
+    // Pre-fix this counted only write-lease holders, so a read-only
+    // Plex playback client never appeared — Home showed "1 FUSE client"
+    // while the Nodes page showed 3.
+    let client_count: u64 = {
+        let mut hosts: std::collections::HashSet<String> = sm
+            .nodes
+            .values()
+            .filter(|n| n.role == NodeRole::Client)
+            .map(|n| n.hostname.clone())
+            .collect();
         for lease in sm.write_leases.values() {
             if let Some(host) = lease.owner_id.split(':').next() {
                 if !host.is_empty() {
@@ -1026,22 +1216,50 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
     })
     .collect();
 
-    // Net usable = raw_total / hot_replication_factor (conservative estimate).
-    let hot_rf = state.config.defaults.replication.hot.max(1) as u64;
-    let net_usable = raw_total / hot_rf;
-    let net_used = raw_used / hot_rf;
+    // Bug AJ — net usable / net used must divide each tier's raw figure by
+    // THAT tier's replication factor, then sum. The previous code divided
+    // total raw by `hot_replication_factor` only, which broke in two ways:
+    //
+    //   1. On clusters with no hot tier (Plexmedia: hot=0), `hot_rf.max(1)`
+    //      becomes 1 → no division → `net_used == raw_used`. Dashboard then
+    //      lied that every byte of raw storage was usable space.
+    //   2. Even with hot_rf > 0, using a SINGLE replication factor across
+    //      hot+warm+cold+tape misses the per-tier reality (Plexmedia:
+    //      warm=2, cold=1) — a warm-rf=2 disk pool reports 2× actual user
+    //      data; a cold-rf=1 disk pool reports 1×. Mixing them with one
+    //      divisor produces a fiction.
+    //
+    // Read the default per-tier replication from cluster config; fall back
+    // to 1 (best-case net == raw) for any tier that's effectively disabled
+    // (rf == 0). The result is a meaningful "how much user data this
+    // cluster can hold" number that survives tier mix changes.
+    let repl = &state.config.defaults.replication;
+    let net_for_tier = |tier: DiskTier, raw_in_tier: u64| -> u64 {
+        let rf = match tier {
+            DiskTier::Hot => repl.hot,
+            DiskTier::Warm => repl.warm,
+            DiskTier::Cold => repl.cold,
+            DiskTier::Tape => repl.tape,
+        };
+        let divisor = (rf as u64).max(1);
+        raw_in_tier / divisor
+    };
+    let net_usable: u64 = tier_total
+        .iter()
+        .map(|(t, raw)| net_for_tier(*t, *raw))
+        .sum();
+    let net_used: u64 = tier_used
+        .iter()
+        .map(|(t, raw)| net_for_tier(*t, *raw))
+        .sum();
 
-    // WebUI bug — was hardcoded to 0. Aggregate cumulative bytes across
-    // all data nodes and amortise over the heartbeat-observed window to
-    // get a crude bytes/sec figure. Better than nothing; a future fix
-    // tracks a true rolling-window rate per node.
-    let io_window_secs = compute_io_window_secs(&sm.nodes);
-    let total_bytes_read_all: u64 =
-        sm.nodes.values().map(|n| n.total_bytes_read).sum();
-    let total_bytes_written_all: u64 =
-        sm.nodes.values().map(|n| n.total_bytes_written).sum();
-    let io_read_bps = total_bytes_read_all / io_window_secs;
-    let io_write_bps = total_bytes_written_all / io_window_secs;
+    // Bug AL — true rolling rate (delta cumulative ÷ time-since-last-call)
+    // computed in a process-local tracker. See `compute_io_rate` for
+    // the full design rationale.
+    let (io_read_bps, io_write_bps) = {
+        let mut tracker = state.io_rate.write();
+        compute_io_rate(&mut tracker, &sm.nodes)
+    };
 
     // Overall cluster health.
     let total_nodes = sm.nodes.len();
@@ -1112,6 +1330,31 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
             })
         });
 
+    // Bug AK — logical user-visible bytes across all files. Sum per-file
+    // sizes deduped by chunk_index (replicas don't multiply user data).
+    // The dashboard contrasts this with `net_used_bytes` (data nodes'
+    // actual on-disk usage divided by tier RF). In a healthy cluster the
+    // two should match within rounding. When `logical_bytes >>
+    // net_used_bytes`, the cluster is carrying GHOST METADATA — files
+    // whose chunks were physically lost (data-node wipe, ENOSPC unlink
+    // cascade like Bug AD, etc.) but whose FileMetadata still references
+    // them. `phantom_bytes_estimate` exposes the delta so operators can
+    // see ghost accumulation without diffing two endpoints by hand.
+    let logical_bytes: u64 = sm
+        .files
+        .values()
+        .map(|f| {
+            let mut by_index: std::collections::BTreeMap<u64, u64> =
+                std::collections::BTreeMap::new();
+            for c in &f.chunks {
+                let e = by_index.entry(c.chunk_index).or_insert(0);
+                *e = (*e).max(c.size_bytes);
+            }
+            by_index.values().sum::<u64>()
+        })
+        .sum();
+    let phantom_bytes_estimate = logical_bytes.saturating_sub(net_used);
+
     Json(json!({
         "health":                health,
         "healthy_nodes":         healthy_nodes,
@@ -1128,6 +1371,9 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         "raw_used_bytes":        raw_used,
         "net_usable_bytes":      net_usable,
         "net_used_bytes":        net_used,
+        // Bug AK — see above.
+        "logical_bytes":         logical_bytes,
+        "phantom_bytes_estimate": phantom_bytes_estimate,
         "tier_breakdown":        tier_breakdown,
         "io_read_bytes_per_sec":  io_read_bps,
         "io_write_bytes_per_sec": io_write_bps,
@@ -1435,5 +1681,269 @@ async fn readyz_probe(State(state): State<Arc<AppState>>) -> (axum::http::Status
                 "not ready: fsm_initialised={fsm_initialised} any_healthy={any_healthy}\n"
             ),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bug AI — pure helper for audit-entry display backfill (unit-tested below)
+// ---------------------------------------------------------------------------
+
+/// Produce `(actor, action, target, result)` for the WebUI Audit table.
+///
+/// When the entry already carries structured fields (i.e. an `AppendAudit`
+/// fan-out from `audit.log()` — Bug AH), return them unchanged. When the
+/// entry is a legacy `apply_request`-generated one (only `summary` populated),
+/// parse `summary` in the form `"VariantName: details"` to synthesise
+/// `action` and `target`, set `actor="raft"`, and `result="success"` (the
+/// state-machine apply path only pushes audit on the success branch — failed
+/// applies return before reaching the `audit()` helper, so any entry
+/// reaching us is by construction a success).
+///
+/// Public-in-crate so the unit tests below can call it without going
+/// through the HTTP handler.
+pub(crate) fn backfill_audit_fields(
+    actor: &str,
+    action: &str,
+    target: &str,
+    result: &str,
+    summary: &str,
+) -> (String, String, String, String) {
+    if !action.is_empty() {
+        return (
+            actor.to_string(),
+            action.to_string(),
+            target.to_string(),
+            result.to_string(),
+        );
+    }
+    let (action_part, target_part) = match summary.split_once(": ") {
+        Some((a, t)) => (a.to_string(), t.to_string()),
+        None => (summary.to_string(), String::new()),
+    };
+    (
+        "raft".to_string(),
+        action_part,
+        target_part,
+        "success".to_string(),
+    )
+}
+
+#[cfg(test)]
+mod bug_ai_audit_backfill_tests {
+    use super::backfill_audit_fields;
+
+    /// AppendAudit fan-out entries (Bug AH) already have structured fields;
+    /// the backfill must pass them through unchanged.
+    #[test]
+    fn structured_entry_passes_through_unchanged() {
+        let (a, ac, t, r) = backfill_audit_fields(
+            "api",
+            "volume.create",
+            "bug-ah-fanout-test",
+            "success",
+            "volume.create: bug-ah-fanout-test [mgr02]",
+        );
+        assert_eq!(a, "api");
+        assert_eq!(ac, "volume.create");
+        assert_eq!(t, "bug-ah-fanout-test");
+        assert_eq!(r, "success");
+    }
+
+    /// Legacy state-machine-internal entries (CreateFile, DeleteFile, …)
+    /// have empty structured fields and a "Variant: target" summary. The
+    /// backfill splits on the first ": " and synthesises actor/result.
+    #[test]
+    fn legacy_create_file_entry_splits_summary() {
+        let (a, ac, t, r) = backfill_audit_fields(
+            "", "", "", "",
+            "CreateFile: /movies/Wicked.mkv",
+        );
+        assert_eq!(a, "raft");
+        assert_eq!(ac, "CreateFile");
+        assert_eq!(t, "/movies/Wicked.mkv");
+        assert_eq!(r, "success");
+    }
+
+    /// "CreateFile: /foo (directory)" — extra annotation in target stays
+    /// part of the target side.
+    #[test]
+    fn legacy_create_file_with_directory_marker() {
+        let (_, ac, t, _) = backfill_audit_fields(
+            "", "", "", "",
+            "CreateFile: /movies/Season 1 (directory)",
+        );
+        assert_eq!(ac, "CreateFile");
+        assert_eq!(t, "/movies/Season 1 (directory)");
+    }
+
+    /// A summary without ": " separator (defensive — shouldn't happen in
+    /// practice, but if a future audit() call passes a freeform string
+    /// we still produce something rather than panicking).
+    #[test]
+    fn legacy_summary_without_separator_uses_full_as_action() {
+        let (a, ac, t, r) = backfill_audit_fields("", "", "", "", "some-event");
+        assert_eq!(a, "raft");
+        assert_eq!(ac, "some-event");
+        assert!(t.is_empty());
+        assert_eq!(r, "success");
+    }
+
+    /// Target may itself contain ": " (e.g. "UpdateNodeStatus: 12345 = healthy").
+    /// `split_once(": ")` only splits on the FIRST occurrence — verifies
+    /// the colons within target are preserved.
+    #[test]
+    fn legacy_target_with_internal_colons_preserved() {
+        let (_, ac, t, _) = backfill_audit_fields(
+            "", "", "", "",
+            "UpdateNodeStatus: 12345: healthy",
+        );
+        assert_eq!(ac, "UpdateNodeStatus");
+        assert_eq!(t, "12345: healthy");
+    }
+}
+
+#[cfg(test)]
+mod bug_al_io_rate_tests {
+    //! Bug AL — process-local rolling I/O rate tracker.
+    //!
+    //! Pre-fix, the dashboard `/api/v1/stats.io_read_bytes_per_sec` was
+    //! computed as `Σ total_bytes_read / (now − min(last_seen_ms))` which
+    //! divided cumulative bytes by the staleness of the slowest-updated
+    //! node. With `record_read` / `record_write` finally wired up in the
+    //! data-node `put_chunk` / `get_chunk` handlers, the cumulative
+    //! counters grow under load; this tracker deltas them against a
+    //! per-call snapshot to produce a real bytes/sec rate.
+    //!
+    //! These tests use a small NodeInfo factory (only the fields the
+    //! rate calculation reads — total_bytes_read / total_bytes_written
+    //! / last_seen_ms) so we don't need the full data-node registration
+    //! protocol just to verify arithmetic.
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn node(read: u64, written: u64) -> dtfs_raft::NodeInfo {
+        dtfs_raft::NodeInfo {
+            hostname: String::new(),
+            grpc_addr: String::new(),
+            role: dtfs_common::types::NodeRole::Data,
+            disks: Vec::new(),
+            location: dtfs_common::topology::Location::new("", "", "", ""),
+            health: dtfs_common::types::HealthStatus::Healthy,
+            total_capacity: 0,
+            used_capacity: 0,
+            last_seen_ms: 0,
+            total_bytes_read: read,
+            total_bytes_written: written,
+        }
+    }
+
+    /// First call with an empty tracker must return (0, 0) — there's no
+    /// baseline to diff against yet. The tracker stores the snapshot so
+    /// the next call can compute a real delta.
+    #[test]
+    fn first_call_returns_zero_then_baselines() {
+        let mut tracker = IoRateTracker::default();
+        let mut nodes: BTreeMap<u64, dtfs_raft::NodeInfo> = BTreeMap::new();
+        nodes.insert(1, node(1_000_000, 500_000));
+
+        let (r, w) = compute_io_rate_at(&mut tracker, &nodes, 1_000_000);
+        assert_eq!(r, 0, "first call has no baseline");
+        assert_eq!(w, 0);
+        assert_eq!(tracker.previous.len(), 1, "baseline stored for next call");
+        assert_eq!(tracker.last_query_ms, 1_000_000);
+    }
+
+    /// Sustained-write scenario: 10 MB read + 5 MB written over a 10-second
+    /// window across two calls → (1 MB/s, 0.5 MB/s).
+    ///
+    /// Baselines must use non-zero `now_ms` because `last_query_ms == 0`
+    /// is the sentinel for "never queried" in the production path. In
+    /// real use, `SystemTime::now().as_millis()` is always ~1.8 × 10¹²
+    /// so this distinction is invisible; we honour it here with an
+    /// arbitrary epoch offset.
+    #[test]
+    fn delta_over_known_window_produces_expected_rate() {
+        let mut tracker = IoRateTracker::default();
+        let mut nodes: BTreeMap<u64, dtfs_raft::NodeInfo> = BTreeMap::new();
+        nodes.insert(1, node(0, 0));
+        // Baseline at t=1_000_000.
+        let _ = compute_io_rate_at(&mut tracker, &nodes, 1_000_000);
+        // Second sample 10 s later, after 10 MB read + 5 MB written.
+        nodes.insert(1, node(10_000_000, 5_000_000));
+        let (r, w) = compute_io_rate_at(&mut tracker, &nodes, 1_010_000);
+        assert_eq!(r, 1_000_000, "10 MB / 10 s = 1 MB/s");
+        assert_eq!(w, 500_000, "5 MB / 10 s = 500 KB/s");
+    }
+
+    /// Cumulative counters going backwards (e.g. a data-node restart
+    /// reset to 0, or an u64 wraparound) must NOT produce negative or
+    /// astronomical rates. `saturating_sub` zeroes the delta.
+    #[test]
+    fn cumulative_regression_does_not_underflow() {
+        let mut tracker = IoRateTracker::default();
+        tracker.previous.insert(1, IoSnapshot {
+            total_bytes_read: 1_000_000_000,
+            total_bytes_written: 500_000_000,
+            observed_at_ms: 1_000_000,
+        });
+        tracker.last_query_ms = 1_000_000;
+
+        let mut nodes: BTreeMap<u64, dtfs_raft::NodeInfo> = BTreeMap::new();
+        nodes.insert(1, node(0, 0)); // counters reset
+
+        // 10 s later than the baseline.
+        let (r, w) = compute_io_rate_at(&mut tracker, &nodes, 1_010_000);
+        assert_eq!(r, 0, "regression contributes 0 to the delta, not a huge spike");
+        assert_eq!(w, 0);
+    }
+
+    /// A node that disappears between calls is silently dropped from
+    /// the delta — the remaining nodes' bytes still produce a sensible
+    /// rate. Guards against a decommission causing the dashboard to
+    /// show 0 B/s for one cycle.
+    #[test]
+    fn disappearing_node_does_not_blow_up_rate() {
+        let mut tracker = IoRateTracker::default();
+        tracker.previous.insert(1, IoSnapshot {
+            total_bytes_read: 500_000,
+            total_bytes_written: 200_000,
+            observed_at_ms: 1_000_000,
+        });
+        tracker.previous.insert(2, IoSnapshot {
+            total_bytes_read: 1_000_000,
+            total_bytes_written: 400_000,
+            observed_at_ms: 1_000_000,
+        });
+        tracker.last_query_ms = 1_000_000;
+
+        // Only node 1 left; node 2 vanished. 5 s window.
+        let mut nodes: BTreeMap<u64, dtfs_raft::NodeInfo> = BTreeMap::new();
+        nodes.insert(1, node(1_500_000, 700_000));
+
+        let (r, w) = compute_io_rate_at(&mut tracker, &nodes, 1_005_000);
+        // Node 1's delta: +1 MB read, +500 KB written, over 5 s.
+        // (No contribution from node 2 since it's gone.)
+        assert_eq!(r, 200_000, "node 1 delta / 5 s");
+        assert_eq!(w, 100_000);
+        assert_eq!(tracker.previous.len(), 1, "previous baseline only carries surviving nodes");
+    }
+
+    /// Sub-second back-to-back calls return the cached rate to avoid
+    /// dividing by tiny numbers (which would produce 100×-spiky values).
+    /// Critical when WebUI + Prometheus both scrape /stats at ~5s.
+    #[test]
+    fn sub_second_calls_return_cached_rate() {
+        let mut tracker = IoRateTracker::default();
+        // Pretend we just measured a rate.
+        tracker.last_read_bps = 12_345;
+        tracker.last_write_bps = 6_789;
+        tracker.last_query_ms = 1_000_000;
+
+        let nodes: BTreeMap<u64, dtfs_raft::NodeInfo> = BTreeMap::new();
+        // 200 ms after the previous call — well under the 1 s window
+        // floor, so we hit the cache return path.
+        let (r, w) = compute_io_rate_at(&mut tracker, &nodes, 1_000_200);
+        assert_eq!(r, 12_345);
+        assert_eq!(w, 6_789);
     }
 }
