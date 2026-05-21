@@ -431,11 +431,13 @@ the AV-3-1/AV-3-2 FUSE binary rolled to a client VM with
 `first_write_tier = "nearest-warm"` configured. The blocker is
 mechanical (deploy a client config), not architectural.
 
-**Carryovers (open after Phase 3):**
+**Carryovers (open after Phase 3 — Bug AV closes here, no
+successor Phase is scheduled; each item below is a standalone
+follow-up):**
 
 * WebUI volume-edit form (AV-3-4 partial). Read-side is unblocked
   by AV-3-5's `GET /api/v1/volumes/{id}`; a display card is a
-  straightforward fetch+render. Inline-edit modal is a Phase 4
+  straightforward fetch+render. Inline-edit modal is a deferred
   polish item — CLI covers the operational need today.
 * `ENABLE_CACHE_REDUNDANCY_ESCALATION` flag stays `false` per the
   AV-2-4 spec. Flip + matching test extension when a real per-DC
@@ -443,7 +445,7 @@ mechanical (deploy a client config), not architectural.
 * `GET /api/v1/volumes` (list endpoint) still uses its
   aggregation-only projection. Per-volume reads via the new
   endpoint cover today's needs; widening the list shape is a
-  Phase 4 polish item if any client ever requires it.
+  deferred polish item if any client ever requires it.
 
 ## Combined summary — tests
 
