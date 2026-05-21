@@ -813,23 +813,28 @@ manually for now (or by the existing additive-migrate UI button).
 
 ## Phase 3 — Client first-write tier + UX (~2 d)
 
-### ⬜ AV-3-1 — `fuse.toml [client.write]` block
+### ✅ AV-3-1 — `fuse.toml [client.write]` block
 
-* **Files:** `crates/dtfs-common/src/config.rs::FuseConfig`,
+* **Files:** `crates/dtfs-common/src/config.rs` +
   `tests/proxmox/ansible/templates/fuse.toml.j2`.
-* **Implementation:**
-  ```rust
-  pub struct FuseWriteConfig {
-      #[serde(default = "default_first_write_tier")]
-      pub first_write_tier: String, // "cold" | "nearest-warm"
-  }
-  fn default_first_write_tier() -> String { "cold".into() }
-  ```
-* **Tests:** `bug_av_fuse_write_config_default`,
-  `bug_av_fuse_write_config_nearest_warm_parsed`,
-  `bug_av_fuse_write_config_invalid_value_falls_back_to_cold`.
-* **Done when:** 3 tests + a minicluster client with
-  `first_write_tier="nearest-warm"` boots cleanly.
+* **Implementation:** new `FuseWriteConfig { first_write_tier:
+  String }` with default `"cold"`; `FirstWriteTier` enum with
+  `Cold`/`NearestWarm` variants; pure helper
+  `FuseWriteConfig::effective_first_write_tier()` returns the
+  enum, falling back to `Cold` for any unrecognised value. The
+  field-level `#[serde(default)]` + impl `Default` means an
+  omitted `[write]` block in legacy `fuse.toml` parses cleanly.
+  Ansible template extended with a templated `dtfs_first_write_
+  tier` variable defaulting to `"cold"`.
+* **Tests (3 green):**
+  - `bug_av_fuse_write_config_default`
+  - `bug_av_fuse_write_config_nearest_warm_parsed`
+  - `bug_av_fuse_write_config_invalid_value_falls_back_to_cold`
+* **Done when:** 3 tests green + workspace builds + the
+  template renders without error in Ansible. ✓ — minicluster
+  bring-up of a `nearest-warm` client deferred to AV-3-2's
+  live verification (the proto + placement engine changes are
+  what actually exercise the value end-to-end).
 
 ### ⬜ AV-3-2 — `preferred_tier` hint on `allocate_chunks`
 
@@ -965,6 +970,40 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-3-1 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-common/src/config.rs` — new
+    `FuseWriteConfig { first_write_tier: String }`, `Default`
+    impl, `FirstWriteTier` enum (Cold / NearestWarm),
+    `effective_first_write_tier()` helper; `FuseConfig.write:
+    FuseWriteConfig` field with `#[serde(default)]`.
+  - `tests/proxmox/ansible/templates/fuse.toml.j2` — new
+    `[write] first_write_tier = "{{ dtfs_first_write_tier |
+    default('cold') }}"` block at the bottom of the template
+    with an explanatory comment.
+* **Unit tests** (`cargo test -p dtfs-common bug_av_fuse_write`):
+  3 green:
+  - `bug_av_fuse_write_config_default` — omitted block →
+    `Cold`.
+  - `bug_av_fuse_write_config_nearest_warm_parsed` — explicit
+    string → `NearestWarm`.
+  - `bug_av_fuse_write_config_invalid_value_falls_back_to_cold`
+    — unknown string preserves raw value (for diagnostics) but
+    `effective_first_write_tier()` returns `Cold`.
+* **Workspace regression**: dtfs-common 39 → 42; all other
+  crates unchanged. `cargo test --workspace --release` all
+  green.
+* **Live verification:** deferred to AV-3-2 — the config-side
+  test confirms the value flows from `fuse.toml` to a
+  `FirstWriteTier`, but the end-to-end "warm placement happens
+  on a `nearest-warm` client" demo requires the proto +
+  placement engine changes in AV-3-2.
+* **Deviations:** none. The plan called for the field to be
+  `String`; left as `String` for forward-compat (a future
+  client added a new tier name won't fail to parse on older
+  managers / configs).
 
 ### AV-2-6 — 2026-05-21
 

@@ -50,3 +50,13 @@ prune_interval_secs = 3600
 mode = "localreadonly"
 quorum_loss_timeout_secs = 30
 show_warning = true
+
+# Bug AV (AV-3-1) — write-path preference. "cold" (default) waits
+# for the mandatory anchor copy before ACKing the write — safer
+# but slower in DCs with slow uplinks to the anchor DC.
+# "nearest-warm" places on the nearest warm-tier node and lets the
+# manager schedule the anchor copy asynchronously (AV-3-3
+# auto-anchor-migration). Unknown values fall back to "cold" so
+# rolling upgrades stay safe.
+[write]
+first_write_tier = "{{ dtfs_first_write_tier | default('cold') }}"
