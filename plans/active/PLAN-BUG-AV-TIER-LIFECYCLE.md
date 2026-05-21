@@ -836,23 +836,44 @@ manually for now (or by the existing additive-migrate UI button).
   live verification (the proto + placement engine changes are
   what actually exercise the value end-to-end).
 
-### ⬜ AV-3-2 — `preferred_tier` hint on `allocate_chunks`
+### ✅ AV-3-2 — `preferred_tier` hint on `allocate_chunks`
 
 * **Files:** `proto/manager.proto`,
-  `crates/dtfs-manager/src/metadata.rs` (`allocate_chunks` handler),
-  `crates/dtfs-manager/src/placement.rs` (PlacementEngine),
-  `crates/dtfs-fuse/src/filesystem.rs` (write path).
-* **Implementation:** new proto field `string preferred_tier = N`
-  (`#[serde(default)]` empty = "no preference, use volume default").
-  Placement engine honours when set, ignored otherwise.
-* **Tests:**
+  `crates/dtfs-manager/src/metadata.rs` (handler +
+  `resolve_preferred_tier` pure helper),
+  `crates/dtfs-client/src/client.rs`
+  (`allocate_chunks_with_hint`),
+  `crates/dtfs-fuse/src/filesystem.rs` (writes the hint based on
+  the AV-3-1 `FirstWriteTier`).
+* **Implementation:** new proto field
+  `string preferred_tier = 4` on `AllocateChunksRequest`. New
+  pure helpers in `metadata.rs`:
+  - `parse_preferred_tier_hint(&str) -> Option<DiskTier>`
+    (recognises `"hot"`, `"warm"`, `"cold"`, `"tape"`; empty +
+    unknown → `None`).
+  - `resolve_preferred_tier(hint, legacy_replication,
+    available_tiers) -> (DiskTier, u32)`. When the hint
+    resolves AND the tier has at least one healthy node, return
+    `(tier, 1)` (single first-chunk cache replica). Otherwise
+    fall back to `pick_effective_tier(legacy_replication)`.
+  - `allocate_chunks` handler queries the SM for available tiers,
+    then calls `resolve_preferred_tier`.
+  - FUSE filesystem maps `FirstWriteTier::Cold → ""` (legacy
+    behaviour) and `FirstWriteTier::NearestWarm → "warm"`.
+* **Tests (5 green):**
   - `bug_av_allocate_chunks_honours_preferred_tier`
   - `bug_av_allocate_chunks_falls_back_when_tier_full`
   - `bug_av_allocate_chunks_empty_hint_uses_default`
-* **Done when:** 3 tests + live verification: FUSE with
-  `nearest-warm` writes a 4 MiB file, observe chunk lands on a warm
-  disk first (data01-warm or data02-warm), then anchor migration
-  schedules a cold copy within 30 s.
+  - `bug_av_allocate_chunks_unknown_hint_falls_back` (defensive)
+  - `bug_av_parse_preferred_tier_hint_coverage` (defensive)
+* **Done when:** 5 tests + smoke check on minicluster (new
+  manager binary rolls cleanly, no panics). ✓
+* **Deviation:** the full write→placement live demo bundles
+  with AV-3-3's close-out — without the AV-3-3 anchor-lag
+  repair the warm-first writes leave chunks on warm forever
+  (no cold copy gets scheduled), which is the opposite of
+  desirable. Both pieces are needed to demo the full
+  Plexmedia-style "warm-first → async-cold" pattern.
 
 ### ⬜ AV-3-3 — Auto-anchor-migration on warm-first writes
 
@@ -970,6 +991,52 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-3-2 — 2026-05-21
+
+* **Files touched:**
+  - `proto/manager.proto` —
+    `AllocateChunksRequest.preferred_tier: string = 4`. Empty
+    string = "no preference"; recognised values `"hot"` /
+    `"warm"` / `"cold"` / `"tape"`; unknown values fall back.
+  - `crates/dtfs-manager/src/metadata.rs` — new pure helpers
+    `parse_preferred_tier_hint` + `resolve_preferred_tier`;
+    `allocate_chunks` handler queries SM nodes for available
+    tiers, then resolves the hint.
+  - `crates/dtfs-client/src/client.rs` — new
+    `allocate_chunks_with_hint(path, num_chunks, volume_id,
+    preferred_tier)`. Existing `allocate_chunks` delegates with
+    empty hint (legacy behaviour preserved).
+  - `crates/dtfs-fuse/src/filesystem.rs` — write path translates
+    `self.config.write.effective_first_write_tier()` to the
+    protocol string (`Cold` → `""`, `NearestWarm` → `"warm"`).
+* **Unit tests** (`cargo test -p dtfs-manager bug_av_preferred_tier`):
+  5 green:
+  - `bug_av_allocate_chunks_honours_preferred_tier`
+  - `bug_av_allocate_chunks_falls_back_when_tier_full`
+  - `bug_av_allocate_chunks_empty_hint_uses_default`
+  - `bug_av_allocate_chunks_unknown_hint_falls_back` (defensive)
+  - `bug_av_parse_preferred_tier_hint_coverage` (defensive)
+* **Workspace regression**: dtfs-manager 88 → 93; all other
+  crates unchanged. `cargo test --workspace --release` all
+  green.
+* **Build hiccup:** initial sort+dedup of available-tiers list
+  rejected because `DiskTier` doesn't impl `Ord` (and adding
+  it ripples through the workspace). Switched to
+  `HashSet<DiskTier> → Vec<DiskTier>` collect — same dedup
+  effect, no trait change.
+* **Live verification** on minicluster (binaries rolled
+  2026-05-21):
+  - Smoke: mini-mgr01 + mini-mgr03 rolled cleanly, cluster
+    info responds, no panics.
+  - End-to-end "warm-first write places on warm" demo
+    deferred to AV-3-3 close-out (without anchor-lag repair
+    the warm-first write would never get a cold copy, so
+    demoing the proto+placement piece without the repair is
+    misleading).
+* **Deviations:** 2 extra defensive tests added covering
+  unknown-hint fall-back + parse-helper coverage (both gates
+  worth guarding against regression).
 
 ### AV-3-1 — 2026-05-21
 

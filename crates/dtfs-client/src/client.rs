@@ -249,6 +249,12 @@ impl DtfsClient {
     }
 
     /// Allocate chunk placements for writing to a file.
+    ///
+    /// Bug AV (AV-3-2) — when `preferred_tier` is non-empty, the
+    /// manager honours the tier hint for first-chunk placement if
+    /// a healthy node with that tier exists in the cluster.
+    /// Recognised values: `"cold"`, `"warm"`, `"hot"`, `"tape"`.
+    /// Empty string = use the volume default (legacy behaviour).
     #[instrument(skip(self))]
     pub async fn allocate_chunks(
         &self,
@@ -256,10 +262,26 @@ impl DtfsClient {
         num_chunks: u32,
         volume_id: &str,
     ) -> Result<AllocateChunksResponse> {
+        self.allocate_chunks_with_hint(path, num_chunks, volume_id, "")
+            .await
+    }
+
+    /// Bug AV (AV-3-2) — like [`allocate_chunks`] but with an
+    /// explicit `preferred_tier` hint. Callers that don't care
+    /// about tier preference should use [`allocate_chunks`].
+    #[instrument(skip(self))]
+    pub async fn allocate_chunks_with_hint(
+        &self,
+        path: &str,
+        num_chunks: u32,
+        volume_id: &str,
+        preferred_tier: &str,
+    ) -> Result<AllocateChunksResponse> {
         let request = AllocateChunksRequest {
             path: path.to_string(),
             num_chunks,
             volume_id: volume_id.to_string(),
+            preferred_tier: preferred_tier.to_string(),
         };
         let response = self
             .call_manager("allocate_chunks", |mut c| {

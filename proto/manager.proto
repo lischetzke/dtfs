@@ -309,6 +309,15 @@ message AllocateChunksRequest {
   string path = 1;
   uint32 num_chunks = 2;
   string volume_id = 3;
+  // Bug AV (AV-3-2) — FUSE client write-path preference. Optional;
+  // empty string means "use the volume default" (the legacy
+  // behaviour). Recognised values: "cold", "warm", "hot", "tape".
+  // The manager's placement engine honours the hint when a healthy
+  // node with the requested tier exists in the client's DC;
+  // otherwise it falls back to the volume default. Unknown values
+  // are also treated as "no preference" so a rolling FUSE upgrade
+  // that adds a new tier name doesn't break older managers.
+  string preferred_tier = 4;
 }
 
 message ChunkPlacement {
