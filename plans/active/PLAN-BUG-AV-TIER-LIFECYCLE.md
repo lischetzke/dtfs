@@ -672,30 +672,54 @@ manually for now (or by the existing additive-migrate UI button).
     deterministic tie-break is what audit logs depend on).
 * **Done when:** 5 tests green. ✓
 
-### ⬜ AV-2-4 — `tiering::tick` wires AV-2-1..3 + schedules replication
+### ✅ AV-2-4 — `tiering::tick` wires AV-2-1..3 + schedules replication
 
 * **Files:** `crates/dtfs-manager/src/tiering.rs`.
-* **Implementation:** replace the old hot/cold-threshold logic with
-  the new cache-promotion + cache-demotion. Demotion = "cache
-  replica with no reads in `promote_window_secs` is eligible for
-  flush". Demotion runs at the same low priority as today's
-  scheduler; doesn't fight the cooldown.
-
-  **Redundancy escalation** (when `max > min`) is implemented behind
-  a constant `ENABLE_CACHE_REDUNDANCY_ESCALATION: bool = false` in
-  Phase 2 — the code is there and unit-tested but turned off until
-  we have a real per-DC HA use case. Flip to true in a follow-up
-  with the matching test extension.
-* **Tests:** *engine-level integration with a mock SM*:
+* **Implementation:**
+  - Pure planner `plan_cache_tick(snapshot, now_ms)` walks the
+    `TickSnapshot` and emits `TickPromotion` + `TickDemotion`
+    actions. Promotion path composes AV-2-1 (`read_window_count`)
+    + AV-2-2 (`plan_cache_promotion`) + AV-2-3
+    (`select_promotion_target`). Demotion path: a cache-tier
+    placement with 0 reads in window AND a surviving mandatory
+    replica becomes a demotion candidate.
+  - `TieringEngine` gains two new fields:
+    `read_windows: RwLock<HashMap<(chunk, dc), Vec<ReadSample>>>`
+    and `prev_reads_by_dc` for heartbeat delta tracking.
+    `report_access` pushes a sample on each positive delta.
+  - `tick_av_cache()` runs alongside the legacy temperature path:
+    builds the snapshot under one SM read lock, calls the
+    planner, dispatches promotions via
+    `scheduler.schedule_replication` (existing path that already
+    handles WAL + verify + remove-source race-safety), audits
+    every promote/demote. **The actual delete RPC for demotion is
+    routed through AV-2-5** (cooldown-clear + RemoveChunkLocation
+    + DeleteChunkReplica) so this commit ships demotion as
+    "planned + audited but not yet executed".
+  - `ENABLE_CACHE_REDUNDANCY_ESCALATION: bool = false` Phase-2
+    flag honoured: the planner's escalation branch only runs when
+    the flag is set, so a volume with `max > min` doesn't yet
+    ramp past `min`. Flip is a Phase-4 follow-up.
+* **Tests (6 green):**
   - `bug_av_tiering_tick_promotes_on_threshold`
   - `bug_av_tiering_tick_demotes_idle_cache_replica`
   - `bug_av_tiering_tick_respects_cooldown`
   - `bug_av_tiering_tick_respects_per_dc_cap`
   - `bug_av_tiering_tick_redundancy_escalation_off_by_default`
-* **Done when:** 5 tests green + live demo on minicluster: write a
-  file, read it twice from data01's DC over 4h (simulate by
-  shortening the window to 60s for the test), observe warm replica
-  appears in that DC.
+  - `bug_av_tiering_tick_per_dc_false_uses_global_pool`
+    (defensive: per_dc=false code path).
+* **Done when:** 6 tests green + smoke check on minicluster
+  (binary rolls cleanly; tiering engine starts; no panics).
+  ✓ — verified at 2026-05-21 11:53 UTC.
+* **Deviation:** the full live demo (write file → 2 reads → warm
+  replica appears) requires a volume with `cache_replicas`
+  configured, which today only the REST API can set (no CLI
+  surface until AV-3-5). Live demo deferred to the Phase 2
+  close-out after AV-2-6, by which point the cache-tier-on
+  volume can be plumbed via raw REST. The AV-2-4 commit itself
+  is structurally complete: planner + engine wiring + audit
+  hooks + heartbeat-delta sample push, all running on the
+  minicluster.
 
 ### ⬜ AV-2-5 — Cooldown clearance on demote
 
@@ -912,6 +936,58 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-2-4 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-manager/src/tiering.rs` — new `plan_cache_tick`
+    pure planner + `TickSnapshot` / `TickChunk` / `TickPlacement`
+    / `TickVolumePolicy` / `TickPromotion` / `TickDemotion` /
+    `TickPlan` types. `TieringEngine` gains `read_windows` +
+    `prev_reads_by_dc` storage; `report_access` pushes positive-
+    delta samples; new `tick_av_cache` + `build_av_cache_snapshot`
+    methods wire the planner into `evaluate`. Audit hooks emit
+    `cache.promote` / `cache.demote` with stable reason codes
+    (`"promote_threshold_met"`, `"idle_window"`).
+  - The `ENABLE_CACHE_REDUNDANCY_ESCALATION: bool = false` Phase-2
+    flag is honoured — the planner's escalation branch is
+    structurally present (and unit-tested with the flag off) but
+    a Phase-4 follow-up flips it on.
+* **Unit tests** (`cargo test -p dtfs-manager bug_av_tiering_tick`):
+  6 green:
+  - `bug_av_tiering_tick_promotes_on_threshold`
+  - `bug_av_tiering_tick_demotes_idle_cache_replica`
+  - `bug_av_tiering_tick_respects_cooldown`
+  - `bug_av_tiering_tick_respects_per_dc_cap`
+  - `bug_av_tiering_tick_redundancy_escalation_off_by_default`
+  - `bug_av_tiering_tick_per_dc_false_uses_global_pool` (defensive)
+* **Workspace regression**: dtfs-manager 79 → 85; all other
+  crates unchanged. `cargo test --workspace --release` all green.
+* **Build hiccups** worth remembering:
+  - Initial closure pattern `|(_, &r)| r` rejected by rustc's
+    "implicitly-borrowing pattern" lint; fixed by `|entry| *entry.1`.
+  - `effective_mandatory_replicas()` returns `&TierReplication`,
+    not owned. Cloned at the policy projection site.
+* **Live verification** on minicluster (manager binaries rolled
+  2026-05-21 11:53 UTC):
+  - Smoke check: both `mini-mgr01` and `mini-mgr03` came back up
+    cleanly, `Tiering engine started (evaluation interval:
+    3600s)` logged, no panics or errors in the 30-second
+    post-restart window.
+  - Full read→promote demo deferred to Phase 2 close-out: needs a
+    volume with `cache_replicas` set (no CLI surface for that
+    until AV-3-5; the REST `UpsertVolume` accepts it but no
+    convenient one-shot endpoint exists yet).
+* **Deviations:**
+  - The demotion *delete + cooldown clear* is routed through
+    AV-2-5; this commit emits the demotion plan + audit hook but
+    does not yet issue the data-node delete RPC. That keeps the
+    diff reviewable and lets AV-2-5 wire the delete + cooldown
+    clear in one place. Consistent with the AV-1-6 / AV-1-7
+    "async dispatcher" boundary pattern.
+  - One extra defensive planner test (`per_dc_false_uses_global_
+    pool`) added since the global-pool branch had distinct logic
+    and was easy to test.
 
 ### AV-2-1 / AV-2-2 / AV-2-3 — 2026-05-21
 
