@@ -699,7 +699,11 @@ manually for now (or by the existing additive-migrate UI button).
   - `ENABLE_CACHE_REDUNDANCY_ESCALATION: bool = false` Phase-2
     flag honoured: the planner's escalation branch only runs when
     the flag is set, so a volume with `max > min` doesn't yet
-    ramp past `min`. Flip is a Phase-4 follow-up.
+    ramp past `min`. Flipping the flag is a follow-up that
+    requires a per-DC HA workload to validate against; no
+    successor Phase is currently scheduled — the deferral lives
+    in this plan's § 5 deviations until a follow-up ticket is
+    cut.
 * **Tests (6 green):**
   - `bug_av_tiering_tick_promotes_on_threshold`
   - `bug_av_tiering_tick_demotes_idle_cache_replica`
@@ -994,8 +998,8 @@ manually for now (or by the existing additive-migrate UI button).
   unit-test load. **Closes AV-1-10 carryover** (REST
   projection of the new fields). **Closes AV-3-4 carryover**
   partially (the WebUI can now `fetch` per-volume policy via
-  the new endpoint; the inline-edit form remains a Phase-4
-  polish item).
+  the new endpoint; the inline-edit form is deferred as a
+  separate follow-up — see § 5 deviations).
 
 ### ✅ AV-3-6 — Documentation: client + WebUI + CLI
 
@@ -1168,7 +1172,8 @@ tasks:
   - **AV-3-4** — partially closed: the WebUI can now
     `fetch` per-volume policy via the new endpoint, so a
     follow-up display card is straightforward. The
-    inline-edit form remains a Phase 4 polish item.
+    inline-edit form is a separate deferred polish item;
+    no successor Phase is currently scheduled.
 
 ### AV-3-4 — 2026-05-21
 
@@ -1401,8 +1406,10 @@ tasks:
     (`"promote_threshold_met"`, `"idle_window"`).
   - The `ENABLE_CACHE_REDUNDANCY_ESCALATION: bool = false` Phase-2
     flag is honoured — the planner's escalation branch is
-    structurally present (and unit-tested with the flag off) but
-    a Phase-4 follow-up flips it on.
+    structurally present (and unit-tested with the flag off);
+    flipping it is a deferred follow-up that needs a per-DC HA
+    workload to validate against. No successor Phase is
+    scheduled — recorded in § 5 deviations.
 * **Unit tests** (`cargo test -p dtfs-manager bug_av_tiering_tick`):
   6 green:
   - `bug_av_tiering_tick_promotes_on_threshold`
@@ -1936,9 +1943,11 @@ coordinated WebUI/CLI bump; per-volume reads through the new
 endpoint cover the operator's need.
 
 A residual sub-task — "broaden the list-endpoint JSON to match
-the per-volume shape" — is a Phase 4 polish item if any client
+the per-volume shape" — is a deferred polish item if any client
 ever needs it; today the CLI (`dtfs-cli volumes show <id>`)
 and WebUI (planned card) both prefer the per-volume endpoint.
+No successor Phase is currently scheduled for the Bug AV
+plan.
 
 _(end AV-1-10 deviation — resolved)_
 
@@ -1959,7 +1968,10 @@ longer on the critical path.
 
 **Residual deferral:** WebUI volume detail card (read-only,
 ~30 min of HTML/JS) + inline-edit modal (~2 h). Both are
-Phase 4 polish items; the CLI covers the operational need.
+deferred polish items; the CLI covers the operational
+need today. No successor Phase is scheduled — track as
+standalone follow-ups if/when the WebUI becomes the primary
+volume-policy editor.
 
 _(end AV-3-4 deviation — partially resolved)_
 
@@ -2241,7 +2253,9 @@ required_tier = "cold"
 Note: the redundancy-escalation pass is gated by
 `ENABLE_CACHE_REDUNDANCY_ESCALATION = false` in Phase 2 binaries.
 Setting `max = 2` is correct future-proofing; the engine will
-honour it once that flag flips (Phase 4 follow-up).
+honour it once that flag flips. Flipping is a separate deferred
+follow-up — no successor Phase is scheduled today (see § 5
+deviations).
 
 ---
 

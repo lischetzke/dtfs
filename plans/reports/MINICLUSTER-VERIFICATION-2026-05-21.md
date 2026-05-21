@@ -263,12 +263,17 @@ tests (per the AV-1-6 / AV-1-7 convention).
 
 ### Carryovers from Bug AV after Phase 3
 
+The Bug AV plan ships with Phases 1-3 only — no successor Phase
+is currently scheduled. Each carryover below is a standalone
+follow-up tracked in the plan's § 5 deviations:
+
 * WebUI volume-edit form (AV-3-4 partial). Read-side is unblocked
   by AV-3-5's `GET /api/v1/volumes/{id}`; a display card is a
-  straightforward fetch+render. Inline-edit modal is Phase 4
-  polish.
+  straightforward fetch+render. Inline-edit modal is a deferred
+  polish item — CLI covers the operational need.
 * `ENABLE_CACHE_REDUNDANCY_ESCALATION` flag stays `false` per the
-  AV-2-4 spec. Flip is Phase 4 follow-up.
+  AV-2-4 spec. Flipping it is a deferred follow-up that needs a
+  per-DC HA workload to validate against.
 * End-to-end write-→-promote demo deferred until the
   AV-3-1/AV-3-2 FUSE binary is deployed to a client VM in the
   minicluster (next session).

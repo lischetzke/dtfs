@@ -42,7 +42,8 @@ every tick (default 5 min, configurable via
    `min(min, max) - current_in_dc` new replicas. Always 0 once
    `min` is reached (the redundancy-escalation pass that ramps
    toward `max` is `ENABLE_CACHE_REDUNDANCY_ESCALATION = false`
-   in Phase 2; Phase 4 follow-up flips it).
+   in Phase 2; flipping it is a deferred follow-up gated on a
+   real per-DC HA workload to validate against).
 5. **Target selection** — pick a healthy non-draining node in the
    requesting DC that has a disk of the target tier and doesn't
    already hold this chunk. Tie-break by highest free capacity,
