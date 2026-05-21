@@ -273,6 +273,19 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .badge-tape {{ background: #a855f722; color: var(--tape); }}
         .badge-manager {{ background: #6366f122; color: #818cf8; }}
         .badge-data    {{ background: #22c55e22; color: var(--success); }}
+        /* Bug AN — clients previously had no badge style, so the role
+           column on Nodes rendered an unstyled "client" text without
+           the pill that data/manager rows have. */
+        .badge-client  {{ background: #06b6d422; color: #22d3ee; }}
+        .badge-unknown {{ background: #6b728022; color: var(--text-muted); }}
+        /* Bug AS — right-click context menu for the Data Explorer. */
+        .ctxmenu {{ position: absolute; z-index: 1000; min-width: 180px;
+                    background: var(--surface); border: 1px solid var(--border);
+                    border-radius: .375rem; box-shadow: 0 4px 12px #0008;
+                    padding: .25rem 0; font-size: .82rem; }}
+        .ctxmenu-item {{ padding: .35rem .75rem; cursor: pointer; color: var(--text); }}
+        .ctxmenu-item:hover {{ background: var(--surface2); }}
+        .explorer-row:hover {{ background: var(--surface2); }}
 
         .placeholder {{
             text-align: center; color: var(--text-muted);
@@ -290,10 +303,17 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .topo-region-label {{ font-size: .9rem; font-weight: 700; margin-bottom: .75rem; }}
         .topo-dc {{ background: var(--surface2); border: 1px solid var(--border); border-radius: .5rem; padding: .875rem 1rem; margin-bottom: .75rem; }}
         .topo-dc-label {{ font-size: .85rem; font-weight: 600; margin-bottom: .5rem; color: var(--primary); }}
-        .topo-rack {{ margin: .5rem 0; }}
-        .topo-rack-label {{ font-size: .78rem; color: var(--text-muted); margin-bottom: .4rem; text-transform: uppercase; letter-spacing: .04em; }}
-        .topo-nodes {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: .75rem; }}
-        .topo-node {{ background: var(--surface); border: 1px solid var(--border); border-radius: .5rem; padding: .75rem 1rem; font-size: .83rem; }}
+        /* Bug AO — racks lay out HORIZONTALLY inside a DC (left-to-right);
+           hosts inside a rack stack VERTICALLY (top-to-bottom). Previously
+           racks stacked vertically and hosts wrapped in a grid, which
+           collapsed the rack-vs-host hierarchy for any DC with more
+           than one rack. flex-wrap so very wide DCs still fit small
+           screens; min-width on each rack so columns stay readable. */
+        .topo-racks {{ display: flex; flex-direction: row; flex-wrap: wrap; gap: .75rem; align-items: flex-start; }}
+        .topo-rack {{ display: flex; flex-direction: column; flex: 0 0 auto; min-width: 220px; max-width: 280px; background: var(--surface); border: 1px solid var(--border); border-radius: .5rem; padding: .75rem .85rem; }}
+        .topo-rack-label {{ font-size: .78rem; color: var(--text-muted); margin-bottom: .5rem; text-transform: uppercase; letter-spacing: .04em; }}
+        .topo-nodes {{ display: flex; flex-direction: column; gap: .5rem; }}
+        .topo-node {{ background: var(--surface2); border: 1px solid var(--border); border-radius: .4rem; padding: .6rem .75rem; font-size: .83rem; }}
 
         /* ── Node cards ── */
         .node-card {{ background: var(--surface); border: 1px solid var(--border); border-radius: .625rem; margin-bottom: 1rem; overflow: hidden; }}
@@ -500,6 +520,21 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         return null; // keep default class
     }}
 
+    // Bug AT — set the innerHTML of an element while preserving the
+    // window's scroll position. Replacing innerHTML on an in-view
+    // element resets scrollTop to 0 when the new content is shorter
+    // than the scroll offset, which looks to the user like the page
+    // "jumped back". All periodic refreshes that swap a large element
+    // (migrations list, audit log, nodes detail, topology) should
+    // wrap their innerHTML write in this helper.
+    function setHtmlPreserveScroll(el, html) {{
+        if (!el) return;
+        const sx = window.scrollX;
+        const sy = window.scrollY;
+        el.innerHTML = html;
+        window.scrollTo(sx, sy);
+    }}
+
     function fmtDuration(secs) {{
         if (secs < 60) return secs.toFixed(1) + 's';
         if (secs < 3600) return Math.round(secs / 60) + 'm';
@@ -577,6 +612,22 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         const netBar = document.getElementById('net-bar');
         netBar.style.width = netPct + '%';
         if (barColor(netPct)) netBar.style.background = barColor(netPct);
+
+        // ── Bug AK — logical claimed bytes vs phantom (metadata without on-disk data).
+        const logical = stats.logical_bytes || 0;
+        const phantom = stats.phantom_bytes_estimate || 0;
+        document.getElementById('logical-bytes').textContent = fmtBytes(logical);
+        const phantomEl = document.getElementById('phantom-bytes');
+        phantomEl.textContent = fmtBytes(phantom);
+        // Color the phantom number based on severity relative to logical:
+        // 0 → muted; <10% logical → warning; ≥10% logical → danger.
+        if (phantom === 0) {{
+            phantomEl.style.color = 'var(--text-muted)';
+        }} else if (logical > 0 && phantom / logical < 0.1) {{
+            phantomEl.style.color = 'var(--warning)';
+        }} else {{
+            phantomEl.style.color = 'var(--danger)';
+        }}
 
         // ── I/O
         const rd = fmtBytesUnit(stats.io_read_bytes_per_sec  || 0);
@@ -684,43 +735,85 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             </div>`;
     }}
 
+    // Bug AN — stable sort + per-role grouping for the Home page "Data &
+    // Manager Nodes" table. Order:
+    //   1. role (manager → data → client → other), so each kind clusters
+    //   2. datacenter/location (groups within DC together)
+    //   3. hostname (deterministic within DC)
+    // Without this the table follows whatever order /api/v1/nodes
+    // returned (BTreeMap by u64 node_id — neither human-readable nor
+    // stable across renames). On every refresh, rows visually swap.
+    const NODE_ROLE_ORDER = {{ manager: 0, data: 1, client: 2 }};
+    function sortNodesForHome(nodes) {{
+        return [...nodes].sort((a, b) => {{
+            const ra = NODE_ROLE_ORDER[(a.role||'').toLowerCase()] ?? 9;
+            const rb = NODE_ROLE_ORDER[(b.role||'').toLowerCase()] ?? 9;
+            if (ra !== rb) return ra - rb;
+            const la = (a.location||'').toLowerCase();
+            const lb = (b.location||'').toLowerCase();
+            if (la !== lb) return la.localeCompare(lb);
+            return (a.hostname||'').localeCompare(b.hostname||'');
+        }});
+    }}
+
     function renderNodes(nodes) {{
         const tbody = document.getElementById('nodes-table');
         if (!nodes || nodes.length === 0) {{
-            tbody.innerHTML = '<tr><td colspan="8" class="placeholder">No nodes registered yet.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="9" class="placeholder">No nodes registered yet.</td></tr>';
             document.getElementById('nodes-summary').textContent = '';
             return;
         }}
 
-        const healthy = nodes.filter(n => (n.health||'').toLowerCase() === 'healthy').length;
+        const sorted = sortNodesForHome(nodes);
+        const healthy = sorted.filter(n => (n.health||'').toLowerCase() === 'healthy').length;
         document.getElementById('nodes-summary').textContent =
-            healthy + '/' + nodes.length + ' healthy';
+            healthy + '/' + sorted.length + ' healthy';
 
-        tbody.innerHTML = nodes.map(n => {{
+        // Bug AN — split the "Used" column into separate cells for bar
+        // and value. Previously they shared one flex row inside a single
+        // <td>, so variable text widths shifted the bars left/right and
+        // they didn't line up vertically down the column.
+        tbody.innerHTML = sorted.map(n => {{
             const h  = (n.health || 'unknown').toLowerCase();
             const hc = 'badge badge-' + h;
             const role = (n.role || 'data').toLowerCase();
             const rc = 'badge badge-' + role;
+            const isManager = role === 'manager';
+            const isClient  = role === 'client';
             const usedPct = n.total_capacity
                 ? Math.round(n.used_capacity / n.total_capacity * 100) : 0;
             const barFill = usedPct > 90 ? 'var(--danger)'
                           : usedPct > 75 ? 'var(--warning)' : 'var(--primary)';
+            // Bug AP — manager nodes have no disks of their own; the
+            // utilization bar would always read 0% which is misleading.
+            // Render an em-dash instead so it's visually obvious that
+            // the metric doesn't apply.
+            const usedBarCell = (isManager || isClient)
+                ? `<td style="text-align:center;color:var(--text-muted)">—</td>`
+                : `<td style="width:120px">
+                       <div style="height:6px;background:var(--border);border-radius:3px;width:100%">
+                           <div style="height:100%;border-radius:3px;background:${{barFill}};width:${{usedPct}}%"></div>
+                       </div>
+                   </td>`;
+            const usedValCell = (isManager || isClient)
+                ? `<td style="font-size:.78rem;white-space:nowrap;color:var(--text-muted)">—</td>`
+                : `<td style="font-size:.78rem;white-space:nowrap">${{fmtBytes(n.used_capacity||0)}} <span style="color:var(--text-muted)">(${{usedPct}}%)</span></td>`;
+            const capCell = (isManager || isClient)
+                ? `<td style="color:var(--text-muted)">—</td>`
+                : `<td>${{fmtBytes(n.total_capacity||0)}}</td>`;
+            const diskCell = (isManager || isClient)
+                ? `<td style="color:var(--text-muted)">—</td>`
+                : `<td>${{n.disk_count||0}}</td>`;
             return `<tr>
                 <td style="font-size:.78rem;color:var(--text-muted);font-family:monospace">
                     ${{(n.node_id||'').slice(0,8)}}…</td>
                 <td><b>${{n.hostname||'—'}}</b></td>
                 <td><span class="${{rc}}">${{role}}</span></td>
                 <td style="font-size:.78rem;color:var(--text-muted)">${{n.location||'—'}}</td>
-                <td>${{n.disk_count||0}}</td>
-                <td>${{fmtBytes(n.total_capacity||0)}}</td>
-                <td>
-                    <div style="display:flex;align-items:center;gap:.5rem">
-                        <div style="flex:1;height:4px;background:var(--border);border-radius:2px;min-width:48px">
-                            <div style="height:100%;border-radius:2px;background:${{barFill}};width:${{usedPct}}%"></div>
-                        </div>
-                        <span style="font-size:.78rem;white-space:nowrap">${{fmtBytes(n.used_capacity||0)}}</span>
-                    </div>
-                </td>
+                ${{diskCell}}
+                ${{capCell}}
+                ${{usedBarCell}}
+                ${{usedValCell}}
                 <td><span class="${{hc}}">${{n.health||'unknown'}}</span></td>
             </tr>`;
         }}).join('');
@@ -810,10 +903,14 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 </div>
                 <div class="metric-row" style="margin-top:.25rem"><span class="metric-label">Free</span><span class="metric-value" id="raw-free" style="color:var(--success)">—</span></div>
             </div>
+            <!-- Bug AN — drop the "After replication factor (÷ hot RF)"
+                 subheader (the math is per-tier now anyway, and the title
+                 already conveys the intent). Card body structurally mirrors
+                 Raw Capacity so the rows line up at the same vertical
+                 baseline across both cards. -->
             <div class="metric-card">
                 <h3>Net Usable Capacity</h3>
-                <div style="font-size:.72rem;color:var(--text-muted);margin-bottom:.75rem">After replication factor (÷ hot RF)</div>
-                <div class="metric-row"><span class="metric-label">Usable</span><span class="metric-value" id="net-usable">—</span></div>
+                <div class="metric-row"><span class="metric-label">Total</span><span class="metric-value" id="net-usable">—</span></div>
                 <div class="metric-row"><span class="metric-label">Used</span><span class="metric-value" id="net-used">—</span></div>
                 <div class="progress-wrap">
                     <div style="display:flex;justify-content:space-between;margin-bottom:.3rem">
@@ -823,6 +920,9 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     <div class="progress-bar"><div class="progress-fill success" id="net-bar" style="width:0%"></div></div>
                 </div>
                 <div class="metric-row" style="margin-top:.25rem"><span class="metric-label">Free</span><span class="metric-value" id="net-free" style="color:var(--success)">—</span></div>
+                <!-- Bug AK — show logical bytes claimed by file metadata vs net actually on disk. -->
+                <div class="metric-row" style="margin-top:.6rem;border-top:1px solid var(--border-color);padding-top:.4rem"><span class="metric-label" title="Sum of file sizes in metadata (replicas deduped). Should match Net Used in a healthy cluster.">Logical</span><span class="metric-value" id="logical-bytes">—</span></div>
+                <div class="metric-row"><span class="metric-label" title="Logical − Net Used. Non-zero indicates file metadata referencing chunks that aren't on any disk (data-node wipe, ENOSPC unlink cascade, etc.). A scrub-driven GC would reclaim these.">Phantom</span><span class="metric-value" id="phantom-bytes" style="color:var(--text-muted)">—</span></div>
             </div>
             <div class="metric-card">
                 <h3>I/O Throughput</h3>
@@ -865,8 +965,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <h3>Data &amp; Manager Nodes</h3>
                 <span style="font-size:.75rem;color:var(--text-muted)" id="nodes-summary"></span>
             </div>
-            <table><thead><tr><th>ID</th><th>Hostname</th><th>Role</th><th>Location</th><th>Disks</th><th>Capacity</th><th>Used</th><th>Health</th></tr></thead>
-            <tbody id="nodes-table"><tr><td colspan="8" class="placeholder">Fetching node list…</td></tr></tbody></table>
+            <table><thead><tr><th>ID</th><th>Hostname</th><th>Role</th><th>Location</th><th>Disks</th><th>Capacity</th><th style="width:120px">Utilization</th><th>Used</th><th>Health</th></tr></thead>
+            <tbody id="nodes-table"><tr><td colspan="9" class="placeholder">Fetching node list…</td></tr></tbody></table>
         </div>`;
         fetchStats();
         refreshTimer = setInterval(fetchStats, 8000);
@@ -878,8 +978,21 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         document.getElementById('page-content').innerHTML =
             '<div class="page-header"><h2>Topology</h2><p class="page-desc">Region → DC → Rack → Host hierarchy</p></div>' +
             '<div id="topo-tree" class="topo-root"><div class="placeholder">Loading topology…</div></div>';
+        await refreshTopology();
+        // Bug AT — refresh ONLY the topo-tree element on each tick (not
+        // the whole page). The previous code recursively called
+        // renderTopology which replaces page-content innerHTML every
+        // 15s, blowing away scroll position and any user interaction
+        // state. Also: that previous self-call set a NEW setInterval
+        // without clearing the old one, so timers stacked up over time.
+        refreshTimer = setInterval(refreshTopology, 15000);
+    }}
 
+    async function refreshTopology() {{
+        const topo = document.getElementById('topo-tree');
+        if (!topo) return; // user navigated away mid-fetch
         const nodes = await fetch('/api/v1/nodes').then(r => r.json()).catch(() => []);
+        if (!document.getElementById('topo-tree')) return; // checked again after await
 
         // Group nodes: region → dc → rack → [nodes]
         const tree = {{}};
@@ -892,7 +1005,6 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             tree[region][dc][rack].push(n);
         }}
 
-        const topo = document.getElementById('topo-tree');
         if (nodes.length === 0) {{
             topo.innerHTML = '<div class="placeholder">No nodes registered yet.</div>';
             return;
@@ -909,7 +1021,17 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         for (const [region, dcs] of sortedEntries(tree)) {{
             html += `<div class="topo-region"><div class="topo-region-label">🌐 Region: <b>${{region}}</b></div>`;
             for (const [dc, racks] of sortedEntries(dcs)) {{
-                html += `<div class="topo-dc"><div class="topo-dc-label">🏢 Datacenter: <b>${{dc}}</b></div>`;
+                // Bug AO — wrap all racks of this DC in a horizontal flex
+                // container (.topo-racks); each .topo-rack inside is a
+                // vertical column of hosts. Yields the visual layout:
+                //
+                //   [Rack A]   [Rack B]   [Rack C]
+                //   host-1      host-1     host-1
+                //   host-2      host-2     host-2
+                //
+                // Matches operator mental model: racks are physical
+                // siblings; hosts within a rack are stacked.
+                html += `<div class="topo-dc"><div class="topo-dc-label">🏢 Datacenter: <b>${{dc}}</b></div><div class="topo-racks">`;
                 for (const [rack, rnodes] of sortedEntries(racks)) {{
                     html += `<div class="topo-rack"><div class="topo-rack-label">🗄 Rack: <b>${{rack}}</b></div><div class="topo-nodes">`;
                     // Sort hosts (nodes) inside the rack by hostname ASC.
@@ -935,12 +1057,17 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     }}
                     html += '</div></div>';
                 }}
-                html += '</div>';
+                html += '</div></div>';
             }}
             html += '</div>';
         }}
+        // Bug AT — preserve scroll position across refresh. innerHTML
+        // assignment moves scrollTop back to 0 on long pages, making
+        // the page look like it "jumped back" to the user. Snapshot
+        // before, restore after.
+        const savedScroll = window.scrollY;
         topo.innerHTML = html;
-        refreshTimer = setInterval(renderTopology, 15000);
+        window.scrollTo(0, savedScroll);
     }}
 
     // ── Nodes list page ────────────────────────────────────────────────────────
@@ -961,12 +1088,92 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             el.innerHTML = '<div class="placeholder">No nodes registered.</div>';
             return;
         }}
-        el.innerHTML = nodes.map(n => {{
+
+        // Bug AT — preserve scroll position across the periodic refresh
+        // (was setInterval 10s). innerHTML reset of the whole list resets
+        // scrollTop to 0 which felt like a "jump back" on long node lists.
+        const savedScroll = window.scrollY;
+
+        // Use the same role-aware sort as the Home page so the user
+        // sees a consistent order on both pages: manager → data → client,
+        // then by location then hostname.
+        const sorted = sortNodesForHome(nodes);
+
+        el.innerHTML = sorted.map(n => {{
             const h = (n.health||'unknown').toLowerCase();
             const role = (n.role||'data').toLowerCase();
+            const isManager = role === 'manager';
+            const isClient  = role === 'client';
+            const isStorageRole = !isManager && !isClient;
             const pct = n.total_capacity ? Math.round(n.used_capacity/n.total_capacity*100) : 0;
             const barCol = pct>90?'var(--danger)':pct>75?'var(--warning)':'var(--primary)';
             const isMaintenance = h === 'maintenance';
+
+            // Bug AP — manager + client nodes have no disks of their own;
+            // showing a "Used / Utilisation" row that always reads 0
+            // (or — / —) is misleading clutter. For those roles, drop the
+            // size/util rows entirely. For data nodes keep the full
+            // breakdown.
+            const sizeMetaRows = isStorageRole
+                ? `<div class="node-meta-item"><span>Total</span>${{fmtBytes(n.total_capacity||0)}}</div>
+                   <div class="node-meta-item"><span>Used</span>${{fmtBytes(n.used_capacity||0)}} (${{pct}}%)</div>`
+                : '';
+            const utilBar = isStorageRole
+                ? `<div style="margin:.5rem 0">
+                       <div class="progress-bar" style="height:8px">
+                           <div style="height:100%;border-radius:4px;background:${{barCol}};width:${{pct}}%"></div>
+                       </div>
+                   </div>`
+                : '';
+
+            // Bug AR — per-disk table for data nodes. Lets the operator
+            // spot a single full disk (which would otherwise be hidden
+            // behind the node-level aggregate, e.g. data-primary01 with
+            // 4 cold disks where one fills to 100% while the others stay
+            // at 2% — the symptom that drove the Bug AD fix).
+            const disks = Array.isArray(n.disks) ? n.disks : [];
+            const diskTable = isStorageRole && disks.length > 0
+                ? `<div style="margin-top:.5rem">
+                       <div style="font-size:.75rem;color:var(--text-muted);margin-bottom:.3rem;text-transform:uppercase;letter-spacing:.04em">Disks (${{disks.length}})</div>
+                       <table style="width:100%;font-size:.78rem;border-collapse:collapse">
+                           <thead>
+                               <tr style="text-align:left;color:var(--text-muted);border-bottom:1px solid var(--border)">
+                                   <th style="padding:.25rem .4rem">ID</th>
+                                   <th style="padding:.25rem .4rem">Tier</th>
+                                   <th style="padding:.25rem .4rem">Mount</th>
+                                   <th style="padding:.25rem .4rem">Total</th>
+                                   <th style="padding:.25rem .4rem">Used</th>
+                                   <th style="padding:.25rem .4rem;width:140px">Utilisation</th>
+                                   <th style="padding:.25rem .4rem">Status</th>
+                               </tr>
+                           </thead>
+                           <tbody>
+                               ${{disks.map(d => {{
+                                   const dpct = d.total_bytes ? Math.round(d.used_bytes/d.total_bytes*100) : 0;
+                                   const dcol = dpct>90?'var(--danger)':dpct>75?'var(--warning)':'var(--primary)';
+                                   const dstatus = (d.status||'healthy').toLowerCase();
+                                   return `<tr>
+                                       <td style="padding:.25rem .4rem;font-family:monospace">${{d.disk_id}}</td>
+                                       <td style="padding:.25rem .4rem"><span class="badge badge-${{(d.tier||'').toLowerCase()}}">${{d.tier||'—'}}</span></td>
+                                       <td style="padding:.25rem .4rem;font-family:monospace;color:var(--text-muted);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{d.mount_path||''}}">${{d.mount_path||'—'}}</td>
+                                       <td style="padding:.25rem .4rem">${{fmtBytes(d.total_bytes||0)}}</td>
+                                       <td style="padding:.25rem .4rem">${{fmtBytes(d.used_bytes||0)}}</td>
+                                       <td style="padding:.25rem .4rem">
+                                           <div style="display:flex;align-items:center;gap:.5rem">
+                                               <div style="flex:1;height:5px;background:var(--border);border-radius:3px;min-width:60px">
+                                                   <div style="height:100%;border-radius:3px;background:${{dcol}};width:${{dpct}}%"></div>
+                                               </div>
+                                               <span style="font-size:.72rem;color:var(--text-muted);min-width:2.5em;text-align:right">${{dpct}}%</span>
+                                           </div>
+                                       </td>
+                                       <td style="padding:.25rem .4rem"><span class="badge badge-${{dstatus}}">${{d.status||'—'}}</span></td>
+                                   </tr>`;
+                               }}).join('')}}
+                           </tbody>
+                       </table>
+                   </div>`
+                : '';
+
             return `<div class="node-card">
                 <div class="node-card-header">
                     <div>
@@ -978,26 +1185,24 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     </div>
                     <div style="display:flex;gap:.5rem;align-items:center">
                         <span class="badge badge-${{h}}">${{n.health||'unknown'}}</span>
-                        <button class="btn-maint" onclick="toggleMaintenance('${{n.node_id}}', ${{!isMaintenance}})">
+                        ${{isStorageRole ? `<button class="btn-maint" onclick="toggleMaintenance('${{n.node_id}}', ${{!isMaintenance}})">
                             ${{isMaintenance ? 'Exit Maintenance' : 'Set Maintenance'}}
-                        </button>
+                        </button>` : ''}}
                     </div>
                 </div>
                 <div class="node-card-body">
                     <div class="node-meta">
                         <div class="node-meta-item"><span>gRPC</span>${{n.grpc_addr||'—'}}</div>
                         <div class="node-meta-item"><span>Location</span>${{n.location||'—'}}</div>
-                        <div class="node-meta-item"><span>Total</span>${{fmtBytes(n.total_capacity||0)}}</div>
-                        <div class="node-meta-item"><span>Used</span>${{fmtBytes(n.used_capacity||0)}} (${{pct}}%)</div>
+                        ${{sizeMetaRows}}
                     </div>
-                    <div style="margin:.5rem 0">
-                        <div class="progress-bar" style="height:8px">
-                            <div style="height:100%;border-radius:4px;background:${{barCol}};width:${{pct}}%"></div>
-                        </div>
-                    </div>
+                    ${{utilBar}}
+                    ${{diskTable}}
                 </div>
             </div>`;
         }}).join('');
+
+        window.scrollTo(0, savedScroll);
     }}
 
     async function toggleMaintenance(nodeId, enable) {{
@@ -1036,58 +1241,194 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
     // ── Data Explorer page ────────────────────────────────────────────────────
 
+    // Bug AS — folder-aware data explorer.
+    //
+    // Pre-fix the explorer dumped every file in the cluster (paginated to
+    // the first 1000 by /api/v1/files) as a flat table with the whole
+    // path in one column. Useless on a media library with thousands of
+    // files under nested `/movies/Season N/` paths.
+    //
+    // New behaviour:
+    //   * Browse a single directory at a time, starting at `/`.
+    //   * Subdirectories shown first as folder rows; clicking a folder
+    //     descends into it. Breadcrumb above lets you climb back.
+    //   * Files shown after folders with size + chunk count.
+    //   * Right-click on either a folder or a file opens a context menu
+    //     with operator actions: "Migrate this path…" prefilled. Falls
+    //     back to standard click handlers for keyboard users (the menu
+    //     also opens on Enter when the row is focused).
+    //
+    // The grouping is computed client-side from the full file list (we
+    // fetch up to 100k files in one shot — adequate for the household
+    // Plex scale). For huge clusters this should be replaced with a
+    // server-side `/api/v1/files/browse?path=...&depth=1` endpoint.
+    let explorerCwd = '/';
+    let explorerLastFiles = [];
+
     async function renderExplorer() {{
         document.getElementById('page-content').innerHTML =
             `<div class="page-header">
                 <h2>Data Explorer</h2>
-                <p class="page-desc">Browse files across all volumes</p>
+                <p class="page-desc">Browse files and folders cluster-wide. Right-click a row for actions.</p>
             </div>
-            <div style="display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap">
-                <input id="explorer-filter" type="text" class="form-input" placeholder="Filter by path…" style="max-width:320px">
+            <div style="display:flex;gap:.75rem;margin-bottom:.5rem;flex-wrap:wrap;align-items:center">
+                <div id="explorer-breadcrumb" style="flex:1;min-width:200px;font-family:monospace;font-size:.85rem;color:var(--text-muted)">/</div>
+                <input id="explorer-filter" type="text" class="form-input" placeholder="Filter by name…" style="max-width:240px">
                 <button class="btn-primary"   onclick="loadExplorer()">Refresh</button>
-                <button class="btn-secondary" onclick="openMigrate('')" title="Schedule migration for any path prefix">Migrate path…</button>
+                <button class="btn-secondary" onclick="openMigrate(window.explorerCwd || '/')" title="Migrate the current folder">Migrate folder…</button>
             </div>
-            <div id="explorer-list"><div class="placeholder">Loading…</div></div>`;
-        document.getElementById('explorer-filter').addEventListener('input', () => loadExplorer());
+            <div id="explorer-list"><div class="placeholder">Loading…</div></div>
+            <div id="explorer-ctxmenu" class="ctxmenu" style="display:none"></div>`;
+        document.getElementById('explorer-filter').addEventListener('input', () => renderExplorerCwd());
+        // Hide the context menu on any outside click / Escape.
+        document.addEventListener('click', hideCtxMenu);
+        document.addEventListener('keydown', e => {{ if (e.key === 'Escape') hideCtxMenu(); }});
+        explorerCwd = '/';
+        window.explorerCwd = '/';
         await loadExplorer();
     }}
 
     async function loadExplorer() {{
-        const filter = (document.getElementById('explorer-filter')?.value || '').toLowerCase();
-        const data = await fetch('/api/v1/files').then(r => r.json()).catch(() => ({{count:0,files:[]}}));
+        // Fetch a large slice once; folder rendering is purely client-side.
+        const data = await fetch('/api/v1/files?limit=100000').then(r => r.json()).catch(() => ({{count:0,files:[]}}));
+        explorerLastFiles = data.files || [];
+        renderExplorerCwd();
+    }}
+
+    /// Render the current working directory (`explorerCwd`) by grouping
+    /// `explorerLastFiles` into direct-child folders and direct-child files.
+    function renderExplorerCwd() {{
         const el = document.getElementById('explorer-list');
         if (!el) return;
-        let files = data.files || [];
-        if (filter) files = files.filter(f => (f.path||'').toLowerCase().includes(filter));
-        if (files.length === 0) {{
-            el.innerHTML = '<div class="placeholder">' + (filter ? 'No files match "' + filter + '".' : 'No files stored yet.') + '</div>';
+        const cwd = explorerCwd.endsWith('/') ? explorerCwd : explorerCwd + '/';
+        window.explorerCwd = cwd;
+        const filter = (document.getElementById('explorer-filter')?.value || '').toLowerCase();
+
+        // Breadcrumb
+        const crumbs = ['/', ...cwd.split('/').filter(Boolean)];
+        document.getElementById('explorer-breadcrumb').innerHTML = crumbs.map((seg, idx) => {{
+            if (idx === 0) {{
+                const onClick = `event.preventDefault();explorerNavigate('/')`;
+                return `<a href="#" onclick="${{onClick}}" style="color:var(--primary);text-decoration:none">/</a>`;
+            }}
+            const full = '/' + crumbs.slice(1, idx + 1).join('/') + '/';
+            const onClick = `event.preventDefault();explorerNavigate('${{full.replace(/'/g, "&#39;")}}')`;
+            return `<a href="#" onclick="${{onClick}}" style="color:var(--primary);text-decoration:none">${{seg}}</a>/`;
+        }}).join('');
+
+        // Group direct children: folders (have at least one descendant) vs files.
+        const folders = new Map(); // name → {{ name, path, fileCount, totalSize }}
+        const files = [];
+        for (const f of explorerLastFiles) {{
+            const p = f.path || '';
+            if (!p.startsWith(cwd)) continue;
+            const tail = p.slice(cwd.length);
+            const slash = tail.indexOf('/');
+            if (slash === -1) {{
+                // Direct file under cwd
+                if (!filter || tail.toLowerCase().includes(filter)) {{
+                    files.push({{ ...f, name: tail }});
+                }}
+            }} else {{
+                const name = tail.slice(0, slash);
+                if (!folders.has(name)) {{
+                    folders.set(name, {{
+                        name,
+                        path: cwd + name + '/',
+                        fileCount: 0,
+                        totalSize: 0,
+                    }});
+                }}
+                const entry = folders.get(name);
+                entry.fileCount += 1;
+                entry.totalSize += (f.total_size || 0);
+            }}
+        }}
+        let folderList = [...folders.values()];
+        if (filter) folderList = folderList.filter(f => f.name.toLowerCase().includes(filter));
+        folderList.sort((a, b) => a.name.localeCompare(b.name, undefined, {{numeric:true}}));
+        files.sort((a, b) => a.name.localeCompare(b.name, undefined, {{numeric:true}}));
+
+        if (folderList.length === 0 && files.length === 0) {{
+            el.innerHTML = '<div class="placeholder">' +
+                (filter ? `No entries match "${{filter}}" in ${{cwd}}.` : `Empty folder: ${{cwd}}`) +
+                '</div>';
             return;
         }}
-        el.innerHTML = '<div class="table-card"><table>' +
-            '<thead><tr><th>Path</th><th>Volume</th><th>Chunks</th><th>Size</th><th>Created</th><th></th></tr></thead><tbody>' +
-            files.map(f => {{
-                const safePath  = (f.path || '').replace(/'/g, "&#39;");
-                const parentDir = (f.path || '').replace(/[^/]*$/, '');
-                return `<tr>
-                <td style="font-family:monospace;font-size:.8rem;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{f.path||''}}">
-                    ${{f.path||'—'}}
-                </td>
-                <td style="font-family:monospace;font-size:.78rem;color:var(--text-muted)">${{f.volume_id||'—'}}</td>
-                <td>${{f.chunk_count||0}}</td>
+
+        const folderRows = folderList.map(d => `<tr class="explorer-row" oncontextmenu="event.preventDefault();showCtxMenu(event,'${{d.path.replace(/'/g, "&#39;")}}',true)">
+            <td style="font-size:1rem;width:1.5rem">📁</td>
+            <td>
+                <a href="#" onclick="event.preventDefault();explorerNavigate('${{d.path.replace(/'/g, "&#39;")}}')" style="color:var(--primary);text-decoration:none;font-family:monospace">${{d.name}}/</a>
+            </td>
+            <td style="font-size:.78rem;color:var(--text-muted)">${{d.fileCount.toLocaleString()}} file${{d.fileCount!==1?'s':''}}</td>
+            <td>${{fmtBytes(d.totalSize)}}</td>
+            <td></td>
+            <td style="white-space:nowrap">
+                <button class="btn-secondary" style="font-size:.72rem;padding:.2rem .5rem"
+                        onclick="openMigrate('${{d.path.replace(/'/g, "&#39;")}}')" title="Migrate this folder">⋯</button>
+            </td>
+        </tr>`).join('');
+
+        const fileRows = files.map(f => {{
+            const safePath = (f.path || '').replace(/'/g, "&#39;");
+            return `<tr class="explorer-row" oncontextmenu="event.preventDefault();showCtxMenu(event,'${{safePath}}',false)">
+                <td style="font-size:1rem;width:1.5rem">📄</td>
+                <td style="font-family:monospace;font-size:.85rem;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{f.path||''}}">${{f.name}}</td>
+                <td style="font-size:.78rem;color:var(--text-muted)">${{f.chunk_count||0}} chunk${{(f.chunk_count||0)!==1?'s':''}}</td>
                 <td>${{fmtBytes(f.total_size||0)}}</td>
                 <td style="font-size:.78rem;color:var(--text-muted)">${{f.created_at ? timeAgo(f.created_at) : '—'}}</td>
                 <td style="white-space:nowrap">
                     <button class="btn-secondary" style="font-size:.72rem;padding:.2rem .5rem"
-                            onclick="openMigrate('${{safePath}}')" title="Migrate just this file">file</button>
-                    <button class="btn-secondary" style="font-size:.72rem;padding:.2rem .5rem"
-                            onclick="openMigrate('${{parentDir.replace(/'/g, "&#39;")}}')" title="Migrate parent folder">folder</button>
+                            onclick="openMigrate('${{safePath}}')" title="Migrate just this file">⋯</button>
                 </td>
             </tr>`;
-            }}).join('') +
+        }}).join('');
+
+        const savedScroll = window.scrollY;
+        el.innerHTML = '<div class="table-card"><table>' +
+            '<thead><tr><th></th><th>Name</th><th>Contents</th><th>Size</th><th>Created</th><th></th></tr></thead><tbody>' +
+            folderRows + fileRows +
             `</tbody></table>` +
             `<div style="padding:.75rem 1.25rem;font-size:.78rem;color:var(--text-muted);border-top:1px solid var(--border)">
-                Showing ${{files.length}} of ${{data.count||0}} files · use the buttons on the right to migrate a single file or the whole folder
+                ${{folderList.length}} folder${{folderList.length!==1?'s':''}} · ${{files.length}} file${{files.length!==1?'s':''}} in <code>${{cwd}}</code> · right-click for actions
             </div></div>`;
+        window.scrollTo(0, savedScroll);
+    }}
+
+    function explorerNavigate(path) {{
+        explorerCwd = path || '/';
+        renderExplorerCwd();
+    }}
+
+    function showCtxMenu(evt, path, isFolder) {{
+        const menu = document.getElementById('explorer-ctxmenu');
+        if (!menu) return;
+        const safe = (path || '').replace(/'/g, "&#39;");
+        const parent = isFolder ? path : path.replace(/[^/]*$/, '');
+        const safeParent = parent.replace(/'/g, "&#39;");
+        const items = isFolder
+            ? [
+                {{ label: 'Open folder',           onClick: `explorerNavigate('${{safe}}')` }},
+                {{ label: 'Migrate this folder…',  onClick: `openMigrate('${{safe}}')` }},
+                {{ label: 'Copy path',             onClick: `navigator.clipboard&&navigator.clipboard.writeText('${{safe}}')` }},
+              ]
+            : [
+                {{ label: 'Migrate this file…',    onClick: `openMigrate('${{safe}}')` }},
+                {{ label: 'Migrate parent folder…',onClick: `openMigrate('${{safeParent}}')` }},
+                {{ label: 'Copy path',             onClick: `navigator.clipboard&&navigator.clipboard.writeText('${{safe}}')` }},
+              ];
+        menu.innerHTML = items.map(it =>
+            `<div class="ctxmenu-item" onclick="${{it.onClick}};hideCtxMenu()">${{it.label}}</div>`
+        ).join('');
+        menu.style.display = 'block';
+        menu.style.left = evt.pageX + 'px';
+        menu.style.top  = evt.pageY + 'px';
+    }}
+
+    function hideCtxMenu() {{
+        const m = document.getElementById('explorer-ctxmenu');
+        if (m) m.style.display = 'none';
     }}
 
     // ── Migrate dialog (operator-driven path migration) ──────────────────────
@@ -1196,7 +1537,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         if (!el) return;
         const tasks = data.tasks || [];
         if (tasks.length === 0) {{
-            el.innerHTML = '<div class="placeholder">No migration tasks. Schedule one from Data Explorer or the “+ New migration” button.</div>';
+            setHtmlPreserveScroll(el, '<div class="placeholder">No migration tasks. Schedule one from Data Explorer or the “+ New migration” button.</div>');
             return;
         }}
         const statusColor = (s) => {{
@@ -1205,7 +1546,13 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             if (s === 'pending')   return 'var(--text-muted)';
             return 'var(--warning)'; // copying/verifying/completing
         }};
-        el.innerHTML = '<div class="table-card"><table>' +
+        // Bug AT — wrap the innerHTML write in setHtmlPreserveScroll so
+        // the 5s auto-refresh doesn't yank the user back to the top of
+        // a long migration list. The server-side sort (Bug AM) plus
+        // scroll preservation here means the table stays readable
+        // during sustained migration storms.
+        setHtmlPreserveScroll(el,
+            '<div class="table-card"><table>' +
             '<thead><tr><th>Task</th><th>Chunk</th><th>Src → Tgt</th><th>Tier</th><th>Status</th><th>Attempts</th><th>Updated</th><th>Last error</th></tr></thead><tbody>' +
             tasks.map(t => `<tr>
                 <td style="font-family:monospace;font-size:.75rem">${{t.task_id||'—'}}</td>
@@ -1220,7 +1567,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             `</tbody></table>` +
             `<div style="padding:.75rem 1.25rem;font-size:.78rem;color:var(--text-muted);border-top:1px solid var(--border)">
                 ${{data.count}} task(s) tracked
-            </div></div>`;
+            </div></div>`
+        );
     }}
 
     // ── Audit Log page ────────────────────────────────────────────────────────
@@ -1267,7 +1615,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 const resultColor = ok ? 'var(--success)' : e.result === 'pending' ? 'var(--warning)' : 'var(--text-muted)';
                 return `<tr>
                     <td style="font-size:.78rem;color:var(--text-muted);white-space:nowrap">
-                        ${{e.timestamp ? new Date(e.timestamp).toLocaleString() : '—'}}
+                        ${{/* Bug AG — AuditEntry.timestamp is SECONDS-since-epoch (chrono::Utc::now().timestamp() in audit.rs). JS new Date() expects MS. Without *1000 every entry rendered as 1970-01-2x. */ e.timestamp ? new Date(e.timestamp * 1000).toLocaleString() : '—'}}
                     </td>
                     <td style="font-size:.8rem">${{e.actor||'—'}}</td>
                     <td style="font-family:monospace;font-size:.78rem">${{e.action||'—'}}</td>
