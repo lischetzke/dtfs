@@ -1,4 +1,4 @@
-# DTFS2 Data-Integrity Audit — 2026-05-18
+# DTFS Data-Integrity Audit — 2026-05-18
 
 Senior-developer review of write / migrate / delete / scrub paths. 16
 findings, 6 HIGH-severity. The HIGH findings cluster around three
