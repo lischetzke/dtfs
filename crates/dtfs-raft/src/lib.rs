@@ -9,7 +9,7 @@ use std::io::Cursor;
 use serde::{Deserialize, Serialize};
 
 use dtfs_common::topology::Location;
-use dtfs_common::types::{DiskInfo, HealthStatus, NodeRole, VolumeConfig};
+use dtfs_common::types::{AnchorPolicy, DiskInfo, HealthStatus, NodeRole, VolumeConfig};
 
 // ---------------------------------------------------------------------------
 // TypeConfig — wires our application types into OpenRaft
@@ -393,6 +393,37 @@ pub enum ClientRequest {
         origin_manager: String,
         timestamp_ms: u64,
     },
+
+    // ---- Bug AV — operator-driven cache replica removal ----
+
+    /// Bug AV — drop a single `ChunkLocationEntry` from a file's
+    /// `chunks` list. Used by the cache-flush path
+    /// (`flush_cache_for_path`, AV-1-7) AFTER the underlying
+    /// `DeleteChunkReplica` data-node RPC has succeeded, so the SM's
+    /// view stays consistent with what physically exists on disk.
+    ///
+    /// **Anchor safety.** When `enforce_anchor` is `Some(policy)`, the
+    /// apply path refuses the operation if dropping this entry would
+    /// leave the affected chunk with zero replicas satisfying the
+    /// policy. The check fires per chunk_index, not per file — a
+    /// multi-chunk file may have some chunks anchor-satisfied and some
+    /// not; only the actually-stranding case is rejected.
+    ///
+    /// Idempotent: removing an entry that isn't present is a no-op
+    /// (the data-node delete may have raced with a prior identical
+    /// call).
+    RemoveChunkLocation {
+        path: String,
+        chunk_index: u64,
+        /// String form to match `ChunkLocationEntry.node_id` (u64 as
+        /// string for protobuf interop).
+        node_id: String,
+        /// When Some, refuse if the resulting state would strand the
+        /// anchor for this chunk_index. Threading the policy through
+        /// the apply path is cleaner than re-reading the volume here
+        /// (apply is meant to be a pure function of `req + state`).
+        enforce_anchor: Option<AnchorPolicy>,
+    },
 }
 
 impl fmt::Display for ClientRequest {
@@ -480,6 +511,16 @@ impl fmt::Display for ClientRequest {
             }
             Self::UpdateNodeDiskUsage { node_id, per_disk } => {
                 write!(f, "UpdateNodeDiskUsage(node={node_id}, {} disks)", per_disk.len())
+            }
+            Self::RemoveChunkLocation { path, chunk_index, node_id, enforce_anchor } => {
+                let anchor_marker = match enforce_anchor {
+                    Some(p) => match p.required_tier {
+                        Some(t) => format!(", anchor={}@{}", p.datacenter, t),
+                        None    => format!(", anchor={}", p.datacenter),
+                    },
+                    None => String::new(),
+                };
+                write!(f, "RemoveChunkLocation({path}, idx={chunk_index}, node={node_id}{anchor_marker})")
             }
         }
     }
