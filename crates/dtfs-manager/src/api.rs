@@ -115,6 +115,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/migrations",
             get(list_migrations).post(start_path_migration),
         )
+        // Bug AV — operator-driven cache-tier flush. Drops warm/hot
+        // replicas under a path prefix while preserving the mandatory
+        // anchor and setting a cooldown that blocks immediate
+        // re-promotion by the tiering engine.
+        .route("/api/v1/files/flush_cache", post(flush_cache_endpoint))
         // Stats (aggregate cluster metrics for WebUI home page)
         .route("/api/v1/stats", get(get_stats))
         // HMAC join (phase 1: challenge, phase 2: Raft register)
@@ -1561,6 +1566,128 @@ async fn list_migrations(State(state): State<Arc<AppState>>) -> Json<Value> {
         "count": snapshot.len(),
         "tasks": snapshot,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Bug AV (AV-1-9) — POST /api/v1/files/flush_cache
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct FlushCacheRequest {
+    /// Path prefix to flush. Empty matches every file in the cluster
+    /// (requires `allow_empty_prefix=true`).
+    path_prefix: String,
+    /// Tiers to flush. Defaults to `["warm", "hot"]` when unset — the
+    /// typical non-mandatory cache tiers. Tiers configured as
+    /// mandatory for a file's volume are filtered out by the planner
+    /// regardless of this list.
+    #[serde(default)]
+    cache_tiers: Option<Vec<String>>,
+    /// Cooldown in seconds blocking re-promotion. Default 300 (5 min).
+    #[serde(default)]
+    cooldown_secs: Option<u64>,
+    /// Cap on in-flight delete actions per call. Default 10 000;
+    /// overage reported under `truncated`.
+    #[serde(default)]
+    max_tasks: Option<usize>,
+    /// Safety gate against accidental "flush everything". Required
+    /// when `path_prefix` is empty.
+    #[serde(default)]
+    allow_empty_prefix: bool,
+}
+
+async fn flush_cache_endpoint(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<FlushCacheRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    use axum::http::StatusCode;
+
+    // Safety gate: empty prefix matches every file.
+    if body.path_prefix.is_empty() && !body.allow_empty_prefix {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "empty path_prefix would flush every file — set allow_empty_prefix=true to confirm",
+            })),
+        ));
+    }
+
+    // Parse cache_tiers. Default = warm + hot (the typical
+    // opportunistic tiers); operator can override to e.g. [warm] only.
+    let tiers: Vec<dtfs_common::types::DiskTier> = match body.cache_tiers {
+        Some(list) => {
+            let mut parsed = Vec::with_capacity(list.len());
+            for t in &list {
+                match parse_tier(t) {
+                    Some(d) => parsed.push(d),
+                    None => return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": format!(
+                                "invalid cache tier '{}': expected one of hot|warm|cold|tape",
+                                t
+                            ),
+                        })),
+                    )),
+                }
+            }
+            parsed
+        }
+        None => vec![
+            dtfs_common::types::DiskTier::Warm,
+            dtfs_common::types::DiskTier::Hot,
+        ],
+    };
+
+    let cooldown_secs = body.cooldown_secs.unwrap_or(300);
+    let max_tasks    = body.max_tasks.unwrap_or(10_000);
+
+    let report = state
+        .scheduler
+        .flush_cache_for_path(&body.path_prefix, &tiers, cooldown_secs, max_tasks)
+        .await;
+
+    state.audit_log.log(
+        "api",
+        "cache.flush",
+        &format!(
+            "prefix={} tiers={:?} cooldown={}s",
+            body.path_prefix, tiers, cooldown_secs
+        ),
+        &format!(
+            "matched={} dropped={} refusals={} truncated={}",
+            report.files_matched,
+            report.replicas_dropped,
+            report.mandatory_refusals,
+            report.truncated,
+        ),
+    );
+
+    info!(
+        prefix = %body.path_prefix,
+        tiers = ?tiers,
+        cooldown_secs,
+        dropped = report.replicas_dropped,
+        refusals = report.mandatory_refusals,
+        "Cache flush accepted"
+    );
+
+    Ok(Json(json!({
+        "status": "accepted",
+        "path_prefix": body.path_prefix,
+        "cache_tiers": tiers.iter()
+            .map(|t| format!("{:?}", t).to_lowercase())
+            .collect::<Vec<_>>(),
+        "cooldown_secs": cooldown_secs,
+        "files_matched":        report.files_matched,
+        "chunks_examined":      report.chunks_examined,
+        "replicas_dropped":     report.replicas_dropped,
+        "mandatory_refusals":   report.mandatory_refusals,
+        "truncated":            report.truncated,
+        "unreachable_nodes":    report.unreachable_nodes,
+        "rpc_failures":         report.rpc_failures,
+        "raft_failures":        report.raft_failures,
+    })))
 }
 
 // ---------------------------------------------------------------------------

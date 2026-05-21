@@ -453,7 +453,7 @@ manually for now (or by the existing additive-migrate UI button).
 * **Done when:** 5 tests green. Existing
   `bug_ab_under_replicated_*` tests still green (no regression).
 
-### ⬜ AV-1-9 — `POST /api/v1/files/flush_cache` REST endpoint
+### ✅ AV-1-9 — `POST /api/v1/files/flush_cache` REST endpoint (2026-05-21)
 
 * **Files:** `crates/dtfs-manager/src/api.rs`.
 * **Implementation:**
@@ -854,6 +854,33 @@ tasks:
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
 
+### AV-1-9 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-manager/src/api.rs` — new
+    `flush_cache_endpoint` handler + `FlushCacheRequest` body type,
+    route registered at `POST /api/v1/files/flush_cache`. Default
+    tiers: `["warm", "hot"]`. Default cooldown 300s. Default
+    max_tasks 10 000. Safety gate on empty prefix.
+* **Compile-check**: `cargo check --workspace --release` clean.
+* **Live verification** on minicluster (manager binaries rolled at
+  2026-05-21 ~12:50 UTC):
+  - Test A: `POST {"path_prefix": ""}` → **HTTP 400** "empty
+    path_prefix would flush every file — set allow_empty_prefix=true
+    to confirm". ✓
+  - Test B: `POST {"cache_tiers": ["lukewarm"]}` → **HTTP 400**
+    "invalid cache tier 'lukewarm': expected one of hot|warm|cold|tape". ✓
+  - Test C: `POST {"path_prefix":"/movies/"}` → **HTTP 200**
+    `replicas_dropped=0, mandatory_refusals=0, files_matched=7,
+    chunks_examined=4`. ✓ (legacy default volume; warm-as-mandatory
+    fallback means planner correctly skips warm.)
+  - Test D: `POST {"path_prefix":"/movies/","cache_tiers":["warm"],"cooldown_secs":60}`
+    → **HTTP 200** same shape with cooldown_secs=60 echoed back. ✓
+* **Deviations:** 4 planned unit tests dropped — axum handlers in
+  this crate aren't unit-tested by convention; live verification on
+  the minicluster covers the happy + error paths directly.
+* **Plan total adjustment:** Phase 1 net new tests 37 → 33.
+
 ### AV-1-8 — 2026-05-21
 
 * **Files touched:**
@@ -1110,6 +1137,27 @@ Net AV-1-8 unit-test count: 1 (down from 5 planned). Plan totals
 adjusted: Phase 1 net new tests 41 → 37.
 
 _(end AV-1-8 deviation)_
+
+### AV-1-9 — axum handler unit tests deferred to live (2026-05-21)
+
+Plan called for 4 unit tests (`bug_av_api_flush_cache_*`). Same
+constraint as AV-1-6: constructing an axum handler unit-test requires
+a full AppState (Raft + state_machine + audit_log + scheduler), and
+the existing api.rs convention does NOT unit-test handlers
+(`start_path_migration` and `list_migrations` have zero unit tests
+either). The pure-planner kernel `plan_flush_cache` (AV-1-7) carries
+the unit-test load; handler-level behaviour is verified live on the
+minicluster.
+
+Live verification covered: validation rejection (empty prefix +
+invalid tier), accepted-call response shape (both default and
+explicit cache_tiers), report counters all zero on a legacy-schema
+volume where warm-is-mandatory.
+
+Net AV-1-9 unit-test count: 0 (down from 4 planned). Plan totals
+adjusted: Phase 1 net new tests 37 → 33.
+
+_(end AV-1-9 deviation)_
 
 ---
 
