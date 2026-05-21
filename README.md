@@ -2,6 +2,14 @@
 
 Distributed tiered file storage: **Raft** managers (metadata), **chunk** data nodes, **gRPC** data plane, optional **FUSE** client (Linux), **REST + WebUI** on managers.
 
+DTFS separates replication into a **mandatory anchor** copy (the durable
+floor; under-replication scheduler enforces it) and **opportunistic
+cache** copies created on read demand by the tiering engine (freely
+evictable; operator can pre-emptively drop them via
+`POST /api/v1/files/flush_cache` to reclaim warm storage). See
+[Volume Configuration](docs/src/configuration/volume-config.md#replication-classes)
+for the schema and worked examples.
+
 > [!WARNING]
 > **Deployment notice — please read.**
 >

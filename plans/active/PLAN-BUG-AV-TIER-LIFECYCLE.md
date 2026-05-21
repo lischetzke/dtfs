@@ -551,35 +551,42 @@ manually for now (or by the existing additive-migrate UI button).
   is deferred to Phase 2 when AV-2 sets up volumes with mismatched
   mandatory/actual placement.
 
-### ⬜ AV-1-12 — Documentation: schema + flush API
+### ✅ AV-1-12 — Documentation: schema + flush API
 
-* **Files:**
-  - `docs/src/configuration/volume-config.md` — extend the settings
-    reference table with the new fields; add a "Replication classes"
-    subsection explaining mandatory vs cache and the back-compat
-    rules. Include 2 of the 5 examples from this plan's Appendix A
-    inline.
-  - `docs/src/storage/replication.md` — add the same "mandatory vs
-    cache" framing at the top; cross-link to tiering.md for the
-    promotion engine.
-  - `docs/src/storage/tiering.md` — add a "Cache tier semantics
-    (Bug AV)" section *placeholder*; full text lands with AV-2-6.
-  - `docs/src/api-reference/rest-api.md` — document the new
-    `POST /api/v1/files/flush_cache` endpoint with request/response
-    schema + one example curl invocation.
-  - `docs/src/api-reference/cli-reference.md` — placeholder for the
-    CLI commands (filled in by AV-3-5).
-  - `CLAUDE.md` — § 3 (Conventions): add invariant "cache replicas
-    are NEVER auto-created by the under-replication scheduler — only
-    the tiering engine creates them, and only on threshold." § 10
-    (file map): note the new `flush_cache_for_path` entry point in
-    scheduler.rs.
-  - `README.md` — one-paragraph mention in the feature list of the
-    new "mandatory anchor + opportunistic cache" model with a link
-    to the volume-config docs.
-* **Tests:** doc smoke test — `mdbook build` from `docs/` succeeds
-  (no broken cross-links).
-* **Done when:** all 5 doc files updated, mdbook builds clean.
+* **Files touched** (all 7):
+  - `docs/src/configuration/volume-config.md` — extended settings
+    reference table with `mandatory_replicas.*`, `cache_replicas.*`,
+    `anchor.*`; added "Replication classes" subsection covering the
+    two-class model + legacy back-compat rules; embedded Examples A
+    (Plexmedia) and B (single-DC home lab) inline.
+  - `docs/src/storage/replication.md` — added "Two replication
+    classes" section at the top with the comparison table and the
+    "Anchor invariant" sub-section; cross-links to `volume-config.md`
+    and `tiering.md`.
+  - `docs/src/storage/tiering.md` — added "Cache tier semantics
+    (Bug AV)" placeholder section explaining what *will* land in
+    Phase 2 plus what the operator *can* do today
+    (`flush_cache`, manual schema migration).
+  - `docs/src/api-reference/rest-api.md` — full documentation of
+    `POST /api/v1/files/flush_cache` (request/response/audit/alert
+    + curl example) and `POST /api/v1/volumes/{id}/migrate-policy`
+    (idempotent helper).
+  - `docs/src/api-reference/cli-reference.md` — `volumes
+    migrate-policy` section + planned placeholder for `files
+    flush-cache` (AV-3-5).
+  - `CLAUDE.md` — new § 3.4 "Mandatory vs cache replicas (Bug AV
+    invariant)" elevating the AV constraint to a top-level
+    convention; § 10 file map extended with the new entry points
+    on `scheduler.rs` (`flush_cache_for_path`, planner,
+    `check_under_replicated` now via `effective_mandatory_replicas`).
+  - `README.md` — paragraph in the lead explaining the
+    mandatory-anchor + opportunistic-cache model with a link to
+    `volume-config.md#replication-classes`.
+* **Tests:** `mdbook build docs/` clean (no warnings, no errors).
+* **Done when:** all 7 files updated, mdbook builds clean.
+  Live-verified on dtfs-builder VM (`mdbook 0.4.36` installed via
+  `cargo install`, build completes in <1 s with only `INFO`
+  output — no warnings/errors).
 
 ### Phase 1 Done When
 
@@ -897,6 +904,44 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-1-12 — 2026-05-21
+
+* **Files touched** (7):
+  - `docs/src/configuration/volume-config.md` — settings table
+    extended with 11 new field rows (4 mandatory, 4 cache + per-DC,
+    2 anchor) + new "Replication classes" section + Examples A & B
+    inline + back-compat migration walkthrough.
+  - `docs/src/storage/replication.md` — added the "Two replication
+    classes" framing + Anchor invariant subsection above the
+    legacy content.
+  - `docs/src/storage/tiering.md` — placeholder "Cache tier
+    semantics (Bug AV)" with status (Phase 1 done; Phase 2 will
+    wire `reads_by_dc`) + the lifecycle ASCII diagram.
+  - `docs/src/api-reference/rest-api.md` — full
+    `POST /api/v1/files/flush_cache` documentation (request body,
+    response shape, audit/alert behaviour, error codes, curl
+    example) + `POST /api/v1/volumes/{id}/migrate-policy`.
+  - `docs/src/api-reference/cli-reference.md` — new
+    `volumes migrate-policy` subsection + a "files flush-cache
+    (planned)" placeholder referencing AV-3-5.
+  - `CLAUDE.md` — new § 3.4 invariant ("only the tiering engine
+    creates cache replicas; only the under-replication scheduler
+    maintains the mandatory floor") + § 10 file-map extension on
+    `scheduler.rs`.
+  - `README.md` — paragraph after the one-liner explaining the
+    Bug AV two-class model with a link to volume-config.
+* **Build verification:** `mdbook build docs/` on dtfs-builder
+  succeeds with only `INFO` output (no warnings, no errors).
+  Build runs in <1 s after the initial `cargo install --version
+  0.4.36 mdbook` (~2 min once-off).
+* **Live verification:** N/A — docs only.
+* **Deviations:** none (all 7 doc files updated as planned; the
+  REST API doc explicitly flags the `/api/v1/volumes` listing
+  projection gap from AV-1-10 as a tracked follow-up).
+* **Plan total adjustment:** Phase 1 net new tests still 33;
+  AV-1-12 adds the mdbook-build smoke check as the docs-level
+  test.
 
 ### AV-1-11 — 2026-05-21
 

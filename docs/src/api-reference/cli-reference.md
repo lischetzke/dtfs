@@ -123,6 +123,41 @@ default                  1200       512.0 GB
 archive                  223        100.0 GB
 ```
 
+#### volumes migrate-policy
+
+Bug AV — copy a volume's legacy `replication` block into the new
+`mandatory_replicas` field. Idempotent: re-running it once the
+migration has been applied is a no-op.
+
+```bash
+dtfs-cli volumes migrate-policy <volume_id>
+```
+
+**Example:**
+
+```
+$ dtfs-cli volumes migrate-policy default
+Volume 'default' migrate-policy: applied (mandatory hot=0 warm=2 cold=1 tape=1)
+
+$ dtfs-cli volumes migrate-policy default
+Volume 'default' migrate-policy: no-op (already migrated) (mandatory hot=0 warm=2 cold=1 tape=1)
+```
+
+Exits non-zero with an HTTP 404 message if the volume is unknown.
+See [REST API → POST /api/v1/volumes/{id}/migrate-policy](./rest-api.md#post-apiv1volumesidmigrate-policy)
+for the underlying request.
+
+---
+
+#### files flush-cache (planned)
+
+Bug AV — operator-facing wrapper for `POST /api/v1/files/flush_cache`.
+Currently exposed only via the REST endpoint; CLI surface lands
+with AV-3-5. See
+[REST API → POST /api/v1/files/flush_cache](./rest-api.md#post-apiv1filesflush_cache)
+for the request/response schema and audit/alert semantics that
+will be plumbed through the CLI.
+
 ---
 
 ### files

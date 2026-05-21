@@ -156,7 +156,34 @@ Every code path that *touches bytes* must:
 
 See § 7 for the senior-dev integrity audit checklist.
 
-### 3.4 The bug catalog (`SOAK-RECOVERY-2026-05-18.md`)
+### 3.4 Mandatory vs cache replicas (Bug AV invariant)
+
+Replica creation has two independent classes, and **only the
+under-replication scheduler is allowed to maintain the mandatory
+class**:
+
+- `mandatory_replicas.<tier>` are protected. The under-replication
+  scheduler enforces the configured count and refuses to drop
+  below it (`scheduler::check_under_replicated`).
+- `cache_replicas.<tier>.{min,max}` are demand-driven. **The
+  tiering engine is the *only* component allowed to create cache
+  replicas, and only when the configured promotion threshold has
+  fired** (`promote_reads` / `promote_window_secs`). The
+  under-replication scheduler MUST NOT attempt to backfill cache
+  replicas — they are evictable by design.
+- The cache-flush planner (`scheduler::plan_flush_cache`) refuses
+  any flush that would strand the mandatory copy, emitting a
+  `cache.flush_refused` audit row + an `AnchorViolated` alert.
+  The async dispatcher path additionally records
+  `cache.flush_replica` per successful drop and
+  `cache.flush_complete` per call (unconditional).
+
+When you add a new code path that creates replicas, decide which
+class it produces and make the boundary explicit in the function
+name or doc comment. Mixing the two classes in one creation site
+is a regression risk against the AV invariant.
+
+### 3.5 The bug catalog (`SOAK-RECOVERY-2026-05-18.md`)
 
 Bugs A–J + the chunk-size default + Bug I (streaming put_chunk) are
 documented there with: symptom → root cause → fix → test name →
@@ -388,7 +415,13 @@ heartbeats fail under jitter and the cluster can't elect a leader).
   in `apply_request`.
 - `crates/dtfs-manager/src/scheduler.rs` — migration / re-replication
   background loop. `schedule_path_migration` is the public entry
-  point for operator-driven moves.
+  point for operator-driven moves. Bug AV adds two more:
+  `flush_cache_for_path` (operator drops cache replicas under a
+  prefix; pure planner `plan_flush_cache` + dispatcher that emits
+  `cache.flush_replica` / `cache.flush_refused` /
+  `cache.flush_complete` audit + an `AnchorViolated` alert on
+  refusals), and `check_under_replicated` (now reads
+  `effective_mandatory_replicas()` from the volume — see § 3.4).
 - `crates/dtfs-manager/src/metadata.rs` — gRPC service implementing
   the manager RPCs. Thin wrappers over `raft_write(ClientRequest::*)`.
 - `crates/dtfs-manager/src/api.rs` — REST endpoints (consumed by

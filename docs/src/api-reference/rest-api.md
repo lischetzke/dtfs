@@ -225,6 +225,156 @@ Lists volumes aggregated from file metadata.
 }
 ```
 
+> **Bug AV note:** the JSON shape currently emits only the
+> legacy `replication` block. The new `mandatory_replicas`,
+> `cache_replicas`, and `anchor` fields are stored on the
+> state machine (`POST /api/v1/volumes/{id}/migrate-policy` is
+> idempotent thanks to this) but the read-side projection has
+> not yet been broadened. Tracked as a follow-up under
+> [Plan AV-1-12 / AV-1-13](https://github.com/lischetzke/dtfs/blob/master/plans/active/PLAN-BUG-AV-TIER-LIFECYCLE.md).
+
+---
+
+### POST /api/v1/volumes/{id}/migrate-policy
+
+Bug AV — idempotently copy a volume's legacy `replication` block
+into the new `mandatory_replicas` field, leaving the legacy field
+intact for rollback safety. No-op if the migration has already
+been applied.
+
+**Path parameters:**
+
+| Name | Description |
+|------|-------------|
+| `id` | Volume ID. |
+
+**Response (changed):**
+
+```json
+{
+  "volume_id": "default",
+  "changed": true,
+  "mandatory_replicas": { "hot": 0, "warm": 2, "cold": 1, "tape": 1 }
+}
+```
+
+**Response (no-op):**
+
+```json
+{
+  "volume_id": "default",
+  "changed": false,
+  "mandatory_replicas": { "hot": 0, "warm": 2, "cold": 1, "tape": 1 }
+}
+```
+
+**Errors:**
+
+| Status | Reason |
+|--------|--------|
+| `404 Not Found` | Volume does not exist. |
+| `503 Service Unavailable` | Raft write failed (cluster lost quorum or follower without forwarding). |
+
+**Example:**
+
+```bash
+$ curl -X POST http://mgr-01:9402/api/v1/volumes/default/migrate-policy
+{"changed":true,"mandatory_replicas":{...},"volume_id":"default"}
+```
+
+CLI equivalent: `dtfs-cli volumes migrate-policy default` (see
+[CLI reference](./cli-reference.md#volumes-migrate-policy)).
+
+---
+
+### POST /api/v1/files/flush_cache
+
+Bug AV — operator-driven button to drop **cache** replicas of every
+chunk under a path prefix on the listed tiers, refusing any drop
+that would strand the mandatory replica or anchor. Sets a
+per-chunk cooldown so the tiering engine doesn't immediately
+re-promote.
+
+**Request body:**
+
+```json
+{
+  "path_prefix": "/movies/Wicked.mkv",
+  "cache_tiers": ["warm"],
+  "cooldown_secs": 300,
+  "max_tasks": 10000,
+  "allow_empty_prefix": false
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `path_prefix` | string | *(required)* | Prefix to match. `/` matches every file in the cluster but is rejected unless `allow_empty_prefix=true`. |
+| `cache_tiers` | array of `"hot"`/`"warm"`/`"cold"`/`"tape"` | `["warm","hot"]` | Tiers eligible to be flushed. The planner additionally filters out any tier that's also `mandatory_replicas.<tier> > 0` for the file's volume — so e.g. flushing warm on a volume with `mandatory_replicas.warm = 1` is a safe no-op. |
+| `cooldown_secs` | integer | `300` | How long after the flush the tiering engine refuses to re-promote affected chunks. Set to `0` to disable the cooldown. |
+| `max_tasks` | integer | `10000` | Maximum replica deletions to enqueue in a single call. Operators re-run the call to pick up remaining work; the `truncated` counter in the response reports the unseen tail. |
+| `allow_empty_prefix` | bool | `false` | Safety gate against an empty/`"/"` prefix accidentally flushing the entire cluster. |
+
+**Response:**
+
+```json
+{
+  "status": "accepted",
+  "path_prefix": "/movies/Wicked.mkv",
+  "cache_tiers": ["warm"],
+  "cooldown_secs": 300,
+  "files_matched": 1,
+  "chunks_examined": 128,
+  "replicas_dropped": 254,
+  "mandatory_refusals": 0,
+  "truncated": 0,
+  "unreachable_nodes": 0,
+  "rpc_failures": 0,
+  "raft_failures": 0
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `files_matched` | Files whose path begins with `path_prefix`. |
+| `chunks_examined` | Distinct `chunk_index`es considered across all matched files. |
+| `replicas_dropped` | Successful per-replica deletes (counts replicas, not chunks). |
+| `mandatory_refusals` | Chunks where the planner refused to flush because doing so would have stranded the mandatory/anchor copy. Operator should investigate (each refusal emits a `cache.flush_refused` audit row + fires one deduped `AnchorViolated` alert per call). |
+| `truncated` | Replicas the planner skipped because `max_tasks` was hit. |
+| `unreachable_nodes` | Per-action failures: the node hosting the replica was unreachable at delete time. |
+| `rpc_failures` | Per-action failures: the data node's `DeleteChunkReplica` RPC errored. |
+| `raft_failures` | Per-action failures: the manager's `RemoveChunkLocation` Raft write errored. |
+
+**Audit and alerting:**
+
+* `cache.flush_replica` audit row per successful per-replica delete.
+* `cache.flush_refused` audit row per refused chunk (reason
+  `mandatory_strand`).
+* `cache.flush_complete` audit row at the end of the call (always
+  fires, even on early-return paths).
+* `AlertKind::AnchorViolated` fires once per call (deduped) when
+  any refusals occurred, with `subsystem: "cache_flush"` and a
+  sampled first-20 refusals in the details JSON.
+
+**Errors:**
+
+| Status | Reason |
+|--------|--------|
+| `400 Bad Request` | Empty `path_prefix` without `allow_empty_prefix=true`; invalid `cache_tiers` entry. |
+| `503 Service Unavailable` | Raft writes during the dispatch failed; partial progress is committed and reflected in counters. |
+
+**Example:**
+
+```bash
+$ curl -X POST http://mgr-01:9402/api/v1/files/flush_cache \
+       -H 'content-type: application/json' \
+       -d '{"path_prefix":"/movies/Wicked.mkv","cache_tiers":["warm"],"cooldown_secs":300}'
+{"status":"accepted","replicas_dropped":254,"mandatory_refusals":0,...}
+```
+
+CLI equivalent: planned `dtfs-cli files flush-cache` under AV-3-5
+(see [CLI reference](./cli-reference.md#files-flush-cache-planned)).
+
 ---
 
 ### GET /api/v1/audit
