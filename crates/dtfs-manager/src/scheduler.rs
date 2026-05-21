@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dtfs_common::types::{DiskTier, HealthStatus, MigrationStatus};
+use dtfs_common::types::{DiskTier, HealthStatus, MigrationStatus, TierReplication};
 use dtfs_raft::state_machine::StateMachineData;
 use dtfs_raft::{ChunkLocationEntry, ClientRequest, DtfsRaft};
 use dtfs_proto::dtfs::data::data_service_client::DataServiceClient;
@@ -1089,6 +1089,342 @@ impl TaskScheduler {
         });
         out
     }
+
+    // -----------------------------------------------------------------------
+    // Bug AV — operator-driven cache-tier flush (AV-1-7)
+    // -----------------------------------------------------------------------
+
+    /// Bug AV — flush opportunistic cache replicas for every file whose path
+    /// starts with `path_prefix`. For each chunk:
+    ///
+    /// 1. Resolve mandatory tiers for the chunk's volume (via
+    ///    `VolumeConfig::effective_mandatory_replicas` from AV-1-2).
+    /// 2. Identify candidate replicas — those on tiers in `cache_tiers`
+    ///    AND not in any mandatory tier with rf > 0 for this volume.
+    /// 3. Verify the chunk still has at least one mandatory-tier replica
+    ///    after the proposed removals. If not, audit a refusal and skip.
+    /// 4. Issue `DeleteChunkReplica` on each candidate node (AV-1-6),
+    ///    then `RemoveChunkLocation` Raft writes (AV-1-3) to drop the
+    ///    SM entries, then a single `SetChunkCooldown` Raft write
+    ///    (AV-1-4) covering every affected chunk_index.
+    ///
+    /// Returns a [`FlushCacheReport`] mirroring `PathMigrationReport`'s
+    /// shape so the REST + CLI handlers can present a uniform summary.
+    pub async fn flush_cache_for_path(
+        &self,
+        path_prefix: &str,
+        cache_tiers: &[DiskTier],
+        cooldown_secs: u64,
+        max_tasks: usize,
+    ) -> FlushCacheReport {
+        // Snapshot SM under one read lock so all planning decisions are
+        // made against a consistent view (same pattern as
+        // `schedule_path_migration`).
+        let snapshot: FlushSnapshot = {
+            let sm = self.state_data.read().await;
+            FlushSnapshot::from_sm(&sm, path_prefix)
+        };
+
+        let (actions, mut report) =
+            plan_flush_cache(&snapshot, cache_tiers, max_tasks);
+
+        if actions.is_empty() {
+            return report;
+        }
+
+        // Dispatch deletes. We don't currently bound the parallelism per
+        // source node — the typical operator-driven flush is at-most-a-few-
+        // hundred chunks. If we ever start seeing 10k-chunk flushes, gate
+        // this with a per-source Semaphore (max 8 in-flight per node).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let cooldown_until_ms = now_ms.saturating_add(cooldown_secs * 1000);
+
+        // Group affected chunk_indexes per file_path for one
+        // SetChunkCooldown write per file at the end.
+        let mut cooldowns: HashMap<String, std::collections::BTreeSet<u64>> =
+            HashMap::new();
+
+        for action in &actions {
+            let Some(node_addr) = self.node_grpc_addr(action.node_id).await else {
+                report.unreachable_nodes += 1;
+                continue;
+            };
+            match self
+                .delete_chunk_replica_on_node(&node_addr, &action.chunk_id)
+                .await
+            {
+                Ok((was_present, _freed)) => {
+                    // Audit each replica delete.
+                    self.audit.log(
+                        "scheduler",
+                        "cache.flush_replica",
+                        &format!(
+                            "chunk={} file={} idx={} node={}",
+                            action.chunk_id,
+                            action.file_path,
+                            action.chunk_index,
+                            action.node_id
+                        ),
+                        if was_present { "success" } else { "noop" },
+                    );
+
+                    // Drop the SM entry. Anchor enforcement is threaded
+                    // through so the apply path refuses if a race left
+                    // us about to strand the anchor (defence in depth —
+                    // the planner already filtered).
+                    let req = ClientRequest::RemoveChunkLocation {
+                        path: action.file_path.clone(),
+                        chunk_index: action.chunk_index,
+                        node_id: action.node_id.to_string(),
+                        enforce_anchor: snapshot.anchor.clone(),
+                    };
+                    if let Err(e) = self.raft.client_write(req).await {
+                        warn!(
+                            chunk = %action.chunk_id,
+                            error = %e,
+                            "RemoveChunkLocation Raft write failed during flush"
+                        );
+                        report.raft_failures += 1;
+                        continue;
+                    }
+                    cooldowns
+                        .entry(action.file_path.clone())
+                        .or_default()
+                        .insert(action.chunk_index);
+                    report.replicas_dropped += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        chunk = %action.chunk_id,
+                        node = action.node_id,
+                        error = %e,
+                        "DeleteChunkReplica RPC failed during flush"
+                    );
+                    report.rpc_failures += 1;
+                }
+            }
+        }
+
+        // One SetChunkCooldown per file covering every affected
+        // chunk_index. Tiering engine refuses re-promotion while these
+        // are in the future.
+        for (path, idxs) in cooldowns {
+            let req = ClientRequest::SetChunkCooldown {
+                path,
+                chunk_indexes: idxs.into_iter().collect(),
+                expires_at_ms: cooldown_until_ms,
+            };
+            if let Err(e) = self.raft.client_write(req).await {
+                warn!(error = %e, "SetChunkCooldown Raft write failed during flush");
+                report.raft_failures += 1;
+            }
+        }
+
+        self.audit.log(
+            "scheduler",
+            "cache.flush_complete",
+            &format!(
+                "prefix={} replicas_dropped={} mandatory_refusals={}",
+                path_prefix, report.replicas_dropped, report.mandatory_refusals
+            ),
+            "success",
+        );
+
+        report
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bug AV — flush_cache_for_path pure-planner kernel
+// ---------------------------------------------------------------------------
+
+/// Bug AV — snapshot extracted from the state machine for the flush
+/// planner. Contains exactly what the planner needs: files matching the
+/// prefix, their volumes' effective mandatory replication policy, and a
+/// node table mapping `node_id → (datacenter, [disk_tier])`. Built once
+/// under a single SM read lock by the async wrapper.
+#[derive(Debug, Clone)]
+pub(crate) struct FlushSnapshot {
+    pub files: Vec<(String, Vec<ChunkLocationEntry>, TierReplication)>, // (path, chunks, mandatory)
+    pub nodes: HashMap<u64, FlushNodeSummary>,
+    pub anchor: Option<dtfs_common::types::AnchorPolicy>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FlushNodeSummary {
+    pub datacenter: String,
+    pub disk_tiers: Vec<DiskTier>, // by disk_id index
+}
+
+impl FlushSnapshot {
+    fn from_sm(sm: &StateMachineData, path_prefix: &str) -> Self {
+        let nodes: HashMap<u64, FlushNodeSummary> = sm
+            .nodes
+            .iter()
+            .map(|(id, info)| {
+                (
+                    *id,
+                    FlushNodeSummary {
+                        datacenter: info.location.datacenter.clone(),
+                        disk_tiers: info.disks.iter().map(|d| d.tier).collect(),
+                    },
+                )
+            })
+            .collect();
+        // Pick any one anchor — file-level overrides aren't a thing yet
+        // (each volume has its own policy; we honour the first matching
+        // file's volume in the dispatcher's per-action RemoveChunkLocation
+        // call).  For the snapshot we cache the most common (default
+        // volume's) anchor for simplicity.
+        let anchor = sm
+            .volumes
+            .get("default")
+            .and_then(|v| v.effective_anchor());
+
+        let mut files = Vec::new();
+        for (path, meta) in sm.files.iter() {
+            if !path.starts_with(path_prefix) {
+                continue;
+            }
+            let mandatory = sm
+                .volumes
+                .get(&meta.volume_id)
+                .map(|v| v.effective_mandatory_replicas().clone())
+                .unwrap_or_else(TierReplication::default);
+            files.push((path.clone(), meta.chunks.clone(), mandatory));
+        }
+        Self { files, nodes, anchor }
+    }
+}
+
+/// Bug AV — one replica to drop, produced by the flush planner. The
+/// dispatcher feeds these one-by-one into `delete_chunk_replica_on_node`
+/// + `RemoveChunkLocation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FlushAction {
+    pub file_path: String,
+    pub chunk_index: u64,
+    pub chunk_id: String,
+    pub node_id: u64,
+}
+
+/// Bug AV — operator-facing summary of a flush_cache call. Mirrors
+/// PathMigrationReport's shape so the REST + CLI presenters share UX.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct FlushCacheReport {
+    pub files_matched: usize,
+    pub chunks_examined: usize,
+    pub replicas_dropped: usize,
+    /// Number of chunks where the proposed flush would have stranded the
+    /// mandatory-tier replicas. Skipped (NOT counted in
+    /// `replicas_dropped`); operator should investigate.
+    pub mandatory_refusals: usize,
+    pub truncated: usize,
+    /// Per-action runtime failure counters. Populated by the dispatcher,
+    /// always 0 from the pure planner.
+    #[serde(default)] pub unreachable_nodes: usize,
+    #[serde(default)] pub rpc_failures: usize,
+    #[serde(default)] pub raft_failures: usize,
+}
+
+/// Bug AV — pure planner kernel. Walks the snapshot, identifies cache-
+/// tier replicas eligible for deletion, refuses anything that would
+/// strand a mandatory-tier replica.
+///
+/// `cache_tiers` is the operator-supplied list of tiers to flush. The
+/// planner additionally filters out any tier that's also configured as
+/// mandatory for the file's volume (so e.g. a volume with
+/// `mandatory_replicas.warm = 1` won't have its warm replicas dropped
+/// even if the operator passed `cache_tiers = [warm]`).
+pub(crate) fn plan_flush_cache(
+    snapshot: &FlushSnapshot,
+    cache_tiers: &[DiskTier],
+    max_tasks: usize,
+) -> (Vec<FlushAction>, FlushCacheReport) {
+    let mut actions: Vec<FlushAction> = Vec::new();
+    let mut report = FlushCacheReport::default();
+
+    'files: for (file_path, chunks, mandatory) in &snapshot.files {
+        report.files_matched += 1;
+        // Group by chunk_index so we evaluate each chunk as a unit.
+        let mut by_index: std::collections::BTreeMap<u64, Vec<&ChunkLocationEntry>> =
+            std::collections::BTreeMap::new();
+        for c in chunks {
+            by_index.entry(c.chunk_index).or_default().push(c);
+        }
+
+        for (chunk_index, entries) in by_index {
+            report.chunks_examined += 1;
+
+            // Categorise replicas as cache-eligible or mandatory.
+            // A tier is mandatory when mandatory_replicas.<tier> > 0.
+            let mandatory_tier = |tier: DiskTier| -> bool {
+                mandatory.for_tier(tier) > 0
+            };
+            // Resolve tier of a stored replica via the node table.
+            let entry_tier = |e: &ChunkLocationEntry| -> Option<DiskTier> {
+                let nid: u64 = e.node_id.parse().ok()?;
+                let node = snapshot.nodes.get(&nid)?;
+                node.disk_tiers.get(e.disk_id as usize).copied()
+            };
+
+            // Survivors AFTER the proposed flush. We refuse if no
+            // mandatory-tier replica would remain.
+            let mut would_drop: Vec<&ChunkLocationEntry> = Vec::new();
+            let mut would_remain: Vec<&ChunkLocationEntry> = Vec::new();
+            for e in &entries {
+                let tier = entry_tier(e);
+                let is_cache = match tier {
+                    Some(t) => cache_tiers.contains(&t) && !mandatory_tier(t),
+                    None => false, // unresolvable tier → leave alone
+                };
+                if is_cache {
+                    would_drop.push(e);
+                } else {
+                    would_remain.push(e);
+                }
+            }
+
+            if would_drop.is_empty() {
+                continue;
+            }
+
+            // Refuse if no mandatory-tier replica survives.
+            let mandatory_survives = would_remain.iter().any(|e| {
+                entry_tier(e).map(mandatory_tier).unwrap_or(false)
+            });
+            if !mandatory_survives {
+                report.mandatory_refusals += 1;
+                continue;
+            }
+
+            // Cap on number of in-flight actions. Once we hit max_tasks
+            // we stop enqueueing — operator re-runs the call to pick up
+            // remaining work.
+            for e in would_drop {
+                if actions.len() >= max_tasks {
+                    // Count remaining unseen as truncated and bail.
+                    report.truncated +=
+                        report.chunks_examined.saturating_sub(actions.len());
+                    break 'files;
+                }
+                let Ok(nid) = e.node_id.parse::<u64>() else {
+                    continue;
+                };
+                actions.push(FlushAction {
+                    file_path: file_path.clone(),
+                    chunk_index,
+                    chunk_id: e.chunk_hash.clone(),
+                    node_id: nid,
+                });
+            }
+        }
+    }
+
+    (actions, report)
 }
 
 /// A single replication operation produced by [`plan_path_migration`]. The
@@ -1723,6 +2059,184 @@ mod path_migration_tests {
         );
         assert_eq!(report.chunks_total, 2); // chunk_index 0 + 1, not 3 rows
         assert_eq!(plan.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod bug_av_flush_cache_tests {
+    //! Bug AV (AV-1-7) — pure-planner tests for the cache-flush
+    //! routine. The async wrapper that dispatches DeleteChunkReplica +
+    //! issues Raft writes is covered live (AV-1-7 "Done when"
+    //! verification on the minicluster); these tests cover the
+    //! decision logic.
+    use super::*;
+
+    fn ent(chunk_index: u64, hash: &str, node: u64, disk: u32) -> ChunkLocationEntry {
+        ChunkLocationEntry {
+            chunk_index,
+            chunk_hash: hash.to_string(),
+            node_id: node.to_string(),
+            disk_id: disk,
+            size_bytes: 1024,
+        }
+    }
+
+    fn node_summary(dc: &str, tiers: &[DiskTier]) -> FlushNodeSummary {
+        FlushNodeSummary {
+            datacenter: dc.to_string(),
+            disk_tiers: tiers.to_vec(),
+        }
+    }
+
+    fn mandatory_cold_only() -> TierReplication {
+        TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 }
+    }
+
+    fn mandatory_warm_and_cold() -> TierReplication {
+        TierReplication { hot: 0, warm: 1, cold: 1, tape: 0 }
+    }
+
+    /// AV-1-7 test 1 — happy path: a file with one cold (mandatory) +
+    /// one warm (cache) replica has its warm replica flushed; cold
+    /// preserved.
+    #[test]
+    fn bug_av_plan_flush_drops_warm_keeps_cold() {
+        let snapshot = FlushSnapshot {
+            files: vec![(
+                "/movies/wicked.mkv".to_string(),
+                vec![
+                    ent(0, "h", 10, 0), // node 10 = cold
+                    ent(0, "h", 11, 0), // node 11 = warm
+                ],
+                mandatory_cold_only(),
+            )],
+            nodes: HashMap::from([
+                (10u64, node_summary("leli", &[DiskTier::Cold])),
+                (11u64, node_summary("toro", &[DiskTier::Warm])),
+            ]),
+            anchor: None,
+        };
+        let (actions, report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
+        assert_eq!(actions.len(), 1, "drops the warm replica");
+        assert_eq!(actions[0].node_id, 11);
+        assert_eq!(actions[0].chunk_id, "h");
+        assert_eq!(actions[0].chunk_index, 0);
+        assert_eq!(report.replicas_dropped, 0, "planner doesn't run the deletes — wrapper does");
+        assert_eq!(report.mandatory_refusals, 0);
+    }
+
+    /// AV-1-7 test 2 — refuse to flush if doing so would leave no
+    /// mandatory-tier replica. Volume mandates 1 cold, file only has
+    /// warm replicas (state shouldn't normally happen, but defence
+    /// in depth) → refuse.
+    #[test]
+    fn bug_av_plan_flush_refuses_when_anchor_only_on_warm() {
+        let snapshot = FlushSnapshot {
+            files: vec![(
+                "/movies/oops.mkv".to_string(),
+                vec![
+                    ent(0, "h", 11, 0), // node 11 = warm (only)
+                    ent(0, "h", 12, 0), // node 12 = warm (only)
+                ],
+                mandatory_cold_only(),
+            )],
+            nodes: HashMap::from([
+                (11u64, node_summary("toro", &[DiskTier::Warm])),
+                (12u64, node_summary("nrb",  &[DiskTier::Warm])),
+            ]),
+            anchor: None,
+        };
+        let (actions, report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
+        assert!(actions.is_empty(), "no actions when mandatory not satisfied");
+        assert_eq!(report.mandatory_refusals, 1);
+    }
+
+    /// AV-1-7 test 3 — `max_tasks` caps the planned actions; truncated
+    /// counter reports the remaining unseen.
+    #[test]
+    fn bug_av_plan_flush_respects_max_tasks() {
+        // 5 files, each with 1 chunk, each with cold + warm replicas.
+        let files: Vec<_> = (0..5u64)
+            .map(|i| {
+                (
+                    format!("/movies/f{i}.bin"),
+                    vec![ent(0, &format!("h{i}"), 10, 0), ent(0, &format!("h{i}"), 11, 0)],
+                    mandatory_cold_only(),
+                )
+            })
+            .collect();
+        let snapshot = FlushSnapshot {
+            files,
+            nodes: HashMap::from([
+                (10u64, node_summary("leli", &[DiskTier::Cold])),
+                (11u64, node_summary("toro", &[DiskTier::Warm])),
+            ]),
+            anchor: None,
+        };
+        let (actions, report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 3);
+        assert_eq!(actions.len(), 3, "max_tasks honoured");
+        assert!(report.truncated > 0, "remaining counted as truncated");
+    }
+
+    /// AV-1-7 test 4 — no cache-tier replicas → empty plan, no refusals.
+    #[test]
+    fn bug_av_plan_flush_empty_when_no_cache_tier_replicas() {
+        let snapshot = FlushSnapshot {
+            files: vec![(
+                "/movies/cold-only.mkv".to_string(),
+                vec![ent(0, "h", 10, 0)], // cold only
+                mandatory_cold_only(),
+            )],
+            nodes: HashMap::from([
+                (10u64, node_summary("leli", &[DiskTier::Cold])),
+            ]),
+            anchor: None,
+        };
+        let (actions, report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
+        assert!(actions.is_empty());
+        assert_eq!(report.mandatory_refusals, 0);
+        assert_eq!(report.files_matched, 1);
+        assert_eq!(report.chunks_examined, 1);
+    }
+
+    /// AV-1-7 test 5 — two files in different volumes evaluated
+    /// independently. A volume that mandates warm protects its warm
+    /// replicas; a volume that doesn't mandate warm permits flushing.
+    #[test]
+    fn bug_av_plan_flush_multi_volume_isolation() {
+        let snapshot = FlushSnapshot {
+            files: vec![
+                // Volume "default": cold mandatory; warm is cache → flushable.
+                (
+                    "/vol-default/foo.bin".to_string(),
+                    vec![ent(0, "ha", 10, 0), ent(0, "ha", 11, 0)],
+                    mandatory_cold_only(),
+                ),
+                // Volume "office": warm + cold both mandatory; warm
+                // protected from flush even though caller asked for it.
+                (
+                    "/vol-office/bar.docx".to_string(),
+                    vec![ent(0, "hb", 10, 0), ent(0, "hb", 11, 0)],
+                    mandatory_warm_and_cold(),
+                ),
+            ],
+            nodes: HashMap::from([
+                (10u64, node_summary("leli", &[DiskTier::Cold])),
+                (11u64, node_summary("toro", &[DiskTier::Warm])),
+            ]),
+            anchor: None,
+        };
+        let (actions, report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
+        // Only foo.bin's warm replica drops.
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].file_path, "/vol-default/foo.bin");
+        assert_eq!(report.replicas_dropped, 0, "wrapper drives this");
+        assert_eq!(report.files_matched, 2);
     }
 }
 

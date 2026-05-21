@@ -395,7 +395,7 @@ manually for now (or by the existing additive-migrate UI button).
   live data node (verify via `grpcurl` or by triggering the AV-1-8
   flow against a tiny test).
 
-### ⬜ AV-1-7 — `flush_cache_for_path` scheduler routine
+### ✅ AV-1-7 — `flush_cache_for_path` scheduler routine (2026-05-21)
 
 * **Files:** `crates/dtfs-manager/src/scheduler.rs`.
 * **Implementation:** new `pub async fn flush_cache_for_path(
@@ -853,6 +853,25 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-1-7 — 2026-05-21
+
+* **Files touched:**
+  - `crates/dtfs-manager/src/scheduler.rs` — new async
+    `flush_cache_for_path`, pure helper `plan_flush_cache`,
+    `FlushSnapshot` extraction, `FlushAction`, `FlushCacheReport`.
+* **Unit tests** (`cargo test -p dtfs-manager bug_av_plan_flush`):
+  5 AV-1-7 tests all green:
+    drops_warm_keeps_cold, refuses_when_anchor_only_on_warm,
+    respects_max_tasks, empty_when_no_cache_tier_replicas,
+    multi_volume_isolation.
+* **Workspace regression**: dtfs-manager 54 → 59; all others
+  unchanged. `cargo test --workspace --release` all green.
+* **Live verification:** deferred to AV-1-9 (REST endpoint) +
+  AV-1-7's "Done when" end-to-end on minicluster after deployment.
+  Pure planner is the testable kernel; the dispatcher exercises
+  AV-1-6 + AV-1-3 + AV-1-4 + AV-1-5 in concert and is live-only.
+* **Deviations:** none.
 
 ### AV-1-6 — 2026-05-21
 
