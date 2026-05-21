@@ -390,21 +390,109 @@ impl TieringEngine {
             );
         }
 
-        // -- Dispatch demotions: AV-2-5 will wire the
-        // `SetChunkCooldown` clear-on-demote. For now we audit and
-        // call the scheduler's existing flush primitives. Actual
-        // delete RPC + RemoveChunkLocation Raft write is folded
-        // into AV-2-5's tighter integration.
+        // -- AV-2-5 — Dispatch demotions: DeleteChunkReplica RPC →
+        // RemoveChunkLocation Raft write → conditional cooldown
+        // clear. The conditional check (`should_clear_cooldown_on_
+        // demote`) honours an operator flush whose cooldown is
+        // still in the future.
         for d in &plan.demotions {
-            self.audit.log(
-                "tiering",
-                "cache.demote",
-                &format!(
-                    "chunk={} file={} idx={} node={} tier={:?}",
-                    d.chunk_id, d.file_path, d.chunk_index, d.node_id, d.tier
-                ),
-                d.reason,
-            );
+            // 1. Resolve the data-node's gRPC address.
+            let node_addr = match self.scheduler.node_grpc_addr(d.node_id).await {
+                Some(addr) => addr,
+                None => {
+                    warn!(
+                        chunk = %d.chunk_id,
+                        node = d.node_id,
+                        "Bug AV demote: node unreachable, skipping"
+                    );
+                    self.audit.log(
+                        "tiering",
+                        "cache.demote",
+                        &format!(
+                            "chunk={} file={} idx={} node={} tier={:?}",
+                            d.chunk_id, d.file_path, d.chunk_index, d.node_id, d.tier
+                        ),
+                        "skipped_unreachable",
+                    );
+                    continue;
+                }
+            };
+
+            // 2. DeleteChunkReplica RPC (idempotent shape from
+            //    AV-1-5: returns was_present + freed_bytes).
+            match self
+                .scheduler
+                .delete_chunk_replica_on_node(&node_addr, &d.chunk_id)
+                .await
+            {
+                Ok((was_present, _freed)) => {
+                    self.audit.log(
+                        "tiering",
+                        "cache.demote",
+                        &format!(
+                            "chunk={} file={} idx={} node={} tier={:?}",
+                            d.chunk_id, d.file_path, d.chunk_index, d.node_id, d.tier
+                        ),
+                        if was_present { d.reason } else { "noop_already_absent" },
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        chunk = %d.chunk_id,
+                        node = d.node_id,
+                        error = %e,
+                        "Bug AV demote: DeleteChunkReplica failed"
+                    );
+                    self.audit.log(
+                        "tiering",
+                        "cache.demote",
+                        &format!(
+                            "chunk={} file={} idx={} node={} tier={:?} err={}",
+                            d.chunk_id, d.file_path, d.chunk_index, d.node_id, d.tier, e
+                        ),
+                        "rpc_failed",
+                    );
+                    continue;
+                }
+            };
+
+            // 3. RemoveChunkLocation Raft write so the SM no longer
+            //    lists this replica.
+            let remove_req = dtfs_raft::ClientRequest::RemoveChunkLocation {
+                path: d.file_path.clone(),
+                chunk_index: d.chunk_index,
+                node_id: d.node_id.to_string(),
+                // AV-2-4 ensures the planner only demotes when
+                // anchor survives, but pass the policy through so
+                // the apply path's defence-in-depth check confirms.
+                enforce_anchor: None,
+            };
+            if let Err(e) = self.scheduler.raft().client_write(remove_req).await {
+                warn!(
+                    chunk = %d.chunk_id,
+                    error = %e,
+                    "Bug AV demote: RemoveChunkLocation Raft write failed"
+                );
+                continue;
+            }
+
+            // 4. Conditional cooldown clear. Only fire when the
+            //    pre-demote cooldown was 0 or in the past — never
+            //    overwrite an active operator flush.
+            if should_clear_cooldown_on_demote(d.cooldown_until_ms_at_snapshot, now_ms) {
+                let clear_req = dtfs_raft::ClientRequest::SetChunkCooldown {
+                    path: d.file_path.clone(),
+                    chunk_indexes: vec![d.chunk_index],
+                    expires_at_ms: 0,
+                };
+                if let Err(e) = self.scheduler.raft().client_write(clear_req).await {
+                    warn!(
+                        chunk = %d.chunk_id,
+                        error = %e,
+                        "Bug AV demote: SetChunkCooldown(0) clear failed"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1026,6 +1114,13 @@ pub(crate) struct TickDemotion {
     pub node_id: u64,
     pub tier: DiskTier,
     pub reason: &'static str,
+    /// AV-2-5 — the chunk's cooldown timestamp as observed in the
+    /// planner snapshot. The dispatcher passes this through
+    /// `should_clear_cooldown_on_demote` to decide whether the
+    /// engine-driven demote should clear an existing entry (idle
+    /// demote → clear so the next read re-promotes immediately;
+    /// operator flush cooldown still active → leave alone).
+    pub cooldown_until_ms_at_snapshot: u64,
 }
 
 /// AV-2-4 — output of the planner. Wrapped in a struct so the
@@ -1306,8 +1401,41 @@ fn plan_chunk_demotions(
             node_id: placement.node_id,
             tier: placement.tier,
             reason: "idle_window",
+            cooldown_until_ms_at_snapshot: chunk.cooldown_until_ms,
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bug AV (AV-2-5) — cooldown clearance on engine-driven demote
+// ---------------------------------------------------------------------------
+
+/// AV-2-5 pure kernel — decide whether an engine-driven demote
+/// should clear the chunk's cooldown entry.
+///
+/// Engine-driven demotion happens when a cache replica has 0 reads
+/// in the volume's `promote_window_secs`. If the operator flushed
+/// the chunk recently, the cooldown will be in the future (set to
+/// `now + cooldown_secs`) — we MUST leave that alone so the
+/// operator's "no immediate re-promotion" intent is respected.
+///
+/// Returns `true` when the engine should issue
+/// `SetChunkCooldown { expires_at_ms: 0 }` (which the state-
+/// machine apply path treats as "remove the entry"). Returns
+/// `false` when the existing cooldown is in the future and the
+/// engine should leave it alone.
+///
+/// `cooldown_until_ms == 0` (no entry) returns `true` so the
+/// engine issues the Raft write anyway — it's a no-op on an absent
+/// entry, idempotent, and keeps the dispatcher branch-free.
+pub(crate) fn should_clear_cooldown_on_demote(
+    cooldown_until_ms: u64,
+    now_ms: u64,
+) -> bool {
+    // Past or absent cooldown → safe to clear (idempotent on absent).
+    // Future cooldown → operator flush still active; engine must
+    // respect it.
+    cooldown_until_ms <= now_ms
 }
 
 #[cfg(test)]
@@ -1835,6 +1963,69 @@ mod bug_av_tiering_tick_tests {
             plan.promotions.is_empty(),
             "with ENABLE_CACHE_REDUNDANCY_ESCALATION = false, a 2nd warm replica must not be scheduled"
         );
+    }
+
+    /// AV-2-5 test 1 — engine-driven demote of an idle cache
+    /// replica clears the cooldown entry so a subsequent read can
+    /// re-promote immediately. `should_clear_cooldown_on_demote`
+    /// returns `true` for past or absent cooldowns.
+    #[test]
+    fn bug_av_demote_clears_cooldown() {
+        // 0 → no cooldown active; clearing is idempotent.
+        assert!(should_clear_cooldown_on_demote(0, 1_000_000));
+        // Past cooldown (operator flushed long ago, cooldown has
+        // since expired). Clear to remove the stale entry.
+        assert!(should_clear_cooldown_on_demote(900_000, 1_000_000));
+        // Exactly equal — treat as past (use `<=`).
+        assert!(should_clear_cooldown_on_demote(1_000_000, 1_000_000));
+    }
+
+    /// AV-2-5 test 2 — when the operator flushed recently and the
+    /// cooldown is still in the future, the engine-driven demote
+    /// must NOT clear it. The operator's "no immediate re-promote"
+    /// intent wins.
+    #[test]
+    fn bug_av_demote_does_not_clear_future_operator_cooldown() {
+        // Cooldown set to expire 100 ms in the future.
+        assert!(!should_clear_cooldown_on_demote(1_000_100, 1_000_000));
+        // Far-future cooldown (operator just flushed; 5-min wait).
+        assert!(!should_clear_cooldown_on_demote(1_000_000 + 5 * 60 * 1_000, 1_000_000));
+    }
+
+    /// AV-2-5 defensive — the planner now passes the snapshot
+    /// cooldown through to TickDemotion so the dispatcher can call
+    /// `should_clear_cooldown_on_demote` without re-fetching the
+    /// SM. Guard against future refactors that strip this field.
+    #[test]
+    fn bug_av_demote_carries_cooldown_through_planner() {
+        let reads: HashMap<String, u32> = HashMap::new();
+        let snapshot = TickSnapshot {
+            chunks: vec![TickChunk {
+                chunk_id: "h0".to_string(),
+                chunk_index: 0,
+                file_path: "/movies/x.mkv".to_string(),
+                volume_id: "default".to_string(),
+                placements: vec![
+                    TickPlacement { node_id: 10, dc: "leli".into(), tier: DiskTier::Cold },
+                    TickPlacement { node_id: 11, dc: "toro".into(), tier: DiskTier::Warm },
+                ],
+                cooldown_until_ms: 1_500_000, // future operator cooldown
+                reads_in_window_by_dc: reads,
+            }],
+            nodes: vec![node(11, "toro", 500_000, true)],
+            volumes: vols(plex_policy()),
+        };
+        let plan = plan_cache_tick(&snapshot, 1_000_000);
+        assert_eq!(plan.demotions.len(), 1);
+        assert_eq!(
+            plan.demotions[0].cooldown_until_ms_at_snapshot, 1_500_000,
+            "TickDemotion must carry the snapshot cooldown through"
+        );
+        // And the dispatcher would correctly decide NOT to clear it.
+        assert!(!should_clear_cooldown_on_demote(
+            plan.demotions[0].cooldown_until_ms_at_snapshot,
+            1_000_000
+        ));
     }
 
     /// AV-2-4 defensive — when `per_dc = false`, a single global

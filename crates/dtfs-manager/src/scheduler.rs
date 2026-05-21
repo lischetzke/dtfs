@@ -769,9 +769,20 @@ impl TaskScheduler {
     // -----------------------------------------------------------------------
 
     /// Look up the gRPC address of a node from the Raft state machine.
-    async fn node_grpc_addr(&self, node_id: u64) -> Option<String> {
+    pub(crate) async fn node_grpc_addr(&self, node_id: u64) -> Option<String> {
         let sm = self.state_data.read().await;
         sm.nodes.get(&node_id).map(|info| info.grpc_addr.clone())
+    }
+
+    /// AV-2-5 — expose the Raft handle so the tiering engine (which
+    /// owns a reference to the scheduler) can propose
+    /// `RemoveChunkLocation` + `SetChunkCooldown` for engine-driven
+    /// demotions. This mirrors the established API surface used by
+    /// the manager's REST handlers — the alternative (mirror each
+    /// Raft request shape as a scheduler method) would just bloat
+    /// the surface without adding safety.
+    pub(crate) fn raft(&self) -> &std::sync::Arc<DtfsRaft> {
+        &self.raft
     }
 
     /// Pick any healthy node that currently has a copy of `chunk_id`,
@@ -873,7 +884,7 @@ impl TaskScheduler {
     /// idempotent delete (AV-1-5). A `was_present == false` is a
     /// normal no-op (retry, or chunk never landed on this node) and
     /// must NOT be treated as an error.
-    async fn delete_chunk_replica_on_node(
+    pub(crate) async fn delete_chunk_replica_on_node(
         &self,
         node_addr: &str,
         chunk_id: &str,
