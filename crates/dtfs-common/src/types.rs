@@ -249,7 +249,7 @@ impl Default for TierReplication {
 // by `CacheReplication` below — per-DC `(min, max)` caps with a promotion
 // trigger and a flush cooldown.
 //
-// See: tests/proxmox/PLAN-BUG-AV-TIER-LIFECYCLE.md for the full design.
+// See: plans/active/PLAN-BUG-AV-TIER-LIFECYCLE.md for the full design.
 // ---------------------------------------------------------------------------
 
 /// Bug AV — per-tier cache configuration. `min` is the per-DC promotion

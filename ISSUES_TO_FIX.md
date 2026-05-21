@@ -1,4 +1,4 @@
-# Issues to Fix — DTFS2
+# Issues to Fix — DTFS
 
 This document tracks gaps and bugs. **Status** reflects the codebase after the latest fixes (see git history). Build validation: **`cargo build` in WSL** (Linux target).
 

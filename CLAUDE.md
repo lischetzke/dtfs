@@ -1,6 +1,6 @@
-# CLAUDE.md — Operating Guide for AI Coding Agents on DTFS2
+# CLAUDE.md — Operating Guide for AI Coding Agents on DTFS
 
-You are working on **DTFS2**, a Raft-managed tiered distributed filesystem
+You are working on **DTFS**, a Raft-managed tiered distributed filesystem
 written in Rust. Read this file fully before any non-trivial work.
 This document is the canonical contract: keep it accurate and update it
 whenever you change behaviour, conventions, or the target workload.
@@ -9,7 +9,7 @@ whenever you change behaviour, conventions, or the target workload.
 
 ## 1. Mission & Target Workload
 
-DTFS2 exists to serve **a single household-scale Plex media library
+DTFS exists to serve **a single household-scale Plex media library
 across multiple datacenters with asymmetric bandwidth**. Every design
 decision is anchored to this scenario.
 
@@ -348,7 +348,7 @@ scrub path. Mark each item as "Verified by <test name>" in the PR.
 ## 8. When You Encounter a Bug
 
 1. Reproduce on the lab (or pure unit test if the bug surface allows).
-2. Open `tests/proxmox/SOAK-RECOVERY-YYYY-MM-DD.md` (latest) — if
+2. Open `plans/incidents/SOAK-RECOVERY-YYYY-MM-DD.md` (latest) — if
    the bug looks like one of the catalogued A–J, your fix probably
    has a regression test already; extend it rather than starting
    fresh.
@@ -405,8 +405,11 @@ heartbeats fail under jitter and the cluster can't elect a leader).
 - `crates/dtfs-fuse/src/fuse_adapter.rs` — fuse3 trait
   implementation. **Cookie scheme** for readdir/readdirplus lives at
   `dir_entry_cookie()` — DO NOT diverge the two paths (Bug F).
-- `tests/proxmox/SOAK-RECOVERY-2026-05-18.md` — current bug catalog
-  + verification log.
+- `plans/incidents/SOAK-RECOVERY-2026-05-18.md` — current bug
+  catalog + verification log.
+- `plans/active/` — in-flight plans; `plans/incidents/` and
+  `plans/reports/` for archived material. See
+  [`plans/README.md`](./plans/README.md).
 - `tests/proxmox/abuse/` — shell regression tests (numbered).
 
 ---

@@ -256,7 +256,7 @@ impl StateMachineData {
     ///
     /// `prefix_path` is the directory path with or without a trailing slash;
     /// the helper normalises it. Three behaviours that fix Bug E from
-    /// `tests/proxmox/SOAK-RECOVERY-2026-05-18.md`:
+    /// `plans/incidents/SOAK-RECOVERY-2026-05-18.md`:
     ///
     /// 1. If both an explicit mkdir entry (`/foo`) AND child files
     ///    (`/foo/bar.mkv`) exist, the returned entry is always reported as
@@ -346,7 +346,7 @@ impl StateMachineData {
     /// This is the canonical "does this path exist for posix purposes"
     /// helper — used by the manager's `get_file_locations` handler and
     /// the rest of the metadata RPCs to fix bugs A and B from
-    /// `tests/proxmox/SOAK-RECOVERY-2026-05-18.md`.
+    /// `plans/incidents/SOAK-RECOVERY-2026-05-18.md`.
     pub fn lookup_path(&self, path: &str) -> Option<FileMetadata> {
         // 1. Direct hit.
         if let Some(meta) = self.files.get(path) {
@@ -1698,7 +1698,7 @@ mod snapshot_persistence_tests {
 
 // ---------------------------------------------------------------------------
 // Regression tests for three live-lab bugs uncovered during the 2026-05-18
-// soak recovery (see tests/proxmox/SOAK-RECOVERY-2026-05-18.md):
+// soak recovery (see plans/incidents/SOAK-RECOVERY-2026-05-18.md):
 //
 //   Bug A — empty `mkdir` doesn't persist as a lookup-able directory. FUSE
 //           sends `CreateFile("/foo/")` (with a trailing slash to signal
