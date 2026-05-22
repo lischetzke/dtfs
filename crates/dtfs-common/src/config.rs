@@ -342,6 +342,16 @@ pub struct TieringConfig {
     pub migration_bandwidth_limit_mbps: u32,
     #[serde(default = "default_tiering_interval")]
     pub evaluation_interval_secs: u64,
+    /// Bug AV (AV-4-5) — opt-in for the cache-tier redundancy
+    /// escalation pass. When `false` (default) the cache planner
+    /// caps each `(chunk, dc, tier)` group at `cache_replicas.<t>.min`
+    /// replicas. When `true` the planner may ramp toward
+    /// `cache_replicas.<t>.max` once the read count is at least
+    /// `2 * promote_reads` — useful for per-DC HA when warm capacity
+    /// exists. Defaults to `false` so legacy configs keep current
+    /// behaviour.
+    #[serde(default)]
+    pub enable_cache_redundancy_escalation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

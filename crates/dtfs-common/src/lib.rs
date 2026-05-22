@@ -6,6 +6,7 @@ pub mod hash_ring;
 pub mod reconfig;
 pub mod topology;
 pub mod types;
+pub mod version;
 
 /// Deterministic `u64` id from a hostname (data nodes, manager Raft peers).
 #[inline]

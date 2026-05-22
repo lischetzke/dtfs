@@ -155,6 +155,25 @@ pub struct NodeInfo {
     /// the data-node process started.
     #[serde(default)]
     pub total_bytes_written: u64,
+    /// Bug AX — peer IP captured at RegisterNode time. Populated only for
+    /// clients (FUSE mounts) where `grpc_addr` is intentionally empty
+    /// (Bug AA — clients run no gRPC listener) and the operator still
+    /// needs to see *where* the mount is talking from. Data / manager
+    /// nodes carry their IP inside `grpc_addr`, so this stays `None` for
+    /// them. `#[serde(default)]` keeps older snapshots loadable.
+    #[serde(default)]
+    pub client_ip: Option<String>,
+    /// Bug AY — binary version string this node reported at RegisterNode
+    /// time (e.g. `"v0.0.0-dev"`). Empty when the node pre-dates Bug AY.
+    /// `#[serde(default)]` keeps older snapshots loadable.
+    #[serde(default)]
+    pub version: String,
+    /// Bug AY — build date of the binary this node is running, format
+    /// `YYYYMMDD-HHmmss` (UTC, e.g. `"20260522-141034"`). Comes from
+    /// `dtfs_common::version::BUILD_DATE` baked in at compile time.
+    /// Empty when the node pre-dates Bug AY.
+    #[serde(default)]
+    pub build_date: String,
 }
 
 impl fmt::Display for NodeInfo {

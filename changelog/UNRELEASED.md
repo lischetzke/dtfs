@@ -15,7 +15,22 @@
 - _(none)_
 
 ## New Features
-- _(none yet)_
+- **Bug AV — two-class tier lifecycle (Phase 4 close-out).** Volumes
+  now declare separate `mandatory_replicas` (durability floor enforced
+  by the under-replication scheduler) and `cache_replicas`
+  (opportunistic, demand-driven, owned by the tiering engine). The
+  `GET /api/v1/volumes` list endpoint embeds the full per-volume
+  projection (AV-4-2); the WebUI Volumes page exposes inline policy
+  cards + an edit modal posting to `/set-cache` (AV-4-3 / AV-4-4);
+  the cache-tier redundancy-escalation pass that ramps toward `max`
+  is now an opt-in runtime flag `tiering.enable_cache_redundancy_
+  escalation` (AV-4-5, was compile-time const); and
+  `DeleteChunkReplica` is WAL-recoverable across crashes (AV-4-7).
+- The FUSE writer now propagates the manager-resolved tier through
+  every `put_chunk` RPC (AV-4-1d); previously it hardcoded `"hot"`
+  and silently landed chunks on the wrong tier whenever the
+  data-node's `select_disk_for_tier` fell back to the
+  "any-healthy-disk" path.
 
 ## Bug Fixes
 - _(none yet)_

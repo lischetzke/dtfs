@@ -36,8 +36,8 @@ Full table of contents: [`docs/src/SUMMARY.md`](docs/src/SUMMARY.md).
 - `plans/` — active plans, completed plans, incidents, reports (see [plans/README.md](plans/README.md))
 - `changelog/` — per-release changelog entries (see [changelog/README.md](changelog/README.md))
 - `tests/` — integration, chaos, performance, and lab harness
-- [`CLAUDE.md`](CLAUDE.md) — codebase-specific knowledge for agents (architecture, integrity invariants, memory model, bug catalog)
-- [`AGENTS.md`](AGENTS.md) — operating discipline for contributors and AI agents
+- [`AGENTS.md`](AGENTS.md) — canonical guide for contributors and AI agents (Part A: codebase knowledge — architecture, integrity invariants, memory model, bug catalog; Part B: operating discipline)
+- [`CLAUDE.md`](CLAUDE.md) — single-line `@AGENTS.md` import shim for Claude Code (do not add content here)
 
 The authoritative table of *where each kind of artefact lives* is in [AGENTS.md § Structure Discipline](AGENTS.md#structure-discipline). Read that before adding a file at a new path.
 
@@ -49,7 +49,7 @@ Contributions are welcome. **Every fix must come with a working test case that d
 2. Implement the fix.
 3. Verify the test now passes (and that existing tests still pass).
 
-Before any non-trivial change, read [AGENTS.md](AGENTS.md) (contributor and AI-agent operating discipline) and [CLAUDE.md](CLAUDE.md) (architecture, invariants, file map). For style, PR process, and where things live, see the [Contribution Guide](docs/src/development/contributing.md).
+Before any non-trivial change, read [AGENTS.md](AGENTS.md) — it is the single source of truth for both the codebase (Part A: architecture, invariants, file map) and the operating discipline (Part B: fixing procedure, plan-driven workflow, commit/test discipline). For style, PR process, and where things live, see the [Contribution Guide](docs/src/development/contributing.md).
 
 ## Use of AI
 

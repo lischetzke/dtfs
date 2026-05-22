@@ -19,7 +19,7 @@ dtfs_shape_iface: eth0
 dtfs_shape_ifb: ifb0
 
 # Ports exempted from shaping so management/Raft traffic isn't
-# bottlenecked. CLAUDE.md §9 lists the required exemptions explicitly:
+# bottlenecked. AGENTS.md § A.7 lists the required exemptions explicitly:
 # without exempting Raft ports, heartbeats are throttled by the shaped
 # link and the cluster suffers election storms (Bug Y, observed on
 # Plexmedia: all-LELI voters churn through 800+ Raft terms in minutes

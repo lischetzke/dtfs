@@ -31,6 +31,7 @@ Controls the cluster-wide automatic data tiering engine.
 | `tiering.frozen_threshold_days` | `u32` | `60` | 1--3650 | Days without access before data is reclassified as frozen. |
 | `tiering.migration_bandwidth_limit_mbps` | `u32` | `200` | 0--10000 | Maximum bandwidth in Mbps for tier migration traffic. `0` means unlimited. |
 | `tiering.evaluation_interval_secs` | `u64` | `3600` | 60--86400 | Seconds between tiering evaluation cycles. |
+| `tiering.enable_cache_redundancy_escalation` | `bool` | `false` | `true` or `false` | Bug AV (AV-4-5): opt-in for the cache-tier redundancy-escalation pass. When `true` the planner may ramp cache replicas past `cache_replicas.<tier>.min` toward `.max` for chunks with sustained read pressure (>= `2 * promote_reads`). Leave `false` unless per-DC HA on warm needs the extra copy. |
 
 ## Monitoring Settings
 

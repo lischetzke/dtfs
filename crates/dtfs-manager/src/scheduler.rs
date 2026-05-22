@@ -1237,24 +1237,16 @@ impl TaskScheduler {
                 })
             })
             .collect();
-        // Bug AM — most recently updated first, then by task_id ascending
-        // for stable ordering on refresh. The previous sort used only
-        // updated_at_ms which is shared by every task touched in the same
-        // 30s scheduler tick; HashMap iteration order then randomised the
-        // display each refresh and made the page unreadable when a burst
-        // of migrations all completed simultaneously.
-        out.sort_by(|a, b| {
-            let bts = b.get("updated_at_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-            let ats = a.get("updated_at_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-            bts.cmp(&ats).then_with(|| {
-                // task_id is "repl-<N>" — natural ordering on the trailing
-                // integer would be nicer but lexicographic is consistent
-                // and stable, which is all we need.
-                let aid = a.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                let bid = b.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                aid.cmp(bid)
-            })
-        });
+        // Bug AW — sort by created_at_ms (set-once) DESC, tiebreak by
+        // natural-numeric task_id ASC. Bug AM's earlier fix sorted on
+        // updated_at_ms, but that field is bumped on every scheduler
+        // tick for any task in flight, so running tasks shuffled position
+        // on each 5s WebUI refresh. created_at_ms is immutable after
+        // insertion → newest task on top, frozen position thereafter.
+        // Natural-numeric tiebreak ("repl-2" before "repl-10") replaces
+        // the lexicographic compare that put "repl-10" between "repl-1"
+        // and "repl-2".
+        sort_migration_snapshot(&mut out);
         out
     }
 
@@ -3054,5 +3046,156 @@ mod bug_ae_orphan_tests {
         assert!(!should_retain_task(MigrationStatus::Failed, stale_failed, now));
         // Copying + stale → retained; advance_tasks owns the fast-path.
         assert!(should_retain_task(MigrationStatus::Copying, stuck_copying, now));
+    }
+}
+
+/// Bug AW — split out the migration-snapshot sort comparator so we can
+/// unit-test it without spinning up a scheduler. Sorts in place by
+/// `created_at_ms` DESC (newest first, immutable after insertion)
+/// then by natural-numeric `task_id` ASC ("repl-2" before "repl-10").
+fn sort_migration_snapshot(out: &mut Vec<serde_json::Value>) {
+    out.sort_by(|a, b| {
+        let bts = b
+            .get("created_at_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let ats = a
+            .get("created_at_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        bts.cmp(&ats).then_with(|| {
+            let aid = a.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let bid = b.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            natural_task_id_cmp(aid, bid)
+        })
+    });
+}
+
+/// Compare two task IDs like "repl-<N>" by their trailing integer when
+/// both parse, otherwise fall back to lexicographic. Keeps a burst of
+/// 10+ tasks sorted as repl-1, repl-2, … repl-10 instead of
+/// repl-1, repl-10, repl-2, … (the prior lex compare).
+fn natural_task_id_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match (trailing_u64(a), trailing_u64(b)) {
+        (Some(an), Some(bn)) => an.cmp(&bn).then_with(|| a.cmp(b)),
+        _ => a.cmp(b),
+    }
+}
+
+fn trailing_u64(s: &str) -> Option<u64> {
+    let digits: String = s.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.chars().rev().collect::<String>().parse::<u64>().ok()
+}
+
+#[cfg(test)]
+mod bug_aw_migration_sort_tests {
+    //! Bug AW — Migrations page randomised row order on each 5s refresh.
+    //!
+    //! Symptom: operators watching the Migrations panel during a tier
+    //! storm saw rows leap around between refreshes, making the page
+    //! unreadable.
+    //!
+    //! Root cause: the snapshot sort keyed on `updated_at_ms`, which is
+    //! bumped on every scheduler tick for any task in flight. Two ticks
+    //! in different orders → two different sort orders.
+    //!
+    //! Fix: sort on `created_at_ms` (set once at insertion) DESC,
+    //! tiebreak with a natural-numeric `task_id` compare.
+    use super::*;
+    use serde_json::json;
+
+    fn t(task_id: &str, created: u64, updated: u64) -> serde_json::Value {
+        json!({
+            "task_id": task_id,
+            "created_at_ms": created,
+            "updated_at_ms": updated,
+        })
+    }
+
+    fn ids(v: &[serde_json::Value]) -> Vec<&str> {
+        v.iter()
+            .map(|x| x.get("task_id").and_then(|s| s.as_str()).unwrap_or(""))
+            .collect()
+    }
+
+    /// Two scheduler ticks bump `updated_at_ms` in different orders;
+    /// the pre-fix sort would flip the rows. With the fix, ordering
+    /// is anchored to `created_at_ms` and is stable.
+    #[test]
+    fn bug_aw_running_tasks_dont_reshuffle() {
+        // Tick 1: repl-1 was updated last.
+        let mut tick1 = vec![
+            t("repl-1", 1_000, 5_000),
+            t("repl-2", 2_000, 4_000),
+            t("repl-3", 3_000, 3_000),
+        ];
+        sort_migration_snapshot(&mut tick1);
+
+        // Tick 2: same three tasks, scheduler touched repl-2 last
+        // (different updated_at_ms ordering), creation order unchanged.
+        let mut tick2 = vec![
+            t("repl-1", 1_000, 6_000),
+            t("repl-2", 2_000, 9_000),
+            t("repl-3", 3_000, 7_000),
+        ];
+        sort_migration_snapshot(&mut tick2);
+
+        // Bug AW: order is identical between ticks regardless of how
+        // updated_at_ms shifted.
+        assert_eq!(ids(&tick1), ids(&tick2));
+        // And newest-created is on top.
+        assert_eq!(ids(&tick1), vec!["repl-3", "repl-2", "repl-1"]);
+    }
+
+    /// Natural numeric tiebreak: a burst of >=10 tasks created in the
+    /// same millisecond must render as repl-1..repl-10 in numeric order.
+    #[test]
+    fn bug_aw_natural_numeric_tiebreak() {
+        let mut burst: Vec<_> = (1..=12u64)
+            .map(|n| t(&format!("repl-{n}"), 5_000, 5_000))
+            .collect();
+        // Shuffle insertion order to prove sort doesn't depend on it.
+        burst.swap(0, 11);
+        burst.swap(2, 7);
+
+        sort_migration_snapshot(&mut burst);
+
+        let want: Vec<String> = (1..=12u64).map(|n| format!("repl-{n}")).collect();
+        let got: Vec<String> = ids(&burst).into_iter().map(String::from).collect();
+        assert_eq!(got, want);
+    }
+
+    /// Pre-Bug-AW lex sort would order ["repl-1","repl-10","repl-2"];
+    /// the new natural compare must order ["repl-1","repl-2","repl-10"].
+    #[test]
+    fn bug_aw_natural_compare_helper() {
+        use std::cmp::Ordering::*;
+        assert_eq!(natural_task_id_cmp("repl-2", "repl-10"), Less);
+        assert_eq!(natural_task_id_cmp("repl-10", "repl-2"), Greater);
+        assert_eq!(natural_task_id_cmp("repl-7", "repl-7"), Equal);
+    }
+
+    /// Non-numeric IDs fall back to lex compare without panicking.
+    #[test]
+    fn bug_aw_non_numeric_ids_fallback() {
+        use std::cmp::Ordering::*;
+        assert_eq!(natural_task_id_cmp("alpha", "beta"), Less);
+        assert_eq!(natural_task_id_cmp("repl-foo", "repl-bar"), Greater);
+    }
+
+    /// Tasks missing created_at_ms (older snapshots) sort to the bottom
+    /// instead of randomising the head of the list.
+    #[test]
+    fn bug_aw_missing_created_at_sinks() {
+        let mut v = vec![
+            json!({"task_id": "repl-1"}), // missing created_at_ms
+            t("repl-2", 1_000, 1_000),
+            t("repl-3", 2_000, 2_000),
+        ];
+        sort_migration_snapshot(&mut v);
+        assert_eq!(ids(&v), vec!["repl-3", "repl-2", "repl-1"]);
     }
 }

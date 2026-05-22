@@ -495,20 +495,22 @@ impl ChunkStore {
         Ok(())
     }
 
-    /// Bug AV — idempotent chunk delete. Returns `(was_present,
-    /// freed_bytes)`:
+    /// Bug AV (AV-4-7 WAL-recoverable) — idempotent chunk delete.
+    /// Returns `(was_present, freed_bytes)`:
     /// * `was_present = true, freed_bytes = N` — file was removed,
     ///   counters decremented by N.
     /// * `was_present = false, freed_bytes = 0` — chunk not found on
     ///   any disk; this is the operation's natural no-op state, not
     ///   an error.
     ///
-    /// On-disk order: remove `.dat` first (releases bytes immediately
-    /// even on crash before `.meta` removal), then `.meta`. A crash
-    /// in between leaves an orphan `.meta` with no data; periodic
-    /// scrub detects + cleans these. Full WAL-recoverable atomicity
-    /// is a separate feature (see Deviations in
-    /// PLAN-BUG-AV-TIER-LIFECYCLE.md §5).
+    /// WAL-recoverable atomicity (AV-4-7): the WAL is written +
+    /// fsynced BEFORE either unlink, then `.dat` is removed first
+    /// (releases bytes immediately), then `.meta`, then the WAL
+    /// entry is cleared. On a crash between any two steps,
+    /// `recover_from_wal` re-runs the unlinks (idempotent — already-
+    /// missing files are not errors) and clears the WAL. Net effect:
+    /// every delete is durable and re-runnable; there is no window in
+    /// which an orphan `.meta` outlives a successful boot.
     pub async fn delete_chunk_idempotent(
         &self,
         chunk_id: &ChunkId,
@@ -527,12 +529,33 @@ impl ChunkStore {
                     .map(|m| m.len())
                     .unwrap_or(0);
 
+                // AV-4-7 — WAL-recoverable delete. Write the WAL entry
+                // first so a crash mid-delete (or before either unlink
+                // even starts) replays on boot via `recover_from_wal`.
+                let wal_dir_path = wal_dir(&disk.mount_path);
+                fs::create_dir_all(&wal_dir_path).await.map_err(DtfsError::Io)?;
+                let wal_entry = WalEntry {
+                    operation: WalOperation::DeleteChunk,
+                    chunk_id: chunk_id.as_hex(),
+                    disk_path: disk.mount_path.to_string_lossy().to_string(),
+                    timestamp_ms: now_millis(),
+                };
+                let wal_path = wal_dir_path
+                    .join(format!("{}.wal.json", chunk_id.as_hex()));
+                write_wal_entry(&wal_path, &wal_entry).await?;
+
                 fs::remove_file(&dat_path).await.map_err(DtfsError::Io)?;
                 if meta_path.exists() {
                     fs::remove_file(&meta_path)
                         .await
                         .map_err(DtfsError::Io)?;
                 }
+
+                // Clear the WAL marker last — only after both unlinks
+                // have succeeded. A crash before this point leaves the
+                // WAL for replay, which is harmless because the unlinks
+                // are idempotent.
+                let _ = fs::remove_file(&wal_path).await;
 
                 tracing::debug!("Deleted chunk {} ({} bytes)", chunk_id, file_size);
 
@@ -1650,6 +1673,65 @@ mod tests {
         assert!(was_present_1, "first delete sees chunk");
         assert!(!was_present_2, "second delete: gone");
         assert_eq!(freed_2, 0);
+    }
+
+    /// AV-4-7 — WAL-recoverable delete. Resolves the AV-1-5
+    /// deviation that originally deferred WAL-side atomicity. Test
+    /// scenario: simulate a crash that happened AFTER the WAL was
+    /// written and the `.dat` was unlinked, but BEFORE the `.meta`
+    /// was unlinked. On boot, `recover_from_wal` must finish the job
+    /// and clear the WAL entry.
+    #[tokio::test]
+    async fn bug_av_delete_chunk_wal_recovery_after_crash() {
+        let (store, tmp) = make_test_store().await;
+        let data = b"wal-recovery-victim";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+
+        store
+            .put_chunk(&chunk_id, data, &volume_id, DiskTier::Hot)
+            .await
+            .unwrap();
+        let dat = chunk_data_path(tmp.path(), &chunk_id);
+        let meta = chunk_meta_path(tmp.path(), &chunk_id);
+        assert!(dat.exists() && meta.exists(), "pre-crash setup");
+
+        // Simulate the AV-4-7 crash window: WAL was written, `.dat`
+        // was unlinked, process died before `.meta` was unlinked.
+        let wal_path = wal_dir(tmp.path())
+            .join(format!("{}.wal.json", chunk_id.as_hex()));
+        let wal_entry = WalEntry {
+            operation: WalOperation::DeleteChunk,
+            chunk_id: chunk_id.as_hex(),
+            disk_path: tmp.path().to_string_lossy().to_string(),
+            timestamp_ms: now_millis(),
+        };
+        write_wal_entry(&wal_path, &wal_entry).await.unwrap();
+        fs::remove_file(&dat).await.unwrap();
+        assert!(!dat.exists(),  "crash sim: .dat removed");
+        assert!( meta.exists(), "crash sim: .meta still present");
+        assert!( wal_path.exists(), "crash sim: WAL marker present");
+
+        // Recover.
+        let n = store.recover_from_wal().await.unwrap();
+        assert!(n >= 1, "at least the delete WAL entry processed");
+
+        // Both files must be gone now, WAL entry cleared.
+        assert!(!dat.exists(),  "post-recovery .dat gone");
+        assert!(!meta.exists(), "post-recovery .meta gone");
+        assert!(!wal_path.exists(), "post-recovery WAL cleared");
+    }
+
+    /// AV-4-7 — WAL replay is safe to re-run any number of times.
+    /// Re-invoking recover after a successful one is a no-op.
+    #[tokio::test]
+    async fn bug_av_delete_chunk_wal_recovery_idempotent() {
+        let (store, _tmp) = make_test_store().await;
+        let n1 = store.recover_from_wal().await.unwrap();
+        let n2 = store.recover_from_wal().await.unwrap();
+        assert_eq!(n1, 0, "fresh store: nothing to recover");
+        assert_eq!(n2, 0, "second run: still nothing to recover");
     }
 
     /// AV-1-5 test 4 — sequential put followed by delete leaves

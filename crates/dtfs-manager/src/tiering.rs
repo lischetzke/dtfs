@@ -338,7 +338,15 @@ impl TieringEngine {
             return Ok(());
         }
 
-        let plan = plan_cache_tick(&snapshot, now_ms);
+        // AV-4-5 — read the runtime flag under the same `config`
+        // RwLock used by `update_config` so a `reload_config` call
+        // takes effect on the next tick.
+        let enable_redundancy_escalation = self
+            .config
+            .read()
+            .await
+            .enable_cache_redundancy_escalation;
+        let plan = plan_cache_tick(&snapshot, now_ms, enable_redundancy_escalation);
         if plan.promotions.is_empty() && plan.demotions.is_empty() {
             return Ok(());
         }
@@ -951,9 +959,10 @@ pub(crate) fn prune_read_window(
 /// nothing" (every gate path returns `0`).
 ///
 /// The basic-promotion path caps at `min` — the redundancy
-/// escalation pass that ramps toward `max` is opt-in
-/// (`ENABLE_CACHE_REDUNDANCY_ESCALATION = false` in Phase 2; see
-/// AV-2-4 wiring).
+/// escalation pass that ramps toward `max` is opt-in via the
+/// runtime `TieringConfig::enable_cache_redundancy_escalation`
+/// flag (default `false`; AV-4-5 promoted it from a compile-time
+/// const so operators can flip it without rebuilding).
 pub(crate) fn plan_cache_promotion(
     read_count_in_window: u32,
     tier_cfg: &dtfs_common::types::CacheTierConfig,
@@ -1056,9 +1065,13 @@ pub(crate) fn select_promotion_target(
 // `promote_window_secs` → schedule demotion", "draining nodes never
 // receive promotions", etc.) without spinning up Raft / SM mocks.
 
-/// AV-2-4 — feature flag for redundancy-escalation past `min` toward
-/// `max`. Phase 2 ships with this off; Phase 4 follow-up flips it on
-/// once a real per-DC HA workload exists to validate against.
+/// AV-4-5 — deprecated marker. The redundancy-escalation gate is now
+/// the runtime `TieringConfig::enable_cache_redundancy_escalation`
+/// flag (per-cluster, hot-reloadable). The const is kept for
+/// documentation; new code paths MUST take the bool as a parameter
+/// instead of reading this constant.
+#[deprecated(note = "AV-4-5: use TieringConfig::enable_cache_redundancy_escalation runtime flag instead")]
+#[allow(dead_code)]
 pub(crate) const ENABLE_CACHE_REDUNDANCY_ESCALATION: bool = false;
 
 /// AV-2-4 — projection of a volume's caching policy used by the
@@ -1162,6 +1175,7 @@ pub(crate) struct TickPlan {
 pub(crate) fn plan_cache_tick(
     snapshot: &TickSnapshot,
     now_ms: u64,
+    enable_redundancy_escalation: bool,
 ) -> TickPlan {
     let mut plan = TickPlan::default();
     for chunk in &snapshot.chunks {
@@ -1173,7 +1187,14 @@ pub(crate) fn plan_cache_tick(
         };
 
         // -- Promotions --
-        plan_chunk_promotions(chunk, policy, &snapshot.nodes, now_ms, &mut plan.promotions);
+        plan_chunk_promotions(
+            chunk,
+            policy,
+            &snapshot.nodes,
+            now_ms,
+            enable_redundancy_escalation,
+            &mut plan.promotions,
+        );
 
         // -- Demotions --
         plan_chunk_demotions(chunk, policy, now_ms, &mut plan.demotions);
@@ -1187,6 +1208,7 @@ fn plan_chunk_promotions(
     policy: &TickVolumePolicy,
     nodes: &[NodeSelectionView],
     now_ms: u64,
+    enable_redundancy_escalation: bool,
     out: &mut Vec<TickPromotion>,
 ) {
     // Each tier with `cache_replicas.<tier>.max > 0` is a candidate.
@@ -1256,7 +1278,7 @@ fn plan_chunk_promotions(
             // already met `min` AND `read_count >= 2 *
             // promote_reads` (a coarse "hot enough to justify"
             // heuristic; Phase-4 will refine).
-            let want = if ENABLE_CACHE_REDUNDANCY_ESCALATION
+            let want = if enable_redundancy_escalation
                 && tier_cfg.max > tier_cfg.min
                 && current >= tier_cfg.min
                 && reads >= policy.cache.promote_reads.saturating_mul(2)
@@ -1336,7 +1358,7 @@ fn plan_chunk_promotions(
                         target_node_id: target,
                         target_dc: target_dc.clone(),
                         target_tier: *tier,
-                        reason: if ENABLE_CACHE_REDUNDANCY_ESCALATION
+                        reason: if enable_redundancy_escalation
                             && current >= tier_cfg.min
                         {
                             "promote_redundancy"
@@ -1942,7 +1964,7 @@ mod bug_av_tiering_tick_tests {
             ],
             volumes: vols(plex_policy()),
         };
-        let plan = plan_cache_tick(&snapshot, 1_000_000);
+        let plan = plan_cache_tick(&snapshot, 1_000_000, false);
         assert_eq!(plan.promotions.len(), 1, "one warm promotion");
         let p = &plan.promotions[0];
         assert_eq!(p.target_node_id, 11);
@@ -1977,7 +1999,7 @@ mod bug_av_tiering_tick_tests {
             nodes: vec![node(11, "toro", 500_000, true)],
             volumes: vols(plex_policy()),
         };
-        let plan = plan_cache_tick(&snapshot, 1_000_000);
+        let plan = plan_cache_tick(&snapshot, 1_000_000, false);
         assert!(plan.promotions.is_empty(), "no promotions when reads = 0");
         assert_eq!(plan.demotions.len(), 1);
         assert_eq!(plan.demotions[0].node_id, 11);
@@ -2005,7 +2027,7 @@ mod bug_av_tiering_tick_tests {
             nodes: vec![node(11, "toro", 500_000, true)],
             volumes: vols(plex_policy()),
         };
-        let plan = plan_cache_tick(&snapshot, 1_000_000);
+        let plan = plan_cache_tick(&snapshot, 1_000_000, false);
         assert!(plan.promotions.is_empty(), "cooldown blocks the promotion");
     }
 
@@ -2036,23 +2058,20 @@ mod bug_av_tiering_tick_tests {
             ],
             volumes: vols(plex_policy()),
         };
-        let plan = plan_cache_tick(&snapshot, 1_000_000);
+        let plan = plan_cache_tick(&snapshot, 1_000_000, false);
         assert_eq!(plan.promotions.len(), 1, "per-DC cap of 1 honoured");
         assert_eq!(plan.promotions[0].target_node_id, 11, "highest-free wins");
     }
 
-    /// AV-2-4 test 5 — the redundancy-escalation flag is off in
-    /// Phase 2. A volume with `cache_replicas.warm.max = 2` that
-    /// already has 1 warm replica + plenty of reads MUST NOT get a
-    /// second cache replica.
+    /// AV-2-4 test 5 (renamed for AV-4-5) — with the runtime
+    /// escalation flag OFF, a volume with `cache_replicas.warm.max
+    /// = 2` that already has 1 warm replica + plenty of reads
+    /// MUST NOT get a second cache replica. The planner caps at
+    /// `min`.
     #[test]
-    fn bug_av_tiering_tick_redundancy_escalation_off_by_default() {
-        // Sanity: confirm the flag is wired off so the test is
-        // actually testing what we think.
-        assert!(!ENABLE_CACHE_REDUNDANCY_ESCALATION);
-
+    fn bug_av_tiering_tick_redundancy_escalation_off() {
         let mut policy = plex_policy();
-        // Set max=2 to invite escalation if it were on.
+        // Set max=2 to invite escalation if the flag were on.
         policy.cache.warm = CacheTierConfig { min: 1, max: 2 };
 
         let mut reads = HashMap::new();
@@ -2078,10 +2097,85 @@ mod bug_av_tiering_tick_tests {
             ],
             volumes: vols(policy),
         };
-        let plan = plan_cache_tick(&snapshot, 1_000_000);
+        let plan = plan_cache_tick(&snapshot, 1_000_000, false);
         assert!(
             plan.promotions.is_empty(),
-            "with ENABLE_CACHE_REDUNDANCY_ESCALATION = false, a 2nd warm replica must not be scheduled"
+            "with redundancy escalation flag OFF, a 2nd warm replica must not be scheduled"
+        );
+    }
+
+    /// AV-4-5 test 1 — same snapshot, flag flipped ON. Planner must
+    /// schedule the 2nd warm replica with the `promote_redundancy`
+    /// reason code.
+    #[test]
+    fn bug_av_tiering_tick_redundancy_escalation_on() {
+        let mut policy = plex_policy();
+        policy.cache.warm = CacheTierConfig { min: 1, max: 2 };
+
+        let mut reads = HashMap::new();
+        reads.insert("toro".to_string(), 100);
+        let snapshot = TickSnapshot {
+            chunks: vec![TickChunk {
+                chunk_id: "h0".to_string(),
+                chunk_index: 0,
+                file_path: "/movies/x.mkv".to_string(),
+                volume_id: "default".to_string(),
+                placements: vec![
+                    TickPlacement { node_id: 10, dc: "leli".into(), tier: DiskTier::Cold },
+                    TickPlacement { node_id: 11, dc: "toro".into(), tier: DiskTier::Warm },
+                ],
+                cooldown_until_ms: 0,
+                reads_in_window_by_dc: reads,
+            }],
+            nodes: vec![
+                node(11, "toro", 500_000, true),
+                node(12, "toro", 400_000, true), // gains the 2nd replica
+            ],
+            volumes: vols(policy),
+        };
+        let plan = plan_cache_tick(&snapshot, 1_000_000, true);
+        assert_eq!(plan.promotions.len(), 1,
+            "flag ON must schedule the 2nd warm replica");
+        assert_eq!(plan.promotions[0].target_node_id, 12,
+            "the un-held warm node is picked");
+        assert_eq!(plan.promotions[0].reason, "promote_redundancy",
+            "escalation reason code");
+    }
+
+    /// AV-4-5 test 2 — the escalation flag does NOT bypass the
+    /// already-existing safety checks. When no candidate warm-tier
+    /// node exists in the DC (the only candidate already holds the
+    /// chunk), no extra promotion is scheduled even though `max >
+    /// min` and reads are far above the threshold.
+    #[test]
+    fn bug_av_tiering_redundancy_escalation_respects_anchor() {
+        let mut policy = plex_policy();
+        policy.cache.warm = CacheTierConfig { min: 1, max: 2 };
+
+        let mut reads = HashMap::new();
+        reads.insert("toro".to_string(), 100);
+        let snapshot = TickSnapshot {
+            chunks: vec![TickChunk {
+                chunk_id: "h0".to_string(),
+                chunk_index: 0,
+                file_path: "/movies/x.mkv".to_string(),
+                volume_id: "default".to_string(),
+                placements: vec![
+                    TickPlacement { node_id: 10, dc: "leli".into(), tier: DiskTier::Cold },
+                    TickPlacement { node_id: 11, dc: "toro".into(), tier: DiskTier::Warm },
+                ],
+                cooldown_until_ms: 0,
+                reads_in_window_by_dc: reads,
+            }],
+            // Only 1 warm-tier node in toro, and it already holds
+            // the chunk. Planner must not pick it again.
+            nodes: vec![node(11, "toro", 500_000, true)],
+            volumes: vols(policy),
+        };
+        let plan = plan_cache_tick(&snapshot, 1_000_000, true);
+        assert!(
+            plan.promotions.is_empty(),
+            "no spare warm-tier node in toro → no escalation, even with flag on"
         );
     }
 
@@ -2135,7 +2229,7 @@ mod bug_av_tiering_tick_tests {
             nodes: vec![node(11, "toro", 500_000, true)],
             volumes: vols(plex_policy()),
         };
-        let plan = plan_cache_tick(&snapshot, 1_000_000);
+        let plan = plan_cache_tick(&snapshot, 1_000_000, false);
         assert_eq!(plan.demotions.len(), 1);
         assert_eq!(
             plan.demotions[0].cooldown_until_ms_at_snapshot, 1_500_000,
@@ -2176,7 +2270,7 @@ mod bug_av_tiering_tick_tests {
             ],
             volumes: vols(policy),
         };
-        let plan = plan_cache_tick(&snapshot, 1_000_000);
+        let plan = plan_cache_tick(&snapshot, 1_000_000, false);
         assert_eq!(plan.promotions.len(), 1);
         assert_eq!(plan.promotions[0].target_dc, "nrb",
             "global pool targets the DC with the most reads");

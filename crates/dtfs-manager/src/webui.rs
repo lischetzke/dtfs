@@ -88,7 +88,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .header {{
             background: var(--surface);
             border-bottom: 1px solid var(--border);
-            padding: .75rem 2rem;
+            padding: .5rem 1.25rem;
             display: flex; align-items: center; justify-content: space-between;
         }}
         .header-brand {{ display: flex; align-items: center; gap: .75rem; }}
@@ -102,12 +102,12 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .nav {{
             background: var(--surface);
             border-bottom: 1px solid var(--border);
-            padding: 0 2rem;
+            padding: 0 1.25rem;
             display: flex; gap: 0; overflow-x: auto;
         }}
         .nav a {{
             color: var(--text-muted); text-decoration: none;
-            padding: .7rem 1.1rem; font-size: .85rem;
+            padding: .55rem .9rem; font-size: .85rem;
             border-bottom: 2px solid transparent; white-space: nowrap;
             transition: color .15s, border-color .15s;
         }}
@@ -116,7 +116,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
         /* ── Health banner ── */
         .health-banner {{
-            padding: .9rem 2rem;
+            padding: .6rem 1.25rem;
             display: flex; align-items: center; justify-content: space-between;
             font-size: .9rem; font-weight: 600;
             border-bottom: 1px solid var(--border);
@@ -140,22 +140,22 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .health-right {{ font-size: .8rem; color: var(--text-muted); font-weight: 400; }}
 
         /* ── Main layout ── */
-        .container {{ max-width: 1440px; margin: 0 auto; padding: 1.5rem 2rem; }}
+        .container {{ max-width: none; margin: 0; padding: 1rem 1.25rem; }}
         .section-title {{
             font-size: .7rem; font-weight: 600; text-transform: uppercase;
             letter-spacing: .08em; color: var(--text-muted); margin-bottom: .75rem;
         }}
 
-        /* ── Count cards (row of 4) ── */
+        /* ── Count cards (auto-fit so wide displays show more per row) ── */
         .counts-row {{
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 1rem; margin-bottom: 1.25rem;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: .75rem; margin-bottom: 1rem;
         }}
         .count-card {{
             background: var(--surface); border: 1px solid var(--border);
-            border-radius: .625rem; padding: 1rem 1.25rem;
-            display: flex; align-items: center; gap: 1rem;
+            border-radius: .5rem; padding: .65rem .9rem;
+            display: flex; align-items: center; gap: .75rem;
         }}
         .count-icon {{
             width: 40px; height: 40px; border-radius: .5rem;
@@ -172,12 +172,12 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         /* ── Metric cards (capacity + I/O) ── */
         .metrics-row {{
             display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 1rem; margin-bottom: 1.25rem;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: .75rem; margin-bottom: 1rem;
         }}
         .metric-card {{
             background: var(--surface); border: 1px solid var(--border);
-            border-radius: .625rem; padding: 1.25rem;
+            border-radius: .5rem; padding: .85rem 1rem;
         }}
         .metric-card h3 {{
             font-size: .75rem; font-weight: 600; text-transform: uppercase;
@@ -205,11 +205,11 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         /* ── Scrub card ── */
         .scrub-card {{
             background: var(--surface); border: 1px solid var(--border);
-            border-radius: .625rem; padding: 1.25rem;
+            border-radius: .5rem; padding: .85rem 1rem;
             /* WebUI bug — was missing the top margin so the card
                sat flush against Tier Distribution above. */
-            margin-top: 1rem;
-            margin-bottom: 1.25rem;
+            margin-top: .75rem;
+            margin-bottom: 1rem;
         }}
         .scrub-card h3 {{
             font-size: .75rem; font-weight: 600; text-transform: uppercase;
@@ -218,7 +218,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .scrub-meta {{ display: flex; flex-wrap: wrap; gap: .5rem 2rem; margin-bottom: .875rem; }}
         .scrub-meta-item {{ font-size: .85rem; }}
         .scrub-meta-item span {{ color: var(--text-muted); margin-right: .3rem; }}
-        .scrub-stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: .75rem; }}
+        .scrub-stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: .75rem; }}
         .scrub-stat {{ text-align: center; }}
         .scrub-stat .stat-val {{ font-size: 1.4rem; font-weight: 700; }}
         .scrub-stat .stat-lbl {{ font-size: .7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: .05em; margin-top: .15rem; }}
@@ -229,10 +229,10 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         /* ── Nodes table ── */
         .table-card {{
             background: var(--surface); border: 1px solid var(--border);
-            border-radius: .625rem; overflow: hidden; margin-bottom: 1.25rem;
+            border-radius: .5rem; overflow: hidden; margin-bottom: 1rem;
         }}
         .table-card-header {{
-            padding: .875rem 1.25rem;
+            padding: .55rem 1rem;
             display: flex; align-items: center; justify-content: space-between;
             border-bottom: 1px solid var(--border);
         }}
@@ -243,7 +243,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         table {{ width: 100%; border-collapse: collapse; }}
         th, td {{
             text-align: left;
-            padding: .625rem 1.25rem;
+            padding: .4rem .85rem;
             border-bottom: 1px solid var(--border);
         }}
         th {{
@@ -251,7 +251,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             text-transform: uppercase; letter-spacing: .05em;
             background: var(--surface2);
         }}
-        td {{ font-size: .83rem; }}
+        td {{ font-size: .8rem; }}
         tr:last-child td {{ border-bottom: none; }}
         tr:hover td {{ background: var(--surface2); }}
 
@@ -272,6 +272,9 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .badge-cold {{ background: #3b82f622; color: var(--primary); }}
         .badge-tape {{ background: #a855f722; color: var(--tape); }}
         .badge-manager {{ background: #6366f122; color: #818cf8; }}
+        /* Bug AX — Raft-leader marker on the Nodes page. Bright accent so
+           it stands out next to the normal role/health badges. */
+        .badge-leader {{ background: var(--primary); color: white; letter-spacing: .04em; }}
         .badge-data    {{ background: #22c55e22; color: var(--success); }}
         /* Bug AN — clients previously had no badge style, so the role
            column on Nodes rendered an unstyled "client" text without
@@ -293,7 +296,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         }}
 
         /* ── Page header ── */
-        .page-header {{ margin-bottom: 1.5rem; }}
+        .page-header {{ margin-bottom: 1rem; }}
         .page-header h2 {{ font-size: 1.25rem; font-weight: 700; margin-bottom: .25rem; }}
         .page-desc {{ font-size: .85rem; color: var(--text-muted); }}
 
@@ -310,16 +313,16 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
            than one rack. flex-wrap so very wide DCs still fit small
            screens; min-width on each rack so columns stay readable. */
         .topo-racks {{ display: flex; flex-direction: row; flex-wrap: wrap; gap: .75rem; align-items: flex-start; }}
-        .topo-rack {{ display: flex; flex-direction: column; flex: 0 0 auto; min-width: 220px; max-width: 280px; background: var(--surface); border: 1px solid var(--border); border-radius: .5rem; padding: .75rem .85rem; }}
+        .topo-rack {{ display: flex; flex-direction: column; flex: 1 1 240px; min-width: 220px; background: var(--surface); border: 1px solid var(--border); border-radius: .5rem; padding: .75rem .85rem; }}
         .topo-rack-label {{ font-size: .78rem; color: var(--text-muted); margin-bottom: .5rem; text-transform: uppercase; letter-spacing: .04em; }}
         .topo-nodes {{ display: flex; flex-direction: column; gap: .5rem; }}
         .topo-node {{ background: var(--surface2); border: 1px solid var(--border); border-radius: .4rem; padding: .6rem .75rem; font-size: .83rem; }}
 
         /* ── Node cards ── */
-        .node-card {{ background: var(--surface); border: 1px solid var(--border); border-radius: .625rem; margin-bottom: 1rem; overflow: hidden; }}
-        .node-card-header {{ padding: .875rem 1.25rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); background: var(--surface2); }}
-        .node-card-body {{ padding: .875rem 1.25rem; }}
-        .node-meta {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: .4rem .75rem; margin-bottom: .5rem; }}
+        .node-card {{ background: var(--surface); border: 1px solid var(--border); border-radius: .5rem; margin-bottom: .75rem; overflow: hidden; }}
+        .node-card-header {{ padding: .6rem 1rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); background: var(--surface2); }}
+        .node-card-body {{ padding: .6rem 1rem; }}
+        .node-meta {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: .35rem .75rem; margin-bottom: .5rem; }}
         .node-meta-item {{ font-size: .8rem; }}
         .node-meta-item span {{ color: var(--text-muted); margin-right: .3rem; font-size: .75rem; }}
         .btn-maint {{
@@ -330,10 +333,10 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .btn-maint:hover {{ border-color: var(--primary); color: var(--primary); }}
 
         /* ── Settings ── */
-        .settings-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1rem; }}
+        .settings-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .75rem; }}
         .settings-section {{
             background: var(--surface); border: 1px solid var(--border);
-            border-radius: .625rem; padding: 1.25rem;
+            border-radius: .5rem; padding: .9rem 1.1rem;
         }}
         .settings-section h3 {{
             font-size: .8rem; font-weight: 700; text-transform: uppercase;
@@ -394,12 +397,14 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         /* ── Footer ── */
         .footer {{
             text-align: center; color: var(--text-muted);
-            font-size: .75rem; padding: 1rem 2rem 2rem;
+            font-size: .75rem; padding: .75rem 1.25rem 1.25rem;
         }}
         @media (max-width: 900px) {{
-            .counts-row {{ grid-template-columns: repeat(2, 1fr); }}
+            .counts-row {{ grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }}
             .metrics-row {{ grid-template-columns: 1fr; }}
-            .scrub-stats {{ grid-template-columns: repeat(2, 1fr); }}
+            .scrub-stats {{ grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }}
+            .container {{ padding: .75rem .75rem; }}
+            .header, .nav, .health-banner {{ padding-left: .75rem; padding-right: .75rem; }}
         }}
     </style>
 </head>
@@ -521,6 +526,62 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <button class="btn-primary"  onclick="submitFlushCache()" id="fc-submit">Flush cache</button>
         </div>
         <div id="fc-result" class="modal-result" style="display:none"></div>
+    </div>
+</div>
+
+<!-- ── Volume edit dialog (Bug AV — AV-4-4 inline policy editor) ── -->
+<div id="volume-edit-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeVolumeEdit()">
+    <div class="modal-card">
+        <h3>Edit volume cache policy</h3>
+        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:1rem">
+            Updates <code>cache_replicas</code> for the volume via
+            <code>POST /api/v1/volumes/{{id}}/set-cache</code>. Empty fields are left
+            unchanged. Mandatory replicas and the legacy <code>replication</code>
+            block are NOT touched here — use the CLI for those.
+        </div>
+        <div class="modal-row">
+            <label>Volume ID</label>
+            <input id="ve-volume-id" class="form-input" readonly>
+        </div>
+        <div class="modal-row">
+            <label>warm.min</label>
+            <input id="ve-warm-min" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label>warm.max</label>
+            <input id="ve-warm-max" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label>hot.min (advanced)</label>
+            <input id="ve-hot-min" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label>hot.max (advanced)</label>
+            <input id="ve-hot-max" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label>per_dc</label>
+            <label style="font-weight:normal">
+                <input id="ve-per-dc" type="checkbox"> apply caps per datacenter
+            </label>
+        </div>
+        <div class="modal-row">
+            <label>promote_reads</label>
+            <input id="ve-promote-reads" class="form-input" type="number" min="1" step="1">
+        </div>
+        <div class="modal-row">
+            <label>promote_window_secs</label>
+            <input id="ve-promote-window" class="form-input" type="number" min="1" step="1">
+        </div>
+        <div class="modal-row">
+            <label>cooldown_secs</label>
+            <input id="ve-cooldown" class="form-input" type="number" min="0" step="1">
+        </div>
+        <div class="modal-actions">
+            <button class="btn-secondary" onclick="closeVolumeEdit()">Cancel</button>
+            <button class="btn-primary"  onclick="submitVolumeEdit()" id="ve-submit">Apply</button>
+        </div>
+        <div id="ve-result" class="modal-result" style="display:none"></div>
     </div>
 </div>
 
@@ -1213,10 +1274,30 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                    </div>`
                 : '';
 
+            // Bug AX — show the manager's Raft-leader status, render
+            // a client's source IP (clients have no gRPC listener), and
+            // surface last_seen on every node so operators can see how
+            // fresh the heartbeat is at a glance.
+            const leaderBadge = (isManager && n.is_leader)
+                ? '<span class="badge badge-leader" style="margin-right:.4rem" title="Current Raft leader">LEADER</span>'
+                : '';
+            const addrRow = isClient
+                ? `<div class="node-meta-item"><span>Client IP</span>${{n.client_ip || '—'}}</div>`
+                : `<div class="node-meta-item"><span>gRPC</span>${{n.grpc_addr||'—'}}</div>`;
+            const lastSeenRow = n.last_seen_ms
+                ? `<div class="node-meta-item"><span>Last seen</span>${{timeAgo(n.last_seen_ms)}}</div>`
+                : `<div class="node-meta-item"><span>Last seen</span>—</div>`;
+            // Bug AY — show binary version + build date. Empty values
+            // mean the node pre-dates Bug AY or wasn't queried directly
+            // (older clients, peer managers).
+            const versionRow = (n.version || n.build_date)
+                ? `<div class="node-meta-item"><span>Version</span>${{n.version || '—'}}${{n.build_date ? ' / ' + n.build_date : ''}}</div>`
+                : '';
             return `<div class="node-card">
                 <div class="node-card-header">
                     <div>
                         <span class="badge badge-${{role}}" style="margin-right:.4rem">${{role}}</span>
+                        ${{leaderBadge}}
                         <b style="font-size:1rem">${{n.hostname||'—'}}</b>
                         <span style="font-size:.78rem;color:var(--text-muted);margin-left:.5rem;font-family:monospace">
                             id:${{(n.node_id||'').slice(0,12)}}…
@@ -1231,8 +1312,10 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 </div>
                 <div class="node-card-body">
                     <div class="node-meta">
-                        <div class="node-meta-item"><span>gRPC</span>${{n.grpc_addr||'—'}}</div>
+                        ${{addrRow}}
                         <div class="node-meta-item"><span>Location</span>${{n.location||'—'}}</div>
+                        ${{lastSeenRow}}
+                        ${{versionRow}}
                         ${{sizeMetaRows}}
                     </div>
                     ${{utilBar}}
@@ -1255,27 +1338,172 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
     // ── Volumes page ──────────────────────────────────────────────────────────
 
-    async function renderVolumes() {{
-        document.getElementById('page-content').innerHTML =
-            '<div class="page-header"><h2>Volumes</h2><p class="page-desc">Storage volumes and their file distribution</p></div>' +
-            '<div id="volumes-list"><div class="placeholder">Loading…</div></div>';
-        const data = await fetch('/api/v1/volumes').then(r => r.json()).catch(() => ({{count:0, volumes:[]}}));
+    // Bug AV (AV-4-3 / AV-4-4) — Volumes page extended with a per-row
+    // policy detail card and an inline "Edit policy" button. The list
+    // endpoint now embeds the full AV-3-5 projection (AV-4-2), so the
+    // card data comes from the same fetch — no per-volume GET needed.
+    window._volumesData = [];
+    window._volumesExpanded = new Set();
+
+    function renderVolumeCard(v) {{
+        const tier = (t) => {{
+            const m = (v.mandatory_replicas && v.mandatory_replicas[t]) || 0;
+            const c = (v.cache_replicas && v.cache_replicas[t]) || {{min:0, max:0}};
+            return `${{t}}: mandatory=${{m}}, cache.min=${{c.min||0}}, cache.max=${{c.max||0}}`;
+        }};
+        const cr = v.cache_replicas || {{}};
+        const anchor = v.anchor
+            ? `dc=${{v.anchor.datacenter||'—'}}, required_tier=${{v.anchor.required_tier||'(any)'}}`
+            : '(none)';
+        return `<div class="placeholder" style="text-align:left;padding:1rem;background:rgba(0,0,0,.04);border-radius:.5rem">
+            <div style="font-weight:bold;margin-bottom:.5rem">Policy for ${{v.volume_id}}</div>
+            <div style="font-family:monospace;font-size:.78rem;line-height:1.6">
+                <div>Mandatory replicas: hot=${{(v.mandatory_replicas||{{}}).hot||0}}, warm=${{(v.mandatory_replicas||{{}}).warm||0}}, cold=${{(v.mandatory_replicas||{{}}).cold||0}}, tape=${{(v.mandatory_replicas||{{}}).tape||0}}</div>
+                <div>Cache replicas (per_dc=${{cr.per_dc===true?'true':'false'}}, promote_reads=${{cr.promote_reads||0}}, promote_window_secs=${{cr.promote_window_secs||0}}, cooldown_secs=${{cr.cooldown_secs||0}}):</div>
+                <div style="margin-left:1rem">${{tier('hot')}}</div>
+                <div style="margin-left:1rem">${{tier('warm')}}</div>
+                <div style="margin-left:1rem">${{tier('cold')}}</div>
+                <div style="margin-left:1rem">${{tier('tape')}}</div>
+                <div>Anchor: ${{anchor}}</div>
+                <div>Chunk size: ${{fmtBytes(v.chunk_size_bytes||0)}}</div>
+            </div>
+        </div>`;
+    }}
+
+    function toggleVolumeRow(volumeId) {{
+        if (window._volumesExpanded.has(volumeId)) {{
+            window._volumesExpanded.delete(volumeId);
+        }} else {{
+            window._volumesExpanded.add(volumeId);
+        }}
+        rerenderVolumesTable();
+    }}
+
+    function rerenderVolumesTable() {{
         const el = document.getElementById('volumes-list');
         if (!el) return;
-        const vols = data.volumes || [];
-        if (vols.length === 0) {{
+        const vols = window._volumesData;
+        if (!vols.length) {{
             el.innerHTML = '<div class="placeholder">No volumes yet. Create one with <code>dtfs-cli volume create</code>.</div>';
             return;
         }}
         el.innerHTML = '<div class="table-card"><table>' +
-            '<thead><tr><th>Volume ID</th><th>Files</th><th>Total Size</th><th>Avg File Size</th></tr></thead><tbody>' +
-            vols.map(v => `<tr>
-                <td><b style="font-family:monospace">${{v.volume_id||'—'}}</b></td>
-                <td>${{(v.file_count||0).toLocaleString()}}</td>
-                <td>${{fmtBytes(v.total_size||0)}}</td>
-                <td>${{v.file_count ? fmtBytes(Math.round((v.total_size||0)/v.file_count)) : '—'}}</td>
-            </tr>`).join('') +
+            '<thead><tr><th>Volume ID</th><th>Files</th><th>Total Size</th><th>Avg File Size</th><th>Cache</th><th>Anchor</th><th>Actions</th></tr></thead><tbody>' +
+            vols.flatMap(v => {{
+                const vid = v.volume_id||'—';
+                const safeVid = vid.replace(/'/g, "&#39;");
+                const cacheLabel = (v.cache_replicas && v.cache_replicas.warm)
+                    ? `warm min=${{v.cache_replicas.warm.min||0}}/max=${{v.cache_replicas.warm.max||0}}${{v.cache_replicas.per_dc?' per-dc':''}}`
+                    : '—';
+                const anchorLabel = v.anchor ? (v.anchor.datacenter||'—') : '—';
+                const isOpen = window._volumesExpanded.has(vid);
+                const rows = [`<tr>
+                    <td><b style="font-family:monospace">${{vid}}</b></td>
+                    <td>${{(v.file_count||0).toLocaleString()}}</td>
+                    <td>${{fmtBytes(v.total_size||0)}}</td>
+                    <td>${{v.file_count ? fmtBytes(Math.round((v.total_size||0)/v.file_count)) : '—'}}</td>
+                    <td>${{cacheLabel}}</td>
+                    <td>${{anchorLabel}}</td>
+                    <td style="white-space:nowrap">
+                        <button class="btn-secondary" style="padding:.25rem .5rem;font-size:.78rem"
+                            onclick="toggleVolumeRow('${{safeVid}}')">${{isOpen?'Hide':'Details'}}</button>
+                        <button class="btn-secondary" style="padding:.25rem .5rem;font-size:.78rem"
+                            onclick="openVolumeEdit('${{safeVid}}')">Edit policy…</button>
+                        <button class="btn-secondary" style="padding:.25rem .5rem;font-size:.78rem"
+                            onclick="openFlushCache('/')">Flush cache…</button>
+                    </td>
+                </tr>`];
+                if (isOpen) {{
+                    rows.push(`<tr><td colspan="7">${{renderVolumeCard(v)}}</td></tr>`);
+                }}
+                return rows;
+            }}).join('') +
             '</tbody></table></div>';
+    }}
+
+    async function renderVolumes() {{
+        document.getElementById('page-content').innerHTML =
+            '<div class="page-header"><h2>Volumes</h2><p class="page-desc">Storage volumes, file distribution, and cache policy (Bug AV)</p></div>' +
+            '<div id="volumes-list"><div class="placeholder">Loading…</div></div>';
+        const data = await fetch('/api/v1/volumes').then(r => r.json()).catch(() => ({{count:0, volumes:[]}}));
+        window._volumesData = data.volumes || [];
+        rerenderVolumesTable();
+    }}
+
+    // ── Volume policy edit modal (AV-4-4) ─────────────────────────
+    function openVolumeEdit(volumeId) {{
+        const v = (window._volumesData||[]).find(x => x.volume_id === volumeId);
+        document.getElementById('ve-volume-id').value = volumeId;
+        if (v) {{
+            const cr = v.cache_replicas || {{}};
+            document.getElementById('ve-warm-min').value = (cr.warm && cr.warm.min) || 0;
+            document.getElementById('ve-warm-max').value = (cr.warm && cr.warm.max) || 0;
+            document.getElementById('ve-hot-min').value  = (cr.hot  && cr.hot.min)  || 0;
+            document.getElementById('ve-hot-max').value  = (cr.hot  && cr.hot.max)  || 0;
+            document.getElementById('ve-per-dc').checked = cr.per_dc === true;
+            document.getElementById('ve-promote-reads').value = cr.promote_reads || '';
+            document.getElementById('ve-promote-window').value = cr.promote_window_secs || '';
+            document.getElementById('ve-cooldown').value = cr.cooldown_secs || '';
+        }}
+        document.getElementById('ve-result').style.display = 'none';
+        document.getElementById('volume-edit-modal').classList.remove('hidden');
+    }}
+
+    function closeVolumeEdit() {{
+        document.getElementById('volume-edit-modal').classList.add('hidden');
+    }}
+
+    async function submitVolumeEdit() {{
+        const vid = document.getElementById('ve-volume-id').value.trim();
+        if (!vid) {{ alert('volume id is required'); return; }}
+
+        const intOrNull = (id) => {{
+            const raw = document.getElementById(id).value.trim();
+            return raw === '' ? null : parseInt(raw, 10);
+        }};
+        const body = {{
+            warm_min: intOrNull('ve-warm-min'),
+            warm_max: intOrNull('ve-warm-max'),
+            hot_min:  intOrNull('ve-hot-min'),
+            hot_max:  intOrNull('ve-hot-max'),
+            per_dc:   document.getElementById('ve-per-dc').checked,
+            promote_reads:       intOrNull('ve-promote-reads'),
+            promote_window_secs: intOrNull('ve-promote-window'),
+            cooldown_secs:       intOrNull('ve-cooldown'),
+        }};
+        // Client-side guard: warm.max >= warm.min when both provided.
+        if (body.warm_min != null && body.warm_max != null
+            && body.warm_max < body.warm_min) {{
+            alert('warm.max must be >= warm.min');
+            return;
+        }}
+
+        const btn = document.getElementById('ve-submit');
+        btn.disabled = true; btn.textContent = 'Applying…';
+        const result = document.getElementById('ve-result');
+        result.style.display = 'block';
+        result.textContent = 'Submitting…';
+
+        try {{
+            const r = await fetch(`/api/v1/volumes/${{encodeURIComponent(vid)}}/set-cache`, {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify(body),
+            }});
+            const j = await r.json().catch(() => ({{error: 'invalid JSON response'}}));
+            if (!r.ok) {{
+                result.textContent = 'Error ' + r.status + ': ' + (j.error || JSON.stringify(j));
+            }} else {{
+                result.textContent = j.changed
+                    ? 'Updated. New policy:\n' + JSON.stringify(j.config, null, 2)
+                    : 'No change (request was a no-op).';
+                await renderVolumes();
+            }}
+        }} catch (e) {{
+            result.textContent = 'Network error: ' + e;
+        }} finally {{
+            btn.disabled = false; btn.textContent = 'Apply';
+        }}
     }}
 
     // ── Data Explorer page ────────────────────────────────────────────────────

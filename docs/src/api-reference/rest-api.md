@@ -203,35 +203,44 @@ Lists files tracked in the cluster metadata. Results are capped at 1,000 entries
 
 ### GET /api/v1/volumes
 
-Lists volumes aggregated from file metadata.
+Lists volumes aggregated from file metadata. Bug AV (AV-4-2):
+each row now embeds the full per-volume policy projection
+(`mandatory_replicas`, `cache_replicas`, `anchor`, legacy
+`replication`, `write_safety`, `chunk_size_bytes`, `name`)
+alongside the aggregation fields (`file_count`, `total_size`).
+Volumes that have no `VolumeConfig` (usage-only rows) render
+with just `volume_id` + the aggregation fields.
 
 **Response:**
 
 ```json
 {
-  "count": 2,
+  "count": 1,
   "volumes": [
     {
       "volume_id": "default",
+      "name": "default",
+      "chunk_size_bytes": 4194304,
+      "replication": { "hot": 0, "warm": 2, "cold": 1, "tape": 1 },
+      "mandatory_replicas": { "hot": 0, "warm": 0, "cold": 1, "tape": 0 },
+      "cache_replicas": {
+        "hot":  { "min": 0, "max": 0 },
+        "warm": { "min": 1, "max": 1 },
+        "cold": { "min": 0, "max": 0 },
+        "tape": { "min": 0, "max": 0 },
+        "per_dc": true,
+        "promote_reads": 2,
+        "promote_window_secs": 60,
+        "cooldown_secs": 30
+      },
+      "anchor": { "datacenter": "dc-a", "required_tier": null },
+      "write_safety": { "min_replicas_before_ack": 2, "write_timeout_secs": 30 },
       "file_count": 1200,
       "total_size": 549755813888
-    },
-    {
-      "volume_id": "archive",
-      "file_count": 223,
-      "total_size": 107374182400
     }
   ]
 }
 ```
-
-> **Bug AV note:** the JSON shape currently emits only the
-> legacy `replication` block. The new `mandatory_replicas`,
-> `cache_replicas`, and `anchor` fields are stored on the
-> state machine (`POST /api/v1/volumes/{id}/migrate-policy` is
-> idempotent thanks to this) but the read-side projection has
-> not yet been broadened. Tracked as a follow-up under
-> [Plan AV-1-12 / AV-1-13](https://github.com/leduckmtw/dtfs2/blob/master/plans/active/PLAN-BUG-AV-TIER-LIFECYCLE.md).
 
 ---
 

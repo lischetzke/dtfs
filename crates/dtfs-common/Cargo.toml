@@ -2,6 +2,10 @@
 name = "dtfs-common"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+chrono = { workspace = true }
 
 [dependencies]
 serde = { workspace = true }

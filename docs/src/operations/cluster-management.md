@@ -242,6 +242,25 @@ curl -X POST http://mgr-01:9402/api/v1/files/flush_cache \
      -d '{"path_prefix":"/movies/Season-1/","cache_tiers":["warm"]}'
 ```
 
+### WebUI alternative (Bug AV — AV-4-3 / AV-4-4)
+
+The Volumes page in the WebUI now embeds the per-volume policy
+inline and exposes the same flush operation without curl:
+
+* **Details** button on each row expands a card showing the
+  volume's mandatory / cache / anchor policy (AV-4-3).
+* **Edit policy…** opens an inline modal that POSTs to
+  `/api/v1/volumes/{id}/set-cache` (AV-4-4) — useful for raising
+  `warm.max`, flipping `per_dc`, or tightening
+  `cooldown_secs` without dropping to the CLI.
+* **Flush cache…** opens the same `flush_cache` modal the Data
+  Explorer's right-click menu uses; pre-fills the volume's root
+  prefix.
+
+These three actions cover the same operator surface as the curl
++ `dtfs-cli` paths and use the AV-4-2 list-endpoint projection
+to display the current policy without an extra round-trip.
+
 Response shape:
 
 ```json

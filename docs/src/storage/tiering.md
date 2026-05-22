@@ -40,10 +40,16 @@ every tick (default 5 min, configurable via
    `cache_replicas.promote_reads` (default 2).
 4. **Target count** — basic promotion path schedules
    `min(min, max) - current_in_dc` new replicas. Always 0 once
-   `min` is reached (the redundancy-escalation pass that ramps
-   toward `max` is `ENABLE_CACHE_REDUNDANCY_ESCALATION = false`
-   in Phase 2; flipping it is a deferred follow-up gated on a
-   real per-DC HA workload to validate against).
+   `min` is reached. The redundancy-escalation pass that ramps
+   toward `max` is opt-in via the
+   `tiering.enable_cache_redundancy_escalation` runtime config
+   flag (default `false`; AV-4-5 promoted it from a compile-time
+   constant so operators can flip without rebuilding). When
+   enabled, the planner schedules up to `max - current_in_dc`
+   replicas once `current_in_dc >= min` AND read count is at
+   least `2 * promote_reads` — the audit reason code switches
+   from `promote_threshold_met` to `promote_redundancy` so
+   operators can distinguish the two paths.
 5. **Target selection** — pick a healthy non-draining node in the
    requesting DC that has a disk of the target tier and doesn't
    already hold this chunk. Tie-break by highest free capacity,

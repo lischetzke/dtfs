@@ -987,6 +987,10 @@ impl DtfsClient {
             location: Some(location),
             disks: Vec::new(),
             shared_secret,
+            // Bug AY — report what this client binary is running so the
+            // manager Nodes page can flag stale FUSE mounts.
+            version: dtfs_common::version::VERSION.to_string(),
+            build_date: dtfs_common::version::BUILD_DATE.to_string(),
         };
         let _ = self
             .call_manager("register_node", |mut c| {

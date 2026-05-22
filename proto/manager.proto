@@ -324,6 +324,12 @@ message ChunkPlacement {
   uint32 chunk_index = 1;
   string primary_address = 2;
   repeated string replica_addresses = 3;
+  // Bug AV (AV-4-1d) — the manager-resolved target tier as a lowercase
+  // string ("hot"/"warm"/"cold"/"tape"). FUSE writers must pass this
+  // to the data-node so that `select_disk_for_tier` lands the chunk on
+  // the right tier. Empty string preserves legacy behaviour (data-node
+  // falls back to "any healthy disk by free capacity").
+  string tier = 4;
 }
 
 message AllocateChunksResponse {
@@ -370,6 +376,11 @@ message RegisterNodeRequest {
   repeated dtfs.common.DiskInfo disks = 5;
   // Must match manager cluster.shared_secret when the cluster secret is non-empty.
   optional string shared_secret = 6;
+  // Bug AY — binary version + build date the node is running. Both are
+  // strings so the wire format never drifts with type changes; empty
+  // values are treated as "unknown" by the manager.
+  string version = 7;
+  string build_date = 8;
 }
 
 message RegisterNodeResponse {

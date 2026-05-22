@@ -36,6 +36,7 @@
 - [Alerting](./operations/alerting.md)
 - [Backup & Recovery](./operations/backup-recovery.md)
 - [Time Synchronisation](./operations/time-sync.md)
+- [Failure Scenarios](./operations/failure-scenarios.md)
 - [Troubleshooting](./operations/troubleshooting.md)
 
 # Storage

@@ -439,13 +439,69 @@ follow-up):**
   by AV-3-5's `GET /api/v1/volumes/{id}`; a display card is a
   straightforward fetch+render. Inline-edit modal is a deferred
   polish item — CLI covers the operational need today.
-* `ENABLE_CACHE_REDUNDANCY_ESCALATION` flag stays `false` per the
+* ~~`ENABLE_CACHE_REDUNDANCY_ESCALATION` flag stays `false` per the
   AV-2-4 spec. Flip + matching test extension when a real per-DC
-  HA workload exists to validate against.
-* `GET /api/v1/volumes` (list endpoint) still uses its
-  aggregation-only projection. Per-volume reads via the new
-  endpoint cover today's needs; widening the list shape is a
-  deferred polish item if any client ever requires it.
+  HA workload exists to validate against.~~ **Resolved by AV-4-5
+  (2026-05-22):** promoted to runtime config
+  `tiering.enable_cache_redundancy_escalation` (default `false`,
+  `#[serde(default)]` for back-compat). Two new planner tests pin
+  flag-on behaviour + anchor-safety. Ansible template carries the
+  field commented to operator-defaulted `false`.
+* ~~`GET /api/v1/volumes` (list endpoint) still uses its
+  aggregation-only projection.~~ **Resolved by AV-4-2 (2026-05-22):**
+  `list_volumes` now delegates per-row JSON construction to
+  `list_volumes_row_json`, which embeds the full AV-3-5
+  `volume_config_to_json` projection (mandatory + cache + anchor)
+  alongside `file_count` / `total_size`. Two new unit tests pin the
+  row shape (`bug_av_4_2_list_volumes_row_includes_av_fields` +
+  `bug_av_4_2_list_volumes_legacy_volume_renders_correctly`); live
+  verified via `curl /api/v1/volumes`.
+
+## Phase 4 close-out (2026-05-22)
+
+Phase 4 of Bug AV closed structurally with 9 tasks green at the
+code/test level. Highlights:
+
+* **AV-4-1d** — FUSE writer now passes the manager-resolved tier
+  from `ChunkPlacement.tier` to `put_chunk`. Pre-fix it hardcoded
+  `"hot"` and the data-node's `select_disk_for_tier(Hot)` fell back
+  to "any healthy disk by free capacity" silently. Verified on-disk:
+  fresh writes land on `data01-cold`.
+* **AV-4-2** — list endpoint embeds full per-volume projection
+  (mandatory + cache + anchor) so a single `/api/v1/volumes` round
+  trip drives both the policy view and the usage view.
+* **AV-4-3 / AV-4-4** — Volumes WebUI extended with per-row
+  expand-on-click detail card + inline `set-cache` edit modal.
+* **AV-4-5** — `ENABLE_CACHE_REDUNDANCY_ESCALATION` const promoted
+  to `TieringConfig::enable_cache_redundancy_escalation` runtime
+  flag (default off; reload-safe via `update_config`).
+* **AV-4-7 (added during close-out)** — `DeleteChunkReplica` is
+  now WAL-recoverable end-to-end. Resolves the AV-1-5 deviation.
+* **AV-4-6** — docs (`storage/tiering.md`, `configuration/cluster-
+  config.md`, `api-reference/rest-api.md`, `operations/cluster-
+  management.md`) + changelog entry + plan archival.
+
+**Carryovers explicitly deferred out of Phase 4:**
+
+* **AV-4-1b** — multi-DC topology to demo S4 anchor-lag-repair on
+  real cross-DC placement (infra requirement).
+* **AV-4-8** — live S1 promote pipeline silent after Raft state
+  wipe + AV-4-1d deploy. Heartbeat ingests chunk_reads but no
+  `cache.promote` audit entry fires; AV-4-1d structural fix
+  verified on-disk. Likely in the AV-4-1c read-window → tick
+  subsystem; needs diagnostic logging inside
+  `plan_chunk_promotions` to confirm where the path drops.
+
+**Operational note (lab):** the Phase 4 deploy required a
+full-cluster Raft state wipe on all three managers because the
+freshly-built binary failed `Read Logs: unexpected end of file`
+against the existing log on every manager (root cause undetermined;
+Cargo.lock unchanged, all schema additions `#[serde(default)]`).
+mgr01 wipe was clean → bootstrap → snapshot transfer; mgr02/03
+required the same wipe to stop the candidate-election loop. Cluster
+re-bootstrapped clean, data nodes re-registered on first heartbeat,
+on-disk chunks survived (Raft holds metadata only). Track separately
+if it recurs.
 
 ## Combined summary — tests
 

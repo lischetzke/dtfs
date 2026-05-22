@@ -75,6 +75,12 @@ cold_threshold_days = {{ dtfs_tiering_cold_days | default(14) }}
 frozen_threshold_days = {{ dtfs_tiering_frozen_days | default(90) }}
 evaluation_interval_secs = {{ dtfs_tiering_eval_interval_secs | default(3600) }}
 migration_bandwidth_limit_mbps = 200
+# Bug AV (AV-4-5) — opt-in for cache-tier redundancy escalation.
+# When `true` the tiering engine may ramp cache replicas past
+# `cache_replicas.<tier>.min` toward `.max` for chunks with sustained
+# read pressure (>= 2 * promote_reads). Leave `false` unless you have
+# a per-DC HA workload that needs the extra copy.
+enable_cache_redundancy_escalation = {{ (dtfs_tiering_enable_cache_redundancy_escalation | default(false)) | string | lower }}
 
 [monitoring]
 heartbeat_interval_secs = 5
