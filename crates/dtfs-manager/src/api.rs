@@ -133,6 +133,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // `cache_replicas`; omitted fields keep their current
         // values. Atomic via Raft UpsertVolume.
         .route("/api/v1/volumes/{id}/set-cache", post(set_volume_cache_endpoint))
+        // Bug AV (AV-4-1a) — operator-friendly mandatory-replica
+        // editor. Mirrors set-cache shape. Rejects all-zero
+        // results (would orphan the durability floor) and
+        // anchor-violating updates (e.g. cold=0 when
+        // anchor.required_tier=cold).
+        .route("/api/v1/volumes/{id}/set-mandatory", post(set_volume_mandatory_endpoint))
         // Stats (aggregate cluster metrics for WebUI home page)
         .route("/api/v1/stats", get(get_stats))
         // HMAC join (phase 1: challenge, phase 2: Raft register)
@@ -1120,6 +1126,134 @@ async fn set_volume_cache_endpoint(
     } else {
         state.audit_log.log(
             "api", "volume.set_cache", &volume_id, "noop",
+        );
+    }
+
+    Ok(Json(json!({
+        "volume_id": volume_id,
+        "changed": changed,
+        "config": volume_config_to_json(&next),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Bug AV (AV-4-1a) — POST /api/v1/volumes/{id}/set-mandatory
+// ---------------------------------------------------------------------------
+
+/// AV-4-1a — request body for
+/// `POST /api/v1/volumes/{id}/set-mandatory`. Every field is
+/// optional; supplied fields are merged onto the current
+/// `mandatory_replicas`. Omitted fields keep their current value
+/// (consistent with AV-3-5's `set-cache` semantics).
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetMandatoryRequest {
+    pub hot_replicas: Option<u32>,
+    pub warm_replicas: Option<u32>,
+    pub cold_replicas: Option<u32>,
+    pub tape_replicas: Option<u32>,
+}
+
+/// AV-4-1a pure helper — merge a partial mandatory_replicas
+/// update onto the current volume config + validate the result.
+///
+/// Validation rules:
+/// 1. **Reject all-zero result.** After the merge, at least one
+///    mandatory tier must be > 0. All-zero would re-enable the
+///    legacy-fallback path inside `effective_mandatory_replicas()`,
+///    which is technically valid but is almost never what the
+///    operator wanted — they should drop the volume + recreate
+///    it explicitly if that's the intent.
+/// 2. **Reject if anchor invariant unsatisfiable.** When the
+///    volume has `anchor.required_tier = Some(tier)`, the
+///    corresponding `mandatory_replicas.<tier>` must be > 0
+///    (otherwise no chunk can ever satisfy the anchor).
+///
+/// Returns the new `VolumeConfig` on success; the dispatcher
+/// decides whether to Raft-write it (skip when current == next).
+pub(crate) fn apply_set_mandatory(
+    current: &dtfs_common::types::VolumeConfig,
+    req: &SetMandatoryRequest,
+) -> Result<dtfs_common::types::VolumeConfig, String> {
+    let mut next = current.clone();
+
+    if let Some(v) = req.hot_replicas  { next.mandatory_replicas.hot  = v; }
+    if let Some(v) = req.warm_replicas { next.mandatory_replicas.warm = v; }
+    if let Some(v) = req.cold_replicas { next.mandatory_replicas.cold = v; }
+    if let Some(v) = req.tape_replicas { next.mandatory_replicas.tape = v; }
+
+    // Validation 1: reject all-zero result.
+    let m = &next.mandatory_replicas;
+    if m.hot == 0 && m.warm == 0 && m.cold == 0 && m.tape == 0 {
+        return Err(
+            "all-zero mandatory_replicas would orphan the durability floor; \
+             drop + recreate the volume if that's intentional".to_string(),
+        );
+    }
+
+    // Validation 2: anchor.required_tier must stay satisfiable.
+    if let Some(anchor) = next.effective_anchor() {
+        if let Some(tier) = anchor.required_tier {
+            let count = match tier {
+                dtfs_common::types::DiskTier::Hot  => m.hot,
+                dtfs_common::types::DiskTier::Warm => m.warm,
+                dtfs_common::types::DiskTier::Cold => m.cold,
+                dtfs_common::types::DiskTier::Tape => m.tape,
+            };
+            if count == 0 {
+                return Err(format!(
+                    "anchor.required_tier = {:?} but mandatory_replicas.{} = 0; \
+                     anchor would be permanently unsatisfiable",
+                    tier,
+                    format!("{:?}", tier).to_lowercase(),
+                ));
+            }
+        }
+    }
+
+    Ok(next)
+}
+
+async fn set_volume_mandatory_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(volume_id): axum::extract::Path<String>,
+    Json(body): Json<SetMandatoryRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    use axum::http::StatusCode;
+
+    let current = {
+        let sm = state.sm_data.read().await;
+        sm.volumes.get(&volume_id).cloned()
+    };
+    let Some(current) = current else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("volume not found: {volume_id}")})),
+        ));
+    };
+
+    let next = apply_set_mandatory(&current, &body)
+        .map_err(|e| (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e})),
+        ))?;
+
+    let changed = current != next;
+    if changed {
+        let req = ClientRequest::UpsertVolume { config: next.clone() };
+        if let Err(e) = state.raft.client_write(req).await {
+            warn!(volume = %volume_id, error = %e,
+                "set_volume_mandatory Raft write failed");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("raft write failed: {e}")})),
+            ));
+        }
+        state.audit_log.log(
+            "api", "volume.set_mandatory", &volume_id, "success",
+        );
+    } else {
+        state.audit_log.log(
+            "api", "volume.set_mandatory", &volume_id, "noop",
         );
     }
 
@@ -2471,5 +2605,155 @@ mod bug_av_set_cache_tests {
             "anchor is None → null, not an empty object (got {})",
             v["anchor"]
         );
+    }
+}
+
+#[cfg(test)]
+mod bug_av_set_mandatory_tests {
+    //! AV-4-1a — pure tests for `apply_set_mandatory`. Mirrors
+    //! the AV-3-5 `bug_av_set_cache_tests` convention (axum
+    //! handler is live-only; the pure helper carries the
+    //! unit-test load).
+    use super::*;
+    use dtfs_common::types::{
+        AnchorPolicy, CacheReplication, DiskTier, TierReplication,
+        VolumeConfig, VolumeId, WriteSafety,
+    };
+
+    fn legacy_volume() -> VolumeConfig {
+        // Same shape as the set-cache test fixture; mandatory all-zero
+        // exercises the legacy-fallback path.
+        VolumeConfig {
+            id: VolumeId("default".to_string()),
+            name: "default".to_string(),
+            chunk_size_bytes: 16 * 1024 * 1024,
+            replication: TierReplication {
+                hot: 0, warm: 2, cold: 1, tape: 0,
+            },
+            mandatory_replicas: TierReplication {
+                hot: 0, warm: 0, cold: 0, tape: 0,
+            },
+            cache_replicas: CacheReplication::default(),
+            anchor: None,
+            anchor_datacenter: None,
+            write_safety: WriteSafety {
+                min_replicas_before_ack: 2,
+                write_timeout_secs: 30,
+            },
+        }
+    }
+
+    /// AV-4-1a test 1 — supplied fields overwrite, omitted
+    /// fields keep their current value. Legacy `replication`
+    /// is preserved as a rollback path.
+    #[test]
+    fn bug_av_set_mandatory_merges_partial_update() {
+        let mut current = legacy_volume();
+        current.mandatory_replicas = TierReplication {
+            hot: 0, warm: 2, cold: 1, tape: 1,
+        };
+        let req = SetMandatoryRequest {
+            warm_replicas: Some(0),  // drop warm
+            cold_replicas: Some(1),  // unchanged
+            tape_replicas: Some(0),  // drop tape
+            ..Default::default()       // hot keeps current = 0
+        };
+        let next = apply_set_mandatory(&current, &req).expect("valid");
+        assert_eq!(next.mandatory_replicas.hot,  0);
+        assert_eq!(next.mandatory_replicas.warm, 0);
+        assert_eq!(next.mandatory_replicas.cold, 1);
+        assert_eq!(next.mandatory_replicas.tape, 0);
+        // Legacy `replication` untouched.
+        assert_eq!(next.replication.warm, 2);
+    }
+
+    /// AV-4-1a test 2 — rejecting all-zero result. Would
+    /// re-enable the legacy fallback silently; not what the
+    /// operator wanted.
+    #[test]
+    fn bug_av_set_mandatory_rejects_all_zero() {
+        let mut current = legacy_volume();
+        current.mandatory_replicas = TierReplication {
+            hot: 0, warm: 2, cold: 1, tape: 0,
+        };
+        let req = SetMandatoryRequest {
+            warm_replicas: Some(0),
+            cold_replicas: Some(0),
+            // hot + tape stay at 0.
+            ..Default::default()
+        };
+        let err = apply_set_mandatory(&current, &req).unwrap_err();
+        assert!(err.contains("all-zero"),
+            "error must explain the all-zero rejection: {err}");
+    }
+
+    /// AV-4-1a test 3 — rejecting an update that would make
+    /// the anchor invariant permanently unsatisfiable.
+    #[test]
+    fn bug_av_set_mandatory_rejects_anchor_required_tier_zero() {
+        let mut current = legacy_volume();
+        current.mandatory_replicas = TierReplication {
+            hot: 0, warm: 0, cold: 1, tape: 0,
+        };
+        current.anchor = Some(AnchorPolicy {
+            datacenter: "leli".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        });
+        let req = SetMandatoryRequest {
+            cold_replicas: Some(0),
+            warm_replicas: Some(2), // satisfy the all-zero rule
+            ..Default::default()
+        };
+        let err = apply_set_mandatory(&current, &req).unwrap_err();
+        assert!(err.contains("anchor"),
+            "error must mention anchor: {err}");
+        assert!(err.contains("Cold") || err.contains("cold"),
+            "error must name the offending tier: {err}");
+    }
+
+    /// AV-4-1a test 4 — calling set-mandatory on a legacy
+    /// volume (current mandatory all-zero) populates the new
+    /// field without disturbing legacy `replication`. The
+    /// operator can use this as an alternative to
+    /// migrate-policy when they want different mandatory
+    /// values than the legacy field carries.
+    #[test]
+    fn bug_av_set_mandatory_legacy_volume_round_trips() {
+        let current = legacy_volume(); // mandatory all-zero
+        assert_eq!(current.mandatory_replicas.hot,  0);
+        assert_eq!(current.mandatory_replicas.warm, 0);
+        assert_eq!(current.mandatory_replicas.cold, 0);
+        assert_eq!(current.mandatory_replicas.tape, 0);
+
+        let req = SetMandatoryRequest {
+            cold_replicas: Some(1),
+            ..Default::default()
+        };
+        let next = apply_set_mandatory(&current, &req).expect("valid");
+
+        // New mandatory_replicas populated.
+        assert_eq!(next.mandatory_replicas.cold, 1);
+        // Legacy replication untouched (rollback safety).
+        assert_eq!(next.replication.warm, 2);
+        assert_eq!(next.replication.cold, 1);
+        // effective_mandatory_replicas now returns the new field
+        // (cold=1) rather than the legacy fallback (warm=2, cold=1).
+        assert_eq!(next.effective_mandatory_replicas().cold, 1);
+        assert_eq!(next.effective_mandatory_replicas().warm, 0,
+            "new mandatory_replicas takes precedence over legacy");
+    }
+
+    /// AV-4-1a defensive — empty request body produces an
+    /// unchanged clone (so the dispatcher detects no-op and
+    /// skips the Raft write).
+    #[test]
+    fn bug_av_set_mandatory_empty_request_is_noop() {
+        let mut current = legacy_volume();
+        current.mandatory_replicas = TierReplication {
+            hot: 0, warm: 2, cold: 1, tape: 0,
+        };
+        let req = SetMandatoryRequest::default();
+        let next = apply_set_mandatory(&current, &req).expect("empty req valid");
+        assert_eq!(current, next);
     }
 }

@@ -162,6 +162,27 @@ enum VolumesCmd {
         #[arg(long)]
         cooldown_secs: Option<u64>,
     },
+    /// Bug AV (AV-4-1a) — set or update the volume's
+    /// `mandatory_replicas` (durability floor enforced by the
+    /// under-replication scheduler). Every flag is optional;
+    /// omitted flags keep the current value. Rejects all-zero
+    /// results and anchor-violating updates.
+    SetMandatory {
+        /// Volume id to update.
+        volume_id: String,
+        /// Required hot-tier replicas (default keep current).
+        #[arg(long)]
+        hot_replicas: Option<u32>,
+        /// Required warm-tier replicas (default keep current).
+        #[arg(long)]
+        warm_replicas: Option<u32>,
+        /// Required cold-tier replicas (default keep current).
+        #[arg(long)]
+        cold_replicas: Option<u32>,
+        /// Required tape-tier replicas (default keep current).
+        #[arg(long)]
+        tape_replicas: Option<u32>,
+    },
 }
 
 /// Bug AV (AV-3-5) — file-level commands. The legacy
@@ -276,6 +297,15 @@ async fn main() -> anyhow::Result<()> {
                     &api, &args.format, &volume_id,
                     warm_min, warm_max, hot_min, hot_max,
                     per_dc, promote_reads, promote_window_secs, cooldown_secs,
+                ).await?
+            }
+            VolumesCmd::SetMandatory {
+                volume_id,
+                hot_replicas, warm_replicas, cold_replicas, tape_replicas,
+            } => {
+                cmd_volumes_set_mandatory(
+                    &api, &args.format, &volume_id,
+                    hot_replicas, warm_replicas, cold_replicas, tape_replicas,
                 ).await?
             }
         },
@@ -614,6 +644,50 @@ async fn cmd_volumes_set_cache(
             println!("  promote_reads:        {}", c["promote_reads"].as_u64().unwrap_or(2));
             println!("  promote_window_secs:  {}", c["promote_window_secs"].as_u64().unwrap_or(14_400));
             println!("  cooldown_secs:        {}", c["cooldown_secs"].as_u64().unwrap_or(300));
+        }
+    }
+    Ok(())
+}
+
+/// AV-4-1a — `dtfs-cli volumes set-mandatory <id> [--cold-replicas N ...]`:
+/// patch the volume's `mandatory_replicas`. Only supplied flags
+/// are merged; others keep current values. Server-side validation
+/// rejects all-zero results and anchor-violating updates.
+async fn cmd_volumes_set_mandatory(
+    api: &ApiClient,
+    format: &OutputFormat,
+    volume_id: &str,
+    hot_replicas: Option<u32>,
+    warm_replicas: Option<u32>,
+    cold_replicas: Option<u32>,
+    tape_replicas: Option<u32>,
+) -> anyhow::Result<()> {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = hot_replicas  { body.insert("hot_replicas".into(),  v.into()); }
+    if let Some(v) = warm_replicas { body.insert("warm_replicas".into(), v.into()); }
+    if let Some(v) = cold_replicas { body.insert("cold_replicas".into(), v.into()); }
+    if let Some(v) = tape_replicas { body.insert("tape_replicas".into(), v.into()); }
+    let body = serde_json::Value::Object(body);
+
+    let url = format!("/api/v1/volumes/{}/set-mandatory", volume_id);
+    let resp = api.post(&url, &body).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => {
+            let changed = resp["changed"].as_bool().unwrap_or(false);
+            let m = &resp["config"]["mandatory_replicas"];
+            println!(
+                "Volume '{}' set-mandatory: {}",
+                volume_id,
+                if changed { "applied" } else { "no-op" },
+            );
+            println!(
+                "  hot={} warm={} cold={} tape={}",
+                m["hot"].as_u64().unwrap_or(0),
+                m["warm"].as_u64().unwrap_or(0),
+                m["cold"].as_u64().unwrap_or(0),
+                m["tape"].as_u64().unwrap_or(0),
+            );
         }
     }
     Ok(())
