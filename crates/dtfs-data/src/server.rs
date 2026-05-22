@@ -251,7 +251,7 @@ impl DataService for DataServiceImpl {
         let hash = hasher.finalize();
         let chunk_id = ChunkId::from_bytes(hash);
 
-        let meta = self
+        let (meta, disk_id) = self
             .store
             .commit_chunk_from_tmp(&chunk_id, &tmp_path, &vol_id, tier, total_size, hash)
             .await
@@ -277,6 +277,7 @@ impl DataService for DataServiceImpl {
             size: meta.size,
             checksum: hex::encode(&meta.checksum),
             success: true,
+            disk_id,
         }))
     }
 

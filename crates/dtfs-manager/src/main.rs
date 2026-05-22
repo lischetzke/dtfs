@@ -231,7 +231,18 @@ async fn main() -> anyhow::Result<()> {
         // node round-robin happens to pick. Plexmedia operator sets
         // `defaults.anchor_datacenter = "leli"` so data-primary01 holds a
         // copy of every chunk.
+        //
+        // AV-4-8 fix — the upsert is **insert-if-missing**, not
+        // unconditional. Pre-fix every manager boot called
+        // `UpsertVolume { config: bootstrap_default }` and the state-
+        // machine's apply path is a blind `volumes.insert(id, config)`,
+        // so any operator-supplied `set-cache` / `set-mandatory` on
+        // `default` was silently destroyed on the next manager restart.
+        // We now check the SM first and skip the upsert when `default`
+        // already exists; a fresh cluster (no existing entry) still
+        // gets the bootstrap volume.
         let raft_for_volume = raft.clone();
+        let sm_data_for_bootstrap = sm_data.clone();
         let default_volume_replication = config.defaults.replication.clone();
         let default_chunk_size_bytes =
             (config.defaults.chunk_size_mb as u64).saturating_mul(1024 * 1024);
@@ -240,6 +251,16 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             // Wait for raft to elect a leader before proposing.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            // AV-4-8 — skip when the operator already configured the
+            // default volume (typical post-bootstrap restart).
+            if sm_data_for_bootstrap.read().await.volumes.contains_key("default") {
+                tracing::info!(
+                    "Bug Z default volume already present; skipping bootstrap upsert (operator config preserved)"
+                );
+                return;
+            }
+
             let vol_cfg = dtfs_common::types::VolumeConfig {
                 id: dtfs_common::types::VolumeId::new("default".to_string()),
                 name: "default".to_string(),
@@ -261,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
             {
                 Ok(_) => tracing::info!(
                     anchor = ?default_anchor,
-                    "Bug Z default volume upserted with anchor enforcement"
+                    "Bug Z default volume upserted with anchor enforcement (fresh cluster)"
                 ),
                 Err(e) => {
                     tracing::warn!(error = %e, "Bug Z default volume upsert failed at bootstrap")

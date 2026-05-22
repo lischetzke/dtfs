@@ -59,6 +59,12 @@ message PutChunkResponse {
   uint64 size = 2;
   string checksum = 3;    // Hex-encoded BLAKE3 checksum
   bool success = 4;
+  // AV-4-8 — disk_id the chunk physically landed on. The FUSE writer
+  // propagates this into ChunkLocationCommit so the manager's
+  // `id_to_tiers` lookup resolves the correct tier; pre-fix FUSE
+  // hardcoded `disk_id: 0` and the cache planner saw every cold-tier
+  // placement as warm-tier, killing the cache lifecycle.
+  uint32 disk_id = 5;
 }
 
 // --- GetChunk ---

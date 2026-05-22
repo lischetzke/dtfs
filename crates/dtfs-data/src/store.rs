@@ -339,7 +339,7 @@ impl ChunkStore {
         tier: DiskTier,
         size: u64,
         checksum: [u8; 32],
-    ) -> DtfsResult<ChunkMeta> {
+    ) -> DtfsResult<(ChunkMeta, u32)> {
         let outcome = self
             .commit_chunk_from_tmp_inner(chunk_id, tmp_path, volume_id, tier, size, checksum)
             .await;
@@ -358,7 +358,7 @@ impl ChunkStore {
         tier: DiskTier,
         size: u64,
         checksum: [u8; 32],
-    ) -> DtfsResult<ChunkMeta> {
+    ) -> DtfsResult<(ChunkMeta, u32)> {
         // Look up the disk that owns this tmp path.
         let disk = self
             .disk_manager
@@ -372,6 +372,7 @@ impl ChunkStore {
                 ))
             })?
             .clone();
+        let disk_id = disk.disk_id;
         let _ = tier; // tier is informational here — disk is already chosen
 
         let chunk_dir = chunk_data_dir(&disk.mount_path, chunk_id);
@@ -449,12 +450,13 @@ impl ChunkStore {
         self.bytes_stored.fetch_add(size, Ordering::Relaxed);
 
         tracing::debug!(
-            "Streamed chunk {} ({} bytes) onto disk {}",
+            "Streamed chunk {} ({} bytes) onto disk {} (disk_id={})",
             chunk_id,
             size,
-            disk.mount_path.display()
+            disk.mount_path.display(),
+            disk_id,
         );
-        Ok(meta)
+        Ok((meta, disk_id))
     }
 
     /// Read a chunk from disk.
@@ -1421,7 +1423,7 @@ mod tests {
         let chunk_id = ChunkId::from_bytes(hash);
 
         // Commit.
-        let meta = store
+        let (meta, _disk_id) = store
             .commit_chunk_from_tmp(&chunk_id, &tmp_path, &volume_id, DiskTier::Hot, size, hash)
             .await
             .expect("commit succeeds");
@@ -1506,7 +1508,7 @@ mod tests {
         }
         let hash = dtfs_common::checksum::compute(payload);
         let chunk_id = ChunkId::from_bytes(hash);
-        let meta = store
+        let (meta, _disk_id) = store
             .commit_chunk_from_tmp(
                 &chunk_id,
                 &tmp_path,
