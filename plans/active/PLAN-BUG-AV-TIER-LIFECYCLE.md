@@ -1211,7 +1211,135 @@ This task fills that gap so the test setup can convert
   cooldown behaviour. After verification, flip AV-4-1's
   🟨 to ✅ with a reference to this fixup commit.
 
-### ⬜ AV-4-1c — Diagnose reads→tiering pipeline gap (~0.5-1 d) — _newly-discovered blocker_
+### ✅ AV-4-1c — Reads→tiering pipeline fixes (~1 d) — _three real bugs found_
+
+The "single bug" hypothesis turned into three:
+
+1. **FUSE-side cache-hit reads were invisible to tiering.**
+   The readahead in-memory cache absorbed repeat reads
+   before they reached the data-node; the per-DC counter
+   never reached `promote_reads`. Fix: new lightweight
+   `DataService.RecordCacheHit` RPC; FUSE fires
+   fire-and-forget on every readahead + local-cache hit.
+2. **Manager treated heartbeat counts as cumulative,
+   data-node sent them as deltas.** `harvest_per_chunk`
+   swap-resets counters to 0 each harvest; the manager's
+   `report_access` compared `new` to a stored `prev` and
+   pushed `new - old`. Every heartbeat after the first
+   silently dropped reads (because `new < prev`). Fix:
+   extract `apply_heartbeat_reads` pure helper that
+   pushes the value directly as a delta; drop the now-
+   useless `prev_reads_by_dc` field.
+3. **Placement engine consulted legacy `replication`,
+   not `mandatory_replicas`.** `allocate_chunks` for a
+   volume with `mandatory.cold=1 + legacy.warm=2`
+   silently picked Warm (because `pick_effective_tier`
+   prefers higher tiers and `replication.warm=2 > 0`).
+   New writes landed on warm, saturating the
+   `cache_replicas.warm.max=1` cap on first write and
+   permanently blocking demand-driven promotion. Fix:
+   new `resolve_volume_placement` wrapper that always
+   passes `effective_mandatory_replicas()` to
+   `resolve_preferred_tier`.
+
+* **Files:** `proto/data.proto` (new RPC),
+  `crates/dtfs-data/src/server.rs` (handler),
+  `crates/dtfs-data/src/metrics.rs` (3 regression tests),
+  `crates/dtfs-client/src/client.rs` (new method),
+  `crates/dtfs-fuse/src/filesystem.rs` (fire on cache
+  hit), `crates/dtfs-manager/src/tiering.rs`
+  (`apply_heartbeat_reads` helper + 4 regression
+  tests; drop `prev_reads_by_dc`),
+  `crates/dtfs-manager/src/metadata.rs`
+  (`resolve_volume_placement` helper + 3 regression
+  tests).
+* **Tests (10 new, all green):**
+  - `bug_av_4_1c_repeat_reads_count_in_per_dc_bucket`
+    (data-node metrics).
+  - `bug_av_4_1c_same_dc_same_chunk_aggregates_one_bucket`
+    (data-node metrics).
+  - `bug_av_4_1c_empty_dc_falls_back_to_unknown_bucket`
+    (data-node metrics, defensive).
+  - `bug_av_4_1c_heartbeat_treated_as_delta_not_cumulative`
+    (manager tiering — pins the heartbeat-delta
+    contract).
+  - `bug_av_4_1c_zero_count_does_not_create_bucket`
+    (manager tiering, defensive).
+  - `bug_av_4_1c_per_dc_buckets_isolated`
+    (manager tiering, defensive).
+  - `bug_av_4_1c_chunk_id_isolates_buckets`
+    (manager tiering, defensive).
+  - `bug_av_4_1c_placement_uses_mandatory_not_legacy_replication`
+    (manager metadata — pins the placement contract).
+  - `bug_av_4_1c_explicit_warm_hint_still_wins_over_mandatory`
+    (manager metadata, defensive).
+  - `bug_av_4_1c_legacy_volume_keeps_legacy_replication_behaviour`
+    (manager metadata, back-compat guard).
+* **Workspace test count**: dtfs-data 54→57,
+  dtfs-manager 109→116. Full
+  `cargo test --workspace --release` green.
+* **Live verification:** binaries rolled to mini-mgr01
+  + mini-mgr02 + mini-mgr03 + mini-data01 + mini-data02
+  + mini-client01. Cache-hit RPCs visible in
+  diagnostic-build logs; manager's `tick_av_cache`
+  reports non-zero `reads_in_window_total` on fresh
+  reads (was always 0 pre-fix). End-to-end S1 still
+  fails on `15-bug-av-cache-lifecycle.sh` because of
+  the newly-discovered AV-4-1d below.
+* **Disposition:** ✅ — the three fixes are
+  structurally complete, regression-tested at the right
+  layer per CLAUDE.md § 4, and live-verified to do
+  their individual jobs. End-to-end S1 demo still gates
+  on AV-4-1d (writes hardcoded to "hot" tier in FUSE
+  filesystem.rs line 1542).
+
+### 🟦 AV-4-1d — FUSE `write_chunk_bytes` hardcodes `tier: "hot"` (~0.5 d) — _newly-discovered_
+
+While verifying AV-4-1c live, the diagnostic snapshot
+showed fresh writes landing on **warm**, not cold, even
+though the manager's `allocate_chunks` (post AV-4-1c)
+correctly resolved to Cold. Tracing it:
+
+`crates/dtfs-fuse/src/filesystem.rs:1542` —
+```rust
+.write_chunk_bytes(&addr, "", &volume_id, "hot", data)
+```
+
+The tier value sent to the data-node is hardcoded
+`"hot"`. The data-node's `select_disk_for_tier(Hot)`
+finds no hot-tier disk on the minicluster, falls back to
+"any healthy disk by free capacity" (see
+`disk.rs:106-109`), and writes to warm (which has more
+free space than cold on data02).
+
+So the placement decision the manager makes is correct
+at the AllocateChunks level, but the FUSE writer
+ignores it and the data-node fallback path lands on the
+wrong tier.
+
+* **Files:** `proto/manager.proto` (add `string tier =
+  N` to `ChunkPlacement`),
+  `crates/dtfs-manager/src/metadata.rs` (populate
+  `tier` in each placement),
+  `crates/dtfs-fuse/src/filesystem.rs` (read
+  `placement.tier`, pass to `write_chunk_bytes`).
+* **Tests:**
+  - `bug_av_4_1d_allocate_chunks_response_carries_tier`
+    — manager populates `placement.tier` from
+    `resolve_volume_placement` output.
+  - `bug_av_4_1d_fuse_uses_placement_tier_not_hardcoded`
+    — requires a small wrapper that returns the tier
+    string FUSE would send for a given placement. Or
+    pin via `assert!(!source.contains("\"hot\""))` style
+    check on `filesystem.rs`'s write-segment loop.
+* **Done when:** 2 tests + AV-4-1's
+  `15-bug-av-cache-lifecycle.sh` S1 produces a real
+  `cache.promote` audit entry on the minicluster.
+  Re-uses the AV-4-1c regression tests as gates
+  (heartbeat-delta + placement-uses-mandatory still
+  green).
+
+### ⬜ AV-4-1b — Multi-DC topology for S4 anchor-lag-repair demo (~1-2 d) — _deferred_
 
 Discovered during AV-4-1a live verification. With AV-4-1a in
 place, `default` was successfully converted to cold-only

@@ -50,14 +50,10 @@ pub struct TieringEngine {
     /// P1-8: optional alert dispatcher. Anchor refusals fire here.
     alerts: Option<Arc<crate::alerts::AlertDispatcher>>,
     /// Bug AV (AV-2-1) — per-(chunk_id, dc) sliding window of reads.
-    /// Pushed by `report_access` on positive heartbeat deltas; consumed
-    /// by `tick_av_cache` for promotion decisions.
+    /// Each heartbeat appends a fresh `ReadSample` carrying the
+    /// per-harvest delta (AV-4-1c fix); `tick_av_cache` reads
+    /// these for promotion decisions.
     read_windows: RwLock<HashMap<(String, String), Vec<ReadSample>>>,
-    /// Bug AV (AV-2-4) — last observed `reads_by_dc` value per
-    /// (chunk_id, dc). Used to compute the delta on each heartbeat
-    /// so we don't double-count reads carried inside the data
-    /// node's own 1h sliding window.
-    prev_reads_by_dc: RwLock<HashMap<(String, String), u32>>,
 }
 
 impl TieringEngine {
@@ -75,7 +71,6 @@ impl TieringEngine {
             access_stats: RwLock::new(HashMap::new()),
             alerts: None,
             read_windows: RwLock::new(HashMap::new()),
-            prev_reads_by_dc: RwLock::new(HashMap::new()),
         }
     }
 
@@ -152,28 +147,19 @@ impl TieringEngine {
         profile.current_node = current_node;
         drop(stats);
 
-        // Bug AV (AV-2-4) — track per-(chunk, dc) deltas to feed the
-        // read-window store. The data node already reports a
-        // 1h-windowed counter (`reads_by_dc_1h`); we record only the
-        // positive deltas as samples so the manager-side window
-        // doesn't double-count reads that the data-node window
-        // already smoothed.
-        let mut prev = self.prev_reads_by_dc.write().await;
+        // Bug AV (AV-4-1c fix) — feed per-(chunk, dc) reads into the
+        // read-window store. The data-node's `harvest_per_chunk`
+        // reports the count of reads SINCE THE LAST HARVEST and
+        // swap-resets the counter to 0; the manager must treat the
+        // incoming value as a per-heartbeat delta and push it
+        // directly. The earlier AV-2-4 implementation compared the
+        // incoming value to a stored "prev" and pushed `new - old`,
+        // which silently dropped every read after the first
+        // heartbeat (the harvest reset makes "new" smaller than
+        // "old" on every subsequent heartbeat). Regression-tested
+        // by `bug_av_4_1c_heartbeat_treated_as_delta_not_cumulative`.
         let mut windows = self.read_windows.write().await;
-        for (dc, new_val) in reads_by_dc.iter() {
-            let key = (chunk_id.to_string(), dc.clone());
-            let old_val = prev.get(&key).copied().unwrap_or(0);
-            if *new_val > old_val {
-                let delta = *new_val - old_val;
-                windows
-                    .entry(key.clone())
-                    .or_default()
-                    .push(ReadSample { ts_ms: now_ms, count: delta });
-            }
-            // Always update the stored "last seen" value, including
-            // when it drops (data-node 1h window slid past a read).
-            prev.insert(key, *new_val);
-        }
+        apply_heartbeat_reads(chunk_id, &reads_by_dc, now_ms, &mut windows);
     }
 
     /// Bug AV (AV-2-4) — return a snapshot of the read window for a
@@ -890,6 +876,36 @@ pub(crate) fn count_reads_in_window(
     total
 }
 
+/// Bug AV (AV-4-1c) — pure helper that ingests a per-heartbeat
+/// `reads_by_dc` payload into the read-window store. The data-
+/// node's `harvest_per_chunk` returns the count of reads SINCE
+/// the last harvest and swap-resets the counter to 0, so each
+/// incoming value is a delta — push it directly. Zero counts
+/// are ignored (no point creating an empty bucket).
+///
+/// Extracted as a free function so `report_access` becomes a
+/// thin wrapper and the delta-semantics live in one
+/// unit-testable place. Regressions surface in
+/// `bug_av_4_1c_heartbeat_treated_as_delta_not_cumulative` and
+/// friends.
+pub(crate) fn apply_heartbeat_reads(
+    chunk_id: &str,
+    reads_by_dc: &HashMap<String, u32>,
+    now_ms: u64,
+    windows: &mut HashMap<(String, String), Vec<ReadSample>>,
+) {
+    for (dc, count) in reads_by_dc.iter() {
+        if *count == 0 {
+            continue;
+        }
+        let key = (chunk_id.to_string(), dc.clone());
+        windows
+            .entry(key)
+            .or_default()
+            .push(ReadSample { ts_ms: now_ms, count: *count });
+    }
+}
+
 /// AV-2-1 housekeeping helper — drop samples older than the window.
 /// Intended for in-place pruning of the ring-buffer that the engine
 /// keeps in its `read_windows` map. Not a hot-path operation; called
@@ -1555,6 +1571,110 @@ mod bug_av_read_window_tests {
         let mut s2 = samples.clone();
         prune_read_window(&mut s2, 1_000_000, 0);
         assert!(s2.is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Bug AV (AV-4-1c) — heartbeat-delta semantics
+    // ─────────────────────────────────────────────────────────────
+    //
+    // Pre-fix, `report_access` treated the incoming heartbeat
+    // `reads_by_dc` as a CUMULATIVE counter and pushed `new - old`
+    // as the sample. The data-node's `harvest_per_chunk` already
+    // returns a per-harvest delta (the counter is swap-reset to
+    // 0 after each harvest), so the manager dropped every read
+    // after the first heartbeat per chunk. The cache-promotion
+    // threshold never fired in production and the AV-4-1 live
+    // demo silently failed every run.
+    //
+    // The fix lives in `apply_heartbeat_reads` (free function);
+    // these tests pin its semantics so a refactor can't regress
+    // the contract.
+
+    fn hb(entries: &[(&str, u32)]) -> std::collections::HashMap<String, u32> {
+        let mut m = std::collections::HashMap::new();
+        for (k, v) in entries { m.insert(k.to_string(), *v); }
+        m
+    }
+
+    /// Regression #1 — three heartbeats reporting `(2, 3, 1)`
+    /// reads-since-last-harvest in `dc-a` must accumulate to
+    /// 6 total samples in the window. Pre-fix the manager would
+    /// have stored 2 + max(0, 3-2) + max(0, 1-3) = 2 + 1 + 0 = 3,
+    /// losing half the reads.
+    #[test]
+    fn bug_av_4_1c_heartbeat_treated_as_delta_not_cumulative() {
+        let mut windows = std::collections::HashMap::new();
+        let chunk = "x";
+        apply_heartbeat_reads(chunk, &hb(&[("dc-a", 2)]), 1_000, &mut windows);
+        apply_heartbeat_reads(chunk, &hb(&[("dc-a", 3)]), 6_000, &mut windows);
+        apply_heartbeat_reads(chunk, &hb(&[("dc-a", 1)]), 11_000, &mut windows);
+
+        let key = (chunk.to_string(), "dc-a".to_string());
+        let samples = windows.get(&key).expect("dc-a bucket exists");
+        let total: u32 = samples.iter().map(|s| s.count).sum();
+        assert_eq!(
+            total, 6,
+            "three heartbeats of (2, 3, 1) reads must accumulate to 6; \
+             treating the heartbeat value as a cumulative counter would \
+             have produced 3 (silent regression of the cache-promotion \
+             pipeline)"
+        );
+        // And the window count helper must see all 6 too.
+        let counted = count_reads_in_window(samples, 11_000, 60);
+        assert_eq!(counted, 6);
+    }
+
+    /// Regression #2 — a heartbeat carrying a zero count for a
+    /// DC must NOT create an empty bucket. (Empty buckets would
+    /// confuse the planner's `chunks.reads_in_window_by_dc.keys()
+    /// .collect()` iteration into "saw activity here" when there
+    /// was none.)
+    #[test]
+    fn bug_av_4_1c_zero_count_does_not_create_bucket() {
+        let mut windows = std::collections::HashMap::new();
+        apply_heartbeat_reads("x", &hb(&[("dc-a", 0)]), 1_000, &mut windows);
+        assert!(
+            windows.get(&("x".to_string(), "dc-a".to_string())).is_none(),
+            "zero-count heartbeat must not create an empty bucket"
+        );
+    }
+
+    /// Regression #3 — multiple DCs in the same heartbeat each
+    /// land in their own bucket. Guards against accidental
+    /// aggregation across DCs.
+    #[test]
+    fn bug_av_4_1c_per_dc_buckets_isolated() {
+        let mut windows = std::collections::HashMap::new();
+        apply_heartbeat_reads(
+            "x",
+            &hb(&[("dc-a", 2), ("dc-b", 5)]),
+            1_000,
+            &mut windows,
+        );
+        let dc_a = windows.get(&("x".to_string(), "dc-a".to_string())).unwrap();
+        let dc_b = windows.get(&("x".to_string(), "dc-b".to_string())).unwrap();
+        assert_eq!(dc_a.iter().map(|s| s.count).sum::<u32>(), 2);
+        assert_eq!(dc_b.iter().map(|s| s.count).sum::<u32>(), 5);
+    }
+
+    /// Regression #4 — repeated heartbeats for the same chunk
+    /// from DIFFERENT chunks must not collide. Guards the
+    /// (chunk_id, dc) compound key.
+    #[test]
+    fn bug_av_4_1c_chunk_id_isolates_buckets() {
+        let mut windows = std::collections::HashMap::new();
+        apply_heartbeat_reads("chunk-a", &hb(&[("dc-a", 2)]), 1_000, &mut windows);
+        apply_heartbeat_reads("chunk-b", &hb(&[("dc-a", 3)]), 1_000, &mut windows);
+        assert_eq!(
+            windows.get(&("chunk-a".to_string(), "dc-a".to_string()))
+                .unwrap().iter().map(|s| s.count).sum::<u32>(),
+            2,
+        );
+        assert_eq!(
+            windows.get(&("chunk-b".to_string(), "dc-a".to_string()))
+                .unwrap().iter().map(|s| s.count).sum::<u32>(),
+            3,
+        );
     }
 }
 

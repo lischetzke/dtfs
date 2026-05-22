@@ -246,4 +246,120 @@ mod tests {
         assert_eq!(snap.total_reads, 0);
         assert_eq!(snap.total_writes, 0);
     }
+
+    // ─────────────────────────────────────────────────────────────
+    // Bug AV (AV-4-1c) — repeat-reads-via-cache regression contract
+    // ─────────────────────────────────────────────────────────────
+
+    /// Bug AV-4-1c regression test #1.
+    ///
+    /// The promotion threshold (`cache_replicas.promote_reads`,
+    /// default 2) counts CLIENT reads — not network reads. The
+    /// FUSE readahead cache absorbs repeat reads of the same
+    /// chunk, so without an explicit cache-hit notification path
+    /// the data-node's `record_chunk_read` counter only fires
+    /// once even if the user `cat`s the file 100 times in quick
+    /// succession.
+    ///
+    /// Invariant this test pins: **N successful
+    /// `record_chunk_read` calls (regardless of which path
+    /// triggered them — cache miss via `get_chunk`, or cache hit
+    /// via the AV-4-1c `record_cache_hit` RPC) MUST produce N
+    /// in the per-DC counter for that chunk.** Anything else
+    /// silently understates demand and breaks the cache-
+    /// promotion lifecycle.
+    ///
+    /// If this test starts failing, look at:
+    /// - The FUSE filesystem's readahead-cache-hit path
+    ///   (`filesystem.rs`): does it still call
+    ///   `client.record_cache_hit(...)` on every cache hit?
+    /// - The data-node's `record_cache_hit` handler
+    ///   (`server.rs`): does it still funnel into
+    ///   `metrics.record_chunk_read(...)`?
+    /// - The metrics struct here: does `record_chunk_read`
+    ///   still increment the per-DC bucket atomically?
+    #[test]
+    fn bug_av_4_1c_repeat_reads_count_in_per_dc_bucket() {
+        let m = DataMetrics::new();
+        let chunk = "deadbeef0000000000000000000000000000000000000000000000000000aaaa";
+        // Simulate 5 client reads of the same chunk from dc-a.
+        // First read = cache miss (would go via get_chunk).
+        // Reads 2-5 = readahead cache hits (would go via the
+        // AV-4-1c record_cache_hit RPC). At this layer both
+        // paths funnel into record_chunk_read, so the test
+        // calls it 5 times directly.
+        for i in 0..5 {
+            m.record_chunk_read(chunk, "dc-a", 1_000_000 + i);
+        }
+        let harvest = m.harvest_per_chunk(100);
+        assert_eq!(harvest.len(), 1, "exactly one chunk reported");
+        let entry = &harvest[0];
+        assert_eq!(entry.chunk_id, chunk);
+        let dc_a_count = entry.reads_by_dc.get("dc-a").copied().unwrap_or(0);
+        assert_eq!(
+            dc_a_count, 5,
+            "all 5 client reads must show up in the per-DC counter; \
+             FUSE cache-hit notifications regressed if this drops"
+        );
+    }
+
+    /// Bug AV-4-1c regression test #2.
+    ///
+    /// The promotion math depends on counting reads in a
+    /// `promote_window_secs` window. If `record_chunk_read`
+    /// happens to record under a DIFFERENT bucket key when the
+    /// FUSE client sends a different `requester_dc` value on
+    /// cache-hit vs cache-miss paths, the per-DC count
+    /// silently splits and the threshold never fires.
+    ///
+    /// Invariant: **the same `(chunk_id, requester_dc)` pair
+    /// MUST aggregate into the same bucket, regardless of
+    /// which RPC path drove it.**
+    #[test]
+    fn bug_av_4_1c_same_dc_same_chunk_aggregates_one_bucket() {
+        let m = DataMetrics::new();
+        let chunk = "feedface0000000000000000000000000000000000000000000000000000bbbb";
+        // Three reads from dc-a, alternating "as if" cache
+        // hit / miss paths (since both call record_chunk_read,
+        // they MUST aggregate into one bucket).
+        m.record_chunk_read(chunk, "dc-a", 1_000);
+        m.record_chunk_read(chunk, "dc-a", 1_010);
+        m.record_chunk_read(chunk, "dc-a", 1_020);
+        let harvest = m.harvest_per_chunk(100);
+        assert_eq!(harvest.len(), 1);
+        assert_eq!(
+            harvest[0].reads_by_dc.len(),
+            1,
+            "all reads from dc-a must aggregate into one (chunk, dc) bucket"
+        );
+        assert_eq!(
+            harvest[0].reads_by_dc.get("dc-a").copied(),
+            Some(3),
+            "three reads must produce count=3 in the dc-a bucket"
+        );
+    }
+
+    /// Bug AV-4-1c regression test #3.
+    ///
+    /// An empty `requester_dc` (which would happen if FUSE
+    /// forgot to call `set_requester_location` before its
+    /// first read, or if the proto field wasn't populated)
+    /// should land in the `"unknown"` bucket, NOT silently
+    /// drop the read. Otherwise the per-DC counter
+    /// understates demand without any error trail.
+    #[test]
+    fn bug_av_4_1c_empty_dc_falls_back_to_unknown_bucket() {
+        let m = DataMetrics::new();
+        let chunk = "1234567800000000000000000000000000000000000000000000000000000000";
+        m.record_chunk_read(chunk, "", 1_000);
+        m.record_chunk_read(chunk, "", 1_001);
+        let harvest = m.harvest_per_chunk(100);
+        assert_eq!(harvest.len(), 1);
+        assert_eq!(
+            harvest[0].reads_by_dc.get("unknown").copied(),
+            Some(2),
+            "empty requester_dc must map to the 'unknown' bucket so the \
+             reads are still visible — not silently dropped"
+        );
+    }
 }

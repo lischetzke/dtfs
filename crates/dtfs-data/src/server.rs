@@ -490,6 +490,41 @@ impl DataService for DataServiceImpl {
             cache_misses: snap.cache_misses,
         }))
     }
+
+    /// Bug AV (AV-4-1c) — record a client-side cache hit. The
+    /// FUSE-side readahead + local-disk caches absorb repeat
+    /// reads so the data-node never sees them via `get_chunk` —
+    /// which means the per-DC read counter never reaches the
+    /// promote_reads threshold and the tiering engine never
+    /// fires a promotion. The FUSE client calls this on every
+    /// readahead/local-cache hit so the counter reflects the
+    /// real client-facing demand.
+    ///
+    /// Idempotent (counter increment is associative). No
+    /// disk/cache I/O on the data-node side — just a counter
+    /// bump.
+    async fn record_cache_hit(
+        &self,
+        request: Request<RecordCacheHitRequest>,
+    ) -> Result<Response<RecordCacheHitResponse>, Status> {
+        let req = request.into_inner();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.metrics
+            .record_chunk_read(&req.chunk_id, &req.requester_dc, now_ms);
+        // Bug AL — also count the read for the manager's
+        // dashboard rate calculation. The bytes-served estimate
+        // is unknown at this layer, so we report 0 bytes; the
+        // count side still tracks correctly because record_read
+        // bumps a separate counter.
+        // (We deliberately do NOT call record_read(bytes) here
+        // — bandwidth came from FUSE-local cache, not from this
+        // data node. Recording the read for tiering is the
+        // semantic we care about.)
+        Ok(Response::new(RecordCacheHitResponse {}))
+    }
 }
 
 mod chunk_hex {

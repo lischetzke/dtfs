@@ -558,10 +558,17 @@ impl DtfsFilesystem {
             // Try read-ahead in-memory cache first: any candidate's cache
             // key works because chunks are content-addressed by chunk_id.
             let mut chunk_data: Option<bytes::Bytes> = None;
+            let mut cache_hit_notify_addr: Option<String> = None;
             for cand in &candidates {
                 if let Some(cached) = self.readahead.get_cached(cand, &chunk.chunk_id) {
                     debug!(chunk_id = %chunk.chunk_id, node = %cand, "readahead cache hit");
                     chunk_data = Some(cached);
+                    // Bug AV (AV-4-1c) — notify the data-node so its
+                    // per-DC counter reflects this read even though we
+                    // didn't traverse the network. Without this the
+                    // tiering engine never sees the demand that drives
+                    // cache promotion.
+                    cache_hit_notify_addr = Some(cand.clone());
                     break;
                 }
             }
@@ -581,8 +588,41 @@ impl DtfsFilesystem {
                     {
                         debug!(chunk_id = %chunk.chunk_id, "local-disk cache hit");
                         chunk_data = Some(cached);
+                        // AV-4-1c — pick any candidate (the disk cache
+                        // is content-addressed; the bytes are
+                        // identical regardless of which node we
+                        // notify). First candidate is the nearest
+                        // healthy replica per `sort_candidates`.
+                        if cache_hit_notify_addr.is_none() {
+                            cache_hit_notify_addr =
+                                candidates.first().cloned();
+                        }
                     }
                 }
+            }
+
+            // Bug AV (AV-4-1c) — fire-and-forget notification so the
+            // data-node's per-DC counter sees this read. The actual
+            // I/O completed via the cache; the RPC is purely metrics.
+            // Errors are logged but never propagated (a missed
+            // metrics ping is acceptable; an aborted user read is
+            // not).
+            if let Some(notify_addr) = cache_hit_notify_addr.clone() {
+                let client = self.client.clone();
+                let chunk_id_clone = chunk.chunk_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = client
+                        .record_cache_hit(&notify_addr, &chunk_id_clone)
+                        .await
+                    {
+                        debug!(
+                            chunk_id = %chunk_id_clone,
+                            node = %notify_addr,
+                            error = %e,
+                            "record_cache_hit notify failed (non-fatal)"
+                        );
+                    }
+                });
             }
 
             let chunk_data = if let Some(d) = chunk_data {
