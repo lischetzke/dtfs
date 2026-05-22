@@ -1089,7 +1089,7 @@ delivered:
 Plus the standard close-out: docs sweep, plan archival, CLAUDE.md
 update, PROGRESS.md / ISSUES_TO_FIX.md tightening.
 
-### ⬜ AV-4-1 — End-to-end Phase 2 + Phase 3 live demos (~1 d)
+### 🟨 AV-4-1 — End-to-end Phase 2 + Phase 3 live demos (~1 d) — **needs-review (topology blocker)**
 
 The minicluster has the new manager binaries (Phase 1-3); it
 does NOT yet have a FUSE client built from the AV-3-1/3-2 code
@@ -1395,6 +1395,98 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-4-1 — 2026-05-22 (🟨 needs review — topology blocker)
+
+* **Files touched:**
+  - `tests/proxmox/abuse/15-bug-av-cache-lifecycle.sh` — new
+    shell regression test, 4 scenarios (S1 promote-on-threshold,
+    S2 demote-on-idle, S3 cooldown asymmetry, S4 warm-first
+    write + anchor-lag-repair). Bash syntax-checks cleanly
+    (`bash -n` exit 0).
+  - `tests/proxmox/ansible/templates/fuse.toml.j2` — already
+    has the AV-3-1 `[write]` block; no change needed.
+  - Production binary rolls completed: dtfs-fuse rolled to
+    mini-client01, `[write] first_write_tier =
+    "nearest-warm"` appended to `/etc/dtfs/fuse.toml`, FUSE
+    restarted and re-mounted.
+* **Cluster repairs done during this task** (worth recording so
+  later runs don't re-discover):
+  - mini-mgr02 had been flap-restarting since AV-2 work
+    with `Error: when Read Logs: io error: unexpected end of
+    file` — a partially-truncated Raft log tail. Wiped
+    `/var/lib/dtfs/manager/raft-log` + `raft-sm`, restarted;
+    Bug AC auto-recovery re-initialised from leader
+    snapshot cleanly.
+  - mini-mgr01 had stale cached Raft gRPC channels pointing
+    at the previously-unreachable mini-mgr02 → `connect to
+    http://10.20.0.172:9401 failed: transport error` on
+    every `client_write`. Resolved by restarting mini-mgr01;
+    leader re-elected (mini-mgr03 won).
+* **Configuration surface added:** tiering tick interval
+  reduced from 3600s default to 10s via
+  `POST /api/v1/config {"config_json":
+  "{\"tiering\":{\"evaluation_interval_secs\":10}}"}` so
+  the demo can complete in minutes.
+* **Topology blocker discovered:** the current minicluster
+  cannot fully demonstrate AV-4-1's four scenarios:
+  1. The `default` volume has
+     `mandatory_replicas = {hot:0, warm:2, cold:1, tape:1}`.
+     The plan's S1/S2/S3 scenarios require a volume where
+     `warm` is **cache-class, not mandatory** (the cache
+     planner deliberately skips tiers that are also
+     mandatory — see CLAUDE.md § 3.4).
+  2. The FUSE client routes EVERY write through the
+     `"default"` volume id (`find_volume_id_for_path`
+     reads from open-file state, not from a path-prefix
+     map). There is no operator-facing way to create a
+     file under a non-default volume_id via the mount.
+  3. Single-DC topology + `anchor = { dc: dc-a,
+     required_tier: null }` means the anchor invariant is
+     trivially satisfied by any placement — AV-3-3
+     anchor-lag-repair never has work to do.
+  4. The REST surface has no `set-mandatory` endpoint
+     equivalent to the AV-3-5 `set-cache`. Mutating
+     `default`'s mandatory_replicas in-place isn't
+     possible without adding a new endpoint or using a
+     raw UpsertVolume.
+* **What WAS verified live:**
+  - FUSE on mini-client01 picks up the `[write]
+    first_write_tier = "nearest-warm"` config without
+    parse errors (`bug_av_fuse_write_config_*` unit tests
+    already covered the parse paths; the live config
+    loaded into a healthy FUSE process here).
+  - Bash syntax + cluster control-plane reachability
+    (`mgr_get`, `mgr_post`, `client_run`,
+    `count_warm_chunks_for_path`, `audit_since`,
+    `first_dc`, `wait_for` all execute correctly when
+    invoked manually).
+  - Volume create on the leader (mini-mgr03) works:
+    `av-demo` volume now exists in the SM but cannot
+    receive writes via the FUSE namespace.
+* **Disposition:** 🟨 needs-review. The deliverable script
+  is in place and structurally complete; the remaining
+  work is infra/code, not script. Three credible paths
+  forward, ordered by smallest scope:
+  1. **Add `POST /api/v1/volumes/{id}/set-mandatory`**
+     endpoint mirroring AV-3-5's `set-cache`. Use it from
+     the test setup to convert `default` to cold-only
+     mandatory. This unblocks S1/S2/S3 on the current
+     minicluster. (~0.5 d code.)
+  2. **Add per-path volume routing in FUSE**: a config
+     like `[mount.volume_map] "/av-demo/" = "av-demo"`,
+     plumbed through `find_volume_id_for_path`. Operator-
+     friendly multi-volume namespace. (~1 d code +
+     plumbing.)
+  3. **Provision a multi-DC minicluster** (per the plan's
+     Plexmedia spec, 3 DCs with bandwidth shaping). The
+     correct long-term home for these demos; meaningful
+     infra work. (~1-2 d.)
+* **Recommendation:** pursue option 1 as a new AV-4-1-fixup
+  sub-task — smallest code change, unblocks S1/S2/S3 fully,
+  and aligns with the existing AV-3-5 mutation surface.
+  S4 (anchor-lag-repair) still needs multi-DC (option 3)
+  to produce observable behaviour and remains deferred.
 
 ### AV-3-6 — 2026-05-21
 
