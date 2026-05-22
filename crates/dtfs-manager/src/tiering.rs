@@ -389,7 +389,55 @@ impl TieringEngine {
         // clear. The conditional check (`should_clear_cooldown_on_
         // demote`) honours an operator flush whose cooldown is
         // still in the future.
+        // AV-5-5 — grace window must cover the full replication
+        // cycle plus a margin so a just-completed PutChunk has time
+        // to be observed (or operator-flushed) before the next
+        // idle-demote tick yanks it. Replication: scheduler tick =
+        // 30s × 4 states ≈ 120s; add `promote_window_secs` headroom
+        // (so reads accumulated during replication remain "fresh"
+        // when the planner re-evaluates).
+        let promote_window_max = self
+            .state_data
+            .read()
+            .await
+            .volumes
+            .values()
+            .map(|v| v.cache_replicas.promote_window_secs)
+            .max()
+            .unwrap_or(60);
+        let grace_ms = promote_window_max
+            .saturating_add(180)
+            .saturating_mul(1_000);
         for d in &plan.demotions {
+            // AV-5-5 dispatcher re-check #1: between the planner's
+            // snapshot and now, a replication.complete may have
+            // landed a fresh ChunkLocationEntry for this file. Skip
+            // the delete if the file's `updated_at_ms` is within
+            // the grace window — otherwise we yank a just-added
+            // warm replica and the cache lifecycle yo-yos.
+            let recently_updated = {
+                let sm = self.state_data.read().await;
+                sm.files
+                    .get(&d.file_path)
+                    .map(|fm| now_ms.saturating_sub(fm.updated_at_ms) < grace_ms)
+                    .unwrap_or(false)
+            };
+            if recently_updated {
+                continue;
+            }
+            // AV-5-5 dispatcher re-check #2: also skip when there's
+            // an active replication targeting THIS (chunk, node)
+            // pair. The Verifying / Completing / Done sequence can
+            // span 90s+ and a stale demote plan would otherwise
+            // race the PutChunk write, deleting the file off disk
+            // mid-replication.
+            if self
+                .scheduler
+                .has_active_replication_to(&d.chunk_id, d.node_id)
+                .await
+            {
+                continue;
+            }
             // 1. Resolve the data-node's gRPC address.
             let node_addr = match self.scheduler.node_grpc_addr(d.node_id).await {
                 Some(addr) => addr,
@@ -644,6 +692,7 @@ impl TieringEngine {
                     placements,
                     cooldown_until_ms: cooldown,
                     reads_in_window_by_dc,
+                    file_updated_at_ms: fm.updated_at_ms,
                 });
             }
         }
@@ -1098,6 +1147,15 @@ pub(crate) struct TickChunk {
     /// Reads observed in the volume's promote window, bucketed by
     /// source DC (output of `count_reads_in_window` per dc).
     pub reads_in_window_by_dc: std::collections::HashMap<String, u32>,
+    /// AV-5-5 — `FileMetadata.updated_at_ms` at snapshot time. The
+    /// demote planner uses this as a freshly-added grace window:
+    /// placements on a file whose metadata was touched in the last
+    /// `promote_window_secs` are deferred from idle-demote so a just-
+    /// completed cache replication isn't immediately undone by the
+    /// next tick's planner (and an operator flush has time to see
+    /// the SM entry).
+    #[doc(hidden)]
+    pub file_updated_at_ms: u64,
 }
 
 /// AV-2-4 — one placement of a chunk (node + DC + tier).
@@ -1390,12 +1448,28 @@ fn plan_chunk_promotions(
 fn plan_chunk_demotions(
     chunk: &TickChunk,
     policy: &TickVolumePolicy,
-    _now_ms: u64,
+    now_ms: u64,
     out: &mut Vec<TickDemotion>,
 ) {
     if policy.cache.promote_window_secs == 0 {
         // Cache disabled cluster-wide on this volume; demotions
         // would be misleading.
+        return;
+    }
+    // AV-5-5 — freshly-added grace. If the file's metadata was
+    // touched within the last `promote_window_secs` (e.g. a
+    // just-completed cache replication landed a new
+    // ChunkLocationEntry), defer the idle-demote for one window
+    // so:
+    //  * an operator `flush_cache` between replication.complete
+    //    and the next tick actually sees the warm replica in SM,
+    //  * the planner doesn't yo-yo schedule-replicate ->
+    //    immediately-demote on a chunk that's still warming up.
+    let grace_ms = policy.cache.promote_window_secs.saturating_mul(1_000);
+    if grace_ms > 0
+        && chunk.file_updated_at_ms > 0
+        && now_ms.saturating_sub(chunk.file_updated_at_ms) < grace_ms
+    {
         return;
     }
     // Build a quick is-cache-tier predicate.
@@ -1957,6 +2031,7 @@ mod bug_av_tiering_tick_tests {
                 }],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
+                file_updated_at_ms: 0,
             }],
             nodes: vec![
                 node(10, "leli", 1_000_000, /* cold */ false),
@@ -1996,6 +2071,7 @@ mod bug_av_tiering_tick_tests {
                 ],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
+                file_updated_at_ms: 0,
             }],
             nodes: vec![node(11, "toro", 500_000, true)],
             volumes: vols(plex_policy()),
@@ -2024,6 +2100,7 @@ mod bug_av_tiering_tick_tests {
                 }],
                 cooldown_until_ms: 2_000_000, // future, still in cooldown
                 reads_in_window_by_dc: reads,
+                file_updated_at_ms: 0,
             }],
             nodes: vec![node(11, "toro", 500_000, true)],
             volumes: vols(plex_policy()),
@@ -2051,6 +2128,7 @@ mod bug_av_tiering_tick_tests {
                 }],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
+                file_updated_at_ms: 0,
             }],
             nodes: vec![
                 node(11, "toro", 500_000, true),
@@ -2091,6 +2169,7 @@ mod bug_av_tiering_tick_tests {
                 ],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
+                file_updated_at_ms: 0,
             }],
             nodes: vec![
                 node(11, "toro", 500_000, true),
@@ -2127,6 +2206,7 @@ mod bug_av_tiering_tick_tests {
                 ],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
+                file_updated_at_ms: 0,
             }],
             nodes: vec![
                 node(11, "toro", 500_000, true),
@@ -2167,6 +2247,7 @@ mod bug_av_tiering_tick_tests {
                 ],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
+                file_updated_at_ms: 0,
             }],
             // Only 1 warm-tier node in toro, and it already holds
             // the chunk. Planner must not pick it again.
@@ -2226,6 +2307,7 @@ mod bug_av_tiering_tick_tests {
                 ],
                 cooldown_until_ms: 1_500_000, // future operator cooldown
                 reads_in_window_by_dc: reads,
+                file_updated_at_ms: 0,
             }],
             nodes: vec![node(11, "toro", 500_000, true)],
             volumes: vols(plex_policy()),
@@ -2264,6 +2346,7 @@ mod bug_av_tiering_tick_tests {
                 }],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
+                file_updated_at_ms: 0,
             }],
             nodes: vec![
                 node(11, "toro", 500_000, true),

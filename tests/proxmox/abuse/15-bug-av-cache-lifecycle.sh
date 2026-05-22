@@ -79,11 +79,44 @@ for n in json.load(sys.stdin):
 '
 }
 
-# Count warm-tier replicas of files matching $1 by listing each
-# data node's warm mount via SSH. Returns a single integer.
+# Count warm-tier replicas of the chunks that belong to file $1.
+# AV-5-5 fix: pre-fix this counted *every* warm-tier `.dat` file on
+# the cluster regardless of which file it belonged to, so S2's
+# "warm count must drop" assertion produced false negatives on any
+# minicluster carrying orphan chunks from prior test runs. Now we
+# pull the chunk_hashes from the FileMetadata projection and grep
+# the data nodes' warm tier for those specific hashes.
 count_warm_chunks_for_path() {
     local path="$1"
     local total=0
+    # Pull the chunk_hashes belonging to this file from the SM.
+    # `/api/v1/files` exposes per-file chunk_count + total_size but
+    # not the underlying hashes — so call the chunk_locations API
+    # (Bug AV exposes it via files/{path:.*}/locations or the audit
+    # log). Fall back: read recent audit `cache.promote` / `Update
+    # Chunks` summaries which carry `chunk=<hash>`.
+    mapfile -t hashes < <(
+        AV_PATH="/$path" mgr_get "/api/v1/audit?limit=400" \
+        | AV_PATH="/$path" python3 -c '
+import json,sys,re,os
+ap = os.environ.get("AV_PATH","")
+seen = set()
+for r in json.load(sys.stdin):
+    s = r.get("summary","")
+    if ap and ap not in s:
+        continue
+    m = re.search(r"chunk=([0-9a-f]{64})", s)
+    if m:
+        seen.add(m.group(1))
+for h in seen:
+    print(h)
+'
+    )
+    if [ "${#hashes[@]}" -eq 0 ]; then
+        echo 0
+        return
+    fi
+
     # Pull the list of data-node hostnames from the cluster.
     mapfile -t nodes < <(
         mgr_get /api/v1/nodes \
@@ -95,9 +128,11 @@ for n in json.load(sys.stdin):
 '
     )
     for n in "${nodes[@]}"; do
-        cnt=$(ssh "${SSH_OPTS[@]}" "debian@$n" \
-            "sudo find /mnt/${n#mini-}-warm/chunks -name '*.dat' 2>/dev/null | wc -l")
-        total=$((total + cnt))
+        for h in "${hashes[@]}"; do
+            cnt=$(ssh "${SSH_OPTS[@]}" "debian@$n" \
+                "sudo find /mnt/${n#mini-}-warm/chunks -name '$h.dat' 2>/dev/null | wc -l")
+            total=$((total + cnt))
+        done
     done
     echo "$total"
 }
@@ -212,14 +247,16 @@ s1_promote() {
     ok "issued 2 sequential reads"
 
     # Wait for the tiering tick to fire + the replication task to
-    # complete. Worst case: 1 tick (10s) + replicate_chunk RPC
-    # (~1s) + RemoveChunkLocation Raft write (~1s).
-    if ! wait_for "warm replica appears" 60 \
+    # fully complete. Scheduler tick = 30s; replication walks
+    # Pending → Copying → Verifying → Completing → Done (~120s
+    # end-to-end). Plus AV cache tick (10s) before scheduling.
+    # Worst case: ~180s.
+    if ! wait_for "warm replica appears" 240 \
         "[ \$(count_warm_chunks_for_path '$VOL/s1-promote.bin') -gt $before ]"
     then
         echo "    audit (cache.promote since 90s):"
         audit_since "cache." 90 | python3 -m json.tool | head -30
-        fail "S1: warm replica did not appear within 60 s"
+        fail "S1: warm replica did not appear within 240 s"
     fi
     local after; after=$(count_warm_chunks_for_path "$VOL/s1-promote.bin")
     ok "after reads: warm chunks for $VOL = $after (promoted)"
@@ -267,13 +304,47 @@ s2_demote() {
 s3_cooldown_asymmetry() {
     step "S3: cooldown asymmetry (operator flush ≠ engine demote)"
 
-    # Re-promote the chunk via two reads (same recipe as S1).
+    # Re-promote the chunk via two reads (same recipe as S1) and
+    # keep the read window hot during replication to prevent the
+    # engine's idle-demote from racing flush_cache.
     local file="$MOUNT/$VOL/s1-promote.bin"
     client_run "sudo cat $file > /dev/null; sleep 1; sudo cat $file > /dev/null"
-    wait_for "re-promotion after S2 demote" 60 \
+    # AV-5-5: replication takes ~120s (scheduler tick 30s × 4
+    # states) so the wait_for must cover Pending → Copying →
+    # Verifying → Completing → Done plus the AV cache tick that
+    # actually emits the promote. Budget 360s.
+    wait_for "re-promotion after S2 demote" 360 \
         "[ \$(count_warm_chunks_for_path '$VOL/s1-promote.bin') -gt 0 ]" \
         || fail "S3 setup: chunk did not re-promote after S2's engine-cleared cooldown"
     ok "engine-cleared cooldown ⇒ immediate re-promote after 2 reads (S2 invariant)"
+
+    # AV-5-5 / AV-5-9 fix: wait for the replication task to fully
+    # reach the state machine (Pending → Copying → Verifying →
+    # Completing → Done at scheduler tick = 30s = ~120s end-to-end).
+    # Keep reads flowing every 5s so the read-window stays >= 2
+    # during replication — otherwise the engine's idle-demote
+    # planner races flush_cache and drops the warm replica from SM
+    # before the operator's flush even runs.
+    step "Waiting for replication.complete audit row (max 240s)..."
+    local waited=0
+    while [ $waited -lt 240 ]; do
+        if audit_since "replication.complete" 30 | grep -q replication.complete; then
+            break
+        fi
+        client_run "sudo cat $file > /dev/null" >/dev/null 2>&1 || true
+        sleep 5
+        waited=$((waited + 5))
+    done
+    if ! audit_since "replication.complete" 60 | grep -q replication.complete; then
+        fail "S3 setup: warm replica never reached SM (replication.complete absent)"
+    fi
+    ok "warm replica registered in SM"
+
+    # AV-5-5: keep the read-window saturated all the way through
+    # the flush call so the planner's idle-demote can't race in
+    # between (the tick interval is 10s).
+    client_run "sudo cat $file > /dev/null; sleep 1; sudo cat $file > /dev/null" \
+        >/dev/null 2>&1 || true
 
     # Operator flush: sets a future cooldown.
     mgr_post "/api/v1/files/flush_cache" \

@@ -31,6 +31,7 @@ impl ReplicationManager {
         &self,
         chunk_id: &ChunkId,
         target_addr: &str,
+        target_tier: &str,
     ) -> anyhow::Result<()> {
         tracing::info!(
             "Replicating chunk {} to {}",
@@ -62,7 +63,11 @@ impl ReplicationManager {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
 
         let volume_id = String::new();
-        let tier = String::new();
+        // AV-5-9 — preserve the manager-resolved tier (e.g. "warm" for
+        // a cache promotion). Empty stays empty for legacy callers; the
+        // target's `put_chunk` still falls back to its "any healthy
+        // disk" path in that case.
+        let tier = target_tier.to_string();
 
         tokio::spawn({
             let chunk_hex = chunk_hex.clone();

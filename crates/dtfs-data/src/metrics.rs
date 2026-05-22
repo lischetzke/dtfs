@@ -89,11 +89,30 @@ impl DataMetrics {
             requester_dc
         };
 
-        // Update last-access first (cheap path).
-        self.per_chunk_last_access
+        // AV-5-7 — dedupe rapid back-to-back records for the same
+        // (chunk_id, dc). A single Plex stream typically issues 16
+        // FUSE read() calls per chunk (kernel splits the 2-4 MB
+        // playback chunk into 128KB pages), each routing through
+        // get_chunk OR record_cache_hit on the data-node. Without
+        // dedup, one viewer triggers a count = 16-32 inside the
+        // 60 s window, and the tiering engine's `promote_reads`
+        // threshold (default 2) loses all meaning. Cap to "one
+        // increment per (chunk, dc) per `DEDUP_MS`".
+        const DEDUP_MS: u64 = 1_000;
+        let last = self
+            .per_chunk_last_access
             .entry(chunk_id.to_string())
-            .or_insert_with(|| AtomicU64::new(0))
-            .store(now_ms, Ordering::Relaxed);
+            .or_insert_with(|| AtomicU64::new(0));
+        let prev = last.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(prev) < DEDUP_MS && prev != 0 {
+            // Still update last-access timestamp so the LRU
+            // eviction (below) keeps the chunk warm.
+            last.store(now_ms, Ordering::Relaxed);
+            drop(last);
+            return;
+        }
+        last.store(now_ms, Ordering::Relaxed);
+        drop(last);
 
         // Eviction: if the table is at capacity AND this chunk isn't already
         // tracked, drop the entry with the oldest last_access to make room.
@@ -288,8 +307,13 @@ mod tests {
         // AV-4-1c record_cache_hit RPC). At this layer both
         // paths funnel into record_chunk_read, so the test
         // calls it 5 times directly.
-        for i in 0..5 {
-            m.record_chunk_read(chunk, "dc-a", 1_000_000 + i);
+        // AV-5-7: space the calls by >= DEDUP_MS (1000 ms) so the
+        // per-(chunk, dc) dedupe filter does not collapse them.
+        // Reads issued faster than DEDUP_MS (kernel-page bursts)
+        // are correctly collapsed by the dedup; this test pins the
+        // semantic that LOGICALLY separate reads still count.
+        for i in 0..5u64 {
+            m.record_chunk_read(chunk, "dc-a", 1_000_000 + i * 1_500);
         }
         let harvest = m.harvest_per_chunk(100);
         assert_eq!(harvest.len(), 1, "exactly one chunk reported");
@@ -322,9 +346,11 @@ mod tests {
         // Three reads from dc-a, alternating "as if" cache
         // hit / miss paths (since both call record_chunk_read,
         // they MUST aggregate into one bucket).
+        // AV-5-7: space the calls by >= DEDUP_MS so they aren't
+        // collapsed by the per-(chunk, dc) dedupe filter.
         m.record_chunk_read(chunk, "dc-a", 1_000);
-        m.record_chunk_read(chunk, "dc-a", 1_010);
-        m.record_chunk_read(chunk, "dc-a", 1_020);
+        m.record_chunk_read(chunk, "dc-a", 2_500);
+        m.record_chunk_read(chunk, "dc-a", 4_000);
         let harvest = m.harvest_per_chunk(100);
         assert_eq!(harvest.len(), 1);
         assert_eq!(
@@ -351,8 +377,9 @@ mod tests {
     fn bug_av_4_1c_empty_dc_falls_back_to_unknown_bucket() {
         let m = DataMetrics::new();
         let chunk = "1234567800000000000000000000000000000000000000000000000000000000";
+        // AV-5-7: space the calls by >= DEDUP_MS.
         m.record_chunk_read(chunk, "", 1_000);
-        m.record_chunk_read(chunk, "", 1_001);
+        m.record_chunk_read(chunk, "", 2_500);
         let harvest = m.harvest_per_chunk(100);
         assert_eq!(harvest.len(), 1);
         assert_eq!(
@@ -360,6 +387,64 @@ mod tests {
             Some(2),
             "empty requester_dc must map to the 'unknown' bucket so the \
              reads are still visible — not silently dropped"
+        );
+    }
+
+    /// Bug AV-5-7 regression — kernel-page amplification dedup.
+    ///
+    /// `cat`ting a 2 MB file with a 4 MB chunk_size produces 16
+    /// FUSE `read()` calls (kernel splits the read into 128 KB
+    /// pages). Each call routes through either `get_chunk` or
+    /// `record_cache_hit` on the data-node, both funnelling into
+    /// `record_chunk_read`. Pre-fix, the per-DC counter saw
+    /// count=16 for one user-level read; the tiering engine's
+    /// `promote_reads` threshold (default 2) lost all meaning —
+    /// a single Plex view promoted everything immediately.
+    ///
+    /// Invariant: **N rapid calls (within `DEDUP_MS`) for the
+    /// same (chunk_id, dc) collapse to one increment.**
+    #[test]
+    fn bug_av_5_7_kernel_page_burst_collapses_to_one() {
+        let m = DataMetrics::new();
+        let chunk = "ab12cd34ef560000000000000000000000000000000000000000000000000000";
+        // 16 records 10 ms apart — total span 150 ms, well under
+        // the 1000 ms dedupe window. Mirrors what one 2 MB `cat`
+        // produces in the live cluster.
+        for i in 0..16u64 {
+            m.record_chunk_read(chunk, "dc-a", 1_000_000 + i * 10);
+        }
+        let harvest = m.harvest_per_chunk(100);
+        assert_eq!(harvest.len(), 1);
+        let entry = &harvest[0];
+        assert_eq!(
+            entry.reads_by_dc.get("dc-a").copied(),
+            Some(1),
+            "kernel-page burst must collapse to 1 logical read; \
+             got {:?}",
+            entry.reads_by_dc.get("dc-a")
+        );
+    }
+
+    /// Bug AV-5-7 regression #2 — separate reads still count.
+    ///
+    /// Pin that the dedup doesn't accidentally collapse genuine
+    /// repeat reads (e.g. two `cat` invocations 2 s apart, which
+    /// in operator terms are two distinct user-facing reads and
+    /// MUST hit the `promote_reads=2` threshold).
+    #[test]
+    fn bug_av_5_7_separate_reads_outside_window_count_independently() {
+        let m = DataMetrics::new();
+        let chunk = "fa17fa17fa170000000000000000000000000000000000000000000000000000";
+        // Two reads spaced 2 s apart (well outside the 1 s
+        // dedupe window).
+        m.record_chunk_read(chunk, "dc-a", 1_000_000);
+        m.record_chunk_read(chunk, "dc-a", 3_000_000);
+        let harvest = m.harvest_per_chunk(100);
+        assert_eq!(harvest.len(), 1);
+        assert_eq!(
+            harvest[0].reads_by_dc.get("dc-a").copied(),
+            Some(2),
+            "two reads spaced >= DEDUP_MS apart MUST count as 2",
         );
     }
 }
