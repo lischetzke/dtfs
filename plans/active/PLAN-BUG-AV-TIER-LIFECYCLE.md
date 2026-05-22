@@ -4,6 +4,142 @@
 
 ---
 
+## Resume here (2026-05-22)
+
+Phase 4 of 4 in progress. Phases 1-3 closed. Latest commit:
+`58978ac AV-4-1c: reads->tiering pipeline (3 bugs, 10 regression tests)`.
+
+### Commit chain (most recent last)
+```
+080aec8 AV-3-1 fuse.toml [write] first_write_tier
+065d341 AV-3-2 preferred_tier hint on allocate_chunks
+6a8cb39 AV-3-3 auto-anchor-migration
+4233b01 AV-3-4 WebUI Flush cache
+a650113 AV-3-5 CLI files flush-cache + volumes set-cache
+1b6efce AV-3-6 Phase 3 docs + incident write-up
+58b365a docs+plan(Bug AV): purge "Phase 4" -- plan has no Phase 4
+6005f7b plan(Bug AV): add Phase 4 -- polish + verification close-out
+8618e3c AV-4-1: live-demo script + topology-blocker writeup
+c3f40e4 plan(Bug AV): formally register AV-4-1 deferral + queue AV-4-1a/b
+a30cf42 AV-4-1a: POST /api/v1/volumes/{id}/set-mandatory endpoint
+58978ac AV-4-1c: reads->tiering pipeline (3 bugs, 10 regression tests)
+```
+
+### Current task status
+
+| Task | Status | Tests | Commit |
+|------|--------|-------|--------|
+| AV-4-1 | 🟨 needs-review | script written | 8618e3c |
+| AV-4-1a | ✅ done | 5 unit | a30cf42 |
+| AV-4-1b | ⬜ deferred out of Phase 4 (multi-DC) | n/a | n/a |
+| AV-4-1c | ✅ done | 10 unit | 58978ac |
+| AV-4-1d | ⬜ **NEXT** | 2 unit planned | n/a |
+| AV-4-2 | ⬜ | 2 unit planned | n/a |
+| AV-4-3 | ⬜ | live | n/a |
+| AV-4-4 | ⬜ | live | n/a |
+| AV-4-5 | ⬜ | 3 unit planned | n/a |
+| AV-4-6 | ⬜ | mdbook build | n/a |
+
+### Immediate next step: **AV-4-1d**
+
+Bug: `crates/dtfs-fuse/src/filesystem.rs:1542` hardcodes
+`tier: "hot"` in `write_chunk_bytes`. The manager's
+`allocate_chunks` (post AV-4-1c) correctly resolves to Cold
+for `mandatory.cold=1` volumes, but FUSE ignores it. The
+data-node's `select_disk_for_tier(Hot)` finds no hot disk
+on the minicluster, falls back to "any healthy disk by free
+capacity" (`disk.rs:106-109`), and writes to warm.
+
+This is the last gate on AV-4-1's end-to-end S1 demo
+producing a real `cache.promote` audit entry.
+
+Fix plan (full detail in AV-4-1d task block below):
+1. Add `string tier = N` to `ChunkPlacement` in
+   `proto/manager.proto`.
+2. Manager `allocate_chunks` populates `tier` field from
+   `resolve_volume_placement` output (each placement carries
+   the resolved tier string).
+3. FUSE `filesystem.rs:1542` reads `placement.tier` instead
+   of hardcoded `"hot"`.
+4. Regression tests:
+   - `bug_av_4_1d_allocate_chunks_response_carries_tier`
+     (manager — placement has the right tier string).
+   - `bug_av_4_1d_fuse_uses_placement_tier` (FUSE — small
+     wrapper helper returning the tier string the writer
+     would send for a given placement).
+5. Live verify: re-run
+   `tests/proxmox/abuse/15-bug-av-cache-lifecycle.sh` S1 ->
+   must see a real `cache.promote` audit entry within 60 s.
+   When green, flip AV-4-1 to ✅.
+
+### Open blockers / decisions for next agent
+
+- **AV-4-1d** is the immediate next step. Substantial
+  enough to deserve its own commit (proto change +
+  manager+FUSE wiring + 2 regression tests + live verify).
+- **AV-4-1b** stays deferred out of Phase 4 by design
+  (multi-DC infra is out-of-scope for this minicluster).
+  S4 anchor-lag-repair is unit-tested via 6
+  `bug_av_anchor_lag_repair_*` tests in AV-3-3.
+- **After AV-4-1d** flips AV-4-1 to ✅: proceed to AV-4-2
+  (list-endpoint projection). Pure-code, no infra
+  dependency.
+
+### Live cluster state (minicluster, 2026-05-22)
+
+- mgr01/mgr02/mgr03: healthy, all running 58978ac
+  (md5 `c6917bc2e2b9b02ae4dc5ec162475660`).
+- data01/data02: healthy, running 58978ac
+  (md5 `2c1c3e547a04f822a1be038618634811`).
+- client01: healthy, running 58978ac
+  (md5 `fb5c18c742374dde5f26b15f4907a2cf`).
+- `default` volume:
+  `mandatory_replicas = {hot:0, warm:0, cold:1, tape:0}`,
+  `cache_replicas.warm = {min:1, max:1}`, `per_dc=true`,
+  `promote_reads=2`, `promote_window_secs=60`,
+  `cooldown_secs=30`, anchor `dc=dc-a, required_tier=null`.
+- Tiering tick interval: 10s (manager.toml on all 3 mgrs).
+- mini-client01 fuse.toml has
+  `[write] first_write_tier = "cold"`.
+- Test script: `tests/proxmox/abuse/15-bug-av-cache-lifecycle.sh`
+  (250 lines, bash-syntax-clean). Currently fails at S1
+  because of AV-4-1d.
+- Leader: mini-mgr01 last seen, but may have rotated -
+  pick by trying `set-cache` and using the one that
+  returns 200.
+
+### Test counts (cumulative across Bug AV)
+
+| Crate | Pre-Bug-AV | Post-AV-4-1c |
+|-------|------------|--------------|
+| dtfs-common | 39 | 42 |
+| dtfs-raft | 42 (estimated) | 42 |
+| dtfs-data | 50 | 57 |
+| dtfs-manager | 62 | 116 |
+| dtfs-fuse | 27 | 27 |
+
+Workspace `cargo test --workspace --release` green at every
+commit.
+
+### Reading order for a fresh agent
+
+1. `AGENTS.md` § 1-3 (plan-driven workflow, per-task
+   procedure, commit discipline).
+2. `CLAUDE.md` § 3.4 (mandatory vs cache invariants),
+   § 4 (test-first workflow), § 10 (file map).
+3. This plan, jump to **AV-4-1d** task block below.
+4. `plans/incidents/SOAK-RECOVERY-2026-05-21.md` Bug AV
+   section for cross-Phase context.
+
+### Operator-style style guide (per updated CLAUDE.md sec 1-7)
+
+- Caveman style for prose: no articles/filler/hedging.
+- Normal style for code, commits, security.
+- No em-dashes, smart quotes, emojis in tracked files.
+- Plain hyphens + straight quotes only.
+
+---
+
 ## 0. Background, goals, non-goals
 
 ### 0.1 Why this exists
@@ -272,7 +408,7 @@ from the original sketch get appended under each task as
 | 1 | Schema + flush API (~4.5 d) | ✅ closed 2026-05-21 |
 | 2 | Tiering engine: read-driven cache promotion (~2.5 d) | ✅ closed 2026-05-21 |
 | 3 | Client first-write tier + UX (~2 d) | ✅ closed 2026-05-21 |
-| 4 | Polish + verification close-out (~4.5 d) | 🟦 in progress — AV-4-1 🟨; AV-4-1a ✅; AV-4-1c new (reads→tiering pipeline); AV-4-1b deferred (multi-DC) |
+| 4 | Polish + verification close-out (~5 d) | 🟦 in progress — AV-4-1 🟨; AV-4-1a ✅; AV-4-1c ✅; AV-4-1d ⬜ next (FUSE hardcoded tier); AV-4-1b deferred (multi-DC) |
 
 ---
 
@@ -1341,69 +1477,6 @@ wrong tier.
 
 ### ⬜ AV-4-1b — Multi-DC topology for S4 anchor-lag-repair demo (~1-2 d) — _deferred_
 
-Discovered during AV-4-1a live verification. With AV-4-1a in
-place, `default` was successfully converted to cold-only
-mandatory (the AV-4-1a goal). Re-running
-`tests/proxmox/abuse/15-bug-av-cache-lifecycle.sh` still
-produces 0 cache promotions despite:
-
-* Tiering tick lowered to 10s (verified in startup log).
-* `default` mandatory_replicas now `{hot:0, warm:0, cold:1,
-  tape:0}` — warm IS cache-eligible.
-* `default` cache_replicas.warm = `{min: 1, max: 1,
-  per_dc: true, promote_reads: 2, promote_window_secs: 60}`.
-* Manager + data-node binaries are the freshly-built ones
-  matching the workspace.
-* `set_requester_location("dc-a", host)` is called from FUSE
-  main.rs after `DtfsClient::new()`.
-* The legacy temperature-based tiering IS running (we saw a
-  `Tiering demote: chunk … (Cold→Warm)` log + a real
-  `Migration: Pending→Copying` task).
-
-The AV cache-tick path is silent — `info!("Bug AV tick: {}
-promotions, {} demotions", ...)` only fires when one is
-non-zero, and we never see it. So either:
-
-* `tick_av_cache` is being called every 10s but the
-  TickSnapshot has zero matching chunks (the per-volume
-  filter rejects everything for some reason), OR
-* The snapshot has chunks but `count_reads_in_window`
-  returns 0 because the read window store wasn't populated
-  (the data-node's heartbeat carries the reads but the
-  manager's `report_access` didn't push samples), OR
-* Something subtler — the chunks belong to the wrong
-  volume_id after the set-mandatory conversion.
-
-* **Files to investigate (no obvious culprit):**
-  - `crates/dtfs-manager/src/tiering.rs::tick_av_cache` /
-    `build_av_cache_snapshot` — does the snapshot include
-    `default`-volume chunks after set-mandatory?
-  - `crates/dtfs-manager/src/metadata.rs::heartbeat` →
-    `tiering.report_access` — is `reads_by_dc.get("dc-a")`
-    actually non-zero in the incoming heartbeat?
-  - `crates/dtfs-data/src/server.rs::get_chunk` →
-    `metrics.record_chunk_read(chunk_id, requester_dc, …)`
-    — is `requester_dc` actually `"dc-a"` at recording
-    time?
-* **Approach:** add narrow debug `tracing::info!` to each
-  hop (data-node receives GetChunk with requester_dc=X;
-  data-node harvest_per_chunk emits N (chunk, dc) entries;
-  manager heartbeat reports M chunk_reads entries; manager
-  report_access pushes K samples; tick builds T tick-
-  chunks). Find the first hop where the count drops to 0.
-  Once located, fix narrowly.
-* **Tests:** depending on the root cause, this likely lands
-  as a 1-line fix + a regression test in
-  `bug_av_tiering_tick_tests`. May also require an end-to-end
-  abuse test that doesn't depend on minicluster timing.
-* **Done when:** AV-4-1's S1 scenario produces a real
-  `cache.promote` audit entry on the minicluster after
-  2 reads. Once that's verified, re-run S2 + S3 + flip
-  AV-4-1 to ✅. (S4 remains AV-4-1b's deferred multi-DC
-  work.)
-
-### ⬜ AV-4-1b — Multi-DC topology for S4 anchor-lag-repair demo (~1-2 d) — _deferred_
-
 S4 (warm-first write → anchor-lag-repair) cannot demonstrate
 observable behaviour on a single-DC minicluster: the anchor
 invariant (`dc=dc-a, required_tier=any`) is trivially
@@ -1621,15 +1694,15 @@ Wraps up Bug AV. The plan moves from `plans/active/` to
 
 ### Phase 4 Done When
 
-* AV-4-1, AV-4-1a, AV-4-1c, AV-4-2, AV-4-3, AV-4-4,
-  AV-4-5, AV-4-6 all ✅. AV-4-1b (multi-DC) is the
-  explicit infra follow-up that closes the S4 demo gap;
-  it is **deferred out of Phase 4** (see § 5 deviations)
-  and Phase 4 closes without it.
-* **~10 new tests green** (5 set-mandatory + 2 list-
-  endpoint + ~3 redundancy escalation + possibly 1 from
-  AV-4-1c depending on root cause; UI work is live-only
-  per the WebUI testing convention).
+* AV-4-1, AV-4-1a, AV-4-1c, AV-4-1d, AV-4-2, AV-4-3,
+  AV-4-4, AV-4-5, AV-4-6 all ✅. AV-4-1b (multi-DC) is
+  the explicit infra follow-up that closes the S4 demo
+  gap; **deferred out of Phase 4** (see § 5 deviations).
+* **~20 new tests green** so far: 5 set-mandatory
+  (AV-4-1a) + 10 reads→tiering (AV-4-1c) + ~2 list-
+  endpoint (AV-4-2) + ~3 redundancy escalation (AV-4-5)
+  + 2-ish AV-4-1d. UI work is live-only per WebUI
+  convention.
 * End-to-end live demos for AV-2-4 / AV-2-5 / AV-3-3 (S1,
   S2, S3 from AV-4-1) recorded in
   `MINICLUSTER-VERIFICATION-2026-05-21.md`. S4
