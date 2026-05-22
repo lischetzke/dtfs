@@ -272,7 +272,7 @@ from the original sketch get appended under each task as
 | 1 | Schema + flush API (~4.5 d) | ✅ closed 2026-05-21 |
 | 2 | Tiering engine: read-driven cache promotion (~2.5 d) | ✅ closed 2026-05-21 |
 | 3 | Client first-write tier + UX (~2 d) | ✅ closed 2026-05-21 |
-| 4 | Polish + verification close-out (~3.5 d) | ⬜ in progress |
+| 4 | Polish + verification close-out (~4 d) | 🟦 in progress — AV-4-1 🟨 needs AV-4-1a fixup; AV-4-1b deferred (multi-DC) |
 
 ---
 
@@ -1148,6 +1148,89 @@ demos are gated on that:
   added to `MINICLUSTER-VERIFICATION-2026-05-21.md`; all four
   AV-2-4 / AV-2-5 / AV-3-3 carryover bullets in § 5
   deviations marked ✅ RESOLVED.
+* **Current state (2026-05-22):** 🟨 needs-review. The shell
+  script is written + the cluster repairs + FUSE roll
+  completed (see verification log). The live scenarios do
+  not yet produce observable behaviour on this minicluster
+  due to the topology constraints documented in the
+  verification log; AV-4-1a below adds the smallest code
+  change that unblocks S1/S2/S3, and AV-4-1b queues the
+  multi-DC infra work for S4.
+
+### ⬜ AV-4-1a — `POST /api/v1/volumes/{id}/set-mandatory` endpoint (~0.5 d) — _unblocks AV-4-1 S1/S2/S3_
+
+The minicluster's `default` volume has
+`mandatory_replicas.warm = 2`, which (correctly per the AV
+invariant) means the cache planner skips warm and AV-4-1's
+S1/S2/S3 cache-lifecycle scenarios produce no observable
+behaviour. Phase 1 added `migrate-policy` (legacy → mandatory
+clone) and Phase 3 added `set-cache` (mutate cache_replicas),
+but there's no API to mutate `mandatory_replicas` in-place.
+This task fills that gap so the test setup can convert
+`default` to cold-only mandatory.
+
+* **Files:** `crates/dtfs-manager/src/api.rs` (new
+  `set_volume_mandatory_endpoint` + `apply_set_mandatory`
+  pure helper + route registration);
+  `crates/dtfs-cli/src/main.rs` (`VolumesCmd::SetMandatory`
+  with one flag per tier);
+  `crates/dtfs-manager/src/webui.rs` (extend the AV-4-4
+  inline-edit modal to cover mandatory fields too — defer
+  to AV-4-4 if scope creep risk).
+* **Implementation:**
+  - `SetMandatoryRequest { hot_replicas: Option<u32>,
+    warm_replicas: Option<u32>, cold_replicas: Option<u32>,
+    tape_replicas: Option<u32> }`. Every field optional —
+    omitted fields keep the current value.
+  - Pure helper `apply_set_mandatory(current, req) ->
+    Result<VolumeConfig, String>` mirrors AV-3-5's
+    `apply_set_cache` shape: merge, then validate. Validation
+    rejects "all tiers zero" (that would orphan the volume's
+    durability floor — operators wanting that should drop
+    `mandatory_replicas` entirely via UpsertVolume on a
+    fresh volume; not a runtime operation).
+  - Anchor invariant defence-in-depth: if the volume has an
+    `anchor.required_tier` set and the new mandatory_replicas
+    has 0 for that tier, return HTTP 400 with a clear error
+    (otherwise the anchor would be permanently unsatisfiable).
+* **Tests:**
+  - `bug_av_set_mandatory_merges_partial_update`
+  - `bug_av_set_mandatory_rejects_all_zero` (defensive)
+  - `bug_av_set_mandatory_rejects_anchor_required_tier_zero`
+    (defensive)
+  - `bug_av_set_mandatory_legacy_volume_round_trips` —
+    when called on a volume that's never been
+    migrate-policy'd, the helper migrates implicitly (so
+    the result has both legacy `replication` AND new
+    `mandatory_replicas` populated).
+* **Done when:** 4 tests + live verification on the
+  minicluster: `dtfs-cli volumes set-mandatory default
+  --cold-replicas 1 --warm-replicas 0 --tape-replicas 0`
+  succeeds; subsequent re-run of the AV-4-1 shell script's
+  S1/S2/S3 produces the expected promote / demote /
+  cooldown behaviour. After verification, flip AV-4-1's
+  🟨 to ✅ with a reference to this fixup commit.
+
+### ⬜ AV-4-1b — Multi-DC topology for S4 anchor-lag-repair demo (~1-2 d) — _deferred_
+
+S4 (warm-first write → anchor-lag-repair) cannot demonstrate
+observable behaviour on a single-DC minicluster: the anchor
+invariant (`dc=dc-a, required_tier=any`) is trivially
+satisfied by any first-chunk placement. Multi-DC provisioning
+is the long-term home for AV demos and matches the plan's
+Plexmedia topology spec, but it's an infra-heavy
+undertaking that doesn't belong on the critical path for
+closing Phase 4.
+
+* **Disposition:** deferred from Phase 4. Tracked here as a
+  named follow-up rather than left as an unlabelled deviation.
+  Picked up when (a) a multi-DC test-lab budget exists, or
+  (b) the Plexmedia production rollout drives the
+  requirement.
+* **Done when:** a multi-DC minicluster (3 DCs minimum per
+  the plan's Plexmedia spec) exists, AV-4-1's S4 runs green
+  on it, and the result is recorded in
+  `MINICLUSTER-VERIFICATION-*.md`.
 
 ### ⬜ AV-4-2 — `GET /api/v1/volumes` list-endpoint projection (~0.5 d)
 
@@ -1347,20 +1430,33 @@ Wraps up Bug AV. The plan moves from `plans/active/` to
 
 ### Phase 4 Done When
 
-* AV-4-1 … AV-4-6 all ✅. **~5 new tests green** (2 list-
-  endpoint + ~3 redundancy escalation; UI work is
-  live-only per the WebUI testing convention).
-* End-to-end live demos for AV-2-4 / AV-2-5 / AV-3-3
-  recorded in
-  `MINICLUSTER-VERIFICATION-2026-05-21.md`.
-* All three § 5 deviation entries marked ✅ RESOLVED:
-  - AV-2-4 / AV-2-5 — Phase 2 live end-to-end demo.
-  - AV-3-4 — WebUI volume-edit form.
+* AV-4-1, AV-4-1a, AV-4-2, AV-4-3, AV-4-4, AV-4-5, AV-4-6
+  all ✅. AV-4-1b is the explicit multi-DC infra
+  follow-up that closes the S4 demo gap; it is **deferred
+  out of Phase 4** (see § 5 deviations) and Phase 4 closes
+  without it.
+* **~9 new tests green** (4 set-mandatory + 2 list-endpoint
+  + ~3 redundancy escalation; UI work is live-only per the
+  WebUI testing convention).
+* End-to-end live demos for AV-2-4 / AV-2-5 / AV-3-3 (S1,
+  S2, S3 from AV-4-1) recorded in
+  `MINICLUSTER-VERIFICATION-2026-05-21.md`. S4
+  (anchor-lag-repair) explicitly noted as "deferred to
+  AV-4-1b — needs multi-DC topology".
+* All four § 5 deviation entries marked ✅ RESOLVED:
+  - AV-2-4 / AV-2-5 — Phase 2 live end-to-end demo
+    (resolved by AV-4-1 + AV-4-1a together).
+  - AV-3-4 — WebUI volume-edit form (resolved by AV-4-3
+    + AV-4-4).
   - List-endpoint projection sub-task under the
-    AV-1-10-resolved entry.
+    AV-1-10-resolved entry (resolved by AV-4-2).
+  - AV-4-1 S4 deferral to AV-4-1b (this one stays open;
+    documents the multi-DC requirement).
 * `mdbook build docs/` green.
 * Plan file moved to `plans/completed/`; `git log --follow`
-  preserves history.
+  preserves history. The AV-4-1b follow-up remains as an
+  unticked task in the moved plan so a future
+  multi-DC-aware run knows what to pick up.
 * No "Phase 4 follow-up" / "deferred polish" language
   remains in tracked sources (`grep -r "Phase 4" plans/
   docs/ CLAUDE.md` returns empty).
@@ -2377,6 +2473,65 @@ standalone follow-ups if/when the WebUI becomes the primary
 volume-policy editor.
 
 _(end AV-3-4 deviation — partially resolved)_
+
+### AV-4-1 — live demos blocked on minicluster topology; AV-4-1a / AV-4-1b queued (2026-05-22)
+
+AV-4-1 attempted to verify the four end-to-end Bug AV
+scenarios (S1 promote-on-threshold, S2 demote-on-idle, S3
+cooldown asymmetry, S4 warm-first → anchor-lag-repair) on the
+existing single-DC minicluster. The shell regression test
+(`tests/proxmox/abuse/15-bug-av-cache-lifecycle.sh`) is
+written and syntactically clean, the FUSE binary was rebuilt
++ rolled with the AV-3-1 `[write] first_write_tier =
+"nearest-warm"` config, mini-mgr02 + mini-mgr01 were repaired
+mid-task (corrupt Raft log + stale Raft channels — see the
+verification log entry for AV-4-1), and the tiering tick was
+reduced 3600s → 10s.
+
+**Why AV-4-1 cannot fully verify on the current cluster:**
+
+1. The `default` volume has
+   `mandatory_replicas = {hot:0, warm:2, cold:1, tape:1}`.
+   The cache planner correctly skips tiers that are also
+   mandatory (CLAUDE.md § 3.4), so S1/S2/S3 produce no
+   observable behaviour.
+2. The FUSE client routes every write through
+   `volume_id = "default"` — no per-path volume routing
+   exists, so creating a fresh `av-demo` volume in the SM
+   doesn't help (writes can't reach it).
+3. The REST surface has no `set-mandatory` endpoint
+   equivalent to AV-3-5's `set-cache`; mutating `default`'s
+   `mandatory_replicas` in-place is not possible via the
+   current API.
+4. Single-DC topology + `anchor = (dc-a, any-tier)` means
+   S4 anchor-lag-repair has no work to do — the invariant
+   is trivially satisfied by any first-chunk placement.
+
+**Disposition (recorded as two named follow-ups, not a
+hand-wavey deferral):**
+
+* **AV-4-1a** — new `POST /api/v1/volumes/{id}/set-mandatory`
+  endpoint (~0.5 d). Smallest code change that unblocks S1,
+  S2, and S3 on the current minicluster. Added as an
+  explicit Phase 4 task between AV-4-1 and AV-4-2; included
+  in Phase 4 Done When.
+* **AV-4-1b** — multi-DC topology provisioning (~1-2 d).
+  S4 needs this regardless of any code change. Explicitly
+  **deferred out of Phase 4** because (a) it's infra-heavy
+  and doesn't belong on Phase 4's critical path, (b) the
+  S4 behaviour is unit-tested in
+  `bug_av_anchor_lag_repair_*` (6 tests), and (c) the
+  reasoning-verified production path is straightforward.
+  Tracked as a named task so future agents pick it up
+  rather than re-deriving the requirement.
+
+AV-4-1 itself stays at 🟨 (needs review) until AV-4-1a
+lands and the shell script is re-run with S1/S2/S3 green.
+At that point AV-4-1 flips to ✅ with S4 explicitly noted
+"awaiting AV-4-1b". Phase 4 closes without AV-4-1b.
+
+_(end AV-4-1 deviation — disposition: queued as AV-4-1a
++ AV-4-1b)_
 
 ### AV-2-4 / AV-2-5 — Phase 2 live end-to-end demo deferred (2026-05-21)
 
