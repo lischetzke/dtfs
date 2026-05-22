@@ -24,7 +24,27 @@ service DataService {
 
   // Report I/O statistics
   rpc ReportStats(StatsRequest) returns (StatsResponse);
+
+  // Bug AV (AV-4-1c) — record a client-side cache hit so the
+  // data-node's per-DC read counter reflects ALL client reads,
+  // not only the ones that traverse the network. Without this,
+  // the FUSE readahead cache (and disk-backed local cache)
+  // absorbs repeat reads and the tiering engine never sees
+  // enough demand to fire a `cache.promote`. Lightweight: no
+  // data transfer, idempotent, fire-and-forget.
+  rpc RecordCacheHit(RecordCacheHitRequest) returns (RecordCacheHitResponse);
 }
+
+// AV-4-1c — body for RecordCacheHit. Same shape as the
+// (chunk_id, requester_dc) tracking key on GetChunk so the
+// data-node simply funnels it into the same metrics path.
+message RecordCacheHitRequest {
+  string chunk_id = 1;
+  string requester_dc = 2;
+  string requester_host = 3;
+}
+
+message RecordCacheHitResponse {}
 
 // --- PutChunk ---
 message PutChunkRequest {

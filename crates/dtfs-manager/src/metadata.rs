@@ -724,9 +724,14 @@ impl ManagerService for MetadataService {
         };
         let (effective_tier, effective_rf, anchor_dc) = match &volume_cfg {
             Some(v) => {
-                let (tier, rf) = resolve_preferred_tier(
+                // Bug AV (AV-4-1c) — `resolve_volume_placement` pins
+                // the contract that placement consults
+                // `effective_mandatory_replicas`, not the legacy
+                // `replication` field. See the helper's doc
+                // comment + regression test.
+                let (tier, rf) = resolve_volume_placement(
+                    v,
                     &req.preferred_tier,
-                    &v.replication,
                     &available_tiers,
                 );
                 (tier, rf, v.anchor_datacenter.clone())
@@ -1282,6 +1287,32 @@ pub(crate) fn parse_preferred_tier_hint(
     }
 }
 
+/// Bug AV (AV-4-1c) — top-level resolver used by the
+/// `allocate_chunks` handler. Wraps `resolve_preferred_tier`
+/// while pinning the contract that placement decisions MUST
+/// consult `mandatory_replicas` (via
+/// `effective_mandatory_replicas`), NOT the legacy
+/// `replication` field. Pre-fix the handler passed legacy
+/// `replication` directly, which silently routed writes onto
+/// the cache tier (e.g. `mandatory.cold=1` + `legacy.warm=2` →
+/// writes landed on warm), saturating the cache-replica cap on
+/// first write and blocking every demand-driven promotion
+/// forever.
+///
+/// Regression-tested by
+/// `bug_av_4_1c_placement_uses_mandatory_not_legacy_replication`.
+pub(crate) fn resolve_volume_placement(
+    volume: &dtfs_common::types::VolumeConfig,
+    hint: &str,
+    available_tiers: &[dtfs_common::types::DiskTier],
+) -> (dtfs_common::types::DiskTier, u32) {
+    resolve_preferred_tier(
+        hint,
+        volume.effective_mandatory_replicas(),
+        available_tiers,
+    )
+}
+
 /// Bug AV (AV-3-2) — pure-function resolution of the
 /// `preferred_tier` hint into a concrete `(tier, replication)`
 /// pair. The placement engine uses this output instead of
@@ -1428,6 +1459,111 @@ mod bug_av_preferred_tier_tests {
         assert_eq!(parse_preferred_tier_hint("banana"), None);
         assert_eq!(parse_preferred_tier_hint("Hot"), None,
             "case-sensitive: protocol values are lowercase");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Bug AV (AV-4-1c) — placement uses mandatory, not legacy
+    // ─────────────────────────────────────────────────────────────
+    //
+    // The bug that prompted these tests: a volume with
+    // `mandatory_replicas.cold=1` (operator just ran
+    // `volumes set-mandatory --cold-replicas 1 --warm-replicas 0
+    // --tape-replicas 0`) still had the pre-AV-migration legacy
+    // `replication = {warm:2, cold:1, tape:1}` field set. The
+    // `allocate_chunks` handler passed legacy `replication` to
+    // `resolve_preferred_tier`, which (per `pick_effective_tier`)
+    // returned (Warm, 2). New writes landed on warm, saturating
+    // the `cache_replicas.warm.max=1` cap on first write and
+    // permanently blocking the cache-promotion path (the planner
+    // saw 2 warm replicas already > target of 1, so
+    // `saturating_sub` returned 0 → no promotion ever fired).
+    //
+    // The fix wires `allocate_chunks` to consult
+    // `effective_mandatory_replicas()` via the
+    // `resolve_volume_placement` helper. These tests pin that
+    // contract so a future refactor can't silently regress it.
+
+    fn vol_with_split_mandatory_and_legacy() -> dtfs_common::types::VolumeConfig {
+        use dtfs_common::types::*;
+        VolumeConfig {
+            id: VolumeId::new("default".to_string()),
+            name: "default".to_string(),
+            chunk_size_bytes: 4 * 1024 * 1024,
+            // Legacy: warm=2, cold=1 — the pre-AV state.
+            replication: TierReplication { hot: 0, warm: 2, cold: 1, tape: 1 },
+            // Mandatory: cold-only — the post-set-mandatory state.
+            mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            cache_replicas: CacheReplication {
+                hot: CacheTierConfig::default(),
+                warm: CacheTierConfig { min: 1, max: 1 },
+                cold: CacheTierConfig::default(),
+                tape: CacheTierConfig::default(),
+                per_dc: true,
+                promote_reads: 2,
+                promote_window_secs: 60,
+                cooldown_secs: 30,
+            },
+            anchor: None,
+            anchor_datacenter: Some("dc-a".to_string()),
+            write_safety: WriteSafety {
+                min_replicas_before_ack: 1,
+                write_timeout_secs: 30,
+            },
+        }
+    }
+
+    /// AV-4-1c regression #1: a volume with mandatory=cold-only AND
+    /// legacy=warm-heavy MUST place new writes on COLD when the
+    /// client hint is empty (default first-write-tier). Pre-fix
+    /// the handler passed legacy `replication` to
+    /// `resolve_preferred_tier` and writes landed on warm,
+    /// poisoning the cache-promotion lifecycle.
+    #[test]
+    fn bug_av_4_1c_placement_uses_mandatory_not_legacy_replication() {
+        let v = vol_with_split_mandatory_and_legacy();
+        let available = vec![DiskTier::Hot, DiskTier::Warm, DiskTier::Cold];
+        let (tier, rf) = resolve_volume_placement(&v, "", &available);
+        assert_eq!(
+            tier, DiskTier::Cold,
+            "must place on Cold (the mandatory tier), not Warm (the legacy tier); \
+             writes-land-on-cache-tier silently broke cache promotion"
+        );
+        assert_eq!(rf, 1, "rf must come from mandatory.cold=1, not legacy.warm=2");
+    }
+
+    /// AV-4-1c regression #2: when the client explicitly requests
+    /// `preferred_tier="warm"` (FUSE `first_write_tier =
+    /// "nearest-warm"`), the placement engine honours the hint
+    /// even though mandatory says cold-only. Mandatory is the
+    /// fall-back floor, not a hard barrier — the hint takes
+    /// priority when the operator has explicitly opted in.
+    #[test]
+    fn bug_av_4_1c_explicit_warm_hint_still_wins_over_mandatory() {
+        let v = vol_with_split_mandatory_and_legacy();
+        let available = vec![DiskTier::Warm, DiskTier::Cold];
+        let (tier, rf) = resolve_volume_placement(&v, "warm", &available);
+        assert_eq!(tier, DiskTier::Warm, "explicit hint honoured");
+        assert_eq!(rf, 1, "hint placements always rf=1");
+    }
+
+    /// AV-4-1c regression #3: a legacy volume that has NEVER run
+    /// `migrate-policy` (mandatory_replicas all-zero) falls back
+    /// to legacy `replication` — preserves the pre-AV behaviour.
+    /// Guards against the fix accidentally breaking
+    /// pre-Bug-AV deployments.
+    #[test]
+    fn bug_av_4_1c_legacy_volume_keeps_legacy_replication_behaviour() {
+        use dtfs_common::types::*;
+        let mut v = vol_with_split_mandatory_and_legacy();
+        // Strip mandatory (legacy state).
+        v.mandatory_replicas = TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 };
+        let available = vec![DiskTier::Warm, DiskTier::Cold];
+        let (tier, rf) = resolve_volume_placement(&v, "", &available);
+        // With mandatory all-zero, effective_mandatory_replicas
+        // falls back to legacy.replication = {warm:2, cold:1, ...}.
+        // pick_effective_tier prefers higher tiers → returns Warm.
+        assert_eq!(tier, DiskTier::Warm, "legacy fallback uses replication.warm=2");
+        assert_eq!(rf, 2);
     }
 }
 

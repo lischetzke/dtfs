@@ -329,6 +329,37 @@ impl DtfsClient {
         Ok(inner.success)
     }
 
+    /// Bug AV (AV-4-1c) — notify a data node that a chunk was
+    /// served to a local FUSE-side cache hit. Used so the
+    /// data-node's per-DC read counter reflects ALL client
+    /// reads (not only the ones that traverse the network).
+    /// Without this, the FUSE readahead absorbs repeat reads
+    /// and the tiering engine never sees enough demand to fire
+    /// a promotion.
+    ///
+    /// Fire-and-forget at the call site (use `tokio::spawn`).
+    /// Errors are logged but never propagated — a missed
+    /// metrics ping is acceptable; an aborted read is not.
+    #[instrument(skip(self))]
+    pub async fn record_cache_hit(
+        &self,
+        node_addr: &str,
+        chunk_id: &str,
+    ) -> Result<()> {
+        use dtfs_proto::dtfs::data::RecordCacheHitRequest;
+        let mut client = self.data_client(node_addr).await?;
+        let request = RecordCacheHitRequest {
+            chunk_id: chunk_id.to_string(),
+            requester_dc: self.inner.requester_dc.read().clone(),
+            requester_host: self.inner.requester_host.read().clone(),
+        };
+        client
+            .record_cache_hit(request)
+            .await
+            .context("record_cache_hit RPC failed")?;
+        Ok(())
+    }
+
     /// Read a chunk from a data node.
     ///
     /// Uses server streaming: the data node sends the chunk back in 1 MB
