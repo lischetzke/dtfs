@@ -139,6 +139,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // anchor-violating updates (e.g. cold=0 when
         // anchor.required_tier=cold).
         .route("/api/v1/volumes/{id}/set-mandatory", post(set_volume_mandatory_endpoint))
+        // AV-5-12 — operator-facing set-anchor.
+        .route("/api/v1/volumes/{id}/set-anchor", post(set_volume_anchor_endpoint))
         // Stats (aggregate cluster metrics for WebUI home page)
         .route("/api/v1/stats", get(get_stats))
         // HMAC join (phase 1: challenge, phase 2: Raft register)
@@ -1282,6 +1284,127 @@ pub(crate) fn apply_set_mandatory(
     }
 
     Ok(next)
+}
+
+/// AV-5-12 — request body for `POST /api/v1/volumes/{id}/set-anchor`.
+/// Every field is optional; only the supplied ones are merged.
+///
+/// `datacenter` empty-string clears the anchor (sets to None).
+/// `required_tier` accepts "hot" / "warm" / "cold" / "tape" / "" to
+/// clear back to any-tier.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetAnchorRequest {
+    pub datacenter: Option<String>,
+    pub required_tier: Option<String>,
+}
+
+/// AV-5-12 pure helper — merge a partial anchor update onto the
+/// current volume config + validate. Sets `anchor` field; preserves
+/// legacy `anchor_datacenter` (kept for back-compat).
+///
+/// Validation: when `required_tier` is `Some(t)` and `mandatory_replicas.<t>`
+/// is 0, refuse — the anchor would be unsatisfiable forever.
+pub(crate) fn apply_set_anchor(
+    current: &dtfs_common::types::VolumeConfig,
+    req: &SetAnchorRequest,
+) -> Result<dtfs_common::types::VolumeConfig, String> {
+    use dtfs_common::types::{AnchorPolicy, DiskTier};
+    let mut next = current.clone();
+
+    let current_anchor = next
+        .effective_anchor()
+        .unwrap_or(AnchorPolicy {
+            datacenter: String::new(),
+            required_tier: None,
+        });
+
+    let new_dc = req
+        .datacenter
+        .clone()
+        .unwrap_or_else(|| current_anchor.datacenter.clone());
+    let new_tier: Option<DiskTier> = match req.required_tier.as_deref() {
+        None => current_anchor.required_tier,
+        Some("") => None,
+        Some("hot") => Some(DiskTier::Hot),
+        Some("warm") => Some(DiskTier::Warm),
+        Some("cold") => Some(DiskTier::Cold),
+        Some("tape") => Some(DiskTier::Tape),
+        Some(other) => return Err(format!("unknown required_tier: {other}")),
+    };
+
+    // Empty datacenter clears the anchor.
+    if new_dc.is_empty() {
+        next.anchor = None;
+        next.anchor_datacenter = None;
+        return Ok(next);
+    }
+
+    // Validate: required_tier reachable.
+    if let Some(t) = new_tier {
+        let mandatory_for_tier = next.effective_mandatory_replicas().for_tier(t);
+        if mandatory_for_tier == 0 {
+            return Err(format!(
+                "anchor.required_tier = {:?} but mandatory_replicas.{} = 0; \
+                 raise mandatory_replicas first or pick a different tier",
+                t,
+                format!("{:?}", t).to_lowercase()
+            ));
+        }
+    }
+
+    next.anchor = Some(AnchorPolicy {
+        datacenter: new_dc.clone(),
+        required_tier: new_tier,
+    });
+    next.anchor_datacenter = Some(new_dc);
+    Ok(next)
+}
+
+async fn set_volume_anchor_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(volume_id): axum::extract::Path<String>,
+    Json(body): Json<SetAnchorRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    use axum::http::StatusCode;
+
+    let current = {
+        let sm = state.sm_data.read().await;
+        sm.volumes.get(&volume_id).cloned()
+    };
+    let Some(current) = current else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("volume not found: {volume_id}")})),
+        ));
+    };
+
+    let next = apply_set_anchor(&current, &body)
+        .map_err(|e| (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e})),
+        ))?;
+
+    let changed = current != next;
+    if changed {
+        let req = ClientRequest::UpsertVolume { config: next.clone() };
+        if let Err(e) = state.raft.client_write(req).await {
+            warn!(volume = %volume_id, error = %e,
+                "set_volume_anchor Raft write failed");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("raft write failed: {e}")})),
+            ));
+        }
+        state.audit_log.log("api", "volume.set_anchor", &volume_id, "success");
+    } else {
+        state.audit_log.log("api", "volume.set_anchor", &volume_id, "noop");
+    }
+
+    Ok(Json(json!({
+        "volume_id": volume_id,
+        "changed": changed,
+        "config": volume_config_to_json(&next),
+    })))
 }
 
 async fn set_volume_mandatory_endpoint(

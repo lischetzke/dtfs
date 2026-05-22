@@ -1214,7 +1214,7 @@ manually for now (or by the existing additive-migrate UI button).
   `MINICLUSTER-VERIFICATION-2026-05-21.md` Bug AV section.
 * `mdbook build docs/` green.
 * `CLAUDE.md` updated in the same commit that lands the final Phase 3
-  code (per § 11 of CLAUDE.md itself — "update CLAUDE.md in the SAME
+  code (per § B.9 of AGENTS.md itself — "update CLAUDE.md in the SAME
   commit as the code change").
 
 ---
@@ -1442,7 +1442,7 @@ The "single bug" hypothesis turned into three:
   the newly-discovered AV-4-1d below.
 * **Disposition:** ✅ — the three fixes are
   structurally complete, regression-tested at the right
-  layer per CLAUDE.md § 4, and live-verified to do
+  layer per AGENTS.md § B.5, and live-verified to do
   their individual jobs. End-to-end S1 demo still gates
   on AV-4-1d (writes hardcoded to "hot" tier in FUSE
   filesystem.rs line 1542).
@@ -1862,7 +1862,7 @@ tasks:
      The plan's S1/S2/S3 scenarios require a volume where
      `warm` is **cache-class, not mandatory** (the cache
      planner deliberately skips tiers that are also
-     mandatory — see CLAUDE.md § 3.4).
+     mandatory — see AGENTS.md § A.3.4).
   2. The FUSE client routes EVERY write through the
      `"default"` volume id (`find_volume_id_for_path`
      reads from open-file state, not from a path-prefix
@@ -2824,7 +2824,7 @@ reduced 3600s → 10s.
 1. The `default` volume has
    `mandatory_replicas = {hot:0, warm:2, cold:1, tape:1}`.
    The cache planner correctly skips tiers that are also
-   mandatory (CLAUDE.md § 3.4), so S1/S2/S3 produce no
+   mandatory (AGENTS.md § A.3.4), so S1/S2/S3 produce no
    observable behaviour.
 2. The FUSE client routes every write through
    `volume_id = "default"` — no per-path volume routing

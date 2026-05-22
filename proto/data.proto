@@ -110,6 +110,12 @@ message DeleteChunkResponse {
 message ReplicateChunkRequest {
   string chunk_id = 1;
   string target_address = 2;  // Address of the target data node
+  // AV-5-9 — the tier the target node should write the replica to.
+  // Empty preserves the legacy behaviour (target's `put_chunk`
+  // falls back to `DiskTier::Hot` then to "any healthy disk"). The
+  // cache-promotion path now sets this so a warm promotion actually
+  // lands on the warm disk, not whichever has the most free space.
+  string target_tier = 3;
 }
 
 message ReplicateChunkResponse {

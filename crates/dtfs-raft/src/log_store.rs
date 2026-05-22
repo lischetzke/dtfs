@@ -2,15 +2,26 @@
 //!
 //! Column families:
 //! - `logs`  — Raft log entries keyed by index (big-endian u64), values are
-//!   bincode-encoded `Entry`.
+//!   JSON-encoded `Entry` (AV-5-11; older clusters wrote bincode and are
+//!   transparently read via the bincode-fallback path).
 //! - `meta`  — Small key/value pairs such as the current vote, last purged log
-//!   id, etc.
+//!   id, etc. (same JSON-first / bincode-fallback codec).
+//!
+//! AV-5-11 codec note: writes always use `serde_json` because bincode is
+//! positional and cannot honour `#[serde(default)]` for trailing
+//! struct fields — adding a field to any type embedded in a log entry
+//! (e.g. `NodeInfo` inside `ClientRequest::RegisterNode`) breaks reads
+//! of every existing log entry against the new binary
+//! (see `plans/incidents/RAFT-LOG-EOF-2026-05-23.md`). Reads first try
+//! JSON, then fall back to bincode so a manager can roll up to the new
+//! binary without a `rm -rf raft-log` step.
 
 use std::fmt::Debug;
 use std::io;
 use std::ops::RangeBounds;
 use std::path::Path;
 use std::sync::Arc;
+use serde::{de::DeserializeOwned, Serialize};
 
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
 use rocksdb::{ColumnFamilyDescriptor, Options, DB};
@@ -61,8 +72,7 @@ impl LogStore {
             let cf = db.cf_handle(CF_META).expect("meta CF must exist");
             match db.get_cf(&cf, META_KEY_LAST_PURGED) {
                 Ok(Some(bytes)) => {
-                    let lid: Option<LogId> = bincode::deserialize(&bytes)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    let lid: Option<LogId> = decode_value(&bytes)?;
                     lid
                 }
                 _ => None,
@@ -89,8 +99,7 @@ impl LogStore {
         let cf = self.db.cf_handle(CF_META).expect("meta CF");
         match self.db.get_cf(&cf, META_KEY_VOTE) {
             Ok(Some(bytes)) => {
-                let vote: Vote = bincode::deserialize(&bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let vote: Vote = decode_value(&bytes)?;
                 Ok(Some(vote))
             }
             Ok(None) => Ok(None),
@@ -105,8 +114,7 @@ impl LogStore {
         let mut iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::End);
         match iter.next() {
             Some(Ok((_key, value))) => {
-                let entry: Entry = bincode::deserialize(&value)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let entry: Entry = decode_value(&value)?;
                 Ok(Some(entry.log_id.clone()))
             }
             _ => Ok(None),
@@ -115,8 +123,7 @@ impl LogStore {
 
     fn persist_last_purged(&self, lid: &Option<LogId>) -> Result<(), io::Error> {
         let cf = self.db.cf_handle(CF_META).expect("meta CF");
-        let bytes = bincode::serialize(lid)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let bytes = encode_value(lid)?;
         self.db
             .put_cf(&cf, META_KEY_LAST_PURGED, bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
@@ -135,6 +142,29 @@ fn key_to_index(key: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(key);
     u64::from_be_bytes(buf)
+}
+
+/// AV-5-11 — encode a Raft log value (entry / vote / last_purged).
+/// Always uses JSON so reads tolerate future field additions on
+/// embedded structs.
+fn encode_value<T: Serialize>(v: &T) -> Result<Vec<u8>, io::Error> {
+    serde_json::to_vec(v).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// AV-5-11 — decode a Raft log value. Tries JSON first (the AV-5-11
+/// format); on parse failure falls back to bincode (the pre-AV-5-11
+/// format) so a freshly-rolled binary keeps serving an existing
+/// cluster without needing a `rm -rf raft-log` recovery step.
+fn decode_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, io::Error> {
+    match serde_json::from_slice::<T>(bytes) {
+        Ok(v) => Ok(v),
+        Err(json_err) => bincode::deserialize::<T>(bytes).map_err(|bin_err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("json={json_err}; bincode_fallback={bin_err}"),
+            )
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -176,8 +206,7 @@ impl RaftLogReader<TypeConfig> for LogReader {
             if idx >= end {
                 break;
             }
-            let entry: Entry = bincode::deserialize(&value)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let entry: Entry = decode_value(&value)?;
             entries.push(entry);
         }
 
@@ -188,8 +217,7 @@ impl RaftLogReader<TypeConfig> for LogReader {
         let cf = self.db.cf_handle(CF_META).expect("meta CF");
         match self.db.get_cf(&cf, META_KEY_VOTE) {
             Ok(Some(bytes)) => {
-                let vote: Vote = bincode::deserialize(&bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let vote: Vote = decode_value(&bytes)?;
                 Ok(Some(vote))
             }
             Ok(None) => Ok(None),
@@ -214,8 +242,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         let mut iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::End);
         let last_log_id = match iter.next() {
             Some(Ok((_key, value))) => {
-                let entry: Entry = bincode::deserialize(&value)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let entry: Entry = decode_value(&value)?;
                 Some(entry.log_id.clone())
             }
             _ => last_purged.clone(),
@@ -233,8 +260,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), io::Error> {
         let cf = self.db.cf_handle(CF_META).expect("meta CF");
-        let bytes = bincode::serialize(vote)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let bytes = encode_value(vote)?;
         self.db
             .put_cf(&cf, META_KEY_VOTE, bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -258,8 +284,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 
         for entry in entries {
             let key = index_to_key(entry.log_id.index);
-            let value = bincode::serialize(&entry)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let value = encode_value(&entry)?;
             self.db
                 .put_cf(&cf, key, value)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;

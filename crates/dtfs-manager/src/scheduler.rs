@@ -241,6 +241,26 @@ impl TaskScheduler {
         self.save_migration_state(&state).await;
     }
 
+    /// AV-5-5 — return true when a replication task targeting `chunk_id`
+    /// on `target_node` is still in flight (any status except Done /
+    /// Failed). The AV-2-5 demote dispatcher consults this to avoid
+    /// racing a just-completed PutChunk against a stale planner-emitted
+    /// demote (the planner's snapshot can predate the
+    /// UpdateChunkLocations Raft write that records the new replica).
+    pub(crate) async fn has_active_replication_to(
+        &self,
+        chunk_id: &str,
+        target_node: u64,
+    ) -> bool {
+        let state = self.load_migration_state().await;
+        state.tasks.values().any(|t| {
+            t.chunk_id == chunk_id
+                && t.target_node == target_node
+                && t.status != MigrationStatus::Done
+                && t.status != MigrationStatus::Failed
+        })
+    }
+
     /// Check the cluster state for under-replicated chunks and schedule
     /// re-replication tasks for them.
     async fn check_under_replicated(&self, migration_state: &mut MigrationState) {
@@ -614,7 +634,8 @@ impl TaskScheduler {
                                 task.source_node = src_node;
                             }
                             let chunk_id = task.chunk_id.clone();
-                            match self.replicate_chunk(&src_addr, &chunk_id, &tgt_addr).await {
+                            let tier_str = task.tier.to_string();
+                            match self.replicate_chunk(&src_addr, &chunk_id, &tgt_addr, &tier_str).await {
                                 Ok(()) => {
                                     info!(
                                         task_id = %task.task_id,
@@ -812,7 +833,24 @@ impl TaskScheduler {
                                 })
                                 .unwrap_or_default();
                             // Add the new target if it's not already present.
+                            // AV-5-9 — pick the disk_id that matches the
+                            // replication task's tier on the target node.
+                            // Pre-fix this was hardcoded `0`, so when the
+                            // target's disk[0] wasn't the tier we asked
+                            // for, the planner read the entry back as the
+                            // wrong tier and the cache lifecycle silently
+                            // misclassified replicas.
                             let target_str = target_node.to_string();
+                            let resolved_disk_id: u32 = sm
+                                .nodes
+                                .get(&target_node)
+                                .and_then(|n| {
+                                    n.disks
+                                        .iter()
+                                        .position(|d| d.tier == tier)
+                                        .map(|p| p as u32)
+                                })
+                                .unwrap_or(0);
                             let already_present = entries
                                 .iter()
                                 .any(|c| c.node_id == target_str);
@@ -821,7 +859,7 @@ impl TaskScheduler {
                                     chunk_index,
                                     chunk_hash: chunk_id.clone(),
                                     node_id: target_str,
-                                    disk_id: 0,
+                                    disk_id: resolved_disk_id,
                                     size_bytes: 0,
                                 });
                             }
@@ -964,12 +1002,17 @@ impl TaskScheduler {
         None
     }
 
-    /// Ask the source node to replicate `chunk_id` to `target_addr`.
+    /// Ask the source node to replicate `chunk_id` to `target_addr`,
+    /// landing the replica on `target_tier` ("hot"/"warm"/"cold"/
+    /// "tape"). AV-5-9: empty tier preserves legacy behaviour (target
+    /// falls back to "any healthy disk"), non-empty pins the
+    /// destination tier so cache promotions actually land on warm.
     async fn replicate_chunk(
         &self,
         source_addr: &str,
         chunk_id: &str,
         target_addr: &str,
+        target_tier: &str,
     ) -> anyhow::Result<()> {
         // Bug W (part 2) — `source_addr` is `NodeInfo.grpc_addr`, which the
         // RegisterNode path stores already as a full URL ("http://ip:port").
@@ -984,6 +1027,7 @@ impl TaskScheduler {
             .replicate_chunk(ReplicateChunkRequest {
                 chunk_id: chunk_id.to_string(),
                 target_address: target_addr.to_string(),
+                target_tier: target_tier.to_string(),
             })
             .await
             .map_err(|e| anyhow::anyhow!("ReplicateChunk RPC: {}", e))?

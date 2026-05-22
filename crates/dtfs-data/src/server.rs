@@ -464,7 +464,7 @@ impl DataService for DataServiceImpl {
 
         match self
             .replication
-            .replicate_to(&chunk_id, &req.target_address)
+            .replicate_to(&chunk_id, &req.target_address, &req.target_tier)
             .await
         {
             Ok(()) => Ok(Response::new(ReplicateChunkResponse {
