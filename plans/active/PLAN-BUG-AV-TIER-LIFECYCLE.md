@@ -272,7 +272,7 @@ from the original sketch get appended under each task as
 | 1 | Schema + flush API (~4.5 d) | ✅ closed 2026-05-21 |
 | 2 | Tiering engine: read-driven cache promotion (~2.5 d) | ✅ closed 2026-05-21 |
 | 3 | Client first-write tier + UX (~2 d) | ✅ closed 2026-05-21 |
-| 4 | Polish + verification close-out (~4 d) | 🟦 in progress — AV-4-1 🟨 needs AV-4-1a fixup; AV-4-1b deferred (multi-DC) |
+| 4 | Polish + verification close-out (~4.5 d) | 🟦 in progress — AV-4-1 🟨; AV-4-1a ✅; AV-4-1c new (reads→tiering pipeline); AV-4-1b deferred (multi-DC) |
 
 ---
 
@@ -1157,7 +1157,7 @@ demos are gated on that:
   change that unblocks S1/S2/S3, and AV-4-1b queues the
   multi-DC infra work for S4.
 
-### ⬜ AV-4-1a — `POST /api/v1/volumes/{id}/set-mandatory` endpoint (~0.5 d) — _unblocks AV-4-1 S1/S2/S3_
+### ✅ AV-4-1a — `POST /api/v1/volumes/{id}/set-mandatory` endpoint (~0.5 d) — _intended to unblock AV-4-1 S1/S2/S3_
 
 The minicluster's `default` volume has
 `mandatory_replicas.warm = 2`, which (correctly per the AV
@@ -1210,6 +1210,69 @@ This task fills that gap so the test setup can convert
   S1/S2/S3 produces the expected promote / demote /
   cooldown behaviour. After verification, flip AV-4-1's
   🟨 to ✅ with a reference to this fixup commit.
+
+### ⬜ AV-4-1c — Diagnose reads→tiering pipeline gap (~0.5-1 d) — _newly-discovered blocker_
+
+Discovered during AV-4-1a live verification. With AV-4-1a in
+place, `default` was successfully converted to cold-only
+mandatory (the AV-4-1a goal). Re-running
+`tests/proxmox/abuse/15-bug-av-cache-lifecycle.sh` still
+produces 0 cache promotions despite:
+
+* Tiering tick lowered to 10s (verified in startup log).
+* `default` mandatory_replicas now `{hot:0, warm:0, cold:1,
+  tape:0}` — warm IS cache-eligible.
+* `default` cache_replicas.warm = `{min: 1, max: 1,
+  per_dc: true, promote_reads: 2, promote_window_secs: 60}`.
+* Manager + data-node binaries are the freshly-built ones
+  matching the workspace.
+* `set_requester_location("dc-a", host)` is called from FUSE
+  main.rs after `DtfsClient::new()`.
+* The legacy temperature-based tiering IS running (we saw a
+  `Tiering demote: chunk … (Cold→Warm)` log + a real
+  `Migration: Pending→Copying` task).
+
+The AV cache-tick path is silent — `info!("Bug AV tick: {}
+promotions, {} demotions", ...)` only fires when one is
+non-zero, and we never see it. So either:
+
+* `tick_av_cache` is being called every 10s but the
+  TickSnapshot has zero matching chunks (the per-volume
+  filter rejects everything for some reason), OR
+* The snapshot has chunks but `count_reads_in_window`
+  returns 0 because the read window store wasn't populated
+  (the data-node's heartbeat carries the reads but the
+  manager's `report_access` didn't push samples), OR
+* Something subtler — the chunks belong to the wrong
+  volume_id after the set-mandatory conversion.
+
+* **Files to investigate (no obvious culprit):**
+  - `crates/dtfs-manager/src/tiering.rs::tick_av_cache` /
+    `build_av_cache_snapshot` — does the snapshot include
+    `default`-volume chunks after set-mandatory?
+  - `crates/dtfs-manager/src/metadata.rs::heartbeat` →
+    `tiering.report_access` — is `reads_by_dc.get("dc-a")`
+    actually non-zero in the incoming heartbeat?
+  - `crates/dtfs-data/src/server.rs::get_chunk` →
+    `metrics.record_chunk_read(chunk_id, requester_dc, …)`
+    — is `requester_dc` actually `"dc-a"` at recording
+    time?
+* **Approach:** add narrow debug `tracing::info!` to each
+  hop (data-node receives GetChunk with requester_dc=X;
+  data-node harvest_per_chunk emits N (chunk, dc) entries;
+  manager heartbeat reports M chunk_reads entries; manager
+  report_access pushes K samples; tick builds T tick-
+  chunks). Find the first hop where the count drops to 0.
+  Once located, fix narrowly.
+* **Tests:** depending on the root cause, this likely lands
+  as a 1-line fix + a regression test in
+  `bug_av_tiering_tick_tests`. May also require an end-to-end
+  abuse test that doesn't depend on minicluster timing.
+* **Done when:** AV-4-1's S1 scenario produces a real
+  `cache.promote` audit entry on the minicluster after
+  2 reads. Once that's verified, re-run S2 + S3 + flip
+  AV-4-1 to ✅. (S4 remains AV-4-1b's deferred multi-DC
+  work.)
 
 ### ⬜ AV-4-1b — Multi-DC topology for S4 anchor-lag-repair demo (~1-2 d) — _deferred_
 
@@ -1430,14 +1493,15 @@ Wraps up Bug AV. The plan moves from `plans/active/` to
 
 ### Phase 4 Done When
 
-* AV-4-1, AV-4-1a, AV-4-2, AV-4-3, AV-4-4, AV-4-5, AV-4-6
-  all ✅. AV-4-1b is the explicit multi-DC infra
-  follow-up that closes the S4 demo gap; it is **deferred
-  out of Phase 4** (see § 5 deviations) and Phase 4 closes
-  without it.
-* **~9 new tests green** (4 set-mandatory + 2 list-endpoint
-  + ~3 redundancy escalation; UI work is live-only per the
-  WebUI testing convention).
+* AV-4-1, AV-4-1a, AV-4-1c, AV-4-2, AV-4-3, AV-4-4,
+  AV-4-5, AV-4-6 all ✅. AV-4-1b (multi-DC) is the
+  explicit infra follow-up that closes the S4 demo gap;
+  it is **deferred out of Phase 4** (see § 5 deviations)
+  and Phase 4 closes without it.
+* **~10 new tests green** (5 set-mandatory + 2 list-
+  endpoint + ~3 redundancy escalation + possibly 1 from
+  AV-4-1c depending on root cause; UI work is live-only
+  per the WebUI testing convention).
 * End-to-end live demos for AV-2-4 / AV-2-5 / AV-3-3 (S1,
   S2, S3 from AV-4-1) recorded in
   `MINICLUSTER-VERIFICATION-2026-05-21.md`. S4
@@ -1491,6 +1555,54 @@ tasks:
 
 > Updated as each task completes. Each entry: task ID, date, what was
 > tested, command/output snippet, anomalies.
+
+### AV-4-1a — 2026-05-22
+
+* **Files touched:**
+  - `crates/dtfs-manager/src/api.rs` — new
+    `SetMandatoryRequest`, pure helper `apply_set_mandatory`,
+    async `set_volume_mandatory_endpoint`, route
+    registration. Mirrors AV-3-5 `set-cache` shape and
+    layering. Two validation gates: reject all-zero
+    result + reject anchor-required-tier-zero.
+  - `crates/dtfs-cli/src/main.rs` — `VolumesCmd::SetMandatory
+    { volume_id, hot/warm/cold/tape_replicas }` +
+    `cmd_volumes_set_mandatory` handler.
+* **Unit tests** (`cargo test -p dtfs-manager bug_av_set_mandatory`):
+  5 green:
+  - `bug_av_set_mandatory_merges_partial_update`
+  - `bug_av_set_mandatory_rejects_all_zero`
+  - `bug_av_set_mandatory_rejects_anchor_required_tier_zero`
+  - `bug_av_set_mandatory_legacy_volume_round_trips`
+  - `bug_av_set_mandatory_empty_request_is_noop` (defensive)
+* **Workspace regression**: dtfs-manager 104 → 109; all
+  other crates unchanged. `cargo test --workspace --release`
+  all green.
+* **Live verification** on minicluster (2026-05-22, after
+  rolling manager binaries to all 3 mgrs and re-recovering
+  mini-mgr02's Raft state):
+  - `volumes set-mandatory default --hot 0 --warm 0
+    --cold 1 --tape 0` → "applied" on the leader
+    (mini-mgr03); 503 on followers (expected — CLI doesn't
+    auto-forward, operator picks the leader by iterating).
+  - `volumes show default` confirms
+    `Mandatory replicas: hot=0 warm=0 cold=1 tape=0`.
+  - All-zero rejected with HTTP 400 ✓.
+  - Idempotent re-apply returns "no-op" ✓.
+* **Downstream gap discovered:** despite AV-4-1a being
+  structurally complete + verified, re-running the AV-4-1
+  shell script still produces 0 cache promotions. The
+  reads→tiering pipeline has a separate gap — registered
+  as AV-4-1c.
+* **Deviations:** one extra defensive test
+  (`empty_request_is_noop`) added to guard the
+  no-op-detection path the dispatcher relies on. Matches
+  the same defensive pattern in `bug_av_set_cache_empty_
+  request_is_noop`.
+* **Status:** ✅ AV-4-1a itself is complete (5 tests green;
+  live API works; CLI works; validation works). The
+  AV-4-1 demo still doesn't run end-to-end because AV-4-1c
+  has surfaced as a deeper-stack blocker.
 
 ### AV-4-1 — 2026-05-22 (🟨 needs review — topology blocker)
 
