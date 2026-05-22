@@ -2435,6 +2435,9 @@ mod posix_path_regression {
                 last_seen_ms: 0,
                 total_bytes_read: 0,
                 total_bytes_written: 0,
+                client_ip: None,
+                version: String::new(),
+                build_date: String::new(),
             });
         }
         sm.files.insert(file_path.to_string(), FileMetadata {

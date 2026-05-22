@@ -424,6 +424,9 @@ async fn join_complete_api(
             .unwrap_or(0),
         total_bytes_read: 0,
         total_bytes_written: 0,
+        client_ip: None,
+        version: String::new(),
+        build_date: String::new(),
     };
 
     let completion = state
@@ -477,6 +480,26 @@ struct NodeResponse {
     /// approximate via the most-recent write_lease for any of their
     /// owner_id hostnames.
     last_seen_ms: u64,
+    /// Bug AX — peer IP for client (FUSE) nodes, captured at
+    /// RegisterNode time. `None` for data/manager nodes (their IP is
+    /// already in `grpc_addr`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_ip: Option<String>,
+    /// Bug AX — true for the manager whose `node_id` matches openraft's
+    /// `current_leader` at request time. Always false for data/client
+    /// roles. The leader can shift between calls (Raft elections), so
+    /// the WebUI should treat this as a snapshot, not a durable label.
+    is_leader: bool,
+    /// Bug AY — binary version this node reported. Empty for nodes that
+    /// pre-date Bug AY or for synthetic/lease-derived entries the
+    /// manager couldn't ask directly.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    version: String,
+    /// Bug AY — build date of the binary this node is running, format
+    /// `YYYYMMDD-HHmmss` (UTC, e.g. `"20260522-141034"`). Empty when
+    /// unknown.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    build_date: String,
     /// Bug AR — per-disk detail so the Nodes page can render a row per
     /// disk (tier, mount_path, individual utilisation). The list was
     /// previously hidden behind `disk_count`, making it impossible for
@@ -504,6 +527,10 @@ impl NodeResponse {
             health: format!("{:?}", info.health),
             role: format!("{:?}", info.role),
             last_seen_ms: info.last_seen_ms,
+            client_ip: info.client_ip.clone(),
+            is_leader: false,
+            version: info.version.clone(),
+            build_date: info.build_date.clone(),
             disks: info
                 .disks
                 .iter()
@@ -528,12 +555,27 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
+    // Bug AX — query Raft's current leader once so we can mark whichever
+    // manager NodeResponse matches. None when quorum is lost.
+    use openraft::async_runtime::watch::WatchReceiver;
+    let leader_id: Option<u64> = state
+        .raft
+        .metrics()
+        .borrow_watched()
+        .current_leader;
+
     // 1. Data + manager nodes registered in Raft (have heartbeat /
     //    join records).
     let mut nodes: Vec<NodeResponse> = sm
         .nodes
         .iter()
-        .map(|(id, info)| NodeResponse::from_entry(*id, info))
+        .map(|(id, info)| {
+            let mut r = NodeResponse::from_entry(*id, info);
+            if Some(*id) == leader_id {
+                r.is_leader = true;
+            }
+            r
+        })
         .collect();
 
     // 2. WebUI bug — managers don't self-register through the
@@ -564,6 +606,21 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             render_seg(&v.rack),
             v.hostname,
         );
+        // Bug AY — managers don't go through RegisterNode, so the only
+        // version we can confidently fill is the local manager's own
+        // (the one serving this API call). Other managers' version
+        // stays empty until a future per-manager status RPC is wired.
+        let is_local = v.hostname == state.config.node.hostname;
+        let synth_version = if is_local {
+            dtfs_common::version::VERSION.to_string()
+        } else {
+            String::new()
+        };
+        let synth_build_date = if is_local {
+            dtfs_common::version::BUILD_DATE.to_string()
+        } else {
+            String::new()
+        };
         nodes.push(NodeResponse {
             node_id: id.to_string(),
             hostname: v.hostname.clone(),
@@ -578,6 +635,10 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             // assumed alive within the cluster heartbeat window. A
             // future fix wires per-manager last-seen via Raft membership.
             last_seen_ms: now_ms,
+            client_ip: None,
+            is_leader: Some(id) == leader_id,
+            version: synth_version,
+            build_date: synth_build_date,
             disks: Vec::new(),
         });
     }
@@ -627,6 +688,12 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             health: "Healthy".to_string(),
             role: "Client".to_string(),
             last_seen_ms: last_seen,
+            // Lease-derived clients pre-date Bug AX self-registration,
+            // so we have no peer IP for them.
+            client_ip: None,
+            is_leader: false,
+            version: String::new(),
+            build_date: String::new(),
             disks: Vec::new(),
         });
     }
@@ -795,40 +862,44 @@ async fn list_volumes(State(state): State<Arc<AppState>>) -> Json<Value> {
 
     let volume_list: Vec<Value> = volume_ids
         .iter()
-        .map(|vid| {
-            let (file_count, total_size) = usage.get(vid).copied().unwrap_or((0, 0));
-            if let Some(cfg) = sm.volumes.get(vid) {
-                json!({
-                    "volume_id": vid,
-                    "name": cfg.name,
-                    "chunk_size_bytes": cfg.chunk_size_bytes,
-                    "replication": {
-                        "hot": cfg.replication.hot,
-                        "warm": cfg.replication.warm,
-                        "cold": cfg.replication.cold,
-                        "tape": cfg.replication.tape,
-                    },
-                    "write_safety": {
-                        "min_replicas_before_ack": cfg.write_safety.min_replicas_before_ack,
-                        "write_timeout_secs": cfg.write_safety.write_timeout_secs,
-                    },
-                    "file_count": file_count,
-                    "total_size": total_size,
-                })
-            } else {
-                json!({
-                    "volume_id": vid,
-                    "file_count": file_count,
-                    "total_size": total_size,
-                })
-            }
-        })
+        .map(|vid| list_volumes_row_json(sm.volumes.get(vid), vid,
+            usage.get(vid).copied().unwrap_or((0, 0))))
         .collect();
 
     Json(json!({
         "count": volume_list.len(),
         "volumes": volume_list,
     }))
+}
+
+/// Bug AV (AV-4-2) — pure helper for the per-volume row in
+/// `GET /api/v1/volumes`. Embeds the full AV-3-5
+/// `volume_config_to_json` projection (mandatory_replicas,
+/// cache_replicas, anchor, …) and merges the aggregation fields
+/// (`file_count`, `total_size`) so a single endpoint serves both the
+/// usage view and the policy view. Legacy volumes (no AV fields set)
+/// render with their default-zero values via `effective_*` helpers, so
+/// older snapshots don't crash.
+pub(crate) fn list_volumes_row_json(
+    cfg: Option<&dtfs_common::types::VolumeConfig>,
+    vid: &str,
+    usage: (usize, u64),
+) -> Value {
+    let (file_count, total_size) = usage;
+    if let Some(cfg) = cfg {
+        let mut row = volume_config_to_json(cfg);
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("file_count".into(), json!(file_count));
+            obj.insert("total_size".into(), json!(total_size));
+        }
+        row
+    } else {
+        json!({
+            "volume_id": vid,
+            "file_count": file_count,
+            "total_size": total_size,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -2359,6 +2430,9 @@ mod bug_al_io_rate_tests {
             last_seen_ms: 0,
             total_bytes_read: read,
             total_bytes_written: written,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
         }
     }
 
@@ -2605,6 +2679,55 @@ mod bug_av_set_cache_tests {
             "anchor is None → null, not an empty object (got {})",
             v["anchor"]
         );
+    }
+
+    /// AV-4-2 regression #1 — the list-endpoint row must include
+    /// the full AV-3-5 projection (mandatory_replicas,
+    /// cache_replicas, anchor) PLUS the aggregation fields
+    /// (file_count, total_size). Pre-AV-4-2 the list row only
+    /// emitted `replication` + aggregation, so operators reading
+    /// the list endpoint couldn't see what cache policy a volume
+    /// carried without an extra per-volume GET.
+    #[test]
+    fn bug_av_4_2_list_volumes_row_includes_av_fields() {
+        let mut cfg = legacy_volume();
+        cfg.mandatory_replicas = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+        cfg.cache_replicas.warm = CacheTierConfig { min: 1, max: 1 };
+        cfg.cache_replicas.per_dc = true;
+        cfg.cache_replicas.promote_reads = 2;
+        cfg.cache_replicas.promote_window_secs = 60;
+        cfg.cache_replicas.cooldown_secs = 30;
+        cfg.anchor = Some(AnchorPolicy {
+            datacenter: "dc-a".to_string(),
+            required_tier: None,
+        });
+
+        let row = list_volumes_row_json(Some(&cfg), "default", (12, 9_999_999));
+
+        // Aggregation fields.
+        assert_eq!(row["file_count"], 12);
+        assert_eq!(row["total_size"], 9_999_999);
+        // AV-3-5 projection fields.
+        assert_eq!(row["mandatory_replicas"]["cold"], 1);
+        assert_eq!(row["cache_replicas"]["warm"]["max"], 1);
+        assert_eq!(row["cache_replicas"]["per_dc"], true);
+        assert_eq!(row["anchor"]["datacenter"], "dc-a");
+        // Legacy `replication` block still present (back-compat).
+        assert_eq!(row["replication"]["warm"], 2);
+    }
+
+    /// AV-4-2 regression #2 — a usage-only row (volume exists in
+    /// `files` but has no `VolumeConfig`) renders with just
+    /// `volume_id` + aggregation, no crash on missing config.
+    /// Pre-fix behaviour preserved.
+    #[test]
+    fn bug_av_4_2_list_volumes_legacy_volume_renders_correctly() {
+        let row = list_volumes_row_json(None, "orphan", (3, 42));
+        assert_eq!(row["volume_id"], "orphan");
+        assert_eq!(row["file_count"], 3);
+        assert_eq!(row["total_size"], 42);
+        assert!(row.get("cache_replicas").is_none(),
+            "config-less row must not invent default fields");
     }
 }
 

@@ -363,6 +363,10 @@ async fn manager_lifecycle(
         }),
         disks: disk_infos.clone(),
         shared_secret: Some(config.cluster.shared_secret.clone()),
+        // Bug AY — surface this binary's version + build date so the
+        // manager can show what each data node is actually running.
+        version: dtfs_common::version::VERSION.to_string(),
+        build_date: dtfs_common::version::BUILD_DATE.to_string(),
     };
 
     let mut reg_backoff = Duration::from_secs(1);

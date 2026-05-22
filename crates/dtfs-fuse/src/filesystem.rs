@@ -1532,14 +1532,20 @@ impl DtfsFilesystem {
             // cheap (zero-copy). Use the Bytes overload so the data buffer is
             // shared across all N replica writers instead of being copied N
             // times.
+            // Bug AV (AV-4-1d) — pass the manager-resolved tier
+            // through to the data-node. Empty string preserves the
+            // legacy "any healthy disk" fallback for managers that
+            // pre-date AV-4-1d. See `fuse_tier_for_placement`.
+            let tier = fuse_tier_for_placement(&placement.tier).to_string();
             let writes = targets.iter().map(|addr| {
                 let client = self.client.clone();
                 let addr = addr.clone();
                 let volume_id = volume_id.clone();
                 let data = segment.data.clone();
+                let tier = tier.clone();
                 async move {
                     let res = client
-                        .write_chunk_bytes(&addr, "", &volume_id, "hot", data)
+                        .write_chunk_bytes(&addr, "", &volume_id, &tier, data)
                         .await;
                     (addr, res)
                 }
@@ -1671,6 +1677,19 @@ fn file_attr_from_locations(locations: &FileLocations) -> FileAttr {
     }
 }
 
+/// Bug AV (AV-4-1d) — returns the tier string FUSE will pass to the
+/// data-node `put_chunk` RPC for the given manager-resolved placement
+/// tier. Pre-AV-4-1d FUSE hardcoded `"hot"` here regardless of what
+/// the manager resolved, which made the data-node's
+/// `select_disk_for_tier(Hot)` fall back to "any healthy disk by free
+/// capacity" (`disk.rs:106`) and silently land the chunk on the wrong
+/// tier. Empty string is preserved verbatim — pre-AV-4-1d managers
+/// don't populate `placement.tier`, and the data-node's legacy "any
+/// healthy disk" fallback matches the old behaviour for that case.
+fn fuse_tier_for_placement(placement_tier: &str) -> &str {
+    placement_tier
+}
+
 /// Convert epoch milliseconds (i64) to `SystemTime`. Returns `UNIX_EPOCH` when
 /// the input is zero or negative — those are sentinels for "not known yet".
 fn system_time_from_epoch_ms(ms: i64) -> SystemTime {
@@ -1684,6 +1703,30 @@ fn system_time_from_epoch_ms(ms: i64) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bug AV (AV-4-1d) regression #1: the writer used to hardcode
+    /// `"hot"` regardless of what the manager resolved. Pinning the
+    /// contract so a future refactor can't silently regress.
+    #[test]
+    fn bug_av_4_1d_fuse_uses_placement_tier_not_hardcoded() {
+        assert_eq!(
+            fuse_tier_for_placement("cold"),
+            "cold",
+            "FUSE must propagate the manager-resolved tier, not hardcode 'hot'"
+        );
+        assert_eq!(fuse_tier_for_placement("warm"), "warm");
+        assert_eq!(fuse_tier_for_placement("tape"), "tape");
+        assert_eq!(fuse_tier_for_placement("hot"), "hot");
+    }
+
+    /// Bug AV (AV-4-1d) regression #2: old managers don't populate
+    /// `placement.tier`. FUSE passes empty through so the data-node
+    /// uses its legacy "any healthy disk" fallback (matches pre-fix
+    /// behaviour for older clusters).
+    #[test]
+    fn bug_av_4_1d_fuse_empty_tier_preserves_legacy_fallback() {
+        assert_eq!(fuse_tier_for_placement(""), "");
+    }
 
     #[test]
     fn test_system_time_from_epoch_positive() {

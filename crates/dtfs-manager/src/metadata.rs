@@ -336,6 +336,13 @@ impl ManagerService for MetadataService {
         } else {
             build_data_grpc_addr(peer_addr, &req.hostname, req.grpc_port)
         };
+        // Bug AX — clients have no grpc_addr; record their source IP so
+        // operators can see where the FUSE mount is connecting from.
+        let client_ip = if is_client {
+            peer_addr.map(|sa| sa.ip().to_string())
+        } else {
+            None
+        };
         let disks = disks_from_register_req(&req.disks);
         let total_capacity: u64 = disks.iter().map(|d| d.total_bytes).sum();
         let used_capacity: u64 = disks.iter().map(|d| d.used_bytes).sum();
@@ -365,6 +372,12 @@ impl ManagerService for MetadataService {
                 .unwrap_or(0),
             total_bytes_read: 0,
             total_bytes_written: 0,
+            client_ip,
+            // Bug AY — propagate the reporting node's version + build date
+            // into Raft state so every manager surfaces the same value
+            // in /api/v1/nodes and the WebUI Nodes page.
+            version: req.version.clone(),
+            build_date: req.build_date.clone(),
         };
 
         let resp = self
@@ -781,6 +794,7 @@ impl ManagerService for MetadataService {
                     chunk_index: p.chunk_index,
                     primary_address: primary,
                     replica_addresses,
+                    tier: chunk_placement_tier_string(effective_tier),
                 });
             }
         }
@@ -818,6 +832,7 @@ impl ManagerService for MetadataService {
                     chunk_index: i,
                     primary_address: primary.grpc_addr.clone(),
                     replica_addresses,
+                    tier: chunk_placement_tier_string(effective_tier),
                 });
             }
         }
@@ -1313,6 +1328,15 @@ pub(crate) fn resolve_volume_placement(
     )
 }
 
+/// Bug AV (AV-4-1d) — wire-format string we put into
+/// `ChunkPlacement.tier` so the FUSE writer can pass the
+/// manager-resolved tier to the data-node's `put_chunk` RPC. Pins the
+/// DiskTier → wire-string contract; if either side ever drifts, the
+/// regression test catches it.
+pub(crate) fn chunk_placement_tier_string(tier: dtfs_common::types::DiskTier) -> String {
+    tier.to_string()
+}
+
 /// Bug AV (AV-3-2) — pure-function resolution of the
 /// `preferred_tier` hint into a concrete `(tier, replication)`
 /// pair. The placement engine uses this output instead of
@@ -1544,6 +1568,24 @@ mod bug_av_preferred_tier_tests {
         let (tier, rf) = resolve_volume_placement(&v, "warm", &available);
         assert_eq!(tier, DiskTier::Warm, "explicit hint honoured");
         assert_eq!(rf, 1, "hint placements always rf=1");
+    }
+
+    /// AV-4-1d regression: every `ChunkPlacement` returned by
+    /// `allocate_chunks` must carry the manager-resolved tier as a
+    /// lowercase wire-format string. Pre-fix the field didn't exist,
+    /// so the FUSE writer hardcoded `"hot"` and the data-node's
+    /// `select_disk_for_tier(Hot)` fell back to "any healthy disk by
+    /// free capacity", silently landing chunks on the wrong tier.
+    /// Pinning the DiskTier → wire-string contract here means a
+    /// future enum-rename or Display-impl change can't silently
+    /// re-introduce the bug.
+    #[test]
+    fn bug_av_4_1d_allocate_chunks_response_carries_tier() {
+        use dtfs_common::types::DiskTier;
+        assert_eq!(chunk_placement_tier_string(DiskTier::Cold), "cold");
+        assert_eq!(chunk_placement_tier_string(DiskTier::Warm), "warm");
+        assert_eq!(chunk_placement_tier_string(DiskTier::Hot), "hot");
+        assert_eq!(chunk_placement_tier_string(DiskTier::Tape), "tape");
     }
 
     /// AV-4-1c regression #3: a legacy volume that has NEVER run

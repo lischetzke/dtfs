@@ -1,6 +1,6 @@
 # Log Shipping (Filebeat → Elastic)
 
-This guide is a **worked example** for shipping DTFS logs from every cluster node to an Elastic Stack (Elasticsearch + Kibana) using Filebeat as the on-node agent. It is tuned for the multi-DC Plexmedia topology described in [CLAUDE.md § 1.1](../../../CLAUDE.md) — bandwidth-asymmetric DCs where naive log shipping can saturate the 40 Mbps LELI uplink during an incident.
+This guide is a **worked example** for shipping DTFS logs from every cluster node to an Elastic Stack (Elasticsearch + Kibana) using Filebeat as the on-node agent. It is tuned for the multi-DC Plexmedia topology described in [AGENTS.md § A.1.1](../../../AGENTS.md) — bandwidth-asymmetric DCs where naive log shipping can saturate the 40 Mbps LELI uplink during an incident.
 
 Adapt the version numbers, hostnames, and credentials to your environment. Tested with Elastic Stack 8.13 and Filebeat 8.13.
 
@@ -37,7 +37,7 @@ Each DTFS node runs its own Filebeat. The agent reads only the DTFS systemd unit
 
 - **Elastic Stack 8.x** (Elasticsearch + Kibana). 8.13+ recommended for ECS 8 mappings.
 - **Filebeat 8.x**, matching your Elasticsearch major version.
-- **Network**: outbound TCP 9200 (ES direct) or 5044 (via Logstash) from each DTFS node to the Elastic cluster. Add this to your shaping exemption list alongside SSH/22, manager gRPC/9401, manager API/9402, data gRPC/9500, NTP/123 (CLAUDE.md § 9) — otherwise Filebeat backoff will mask real incidents.
+- **Network**: outbound TCP 9200 (ES direct) or 5044 (via Logstash) from each DTFS node to the Elastic cluster. Add this to your shaping exemption list alongside SSH/22, manager gRPC/9401, manager API/9402, data gRPC/9500, NTP/123 (AGENTS.md § A.7) — otherwise Filebeat backoff will mask real incidents.
 - **Disk**: ~1 GB per node for Filebeat's local queue (see § Bandwidth and noise control).
 - **Credentials**: a dedicated `filebeat_writer` Elasticsearch role with `create_doc` on `filebeat-dtfs-*` and `monitor` on the cluster. Do not reuse the superuser.
 
@@ -367,4 +367,4 @@ These knobs all matter most for LELI. Apply selectively:
 - [Monitoring](monitoring.md) — Prometheus metrics scrape (complement to log shipping).
 - [Alerting](alerting.md) — alert rules; consider adding log-derived alerts for the saved searches above.
 - [Troubleshooting](troubleshooting.md) — on-cluster diagnostic commands that complement centralised logs.
-- [CLAUDE.md § 9](../../../CLAUDE.md) — DTFS bandwidth-shaping and port exemption rules.
+- [AGENTS.md § A.7](../../../AGENTS.md) — DTFS bandwidth-shaping and port exemption rules.
