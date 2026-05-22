@@ -3345,16 +3345,50 @@ are explicit deferrals out of Phase 4.
   cleans up) and `bug_av_delete_chunk_wal_recovery_idempotent`
   (recover-on-empty-store no-op).
 
-### 7.2 New follow-up tracked as deferral
+### 7.2 New follow-up tracked, then resolved
 
-- **AV-4-8 — live S1 promote pipeline silent.** After the AV-4-1d
-  deploy + the necessary Raft state wipe (the existing log on all
-  three managers failed `Read Logs: unexpected end of file` against
-  the freshly-built binary; root cause undetermined, masked by the
-  full-cluster wipe), the cluster comes up healthy and writes land
-  on the correct cold tier (verified on-disk at
-  `/mnt/data01-cold/chunks/.../e6fb…b2de.dat`). Heartbeat ingests
-  chunk_reads (`DEBUG: dtfs_manager::metadata: tiering: ingested 1
+- **AV-4-8 — live S1 promote pipeline silent (resolved
+  2026-05-22).** Root cause turned out to be two chained bugs
+  found via diagnostic-logged tick walk-through:
+  1. **Bug Z bootstrap UpsertVolume runs on every manager boot.**
+     The state-machine `UpsertVolume` apply path is a blind
+     `volumes.insert(id, config)`, so any operator's
+     `set-cache` / `set-mandatory` on the bootstrap-default
+     volume was silently destroyed on the next manager restart.
+     Fix: `main.rs` now reads
+     `sm_data.volumes.contains_key("default")` before the
+     bootstrap upsert and skips when the volume is already
+     configured. Fresh clusters still get the initial volume on
+     the first boot.
+  2. **FUSE `ChunkLocationCommit.disk_id` hardcoded to `0`.**
+     The data-node's `select_disk_for_tier(Cold)` correctly
+     wrote to the cold-tier disk (disk_id=1 on the minicluster),
+     but FUSE committed every placement with `disk_id: 0`. The
+     manager's tiering planner then looked up
+     `id_to_tiers[node_id][disk_id=0]` and got Warm for every
+     chunk, so the cache planner saw cold placements as warm and
+     decided the warm cap was already met → no promotion. Fix:
+     `proto/data.proto` adds `uint32 disk_id = 5` to
+     `PutChunkResponse`; `store::commit_chunk_from_tmp` now
+     returns `(ChunkMeta, u32)`; `dtfs-data` server populates;
+     `dtfs-fuse` propagates into `ChunkLocationCommit.disk_id`.
+  Live-verified on the minicluster: fresh write to
+  `/av-demo/s1-promote.bin` lands on `data01-cold` (mandatory
+  copy, AV-4-1d), the tiering planner observes the cold-tier
+  placement correctly, and the next tick fires a
+  `cache.promote` audit row + creates the warm cache replica
+  at `data02-warm`. S1 end-to-end green.
+
+_(unused historical follow-up notes below kept for context)_
+
+- After the AV-4-1d deploy + the necessary Raft state wipe (the
+  existing log on all three managers failed `Read Logs: unexpected
+  end of file` against the freshly-built binary; root cause
+  undetermined, masked by the full-cluster wipe), the cluster came
+  up healthy and writes landed on the correct cold tier (verified
+  on-disk at `/mnt/data01-cold/chunks/.../e6fb…b2de.dat`).
+  Heartbeat ingests chunk_reads (`DEBUG: dtfs_manager::metadata:
+  tiering: ingested 1
   chunk-read entries from heartbeat`) but no `cache.promote` audit
   entry fires for the chunk under read. Likely in the AV-4-1c
   read-window → `plan_chunk_promotions` path; needs diagnostic

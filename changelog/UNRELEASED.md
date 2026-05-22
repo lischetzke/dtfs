@@ -33,4 +33,22 @@
   "any-healthy-disk" path.
 
 ## Bug Fixes
+- **AV-4-8 (1) — Bug Z bootstrap stops overwriting operator config.**
+  Every manager start used to re-`UpsertVolume` the default volume,
+  destroying any subsequent `set-cache` / `set-mandatory` the
+  operator had applied. The bootstrap upsert now checks the state
+  machine for the `default` volume and skips when present; fresh
+  clusters still get the initial volume on the first boot.
+- **AV-4-8 (2) — FUSE `ChunkLocationCommit.disk_id` propagation.**
+  The FUSE writer hardcoded `disk_id: 0` regardless of which disk
+  the data-node actually chose. The manager's tiering engine then
+  resolved every placement against `disks[0]` and silently
+  misclassified cold-tier chunks as warm-tier, killing the cache
+  promotion lifecycle (no `cache.promote` audit, no warm replica
+  even with 100+ reads in window). `PutChunkResponse` now carries
+  `disk_id`; the data-node populates from `commit_chunk_from_tmp`
+  (which now returns `(ChunkMeta, u32)`); FUSE propagates into
+  `ChunkLocationCommit`.
+
+## Bug Fixes
 - _(none yet)_

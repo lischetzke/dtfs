@@ -583,6 +583,7 @@ impl TieringEngine {
             let Some(policy) = volumes.get(&fm.volume_id) else {
                 continue;
             };
+            let _ = path;
             // Group ChunkLocationEntry rows by chunk_index so we
             // build one TickChunk per (file, chunk_index).
             let mut by_idx: std::collections::BTreeMap<u64, Vec<&dtfs_raft::ChunkLocationEntry>> =

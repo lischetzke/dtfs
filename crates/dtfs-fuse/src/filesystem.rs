@@ -1592,7 +1592,13 @@ impl DtfsFilesystem {
                     chunk_id: put_resp.chunk_id.clone(),
                     primary_address: addr,
                     size_bytes: put_resp.size,
-                    disk_id: 0,
+                    // AV-4-8 — propagate the data-node's actual
+                    // chosen disk_id so the manager's tiering
+                    // engine resolves tier correctly. Pre-fix
+                    // hardcoded 0 caused cold writes to be
+                    // counted as warm and the cache planner
+                    // wrongly thought warm cap was already met.
+                    disk_id: put_resp.disk_id,
                 });
             }
 
