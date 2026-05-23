@@ -34,6 +34,24 @@ step()  { echo -e "\n${BOLD}>>> $*${OFF}"; }
 for a in "$@"; do
     if [ "$a" = "--help" ] || [ "$a" = "-h" ]; then
         sed -n '2,21p' "$0"
+        cat <<'AZ2HELP'
+
+AZ-2 source selection flags (in addition to the legacy positional arg):
+  --source local|github|auto   default `auto`. `local` searches
+                               $DTFS_LOCAL_BIN_DIR, ./target/release,
+                               /opt/dtfs/staging/*/release, ~/.cache/dtfs;
+                               `github` downloads from $DTFS_REPO_URL
+                               releases; `auto` tries local first, then
+                               github.
+  --version <tag>              GitHub release tag (default `latest`).
+                               Honoured for source=github and the auto
+                               fallback. Ignored for source=local.
+
+Env vars:
+  DTFS_LOCAL_BIN_DIR  highest-priority local search dir (optional).
+  DTFS_REPO_URL       override the GitHub repo. Default:
+                      https://github.com/lischetzke/dtfs
+AZ2HELP
         exit 0
     fi
 done
@@ -54,6 +72,16 @@ PURGE=0
 NONINT=0
 TARBALL=""
 ROLE_ARG=""
+# AZ-2 — source selection.
+#   auto   : check local search paths first, fall back to github (default)
+#   local  : only local search paths; fail if none found
+#   github : skip local, fetch from GitHub release
+SOURCE="auto"
+VERSION=""        # tag / "latest". empty = "latest" when SOURCE != local
+REPO="${DTFS_REPO_URL:-https://github.com/lischetzke/dtfs}"
+STAGING_ROOT="/opt/dtfs/staging"
+DOWNLOAD_CACHE="${HOME}/.cache/dtfs"
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --uninstall)
@@ -78,8 +106,39 @@ while [ $# -gt 0 ]; do
         --role)
             shift; ROLE_ARG="${1:-}"
             ;;
+        --source)
+            shift
+            case "${1:-}" in
+                local|github|auto) SOURCE="$1" ;;
+                *) error "--source must be local|github|auto"; exit 1 ;;
+            esac
+            ;;
+        --version)
+            shift; VERSION="${1:-}"
+            ;;
         --help|-h)
             sed -n '2,18p' "$0"
+            cat <<'AZ2HELP'
+
+AZ-2 source selection flags (in addition to the legacy positional arg):
+  --source local|github|auto   default `auto`. `local` searches
+                               $DTFS_LOCAL_BIN_DIR, ./target/release,
+                               /opt/dtfs/staging/*/release, ~/.cache/dtfs;
+                               `github` downloads from $DTFS_REPO_URL
+                               releases; `auto` tries local first, then
+                               github.
+  --version <tag>              GitHub release tag (default `latest`).
+                               Honoured for source=github and the auto
+                               fallback. Ignored for source=local.
+
+The legacy positional tarball arg still wins when supplied — the install
+script unpacks it directly, no source-selection logic runs.
+
+Env vars:
+  DTFS_LOCAL_BIN_DIR  highest-priority local search dir (optional).
+  DTFS_REPO_URL       override the GitHub repo. Default:
+                      https://github.com/lischetzke/dtfs
+AZ2HELP
             exit 0
             ;;
         *)
@@ -91,9 +150,90 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-if [ -z "$TARBALL" ] || [ ! -f "$TARBALL" ]; then
-    error "missing tarball; usage: $0 <tarball>"; exit 1
+# AZ-2 — when no positional tarball was supplied, run the source-selection
+# pipeline (local-first / github fallback per --source). Sets TARBALL to a
+# concrete path on disk. Skipped entirely when the operator passed an
+# explicit tarball (legacy workflow stays unchanged).
+if [ -z "$TARBALL" ]; then
+    select_tarball_local() {
+        local candidates=(
+            "${DTFS_LOCAL_BIN_DIR:-}/dtfs-*-linux-amd64.tar.gz"
+            "./target/release/dtfs-*-linux-amd64.tar.gz"
+            "/opt/dtfs/staging/"*"/dtfs-*-linux-amd64.tar.gz"
+            "${DOWNLOAD_CACHE}/dtfs-*-linux-amd64.tar.gz"
+        )
+        for pattern in "${candidates[@]}"; do
+            [ -z "$pattern" ] && continue
+            for f in $pattern; do
+                if [ -f "$f" ]; then
+                    info "AZ-2: local source matched $f"
+                    TARBALL="$f"
+                    return 0
+                fi
+            done
+        done
+        return 1
+    }
+    download_tarball_github() {
+        local tag="${VERSION:-latest}"
+        local url
+        if [ "$tag" = "latest" ]; then
+            url="${REPO}/releases/latest/download/dtfs-linux-amd64.tar.gz"
+        else
+            url="${REPO}/releases/download/${tag}/dtfs-linux-amd64.tar.gz"
+        fi
+        mkdir -p "$DOWNLOAD_CACHE"
+        local out="${DOWNLOAD_CACHE}/dtfs-${tag}-linux-amd64.tar.gz"
+        info "AZ-2: downloading $url -> $out"
+        if curl -fL --output "$out.partial" "$url"; then
+            mv "$out.partial" "$out"
+            TARBALL="$out"
+            return 0
+        else
+            rm -f "$out.partial"
+            return 1
+        fi
+    }
+    case "$SOURCE" in
+        local)
+            select_tarball_local || {
+                error "AZ-2: --source=local but no tarball found in local search paths"
+                exit 1
+            }
+            ;;
+        github)
+            download_tarball_github || {
+                error "AZ-2: GitHub download failed for tag '${VERSION:-latest}'"
+                exit 1
+            }
+            ;;
+        auto)
+            if select_tarball_local; then
+                :
+            elif download_tarball_github; then
+                :
+            else
+                error "AZ-2: no local source found and GitHub fallback failed"
+                exit 1
+            fi
+            ;;
+    esac
 fi
+
+if [ -z "$TARBALL" ] || [ ! -f "$TARBALL" ]; then
+    error "missing tarball; usage: $0 [<tarball> | --source local|github|auto]"; exit 1
+fi
+
+# AZ-2 — stage the tarball into /opt/dtfs/staging/<version>/ before
+# unpacking. Atomic install via `install -m 755` (done by individual
+# binary copies below); the staging dir survives for forensics if
+# the install fails partway through.
+TARBALL_BASENAME="$(basename "$TARBALL")"
+VERSION_TAG="$(echo "$TARBALL_BASENAME" | sed -E 's/^dtfs-([^-]+).*/\1/' || echo unknown)"
+STAGING_DIR="${STAGING_ROOT}/${VERSION_TAG}"
+mkdir -p "$STAGING_DIR"
+cp -f "$TARBALL" "${STAGING_DIR}/${TARBALL_BASENAME}"
+info "AZ-2: staged at ${STAGING_DIR}/${TARBALL_BASENAME}"
 
 # ─── TUI: gather role + cluster info ────────────────────────────────────────
 if [ -n "$ROLE_ARG" ]; then

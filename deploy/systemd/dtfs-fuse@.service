@@ -1,6 +1,6 @@
 [Unit]
 Description=DTFS FUSE Mount (/%I)
-Documentation=https://github.com/leduc/dtfs2
+Documentation=https://github.com/lischetzke/dtfs
 After=network-online.target
 Wants=network-online.target
 

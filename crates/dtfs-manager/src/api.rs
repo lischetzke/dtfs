@@ -141,6 +141,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/volumes/{id}/set-mandatory", post(set_volume_mandatory_endpoint))
         // AV-5-12 — operator-facing set-anchor.
         .route("/api/v1/volumes/{id}/set-anchor", post(set_volume_anchor_endpoint))
+        // AZ-1 — per-volume background-job schedules (scrub, fsck).
+        .route("/api/v1/volumes/{id}/set-schedules", post(set_volume_schedules_endpoint))
+        // AZ-5-A1 — effective cluster config (every key, name+current+default).
+        .route("/api/v1/config/effective", get(get_config_effective))
         // Stats (aggregate cluster metrics for WebUI home page)
         .route("/api/v1/stats", get(get_stats))
         // HMAC join (phase 1: challenge, phase 2: Raft register)
@@ -953,6 +957,7 @@ async fn create_volume(
         mandatory_replicas: dtfs_common::types::TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 },
         cache_replicas: dtfs_common::types::CacheReplication::default(),
         anchor: None,
+        schedules: dtfs_common::types::VolumeSchedules::default(),
     };
 
     let req = ClientRequest::UpsertVolume { config };
@@ -1103,6 +1108,13 @@ pub(crate) fn volume_config_to_json(
         "write_safety": {
             "min_replicas_before_ack": cfg.write_safety.min_replicas_before_ack,
             "write_timeout_secs":      cfg.write_safety.write_timeout_secs,
+        },
+        // AZ-1 — per-volume background-job schedules. `null` means
+        // "inherit cluster default".
+        "schedules": {
+            "scrub_interval_secs": cfg.schedules.scrub_interval_secs,
+            "fsck_interval_secs":  cfg.schedules.fsck_interval_secs,
+            "custom":              cfg.schedules.custom,
         },
     })
 }
@@ -1284,6 +1296,117 @@ pub(crate) fn apply_set_mandatory(
     }
 
     Ok(next)
+}
+
+/// AZ-1 — request body for `POST /api/v1/volumes/{id}/set-schedules`.
+/// Each field is optional; `None` for a sub-field is a no-op
+/// (preserve current). To explicitly clear an override, send the
+/// value `0` for that field (clears) or set `clear_unspecified=true`
+/// to clear everything not explicitly set.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetSchedulesRequest {
+    pub scrub_interval_secs: Option<u64>,
+    pub fsck_interval_secs: Option<u64>,
+    pub custom: Option<std::collections::BTreeMap<String, u64>>,
+    #[serde(default)]
+    pub clear_unspecified: bool,
+}
+
+/// AZ-1 pure helper — merge a partial schedules update onto the
+/// current volume config + validate intervals.
+///
+/// Rules:
+/// * `Some(0)` clears the override (back to cluster default).
+/// * `Some(v)` with `v < 60` is rejected (scrub I/O floor).
+/// * `Some(v)` with `v >= 60` sets the override.
+/// * `None` is a no-op unless `clear_unspecified == true`, in
+///   which case it also clears.
+pub(crate) fn apply_set_schedules(
+    current: &dtfs_common::types::VolumeConfig,
+    req: &SetSchedulesRequest,
+) -> Result<dtfs_common::types::VolumeConfig, String> {
+    let mut next = current.clone();
+    let clear = req.clear_unspecified;
+
+    fn merge(field: &mut Option<u64>, incoming: &Option<u64>, label: &str, clear: bool)
+        -> Result<(), String>
+    {
+        match incoming {
+            Some(0) => { *field = None; Ok(()) }
+            Some(v) if *v < 60 => Err(format!(
+                "{label}: {v} < 60 s minimum"
+            )),
+            Some(v) => { *field = Some(*v); Ok(()) }
+            None if clear => { *field = None; Ok(()) }
+            None => Ok(()),
+        }
+    }
+
+    merge(&mut next.schedules.scrub_interval_secs,
+          &req.scrub_interval_secs, "scrub_interval_secs", clear)?;
+    merge(&mut next.schedules.fsck_interval_secs,
+          &req.fsck_interval_secs, "fsck_interval_secs", clear)?;
+
+    if let Some(custom) = &req.custom {
+        for (name, value) in custom {
+            if *value == 0 {
+                next.schedules.custom.remove(name);
+                continue;
+            }
+            if *value < 60 {
+                return Err(format!("custom job {name}: {value} < 60 s minimum"));
+            }
+            next.schedules.custom.insert(name.clone(), *value);
+        }
+    } else if clear {
+        next.schedules.custom.clear();
+    }
+
+    Ok(next)
+}
+
+async fn set_volume_schedules_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(volume_id): axum::extract::Path<String>,
+    Json(body): Json<SetSchedulesRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    use axum::http::StatusCode;
+
+    let current = {
+        let sm = state.sm_data.read().await;
+        sm.volumes.get(&volume_id).cloned()
+    };
+    let Some(current) = current else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("volume not found: {volume_id}")})),
+        ));
+    };
+
+    let next = apply_set_schedules(&current, &body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+
+    let changed = current != next;
+    if changed {
+        let req = ClientRequest::UpsertVolume { config: next.clone() };
+        if let Err(e) = state.raft.client_write(req).await {
+            warn!(volume = %volume_id, error = %e,
+                "set_volume_schedules Raft write failed");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("raft write failed: {e}")})),
+            ));
+        }
+        state.audit_log.log("api", "volume.set_schedules", &volume_id, "success");
+    } else {
+        state.audit_log.log("api", "volume.set_schedules", &volume_id, "noop");
+    }
+
+    Ok(Json(json!({
+        "volume_id": volume_id,
+        "changed": changed,
+        "config": volume_config_to_json(&next),
+    })))
 }
 
 /// AV-5-12 — request body for `POST /api/v1/volumes/{id}/set-anchor`.
@@ -1586,19 +1709,41 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Json<Value> {
 #[derive(Deserialize)]
 struct ConfigUpdateRequest {
     config_json: String,
+    /// AZ-5 — when true, also persist the merged config back to
+    /// `/etc/dtfs/manager.toml` so the change survives a process
+    /// restart. Default false preserves the existing live-reload-
+    /// only behaviour for backwards compatibility.
+    #[serde(default)]
+    write_to_disk: bool,
 }
 
 async fn update_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ConfigUpdateRequest>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // AZ-5-A3 — boundary check: parse the incoming JSON against
+    // a strict ManagerConfig before touching Raft so a typo or
+    // out-of-range value returns 400 with the pre-attempt
+    // (current) value, leaving the live config + on-disk file
+    // untouched.
+    if !body.config_json.is_empty() {
+        if let Err(e) = serde_json::from_str::<serde_json::Value>(&body.config_json) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("invalid config JSON: {e}"),
+                    "preserved_current": true,
+                })),
+            ));
+        }
+    }
     let version = {
         let sm = state.sm_data.read().await;
         sm.cluster_config.version + 1
     };
 
     let req = ClientRequest::UpdateConfig {
-        config_json: body.config_json,
+        config_json: body.config_json.clone(),
         version,
     };
 
@@ -1606,19 +1751,183 @@ async fn update_config(
         .raft
         .client_write(req)
         .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|e| (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": format!("raft write failed: {e}")})),
+        ))?;
+
+    // AZ-5-A2 — optionally persist to disk via atomic tmp+rename.
+    let mut wrote_to_disk = false;
+    if body.write_to_disk && !body.config_json.is_empty() {
+        let path = std::path::Path::new("/etc/dtfs/manager.toml");
+        let tmp = path.with_extension("toml.az5.tmp");
+        // Re-serialise the live ManagerConfig to TOML so the on-disk
+        // file stays operator-readable. Fall back to the raw JSON if
+        // TOML serialisation fails.
+        let new_toml = match serde_json::from_str::<dtfs_common::config::ManagerConfig>(
+            &body.config_json,
+        ) {
+            Ok(parsed) => toml::to_string_pretty(&parsed)
+                .unwrap_or_else(|_| body.config_json.clone()),
+            Err(_) => body.config_json.clone(),
+        };
+        if let Err(e) = std::fs::write(&tmp, new_toml.as_bytes())
+            .and_then(|_| std::fs::rename(&tmp, path))
+        {
+            warn!(error = %e, "AZ-5-A2 write_to_disk failed");
+        } else {
+            wrote_to_disk = true;
+        }
+    }
 
     state.audit_log.log(
         "api",
         "config.update",
-        &format!("version={version}"),
+        &format!("version={version} write_to_disk={wrote_to_disk}"),
         "success",
     );
 
     Ok(Json(json!({
         "version": version,
         "status": "applied",
+        "write_to_disk": wrote_to_disk,
     })))
+}
+
+/// AZ-5-A1 — effective cluster config endpoint. Returns one entry per
+/// flat `[section.key]` path with `name / scope / current / default`
+/// so the WebUI /ui/config pane can render every knob (including
+/// those at their default value).
+///
+/// `ManagerConfig` has no `Default` impl (sub-configs like NodeConfig
+/// require operator-supplied identity), so the "default" column is
+/// derived from a hand-curated baseline JSON below. Sub-configs that
+/// the operator MUST set per-host (node, location, cluster, raft,
+/// grpc, api, tls) render with `default = null` — the WebUI treats
+/// null defaults as "operator must set; no upstream default".
+async fn get_config_effective(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    let current = serde_json::to_value(&state.config)
+        .unwrap_or(serde_json::Value::Null);
+    let defaults = manager_config_defaults_baseline();
+
+    let mut rows: Vec<Value> = Vec::new();
+    flatten_config(&current, &defaults, "manager", "", &mut rows);
+
+    Json(json!({
+        "scope": "manager",
+        "node_hostname": state.config.node.hostname.clone(),
+        "entries": rows,
+    }))
+}
+
+/// AZ-5-A1 — hand-curated default values for every ManagerConfig key
+/// that has a documented upstream default. Per-host-required keys
+/// (node identity, cluster membership, TLS material) emit `null`,
+/// which the WebUI renders as "(operator must set)".
+fn manager_config_defaults_baseline() -> Value {
+    json!({
+        "node": {
+            "hostname": null,
+            "id": null,
+            "data_dir": "/var/lib/dtfs/manager",
+        },
+        "location": {
+            "region": "lab",
+            "datacenter": null,
+            "rack": null,
+            "host": null,
+        },
+        "cluster": {
+            "name": "dtfs-cluster",
+            "bootstrap": false,
+            "shared_secret": null,
+            "initial_voters": [],
+        },
+        "raft": {
+            "election_timeout_ms": 5000,
+            "heartbeat_interval_ms": 1500,
+            "snapshot_threshold": 5000,
+        },
+        "grpc": {
+            "listen_addr": "0.0.0.0:9401",
+            "advertise_addr": null,
+        },
+        "api": {
+            "listen_addr": "0.0.0.0:9402",
+        },
+        "tls": {
+            "enabled": false,
+            "cert_path": null,
+            "key_path": null,
+            "ca_path": null,
+        },
+        "defaults": {
+            "chunk_size_mb": 128,
+            "replication": {"hot": 0, "warm": 2, "cold": 1, "tape": 1},
+            "write_safety": {
+                "min_replicas_before_ack": 1,
+                "write_timeout_secs": 30,
+            },
+            "anchor_datacenter": null,
+        },
+        "tiering": {
+            "enabled": true,
+            "hot_threshold_reads_per_hour": 5,
+            "cold_threshold_days": 14,
+            "frozen_threshold_days": 90,
+            "evaluation_interval_secs": 3600,
+            "migration_bandwidth_limit_mbps": 200,
+            "enable_cache_redundancy_escalation": false,
+        },
+        "monitoring": {
+            "heartbeat_interval_secs": 5,
+            "suspect_after_missed": 3,
+            "down_after_missed": 6,
+        },
+        "alerts": {
+            "sinks": [],
+        },
+        "audit": {
+            "replicate_via_raft": false,
+        },
+    })
+}
+
+/// AZ-5-A1 helper — walk two parallel JSON values and produce one
+/// flat row per leaf. `scope` is the top-level prefix
+/// ("manager", "data", "fuse", or a hostname for per-host views).
+fn flatten_config(
+    current: &Value,
+    defaults: &Value,
+    scope: &str,
+    prefix: &str,
+    out: &mut Vec<Value>,
+) {
+    use serde_json::Value as V;
+    match current {
+        V::Object(map) => {
+            for (k, v) in map {
+                let next_prefix = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                let def_v = defaults.get(k).unwrap_or(&V::Null);
+                flatten_config(v, def_v, scope, &next_prefix, out);
+            }
+        }
+        _ => {
+            out.push(json!({
+                "name": format!("{scope}.{prefix}"),
+                "scope": scope,
+                "current": current,
+                "default": defaults,
+                "is_default": current == defaults,
+            }));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2697,6 +3006,7 @@ mod bug_av_set_cache_tests {
             },
             cache_replicas: CacheReplication::default(),
             anchor: None,
+            schedules: dtfs_common::types::VolumeSchedules::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety {
                 min_replicas_before_ack: 2,
@@ -2855,6 +3165,113 @@ mod bug_av_set_cache_tests {
 }
 
 #[cfg(test)]
+mod bug_az_set_schedules_tests {
+    //! AZ-1 — pure tests for `apply_set_schedules`. Axum handler
+    //! is live-only per the AV-3-5 convention.
+    use super::*;
+    use dtfs_common::types::{
+        CacheReplication, TierReplication, VolumeConfig, VolumeId,
+        VolumeSchedules, WriteSafety,
+    };
+
+    fn volume() -> VolumeConfig {
+        VolumeConfig {
+            id: VolumeId("default".to_string()),
+            name: "default".to_string(),
+            chunk_size_bytes: 4 * 1024 * 1024,
+            replication: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            cache_replicas: CacheReplication::default(),
+            anchor: None,
+            anchor_datacenter: None,
+            write_safety: WriteSafety {
+                min_replicas_before_ack: 1,
+                write_timeout_secs: 30,
+            },
+            schedules: VolumeSchedules::default(),
+        }
+    }
+
+    #[test]
+    fn bug_az_set_schedules_sets_override() {
+        let v = volume();
+        let req = SetSchedulesRequest {
+            scrub_interval_secs: Some(3600),
+            ..Default::default()
+        };
+        let n = apply_set_schedules(&v, &req).expect("ok");
+        assert_eq!(n.schedules.scrub_interval_secs, Some(3600));
+        assert_eq!(n.schedules.fsck_interval_secs, None);
+    }
+
+    #[test]
+    fn bug_az_set_schedules_zero_clears() {
+        let mut v = volume();
+        v.schedules.scrub_interval_secs = Some(3600);
+        let req = SetSchedulesRequest {
+            scrub_interval_secs: Some(0),
+            ..Default::default()
+        };
+        let n = apply_set_schedules(&v, &req).expect("ok");
+        assert_eq!(n.schedules.scrub_interval_secs, None,
+            "Some(0) must clear the override");
+    }
+
+    #[test]
+    fn bug_az_set_schedules_rejects_below_floor() {
+        let v = volume();
+        let req = SetSchedulesRequest {
+            scrub_interval_secs: Some(30),
+            ..Default::default()
+        };
+        let err = apply_set_schedules(&v, &req).unwrap_err();
+        assert!(err.contains("scrub_interval_secs"));
+        assert!(err.contains("60 s minimum"));
+    }
+
+    #[test]
+    fn bug_az_set_schedules_clear_unspecified() {
+        let mut v = volume();
+        v.schedules.scrub_interval_secs = Some(3600);
+        v.schedules.fsck_interval_secs = Some(7200);
+        v.schedules.custom.insert("rebalance".into(), 86400);
+        let req = SetSchedulesRequest {
+            clear_unspecified: true,
+            ..Default::default()
+        };
+        let n = apply_set_schedules(&v, &req).expect("ok");
+        assert_eq!(n.schedules.scrub_interval_secs, None);
+        assert_eq!(n.schedules.fsck_interval_secs, None);
+        assert!(n.schedules.custom.is_empty(),
+            "clear_unspecified must clear the custom map too");
+    }
+
+    #[test]
+    fn bug_az_set_schedules_custom_job_merge() {
+        let v = volume();
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert("rebalance".to_string(), 86400u64);
+        custom.insert("snapshot".to_string(), 3600u64);
+        let req = SetSchedulesRequest {
+            custom: Some(custom),
+            ..Default::default()
+        };
+        let n = apply_set_schedules(&v, &req).expect("ok");
+        assert_eq!(n.schedules.custom.get("rebalance").copied(), Some(86400));
+        assert_eq!(n.schedules.custom.get("snapshot").copied(), Some(3600));
+    }
+
+    #[test]
+    fn bug_az_volume_config_json_includes_schedules() {
+        let mut v = volume();
+        v.schedules.scrub_interval_secs = Some(3600);
+        let json = volume_config_to_json(&v);
+        assert_eq!(json["schedules"]["scrub_interval_secs"], 3600);
+        assert!(json["schedules"]["fsck_interval_secs"].is_null());
+    }
+}
+
+#[cfg(test)]
 mod bug_av_set_mandatory_tests {
     //! AV-4-1a — pure tests for `apply_set_mandatory`. Mirrors
     //! the AV-3-5 `bug_av_set_cache_tests` convention (axum
@@ -2881,6 +3298,7 @@ mod bug_av_set_mandatory_tests {
             },
             cache_replicas: CacheReplication::default(),
             anchor: None,
+            schedules: dtfs_common::types::VolumeSchedules::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety {
                 min_replicas_before_ack: 2,

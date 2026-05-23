@@ -13,6 +13,6 @@ create-missing = true
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/leduc/dtfs2"
-edit-url-template = "https://github.com/leduc/dtfs2/edit/main/docs/{path}"
+git-repository-url = "https://github.com/lischetzke/dtfs"
+edit-url-template = "https://github.com/lischetzke/dtfs/edit/main/docs/{path}"
 site-url = "/docs/"

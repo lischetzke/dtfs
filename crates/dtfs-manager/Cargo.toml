@@ -40,6 +40,9 @@ xxhash-rust = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 hex = { workspace = true }
+# AZ-5 — write-to-disk on POST /config persists merged config back
+# to /etc/dtfs/manager.toml so the change survives a process restart.
+toml = { workspace = true }
 # P1-8 alert webhooks: HMAC-signed POST to operator-configured sinks.
 reqwest = { workspace = true }
 hmac = { workspace = true }

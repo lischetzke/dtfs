@@ -5,57 +5,91 @@ use std::sync::Arc;
 
 use dtfs_common::config::ScrubConfig;
 use dtfs_common::types::ScrubLevel;
+use tokio::sync::RwLock;
 
 use crate::store::ChunkStore;
 
+/// AZ-1 — decision-tick cadence for the scrub loop. The loop wakes
+/// every `DECISION_TICK_SECS` and consults the live `ScrubConfig` to
+/// decide whether the (now - last_run) gap has reached the configured
+/// interval. Replaces the legacy fixed-interval ticker so a config
+/// hot-reload (e.g. operator drops a volume's scrub_interval_secs)
+/// takes effect within `DECISION_TICK_SECS`, not at next restart.
+const DECISION_TICK_SECS: u64 = 60;
+
 /// Background scrub scheduler that runs quick and deep scrubs on configured
-/// intervals against all disks managed by the chunk store.
+/// intervals against all disks managed by the chunk store. AZ-1: the
+/// `config` field is an `Arc<RwLock<ScrubConfig>>` so the manager's
+/// heartbeat-driven config-update path can lower the effective interval
+/// at runtime (e.g. when an operator raises a per-volume scrub cadence).
 pub struct ScrubScheduler {
     store: Arc<ChunkStore>,
-    config: ScrubConfig,
+    config: Arc<RwLock<ScrubConfig>>,
 }
 
 impl ScrubScheduler {
-    /// Create a new scrub scheduler.
-    pub fn new(store: Arc<ChunkStore>, config: ScrubConfig) -> Self {
+    /// Create a new scrub scheduler with a hot-reloadable config handle.
+    pub fn new(store: Arc<ChunkStore>, config: Arc<RwLock<ScrubConfig>>) -> Self {
         Self { store, config }
     }
 
-    /// Run the background scrub loop.
-    ///
-    /// This runs indefinitely, executing quick scrubs every
-    /// `quick_interval_hours` and deep scrubs every `deep_interval_hours`.
-    /// Between chunk checks it sleeps to respect `max_io_percent`.
+    /// Construct a scheduler from an owned config (test / legacy callers).
+    /// Wraps the value in `Arc<RwLock<...>>` so the loop's hot-reload
+    /// semantics still hold.
+    pub fn new_owned(store: Arc<ChunkStore>, config: ScrubConfig) -> Self {
+        Self { store, config: Arc::new(RwLock::new(config)) }
+    }
+
+    /// Run the background scrub loop. Wakes every `DECISION_TICK_SECS`,
+    /// reads the live `ScrubConfig`, and runs a quick / deep scrub
+    /// when the configured interval has elapsed since the last run.
     pub async fn run(&self) {
-        let quick_interval = tokio::time::Duration::from_secs(
-            self.config.quick_interval_hours * 3600,
-        );
-        let deep_interval = tokio::time::Duration::from_secs(
-            self.config.deep_interval_hours * 3600,
-        );
-
-        let mut quick_ticker = tokio::time::interval(quick_interval);
-        let mut deep_ticker = tokio::time::interval(deep_interval);
-
-        // Skip the first immediate tick for both so we don't scrub on startup.
-        quick_ticker.tick().await;
-        deep_ticker.tick().await;
-
+        let (q_h, d_h, io_pct) = {
+            let c = self.config.read().await;
+            (c.quick_interval_hours, c.deep_interval_hours, c.max_io_percent)
+        };
         tracing::info!(
-            "Scrub scheduler started: quick every {}h, deep every {}h, max I/O {}%",
-            self.config.quick_interval_hours,
-            self.config.deep_interval_hours,
-            self.config.max_io_percent,
+            "Scrub scheduler started: quick every {}h, deep every {}h, max I/O {}% (live-reloadable)",
+            q_h,
+            d_h,
+            io_pct,
         );
+
+        let mut ticker = tokio::time::interval(
+            tokio::time::Duration::from_secs(DECISION_TICK_SECS),
+        );
+        // Skip the first immediate tick so a fresh process doesn't
+        // scrub on startup.
+        ticker.tick().await;
+        let start = std::time::Instant::now();
+        let mut last_quick: Option<std::time::Instant> = None;
+        let mut last_deep: Option<std::time::Instant> = None;
 
         loop {
-            tokio::select! {
-                _ = quick_ticker.tick() => {
-                    self.run_scrub(ScrubLevel::Quick).await;
-                }
-                _ = deep_ticker.tick() => {
-                    self.run_scrub(ScrubLevel::Deep).await;
-                }
+            ticker.tick().await;
+            let (quick_secs, deep_secs) = {
+                let c = self.config.read().await;
+                (
+                    c.quick_interval_hours.saturating_mul(3600),
+                    c.deep_interval_hours.saturating_mul(3600),
+                )
+            };
+            let now = std::time::Instant::now();
+            let quick_due = match last_quick {
+                Some(t) => now.duration_since(t).as_secs() >= quick_secs,
+                None => now.duration_since(start).as_secs() >= quick_secs,
+            };
+            let deep_due = match last_deep {
+                Some(t) => now.duration_since(t).as_secs() >= deep_secs,
+                None => now.duration_since(start).as_secs() >= deep_secs,
+            };
+            if quick_due {
+                self.run_scrub(ScrubLevel::Quick).await;
+                last_quick = Some(std::time::Instant::now());
+            }
+            if deep_due {
+                self.run_scrub(ScrubLevel::Deep).await;
+                last_deep = Some(std::time::Instant::now());
             }
         }
     }
@@ -75,7 +109,7 @@ impl ScrubScheduler {
             // Throttle I/O between disks based on max_io_percent.
             // A simple approach: if max_io_percent is 10%, sleep 90% of a
             // small time slice between disk scrubs.
-            let io_percent = self.config.max_io_percent.max(1).min(100) as f64;
+            let io_percent = self.config.read().await.max_io_percent.max(1).min(100) as f64;
             let sleep_fraction = (100.0 - io_percent) / io_percent;
             let throttle_delay = tokio::time::Duration::from_millis(
                 (100.0 * sleep_fraction) as u64,

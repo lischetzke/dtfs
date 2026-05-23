@@ -422,7 +422,7 @@ pub struct CacheConfig {
     pub policy: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScrubConfig {
     #[serde(default = "default_quick_interval")]
     pub quick_interval_hours: u64,

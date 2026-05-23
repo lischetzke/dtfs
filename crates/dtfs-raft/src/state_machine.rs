@@ -1694,6 +1694,146 @@ mod snapshot_persistence_tests {
         assert_eq!(data.files.len(), 1);
         assert_eq!(data.cluster_config.version, 7);
     }
+
+    /// Bug AZ-3 — `FileMetadata.chunk_size` is per-file and snapshotted at
+    /// `CreateFile` time. An operator UpsertVolume call that changes
+    /// `VolumeConfig.chunk_size_bytes` MUST NOT retro-modify any existing
+    /// `FileMetadata.chunk_size`. The read path resolves chunk indices
+    /// against the per-file value
+    /// (`dtfs-fuse/src/filesystem.rs::resolve_chunk_size`), so leaving
+    /// FileMetadata alone is the load-bearing invariant — without it,
+    /// files written before the resize become unreadable because
+    /// `offset / chunk_size` produces an out-of-range chunk_index.
+    #[tokio::test]
+    async fn bug_az_3_volume_chunk_size_change_does_not_touch_existing_file() {
+        use dtfs_common::types::{
+            CacheReplication, TierReplication, VolumeConfig, VolumeId, WriteSafety,
+        };
+        use openraft::vote::RaftLeaderId;
+
+        fn mk_log_id(idx: u64) -> LogId {
+            let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+            openraft::LogId::new(leader, idx)
+        }
+
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let store = StateMachineStore::open_at(dir.path()).expect("open sm");
+        let mut sm = store.data.write().await;
+
+        let volume = VolumeConfig {
+            id: VolumeId::new("default".to_string()),
+            name: "default".to_string(),
+            chunk_size_bytes: 16 * 1024 * 1024,
+            replication: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            cache_replicas: CacheReplication::default(),
+            anchor: None,
+            schedules: dtfs_common::types::VolumeSchedules::default(),
+            anchor_datacenter: None,
+            write_safety: WriteSafety {
+                min_replicas_before_ack: 1,
+                write_timeout_secs: 30,
+            },
+        };
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::UpsertVolume { config: volume.clone() },
+        );
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::CreateFile {
+                path: "/foo.bin".to_string(),
+                volume_id: "default".to_string(),
+                chunk_size: 16 * 1024 * 1024,
+            },
+        );
+
+        let mut shrunk = volume.clone();
+        shrunk.chunk_size_bytes = 4 * 1024 * 1024;
+        apply_request(
+            &mut sm,
+            &mk_log_id(3),
+            &ClientRequest::UpsertVolume { config: shrunk },
+        );
+
+        let file = sm.files.get("/foo.bin").expect("file persisted");
+        assert_eq!(
+            file.chunk_size,
+            16 * 1024 * 1024,
+            "FileMetadata.chunk_size must NOT track volume.chunk_size_bytes; \
+             the read path uses the per-file value to compute chunk indices",
+        );
+        let vol = sm.volumes.get("default").expect("volume present");
+        assert_eq!(vol.chunk_size_bytes, 4 * 1024 * 1024);
+    }
+
+    /// Bug AZ-3 — the inverse: a NEW file created after the resize picks up
+    /// the NEW volume.chunk_size_bytes. Pins the contract that the
+    /// CreateFile caller (FUSE / dtfs-cli) reads volume.chunk_size_bytes
+    /// at write time and snapshots it onto the file.
+    #[tokio::test]
+    async fn bug_az_3_new_file_after_resize_uses_new_chunk_size() {
+        use dtfs_common::types::{
+            CacheReplication, TierReplication, VolumeConfig, VolumeId, WriteSafety,
+        };
+        use openraft::vote::RaftLeaderId;
+
+        fn mk_log_id(idx: u64) -> LogId {
+            let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+            openraft::LogId::new(leader, idx)
+        }
+
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let store = StateMachineStore::open_at(dir.path()).expect("open sm");
+        let mut sm = store.data.write().await;
+
+        let mut volume = VolumeConfig {
+            id: VolumeId::new("default".to_string()),
+            name: "default".to_string(),
+            chunk_size_bytes: 16 * 1024 * 1024,
+            replication: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            cache_replicas: CacheReplication::default(),
+            anchor: None,
+            schedules: dtfs_common::types::VolumeSchedules::default(),
+            anchor_datacenter: None,
+            write_safety: WriteSafety {
+                min_replicas_before_ack: 1,
+                write_timeout_secs: 30,
+            },
+        };
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::UpsertVolume { config: volume.clone() },
+        );
+
+        volume.chunk_size_bytes = 4 * 1024 * 1024;
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::UpsertVolume { config: volume.clone() },
+        );
+
+        apply_request(
+            &mut sm,
+            &mk_log_id(3),
+            &ClientRequest::CreateFile {
+                path: "/post-resize.bin".to_string(),
+                volume_id: "default".to_string(),
+                chunk_size: 4 * 1024 * 1024,
+            },
+        );
+
+        let file = sm.files.get("/post-resize.bin").expect("file persisted");
+        assert_eq!(
+            file.chunk_size,
+            4 * 1024 * 1024,
+            "post-resize file must use the NEW chunk_size_bytes"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
