@@ -432,6 +432,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     <a href="/ui/explorer">Data Explorer</a>
     <a href="/ui/migrations">Migrations</a>
     <a href="/ui/audit">Audit Log</a>
+    <a href="/ui/config">Config</a>
     <a href="/ui/settings">Settings</a>
     <a href="https://github.com/lischetzke/dtfs/tree/master/docs" target="_blank">Docs ↗</a>
 </nav>
@@ -582,6 +583,35 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <button class="btn-primary"  onclick="submitVolumeEdit()" id="ve-submit">Apply</button>
         </div>
         <div id="ve-result" class="modal-result" style="display:none"></div>
+    </div>
+</div>
+
+<!-- AZ-1 — Schedules edit dialog -->
+<div id="volume-schedules-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeVolumeSchedules()">
+    <div class="modal-card">
+        <h3>Edit volume schedules</h3>
+        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:1rem">
+            Per-volume background-job cadence overrides. Empty input
+            preserves the current value; <code>0</code> clears the
+            override (back to cluster default). Minimum: 60 s.
+        </div>
+        <div class="modal-row">
+            <label>Volume ID</label>
+            <input id="vs-volume-id" class="form-input" readonly>
+        </div>
+        <div class="modal-row">
+            <label>scrub_interval_secs</label>
+            <input id="vs-scrub-secs" class="form-input" type="number" min="0" step="60" placeholder="(inherit cluster default)">
+        </div>
+        <div class="modal-row">
+            <label>fsck_interval_secs</label>
+            <input id="vs-fsck-secs" class="form-input" type="number" min="0" step="60" placeholder="(inherit; reserved for future fsck)">
+        </div>
+        <div class="modal-actions">
+            <button class="btn-secondary" onclick="closeVolumeSchedules()">Cancel</button>
+            <button class="btn-primary"  onclick="submitVolumeSchedules()" id="vs-submit">Apply</button>
+        </div>
+        <div id="vs-result" class="modal-result" style="display:none"></div>
     </div>
 </div>
 
@@ -930,6 +960,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         '/ui/explorer':   renderExplorer,
         '/ui/migrations': renderMigrations,
         '/ui/audit':      renderAudit,
+        '/ui/config':     renderConfig,
         '/ui/settings':   renderSettings,
     }};
 
@@ -1355,6 +1386,16 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         const anchor = v.anchor
             ? `dc=${{v.anchor.datacenter||'—'}}, required_tier=${{v.anchor.required_tier||'(any)'}}`
             : '(none)';
+        // AZ-1 — per-volume background-job schedules.
+        const sch = v.schedules || {{}};
+        const scrubLine = (sch.scrub_interval_secs != null)
+            ? `${{sch.scrub_interval_secs}}s (override)`
+            : '(inherit cluster default)';
+        const fsckLine = (sch.fsck_interval_secs != null)
+            ? `${{sch.fsck_interval_secs}}s (override)`
+            : '(inherit cluster default)';
+        const customMap = sch.custom || {{}};
+        const customCount = Object.keys(customMap).length;
         return `<div class="placeholder" style="text-align:left;padding:1rem;background:rgba(0,0,0,.04);border-radius:.5rem">
             <div style="font-weight:bold;margin-bottom:.5rem">Policy for ${{v.volume_id}}</div>
             <div style="font-family:monospace;font-size:.78rem;line-height:1.6">
@@ -1366,6 +1407,10 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <div style="margin-left:1rem">${{tier('tape')}}</div>
                 <div>Anchor: ${{anchor}}</div>
                 <div>Chunk size: ${{fmtBytes(v.chunk_size_bytes||0)}}</div>
+                <div style="margin-top:.5rem;font-weight:bold">Schedules (AZ-1)</div>
+                <div style="margin-left:1rem">scrub_interval_secs: ${{scrubLine}}</div>
+                <div style="margin-left:1rem">fsck_interval_secs: ${{fsckLine}}</div>
+                <div style="margin-left:1rem">custom jobs: ${{customCount}}</div>
             </div>
         </div>`;
     }}
@@ -1409,6 +1454,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                             onclick="toggleVolumeRow('${{safeVid}}')">${{isOpen?'Hide':'Details'}}</button>
                         <button class="btn-secondary" style="padding:.25rem .5rem;font-size:.78rem"
                             onclick="openVolumeEdit('${{safeVid}}')">Edit policy…</button>
+                        <button class="btn-secondary" style="padding:.25rem .5rem;font-size:.78rem"
+                            onclick="openVolumeSchedules('${{safeVid}}')">Schedules…</button>
                         <button class="btn-secondary" style="padding:.25rem .5rem;font-size:.78rem"
                             onclick="openFlushCache('/')">Flush cache…</button>
                     </td>
@@ -1496,6 +1543,62 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             }} else {{
                 result.textContent = j.changed
                     ? 'Updated. New policy:\n' + JSON.stringify(j.config, null, 2)
+                    : 'No change (request was a no-op).';
+                await renderVolumes();
+            }}
+        }} catch (e) {{
+            result.textContent = 'Network error: ' + e;
+        }} finally {{
+            btn.disabled = false; btn.textContent = 'Apply';
+        }}
+    }}
+
+    // ── AZ-1 Schedules modal ──────────────────────────────────────
+    function openVolumeSchedules(volumeId) {{
+        const v = (window._volumesData||[]).find(x => x.volume_id === volumeId);
+        document.getElementById('vs-volume-id').value = volumeId;
+        const sch = (v && v.schedules) || {{}};
+        document.getElementById('vs-scrub-secs').value = sch.scrub_interval_secs || '';
+        document.getElementById('vs-fsck-secs').value = sch.fsck_interval_secs || '';
+        document.getElementById('vs-result').style.display = 'none';
+        document.getElementById('volume-schedules-modal').classList.remove('hidden');
+    }}
+
+    function closeVolumeSchedules() {{
+        document.getElementById('volume-schedules-modal').classList.add('hidden');
+    }}
+
+    async function submitVolumeSchedules() {{
+        const vid = document.getElementById('vs-volume-id').value.trim();
+        if (!vid) {{ alert('volume id is required'); return; }}
+
+        const intOrNull = (id) => {{
+            const raw = document.getElementById(id).value.trim();
+            return raw === '' ? null : parseInt(raw, 10);
+        }};
+        const body = {{
+            scrub_interval_secs: intOrNull('vs-scrub-secs'),
+            fsck_interval_secs:  intOrNull('vs-fsck-secs'),
+        }};
+
+        const btn = document.getElementById('vs-submit');
+        btn.disabled = true; btn.textContent = 'Applying…';
+        const result = document.getElementById('vs-result');
+        result.style.display = 'block';
+        result.textContent = 'Submitting…';
+
+        try {{
+            const r = await fetch(`/api/v1/volumes/${{encodeURIComponent(vid)}}/set-schedules`, {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify(body),
+            }});
+            const j = await r.json().catch(() => ({{error: 'invalid JSON response'}}));
+            if (!r.ok) {{
+                result.textContent = 'Error ' + r.status + ': ' + (j.error || JSON.stringify(j));
+            }} else {{
+                result.textContent = j.changed
+                    ? 'Updated. New schedules:\n' + JSON.stringify(j.config.schedules, null, 2)
                     : 'No change (request was a no-op).';
                 await renderVolumes();
             }}
@@ -1969,6 +2072,150 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 </tr>`;
             }}).join('') +
             '</tbody></table></div>';
+    }}
+
+    // ── Config page (AZ-5) ────────────────────────────────────────────────────
+    // Raw cluster-config viewer/editor. Every [section.key] from the
+    // ManagerConfig is listed with name / current / default; operators
+    // can edit and Apply (live-reload + write-to-disk). Validation
+    // failures surface inline and the input reverts to the
+    // pre-attempt value (AZ-5-A3 boundary fallback).
+    window._configRows = [];
+    window._configFilter = '';
+    window._configPending = {{}};
+
+    async function renderConfig() {{
+        document.getElementById('page-content').innerHTML = `
+            <div class="page-header"><h2>Config</h2>
+                <p class="page-desc">Raw cluster config — every key with current + default value.
+                Edit a field and click <b>Apply</b> to live-reload + persist to disk.</p>
+            </div>
+            <div style="display:flex;gap:.5rem;margin-bottom:.5rem;flex-wrap:wrap;align-items:center">
+                <input id="cfg-filter" type="text" class="form-input" placeholder="Filter by name…" style="max-width:260px"
+                       oninput="onConfigFilter(this.value)">
+                <button class="btn-secondary" onclick="renderConfig()">Refresh</button>
+                <button class="btn-primary"   onclick="submitConfigDiff(false)">Apply (live only)</button>
+                <button class="btn-primary"   onclick="submitConfigDiff(true)">Apply + write to disk</button>
+                <span id="cfg-pending-count" style="font-size:.85rem;color:var(--text-muted)"></span>
+            </div>
+            <div id="cfg-result" class="modal-result" style="display:none"></div>
+            <div id="cfg-list"><div class="placeholder">Loading…</div></div>`;
+        const data = await fetch('/api/v1/config/effective').then(r => r.json())
+            .catch(() => ({{entries: [], scope: 'unknown', node_hostname: 'unknown'}}));
+        window._configRows = data.entries || [];
+        window._configPending = {{}};
+        rerenderConfigTable();
+    }}
+
+    function onConfigFilter(v) {{
+        window._configFilter = (v||'').toLowerCase();
+        rerenderConfigTable();
+    }}
+
+    function rerenderConfigTable() {{
+        const el = document.getElementById('cfg-list');
+        if (!el) return;
+        const rows = window._configRows;
+        const filter = window._configFilter;
+        const filtered = filter
+            ? rows.filter(r => (r.name||'').toLowerCase().includes(filter))
+            : rows;
+        if (!filtered.length) {{
+            el.innerHTML = '<div class="placeholder">No matching config keys.</div>';
+            return;
+        }}
+        const pendingCount = Object.keys(window._configPending).length;
+        document.getElementById('cfg-pending-count').textContent =
+            pendingCount ? `${{pendingCount}} pending change${{pendingCount===1?'':'s'}}` : '';
+        el.innerHTML = '<div class="table-card"><table>' +
+            '<thead><tr><th>Name</th><th>Scope</th><th>Current</th><th>Default</th><th>Edit</th></tr></thead><tbody>' +
+            filtered.map(r => {{
+                const safeName = r.name.replace(/"/g, '&quot;');
+                const cur = (r.current === null || r.current === undefined)
+                    ? '' : JSON.stringify(r.current);
+                const def = (r.default === null || r.default === undefined)
+                    ? '(operator-set)' : JSON.stringify(r.default);
+                const pending = window._configPending[r.name];
+                const pendingFlag = (pending !== undefined)
+                    ? `<span style="color:var(--warning);font-weight:bold">●</span>` : '';
+                const isDefault = r.is_default
+                    ? `<span style="color:var(--text-muted);font-size:.75rem">(default)</span>` : '';
+                return `<tr>
+                    <td style="font-family:monospace;font-size:.78rem">${{r.name}} ${{pendingFlag}} ${{isDefault}}</td>
+                    <td>${{r.scope}}</td>
+                    <td style="font-family:monospace;font-size:.78rem">${{cur||'(null)'}}</td>
+                    <td style="font-family:monospace;font-size:.78rem;color:var(--text-muted)">${{def}}</td>
+                    <td><input class="form-input" style="font-family:monospace;font-size:.78rem;width:14rem"
+                               value="${{pending !== undefined ? String(pending).replace(/"/g,'&quot;') : cur}}"
+                               oninput="onConfigEdit('${{safeName}}', this.value)"></td>
+                </tr>`;
+            }}).join('') +
+            '</tbody></table></div>';
+    }}
+
+    function onConfigEdit(name, value) {{
+        if (value === '') {{
+            delete window._configPending[name];
+        }} else {{
+            // Attempt JSON parse so numbers/bools/arrays don't get
+            // string-quoted. Fall back to literal string on failure.
+            try {{
+                window._configPending[name] = JSON.parse(value);
+            }} catch (_) {{
+                window._configPending[name] = value;
+            }}
+        }}
+        const pendingCount = Object.keys(window._configPending).length;
+        document.getElementById('cfg-pending-count').textContent =
+            pendingCount ? `${{pendingCount}} pending change${{pendingCount===1?'':'s'}}` : '';
+    }}
+
+    async function submitConfigDiff(writeToDisk) {{
+        const pending = window._configPending;
+        const keys = Object.keys(pending);
+        if (!keys.length) {{
+            alert('No pending changes.');
+            return;
+        }}
+        // Build a JSON-merge from the dotted-path names. Drop the
+        // "manager." prefix to match the ManagerConfig shape.
+        const merged = {{}};
+        for (const dotted of keys) {{
+            const parts = dotted.replace(/^manager\./, '').split('.');
+            let cursor = merged;
+            for (let i = 0; i < parts.length - 1; i++) {{
+                cursor[parts[i]] = cursor[parts[i]] || {{}};
+                cursor = cursor[parts[i]];
+            }}
+            cursor[parts[parts.length - 1]] = pending[dotted];
+        }}
+        const result = document.getElementById('cfg-result');
+        result.style.display = 'block';
+        result.textContent = 'Submitting…';
+        try {{
+            const r = await fetch('/api/v1/config', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{
+                    config_json: JSON.stringify(merged),
+                    write_to_disk: writeToDisk,
+                }}),
+            }});
+            const j = await r.json().catch(() => ({{error: 'invalid JSON response'}}));
+            if (!r.ok) {{
+                result.textContent = 'Error ' + r.status + ': ' + (j.error || JSON.stringify(j))
+                    + (j.preserved_current ? ' (current values preserved)' : '');
+                // AZ-5-A3 — reload to revert pending UI state to
+                // server's current values.
+                await renderConfig();
+                return;
+            }}
+            result.textContent = `Applied. version=${{j.version}}, write_to_disk=${{j.write_to_disk}}`;
+            // Re-fetch to reflect post-apply state.
+            await renderConfig();
+        }} catch (e) {{
+            result.textContent = 'Network error: ' + e;
+        }}
     }}
 
     // ── Settings page ─────────────────────────────────────────────────────────

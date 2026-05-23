@@ -216,7 +216,96 @@ Only the fields included in the request body are changed. Omitted fields retain 
 The following settings cannot be changed after volume creation:
 
 - `id` -- The volume identifier.
-- `chunk_size_bytes` -- Changing the chunk size would require re-chunking all existing data. Create a new volume with the desired chunk size and migrate data if needed.
+
+### True config pane (AZ-5)
+
+The WebUI `/ui/config` page renders every `[section.key]` from the
+manager's loaded `ManagerConfig` with `name / scope / current / default`.
+
+* `GET /api/v1/config/effective` — returns an array of
+  `{name, scope, current, default, is_default}` entries (one per
+  flat key). Use this to drive any external dashboard.
+* `POST /api/v1/config` — body
+  `{"config_json": "{...}", "write_to_disk": true|false}`. When
+  `write_to_disk=true` the manager re-serialises the merged config
+  back to `/etc/dtfs/manager.toml` (atomic tmp+rename) so the
+  change survives a process restart. When `false`, only the
+  in-memory live config + Raft cluster_config are updated (legacy
+  behaviour).
+* **Boundary check (AZ-5-A3)**: invalid JSON returns 400 with
+  `{"error": "...", "preserved_current": true}` and the live
+  config + on-disk file stay untouched. The WebUI re-fetches the
+  effective config on failure to revert the input field to the
+  pre-attempt value.
+
+The page shows ALL keys (operator-set and at-default both). A
+chip-style "(default)" marker flags rows where current == default.
+Edit a row's value, click **Apply (live only)** for an in-memory
+update or **Apply + write to disk** to persist; pending count is
+shown at the top of the page.
+
+### Per-volume schedules (AZ-1)
+
+Each volume carries a `[volume.schedules]` block that overrides
+cluster-wide background-job cadences for its chunks.
+
+```toml
+[volume.schedules]
+# Scrub more often than the cluster default (default 6h = 21600s)
+scrub_interval_secs = 3600    # 1 hour
+fsck_interval_secs  = 86400   # 24 hours (reserved for future fsck)
+[volume.schedules.custom]
+rebalance = 21600             # 6 hours
+```
+
+REST: `POST /api/v1/volumes/{id}/set-schedules`. Body:
+
+```json
+{
+  "scrub_interval_secs": 3600,
+  "fsck_interval_secs":  null,
+  "custom": {"rebalance": 21600},
+  "clear_unspecified": false
+}
+```
+
+Rules:
+- `null` (or omitted): preserve current value.
+- `0`: clear the override (back to cluster default).
+- Positive value: must be >= 60 seconds.
+- `clear_unspecified=true`: every `null` sub-field resets too.
+
+The manager pushes the effective scrub interval to data nodes via
+the heartbeat `ConfigUpdate.scrub_override` field (AZ-1). The
+data-node scrub scheduler reads its `Arc<RwLock<ScrubConfig>>`
+every `DECISION_TICK_SECS` (60s), so changes take effect inside
+1-2 minutes without restart.
+
+WebUI: the Volumes page exposes a **Schedules…** button next to
+**Edit policy…** that opens the same set-schedules form.
+
+### Per-file chunk_size (AZ-3)
+
+`chunk_size_bytes` is editable on the volume, but the change does
+**not** retroactively affect files already written. Each
+`FileMetadata` snapshots the volume's `chunk_size_bytes` at
+`CreateFile` time and stores it as `FileMetadata.chunk_size`; the
+FUSE read path resolves byte-offset → chunk-index against that
+per-file value (`dtfs-fuse/src/filesystem.rs::resolve_chunk_size`).
+Consequences:
+
+- Existing files remain readable byte-for-byte after a resize.
+- New files created after the resize use the new value.
+- A volume can carry a mix of file chunk sizes indefinitely.
+- The per-file value is the load-bearing invariant; do not
+  attempt to "fix up" `FileMetadata.chunk_size` to match the
+  volume after a resize — that would break reads of files written
+  at the prior size.
+
+Regression contract: `dtfs-raft` unit tests
+`bug_az_3_volume_chunk_size_change_does_not_touch_existing_file`
+and `bug_az_3_new_file_after_resize_uses_new_chunk_size`. Live
+verification: `tests/proxmox/abuse/16-bug-az-chunk-size-shrink.sh`.
 
 ### Effects of Changing Replication
 

@@ -218,6 +218,28 @@ dtfs2/
 +-- docs/                    # This documentation (mdBook)
 ```
 
+## Installer flags (AZ-2)
+
+`scripts/dtfs-install.sh` accepts a positional build tarball (the legacy
+workflow) OR resolves the tarball itself via `--source` + `--version`:
+
+| Flag | Default | Behaviour |
+|------|---------|-----------|
+| `--source local` | — | Search `$DTFS_LOCAL_BIN_DIR`, `./target/release`, `/opt/dtfs/staging/*/`, `~/.cache/dtfs`. Fail if none match. |
+| `--source github` | — | Download from `$DTFS_REPO_URL` (default `https://github.com/lischetzke/dtfs`) releases. Use `--version` to pin a tag. |
+| `--source auto` | yes | Try local first; fall back to GitHub. |
+| `--version <tag>` | `latest` | GitHub release tag. Ignored for `--source local`. |
+
+The installer stages the chosen tarball at `/opt/dtfs/staging/<version>/`
+before unpacking + installing. Failed runs leave the staging dir for
+forensic inspection.
+
+Air-gapped workflow: pre-stage the tarball at
+`/opt/dtfs/staging/<version>/dtfs-<rev>-linux-amd64.tar.gz` on each
+host, then run `dtfs-install.sh --source local`.
+
+Regression test: `bash scripts/tests/test-dtfs-install.sh`.
+
 ## Next Steps
 
 - [Quick Start](./quickstart.md) -- run a single-node DTFS instance in 5 minutes

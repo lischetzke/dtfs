@@ -502,6 +502,36 @@ pub struct VolumeConfig {
     /// resolution.
     #[serde(default)]
     pub anchor: Option<AnchorPolicy>,
+
+    /// Bug AZ-1 — per-volume background-job schedules. Currently
+    /// covers scrub cadence; future: fsck and operator-defined jobs.
+    /// `None` on any sub-field means "inherit cluster default".
+    #[serde(default)]
+    pub schedules: VolumeSchedules,
+}
+
+/// Bug AZ-1 — per-volume background-job cadence overrides. Lets
+/// operators run scrub more often on hot volumes (e.g. Plex media
+/// libraries with frequent reads) than the cluster-wide default
+/// without dialling up scrub I/O on archival volumes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct VolumeSchedules {
+    /// Override `ScrubConfig.quick_interval_hours` (cluster-wide
+    /// default) for this volume's chunks. None = inherit. Minimum
+    /// honoured value is 60 s; the scheduler clamps anything
+    /// lower to prevent runaway scrub I/O.
+    #[serde(default)]
+    pub scrub_interval_secs: Option<u64>,
+    /// Reserved for a future fsck job (Bug AZ-1 plan); ignored by
+    /// data nodes until that lands. Operators can still set the
+    /// value via /set-schedules; storage is forward-compatible.
+    #[serde(default)]
+    pub fsck_interval_secs: Option<u64>,
+    /// Future hook: arbitrary named jobs (e.g. "rebalance",
+    /// "snapshot"). Operators set the cadence; the scheduler
+    /// matches by job name. Empty by default.
+    #[serde(default)]
+    pub custom: std::collections::BTreeMap<String, u64>,
 }
 
 impl VolumeConfig {
@@ -581,6 +611,7 @@ impl Default for VolumeConfig {
             mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 },
             cache_replicas: CacheReplication::default(),
             anchor: None,
+            schedules: VolumeSchedules::default(),
         }
     }
 }

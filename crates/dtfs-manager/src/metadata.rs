@@ -414,7 +414,43 @@ impl ManagerService for MetadataService {
         // never populated and every node appeared as Down immediately (fix #2).
         self.cluster.process_heartbeat(node_id);
 
-        let cfg_version = self.sm_data.read().await.cluster_config.version;
+        // AZ-1 — compute the effective scrub override from cluster
+        // defaults + any per-volume `schedules.scrub_interval_secs`.
+        // Send to the data-node every heartbeat; the data-side
+        // scrub scheduler hot-reloads within DECISION_TICK_SECS.
+        // Cluster defaults: 6 h quick / 168 h deep
+        // (`default_quick_interval` / `default_deep_interval` in
+        // dtfs-common/src/config.rs). The manager binary does not
+        // load a `ScrubConfig` (those live in DataNodeConfig); we
+        // use the same defaults so a fresh cluster has the same
+        // behaviour with or without ConfigUpdate.
+        const CLUSTER_QUICK_HOURS_DEFAULT: u64 = 6;
+        const CLUSTER_DEEP_HOURS_DEFAULT: u64 = 168;
+        let (cfg_version, scrub_override) = {
+            let sm = self.sm_data.read().await;
+            let cfg_version = sm.cluster_config.version;
+            let cluster_quick_secs =
+                CLUSTER_QUICK_HOURS_DEFAULT.saturating_mul(3600);
+            let cluster_deep_secs =
+                CLUSTER_DEEP_HOURS_DEFAULT.saturating_mul(3600);
+            let mut min_quick = cluster_quick_secs;
+            for v in sm.volumes.values() {
+                if let Some(override_secs) = v.schedules.scrub_interval_secs {
+                    if override_secs < min_quick {
+                        min_quick = override_secs;
+                    }
+                }
+            }
+            let quick_h = (min_quick.max(60) + 3599) / 3600;
+            let deep_h = (cluster_deep_secs.max(60) + 3599) / 3600;
+            (
+                cfg_version,
+                Some(dtfs_proto::dtfs::manager::ScrubConfigOverride {
+                    quick_interval_hours: quick_h.max(1),
+                    deep_interval_hours: deep_h.max(1),
+                }),
+            )
+        };
 
         let _ = self
             .raft_write(ClientRequest::UpdateNodeUsage {
@@ -484,10 +520,23 @@ impl ManagerService for MetadataService {
             }
         }
 
+        // AZ-1 — emit a minimal ConfigUpdate carrying the scrub
+        // override. config_json stays empty (data-side parses it as
+        // DataNodeConfig only when non-empty; the legacy live-reload
+        // path is unaffected). Sent every heartbeat — the data-side
+        // RwLock write is a noop when the value is unchanged.
+        let config_update = scrub_override.map(|s| {
+            dtfs_proto::dtfs::manager::ConfigUpdate {
+                version: cfg_version,
+                config_json: String::new(),
+                scrub_override: Some(s),
+            }
+        });
+
         Ok(Response::new(HeartbeatResponse {
             accepted: true,
             config_version: cfg_version,
-            config_update: None,
+            config_update,
         }))
     }
 
@@ -1528,6 +1577,7 @@ mod bug_av_preferred_tier_tests {
                 cooldown_secs: 30,
             },
             anchor: None,
+            schedules: dtfs_common::types::VolumeSchedules::default(),
             anchor_datacenter: Some("dc-a".to_string()),
             write_safety: WriteSafety {
                 min_replicas_before_ack: 1,

@@ -95,8 +95,15 @@ async fn main() -> anyhow::Result<()> {
     let data_metrics = Arc::new(metrics::DataMetrics::new());
     tracing::info!("Initialized I/O metrics");
 
-    // Start scrub scheduler as a background task.
-    let scrub_scheduler = scrub::ScrubScheduler::new(chunk_store.clone(), config.scrub.clone());
+    // AZ-1 — scrub scheduler holds a hot-reloadable `Arc<RwLock<ScrubConfig>>`
+    // so the manager's heartbeat-driven ConfigUpdate path can lower the
+    // effective interval at runtime (e.g. when an operator raises a
+    // per-volume scrub cadence via `POST /api/v1/volumes/{id}/set-schedules`).
+    let scrub_config = Arc::new(tokio::sync::RwLock::new(config.scrub.clone()));
+    let scrub_scheduler = scrub::ScrubScheduler::new(
+        chunk_store.clone(),
+        scrub_config.clone(),
+    );
     tokio::spawn(async move {
         scrub_scheduler.run().await;
     });
@@ -107,10 +114,11 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_config = config.clone();
     let heartbeat_store = chunk_store.clone();
     let heartbeat_metrics = data_metrics.clone();
+    let heartbeat_scrub_config = scrub_config.clone();
     let process_start = Instant::now();
     tokio::spawn(async move {
         if let Err(e) =
-            manager_lifecycle(heartbeat_config, heartbeat_store, heartbeat_metrics, process_start)
+            manager_lifecycle(heartbeat_config, heartbeat_store, heartbeat_metrics, process_start, heartbeat_scrub_config)
                 .await
         {
             tracing::error!("Manager lifecycle task failed: {}", e);
@@ -269,6 +277,11 @@ async fn manager_lifecycle(
     chunk_store: Arc<ChunkStore>,
     data_metrics: Arc<metrics::DataMetrics>,
     process_start: Instant,
+    // AZ-1 — shared scrub config the scheduler reads each tick. When
+    // the manager pushes a `ConfigUpdate` via heartbeat response, we
+    // overwrite this lock so the scheduler picks up the new interval
+    // within DECISION_TICK_SECS.
+    scrub_config: Arc<tokio::sync::RwLock<dtfs_common::config::ScrubConfig>>,
 ) -> anyhow::Result<()> {
     // F-024 hardening: walk through every configured manager endpoint when the
     // primary is down (e.g. after a rolling restart). The list is built from
@@ -518,30 +531,60 @@ async fn manager_lifecycle(
 
                 // Apply config updates pushed by the manager via heartbeat response.
                 if let Some(config_update) = resp.config_update {
-                    tracing::info!(
-                        "Received config update v{}: {} bytes — applying",
-                        config_update.version,
-                        config_update.config_json.len()
-                    );
-                    // Attempt to deserialise and apply the updated DataNodeConfig.
-                    match serde_json::from_str::<DataNodeConfig>(&config_update.config_json) {
-                        Ok(_new_cfg) => {
-                            // In a full implementation each sub-module (scrub scheduler,
-                            // cache, replication) would implement the `Reconfigurable`
-                            // trait and be called here.  For now we record that we have
-                            // accepted this version so future heartbeats report it correctly.
-                            current_config_version = config_update.version;
+                    // AZ-1 — apply the scrub override path first (it's
+                    // sent on every heartbeat). The full config_json
+                    // path stays for legacy live-reload — when empty,
+                    // skip the JSON parse + log noise.
+                    if let Some(s) = &config_update.scrub_override {
+                        let mut sc = scrub_config.write().await;
+                        if sc.quick_interval_hours != s.quick_interval_hours
+                            || sc.deep_interval_hours != s.deep_interval_hours
+                        {
                             tracing::info!(
-                                "Config update v{} applied (config_version advanced)",
-                                current_config_version
+                                "AZ-1 scrub override: quick {}h -> {}h, deep {}h -> {}h",
+                                sc.quick_interval_hours,
+                                s.quick_interval_hours,
+                                sc.deep_interval_hours,
+                                s.deep_interval_hours,
                             );
+                            sc.quick_interval_hours = s.quick_interval_hours;
+                            sc.deep_interval_hours = s.deep_interval_hours;
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to parse config update v{}: {}",
-                                config_update.version,
-                                e
-                            );
+                    }
+                    if !config_update.config_json.is_empty() {
+                        tracing::info!(
+                            "Received config update v{}: {} bytes — applying",
+                            config_update.version,
+                            config_update.config_json.len()
+                        );
+                        match serde_json::from_str::<DataNodeConfig>(&config_update.config_json) {
+                            Ok(new_cfg) => {
+                                {
+                                    let mut sc = scrub_config.write().await;
+                                    if *sc != new_cfg.scrub {
+                                        tracing::info!(
+                                            "Scrub config updated from config_json: quick {}h -> {}h, deep {}h -> {}h",
+                                            sc.quick_interval_hours,
+                                            new_cfg.scrub.quick_interval_hours,
+                                            sc.deep_interval_hours,
+                                            new_cfg.scrub.deep_interval_hours,
+                                        );
+                                        *sc = new_cfg.scrub.clone();
+                                    }
+                                }
+                                current_config_version = config_update.version;
+                                tracing::info!(
+                                    "Config update v{} applied (config_version advanced)",
+                                    current_config_version
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to parse config update v{}: {}",
+                                    config_update.version,
+                                    e
+                                );
+                            }
                         }
                     }
                 }
