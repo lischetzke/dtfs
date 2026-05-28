@@ -146,7 +146,7 @@ home plan (AV, BA) and is only cross-referenced here.
 
 ## Phase 3 — Loose ends (low priority)
 
-### ⬜ BG-8 — AZ-4-3 loose end: interpolate `REPO_URL` into WebUI links
+### ✅ BG-8 — AZ-4-3 loose end: interpolate `REPO_URL` into WebUI links
 - **Files:** `crates/dtfs-manager/src/webui.rs` (~:487, :707) — replace
   hardcoded `github.com/lischetzke/dtfs…` with `dtfs_common::REPO_URL`.
 - **Done when:** no hardcoded repo URL in webui; footer/docs links
@@ -239,6 +239,16 @@ BG-8, BG-9, BG-10.
   logic (they already pass); they are not refactored to the new libs,
   and a full `run.sh --quick` run is deferred (needs the 15-min soak
   case + orchestrator host) — the libs are additive and smoke-verified.
+
+- **2026-05-28 BG-8 (AZ-4-3)**: replaced both hardcoded
+  `github.com/lischetzke/dtfs/tree/master/docs` links in
+  `render_dashboard` with `{repo}/tree/master/docs`, added
+  `repo = dtfs_common::REPO_URL` to the page `format!` args. Grep
+  confirms zero `lischetzke/dtfs` literals left in webui.rs;
+  `cargo build --release -p dtfs-manager` clean on builder. No live
+  deploy: `REPO_URL` is byte-identical to the former literal, so the
+  rendered HTML is unchanged (maintainability-only, no behaviour
+  change → no release-suite case needed).
 
 ## Deviations from plan
 - BG-5 done-when softened: BE-1 libs delivered + smoke-verified rather

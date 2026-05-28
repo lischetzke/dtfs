@@ -484,7 +484,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <a href="/ui/migrations" data-route="/ui/migrations">Migrations</a>
         </div>
     </div>
-    <a href="https://github.com/lischetzke/dtfs/tree/master/docs" target="_blank">Docs ↗</a>
+    <a href="{repo}/tree/master/docs" target="_blank">Docs ↗</a>
 </nav>
 
 <div class="health-banner unknown" id="health-banner">
@@ -704,7 +704,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 <div class="footer">
     DTFS — Distributed Tiered Filesystem &nbsp;·&nbsp;
     <a href="/api/v1/cluster/status" style="color:var(--primary)">API</a> &nbsp;·&nbsp;
-    <a href="https://github.com/lischetzke/dtfs/tree/master/docs" style="color:var(--primary)" target="_blank">Docs</a>
+    <a href="{repo}/tree/master/docs" style="color:var(--primary)" target="_blank">Docs</a>
 </div>
 
 <script>
@@ -2673,5 +2673,6 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 </html>"##,
         cluster_name = cluster_name,
         hostname = hostname,
+        repo = dtfs_common::REPO_URL,
     )
 }
