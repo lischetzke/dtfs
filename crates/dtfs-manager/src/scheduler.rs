@@ -860,9 +860,18 @@ impl TaskScheduler {
                                         .map(|p| p as u32)
                                 })
                                 .unwrap_or(0);
-                            let already_present = entries
-                                .iter()
-                                .any(|c| c.node_id == target_str);
+                            // Bug BH — dedup by (node_id, disk_id), NOT
+                            // node_id alone. On a no-spare-node multi-tier
+                            // topology the anchor-cold target already holds
+                            // the chunk on its warm disk; a node-only guard
+                            // dropped the new cold entry, so the cold anchor
+                            // was never recorded → infinite anchor-lag-repair
+                            // loop + mandatory_strand flush refusals.
+                            let already_present = replica_already_present(
+                                &entries,
+                                &target_str,
+                                resolved_disk_id,
+                            );
                             if !already_present {
                                 entries.push(ChunkLocationEntry {
                                     chunk_index,
@@ -1952,6 +1961,23 @@ pub struct FlushCacheReport {
     #[serde(skip)] pub(crate) refusals: Vec<FlushRefusal>,
 }
 
+/// Bug BH — true if `entries` already records a replica of this chunk on
+/// the exact `(node_id, disk_id)` slot. The anchor-lag-repair completion
+/// path used to dedup on `node_id` alone, which on a no-spare-node
+/// multi-tier topology (target already holds the chunk on its warm disk)
+/// silently dropped the new *cold* anchor entry — `disk_id` is already
+/// tier-resolved (AV-5-9 `resolved_disk_id`), so `(node_id, disk_id)` is
+/// the exact `(node, tier)` slot and the correct dedup key.
+pub(crate) fn replica_already_present(
+    entries: &[ChunkLocationEntry],
+    node_id: &str,
+    disk_id: u32,
+) -> bool {
+    entries
+        .iter()
+        .any(|c| c.node_id == node_id && c.disk_id == disk_id)
+}
+
 /// Bug AV — pure planner kernel. Walks the snapshot, identifies cache-
 /// tier replicas eligible for deletion, refuses anything that would
 /// strand a mandatory-tier replica.
@@ -2469,6 +2495,69 @@ mod endpoint_tests {
     fn bug_w_endpoint_https_passthrough() {
         let stored = "https://data-warm01:9500";
         assert_eq!(normalize_endpoint(stored), "https://data-warm01:9500");
+    }
+}
+
+#[cfg(test)]
+mod bug_bh_dedup_tests {
+    use super::*;
+
+    fn ent(node: &str, disk: u32) -> ChunkLocationEntry {
+        ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: "h".to_string(),
+            node_id: node.to_string(),
+            disk_id: disk,
+            size_bytes: 0,
+        }
+    }
+
+    /// BH-1 — the dedup guard must key on (node_id, disk_id). A node that
+    /// holds the chunk on disk 0 (warm) is NOT "already present" for a
+    /// cold copy on disk 1. (Fails with the old node-only guard.)
+    #[test]
+    fn replica_present_dedupes_by_node_and_disk() {
+        let entries = vec![ent("A", 0)];
+        assert!(
+            !replica_already_present(&entries, "A", 1),
+            "same node, different disk/tier must NOT count as present"
+        );
+        assert!(
+            replica_already_present(&entries, "A", 0),
+            "exact (node, disk) match must count as present (idempotency)"
+        );
+        assert!(
+            !replica_already_present(&entries, "B", 0),
+            "different node must NOT count as present"
+        );
+    }
+
+    /// BH-2 — the completion path must RECORD a same-node cold replica
+    /// when the anchor target already holds the chunk on its warm disk.
+    /// Mirrors the dispatcher push logic; pre-BH (node-only guard) this
+    /// leaves 2 entries (cold never recorded) → infinite anchor-lag loop.
+    #[test]
+    fn completion_records_same_node_cold_replica() {
+        // Existing warm replicas on both data nodes (warm disk = 0).
+        let mut entries = vec![ent("A", 0), ent("B", 0)];
+        // Anchor-cold repair targets B; its cold disk resolved to id 1.
+        let target = "B";
+        let resolved_cold_disk = 1u32;
+        if !replica_already_present(&entries, target, resolved_cold_disk) {
+            entries.push(ent(target, resolved_cold_disk));
+        }
+        assert_eq!(
+            entries.len(),
+            3,
+            "cold anchor on B must be recorded alongside its warm copy"
+        );
+        assert!(
+            entries.iter().any(|e| e.node_id == "B" && e.disk_id == 1),
+            "the new B-cold entry must be present"
+        );
+        // Integrity invariant (A.3.3): existing warm entries untouched.
+        assert!(entries.iter().any(|e| e.node_id == "A" && e.disk_id == 0));
+        assert!(entries.iter().any(|e| e.node_id == "B" && e.disk_id == 0));
     }
 }
 

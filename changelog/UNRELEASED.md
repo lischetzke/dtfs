@@ -51,4 +51,15 @@
   `ChunkLocationCommit`.
 
 ## Bug Fixes
-- _(none yet)_
+- **Bug BH — anchor-lag repair now converges on no-spare-node
+  multi-tier clusters.** When a volume keeps a warm cache replica on
+  every data node plus a mandatory cold anchor, the cold-repair target
+  already held the chunk on its warm disk. The repair completion path
+  deduped recorded replicas by node id alone, so the new cold entry was
+  never persisted: anchor-lag repair re-scheduled the same chunks
+  forever and `flush_cache` refused every chunk with
+  `reason=mandatory_strand`. The guard now keys on `(node_id, disk_id)`,
+  so a second-tier (cold) replica is recorded on a node that already
+  holds the warm copy; the repair queue drains and flush stops being
+  refused once the anchor exists. Production-shaped clusters (cold
+  anchor on a node that holds no warm cache) were unaffected.
