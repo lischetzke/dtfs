@@ -1506,6 +1506,38 @@ pub(crate) fn apply_set_mandatory(
     Ok(next)
 }
 
+/// Bug BM-3 — reject a mandatory tape-tier replica count that no
+/// topology can ever satisfy. `mandatory_replicas` is enforced by the
+/// under-replication scheduler, which would otherwise queue a failing
+/// replication task for every chunk on the volume forever. The check is
+/// evaluated against the *current* cluster topology at API time (a tape
+/// disk added later lets a re-save succeed).
+pub(crate) fn validate_tape_satisfiable(
+    mandatory_tape: u32,
+    has_tape_disk: bool,
+) -> Result<(), String> {
+    if mandatory_tape > 0 && !has_tape_disk {
+        return Err(format!(
+            "mandatory_replicas.tape={mandatory_tape} but no tape-tier disk is \
+             registered in the cluster; the under-replication scheduler could \
+             never satisfy it. Add a tape-tier disk first, or set \
+             mandatory_replicas.tape=0."
+        ));
+    }
+    Ok(())
+}
+
+/// Bug BM-3 — does any registered data node expose a tape-tier disk?
+fn cluster_has_tape_disk(
+    nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+) -> bool {
+    nodes.values().any(|n| {
+        n.disks
+            .iter()
+            .any(|d| d.tier == dtfs_common::types::DiskTier::Tape)
+    })
+}
+
 /// AZ-1 — request body for `POST /api/v1/volumes/{id}/set-schedules`.
 /// Each field is optional; `None` for a sub-field is a no-op
 /// (preserve current). To explicitly clear an override, send the
@@ -1766,6 +1798,14 @@ async fn set_volume_mandatory_endpoint(
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e})),
         ))?;
+
+    // Bug BM-3 — reject an unsatisfiable mandatory tape constraint
+    // against the current topology.
+    {
+        let sm = state.sm_data.read().await;
+        validate_tape_satisfiable(next.mandatory_replicas.tape, cluster_has_tape_disk(&sm.nodes))
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    }
 
     let changed = current != next;
     if changed {
@@ -2460,6 +2500,63 @@ pub(crate) fn infra_health_counts<'a>(
         }
     }
     (manager_count + data_healthy, manager_count + data_total)
+}
+
+#[cfg(test)]
+mod bug_bm3_tape_validation_tests {
+    use super::*;
+
+    /// BM-3 — mandatory tape replicas with no tape disk is rejected; a
+    /// zero tape requirement (or a topology that has a tape disk) passes.
+    #[test]
+    fn tape_mandatory_requires_tape_disk() {
+        // tape required, no tape disk → reject.
+        assert!(validate_tape_satisfiable(1, false).is_err());
+        // tape required, tape disk present → ok.
+        assert!(validate_tape_satisfiable(1, true).is_ok());
+        // no tape required → ok regardless of topology.
+        assert!(validate_tape_satisfiable(0, false).is_ok());
+        assert!(validate_tape_satisfiable(0, true).is_ok());
+    }
+
+    /// BM-3 — cluster_has_tape_disk scans every node's disks for a
+    /// Tape-tier entry.
+    #[test]
+    fn detects_tape_disk_in_topology() {
+        use dtfs_common::types::{DiskInfo, DiskStatus, DiskTier};
+        let mut nodes: std::collections::BTreeMap<u64, dtfs_raft::NodeInfo> =
+            std::collections::BTreeMap::new();
+        let mk_disk = |tier: DiskTier| DiskInfo {
+            disk_id: 0,
+            uuid: "u".into(),
+            mount_path: "/mnt/d".into(),
+            tier,
+            total_bytes: 1,
+            used_bytes: 0,
+            status: DiskStatus::Healthy,
+        };
+        let mk_node = |tier: DiskTier| dtfs_raft::NodeInfo {
+            role: dtfs_common::types::NodeRole::Data,
+            hostname: "d".into(),
+            grpc_addr: "d:9500".into(),
+            location: dtfs_common::topology::Location::new("", "", "", ""),
+            disks: vec![mk_disk(tier)],
+            total_capacity: 0,
+            used_capacity: 0,
+            health: HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        };
+        nodes.insert(1, mk_node(DiskTier::Cold));
+        assert!(!cluster_has_tape_disk(&nodes), "only a cold disk → no tape");
+        nodes.insert(2, mk_node(DiskTier::Tape));
+        assert!(cluster_has_tape_disk(&nodes), "a tape disk is now present");
+    }
 }
 
 #[cfg(test)]
