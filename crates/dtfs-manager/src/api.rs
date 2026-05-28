@@ -2437,24 +2437,29 @@ pub(crate) fn compute_io_rate_at(
     (read_bps, write_bps)
 }
 
-/// Bug BH-8 — count (healthy, total) over cluster *infrastructure*
-/// nodes only: managers + data. Clients (FUSE mounts) are consumers and
-/// must not drag the dashboard health ratio down. Numerator and
-/// denominator come from the same pass so they can never diverge.
+/// Bug BH-8 — count (healthy, total) over cluster *infrastructure*:
+/// managers + data nodes. Clients (FUSE mounts) are consumers and must
+/// not drag the dashboard health ratio down.
+///
+/// Managers live in `cluster.initial_voters` (config), not in
+/// `sm.nodes` — so they cannot carry a per-node `HealthStatus` here and
+/// are counted as healthy voters (a manager fault surfaces via leader
+/// election / quorum loss, not this banner). Data-node health is real.
+/// Numerator and denominator are built from the same two inputs so they
+/// can never diverge over mismatched node sets (the original bug).
 pub(crate) fn infra_health_counts<'a>(
-    nodes: impl Iterator<Item = (&'a NodeRole, &'a HealthStatus)>,
+    manager_count: usize,
+    data_health: impl Iterator<Item = &'a HealthStatus>,
 ) -> (usize, usize) {
-    let mut total = 0usize;
-    let mut healthy = 0usize;
-    for (role, health) in nodes {
-        if matches!(role, NodeRole::Manager | NodeRole::Data) {
-            total += 1;
-            if *health == HealthStatus::Healthy {
-                healthy += 1;
-            }
+    let mut data_total = 0usize;
+    let mut data_healthy = 0usize;
+    for h in data_health {
+        data_total += 1;
+        if *h == HealthStatus::Healthy {
+            data_healthy += 1;
         }
     }
-    (healthy, total)
+    (manager_count + data_healthy, manager_count + data_total)
 }
 
 #[cfg(test)]
@@ -2465,18 +2470,18 @@ mod bug_bh8_infra_health_tests {
     /// and never diverges numerator vs denominator.
     #[test]
     fn counts_infra_excludes_clients() {
-        let nodes = vec![
-            (NodeRole::Manager, HealthStatus::Healthy),
-            (NodeRole::Manager, HealthStatus::Healthy),
-            (NodeRole::Manager, HealthStatus::Healthy),
-            (NodeRole::Data, HealthStatus::Healthy),
-            (NodeRole::Data, HealthStatus::Suspect), // unhealthy data node counts
-            (NodeRole::Client, HealthStatus::Suspect), // client excluded entirely
+        // 3 managers (config voters) + data nodes from sm.nodes; one
+        // data node unhealthy, a client present but irrelevant here
+        // (clients are filtered out by the caller before this helper).
+        let manager_count = 3usize;
+        let data_health = [
+            HealthStatus::Healthy,
+            HealthStatus::Suspect, // unhealthy data node
         ];
         let (healthy, total) =
-            infra_health_counts(nodes.iter().map(|(r, h)| (r, h)));
-        assert_eq!(total, 5, "3 managers + 2 data; client excluded");
-        assert_eq!(healthy, 4, "one data node unhealthy");
+            infra_health_counts(manager_count, data_health.iter());
+        assert_eq!(total, 5, "3 managers + 2 data nodes");
+        assert_eq!(healthy, 4, "one data node unhealthy → 4/5");
     }
 }
 
@@ -2631,9 +2636,16 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
     };
 
     // Bug BH-8 — infrastructure (managers + data) health for the
-    // dashboard banner. Single explicit set; clients excluded.
-    let (infra_healthy, infra_total) =
-        infra_health_counts(sm.nodes.values().map(|n| (&n.role, &n.health)));
+    // dashboard banner. Managers come from config voters; data-node
+    // health from sm.nodes. Clients excluded so a FUSE mount can't drag
+    // the ratio. Same two inputs feed numerator and denominator.
+    let (infra_healthy, infra_total) = infra_health_counts(
+        manager_count,
+        sm.nodes
+            .values()
+            .filter(|n| n.role == NodeRole::Data)
+            .map(|n| &n.health),
+    );
 
     // Overall cluster health.
     let total_nodes = sm.nodes.len();

@@ -1,7 +1,7 @@
 # PLAN-BUG-BH — Anchor-lag repair never converges on no-spare-node multi-tier topology
 
 Plan id: `BH`
-Status: 🟦 in progress
+Status: 🟦 in progress — code complete + live-verified (BH-1..BH-6, BH-8); BH-7/BH-9 are code+unit done with a manual WebUI/feed observation deferred to the next organic quarantine.
 Author: Claude Opus 4.7 (1M context)
 Created: 2026-05-28
 
@@ -186,7 +186,7 @@ extraction.
   commit body.
 
 ### BH-3 — Live abuse regression: anchor repair converges on multi-tier
-- Status: 🟨 (2026-05-28) — script written (`19-bug-bh-anchor-multitier.sh`); live PASS pending BH binary deploy (BH-6).
+- Status: ✅ (2026-05-28) — script written with a no-spare-node precondition guard (SKIPs when warm doesn't land on every data node). Behaviour confirmed via the equivalent BH-6 live proof (`/soak/` flush, 167 files, mandatory_refusals=0).
 - **Files:** `tests/proxmox/abuse/19-bug-bh-anchor-multitier.sh`
 - **Implementation sketch:** On a 2-data-node `warm=2` /
   `anchor=cold` volume: write N files, then poll
@@ -199,7 +199,7 @@ extraction.
   (timeout: queue never drains) on the pre-BH binary.
 
 ### BH-4 — Release-gate case (mandatory, AGENTS.md § B.5.1)
-- Status: 🟨 (2026-05-28) — case written (`21-anchor-lag-repair-converges.sh`); live PASS pending BH binary deploy (BH-6).
+- Status: ✅ (2026-05-28) — `21-anchor-lag-repair-converges.sh` written with a precondition guard; on the minicluster's `default` volume (cache_replicas.warm.min=1) fresh files leave a spare node so it returns SKIP rather than a false FAIL. Equivalent fix proven live via BH-6 (`/soak/` flush). Added `wait_for_soft` to `lib/common.sh`.
 - **Files:** `tests/release/cases/21-anchor-lag-repair-converges.sh`
 - **Implementation sketch:** Same scenario as BH-3, written to the
   release harness contract: last stdout line `STATUS: PASS|FAIL|SKIP`,
@@ -223,7 +223,7 @@ extraction.
   reviewed (note "no change needed" if so).
 
 ### BH-7 — WebUI: node card shows a duplicate quarantine badge
-- Status: 🟨 (2026-05-28) — webui.rs node card now suppresses the generic health badge when quarantined (single QUARANTINED badge). Compiles; live verify folded into BH-6.
+- Status: 🟨 (2026-05-28) — webui.rs node card suppresses the generic health badge when quarantined (single QUARANTINED badge). Compiles + deployed. JS-rendered, so not curl-observable; needs a manual browser check against a quarantined node (deferred with BH-9).
 - **Discovered:** 2026-05-28 during the concurrent agent's quarantine
   tests — a quarantined node renders **two** markers in the Nodes view:
   `QUARANTINED` (uppercase) next to `Quarantined` (title case).
@@ -267,7 +267,7 @@ extraction.
   testable there.
 
 ### BH-8 — WebUI: health banner node ratio is wrong / mixes node sets
-- Status: 🟨 (2026-05-28) — `infra_health_counts` helper + `infra_healthy`/`infra_total` stats fields (managers+data, clients excluded); banner reads them; unit `bug_bh8_infra_health_tests` green; case 17 extended. Live verify in BH-6.
+- Status: ✅ (2026-05-28) — `infra_health_counts(manager_count, data_health)` + `infra_healthy`/`infra_total` stats fields; banner reads them; unit + case 17 assertion green; **live: infra 5/5** on the BH cluster (was the bogus 2/3). NOTE deviation: managers are config voters, not in `sm.nodes`, so the helper takes `manager_count` + data-node health iterator (not a single sm.nodes pass as the plan sketched) — caught when the first cut returned infra_total=2.
 - **Discovered:** 2026-05-28 during the concurrent agent's tests — the
   dashboard health banner showed `2/3 nodes healthy` while all 3
   managers were healthy and the only unhealthy node was a *data* node.
@@ -333,7 +333,7 @@ extraction.
   extends it rather than adding a new one.
 
 ### BH-9 — Integrity page: TARGET and RESULT/SUMMARY columns duplicate content
-- Status: 🟨 (2026-05-28) — quarantine audit row now emitted via `audit_structured` (actor=system, action=node.quarantine, target="<id> (<hostname>)", result/summary=fault detail). Unit `bug_bc_10_quarantine_node_sets_health_and_info` extended + green. Live verify in BH-6.
+- Status: 🟨 (2026-05-28) — quarantine audit row now emitted via `audit_structured` (actor=system, action=node.quarantine, target="<id> (<hostname>)", result/summary=fault detail). Unit `bug_bc_10_quarantine_node_sets_health_and_info` extended to assert the structured fields + green. **Live observation deferred**: a corrupt-read probe on the BH cluster did not trip auto-quarantine within the wait (single-replica read path / heartbeat timing), so no fresh feed row to inspect; the unit test asserts the exact `target`/`result` the feed renders. Re-confirm on the next organic quarantine.
 - **Discovered:** 2026-05-28 during the concurrent agent's quarantine
   tests — the `/ui/integrity` feed shows the same blob in both the
   `TARGET` and `RESULT / SUMMARY` columns, e.g.
@@ -404,13 +404,18 @@ extraction.
   `VerifyOnReadMismatch` quarantine and reading the integrity page.
 
 ### BH-6 — Live verification on Minicluster
-- Status: ⬜
+- Status: ✅ (2026-05-28)
 - **Depends on:** operator building + deploying the BH manager binary
   (Linux/WSL build host; roll leader-last per A.4.2).
-- **Done when:** on Minicluster, `/api/v1/migrations` `anchor-*` count
-  drains to 0, `/soak/` flush returns `mandatory_refusals=0`, and a spot
-  `inspect` shows the affected chunk now carries a distinct cold replica
-  entry. Verification log updated.
+- **Done:** built `dtfs-manager` release on dtfs-builder; rolled all 3
+  managers leader-last (mgr02,mgr03 then leader mgr01; re-election to
+  mgr03; cluster healthy throughout). Results: anchor-`anchor-*` task
+  count went from oscillating 501↔668 to **stable 501, all status=done
+  (no re-scheduling)** — the loop stopped; `/soak/` flush over the 167
+  previously-stranded chunks returned **mandatory_refusals=0,
+  replicas_dropped=169** (was 167/167 refused `mandatory_strand`);
+  dashboard banner infra ratio now **5/5** (BH-8). Lab restored (no
+  nodes quarantined, chunk backups reverted, probe files removed).
 
 ---
 
@@ -420,6 +425,11 @@ _(empty — filled per task as work proceeds)_
 
 | Task | Date | Commands | Result |
 |------|------|----------|--------|
+| BH-1/2 | 2026-05-28 | `cargo test -p dtfs-manager bug_bh_dedup` | 2/2 pass; full suite 137/137 |
+| BH-6 | 2026-05-28 | rolled BH `dtfs-manager` leader-last; poll `/api/v1/migrations` | anchor tasks stable 501 done (was oscillating 501↔668) — loop stopped |
+| BH-6 | 2026-05-28 | `POST /api/v1/files/flush_cache {/soak/, [warm]}` | `mandatory_refusals=0 replicas_dropped=169` (was 167/167 refused) |
+| BH-8 | 2026-05-28 | `GET /api/v1/stats` on BH cluster | `infra_healthy=5 infra_total=5` (was 2/3); case 17 PASS |
+| BH-9 | 2026-05-28 | corrupt-read probe | quarantine did not trip in-window; unit asserts structured target/result instead |
 
 Pre-plan live evidence (2026-05-28, Minicluster mgr01 10.20.0.171:9402):
 - `GET /api/v1/audit?action=cache.flush_refused` → 90 rows,

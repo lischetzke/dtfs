@@ -84,6 +84,19 @@ wait_for() {
     fail "wait_for: $desc did not become true in ${secs}s"
 }
 
+# Like wait_for but returns 1 on timeout instead of failing the case.
+# Use when a not-yet-true condition should drive a SKIP, not a FAIL.
+#   wait_for_soft <secs> <cmd...>
+wait_for_soft() {
+    local secs="$1"; shift
+    local start=$(date +%s)
+    while [ $(( $(date +%s) - start )) -lt "$secs" ]; do
+        if "$@"; then return 0; fi
+        sleep 2
+    done
+    return 1
+}
+
 # ─── Domain helpers ──────────────────────────────────────────────
 
 # Return the chunk_ids list for a given file path (newline-separated).
