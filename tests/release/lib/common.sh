@@ -123,3 +123,10 @@ sha256_via_fuse() {
 # Cases SHOULD register cleanup via trap "case_cleanup" EXIT and define
 # a case_cleanup fn. Suite continues to the next case even if this one
 # fails; cleanup runs regardless.
+
+# ─── BE-1 — pull in fixture + health helpers ─────────────────────
+# Sourced here so every case gets all three libs from one
+# `source .../lib/common.sh` line.
+_LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$_LIBDIR/fixtures.sh"
+. "$_LIBDIR/health.sh"

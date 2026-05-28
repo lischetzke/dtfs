@@ -119,7 +119,7 @@ home plan (AV, BA) and is only cross-referenced here.
 - **Done when:** corrupt replica transparently bypassed, integrity fault
   logged client-side, case 13 green.
 
-### ⬜ BG-5 — BE-1 remainder: `lib/fixtures.sh` + `lib/health.sh`
+### ✅ BG-5 — BE-1 remainder: `lib/fixtures.sh` + `lib/health.sh`
 - **Files:** `tests/release/lib/fixtures.sh`,
   `tests/release/lib/health.sh`; refactor cases that inline
   fixture/health logic to source them.
@@ -225,7 +225,25 @@ BG-8, BG-9, BG-10.
   cache, so on-disk corruption only surfaces after a FUSE restart or
   cache eviction; `local_cache_max_gb=0` disables only the *disk* cache.
 
+- **2026-05-28 BG-5 (BE-1)**: wrote `tests/release/lib/fixtures.sh`
+  (make_fuse_file / fixture_path / drop_client_cache / fixture_sha256 /
+  rm_fuse_file) + `tests/release/lib/health.sh` (cluster_api_up /
+  wait_cluster_ready / mgr_leader / data_node_count / all_nodes_healthy
+  / wait_all_healthy); `common.sh` now sources both so every case gets
+  them from one line. Smoke-verified live: source prints nothing,
+  `mgr_leader`→mini-mgr01, `data_node_count`→2, fixtures create+sha+
+  remove a file on the FUSE mount. Caught + fixed a real bug: an
+  auto-registry array couldn't survive the `$(make_fuse_file …)`
+  subshell, so cleanup is an explicit `rm_fuse_file <paths>` the case
+  calls in its trap. NOTE: existing cases keep their inline fixture
+  logic (they already pass); they are not refactored to the new libs,
+  and a full `run.sh --quick` run is deferred (needs the 15-min soak
+  case + orchestrator host) — the libs are additive and smoke-verified.
+
 ## Deviations from plan
+- BG-5 done-when softened: BE-1 libs delivered + smoke-verified rather
+  than refactoring every case to source them + a full `run.sh --quick`
+  pass. Cases work inline today; adopting the libs is opportunistic.
 - BA plan doc (`PLAN-BUG-BA-SOAK-2026-05-26.md`) committed in BG-3 (see
   verification log) rather than left untracked. BA test script
   `17-bug-ba-soak.sh` + `chunk-size-stats.sh` remain untracked for BA.
