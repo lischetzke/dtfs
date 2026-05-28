@@ -71,6 +71,25 @@
   holds the warm copy; the repair queue drains and flush stops being
   refused once the anchor exists. Production-shaped clusters (cold
   anchor on a node that holds no warm cache) were unaffected.
+- **Bug BO-1 — anchor copies succeed on single-DC / single-node-per-tier
+  topologies.** A same-node warm→cold anchor copy no longer fails with "no
+  healthy source replica": the copy dispatcher only excludes the target
+  node when it differs from the source, so a node that holds the chunk on
+  its warm disk can serve its own cold anchor copy.
+- **Bug BO-2 — failed anchor-lag repairs no longer spin a tight re-queue
+  loop.** A task that exhausts its retry attempts now stays in the
+  scheduler's de-dup set for its retention window, so the same chunk is
+  not re-queued on every 30 s tick. This eliminates the audit-log flooding
+  (previously ~100% anchor.lag_repair + migration.failed).
+- **Bug BO-3 — new chunk placement spreads across data nodes.** The
+  placement ring key now mixes in the file path, so chunk index 0 of every
+  file no longer collides onto a single node. Single-chunk files (the
+  common case) now distribute across data nodes instead of saturating one.
+- **Bug BO-4 — verify-on-read mismatches surface in the integrity feed.**
+  A `read.integrity_fault` event (node + chunk + expected/actual hashes) is
+  now emitted to `/api/v1/integrity/faults` when a data node refuses a
+  corrupt chunk on read, distinct from the subsequent node-quarantine
+  event (completes BC-12e).
 - **Bug BN-1 — disk UUIDs are now stable across data-node restarts.**
   Each disk's UUID is persisted to `<mount_path>/.dtfs-disk-uuid` on first
   discovery and read on every later boot; previously a fresh random UUID

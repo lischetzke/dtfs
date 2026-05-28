@@ -147,6 +147,7 @@ impl PlacementEngine {
     pub fn place_chunks_with_anchor(
         &self,
         volume_id: &str,
+        placement_seed: &str,
         num_chunks: u32,
         tier: DiskTier,
         replication_factor: u32,
@@ -169,7 +170,7 @@ impl PlacementEngine {
 
         let mut placements = Vec::with_capacity(num_chunks as usize);
         for i in 0..num_chunks {
-            let key = format!("{}:chunk:{}", volume_id, i);
+            let key = chunk_placement_key(volume_id, placement_seed, i);
             let hash = xxhash_rust::xxh3::xxh3_128(key.as_bytes());
             let mut chunk_id = [0u8; 32];
             chunk_id[..16].copy_from_slice(&hash.to_be_bytes());
@@ -188,5 +189,37 @@ impl PlacementEngine {
 impl Default for PlacementEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Bug BO-3 — ring key for a chunk's placement. Previously keyed on
+/// `{volume_id}:chunk:{index}` only, so chunk-index-0 of EVERY file hashed
+/// to the same key and landed on the same node — single-chunk files (the
+/// common case) all collided onto one data node, saturating it while peers
+/// sat at 0%. Mixing in a per-file `placement_seed` (the file path) spreads
+/// each file's chunks independently across the ring.
+pub(crate) fn chunk_placement_key(volume_id: &str, placement_seed: &str, index: u32) -> String {
+    format!("{volume_id}:{placement_seed}:chunk:{index}")
+}
+
+#[cfg(test)]
+mod bug_bo3_placement_key_tests {
+    use super::chunk_placement_key;
+
+    /// BO-3 — two different files' chunk-0 must yield DIFFERENT placement
+    /// keys (so single-chunk files spread across nodes), while the same
+    /// (volume, path, index) is stable.
+    #[test]
+    fn distinct_paths_yield_distinct_keys() {
+        let a = chunk_placement_key("default", "/a.bin", 0);
+        let b = chunk_placement_key("default", "/b.bin", 0);
+        assert_ne!(a, b, "chunk-0 of different files must not collide to one key");
+        // Deterministic for the same inputs.
+        assert_eq!(a, chunk_placement_key("default", "/a.bin", 0));
+        // Index still differentiates within a file.
+        assert_ne!(
+            chunk_placement_key("default", "/a.bin", 0),
+            chunk_placement_key("default", "/a.bin", 1),
+        );
     }
 }
