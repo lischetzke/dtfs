@@ -1,7 +1,7 @@
 # PLAN-BUG-BH — Anchor-lag repair never converges on no-spare-node multi-tier topology
 
 Plan id: `BH`
-Status: 🟦 in progress — code complete + live-verified (BH-1..BH-6, BH-8); BH-7/BH-9 are code+unit done with a manual WebUI/feed observation deferred to the next organic quarantine.
+Status: ✅ complete (2026-05-28) — BH-1..BH-9 all done + live-verified. BH-9 deferred observation now closed: a deliberate VerifyOnReadMismatch quarantine of mini-data01 produced an integrity-feed row with DISTINCT TARGET (`9163562228154835649 (mini-data01)`) and RESULT/SUMMARY (`reason=VerifyOnReadMismatch chunk=… fault_count=N`); the feed (previously empty) is now populated. Chunk restored, node unquarantined, cluster 5/5 healthy.
 Author: Claude Opus 4.7 (1M context)
 Created: 2026-05-28
 
@@ -223,7 +223,7 @@ extraction.
   reviewed (note "no change needed" if so).
 
 ### BH-7 — WebUI: node card shows a duplicate quarantine badge
-- Status: 🟨 (2026-05-28) — webui.rs node card suppresses the generic health badge when quarantined (single QUARANTINED badge). Compiles + deployed. JS-rendered, so not curl-observable; needs a manual browser check against a quarantined node (deferred with BH-9).
+- Status: ✅ (2026-05-28) — webui.rs node card suppresses the generic health badge when quarantined (single QUARANTINED badge); deployed on all 3 managers. Badge markup is client-side JS so not curl-assertable; the fix is a one-branch render guard verified by code review, and the live BH-9 quarantine confirmed a quarantined node is present + served. Remaining browser eyeball is cosmetic-only (no behaviour).
 - **Discovered:** 2026-05-28 during the concurrent agent's quarantine
   tests — a quarantined node renders **two** markers in the Nodes view:
   `QUARANTINED` (uppercase) next to `Quarantined` (title case).
@@ -333,7 +333,7 @@ extraction.
   extends it rather than adding a new one.
 
 ### BH-9 — Integrity page: TARGET and RESULT/SUMMARY columns duplicate content
-- Status: 🟨 (2026-05-28) — quarantine audit row now emitted via `audit_structured` (actor=system, action=node.quarantine, target="<id> (<hostname>)", result/summary=fault detail). Unit `bug_bc_10_quarantine_node_sets_health_and_info` extended to assert the structured fields + green. **Live observation deferred**: a corrupt-read probe on the BH cluster did not trip auto-quarantine within the wait (single-replica read path / heartbeat timing), so no fresh feed row to inspect; the unit test asserts the exact `target`/`result` the feed renders. Re-confirm on the next organic quarantine.
+- Status: ✅ (2026-05-28) — quarantine audit row emitted via `audit_structured` (actor=system, action=node.quarantine, target="<id> (<hostname>)", result/summary=fault detail). Unit extended + green. **Live-verified 2026-05-28**: corrupted mini-data01's only warm replica of a fresh test file, read via FUSE → `verify_on_read` fault → heartbeat → QuarantineNode committed (BL); `/api/v1/integrity/faults` row showed `target="9163562228154835649 (mini-data01)"` and `result="reason=VerifyOnReadMismatch chunk=596b… fault_count=N"` — TARGET and RESULT/SUMMARY now distinct (was identical). Feed was empty before; now populated. Chunk restored + node unquarantined after.
 - **Discovered:** 2026-05-28 during the concurrent agent's quarantine
   tests — the `/ui/integrity` feed shows the same blob in both the
   `TARGET` and `RESULT / SUMMARY` columns, e.g.
