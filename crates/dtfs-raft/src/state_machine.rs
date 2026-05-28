@@ -1067,6 +1067,11 @@ fn apply_request(
                     );
                     return ClientResponse::Success;
                 }
+                // Bug BN-2 — only audit a genuine health transition. The
+                // health monitor + heartbeat path apply UpdateNodeStatus
+                // ("healthy") on every cycle; auditing each one spammed the
+                // log (~24 rows/min) and evicted real events against the cap.
+                let old_health = node.health;
                 match status.as_str() {
                     "healthy" => node.health = HealthStatus::Healthy,
                     "suspect" => node.health = HealthStatus::Suspect,
@@ -1079,10 +1084,14 @@ fn apply_request(
                         warn!("unknown node status: {other}");
                     }
                 }
-                push_audit_capped(
-                    &mut sm.audit_log,
-                    audit(format!("UpdateNodeStatus: {node_id} -> {status}")),
-                );
+                if node.health != old_health {
+                    push_audit_capped(
+                        &mut sm.audit_log,
+                        audit(format!(
+                            "UpdateNodeStatus: {node_id} {old_health:?} -> {status}"
+                        )),
+                    );
+                }
                 ClientResponse::Success
             } else {
                 ClientResponse::Error {
@@ -1169,10 +1178,10 @@ fn apply_request(
                 if *observed_at_ms > 0 {
                     node.last_seen_ms = *observed_at_ms;
                 }
-                push_audit_capped(
-                    &mut sm.audit_log,
-                    audit(format!("UpdateNodeUsage: {node_id} used={used_capacity}")),
-                );
+                // Bug BN-2 — no audit row. Usage counters + last_seen_ms are
+                // pure telemetry (exposed live via /api/v1/nodes); data nodes
+                // send this every 5 s, so auditing it flooded the log and
+                // evicted genuine integrity events against the cap.
                 ClientResponse::Success
             } else {
                 ClientResponse::Error {
@@ -3551,5 +3560,53 @@ mod posix_path_regression {
         migrate_scrub_results_by_level(&mut sm);
         assert_eq!(sm.scrub_results_by_level.get(&7).unwrap().len(), 2,
             "migration is a no-op once the nested map is populated");
+    }
+
+    // ── Bug BN-2 — heartbeat audit spam suppression ─────────────────
+
+    fn count_audit_prefix(sm: &StateMachineData, prefix: &str) -> usize {
+        sm.audit_log.iter().filter(|e| e.summary.starts_with(prefix)).count()
+    }
+
+    #[test]
+    fn bug_bn2_update_node_usage_emits_no_audit() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() });
+        let before = sm.audit_log.len();
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::UpdateNodeUsage {
+            node_id: 7, used_capacity: 123, chunk_count: 4,
+            total_bytes_read: 5, total_bytes_written: 6, observed_at_ms: 1_000,
+        });
+        assert_eq!(sm.audit_log.len(), before,
+            "UpdateNodeUsage is telemetry — it must add no audit row");
+    }
+
+    #[test]
+    fn bug_bn2_update_node_status_no_audit_without_transition() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() });
+        // mk_quarantinable_node() is Healthy; applying "healthy" twice is a
+        // no-op transition each time.
+        apply_request(&mut sm, &mk_log_id(2),
+            &ClientRequest::UpdateNodeStatus { node_id: 7, status: "healthy".into() });
+        apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::UpdateNodeStatus { node_id: 7, status: "healthy".into() });
+        assert_eq!(count_audit_prefix(&sm, "UpdateNodeStatus:"), 0,
+            "Healthy -> Healthy must not audit");
+    }
+
+    #[test]
+    fn bug_bn2_update_node_status_audits_real_transition() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() });
+        apply_request(&mut sm, &mk_log_id(2),
+            &ClientRequest::UpdateNodeStatus { node_id: 7, status: "suspect".into() });
+        apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::UpdateNodeStatus { node_id: 7, status: "healthy".into() });
+        assert_eq!(count_audit_prefix(&sm, "UpdateNodeStatus:"), 2,
+            "Healthy->Suspect then Suspect->Healthy = two transitions = two rows");
     }
 }

@@ -1,7 +1,7 @@
 # PLAN-BUG-BN — Persistent disk UUIDs + heartbeat audit spam
 
 Plan id: `BN`
-Status: 🟦 in progress
+Status: 🟦 code complete (2026-05-28) — BN-1..BN-4 code + unit tests green (dtfs-data 68/68, dtfs-raft 52/52); release cases 26/27 written; deploy + live verification pending.
 Author: Claude Sonnet 4.6
 Created: 2026-05-28
 Sources: BJ Deviations (disk UUID follow-up candidate); live audit feed observation post-BJ
@@ -77,7 +77,7 @@ No data-model changes. Two call sites in `state_machine.rs` are modified in plac
 ## 3. Task list
 
 ### BN-1 — Persist disk UUID to mount-path file
-- Status: ⬜
+- Status: ✅ code (2026-05-28) — `load_or_create_disk_uuid(&Path)` in store.rs; main.rs disk-build calls it with graceful fresh-UUID fallback on I/O error. 3 unit tests (stable, corrupt-regenerated, valid-not-rewritten) green; dtfs-data 68/68. Live restart check via case 26 pending deploy.
 - **Files:** `crates/dtfs-data/src/store.rs` (new helper), `crates/dtfs-data/src/main.rs` (call site)
 - **Implementation sketch:**
   Add a helper in `store.rs` (or a new `disk_uuid.rs` module if cleaner):
@@ -123,7 +123,7 @@ No data-model changes. Two call sites in `state_machine.rs` are modified in plac
   restarts.
 
 ### BN-2 — Suppress heartbeat audit spam (UpdateNodeUsage + UpdateNodeStatus)
-- Status: ⬜
+- Status: ✅ code (2026-05-28) — `UpdateNodeUsage` arm: `push_audit_capped` removed (pure telemetry). `UpdateNodeStatus` arm: captures `old_health` after the BF-6 quarantine early-return, audits only when `node.health != old_health`. 3 unit tests (usage no-audit, status no-transition, status real-transition) green; dtfs-raft 52/52. `grep push_audit_capped` confirms no other unconditional heartbeat-path audit remains.
 - **Files:** `crates/dtfs-raft/src/state_machine.rs`
 - **Implementation sketch:**
 
@@ -163,7 +163,7 @@ No data-model changes. Two call sites in `state_machine.rs` are modified in plac
   on genuine health transitions.
 
 ### BN-3 — Release-suite coverage
-- Status: ⬜
+- Status: ✅ code (2026-05-28) — `tests/release/cases/26-disk-uuid-stable.sh` (restart data node, assert disk UUID set unchanged) + `27-heartbeat-audit-suppressed.sh` (wait 6 cycles, assert UpdateNodeUsage audit rows stay 0). Auto-discovered by run.sh full mode. Live PASS pending deploy.
 - **Files:** `tests/release/cases/NN-disk-uuid-stable.sh`,
   `tests/release/cases/NN-heartbeat-audit-suppressed.sh`,
   `tests/release/run.sh`
@@ -180,7 +180,7 @@ No data-model changes. Two call sites in `state_machine.rs` are modified in plac
   Required per AGENTS.md § B.5.1 (cluster-visible: node registry + audit feed).
 
 ### BN-4 — Docs + changelog
-- Status: ⬜
+- Status: ✅ (2026-05-28) — `changelog/UNRELEASED.md` Bug BN-1 (stable disk UUIDs + operator wipe note) and Bug BN-2 (heartbeat telemetry no longer audited; status audits only on transition) entries added.
 - **Files:** `changelog/UNRELEASED.md`
 - **Entries:**
   1. Disk UUIDs now persisted to `<mount_path>/.dtfs-disk-uuid` and stable across

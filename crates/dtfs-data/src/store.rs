@@ -12,6 +12,42 @@ use tokio::io::AsyncWriteExt;
 
 use crate::disk::DiskManager;
 
+/// Bug BN-1 — load a stable per-disk UUID from `<mount_path>/.dtfs-disk-uuid`,
+/// creating it on first discovery. Previously every data-node boot minted a
+/// fresh random UUID (`Uuid::new_v4`), defeating UUID-based disk identity
+/// (placement dedup, scrub tracking) and forcing BJ's `disks_identity_eq` to
+/// key on `mount_path`. The file is written once and read on every later boot,
+/// so a disk keeps its identity until it is wiped/reformatted.
+///
+/// Returns an error only on I/O failure; the caller falls back to a fresh
+/// random UUID (read-only mount, ENOSPC, permissions) rather than crashing the
+/// boot loop. A corrupt/garbage file is transparently regenerated.
+pub fn load_or_create_disk_uuid(mount_path: &Path) -> std::io::Result<String> {
+    let uuid_file = mount_path.join(".dtfs-disk-uuid");
+    if uuid_file.exists() {
+        let s = std::fs::read_to_string(&uuid_file)?.trim().to_string();
+        if uuid::Uuid::parse_str(&s).is_ok() {
+            return Ok(s);
+        }
+        tracing::warn!(
+            "disk UUID file {:?} is corrupt ({:?}); regenerating",
+            uuid_file,
+            s
+        );
+    }
+    let u = uuid::Uuid::new_v4().to_string();
+    std::fs::write(&uuid_file, &u)?;
+    // fsync the file + parent dir so the identity survives a crash right
+    // after first provisioning.
+    if let Ok(f) = std::fs::File::open(&uuid_file) {
+        let _ = f.sync_all();
+    }
+    if let Ok(d) = std::fs::File::open(mount_path) {
+        let _ = d.sync_all();
+    }
+    Ok(u)
+}
+
 /// A lightweight stats snapshot for heartbeat reporting.
 #[derive(Debug, Clone, Default)]
 pub struct ChunkStoreStats {
@@ -1060,6 +1096,41 @@ mod tests {
     use super::*;
     use dtfs_common::types::DiskTier;
     use tempfile::TempDir;
+
+    // ── Bug BN-1 — persistent disk UUID ────────────────────────────
+
+    #[test]
+    fn disk_uuid_stable_across_calls() {
+        let tmp = TempDir::new().unwrap();
+        let first = load_or_create_disk_uuid(tmp.path()).unwrap();
+        let second = load_or_create_disk_uuid(tmp.path()).unwrap();
+        assert_eq!(first, second, "UUID must be stable across boots");
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+        assert!(tmp.path().join(".dtfs-disk-uuid").exists());
+    }
+
+    #[test]
+    fn disk_uuid_corrupt_file_regenerated() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".dtfs-disk-uuid"), "not-a-uuid\n").unwrap();
+        let u = load_or_create_disk_uuid(tmp.path()).unwrap();
+        assert!(uuid::Uuid::parse_str(&u).is_ok(), "corrupt file regenerated to a valid UUID");
+        // and the regenerated value now persists
+        assert_eq!(u, load_or_create_disk_uuid(tmp.path()).unwrap());
+    }
+
+    #[test]
+    fn disk_uuid_valid_file_not_rewritten() {
+        let tmp = TempDir::new().unwrap();
+        let first = load_or_create_disk_uuid(tmp.path()).unwrap();
+        let f = tmp.path().join(".dtfs-disk-uuid");
+        let mtime0 = std::fs::metadata(&f).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = load_or_create_disk_uuid(tmp.path()).unwrap();
+        let mtime1 = std::fs::metadata(&f).unwrap().modified().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(mtime0, mtime1, "valid UUID file must not be rewritten on read");
+    }
 
     async fn make_test_store() -> (ChunkStore, TempDir) {
         let tmp = TempDir::new().unwrap();
