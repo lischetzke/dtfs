@@ -64,7 +64,7 @@ home plan (AV, BA) and is only cross-referenced here.
 
 ## Phase 1 — Hygiene (reconcile the tree)
 
-### ⬜ BG-1 — Commit the untracked BE release harness
+### ✅ BG-1 — Commit the untracked BE release harness  (commit 3469ac5)
 - **Files:** `tests/release/run.sh`, `tests/release/lib/common.sh`,
   `tests/release/cases/00-…20-*.sh` (20 cases),
   `docs/src/operations/release-testing.md`.
@@ -75,7 +75,7 @@ home plan (AV, BA) and is only cross-referenced here.
 - **Done when:** `git status` shows `tests/release/` tracked; harness
   files unchanged from current working-tree content.
 
-### ⬜ BG-2 — Reconcile stale plan markers
+### ✅ BG-2 — Reconcile stale plan markers  (commit 22e2c60)
 - **Files:** `plans/active/PLAN-BUG-BC-SCRUB.md`,
   `PLAN-BUG-BD-CONFIG-PANE.md`, `PLAN-BUG-AZ-WEBUI-INSTALL-CONFIG.md`,
   `PLAN-BUG-BE-E2E-RELEASE.md`.
@@ -86,7 +86,7 @@ home plan (AV, BA) and is only cross-referenced here.
 - **Done when:** no false ⬜ remains; every ⬜ left is genuinely open or
   redirected to a BG task.
 
-### ⬜ BG-3 — Archive completed plans
+### ✅ BG-3 — Archive completed plans  (commit 4ddbec7)
 - **Files:** `git mv` →
   `plans/completed/2026-05-28-PLAN-BUG-BF-FOLLOWUPS.md`,
   `…-PLAN-BUG-BD-CONFIG-PANE.md`,
@@ -192,4 +192,25 @@ BG-8, BG-9, BG-10.
 - (empty — fill during execution)
 
 ## Verification log
-- (empty — fill during execution)
+- **2026-05-28 BG-1** (`3469ac5`): committed untracked `tests/release/`
+  (run.sh + lib/common.sh + patch.py + 20 cases) + release-testing.md.
+  No behaviour change. Build/run verification (run.sh --quick) deferred
+  to the lab cluster — Windows host cannot build.
+- **2026-05-28 BG-2** (`22e2c60`): flipped done markers in BC/BD/AZ/BE;
+  post-edit grep confirms only BC-9, BE-1(🟨), BE-22 remain open, all
+  redirected to BG. PLAN-BUG-BE-E2E-RELEASE.md now tracked.
+- **2026-05-28 BG-3** (`4ddbec7`): `git mv` of BF/BD/AZ/BC plans to
+  plans/completed/ (rename-only, 0 content delta); `plans/active/` =
+  {BG, BE, AV, BA}; fixed scope.md link + api.rs comment cross-refs.
+  Note: the previously-untracked BA plan doc was swept into this commit
+  by `git add -A plans/` — harmless (a plan doc that needed tracking),
+  but landed here rather than under a BA commit.
+
+## Deviations from plan
+- BA plan doc (`PLAN-BUG-BA-SOAK-2026-05-26.md`) committed in BG-3 (see
+  verification log) rather than left untracked. BA test script
+  `17-bug-ba-soak.sh` + `chunk-size-stats.sh` remain untracked for BA.
+- Phase 2/3 (BG-4..BG-10) are code/build tasks requiring the Linux/WSL
+  builder + lab; not executable from the Windows host. Paused at the
+  Phase 1→2 boundary for review (AGENTS § B.4: keep work local at phase
+  boundaries).
