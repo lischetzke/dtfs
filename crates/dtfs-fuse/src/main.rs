@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
-// Mitigate rustc 1.94.x ICE in dead_code analysis (see ISSUES_TO_FIX.md #12).
+// Mitigate rustc 1.94.x ICE in dead_code analysis.
 
 // DTFS FUSE Client Mount — Phase 2 (Linux: fuse3 mount).
 //
