@@ -1805,7 +1805,7 @@ struct AuditQuery {
 }
 
 /// Bug BC-12b — list of action prefixes the integrity feed surfaces.
-/// Order matches the section in PLAN-BUG-BC-SCRUB.md § 4.5.
+/// Order matches the section in plans/completed/2026-05-28-PLAN-BUG-BC-SCRUB.md § 4.5.
 const INTEGRITY_ACTIONS: &[&str] = &[
     "node.quarantine",
     "node.unquarantine",
