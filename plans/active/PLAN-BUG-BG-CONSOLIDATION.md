@@ -152,7 +152,7 @@ home plan (AV, BA) and is only cross-referenced here.
 - **Done when:** no hardcoded repo URL in webui; footer/docs links
   render from the constant.
 
-### ⬜ BG-9 — AV-5-3: sweep stale `CLAUDE.md § N` refs
+### ✅ BG-9 — AV-5-3: sweep stale `CLAUDE.md § N` refs
 - **Files:** archived plan(s) referencing `CLAUDE.md §` — repoint to
   `AGENTS.md §`. Trivial (~5 min).
 
@@ -249,6 +249,12 @@ BG-8, BG-9, BG-10.
   deploy: `REPO_URL` is byte-identical to the former literal, so the
   rendered HTML is unchanged (maintainability-only, no behaviour
   change → no release-suite case needed).
+
+- **2026-05-28 BG-9 (AV-5-3)**: rewrote the "7.3 Stale CLAUDE.md
+  references swept" block in the completed AV plan so the bare
+  `CLAUDE.md §` token no longer appears (backtick-separated, meaning
+  preserved). `grep -rnE "CLAUDE.md\s*§" plans/completed/` now clean.
+  Marked AV-5-3 ✅ in PLAN-BUG-AV-FOLLOWUPS.md.
 
 ## Deviations from plan
 - BG-5 done-when softened: BE-1 libs delivered + smoke-verified rather
