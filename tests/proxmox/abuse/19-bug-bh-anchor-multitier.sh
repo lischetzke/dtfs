@@ -57,6 +57,38 @@ for i in 1 2; do
     client_run "sudo cat $MOUNT${PREFIX}f$i.bin > /dev/null; sleep 1; sudo cat $MOUNT${PREFIX}f$i.bin > /dev/null"
 done
 
+skip() { echo "[BH] SKIP: $*"; exit 0; }
+
+# Precondition: the BH bug only manifests when the chunk's warm replica
+# is on EVERY data node (no spare node free of the chunk). If the volume
+# config left a spare node, the cold target is free and flush would
+# never be refused regardless of the fix. Detect; SKIP if absent.
+DATA_IPS=${DATA_IPS:-10.150.0.174 10.150.0.175}
+data_run() { ssh "${SSH_OPTS[@]}" "debian@$1" "$2"; }
+warm_on_all_data() {
+    local cid="$1" holders=0
+    for d in $DATA_IPS; do
+        if [ -n "$(data_run "$d" "sudo find /mnt -name '$cid.dat' 2>/dev/null | head -1")" ]; then
+            holders=$((holders+1))
+        fi
+    done
+    [ "$holders" -ge "$(echo $DATA_IPS | wc -w)" ]
+}
+
+step "establish no-spare-node precondition (warm replica on every data node)"
+CID=$(mgr_get "/api/v1/files/inspect?path=${PREFIX}f1.bin" \
+    | python3 -c "import json,sys
+try: print(json.load(sys.stdin)['chunks'][0]['chunk_id'])
+except Exception: pass")
+[ -n "$CID" ] || skip "could not resolve chunk id for ${PREFIX}f1.bin"
+pre_deadline=$(( $(date +%s) + 60 ))
+until warm_on_all_data "$CID"; do
+    [ "$(date +%s)" -ge "$pre_deadline" ] && \
+        skip "warm cache did not land on every data node for this volume config — BH no-spare-node condition not reproduced (canonical check: flush a warm-on-all prefix, e.g. /soak/)"
+    sleep 5
+done
+ok "warm replica present on every data node — precondition met"
+
 step "poll until anchor-lag repair records the cold anchor (flush stops refusing)"
 deadline=$(( $(date +%s) + WINDOW_SECS ))
 while :; do

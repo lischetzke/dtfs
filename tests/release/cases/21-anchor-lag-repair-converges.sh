@@ -47,7 +47,33 @@ sys.exit(0 if ref == 0 else 1)
 "
 }
 
-echo "[2/3] wait for anchor-lag repair to record the cold anchor"
+# Precondition: the BH bug only manifests when the chunk's warm cache
+# replica lands on EVERY data node (no spare node free of the chunk in
+# the anchor DC). On a volume whose cache_replicas.warm.min < data-node
+# count, a couple of reads may leave a spare node, in which case the
+# cold target is free and flush would never be refused regardless of the
+# fix — not a meaningful test. Detect the precondition; SKIP if absent.
+DATA_N=$(data_list | wc -w)
+warm_on_all() {
+    local cid holders
+    cid=$(chunk_ids_for_path "${PREFIX}f1.bin" | head -1)
+    [ -n "$cid" ] || return 1
+    holders=0
+    for h in $(data_list); do
+        if host_has_chunk "$h" "$cid"; then holders=$((holders+1)); fi
+    done
+    [ "$holders" -ge "$DATA_N" ]
+}
+
+echo "[2/4] establish no-spare-node precondition (warm on all $DATA_N data nodes)"
+if ! wait_for_soft 60 warm_on_all; then
+    skip "warm cache did not land on all $DATA_N data nodes for this volume \
+config (cache_replicas.warm.min < data-node count) — BH no-spare-node \
+condition not reproduced; canonical verification is a flush over a \
+warm-on-all prefix (see BH-6 /soak/ live proof)"
+fi
+
+echo "[3/4] wait for anchor-lag repair to record the cold anchor"
 wait_for 150 "flush stops refusing (cold anchor recorded by repair)" flush_not_refused
 
 echo "[3/3] confirm no AnchorViolated alert fired on the successful flush"
