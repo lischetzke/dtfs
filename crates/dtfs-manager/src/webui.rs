@@ -251,6 +251,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             font-size: .75rem; font-weight: 600; text-transform: uppercase;
             letter-spacing: .06em; color: var(--text-muted); margin-bottom: .875rem;
         }}
+        .scrub-result {{ padding: .75rem 0; }}
+        .scrub-result + .scrub-result {{ border-top: 1px solid var(--border); margin-top: .25rem; }}
         .scrub-meta {{ display: flex; flex-wrap: wrap; gap: .5rem 2rem; margin-bottom: .875rem; }}
         .scrub-meta-item {{ font-size: .85rem; }}
         .scrub-meta-item span {{ color: var(--text-muted); margin-right: .3rem; }}
@@ -862,8 +864,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         // ── Tier breakdown
         renderTierBreakdown(stats.tier_breakdown || []);
 
-        // ── Last scrub
-        renderScrub(stats.last_scrub);
+        // ── Scrub results (one card per node + level)
+        renderScrub(stats.scrub_results_by_node || []);
 
         // ── Nodes table
         renderNodes(nodes);
@@ -914,13 +916,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         document.getElementById('health-right').textContent = right;
     }}
 
-    function renderScrub(s) {{
-        const el = document.getElementById('scrub-content');
-        if (!s) {{
-            el.innerHTML = '<div class="scrub-placeholder">No scrub result recorded yet. ' +
-                'Run <code>dtfs-cli scrub --level deep</code> to trigger one.</div>';
-            return;
-        }}
+    function renderScrubCard(s) {{
         const when = new Date(s.completed_at_ms).toLocaleString();
         const ago  = timeAgo(s.completed_at_ms);
         const dur  = fmtDuration(s.duration_secs);
@@ -928,7 +924,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             ? '<span class="badge badge-healthy">Deep</span>'
             : '<span class="badge badge-warm">Quick</span>';
 
-        el.innerHTML = `
+        return `
+            <div class="scrub-result">
             <div class="scrub-meta">
                 <div class="scrub-meta-item">${{lvlBadge}}</div>
                 <div class="scrub-meta-item"><span>Node:</span> ${{s.node_id}}</div>
@@ -953,7 +950,23 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     <div class="stat-val">${{s.chunks_missing.toLocaleString()}}</div>
                     <div class="stat-lbl">Missing</div>
                 </div>
+            </div>
             </div>`;
+    }}
+
+    // BK — list every retained scrub result (one card per node + level),
+    // not just the single most-recent. Sort by node_id then level so the
+    // Quick / Deep pair for each node renders together.
+    function renderScrub(list) {{
+        const el = document.getElementById('scrub-content');
+        if (!list || !list.length) {{
+            el.innerHTML = '<div class="scrub-placeholder">No scrub result recorded yet. ' +
+                'Run <code>dtfs-cli scrub --level deep</code> to trigger one.</div>';
+            return;
+        }}
+        const sorted = [...list].sort((a, b) =>
+            (a.node_id - b.node_id) || String(a.level).localeCompare(String(b.level)));
+        el.innerHTML = sorted.map(renderScrubCard).join('');
     }}
 
     // Bug AN — stable sort + per-role grouping for the Home page "Data &
@@ -2708,6 +2721,33 @@ mod bug_bi_nav_caret_tests {
         assert!(
             html.contains('▾'),
             "nav caret should render the literal ▾ glyph"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bug_bk_scrub_tests {
+    use super::*;
+
+    /// Bug BK — the scrub card must list every retained result (per node +
+    /// level), not just the single most-recent. The render path iterates
+    /// `stats.scrub_results_by_node` and emits one card per entry, each
+    /// carrying its own Quick/Deep badge. Assert the template wires the
+    /// array (not the scalar `last_scrub`) and carries both badge labels.
+    #[test]
+    fn scrub_lists_all_levels() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        assert!(
+            html.contains("renderScrub(stats.scrub_results_by_node"),
+            "scrub render must consume the per-(node,level) array, not last_scrub"
+        );
+        assert!(
+            html.contains(">Deep<") && html.contains(">Quick<"),
+            "both Quick and Deep level badges must be present in the scrub card template"
+        );
+        assert!(
+            html.contains("renderScrubCard"),
+            "per-entry card renderer should be present"
         );
     }
 }
