@@ -74,6 +74,17 @@ Use only the categories that actually have content:
 
 ## Cutting a release
 
+**Release gate (Bug BE):** before tagging, run the end-to-end release
+suite against a representative cluster and confirm every case is `PASS`
+or a `KNOWN_ISSUE` pinned to a tracked follow-up:
+
+```bash
+bash tests/release/run.sh            # full suite
+bash tests/release/run.sh --quick    # ~15-min critical-path subset
+```
+
+Do not tag a release with an unexplained `FAIL`. Then:
+
 1. Add the version header at the top of `UNRELEASED.md`:
 
    ```markdown
