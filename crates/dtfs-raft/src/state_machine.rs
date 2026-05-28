@@ -193,6 +193,16 @@ pub struct StateMachineData {
     #[serde(default)]
     pub scrub_results: BTreeMap<u64, ScrubRecord>,
 
+    /// Latest scrub result per `(node_id, level)` (BK). The legacy
+    /// `scrub_results` map above is single-per-node, so a deep scrub
+    /// overwrites the quick result (and vice versa). This nested map
+    /// retains the latest of each level: outer key = node_id, inner key =
+    /// level (`"quick"` / `"deep"`). The legacy map is kept populated with
+    /// the node's most-recent record for one release of snapshot
+    /// back-compat (an older manager binary mid-roll still renders it).
+    #[serde(default)]
+    pub scrub_results_by_level: BTreeMap<u64, BTreeMap<String, ScrubRecord>>,
+
     /// Number of registered FUSE clients (updated by client heartbeats).
     pub client_count: u64,
 
@@ -232,6 +242,7 @@ impl Default for StateMachineData {
             cluster_config: ClusterConfig::default(),
             audit_log: Vec::new(),
             scrub_results: BTreeMap::new(),
+            scrub_results_by_level: BTreeMap::new(),
             client_count: 0,
             volumes: BTreeMap::new(),
             migration_state_json: String::new(),
@@ -475,6 +486,8 @@ impl StateMachineStore {
             sm.cluster_config = snap.cluster_config;
             sm.audit_log = snap.audit_log;
             sm.scrub_results = snap.scrub_results;
+            sm.scrub_results_by_level = snap.scrub_results_by_level;
+            migrate_scrub_results_by_level(&mut sm);
             sm.client_count = snap.client_count;
             sm.volumes = snap.volumes;
             sm.migration_state_json = snap.migration_state_json;
@@ -565,6 +578,7 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
             cluster_config: sm.cluster_config.clone(),
             audit_log: sm.audit_log.clone(),
             scrub_results: sm.scrub_results.clone(),
+            scrub_results_by_level: sm.scrub_results_by_level.clone(),
             client_count: sm.client_count,
             volumes: sm.volumes.clone(),
             migration_state_json: sm.migration_state_json.clone(),
@@ -695,6 +709,8 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             sm.cluster_config = snap_data.cluster_config;
             sm.audit_log = snap_data.audit_log;
             sm.scrub_results = snap_data.scrub_results;
+            sm.scrub_results_by_level = snap_data.scrub_results_by_level;
+            migrate_scrub_results_by_level(&mut sm);
             sm.client_count = snap_data.client_count;
             sm.volumes = snap_data.volumes;
             sm.migration_state_json = snap_data.migration_state_json;
@@ -750,6 +766,24 @@ fn push_audit_capped(log: &mut Vec<AuditEntry>, entry: AuditEntry) {
     if log.len() > MAX_AUDIT_LOG_ENTRIES {
         let excess = log.len() - MAX_AUDIT_LOG_ENTRIES;
         log.drain(..excess);
+    }
+}
+
+/// Bug BK — one-shot migration on snapshot restore: when the nested
+/// `scrub_results_by_level` map is empty but the legacy single-per-node
+/// `scrub_results` map has entries (a snapshot written by a pre-BK
+/// manager binary), seed the nested map from the legacy records keyed by
+/// each record's own `level`. Idempotent: a no-op once the nested map is
+/// populated.
+fn migrate_scrub_results_by_level(sm: &mut StateMachineData) {
+    if !sm.scrub_results_by_level.is_empty() {
+        return;
+    }
+    for (node_id, record) in &sm.scrub_results {
+        sm.scrub_results_by_level
+            .entry(*node_id)
+            .or_default()
+            .insert(record.level.clone(), record.clone());
     }
 }
 
@@ -1194,10 +1228,15 @@ fn apply_request(
                 chunks_missing: *chunks_missing,
                 duration_secs: *duration_secs,
             };
-            // Store per-node: each data node maintains its own latest result.
-            // Previously only the single most-recent cluster-wide result was
-            // kept, which caused a fast scrub on node B to silently drop node
-            // A's result (fix for issue #8).
+            // BK — store per (node, level) so a deep scrub does not
+            // overwrite the quick result (and vice versa). The legacy
+            // per-node map is kept populated with the node's most-recent
+            // record for one release of snapshot back-compat (an older
+            // manager binary mid-roll still renders something).
+            sm.scrub_results_by_level
+                .entry(*node_id)
+                .or_default()
+                .insert(level.clone(), record.clone());
             sm.scrub_results.insert(*node_id, record);
             push_audit_capped(&mut sm.audit_log, audit(format!(
                 "ScrubResult: node={node_id} disk={disk_path} level={level} \
@@ -3437,5 +3476,80 @@ mod posix_path_regression {
             },
         );
         assert!(matches!(resp, ClientResponse::Error { .. }));
+    }
+
+    // ── Bug BK — scrub results per (node, level) ────────────────────
+
+    fn mk_scrub_req(node_id: u64, level: &str, completed_at_ms: u64) -> ClientRequest {
+        ClientRequest::ReportScrubResult {
+            node_id,
+            disk_path: "/mnt/d0".into(),
+            level: level.into(),
+            completed_at_ms,
+            chunks_checked: 10,
+            chunks_healthy: 10,
+            chunks_corrupt: 0,
+            chunks_missing: 0,
+            duration_secs: 1.0,
+        }
+    }
+
+    #[test]
+    fn scrub_quick_then_deep_both_retained() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &mk_scrub_req(7, "quick", 1_000));
+        apply_request(&mut sm, &mk_log_id(2), &mk_scrub_req(7, "deep", 2_000));
+        let by_level = sm.scrub_results_by_level.get(&7).expect("node 7 present");
+        assert!(by_level.contains_key("quick"), "quick result retained");
+        assert!(by_level.contains_key("deep"), "deep result retained");
+        assert_eq!(by_level.len(), 2, "both levels coexist (deep did not overwrite quick)");
+        // Same level re-reports → overwrite (latest of each level).
+        apply_request(&mut sm, &mk_log_id(3), &mk_scrub_req(7, "quick", 3_000));
+        let by_level = sm.scrub_results_by_level.get(&7).unwrap();
+        assert_eq!(by_level.len(), 2);
+        assert_eq!(by_level.get("quick").unwrap().completed_at_ms, 3_000,
+            "latest quick replaces the earlier quick");
+    }
+
+    #[test]
+    fn scrub_snapshot_roundtrip_preserves_levels() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &mk_scrub_req(7, "quick", 1_000));
+        apply_request(&mut sm, &mk_log_id(2), &mk_scrub_req(7, "deep", 2_000));
+        // Round-trip the nested map through serde (snapshot uses JSON).
+        let json = serde_json::to_string(&sm.scrub_results_by_level).unwrap();
+        let restored: std::collections::BTreeMap<u64, std::collections::BTreeMap<String, ScrubRecord>> =
+            serde_json::from_str(&json).unwrap();
+        let by_level = restored.get(&7).expect("node 7 survives round-trip");
+        assert!(by_level.contains_key("quick") && by_level.contains_key("deep"),
+            "both levels survive snapshot serialize/deserialize");
+    }
+
+    #[test]
+    fn scrub_legacy_snapshot_migrates() {
+        // Simulate a pre-BK snapshot: only the legacy single-per-node map is
+        // populated; the nested map is empty. migrate_* must seed it.
+        let mut sm = StateMachineData::default();
+        sm.scrub_results.insert(7, ScrubRecord {
+            node_id: 7,
+            disk_path: "/mnt/d0".into(),
+            level: "deep".into(),
+            completed_at_ms: 5_000,
+            chunks_checked: 3,
+            chunks_healthy: 3,
+            chunks_corrupt: 0,
+            chunks_missing: 0,
+            duration_secs: 0.5,
+        });
+        assert!(sm.scrub_results_by_level.is_empty());
+        migrate_scrub_results_by_level(&mut sm);
+        let by_level = sm.scrub_results_by_level.get(&7).expect("migrated");
+        assert!(by_level.contains_key("deep"),
+            "legacy record migrates into nested map keyed by its own level");
+        // Idempotent: a second call must not clobber freshly-applied entries.
+        apply_request(&mut sm, &mk_log_id(1), &mk_scrub_req(7, "quick", 6_000));
+        migrate_scrub_results_by_level(&mut sm);
+        assert_eq!(sm.scrub_results_by_level.get(&7).unwrap().len(), 2,
+            "migration is a no-op once the nested map is populated");
     }
 }

@@ -41,6 +41,12 @@ pub struct StateMachineSnapshot {
     #[serde(default)]
     pub scrub_results: BTreeMap<u64, ScrubRecord>,
 
+    /// BK — latest scrub result per `(node_id, level)`. `#[serde(default)]`
+    /// keeps pre-BK snapshots loadable; on restore the nested map is seeded
+    /// from the legacy `scrub_results` when empty (state_machine migration).
+    #[serde(default)]
+    pub scrub_results_by_level: BTreeMap<u64, BTreeMap<String, ScrubRecord>>,
+
     /// Number of registered FUSE clients (updated by client heartbeats).
     #[serde(default)]
     pub client_count: u64,
@@ -106,6 +112,7 @@ mod tests {
             cluster_config: ClusterConfig::default(),
             audit_log: Vec::new(),
             scrub_results: BTreeMap::new(),
+            scrub_results_by_level: BTreeMap::new(),
             client_count: 0,
             volumes: BTreeMap::new(),
             migration_state_json: String::new(),
