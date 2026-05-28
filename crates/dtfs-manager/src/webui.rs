@@ -127,7 +127,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         }}
         .nav .nav-group {{ position: relative; }}
         .nav .nav-group > button::after {{
-            content: ' \\25BE'; font-size: .7rem; margin-left: .3rem;
+            content: ' ▾'; font-size: .7rem; margin-left: .3rem;
             color: var(--text-muted);
         }}
         .nav .nav-menu {{
@@ -2680,4 +2680,34 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         hostname = hostname,
         repo = dtfs_common::REPO_URL,
     )
+}
+
+#[cfg(test)]
+mod bug_bi_nav_caret_tests {
+    use super::*;
+
+    /// Bug BI — the nav-group dropdown caret must NOT be emitted as a
+    /// double-backslash CSS escape. The page is a Rust raw string, so
+    /// `\25BE` in source survives verbatim and the browser renders the
+    /// literal text `\25BE`. The fix uses the literal ▾ glyph.
+    #[test]
+    fn nav_caret_not_double_escaped() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        assert!(
+            !html.contains(r"\25BE"),
+            "nav caret must not emit a double-backslash CSS escape (raw-string trap)"
+        );
+        assert!(
+            !html.contains("25BE"),
+            "no leftover CSS hex escape for the caret"
+        );
+        assert!(
+            html.contains("button::after"),
+            "nav-group caret rule should be present"
+        );
+        assert!(
+            html.contains('▾'),
+            "nav caret should render the literal ▾ glyph"
+        );
+    }
 }
