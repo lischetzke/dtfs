@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
-// Mitigate rustc 1.94.x ICE in dead_code / join module analysis (see ISSUES_TO_FIX.md).
+// Mitigate rustc 1.94.x ICE in dead_code / join module analysis.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

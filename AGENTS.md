@@ -309,9 +309,9 @@ cargo test -p dtfs-data --release
 ```
 
 A `#![allow(dead_code)]` crate-level attribute on the `dtfs-manager`
-and `dtfs-data` binaries works around an rustc 1.94 ICE — see
-`ISSUES_TO_FIX.md`. **Do not remove those allows** without first
-verifying the ICE no longer reproduces on the current toolchain.
+and `dtfs-data` binaries works around a rustc 1.94 ICE in dead-code
+analysis. **Do not remove those allows** without first verifying the
+ICE no longer reproduces on the current toolchain.
 
 ### A.4.2 Rolling deploy
 
@@ -792,7 +792,6 @@ mandatory:
 | Test inventories / provisioning scripts | `tests/proxmox/{ansible,soak,*.json,*.sh,*.ps1}` | Test infrastructure. |
 | Operator scripts | `scripts/` | Repeatable operator-facing tooling. |
 | Deployment surface | `deploy/` | Docker Compose, sample configs, systemd units. |
-| Open-issue tracker | `ISSUES_TO_FIX.md` (repo root) | Status of known gaps. Linked from § A.8. |
 | Canonical agent guide (knowledge + discipline) | `AGENTS.md` (this file) | Cross-tool source of truth. |
 | Claude Code shim | `CLAUDE.md` | Single `@AGENTS.md` import. Do not add content here — edit AGENTS.md instead. |
 

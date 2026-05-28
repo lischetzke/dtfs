@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-// Work around rustc ICE on stable when dead_code diagnostics hit `metrics` (see ISSUES_TO_FIX.md).
+// Work around rustc ICE on stable when dead_code diagnostics hit `metrics`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

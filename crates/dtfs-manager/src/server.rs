@@ -346,7 +346,7 @@ pub async fn run_grpc_server(
         && !config.tls.mode.eq_ignore_ascii_case("off")
     {
         tracing::warn!(
-            "TLS mode '{}' is set but manager gRPC still listens in plaintext; see ISSUES_TO_FIX.md §10",
+            "TLS mode '{}' is set but manager gRPC still listens in plaintext (TLS not yet implemented)",
             config.tls.mode
         );
     }
