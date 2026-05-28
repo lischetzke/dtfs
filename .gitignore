@@ -32,4 +32,9 @@ MANIFEST-*
 
 # Local test corpus and Claude Code session state
 dummy_files/
-.claude/
+# Exclude .claude contents but allow project skills to be versioned.
+# Must use .claude/* (not .claude/) so git descends and honours negations.
+.claude/*
+!.claude/skills/
+!.claude/skills/**
+.claude/skills/*-workspace/
