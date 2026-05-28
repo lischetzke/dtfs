@@ -103,16 +103,52 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             background: var(--surface);
             border-bottom: 1px solid var(--border);
             padding: 0 1.25rem;
-            display: flex; gap: 0; overflow-x: auto;
+            display: flex; gap: 0;
+            /* overflow MUST be visible so the absolute-positioned
+               .nav-menu dropdowns aren't clipped at the nav bottom.
+               Horizontal scroll on tiny viewports is handled by the
+               page-level overflow-x; this nav is short enough that
+               no clipping is needed on standard desktop widths. */
+            overflow: visible;
         }}
-        .nav a {{
+        .nav a, .nav .nav-group > button {{
             color: var(--text-muted); text-decoration: none;
             padding: .55rem .9rem; font-size: .85rem;
             border-bottom: 2px solid transparent; white-space: nowrap;
             transition: color .15s, border-color .15s;
+            background: transparent; border-top: none; border-left: none;
+            border-right: none; cursor: pointer; font-family: inherit;
         }}
-        .nav a:hover {{ color: var(--text); border-bottom-color: var(--border); }}
-        .nav a.active {{ color: var(--text); border-bottom-color: var(--primary); }}
+        .nav a:hover, .nav .nav-group > button:hover {{
+            color: var(--text); border-bottom-color: var(--border);
+        }}
+        .nav a.active, .nav .nav-group.active > button {{
+            color: var(--text); border-bottom-color: var(--primary);
+        }}
+        .nav .nav-group {{ position: relative; }}
+        .nav .nav-group > button::after {{
+            content: ' \\25BE'; font-size: .7rem; margin-left: .3rem;
+            color: var(--text-muted);
+        }}
+        .nav .nav-menu {{
+            display: none; position: absolute; top: 100%; left: 0;
+            background: var(--surface); border: 1px solid var(--border);
+            border-top: none; min-width: 11rem; z-index: 50;
+            box-shadow: 0 4px 12px rgba(0,0,0,.25);
+        }}
+        .nav .nav-group:hover .nav-menu,
+        .nav .nav-group.open .nav-menu {{ display: block; }}
+        .nav .nav-menu a {{
+            display: block; padding: .5rem .9rem; border-bottom: none;
+            font-size: .85rem; color: var(--text-muted);
+        }}
+        .nav .nav-menu a:hover {{
+            background: var(--bg); color: var(--text); border-bottom: none;
+        }}
+        .nav .nav-menu a.active {{
+            color: var(--text); background: var(--bg);
+            border-left: 2px solid var(--primary);
+        }}
 
         /* ── Health banner ── */
         .health-banner {{
@@ -265,6 +301,9 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .badge-degraded   {{ background: #f59e0b22; color: var(--warning); }}
         .badge-down       {{ background: #ef444422; color: var(--danger); }}
         .badge-failed     {{ background: #ef444422; color: var(--danger); }}
+        /* Bug BC — Quarantined nodes hard-flag in deep red so an
+           operator scanning the page can't miss a data-integrity event. */
+        .badge-quarantined {{ background: #b91c1c; color: white; font-weight: 700; letter-spacing: .04em; }}
         .badge-maintenance {{ background: #3b82f622; color: var(--primary); }}
         .badge-draining   {{ background: #3b82f622; color: var(--primary); }}
         .badge-hot  {{ background: #ef444422; color: var(--danger); }}
@@ -424,16 +463,27 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     </div>
 </div>
 
-<nav class="nav">
-    <a href="/ui" class="active">Home</a>
-    <a href="/ui/topology">Topology</a>
-    <a href="/ui/nodes">Nodes</a>
-    <a href="/ui/volumes">Volumes</a>
-    <a href="/ui/explorer">Data Explorer</a>
-    <a href="/ui/migrations">Migrations</a>
-    <a href="/ui/audit">Audit Log</a>
-    <a href="/ui/config">Config</a>
-    <a href="/ui/settings">Settings</a>
+<nav class="nav" id="topnav">
+    <a href="/ui" class="active" data-route="/ui">Home</a>
+    <div class="nav-group" data-group="cluster">
+        <button type="button" onclick="toggleNavGroup(event,'cluster')">Cluster</button>
+        <div class="nav-menu">
+            <a href="/ui/topology"   data-route="/ui/topology">Topology</a>
+            <a href="/ui/nodes"      data-route="/ui/nodes">Nodes</a>
+            <a href="/ui/integrity"  data-route="/ui/integrity">Integrity</a>
+            <a href="/ui/audit"      data-route="/ui/audit">Audit Log</a>
+            <a href="/ui/config"     data-route="/ui/config">Config</a>
+            <a href="/ui/settings"   data-route="/ui/settings">Settings</a>
+        </div>
+    </div>
+    <div class="nav-group" data-group="data">
+        <button type="button" onclick="toggleNavGroup(event,'data')">Data</button>
+        <div class="nav-menu">
+            <a href="/ui/volumes"    data-route="/ui/volumes">Volumes</a>
+            <a href="/ui/explorer"   data-route="/ui/explorer">Data Explorer</a>
+            <a href="/ui/migrations" data-route="/ui/migrations">Migrations</a>
+        </div>
+    </div>
     <a href="https://github.com/lischetzke/dtfs/tree/master/docs" target="_blank">Docs ↗</a>
 </nav>
 
@@ -600,8 +650,12 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <input id="vs-volume-id" class="form-input" readonly>
         </div>
         <div class="modal-row">
-            <label>scrub_interval_secs</label>
-            <input id="vs-scrub-secs" class="form-input" type="number" min="0" step="60" placeholder="(inherit cluster default)">
+            <label>scrub_interval_secs <span style="color:var(--warning);font-size:.7rem">(deprecated, Bug BC-13)</span></label>
+            <input id="vs-scrub-secs" class="form-input" type="number" min="0" step="60" placeholder="(ignored — set cluster [scrub] block instead)">
+            <div style="font-size:.7rem;color:var(--text-muted);margin-top:.2rem">
+                Per-volume scrub cadence is no longer effective: data nodes scrub by disk,
+                not by volume. Set cluster-wide values in Config → scrub.* instead.
+            </div>
         </div>
         <div class="modal-row">
             <label>fsck_interval_secs</label>
@@ -612,6 +666,38 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <button class="btn-primary"  onclick="submitVolumeSchedules()" id="vs-submit">Apply</button>
         </div>
         <div id="vs-result" class="modal-result" style="display:none"></div>
+    </div>
+</div>
+
+<!-- Bug BC-12d — Unquarantine confirmation dialog -->
+<div id="unquarantine-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeUnquarantineModal()">
+    <div class="modal-card" style="max-width:32rem">
+        <h3 style="color:var(--danger)">Unquarantine <span id="uq-hostname"></span></h3>
+        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:.8rem">
+            This re-admits the node to all serving paths (reads, replication source, allocate target).
+            Do this only AFTER you have personally verified the chunk integrity or replaced the failing
+            disk. Both fields below land in the audit log and are required.
+        </div>
+        <input type="hidden" id="uq-node-id">
+        <div style="background:#b91c1c14;border:1px solid #b91c1c;border-radius:.4rem;padding:.5rem;margin-bottom:.8rem;font-size:.8rem">
+            <div><b>Reason:</b> <span id="uq-reason"></span></div>
+            <div><b>Triggering chunk:</b> <span id="uq-chunk" style="font-family:monospace;font-size:.7rem"></span></div>
+            <div><b>Total faults:</b> <span id="uq-fault-count"></span></div>
+            <div><b>Last summary:</b> <span id="uq-summary"></span></div>
+        </div>
+        <div class="modal-row">
+            <label>operator_id (your identity)</label>
+            <input id="uq-operator" class="form-input" oninput="onUnquarantineInput()" placeholder="alice / ticket-123 / on-call">
+        </div>
+        <div class="modal-row">
+            <label>reason_acknowledged (≥ 16 chars; what you verified)</label>
+            <input id="uq-ack" class="form-input" oninput="onUnquarantineInput()" placeholder="e.g. disk swapped + bitrot rescan clean">
+        </div>
+        <div class="modal-actions">
+            <button class="btn-secondary" onclick="closeUnquarantineModal()">Cancel</button>
+            <button class="btn-primary" style="background:#b91c1c" onclick="submitUnquarantine()" id="uq-submit" disabled>Unquarantine</button>
+        </div>
+        <div id="uq-result" class="modal-result" style="display:none"></div>
     </div>
 </div>
 
@@ -889,7 +975,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     function renderNodes(nodes) {{
         const tbody = document.getElementById('nodes-table');
         if (!nodes || nodes.length === 0) {{
-            tbody.innerHTML = '<tr><td colspan="9" class="placeholder">No nodes registered yet.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="10" class="placeholder">No nodes registered yet.</td></tr>';
             document.getElementById('nodes-summary').textContent = '';
             return;
         }}
@@ -934,12 +1020,20 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             const diskCell = (isManager || isClient)
                 ? `<td style="color:var(--text-muted)">—</td>`
                 : `<td>${{n.disk_count||0}}</td>`;
+            // Show full node_id (no slice). Location + Version columns
+            // get explicit min-widths (×4 + ×2 of the previous implicit
+            // width) so the full location string and the version+build
+            // pair fit without truncation or wrapping.
+            const versionText = (n.version || n.build_date)
+                ? `${{n.version || '—'}}${{n.build_date ? ' / ' + n.build_date : ''}}`
+                : '—';
             return `<tr>
-                <td style="font-size:.78rem;color:var(--text-muted);font-family:monospace">
-                    ${{(n.node_id||'').slice(0,8)}}…</td>
+                <td style="font-size:.75rem;color:var(--text-muted);font-family:monospace;white-space:nowrap">
+                    ${{n.node_id||'—'}}</td>
                 <td><b>${{n.hostname||'—'}}</b></td>
                 <td><span class="${{rc}}">${{role}}</span></td>
-                <td style="font-size:.78rem;color:var(--text-muted)">${{n.location||'—'}}</td>
+                <td style="font-size:.78rem;color:var(--text-muted);white-space:nowrap">${{n.location||'—'}}</td>
+                <td style="font-size:.78rem;color:var(--text-muted);white-space:nowrap">${{versionText}}</td>
                 ${{diskCell}}
                 ${{capCell}}
                 ${{usedBarCell}}
@@ -951,11 +1045,27 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
     // ── SPA Router ───────────────────────────────────────────────────────────
 
+    // Map dotted route → which top-level nav group should light up.
+    // Lets the active highlight cascade onto the group button when a
+    // child route is active.
+    const NAV_GROUP_OF = {{
+        '/ui/topology':   'cluster',
+        '/ui/nodes':      'cluster',
+        '/ui/integrity':  'cluster',
+        '/ui/audit':      'cluster',
+        '/ui/config':     'cluster',
+        '/ui/settings':   'cluster',
+        '/ui/volumes':    'data',
+        '/ui/explorer':   'data',
+        '/ui/migrations': 'data',
+    }};
+
     const ROUTES = {{
         '/ui':            renderHome,
         '/ui/':           renderHome,
         '/ui/topology':   renderTopology,
         '/ui/nodes':      renderNodesList,
+        '/ui/integrity':  renderIntegrityFeed,
         '/ui/volumes':    renderVolumes,
         '/ui/explorer':   renderExplorer,
         '/ui/migrations': renderMigrations,
@@ -963,6 +1073,78 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         '/ui/config':     renderConfig,
         '/ui/settings':   renderSettings,
     }};
+
+    // Bug BC-12e — Integrity feed page. Lists every integrity-related
+    // audit row (quarantine, unquarantine, scrub faults, read mismatch,
+    // orphan in-state-missing). Polls every 5s while the page is open.
+    let _integrityTimer = null;
+    async function renderIntegrityFeed() {{
+        document.getElementById('page-content').innerHTML = `
+            <div class="page-header">
+                <h2>Integrity</h2>
+                <p class="page-desc">
+                    Data-integrity events across the cluster (Bug BC). Quarantined nodes,
+                    scrub faults, read-hash mismatches, orphan reaps. Click a row to jump
+                    to the node detail panel.
+                </p>
+            </div>
+            <div id="integrity-summary" style="margin-bottom:.6rem;font-size:.85rem;color:var(--text-muted)">Loading…</div>
+            <div class="table-card"><table>
+                <thead><tr>
+                    <th style="min-width:11rem">Time (UTC)</th>
+                    <th style="min-width:9rem">Action</th>
+                    <th style="min-width:9rem">Actor</th>
+                    <th style="min-width:9rem">Target</th>
+                    <th>Result / Summary</th>
+                </tr></thead>
+                <tbody id="integrity-body"><tr><td colspan="5" class="placeholder">Fetching…</td></tr></tbody>
+            </table></div>`;
+        const tick = async () => {{
+            const rows = await fetch('/api/v1/integrity/faults?limit=200')
+                .then(r => r.json()).catch(() => []);
+            const body = document.getElementById('integrity-body');
+            const sum  = document.getElementById('integrity-summary');
+            if (!rows.length) {{
+                body.innerHTML = '<tr><td colspan="5" class="placeholder">No integrity events. Cluster is clean.</td></tr>';
+                sum.textContent = '0 events';
+                return;
+            }}
+            sum.textContent = rows.length + ' event(s); newest first';
+            body.innerHTML = rows.map(r => {{
+                const ts = new Date((r.timestamp||0)*1000).toISOString().replace('T',' ').replace(/\..*/, '');
+                const action = (r.action||'').replace(/'/g, '&#39;');
+                const isQuar = action.startsWith('node.quarantine');
+                const isUnq  = action.startsWith('node.unquarantine');
+                const rowStyle = isQuar ? 'background:#b91c1c14' : (isUnq ? 'background:#22c55e10' : '');
+                return `<tr style="${{rowStyle}}">
+                    <td style="font-family:monospace;font-size:.78rem">${{ts}}</td>
+                    <td><b>${{action}}</b></td>
+                    <td style="font-size:.78rem;color:var(--text-muted)">${{r.actor||'—'}}</td>
+                    <td style="font-size:.78rem;font-family:monospace">${{r.target||'—'}}</td>
+                    <td style="font-size:.78rem">${{r.summary||r.result||'—'}}</td>
+                </tr>`;
+            }}).join('');
+        }};
+        await tick();
+        if (refreshTimer) {{ clearInterval(refreshTimer); }}
+        refreshTimer = setInterval(tick, 5000);
+    }}
+
+    function toggleNavGroup(ev, name) {{
+        ev.stopPropagation();
+        document.querySelectorAll('.nav .nav-group').forEach(g => {{
+            if (g.dataset.group === name) {{
+                g.classList.toggle('open');
+            }} else {{
+                g.classList.remove('open');
+            }}
+        }});
+    }}
+    document.addEventListener('click', () => {{
+        document.querySelectorAll('.nav .nav-group.open').forEach(g =>
+            g.classList.remove('open'));
+    }});
+    window.toggleNavGroup = toggleNavGroup;
 
     let refreshTimer = null;
 
@@ -975,10 +1157,18 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         const path = window.location.pathname.replace(/\/$/, '') || '/ui';
         const normPath = path === '' ? '/ui' : path;
 
-        // Update active nav link
+        // Update active nav link (top-level + dropdown children).
         document.querySelectorAll('.nav a').forEach(a => {{
-            const href = a.getAttribute('href').replace(/\/$/, '');
+            const href = (a.getAttribute('href')||'').replace(/\/$/, '');
             a.classList.toggle('active', href === normPath);
+        }});
+
+        // Cascade active highlight onto the parent nav-group button.
+        const groupName = NAV_GROUP_OF[normPath] || null;
+        document.querySelectorAll('.nav .nav-group').forEach(g => {{
+            g.classList.toggle('active', g.dataset.group === groupName);
+            // Close any open dropdowns when route changes.
+            g.classList.remove('open');
         }});
 
         // Clear existing auto-refresh
@@ -1096,8 +1286,19 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <h3>Data &amp; Manager Nodes</h3>
                 <span style="font-size:.75rem;color:var(--text-muted)" id="nodes-summary"></span>
             </div>
-            <table><thead><tr><th>ID</th><th>Hostname</th><th>Role</th><th>Location</th><th>Disks</th><th>Capacity</th><th style="width:120px">Utilization</th><th>Used</th><th>Health</th></tr></thead>
-            <tbody id="nodes-table"><tr><td colspan="9" class="placeholder">Fetching node list…</td></tr></tbody></table>
+            <table><thead><tr>
+                <th style="min-width:14rem">ID</th>
+                <th>Hostname</th>
+                <th>Role</th>
+                <th style="min-width:16rem">Location</th>
+                <th style="min-width:10rem">Version</th>
+                <th>Disks</th>
+                <th>Capacity</th>
+                <th style="width:120px">Utilization</th>
+                <th>Used</th>
+                <th>Health</th>
+            </tr></thead>
+            <tbody id="nodes-table"><tr><td colspan="10" class="placeholder">Fetching node list…</td></tr></tbody></table>
         </div>`;
         fetchStats();
         refreshTimer = setInterval(fetchStats, 8000);
@@ -1324,6 +1525,32 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             const versionRow = (n.version || n.build_date)
                 ? `<div class="node-meta-item"><span>Version</span>${{n.version || '—'}}${{n.build_date ? ' / ' + n.build_date : ''}}</div>`
                 : '';
+            // Bug BC-12c — Quarantined badge + details panel. The
+            // operator never needs to curl: the reason, triggering
+            // chunk, fault count, and unquarantine action all live
+            // in the card.
+            const isQuarantined = !!n.quarantine;
+            const quarBadge = isQuarantined
+                ? `<span class="badge badge-quarantined" title="Click to inspect">QUARANTINED</span>`
+                : '';
+            const quarPanel = isQuarantined ? `
+                <div style="margin-top:.6rem;padding:.6rem;border:1px solid #b91c1c;border-radius:.4rem;background:#b91c1c14">
+                    <div style="font-weight:700;color:var(--danger);margin-bottom:.3rem">
+                        Integrity fault — node excluded from all serving paths.
+                    </div>
+                    <div class="node-meta-item"><span>Reason</span><b>${{n.quarantine.reason}}</b></div>
+                    ${{n.quarantine.triggering_chunk_id ? `<div class="node-meta-item"><span>Triggering chunk</span><span style="font-family:monospace;font-size:.75rem">${{n.quarantine.triggering_chunk_id}}</span></div>` : ''}}
+                    <div class="node-meta-item"><span>Since</span>${{new Date(n.quarantine.since_ms).toISOString()}}</div>
+                    <div class="node-meta-item"><span>Last fault</span>${{new Date(n.quarantine.last_fault_at_ms).toISOString()}}</div>
+                    <div class="node-meta-item"><span>Total faults</span>${{n.quarantine.fault_count_total||0}}</div>
+                    <div class="node-meta-item"><span>Summary</span>${{n.quarantine.last_fault_summary||'—'}}</div>
+                    <div style="margin-top:.6rem;display:flex;gap:.4rem">
+                        <button class="btn-primary" style="background:#b91c1c"
+                            onclick="openUnquarantineModal('${{n.node_id}}','${{(n.hostname||'').replace(/'/g,'&#39;')}}','${{n.quarantine.reason}}','${{(n.quarantine.triggering_chunk_id||'').replace(/'/g,'&#39;')}}','${{n.quarantine.fault_count_total||0}}','${{(n.quarantine.last_fault_summary||'').replace(/'/g,'&#39;')}}')">
+                            Unquarantine…
+                        </button>
+                    </div>
+                </div>` : '';
             return `<div class="node-card">
                 <div class="node-card-header">
                     <div>
@@ -1335,6 +1562,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                         </span>
                     </div>
                     <div style="display:flex;gap:.5rem;align-items:center">
+                        ${{quarBadge}}
                         <span class="badge badge-${{h}}">${{n.health||'unknown'}}</span>
                         ${{isStorageRole ? `<button class="btn-maint" onclick="toggleMaintenance('${{n.node_id}}', ${{!isMaintenance}})">
                             ${{isMaintenance ? 'Exit Maintenance' : 'Set Maintenance'}}
@@ -1349,6 +1577,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                         ${{versionRow}}
                         ${{sizeMetaRows}}
                     </div>
+                    ${{quarPanel}}
                     ${{utilBar}}
                     ${{diskTable}}
                 </div>
@@ -1366,6 +1595,59 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         }}).catch(() => {{}});
         await refreshNodesList();
     }}
+
+    // ── Bug BC-12d — Unquarantine confirmation modal ────────────────
+    function openUnquarantineModal(nodeId, hostname, reason, chunkId, faultCount, summary) {{
+        document.getElementById('uq-node-id').value   = nodeId;
+        document.getElementById('uq-hostname').textContent = hostname;
+        document.getElementById('uq-reason').textContent   = reason;
+        document.getElementById('uq-chunk').textContent    = chunkId || '—';
+        document.getElementById('uq-fault-count').textContent = faultCount;
+        document.getElementById('uq-summary').textContent  = summary || '—';
+        document.getElementById('uq-operator').value = '';
+        document.getElementById('uq-ack').value = '';
+        document.getElementById('uq-result').style.display = 'none';
+        document.getElementById('uq-submit').disabled = true;
+        document.getElementById('unquarantine-modal').classList.remove('hidden');
+    }}
+    function closeUnquarantineModal() {{
+        document.getElementById('unquarantine-modal').classList.add('hidden');
+    }}
+    function onUnquarantineInput() {{
+        const op  = document.getElementById('uq-operator').value.trim();
+        const ack = document.getElementById('uq-ack').value.trim();
+        document.getElementById('uq-submit').disabled = !(op.length > 0 && ack.length >= 16);
+    }}
+    async function submitUnquarantine() {{
+        const nid = document.getElementById('uq-node-id').value;
+        const body = {{
+            operator_id:        document.getElementById('uq-operator').value.trim(),
+            reason_acknowledged: document.getElementById('uq-ack').value.trim(),
+        }};
+        const r = await fetch('/api/v1/nodes/' + nid + '/unquarantine', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify(body),
+        }});
+        const txt = await r.text();
+        const result = document.getElementById('uq-result');
+        result.style.display = 'block';
+        if (r.ok) {{
+            result.style.color = 'var(--success)';
+            result.textContent = 'Unquarantined.';
+            setTimeout(async () => {{
+                closeUnquarantineModal();
+                await refreshNodesList();
+            }}, 800);
+        }} else {{
+            result.style.color = 'var(--danger)';
+            result.textContent = 'Failed: ' + txt;
+        }}
+    }}
+    window.openUnquarantineModal = openUnquarantineModal;
+    window.closeUnquarantineModal = closeUnquarantineModal;
+    window.onUnquarantineInput   = onUnquarantineInput;
+    window.submitUnquarantine    = submitUnquarantine;
 
     // ── Volumes page ──────────────────────────────────────────────────────────
 
@@ -1432,8 +1714,29 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             el.innerHTML = '<div class="placeholder">No volumes yet. Create one with <code>dtfs-cli volume create</code>.</div>';
             return;
         }}
+        // Bug volumes-actions — each action gets its own column so the
+        // table column widths are stable. Button widths are fixed via
+        // min-width sized to the LONGEST text variant ("Details" wins
+        // over "Hide"; modal-opener buttons keep their full label
+        // including the trailing ellipsis). Without this, the Details
+        // toggle would shrink the Actions cell whenever it flipped to
+        // "Hide", causing the surrounding columns to jitter.
+        const ACT_BTN = 'btn-secondary';
+        const ACT_STYLE = 'padding:.25rem .5rem;font-size:.78rem;width:100%';
+        const ACT_TD = 'style="white-space:nowrap;width:1%;text-align:center"';
         el.innerHTML = '<div class="table-card"><table>' +
-            '<thead><tr><th>Volume ID</th><th>Files</th><th>Total Size</th><th>Avg File Size</th><th>Cache</th><th>Anchor</th><th>Actions</th></tr></thead><tbody>' +
+            '<thead><tr>' +
+                '<th>Volume ID</th>' +
+                '<th>Files</th>' +
+                '<th>Total Size</th>' +
+                '<th>Avg File Size</th>' +
+                '<th>Cache</th>' +
+                '<th>Anchor</th>' +
+                '<th style="min-width:5.5rem">Details</th>' +
+                '<th style="min-width:7.5rem">Edit policy</th>' +
+                '<th style="min-width:7rem">Schedules</th>' +
+                '<th style="min-width:8rem">Flush cache</th>' +
+            '</tr></thead><tbody>' +
             vols.flatMap(v => {{
                 const vid = v.volume_id||'—';
                 const safeVid = vid.replace(/'/g, "&#39;");
@@ -1449,19 +1752,17 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     <td>${{v.file_count ? fmtBytes(Math.round((v.total_size||0)/v.file_count)) : '—'}}</td>
                     <td>${{cacheLabel}}</td>
                     <td>${{anchorLabel}}</td>
-                    <td style="white-space:nowrap">
-                        <button class="btn-secondary" style="padding:.25rem .5rem;font-size:.78rem"
-                            onclick="toggleVolumeRow('${{safeVid}}')">${{isOpen?'Hide':'Details'}}</button>
-                        <button class="btn-secondary" style="padding:.25rem .5rem;font-size:.78rem"
-                            onclick="openVolumeEdit('${{safeVid}}')">Edit policy…</button>
-                        <button class="btn-secondary" style="padding:.25rem .5rem;font-size:.78rem"
-                            onclick="openVolumeSchedules('${{safeVid}}')">Schedules…</button>
-                        <button class="btn-secondary" style="padding:.25rem .5rem;font-size:.78rem"
-                            onclick="openFlushCache('/')">Flush cache…</button>
-                    </td>
+                    <td ${{ACT_TD}}><button class="${{ACT_BTN}}" style="${{ACT_STYLE}}"
+                        onclick="toggleVolumeRow('${{safeVid}}')">${{isOpen?'Hide':'Details'}}</button></td>
+                    <td ${{ACT_TD}}><button class="${{ACT_BTN}}" style="${{ACT_STYLE}}"
+                        onclick="openVolumeEdit('${{safeVid}}')">Edit policy…</button></td>
+                    <td ${{ACT_TD}}><button class="${{ACT_BTN}}" style="${{ACT_STYLE}}"
+                        onclick="openVolumeSchedules('${{safeVid}}')">Schedules…</button></td>
+                    <td ${{ACT_TD}}><button class="${{ACT_BTN}}" style="${{ACT_STYLE}}"
+                        onclick="openFlushCache('/')">Flush cache…</button></td>
                 </tr>`];
                 if (isOpen) {{
-                    rows.push(`<tr><td colspan="7">${{renderVolumeCard(v)}}</td></tr>`);
+                    rows.push(`<tr><td colspan="10">${{renderVolumeCard(v)}}</td></tr>`);
                 }}
                 return rows;
             }}).join('') +
@@ -2084,13 +2385,19 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     window._configFilter = '';
     window._configPending = {{}};
 
+    window._configTab = 'cluster';
     async function renderConfig() {{
         document.getElementById('page-content').innerHTML = `
             <div class="page-header"><h2>Config</h2>
-                <p class="page-desc">Raw cluster config — every key with current + default value.
-                Edit a field and click <b>Apply</b> to live-reload + persist to disk.</p>
+                <p class="page-desc">Cluster-wide keys must match across every manager. Node-specific
+                keys (hostname, listen addrs, TLS material) live in the per-host tab. Edit a field
+                and click <b>Apply</b> to live-reload + persist.</p>
             </div>
             <div style="display:flex;gap:.5rem;margin-bottom:.5rem;flex-wrap:wrap;align-items:center">
+                <button id="cfg-tab-cluster" class="btn-secondary"
+                        onclick="onConfigTab('cluster')">Cluster (—)</button>
+                <button id="cfg-tab-node" class="btn-secondary"
+                        onclick="onConfigTab('node')">Node: <span id="cfg-tab-node-host">—</span> (—)</button>
                 <input id="cfg-filter" type="text" class="form-input" placeholder="Filter by name…" style="max-width:260px"
                        oninput="onConfigFilter(this.value)">
                 <button class="btn-secondary" onclick="renderConfig()">Refresh</button>
@@ -2103,9 +2410,27 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         const data = await fetch('/api/v1/config/effective').then(r => r.json())
             .catch(() => ({{entries: [], scope: 'unknown', node_hostname: 'unknown'}}));
         window._configRows = data.entries || [];
+        window._configHost = data.node_hostname || '—';
         window._configPending = {{}};
+        document.getElementById('cfg-tab-node-host').textContent = window._configHost;
+        // Counts per scope_kind.
+        const cn = window._configRows.filter(r => r.scope_kind === 'cluster').length;
+        const nn = window._configRows.filter(r => r.scope_kind === 'node').length;
+        document.getElementById('cfg-tab-cluster').textContent = 'Cluster (' + cn + ')';
+        document.getElementById('cfg-tab-node').innerHTML =
+            'Node: ' + window._configHost + ' (' + nn + ')';
         rerenderConfigTable();
     }}
+
+    function onConfigTab(name) {{
+        window._configTab = name;
+        const ct = document.getElementById('cfg-tab-cluster');
+        const nt = document.getElementById('cfg-tab-node');
+        if (ct) ct.classList.toggle('btn-primary', name === 'cluster');
+        if (nt) nt.classList.toggle('btn-primary', name === 'node');
+        rerenderConfigTable();
+    }}
+    window.onConfigTab = onConfigTab;
 
     function onConfigFilter(v) {{
         window._configFilter = (v||'').toLowerCase();
@@ -2117,9 +2442,11 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         if (!el) return;
         const rows = window._configRows;
         const filter = window._configFilter;
+        const tab = window._configTab || 'cluster';
+        const scoped = rows.filter(r => (r.scope_kind||'node') === tab);
         const filtered = filter
-            ? rows.filter(r => (r.name||'').toLowerCase().includes(filter))
-            : rows;
+            ? scoped.filter(r => (r.name||'').toLowerCase().includes(filter))
+            : scoped;
         if (!filtered.length) {{
             el.innerHTML = '<div class="placeholder">No matching config keys.</div>';
             return;

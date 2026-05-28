@@ -415,6 +415,26 @@ message HeartbeatRequest {
   // Optional: older data nodes that don't emit this still register
   // successfully (the manager keeps the boot snapshot in that case).
   repeated DiskUsageSnapshot disk_usage = 9;
+  // Bug BF-1 — integrity faults the data node observed since the last
+  // heartbeat (verify_on_read mismatch, etc.). The manager iterates
+  // each fault and emits ClientRequest::QuarantineNode +
+  // RemoveCorruptChunkReplicas. Optional: older data nodes that don't
+  // emit this still register successfully + heartbeat normally (older
+  // path = no auto-quarantine; operator-driven via the WebUI).
+  repeated IntegrityFault integrity_faults = 10;
+}
+
+// Bug BF-1 — single integrity-fault record reported by a data node.
+// `detector` distinguishes BC-8 verify_on_read from any future inline
+// detection paths (deep scrub during background work, etc.).
+message IntegrityFault {
+  string chunk_id      = 1;
+  uint64 observed_at_ms = 2;
+  string detector      = 3;  // e.g. "verify_on_read", "verify_on_read_meta_absent"
+  uint64 expected_len  = 4;
+  uint64 actual_len    = 5;
+  string expected_hash = 6;
+  string actual_hash   = 7;  // may be empty if the data side couldn't compute it
 }
 
 // Bug AU — per-disk live usage delivered with each heartbeat. The data
@@ -450,18 +470,45 @@ message ConfigUpdate {
   optional ScrubConfigOverride scrub_override = 3;
 }
 
-// AZ-1 — minimal scrub override pushed to data nodes alongside the
-// existing config_json. Only carries the fields the scheduler reads
-// each tick.
+// AZ-1 / Bug BC — scrub + integrity policy pushed to data nodes
+// alongside the existing config_json. The data-side scheduler
+// hot-reloads these values within 60 s of receiving the heartbeat.
+//
+// Bug BC-2 extension: the manager now carries the FULL integrity
+// policy (orphan cadence, verify_on_read, quarantine_on_fault,
+// auto-unquarantine cooldown). Fields 1 + 2 keep the legacy
+// hour-units names for wire-compat with managers/data nodes still
+// running AZ-1 binaries; fields 3-8 are additive (default-zero on
+// older peers).
+//
+// Rolling-upgrade order: managers first (start emitting the new
+// fields with safe defaults), data nodes next (start honouring
+// them). A data node that ignores fields 3-8 behaves exactly as
+// the AZ-1 baseline.
 message ScrubConfigOverride {
   uint64 quick_interval_hours = 1;
-  uint64 deep_interval_hours = 2;
+  uint64 deep_interval_hours  = 2;
+
+  // Bug BC additions:
+  uint64 orphan_interval_secs   = 3;
+  uint64 orphan_grace_secs      = 4;
+  uint32 max_io_percent         = 5;
+  bool   verify_on_read         = 6;
+  bool   quarantine_on_fault    = 7;
+  uint64 auto_unquarantine_secs = 8;
 }
 
 message HeartbeatResponse {
   bool accepted = 1;
   uint64 config_version = 2;
   optional ConfigUpdate config_update = 3;
+  // Bug BF — clear-signal for the data-side IntegrityFaultCollector's
+  // sticky `self_quarantined` flag. True iff the manager's view of
+  // this node is NOT Quarantined. The data node clears its local
+  // flag on this signal so an operator-driven UnquarantineNode (via
+  // /api/v1/nodes/{id}/unquarantine + /ui/integrity) re-enables
+  // writes WITHOUT requiring a `systemctl restart dtfs-data`.
+  bool self_quarantine_cleared = 4;
 }
 
 // --- ChunkStatus ---

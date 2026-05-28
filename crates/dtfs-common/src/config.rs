@@ -24,6 +24,12 @@ pub struct ManagerConfig {
     /// Bug AH — audit log replication settings.
     #[serde(default)]
     pub audit: AuditConfig,
+    /// Bug BC — cluster-wide scrub + integrity policy. Propagated to
+    /// data nodes via the heartbeat `ScrubConfigOverride`. Replaces the
+    /// per-volume `scrub_interval_secs` and the hardcoded constants
+    /// previously in `metadata.rs`.
+    #[serde(default)]
+    pub scrub: ClusterScrubConfig,
 }
 
 /// Bug AH — audit log replication configuration.
@@ -432,6 +438,97 @@ pub struct ScrubConfig {
     pub deep_cron: Option<String>,
     #[serde(default = "default_scrub_io")]
     pub max_io_percent: u32,
+    /// Bug BC — data-side mirror of `ClusterScrubConfig.verify_on_read`.
+    /// Defaults `true` so a data node starting before the first
+    /// heartbeat still enforces hash-on-read.
+    #[serde(default = "default_cluster_verify_on_read")]
+    pub verify_on_read: bool,
+    /// Bug BC — data-side mirror of `ClusterScrubConfig.quarantine_on_fault`.
+    /// Defaults `true` to match the single-fault → full ban invariant.
+    #[serde(default = "default_cluster_quarantine_on_fault")]
+    pub quarantine_on_fault: bool,
+}
+
+/// Bug BC — cluster-wide scrub + integrity policy.
+///
+/// Lives on `ManagerConfig.scrub`. Heartbeat propagates the
+/// resolved values to every data node, where they replace the local
+/// `DataNodeConfig.scrub` block at runtime (the data-side block is
+/// kept only as a startup fallback before the first heartbeat
+/// arrives).
+///
+/// Defaults match the data-side defaults so a fresh cluster on
+/// pre-BC binaries behaves identically (6h quick, 168h deep).
+///
+/// The integrity knobs (`verify_on_read`, `quarantine_on_fault`,
+/// `auto_unquarantine_secs`) are wired by Bug BC tasks BC-8/10/12.
+/// Disabling `verify_on_read` is gated by an explicit
+/// acknowledgement at the API boundary (see BC-8 boundary check).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterScrubConfig {
+    /// Quick scrub cadence (stat + size + meta presence). Default
+    /// `default_cluster_quick_interval` = 21600 (6 h).
+    #[serde(default = "default_cluster_quick_interval")]
+    pub quick_interval_secs: u64,
+
+    /// Deep scrub cadence (full BLAKE3 verify). Default
+    /// `default_cluster_deep_interval` = 604800 (7 d).
+    #[serde(default = "default_cluster_deep_interval")]
+    pub deep_interval_secs: u64,
+
+    /// Orphan-scrub cadence: manager-driven cross-check between data
+    /// node `ListChunks` and state-machine `chunk_locations`. Default
+    /// `default_cluster_orphan_interval` = 86400 (1 d).
+    #[serde(default = "default_cluster_orphan_interval")]
+    pub orphan_interval_secs: u64,
+
+    /// Grace period before an orphan candidate is reaped. Catches
+    /// in-flight unlink/re-promote races. Default
+    /// `default_cluster_orphan_grace` = 86400 (1 d).
+    #[serde(default = "default_cluster_orphan_grace")]
+    pub orphan_grace_secs: u64,
+
+    /// Throttle for deep scrub I/O — fraction of disk bandwidth the
+    /// scrubber may use. Default 10.
+    #[serde(default = "default_cluster_scrub_io")]
+    pub max_io_percent: u32,
+
+    /// Data consistency knob: hash-verify every read at the data
+    /// node before bytes leave the process. Default **true**.
+    /// Operator can set to `false` only with explicit ack at the
+    /// API boundary (BC-8). Disabling is a footgun; AGENTS.md flags
+    /// the false branch as the only DTFS-supported mode where
+    /// reads can deliver corrupt bytes.
+    #[serde(default = "default_cluster_verify_on_read")]
+    pub verify_on_read: bool,
+
+    /// If true (default), a single integrity fault (quick mismatch,
+    /// deep mismatch, verify-on-read mismatch, in-state-missing)
+    /// quarantines the faulting node immediately. No threshold,
+    /// no debounce. Leave true unless you know what you do.
+    #[serde(default = "default_cluster_quarantine_on_fault")]
+    pub quarantine_on_fault: bool,
+
+    /// Cooldown after which a Quarantined node auto-clears if no
+    /// fresh fault has arrived. 0 = manual only (default, matches
+    /// data-consistency-first stance).
+    #[serde(default)]
+    pub auto_unquarantine_secs: u64,
+}
+
+impl Default for ClusterScrubConfig {
+    fn default() -> Self {
+        Self {
+            quick_interval_secs:    default_cluster_quick_interval(),
+            deep_interval_secs:     default_cluster_deep_interval(),
+            orphan_interval_secs:   default_cluster_orphan_interval(),
+            orphan_grace_secs:      default_cluster_orphan_grace(),
+            max_io_percent:         default_cluster_scrub_io(),
+            verify_on_read:         default_cluster_verify_on_read(),
+            quarantine_on_fault:    default_cluster_quarantine_on_fault(),
+            auto_unquarantine_secs: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,6 +766,30 @@ fn default_quick_interval() -> u64 {
 }
 fn default_deep_interval() -> u64 {
     168
+}
+
+// Bug BC — defaults for `ClusterScrubConfig`. Hour-equivalents of the
+// legacy data-side defaults so an upgraded cluster behaves identically.
+fn default_cluster_quick_interval() -> u64 {
+    6 * 3600
+}
+fn default_cluster_deep_interval() -> u64 {
+    168 * 3600
+}
+fn default_cluster_orphan_interval() -> u64 {
+    24 * 3600
+}
+fn default_cluster_orphan_grace() -> u64 {
+    24 * 3600
+}
+fn default_cluster_scrub_io() -> u32 {
+    10
+}
+fn default_cluster_verify_on_read() -> bool {
+    true
+}
+fn default_cluster_quarantine_on_fault() -> bool {
+    true
 }
 fn default_scrub_io() -> u32 {
     10
@@ -928,5 +1049,57 @@ max_io_percent = 10
             FirstWriteTier::Cold,
             "unknown values must fall back to the safe default"
         );
+    }
+
+    /// Bug BC-1 — an empty `[scrub]` block (or its complete absence)
+    /// must yield the documented defaults. The data-integrity
+    /// invariants (`verify_on_read=true`, `quarantine_on_fault=true`,
+    /// `auto_unquarantine_secs=0`) are load-bearing for the rest of
+    /// Bug BC: if the default ever flips, a fresh cluster would start
+    /// silently delivering corrupt bytes on read.
+    #[test]
+    fn bug_bc_1_cluster_scrub_config_defaults() {
+        let empty: ClusterScrubConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.quick_interval_secs,    6 * 3600);
+        assert_eq!(empty.deep_interval_secs,     168 * 3600);
+        assert_eq!(empty.orphan_interval_secs,   24 * 3600);
+        assert_eq!(empty.orphan_grace_secs,      24 * 3600);
+        assert_eq!(empty.max_io_percent,         10);
+        assert!(empty.verify_on_read,
+            "verify_on_read must default true (data consistency invariant)");
+        assert!(empty.quarantine_on_fault,
+            "quarantine_on_fault must default true (single-fault → full ban)");
+        assert_eq!(empty.auto_unquarantine_secs, 0,
+            "auto_unquarantine_secs must default 0 (manual only)");
+
+        let default = ClusterScrubConfig::default();
+        assert_eq!(default, empty, "Default impl must match the serde-default deserialiser");
+    }
+
+    /// Bug BC-1 — overrides round-trip cleanly and the integrity
+    /// knobs are honoured even when an operator sets them to the
+    /// risky values.
+    #[test]
+    fn bug_bc_1_cluster_scrub_config_overrides_apply() {
+        let cfg: ClusterScrubConfig = toml::from_str(r#"
+quick_interval_secs    = 600
+deep_interval_secs     = 3600
+orphan_interval_secs   = 7200
+orphan_grace_secs      = 60
+max_io_percent         = 25
+verify_on_read         = false
+quarantine_on_fault    = false
+auto_unquarantine_secs = 3600
+"#).unwrap();
+        assert_eq!(cfg.quick_interval_secs, 600);
+        assert_eq!(cfg.deep_interval_secs, 3600);
+        assert_eq!(cfg.orphan_interval_secs, 7200);
+        assert_eq!(cfg.orphan_grace_secs, 60);
+        assert_eq!(cfg.max_io_percent, 25);
+        assert!(!cfg.verify_on_read,
+            "operator may disable verify_on_read; the API-level ack guard \
+             (Bug BC-8) is what protects against silent toggles");
+        assert!(!cfg.quarantine_on_fault);
+        assert_eq!(cfg.auto_unquarantine_secs, 3600);
     }
 }

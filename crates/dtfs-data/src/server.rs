@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
 use dtfs_common::config::DataNodeConfig;
 use dtfs_common::types::{ChunkId, DiskStatus, DiskTier, VolumeId};
 use dtfs_proto::dtfs::data::data_service_server::{DataService, DataServiceServer};
@@ -14,6 +13,9 @@ use crate::memory::MemoryBudget;
 use crate::metrics::DataMetrics;
 use crate::replication::ReplicationManager;
 use crate::store::ChunkStore;
+use dtfs_common::checksum;
+use dtfs_common::config::ScrubConfig;
+use tokio::sync::RwLock;
 
 pub struct DataServiceImpl {
     config: DataNodeConfig,
@@ -32,6 +34,15 @@ pub struct DataServiceImpl {
     /// flips true, new `put_chunk` calls return `RESOURCE_EXHAUSTED`
     /// instead of accumulating more chunks into RAM.
     memory: Arc<MemoryBudget>,
+    /// Bug BC-8 — shared cluster scrub + integrity policy.
+    /// `verify_on_read` here gates the hash-on-read code path in
+    /// `get_chunk`. Hot-reloaded by the heartbeat handler in main.
+    scrub_config: Arc<RwLock<ScrubConfig>>,
+    /// Bug BF-2 — integrity-fault collector. Recorded into on every
+    /// `verify_on_read` mismatch (BF-3); drained by the heartbeat
+    /// loop (BF-5); also read at put_chunk-entry for self-reject
+    /// when the node is locally Quarantined (BF-4).
+    integrity_faults: Arc<crate::integrity::IntegrityFaultCollector>,
 }
 
 /// Handle that main can use to drive Bug U graceful shutdown after the
@@ -50,6 +61,8 @@ pub async fn run_grpc_server(
     metrics: Arc<DataMetrics>,
     cache: Arc<ArcCache>,
     memory: Arc<MemoryBudget>,
+    scrub_config: Arc<RwLock<ScrubConfig>>,
+    integrity_faults: Arc<crate::integrity::IntegrityFaultCollector>,
     shutdown: impl std::future::Future<Output = ()>,
     ctx_tx: Option<tokio::sync::oneshot::Sender<ServerContext>>,
 ) -> anyhow::Result<()> {
@@ -106,6 +119,8 @@ pub async fn run_grpc_server(
         cache,
         write_slots,
         memory,
+        scrub_config,
+        integrity_faults,
     };
 
     tracing::info!("Data node gRPC server listening on {}", addr);
@@ -146,6 +161,21 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<Streaming<PutChunkRequest>>,
     ) -> Result<Response<PutChunkResponse>, Status> {
+        // Bug BF-4 — self-reject ALL writes while this node has at least
+        // one un-acked integrity fault outstanding. The mgr's
+        // auto-quarantine path (BF-6) clears the flag via ConfigUpdate
+        // once it has issued QuarantineNode + the operator has
+        // unquarantined. Refusing here is defence-in-depth: routing
+        // already excludes Quarantined nodes (BC-11), but a stale
+        // mgr-side cache could still send a put_chunk our way during
+        // the propagation window.
+        if self.integrity_faults.is_self_quarantined() {
+            return Err(Status::failed_precondition(
+                "Bug BF-4: data node self-quarantined: verify_on_read \
+                 fault pending mgr ack. Operator must unquarantine via \
+                 /ui/integrity before this node accepts writes.",
+            ));
+        }
         // Bug G — if a hard memory cap is configured and the background
         // sampler has flagged the process as past the shed threshold,
         // refuse the write outright. The FUSE client retries on
@@ -281,6 +311,43 @@ impl DataService for DataServiceImpl {
         }))
     }
 
+    /// Bug BC-6 — enumerate every chunk_id this data node holds.
+    /// Walks each configured disk's `chunks/aa/bb/<id>.dat` tree,
+    /// collects stems whose `.meta` companion also exists, applies
+    /// the page_token cursor + limit, and returns the slice.
+    /// Used by the manager's orphan_scrub tick (BC-7).
+    async fn list_chunks(
+        &self,
+        request: Request<ListChunksRequest>,
+    ) -> Result<Response<ListChunksResponse>, Status> {
+        let req = request.into_inner();
+        let limit = if req.limit == 0 { 1000 } else { req.limit as usize };
+
+        // Cheap implementation: enumerate everything, sort, then slice.
+        // A future revision can cache the listing between paged calls
+        // (orphan_scrub typically iterates all pages back-to-back).
+        let mut all: Vec<String> = self.store.list_all_chunk_ids().await
+            .map_err(|e| Status::internal(format!("list chunks failed: {e}")))?;
+        all.sort();
+
+        let start_idx = if req.page_token.is_empty() {
+            0
+        } else {
+            all.binary_search(&req.page_token).map(|i| i + 1).unwrap_or_else(|i| i)
+        };
+        let end_idx = (start_idx + limit).min(all.len());
+        let next = if end_idx < all.len() {
+            all[end_idx - 1].clone()
+        } else {
+            String::new()
+        };
+
+        Ok(Response::new(ListChunksResponse {
+            chunk_ids: all[start_idx..end_idx].to_vec(),
+            next_page_token: next,
+        }))
+    }
+
     async fn get_chunk(
         &self,
         request: Request<GetChunkRequest>,
@@ -316,9 +383,85 @@ impl DataService for DataServiceImpl {
                 .get_chunk(&chunk_id)
                 .await
                 .map_err(|e| Status::not_found(e.to_string()))?;
-            self.cache.put(key, loaded.clone());
+            self.cache.put(key.clone(), loaded.clone());
             loaded
         };
+
+        // Bug BC-8 — verify_on_read. When the cluster integrity knob is
+        // enabled (default true), BLAKE3-hash the chunk against the
+        // stored ChunkMeta.checksum BEFORE the bytes leave this process.
+        // Mismatch → DO NOT send any bytes; return DATA_LOSS so the FUSE
+        // client retries the next replica (existing P0-2 fallback path).
+        // We also log a `read.integrity_fault` audit so the operator's
+        // /ui/integrity feed surfaces the event without polling.
+        //
+        // Disabling this flag is gated by an explicit-acknowledgement
+        // boundary at the manager API (BC-8 ack guard). Once disabled,
+        // this code path skips the hash and serves the raw bytes —
+        // operator-acknowledged risk, AGENTS.md flags the false branch
+        // as the only mode where reads can deliver corrupt bytes.
+        if self.scrub_config.read().await.verify_on_read {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let expected = match self.store.get_chunk_meta(&chunk_id).await {
+                Ok(m) => m.checksum,
+                Err(_) => {
+                    // No meta on this node — can't verify. Bug BF-3:
+                    // record an integrity fault (detector =
+                    // "verify_on_read_meta_absent") so the heartbeat
+                    // surfaces this + the mgr quarantines us. Then
+                    // return DATA_LOSS so the FUSE client falls over
+                    // to a healthy replica.
+                    self.integrity_faults.record(
+                        crate::integrity::IntegrityFault {
+                            chunk_id:      req.chunk_id.clone(),
+                            observed_at_ms: now_ms,
+                            detector:      "verify_on_read_meta_absent".into(),
+                            expected_len:  0,
+                            actual_len:    data.len() as u64,
+                            expected_hash: String::new(),
+                            actual_hash:   String::new(),
+                        }
+                    );
+                    return Err(Status::data_loss(format!(
+                        "verify_on_read: meta absent for chunk {}", req.chunk_id
+                    )));
+                }
+            };
+            if !checksum::verify(&data, &expected) {
+                let actual_hex = hex::encode(checksum::compute(&data));
+                tracing::error!(
+                    chunk_id = %req.chunk_id,
+                    actual = %actual_hex,
+                    "Bug BC-8: read.integrity_fault — BLAKE3 mismatch \
+                     against stored meta. Refusing to serve."
+                );
+                // Bug BF-3 — record the fault so heartbeat ships it +
+                // mgr auto-quarantines this node (BF-6). The exact
+                // expected + actual hashes go to the operator's
+                // integrity feed (BC-12e).
+                self.integrity_faults.record(
+                    crate::integrity::IntegrityFault {
+                        chunk_id:      req.chunk_id.clone(),
+                        observed_at_ms: now_ms,
+                        detector:      "verify_on_read".into(),
+                        expected_len:  0,
+                        actual_len:    data.len() as u64,
+                        expected_hash: hex::encode(expected),
+                        actual_hash:   actual_hex,
+                    }
+                );
+                // Note: ArcCache has no per-key invalidate. The cached
+                // entry will age out via the LRU policy; meanwhile every
+                // subsequent read will hit this same check and refuse
+                // to serve, so a corrupted byte never leaves the process.
+                return Err(Status::data_loss(format!(
+                    "verify_on_read mismatch on chunk {}", req.chunk_id
+                )));
+            }
+        }
 
         // Bug AL — record the read for the manager-side I/O Throughput
         // rolling-rate. Cache hits are still real read traffic to the

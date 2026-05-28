@@ -16,6 +16,61 @@ use tracing::info;
 use crate::cluster::ClusterManager;
 use crate::placement::PlacementEngine;
 
+/// Bug BF-9 / BF-10 — warn-once gates for the three deprecated
+/// `VolumeSchedules` fields. Each AtomicBool flips on first observation
+/// so the warn lands once per manager process lifetime instead of every
+/// heartbeat.
+static WARNED_SCRUB_INTERVAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static WARNED_FSCK_INTERVAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static WARNED_CUSTOM_SCHEDULE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// The helper itself MUST read the deprecated fields to detect
+// them. Suppress the deprecation warning at the read site only.
+#[allow(deprecated)]
+fn warn_once_on_dead_schedule_fields(
+    volumes: &std::collections::BTreeMap<String, dtfs_common::types::VolumeConfig>,
+) {
+    use std::sync::atomic::Ordering;
+    for v in volumes.values() {
+        if v.schedules.scrub_interval_secs.is_some()
+            && !WARNED_SCRUB_INTERVAL.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                volume_id = %v.id,
+                value = ?v.schedules.scrub_interval_secs,
+                "Bug BF-9: VolumeSchedules.scrub_interval_secs is removed from \
+                 the active path. Cluster-wide [scrub] block governs cadence. \
+                 The field is preserved for snapshot compatibility but has no \
+                 effect. Remove it from your volume config."
+            );
+        }
+        if v.schedules.fsck_interval_secs.is_some()
+            && !WARNED_FSCK_INTERVAL.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                volume_id = %v.id,
+                value = ?v.schedules.fsck_interval_secs,
+                "Bug BF-10: VolumeSchedules.fsck_interval_secs is reserved \
+                 but never consumed. No fsck scheduler exists. Scheduled for \
+                 removal in next minor release."
+            );
+        }
+        if !v.schedules.custom.is_empty()
+            && !WARNED_CUSTOM_SCHEDULE.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                volume_id = %v.id,
+                count = v.schedules.custom.len(),
+                "Bug BF-10: VolumeSchedules.custom map is reserved but no \
+                 scheduler consumes named-job entries. Scheduled for removal."
+            );
+        }
+    }
+}
+
 /// gRPC metadata service backed by Raft-replicated state.
 ///
 /// Write operations (CreateFile, DeleteFile) are replicated through Raft.
@@ -378,6 +433,7 @@ impl ManagerService for MetadataService {
             // in /api/v1/nodes and the WebUI Nodes page.
             version: req.version.clone(),
             build_date: req.build_date.clone(),
+            quarantine: None,
         };
 
         let resp = self
@@ -414,40 +470,47 @@ impl ManagerService for MetadataService {
         // never populated and every node appeared as Down immediately (fix #2).
         self.cluster.process_heartbeat(node_id);
 
-        // AZ-1 — compute the effective scrub override from cluster
-        // defaults + any per-volume `schedules.scrub_interval_secs`.
-        // Send to the data-node every heartbeat; the data-side
-        // scrub scheduler hot-reloads within DECISION_TICK_SECS.
-        // Cluster defaults: 6 h quick / 168 h deep
-        // (`default_quick_interval` / `default_deep_interval` in
-        // dtfs-common/src/config.rs). The manager binary does not
-        // load a `ScrubConfig` (those live in DataNodeConfig); we
-        // use the same defaults so a fresh cluster has the same
-        // behaviour with or without ConfigUpdate.
-        const CLUSTER_QUICK_HOURS_DEFAULT: u64 = 6;
-        const CLUSTER_DEEP_HOURS_DEFAULT: u64 = 168;
+        // Bug BC-3 — heartbeat carries the full cluster scrub +
+        // integrity policy from `ManagerConfig.scrub`. The data-side
+        // scheduler hot-reloads within DECISION_TICK_SECS.
+        //
+        // Back-compat: the AZ-1 fields `quick_interval_hours` +
+        // `deep_interval_hours` are kept on the wire so a data node
+        // still on AZ-1 code reads the same values it always has.
+        // The new fields (orphan + verify_on_read + quarantine +
+        // auto-unquarantine) are populated from the same
+        // ClusterScrubConfig source of truth.
+        //
+        // Per-volume `VolumeSchedules.scrub_interval_secs` is now
+        // Bug BF-9 — per-volume `scrub_interval_secs` removed from the
+        // active path. Cluster-wide `manager.scrub.quick_interval_secs`
+        // is now the only source. The serde field on VolumeSchedules
+        // stays for back-compat reads of older snapshots but no longer
+        // influences the heartbeat override.
+        //
+        // Bug BF-10 — `fsck_interval_secs` + `custom` schedule fields
+        // are reserved-but-unused. We warn-once per process on first
+        // observation so operators see the deprecation in journalctl
+        // without the noise of a per-heartbeat warn.
+        let scrub_cfg = &self.config.scrub;
         let (cfg_version, scrub_override) = {
             let sm = self.sm_data.read().await;
             let cfg_version = sm.cluster_config.version;
-            let cluster_quick_secs =
-                CLUSTER_QUICK_HOURS_DEFAULT.saturating_mul(3600);
-            let cluster_deep_secs =
-                CLUSTER_DEEP_HOURS_DEFAULT.saturating_mul(3600);
-            let mut min_quick = cluster_quick_secs;
-            for v in sm.volumes.values() {
-                if let Some(override_secs) = v.schedules.scrub_interval_secs {
-                    if override_secs < min_quick {
-                        min_quick = override_secs;
-                    }
-                }
-            }
-            let quick_h = (min_quick.max(60) + 3599) / 3600;
-            let deep_h = (cluster_deep_secs.max(60) + 3599) / 3600;
+            warn_once_on_dead_schedule_fields(&sm.volumes);
+            let effective_quick_secs = scrub_cfg.quick_interval_secs.max(60);
+            let quick_h = (effective_quick_secs + 3599) / 3600;
+            let deep_h = (scrub_cfg.deep_interval_secs.max(60) + 3599) / 3600;
             (
                 cfg_version,
                 Some(dtfs_proto::dtfs::manager::ScrubConfigOverride {
-                    quick_interval_hours: quick_h.max(1),
-                    deep_interval_hours: deep_h.max(1),
+                    quick_interval_hours:   quick_h.max(1),
+                    deep_interval_hours:    deep_h.max(1),
+                    orphan_interval_secs:   scrub_cfg.orphan_interval_secs,
+                    orphan_grace_secs:      scrub_cfg.orphan_grace_secs,
+                    max_io_percent:         scrub_cfg.max_io_percent,
+                    verify_on_read:         scrub_cfg.verify_on_read,
+                    quarantine_on_fault:    scrub_cfg.quarantine_on_fault,
+                    auto_unquarantine_secs: scrub_cfg.auto_unquarantine_secs,
                 }),
             )
         };
@@ -482,12 +545,83 @@ impl ManagerService for MetadataService {
                 .await;
         }
 
-        let _ = self
-            .raft_write(ClientRequest::UpdateNodeStatus {
+        // Bug BF-6 — only mark Healthy if the node isn't currently
+        // Quarantined. Without this guard the very next heartbeat after
+        // an integrity-fault auto-quarantine would clobber the
+        // Quarantined status back to Healthy.
+        // Bug BF (data-side self-quarantine clear) — also surfaces the
+        // current Quarantined state so the heartbeat response can tell
+        // the data node it is free again.
+        let is_quarantined = {
+            let sm = self.sm_data.read().await;
+            sm.nodes
+                .get(&node_id)
+                .map(|n| n.quarantine.is_some())
+                .unwrap_or(false)
+        };
+        let self_quarantine_cleared = !is_quarantined;
+        if !is_quarantined {
+            let _ = self
+                .raft_write(ClientRequest::UpdateNodeStatus {
+                    node_id,
+                    status: "healthy".to_string(),
+                })
+                .await;
+        }
+
+        // Bug BF-6 — process every integrity_fault the data node
+        // reported since its last heartbeat. For each fault:
+        //   1. raft-write QuarantineNode (state_machine apply path
+        //      accumulates fault_count_total across faults).
+        //   2. raft-write RemoveCorruptChunkReplicas so the under-
+        //      replication scheduler re-replicates the chunk from a
+        //      healthy node immediately.
+        // Older data nodes don't emit field 10; for them the vec is
+        // empty + this loop is a no-op (back-compat with pre-BF data).
+        if !req.integrity_faults.is_empty() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            for fault in &req.integrity_faults {
+                let reason = match fault.detector.as_str() {
+                    "verify_on_read" => dtfs_common::types::QuarantineReason::VerifyOnReadMismatch,
+                    "verify_on_read_meta_absent" => dtfs_common::types::QuarantineReason::VerifyOnReadMismatch,
+                    _ => dtfs_common::types::QuarantineReason::VerifyOnReadMismatch,
+                };
+                let info = dtfs_common::types::QuarantineInfo {
+                    since_ms: now_ms,
+                    reason,
+                    triggering_chunk_id: Some(fault.chunk_id.clone()),
+                    fault_count_total: 0,  // apply path accumulates
+                    last_fault_at_ms: fault.observed_at_ms,
+                    last_fault_summary: format!(
+                        "{}: expected={} actual={}",
+                        fault.detector,
+                        if fault.expected_hash.is_empty() { "?" } else { &fault.expected_hash },
+                        if fault.actual_hash.is_empty() { "?" } else { &fault.actual_hash },
+                    ),
+                };
+                let _ = self
+                    .raft_write(ClientRequest::QuarantineNode { node_id, info })
+                    .await;
+                // Drop the (node, chunk) replica entry so the
+                // under-replication scheduler immediately picks a
+                // healthy source + re-replicates. RemoveCorruptChunkReplicas
+                // is the existing apply path used by Bug O scrub.
+                let _ = self
+                    .raft_write(ClientRequest::RemoveCorruptChunkReplicas {
+                        node_id: node_id.to_string(),
+                        chunk_hashes: vec![fault.chunk_id.clone()],
+                    })
+                    .await;
+            }
+            tracing::warn!(
                 node_id,
-                status: "healthy".to_string(),
-            })
-            .await;
+                count = req.integrity_faults.len(),
+                "Bug BF-6: auto-quarantined node after integrity faults reported via heartbeat"
+            );
+        }
 
         // P0-9: fan out per-chunk read counters into the tiering engine.
         // The TieringEngine aggregates by chunk_id and uses `reads_by_dc`
@@ -537,6 +671,7 @@ impl ManagerService for MetadataService {
             accepted: true,
             config_version: cfg_version,
             config_update,
+            self_quarantine_cleared,
         }))
     }
 

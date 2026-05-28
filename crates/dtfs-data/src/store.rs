@@ -615,6 +615,46 @@ impl ChunkStore {
             .collect()
     }
 
+    /// Bug BC-6 — enumerate every chunk_id this node holds on disk.
+    /// Walks each configured disk's `chunks/aa/bb/<id>.dat` tree and
+    /// returns the stems whose `.meta` companion also exists. Used by
+    /// the manager-side orphan_scrub planner (BC-7). Linear in chunk
+    /// count; OK at the ~24h cadence we tick orphan_scrub on.
+    pub async fn list_all_chunk_ids(&self) -> DtfsResult<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        for disk in self.disk_manager.all_disks() {
+            let chunks_dir = disk.mount_path.join("chunks");
+            if !chunks_dir.exists() {
+                continue;
+            }
+            let mut d1 = fs::read_dir(&chunks_dir).await.map_err(DtfsError::Io)?;
+            while let Some(e1) = d1.next_entry().await.map_err(DtfsError::Io)? {
+                if !e1.file_type().await.map_err(DtfsError::Io)?.is_dir() { continue; }
+                let mut d2 = fs::read_dir(e1.path()).await.map_err(DtfsError::Io)?;
+                while let Some(e2) = d2.next_entry().await.map_err(DtfsError::Io)? {
+                    if !e2.file_type().await.map_err(DtfsError::Io)?.is_dir() { continue; }
+                    let mut files = fs::read_dir(e2.path()).await.map_err(DtfsError::Io)?;
+                    while let Some(f) = files.next_entry().await.map_err(DtfsError::Io)? {
+                        let p = f.path();
+                        if p.extension().map_or(false, |x| x == "dat") {
+                            let stem = match p.file_stem().and_then(|s| s.to_str()) {
+                                Some(s) if !s.is_empty() => s.to_string(),
+                                _ => continue,
+                            };
+                            // Require the .meta companion so we never
+                            // surface a half-written chunk to the orphan
+                            // reaper.
+                            if p.with_extension("meta").exists() {
+                                out.push(stem);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Recover from WAL after a crash.
     ///
     /// Replays all WAL entries found across all disks:
