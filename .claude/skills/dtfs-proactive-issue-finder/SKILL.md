@@ -24,6 +24,49 @@ exist: a triage/intake session that turns reported issues into plans, and an
 implementation session that fixes them. Your job is to *find* the issues they
 will act on. You discover and report; you do not fix.
 
+## Step 0: load environments.yml (mandatory before any cluster action)
+
+Read `./environments.yml` at the repo root **before doing anything else**. If
+the file does not exist, print:
+
+```
+ERROR: ./environments.yml not found. Cannot determine cluster addresses.
+Create it from ./environments.yml.example and re-run the finder.
+```
+
+Then stop — do not proceed with the sweep.
+
+The file lists one or more named environments. Schema (see `environments.yml.example`
+for a full annotated reference):
+
+```yaml
+<env-name>:
+  ignore_missing: true | false   # true = env may be unreachable; skip gracefully
+  manager_nodes:                  # one or more host:port for the manager REST API
+    - <host>:<port>
+  jumpclient:                     # optional; SSH jump host to reach node logs
+    <alias>:
+      address: <ip>
+      user: <ssh-user>            # optional; defaults to current user
+      sshkey: <path>              # optional; relative to repo root
+```
+
+If multiple environments are defined and the user has not specified which one,
+ask before proceeding — do not silently sweep all environments unless the user
+explicitly says so.
+
+For each environment you are about to sweep:
+
+1. Pick the first reachable `manager_nodes` entry (try each in order; skip
+   unreachable ones).
+2. If no node is reachable and `ignore_missing: false`, treat this as a
+   **critical finding** ("environment `<name>` is completely unreachable").
+3. If no node is reachable and `ignore_missing: true`, note it as **info**
+   ("environment `<name>` unreachable — skipped per ignore_missing") and move on.
+4. When SSH to node logs is needed, use the `jumpclient` block from the same
+   environment entry as the jump host. If no `jumpclient` is defined, SSH
+   directly (assumes the nodes are reachable without a bastion).
+
 ## Prime directive: read-only
 
 This session is strictly observational. You may read state, read logs, and run
@@ -47,19 +90,22 @@ sessions. Discipline here keeps the division of labour clean.
 ## How to access the cluster
 
 You have three read paths. Prefer the cheapest that answers the question, and
-cross-check when something looks wrong.
+cross-check when something looks wrong. **All addresses and SSH details come
+from `./environments.yml`** (loaded in Step 0) — never hardcode IPs.
 
-1. **Manager REST API** (primary, no SSH needed). Default manager API is
-   `http://<mgr>:9402`. JSON is the machine-readable form — append nothing
-   special, the endpoints return JSON. Use `curl -s`.
+1. **Manager REST API** (primary, no SSH needed). Use the first reachable entry
+   from `manager_nodes` in the chosen environment: `http://<host:port>`. JSON is
+   the machine-readable form — the endpoints return JSON. Use `curl -s`.
 2. **dtfs-cli** (convenience wrapper over the same API). `dtfs-cli --manager
-   <host:9402> --format json <cmd>`. Use `--format json` so output is parseable.
+   <host:port> --format json <cmd>`. Use `--format json` so output is parseable.
    Only the read subcommands: `status`, `nodes`, `volumes list`, `volumes show`,
    `files list`, `audit`, `config`, `health`. **Never** `scrub`, `maintenance`,
    `files flush-cache`, or any `volumes set-*` / `create` / `migrate-policy`.
-3. **SSH to nodes** for logs the API does not expose. Lab is `10.150.0.0/24`,
-   key `~/.ssh/dtfs-lab/id_ed25519`. Daemons run under systemd as
-   `dtfs-manager` and `dtfs-data`; read their logs with
+3. **SSH to nodes** for logs the API does not expose. Use the `jumpclient` block
+   from the environment entry as the SSH jump host (if present); otherwise
+   connect directly. SSH key and user come from the `jumpclient.sshkey` /
+   `jumpclient.user` fields (fall back to defaults if absent). Daemons run under
+   systemd as `dtfs-manager` and `dtfs-data`; read their logs with
    `journalctl -u dtfs-manager --no-pager -n <N>` (read-only). Never restart a
    unit or edit a config on the node.
 
@@ -110,10 +156,13 @@ state, then reason across it (a single symptom often shows up in three places).
 - `dtfs-cli nodes --format json` / `GET /api/v1/nodes`: every node's health,
   role, datacenter, disk count, capacity, used. Then per-suspect node
   `GET /api/v1/nodes/<id>` for per-disk tier/usage/SMART/status.
-- Compare the live node roster against the Plexmedia roster: are mgr01-05,
-  data-primary01, data-warm01, data-warm02 all present and in the right DC with
-  the right role? A node that is **quarantined**, in **maintenance**, or
-  **unhealthy** is a finding. A node that is *missing entirely* is a bigger one.
+- Compare the live node roster against the expected topology. For production
+  (`cluster_name` matches the Plexmedia cluster name), cross-check against
+  AGENTS.md § A.1: mgr01-05, data-primary01, data-warm01, data-warm02 in the
+  right DCs and roles. For any other cluster name, cross-check against whatever
+  nodes the volume configs and `environments.yml` imply. A node that is
+  **quarantined**, in **maintenance**, or **unhealthy** is a finding. A node
+  that is *missing entirely* is a bigger one.
 
 ### 2. Cluster / volume / disk usage vs expected
 

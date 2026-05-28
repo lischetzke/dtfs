@@ -54,7 +54,11 @@ Forbidden (mutating): `scrub`, `maintenance`, `files flush-cache`,
 Any `*.corrupt` / `*.fault` / `read.integrity_fault` is a data-integrity
 finding (high/critical).
 
-## SSH + logs (lab `10.150.0.0/24`, key `~/.ssh/dtfs-lab/id_ed25519`)
+## SSH + logs
+
+Host addresses, jump host, SSH user, and key all come from the `jumpclient`
+block of the chosen environment in `./environments.yml`. If no `jumpclient` is
+defined, connect directly to the node IPs returned by `/api/v1/nodes`.
 
 Systemd units: `dtfs-manager` (mgr nodes), `dtfs-data` (data nodes).
 
