@@ -26,6 +26,52 @@ use dtfs_proto::dtfs::manager::{
 /// Size of each streaming piece for chunk I/O (1 MB).
 const STREAM_PIECE_SIZE: usize = 1024 * 1024;
 
+/// Bug BC-9 — a read failed because the data node reported the chunk
+/// failed its `verify_on_read` BLAKE3 check (gRPC `DataLoss`). Kept as a
+/// distinct error type so the FUSE read path can recognise corruption
+/// (vs a transport fault), log it as an integrity event, and fail over
+/// to a healthy replica instead of surfacing the corrupt bytes.
+#[derive(Debug, Clone)]
+pub struct IntegrityFaultError {
+    pub chunk_id: String,
+    pub node: String,
+    pub detail: String,
+}
+
+impl std::fmt::Display for IntegrityFaultError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "integrity fault: chunk {} failed verify_on_read on {} ({})",
+            self.chunk_id, self.node, self.detail
+        )
+    }
+}
+
+impl std::error::Error for IntegrityFaultError {}
+
+/// Bug BC-9 — classify a data-node read failure. A `DataLoss` status is
+/// the verify_on_read integrity signal and becomes an
+/// [`IntegrityFaultError`]; everything else stays a generic transport
+/// error so the two are never conflated in logs or fallback decisions.
+fn map_read_status(status: tonic::Status, node: &str, chunk_id: &str) -> anyhow::Error {
+    if status.code() == tonic::Code::DataLoss {
+        tracing::warn!(
+            chunk_id,
+            node,
+            detail = %status.message(),
+            "Bug BC-9: integrity fault on read; failing over to next replica"
+        );
+        anyhow::Error::new(IntegrityFaultError {
+            chunk_id: chunk_id.to_string(),
+            node: node.to_string(),
+            detail: status.message().to_string(),
+        })
+    } else {
+        anyhow::Error::new(status).context("error reading chunk stream")
+    }
+}
+
 /// Bug G — retry policy for `RESOURCE_EXHAUSTED` from put_chunk. The
 /// data node returns this status while its memory budget is in the
 /// "shedding" state. Client backs off exponentially and retries — this
@@ -372,10 +418,13 @@ impl DtfsClient {
             requester_dc: self.inner.requester_dc.read().clone(),
             requester_host: self.inner.requester_host.read().clone(),
         };
-        let response = client
-            .get_chunk(request)
-            .await
-            .context("get_chunk RPC failed")?;
+        let response = match client.get_chunk(request).await {
+            Ok(r) => r,
+            // Bug BC-9 — classify integrity faults distinctly from
+            // transport errors (a corrupt chunk can be rejected before
+            // any piece is streamed).
+            Err(status) => return Err(map_read_status(status, node_addr, chunk_id)),
+        };
 
         let mut stream = response.into_inner();
         // Pre-allocate based on the total_size hint in the first piece to
@@ -383,16 +432,21 @@ impl DtfsClient {
         let mut data: Vec<u8> = Vec::new();
         let mut total_hint = 0u64;
 
-        while let Some(piece) = stream
-            .message()
-            .await
-            .context("error reading chunk stream")?
-        {
-            if total_hint == 0 && piece.total_size > 0 {
-                total_hint = piece.total_size;
-                data.reserve(piece.total_size as usize);
+        loop {
+            match stream.message().await {
+                Ok(Some(piece)) => {
+                    if total_hint == 0 && piece.total_size > 0 {
+                        total_hint = piece.total_size;
+                        data.reserve(piece.total_size as usize);
+                    }
+                    data.extend_from_slice(&piece.data);
+                }
+                Ok(None) => break,
+                // Bug BC-9 — verify_on_read emits the `DataLoss` trailer
+                // after streaming; drop the (corrupt) buffer and surface
+                // a typed integrity fault so the caller fails over.
+                Err(status) => return Err(map_read_status(status, node_addr, chunk_id)),
             }
-            data.extend_from_slice(&piece.data);
         }
 
         debug!(
@@ -1005,6 +1059,45 @@ impl DtfsClient {
 impl Default for DtfsClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod bug_bc9_integrity_fault_tests {
+    use super::*;
+
+    /// Bug BC-9 — a `DataLoss` status (verify_on_read mismatch) must map
+    /// to a typed `IntegrityFaultError` so the FUSE read path can tell
+    /// corruption apart from a flaky link and fail over deliberately.
+    #[test]
+    fn data_loss_status_classified_as_integrity_fault() {
+        let e = map_read_status(
+            tonic::Status::data_loss("blake3 mismatch"),
+            "data01:9500",
+            "chunk-abc",
+        );
+        let fault = e.downcast_ref::<IntegrityFaultError>();
+        assert!(
+            fault.is_some(),
+            "DataLoss must classify as IntegrityFaultError, got: {e}"
+        );
+        let fault = fault.unwrap();
+        assert_eq!(fault.node, "data01:9500");
+        assert_eq!(fault.chunk_id, "chunk-abc");
+    }
+
+    /// A transport error must NOT be tagged as an integrity fault.
+    #[test]
+    fn transport_status_is_not_an_integrity_fault() {
+        let e = map_read_status(
+            tonic::Status::unavailable("connection refused"),
+            "data02:9500",
+            "chunk-xyz",
+        );
+        assert!(
+            e.downcast_ref::<IntegrityFaultError>().is_none(),
+            "transport errors must stay generic, not integrity faults"
+        );
     }
 }
 
