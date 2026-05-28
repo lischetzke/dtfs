@@ -71,6 +71,12 @@
   holds the warm copy; the repair queue drains and flush stops being
   refused once the anchor exists. Production-shaped clusters (cold
   anchor on a node that holds no warm cache) were unaffected.
+- **Bug BM-3 — unsatisfiable mandatory tape constraint rejected at volume
+  save.** `POST /api/v1/volumes/{id}/set-mandatory` now returns 400 when
+  `mandatory_replicas.tape > 0` but no tape-tier disk is registered in the
+  cluster. Previously the API accepted it and the under-replication
+  scheduler queued a replication task that could never succeed for every
+  chunk on the volume.
 - **Bug BL — non-leader managers now forward heartbeat Raft writes to the
   leader.** A data node whose heartbeat landed on a follower had its Raft
   writes (node usage / liveness, per-disk usage, auto-quarantine, and
