@@ -4,6 +4,7 @@ use std::sync::Arc;
 use dtfs_common::config::ManagerConfig;
 use dtfs_common::topology::Location;
 use dtfs_common::types::{DiskStatus, DiskTier, HealthStatus, NodeRole};
+use dtfs_proto::dtfs::manager::manager_service_client::ManagerServiceClient;
 use dtfs_proto::dtfs::manager::manager_service_server::ManagerService;
 use dtfs_proto::dtfs::manager::*;
 use dtfs_raft::state_machine::StateMachineData;
@@ -88,6 +89,18 @@ pub struct MetadataService {
     /// heartbeats so the auto-move-replica-toward-active-DC decisions
     /// are driven by real access patterns.
     pub tiering: Option<Arc<crate::tiering::TieringEngine>>,
+    /// Bug BL — cached manager-to-manager clients keyed by leader gRPC
+    /// addr. A non-leader heartbeat handler forwards the heartbeat's Raft
+    /// writes to the current leader via `ForwardClientWrite`; caching the
+    /// channel avoids a TCP+HTTP/2 handshake on every 5 s heartbeat tick.
+    leader_clients: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                ManagerServiceClient<tonic::transport::Channel>,
+            >,
+        >,
+    >,
 }
 
 impl MetadataService {
@@ -105,6 +118,9 @@ impl MetadataService {
             placement,
             cluster,
             tiering: None,
+            leader_clients: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -173,6 +189,121 @@ impl MetadataService {
             }
         }
     }
+
+    /// Bug BL — propose a heartbeat-originated write, forwarding to the
+    /// current leader when this manager is a follower.
+    ///
+    /// On a follower, `client_write` returns `ForwardToLeader`; the four
+    /// heartbeat writes (UpdateNodeUsage, UpdateNodeDiskUsage,
+    /// QuarantineNode, RemoveCorruptChunkReplicas) were previously
+    /// `let _`-dropped, so node liveness, quarantine state, and integrity
+    /// faults never committed when a data node heartbeat landed on a
+    /// non-leader. This wrapper proxies the request to the leader via the
+    /// `ForwardClientWrite` RPC instead of dropping it.
+    async fn raft_write_or_forward(&self, req: ClientRequest) -> Result<ClientResponse, Status> {
+        match self.raft.client_write(req.clone()).await {
+            Ok(resp) => Ok(resp.data),
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("forward request to") || msg.contains("ForwardToLeader") {
+                    tracing::debug!(error = %e, "heartbeat raft write: forwarding to leader");
+                    self.proxy_to_leader(req).await
+                } else {
+                    Err(Status::internal(format!("Raft write failed: {e}")))
+                }
+            }
+        }
+    }
+
+    /// Bug BL — forward a `ClientRequest` to the current Raft leader and
+    /// return the leader's `ClientResponse`.
+    async fn proxy_to_leader(&self, req: ClientRequest) -> Result<ClientResponse, Status> {
+        use openraft::async_runtime::watch::WatchReceiver;
+        let leader_id = self
+            .raft
+            .metrics()
+            .borrow_watched()
+            .current_leader
+            .ok_or_else(|| Status::unavailable("no leader to forward heartbeat write to"))?;
+
+        // Resolve the leader's gRPC addr from the configured voter set
+        // (node_id_from_hostname matches the openraft node id).
+        let leader_addr = resolve_leader_addr(&self.config.cluster.initial_voters, leader_id)
+            .ok_or_else(|| {
+                Status::unavailable(format!(
+                    "leader {leader_id} not found in cluster.initial_voters"
+                ))
+            })?;
+
+        let mut client = self.leader_client(&leader_addr).await?;
+        let body = serde_json::to_vec(&req)
+            .map_err(|e| Status::internal(format!("serialize ClientRequest: {e}")))?;
+        let resp = client
+            .forward_client_write(ForwardWriteRequest { client_request_json: body })
+            .await
+            .map_err(|e| {
+                // Drop the cached client on transport error so the next
+                // forward reconnects (leader may have restarted).
+                Status::unavailable(format!("forward to leader {leader_addr} failed: {e}"))
+            })?
+            .into_inner();
+
+        if !resp.success {
+            return Err(Status::unavailable(format!(
+                "leader rejected forwarded write: {}",
+                resp.error
+            )));
+        }
+        serde_json::from_slice(&resp.response_json)
+            .map_err(|e| Status::internal(format!("deserialize ClientResponse: {e}")))
+    }
+
+    /// Bug BL — return a cached (or freshly-connected) manager client to
+    /// the given leader addr.
+    async fn leader_client(
+        &self,
+        addr: &str,
+    ) -> Result<ManagerServiceClient<tonic::transport::Channel>, Status> {
+        {
+            let cache = self.leader_clients.lock().await;
+            if let Some(c) = cache.get(addr) {
+                return Ok(c.clone());
+            }
+        }
+        let endpoint = format!("http://{addr}");
+        let client = ManagerServiceClient::connect(endpoint)
+            .await
+            .map_err(|e| Status::unavailable(format!("connect leader {addr}: {e}")))?;
+        self.leader_clients
+            .lock()
+            .await
+            .insert(addr.to_string(), client.clone());
+        Ok(client)
+    }
+}
+
+/// Bug BL-3 — a data node may be told it is clear (so it re-enables
+/// `put_chunk`) only when it is not currently quarantined in Raft state
+/// AND it did not report any integrity fault in this heartbeat. The
+/// second clause closes the same-cycle window: a node that just reported
+/// corruption must not be re-enabled before the QuarantineNode write
+/// (forwarded to the leader) has committed and replicated back.
+fn compute_self_quarantine_cleared(is_quarantined: bool, reported_fault_count: usize) -> bool {
+    !is_quarantined && reported_fault_count == 0
+}
+
+/// Bug BL — resolve the gRPC address of the current Raft leader from the
+/// configured voter set. The openraft node id is derived from the
+/// hostname via `node_id_from_hostname`, so a voter matches the leader
+/// when their derived id equals `leader_id`.
+fn resolve_leader_addr(
+    voters: &[dtfs_common::config::InitialVoter],
+    leader_id: u64,
+) -> Option<String> {
+    voters
+        .iter()
+        .find(|v| dtfs_common::node_id_from_hostname(&v.hostname) == leader_id)
+        .map(|v| v.addr.clone())
 }
 
 fn tier_from_proto(s: &str) -> DiskTier {
@@ -516,7 +647,7 @@ impl ManagerService for MetadataService {
         };
 
         let _ = self
-            .raft_write(ClientRequest::UpdateNodeUsage {
+            .raft_write_or_forward(ClientRequest::UpdateNodeUsage {
                 node_id,
                 used_capacity: req.total_bytes_used,
                 chunk_count: req.total_chunks,
@@ -541,7 +672,7 @@ impl ManagerService for MetadataService {
                 .map(|d| (d.disk_id, d.total_bytes, d.used_bytes))
                 .collect();
             let _ = self
-                .raft_write(ClientRequest::UpdateNodeDiskUsage { node_id, per_disk })
+                .raft_write_or_forward(ClientRequest::UpdateNodeDiskUsage { node_id, per_disk })
                 .await;
         }
 
@@ -559,10 +690,19 @@ impl ManagerService for MetadataService {
                 .map(|n| n.quarantine.is_some())
                 .unwrap_or(false)
         };
-        let self_quarantine_cleared = !is_quarantined;
+        // Bug BL-3 — never tell a data node it is clear in the same cycle
+        // it reported an integrity fault. Without this guard, a non-leader
+        // whose QuarantineNode write was dropped (now forwarded, but
+        // committed asynchronously on the leader) would read the local,
+        // not-yet-replicated `quarantine = None` and re-enable put_chunk
+        // on a node that just reported a corrupt chunk. Combined with the
+        // forwarding above, subsequent cycles read the replicated
+        // quarantine state correctly.
+        let self_quarantine_cleared =
+            compute_self_quarantine_cleared(is_quarantined, req.integrity_faults.len());
         if !is_quarantined {
             let _ = self
-                .raft_write(ClientRequest::UpdateNodeStatus {
+                .raft_write_or_forward(ClientRequest::UpdateNodeStatus {
                     node_id,
                     status: "healthy".to_string(),
                 })
@@ -603,14 +743,14 @@ impl ManagerService for MetadataService {
                     ),
                 };
                 let _ = self
-                    .raft_write(ClientRequest::QuarantineNode { node_id, info })
+                    .raft_write_or_forward(ClientRequest::QuarantineNode { node_id, info })
                     .await;
                 // Drop the (node, chunk) replica entry so the
                 // under-replication scheduler immediately picks a
                 // healthy source + re-replicates. RemoveCorruptChunkReplicas
                 // is the existing apply path used by Bug O scrub.
                 let _ = self
-                    .raft_write(ClientRequest::RemoveCorruptChunkReplicas {
+                    .raft_write_or_forward(ClientRequest::RemoveCorruptChunkReplicas {
                         node_id: node_id.to_string(),
                         chunk_hashes: vec![fault.chunk_id.clone()],
                     })
@@ -730,6 +870,38 @@ impl ManagerService for MetadataService {
         }
 
         Ok(Response::new(ChunkStatusAck { accepted: true }))
+    }
+
+    /// Bug BL — leader-side handler for writes forwarded by a non-leader
+    /// manager (see `proxy_to_leader`). Deserializes the `ClientRequest`,
+    /// applies it through Raft, and returns the serialized `ClientResponse`.
+    /// If this manager is itself no longer the leader (leadership changed
+    /// mid-flight), `client_write` returns `ForwardToLeader` and we reply
+    /// `success = false` with the error so the caller drops the write
+    /// (best-effort; the next heartbeat re-attempts).
+    async fn forward_client_write(
+        &self,
+        request: Request<ForwardWriteRequest>,
+    ) -> Result<Response<ForwardWriteResponse>, Status> {
+        let body = request.into_inner();
+        let req: ClientRequest = serde_json::from_slice(&body.client_request_json)
+            .map_err(|e| Status::invalid_argument(format!("bad ClientRequest json: {e}")))?;
+        match self.raft.client_write(req).await {
+            Ok(resp) => {
+                let response_json = serde_json::to_vec(&resp.data)
+                    .map_err(|e| Status::internal(format!("serialize ClientResponse: {e}")))?;
+                Ok(Response::new(ForwardWriteResponse {
+                    success: true,
+                    response_json,
+                    error: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(ForwardWriteResponse {
+                success: false,
+                response_json: Vec::new(),
+                error: format!("{e}"),
+            })),
+        }
     }
 
     async fn delete_file(
@@ -1882,5 +2054,53 @@ mod tests {
     fn bug_w_no_peer_falls_back_to_hostname() {
         let addr = build_data_grpc_addr(None, "data-warm01", 9500);
         assert_eq!(addr, "http://data-warm01:9500");
+    }
+
+    // ── Bug BL — heartbeat non-leader forwarding helpers ────────────
+
+    fn mk_voter(hostname: &str, addr: &str) -> dtfs_common::config::InitialVoter {
+        dtfs_common::config::InitialVoter {
+            hostname: hostname.to_string(),
+            addr: addr.to_string(),
+            region: String::new(),
+            datacenter: String::new(),
+            rack: String::new(),
+        }
+    }
+
+    /// BL-3 — a node that reported an integrity fault this cycle must
+    /// never be told it is clear, even if Raft state still shows it as
+    /// not-yet-quarantined (the QuarantineNode write commits async on the
+    /// leader). Without this the data node re-enables put_chunk on a
+    /// corrupt node within one heartbeat.
+    #[test]
+    fn bl3_self_quarantine_cleared_guard() {
+        // Healthy node, no faults → cleared.
+        assert!(compute_self_quarantine_cleared(false, 0));
+        // Reported a fault this cycle → NOT cleared, even though not yet
+        // quarantined in local state.
+        assert!(!compute_self_quarantine_cleared(false, 1));
+        // Already quarantined → not cleared.
+        assert!(!compute_self_quarantine_cleared(true, 0));
+        // Quarantined AND reporting faults → not cleared.
+        assert!(!compute_self_quarantine_cleared(true, 2));
+    }
+
+    /// BL-1 — the leader's gRPC addr resolves from the voter set by
+    /// matching node_id_from_hostname against the openraft leader id.
+    #[test]
+    fn bl1_resolve_leader_addr_matches_by_hostname_id() {
+        let voters = vec![
+            mk_voter("mini-mgr01", "10.0.0.1:9401"),
+            mk_voter("mini-mgr02", "10.0.0.2:9401"),
+            mk_voter("mini-mgr03", "10.0.0.3:9401"),
+        ];
+        let leader_id = dtfs_common::node_id_from_hostname("mini-mgr02");
+        assert_eq!(
+            resolve_leader_addr(&voters, leader_id),
+            Some("10.0.0.2:9401".to_string())
+        );
+        // Unknown leader id (not in voter set) → None.
+        assert_eq!(resolve_leader_addr(&voters, 0), None);
     }
 }
