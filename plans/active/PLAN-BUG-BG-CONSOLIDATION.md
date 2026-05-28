@@ -100,7 +100,7 @@ home plan (AV, BA) and is only cross-referenced here.
 
 ## Phase 2 — Code gaps
 
-### ⬜ BG-4 — BC-9: integrity-aware read fallback (the real data gap)
+### ✅ BG-4 — BC-9: integrity-aware read fallback (the real data gap)
 - **Problem:** data node returns `Status::data_loss` on a verify-on-read
   BLAKE3 mismatch, but `dtfs-client` `read_chunk` does not detect the
   integrity-fault signal, and `dtfs-fuse/src/filesystem.rs` (~:636) only
@@ -205,6 +205,25 @@ BG-8, BG-9, BG-10.
   Note: the previously-untracked BA plan doc was swept into this commit
   by `git add -A plans/` — harmless (a plan doc that needed tracking),
   but landed here rather than under a BA commit.
+
+- **2026-05-28 BG-4 (BC-9)**: implemented typed `IntegrityFaultError` +
+  `map_read_status` in dtfs-client (`DataLoss` → integrity fault, else
+  generic), rewrote `read_chunk` to route both error paths through it,
+  and made the FUSE fallback loop log integrity faults distinctly.
+  Unit tests `bug_bc9_integrity_fault_tests` (2/2) green on builder;
+  full `dtfs-client` suite green; `dtfs-fuse` release build clean.
+  Live on mini cluster: deployed new dtfs-fuse to mini-client01,
+  corrupted the chunk replicas, restarted FUSE to bust its in-memory
+  chunk cache, read → client journal showed BOTH new log lines
+  (`dtfs_client::client: Bug BC-9: integrity fault on read; failing
+  over` + `dtfs_fuse::filesystem: Bug BC-9: integrity fault on replica,
+  failing over to next`) for node 10.150.0.175, and the read STILL
+  returned the correct sha (8418b950…) via fail-over — corrupt bytes
+  never served. Lab restored (all chunk backups reverted, test files
+  removed, no volume config changed — set-mandatory was intentionally
+  not used). Note: reads are served from dtfs-fuse's in-memory chunk
+  cache, so on-disk corruption only surfaces after a FUSE restart or
+  cache eviction; `local_cache_max_gb=0` disables only the *disk* cache.
 
 ## Deviations from plan
 - BA plan doc (`PLAN-BUG-BA-SOAK-2026-05-26.md`) committed in BG-3 (see

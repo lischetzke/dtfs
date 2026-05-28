@@ -639,12 +639,26 @@ impl DtfsFilesystem {
                             break;
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                chunk_id = %chunk.chunk_id,
-                                node = %cand,
-                                error = %e,
-                                "replica read failed, trying next"
-                            );
+                            // Bug BC-9 — distinguish a verify_on_read
+                            // integrity fault from a transport error so
+                            // operators see corruption fail-over clearly.
+                            if e.downcast_ref::<dtfs_client::client::IntegrityFaultError>()
+                                .is_some()
+                            {
+                                tracing::warn!(
+                                    chunk_id = %chunk.chunk_id,
+                                    node = %cand,
+                                    error = %e,
+                                    "Bug BC-9: integrity fault on replica, failing over to next"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    chunk_id = %chunk.chunk_id,
+                                    node = %cand,
+                                    error = %e,
+                                    "replica read failed, trying next"
+                                );
+                            }
                             last_err = Some(e);
                         }
                     }
