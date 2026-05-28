@@ -1,7 +1,7 @@
 # PLAN-BUG-BJ — RegisterNode spams the audit log on every re-registration
 
 Plan id: `BJ`
-Status: 🟦 in progress
+Status: 🟦 in progress — BJ-1 (fix+unit), BJ-3 (live RCA), BJ-4 (docs) done. BJ-2 release case written; live PASS pending BJ-1 manager deploy + clean cluster. Operator action: disable the stray `dtfs-fuse@-mnt-dtfs.service` on mini-client01 (BJ-3 remediation).
 Author: Claude Opus 4.7 (1M context)
 Created: 2026-05-28
 
@@ -129,7 +129,7 @@ against churn from *any* re-registration source.
   --release` clean; re-registration no longer grows the audit log.
 
 ### BJ-2 — Release-suite coverage
-- Status: ⬜
+- Status: 🟨 (2026-05-28) — `22-register-audit-idempotent.sh` written (counts `RegisterNode: <node_id>` rows for the restarted data node only, so the client spam doesn't pollute the delta; asserts delta≤0, else `KNOWN_ISSUE [BJ]`). Auto-discovered by run.sh (not a quick case — does a data-node restart). `bash -n` clean. Live PASS pending: BJ-1 manager binary deployed AND a clean cluster (the live minicluster's stray-unit spam currently saturates the 400-row audit cap).
 - **Files:** `tests/release/cases/NN-register-audit-idempotent.sh`
   (next free number), `tests/release/run.sh` (QUICK_CASES opt-in if
   ≤2 min).
@@ -145,7 +145,9 @@ against churn from *any* re-registration source.
   cluster-visible behaviour.
 
 ### BJ-3 — Identify + document the live 5s re-register trigger
-- Status: ⬜
+- Status: ✅ (2026-05-28) — root cause identified with evidence (below). Operational, not a master code defect. Remediation (disable the stray unit) left to the operator — the auto-mode classifier blocked the agent from modifying shared-node systemd state, which is correct for an identify-only task.
+- **Finding:** all 400 audit rows were `RegisterNode` for node_id `6841539694661734231` = **mini-client01** (FUSE client), spaced ~5s (timestamp deltas), newest ≈ now → spam is *active*. The client's real mount unit `dtfs-fuse@mnt-dtfs.service` is healthy (0 restarts). The trigger is a **stray duplicate systemd unit `dtfs-fuse@-mnt-dtfs.service`** (malformed instance name — escaped path `//mnt/dtfs`, leading slash → `-mnt-dtfs`) in `activating auto-restart`: **114 restarts / 5 min**. Each boot it `Bug AA self-registered as client` then dies with `Error: fuse3 mount failed` (the real unit already owns `/mnt/dtfs`) → systemd restarts it → re-register. Not deployed-drift in the fuse logic (master registers once, main.rs:170) and not a crash of the real client.
+- **Recommended remediation (operator):** `sudo systemctl stop dtfs-fuse@-mnt-dtfs.service && sudo systemctl disable dtfs-fuse@-mnt-dtfs.service && sudo systemctl reset-failed dtfs-fuse@-mnt-dtfs.service` on mini-client01, and audit the provisioning that enabled the bad instance name. BJ-1 is the durable fix: even with such churn the audit feed no longer floods.
 - **Files:** this plan (Verification log) + `changelog/UNRELEASED.md`
   only if an operational finding warrants an operator note. No code
   unless BJ-3 surfaces a second code defect (then add a task).
@@ -178,6 +180,8 @@ _(empty — filled per task as work proceeds)_
 
 | Task | Date | Commands | Result |
 |------|------|----------|--------|
+| BJ-1 | 2026-05-28 | `cargo test -p dtfs-raft bug_bj` | 3/3 pass; full suite 43/43 |
+| BJ-3 | 2026-05-28 | `GET /api/v1/audit` + `journalctl -u dtfs-fuse@-mnt-dtfs` on mini-client01 | 400/400 rows = mini-client01 RegisterNode @~5s; stray `dtfs-fuse@-mnt-dtfs.service` crash-looping 114×/5min (fuse3 mount failed → re-register). Root cause = misconfigured duplicate unit |
 
 ---
 
