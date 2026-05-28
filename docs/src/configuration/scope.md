@@ -38,4 +38,4 @@ or they fall back to `node` (safer default).
   `ClientRequest::SetClusterConfig` variant so cluster-key changes
   land on every manager without operator SSH.
 
-See [`PLAN-BUG-BD-CONFIG-PANE.md`](../../../plans/active/PLAN-BUG-BD-CONFIG-PANE.md).
+See [`PLAN-BUG-BD-CONFIG-PANE.md`](../../../plans/completed/2026-05-28-PLAN-BUG-BD-CONFIG-PANE.md).
