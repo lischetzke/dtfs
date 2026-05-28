@@ -71,6 +71,20 @@
   holds the warm copy; the repair queue drains and flush stops being
   refused once the anchor exists. Production-shaped clusters (cold
   anchor on a node that holds no warm cache) were unaffected.
+- **Bug BL — non-leader managers now forward heartbeat Raft writes to the
+  leader.** A data node whose heartbeat landed on a follower had its Raft
+  writes (node usage / liveness, per-disk usage, auto-quarantine, and
+  corrupt-replica removal) silently dropped — openraft returned
+  `ForwardToLeader` and the handler discarded it. Symptoms: `last_seen_ms`
+  frozen for hours, integrity faults never recorded in the audit/integrity
+  feed, and a corrupt self-quarantined node re-enabled for writes within
+  one heartbeat. Followers now proxy these writes to the current leader via
+  a new internal `ForwardClientWrite` RPC, so liveness and integrity state
+  stay current regardless of which manager a node heartbeats.
+- **Bug BL — self-quarantine no longer falsely cleared.** A data node that
+  reports an integrity fault in a heartbeat is never told it is clear in
+  the same cycle, so it cannot re-enable `put_chunk` on a chunk it just
+  found corrupt before the quarantine commits.
 - **Bug BK — WebUI now lists quick and deep scrub results separately per
   node.** Scrub results were keyed by node id alone in Raft state, so a
   deep scrub overwrote the quick result (and vice versa) and the
