@@ -138,7 +138,7 @@ legacy field retained. Add a focused snapshot round-trip test.
   node that ran both; `cargo test -p dtfs-manager --release` clean.
 
 ### BK-3 — WebUI lists all scrub results (per node + level)
-- Status: ⬜
+- Status: ✅ (2026-05-28) — `renderScrub` now loops `stats.scrub_results_by_node`, rendering one `renderScrubCard` per (node,level) sorted by node then level; empty-state placeholder preserved; `.scrub-result` separator CSS added. Unit `bug_bk_scrub_tests::scrub_lists_all_levels` asserts the array wiring + both Quick/Deep badges; dtfs-manager 140/140. Live browser confirm pending next manager redeploy.
 - **Files:** `crates/dtfs-manager/src/webui.rs`
 - **Implementation sketch:** Replace the single
   `renderScrub(stats.last_scrub)` call (line 866) with a loop that
@@ -184,6 +184,7 @@ _(empty — filled per task as work proceeds)_
 | Task | Date | Commands | Result |
 |------|------|----------|--------|
 | BK-1 | 2026-05-28 | `cargo test -p dtfs-raft --release scrub` (builder) | 3/3 pass (quick_then_deep, snapshot_roundtrip, legacy_migrates); full crate 49/49 |
+| BK-2/3 | 2026-05-28 | `cargo test -p dtfs-manager --release` (builder) | 140/140 (incl. `scrub_lists_all_levels`) |
 
 ---
 
