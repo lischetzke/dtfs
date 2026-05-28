@@ -792,7 +792,12 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
         // ── Health banner
         const h = stats.health || 'unknown';
-        const detail = stats.healthy_nodes + '/' + stats.total_nodes + ' nodes healthy';
+        // Bug BH-8 — count managers + data only (infra_*); clients are
+        // consumers and must not drag the ratio. Fall back to the legacy
+        // all-node fields if an older manager hasn't shipped infra_*.
+        const infraHealthy = stats.infra_healthy ?? stats.healthy_nodes;
+        const infraTotal   = stats.infra_total   ?? stats.total_nodes;
+        const detail = infraHealthy + '/' + infraTotal + ' nodes healthy';
         const right = 'Config v' + (stats.config_version || 0) +
                       ' · ' + (stats.file_count || 0) + ' files';
         setHealthBanner(h, h.toUpperCase(), detail, right);
@@ -1563,7 +1568,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     </div>
                     <div style="display:flex;gap:.5rem;align-items:center">
                         ${{quarBadge}}
-                        <span class="badge badge-${{h}}">${{n.health||'unknown'}}</span>
+                        ${{isQuarantined ? '' : `<span class="badge badge-${{h}}">${{n.health||'unknown'}}</span>`}}
                         ${{isStorageRole ? `<button class="btn-maint" onclick="toggleMaintenance('${{n.node_id}}', ${{!isMaintenance}})">
                             ${{isMaintenance ? 'Exit Maintenance' : 'Set Maintenance'}}
                         </button>` : ''}}

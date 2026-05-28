@@ -223,7 +223,7 @@ extraction.
   reviewed (note "no change needed" if so).
 
 ### BH-7 — WebUI: node card shows a duplicate quarantine badge
-- Status: ⬜
+- Status: 🟨 (2026-05-28) — webui.rs node card now suppresses the generic health badge when quarantined (single QUARANTINED badge). Compiles; live verify folded into BH-6.
 - **Discovered:** 2026-05-28 during the concurrent agent's quarantine
   tests — a quarantined node renders **two** markers in the Nodes view:
   `QUARANTINED` (uppercase) next to `Quarantined` (title case).
@@ -267,7 +267,7 @@ extraction.
   testable there.
 
 ### BH-8 — WebUI: health banner node ratio is wrong / mixes node sets
-- Status: ⬜
+- Status: 🟨 (2026-05-28) — `infra_health_counts` helper + `infra_healthy`/`infra_total` stats fields (managers+data, clients excluded); banner reads them; unit `bug_bh8_infra_health_tests` green; case 17 extended. Live verify in BH-6.
 - **Discovered:** 2026-05-28 during the concurrent agent's tests — the
   dashboard health banner showed `2/3 nodes healthy` while all 3
   managers were healthy and the only unhealthy node was a *data* node.
@@ -333,7 +333,7 @@ extraction.
   extends it rather than adding a new one.
 
 ### BH-9 — Integrity page: TARGET and RESULT/SUMMARY columns duplicate content
-- Status: ⬜
+- Status: 🟨 (2026-05-28) — quarantine audit row now emitted via `audit_structured` (actor=system, action=node.quarantine, target="<id> (<hostname>)", result/summary=fault detail). Unit `bug_bc_10_quarantine_node_sets_health_and_info` extended + green. Live verify in BH-6.
 - **Discovered:** 2026-05-28 during the concurrent agent's quarantine
   tests — the `/ui/integrity` feed shows the same blob in both the
   `TARGET` and `RESULT / SUMMARY` columns, e.g.

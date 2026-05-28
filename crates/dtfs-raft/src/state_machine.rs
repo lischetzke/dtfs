@@ -777,6 +777,22 @@ fn apply_request(
         result: String::new(),
         origin_manager: String::new(),
     };
+    // Bug BH-9 — a state-machine-internal audit row that DOES carry the
+    // structured fields, so the integrity feed renders distinct TARGET
+    // vs RESULT/SUMMARY columns instead of `backfill_audit_fields`
+    // splitting one summary string into both. Shares the log_index /
+    // timestamp bookkeeping with `audit` above.
+    let audit_structured =
+        |action: &str, target: String, result: String, summary: String| AuditEntry {
+            log_index: log_id.index,
+            summary,
+            timestamp_ms: now_ms,
+            actor: "system".to_string(),
+            action: action.to_string(),
+            target,
+            result,
+            origin_manager: String::new(),
+        };
 
     match req {
         ClientRequest::CreateFile {
@@ -975,6 +991,7 @@ fn apply_request(
             use dtfs_common::types::HealthStatus;
             if let Some(node) = sm.nodes.get_mut(node_id) {
                 node.health = HealthStatus::Quarantined;
+                let hostname = node.hostname.clone();
                 // Accumulate fault_count_total across faults instead of
                 // resetting on every new quarantine — the WebUI badge
                 // surfaces the running total so operators see whether
@@ -986,14 +1003,29 @@ fn apply_request(
                 let mut merged = info.clone();
                 merged.fault_count_total = prior_count + 1;
                 node.quarantine = Some(merged);
+                // Bug BH-9 — emit with structured fields so the integrity
+                // feed shows node id + hostname in TARGET and the fault
+                // detail (reason / chunk / fault_count) in RESULT/SUMMARY,
+                // instead of `backfill_audit_fields` dumping the whole
+                // string into both columns.
+                let chunk = info
+                    .triggering_chunk_id
+                    .clone()
+                    .unwrap_or_else(|| "-".into());
+                let detail = format!(
+                    "reason={:?} chunk={} fault_count={}",
+                    info.reason,
+                    chunk,
+                    prior_count + 1,
+                );
                 push_audit_capped(
                     &mut sm.audit_log,
-                    audit(format!(
-                        "node.quarantine: {node_id} reason={:?} chunk={} fault_count={}",
-                        info.reason,
-                        info.triggering_chunk_id.clone().unwrap_or_else(|| "-".into()),
-                        prior_count + 1,
-                    )),
+                    audit_structured(
+                        "node.quarantine",
+                        format!("{node_id} ({hostname})"),
+                        detail.clone(),
+                        format!("node.quarantine: {node_id} {detail}"),
+                    ),
                 );
                 ClientResponse::Success
             } else {
@@ -3017,6 +3049,25 @@ mod posix_path_regression {
         // Audit row should mention quarantine + reason.
         let last = sm.audit_log.last().unwrap();
         assert_eq!(last.summary, "node.quarantine: 42 reason=VerifyOnReadMismatch chunk=aabbccdd fault_count=1");
+
+        // Bug BH-9 — the row must carry STRUCTURED fields so the
+        // integrity feed renders TARGET (node id + hostname) distinctly
+        // from RESULT/SUMMARY (the fault detail), not the same blob in
+        // both columns.
+        assert_eq!(last.actor, "system");
+        assert_eq!(last.action, "node.quarantine");
+        assert_eq!(last.target, "42 (data-1)", "TARGET = node id + hostname only");
+        assert!(
+            !last.target.contains("reason=") && !last.target.contains("chunk="),
+            "TARGET must not carry fault detail: {}",
+            last.target
+        );
+        assert!(
+            last.result.contains("reason=VerifyOnReadMismatch")
+                && last.result.contains("chunk=aabbccdd"),
+            "RESULT must carry the fault detail: {}",
+            last.result
+        );
     }
 
     #[test]
