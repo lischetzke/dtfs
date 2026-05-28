@@ -181,8 +181,13 @@ because some steps are blocked.
 * Document: how to run, what each case checks, how to interpret
   KNOWN_ISSUE rows, how to add a new case.
 
-#### ⬜ BE-22 — Make `--quick` part of pre-commit (optional, not
-  enforced) + add a release checklist row in CHANGELOG template.  [→ BG-10]
+#### ✅ BE-22 — Make `--quick` part of pre-commit (optional, not
+  enforced) + add a release checklist row in CHANGELOG template.  [done under BG-10]
+> Done 2026-05-28 (BG-10). Added the release-suite gate to
+> `changelog/README.md` "Cutting a release". The pre-commit-hook half
+> was deliberately NOT implemented: the suite needs a live cluster, so a
+> local git hook would fail every offline commit — wrong tradeoff for a
+> hermetic pre-commit. The gate lives in the release runbook instead.
 
 ## 5. Invariants every test must preserve
 

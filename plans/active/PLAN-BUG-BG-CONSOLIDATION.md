@@ -156,7 +156,7 @@ home plan (AV, BA) and is only cross-referenced here.
 - **Files:** archived plan(s) referencing `CLAUDE.md §` — repoint to
   `AGENTS.md §`. Trivial (~5 min).
 
-### ⬜ BG-10 — BE-22 (optional): `--quick` pre-commit hook
+### ✅ BG-10 — BE-22 (optional): release gate (pre-commit hook declined)
 - **Files:** pre-commit hook / `scripts/`. Mark **optional**; only land
   if cheap and non-disruptive.
 
@@ -277,7 +277,17 @@ BG-8, BG-9, BG-10.
   log_store_reopens_clean_db`; full dtfs-raft suite 40/40 green on
   builder. Updated the incident doc status + AV plan marker.
 
+- **2026-05-28 BG-10 (BE-22)**: added the release-suite gate to
+  `changelog/README.md` "Cutting a release" (run `tests/release/run.sh`,
+  no unexplained FAIL before tagging). Declined the optional pre-commit
+  hook: the suite needs a live cluster, so a local git hook would fail
+  every offline commit — wrong tradeoff for a hermetic pre-commit.
+  Marked BE-22 ✅ in the BE plan.
+
 ## Deviations from plan
+- BG-10 pre-commit hook deliberately not implemented (cluster-dependent
+  suite is unfit for a hermetic local hook); shipped the release-runbook
+  gate instead, which is the part that adds value.
 - BG-6 turned out to be RCA-already-done (codec, AV-5-11). Kept the
   scope tight: a small WAL-tail hardening + test rather than re-doing
   the resolved investigation. Chose TolerateCorruptedTailRecords (drops
