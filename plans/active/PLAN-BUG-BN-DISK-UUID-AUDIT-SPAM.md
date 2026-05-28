@@ -1,7 +1,7 @@
 # PLAN-BUG-BN — Persistent disk UUIDs + heartbeat audit spam
 
 Plan id: `BN`
-Status: 🟦 code complete (2026-05-28) — BN-1..BN-4 code + unit tests green (dtfs-data 68/68, dtfs-raft 52/52); release cases 26/27 written; deploy + live verification pending.
+Status: ✅ complete (2026-05-28) — BN-1..BN-4 done, deployed (data + manager binaries, leader-last), live-verified. Case 26 PASS (disk UUIDs identical across mini-data01 restart). Case 27 PASS (UpdateNodeUsage audit rows 198→198, no growth over 30s). unit: dtfs-data 68/68, dtfs-raft 52/52.
 Author: Claude Sonnet 4.6
 Created: 2026-05-28
 Sources: BJ Deviations (disk UUID follow-up candidate); live audit feed observation post-BJ
@@ -205,6 +205,9 @@ _(empty — filled per task as work proceeds)_
 
 | Task | Date | Commands | Result |
 |------|------|----------|--------|
+| BN-1/2 | 2026-05-28 | `cargo test -p dtfs-data -p dtfs-raft --release` (builder) | dtfs-data 68/68, dtfs-raft 52/52 |
+| BN-1 | 2026-05-28 | deploy data binary; `bash tests/release/cases/26-disk-uuid-stable.sh` | PASS — UUIDs identical across mini-data01 restart |
+| BN-2 | 2026-05-28 | deploy mgr binary; `bash tests/release/cases/27-heartbeat-audit-suppressed.sh` | PASS — UpdateNodeUsage rows 198→198 (no growth) |
 
 ---
 
