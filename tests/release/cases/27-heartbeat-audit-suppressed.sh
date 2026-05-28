@@ -28,9 +28,12 @@ echo "[3/3] re-count"
 U1=$(count_summary_prefix "UpdateNodeUsage")
 echo "  UpdateNodeUsage rows after wait: $U1"
 
-# Post-BN-2: 0 and non-growing. Pre-BN-2: grows every 5s.
-if [ "${U1:-1}" -eq 0 ] && [ "${U0:-1}" -eq 0 ]; then
+# Post-BN-2: must NOT grow (data nodes heartbeat ~6x in 30s). Residual
+# rows from before a rolling upgrade may linger in the capped log and get
+# evicted over time, so we assert no-growth (U1 <= U0), not absolute zero.
+# Pre-BN-2: grows every 5s -> U1 > U0.
+if [ "${U1:-1}" -le "${U0:-0}" ]; then
     pass
 else
-    known_issue BN "audit feed carries UpdateNodeUsage rows (before=$U0 after=$U1) — BN-2 heartbeat-audit suppression not in the deployed manager binary"
+    known_issue BN "UpdateNodeUsage audit rows grew $U0 -> $U1 over 30s — BN-2 heartbeat-audit suppression not in the deployed manager binary"
 fi
