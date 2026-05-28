@@ -71,3 +71,11 @@
   holds the warm copy; the repair queue drains and flush stops being
   refused once the anchor exists. Production-shaped clusters (cold
   anchor on a node that holds no warm cache) were unaffected.
+- **Bug BK — WebUI now lists quick and deep scrub results separately per
+  node.** Scrub results were keyed by node id alone in Raft state, so a
+  deep scrub overwrote the quick result (and vice versa) and the
+  dashboard "Last Scrub" card showed only the single most-recent level.
+  Results are now retained per `(node, level)` (the legacy per-node map
+  is kept one release for snapshot back-compat and migrated on load),
+  `GET /api/v1/stats` returns one entry per `(node, level)`, and the
+  WebUI renders one card per node and level.
