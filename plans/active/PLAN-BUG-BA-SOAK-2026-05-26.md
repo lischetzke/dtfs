@@ -56,34 +56,11 @@ Every 5 minutes:
 
 ## 1. Task list
 
-### ⬜ BA-1 — 1h soak
-
-* **Files:** `tests/proxmox/abuse/17-bug-ba-soak-1h.sh` (new).
-* **Implementation:** driver that runs the workload above for
-  3600 s + a checker that polls every 5 min. Writes to
-  `plans/reports/SOAK-2026-05-26-1h.md` as it goes.
-* **Done when:** report has 12 check rows + bug-list section.
-
-### 🟥 BA-2 — 4h soak (CANCELLED 2026-05-26)
-
-Operator cancelled. 1h soak surfaced enough material (BA-1 orphans,
-BA-2 disk-usage apportionment lie, scrub gaps) to drive Bugs BC,
-BB, BD. Re-spawn a longer soak after BC + BB land if regression
-risk warrants it.
-
-**2026-05-27 on-demand re-run** (Bug BF-14): the soak driver is
-parameterised by duration. To run a fresh 4 h soak against the
-current binaries:
-
-```
-ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.150.0.150 \
-    'cd ~/dtfs2 && bash tests/proxmox/abuse/17-bug-ba-soak.sh 14400 \
-       plans/reports/SOAK-$(date -u +%Y%m%dT%H%M%SZ)-4h.md'
-```
-
-Report lands at `plans/reports/SOAK-<run-id>-4h.md` on the builder.
-48 probe rounds expected (5 min cadence × 4 h). Append any new
-findings to § 5 of this plan with a fresh `BA-N` id.
+> BA-1 (1h soak) and BA-2 (4h soak) removed from scope per operator
+> 2026-05-28 — the soak driver (`tests/proxmox/abuse/17-bug-ba-soak.sh`,
+> duration-parameterised) already exists and the findings it surfaced are
+> captured in § 5 + forked to Bugs BC/BB/BD. Only the issue catalog
+> (BA-3) remains as the live deliverable.
 
 ### ⬜ BA-3 — Issue catalog
 
