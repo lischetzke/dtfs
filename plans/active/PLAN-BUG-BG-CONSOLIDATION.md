@@ -129,7 +129,7 @@ home plan (AV, BA) and is only cross-referenced here.
 - **Done when:** `bash tests/release/run.sh --quick` green on the lab
   cluster; cases reference the shared libs.
 
-### ⬜ BG-6 — AV-5-2: Raft log "unexpected EOF" RCA + fix
+### ✅ BG-6 — AV-5-2: Raft log "unexpected EOF" RCA + fix
 - **Files:** `crates/dtfs-raft/src/` (log/snapshot read path) — scope
   confirmed during RCA.
 - **Sketch:** reproduce, root-cause the truncated/short log read, fix
@@ -265,7 +265,24 @@ BG-8, BG-9, BG-10.
   (full dtfs-data metrics suite 9/9). Marker was stale; reconciled in
   AV plan + here. No commit of code.
 
+- **2026-05-28 BG-6 (AV-5-2)**: RCA already existed — root cause was
+  bincode positional encoding breaking on `#[serde(default)]` field
+  additions (NOT a torn tail), documented in
+  `plans/incidents/RAFT-LOG-EOF-2026-05-23.md` and fixed by AV-5-11
+  (JSON-first codec + bincode fallback, already in `log_store.rs`).
+  Added complementary defence-in-depth for the torn-WAL-tail case the
+  codec fix doesn't cover: `DBRecoveryMode::TolerateCorruptedTailRecords`
+  on log-store open + an actionable open-error pointing at the recovery
+  runbook. Regression test `bug_av_5_2_recovery_tests::
+  log_store_reopens_clean_db`; full dtfs-raft suite 40/40 green on
+  builder. Updated the incident doc status + AV plan marker.
+
 ## Deviations from plan
+- BG-6 turned out to be RCA-already-done (codec, AV-5-11). Kept the
+  scope tight: a small WAL-tail hardening + test rather than re-doing
+  the resolved investigation. Chose TolerateCorruptedTailRecords (drops
+  only an incomplete trailing record) over PointInTimeRecovery (can
+  drop committed mid-log entries) to avoid any durability regression.
 - BG-7 was already implemented (stale marker), so it became a
   reconciliation rather than a code task — same class of drift this
   whole plan exists to fix.
