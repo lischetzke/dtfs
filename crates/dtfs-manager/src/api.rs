@@ -2437,6 +2437,49 @@ pub(crate) fn compute_io_rate_at(
     (read_bps, write_bps)
 }
 
+/// Bug BH-8 — count (healthy, total) over cluster *infrastructure*
+/// nodes only: managers + data. Clients (FUSE mounts) are consumers and
+/// must not drag the dashboard health ratio down. Numerator and
+/// denominator come from the same pass so they can never diverge.
+pub(crate) fn infra_health_counts<'a>(
+    nodes: impl Iterator<Item = (&'a NodeRole, &'a HealthStatus)>,
+) -> (usize, usize) {
+    let mut total = 0usize;
+    let mut healthy = 0usize;
+    for (role, health) in nodes {
+        if matches!(role, NodeRole::Manager | NodeRole::Data) {
+            total += 1;
+            if *health == HealthStatus::Healthy {
+                healthy += 1;
+            }
+        }
+    }
+    (healthy, total)
+}
+
+#[cfg(test)]
+mod bug_bh8_infra_health_tests {
+    use super::*;
+
+    /// BH-8 — banner ratio counts managers + data, excludes clients,
+    /// and never diverges numerator vs denominator.
+    #[test]
+    fn counts_infra_excludes_clients() {
+        let nodes = vec![
+            (NodeRole::Manager, HealthStatus::Healthy),
+            (NodeRole::Manager, HealthStatus::Healthy),
+            (NodeRole::Manager, HealthStatus::Healthy),
+            (NodeRole::Data, HealthStatus::Healthy),
+            (NodeRole::Data, HealthStatus::Suspect), // unhealthy data node counts
+            (NodeRole::Client, HealthStatus::Suspect), // client excluded entirely
+        ];
+        let (healthy, total) =
+            infra_health_counts(nodes.iter().map(|(r, h)| (r, h)));
+        assert_eq!(total, 5, "3 managers + 2 data; client excluded");
+        assert_eq!(healthy, 4, "one data node unhealthy");
+    }
+}
+
 async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
     use dtfs_common::types::{DiskTier, HealthStatus, NodeRole};
 
@@ -2587,6 +2630,11 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         compute_io_rate(&mut tracker, &sm.nodes)
     };
 
+    // Bug BH-8 — infrastructure (managers + data) health for the
+    // dashboard banner. Single explicit set; clients excluded.
+    let (infra_healthy, infra_total) =
+        infra_health_counts(sm.nodes.values().map(|n| (&n.role, &n.health)));
+
     // Overall cluster health.
     let total_nodes = sm.nodes.len();
     let healthy_nodes = sm
@@ -2703,6 +2751,12 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         // excludes them; the counter is what the WebUI badge reads.
         "quarantined_nodes":     quarantined_nodes,
         "total_nodes":           total_nodes,
+        // Bug BH-8 — banner ratio over cluster infrastructure only
+        // (managers + data); clients are consumers, not cluster health.
+        // Numerator/denominator are taken from one explicit set so they
+        // can never diverge.
+        "infra_healthy":         infra_healthy,
+        "infra_total":           infra_total,
         "manager_count":         manager_count,
         "data_node_count":       data_node_count,
         "disk_count":            disk_count,

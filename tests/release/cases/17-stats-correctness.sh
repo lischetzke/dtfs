@@ -19,6 +19,11 @@ print(f'TIER_USED_SUM={sum(t[\"used_bytes\"] for t in d[\"tier_breakdown\"])}')
 print(f'TIER_TOTAL_SUM={sum(t[\"total_bytes\"] for t in d[\"tier_breakdown\"])}')
 print(f'NODES_HEALTHY={d[\"healthy_nodes\"]}')
 print(f'NODES_TOTAL={d[\"total_nodes\"]}')
+print(f'INFRA_HEALTHY={d.get(\"infra_healthy\", d[\"healthy_nodes\"])}')
+print(f'INFRA_TOTAL={d.get(\"infra_total\", d[\"total_nodes\"])}')
+print(f'MGR={d.get(\"manager_count\",0)}')
+print(f'DATA={d.get(\"data_node_count\",0)}')
+print(f'CLIENT={d.get(\"client_count\",0)}')
 ")"
 
 echo "logical=$LOG  net=$NET  raw=$RAW"
@@ -46,6 +51,16 @@ fi
 # 4. Healthy nodes equal total nodes.
 if [ "$NODES_HEALTHY" -lt "$NODES_TOTAL" ]; then
     fail "$((NODES_TOTAL - NODES_HEALTHY)) node(s) unhealthy"
+fi
+
+# 5. Bug BH-8 — the banner ratio (infra_*) covers managers + data only,
+# never clients, and numerator ≤ denominator over the same set.
+echo "infra_healthy=$INFRA_HEALTHY infra_total=$INFRA_TOTAL mgr=$MGR data=$DATA client=$CLIENT"
+if [ "$INFRA_TOTAL" -ne "$((MGR + DATA))" ]; then
+    fail "infra_total $INFRA_TOTAL != manager_count+data_node_count $((MGR + DATA)) — banner counts the wrong node set"
+fi
+if [ "$INFRA_HEALTHY" -gt "$INFRA_TOTAL" ]; then
+    fail "infra_healthy $INFRA_HEALTHY > infra_total $INFRA_TOTAL — numerator/denominator diverge"
 fi
 
 pass
