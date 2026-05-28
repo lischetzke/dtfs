@@ -354,9 +354,20 @@ async fn manager_lifecycle(
             let live = managed.all_disks().iter().find(|md| md.disk_id == i as u32);
             let total_bytes = live.map(|m| m.total_bytes).unwrap_or(0);
             let used_bytes = live.map(|m| m.used_bytes).unwrap_or(0);
+            // Bug BN-1 — stable UUID persisted to <mount>/.dtfs-disk-uuid.
+            // Fall back to a fresh random UUID (not a crash) if the file is
+            // unwritable (read-only mount, permissions, ENOSPC).
+            let uuid = crate::store::load_or_create_disk_uuid(&d.path)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "disk UUID file unavailable for {:?}: {e}; using ephemeral UUID",
+                        d.path
+                    );
+                    uuid::Uuid::new_v4().to_string()
+                });
             dtfs_proto::dtfs::common::DiskInfo {
                 disk_id: i as u32,
-                uuid: uuid::Uuid::new_v4().to_string(),
+                uuid,
                 mount_path: d.path.display().to_string(),
                 tier: match d.tier {
                     DiskTier::Hot => "hot".to_string(),

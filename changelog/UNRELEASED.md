@@ -71,6 +71,18 @@
   holds the warm copy; the repair queue drains and flush stops being
   refused once the anchor exists. Production-shaped clusters (cold
   anchor on a node that holds no warm cache) were unaffected.
+- **Bug BN-1 — disk UUIDs are now stable across data-node restarts.**
+  Each disk's UUID is persisted to `<mount_path>/.dtfs-disk-uuid` on first
+  discovery and read on every later boot; previously a fresh random UUID
+  was minted each boot, defeating UUID-based disk identity. Operational
+  note: when wiping/re-provisioning a disk under the same mount path,
+  delete `.dtfs-disk-uuid` so the new disk gets a fresh UUID.
+- **Bug BN-2 — heartbeat telemetry no longer spams the audit log.** Node
+  usage heartbeats (`UpdateNodeUsage`, every 5 s) no longer write an audit
+  row, and node-status updates (`UpdateNodeStatus`) audit only a genuine
+  health transition (e.g. Healthy→Suspect), not repeated same-state
+  applications. This stops real integrity events being evicted against the
+  audit-log cap.
 - **Bug BM-3 — unsatisfiable mandatory tape constraint rejected at volume
   save.** `POST /api/v1/volumes/{id}/set-mandatory` now returns 400 when
   `mandatory_replicas.tape > 0` but no tape-tier disk is registered in the
