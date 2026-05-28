@@ -75,7 +75,8 @@ sub-config arrives.
 
 ## 3. Tasks
 
-### ⬜ BC-1 — `config_key_scope` helper + row tagging
+### ✅ BC-1 — `config_key_scope` helper + row tagging
+> Done 2026-05-28 (commit d8c5822). `config_key_scope` at api.rs:2231 + `config_scope_tests`.
 
 * **Files:** `crates/dtfs-manager/src/api.rs`.
 * **Implementation:** add
@@ -90,7 +91,8 @@ sub-config arrives.
 * **Done when:** `cargo test -p dtfs-manager` green + curl
   `/api/v1/config/effective` shows `scope_kind` on every row.
 
-### ⬜ BC-2 — WebUI tab switcher
+### ✅ BC-2 — WebUI tab switcher
+> Done 2026-05-28 (commit 7fc1c7f). Cluster/Node segmented tabs in webui.rs renderConfig (~:2416).
 
 * **Files:** `crates/dtfs-manager/src/webui.rs::renderConfig`.
 * **Implementation:** two segmented buttons above the search box:
@@ -100,7 +102,8 @@ sub-config arrives.
 * **Done when:** WebUI loads with Cluster tab active, switch to
   Node tab shows only per-host keys, search filters within tab.
 
-### ⬜ BC-3 — Write-guard at API boundary
+### ✅ BC-3 — Write-guard at API boundary
+> Done 2026-05-28 (commit 7fc1c7f/d8c5822). `acknowledge_cluster_wide` guard on ConfigUpdateRequest (api.rs ~:2021/2052).
 
 * **Files:** `crates/dtfs-manager/src/api.rs::update_config`.
 * **Implementation:** before writing the merged config to disk,
@@ -113,7 +116,8 @@ sub-config arrives.
 * **Done when:** POST without ack returns 400 listing the cluster
   keys that would have been touched; with ack succeeds.
 
-### ⬜ BC-4 — Doc
+### ✅ BC-4 — Doc
+> Done 2026-05-28 (commit d8c5822). `docs/src/configuration/scope.md`.
 
 * **Files:** `docs/src/configuration/index.md` (or
   `docs/src/configuration/scope.md` new).

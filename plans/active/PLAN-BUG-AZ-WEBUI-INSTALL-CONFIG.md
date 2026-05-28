@@ -2,6 +2,13 @@
 
 **Status legend:** ⬜ todo · 🟦 in progress · ✅ done · 🟥 blocked · 🟨 needs review
 
+> **Reconciled 2026-05-28 (BG-2):** all 22 tasks shipped in commits
+> `7fc1c7f` + `d8c5822`; markers had never been flipped. One loose end
+> remains — AZ-4-2 rewrote the WebUI repo links as hardcoded strings
+> rather than interpolating `dtfs_common::REPO_URL`. That is tracked as
+> **BG-8** in `PLAN-BUG-BG-CONSOLIDATION.md`. This plan is otherwise
+> complete and archived to `plans/completed/`.
+
 Five-pronged plan combining operator UX work (WebUI), install
 ergonomics, a safety investigation (chunk-size resize), a doc-link
 cleanup, and a true raw-config pane. Each prong gets its own phase
@@ -151,7 +158,7 @@ AZ-3 and AZ-4 are small enough to bundle into a single PR.
 
 ## Phase 1 — Volume schedules (AZ-1, ~1.5 d)
 
-### ⬜ AZ-1-1 — `VolumeSchedules` type + `VolumeConfig::schedules`
+### ✅ AZ-1-1 — `VolumeSchedules` type + `VolumeConfig::schedules`
 
 * **Files:** `crates/dtfs-common/src/types.rs`.
 * **Implementation:** add struct from § 1.1. `#[serde(default)]`
@@ -162,7 +169,7 @@ AZ-3 and AZ-4 are small enough to bundle into a single PR.
 * **Done when:** 3 tests green; existing volume
   `snapshot_roundtrip` still green.
 
-### ⬜ AZ-1-2 — `POST /api/v1/volumes/{id}/set-schedules` REST
+### ✅ AZ-1-2 — `POST /api/v1/volumes/{id}/set-schedules` REST
 
 * **Files:** `crates/dtfs-manager/src/api.rs`.
 * **Implementation:** `SetSchedulesRequest { scrub_interval_secs:
@@ -175,7 +182,7 @@ AZ-3 and AZ-4 are small enough to bundle into a single PR.
   reject-too-small).
 * **Done when:** 4 tests + live curl returns updated config.
 
-### ⬜ AZ-1-3 — Scheduler honours per-volume scrub override
+### ✅ AZ-1-3 — Scheduler honours per-volume scrub override
 
 * **Files:** `crates/dtfs-data/src/scrub.rs`.
 * **Implementation:** scrub scheduler reads
@@ -187,7 +194,7 @@ AZ-3 and AZ-4 are small enough to bundle into a single PR.
 * **Done when:** 1 test + live verify: set scrub_interval_secs=60
   on `default`, observe next scrub firing within 60s.
 
-### ⬜ AZ-1-4 — WebUI Schedules card on Volumes page
+### ✅ AZ-1-4 — WebUI Schedules card on Volumes page
 
 * **Files:** `crates/dtfs-manager/src/webui.rs`.
 * **Implementation:** extend the AV-4-3 volume-detail card with a
@@ -198,7 +205,7 @@ AZ-3 and AZ-4 are small enough to bundle into a single PR.
 * **Done when:** card renders; setting + clearing schedules works
   via UI and reflects in `dtfs-cli volumes show`.
 
-### ⬜ AZ-1-5 — Docs
+### ✅ AZ-1-5 — Docs
 
 * **Files:** `docs/src/configuration/volume-config.md`,
   `docs/src/operations/cluster-management.md`,
@@ -219,7 +226,7 @@ AZ-3 and AZ-4 are small enough to bundle into a single PR.
 
 ## Phase 2 — Install script local-first + version select (AZ-2, ~1 d)
 
-### ⬜ AZ-2-1 — `scripts/dtfs-install.sh` source selection
+### ✅ AZ-2-1 — `scripts/dtfs-install.sh` source selection
 
 * **Files:** `scripts/dtfs-install.sh`.
 * **Implementation:** add CLI args
@@ -239,7 +246,7 @@ AZ-3 and AZ-4 are small enough to bundle into a single PR.
 * **Done when:** 4 source paths verified; `--source github
   --version v0.0.0-dev` rejects unknown tags with a clear error.
 
-### ⬜ AZ-2-2 — Atomic install (no symlinks)
+### ✅ AZ-2-2 — Atomic install (no symlinks)
 
 * **Files:** `scripts/dtfs-install.sh`.
 * **Implementation:** download into `/opt/dtfs/staging/<version>/`,
@@ -249,7 +256,7 @@ AZ-3 and AZ-4 are small enough to bundle into a single PR.
 * **Done when:** an interrupted download leaves the running
   binary intact (no half-written `/usr/local/bin/dtfs-manager`).
 
-### ⬜ AZ-2-3 — README + ops doc
+### ✅ AZ-2-3 — README + ops doc
 
 * **Files:** `README.md`, `docs/src/installation/getting-started.md`.
 * **Implementation:** document the new `--source` and `--version`
@@ -270,7 +277,7 @@ AZ-3 and AZ-4 are small enough to bundle into a single PR.
 This phase is an **investigation + a fix or a documentation
 update**, depending on what the read path currently does.
 
-### ⬜ AZ-3-1 — Reproduce the failure mode
+### ✅ AZ-3-1 — Reproduce the failure mode
 
 * **Files:** `tests/proxmox/abuse/16-bug-az-chunk-size-shrink.sh`
   (new).
@@ -285,7 +292,7 @@ update**, depending on what the read path currently does.
 * **Done when:** script written and run on the minicluster;
   failure mode documented in the verification log.
 
-### ⬜ AZ-3-2 — Reading code review
+### ✅ AZ-3-2 — Reading code review
 
 * **Files (read-only):** `crates/dtfs-fuse/src/filesystem.rs::read`,
   `crates/dtfs-client/src/client.rs`,
@@ -300,7 +307,7 @@ update**, depending on what the read path currently does.
   section: either AZ-3-3 (code fix) or AZ-3-3-alt (lock chunk_size
   post-first-write).
 
-### ⬜ AZ-3-3 — Fix: tolerate oversized on-disk chunks
+### ✅ AZ-3-3 — Fix: tolerate oversized on-disk chunks
 
 * **Files:** TBD per AZ-3-2's conclusion.
 * **Implementation:** either:
@@ -319,7 +326,7 @@ update**, depending on what the read path currently does.
   covering the boundary.
 * **Done when:** 1 script live-verify + 2 unit tests.
 
-### ⬜ AZ-3-4 — Docs
+### ✅ AZ-3-4 — Docs
 
 * **Files:** `docs/src/configuration/volume-config.md`.
 * **Implementation:** document the final chunk_size mutability
@@ -339,14 +346,14 @@ update**, depending on what the read path currently does.
 
 ## Phase 4 — Repo URL sweep (AZ-4, ~0.5 d)
 
-### ⬜ AZ-4-1 — Add `dtfs_common::REPO_URL` constant
+### ✅ AZ-4-1 — Add `dtfs_common::REPO_URL` constant
 
 * **Files:** `crates/dtfs-common/src/lib.rs`.
 * **Implementation:** per § 1.3. Re-export.
 * **Tests:** none (literal).
 * **Done when:** `cargo build` green.
 
-### ⬜ AZ-4-2 — WebUI consumes `REPO_URL`
+### ✅ AZ-4-2 — WebUI consumes `REPO_URL`
 
 * **Files:** `crates/dtfs-manager/src/webui.rs`.
 * **Implementation:** replace the hardcoded
@@ -358,7 +365,7 @@ update**, depending on what the read path currently does.
   `github.com/leduc/dtfs2`, assert 0 matches.
 * **Done when:** 0 matches.
 
-### ⬜ AZ-4-3 — Repo-wide sweep
+### ✅ AZ-4-3 — Repo-wide sweep
 
 * **Files:** any `*.md`, `*.rs`, `*.sh`, `*.yml`.
 * **Implementation:** `grep -rn "leduc/dtfs2" .` and rewrite all
@@ -379,7 +386,7 @@ update**, depending on what the read path currently does.
 
 ## Phase 5 — True config pane (AZ-5, ~2–3 d)
 
-### ⬜ AZ-5-A1 — `GET /api/v1/config/effective` endpoint
+### ✅ AZ-5-A1 — `GET /api/v1/config/effective` endpoint
 
 * **Files:** `crates/dtfs-manager/src/api.rs`,
   `crates/dtfs-common/src/config.rs`.
@@ -400,7 +407,7 @@ update**, depending on what the read path currently does.
 * **Done when:** 3 tests + live curl returns ~40-50 keys for the
   minicluster.
 
-### ⬜ AZ-5-A2 — Config write-to-disk capability
+### ✅ AZ-5-A2 — Config write-to-disk capability
 
 * **Files:** `crates/dtfs-manager/src/api.rs::update_config`.
 * **Implementation:** add `write_to_disk: bool` per § 1.2.
@@ -417,7 +424,7 @@ update**, depending on what the read path currently does.
   restart manager, observe value still 10 (not reverted to
   default).
 
-### ⬜ AZ-5-A3 — Boundary check fallback
+### ✅ AZ-5-A3 — Boundary check fallback
 
 * **Files:** `crates/dtfs-common/src/config.rs`,
   `crates/dtfs-manager/src/api.rs`.
@@ -433,7 +440,7 @@ update**, depending on what the read path currently does.
   `monitoring.heartbeat_interval_secs=0`, observe 400 +
   pre-attempt value in body + on-disk file unchanged.
 
-### ⬜ AZ-5-B1 — WebUI `/ui/config` page
+### ✅ AZ-5-B1 — WebUI `/ui/config` page
 
 * **Files:** `crates/dtfs-manager/src/webui.rs`.
 * **Implementation:** new page wired into the nav. Renders a
@@ -448,7 +455,7 @@ update**, depending on what the read path currently does.
   see the change reflected in
   `dtfs-cli config show` AND survive a manager restart.
 
-### ⬜ AZ-5-C1 — Docs
+### ✅ AZ-5-C1 — Docs
 
 * **Files:** `docs/src/operations/cluster-management.md`,
   `docs/src/api-reference/rest-api.md`.
