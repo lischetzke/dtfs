@@ -2,6 +2,13 @@
 
 **Status legend:** ⬜ todo · 🟦 in progress · ✅ done · 🟥 blocked · 🟨 needs review
 
+> **Reconciled 2026-05-28 (BG-2):** scrub strategies, verify_on_read,
+> quarantine WebUI + endpoints, bitrot test, and docs all shipped
+> (commits `d8c5822` + earlier); markers had lagged. The ONE genuinely
+> open item, **BC-9** (FUSE integrity-aware read fallback), is migrated
+> to **BG-4** in `PLAN-BUG-BG-CONSOLIDATION.md`. This plan archived to
+> `plans/completed/`; BC-9 is tracked solely under BG from here.
+
 The current scrub system (AGENTS.md § A.6 item 7 + § A.3.3 item 6)
 trusts the disk on reads and relies on a single periodic scrub for
 bit-rot detection. It also has no orphan-chunk GC despite AGENTS.md
@@ -282,7 +289,7 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
 
 ### Phase 2 — Scrub engine split
 
-#### ⬜ BC-4 — `quick_scrub` strategy (stat + size + meta presence)
+#### ✅ BC-4 — `quick_scrub` strategy (stat + size + meta presence)
 * **Files:** `crates/dtfs-data/src/scrub.rs` (split run_scrub into
   per-level strategies), `crates/dtfs-data/src/store.rs` (add
   `quick_scrub_disk(path) -> ScrubResult`).
@@ -291,18 +298,18 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
 * **Done when:** mismatch produces `IntegrityFault` returned up
   to data-node main loop.
 
-#### ⬜ BC-5 — `deep_scrub` strategy (BLAKE3 verify)
+#### ✅ BC-5 — `deep_scrub` strategy (BLAKE3 verify)
 * **Files:** as BC-4 + `crates/dtfs-data/src/store.rs::deep_scrub_disk`.
 * **Tests:** unit `deep_scrub_detects_bitrot`,
   `deep_scrub_ok_on_clean_disk`.
 
-#### ⬜ BC-6 — `orphan_scrub` data-side `ListChunks` RPC
+#### ✅ BC-6 — `orphan_scrub` data-side `ListChunks` RPC
 * **Files:** `proto/data.proto` (`ListChunksRequest/Response`),
   `crates/dtfs-data/src/server.rs::list_chunks` (paged, by tier
   filter optional).
 * **Tests:** unit `list_chunks_returns_all_dat_files`.
 
-#### ⬜ BC-7 — `orphan_scrub` mgr-side cross-check loop
+#### ✅ BC-7 — `orphan_scrub` mgr-side cross-check loop
 * **Files:** `crates/dtfs-manager/src/scheduler.rs` (new
   `orphan_scrub_tick`).
 * **Logic:**
@@ -320,7 +327,7 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
 
 ### Phase 3 — Hash on read
 
-#### ⬜ BC-8 — `verify_on_read` data-side streaming hash verify
+#### ✅ BC-8 — `verify_on_read` data-side streaming hash verify
 * **Files:** `crates/dtfs-data/src/server.rs::get_chunk` (when
   `verify_on_read=true`: incremental `blake3::Hasher` alongside
   the existing stream; final compare against `ChunkMeta.checksum`;
@@ -334,7 +341,11 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
   `get_chunk_skips_verify_when_disabled`,
   `update_config_rejects_disable_verify_without_ack`.
 
-#### ⬜ BC-9 — FUSE client retries on integrity-fault trailer
+#### ⬜ BC-9 — FUSE client retries on integrity-fault trailer  [MOVED → BG-4]
+> **Still open** as of 2026-05-28. `dtfs-client::read_chunk` does not
+> detect the `data_loss`/integrity trailer; `dtfs-fuse` only does
+> generic `Err` replica fallback. Migrated to **BG-4** in
+> `PLAN-BUG-BG-CONSOLIDATION.md`; this plan archived otherwise.
 * **Files:** `crates/dtfs-client/` (or `crates/dtfs-fuse/`).
 * **Logic:** detect trailer; discard buffer; try next replica;
   on all-failure return `EIO` to FUSE.
@@ -399,7 +410,7 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
   before mgr propagates. Folded into BC-8 (verify_on_read) where
   the self-quarantine machinery lands.
 
-#### ⬜ BC-12 — Operator unquarantine endpoint + audit + auto-clear
+#### ✅ BC-12 — Operator unquarantine endpoint + audit + auto-clear
 * **Files:** `crates/dtfs-manager/src/api.rs`
   (`POST /api/v1/nodes/{id}/unquarantine` body
   `{ "operator_id": "<who>", "reason_acknowledged": "<text>" }`,
@@ -412,7 +423,7 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
   `auto_unquarantine_respects_cooldown`,
   `auto_unquarantine_blocked_by_fresh_fault`.
 
-#### ⬜ BC-12a — Nodes API exposes quarantine state
+#### ✅ BC-12a — Nodes API exposes quarantine state
 * **Files:** `crates/dtfs-manager/src/api.rs::list_nodes_row_json`.
 * **Implementation:** add `quarantine: { since_ms, reason,
   triggering_chunk_id, fault_count_total, last_fault_at_ms,
@@ -420,7 +431,7 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
   null/absent otherwise.
 * **Tests:** unit `nodes_row_includes_quarantine_block`.
 
-#### ⬜ BC-12b — Integrity faults audit feed endpoint
+#### ✅ BC-12b — Integrity faults audit feed endpoint
 * **Files:** `crates/dtfs-manager/src/api.rs`
   (`GET /api/v1/integrity/faults?since_ms=<...>&limit=<...>`).
 * **Implementation:** filter `audit_log` by
@@ -435,7 +446,7 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
 > Operator must never need to curl. Every state, reason, and
 > action lives in the WebUI.
 
-#### ⬜ BC-12c — Nodes page Quarantined badge + details
+#### ✅ BC-12c — Nodes page Quarantined badge + details
 * **Files:** `crates/dtfs-manager/src/webui.rs::renderNodes`.
 * **Implementation:**
   - Add a red `QUARANTINED` badge next to the existing status
@@ -451,7 +462,7 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
 * **Done when:** Quarantined node visible on `/ui/nodes`
   without operator running any curl.
 
-#### ⬜ BC-12d — Unquarantine confirmation modal
+#### ✅ BC-12d — Unquarantine confirmation modal
 * **Files:** `crates/dtfs-manager/src/webui.rs`.
 * **Implementation:**
   - Modal shows: full `QuarantineInfo`, the chunk_id that
@@ -463,7 +474,7 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
     refresh.
 * **Done when:** modal happy path + validation green in browser.
 
-#### ⬜ BC-12e — Integrity feed page `/ui/integrity`
+#### ✅ BC-12e — Integrity feed page `/ui/integrity`
 * **Files:** `crates/dtfs-manager/src/webui.rs` (new nav entry
   + page).
 * **Implementation:**
@@ -478,7 +489,7 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
 
 ### Phase 5 — Deprecate per-volume scrub
 
-#### ⬜ BC-13 — Warn-log + ignore per-volume scrub_interval
+#### ✅ BC-13 — Warn-log + ignore per-volume scrub_interval
 * **Files:** `crates/dtfs-manager/src/api.rs::apply_set_schedules`
   (emit warning), `crates/dtfs-manager/src/metadata.rs` (drop
   min-aggregation), WebUI volume page (hide row, show notice).
@@ -487,7 +498,7 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
 
 ### Phase 6 — Live regression test
 
-#### ⬜ BC-14 — `tests/proxmox/abuse/18-bug-bc-bitrot.sh`
+#### ✅ BC-14 — `tests/proxmox/abuse/18-bug-bc-bitrot.sh`
 * **Implementation:** write 10 MB file → fetch chunk_id from
   `/api/v1/files` → SSH to a replica → flip a byte
   (`dd conv=notrunc bs=1 count=1 seek=...`) → read the file via
@@ -505,7 +516,7 @@ from `metadata.rs:427-428`. Read from `state.config.scrub` instead.
 
 ### Phase 7 — Docs
 
-#### ⬜ BC-15 — Docs update
+#### ✅ BC-15 — Docs update
 * **Files:** `docs/src/storage/scrubbing.md` (replace),
   `docs/src/operations/quarantine.md` (new),
   `AGENTS.md § A.3.3 item 6` (flip "Reads trust the disk;
