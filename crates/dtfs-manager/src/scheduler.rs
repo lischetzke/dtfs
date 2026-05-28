@@ -443,14 +443,17 @@ impl TaskScheduler {
 
         // Quick lookup: existing task fingerprints (chunk_id, target_node)
         // for in-progress tasks so we don't double-schedule.
+        // Bug BO-2: keep Failed tasks in the fingerprint set so a chunk that
+        // just exhausted its attempts is NOT immediately re-queued on the
+        // next 30s tick. A Failed task lingers for FAILED_TASK_RETENTION_MS
+        // (30 min, Bug AE prune); only after it is GC'd does check_anchor_lag
+        // schedule a fresh attempt. Previously Failed was excluded here, so
+        // the same chunk was re-queued every tick → tight loop + audit spam.
         let existing_tasks: std::collections::HashSet<(String, u64)> =
             migration_state
                 .tasks
                 .values()
-                .filter(|t| {
-                    t.status != MigrationStatus::Done
-                        && t.status != MigrationStatus::Failed
-                })
+                .filter(|t| task_blocks_requeue(t.status))
                 .map(|t| (t.chunk_id.clone(), t.target_node))
                 .collect();
 
@@ -626,8 +629,12 @@ impl TaskScheduler {
                     }
 
                     let target_addr = self.node_grpc_addr(task.target_node).await;
+                    // Bug BO-1: for a same-node cross-tier anchor copy, don't
+                    // exclude the target — it IS the only holder of the chunk
+                    // (on its other tier), and excluding it strands the copy.
+                    let exclude = anchor_copy_source_exclude(task.source_node, task.target_node);
                     let resolved_source = self
-                        .resolve_healthy_source(&task.chunk_id, task.target_node)
+                        .resolve_healthy_source(&task.chunk_id, exclude)
                         .await;
 
                     let outcome: Result<(), String> = match (resolved_source, target_addr) {
@@ -992,10 +999,17 @@ impl TaskScheduler {
     /// excluding `exclude` (the migration target). Returns `(node_id,
     /// grpc_addr)` for the chosen source, or `None` if no healthy replica
     /// exists. (Helper for F-015.)
+    /// Resolve a healthy node that holds `chunk_id`, optionally excluding
+    /// one node id. Bug BO-1: `exclude` is `None` for a same-node
+    /// cross-tier anchor copy (`source_node == target_node`) — the planner
+    /// (`plan_anchor_lag_repair`, BH) legitimately targets a node that
+    /// already holds the chunk on another tier, so excluding the target
+    /// would strand the copy with "no healthy source replica". All other
+    /// call sites pass `Some(target_node)` (unchanged behaviour).
     async fn resolve_healthy_source(
         &self,
         chunk_id: &str,
-        exclude: u64,
+        exclude: Option<u64>,
     ) -> Option<(u64, String)> {
         let sm = self.state_data.read().await;
         let mut candidates: Vec<u64> = Vec::new();
@@ -1003,7 +1017,7 @@ impl TaskScheduler {
             for c in &file.chunks {
                 if c.chunk_hash == chunk_id {
                     if let Ok(nid) = c.node_id.parse::<u64>() {
-                        if nid != exclude && !candidates.contains(&nid) {
+                        if Some(nid) != exclude && !candidates.contains(&nid) {
                             candidates.push(nid);
                         }
                     }
@@ -2285,6 +2299,29 @@ pub(crate) fn normalize_endpoint(stored_addr: &str) -> String {
     } else {
         format!("http://{}", stored_addr)
     }
+}
+
+/// Bug BO-1 — which node id (if any) `resolve_healthy_source` must exclude
+/// when copying a chunk for an anchor-lag task. For a same-node cross-tier
+/// copy (`source_node == target_node`) the target is the ONLY holder of the
+/// chunk (on its other tier), so excluding it strands the copy with "no
+/// healthy source replica". Returns `None` in that case; `Some(target)`
+/// otherwise (unchanged behaviour for cross-node copies).
+pub(crate) fn anchor_copy_source_exclude(source_node: u64, target_node: u64) -> Option<u64> {
+    if source_node == target_node {
+        None
+    } else {
+        Some(target_node)
+    }
+}
+
+/// Bug BO-2 — should a task with this status keep a chunk out of the
+/// anchor-lag re-queue set? Only non-Done tasks block a re-queue; a Failed
+/// task lingers (Bug AE 30-min retention) so the same chunk is NOT
+/// immediately re-scheduled every 30s tick. (Previously Failed was excluded
+/// too → tight re-queue loop + audit spam.)
+pub(crate) fn task_blocks_requeue(status: MigrationStatus) -> bool {
+    status != MigrationStatus::Done
 }
 
 // ---------------------------------------------------------------------------
@@ -3726,5 +3763,37 @@ mod bug_aw_migration_sort_tests {
         ];
         sort_migration_snapshot(&mut v);
         assert_eq!(ids(&v), vec!["repl-3", "repl-2", "repl-1"]);
+    }
+}
+
+#[cfg(test)]
+mod bug_bo_tests {
+    use super::*;
+
+    /// BO-1 — a same-node cross-tier anchor copy must NOT exclude the
+    /// target from the source search (the target is the only holder of the
+    /// chunk, on its other tier). Cross-node copies still exclude the
+    /// target.
+    #[test]
+    fn bo_1_same_node_source_not_excluded() {
+        assert_eq!(anchor_copy_source_exclude(1, 1), None,
+            "same-node warm->cold copy: target must not be excluded");
+        assert_eq!(anchor_copy_source_exclude(1, 2), Some(2),
+            "cross-node copy: target excluded as before");
+    }
+
+    /// BO-2 — a Failed task must keep its chunk in the re-queue-blocking
+    /// set (so check_anchor_lag does not re-schedule it every tick during
+    /// the 30-min retention window); only Done tasks free the chunk.
+    #[test]
+    fn bo_2_failed_blocks_requeue_done_does_not() {
+        assert!(task_blocks_requeue(MigrationStatus::Failed),
+            "Failed task must block immediate re-queue (was the tight-loop bug)");
+        assert!(!task_blocks_requeue(MigrationStatus::Done),
+            "Done task frees the chunk for a future schedule");
+        // In-flight states also block (unchanged).
+        assert!(task_blocks_requeue(MigrationStatus::Pending));
+        assert!(task_blocks_requeue(MigrationStatus::Copying));
+        assert!(task_blocks_requeue(MigrationStatus::Verifying));
     }
 }

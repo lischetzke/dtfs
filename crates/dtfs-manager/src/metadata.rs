@@ -723,7 +723,33 @@ impl ManagerService for MetadataService {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
+            // Bug BO-4 (BC-12e remainder) — the data node's verify-on-read
+            // mismatch surfaces only as a node.quarantine row today. Emit a
+            // distinct `read.integrity_fault` audit per fault so the
+            // /api/v1/integrity/faults feed shows the raw read event (chunk
+            // + hashes) separately from the node-quarantine action.
+            let hostname = {
+                let sm = self.sm_data.read().await;
+                sm.nodes.get(&node_id).map(|n| n.hostname.clone()).unwrap_or_default()
+            };
+            let origin_manager = self.config.node.hostname.clone();
             for fault in &req.integrity_faults {
+                let _ = self
+                    .raft_write_or_forward(ClientRequest::AppendAudit {
+                        actor: "system".to_string(),
+                        action: "read.integrity_fault".to_string(),
+                        target: format!("{node_id} ({hostname})"),
+                        result: format!(
+                            "detector={} chunk={} expected={} actual={}",
+                            fault.detector,
+                            fault.chunk_id,
+                            if fault.expected_hash.is_empty() { "?" } else { &fault.expected_hash },
+                            if fault.actual_hash.is_empty() { "?" } else { &fault.actual_hash },
+                        ),
+                        origin_manager: origin_manager.clone(),
+                        timestamp_ms: now_ms,
+                    })
+                    .await;
                 let reason = match fault.detector.as_str() {
                     "verify_on_read" => dtfs_common::types::QuarantineReason::VerifyOnReadMismatch,
                     "verify_on_read_meta_absent" => dtfs_common::types::QuarantineReason::VerifyOnReadMismatch,
@@ -1122,6 +1148,7 @@ impl ManagerService for MetadataService {
 
         let placed = self.placement.place_chunks_with_anchor(
             &req.volume_id,
+            &req.path, // Bug BO-3 — per-file seed so chunk-0 doesn't collide cross-file
             req.num_chunks,
             effective_tier,
             replication,
