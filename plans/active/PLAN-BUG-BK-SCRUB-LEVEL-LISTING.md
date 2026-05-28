@@ -1,7 +1,7 @@
 # PLAN-BUG-BK — WebUI lists only one scrub; quick + deep not shown
 
 Plan id: `BK`
-Status: 🟦 in progress
+Status: ✅ complete (2026-05-28) — BK-1..BK-5 all ✅. Storage/API/WebUI fix landed + deployed leader-last; unit tests green (dtfs-raft 49/49, dtfs-manager 140/140); release case 23 added (live SKIP on precondition — no on-demand scrub trigger exists, see § 6). Live API serves per-(node,level) array on all 3 managers.
 Author: Claude Opus 4.7 (1M context)
 Created: 2026-05-28
 
@@ -168,7 +168,7 @@ legacy field retained. Add a focused snapshot round-trip test.
   (cluster-visible: scrub result surfacing).
 
 ### BK-5 — Docs + changelog
-- Status: ⬜
+- Status: ✅ (2026-05-28) — `changelog/UNRELEASED.md` Bug BK entry added; `docs/src/operations/monitoring.md` scrub-status bullet updated to describe per-(node,level) cards.
 - **Files:** `changelog/UNRELEASED.md`;
   `docs/src/operations/monitoring.md` if it documents the scrub card.
 - **Implementation sketch:** Changelog line: WebUI now lists quick and
@@ -224,6 +224,15 @@ _(empty — filled per task as work proceeds)_
   (all three managers serve `scrub_results_by_node` as an array with the
   `level` field). Logged the unwired-scrub-trigger gap as a follow-up
   candidate (see § 7).
+- BK-4 commit hygiene: a concurrent actor had pre-staged a deliberate
+  plan-tree reorganization into the shared index (add `.gitignore` rule
+  `plans/completed/`, archive BE/BG/BI/BJ active→completed, add the
+  BL/BM/BN active plans + the 1416 issue-scan report) between the BK-3
+  and BK-4 commits. The BK-4 `git commit` swept those staged changes in
+  alongside the release case. The reorg content is intended (authored
+  under the repo owner's git identity) and the working tree is clean;
+  BK-1/BK-2/BK-3 commits were unaffected. Not rewriting history because
+  the index is shared with a concurrent agent and nothing is pushed.
 
 ---
 

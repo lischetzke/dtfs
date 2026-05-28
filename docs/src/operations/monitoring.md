@@ -157,7 +157,10 @@ Recommended panels for a Grafana cluster overview:
 - **Disk utilization** -- Per-disk capacity bars.
 - **I/O rates** -- Reads/writes per second.
 - **Cache performance** -- Hit ratio, T1/T2 sizes.
-- **Scrub status** -- Last scrub time, duration, corrupt chunk count.
+- **Scrub status** -- One card per node and scrub level (quick / deep):
+  completion time, duration, and chunks checked / healthy / corrupt /
+  missing. Quick and deep results are listed separately so the latest of
+  each level is always visible.
 
 ### Raft Dashboard
 
