@@ -121,7 +121,7 @@ legacy field retained. Add a focused snapshot round-trip test.
   --release` clean.
 
 ### BK-2 — API exposes per-(node, level) results
-- Status: ⬜
+- Status: ✅ (2026-05-28) — `get_stats` builds `scrub_results_by_node` and the back-compat `last_scrub` scalar by flattening `scrub_results_by_level` (node→level→record). Kept the existing JSON key name `scrub_results_by_node` (now one object per (node,level)); see Deviations. dtfs-manager 140/140; live + release-case coverage via BK-4.
 - **Files:** `crates/dtfs-manager/src/api.rs`
 - **Implementation sketch:** In `get_stats` (~line 2693), build the
   scrub array from `scrub_results_by_level` (flatten node→level→record),
@@ -200,7 +200,10 @@ _(empty — filled per task as work proceeds)_
 
 ## 6. Deviations from plan
 
-_(empty)_
+- BK-2/BK-3 API key naming: kept the existing key `scrub_results_by_node`
+  (it now carries one entry per `(node, level)` rather than per node).
+  Avoids a rename churn in any other consumer; WebUI BK-3 reads the same
+  key. The back-compat `last_scrub` scalar is retained.
 
 ---
 

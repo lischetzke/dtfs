@@ -2690,11 +2690,13 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         "healthy"
     };
 
-    // Per-node scrub results (fix for issue #8 — previously only the single
-    // most-recent cluster-wide result was kept, silently dropping all others).
+    // Per (node, level) scrub results (BK — previously keyed per-node only,
+    // so a deep scrub overwrote the quick result). Flatten the nested map to
+    // one JSON object per (node, level); the WebUI lists every entry.
     let scrub_results_by_node: Vec<Value> = sm
-        .scrub_results
+        .scrub_results_by_level
         .values()
+        .flat_map(|by_level| by_level.values())
         .map(|s| {
             json!({
                 "node_id":         s.node_id,
@@ -2711,10 +2713,11 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         .collect();
 
     // Backward-compatible `last_scrub` field: the most recent result across
-    // all nodes, or null when no scrubs have run yet.
+    // all (node, level) records, or null when no scrubs have run yet.
     let last_scrub = sm
-        .scrub_results
+        .scrub_results_by_level
         .values()
+        .flat_map(|by_level| by_level.values())
         .max_by_key(|s| s.completed_at_ms)
         .map(|s| {
             json!({
