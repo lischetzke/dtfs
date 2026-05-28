@@ -51,6 +51,14 @@
   `ChunkLocationCommit`.
 
 ## Bug Fixes
+- **Bug BJ — re-registering an unchanged node no longer spams the audit
+  log.** `RegisterNode` previously wrote an audit row on every apply, so
+  a node re-registering (deterministic node id reused) added a noise row
+  each time and evicted genuine events against the audit-log cap. The
+  state machine now audits a registration only when the node is new or
+  its identity/topology fields (role, hostname, grpc_addr, location,
+  disks, version, build_date, client_ip) materially changed; volatile
+  fields (last_seen / usage counters) are still refreshed silently.
 - **Bug BH — anchor-lag repair now converges on no-spare-node
   multi-tier clusters.** When a volume keeps a warm cache replica on
   every data node plus a mandatory cold anchor, the cold-repair target
