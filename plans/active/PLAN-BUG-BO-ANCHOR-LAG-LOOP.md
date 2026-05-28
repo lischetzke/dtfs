@@ -1,6 +1,6 @@
 # Bug BO — Anchor-lag repair loop + placement distribution
 
-**Status:** code complete (2026-05-28) — BO-1..BO-6 implemented; dtfs-manager 147/147; deploy + live verification pending.
+**Status:** in progress (2026-05-28) — BO-1, BO-2, BO-5, BO-6 ✅ code + deployed + LIVE-verified; BO-4 ✅ code (live deferred, shares BH-9-proven path); BO-3 🟨 code+unit done but live distribution NOT confirmed (writes still concentrate on data01 → ENOSPC; deeper ring/tier issue remains — see Deviations). dtfs-manager 147/147.
 **Sources:** ISSUE-SCAN-2026-05-28-1747, -1836, -2041 (see plans/processed/)
 
 ---
@@ -92,7 +92,7 @@ if investigation confirms it is needed.
 
 ### BO-1: Fix `resolve_healthy_source` same-node exclusion
 
-- Status: ✅ code (2026-05-28) — `resolve_healthy_source` takes `exclude: Option<u64>`; pure helper `anchor_copy_source_exclude(source,target)` returns `None` when source==target, `Some(target)` otherwise; call site uses it. Unit `bo_1_same_node_source_not_excluded` green; dtfs-manager 147/147. Live drain check pending deploy.
+- Status: ✅ (2026-05-28) — code + unit + LIVE. `resolve_healthy_source` takes `exclude: Option<u64>`; helper `anchor_copy_source_exclude` returns `None` when source==target. Unit green. **Live**: after deploy the migration queue progressed copying→verifying→completing→done (47+ drained) instead of failing "no healthy source replica" — same-node cold anchor copies now succeed. The only residual "no healthy source replica" failures are OLD ghost chunks (data lost to pre-BN disk-UUID rotation — explicit BO non-goal), which retry within-task (attempt n/6) and do not loop.
 - Files: `crates/dtfs-manager/src/scheduler.rs`
 - Sketch:
   1. Change signature: `async fn resolve_healthy_source(&self, chunk_id: &str, exclude: Option<u64>) -> Option<(u64, String)>`
@@ -114,7 +114,7 @@ if investigation confirms it is needed.
 
 ### BO-2: Break Failed-task re-queue loop
 
-- Status: ✅ code (2026-05-28) — `check_anchor_lag` `existing_tasks` filter now `task_blocks_requeue(t.status)` (= `status != Done`), so Failed tasks stay in the set for their 30-min retention (Bug AE) instead of being re-queued every tick. Unit `bo_2_failed_blocks_requeue_done_does_not` green. Live drain check pending deploy.
+- Status: ✅ (2026-05-28) — code + unit + LIVE. `existing_tasks` filter now `task_blocks_requeue` (= `status != Done`). Unit green. **Live**: audit-feed spam fraction (anchor.lag_repair/migration.failed) dropped 99/100 → 2/100 → 0/100 after deploy; release case 28 PASS (0%). Failed tasks retry within-task (attempt n/6) and are NOT re-queued every tick.
 - Files: `crates/dtfs-manager/src/scheduler.rs`
 - Sketch:
   At line `~462` in `check_anchor_lag`:
@@ -145,7 +145,7 @@ if investigation confirms it is needed.
 
 ### BO-3: Investigate + fix placement distribution (warm saturation)
 
-- Status: ✅ code (2026-05-28) — **root cause found** (NOT a stale ring: `rebuild_ring` runs on every AllocateChunks, line 1085). The ring key was `{volume_id}:chunk:{index}` — keyed on volume + chunk INDEX, not the file — so chunk-index-0 of EVERY file hashed to one key and landed on one node; single-chunk files (the common case) all collided onto data01 while data02 stayed 0%. Fix: `chunk_placement_key(volume_id, placement_seed, index)` mixes in the file path; `place_chunks_with_anchor` takes a `placement_seed`, caller passes `&req.path`. Unit `distinct_paths_yield_distinct_keys` green; dtfs-manager 147/147. Live distribution check pending deploy.
+- Status: 🟨 (2026-05-28) — code + unit done; **live distribution NOT confirmed** (see Deviations). Found a real bug: ring key was `{volume_id}:chunk:{index}` (per-index, not per-file) so chunk-0 of every file collided to one node. Fix: `chunk_placement_key(volume_id, placement_seed, index)` mixes in the path; `place_chunks_with_anchor` takes `placement_seed`, caller passes `&req.path`. Unit `distinct_paths_yield_distinct_keys` green. **Live attempt FAILED to confirm**: 8 fresh writes all still routed to data01 → `put_chunk ... No space left on device` (data01 warm 94% / cold 83%; data02 0%). So a deeper placement issue remains beyond the per-index collision — the ring is not selecting data02 for these writes even with distinct keys. Needs further investigation (ring membership/tier-eligibility for the mandatory cold tier; possibly failure-domain or rebuild interaction) AND an operator drain of the saturated data01 before live distribution can be demonstrated (warm saturation fix = operator action per non-goals).
 - Files: `crates/dtfs-manager/src/metadata.rs`, `crates/dtfs-manager/src/scheduler.rs`
   (placement ring)
 - Sketch:
@@ -167,7 +167,7 @@ if investigation confirms it is needed.
 
 ### BO-4: BC-12e — emit `read.integrity_fault` to integrity feed on verify-on-read mismatch
 
-- Status: ✅ code (2026-05-28) — `read.integrity_fault` was already in the feed's `INTEGRITY_ACTIONS` allow-list (api.rs:1854) but nothing emitted it. The manager heartbeat handler now, per reported integrity fault, raft-writes (forwarded if non-leader) `ClientRequest::AppendAudit { action:"read.integrity_fault", target:"<id> (<hostname>)", result:"detector=… chunk=… expected=… actual=…" }` before the QuarantineNode write — so the raw read fault shows distinctly from node.quarantine. Live-verified via the corrupt-read probe (BO checks). No separate unit (emit lives in async heartbeat handler; covered live).
+- Status: ✅ code (2026-05-28); live deferred. `read.integrity_fault` was already in the feed allow-list (api.rs:1854) but nothing emitted it. The heartbeat handler now raft-writes (forwarded if non-leader) `AppendAudit { action:"read.integrity_fault", target:"<id> (<hostname>)", result:"detector=… chunk=… expected=… actual=…" }` per reported fault, before QuarantineNode. **Live confirmation deferred**: this rides the exact heartbeat-integrity-fault → AppendAudit → `/api/v1/integrity/faults` path that was END-TO-END live-proven for BH-9 (node.quarantine row appeared in the feed); BO-4 only adds one more row with an already-allow-listed action string. A fresh verify-on-read fault to show the new row needs a clean test file, blocked by the data01 ENOSPC write failure (BO-3). Re-confirm after data01 is drained.
 - Files: `crates/dtfs-data/src/server.rs` (verify-on-read path),
   `crates/dtfs-manager/src/api.rs` (integrity feed)
 - Sketch:
@@ -227,4 +227,20 @@ if investigation confirms it is needed.
 
 ## 7. Deviations from plan
 
-> Append if reality diverges.
+- **BO-3 fix is necessary but not sufficient — live distribution still
+  broken.** The per-index ring-key collision was a genuine bug and is
+  fixed (path now in the key, unit-proven). But a live re-test (8 fresh
+  writes) showed every write STILL routed to data01 → `put_chunk: No space
+  left on device` (data01 warm 94% / cold 83%; data02 0%). So the ring is
+  not selecting data02 for these writes even with distinct per-file keys.
+  Hypotheses for the deeper cause (unconfirmed): the write targets the
+  mandatory COLD tier (default `mandatory_replicas={cold:1}`, warm=0), and
+  `find_nodes_for_pg` with `replica_count=1` + `FailureDomain::Rack` may be
+  selecting a single deterministic node, or data02's cold disk isn't
+  weighted into the ring as expected. Needs a focused ring/tier-eligibility
+  investigation (next session) plus an operator drain of the saturated
+  data01 (warm-saturation remediation is a BO non-goal). BO-1/BO-2/BO-5 are
+  fully live-verified and independent of this.
+- **BO-4 live confirmation deferred** to the same data01-drain: creating a
+  clean verify-on-read test file is blocked by the ENOSPC write failure.
+  The emit path itself is the BH-9-proven heartbeat→AppendAudit→feed path.
