@@ -48,7 +48,8 @@ order shifts.
 | 6 | AV-5-6 | 1 d |
 | 7 | AV-5-1 | 1-2 d infra |
 
-### ⬜ AV-5-3 — Sweep remaining CLAUDE.md § N refs in archived plan (~5 min)
+### ✅ AV-5-3 — Sweep remaining CLAUDE.md § N refs in archived plan (~5 min)
+> Done 2026-05-28 under **BG-9**. `grep -rnE "CLAUDE.md\s*§" plans/completed/` clean.
 
 * **Files:**
   `plans/completed/2026-05-22-PLAN-BUG-AV-TIER-LIFECYCLE.md`.

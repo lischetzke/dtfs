@@ -3400,15 +3400,16 @@ _(unused historical follow-up notes below kept for context)_
 
 ### 7.3 Stale CLAUDE.md references swept
 
-Phase 4 close-out also fixed stale `CLAUDE.md § …` cross-references
-that pre-dated the AGENTS.md consolidation (memory S6, 2026-05-22):
+Phase 4 close-out also fixed stale legacy `CLAUDE.md` section
+cross-references that pre-dated the AGENTS.md consolidation
+(memory S6, 2026-05-22):
 
 - `README.md` — repository layout entry + contribution paragraph
   rewritten to point at AGENTS.md as the canonical source.
 - `tests/proxmox/ansible/roles/dtfs-netshape/defaults/main.yml` —
-  `CLAUDE.md §9` → `AGENTS.md § A.7`.
-- `docs/src/operations/log-shipping.md` — three `CLAUDE.md § …`
-  pointers → `AGENTS.md § A.1.1` / `§ A.7`.
+  old `CLAUDE.md` §9 pointer → `AGENTS.md § A.7`.
+- `docs/src/operations/log-shipping.md` — three legacy `CLAUDE.md`
+  section pointers → `AGENTS.md § A.1.1` / `§ A.7`.
 - This plan's "Reading order for a fresh agent" header updated to
   cite `AGENTS.md § A.3.4` / `§ B.5` / `§ A.8`.
 
