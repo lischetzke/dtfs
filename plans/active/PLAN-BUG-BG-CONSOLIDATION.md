@@ -1,0 +1,195 @@
+# PLAN-BUG-BG — Consolidation of open/missing tasks
+
+**Status legend:** ⬜ todo · 🟦 in progress · ✅ done · 🟥 blocked · 🟨 needs review
+
+## Context
+
+A multi-plan audit (2026-05-28) found the active-plan tree had drifted
+badly from reality:
+
+- **BF** (auto-quarantine pipeline) — done, committed `d8c5822`.
+- **BC / BD / AZ** — the vast majority of their ⬜ tasks were *already
+  implemented and committed* (`d8c5822`, `7fc1c7f`); only the markers
+  were never flipped. Verified done: BC-4/5/6/7/8/12*/13/14/15, all 26
+  AZ tasks, all 4 BD tasks.
+- **BE** (release-gate harness) — `run.sh`, `lib/common.sh`, all 20
+  cases `00–20`, and `release-testing.md` exist **but are untracked**
+  (never committed); `lib/fixtures.sh` + `lib/health.sh` were never
+  written.
+- A handful of genuinely-open code gaps remained scattered across plans.
+
+The drift made it impossible to tell in-flight work from landed work.
+This plan does two things: (1) **reconcile + archive** the stale plans
+so the tree tells the truth, and (2) **consolidate the genuinely-open
+code + hygiene tasks into one tracker (BG)** so there is a single
+actionable backlog. Live/manual/infra verification stays owned by its
+home plan (AV, BA) and is only cross-referenced here.
+
+## Goals
+
+- One source of truth (BG) for open *actionable* (code + hygiene) work.
+- Plan tree reflects reality: done plans archived, markers correct.
+- Close the one real data-path gap (BC-9) and the harness gaps (BE-1
+  libs + commit the harness).
+
+## Non-goals
+
+- Re-implementing already-done BC/BD/AZ work (only flip markers).
+- Owning live/manual/infra tasks (AV-5-1/4/5/6, BA-1/3) — those remain
+  in AV / BA plans; BG links to them.
+- Changing the BE harness *behaviour* beyond the two missing lib files
+  and committing what exists.
+
+## Locked-in decisions (user, 2026-05-28)
+
+- BG scope = **open work + hygiene** (code gaps + commit/reconcile/
+  archive). Pure live/manual excluded, referenced only.
+- Source plans = **reconcile + archive done**. BC-9 and AZ-4-3 (the
+  only open items in otherwise-complete BC/AZ) **migrate into BG** so
+  BC + AZ become archivable. BD + BF archive as-is. BE, AV, BA stay
+  active with a BG cross-reference for their open items.
+
+## Cross-cutting invariants (every BG code task)
+
+- AGENTS.md § B.1 fixing procedure: failing test FIRST, then fix, then
+  verify. Quote failing→passing in the commit body.
+- AGENTS.md § B.5.1: any cluster-visible behaviour change keeps/adds a
+  `tests/release/cases/NN-*.sh` case green (BC-9 maps to existing
+  `13-integrity-corruption.sh`).
+- Build/test only on the Linux/WSL builder — the Windows host cannot
+  build (`rocksdb`/`fuse3`). State this in each verification note.
+- One commit per BG task, `Plan:` + `Co-Authored-By:` trailers.
+
+---
+
+## Phase 1 — Hygiene (reconcile the tree)
+
+### ⬜ BG-1 — Commit the untracked BE release harness
+- **Files:** `tests/release/run.sh`, `tests/release/lib/common.sh`,
+  `tests/release/cases/00-…20-*.sh` (20 cases),
+  `docs/src/operations/release-testing.md`.
+- **Sketch:** stage + commit the existing untracked harness as the
+  landing of BE-2 / BE-3..BE-20 / BE-21. Do NOT alter behaviour. Leave
+  `tests/proxmox/abuse/17-bug-ba-soak.sh` + `chunk-size-stats.sh` out —
+  those belong to BA / a separate AZ follow-up.
+- **Done when:** `git status` shows `tests/release/` tracked; harness
+  files unchanged from current working-tree content.
+
+### ⬜ BG-2 — Reconcile stale plan markers
+- **Files:** `plans/active/PLAN-BUG-BC-SCRUB.md`,
+  `PLAN-BUG-BD-CONFIG-PANE.md`, `PLAN-BUG-AZ-WEBUI-INSTALL-CONFIG.md`,
+  `PLAN-BUG-BE-E2E-RELEASE.md`.
+- **Sketch:** flip ⬜→✅ for every task the audit proved done, citing
+  file:line evidence. BC: mark BC-9 "moved to BG-4". AZ: mark AZ-4-3
+  "moved to BG-8". BE: BE-1 partial (common.sh ✅; fixtures/health →
+  BG-5), BE-22 → BG-10, BE-2..21 ✅.
+- **Done when:** no false ⬜ remains; every ⬜ left is genuinely open or
+  redirected to a BG task.
+
+### ⬜ BG-3 — Archive completed plans
+- **Files:** `git mv` →
+  `plans/completed/2026-05-28-PLAN-BUG-BF-FOLLOWUPS.md`,
+  `…-PLAN-BUG-BD-CONFIG-PANE.md`,
+  `…-PLAN-BUG-AZ-WEBUI-INSTALL-CONFIG.md`,
+  `…-PLAN-BUG-BC-SCRUB.md` (after BC-9 migrated out).
+- **Sketch:** move the four complete plans; fix any `plans/active/…`
+  cross-references that break (grep first). BE/AV/BA stay in
+  `plans/active/`.
+- **Done when:** `plans/active/` holds only BG, BE, AV, BA; moved files
+  resolve from `plans/completed/`.
+
+## Phase 2 — Code gaps
+
+### ⬜ BG-4 — BC-9: integrity-aware read fallback (the real data gap)
+- **Problem:** data node returns `Status::data_loss` on a verify-on-read
+  BLAKE3 mismatch, but `dtfs-client` `read_chunk` does not detect the
+  integrity-fault signal, and `dtfs-fuse/src/filesystem.rs` (~:636) only
+  does *generic* `Err` replica fallback — the integrity fault is not
+  distinguished/logged and a single-replica read can surface
+  corrupt-vs-error ambiguously.
+- **Files:** `crates/dtfs-client/src/client.rs` (detect `data_loss` /
+  integrity trailer in `read_chunk`),
+  `crates/dtfs-fuse/src/filesystem.rs` (treat `data_loss` as a fallback
+  trigger that exhausts all replicas, log integrity event, only ENODATA
+  after all fail).
+- **Tests:** dtfs-fuse/dtfs-client unit test simulating one `data_loss`
+  replica + one healthy → read returns healthy bytes; existing
+  `tests/release/cases/13-integrity-corruption.sh` stays PASS; live
+  `tests/proxmox/abuse/18-bug-bc-bitrot.sh`.
+- **Done when:** corrupt replica transparently bypassed, integrity fault
+  logged client-side, case 13 green.
+
+### ⬜ BG-5 — BE-1 remainder: `lib/fixtures.sh` + `lib/health.sh`
+- **Files:** `tests/release/lib/fixtures.sh`,
+  `tests/release/lib/health.sh`; refactor cases that inline
+  fixture/health logic to source them.
+- **Sketch:** extract the fixture (test file gen/cleanup) and health
+  (cluster-ready / `wait_for` wrappers) helpers per the BE-1 spec in
+  `PLAN-BUG-BE-E2E-RELEASE.md`.
+- **Done when:** `bash tests/release/run.sh --quick` green on the lab
+  cluster; cases reference the shared libs.
+
+### ⬜ BG-6 — AV-5-2: Raft log "unexpected EOF" RCA + fix
+- **Files:** `crates/dtfs-raft/src/` (log/snapshot read path) — scope
+  confirmed during RCA.
+- **Sketch:** reproduce, root-cause the truncated/short log read, fix
+  the read or recovery path; regression test in dtfs-raft.
+- **Done when:** RCA documented; failing test → green; no EOF on restart
+  in lab.
+
+### ⬜ BG-7 — AV-5-7: heartbeat `chunk_reads` count inflation audit
+- **Files:** read-path counter increment site(s) + `crates/dtfs-manager`
+  heartbeat aggregation.
+- **Sketch:** audit where `chunk_reads` is incremented vs aggregated;
+  fix double-count; unit test on the aggregator.
+- **Done when:** counter matches actual reads in a controlled lab run.
+
+## Phase 3 — Loose ends (low priority)
+
+### ⬜ BG-8 — AZ-4-3 loose end: interpolate `REPO_URL` into WebUI links
+- **Files:** `crates/dtfs-manager/src/webui.rs` (~:487, :707) — replace
+  hardcoded `github.com/lischetzke/dtfs…` with `dtfs_common::REPO_URL`.
+- **Done when:** no hardcoded repo URL in webui; footer/docs links
+  render from the constant.
+
+### ⬜ BG-9 — AV-5-3: sweep stale `CLAUDE.md § N` refs
+- **Files:** archived plan(s) referencing `CLAUDE.md §` — repoint to
+  `AGENTS.md §`. Trivial (~5 min).
+
+### ⬜ BG-10 — BE-22 (optional): `--quick` pre-commit hook
+- **Files:** pre-commit hook / `scripts/`. Mark **optional**; only land
+  if cheap and non-disruptive.
+
+---
+
+## Referenced (NOT owned by BG — live/manual/infra)
+
+Tracked in their home plans; BG links for visibility:
+
+- `PLAN-BUG-AV-FOLLOWUPS.md`: AV-5-1 (multi-DC infra), AV-5-4 (browser
+  click-test), AV-5-5 (live S2/S3 demos), AV-5-6 (per-DC HA validate).
+- `PLAN-BUG-BA-SOAK-2026-05-26.md`: BA-1 (1h soak), BA-3 (issue
+  catalog). `17-bug-ba-soak.sh` is currently untracked — commit under
+  BA, not BG.
+
+## Verification
+
+- Per task: `cargo test --release -p <crate>` on the builder (Windows
+  cannot build).
+- BC-9 (BG-4): `tests/release/cases/13-integrity-corruption.sh` PASS +
+  `tests/proxmox/abuse/18-bug-bc-bitrot.sh` on lab.
+- BE (BG-1/BG-5): `bash tests/release/run.sh --quick` PASS.
+- Tree truth (BG-1/2/3): `plans/active/` = {BG, BE, AV, BA};
+  `git status` clean of the BE harness; no false ⬜ in reconciled plans.
+
+## Order
+
+BG-1 → BG-2 → BG-3 (hygiene first: gets the tree honest, makes the
+remaining backlog legible) → BG-4 (the real gap) → BG-5 → BG-6, BG-7 →
+BG-8, BG-9, BG-10.
+
+## Deviations from plan
+- (empty — fill during execution)
+
+## Verification log
+- (empty — fill during execution)
