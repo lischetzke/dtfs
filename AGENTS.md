@@ -260,6 +260,16 @@ class**:
   is the boundary — past/absent → clear; future → preserve. Any new
   demote-like path must route through that helper rather than
   unconditionally calling `SetChunkCooldown(0)`.
+- **A mandatory replica may co-locate on a node that already holds a
+  cache replica of the same chunk (different tier).** On a topology
+  with no spare node in the anchor DC, the cold anchor copy *must* land
+  on a data node that already holds the warm cache copy. Replica
+  presence is therefore keyed by `(node_id, disk_id)` — equivalently
+  `(node, tier)` — never by `node_id` alone (Bug BH:
+  `scheduler::replica_already_present`). A node-only dedup silently
+  drops the second-tier mandatory entry and the anchor-lag repair loops
+  forever. The two replicas remain distinct classes (mandatory cold +
+  cache warm) on the one node.
 
 When you add a new code path that creates replicas, decide which class
 it produces and make the boundary explicit in the function name or doc
