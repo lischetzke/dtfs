@@ -30,8 +30,9 @@ LOCK
 CURRENT
 MANIFEST-*
 
-# Completed plans — archived; excluded so Claude agents skip them and keep context clean
+# Archived plans/reports/incidents — excluded so Claude agents skip them and keep context clean
 plans/completed/
+plans/processed/
 
 # Local test corpus and Claude Code session state
 dummy_files/

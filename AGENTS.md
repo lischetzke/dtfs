@@ -483,10 +483,7 @@ and the cluster can't elect a leader).
   Bug AY build-time `VERSION` (currently `v0.0.0-dev`) and
   `BUILD_DATE` (UTC `YYYYMMDD-HHmmss`). Every binary reports these to
   the manager via `RegisterNode`.
-- `plans/incidents/SOAK-RECOVERY-2026-05-18.md` — current bug catalog
-  + verification log.
-- `plans/active/` — in-flight plans; `plans/incidents/` and
-  `plans/reports/` for archived material. See
+- `plans/active/` — in-flight plans. See
   [`plans/README.md`](./plans/README.md).
 - `tests/proxmox/abuse/` — shell regression tests (numbered).
 
@@ -542,14 +539,13 @@ contract violation.
 ### B.1.1 When you encounter a bug
 
 1. Reproduce on the lab (or pure unit test if the bug surface allows).
-2. Open `plans/incidents/SOAK-RECOVERY-YYYY-MM-DD.md` (latest) — if the
-   bug looks like one of the catalogued A–J, your fix probably has a
-   regression test already; extend it rather than starting fresh.
-3. Pick a new bug letter (continue alphabetically from the latest in
-   the catalog).
-4. Follow the three-step procedure above.
-5. Document in the soak-recovery doc with the same template as existing
-   entries.
+2. Check `plans/active/` for any open plan that already covers the bug.
+   If found, add a task to that plan rather than creating a new one.
+3. Pick a new bug letter (continue alphabetically from the highest plan
+   ID visible in `plans/active/`).
+4. Create `plans/active/PLAN-BUG-<letter>-<name>.md` following the
+   template in § B.2.
+5. Follow the three-step procedure above.
 
 ---
 
@@ -561,19 +557,15 @@ is mandatory for new plans:
 
 - `plans/active/PLAN-<id>-<short-name>.md` — in-progress plans.
 - `plans/completed/<completion-date>-PLAN-<id>-<short-name>.md` —
-  finished plans, moved here once every task is ✅ verified.
-- `plans/incidents/` — post-mortem write-ups (SOAK-RECOVERY,
-  INTEGRITY-AUDIT style).
-- `plans/reports/` — historical lab / fix-campaign reports.
+  finished plans; gitignored and local-only once archived.
+- `plans/processed/` — processed reports, issue scans, and
+  post-mortems; gitignored and local-only. Move here once findings are
+  captured in active plans. Not visible to agents.
 
 See [`plans/README.md`](./plans/README.md) for the directory's naming
-and lifecycle rules. Legacy plans previously under
-`tests/proxmox/PLAN-*.md`, `tests/proxmox/SOAK-RECOVERY-*.md`,
-`tests/proxmox/INTEGRITY-AUDIT-*.md`, `tests/proxmox/FIX-REPORT-*.md`,
-etc. have been migrated into `plans/`; **do not put plans, reports, or
-post-mortems under `tests/` again** — that tree is for test
-infrastructure only (`abuse/`, `ansible/`, `soak/`, inventories,
-provisioning scripts).
+and lifecycle rules. **Do not put plans, reports, or post-mortems under
+`tests/` again** — that tree is for test infrastructure only (`abuse/`,
+`ansible/`, `soak/`, inventories, provisioning scripts).
 
 The plan **must** include:
 
@@ -763,8 +755,8 @@ description must explain why the scenario does not warrant
 release-suite coverage. "Internal-only refactor, no behaviour
 change" is acceptable; "out of scope" is not.
 
-See [`plans/active/PLAN-BUG-BE-E2E-RELEASE.md`](./plans/active/PLAN-BUG-BE-E2E-RELEASE.md)
-for the canonical harness design + case-authoring template.
+See `tests/release/cases/` and `tests/release/lib/common.sh` for the
+canonical harness design + case-authoring template.
 
 ---
 
@@ -779,9 +771,8 @@ mandatory:
 | Artefact | Canonical location | Notes |
 |---|---|---|
 | In-flight work plan | `plans/active/PLAN-<id>-<name>.md` | One per non-trivial change. See § B.2. |
-| Finished plan | `plans/completed/<YYYY-MM-DD>-PLAN-<id>-<name>.md` | `git mv` when every task is ✅ verified. |
-| Post-mortem (SOAK-RECOVERY, INTEGRITY-AUDIT, …) | `plans/incidents/` | Write-once; documents what we did and why. |
-| Lab campaign / fix-report artefact | `plans/reports/` | Historical record only — no live state. |
+| Finished plan | `plans/completed/<YYYY-MM-DD>-PLAN-<id>-<name>.md` | Move when every task is ✅ verified. Gitignored; local-only. |
+| Post-mortem, report, issue scan (processed) | `plans/processed/` | Gitignored; local-only. Move here once findings are captured in active plans. Not visible to agents. |
 | Release note (bug fix, new feature, known issue, breaking change, special update requirement) | `changelog/UNRELEASED.md` | One entry per user-visible change, **same commit** as the code. Internal restructures, doc edits, refactors, and test/CI tweaks do **not** go here. See [`changelog/README.md`](./changelog/README.md). |
 | Architecture / config / ops reference | `docs/src/...` (mdBook) | Update in the same commit as behaviour changes (§ A.8 + § B.9). |
 | Code | `crates/<crate>/src/...` | New crates require a `Cargo.toml` workspace member entry. |
@@ -801,7 +792,8 @@ What **does not** belong anywhere except these paths:
   layout is historical; all new plans go to `plans/active/`.
 - A "Project status / PROGRESS" file checked in at the repo root.
   `git log`, the changelog, and the plans are the status sources.
-  Historical snapshot reports live under `plans/reports/`.
+  Historical snapshot reports belong in `plans/processed/` once
+  processed.
 - Loose `*.md` notes scattered through `crates/` or `tests/`. If the
   note describes work, it belongs in `plans/`; if it describes a
   user-visible change, in `changelog/`; if it documents a subsystem,
@@ -813,18 +805,15 @@ Edge cases:
 
 - **A doc that is both a plan *and* a post-mortem** (a plan that morphed
   into a recovery write-up): keep it in `plans/active/` while the work
-  is in flight, then move it to `plans/incidents/` on completion.
-  Leave a one-line breadcrumb in `plans/completed/` if downstream
-  readers expect to find it there.
-- **A code comment that points to a plan or incident**: use the full
-  `plans/active/...` or `plans/incidents/...` path. Update these in
-  the same commit that moves the file (`git grep` is the tool of last
-  resort, not first).
+  is in flight, then move it to `plans/processed/` on completion.
+- **A code comment that points to a plan**: use the full
+  `plans/active/...` path. Update in the same commit that moves the
+  file (`git grep` is the tool of last resort, not first).
 - **A new artefact type that doesn't fit the table**: update this
   table in the same commit that introduces the artefact. Adding a row
   is cheaper than letting a one-off live somewhere ambiguous.
 
-When in doubt, prefer `plans/reports/` for historical artefacts and
+When in doubt, prefer `plans/processed/` for historical artefacts and
 `docs/` for forward-looking reference. Never invent a new top-level
 directory without first updating this table.
 
@@ -913,22 +902,16 @@ PR descriptions for non-trivial work should explicitly note
   procedural details.
 - **`plans/active/PLAN-<id>-*.md`** — feature-specific plan documents
   currently in flight. One per non-trivial work item.
-- **`plans/completed/`** — finished plans, archived once every task is
-  ✅ verified.
-- **`plans/incidents/SOAK-RECOVERY-*.md`**,
-  **`plans/incidents/INTEGRITY-AUDIT-*.md`** — incident-style write-ups
-  after the fact (symptom → root cause → fix → verification). The plan
-  covers *what we're about to do*; the incident doc covers *what we
-  just did and why*.
-- **`plans/reports/`** — historical lab-campaign and fix-report
-  artefacts.
+- **`plans/completed/`** — finished plans; gitignored, local-only.
+- **`plans/processed/`** — processed reports, issue scans, and
+  post-mortems; gitignored, local-only. Not read by agents.
 - **`changelog/UNRELEASED.md`** — accumulator for the next release. Add
   a one-line entry per user-visible change in the same commit; see
   [`changelog/README.md`](./changelog/README.md).
 - **`CLAUDE.md`** — Claude Code shim. One line: `@AGENTS.md`. Do not
   put content here.
 
-All of these are read together by any AI agent starting work on a
-non-trivial change. The user is the final arbiter when AGENTS.md and
-the plan conflict; the plan is the arbiter when the plan and the code
-conflict.
+Active plans and the changelog are read together by AI agents starting
+work on a non-trivial change. The user is the final arbiter when
+AGENTS.md and the plan conflict; the plan is the arbiter when the plan
+and the code conflict.
