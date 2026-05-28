@@ -753,6 +753,25 @@ fn push_audit_capped(log: &mut Vec<AuditEntry>, entry: AuditEntry) {
     }
 }
 
+/// Bug BJ — material (identity/topology) equality for the RegisterNode
+/// audit-dedup. Compares only the fields a genuine re-registration would
+/// change; volatile fields (`last_seen_ms`, usage counters, `health`,
+/// `quarantine`) are excluded because they tick on every registration
+/// and would otherwise make every re-register look "changed" and defeat
+/// the dedup. `quarantine`/`health` are owned by other apply paths
+/// (QuarantineNode / UpdateNodeStatus), not RegisterNode, so excluding
+/// them here cannot suppress a legitimate state change.
+fn node_info_material_eq(a: &crate::NodeInfo, b: &crate::NodeInfo) -> bool {
+    a.role == b.role
+        && a.hostname == b.hostname
+        && a.grpc_addr == b.grpc_addr
+        && a.location == b.location
+        && a.disks == b.disks
+        && a.version == b.version
+        && a.build_date == b.build_date
+        && a.client_ip == b.client_ip
+}
+
 fn apply_request(
     sm: &mut StateMachineData,
     log_id: &LogId,
@@ -934,8 +953,21 @@ fn apply_request(
         }
 
         ClientRequest::RegisterNode { node_id, info } => {
-            sm.nodes.insert(*node_id, info.clone());
-            push_audit_capped(&mut sm.audit_log, audit(format!("RegisterNode: {node_id}")));
+            // Bug BJ — audit only on a NEW node or a materially-changed
+            // re-registration. node_id is deterministic
+            // (node_id_from_hostname), so a re-register reuses the id and
+            // overwrites sm.nodes with near-identical info; auditing it
+            // unconditionally spammed the feed and evicted real events
+            // against the MAX_AUDIT_LOG_ENTRIES cap. Still refresh
+            // sm.nodes so last_seen_ms / usage update.
+            let prior = sm.nodes.insert(*node_id, info.clone());
+            let materially_changed = match &prior {
+                None => true,
+                Some(old) => !node_info_material_eq(old, info),
+            };
+            if materially_changed {
+                push_audit_capped(&mut sm.audit_log, audit(format!("RegisterNode: {node_id}")));
+            }
             ClientResponse::Success
         }
 
@@ -3023,6 +3055,76 @@ mod posix_path_regression {
             last_fault_at_ms: 1_000,
             last_fault_summary: "bytes mismatched expected hash".into(),
         }
+    }
+
+    // ── Bug BJ — RegisterNode audit idempotency ────────────────────
+
+    fn count_register_audits(sm: &StateMachineData) -> usize {
+        sm.audit_log
+            .iter()
+            .filter(|e| e.summary.starts_with("RegisterNode:"))
+            .count()
+    }
+
+    #[test]
+    fn bug_bj_register_node_new_emits_audit() {
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        assert_eq!(count_register_audits(&sm), 1, "first register emits one row");
+    }
+
+    #[test]
+    fn bug_bj_register_node_reregister_identical_no_audit() {
+        let mut sm = StateMachineData::default();
+        let info = mk_quarantinable_node();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 7, info: info.clone() },
+        );
+        // Re-register: only volatile fields differ (heartbeat-driven).
+        let mut info2 = info;
+        info2.last_seen_ms = 999_999;
+        info2.used_capacity = 12_345;
+        info2.total_bytes_read = 555;
+        info2.total_bytes_written = 666;
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::RegisterNode { node_id: 7, info: info2 },
+        );
+        assert_eq!(
+            count_register_audits(&sm),
+            1,
+            "identical re-register (only volatile fields changed) must add no audit row"
+        );
+    }
+
+    #[test]
+    fn bug_bj_register_node_material_change_emits_audit() {
+        let mut sm = StateMachineData::default();
+        let info = mk_quarantinable_node();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 7, info: info.clone() },
+        );
+        let mut info2 = info;
+        info2.version = "v0.0.1-new".into(); // material identity field
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::RegisterNode { node_id: 7, info: info2 },
+        );
+        assert_eq!(
+            count_register_audits(&sm),
+            2,
+            "a materially-changed re-register (version) must add exactly one row"
+        );
     }
 
     #[test]
