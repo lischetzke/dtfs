@@ -155,7 +155,7 @@ legacy field retained. Add a focused snapshot round-trip test.
   the node; unit assertion green; live-verified on a manager WebUI.
 
 ### BK-4 — Release-suite coverage
-- Status: ⬜
+- Status: ✅ (2026-05-28) — `tests/release/cases/23-scrub-quick-deep-listed.sh`. Asserts the `scrub_results_by_node` shape (array; every entry carries `node_id`+`level`) and, when any node has both quick+deep, that BOTH surface (the BK-1 discriminating signal). Auto-discovered by `run.sh` full mode (not added to `QUICK_CASES` — precondition-dependent). Live run on minicluster = SKIP (precondition: no node has run both levels yet — see Deviations; scrub execution is scheduler-driven and there is NO on-demand trigger, so two-level retention is proven deterministically by the BK-1 unit test and the live API shape; the case auto-promotes to PASS once a node runs both levels). Mirrors the BH-4 precondition-SKIP pattern.
 - **Files:** `tests/release/cases/NN-scrub-quick-deep-listed.sh`,
   `tests/release/run.sh`
 - **Implementation sketch:** Trigger `dtfs-cli scrub --level quick` then
@@ -185,6 +185,8 @@ _(empty — filled per task as work proceeds)_
 |------|------|----------|--------|
 | BK-1 | 2026-05-28 | `cargo test -p dtfs-raft --release scrub` (builder) | 3/3 pass (quick_then_deep, snapshot_roundtrip, legacy_migrates); full crate 49/49 |
 | BK-2/3 | 2026-05-28 | `cargo test -p dtfs-manager --release` (builder) | 140/140 (incl. `scrub_lists_all_levels`) |
+| BK-2/3 | 2026-05-28 | deploy BK manager leader-last; `GET /api/v1/stats` ×3 mgrs | all serve `scrub_results_by_node` as a list (len 0; level field present) |
+| BK-4 | 2026-05-28 | `bash tests/release/cases/23-scrub-quick-deep-listed.sh` (builder→minicluster) | STATUS: SKIP (precondition: no node has both levels; no on-demand trigger exists) |
 
 ---
 
@@ -205,6 +207,23 @@ _(empty — filled per task as work proceeds)_
   (it now carries one entry per `(node, level)` rather than per node).
   Avoids a rename churn in any other consumer; WebUI BK-3 reads the same
   key. The back-compat `last_scrub` scalar is retained.
+- BK-4 live result is SKIP, not PASS. Root cause discovered during live
+  verification: there is NO supported on-demand scrub trigger — the
+  manager `POST /api/v1/scrub` handler only audit-logs (no dispatch),
+  the data node's `TriggerScrub` admin RPC is declared in `admin.proto`
+  but has no server implementation, and the manager heartbeat
+  unconditionally overrides the data node's local `[scrub]` intervals
+  with the cluster config (floored at 1h via `quick_h.max(1)`), so
+  lowering `data.toml` intervals cannot force a scrub either. Scrub
+  execution is therefore purely scheduler-driven (quick 6h / deep 168h
+  in the lab), and a deterministic in-suite two-level datapoint is
+  impossible without changing the scrub-execution path — explicitly a
+  BK non-goal. The core BK-1 storage fix is proven by the
+  `scrub_quick_then_deep_both_retained` unit test; the BK-2/BK-3
+  surfacing is proven by the manager unit test and the live API shape
+  (all three managers serve `scrub_results_by_node` as an array with the
+  `level` field). Logged the unwired-scrub-trigger gap as a follow-up
+  candidate (see § 7).
 
 ---
 
@@ -218,3 +237,19 @@ _(empty — filled per task as work proceeds)_
   values like `"orphan"`?) before keying the inner map on it — read the
   `ReportScrubResult` producer in `dtfs-data` so the inner key space is
   understood (an unexpected level value must not silently collide).
+  CONFIRMED: `dtfs-data/src/scrub.rs` emits exactly `"quick"` / `"deep"`
+  (the `ScrubLevel` enum has only those two variants).
+
+### Follow-up candidate (out of BK scope) — unwired on-demand scrub trigger
+
+Discovered during BK-4 live verification: there is no working way to
+trigger a scrub on demand. `POST /api/v1/scrub` (manager) only writes an
+audit row and returns `accepted` — it never dispatches to a data node.
+The data node's `TriggerScrub` admin RPC is declared in `proto/admin.proto`
+but has no server implementation in `crates/dtfs-data`. Consequently
+`dtfs-cli scrub --level …` (which posts to the manager endpoint) is a
+no-op. Scrubs only ever run on the data node's internal scheduler
+(quick/deep interval). This blocks deterministic release/abuse coverage
+of any scrub-dependent behaviour. Recommend a separate plan to wire the
+manager endpoint → data `TriggerScrub` → `run_scrub(level)` so an
+operator (and the release suite) can force a scrub.

@@ -30,6 +30,9 @@ LOCK
 CURRENT
 MANIFEST-*
 
+# Completed plans — archived; excluded so Claude agents skip them and keep context clean
+plans/completed/
+
 # Local test corpus and Claude Code session state
 dummy_files/
 # Exclude .claude contents but allow project skills to be versioned.
@@ -38,3 +41,4 @@ dummy_files/
 !.claude/skills/
 !.claude/skills/**
 .claude/skills/*-workspace/
+environments.yml
