@@ -1,8 +1,16 @@
 # Raft log "unexpected end of file" — RCA (AV-5-2)
 
-**Status:** Root cause confirmed. Operational runbook below.
-**Resolved by:** This document + the wipe-and-rebootstrap runbook.
-**Code fix:** Deferred as **AV-5-11** (substantial — log format change).
+**Status:** Root cause confirmed and code-fixed.
+**Resolved by:** AV-5-11 (JSON-first codec + bincode fallback in
+`log_store.rs`) for the primary cause; the wipe-and-rebootstrap runbook
+below remains the recovery path for unrelated corruption.
+**Code fix:** **AV-5-11** landed (log format change). BG-6 (2026-05-28)
+added complementary defence-in-depth for the *other* EOF source — a
+torn WAL tail from an unclean shutdown — via
+`DBRecoveryMode::TolerateCorruptedTailRecords` on log-store open plus an
+actionable open-error message, so a torn tail self-heals instead of
+crash-looping. Regression test: `bug_av_5_2_recovery_tests` in
+`log_store.rs`.
 
 ## Symptom
 

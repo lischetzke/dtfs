@@ -55,15 +55,40 @@ pub struct LogStore {
 impl LogStore {
     /// Open (or create) the log store at the given directory.
     pub fn new(path: impl AsRef<Path>) -> Result<Self, io::Error> {
+        let path = path.as_ref();
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+
+        // Bug AV-5-2 / BG-6 — tolerate a torn WAL tail left when the
+        // previous binary was killed mid-append (e.g. during a rolling
+        // upgrade). Without this, RocksDB rejects the open with an
+        // opaque "unexpected end of file" and the manager crash-loops.
+        // TolerateCorruptedTailRecords drops ONLY an incomplete trailing
+        // WAL record, never a committed mid-log entry — safe for a Raft
+        // log because any uncommitted tail entry dropped here is
+        // re-replicated by the leader, while committed entries were
+        // fsync'd before the append was acked.
+        db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::TolerateCorruptedTailRecords);
 
         let cf_logs = ColumnFamilyDescriptor::new(CF_LOGS, Options::default());
         let cf_meta = ColumnFamilyDescriptor::new(CF_META, Options::default());
 
         let db = DB::open_cf_descriptors(&db_opts, path, vec![cf_logs, cf_meta])
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "failed to open Raft log store at {}: {e}. If this \
+                         persists after an unclean shutdown the on-disk \
+                         RocksDB may be corrupt beyond a torn tail; see the \
+                         manager recovery runbook (stop the node, wipe \
+                         raft-log + raft-sm, and re-bootstrap from a healthy \
+                         peer) rather than letting the service crash-loop.",
+                        path.display()
+                    ),
+                )
+            })?;
 
         let db = Arc::new(db);
 
@@ -359,5 +384,41 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         self.persist_last_purged(&Some(log_id))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bug_av_5_2_recovery_tests {
+    use super::*;
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("dtfs-bg6-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    /// Bug AV-5-2 — a clean log store must reopen without error under the
+    /// TolerateCorruptedTailRecords WAL recovery mode (regression guard
+    /// that the recovery-mode option does not break the normal open path).
+    #[test]
+    fn log_store_reopens_clean_db() {
+        let dir = scratch_dir("reopen");
+        {
+            let store = LogStore::new(&dir).expect("first open must succeed");
+            // Touch the meta CF so a WAL/SST actually exists on disk.
+            store
+                .persist_last_purged(&None)
+                .expect("persist on fresh store");
+        }
+        // Reopen the same path — must succeed (mirrors a process restart).
+        let reopened = LogStore::new(&dir);
+        assert!(
+            reopened.is_ok(),
+            "reopening a clean log store must succeed, got {:?}",
+            reopened.err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -116,7 +116,15 @@ order shifts.
 * **Done when:** unit test green AND live: 2 `cat` reads through
   FUSE → heartbeat ships count=2 (not 16).
 
-### ⬜ AV-5-2 — Raft log "unexpected EOF" RCA (~0.5-1 d)
+### ✅ AV-5-2 — Raft log "unexpected EOF" RCA (~0.5-1 d)
+> Done (RCA + fix already landed; reconciled + hardened under BG-7/BG-6
+> 2026-05-28). Root cause was NOT a torn tail but bincode's positional
+> encoding breaking on `#[serde(default)]` field additions — documented
+> in `plans/incidents/RAFT-LOG-EOF-2026-05-23.md` and fixed by AV-5-11
+> (JSON-first codec + bincode fallback in `log_store.rs`). BG-6 added
+> complementary defence: `TolerateCorruptedTailRecords` WAL recovery
+> mode + an actionable open-error message, with a reopen regression
+> test (`bug_av_5_2_recovery_tests`).
 
 * **Files:** investigate `crates/dtfs-raft/src/log_store.rs` (if
   exists) + the openraft-rt-tokio adapter at the pinned version
