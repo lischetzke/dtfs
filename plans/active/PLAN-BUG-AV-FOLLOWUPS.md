@@ -96,7 +96,12 @@ order shifts.
   `plans/reports/MINICLUSTER-VERIFICATION-<date>.md`; Phase 4
   plan § 7.4 updated to include S2/S3.
 
-### ⬜ AV-5-7 — Audit heartbeat `chunk_reads` count inflation (~0.5 d)
+### ✅ AV-5-7 — Audit heartbeat `chunk_reads` count inflation (~0.5 d)
+> Done (already implemented 2026-05-22/23; marker reconciled under BG-7
+> 2026-05-28). `metrics.rs::record_chunk_read` dedups a (chunk,dc) to
+> one increment per 1s window, collapsing the ~16 kernel-page reads of a
+> single playback chunk to count=1. Tests `bug_av_5_7_*` (2) green on
+> builder.
 
 * **Files:** `crates/dtfs-data/src/metrics.rs::record_chunk_read`,
   `crates/dtfs-data/src/server.rs::get_chunk`.

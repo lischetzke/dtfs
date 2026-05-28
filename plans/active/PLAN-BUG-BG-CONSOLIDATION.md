@@ -137,7 +137,7 @@ home plan (AV, BA) and is only cross-referenced here.
 - **Done when:** RCA documented; failing test → green; no EOF on restart
   in lab.
 
-### ⬜ BG-7 — AV-5-7: heartbeat `chunk_reads` count inflation audit
+### ✅ BG-7 — AV-5-7: heartbeat `chunk_reads` count inflation audit  (already done; reconciled)
 - **Files:** read-path counter increment site(s) + `crates/dtfs-manager`
   heartbeat aggregation.
 - **Sketch:** audit where `chunk_reads` is incremented vs aggregated;
@@ -256,7 +256,19 @@ BG-8, BG-9, BG-10.
   preserved). `grep -rnE "CLAUDE.md\s*§" plans/completed/` now clean.
   Marked AV-5-3 ✅ in PLAN-BUG-AV-FOLLOWUPS.md.
 
+- **2026-05-28 BG-7 (AV-5-7)**: no new code needed — the inflation fix
+  already shipped (2026-05-22/23). `metrics.rs::record_chunk_read`
+  dedups a (chunk_id, dc) to one increment per `DEDUP_MS`=1000ms, so a
+  single playback chunk's ~16 kernel-page reads collapse to count=1.
+  Verified green on builder: `bug_av_5_7_kernel_page_burst_collapses_to
+  _one` + `bug_av_5_7_separate_reads_outside_window_count_independently`
+  (full dtfs-data metrics suite 9/9). Marker was stale; reconciled in
+  AV plan + here. No commit of code.
+
 ## Deviations from plan
+- BG-7 was already implemented (stale marker), so it became a
+  reconciliation rather than a code task — same class of drift this
+  whole plan exists to fix.
 - BG-5 done-when softened: BE-1 libs delivered + smoke-verified rather
   than refactoring every case to source them + a full `run.sh --quick`
   pass. Cases work inline today; adopting the libs is opportunistic.
