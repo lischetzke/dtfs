@@ -211,8 +211,17 @@ Every code path that *touches bytes* must:
 5. **Never silently downgrade replication factor**. If we can't place
    RF=N replicas, queue migration tasks instead of accepting the write
    at RF<N.
-6. **Verify on scrub**, not on every read. Reads trust the disk; scrub
-   catches bit-rot.
+6. **Verify on every read AND on scrub** (Bug BC-8). Default
+   `verify_on_read = true` makes the data node BLAKE3-hash each
+   chunk before serving; mismatch returns `Status::data_loss` so
+   the FUSE client falls over to a healthy replica (P0-2). A
+   detected fault on this node is also pushed into the WebUI
+   `/ui/integrity` feed (BC-12e). Disabling `verify_on_read`
+   requires an explicit acknowledgement at the API boundary
+   (BC-8 ack guard); the false branch is the only DTFS-supported
+   mode where reads can deliver corrupt bytes. Scrub still runs
+   (quick + deep + orphan) to catch chunks that haven't been
+   read in a long time.
 
 See § A.7 for the senior-dev integrity audit checklist.
 
@@ -689,10 +698,63 @@ Skipping the failing-first step makes the fix unverifiable.
 | Manager-side aggregator (against `StateMachineData`) | unit test in `dtfs-manager` |
 | FUSE-side helper | unit test in `dtfs-fuse` |
 | Cross-process / cluster behaviour | shell script under `tests/proxmox/abuse/NN-name.sh` |
+| Release-gate end-to-end scenario | `tests/release/cases/NN-name.sh` (see § B.5.1) |
 | New durability/anchor invariants | property-style test exercising many random op sequences |
 
 The plan declares the tests up front. Each task's "Done when" requires
 those tests green AND the live verification step.
+
+### B.5.1 Release-suite registration is mandatory
+
+Every new test that exercises **cluster-visible behaviour** — a new
+API endpoint, a new operator action, a new WebUI flow that hits the
+manager, a new failure / recovery path, a new invariant on
+placement, integrity, scrub, quarantine, or routing — **MUST also
+ship a corresponding case under `tests/release/cases/NN-name.sh`**
+in the SAME commit as the unit or abuse test.
+
+The release suite (`tests/release/run.sh`) is the single artefact
+the operator runs prior to a release tag. Anything not in it is, by
+definition, not gated by release. A regression test that lives only
+in `tests/proxmox/abuse/` will get run when someone touches the
+adjacent code; it will NOT run on release day. That's the gap this
+rule closes.
+
+Rules:
+
+- **One case per scenario.** Numbered, sortable, named for the
+  behaviour it verifies (`13-integrity-corruption.sh`, not
+  `13-bug-bc-test.sh`).
+- **Status protocol mandatory.** Last line of stdout is
+  `STATUS: PASS|FAIL|SKIP|KNOWN_ISSUE [<bug-id>]`. The harness
+  parses this; without it the case shows as FAIL.
+- **Cleanup mandatory.** Register `trap case_cleanup EXIT`; cluster
+  state must be restorable so re-running the suite works without
+  manual reset.
+- **No operator interaction.** No prompts, no manual confirmation,
+  no fixed wall-clock waits — use `wait_for` from
+  `tests/release/lib/common.sh`.
+- **KNOWN_ISSUE pins to a Bug ID.** A scenario that depends on
+  unshipped functionality exits `KNOWN_ISSUE [BC]` (or similar);
+  when BC closes, the case automatically promotes to PASS or FAIL
+  on the next run without code changes.
+- **Quick-subset opt-in.** If the case is cheap (≤ 2 min) and
+  exercises a critical path, list its stem in `QUICK_CASES` inside
+  `tests/release/run.sh`. Quick mode (`run.sh --quick`) targets
+  ~15 min total.
+- **Plan tasks reference the case.** A plan's "Done when" line
+  cites the case file (`tests/release/cases/NN-name.sh`); a task
+  cannot be marked ✅ until the case is committed AND its row in
+  the most recent release-suite run is PASS or KNOWN_ISSUE pinned
+  to a tracked follow-up.
+
+If a unit/abuse test exists but no release case does, the PR
+description must explain why the scenario does not warrant
+release-suite coverage. "Internal-only refactor, no behaviour
+change" is acceptable; "out of scope" is not.
+
+See [`plans/active/PLAN-BUG-BE-E2E-RELEASE.md`](./plans/active/PLAN-BUG-BE-E2E-RELEASE.md)
+for the canonical harness design + case-authoring template.
 
 ---
 
@@ -716,6 +778,7 @@ mandatory:
 | Protobuf | `proto/<file>.proto` | Rebuild `dtfs-proto` after every edit. |
 | Unit tests | inline `#[cfg(test)]` modules | Pure helpers, state-machine apply paths, aggregators. |
 | Integration / shell tests | `tests/integration/`, `tests/proxmox/abuse/NN-name.sh` | Cluster-level behaviour, numbered. |
+| Release-gate end-to-end suite | `tests/release/cases/NN-name.sh` + `tests/release/lib/` + `tests/release/run.sh` | Single entry point operator runs prior to a release. New tests MUST register here per § B.5.1. |
 | Test inventories / provisioning scripts | `tests/proxmox/{ansible,soak,*.json,*.sh,*.ps1}` | Test infrastructure. |
 | Operator scripts | `scripts/` | Repeatable operator-facing tooling. |
 | Deployment surface | `deploy/` | Docker Compose, sample configs, systemd units. |

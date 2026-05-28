@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 mod cache;
 mod disk;
+mod integrity;
 mod memory;
 mod metrics;
 mod replication;
@@ -100,6 +101,10 @@ async fn main() -> anyhow::Result<()> {
     // effective interval at runtime (e.g. when an operator raises a
     // per-volume scrub cadence via `POST /api/v1/volumes/{id}/set-schedules`).
     let scrub_config = Arc::new(tokio::sync::RwLock::new(config.scrub.clone()));
+
+    // Bug BF-2 — integrity-fault collector. verify_on_read records here;
+    // heartbeat drains + ships to mgr (BF-5); mgr auto-quarantines (BF-6).
+    let integrity_faults = Arc::new(integrity::IntegrityFaultCollector::new(1024));
     let scrub_scheduler = scrub::ScrubScheduler::new(
         chunk_store.clone(),
         scrub_config.clone(),
@@ -115,11 +120,18 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_store = chunk_store.clone();
     let heartbeat_metrics = data_metrics.clone();
     let heartbeat_scrub_config = scrub_config.clone();
+    let heartbeat_integrity = integrity_faults.clone();
     let process_start = Instant::now();
     tokio::spawn(async move {
-        if let Err(e) =
-            manager_lifecycle(heartbeat_config, heartbeat_store, heartbeat_metrics, process_start, heartbeat_scrub_config)
-                .await
+        if let Err(e) = manager_lifecycle(
+            heartbeat_config,
+            heartbeat_store,
+            heartbeat_metrics,
+            process_start,
+            heartbeat_scrub_config,
+            heartbeat_integrity,
+        )
+        .await
         {
             tracing::error!("Manager lifecycle task failed: {}", e);
         }
@@ -176,6 +188,8 @@ async fn main() -> anyhow::Result<()> {
         let metrics = data_metrics.clone();
         let cache = cache.clone();
         let memory = memory.clone();
+        let scrub_config_for_server = scrub_config.clone();
+        let integrity_for_server = integrity_faults.clone();
         tokio::spawn(async move {
             server::run_grpc_server(
                 config,
@@ -183,6 +197,8 @@ async fn main() -> anyhow::Result<()> {
                 metrics,
                 cache,
                 memory,
+                scrub_config_for_server,
+                integrity_for_server,
                 shutdown_signal,
                 Some(ctx_tx),
             )
@@ -282,6 +298,10 @@ async fn manager_lifecycle(
     // overwrite this lock so the scheduler picks up the new interval
     // within DECISION_TICK_SECS.
     scrub_config: Arc<tokio::sync::RwLock<dtfs_common::config::ScrubConfig>>,
+    // Bug BF-5 — integrity faults the data-side recorded since the
+    // last tick. Drained into each outgoing HeartbeatRequest; on RPC
+    // failure we re-enqueue so the next tick retries.
+    integrity_faults: Arc<crate::integrity::IntegrityFaultCollector>,
 ) -> anyhow::Result<()> {
     // F-024 hardening: walk through every configured manager endpoint when the
     // primary is down (e.g. after a rolling restart). The list is built from
@@ -470,6 +490,12 @@ async fn manager_lifecycle(
                 used_bytes: used,
             })
             .collect();
+        // Bug BF-5 — drain integrity faults into the outgoing heartbeat.
+        // The mgr-side handler (BF-6) iterates these + raft-writes
+        // QuarantineNode + RemoveCorruptChunkReplicas per fault. On RPC
+        // failure we re-enqueue so a transient mgr outage doesn't lose
+        // the signal — mirrors the Bug O re-enqueue pattern at line 514.
+        let drained_faults = integrity_faults.drain();
         let heartbeat = HeartbeatRequest {
             node_id: node_id.clone(),
             uptime_secs: uptime,
@@ -480,6 +506,7 @@ async fn manager_lifecycle(
             total_bytes_read: io_snapshot.total_bytes_read,
             total_bytes_written: io_snapshot.total_bytes_written,
             disk_usage,
+            integrity_faults: drained_faults.clone(),
         };
 
         // Bug O — after each heartbeat tick, drain any locally-quarantined
@@ -526,6 +553,25 @@ async fn manager_lifecycle(
                 let resp = resp.into_inner();
                 if !resp.accepted {
                     tracing::warn!("Manager rejected heartbeat");
+                    // Bug BF-5: rejection ≠ delivery confirmation;
+                    // re-enqueue so the next tick retries the faults
+                    // we just shipped.
+                    if !drained_faults.is_empty() {
+                        integrity_faults.re_enqueue(drained_faults.clone());
+                    }
+                }
+                // Bug BF — mgr says we're not Quarantined any more
+                // (operator unquarantine OR clean from the start).
+                // Clear the sticky self-quarantine flag so put_chunk
+                // accepts writes again without a process restart.
+                if resp.self_quarantine_cleared
+                    && integrity_faults.is_self_quarantined()
+                {
+                    tracing::warn!(
+                        "Bug BF: manager cleared self-quarantine \
+                         (operator unquarantine); re-enabling put_chunk"
+                    );
+                    integrity_faults.clear_self_quarantined();
                 }
                 consecutive_failures = 0;
 
@@ -590,6 +636,12 @@ async fn manager_lifecycle(
                 }
             }
             Err(e) => {
+                // Bug BF-5 — RPC failed; re-enqueue so faults retry on
+                // the next tick. Mirrors the Bug O re-enqueue at
+                // line 514.
+                if !drained_faults.is_empty() {
+                    integrity_faults.re_enqueue(drained_faults.clone());
+                }
                 consecutive_failures += 1;
                 if consecutive_failures <= 3 {
                     tracing::warn!(

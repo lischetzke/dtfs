@@ -33,6 +33,31 @@ service DataService {
   // enough demand to fire a `cache.promote`. Lightweight: no
   // data transfer, idempotent, fire-and-forget.
   rpc RecordCacheHit(RecordCacheHitRequest) returns (RecordCacheHitResponse);
+
+  // Bug BC-6 — enumerate every chunk_id this data node holds on disk.
+  // The manager-side orphan_scrub tick (BC-7) calls this periodically,
+  // diffs the result against state_machine.chunk_locations, and reaps
+  // anything on disk that no FileMetadata references after a grace
+  // period. Paged so a node with millions of chunks doesn't ship a
+  // single multi-MB response.
+  rpc ListChunks(ListChunksRequest) returns (ListChunksResponse);
+}
+
+// Bug BC-6 — body for ListChunks. `page_token` is an opaque cursor
+// returned by a previous call; empty starts from the beginning.
+// `limit` caps response size; the server may return fewer.
+message ListChunksRequest {
+  string page_token = 1;
+  uint32 limit      = 2;
+}
+
+message ListChunksResponse {
+  // Hex-encoded chunk_ids actually present on disk (`.dat` files
+  // whose `.meta` companion also exists). The orphan_scrub planner
+  // intersects this set with manager-side `chunk_locations`.
+  repeated string chunk_ids = 1;
+  // Opaque cursor; empty when no more pages remain.
+  string next_page_token = 2;
 }
 
 // AV-4-1c — body for RecordCacheHit. Same shape as the

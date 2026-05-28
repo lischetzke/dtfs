@@ -155,6 +155,44 @@ pub enum HealthStatus {
     Failed,
     Maintenance,
     Draining,
+    /// Bug BC — a data integrity fault was observed on this node.
+    /// While Quarantined, the manager excludes the node from EVERY
+    /// serving path: read source, replication source, allocate
+    /// target. Heartbeats still accepted so we know when the
+    /// process recovers. State stays Quarantined until an operator
+    /// explicitly unquarantines via WebUI; the corresponding
+    /// `NodeInfo.quarantine: Option<QuarantineInfo>` carries the
+    /// reason + triggering chunk + history for the operator.
+    Quarantined,
+}
+
+/// Bug BC — reason the node was quarantined. Compact enum so the
+/// WebUI badge can render a short label; the human-readable
+/// summary lives on `QuarantineInfo.last_fault_summary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuarantineReason {
+    QuickScrubSizeMismatch,
+    QuickScrubMissingDat,
+    DeepScrubHashMismatch,
+    VerifyOnReadMismatch,
+    OrphanScrubInStateMissing,
+    OperatorRequested,
+}
+
+/// Bug BC — quarantine metadata attached to `NodeInfo.quarantine`
+/// while `HealthStatus == Quarantined`. Persists through Raft
+/// snapshots via `#[serde(default)]` on `NodeInfo.quarantine`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantineInfo {
+    pub since_ms: u64,
+    pub reason: QuarantineReason,
+    #[serde(default)]
+    pub triggering_chunk_id: Option<String>,
+    #[serde(default)]
+    pub fault_count_total: u32,
+    pub last_fault_at_ms: u64,
+    pub last_fault_summary: String,
 }
 
 /// Status of a disk.
@@ -192,6 +230,11 @@ pub struct NodeInfo {
     pub total_capacity: u64,
     pub used_capacity: u64,
     pub health: HealthStatus,
+    /// Bug BC — `Some(_)` iff `health == Quarantined`. Snapshot-safe:
+    /// `#[serde(default)]` lets older snapshots without this field
+    /// load as `None`.
+    #[serde(default)]
+    pub quarantine: Option<QuarantineInfo>,
 }
 
 /// Per-tier replication configuration.
@@ -516,21 +559,28 @@ pub struct VolumeConfig {
 /// without dialling up scrub I/O on archival volumes.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct VolumeSchedules {
-    /// Override `ScrubConfig.quick_interval_hours` (cluster-wide
-    /// default) for this volume's chunks. None = inherit. Minimum
-    /// honoured value is 60 s; the scheduler clamps anything
-    /// lower to prevent runaway scrub I/O.
+    /// Bug BF-9 — REMOVED FROM THE ACTIVE PATH. Cluster-wide
+    /// `manager.scrub.quick_interval_secs` governs scrub cadence
+    /// (data nodes scrub by disk, not by volume). The field is
+    /// kept for snapshot back-compat + `#[serde(skip_serializing_if =
+    /// "Option::is_none")]` so fresh writes don't emit it. A
+    /// warn-once log fires on first observation per process.
+    #[deprecated(note = "Bug BF-9: removed from active path; set [scrub] block instead")]
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scrub_interval_secs: Option<u64>,
-    /// Reserved for a future fsck job (Bug AZ-1 plan); ignored by
-    /// data nodes until that lands. Operators can still set the
-    /// value via /set-schedules; storage is forward-compatible.
+    /// Bug BF-10 — RESERVED, NEVER CONSUMED. No fsck scheduler
+    /// exists. Scheduled for removal in next minor. Warn-once
+    /// log fires on first observation per process.
+    #[deprecated(note = "Bug BF-10: reserved-but-unused; scheduled for removal")]
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fsck_interval_secs: Option<u64>,
-    /// Future hook: arbitrary named jobs (e.g. "rebalance",
-    /// "snapshot"). Operators set the cadence; the scheduler
-    /// matches by job name. Empty by default.
+    /// Bug BF-10 — RESERVED, NEVER CONSUMED. No scheduler honours
+    /// named-job entries. Scheduled for removal in next minor.
+    #[deprecated(note = "Bug BF-10: reserved-but-unused; scheduled for removal")]
     #[serde(default)]
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub custom: std::collections::BTreeMap<String, u64>,
 }
 

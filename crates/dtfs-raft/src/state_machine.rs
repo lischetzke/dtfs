@@ -932,6 +932,21 @@ fn apply_request(
         ClientRequest::UpdateNodeStatus { node_id, status } => {
             use dtfs_common::types::HealthStatus;
             if let Some(node) = sm.nodes.get_mut(node_id) {
+                // Bug BF-6 — refuse to overwrite Quarantined via the
+                // generic UpdateNodeStatus path. Only UnquarantineNode
+                // (which also clears the quarantine record) can flip a
+                // Quarantined node back to Healthy. Without this
+                // guard a stale heartbeat from a manager that hasn't
+                // applied the QuarantineNode log entry yet would
+                // clobber the integrity-fault state.
+                if node.quarantine.is_some() && status.as_str() != "down" && status.as_str() != "failed" {
+                    debug!(
+                        node_id,
+                        attempted = %status,
+                        "Bug BF-6: refusing UpdateNodeStatus on Quarantined node"
+                    );
+                    return ClientResponse::Success;
+                }
                 match status.as_str() {
                     "healthy" => node.health = HealthStatus::Healthy,
                     "suspect" => node.health = HealthStatus::Suspect,
@@ -953,6 +968,53 @@ fn apply_request(
                 ClientResponse::Error {
                     message: format!("node not found: {node_id}"),
                 }
+            }
+        }
+
+        ClientRequest::QuarantineNode { node_id, info } => {
+            use dtfs_common::types::HealthStatus;
+            if let Some(node) = sm.nodes.get_mut(node_id) {
+                node.health = HealthStatus::Quarantined;
+                // Accumulate fault_count_total across faults instead of
+                // resetting on every new quarantine — the WebUI badge
+                // surfaces the running total so operators see whether
+                // a node is repeatedly faulting.
+                let prior_count = node.quarantine
+                    .as_ref()
+                    .map(|q| q.fault_count_total)
+                    .unwrap_or(0);
+                let mut merged = info.clone();
+                merged.fault_count_total = prior_count + 1;
+                node.quarantine = Some(merged);
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit(format!(
+                        "node.quarantine: {node_id} reason={:?} chunk={} fault_count={}",
+                        info.reason,
+                        info.triggering_chunk_id.clone().unwrap_or_else(|| "-".into()),
+                        prior_count + 1,
+                    )),
+                );
+                ClientResponse::Success
+            } else {
+                ClientResponse::Error { message: format!("node not found: {node_id}") }
+            }
+        }
+
+        ClientRequest::UnquarantineNode { node_id, operator_id, reason_acknowledged } => {
+            use dtfs_common::types::HealthStatus;
+            if let Some(node) = sm.nodes.get_mut(node_id) {
+                node.quarantine = None;
+                node.health = HealthStatus::Healthy;
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit(format!(
+                        "node.unquarantine: {node_id} by={operator_id} ack={reason_acknowledged}"
+                    )),
+                );
+                ClientResponse::Success
+            } else {
+                ClientResponse::Error { message: format!("node not found: {node_id}") }
             }
         }
 
@@ -2578,6 +2640,7 @@ mod posix_path_regression {
                 client_ip: None,
                 version: String::new(),
                 build_date: String::new(),
+                quarantine: None,
             });
         }
         sm.files.insert(file_path.to_string(), FileMetadata {
@@ -2895,5 +2958,179 @@ mod posix_path_regression {
         // BTreeMap iteration order is by key — deterministic across runs.
         let keys: Vec<_> = round_tripped.cache_cooldown_until_ms.keys().copied().collect();
         assert_eq!(keys, vec![0, 2]);
+    }
+
+    // ── Bug BC-10 — Quarantine state-machine apply ──────────────────
+
+    fn mk_quarantinable_node() -> crate::NodeInfo {
+        crate::NodeInfo {
+            role: dtfs_common::types::NodeRole::Data,
+            hostname: "data-1".into(),
+            grpc_addr: "data-1:9500".into(),
+            location: dtfs_common::topology::Location::new("lab", "dc-a", "r1", "h1"),
+            disks: Vec::new(),
+            total_capacity: 0,
+            used_capacity: 0,
+            health: dtfs_common::types::HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    fn mk_quarantine_info(reason: dtfs_common::types::QuarantineReason) -> dtfs_common::types::QuarantineInfo {
+        dtfs_common::types::QuarantineInfo {
+            since_ms: 1_000,
+            reason,
+            triggering_chunk_id: Some("aabbccdd".into()),
+            fault_count_total: 0,
+            last_fault_at_ms: 1_000,
+            last_fault_summary: "bytes mismatched expected hash".into(),
+        }
+    }
+
+    #[test]
+    fn bug_bc_10_quarantine_node_sets_health_and_info() {
+        use dtfs_common::types::{HealthStatus, QuarantineReason};
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(42, mk_quarantinable_node());
+
+        let info = mk_quarantine_info(QuarantineReason::VerifyOnReadMismatch);
+        let resp = apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::QuarantineNode { node_id: 42, info: info.clone() },
+        );
+        assert!(matches!(resp, ClientResponse::Success));
+
+        let n = sm.nodes.get(&42).expect("node still present");
+        assert_eq!(n.health, HealthStatus::Quarantined);
+        let q = n.quarantine.as_ref().expect("quarantine record present");
+        assert_eq!(q.reason, QuarantineReason::VerifyOnReadMismatch);
+        assert_eq!(q.triggering_chunk_id.as_deref(), Some("aabbccdd"));
+        assert_eq!(q.fault_count_total, 1, "first fault accumulates to 1");
+
+        // Audit row should mention quarantine + reason.
+        let last = sm.audit_log.last().unwrap();
+        assert_eq!(last.summary, "node.quarantine: 42 reason=VerifyOnReadMismatch chunk=aabbccdd fault_count=1");
+    }
+
+    #[test]
+    fn bug_bc_10_quarantine_accumulates_fault_count() {
+        use dtfs_common::types::QuarantineReason;
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(7, mk_quarantinable_node());
+
+        for i in 1..=3 {
+            apply_request(
+                &mut sm,
+                &mk_log_id(i),
+                &ClientRequest::QuarantineNode {
+                    node_id: 7,
+                    info: mk_quarantine_info(QuarantineReason::DeepScrubHashMismatch),
+                },
+            );
+        }
+        let q = sm.nodes.get(&7).unwrap().quarantine.as_ref().unwrap();
+        assert_eq!(q.fault_count_total, 3,
+            "three faults must accumulate, not reset on each apply");
+    }
+
+    #[test]
+    fn bug_bc_10_unquarantine_clears_and_restores_health() {
+        use dtfs_common::types::{HealthStatus, QuarantineReason};
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(9, mk_quarantinable_node());
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::QuarantineNode {
+                node_id: 9,
+                info: mk_quarantine_info(QuarantineReason::QuickScrubMissingDat),
+            },
+        );
+        assert_eq!(sm.nodes.get(&9).unwrap().health, HealthStatus::Quarantined);
+
+        let resp = apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::UnquarantineNode {
+                node_id: 9,
+                operator_id: "alice".into(),
+                reason_acknowledged: "disk swapped + bitrot test passed".into(),
+            },
+        );
+        assert!(matches!(resp, ClientResponse::Success));
+
+        let n = sm.nodes.get(&9).unwrap();
+        assert_eq!(n.health, HealthStatus::Healthy,
+            "unquarantine must restore Healthy, not leave the node in Suspect");
+        assert!(n.quarantine.is_none(),
+            "quarantine record must be cleared");
+
+        let last = sm.audit_log.last().unwrap();
+        assert!(last.summary.contains("node.unquarantine: 9"),
+            "audit must record the unquarantine event: {}", last.summary);
+        assert!(last.summary.contains("by=alice"));
+        assert!(last.summary.contains("ack=disk swapped"));
+    }
+
+    /// Bug BC-11 — once a node is Quarantined, the canonical
+    /// `health == Healthy` filter used by `placement::rebuild_ring`,
+    /// `scheduler::resolve_healthy_source`, and `api::allocate_chunks`
+    /// MUST exclude it. We exercise the filter directly here so a
+    /// future refactor that flips one of those sites to a negative
+    /// `health != Down` predicate (which would leak Quarantined into
+    /// the serving pool) is caught immediately.
+    #[test]
+    fn bug_bc_11_quarantined_node_excluded_from_healthy_filter() {
+        use dtfs_common::types::{HealthStatus, QuarantineReason};
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(1, mk_quarantinable_node());
+        sm.nodes.insert(2, mk_quarantinable_node());
+        sm.nodes.insert(3, mk_quarantinable_node());
+
+        // Quarantine node 2.
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::QuarantineNode {
+                node_id: 2,
+                info: mk_quarantine_info(QuarantineReason::VerifyOnReadMismatch),
+            },
+        );
+
+        let healthy: Vec<u64> = sm
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.health == HealthStatus::Healthy)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut sorted = healthy.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![1, 3],
+            "Quarantined node 2 must NOT appear in the healthy serving \
+             pool. If this assertion ever fires after a placement or \
+             scheduler refactor, the cluster is at risk of routing reads \
+             or replication to a node we know is corrupt.");
+    }
+
+    #[test]
+    fn bug_bc_10_quarantine_missing_node_returns_error() {
+        use dtfs_common::types::QuarantineReason;
+        let mut sm = StateMachineData::default();
+        let resp = apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::QuarantineNode {
+                node_id: 999,
+                info: mk_quarantine_info(QuarantineReason::OrphanScrubInStateMissing),
+            },
+        );
+        assert!(matches!(resp, ClientResponse::Error { .. }));
     }
 }

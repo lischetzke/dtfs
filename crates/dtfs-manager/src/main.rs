@@ -360,6 +360,30 @@ async fn main() -> anyhow::Result<()> {
         scheduler_ref.run().await;
     });
 
+    // Bug BC-7 — orphan_scrub loop. Cross-checks on-disk chunks
+    // against state_machine.chunk_locations + reaps the diff after
+    // a grace period. Interval + grace come from the new
+    // [scrub] block in manager.toml; defaults: 1d / 1d.
+    let orphan_ref = task_scheduler.clone();
+    let orphan_interval = config.scrub.orphan_interval_secs;
+    let orphan_grace = config.scrub.orphan_grace_secs;
+    let _orphan_handle = tokio::spawn(async move {
+        orphan_ref.run_orphan_scrub(orphan_interval, orphan_grace).await;
+    });
+
+    // Bug BF-7 — auto-unquarantine sweep. Disabled when
+    // auto_unquarantine_secs == 0 (default; operator-only). The tick
+    // cadence is one-tenth of the cooldown (clamped to >= 30s) so the
+    // window doesn't drift by more than ~10 %.
+    let auto_unq_ref = task_scheduler.clone();
+    let cooldown = config.scrub.auto_unquarantine_secs;
+    let tick_secs = (cooldown / 10).max(30);
+    let _auto_unq_handle = tokio::spawn(async move {
+        auto_unq_ref
+            .run_auto_unquarantine_sweep(tick_secs, cooldown)
+            .await;
+    });
+
     // P0-1: Lease GC — sweeps expired write leases every 1s through Raft.
     let lease_gc_raft = raft.clone();
     let _lease_gc_handle = tokio::spawn(async move {

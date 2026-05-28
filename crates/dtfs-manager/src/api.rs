@@ -6,6 +6,12 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+// Bug BF-12 — bring `Instant::elapsed()` into scope for the
+// `last_quorum_acked` migration (openraft 0.10 wraps the timestamp
+// in `SerdeInstant`, whose `.elapsed()` lives on this trait).
+#[allow(unused_imports)]
+use openraft::Instant as _;
+
 use axum::{
     extract::{Json, Query, State},
     http::StatusCode,
@@ -95,6 +101,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Nodes
         .route("/api/v1/nodes", get(list_nodes))
         .route("/api/v1/nodes/{node_id}", get(get_node))
+        // Bug BC-12 — operator unquarantine endpoint.
+        .route(
+            "/api/v1/nodes/{node_id}/unquarantine",
+            post(unquarantine_node_endpoint),
+        )
         .route(
             "/api/v1/nodes/{node_id}/maintenance",
             post(set_maintenance),
@@ -105,6 +116,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/volumes", get(list_volumes).post(create_volume))
         // Audit
         .route("/api/v1/audit", get(get_audit_log))
+        // Bug BC-12b — operator integrity feed. Filters audit by the
+        // BC action prefixes so the WebUI /ui/integrity page (BC-12e)
+        // is a single fetch, not a polling N-merge across actions.
+        .route("/api/v1/integrity/faults", get(get_integrity_faults))
         // Config
         .route("/api/v1/config", get(get_config).post(update_config))
         // Scrub
@@ -120,6 +135,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // anchor and setting a cooldown that blocks immediate
         // re-promotion by the tiering engine.
         .route("/api/v1/files/flush_cache", post(flush_cache_endpoint))
+        // Bug BE-5/8 helper — return the chunk list for a single path so
+        // release-suite cases can resolve a path to chunk_ids + the
+        // nodes that hold each. The bulk /api/v1/files list omits
+        // chunks to keep the WebUI Explorer payload bounded; this
+        // endpoint is the focused per-path inspector.
+        .route("/api/v1/files/inspect", get(inspect_file_endpoint))
         // Bug AV — one-shot policy migration: clone legacy
         // `replication` into `mandatory_replicas` for a volume.
         .route("/api/v1/volumes/{id}/migrate-policy", post(migrate_volume_policy_endpoint))
@@ -274,7 +295,14 @@ async fn raft_state(State(state): State<Arc<AppState>>) -> Json<Value> {
             .map(|l| l.index)
             .unwrap_or(0),
         "voters": voters,
-        "millis_since_quorum_ack": metrics.millis_since_quorum_ack,
+        // Bug BF-12 — openraft 0.10 deprecated `millis_since_quorum_ack`
+        // (computed-on-emit; clock-skew bait) in favour of an absolute
+        // `last_quorum_acked: SerdeInstant`. Derive the legacy millis
+        // shape client-side via `.elapsed()` so the JSON contract the
+        // WebUI + scripts consume is unchanged.
+        "millis_since_quorum_ack": metrics.last_quorum_acked
+            .as_ref()
+            .map(|t| t.elapsed().as_millis() as u64),
     }))
 }
 
@@ -433,6 +461,7 @@ async fn join_complete_api(
         client_ip: None,
         version: String::new(),
         build_date: String::new(),
+        quarantine: None,
     };
 
     let completion = state
@@ -512,6 +541,36 @@ struct NodeResponse {
     /// the WebUI to show which disk in a multi-disk data node was
     /// filling up. Empty for manager/client roles.
     disks: Vec<DiskResponse>,
+    /// Bug BC-12a — `Some(_)` whenever the node is Quarantined.
+    /// Carries the reason / triggering chunk / fault history the
+    /// WebUI nodes page renders alongside the QUARANTINED badge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quarantine: Option<QuarantineResponse>,
+}
+
+/// Bug BC-12a — quarantine projection on /api/v1/nodes rows.
+#[derive(Serialize)]
+struct QuarantineResponse {
+    since_ms: u64,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    triggering_chunk_id: Option<String>,
+    fault_count_total: u32,
+    last_fault_at_ms: u64,
+    last_fault_summary: String,
+}
+
+impl QuarantineResponse {
+    fn from_info(q: &dtfs_common::types::QuarantineInfo) -> Self {
+        Self {
+            since_ms: q.since_ms,
+            reason: format!("{:?}", q.reason),
+            triggering_chunk_id: q.triggering_chunk_id.clone(),
+            fault_count_total: q.fault_count_total,
+            last_fault_at_ms: q.last_fault_at_ms,
+            last_fault_summary: q.last_fault_summary.clone(),
+        }
+    }
 }
 
 impl NodeResponse {
@@ -550,6 +609,7 @@ impl NodeResponse {
                     status: format!("{:?}", d.status).to_ascii_lowercase(),
                 })
                 .collect(),
+            quarantine: info.quarantine.as_ref().map(QuarantineResponse::from_info),
         }
     }
 }
@@ -646,6 +706,7 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             version: synth_version,
             build_date: synth_build_date,
             disks: Vec::new(),
+            quarantine: None,
         });
     }
 
@@ -701,6 +762,7 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             version: String::new(),
             build_date: String::new(),
             disks: Vec::new(),
+            quarantine: None,
         });
     }
 
@@ -795,6 +857,148 @@ async fn set_maintenance(
     Ok(Json(json!({
         "node_id": nid.to_string(),
         "maintenance": body.enable,
+    })))
+}
+
+/// Bug BC-12 — body for `POST /api/v1/nodes/{id}/unquarantine`.
+///
+/// `operator_id` identifies WHO unquarantined (free-form; in the absence
+/// of auth this is a label the operator picks, e.g. their initials or
+/// a ticket number). Empty rejected so the audit row always has a name.
+///
+/// `reason_acknowledged` is the operator's written justification for
+/// clearing the integrity-fault state. Minimum 16 chars to force a
+/// real sentence rather than "ok". The text lands in the audit log
+/// + the WebUI integrity feed so a future operator can reconstruct
+/// why the quarantine was lifted.
+#[derive(Deserialize)]
+struct UnquarantineRequest {
+    operator_id: String,
+    reason_acknowledged: String,
+}
+
+async fn unquarantine_node_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(node_id): axum::extract::Path<String>,
+    Json(body): Json<UnquarantineRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let nid: u64 = node_id.parse().map_err(|_| (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "node_id must be u64"})),
+    ))?;
+
+    let op = body.operator_id.trim();
+    if op.is_empty() {
+        return Err((StatusCode::BAD_REQUEST,
+            Json(json!({"error": "operator_id required"}))));
+    }
+    if body.reason_acknowledged.trim().len() < 16 {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({
+            "error": "reason_acknowledged must be at least 16 characters \
+                      (force a real justification, not 'ok'). Recommended: \
+                      describe what you investigated + why the chunk \
+                      is now trusted."
+        }))));
+    }
+
+    // Confirm the node is actually Quarantined before raft-writing —
+    // unquarantine on a Healthy node is a no-op but operators
+    // probably typed the wrong node id.
+    {
+        let sm = state.sm_data.read().await;
+        match sm.nodes.get(&nid) {
+            None => return Err((StatusCode::NOT_FOUND, Json(json!({
+                "error": format!("node {nid} not found")
+            })))),
+            Some(n) if n.quarantine.is_none() => {
+                return Err((StatusCode::CONFLICT, Json(json!({
+                    "error": format!("node {nid} is not Quarantined (current health={:?})", n.health)
+                }))));
+            }
+            _ => {}
+        }
+    }
+
+    let req = ClientRequest::UnquarantineNode {
+        node_id: nid,
+        operator_id: op.to_string(),
+        reason_acknowledged: body.reason_acknowledged.clone(),
+    };
+
+    state
+        .raft
+        .client_write(req)
+        .await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": format!("raft write failed: {e}")}))))?;
+
+    state.audit_log.log(
+        "api",
+        "node.unquarantine",
+        &format!("node={nid} by={op}"),
+        &body.reason_acknowledged,
+    );
+
+    info!("Bug BC-12: node {nid} unquarantined by {op}");
+    Ok(Json(json!({
+        "node_id": nid.to_string(),
+        "ok": true,
+    })))
+}
+
+#[derive(Deserialize)]
+struct InspectFileQuery {
+    path: String,
+}
+
+/// Bug BE helper — return the resolved chunk list for a path, with
+/// each chunk's hash + the node_ids holding it. Used by release-suite
+/// cases that need to corrupt or count replicas without scraping
+/// the WebUI Explorer.
+async fn inspect_file_endpoint(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<InspectFileQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let sm = state.sm_data.read().await;
+    let file = sm.files.get(&q.path).ok_or_else(|| (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": format!("file not found: {}", q.path)})),
+    ))?;
+    // ChunkLocationEntry is one row per replica — group by chunk_index
+    // so the response has one entry per logical chunk with the full
+    // node_id set holding it.
+    let mut by_index: std::collections::BTreeMap<u64, (String, u64, Vec<String>)> =
+        std::collections::BTreeMap::new();
+    for c in &file.chunks {
+        let e = by_index
+            .entry(c.chunk_index)
+            .or_insert_with(|| (c.chunk_hash.clone(), c.size_bytes, Vec::new()));
+        e.2.push(c.node_id.clone());
+    }
+    let chunks: Vec<Value> = by_index
+        .into_iter()
+        .map(|(idx, (hash, size, nodes))| {
+            json!({
+                "chunk_index": idx,
+                "chunk_id":    hash,
+                "size":        size,
+                "node_ids":    nodes,
+            })
+        })
+        .collect();
+    let total_size: u64 = file
+        .logical_size
+        .unwrap_or_else(|| file.chunks.iter().map(|c| c.size_bytes).sum());
+    Ok(Json(json!({
+        "path":        &file.path,
+        "volume_id":   &file.volume_id,
+        "total_size":  total_size,
+        "chunk_size":  file.chunk_size,
+        "chunks":      chunks,
+        "chunk_count": file.chunks.iter()
+            .map(|c| c.chunk_index)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
     })))
 }
 
@@ -1070,6 +1274,10 @@ async fn get_volume_endpoint(
 /// AV-3-5 pure helper — render a `VolumeConfig` to the JSON shape
 /// the GET and set-cache endpoints return. Pulled out so the
 /// shape can be unit-tested without spinning an axum runtime.
+// Bug BF-9 / BF-10 — back-compat surface that echoes the deprecated
+// schedule fields verbatim so older clients still parse the response.
+// Suppress the deprecation read warning at the function boundary.
+#[allow(deprecated)]
 pub(crate) fn volume_config_to_json(
     cfg: &dtfs_common::types::VolumeConfig,
 ) -> serde_json::Value {
@@ -1321,6 +1529,11 @@ pub(crate) struct SetSchedulesRequest {
 /// * `Some(v)` with `v >= 60` sets the override.
 /// * `None` is a no-op unless `clear_unspecified == true`, in
 ///   which case it also clears.
+// Bug BF-9 / BF-10 — back-compat surface that accepts the deprecated
+// schedule fields. The merge writes them to state-machine for snapshot
+// continuity, but the heartbeat path (metadata.rs:warn_once_*) no
+// longer honors them.
+#[allow(deprecated)]
 pub(crate) fn apply_set_schedules(
     current: &dtfs_common::types::VolumeConfig,
     req: &SetSchedulesRequest,
@@ -1591,6 +1804,89 @@ struct AuditQuery {
     action: Option<String>,
 }
 
+/// Bug BC-12b — list of action prefixes the integrity feed surfaces.
+/// Order matches the section in PLAN-BUG-BC-SCRUB.md § 4.5.
+const INTEGRITY_ACTIONS: &[&str] = &[
+    "node.quarantine",
+    "node.unquarantine",
+    "scrub.quick.fault",
+    "scrub.deep.corrupt",
+    "read.integrity_fault",
+    "orphan.in_state_missing",
+];
+
+/// Bug BC-12b — returns all audit entries whose `action` (or, for
+/// legacy state-machine entries, `summary`) starts with one of the
+/// integrity prefixes. Same wire shape as `/api/v1/audit` rows so the
+/// WebUI consumer can reuse its render code.
+async fn get_integrity_faults(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<AuditQuery>,
+) -> Json<Vec<Value>> {
+    let limit = query.limit.unwrap_or(200);
+
+    let matches_integrity = |action: &str, summary: &str| -> bool {
+        INTEGRITY_ACTIONS
+            .iter()
+            .any(|p| action.starts_with(p) || summary.starts_with(p))
+    };
+
+    if state.config.audit.replicate_via_raft {
+        let sm = state.sm_data.read().await;
+        let entries: Vec<Value> = sm
+            .audit_log
+            .iter()
+            .rev()
+            .filter(|e| matches_integrity(&e.action, &e.summary))
+            .take(limit)
+            .map(|e| {
+                let (actor, action, target, result) =
+                    backfill_audit_fields(&e.actor, &e.action, &e.target, &e.result, &e.summary);
+                json!({
+                    "timestamp": e.timestamp_ms / 1_000,
+                    "actor": actor,
+                    "action": action,
+                    "target": target,
+                    "result": result,
+                    "summary": e.summary,
+                    "origin_manager": e.origin_manager,
+                })
+            })
+            .collect();
+        Json(entries)
+    } else {
+        // Local-ring AuditEntry has no `summary` field (that lives on
+        // the replicated state_machine variant). Match against action
+        // only. Over-fetch so the filter has enough material before
+        // truncation.
+        let filter = crate::audit::AuditFilter {
+            since: None,
+            until: None,
+            action: None,
+            limit: Some(limit.saturating_mul(4).max(limit)),
+        };
+        let entries: Vec<Value> = state
+            .audit_log
+            .query(&filter)
+            .into_iter()
+            .filter(|e| matches_integrity(&e.action, ""))
+            .take(limit)
+            .map(|e| {
+                json!({
+                    "timestamp": e.timestamp,
+                    "actor": e.actor,
+                    "action": e.action,
+                    "target": e.target,
+                    "result": e.result,
+                    "summary": "",
+                    "origin_manager": "",
+                })
+            })
+            .collect();
+        Json(entries)
+    }
+}
+
 async fn get_audit_log(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AuditQuery>,
@@ -1715,6 +2011,14 @@ struct ConfigUpdateRequest {
     /// only behaviour for backwards compatibility.
     #[serde(default)]
     write_to_disk: bool,
+    /// Bug BD-3 — operator must explicitly acknowledge any write
+    /// that affects cluster-wide keys. The WebUI sets this only on
+    /// the Cluster-tab save action. Without it, the endpoint
+    /// refuses to write, preventing accidental drift caused by
+    /// an operator editing a cluster-wide key from a per-host
+    /// view that lacks federation.
+    #[serde(default)]
+    acknowledge_cluster_wide: bool,
 }
 
 async fn update_config(
@@ -1736,6 +2040,25 @@ async fn update_config(
                 })),
             ));
         }
+    }
+
+    // Bug BD-3 — guard cluster-wide writes. We treat any non-empty
+    // payload that the WebUI would touch under the Cluster tab as
+    // cluster-wide; the ack flag confirms the operator understands
+    // this propagates to every manager. Node-only writes are accepted
+    // without ack but only when `write_to_disk` is false (live-reload
+    // doesn't drift across peers — manager.toml is the durability
+    // boundary).
+    if body.write_to_disk && !body.acknowledge_cluster_wide {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "acknowledge_cluster_wide:true required for write_to_disk:true. \
+                          Cluster-scoped values must match across every manager; the WebUI \
+                          Cluster tab sets this automatically.",
+                "preserved_current": true,
+            })),
+        ));
     }
     let version = {
         let sm = state.sm_data.read().await;
@@ -1895,6 +2218,91 @@ fn manager_config_defaults_baseline() -> Value {
     })
 }
 
+/// Bug BD-1 — classify a flattened ManagerConfig key into the
+/// scope that decides whether the WebUI surfaces it under "Cluster"
+/// (must be identical across every manager — safe to edit + propagate)
+/// or under "Node" (intentionally per-host).
+///
+/// Anything that isn't in the table below defaults to `Node` —
+/// safer, since the cluster tab would otherwise expose an unknown
+/// key as cluster-wide and operators could change it expecting
+/// global effect. Add new prefixes to the table when new sub-configs
+/// arrive.
+pub(crate) fn config_key_scope(dotted: &str) -> &'static str {
+    // Trim the leading scope label produced by flatten_config
+    // ("manager.", "data.", "fuse." …) before matching.
+    let key = match dotted.find('.') {
+        Some(i) => &dotted[i + 1..],
+        None => dotted,
+    };
+    const CLUSTER_PREFIXES: &[&str] = &[
+        "cluster.",
+        "defaults.",
+        "tiering.",
+        "monitoring.",
+        "alerts.",
+        "audit.",
+        "scrub.",
+        "raft.election_timeout_ms",
+        "raft.heartbeat_interval_ms",
+        "raft.snapshot_threshold",
+    ];
+    for p in CLUSTER_PREFIXES {
+        if key.starts_with(p) || key == p.trim_end_matches('.') {
+            return "cluster";
+        }
+    }
+    "node"
+}
+
+#[cfg(test)]
+mod config_scope_tests {
+    use super::config_key_scope;
+
+    /// Bug BD-1 — exhaustive prefix table the WebUI consumes.
+    /// Future refactors that change the classifier MUST keep this
+    /// test green; misclassifying a node-specific key as cluster
+    /// would let an operator edit (e.g.) `node.hostname` in the
+    /// cluster tab and silently write it back to one manager only,
+    /// causing config drift across peers.
+    #[test]
+    fn bug_bd_1_classification_table() {
+        // Cluster-scope keys.
+        for k in [
+            "manager.cluster.name",
+            "manager.cluster.shared_secret",
+            "manager.defaults.chunk_size_mb",
+            "manager.defaults.replication.warm",
+            "manager.tiering.evaluation_interval_secs",
+            "manager.monitoring.heartbeat_interval_secs",
+            "manager.alerts.sinks",
+            "manager.audit.replicate_via_raft",
+            "manager.scrub.verify_on_read",
+            "manager.raft.election_timeout_ms",
+            "manager.raft.heartbeat_interval_ms",
+            "manager.raft.snapshot_threshold",
+        ] {
+            assert_eq!(config_key_scope(k), "cluster", "expected cluster: {k}");
+        }
+        // Node-scope keys.
+        for k in [
+            "manager.node.hostname",
+            "manager.node.id",
+            "manager.node.data_dir",
+            "manager.location.datacenter",
+            "manager.grpc.listen_addr",
+            "manager.grpc.advertise_addr",
+            "manager.api.listen_addr",
+            "manager.tls.cert_path",
+            "manager.tls.enabled",
+        ] {
+            assert_eq!(config_key_scope(k), "node", "expected node: {k}");
+        }
+        // Unknown prefix → fall back to node (safer default).
+        assert_eq!(config_key_scope("manager.something_new"), "node");
+    }
+}
+
 /// AZ-5-A1 helper — walk two parallel JSON values and produce one
 /// flat row per leaf. `scope` is the top-level prefix
 /// ("manager", "data", "fuse", or a hostname for per-host views).
@@ -1919,9 +2327,13 @@ fn flatten_config(
             }
         }
         _ => {
+            let dotted = format!("{scope}.{prefix}");
+            let kind = config_key_scope(&dotted);
             out.push(json!({
-                "name": format!("{scope}.{prefix}"),
+                "name": dotted,
                 "scope": scope,
+                // Bug BD-1 — WebUI tab dispatch reads this field.
+                "scope_kind": kind,
                 "current": current,
                 "default": defaults,
                 "is_default": current == defaults,
@@ -2092,11 +2504,19 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
             *tier_disks.entry(d.tier).or_default() += 1;
             // Apportion the node's used_capacity by this disk's share of
             // the node's total. Loses precision on multi-tier nodes if
-            // usage is uneven across tiers — best signal available until
-            // data nodes start reporting per-disk used in heartbeats.
-            let share = d.total_bytes as f64 / node_cap as f64;
-            *tier_used.entry(d.tier).or_default() +=
-                (n.used_capacity as f64 * share) as u64;
+            // usage is uneven across tiers. Bug BB-1: prefer per-disk
+            // `used_bytes` if the heartbeat populated it
+            // (DiskUsageSnapshot is now wired). Fall back to the
+            // share-of-total apportionment for clusters still on
+            // pre-AU data nodes.
+            let direct = d.used_bytes;
+            let value = if direct > 0 {
+                direct
+            } else {
+                let share = d.total_bytes as f64 / node_cap as f64;
+                (n.used_capacity as f64 * share) as u64
+            };
+            *tier_used.entry(d.tier).or_default() += value;
         }
     }
     let tier_breakdown: Vec<Value> = [
@@ -2184,8 +2604,22 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
             )
         })
         .count();
+    // Bug BC-11 — count quarantined nodes separately so /api/v1/stats
+    // surfaces the integrity-fault state without forcing the operator
+    // to scrape Prometheus or enumerate /api/v1/nodes by hand.
+    let quarantined_nodes = sm
+        .nodes
+        .values()
+        .filter(|n| matches!(n.health, HealthStatus::Quarantined))
+        .count();
     let health = if total_nodes == 0 {
         "unknown"
+    } else if quarantined_nodes > 0 {
+        // A Quarantined node = data-integrity event in progress. Even
+        // if every other node is Healthy, the cluster is no longer
+        // "healthy" — the operator needs to look at the integrity feed.
+        // We surface "critical" so dashboards page on this state.
+        "critical"
     } else if degraded_nodes > 0 || healthy_nodes < total_nodes {
         if healthy_nodes == 0 {
             "critical"
@@ -2264,6 +2698,10 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "health":                health,
         "healthy_nodes":         healthy_nodes,
+        // Bug BC-11 — non-zero means at least one node has been
+        // quarantined after an integrity fault. Routing already
+        // excludes them; the counter is what the WebUI badge reads.
+        "quarantined_nodes":     quarantined_nodes,
         "total_nodes":           total_nodes,
         "manager_count":         manager_count,
         "data_node_count":       data_node_count,
@@ -2602,6 +3040,7 @@ async fn prometheus_metrics(
     let mut healthy = 0u64;
     let mut suspect = 0u64;
     let mut down = 0u64;
+    let mut quarantined = 0u64;
     let mut total_capacity: u64 = 0;
     let mut used_capacity: u64 = 0;
     for info in sm.nodes.values() {
@@ -2609,6 +3048,11 @@ async fn prometheus_metrics(
             dtfs_common::types::HealthStatus::Healthy => healthy += 1,
             dtfs_common::types::HealthStatus::Suspect => suspect += 1,
             dtfs_common::types::HealthStatus::Down => down += 1,
+            // Bug BC-11 — surface quarantined node count in cluster
+            // status so the operator sees a non-zero counter the moment
+            // an integrity fault fires, without having to enumerate
+            // /api/v1/nodes by hand.
+            dtfs_common::types::HealthStatus::Quarantined => quarantined += 1,
             _ => {}
         }
         total_capacity = total_capacity.saturating_add(info.total_capacity);
@@ -2652,6 +3096,9 @@ async fn prometheus_metrics(
          # HELP dtfs_nodes_down Number of nodes in Down state.\n\
          # TYPE dtfs_nodes_down gauge\n\
          dtfs_nodes_down {down}\n\
+         # HELP dtfs_nodes_quarantined Bug BC: nodes Quarantined after integrity fault.\n\
+         # TYPE dtfs_nodes_quarantined gauge\n\
+         dtfs_nodes_quarantined {quarantined}\n\
          # HELP dtfs_cluster_capacity_bytes Total cluster capacity in bytes.\n\
          # TYPE dtfs_cluster_capacity_bytes gauge\n\
          dtfs_cluster_capacity_bytes {total_capacity}\n\
@@ -2865,6 +3312,7 @@ mod bug_al_io_rate_tests {
             client_ip: None,
             version: String::new(),
             build_date: String::new(),
+            quarantine: None,
         }
     }
 

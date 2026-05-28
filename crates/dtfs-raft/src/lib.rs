@@ -174,6 +174,14 @@ pub struct NodeInfo {
     /// Empty when the node pre-dates Bug AY.
     #[serde(default)]
     pub build_date: String,
+    /// Bug BC — quarantine metadata. `Some(_)` iff `health ==
+    /// HealthStatus::Quarantined`. When set, the manager EXCLUDES this
+    /// node from every serving path (read source, replication
+    /// source, allocate target). Cleared by an explicit operator
+    /// `UnquarantineNode` Raft write. Snapshot-safe via
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub quarantine: Option<dtfs_common::types::QuarantineInfo>,
 }
 
 impl fmt::Display for NodeInfo {
@@ -235,6 +243,27 @@ pub enum ClientRequest {
     UpdateNodeStatus {
         node_id: u64,
         status: String,
+    },
+
+    /// Bug BC-10 — quarantine a node after an integrity fault.
+    /// Apply path sets `NodeInfo.health = Quarantined` and stores
+    /// `info` on `NodeInfo.quarantine`. When the node was already
+    /// Quarantined, `info` REPLACES the existing record so a fresh
+    /// fault always surfaces the most recent reason/triggering
+    /// chunk while `fault_count_total` accumulates across faults.
+    QuarantineNode {
+        node_id: u64,
+        info: dtfs_common::types::QuarantineInfo,
+    },
+
+    /// Bug BC-12 — operator-driven unquarantine. Apply path clears
+    /// `NodeInfo.quarantine = None` and flips `health` back to
+    /// Healthy. `operator_id` + `reason_acknowledged` get logged to
+    /// the audit ring buffer by the calling site.
+    UnquarantineNode {
+        node_id: u64,
+        operator_id: String,
+        reason_acknowledged: String,
     },
 
     /// Heartbeat-derived usage counters for a data node (best-effort).
@@ -490,6 +519,12 @@ impl fmt::Display for ClientRequest {
             Self::DeregisterNode { node_id } => write!(f, "DeregisterNode({node_id})"),
             Self::UpdateNodeStatus { node_id, status } => {
                 write!(f, "UpdateNodeStatus({node_id}, {status})")
+            }
+            Self::QuarantineNode { node_id, info } => {
+                write!(f, "QuarantineNode({node_id}, {:?})", info.reason)
+            }
+            Self::UnquarantineNode { node_id, operator_id, .. } => {
+                write!(f, "UnquarantineNode({node_id}, by={operator_id})")
             }
             Self::UpdateNodeUsage {
                 node_id,

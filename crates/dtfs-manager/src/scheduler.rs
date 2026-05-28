@@ -67,6 +67,14 @@ pub struct TaskScheduler {
     audit: Arc<AuditLog>,
     /// P1-8: optional alert dispatcher. MigrationFailed fires here.
     alerts: parking_lot::RwLock<Option<Arc<crate::alerts::AlertDispatcher>>>,
+    /// Bug BC-7 — orphan-candidate tracker. Keyed by (node_id,
+    /// chunk_id), value is the wall-clock ms when we first observed
+    /// the chunk on disk WITHOUT a matching FileMetadata reference.
+    /// A subsequent tick that no longer sees the same orphan drops
+    /// the entry (the chunk was reattached or already deleted).
+    /// A tick that still sees it AFTER `orphan_grace_secs` elapsed
+    /// raft-writes a DeleteChunk + audits `orphan.reaped`.
+    orphan_seen: parking_lot::Mutex<std::collections::BTreeMap<(u64, String), u64>>,
 }
 
 impl TaskScheduler {
@@ -81,6 +89,7 @@ impl TaskScheduler {
             state_data,
             audit,
             alerts: parking_lot::RwLock::new(None),
+            orphan_seen: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -1496,6 +1505,334 @@ impl TaskScheduler {
 
         report
     }
+
+    // ── Bug BF-7 — auto-unquarantine cooldown sweep ──────────────────────
+
+    /// Run the auto-unquarantine loop forever. Each tick scans every
+    /// Quarantined node; if BOTH `(now - q.since_ms) > cooldown_secs`
+    /// AND `(now - q.last_fault_at_ms) > cooldown_secs`, raft-write
+    /// `UnquarantineNode` with operator_id="auto-cooldown".
+    ///
+    /// `cooldown_secs = 0` (the default) DISABLES the loop — operator-
+    /// only unquarantine matches the data-consistency-first stance.
+    pub async fn run_auto_unquarantine_sweep(
+        &self,
+        tick_secs: u64,
+        cooldown_secs: u64,
+    ) {
+        if cooldown_secs == 0 {
+            info!(
+                "Bug BF-7: auto-unquarantine disabled \
+                 (manager.scrub.auto_unquarantine_secs=0; manual only)"
+            );
+            return;
+        }
+        info!(
+            tick_secs,
+            cooldown_secs,
+            "Bug BF-7: auto-unquarantine sweep starting"
+        );
+        let mut tick = tokio::time::interval(Duration::from_secs(tick_secs.max(30)));
+        tick.tick().await; // skip immediate
+        loop {
+            tick.tick().await;
+            match self.auto_unquarantine_tick(cooldown_secs).await {
+                Ok(n) if n > 0 => info!(
+                    cleared = n,
+                    "Bug BF-7: auto-unquarantine cleared nodes after cooldown"
+                ),
+                Ok(_) => debug!("Bug BF-7: auto-unquarantine tick clean"),
+                Err(e) => warn!("Bug BF-7: auto-unquarantine tick failed: {e}"),
+            }
+        }
+    }
+
+    /// One sweep. Returns the number of nodes auto-unquarantined.
+    pub async fn auto_unquarantine_tick(&self, cooldown_secs: u64) -> anyhow::Result<usize> {
+        use dtfs_common::types::HealthStatus;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let cooldown_ms = cooldown_secs.saturating_mul(1000);
+
+        // Collect eligible (node_id, since, last_fault) snapshots.
+        let eligible: Vec<u64> = {
+            let sm = self.state_data.read().await;
+            sm.nodes
+                .iter()
+                .filter_map(|(id, n)| {
+                    if !matches!(n.health, HealthStatus::Quarantined) {
+                        return None;
+                    }
+                    let q = n.quarantine.as_ref()?;
+                    let age = now_ms.saturating_sub(q.since_ms);
+                    let since_last_fault = now_ms.saturating_sub(q.last_fault_at_ms);
+                    if age > cooldown_ms && since_last_fault > cooldown_ms {
+                        Some(*id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        let mut cleared = 0usize;
+        for node_id in eligible {
+            let req = ClientRequest::UnquarantineNode {
+                node_id,
+                operator_id: "auto-cooldown".to_string(),
+                reason_acknowledged: format!(
+                    "auto-cooldown after {}s clean (Bug BF-7)",
+                    cooldown_secs
+                ),
+            };
+            match self.raft.client_write(req).await {
+                Ok(_) => {
+                    cleared += 1;
+                    self.audit.log(
+                        "scheduler",
+                        "node.unquarantine.auto",
+                        &format!("node={node_id} cooldown_secs={cooldown_secs}"),
+                        "success",
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        node_id,
+                        error = %e,
+                        "Bug BF-7: UnquarantineNode raft write failed"
+                    );
+                }
+            }
+        }
+        Ok(cleared)
+    }
+
+    // ── Bug BC-7 — orphan_scrub ─────────────────────────────────────────
+
+    /// Run the orphan_scrub loop forever. Each tick:
+    /// 1. Walk every data node, call `ListChunks`, get on-disk chunk_id set.
+    /// 2. Diff against `state_machine.chunk_locations`.
+    /// 3. Update the `orphan_seen` tracker:
+    ///    - First time a chunk is seen orphan → record `first_seen_ms = now`.
+    ///    - Still orphan AFTER `grace_secs` → raft-write DeleteChunk +
+    ///      audit `orphan.reaped` + drop tracker entry.
+    ///    - Not orphan anymore (re-attached / already gone) → drop entry.
+    pub async fn run_orphan_scrub(&self, interval_secs: u64, grace_secs: u64) {
+        info!(
+            interval_secs,
+            grace_secs,
+            "Bug BC-7: orphan_scrub loop starting"
+        );
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(60)));
+        // Skip the first immediate tick so a fresh manager doesn't race
+        // with concurrent put_chunks at boot.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            match self.orphan_scrub_tick(grace_secs).await {
+                Ok(reaped) => {
+                    if reaped > 0 {
+                        info!(reaped, "Bug BC-7: orphan_scrub tick reaped chunks");
+                    } else {
+                        debug!("Bug BC-7: orphan_scrub tick clean");
+                    }
+                }
+                Err(e) => warn!("Bug BC-7: orphan_scrub tick failed: {e}"),
+            }
+        }
+    }
+
+    /// One sweep of orphan_scrub. Returns the number of chunks reaped.
+    pub async fn orphan_scrub_tick(&self, grace_secs: u64) -> anyhow::Result<usize> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // 1. Snapshot in-state chunk_ids from state-machine. Bug BF-8
+        // also snapshots per-node expected sets so the in-state-missing
+        // inverse check can fire alongside the on-disk-not-in-state
+        // reap loop without taking the state-machine lock twice.
+        let (data_nodes, in_state_chunks, expected_by_node, already_quarantined) = {
+            let sm = self.state_data.read().await;
+            let nodes: Vec<(u64, String)> = sm
+                .nodes
+                .iter()
+                .filter(|(_, n)| matches!(n.role, dtfs_common::types::NodeRole::Data))
+                .map(|(id, n)| (*id, n.grpc_addr.clone()))
+                .collect();
+            let mut chunks: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut expected: std::collections::BTreeMap<u64, std::collections::HashSet<String>> =
+                std::collections::BTreeMap::new();
+            for f in sm.files.values() {
+                for c in &f.chunks {
+                    chunks.insert(c.chunk_hash.clone());
+                    if let Ok(nid) = c.node_id.parse::<u64>() {
+                        expected.entry(nid).or_default().insert(c.chunk_hash.clone());
+                    }
+                }
+            }
+            let quarantined: std::collections::HashSet<u64> = sm
+                .nodes
+                .iter()
+                .filter(|(_, n)| matches!(
+                    n.health,
+                    dtfs_common::types::HealthStatus::Quarantined
+                ))
+                .map(|(id, _)| *id)
+                .collect();
+            (nodes, chunks, expected, quarantined)
+        };
+
+        let mut reaped: usize = 0;
+        let mut current_orphans: std::collections::BTreeSet<(u64, String)> =
+            std::collections::BTreeSet::new();
+
+        for (node_id, grpc_addr) in &data_nodes {
+            if grpc_addr.is_empty() { continue; }
+            let on_disk = match self.list_chunks_on_node(grpc_addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(node = %node_id, error = %e, "Bug BC-7: ListChunks failed");
+                    continue;
+                }
+            };
+            // Bug BF-8 — in-state-missing inverse. Before processing
+            // the on-disk-not-in-state loop, check what the state
+            // machine THINKS this node holds; quarantine the node if
+            // any expected chunk is absent from its ListChunks reply.
+            // Skip if the node is already Quarantined (apply path
+            // accumulates fault_count_total; no need to bump on every
+            // tick).
+            if !already_quarantined.contains(node_id) {
+                if let Some(expected) = expected_by_node.get(node_id) {
+                    let missing: Vec<&String> =
+                        expected.iter().filter(|c| !on_disk.contains(*c)).collect();
+                    if !missing.is_empty() {
+                        let first = missing[0].clone();
+                        let info = dtfs_common::types::QuarantineInfo {
+                            since_ms: now_ms,
+                            reason: dtfs_common::types::QuarantineReason::OrphanScrubInStateMissing,
+                            triggering_chunk_id: Some(first.clone()),
+                            fault_count_total: 0,
+                            last_fault_at_ms: now_ms,
+                            last_fault_summary: format!(
+                                "orphan_scrub: {} chunk(s) in state but not on disk; first={}",
+                                missing.len(),
+                                first
+                            ),
+                        };
+                        let req = ClientRequest::QuarantineNode {
+                            node_id: *node_id,
+                            info,
+                        };
+                        if let Err(e) = self.raft.client_write(req).await {
+                            warn!(
+                                node = %node_id, error = %e,
+                                "Bug BF-8: QuarantineNode raft write failed"
+                            );
+                        } else {
+                            self.audit.log(
+                                "scheduler",
+                                "orphan.in_state_missing",
+                                &format!(
+                                    "node={node_id} missing={} first={}",
+                                    missing.len(),
+                                    first
+                                ),
+                                "quarantined",
+                            );
+                            // Continue to reap on-disk-not-in-state below
+                            // — even a Quarantined node can have orphans
+                            // that the reaper should still clear.
+                        }
+                    }
+                }
+            }
+
+            for cid in &on_disk {
+                if in_state_chunks.contains(cid) { continue; }
+                current_orphans.insert((*node_id, cid.clone()));
+
+                let first_seen = {
+                    let mut map = self.orphan_seen.lock();
+                    *map.entry((*node_id, cid.clone())).or_insert(now_ms)
+                };
+                let age_secs = (now_ms.saturating_sub(first_seen)) / 1000;
+                if age_secs < grace_secs { continue; }
+
+                // Past grace — reap.
+                match self.delete_chunk_replica_on_node(grpc_addr, cid).await {
+                    Ok((was_present, freed)) => {
+                        let result_msg = if was_present {
+                            format!("freed_bytes={freed}")
+                        } else {
+                            "noop_already_absent".to_string()
+                        };
+                        self.audit.log(
+                            "scheduler",
+                            "orphan.reaped",
+                            &format!("node={node_id} chunk={cid} age_secs={age_secs}"),
+                            &result_msg,
+                        );
+                        reaped += 1;
+                        self.orphan_seen.lock().remove(&(*node_id, cid.clone()));
+                    }
+                    Err(e) => {
+                        warn!(
+                            node = %node_id, chunk = %cid, error = %e,
+                            "Bug BC-7: orphan reap delete RPC failed"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Drop tracker entries no longer orphan (file re-attached, or
+        // a different node's listing already reaped it).
+        {
+            let mut map = self.orphan_seen.lock();
+            map.retain(|k, _| current_orphans.contains(k));
+        }
+
+        Ok(reaped)
+    }
+
+    /// Bug BC-6 — invoke `ListChunks` on a single data node, drain all
+    /// pages, return the combined set of chunk_ids.
+    async fn list_chunks_on_node(
+        &self,
+        node_addr: &str,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        use dtfs_proto::dtfs::data::ListChunksRequest;
+        let endpoint = normalize_endpoint(node_addr);
+        let mut client = DataServiceClient::connect(endpoint).await
+            .map_err(|e| anyhow::anyhow!("connect to data node {}: {}", node_addr, e))?;
+        let mut out: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut token = String::new();
+        loop {
+            let resp = client
+                .list_chunks(ListChunksRequest {
+                    page_token: token.clone(),
+                    limit: 1000,
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("ListChunks RPC: {}", e))?
+                .into_inner();
+            for cid in resp.chunk_ids {
+                out.insert(cid);
+            }
+            if resp.next_page_token.is_empty() {
+                break;
+            }
+            token = resp.next_page_token;
+        }
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1998,16 +2335,24 @@ pub(crate) fn plan_anchor_lag_repair(
     let candidate_tier = anchor.required_tier.unwrap_or(DiskTier::Cold);
 
     // Gate 3 — find a healthy node in the anchor DC with the
-    // candidate tier. Exclude nodes that already hold the chunk
-    // (placement.node_id) to avoid self-placement.
-    let holders: std::collections::HashSet<u64> =
-        placements.iter().map(|p| p.node_id).collect();
+    // candidate tier. Bug fix (BF-followup): exclude only nodes that
+    // already hold the chunk ON THE CANDIDATE TIER. A node that
+    // holds the chunk on warm AND also has a cold disk is a valid
+    // target for the cold anchor copy — that single-node
+    // multi-tier case is the lab topology (data01 has warm+cold)
+    // and previously the holders-set excluded data01 entirely,
+    // stranding the anchor-lag pass + leaving cold=0 forever.
+    let tier_holders: std::collections::HashSet<u64> = placements
+        .iter()
+        .filter(|p| p.tier == candidate_tier)
+        .map(|p| p.node_id)
+        .collect();
     let target = nodes
         .iter()
         .filter(|n| n.healthy)
         .filter(|n| n.datacenter == anchor.datacenter)
         .filter(|n| n.tiers.contains(&candidate_tier))
-        .filter(|n| !holders.contains(&n.node_id))
+        .filter(|n| !tier_holders.contains(&n.node_id))
         .min_by_key(|n| n.node_id)?; // deterministic by node_id
 
     // Gate 4 — already scheduled?
@@ -2888,6 +3233,57 @@ mod bug_av_anchor_lag_tests {
             plan_anchor_lag_repair(&anchor, &placements, &nodes, "h0", &HashSet::new());
         assert!(action.is_none(),
             "no healthy LELI cold node → no repair");
+    }
+
+    /// 2026-05-27 lab-found bug: when the only anchor-DC node ALSO
+    /// holds the chunk on a non-anchor tier (warm), the previous
+    /// `holders` filter excluded that node entirely, so no cold
+    /// replica was ever scheduled. The lab minicluster topology
+    /// (data01 holds both warm + cold disks in dc-a) exposed this:
+    /// after writes the cold tier stayed empty forever.
+    #[test]
+    fn anchor_lag_repair_allows_self_when_holding_only_non_required_tier() {
+        let anchor = AnchorPolicy {
+            datacenter: "dc-a".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        // data01 (node_id=1) holds the chunk on warm; it ALSO has a
+        // cold disk and is the only node in dc-a. Anchor cold must
+        // land here.
+        let placements = vec![placement(1, "dc-a", DiskTier::Warm)];
+        let nodes = vec![
+            node(1, "dc-a", true, &[DiskTier::Warm, DiskTier::Cold]),
+            node(2, "dc-b", true, &[DiskTier::Warm, DiskTier::Cold]),
+        ];
+        let action = plan_anchor_lag_repair(
+            &anchor, &placements, &nodes, "h0", &HashSet::new(),
+        )
+        .expect("anchor-DC node with cold disk MUST be a valid target \
+                 even when it already holds the chunk on a different tier");
+        assert_eq!(action.target_node, 1);
+        assert_eq!(action.target_tier, DiskTier::Cold);
+    }
+
+    /// Inverse: when the candidate-tier copy already exists on the
+    /// node, don't double-schedule.
+    #[test]
+    fn anchor_lag_repair_skips_self_when_holding_required_tier() {
+        let anchor = AnchorPolicy {
+            datacenter: "dc-a".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        // data01 already holds a cold replica → anchor satisfied.
+        let placements = vec![placement(1, "dc-a", DiskTier::Cold)];
+        let nodes = vec![
+            node(1, "dc-a", true, &[DiskTier::Warm, DiskTier::Cold]),
+        ];
+        assert!(
+            plan_anchor_lag_repair(
+                &anchor, &placements, &nodes, "h0", &HashSet::new(),
+            )
+            .is_none(),
+            "anchor already satisfied → no repair"
+        );
     }
 }
 
