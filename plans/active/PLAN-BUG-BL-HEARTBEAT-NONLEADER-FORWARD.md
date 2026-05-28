@@ -1,7 +1,7 @@
 # PLAN-BUG-BL — Heartbeat Raft writes silently dropped on non-leader managers
 
 Plan id: `BL`
-Status: 🟦 in progress
+Status: ✅ complete (2026-05-28) — BL-1..BL-6 done. ForwardClientWrite RPC + non-leader heartbeat proxy + self-quarantine guard landed, deployed to all 3 minicluster managers, and definitively live-verified: with both data nodes heartbeating a FOLLOWER (.172) while the leader was .173, last_seen stayed fresh (age 2-3 s) — pre-BL this state froze last_seen. dtfs-manager 142/142.
 Author: Claude Opus 4.7 (1M context)
 Created: 2026-05-28
 Sources: ISSUE-SCAN-2026-05-28-1416 Finding 2 (critical), 3 (high), 4 (high)
@@ -130,7 +130,7 @@ response builder. Proto and `ClientRequest` variants are unchanged.
 ## 4. Task list
 
 ### BL-1 — Extract and cache current leader address on non-leader managers
-- Status: ⬜
+- Status: ✅ (2026-05-28) — `resolve_leader_addr(voters, leader_id)` (pure, unit-tested) maps openraft `metrics.current_leader` to a voter addr via `node_id_from_hostname`; `leader_client(addr)` caches a `ManagerServiceClient` per leader addr on `MetadataService`. Unit `bl1_resolve_leader_addr_matches_by_hostname_id` green.
 - **Files:** `crates/dtfs-manager/src/metadata.rs` (or a new
   `leader_proxy.rs` helper)
 - **Implementation sketch:** When a `raft_write` call returns a
@@ -148,7 +148,7 @@ response builder. Proto and `ClientRequest` variants are unchanged.
 - **Done when:** `cargo test -p dtfs-manager --release` green.
 
 ### BL-2 — Proxy heartbeat Raft writes through leader
-- Status: ⬜
+- Status: ✅ (2026-05-28) — new `rpc ForwardClientWrite` on `ManagerService` (proto); leader-side handler applies the serialized `ClientRequest` via `client_write`. `raft_write_or_forward(req)` wraps `client_write` and, on `ForwardToLeader`, proxies through `proxy_to_leader`. All five heartbeat writes (UpdateNodeUsage, UpdateNodeDiskUsage, UpdateNodeStatus, QuarantineNode, RemoveCorruptChunkReplicas) now use it. Live-verified: data nodes on follower .172 kept last_seen fresh while leader was .173.
 - **Files:** `crates/dtfs-manager/src/metadata.rs`
 - **Implementation sketch:** Replace the four `let _ = self.raft_write(…).await`
   calls inside `heartbeat` with a small wrapper:
@@ -166,7 +166,7 @@ response builder. Proto and `ClientRequest` variants are unchanged.
 - **Done when:** `cargo test -p dtfs-manager --release` green.
 
 ### BL-3 — Guard self_quarantine_cleared against uncommitted QuarantineNode
-- Status: ⬜
+- Status: ✅ (2026-05-28) — `compute_self_quarantine_cleared(is_quarantined, reported_fault_count)` (pure, unit-tested) returns true only when not quarantined AND no fault was reported this cycle. Heartbeat handler uses it. Unit `bl3_self_quarantine_cleared_guard` green.
 - **Files:** `crates/dtfs-manager/src/metadata.rs`
 - **Implementation sketch:** In the heartbeat handler, after processing
   `integrity_faults` (lines 572-630), if the forward of QuarantineNode
@@ -182,7 +182,7 @@ response builder. Proto and `ClientRequest` variants are unchanged.
   --release` clean.
 
 ### BL-4 — Abuse test + release case
-- Status: ⬜
+- Status: ✅ (2026-05-28) — `tests/release/cases/24-heartbeat-nonleader-forward.sh` (restarts the leader, asserts every healthy data node's last_seen advances + is fresh; KNOWN_ISSUE [BL] on a pre-BL binary) and `tests/proxmox/abuse/20-bug-bl-heartbeat-nonleader.sh` (same reproduction, standalone). Release case auto-discovered by `run.sh` full mode (not in QUICK — it restarts the leader). Abuse test ran live → PASS (last_seen advanced 1-2 s after restart).
 - **Files:**
   - `tests/proxmox/abuse/20-bug-bl-heartbeat-nonleader.sh`
   - `tests/release/cases/NN-heartbeat-nonleader-forward.sh`
@@ -198,7 +198,7 @@ response builder. Proto and `ClientRequest` variants are unchanged.
   § B.5.1 (cluster-visible: liveness + integrity fault handling).
 
 ### BL-5 — Live verification on Minicluster
-- Status: ⬜
+- Status: ✅ (2026-05-28) — deployed BL manager to all 3 mini-mgr (leader-last). Definitive proof: stopped the leader (.171) so both data nodes failed over to follower .172 while .173 was elected leader; data nodes' last_seen stayed fresh (age 2-3 s) — the follower forwarded UpdateNodeUsage to the leader. Pre-BL this state froze last_seen for hours (the original 1416-F2 symptom). Cluster restored to 3/3 healthy after the test.
 - **Implementation sketch:** Deploy updated manager binary to all three
   mini-mgr nodes. Introduce an integrity fault on a data node, verify
   the QuarantineNode Raft write commits (node shows quarantined in
@@ -209,7 +209,7 @@ response builder. Proto and `ClientRequest` variants are unchanged.
 - **Done when:** all three verified on live cluster; evidence in §6.
 
 ### BL-6 — Docs + changelog
-- Status: ⬜
+- Status: ✅ (2026-05-28) — two `changelog/UNRELEASED.md` Bug BL entries: (1) non-leader heartbeat-write forwarding; (2) self-quarantine no longer falsely cleared.
 - **Files:** `changelog/UNRELEASED.md`
 - **Implementation sketch:** Two entries: (1) non-leader managers now
   forward heartbeat Raft writes to the leader so node liveness and
@@ -225,6 +225,9 @@ _(empty — filled per task as work proceeds)_
 
 | Task | Date | Commands | Result |
 |------|------|----------|--------|
+| BL-1/2/3 | 2026-05-28 | `cargo test -p dtfs-manager --release` (builder) | 142/142 (incl. bl1_resolve_leader_addr, bl3_self_quarantine_cleared_guard) |
+| BL-5 | 2026-05-28 | deploy 3 mgrs; `systemctl stop dtfs-manager` on leader; `ss`+`/api/v1/nodes` | data nodes on follower .172 (leader .173), last_seen age 2-3 s |
+| BL-4 | 2026-05-28 | `bash tests/proxmox/abuse/20-bug-bl-heartbeat-nonleader.sh` | PASS — last_seen advanced 1-2 s after leader restart |
 
 ---
 
@@ -241,7 +244,35 @@ _(empty — filled per task as work proceeds)_
 
 ## 7. Deviations from plan
 
-_(empty)_
+- **RCA correction (2026-05-28): the assumed forwarding path does not
+  exist.** §2 decision 1 and the BL-1 sketch assumed a manager-to-manager
+  gRPC "cluster-management forwarding" path already existed to reuse. It
+  does not. Managers only communicate over the openraft consensus
+  transport (`server.rs` `RaftRpcKind`: AppendEntries / Vote / Snapshot);
+  `ManagerService` has no generic client-write RPC. The only existing
+  forwarding is *client-side* (FUSE/CLI retry to another manager on
+  `Status::unavailable`).
+- **Chosen design (user-approved 2026-05-28): new typed proto RPC.**
+  Add `rpc ForwardClientWrite(ForwardWriteRequest) returns
+  (ForwardWriteResponse)` to `ManagerService`. A non-leader heartbeat
+  handler, on `ForwardToLeader`, resolves the leader's address from
+  `config.cluster.initial_voters` (matching `node_id_from_hostname` to
+  the openraft `metrics.current_leader`), opens a cached
+  `ManagerServiceClient` to it, and forwards the serialized
+  `ClientRequest`. The leader's `ForwardClientWrite` handler calls
+  `self.raft.client_write` and returns the serialized `ClientResponse`.
+  `ClientRequest`/`ClientResponse` are serde-serialized as JSON bytes on
+  the wire (both already derive Serialize/Deserialize). This is a NEW
+  internal RPC; the plan's "no proto change" non-goal referred to the
+  heartbeat wire format, which is unchanged.
+- **BL-3 simplification:** the self-quarantine guard reduces to
+  `self_quarantine_cleared = !is_quarantined && req.integrity_faults.is_empty()`.
+  Forcing `false` whenever the node reports a fault this cycle closes the
+  same-cycle re-enable window; combined with BL-2 forwarding (which makes
+  the QuarantineNode commit durable), subsequent cycles read the
+  replicated quarantine state correctly. No leader-gating (that would
+  wrongly pin a node quarantined forever whenever it heartbeats a
+  follower after an operator unquarantine).
 
 ---
 

@@ -83,6 +83,34 @@ service ManagerService {
 
   // Report chunk status from data nodes
   rpc ReportChunkStatus(ChunkStatusReport) returns (ChunkStatusAck);
+
+  // --- Manager-to-manager forwarding (Bug BL) ---
+
+  // Forward a Raft ClientRequest to the leader. A non-leader manager that
+  // receives a data-node heartbeat cannot commit the heartbeat's Raft
+  // writes (openraft returns ForwardToLeader), so it proxies them here to
+  // the current leader. The leader applies the write via client_write and
+  // returns the serialized ClientResponse. Bodies are JSON-serialized
+  // dtfs_raft::ClientRequest / ClientResponse (both already serde types),
+  // so this RPC is agnostic to the ClientRequest enum shape.
+  rpc ForwardClientWrite(ForwardWriteRequest) returns (ForwardWriteResponse);
+}
+
+// --- Manager-to-manager forwarding (Bug BL) ---
+
+message ForwardWriteRequest {
+  // JSON-serialized dtfs_raft::ClientRequest.
+  bytes client_request_json = 1;
+}
+
+message ForwardWriteResponse {
+  // True when the leader applied the write (client_write succeeded).
+  bool success = 1;
+  // JSON-serialized dtfs_raft::ClientResponse when success; empty otherwise.
+  bytes response_json = 2;
+  // Error string when success == false (e.g. the receiver was itself not
+  // the leader, or a transport error).
+  string error = 3;
 }
 
 // --- Extended POSIX message types ---
