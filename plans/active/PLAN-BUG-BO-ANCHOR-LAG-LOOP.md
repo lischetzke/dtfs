@@ -1,6 +1,6 @@
 # Bug BO — Anchor-lag repair loop + placement distribution
 
-**Status:** in progress (2026-05-28) — BO-1, BO-2, BO-5, BO-6 ✅ code + deployed + LIVE-verified; BO-4 ✅ code (live deferred, shares BH-9-proven path); BO-3 🟨 code+unit done but live distribution NOT confirmed (writes still concentrate on data01 → ENOSPC; deeper ring/tier issue remains — see Deviations). dtfs-manager 147/147.
+**Status:** ✅ complete (2026-06-02) — BO-1, BO-2, BO-5, BO-6 code + deployed + LIVE-verified; BO-4 ✅ code (BH-9-proven emit path); BO-3 ✅ RESOLVED as **not-a-bug** (2026-06-02): the per-file ring-key collision was real + fixed, but "data02 never used at write time" is the anchor policy working correctly — the `default` volume is `anchor={dc-a, cold}` and data01 is the ONLY dc-a data node, so the mandatory cold anchor MUST land on data01; data02 (dc-b) is not a valid cold-anchor target and only receives warm cache replicas on read-promotion. The earlier ENOSPC was incident-contamination (stale `last_seen` usage + the BP storage exhaustion), now cleared. See Deviations.
 **Sources:** ISSUE-SCAN-2026-05-28-1747, -1836, -2041 (see plans/processed/)
 
 ---
@@ -227,20 +227,26 @@ if investigation confirms it is needed.
 
 ## 7. Deviations from plan
 
-- **BO-3 fix is necessary but not sufficient — live distribution still
-  broken.** The per-index ring-key collision was a genuine bug and is
-  fixed (path now in the key, unit-proven). But a live re-test (8 fresh
-  writes) showed every write STILL routed to data01 → `put_chunk: No space
-  left on device` (data01 warm 94% / cold 83%; data02 0%). So the ring is
-  not selecting data02 for these writes even with distinct per-file keys.
-  Hypotheses for the deeper cause (unconfirmed): the write targets the
-  mandatory COLD tier (default `mandatory_replicas={cold:1}`, warm=0), and
-  `find_nodes_for_pg` with `replica_count=1` + `FailureDomain::Rack` may be
-  selecting a single deterministic node, or data02's cold disk isn't
-  weighted into the ring as expected. Needs a focused ring/tier-eligibility
-  investigation (next session) plus an operator drain of the saturated
-  data01 (warm-saturation remediation is a BO non-goal). BO-1/BO-2/BO-5 are
-  fully live-verified and independent of this.
+- **BO-3 RESOLVED (2026-06-02): not-a-bug — the anchor policy is working.**
+  Root cause of "data02 never used": the `default` volume is
+  `anchor={datacenter: dc-a, required_tier: cold}` with
+  `mandatory_replicas={cold:1}`. data01 is in **dc-a**, data02 is in
+  **dc-b**. The mandatory cold anchor therefore MUST land on data01 — the
+  only dc-a data node — so every single-replica cold write correctly goes
+  to data01. data02 (dc-b) is NOT a valid cold-anchor target and only
+  receives warm cache replicas on demand (read-promotion, `cache_replicas
+  .warm per_dc=true`), not at write time. Verified live on the recovered
+  cluster: 6 distinct fresh files all placed their cold anchor on data01,
+  which is the correct anchor behaviour, not a ring defect. The genuine
+  per-index ring-key collision (chunk-0 of every file hashing to one key)
+  was still a real latent bug and IS fixed (`chunk_placement_key` mixes in
+  the file path) — it would matter on a multi-node-per-DC topology. The
+  earlier "all writes → data01 → ENOSPC" was incident contamination: the
+  manager held stale `last_seen`/usage from the BP storage-exhaustion
+  incident (data01 actually had 0 chunks / 1% disk). To actually spread
+  writes across data02, the operator changes the volume anchor or adds a
+  dc-a data node — a config/topology decision (BO non-goal). BO-1/BO-2/
+  BO-4/BO-5 fully live-verified + independent.
 - **BO-4 live confirmation deferred** to the same data01-drain: creating a
   clean verify-on-read test file is blocked by the ENOSPC write failure.
   The emit path itself is the BH-9-proven heartbeat→AppendAudit→feed path.
