@@ -3306,6 +3306,63 @@ mod posix_path_regression {
         );
     }
 
+    // Bug BR-1 — managers now self-register (role="manager") to publish
+    // their version/build_date and a live last_seen_ms into shared state.
+    // The same audit-idempotency that protects data-node re-registration
+    // must hold for the manager keepalive: a steady-state beat (only
+    // last_seen_ms changes) adds no audit row, while a real upgrade
+    // (version change) logs exactly once. Guards the new manager keepalive
+    // from spamming the audit feed.
+    #[test]
+    fn bug_br1_manager_self_register_versioned_and_idempotent() {
+        let mut sm = StateMachineData::default();
+        let mut info = mk_quarantinable_node();
+        info.role = dtfs_common::types::NodeRole::Manager;
+        info.hostname = "mgr01".into();
+        info.grpc_addr = "10.0.0.1:9401".into();
+        info.version = "v1.2.3".into();
+        info.build_date = "20260602-000000".into();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 42, info: info.clone() },
+        );
+        assert_eq!(
+            sm.nodes.get(&42).map(|n| n.version.as_str()),
+            Some("v1.2.3"),
+            "manager self-register must store version in shared state"
+        );
+        assert_eq!(count_register_audits(&sm), 1, "first manager register emits one row");
+
+        // Keepalive beat: only last_seen_ms moves.
+        let mut beat = info.clone();
+        beat.last_seen_ms = 123_456;
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::RegisterNode { node_id: 42, info: beat },
+        );
+        assert_eq!(
+            count_register_audits(&sm),
+            1,
+            "manager keepalive re-register must not spam the audit log"
+        );
+
+        // Upgrade: version changes once.
+        let mut upgraded = info;
+        upgraded.version = "v1.2.4".into();
+        apply_request(
+            &mut sm,
+            &mk_log_id(3),
+            &ClientRequest::RegisterNode { node_id: 42, info: upgraded },
+        );
+        assert_eq!(
+            count_register_audits(&sm),
+            2,
+            "a manager version change (upgrade) must log exactly one row"
+        );
+    }
+
     fn mk_data_node_with_disk(used_bytes: u64) -> crate::NodeInfo {
         let mut n = mk_quarantinable_node();
         n.disks = vec![dtfs_common::types::DiskInfo {

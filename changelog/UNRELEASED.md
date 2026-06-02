@@ -184,3 +184,14 @@
   `/bin -> /usr/bin` usr-merge symlink (`status=203/EXEC`), leaving the
   mount half-dead on stop/restart. The unit (and the ansible template)
   now reference `/usr/bin/fusermount3`.
+- **Bug BR-1 — every manager's version + build_date is visible from any
+  manager.** Managers are Raft peers, not `RegisterNode` callers, so each
+  manager's `/api/v1/nodes` showed a version only for itself and rendered
+  peers blank, and synthesized peer liveness as "always now". Each manager
+  now self-registers (role=manager) through the same `RegisterNode` path
+  the data nodes use, populating its version/build_date and a live
+  `last_seen_ms` in shared Raft state. Peer managers now render their real
+  version everywhere and a downed manager ages to non-Healthy via
+  `effective_health` (BP-3) instead of appearing perpetually alive. The
+  self-register is audit-idempotent (Bug BJ): steady-state keepalive adds
+  no audit rows; an upgrade logs once.
