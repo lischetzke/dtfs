@@ -1,0 +1,21 @@
+production:
+  ignore_missing: true
+  manager_nodes:
+    - 10.0.0.2:9402
+    - 10.0.0.3:9402
+	- 10.0.0.4:9402
+testing:
+  ignore_missing: false
+  manager_nodes:
+    - 10.1.0.2:9402
+	- 10.1.0.3:9402
+	- 10.1.0.4:9402
+development:
+  ignore_missing: true
+  manager_nodes:
+    - 10.2.0.2:9402
+  jumpclient:
+    dtfs-admin:
+	  address: 10.2.0.1
+	  user: root
+	  sshkey: ./id_ecdsa_adminkey
