@@ -1188,13 +1188,26 @@ impl ManagerService for MetadataService {
             // skips nodes that aren't Healthy so writes don't target Down hosts
             // (fix for F-010 + F-012).
             placements.clear();
+            // Bug BU — the fallback must also avoid full disks: a node is
+            // eligible only if it has at least one disk on the target tier
+            // with free space above the headroom. Otherwise this path
+            // happily round-robins a chunk onto a 100%-full node and
+            // put_chunk hard-fails with ENOSPC.
+            let pcfg = &self.config.placement;
             let node_list: Vec<_> = data
                 .nodes
                 .values()
                 .filter(|n| n.health == dtfs_common::types::HealthStatus::Healthy)
+                .filter(|n| {
+                    n.disks.iter().any(|d| {
+                        d.tier == effective_tier && pcfg.has_room(d.total_bytes, d.used_bytes)
+                    })
+                })
                 .collect();
             if node_list.is_empty() {
-                return Err(Status::unavailable("No healthy data nodes available"));
+                return Err(Status::unavailable(format!(
+                    "No healthy data node has free space on tier {effective_tier:?} (all candidate disks below placement headroom)"
+                )));
             }
             let rf = (replication as usize).min(node_list.len());
 

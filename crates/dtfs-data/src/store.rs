@@ -357,6 +357,43 @@ impl ChunkStore {
         Ok((tmp_path, mount))
     }
 
+    /// Bug BU-6 — sweep leftover streaming `*.dat.tmp` files at startup.
+    ///
+    /// At process start there are no in-flight `put_chunk` streams, so any
+    /// `*.dat.tmp` under a disk's `tmp/` is an orphan from a crash or an
+    /// ENOSPC-aborted put (whose RAII cleanup couldn't run across the
+    /// restart). Such leaks keep the disk full and make the ENOSPC
+    /// condition self-sustaining (live: 84 tmps = 18.5 GB stranded).
+    /// Returns the number of files reclaimed.
+    pub fn reclaim_orphan_streaming_tmps(&self) -> usize {
+        let mut removed = 0usize;
+        for disk in self.disk_manager.all_disks() {
+            let tmp_root = tmp_dir(&disk.mount_path);
+            let entries = match std::fs::read_dir(&tmp_root) {
+                Ok(e) => e,
+                Err(_) => continue, // tmp/ may not exist yet on a fresh disk
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_streaming_tmp = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.ends_with(".dat.tmp"))
+                    .unwrap_or(false);
+                if is_streaming_tmp && std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            tracing::warn!(
+                removed,
+                "Bug BU-6 reclaimed orphaned streaming tmp files at startup"
+            );
+        }
+        removed
+    }
+
     /// Commit a chunk whose bytes are already on disk in `tmp_path`.
     ///
     /// The chunk_id MUST be the BLAKE3 of the bytes streamed to
@@ -1166,6 +1203,25 @@ mod tests {
 
         let retrieved = store.get_chunk(&chunk_id).await.unwrap();
         assert_eq!(retrieved.as_ref(), data);
+    }
+
+    // Bug BU-6 — startup reclaim removes leftover streaming *.dat.tmp
+    // orphans (a crash/ENOSPC-aborted put) but leaves unrelated files.
+    #[tokio::test]
+    async fn bu6_reclaim_orphan_streaming_tmps() {
+        let (store, tmp) = make_test_store().await;
+        let tmp_dir = tmp.path().join("tmp");
+        let orphan1 = tmp_dir.join("streaming-123-456.dat.tmp");
+        let orphan2 = tmp_dir.join("streaming-123-789.dat.tmp");
+        let keep = tmp_dir.join("keep.txt");
+        std::fs::write(&orphan1, b"partial").unwrap();
+        std::fs::write(&orphan2, b"partial").unwrap();
+        std::fs::write(&keep, b"unrelated").unwrap();
+
+        let removed = store.reclaim_orphan_streaming_tmps();
+        assert_eq!(removed, 2, "both .dat.tmp orphans reclaimed");
+        assert!(!orphan1.exists() && !orphan2.exists(), "orphan tmps gone");
+        assert!(keep.exists(), "non-tmp file preserved");
     }
 
     #[tokio::test]

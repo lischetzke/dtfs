@@ -206,3 +206,18 @@
   `cargo build`. Reproducible-build pins (caller-set `SOURCE_DATE_EPOCH`)
   still produce a fixed stamp. Every binary now reports its build via
   `dtfs-* --version` (`v0.0.0-dev (built YYYYMMDD-HHmmss)`).
+- **Bug BU — writes route around full disks (capacity-aware placement).**
+  The placement ring weighted disks by *total* capacity and never checked
+  free space, so a 100%-full disk kept full ring weight and every chunk
+  that hashed to it hard-failed with `No space left on device` (ENOSPC) —
+  returning EIO to the client and unlinking the file — even when a peer
+  disk had abundant room. The ring now weights by *available* bytes and
+  excludes any disk whose free space is below a configurable headroom
+  (`[placement] min_free_bytes`/`min_free_pct`, default reserve
+  `max(1 GiB, 5%)`); the round-robin allocation fallback applies the same
+  filter. `put_chunk` now returns a typed `RESOURCE_EXHAUSTED` (not opaque
+  `Internal`) when a disk is full, and reclaims its partial streaming
+  `.tmp` on every error path; data nodes also sweep leftover `*.dat.tmp`
+  at startup (BU-6) — previously a disk-full put leaked its partial tmp
+  (live: 84 tmps = 18.5 GB stranded), making the ENOSPC condition
+  self-sustaining.

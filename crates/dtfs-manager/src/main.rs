@@ -350,7 +350,7 @@ async fn main() -> anyhow::Result<()> {
     // ClusterManager no longer holds a Raft reference; heartbeat tracking is
     // its only responsibility. Raft writes are performed by HealthMonitor.
     let cluster_mgr = Arc::new(ClusterManager::new());
-    let placement_engine = Arc::new(PlacementEngine::new());
+    let placement_engine = Arc::new(PlacementEngine::new(config.placement.clone()));
     let join_handler = Arc::new(join::JoinHandler::new(
         config.cluster.shared_secret.clone(),
         config.cluster.name.clone(),
