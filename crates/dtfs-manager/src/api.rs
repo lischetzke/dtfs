@@ -348,6 +348,38 @@ pub(crate) fn count_files_missing_chunks(sm: &dtfs_raft::state_machine::StateMac
         .count()
 }
 
+/// Bug BB-1 — per-tier `used_bytes` contribution of one node's disks.
+/// Returns `(tier, used_bytes)` per disk. When the node ships ANY per-disk
+/// usage (`used_bytes > 0` on at least one disk — the post-AU heartbeat),
+/// every disk's real `used_bytes` is trusted, including 0 for a genuinely
+/// empty disk. Only a legacy node that ships no per-disk usage at all
+/// (every disk 0) AND has a node-level `used_capacity` falls back to
+/// apportioning that capacity by each disk's share of the node total. This
+/// fixes the BA-2 lie where the previous per-disk decision fabricated usage
+/// onto an empty tier disk of an otherwise-used node.
+pub(crate) fn node_tier_used(
+    disks: &[dtfs_common::types::DiskInfo],
+    node_used_capacity: u64,
+) -> Vec<(DiskTier, u64)> {
+    let node_cap: u64 = disks.iter().map(|d| d.total_bytes).sum();
+    if node_cap == 0 {
+        return Vec::new();
+    }
+    let reports_per_disk = disks.iter().any(|d| d.used_bytes > 0);
+    disks
+        .iter()
+        .map(|d| {
+            let used = if reports_per_disk {
+                d.used_bytes
+            } else {
+                let share = d.total_bytes as f64 / node_cap as f64;
+                (node_used_capacity as f64 * share) as u64
+            };
+            (d.tier, used)
+        })
+        .collect()
+}
+
 async fn cluster_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let sm = state.sm_data.read().await;
     let node_count = sm.nodes.len();
@@ -2728,6 +2760,57 @@ mod bug_bp_tests {
 }
 
 #[cfg(test)]
+mod bug_bb_tests {
+    use super::*;
+    use dtfs_common::types::{DiskInfo, DiskStatus, DiskTier};
+
+    fn disk(tier: DiskTier, total: u64, used: u64) -> DiskInfo {
+        DiskInfo {
+            disk_id: 0, uuid: "u".into(), mount_path: "/m".into(),
+            tier, total_bytes: total, used_bytes: used, status: DiskStatus::Healthy,
+        }
+    }
+
+    /// BB-1 — when the node reports per-disk usage, each tier gets its REAL
+    /// used_bytes (including 0 for an empty disk) — never an apportioned
+    /// fabrication (the BA-2 lie).
+    #[test]
+    fn bb_1_real_per_disk_no_fabrication() {
+        // warm has 50MB used, cold is genuinely empty. node used_capacity=50MB.
+        let disks = vec![
+            disk(DiskTier::Warm, 100, 50),
+            disk(DiskTier::Cold, 100, 0),
+        ];
+        let got: std::collections::HashMap<DiskTier, u64> =
+            node_tier_used(&disks, 50).into_iter().collect();
+        assert_eq!(got[&DiskTier::Warm], 50, "warm = real used");
+        assert_eq!(got[&DiskTier::Cold], 0, "empty cold disk must NOT be apportioned 25MB");
+    }
+
+    /// BB-1 — a legacy node that ships NO per-disk usage (all zero) but has a
+    /// node-level used_capacity falls back to capacity-share apportionment.
+    #[test]
+    fn bb_1_legacy_node_apportions() {
+        let disks = vec![
+            disk(DiskTier::Warm, 100, 0),
+            disk(DiskTier::Cold, 100, 0),
+        ];
+        let got: std::collections::HashMap<DiskTier, u64> =
+            node_tier_used(&disks, 80).into_iter().collect();
+        // 80 split 50/50 across equal-size disks.
+        assert_eq!(got[&DiskTier::Warm], 40);
+        assert_eq!(got[&DiskTier::Cold], 40);
+    }
+
+    /// BB-1 — a zero-capacity node contributes nothing.
+    #[test]
+    fn bb_1_zero_capacity_node_empty() {
+        assert!(node_tier_used(&[], 100).is_empty());
+        assert!(node_tier_used(&[disk(DiskTier::Warm, 0, 0)], 100).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod bug_bh8_infra_health_tests {
     use super::*;
 
@@ -2815,21 +2898,17 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         for d in &n.disks {
             *tier_total.entry(d.tier).or_default() += d.total_bytes;
             *tier_disks.entry(d.tier).or_default() += 1;
-            // Apportion the node's used_capacity by this disk's share of
-            // the node's total. Loses precision on multi-tier nodes if
-            // usage is uneven across tiers. Bug BB-1: prefer per-disk
-            // `used_bytes` if the heartbeat populated it
-            // (DiskUsageSnapshot is now wired). Fall back to the
-            // share-of-total apportionment for clusters still on
-            // pre-AU data nodes.
-            let direct = d.used_bytes;
-            let value = if direct > 0 {
-                direct
-            } else {
-                let share = d.total_bytes as f64 / node_cap as f64;
-                (n.used_capacity as f64 * share) as u64
-            };
-            *tier_used.entry(d.tier).or_default() += value;
+        }
+        // Bug BB-1: per-tier used is summed from REAL per-disk `used_bytes`
+        // when the node reports any (post-AU heartbeat ships per-disk usage),
+        // including 0 for a genuinely-empty disk. Only a legacy node that
+        // ships NO per-disk usage at all falls back to apportioning its
+        // node-level `used_capacity` by each disk's capacity share. The old
+        // code decided this PER-DISK (`used_bytes > 0`), which fabricated
+        // usage onto an empty tier disk of an otherwise-used node
+        // (BA-2 apportionment lie).
+        for (tier, used) in node_tier_used(&n.disks, n.used_capacity) {
+            *tier_used.entry(tier).or_default() += used;
         }
     }
     let tier_breakdown: Vec<Value> = [
