@@ -277,6 +277,29 @@ pub struct RaftConfig {
     pub heartbeat_interval_ms: u64,
     #[serde(default = "default_snapshot_threshold")]
     pub snapshot_threshold: u64,
+    /// Bug BP-1 — RocksDB info-LOG retention for the raft log store.
+    /// Unbounded by default in RocksDB, the `LOG.old.*` info logs grew to
+    /// ~6.8 GB and filled a 16 GB manager partition (ISSUE-SCAN-2026-06-02
+    /// F5). Keep only the most recent N.
+    #[serde(default = "default_rocksdb_keep_log_file_num")]
+    pub rocksdb_keep_log_file_num: u64,
+    /// Bug BP-1 — max RocksDB MANIFEST size before it rotates. Unbounded
+    /// by default, the MANIFEST grew to ~207 MB. Rotating bounds it.
+    #[serde(default = "default_rocksdb_max_manifest_bytes")]
+    pub rocksdb_max_manifest_bytes: u64,
+    /// Bug BP-1 — how many committed raft-log entries openraft keeps after
+    /// a snapshot. A large/implicit-default value let ~10 000 tiny `.sst`
+    /// files accumulate, slowing RocksDB open to minutes. Bounded purge
+    /// keeps the on-disk log small.
+    #[serde(default = "default_max_in_snapshot_log_to_keep")]
+    pub max_in_snapshot_log_to_keep: u64,
+    /// Bug BP-3 — liveness window (seconds). A node whose `last_seen_ms` is
+    /// older than this is projected `Suspect` (and `Down` past 4×) in the
+    /// read API regardless of its stored `Healthy`, so a frozen heartbeat
+    /// (raft degraded) cannot keep reporting a dead node as Healthy
+    /// (ISSUE-SCAN-2026-06-02 F4). Read-path only — no raft write needed.
+    #[serde(default = "default_node_liveness_secs")]
+    pub node_liveness_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -694,6 +717,20 @@ fn default_heartbeat_interval() -> u64 {
 }
 fn default_snapshot_threshold() -> u64 {
     10000
+}
+fn default_rocksdb_keep_log_file_num() -> u64 {
+    4
+}
+fn default_rocksdb_max_manifest_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+fn default_max_in_snapshot_log_to_keep() -> u64 {
+    1000
+}
+fn default_node_liveness_secs() -> u64 {
+    // ~6 missed 5 s heartbeats. Long enough to ride out a brief GC pause or
+    // leader election, short enough that a truly dead node is flagged fast.
+    30
 }
 fn default_max_message_size() -> u32 {
     256

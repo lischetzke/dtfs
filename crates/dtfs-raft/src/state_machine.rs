@@ -4,7 +4,7 @@
 //! [`crate::snapshot`] and stored as `Cursor<Vec<u8>>` blobs.
 
 use std::collections::BTreeMap;
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -467,14 +467,49 @@ impl StateMachineStore {
             snapshot_dir: Some(dir.clone()),
         };
 
+        // Bug BP-2 — clean any stray `.tmp` from an interrupted write so a
+        // partial temp can never be mistaken for a snapshot.
+        let _ = std::fs::remove_file(dir.join("snapshot.bin.tmp"));
+
         let path = dir.join("snapshot.bin");
         if path.exists() {
-            let bytes = std::fs::read(&path)?;
-            let persisted: PersistedSnapshot = bincode::deserialize(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            // Replay the snapshot contents into the in-memory FSM.
-            let snap: StateMachineSnapshot = serde_json::from_slice(&persisted.data)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            // Bug BP-2 — a snapshot truncated by a disk-full / crash mid-write
+            // (0-byte or partial) must NOT hard-error the open (that wedged
+            // the manager on `Read Snapshot EOF`, ISSUE-SCAN-2026-06-02 F3).
+            // Treat an unreadable snapshot as absent: log, delete it, and
+            // start blank — openraft log-catchup from a healthy peer brings
+            // the node current.
+            let decoded: Option<(PersistedSnapshot, StateMachineSnapshot)> =
+                match std::fs::read(&path) {
+                    Ok(bytes) => match bincode::deserialize::<PersistedSnapshot>(&bytes) {
+                        Ok(persisted) => match serde_json::from_slice::<StateMachineSnapshot>(
+                            &persisted.data,
+                        ) {
+                            Ok(snap) => Some((persisted, snap)),
+                            Err(e) => {
+                                tracing::warn!(error = %e, path = ?path,
+                                    "Bug BP-2: snapshot inner payload corrupt; \
+                                     discarding + catching up via log replay");
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, path = ?path,
+                                "Bug BP-2: snapshot envelope corrupt/truncated; \
+                                 discarding + catching up via log replay");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = ?path,
+                            "Bug BP-2: snapshot unreadable; discarding");
+                        None
+                    }
+                };
+            let Some((persisted, snap)) = decoded else {
+                let _ = std::fs::remove_file(&path);
+                return Ok(store);
+            };
             let mut sm = store
                 .data
                 .try_write()
@@ -534,8 +569,22 @@ impl StateMachineStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let tmp = dir.join("snapshot.bin.tmp");
         let final_path = dir.join("snapshot.bin");
-        std::fs::write(&tmp, &buf)?;
+        // Bug BP-2 — crash/ENOSPC-safe write: fsync the tmp file BEFORE the
+        // rename, then fsync the directory AFTER, so a power loss / disk-full
+        // mid-write can only ever leave the old committed snapshot or a
+        // stray `.tmp` — never a truncated `snapshot.bin`. (ISSUE-SCAN
+        // 2026-06-02 F3: a disk-full snapshot write left a 0-byte
+        // snapshot.bin that wedged the manager on `Read Snapshot EOF`.)
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &final_path)?;
+        // fsync the directory so the rename itself is durable.
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
         debug!(
             "persisted snapshot to {:?}: id={} bytes={}",
             final_path,
@@ -1865,6 +1914,50 @@ mod snapshot_persistence_tests {
         let data = sm.data.read().await;
         assert!(data.files.is_empty());
         assert!(data.last_applied_log.is_none());
+    }
+
+    /// Bug BP-2 — a truncated/0-byte `snapshot.bin` (disk-full mid-write)
+    /// must NOT hard-error `open_at`; it is treated as absent, removed, and
+    /// the store starts blank so openraft catches up via log replay.
+    #[tokio::test]
+    async fn bp_2_truncated_snapshot_treated_as_absent() {
+        let dir = tmp_dir();
+        // Write a 0-byte snapshot.bin (the exact F3 corruption shape).
+        std::fs::write(dir.path().join("snapshot.bin"), b"").expect("write empty");
+        let sm = StateMachineStore::open_at(dir.path())
+            .expect("open must NOT error on a truncated snapshot");
+        {
+            let data = sm.data.read().await;
+            assert!(data.files.is_empty(), "blank state after discarding corrupt snapshot");
+        }
+        // The corrupt file is removed so it cannot wedge subsequent opens.
+        assert!(
+            !dir.path().join("snapshot.bin").exists(),
+            "corrupt snapshot.bin must be deleted"
+        );
+        // A partial (non-bincode) payload is likewise tolerated.
+        std::fs::write(dir.path().join("snapshot.bin"), b"\x00\x01garbage").expect("write junk");
+        assert!(
+            StateMachineStore::open_at(dir.path()).is_ok(),
+            "partial snapshot envelope tolerated"
+        );
+    }
+
+    /// Bug BP-2 — a stray `snapshot.bin.tmp` left by an interrupted write is
+    /// ignored on open and does not become the active snapshot.
+    #[tokio::test]
+    async fn bp_2_stray_tmp_ignored_on_open() {
+        let dir = tmp_dir();
+        std::fs::write(dir.path().join("snapshot.bin.tmp"), b"partial").expect("write tmp");
+        let sm = StateMachineStore::open_at(dir.path()).expect("open ignores .tmp");
+        {
+            let data = sm.data.read().await;
+            assert!(data.files.is_empty());
+        }
+        assert!(
+            !dir.path().join("snapshot.bin.tmp").exists(),
+            "stray .tmp is cleaned up on open"
+        );
     }
 
     #[tokio::test]

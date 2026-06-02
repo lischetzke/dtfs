@@ -51,6 +51,37 @@
   `ChunkLocationCommit`.
 
 ## Bug Fixes
+- **Bug BP-1 — manager raft storage no longer grows unbounded.** RocksDB
+  info-LOG (`LOG.old.*`) and MANIFEST were uncapped and grew to ~6.8 GB +
+  ~207 MB, filling a 16 GB manager partition and taking the cluster to the
+  edge of quorum loss. The log store now bounds `keep_log_file_num` (4) and
+  `max_manifest_file_size` (64 MiB), and openraft retains far fewer
+  post-snapshot log entries (`max_in_snapshot_log_to_keep`), so the on-disk
+  `.sst` set stays small. New `[raft]` config keys
+  (`rocksdb_keep_log_file_num`, `rocksdb_max_manifest_bytes`,
+  `max_in_snapshot_log_to_keep`) with bounded defaults.
+- **Bug BP-2 — snapshot writes are crash/ENOSPC-safe.** The state-machine
+  snapshot is written to `snapshot.bin.tmp`, fsynced, atomically renamed,
+  and the directory fsynced, so a disk-full / crash mid-write can never
+  leave a truncated `snapshot.bin`. On startup a corrupt/0-byte snapshot is
+  discarded (and removed) instead of wedging the manager on `Read Snapshot
+  EOF`; the node catches up via raft log replay.
+- **Bug BP-3 — stale nodes are no longer reported Healthy.** The node
+  health shown by `/api/v1/nodes` and counted in
+  `/api/v1/cluster/status` is now projected against a liveness window
+  (`node_liveness_secs`, default 30 s): a node whose `last_seen_ms` is
+  stale is reported `Suspect` (then `Down`), even while raft writes are
+  stalled — a read-path projection that needs no committing leader.
+- **Bug BP-4 — realized data loss is surfaced.** `/api/v1/cluster/status`
+  now reports `files_missing_chunks` and degrades its top-line `status`
+  when files exist with zero chunk bindings, instead of a bare `ok`. The
+  GC orphan-reap guard is made explicit: a chunk is deleted only when no
+  FileMetadata references its hash (defence-in-depth against the
+  disk-UUID-rotation data-loss vector closed by BN-1).
+- **Bug BP-5 — phantom tape replication is normalized away.** Saving a
+  volume on a cluster with no tape-tier disks drops a `replication.tape`
+  target to 0 (the non-fatal sibling of BM-3's mandatory-tape reject), so
+  the scheduler is not handed an unsatisfiable target.
 - **Bug BJ — re-registering an unchanged node no longer spams the audit
   log.** `RegisterNode` previously wrote an audit row on every apply, so
   a node re-registering (deterministic node id reused) added a noise row

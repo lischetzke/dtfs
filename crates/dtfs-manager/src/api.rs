@@ -306,26 +306,91 @@ async fn raft_state(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
+/// Bug BP-3 — effective (projected) health for a node, downgrading a stored
+/// `Healthy` to `Suspect`/`Down` when its `last_seen_ms` is stale. Read-path
+/// only: it never mutates state, so it surfaces the truth even when raft
+/// writes are stalled (the exact condition that froze `last_seen` while the
+/// node still reported `Healthy`, ISSUE-SCAN-2026-06-02 F4). Non-Healthy
+/// stored states (Quarantined/Down/…) are authoritative and pass through.
+pub(crate) fn effective_health(
+    stored: dtfs_common::types::HealthStatus,
+    last_seen_ms: u64,
+    now_ms: u64,
+    window_secs: u64,
+) -> dtfs_common::types::HealthStatus {
+    use dtfs_common::types::HealthStatus;
+    if !matches!(stored, HealthStatus::Healthy) {
+        return stored;
+    }
+    let window_ms = window_secs.saturating_mul(1000);
+    // last_seen==0 (never reported) or window==0 (disabled) → leave as stored.
+    if last_seen_ms == 0 || window_ms == 0 {
+        return stored;
+    }
+    let age_ms = now_ms.saturating_sub(last_seen_ms);
+    if age_ms > window_ms.saturating_mul(4) {
+        HealthStatus::Down
+    } else if age_ms > window_ms {
+        HealthStatus::Suspect
+    } else {
+        HealthStatus::Healthy
+    }
+}
+
+/// Bug BP-4 — count regular files that have no chunk bindings (realized data
+/// loss: FileMetadata stranded with zero chunks, e.g. after GC deleted
+/// orphaned chunks). Directories + symlinks legitimately have no chunks and
+/// are excluded.
+pub(crate) fn count_files_missing_chunks(sm: &dtfs_raft::state_machine::StateMachineData) -> usize {
+    sm.files
+        .values()
+        .filter(|f| !f.is_directory && f.symlink_target.is_none() && f.chunks.is_empty())
+        .count()
+}
+
 async fn cluster_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let sm = state.sm_data.read().await;
     let node_count = sm.nodes.len();
     let file_count = sm.files.len();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let window = state.config.raft.node_liveness_secs;
+    // Bug BP-3 — count effective (liveness-projected) health, not the stale
+    // stored value, so a frozen-heartbeat node is not counted Healthy.
     let healthy_count = sm
         .nodes
         .values()
-        .filter(|n| n.health == dtfs_common::types::HealthStatus::Healthy)
+        .filter(|n| {
+            effective_health(n.health, n.last_seen_ms, now_ms, window)
+                == dtfs_common::types::HealthStatus::Healthy
+        })
         .count();
+    // Bug BP-4 — files that lost all chunk bindings (realized data loss).
+    let files_missing_chunks = count_files_missing_chunks(&sm);
 
     let total_capacity: u64 = sm.nodes.values().map(|n| n.total_capacity).sum();
     let used_capacity: u64 = sm.nodes.values().map(|n| n.used_capacity).sum();
 
+    // Bug BP-4 — a bare "ok" masked 184 files at chunk_count=0. Reflect
+    // realized data loss + degraded liveness in the top-line status.
+    let status = if files_missing_chunks > 0 {
+        "degraded"
+    } else if healthy_count < node_count {
+        "degraded"
+    } else {
+        "ok"
+    };
+
     Json(json!({
-        "status": "ok",
+        "status": status,
         "cluster_name": state.config.cluster.name,
         "node": state.config.node.hostname,
         "data_nodes": node_count,
         "data_nodes_healthy": healthy_count,
         "files": file_count,
+        "files_missing_chunks": files_missing_chunks,
         "total_capacity": total_capacity,
         "used_capacity": used_capacity,
         "config_version": sm.cluster_config.version,
@@ -632,11 +697,16 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
 
     // 1. Data + manager nodes registered in Raft (have heartbeat /
     //    join records).
+    let liveness_window = state.config.raft.node_liveness_secs;
     let mut nodes: Vec<NodeResponse> = sm
         .nodes
         .iter()
         .map(|(id, info)| {
             let mut r = NodeResponse::from_entry(*id, info);
+            // Bug BP-3 — project stale-liveness downgrade onto the reported
+            // health so a frozen-heartbeat node is not shown Healthy.
+            let eff = effective_health(info.health, info.last_seen_ms, now_ms, liveness_window);
+            r.health = format!("{eff:?}");
             if Some(*id) == leader_id {
                 r.is_leader = true;
             }
@@ -1527,6 +1597,23 @@ pub(crate) fn validate_tape_satisfiable(
     Ok(())
 }
 
+/// Bug BP-5 — drop a `replication.tape` target a cluster with no tape disks
+/// can never satisfy. Unlike `mandatory_replicas.tape` (BM-3, hard reject),
+/// the legacy `replication.tape` is non-fatal scheduler drift, so we
+/// normalize it to 0 at save time (mutating `cfg`) rather than rejecting.
+/// Returns true when it changed the config. Idempotent.
+pub(crate) fn normalize_tape_replication(
+    cfg: &mut dtfs_common::types::VolumeConfig,
+    has_tape_disk: bool,
+) -> bool {
+    if !has_tape_disk && cfg.replication.tape > 0 {
+        cfg.replication.tape = 0;
+        true
+    } else {
+        false
+    }
+}
+
 /// Bug BM-3 — does any registered data node expose a tape-tier disk?
 fn cluster_has_tape_disk(
     nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
@@ -1793,18 +1880,24 @@ async fn set_volume_mandatory_endpoint(
         ));
     };
 
-    let next = apply_set_mandatory(&current, &body)
+    let mut next = apply_set_mandatory(&current, &body)
         .map_err(|e| (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e})),
         ))?;
 
     // Bug BM-3 — reject an unsatisfiable mandatory tape constraint
-    // against the current topology.
+    // against the current topology. Bug BP-5 — and normalize a phantom
+    // `replication.tape` to 0 on the same save (non-fatal drift).
     {
         let sm = state.sm_data.read().await;
-        validate_tape_satisfiable(next.mandatory_replicas.tape, cluster_has_tape_disk(&sm.nodes))
+        let has_tape = cluster_has_tape_disk(&sm.nodes);
+        validate_tape_satisfiable(next.mandatory_replicas.tape, has_tape)
             .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+        if normalize_tape_replication(&mut next, has_tape) {
+            warn!(volume = %volume_id,
+                "Bug BP-5: dropped replication.tape -> 0 (no tape disks in cluster)");
+        }
     }
 
     let changed = current != next;
@@ -2556,6 +2649,81 @@ mod bug_bm3_tape_validation_tests {
         assert!(!cluster_has_tape_disk(&nodes), "only a cold disk → no tape");
         nodes.insert(2, mk_node(DiskTier::Tape));
         assert!(cluster_has_tape_disk(&nodes), "a tape disk is now present");
+    }
+}
+
+#[cfg(test)]
+mod bug_bp_tests {
+    use super::*;
+    use dtfs_common::types::HealthStatus;
+
+    // ── BP-3 — stale-liveness health projection ─────────────────────
+    #[test]
+    fn bp_3_effective_health_downgrades_stale() {
+        let now = 1_000_000u64;
+        let win = 30u64; // 30s window
+        // Fresh → stays Healthy.
+        assert_eq!(effective_health(HealthStatus::Healthy, now - 5_000, now, win), HealthStatus::Healthy);
+        // Past 1× window → Suspect.
+        assert_eq!(effective_health(HealthStatus::Healthy, now - 40_000, now, win), HealthStatus::Suspect);
+        // Past 4× window → Down.
+        assert_eq!(effective_health(HealthStatus::Healthy, now - 200_000, now, win), HealthStatus::Down);
+        // Non-Healthy stored state is authoritative (never upgraded).
+        assert_eq!(effective_health(HealthStatus::Quarantined, now - 200_000, now, win), HealthStatus::Quarantined);
+        // last_seen==0 (never reported) or window==0 (disabled) → unchanged.
+        assert_eq!(effective_health(HealthStatus::Healthy, 0, now, win), HealthStatus::Healthy);
+        assert_eq!(effective_health(HealthStatus::Healthy, now - 999_999, now, 0), HealthStatus::Healthy);
+    }
+
+    // ── BP-4 — files-missing-chunks count ───────────────────────────
+    #[test]
+    fn bp_4_counts_files_missing_chunks() {
+        use dtfs_raft::state_machine::{FileMetadata, StateMachineData};
+        let mut sm = StateMachineData::default();
+        let mk = |path: &str, chunks: usize, dir: bool, link: Option<String>| FileMetadata {
+            path: path.into(),
+            volume_id: "default".into(),
+            chunk_size: 1024,
+            chunks: (0..chunks).map(|i| dtfs_raft::ChunkLocationEntry {
+                chunk_index: i as u64, chunk_hash: format!("h{i}"),
+                node_id: "1".into(), disk_id: 0, size_bytes: 1,
+            }).collect(),
+            created_at_ms: 0, updated_at_ms: 0,
+            symlink_target: link, logical_size: None, is_directory: dir,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+        };
+        sm.files.insert("/ok.bin".into(), mk("/ok.bin", 2, false, None));
+        sm.files.insert("/lost.bin".into(), mk("/lost.bin", 0, false, None)); // data loss
+        sm.files.insert("/dir".into(), mk("/dir", 0, true, None));            // dir, excluded
+        sm.files.insert("/lnk".into(), mk("/lnk", 0, false, Some("/ok.bin".into()))); // symlink, excluded
+        assert_eq!(count_files_missing_chunks(&sm), 1, "only the chunkless regular file counts");
+    }
+
+    // ── BP-5 — tape replication normalization ───────────────────────
+    #[test]
+    fn bp_5_normalize_drops_tape_replication_without_tape_disk() {
+        use dtfs_common::types::{TierReplication, CacheReplication, VolumeConfig, VolumeId, WriteSafety};
+        let mut cfg = VolumeConfig {
+            id: VolumeId::new("default".into()),
+            name: "default".into(),
+            chunk_size_bytes: 4 << 20,
+            replication: TierReplication { hot: 0, warm: 2, cold: 1, tape: 1 },
+            mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            cache_replicas: CacheReplication::default(),
+            anchor: None,
+            schedules: dtfs_common::types::VolumeSchedules::default(),
+            anchor_datacenter: None,
+            write_safety: WriteSafety { min_replicas_before_ack: 1, write_timeout_secs: 30 },
+        };
+        // No tape disk → tape replication dropped.
+        assert!(normalize_tape_replication(&mut cfg, false));
+        assert_eq!(cfg.replication.tape, 0);
+        // Idempotent.
+        assert!(!normalize_tape_replication(&mut cfg, false));
+        // With a tape disk present, a tape target is preserved.
+        cfg.replication.tape = 1;
+        assert!(!normalize_tape_replication(&mut cfg, true));
+        assert_eq!(cfg.replication.tape, 1);
     }
 }
 
