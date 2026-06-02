@@ -92,8 +92,14 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %e, "Bug AC poisoned-state check failed; proceeding anyway");
     }
 
-    // 1. Open the RocksDB log store.
-    let log_store = dtfs_raft::log_store::LogStore::new(&log_store_path)?;
+    // 1. Open the RocksDB log store with bounded info-LOG / MANIFEST (BP-1).
+    let log_store = dtfs_raft::log_store::LogStore::new_with_opts(
+        &log_store_path,
+        dtfs_raft::log_store::RocksDbLogOpts {
+            keep_log_file_num: config.raft.rocksdb_keep_log_file_num,
+            max_manifest_bytes: config.raft.rocksdb_max_manifest_bytes,
+        },
+    )?;
     tracing::info!("Raft log store opened at {:?}", log_store_path);
 
     // 2. Create the state machine. Snapshots are persisted under
@@ -113,6 +119,11 @@ async fn main() -> anyhow::Result<()> {
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
             config.raft.snapshot_threshold,
         ),
+        // Bug BP-1 — bound how many committed log entries are retained
+        // after a snapshot so the on-disk `.sst` set stays small (an
+        // implicit large default let ~10 000 tiny SSTs accumulate and
+        // slowed RocksDB open to minutes — ISSUE-SCAN-2026-06-02).
+        max_in_snapshot_log_to_keep: config.raft.max_in_snapshot_log_to_keep,
         ..Default::default()
     };
     let raft_config = Arc::new(raft_config.validate()?);

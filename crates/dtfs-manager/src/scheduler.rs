@@ -1777,7 +1777,14 @@ impl TaskScheduler {
             }
 
             for cid in &on_disk {
-                if in_state_chunks.contains(cid) { continue; }
+                // Bug BP-4 — a chunk is an orphan candidate ONLY when NO
+                // FileMetadata references its hash (`in_state_chunks` is the
+                // union of every file's chunk hashes). Never reap a chunk a
+                // file still points at, even if its location record looks
+                // stale — that was the data-loss vector (BN-1 UUID rotation
+                // dropped location bindings; the hash-referenced guard here
+                // is the defence-in-depth backstop). AGENTS.md §A.6 #8.
+                if !chunk_is_orphan(&in_state_chunks, cid) { continue; }
                 current_orphans.insert((*node_id, cid.clone()));
 
                 let first_seen = {
@@ -2299,6 +2306,19 @@ pub(crate) fn normalize_endpoint(stored_addr: &str) -> String {
     } else {
         format!("http://{}", stored_addr)
     }
+}
+
+/// Bug BP-4 — GC orphan classification. A physical chunk is an orphan
+/// (eligible for reap) ONLY when no FileMetadata references its hash;
+/// `in_state_chunks` is the union of every file's chunk hashes. Keying on
+/// the hash (not on a per-disk location/UUID match) is the load-bearing
+/// safety invariant: a chunk a file still points at must never be deleted,
+/// even if its location record looks stale. AGENTS.md §A.3.3 #4 / §A.6 #8.
+pub(crate) fn chunk_is_orphan(
+    in_state_chunks: &std::collections::HashSet<String>,
+    chunk_hash: &str,
+) -> bool {
+    !in_state_chunks.contains(chunk_hash)
 }
 
 /// Bug BO-1 — which node id (if any) `resolve_healthy_source` must exclude
@@ -3795,5 +3815,19 @@ mod bug_bo_tests {
         assert!(task_blocks_requeue(MigrationStatus::Pending));
         assert!(task_blocks_requeue(MigrationStatus::Copying));
         assert!(task_blocks_requeue(MigrationStatus::Verifying));
+    }
+
+    /// BP-4 — a chunk referenced by ANY file (hash in the in-state set) is
+    /// never an orphan, even if its on-disk location looks stale; only a
+    /// hash with no file referent is reapable.
+    #[test]
+    fn bp_4_chunk_is_orphan_only_when_unreferenced() {
+        let mut in_state = std::collections::HashSet::new();
+        in_state.insert("referenced".to_string());
+        assert!(!chunk_is_orphan(&in_state, "referenced"), "referenced chunk is NOT orphan");
+        assert!(chunk_is_orphan(&in_state, "dangling"), "unreferenced chunk IS orphan");
+        // Empty in-state set: everything is orphan (no files reference anything).
+        let empty = std::collections::HashSet::new();
+        assert!(chunk_is_orphan(&empty, "anything"));
     }
 }

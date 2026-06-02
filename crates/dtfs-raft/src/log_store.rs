@@ -52,13 +52,49 @@ pub struct LogStore {
     last_purged: Arc<RwLock<Option<LogId>>>,
 }
 
+/// Bug BP-1 — bounds on the RocksDB info-LOG and MANIFEST so the raft log
+/// store cannot fill the manager partition (ISSUE-SCAN-2026-06-02 F5: 6.8 GB
+/// of `LOG.old.*` + a 207 MB MANIFEST on a 16 GB root). Defaults are sane;
+/// `LogStore::new` uses them, `new_with_opts` lets the manager wire config.
+#[derive(Debug, Clone, Copy)]
+pub struct RocksDbLogOpts {
+    /// `keep_log_file_num` — number of RocksDB info `LOG`/`LOG.old.*` files
+    /// retained. RocksDB default is 1000; we keep a handful.
+    pub keep_log_file_num: u64,
+    /// `max_manifest_file_size` — MANIFEST rotates once it exceeds this.
+    pub max_manifest_bytes: u64,
+}
+
+impl Default for RocksDbLogOpts {
+    fn default() -> Self {
+        Self {
+            keep_log_file_num: 4,
+            max_manifest_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 impl LogStore {
-    /// Open (or create) the log store at the given directory.
+    /// Open (or create) the log store at the given directory with default
+    /// bounded RocksDB options.
     pub fn new(path: impl AsRef<Path>) -> Result<Self, io::Error> {
+        Self::new_with_opts(path, RocksDbLogOpts::default())
+    }
+
+    /// Bug BP-1 — open (or create) the log store with explicit RocksDB
+    /// info-LOG / MANIFEST bounds.
+    pub fn new_with_opts(path: impl AsRef<Path>, opts: RocksDbLogOpts) -> Result<Self, io::Error> {
         let path = path.as_ref();
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+
+        // Bug BP-1 — bound the info-LOG count and MANIFEST size so neither
+        // grows unbounded and fills the partition. `keep_log_file_num`
+        // caps the `LOG.old.*` rotation set; `set_max_manifest_file_size`
+        // forces the MANIFEST to roll instead of growing to hundreds of MB.
+        db_opts.set_keep_log_file_num(opts.keep_log_file_num.max(1) as usize);
+        db_opts.set_max_manifest_file_size(opts.max_manifest_bytes.max(1024 * 1024) as usize);
 
         // Bug AV-5-2 / BG-6 — tolerate a torn WAL tail left when the
         // previous binary was killed mid-append (e.g. during a rolling
@@ -419,6 +455,28 @@ mod bug_av_5_2_recovery_tests {
             "reopening a clean log store must succeed, got {:?}",
             reopened.err()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bug BP-1 — opening with explicit bounded RocksDB opts must succeed
+    /// (regression guard that the keep_log_file_num / max_manifest_file_size
+    /// wiring does not break the open path). The default bounds are applied
+    /// via `LogStore::new`; this exercises the explicit `new_with_opts`.
+    #[test]
+    fn log_store_opens_with_bounded_opts() {
+        let dir = scratch_dir("bp1");
+        let opts = RocksDbLogOpts {
+            keep_log_file_num: 4,
+            max_manifest_bytes: 64 * 1024 * 1024,
+        };
+        {
+            let store = LogStore::new_with_opts(&dir, opts).expect("open with bounded opts");
+            store.persist_last_purged(&None).expect("persist");
+        }
+        // Reopen with the same bounds (process restart).
+        assert!(LogStore::new_with_opts(&dir, opts).is_ok(), "reopen with bounded opts");
+        // Defaults also resolve to bounded values.
+        assert_eq!(RocksDbLogOpts::default().keep_log_file_num, 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
