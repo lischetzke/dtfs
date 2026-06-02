@@ -1,6 +1,6 @@
 # Bug BB — per-tier disk usage fidelity (get_stats apportionment lie)
 
-**Status:** todo (authored 2026-06-02)
+**Status:** code complete (2026-06-02) — BB-1/BB-2 done; dtfs-manager 154/154; deploy + live-verify in progress. Finding: the post-AU per-disk preference already largely fixed BA-2 (live tier_breakdown matched real disk sums); the residual bug was the PER-DISK fallback decision fabricating usage onto an empty disk of an otherwise-used node, now fixed by deciding per-NODE.
 **Sources:** PLAN-BUG-BA catalog entry BA-2 (P2). Split out of BA so the BA
 soak plan can close; this is the one BA finding still needing a code fix.
 
@@ -57,7 +57,7 @@ sum the real `disk.used_bytes` per tier instead of apportioning.
 ## 3. Task list
 
 ### BB-1: per-tier used_bytes from real disk usage
-- Status: ⬜
+- Status: ✅ (2026-06-02) — pure `node_tier_used(disks, used_capacity)`: trusts per-disk `used_bytes` (incl 0) when the node reports any; apportions only a legacy all-zero node. Wired into get_stats tier_breakdown. Units bb_1_real_per_disk_no_fabrication / bb_1_legacy_node_apportions / bb_1_zero_capacity_node_empty; dtfs-manager 154/154.
 - Files: `crates/dtfs-manager/src/api.rs` (`get_stats` tier breakdown).
 - Sketch:
   1. Add pure `tier_used_bytes(nodes) -> BTreeMap<DiskTier, u64>` summing
@@ -74,7 +74,7 @@ sum the real `disk.used_bytes` per tier instead of apportioning.
   `du` within rounding on the minicluster.
 
 ### BB-2: release case + changelog
-- Status: ⬜
+- Status: ✅ (2026-06-02) — tests/release/cases/31-stats-tier-usage-fidelity.sh (asserts stats tier used_bytes matches /nodes per-disk sums within 1 MiB). changelog/UNRELEASED.md Bug BB entry. Auto-discovered by run.sh.
 - Files: `tests/release/cases/NN-stats-tier-usage.sh`, `changelog/UNRELEASED.md`.
 - Sketch: assert per-tier `used_bytes` from `/api/v1/stats` is not an exact
   cross-tier tie on a node with asymmetric tier usage (or matches

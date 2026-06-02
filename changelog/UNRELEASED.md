@@ -51,6 +51,14 @@
   `ChunkLocationCommit`.
 
 ## Bug Fixes
+- **Bug BB — per-tier disk usage is no longer fabricated by apportionment.**
+  `/api/v1/stats` `tier_breakdown.used_bytes` now sums each disk's real
+  reported `used_bytes` per tier. The previous logic decided per-disk
+  whether to use the real value or apportion the node's `used_capacity` by
+  capacity share, so a genuinely-empty tier disk on an otherwise-used node
+  was assigned a fabricated share (originally surfacing as equal-size warm +
+  cold disks reporting identical-to-the-byte usage). Apportionment now
+  applies only to a legacy node that ships no per-disk usage at all.
 - **Bug BP-1 — manager raft storage no longer grows unbounded.** RocksDB
   info-LOG (`LOG.old.*`) and MANIFEST were uncapped and grew to ~6.8 GB +
   ~207 MB, filling a 16 GB manager partition and taking the cluster to the
