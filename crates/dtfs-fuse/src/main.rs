@@ -179,6 +179,38 @@ async fn main() -> Result<()> {
         Err(_) => tracing::warn!("Bug AA self-register timed out; proceeding"),
     }
 
+    // Bug BQ-1 — periodic client keepalive. The Bug AA register above is
+    // one-shot; without a refresh an idle mounted client's last_seen_ms
+    // freezes and effective_health (BP-3) projects it Down even though the
+    // mount is alive. Mirror the data node's heartbeat loop (data
+    // main.rs::manager_lifecycle): re-register on a cadence shorter than
+    // raft.node_liveness_secs. Re-register is audit-idempotent (Bug BJ) so
+    // steady state does not spam the audit log; on RPC error the client
+    // pool advances to another manager and the next tick retries.
+    let hb_secs = fuse_config.client.heartbeat_interval_secs;
+    if hb_secs > 0 {
+        let hb_client = client.clone();
+        let hb_hostname = fuse_config.location.host.clone();
+        let hb_location = fuse_config.location.clone();
+        let hb_secret = Some(fuse_config.client.shared_secret.clone());
+        tokio::spawn(async move {
+            run_client_heartbeat(std::time::Duration::from_secs(hb_secs), move || {
+                let c = hb_client.clone();
+                let host = hb_hostname.clone();
+                let loc = dtfs_proto::dtfs::common::Location {
+                    region: hb_location.region.clone(),
+                    datacenter: hb_location.datacenter.clone(),
+                    rack: hb_location.rack.clone(),
+                    host: hb_location.host.clone(),
+                };
+                let secret = hb_secret.clone();
+                async move { c.register_self_as_client(&host, loc, secret).await }
+            })
+            .await;
+        });
+        info!(interval_secs = hb_secs, "Bug BQ-1 client keepalive started");
+    }
+
     // P0-11: set up the disk-backed local cache (if configured) before
     // moving fuse_config into DtfsFilesystem.
     let local_cache_cfg = fuse_config.cache.clone();
@@ -391,5 +423,78 @@ async fn wait_for_terminate_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
         info!("Ctrl+C received");
+    }
+}
+
+/// Bug BQ-1 — drive a periodic client keepalive. Generic over the beat
+/// closure (and its error type) so it can be unit-tested without a live
+/// manager. The loop never returns: each tick calls `beat()`, logs the
+/// outcome at debug, and continues regardless of error so a transient
+/// manager failover cannot stop the client from refreshing its liveness.
+///
+/// The interval's immediate first tick is consumed before the loop because
+/// the caller has already performed the startup registration.
+async fn run_client_heartbeat<F, Fut, E>(interval: std::time::Duration, mut beat: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Consume the immediate first tick — we already registered at startup.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        match beat().await {
+            Ok(()) => tracing::debug!("Bug BQ-1 client keepalive ok"),
+            Err(e) => tracing::debug!(error = %e, "Bug BQ-1 client keepalive failed; retry next tick"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod bq1_heartbeat_tests {
+    use super::run_client_heartbeat;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // Bug BQ-1 — the keepalive loop must fire on cadence AND keep going
+    // across an RPC error, so a transient manager failover doesn't stop the
+    // client from staying live. Drives a paused clock so the test is
+    // deterministic (no wall-clock sleeps).
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_fires_on_cadence_and_survives_errors() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let interval = Duration::from_secs(10);
+        let task = tokio::spawn(async move {
+            run_client_heartbeat(interval, move || {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    // Every 3rd beat simulates a manager RPC failure; the
+                    // loop must survive it and keep beating.
+                    if n % 3 == 2 {
+                        Err("simulated manager RPC failure")
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+        });
+        // Let the task reach its first post-startup tick().await.
+        tokio::task::yield_now().await;
+        for _ in 0..6 {
+            tokio::time::advance(interval).await;
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let n = calls.load(Ordering::SeqCst);
+        assert!(
+            n >= 5,
+            "expected >=5 keepalive beats across 6 intervals, got {n}"
+        );
     }
 }
