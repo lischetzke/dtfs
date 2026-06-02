@@ -557,10 +557,11 @@ is mandatory for new plans:
 
 - `plans/active/PLAN-<id>-<short-name>.md` — in-progress plans.
 - `plans/completed/<completion-date>-PLAN-<id>-<short-name>.md` —
-  finished plans; gitignored and local-only once archived.
+  finished plans; git-tracked (committed) but excluded from AI-agent
+  context via `.claude/settings.json` deny rules.
 - `plans/processed/` — processed reports, issue scans, and
-  post-mortems; gitignored and local-only. Move here once findings are
-  captured in active plans. Not visible to agents.
+  post-mortems; git-tracked but agent-excluded the same way. Move here
+  once findings are captured in active plans. Not read by agents.
 
 See [`plans/README.md`](./plans/README.md) for the directory's naming
 and lifecycle rules. **Do not put plans, reports, or post-mortems under
@@ -771,8 +772,8 @@ mandatory:
 | Artefact | Canonical location | Notes |
 |---|---|---|
 | In-flight work plan | `plans/active/PLAN-<id>-<name>.md` | One per non-trivial change. See § B.2. |
-| Finished plan | `plans/completed/<YYYY-MM-DD>-PLAN-<id>-<name>.md` | Move when every task is ✅ verified. Gitignored; local-only. |
-| Post-mortem, report, issue scan (processed) | `plans/processed/` | Gitignored; local-only. Move here once findings are captured in active plans. Not visible to agents. |
+| Finished plan | `plans/completed/<YYYY-MM-DD>-PLAN-<id>-<name>.md` | Move when every task is ✅ verified. Git-tracked; excluded from AI agents via `.claude/settings.json` deny rules. |
+| Post-mortem, report, issue scan (processed) | `plans/processed/` | Git-tracked; agent-excluded the same way. Move here once findings are captured in active plans. Not read by agents. |
 | Release note (bug fix, new feature, known issue, breaking change, special update requirement) | `changelog/UNRELEASED.md` | One entry per user-visible change, **same commit** as the code. Internal restructures, doc edits, refactors, and test/CI tweaks do **not** go here. See [`changelog/README.md`](./changelog/README.md). |
 | Architecture / config / ops reference | `docs/src/...` (mdBook) | Update in the same commit as behaviour changes (§ A.8 + § B.9). |
 | Code | `crates/<crate>/src/...` | New crates require a `Cargo.toml` workspace member entry. |
@@ -902,9 +903,11 @@ PR descriptions for non-trivial work should explicitly note
   procedural details.
 - **`plans/active/PLAN-<id>-*.md`** — feature-specific plan documents
   currently in flight. One per non-trivial work item.
-- **`plans/completed/`** — finished plans; gitignored, local-only.
+- **`plans/completed/`** — finished plans; git-tracked, excluded from
+  AI agents via `.claude/settings.json` deny rules.
 - **`plans/processed/`** — processed reports, issue scans, and
-  post-mortems; gitignored, local-only. Not read by agents.
+  post-mortems; git-tracked, agent-excluded the same way. Not read by
+  agents.
 - **`changelog/UNRELEASED.md`** — accumulator for the next release. Add
   a one-line entry per user-visible change in the same commit; see
   [`changelog/README.md`](./changelog/README.md).

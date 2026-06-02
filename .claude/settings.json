@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(plans/completed/**)",
+      "Read(plans/processed/**)"
+    ]
+  }
+}
