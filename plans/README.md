@@ -10,12 +10,14 @@ mandatory for any non-trivial change.
 plans/
 ├── README.md            # this file
 ├── active/              # in-progress plans — one per non-trivial work item
-├── completed/           # finished plans — gitignored, local-only
-└── processed/           # processed reports, incidents, issue scans — gitignored, local-only
+├── completed/           # finished plans — git-tracked, agent-excluded
+└── processed/           # processed reports, incidents, issue scans — git-tracked, agent-excluded
 ```
 
-`completed/` and `processed/` are listed in `.gitignore`. Files there are not tracked
-by git and are not visible to AI agents. They exist locally for human reference only.
+`completed/` and `processed/` are git-tracked (committed) so the history is shared,
+but excluded from AI-agent context via deny rules in `.claude/settings.json`
+(`Read(plans/completed/**)` / `Read(plans/processed/**)`). Agents do not read them;
+humans and git history do.
 
 ## Naming
 
