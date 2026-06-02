@@ -13,9 +13,9 @@ User=root
 # Bug H — clear any stale mount left by a previous crashed instance so
 # the new dtfs-fuse can re-mount. `-` ignores failure (first-ever launch
 # has no stale mount).
-ExecStartPre=-/bin/fusermount3 -u /%I
+ExecStartPre=-/usr/bin/fusermount3 -u /%I
 ExecStart={{ dtfs_fuse_bin }} --config {{ dtfs_config_dir }}/fuse.toml --mountpoint /%I
-ExecStop=/bin/fusermount3 -u /%I
+ExecStop=/usr/bin/fusermount3 -u /%I
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
