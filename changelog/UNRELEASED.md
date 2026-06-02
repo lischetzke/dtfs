@@ -169,3 +169,18 @@
   is kept one release for snapshot back-compat and migrated on load),
   `GET /api/v1/stats` returns one entry per `(node, level)`, and the
   WebUI renders one card per node and level.
+- **Bug BQ-1 — idle FUSE clients stay reported online.** A mounted but
+  idle client registered once (Bug AA) and never refreshed its
+  `last_seen_ms`, so once BP-3's liveness projection shipped, an alive
+  read-only client was shown `Down` after `node_liveness_secs`. The FUSE
+  client now runs a periodic keepalive (re-`RegisterNode`, role=client) on
+  a cadence shorter than the liveness window; the re-register is
+  audit-idempotent (Bug BJ) so it adds no audit noise. New
+  `[client] heartbeat_interval_secs` config key (default 10 s; `0`
+  disables for legacy register-once behaviour).
+- **Bug BQ-2 — FUSE systemd unit uses the correct `fusermount3` path.**
+  The `dtfs-fuse@.service` `ExecStartPre`/`ExecStop` called
+  `/bin/fusermount3`, which is absent on client images without the
+  `/bin -> /usr/bin` usr-merge symlink (`status=203/EXEC`), leaving the
+  mount half-dead on stop/restart. The unit (and the ansible template)
+  now reference `/usr/bin/fusermount3`.
