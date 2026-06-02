@@ -81,6 +81,18 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Bug BU-6 — reclaim any leftover streaming *.dat.tmp files. At startup
+    // no put_chunk is in flight, so any streaming tmp is an orphan from a
+    // crash or ENOSPC-aborted put whose RAII cleanup couldn't run across the
+    // restart. Leaked tmps keep the disk full and make ENOSPC self-sustaining.
+    let reclaimed_tmps = chunk_store.reclaim_orphan_streaming_tmps();
+    if reclaimed_tmps > 0 {
+        tracing::warn!(
+            reclaimed = reclaimed_tmps,
+            "Bug BU-6 reclaimed orphaned streaming tmp files at startup"
+        );
+    }
+
     // Initialize ARC cache with configured memory limit.
     // Estimate max entries from max_memory_mb assuming ~128KB average chunk size.
     let avg_chunk_kb = 128;
