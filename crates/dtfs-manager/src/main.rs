@@ -477,6 +477,19 @@ async fn main() -> anyhow::Result<()> {
         "success",
     );
 
+    // Bug BR-1 — self-register this manager's version + build_date + a live
+    // last_seen_ms into shared Raft state. Managers are Raft peers, not
+    // RegisterNode callers, so historically every peer's /api/v1/nodes
+    // showed a blank version for all but the serving manager, and peer
+    // liveness was synthesized as "always now" (api.rs). Registering via the
+    // same RegisterNode RPC the data nodes use makes managers first-class
+    // entries in sm.nodes: step-1 of the nodes projection renders their real
+    // version and routes their health through effective_health (BP-3).
+    let self_reg_config = config.clone();
+    let _self_register_handle = tokio::spawn(async move {
+        manager_self_register_lifecycle(self_reg_config).await;
+    });
+
     // Bug U — spawn a dedicated signal watcher that flips the shutdown
     // signal. We don't put the signal future inside `select!` directly
     // because we want ALL of (gRPC, API, monitors) to run to graceful
@@ -555,6 +568,113 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("DTFS manager exited cleanly");
     Ok(())
+}
+
+/// Bug BR-1 — publish this manager's version/build_date + a live
+/// last_seen_ms into shared Raft state.
+///
+/// Managers are Raft peers, not RegisterNode callers, so their identity
+/// never entered the shared node registry: peers rendered a blank version
+/// and a synthesized "always now" last_seen on each other's /api/v1/nodes.
+/// This task self-registers through the exact RegisterNode RPC the data
+/// nodes use (role="manager"), then refreshes on a cadence shorter than
+/// `raft.node_liveness_secs` so a downed manager ages to non-Healthy via
+/// effective_health (BP-3) like any other node.
+///
+/// Re-register is audit-idempotent (Bug BJ node_info_material_eq): the
+/// steady-state keepalive adds no audit rows; only a real version change
+/// (an upgrade) logs once. Registering against the peer pool converges as
+/// soon as a leader exists — a follower's raft_write returns Unavailable,
+/// so we walk to the next endpoint just like a data node does.
+async fn manager_self_register_lifecycle(config: dtfs_common::config::ManagerConfig) {
+    use dtfs_proto::dtfs::manager::manager_service_client::ManagerServiceClient;
+    use dtfs_proto::dtfs::manager::RegisterNodeRequest;
+
+    let grpc_port: u32 = config
+        .grpc
+        .listen_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9401);
+
+    // Manager peer endpoints to register through, plus a loopback fallback
+    // so a single-node / legacy config (no initial_voters) still registers
+    // itself against its own listener.
+    let mut endpoints: Vec<String> = config
+        .cluster
+        .initial_voters
+        .iter()
+        .map(|v| format!("http://{}", v.addr))
+        .collect();
+    let loopback = format!("http://127.0.0.1:{grpc_port}");
+    if !endpoints.iter().any(|e| e.ends_with(&format!(":{grpc_port}"))) {
+        endpoints.push(loopback.clone());
+    }
+    if endpoints.is_empty() {
+        endpoints.push(loopback);
+    }
+
+    let build_req = || RegisterNodeRequest {
+        hostname: config.node.hostname.clone(),
+        role: "manager".to_string(),
+        grpc_port,
+        location: Some(dtfs_proto::dtfs::common::Location {
+            region: config.location.region.clone(),
+            datacenter: config.location.datacenter.clone(),
+            rack: config.location.rack.clone(),
+            host: config.location.host.clone(),
+        }),
+        disks: Vec::new(),
+        shared_secret: Some(config.cluster.shared_secret.clone()),
+        version: dtfs_common::version::VERSION.to_string(),
+        build_date: dtfs_common::version::BUILD_DATE.to_string(),
+    };
+
+    // ~3 beats per liveness window, floored at 3s. The interval's immediate
+    // first tick performs the startup registration.
+    let interval_secs = (config.raft.node_liveness_secs / 3).max(3);
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut idx = 0usize;
+    loop {
+        ticker.tick().await;
+        let n = endpoints.len();
+        let mut ok = false;
+        for offset in 0..n {
+            let ep = &endpoints[(idx + offset) % n];
+            match ManagerServiceClient::connect(ep.clone()).await {
+                Ok(mut c) => match c.register_node(tonic::Request::new(build_req())).await {
+                    Ok(resp) => {
+                        if resp.into_inner().accepted {
+                            idx = (idx + offset) % n;
+                            ok = true;
+                            break;
+                        }
+                        tracing::debug!(
+                            endpoint = %ep,
+                            "Bug BR-1 self-register rejected (shared_secret mismatch?)"
+                        );
+                    }
+                    Err(e) => tracing::debug!(
+                        endpoint = %ep,
+                        error = %e,
+                        "Bug BR-1 self-register RPC failed; trying next manager"
+                    ),
+                },
+                Err(e) => tracing::debug!(
+                    endpoint = %ep,
+                    error = %e,
+                    "Bug BR-1 manager endpoint unreachable"
+                ),
+            }
+        }
+        if !ok {
+            tracing::debug!(
+                "Bug BR-1 self-register: no manager reachable this tick; retrying next tick"
+            );
+        }
+    }
 }
 
 /// Bug AC — pre-init poisoned-Raft-state detector + auto-recovery.
