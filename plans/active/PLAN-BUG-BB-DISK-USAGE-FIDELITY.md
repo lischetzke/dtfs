@@ -1,6 +1,6 @@
 # Bug BB — per-tier disk usage fidelity (get_stats apportionment lie)
 
-**Status:** code complete (2026-06-02) — BB-1/BB-2 done; dtfs-manager 154/154; deploy + live-verify in progress. Finding: the post-AU per-disk preference already largely fixed BA-2 (live tier_breakdown matched real disk sums); the residual bug was the PER-DISK fallback decision fabricating usage onto an empty disk of an otherwise-used node, now fixed by deciding per-NODE.
+**Status:** ✅ complete (2026-06-02) — BB-1/BB-2 done, deployed to all 3 managers leader-last, LIVE-verified (case 31 PASS: stats per-tier used_bytes == real /nodes disk sums exactly — cold 11161600, warm 51441664). dtfs-manager 154/154. Finding: the post-AU per-disk preference already largely fixed BA-2; the residual bug was the PER-DISK fallback fabricating usage onto an empty disk of an otherwise-used node, fixed by deciding per-NODE.
 **Sources:** PLAN-BUG-BA catalog entry BA-2 (P2). Split out of BA so the BA
 soak plan can close; this is the one BA finding still needing a code fix.
 
