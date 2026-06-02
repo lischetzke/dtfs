@@ -1,10 +1,21 @@
-// Bug AY — emit DTFS_BUILD_DATE at compile time so every binary carries
-// the date of the build that produced it. Re-run only when the build
-// script itself changes; otherwise cargo would invalidate the cache on
-// every invocation and force rebuilds across the workspace.
+// Bug AY / Bug BS — emit DTFS_BUILD_DATE at compile time so every binary
+// carries the date of the build that produced it.
 //
-// SOURCE_DATE_EPOCH is honoured for reproducible-build environments;
-// when set, we format that fixed instant instead of "now".
+// Freshness is driven by SOURCE_DATE_EPOCH, NOT by re-running this script
+// on every `cargo build`. The authoritative build wrappers
+// (scripts/build-linux-amd64.sh, scripts/dtfs-build.sh) export
+// `SOURCE_DATE_EPOCH=$(date -u +%s)` before `cargo build`; because we
+// declare `rerun-if-env-changed=SOURCE_DATE_EPOCH`, cargo re-runs this
+// script (and re-stamps) whenever that value changes — i.e. every wrapper
+// invocation — so two wrapper builds a minute apart get two distinct
+// stamps (AGENTS.md §A.3.6). A plain `cargo build` with the var unset
+// leaves the cached stamp untouched, keeping local incremental builds
+// fast (the broken pre-BS `rerun-if-changed=build.rs` gating froze the
+// stamp at the first-ever build instead).
+//
+// SOURCE_DATE_EPOCH is ALSO the reproducible-build pin: a caller that
+// exports a fixed value gets a fixed, deterministic stamp (the sanctioned
+// exception in AGENTS.md §A.3.6).
 
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
