@@ -17,7 +17,13 @@ User=root
 # subsequent mount(2) fails because the inode still references the
 # dead session. ExecStartPre clears any such stale mount; the `-` means
 # "ignore failure" so the first-ever launch (no stale mount) also works.
-ExecStartPre=-/bin/fusermount3 -u /%I
+#
+# Bug BQ-2 — use the absolute /usr/bin/fusermount3. The client image does
+# not have the /bin -> /usr/bin usr-merge symlink, so /bin/fusermount3
+# returned status=203/EXEC ("No such file or directory") on stop/restart,
+# leaving the mount in a half-dead state. fuse3 installs the helper at
+# /usr/bin/fusermount3.
+ExecStartPre=-/usr/bin/fusermount3 -u /%I
 ExecStart=/usr/local/bin/dtfs-fuse --config /etc/dtfs/fuse.toml --mountpoint /%I
 # Bug U — on `systemctl stop` we deliver SIGTERM, which our signal handler
 # uses to drive a clean MountHandle::unmount() (lets the kernel flush
@@ -25,7 +31,7 @@ ExecStart=/usr/local/bin/dtfs-fuse --config /etc/dtfs/fuse.toml --mountpoint /%I
 # write leases on the manager. The fusermount3 -u on ExecStop is the
 # fallback in case our handler hung up; it forces the kernel-level
 # unmount regardless.
-ExecStop=/bin/fusermount3 -u /%I
+ExecStop=/usr/bin/fusermount3 -u /%I
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=45s

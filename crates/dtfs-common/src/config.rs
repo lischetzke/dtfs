@@ -568,6 +568,14 @@ pub struct FuseClientConfig {
     /// when it holds an active write lease (legacy behavior).
     #[serde(default)]
     pub shared_secret: String,
+    /// Bug BQ-1 — periodic client keepalive interval (seconds). An idle
+    /// mounted FUSE client re-registers on this cadence so its
+    /// `last_seen_ms` stays fresh and `effective_health` (BP-3) does not
+    /// project it `Down`. Must be well under `raft.node_liveness_secs`
+    /// (default 30) or the node flaps `Down` between beats. `0` disables
+    /// the keepalive (legacy register-once behavior).
+    #[serde(default = "default_client_heartbeat_secs")]
+    pub heartbeat_interval_secs: u64,
 }
 
 impl FuseClientConfig {
@@ -785,6 +793,11 @@ fn default_tiering_interval() -> u64 {
 }
 fn default_heartbeat_secs() -> u64 {
     5
+}
+fn default_client_heartbeat_secs() -> u64 {
+    // Bug BQ-1 — well under default_node_liveness_secs (30) so an idle
+    // client re-registers ~3x per liveness window and never flaps Down.
+    10
 }
 fn default_suspect_after() -> u32 {
     3
