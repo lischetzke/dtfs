@@ -33,7 +33,7 @@ use scheduler::TaskScheduler;
 use tiering::TieringEngine;
 
 #[derive(Parser, Debug)]
-#[command(name = "dtfs-manager", about = "DTFS Manager Node")]
+#[command(name = "dtfs-manager", about = "DTFS Manager Node", version = dtfs_common::version::VERSION_STRING)]
 struct Args {
     /// Path to configuration file
     #[arg(short, long, default_value = "/etc/dtfs/manager.toml")]

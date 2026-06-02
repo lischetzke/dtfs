@@ -25,7 +25,7 @@ use dtfs_proto::dtfs::manager::{HeartbeatRequest, RegisterNodeRequest};
 use store::ChunkStore;
 
 #[derive(Parser, Debug)]
-#[command(name = "dtfs-data", about = "DTFS Data Node")]
+#[command(name = "dtfs-data", about = "DTFS Data Node", version = dtfs_common::version::VERSION_STRING)]
 struct Args {
     /// Path to configuration file
     #[arg(short, long, default_value = "/etc/dtfs/data.toml")]

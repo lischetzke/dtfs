@@ -89,6 +89,14 @@ step "Building all binaries (release, target=$TARGET)"
 # known compiler bug that will be fixed in a future release.
 export RUSTFLAGS="${RUSTFLAGS:-} -A dead_code -A unused_imports -A unused_variables"
 
+# Bug BS — stamp BUILD_DATE with this build's instant. dtfs-common/build.rs
+# formats SOURCE_DATE_EPOCH and declares rerun-if-env-changed for it, so
+# exporting a fresh value here re-stamps every wrapper build (two builds a
+# minute apart -> two distinct BUILD_DATE values; AGENTS.md §A.3.6).
+# Honour a caller-pinned value for reproducible builds (the sanctioned
+# exception): only default to "now" when unset.
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date -u +%s)}"
+
 BUILD_START=$(date +%s)
 
 cargo build \

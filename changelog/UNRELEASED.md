@@ -195,3 +195,14 @@
   `effective_health` (BP-3) instead of appearing perpetually alive. The
   self-register is audit-idempotent (Bug BJ): steady-state keepalive adds
   no audit rows; an upgrade logs once.
+- **Bug BS — dev `BUILD_DATE` reflects each build again.** The stamp was
+  frozen at the first-ever build (`build.rs` gated re-runs on
+  `rerun-if-changed=build.rs`), so every node reported an identical, stale
+  `build_date` and "is the new binary deployed?" was unanswerable. The
+  authoritative build wrappers (`scripts/build-linux-amd64.sh`,
+  `scripts/dtfs-build.sh`) now export `SOURCE_DATE_EPOCH=$(date -u +%s)`,
+  which `build.rs` already honours via `rerun-if-env-changed`, so each
+  wrapper build re-stamps without forcing a full rebuild on plain
+  `cargo build`. Reproducible-build pins (caller-set `SOURCE_DATE_EPOCH`)
+  still produce a fixed stamp. Every binary now reports its build via
+  `dtfs-* --version` (`v0.0.0-dev (built YYYYMMDD-HHmmss)`).

@@ -27,7 +27,7 @@ mod writebuf;
 use filesystem::DtfsFilesystem;
 
 #[derive(Parser, Debug)]
-#[command(name = "dtfs-fuse", about = "DTFS FUSE Client Mount")]
+#[command(name = "dtfs-fuse", about = "DTFS FUSE Client Mount", version = dtfs_common::version::VERSION_STRING)]
 struct Args {
     /// Path to configuration file
     #[arg(short, long, default_value = "/etc/dtfs/fuse.toml")]

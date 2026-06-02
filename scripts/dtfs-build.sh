@@ -54,6 +54,11 @@ TARBALL="$OUT_DIR/dtfs-${REV}-linux-amd64.tar.gz"
 BIN_DIR="$PROJECT_ROOT/target/$PROFILE"
 mkdir -p "$OUT_DIR"
 
+# Bug BS — re-stamp BUILD_DATE per build via SOURCE_DATE_EPOCH (build.rs
+# honours it + declares rerun-if-env-changed). Caller-pinned value wins
+# (reproducible-build exception); otherwise default to this build's instant.
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date -u +%s)}"
+
 echo ">>> Building DTFS (profile=$PROFILE, rev=$REV)"
 if [ "$PROFILE" = "release" ]; then
     cargo build --release
