@@ -225,9 +225,8 @@ state, then reason across it (a single symptom often shows up in three places).
 You produce **one report** and nothing else. Write it to
 `plans/reports/ISSUE-SCAN-<YYYY-MM-DD-HHmm>.md` (this is the only file you
 create; `plans/reports/` is the canonical home for historical lab/scan
-artefacts per AGENTS.md § B.6). Do **not** create plans in `plans/active/` and
-do **not** touch `ISSUES_TO_FIX.md` — the triage session owns turning these
-findings into plans.
+artefacts per AGENTS.md § B.6). Do **not** create plans in `plans/active/` — 
+the triage session owns turning these findings into plans.
 
 For each finding, give the triage session everything it needs to act without
 re-running the sweep:
