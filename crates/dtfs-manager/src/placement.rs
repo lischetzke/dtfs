@@ -228,6 +228,108 @@ pub(crate) fn chunk_placement_key(volume_id: &str, placement_seed: &str, index: 
     format!("{volume_id}:{placement_seed}:chunk:{index}")
 }
 
+/// Bug BX — a capacity-spill candidate: one disk on one healthy node that
+/// currently has room (free space above the placement headroom).
+#[derive(Debug, Clone)]
+pub(crate) struct CandidateDisk {
+    pub node_id: u64,
+    pub disk_id: u32,
+    pub tier: DiskTier,
+    pub location: Location,
+    pub free_bytes: u64,
+}
+
+/// Bug BX — order spill candidates **fastest + nearest** first:
+///   1. media speed   — `hot < warm < cold < tape` (`DiskTier::speed_rank`)
+///   2. distance      — topological distance from the requester (nearer first)
+///   3. free space    — most free first (balance, consistent with BU-1)
+///   4. (node_id, disk_id) — deterministic, stable total order tie-break
+///
+/// Pure + deterministic for a given input (no RNG), so reads/repairs stay
+/// stable. The caller filters to disks with room (and excludes the anchor
+/// slot) before ranking.
+pub(crate) fn rank_candidates(
+    candidates: &[CandidateDisk],
+    requester: &Location,
+) -> Vec<CandidateDisk> {
+    let mut out = candidates.to_vec();
+    out.sort_by(|a, b| {
+        a.tier
+            .speed_rank()
+            .cmp(&b.tier.speed_rank())
+            .then(
+                requester
+                    .distance(&a.location)
+                    .cmp(&requester.distance(&b.location)),
+            )
+            .then(b.free_bytes.cmp(&a.free_bytes))
+            .then(a.node_id.cmp(&b.node_id))
+            .then(a.disk_id.cmp(&b.disk_id))
+    });
+    out
+}
+
+#[cfg(test)]
+mod bx1_ranking_tests {
+    use super::*;
+    use dtfs_common::types::DiskTier;
+
+    fn cand(node: u64, disk: u32, tier: DiskTier, dc: &str, free: u64) -> CandidateDisk {
+        CandidateDisk {
+            node_id: node,
+            disk_id: disk,
+            tier,
+            location: Location::new("lab", dc, "rack-1", &format!("h{node}")),
+            free_bytes: free,
+        }
+    }
+
+    // Bug BX — media speed dominates distance: a faster tier far away beats a
+    // slower tier nearby.
+    #[test]
+    fn speed_beats_distance() {
+        let req = Location::new("lab", "dc-a", "rack-1", "writer");
+        let cands = vec![
+            cand(2, 0, DiskTier::Cold, "dc-a", 100), // near but slow
+            cand(1, 0, DiskTier::Hot, "dc-z", 100),  // far but fast
+        ];
+        let ranked = rank_candidates(&cands, &req);
+        assert_eq!(ranked[0].tier, DiskTier::Hot, "fastest tier wins over nearness");
+    }
+
+    // Same speed -> nearer wins; same speed+distance -> more free wins.
+    #[test]
+    fn distance_then_free_break_ties() {
+        let req = Location::new("lab", "dc-a", "rack-1", "writer");
+        let cands = vec![
+            cand(3, 0, DiskTier::Warm, "dc-b", 999), // far, lots free
+            cand(2, 0, DiskTier::Warm, "dc-a", 10),  // near, little free
+            cand(1, 0, DiskTier::Warm, "dc-a", 50),  // near, more free
+        ];
+        let ranked = rank_candidates(&cands, &req);
+        assert_eq!((ranked[0].node_id, ranked[0].free_bytes), (1, 50));
+        assert_eq!(ranked[1].node_id, 2);
+        assert_eq!(ranked[2].node_id, 3, "far node last despite most free");
+    }
+
+    // Deterministic: same input -> same order; ties broken by disk_id asc.
+    #[test]
+    fn deterministic_tiebreak() {
+        let req = Location::new("lab", "dc-a", "rack-1", "writer");
+        let cands = vec![
+            cand(2, 1, DiskTier::Warm, "dc-a", 10),
+            cand(2, 0, DiskTier::Warm, "dc-a", 10),
+        ];
+        let a = rank_candidates(&cands, &req);
+        let b = rank_candidates(&cands, &req);
+        assert_eq!(
+            a.iter().map(|c| (c.node_id, c.disk_id)).collect::<Vec<_>>(),
+            b.iter().map(|c| (c.node_id, c.disk_id)).collect::<Vec<_>>(),
+        );
+        assert_eq!((a[0].node_id, a[0].disk_id), (2, 0));
+    }
+}
+
 #[cfg(test)]
 mod bu1_capacity_ring_tests {
     use super::*;

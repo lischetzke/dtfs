@@ -449,6 +449,21 @@ fn count_anchor_pending_files(sm: &StateMachineData) -> usize {
     pending
 }
 
+/// Bug BX-6 — render the chunk placement-state distribution as JSON for
+/// `/api/v1/stats.chunk_placement`. `pending_deletion` is wired through
+/// from the classifier (orphan/GC accounting can populate it later).
+fn chunk_placement_json(sm: &StateMachineData) -> Value {
+    let c = crate::placement_state::count_placement_states(sm);
+    json!({
+        "missing": c.missing,
+        "undergoal": c.undergoal,
+        "misplaced": c.misplaced,
+        "stable": c.stable,
+        "overgoal": c.overgoal,
+        "pending_deletion": c.pending_deletion,
+    })
+}
+
 async fn cluster_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let sm = state.sm_data.read().await;
     let file_count = sm.files.len();
@@ -3193,6 +3208,10 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         // Bug BV-1 — files whose mandatory anchor copy hasn't landed yet
         // (durability-pending, async convergence; not data loss).
         "anchor_pending":        count_anchor_pending_files(&sm),
+        // Bug BX-6 — cluster-wide chunk placement-state distribution, one
+        // count per logical chunk. The contract the Bug BT WebUI
+        // chunk-redundancy panel renders.
+        "chunk_placement":       chunk_placement_json(&sm),
         // Bug BH-8 — banner ratio over cluster infrastructure only
         // (managers + data); clients are consumers, not cluster health.
         // Numerator/denominator are taken from one explicit set so they
