@@ -219,10 +219,14 @@ impl DtfsFilesystem {
             config.readahead.prefetch_next_files,
         );
 
-        // Default chunk size from the manager defaults. We use 128 MB as
-        // the default; the actual chunk size per file comes from the
-        // volume config when the file is opened.
-        let default_chunk_size = 128 * 1024 * 1024;
+        // Bug BW — the write buffer MUST split files at the same chunk size
+        // the volume uses (recorded in file metadata, default 4 MB), because
+        // reads derive chunk offsets from that metadata. The client used to
+        // hardcode 128 MB here, so a >4 MB file was stored as one oversized
+        // chunk while metadata said 4 MB and reads past the first 4 MB
+        // returned garbage. Driven from config now (must match the volume's
+        // chunk_size_bytes).
+        let chunk_size_bytes = (config.client.chunk_size_mb.max(1) as usize) * 1024 * 1024;
 
         let readahead = ReadAheadEngine::new(
             readahead_mode,
@@ -230,7 +234,7 @@ impl DtfsFilesystem {
             256, // max prefetch cache entries
         );
 
-        let write_buffer = WriteBuffer::new(default_chunk_size);
+        let write_buffer = WriteBuffer::new(chunk_size_bytes);
 
         let migration = MigrationTrigger::new(
             client.clone(),

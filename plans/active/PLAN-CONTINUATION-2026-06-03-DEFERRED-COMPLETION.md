@@ -129,7 +129,7 @@ split these tasks into a dedicated `plans/active/PLAN-BUG-BW-LARGE-FILE-UNDERCHU
 
 ### BW-1: Reproduce with a failing unit test
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-fuse/src/writebuf.rs` (test).
 - Sketch: a write of `N > chunk_size` bytes must yield `ceil(N / chunk_size)`
   segments with correct per-segment sizes + offsets. Assert it currently
@@ -139,7 +139,7 @@ split these tasks into a dedicated `plans/active/PLAN-BUG-BW-LARGE-FILE-UNDERCHU
 
 ### BW-2: Fix segmentation to split at `chunk_size`
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-fuse/src/writebuf.rs` (+ `filesystem.rs` flush path if the
   split lives there).
 - Sketch: on flush, split buffered bytes into `chunk_size`-aligned segments; a
@@ -151,7 +151,7 @@ split these tasks into a dedicated `plans/active/PLAN-BUG-BW-LARGE-FILE-UNDERCHU
 
 ### BW-3: Read-path reassembly verification
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-fuse/src/filesystem.rs` (read path), `readahead.rs`.
 - Sketch: confirm reads map `offset → chunk_index` and reassemble multi-chunk
   files byte-exactly under sequential AND random read patterns (the live bug
@@ -161,7 +161,7 @@ split these tasks into a dedicated `plans/active/PLAN-BUG-BW-LARGE-FILE-UNDERCHU
 
 ### BW-4: Already-corrupted files — decide + document
 
-- Status: ⬜
+- Status: ✅ (2026-06-03 — remediation = operator re-ingest; documented in changelog Special update requirement)
 - Sketch: existing under-chunked files in the library are already stored wrong.
   Decide remediation: operator re-ingest (simplest, recommended) vs a one-off
   repair/rewrite pass. Document the operator action; if a repair pass is built,
@@ -170,7 +170,7 @@ split these tasks into a dedicated `plans/active/PLAN-BUG-BW-LARGE-FILE-UNDERCHU
 
 ### BW-5: Release case — multi-chunk round-trip integrity
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `tests/release/cases/NN-multichunk-integrity.sh`.
 - Case: write a `>chunk_size` file via FUSE, read back (multiple read methods),
   assert sha256 matches the source AND `inspect.chunk_count == ceil(size/chunk_size)`.
@@ -179,7 +179,7 @@ split these tasks into a dedicated `plans/active/PLAN-BUG-BW-LARGE-FILE-UNDERCHU
 
 ### BW-6: Changelog + docs
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `changelog/UNRELEASED.md` (bug fix + KNOWN-ISSUE note for pre-existing
   files), `docs/src/...`.
 
@@ -227,6 +227,17 @@ BT-4 at `chunk_placement`.
 ---
 
 ## Verification log
+
+- **Phase 2 (BW) — 2026-06-03.** Root cause: `filesystem.rs` built the write
+  buffer with a hardcoded 128 MB chunk size while file metadata recorded the
+  4 MB volume chunk size, so >4 MB files were under-chunked and multi-chunk
+  reads returned garbage. Fix: drive the writebuf from `[client] chunk_size_mb`
+  (default 4). Unit `writebuf::tests::bw_large_write_splits_into_chunk_size_segments`
+  PASS. Deployed fixed fuse to mini-client01; release case
+  `tests/release/cases/38-multichunk-integrity.sh` PASS — a 12 MB write now
+  stores `chunk_count=3` (was 1) and reads back byte-exact via FUSE AND dd
+  (`sha256` all equal to source). Existing pre-fix files need re-ingest
+  (documented). BW-3 read reassembly confirmed by the two-read-method check.
 
 - **Phase 1 (BX-9..14) — 2026-06-03.** Implemented + built clean; full manager
   suite 173 passed, 0 failed. Deployed manager+fuse (build 20260603-100706) to
