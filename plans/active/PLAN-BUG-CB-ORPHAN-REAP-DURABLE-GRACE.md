@@ -1,7 +1,7 @@
 # PLAN-BUG-CB — Orphan reap uses a durable grace clock
 
-Status: code complete, build + live-verify pending (Windows host cannot
-build; run on the Linux builder per AGENTS.md A.4.1).
+Status: complete — built + tested on dtfs-builder, deployed and
+live-verified on the Minicluster (2026-06-03). All tasks ✅.
 
 ## Background
 
@@ -89,15 +89,17 @@ data nodes. Analysis (read-only) traced the delete path:
   - Files: `crates/dtfs-manager/src/scheduler.rs`.
 - **CB-8** ✅ docs: AGENTS.md A.6 #8, orphan-cleanup runbook safety
   notes, changelog `UNRELEASED.md` (Bug CB entry).
-- **CB-9** 🟦 build + test on the Linux builder
-  (`cargo test -p dtfs-data -p dtfs-manager --release`). BLOCKED on
-  Windows host (rocksdb/fuse3). Failing-first evidence: the new helper
-  did not exist, so the test module referenced an undefined symbol
-  (compile error = the failing test per B.5).
-- **CB-10** 🟦 live-verify on the lab + release case
-  `tests/release/cases/14-orphan-reap.sh` (still valid; recommend
-  augmenting with a manager-restart-mid-grace assertion as a follow-up).
-  BLOCKED: no cluster access from this session.
+- **CB-9** ✅ build + test on dtfs-builder (10.150.0.150).
+  `cargo test -p dtfs-manager -p dtfs-data --release`: 181 passed / 0
+  failed (manager, incl. both new CB tests + the CA guard) and 69 passed
+  / 0 failed (data). Release build OK; fresh `BUILD_DATE 20260603-154431`
+  on all four binaries.
+- **CB-10** ✅ live-verify on the Minicluster. Rolling deploy (leader-last)
+  of all six nodes to the fresh build. Backlog drain + restart-survival
+  both confirmed (see Verification log). Release case
+  `tests/release/cases/14-orphan-reap.sh` remains valid; a
+  manager-restart-mid-grace assertion is a recommended follow-up to gate
+  the specific CB property in the release suite.
 
 ## Cross-cutting invariants preserved
 
@@ -111,8 +113,37 @@ data nodes. Analysis (read-only) traced the delete path:
 
 ## Verification log
 
-- (pending CB-9 / CB-10) — to be filled in from the Linux builder and
-  the lab cluster.
+- **2026-06-03 — CB-9 build+test (dtfs-builder 10.150.0.150).** Branch
+  `bug-cb-orphan-reap` archived to the builder; `cargo test -p
+  dtfs-manager -p dtfs-data --release` → 181 passed / 0 failed (manager)
+  + 69 passed / 0 failed (data). New tests
+  `cb_orphan_reap_due_uses_durable_mtime` and
+  `cb_orphan_reap_survives_simulated_restart` green. Release build OK,
+  `BUILD_DATE 20260603-154431`. (Note: the CA guard
+  `no_bug_ids_in_served_dashboard` failed first — a missed `// Bug
+  volumes-actions` JS comment in the served volumes table; fixed in the
+  CA follow-up commit, then green.)
+- **2026-06-03 — CB-10 live-verify (Minicluster).** Rolling deploy
+  leader-last (leader was mgr03); all six nodes report build
+  `20260603-154431`, health Healthy.
+  - *Backlog drain (the reported symptom):* the cluster carried ~53 GB of
+    chunks against only 3 files (data01 38 GB, data02 15 GB) — orphans the
+    pre-fix reaper never reclaimed. After deploy, the >24h-old orphans
+    reaped at the first post-restart scan even at the default 24h grace
+    (mgr01 journal: `orphan_scrub tick reaped chunks reaped=286`); after
+    lowering grace to 60s the remaining <24h orphans reaped too. On-disk
+    fell to ~6 MB total; `file_count` stayed 3.
+  - *Restart-survival (the specific fix):* wrote a fresh 30 MB file
+    (data01 4→34 MB), unlinked it, restarted the LEADER mid-grace, waited
+    85s. Tracked chunk `e30ffa9a…` was reaped from every data node and
+    disk returned to the 4 MB baseline; `file_count` still 3. Pre-fix the
+    leader restart reset the in-memory clock and the chunk would never
+    have reaped.
+  - *No data loss:* the 3 referenced files (`media/animes`,
+    `media/movies`) and their chunks were retained throughout
+    (`chunk_is_orphan` guard).
+  - Test config (60s grace/interval) was reverted to the original 86400
+    on all managers after the test; the new binaries remain deployed.
 
 ## Deviations from plan
 
