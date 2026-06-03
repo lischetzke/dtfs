@@ -1,6 +1,6 @@
 # Continuation roadmap — finish BX, fix BW, build BT (2026-06-03)
 
-**Status:** todo (authored 2026-06-03)
+**Status:** complete 2026-06-03 (all 3 phases done + live-verified; BX-13 KNOWN_ISSUE-pinned, BX-5 dispatcher live + safe, BT-5 forked to Bug BY)
 **Source:** user direction 2026-06-03 after the BX implementation (PR #5). Sequences
 the deferred work accumulated across the BS/BU/BV/BX session.
 
