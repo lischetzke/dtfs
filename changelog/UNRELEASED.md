@@ -316,3 +316,23 @@
   (reachable via View Source). Both are now stripped; Rust source comments are
   unaffected. A `render_dashboard` unit test scans the entire served document
   and fails if any "Bug " reference reappears.
+- **Bug CB - deleted files now reclaim disk under manager restart churn.**
+  Unlinking a file removes its manager-side metadata immediately but frees no
+  bytes; the on-disk chunks are reclaimed asynchronously by the orphan reaper
+  (`orphan_scrub`). The reaper measured its reap grace against an in-memory
+  "first observed orphan" timestamp that was wiped on every manager restart /
+  leadership change, and the loop also skipped a full `orphan_interval_secs`
+  (default 24h) after each (re)start - so on a cluster doing rolling deploys or
+  soak chaos, no manager ever accumulated the 24h grace and a deleted file's
+  chunks were never freed (disk usage of deleted media kept climbing). The
+  grace is now anchored to each chunk's durable on-disk `.dat` mtime, reported
+  by `ListChunks` (new `chunk_mtimes_ms` field) and evaluated by the pure
+  `orphan_reap_due` helper: a chunk is reaped only when it is unreferenced AND
+  its file is at least `orphan_grace_secs` old. This survives restarts and
+  reaps long-resident deleted chunks promptly, while a freshly-written chunk
+  (recent mtime) is still protected against the in-flight put/promote race.
+  The post-(re)start first scan now runs after a short warmup instead of a full
+  interval. **Mixed-version note:** a manager on this build talking to a data
+  node that predates Bug CB (no `chunk_mtimes_ms`) DEFERS reaping rather than
+  reaping with no grace; reclamation resumes once data nodes are upgraded
+  (roll data nodes after managers, per AGENTS.md A.4.2).
