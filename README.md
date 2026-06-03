@@ -33,17 +33,17 @@ Full table of contents: [`docs/src/SUMMARY.md`](docs/src/SUMMARY.md).
 - `proto/` — Protobuf / gRPC definitions
 - `deploy/` — Docker Compose, sample configs, systemd units
 - `docs/` — mdBook documentation source
-- `plans/` — active plans, completed plans, incidents, reports (see [plans/README.md](plans/README.md))
+- `plans/` — active work plans (see [plans/README.md](plans/README.md))
 - `changelog/` — per-release changelog entries (see [changelog/README.md](changelog/README.md))
 - `tests/` — integration, chaos, performance, and lab harness
-- [`AGENTS.md`](AGENTS.md) — canonical guide for contributors and AI agents (Part A: codebase knowledge — architecture, integrity invariants, memory model, bug catalog; Part B: operating discipline)
+- [`AGENTS.md`](AGENTS.md) — canonical guide for contributors and AI agents (Part A: codebase knowledge — architecture, integrity invariants, memory model; Part B: operating discipline)
 - [`CLAUDE.md`](CLAUDE.md) — single-line `@AGENTS.md` import shim for Claude Code (do not add content here)
 
-The authoritative table of *where each kind of artefact lives* is in [AGENTS.md § Structure Discipline](AGENTS.md#structure-discipline). Read that before adding a file at a new path.
+The authoritative table of *where each kind of artefact lives* is in [AGENTS.md § Structure Discipline](AGENTS.md#b6-structure-discipline). Read that before adding a file at a new path.
 
 ## Contribution
 
-Contributions are welcome. **Every fix must come with a working test case that demonstrates the bug and proves the fix is correct.** The procedure is defined in [AGENTS.md § Fixing Procedure](AGENTS.md#fixing-procedure):
+Contributions are welcome. **Every fix must come with a working test case that demonstrates the bug and proves the fix is correct.** The procedure is defined in [AGENTS.md § Fixing Procedure](AGENTS.md#b1-fixing-procedure):
 
 1. Write a test that fails because of the issue.
 2. Implement the fix.

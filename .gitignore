@@ -30,11 +30,6 @@ LOCK
 CURRENT
 MANIFEST-*
 
-# Archived plans/reports/incidents are NOW git-tracked (committed) so the
-# history is shared, but kept out of AI-agent context via deny rules in
-# .claude/settings.json (Read(plans/completed/**) / Read(plans/processed/**)).
-# Do not re-add plans/completed or plans/processed here.
-
 # Local test corpus and Claude Code session state
 dummy_files/
 # Exclude .claude contents but allow project skills to be versioned.
