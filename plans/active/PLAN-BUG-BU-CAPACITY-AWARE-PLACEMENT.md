@@ -324,6 +324,20 @@ NRB downloads landing 30 GB seasons) will hit routinely.
   `tests/release/cases/34-write-fallback-disk-full.sh` authored (balloon a
   warm disk under headroom, write via FUSE, assert success + integrity +
   no leaked `.dat.tmp`). Live-run pending the deploy of the new binaries.
-- **Live (pending deploy)** — fill data01-warm, write via client, confirm
-  the chunk lands on data02-warm and the write succeeds (was EIO); confirm
-  no `.tmp` accumulation.
+- **Live (2026-06-03, deployed wrapper build 20260603-083741)** — on the
+  minicluster, `mini-data01`'s warm disk was genuinely 100% full
+  (`df`: 18-21 MB avail of 20 GB). A single-chunk (3 MB) write via the
+  FUSE client SUCCEEDED with matching sha256 and left zero `*.dat.tmp` on
+  the full disk — release case
+  `tests/release/cases/34-write-fallback-disk-full.sh` STATUS: PASS.
+  Pre-fix (plan authorship evidence) the same warm-full condition returned
+  `os error 28` → `0/1 replicas` → ghost-unlink → EIO. Capacity-aware
+  placement routed the chunk to a disk with room.
+- **Out-of-scope blocker found + flagged.** Multi-chunk round-trip can't
+  be integrity-checked on this cluster because of a SEPARATE, pre-existing
+  large-file under-chunking bug: a `>chunk_size` write is stored as a
+  single oversized chunk at index 0 (confirmed on pre-deploy media:
+  a 283 MB .mkv reports `chunk_count=3`, expected ~68), so reads past the
+  first chunk return garbage. This predates BS/BU/BV (old binaries wrote
+  those files) and is NOT a BU regression. Spawned as a separate task; the
+  BU-4 case was switched to a single-chunk file to validate BU cleanly.
