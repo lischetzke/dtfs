@@ -832,31 +832,24 @@ impl ManagerService for MetadataService {
         // The TieringEngine aggregates by chunk_id and uses `reads_by_dc`
         // to score migration target nodes (find_target_node).
         if !req.chunk_reads.is_empty() {
-            if let Some(tiering) = &self.tiering {
-                // Map proto → engine call. The tiering engine wants the
-                // *current* tier and *current* node for the chunk; we leave
-                // those zeroed since the engine looks them up from the
-                // state machine when evaluating.
-                for entry in &req.chunk_reads {
-                    let reads_1h = entry.reads_by_dc_1h.values().sum::<u32>();
-                    let reads_24h = entry.reads_by_dc_24h.values().sum::<u32>();
-                    tiering
-                        .report_access(
-                            &entry.chunk_id,
-                            "", // file_path unknown at heartbeat time; engine fills via SM lookup
-                            reads_1h,
-                            reads_24h,
-                            entry.reads_by_dc_1h.clone(),
-                            dtfs_common::types::DiskTier::Hot, // placeholder; engine recomputes
-                            node_id,
-                        )
-                        .await;
-                }
-                tracing::debug!(
-                    "tiering: ingested {} chunk-read entries from heartbeat",
-                    req.chunk_reads.len()
-                );
-            }
+            // Route per-chunk read counters to the LEADER's tiering engine. The
+            // read-window and the promote/demote tick are in-memory on the
+            // leader, but this heartbeat may have landed on a follower; calling
+            // `report_access` on the local (follower) engine would hide the
+            // reads from the leader's tick and read-hot chunks would never
+            // promote. `proxy_to_leader` sends `ReportChunkReads` to the leader
+            // via `ForwardClientWrite`, where the manager service intercepts it
+            // before Raft and applies it to the tiering engine (the leader
+            // self-forwards). Best-effort: a dropped report (e.g. mid-election)
+            // just costs one read sample; the next heartbeat re-reports.
+            let entries: Vec<(String, std::collections::HashMap<String, u32>)> = req
+                .chunk_reads
+                .iter()
+                .map(|e| (e.chunk_id.clone(), e.reads_by_dc_1h.clone()))
+                .collect();
+            let _ = self
+                .proxy_to_leader(ClientRequest::ReportChunkReads { node_id, entries })
+                .await;
         }
 
         // AZ-1 — emit a minimal ConfigUpdate carrying the scrub
@@ -951,6 +944,37 @@ impl ManagerService for MetadataService {
         let body = request.into_inner();
         let req: ClientRequest = serde_json::from_slice(&body.client_request_json)
             .map_err(|e| Status::invalid_argument(format!("bad ClientRequest json: {e}")))?;
+        // Per-chunk read reports are NOT Raft state — they feed this (leader's)
+        // in-memory tiering read-window. Intercept BEFORE Raft and apply
+        // directly so reads forwarded from a follower reach the engine that
+        // ticks. Without this, the leader's read-window only ever sees reads
+        // from data nodes that happen to heartbeat to the leader, and read-hot
+        // chunks served via other managers never promote.
+        if let ClientRequest::ReportChunkReads { node_id, entries } = &req {
+            if let Some(tiering) = &self.tiering {
+                for (chunk_id, reads_by_dc) in entries {
+                    let total: u32 = reads_by_dc.values().sum();
+                    tiering
+                        .report_access(
+                            chunk_id,
+                            "",
+                            total,
+                            total,
+                            reads_by_dc.clone(),
+                            dtfs_common::types::DiskTier::Hot,
+                            *node_id,
+                        )
+                        .await;
+                }
+            }
+            let response_json = serde_json::to_vec(&ClientResponse::Success)
+                .map_err(|e| Status::internal(format!("serialize ClientResponse: {e}")))?;
+            return Ok(Response::new(ForwardWriteResponse {
+                success: true,
+                response_json,
+                error: String::new(),
+            }));
+        }
         match self.raft.client_write(req).await {
             Ok(resp) => {
                 let response_json = serde_json::to_vec(&resp.data)
