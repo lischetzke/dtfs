@@ -288,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
                 cache_replicas: dtfs_common::types::CacheReplication::default(),
                 anchor: None,
                 schedules: dtfs_common::types::VolumeSchedules::default(),
+                spill: dtfs_common::types::SpillPolicy::default(),
             };
             match raft_for_volume
                 .client_write(dtfs_raft::ClientRequest::UpsertVolume { config: vol_cfg })

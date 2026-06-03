@@ -162,6 +162,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/volumes/{id}/set-mandatory", post(set_volume_mandatory_endpoint))
         // AV-5-12 — operator-facing set-anchor.
         .route("/api/v1/volumes/{id}/set-anchor", post(set_volume_anchor_endpoint))
+        // Bug BZ — per-volume capacity-spill exclusions.
+        .route("/api/v1/volumes/{id}/set-spill", post(set_volume_spill_endpoint))
         // AZ-1 — per-volume background-job schedules (scrub, fsck).
         .route("/api/v1/volumes/{id}/set-schedules", post(set_volume_schedules_endpoint))
         // AZ-5-A1 — effective cluster config (every key, name+current+default).
@@ -1359,6 +1361,7 @@ async fn create_volume(
         cache_replicas: dtfs_common::types::CacheReplication::default(),
         anchor: None,
         schedules: dtfs_common::types::VolumeSchedules::default(),
+        spill: dtfs_common::types::SpillPolicy::default(),
     };
 
     let req = ClientRequest::UpsertVolume { config };
@@ -1520,6 +1523,12 @@ pub(crate) fn volume_config_to_json(
             "scrub_interval_secs": cfg.schedules.scrub_interval_secs,
             "fsck_interval_secs":  cfg.schedules.fsck_interval_secs,
             "custom":              cfg.schedules.custom,
+        },
+        // Bug BZ — per-volume capacity-spill exclusions.
+        "spill": {
+            "allow":                 cfg.spill.allow,
+            "forbidden_tiers":       cfg.spill.forbidden_tiers,
+            "forbidden_datacenters": cfg.spill.forbidden_datacenters,
         },
     })
 }
@@ -1995,6 +2004,107 @@ async fn set_volume_anchor_endpoint(
         state.audit_log.log("api", "volume.set_anchor", &volume_id, "success");
     } else {
         state.audit_log.log("api", "volume.set_anchor", &volume_id, "noop");
+    }
+
+    Ok(Json(json!({
+        "volume_id": volume_id,
+        "changed": changed,
+        "config": volume_config_to_json(&next),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Bug BZ — POST /api/v1/volumes/{id}/set-spill — per-volume capacity-spill
+// exclusions (allow override + forbidden tiers/datacenters).
+// ---------------------------------------------------------------------------
+
+/// Bug BZ — request body for `POST /api/v1/volumes/{id}/set-spill`. Every
+/// field optional; supplied fields replace the corresponding spill setting.
+/// `forbidden_tiers` accepts lowercase tier names; an empty list clears the
+/// exclusion.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetSpillRequest {
+    pub allow: Option<bool>,
+    pub forbidden_tiers: Option<Vec<String>>,
+    pub forbidden_datacenters: Option<Vec<String>>,
+}
+
+/// Bug BZ pure helper — merge a partial spill-policy update + validate the
+/// tier names.
+pub(crate) fn apply_set_spill(
+    current: &dtfs_common::types::VolumeConfig,
+    req: &SetSpillRequest,
+) -> Result<dtfs_common::types::VolumeConfig, String> {
+    let mut next = current.clone();
+    if let Some(a) = req.allow {
+        next.spill.allow = Some(a);
+    }
+    if let Some(tiers) = &req.forbidden_tiers {
+        let mut norm: Vec<String> = Vec::new();
+        for t in tiers {
+            let tl = t.trim().to_ascii_lowercase();
+            if tl.is_empty() {
+                continue;
+            }
+            if !matches!(tl.as_str(), "hot" | "warm" | "cold" | "tape") {
+                return Err(format!("unknown tier in forbidden_tiers: {t}"));
+            }
+            if !norm.contains(&tl) {
+                norm.push(tl);
+            }
+        }
+        next.spill.forbidden_tiers = norm;
+    }
+    if let Some(dcs) = &req.forbidden_datacenters {
+        let mut norm: Vec<String> = Vec::new();
+        for d in dcs {
+            let dt = d.trim().to_string();
+            if dt.is_empty() {
+                continue;
+            }
+            if !norm.contains(&dt) {
+                norm.push(dt);
+            }
+        }
+        next.spill.forbidden_datacenters = norm;
+    }
+    Ok(next)
+}
+
+async fn set_volume_spill_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(volume_id): axum::extract::Path<String>,
+    Json(body): Json<SetSpillRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    use axum::http::StatusCode;
+
+    let current = {
+        let sm = state.sm_data.read().await;
+        sm.volumes.get(&volume_id).cloned()
+    };
+    let Some(current) = current else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("volume not found: {volume_id}")})),
+        ));
+    };
+
+    let next = apply_set_spill(&current, &body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+
+    let changed = current != next;
+    if changed {
+        let req = ClientRequest::UpsertVolume { config: next.clone() };
+        if let Err(e) = state.raft.client_write(req).await {
+            warn!(volume = %volume_id, error = %e, "set_volume_spill Raft write failed");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("raft write failed: {e}")})),
+            ));
+        }
+        state.audit_log.log("api", "volume.set_spill", &volume_id, "success");
+    } else {
+        state.audit_log.log("api", "volume.set_spill", &volume_id, "noop");
     }
 
     Ok(Json(json!({
@@ -2854,6 +2964,7 @@ mod bug_bp_tests {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             schedules: dtfs_common::types::VolumeSchedules::default(),
+            spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety { min_replicas_before_ack: 1, write_timeout_secs: 30 },
         };
@@ -3985,6 +4096,7 @@ mod bug_av_set_cache_tests {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             schedules: dtfs_common::types::VolumeSchedules::default(),
+            spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety {
                 min_replicas_before_ack: 2,
@@ -4046,6 +4158,29 @@ mod bug_av_set_cache_tests {
         let req = SetCacheRequest::default();
         let next = apply_set_cache(&current, &req).expect("empty req is valid");
         assert_eq!(current, next);
+    }
+
+    // Bug BZ — set-spill merges the per-volume spill exclusions + validates
+    // tier names; allows_target then honours them.
+    #[test]
+    fn bug_bz_apply_set_spill() {
+        use dtfs_common::types::DiskTier;
+        let current = legacy_volume();
+        let req = SetSpillRequest {
+            allow: Some(false),
+            forbidden_tiers: Some(vec!["HOT".into(), "".into(), "hot".into()]),
+            forbidden_datacenters: Some(vec!["dc-b".into()]),
+        };
+        let next = apply_set_spill(&current, &req).expect("valid spill update");
+        assert_eq!(next.spill.allow, Some(false));
+        assert_eq!(next.spill.forbidden_tiers, vec!["hot".to_string()], "normalised + deduped");
+        assert_eq!(next.spill.forbidden_datacenters, vec!["dc-b".to_string()]);
+        assert!(!next.spill.allows_target("dc-a", DiskTier::Hot));
+        assert!(!next.spill.allows_target("dc-b", DiskTier::Cold));
+        assert!(next.spill.allows_target("dc-a", DiskTier::Warm));
+        // Unknown tier rejected.
+        let bad = SetSpillRequest { forbidden_tiers: Some(vec!["flash".into()]), ..Default::default() };
+        assert!(apply_set_spill(&current, &bad).unwrap_err().contains("flash"));
     }
 
     // Bug BT follow-on — cold + tape cache tiers are editable via set-cache.
@@ -4188,6 +4323,7 @@ mod bug_az_set_schedules_tests {
                 write_timeout_secs: 30,
             },
             schedules: VolumeSchedules::default(),
+            spill: Default::default(),
         }
     }
 
@@ -4298,6 +4434,7 @@ mod bug_av_set_mandatory_tests {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             schedules: dtfs_common::types::VolumeSchedules::default(),
+            spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety {
                 min_replicas_before_ack: 2,

@@ -2034,6 +2034,7 @@ mod snapshot_persistence_tests {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             schedules: dtfs_common::types::VolumeSchedules::default(),
+            spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety {
                 min_replicas_before_ack: 1,
@@ -2103,6 +2104,7 @@ mod snapshot_persistence_tests {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             schedules: dtfs_common::types::VolumeSchedules::default(),
+            spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety {
                 min_replicas_before_ack: 1,
