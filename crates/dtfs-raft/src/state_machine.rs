@@ -3363,6 +3363,59 @@ mod posix_path_regression {
         );
     }
 
+    // Bug BY — applying a ReportScrubResult (now produced by the data node
+    // via heartbeat) records the result per (node, level) so the WebUI
+    // "Last Scrub" card + stats.scrub_results_by_node populate. A deep
+    // result does not overwrite the quick one (BK).
+    #[test]
+    fn bug_by_report_scrub_result_populates_state() {
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::ReportScrubResult {
+                node_id: 5,
+                disk_path: "/mnt/data01-warm".into(),
+                level: "quick".into(),
+                completed_at_ms: 1_700_000_000_000,
+                chunks_checked: 160,
+                chunks_healthy: 160,
+                chunks_corrupt: 0,
+                chunks_missing: 0,
+                duration_secs: 0.05,
+            },
+        );
+        let rec = sm
+            .scrub_results_by_level
+            .get(&5)
+            .and_then(|m| m.get("quick"))
+            .expect("quick record stored per (node, level)");
+        assert_eq!(rec.chunks_checked, 160);
+        assert_eq!(rec.level, "quick");
+        assert!(sm.scrub_results.contains_key(&5), "legacy per-node map also populated");
+
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::ReportScrubResult {
+                node_id: 5,
+                disk_path: "/mnt/data01-warm".into(),
+                level: "deep".into(),
+                completed_at_ms: 1_700_000_001_000,
+                chunks_checked: 314,
+                chunks_healthy: 314,
+                chunks_corrupt: 0,
+                chunks_missing: 0,
+                duration_secs: 1.2,
+            },
+        );
+        assert_eq!(
+            sm.scrub_results_by_level.get(&5).unwrap().len(),
+            2,
+            "quick + deep both retained (BK), not overwritten"
+        );
+    }
+
     fn mk_data_node_with_disk(used_bytes: u64) -> crate::NodeInfo {
         let mut n = mk_quarantinable_node();
         n.disks = vec![dtfs_common::types::DiskInfo {

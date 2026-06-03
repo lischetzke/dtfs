@@ -105,6 +105,26 @@ pub struct ChunkStore {
     /// the Raft state machine can drop the matching replica entries
     /// and trigger re-replication from a healthy peer.
     pending_corruption: Arc<parking_lot::Mutex<Vec<String>>>,
+    /// Bug BY — completed scrub-result summaries waiting to be shipped to
+    /// the manager on the next heartbeat (one per disk per quick/deep
+    /// cycle). The manager issues a `ReportScrubResult` Raft write per
+    /// entry so the WebUI "Last Scrub" card populates.
+    pending_scrub_results: Arc<parking_lot::Mutex<Vec<ScrubResultSummary>>>,
+}
+
+/// Bug BY — a completed scrub result queued for the next heartbeat. The
+/// data node doesn't know its own manager-assigned node_id; the manager
+/// fills that in from the heartbeat envelope.
+#[derive(Debug, Clone)]
+pub struct ScrubResultSummary {
+    pub disk_path: String,
+    pub level: String,
+    pub completed_at_ms: u64,
+    pub chunks_checked: u64,
+    pub chunks_healthy: u64,
+    pub chunks_corrupt: u64,
+    pub chunks_missing: u64,
+    pub duration_secs: f64,
 }
 
 impl ChunkStore {
@@ -114,7 +134,18 @@ impl ChunkStore {
             chunk_count: Arc::new(AtomicU64::new(0)),
             bytes_stored: Arc::new(AtomicU64::new(0)),
             pending_corruption: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            pending_scrub_results: Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Bug BY — queue a completed scrub result for the next heartbeat.
+    pub fn enqueue_scrub_result(&self, summary: ScrubResultSummary) {
+        self.pending_scrub_results.lock().push(summary);
+    }
+
+    /// Bug BY — drain queued scrub results so each is reported once.
+    pub fn drain_scrub_results(&self) -> Vec<ScrubResultSummary> {
+        std::mem::take(&mut *self.pending_scrub_results.lock())
     }
 
     /// Bug O — append chunk_ids that have been quarantined locally

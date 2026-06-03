@@ -801,6 +801,33 @@ impl ManagerService for MetadataService {
             );
         }
 
+        // Bug BY — record completed scrub results reported by the data node
+        // so the WebUI "Last Scrub" card + stats.scrub_results_by_node
+        // populate. Forwarded to the leader when this manager is a follower
+        // (Bug BL), like the integrity-fault writes above.
+        if !req.scrub_results.is_empty() {
+            for s in &req.scrub_results {
+                let _ = self
+                    .raft_write_or_forward(ClientRequest::ReportScrubResult {
+                        node_id,
+                        disk_path: s.disk_path.clone(),
+                        level: s.level.clone(),
+                        completed_at_ms: s.completed_at_ms,
+                        chunks_checked: s.chunks_checked,
+                        chunks_healthy: s.chunks_healthy,
+                        chunks_corrupt: s.chunks_corrupt,
+                        chunks_missing: s.chunks_missing,
+                        duration_secs: s.duration_secs,
+                    })
+                    .await;
+            }
+            tracing::debug!(
+                node_id,
+                count = req.scrub_results.len(),
+                "Bug BY recorded scrub results reported via heartbeat"
+            );
+        }
+
         // P0-9: fan out per-chunk read counters into the tiering engine.
         // The TieringEngine aggregates by chunk_id and uses `reads_by_dc`
         // to score migration target nodes (find_target_node).
