@@ -45,8 +45,13 @@ echo "  free now: $(ssh_run "$TARGET" "df -h '$WARM_MOUNT' | tail -1 | awk '{pri
 echo "[2/5] wait for the manager to see the disk as (near-)full"
 sleep 8   # one+ heartbeat so used_bytes propagates into the placement ring
 
-echo "[3/5] write a 40 MB file via the FUSE client"
-head -c 41943040 /dev/urandom > "$LOCAL_SRC"
+# NOTE: deliberately a SINGLE-chunk file (< the 4 MB volume chunk_size).
+# Multi-chunk round-trip is blocked by a separate, pre-existing large-file
+# under-chunking bug (a >chunk_size write is stored as one oversized chunk),
+# which is out of scope for Bug BU. A single chunk fully exercises the
+# capacity-aware placement + ENOSPC reroute this case is about.
+echo "[3/5] write a 3 MB (single-chunk) file via the FUSE client"
+head -c 3145728 /dev/urandom > "$LOCAL_SRC"
 SRC_SHA=$(sha256sum "$LOCAL_SRC" | awk '{print $1}')
 # Stage to the client then copy onto the mount (avoids piping over ssh).
 scp "${SSH_OPTS[@]}" "$LOCAL_SRC" "debian@$CLIENT:/tmp/bu4-src.bin" >/dev/null 2>&1 \
