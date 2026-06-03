@@ -585,17 +585,51 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 <!-- ── Volume edit dialog (Bug AV — AV-4-4 inline policy editor) ── -->
 <div id="volume-edit-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeVolumeEdit()">
     <div class="modal-card">
-        <h3>Edit volume cache policy</h3>
+        <h3>Edit volume policy</h3>
         <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:1rem">
-            Updates <code>cache_replicas</code> for the volume via
-            <code>POST /api/v1/volumes/{{id}}/set-cache</code>. Empty fields are left
-            unchanged. Mandatory replicas and the legacy <code>replication</code>
-            block are NOT touched here — use the CLI for those.
+            Edits mandatory replicas (<code>set-mandatory</code>), the anchor
+            policy (<code>set-anchor</code>) and cache replicas
+            (<code>set-cache</code>). Empty fields are left unchanged; each
+            section posts only when you change it. Server-side validation
+            (e.g. unsatisfiable tape / anchor) is shown below.
         </div>
         <div class="modal-row">
             <label>Volume ID</label>
             <input id="ve-volume-id" class="form-input" readonly>
         </div>
+        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Mandatory replicas (Bug BT-1)</div>
+        <div class="modal-row">
+            <label>hot</label>
+            <input id="ve-mand-hot" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label>warm</label>
+            <input id="ve-mand-warm" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label>cold</label>
+            <input id="ve-mand-cold" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label>tape</label>
+            <input id="ve-mand-tape" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Anchor (Bug BT-2)</div>
+        <div class="modal-row">
+            <label>datacenter</label>
+            <input id="ve-anchor-dc" class="form-input" type="text" placeholder="e.g. dc-a">
+        </div>
+        <div class="modal-row">
+            <label>required_tier</label>
+            <select id="ve-anchor-tier" class="form-input">
+                <option value="">(unchanged)</option>
+                <option value="hot">hot</option>
+                <option value="warm">warm</option>
+                <option value="cold">cold</option>
+                <option value="tape">tape</option>
+            </select>
+        </div>
+        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Cache replicas</div>
         <div class="modal-row">
             <label>warm.min</label>
             <input id="ve-warm-min" class="form-input" type="number" min="0" max="9" step="1">
@@ -864,11 +898,43 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         // ── Tier breakdown
         renderTierBreakdown(stats.tier_breakdown || []);
 
+        // ── Bug BT-4 — chunk placement distribution (Bug BX-6 metric)
+        renderChunkPlacement(stats.chunk_placement);
+
         // ── Scrub results (one card per node + level)
         renderScrub(stats.scrub_results_by_node || []);
 
         // ── Nodes table
         renderNodes(nodes);
+    }}
+
+    // Bug BT-4 — render the chunk placement-state distribution (Bug BX-6
+    // `/api/v1/stats.chunk_placement`) as a stacked bar + colour legend.
+    function renderChunkPlacement(cp) {{
+        const el = document.getElementById('chunk-placement-content');
+        if (!el) return;
+        if (!cp) {{ el.innerHTML = '<div class="placeholder">No chunk-placement data</div>'; return; }}
+        const buckets = [
+            ['stable','Stable','var(--success)'],
+            ['misplaced','Misplaced','var(--warning)'],
+            ['undergoal','Undergoal','#e67e22'],
+            ['overgoal','Overgoal','var(--primary)'],
+            ['missing','Missing','var(--danger)'],
+            ['pending_deletion','Pending deletion','var(--text-muted)'],
+        ];
+        const total = buckets.reduce((a, [k]) => a + (cp[k] || 0), 0) || 1;
+        let bar = '<div style="display:flex;height:14px;border-radius:6px;overflow:hidden;margin-bottom:.6rem;background:var(--border)">';
+        let legend = '<div style="display:flex;flex-wrap:wrap;gap:.75rem;font-size:.78rem">';
+        for (const [k, label, color] of buckets) {{
+            const n = cp[k] || 0;
+            const pct = n / total * 100;
+            if (n > 0) bar += `<div title="${{label}}: ${{n}}" style="width:${{pct}}%;background:${{color}}"></div>`;
+            legend += `<span style="display:inline-flex;align-items:center;gap:.3rem">`
+                + `<span style="width:.7rem;height:.7rem;border-radius:2px;background:${{color}};display:inline-block"></span>`
+                + `${{label}}: <strong>${{n.toLocaleString()}}</strong></span>`;
+        }}
+        bar += '</div>'; legend += '</div>';
+        el.innerHTML = bar + legend;
     }}
 
     function renderTierBreakdown(tiers) {{
@@ -1297,6 +1363,13 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 </thead>
                 <tbody id="tier-table"><tr><td colspan="5" class="placeholder">Loading…</td></tr></tbody>
             </table>
+        </div>
+        <div class="metric-card" style="margin-top:1rem">
+            <h3>Chunk Placement</h3>
+            <div style="font-size:.72rem;color:var(--text-muted);margin-bottom:.75rem">
+                Every logical chunk classified by its replica placement vs the volume goal (Bug BX)
+            </div>
+            <div id="chunk-placement-content"><div class="placeholder">Loading…</div></div>
         </div>
         <div class="scrub-card"><h3>Last Scrub</h3><div id="scrub-content"><div class="scrub-placeholder">No scrub result recorded yet.</div></div></div>
         <div class="table-card">
@@ -1810,6 +1883,16 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             document.getElementById('ve-promote-reads').value = cr.promote_reads || '';
             document.getElementById('ve-promote-window').value = cr.promote_window_secs || '';
             document.getElementById('ve-cooldown').value = cr.cooldown_secs || '';
+            // Bug BT-1 — prefill mandatory replicas.
+            const mr = v.mandatory_replicas || {{}};
+            document.getElementById('ve-mand-hot').value  = mr.hot  || 0;
+            document.getElementById('ve-mand-warm').value = mr.warm || 0;
+            document.getElementById('ve-mand-cold').value = mr.cold || 0;
+            document.getElementById('ve-mand-tape').value = mr.tape || 0;
+            // Bug BT-2 — prefill anchor.
+            const an = v.anchor || {{}};
+            document.getElementById('ve-anchor-dc').value = an.datacenter || '';
+            document.getElementById('ve-anchor-tier').value = an.required_tier || '';
         }}
         document.getElementById('ve-result').style.display = 'none';
         document.getElementById('volume-edit-modal').classList.remove('hidden');
@@ -1827,7 +1910,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             const raw = document.getElementById(id).value.trim();
             return raw === '' ? null : parseInt(raw, 10);
         }};
-        const body = {{
+        const cacheBody = {{
             warm_min: intOrNull('ve-warm-min'),
             warm_max: intOrNull('ve-warm-max'),
             hot_min:  intOrNull('ve-hot-min'),
@@ -1838,11 +1921,24 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             cooldown_secs:       intOrNull('ve-cooldown'),
         }};
         // Client-side guard: warm.max >= warm.min when both provided.
-        if (body.warm_min != null && body.warm_max != null
-            && body.warm_max < body.warm_min) {{
+        if (cacheBody.warm_min != null && cacheBody.warm_max != null
+            && cacheBody.warm_max < cacheBody.warm_min) {{
             alert('warm.max must be >= warm.min');
             return;
         }}
+        // Bug BT-1 — mandatory replicas (per tier).
+        const mandBody = {{
+            hot_replicas:  intOrNull('ve-mand-hot'),
+            warm_replicas: intOrNull('ve-mand-warm'),
+            cold_replicas: intOrNull('ve-mand-cold'),
+            tape_replicas: intOrNull('ve-mand-tape'),
+        }};
+        // Bug BT-2 — anchor policy.
+        const dc = document.getElementById('ve-anchor-dc').value.trim();
+        const rt = document.getElementById('ve-anchor-tier').value.trim();
+        const anchorBody = {{}};
+        if (dc !== '') anchorBody.datacenter = dc;
+        if (rt !== '') anchorBody.required_tier = rt;
 
         const btn = document.getElementById('ve-submit');
         btn.disabled = true; btn.textContent = 'Applying…';
@@ -1850,26 +1946,37 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         result.style.display = 'block';
         result.textContent = 'Submitting…';
 
-        try {{
-            const r = await fetch(`/api/v1/volumes/${{encodeURIComponent(vid)}}/set-cache`, {{
-                method: 'POST',
-                headers: {{'Content-Type': 'application/json'}},
-                body: JSON.stringify(body),
-            }});
-            const j = await r.json().catch(() => ({{error: 'invalid JSON response'}}));
-            if (!r.ok) {{
-                result.textContent = 'Error ' + r.status + ': ' + (j.error || JSON.stringify(j));
-            }} else {{
-                result.textContent = j.changed
-                    ? 'Updated. New policy:\n' + JSON.stringify(j.config, null, 2)
-                    : 'No change (request was a no-op).';
-                await renderVolumes();
+        // POST one section; return a human-readable line. Each endpoint
+        // surfaces its own server-side validation error (BM-3 tape, anchor).
+        const post = async (suffix, body) => {{
+            try {{
+                const r = await fetch(`/api/v1/volumes/${{encodeURIComponent(vid)}}/${{suffix}}`, {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify(body),
+                }});
+                const j = await r.json().catch(() => ({{error: 'invalid JSON response'}}));
+                if (!r.ok) return `${{suffix}}: Error ${{r.status}}: ${{j.error || JSON.stringify(j)}}`;
+                return `${{suffix}}: ${{j.changed ? 'updated' : 'no change'}}`;
+            }} catch (e) {{
+                return `${{suffix}}: network error: ${{e}}`;
             }}
-        }} catch (e) {{
-            result.textContent = 'Network error: ' + e;
-        }} finally {{
-            btn.disabled = false; btn.textContent = 'Apply';
+        }};
+
+        const lines = [];
+        // Only post mandatory when at least one field is set (avoid an
+        // all-null no-op being rejected as all-zero by the validator).
+        if (Object.values(mandBody).some(x => x != null)) {{
+            lines.push(await post('set-mandatory', mandBody));
         }}
+        if (Object.keys(anchorBody).length > 0) {{
+            lines.push(await post('set-anchor', anchorBody));
+        }}
+        lines.push(await post('set-cache', cacheBody));
+
+        result.textContent = lines.join('\n');
+        await renderVolumes();
+        btn.disabled = false; btn.textContent = 'Apply';
     }}
 
     // ── AZ-1 Schedules modal ──────────────────────────────────────
@@ -2749,5 +2856,35 @@ mod bug_bk_scrub_tests {
             html.contains("renderScrubCard"),
             "per-entry card renderer should be present"
         );
+    }
+
+    /// Bug BT-4 — the home page renders the chunk-placement distribution
+    /// (Bug BX-6 `stats.chunk_placement`): a card container, a render fn
+    /// wired into the stats refresh, and the six buckets in the legend.
+    #[test]
+    fn chunk_placement_panel_present() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        assert!(html.contains("id=\"chunk-placement-content\""), "panel container present");
+        assert!(html.contains("renderChunkPlacement(stats.chunk_placement)"), "render fn wired to stats");
+        for bucket in ["stable", "misplaced", "undergoal", "overgoal", "missing", "pending_deletion"] {
+            assert!(
+                html.contains(&format!("'{bucket}'")),
+                "bucket {bucket} must appear in the chunk-placement legend"
+            );
+        }
+    }
+
+    /// Bug BT-1/BT-2 — the volume-edit modal exposes mandatory replica
+    /// inputs (per tier) + an anchor section, and the submit posts to
+    /// set-mandatory / set-anchor in addition to set-cache.
+    #[test]
+    fn volume_modal_edits_mandatory_and_anchor() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        for id in ["ve-mand-hot", "ve-mand-warm", "ve-mand-cold", "ve-mand-tape", "ve-anchor-dc", "ve-anchor-tier"] {
+            assert!(html.contains(id), "modal must contain input {id}");
+        }
+        assert!(html.contains("post('set-mandatory'"), "submit posts set-mandatory");
+        assert!(html.contains("post('set-anchor'"), "submit posts set-anchor");
+        assert!(html.contains("post('set-cache'"), "submit still posts set-cache");
     }
 }

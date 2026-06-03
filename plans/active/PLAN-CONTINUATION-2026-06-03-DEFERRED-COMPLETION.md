@@ -228,6 +228,16 @@ BT-4 at `chunk_placement`.
 
 ## Verification log
 
+- **Phase 3 (BT) — 2026-06-03.** WebUI: volume-edit modal extended with per-tier
+  mandatory inputs (set-mandatory, BT-1) + anchor section (set-anchor, BT-2);
+  home "Chunk Placement" panel over stats.chunk_placement (BT-4). BT-3 was
+  delivered by BX-6 (chunk_placement) — no separate aggregator. BT-5 investigated:
+  scrub render is correct but data nodes never report scrub RESULTS to the
+  manager (ReportScrubResult applied but never produced) — forked to Bug BY
+  (spawned). Units chunk_placement_panel_present + volume_modal_edits_mandatory_
+  and_anchor PASS; deployed; release case 39-webui-replica-and-placement.sh PASS
+  (all BT markers in served HTML). See PLAN-BUG-BT Resolution.
+
 - **Phase 2 (BW) — 2026-06-03.** Root cause: `filesystem.rs` built the write
   buffer with a hardcoded 128 MB chunk size while file metadata recorded the
   4 MB volume chunk size, so >4 MB files were under-chunked and multi-chunk

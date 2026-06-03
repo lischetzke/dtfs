@@ -277,3 +277,14 @@
   volume's chunk size. Files written by a pre-fix client are already corrupt on
   disk (stored under-chunked) and must be re-ingested (re-uploaded) to be
   readable; the fix prevents new corruption but cannot repair existing files.
+- **Bug BT - WebUI replica control + chunk-placement panel.** The volume
+  editor now edits mandatory replicas per tier (set-mandatory) and the anchor
+  policy (datacenter + required_tier, set-anchor) alongside cache replicas, with
+  server-side validation surfaced inline (BT-1/BT-2). The home page gains a
+  Chunk Placement panel - a stacked bar + legend of every logical chunk's
+  placement state (stable / misplaced / undergoal / overgoal / missing /
+  pending-deletion) from the Bug BX-6 `stats.chunk_placement` metric (BT-4).
+  Known gap (filed as Bug BY): the WebUI Last Scrub card stays empty because
+  data nodes run scrubs but never report results to the manager - the
+  ReportScrubResult Raft command exists and is applied but is never produced;
+  the render + empty-state are correct.
