@@ -296,3 +296,6 @@
   in the heartbeat (ScrubResultReport), and the manager issues a
   ReportScrubResult per entry (forwarded to the leader on a follower, like the
   integrity-fault path). The WebUI render was already correct.
+- **Bug BT (follow-on) - full per-tier cache editing.** `set-cache` and the
+  WebUI volume editor now accept cold + tape cache `(min,max)` in addition to
+  warm + hot, completing the per-tier cache controls.

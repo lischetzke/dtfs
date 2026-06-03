@@ -647,6 +647,22 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <input id="ve-hot-max" class="form-input" type="number" min="0" max="9" step="1">
         </div>
         <div class="modal-row">
+            <label>cold.min (advanced)</label>
+            <input id="ve-cold-min" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label>cold.max (advanced)</label>
+            <input id="ve-cold-max" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label>tape.min (advanced)</label>
+            <input id="ve-tape-min" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label>tape.max (advanced)</label>
+            <input id="ve-tape-max" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
             <label>per_dc</label>
             <label style="font-weight:normal">
                 <input id="ve-per-dc" type="checkbox"> apply caps per datacenter
@@ -1879,6 +1895,10 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             document.getElementById('ve-warm-max').value = (cr.warm && cr.warm.max) || 0;
             document.getElementById('ve-hot-min').value  = (cr.hot  && cr.hot.min)  || 0;
             document.getElementById('ve-hot-max').value  = (cr.hot  && cr.hot.max)  || 0;
+            document.getElementById('ve-cold-min').value = (cr.cold && cr.cold.min) || 0;
+            document.getElementById('ve-cold-max').value = (cr.cold && cr.cold.max) || 0;
+            document.getElementById('ve-tape-min').value = (cr.tape && cr.tape.min) || 0;
+            document.getElementById('ve-tape-max').value = (cr.tape && cr.tape.max) || 0;
             document.getElementById('ve-per-dc').checked = cr.per_dc === true;
             document.getElementById('ve-promote-reads').value = cr.promote_reads || '';
             document.getElementById('ve-promote-window').value = cr.promote_window_secs || '';
@@ -1915,6 +1935,10 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             warm_max: intOrNull('ve-warm-max'),
             hot_min:  intOrNull('ve-hot-min'),
             hot_max:  intOrNull('ve-hot-max'),
+            cold_min: intOrNull('ve-cold-min'),
+            cold_max: intOrNull('ve-cold-max'),
+            tape_min: intOrNull('ve-tape-min'),
+            tape_max: intOrNull('ve-tape-max'),
             per_dc:   document.getElementById('ve-per-dc').checked,
             promote_reads:       intOrNull('ve-promote-reads'),
             promote_window_secs: intOrNull('ve-promote-window'),
