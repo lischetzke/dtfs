@@ -25,7 +25,7 @@ use dtfs_proto::dtfs::manager::{HeartbeatRequest, RegisterNodeRequest};
 use store::ChunkStore;
 
 #[derive(Parser, Debug)]
-#[command(name = "dtfs-data", about = "DTFS Data Node")]
+#[command(name = "dtfs-data", about = "DTFS Data Node", version = dtfs_common::version::VERSION_STRING)]
 struct Args {
     /// Path to configuration file
     #[arg(short, long, default_value = "/etc/dtfs/data.toml")]
@@ -78,6 +78,18 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(
             error = %e,
             "rescan_existing_chunks failed; bytes_stored counter starts at 0"
+        );
+    }
+
+    // Bug BU-6 — reclaim any leftover streaming *.dat.tmp files. At startup
+    // no put_chunk is in flight, so any streaming tmp is an orphan from a
+    // crash or ENOSPC-aborted put whose RAII cleanup couldn't run across the
+    // restart. Leaked tmps keep the disk full and make ENOSPC self-sustaining.
+    let reclaimed_tmps = chunk_store.reclaim_orphan_streaming_tmps();
+    if reclaimed_tmps > 0 {
+        tracing::warn!(
+            reclaimed = reclaimed_tmps,
+            "Bug BU-6 reclaimed orphaned streaming tmp files at startup"
         );
     }
 

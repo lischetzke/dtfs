@@ -26,6 +26,12 @@ xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Bug BQ-1/BU-2 unit tests use tokio's paused-clock test harness
+# (`start_paused`, `tokio::time::advance`), which lives behind the
+# `test-util` feature. `full` does NOT include it; without this the bin's
+# tests only compiled when feature-unified with another crate that pulled
+# test-util in. Pin it here so `cargo test -p dtfs-fuse` works standalone.
+tokio = { workspace = true, features = ["test-util"] }
 
 # fuse3 requires libfuse3 and is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

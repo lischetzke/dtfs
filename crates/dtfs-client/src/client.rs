@@ -323,11 +323,29 @@ impl DtfsClient {
         volume_id: &str,
         preferred_tier: &str,
     ) -> Result<AllocateChunksResponse> {
+        self.allocate_chunks_excluding(path, num_chunks, volume_id, preferred_tier, &[])
+            .await
+    }
+
+    /// Bug BU-2 — allocate with a set of gRPC addresses EXCLUDED from
+    /// placement (a node whose `put_chunk` just returned
+    /// `RESOURCE_EXHAUSTED`). The FUSE write path uses this to reroute a
+    /// chunk around a full disk instead of failing the write.
+    #[instrument(skip(self, exclude_addrs))]
+    pub async fn allocate_chunks_excluding(
+        &self,
+        path: &str,
+        num_chunks: u32,
+        volume_id: &str,
+        preferred_tier: &str,
+        exclude_addrs: &[String],
+    ) -> Result<AllocateChunksResponse> {
         let request = AllocateChunksRequest {
             path: path.to_string(),
             num_chunks,
             volume_id: volume_id.to_string(),
             preferred_tier: preferred_tier.to_string(),
+            exclude_addrs: exclude_addrs.to_vec(),
         };
         let response = self
             .call_manager("allocate_chunks", |mut c| {

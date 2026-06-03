@@ -9,7 +9,7 @@ use serde_json::Value;
 #[command(
     name = "dtfs-cli",
     about = "DTFS Administration CLI",
-    version,
+    version = dtfs_common::version::VERSION_STRING,
     long_about = "Command-line tool for administering a DTFS distributed storage cluster."
 )]
 struct Args {

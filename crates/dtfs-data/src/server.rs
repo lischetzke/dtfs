@@ -17,6 +17,46 @@ use dtfs_common::checksum;
 use dtfs_common::config::ScrubConfig;
 use tokio::sync::RwLock;
 
+/// Bug BU-6 — RAII guard that removes a streaming `.tmp` file unless
+/// disarmed. `put_chunk` arms it right after allocating the tmp and
+/// disarms it only after `commit_chunk_from_tmp` renames the tmp to its
+/// final path; any early return (ENOSPC mid-stream, client abort, error)
+/// therefore reclaims the partial tmp instead of leaking it.
+struct TmpCleanup {
+    path: Option<std::path::PathBuf>,
+}
+
+impl TmpCleanup {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TmpCleanup {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            if std::fs::remove_file(&p).is_ok() {
+                tracing::debug!(tmp = %p.display(), "Bug BU-6 reclaimed orphaned streaming tmp on error");
+            }
+        }
+    }
+}
+
+/// Bug BU/BU-3 — map a put_chunk I/O error to a typed gRPC status. A
+/// no-space error (ENOSPC, errno 28) becomes `RESOURCE_EXHAUSTED` so the
+/// client can distinguish "disk full, reroute" from a real internal
+/// fault; everything else stays `Internal`.
+fn put_io_status(ctx: &str, e: std::io::Error) -> Status {
+    if e.raw_os_error() == Some(28) {
+        Status::resource_exhausted(format!("{ctx}: disk full (ENOSPC)"))
+    } else {
+        Status::internal(format!("{ctx}: {e}"))
+    }
+}
+
 pub struct DataServiceImpl {
     config: DataNodeConfig,
     store: Arc<ChunkStore>,
@@ -242,19 +282,27 @@ impl DataService for DataServiceImpl {
             .allocate_streaming_tmp(tier)
             .map_err(|e| Status::internal(format!("allocate tmp: {e}")))?;
 
+        // Bug BU-6 — guarantee the streaming tmp is removed on ANY early
+        // return below (write/flush ENOSPC, stream error). A failed put
+        // that leaks its partial .tmp keeps the disk full, making the
+        // ENOSPC condition self-sustaining (live: 84 leaked tmps = 18.5 GB
+        // on a disk holding only 1.25 GB of committed chunks). Disarmed
+        // after a successful commit (which renames the tmp away).
+        let mut tmp_guard = TmpCleanup::new(tmp_path.clone());
+
         let mut hasher = dtfs_common::checksum::IncrementalHasher::new();
         let mut total_size: u64 = 0;
         {
-            let mut f = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
-                Status::internal(format!("create tmp {}: {e}", tmp_path.display()))
-            })?;
+            let mut f = tokio::fs::File::create(&tmp_path)
+                .await
+                .map_err(|e| put_io_status(&format!("create tmp {}", tmp_path.display()), e))?;
             // First piece (already consumed from the stream).
             if !first.data.is_empty() {
                 hasher.update(&first.data);
                 total_size += first.data.len() as u64;
                 tokio::io::AsyncWriteExt::write_all(&mut f, &first.data)
                     .await
-                    .map_err(|e| Status::internal(format!("write tmp: {e}")))?;
+                    .map_err(|e| put_io_status("write tmp", e))?;
             }
             // Remaining pieces.
             while let Some(msg) = stream
@@ -269,11 +317,11 @@ impl DataService for DataServiceImpl {
                 total_size += msg.data.len() as u64;
                 tokio::io::AsyncWriteExt::write_all(&mut f, &msg.data)
                     .await
-                    .map_err(|e| Status::internal(format!("write tmp: {e}")))?;
+                    .map_err(|e| put_io_status("write tmp", e))?;
             }
             tokio::io::AsyncWriteExt::flush(&mut f)
                 .await
-                .map_err(|e| Status::internal(format!("flush tmp: {e}")))?;
+                .map_err(|e| put_io_status("flush tmp", e))?;
             // fsync is done implicitly by commit_chunk_from_tmp before
             // the rename to the final path; we can save the duplicate
             // sync_all on the tmp.
@@ -286,6 +334,8 @@ impl DataService for DataServiceImpl {
             .commit_chunk_from_tmp(&chunk_id, &tmp_path, &vol_id, tier, total_size, hash)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        // Commit renamed the tmp to its final path; nothing to clean up.
+        tmp_guard.disarm();
 
         // Bug AL — record the write so the manager-side I/O Throughput
         // card can compute bytes/sec. Pre-fix `record_write` was
