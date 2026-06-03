@@ -410,6 +410,32 @@ impl FileWriteBuffer {
 mod tests {
     use super::*;
 
+    // Bug BW — a write larger than chunk_size MUST split into
+    // ceil(N/chunk_size) chunk-aligned segments, with the tail carrying the
+    // remainder. The writebuf logic was always correct here; the corruption
+    // came from the FUSE filesystem constructing it with a 128 MB chunk size
+    // while file metadata recorded the volume's 4 MB (filesystem.rs now drives
+    // it from config.client.chunk_size_mb). This guards the segmentation
+    // contract at a realistic 4 MB chunk size.
+    #[test]
+    fn bw_large_write_splits_into_chunk_size_segments() {
+        let chunk = 4 * 1024 * 1024; // 4 MB
+        let wb = WriteBuffer::new(chunk);
+        let data = vec![7u8; 10 * 1024 * 1024]; // 10 MB
+        wb.write("/big", 0, &data);
+
+        let segs = wb.flush_all("/big");
+        assert_eq!(segs.len(), 3, "10 MB at 4 MB chunks -> 3 segments");
+        assert_eq!(segs[0].chunk_index, 0);
+        assert_eq!(segs[1].chunk_index, 1);
+        assert_eq!(segs[2].chunk_index, 2);
+        assert_eq!(segs[0].data.len(), chunk);
+        assert_eq!(segs[1].data.len(), chunk);
+        assert_eq!(segs[2].data.len(), 2 * 1024 * 1024, "tail carries the remainder");
+        let total: usize = segs.iter().map(|s| s.data.len()).sum();
+        assert_eq!(total, data.len(), "no bytes lost across the split");
+    }
+
     #[test]
     fn test_simple_sequential_write() {
         let wb = WriteBuffer::new(10); // 10-byte chunks for testing

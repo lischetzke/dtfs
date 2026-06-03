@@ -252,3 +252,39 @@
   cluster-wide distribution of chunk placement states (missing / undergoal /
   misplaced / stable / overgoal / pending_deletion), one count per logical
   chunk - the metric the WebUI chunk-redundancy panel consumes.
+- **Bug BX (phase 2) - nearest spill, spill audit, live rebalance.** Capacity
+  spill now prefers the writer's datacenter: the FUSE client sends its location
+  in `AllocateChunksRequest.requester_location` and the ranker breaks speed ties
+  by topological distance (BX-9). Each spill records a `placement.spill` audit
+  row (BX-10). A new leader-gated scheduler pass relocates capacity-spilled
+  chunks back to goal: once the mandated tier is backfilled, the excess spill
+  copy is dropped via guarded `RemoveChunkLocation` (never below a mandated tier
+  or the anchor, never touching within-allowance cache replicas; BX-11). And
+  `stats.chunk_placement.pending_deletion` now counts chunks carrying a dangling
+  replica row (a location pointing at a deregistered node) awaiting cleanup
+  (BX-12).
+- **Bug BW - large files are chunked correctly again (data corruption fix).**
+  The FUSE write buffer split files at a hardcoded 128 MB while file metadata
+  recorded the volume chunk size (default 4 MB), so any file larger than the
+  volume chunk size was stored as one oversized chunk and reads past the first
+  chunk returned nondeterministic garbage (a 12 MB file showed chunk_count=1;
+  a 283 MB file chunk_count=3 instead of ~68). The client now derives its chunk
+  size from `[client] chunk_size_mb` (default 4, matching the workspace volume
+  default) so client chunking agrees with the recorded metadata. Verified live:
+  a 12 MB write now stores 3 chunks and reads back byte-exact via multiple read
+  paths.
+  **Special update requirement:** `[client] chunk_size_mb` MUST match the
+  volume's chunk size. Files written by a pre-fix client are already corrupt on
+  disk (stored under-chunked) and must be re-ingested (re-uploaded) to be
+  readable; the fix prevents new corruption but cannot repair existing files.
+- **Bug BT - WebUI replica control + chunk-placement panel.** The volume
+  editor now edits mandatory replicas per tier (set-mandatory) and the anchor
+  policy (datacenter + required_tier, set-anchor) alongside cache replicas, with
+  server-side validation surfaced inline (BT-1/BT-2). The home page gains a
+  Chunk Placement panel - a stacked bar + legend of every logical chunk's
+  placement state (stable / misplaced / undergoal / overgoal / missing /
+  pending-deletion) from the Bug BX-6 `stats.chunk_placement` metric (BT-4).
+  Known gap (filed as Bug BY): the WebUI Last Scrub card stays empty because
+  data nodes run scrubs but never report results to the manager - the
+  ReportScrubResult Raft command exists and is applied but is never produced;
+  the render + empty-state are correct.
