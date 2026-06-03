@@ -50,6 +50,15 @@ pub struct PlacementConfig {
     pub min_free_bytes: u64,
     #[serde(default = "default_min_free_pct")]
     pub min_free_pct: f64,
+    /// Bug BX — when the mandated tier is globally full, spill the chunk to
+    /// the fastest+nearest tier that has room (audited as `placement.spill`,
+    /// flagged misplaced, rebalanced back when capacity returns) instead of
+    /// failing the write. The anchor copy is NEVER spilled out of its
+    /// DC/tier. Default `true`: for the bursty download-ingest workload,
+    /// accepting a degraded-placement write beats dropping it. Set `false`
+    /// for a durability-first, fail-loud cluster.
+    #[serde(default = "default_allow_capacity_spill")]
+    pub allow_capacity_spill: bool,
 }
 
 impl Default for PlacementConfig {
@@ -57,6 +66,7 @@ impl Default for PlacementConfig {
         Self {
             min_free_bytes: default_min_free_bytes(),
             min_free_pct: default_min_free_pct(),
+            allow_capacity_spill: default_allow_capacity_spill(),
         }
     }
 }
@@ -853,6 +863,11 @@ fn default_min_free_bytes() -> u64 {
 }
 fn default_min_free_pct() -> f64 {
     5.0
+}
+fn default_allow_capacity_spill() -> bool {
+    // Bug BX — availability-first default: never drop a write because the
+    // mandated tier is momentarily full; spill + reconcile. Anchor exempt.
+    true
 }
 fn default_client_heartbeat_secs() -> u64 {
     // Bug BQ-1 — well under default_node_liveness_secs (30) so an idle
