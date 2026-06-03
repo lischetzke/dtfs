@@ -640,6 +640,16 @@ pub struct FuseClientConfig {
     /// the keepalive (legacy register-once behavior).
     #[serde(default = "default_client_heartbeat_secs")]
     pub heartbeat_interval_secs: u64,
+    /// Bug BW — chunk size (MB) the FUSE write buffer splits files into.
+    /// MUST match the volume's `chunk_size_bytes` (manager
+    /// `defaults.chunk_size_mb`, default 4 MB) — the manager records the
+    /// volume chunk size in file metadata and reads compute chunk offsets
+    /// from it, so a mismatch corrupts multi-chunk reads. Previously the
+    /// client hardcoded 128 MB, so a >4 MB file was stored as one oversized
+    /// chunk while metadata said 4 MB, and reads past the first 4 MB
+    /// returned garbage. Default 4 to match the workspace volume default.
+    #[serde(default = "default_client_chunk_size_mb")]
+    pub chunk_size_mb: u32,
 }
 
 impl FuseClientConfig {
@@ -868,6 +878,11 @@ fn default_allow_capacity_spill() -> bool {
     // Bug BX — availability-first default: never drop a write because the
     // mandated tier is momentarily full; spill + reconcile. Anchor exempt.
     true
+}
+fn default_client_chunk_size_mb() -> u32 {
+    // Bug BW — match the workspace volume default (`default_chunk_size` = 4 MB)
+    // so client chunking agrees with the chunk size recorded in file metadata.
+    4
 }
 fn default_client_heartbeat_secs() -> u64 {
     // Bug BQ-1 — well under default_node_liveness_secs (30) so an idle
