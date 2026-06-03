@@ -462,6 +462,25 @@ message HeartbeatRequest {
   // emit this still register successfully + heartbeat normally (older
   // path = no auto-quarantine; operator-driven via the WebUI).
   repeated IntegrityFault integrity_faults = 10;
+  // Bug BY — scrub RESULT summaries the data node completed since the last
+  // heartbeat (one per disk per quick/deep cycle). The manager issues a
+  // ClientRequest::ReportScrubResult per entry so the WebUI "Last Scrub"
+  // card + /api/v1/stats.scrub_results_by_node populate. Optional: older
+  // data nodes that don't emit this still heartbeat normally.
+  repeated ScrubResultReport scrub_results = 11;
+}
+
+// Bug BY — one completed scrub result reported by a data node. Mirrors the
+// fields of ClientRequest::ReportScrubResult / ScrubRecord.
+message ScrubResultReport {
+  string disk_path       = 1;
+  string level           = 2;  // "quick" or "deep"
+  uint64 completed_at_ms = 3;
+  uint64 chunks_checked  = 4;
+  uint64 chunks_healthy  = 5;
+  uint64 chunks_corrupt  = 6;
+  uint64 chunks_missing  = 7;
+  double duration_secs   = 8;
 }
 
 // Bug BF-1 — single integrity-fault record reported by a data node.

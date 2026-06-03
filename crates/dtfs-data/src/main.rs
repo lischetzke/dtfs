@@ -519,6 +519,23 @@ async fn manager_lifecycle(
         // failure we re-enqueue so a transient mgr outage doesn't lose
         // the signal — mirrors the Bug O re-enqueue pattern at line 514.
         let drained_faults = integrity_faults.drain();
+        // Bug BY — drain completed scrub-result summaries into the heartbeat
+        // so the manager records them (ReportScrubResult) and the WebUI
+        // "Last Scrub" card / stats.scrub_results_by_node populate.
+        let drained_scrubs = chunk_store.drain_scrub_results();
+        let scrub_results: Vec<dtfs_proto::dtfs::manager::ScrubResultReport> = drained_scrubs
+            .iter()
+            .map(|s| dtfs_proto::dtfs::manager::ScrubResultReport {
+                disk_path: s.disk_path.clone(),
+                level: s.level.clone(),
+                completed_at_ms: s.completed_at_ms,
+                chunks_checked: s.chunks_checked,
+                chunks_healthy: s.chunks_healthy,
+                chunks_corrupt: s.chunks_corrupt,
+                chunks_missing: s.chunks_missing,
+                duration_secs: s.duration_secs,
+            })
+            .collect();
         let heartbeat = HeartbeatRequest {
             node_id: node_id.clone(),
             uptime_secs: uptime,
@@ -530,6 +547,7 @@ async fn manager_lifecycle(
             total_bytes_written: io_snapshot.total_bytes_written,
             disk_usage,
             integrity_faults: drained_faults.clone(),
+            scrub_results,
         };
 
         // Bug O — after each heartbeat tick, drain any locally-quarantined
