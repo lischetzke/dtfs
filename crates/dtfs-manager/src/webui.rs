@@ -421,6 +421,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             background: var(--surface); border: 1px solid var(--border);
             border-radius: .5rem; padding: 1.25rem 1.5rem; min-width: 460px;
             max-width: 640px; box-shadow: 0 10px 40px rgba(0,0,0,.4);
+            max-height: 80vh; overflow-y: auto;
         }}
         .modal-card h3 {{ margin: 0 0 1rem; font-size: 1.05rem; }}
         .modal-row {{ display: flex; flex-direction: column; gap: .25rem; margin-bottom: .85rem; }}
