@@ -176,6 +176,14 @@ impl TaskScheduler {
         // mandatory anchor copy is created asynchronously.
         self.check_anchor_lag(&mut migration_state).await;
 
+        // 1c. Bug BX-11 — rebalance: drop EXCESS spill replicas from
+        // over-replicated chunks so a capacity-spilled chunk converges back
+        // to goal once the mandated tier has been backfilled (by 1./1b.).
+        // Only acts above mandatory_total + cache_allowance and never below a
+        // mandated tier / the anchor (pure planner + enforce_anchor on apply),
+        // so it can't under-replicate or fight the tiering engine.
+        self.check_misplaced_rebalance().await;
+
         // 2. Advance existing migration tasks through their state machine.
         self.advance_tasks(&mut migration_state).await;
 
@@ -424,6 +432,99 @@ impl TaskScheduler {
     /// `mandatory_replicas.<tier>` counter is below threshold —
     /// the anchor invariant is a separate concern (which DC the
     /// replica lives in, not how many of them exist).
+    /// Bug BX-11 — relocate-by-removal pass. Drops ONE excess spill replica
+    /// per over-replicated chunk (via the pure `plan_excess_spill_removal`,
+    /// which guards mandatory tiers + anchor + cache allowance), issuing
+    /// `RemoveChunkLocation` with `enforce_anchor` as defence-in-depth.
+    /// Bounded per tick; leader-gated by the caller. Combined with the
+    /// per-tier backfill (BX-4) + anchor-lag, a capacity-spilled chunk
+    /// converges back to its correct placement once capacity returns.
+    async fn check_misplaced_rebalance(&self) {
+        const MAX_REMOVALS_PER_TICK: usize = 50;
+
+        // Phase 1 — under a read lock, decide the safe removals.
+        let removals: Vec<(String, u64, u64, Option<dtfs_common::types::AnchorPolicy>, String)> = {
+            let sm = self.state_data.read().await;
+            let mut out = Vec::new();
+            'outer: for (path, fm) in &sm.files {
+                if fm.is_directory || fm.symlink_target.is_some() {
+                    continue;
+                }
+                let Some(vol) = sm.volumes.get(&fm.volume_id) else {
+                    continue;
+                };
+                let mandatory = vol.effective_mandatory_replicas().clone();
+                let anchor = vol.effective_anchor();
+                let cache_allow = vol.cache_replicas.hot.max
+                    + vol.cache_replicas.warm.max
+                    + vol.cache_replicas.cold.max
+                    + vol.cache_replicas.tape.max;
+
+                let mut by_idx: std::collections::BTreeMap<u64, Vec<&ChunkLocationEntry>> =
+                    std::collections::BTreeMap::new();
+                for c in &fm.chunks {
+                    by_idx.entry(c.chunk_index).or_default().push(c);
+                }
+                for (idx, entries) in by_idx {
+                    let reps: Vec<(u64, String, DiskTier)> = entries
+                        .iter()
+                        .filter_map(|e| {
+                            let nid = e.node_id.parse::<u64>().ok()?;
+                            let info = sm.nodes.get(&nid)?;
+                            let tier = info.disks.get(e.disk_id as usize).map(|d| d.tier)?;
+                            Some((nid, info.location.datacenter.clone(), tier))
+                        })
+                        .collect();
+                    if let Some(node) =
+                        plan_excess_spill_removal(&reps, &mandatory, anchor.as_ref(), cache_allow)
+                    {
+                        let chunk_hash =
+                            entries.first().map(|e| e.chunk_hash.clone()).unwrap_or_default();
+                        out.push((path.clone(), idx, node, anchor.clone(), chunk_hash));
+                        if out.len() >= MAX_REMOVALS_PER_TICK {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        // Phase 2 — issue the Raft removals (lock released).
+        for (path, idx, node, enforce, chunk_hash) in removals {
+            let req = ClientRequest::RemoveChunkLocation {
+                path: path.clone(),
+                chunk_index: idx,
+                node_id: node.to_string(),
+                enforce_anchor: enforce,
+            };
+            match self.raft.client_write(req).await {
+                Ok(_) => {
+                    info!(
+                        path = %path,
+                        idx,
+                        node,
+                        chunk = %chunk_hash,
+                        "Bug BX-11 removed an excess spill replica (rebalance toward goal)"
+                    );
+                    self.audit.log(
+                        "scheduler",
+                        "rebalance.remove_excess",
+                        &format!("chunk={chunk_hash} path={path} idx={idx} node={node}"),
+                        "removed",
+                    );
+                }
+                Err(e) => warn!(
+                    path = %path,
+                    idx,
+                    node,
+                    error = %e,
+                    "Bug BX-11 excess-replica removal failed"
+                ),
+            }
+        }
+    }
+
     async fn check_anchor_lag(&self, migration_state: &mut MigrationState) {
         let sm = self.state_data.read().await;
 

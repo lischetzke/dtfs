@@ -445,7 +445,8 @@ async fn main() -> anyhow::Result<()> {
         placement_engine.clone(),
         cluster_mgr.clone(), // Fix #2: wire heartbeat tracking into the gRPC handler
     )
-    .with_tiering(tiering_engine.clone()); // P0-9: receive per-chunk-per-DC reads
+    .with_tiering(tiering_engine.clone()) // P0-9: receive per-chunk-per-DC reads
+    .with_audit(audit_log.clone()); // Bug BX-10: placement.spill audit rows
 
     // --- Start servers ---
 

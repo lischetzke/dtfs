@@ -340,12 +340,29 @@ impl DtfsClient {
         preferred_tier: &str,
         exclude_addrs: &[String],
     ) -> Result<AllocateChunksResponse> {
+        // Bug BX-9 — send the writer's datacenter so the manager's capacity
+        // spill can prefer the NEAREST tier with room (BX-1 distance key).
+        // We only have the DC (set via `set_requester_location`); region/rack/
+        // host stay empty, which is enough for same-DC-first ranking. Absent
+        // DC => no location => legacy speed->free ordering.
+        let dc = self.inner.requester_dc.read().clone();
+        let requester_location = if dc.is_empty() {
+            None
+        } else {
+            Some(dtfs_proto::dtfs::common::Location {
+                region: String::new(),
+                datacenter: dc,
+                rack: String::new(),
+                host: String::new(),
+            })
+        };
         let request = AllocateChunksRequest {
             path: path.to_string(),
             num_chunks,
             volume_id: volume_id.to_string(),
             preferred_tier: preferred_tier.to_string(),
             exclude_addrs: exclude_addrs.to_vec(),
+            requester_location,
         };
         let response = self
             .call_manager("allocate_chunks", |mut c| {

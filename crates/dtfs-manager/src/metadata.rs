@@ -101,6 +101,10 @@ pub struct MetadataService {
             >,
         >,
     >,
+    /// Bug BX-10 — audit log for `placement.spill` rows on the allocate
+    /// path. Optional so construction order stays simple; injected via
+    /// `with_audit` from `main`.
+    audit: Option<Arc<crate::audit::AuditLog>>,
 }
 
 impl MetadataService {
@@ -121,7 +125,15 @@ impl MetadataService {
             leader_clients: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            audit: None,
         }
+    }
+
+    /// Bug BX-10 — inject the audit log so capacity spills record a
+    /// `placement.spill` row.
+    pub fn with_audit(mut self, audit: Arc<crate::audit::AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Inject the tiering engine after construction (avoids circular Arc
@@ -1264,11 +1276,22 @@ impl ManagerService for MetadataService {
                         });
                     }
                 }
-                // Requester location isn't carried in AllocateChunksRequest
-                // yet, so nearness is neutral here and ranking falls to
-                // speed -> free-space (see plan Deviations: plumb the writer
-                // location to make "nearest" effective for spill).
-                let requester = dtfs_common::topology::Location::new("", "", "", "");
+                // Bug BX-9 — the writer's location (sent by the FUSE client)
+                // makes nearness effective: same-DC candidates rank ahead of
+                // far ones at equal speed. Absent location => neutral distance
+                // => speed -> free-space ordering (legacy behaviour).
+                let requester = req
+                    .requester_location
+                    .as_ref()
+                    .map(|l| {
+                        dtfs_common::topology::Location::new(
+                            &l.region,
+                            &l.datacenter,
+                            &l.rack,
+                            &l.host,
+                        )
+                    })
+                    .unwrap_or_else(|| dtfs_common::topology::Location::new("", "", "", ""));
                 let ranked = crate::placement::rank_candidates(&candidates, &requester);
                 let Some(best) = ranked.first() else {
                     return Err(Status::unavailable(
@@ -1292,6 +1315,19 @@ impl ManagerService for MetadataService {
                     nodes = spill_nodes.len(),
                     "Bug BX-2 capacity spill: mandated tier full, placing on next-best tier (chunk will classify misplaced + be rebalanced)"
                 );
+                // Bug BX-10 — record a placement.spill audit row so the spill
+                // is visible in /api/v1/audit, not just the manager log.
+                if let Some(audit) = &self.audit {
+                    audit.log(
+                        "placement",
+                        "placement.spill",
+                        &format!(
+                            "path={} intended_tier={:?} spill_tier={:?} reason=tier_full",
+                            req.path, effective_tier, spill_tier
+                        ),
+                        "spilled",
+                    );
+                }
                 let rf = (replication as usize).min(spill_nodes.len());
                 for i in 0..req.num_chunks {
                     let primary_idx = i as usize % spill_nodes.len();
