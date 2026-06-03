@@ -220,4 +220,8 @@
   `.tmp` on every error path; data nodes also sweep leftover `*.dat.tmp`
   at startup (BU-6) — previously a disk-full put leaked its partial tmp
   (live: 84 tmps = 18.5 GB stranded), making the ENOSPC condition
-  self-sustaining.
+  self-sustaining. If a disk fills mid-write (the race BU-1's ring rebuild
+  can't pre-empt), the FUSE client now reroutes: on `RESOURCE_EXHAUSTED`
+  it re-allocates the chunk with the full node excluded
+  (`AllocateChunksRequest.exclude_addrs`) and retries on a node with room,
+  bounded to 3 reroutes, instead of failing the write (BU-2).

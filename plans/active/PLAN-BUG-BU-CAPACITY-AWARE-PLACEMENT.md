@@ -142,7 +142,7 @@ NRB downloads landing 30 GB seasons) will hit routinely.
 
 ### BU-2: Write-path fallback on ENOSPC
 
-- Status: 🟥 DEFERRED (2026-06-02 — see Deviations; BU-1 obviates the repro)
+- Status: ✅ (2026-06-03 — implemented at user request after the initial defer)
 - Files: `crates/dtfs-fuse/src/filesystem.rs` (`write_chunk` / allocate-and-write
   loop ~1475-1595), `crates/dtfs-data/src/server.rs` (`put_chunk` typed status),
   `crates/dtfs-manager/src/metadata.rs` (`allocate_chunks` honour exclusion),
@@ -265,7 +265,22 @@ NRB downloads landing 30 GB seasons) will hit routinely.
 
 ## 7. Deviations from plan
 
-- **BU-2 (FUSE re-allocate retry on ENOSPC) DEFERRED.** BU-1 makes the
+- **BU-2 was initially deferred, then implemented at the user's request
+  (2026-06-03).** Added `exclude_addrs` (field 5) to
+  `AllocateChunksRequest`; the manager builds an exclude set from those
+  addresses and, when non-empty, skips the deterministic ring path and
+  uses the capacity + exclude-filtered round-robin so the failed (full)
+  node is dropped. `dtfs-client` gained `allocate_chunks_excluding`; the
+  FUSE write path detects a `RESOURCE_EXHAUSTED` put (via the rendered
+  error chain — `client::write_chunk_bytes` surfaces `code=...`), then
+  re-allocates that one chunk excluding the full node and retries, bounded
+  to `MAX_REROUTES = 3`. Note the data node's `write_chunk_bytes` already
+  retries `RESOURCE_EXHAUSTED` for Bug G mem-shed before bubbling, so a
+  disk-full put pays a short retry before the reroute fires. Also fixed a
+  latent build bug: `dtfs-fuse`'s paused-clock tests (BQ-1, BU-2) only
+  compiled under feature-unification; added a `test-util` tokio
+  dev-dependency so `cargo test -p dtfs-fuse` works standalone.
+- **(historical) BU-2 deferral rationale.** BU-1 makes the
   manager exclude near-full disks from the placement ring AND from the
   round-robin fallback, so `allocate_chunks` no longer hands out a full
   disk — which is exactly the live repro (data01-warm full, data02-warm
