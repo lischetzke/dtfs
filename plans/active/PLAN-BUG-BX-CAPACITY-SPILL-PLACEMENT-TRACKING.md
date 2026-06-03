@@ -180,7 +180,7 @@ The user's two requirements:
 
 ### BX-1: Fastest+nearest placement-candidate ranking (pure)
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-manager/src/placement.rs` (new pure ranker),
   `crates/dtfs-common/src/topology.rs` (reuse distance), possibly
   `crates/dtfs-common/src/types.rs` (a `DiskTier::speed_rank()` helper).
@@ -197,7 +197,7 @@ The user's two requirements:
 
 ### BX-2: Policy-gated capacity spill at write time
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-manager/src/metadata.rs` (`allocate_chunks` — extend the
   BU-1 capacity path), `crates/dtfs-manager/src/placement.rs` (use BX-1 ranker),
   `crates/dtfs-manager/src/api.rs` if a spill counter is surfaced.
@@ -218,7 +218,7 @@ The user's two requirements:
 
 ### BX-3: Per-chunk placement-state classifier (pure)
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-manager/src/api.rs` (or a new
   `crates/dtfs-manager/src/placement_state.rs` module) — pure
   `classify_chunk(...) -> PlacementState` + `count_placement_states(sm) ->
@@ -236,7 +236,7 @@ The user's two requirements:
 
 ### BX-4: Fix `check_under_replicated` tier-derivation gap
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-manager/src/scheduler.rs` (`check_under_replicated`,
   ~275-360).
 - Sketch: replace the single `chunk_tier`-from-source-disk derivation with a
@@ -251,7 +251,7 @@ The user's two requirements:
 
 ### BX-5: Rebalance pass — relocate misplaced chunks (integrity-safe, bounded)
 
-- Status: ⬜
+- Status: 🟨 planner+test done; live delete-dispatcher DEFERRED (see Deviations)
 - Files: `crates/dtfs-manager/src/scheduler.rs` (new `check_misplaced` /
   `plan_rebalance` pure planner + dispatcher), reuses `ReplicationTask`,
   `RemoveChunkLocation` (`enforce_anchor`).
@@ -271,7 +271,7 @@ The user's two requirements:
 
 ### BX-6: Surface `chunk_placement` distribution in stats
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-manager/src/api.rs` (`get_stats`).
 - Sketch: add `chunk_placement: { missing, undergoal, misplaced, stable,
   overgoal, pending_deletion }` from BX-3, computed in the existing stats walk
@@ -286,7 +286,7 @@ The user's two requirements:
 
 ### BX-7: Config — spill policy + ordering knobs
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-common/src/config.rs` (extend `PlacementConfig`), optional
   per-volume override in `crates/dtfs-common/src/types.rs` (`VolumeConfig`).
 - Sketch: `allow_capacity_spill: bool` (+ any ordering knob) with
@@ -298,7 +298,7 @@ The user's two requirements:
 
 ### BX-8: Release cases + changelog + docs
 
-- Status: ⬜
+- Status: 🟨 (2026-06-03 — case 36 + changelog done; spill/rebalance e2e case deferred with BX-5)
 - Files: `tests/release/cases/NN-capacity-spill.sh`,
   `tests/release/cases/NN-placement-distribution.sh`,
   `changelog/UNRELEASED.md`, `docs/src/...` (placement/capacity ops).
@@ -334,15 +334,64 @@ The user's two requirements:
 
 ## 6. Verification log
 
-> Append per-task.
+- **BX-1/BX-3/BX-7 (2026-06-03)** — pure ranking + classifier + spill config.
+  Units `placement::bx1_ranking_tests` (3), `placement_state::tests` (7) PASS.
+- **BX-4 (2026-06-03)** — per-tier under-replication. Unit
+  `scheduler::bx4_under_replication_tests::detects_missing_mandated_tier` PASS;
+  full manager suite 173 passed, 0 failed (no regression).
+- **BX-5 (2026-06-03)** — excess-removal planner. Units
+  `scheduler::bx5_excess_removal_tests` (3) PASS. Live delete-dispatcher
+  deferred (Deviations).
+- **BX-2 (2026-06-03)** — spill placement compiles + manager suite green.
+  Live spill branch exercised only when ALL of a tier is full; not forced on
+  the lab (destructive — would require filling data02-warm too). Covered by
+  unit/compile; e2e deferred with BX-5.
+- **BX-6 (2026-06-03)** — deployed the BX manager (build 20260603-092048) to
+  all three minicluster managers. Release case
+  `tests/release/cases/36-placement-distribution.sh` STATUS: PASS;
+  `/api/v1/stats.chunk_placement` returned
+  `missing=0 undergoal=0 misplaced=121 stable=159 overgoal=0 pending_deletion=0`
+  — the metric correctly surfaces that 121 chunks lack their mandated warm-tier
+  copies while data01-warm is 100% full (the exact degraded-placement state the
+  feature exposes; classified misplaced, not lost).
+- **BX-8 (2026-06-03)** — case 36 + changelog landed; docs note + the
+  fill→spill→free→rebalance e2e case deferred with the BX-5 dispatcher.
 
 ---
 
 ## 7. Deviations from plan
 
-> Append if reality diverges (esp. the `misplaced` vs `undergoal` boundary in
-> BX-3, the spill-default decision in BX-7, and whether BX-4 fully subsumes the
-> legacy `check_under_replicated` tier derivation).
+- **Decisions taken without a round-trip** (user said "start implementing"):
+  spill default = **on** (BX-7), anchor exempt; `undergoal` = total replicas
+  below the mandatory total, `misplaced` = mandatory count met but per-tier /
+  anchor placement wrong (BX-3). Both easy to flip.
+- **BX-2 spill nearness is currently neutral.** `AllocateChunksRequest` carries
+  no writer location, so the BX-1 ranker runs with an empty `Location` and
+  ordering falls to **speed → free-space** ("fastest" met; "nearest" a no-op
+  until the writer location is plumbed). Follow-up: add `requester_location` to
+  `AllocateChunksRequest` and pass it from the FUSE client.
+- **BX-2 audits via `tracing::warn!`, not an audit-log row** (`MetadataService`
+  has no `AuditLog` handle on the allocate path). No explicit "misplaced" flag
+  is stored — the spilled chunk is *derived* misplaced by the BX-3 classifier
+  and reconciled by BX-4, so correctness doesn't depend on the audit row.
+- **BX-4 subsumes the legacy single-tier derivation.** `check_under_replicated`
+  now groups rows by `chunk_index` and schedules a copy for EVERY short mandated
+  tier (pure `under_replicated_tiers`), keying target exclusion on
+  `(node, target-tier)` so Bug BH's single-node multi-tier case still works.
+  This is the primary "relocate to correct tier" path; with `check_anchor_lag`
+  it converges most spill cases to `Stable` once capacity returns (a spill onto
+  a *mandated* tier is itself a mandated copy — nothing to undo).
+- **BX-5 live delete-dispatcher DEFERRED.** The pure cache-aware excess-removal
+  planner (`plan_excess_spill_removal`) + tests ship; wiring it to issue live
+  `RemoveChunkLocation` Raft writes is held back — deleting a replica is
+  integrity-critical (§A.6) and must not race tiering's cache demotion. The
+  planner only acts above `mandatory_total + cache_allowance` and never below a
+  mandated tier / the anchor, so it is safe in principle, but warrants its own
+  live verification before it deletes data. The ADD side (BX-4) already
+  delivers convergence; the deferred REMOVE side only trims genuinely-excess
+  spill copies (extra durability until then). Re-open with a release case that
+  fills → spills → frees → asserts the excess copy is removed without ever
+  under-replicating.
 
 ---
 

@@ -1227,9 +1227,90 @@ impl ManagerService for MetadataService {
                 })
                 .collect();
             if node_list.is_empty() {
-                return Err(Status::unavailable(format!(
-                    "No healthy data node has free space on tier {effective_tier:?} (all candidate disks below placement headroom or excluded)"
-                )));
+                // Bug BX-2 — capacity spill. The mandated tier is globally
+                // full. If spill is enabled, place on the fastest+nearest
+                // OTHER tier with room (ranked by BX-1) instead of failing the
+                // write; the chunk lands "misplaced" and the BX-5 rebalancer
+                // relocates it once the mandated tier frees. The anchor is
+                // never spilled out of its DC/tier — the async anchor-lag
+                // scheduler still places the anchor copy (a missing anchor
+                // stays visible via BV-1 anchor_pending / BX-3 misplaced).
+                if !pcfg.allow_capacity_spill {
+                    return Err(Status::unavailable(format!(
+                        "No healthy data node has free space on tier {effective_tier:?} (all candidate disks below placement headroom or excluded); capacity spill disabled"
+                    )));
+                }
+                let mut candidates: Vec<crate::placement::CandidateDisk> = Vec::new();
+                for (id, info) in &data.nodes {
+                    if info.health != dtfs_common::types::HealthStatus::Healthy {
+                        continue;
+                    }
+                    if exclude_set.contains(&norm_addr(&info.grpc_addr)) {
+                        continue;
+                    }
+                    for d in &info.disks {
+                        if d.tier == effective_tier {
+                            continue; // the mandated tier is the full one
+                        }
+                        if !pcfg.has_room(d.total_bytes, d.used_bytes) {
+                            continue;
+                        }
+                        candidates.push(crate::placement::CandidateDisk {
+                            node_id: *id,
+                            disk_id: d.disk_id,
+                            tier: d.tier,
+                            location: info.location.clone(),
+                            free_bytes: d.total_bytes.saturating_sub(d.used_bytes),
+                        });
+                    }
+                }
+                // Requester location isn't carried in AllocateChunksRequest
+                // yet, so nearness is neutral here and ranking falls to
+                // speed -> free-space (see plan Deviations: plumb the writer
+                // location to make "nearest" effective for spill).
+                let requester = dtfs_common::topology::Location::new("", "", "", "");
+                let ranked = crate::placement::rank_candidates(&candidates, &requester);
+                let Some(best) = ranked.first() else {
+                    return Err(Status::unavailable(
+                        "No data node has free space on ANY tier (cluster full); cannot spill",
+                    ));
+                };
+                let spill_tier = best.tier;
+                let mut spill_nodes: Vec<&dtfs_raft::NodeInfo> = Vec::new();
+                let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                for c in ranked.iter().filter(|c| c.tier == spill_tier) {
+                    if seen.insert(c.node_id) {
+                        if let Some(n) = data.nodes.get(&c.node_id) {
+                            spill_nodes.push(n);
+                        }
+                    }
+                }
+                tracing::warn!(
+                    path = %req.path,
+                    intended_tier = ?effective_tier,
+                    spill_tier = ?spill_tier,
+                    nodes = spill_nodes.len(),
+                    "Bug BX-2 capacity spill: mandated tier full, placing on next-best tier (chunk will classify misplaced + be rebalanced)"
+                );
+                let rf = (replication as usize).min(spill_nodes.len());
+                for i in 0..req.num_chunks {
+                    let primary_idx = i as usize % spill_nodes.len();
+                    let primary = spill_nodes[primary_idx];
+                    let mut replica_addresses = Vec::new();
+                    for r in 1..rf {
+                        let replica_idx = (primary_idx + r) % spill_nodes.len();
+                        if replica_idx != primary_idx {
+                            replica_addresses.push(spill_nodes[replica_idx].grpc_addr.clone());
+                        }
+                    }
+                    placements.push(ChunkPlacement {
+                        chunk_index: i,
+                        primary_address: primary.grpc_addr.clone(),
+                        replica_addresses,
+                        tier: chunk_placement_tier_string(spill_tier),
+                    });
+                }
+                return Ok(Response::new(AllocateChunksResponse { placements }));
             }
             let rf = (replication as usize).min(node_list.len());
 
