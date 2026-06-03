@@ -129,6 +129,24 @@ impl ScrubScheduler {
                         result.duration_secs,
                     );
 
+                    // Bug BY — queue the scrub RESULT summary so the next
+                    // heartbeat ships it to the manager (the WebUI "Last
+                    // Scrub" card + stats.scrub_results_by_node consume it).
+                    let completed_at_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    self.store.enqueue_scrub_result(crate::store::ScrubResultSummary {
+                        disk_path: disk_path.display().to_string(),
+                        level: level_str.to_string(),
+                        completed_at_ms,
+                        chunks_checked: result.chunks_checked,
+                        chunks_healthy: result.chunks_healthy,
+                        chunks_corrupt: result.chunks_corrupt,
+                        chunks_missing: result.chunks_missing,
+                        duration_secs: result.duration_secs,
+                    });
+
                     // Bug O — quarantine the offending local chunks
                     // and enqueue them so the next heartbeat can tell
                     // the manager. The manager's Raft state machine

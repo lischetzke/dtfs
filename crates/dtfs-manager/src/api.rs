@@ -1532,6 +1532,17 @@ pub(crate) struct SetCacheRequest {
     pub warm_max: Option<u32>,
     pub hot_min: Option<u32>,
     pub hot_max: Option<u32>,
+    // Bug BT (follow-on) — full per-tier cache editing. Cold/tape cache is
+    // atypical (cold is usually mandatory, tape isn't a cache target) but
+    // exposing it completes the volume editor.
+    #[serde(default)]
+    pub cold_min: Option<u32>,
+    #[serde(default)]
+    pub cold_max: Option<u32>,
+    #[serde(default)]
+    pub tape_min: Option<u32>,
+    #[serde(default)]
+    pub tape_max: Option<u32>,
     pub per_dc: Option<bool>,
     pub promote_reads: Option<u32>,
     pub promote_window_secs: Option<u64>,
@@ -1553,6 +1564,10 @@ pub(crate) fn apply_set_cache(
     if let Some(m) = req.warm_max { next.cache_replicas.warm.max = m; }
     if let Some(m) = req.hot_min  { next.cache_replicas.hot.min  = m; }
     if let Some(m) = req.hot_max  { next.cache_replicas.hot.max  = m; }
+    if let Some(m) = req.cold_min { next.cache_replicas.cold.min = m; }
+    if let Some(m) = req.cold_max { next.cache_replicas.cold.max = m; }
+    if let Some(m) = req.tape_min { next.cache_replicas.tape.min = m; }
+    if let Some(m) = req.tape_max { next.cache_replicas.tape.max = m; }
     if let Some(v) = req.per_dc   { next.cache_replicas.per_dc   = v; }
     if let Some(v) = req.promote_reads
         { next.cache_replicas.promote_reads = v; }
@@ -4031,6 +4046,27 @@ mod bug_av_set_cache_tests {
         let req = SetCacheRequest::default();
         let next = apply_set_cache(&current, &req).expect("empty req is valid");
         assert_eq!(current, next);
+    }
+
+    // Bug BT follow-on — cold + tape cache tiers are editable via set-cache.
+    #[test]
+    fn set_cache_applies_cold_and_tape() {
+        let current = legacy_volume();
+        let req = SetCacheRequest {
+            cold_min: Some(1),
+            cold_max: Some(2),
+            tape_min: Some(0),
+            tape_max: Some(1),
+            ..Default::default()
+        };
+        let next = apply_set_cache(&current, &req).expect("valid cold/tape update");
+        assert_eq!(next.cache_replicas.cold.min, 1);
+        assert_eq!(next.cache_replicas.cold.max, 2);
+        assert_eq!(next.cache_replicas.tape.min, 0);
+        assert_eq!(next.cache_replicas.tape.max, 1);
+        // max < min still rejected for the new tiers.
+        let bad = SetCacheRequest { cold_min: Some(3), cold_max: Some(1), ..Default::default() };
+        assert!(apply_set_cache(&current, &bad).unwrap_err().contains("cold"));
     }
 
     /// AV-3-5 test 4 — the JSON projection includes the new AV
