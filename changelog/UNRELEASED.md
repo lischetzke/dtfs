@@ -288,3 +288,11 @@
   data nodes run scrubs but never report results to the manager - the
   ReportScrubResult Raft command exists and is applied but is never produced;
   the render + empty-state are correct.
+- **Bug BY - the WebUI "Last Scrub" card populates (scrub-result reporting).**
+  Data nodes ran scrubs but never reported the RESULTS to the manager: the
+  ReportScrubResult Raft command existed and was applied + surfaced by the API,
+  but nothing produced it, so /api/v1/stats.scrub_results_by_node was always
+  empty. Data nodes now ship completed scrub summaries (per disk, quick/deep)
+  in the heartbeat (ScrubResultReport), and the manager issues a
+  ReportScrubResult per entry (forwarded to the leader on a follower, like the
+  integrity-fault path). The WebUI render was already correct.
