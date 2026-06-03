@@ -180,7 +180,7 @@ The user's two requirements:
 
 ### BX-1: Fastest+nearest placement-candidate ranking (pure)
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-manager/src/placement.rs` (new pure ranker),
   `crates/dtfs-common/src/topology.rs` (reuse distance), possibly
   `crates/dtfs-common/src/types.rs` (a `DiskTier::speed_rank()` helper).
@@ -218,7 +218,7 @@ The user's two requirements:
 
 ### BX-3: Per-chunk placement-state classifier (pure)
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-manager/src/api.rs` (or a new
   `crates/dtfs-manager/src/placement_state.rs` module) — pure
   `classify_chunk(...) -> PlacementState` + `count_placement_states(sm) ->
@@ -286,7 +286,7 @@ The user's two requirements:
 
 ### BX-7: Config — spill policy + ordering knobs
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-common/src/config.rs` (extend `PlacementConfig`), optional
   per-volume override in `crates/dtfs-common/src/types.rs` (`VolumeConfig`).
 - Sketch: `allow_capacity_spill: bool` (+ any ordering knob) with

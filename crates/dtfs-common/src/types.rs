@@ -109,6 +109,21 @@ pub enum DiskTier {
     Tape,
 }
 
+impl DiskTier {
+    /// Bug BX — media speed rank, lower = faster. Used to order capacity
+    /// spill candidates so a chunk that can't fit on its mandated tier
+    /// lands on the FASTEST tier with room (hot before warm before cold
+    /// before tape) rather than just "any tier".
+    pub fn speed_rank(&self) -> u8 {
+        match self {
+            DiskTier::Hot => 0,
+            DiskTier::Warm => 1,
+            DiskTier::Cold => 2,
+            DiskTier::Tape => 3,
+        }
+    }
+}
+
 impl fmt::Display for DiskTier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

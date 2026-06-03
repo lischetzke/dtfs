@@ -19,6 +19,7 @@ mod join;
 mod metadata;
 mod monitor;
 mod placement;
+mod placement_state;
 mod scheduler;
 mod server;
 mod shutdown;
