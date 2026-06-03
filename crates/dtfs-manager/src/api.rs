@@ -380,20 +380,95 @@ pub(crate) fn node_tier_used(
         .collect()
 }
 
+/// Bug BV-3 — number of registered data-plane nodes (role==Data only).
+/// The shared predicate behind both `cluster_status.data_nodes` and
+/// `stats.data_node_count`, so the two endpoints never disagree.
+fn count_data_nodes(sm: &StateMachineData) -> usize {
+    sm.nodes.values().filter(|n| n.role == NodeRole::Data).count()
+}
+
+/// Bug BV-1 — files that have chunks but whose mandatory ANCHOR replica
+/// isn't placed yet. `write_safety.min_replicas_before_ack` counts ANY
+/// replicas toward the ack threshold, so a write can ack on warm replicas
+/// before the cold anchor copy lands (convergence is async via the
+/// anchor-lag scheduler). `files_missing_chunks:0` then hides this: the
+/// chunks exist, just not on the anchor. This read-path projection makes
+/// the anchor-pending state honest WITHOUT changing ack timing.
+///
+/// A file is anchor-pending when its volume has an effective anchor and
+/// at least one of its chunks has no replica in the anchor DC on the
+/// required tier (mirrors `scheduler::plan_anchor_lag_repair`'s gate-1
+/// satisfaction check). Counted once per file.
+/// Bug BV-1 — does any replica satisfy the anchor? A `(datacenter, tier)`
+/// list satisfies an `AnchorPolicy` when some replica sits in the anchor
+/// DC and (if `required_tier` is set) on that tier. Mirrors gate-1 of
+/// `scheduler::plan_anchor_lag_repair`. Pure, so it's unit-tested directly.
+fn anchor_satisfied_by(
+    placements: &[(String, dtfs_common::types::DiskTier)],
+    anchor: &dtfs_common::types::AnchorPolicy,
+) -> bool {
+    placements.iter().any(|(dc, tier)| {
+        dc == &anchor.datacenter
+            && match anchor.required_tier {
+                Some(t) => *tier == t,
+                None => true,
+            }
+    })
+}
+
+fn count_anchor_pending_files(sm: &StateMachineData) -> usize {
+    use std::collections::BTreeMap;
+    let mut pending = 0usize;
+    for file_meta in sm.files.values() {
+        let Some(volume) = sm.volumes.get(&file_meta.volume_id) else {
+            continue;
+        };
+        let Some(anchor) = volume.effective_anchor() else {
+            continue;
+        };
+        let mut by_idx: BTreeMap<u64, Vec<&dtfs_raft::ChunkLocationEntry>> = BTreeMap::new();
+        for c in &file_meta.chunks {
+            by_idx.entry(c.chunk_index).or_default().push(c);
+        }
+        let any_chunk_unanchored = by_idx.values().any(|entries| {
+            let placements: Vec<(String, dtfs_common::types::DiskTier)> = entries
+                .iter()
+                .filter_map(|e| {
+                    let nid = e.node_id.parse::<u64>().ok()?;
+                    let info = sm.nodes.get(&nid)?;
+                    let tier = info.disks.get(e.disk_id as usize).map(|d| d.tier)?;
+                    Some((info.location.datacenter.clone(), tier))
+                })
+                .collect();
+            !anchor_satisfied_by(&placements, &anchor)
+        });
+        if any_chunk_unanchored {
+            pending += 1;
+        }
+    }
+    pending
+}
+
 async fn cluster_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let sm = state.sm_data.read().await;
-    let node_count = sm.nodes.len();
     let file_count = sm.files.len();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let window = state.config.raft.node_liveness_secs;
+    // Bug BV-3 — `data_nodes` must count only role==Data, matching
+    // `stats.data_node_count`. Pre-fix it was `sm.nodes.len()`, so a
+    // 3-manager + 2-data + 1-client roster reported `data_nodes:6`
+    // (and `data_nodes_healthy:6`) — misleading operators/monitoring.
+    let node_count = count_data_nodes(&sm);
     // Bug BP-3 — count effective (liveness-projected) health, not the stale
     // stored value, so a frozen-heartbeat node is not counted Healthy.
+    // Bug BV-3 — restricted to role==Data (was every node).
     let healthy_count = sm
         .nodes
         .values()
+        .filter(|n| n.role == NodeRole::Data)
         .filter(|n| {
             effective_health(n.health, n.last_seen_ms, now_ms, window)
                 == dtfs_common::types::HealthStatus::Healthy
@@ -423,6 +498,11 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> Json<Value> {
         "data_nodes_healthy": healthy_count,
         "files": file_count,
         "files_missing_chunks": files_missing_chunks,
+        // Bug BV-1 — files whose mandatory anchor copy hasn't landed yet
+        // (chunks exist on non-anchor replicas; convergence is async). Not
+        // data loss, so it does NOT degrade the top-line status — but it is
+        // surfaced so `files_missing_chunks:0` no longer hides it.
+        "anchor_pending": count_anchor_pending_files(&sm),
         "total_capacity": total_capacity,
         "used_capacity": used_capacity,
         "config_version": sm.cluster_config.version,
@@ -3110,6 +3190,9 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         // excludes them; the counter is what the WebUI badge reads.
         "quarantined_nodes":     quarantined_nodes,
         "total_nodes":           total_nodes,
+        // Bug BV-1 — files whose mandatory anchor copy hasn't landed yet
+        // (durability-pending, async convergence; not data loss).
+        "anchor_pending":        count_anchor_pending_files(&sm),
         // Bug BH-8 — banner ratio over cluster infrastructure only
         // (managers + data); clients are consumers, not cluster health.
         // Numerator/denominator are taken from one explicit set so they
@@ -4280,5 +4363,75 @@ mod bug_av_set_mandatory_tests {
         let req = SetMandatoryRequest::default();
         let next = apply_set_mandatory(&current, &req).expect("empty req valid");
         assert_eq!(current, next);
+    }
+}
+
+#[cfg(test)]
+mod bug_bv3_data_node_count_tests {
+    use super::*;
+
+    fn node_role(role: dtfs_common::types::NodeRole) -> dtfs_raft::NodeInfo {
+        dtfs_raft::NodeInfo {
+            hostname: String::new(),
+            grpc_addr: String::new(),
+            role,
+            disks: Vec::new(),
+            location: dtfs_common::topology::Location::new("", "", "", ""),
+            health: dtfs_common::types::HealthStatus::Healthy,
+            total_capacity: 0,
+            used_capacity: 0,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    // Bug BV-3 — `cluster_status.data_nodes` must count only role==Data,
+    // matching `stats.data_node_count`. Pre-fix it used `sm.nodes.len()`,
+    // so a 3-manager + 2-data + 1-client roster reported 6.
+    #[test]
+    fn counts_only_role_data() {
+        use dtfs_common::types::NodeRole;
+        let mut sm = dtfs_raft::state_machine::StateMachineData::default();
+        sm.nodes.insert(1, node_role(NodeRole::Manager));
+        sm.nodes.insert(2, node_role(NodeRole::Manager));
+        sm.nodes.insert(3, node_role(NodeRole::Manager));
+        sm.nodes.insert(4, node_role(NodeRole::Data));
+        sm.nodes.insert(5, node_role(NodeRole::Data));
+        sm.nodes.insert(6, node_role(NodeRole::Client));
+        assert_eq!(
+            count_data_nodes(&sm),
+            2,
+            "3 manager + 2 data + 1 client must report 2 data nodes"
+        );
+    }
+
+    // Bug BV-1 — anchor satisfaction: a chunk replicated only on warm in a
+    // non-anchor DC is NOT anchored for a {dc-a, cold} policy (the live F4
+    // case: write acked on 2 warm in dc-b, no cold copy in dc-a).
+    #[test]
+    fn bv1_anchor_satisfied_by_tier_and_dc() {
+        use dtfs_common::types::{AnchorPolicy, DiskTier};
+        let anchor = AnchorPolicy {
+            datacenter: "dc-a".into(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        // Only warm in dc-b -> not anchored.
+        assert!(!anchor_satisfied_by(&[("dc-b".into(), DiskTier::Warm)], &anchor));
+        // Warm in dc-a but wrong tier -> not anchored.
+        assert!(!anchor_satisfied_by(&[("dc-a".into(), DiskTier::Warm)], &anchor));
+        // Cold in dc-a -> anchored.
+        assert!(anchor_satisfied_by(
+            &[("dc-b".into(), DiskTier::Warm), ("dc-a".into(), DiskTier::Cold)],
+            &anchor
+        ));
+        // required_tier None -> any replica in the anchor DC satisfies.
+        let any_tier = AnchorPolicy { datacenter: "dc-a".into(), required_tier: None };
+        assert!(anchor_satisfied_by(&[("dc-a".into(), DiskTier::Warm)], &any_tier));
+        assert!(!anchor_satisfied_by(&[("dc-b".into(), DiskTier::Cold)], &any_tier));
     }
 }
