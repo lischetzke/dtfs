@@ -195,3 +195,47 @@
   `effective_health` (BP-3) instead of appearing perpetually alive. The
   self-register is audit-idempotent (Bug BJ): steady-state keepalive adds
   no audit rows; an upgrade logs once.
+- **Bug BS — dev `BUILD_DATE` reflects each build again.** The stamp was
+  frozen at the first-ever build (`build.rs` gated re-runs on
+  `rerun-if-changed=build.rs`), so every node reported an identical, stale
+  `build_date` and "is the new binary deployed?" was unanswerable. The
+  authoritative build wrappers (`scripts/build-linux-amd64.sh`,
+  `scripts/dtfs-build.sh`) now export `SOURCE_DATE_EPOCH=$(date -u +%s)`,
+  which `build.rs` already honours via `rerun-if-env-changed`, so each
+  wrapper build re-stamps without forcing a full rebuild on plain
+  `cargo build`. Reproducible-build pins (caller-set `SOURCE_DATE_EPOCH`)
+  still produce a fixed stamp. Every binary now reports its build via
+  `dtfs-* --version` (`v0.0.0-dev (built YYYYMMDD-HHmmss)`).
+- **Bug BU — writes route around full disks (capacity-aware placement).**
+  The placement ring weighted disks by *total* capacity and never checked
+  free space, so a 100%-full disk kept full ring weight and every chunk
+  that hashed to it hard-failed with `No space left on device` (ENOSPC) —
+  returning EIO to the client and unlinking the file — even when a peer
+  disk had abundant room. The ring now weights by *available* bytes and
+  excludes any disk whose free space is below a configurable headroom
+  (`[placement] min_free_bytes`/`min_free_pct`, default reserve
+  `max(1 GiB, 5%)`); the round-robin allocation fallback applies the same
+  filter. `put_chunk` now returns a typed `RESOURCE_EXHAUSTED` (not opaque
+  `Internal`) when a disk is full, and reclaims its partial streaming
+  `.tmp` on every error path; data nodes also sweep leftover `*.dat.tmp`
+  at startup (BU-6) — previously a disk-full put leaked its partial tmp
+  (live: 84 tmps = 18.5 GB stranded), making the ENOSPC condition
+  self-sustaining. If a disk fills mid-write (the race BU-1's ring rebuild
+  can't pre-empt), the FUSE client now reroutes: on `RESOURCE_EXHAUSTED`
+  it re-allocates the chunk with the full node excluded
+  (`AllocateChunksRequest.exclude_addrs`) and retries on a node with room,
+  bounded to 3 reroutes, instead of failing the write (BU-2).
+- **Bug BV — anchor-pending visibility, tiering zero-threshold semantics,
+  data-node count fix.** (BV-1) `/api/v1/stats` and
+  `/api/v1/cluster/status` now report `anchor_pending`: files whose
+  mandatory anchor copy hasn't landed yet (chunks exist on non-anchor
+  replicas; convergence is async). This is durability-pending, not data
+  loss, so it does not degrade the top-line status, but it stops
+  `files_missing_chunks:0` from hiding it. Write-ack semantics are
+  unchanged. (BV-2) `cache_replicas.promote_reads = 0` now means
+  "promotion disabled" instead of "promote on every read" — the
+  threshold gate previously read `count < 0` (always false), so a
+  zeroed threshold made the tiering engine promote on any (or zero)
+  reads. (BV-3) `cluster_status.data_nodes`/`data_nodes_healthy` now
+  count only `role==Data`, matching `stats.data_node_count` (a
+  3-manager + 2-data + 1-client roster reported `data_nodes:6`).

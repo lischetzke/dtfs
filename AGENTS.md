@@ -285,6 +285,46 @@ list_directory aggregation, lease lifecycle, or put_chunk buffering** —
 those areas have subtle interactions and the doc captures the lessons
 learned.
 
+### A.3.6 Dev-build date freshness (HARD REQUIREMENT)
+
+**Every dev build MUST stamp its own build instant into `BUILD_DATE`.**
+Two binaries built at different times MUST report different
+`BUILD_DATE` values. This is non-negotiable: `VERSION` is pinned at
+`v0.0.0-dev`, so `BUILD_DATE` is the *only* field that distinguishes
+one dev build from another — in the WebUI node table, in logs
+(`version_string()`), and in the manager node registry. A stale
+`BUILD_DATE` makes "is the new binary actually deployed?" unanswerable.
+
+**Mechanism (Bug BS, shipped).** `dtfs-common/build.rs` emits
+`DTFS_BUILD_DATE` from `SOURCE_DATE_EPOCH` (falling back to
+`SystemTime::now()` when unset) and declares
+`cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH`. The authoritative build
+wrappers — `scripts/build-linux-amd64.sh` and `scripts/dtfs-build.sh` —
+`export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date -u +%s)}"` before
+`cargo build`, so every wrapper invocation passes a fresh instant, cargo
+re-runs the build script, and the stamp refreshes — two wrapper builds a
+minute apart get two distinct `BUILD_DATE` values. A plain `cargo build`
+with the var unset leaves the cached stamp untouched, so local
+incremental builds stay fast (the pre-BS bug was
+`rerun-if-changed=build.rs`, which froze the stamp at the first-ever
+build, e.g. `20260522-131629` clusterwide).
+
+**Release / deploy builds MUST go through a wrapper** (or otherwise
+export `SOURCE_DATE_EPOCH`) so the deployed binary carries the real
+build instant. A bare `cargo build --release` on the builder will report
+a stale date — acceptable for local iteration, never for a build you
+deploy. Each binary now reports its stamp via `--version`
+(`dtfs-* --version` → `v0.0.0-dev (built YYYYMMDD-HHmmss)`, from
+`dtfs_common::version::VERSION_STRING`), so you can confirm a deployed
+binary's date directly against `/api/v1/nodes`.
+
+**Guard:** `scripts/tests/test-build-date-fresh.sh` asserts both
+properties (distinct instants → distinct stamp; pinned
+`SOURCE_DATE_EPOCH` → reproducible stamp). Reproducible-build
+environments that pin `SOURCE_DATE_EPOCH` are the one sanctioned
+exception (the stamp is intentionally fixed there) — the wrapper honours
+a caller-set value rather than overwriting it.
+
 ---
 
 ## A.4 Build / Test / Deploy mechanics
@@ -301,6 +341,14 @@ cd /home/debian/dtfs2
 cargo build --release --workspace
 cargo test  --release --workspace
 ```
+
+**Builds you intend to deploy MUST go through a wrapper**
+(`scripts/build-linux-amd64.sh` or `scripts/dtfs-build.sh`), which exports
+`SOURCE_DATE_EPOCH` so `BUILD_DATE` reflects the build instant (Bug BS,
+§A.3.6). A bare `cargo build --release` is fine for iteration but stamps a
+stale date. To re-stamp a manual build, prefix it:
+`SOURCE_DATE_EPOCH=$(date -u +%s) cargo build --release …`. Confirm a
+binary's stamp with `dtfs-<bin> --version`.
 
 Per-crate test:
 

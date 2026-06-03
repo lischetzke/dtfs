@@ -30,6 +30,55 @@ pub struct ManagerConfig {
     /// previously in `metadata.rs`.
     #[serde(default)]
     pub scrub: ClusterScrubConfig,
+    /// Bug BU — free-space headroom for capacity-aware placement. A disk
+    /// whose free space is below the headroom is excluded from the
+    /// placement ring so new chunks route to a disk that can hold them.
+    #[serde(default)]
+    pub placement: PlacementConfig,
+}
+
+/// Bug BU — capacity-aware placement headroom.
+///
+/// A disk is "full for placement" when its free space drops below
+/// `max(min_free_bytes, total * min_free_pct%)`. Such a disk is excluded
+/// from the placement ring (manager) and rejected by `put_chunk` (data)
+/// so new writes route to a disk with room instead of hard-failing on
+/// ENOSPC. Defaults reserve `max(1 GiB, 5%)` per disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacementConfig {
+    #[serde(default = "default_min_free_bytes")]
+    pub min_free_bytes: u64,
+    #[serde(default = "default_min_free_pct")]
+    pub min_free_pct: f64,
+}
+
+impl Default for PlacementConfig {
+    fn default() -> Self {
+        Self {
+            min_free_bytes: default_min_free_bytes(),
+            min_free_pct: default_min_free_pct(),
+        }
+    }
+}
+
+impl PlacementConfig {
+    /// Bytes that must stay free on a disk of the given total size.
+    pub fn headroom_bytes(&self, total_bytes: u64) -> u64 {
+        let pct = ((total_bytes as f64) * self.min_free_pct / 100.0) as u64;
+        self.min_free_bytes.max(pct)
+    }
+
+    /// True when the disk has room for a new chunk: free space stays
+    /// strictly above the headroom reserve. A `total_bytes == 0` disk
+    /// (capacity not yet reported) is treated as having room so a node
+    /// that hasn't run statvfs yet isn't spuriously excluded.
+    pub fn has_room(&self, total_bytes: u64, used_bytes: u64) -> bool {
+        if total_bytes == 0 {
+            return true;
+        }
+        let free = total_bytes.saturating_sub(used_bytes);
+        free > self.headroom_bytes(total_bytes)
+    }
 }
 
 /// Bug AH — audit log replication configuration.
@@ -118,6 +167,11 @@ pub struct DataNodeConfig {
     /// `#[serde(default)]` so old config files keep working.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Bug BU — free-space headroom; `put_chunk` rejects a write to a
+    /// disk under headroom with a typed `RESOURCE_EXHAUSTED` so the
+    /// client can reroute, rather than streaming until the kernel ENOSPCs.
+    #[serde(default)]
+    pub placement: PlacementConfig,
 }
 
 /// Hard memory budget for the data node process.
@@ -794,6 +848,12 @@ fn default_tiering_interval() -> u64 {
 fn default_heartbeat_secs() -> u64 {
     5
 }
+fn default_min_free_bytes() -> u64 {
+    1024 * 1024 * 1024 // 1 GiB
+}
+fn default_min_free_pct() -> f64 {
+    5.0
+}
 fn default_client_heartbeat_secs() -> u64 {
     // Bug BQ-1 — well under default_node_liveness_secs (30) so an idle
     // client re-registers ~3x per liveness window and never flaps Down.
@@ -873,6 +933,35 @@ pub fn load_config<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Bug BU — headroom classification at the threshold boundary.
+    #[test]
+    fn bu3_placement_has_room_boundary() {
+        // 20 GiB disk, default reserve = max(1 GiB, 5% of 20 GiB = 1 GiB) = 1 GiB.
+        let cfg = PlacementConfig::default();
+        let total = 20 * 1024 * 1024 * 1024u64;
+        let reserve = cfg.headroom_bytes(total);
+        assert_eq!(reserve, 1024 * 1024 * 1024, "5% of 20GiB == 1GiB == min_free_bytes");
+
+        // Free == reserve -> NOT room (strict >).
+        let used_at_reserve = total - reserve;
+        assert!(!cfg.has_room(total, used_at_reserve), "free == reserve is full");
+        // Free just above reserve -> room.
+        assert!(cfg.has_room(total, used_at_reserve - 1));
+        // Disk literally full -> no room.
+        assert!(!cfg.has_room(total, total));
+        // Unreported capacity (total 0) -> treated as room (not yet measured).
+        assert!(cfg.has_room(0, 0));
+    }
+
+    // Bug BU — percentage reserve dominates on a large disk.
+    #[test]
+    fn bu3_placement_pct_dominates_on_large_disk() {
+        let cfg = PlacementConfig::default(); // 1 GiB / 5%
+        let total = 1024 * 1024 * 1024 * 1024u64; // 1 TiB
+        // 5% of 1 TiB ~= 52 GiB > 1 GiB, so the pct reserve wins.
+        assert_eq!(cfg.headroom_bytes(total), (total as f64 * 0.05) as u64);
+    }
 
     #[test]
     fn test_parse_data_node_config() {

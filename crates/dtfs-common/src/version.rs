@@ -18,3 +18,11 @@ pub const BUILD_DATE: &str = env!("DTFS_BUILD_DATE");
 pub fn version_string() -> String {
     format!("{VERSION} (built {BUILD_DATE})")
 }
+
+/// Compile-time equivalent of [`version_string`] for use where a
+/// `&'static str` is required (e.g. clap's `#[command(version = ...)]`),
+/// so `dtfs-* --version` reports the build date an operator can compare
+/// against `/api/v1/nodes`. The literal must match [`VERSION`]; concat!
+/// cannot interpolate a const ident, only literals + macro output.
+pub const VERSION_STRING: &str =
+    concat!("v0.0.0-dev (built ", env!("DTFS_BUILD_DATE"), ")");

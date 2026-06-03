@@ -1521,7 +1521,7 @@ impl DtfsFilesystem {
         // ends up with N location entries — that's what actually makes
         // replication-factor=N real (fix for F-010).
         for (i, segment) in segments.iter().enumerate() {
-            let placement = alloc_response
+            let mut placement = alloc_response
                 .placements
                 .get(i)
                 .with_context(|| {
@@ -1530,75 +1530,120 @@ impl DtfsFilesystem {
                         alloc_response.placements.len(),
                         segments.len()
                     )
-                })?;
+                })?
+                .clone();
 
-            let mut targets: Vec<String> = Vec::with_capacity(1 + placement.replica_addresses.len());
-            targets.push(placement.primary_address.clone());
-            for r in &placement.replica_addresses {
-                if !targets.contains(r) {
-                    targets.push(r.clone());
-                }
-            }
-            let rf = targets.len();
-            let min_ok = ((rf + 1) / 2).max(1);
+            // Bug BU-2 — bounded reroute. If the assigned placement can't
+            // accept the write because its target-tier disk is full
+            // (put_chunk returns RESOURCE_EXHAUSTED), re-allocate this chunk
+            // with the full node excluded and retry on a node with room,
+            // instead of failing the write and unlinking the file. BU-1
+            // already keeps full disks out of the ring, so this only fires
+            // on the fill-mid-write race.
+            const MAX_REROUTES: usize = 3;
+            let mut excluded: Vec<String> = Vec::new();
+            let mut reroute = 0usize;
 
-            // Issue writes in parallel — Bytes is refcounted so cloning is
-            // cheap (zero-copy). Use the Bytes overload so the data buffer is
-            // shared across all N replica writers instead of being copied N
-            // times.
-            // Bug AV (AV-4-1d) — pass the manager-resolved tier
-            // through to the data-node. Empty string preserves the
-            // legacy "any healthy disk" fallback for managers that
-            // pre-date AV-4-1d. See `fuse_tier_for_placement`.
-            let tier = fuse_tier_for_placement(&placement.tier).to_string();
-            let writes = targets.iter().map(|addr| {
-                let client = self.client.clone();
-                let addr = addr.clone();
-                let volume_id = volume_id.clone();
-                let data = segment.data.clone();
-                let tier = tier.clone();
-                async move {
-                    let res = client
-                        .write_chunk_bytes(&addr, "", &volume_id, &tier, data)
-                        .await;
-                    (addr, res)
-                }
-            });
-            let results = futures_util::future::join_all(writes).await;
-
-            let mut successes: Vec<(String, _)> = Vec::with_capacity(rf);
-            let mut last_err: Option<anyhow::Error> = None;
-            for (addr, res) in results {
-                match res {
-                    Ok(put_resp) => successes.push((addr, put_resp)),
-                    Err(e) => {
-                        warn!(
-                            chunk_index = segment.chunk_index,
-                            node = %addr,
-                            error = %e,
-                            "write_chunk failed on replica",
-                        );
-                        last_err = Some(anyhow::anyhow!(e));
+            let successes = loop {
+                let mut targets: Vec<String> =
+                    Vec::with_capacity(1 + placement.replica_addresses.len());
+                targets.push(placement.primary_address.clone());
+                for r in &placement.replica_addresses {
+                    if !targets.contains(r) {
+                        targets.push(r.clone());
                     }
                 }
-            }
+                let rf = targets.len();
+                let min_ok = ((rf + 1) / 2).max(1);
+                // Bug AV (AV-4-1d) — pass the manager-resolved tier through to
+                // the data-node so it lands the chunk on the right tier.
+                let tier = fuse_tier_for_placement(&placement.tier).to_string();
 
-            if successes.len() < min_ok {
-                return Err(last_err.unwrap_or_else(|| {
-                    anyhow::anyhow!(
-                        "write_chunk failed for chunk_index {}: 0/{} replicas succeeded",
+                // Issue writes in parallel — Bytes is refcounted so cloning is
+                // cheap (zero-copy), so the buffer is shared across replicas.
+                let writes = targets.iter().map(|addr| {
+                    let client = self.client.clone();
+                    let addr = addr.clone();
+                    let volume_id = volume_id.clone();
+                    let data = segment.data.clone();
+                    let tier = tier.clone();
+                    async move {
+                        let res = client
+                            .write_chunk_bytes(&addr, "", &volume_id, &tier, data)
+                            .await;
+                        (addr, res)
+                    }
+                });
+                let results = futures_util::future::join_all(writes).await;
+
+                let mut successes: Vec<(String, _)> = Vec::with_capacity(rf);
+                let mut last_err: Option<anyhow::Error> = None;
+                let mut exhausted_addrs: Vec<String> = Vec::new();
+                for (addr, res) in results {
+                    match res {
+                        Ok(put_resp) => successes.push((addr, put_resp)),
+                        Err(e) => {
+                            if is_resource_exhausted(&e) {
+                                exhausted_addrs.push(addr.clone());
+                            }
+                            warn!(
+                                chunk_index = segment.chunk_index,
+                                node = %addr,
+                                error = %e,
+                                "write_chunk failed on replica",
+                            );
+                            last_err = Some(anyhow::anyhow!(e));
+                        }
+                    }
+                }
+
+                if successes.len() >= min_ok {
+                    break successes;
+                }
+
+                // Shortfall — reroute only if a target was full AND we have
+                // retry budget; otherwise surface the original error.
+                if reroute >= MAX_REROUTES || exhausted_addrs.is_empty() {
+                    return Err(last_err.unwrap_or_else(|| {
+                        anyhow::anyhow!(
+                            "write_chunk failed for chunk_index {}: 0/{} replicas succeeded",
+                            segment.chunk_index,
+                            rf
+                        )
+                    })
+                    .context(format!(
+                        "write_chunk failed for chunk_index {}: only {}/{} replicas succeeded (need {})",
                         segment.chunk_index,
-                        rf
+                        successes.len(),
+                        rf,
+                        min_ok
+                    )));
+                }
+
+                reroute += 1;
+                for a in &exhausted_addrs {
+                    if !excluded.contains(a) {
+                        excluded.push(a.clone());
+                    }
+                }
+                warn!(
+                    chunk_index = segment.chunk_index,
+                    reroute,
+                    excluded = ?excluded,
+                    "Bug BU-2 rerouting chunk around full disk(s)"
+                );
+                let realloc = self
+                    .client
+                    .allocate_chunks_excluding(path, 1, &volume_id, preferred_tier, &excluded)
+                    .await
+                    .with_context(|| format!("BU-2 reroute allocate failed for {path}"))?;
+                placement = realloc.placements.into_iter().next().with_context(|| {
+                    format!(
+                        "BU-2 reroute for {path} chunk {}: no eligible placement (tier exhausted)",
+                        segment.chunk_index
                     )
-                })
-                .context(format!(
-                    "write_chunk failed for chunk_index {}: only {}/{} replicas succeeded (need {})",
-                    segment.chunk_index,
-                    successes.len(),
-                    rf,
-                    min_ok
-                )));
-            }
+                })?;
+            };
 
             for (addr, put_resp) in successes {
                 commits.push(ChunkLocationCommit {
@@ -1606,12 +1651,8 @@ impl DtfsFilesystem {
                     chunk_id: put_resp.chunk_id.clone(),
                     primary_address: addr,
                     size_bytes: put_resp.size,
-                    // AV-4-8 — propagate the data-node's actual
-                    // chosen disk_id so the manager's tiering
-                    // engine resolves tier correctly. Pre-fix
-                    // hardcoded 0 caused cold writes to be
-                    // counted as warm and the cache planner
-                    // wrongly thought warm cap was already met.
+                    // AV-4-8 — propagate the data-node's actual chosen disk_id
+                    // so the manager's tiering engine resolves tier correctly.
                     disk_id: put_resp.disk_id,
                 });
             }
@@ -1619,8 +1660,6 @@ impl DtfsFilesystem {
             debug!(
                 path,
                 chunk_index = segment.chunk_index,
-                replicas = rf,
-                size = segment.data.len(),
                 "chunk written to cluster",
             );
         }
@@ -1708,6 +1747,43 @@ fn file_attr_from_locations(locations: &FileLocations) -> FileAttr {
 /// healthy disk" fallback matches the old behaviour for that case.
 fn fuse_tier_for_placement(placement_tier: &str) -> &str {
     placement_tier
+}
+
+/// Bug BU-2 — did this write error originate from a data-node out-of-space
+/// (ENOSPC)? `client::write_chunk_bytes` surfaces the gRPC status code in
+/// its error message (`code=ResourceExhausted`) after exhausting the Bug G
+/// memory-shed retries, so a disk-full put is reroute-able while a genuine
+/// internal fault is not. Matching on the rendered chain keeps this
+/// independent of the error's concrete type.
+fn is_resource_exhausted(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("ResourceExhausted")
+}
+
+#[cfg(test)]
+mod bu2_reroute_tests {
+    use super::is_resource_exhausted;
+
+    #[test]
+    fn classifies_resource_exhausted_vs_other() {
+        let exhausted = anyhow::anyhow!(
+            "put_chunk RPC failed (code=ResourceExhausted, attempts=3): disk full (ENOSPC)"
+        );
+        assert!(is_resource_exhausted(&exhausted));
+
+        let internal = anyhow::anyhow!(
+            "put_chunk RPC failed (code=Internal, attempts=1): write tmp: broken pipe"
+        );
+        assert!(!is_resource_exhausted(&internal));
+
+        // Context-wrapped chain still matches.
+        let wrapped = exhausted_chain();
+        assert!(is_resource_exhausted(&wrapped));
+    }
+
+    fn exhausted_chain() -> anyhow::Error {
+        let base = anyhow::anyhow!("put_chunk RPC failed (code=ResourceExhausted): full");
+        base.context("write_chunk failed on replica data01:9500")
+    }
 }
 
 /// Convert epoch milliseconds (i64) to `SystemTime`. Returns `UNIX_EPOCH` when

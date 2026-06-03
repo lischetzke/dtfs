@@ -25,12 +25,16 @@ pub struct ChunkPlacement {
 pub struct PlacementEngine {
     /// Cached hash ring — rebuilt when the node set changes.
     ring: RwLock<ConsistentHashRing>,
+    /// Bug BU — free-space headroom used to exclude near-full disks from
+    /// the ring so new chunks route to a disk that can hold them.
+    placement_cfg: dtfs_common::config::PlacementConfig,
 }
 
 impl PlacementEngine {
-    pub fn new() -> Self {
+    pub fn new(placement_cfg: dtfs_common::config::PlacementConfig) -> Self {
         Self {
             ring: RwLock::new(ConsistentHashRing::new(256)),
+            placement_cfg,
         }
     }
 
@@ -55,8 +59,30 @@ impl PlacementEngine {
             }
             let nid = NodeId::from_string(node_id.to_string());
             for disk in &info.disks {
+                // Bug BU — exclude a disk whose free space is below the
+                // configured headroom so new chunks never hash to a
+                // (near-)full disk and hard-fail at the data plane. The
+                // live repro: data01-warm at 100% kept full ring weight,
+                // so every chunk hashing to it returned ENOSPC while
+                // data02-warm sat idle with 21 GB free.
+                if !self.placement_cfg.has_room(disk.total_bytes, disk.used_bytes) {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        hostname = %info.hostname,
+                        disk_id = disk.disk_id,
+                        tier = ?disk.tier,
+                        total_bytes = disk.total_bytes,
+                        used_bytes = disk.used_bytes,
+                        "Bug BU — disk below free-space headroom; excluding from placement ring",
+                    );
+                    continue;
+                }
+                // Bug BU — weight by AVAILABLE bytes (was total), so a
+                // disk with more free space attracts proportionally more
+                // new placements than a fuller peer of the same size.
+                let free = disk.total_bytes.saturating_sub(disk.used_bytes);
                 let weight = if disk.total_bytes > 0 {
-                    disk.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 100.0)
+                    free as f64 / (1024.0 * 1024.0 * 1024.0 * 100.0)
                 } else {
                     1.0
                 };
@@ -188,7 +214,7 @@ impl PlacementEngine {
 
 impl Default for PlacementEngine {
     fn default() -> Self {
-        Self::new()
+        Self::new(dtfs_common::config::PlacementConfig::default())
     }
 }
 
@@ -200,6 +226,94 @@ impl Default for PlacementEngine {
 /// each file's chunks independently across the ring.
 pub(crate) fn chunk_placement_key(volume_id: &str, placement_seed: &str, index: u32) -> String {
     format!("{volume_id}:{placement_seed}:chunk:{index}")
+}
+
+#[cfg(test)]
+mod bu1_capacity_ring_tests {
+    use super::*;
+    use dtfs_common::types::{DiskInfo, DiskStatus, DiskTier, HealthStatus, NodeRole};
+
+    fn mk_node(hostname: &str, rack: &str, total: u64, used: u64) -> dtfs_raft::NodeInfo {
+        dtfs_raft::NodeInfo {
+            role: NodeRole::Data,
+            hostname: hostname.to_string(),
+            grpc_addr: format!("{hostname}:9500"),
+            location: dtfs_common::topology::Location::new("lab", "dc-a", rack, hostname),
+            disks: vec![DiskInfo {
+                disk_id: 0,
+                uuid: "u".into(),
+                mount_path: "/mnt/x".into(),
+                tier: DiskTier::Warm,
+                total_bytes: total,
+                used_bytes: used,
+                status: DiskStatus::Healthy,
+            }],
+            total_capacity: total,
+            used_capacity: used,
+            health: HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    // Bug BU-1 — a 100%-full disk is excluded from the placement ring, so
+    // new chunks route to the peer node with free space instead of
+    // hard-failing on ENOSPC (the live data01-warm-full repro).
+    #[tokio::test]
+    async fn full_disk_excluded_writes_route_to_peer() {
+        let gib = 1024 * 1024 * 1024u64;
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(1, mk_node("data01", "rack-1", 20 * gib, 20 * gib)); // full
+        sm.nodes.insert(2, mk_node("data02", "rack-2", 20 * gib, 0)); // empty
+        let sm_arc = Arc::new(TokioRwLock::new(sm));
+
+        let engine = PlacementEngine::new(dtfs_common::config::PlacementConfig::default());
+        engine.rebuild_ring(&sm_arc).await;
+
+        let placements =
+            engine.place_chunks_with_anchor("default", "/season.mkv", 50, DiskTier::Warm, 1, None);
+        assert_eq!(placements.len(), 50, "every chunk gets a placement");
+
+        let mut saw_peer = false;
+        for p in &placements {
+            for nid in &p.node_ids {
+                assert_ne!(nid.0, "1", "full data01 must never receive a placement");
+                if nid.0 == "2" {
+                    saw_peer = true;
+                }
+            }
+        }
+        assert!(saw_peer, "empty data02 should receive the placements");
+    }
+
+    // Bug BU-1 — when BOTH disks have room the ring keeps both (no spurious
+    // exclusion), so this is not a one-node-only artefact.
+    #[tokio::test]
+    async fn both_disks_with_room_stay_in_ring() {
+        let gib = 1024 * 1024 * 1024u64;
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(1, mk_node("data01", "rack-1", 20 * gib, 5 * gib));
+        sm.nodes.insert(2, mk_node("data02", "rack-2", 20 * gib, 0));
+        let sm_arc = Arc::new(TokioRwLock::new(sm));
+
+        let engine = PlacementEngine::new(dtfs_common::config::PlacementConfig::default());
+        engine.rebuild_ring(&sm_arc).await;
+
+        let placements =
+            engine.place_chunks_with_anchor("default", "/x.mkv", 80, DiskTier::Warm, 1, None);
+        let mut seen = std::collections::HashSet::new();
+        for p in &placements {
+            for nid in &p.node_ids {
+                seen.insert(nid.0.clone());
+            }
+        }
+        assert!(seen.contains("1") && seen.contains("2"), "both eligible nodes used, got {seen:?}");
+    }
 }
 
 #[cfg(test)]

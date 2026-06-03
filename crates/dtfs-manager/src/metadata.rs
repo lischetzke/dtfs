@@ -1146,14 +1146,33 @@ impl ManagerService for MetadataService {
         };
         let replication = effective_rf.max(1).min(data.nodes.len() as u32);
 
-        let placed = self.placement.place_chunks_with_anchor(
-            &req.volume_id,
-            &req.path, // Bug BO-3 — per-file seed so chunk-0 doesn't collide cross-file
-            req.num_chunks,
-            effective_tier,
-            replication,
-            anchor_dc.clone(),
-        );
+        // Bug BU-2 — addresses the client asked to exclude (a node whose
+        // put_chunk just returned RESOURCE_EXHAUSTED). Normalise off any
+        // scheme prefix so `http://h:9500` and `h:9500` compare equal.
+        let norm_addr = |a: &str| {
+            a.trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .to_string()
+        };
+        let exclude_set: std::collections::HashSet<String> =
+            req.exclude_addrs.iter().map(|a| norm_addr(a)).collect();
+
+        // The deterministic hash-ring path has no native node exclusion
+        // (`find_nodes_for_pg` takes client_locations, not an exclude list),
+        // so when the client is rerouting we skip it and fall straight to
+        // the capacity + exclude-filtered round-robin below.
+        let placed = if exclude_set.is_empty() {
+            self.placement.place_chunks_with_anchor(
+                &req.volume_id,
+                &req.path, // Bug BO-3 — per-file seed so chunk-0 doesn't collide cross-file
+                req.num_chunks,
+                effective_tier,
+                replication,
+                anchor_dc.clone(),
+            )
+        } else {
+            Vec::new()
+        };
 
         let mut placements = Vec::new();
 
@@ -1188,13 +1207,29 @@ impl ManagerService for MetadataService {
             // skips nodes that aren't Healthy so writes don't target Down hosts
             // (fix for F-010 + F-012).
             placements.clear();
+            // Bug BU — the fallback must also avoid full disks: a node is
+            // eligible only if it has at least one disk on the target tier
+            // with free space above the headroom. Otherwise this path
+            // happily round-robins a chunk onto a 100%-full node and
+            // put_chunk hard-fails with ENOSPC.
+            let pcfg = &self.config.placement;
             let node_list: Vec<_> = data
                 .nodes
                 .values()
                 .filter(|n| n.health == dtfs_common::types::HealthStatus::Healthy)
+                // Bug BU-2 — drop client-excluded nodes (the full one it
+                // just failed on) so the retry reroutes elsewhere.
+                .filter(|n| !exclude_set.contains(&norm_addr(&n.grpc_addr)))
+                .filter(|n| {
+                    n.disks.iter().any(|d| {
+                        d.tier == effective_tier && pcfg.has_room(d.total_bytes, d.used_bytes)
+                    })
+                })
                 .collect();
             if node_list.is_empty() {
-                return Err(Status::unavailable("No healthy data nodes available"));
+                return Err(Status::unavailable(format!(
+                    "No healthy data node has free space on tier {effective_tier:?} (all candidate disks below placement headroom or excluded)"
+                )));
             }
             let rf = (replication as usize).min(node_list.len());
 
