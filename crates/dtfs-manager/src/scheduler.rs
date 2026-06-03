@@ -288,122 +288,120 @@ impl TaskScheduler {
             })
             .collect();
 
-        // Walk all files and check chunk replica counts.
+        // Walk all files; for each LOGICAL chunk check the PER-TIER replica
+        // count against the volume's mandatory per-tier requirement.
+        //
+        // Bug BX-4 — the previous version derived a single `chunk_tier` from
+        // one replica row and checked only that tier's count, so a mandated
+        // tier with ZERO replicas (e.g. a chunk that landed only on cold under
+        // a warm=2,cold=1 volume because warm was full at write) was never
+        // noticed and never backfilled. We now group rows by chunk_index and
+        // schedule a copy for every tier that is short of its mandatory count.
+        //
+        // Bug AV (AV-1-8) — under-replication enforces ONLY mandatory tiers;
+        // cache tiers are the tiering engine's job.
         for (_path, file_meta) in &sm.files {
-            for chunk_loc in &file_meta.chunks {
-                // Each chunk_loc entry represents one replica. Count how many
-                // replicas exist for the same chunk_index.
-                let replica_count = file_meta
-                    .chunks
-                    .iter()
-                    .filter(|c| c.chunk_index == chunk_loc.chunk_index)
-                    .count() as u32;
+            if file_meta.is_directory || file_meta.symlink_target.is_some() {
+                continue;
+            }
+            let mandatory: TierReplication = sm
+                .volumes
+                .get(&file_meta.volume_id)
+                .map(|v| v.effective_mandatory_replicas().clone())
+                .unwrap_or(TierReplication { hot: 3, warm: 0, cold: 0, tape: 0 });
 
-                // Look up the per-volume replication factor, falling back to
-                // the cluster-wide default of 3 for the hot tier.
-                let chunk_tier = {
-                    // Try to determine the actual tier from the source node's
-                    // disk matching the stored disk_id.
-                    let source_node_id_for_tier: u64 =
-                        chunk_loc.node_id.parse().unwrap_or(0);
+            let mut by_idx: std::collections::BTreeMap<u64, Vec<&ChunkLocationEntry>> =
+                std::collections::BTreeMap::new();
+            for c in &file_meta.chunks {
+                by_idx.entry(c.chunk_index).or_default().push(c);
+            }
+
+            for (_idx, entries) in &by_idx {
+                let tier_of = |e: &ChunkLocationEntry| -> Option<DiskTier> {
+                    let nid: u64 = e.node_id.parse().ok()?;
                     sm.nodes
-                        .get(&source_node_id_for_tier)
-                        .and_then(|n| n.disks.get(chunk_loc.disk_id as usize))
+                        .get(&nid)
+                        .and_then(|n| n.disks.get(e.disk_id as usize))
                         .map(|d| d.tier)
-                        .unwrap_or(DiskTier::Hot)
                 };
-                // Bug AV (AV-1-8) — under-replication enforces ONLY
-                // mandatory tiers. `effective_mandatory_replicas()`
-                // returns the new `mandatory_replicas` field when any
-                // of its tiers > 0, otherwise falls back to the legacy
-                // `replication` field (pre-AV behaviour). Cache tiers
-                // are NEVER auto-filled by this scheduler — that's
-                // the tiering engine's job (Phase 2). Pre-fix every
-                // tier with rf > 0 in `replication` got enforced
-                // including warm, which is incompatible with the
-                // cache-tier semantics.
-                let desired_replicas = sm.volumes
-                    .get(&file_meta.volume_id)
-                    .map(|v| v.effective_mandatory_replicas().for_tier(chunk_tier))
-                    .unwrap_or(3u32);
+                let count_on = |t: DiskTier| entries.iter().filter(|e| tier_of(e) == Some(t)).count() as u32;
 
-                if replica_count < desired_replicas {
-                    // Pick a HEALTHY source from the chunk's current replicas
-                    // rather than blindly using `chunk_loc.node_id` (which may
-                    // be the Down node that caused the under-replication in
-                    // the first place). The Copying-state retry logic will
-                    // re-resolve too (F-015), but scheduling with a healthy
-                    // source up-front avoids a wasted retry cycle (F-016).
-                    let existing_node_ids: Vec<u64> = file_meta
-                        .chunks
+                let chunk_hash = match entries.first() {
+                    Some(e) => e.chunk_hash.clone(),
+                    None => continue,
+                };
+                let existing_nodes: Vec<u64> =
+                    entries.iter().filter_map(|e| e.node_id.parse().ok()).collect();
+
+                // Healthy source = any existing replica on a healthy node.
+                let source_node_id: u64 = existing_nodes
+                    .iter()
+                    .copied()
+                    .find(|nid| {
+                        sm.nodes
+                            .get(nid)
+                            .map(|n| n.health == HealthStatus::Healthy)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(0);
+                if source_node_id == 0 {
+                    continue; // no healthy source to copy from
+                }
+
+                // Schedule a copy for every mandated tier that is short.
+                for (tier, _deficit) in under_replicated_tiers(count_on, &mandatory) {
+                    // Bug BH — exclude a node that already holds this chunk ON
+                    // THE TARGET TIER, but a node holding it on a DIFFERENT
+                    // tier is still a valid target (single-node multi-tier
+                    // topology: data01 warm+cold).
+                    let tier_holders: std::collections::HashSet<u64> = entries
                         .iter()
-                        .filter(|c| c.chunk_index == chunk_loc.chunk_index)
-                        .filter_map(|c| c.node_id.parse().ok())
+                        .filter(|e| tier_of(e) == Some(tier))
+                        .filter_map(|e| e.node_id.parse().ok())
                         .collect();
 
-                    let source_node_id: u64 = existing_node_ids
+                    let Some((target, _)) = healthy_nodes
                         .iter()
-                        .copied()
-                        .find(|nid| {
-                            sm.nodes
-                                .get(nid)
-                                .map(|n| n.health == HealthStatus::Healthy)
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or_else(|| chunk_loc.node_id.parse().unwrap_or(0));
+                        .find(|(id, tiers)| !tier_holders.contains(id) && tiers.contains(&tier))
+                    else {
+                        continue;
+                    };
 
-                    if source_node_id == 0 {
+                    let already = migration_state.tasks.values().any(|t| {
+                        t.chunk_id == chunk_hash
+                            && t.target_node == *target
+                            && t.tier == tier
+                            && t.status != MigrationStatus::Done
+                            && t.status != MigrationStatus::Failed
+                    });
+                    if already {
                         continue;
                     }
 
-                    let existing_nodes: Vec<u64> = existing_node_ids;
-
-                    let tier = chunk_tier;
-
-                    if let Some((target, _)) = healthy_nodes
-                        .iter()
-                        .find(|(id, tiers)| !existing_nodes.contains(id) && tiers.contains(&tier))
-                    {
-                        // Check if already scheduled.
-                        let already = migration_state.tasks.values().any(|t| {
-                            t.chunk_id == chunk_loc.chunk_hash
-                                && t.target_node == *target
-                                && t.status != MigrationStatus::Done
-                                && t.status != MigrationStatus::Failed
-                        });
-
-                        if !already {
-                            let now_ms = now_millis();
-                            let task_id =
-                                format!("repl-{}", migration_state.next_task_id);
-                            migration_state.next_task_id += 1;
-
-                            let task = ReplicationTask {
-                                task_id: task_id.clone(),
-                                chunk_id: chunk_loc.chunk_hash.clone(),
-                                source_node: source_node_id,
-                                target_node: *target,
-                                tier,
-                                status: MigrationStatus::Pending,
-                                created_at_ms: now_ms,
-                                updated_at_ms: now_ms,
-                                attempts: 0,
-                                last_error: None,
-                            };
-
-                            info!(
-                                task_id = %task_id,
-                                chunk = %chunk_loc.chunk_hash,
-                                source = source_node_id,
-                                target = *target,
-                                "Auto-scheduled re-replication (replica count {} < {})",
-                                replica_count,
-                                desired_replicas
-                            );
-
-                            migration_state.tasks.insert(task_id, task);
-                        }
-                    }
+                    let now_ms = now_millis();
+                    let task_id = format!("repl-{}", migration_state.next_task_id);
+                    migration_state.next_task_id += 1;
+                    let task = ReplicationTask {
+                        task_id: task_id.clone(),
+                        chunk_id: chunk_hash.clone(),
+                        source_node: source_node_id,
+                        target_node: *target,
+                        tier,
+                        status: MigrationStatus::Pending,
+                        created_at_ms: now_ms,
+                        updated_at_ms: now_ms,
+                        attempts: 0,
+                        last_error: None,
+                    };
+                    info!(
+                        task_id = %task_id,
+                        chunk = %chunk_hash,
+                        source = source_node_id,
+                        target = *target,
+                        tier = ?tier,
+                        "Bug BX-4 auto-scheduled re-replication for a short mandated tier"
+                    );
+                    migration_state.tasks.insert(task_id, task);
                 }
             }
         }
@@ -2393,6 +2391,150 @@ pub(crate) struct AnchorRepairAction {
 /// exactly. Otherwise prefer cold (the durable anchor tier) if
 /// any node in the anchor DC has a cold disk; else fall back to
 /// any tier the candidate offers.
+/// Bug BX-4 — per-tier replica shortfall for one logical chunk. Returns
+/// `(tier, deficit)` for every mandated tier with fewer replicas than the
+/// volume requires. Pure + testable; replaces the old single-tier-from-
+/// source derivation that missed a mandated tier with ZERO replicas
+/// entirely (e.g. a chunk that landed only on cold under a warm=2,cold=1
+/// volume never got its warm copies scheduled).
+pub(crate) fn under_replicated_tiers<F: Fn(DiskTier) -> u32>(
+    count_on_tier: F,
+    mandatory: &TierReplication,
+) -> Vec<(DiskTier, u32)> {
+    let mut out = Vec::new();
+    for tier in [DiskTier::Hot, DiskTier::Warm, DiskTier::Cold, DiskTier::Tape] {
+        let want = mandatory.for_tier(tier);
+        let have = count_on_tier(tier);
+        if want > have {
+            out.push((tier, want - have));
+        }
+    }
+    out
+}
+
+/// Bug BX-5 — choose ONE safe excess replica to drop from an
+/// over-replicated chunk so it converges toward its goal, without dropping
+/// below any mandated tier or stranding the anchor, and without touching
+/// legitimate cache replicas (within `cache_allowance`). Returns the
+/// `node_id` to remove, or None when no safe removal exists.
+///
+/// Only acts when the chunk is genuinely OVER goal
+/// (`total > mandatory_total + cache_allowance`) — the same threshold
+/// BX-3 uses for `Overgoal` — so a chunk carrying mandated + legit cache
+/// copies is left alone (the tiering engine owns cache demotion). A
+/// candidate removal is accepted only if every mandated tier AND the
+/// anchor remain satisfied afterwards, so this can never under-replicate
+/// or strand the anchor. Pure + deterministic (first safe candidate in
+/// replica order).
+pub(crate) fn plan_excess_spill_removal(
+    replicas: &[(u64, String, DiskTier)],
+    mandatory: &TierReplication,
+    anchor: Option<&dtfs_common::types::AnchorPolicy>,
+    cache_allowance: u32,
+) -> Option<u64> {
+    let total = replicas.len() as u32;
+    let mandatory_total = mandatory.hot + mandatory.warm + mandatory.cold + mandatory.tape;
+    if total <= mandatory_total + cache_allowance {
+        return None; // not over goal — leave cache/tiering alone
+    }
+    for (idx, (node, _dc, _tier)) in replicas.iter().enumerate() {
+        let remaining: Vec<&(u64, String, DiskTier)> = replicas
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .map(|(_, r)| r)
+            .collect();
+        let on_tier = |t: DiskTier| remaining.iter().filter(|(_, _, tt)| *tt == t).count() as u32;
+        let tiers_ok = on_tier(DiskTier::Hot) >= mandatory.hot
+            && on_tier(DiskTier::Warm) >= mandatory.warm
+            && on_tier(DiskTier::Cold) >= mandatory.cold
+            && on_tier(DiskTier::Tape) >= mandatory.tape;
+        let anchor_ok = match anchor {
+            None => true,
+            Some(a) => remaining.iter().any(|(_, dc, tt)| {
+                dc == &a.datacenter
+                    && match a.required_tier {
+                        Some(rt) => *tt == rt,
+                        None => true,
+                    }
+            }),
+        };
+        if tiers_ok && anchor_ok {
+            return Some(*node);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod bx5_excess_removal_tests {
+    use super::plan_excess_spill_removal;
+    use dtfs_common::types::{AnchorPolicy, DiskTier, TierReplication};
+
+    fn rep(node: u64, dc: &str, tier: DiskTier) -> (u64, String, DiskTier) {
+        (node, dc.to_string(), tier)
+    }
+
+    // Spilled extra copy beyond mandatory+cache is removed, keeping mandated
+    // tiers + anchor satisfied.
+    #[test]
+    fn removes_excess_keeps_goal() {
+        let m = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 }; // total 1
+        let anchor = AnchorPolicy { datacenter: "dc-a".into(), required_tier: Some(DiskTier::Cold) };
+        // cold anchor (node 1) + a spilled hot copy (node 2). allowance 0 -> over.
+        let reps = vec![rep(1, "dc-a", DiskTier::Cold), rep(2, "dc-b", DiskTier::Hot)];
+        // The removable one is node 2 (removing node 1 would strand the anchor).
+        assert_eq!(plan_excess_spill_removal(&reps, &m, Some(&anchor), 0), Some(2));
+    }
+
+    // Within mandatory+cache allowance -> nothing removed (don't fight tiering).
+    #[test]
+    fn keeps_legit_cache_replica() {
+        let m = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+        let reps = vec![rep(1, "dc-a", DiskTier::Cold), rep(2, "dc-a", DiskTier::Warm)];
+        // total 2 == mandatory 1 + cache allowance 1 -> not over.
+        assert_eq!(plan_excess_spill_removal(&reps, &m, None, 1), None);
+    }
+
+    // Never drops below a mandated tier: removing the only mandated copy is refused.
+    #[test]
+    fn refuses_to_underreplicate() {
+        let m = TierReplication { hot: 0, warm: 2, cold: 0, tape: 0 }; // total 2
+        // 2 warm (exactly mandated) -> total 2, not over (allowance 0) -> None.
+        let reps = vec![rep(1, "dc-a", DiskTier::Warm), rep(2, "dc-b", DiskTier::Warm)];
+        assert_eq!(plan_excess_spill_removal(&reps, &m, None, 0), None);
+    }
+}
+
+#[cfg(test)]
+mod bx4_under_replication_tests {
+    use super::under_replicated_tiers;
+    use dtfs_common::types::{DiskTier, TierReplication};
+
+    // Bug BX-4 — a chunk on cold-only under warm=2,cold=1 reports warm short
+    // by 2 (pre-fix: the warm shortfall was invisible).
+    #[test]
+    fn detects_missing_mandated_tier() {
+        let mandatory = TierReplication { hot: 0, warm: 2, cold: 1, tape: 0 };
+        let cold_only = |t: DiskTier| if t == DiskTier::Cold { 1 } else { 0 };
+        assert_eq!(
+            under_replicated_tiers(cold_only, &mandatory),
+            vec![(DiskTier::Warm, 2)]
+        );
+        // Fully satisfied -> nothing short.
+        let ok = |t: DiskTier| match t {
+            DiskTier::Warm => 2,
+            DiskTier::Cold => 1,
+            _ => 0,
+        };
+        assert!(under_replicated_tiers(ok, &mandatory).is_empty());
+        // Cache-only tiers (mandatory 0) are never reported short.
+        let none = |_t: DiskTier| 0u32;
+        let cache_vol = TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 };
+        assert!(under_replicated_tiers(none, &cache_vol).is_empty());
+    }
+}
+
 pub(crate) fn plan_anchor_lag_repair(
     anchor: &dtfs_common::types::AnchorPolicy,
     placements: &[AnchorRepairPlacement],
