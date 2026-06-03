@@ -1021,6 +1021,16 @@ pub(crate) fn plan_cache_promotion(
     promote_reads_threshold: u32,
     now_ms: u64,
 ) -> u32 {
+    // Gate 0 (Bug BV-2) — `promote_reads == 0` means promotion DISABLED,
+    // not "promote on every read". Without this, gate 3's
+    // `read_count_in_window < 0` is always false (u32), so a chunk
+    // promotes on a single read — or even zero reads — turning an
+    // accidentally-zeroed threshold into a hyperactive tiering engine.
+    // `0` is the documented disabled sentinel, matching the engine-tick
+    // gate on `promote_window_secs == 0`.
+    if promote_reads_threshold == 0 {
+        return 0;
+    }
     // Gate 1 — tier disabled.
     if tier_cfg.max == 0 {
         return 0;
@@ -1785,6 +1795,25 @@ mod bug_av_promotion_decision_tests {
 
     fn cfg(min: u32, max: u32) -> CacheTierConfig {
         CacheTierConfig { min, max }
+    }
+
+    /// Bug BV-2 — `promote_reads == 0` is DISABLED, not promote-on-every-read.
+    /// Even a large read count (and a non-zero target tier) must not promote.
+    #[test]
+    fn bug_bv2_zero_threshold_disables_promotion() {
+        // High read count, healthy tier, no current replicas — pre-fix this
+        // promoted to `min`; with Gate 0 it stays 0.
+        let n = plan_cache_promotion(
+            /* read_count_in_window */ 100,
+            /* tier_cfg */ &cfg(2, 2),
+            /* current_cache_replicas_in_dc */ 0,
+            /* cooldown_until_ms */ 0,
+            /* promote_reads_threshold */ 0,
+            /* now_ms */ 1_000_000,
+        );
+        assert_eq!(n, 0, "promote_reads=0 disables promotion");
+        // And zero reads with zero threshold also stays disabled.
+        assert_eq!(plan_cache_promotion(0, &cfg(2, 2), 0, 0, 0, 1_000_000), 0);
     }
 
     /// AV-2-2 test 1 — read count below threshold → do nothing.

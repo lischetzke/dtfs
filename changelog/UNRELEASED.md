@@ -225,3 +225,17 @@
   it re-allocates the chunk with the full node excluded
   (`AllocateChunksRequest.exclude_addrs`) and retries on a node with room,
   bounded to 3 reroutes, instead of failing the write (BU-2).
+- **Bug BV — anchor-pending visibility, tiering zero-threshold semantics,
+  data-node count fix.** (BV-1) `/api/v1/stats` and
+  `/api/v1/cluster/status` now report `anchor_pending`: files whose
+  mandatory anchor copy hasn't landed yet (chunks exist on non-anchor
+  replicas; convergence is async). This is durability-pending, not data
+  loss, so it does not degrade the top-line status, but it stops
+  `files_missing_chunks:0` from hiding it. Write-ack semantics are
+  unchanged. (BV-2) `cache_replicas.promote_reads = 0` now means
+  "promotion disabled" instead of "promote on every read" — the
+  threshold gate previously read `count < 0` (always false), so a
+  zeroed threshold made the tiering engine promote on any (or zero)
+  reads. (BV-3) `cluster_status.data_nodes`/`data_nodes_healthy` now
+  count only `role==Data`, matching `stats.data_node_count` (a
+  3-manager + 2-data + 1-client roster reported `data_nodes:6`).
