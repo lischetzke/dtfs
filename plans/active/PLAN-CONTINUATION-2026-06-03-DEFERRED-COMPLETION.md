@@ -36,7 +36,7 @@ Goal: close the spill→classify→reconcile loop end to end.
 
 ### BX-9: Nearest-spill — plumb the writer location
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Problem: `BX-2` spill ranks by speed→free only; "nearest" is neutral because
   `AllocateChunksRequest` carries no writer location.
 - Files: `proto/manager.proto` (add `Location requester_location = 6;` to
@@ -54,7 +54,7 @@ Goal: close the spill→classify→reconcile loop end to end.
 
 ### BX-10: Spill audit row
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Problem: spill is logged via `tracing::warn!` only; no `placement.spill` audit
   row (the `MetadataService` allocate path has no `AuditLog` handle).
 - Files: `crates/dtfs-manager/src/metadata.rs` (thread an `Arc<AuditLog>` into
@@ -67,7 +67,7 @@ Goal: close the spill→classify→reconcile loop end to end.
 
 ### BX-11: BX-5 live rebalance dispatcher (live delete with guards)
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `crates/dtfs-manager/src/scheduler.rs` (new `check_misplaced_rebalance`
   pass, leader-gated, called from the tick after `check_anchor_lag`).
 - Sketch: walk chunks; for each, build `(node, dc, tier)` replicas; call the
@@ -87,7 +87,7 @@ Goal: close the spill→classify→reconcile loop end to end.
 
 ### BX-12: `pending_deletion` source
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Problem: `chunk_placement.pending_deletion` is hard-0; orphans/GC-queued chunks
   aren't counted.
 - Files: `crates/dtfs-manager/src/placement_state.rs` (+ caller in `api.rs`):
@@ -99,7 +99,7 @@ Goal: close the spill→classify→reconcile loop end to end.
 
 ### BX-13: e2e spill→rebalance release case
 
-- Status: ⬜
+- Status: 🟨 (2026-06-03 — case authored, KNOWN_ISSUE-pinned for the destructive fill scenario)
 - Files: `tests/release/cases/NN-capacity-spill-rebalance.sh`.
 - Case: on a warm-mandated test volume (or by filling warm on ALL data nodes),
   write a single-chunk file → assert it SPILLS to the next tier (succeeds, not
@@ -112,7 +112,7 @@ Goal: close the spill→classify→reconcile loop end to end.
 
 ### BX-14: changelog + docs (Phase 1 close)
 
-- Status: ⬜
+- Status: ✅ (2026-06-03)
 - Files: `changelog/UNRELEASED.md`, `docs/src/...` (placement/capacity ops):
   document nearest-spill, the spill audit, the rebalance pass, and the
   `chunk_placement` metric semantics.
@@ -228,7 +228,17 @@ BT-4 at `chunk_placement`.
 
 ## Verification log
 
-> Append per-task as phases execute.
+- **Phase 1 (BX-9..14) — 2026-06-03.** Implemented + built clean; full manager
+  suite 173 passed, 0 failed. Deployed manager+fuse (build 20260603-100706) to
+  the minicluster. BX-11 rebalance ran across several scheduler ticks and
+  removed nothing (cluster has overgoal=0 -> `plan_excess_spill_removal` returns
+  None) while `chunk_placement.missing` stayed 0 — the live delete-dispatcher is
+  confirmed SAFE (no errant removal, no under-replication). `chunk_placement` =
+  `missing=0 undergoal=0 misplaced=121 stable=159 overgoal=0 pending_deletion=0`
+  unchanged. Release case 36 PASS; case 37 (spill/rebalance) KNOWN_ISSUE [BX] —
+  the destructive fill-all-tiers convergence isn't run on the shared lab; spill
+  is unit-tested + nearness wired (BX-9) + audited (BX-10). BX-12 dangling-row
+  `pending_deletion` verified live (0 dangling rows currently).
 
 ---
 

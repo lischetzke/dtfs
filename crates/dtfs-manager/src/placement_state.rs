@@ -119,14 +119,18 @@ pub fn count_placement_states(sm: &StateMachineData) -> PlacementCounts {
         let allowance = volume.map(|v| cache_allowance(&v.cache_replicas)).unwrap_or(0);
 
         let mut by_idx: BTreeMap<u64, Vec<(String, DiskTier)>> = BTreeMap::new();
+        // Bug BX-12 — indices that carry a DANGLING replica row (a location
+        // pointing at a node that's no longer registered). Such rows are
+        // stale entries awaiting GC/cleanup -> counted as `pending_deletion`.
+        let mut dangling: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         for c in &file_meta.chunks {
             let entry = by_idx.entry(c.chunk_index).or_default();
             if let Some((dc, tier)) = resolve_dc_tier(sm, c) {
                 entry.push((dc, tier));
             } else {
-                // Keep the index present (so a wholly-unresolvable chunk still
-                // counts) but with no resolvable replica -> looks like missing.
-                let _ = entry;
+                // Unresolvable row (node gone): the replica doesn't count
+                // toward placement, and the dangling entry needs cleanup.
+                dangling.insert(c.chunk_index);
             }
         }
 
@@ -139,6 +143,7 @@ pub fn count_placement_states(sm: &StateMachineData) -> PlacementCounts {
                 PlacementState::Stable => counts.stable += 1,
             }
         }
+        counts.pending_deletion += dangling.len() as u64;
     }
 
     counts

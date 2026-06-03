@@ -353,6 +353,11 @@ message AllocateChunksRequest {
   // retry reroutes to a node with room instead of looping onto the same
   // full disk. Empty = no exclusions (the normal first-attempt path).
   repeated string exclude_addrs = 5;
+  // Bug BX-9 — the writer's location, so capacity spill can prefer the
+  // fastest+NEAREST tier with room (BX-1 ranking's distance key). Absent /
+  // empty location keeps the legacy speed -> free-space ordering (nearness
+  // neutral), so older FUSE clients that don't send it still work.
+  dtfs.common.Location requester_location = 6;
 }
 
 message ChunkPlacement {

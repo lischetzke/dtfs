@@ -252,3 +252,14 @@
   cluster-wide distribution of chunk placement states (missing / undergoal /
   misplaced / stable / overgoal / pending_deletion), one count per logical
   chunk - the metric the WebUI chunk-redundancy panel consumes.
+- **Bug BX (phase 2) - nearest spill, spill audit, live rebalance.** Capacity
+  spill now prefers the writer's datacenter: the FUSE client sends its location
+  in `AllocateChunksRequest.requester_location` and the ranker breaks speed ties
+  by topological distance (BX-9). Each spill records a `placement.spill` audit
+  row (BX-10). A new leader-gated scheduler pass relocates capacity-spilled
+  chunks back to goal: once the mandated tier is backfilled, the excess spill
+  copy is dropped via guarded `RemoveChunkLocation` (never below a mandated tier
+  or the anchor, never touching within-allowance cache replicas; BX-11). And
+  `stats.chunk_placement.pending_deletion` now counts chunks carrying a dangling
+  replica row (a location pointing at a deregistered node) awaiting cleanup
+  (BX-12).
