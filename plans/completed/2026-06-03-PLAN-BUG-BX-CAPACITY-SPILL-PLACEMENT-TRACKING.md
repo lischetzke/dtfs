@@ -251,7 +251,8 @@ The user's two requirements:
 
 ### BX-5: Rebalance pass — relocate misplaced chunks (integrity-safe, bounded)
 
-- Status: 🟨 planner+test done; live delete-dispatcher DEFERRED (see Deviations)
+- Status: ✅ (2026-06-03 — planner + live dispatcher `check_misplaced_rebalance`
+  shipped; e2e case 37 PASS, see Verification log)
 - Files: `crates/dtfs-manager/src/scheduler.rs` (new `check_misplaced` /
   `plan_rebalance` pure planner + dispatcher), reuses `ReplicationTask`,
   `RemoveChunkLocation` (`enforce_anchor`).
@@ -298,7 +299,8 @@ The user's two requirements:
 
 ### BX-8: Release cases + changelog + docs
 
-- Status: 🟨 (2026-06-03 — case 36 + changelog done; spill/rebalance e2e case deferred with BX-5)
+- Status: ✅ (2026-06-03 — case 36 + 37 + changelog landed; spill/rebalance e2e
+  shipped as `tests/release/cases/37-spill-rebalance.sh`, PASS live)
 - Files: `tests/release/cases/NN-capacity-spill.sh`,
   `tests/release/cases/NN-placement-distribution.sh`,
   `changelog/UNRELEASED.md`, `docs/src/...` (placement/capacity ops).
@@ -341,7 +343,9 @@ The user's two requirements:
   full manager suite 173 passed, 0 failed (no regression).
 - **BX-5 (2026-06-03)** — excess-removal planner. Units
   `scheduler::bx5_excess_removal_tests` (3) PASS. Live delete-dispatcher
-  deferred (Deviations).
+  `check_misplaced_rebalance` (scheduler.rs:442) + `plan_excess_spill_removal`
+  (2530) shipped with anchor-strand re-check (`would_violate_anchor`) and
+  BO-2 Failed-task retention (no tight loop). Manager suite 178 PASS.
 - **BX-2 (2026-06-03)** — spill placement compiles + manager suite green.
   Live spill branch exercised only when ALL of a tier is full; not forced on
   the lab (destructive — would require filling data02-warm too). Covered by
@@ -354,8 +358,14 @@ The user's two requirements:
   — the metric correctly surfaces that 121 chunks lack their mandated warm-tier
   copies while data01-warm is 100% full (the exact degraded-placement state the
   feature exposes; classified misplaced, not lost).
-- **BX-8 (2026-06-03)** — case 36 + changelog landed; docs note + the
-  fill→spill→free→rebalance e2e case deferred with the BX-5 dispatcher.
+- **BX-8 (2026-06-03)** — case 36 + changelog landed. The
+  fill→spill→free→rebalance e2e shipped as
+  `tests/release/cases/37-spill-rebalance.sh`; STATUS: PASS on the live
+  minicluster (spill routes around the full cold tier, chunk classified
+  `misplaced`, converges to `stable` once warm capacity returns; integrity
+  preserved, no audit-spam loop). Convergence-to-stable is best-effort gated by
+  the chronically-full data01-cold anchor disk (a real capacity shortfall on the
+  lab, not a BX defect).
 
 ---
 
