@@ -303,7 +303,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .badge-degraded   {{ background: #f59e0b22; color: var(--warning); }}
         .badge-down       {{ background: #ef444422; color: var(--danger); }}
         .badge-failed     {{ background: #ef444422; color: var(--danger); }}
-        /* Bug BC — Quarantined nodes hard-flag in deep red so an
+        /* Quarantined nodes hard-flag in deep red so an
            operator scanning the page can't miss a data-integrity event. */
         .badge-quarantined {{ background: #b91c1c; color: white; font-weight: 700; letter-spacing: .04em; }}
         .badge-maintenance {{ background: #3b82f622; color: var(--primary); }}
@@ -313,16 +313,16 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .badge-cold {{ background: #3b82f622; color: var(--primary); }}
         .badge-tape {{ background: #a855f722; color: var(--tape); }}
         .badge-manager {{ background: #6366f122; color: #818cf8; }}
-        /* Bug AX — Raft-leader marker on the Nodes page. Bright accent so
+        /* Raft-leader marker on the Nodes page. Bright accent so
            it stands out next to the normal role/health badges. */
         .badge-leader {{ background: var(--primary); color: white; letter-spacing: .04em; }}
         .badge-data    {{ background: #22c55e22; color: var(--success); }}
-        /* Bug AN — clients previously had no badge style, so the role
+        /* clients previously had no badge style, so the role
            column on Nodes rendered an unstyled "client" text without
            the pill that data/manager rows have. */
         .badge-client  {{ background: #06b6d422; color: #22d3ee; }}
         .badge-unknown {{ background: #6b728022; color: var(--text-muted); }}
-        /* Bug AS — right-click context menu for the Data Explorer. */
+        /* right-click context menu for the Data Explorer. */
         .ctxmenu {{ position: absolute; z-index: 1000; min-width: 180px;
                     background: var(--surface); border: 1px solid var(--border);
                     border-radius: .375rem; box-shadow: 0 4px 12px #0008;
@@ -347,7 +347,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .topo-region-label {{ font-size: .9rem; font-weight: 700; margin-bottom: .75rem; }}
         .topo-dc {{ background: var(--surface2); border: 1px solid var(--border); border-radius: .5rem; padding: .875rem 1rem; margin-bottom: .75rem; }}
         .topo-dc-label {{ font-size: .85rem; font-weight: 600; margin-bottom: .5rem; color: var(--primary); }}
-        /* Bug AO — racks lay out HORIZONTALLY inside a DC (left-to-right);
+        /* racks lay out HORIZONTALLY inside a DC (left-to-right);
            hosts inside a rack stack VERTICALLY (top-to-bottom). Previously
            racks stacked vertically and hosts wrapped in a grid, which
            collapsed the rack-vs-host hierarchy for any DC with more
@@ -544,7 +544,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     </div>
 </div>
 
-<!-- ── Flush cache dialog (Bug AV — operator-driven cache eviction) ── -->
+<!-- ── Flush cache dialog (operator-driven cache eviction) ── -->
 <div id="flush-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeFlushCache()">
     <div class="modal-card">
         <h3>Flush cache replicas</h3>
@@ -583,7 +583,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     </div>
 </div>
 
-<!-- ── Volume edit dialog (Bug AV — AV-4-4 inline policy editor) ── -->
+<!-- ── Volume edit dialog (inline policy editor) ── -->
 <div id="volume-edit-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeVolumeEdit()">
     <div class="modal-card">
         <h3>Edit volume policy</h3>
@@ -598,7 +598,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <label>Volume ID</label>
             <input id="ve-volume-id" class="form-input" readonly>
         </div>
-        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Mandatory replicas (Bug BT-1)</div>
+        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Mandatory replicas</div>
         <div class="modal-row">
             <label>hot</label>
             <input id="ve-mand-hot" class="form-input" type="number" min="0" max="9" step="1">
@@ -615,7 +615,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <label>tape</label>
             <input id="ve-mand-tape" class="form-input" type="number" min="0" max="9" step="1">
         </div>
-        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Anchor (Bug BT-2)</div>
+        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Anchor</div>
         <div class="modal-row">
             <label>datacenter</label>
             <input id="ve-anchor-dc" class="form-input" type="text" placeholder="e.g. dc-a">
@@ -630,7 +630,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <option value="tape">tape</option>
             </select>
         </div>
-        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Spill policy (Bug BZ)</div>
+        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Spill policy</div>
         <div class="modal-row">
             <label>allow spill</label>
             <select id="ve-spill-allow" class="form-input">
@@ -725,7 +725,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <input id="vs-volume-id" class="form-input" readonly>
         </div>
         <div class="modal-row">
-            <label>scrub_interval_secs <span style="color:var(--warning);font-size:.7rem">(deprecated, Bug BC-13)</span></label>
+            <label>scrub_interval_secs <span style="color:var(--warning);font-size:.7rem">(deprecated)</span></label>
             <input id="vs-scrub-secs" class="form-input" type="number" min="0" step="60" placeholder="(ignored — set cluster [scrub] block instead)">
             <div style="font-size:.7rem;color:var(--text-muted);margin-top:.2rem">
                 Per-volume scrub cadence is no longer effective: data nodes scrub by disk,
@@ -744,7 +744,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     </div>
 </div>
 
-<!-- Bug BC-12d — Unquarantine confirmation dialog -->
+<!-- Unquarantine confirmation dialog -->
 <div id="unquarantine-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeUnquarantineModal()">
     <div class="modal-card" style="max-width:32rem">
         <h3 style="color:var(--danger)">Unquarantine <span id="uq-hostname"></span></h3>
@@ -811,7 +811,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         return null; // keep default class
     }}
 
-    // Bug AT — set the innerHTML of an element while preserving the
+    // set the innerHTML of an element while preserving the
     // window's scroll position. Replacing innerHTML on an in-view
     // element resets scrollTop to 0 when the new content is shorter
     // than the scroll offset, which looks to the user like the page
@@ -867,7 +867,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
         // ── Health banner
         const h = stats.health || 'unknown';
-        // Bug BH-8 — count managers + data only (infra_*); clients are
+        // count managers + data only (infra_*); clients are
         // consumers and must not drag the ratio. Fall back to the legacy
         // all-node fields if an older manager hasn't shipped infra_*.
         const infraHealthy = stats.infra_healthy ?? stats.healthy_nodes;
@@ -909,7 +909,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         netBar.style.width = netPct + '%';
         if (barColor(netPct)) netBar.style.background = barColor(netPct);
 
-        // ── Bug AK — logical claimed bytes vs phantom (metadata without on-disk data).
+        // ── logical claimed bytes vs phantom (metadata without on-disk data).
         const logical = stats.logical_bytes || 0;
         const phantom = stats.phantom_bytes_estimate || 0;
         document.getElementById('logical-bytes').textContent = fmtBytes(logical);
@@ -937,7 +937,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         // ── Tier breakdown
         renderTierBreakdown(stats.tier_breakdown || []);
 
-        // ── Bug BT-4 — chunk placement distribution (Bug BX-6 metric)
+        // ── chunk placement distribution
         renderChunkPlacement(stats.chunk_placement);
 
         // ── Scrub results (one card per node + level)
@@ -947,8 +947,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         renderNodes(nodes);
     }}
 
-    // Bug BT-4 — render the chunk placement-state distribution (Bug BX-6
-    // `/api/v1/stats.chunk_placement`) as a stacked bar + colour legend.
+    // render the chunk placement-state distribution
+    // (`/api/v1/stats.chunk_placement`) as a stacked bar + colour legend.
     function renderChunkPlacement(cp) {{
         const el = document.getElementById('chunk-placement-content');
         if (!el) return;
@@ -1074,7 +1074,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         el.innerHTML = sorted.map(renderScrubCard).join('');
     }}
 
-    // Bug AN — stable sort + per-role grouping for the Home page "Data &
+    // stable sort + per-role grouping for the Home page "Data &
     // Manager Nodes" table. Order:
     //   1. role (manager → data → client → other), so each kind clusters
     //   2. datacenter/location (groups within DC together)
@@ -1108,7 +1108,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         document.getElementById('nodes-summary').textContent =
             healthy + '/' + sorted.length + ' healthy';
 
-        // Bug AN — split the "Used" column into separate cells for bar
+        // split the "Used" column into separate cells for bar
         // and value. Previously they shared one flex row inside a single
         // <td>, so variable text widths shifted the bars left/right and
         // they didn't line up vertically down the column.
@@ -1123,7 +1123,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 ? Math.round(n.used_capacity / n.total_capacity * 100) : 0;
             const barFill = usedPct > 90 ? 'var(--danger)'
                           : usedPct > 75 ? 'var(--warning)' : 'var(--primary)';
-            // Bug AP — manager nodes have no disks of their own; the
+            // manager nodes have no disks of their own; the
             // utilization bar would always read 0% which is misleading.
             // Render an em-dash instead so it's visually obvious that
             // the metric doesn't apply.
@@ -1197,7 +1197,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         '/ui/settings':   renderSettings,
     }};
 
-    // Bug BC-12e — Integrity feed page. Lists every integrity-related
+    // Integrity feed page. Lists every integrity-related
     // audit row (quarantine, unquarantine, scrub faults, read mismatch,
     // orphan in-state-missing). Polls every 5s while the page is open.
     let _integrityTimer = null;
@@ -1206,7 +1206,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <div class="page-header">
                 <h2>Integrity</h2>
                 <p class="page-desc">
-                    Data-integrity events across the cluster (Bug BC). Quarantined nodes,
+                    Data-integrity events across the cluster. Quarantined nodes,
                     scrub faults, read-hash mismatches, orphan reaps. Click a row to jump
                     to the node detail panel.
                 </p>
@@ -1347,7 +1347,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 </div>
                 <div class="metric-row" style="margin-top:.25rem"><span class="metric-label">Free</span><span class="metric-value" id="raw-free" style="color:var(--success)">—</span></div>
             </div>
-            <!-- Bug AN — drop the "After replication factor (÷ hot RF)"
+            <!-- drop the "After replication factor (÷ hot RF)"
                  subheader (the math is per-tier now anyway, and the title
                  already conveys the intent). Card body structurally mirrors
                  Raw Capacity so the rows line up at the same vertical
@@ -1364,7 +1364,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     <div class="progress-bar"><div class="progress-fill success" id="net-bar" style="width:0%"></div></div>
                 </div>
                 <div class="metric-row" style="margin-top:.25rem"><span class="metric-label">Free</span><span class="metric-value" id="net-free" style="color:var(--success)">—</span></div>
-                <!-- Bug AK — show logical bytes claimed by file metadata vs net actually on disk. -->
+                <!-- show logical bytes claimed by file metadata vs net actually on disk. -->
                 <div class="metric-row" style="margin-top:.6rem;border-top:1px solid var(--border-color);padding-top:.4rem"><span class="metric-label" title="Sum of file sizes in metadata (replicas deduped). Should match Net Used in a healthy cluster.">Logical</span><span class="metric-value" id="logical-bytes">—</span></div>
                 <div class="metric-row"><span class="metric-label" title="Logical − Net Used. Non-zero indicates file metadata referencing chunks that aren't on any disk (data-node wipe, ENOSPC unlink cascade, etc.). A scrub-driven GC would reclaim these.">Phantom</span><span class="metric-value" id="phantom-bytes" style="color:var(--text-muted)">—</span></div>
             </div>
@@ -1406,7 +1406,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         <div class="metric-card" style="margin-top:1rem">
             <h3>Chunk Placement</h3>
             <div style="font-size:.72rem;color:var(--text-muted);margin-bottom:.75rem">
-                Every logical chunk classified by its replica placement vs the volume goal (Bug BX)
+                Every logical chunk classified by its replica placement vs the volume goal
             </div>
             <div id="chunk-placement-content"><div class="placeholder">Loading…</div></div>
         </div>
@@ -1441,7 +1441,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             '<div class="page-header"><h2>Topology</h2><p class="page-desc">Region → DC → Rack → Host hierarchy</p></div>' +
             '<div id="topo-tree" class="topo-root"><div class="placeholder">Loading topology…</div></div>';
         await refreshTopology();
-        // Bug AT — refresh ONLY the topo-tree element on each tick (not
+        // refresh ONLY the topo-tree element on each tick (not
         // the whole page). The previous code recursively called
         // renderTopology which replaces page-content innerHTML every
         // 15s, blowing away scroll position and any user interaction
@@ -1483,7 +1483,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         for (const [region, dcs] of sortedEntries(tree)) {{
             html += `<div class="topo-region"><div class="topo-region-label">🌐 Region: <b>${{region}}</b></div>`;
             for (const [dc, racks] of sortedEntries(dcs)) {{
-                // Bug AO — wrap all racks of this DC in a horizontal flex
+                // wrap all racks of this DC in a horizontal flex
                 // container (.topo-racks); each .topo-rack inside is a
                 // vertical column of hosts. Yields the visual layout:
                 //
@@ -1523,7 +1523,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             }}
             html += '</div>';
         }}
-        // Bug AT — preserve scroll position across refresh. innerHTML
+        // preserve scroll position across refresh. innerHTML
         // assignment moves scrollTop back to 0 on long pages, making
         // the page look like it "jumped back" to the user. Snapshot
         // before, restore after.
@@ -1551,7 +1551,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             return;
         }}
 
-        // Bug AT — preserve scroll position across the periodic refresh
+        // preserve scroll position across the periodic refresh
         // (was setInterval 10s). innerHTML reset of the whole list resets
         // scrollTop to 0 which felt like a "jump back" on long node lists.
         const savedScroll = window.scrollY;
@@ -1571,7 +1571,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             const barCol = pct>90?'var(--danger)':pct>75?'var(--warning)':'var(--primary)';
             const isMaintenance = h === 'maintenance';
 
-            // Bug AP — manager + client nodes have no disks of their own;
+            // manager + client nodes have no disks of their own;
             // showing a "Used / Utilisation" row that always reads 0
             // (or — / —) is misleading clutter. For those roles, drop the
             // size/util rows entirely. For data nodes keep the full
@@ -1588,11 +1588,11 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                    </div>`
                 : '';
 
-            // Bug AR — per-disk table for data nodes. Lets the operator
+            // per-disk table for data nodes. Lets the operator
             // spot a single full disk (which would otherwise be hidden
             // behind the node-level aggregate, e.g. data-primary01 with
             // 4 cold disks where one fills to 100% while the others stay
-            // at 2% — the symptom that drove the Bug AD fix).
+            // at 2% — the symptom that drove the earlier fix).
             const disks = Array.isArray(n.disks) ? n.disks : [];
             const diskTable = isStorageRole && disks.length > 0
                 ? `<div style="margin-top:.5rem">
@@ -1636,7 +1636,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                    </div>`
                 : '';
 
-            // Bug AX — show the manager's Raft-leader status, render
+            // show the manager's Raft-leader status, render
             // a client's source IP (clients have no gRPC listener), and
             // surface last_seen on every node so operators can see how
             // fresh the heartbeat is at a glance.
@@ -1649,13 +1649,13 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             const lastSeenRow = n.last_seen_ms
                 ? `<div class="node-meta-item"><span>Last seen</span>${{timeAgo(n.last_seen_ms)}}</div>`
                 : `<div class="node-meta-item"><span>Last seen</span>—</div>`;
-            // Bug AY — show binary version + build date. Empty values
-            // mean the node pre-dates Bug AY or wasn't queried directly
+            // show binary version + build date. Empty values
+            // mean the node pre-dates that field or wasn't queried directly
             // (older clients, peer managers).
             const versionRow = (n.version || n.build_date)
                 ? `<div class="node-meta-item"><span>Version</span>${{n.version || '—'}}${{n.build_date ? ' / ' + n.build_date : ''}}</div>`
                 : '';
-            // Bug BC-12c — Quarantined badge + details panel. The
+            // Quarantined badge + details panel. The
             // operator never needs to curl: the reason, triggering
             // chunk, fault count, and unquarantine action all live
             // in the card.
@@ -1726,7 +1726,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         await refreshNodesList();
     }}
 
-    // ── Bug BC-12d — Unquarantine confirmation modal ────────────────
+    // ── Unquarantine confirmation modal ────────────────
     function openUnquarantineModal(nodeId, hostname, reason, chunkId, faultCount, summary) {{
         document.getElementById('uq-node-id').value   = nodeId;
         document.getElementById('uq-hostname').textContent = hostname;
@@ -1781,7 +1781,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
     // ── Volumes page ──────────────────────────────────────────────────────────
 
-    // Bug AV (AV-4-3 / AV-4-4) — Volumes page extended with a per-row
+    // Volumes page extended with a per-row
     // policy detail card and an inline "Edit policy" button. The list
     // endpoint now embeds the full AV-3-5 projection (AV-4-2), so the
     // card data comes from the same fetch — no per-volume GET needed.
@@ -1901,7 +1901,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
     async function renderVolumes() {{
         document.getElementById('page-content').innerHTML =
-            '<div class="page-header"><h2>Volumes</h2><p class="page-desc">Storage volumes, file distribution, and cache policy (Bug AV)</p></div>' +
+            '<div class="page-header"><h2>Volumes</h2><p class="page-desc">Storage volumes, file distribution, and cache policy</p></div>' +
             '<div id="volumes-list"><div class="placeholder">Loading…</div></div>';
         const data = await fetch('/api/v1/volumes').then(r => r.json()).catch(() => ({{count:0, volumes:[]}}));
         window._volumesData = data.volumes || [];
@@ -1926,17 +1926,17 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             document.getElementById('ve-promote-reads').value = cr.promote_reads || '';
             document.getElementById('ve-promote-window').value = cr.promote_window_secs || '';
             document.getElementById('ve-cooldown').value = cr.cooldown_secs || '';
-            // Bug BT-1 — prefill mandatory replicas.
+            // prefill mandatory replicas.
             const mr = v.mandatory_replicas || {{}};
             document.getElementById('ve-mand-hot').value  = mr.hot  || 0;
             document.getElementById('ve-mand-warm').value = mr.warm || 0;
             document.getElementById('ve-mand-cold').value = mr.cold || 0;
             document.getElementById('ve-mand-tape').value = mr.tape || 0;
-            // Bug BT-2 — prefill anchor.
+            // prefill anchor.
             const an = v.anchor || {{}};
             document.getElementById('ve-anchor-dc').value = an.datacenter || '';
             document.getElementById('ve-anchor-tier').value = an.required_tier || '';
-            // Bug BZ — prefill spill policy.
+            // prefill spill policy.
             const sp = v.spill || {{}};
             document.getElementById('ve-spill-allow').value =
                 (sp.allow === true) ? 'true' : (sp.allow === false) ? 'false' : '';
@@ -1984,20 +1984,20 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             alert('warm.max must be >= warm.min');
             return;
         }}
-        // Bug BT-1 — mandatory replicas (per tier).
+        // mandatory replicas (per tier).
         const mandBody = {{
             hot_replicas:  intOrNull('ve-mand-hot'),
             warm_replicas: intOrNull('ve-mand-warm'),
             cold_replicas: intOrNull('ve-mand-cold'),
             tape_replicas: intOrNull('ve-mand-tape'),
         }};
-        // Bug BT-2 — anchor policy.
+        // anchor policy.
         const dc = document.getElementById('ve-anchor-dc').value.trim();
         const rt = document.getElementById('ve-anchor-tier').value.trim();
         const anchorBody = {{}};
         if (dc !== '') anchorBody.datacenter = dc;
         if (rt !== '') anchorBody.required_tier = rt;
-        // Bug BZ — spill policy body.
+        // spill policy body.
         const spillAllow = document.getElementById('ve-spill-allow').value;
         const forbidTiers = ['hot','warm','cold','tape']
             .filter(t => document.getElementById('ve-spill-forbid-' + t).checked);
@@ -2041,7 +2041,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         if (Object.keys(anchorBody).length > 0) {{
             lines.push(await post('set-anchor', anchorBody));
         }}
-        // Bug BZ — post spill policy when the operator set anything.
+        // post spill policy when the operator set anything.
         if (spillBody.allow !== null || forbidTiers.length > 0 || forbidDcs.length > 0) {{
             lines.push(await post('set-spill', spillBody));
         }}
@@ -2110,7 +2110,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
     // ── Data Explorer page ────────────────────────────────────────────────────
 
-    // Bug AS — folder-aware data explorer.
+    // folder-aware data explorer.
     //
     // Pre-fix the explorer dumped every file in the cluster (paginated to
     // the first 1000 by /api/v1/files) as a flat table with the whole
@@ -2386,7 +2386,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         }}
     }}
 
-    // ── Bug AV (AV-3-4) — Flush cache modal ──────────────────────────────────
+    // ── Flush cache modal ──────────────────────────────────
 
     function openFlushCache(prefix) {{
         document.getElementById('fc-path').value = prefix || '';
@@ -2491,9 +2491,9 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             if (s === 'pending')   return 'var(--text-muted)';
             return 'var(--warning)'; // copying/verifying/completing
         }};
-        // Bug AT — wrap the innerHTML write in setHtmlPreserveScroll so
+        // wrap the innerHTML write in setHtmlPreserveScroll so
         // the 5s auto-refresh doesn't yank the user back to the top of
-        // a long migration list. The server-side sort (Bug AM) plus
+        // a long migration list. The server-side sort plus
         // scroll preservation here means the table stays readable
         // during sustained migration storms.
         setHtmlPreserveScroll(el,
@@ -2560,7 +2560,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 const resultColor = ok ? 'var(--success)' : e.result === 'pending' ? 'var(--warning)' : 'var(--text-muted)';
                 return `<tr>
                     <td style="font-size:.78rem;color:var(--text-muted);white-space:nowrap">
-                        ${{/* Bug AG — AuditEntry.timestamp is SECONDS-since-epoch (chrono::Utc::now().timestamp() in audit.rs). JS new Date() expects MS. Without *1000 every entry rendered as 1970-01-2x. */ e.timestamp ? new Date(e.timestamp * 1000).toLocaleString() : '—'}}
+                        ${{/* AuditEntry.timestamp is SECONDS-since-epoch (chrono::Utc::now().timestamp() in audit.rs). JS new Date() expects MS. Without *1000 every entry rendered as 1970-01-2x. */ e.timestamp ? new Date(e.timestamp * 1000).toLocaleString() : '—'}}
                     </td>
                     <td style="font-size:.8rem">${{e.actor||'—'}}</td>
                     <td style="font-family:monospace;font-size:.78rem">${{e.action||'—'}}</td>
@@ -2978,5 +2978,25 @@ mod bug_bk_scrub_tests {
             assert!(html.contains(id), "modal must contain spill control {id}");
         }
         assert!(html.contains("post('set-spill'"), "submit posts set-spill");
+    }
+}
+
+#[cfg(test)]
+mod rendered_text_no_bug_refs {
+    use super::*;
+
+    /// Internal bug-tracker IDs (e.g. "Bug BX", "Bug BC") must never leak
+    /// into the served WebUI — neither rendered, operator-facing text nor
+    /// the CSS/HTML/JS comments shipped inside the page (View Source). The
+    /// whole `render_dashboard` output is the served document, so a blanket
+    /// scan catches any future regression in label or comment. Rust source
+    /// comments (this test module) are not part of the output and unaffected.
+    #[test]
+    fn no_bug_ids_in_served_dashboard() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        assert!(
+            !html.contains("Bug "),
+            "internal bug-tracker IDs must not appear in the served WebUI (rendered text or shipped comments)"
+        );
     }
 }
