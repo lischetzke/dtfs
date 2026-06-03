@@ -158,10 +158,11 @@ are unchanged; only WHEN the stamp is recomputed changes.
   the `VERSION_STRING`/clap wiring compiles and `--version` emits the
   stamp.
 - **BS-3 (2026-06-02)** — `changelog/UNRELEASED.md` entry added.
-- **Live (at deploy)** — the wrapper build that produces the BU/BV/BT
-  binaries stamps today's instant; deployed nodes report it via
-  `dtfs-* --version` and `/api/v1/nodes.build_date` (no longer the frozen
-  `20260522-131629`).
+- **Live (2026-06-03)** — `scripts/build-linux-amd64.sh` produced binaries
+  reporting `dtfs-manager --version` → `v0.0.0-dev (built 20260603-083741)`
+  (the build instant; previously frozen at `20260522-131629`). Deployed to
+  all minicluster nodes; `dtfs-data --version` / `dtfs-fuse --version`
+  report the same fresh stamp. Confirmed distinct from the old frozen date.
 
 ---
 
