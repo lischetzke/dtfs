@@ -22,10 +22,13 @@ Part A = what to know about DTFS. Part B = how to work on it.
 - Token-efficient: targeted Grep/Read with `offset`/`limit` over
   full-file reads; narrow edits over re-emitting whole files; reuse
   already-read context; batch independent tool calls into one message.
-- Simplest working solution. No speculative features, no abstractions
-  for single-use code, no error handling for impossible cases, no
-  docstrings/types on code you aren't changing. Three similar lines beat
-  a premature abstraction.
+- Don't over-engineer. Simplest solution that works, for code and for
+  actions alike — fewest moving parts, smallest diff, least new
+  machinery. Solve the problem in front of you, not an imagined future
+  one. No speculative features, no abstractions for single-use code, no
+  error handling for impossible cases, no docstrings/types on code you
+  aren't changing. Three similar lines beat a premature abstraction. When
+  in doubt, do the smaller thing.
 - Reviews and debugging: state the finding, show the fix, stop. Never
   speculate about a bug without reading the code first; if the cause is
   unclear, say so.
