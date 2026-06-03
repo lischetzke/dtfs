@@ -376,24 +376,31 @@ impl DataService for DataServiceImpl {
         // Cheap implementation: enumerate everything, sort, then slice.
         // A future revision can cache the listing between paged calls
         // (orphan_scrub typically iterates all pages back-to-back).
-        let mut all: Vec<String> = self.store.list_all_chunk_ids().await
+        // Bug CB — carry each chunk's `.dat` mtime alongside its id so the
+        // manager's orphan reaper has a durable grace clock. Sort by id so
+        // the opaque page_token cursor stays stable; the mtime rides along.
+        let mut all: Vec<(String, u64)> = self.store.list_all_chunks_with_mtime().await
             .map_err(|e| Status::internal(format!("list chunks failed: {e}")))?;
-        all.sort();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
 
         let start_idx = if req.page_token.is_empty() {
             0
         } else {
-            all.binary_search(&req.page_token).map(|i| i + 1).unwrap_or_else(|i| i)
+            all.binary_search_by(|c| c.0.as_str().cmp(req.page_token.as_str()))
+                .map(|i| i + 1)
+                .unwrap_or_else(|i| i)
         };
         let end_idx = (start_idx + limit).min(all.len());
         let next = if end_idx < all.len() {
-            all[end_idx - 1].clone()
+            all[end_idx - 1].0.clone()
         } else {
             String::new()
         };
 
+        let page = &all[start_idx..end_idx];
         Ok(Response::new(ListChunksResponse {
-            chunk_ids: all[start_idx..end_idx].to_vec(),
+            chunk_ids: page.iter().map(|c| c.0.clone()).collect(),
+            chunk_mtimes_ms: page.iter().map(|c| c.1).collect(),
             next_page_token: next,
         }))
     }

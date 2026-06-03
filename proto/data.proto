@@ -58,6 +58,15 @@ message ListChunksResponse {
   repeated string chunk_ids = 1;
   // Opaque cursor; empty when no more pages remain.
   string next_page_token = 2;
+  // Bug CB — on-disk `.dat` mtime in Unix milliseconds, index-aligned
+  // with `chunk_ids`. The orphan reaper measures the reap grace against
+  // this DURABLE per-chunk age instead of a manager-local "first
+  // observed orphan" clock, so the grace survives manager restarts and
+  // leadership changes (see scheduler::orphan_reap_due). A pre-Bug-CB
+  // data node leaves this empty; the manager treats a missing/zero
+  // mtime as "age unknown -> not yet due" and defers the reap rather
+  // than risk dropping an in-flight write.
+  repeated uint64 chunk_mtimes_ms = 3;
 }
 
 // AV-4-1c — body for RecordCacheHit. Same shape as the

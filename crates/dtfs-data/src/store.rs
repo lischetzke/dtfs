@@ -719,13 +719,18 @@ impl ChunkStore {
             .collect()
     }
 
-    /// Bug BC-6 — enumerate every chunk_id this node holds on disk.
-    /// Walks each configured disk's `chunks/aa/bb/<id>.dat` tree and
-    /// returns the stems whose `.meta` companion also exists. Used by
-    /// the manager-side orphan_scrub planner (BC-7). Linear in chunk
-    /// count; OK at the ~24h cadence we tick orphan_scrub on.
-    pub async fn list_all_chunk_ids(&self) -> DtfsResult<Vec<String>> {
-        let mut out: Vec<String> = Vec::new();
+    /// Bug BC-6 / Bug CB — enumerate every chunk this node holds on disk
+    /// together with its `.dat` mtime (Unix ms). Walks each configured
+    /// disk's `chunks/aa/bb/<id>.dat` tree and returns the stems whose
+    /// `.meta` companion also exists. Used by the manager-side
+    /// orphan_scrub planner (BC-7); the mtime is the durable grace clock
+    /// the reaper measures against (Bug CB, scheduler::orphan_reap_due).
+    /// Linear in chunk count; OK at the ~24h cadence we tick orphan_scrub
+    /// on. A stat failure on an individual file yields mtime 0 ("age
+    /// unknown"), which the manager treats as not-yet-due rather than
+    /// reaping with no grace.
+    pub async fn list_all_chunks_with_mtime(&self) -> DtfsResult<Vec<(String, u64)>> {
+        let mut out: Vec<(String, u64)> = Vec::new();
         for disk in self.disk_manager.all_disks() {
             let chunks_dir = disk.mount_path.join("chunks");
             if !chunks_dir.exists() {
@@ -749,7 +754,17 @@ impl ChunkStore {
                             // surface a half-written chunk to the orphan
                             // reaper.
                             if p.with_extension("meta").exists() {
-                                out.push(stem);
+                                let mtime_ms = f
+                                    .metadata()
+                                    .await
+                                    .ok()
+                                    .and_then(|m| m.modified().ok())
+                                    .and_then(|t| {
+                                        t.duration_since(std::time::UNIX_EPOCH).ok()
+                                    })
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                out.push((stem, mtime_ms));
                             }
                         }
                     }
