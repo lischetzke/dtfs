@@ -629,6 +629,28 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <option value="tape">tape</option>
             </select>
         </div>
+        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Spill policy (Bug BZ)</div>
+        <div class="modal-row">
+            <label>allow spill</label>
+            <select id="ve-spill-allow" class="form-input">
+                <option value="">(inherit cluster default)</option>
+                <option value="true">yes — spill allowed</option>
+                <option value="false">no — fail the write instead</option>
+            </select>
+        </div>
+        <div class="modal-row">
+            <label>forbid tiers</label>
+            <label style="font-weight:normal;display:flex;gap:.6rem;flex-wrap:wrap">
+                <span><input id="ve-spill-forbid-hot"  type="checkbox"> hot</span>
+                <span><input id="ve-spill-forbid-warm" type="checkbox"> warm</span>
+                <span><input id="ve-spill-forbid-cold" type="checkbox"> cold</span>
+                <span><input id="ve-spill-forbid-tape" type="checkbox"> tape</span>
+            </label>
+        </div>
+        <div class="modal-row">
+            <label>forbid datacenters</label>
+            <input id="ve-spill-forbid-dcs" class="form-input" type="text" placeholder="comma-separated, e.g. dc-b, dc-c">
+        </div>
         <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Cache replicas</div>
         <div class="modal-row">
             <label>warm.min</label>
@@ -1913,6 +1935,17 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             const an = v.anchor || {{}};
             document.getElementById('ve-anchor-dc').value = an.datacenter || '';
             document.getElementById('ve-anchor-tier').value = an.required_tier || '';
+            // Bug BZ — prefill spill policy.
+            const sp = v.spill || {{}};
+            document.getElementById('ve-spill-allow').value =
+                (sp.allow === true) ? 'true' : (sp.allow === false) ? 'false' : '';
+            const ft = sp.forbidden_tiers || [];
+            document.getElementById('ve-spill-forbid-hot').checked  = ft.includes('hot');
+            document.getElementById('ve-spill-forbid-warm').checked = ft.includes('warm');
+            document.getElementById('ve-spill-forbid-cold').checked = ft.includes('cold');
+            document.getElementById('ve-spill-forbid-tape').checked = ft.includes('tape');
+            document.getElementById('ve-spill-forbid-dcs').value =
+                (sp.forbidden_datacenters || []).join(', ');
         }}
         document.getElementById('ve-result').style.display = 'none';
         document.getElementById('volume-edit-modal').classList.remove('hidden');
@@ -1963,6 +1996,17 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         const anchorBody = {{}};
         if (dc !== '') anchorBody.datacenter = dc;
         if (rt !== '') anchorBody.required_tier = rt;
+        // Bug BZ — spill policy body.
+        const spillAllow = document.getElementById('ve-spill-allow').value;
+        const forbidTiers = ['hot','warm','cold','tape']
+            .filter(t => document.getElementById('ve-spill-forbid-' + t).checked);
+        const forbidDcs = document.getElementById('ve-spill-forbid-dcs').value
+            .split(',').map(s => s.trim()).filter(s => s !== '');
+        const spillBody = {{
+            allow: spillAllow === '' ? null : (spillAllow === 'true'),
+            forbidden_tiers: forbidTiers,
+            forbidden_datacenters: forbidDcs,
+        }};
 
         const btn = document.getElementById('ve-submit');
         btn.disabled = true; btn.textContent = 'Applying…';
@@ -1995,6 +2039,10 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         }}
         if (Object.keys(anchorBody).length > 0) {{
             lines.push(await post('set-anchor', anchorBody));
+        }}
+        // Bug BZ — post spill policy when the operator set anything.
+        if (spillBody.allow !== null || forbidTiers.length > 0 || forbidDcs.length > 0) {{
+            lines.push(await post('set-spill', spillBody));
         }}
         lines.push(await post('set-cache', cacheBody));
 
@@ -2910,5 +2958,24 @@ mod bug_bk_scrub_tests {
         assert!(html.contains("post('set-mandatory'"), "submit posts set-mandatory");
         assert!(html.contains("post('set-anchor'"), "submit posts set-anchor");
         assert!(html.contains("post('set-cache'"), "submit still posts set-cache");
+    }
+
+    /// Bug BZ — the volume-edit modal exposes the spill-policy controls
+    /// (allow override + forbidden tiers/datacenters) and the submit posts
+    /// to set-spill.
+    #[test]
+    fn volume_modal_edits_spill_policy() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        for id in [
+            "ve-spill-allow",
+            "ve-spill-forbid-hot",
+            "ve-spill-forbid-warm",
+            "ve-spill-forbid-cold",
+            "ve-spill-forbid-tape",
+            "ve-spill-forbid-dcs",
+        ] {
+            assert!(html.contains(id), "modal must contain spill control {id}");
+        }
+        assert!(html.contains("post('set-spill'"), "submit posts set-spill");
     }
 }

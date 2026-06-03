@@ -299,3 +299,12 @@
 - **Bug BT (follow-on) - full per-tier cache editing.** `set-cache` and the
   WebUI volume editor now accept cold + tape cache `(min,max)` in addition to
   warm + hot, completing the per-tier cache controls.
+- **Bug BZ - per-volume spill-over exclusions.** A volume can now forbid the
+  manager from spilling its chunks (Bug BX-2 capacity spill) onto specific
+  tiers or datacenters, or disable spill entirely. New VolumeConfig `spill`
+  policy ({allow, forbidden_tiers, forbidden_datacenters}), a
+  `POST /api/v1/volumes/{id}/set-spill` endpoint, and a Spill-policy section in
+  the WebUI volume editor (allow override + per-tier forbid checkboxes + forbid
+  datacenters). The capacity-spill candidate ranker drops any disk on a
+  forbidden tier or in a forbidden datacenter; the anchor copy is never spilled
+  regardless. `#[serde(default)]` keeps old snapshots loadable.
