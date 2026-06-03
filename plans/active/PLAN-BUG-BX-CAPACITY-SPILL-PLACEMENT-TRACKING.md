@@ -298,7 +298,7 @@ The user's two requirements:
 
 ### BX-8: Release cases + changelog + docs
 
-- Status: ⬜
+- Status: 🟨 (2026-06-03 — case 36 + changelog done; spill/rebalance e2e case deferred with BX-5)
 - Files: `tests/release/cases/NN-capacity-spill.sh`,
   `tests/release/cases/NN-placement-distribution.sh`,
   `changelog/UNRELEASED.md`, `docs/src/...` (placement/capacity ops).
@@ -334,7 +334,28 @@ The user's two requirements:
 
 ## 6. Verification log
 
-> Append per-task.
+- **BX-1/BX-3/BX-7 (2026-06-03)** — pure ranking + classifier + spill config.
+  Units `placement::bx1_ranking_tests` (3), `placement_state::tests` (7) PASS.
+- **BX-4 (2026-06-03)** — per-tier under-replication. Unit
+  `scheduler::bx4_under_replication_tests::detects_missing_mandated_tier` PASS;
+  full manager suite 173 passed, 0 failed (no regression).
+- **BX-5 (2026-06-03)** — excess-removal planner. Units
+  `scheduler::bx5_excess_removal_tests` (3) PASS. Live delete-dispatcher
+  deferred (Deviations).
+- **BX-2 (2026-06-03)** — spill placement compiles + manager suite green.
+  Live spill branch exercised only when ALL of a tier is full; not forced on
+  the lab (destructive — would require filling data02-warm too). Covered by
+  unit/compile; e2e deferred with BX-5.
+- **BX-6 (2026-06-03)** — deployed the BX manager (build 20260603-092048) to
+  all three minicluster managers. Release case
+  `tests/release/cases/36-placement-distribution.sh` STATUS: PASS;
+  `/api/v1/stats.chunk_placement` returned
+  `missing=0 undergoal=0 misplaced=121 stable=159 overgoal=0 pending_deletion=0`
+  — the metric correctly surfaces that 121 chunks lack their mandated warm-tier
+  copies while data01-warm is 100% full (the exact degraded-placement state the
+  feature exposes; classified misplaced, not lost).
+- **BX-8 (2026-06-03)** — case 36 + changelog landed; docs note + the
+  fill→spill→free→rebalance e2e case deferred with the BX-5 dispatcher.
 
 ---
 

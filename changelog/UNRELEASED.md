@@ -239,3 +239,16 @@
   reads. (BV-3) `cluster_status.data_nodes`/`data_nodes_healthy` now
   count only `role==Data`, matching `stats.data_node_count` (a
   3-manager + 2-data + 1-client roster reported `data_nodes:6`).
+- **Bug BX - capacity spill + per-chunk placement-state tracking.** When the
+  mandated tier is globally full, a write no longer fails: with
+  `[placement] allow_capacity_spill` (default on) the manager spills the chunk
+  to the fastest tier with room (hot > warm > cold > tape, then nearest, then
+  most free) and the schedulers reconcile it to the correct tier once capacity
+  returns. The anchor copy is never spilled out of its DC/tier. The
+  under-replication scheduler was fixed to enforce mandatory replicas **per
+  tier** - previously it derived a chunk's tier from one replica row, so a
+  chunk that landed only on cold (warm full at write) never had its missing
+  warm copies backfilled. `/api/v1/stats.chunk_placement` now reports the
+  cluster-wide distribution of chunk placement states (missing / undergoal /
+  misplaced / stable / overgoal / pending_deletion), one count per logical
+  chunk - the metric the WebUI chunk-redundancy panel consumes.
