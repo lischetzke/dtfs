@@ -566,6 +566,57 @@ pub struct VolumeConfig {
     /// `None` on any sub-field means "inherit cluster default".
     #[serde(default)]
     pub schedules: VolumeSchedules,
+
+    /// Bug BZ — per-volume capacity-spill policy. Controls whether and
+    /// WHERE the manager may spill this volume's chunks when the mandated
+    /// tier is full (Bug BX-2). `#[serde(default)]` keeps old snapshots
+    /// loadable (default = inherit the cluster `allow_capacity_spill`, no
+    /// tier/DC exclusions).
+    #[serde(default)]
+    pub spill: SpillPolicy,
+}
+
+/// Bug BZ — per-volume capacity-spill exclusions. When the mandated tier
+/// is globally full, Bug BX-2 spills a chunk to the fastest+nearest tier
+/// with room. This policy lets an operator forbid specific spill targets
+/// per volume — e.g. "never spill the cold archive onto hot SSD" or "never
+/// spill into datacenter dc-b". The anchor copy is never spilled regardless
+/// (Bug BX-2 invariant); these rules constrain the NON-anchor spill targets.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SpillPolicy {
+    /// Per-volume override of the cluster `[placement] allow_capacity_spill`.
+    /// `None` = inherit the cluster default; `Some(false)` = this volume
+    /// fails the write rather than spilling; `Some(true)` = spill allowed.
+    #[serde(default)]
+    pub allow: Option<bool>,
+    /// Tiers this volume must NEVER spill onto (lowercase: "hot"/"warm"/
+    /// "cold"/"tape"). A candidate disk on a forbidden tier is dropped from
+    /// the spill ranking.
+    #[serde(default)]
+    pub forbidden_tiers: Vec<String>,
+    /// Datacenters this volume must NEVER spill into. A candidate disk on a
+    /// node in a forbidden datacenter is dropped from the spill ranking.
+    #[serde(default)]
+    pub forbidden_datacenters: Vec<String>,
+}
+
+impl SpillPolicy {
+    /// Bug BZ — is spill to `(datacenter, tier)` permitted for this volume?
+    /// Tier comparison is case-insensitive against the lowercase tier name.
+    pub fn allows_target(&self, datacenter: &str, tier: DiskTier) -> bool {
+        let tier_name = tier.to_string(); // Display = lowercase
+        if self.forbidden_tiers.iter().any(|t| t.eq_ignore_ascii_case(&tier_name)) {
+            return false;
+        }
+        if self
+            .forbidden_datacenters
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(datacenter))
+        {
+            return false;
+        }
+        true
+    }
 }
 
 /// Bug AZ-1 — per-volume background-job cadence overrides. Lets
@@ -677,6 +728,7 @@ impl Default for VolumeConfig {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             schedules: VolumeSchedules::default(),
+            spill: SpillPolicy::default(),
         }
     }
 }
@@ -802,6 +854,31 @@ mod tests {
         assert_eq!(tr.hot, 3);
         assert_eq!(tr.warm, 2);
         assert_eq!(tr.cold, 1);
+    }
+}
+
+#[cfg(test)]
+mod bug_bz_spill_policy_tests {
+    use super::{DiskTier, SpillPolicy};
+
+    // Bug BZ — forbidden tiers + datacenters block spill targets; an empty
+    // policy permits everything; tier match is case-insensitive.
+    #[test]
+    fn allows_target_respects_exclusions() {
+        let p = SpillPolicy {
+            allow: None,
+            forbidden_tiers: vec!["hot".into()],
+            forbidden_datacenters: vec!["dc-b".into()],
+        };
+        assert!(!p.allows_target("dc-a", DiskTier::Hot), "forbidden tier blocked");
+        assert!(!p.allows_target("dc-b", DiskTier::Warm), "forbidden dc blocked");
+        assert!(p.allows_target("dc-a", DiskTier::Warm), "allowed target permitted");
+        // Default policy forbids nothing.
+        let open = SpillPolicy::default();
+        assert!(open.allows_target("dc-z", DiskTier::Hot));
+        // Case-insensitive tier name.
+        let p2 = SpillPolicy { forbidden_tiers: vec!["HOT".into()], ..Default::default() };
+        assert!(!p2.allows_target("dc-a", DiskTier::Hot));
     }
 }
 

@@ -1274,9 +1274,22 @@ impl ManagerService for MetadataService {
                 // never spilled out of its DC/tier — the async anchor-lag
                 // scheduler still places the anchor copy (a missing anchor
                 // stays visible via BV-1 anchor_pending / BX-3 misplaced).
-                if !pcfg.allow_capacity_spill {
+                // Bug BZ — per-volume spill policy. `allow` overrides the
+                // cluster default (so a durability-first volume can fail-loud
+                // even when the cluster permits spill); `forbidden_tiers` /
+                // `forbidden_datacenters` constrain WHERE non-anchor spill may
+                // land (e.g. "never spill the cold archive onto hot SSD" or
+                // "never spill into dc-b").
+                let spill_policy = volume_cfg
+                    .as_ref()
+                    .map(|v| v.spill.clone())
+                    .unwrap_or_default();
+                let spill_allowed = spill_policy
+                    .allow
+                    .unwrap_or(pcfg.allow_capacity_spill);
+                if !spill_allowed {
                     return Err(Status::unavailable(format!(
-                        "No healthy data node has free space on tier {effective_tier:?} (all candidate disks below placement headroom or excluded); capacity spill disabled"
+                        "No healthy data node has free space on tier {effective_tier:?} (all candidate disks below placement headroom or excluded); capacity spill disabled for this volume"
                     )));
                 }
                 let mut candidates: Vec<crate::placement::CandidateDisk> = Vec::new();
@@ -1292,6 +1305,10 @@ impl ManagerService for MetadataService {
                             continue; // the mandated tier is the full one
                         }
                         if !pcfg.has_room(d.total_bytes, d.used_bytes) {
+                            continue;
+                        }
+                        // Bug BZ — drop spill targets this volume forbids.
+                        if !spill_policy.allows_target(&info.location.datacenter, d.tier) {
                             continue;
                         }
                         candidates.push(crate::placement::CandidateDisk {
@@ -2091,6 +2108,7 @@ mod bug_av_preferred_tier_tests {
             },
             anchor: None,
             schedules: dtfs_common::types::VolumeSchedules::default(),
+            spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: Some("dc-a".to_string()),
             write_safety: WriteSafety {
                 min_replicas_before_ack: 1,
