@@ -1844,7 +1844,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             el.innerHTML = '<div class="placeholder">No volumes yet. Create one with <code>dtfs-cli volume create</code>.</div>';
             return;
         }}
-        // Bug volumes-actions — each action gets its own column so the
+        // Actions layout — each action gets its own column so the
         // table column widths are stable. Button widths are fixed via
         // min-width sized to the LONGEST text variant ("Details" wins
         // over "Hide"; modal-opener buttons keep their full label
