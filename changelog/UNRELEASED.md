@@ -336,3 +336,19 @@
   node that predates Bug CB (no `chunk_mtimes_ms`) DEFERS reaping rather than
   reaping with no grace; reclamation resumes once data nodes are upgraded
   (roll data nodes after managers, per AGENTS.md A.4.2).
+- **Bug CC - read-driven cache promotion works regardless of which manager a
+  data node heartbeats to.** The tiering engine's per-(chunk,DC) read window and
+  its promote/demote tick are in-memory on the Raft LEADER, but a data node
+  heartbeats to whatever manager it connected to - often a FOLLOWER. The
+  heartbeat handler applied the heartbeat's per-chunk read counters to the LOCAL
+  manager's tiering engine, so reads that landed on a follower were invisible to
+  the leader's tick: read-hot chunks never promoted to a warm cache replica (the
+  tick saw zero reads for them and instead demoted them as idle, so caching only
+  ever evicted, never cached). The heartbeat now routes per-chunk reads to the
+  leader via a new `ClientRequest::ReportChunkReads` forwarded through the
+  existing `ForwardClientWrite` path; the manager service intercepts that variant
+  BEFORE Raft and applies it directly to the leader's tiering engine (the leader
+  self-forwards). The variant is not state-machine state - its apply arm is a
+  no-op. Verified live: a cold-only file read from a cold-cache client now
+  promotes a warm cache replica (`cache.promote` audit fires + the warm `.dat`
+  appears) even when the serving data node heartbeats to a follower.

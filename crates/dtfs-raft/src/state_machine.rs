@@ -1638,6 +1638,14 @@ fn apply_request(
             ClientResponse::WriteLeasesReleased { count }
         }
 
+        ClientRequest::ReportChunkReads { .. } => {
+            // Not state-machine state. The manager service intercepts this
+            // variant in `forward_client_write` and applies it directly to the
+            // leader's in-memory tiering engine; it must never reach Raft
+            // apply. This arm exists only for match exhaustiveness.
+            ClientResponse::Success
+        }
+
         ClientRequest::UpdateNodeDiskUsage { node_id, per_disk } => {
             // Bug AU — refresh per-disk total_bytes + used_bytes from
             // the heartbeat. Snapshots referencing an unknown disk_id

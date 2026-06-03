@@ -403,6 +403,22 @@ pub enum ClientRequest {
         now_ms: u64,
     },
 
+    /// Per-chunk read counters routed to the LEADER's tiering engine. The
+    /// tiering read-window + promote tick are in-memory on the leader, but a
+    /// data node heartbeats to whatever manager it connected to (often a
+    /// follower). A follower forwards its heartbeat's chunk reads here via
+    /// `ForwardClientWrite`; the manager service intercepts this variant
+    /// BEFORE Raft and applies it directly to the leader's tiering engine
+    /// (`TieringEngine::report_access`), so reads landing on a follower still
+    /// reach the engine that ticks. This is NOT Raft/state-machine state — the
+    /// apply arm is a no-op for exhaustiveness only.
+    ReportChunkReads {
+        node_id: u64,
+        /// `(chunk_id_hex, reads_by_dc)` per chunk, harvested since the last
+        /// heartbeat.
+        entries: Vec<(String, std::collections::HashMap<String, u32>)>,
+    },
+
     // ---- Bug AU — refresh per-disk usage on each heartbeat ----
 
     /// Bug AU — apply the live per-disk usage snapshot from a data
@@ -580,6 +596,9 @@ impl fmt::Display for ClientRequest {
             ),
             Self::SweepExpiredLeases { now_ms } => {
                 write!(f, "SweepExpiredLeases(now_ms={now_ms})")
+            }
+            Self::ReportChunkReads { node_id, entries } => {
+                write!(f, "ReportChunkReads(node={node_id}, {} chunks)", entries.len())
             }
             Self::AppendAudit { actor, action, target, .. } => {
                 write!(f, "AppendAudit({actor}, {action}, {target})")
