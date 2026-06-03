@@ -308,3 +308,11 @@
   datacenters). The capacity-spill candidate ranker drops any disk on a
   forbidden tier or in a forbidden datacenter; the anchor copy is never spilled
   regardless. `#[serde(default)]` keeps old snapshots loadable.
+- **Bug CA - internal bug IDs no longer leak into the WebUI.** The embedded
+  dashboard exposed bug-tracker tags two ways: in operator-facing rendered text
+  (Integrity / Home Chunk-Placement / Volumes page descriptions and the
+  volume-edit / volume-scrub modals, e.g. "(Bug BX)", "Mandatory replicas (Bug
+  BT-1)") and in the CSS/HTML/JS comments shipped inside the page source
+  (reachable via View Source). Both are now stripped; Rust source comments are
+  unaffected. A `render_dashboard` unit test scans the entire served document
+  and fails if any "Bug " reference reappears.
