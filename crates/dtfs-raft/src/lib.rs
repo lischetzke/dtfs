@@ -391,11 +391,17 @@ pub enum ClientRequest {
         lease_id: String,
     },
     /// Garbage-collect orphan leases from a crashed FUSE process. Releases
-    /// every lease whose `owner_id` starts with `hostname_prefix` AND whose
-    /// `:pid:` segment does NOT match `except_pid` (the current FUSE PID).
+    /// every lease whose `owner_id` starts with `hostname_prefix`, whose
+    /// `:pid:` segment does NOT match `except_pid` (the current FUSE PID),
+    /// AND that is already expired (`expires_at_ms <= now_ms`). Bug CD — the
+    /// expiry gate keeps a live concurrent FUSE client (renews at half-life,
+    /// so never expired) from losing its lease when a peer on the same host
+    /// (re)starts.
     ReleaseLeasesByHost {
         hostname_prefix: String,
         except_pid: u32,
+        /// Manager-supplied wall-clock ms (deterministic across replicas).
+        now_ms: u64,
     },
     /// Sweep all leases with `expires_at_ms <= now_ms`. Called by the manager
     /// GC tokio task on its 1s tick.
@@ -590,9 +596,9 @@ impl fmt::Display for ClientRequest {
             Self::ReleaseWriteLease { path, lease_id } => {
                 write!(f, "ReleaseWriteLease({path}, lease_id={lease_id})")
             }
-            Self::ReleaseLeasesByHost { hostname_prefix, except_pid } => write!(
+            Self::ReleaseLeasesByHost { hostname_prefix, except_pid, now_ms } => write!(
                 f,
-                "ReleaseLeasesByHost(host={hostname_prefix}, except_pid={except_pid})"
+                "ReleaseLeasesByHost(host={hostname_prefix}, except_pid={except_pid}, now_ms={now_ms})"
             ),
             Self::SweepExpiredLeases { now_ms } => {
                 write!(f, "SweepExpiredLeases(now_ms={now_ms})")

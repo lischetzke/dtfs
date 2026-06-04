@@ -1849,10 +1849,17 @@ impl ManagerService for MetadataService {
         request: Request<ReleaseLeasesByHostRequest>,
     ) -> Result<Response<ReleaseLeasesByHostResponse>, Status> {
         let req = request.into_inner();
+        // Bug CD — supply now_ms so the apply reaps only expired host leases
+        // (a live, renewing concurrent client is never expired, never dropped).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let resp = self
             .raft_write(ClientRequest::ReleaseLeasesByHost {
                 hostname_prefix: req.hostname,
                 except_pid: req.except_pid,
+                now_ms,
             })
             .await?;
         let count = match resp {
