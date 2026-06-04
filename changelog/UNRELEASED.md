@@ -366,3 +366,13 @@
   restarting writer's own not-yet-expired orphan on a given path is already
   handled by `AcquireWriteLease`'s lazy expired-eviction. `ReleaseLeasesByHost`
   gains a `now_ms` field (not persisted; no snapshot impact).
+- **Bug CE - FUSE readahead cache is bounded by bytes, not entry count (OOM
+  fix).** The in-memory prefetch cache was capped at 256 ENTRIES, but each
+  entry is a whole chunk (up to 128 MB), and the prefetch task inserted with no
+  bound check at all - so a whole-file sequential read on a RAM-starved client
+  (the 1 GB Minicluster client) drove FUSE RSS past ~800 MB and the OOM killer
+  reaped the mount. The cache is now bounded by a configurable byte budget
+  (`[readahead] cache_mb`, default 64): all inserts (foreground + prefetch)
+  route through one accountant that evicts arbitrary entries until the running
+  byte total fits, never rejecting a read (§ A.5 best-effort). Bounds memory
+  regardless of chunk size or prefetch concurrency.
