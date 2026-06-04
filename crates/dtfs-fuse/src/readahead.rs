@@ -85,8 +85,14 @@ pub struct ReadAheadEngine {
     pending: Arc<DashMap<String, JoinHandle<()>>>,
     /// Cached prefetched chunk data keyed by cache key.
     cache: Arc<DashMap<String, Bytes>>,
-    /// Maximum number of cached entries before eviction starts.
-    max_cache_entries: usize,
+    /// Bug CE — running total of bytes held in `cache`, kept in sync with
+    /// every insert/evict so the cache is bounded by SIZE, not entry count.
+    /// A whole chunk can be up to 128 MB; the old 256-entry count bound x
+    /// whole-chunk values OOM-killed the 1 GB FUSE client on a full-file read.
+    cache_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Soft byte budget for `cache`. Inserts evict arbitrary entries until
+    /// the total fits (best-effort; never rejects a read — § A.5).
+    max_cache_bytes: usize,
     /// P0-11 / "next episode survives" — when set, prefetched chunks are
     /// also mirrored into the persistent disk cache so they survive
     /// in-memory eviction, FUSE restart, and scanner storms. Setting an
@@ -96,16 +102,57 @@ pub struct ReadAheadEngine {
 }
 
 impl ReadAheadEngine {
-    /// Create a new read-ahead engine.
-    pub fn new(mode: ReadAheadMode, client: DtfsClient, max_cache_entries: usize) -> Self {
+    /// Create a new read-ahead engine. `max_cache_bytes` is the soft byte
+    /// budget for the in-memory prefetch cache (Bug CE).
+    pub fn new(mode: ReadAheadMode, client: DtfsClient, max_cache_bytes: usize) -> Self {
         Self {
             mode,
             client,
             pending: Arc::new(DashMap::new()),
             cache: Arc::new(DashMap::new()),
-            max_cache_entries,
+            cache_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_cache_bytes,
             local_cache: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Bug CE — insert into the byte-bounded cache, evicting arbitrary other
+    /// entries until the running byte total fits `max_cache_bytes`. Associated
+    /// fn (not `&self`) so the prefetch task can call it with cloned `Arc`s.
+    /// Keeps at least the just-stored entry; best-effort, never rejects.
+    fn store_in_cache(
+        cache: &DashMap<String, Bytes>,
+        cache_bytes: &std::sync::atomic::AtomicUsize,
+        max_cache_bytes: usize,
+        key: String,
+        data: Bytes,
+    ) {
+        use std::sync::atomic::Ordering;
+        let incoming = data.len();
+        if let Some(old) = cache.insert(key.clone(), data) {
+            cache_bytes.fetch_sub(old.len(), Ordering::Relaxed);
+        }
+        cache_bytes.fetch_add(incoming, Ordering::Relaxed);
+        // Evict until under budget, never dropping the entry just stored.
+        while cache_bytes.load(Ordering::Relaxed) > max_cache_bytes {
+            let victim = cache
+                .iter()
+                .find(|e| e.key() != &key)
+                .map(|e| e.key().clone());
+            match victim {
+                Some(k) => {
+                    if let Some((_, v)) = cache.remove(&k) {
+                        cache_bytes.fetch_sub(v.len(), Ordering::Relaxed);
+                    }
+                }
+                None => break, // only the fresh entry remains
+            }
+        }
+    }
+
+    /// Bytes currently held in the prefetch cache (Bug CE accounting).
+    pub fn cache_bytes(&self) -> usize {
+        self.cache_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Attach a disk-backed cache. Prefetched chunks will be mirrored to
@@ -182,22 +229,23 @@ impl ReadAheadEngine {
     /// 128 MB chunk) re-issues a full chunk fetch — observed ~1.2 MB/s.
     /// Storing the chunk here lets the next FUSE read hit the cache.
     pub fn insert_cached(&self, node_addr: &str, chunk_id: &str, data: Bytes) {
-        if self.cache.len() >= self.max_cache_entries {
-            // Simple eviction: drop a single old entry to make room.
-            if let Some(entry) = self.cache.iter().next() {
-                let k = entry.key().clone();
-                drop(entry);
-                self.cache.remove(&k);
-            }
-        }
         let key = cache_key(node_addr, chunk_id);
-        self.cache.insert(key, data);
+        Self::store_in_cache(
+            &self.cache,
+            &self.cache_bytes,
+            self.max_cache_bytes,
+            key,
+            data,
+        );
     }
 
     /// Remove a cached entry (e.g., after it has been consumed).
     pub fn evict(&self, node_addr: &str, chunk_id: &str) {
         let key = cache_key(node_addr, chunk_id);
-        self.cache.remove(&key);
+        if let Some((_, v)) = self.cache.remove(&key) {
+            self.cache_bytes
+                .fetch_sub(v.len(), std::sync::atomic::Ordering::Relaxed);
+        }
         // Also cancel pending task if any.
         if let Some((_, handle)) = self.pending.remove(&key) {
             handle.abort();
@@ -211,6 +259,8 @@ impl ReadAheadEngine {
         }
         self.pending.clear();
         self.cache.clear();
+        self.cache_bytes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Number of entries currently in the prefetch cache.
@@ -220,14 +270,16 @@ impl ReadAheadEngine {
 
     /// Spawn a background task to fetch a single chunk.
     fn spawn_prefetch(&self, key: String, node_addr: String, chunk_id: String) {
-        // Simple eviction: if cache is full, skip this prefetch.
-        if self.cache.len() >= self.max_cache_entries {
-            debug!(key, "readahead cache full, skipping prefetch");
+        // Bug CE — skip prefetch when the byte budget is already exhausted.
+        if self.cache_bytes() >= self.max_cache_bytes {
+            debug!(key, "readahead cache full (bytes), skipping prefetch");
             return;
         }
 
         let client = self.client.clone();
         let cache = Arc::clone(&self.cache);
+        let cache_bytes = Arc::clone(&self.cache_bytes);
+        let max_cache_bytes = self.max_cache_bytes;
         let pending_key = key.clone();
         let pending_ref = Arc::clone(&self.pending);
         let local_cache = self.local_cache.read().clone();
@@ -241,7 +293,15 @@ impl ReadAheadEngine {
                         size = data.len(),
                         "readahead prefetch complete"
                     );
-                    cache.insert(pending_key.clone(), data.clone());
+                    // Bug CE — byte-bounded insert (was an unbounded
+                    // `cache.insert`, the worst offender for the OOM).
+                    Self::store_in_cache(
+                        &cache,
+                        &cache_bytes,
+                        max_cache_bytes,
+                        pending_key.clone(),
+                        data.clone(),
+                    );
                     // Mirror to disk cache so the prefetched chunk
                     // survives in-mem eviction + FUSE restart. Best-
                     // effort; disk-cache failures are logged, not fatal.
@@ -324,6 +384,35 @@ mod tests {
         assert_eq!(
             cache_key("node1:9000", "abc123"),
             "node1:9000|abc123"
+        );
+    }
+
+    /// Bug CE — the in-memory prefetch cache must be bounded by BYTES, not
+    /// entry count. With a 4 MB budget, inserting eight 1 MB chunks must
+    /// evict down to <= 4 MB (the old count bound kept all 8 MB, which on
+    /// the 1 GB client with whole-chunk values OOM-killed FUSE).
+    #[test]
+    fn bug_ce_cache_is_byte_bounded() {
+        let client = DtfsClient::new();
+        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, client, 4 * 1024 * 1024);
+        let one_mb = Bytes::from(vec![0u8; 1024 * 1024]);
+        for i in 0..8 {
+            engine.insert_cached("node:9000", &format!("chunk{i}"), one_mb.clone());
+        }
+        assert!(
+            engine.cache_bytes() <= 4 * 1024 * 1024,
+            "cache must stay within the 4 MB byte budget, got {} bytes",
+            engine.cache_bytes()
+        );
+        assert!(
+            engine.cache_bytes() > 0,
+            "cache should retain the most-recent chunks, not drop everything"
+        );
+        // Byte accounting stays consistent with the entry count.
+        assert!(
+            engine.cache_len() <= 4,
+            "at most four 1 MB chunks fit in a 4 MB budget, got {} entries",
+            engine.cache_len()
         );
     }
 }

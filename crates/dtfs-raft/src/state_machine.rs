@@ -1587,19 +1587,28 @@ fn apply_request(
         ClientRequest::ReleaseLeasesByHost {
             hostname_prefix,
             except_pid,
+            now_ms,
         } => {
-            // Recommended owner_id format is `<hostname>:<pid>:<fh>`; match
-            // the hostname prefix and ensure the PID segment differs from
-            // `except_pid` (the live FUSE process). This drops orphan leases
-            // left by a crashed previous FUSE process while keeping leases
-            // from healthy concurrent mounts on the same host.
+            // owner_id format is `<hostname>:<pid>:<fh>`. Match the hostname
+            // prefix, exclude the caller's own pid, and — Bug CD — drop ONLY
+            // leases that are already expired (`expires_at_ms <= now_ms`).
+            // A live concurrent FUSE client renews at half-life, so its lease
+            // is never expired and is never dropped here; a crashed/orphan
+            // client stops renewing and lapses, so its lease is reaped. The
+            // restarting writer's own not-yet-expired orphan on a given path
+            // is handled by AcquireWriteLease's lazy expired-eviction. Pre-CD
+            // this dropped EVERY non-caller lease on the host, nuking healthy
+            // concurrent writers mid-write (their next commit hit
+            // WriteLeaseConflict -> EIO).
             let prefix = format!("{hostname_prefix}:");
             let except_segment = format!(":{except_pid}:");
             let to_drop: Vec<String> = sm
                 .write_leases
                 .iter()
                 .filter(|(_, l)| {
-                    l.owner_id.starts_with(&prefix) && !l.owner_id.contains(&except_segment)
+                    l.owner_id.starts_with(&prefix)
+                        && !l.owner_id.contains(&except_segment)
+                        && l.expires_at_ms <= *now_ms
                 })
                 .map(|(p, _)| p.clone())
                 .collect();
@@ -1636,6 +1645,14 @@ fn apply_request(
                 );
             }
             ClientResponse::WriteLeasesReleased { count }
+        }
+
+        ClientRequest::ReportChunkReads { .. } => {
+            // Not state-machine state. The manager service intercepts this
+            // variant in `forward_client_write` and applies it directly to the
+            // leader's in-memory tiering engine; it must never reach Raft
+            // apply. This arm exists only for match exhaustiveness.
+            ClientResponse::Success
         }
 
         ClientRequest::UpdateNodeDiskUsage { node_id, per_disk } => {
@@ -2182,6 +2199,58 @@ mod posix_path_regression {
         use openraft::vote::RaftLeaderId;
         let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
         openraft::LogId::new(leader, idx)
+    }
+
+    /// Bug CD — `ReleaseLeasesByHost` must reap only EXPIRED host leases. A
+    /// live concurrent FUSE client (same host, different pid, lease still
+    /// valid because it renews at half-life) MUST keep its lease; only the
+    /// orphan (expired) lease is dropped. Pre-CD the apply dropped every
+    /// non-caller lease on the host and nuked the live writer mid-write.
+    #[test]
+    fn bug_cd_release_by_host_spares_live_peer() {
+        let mut sm = StateMachineData::default();
+        let now_ms = 1_000_000u64;
+        // Live concurrent writer on the same host, different pid, unexpired.
+        sm.write_leases.insert(
+            "/media/live.mkv".into(),
+            WriteLease {
+                owner_id: "toro-plex:222:7".into(),
+                lease_id: "live".into(),
+                expires_at_ms: now_ms + 10_000,
+            },
+        );
+        // Orphan from a crashed prior process on the same host: expired.
+        sm.write_leases.insert(
+            "/media/orphan.mkv".into(),
+            WriteLease {
+                owner_id: "toro-plex:111:3".into(),
+                lease_id: "orphan".into(),
+                expires_at_ms: now_ms - 1,
+            },
+        );
+
+        let resp = apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::ReleaseLeasesByHost {
+                hostname_prefix: "toro-plex".into(),
+                except_pid: 999, // the caller's own (new) pid; matches neither
+                now_ms,
+            },
+        );
+
+        assert!(
+            matches!(resp, ClientResponse::WriteLeasesReleased { count: 1 }),
+            "exactly one (expired orphan) lease should be released, got {resp:?}"
+        );
+        assert!(
+            sm.write_leases.contains_key("/media/live.mkv"),
+            "live concurrent writer's lease must NOT be dropped"
+        );
+        assert!(
+            !sm.write_leases.contains_key("/media/orphan.mkv"),
+            "expired orphan lease must be reaped"
+        );
     }
 
     /// Bug A — `mkdir("/foo")` arrives at the state machine as

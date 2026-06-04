@@ -264,7 +264,14 @@ by <test>" in the commit.
    replicate_chunk.
 8. unlink removes manager-side FileMetadata first, then GC deletes chunks
    async; a crash between leaves orphans (reclaimed by scrub), never
-   dangling pointers.
+   dangling pointers. Bug CB — the orphan reaper measures its grace
+   against each chunk's durable on-disk `.dat` mtime
+   (`scheduler::orphan_reap_due`, fed by `ListChunks.chunk_mtimes_ms`),
+   NOT a manager-local first-observed clock, so reclamation survives
+   manager restarts / leadership changes (pre-CB the in-memory clock
+   reset every restart and deleted-file disk was never freed under
+   rolling-restart churn). An unknown mtime (pre-CB data node) defers
+   the reap rather than dropping a possibly in-flight chunk.
 9. rename is a single Raft command; open handles keep reading the same
    chunks (path updated, chunk_id binding unchanged).
 10. Reads use replica-fallback (P0-2): try the next replica on error,
