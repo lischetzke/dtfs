@@ -352,3 +352,17 @@
   no-op. Verified live: a cold-only file read from a cold-cache client now
   promotes a warm cache replica (`cache.promote` audit fires + the warm `.dat`
   appears) even when the serving data node heartbeats to a follower.
+- **Bug CD - orphan-lease cleanup no longer drops a live concurrent writer's
+  lease.** `ReleaseLeasesByHost` (run at FUSE startup/shutdown to clear orphan
+  leases from a crashed prior process) dropped EVERY write lease on the host
+  except the caller's own pid - its claim to "keep leases from healthy
+  concurrent mounts" was false. A second live FUSE process on the host (or a
+  duplicate/crash-looping mount unit) lost its in-flight lease whenever another
+  FUSE process (re)started, so the live writer's next `commit_chunk_locations`
+  hit `WriteLeaseConflict` and the write failed with EIO. The apply now drops
+  only leases that are already EXPIRED (`expires_at_ms <= now_ms`, manager-
+  supplied): a live client renews at half-life so it is never expired and is
+  never dropped, while a crashed client's lease lapses and is still reaped. A
+  restarting writer's own not-yet-expired orphan on a given path is already
+  handled by `AcquireWriteLease`'s lazy expired-eviction. `ReleaseLeasesByHost`
+  gains a `now_ms` field (not persisted; no snapshot impact).
