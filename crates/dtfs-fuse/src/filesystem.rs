@@ -231,7 +231,9 @@ impl DtfsFilesystem {
         let readahead = ReadAheadEngine::new(
             readahead_mode,
             client.clone(),
-            256, // max prefetch cache entries
+            // Bug CE — byte budget, not entry count. 256 entries x whole
+            // chunks OOM-killed the 1 GB client; bound by config bytes now.
+            (config.readahead.cache_mb.max(1) as usize) * 1024 * 1024,
         );
 
         let write_buffer = WriteBuffer::new(chunk_size_bytes);
