@@ -72,11 +72,20 @@ pane, observe the reap audit lines, then restore defaults.
 - `orphan_scrub` respects `enforce_anchor`: a chunk that LOOKS
   orphan but matches a mandatory-anchor policy is never reaped
   (`state_machine.rs` apply path).
-- Mid-reap the grace tracker (`scheduler.rs::orphan_seen`) only
-  fires after seeing the same orphan TWICE across two consecutive
-  ticks. A chunk re-attached between ticks is preserved.
+- Bug CB — the reap grace is measured against each chunk's durable
+  on-disk `.dat` mtime (`scheduler.rs::orphan_reap_due`), reported by
+  `ListChunks`, NOT a manager-local "first observed orphan" clock.
+  A chunk is reaped only when it is unreferenced AND its mtime is at
+  least `orphan_grace_secs` old. This survives manager restarts and
+  leadership changes, so an accelerated drain still completes even if a
+  manager bounces mid-drain. A chunk re-attached (re-referenced by a
+  file) before the reap is preserved by the orphan check.
+- A data node that does not report chunk mtimes (pre-Bug-CB binary)
+  makes the manager DEFER reaping — `orphan.reaped` will not advance
+  until the data nodes are upgraded. If a drain stalls with zero reaps,
+  confirm the data-node build carries Bug CB (`dtfs-data --version`).
 - Lowering `orphan_grace_secs` below 60 s risks reaping
-  in-flight writes (WAL+commit window). Don't go lower.
+  in-flight writes (commit-to-raft-apply window). Don't go lower.
 - This is a CLUSTER-WIDE knob. Every data node will run the
   same accelerated cadence while the override is live.
 

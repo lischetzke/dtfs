@@ -684,6 +684,12 @@ pub struct ReadAheadConfig {
     pub prefetch_chunks: u32,
     #[serde(default = "default_prefetch_files")]
     pub prefetch_next_files: u32,
+    /// Bug CE — soft byte budget (MB) for the in-memory prefetch cache. The
+    /// cache evicts to stay under this regardless of chunk size, so a
+    /// whole-file read on a RAM-starved client cannot OOM FUSE. Was an
+    /// unbounded 256-entry count cap.
+    #[serde(default = "default_readahead_cache_mb")]
+    pub cache_mb: u64,
 }
 
 /// Bug AV (AV-3-1) — FUSE write-path preference for first-write
@@ -942,6 +948,9 @@ fn default_prefetch_chunks() -> u32 {
 }
 fn default_prefetch_files() -> u32 {
     3
+}
+fn default_readahead_cache_mb() -> u64 {
+    64
 }
 fn default_local_cache_gb() -> u64 {
     50

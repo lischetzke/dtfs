@@ -67,14 +67,6 @@ pub struct TaskScheduler {
     audit: Arc<AuditLog>,
     /// P1-8: optional alert dispatcher. MigrationFailed fires here.
     alerts: parking_lot::RwLock<Option<Arc<crate::alerts::AlertDispatcher>>>,
-    /// Bug BC-7 — orphan-candidate tracker. Keyed by (node_id,
-    /// chunk_id), value is the wall-clock ms when we first observed
-    /// the chunk on disk WITHOUT a matching FileMetadata reference.
-    /// A subsequent tick that no longer sees the same orphan drops
-    /// the entry (the chunk was reattached or already deleted).
-    /// A tick that still sees it AFTER `orphan_grace_secs` elapsed
-    /// raft-writes a DeleteChunk + audits `orphan.reaped`.
-    orphan_seen: parking_lot::Mutex<std::collections::BTreeMap<(u64, String), u64>>,
 }
 
 impl TaskScheduler {
@@ -89,7 +81,6 @@ impl TaskScheduler {
             state_data,
             audit,
             alerts: parking_lot::RwLock::new(None),
-            orphan_seen: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -1734,23 +1725,33 @@ impl TaskScheduler {
     // ── Bug BC-7 — orphan_scrub ─────────────────────────────────────────
 
     /// Run the orphan_scrub loop forever. Each tick:
-    /// 1. Walk every data node, call `ListChunks`, get on-disk chunk_id set.
-    /// 2. Diff against `state_machine.chunk_locations`.
-    /// 3. Update the `orphan_seen` tracker:
-    ///    - First time a chunk is seen orphan → record `first_seen_ms = now`.
-    ///    - Still orphan AFTER `grace_secs` → raft-write DeleteChunk +
-    ///      audit `orphan.reaped` + drop tracker entry.
-    ///    - Not orphan anymore (re-attached / already gone) → drop entry.
+    /// 1. Walk every data node, call `ListChunks`, get the on-disk
+    ///    `chunk_id -> .dat mtime` map.
+    /// 2. Diff against the union of every file's chunk hashes
+    ///    (`chunk_is_orphan`).
+    /// 3. Reap each orphan whose durable mtime is at least `grace_secs`
+    ///    old (`orphan_reap_due`): call `DeleteChunkReplica` on the node +
+    ///    audit `orphan.reaped`. Bug CB — the grace is measured against
+    ///    the chunk's on-disk mtime, NOT a manager-local first-observed
+    ///    clock, so it survives restarts / leadership changes and a
+    ///    deleted file's chunks reclaim even under rolling-restart churn.
+    ///    An unknown mtime (pre-Bug-CB data node) defers the reap.
     pub async fn run_orphan_scrub(&self, interval_secs: u64, grace_secs: u64) {
         info!(
             interval_secs,
             grace_secs,
             "Bug BC-7: orphan_scrub loop starting"
         );
+        // Bug CB — short warmup (NOT a full interval) so a freshly
+        // (re)started manager lets its raft log replay settle before the
+        // first scan, then create the ticker so its first (immediate) tick
+        // fires right after the warmup. The pre-CB code skipped a whole
+        // `interval_secs` after every restart, which — combined with the
+        // old in-memory grace clock — starved reaping under rolling-restart
+        // churn. In-flight puts/promotes are protected by the mtime grace
+        // (orphan_reap_due), not by deferring the scan.
+        tokio::time::sleep(Duration::from_secs(30)).await;
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(60)));
-        // Skip the first immediate tick so a fresh manager doesn't race
-        // with concurrent put_chunks at boot.
-        tick.tick().await;
         loop {
             tick.tick().await;
             match self.orphan_scrub_tick(grace_secs).await {
@@ -1810,8 +1811,6 @@ impl TaskScheduler {
         };
 
         let mut reaped: usize = 0;
-        let mut current_orphans: std::collections::BTreeSet<(u64, String)> =
-            std::collections::BTreeSet::new();
 
         for (node_id, grpc_addr) in &data_nodes {
             if grpc_addr.is_empty() { continue; }
@@ -1832,7 +1831,7 @@ impl TaskScheduler {
             if !already_quarantined.contains(node_id) {
                 if let Some(expected) = expected_by_node.get(node_id) {
                     let missing: Vec<&String> =
-                        expected.iter().filter(|c| !on_disk.contains(*c)).collect();
+                        expected.iter().filter(|c| !on_disk.contains_key(*c)).collect();
                     if !missing.is_empty() {
                         let first = missing[0].clone();
                         let info = dtfs_common::types::QuarantineInfo {
@@ -1875,7 +1874,7 @@ impl TaskScheduler {
                 }
             }
 
-            for cid in &on_disk {
+            for (cid, mtime_ms) in &on_disk {
                 // Bug BP-4 — a chunk is an orphan candidate ONLY when NO
                 // FileMetadata references its hash (`in_state_chunks` is the
                 // union of every file's chunk hashes). Never reap a chunk a
@@ -1883,15 +1882,31 @@ impl TaskScheduler {
                 // stale — that was the data-loss vector (BN-1 UUID rotation
                 // dropped location bindings; the hash-referenced guard here
                 // is the defence-in-depth backstop). AGENTS.md §A.6 #8.
-                if !chunk_is_orphan(&in_state_chunks, cid) { continue; }
-                current_orphans.insert((*node_id, cid.clone()));
+                let is_orphan = chunk_is_orphan(&in_state_chunks, cid);
 
-                let first_seen = {
-                    let mut map = self.orphan_seen.lock();
-                    *map.entry((*node_id, cid.clone())).or_insert(now_ms)
-                };
-                let age_secs = (now_ms.saturating_sub(first_seen)) / 1000;
-                if age_secs < grace_secs { continue; }
+                // Bug CB — measure the reap grace against the chunk's
+                // DURABLE on-disk mtime, not a manager-local "first
+                // observed orphan" clock. The old in-memory tracker reset
+                // on every manager restart / leadership change, so under
+                // rolling-restart churn a manager never accumulated the
+                // 24h grace and orphaned chunks were never reaped (disk
+                // usage of deleted files never dropped). The mtime survives
+                // restarts; a freshly-written chunk (recent mtime) is still
+                // protected against the in-flight put/promote race.
+                if !orphan_reap_due(is_orphan, *mtime_ms, now_ms, grace_secs) {
+                    // Surface a known-orphan we are deferring only because
+                    // its age is unknown (mtime 0 = pre-Bug-CB data node),
+                    // so a permanently-stalled reap is diagnosable.
+                    if is_orphan && *mtime_ms == 0 {
+                        debug!(
+                            node = %node_id, chunk = %cid,
+                            "Bug CB: orphan deferred — data node reported no \
+                             mtime (upgrade the data node to enable reaping)"
+                        );
+                    }
+                    continue;
+                }
+                let age_secs = now_ms.saturating_sub(*mtime_ms) / 1000;
 
                 // Past grace — reap.
                 match self.delete_chunk_replica_on_node(grpc_addr, cid).await {
@@ -1908,7 +1923,6 @@ impl TaskScheduler {
                             &result_msg,
                         );
                         reaped += 1;
-                        self.orphan_seen.lock().remove(&(*node_id, cid.clone()));
                     }
                     Err(e) => {
                         warn!(
@@ -1920,13 +1934,6 @@ impl TaskScheduler {
             }
         }
 
-        // Drop tracker entries no longer orphan (file re-attached, or
-        // a different node's listing already reaped it).
-        {
-            let mut map = self.orphan_seen.lock();
-            map.retain(|k, _| current_orphans.contains(k));
-        }
-
         Ok(reaped)
     }
 
@@ -1935,13 +1942,17 @@ impl TaskScheduler {
     async fn list_chunks_on_node(
         &self,
         node_addr: &str,
-    ) -> anyhow::Result<std::collections::HashSet<String>> {
+    ) -> anyhow::Result<std::collections::HashMap<String, u64>> {
         use dtfs_proto::dtfs::data::ListChunksRequest;
         let endpoint = normalize_endpoint(node_addr);
         let mut client = DataServiceClient::connect(endpoint).await
             .map_err(|e| anyhow::anyhow!("connect to data node {}: {}", node_addr, e))?;
-        let mut out: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        // Bug CB — value is the chunk's `.dat` mtime (Unix ms); a
+        // pre-Bug-CB data node sends an empty `chunk_mtimes_ms`, so a
+        // missing entry defaults to 0 ("age unknown") and the reaper
+        // defers rather than dropping a possibly in-flight chunk.
+        let mut out: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         let mut token = String::new();
         loop {
             let resp = client
@@ -1952,8 +1963,9 @@ impl TaskScheduler {
                 .await
                 .map_err(|e| anyhow::anyhow!("ListChunks RPC: {}", e))?
                 .into_inner();
-            for cid in resp.chunk_ids {
-                out.insert(cid);
+            for (i, cid) in resp.chunk_ids.into_iter().enumerate() {
+                let mtime = resp.chunk_mtimes_ms.get(i).copied().unwrap_or(0);
+                out.insert(cid, mtime);
             }
             if resp.next_page_token.is_empty() {
                 break;
@@ -2418,6 +2430,34 @@ pub(crate) fn chunk_is_orphan(
     chunk_hash: &str,
 ) -> bool {
     !in_state_chunks.contains(chunk_hash)
+}
+
+/// Bug CB — is an on-disk chunk due to be reaped this tick? A chunk is
+/// reaped only when it is unreferenced (`is_orphan`) AND its durable
+/// on-disk `.dat` mtime is at least `grace_secs` old. Anchoring the grace
+/// to the chunk's mtime (reported by ListChunks) instead of a
+/// manager-local "first observed orphan" timestamp makes the grace clock
+/// survive manager restarts and leadership changes, so a deleted file's
+/// chunks reclaim even under rolling-restart churn — the bug where disk
+/// usage of deleted files never dropped.
+///
+/// `chunk_mtime_ms == 0` means "age unknown" — a pre-Bug-CB data node
+/// that does not populate `chunk_mtimes_ms`, or a stat failure. In that
+/// case we DEFER (return false) rather than reap with no grace, so the
+/// in-flight put/promote race can never drop a just-written chunk during
+/// a mixed-version rollout. Reaping resumes once the data node is
+/// upgraded to report mtimes.
+pub(crate) fn orphan_reap_due(
+    is_orphan: bool,
+    chunk_mtime_ms: u64,
+    now_ms: u64,
+    grace_secs: u64,
+) -> bool {
+    if !is_orphan || chunk_mtime_ms == 0 {
+        return false;
+    }
+    let age_secs = now_ms.saturating_sub(chunk_mtime_ms) / 1000;
+    age_secs >= grace_secs
 }
 
 /// Bug BO-1 — which node id (if any) `resolve_healthy_source` must exclude
@@ -4072,5 +4112,72 @@ mod bug_bo_tests {
         // Empty in-state set: everything is orphan (no files reference anything).
         let empty = std::collections::HashSet::new();
         assert!(chunk_is_orphan(&empty, "anything"));
+    }
+
+    /// Bug CB — the reap decision is a pure function of the chunk's
+    /// durable mtime, so it survives manager restarts (no first-observed
+    /// clock to reset). Covers: referenced never reaps, recent orphan is
+    /// protected, aged orphan reaps, unknown mtime defers.
+    #[test]
+    fn cb_orphan_reap_due_uses_durable_mtime() {
+        // Fixed clock so the test never touches Date::now (forbidden in
+        // workflow scripts and avoided in pure tests for determinism).
+        let now_ms: u64 = 1_700_000_000_000;
+        let grace_secs: u64 = 86_400; // 24h, the stock default
+
+        // Referenced chunk (not orphan) is NEVER reaped, even if ancient.
+        assert!(
+            !orphan_reap_due(false, now_ms - 10 * grace_secs * 1000, now_ms, grace_secs),
+            "a referenced chunk must never be reaped"
+        );
+
+        // Orphan but freshly written (1 min old) — within grace, protected
+        // against the in-flight put/promote race.
+        assert!(
+            !orphan_reap_due(true, now_ms - 60_000, now_ms, grace_secs),
+            "a recently-written orphan must be protected by grace"
+        );
+
+        // Orphan whose .dat is older than grace — reap.
+        assert!(
+            orphan_reap_due(true, now_ms - (grace_secs + 10) * 1000, now_ms, grace_secs),
+            "an aged orphan past grace must be reaped"
+        );
+
+        // Exactly at the grace boundary — reap (>=).
+        assert!(
+            orphan_reap_due(true, now_ms - grace_secs * 1000, now_ms, grace_secs),
+            "grace boundary is inclusive"
+        );
+
+        // Unknown mtime (0) — a pre-Bug-CB data node or a stat failure.
+        // Defer rather than reap with no grace, even though the chunk is
+        // an orphan and `now - 0` is astronomically larger than grace.
+        assert!(
+            !orphan_reap_due(true, 0, now_ms, grace_secs),
+            "unknown mtime must defer the reap, not fire it"
+        );
+    }
+
+    /// Bug CB — regression for the actual symptom: the decision carries NO
+    /// state across calls, so a manager that "restarts" (re-evaluates from
+    /// scratch) reaches the same verdict. The pre-CB in-memory clock reset
+    /// to `now` on every restart, so an aged orphan re-started its 24h
+    /// countdown forever and disk was never reclaimed.
+    #[test]
+    fn cb_orphan_reap_survives_simulated_restart() {
+        let grace_secs: u64 = 86_400;
+        let mtime_ms: u64 = 1_700_000_000_000; // written once, long ago
+        // First "manager process": observes the orphan well past grace.
+        let now_1 = mtime_ms + (grace_secs + 1) * 1000;
+        assert!(orphan_reap_due(true, mtime_ms, now_1, grace_secs));
+        // Manager restarts (any in-memory tracker is gone). A later tick
+        // on the fresh process still sees the same durable mtime and still
+        // reaps — it does NOT restart the grace countdown.
+        let now_2 = now_1 + 5_000;
+        assert!(
+            orphan_reap_due(true, mtime_ms, now_2, grace_secs),
+            "reap verdict must not reset across a manager restart"
+        );
     }
 }
