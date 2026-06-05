@@ -145,6 +145,23 @@ show_warning = true
 
 ---
 
+## `[updater]` -- Self-Updater Source
+
+Read by [`dtfs-cli update`](../api-reference/cli-reference.md#update) when
+run on this node (e.g. `dtfs-cli update fuse`, alias `client`); the FUSE
+client daemon itself ignores the block. Both keys are optional and
+default to the canonical DTFS repo and `/usr/local/bin`. See the
+`[updater]` section of the [Manager Configuration](./manager.md) page for
+the full option table.
+
+```toml
+[updater]
+repo_url    = "https://github.com/lischetzke/dtfs"
+install_dir = "/usr/local/bin"
+```
+
+---
+
 ## Complete Example
 
 ```toml

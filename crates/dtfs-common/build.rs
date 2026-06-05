@@ -34,6 +34,19 @@ fn main() {
     // the value is always UTC by construction).
     let build_date = dt.format("%Y%m%d-%H%M%S").to_string();
     println!("cargo:rustc-env=DTFS_BUILD_DATE={build_date}");
+
+    // AZ-5 — release version stamp. The release wrapper
+    // (scripts/dtfs-release.sh) exports DTFS_VERSION=<tag>; unset/empty
+    // keeps the dev default so plain `cargo build` and the dev wrappers
+    // report `v0.0.0-dev` byte-for-byte as before. Pair the
+    // rerun-if-env-changed so cargo re-stamps when the value changes.
+    let version = env::var("DTFS_VERSION")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "v0.0.0-dev".to_string());
+    println!("cargo:rustc-env=DTFS_VERSION={version}");
+
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rerun-if-env-changed=DTFS_VERSION");
 }

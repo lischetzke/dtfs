@@ -228,6 +228,30 @@ down_after_missed = 6
 
 ---
 
+## `[updater]` -- Self-Updater Source
+
+Read by [`dtfs-cli update`](../api-reference/cli-reference.md#update), not
+by the manager daemon (the daemon ignores the block). Both keys are
+optional; the defaults apply when the block -- or the whole file -- is
+absent. The same block is honoured in `data.toml` and `fuse.toml`;
+`dtfs-cli update <target>` reads `/etc/dtfs/<role>.toml` by default
+(override with `--config`).
+
+| Option | TOML Path | Type | Default | Live Reload | Description |
+|--------|-----------|------|---------|-------------|-------------|
+| `repo_url` | `updater.repo_url` | `String` | the canonical DTFS repo | No | GitHub repo the release tarball is pulled from (`<repo_url>/releases/{latest/download,download/<tag>}/dtfs-linux-amd64.tar.gz`). Overridden by `--repo-url` and the `DTFS_REPO_URL` env var. |
+| `install_dir` | `updater.install_dir` | `String` | `/usr/local/bin` | No | Directory binaries are installed into. Overridden by `--install-dir`. |
+
+### Example
+
+```toml
+[updater]
+repo_url    = "https://github.com/lischetzke/dtfs"
+install_dir = "/usr/local/bin"
+```
+
+---
+
 ## Complete Example
 
 ```toml
@@ -288,4 +312,8 @@ evaluation_interval_secs = 3600
 heartbeat_interval_secs = 5
 suspect_after_missed = 3
 down_after_missed = 6
+
+[updater]
+repo_url    = "https://github.com/lischetzke/dtfs"
+install_dir = "/usr/local/bin"
 ```

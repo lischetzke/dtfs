@@ -172,9 +172,10 @@ When a new code path creates replicas, make the class explicit in its
 name/doc and consult one of these checks.
 
 **A.3.5 Dev-build date freshness (hard requirement).** Every dev build
-MUST stamp its own build instant into `BUILD_DATE` — `VERSION` is pinned
-at `v0.0.0-dev`, so `BUILD_DATE` is the only field distinguishing two dev
-builds (WebUI node table, logs, node registry). Mechanism (Bug BS):
+MUST stamp its own build instant into `BUILD_DATE` — `VERSION` defaults
+to `v0.0.0-dev` (release builds override it via `DTFS_VERSION`, see
+below), so for two *dev* builds `BUILD_DATE` is the only distinguishing
+field (WebUI node table, logs, node registry). Mechanism (Bug BS):
 `dtfs-common/build.rs` emits `DTFS_BUILD_DATE` from `SOURCE_DATE_EPOCH`
 (falls back to `SystemTime::now()` when unset) and declares
 `cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH`. The build wrappers
@@ -188,11 +189,39 @@ var). Confirm a binary's stamp with `dtfs-<bin> --version`. Guard:
 pin `SOURCE_DATE_EPOCH` are the sanctioned exception (wrappers honour a
 caller-set value).
 
+**Release version stamp (AZ-5).** `build.rs` also emits `DTFS_VERSION`
+(default `v0.0.0-dev`, with `rerun-if-env-changed`); `version.rs` reads
+it for `VERSION`/`VERSION_STRING`. `scripts/dtfs-release.sh <tag>`
+exports `DTFS_VERSION=<tag>` before the build so a release binary's
+`--version` (and the WebUI/node table) reports the real tag; plain/dev
+builds stay `v0.0.0-dev`. `dtfs-cli update --check` compares that
+installed version against the latest GitHub release tag. Guard:
+`scripts/tests/test-release-version-stamp.sh`.
+
 ## A.4 Build / test / deploy
 
 The workspace builds on **Linux/WSL** only (the Windows host can't build
-rocksdb + fuse3). The `dtfs-builder` VM hosts the build chain
-(historically 10.150.0.150).
+rocksdb + fuse3). The `dtfs-builder` VM hosts the build chain at
+**10.150.0.150** (the hostname `dtfs-builder` resolves only inside the
+lab DNS 10.150.0.2/3 — from the operator host, use the IP). Access:
+`ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.150.0.150`. The builder has
+rustup (`source ~/.cargo/env` first — login shells don't auto-add
+`~/.cargo/bin`), protoc, fuse3, `mdbook`, and `clang`/`libclang-dev`
+(needed by the rocksdb bindgen in dtfs-manager/dtfs-data), so the full
+workspace builds. `debian` has passwordless sudo.
+
+The builder is **not** a git checkout — sync the working tree to
+`~/dtfs2` (the operator host has no `rsync`; use `tar` over SSH), then
+build over SSH:
+
+```bash
+# from the operator host, in the worktree root; exclude build/VCS/agent dirs
+tar czf - --exclude=./target --exclude=./.git --exclude=./.claude . \
+  | ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.150.0.150 \
+      'mkdir -p ~/dtfs2 && tar xzf - -C ~/dtfs2'
+ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.150.0.150 \
+  'source ~/.cargo/env && cd ~/dtfs2 && cargo test -p dtfs-cli --release'
+```
 
 ```bash
 cargo build --release --workspace
@@ -200,10 +229,14 @@ cargo test  --release --workspace
 cargo test -p dtfs-data --release   # per-crate
 ```
 
-Deploy builds MUST go through a wrapper (`scripts/build-linux-amd64.sh`
-or `scripts/dtfs-build.sh`) so `BUILD_DATE` is fresh (§ A.3.5). Bare
-`cargo build --release` is fine for iteration but stamps stale; re-stamp
-with `SOURCE_DATE_EPOCH=$(date -u +%s) cargo build --release …`.
+Deploy builds MUST go through a wrapper (`scripts/build-linux-amd64.sh`,
+`scripts/dtfs-build.sh`, or `scripts/dtfs-release.sh <tag>` for a tagged
+release) so `BUILD_DATE` is fresh (§ A.3.5). Bare `cargo build --release`
+is fine for iteration but stamps stale; re-stamp with
+`SOURCE_DATE_EPOCH=$(date -u +%s) cargo build --release …`. Cutting a
+release: `scripts/dtfs-release.sh <tag>` stamps `DTFS_VERSION`, builds,
+and writes `target/release-artifacts/<tag>/` (the `dtfs-linux-amd64.tar.gz`
+the updater pulls, `SHA256SUMS`, notes) + the `gh release create` line.
 
 A crate-level `#![allow(dead_code)]` on the dtfs-manager and dtfs-data
 binaries works around a rustc 1.94 dead-code ICE — don't remove it
@@ -317,8 +350,16 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   readahead engine, local disk cache.
 - `dtfs-fuse/src/fuse_adapter.rs` — fuse3 trait impl; cookie scheme at
   `dir_entry_cookie()` — don't diverge readdir/readdirplus (Bug F).
-- `dtfs-common/build.rs` + `src/version.rs` — VERSION (v0.0.0-dev) +
-  BUILD_DATE (§ A.3.5); every binary reports these via RegisterNode.
+- `dtfs-common/build.rs` + `src/version.rs` — VERSION (default
+  `v0.0.0-dev`, overridable via `DTFS_VERSION`) + BUILD_DATE (§ A.3.5);
+  every binary reports these via RegisterNode.
+- `dtfs-cli/src/updater.rs` — `dtfs-cli update <target>` (download →
+  sha256-verify vs MANIFEST → atomic install → restart) + the
+  `[updater]` config; local-node only. Pairs with the release builder.
+- `scripts/dtfs-release.sh` — release builder: stamps `DTFS_VERSION`,
+  builds via `dtfs-build.sh`, assembles the fixed-name
+  `dtfs-linux-amd64.tar.gz` + `SHA256SUMS` + notes, prints/`--publish`es
+  `gh release create`.
 - `plans/active/` — in-flight plans (see plans/README.md).
 - `tests/proxmox/abuse/` — numbered shell regression tests.
 
