@@ -24,7 +24,7 @@ print('ok' if '$k' in top else 'missing')
 }
 
 check_keys /api/v1/cluster/status status cluster_name data_nodes
-check_keys /api/v1/nodes node_id hostname role
+check_keys /api/v1/nodes node_id hostname role total_bytes_read
 check_keys /api/v1/volumes volumes
 check_keys /api/v1/stats raw_total_bytes raw_used_bytes net_used_bytes logical_bytes tier_breakdown
 check_keys /api/v1/files files

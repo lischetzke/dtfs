@@ -700,6 +700,10 @@ struct NodeResponse {
     disk_count: usize,
     total_capacity: u64,
     used_capacity: u64,
+    /// REL-1-1 — cumulative bytes this node has served / stored. Surfaced so a
+    /// release test can prove a read was served by the nearest-DC replica.
+    total_bytes_read: u64,
+    total_bytes_written: u64,
     health: String,
     role: String,
     /// Unix milliseconds when this node was last observed alive.
@@ -783,6 +787,8 @@ impl NodeResponse {
             disk_count: info.disks.len(),
             total_capacity: info.total_capacity,
             used_capacity: info.used_capacity,
+            total_bytes_read: info.total_bytes_read,
+            total_bytes_written: info.total_bytes_written,
             health: format!("{:?}", info.health),
             role: format!("{:?}", info.role),
             last_seen_ms: info.last_seen_ms,
@@ -894,6 +900,8 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             disk_count: 0,
             total_capacity: 0,
             used_capacity: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
             health: "Healthy".to_string(),
             role: "Manager".to_string(),
             // The API server replying is itself a manager — peers are
@@ -951,6 +959,8 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             disk_count: 0,
             total_capacity: 0,
             used_capacity: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
             health: "Healthy".to_string(),
             role: "Client".to_string(),
             last_seen_ms: last_seen,
@@ -1154,6 +1164,16 @@ struct InspectFileQuery {
 /// each chunk's hash + the node_ids holding it. Used by release-suite
 /// cases that need to corrupt or count replicas without scraping
 /// the WebUI Explorer.
+/// REL-1-2 — resolve a replica's tier from the owning node's disk list so
+/// /api/v1/files/inspect can distinguish a cold (mandatory/anchor) replica
+/// from a warm (cache) one even on a multi-tier node. "unknown" if the node
+/// or disk is no longer registered.
+fn tier_of_disk(node: Option<&dtfs_raft::NodeInfo>, disk_id: u32) -> String {
+    node.and_then(|n| n.disks.iter().find(|d| d.disk_id == disk_id))
+        .map(|d| format!("{:?}", d.tier).to_ascii_lowercase())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 async fn inspect_file_endpoint(
     State(state): State<Arc<AppState>>,
     Query(q): Query<InspectFileQuery>,
@@ -1166,22 +1186,38 @@ async fn inspect_file_endpoint(
     // ChunkLocationEntry is one row per replica — group by chunk_index
     // so the response has one entry per logical chunk with the full
     // node_id set holding it.
-    let mut by_index: std::collections::BTreeMap<u64, (String, u64, Vec<String>)> =
+    let mut by_index: std::collections::BTreeMap<u64, (String, u64, Vec<(String, u32)>)> =
         std::collections::BTreeMap::new();
     for c in &file.chunks {
         let e = by_index
             .entry(c.chunk_index)
             .or_insert_with(|| (c.chunk_hash.clone(), c.size_bytes, Vec::new()));
-        e.2.push(c.node_id.clone());
+        e.2.push((c.node_id.clone(), c.disk_id));
     }
+    // REL-1-2 — emit per-replica {node_id, disk_id, tier} alongside the bare
+    // node_ids (kept for back-compat) so a caller can tell a cold (mandatory/
+    // anchor) replica from a warm (cache) one on a multi-tier node.
     let chunks: Vec<Value> = by_index
         .into_iter()
-        .map(|(idx, (hash, size, nodes))| {
+        .map(|(idx, (hash, size, reps))| {
+            let node_ids: Vec<String> = reps.iter().map(|(n, _)| n.clone()).collect();
+            let replicas: Vec<Value> = reps
+                .iter()
+                .map(|(n, disk)| {
+                    let node = n.parse::<u64>().ok().and_then(|nid| sm.nodes.get(&nid));
+                    json!({
+                        "node_id": n,
+                        "disk_id": disk,
+                        "tier":    tier_of_disk(node, *disk),
+                    })
+                })
+                .collect();
             json!({
                 "chunk_index": idx,
                 "chunk_id":    hash,
                 "size":        size,
-                "node_ids":    nodes,
+                "node_ids":    node_ids,
+                "replicas":    replicas,
             })
         })
         .collect();
@@ -3955,6 +3991,29 @@ mod bug_al_io_rate_tests {
             build_date: String::new(),
             quarantine: None,
         }
+    }
+
+    /// REL-1-1 — /api/v1/nodes must surface per-node served/written bytes so a
+    /// release case can prove a read was served by the nearest-DC replica.
+    #[test]
+    fn node_response_exposes_io_counters() {
+        let mut info = node(4242, 99);
+        info.hostname = "data-b1".to_string();
+        let resp = NodeResponse::from_entry(12, &info);
+        assert_eq!(resp.total_bytes_read, 4242);
+        assert_eq!(resp.total_bytes_written, 99);
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["total_bytes_read"].as_u64(), Some(4242));
+        assert_eq!(v["total_bytes_written"].as_u64(), Some(99));
+    }
+
+    /// REL-1-2 — tier resolution falls back to "unknown" when the node or disk
+    /// is gone (the positive tier path is covered by release cases 45/46/47).
+    #[test]
+    fn inspect_tier_unknown_when_node_or_disk_missing() {
+        let info = node(0, 0); // no disks
+        assert_eq!(tier_of_disk(None, 2), "unknown");
+        assert_eq!(tier_of_disk(Some(&info), 2), "unknown");
     }
 
     /// First call with an empty tracker must return (0, 0) — there's no
