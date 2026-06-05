@@ -31,6 +31,22 @@
   and silently landed chunks on the wrong tier whenever the
   data-node's `select_disk_for_tier` fell back to the
   "any-healthy-disk" path.
+- **AZ-5 — self-updater + release builder.** `dtfs-cli update
+  <manager|data|fuse|cli|all>` pulls the latest release from GitHub
+  (`[updater].repo_url`, default the canonical repo), verifies each
+  binary's sha256 against the in-tarball `MANIFEST`, atomically installs
+  it, and restarts the matching systemd service on the local host.
+  `--check` reports installed vs latest without changing anything;
+  `--tag` pins a release; `--no-restart`, `-y/--yes`, and
+  `--repo-url`/`--install-dir`/`--config` override the source/target. A
+  single sha256 mismatch aborts the whole update before anything is
+  installed. New `scripts/dtfs-release.sh <version>` builds and assembles
+  every GitHub-release file (the fixed-name `dtfs-linux-amd64.tar.gz` the
+  updater downloads, `SHA256SUMS`, release notes) and prints the
+  `gh release create` command (`--publish` runs it). Release builds now
+  stamp the version into the binaries via `DTFS_VERSION` (dev builds keep
+  `v0.0.0-dev`), so `dtfs-* --version` and the WebUI node table show the
+  real release tag.
 
 ## Bug Fixes
 - **AV-4-8 (1) — Bug Z bootstrap stops overwriting operator config.**
