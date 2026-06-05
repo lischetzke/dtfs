@@ -9,6 +9,7 @@ not gated by release.
 ```
 bash tests/release/run.sh            # full suite (~60-90 min)
 bash tests/release/run.sh --quick    # ~15 min subset
+bash tests/release/run.sh --chaos    # chaos/cross-DC/balance subset (3dc lab)
 ```
 
 Required env (defaults match the lab minicluster):
@@ -22,6 +23,10 @@ Required env (defaults match the lab minicluster):
 | `VOL` | `default` | volume id |
 | `MGR_PORT` | `9402` | manager API |
 | `SSH_KEY` | `~/.ssh/dtfs-lab/id_ed25519` | private key |
+| `ALLOW_PVE_CHAOS` | `0` | `1` enables hypervisor-destructive cases (else they SKIP) |
+| `PVE_TOKEN` | _(unset)_ | Proxmox API token `root@pam!dtfs-test=…`; never commit |
+| `INVENTORY_JSON` | `tests/proxmox/inventory-3dc.json` | topology map (hostname→vmid→dc→disks) |
+| `KEEP_CLUSTER` | `0` | after `--provision`, `1` leaves the VMs up for debugging |
 
 ## Output
 
@@ -76,3 +81,53 @@ scenario depends on un-shipped functionality.
 | 18 | api-shape | endpoint schema keys present | yes |
 | 19 | config-effective | scope_kind on every row; scrub keys present | — |
 | 20 | quarantine-flow | unquarantine endpoint validation | — |
+
+(cases 21–41 cover later bug-fix regressions; see `tests/release/cases/`.)
+
+## Chaos / cross-DC / balance run (3dc lab)
+
+`--chaos` runs the hypervisor-level + cross-DC + auto-balance cases against
+the **3dc** lab (one Raft voter per DC, two data nodes per DC, one client per
+DC — `tests/proxmox/inventory-3dc.json`). It is a separate ~45–60 min gate
+from the SSH-only full run.
+
+```
+# from-scratch: provision a clean 3dc cluster, run the chaos cases, tear down
+ALLOW_PVE_CHAOS=1 PVE_TOKEN='root@pam!dtfs-test=…' \
+  MGRS=mgr-01,mgr-02,mgr-03 \
+  DATA=data-a1,data-a2,data-b1,data-b2,data-c1,data-c2 \
+  CLIENT=client-a \
+  bash tests/release/run.sh --chaos --provision
+```
+
+Prerequisites on the runner: `pwsh` (PowerShell 7 — drives the PVE REST API
+via `tests/proxmox/pve.ps1`/`pve-chaos.ps1`) and `ansible` (deploy + netshape
+playbooks). Without `ALLOW_PVE_CHAOS=1` + `PVE_TOKEN` the PVE-destructive
+cases SKIP, so the suite still runs on a pre-provisioned cluster. Power/disk
+chaos and teardown go through `tests/proxmox/pve-chaos.ps1` (REST-only, no
+ssh, so it works under Linux `pwsh`).
+
+### What's testable on 3dc vs total-outage-by-design
+
+| Scenario | 3dc | plexmedia |
+|---|---|---|
+| Single DC power-off, quorum holds, reads continue | testable | only TORO/NRB (LELI = total outage) |
+| DC power-on recovery converges | testable | only TORO/NRB |
+| Intra-DC node/disk failure, same-DC replica survives | testable | not (1 data/DC) |
+| Per-tier mandatory + per-DC cache balance | testable | testable |
+
+The 3dc topology spreads one voter per DC, so losing any single DC leaves 2/3
+quorum and recovery is observable. plexmedia puts all voters + the anchor in
+LELI, so killing LELI is quorum + anchor loss (total outage by design).
+
+### Chaos cases
+
+| # | Case | What it verifies | PVE |
+|---|---|---|---|
+| 42 | crossdc-read-routing | a dc-b read is served by the dc-b replica (per-node served-bytes) | — |
+| 43 | dc-poweroff-read-continuity | power a whole DC off; quorum holds; reads continue | yes |
+| 44 | dc-poweron-recovery-converge | power DC back on; under-replication heals; anchor safe | yes |
+| 45 | disk-failure-and-backfill | yank a disk → re-replicate; install blank → rejoins ring | yes |
+| 46 | autobalance-convergence | declared mandatory+per-DC-cache target converges and stays | — |
+| 47 | cache-perdc-promote-demote | per-DC cache promote on read, drop on flush, anchor safe | — |
+| 48 | crossdc-read-under-shaping | cross-DC read completes under tc shaping; Raft stable | yes |
