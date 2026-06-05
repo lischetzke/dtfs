@@ -137,9 +137,18 @@ sha256_via_fuse() {
 # a case_cleanup fn. Suite continues to the next case even if this one
 # fails; cleanup runs regardless.
 
-# ─── BE-1 — pull in fixture + health helpers ─────────────────────
-# Sourced here so every case gets all three libs from one
-# `source .../lib/common.sh` line.
+# ─── Chaos / lifecycle env (consumed by lib/pve.sh + lib/lifecycle.sh) ──
+# ALLOW_PVE_CHAOS=1   opt-in for hypervisor-destructive cases (else they SKIP)
+# PVE_TOKEN=...       Proxmox API token (root@pam!dtfs-test=...); never commit
+# INVENTORY_JSON=...  topology map (default tests/proxmox/inventory-3dc.json)
+# KEEP_CLUSTER=1      after a --provision run, leave the VMs up for debugging
+
+# ─── BE-1 — pull in fixture + health + DC/PVE helpers ────────────
+# Sourced here so every case gets all libs from one
+# `source .../lib/common.sh` line. dc.sh is pure SSH/API (safe always);
+# pve.sh only defines functions (inert until a case calls require_pve).
 _LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_LIBDIR/fixtures.sh"
 . "$_LIBDIR/health.sh"
+. "$_LIBDIR/dc.sh"
+. "$_LIBDIR/pve.sh"

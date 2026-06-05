@@ -38,6 +38,8 @@
 - [Time Synchronisation](./operations/time-sync.md)
 - [Failure Scenarios](./operations/failure-scenarios.md)
 - [Troubleshooting](./operations/troubleshooting.md)
+- [Release Testing](./operations/release-testing.md)
+- [Chaos / Cross-DC / Balance Testing](./operations/chaos-testing.md)
 
 # Storage
 
