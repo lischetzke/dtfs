@@ -31,6 +31,12 @@
   and silently landed chunks on the wrong tier whenever the
   data-node's `select_disk_for_tier` fell back to the
   "any-healthy-disk" path.
+- **Read-only inspection fields for release/chaos testing.** To let the
+  automated release suite assert cross-DC read routing and per-DC
+  placement, `GET /api/v1/nodes` now reports per-node `total_bytes_read`
+  / `total_bytes_written`, and `GET /api/v1/files/inspect` reports a
+  per-chunk `replicas` array (`{node_id, disk_id, tier}`) alongside the
+  existing `node_ids`. Both are additive; no existing field changed.
 - **AZ-5 — self-updater + release builder.** `dtfs-cli update
   <manager|data|fuse|cli|all>` pulls the latest release from GitHub
   (`[updater].repo_url`, default the canonical repo), verifies each

@@ -69,6 +69,11 @@ docker compose down -v
 
 Chaos tests simulate failure conditions to verify that DTFS recovers correctly. These tests are typically longer-running and are gated behind a feature flag or test filter.
 
+> The lab-level chaos gate (whole-DC power-off, disk yank/replace, cross-DC
+> reads under shaping, per-DC balance convergence) runs against the Proxmox
+> 3dc topology via `tests/release/run.sh --chaos`. See
+> [Chaos / Cross-DC / Balance Testing](../operations/chaos-testing.md).
+
 ### Running Chaos Tests
 
 ```bash
