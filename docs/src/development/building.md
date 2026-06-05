@@ -158,6 +158,45 @@ After a release build, the following binaries are available:
 
 These are statically linked against `rustls` (no OpenSSL dependency at runtime). The only runtime dependency is FUSE 3 for `dtfs-fuse`.
 
+## Cutting a Release
+
+`scripts/dtfs-release.sh <version>` turns a version string into a
+publishable GitHub release. It stamps the version into the binaries
+(`DTFS_VERSION`, see below), builds + stages the canonical tarball via
+`scripts/dtfs-build.sh`, and assembles everything `gh release create`
+needs:
+
+```bash
+scripts/dtfs-release.sh v0.3.0                 # stage only, print the gh command
+scripts/dtfs-release.sh v0.3.0 --publish       # also run `gh release create`
+scripts/dtfs-release.sh v0.3.0 --notes-file NOTES.md
+```
+
+Output lands in `target/release-artifacts/<version>/`:
+
+| File | Purpose |
+|------|---------|
+| `dtfs-linux-amd64.tar.gz` | The release asset `dtfs-cli update` downloads (`dtfs/bin/*` + `dtfs/systemd/*` + `dtfs/MANIFEST`). The **fixed** name is what the updater expects at `<repo>/releases/latest/download/`. |
+| `SHA256SUMS` | Checksum of the asset. |
+| `RELEASE_NOTES.md` | `--notes-file` if given, else `changelog/UNRELEASED.md`. |
+
+Without `--publish` the script prints the exact `gh release create …`
+command to run by hand. The updater verifies each binary against the
+per-binary sha256 lines inside `dtfs/MANIFEST`, so the asset is
+self-describing; the top-level `SHA256SUMS` covers the asset itself.
+
+### Version stamping (`DTFS_VERSION`)
+
+`VERSION` defaults to `v0.0.0-dev`. `dtfs-common/build.rs` reads the
+`DTFS_VERSION` environment variable and emits it as a compile-time
+constant; `dtfs-release.sh` exports `DTFS_VERSION=<version>` before
+building so `dtfs-* --version` (and the WebUI node table) report the real
+tag. Plain `cargo build` and the dev wrappers leave it at `v0.0.0-dev`.
+`scripts/tests/test-release-version-stamp.sh` guards both behaviours.
+
+Operators upgrade a node with [`dtfs-cli update`](../api-reference/cli-reference.md#update),
+which pulls and installs the matching binary from the published release.
+
 ## Troubleshooting
 
 ### `protoc` not found

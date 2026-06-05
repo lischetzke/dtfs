@@ -461,6 +461,64 @@ Manager is healthy
 Manager status: unavailable
 ```
 
+---
+
+### update
+
+Update DTFS binaries from the configured GitHub release and restart the
+matching systemd service **on the local host** (cluster-wide rolling
+stays in `scripts/dtfs-update.sh`). Unlike the other commands this one
+does not talk to the manager API; it downloads the release tarball,
+verifies each binary's sha256 against the in-tarball `MANIFEST`,
+atomically installs it (`install -m 0755`), and restarts the service.
+
+Run as **root** (it writes the install directory and calls `systemctl`).
+
+```bash
+dtfs-cli update <TARGET> [--check] [--tag <TAG>] [--repo-url <URL>] \
+                         [--install-dir <DIR>] [--config <PATH>] \
+                         [--no-restart] [-y|--yes]
+```
+
+| Argument / Option | Description |
+|-------------------|-------------|
+| `<TARGET>` | `manager`, `data`, `fuse` (alias `client`), `cli`, or `all`. |
+| `--check` | Report installed vs latest available; make no changes. |
+| `--tag <TAG>` | Install a specific release tag (default: the latest release). |
+| `--repo-url <URL>` | Override the release repo (default: `[updater].repo_url`, then `DTFS_REPO_URL`, then the built-in repo). |
+| `--install-dir <DIR>` | Override the install directory (default: `[updater].install_dir` or `/usr/local/bin`). |
+| `--config <PATH>` | Read the `[updater]` block from this file (default: `/etc/dtfs/<role>.toml`). |
+| `--no-restart` | Install the new binary but do not restart the service. |
+| `-y`, `--yes` | Skip the confirmation prompt. |
+
+Target → service: `manager` → `dtfs-manager.service`, `data` →
+`dtfs-data.service`, `fuse` → every running `dtfs-fuse@*` instance,
+`cli` → none (the binary is replaced in place). `all` installs every
+binary and restarts each present service.
+
+The source repo URL lives in the `[updater]` block of any role config
+(see [Configuration](../configuration/manager.md)); it defaults to the
+canonical DTFS repository, so no config is required.
+
+**Integrity:** a single sha256 mismatch between a downloaded binary and
+its `MANIFEST` entry aborts the entire update — nothing is installed.
+
+**Examples:**
+
+```bash
+# What's the latest release, and what's installed here?
+dtfs-cli update manager --check
+
+# Update + restart this data node (prompts before restarting).
+sudo dtfs-cli update data
+
+# Update the manager to a specific tag without prompting.
+sudo dtfs-cli update manager --tag v0.3.0 --yes
+
+# Refresh just the CLI (no service to restart).
+sudo dtfs-cli update cli
+```
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -474,3 +532,4 @@ Manager status: unavailable
 |----------|-------------|
 | `DTFS_MANAGER` | Default manager address (overridden by `--manager` flag) |
 | `DTFS_TOKEN` | JWT authentication token |
+| `DTFS_REPO_URL` | Default release repo for `update` (overridden by `--repo-url` and by `[updater].repo_url`) |
