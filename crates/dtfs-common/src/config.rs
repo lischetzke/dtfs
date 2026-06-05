@@ -228,6 +228,40 @@ fn default_memory_sample_secs() -> u64 {
     5
 }
 
+/// AZ-5 — self-updater source config, consumed by `dtfs-cli update`.
+///
+/// Lives in dtfs-common so the defaults + parsing are tested once. The
+/// CLI pulls just this block out of any role `.toml` via a small
+/// `#[serde(default)]` extractor; the daemons do not read it (serde
+/// silently ignores the unknown `[updater]` table), so it is
+/// intentionally NOT a field on the manager/data/fuse config structs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdaterConfig {
+    /// GitHub repo base URL releases are fetched from. The download URL
+    /// is `<repo_url>/releases/{latest/download,download/<tag>}/dtfs-linux-amd64.tar.gz`.
+    #[serde(default = "default_updater_repo_url")]
+    pub repo_url: String,
+    /// Directory the binaries are installed into (atomic `install -m 0755`).
+    #[serde(default = "default_updater_install_dir")]
+    pub install_dir: String,
+}
+
+impl Default for UpdaterConfig {
+    fn default() -> Self {
+        Self {
+            repo_url: default_updater_repo_url(),
+            install_dir: default_updater_install_dir(),
+        }
+    }
+}
+
+fn default_updater_repo_url() -> String {
+    crate::REPO_URL.to_string()
+}
+fn default_updater_install_dir() -> String {
+    "/usr/local/bin".to_string()
+}
+
 /// FUSE client configuration (loaded from /etc/dtfs/fuse.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FuseConfig {
@@ -684,6 +718,12 @@ pub struct ReadAheadConfig {
     pub prefetch_chunks: u32,
     #[serde(default = "default_prefetch_files")]
     pub prefetch_next_files: u32,
+    /// Bug CE — soft byte budget (MB) for the in-memory prefetch cache. The
+    /// cache evicts to stay under this regardless of chunk size, so a
+    /// whole-file read on a RAM-starved client cannot OOM FUSE. Was an
+    /// unbounded 256-entry count cap.
+    #[serde(default = "default_readahead_cache_mb")]
+    pub cache_mb: u64,
 }
 
 /// Bug AV (AV-3-1) — FUSE write-path preference for first-write
@@ -943,6 +983,9 @@ fn default_prefetch_chunks() -> u32 {
 fn default_prefetch_files() -> u32 {
     3
 }
+fn default_readahead_cache_mb() -> u64 {
+    64
+}
 fn default_local_cache_gb() -> u64 {
     50
 }
@@ -991,6 +1034,27 @@ mod tests {
         let total = 1024 * 1024 * 1024 * 1024u64; // 1 TiB
         // 5% of 1 TiB ~= 52 GiB > 1 GiB, so the pct reserve wins.
         assert_eq!(cfg.headroom_bytes(total), (total as f64 * 0.05) as u64);
+    }
+
+    // AZ-5 — updater config: empty block yields defaults; values override.
+    #[test]
+    fn updater_config_defaults() {
+        let empty: UpdaterConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.repo_url, crate::REPO_URL);
+        assert_eq!(empty.install_dir, "/usr/local/bin");
+        // Default impl agrees with the empty-parse path.
+        assert_eq!(UpdaterConfig::default().repo_url, crate::REPO_URL);
+        assert_eq!(UpdaterConfig::default().install_dir, "/usr/local/bin");
+    }
+
+    #[test]
+    fn updater_config_override() {
+        let cfg: UpdaterConfig = toml::from_str(
+            "repo_url = \"https://github.com/acme/fork\"\ninstall_dir = \"/opt/dtfs/bin\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.repo_url, "https://github.com/acme/fork");
+        assert_eq!(cfg.install_dir, "/opt/dtfs/bin");
     }
 
     #[test]

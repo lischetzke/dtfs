@@ -5,6 +5,8 @@
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
+mod updater;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "dtfs-cli",
@@ -96,6 +98,36 @@ enum Commands {
 
     /// Check manager health
     Health,
+
+    /// Update DTFS binaries from the configured GitHub release and
+    /// restart the matching local service. Run as root (writes the
+    /// install dir and calls systemctl).
+    Update {
+        /// What to update on this host.
+        #[arg(value_enum)]
+        target: updater::UpdateTarget,
+        /// Only report installed vs latest available; make no changes.
+        #[arg(long)]
+        check: bool,
+        /// Release tag to install (default: the latest release).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Override the release repo URL (default: [updater].repo_url or built-in).
+        #[arg(long)]
+        repo_url: Option<String>,
+        /// Override the install directory (default: [updater].install_dir or /usr/local/bin).
+        #[arg(long)]
+        install_dir: Option<String>,
+        /// Read [updater] from this config file (default: /etc/dtfs/<role>.toml).
+        #[arg(long)]
+        config: Option<String>,
+        /// Install the new binary but do not restart the service.
+        #[arg(long)]
+        no_restart: bool,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -332,6 +364,16 @@ async fn main() -> anyhow::Result<()> {
         Commands::Audit { limit, action } => cmd_audit(&api, &args.format, limit, action).await?,
         Commands::Config { show: _ } => cmd_config(&api, &args.format).await?,
         Commands::Health => cmd_health(&api).await?,
+        Commands::Update {
+            target,
+            check,
+            tag,
+            repo_url,
+            install_dir,
+            config,
+            no_restart,
+            yes,
+        } => updater::run(target, check, tag, repo_url, install_dir, config, no_restart, yes)?,
     }
 
     Ok(())

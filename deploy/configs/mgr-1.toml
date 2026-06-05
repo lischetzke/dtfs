@@ -48,3 +48,10 @@ migration_bandwidth_limit_mbps = 200
 heartbeat_interval_secs = 5
 suspect_after_missed = 3
 down_after_missed = 6
+
+# AZ-5 — source for `dtfs-cli update` (read by the CLI; the daemon
+# ignores the block). Both keys are optional; the defaults shown are
+# used when the block is absent.
+[updater]
+repo_url    = "https://github.com/lischetzke/dtfs"
+install_dir = "/usr/local/bin"

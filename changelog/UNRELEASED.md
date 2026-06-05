@@ -37,6 +37,22 @@
   / `total_bytes_written`, and `GET /api/v1/files/inspect` reports a
   per-chunk `replicas` array (`{node_id, disk_id, tier}`) alongside the
   existing `node_ids`. Both are additive; no existing field changed.
+- **AZ-5 — self-updater + release builder.** `dtfs-cli update
+  <manager|data|fuse|cli|all>` pulls the latest release from GitHub
+  (`[updater].repo_url`, default the canonical repo), verifies each
+  binary's sha256 against the in-tarball `MANIFEST`, atomically installs
+  it, and restarts the matching systemd service on the local host.
+  `--check` reports installed vs latest without changing anything;
+  `--tag` pins a release; `--no-restart`, `-y/--yes`, and
+  `--repo-url`/`--install-dir`/`--config` override the source/target. A
+  single sha256 mismatch aborts the whole update before anything is
+  installed. New `scripts/dtfs-release.sh <version>` builds and assembles
+  every GitHub-release file (the fixed-name `dtfs-linux-amd64.tar.gz` the
+  updater downloads, `SHA256SUMS`, release notes) and prints the
+  `gh release create` command (`--publish` runs it). Release builds now
+  stamp the version into the binaries via `DTFS_VERSION` (dev builds keep
+  `v0.0.0-dev`), so `dtfs-* --version` and the WebUI node table show the
+  real release tag.
 
 ## Bug Fixes
 - **AV-4-8 (1) — Bug Z bootstrap stops overwriting operator config.**
@@ -314,3 +330,71 @@
   datacenters). The capacity-spill candidate ranker drops any disk on a
   forbidden tier or in a forbidden datacenter; the anchor copy is never spilled
   regardless. `#[serde(default)]` keeps old snapshots loadable.
+- **Bug CA - internal bug IDs no longer leak into the WebUI.** The embedded
+  dashboard exposed bug-tracker tags two ways: in operator-facing rendered text
+  (Integrity / Home Chunk-Placement / Volumes page descriptions and the
+  volume-edit / volume-scrub modals, e.g. "(Bug BX)", "Mandatory replicas (Bug
+  BT-1)") and in the CSS/HTML/JS comments shipped inside the page source
+  (reachable via View Source). Both are now stripped; Rust source comments are
+  unaffected. A `render_dashboard` unit test scans the entire served document
+  and fails if any "Bug " reference reappears.
+- **Bug CB - deleted files now reclaim disk under manager restart churn.**
+  Unlinking a file removes its manager-side metadata immediately but frees no
+  bytes; the on-disk chunks are reclaimed asynchronously by the orphan reaper
+  (`orphan_scrub`). The reaper measured its reap grace against an in-memory
+  "first observed orphan" timestamp that was wiped on every manager restart /
+  leadership change, and the loop also skipped a full `orphan_interval_secs`
+  (default 24h) after each (re)start - so on a cluster doing rolling deploys or
+  soak chaos, no manager ever accumulated the 24h grace and a deleted file's
+  chunks were never freed (disk usage of deleted media kept climbing). The
+  grace is now anchored to each chunk's durable on-disk `.dat` mtime, reported
+  by `ListChunks` (new `chunk_mtimes_ms` field) and evaluated by the pure
+  `orphan_reap_due` helper: a chunk is reaped only when it is unreferenced AND
+  its file is at least `orphan_grace_secs` old. This survives restarts and
+  reaps long-resident deleted chunks promptly, while a freshly-written chunk
+  (recent mtime) is still protected against the in-flight put/promote race.
+  The post-(re)start first scan now runs after a short warmup instead of a full
+  interval. **Mixed-version note:** a manager on this build talking to a data
+  node that predates Bug CB (no `chunk_mtimes_ms`) DEFERS reaping rather than
+  reaping with no grace; reclamation resumes once data nodes are upgraded
+  (roll data nodes after managers, per AGENTS.md A.4.2).
+- **Bug CC - read-driven cache promotion works regardless of which manager a
+  data node heartbeats to.** The tiering engine's per-(chunk,DC) read window and
+  its promote/demote tick are in-memory on the Raft LEADER, but a data node
+  heartbeats to whatever manager it connected to - often a FOLLOWER. The
+  heartbeat handler applied the heartbeat's per-chunk read counters to the LOCAL
+  manager's tiering engine, so reads that landed on a follower were invisible to
+  the leader's tick: read-hot chunks never promoted to a warm cache replica (the
+  tick saw zero reads for them and instead demoted them as idle, so caching only
+  ever evicted, never cached). The heartbeat now routes per-chunk reads to the
+  leader via a new `ClientRequest::ReportChunkReads` forwarded through the
+  existing `ForwardClientWrite` path; the manager service intercepts that variant
+  BEFORE Raft and applies it directly to the leader's tiering engine (the leader
+  self-forwards). The variant is not state-machine state - its apply arm is a
+  no-op. Verified live: a cold-only file read from a cold-cache client now
+  promotes a warm cache replica (`cache.promote` audit fires + the warm `.dat`
+  appears) even when the serving data node heartbeats to a follower.
+- **Bug CD - orphan-lease cleanup no longer drops a live concurrent writer's
+  lease.** `ReleaseLeasesByHost` (run at FUSE startup/shutdown to clear orphan
+  leases from a crashed prior process) dropped EVERY write lease on the host
+  except the caller's own pid - its claim to "keep leases from healthy
+  concurrent mounts" was false. A second live FUSE process on the host (or a
+  duplicate/crash-looping mount unit) lost its in-flight lease whenever another
+  FUSE process (re)started, so the live writer's next `commit_chunk_locations`
+  hit `WriteLeaseConflict` and the write failed with EIO. The apply now drops
+  only leases that are already EXPIRED (`expires_at_ms <= now_ms`, manager-
+  supplied): a live client renews at half-life so it is never expired and is
+  never dropped, while a crashed client's lease lapses and is still reaped. A
+  restarting writer's own not-yet-expired orphan on a given path is already
+  handled by `AcquireWriteLease`'s lazy expired-eviction. `ReleaseLeasesByHost`
+  gains a `now_ms` field (not persisted; no snapshot impact).
+- **Bug CE - FUSE readahead cache is bounded by bytes, not entry count (OOM
+  fix).** The in-memory prefetch cache was capped at 256 ENTRIES, but each
+  entry is a whole chunk (up to 128 MB), and the prefetch task inserted with no
+  bound check at all - so a whole-file sequential read on a RAM-starved client
+  (the 1 GB Minicluster client) drove FUSE RSS past ~800 MB and the OOM killer
+  reaped the mount. The cache is now bounded by a configurable byte budget
+  (`[readahead] cache_mb`, default 64): all inserts (foreground + prefetch)
+  route through one accountant that evicts arbitrary entries until the running
+  byte total fits, never rejecting a read (§ A.5 best-effort). Bounds memory
+  regardless of chunk size or prefetch concurrency.
