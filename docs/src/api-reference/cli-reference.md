@@ -222,6 +222,39 @@ Idempotent: re-running with the same flags reports `no-op`.
 
 ---
 
+#### volumes set-write-safety
+
+CF-3a — set or update a volume's `write_safety` policy (the
+durability-ack threshold + per-write timeout). Every flag is optional;
+omitted flags keep the current value. The runtime reconciliation tool
+for the ack threshold — without it the only way to change a stored
+`min_replicas_before_ack` is a full volume upsert.
+
+```bash
+dtfs-cli volumes set-write-safety <volume_id> \
+    [--min-replicas-before-ack N] [--write-timeout-secs N]
+```
+
+**Example — lower the production default volume's ack floor to 1:**
+
+```
+$ dtfs-cli volumes set-write-safety default --min-replicas-before-ack 1
+Volume 'default' set-write-safety: applied
+  min_replicas_before_ack: 1
+  write_timeout_secs:      30
+```
+
+Idempotent: re-running with the same value reports `no-op`.
+
+**Errors:**
+
+| Status | Reason |
+|--------|--------|
+| HTTP 400 | `--min-replicas-before-ack 0` or `--write-timeout-secs 0` (both must be >= 1). |
+| HTTP 404 | Volume not found. |
+
+---
+
 #### files flush-cache
 
 Bug AV (AV-3-5) — drop cache replicas under a path prefix. Mandatory
@@ -306,20 +339,14 @@ PATH                                     VOLUME       CHUNKS   SIZE
 
 ### scrub
 
-Trigger a scrub operation. Without target options, triggers a cluster-wide scrub.
+Trigger an immediate cluster-wide scrub on every data node (CF-8: the
+manager replicates the request and relays it via heartbeat; each data
+node runs it once and reports the result, visible in
+`/api/v1/stats.scrub_results_by_node` and the WebUI Last Scrub card).
 
 ```bash
 # Cluster-wide deep scrub
 dtfs-cli scrub
-
-# Scrub a specific disk
-dtfs-cli scrub --disk /mnt/dtfs-disk-a1b2c3d4
-
-# Scrub a specific file
-dtfs-cli scrub --file /data/reports/2024-q1.parquet
-
-# Scrub a specific chunk
-dtfs-cli scrub --chunk abc123def456
 
 # Quick scrub (metadata only)
 dtfs-cli scrub --level quick
@@ -327,15 +354,13 @@ dtfs-cli scrub --level quick
 
 | Option | Description |
 |--------|-------------|
-| `--disk <PATH>` | Target a specific disk by mount path |
-| `--file <PATH>` | Target a specific file |
-| `--chunk <ID>` | Target a specific chunk by ID |
 | `--level <LEVEL>` | Scrub level: `quick` (metadata) or `deep` (full checksum). Default: `deep` |
+| `--disk <PATH>` / `--file <PATH>` / `--chunk <ID>` | **Not implemented** — the API rejects targeted scrubs with `400`; only full cluster-wide scrubs are supported. |
 
 **Example output:**
 
 ```
-Scrub triggered: disk /mnt/dtfs-disk-a1b2c3d4 (level: deep)
+Scrub triggered: all * (level: deep)
 Status: accepted
 ```
 
