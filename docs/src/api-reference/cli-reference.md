@@ -306,20 +306,14 @@ PATH                                     VOLUME       CHUNKS   SIZE
 
 ### scrub
 
-Trigger a scrub operation. Without target options, triggers a cluster-wide scrub.
+Trigger an immediate cluster-wide scrub on every data node (CF-8: the
+manager replicates the request and relays it via heartbeat; each data
+node runs it once and reports the result, visible in
+`/api/v1/stats.scrub_results_by_node` and the WebUI Last Scrub card).
 
 ```bash
 # Cluster-wide deep scrub
 dtfs-cli scrub
-
-# Scrub a specific disk
-dtfs-cli scrub --disk /mnt/dtfs-disk-a1b2c3d4
-
-# Scrub a specific file
-dtfs-cli scrub --file /data/reports/2024-q1.parquet
-
-# Scrub a specific chunk
-dtfs-cli scrub --chunk abc123def456
 
 # Quick scrub (metadata only)
 dtfs-cli scrub --level quick
@@ -327,15 +321,13 @@ dtfs-cli scrub --level quick
 
 | Option | Description |
 |--------|-------------|
-| `--disk <PATH>` | Target a specific disk by mount path |
-| `--file <PATH>` | Target a specific file |
-| `--chunk <ID>` | Target a specific chunk by ID |
 | `--level <LEVEL>` | Scrub level: `quick` (metadata) or `deep` (full checksum). Default: `deep` |
+| `--disk <PATH>` / `--file <PATH>` / `--chunk <ID>` | **Not implemented** — the API rejects targeted scrubs with `400`; only full cluster-wide scrubs are supported. |
 
 **Example output:**
 
 ```
-Scrub triggered: disk /mnt/dtfs-disk-a1b2c3d4 (level: deep)
+Scrub triggered: all * (level: deep)
 Status: accepted
 ```
 

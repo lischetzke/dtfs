@@ -17,6 +17,30 @@ use crate::store::ChunkStore;
 /// takes effect within `DECISION_TICK_SECS`, not at next restart.
 const DECISION_TICK_SECS: u64 = 60;
 
+/// CF-8 — staleness window for manual scrub requests. The manager
+/// re-sends the latest `ScrubRequestNow` on every heartbeat forever
+/// (it is replaced, never cleared); per-process id dedupe handles the
+/// steady state, and this window stops a *restarted* data node from
+/// surprise-running a scrub the operator triggered long ago.
+pub const MANUAL_SCRUB_MAX_AGE_SECS: u64 = 3600;
+
+/// CF-8 — should this manual scrub request run now?
+///
+/// `true` iff the id is non-empty, differs from the last id this
+/// process handled, and the request is younger than `max_age_secs`.
+pub fn manual_scrub_due(
+    req_id: &str,
+    requested_at_ms: u64,
+    last_handled_id: Option<&str>,
+    now_ms: u64,
+    max_age_secs: u64,
+) -> bool {
+    if req_id.is_empty() || last_handled_id == Some(req_id) {
+        return false;
+    }
+    now_ms.saturating_sub(requested_at_ms) <= max_age_secs.saturating_mul(1000)
+}
+
 /// Background scrub scheduler that runs quick and deep scrubs on configured
 /// intervals against all disks managed by the chunk store. AZ-1: the
 /// `config` field is an `Arc<RwLock<ScrubConfig>>` so the manager's
@@ -43,7 +67,10 @@ impl ScrubScheduler {
     /// Run the background scrub loop. Wakes every `DECISION_TICK_SECS`,
     /// reads the live `ScrubConfig`, and runs a quick / deep scrub
     /// when the configured interval has elapsed since the last run.
-    pub async fn run(&self) {
+    /// CF-8: also selects on `scrub_now` — a manual trigger relayed by
+    /// the manager via heartbeat — and runs that level immediately
+    /// (which resets the level's interval timer, like any other run).
+    pub async fn run(&self, mut scrub_now: tokio::sync::mpsc::Receiver<ScrubLevel>) {
         let (q_h, d_h, io_pct) = {
             let c = self.config.read().await;
             (c.quick_interval_hours, c.deep_interval_hours, c.max_io_percent)
@@ -66,30 +93,43 @@ impl ScrubScheduler {
         let mut last_deep: Option<std::time::Instant> = None;
 
         loop {
-            ticker.tick().await;
-            let (quick_secs, deep_secs) = {
-                let c = self.config.read().await;
-                (
-                    c.quick_interval_hours.saturating_mul(3600),
-                    c.deep_interval_hours.saturating_mul(3600),
-                )
-            };
-            let now = std::time::Instant::now();
-            let quick_due = match last_quick {
-                Some(t) => now.duration_since(t).as_secs() >= quick_secs,
-                None => now.duration_since(start).as_secs() >= quick_secs,
-            };
-            let deep_due = match last_deep {
-                Some(t) => now.duration_since(t).as_secs() >= deep_secs,
-                None => now.duration_since(start).as_secs() >= deep_secs,
-            };
-            if quick_due {
-                self.run_scrub(ScrubLevel::Quick).await;
-                last_quick = Some(std::time::Instant::now());
-            }
-            if deep_due {
-                self.run_scrub(ScrubLevel::Deep).await;
-                last_deep = Some(std::time::Instant::now());
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let (quick_secs, deep_secs) = {
+                        let c = self.config.read().await;
+                        (
+                            c.quick_interval_hours.saturating_mul(3600),
+                            c.deep_interval_hours.saturating_mul(3600),
+                        )
+                    };
+                    let now = std::time::Instant::now();
+                    let quick_due = match last_quick {
+                        Some(t) => now.duration_since(t).as_secs() >= quick_secs,
+                        None => now.duration_since(start).as_secs() >= quick_secs,
+                    };
+                    let deep_due = match last_deep {
+                        Some(t) => now.duration_since(t).as_secs() >= deep_secs,
+                        None => now.duration_since(start).as_secs() >= deep_secs,
+                    };
+                    if quick_due {
+                        self.run_scrub(ScrubLevel::Quick).await;
+                        last_quick = Some(std::time::Instant::now());
+                    }
+                    if deep_due {
+                        self.run_scrub(ScrubLevel::Deep).await;
+                        last_deep = Some(std::time::Instant::now());
+                    }
+                }
+                Some(level) = scrub_now.recv() => {
+                    // CF-8 — operator-triggered run; counts as a regular
+                    // run for the interval timer of that level.
+                    tracing::info!("CF-8 manual {:?} scrub starting (operator trigger)", level);
+                    self.run_scrub(level).await;
+                    match level {
+                        ScrubLevel::Quick => last_quick = Some(std::time::Instant::now()),
+                        ScrubLevel::Deep => last_deep = Some(std::time::Instant::now()),
+                    }
+                }
             }
         }
     }
@@ -188,5 +228,40 @@ impl ScrubScheduler {
         }
 
         tracing::info!("Completed {} scrub on all disks", level_str);
+    }
+}
+
+#[cfg(test)]
+mod cf8_manual_scrub_tests {
+    use super::manual_scrub_due;
+
+    const HOUR_MS: u64 = 3600 * 1000;
+
+    #[test]
+    fn fresh_new_id_runs() {
+        assert!(manual_scrub_due("t1", 1_000, None, 2_000, 3600));
+        // a different id than the last handled one also runs
+        assert!(manual_scrub_due("t2", 1_000, Some("t1"), 2_000, 3600));
+    }
+
+    #[test]
+    fn same_id_dedupes() {
+        // the manager re-sends the request on every heartbeat — only the
+        // first delivery may run
+        assert!(!manual_scrub_due("t1", 1_000, Some("t1"), 2_000, 3600));
+    }
+
+    #[test]
+    fn stale_request_ignored() {
+        // restarted data node sees a request from >1h ago: skip
+        let now = 10 * HOUR_MS;
+        assert!(!manual_scrub_due("t1", now - HOUR_MS - 1, None, now, 3600));
+        // boundary: exactly max_age old still runs
+        assert!(manual_scrub_due("t1", now - HOUR_MS, None, now, 3600));
+    }
+
+    #[test]
+    fn empty_id_never_runs() {
+        assert!(!manual_scrub_due("", 1_000, None, 2_000, 3600));
     }
 }

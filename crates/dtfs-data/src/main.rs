@@ -117,12 +117,17 @@ async fn main() -> anyhow::Result<()> {
     // Bug BF-2 — integrity-fault collector. verify_on_read records here;
     // heartbeat drains + ships to mgr (BF-5); mgr auto-quarantines (BF-6).
     let integrity_faults = Arc::new(integrity::IntegrityFaultCollector::new(1024));
+    // CF-8 — manual scrub trigger path: the heartbeat task receives a
+    // ScrubRequestNow from the manager and pushes the level here; the
+    // scheduler loop selects on it and runs the scrub immediately.
+    let (scrub_now_tx, scrub_now_rx) =
+        tokio::sync::mpsc::channel::<dtfs_common::types::ScrubLevel>(4);
     let scrub_scheduler = scrub::ScrubScheduler::new(
         chunk_store.clone(),
         scrub_config.clone(),
     );
     tokio::spawn(async move {
-        scrub_scheduler.run().await;
+        scrub_scheduler.run(scrub_now_rx).await;
     });
     tracing::info!("Started scrub scheduler background task");
 
@@ -142,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
             process_start,
             heartbeat_scrub_config,
             heartbeat_integrity,
+            scrub_now_tx,
         )
         .await
         {
@@ -314,7 +320,13 @@ async fn manager_lifecycle(
     // last tick. Drained into each outgoing HeartbeatRequest; on RPC
     // failure we re-enqueue so the next tick retries.
     integrity_faults: Arc<crate::integrity::IntegrityFaultCollector>,
+    // CF-8 — manual scrub trigger relay into the scrub scheduler.
+    scrub_now_tx: tokio::sync::mpsc::Sender<dtfs_common::types::ScrubLevel>,
 ) -> anyhow::Result<()> {
+    // CF-8 — dedupe state: each ScrubRequestNow id runs at most once per
+    // process lifetime (the manager re-sends the latest request on every
+    // heartbeat; it is replaced, never cleared).
+    let mut last_scrub_request_id: Option<String> = None;
     // F-024 hardening: walk through every configured manager endpoint when the
     // primary is down (e.g. after a rolling restart). The list is built from
     // `manager_addr` + `manager_addrs` in priority order.
@@ -615,6 +627,55 @@ async fn manager_lifecycle(
                     integrity_faults.clear_self_quarantined();
                 }
                 consecutive_failures = 0;
+
+                // CF-8 — manual scrub trigger relayed by the manager.
+                // Dedupe by id (it is re-sent every heartbeat) and skip
+                // stale requests (e.g. re-delivered across a data-node
+                // restart long after the operator triggered).
+                if let Some(sr) = &resp.scrub_request {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    if scrub::manual_scrub_due(
+                        &sr.id,
+                        sr.requested_at_ms,
+                        last_scrub_request_id.as_deref(),
+                        now_ms,
+                        scrub::MANUAL_SCRUB_MAX_AGE_SECS,
+                    ) {
+                        let level = match sr.level.as_str() {
+                            "quick" => Some(dtfs_common::types::ScrubLevel::Quick),
+                            "deep" => Some(dtfs_common::types::ScrubLevel::Deep),
+                            other => {
+                                tracing::warn!(
+                                    "CF-8 manual scrub request {} has unknown level {:?} — ignoring",
+                                    sr.id,
+                                    other
+                                );
+                                None
+                            }
+                        };
+                        if let Some(level) = level {
+                            // Mark handled even if the channel is full —
+                            // a dropped duplicate must not retrigger
+                            // forever on every heartbeat.
+                            last_scrub_request_id = Some(sr.id.clone());
+                            match scrub_now_tx.try_send(level) {
+                                Ok(()) => tracing::info!(
+                                    "CF-8 manual {} scrub request {} accepted — forwarding to scheduler",
+                                    sr.level,
+                                    sr.id
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "CF-8 manual scrub request {} dropped (scheduler busy): {}",
+                                    sr.id,
+                                    e
+                                ),
+                            }
+                        }
+                    }
+                }
 
                 // Apply config updates pushed by the manager via heartbeat response.
                 if let Some(config_update) = resp.config_update {

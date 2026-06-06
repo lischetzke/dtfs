@@ -636,7 +636,7 @@ impl ManagerService for MetadataService {
         // observation so operators see the deprecation in journalctl
         // without the noise of a per-heartbeat warn.
         let scrub_cfg = &self.config.scrub;
-        let (cfg_version, scrub_override) = {
+        let (cfg_version, scrub_override, pending_scrub) = {
             let sm = self.sm_data.read().await;
             let cfg_version = sm.cluster_config.version;
             warn_once_on_dead_schedule_fields(&sm.volumes);
@@ -655,6 +655,10 @@ impl ManagerService for MetadataService {
                     quarantine_on_fault:    scrub_cfg.quarantine_on_fault,
                     auto_unquarantine_secs: scrub_cfg.auto_unquarantine_secs,
                 }),
+                // CF-8 — relay the latest manual scrub trigger on every
+                // heartbeat (works from any manager — replicated state).
+                // The data node dedupes by id, so repetition is free.
+                sm.pending_scrub.clone(),
             )
         };
 
@@ -865,11 +869,21 @@ impl ManagerService for MetadataService {
             }
         });
 
+        // CF-8 — manual scrub trigger relay.
+        let scrub_request = pending_scrub.map(|p| {
+            dtfs_proto::dtfs::manager::ScrubRequestNow {
+                id: p.id,
+                level: p.level,
+                requested_at_ms: p.requested_at_ms,
+            }
+        });
+
         Ok(Response::new(HeartbeatResponse {
             accepted: true,
             config_version: cfg_version,
             config_update,
             self_quarantine_cleared,
+            scrub_request,
         }))
     }
 
