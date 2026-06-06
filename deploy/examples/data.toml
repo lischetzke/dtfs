@@ -1,0 +1,96 @@
+# dtfs-data example configuration — /etc/dtfs/data.toml
+#
+# Canonical, exhaustive reference: every option the binary understands.
+# Required options are set; optional options are commented out and show
+# their compiled-in default. Source of truth: crates/dtfs-common/src/config.rs
+# (DataNodeConfig). Keep this file in sync with that struct in the same commit
+# (AGENTS.md § B.6).
+
+[node]
+# hostname is this data node's IDENTITY: node_id = hash(hostname). MUST be
+# unique across every daemon in the cluster — in particular it must differ
+# from a co-located manager's [node].hostname and from a co-located FUSE
+# client's [location].host (the client registers under that string).
+hostname = "dtfs-example-data01"
+#id = "auto"
+#data_dir = "/var/lib/dtfs"
+
+[location]
+# Same region/datacenter/rack/host as other daemons on the same physical box
+# so reads prefer the local replica. All four fields required.
+region = "eu"
+datacenter = "example-dc"
+rack = "box1"
+host = "example-box1"
+
+[cluster]
+manager_addr = "10.0.0.1:9401"      # primary manager gRPC endpoint
+shared_secret = "change-me"         # same secret as the managers
+# Fallback managers, walked in order when the primary is unreachable (F-024).
+# List every manager here so a rolling manager restart never strands the node.
+#manager_addrs = ["10.0.0.2:9401", "10.0.0.3:9401"]
+
+[grpc]
+listen_addr = "10.0.0.4:9500"       # chunk-streaming gRPC. Use the ROUTABLE
+                                    # address other nodes dial, not 0.0.0.0,
+                                    # if the host has several interfaces.
+#max_message_size_mb = 256
+#max_concurrent_chunk_writes = 8    # Bug D: bounds peak put memory
+                                    # (N in-flight writes x chunk size)
+
+[tls]
+#mode = "auto"                      # NOT implemented — plaintext today (see manager.toml)
+#cert_file = "/etc/dtfs/tls/server.crt"
+#key_file = "/etc/dtfs/tls/server.key"
+#ca_file = "/etc/dtfs/tls/ca.crt"
+
+# One block per local disk. tier: "hot" | "warm" | "cold" | "tape".
+[[disks]]
+path = "/mnt/hdd0"
+tier = "cold"
+
+#[[disks]]
+#path = "/mnt/ssd0"
+#tier = "warm"
+
+[cache]
+#max_memory_mb = 8192               # ARC read-cache budget
+#policy = "arc"
+
+[scrub]
+# Local fallback only — the manager's [scrub] (ClusterScrubConfig) overrides
+# these via heartbeat once connected.
+#quick_interval_hours = 6
+#deep_interval_hours = 168
+#quick_cron = "0 3 * * *"           # optional cron override of the interval
+#deep_cron = "0 4 * * 0"
+#max_io_percent = 10
+#verify_on_read = true              # startup fallback before first heartbeat
+#quarantine_on_fault = true
+
+# Optional sections below — whole block may be omitted.
+
+#[memory]
+# Bug G: per-process RAM budget with proactive backpressure. 0 = unbounded
+# (legacy). Set non-zero on every production deploy; on a composite host the
+# sum of all roles' caps must stay under host RAM (AGENTS.md § A.5).
+#hard_cap_mb = 0
+#warn_threshold_pct = 80
+#shed_threshold_pct = 92            # above this, new put_chunk -> RESOURCE_EXHAUSTED
+#sample_interval_secs = 5
+
+#[placement]
+# Bug BU: reject writes to a disk under free-space headroom (typed
+# RESOURCE_EXHAUSTED) instead of streaming into ENOSPC.
+#min_free_bytes = 1073741824
+#min_free_pct = 5.0
+#allow_capacity_spill = true
+
+# LTFS-backed tape devices (frozen/archival tier). Omit if no tape drives.
+#[[tape_devices]]
+#ltfs_path = "/mnt/tape-a"          # must be LTFS-mounted before dtfs-data starts
+#device = "/dev/nst0"               # raw drive node (status/rewind); optional
+#library_device = "/dev/sg2"        # robotic changer; omit for standalone drive
+#label = "lto9-library-a"
+#capacity_gb = 18000                # informational hint (LTO-9 native ~18 TB)
+#max_write_mbps = 0                 # 0 = unlimited tiering write bandwidth

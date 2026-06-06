@@ -51,18 +51,27 @@ The following action types are recorded:
 
 ## Retention
 
-The in-memory ring buffer has a configurable maximum size. The default capacity is 10,000 entries. At typical event rates, this provides approximately 90 days of retention for a moderately active cluster.
+The in-memory log is capped at 10,000 entries (`MAX_AUDIT_LOG_ENTRIES`,
+compile-time constant — not configurable). At typical event rates this
+provides days-to-months of retention, but a bulk operation (e.g. a
+re-replication wave emitting one `replication.complete` per chunk) can
+churn through the whole cap in minutes — export to JSONL if you need
+history.
 
-### Configuring Retention
+### `[audit]` Configuration
 
-The maximum entry count can be set in the manager configuration:
+The manager's `[audit]` block has a single option:
 
 ```toml
 [audit]
-max_entries = 10000
+replicate_via_raft = false   # default
 ```
 
-Increasing this value consumes more memory on the manager node. Each entry is approximately 200-500 bytes depending on field lengths, so 10,000 entries uses roughly 2-5 MB of memory.
+When `false`, audit entries stay in a per-manager local ring (+ JSONL
+archive) — each manager returns only events it observed itself. When `true`,
+entries replicate through Raft so every manager serves the same view. Enable
+only after **all** managers run a binary that understands `AppendAudit` (see
+the rollout recipe in `crates/dtfs-common/src/config.rs`).
 
 ### Retention Policy
 
@@ -99,6 +108,13 @@ Query parameters:
 |-----------|------|---------|-------------|
 | `limit` | Integer | 50 | Maximum number of entries to return |
 | `action` | String | (none) | Filter by action prefix (e.g., `node.join` matches both `node.join.request` and `node.join.complete`) |
+
+> **`limit` ordering gotcha.** With the default local ring
+> (`replicate_via_raft = false`), `limit=N` returns the **oldest** N
+> matching entries — recent events are silently cut off. With
+> `replicate_via_raft = true`, the same query returns the **newest** N.
+> When investigating recent activity on a default-config cluster, request a
+> limit larger than the buffer (e.g. `limit=20000`) and tail client-side.
 
 ### Via gRPC
 

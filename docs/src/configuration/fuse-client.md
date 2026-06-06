@@ -2,17 +2,28 @@
 
 The FUSE client is configured via `/etc/dtfs/fuse.toml`. This page documents every available option.
 
+> **Malformed config = restart loop.** A `fuse.toml` that fails to parse
+> (syntax error, missing required field such as `manager_addr`) makes the
+> service exit at startup; under systemd it restart-loops every few seconds.
+> After editing, check `journalctl -u dtfs-fuse@<mount> -n 20`.
+
 ## `[client]` -- Manager Connection
 
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
-| `manager_addr` | `client.manager_addr` | `String` | *(required)* | `host:port` | No | Address of a manager node for metadata operations. The FUSE client contacts this address to resolve file paths to chunk locations. For high availability, this can point to a load balancer in front of multiple managers. |
+| `manager_addr` | `client.manager_addr` | `String` | *(required)* | `host:port` | No | Primary manager gRPC endpoint for metadata operations. |
+| `manager_addrs` | `client.manager_addrs` | `Vec<String>` | `[]` | List of `host:port` | No | Additional manager endpoints, walked in order on failover (F-024). List every manager. |
+| `shared_secret` | `client.shared_secret` | `String` | `""` | Cluster secret | No | Required for the client to self-register and appear in the node table (Bug AA). Empty = the client stays invisible except while holding a write lease. |
+| `heartbeat_interval_secs` | `client.heartbeat_interval_secs` | `u64` | `10` | 0--liveness window | No | Keepalive re-register cadence (Bug BQ-1). Keep well under the manager's `raft.node_liveness_secs` (default 30) or the client flaps `Down`. `0` = register once. |
+| `chunk_size_mb` | `client.chunk_size_mb` | `u32` | `4` | Must match volume | No | Chunk size the write buffer splits files into (Bug BW). **Must equal the volume's chunk size** (manager `defaults.chunk_size_mb`); a mismatch corrupts multi-chunk reads. |
 
 ### Example
 
 ```toml
 [client]
 manager_addr = "mgr-01.example.com:9401"
+manager_addrs = ["mgr-02.example.com:9401", "mgr-03.example.com:9401"]
+shared_secret = "a-strong-random-secret"
 ```
 
 ---
@@ -26,7 +37,11 @@ The location block places this client in the four-level topology hierarchy. The 
 | `region` | `location.region` | `String` | *(required)* | Any non-empty string | No | Geographic region where this client runs. |
 | `datacenter` | `location.datacenter` | `String` | *(required)* | Any non-empty string | No | Datacenter within the region. |
 | `rack` | `location.rack` | `String` | *(required)* | Any non-empty string | No | Rack or failure zone. |
-| `host` | `location.host` | `String` | *(required)* | Any non-empty string | No | Host-level identifier. |
+| `host` | `location.host` | `String` | *(required)* | Any non-empty string | No | Host-level identifier — **and this client's registry identity**. The FUSE client has no `[node].hostname`; it registers (and holds write leases) under this string. It must be unique cluster-wide: never reuse a data node's or manager's hostname, or the two daemons overwrite each other's registry entry. Convention for a client co-located with a data node: `<data-hostname>_cln`. |
+
+> The `_cln` suffix costs the `SameHost` distance tie-break for read routing
+> (the strings no longer match). Give each physical box its own `rack` value
+> so `SameRack` keeps reads local.
 
 ### Example
 
@@ -35,7 +50,7 @@ The location block places this client in the four-level topology hierarchy. The 
 region = "eu"
 datacenter = "frankfurt"
 rack = "rack-b2"
-host = "app-server-01"
+host = "app-server-01_cln"
 ```
 
 ---
@@ -45,6 +60,7 @@ host = "app-server-01"
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
 | `mountpoint` | `mount.mountpoint` | `PathBuf` | *(required)* | Absolute filesystem path | No | Directory where the DTFS filesystem is mounted. This directory must exist and be empty before the FUSE client starts. Applications access DTFS files through this path. |
+| `allow_other` | `mount.allow_other` | `bool` | `false` | `true` or `false` | No | Mount with FUSE `allow_other` so non-root users (e.g. a media-server service under its own UID) can read and write through the mount (F-028). |
 
 ### Example
 
@@ -61,9 +77,10 @@ Controls speculative prefetching of chunks and files to reduce read latency for 
 
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
-| `mode` | `readahead.mode` | `String` | `"folder-sequential"` | `"disabled"`, `"sequential"`, `"folder-sequential"` | Yes | Read-ahead strategy. `"disabled"` turns off all prefetching. `"sequential"` prefetches subsequent chunks of the current file. `"folder-sequential"` additionally prefetches the next files in the same directory (sorted by name), which is useful for media streaming and log processing workloads. |
+| `mode` | `readahead.mode` | `String` | `"folder-sequential"` | `"disabled"`, `"file-only"`, `"file-sequential"`, `"folder-sequential"` | Yes | Read-ahead strategy. `"disabled"` turns off all prefetching. `"file-only"` / `"file-sequential"` prefetch subsequent chunks of the current file. `"folder-sequential"` additionally prefetches the next files in the same directory (sorted by name) — useful for media streaming. Unknown values fall back to `"folder-sequential"` with a warning. |
 | `prefetch_chunks` | `readahead.prefetch_chunks` | `u32` | `8` | 0--64 | Yes | Number of subsequent chunks to prefetch when sequential access is detected. Set to `0` to disable chunk-level prefetching while keeping file-level prefetching active. |
 | `prefetch_next_files` | `readahead.prefetch_next_files` | `u32` | `3` | 0--20 | Yes | Number of subsequent files in the same directory to prefetch. Only applies when `mode` is `"folder-sequential"`. |
+| `cache_mb` | `readahead.cache_mb` | `u64` | `64` | >=1 | Yes | Byte budget (MB) for the in-memory prefetch cache (Bug CE). The cache evicts to stay under this regardless of chunk size, so whole-file reads cannot OOM the FUSE process. |
 
 ### Example
 
@@ -83,7 +100,9 @@ Controls an optional on-disk cache on the client machine that stores recently ac
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
 | `local_cache_dir` | `cache.local_cache_dir` | `Option<PathBuf>` | `None` | Absolute filesystem path | No | Directory for the local chunk cache. When set to `None` (omitted), the local disk cache is disabled and all reads go to the network. |
-| `local_cache_max_gb` | `cache.local_cache_max_gb` | `u64` | `50` | 1--10000 | Yes | Maximum size of the local disk cache in gigabytes. When the cache exceeds this limit, the least recently used entries are evicted. |
+| `local_cache_max_gb` | `cache.local_cache_max_gb` | `u64` | `50` | 0--10000 | Yes | Maximum size of the local disk cache in gigabytes. When the cache exceeds this limit, the least recently used entries are evicted. `0` = zero byte budget (cache effectively disabled even when `local_cache_dir` is set). |
+| `max_age_days` | `cache.max_age_days` | `Option<u32>` | `None` | >=1 | Yes | Maximum age of a cached chunk before the pruner evicts it (atime-based, P0-11). Unset = size-based eviction only. |
+| `prune_interval_secs` | `cache.prune_interval_secs` | `u64` | `3600` | >=60 | Yes | Interval between background pruner sweeps. |
 
 ### Example
 
@@ -130,7 +149,7 @@ Controls how the FUSE client behaves when it loses contact with the manager clus
 
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
-| `mode` | `partition_safety.mode` | `PartitionMode` | `"strict"` | `"strict"`, `"local-readonly"`, `"full-lock"` | Yes | Behavior when the client cannot reach the manager quorum. `"strict"` returns I/O errors for all operations after `quorum_loss_timeout_secs`. `"local-readonly"` allows reads from the local cache but blocks all writes. `"full-lock"` freezes the mount entirely, causing all I/O to block until connectivity is restored. |
+| `mode` | `partition_safety.mode` | `PartitionMode` | `"strict"` | `"strict"`, `"localreadonly"`, `"fulllock"` | Yes | Behavior when the client cannot reach the manager quorum. `"strict"` returns I/O errors for all operations after `quorum_loss_timeout_secs`. `"localreadonly"` allows reads from the local cache but blocks all writes. `"fulllock"` freezes the mount entirely, causing all I/O to block until connectivity is restored. (TOML values are the lowercase variant names, no hyphens.) |
 | `quorum_loss_timeout_secs` | `partition_safety.quorum_loss_timeout_secs` | `u64` | `10` | 1--3600 | Yes | Number of seconds to wait after losing manager contact before the partition safety `mode` takes effect. During this grace period, cached metadata is used for reads and writes are buffered. |
 | `show_warning` | `partition_safety.show_warning` | `bool` | `true` | `true` or `false` | Yes | When `true`, the FUSE client logs a warning and writes a marker file at the mount root (`.dtfs-partition-warning`) when a partition is detected. Applications can watch for this file to implement their own partition-aware logic. |
 
@@ -164,30 +183,7 @@ install_dir = "/usr/local/bin"
 
 ## Complete Example
 
-```toml
-[client]
-manager_addr = "mgr-01.example.com:9401"
-
-[location]
-region = "eu"
-datacenter = "frankfurt"
-rack = "rack-b2"
-host = "app-server-01"
-
-[mount]
-mountpoint = "/mnt/dtfs"
-
-[readahead]
-mode = "folder-sequential"
-prefetch_chunks = 8
-prefetch_next_files = 3
-
-[cache]
-local_cache_dir = "/var/cache/dtfs"
-local_cache_max_gb = 50
-
-[partition_safety]
-mode = "strict"
-quorum_loss_timeout_secs = 10
-show_warning = true
-```
+The canonical, exhaustive example (every option, optional ones commented out
+with their defaults) is checked in at `deploy/examples/fuse.toml`. It is
+parse-tested against the config structs (`dtfs-common`
+`example_fuse_toml_parses`), so it cannot silently drift from the code.

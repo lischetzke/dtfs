@@ -7,7 +7,7 @@ The data node is configured via `/etc/dtfs/data.toml`. This page documents every
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
 | `id` | `node.id` | `String` | `"auto"` | Any non-empty string or `"auto"` | No | Unique identifier for this data node. When set to `"auto"`, a UUID v4 is generated on first startup and persisted to the data directory. |
-| `hostname` | `node.hostname` | `String` | *(required)* | Valid hostname or FQDN | No | The hostname that the manager and other nodes use to reach this data node. Must be resolvable by all cluster members. |
+| `hostname` | `node.hostname` | `String` | *(required)* | Any non-empty string | No | This data node's **identity**: the registry `node_id` is a hash of this string. Must be unique across every daemon in the cluster — in particular it must differ from a co-located manager's `[node].hostname` and from a co-located FUSE client's `[location].host`. A collision makes the two daemons overwrite each other's registry entry on every heartbeat. |
 | `data_dir` | `node.data_dir` | `PathBuf` | `"/var/lib/dtfs"` | Absolute filesystem path | No | Directory where the data node stores local metadata and state. Must exist and be writable. Chunk data itself is stored on the configured disks (see `[[disks]]`). |
 
 ### Example
@@ -48,7 +48,8 @@ host = "data-01"
 
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
-| `manager_addr` | `cluster.manager_addr` | `String` | *(required)* | `host:port` | No | Address of a manager node to connect to on startup. The data node uses this to register itself and receive cluster state. For high availability, this can point to a load balancer in front of multiple managers. |
+| `manager_addr` | `cluster.manager_addr` | `String` | *(required)* | `host:port` | No | Primary manager gRPC endpoint to register with on startup. |
+| `manager_addrs` | `cluster.manager_addrs` | `Vec<String>` | `[]` | List of `host:port` | No | Additional manager endpoints, walked in order when the primary is unreachable (F-024). List every manager so a rolling manager restart never strands the node. |
 | `shared_secret` | `cluster.shared_secret` | `String` | *(required)* | Any non-empty string | No | Pre-shared key used to authenticate with the manager cluster. Must match the `cluster.shared_secret` in the manager configuration. |
 
 ### Example
@@ -56,6 +57,7 @@ host = "data-01"
 ```toml
 [cluster]
 manager_addr = "mgr-01.example.com:9401"
+manager_addrs = ["mgr-02.example.com:9401", "mgr-03.example.com:9401"]
 shared_secret = "a-strong-random-secret"
 ```
 
@@ -65,8 +67,9 @@ shared_secret = "a-strong-random-secret"
 
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
-| `listen_addr` | `grpc.listen_addr` | `String` | *(required)* | `host:port` | No | Address and port for the gRPC server that handles chunk read/write requests from clients and replication traffic from peers. |
+| `listen_addr` | `grpc.listen_addr` | `String` | *(required)* | `host:port` | No | Address and port for the gRPC server that handles chunk read/write requests from clients and replication traffic from peers. On a multi-interface host, prefer the routable address other nodes dial over `0.0.0.0`. |
 | `max_message_size_mb` | `grpc.max_message_size_mb` | `u32` | `256` | 1--1024 | No | Maximum gRPC message size in megabytes. Must be at least as large as the maximum chunk size used in the cluster. |
+| `max_concurrent_chunk_writes` | `grpc.max_concurrent_chunk_writes` | `usize` | `8` | 1--32 | No | Maximum in-flight `PutChunk` operations (Bug D). Bounds peak write memory: N in-flight writes x chunk size. |
 
 ### Example
 
@@ -106,7 +109,7 @@ The `[[disks]]` section is an array of tables. Each entry declares a disk (or mo
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
 | `path` | `disks[].path` | `PathBuf` | *(required)* | Absolute filesystem path | No | Mount point or directory path where chunk data is stored. Must be a dedicated mount point or directory that the DTFS process has full read/write access to. |
-| `tier` | `disks[].tier` | `DiskTier` | *(required)* | `"hot"`, `"warm"`, `"cold"` | No | Storage tier classification for this disk. The tiering engine uses this to decide where to place chunks based on their access temperature. Typically, `"hot"` is NVMe/SSD, `"warm"` is SSD/fast HDD, and `"cold"` is high-capacity HDD. |
+| `tier` | `disks[].tier` | `DiskTier` | *(required)* | `"hot"`, `"warm"`, `"cold"`, `"tape"` | No | Storage tier classification for this disk. The tiering engine uses this to decide where to place chunks based on their access temperature. Typically, `"hot"` is NVMe/SSD, `"warm"` is SSD/fast HDD, `"cold"` is high-capacity HDD; `"tape"` is for LTFS mounts declared via `[[tape_devices]]`. |
 
 ### Example
 
@@ -160,6 +163,12 @@ Controls the background scrubbing process that verifies chunk integrity by recal
 | `quick_cron` | `scrub.quick_cron` | `Option<String>` | `None` | Valid cron expression | Yes | Optional cron expression that overrides `quick_interval_hours` for scheduling quick scrubs. When set, `quick_interval_hours` is ignored. |
 | `deep_cron` | `scrub.deep_cron` | `Option<String>` | `None` | Valid cron expression | Yes | Optional cron expression that overrides `deep_interval_hours` for scheduling deep scrubs. When set, `deep_interval_hours` is ignored. |
 | `max_io_percent` | `scrub.max_io_percent` | `u32` | `10` | 1--100 | Yes | Maximum percentage of disk I/O bandwidth that scrubbing is allowed to consume. Keeps scrubbing from impacting normal read/write performance. |
+| `verify_on_read` | `scrub.verify_on_read` | `bool` | `true` | `true` or `false` | Yes | Startup fallback for hash-on-read before the first manager heartbeat arrives. |
+| `quarantine_on_fault` | `scrub.quarantine_on_fault` | `bool` | `true` | `true` or `false` | Yes | Startup fallback for fault-quarantine policy. |
+
+> This local block is only a **startup fallback** — once connected, the
+> manager's cluster-wide `[scrub]` policy (see the manager page) overrides it
+> via heartbeat.
 
 ### Example
 
@@ -197,45 +206,57 @@ install_dir = "/usr/local/bin"
 
 ---
 
+## `[memory]` -- Process Memory Budget
+
+Optional block (Bug G). `hard_cap_mb = 0` (the default, and the behaviour when
+the block is absent) means unbounded — no backpressure ladder. **Set a
+non-zero cap on every production deploy**; on a composite host the sum of all
+roles' caps must stay under host RAM.
+
+| Option | TOML Path | Type | Default | Description |
+|--------|-----------|------|---------|-------------|
+| `hard_cap_mb` | `memory.hard_cap_mb` | `u64` | `0` | Total RAM budget for the data-node process in MB. `0` disables the ladder. |
+| `warn_threshold_pct` | `memory.warn_threshold_pct` | `u8` | `80` | Log a warning when RSS crosses this fraction of the cap. |
+| `shed_threshold_pct` | `memory.shed_threshold_pct` | `u8` | `92` | Above this, new `put_chunk` requests get `RESOURCE_EXHAUSTED` (clients retry with backoff) instead of risking an OOM kill. |
+| `sample_interval_secs` | `memory.sample_interval_secs` | `u64` | `5` | RSS sampling cadence. |
+
+---
+
+## `[placement]` -- Free-Space Headroom
+
+Optional block (Bug BU). `put_chunk` rejects writes to a disk whose free space
+is below `max(min_free_bytes, total * min_free_pct%)` with a typed
+`RESOURCE_EXHAUSTED`, so the client reroutes instead of streaming into ENOSPC.
+
+| Option | TOML Path | Type | Default |
+|--------|-----------|------|---------|
+| `min_free_bytes` | `placement.min_free_bytes` | `u64` | `1073741824` (1 GiB) |
+| `min_free_pct` | `placement.min_free_pct` | `f64` | `5.0` |
+| `allow_capacity_spill` | `placement.allow_capacity_spill` | `bool` | `true` |
+
+---
+
+## `[[tape_devices]]` -- LTFS Tape Devices
+
+Optional array; omit if the node has no tape drives. Each entry exposes an
+LTFS mount as `"tape"`-tier storage (write-once; only the tiering engine
+writes to tape). The LTFS filesystem must be mounted before `dtfs-data`
+starts.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `ltfs_path` | `PathBuf` | *(required)* | LTFS mount point. |
+| `device` | `Option<String>` | `None` | Raw drive node (e.g. `/dev/nst0`) for status/rewind. |
+| `library_device` | `Option<String>` | `None` | Robotic changer (e.g. `/dev/sg2`); omit for standalone drives. |
+| `label` | `String` | *(required)* | Human-readable label for WebUI/CLI. |
+| `capacity_gb` | `Option<u64>` | `None` | Informational capacity hint per cartridge. |
+| `max_write_mbps` | `u32` | `0` | Tiering write bandwidth cap; `0` = unlimited. |
+
+---
+
 ## Complete Example
 
-```toml
-[node]
-id = "auto"
-hostname = "data-01.example.com"
-data_dir = "/var/lib/dtfs/data"
-
-[location]
-region = "eu"
-datacenter = "frankfurt"
-rack = "rack-a1"
-host = "data-01"
-
-[cluster]
-manager_addr = "mgr-01.example.com:9401"
-shared_secret = "change-me-to-a-strong-secret"
-
-[grpc]
-listen_addr = "0.0.0.0:9500"
-max_message_size_mb = 256
-
-[tls]
-mode = "auto"
-
-[[disks]]
-path = "/mnt/nvme-a"
-tier = "hot"
-
-[[disks]]
-path = "/mnt/hdd-a"
-tier = "cold"
-
-[cache]
-max_memory_mb = 8192
-policy = "arc"
-
-[scrub]
-quick_interval_hours = 6
-deep_interval_hours = 168
-max_io_percent = 10
-```
+The canonical, exhaustive example (every option, optional ones commented out
+with their defaults) is checked in at `deploy/examples/data.toml`. It is
+parse-tested against the config structs (`dtfs-common`
+`example_data_toml_parses`), so it cannot silently drift from the code.

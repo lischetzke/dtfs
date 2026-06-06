@@ -1007,6 +1007,54 @@ pub fn load_config<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> anyh
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------
+    // deploy/examples/*.toml parse guard
+    //
+    // The example configs are the operator-facing canonical reference
+    // (AGENTS.md § B.6): every option, optional ones commented out.
+    // They MUST parse against the current structs — if a config struct
+    // gains a required field or renames a section, these tests fail
+    // until the matching example (and docs) are updated in the same
+    // commit.
+    // ---------------------------------------------------------------
+
+    fn example_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/examples")
+            .join(name)
+    }
+
+    #[test]
+    fn example_manager_toml_parses() {
+        let cfg: ManagerConfig = load_config(&example_path("manager.toml"))
+            .expect("deploy/examples/manager.toml must parse against ManagerConfig");
+        assert_eq!(cfg.node.hostname, "dtfs-example-mgr01");
+        assert_eq!(cfg.cluster.initial_voters.len(), 3);
+        // The example's self-entry must satisfy the Bug AC identity
+        // contract it documents: [node].hostname appears in initial_voters.
+        assert!(
+            cfg.cluster.initial_voters.iter().any(|v| v.hostname == cfg.node.hostname),
+            "example must model the hostname<->initial_voters match"
+        );
+    }
+
+    #[test]
+    fn example_data_toml_parses() {
+        let cfg: DataNodeConfig = load_config(&example_path("data.toml"))
+            .expect("deploy/examples/data.toml must parse against DataNodeConfig");
+        assert_eq!(cfg.node.hostname, "dtfs-example-data01");
+        assert!(!cfg.disks.is_empty());
+    }
+
+    #[test]
+    fn example_fuse_toml_parses() {
+        let cfg: FuseConfig = load_config(&example_path("fuse.toml"))
+            .expect("deploy/examples/fuse.toml must parse against FuseConfig");
+        // The client identity is location.host and must model the "_cln"
+        // uniqueness convention the file documents.
+        assert!(cfg.location.host.ends_with("_cln"));
+    }
+
     // Bug BU — headroom classification at the threshold boundary.
     #[test]
     fn bu3_placement_has_room_boundary() {
