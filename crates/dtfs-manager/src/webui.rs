@@ -306,6 +306,10 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         /* Quarantined nodes hard-flag in deep red so an
            operator scanning the page can't miss a data-integrity event. */
         .badge-quarantined {{ background: #b91c1c; color: white; font-weight: 700; letter-spacing: .04em; }}
+        /* CF-4c — a Manager-role node that is configured/registered but
+           NOT in raft membership (voter or learner). Amber so it reads as
+           a warning distinct from the red integrity quarantine. */
+        .badge-unjoined {{ background: #d97706; color: white; font-weight: 700; letter-spacing: .04em; }}
         .badge-maintenance {{ background: #3b82f622; color: var(--primary); }}
         .badge-draining   {{ background: #3b82f622; color: var(--primary); }}
         .badge-hot  {{ background: #ef444422; color: var(--danger); }}
@@ -1150,6 +1154,12 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             const versionText = (n.version || n.build_date)
                 ? `${{n.version || '—'}}${{n.build_date ? ' / ' + n.build_date : ''}}`
                 : '—';
+            // CF-4c — a manager that's not a raft voter/learner is
+            // configured/registered but never joined; flag it so it doesn't
+            // masquerade as a plain Healthy member (the production fsn case).
+            const unjoinedBadge = (isManager && n.raft_member === false)
+                ? '<span class="badge badge-unjoined" style="margin-right:.4rem" title="Manager is not a raft member (voter or learner)">UNJOINED</span>'
+                : '';
             return `<tr>
                 <td style="font-size:.75rem;color:var(--text-muted);font-family:monospace;white-space:nowrap">
                     ${{n.node_id||'—'}}</td>
@@ -1161,7 +1171,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 ${{capCell}}
                 ${{usedBarCell}}
                 ${{usedValCell}}
-                <td><span class="${{hc}}">${{n.health||'unknown'}}</span></td>
+                <td>${{unjoinedBadge}}<span class="${{hc}}">${{n.health||'unknown'}}</span></td>
             </tr>`;
         }}).join('');
     }}
@@ -1643,6 +1653,12 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             const leaderBadge = (isManager && n.is_leader)
                 ? '<span class="badge badge-leader" style="margin-right:.4rem" title="Current Raft leader">LEADER</span>'
                 : '';
+            // CF-4c — manager registered/configured but not a raft member
+            // (voter or learner). The production fsn symptom rendered such a
+            // node as plain "Healthy"; flag it explicitly.
+            const unjoinedBadge = (isManager && n.raft_member === false)
+                ? '<span class="badge badge-unjoined" style="margin-right:.4rem" title="Manager is not a raft member (voter or learner)">UNJOINED</span>'
+                : '';
             const addrRow = isClient
                 ? `<div class="node-meta-item"><span>Client IP</span>${{n.client_ip || '—'}}</div>`
                 : `<div class="node-meta-item"><span>gRPC</span>${{n.grpc_addr||'—'}}</div>`;
@@ -1686,6 +1702,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     <div>
                         <span class="badge badge-${{role}}" style="margin-right:.4rem">${{role}}</span>
                         ${{leaderBadge}}
+                        ${{unjoinedBadge}}
                         <b style="font-size:1rem">${{n.hostname||'—'}}</b>
                         <span style="font-size:.78rem;color:var(--text-muted);margin-left:.5rem;font-family:monospace">
                             id:${{(n.node_id||'').slice(0,12)}}…
