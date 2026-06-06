@@ -109,12 +109,9 @@ Query parameters:
 | `limit` | Integer | 50 | Maximum number of entries to return |
 | `action` | String | (none) | Filter by action prefix (e.g., `node.join` matches both `node.join.request` and `node.join.complete`) |
 
-> **`limit` ordering gotcha.** With the default local ring
-> (`replicate_via_raft = false`), `limit=N` returns the **oldest** N
-> matching entries — recent events are silently cut off. With
-> `replicate_via_raft = true`, the same query returns the **newest** N.
-> When investigating recent activity on a default-config cluster, request a
-> limit larger than the buffer (e.g. `limit=20000`) and tail client-side.
+> **`limit` ordering.** `limit=N` returns the **newest** N matching
+> entries, newest-first, regardless of `replicate_via_raft` (CF-4a — the
+> default local ring and the replicated log now agree).
 
 ### Via gRPC
 
