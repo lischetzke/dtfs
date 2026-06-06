@@ -1047,20 +1047,16 @@ impl ManagerService for MetadataService {
             .await?;
 
         // Now best-effort fan-out chunk deletes. Group by node so we
-        // open one connection per target.
-        let mut by_node: std::collections::HashMap<String, Vec<String>> =
-            Default::default();
-        for (chunk_hash, node_id) in chunk_targets {
-            if let Some(addr) = node_addrs.get(&node_id) {
-                by_node.entry(addr.clone()).or_default().push(chunk_hash);
-            }
-        }
+        // open one connection per target. `plan_delete_fanout` returns
+        // tonic-ready endpoints (Bug N fix: the registry grpc_addr is
+        // already a full URL, re-prefixing doubled the scheme and made
+        // every fan-out fail with a transport error).
+        let by_node = plan_delete_fanout(chunk_targets, &node_addrs);
 
         let path_for_log = req.path.clone();
         tokio::spawn(async move {
             for (addr, chunks) in by_node {
-                let endpoint = format!("http://{}", addr);
-                let mut client = match dtfs_proto::dtfs::data::data_service_client::DataServiceClient::connect(endpoint.clone()).await {
+                let mut client = match dtfs_proto::dtfs::data::data_service_client::DataServiceClient::connect(addr.clone()).await {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!(
@@ -2244,6 +2240,31 @@ mod bug_av_preferred_tier_tests {
 /// RegisterNode gRPC connection). Fall back to the reported hostname
 /// only when remote_addr isn't available (unit-test path, or a transport
 /// that doesn't surface a peer — UDS etc.).
+/// Bug N (endpoint fix) — group per-chunk delete targets by data node and
+/// return a map of tonic-ready endpoint URL → chunk hashes. The registry
+/// `grpc_addr` is a fully-formed URL (`http://ip:port`, Bug W), so it must
+/// go through `scheduler::normalize_endpoint` rather than getting another
+/// `http://` prefix — the old inline `format!("http://{}", addr)` produced
+/// `http://http://…`, every DeleteChunk fan-out failed with a transport
+/// error, and every deleted file leaked its chunks to the orphan reconciler
+/// (observed live on production 2026-06-06, 119/123 deletes failing).
+pub(crate) fn plan_delete_fanout(
+    chunk_targets: Vec<(String, String)>,
+    node_addrs: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut by_endpoint: std::collections::HashMap<String, Vec<String>> =
+        Default::default();
+    for (chunk_hash, node_id) in chunk_targets {
+        if let Some(addr) = node_addrs.get(&node_id) {
+            by_endpoint
+                .entry(crate::scheduler::normalize_endpoint(addr))
+                .or_default()
+                .push(chunk_hash);
+        }
+    }
+    by_endpoint
+}
+
 pub(crate) fn build_data_grpc_addr(
     peer: Option<std::net::SocketAddr>,
     reported_hostname: &str,
@@ -2268,6 +2289,57 @@ pub(crate) fn build_data_grpc_addr(
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    /// Bug N regression — the registry stores a fully-formed URL
+    /// (`http://ip:port`, Bug W). The fan-out planner must NOT add a
+    /// second scheme; pre-fix it produced `http://http://ip:port` and
+    /// every delete fan-out failed with a tonic transport error.
+    #[test]
+    fn bug_n_fanout_registry_url_not_double_prefixed() {
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert("7".to_string(), "http://100.64.0.20:9500".to_string());
+        let plan = plan_delete_fanout(
+            vec![("chunk-a".to_string(), "7".to_string())],
+            &addrs,
+        );
+        assert_eq!(plan.len(), 1);
+        assert!(
+            plan.contains_key("http://100.64.0.20:9500"),
+            "endpoint must be the registry URL verbatim, got keys: {:?}",
+            plan.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Bug N — pre-Bug-W registries stored bare `host:port`; those still
+    /// get exactly one scheme via normalize_endpoint.
+    #[test]
+    fn bug_n_fanout_bare_addr_gets_single_scheme() {
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert("7".to_string(), "10.0.0.4:9500".to_string());
+        let plan = plan_delete_fanout(
+            vec![("chunk-a".to_string(), "7".to_string())],
+            &addrs,
+        );
+        assert!(plan.contains_key("http://10.0.0.4:9500"));
+    }
+
+    /// Bug N — chunks group per endpoint; targets with no registry entry
+    /// are skipped (node gone — reconciler's job).
+    #[test]
+    fn bug_n_fanout_groups_and_skips_unknown_nodes() {
+        let mut addrs = std::collections::HashMap::new();
+        addrs.insert("7".to_string(), "http://10.0.0.4:9500".to_string());
+        let plan = plan_delete_fanout(
+            vec![
+                ("chunk-a".to_string(), "7".to_string()),
+                ("chunk-b".to_string(), "7".to_string()),
+                ("chunk-c".to_string(), "999".to_string()), // unknown node
+            ],
+            &addrs,
+        );
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan["http://10.0.0.4:9500"].len(), 2);
+    }
 
     /// Bug W regression — peer IP wins over reported hostname.
     /// This is the actual prod bug from Plexmedia: data-warm01 resolves

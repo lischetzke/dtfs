@@ -55,7 +55,18 @@ Source: ISSUE-SCAN-2026-06-06-1550 (plans/reports/) + operator decisions
 
 ## Tasks
 
-### CF-1: delete fan-out failure — root-cause, re-dial, observability ⬜
+### CF-1: delete fan-out failure — root-cause, re-dial, observability 🟦
+
+**Root cause FOUND (CF-1a, 2026-06-06):** `metadata.rs` DeleteFile fan-out
+built its endpoint as `format!("http://{}", addr)` on the registry
+`grpc_addr` that already carries the scheme (Bug W) →
+`http://http://ip:port` → tonic transport error on every call. The Bug W
+part-2 helper `scheduler::normalize_endpoint` existed precisely for this
+and was simply not used at this call site. Fix: extracted pure
+`plan_delete_fanout()` (groups chunks per node, normalizes endpoints),
+3 regression tests (`bug_n_fanout_*`), release case
+`tests/release/cases/42-delete-fanout-reclaims.sh` (+ QUICK_CASES).
+Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
 
 - Files: `crates/dtfs-manager/src/metadata.rs` (Bug N fan-out site),
   client-channel construction/caching used by the fan-out path.

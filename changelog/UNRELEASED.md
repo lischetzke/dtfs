@@ -55,6 +55,15 @@
   real release tag.
 
 ## Bug Fixes
+- **Bug CF-1a — file deletion now actually reclaims chunk disk space.**
+  The manager's delete fan-out built its data-node endpoint as
+  `format!("http://{}", grpc_addr)` on a registry address that already
+  carries the scheme (Bug W), producing `http://http://ip:port` — every
+  `DeleteChunk` RPC failed with a transport error, so every deleted
+  file's chunks stayed on disk until the orphan reaper's 24 h grace
+  (observed live: 119 of 123 deletes leaking). The fan-out now routes
+  through `normalize_endpoint`; release case
+  `42-delete-fanout-reclaims.sh` guards the path end-to-end.
 - **AV-4-8 (1) — Bug Z bootstrap stops overwriting operator config.**
   Every manager start used to re-`UpsertVolume` the default volume,
   destroying any subsequent `set-cache` / `set-mandatory` the
