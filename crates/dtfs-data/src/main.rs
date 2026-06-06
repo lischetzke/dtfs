@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
     let mon_cache = cache.clone();
     let mon_cache_max = max_entries.max(64);
     tokio::spawn(async move {
-        mon.run_monitor_with_cache(mon_cache, mon_cache_max).await;
+        crate::memory::run_monitor_with_cache(mon, mon_cache, mon_cache_max).await;
     });
 
     // Bug U — graceful shutdown wiring.

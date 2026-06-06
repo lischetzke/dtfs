@@ -5,6 +5,7 @@
 // data is served from memory on subsequent reads, eliminating round-trips
 // to data nodes.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -92,7 +93,13 @@ pub struct ReadAheadEngine {
     cache_bytes: Arc<std::sync::atomic::AtomicUsize>,
     /// Soft byte budget for `cache`. Inserts evict arbitrary entries until
     /// the total fits (best-effort; never rejects a read — § A.5).
-    max_cache_bytes: usize,
+    ///
+    /// CF-5 — runtime-adjustable (was a fixed `usize`) so the memory-pressure
+    /// ladder can halve it at the Warn level and restore it on recovery. An
+    /// `Arc<AtomicUsize>` so the cheap `ReadAheadCacheController` handle can
+    /// shrink it without owning the engine (the engine is moved into the
+    /// fuse adapter at mount time).
+    max_cache_bytes: Arc<AtomicUsize>,
     /// P0-11 / "next episode survives" — when set, prefetched chunks are
     /// also mirrored into the persistent disk cache so they survive
     /// in-memory eviction, FUSE restart, and scanner storms. Setting an
@@ -111,8 +118,24 @@ impl ReadAheadEngine {
             pending: Arc::new(DashMap::new()),
             cache: Arc::new(DashMap::new()),
             cache_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            max_cache_bytes,
+            max_cache_bytes: Arc::new(AtomicUsize::new(max_cache_bytes)),
             local_cache: parking_lot::RwLock::new(None),
+        }
+    }
+
+    /// CF-5 — a cheap clonable handle that lets a background task drive the
+    /// memory-pressure ladder (shrink the byte budget, drop unconsumed
+    /// prefetch) without owning the engine, which is moved into the fuse
+    /// adapter at mount time. Captures the Arcs the engine already shares
+    /// internally plus the operator-configured budget so Normal can restore
+    /// the full size.
+    pub fn cache_controller(&self) -> ReadAheadCacheController {
+        ReadAheadCacheController {
+            cache: Arc::clone(&self.cache),
+            cache_bytes: Arc::clone(&self.cache_bytes),
+            pending: Arc::clone(&self.pending),
+            max_cache_bytes: Arc::clone(&self.max_cache_bytes),
+            configured_budget: self.max_cache_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -233,7 +256,7 @@ impl ReadAheadEngine {
         Self::store_in_cache(
             &self.cache,
             &self.cache_bytes,
-            self.max_cache_bytes,
+            self.max_cache_bytes.load(Ordering::Relaxed),
             key,
             data,
         );
@@ -271,7 +294,7 @@ impl ReadAheadEngine {
     /// Spawn a background task to fetch a single chunk.
     fn spawn_prefetch(&self, key: String, node_addr: String, chunk_id: String) {
         // Bug CE — skip prefetch when the byte budget is already exhausted.
-        if self.cache_bytes() >= self.max_cache_bytes {
+        if self.cache_bytes() >= self.max_cache_bytes.load(Ordering::Relaxed) {
             debug!(key, "readahead cache full (bytes), skipping prefetch");
             return;
         }
@@ -279,7 +302,7 @@ impl ReadAheadEngine {
         let client = self.client.clone();
         let cache = Arc::clone(&self.cache);
         let cache_bytes = Arc::clone(&self.cache_bytes);
-        let max_cache_bytes = self.max_cache_bytes;
+        let max_cache_bytes = self.max_cache_bytes.load(Ordering::Relaxed);
         let pending_key = key.clone();
         let pending_ref = Arc::clone(&self.pending);
         let local_cache = self.local_cache.read().clone();
@@ -340,6 +363,76 @@ impl Drop for ReadAheadEngine {
         for entry in self.pending.iter() {
             entry.value().abort();
         }
+    }
+}
+
+/// CF-5 — cheap clonable handle to the readahead engine's cache, used by the
+/// FUSE memory-pressure ladder. The engine is moved into the fuse adapter at
+/// mount time, so a background sampler task can't hold `&ReadAheadEngine`;
+/// this captures the same internal `Arc`s and drives the two ladder rungs:
+///
+///  * Warn → `shrink_to_bytes(configured / 2)`: halve the live byte budget
+///    and evict down to it. Prefetch still runs, just bounded smaller.
+///  * Shed → `drop_unconsumed()`: cancel pending prefetch + clear the cache.
+///  * Normal → `shrink_to_bytes(configured)`: restore the operator budget.
+#[derive(Clone)]
+pub struct ReadAheadCacheController {
+    cache: Arc<DashMap<String, Bytes>>,
+    cache_bytes: Arc<AtomicUsize>,
+    pending: Arc<DashMap<String, JoinHandle<()>>>,
+    max_cache_bytes: Arc<AtomicUsize>,
+    /// The operator-configured budget (Bug CE `cache_mb`), captured at
+    /// construction so `Normal` can restore it after pressure clears.
+    configured_budget: usize,
+}
+
+impl ReadAheadCacheController {
+    /// The operator-configured byte budget (Bug CE `cache_mb`).
+    pub fn configured_budget(&self) -> usize {
+        self.configured_budget
+    }
+
+    /// Current live byte budget.
+    pub fn current_budget(&self) -> usize {
+        self.max_cache_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes currently held in the prefetch cache.
+    pub fn cache_bytes(&self) -> usize {
+        self.cache_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Set the live byte budget to `target` and evict arbitrary entries until
+    /// the cache fits. Best-effort, never rejects a read (§ A.5). Returns the
+    /// number of entries evicted.
+    pub fn shrink_to_bytes(&self, target: usize) -> usize {
+        self.max_cache_bytes.store(target, Ordering::Relaxed);
+        let mut evicted = 0usize;
+        while self.cache_bytes.load(Ordering::Relaxed) > target {
+            let victim = self.cache.iter().next().map(|e| e.key().clone());
+            match victim {
+                Some(k) => {
+                    if let Some((_, v)) = self.cache.remove(&k) {
+                        self.cache_bytes.fetch_sub(v.len(), Ordering::Relaxed);
+                        evicted += 1;
+                    }
+                }
+                None => break,
+            }
+        }
+        evicted
+    }
+
+    /// Shed rung — cancel every pending prefetch and clear the in-memory
+    /// cache. The disk-backed local cache (P0-11) is untouched, so warm
+    /// chunks still survive; only the volatile RAM cache is dropped.
+    pub fn drop_unconsumed(&self) {
+        for entry in self.pending.iter() {
+            entry.value().abort();
+        }
+        self.pending.clear();
+        self.cache.clear();
+        self.cache_bytes.store(0, Ordering::Relaxed);
     }
 }
 
@@ -414,5 +507,39 @@ mod tests {
             "at most four 1 MB chunks fit in a 4 MB budget, got {} entries",
             engine.cache_len()
         );
+    }
+
+    /// CF-5 — the controller's `shrink_to_bytes` halves the live budget and
+    /// evicts down to it; `drop_unconsumed` clears the cache entirely. This
+    /// is the FUSE memory-pressure ladder's Warn and Shed rungs.
+    #[test]
+    fn cf5_controller_shrink_and_drop() {
+        let client = DtfsClient::new();
+        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, client, 8 * 1024 * 1024);
+        let one_mb = Bytes::from(vec![0u8; 1024 * 1024]);
+        for i in 0..8 {
+            engine.insert_cached("node:9000", &format!("chunk{i}"), one_mb.clone());
+        }
+        let ctrl = engine.cache_controller();
+        assert_eq!(ctrl.configured_budget(), 8 * 1024 * 1024);
+        assert!(ctrl.cache_bytes() > 4 * 1024 * 1024);
+
+        // Warn rung — halve the budget; cache must evict down to <= 4 MB.
+        let evicted = ctrl.shrink_to_bytes(4 * 1024 * 1024);
+        assert!(evicted > 0, "halving the budget must evict entries");
+        assert!(
+            ctrl.cache_bytes() <= 4 * 1024 * 1024,
+            "cache must fit the halved 4 MB budget, got {} bytes",
+            ctrl.cache_bytes()
+        );
+
+        // Shed rung — drop everything.
+        ctrl.drop_unconsumed();
+        assert_eq!(ctrl.cache_bytes(), 0, "drop_unconsumed clears the cache");
+        assert_eq!(engine.cache_len(), 0);
+
+        // Normal rung — restore the operator budget.
+        ctrl.shrink_to_bytes(ctrl.configured_budget());
+        assert_eq!(ctrl.current_budget(), 8 * 1024 * 1024);
     }
 }

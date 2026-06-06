@@ -282,6 +282,13 @@ impl DtfsFilesystem {
         self.local_cache = Some(cache);
     }
 
+    /// CF-5 — cheap clonable handle to the readahead cache, captured before
+    /// the filesystem is moved into the fuse adapter so the memory-pressure
+    /// ladder task can shrink/clear the prefetch cache under RSS pressure.
+    pub fn readahead_controller(&self) -> crate::readahead::ReadAheadCacheController {
+        self.readahead.cache_controller()
+    }
+
     /// P0-1: hostname (without PID/fh) used for the orphan-lease cleanup
     /// call at FUSE startup. Returns just the hostname segment.
     pub fn lease_hostname(&self) -> String {
