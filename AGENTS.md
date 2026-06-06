@@ -219,8 +219,11 @@ The builder is **not** a git checkout — sync the working tree to
 build over SSH:
 
 ```bash
-# from the operator host, in the worktree root; exclude build/VCS/agent dirs
-tar czf - --exclude=./target --exclude=./.git --exclude=./.claude . \
+# from the operator host, in the worktree root; exclude build/VCS/agent
+# dirs AND ./dummy_files (a ~255 GB gitignored local fixture dir — the
+# builder disk is 32 GB; syncing it fills the disk mid-tar)
+tar czf - --exclude=./target --exclude=./.git --exclude=./.claude \
+    --exclude=./dummy_files . \
   | ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.150.0.150 \
       'mkdir -p ~/dtfs2 && tar xzf - -C ~/dtfs2'
 ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.150.0.150 \
@@ -361,6 +364,10 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   `raft_write(ClientRequest::*)`.
 - `dtfs-manager/src/api.rs` — REST endpoints (WebUI + CLI); `get_stats`
   is the WebUI home aggregator.
+- `dtfs-manager/src/membership.rs` — CF-2 online raft membership: pure
+  validation for the leader-only `/api/v1/raft/{add-learner,promote,
+  remove}` endpoints (openraft `add_learner`/`change_membership`;
+  `initial_voters` is bootstrap-only).
 - `dtfs-manager/src/webui.rs` — embedded SPA, format-string HTML
   (`{{`/`}}` for literal braces).
 - `dtfs-data/src/server.rs::put_chunk` — streaming put path.

@@ -3,7 +3,7 @@
 //! Connects to a manager node's REST API to perform cluster operations.
 
 use clap::{Parser, Subcommand};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 mod updater;
 
@@ -98,6 +98,12 @@ enum Commands {
 
     /// Check manager health
     Health,
+
+    /// CF-2 — raft membership operations. Membership lives in the raft
+    /// log (`[[cluster.initial_voters]]` is consulted at bootstrap
+    /// only); growing/shrinking a live cluster goes through these.
+    #[command(subcommand)]
+    Raft(RaftCmd),
 
     /// Update DTFS binaries from the configured GitHub release and
     /// restart the matching local service. Run as root (writes the
@@ -252,6 +258,41 @@ enum FilesCmd {
     },
 }
 
+/// CF-2 — raft membership subcommands. The mutating ones must be sent
+/// to the LEADER's API (`--manager <leader>:9402`); a follower answers
+/// 409 with a leader hint.
+#[derive(clap::Subcommand, Debug)]
+enum RaftCmd {
+    /// Show raft membership (voters, learners, leader) as seen by the
+    /// queried manager.
+    Members,
+    /// Add a manager as a non-voting LEARNER (full state replication).
+    AddLearner {
+        /// Manager hostname (`[node].hostname` in its manager.toml).
+        hostname: String,
+        /// Raft/gRPC addr host:port peers dial for replication
+        /// (e.g. 100.127.84.26:9401). Never a wildcard.
+        addr: String,
+        /// Cluster shared secret (`[cluster].shared_secret`).
+        #[arg(long, env = "DTFS_SHARED_SECRET", hide_env_values = true)]
+        secret: String,
+    },
+    /// Promote an up-to-date learner to voter.
+    Promote {
+        /// Manager hostname of the learner.
+        hostname: String,
+        #[arg(long, env = "DTFS_SHARED_SECRET", hide_env_values = true)]
+        secret: String,
+    },
+    /// Remove a learner or voter from the membership entirely.
+    Remove {
+        /// Manager hostname of the member.
+        hostname: String,
+        #[arg(long, env = "DTFS_SHARED_SECRET", hide_env_values = true)]
+        secret: String,
+    },
+}
+
 struct ApiClient {
     base_url: String,
     client: reqwest::Client,
@@ -296,6 +337,21 @@ impl ApiClient {
             .json::<Value>()
             .await?;
         Ok(resp)
+    }
+
+    /// POST that preserves the server's JSON error body on non-2xx
+    /// (CF-2: the membership endpoints return structured errors — e.g.
+    /// a leader hint on 409 — that `error_for_status()` would discard).
+    async fn post_with_status(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> anyhow::Result<(reqwest::StatusCode, Value)> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self.client.post(&url).json(body).send().await?;
+        let status = resp.status();
+        let value = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        Ok((status, value))
     }
 }
 
@@ -364,6 +420,37 @@ async fn main() -> anyhow::Result<()> {
         Commands::Audit { limit, action } => cmd_audit(&api, &args.format, limit, action).await?,
         Commands::Config { show: _ } => cmd_config(&api, &args.format).await?,
         Commands::Health => cmd_health(&api).await?,
+        Commands::Raft(sub) => match sub {
+            RaftCmd::Members => cmd_raft_members(&api, &args.format).await?,
+            RaftCmd::AddLearner {
+                hostname,
+                addr,
+                secret,
+            } => {
+                cmd_raft_change(
+                    &api,
+                    "/api/v1/raft/add-learner",
+                    json!({"hostname": hostname, "addr": addr, "shared_secret": secret}),
+                )
+                .await?
+            }
+            RaftCmd::Promote { hostname, secret } => {
+                cmd_raft_change(
+                    &api,
+                    "/api/v1/raft/promote",
+                    json!({"hostname": hostname, "shared_secret": secret}),
+                )
+                .await?
+            }
+            RaftCmd::Remove { hostname, secret } => {
+                cmd_raft_change(
+                    &api,
+                    "/api/v1/raft/remove",
+                    json!({"hostname": hostname, "shared_secret": secret}),
+                )
+                .await?
+            }
+        },
         Commands::Update {
             target,
             check,
@@ -1042,6 +1129,64 @@ async fn cmd_health(api: &ApiClient) -> anyhow::Result<()> {
     } else {
         println!("Manager status: {}", status);
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CF-2 — raft membership commands
+// ---------------------------------------------------------------------------
+
+async fn cmd_raft_members(api: &ApiClient, format: &OutputFormat) -> anyhow::Result<()> {
+    let state = api.get("/api/v1/raft/state").await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&state)?);
+        }
+        OutputFormat::Table => {
+            println!(
+                "Queried: {} (state={}, term={})",
+                state["hostname"].as_str().unwrap_or("?"),
+                state["state"].as_str().unwrap_or("?"),
+                state["current_term"]
+            );
+            let leader_id = state["current_leader"].as_str().unwrap_or("");
+            println!(
+                "{:<22} {:<22} {:<24} {:<8} {}",
+                "HOSTNAME", "NODE_ID", "ADDR", "ROLE", ""
+            );
+            for m in state["membership"].as_array().into_iter().flatten() {
+                let id = m["node_id"].as_str().unwrap_or("?");
+                println!(
+                    "{:<22} {:<22} {:<24} {:<8} {}",
+                    m["hostname"].as_str().unwrap_or("?"),
+                    id,
+                    m["addr"].as_str().unwrap_or("?"),
+                    if m["is_voter"].as_bool().unwrap_or(false) {
+                        "voter"
+                    } else {
+                        "learner"
+                    },
+                    if id == leader_id { "(leader)" } else { "" },
+                );
+            }
+            if state["membership"].as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                println!("(membership empty — this manager was never joined to a cluster)");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Shared POST runner for add-learner/promote/remove: prints the
+/// server's JSON verbatim and exits non-zero on a non-2xx answer (the
+/// body carries the reason, e.g. the 409 leader hint).
+async fn cmd_raft_change(api: &ApiClient, path: &str, body: Value) -> anyhow::Result<()> {
+    let (status, value) = api.post_with_status(path, &body).await?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    if !status.is_success() {
+        anyhow::bail!("{} failed: HTTP {}", path, status);
     }
     Ok(())
 }

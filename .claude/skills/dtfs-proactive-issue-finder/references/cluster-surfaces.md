@@ -11,7 +11,7 @@ manager API base is `http://<mgr>:9402`.
 |---|---|---|
 | `/api/v1/cluster/status` | cluster summary | `cluster_name`, `status`, `data_nodes`, `data_nodes_healthy`, `files`, `total_capacity`, `used_capacity`, `config_version` |
 | `/api/v1/health` | manager health | `status` (`healthy` or else) |
-| `/api/v1/raft/state` | raft membership | leader id, term, per-peer match/commit (confirm quorum + no lag) |
+| `/api/v1/raft/state` | raft membership | leader id, term, `voters`, `learners`, `membership[]` (`hostname`/`addr`/`is_voter` per member — a Manager-role registry node missing here is unjoined), `applied_log_lag` (confirm quorum + no lag) |
 | `/api/v1/nodes` | all nodes | `node_id`, `hostname`, `location`, `role`, `health`, `disk_count`, `total_capacity`, `used_capacity`; quarantine projection (BC-12a) |
 | `/api/v1/nodes/{id}` | one node detail | `health`, `role`, `location.{region,datacenter,rack,host}`, `disks[].{disk_id,tier,mount_path,total_bytes,used_bytes,status}` (SMART/status per disk) |
 | `/api/v1/volumes` | volume list | `volumes[].{volume_id,file_count,total_size}` |
@@ -28,7 +28,9 @@ manager API base is `http://<mgr>:9402`.
 Do NOT call the mutating routes (here for avoidance only): any POST —
 `/scrub`, `/files/flush_cache`, `/nodes/{id}/maintenance`,
 `/nodes/{id}/unquarantine`, `/volumes` (create), `/volumes/{id}/set-*`,
-`/volumes/{id}/migrate-policy`, `/config` (update), `/join/*`.
+`/volumes/{id}/migrate-policy`, `/config` (update), `/join/*`,
+`/raft/add-learner`, `/raft/promote`, `/raft/remove` (CF-2 membership
+changes — never from the finder).
 
 ## Read-only dtfs-cli subcommands
 
