@@ -214,6 +214,8 @@ async fn main() -> Result<()> {
     // P0-11: set up the disk-backed local cache (if configured) before
     // moving fuse_config into DtfsFilesystem.
     let local_cache_cfg = fuse_config.cache.clone();
+    // CF-5 — snapshot the memory config before fuse_config is moved.
+    let memory_cfg = fuse_config.memory.clone();
     let client_location = fuse_config.location.clone();
     // Bug U — keep a handle to the client (cheap Arc clone) so we can
     // release this PID's leases on the way out, after DtfsFilesystem has
@@ -255,6 +257,35 @@ async fn main() -> Result<()> {
             }
         }
     }
+
+    // CF-5 — per-process memory budget + RSS sampler. When the operator sets
+    // [memory] hard_cap_mb > 0 the sampler watches RSS and publishes a
+    // pressure level; a small ladder task halves the readahead/prefetch byte
+    // budget at the Warn level and drops all unconsumed prefetch at Shed, so
+    // a RAM-starved client gives memory back instead of being OOM/cgroup-
+    // killed. Cap 0 = unbounded: the sampler still runs for the RSS gauge but
+    // the level stays pinned Normal. The systemd MemoryHigh/MemoryMax drop-ins
+    // remain the hard backstop.
+    let memory_budget =
+        std::sync::Arc::new(dtfs_common::memory::MemoryBudget::from_config(&memory_cfg));
+    if memory_cfg.hard_cap_mb > 0 {
+        info!(
+            cap_mb = memory_cfg.hard_cap_mb,
+            warn_pct = memory_cfg.warn_threshold_pct,
+            shed_pct = memory_cfg.shed_threshold_pct,
+            sample_secs = memory_cfg.sample_interval_secs,
+            "CF-5 memory budget configured"
+        );
+        let controller = fs.readahead_controller();
+        let ladder_budget = memory_budget.clone();
+        tokio::spawn(async move {
+            run_readahead_pressure_ladder(ladder_budget, controller).await;
+        });
+    }
+    let mem_mon = memory_budget.clone();
+    tokio::spawn(async move {
+        mem_mon.run_monitor().await;
+    });
 
     info!(mountpoint, "filesystem initialised");
 
@@ -450,6 +481,86 @@ where
             Ok(()) => tracing::debug!("Bug BQ-1 client keepalive ok"),
             Err(e) => tracing::debug!(error = %e, "Bug BQ-1 client keepalive failed; retry next tick"),
         }
+    }
+}
+
+/// CF-5 — drive the FUSE memory-pressure ladder. Polls the budget's pressure
+/// level on the sampler cadence and adjusts the readahead/prefetch cache:
+///
+///  * Warn → halve the live byte budget (evict down to it).
+///  * Shed → pin the budget to 0 (stops new prefetch) and abort/clear all
+///    unconsumed prefetch.
+///  * Normal → restore the operator-configured budget.
+///
+/// Only acts on level changes to avoid hammering the cache on a stable
+/// system. Best-effort, never rejects a read (§ A.5). Pure ladder logic is
+/// factored into `pressure_target_budget` so it can be unit-tested.
+async fn run_readahead_pressure_ladder(
+    budget: std::sync::Arc<dtfs_common::memory::MemoryBudget>,
+    controller: readahead::ReadAheadCacheController,
+) {
+    use dtfs_common::memory::PressureLevel;
+    let mut tick = tokio::time::interval(budget.sample_interval());
+    let mut last_level = PressureLevel::Normal;
+    loop {
+        tick.tick().await;
+        let level = budget.pressure_level();
+        if level == last_level {
+            continue;
+        }
+        let target = pressure_target_budget(level, controller.configured_budget());
+        // Pin the live budget first so no new prefetch can refill past the
+        // target while we are under pressure (Shed -> 0 stops prefetch
+        // entirely; spawn_prefetch skips once cache_bytes >= max_cache_bytes).
+        let evicted = controller.shrink_to_bytes(target);
+        if level == PressureLevel::Shed {
+            // Also abort in-flight prefetch tasks — shrink_to_bytes only
+            // evicts already-stored bytes, not pending fetches.
+            controller.drop_unconsumed();
+        }
+        info!(
+            level = ?level,
+            target_bytes = target,
+            evicted,
+            cache_bytes = controller.cache_bytes(),
+            "CF-5 memory pressure ladder adjusted readahead budget"
+        );
+        last_level = level;
+    }
+}
+
+/// CF-5 — pure ladder map from pressure level to readahead byte budget.
+/// Normal restores the operator budget; Warn halves it; Shed is handled by
+/// `drop_unconsumed` (returns 0 here as a defensive floor).
+fn pressure_target_budget(
+    level: dtfs_common::memory::PressureLevel,
+    configured: usize,
+) -> usize {
+    use dtfs_common::memory::PressureLevel;
+    match level {
+        PressureLevel::Normal => configured,
+        PressureLevel::Warn => configured / 2,
+        PressureLevel::Shed => 0,
+    }
+}
+
+#[cfg(test)]
+mod cf5_ladder_tests {
+    use super::pressure_target_budget;
+    use dtfs_common::memory::PressureLevel;
+
+    /// CF-5 — the FUSE ladder halves the readahead budget at Warn, floors it
+    /// at Shed, and restores the full operator budget at Normal. Mirrors the
+    /// data-node ARC ladder shape (Bug V) for the prefetch cache.
+    #[test]
+    fn cf5_pressure_target_budget_ladder() {
+        let configured = 256 * 1024 * 1024;
+        assert_eq!(pressure_target_budget(PressureLevel::Normal, configured), configured);
+        assert_eq!(
+            pressure_target_budget(PressureLevel::Warn, configured),
+            configured / 2
+        );
+        assert_eq!(pressure_target_budget(PressureLevel::Shed, configured), 0);
     }
 }
 

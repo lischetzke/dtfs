@@ -361,6 +361,29 @@ async fn main() -> anyhow::Result<()> {
         audit_log.clone(),
     ));
 
+    // CF-5 — per-process memory budget + RSS sampler. When the operator
+    // sets [memory] hard_cap_mb > 0 the sampler watches RSS and publishes a
+    // pressure level; the scheduler polls it and skips background ticks at
+    // the Warn level (cheapest ladder rung — re-replication/migration scans
+    // hold the largest transient state). Cap 0 = unbounded: the sampler
+    // still runs for the RSS gauge but the level stays pinned Normal. The
+    // systemd MemoryHigh/MemoryMax drop-ins remain the hard backstop.
+    let memory_budget =
+        Arc::new(dtfs_common::memory::MemoryBudget::from_config(&config.memory));
+    if config.memory.hard_cap_mb > 0 {
+        tracing::info!(
+            cap_mb = config.memory.hard_cap_mb,
+            warn_pct = config.memory.warn_threshold_pct,
+            shed_pct = config.memory.shed_threshold_pct,
+            sample_secs = config.memory.sample_interval_secs,
+            "CF-5 memory budget configured"
+        );
+    }
+    let mem_mon = memory_budget.clone();
+    tokio::spawn(async move {
+        mem_mon.run_monitor().await;
+    });
+
     // --- Task scheduler background task ---
 
     let task_scheduler = Arc::new(TaskScheduler::new(
@@ -368,6 +391,8 @@ async fn main() -> anyhow::Result<()> {
         sm_data.clone(),
         audit_log.clone(),
     ));
+    // CF-5 — let the scheduler skip ticks under memory pressure.
+    task_scheduler.set_memory_budget(memory_budget.clone());
 
     let scheduler_ref = task_scheduler.clone();
     let scheduler_handle = tokio::spawn(async move {

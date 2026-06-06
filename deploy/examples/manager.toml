@@ -160,6 +160,18 @@ listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
                                     # instead of failing the write (anchor never
                                     # spilled). false = fail-loud.
 
+#[memory]
+# CF-5: per-process RAM budget + pressure ladder. 0 = unbounded (legacy).
+# When non-zero, a background sampler watches RSS and, at the warn level, the
+# scheduler skips its background ticks (re-replication / migration / rebalance)
+# so the manager gives RAM back. systemd MemoryHigh/MemoryMax stay the hard
+# backstop; on a composite host the sum of all roles' caps must stay under
+# host RAM (AGENTS.md § A.5).
+#hard_cap_mb = 0
+#warn_threshold_pct = 80            # at/above this -> scheduler ticks pause
+#shed_threshold_pct = 92
+#sample_interval_secs = 5
+
 #[updater]
 # AZ-5: read by `dtfs-cli update` only; the daemon ignores this block.
 #repo_url = "https://github.com/lischetzke/dtfs"

@@ -35,6 +35,14 @@ pub struct ManagerConfig {
     /// placement ring so new chunks route to a disk that can hold them.
     #[serde(default)]
     pub placement: PlacementConfig,
+    /// CF-5 — per-process RAM cap + pressure ladder. When `hard_cap_mb > 0`
+    /// a background sampler watches RSS and, at the Warn level, the
+    /// scheduler skips its background ticks (re-replication / migration /
+    /// rebalance) so the manager gives RAM back instead of being
+    /// OOM/cgroup-killed. `#[serde(default)]` so old config files keep
+    /// working (cap 0 = unbounded, no ladder).
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 /// Bug BU — capacity-aware placement headroom.
@@ -276,6 +284,14 @@ pub struct FuseConfig {
     /// = "cold"`) so a legacy `fuse.toml` keeps working.
     #[serde(default)]
     pub write: FuseWriteConfig,
+    /// CF-5 — per-process RAM cap + pressure ladder. When `hard_cap_mb > 0`
+    /// a background sampler watches RSS and, at the Warn level, halves the
+    /// in-memory readahead/prefetch cache budget; at Shed it drops all
+    /// unconsumed prefetch so a RAM-starved client stops growing instead of
+    /// being OOM/cgroup-killed. `#[serde(default)]` so a legacy `fuse.toml`
+    /// keeps working (cap 0 = unbounded, no ladder).
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 // --- Sub-configs ---
@@ -1036,6 +1052,11 @@ mod tests {
             cfg.cluster.initial_voters.iter().any(|v| v.hostname == cfg.node.hostname),
             "example must model the hostname<->initial_voters match"
         );
+        // CF-5 — the commented-out [memory] block leaves the role on the
+        // unbounded default (cap 0, no ladder).
+        assert_eq!(cfg.memory.hard_cap_mb, 0);
+        assert_eq!(cfg.memory.warn_threshold_pct, default_warn_pct());
+        assert_eq!(cfg.memory.shed_threshold_pct, default_shed_pct());
     }
 
     #[test]
@@ -1053,6 +1074,36 @@ mod tests {
         // The client identity is location.host and must model the "_cln"
         // uniqueness convention the file documents.
         assert!(cfg.location.host.ends_with("_cln"));
+        // CF-5 — the commented-out [memory] block leaves the FUSE client on
+        // the unbounded default (cap 0, no ladder).
+        assert_eq!(cfg.memory.hard_cap_mb, 0);
+        assert_eq!(cfg.memory.warn_threshold_pct, default_warn_pct());
+        assert_eq!(cfg.memory.shed_threshold_pct, default_shed_pct());
+    }
+
+    /// CF-5 — an explicit `[memory]` block on the manager/fuse roles parses
+    /// and overrides the unbounded default, mirroring the data-node block.
+    /// `MemoryConfig` is shared across all three roles (one struct, one
+    /// parser) so a per-role parse test would be redundant; we assert the
+    /// shared override path + the absent-block default path here.
+    #[test]
+    fn cf5_memory_block_parses_and_overrides() {
+        // Absent block → unbounded default.
+        let empty: MemoryConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.hard_cap_mb, 0);
+        assert_eq!(empty.warn_threshold_pct, default_warn_pct());
+        assert_eq!(empty.shed_threshold_pct, default_shed_pct());
+        assert_eq!(empty.sample_interval_secs, default_memory_sample_secs());
+
+        // Explicit block → operator values win.
+        let cfg: MemoryConfig = toml::from_str(
+            "hard_cap_mb = 1500\nwarn_threshold_pct = 70\nshed_threshold_pct = 90\nsample_interval_secs = 3\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.hard_cap_mb, 1500);
+        assert_eq!(cfg.warn_threshold_pct, 70);
+        assert_eq!(cfg.shed_threshold_pct, 90);
+        assert_eq!(cfg.sample_interval_secs, 3);
     }
 
     // Bug BU — headroom classification at the threshold boundary.

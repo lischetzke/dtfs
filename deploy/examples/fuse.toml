@@ -69,6 +69,18 @@ mountpoint = "/mnt/dtfs"
                                     # "nearest-warm": ACK on a warm replica,
                                     # anchor copy follows asynchronously.
 
+#[memory]
+# CF-5: per-process RAM budget + pressure ladder. 0 = unbounded (legacy).
+# When non-zero, a background sampler watches RSS and, at the warn level,
+# halves the [readahead] cache_mb prefetch budget; at the shed level it drops
+# all unconsumed prefetch. systemd MemoryHigh/MemoryMax stay the hard backstop;
+# on a composite host the sum of all roles' caps must stay under host RAM
+# (AGENTS.md § A.5).
+#hard_cap_mb = 0
+#warn_threshold_pct = 80            # at/above this -> readahead budget halved
+#shed_threshold_pct = 92            # at/above this -> drop unconsumed prefetch
+#sample_interval_secs = 5
+
 #[updater]
 # AZ-5: read by `dtfs-cli update` only; the daemon ignores this block.
 #repo_url = "https://github.com/lischetzke/dtfs"
