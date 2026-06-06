@@ -297,6 +297,25 @@ down_after_missed = 6
 
 ---
 
+## `[memory]` -- Process Memory Budget
+
+Optional block (CF-5). `hard_cap_mb = 0` (the default, and the behaviour when
+the block is absent) means unbounded -- no pressure ladder. When non-zero, a
+background sampler watches RSS and, once it reaches the warn level, the
+scheduler skips its background ticks (re-replication / migration / rebalance)
+so the manager gives RAM back instead of being OOM/cgroup-killed. systemd
+`MemoryHigh`/`MemoryMax` remain the hard backstop; on a composite host the sum
+of all roles' caps must stay under host RAM.
+
+| Option | TOML Path | Type | Default | Description |
+|--------|-----------|------|---------|-------------|
+| `hard_cap_mb` | `memory.hard_cap_mb` | `u64` | `0` | Total RAM budget for the manager process in MB. `0` disables the ladder. |
+| `warn_threshold_pct` | `memory.warn_threshold_pct` | `u8` | `80` | At/above this fraction of the cap the scheduler pauses background ticks until RSS recovers. |
+| `shed_threshold_pct` | `memory.shed_threshold_pct` | `u8` | `92` | Reserved for the higher rung; the manager has no request-shed today, so ticks stay paused. |
+| `sample_interval_secs` | `memory.sample_interval_secs` | `u64` | `5` | RSS sampling cadence. |
+
+---
+
 ## `[updater]` -- Self-Updater Source
 
 Read by [`dtfs-cli update`](../api-reference/cli-reference.md#update), not

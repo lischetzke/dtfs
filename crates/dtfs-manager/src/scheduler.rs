@@ -67,6 +67,12 @@ pub struct TaskScheduler {
     audit: Arc<AuditLog>,
     /// P1-8: optional alert dispatcher. MigrationFailed fires here.
     alerts: parking_lot::RwLock<Option<Arc<crate::alerts::AlertDispatcher>>>,
+    /// CF-5: optional memory budget. When set and RSS reaches the Warn
+    /// pressure level, the scheduler skips its background ticks
+    /// (re-replication / migration / rebalance) so the manager gives RAM
+    /// back instead of being OOM/cgroup-killed. None = no cap configured
+    /// (the common case) and ticks always run.
+    memory: parking_lot::RwLock<Option<Arc<dtfs_common::memory::MemoryBudget>>>,
 }
 
 impl TaskScheduler {
@@ -81,12 +87,32 @@ impl TaskScheduler {
             state_data,
             audit,
             alerts: parking_lot::RwLock::new(None),
+            memory: parking_lot::RwLock::new(None),
         }
     }
 
     /// Inject the alert dispatcher (called after main.rs has wired one).
     pub fn set_alerts(&self, alerts: Arc<crate::alerts::AlertDispatcher>) {
         *self.alerts.write() = Some(alerts);
+    }
+
+    /// CF-5 — inject the memory budget so the scheduler can skip background
+    /// ticks under memory pressure (called after main.rs builds the budget).
+    pub fn set_memory_budget(&self, budget: Arc<dtfs_common::memory::MemoryBudget>) {
+        *self.memory.write() = Some(budget);
+    }
+
+    /// CF-5 — true when a memory budget is configured and RSS has reached the
+    /// Warn pressure level. The scheduler's background loop checks this before
+    /// each tick and skips the work to give RAM back (the cheapest ladder rung
+    /// for the manager: re-replication/migration scans hold the largest
+    /// transient state). Returns false when no cap is configured.
+    fn under_memory_pressure(&self) -> bool {
+        use dtfs_common::memory::PressureLevel;
+        match &*self.memory.read() {
+            Some(b) => b.pressure_level() != PressureLevel::Normal,
+            None => false,
+        }
     }
 
     /// Run the scheduler background loop. Intended to be spawned as a tokio task.
@@ -96,6 +122,18 @@ impl TaskScheduler {
         let mut interval = tokio::time::interval(SCHEDULER_TICK);
         loop {
             interval.tick().await;
+
+            // CF-5 — under memory pressure, skip the tick. Re-replication
+            // and migration scans build the largest transient state in the
+            // manager; pausing them is the cheapest ladder rung to give RAM
+            // back before the systemd cgroup kills us. Work resumes
+            // automatically once RSS drops back below the warn threshold.
+            if self.under_memory_pressure() {
+                tracing::warn!(
+                    "Scheduler tick skipped: under memory pressure (CF-5 ladder)"
+                );
+                continue;
+            }
 
             if let Err(e) = self.tick().await {
                 warn!("Scheduler tick failed: {}", e);

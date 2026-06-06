@@ -113,11 +113,13 @@ new field.
 the hot path — stream to disk, hash incrementally (Bug I). Memory caps
 are best-effort; never reject requests by default (the RESOURCE_EXHAUSTED
 shed is opt-in, last resort — see § A.5). The `[memory]` block
-(`hard_cap_mb` etc.) is implemented on **dtfs-data only** today; manager
-and fuse are bounded via systemd `MemoryMax` plus internal caps (gRPC
-write concurrency, readahead `cache_mb`, ARC budget). Extending
-`[memory]` to the other roles is open work — update this section when it
-lands.
+(`hard_cap_mb` etc.) is implemented on **all three roles** (CF-5): the
+role-agnostic core (`MemoryBudget`, `PressureLevel`, RSS sampler) lives in
+`dtfs-common/src/memory.rs`; each role wires its own cheap ladder rung —
+dtfs-data sheds put_chunk + shrinks ARC, dtfs-manager pauses scheduler
+ticks at Warn, dtfs-fuse halves the readahead `cache_mb` at Warn / drops
+unconsumed prefetch at Shed. systemd `MemoryMax` remains the hard backstop
+for all roles.
 
 **A.3.3 Integrity is the prime directive.** Every path that touches
 bytes must:
@@ -273,8 +275,9 @@ committed). VM key `~/.ssh/dtfs-lab/id_ed25519`. Bandwidth shaping in
 ## A.5 Memory model
 
 Deterministic, bounded, best-effort: under pathological load we slow
-down, never OOM-kill. `data.toml` has an optional `[memory]` block
-(dtfs-data only for now — § A.3.2; defaults warn 80 / shed 92 / sample 5):
+down, never OOM-kill. All three role configs accept an optional `[memory]`
+block (CF-5; shared core in `dtfs-common/src/memory.rs`, per-role ladder
+rung — § A.3.2; defaults warn 80 / shed 92 / sample 5):
 
 ```toml
 [memory]
@@ -373,7 +376,11 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
 - `dtfs-data/src/server.rs::put_chunk` — streaming put path.
 - `dtfs-data/src/store.rs::commit_chunk_from_tmp` — atomic commit
   (§ A.6).
-- `dtfs-data/src/memory.rs` — Bug G memory budget + sampler.
+- `dtfs-common/src/memory.rs` — CF-5 role-agnostic memory budget core
+  (`MemoryBudget`, `PressureLevel`, RSS sampler, `run_monitor`); shared by
+  all three roles.
+- `dtfs-data/src/memory.rs` — Bug G data-node rung: re-exports the common
+  core + the ARC-cache shrinker monitor (`run_monitor_with_cache`).
 - `dtfs-fuse/src/filesystem.rs` — FUSE↔cluster bridge: write leases,
   readahead engine, local disk cache.
 - `dtfs-fuse/src/fuse_adapter.rs` — fuse3 trait impl; cookie scheme at

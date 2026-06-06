@@ -164,6 +164,25 @@ show_warning = true
 
 ---
 
+## `[memory]` -- Process Memory Budget
+
+Optional block (CF-5). `hard_cap_mb = 0` (the default, and the behaviour when
+the block is absent) means unbounded -- no pressure ladder. When non-zero, a
+background sampler watches RSS and, at the warn level, halves the
+[`[readahead]`](#readahead--read-ahead-prefetching) `cache_mb` prefetch budget;
+at the shed level it drops all unconsumed prefetch (the on-disk `[cache]`
+survives). systemd `MemoryHigh`/`MemoryMax` remain the hard backstop; on a
+composite host the sum of all roles' caps must stay under host RAM.
+
+| Option | TOML Path | Type | Default | Description |
+|--------|-----------|------|---------|-------------|
+| `hard_cap_mb` | `memory.hard_cap_mb` | `u64` | `0` | Total RAM budget for the FUSE client process in MB. `0` disables the ladder. |
+| `warn_threshold_pct` | `memory.warn_threshold_pct` | `u8` | `80` | At/above this fraction of the cap the readahead `cache_mb` budget is halved. |
+| `shed_threshold_pct` | `memory.shed_threshold_pct` | `u8` | `92` | At/above this all unconsumed prefetch is dropped from the in-memory cache. |
+| `sample_interval_secs` | `memory.sample_interval_secs` | `u64` | `5` | RSS sampling cadence. |
+
+---
+
 ## `[updater]` -- Self-Updater Source
 
 Read by [`dtfs-cli update`](../api-reference/cli-reference.md#update) when
