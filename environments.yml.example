@@ -1,21 +1,41 @@
+# Annotated reference for ./environments.yml (gitignored; copy + fill in).
+# Spaces only — tabs are invalid YAML.
+#
+# <env-name>:
+#   ignore_missing: true|false    # true = env may be unreachable; skip gracefully
+#   manager_nodes:                # plain list, or a map keyed by node name
+#     - <host>:<port>             #   (manager REST API, default port 9402)
+#   data_nodes:                   # optional; map keyed by node name
+#     <name>:
+#       address: <host>:<port>    #   (data gRPC, default port 9500)
+#   fuse_nodes:                   # optional; map keyed by node name
+#     <name>:
+#       address: <host>
+#       mount: /mnt/dtfs
+#   jumpclient:                   # optional SSH jump host for node access
+#     <alias>:
+#       address: <ip>
+#       user: <ssh-user>          # optional; defaults to current user
+#       sshkey: <path>            # optional; relative to repo root
+
 production:
   ignore_missing: true
   manager_nodes:
     - 10.0.0.2:9402
     - 10.0.0.3:9402
-	- 10.0.0.4:9402
+    - 10.0.0.4:9402
 testing:
   ignore_missing: false
   manager_nodes:
     - 10.1.0.2:9402
-	- 10.1.0.3:9402
-	- 10.1.0.4:9402
+    - 10.1.0.3:9402
+    - 10.1.0.4:9402
 development:
   ignore_missing: true
   manager_nodes:
     - 10.2.0.2:9402
   jumpclient:
     dtfs-admin:
-	  address: 10.2.0.1
-	  user: root
-	  sshkey: ./id_ecdsa_adminkey
+      address: 10.2.0.1
+      user: root
+      sshkey: ./id_ecdsa_adminkey
