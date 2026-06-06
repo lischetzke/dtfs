@@ -167,7 +167,7 @@ All three libs are sourced from `lib/common.sh`; the bash chaos cases need only
 ## Observability the cases rely on
 
 The cases assert real end-state through read-only manager APIs (added in the
-same change as the suite — see `changelog/UNRELEASED.md`):
+same change as the suite):
 
 - **`GET /api/v1/nodes`** — per-node `total_bytes_read` / `total_bytes_written`.
   Proves *which* DC served a read (case 42).

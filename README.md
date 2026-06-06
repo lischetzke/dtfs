@@ -34,7 +34,6 @@ Full table of contents: [`docs/src/SUMMARY.md`](docs/src/SUMMARY.md).
 - `deploy/` — Docker Compose, sample configs, systemd units
 - `docs/` — mdBook documentation source
 - `plans/` — active work plans (see [plans/README.md](plans/README.md))
-- `changelog/` — per-release changelog entries (see [changelog/README.md](changelog/README.md))
 - `tests/` — integration, chaos, performance, and lab harness
 - [`AGENTS.md`](AGENTS.md) — canonical guide for contributors and AI agents (Part A: codebase knowledge — architecture, integrity invariants, memory model; Part B: operating discipline)
 - [`CLAUDE.md`](CLAUDE.md) — single-line `@AGENTS.md` import shim for Claude Code (do not add content here)

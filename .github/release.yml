@@ -1,0 +1,26 @@
+# Grouping config for GitHub auto-generated release notes
+# (`gh release create --generate-notes`, see scripts/dtfs-release.sh).
+# PR titles become the release-note lines; labels pick the section.
+changelog:
+  exclude:
+    labels:
+      - int
+  categories:
+    - title: Breaking Changes
+      labels:
+        - breaking
+    - title: Special Requirements for Updates
+      labels:
+        - update-required
+    - title: Known Issues
+      labels:
+        - known-issue
+    - title: New Features
+      labels:
+        - feat
+    - title: Bug Fixes
+      labels:
+        - bug
+    - title: Other Changes
+      labels:
+        - "*"
