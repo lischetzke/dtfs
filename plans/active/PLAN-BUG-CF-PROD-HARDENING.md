@@ -185,6 +185,41 @@ Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
   docs/src/security/tls.md status banner.
 - Large; schedule after CF-1..4. Interim risk accepted (tailscale).
 
+### CF-8: manual scrub trigger actually dispatches ✅
+
+- Evidence (2026-06-06 prod): `dtfs-cli scrub --level quick` → API
+  `accepted` + audit row, but ZERO scrub starts on any data node
+  (`trigger_scrub` in api.rs is audit+log only; heartbeat
+  `ScrubConfigOverride` carries interval policy, not on-demand runs;
+  `scrub.rs` always logs `Starting {} scrub` — absence conclusive).
+  Release case 03 only asserted the `accepted` contract, so the gap was
+  never caught. Same genus as CF-3 (decorative setting).
+- Files: `proto/manager.proto` (`ScrubRequestNow` + HeartbeatResponse
+  field 5), `dtfs-raft/src/lib.rs` (`ClientRequest::TriggerScrub`,
+  `PendingScrub`), `state_machine.rs` (`pending_scrub` field +
+  apply arm + § A.3.1 snapshot test), `dtfs-manager/src/api.rs`
+  (trigger_scrub raft-writes; rejects non-all targets instead of
+  pretending), `metadata.rs` (heartbeat relays pending request),
+  `dtfs-data/src/scrub.rs` (`manual_scrub_due` dedupe/staleness helper,
+  `run()` selects on a manual-trigger channel), `dtfs-data/src/main.rs`
+  (heartbeat → channel), release case 03.
+- Sketch: trigger raft-replicates `PendingScrub{id,level,requested_at_ms}`
+  (any manager's heartbeat handler relays it — Bug CC lesson: data
+  nodes heartbeat to arbitrary managers); response carries it every
+  heartbeat; data node dedupes by id (in-memory) and ignores requests
+  older than 1 h (restart-reconnect guard); manual run resets that
+  level's interval timer. Request is never cleared, only replaced —
+  dedupe + staleness make that safe.
+- Tests: state-machine apply + old-snapshot-default (unit),
+  `manual_scrub_due` (unit), case 03 extended to assert
+  `stats.last_scrub` advances after trigger.
+- Done when: trigger on a live cluster produces `Starting quick scrub`
+  on every data node + a fresh `scrub_results_by_node` entry; case 03
+  fails against a pre-CF-8 manager.
+- Mixed-version note: roll ALL managers before first trigger (new
+  ClientRequest variant must not hit an old manager via raft); old data
+  nodes ignore the new heartbeat field harmlessly.
+
 ### CF-7: docs truth pass — recovery/join procedures ⬜
 
 - Files: `docs/src/operations/backup-recovery.md` ("Single Manager
@@ -258,6 +293,26 @@ Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
   no promote). Incidental fix this session: `.gitattributes`
   `*.sh text eol=lf` (e8fbab6) — the Windows-checkout CRLF worktree
   broke the builder's shell wrappers via the tar sync.
+
+- 2026-06-06 CF-8 implemented + lab-verified. Observed failure first:
+  live production trigger (`dtfs-cli scrub --level quick`, audit row
+  `scrub.trigger.quick` ts 1780770916) produced ZERO scrub starts on
+  either data node in 90 s (scrub.rs always logs `Starting {} scrub` —
+  absence conclusive); plus `E0063 missing field pending_scrub`
+  compile-fail for the new state-machine field. Green: dtfs-raft 73 /
+  dtfs-data 60 / dtfs-manager 191, workspace 438/0 on the builder.
+  Built `20260606-185513` via wrapper; deployed Minicluster managers
+  (mgr02→mgr03→leader mgr01) + data nodes (data01, data02). Live:
+  one trigger id `0808f054-…` → BOTH data nodes logged
+  `CF-8 manual quick scrub request … accepted` →
+  `Starting quick scrub on all disks` within one heartbeat (~5 s),
+  ran it exactly once (id dedupe held across the 5 s re-delivery),
+  results shipped (case 03 asserts fresh `scrub_results_by_node` from
+  every data node). Release cases: 03 PASS (now asserts EXECUTION +
+  honest 400 on per-target), 04 PASS, 50 regression PASS. The
+  "case 03 fails pre-CF-8" leg holds by construction (pre-CF-8
+  dispatches nothing → wait_for times out); not separately re-run
+  against the old binary. Production gets CF-8 with its next deploy.
 
 ## Deviations
 

@@ -203,6 +203,15 @@ pub struct StateMachineData {
     #[serde(default)]
     pub scrub_results_by_level: BTreeMap<u64, BTreeMap<String, ScrubRecord>>,
 
+    /// CF-8 — latest manual scrub trigger, replicated so the heartbeat
+    /// handler on ANY manager relays it to data nodes (they heartbeat
+    /// to whichever manager they connected to — Bug CC lesson).
+    /// Replaced by each new trigger, never cleared; data nodes dedupe
+    /// by `id` and ignore stale `requested_at_ms`, so permanent
+    /// presence is harmless. `#[serde(default)]` per § A.3.1.
+    #[serde(default)]
+    pub pending_scrub: Option<crate::PendingScrub>,
+
     /// Number of registered FUSE clients (updated by client heartbeats).
     pub client_count: u64,
 
@@ -243,6 +252,7 @@ impl Default for StateMachineData {
             audit_log: Vec::new(),
             scrub_results: BTreeMap::new(),
             scrub_results_by_level: BTreeMap::new(),
+            pending_scrub: None,
             client_count: 0,
             volumes: BTreeMap::new(),
             migration_state_json: String::new(),
@@ -1655,6 +1665,18 @@ fn apply_request(
             ClientResponse::Success
         }
 
+        ClientRequest::TriggerScrub { id, level, requested_at_ms } => {
+            // CF-8 — record (replace) the pending manual scrub request.
+            // Every manager's heartbeat handler relays it; data nodes
+            // dedupe by id, so replacement is the only cleanup needed.
+            sm.pending_scrub = Some(crate::PendingScrub {
+                id: id.clone(),
+                level: level.clone(),
+                requested_at_ms: *requested_at_ms,
+            });
+            ClientResponse::Success
+        }
+
         ClientRequest::UpdateNodeDiskUsage { node_id, per_disk } => {
             // Bug AU — refresh per-disk total_bytes + used_bytes from
             // the heartbeat. Snapshots referencing an unknown disk_id
@@ -2199,6 +2221,50 @@ mod posix_path_regression {
         use openraft::vote::RaftLeaderId;
         let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
         openraft::LogId::new(leader, idx)
+    }
+
+    /// CF-8 — TriggerScrub apply records the request; a later trigger
+    /// replaces it (replacement is the only cleanup the design needs).
+    #[test]
+    fn cf8_trigger_scrub_sets_and_replaces_pending() {
+        let mut sm = StateMachineData::default();
+        assert!(sm.pending_scrub.is_none());
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::TriggerScrub {
+                id: "t1".into(),
+                level: "quick".into(),
+                requested_at_ms: 111,
+            },
+        );
+        let p = sm.pending_scrub.clone().expect("pending set");
+        assert_eq!(
+            (p.id.as_str(), p.level.as_str(), p.requested_at_ms),
+            ("t1", "quick", 111)
+        );
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::TriggerScrub {
+                id: "t2".into(),
+                level: "deep".into(),
+                requested_at_ms: 222,
+            },
+        );
+        assert_eq!(sm.pending_scrub.expect("replaced").id, "t2");
+    }
+
+    /// CF-8 / § A.3.1 — a snapshot written before `pending_scrub`
+    /// existed must load with the field defaulting to None.
+    #[test]
+    fn cf8_pending_scrub_old_snapshot_defaults_none() {
+        let sm = StateMachineData::default();
+        let mut v = serde_json::to_value(&sm).expect("serialize");
+        v.as_object_mut().unwrap().remove("pending_scrub"); // pre-CF-8 shape
+        let restored: StateMachineData =
+            serde_json::from_value(v).expect("old snapshot loads");
+        assert!(restored.pending_scrub.is_none());
     }
 
     /// Bug CD — `ReleaseLeasesByHost` must reap only EXPIRED host leases. A

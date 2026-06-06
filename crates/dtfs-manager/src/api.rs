@@ -3688,32 +3688,69 @@ struct ScrubRequest {
     level: Option<String>,       // "quick" or "deep"
 }
 
+/// CF-8 — manual scrub trigger. Raft-replicates a `PendingScrub` so the
+/// heartbeat handler on every manager relays it to the data nodes
+/// (which dedupe by id and run the scrub immediately). Pre-CF-8 this
+/// handler wrote an audit row and dispatched nothing.
 async fn trigger_scrub(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ScrubRequest>,
-) -> Json<Value> {
-    let target_type = body.target_type.as_deref().unwrap_or("all");
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let level = body.level.as_deref().unwrap_or("deep");
+    if !matches!(level, "quick" | "deep") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("level must be \"quick\" or \"deep\", got {level:?}")})),
+        ));
+    }
+    // Per-target scrub is not implemented — be honest instead of
+    // accepting-and-ignoring a target (the pre-CF-8 behaviour).
+    let target_type = body.target_type.as_deref().unwrap_or("all");
     let target = body.target.as_deref().unwrap_or("*");
+    if target_type != "all" || target != "*" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "per-target scrub is not implemented — omit target/target_type for a full scrub of all disks"})),
+        ));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let requested_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    state
+        .raft
+        .client_write(ClientRequest::TriggerScrub {
+            id: id.clone(),
+            level: level.to_string(),
+            requested_at_ms,
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("raft write failed: {e}")})),
+            )
+        })?;
 
     state.audit_log.log(
         "api",
         &format!("scrub.trigger.{level}"),
-        &format!("{target_type}={target}"),
+        &format!("all=* id={id}"),
         "accepted",
     );
 
-    info!(
-        "Scrub triggered via API: type={}, target={}, level={}",
-        target_type, target, level
-    );
+    info!("Scrub triggered via API: level={}, id={}", level, id);
 
-    Json(json!({
+    Ok(Json(json!({
         "status": "accepted",
         "target_type": target_type,
         "target": target,
         "level": level,
-    }))
+        "id": id,
+    })))
 }
 
 // ---------------------------------------------------------------------------
