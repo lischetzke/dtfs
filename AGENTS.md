@@ -250,7 +250,8 @@ is fine for iteration but stamps stale; re-stamp with
 `SOURCE_DATE_EPOCH=$(date -u +%s) cargo build --release …`. Cutting a
 release: `scripts/dtfs-release.sh <tag>` stamps `DTFS_VERSION`, builds,
 and writes `target/release-artifacts/<tag>/` (the `dtfs-linux-amd64.tar.gz`
-the updater pulls, `SHA256SUMS`, notes) + the `gh release create` line.
+the updater pulls, `SHA256SUMS`) + the `gh release create` line (release
+notes auto-generated from merged PRs via `--generate-notes`).
 
 A crate-level `#![allow(dead_code)]` on the dtfs-manager and dtfs-data
 binaries works around a rustc 1.94 dead-code ICE — don't remove it
@@ -378,8 +379,8 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   `[updater]` config; local-node only. Pairs with the release builder.
 - `scripts/dtfs-release.sh` — release builder: stamps `DTFS_VERSION`,
   builds via `dtfs-build.sh`, assembles the fixed-name
-  `dtfs-linux-amd64.tar.gz` + `SHA256SUMS` + notes, prints/`--publish`es
-  `gh release create`.
+  `dtfs-linux-amd64.tar.gz` + `SHA256SUMS`, prints/`--publish`es
+  `gh release create --generate-notes`.
 - `plans/active/` — in-flight plans (see plans/README.md).
 - `tests/proxmox/abuse/` — numbered shell regression tests.
 
@@ -446,7 +447,10 @@ status flip land in the **same commit** as the code.
 
 ## B.4 Commit discipline
 
-**Work on master directly. No feature branches, no PRs.** Commit format:
+Work on a branch and merge via PR when the change is user-visible — the
+PR title becomes the release-note line (§ B.6); label it for its
+release-notes section. Committing small internal work directly to
+master is fine. Commit format:
 
 ```
 <plan-id>-<phase>-<n>: <one-line summary, <72 chars>
@@ -499,7 +503,8 @@ Where a file lives is part of its meaning. Canonical locations:
 |---|---|
 | In-flight work plan | `plans/active/PLAN-<id>-<name>.md` (delete when done, § B.2) |
 | Cluster scan / lab report | `plans/reports/<NAME>-<date>.md` (e.g. `ISSUE-SCAN-…`) |
-| Release note (user-visible change) | `changelog/UNRELEASED.md`, same commit as the code |
+| Release note (user-visible change) | PR title + description — GitHub auto-generates release notes from merged PRs (`gh release create --generate-notes`, grouped via `.github/release.yml`); no in-repo changelog |
+| GitHub repo config (release-notes grouping, workflows) | `.github/` |
 | Architecture / config / ops reference | `docs/src/...` (mdBook), same commit as the behaviour change |
 | Code | `crates/<crate>/src/...` (new crate → workspace `Cargo.toml` entry) |
 | Protobuf | `proto/<file>.proto` (rebuild dtfs-proto after edits) |
@@ -521,13 +526,18 @@ option, no duplicated complete-example blocks (the example files are the
 single source for those).
 
 Don't: invent a top-level directory without adding a row here first;
-check in a root PROGRESS/status file (git log + changelog + plans are the
-status sources); scatter loose `.md` notes through `crates/` or `tests/`
-(work → `plans/`, user-visible → `changelog/`, subsystem → `docs/`). The
-changelog gets one entry per user-visible change (bug fix, feature, known
-issue, breaking change, special update requirement); internal refactors,
-doc edits, and test/CI tweaks do **not** go there (see
-`changelog/README.md`).
+check in a root PROGRESS/status file (git log + plans are the status
+sources); scatter loose `.md` notes through `crates/` or `tests/` (work
+→ `plans/`, user-visible → the PR description, subsystem → `docs/`).
+Release notes are auto-generated from merged PR titles at release time;
+there is no in-repo changelog. PR title: `<type>: <short description>`
+with type one of `bug` / `feat` / `int` (internal); the description is
+an imperative, user-visible summary ≤72 chars, written for the operator
+reading the release page. Label the PR with its type (`bug` / `feat` /
+`int` — `int` is excluded from the notes: refactors, tests, CI,
+docs-only); add `breaking` / `update-required` / `known-issue` when one
+of those sections applies instead. Unlabeled PRs land in "Other
+Changes". Grouping lives in `.github/release.yml`.
 
 ## B.7 Updating this file
 
