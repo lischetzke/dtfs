@@ -63,7 +63,7 @@
   file's chunks stayed on disk until the orphan reaper's 24 h grace
   (observed live: 119 of 123 deletes leaking). The fan-out now routes
   through `normalize_endpoint`; release case
-  `42-delete-fanout-reclaims.sh` guards the path end-to-end.
+  `49-delete-fanout-reclaims.sh` guards the path end-to-end.
 - **AV-4-8 (1) — Bug Z bootstrap stops overwriting operator config.**
   Every manager start used to re-`UpsertVolume` the default volume,
   destroying any subsequent `set-cache` / `set-mandatory` the

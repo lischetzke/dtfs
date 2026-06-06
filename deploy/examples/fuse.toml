@@ -68,3 +68,8 @@ mountpoint = "/mnt/dtfs"
                                     # tier holds the chunk (safe, slower).
                                     # "nearest-warm": ACK on a warm replica,
                                     # anchor copy follows asynchronously.
+
+#[updater]
+# AZ-5: read by `dtfs-cli update` only; the daemon ignores this block.
+#repo_url = "https://github.com/lischetzke/dtfs"
+#install_dir = "/usr/local/bin"

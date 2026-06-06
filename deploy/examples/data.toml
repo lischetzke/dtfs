@@ -86,6 +86,11 @@ tier = "cold"
 #min_free_pct = 5.0
 #allow_capacity_spill = true
 
+#[updater]
+# AZ-5: read by `dtfs-cli update` only; the daemon ignores this block.
+#repo_url = "https://github.com/lischetzke/dtfs"
+#install_dir = "/usr/local/bin"
+
 # LTFS-backed tape devices (frozen/archival tier). Omit if no tape drives.
 #[[tape_devices]]
 #ltfs_path = "/mnt/tape-a"          # must be LTFS-mounted before dtfs-data starts
