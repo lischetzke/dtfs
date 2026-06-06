@@ -519,6 +519,125 @@ Trigger a scrub operation. See [Scrubbing](../storage/scrubbing.md) for details 
 }
 ```
 
+### GET /api/v1/raft/state
+
+Returns the queried manager's view of the Raft consensus state: who the
+leader is, whether this node is caught up, and the full membership
+(voters and learners). Read-only; safe to call on any manager. Used by
+operators and the `dtfs-cli raft members` command. See
+[Cluster Management](../operations/cluster-management.md) for the
+membership-change procedures these fields support.
+
+**Response (healthy follower):**
+
+```json
+{
+  "node_id": "12709699821947187762",
+  "hostname": "mgr01",
+  "running_state": "ok",
+  "state": "Follower",
+  "is_leader": false,
+  "current_term": 18,
+  "current_leader": "15786580940693171021",
+  "last_log_index": 4521,
+  "last_applied_index": 4521,
+  "applied_log_lag": 0,
+  "snapshot_index": 4000,
+  "voters": ["12709...", "15786...", "5766..."],
+  "learners": ["8841..."],
+  "membership": [
+    { "node_id": "12709...", "hostname": "mgr01", "addr": "10.0.0.1:9401", "is_voter": true },
+    { "node_id": "8841...",  "hostname": "mgr04", "addr": "10.1.0.1:9401", "is_voter": false }
+  ],
+  "millis_since_quorum_ack": null
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `node_id` / `hostname` | String | The responding manager's identity (`node_id = hash(hostname)`) |
+| `state` | String | `Leader`, `Follower`, `Candidate`, or `Learner` |
+| `is_leader` | Bool | True when this node is the current leader |
+| `current_leader` | String / null | Leader node id; `null` means quorum is currently lost |
+| `current_term` | Integer | Current Raft term |
+| `last_log_index` / `last_applied_index` | Integer | Log head vs applied position |
+| `applied_log_lag` | Integer | `last_log_index - last_applied_index`; `> 0` on a follower means it is behind |
+| `snapshot_index` | Integer | Log index of the latest on-disk snapshot |
+| `voters` | Array | Node ids in the voter set (count toward quorum) |
+| `learners` | Array | Node ids that replicate state but do not vote |
+| `membership` | Array | One entry per member: `node_id`, `hostname`, `addr`, `is_voter` (the openraft `membership_config` projected to JSON) |
+| `millis_since_quorum_ack` | Integer / null | Milliseconds since the leader last confirmed quorum (leader only) |
+
+### POST /api/v1/raft/add-learner
+
+Add a manager to the Raft group as a non-voting **learner**: the leader
+begins replicating the full state (snapshot + log) to it immediately, but
+it does not count toward quorum until promoted. Leader-only; a follower
+answers `409` with a `leader` hint. Requires the cluster `shared_secret`.
+Idempotent (re-adding an existing learner re-registers its addr).
+
+**Request body:**
+
+```json
+{
+  "hostname": "mgr04",
+  "addr": "10.1.0.1:9401",
+  "shared_secret": "your-shared-secret"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `hostname` | String | New manager's `[node].hostname` (raft node id is `hash(hostname)`) |
+| `addr` | String | Peer-routable Raft/gRPC `host:port`; never a wildcard (`0.0.0.0` is rejected) |
+| `shared_secret` | String | Must match `[cluster].shared_secret` |
+
+**Response:**
+
+```json
+{ "status": "ok", "node_id": "8841...", "hostname": "mgr04", "addr": "10.1.0.1:9401", "log_index": 4522 }
+```
+
+### POST /api/v1/raft/promote
+
+Promote an up-to-date learner to a voting member. Leader-only,
+shared-secret gated. Returns `404` if the target is not in the membership
+(add-learner first) and `409` if it is already a voter.
+
+**Request body:**
+
+```json
+{ "hostname": "mgr04", "shared_secret": "your-shared-secret" }
+```
+
+### POST /api/v1/raft/remove
+
+Remove a learner or voter from the membership entirely (a removed voter is
+not retained as a learner). Leader-only, shared-secret gated. Refuses to
+remove the last voter (`400`).
+
+**Request body:**
+
+```json
+{ "hostname": "mgr04", "shared_secret": "your-shared-secret" }
+```
+
+**Response:**
+
+```json
+{ "status": "ok", "node_id": "8841...", "hostname": "mgr04", "was_voter": true, "log_index": 4530 }
+```
+
+**Membership-change error codes:**
+
+| Status | Meaning |
+|--------|---------|
+| 403 | `shared_secret` mismatch |
+| 409 | Not the leader (body carries a `leader` hint: `leader_id`, `leader_hostname`, `leader_addr`) or already a voter (promote) |
+| 400 | Bad target (empty/wildcard addr, hostname collides with a data/client node) or refusing to remove the last voter |
+| 404 | Target not in the membership (promote/remove) |
+| 503 | The underlying openraft `add_learner` / `change_membership` call failed |
+
 ## Error Format
 
 When an error occurs, the API returns an appropriate HTTP status code. Common error codes:

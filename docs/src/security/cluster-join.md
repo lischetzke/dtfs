@@ -2,6 +2,8 @@
 
 When a new node starts and contacts the manager to register itself, it must prove that it holds the cluster's shared secret. DTFS uses a two-phase handshake based on HMAC-SHA256 to authenticate joining nodes without transmitting the secret over the network.
 
+> **Scope.** This protocol covers **data-node and client registration**: the HMAC handshake, cluster CA issuance, and the `RegisterNode` write that records the node in the node registry. It does **not** change Raft membership. Adding, promoting, or removing a *manager* in the Raft voter/learner set is a separate operation through the membership API (`/api/v1/raft/{add-learner,promote,remove}` and `dtfs-cli raft …`); see [Cluster Management → Adding a Manager Node](../operations/cluster-management.md#adding-a-manager-node).
+
 ## Prerequisites
 
 Before a node can join the cluster, the following must be in place:
