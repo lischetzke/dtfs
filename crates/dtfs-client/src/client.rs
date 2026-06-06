@@ -104,6 +104,32 @@ pub(crate) fn put_chunk_retry_backoff(
     }
 }
 
+/// Bug CF — retry policy for re-walking the manager pool after a full
+/// walk found no usable manager (rolling restart / leader election).
+/// Incident dtfs-lm 2026-06-06: a ~2.5 s no-leader window (dead leader +
+/// followers still replying "forward to <dead leader>") killed a write
+/// because the single pool walk burned in ~4 ms.
+pub(crate) const MANAGER_WALK_DEADLINE_MS: u64 = 15_000;
+const MANAGER_WALK_BASE_BACKOFF_MS: u64 = 250;
+const MANAGER_WALK_MAX_BACKOFF_MS: u64 = 2_000;
+
+/// Decide how long to back off before the next full pool walk. Returns
+/// `None` once the overall deadline is spent (caller surfaces the error).
+///
+/// Pure function so we can unit-test the policy without running gRPC.
+pub(crate) fn manager_walk_retry_backoff(
+    walk_round: u32,
+    elapsed: std::time::Duration,
+) -> Option<std::time::Duration> {
+    if elapsed >= std::time::Duration::from_millis(MANAGER_WALK_DEADLINE_MS) {
+        return None;
+    }
+    let ms = MANAGER_WALK_BASE_BACKOFF_MS
+        .saturating_mul(1u64 << walk_round.min(8))
+        .min(MANAGER_WALK_MAX_BACKOFF_MS);
+    Some(std::time::Duration::from_millis(ms))
+}
+
 /// Inner shared state for the client, wrapped in Arc for cheap cloning.
 struct DtfsClientInner {
     /// Cached manager gRPC channels, keyed by address.
@@ -697,54 +723,96 @@ impl DtfsClient {
 
     /// Run a manager RPC closure with automatic failover on transport errors.
     ///
-    /// Retries up to `manager_addrs.len()` times. On each retry, the closure
-    /// is given a freshly-built `ManagerServiceClient` connected to the
-    /// (possibly newly-active) manager. Stops retrying on application-level
-    /// errors (FailedPrecondition, NotFound, AlreadyExists, etc.) — those
-    /// surface immediately.
+    /// Walks the manager pool, failing over on transport-level errors; on
+    /// each attempt the closure is given a freshly-built
+    /// `ManagerServiceClient` connected to the (possibly newly-active)
+    /// manager. Bug CF — when a full walk finds no usable manager (rolling
+    /// restart / leader election: dead leader plus followers still
+    /// answering "forward to <dead leader>"), back off and re-walk until
+    /// `MANAGER_WALK_DEADLINE_MS` is spent, so a few seconds of electing
+    /// cluster do not surface as EIO. Application-level errors
+    /// (FailedPrecondition, NotFound, AlreadyExists, etc.) surface
+    /// immediately.
     pub(crate) async fn call_manager<F, Fut, T>(&self, op_name: &'static str, mut f: F) -> Result<T>
     where
         F: FnMut(ManagerServiceClient<Channel>) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     {
-        let attempts = self.inner.manager_addrs.read().len().max(1);
-        let mut last_err: Option<tonic::Status> = None;
-        for attempt in 0..attempts {
-            let client = self.manager_client().await?;
-            match f(client).await {
-                Ok(v) => return Ok(v),
-                Err(status) => {
-                    let code = status.code();
-                    if matches!(
-                        code,
-                        tonic::Code::Unavailable
-                            | tonic::Code::DeadlineExceeded
-                            | tonic::Code::Unknown
-                    ) {
-                        tracing::warn!(
-                            rpc = op_name,
-                            code = ?code,
-                            attempt = attempt + 1,
-                            "manager RPC transport error — failing over"
-                        );
-                        // Evict the current channel so manager_client rebuilds.
-                        if let Some(addr) = self.inner.manager_addrs.read().get(*self.inner.active_idx.read()) {
-                            self.inner.manager_channels.remove(addr);
+        if self.inner.manager_addrs.read().is_empty() {
+            anyhow::bail!("{op_name}: no managers configured");
+        }
+        let started = std::time::Instant::now();
+        let mut walk_round: u32 = 0;
+        loop {
+            let attempts = self.inner.manager_addrs.read().len().max(1);
+            let mut last_err: Option<anyhow::Error> = None;
+            for attempt in 0..attempts {
+                let client = match self.manager_client().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Whole pool unreachable at channel level —
+                        // manager_client already tried every addr, so this
+                        // walk is exhausted; fall through to the backoff
+                        // decision.
+                        last_err = Some(e);
+                        break;
+                    }
+                };
+                match f(client).await {
+                    Ok(v) => return Ok(v),
+                    Err(status) => {
+                        let code = status.code();
+                        if matches!(
+                            code,
+                            tonic::Code::Unavailable
+                                | tonic::Code::DeadlineExceeded
+                                | tonic::Code::Unknown
+                        ) {
+                            tracing::warn!(
+                                rpc = op_name,
+                                code = ?code,
+                                attempt = attempt + 1,
+                                walk_round,
+                                "manager RPC transport error — failing over"
+                            );
+                            // Evict the current channel so manager_client rebuilds.
+                            if let Some(addr) = self.inner.manager_addrs.read().get(*self.inner.active_idx.read()) {
+                                self.inner.manager_channels.remove(addr);
+                            }
+                            self.advance_active_manager();
+                            last_err = Some(anyhow::Error::new(status));
+                            continue;
+                        } else {
+                            // Application-level error — return immediately.
+                            return Err(anyhow::Error::new(status)
+                                .context(format!("{op_name} RPC failed")));
                         }
-                        self.advance_active_manager();
-                        last_err = Some(status);
-                        continue;
-                    } else {
-                        // Application-level error — return immediately.
-                        return Err(anyhow::Error::new(status)
-                            .context(format!("{op_name} RPC failed")));
                     }
                 }
             }
+            match manager_walk_retry_backoff(walk_round, started.elapsed()) {
+                Some(delay) => {
+                    tracing::warn!(
+                        rpc = op_name,
+                        walk_round,
+                        delay_ms = delay.as_millis() as u64,
+                        "manager pool exhausted — backing off before next walk (election / rolling restart?)"
+                    );
+                    tokio::time::sleep(delay).await;
+                    walk_round += 1;
+                }
+                None => {
+                    return Err(last_err
+                        .map(|e| {
+                            e.context(format!(
+                                "{op_name} RPC failed (all managers exhausted after {:.1}s)",
+                                started.elapsed().as_secs_f32()
+                            ))
+                        })
+                        .unwrap_or_else(|| anyhow::anyhow!("{op_name}: no managers reachable")));
+                }
+            }
         }
-        Err(last_err
-            .map(|s| anyhow::Error::new(s).context(format!("{op_name} RPC failed (all managers exhausted)")))
-            .unwrap_or_else(|| anyhow::anyhow!("{op_name}: no managers configured")))
     }
 
     /// Get a `DataServiceClient` connected to the given data node address.
@@ -1201,5 +1269,142 @@ mod put_chunk_retry_tests {
                 code
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod bug_cf_manager_walk_retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Bug CF — backoff between full pool walks: 250 ms, 500 ms, 1 s,
+    /// then capped at 2 s.
+    #[test]
+    fn bug_cf_walk_backoff_doubles_and_caps() {
+        let e = Duration::ZERO;
+        assert_eq!(
+            manager_walk_retry_backoff(0, e),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            manager_walk_retry_backoff(1, e),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            manager_walk_retry_backoff(2, e),
+            Some(Duration::from_millis(1000))
+        );
+        assert_eq!(
+            manager_walk_retry_backoff(3, e),
+            Some(Duration::from_millis(2000))
+        );
+        assert_eq!(
+            manager_walk_retry_backoff(9, e),
+            Some(Duration::from_millis(2000))
+        );
+    }
+
+    /// Bug CF — once the overall deadline is spent, give up so FUSE ops
+    /// cannot hang forever against a genuinely-down cluster.
+    #[test]
+    fn bug_cf_walk_backoff_deadline_exhausts() {
+        assert_eq!(
+            manager_walk_retry_backoff(4, Duration::from_millis(MANAGER_WALK_DEADLINE_MS)),
+            None
+        );
+        assert_eq!(
+            manager_walk_retry_backoff(0, Duration::from_millis(MANAGER_WALK_DEADLINE_MS + 1)),
+            None
+        );
+    }
+
+    /// Bug CF incident regression (dtfs-lm, 2026-06-06 16:00 CEST): during
+    /// a rolling manager restart the whole pool answered Unavailable for
+    /// ~2.5 s (dead leader + followers still replying "forward to <dead
+    /// leader>"). call_manager burned its single pool walk in ~4 ms and a
+    /// WinSCP transfer died with EIO. It must instead re-walk the pool
+    /// with backoff until MANAGER_WALK_DEADLINE_MS.
+    #[tokio::test]
+    async fn bug_cf_call_manager_retries_walks_until_managers_recover() {
+        const ADDR: &str = "http://127.0.0.1:9";
+        let client = DtfsClient::new();
+        *client.inner.manager_addrs.write() = vec![ADDR.to_string()];
+
+        // No real manager behind ADDR: call_manager evicts the channel on
+        // every transport failure, so keep re-seeding a lazy channel so
+        // each walk's get_or_create_channel fast-path succeeds and the
+        // closure (not the network) decides the outcome.
+        let seeder = {
+            let c = client.clone();
+            tokio::spawn(async move {
+                loop {
+                    let ch = tonic::transport::Endpoint::from_shared(ADDR.to_string())
+                        .unwrap()
+                        .connect_lazy();
+                    c.inner.manager_channels.insert(ADDR.to_string(), ch);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+        };
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_in = calls.clone();
+        let res = client
+            .call_manager("bug_cf_test", move |_c| {
+                let n = calls_in.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < 3 {
+                        Err(tonic::Status::unavailable("manager is not the leader"))
+                    } else {
+                        Ok(42u32)
+                    }
+                }
+            })
+            .await;
+        seeder.abort();
+
+        assert_eq!(
+            res.expect("call_manager must ride through a transient all-Unavailable window"),
+            42
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 4,
+            "must have re-walked the pool, not given up after one walk"
+        );
+    }
+
+    /// Application-level errors must still surface immediately — no walk
+    /// retries, no backoff.
+    #[tokio::test]
+    async fn bug_cf_application_errors_do_not_retry() {
+        const ADDR: &str = "http://127.0.0.1:9";
+        let client = DtfsClient::new();
+        *client.inner.manager_addrs.write() = vec![ADDR.to_string()];
+        let ch = tonic::transport::Endpoint::from_shared(ADDR.to_string())
+            .unwrap()
+            .connect_lazy();
+        client.inner.manager_channels.insert(ADDR.to_string(), ch);
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_in = calls.clone();
+        let started = std::time::Instant::now();
+        let res: Result<u32> = client
+            .call_manager("bug_cf_test_app_err", move |_c| {
+                calls_in.fetch_add(1, Ordering::SeqCst);
+                async move { Err(tonic::Status::not_found("no such file")) }
+            })
+            .await;
+        assert!(res.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "application errors must not be retried"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "application errors must surface without backoff"
+        );
     }
 }
