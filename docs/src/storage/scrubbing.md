@@ -75,42 +75,29 @@ If no healthy replica exists (all copies are corrupt), the manager raises a crit
 
 ## Manual Triggers
 
-### CLI
-
-Operators can trigger a scrub on demand using the CLI:
+Operators can trigger an immediate **cluster-wide** scrub (CF-8). The
+manager raft-replicates the request and relays it to every data node on
+its next heartbeat; each node runs the scrub once (per-trigger id
+dedupe) and ships the result back on a subsequent heartbeat.
 
 ```bash
-# Quick scrub a specific disk
-dtfs-cli scrub quick --node data-01 --disk /mnt/ssd0
+# Quick scrub, all disks on all data nodes
+dtfs-cli scrub --level quick
 
-# Deep scrub all disks on a node
-dtfs-cli scrub deep --node data-01
-
-# Deep scrub a specific chunk by ID
-dtfs-cli scrub deep --chunk abc123def456
-
-# Check scrub status
-dtfs-cli scrub status --node data-01
+# Deep scrub (default level)
+dtfs-cli scrub
 ```
 
-### REST API
+REST equivalent: `POST /api/v1/scrub {"level": "quick"}` (see the
+[REST API reference](../api-reference/rest-api.md)). Per-node /
+per-disk / per-chunk targeting is **not implemented** — the API rejects
+targeted requests with `400` rather than silently ignoring the target.
 
-The same operations are available through the manager's REST API:
-
-```
-POST /api/v1/scrub
-{
-  "type": "deep",
-  "target": {
-    "node": "data-01",
-    "disk": "/mnt/ssd0"
-  }
-}
-
-GET /api/v1/scrub/status?node=data-01
-```
-
-Manual scrubs bypass the scheduling window and start immediately. They respect the bandwidth and concurrency limits.
+Manual scrubs bypass the scheduling window, start within one heartbeat
+interval (~5 s), reset that level's interval timer, and respect the
+same `max_io_percent` throttle as scheduled scrubs. Results land in
+`GET /api/v1/stats` (`scrub_results_by_node` / `last_scrub`) and the
+WebUI Last Scrub card; there is no separate scrub-status endpoint.
 
 ## Corrupt Chunk Handling
 

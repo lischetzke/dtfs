@@ -68,6 +68,16 @@ impl Default for DtfsNode {
 // ClientRequest — application commands replicated through Raft
 // ---------------------------------------------------------------------------
 
+/// CF-8 — the latest manual scrub request (POST /api/v1/scrub), kept in
+/// `StateMachineData.pending_scrub` until replaced by the next trigger.
+/// Data nodes receive it on every heartbeat and dedupe by `id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingScrub {
+    pub id: String,
+    pub level: String,
+    pub requested_at_ms: u64,
+}
+
 /// A chunk location entry referencing where a chunk replica lives.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkLocationEntry {
@@ -425,6 +435,22 @@ pub enum ClientRequest {
         entries: Vec<(String, std::collections::HashMap<String, u32>)>,
     },
 
+    // ---- CF-8 — manual scrub trigger (POST /api/v1/scrub) ----
+
+    /// CF-8 — record a manual scrub request in replicated state so the
+    /// heartbeat handler on ANY manager relays it to data nodes (data
+    /// nodes heartbeat to whichever manager they connected to — the
+    /// Bug CC lesson). Replaces any previous pending request; data
+    /// nodes dedupe by `id` and ignore stale `requested_at_ms`.
+    TriggerScrub {
+        /// Unique per trigger (uuid).
+        id: String,
+        /// "quick" | "deep" (validated at the API boundary).
+        level: String,
+        /// Trigger wall-clock (UTC ms).
+        requested_at_ms: u64,
+    },
+
     // ---- Bug AU — refresh per-disk usage on each heartbeat ----
 
     /// Bug AU — apply the live per-disk usage snapshot from a data
@@ -605,6 +631,9 @@ impl fmt::Display for ClientRequest {
             }
             Self::ReportChunkReads { node_id, entries } => {
                 write!(f, "ReportChunkReads(node={node_id}, {} chunks)", entries.len())
+            }
+            Self::TriggerScrub { id, level, .. } => {
+                write!(f, "TriggerScrub({level}, id={id})")
             }
             Self::AppendAudit { actor, action, target, .. } => {
                 write!(f, "AppendAudit({actor}, {action}, {target})")
