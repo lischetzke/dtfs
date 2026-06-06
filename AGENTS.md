@@ -229,6 +229,16 @@ cargo test  --release --workspace
 cargo test -p dtfs-data --release   # per-crate
 ```
 
+**Stale-artifact trap (Bug CF deploy hiccup).** The tar sync preserves
+source mtimes, so a just-synced edit can land OLDER than cached build
+artifacts and cargo will silently reuse a stale rlib (a lib's
+`#[cfg(test)]` tests can still pass — the lib-test binary rebuilds
+independently — while downstream binaries link the pre-edit lib).
+Before deploying a binary that must contain a fresh change: `touch` the
+edited file(s) on the builder (or rebuild after a marker change) and
+verify the binary actually carries the change (`grep -ac "<new log
+string>" target/release/<bin>` or the `--version` stamp).
+
 Deploy builds MUST go through a wrapper (`scripts/build-linux-amd64.sh`,
 `scripts/dtfs-build.sh`, or `scripts/dtfs-release.sh <tag>` for a tagged
 release) so `BUILD_DATE` is fresh (§ A.3.5). Bare `cargo build --release`

@@ -398,3 +398,18 @@
   route through one accountant that evicts arbitrary entries until the running
   byte total fits, never rejecting a read (§ A.5 best-effort). Bounds memory
   regardless of chunk size or prefetch concurrency.
+- **Bug CF - client writes ride through manager elections / rolling restarts.**
+  The client's manager-RPC failover walked the manager pool exactly ONCE, with
+  no backoff and no overall deadline. During the no-leader window of an
+  election (observed ~2.5 s: leader freshly stopped, followers still answering
+  "forward to <dead leader>" until their election timeout fires) every address
+  returns Unavailable instantly, so the whole retry budget burned in
+  milliseconds and the in-flight write surfaced EIO - a file transfer onto the
+  FUSE mount died whenever the leader restarted mid-write, even with a correct
+  leader-last rolling restart (incident: dtfs-lm 2026-06-06). `call_manager`
+  now re-walks the pool with exponential backoff (250 ms doubling, 2 s cap)
+  until an overall 15 s deadline, covering every manager RPC (lease, allocate,
+  commit, delete, register). Application-level errors still surface
+  immediately; a genuinely-down cluster now fails after ~15 s instead of
+  milliseconds. Connect-level failure of the whole pool (previously an
+  immediate abort that bypassed even the single walk) is retried the same way.
