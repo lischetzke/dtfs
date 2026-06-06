@@ -13,45 +13,68 @@ Manager nodes form a Raft group. An odd number (3, 5, or 7) is recommended for f
 
 ## Adding a Manager Node
 
-> **Current limitation: the Raft voter set is fixed at bootstrap.** The voter
-> membership is established once, when the bootstrap manager calls
-> `raft.initialize()` with the `[[cluster.initial_voters]]` list. There is no
-> online add-learner / change-membership operation yet — neither in the API
-> nor the CLI. The HMAC join protocol
-> ([Cluster Join Protocol](../security/cluster-join.md)) registers **data
-> nodes and clients** in the node registry; it does not change Raft
-> membership.
+Raft membership lives in the raft log. `[[cluster.initial_voters]]` is
+consulted **once**, at bootstrap (`bootstrap = true` →
+`raft.initialize()`); after that, growing or shrinking the live cluster
+goes through the membership API / CLI below. The HMAC join protocol
+([Cluster Join Protocol](../security/cluster-join.md)) registers **data
+nodes and clients** in the node registry; it does not change Raft
+membership.
 
-What this means in practice:
+Two ground rules:
 
-- A manager listed in `initial_voters` at bootstrap time is a voter. If its
-  local Raft state is later lost or wiped, it re-syncs from the leader via
-  snapshot on restart — wiping a *member's* state is recoverable.
-- A manager **not** in the bootstrap voter set (or listed with a hostname
-  that does not exactly match its `[node].hostname` — see the
-  identity contract on the [manager configuration page](../configuration/manager.md))
-  can never join the running cluster. It starts as an inert, empty learner:
-  term 0, no leader, empty namespace. Its API serves an empty cluster view —
-  the typical symptom is a manager whose WebUI shows no data nodes, no
-  clients, and zero files while the rest of the cluster is healthy.
+- A manager that was never joined starts as an inert, empty learner:
+  term 0, no leader, empty namespace. Its API serves an empty cluster
+  view — the typical symptom is a manager whose WebUI shows no data
+  nodes, no clients, and zero files while the rest of the cluster is
+  healthy. Join it; do not trust its reads until it has caught up.
 - **Never** set `bootstrap = true` on such a node to "fix" it: it will
-  initialize a second, divergent single-voter cluster (metadata split-brain)
-  that keeps its own log and never federates.
+  initialize a second, divergent single-voter cluster (metadata
+  split-brain) that keeps its own log and never federates.
 
-### Procedure (requires planned re-initialization)
+### Procedure (online, no re-initialization)
 
-To grow the voter set today:
+1. Install + configure the new manager (`bootstrap = false`; its
+   `[node].hostname` unique cluster-wide — on a composite host it must
+   differ from the data daemon's hostname, since `node_id =
+   hash(hostname)`). Add it to `[[cluster.initial_voters]]` in every
+   manager's `manager.toml` anyway: the list no longer joins anyone,
+   but the BR-1 self-register loop and follower→leader request
+   forwarding read manager addresses from it.
+2. Start the service and confirm its API answers:
+   `curl http://<new-mgr>:9402/api/v1/health`.
+3. Join it as a **learner** (full state replication, no vote). Send to
+   the leader; a follower answers `409` with a `leader` hint:
 
-1. Add the new manager to `[[cluster.initial_voters]]` in **every** manager's
-   `manager.toml`, with `hostname` exactly equal to the new node's
-   `[node].hostname` and a peer-routable `addr`.
-2. Take a metadata backup (see [Backup & Recovery](./backup-recovery.md)).
-3. Re-initialize the Raft group with the new voter set following the
-   full manager group recovery procedure in
-   [Backup & Recovery](./backup-recovery.md) (stop managers, clear Raft
-   state, `bootstrap = true` on exactly one node, restore snapshot).
-4. Verify all voters appear: `curl http://<mgr>:9402/api/v1/raft/state` —
-   check `voters` and `current_leader` on every manager.
+   ```bash
+   dtfs-cli --manager <leader>:9402 raft add-learner <hostname> <ip:9401> \
+       --secret <cluster shared_secret>     # or DTFS_SHARED_SECRET env
+   # REST equivalent:
+   # POST /api/v1/raft/add-learner {"hostname":..., "addr":..., "shared_secret":...}
+   ```
+
+   `addr` is the peer-routable manager gRPC `host:port` (same form as
+   an `initial_voters` entry — never a wildcard).
+4. Watch it catch up: `dtfs-cli --manager <new-mgr>:9402 raft members`
+   (or `GET /api/v1/raft/state`) until `current_leader` is set and
+   `applied_log_lag` is `0`, and `/api/v1/cluster/status` matches the
+   leader's view. Large state arrives via snapshot install; on a slow
+   WAN link this can take a while.
+5. Optionally promote it to **voter** once caught up:
+
+   ```bash
+   dtfs-cli --manager <leader>:9402 raft promote <hostname> --secret ...
+   ```
+
+   A learner serves reads and replicates everything but does not vote
+   — often the right end state for a remote-DC manager (no extra WAN
+   hop in elections, quorum math unchanged).
+6. Verify: `raft members` shows the node with the expected role on
+   every manager; the audit log carries a `raft.add_learner` (and
+   `raft.promote`) row.
+
+All three membership endpoints (`add-learner`, `promote`, `remove`) are
+leader-only and require the cluster `shared_secret` in the body.
 
 ### Recovering a broken member (wipe and re-sync)
 
@@ -78,34 +101,29 @@ empty.
 
 ## Removing a Manager Node
 
-### Graceful Removal
+Membership never changes by itself: a dead voter stays in the voter set
+(and keeps counting against quorum math) until an operator removes it.
 
-1. Ensure the node to be removed is **not** the current Raft leader. If it is, trigger a leader transfer first by restarting the leader or waiting for an election.
-
-2. Remove the node from the Raft group via the REST API:
-
-```bash
-curl -X POST http://<leader>:9402/api/v1/nodes/<node-id>/maintenance \
-  -H 'Content-Type: application/json' \
-  -d '{"enable": true}'
-```
-
-3. Once the node is in maintenance mode and the remaining managers confirm quorum without it, stop the process:
+1. Ensure the node to remove is **not** the current Raft leader (if it
+   is, restart it so another voter wins the election first).
+2. Remove it from the membership (learner or voter; the endpoint
+   refuses to remove the last voter):
 
 ```bash
-systemctl stop dtfs-manager
+dtfs-cli --manager <leader>:9402 raft remove <hostname> --secret <shared_secret>
+# REST: POST /api/v1/raft/remove {"hostname":..., "shared_secret":...}
 ```
 
-4. The Raft leader will eventually remove the non-responsive voter from the configuration after the `down_after_missed` heartbeat threshold is exceeded.
+3. Verify with `raft members` on the remaining managers, then stop the
+   process: `systemctl stop dtfs-manager`.
+4. Remove its `[[cluster.initial_voters]]` entry from the remaining
+   managers' tomls (takes effect at their next restart) so the
+   self-register/forwarding pools stop dialing it.
 
-### Emergency Removal
-
-If a manager node has failed and cannot be recovered:
-
-1. Verify that the remaining managers still form a quorum (e.g., 2 of 3 are healthy).
-2. The Raft leader will detect the failed node after `suspect_after_missed` (default: 3) missed heartbeats and mark it suspect, then `down_after_missed` (default: 6) to mark it down.
-3. Once marked down, the leader removes the node from the voter set.
-4. Add a replacement manager promptly to restore the desired fault tolerance level.
+For a manager that failed permanently and cannot be recovered, the same
+`raft remove` works as long as the remaining voters hold quorum (e.g.
+2 of 3) — run it promptly so a second failure cannot cost quorum, and
+add a replacement via add-learner/promote.
 
 ## Adding a Data Node
 

@@ -16,6 +16,7 @@ mod audit;
 #[allow(dead_code)]
 mod cluster;
 mod join;
+mod membership;
 mod metadata;
 mod monitor;
 mod placement;
