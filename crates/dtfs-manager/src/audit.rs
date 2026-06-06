@@ -227,36 +227,44 @@ impl AuditLog {
     }
 
     /// Query audit entries using an optional filter.
+    ///
+    /// CF-4a — when a `limit` is set we return the NEWEST `limit` matching
+    /// entries, newest-first, mirroring the replicated branch in
+    /// `api::get_audit_log` (`sm.audit_log.iter().rev().filter(..).take`).
+    /// Pre-CF-4a this truncated to the OLDEST N in insertion order, so a
+    /// default-config cluster (local ring, `replicate_via_raft = false`)
+    /// silently hid recent activity behind the limit while a replicated
+    /// cluster showed it. Iterate the ring back-to-front so both branches
+    /// agree.
     pub fn query(&self, filter: &AuditFilter) -> Vec<AuditEntry> {
         let entries = self.entries.read();
-        let mut result: Vec<AuditEntry> = entries
+        let matches = |e: &AuditEntry| {
+            if let Some(since) = filter.since {
+                if e.timestamp < since {
+                    return false;
+                }
+            }
+            if let Some(until) = filter.until {
+                if e.timestamp > until {
+                    return false;
+                }
+            }
+            if let Some(ref action) = filter.action {
+                if !e.action.starts_with(action.as_str()) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let limit = filter.limit.unwrap_or(usize::MAX);
+        entries
             .iter()
-            .filter(|e| {
-                if let Some(since) = filter.since {
-                    if e.timestamp < since {
-                        return false;
-                    }
-                }
-                if let Some(until) = filter.until {
-                    if e.timestamp > until {
-                        return false;
-                    }
-                }
-                if let Some(ref action) = filter.action {
-                    if !e.action.starts_with(action.as_str()) {
-                        return false;
-                    }
-                }
-                true
-            })
+            .rev()
+            .filter(|e| matches(e))
+            .take(limit)
             .cloned()
-            .collect();
-
-        if let Some(limit) = filter.limit {
-            result.truncate(limit);
-        }
-
-        result
+            .collect()
     }
 
     /// Return the total number of entries currently stored.
@@ -425,5 +433,58 @@ mod tests {
         let log = AuditLog::new_with_archive(4, tmp.path().to_path_buf());
         log.log("system", "test", "tgt", "ok");
         assert_eq!(log.len(), 1);
+    }
+
+    /// CF-4a — `query()` with a `limit` MUST return the NEWEST N matching
+    /// entries, newest-first, to match the replicated-branch behaviour in
+    /// `api::get_audit_log` (`sm.audit_log.iter().rev().take(limit)`).
+    /// Pre-CF-4a it truncated to the OLDEST N (insertion order), so a
+    /// default-config cluster silently hid recent activity behind the
+    /// limit. Push more than N entries, query with limit=N, assert we get
+    /// the most-recent N newest-first.
+    #[test]
+    fn cf_4a_query_limit_returns_newest_first() {
+        let log = AuditLog::new(100);
+        for i in 0..10 {
+            log.log("api", &format!("action.{i}"), "tgt", "ok");
+        }
+        let got = log.query(&AuditFilter {
+            limit: Some(3),
+            ..Default::default()
+        });
+        let actions: Vec<&str> = got.iter().map(|e| e.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec!["action.9", "action.8", "action.7"],
+            "limit must return the newest N entries, newest-first"
+        );
+    }
+
+    /// CF-4a — the action prefix filter must compose with the newest-N
+    /// limit: select the newest N entries that match the prefix, not the
+    /// newest N overall then filter.
+    #[test]
+    fn cf_4a_query_limit_with_action_filter_returns_newest_matching() {
+        let log = AuditLog::new(100);
+        // Interleave matching and non-matching actions.
+        for i in 0..10 {
+            let action = if i % 2 == 0 {
+                format!("config.{i}")
+            } else {
+                format!("node.{i}")
+            };
+            log.log("api", &action, "tgt", "ok");
+        }
+        let got = log.query(&AuditFilter {
+            limit: Some(2),
+            action: Some("config.".to_string()),
+            ..Default::default()
+        });
+        let actions: Vec<&str> = got.iter().map(|e| e.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec!["config.8", "config.6"],
+            "newest matching entries first, filtered before limit"
+        );
     }
 }
