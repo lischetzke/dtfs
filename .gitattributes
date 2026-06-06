@@ -1,0 +1,5 @@
+# Shell scripts must stay LF: the Windows operator host syncs its
+# working tree verbatim (tar over SSH) to the Linux builder, and bash
+# chokes on CRLF ("$'\r': command not found" — broke the build wrappers
+# under core.autocrlf=true checkouts).
+*.sh text eol=lf
