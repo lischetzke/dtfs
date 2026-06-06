@@ -544,6 +544,46 @@ sudo dtfs-cli update manager --tag v0.3.0 --yes
 sudo dtfs-cli update cli
 ```
 
+---
+
+### raft
+
+Inspect and change Raft membership (the manager voter/learner set). The
+mutating subcommands (`add-learner`, `promote`, `remove`) are
+**leader-only** — point `--manager` at the current leader; a follower
+answers `409` with a leader hint — and require the cluster
+`shared_secret` (pass `--secret` or set `DTFS_SHARED_SECRET`). See
+[Cluster Management → Adding a Manager Node](../operations/cluster-management.md#adding-a-manager-node)
+for the full add/promote/remove workflow and the learner-vs-voter
+distinction.
+
+```bash
+dtfs-cli raft members
+dtfs-cli --manager <leader>:9402 raft add-learner <HOSTNAME> <ADDR> --secret <SECRET>
+dtfs-cli --manager <leader>:9402 raft promote <HOSTNAME> --secret <SECRET>
+dtfs-cli --manager <leader>:9402 raft remove <HOSTNAME> --secret <SECRET>
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `members` | Show the membership (voters, learners, leader, addrs) as seen by the queried manager. Read-only; works on any manager. Backed by `GET /api/v1/raft/state`. |
+| `add-learner <HOSTNAME> <ADDR>` | Add a manager as a non-voting learner. `<ADDR>` is the peer-routable Raft/gRPC `host:port` (never a wildcard). |
+| `promote <HOSTNAME>` | Promote an up-to-date learner to a voting member. |
+| `remove <HOSTNAME>` | Remove a learner or voter from the membership entirely. |
+
+`<HOSTNAME>` is the target manager's `[node].hostname` (the raft node id
+is `hash(hostname)`). The `--secret` value can also come from the
+`DTFS_SHARED_SECRET` environment variable.
+
+**Example output (`raft members`, table format):**
+
+```
+Queried: mgr01 (state=Leader, term=18)
+HOSTNAME               NODE_ID                ADDR                     ROLE     
+mgr01                  12709699821947187762   10.0.0.1:9401            voter    (leader)
+mgr04                  8841...                10.1.0.1:9401            learner  
+```
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -558,3 +598,4 @@ sudo dtfs-cli update cli
 | `DTFS_MANAGER` | Default manager address (overridden by `--manager` flag) |
 | `DTFS_TOKEN` | JWT authentication token |
 | `DTFS_REPO_URL` | Default release repo for `update` (overridden by `--repo-url` and by `[updater].repo_url`) |
+| `DTFS_SHARED_SECRET` | Cluster shared secret for `raft add-learner`/`promote`/`remove` (overridden by `--secret`) |

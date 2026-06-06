@@ -13,13 +13,16 @@ The Raft state machine contains all cluster metadata:
 - Volume configurations
 - Cluster-wide configuration
 
-This state is stored in RocksDB under the manager's `data_dir` (default: `/var/lib/dtfs/manager/`).
+This state lives under the manager's `data_dir` (default: `/var/lib/dtfs`) in two directories:
+
+- `raft-log/` -- the RocksDB Raft log (the source of truth for all metadata mutations).
+- `raft-sm/` -- the state-machine snapshot. The latest snapshot is the single file `raft-sm/snapshot.bin`; it carries the full FSM state plus the Raft membership, so a restart restores membership before any log replay.
 
 **Loss of all Raft state means loss of the file namespace.** Chunk data would still exist on data nodes but would be unaddressable without metadata.
 
 ### Raft Snapshots
 
-The Raft implementation takes periodic snapshots based on the `snapshot_threshold` configuration (default: every 10,000 log entries). Snapshots capture the full state machine state and are stored alongside the Raft log.
+The Raft implementation takes periodic snapshots based on the `snapshot_threshold` configuration (default: every 10,000 log entries). Each snapshot atomically replaces `raft-sm/snapshot.bin`; there is no separate `raft-snapshots/` directory. The snapshot captures the full state machine state and the membership config.
 
 ### Configuration Files
 
@@ -47,25 +50,24 @@ The recommended backup method for cluster metadata:
 dtfs-cli status
 ```
 
-2. Trigger a snapshot on the leader (or wait for the next automatic snapshot):
+2. Snapshots are automatic. To verify the latest one on disk:
 
 ```bash
-# Snapshots are automatic. To verify the latest:
-ls -la /var/lib/dtfs/manager/raft-snapshots/
+ls -la /var/lib/dtfs/raft-sm/
 ```
 
-3. Copy the snapshot directory to a backup location:
+3. Copy the state-machine snapshot to a backup location:
 
 ```bash
-rsync -av /var/lib/dtfs/manager/raft-snapshots/ \
-  /backup/dtfs/manager-snapshots/$(date +%Y%m%d)/
+rsync -av /var/lib/dtfs/raft-sm/ \
+  /backup/dtfs/manager-sm/$(date +%Y%m%d)/
 ```
 
-4. Back up the full RocksDB directory for a complete state capture:
+4. Back up the full `data_dir` (both `raft-log/` and `raft-sm/`) for a complete state capture:
 
 ```bash
 # Stop writes briefly or use a filesystem snapshot
-rsync -av /var/lib/dtfs/manager/ \
+rsync -av /var/lib/dtfs/ \
   /backup/dtfs/manager-full/$(date +%Y%m%d)/
 ```
 
@@ -75,10 +77,10 @@ Set up a cron job on each manager node:
 
 ```cron
 # Daily Raft snapshot backup at 02:00
-0 2 * * * rsync -av /var/lib/dtfs/manager/raft-snapshots/ /backup/dtfs/snapshots/$(hostname)/$(date +\%Y\%m\%d)/
+0 2 * * * rsync -av /var/lib/dtfs/raft-sm/ /backup/dtfs/sm/$(hostname)/$(date +\%Y\%m\%d)/
 
-# Weekly full RocksDB backup at 03:00 Sunday
-0 3 * * 0 rsync -av /var/lib/dtfs/manager/ /backup/dtfs/full/$(hostname)/$(date +\%Y\%m\%d)/
+# Weekly full data_dir backup at 03:00 Sunday (raft-log/ + raft-sm/)
+0 3 * * 0 rsync -av /var/lib/dtfs/ /backup/dtfs/full/$(hostname)/$(date +\%Y\%m\%d)/
 ```
 
 ### Configuration Backup
@@ -101,48 +103,127 @@ aws s3 sync /backup/dtfs/ s3://dtfs-backups/$(hostname)/
 
 ### Single Manager Recovery
 
-If one manager in a multi-node group fails:
+If one manager in a multi-node group fails, the remaining managers keep
+quorum and the cluster stays up. How you recover the failed member
+depends on whether it kept its local Raft state.
 
-1. The remaining managers continue operating with quorum.
-2. Provision a new host and install `dtfs-manager`.
-3. Configure it with the same `shared_secret` and point it to an existing manager.
-4. Start the manager. It joins the Raft group and automatically syncs state from the leader.
-5. No backup restoration is needed; Raft replication handles state transfer.
-
-### Full Manager Group Recovery
-
-If all manager nodes are lost (total cluster metadata loss):
-
-1. Stop any surviving manager processes.
-
-2. Choose one host as the bootstrap node.
-
-3. Restore the most recent Raft snapshot backup to the data directory:
-
-```bash
-rsync -av /backup/dtfs/manager-full/latest/ /var/lib/dtfs/manager/
-```
-
-4. Configure the bootstrap node with `cluster.bootstrap = true`:
-
-```toml
-[cluster]
-name = "my-cluster"
-shared_secret = "your-shared-secret"
-bootstrap = true
-```
-
-5. Start the bootstrap manager:
+**Case A -- the member kept its `data_dir` (`raft-log/` + `raft-sm/`).**
+It is still in the voter set and already knows its identity. Just restart
+the service:
 
 ```bash
 systemctl start dtfs-manager
 ```
 
-6. The manager initializes a new single-node Raft group from the restored state.
+It rejoins as a follower on its own and catches up from the leader (log
+replay, or an `InstallSnapshot` if it fell far behind). No membership
+change and no backup restoration are needed.
 
-7. Add additional manager nodes following the normal join procedure (see [Cluster Management](./cluster-management.md)).
+**Case B -- the member lost its state** (disk failure, fresh host, wiped
+`data_dir`). A manager with empty Raft state does **not** auto-join: it
+comes up as an inert, empty learner (term 0, no leader, empty namespace)
+and never re-enters the voter set by itself. You must re-add it through
+the membership API:
 
-8. Data nodes will reconnect automatically once they detect the manager is available.
+1. Provision/repair the host, install `dtfs-manager`, and configure it
+   with the same `shared_secret` and `cluster.name`, `bootstrap = false`.
+   Give it the failed member's original `[node].hostname` to recover that
+   member's identity (the raft node id is `hash(hostname)`), or a new
+   hostname to bring it back as a distinct member.
+2. Start the service and confirm its API answers
+   (`curl http://<mgr>:9402/api/v1/health`).
+3. From the **leader**, add it back as a learner, then promote it once it
+   has caught up:
+
+   ```bash
+   dtfs-cli --manager <leader>:9402 raft add-learner <hostname> <ip:9401> --secret <shared_secret>
+   # watch GET /api/v1/raft/state on the new node until applied_log_lag == 0
+   dtfs-cli --manager <leader>:9402 raft promote <hostname> --secret <shared_secret>
+   ```
+
+These commands are leader-only and shared-secret gated; a follower
+answers `409` with a leader hint. See
+[Cluster Management → Adding a Manager Node](./cluster-management.md#adding-a-manager-node)
+for the full procedure and the learner-vs-voter distinction.
+
+### Full Manager Group Recovery
+
+If every manager has lost its Raft state but you hold a backup, recover
+from **one** surviving member identity and grow the group back. Do **not**
+restore a backup and set `bootstrap = true`: `raft.initialize()` refuses
+a non-empty state, and bootstrapping over restored state would instead try
+to form a second, divergent single-voter cluster (split-brain). The
+restored snapshot already carries the old membership, so the recovery is a
+restore-and-restart, not a re-bootstrap.
+
+1. Stop any surviving manager processes.
+
+2. Choose one host as the recovery node. Use the `data_dir` backup taken
+   from one of the original managers (its identity = `hash([node].hostname)`
+   must match the hostname you give the recovery node).
+
+3. Restore that member's `data_dir` (both `raft-log/` and `raft-sm/`):
+
+```bash
+systemctl stop dtfs-manager
+rsync -av --delete /backup/dtfs/manager-full/latest/ /var/lib/dtfs/
+```
+
+4. Configure the recovery node with `bootstrap = false` and the matching
+   hostname / `shared_secret` / `cluster.name`:
+
+```toml
+[node]
+hostname = "mgr01"            # must match the backed-up member's hostname
+
+[cluster]
+name = "my-cluster"
+shared_secret = "your-shared-secret"
+bootstrap = false
+```
+
+5. Start the recovery manager:
+
+```bash
+systemctl start dtfs-manager
+```
+
+6. The manager loads the restored snapshot and log; its membership config
+   still lists the original voter set. **Important constraint:** with the
+   other voters gone, a multi-voter membership cannot reach quorum, so this
+   single survivor cannot elect a leader on its own and will not accept
+   writes yet. Confirm it has loaded the restored state but report
+   `current_leader = null`:
+
+```bash
+curl http://<recovery-mgr>:9402/api/v1/raft/state   # voters lists the old set, current_leader null
+```
+
+7. Restore quorum by re-adding the other manager identities. There is no
+   single-command "force new single-node membership" path today; the
+   supported route is to bring the other original members back (restore
+   each one's `data_dir` from backup, or repair the hosts) so the existing
+   voter set regains a majority and elects a leader. Once a leader exists,
+   use the membership API to drop permanently dead voters and add
+   replacements:
+
+```bash
+dtfs-cli --manager <leader>:9402 raft remove <dead-hostname> --secret <shared_secret>
+dtfs-cli --manager <leader>:9402 raft add-learner <new-hostname> <ip:9401> --secret <shared_secret>
+dtfs-cli --manager <leader>:9402 raft promote <new-hostname> --secret <shared_secret>
+```
+
+   If you cannot bring back enough original voters to reach a majority, the
+   cluster is stuck without quorum: forcing a smaller voter set from a
+   single survivor requires manual openraft surgery that has no operator
+   command today. Treat losing a majority of managers permanently as a
+   genuine disaster and prioritise restoring those identities from backup.
+
+8. Data nodes reconnect automatically once a leader is elected and the
+   manager API is serving.
+
+See [Cluster Management](./cluster-management.md) for the membership
+commands referenced above.
 
 ### Data Node Recovery
 
@@ -198,8 +279,13 @@ dtfs-cli scrub --level deep
 
 Periodically verify that backups are usable:
 
-1. Restore a backup to a test environment.
-2. Bootstrap a single manager from the restored data.
+1. Restore a `data_dir` backup (`raft-log/` + `raft-sm/`) to a test host.
+2. Start a single manager (`bootstrap = false`, hostname matching the
+   backed-up member). It loads the restored state; note that a single
+   survivor of a multi-voter membership will report `current_leader = null`
+   and cannot serve writes until quorum is restored (see Full Manager Group
+   Recovery), but its `/api/v1/raft/state` and snapshot load confirm the
+   backup is intact.
 3. Verify the file namespace is intact:
 
 ```bash
