@@ -1068,6 +1068,11 @@ impl ManagerService for MetadataService {
         let by_node = plan_delete_fanout(chunk_targets, &node_addrs);
 
         let path_for_log = req.path.clone();
+        // CF-1b — thread the audit log into the spawned fan-out task so a
+        // failure emits a `delete.fanout_failed` row (Option<Arc<_>> is
+        // cheap to clone). Pre-CF-1b these failures were journald-only,
+        // which masked the ~238 GB production orphan leak (Bug N).
+        let audit = self.audit.clone();
         tokio::spawn(async move {
             for (addr, chunks) in by_node {
                 let mut client = match dtfs_proto::dtfs::data::data_service_client::DataServiceClient::connect(addr.clone()).await {
@@ -1079,6 +1084,14 @@ impl ManagerService for MetadataService {
                             error = %e,
                             "Bug N delete fan-out: connect failed, leaving orphan chunks for reconciler"
                         );
+                        if let Some(audit) = &audit {
+                            audit.log(
+                                "metadata",
+                                "delete.fanout_failed",
+                                &fanout_failed_summary(&addr, chunks.len()),
+                                "connect",
+                            );
+                        }
                         continue;
                     }
                 };
@@ -1103,6 +1116,14 @@ impl ManagerService for MetadataService {
                                 error = %e,
                                 "Bug N delete fan-out: RPC failed, orphan remains for reconciler"
                             );
+                            if let Some(audit) = &audit {
+                                audit.log(
+                                    "metadata",
+                                    "delete.fanout_failed",
+                                    &fanout_failed_summary(&addr, 1),
+                                    "rpc",
+                                );
+                            }
                         }
                     }
                 }
@@ -2279,6 +2300,18 @@ pub(crate) fn plan_delete_fanout(
     by_endpoint
 }
 
+/// Bug N / CF-1b — build the `delete.fanout_failed` audit summary. The
+/// summary identifies the data node endpoint plus how many chunks were
+/// left orphaned by the failure; the audit `result` carries the failure
+/// class (`connect` for a dial failure, `rpc` for a DeleteChunk RPC
+/// error). The orphan reconciler still reclaims the chunks later, but the
+/// audit row makes the failure observable in `/api/v1/audit` and the WebUI
+/// integrity feed instead of being journald-only (the gap that masked the
+/// ~238 GB production orphan leak).
+pub(crate) fn fanout_failed_summary(node_addr: &str, chunk_count: usize) -> String {
+    format!("node_addr={node_addr} orphan_chunks={chunk_count}")
+}
+
 pub(crate) fn build_data_grpc_addr(
     peer: Option<std::net::SocketAddr>,
     reported_hostname: &str,
@@ -2353,6 +2386,16 @@ mod tests {
         );
         assert_eq!(plan.len(), 1);
         assert_eq!(plan["http://10.0.0.4:9500"].len(), 2);
+    }
+
+    /// CF-1b — the fan-out failure audit summary identifies the data node
+    /// endpoint and the count of chunks left orphaned, so an operator
+    /// reading `/api/v1/audit` or the integrity feed can see which node and
+    /// how much disk is at stake without grepping journald.
+    #[test]
+    fn cf1b_fanout_failed_summary_carries_node_and_count() {
+        let summary = fanout_failed_summary("http://10.0.0.4:9500", 3);
+        assert_eq!(summary, "node_addr=http://10.0.0.4:9500 orphan_chunks=3");
     }
 
     /// Bug W regression — peer IP wins over reported hostname.
