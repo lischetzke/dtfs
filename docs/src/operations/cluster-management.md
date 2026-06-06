@@ -13,41 +13,62 @@ Manager nodes form a Raft group. An odd number (3, 5, or 7) is recommended for f
 
 ## Adding a Manager Node
 
-### Prerequisites
+> **Current limitation: the Raft voter set is fixed at bootstrap.** The voter
+> membership is established once, when the bootstrap manager calls
+> `raft.initialize()` with the `[[cluster.initial_voters]]` list. There is no
+> online add-learner / change-membership operation yet — neither in the API
+> nor the CLI. The HMAC join protocol
+> ([Cluster Join Protocol](../security/cluster-join.md)) registers **data
+> nodes and clients** in the node registry; it does not change Raft
+> membership.
 
-1. The new host has `dtfs-manager` installed and a valid configuration at `/etc/dtfs/manager.toml`.
-2. The `shared_secret` in the configuration matches the existing cluster.
-3. Network connectivity exists between the new node and all existing managers on the Raft port (default `9400`) and gRPC port (default `9401`).
+What this means in practice:
 
-### Procedure
+- A manager listed in `initial_voters` at bootstrap time is a voter. If its
+  local Raft state is later lost or wiped, it re-syncs from the leader via
+  snapshot on restart — wiping a *member's* state is recoverable.
+- A manager **not** in the bootstrap voter set (or listed with a hostname
+  that does not exactly match its `[node].hostname` — see the
+  identity contract on the [manager configuration page](../configuration/manager.md))
+  can never join the running cluster. It starts as an inert, empty learner:
+  term 0, no leader, empty namespace. Its API serves an empty cluster view —
+  the typical symptom is a manager whose WebUI shows no data nodes, no
+  clients, and zero files while the rest of the cluster is healthy.
+- **Never** set `bootstrap = true` on such a node to "fix" it: it will
+  initialize a second, divergent single-voter cluster (metadata split-brain)
+  that keeps its own log and never federates.
 
-1. Configure the new manager. Set `cluster.bootstrap = false` and point `cluster.manager_addr` to any existing manager:
+### Procedure (requires planned re-initialization)
 
-```toml
-[cluster]
-name = "my-cluster"
-shared_secret = "your-shared-secret"
-bootstrap = false
-```
+To grow the voter set today:
 
-2. Start the manager process:
+1. Add the new manager to `[[cluster.initial_voters]]` in **every** manager's
+   `manager.toml`, with `hostname` exactly equal to the new node's
+   `[node].hostname` and a peer-routable `addr`.
+2. Take a metadata backup (see [Backup & Recovery](./backup-recovery.md)).
+3. Re-initialize the Raft group with the new voter set following the
+   full manager group recovery procedure in
+   [Backup & Recovery](./backup-recovery.md) (stop managers, clear Raft
+   state, `bootstrap = true` on exactly one node, restore snapshot).
+4. Verify all voters appear: `curl http://<mgr>:9402/api/v1/raft/state` —
+   check `voters` and `current_leader` on every manager.
 
-```bash
-systemctl start dtfs-manager
-```
+### Recovering a broken member (wipe and re-sync)
 
-3. The new manager executes the cluster join protocol (see [Cluster Join Protocol](../security/cluster-join.md)):
-   - Sends an HMAC-authenticated `RequestJoin` RPC to an existing manager.
-   - Receives the cluster CA certificate and current manager list.
-   - Completes the join with a challenge-response exchange.
+For a manager that IS in the voter set but has bad local Raft state (stuck
+candidate, poisoned vote, corrupt log):
 
-4. The Raft leader adds the new node as a learner, then promotes it to a voter once it has caught up with the log.
+1. Stop the service: `systemctl stop dtfs-manager`.
+2. Move aside `<data_dir>/raft-log/` and `<data_dir>/raft-sm/`
+   (default `data_dir` is `/var/lib/dtfs`).
+3. Start the service. The manager rejoins as a follower and installs a
+   snapshot from the leader.
 
-5. Verify the node joined:
-
-```bash
-dtfs-cli --manager <any-manager>:9402 nodes
-```
+The Bug AC poisoned-state detector performs this wipe automatically on
+startup when it detects a stuck-candidate state; the manual procedure covers
+cases the detector does not catch. Note again: this only works for a node
+already in the membership — wiping a never-joined manager just leaves it
+empty.
 
 ### Scaling Considerations
 

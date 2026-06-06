@@ -1,5 +1,15 @@
 # TLS
 
+> **Implementation status: gRPC TLS is NOT wired up yet.** Regardless of
+> `tls.mode`, every manager and data-node gRPC listener currently serves
+> **plaintext** and logs
+> `TLS mode 'auto' is set but manager gRPC still listens in plaintext (TLS not yet implemented)`
+> at startup. The certificate machinery below (cluster CA, node certs issued
+> during the join handshake) exists and runs, but the resulting certificates
+> are not yet used to encrypt gRPC channels. Treat the rest of this page as
+> the design target; do not rely on transport encryption between DTFS nodes
+> today — isolate the cluster network (e.g. WireGuard/Tailscale) instead.
+
 DTFS secures all inter-node communication with TLS. By default, a cluster CA is auto-generated on first node join, and each node receives a certificate signed by that CA. Operators can also provide their own certificates for environments with existing PKI infrastructure.
 
 ## Auto-Generated Cluster CA
@@ -34,10 +44,10 @@ For environments with existing certificate infrastructure, operators can provide
 
 ```toml
 [tls]
-enabled = true
-ca_cert = "/etc/dtfs/certs/ca.pem"
-node_cert = "/etc/dtfs/certs/node.pem"
-node_key = "/etc/dtfs/certs/node-key.pem"
+mode = "require"                          # "auto" | "require" | "disable"
+cert_file = "/etc/dtfs/certs/node.pem"
+key_file = "/etc/dtfs/certs/node-key.pem"
+ca_file = "/etc/dtfs/certs/ca.pem"
 ```
 
 When custom certificates are provided, the auto-generation logic is skipped entirely. The CA certificate is still distributed to joining nodes so they can validate peer connections.
@@ -107,17 +117,17 @@ TLS can be disabled for development or testing by setting:
 
 ```toml
 [tls]
-enabled = false
+mode = "disable"
 ```
 
-When TLS is disabled, all gRPC connections use plaintext. This is not recommended for production deployments.
+When TLS is disabled, all gRPC connections use plaintext. This is not recommended for production deployments. (As noted at the top of this page, gRPC connections are currently plaintext in **every** mode.)
 
 ## Certificate Rotation
 
 To rotate certificates without downtime:
 
 1. Generate new certificates signed by the same CA (or a new CA that nodes already trust).
-2. Update the `node_cert` and `node_key` paths in each node's configuration file.
+2. Update the `cert_file` and `key_file` paths in each node's configuration file.
 3. Restart nodes one at a time, starting with data nodes and finishing with managers.
 4. If rotating the CA itself, distribute the new CA to all nodes before rotating any node certificates.
 

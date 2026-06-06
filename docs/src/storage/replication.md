@@ -24,6 +24,27 @@ for the promotion + cooldown rules that drive cache replica
 creation, and `cache.flush_replica` / `cache.flush_refused` audit
 events for the operator-visible lifecycle.
 
+> **Every tier needs a maintainer, or it holds zero copies.** A replica only
+> exists if one of the two classes maintains it on that tier:
+>
+> - `mandatory_replicas.<tier> > 0` — the under-replication scheduler creates
+>   and repairs these continuously, and
+>   `min_replicas_before_ack` durability rests on them; or
+> - `cache_replicas.<tier>.min/max > 0` **with a firing promotion trigger** —
+>   cache replicas are created only by the tiering engine when a chunk's
+>   reads reach `promote_reads` within `promote_window_secs`. With
+>   `promote_reads = 0` the trigger never fires and a `min > 0` floor is
+>   inert: the scheduler is *forbidden* from backfilling cache replicas
+>   (that is the Bug AV class separation).
+>
+> The legacy `replication.<tier>` count on its own creates nothing. Example
+> footgun: `replication = {cold = 1, warm = 1}` +
+> `mandatory_replicas = {cold = 1}` + `cache_replicas.warm = {min = 1,
+> promote_reads = 0}` yields a cluster where every file settles at **one**
+> cold copy — the warm "replica" never materializes, and placement reports
+> `undergoal: 0` because only mandatory replicas are counted. If you want a
+> durable second copy, put it in `mandatory_replicas`.
+
 ### Anchor invariant
 
 Volumes additionally carry an `anchor.datacenter` setting (optionally
@@ -42,33 +63,22 @@ Each temperature tier has its own default replication factor:
 | Hot | 3 | High availability and read throughput for frequently accessed data |
 | Warm | 2 | Moderate durability with reduced storage overhead |
 | Cold | 1 | Cost-efficient storage for infrequently accessed data |
+| Tape | 1 | The tape library itself provides durability; 2 only with two independent libraries |
 
-These defaults are configured at the cluster level and can be overridden per volume:
+These defaults are configured at the cluster level (manager.toml) and can be
+overridden per volume through the API/CLI (`dtfs-cli volumes set-mandatory`,
+`set-cache` — see [Volume Configuration](../configuration/volume-config.md)):
 
 ```toml
-# Cluster-wide defaults
+# Cluster-wide defaults (manager.toml)
 [defaults.replication]
 hot  = 3
 warm = 2
 cold = 1
-
-# Per-volume override
-[volume.critical-data.replication]
-hot  = 5
-warm = 3
-cold = 2
+tape = 1
 ```
 
 When a chunk's temperature changes and its tier shifts (see [Tiering](./tiering.md)), the target replication factor changes as well. For example, a chunk moving from hot (3 replicas) to warm (2 replicas) will have one replica decommissioned after the migration completes. A chunk moving from cold (1 replica) to warm (2 replicas) will have a new replica created.
-
-### Frozen Tier Behavior
-
-The frozen tier inherits the cold tier's replication factor by default. Operators who want to reduce replicas further for frozen data can set it explicitly:
-
-```toml
-[defaults.replication]
-frozen = 1
-```
 
 ## Write Safety
 
@@ -92,16 +102,21 @@ The write flow proceeds as follows:
 
 Setting `min_replicas_before_ack` equal to the replication factor provides the strongest durability guarantee but increases write latency. Setting it to 1 gives the lowest latency but risks data loss if the single acknowledging node fails before replication completes.
 
+> **The ack floor is only as durable as its maintainers.** `N` acknowledged
+> replicas at write time stay `N` replicas only if the volume's policy keeps
+> them (see "Every tier needs a maintainer" above). If the extra ack comes
+> from a tier with no `mandatory_replicas` entry and no firing cache
+> promotion, that copy is later dropped and the file settles below `N` —
+> the configured guarantee silently degrades. Before raising
+> `min_replicas_before_ack`, confirm the topology has enough disks on
+> maintained tiers to durably hold `N` copies.
+
 ### fsync Behavior
 
-By default, data nodes call `fsync` on every acknowledged write to guarantee that the data has reached stable storage:
-
-```toml
-[defaults.write_safety]
-fsync = true
-```
-
-Disabling `fsync` improves write throughput but introduces a risk window: data confirmed to the client may be lost if the node loses power before the kernel flushes its page cache. This is generally only acceptable for scratch or temporary data.
+Data nodes always `sync_all()` a chunk before the atomic rename that commits
+it, and sync the metadata before clearing the write-ahead log entry — an
+acknowledged write has reached stable storage. There is no configuration
+option to disable this.
 
 ### write_timeout
 

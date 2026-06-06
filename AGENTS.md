@@ -112,8 +112,12 @@ new field.
 **A.3.2 Memory discipline.** No `Vec<u8>` accumulation of full chunks on
 the hot path — stream to disk, hash incrementally (Bug I). Memory caps
 are best-effort; never reject requests by default (the RESOURCE_EXHAUSTED
-shed is opt-in, last resort — see § A.5). Per-role `[memory]` block in
-each of manager/data/fuse `.toml`, each with its own `hard_cap_mb`.
+shed is opt-in, last resort — see § A.5). The `[memory]` block
+(`hard_cap_mb` etc.) is implemented on **dtfs-data only** today; manager
+and fuse are bounded via systemd `MemoryMax` plus internal caps (gRPC
+write concurrency, readahead `cache_mb`, ARC budget). Extending
+`[memory]` to the other roles is open work — update this section when it
+lands.
 
 **A.3.3 Integrity is the prime directive.** Every path that touches
 bytes must:
@@ -255,7 +259,8 @@ committed). VM key `~/.ssh/dtfs-lab/id_ed25519`. Bandwidth shaping in
 ## A.5 Memory model
 
 Deterministic, bounded, best-effort: under pathological load we slow
-down, never OOM-kill. Each `*.toml` has an optional `[memory]` block:
+down, never OOM-kill. `data.toml` has an optional `[memory]` block
+(dtfs-data only for now — § A.3.2; defaults warn 80 / shed 92 / sample 5):
 
 ```toml
 [memory]
@@ -274,8 +279,13 @@ last resort) return RESOURCE_EXHAUSTED to new put_chunk, client retries
 with backoff.
 
 Composite host (toro-plex = mgr04+data-warm01+client02+Plex): set
-`hard_cap_mb` per role; total ≤ host RAM − Plex headroom − OS overhead.
+`hard_cap_mb` per role where supported (else systemd `MemoryMax`); total
+≤ host RAM − Plex headroom − OS overhead.
 `tests/proxmox/abuse/14-composite-host-budget.sh` validates the sum.
+Composite-host identity rule: every daemon needs its own unique
+`[node].hostname` (node_id = hash(hostname)); the FUSE client registers
+under `[location].host` (`<data-hostname>_cln` convention) — see
+`docs/src/configuration/` and `deploy/examples/`.
 
 ## A.6 Data-integrity audit checklist
 
@@ -478,6 +488,7 @@ Where a file lives is part of its meaning. Canonical locations:
 | Artefact | Location |
 |---|---|
 | In-flight work plan | `plans/active/PLAN-<id>-<name>.md` (delete when done, § B.2) |
+| Cluster scan / lab report | `plans/reports/<NAME>-<date>.md` (e.g. `ISSUE-SCAN-…`) |
 | Release note (user-visible change) | `changelog/UNRELEASED.md`, same commit as the code |
 | Architecture / config / ops reference | `docs/src/...` (mdBook), same commit as the behaviour change |
 | Code | `crates/<crate>/src/...` (new crate → workspace `Cargo.toml` entry) |
@@ -487,7 +498,17 @@ Where a file lives is part of its meaning. Canonical locations:
 | Release-gate e2e | `tests/release/cases/NN-name.sh` + `lib/` + `run.sh` (§ B.5) |
 | Operator scripts | `scripts/` |
 | Deployment surface | `deploy/` |
+| Canonical example configs | `deploy/examples/{manager,data,fuse}.toml` — every option, optional ones commented out with their compiled-in default |
 | Agent guide | `AGENTS.md` (CLAUDE.md is just the `@AGENTS.md` shim — don't add content there) |
+
+**Config-surface sync (mandatory).** Any change to a config struct in
+`crates/dtfs-common/src/config.rs` (new/renamed/removed option, changed
+default) MUST, in the **same commit**, update (1) the matching
+`deploy/examples/*.toml` and (2) the matching reference page under
+`docs/src/configuration/`. The `example_*_toml_parses` tests in
+dtfs-common gate (1); keep the docs streamlined — one table row per
+option, no duplicated complete-example blocks (the example files are the
+single source for those).
 
 Don't: invent a top-level directory without adding a row here first;
 check in a root PROGRESS/status file (git log + changelog + plans are the

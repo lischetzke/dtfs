@@ -1,0 +1,161 @@
+# dtfs-manager example configuration — /etc/dtfs/manager.toml
+#
+# Canonical, exhaustive reference: every option the binary understands.
+# Required options are set; optional options are commented out and show
+# their compiled-in default. Source of truth: crates/dtfs-common/src/config.rs
+# (ManagerConfig). Keep this file in sync with that struct in the same commit
+# (AGENTS.md § B.6).
+
+[node]
+# hostname is this manager's IDENTITY: node_id = hash(hostname). It MUST be
+# unique across every daemon in the cluster (managers, data nodes, clients) —
+# two daemons sharing a hostname overwrite each other's registry entry.
+# On a composite host, give each role its own name (e.g. box "dc1-box1" runs
+# manager "dtfs-dc1-mgr01" + data node "dtfs-dc1-data01").
+# It MUST exactly match this node's [[cluster.initial_voters]] entry.
+hostname = "dtfs-example-mgr01"
+#id = "auto"                        # node id derivation; leave "auto"
+#data_dir = "/var/lib/dtfs"         # raft log + snapshots + metadata
+
+[location]
+# Topology coordinates for placement + proximity routing. Co-located daemons
+# on one physical box should share region/datacenter/rack/host so reads
+# prefer local replicas. All four fields required.
+region = "eu"
+datacenter = "example-dc"
+rack = "box1"
+host = "example-box1"
+
+[cluster]
+name = "dtfs"                       # must be identical on all managers
+shared_secret = "change-me"         # must be identical on all nodes (managers, data, fuse)
+#bootstrap = false                  # true on EXACTLY ONE manager, only for the
+                                    # very first cluster start. Never set true on
+                                    # a node joining an existing cluster — it
+                                    # would form a second, divergent cluster
+                                    # (split-brain).
+
+# The full expected voter set. The SAME list must appear in every manager's
+# config. Each entry's `hostname` must EXACTLY equal that manager's
+# [node].hostname (the node_id is derived from it); `addr` must be the
+# peer-ROUTABLE raft gRPC address — never 0.0.0.0. A manager that finds no
+# entry matching its own hostname cannot join (logs "Bug AC bootstrap: no
+# matching initial_voters entry for self").
+# region/datacenter/rack are optional display hints for the WebUI node table.
+[[cluster.initial_voters]]
+hostname = "dtfs-example-mgr01"
+addr = "10.0.0.1:9401"
+#region = ""
+#datacenter = ""
+#rack = ""
+
+[[cluster.initial_voters]]
+hostname = "dtfs-example-mgr02"
+addr = "10.0.0.2:9401"
+
+[[cluster.initial_voters]]
+hostname = "dtfs-example-mgr03"
+addr = "10.0.0.3:9401"
+
+[raft]
+#listen_addr = "0.0.0.0:9400"       # raft peer-to-peer listener
+#election_timeout_ms = 400
+#heartbeat_interval_ms = 150        # must be well under election_timeout_ms
+#snapshot_threshold = 10000         # applied log entries per snapshot
+#rocksdb_keep_log_file_num = 4      # Bug BP-1: cap RocksDB info-LOG retention
+#rocksdb_max_manifest_bytes = 67108864   # Bug BP-1: rotate MANIFEST at 64 MiB
+#max_in_snapshot_log_to_keep = 1000 # Bug BP-1: purge raft log behind snapshot
+#node_liveness_secs = 30            # Bug BP-3: last_seen older than this -> Suspect
+
+[grpc]
+listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
+#max_message_size_mb = 256
+
+[api]
+#listen_addr = "0.0.0.0:9402"       # REST API + WebUI
+#cors_origins = ["*"]
+
+[tls]
+#mode = "auto"                      # "auto" | "require" | "disable"
+                                    # NOTE: TLS is not implemented yet — every
+                                    # mode currently serves PLAINTEXT and logs a
+                                    # warning. Do not rely on it.
+#cert_file = "/etc/dtfs/tls/server.crt"
+#key_file = "/etc/dtfs/tls/server.key"
+#ca_file = "/etc/dtfs/tls/ca.crt"
+
+[defaults]
+# Defaults applied to the auto-created "default" volume / new volumes.
+#chunk_size_mb = 4                  # 4 MB workspace default (see config.rs rationale)
+#anchor_datacenter = "example-dc"   # Bug Z: pin >=1 replica of every chunk to
+                                    # this DC (unset = no anchor enforcement)
+
+# NOTE: if you uncomment either subsection header below you must set ALL its
+# non-defaulted fields (an empty [defaults.write_safety] table fails to parse).
+#[defaults.write_safety]
+#min_replicas_before_ack = 2        # write acks only after N replicas are durable.
+                                    # The topology must be able to HOLD N durable
+                                    # replicas (see docs: replication maintainers)
+#write_timeout_secs = 30
+
+#[defaults.replication]
+# A tier replication count only creates replicas if something maintains them:
+# mandatory_replicas (under-replication scheduler) or cache promotion
+# (tiering engine with promote_reads > 0). See docs/storage/replication.md.
+#hot = 3
+#warm = 2
+#cold = 1
+#tape = 1                           # only `tape` may be omitted individually
+
+[tiering]
+#enabled = true
+#hot_threshold_reads_per_hour = 5
+#cold_threshold_days = 14
+#frozen_threshold_days = 60         # must be > cold_threshold_days
+#migration_bandwidth_limit_mbps = 200   # 0 = unlimited
+#evaluation_interval_secs = 3600
+#enable_cache_redundancy_escalation = false  # Bug AV-4-5: ramp cache replicas
+                                             # toward max on hot chunks
+
+[monitoring]
+#heartbeat_interval_secs = 5
+#suspect_after_missed = 3
+#down_after_missed = 6              # must be > suspect_after_missed
+
+# Optional sections below — whole block may be omitted.
+
+#[alerts]
+# P1-8: webhook sinks for cluster alerts.
+#[[alerts.webhooks]]
+#url = "https://hooks.example.com/dtfs"
+#secret = ""
+#kinds = []                         # empty = all alert kinds
+#dedup_secs = 300
+
+#[audit]
+# Bug AH: replicate audit entries via raft so every manager serves the same
+# /api/v1/audit view. Enable ONLY after all managers run a binary that
+# understands AppendAudit (see config.rs deployment recipe).
+#replicate_via_raft = false
+
+#[scrub]
+# Bug BC: cluster-wide scrub + integrity policy, propagated to data nodes via
+# heartbeat (overrides their local [scrub] fallback).
+#quick_interval_secs = 21600        # 6 h: stat + size + meta presence
+#deep_interval_secs = 604800        # 7 d: full BLAKE3 verify
+#orphan_interval_secs = 86400       # 1 d: ListChunks vs chunk_locations cross-check
+#orphan_grace_secs = 86400          # 1 d: grace before reaping an orphan (vs .dat mtime, Bug CB)
+#max_io_percent = 10
+#verify_on_read = true              # hash-verify every read. Disabling needs an
+                                    # explicit API ack and is the only mode where
+                                    # reads can return corrupt bytes (A.3.3).
+#quarantine_on_fault = true         # single integrity fault -> quarantine node
+#auto_unquarantine_secs = 0         # 0 = manual unquarantine only
+
+#[placement]
+# Bug BU/BX: capacity-aware placement headroom.
+#min_free_bytes = 1073741824        # 1 GiB reserve per disk
+#min_free_pct = 5.0                 # reserve = max(min_free_bytes, total * pct%)
+#allow_capacity_spill = true        # Bug BX: spill to fastest tier with room
+                                    # instead of failing the write (anchor never
+                                    # spilled). false = fail-loud.
