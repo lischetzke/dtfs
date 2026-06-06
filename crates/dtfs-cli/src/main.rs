@@ -221,6 +221,23 @@ enum VolumesCmd {
         #[arg(long)]
         tape_replicas: Option<u32>,
     },
+    /// CF-3a — set or update the volume's `write_safety` policy
+    /// (durability-ack threshold + write timeout). Every flag is
+    /// optional; omitted flags keep the current value. The runtime
+    /// reconciliation tool for the ack threshold (otherwise only a
+    /// full volume upsert changes it).
+    SetWriteSafety {
+        /// Volume id to update.
+        volume_id: String,
+        /// Replicas that must be durable before acking a write
+        /// (must be >= 1). Default keep current.
+        #[arg(long)]
+        min_replicas_before_ack: Option<u32>,
+        /// Per-write timeout in seconds (must be >= 1). Default keep
+        /// current.
+        #[arg(long)]
+        write_timeout_secs: Option<u32>,
+    },
 }
 
 /// Bug AV (AV-3-5) — file-level commands. The legacy
@@ -394,6 +411,15 @@ async fn main() -> anyhow::Result<()> {
                 cmd_volumes_set_mandatory(
                     &api, &args.format, &volume_id,
                     hot_replicas, warm_replicas, cold_replicas, tape_replicas,
+                ).await?
+            }
+            VolumesCmd::SetWriteSafety {
+                volume_id,
+                min_replicas_before_ack, write_timeout_secs,
+            } => {
+                cmd_volumes_set_write_safety(
+                    &api, &args.format, &volume_id,
+                    min_replicas_before_ack, write_timeout_secs,
                 ).await?
             }
         },
@@ -816,6 +842,50 @@ async fn cmd_volumes_set_mandatory(
                 m["warm"].as_u64().unwrap_or(0),
                 m["cold"].as_u64().unwrap_or(0),
                 m["tape"].as_u64().unwrap_or(0),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// CF-3a — `dtfs-cli volumes set-write-safety <id>
+/// [--min-replicas-before-ack N] [--write-timeout-secs N]`:
+/// patch the volume's `write_safety`. Only supplied flags are
+/// merged; others keep current values. Server-side validation
+/// rejects zero values.
+async fn cmd_volumes_set_write_safety(
+    api: &ApiClient,
+    format: &OutputFormat,
+    volume_id: &str,
+    min_replicas_before_ack: Option<u32>,
+    write_timeout_secs: Option<u32>,
+) -> anyhow::Result<()> {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = min_replicas_before_ack
+        { body.insert("min_replicas_before_ack".into(), v.into()); }
+    if let Some(v) = write_timeout_secs
+        { body.insert("write_timeout_secs".into(), v.into()); }
+    let body = serde_json::Value::Object(body);
+
+    let url = format!("/api/v1/volumes/{}/set-write-safety", volume_id);
+    let resp = api.post(&url, &body).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => {
+            let changed = resp["changed"].as_bool().unwrap_or(false);
+            let w = &resp["config"]["write_safety"];
+            println!(
+                "Volume '{}' set-write-safety: {}",
+                volume_id,
+                if changed { "applied" } else { "no-op" },
+            );
+            println!(
+                "  min_replicas_before_ack: {}",
+                w["min_replicas_before_ack"].as_u64().unwrap_or(0),
+            );
+            println!(
+                "  write_timeout_secs:      {}",
+                w["write_timeout_secs"].as_u64().unwrap_or(0),
             );
         }
     }
