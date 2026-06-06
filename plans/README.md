@@ -36,5 +36,5 @@ The highest letter currently in `plans/active/`, plus one.
 ## What does not belong here
 
 Scratch notes → keep in the session. Code/scripts → `crates/`, `tests/`,
-`scripts/`. User-visible release notes →
-[`changelog/`](../changelog/README.md).
+`scripts/`. User-visible release notes → the PR title/description
+(GitHub auto-generates release notes from merged PRs).

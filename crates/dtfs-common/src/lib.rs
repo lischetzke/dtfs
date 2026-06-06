@@ -10,8 +10,7 @@ pub mod version;
 
 /// AZ-4 — canonical GitHub repo URL. Single source of truth for every
 /// in-tree link (WebUI footer, docs, error messages, install scripts).
-/// Repo was renamed from `lischetzke/dtfs` → `lischetzke/dtfs` per the
-/// changelog Special Requirements note.
+/// Repo was renamed from `lischetzke/dtfs` → `lischetzke/dtfs`.
 pub const REPO_URL: &str = "https://github.com/lischetzke/dtfs";
 
 /// Deterministic `u64` id from a hostname (data nodes, manager Raft peers).
