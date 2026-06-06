@@ -612,6 +612,20 @@ pub(crate) fn effective_health(
     }
 }
 
+/// CF-4c — true iff `node_id` participates in raft membership as a voter or
+/// a learner. A Manager-role node that is in neither set is registered/
+/// configured but has not actually joined the cluster (the production fsn
+/// symptom: roster showed `dtfs-fsn-mgr01 Manager Healthy` while it was an
+/// empty term-0 non-member). The nodes projection uses this to flag such a
+/// manager rather than render plain "Healthy".
+pub(crate) fn is_raft_member(
+    node_id: u64,
+    voters: &BTreeSet<u64>,
+    learners: &BTreeSet<u64>,
+) -> bool {
+    voters.contains(&node_id) || learners.contains(&node_id)
+}
+
 /// Bug BP-4 — count regular files that have no chunk bindings (realized data
 /// loss: FileMetadata stranded with zero chunks, e.g. after GC deleted
 /// orphaned chunks). Directories + symlinks legitimately have no chunks and
@@ -1017,6 +1031,13 @@ struct NodeResponse {
     /// WebUI nodes page renders alongside the QUARANTINED badge.
     #[serde(skip_serializing_if = "Option::is_none")]
     quarantine: Option<QuarantineResponse>,
+    /// CF-4c — for Manager-role rows: `Some(true)` if this node_id is a
+    /// raft voter or learner, `Some(false)` if it is configured/registered
+    /// but not in membership (the production fsn symptom — flagged
+    /// "UNJOINED" in the WebUI instead of plain "Healthy"). `None` for
+    /// data/client rows, which don't participate in raft membership.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raft_member: Option<bool>,
 }
 
 /// Bug BC-12a — quarantine projection on /api/v1/nodes rows.
@@ -1083,6 +1104,8 @@ impl NodeResponse {
                 })
                 .collect(),
             quarantine: info.quarantine.as_ref().map(QuarantineResponse::from_info),
+            // CF-4c — set by list_nodes for Manager rows; None otherwise.
+            raft_member: None,
         }
     }
 }
@@ -1096,12 +1119,15 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
 
     // Bug AX — query Raft's current leader once so we can mark whichever
     // manager NodeResponse matches. None when quorum is lost.
+    // CF-4c — same metrics snapshot yields the membership sets so a
+    // Manager row that is neither voter nor learner is flagged "unjoined"
+    // (the production fsn symptom) rather than rendered plain "Healthy".
     use openraft::async_runtime::watch::WatchReceiver;
-    let leader_id: Option<u64> = state
-        .raft
-        .metrics()
-        .borrow_watched()
-        .current_leader;
+    let metrics = state.raft.metrics().borrow_watched().clone();
+    let leader_id: Option<u64> = metrics.current_leader;
+    let membership = metrics.membership_config.membership();
+    let voter_ids: BTreeSet<u64> = membership.voter_ids().collect();
+    let learner_ids: BTreeSet<u64> = membership.learner_ids().collect();
 
     // 1. Data + manager nodes registered in Raft (have heartbeat /
     //    join records).
@@ -1117,6 +1143,10 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             r.health = format!("{eff:?}");
             if Some(*id) == leader_id {
                 r.is_leader = true;
+            }
+            // CF-4c — only Manager rows carry the membership flag.
+            if matches!(info.role, NodeRole::Manager) {
+                r.raft_member = Some(is_raft_member(*id, &voter_ids, &learner_ids));
             }
             r
         })
@@ -1187,6 +1217,10 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             build_date: synth_build_date,
             disks: Vec::new(),
             quarantine: None,
+            // CF-4c — a configured initial_voter that never actually joined
+            // raft (the production fsn case) is neither voter nor learner;
+            // surface that so the WebUI flags it "UNJOINED".
+            raft_member: Some(is_raft_member(id, &voter_ids, &learner_ids)),
         });
     }
 
@@ -1245,6 +1279,8 @@ async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeResponse
             build_date: String::new(),
             disks: Vec::new(),
             quarantine: None,
+            // CF-4c — client rows don't participate in raft membership.
+            raft_member: None,
         });
     }
 
@@ -3286,6 +3322,28 @@ mod bug_bp_tests {
         cfg.replication.tape = 1;
         assert!(!normalize_tape_replication(&mut cfg, true));
         assert_eq!(cfg.replication.tape, 1);
+    }
+}
+
+#[cfg(test)]
+mod cf_4c_raft_member_tests {
+    use super::*;
+
+    // ── CF-4c — manager raft-membership flag ────────────────────────
+    #[test]
+    fn is_raft_member_voter_or_learner() {
+        let voters: BTreeSet<u64> = [1u64, 2, 3].into_iter().collect();
+        let learners: BTreeSet<u64> = [4u64].into_iter().collect();
+        // A voter is a member.
+        assert!(is_raft_member(1, &voters, &learners));
+        // A learner is a member (fsn joins as a learner per CF-2).
+        assert!(is_raft_member(4, &voters, &learners));
+        // The production fsn symptom: configured/registered manager that is
+        // in neither set is NOT a member.
+        assert!(!is_raft_member(99, &voters, &learners));
+        // Empty membership → nobody is a member.
+        let empty = BTreeSet::new();
+        assert!(!is_raft_member(1, &empty, &empty));
     }
 }
 
