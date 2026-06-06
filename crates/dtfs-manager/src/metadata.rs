@@ -1479,14 +1479,24 @@ impl ManagerService for MetadataService {
         request: Request<CommitChunkLocationsRequest>,
     ) -> Result<Response<CommitChunkLocationsResponse>, Status> {
         let req = request.into_inner();
-        let _ = &req.volume_id; // reserved for volume-scoped policies
 
         // Reverse-look up numeric node IDs from gRPC addresses before storing.
         // `ChunkLocationEntry.node_id` must be a numeric ID string so that the
         // scheduler's `chunk_loc.node_id.parse::<u64>()` succeeds (fix #7).
-        let chunks: Vec<ChunkLocationEntry> = {
+        //
+        // CF-3b — resolve the volume's `write_safety.min_replicas_before_ack`
+        // (falling back to the manager-config default when the volume isn't
+        // registered) in the same lock scope, so the ack-floor gate below
+        // decides on a consistent snapshot.
+        let (chunks, ack_floor): (Vec<ChunkLocationEntry>, u32) = {
             let data = self.sm_data.read().await;
-            req.chunks
+            let ack_floor = data
+                .volumes
+                .get(&req.volume_id)
+                .map(|v| v.write_safety.min_replicas_before_ack)
+                .unwrap_or(self.config.defaults.write_safety.min_replicas_before_ack);
+            let chunks = req
+                .chunks
                 .into_iter()
                 .map(|c| ChunkLocationEntry {
                     chunk_index: c.chunk_index as u64,
@@ -1495,8 +1505,51 @@ impl ManagerService for MetadataService {
                     disk_id: c.disk_id,
                     size_bytes: c.size_bytes,
                 })
-                .collect()
+                .collect();
+            (chunks, ack_floor)
         }; // sm_data lock released here
+
+        // CF-3b — write-safety ack floor. The FUSE writer only commits
+        // replicas that already landed (no more are coming), so we reject
+        // here rather than wait: if any chunk in this batch has fewer than
+        // `ack_floor` distinct (node_id, disk_id) replicas, refuse the
+        // commit WITHOUT raft-writing the locations. The orphan reaper
+        // (Bug CB) reclaims the abandoned chunks on the data nodes. The
+        // gate lives at the manager boundary (defence-in-depth), NOT inside
+        // the raft state machine, so there is no snapshot-compat impact.
+        if !ack_floor_satisfied(&chunks, ack_floor) {
+            let min_committed = chunks
+                .iter()
+                .fold(
+                    std::collections::HashMap::<u64, std::collections::HashSet<(String, u32)>>::new(),
+                    |mut acc, c| {
+                        acc.entry(c.chunk_index)
+                            .or_default()
+                            .insert((c.node_id.clone(), c.disk_id));
+                        acc
+                    },
+                )
+                .values()
+                .map(|s| s.len())
+                .min()
+                .unwrap_or(0);
+            tracing::warn!(
+                path = %req.path,
+                volume = %req.volume_id,
+                ack_floor,
+                min_committed,
+                "Bug CF-3b: rejecting commit below write_safety.min_replicas_before_ack"
+            );
+            return Ok(Response::new(CommitChunkLocationsResponse {
+                success: false,
+                lease_conflict: false,
+                error: format!(
+                    "write rejected: a chunk landed {min_committed} replica(s) but volume \
+                     {} requires write_safety.min_replicas_before_ack={ack_floor}",
+                    req.volume_id
+                ),
+            }));
+        }
 
         let resp = self
             .raft_write(ClientRequest::UpdateChunkLocations {
@@ -1978,6 +2031,35 @@ pub(crate) fn chunk_placement_tier_string(tier: dtfs_common::types::DiskTier) ->
     tier.to_string()
 }
 
+/// Bug CF-3b — write-safety ack floor. Returns `true` only when EVERY
+/// chunk in the commit batch carries at least `floor` distinct
+/// `(node_id, disk_id)` replicas. The FUSE writer commits one
+/// `ChunkLocationEntry` per replica that actually landed, so the per-
+/// chunk distinct-target count is the durable replica count for that
+/// chunk at commit time. Replica identity is `(node_id, disk_id)`,
+/// never `node_id` alone (AGENTS.md A.3.4, Bug BH): two copies on one
+/// node but different disks/tiers count as two.
+///
+/// `floor <= 1` is always satisfied (a single durable copy is enough,
+/// or the gate is disabled). An empty batch is vacuously satisfied.
+/// Pure, so it is unit-tested directly.
+pub(crate) fn ack_floor_satisfied(commits: &[ChunkLocationEntry], floor: u32) -> bool {
+    if floor <= 1 {
+        return true;
+    }
+    let mut per_chunk: std::collections::HashMap<u64, std::collections::HashSet<(String, u32)>> =
+        std::collections::HashMap::new();
+    for c in commits {
+        per_chunk
+            .entry(c.chunk_index)
+            .or_default()
+            .insert((c.node_id.clone(), c.disk_id));
+    }
+    per_chunk
+        .values()
+        .all(|targets| targets.len() as u32 >= floor)
+}
+
 /// Bug AV (AV-3-2) — pure-function resolution of the
 /// `preferred_tier` hint into a concrete `(tier, replication)`
 /// pair. The placement engine uses this output instead of
@@ -2249,6 +2331,82 @@ mod bug_av_preferred_tier_tests {
         // pick_effective_tier prefers higher tiers → returns Warm.
         assert_eq!(tier, DiskTier::Warm, "legacy fallback uses replication.warm=2");
         assert_eq!(rf, 2);
+    }
+}
+
+#[cfg(test)]
+mod bug_cf_3b_ack_floor_tests {
+    //! CF-3b — pure tests for `ack_floor_satisfied`, the write-safety
+    //! ack-floor gate the manager applies in `commit_chunk_locations`.
+    use super::*;
+
+    fn entry(chunk_index: u64, node_id: &str, disk_id: u32) -> ChunkLocationEntry {
+        ChunkLocationEntry {
+            chunk_index,
+            chunk_hash: format!("hash-{chunk_index}-{node_id}-{disk_id}"),
+            node_id: node_id.to_string(),
+            disk_id,
+            size_bytes: 1,
+        }
+    }
+
+    /// floor=2, one chunk with two distinct nodes → satisfied.
+    #[test]
+    fn two_distinct_nodes_meets_floor_2() {
+        let commits = vec![entry(0, "1", 0), entry(0, "2", 0)];
+        assert!(ack_floor_satisfied(&commits, 2));
+    }
+
+    /// floor=2, one chunk with a single replica → NOT satisfied.
+    #[test]
+    fn single_replica_fails_floor_2() {
+        let commits = vec![entry(0, "1", 0)];
+        assert!(!ack_floor_satisfied(&commits, 2));
+    }
+
+    /// Bug BH identity rule: two entries on the SAME node but DIFFERENT
+    /// disk_id (a mandatory + cache replica on different tiers of one
+    /// box) count as two distinct replicas → floor=2 satisfied.
+    #[test]
+    fn same_node_two_disks_counts_as_two() {
+        let commits = vec![entry(0, "1", 0), entry(0, "1", 1)];
+        assert!(
+            ack_floor_satisfied(&commits, 2),
+            "(node,disk) identity: two disks on one node are two replicas"
+        );
+    }
+
+    /// Same node, same disk committed twice (degenerate duplicate) is
+    /// ONE distinct replica → floor=2 NOT satisfied.
+    #[test]
+    fn same_node_same_disk_dedups_to_one() {
+        let commits = vec![entry(0, "1", 0), entry(0, "1", 0)];
+        assert!(!ack_floor_satisfied(&commits, 2));
+    }
+
+    /// Multi-chunk batch: the gate is the MINIMUM across chunks. One
+    /// chunk meets floor=2, another only has 1 replica → batch fails.
+    #[test]
+    fn weakest_chunk_governs_the_batch() {
+        let commits = vec![
+            entry(0, "1", 0),
+            entry(0, "2", 0),
+            entry(1, "1", 0), // chunk 1 has only one replica
+        ];
+        assert!(
+            !ack_floor_satisfied(&commits, 2),
+            "the under-replicated chunk in the batch must fail the whole commit"
+        );
+    }
+
+    /// floor<=1 is always satisfied (single durable copy accepted, or
+    /// the gate is disabled), even for an empty batch.
+    #[test]
+    fn floor_one_or_zero_always_satisfied() {
+        assert!(ack_floor_satisfied(&[], 1));
+        assert!(ack_floor_satisfied(&[], 0));
+        assert!(ack_floor_satisfied(&[entry(0, "1", 0)], 1));
+        assert!(ack_floor_satisfied(&[entry(0, "1", 0)], 0));
     }
 }
 

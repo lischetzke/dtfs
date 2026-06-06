@@ -433,6 +433,21 @@ impl DtfsClient {
                 inner.error
             );
         }
+        // CF-3b — a non-lease-conflict `success=false` is a hard commit
+        // rejection (e.g. the write-safety ack floor was not met). The
+        // FUSE writer discards the returned bool (`?` only catches Err),
+        // so surface the rejection as an error to fail the write instead
+        // of silently acking a write the manager refused to record.
+        if !inner.success {
+            anyhow::bail!(
+                "commit_chunk_locations rejected: {}",
+                if inner.error.is_empty() {
+                    "manager declined the commit".to_string()
+                } else {
+                    inner.error
+                }
+            );
+        }
         Ok(inner.success)
     }
 

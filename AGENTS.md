@@ -94,7 +94,10 @@ drain-then-replace).
 addrs) → per chunk, stream PutChunk pieces to a tmp file on the target
 disk (no full-chunk `Vec`, see Bug I) → commit_chunk_from_tmp (rename +
 meta + WAL clear) → commit_chunk_locations (durable file entry). All
-manager steps go through Raft.
+manager steps go through Raft. CF-3b: commit_chunk_locations rejects the
+write (success=false, no Raft write) when any chunk lands fewer distinct
+`(node_id, disk_id)` replicas than the volume's
+`write_safety.min_replicas_before_ack` (`metadata::ack_floor_satisfied`).
 
 **Read:** lookup metadata (cached for ENTRY_TTL) → pick nearest healthy
 replica (location.rs distance heuristic) → stream GetChunk → optionally
