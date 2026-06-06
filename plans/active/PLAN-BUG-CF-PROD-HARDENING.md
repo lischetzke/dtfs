@@ -65,7 +65,7 @@ part-2 helper `scheduler::normalize_endpoint` existed precisely for this
 and was simply not used at this call site. Fix: extracted pure
 `plan_delete_fanout()` (groups chunks per node, normalizes endpoints),
 3 regression tests (`bug_n_fanout_*`), release case
-`tests/release/cases/42-delete-fanout-reclaims.sh` (+ QUICK_CASES).
+`tests/release/cases/49-delete-fanout-reclaims.sh` (+ QUICK_CASES).
 Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
 
 - Files: `crates/dtfs-manager/src/metadata.rs` (Bug N fan-out site),

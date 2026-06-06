@@ -159,3 +159,8 @@ listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
 #allow_capacity_spill = true        # Bug BX: spill to fastest tier with room
                                     # instead of failing the write (anchor never
                                     # spilled). false = fail-loud.
+
+#[updater]
+# AZ-5: read by `dtfs-cli update` only; the daemon ignores this block.
+#repo_url = "https://github.com/lischetzke/dtfs"
+#install_dir = "/usr/local/bin"
