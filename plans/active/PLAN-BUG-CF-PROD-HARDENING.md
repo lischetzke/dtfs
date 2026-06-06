@@ -55,7 +55,7 @@ Source: ISSUE-SCAN-2026-06-06-1550 (plans/reports/) + operator decisions
 
 ## Tasks
 
-### CF-1: delete fan-out failure — root-cause, re-dial, observability 🟦
+### CF-1: delete fan-out failure — root-cause, re-dial, observability 🟦 (CF-1a ✅)
 
 **Root cause FOUND (CF-1a, 2026-06-06):** `metadata.rs` DeleteFile fan-out
 built its endpoint as `format!("http://{}", addr)` on the registry
@@ -219,6 +219,23 @@ Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
   this session's survey; config side of the join is DONE, only CF-2
   membership remains.
 
+- 2026-06-06 CF-1a deployed + live-verified: built v0.0.0-dev
+  (20260606-151610) via wrapper from master. Tests: dtfs-common 52/52,
+  dtfs-manager 186/186 on the build host (~/dtfs2-cf, separate from the
+  operator's ~/dtfs2). Rolling deploy fsn-mgr → mgr01 → mgr02 → leader
+  mgr03; quorum stable (term 20, lag 0 on all, leader unchanged). Restart
+  also activated the [defaults.write_safety] ack=1 tomls. Live verify:
+  FUSE create+delete of /.cf1a-verify-probe → leader logged DeleteFile
+  with ZERO "Bug N" warnings (pre-fix: warn on every delete). NOTE:
+  operator mass-deleted the library pre-fix (files 112 → 3); ~238 GB of
+  leaked orphan chunks remain on the cold disk until the orphan reaper's
+  24 h mtime grace elapses — expect a large reclaim within ~2 days; do
+  not mistake it for data loss.
+
 ## Deviations
 
-- (none yet)
+- Session work rebased from stale branch bug-cb-orphan-reap onto master
+  (cherry-picks 9e051a2..0a255ce); two doc conflicts resolved by keeping
+  both sides (master's AZ-5 [updater] sections + this plan's new
+  sections). Release case renumbered 42 → 49 (master's chaos suite took
+  42-48).
