@@ -490,34 +490,41 @@ Update the cluster-wide configuration. The new configuration is written to the R
 
 ### POST /api/v1/scrub
 
-Trigger a scrub operation. See [Scrubbing](../storage/scrubbing.md) for details on scrub types and scheduling.
+Trigger an immediate cluster-wide scrub (CF-8). The request is
+raft-replicated and relayed to every data node on its next heartbeat;
+each node runs the scrub once (dedupe by `id`) and ships the result
+back, visible in `GET /api/v1/stats` (`scrub_results_by_node`,
+`last_scrub`). Send to the leader (a follower answers `503` with a
+forward hint). See [Scrubbing](../storage/scrubbing.md) for scrub
+levels and scheduling.
 
 **Request body:**
 
 ```json
 {
-  "target_type": "disk",
-  "target": "/mnt/dtfs-disk-a1b2c3d4",
-  "level": "deep"
+  "level": "quick"
 }
 ```
 
 | Field | Type | Values | Description |
 |-------|------|--------|-------------|
-| `target_type` | String | `"disk"`, `"file"`, `"chunk"`, `"all"` | What to scrub |
-| `target` | String | Path, chunk ID, or `"*"` | Specific target identifier |
-| `level` | String | `"quick"`, `"deep"` | Scrub depth |
+| `level` | String | `"quick"`, `"deep"` | Scrub depth. Default `"deep"`. |
+| `target_type` / `target` | String | only `"all"` / `"*"` | Per-target scrub is **not implemented**; any other value is rejected with `400` (pre-CF-8 the API accepted and silently ignored targets). |
 
 **Response:**
 
 ```json
 {
   "status": "accepted",
-  "target_type": "disk",
-  "target": "/mnt/dtfs-disk-a1b2c3d4",
-  "level": "deep"
+  "target_type": "all",
+  "target": "*",
+  "level": "quick",
+  "id": "0d9c2f6a-..."
 }
 ```
+
+`id` is the trigger's unique identifier; the audit row
+(`scrub.trigger.quick`) carries it.
 
 ### GET /api/v1/raft/state
 

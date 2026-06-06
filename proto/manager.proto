@@ -568,6 +568,24 @@ message HeartbeatResponse {
   // /api/v1/nodes/{id}/unquarantine + /ui/integrity) re-enables
   // writes WITHOUT requiring a `systemctl restart dtfs-data`.
   bool self_quarantine_cleared = 4;
+  // CF-8 — latest manual scrub trigger (POST /api/v1/scrub), relayed on
+  // every heartbeat while pending (it is replaced, never cleared). The
+  // data node dedupes by `id` and ignores stale requests, so repeat
+  // delivery is harmless. Absent on pre-CF-8 managers; ignored by
+  // pre-CF-8 data nodes.
+  optional ScrubRequestNow scrub_request = 5;
+}
+
+// CF-8 — one manual on-demand scrub request.
+message ScrubRequestNow {
+  // Unique per trigger (uuid); the data node runs each id at most once
+  // per process lifetime.
+  string id = 1;
+  // "quick" | "deep" (validated at the API boundary).
+  string level = 2;
+  // Trigger wall-clock (UTC ms). Requests older than the data node's
+  // staleness window are ignored (guards restart-reconnect replays).
+  uint64 requested_at_ms = 3;
 }
 
 // --- ChunkStatus ---

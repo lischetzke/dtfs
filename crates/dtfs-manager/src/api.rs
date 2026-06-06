@@ -161,6 +161,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // `cache_replicas`; omitted fields keep their current
         // values. Atomic via Raft UpsertVolume.
         .route("/api/v1/volumes/{id}/set-cache", post(set_volume_cache_endpoint))
+        // CF-3a — operator-friendly write-safety editor. Merges the
+        // supplied min_replicas_before_ack / write_timeout_secs into
+        // the volume's `write_safety`; omitted fields keep their
+        // current value. Atomic via Raft UpsertVolume. (Enforcement
+        // of the ack threshold is CF-3b.)
+        .route("/api/v1/volumes/{id}/set-write-safety", post(set_volume_write_safety_endpoint))
         // Bug AV (AV-4-1a) — operator-friendly mandatory-replica
         // editor. Mirrors set-cache shape. Rejects all-zero
         // results (would orphan the durability floor) and
@@ -1960,6 +1966,109 @@ async fn set_volume_cache_endpoint(
 }
 
 // ---------------------------------------------------------------------------
+// CF-3a — POST /api/v1/volumes/{id}/set-write-safety
+// ---------------------------------------------------------------------------
+
+/// CF-3a — request body for
+/// `POST /api/v1/volumes/{id}/set-write-safety`. Every field is
+/// optional; supplied fields are merged onto the current
+/// `write_safety`. Omitted fields keep their current value
+/// (consistent with AV-3-5's `set-cache` semantics). This is the
+/// runtime reconciliation tool for the durability-ack policy; today
+/// the only way to change it is a full volume upsert.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetWriteSafetyRequest {
+    pub min_replicas_before_ack: Option<u32>,
+    pub write_timeout_secs: Option<u32>,
+}
+
+/// CF-3a pure helper — merge a partial write_safety update onto a
+/// clone of the current volume config. Returns the updated config;
+/// the caller decides whether to Raft-write it (skip if no change).
+///
+/// Validation rules:
+/// 1. `min_replicas_before_ack >= 1` if supplied (0 means "ack
+///    before any replica is durable" which is nonsense — reject).
+/// 2. `write_timeout_secs >= 1` if supplied (a zero timeout would
+///    immediately abort every write).
+pub(crate) fn apply_set_write_safety(
+    current: &dtfs_common::types::VolumeConfig,
+    req: &SetWriteSafetyRequest,
+) -> Result<dtfs_common::types::VolumeConfig, String> {
+    let mut next = current.clone();
+
+    if let Some(v) = req.min_replicas_before_ack {
+        if v < 1 {
+            return Err(
+                "min_replicas_before_ack must be >= 1".to_string()
+            );
+        }
+        next.write_safety.min_replicas_before_ack = v;
+    }
+    if let Some(v) = req.write_timeout_secs {
+        if v < 1 {
+            return Err(
+                "write_timeout_secs must be >= 1".to_string()
+            );
+        }
+        next.write_safety.write_timeout_secs = v;
+    }
+
+    Ok(next)
+}
+
+async fn set_volume_write_safety_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(volume_id): axum::extract::Path<String>,
+    Json(body): Json<SetWriteSafetyRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    use axum::http::StatusCode;
+
+    let current = {
+        let sm = state.sm_data.read().await;
+        sm.volumes.get(&volume_id).cloned()
+    };
+    let Some(current) = current else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("volume not found: {volume_id}")})),
+        ));
+    };
+
+    let next = apply_set_write_safety(&current, &body)
+        .map_err(|e| (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e})),
+        ))?;
+
+    let changed = current != next;
+    if changed {
+        let req = ClientRequest::UpsertVolume { config: next.clone() };
+        if let Err(e) = state.raft.client_write(req).await {
+            warn!(volume = %volume_id, error = %e,
+                "set_volume_write_safety Raft write failed");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("raft write failed: {e}")})),
+            ));
+        }
+        state.audit_log.log(
+            "api", "volume.set_write_safety", &volume_id, "success",
+        );
+    } else {
+        state.audit_log.log(
+            "api", "volume.set_write_safety", &volume_id, "noop",
+        );
+    }
+
+    Ok(Json(json!({
+        "volume_id": volume_id,
+        "changed": changed,
+        "config": volume_config_to_json(&next),
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // Bug AV (AV-4-1a) — POST /api/v1/volumes/{id}/set-mandatory
 // ---------------------------------------------------------------------------
 
@@ -3688,32 +3797,69 @@ struct ScrubRequest {
     level: Option<String>,       // "quick" or "deep"
 }
 
+/// CF-8 — manual scrub trigger. Raft-replicates a `PendingScrub` so the
+/// heartbeat handler on every manager relays it to the data nodes
+/// (which dedupe by id and run the scrub immediately). Pre-CF-8 this
+/// handler wrote an audit row and dispatched nothing.
 async fn trigger_scrub(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ScrubRequest>,
-) -> Json<Value> {
-    let target_type = body.target_type.as_deref().unwrap_or("all");
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let level = body.level.as_deref().unwrap_or("deep");
+    if !matches!(level, "quick" | "deep") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("level must be \"quick\" or \"deep\", got {level:?}")})),
+        ));
+    }
+    // Per-target scrub is not implemented — be honest instead of
+    // accepting-and-ignoring a target (the pre-CF-8 behaviour).
+    let target_type = body.target_type.as_deref().unwrap_or("all");
     let target = body.target.as_deref().unwrap_or("*");
+    if target_type != "all" || target != "*" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "per-target scrub is not implemented — omit target/target_type for a full scrub of all disks"})),
+        ));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let requested_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    state
+        .raft
+        .client_write(ClientRequest::TriggerScrub {
+            id: id.clone(),
+            level: level.to_string(),
+            requested_at_ms,
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("raft write failed: {e}")})),
+            )
+        })?;
 
     state.audit_log.log(
         "api",
         &format!("scrub.trigger.{level}"),
-        &format!("{target_type}={target}"),
+        &format!("all=* id={id}"),
         "accepted",
     );
 
-    info!(
-        "Scrub triggered via API: type={}, target={}, level={}",
-        target_type, target, level
-    );
+    info!("Scrub triggered via API: level={}, id={}", level, id);
 
-    Json(json!({
+    Ok(Json(json!({
         "status": "accepted",
         "target_type": target_type,
         "target": target,
         "level": level,
-    }))
+        "id": id,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -4490,6 +4636,72 @@ mod bug_av_set_cache_tests {
         let req = SetCacheRequest::default();
         let next = apply_set_cache(&current, &req).expect("empty req is valid");
         assert_eq!(current, next);
+    }
+
+    // CF-3a — set-write-safety mirrors the set-cache merge semantics.
+
+    /// CF-3a test 1 — empty request is a no-op clone (dispatcher
+    /// detects no change and skips Raft).
+    #[test]
+    fn cf3a_set_write_safety_empty_request_is_noop() {
+        let current = legacy_volume();
+        let req = SetWriteSafetyRequest::default();
+        let next =
+            apply_set_write_safety(&current, &req).expect("empty req is valid");
+        assert_eq!(current, next);
+    }
+
+    /// CF-3a test 2 — supplied fields overwrite, omitted fields keep
+    /// their current value. Models the production reconciliation:
+    /// default volume ships with min_replicas_before_ack=2; lower it
+    /// to 1 without touching the timeout.
+    #[test]
+    fn cf3a_set_write_safety_merges_partial_update() {
+        let current = legacy_volume();
+        assert_eq!(current.write_safety.min_replicas_before_ack, 2);
+        let req = SetWriteSafetyRequest {
+            min_replicas_before_ack: Some(1),
+            write_timeout_secs: None,
+        };
+        let next =
+            apply_set_write_safety(&current, &req).expect("valid update");
+        assert_eq!(next.write_safety.min_replicas_before_ack, 1);
+        // Timeout untouched.
+        assert_eq!(next.write_safety.write_timeout_secs, 30);
+        assert_ne!(current, next, "merge changed the config");
+
+        // Both fields supplied.
+        let req2 = SetWriteSafetyRequest {
+            min_replicas_before_ack: Some(3),
+            write_timeout_secs: Some(45),
+        };
+        let next2 =
+            apply_set_write_safety(&current, &req2).expect("valid update");
+        assert_eq!(next2.write_safety.min_replicas_before_ack, 3);
+        assert_eq!(next2.write_safety.write_timeout_secs, 45);
+    }
+
+    /// CF-3a test 3 — invalid zero values are rejected at the apply
+    /// boundary (0 ack = ack before durability; 0 timeout = abort
+    /// every write).
+    #[test]
+    fn cf3a_set_write_safety_rejects_zero() {
+        let current = legacy_volume();
+        let bad_ack = SetWriteSafetyRequest {
+            min_replicas_before_ack: Some(0),
+            write_timeout_secs: None,
+        };
+        let err = apply_set_write_safety(&current, &bad_ack).unwrap_err();
+        assert!(err.contains("min_replicas_before_ack"),
+                "error names the field: {err}");
+
+        let bad_timeout = SetWriteSafetyRequest {
+            min_replicas_before_ack: None,
+            write_timeout_secs: Some(0),
+        };
+        let err = apply_set_write_safety(&current, &bad_timeout).unwrap_err();
+        assert!(err.contains("write_timeout_secs"),
+                "error names the field: {err}");
     }
 
     // Bug BZ — set-spill merges the per-volume spill exclusions + validates
