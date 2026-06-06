@@ -80,10 +80,13 @@ One entry per manager. The identity contract:
 | `addr` | `String` | *(required)* | Routable `host:port` of the peer's manager gRPC. |
 | `region`, `datacenter`, `rack` | `String` | `""` | Optional topology hints for the node table. |
 
-Adding a manager to an **existing** cluster: editing `initial_voters` alone
-does not join an already-initialized cluster — see
-[Cluster Management](../operations/cluster-management.md) for the late-join
-procedure.
+The list is consulted at **bootstrap only** — editing `initial_voters`
+alone does not join an already-initialized cluster. Late joins go through
+the online membership API (`dtfs-cli raft add-learner` / `promote` /
+`remove`) — see [Cluster Management](../operations/cluster-management.md).
+Running managers still read the list as their peer-address pool (BR-1
+self-registration, follower→leader forwarding), so keep it in sync with
+the real membership.
 
 ### Example
 

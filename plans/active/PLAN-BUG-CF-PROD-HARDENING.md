@@ -36,6 +36,10 @@ Source: ISSUE-SCAN-2026-06-06-1550 (plans/reports/) + operator decisions
 - Memory caps: data.toml `[memory]` (fsn 1024 MB, lm-data01 2048 MB,
   verified engaged) + systemd MemoryHigh/MemoryMax drop-ins on all
   manager/data/fuse units (live via set-property + persisted drop-ins).
+- CF-2 membership class (user, 2026-06-06): fsn joins as **LEARNER** with
+  full state replication — no voter promotion for now. The voter set
+  stays the 3 lm managers; the promote/remove endpoints still ship so
+  the API is complete, but production rollout stops at add-learner.
 
 ## Data-model / API changes
 
@@ -87,21 +91,25 @@ Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
 - Done when: live probe (create+delete via FUSE) produces either clean
   fan-out or audited failure + eventual orphan reap; no silent leak.
 
-### CF-2: online raft membership change + join fsn ⬜
+### CF-2: online raft membership change + join fsn 🟦
 
-- Files: `crates/dtfs-manager/src/api.rs` (routes), `metadata.rs` or new
-  `membership.rs`, `crates/dtfs-raft/src/lib.rs` (expose
-  add_learner/change_membership on the Raft handle), `dtfs-cli`.
+- Files: `crates/dtfs-manager/src/api.rs` (routes), new
+  `crates/dtfs-manager/src/membership.rs` (pure validation helpers),
+  `dtfs-cli`. (`DtfsRaft` already exposes openraft's
+  `add_learner`/`change_membership` directly — verified
+  openraft 0.10.0-alpha.17: `add_learner(id, node, blocking)`,
+  `change_membership(impl Into<ChangeMembers>, retain)`,
+  `ChangeMembers::{AddVoterIds, RemoveVoters, RemoveNodes}` — no
+  dtfs-raft changes needed.)
 - Sketch: leader-gated endpoints calling openraft `add_learner` /
   `change_membership`; map hostname→node_id via `node_id_from_hostname`;
   reject if addr unreachable or hostname collides with an existing
   non-manager node_id. Update `initial_voters` docs: list is bootstrap-only;
   runtime membership via the new API.
-- **Decision needed (user review): fsn as permanent LEARNER vs 4th
-  VOTER.** Recommendation: learner — replicates full state (fixes the
-  empty-API symptom), serves local reads, no quorum-math change (4 voters
-  = quorum 3 = still tolerates only 1 failure, gains nothing, adds a
-  WAN link to elections).
+- **Decision (user, 2026-06-06): LEARNER with full state replication.**
+  fsn replicates the full log/snapshot (fixes the empty-API symptom),
+  serves local reads; no quorum-math change. Promote/remove endpoints
+  implemented for API completeness but not applied to fsn.
 - Tests: state-machine/unit where possible; Minicluster live-verify
   (add-learner a fresh manager, watch InstallSnapshot, promote, remove);
   release case `NN-raft-add-learner.sh`.
@@ -231,6 +239,25 @@ Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
   leaked orphan chunks remain on the cold disk until the orphan reaper's
   24 h mtime grace elapses — expect a large reclaim within ~2 days; do
   not mistake it for data loss.
+
+- 2026-06-06 CF-2 implemented + lab-verified. Unit: `membership::tests`
+  5 new tests observed failing (todo! stub) then green;
+  `cargo test --release --workspace` 428 passed / 0 failed on the
+  builder. Built `20260606-170540` via wrapper; rolling-deployed
+  dtfs-manager to mini-mgr02 → mini-mgr03 → leader mini-mgr01 (quorum
+  stable throughout, term 78 unchanged, lag 0). Release case
+  `50-raft-add-learner.sh` PASS on the Minicluster — full lifecycle:
+  throwaway learner boots → bad shared_secret 403 → follower answers
+  409 + leader hint → add-learner ok → learner replicates FULL state
+  (`applied_log_lag` 0, its API serves the real cluster view — the
+  production fsn symptom) → promote → voter → remove → membership
+  restored (3 voters, no learners, no residue) → audit rows
+  `raft.add_learner`/`raft.promote`/`raft.remove` all `ok`.
+  **Production join of dtfs-fsn-mgr01 not yet executed** (deploy +
+  add-learner on dtfs-lm needs operator go; decision = learner only,
+  no promote). Incidental fix this session: `.gitattributes`
+  `*.sh text eol=lf` (e8fbab6) — the Windows-checkout CRLF worktree
+  broke the builder's shell wrappers via the tar sync.
 
 ## Deviations
 
