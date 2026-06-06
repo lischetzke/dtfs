@@ -2507,7 +2507,23 @@ const INTEGRITY_ACTIONS: &[&str] = &[
     "scrub.deep.corrupt",
     "read.integrity_fault",
     "orphan.in_state_missing",
+    // CF-1b — delete fan-out failures (Bug N): a data node was
+    // unreachable or rejected DeleteChunk, so the deleted file's chunks
+    // are orphaned until the reconciler reclaims them. Surfacing it here
+    // makes the leak visible in the WebUI integrity feed.
+    "delete.fanout_failed",
 ];
+
+/// Bug BC-12b / CF-1b — does an audit entry belong in the integrity feed?
+/// True when either the structured `action` or the legacy `summary`
+/// (state-machine-internal entries have no action field) starts with one
+/// of the `INTEGRITY_ACTIONS` prefixes. Pass `""` for `summary` on the
+/// local-ring branch, which has no summary column.
+fn action_is_integrity_fault(action: &str, summary: &str) -> bool {
+    INTEGRITY_ACTIONS
+        .iter()
+        .any(|p| action.starts_with(p) || summary.starts_with(p))
+}
 
 /// Bug BC-12b — returns all audit entries whose `action` (or, for
 /// legacy state-machine entries, `summary`) starts with one of the
@@ -2519,19 +2535,13 @@ async fn get_integrity_faults(
 ) -> Json<Vec<Value>> {
     let limit = query.limit.unwrap_or(200);
 
-    let matches_integrity = |action: &str, summary: &str| -> bool {
-        INTEGRITY_ACTIONS
-            .iter()
-            .any(|p| action.starts_with(p) || summary.starts_with(p))
-    };
-
     if state.config.audit.replicate_via_raft {
         let sm = state.sm_data.read().await;
         let entries: Vec<Value> = sm
             .audit_log
             .iter()
             .rev()
-            .filter(|e| matches_integrity(&e.action, &e.summary))
+            .filter(|e| action_is_integrity_fault(&e.action, &e.summary))
             .take(limit)
             .map(|e| {
                 let (actor, action, target, result) =
@@ -2563,7 +2573,7 @@ async fn get_integrity_faults(
             .audit_log
             .query(&filter)
             .into_iter()
-            .filter(|e| matches_integrity(&e.action, ""))
+            .filter(|e| action_is_integrity_fault(&e.action, ""))
             .take(limit)
             .map(|e| {
                 json!({
@@ -4957,5 +4967,34 @@ mod bug_bv3_data_node_count_tests {
         let any_tier = AnchorPolicy { datacenter: "dc-a".into(), required_tier: None };
         assert!(anchor_satisfied_by(&[("dc-a".into(), DiskTier::Warm)], &any_tier));
         assert!(!anchor_satisfied_by(&[("dc-b".into(), DiskTier::Cold)], &any_tier));
+    }
+}
+
+#[cfg(test)]
+mod cf1b_integrity_feed_tests {
+    use super::action_is_integrity_fault;
+
+    /// CF-1b — `delete.fanout_failed` (Bug N) must surface in the integrity
+    /// feed. The handler matches structured `action` entries (replicated
+    /// branch) via the same prefix helper, so the audit row emitted by the
+    /// metadata fan-out lands in `/api/v1/integrity/faults` and the WebUI
+    /// feed. This was red before the prefix was added to INTEGRITY_ACTIONS.
+    #[test]
+    fn delete_fanout_failed_is_integrity_fault() {
+        assert!(action_is_integrity_fault("delete.fanout_failed", ""));
+    }
+
+    /// A non-integrity action (e.g. a routine volume mutation) must NOT be
+    /// pulled into the integrity feed.
+    #[test]
+    fn unrelated_action_is_not_integrity_fault() {
+        assert!(!action_is_integrity_fault("volume.create", ""));
+    }
+
+    /// Legacy state-machine entries carry the action in the `summary`
+    /// column; the prefix match must still catch them there.
+    #[test]
+    fn matches_on_summary_when_action_empty() {
+        assert!(action_is_integrity_fault("", "delete.fanout_failed: node_addr=..."));
     }
 }
