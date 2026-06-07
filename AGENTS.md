@@ -152,7 +152,10 @@ independent replica classes:
 - `mandatory_replicas.<tier>` — protected. **Only the under-replication
   scheduler maintains them** (`scheduler::check_under_replicated`, reads
   `effective_mandatory_replicas()`); it refuses to drop below the
-  configured count.
+  configured count. Coverage counts only serviceable replicas (node not
+  Down/Failed, disk not Failed/Removed — `live_replica_tier`, Bug CH),
+  so node/disk loss surfaces as a tier deficit and backfills here; the
+  health monitor never schedules repair.
 - `cache_replicas.<tier>.{min,max}` — demand-driven, evictable. **Only
   the tiering engine creates them, and only when the promotion threshold
   fires** (`promote_reads` / `promote_window_secs`). The under-
@@ -360,12 +363,21 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   state-mutation point.
 - `dtfs-raft/src/lib.rs::ClientRequest` — command enum; a new mutation =
   new variant + new arm in apply_request.
-- `dtfs-manager/src/scheduler.rs` — migration/re-replication loop.
+- `dtfs-manager/src/scheduler.rs` — migration/re-replication loop; the
+  SOLE owner of replica repair (Bug AC leader gate + Bug CH).
   `schedule_path_migration` (operator moves), `flush_cache_for_path` +
   `plan_flush_cache` (drop cache replicas; emit cache.flush_* audit +
-  AnchorViolated on refusal), `check_under_replicated`,
+  AnchorViolated on refusal), `check_under_replicated` (counts coverage
+  via `live_replica_tier` — replicas on Down/Failed nodes or
+  Failed/Removed disks don't count, so node/disk loss backfills here),
+  `validate_task_target` (dispatch fast-fails tasks targeting
+  non-Data/dead/tier-less nodes → `migration.invalid_target` audit),
   `check_misplaced_rebalance` / `plan_excess_spill_removal` (Bug BX-5
   rebalance).
+- `dtfs-manager/src/monitor.rs` — heartbeat health detection only
+  (Bug CH): commits node-status transitions, fires NodeDown/SMART
+  alerts. MUST NOT schedule repair — the 2026-06-06 storm came from a
+  monitor-owned evacuation path (PLAN-BUG-CH).
 - `dtfs-manager/src/metadata.rs` — gRPC service; thin wrappers over
   `raft_write(ClientRequest::*)`.
 - `dtfs-manager/src/api.rs` — REST endpoints (WebUI + CLI); `get_stats`
