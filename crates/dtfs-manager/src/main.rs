@@ -454,9 +454,10 @@ async fn main() -> anyhow::Result<()> {
     // Bug CH — the monitor detects and alerts only; repair is owned by
     // the leader-gated scheduler tick (no TaskScheduler handle here).
     // Voters let it forward status commits to the leader (heartbeats
-    // land on one arbitrary manager, usually a follower).
+    // land on one arbitrary manager, usually a follower). Bug CJ — it
+    // judges liveness from replicated state, so it no longer needs the
+    // ClusterManager heartbeat map.
     let health_monitor = HealthMonitor::new(
-        cluster_mgr.clone(),
         Duration::from_secs(10),
         sm_data.clone(),
         raft.clone(),
