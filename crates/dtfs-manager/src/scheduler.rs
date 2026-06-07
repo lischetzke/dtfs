@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dtfs_common::types::{DiskTier, HealthStatus, MigrationStatus, TierReplication};
+use dtfs_common::types::{DiskStatus, DiskTier, HealthStatus, MigrationStatus, NodeRole, TierReplication};
 use dtfs_raft::state_machine::StateMachineData;
 use dtfs_raft::{ChunkLocationEntry, ClientRequest, DtfsRaft};
 use dtfs_proto::dtfs::data::data_service_client::DataServiceClient;
@@ -312,15 +312,24 @@ impl TaskScheduler {
     async fn check_under_replicated(&self, migration_state: &mut MigrationState) {
         let sm = self.state_data.read().await;
 
-        // Collect healthy nodes and their tiers.
+        // Collect healthy DATA nodes and their live tiers. Bug CH — the
+        // role filter is explicit (managers/clients register with no
+        // disks, but relying on the empty tier list alone is fragile),
+        // and a Failed/Removed disk no longer advertises its tier as a
+        // placement target.
         let healthy_nodes: Vec<(u64, Vec<DiskTier>)> = sm
             .nodes
             .iter()
             .filter(|(_, info)| {
-                info.health == HealthStatus::Healthy
+                info.role == NodeRole::Data && info.health == HealthStatus::Healthy
             })
             .map(|(id, info)| {
-                let tiers: Vec<DiskTier> = info.disks.iter().map(|d| d.tier).collect();
+                let tiers: Vec<DiskTier> = info
+                    .disks
+                    .iter()
+                    .filter(|d| !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed))
+                    .map(|d| d.tier)
+                    .collect();
                 (*id, tiers)
             })
             .collect();
@@ -354,12 +363,16 @@ impl TaskScheduler {
             }
 
             for (_idx, entries) in &by_idx {
+                // Bug CH — count a replica only when it is actually
+                // serviceable (node not Down/Failed, disk not
+                // Failed/Removed). Pre-CH the only cold replica sitting
+                // on a dead node still satisfied cold=1, so node loss
+                // was never backfilled by this (leader-gated) tick —
+                // which is what the runaway monitor evacuation path
+                // existed to paper over.
                 let tier_of = |e: &ChunkLocationEntry| -> Option<DiskTier> {
                     let nid: u64 = e.node_id.parse().ok()?;
-                    sm.nodes
-                        .get(&nid)
-                        .and_then(|n| n.disks.get(e.disk_id as usize))
-                        .map(|d| d.tier)
+                    live_replica_tier(sm.nodes.get(&nid), e.disk_id)
                 };
                 let count_on = |t: DiskTier| entries.iter().filter(|e| tier_of(e) == Some(t)).count() as u32;
 
@@ -712,6 +725,45 @@ impl TaskScheduler {
                 }
 
                 MigrationStatus::Copying => {
+                    // Bug CH — fast-fail tasks whose target can never
+                    // receive the copy (not registered / not a data node /
+                    // dead / no live disk of the task's tier). The
+                    // 2026-06-06 monitor storm persisted 36k tasks
+                    // targeting managers and the FUSE client; without
+                    // this guard each burns MAX_MIGRATION_ATTEMPTS
+                    // ReplicateChunk RPCs against e.g. a manager's raft
+                    // port. Cheap map lookup, so it runs before the
+                    // full-namespace orphan scan below. Failed entries
+                    // are pruned by the Bug AE retention window; a
+                    // genuinely missing tier is rescheduled against a
+                    // valid target by check_under_replicated.
+                    let target_check = {
+                        let sm = self.state_data.read().await;
+                        validate_task_target(sm.nodes.get(&task.target_node), task.tier)
+                    };
+                    if let Err(reason) = target_check {
+                        warn!(
+                            task_id = %task.task_id,
+                            chunk = %task.chunk_id,
+                            target = task.target_node,
+                            "Bug CH: dropping migration task with invalid target — {}",
+                            reason
+                        );
+                        task.status = MigrationStatus::Failed;
+                        task.last_error = Some(reason.to_string());
+                        task.updated_at_ms = now_ms;
+                        self.audit.log(
+                            "scheduler",
+                            "migration.invalid_target",
+                            &format!(
+                                "task={} chunk={} target={}",
+                                task.task_id, task.chunk_id, task.target_node
+                            ),
+                            reason,
+                        );
+                        continue;
+                    }
+
                     // Each tick, re-resolve the source live: pick any healthy
                     // node that currently has this chunk. This unsticks tasks
                     // that were scheduled against a node that has since gone
@@ -2845,6 +2897,256 @@ pub(crate) fn chunk_in_any_file(
     files
         .values()
         .any(|f| f.chunks.iter().any(|c| c.chunk_hash == chunk_hash))
+}
+
+// ---------------------------------------------------------------------------
+// Bug CH — node/disk-loss-aware replica accounting + dispatch target guard
+// (pure logic, unit-tested below). See PLAN-BUG-CH /
+// ISSUE-SCAN-2026-06-06-2335 for the incident these prevent.
+// ---------------------------------------------------------------------------
+
+/// Bug CH — resolve the tier of a replica row ONLY when that replica is
+/// actually serviceable: node health not Down/Failed AND backing disk not
+/// Failed/Removed. `check_under_replicated` counts coverage through this,
+/// so losing a node (or a disk) makes its chunks tier-short and the
+/// existing BX-4 backfill repairs them — replacing the monitor's deleted
+/// evacuation path as the single, leader-gated repair owner.
+///
+/// Suspect deliberately still counts: a heartbeat ≤30s overdue must not
+/// trigger a cluster-wide re-replication wave.
+#[inline]
+pub(crate) fn live_replica_tier(
+    node: Option<&dtfs_raft::NodeInfo>,
+    disk_id: u32,
+) -> Option<DiskTier> {
+    let node = node?;
+    if matches!(node.health, HealthStatus::Down | HealthStatus::Failed) {
+        return None;
+    }
+    let disk = node.disks.get(disk_id as usize)?;
+    if matches!(disk.status, DiskStatus::Failed | DiskStatus::Removed) {
+        return None;
+    }
+    Some(disk.tier)
+}
+
+/// Bug CH — dispatch-time guard: can this task's target possibly receive
+/// the copy? Err for a target that is unregistered, not a Data node,
+/// Down/Failed/Quarantined (BC: quarantined nodes are excluded from every
+/// allocation path), or without a live disk of the task's tier. Suspect
+/// targets are allowed — the normal attempt/retry machinery handles a
+/// transiently slow node.
+#[inline]
+pub(crate) fn validate_task_target(
+    node: Option<&dtfs_raft::NodeInfo>,
+    tier: DiskTier,
+) -> Result<(), &'static str> {
+    let Some(node) = node else {
+        return Err("target node not registered");
+    };
+    if node.role != NodeRole::Data {
+        return Err("target node is not a data node");
+    }
+    if matches!(
+        node.health,
+        HealthStatus::Down | HealthStatus::Failed | HealthStatus::Quarantined
+    ) {
+        return Err("target node is down/failed/quarantined");
+    }
+    let has_live_tier = node.disks.iter().any(|d| {
+        d.tier == tier && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed)
+    });
+    if !has_live_tier {
+        return Err("target node has no live disk of the task tier");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod bug_ch_live_replica_tests {
+    use super::live_replica_tier;
+    use dtfs_common::types::{DiskInfo, DiskStatus, DiskTier, HealthStatus, NodeRole};
+
+    fn disk(tier: DiskTier, status: DiskStatus) -> DiskInfo {
+        DiskInfo {
+            disk_id: 0,
+            uuid: String::new(),
+            mount_path: String::new(),
+            tier,
+            total_bytes: 0,
+            used_bytes: 0,
+            status,
+        }
+    }
+
+    fn node(health: HealthStatus, disks: Vec<DiskInfo>) -> dtfs_raft::NodeInfo {
+        dtfs_raft::NodeInfo {
+            hostname: String::new(),
+            grpc_addr: String::new(),
+            role: NodeRole::Data,
+            disks,
+            location: dtfs_common::topology::Location::new("", "", "", ""),
+            health,
+            total_capacity: 0,
+            used_capacity: 0,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    // Bug CH — a replica on a Down node must not count toward mandatory
+    // tier coverage (pre-fix: tier_of ignored health, so the only cold
+    // replica sitting on a dead node satisfied cold=1 and node loss was
+    // never repaired by the leader tick).
+    #[test]
+    fn down_node_replica_does_not_count() {
+        let n = node(HealthStatus::Down, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]);
+        assert_eq!(live_replica_tier(Some(&n), 0), None);
+    }
+
+    #[test]
+    fn failed_node_replica_does_not_count() {
+        let n = node(HealthStatus::Failed, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]);
+        assert_eq!(live_replica_tier(Some(&n), 0), None);
+    }
+
+    // Replica on a Failed/Removed disk of an otherwise healthy node is
+    // equally dead (the handle_disk_failed case, now owned by the tick).
+    #[test]
+    fn failed_disk_replica_does_not_count() {
+        let n = node(HealthStatus::Healthy, vec![disk(DiskTier::Warm, DiskStatus::Failed)]);
+        assert_eq!(live_replica_tier(Some(&n), 0), None);
+        let n = node(HealthStatus::Healthy, vec![disk(DiskTier::Warm, DiskStatus::Removed)]);
+        assert_eq!(live_replica_tier(Some(&n), 0), None);
+    }
+
+    #[test]
+    fn healthy_replica_counts() {
+        let n = node(HealthStatus::Healthy, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]);
+        assert_eq!(live_replica_tier(Some(&n), 0), Some(DiskTier::Cold));
+    }
+
+    // Suspect = heartbeat ≤30s overdue. Still counts — a transient stall
+    // must not trigger a full re-replication wave (cross-cutting
+    // invariant in PLAN-BUG-CH).
+    #[test]
+    fn suspect_node_replica_still_counts() {
+        let n = node(HealthStatus::Suspect, vec![disk(DiskTier::Warm, DiskStatus::Healthy)]);
+        assert_eq!(live_replica_tier(Some(&n), 0), Some(DiskTier::Warm));
+    }
+
+    #[test]
+    fn unknown_node_or_disk_does_not_count() {
+        assert_eq!(live_replica_tier(None, 0), None);
+        let n = node(HealthStatus::Healthy, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]);
+        assert_eq!(live_replica_tier(Some(&n), 7), None); // disk index out of range
+    }
+}
+
+#[cfg(test)]
+mod bug_ch_target_validation_tests {
+    use super::validate_task_target;
+    use dtfs_common::types::{DiskInfo, DiskStatus, DiskTier, HealthStatus, NodeRole};
+
+    fn disk(tier: DiskTier, status: DiskStatus) -> DiskInfo {
+        DiskInfo {
+            disk_id: 0,
+            uuid: String::new(),
+            mount_path: String::new(),
+            tier,
+            total_bytes: 0,
+            used_bytes: 0,
+            status,
+        }
+    }
+
+    fn node(role: NodeRole, health: HealthStatus, disks: Vec<DiskInfo>) -> dtfs_raft::NodeInfo {
+        dtfs_raft::NodeInfo {
+            hostname: String::new(),
+            grpc_addr: String::new(),
+            role,
+            disks,
+            location: dtfs_common::topology::Location::new("", "", "", ""),
+            health,
+            total_capacity: 0,
+            used_capacity: 0,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    // Bug CH — the 2026-06-06 incident left 36k tasks targeting manager
+    // and client node ids (monitor round-robin over every registered
+    // node). Dispatch must fail these in one tick, not burn
+    // MAX_MIGRATION_ATTEMPTS gRPC calls against a manager's raft port.
+    #[test]
+    fn manager_target_rejected() {
+        let n = node(NodeRole::Manager, HealthStatus::Healthy, vec![]);
+        assert!(validate_task_target(Some(&n), DiskTier::Warm).is_err());
+    }
+
+    #[test]
+    fn client_target_rejected() {
+        let n = node(NodeRole::Client, HealthStatus::Healthy, vec![]);
+        assert!(validate_task_target(Some(&n), DiskTier::Warm).is_err());
+    }
+
+    #[test]
+    fn missing_node_rejected() {
+        assert!(validate_task_target(None, DiskTier::Warm).is_err());
+    }
+
+    // Hot was hardcoded by the monitor; a data node without any hot disk
+    // can never satisfy the task's tier.
+    #[test]
+    fn data_node_without_tier_rejected() {
+        let n = node(
+            NodeRole::Data,
+            HealthStatus::Healthy,
+            vec![disk(DiskTier::Warm, DiskStatus::Healthy)],
+        );
+        assert!(validate_task_target(Some(&n), DiskTier::Hot).is_err());
+    }
+
+    #[test]
+    fn data_node_with_only_dead_disk_of_tier_rejected() {
+        let n = node(
+            NodeRole::Data,
+            HealthStatus::Healthy,
+            vec![disk(DiskTier::Warm, DiskStatus::Failed)],
+        );
+        assert!(validate_task_target(Some(&n), DiskTier::Warm).is_err());
+    }
+
+    #[test]
+    fn unhealthy_data_node_rejected() {
+        let n = node(
+            NodeRole::Data,
+            HealthStatus::Down,
+            vec![disk(DiskTier::Warm, DiskStatus::Healthy)],
+        );
+        assert!(validate_task_target(Some(&n), DiskTier::Warm).is_err());
+    }
+
+    #[test]
+    fn healthy_data_node_with_live_tier_accepted() {
+        let n = node(
+            NodeRole::Data,
+            HealthStatus::Healthy,
+            vec![disk(DiskTier::Warm, DiskStatus::Healthy)],
+        );
+        assert!(validate_task_target(Some(&n), DiskTier::Warm).is_ok());
+    }
 }
 
 #[cfg(test)]
