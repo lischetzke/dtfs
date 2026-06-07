@@ -574,6 +574,21 @@ impl ChunkStore {
     /// quick + deep scrubs that detect bit-rot. Verifying on every read
     /// burned ~40 ms per 128 MB chunk and produced no signal we didn't
     /// already get from scrub.
+    /// Bug CI follow-up — resolve a committed chunk to its on-disk `.dat`
+    /// path + size WITHOUT reading it. Replication egress streams from
+    /// this path (Bug I parity for the read side: pre-fix `replicate_to`
+    /// pulled the whole chunk into a heap `Bytes`, which under the
+    /// 2026-06-06 task storm pinned the data node at its memory cap).
+    pub fn chunk_file_path(&self, chunk_id: &ChunkId) -> Option<(std::path::PathBuf, u64)> {
+        for disk in self.disk_manager.all_disks() {
+            let dat_path = chunk_data_path(&disk.mount_path, chunk_id);
+            if let Ok(md) = std::fs::metadata(&dat_path) {
+                return Some((dat_path, md.len()));
+            }
+        }
+        None
+    }
+
     pub async fn get_chunk(&self, chunk_id: &ChunkId) -> DtfsResult<Bytes> {
         for disk in self.disk_manager.all_disks() {
             let dat_path = chunk_data_path(&disk.mount_path, chunk_id);
@@ -1249,6 +1264,37 @@ mod tests {
 
         let retrieved = store.get_chunk(&chunk_id).await.unwrap();
         assert_eq!(retrieved.as_ref(), data);
+    }
+
+    // Bug CI follow-up — replication egress streams straight from the
+    // chunk's on-disk file (Bug I parity for the read side). The path
+    // resolver must find a committed chunk and report its true size, and
+    // return None for an absent id so the caller maps it to ChunkNotFound.
+    #[tokio::test]
+    async fn chunk_file_path_resolves_committed_chunk() {
+        let (store, _tmp) = make_test_store().await;
+        let data: &[u8] = b"bug-ci-replication-streams-from-disk";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+        store
+            .put_chunk(&chunk_id, data, &volume_id, DiskTier::Hot)
+            .await
+            .unwrap();
+
+        let (path, size) = store
+            .chunk_file_path(&chunk_id)
+            .expect("committed chunk must resolve to its .dat path");
+        assert_eq!(size, data.len() as u64);
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".dat"));
+        assert!(path.exists());
+
+        let absent = ChunkId::from_bytes([9u8; 32]);
+        assert!(store.chunk_file_path(&absent).is_none());
     }
 
     // Bug BU-6 — startup reclaim removes leftover streaming *.dat.tmp

@@ -134,7 +134,11 @@ bytes must:
    Recovery scans the WAL on startup.
 4. Never delete a chunk until either a replacement replica is verified by
    the receiving data node, or the chunk's file has been unlinked at the
-   manager and policy allows it.
+   manager and policy allows it. Chunks are content-addressed and may be
+   referenced by several files (or re-created by an identical re-upload),
+   so every delete-by-id path MUST re-check at dispatch time that no live
+   file still references the id (Bug CI: `fanout_delete_allowed` in the
+   unlink fan-out; skipped ids audit as `delete.fanout_skipped_live`).
 5. Never silently downgrade replication factor — if RF=N can't be placed,
    queue migration tasks; don't accept the write at RF<N.
 6. Verify on every read and on scrub (Bug BC-8). `verify_on_read=true`
