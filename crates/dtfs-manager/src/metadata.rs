@@ -1145,7 +1145,12 @@ impl ManagerService for MetadataService {
         // cheap to clone). Pre-CF-1b these failures were journald-only,
         // which masked the ~238 GB production orphan leak (Bug N).
         let audit = self.audit.clone();
+        // Bug CI — the fan-out runs async, so a content-identical re-upload
+        // can recommit the SAME chunk ids before our DeleteChunk RPCs fire.
+        // Carry a state handle and re-check liveness per chunk at dispatch.
+        let sm_for_liveness = self.sm_data.clone();
         tokio::spawn(async move {
+            let mut skipped_live: usize = 0;
             for (addr, chunks) in by_node {
                 let mut client = match dtfs_proto::dtfs::data::data_service_client::DataServiceClient::connect(addr.clone()).await {
                     Ok(c) => c,
@@ -1168,6 +1173,21 @@ impl ManagerService for MetadataService {
                     }
                 };
                 for chunk_id in chunks {
+                    // Bug CI — skip ids a live file references RIGHT NOW.
+                    // The .dat we would have deleted is that file's replica.
+                    let still_live = {
+                        let sm = sm_for_liveness.read().await;
+                        !fanout_delete_allowed(&chunk_id, &sm.files)
+                    };
+                    if still_live {
+                        skipped_live += 1;
+                        tracing::debug!(
+                            path = %path_for_log,
+                            chunk_id = %chunk_id,
+                            "Bug CI delete fan-out: id re-referenced by a live file; skipping delete"
+                        );
+                        continue;
+                    }
                     let req = dtfs_proto::dtfs::data::DeleteChunkRequest {
                         chunk_id: chunk_id.clone(),
                     };
@@ -1198,6 +1218,23 @@ impl ManagerService for MetadataService {
                             }
                         }
                     }
+                }
+            }
+            // Bug CI — surface how many ids were spared because a live
+            // file re-referenced them (one row per unlink, not per chunk).
+            if skipped_live > 0 {
+                tracing::info!(
+                    path = %path_for_log,
+                    skipped_live,
+                    "Bug CI delete fan-out: skipped ids re-referenced by live files"
+                );
+                if let Some(audit) = &audit {
+                    audit.log(
+                        "metadata",
+                        "delete.fanout_skipped_live",
+                        &format!("path={path_for_log} skipped={skipped_live}"),
+                        "ok",
+                    );
                 }
             }
         });
@@ -2528,6 +2565,88 @@ pub(crate) fn plan_delete_fanout(
         }
     }
     by_endpoint
+}
+
+/// Bug CI — may this chunk id actually be deleted from data nodes?
+///
+/// Chunks are content-addressed: an identical re-upload (WinSCP retry of
+/// the same movie) or a second file with identical content re-creates the
+/// SAME chunk ids the unlinked file used. The unlink fan-out captures its
+/// id list at unlink time and deletes asynchronously, so by the time a
+/// DeleteChunk RPC fires, the id may belong to a LIVE file again. Deleting
+/// it then is silent data loss: the new file's location entries stay, the
+/// bytes vanish (§ A.6(4) — 2026-06-06 production lost 2840/4135 chunks of
+/// a re-uploaded library this way). The fan-out re-checks each id against
+/// CURRENT state immediately before its RPC and skips live ones; the
+/// skipped .dat simply remains (it IS the live file's replica).
+pub(crate) fn fanout_delete_allowed(
+    chunk_hash: &str,
+    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
+) -> bool {
+    !crate::scheduler::chunk_in_any_file(chunk_hash, files)
+}
+
+#[cfg(test)]
+mod bug_ci_fanout_liveness_tests {
+    use super::fanout_delete_allowed;
+    use dtfs_raft::state_machine::FileMetadata;
+    use dtfs_raft::ChunkLocationEntry;
+
+    fn file_with_chunks(path: &str, chunk_hashes: &[&str]) -> FileMetadata {
+        FileMetadata {
+            path: path.to_string(),
+            volume_id: "default".to_string(),
+            chunk_size: 4 * 1024 * 1024,
+            chunks: chunk_hashes
+                .iter()
+                .enumerate()
+                .map(|(i, h)| ChunkLocationEntry {
+                    chunk_index: i as u64,
+                    chunk_hash: (*h).to_string(),
+                    node_id: "10".to_string(),
+                    disk_id: 0,
+                    size_bytes: 4 * 1024 * 1024,
+                })
+                .collect(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+        }
+    }
+
+    // Bug CI — chunks are content-addressed, so an identical re-upload (or a
+    // second file sharing identical content) re-creates the SAME chunk ids
+    // the unlinked file used. The async delete fan-out captured its id list
+    // at unlink time; on 2026-06-06 production it swept that list WHILE the
+    // re-upload recommitted the same ids, deleting 2840 of 4135 freshly
+    // written chunks from every node (state kept the entries — silent loss).
+    // The fan-out must re-check liveness against CURRENT state per chunk at
+    // dispatch time and skip any id a live file still references.
+    #[test]
+    fn live_referenced_chunk_must_not_be_deleted() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "/media/movie-v2.mkv".to_string(),
+            file_with_chunks("/media/movie-v2.mkv", &["shared_x", "shared_y"]),
+        );
+        assert!(!fanout_delete_allowed("shared_x", &files));
+        assert!(!fanout_delete_allowed("shared_y", &files));
+    }
+
+    #[test]
+    fn unreferenced_chunk_is_deleted() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "/media/movie-v2.mkv".to_string(),
+            file_with_chunks("/media/movie-v2.mkv", &["shared_x"]),
+        );
+        assert!(fanout_delete_allowed("gone_for_real", &files));
+        let empty = std::collections::BTreeMap::new();
+        assert!(fanout_delete_allowed("anything", &empty));
+    }
 }
 
 /// Bug N / CF-1b — build the `delete.fanout_failed` audit summary. The
