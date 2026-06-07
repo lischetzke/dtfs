@@ -59,7 +59,7 @@ Source: ISSUE-SCAN-2026-06-06-1550 (plans/reports/) + operator decisions
 
 ## Tasks
 
-### CF-1: delete fan-out failure — root-cause, re-dial, observability 🟦 (CF-1a ✅)
+### CF-1: delete fan-out failure — root-cause, re-dial, observability ✅
 
 **Root cause FOUND (CF-1a, 2026-06-06):** `metadata.rs` DeleteFile fan-out
 built its endpoint as `format!("http://{}", addr)` on the registry
@@ -91,7 +91,7 @@ Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
 - Done when: live probe (create+delete via FUSE) produces either clean
   fan-out or audited failure + eventual orphan reap; no silent leak.
 
-### CF-2: online raft membership change + join fsn 🟦
+### CF-2: online raft membership change + join fsn ✅
 
 - Files: `crates/dtfs-manager/src/api.rs` (routes), new
   `crates/dtfs-manager/src/membership.rs` (pure validation helpers),
@@ -120,7 +120,7 @@ Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
 - Done when: fsn manager serves the same cluster view as the leader;
   original user symptom closed.
 
-### CF-3: enforce min_replicas_before_ack ⬜
+### CF-3: enforce min_replicas_before_ack ✅
 
 - Files: write/commit path (`dtfs-manager/src/metadata.rs`
   commit_chunk_locations / allocate path; possibly dtfs-fuse ack handling).
@@ -139,7 +139,7 @@ Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
 - Done when: configured ack floor provably gates client ack; volume
   `default` carries the intended value 1.
 
-### CF-4: observability honesty ⬜
+### CF-4: observability honesty ✅
 
 - Files: `dtfs-manager/src/api.rs` (audit ordering), `audit.rs`,
   `webui.rs` + `/api/v1/nodes` projection.
@@ -161,7 +161,7 @@ Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
 - Done when: an unjoined manager is visibly flagged; audit `limit` is
   newest-first on both branches; fan-out failures appear in the feed.
 
-### CF-5: [memory] for dtfs-manager and dtfs-fuse ⬜
+### CF-5: [memory] for dtfs-manager and dtfs-fuse ✅
 
 - Files: `dtfs-common/src/config.rs` (add `memory: MemoryConfig` to
   ManagerConfig + FuseConfig), `dtfs-manager/src/main.rs` (sampler +
@@ -220,7 +220,7 @@ Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
   ClientRequest variant must not hit an old manager via raft); old data
   nodes ignore the new heartbeat field harmlessly.
 
-### CF-7: docs truth pass — recovery/join procedures ⬜
+### CF-7: docs truth pass — recovery/join procedures ✅
 
 - Files: `docs/src/operations/backup-recovery.md` ("Single Manager
   Recovery" auto-join fiction; "Full Manager Group Recovery"
@@ -313,6 +313,26 @@ Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
   "case 03 fails pre-CF-8" leg holds by construction (pre-CF-8
   dispatches nothing → wait_for times out); not separately re-run
   against the old binary. Production gets CF-8 with its next deploy.
+
+- 2026-06-07 marker sync (housekeeping; tasks were merged by parallel
+  sessions without flipping the plan): CF-1 ✅ — CF-1b `delete.fanout_failed`
+  audit + integrity feed merged as #23 (fdca06c), closing the only open
+  CF-1 item; the fan-out path was further hardened by Bug CI (PR #28,
+  liveness re-check). CF-2 ✅ — endpoints merged as #18 (adb0845);
+  production join EXECUTED 2026-06-06 evening: dtfs-fsn-mgr01 is a raft
+  LEARNER with full state replication (live-confirmed 2026-06-07:
+  /api/v1/raft/state shows the learner caught up, applied 167671, same
+  view as the leader — original symptom closed). CF-3 ✅ — CF-3a
+  set-write-safety endpoint #21 (37f3734) + CF-3b ack-floor enforcement
+  #26 (ed632e9); gating proven live (2026-06-06 19:39Z production
+  rejections + Minicluster cases 53/54); prod volume `default` carries
+  the intended floor 1 (verified in the 2026-06-06 sweep). CF-4 ✅ —
+  4a newest-first audit #22 (2781c1a), 4b fan-out feed events with #23,
+  4c `raft_member` flag #24 (88b923b). CF-5 ✅ — #25 (ca2b066), AGENTS
+  § A.3.2 updated in-commit; NOTE: whether prod manager/fuse tomls
+  actually carry non-zero caps is still unverified live (tracked as an
+  ISSUE-SCAN-2026-06-06-2335 leftover). CF-7 ✅ — #20 (75b0f3d).
+  Remaining open in this plan: **CF-6 (TLS) only**.
 
 ## Deviations
 
