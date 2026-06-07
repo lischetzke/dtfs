@@ -217,7 +217,7 @@ impl MetadataService {
             Ok(resp) => Ok(resp.data),
             Err(e) => {
                 let msg = format!("{e}");
-                if msg.contains("forward request to") || msg.contains("ForwardToLeader") {
+                if is_forward_to_leader_err(&msg) {
                     tracing::debug!(error = %e, "heartbeat raft write: forwarding to leader");
                     self.proxy_to_leader(req).await
                 } else {
@@ -316,6 +316,78 @@ fn resolve_leader_addr(
         .iter()
         .find(|v| dtfs_common::node_id_from_hostname(&v.hostname) == leader_id)
         .map(|v| v.addr.clone())
+}
+
+/// Bug CH — classify a raft `client_write` error as openraft's
+/// ForwardToLeader rejection (a follower received the write). Shared by
+/// the Bug BL heartbeat path and the health monitor's status commits.
+pub(crate) fn is_forward_to_leader_err(msg: &str) -> bool {
+    msg.contains("forward request to") || msg.contains("ForwardToLeader")
+}
+
+/// Bug CH — commit a `ClientRequest` from ANY manager: local
+/// `client_write` when this node is the leader, `ForwardClientWrite`
+/// proxy to the leader otherwise.
+///
+/// Exists for the health monitor: data nodes heartbeat ONE arbitrary
+/// manager, so down-detection happens wherever the heartbeats land —
+/// pre-CH its `UpdateNodeStatus(down)` was a bare `client_write` that
+/// silently errored on a follower, and a node loss observed by a
+/// non-leader never committed (release case 55 caught this: the victim
+/// never showed Down when the heartbeat receiver wasn't the leader).
+/// Uncached connection per call — callers are low-rate (status
+/// transitions, 10s monitor tick at worst). The gRPC heartbeat path
+/// keeps its cached variant (`raft_write_or_forward`).
+pub(crate) async fn write_via_leader(
+    raft: &DtfsRaft,
+    voters: &[dtfs_common::config::InitialVoter],
+    req: ClientRequest,
+) -> Result<(), String> {
+    use openraft::async_runtime::watch::WatchReceiver;
+    match raft.client_write(req.clone()).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = format!("{e}");
+            if !is_forward_to_leader_err(&msg) {
+                return Err(msg);
+            }
+            let leader_id = raft
+                .metrics()
+                .borrow_watched()
+                .current_leader
+                .ok_or_else(|| "no leader to forward to".to_string())?;
+            let leader_addr = resolve_leader_addr(voters, leader_id)
+                .ok_or_else(|| format!("leader {leader_id} not in cluster.initial_voters"))?;
+            let mut client = ManagerServiceClient::connect(format!("http://{leader_addr}"))
+                .await
+                .map_err(|e| format!("connect leader {leader_addr}: {e}"))?;
+            let body =
+                serde_json::to_vec(&req).map_err(|e| format!("serialize ClientRequest: {e}"))?;
+            client
+                .forward_client_write(ForwardWriteRequest {
+                    client_request_json: body,
+                })
+                .await
+                .map_err(|e| format!("forward to leader {leader_addr}: {e}"))?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod bug_ch_forward_classify_tests {
+    use super::is_forward_to_leader_err;
+
+    // Both error shapes seen in the wild must classify as forwardable;
+    // anything else must surface as a real error.
+    #[test]
+    fn classifies_forward_errors() {
+        assert!(is_forward_to_leader_err(
+            "has to forward request to: Some(123), Some(DtfsNode { .. })"
+        ));
+        assert!(is_forward_to_leader_err("ForwardToLeader(..)"));
+        assert!(!is_forward_to_leader_err("storage error: disk full"));
+    }
 }
 
 fn tier_from_proto(s: &str) -> DiskTier {

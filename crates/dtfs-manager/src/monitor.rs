@@ -33,6 +33,11 @@ pub struct HealthMonitor {
     state_data: Arc<RwLock<StateMachineData>>,
     /// Raft handle used to commit node-status changes to the cluster state machine.
     raft: Arc<DtfsRaft>,
+    /// Bug CH — manager peers for leader-forwarding status commits.
+    /// Heartbeats land on ONE arbitrary manager, so the monitor that
+    /// detects a transition is usually a follower; a bare client_write
+    /// would silently drop the status change (case 55 regression).
+    voters: Vec<dtfs_common::config::InitialVoter>,
     /// P1-8: optional alert dispatcher. NodeDown / DiskFailed fire here.
     alerts: Option<Arc<crate::alerts::AlertDispatcher>>,
 }
@@ -43,12 +48,14 @@ impl HealthMonitor {
         check_interval: Duration,
         state_data: Arc<RwLock<StateMachineData>>,
         raft: Arc<DtfsRaft>,
+        voters: Vec<dtfs_common::config::InitialVoter>,
     ) -> Self {
         Self {
             cluster,
             check_interval,
             state_data,
             raft,
+            voters,
             alerts: None,
         }
     }
@@ -114,18 +121,24 @@ impl HealthMonitor {
     }
 
     /// Write a `UpdateNodeStatus` entry to the Raft log, committing the health
-    /// transition cluster-wide.  Errors are only at debug level because this
-    /// node may not be the Raft leader; the leader's own monitor will issue the
-    /// same write.
+    /// transition cluster-wide.
+    ///
+    /// Bug CH — committed via `write_via_leader`: heartbeats land on ONE
+    /// arbitrary manager, so the detecting monitor is usually a follower
+    /// and a bare `client_write` would silently return ForwardToLeader
+    /// (pre-CH the status change then never committed unless the
+    /// heartbeat receiver happened to be the leader — caught by release
+    /// case 55). Failures stay at debug: with no leader at all there is
+    /// nobody to commit to, and the next 10s tick retries.
     async fn update_node_status_in_raft(&self, node_id: u64, status: &str) {
         let req = ClientRequest::UpdateNodeStatus {
             node_id,
             status: status.to_string(),
         };
-        match self.raft.client_write(req).await {
-            Ok(_) => info!("Committed UpdateNodeStatus({}, {}) to Raft", node_id, status),
+        match crate::metadata::write_via_leader(&self.raft, &self.voters, req).await {
+            Ok(()) => info!("Committed UpdateNodeStatus({}, {}) to Raft", node_id, status),
             Err(e) => debug!(
-                "Could not write UpdateNodeStatus to Raft (may not be leader): {}",
+                "Could not write UpdateNodeStatus to Raft (no leader reachable?): {}",
                 e
             ),
         }

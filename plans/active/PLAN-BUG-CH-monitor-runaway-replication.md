@@ -106,7 +106,7 @@ action string: `migration.invalid_target` (same family as Bug AE's
 - Done when: `dtfs-manager` builds; no `schedule_replication` caller
   left outside scheduler.rs + tiering.rs.
 
-### CH-1-4: release-suite case 🟥
+### CH-1-4: release-suite case ✅
 
 - Files: `tests/release/cases/55-node-down-no-task-storm.sh`
 - Sketch: on the release cluster — stop one data node's dtfs-data;
@@ -125,6 +125,24 @@ action string: `migration.invalid_target` (same family as Bug AE's
 - Sketch: note monitor = detection/alerts only, scheduler tick = sole
   repair owner (extends Bug AC), and the live-replica counting rule.
 - Done when: same commit as code.
+
+### CH-1-6: status commits forward to the leader ✅
+
+- (Added 2026-06-07 after case 55 exposed it — see Deviations.)
+- Files: `crates/dtfs-manager/src/metadata.rs`,
+  `crates/dtfs-manager/src/monitor.rs`, `crates/dtfs-manager/src/main.rs`
+- Sketch: data nodes heartbeat ONE arbitrary manager, so down-detection
+  usually happens on a follower; the monitor's UpdateNodeStatus was a
+  bare client_write that silently errored with ForwardToLeader and the
+  transition never committed (pre-CH this was masked only when the
+  receiver happened to be the leader). New shared
+  `metadata::write_via_leader` (local write or ForwardClientWrite proxy
+  — same Bug BL mechanism the heartbeat writes use) +
+  `is_forward_to_leader_err` classifier; monitor carries
+  `cluster.initial_voters` for leader resolution.
+- Tests: `bug_ch_forward_classify_tests` (both wild error shapes
+  classify, real errors do not); release case 55 wait_for-Down leg.
+- Done when: case 55 passes with the victim reported Down via the API.
 
 ## Cross-cutting invariants
 
@@ -155,16 +173,40 @@ action string: `migration.invalid_target` (same family as Bug AE's
   poll1=0 poll2=0 victim=mini-data02`; the old monitor only storms for
   a down-node chunk with a surviving second replica as source, and the
   victim held single-replica chunks only. Victim selection strengthened
-  (max used_capacity data node). Run against a FIXED cluster blocked:
-  auto-mode denied the binary deploy + restart on the shared
-  Minicluster — queued for the next user-approved deploy window /
-  release-gate run.
+  (max used_capacity data node).
+- 2026-06-07 CH-1-4 + CH-1-6 (user approved the Minicluster deploy):
+  deployed build 20260607-095429 to mini-mgr01..03 leader-last →
+  re-election ok (leader mini-mgr03 term 94, lag 0). Case 55 run #2:
+  STATUS: FAIL — `wait_for: victim node reported Down did not become
+  true in 90s`. Journals: mini-mgr02 (follower, heartbeat receiver)
+  logged `Node 5195573662920911622 is DOWN` every 10s but never
+  `Committed UpdateNodeStatus` — the monitor's bare client_write errors
+  ForwardToLeader on a follower and the commit was dropped (latent
+  pre-CH flaw, masked while receiver == leader). Implemented CH-1-6;
+  crate suite 221 passed 0 failed on builder; redeployed build
+  20260607-100809. Case 55 run #3: STATUS: PASS (`chunks=38 baseline=0
+  poll1=0 poll2=0 victim=mini-data02`), victim reported Down within the
+  window and recovered Healthy after cleanup; migrations count 0.
+- 2026-06-07 CH-1-6 residual: in the PASS run the heartbeat receiver
+  was again the leader (mini-mgr03), so write_via_leader's LOCAL branch
+  is live-proven; the FORWARD branch is proven by unit test +
+  composition (identical ForwardClientWrite path Bug BL uses for every
+  follower-received heartbeat write in production). A targeted
+  receiver≠leader live test required stopping a manager (quorum
+  reduction on the shared lab) — denied by auto-mode; left for the
+  next release-gate run.
+- 2026-06-07 storm-leg caveat: on this Minicluster data shape the
+  pre-fix monitor did not storm (victim chunks lacked a surviving
+  second replica as copy source), so case 55's storm assertions
+  gate regressions but the FAIL leg was demonstrated via the
+  detection assertion instead.
 
 ## Deviations
 
-- B.3 per-task "deploy + live-verify" deferred: the auto-mode classifier
-  denied installing/restarting binaries on the shared Minicluster (and
-  production dtfs-lm requires explicit user approval per standing
-  instruction). Code-level verification is complete on the builder;
-  operational verification (case 55 on a fixed cluster + prod recovery)
-  awaits the user's deploy approval.
+- 2026-06-07: user approved the Minicluster deploy; CH-1-4 live-verified
+  there (see log). Production deploy explicitly deferred by the user
+  ("create PR only, more things to do for release v0.1.3") — prod
+  recovery + the 36k-task drain happen with the v0.1.3 rollout.
+- 2026-06-07: case 55 exposed a latent detection flaw (status commits
+  dropped on follower receivers) → task CH-1-6 added mid-plan. Flagged
+  to the user in the session summary; lands in the same PR (#27).
