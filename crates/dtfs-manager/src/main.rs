@@ -451,10 +451,11 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Health monitor background task ---
 
+    // Bug CH — the monitor detects and alerts only; repair is owned by
+    // the leader-gated scheduler tick (no TaskScheduler handle here).
     let health_monitor = HealthMonitor::new(
         cluster_mgr.clone(),
         Duration::from_secs(10),
-        task_scheduler.clone(),
         sm_data.clone(),
         raft.clone(),
     )
