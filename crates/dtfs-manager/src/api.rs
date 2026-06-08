@@ -217,7 +217,11 @@ pub async fn run_api_server(
 
     let app = build_router(state);
 
-    let listener = tokio::net::TcpListener::bind(&config.api.listen_addr).await?;
+    // Bug CK — clear, typed bind error (e.g. Tailscale interface not up at
+    // boot → EADDRNOTAVAIL) so the failure propagates to a non-zero exit.
+    let listener = tokio::net::TcpListener::bind(&config.api.listen_addr)
+        .await
+        .map_err(|e| crate::bind_error("REST API", &config.api.listen_addr, e))?;
     tracing::info!("Manager REST API listening on {}", config.api.listen_addr);
 
     // Bug U — graceful shutdown: existing connections finish, no new ones accepted.
