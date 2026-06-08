@@ -122,6 +122,81 @@ ping <other-manager>
 - Increase `raft.election_timeout_ms` (default: 400ms) if the network has variable latency.
 - Ensure NTP is configured and clock skew is minimal.
 
+### Service Does Not Start After a Reboot (bind address not available)
+
+**Symptoms:** After a reboot, `dtfs-manager` (or `dtfs-data` / `dtfs-fuse`) is
+not running even though it is `enabled`. The boot-time log shows the process
+started, failed to bind, and exited:
+
+```text
+INFO  dtfs_manager::server: Manager gRPC server listening on 100.x.y.z:9401
+ERROR dtfs_manager: gRPC server: bind interface is not available / bind
+      address cannot be found — the network interface may not be up yet
+      (e.g. Tailscale not connected at boot) (addr=100.x.y.z:9401): ...
+```
+
+Affected nodes are inconsistent across a rolling reboot — some come up, some
+do not — because the failure is a timing race.
+
+**Cause:** the daemon binds its listener to a specific overlay-network address
+(e.g. its Tailscale `100.x` IP). `network-online.target`, which the unit waits
+on, only covers the primary interface — the Tailscale interface and its
+address are brought up later, asynchronously by `tailscaled`. If the daemon
+starts before the address is assigned, the bind fails with `EADDRNOTAVAIL`.
+
+> Note: `After=tailscaled.service` alone does **not** fix this — it waits for
+> the tailscaled *process* to start, not for the tailnet to be *connected* and
+> the address assigned. There is no stock systemd target for "Tailscale
+> connected".
+
+On current builds the daemon exits **non-zero** on a bind failure, so
+`Restart=on-failure` retries automatically until the interface is up — the
+node self-heals within `RestartSec`. On older builds the daemon exited `0`
+(treated by systemd as success), so it never retried and stayed down until a
+manual `systemctl start`.
+
+**Diagnosis:**
+
+```bash
+# Is the unit enabled but inactive after boot?
+systemctl is-enabled dtfs-manager; systemctl is-active dtfs-manager
+
+# Find the failed first-start in this boot's log
+journalctl -u dtfs-manager -b | grep -iE "bind|transport error|listening|exited"
+
+# Confirm the bound address belongs to the overlay interface, and whether
+# it was assigned yet at the service start time
+tailscale ip -4
+ip -4 addr show
+```
+
+**Resolution:**
+
+1. Immediate: `systemctl start dtfs-manager` (the address is up by now).
+2. Permanent — gate startup on the interface being connected, via a drop-in so
+   it survives package upgrades:
+
+   ```ini
+   # /etc/systemd/system/dtfs-manager.service.d/10-wait-tailscale.conf
+   [Unit]
+   After=tailscaled.service
+   Wants=tailscaled.service
+
+   [Service]
+   # Block until this node has a Tailscale IPv4 (bounded so a never-connected
+   # tailnet fails the start instead of hanging; Restart=on-failure then retries)
+   ExecStartPre=/usr/bin/timeout 60 sh -c 'until tailscale ip -4 >/dev/null 2>&1; do sleep 1; done'
+   ```
+
+   Then `systemctl daemon-reload`. Apply the same drop-in (adjusting the unit
+   name) to `dtfs-data` and `dtfs-fuse@*`, which bind `:9500` / the mount on the
+   same overlay address. Verify the `tailscale` binary path with
+   `command -v tailscale` and adjust if it is not `/usr/bin/tailscale`.
+3. Alternative: bind to a wildcard address (`0.0.0.0:9401`) in the daemon
+   config so startup does not depend on a specific overlay address. Only do
+   this where the listening ports are otherwise firewalled to the overlay
+   (the reference deployment exempts `9401`/`9402`/`9500` on the tailnet).
+
 ### FUSE Client Cannot Connect
 
 **Symptoms:** FUSE mount fails or shows errors when accessing files.
