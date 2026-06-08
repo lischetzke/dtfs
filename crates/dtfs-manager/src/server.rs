@@ -340,7 +340,9 @@ pub async fn run_grpc_server(
     raft: Arc<DtfsRaft>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let addr = config.grpc.listen_addr.parse()?;
+    let addr: std::net::SocketAddr = config.grpc.listen_addr.parse().map_err(|e| {
+        anyhow::anyhow!("invalid grpc.listen_addr '{}': {e}", config.grpc.listen_addr)
+    })?;
 
     if !config.tls.mode.eq_ignore_ascii_case("disabled")
         && !config.tls.mode.eq_ignore_ascii_case("off")
@@ -355,6 +357,16 @@ pub async fn run_grpc_server(
         handler: RaftTransportHandler::new(raft),
     };
 
+    // Bug CK — bind the listener explicitly BEFORE logging "listening", so a
+    // failure (e.g. the Tailscale interface not up yet at boot →
+    // EADDRNOTAVAIL) surfaces as a clear, typed error that propagates to
+    // `main` and forces a non-zero exit (systemd then retries). Pre-CK
+    // tonic bound internally, the failure was a generic "transport error",
+    // and the "listening" line was logged even when the bind then failed.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| crate::bind_error("gRPC", addr, e))?;
+
     tracing::info!("Manager gRPC server listening on {}", addr);
 
     // Bug U — stop accepting new connections when the shutdown signal fires.
@@ -363,7 +375,10 @@ pub async fn run_grpc_server(
     Server::builder()
         .add_service(ManagerServiceServer::new(metadata_service))
         .add_service(raft_svc)
-        .serve_with_shutdown(addr, shutdown)
+        .serve_with_incoming_shutdown(
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            shutdown,
+        )
         .await?;
 
     Ok(())

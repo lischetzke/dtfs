@@ -539,29 +539,40 @@ async fn main() -> anyhow::Result<()> {
     //   - SIGTERM/SIGINT triggers shutdown → both servers exit via graceful
     //     shutdown → we proceed to cleanup.
     //   - A background task panics → log and bail.
+    // Bug CK — track whether we are stopping because of a FAILURE (a server
+    // returned an error / a background task died unexpectedly) versus a
+    // graceful shutdown signal. A graceful stop has the servers return
+    // Ok(Ok(())) after the signal fires. Any other arm here means something
+    // broke — most importantly a startup bind failure (Tailscale interface
+    // not up yet at boot) — and the process MUST exit non-zero so systemd's
+    // Restart=on-failure retries instead of treating exit 0 as success.
+    let mut server_failed = false;
     tokio::select! {
         result = grpc_handle => {
             match result {
                 Ok(Ok(())) => tracing::info!("gRPC server stopped"),
-                Ok(Err(e)) => tracing::error!(error = %e, "gRPC server returned error"),
-                Err(e) => tracing::error!(error = %e, "gRPC server task panicked"),
+                Ok(Err(e)) => { tracing::error!(error = %e, "gRPC server returned error"); server_failed = true; }
+                Err(e) => { tracing::error!(error = %e, "gRPC server task panicked"); server_failed = true; }
             }
         }
         result = api_handle => {
             match result {
                 Ok(Ok(())) => tracing::info!("API server stopped"),
-                Ok(Err(e)) => tracing::error!(error = %e, "API server returned error"),
-                Err(e) => tracing::error!(error = %e, "API server task panicked"),
+                Ok(Err(e)) => { tracing::error!(error = %e, "API server returned error"); server_failed = true; }
+                Err(e) => { tracing::error!(error = %e, "API server task panicked"); server_failed = true; }
             }
         }
         _ = monitor_handle => {
             tracing::error!("Health monitor exited unexpectedly");
+            server_failed = true;
         }
         _ = scheduler_handle => {
             tracing::error!("Task scheduler exited unexpectedly");
+            server_failed = true;
         }
         _ = tiering_handle => {
             tracing::error!("Tiering engine exited unexpectedly");
+            server_failed = true;
         }
     }
 
@@ -599,6 +610,18 @@ async fn main() -> anyhow::Result<()> {
         &config.node.hostname,
         "clean",
     );
+
+    // Bug CK — if we got here because a server/background task FAILED (not a
+    // graceful signal), exit non-zero AFTER the best-effort cleanup above so
+    // systemd restarts us. The common case is a boot-time bind race against
+    // the Tailscale interface, which self-heals on the next retry.
+    if server_failed {
+        tracing::error!(
+            "DTFS manager exiting non-zero after a server/background-task failure \
+             (systemd Restart=on-failure will retry)"
+        );
+        std::process::exit(1);
+    }
 
     tracing::info!("DTFS manager exited cleanly");
     Ok(())
@@ -853,4 +876,55 @@ async fn maybe_recover_poisoned_raft_state(
         "Bug AC poisoned raft state moved to backup; fresh state will be initialized + snapshot-installed from leader"
     );
     Ok(())
+}
+
+/// Bug CK — operator-facing error for a server listener that cannot bind.
+///
+/// Production trigger: a manager starts at boot before its Tailscale
+/// interface is up, so the configured bind address (`100.x:9401`) is not
+/// yet assigned → `EADDRNOTAVAIL`. Pre-CK the manager logged a generic
+/// "transport error" and exited 0; with `Restart=on-failure` systemd
+/// treated that as success and never retried, so the node had no manager
+/// until a manual start. Now the bind failure is surfaced clearly and
+/// propagated so the process exits non-zero (see `main`'s server-failure
+/// path) and systemd retries until the interface is ready.
+pub(crate) fn bind_error(
+    role: &str,
+    addr: impl std::fmt::Display,
+    e: std::io::Error,
+) -> anyhow::Error {
+    use std::io::ErrorKind;
+    let hint = match e.kind() {
+        ErrorKind::AddrNotAvailable => {
+            "bind interface is not available / bind address cannot be found — \
+             the network interface may not be up yet (e.g. Tailscale not connected at boot)"
+        }
+        ErrorKind::AddrInUse => "bind address is already in use — another process holds this port",
+        _ => "cannot bind listener to the configured address",
+    };
+    anyhow::anyhow!("{role} server: {hint} (addr={addr}): {e}")
+}
+
+#[cfg(test)]
+mod bug_ck_bind_error_tests {
+    use super::bind_error;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn addr_not_available_message_is_clear() {
+        let msg = bind_error("gRPC", "100.64.0.1:9401", Error::from(ErrorKind::AddrNotAvailable))
+            .to_string();
+        assert!(msg.contains("not available"), "{msg}");
+        assert!(msg.contains("bind address cannot be found"), "{msg}");
+        assert!(msg.contains("interface"), "{msg}");
+        assert!(msg.contains("100.64.0.1:9401"), "{msg}");
+    }
+
+    #[test]
+    fn addr_in_use_is_distinct() {
+        let msg =
+            bind_error("REST API", "0.0.0.0:9402", Error::from(ErrorKind::AddrInUse)).to_string();
+        assert!(msg.contains("already in use"), "{msg}");
+        assert!(msg.contains("REST API"), "{msg}");
+    }
 }
