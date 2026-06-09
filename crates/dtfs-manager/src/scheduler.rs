@@ -30,6 +30,31 @@ const SCHEDULER_TICK: Duration = Duration::from_secs(30);
 /// exhaustion the task is moved to Failed and an audit entry recorded (P0-4).
 const MAX_MIGRATION_ATTEMPTS: u32 = 6;
 
+/// U3 — bound on concurrent `ReplicateChunk` RPCs dispatched per
+/// `advance_tasks` round. Pre-U3 the Copying branch awaited each
+/// `replicate_chunk` inline and serially, so a large backlog (e.g. 1195
+/// chunks @ ~1.6s each) spent a whole ~30 min pass just copying and only
+/// verified/completed on the NEXT pass — warm coverage stayed flat then
+/// batch-jumped. We now drive a chunk through Pending -> Copying ->
+/// Verifying -> Completing -> Done within a SINGLE tick (round loop) and
+/// fan the per-task copies out `buffer_unordered`-style up to this cap.
+/// Kept deliberately small: each copy is a streaming gRPC that competes
+/// with foreground put_chunk traffic on the source data node (Bug AF), and
+/// the target archive link is the asymmetric-bandwidth bottleneck (LELI
+/// ≤40 Mbps, § A.1/A.7). 6 in-flight copies saturate the slow links
+/// without starving foreground reads/writes. Verify/Completing stay serial
+/// (cheap, and Completing writes Raft).
+const MIGRATION_COPY_CONCURRENCY: usize = 6;
+
+/// U3 — hard cap on `advance_tasks` rounds within one tick. The round loop
+/// normally terminates when a pass makes no progress; this cap is a
+/// belt-and-braces guard against an unforeseen oscillation (e.g. a chunk
+/// flapping Verifying -> Copying) monopolising the tick. A healthy task
+/// needs at most 4 transitions (Pending -> Copying -> Verifying ->
+/// Completing -> Done), so 8 rounds clears a steady backlog while bounding
+/// the worst case.
+const MAX_ADVANCE_ROUNDS: usize = 8;
+
 /// A replication task tracked by the scheduler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationTask {
@@ -701,422 +726,14 @@ impl TaskScheduler {
     async fn advance_tasks(&self, state: &mut MigrationState) {
         let now_ms = now_millis();
 
-        let task_ids: Vec<String> = state.tasks.keys().cloned().collect();
-
-        for task_id in task_ids {
-            let task = match state.tasks.get_mut(&task_id) {
-                Some(t) => t,
-                None => continue,
-            };
-
-            match task.status {
-                MigrationStatus::Pending => {
-                    // Transition to Copying — reset the attempt counter for
-                    // the new state.
-                    info!(
-                        task_id = %task.task_id,
-                        chunk = %task.chunk_id,
-                        "Migration: Pending -> Copying"
-                    );
-                    task.status = MigrationStatus::Copying;
-                    task.attempts = 0;
-                    task.last_error = None;
-                    task.updated_at_ms = now_ms;
-                }
-
-                MigrationStatus::Copying => {
-                    // Bug CH — fast-fail tasks whose target can never
-                    // receive the copy (not registered / not a data node /
-                    // dead / no live disk of the task's tier). The
-                    // 2026-06-06 monitor storm persisted 36k tasks
-                    // targeting managers and the FUSE client; without
-                    // this guard each burns MAX_MIGRATION_ATTEMPTS
-                    // ReplicateChunk RPCs against e.g. a manager's raft
-                    // port. Cheap map lookup, so it runs before the
-                    // full-namespace orphan scan below. Failed entries
-                    // are pruned by the Bug AE retention window; a
-                    // genuinely missing tier is rescheduled against a
-                    // valid target by check_under_replicated.
-                    let target_check = {
-                        let sm = self.state_data.read().await;
-                        validate_task_target(sm.nodes.get(&task.target_node), task.tier)
-                    };
-                    if let Err(reason) = target_check {
-                        warn!(
-                            task_id = %task.task_id,
-                            chunk = %task.chunk_id,
-                            target = task.target_node,
-                            "Bug CH: dropping migration task with invalid target — {}",
-                            reason
-                        );
-                        task.status = MigrationStatus::Failed;
-                        task.last_error = Some(reason.to_string());
-                        task.updated_at_ms = now_ms;
-                        self.audit.log(
-                            "scheduler",
-                            "migration.invalid_target",
-                            &format!(
-                                "task={} chunk={} target={}",
-                                task.task_id, task.chunk_id, task.target_node
-                            ),
-                            reason,
-                        );
-                        continue;
-                    }
-
-                    // Each tick, re-resolve the source live: pick any healthy
-                    // node that currently has this chunk. This unsticks tasks
-                    // that were scheduled against a node that has since gone
-                    // Down (fix for F-015 — the previous code retried the
-                    // originally-pinned source forever, even when other
-                    // replicas were healthier).
-                    //
-                    // P0-4: after MAX_MIGRATION_ATTEMPTS failed ticks (≈ 3 min
-                    // at 30s tick), give up and mark Failed so an operator
-                    // gets paged via the audit log + alerting pipeline rather
-                    // than the task lingering forever.
-                    //
-                    // Bug AE — before any retry, verify the chunk_id still
-                    // exists in some file's chunks list. After a data-node
-                    // disk wipe (or operator unlink + GC), the original
-                    // file is gone but the migration task lingers in
-                    // migration_state_json forever. resolve_healthy_source
-                    // returns None → "no healthy source replica" → 6
-                    // retries over 3 min → Failed. With 125+ such orphans
-                    // every 30s tick spams the logs AND hammers data nodes
-                    // with ReplicateChunk("Chunk not found") that's pure
-                    // load. Drop these immediately (no retries) and let
-                    // the prune step below garbage-collect them.
-                    if !self.chunk_exists_anywhere(&task.chunk_id).await {
-                        let reason = "chunk no longer exists (orphan task from \
-                                      pre-wipe or unlinked file)";
-                        warn!(
-                            task_id = %task.task_id,
-                            chunk = %task.chunk_id,
-                            "Bug AE: dropping orphan migration task — {}",
-                            reason
-                        );
-                        task.status = MigrationStatus::Failed;
-                        task.last_error = Some(reason.to_string());
-                        task.updated_at_ms = now_ms;
-                        self.audit.log(
-                            "scheduler",
-                            "migration.orphan_dropped",
-                            &format!("task={} chunk={}", task.task_id, task.chunk_id),
-                            reason,
-                        );
-                        continue;
-                    }
-
-                    let target_addr = self.node_grpc_addr(task.target_node).await;
-                    // Bug BO-1: for a same-node cross-tier anchor copy, don't
-                    // exclude the target — it IS the only holder of the chunk
-                    // (on its other tier), and excluding it strands the copy.
-                    let exclude = anchor_copy_source_exclude(task.source_node, task.target_node);
-                    let resolved_source = self
-                        .resolve_healthy_source(&task.chunk_id, exclude)
-                        .await;
-
-                    let outcome: Result<(), String> = match (resolved_source, target_addr) {
-                        (Some((src_node, src_addr)), Some(tgt_addr)) => {
-                            if src_node != task.source_node {
-                                info!(
-                                    task_id = %task.task_id,
-                                    chunk = %task.chunk_id,
-                                    old_src = task.source_node,
-                                    new_src = src_node,
-                                    "Re-replication: source moved to a healthier replica",
-                                );
-                                task.source_node = src_node;
-                            }
-                            let chunk_id = task.chunk_id.clone();
-                            let tier_str = task.tier.to_string();
-                            match self.replicate_chunk(&src_addr, &chunk_id, &tgt_addr, &tier_str).await {
-                                Ok(()) => {
-                                    info!(
-                                        task_id = %task.task_id,
-                                        chunk = %chunk_id,
-                                        src = %src_addr,
-                                        dst = %tgt_addr,
-                                        "Migration: Copying -> Verifying (ReplicateChunk OK)"
-                                    );
-                                    task.status = MigrationStatus::Verifying;
-                                    task.attempts = 0;
-                                    task.last_error = None;
-                                    task.updated_at_ms = now_ms;
-                                    continue;
-                                }
-                                Err(e) => Err(format!("ReplicateChunk error: {e}")),
-                            }
-                        }
-                        (None, _) => Err("no healthy source replica".to_string()),
-                        (_, None) => Err(format!(
-                            "target node {} unresolvable",
-                            task.target_node
-                        )),
-                    };
-
-                    if let Err(reason) = outcome {
-                        task.attempts = task.attempts.saturating_add(1);
-                        task.last_error = Some(reason.clone());
-                        task.updated_at_ms = now_ms;
-
-                        // Bug AF — when the source data node specifically
-                        // reports "Chunk not found", the bytes are gone
-                        // from THAT node (disk wipe, fs reset, manual rm,
-                        // etc.). resolve_healthy_source still returns the
-                        // same node next tick because the file metadata
-                        // hasn't been updated to remove it as a replica.
-                        // Without a fast-fail, the scheduler retries this
-                        // identical RPC every 30s × MAX_MIGRATION_ATTEMPTS
-                        // (= 3 min), and each RPC opens a streaming gRPC
-                        // to the source — which hammers the data node and
-                        // contends with foreground put_chunk traffic from
-                        // FUSE clients. On Plexmedia 4h soak v2 (verified
-                        // 2026-05-19 07:30 UTC) this contention pushed the
-                        // 60s put_chunk RPC timeout, causing every write
-                        // to fail and FUSE to "unlink ghost entry" all
-                        // newly-created files.
-                        //
-                        // Promote "Chunk not found" to instant-Failed.
-                        // The 30-min Failed retention window keeps the
-                        // task visible for operator inspection; the prune
-                        // step clears it once an audit-driven action is
-                        // taken (manual unlink, scrub, or restore from
-                        // off-cluster backup).
-                        if rpc_error_indicates_chunk_missing(&reason) {
-                            task.attempts = MAX_MIGRATION_ATTEMPTS;
-                        }
-                        if task.attempts >= MAX_MIGRATION_ATTEMPTS {
-                            warn!(
-                                task_id = %task.task_id,
-                                chunk = %task.chunk_id,
-                                attempts = task.attempts,
-                                reason = %reason,
-                                "Migration: Copying -> Failed (max attempts exhausted)"
-                            );
-                            task.status = MigrationStatus::Failed;
-                            self.audit.log(
-                                "scheduler",
-                                "migration.failed",
-                                &format!(
-                                    "task={} chunk={} attempts={}",
-                                    task.task_id, task.chunk_id, task.attempts
-                                ),
-                                &reason,
-                            );
-                            if let Some(alerts) = self.alerts.read().clone() {
-                                alerts.fire(
-                                    crate::alerts::AlertKind::MigrationFailed,
-                                    "migration task exhausted retries",
-                                    serde_json::json!({
-                                        "task_id": task.task_id,
-                                        "chunk_id": task.chunk_id,
-                                        "attempts": task.attempts,
-                                        "reason": reason,
-                                        "source_node": task.source_node,
-                                        "target_node": task.target_node,
-                                    }),
-                                );
-                            }
-                        } else {
-                            warn!(
-                                task_id = %task.task_id,
-                                chunk = %task.chunk_id,
-                                attempt = task.attempts,
-                                max = MAX_MIGRATION_ATTEMPTS,
-                                reason = %reason,
-                                "Copying retry queued",
-                            );
-                        }
-                    }
-                }
-
-                MigrationStatus::Verifying => {
-                    // Issue VerifyChunk RPC on the target node.
-                    // Source data is NOT removed yet — only after verification passes.
-                    let target_addr = self.node_grpc_addr(task.target_node).await;
-                    match target_addr {
-                        Some(tgt_addr) => {
-                            let chunk_id = task.chunk_id.clone();
-                            match self.verify_chunk(&tgt_addr, &chunk_id).await {
-                                Ok(true) => {
-                                    info!(
-                                        task_id = %task.task_id,
-                                        chunk = %chunk_id,
-                                        "Migration: Verifying -> Completing (checksum OK)"
-                                    );
-                                    task.status = MigrationStatus::Completing;
-                                    task.updated_at_ms = now_ms;
-                                }
-                                Ok(false) => {
-                                    warn!(
-                                        task_id = %task.task_id,
-                                        chunk = %chunk_id,
-                                        "VerifyChunk failed (checksum mismatch); retrying copy"
-                                    );
-                                    task.status = MigrationStatus::Copying;
-                                    task.updated_at_ms = now_ms;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        task_id = %task.task_id,
-                                        chunk = %chunk_id,
-                                        "VerifyChunk RPC error, will retry: {}",
-                                        e
-                                    );
-                                    task.updated_at_ms = now_ms;
-                                }
-                            }
-                        }
-                        None => {
-                            warn!(
-                                task_id = %task.task_id,
-                                "Cannot resolve target node {} address for verify; failing task",
-                                task.target_node
-                            );
-                            task.status = MigrationStatus::Failed;
-                            task.updated_at_ms = now_ms;
-                        }
-                    }
-                }
-
-                MigrationStatus::Completing => {
-                    // Target is verified.  Register the new replica location in
-                    // the Raft state machine, then mark the task Done.
-                    // The source remains a valid replica; over-replication
-                    // cleanup happens in a separate pass.
-                    let chunk_id = task.chunk_id.clone();
-                    let target_node = task.target_node;
-                    let tier = task.tier;
-
-                    // Find the file path that owns this chunk (needed for
-                    // UpdateChunkLocations).
-                    let file_path = self.find_file_for_chunk(&chunk_id).await;
-
-                    if let Some(path) = file_path {
-                        // Bug AB — `merge_chunk_location_entries` REPLACES
-                        // all existing entries for a chunk_index with the
-                        // incoming set (this matches FUSE flush_segments
-                        // semantics, where the client builds the full
-                        // replica set). The scheduler was passing only
-                        // the new replica entry → previous replicas were
-                        // wiped → under-replication check immediately
-                        // re-fired → infinite Copying → Verifying → Done
-                        // loop on the same chunk. Fix: read the existing
-                        // entries for this chunk_index, ADD the new
-                        // target, dedupe by node_id, pass the full set.
-                        let (chunk_index, full_chunks) = {
-                            let sm = self.state_data.read().await;
-                            let file = sm.files.get(&path);
-                            let chunk_index = file
-                                .and_then(|f| {
-                                    f.chunks
-                                        .iter()
-                                        .find(|c| c.chunk_hash == chunk_id)
-                                        .map(|c| c.chunk_index)
-                                })
-                                .unwrap_or(0);
-                            // Collect every existing entry for this chunk_index
-                            // (i.e. all current replicas).
-                            let mut entries: Vec<ChunkLocationEntry> = file
-                                .map(|f| {
-                                    f.chunks
-                                        .iter()
-                                        .filter(|c| c.chunk_index == chunk_index)
-                                        .cloned()
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            // Add the new target if it's not already present.
-                            // AV-5-9 — pick the disk_id that matches the
-                            // replication task's tier on the target node.
-                            // Pre-fix this was hardcoded `0`, so when the
-                            // target's disk[0] wasn't the tier we asked
-                            // for, the planner read the entry back as the
-                            // wrong tier and the cache lifecycle silently
-                            // misclassified replicas.
-                            let target_str = target_node.to_string();
-                            let resolved_disk_id: u32 = sm
-                                .nodes
-                                .get(&target_node)
-                                .and_then(|n| {
-                                    n.disks
-                                        .iter()
-                                        .position(|d| d.tier == tier)
-                                        .map(|p| p as u32)
-                                })
-                                .unwrap_or(0);
-                            // Bug BH — dedup by (node_id, disk_id), NOT
-                            // node_id alone. On a no-spare-node multi-tier
-                            // topology the anchor-cold target already holds
-                            // the chunk on its warm disk; a node-only guard
-                            // dropped the new cold entry, so the cold anchor
-                            // was never recorded → infinite anchor-lag-repair
-                            // loop + mandatory_strand flush refusals.
-                            let already_present = replica_already_present(
-                                &entries,
-                                &target_str,
-                                resolved_disk_id,
-                            );
-                            if !already_present {
-                                entries.push(ChunkLocationEntry {
-                                    chunk_index,
-                                    chunk_hash: chunk_id.clone(),
-                                    node_id: target_str,
-                                    disk_id: resolved_disk_id,
-                                    size_bytes: 0,
-                                });
-                            }
-                            (chunk_index, entries)
-                        };
-                        let _ = chunk_index; // bound below if needed
-                        let req = ClientRequest::UpdateChunkLocations {
-                            path,
-                            chunks: full_chunks,
-                            // Bug P — re-replication is system-driven,
-                            // not user-driven, so no client lease applies.
-                            // Empty lease_id skips the verification path.
-                            lease_id: String::new(),
-                        };
-                        // Bug AB diagnostic — promote the silent debug
-                        // log to WARN so a stuck-in-loop scheduler is
-                        // visible without per-tick instrumentation.
-                        if let Err(e) = self.raft.client_write(req).await {
-                            warn!(
-                                task_id = %task.task_id,
-                                error = %e,
-                                "Bug AB UpdateChunkLocations Raft write failed; new replica not registered yet"
-                            );
-                        }
-                    }
-
-                    info!(
-                        task_id = %task.task_id,
-                        chunk = %chunk_id,
-                        target_node,
-                        tier = ?tier,
-                        "Migration: Completing -> Done (new replica registered)"
-                    );
-                    task.status = MigrationStatus::Done;
-                    task.updated_at_ms = now_ms;
-
-                    self.audit.log(
-                        "scheduler",
-                        "replication.complete",
-                        &format!(
-                            "chunk={} src={} dst={}",
-                            task.chunk_id, task.source_node, task.target_node
-                        ),
-                        "success",
-                    );
-                }
-
-                MigrationStatus::Done | MigrationStatus::Failed => {
-                    // Terminal states, nothing to do.
-                }
-            }
-        }
+        // U3 — drive the task state machine in rounds so a chunk can go
+        // Pending -> Copying -> Verifying -> Completing -> Done within ONE
+        // tick (pre-U3 each round was the whole 30s tick), and fan the
+        // Copying `replicate_chunk` calls out bounded-parallel. The generic
+        // orchestrator is unit-testable against a mock `MigrationOps`
+        // (advance_round_tests); this method just wires the live ops + the
+        // terminal-task prune.
+        advance_migration_tasks(self, state, now_ms).await;
 
         // Prune completed tasks older than 5 minutes.
         //
@@ -1140,6 +757,7 @@ impl TaskScheduler {
             );
         }
     }
+
 
     /// Load the migration state from the dedicated Raft field.
     ///
@@ -1325,6 +943,86 @@ impl TaskScheduler {
             }
         }
         None
+    }
+
+    /// Completing-stage replica registration (U3 — extracted verbatim from
+    /// the pre-U3 Completing branch so the orchestrator's `MigrationOps`
+    /// impl can call it). Finds the file owning `chunk_id`, ADDs the new
+    /// `target_node`/`tier` replica to the chunk's existing location set
+    /// (Bug AB: read existing entries, dedup by (node_id, disk_id) — Bug BH
+    /// — pick the disk matching `tier` — AV-5-9), and writes the full set
+    /// through Raft. No-op when the file is gone (next round's Bug AE guard
+    /// catches the orphan).
+    async fn register_replica_location(&self, chunk_id: &str, target_node: u64, tier: DiskTier) {
+        let Some(path) = self.find_file_for_chunk(chunk_id).await else {
+            return;
+        };
+
+        // Bug AB — read the chunk's existing replicas, ADD the new target,
+        // dedup, and pass the FULL set (merge_chunk_location_entries
+        // REPLACES the chunk_index's entries). Passing only the new entry
+        // wiped prior replicas and looped under-replication forever.
+        let full_chunks = {
+            let sm = self.state_data.read().await;
+            let file = sm.files.get(&path);
+            let chunk_index = file
+                .and_then(|f| {
+                    f.chunks
+                        .iter()
+                        .find(|c| c.chunk_hash == chunk_id)
+                        .map(|c| c.chunk_index)
+                })
+                .unwrap_or(0);
+            let mut entries: Vec<ChunkLocationEntry> = file
+                .map(|f| {
+                    f.chunks
+                        .iter()
+                        .filter(|c| c.chunk_index == chunk_index)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            // AV-5-9 — pick the disk_id matching the task's tier on the
+            // target (was hardcoded 0; mis-tiered the read-back entry).
+            let target_str = target_node.to_string();
+            let resolved_disk_id: u32 = sm
+                .nodes
+                .get(&target_node)
+                .and_then(|n| {
+                    n.disks
+                        .iter()
+                        .position(|d| d.tier == tier)
+                        .map(|p| p as u32)
+                })
+                .unwrap_or(0);
+            // Bug BH — dedup by (node_id, disk_id), NOT node_id alone, so a
+            // second-tier mandatory copy on the same node is recorded.
+            if !replica_already_present(&entries, &target_str, resolved_disk_id) {
+                entries.push(ChunkLocationEntry {
+                    chunk_index,
+                    chunk_hash: chunk_id.to_string(),
+                    node_id: target_str,
+                    disk_id: resolved_disk_id,
+                    size_bytes: 0,
+                });
+            }
+            entries
+        };
+
+        let req = ClientRequest::UpdateChunkLocations {
+            path,
+            chunks: full_chunks,
+            // Bug P — system-driven, so no client lease applies.
+            lease_id: String::new(),
+        };
+        // Bug AB diagnostic — WARN so a stuck-in-loop scheduler is visible.
+        if let Err(e) = self.raft.client_write(req).await {
+            warn!(
+                chunk = %chunk_id,
+                error = %e,
+                "Bug AB UpdateChunkLocations Raft write failed; new replica not registered yet"
+            );
+        }
     }
 
     /// Bug AE — quick existence check for a chunk hash across every file in
@@ -2063,6 +1761,501 @@ impl TaskScheduler {
             token = resp.next_page_token;
         }
         Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// U3 — migration-task orchestrator (multi-stage-per-tick, bounded-parallel
+// copy). The side effects the per-task state machine performs are captured
+// behind the `MigrationOps` trait so the loop + concurrency behaviour is
+// unit-testable against a mock (advance_round_tests) without a live network
+// or a real Raft handle. `TaskScheduler` implements the trait by delegating
+// to its existing helpers; the live behaviour is byte-for-byte the pre-U3
+// per-task logic, only the *driving loop* changed.
+// ---------------------------------------------------------------------------
+
+/// U3 — the side-effecting operations the migration state machine needs.
+/// One impl is live (`TaskScheduler`); tests supply a mock. All methods are
+/// independent per task, which is what makes the Copying RPCs safe to
+/// fan out in parallel.
+trait MigrationOps {
+    /// Bug CH dispatch guard: can `target_node` possibly receive a copy on
+    /// `tier`? `Err(reason)` fast-fails the task to Failed.
+    async fn validate_target(&self, target_node: u64, tier: DiskTier) -> Result<(), String>;
+    /// Bug AE orphan guard: is `chunk_id` still referenced by some file?
+    async fn chunk_exists(&self, chunk_id: &str) -> bool;
+    /// F-015: pick a healthy node holding `chunk_id` (optionally excluding
+    /// one), returning `(node_id, grpc_addr)`.
+    async fn resolve_source(&self, chunk_id: &str, exclude: Option<u64>) -> Option<(u64, String)>;
+    /// gRPC address of `node_id`, if registered.
+    async fn target_addr(&self, node_id: u64) -> Option<String>;
+    /// The parallelizable RPC: copy `chunk_id` from `src_addr` to
+    /// `tgt_addr`, landing on `tier_str`. Independent per task.
+    async fn replicate(
+        &self,
+        src_addr: &str,
+        chunk_id: &str,
+        tgt_addr: &str,
+        tier_str: &str,
+    ) -> Result<(), String>;
+    /// VerifyChunk on the target. `Ok(false)` = checksum mismatch.
+    async fn verify(&self, tgt_addr: &str, chunk_id: &str) -> Result<bool, String>;
+    /// Completing: register the new replica location through Raft.
+    async fn register_replica(&self, chunk_id: &str, target_node: u64, tier: DiskTier);
+    /// Append an audit-log line (scheduler actor).
+    fn audit(&self, action: &str, detail: &str, outcome: &str);
+    /// Fire the MigrationFailed alert for an exhausted task.
+    fn fire_migration_failed(&self, task: &ReplicationTask, reason: &str);
+}
+
+impl MigrationOps for TaskScheduler {
+    async fn validate_target(&self, target_node: u64, tier: DiskTier) -> Result<(), String> {
+        let sm = self.state_data.read().await;
+        validate_task_target(sm.nodes.get(&target_node), tier).map_err(|s| s.to_string())
+    }
+
+    async fn chunk_exists(&self, chunk_id: &str) -> bool {
+        self.chunk_exists_anywhere(chunk_id).await
+    }
+
+    async fn resolve_source(&self, chunk_id: &str, exclude: Option<u64>) -> Option<(u64, String)> {
+        self.resolve_healthy_source(chunk_id, exclude).await
+    }
+
+    async fn target_addr(&self, node_id: u64) -> Option<String> {
+        self.node_grpc_addr(node_id).await
+    }
+
+    async fn replicate(
+        &self,
+        src_addr: &str,
+        chunk_id: &str,
+        tgt_addr: &str,
+        tier_str: &str,
+    ) -> Result<(), String> {
+        self.replicate_chunk(src_addr, chunk_id, tgt_addr, tier_str)
+            .await
+            .map_err(|e| format!("ReplicateChunk error: {e}"))
+    }
+
+    async fn verify(&self, tgt_addr: &str, chunk_id: &str) -> Result<bool, String> {
+        self.verify_chunk(tgt_addr, chunk_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn register_replica(&self, chunk_id: &str, target_node: u64, tier: DiskTier) {
+        self.register_replica_location(chunk_id, target_node, tier).await;
+    }
+
+    fn audit(&self, action: &str, detail: &str, outcome: &str) {
+        self.audit.log("scheduler", action, detail, outcome);
+    }
+
+    fn fire_migration_failed(&self, task: &ReplicationTask, reason: &str) {
+        if let Some(alerts) = self.alerts.read().clone() {
+            alerts.fire(
+                crate::alerts::AlertKind::MigrationFailed,
+                "migration task exhausted retries",
+                serde_json::json!({
+                    "task_id": task.task_id,
+                    "chunk_id": task.chunk_id,
+                    "attempts": task.attempts,
+                    "reason": reason,
+                    "source_node": task.source_node,
+                    "target_node": task.target_node,
+                }),
+            );
+        }
+    }
+}
+
+/// U3 — a copy job planned for one Copying task in the current round. The
+/// pre-checks (target/source/orphan) already passed; only the parallelizable
+/// `replicate` RPC remains. `resolved_source` may differ from the task's
+/// recorded `source_node` (F-015 re-resolution) — applied when results land.
+struct CopyJob {
+    task_id: String,
+    chunk_id: String,
+    resolved_source: u64,
+    src_addr: String,
+    tgt_addr: String,
+    tier_str: String,
+}
+
+/// U3 — drive every non-terminal task through its state machine, looping in
+/// rounds until a round makes no progress (or the `MAX_ADVANCE_ROUNDS` guard
+/// trips). Within a round, the Copying `replicate` RPCs are dispatched
+/// bounded-parallel (`MIGRATION_COPY_CONCURRENCY`); Pending/Verifying/
+/// Completing transitions stay serial (cheap, and Completing writes Raft).
+/// Mutates `state` in place; the caller persists once per tick.
+async fn advance_migration_tasks<O: MigrationOps>(
+    ops: &O,
+    state: &mut MigrationState,
+    now_ms: u64,
+) {
+    // A task gets at most ONE Copying RPC and ONE Verifying RPC per call
+    // (i.e. per tick). This preserves the pre-U3 retry cadence — a no-source
+    // / transient-error task still burns one attempt per tick over
+    // MAX_MIGRATION_ATTEMPTS ticks, and a verify-mismatch flap re-copies on
+    // the NEXT tick, not by spinning rounds in this one. The round loop only
+    // exists to let a *forward-progressing* chunk climb Pending -> Done in
+    // one tick; it never re-dispatches a network RPC to the same task.
+    let mut copied: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut verified: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _round in 0..MAX_ADVANCE_ROUNDS {
+        let progressed = advance_round(ops, state, now_ms, &mut copied, &mut verified).await;
+        if !progressed {
+            break;
+        }
+    }
+}
+
+/// U3 — a single round over all non-terminal tasks. Returns true if any task
+/// changed status this round (so the caller loops again). A chunk can thus
+/// climb Pending -> Copying -> Verifying -> Completing -> Done across four
+/// rounds of ONE tick instead of four ticks. `copied`/`verified` carry the
+/// once-per-call dispatch guard across rounds (see `advance_migration_tasks`).
+async fn advance_round<O: MigrationOps>(
+    ops: &O,
+    state: &mut MigrationState,
+    now_ms: u64,
+    copied: &mut std::collections::HashSet<String>,
+    verified: &mut std::collections::HashSet<String>,
+) -> bool {
+    use futures::stream::{self, StreamExt};
+
+    let mut progressed = false;
+    let task_ids: Vec<String> = state.tasks.keys().cloned().collect();
+
+    // ---- Phase 1: Pending -> Copying (pure, serial). ----
+    for task_id in &task_ids {
+        let Some(task) = state.tasks.get_mut(task_id) else { continue };
+        if task.status == MigrationStatus::Pending {
+            info!(
+                task_id = %task.task_id,
+                chunk = %task.chunk_id,
+                "Migration: Pending -> Copying"
+            );
+            task.status = MigrationStatus::Copying;
+            task.attempts = 0;
+            task.last_error = None;
+            task.updated_at_ms = now_ms;
+            progressed = true;
+        }
+    }
+
+    // ---- Phase 2: Copying pre-checks (serial state reads), then dispatch
+    // the surviving copies bounded-parallel. ----
+    let mut jobs: Vec<CopyJob> = Vec::new();
+    for task_id in &task_ids {
+        // Snapshot the fields we need; drop the &mut borrow before awaiting.
+        let (chunk_id, target_node, source_node, tier) = {
+            let Some(task) = state.tasks.get(task_id) else { continue };
+            if task.status != MigrationStatus::Copying {
+                continue;
+            }
+            (task.chunk_id.clone(), task.target_node, task.source_node, task.tier)
+        };
+
+        // Once-per-call guard: a task gets at most one copy attempt per tick
+        // (a verify-mismatch flap back to Copying re-copies NEXT tick, and a
+        // no-source/transient failure burns one attempt per tick — pre-U3
+        // cadence). Skip any task already attempted this call.
+        if !copied.insert(task_id.clone()) {
+            continue;
+        }
+
+        // Bug CH — fast-fail tasks whose target can never receive the copy.
+        if let Err(reason) = ops.validate_target(target_node, tier).await {
+            warn!(
+                task_id = %task_id,
+                chunk = %chunk_id,
+                target = target_node,
+                "Bug CH: dropping migration task with invalid target — {}",
+                reason
+            );
+            if let Some(task) = state.tasks.get_mut(task_id) {
+                task.status = MigrationStatus::Failed;
+                task.last_error = Some(reason.clone());
+                task.updated_at_ms = now_ms;
+            }
+            ops.audit(
+                "migration.invalid_target",
+                &format!("task={task_id} chunk={chunk_id} target={target_node}"),
+                &reason,
+            );
+            progressed = true;
+            continue;
+        }
+
+        // Bug AE — drop orphan tasks whose chunk no longer exists anywhere.
+        if !ops.chunk_exists(&chunk_id).await {
+            let reason = "chunk no longer exists (orphan task from \
+                          pre-wipe or unlinked file)"
+                .to_string();
+            warn!(
+                task_id = %task_id,
+                chunk = %chunk_id,
+                "Bug AE: dropping orphan migration task — {}",
+                reason
+            );
+            if let Some(task) = state.tasks.get_mut(task_id) {
+                task.status = MigrationStatus::Failed;
+                task.last_error = Some(reason.clone());
+                task.updated_at_ms = now_ms;
+            }
+            ops.audit(
+                "migration.orphan_dropped",
+                &format!("task={task_id} chunk={chunk_id}"),
+                &reason,
+            );
+            progressed = true;
+            continue;
+        }
+
+        let target_addr = ops.target_addr(target_node).await;
+        // Bug BO-1: for a same-node cross-tier anchor copy, don't exclude
+        // the target — it IS the only holder (on its other tier).
+        let exclude = anchor_copy_source_exclude(source_node, target_node);
+        let resolved_source = ops.resolve_source(&chunk_id, exclude).await;
+
+        match (resolved_source, target_addr) {
+            (Some((src_node, src_addr)), Some(tgt_addr)) => {
+                jobs.push(CopyJob {
+                    task_id: task_id.clone(),
+                    chunk_id: chunk_id.clone(),
+                    resolved_source: src_node,
+                    src_addr,
+                    tgt_addr,
+                    tier_str: tier.to_string(),
+                });
+            }
+            (None, _) => {
+                record_copy_failure(ops, state, task_id, "no healthy source replica".to_string(), now_ms);
+                progressed = true;
+            }
+            (_, None) => {
+                record_copy_failure(
+                    ops,
+                    state,
+                    task_id,
+                    format!("target node {target_node} unresolvable"),
+                    now_ms,
+                );
+                progressed = true;
+            }
+        }
+    }
+
+    // Dispatch the planned copies, at most MIGRATION_COPY_CONCURRENCY in
+    // flight. Each future is independent (distinct task/chunk/target).
+    if !jobs.is_empty() {
+        let results: Vec<(String, u64, Result<(), String>)> = stream::iter(jobs)
+            .map(|job| async move {
+                let r = ops
+                    .replicate(&job.src_addr, &job.chunk_id, &job.tgt_addr, &job.tier_str)
+                    .await;
+                (job.task_id, job.resolved_source, r)
+            })
+            .buffer_unordered(MIGRATION_COPY_CONCURRENCY)
+            .collect()
+            .await;
+
+        for (task_id, resolved_source, result) in results {
+            progressed = true;
+            match result {
+                Ok(()) => {
+                    if let Some(task) = state.tasks.get_mut(&task_id) {
+                        if task.source_node != resolved_source {
+                            info!(
+                                task_id = %task.task_id,
+                                chunk = %task.chunk_id,
+                                old_src = task.source_node,
+                                new_src = resolved_source,
+                                "Re-replication: source moved to a healthier replica",
+                            );
+                            task.source_node = resolved_source;
+                        }
+                        info!(
+                            task_id = %task.task_id,
+                            chunk = %task.chunk_id,
+                            "Migration: Copying -> Verifying (ReplicateChunk OK)"
+                        );
+                        task.status = MigrationStatus::Verifying;
+                        task.attempts = 0;
+                        task.last_error = None;
+                        task.updated_at_ms = now_ms;
+                    }
+                }
+                Err(reason) => {
+                    // Record the source we actually tried (F-015) before
+                    // accounting the failure.
+                    if let Some(task) = state.tasks.get_mut(&task_id) {
+                        task.source_node = resolved_source;
+                    }
+                    record_copy_failure(ops, state, &task_id, reason, now_ms);
+                }
+            }
+        }
+    }
+
+    // ---- Phase 3: Verifying (serial). ----
+    for task_id in &task_ids {
+        let (chunk_id, target_node) = {
+            let Some(task) = state.tasks.get(task_id) else { continue };
+            if task.status != MigrationStatus::Verifying {
+                continue;
+            }
+            (task.chunk_id.clone(), task.target_node)
+        };
+
+        // Once-per-call guard (see phase 2): at most one VerifyChunk RPC per
+        // task per tick. A transient verify error retries on the NEXT tick.
+        if !verified.insert(task_id.clone()) {
+            continue;
+        }
+
+        match ops.target_addr(target_node).await {
+            Some(tgt_addr) => match ops.verify(&tgt_addr, &chunk_id).await {
+                Ok(true) => {
+                    if let Some(task) = state.tasks.get_mut(task_id) {
+                        info!(
+                            task_id = %task.task_id,
+                            chunk = %chunk_id,
+                            "Migration: Verifying -> Completing (checksum OK)"
+                        );
+                        task.status = MigrationStatus::Completing;
+                        task.updated_at_ms = now_ms;
+                    }
+                    progressed = true;
+                }
+                Ok(false) => {
+                    if let Some(task) = state.tasks.get_mut(task_id) {
+                        warn!(
+                            task_id = %task.task_id,
+                            chunk = %chunk_id,
+                            "VerifyChunk failed (checksum mismatch); retrying copy"
+                        );
+                        task.status = MigrationStatus::Copying;
+                        task.updated_at_ms = now_ms;
+                    }
+                    // A flap back to Copying is not forward progress; do NOT
+                    // set `progressed` (else MAX_ADVANCE_ROUNDS is the only
+                    // brake on a persistently-corrupt copy looping in one
+                    // tick — the round loop should fall through to the next
+                    // tick instead).
+                }
+                Err(e) => {
+                    if let Some(task) = state.tasks.get_mut(task_id) {
+                        warn!(
+                            task_id = %task.task_id,
+                            chunk = %chunk_id,
+                            "VerifyChunk RPC error, will retry: {}",
+                            e
+                        );
+                        task.updated_at_ms = now_ms;
+                    }
+                }
+            },
+            None => {
+                if let Some(task) = state.tasks.get_mut(task_id) {
+                    warn!(
+                        task_id = %task.task_id,
+                        "Cannot resolve target node {} address for verify; failing task",
+                        task.target_node
+                    );
+                    task.status = MigrationStatus::Failed;
+                    task.updated_at_ms = now_ms;
+                }
+                progressed = true;
+            }
+        }
+    }
+
+    // ---- Phase 4: Completing -> Done (serial; writes Raft). ----
+    for task_id in &task_ids {
+        let (chunk_id, target_node, tier, source_node) = {
+            let Some(task) = state.tasks.get(task_id) else { continue };
+            if task.status != MigrationStatus::Completing {
+                continue;
+            }
+            (task.chunk_id.clone(), task.target_node, task.tier, task.source_node)
+        };
+
+        ops.register_replica(&chunk_id, target_node, tier).await;
+
+        if let Some(task) = state.tasks.get_mut(task_id) {
+            info!(
+                task_id = %task.task_id,
+                chunk = %chunk_id,
+                target_node,
+                tier = ?tier,
+                "Migration: Completing -> Done (new replica registered)"
+            );
+            task.status = MigrationStatus::Done;
+            task.updated_at_ms = now_ms;
+        }
+        ops.audit(
+            "replication.complete",
+            &format!("chunk={chunk_id} src={source_node} dst={target_node}"),
+            "success",
+        );
+        progressed = true;
+    }
+
+    progressed
+}
+
+/// U3 — account a Copying-stage failure: bump attempts, promote a
+/// "Chunk not found" to instant-Failed (Bug AF), and on exhaustion mark the
+/// task Failed + audit + alert. Mirrors the pre-U3 inline accounting.
+fn record_copy_failure<O: MigrationOps>(
+    ops: &O,
+    state: &mut MigrationState,
+    task_id: &str,
+    reason: String,
+    now_ms: u64,
+) {
+    let Some(task) = state.tasks.get_mut(task_id) else { return };
+    task.attempts = task.attempts.saturating_add(1);
+    task.last_error = Some(reason.clone());
+    task.updated_at_ms = now_ms;
+
+    // Bug AF — a source-side "Chunk not found" can never resolve by retry
+    // (the bytes are gone from that node); promote to instant-Failed.
+    if rpc_error_indicates_chunk_missing(&reason) {
+        task.attempts = MAX_MIGRATION_ATTEMPTS;
+    }
+
+    if task.attempts >= MAX_MIGRATION_ATTEMPTS {
+        warn!(
+            task_id = %task.task_id,
+            chunk = %task.chunk_id,
+            attempts = task.attempts,
+            reason = %reason,
+            "Migration: Copying -> Failed (max attempts exhausted)"
+        );
+        task.status = MigrationStatus::Failed;
+        let snapshot = task.clone();
+        ops.audit(
+            "migration.failed",
+            &format!(
+                "task={} chunk={} attempts={}",
+                snapshot.task_id, snapshot.chunk_id, snapshot.attempts
+            ),
+            &reason,
+        );
+        ops.fire_migration_failed(&snapshot, &reason);
+    } else {
+        warn!(
+            task_id = %task.task_id,
+            chunk = %task.chunk_id,
+            attempt = task.attempts,
+            max = MAX_MIGRATION_ATTEMPTS,
+            reason = %reason,
+            "Copying retry queued",
+        );
     }
 }
 
@@ -4519,5 +4712,303 @@ mod bug_bo_tests {
             orphan_reap_due(true, mtime_ms, now_2, grace_secs),
             "reap verdict must not reset across a manager restart"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// U3 — advance_migration_tasks loop + bounded-parallel-copy tests.
+//
+// advance_tasks made real gRPC calls and needed a live Raft handle, so it
+// had no unit coverage. U3 moved the driving logic into the generic
+// `advance_migration_tasks` over the `MigrationOps` trait; a mock impl lets
+// us assert (a) a chunk climbs Pending -> Done within ONE call (not one
+// stage per call), and (b) the Copying RPCs are dispatched with bounded
+// concurrency.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod advance_round_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Programmable mock for the side effects of the migration state machine.
+    #[derive(Default)]
+    struct MockOps {
+        /// Live count of `replicate` futures in flight, and the peak observed.
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        replicate_calls: AtomicUsize,
+        verify_calls: AtomicUsize,
+        register_calls: AtomicUsize,
+        /// Per-stage overrides for failure-path tests.
+        chunk_missing: bool,          // chunk_exists -> false (Bug AE)
+        invalid_target: bool,         // validate_target -> Err (Bug CH)
+        no_source: bool,              // resolve_source -> None
+        verify_result: VerifyMode,
+        replicate_err: Option<String>,
+        audited: Mutex<Vec<(String, String)>>, // (action, outcome)
+        failed_alerts: AtomicUsize,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    enum VerifyMode {
+        #[default]
+        Ok,
+        Mismatch,
+        RpcErr,
+    }
+
+    impl MigrationOps for MockOps {
+        async fn validate_target(&self, _t: u64, _tier: DiskTier) -> Result<(), String> {
+            if self.invalid_target {
+                Err("target node is not a data node".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        async fn chunk_exists(&self, _c: &str) -> bool {
+            !self.chunk_missing
+        }
+        async fn resolve_source(&self, _c: &str, _ex: Option<u64>) -> Option<(u64, String)> {
+            if self.no_source {
+                None
+            } else {
+                Some((1, "http://src:9500".to_string()))
+            }
+        }
+        async fn target_addr(&self, _n: u64) -> Option<String> {
+            Some("http://tgt:9500".to_string())
+        }
+        async fn replicate(
+            &self,
+            _src: &str,
+            _chunk: &str,
+            _tgt: &str,
+            _tier: &str,
+        ) -> Result<(), String> {
+            self.replicate_calls.fetch_add(1, Ordering::SeqCst);
+            // Track peak concurrency: enter, yield enough that buffer_unordered
+            // has polled the whole window, then leave.
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            match &self.replicate_err {
+                Some(e) => Err(e.clone()),
+                None => Ok(()),
+            }
+        }
+        async fn verify(&self, _tgt: &str, _chunk: &str) -> Result<bool, String> {
+            self.verify_calls.fetch_add(1, Ordering::SeqCst);
+            match self.verify_result {
+                VerifyMode::Ok => Ok(true),
+                VerifyMode::Mismatch => Ok(false),
+                VerifyMode::RpcErr => Err("verify rpc down".to_string()),
+            }
+        }
+        async fn register_replica(&self, _c: &str, _t: u64, _tier: DiskTier) {
+            self.register_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        fn audit(&self, action: &str, _detail: &str, outcome: &str) {
+            self.audited
+                .lock()
+                .unwrap()
+                .push((action.to_string(), outcome.to_string()));
+        }
+        fn fire_migration_failed(&self, _task: &ReplicationTask, _reason: &str) {
+            self.failed_alerts.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn pending_task(n: usize) -> ReplicationTask {
+        ReplicationTask {
+            task_id: format!("repl-{n}"),
+            chunk_id: format!("chunk-{n}"),
+            source_node: 1,
+            target_node: 2,
+            tier: DiskTier::Warm,
+            status: MigrationStatus::Pending,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            attempts: 0,
+            last_error: None,
+        }
+    }
+
+    fn state_with(n: usize) -> MigrationState {
+        let mut s = MigrationState::default();
+        for i in 0..n {
+            let t = pending_task(i);
+            s.tasks.insert(t.task_id.clone(), t);
+        }
+        s.next_task_id = n as u64;
+        s
+    }
+
+    // U3 core: every Pending task reaches Done within ONE advance_migration_tasks
+    // call (pre-U3 each tick advanced a task by a single stage, so this would
+    // leave them all at Copying).
+    #[tokio::test]
+    async fn all_tasks_reach_done_in_one_call() {
+        let ops = MockOps::default();
+        let mut state = state_with(10);
+
+        advance_migration_tasks(&ops, &mut state, 1_000).await;
+
+        assert!(
+            state.tasks.values().all(|t| t.status == MigrationStatus::Done),
+            "all tasks should be Done after one call, got {:?}",
+            state.tasks.values().map(|t| t.status).collect::<Vec<_>>()
+        );
+        assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), 10);
+        assert_eq!(ops.verify_calls.load(Ordering::SeqCst), 10);
+        assert_eq!(ops.register_calls.load(Ordering::SeqCst), 10);
+    }
+
+    // U3 bounded concurrency: with far more Copying tasks than the cap, no
+    // more than MIGRATION_COPY_CONCURRENCY copies are ever in flight at once.
+    #[tokio::test]
+    async fn copy_concurrency_is_bounded() {
+        let ops = MockOps::default();
+        let mut state = state_with(50);
+
+        advance_migration_tasks(&ops, &mut state, 1_000).await;
+
+        let peak = ops.max_in_flight.load(Ordering::SeqCst);
+        assert!(peak > 1, "copies should run in parallel, peak={peak}");
+        assert!(
+            peak <= MIGRATION_COPY_CONCURRENCY,
+            "peak in-flight {peak} exceeded cap {MIGRATION_COPY_CONCURRENCY}"
+        );
+    }
+
+    // Bug CH preserved: an invalid target fast-fails to Failed without ever
+    // attempting a copy, and audits migration.invalid_target.
+    #[tokio::test]
+    async fn invalid_target_fast_fails() {
+        let ops = MockOps {
+            invalid_target: true,
+            ..Default::default()
+        };
+        let mut state = state_with(3);
+
+        advance_migration_tasks(&ops, &mut state, 1_000).await;
+
+        assert!(state.tasks.values().all(|t| t.status == MigrationStatus::Failed));
+        assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), 0);
+        assert!(ops
+            .audited
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(a, _)| a == "migration.invalid_target"));
+    }
+
+    // Bug AE preserved: an orphan chunk (no longer in any file) is dropped to
+    // Failed before any copy, auditing migration.orphan_dropped.
+    #[tokio::test]
+    async fn orphan_chunk_dropped() {
+        let ops = MockOps {
+            chunk_missing: true,
+            ..Default::default()
+        };
+        let mut state = state_with(2);
+
+        advance_migration_tasks(&ops, &mut state, 1_000).await;
+
+        assert!(state.tasks.values().all(|t| t.status == MigrationStatus::Failed));
+        assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), 0);
+        assert!(ops
+            .audited
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(a, _)| a == "migration.orphan_dropped"));
+    }
+
+    // P0-4 preserved: a no-source task burns exactly ONE attempt per call
+    // (per tick) — the once-per-call guard preserves the pre-U3 retry
+    // cadence (6 ticks to exhaust, not collapsed into one). After
+    // MAX_MIGRATION_ATTEMPTS calls it lands Failed with the alert fired once.
+    #[tokio::test]
+    async fn no_source_burns_one_attempt_per_tick_then_fails() {
+        let ops = MockOps {
+            no_source: true,
+            ..Default::default()
+        };
+        let mut state = state_with(1);
+
+        // One call charges exactly one attempt; the task stays Copying.
+        advance_migration_tasks(&ops, &mut state, 1_000).await;
+        let t = state.tasks.values().next().unwrap();
+        assert_eq!(t.status, MigrationStatus::Copying);
+        assert_eq!(t.attempts, 1, "one attempt per tick");
+
+        // Remaining ticks drive it to Failed exactly at the attempt cap.
+        for _ in 1..MAX_MIGRATION_ATTEMPTS {
+            advance_migration_tasks(&ops, &mut state, 1_000).await;
+        }
+        let t = state.tasks.values().next().unwrap();
+        assert_eq!(t.status, MigrationStatus::Failed);
+        assert_eq!(t.attempts, MAX_MIGRATION_ATTEMPTS);
+        assert_eq!(ops.failed_alerts.load(Ordering::SeqCst), 1);
+    }
+
+    // Bug AF preserved: a source-side "Chunk not found" promotes straight to
+    // Failed on the FIRST attempt (no 6-retry storm).
+    #[tokio::test]
+    async fn chunk_not_found_instant_fails() {
+        let ops = MockOps {
+            replicate_err: Some("ReplicateChunk error: Chunk not found".to_string()),
+            ..Default::default()
+        };
+        let mut state = state_with(1);
+
+        advance_migration_tasks(&ops, &mut state, 1_000).await;
+
+        let t = state.tasks.values().next().unwrap();
+        assert_eq!(t.status, MigrationStatus::Failed);
+        assert_eq!(t.attempts, MAX_MIGRATION_ATTEMPTS);
+        // Exactly one copy attempt despite the multi-round loop.
+        assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Verify-mismatch flaps back to Copying and does NOT count as progress,
+    // so the round loop terminates (the task re-copies on the next tick
+    // rather than spinning all MAX_ADVANCE_ROUNDS in one tick).
+    #[tokio::test]
+    async fn verify_mismatch_flaps_to_copying_then_stops() {
+        let ops = MockOps {
+            verify_result: VerifyMode::Mismatch,
+            ..Default::default()
+        };
+        let mut state = state_with(1);
+
+        advance_migration_tasks(&ops, &mut state, 1_000).await;
+
+        let t = state.tasks.values().next().unwrap();
+        // Pending->Copying->Verifying(mismatch)->Copying, then the loop's
+        // no-progress break stops; copy ran once, verify ran once.
+        assert_eq!(t.status, MigrationStatus::Copying);
+        assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ops.verify_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // A transient verify RPC error leaves the task in Verifying (no status
+    // change), so it retries next tick (not this one).
+    #[tokio::test]
+    async fn verify_rpc_error_stays_verifying() {
+        let ops = MockOps {
+            verify_result: VerifyMode::RpcErr,
+            ..Default::default()
+        };
+        let mut state = state_with(1);
+
+        advance_migration_tasks(&ops, &mut state, 1_000).await;
+
+        let t = state.tasks.values().next().unwrap();
+        assert_eq!(t.status, MigrationStatus::Verifying);
     }
 }
