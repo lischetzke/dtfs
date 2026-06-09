@@ -193,6 +193,169 @@ fn disk_status_proto(s: DiskStatus) -> String {
     .to_string()
 }
 
+/// GetChunk streaming piece size. 8 MB gives tonic enough room to keep
+/// the HTTP/2 send window full on a multi-gigabit LAN (the client side
+/// bumps `max_decoding_message_size` to match — default is only 4 MB).
+/// 2 MB pieces + a 32-slot channel capped reads at ~5 MB/s in the F-011
+/// verification even with healthy disk + network underneath.
+const GET_PIECE_SIZE: usize = 8 * 1024 * 1024;
+
+/// U2 — BLAKE3-hash an on-disk chunk file incrementally, holding at most
+/// one ~8 MB piece in RAM at a time (never the whole chunk). Used by the
+/// verify_on_read cache-MISS path so a corrupt on-disk chunk is detected
+/// before any bytes leave the process, with Bug-I memory parity.
+async fn hash_file_incrementally(
+    path: &std::path::Path,
+    total: u64,
+) -> std::io::Result<[u8; 32]> {
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut hasher = dtfs_common::checksum::IncrementalHasher::new();
+    let mut read: u64 = 0;
+    let mut buf = vec![0u8; GET_PIECE_SIZE];
+    while read < total {
+        let want = (total - read).min(GET_PIECE_SIZE as u64) as usize;
+        f.read_exact(&mut buf[..want]).await?;
+        hasher.update(&buf[..want]);
+        read += want as u64;
+    }
+    Ok(hasher.finalize())
+}
+
+/// U2 — stream an on-disk chunk file to the gRPC response channel in
+/// `GET_PIECE_SIZE` pieces, reading one piece at a time via `read_exact`.
+/// Mirrors `replication::replicate_to`'s feeder: only the channel depth
+/// worth of pieces is ever in memory, never the whole chunk.
+fn stream_file(
+    dat_path: std::path::PathBuf,
+    total_size: u64,
+) -> ReceiverStream<Result<GetChunkResponse, Status>> {
+    use tokio::io::AsyncReadExt;
+    let (tx, rx) = mpsc::channel(64);
+    tokio::spawn(async move {
+        let mut f = match tokio::fs::File::open(&dat_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx
+                    .send(Err(Status::internal(format!(
+                        "open chunk {}: {e}",
+                        dat_path.display()
+                    ))))
+                    .await;
+                return;
+            }
+        };
+        let mut offset: u64 = 0;
+        let mut buf = vec![0u8; GET_PIECE_SIZE];
+        while offset < total_size {
+            let want = (total_size - offset).min(GET_PIECE_SIZE as u64) as usize;
+            if let Err(e) = f.read_exact(&mut buf[..want]).await {
+                let _ = tx
+                    .send(Err(Status::internal(format!("read chunk: {e}"))))
+                    .await;
+                return;
+            }
+            let resp = GetChunkResponse {
+                data: buf[..want].to_vec(),
+                offset,
+                total_size,
+            };
+            if tx.send(Ok(resp)).await.is_err() {
+                return;
+            }
+            offset += want as u64;
+        }
+    });
+    ReceiverStream::new(rx)
+}
+
+impl DataServiceImpl {
+    /// U2 — stream an already-resident in-memory chunk (cache HIT) in
+    /// `GET_PIECE_SIZE` pieces. The buffer already exists in heap, so
+    /// slicing it costs nothing extra.
+    fn stream_bytes(
+        &self,
+        data: bytes::Bytes,
+    ) -> ReceiverStream<Result<GetChunkResponse, Status>> {
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            let total = data.len();
+            let mut offset = 0;
+            while offset < total {
+                let end = std::cmp::min(offset + GET_PIECE_SIZE, total);
+                let resp = GetChunkResponse {
+                    data: data.slice(offset..end).to_vec(),
+                    offset: offset as u64,
+                    total_size: total as u64,
+                };
+                if tx.send(Ok(resp)).await.is_err() {
+                    break;
+                }
+                offset = end;
+            }
+        });
+        ReceiverStream::new(rx)
+    }
+
+    /// Bug BC-8 — verify a cache-HIT chunk against its stored meta before
+    /// the bytes leave the process. Records the integrity fault (BF-3) and
+    /// returns DATA_LOSS on mismatch / missing meta so the FUSE client
+    /// falls over to a healthy replica (P0-2).
+    async fn verify_cached_or_fault(
+        &self,
+        chunk_id: &ChunkId,
+        chunk_hex: &str,
+        data: &[u8],
+    ) -> Result<(), Status> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let expected = match self.store.get_chunk_meta(chunk_id).await {
+            Ok(m) => m.checksum,
+            Err(_) => {
+                self.integrity_faults.record(crate::integrity::IntegrityFault {
+                    chunk_id: chunk_hex.to_string(),
+                    observed_at_ms: now_ms,
+                    detector: "verify_on_read_meta_absent".into(),
+                    expected_len: 0,
+                    actual_len: data.len() as u64,
+                    expected_hash: String::new(),
+                    actual_hash: String::new(),
+                });
+                return Err(Status::data_loss(format!(
+                    "verify_on_read: meta absent for chunk {chunk_hex}"
+                )));
+            }
+        };
+        if !checksum::verify(data, &expected) {
+            let actual_hex = hex::encode(checksum::compute(data));
+            tracing::error!(
+                chunk_id = %chunk_hex,
+                actual = %actual_hex,
+                "Bug BC-8: read.integrity_fault — BLAKE3 mismatch \
+                 against stored meta (cached). Refusing to serve."
+            );
+            self.integrity_faults.record(crate::integrity::IntegrityFault {
+                chunk_id: chunk_hex.to_string(),
+                observed_at_ms: now_ms,
+                detector: "verify_on_read".into(),
+                expected_len: 0,
+                actual_len: data.len() as u64,
+                expected_hash: hex::encode(expected),
+                actual_hash: actual_hex,
+            });
+            // Note: ArcCache has no per-key invalidate. The cached entry
+            // ages out via LRU; meanwhile every subsequent read hits this
+            // same check and refuses, so a corrupt byte never escapes.
+            return Err(Status::data_loss(format!(
+                "verify_on_read mismatch on chunk {chunk_hex}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[tonic::async_trait]
 impl DataService for DataServiceImpl {
     type GetChunkStream = ReceiverStream<Result<GetChunkResponse, Status>>;
@@ -430,34 +593,56 @@ impl DataService for DataServiceImpl {
         self.metrics
             .record_chunk_read(&req.chunk_id, &req.requester_dc, now_ms);
 
-        let data = if let Some(cached) = self.cache.get(&key) {
+        let verify_on_read = self.scrub_config.read().await.verify_on_read;
+
+        // Cache HIT — the chunk is already resident in the ARC cache, so
+        // serving it from the in-memory `Bytes` costs no extra heap (the
+        // buffer already exists). Verify against meta (BC-8) before any
+        // bytes leave the process, then stream the in-memory buffer in
+        // 8 MB pieces.
+        if let Some(cached) = self.cache.get(&key) {
             self.metrics.record_cache_hit();
-            cached
-        } else {
-            self.metrics.record_cache_miss();
-            let loaded = self
-                .store
-                .get_chunk(&chunk_id)
-                .await
-                .map_err(|e| Status::not_found(e.to_string()))?;
-            self.cache.put(key.clone(), loaded.clone());
-            loaded
-        };
+
+            if verify_on_read {
+                self.verify_cached_or_fault(&chunk_id, &req.chunk_id, &cached)
+                    .await?;
+            }
+
+            // Bug AL — count this as read traffic (cache hits are still
+            // real reads to the requesting FUSE client).
+            self.metrics.record_read(cached.len() as u64);
+            return Ok(Response::new(self.stream_bytes(cached)));
+        }
+
+        // Cache MISS — U2 (Bug-I parity for the read side). Resolve the
+        // on-disk `.dat` path + size WITHOUT reading the file into heap,
+        // then stream it in pieces. We never hold the whole chunk in RAM
+        // and (like put_chunk, Bug I) do NOT populate the ARC cache here:
+        // caching every cold read would re-buffer the full chunk and
+        // defeat the streaming-to-disk memory win. A hot set re-promoted
+        // by tiering still lands in cache via the HIT path above on
+        // subsequent reads.
+        self.metrics.record_cache_miss();
+        let (dat_path, total_size) = self
+            .store
+            .chunk_file_path(&chunk_id)
+            .ok_or_else(|| Status::not_found(format!("chunk not found: {}", req.chunk_id)))?;
 
         // Bug BC-8 — verify_on_read. When the cluster integrity knob is
-        // enabled (default true), BLAKE3-hash the chunk against the
-        // stored ChunkMeta.checksum BEFORE the bytes leave this process.
-        // Mismatch → DO NOT send any bytes; return DATA_LOSS so the FUSE
-        // client retries the next replica (existing P0-2 fallback path).
-        // We also log a `read.integrity_fault` audit so the operator's
-        // /ui/integrity feed surfaces the event without polling.
+        // enabled (default true), BLAKE3-hash the on-disk chunk against
+        // the stored ChunkMeta.checksum BEFORE any bytes leave this
+        // process. We hash the file incrementally (one piece in RAM at a
+        // time, never the whole chunk), and on a mismatch return DATA_LOSS
+        // so the FUSE client retries the next replica (P0-2 fallback). On
+        // a match we then stream the file a second pass from disk; reading
+        // the file twice keeps memory bounded and is acceptable per U2.
         //
         // Disabling this flag is gated by an explicit-acknowledgement
         // boundary at the manager API (BC-8 ack guard). Once disabled,
-        // this code path skips the hash and serves the raw bytes —
-        // operator-acknowledged risk, AGENTS.md flags the false branch
-        // as the only mode where reads can deliver corrupt bytes.
-        if self.scrub_config.read().await.verify_on_read {
+        // this code path skips the hash and streams the raw bytes —
+        // operator-acknowledged risk, AGENTS.md flags the false branch as
+        // the only mode where reads can deliver corrupt bytes.
+        if verify_on_read {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -477,7 +662,7 @@ impl DataService for DataServiceImpl {
                             observed_at_ms: now_ms,
                             detector:      "verify_on_read_meta_absent".into(),
                             expected_len:  0,
-                            actual_len:    data.len() as u64,
+                            actual_len:    total_size,
                             expected_hash: String::new(),
                             actual_hash:   String::new(),
                         }
@@ -487,8 +672,11 @@ impl DataService for DataServiceImpl {
                     )));
                 }
             };
-            if !checksum::verify(&data, &expected) {
-                let actual_hex = hex::encode(checksum::compute(&data));
+            let actual = hash_file_incrementally(&dat_path, total_size)
+                .await
+                .map_err(|e| Status::internal(format!("verify_on_read hash: {e}")))?;
+            if actual != expected {
+                let actual_hex = hex::encode(actual);
                 tracing::error!(
                     chunk_id = %req.chunk_id,
                     actual = %actual_hex,
@@ -505,15 +693,11 @@ impl DataService for DataServiceImpl {
                         observed_at_ms: now_ms,
                         detector:      "verify_on_read".into(),
                         expected_len:  0,
-                        actual_len:    data.len() as u64,
+                        actual_len:    total_size,
                         expected_hash: hex::encode(expected),
                         actual_hash:   actual_hex,
                     }
                 );
-                // Note: ArcCache has no per-key invalidate. The cached
-                // entry will age out via the LRU policy; meanwhile every
-                // subsequent read will hit this same check and refuse
-                // to serve, so a corrupted byte never leaves the process.
                 return Err(Status::data_loss(format!(
                     "verify_on_read mismatch on chunk {}", req.chunk_id
                 )));
@@ -521,41 +705,10 @@ impl DataService for DataServiceImpl {
         }
 
         // Bug AL — record the read for the manager-side I/O Throughput
-        // rolling-rate. Cache hits are still real read traffic to the
-        // requesting FUSE client, so count them too.
-        self.metrics.record_read(data.len() as u64);
+        // rolling-rate.
+        self.metrics.record_read(total_size);
 
-        // Stream pieces of 8 MB each through a 64-slot channel — gives
-        // tonic enough room to keep the HTTP/2 send window full on a
-        // multi-gigabit LAN. The client side bumps its max_decoding_message_size
-        // to match (default is only 4 MB).
-        // 2 MB pieces + channel(32) capped reads at ~5 MB/s in the F-011
-        // verification, even with healthy disk and network underneath.
-        const PIECE_SIZE: usize = 8 * 1024 * 1024;
-        let (tx, rx) = mpsc::channel(64);
-
-        tokio::spawn(async move {
-            let total = data.len();
-            let mut offset = 0;
-
-            while offset < total {
-                let end = std::cmp::min(offset + PIECE_SIZE, total);
-                let chunk_data = data.slice(offset..end);
-
-                let resp = GetChunkResponse {
-                    data: chunk_data.to_vec(),
-                    offset: offset as u64,
-                    total_size: total as u64,
-                };
-
-                if tx.send(Ok(resp)).await.is_err() {
-                    break;
-                }
-                offset = end;
-            }
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(stream_file(dat_path, total_size)))
     }
 
     async fn delete_chunk(
@@ -744,5 +897,217 @@ mod chunk_hex {
 
     pub fn encode(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::ArcCache;
+    use crate::disk::DiskManager;
+    use crate::integrity::IntegrityFaultCollector;
+    use crate::metrics::DataMetrics;
+    use crate::store::ChunkStore;
+    use dtfs_common::config::ScrubConfig;
+    use tokio_stream::StreamExt;
+
+    // Minimal data-node config whose single hot disk is `disk_path`.
+    fn test_config(disk_path: &std::path::Path) -> DataNodeConfig {
+        let toml_str = format!(
+            r#"
+[node]
+id = "auto"
+hostname = "data-u2.example.com"
+data_dir = "/var/lib/dtfs/data"
+
+[location]
+region = "eu"
+datacenter = "frankfurt"
+rack = "rack-a1"
+host = "data-u2"
+
+[cluster]
+manager_addr = "mgr-01:9401"
+shared_secret = "test-secret"
+
+[grpc]
+listen_addr = "0.0.0.0:9500"
+
+[tls]
+mode = "auto"
+
+[[disks]]
+path = "{}"
+tier = "hot"
+
+[cache]
+max_memory_mb = 16
+policy = "arc"
+
+[scrub]
+quick_interval_hours = 6
+deep_interval_hours = 168
+max_io_percent = 10
+"#,
+            disk_path.display().to_string().replace('\\', "/")
+        );
+        toml::from_str(&toml_str).unwrap()
+    }
+
+    fn scrub_cfg(verify_on_read: bool) -> ScrubConfig {
+        ScrubConfig {
+            quick_interval_hours: 6,
+            deep_interval_hours: 168,
+            quick_cron: None,
+            deep_cron: None,
+            max_io_percent: 10,
+            verify_on_read,
+            quarantine_on_fault: true,
+        }
+    }
+
+    async fn make_service(
+        disk_path: &std::path::Path,
+        verify_on_read: bool,
+    ) -> DataServiceImpl {
+        std::fs::create_dir_all(disk_path.join(".dtfs")).unwrap();
+        std::fs::create_dir_all(disk_path.join(".dtfs").join("wal")).unwrap();
+        std::fs::create_dir_all(disk_path.join("chunks")).unwrap();
+        std::fs::create_dir_all(disk_path.join("tmp")).unwrap();
+
+        let disk_configs = vec![dtfs_common::config::DiskConfig {
+            path: disk_path.to_path_buf(),
+            tier: DiskTier::Hot,
+        }];
+        let dm = DiskManager::new(&disk_configs).unwrap();
+        let store = Arc::new(ChunkStore::new(dm));
+        let config = test_config(disk_path);
+        let replication = Arc::new(ReplicationManager::new(store.clone(), config.clone()));
+        DataServiceImpl {
+            config,
+            store,
+            replication,
+            metrics: Arc::new(DataMetrics::new()),
+            cache: Arc::new(ArcCache::new(64)),
+            write_slots: Arc::new(Semaphore::new(8)),
+            memory: Arc::new(MemoryBudget::from_config(
+                &dtfs_common::config::MemoryConfig::default(),
+            )),
+            scrub_config: Arc::new(RwLock::new(scrub_cfg(verify_on_read))),
+            integrity_faults: Arc::new(IntegrityFaultCollector::new(64)),
+        }
+    }
+
+    async fn collect_stream(
+        svc: &DataServiceImpl,
+        chunk_hex: &str,
+    ) -> Result<Vec<u8>, Status> {
+        let resp = svc
+            .get_chunk(Request::new(GetChunkRequest {
+                chunk_id: chunk_hex.to_string(),
+                requester_dc: String::new(),
+                requester_host: String::new(),
+            }))
+            .await?;
+        let mut stream = resp.into_inner();
+        let mut out: Vec<u8> = Vec::new();
+        let mut expected_offset: u64 = 0;
+        let mut total_seen: Option<u64> = None;
+        while let Some(item) = stream.next().await {
+            let piece = item?;
+            assert_eq!(piece.offset, expected_offset, "pieces must be contiguous");
+            if let Some(t) = total_seen {
+                assert_eq!(piece.total_size, t, "total_size must be stable");
+            } else {
+                total_seen = Some(piece.total_size);
+            }
+            expected_offset += piece.data.len() as u64;
+            out.extend_from_slice(&piece.data);
+        }
+        if let Some(t) = total_seen {
+            assert_eq!(out.len() as u64, t, "delivered bytes match total_size");
+        }
+        Ok(out)
+    }
+
+    // U2 — a cache-MISS read of a chunk LARGER than one streaming piece
+    // must round-trip byte-for-byte through the disk-streaming get path,
+    // with correct offset/total_size on every piece.
+    #[tokio::test]
+    async fn getchunk_streams_multi_piece_chunk_from_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+
+        // > one GET_PIECE_SIZE so the stream spans >1 piece.
+        let mut data = vec![0u8; GET_PIECE_SIZE + 1234];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let hash = checksum::compute(&data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+
+        let got = collect_stream(&svc, &chunk_hex).await.unwrap();
+        assert_eq!(got.len(), data.len());
+        assert_eq!(got, data, "streamed bytes must match the stored chunk");
+    }
+
+    // Bug BC-8 / U2 — verify_on_read mismatch on the streaming MISS path
+    // must still yield DATA_LOSS and deliver NO bytes as success.
+    #[tokio::test]
+    async fn getchunk_verify_on_read_mismatch_yields_data_loss() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+
+        let mut data = vec![7u8; GET_PIECE_SIZE + 99];
+        data[0] = 1;
+        let hash = checksum::compute(&data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+
+        // Corrupt the on-disk .dat so its BLAKE3 no longer matches the
+        // stored ChunkMeta.checksum.
+        let (dat_path, _size) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let mut corrupt = std::fs::read(&dat_path).unwrap();
+        corrupt[0] ^= 0xFF;
+        std::fs::write(&dat_path, &corrupt).unwrap();
+
+        let err = collect_stream(&svc, &chunk_hex)
+            .await
+            .expect_err("corrupt chunk must not stream as success");
+        assert_eq!(
+            err.code(),
+            tonic::Code::DataLoss,
+            "verify_on_read mismatch must map to DATA_LOSS"
+        );
+    }
+
+    // U2 — with verify_on_read disabled the streaming MISS path still
+    // round-trips correct bytes (the only mode where it would serve raw
+    // bytes; here the bytes are intact so the read succeeds).
+    #[tokio::test]
+    async fn getchunk_verify_off_streams_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), false).await;
+
+        let data = vec![3u8; GET_PIECE_SIZE * 2 + 5];
+        let hash = checksum::compute(&data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+
+        let got = collect_stream(&svc, &chunk_hex).await.unwrap();
+        assert_eq!(got, data);
     }
 }
