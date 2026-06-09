@@ -367,6 +367,13 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   state-mutation point.
 - `dtfs-raft/src/lib.rs::ClientRequest` — command enum; a new mutation =
   new variant + new arm in apply_request.
+- `dtfs-raft/src/network.rs::full_snapshot` — snapshot-stream RPC. Bug CL:
+  network failures here (peer unreachable / timeout / empty response) MUST map
+  to the transient `StreamingError::Unreachable` (openraft retries), NEVER to
+  `StreamingError::StorageError` — openraft treats StorageError as a fatal
+  local-storage failure and shuts down the leader's RaftCore (caused
+  cluster-wide quorum loss on dtfs-lm). Only genuine local snapshot reads use
+  StorageError.
 - `dtfs-manager/src/scheduler.rs` — migration/re-replication loop; the
   SOLE owner of replica repair (Bug AC leader gate + Bug CH).
   `schedule_path_migration` (operator moves), `flush_cache_for_path` +
