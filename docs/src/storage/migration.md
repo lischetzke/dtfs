@@ -16,7 +16,7 @@ Each state transition is persisted to the manager's Raft log before work begins,
 
 **Pending**
 
-The migration has been scheduled but not yet started. The manager has selected a source replica and a target node. The task sits in a queue until a migration slot becomes available (see concurrency limits below).
+The migration has been scheduled but not yet started. The manager has selected a source replica and a target node. The task sits in the migration table until the next scheduler pass picks it up (see throughput below).
 
 **Copying**
 
@@ -54,20 +54,33 @@ On manager startup (or leader election), the new leader scans the migration tabl
 
 Data nodes also persist their local migration state. If a data node restarts while serving as a copy target, it reports its partial progress to the manager, which decides whether to resume or restart the copy.
 
-## Concurrency Limits
+## Scheduler Throughput
 
-The number of concurrent migrations is limited to avoid saturating network and disk I/O:
+The migration scheduler runs one pass every `SCHEDULER_TICK` (30s) on the
+Raft leader. Within a pass it drives every tracked task through the state
+machine and then persists the whole migration table back to Raft once.
 
-```toml
-[migration]
-# Maximum concurrent migrations cluster-wide
-max_concurrent_global = 20
+**Multi-stage per tick.** A single pass loops over the tasks in rounds until
+a round makes no further progress, so a freshly scheduled chunk can climb
+`Pending -> Copying -> Verifying -> Completing -> Done` within ONE 30s tick
+rather than advancing a single state per tick. With a large backlog this
+makes warm coverage rise smoothly across ticks instead of staying flat for a
+whole pass and then batch-jumping. A task still attempts at most one copy and
+one verify RPC per tick: a verify checksum mismatch flaps the task back to
+`Copying` and re-copies on the NEXT tick, and a transient
+copy/source failure burns one retry per tick (up to `MAX_MIGRATION_ATTEMPTS`
+= 6 attempts, ~3 minutes, before the task is marked `Failed` and alerted).
 
-# Maximum concurrent migrations per data node (as source or target)
-max_concurrent_per_node = 4
-```
+**Bounded-parallel copies.** The `Copying`-stage `ReplicateChunk` RPCs in a
+round are dispatched concurrently, capped at `MIGRATION_COPY_CONCURRENCY` (6)
+in flight. The cap is deliberately small: each copy is a streaming gRPC that
+competes with foreground reads/writes on the source data node, and the
+primary archive's uplink (LELI, the asymmetric-bandwidth bottleneck) is
+easily saturated by a handful of concurrent streams. The `Verifying` and
+`Completing` stages stay serial (verify is cheap; `Completing` writes Raft).
 
-The manager's migration scheduler respects both limits. When a slot becomes available, the highest-priority pending task is started. Priority is determined by:
+Both constants live in `crates/dtfs-manager/src/scheduler.rs`. Priority of
+work scheduled into the table is:
 
 1. **Re-replication** (under-replicated chunks) -- highest priority.
 2. **Rebalancing** (capacity skew correction) -- medium priority.
