@@ -6,6 +6,114 @@ use std::collections::HashMap;
 use dtfs_common::topology::{Location, LocationDistance};
 use tracing::debug;
 
+/// Tie-break rank for a replica's storage tier (U4 read-locality).
+///
+/// Lower = preferred when two replicas are at the EXACT same physical
+/// distance. We prefer faster media (warm SSD/HDD) over the cold anchor HDD
+/// so reads offload the slow LELI archive disk. `hot` (rare for the media
+/// workload) ranks fastest; `tape` slowest; an empty/unknown string (e.g. an
+/// older manager that doesn't populate `node_tiers`) ranks last so it never
+/// wins a tie over a known tier but also never penalises distance.
+fn tier_tiebreak_rank(tier: &str) -> u8 {
+    match tier {
+        "hot" => 0,
+        "warm" => 1,
+        "cold" => 2,
+        "tape" => 3,
+        _ => u8::MAX,
+    }
+}
+
+/// True iff `loc` matches a `read_location_priority` entry. An entry matches
+/// when it equals (case-insensitively) the replica's datacenter or host, so
+/// an operator can list either a whole DC ("falkenstein") or a single host.
+fn location_matches_priority(loc: &Location, entry: &str) -> bool {
+    loc.datacenter.eq_ignore_ascii_case(entry) || loc.host.eq_ignore_ascii_case(entry)
+}
+
+/// Select the read replica for a chunk using the U4 precedence:
+///
+/// 1. **Configured `read_location_priority`** — the first replica whose
+///    location (datacenter or host) matches the *earliest-listed* priority
+///    entry wins. This is the operator's explicit intent and takes precedence
+///    over raw distance (lets a TORO client try Falkenstein, then Limburg).
+/// 2. **Physical distance** — `Location::distance` (SameHost < ... <
+///    CrossRegion). A strictly-nearer replica ALWAYS wins over a farther one.
+/// 3. **Tier tie-break** — only when distance is EQUAL, prefer faster media
+///    (warm over cold) to offload the cold anchor HDD. NEVER overrides a
+///    strictly-nearer replica.
+///
+/// `replicas` is `(addr, tier)` where `tier` is the lowercase tier string from
+/// the manager (`""` = unknown, older manager). Each replica's location is
+/// looked up in `known_locations` by addr; an unknown location is treated as
+/// `CrossRegion` (worst distance), matching `select_nearest_node`.
+///
+/// Falls back to the first replica when there is no client location, and to
+/// `None` when `replicas` is empty.
+pub fn select_read_replica(
+    client_location: Option<&Location>,
+    replicas: &[(String, String)],
+    known_locations: &HashMap<String, Location>,
+    read_location_priority: &[String],
+) -> Option<String> {
+    if replicas.is_empty() {
+        return None;
+    }
+
+    let client_loc = match client_location {
+        Some(loc) => loc,
+        None => {
+            debug!("no client location available, selecting first replica");
+            return Some(replicas[0].0.clone());
+        }
+    };
+
+    // (1) Priority list: scan entries in operator-listed order; the first
+    // entry that any replica's location matches wins, preferring the
+    // earliest-listed replica among matches (stable over `replicas` order).
+    for entry in read_location_priority {
+        if let Some((addr, _)) = replicas.iter().find(|(addr, _)| {
+            known_locations
+                .get(addr)
+                .map(|loc| location_matches_priority(loc, entry))
+                .unwrap_or(false)
+        }) {
+            debug!(selected = %addr, %entry, "selected replica by read_location_priority");
+            return Some(addr.clone());
+        }
+    }
+
+    // (2) distance, then (3) tier tie-break on EQUAL distance. Iterate in
+    // order so ties keep the first-listed replica (stable).
+    let mut best: Option<(&str, LocationDistance, u8)> = None;
+    for (addr, tier) in replicas {
+        let distance = match known_locations.get(addr) {
+            Some(node_loc) => client_loc.distance(node_loc),
+            None => LocationDistance::CrossRegion,
+        };
+        let rank = tier_tiebreak_rank(tier);
+        let better = match best {
+            None => true,
+            Some((_, best_dist, best_rank)) => {
+                distance < best_dist || (distance == best_dist && rank < best_rank)
+            }
+        };
+        if better {
+            best = Some((addr, distance, rank));
+        }
+    }
+
+    let (best_addr, best_distance, best_rank) = best.expect("replicas non-empty");
+    debug!(
+        selected = %best_addr,
+        distance = ?best_distance,
+        tier_rank = best_rank,
+        candidates = replicas.len(),
+        "selected read replica (distance + tier tie-break)"
+    );
+    Some(best_addr.to_string())
+}
+
 /// Select the nearest data node from a list of candidate addresses.
 ///
 /// Uses the topology `Location` hierarchy to compute distances between the
@@ -234,5 +342,118 @@ mod tests {
         let sorted = sort_nodes_by_distance(Some(&client), &addrs, &locations);
         // known-near first, then unknown-1/known-far/unknown-2 all CrossRegion → stable original order.
         assert_eq!(sorted[0], "known-near:9000");
+    }
+
+    // --- U4: tier-aware + read_location_priority selection ---
+
+    fn rep(addr: &str, tier: &str) -> (String, String) {
+        (addr.to_string(), tier.to_string())
+    }
+
+    #[test]
+    fn test_priority_list_picks_listed_location_first() {
+        // TORO client; replicas in Limburg (nearer-ish) and Falkenstein.
+        // Priority lists Falkenstein first, so it must win over distance.
+        let client = loc("eu", "toro", "rack-1", "client-02");
+        let replicas = vec![rep("limburg:9500", "warm"), rep("falkenstein:9500", "cold")];
+        let mut locations = HashMap::new();
+        locations.insert("limburg:9500".into(), loc("eu", "limburg", "rack-9", "n1"));
+        locations.insert(
+            "falkenstein:9500".into(),
+            loc("eu", "falkenstein", "rack-9", "n2"),
+        );
+
+        let priority = vec!["falkenstein".to_string(), "limburg".to_string()];
+        let got = select_read_replica(Some(&client), &replicas, &locations, &priority);
+        assert_eq!(got.unwrap(), "falkenstein:9500");
+
+        // Reversing the priority order flips the winner.
+        let priority2 = vec!["limburg".to_string(), "falkenstein".to_string()];
+        let got2 = select_read_replica(Some(&client), &replicas, &locations, &priority2);
+        assert_eq!(got2.unwrap(), "limburg:9500");
+    }
+
+    #[test]
+    fn test_equal_distance_warm_beats_cold() {
+        // Two replicas at the SAME distance (both same-datacenter, diff rack).
+        // No priority list → tier tie-break prefers warm over cold.
+        let client = loc("eu", "fra", "rack-1", "client-01");
+        let replicas = vec![rep("cold-node:9500", "cold"), rep("warm-node:9500", "warm")];
+        let mut locations = HashMap::new();
+        locations.insert("cold-node:9500".into(), loc("eu", "fra", "rack-2", "n1"));
+        locations.insert("warm-node:9500".into(), loc("eu", "fra", "rack-3", "n2"));
+
+        let got = select_read_replica(Some(&client), &replicas, &locations, &[]);
+        assert_eq!(got.unwrap(), "warm-node:9500");
+    }
+
+    #[test]
+    fn test_nearer_cold_beats_farther_warm() {
+        // LELI reader: a LOCAL cold replica must beat a remote warm one.
+        // Tier is only a tie-break and must NOT override strictly-nearer.
+        let client = loc("eu", "leli", "rack-1", "client-01");
+        let replicas = vec![
+            rep("remote-warm:9500", "warm"),
+            rep("local-cold:9500", "cold"),
+        ];
+        let mut locations = HashMap::new();
+        // remote warm = cross-region (farthest)
+        locations.insert("remote-warm:9500".into(), loc("us", "east", "rack-1", "n1"));
+        // local cold = same host (nearest)
+        locations.insert(
+            "local-cold:9500".into(),
+            loc("eu", "leli", "rack-1", "client-01"),
+        );
+
+        let got = select_read_replica(Some(&client), &replicas, &locations, &[]);
+        assert_eq!(got.unwrap(), "local-cold:9500");
+    }
+
+    #[test]
+    fn test_no_priority_no_tier_behaves_like_distance_only() {
+        // Empty tier strings (older manager) + no priority list ⇒ pure
+        // distance, identical to select_nearest_node's choice.
+        let client = loc("eu", "fra", "rack-1", "client-01");
+        let replicas = vec![
+            rep("far:9500", ""),
+            rep("same-rack:9500", ""),
+            rep("same-dc:9500", ""),
+        ];
+        let mut locations = HashMap::new();
+        locations.insert("far:9500".into(), loc("us", "east", "rack-1", "n1"));
+        locations.insert("same-rack:9500".into(), loc("eu", "fra", "rack-1", "other"));
+        locations.insert("same-dc:9500".into(), loc("eu", "fra", "rack-2", "n3"));
+
+        let addrs: Vec<String> = replicas.iter().map(|(a, _)| a.clone()).collect();
+        let via_old = select_nearest_node(Some(&client), &addrs, &locations);
+        let via_new = select_read_replica(Some(&client), &replicas, &locations, &[]);
+        assert_eq!(via_new, via_old);
+        assert_eq!(via_new.unwrap(), "same-rack:9500");
+    }
+
+    #[test]
+    fn test_priority_falls_through_to_distance_when_no_match() {
+        // Priority entry matches no replica → fall through to distance.
+        let client = loc("eu", "fra", "rack-1", "client-01");
+        let replicas = vec![rep("far:9500", "cold"), rep("near:9500", "cold")];
+        let mut locations = HashMap::new();
+        locations.insert("far:9500".into(), loc("us", "east", "rack-1", "n1"));
+        locations.insert("near:9500".into(), loc("eu", "fra", "rack-1", "n2"));
+
+        let priority = vec!["nonexistent-dc".to_string()];
+        let got = select_read_replica(Some(&client), &replicas, &locations, &priority);
+        assert_eq!(got.unwrap(), "near:9500");
+    }
+
+    #[test]
+    fn test_select_read_replica_empty() {
+        assert!(select_read_replica(None, &[], &HashMap::new(), &[]).is_none());
+    }
+
+    #[test]
+    fn test_select_read_replica_no_client_loc_returns_first() {
+        let replicas = vec![rep("a:9500", "cold"), rep("b:9500", "warm")];
+        let got = select_read_replica(None, &replicas, &HashMap::new(), &[]);
+        assert_eq!(got.unwrap(), "a:9500");
     }
 }

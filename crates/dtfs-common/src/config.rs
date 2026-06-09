@@ -292,6 +292,15 @@ pub struct FuseConfig {
     /// keeps working (cap 0 = unbounded, no ladder).
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// U4 read-locality — ordered datacenter/host read preference. When set,
+    /// reads pick the first replica whose location (datacenter OR host)
+    /// matches the earliest-listed entry, taking precedence over raw physical
+    /// distance (the operator's explicit intent, e.g. a TORO client trying
+    /// Falkenstein then Limburg). Entries match case-insensitively. Empty
+    /// (the default) = current distance-only behaviour. `#[serde(default)]`
+    /// so a legacy `fuse.toml` keeps working.
+    #[serde(default)]
+    pub read_location_priority: Vec<String>,
 }
 
 // --- Sub-configs ---
@@ -1079,6 +1088,24 @@ mod tests {
         assert_eq!(cfg.memory.hard_cap_mb, 0);
         assert_eq!(cfg.memory.warn_threshold_pct, default_warn_pct());
         assert_eq!(cfg.memory.shed_threshold_pct, default_shed_pct());
+        // U4 — the commented-out read_location_priority leaves reads on the
+        // distance-only default (empty list).
+        assert!(cfg.read_location_priority.is_empty());
+    }
+
+    /// U4 — an explicit read_location_priority list parses and overrides the
+    /// empty default. Gates the FuseConfig field + serde(default) plumbing.
+    #[test]
+    fn u4_read_location_priority_parses() {
+        let cfg: FuseConfig = toml::from_str(
+            "read_location_priority = [\"falkenstein\", \"limburg\"]\n\
+             [client]\nmanager_addr = \"10.0.0.1:9401\"\n\
+             [location]\nregion = \"eu\"\ndatacenter = \"toro\"\nrack = \"r1\"\nhost = \"c_cln\"\n\
+             [mount]\nmountpoint = \"/mnt/dtfs\"\n\
+             [readahead]\n[cache]\n[partition_safety]\n",
+        )
+        .expect("read_location_priority must parse");
+        assert_eq!(cfg.read_location_priority, vec!["falkenstein", "limburg"]);
     }
 
     /// CF-5 — an explicit `[memory]` block on the manager/fuse roles parses
