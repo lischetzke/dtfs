@@ -7,6 +7,26 @@ The FUSE client is configured via `/etc/dtfs/fuse.toml`. This page documents eve
 > service exit at startup; under systemd it restart-loops every few seconds.
 > After editing, check `journalctl -u dtfs-fuse@<mount> -n 20`.
 
+## Top-level options
+
+These keys sit at the root of `fuse.toml` (before any `[table]` header).
+
+| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
+|--------|-----------|------|---------|-------------|-------------|-------------|
+| `read_location_priority` | `read_location_priority` | `Vec<String>` | `[]` | Datacenter or host names | No | Ordered read-location preference (U4). When set, a read picks the first replica whose `datacenter` **or** `host` matches the earliest-listed entry (case-insensitive), taking precedence over raw physical distance — the operator's explicit cross-DC routing intent. When no entry matches, selection falls through to physical distance and then a warm-over-cold tier tie-break. Empty (the default) = distance-only behaviour, unchanged. |
+
+Read replica selection order (U4): **(1)** `read_location_priority` (if any entry matches a replica's DC/host); **(2)** physical distance (`SameHost` < `SameRack` < `SameDatacenter` < `SameRegion` < `CrossRegion`); **(3)** when distance is *equal*, prefer the faster tier (warm over the cold anchor HDD). The tier is only a tie-break — a strictly-nearer replica always wins, so a local cold copy still beats a remote warm one.
+
+### Example
+
+```toml
+# A TORO client that should read from DC1 first, then DC3,
+# before considering any other replica by distance.
+read_location_priority = ["dc1", "dc3"]
+```
+
+---
+
 ## `[client]` -- Manager Connection
 
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |

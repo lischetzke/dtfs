@@ -10,6 +10,13 @@
 # makes the service exit at startup — under systemd that is a restart loop.
 # Validate after editing: journalctl -u dtfs-fuse@<mount> -n 20.
 
+# U4: ordered read-location preference. When set, reads pick the first replica
+# whose datacenter OR host matches the earliest-listed entry (case-insensitive),
+# taking precedence over raw physical distance. Falls through to distance (then
+# a warm-over-cold tier tie-break) when no entry matches. Default: empty list =
+# distance-only. Top-level key: it must precede the first [table] header.
+#read_location_priority = ["dc1", "dc3"]
+
 [client]
 manager_addr = "10.0.0.1:9401"      # primary manager gRPC endpoint
 # Fallback managers, walked in order on failover (F-024).

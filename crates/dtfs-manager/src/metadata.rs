@@ -451,6 +451,23 @@ fn resolve_node_contact(sm: &StateMachineData, stored: &str) -> String {
     stored.to_string()
 }
 
+/// U4: resolve a chunk replica's storage tier (lowercase string) from the
+/// disk it lives on. The chunk entry stores `node_id` (numeric in current
+/// builds) + `disk_id`; the disk's `tier` comes from the node registry. Used
+/// to populate `ChunkLocationInfo.node_tiers` so the read client can prefer
+/// warm over the cold anchor HDD on a distance tie. Returns `""` when the
+/// node/disk is not (yet) known, which the client treats as "no tie-break".
+fn replica_tier_string(sm: &StateMachineData, node_id: &str, disk_id: u32) -> String {
+    let Ok(id) = node_id.parse::<u64>() else {
+        return String::new();
+    };
+    sm.nodes
+        .get(&id)
+        .and_then(|n| n.disks.iter().find(|d| d.disk_id == disk_id))
+        .map(|d| d.tier.to_string())
+        .unwrap_or_default()
+}
+
 /// Reverse-lookup the numeric node ID for a given gRPC address.
 ///
 /// Storing numeric IDs in `ChunkLocationEntry.node_id` keeps the field type
@@ -527,16 +544,22 @@ impl ManagerService for MetadataService {
         let mut by_chunk: BTreeMap<u64, ChunkLocationInfo> = BTreeMap::new();
         for c in &file.chunks {
             let addr = resolve_node_contact(&data, &c.node_id);
+            // U4: derive this replica's storage tier from the disk it lives
+            // on (node.disks[disk_id].tier), positionally aligned with
+            // node_addresses so the client can use it as a read tie-break.
+            let tier = replica_tier_string(&data, &c.node_id, c.disk_id);
             let e = by_chunk
                 .entry(c.chunk_index)
                 .or_insert_with(|| ChunkLocationInfo {
                     chunk_id: c.chunk_hash.clone(),
                     size: c.size_bytes,
                     node_addresses: Vec::new(),
+                    node_tiers: Vec::new(),
                 });
             e.size = e.size.max(c.size_bytes);
             if !e.node_addresses.contains(&addr) {
                 e.node_addresses.push(addr);
+                e.node_tiers.push(tier);
             }
         }
 
