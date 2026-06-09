@@ -286,6 +286,13 @@ message ChunkLocationInfo {
   string chunk_id = 1;
   uint64 size = 2;
   repeated string node_addresses = 3; // All replica addresses
+  // U4 read-locality: per-replica storage tier, lowercase
+  // ("hot"/"warm"/"cold"/"tape"), positionally aligned 1:1 with
+  // node_addresses. The client uses this as a tie-break when two replicas
+  // are at the same physical distance (prefer warm over the cold anchor
+  // HDD). Additive/back-compatible: an older manager leaves this empty, in
+  // which case the client falls back to pure distance.
+  repeated string node_tiers = 4;
 }
 
 message GetFileLocationsResponse {

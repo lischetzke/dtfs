@@ -82,21 +82,30 @@ The FUSE client caches `FileLocations` in a `DashMap` with a configurable TTL (d
 
 Cache invalidation happens automatically on TTL expiry and explicitly after a `flush()` or `unlink()`.
 
-### Nearest-Node Selection
+### Read Replica Selection
 
-When a chunk has multiple replicas across different nodes, the FUSE client selects the nearest one based on topology distance. The client compares its own configured `Location` (region/datacenter/rack/host) against each replica node's location:
+When a chunk has multiple replicas across different nodes, the FUSE client picks the read replica using a three-level precedence (U4):
 
 ```
-  Priority order (closest first):
+  1. read_location_priority (operator config, if any entry matches)
+        first replica whose datacenter OR host matches the
+        earliest-listed entry wins -- takes precedence over distance
+        (the operator's explicit cross-DC routing intent)
 
-  1. SameHost       -- co-located on the same machine
-  2. SameRack       -- same rack, different host
-  3. SameDatacenter -- same DC, different rack
-  4. SameRegion     -- same region, different DC
-  5. CrossRegion    -- different region entirely
+  2. Physical distance (closest first):
+        a. SameHost       -- co-located on the same machine
+        b. SameRack       -- same rack, different host
+        c. SameDatacenter -- same DC, different rack
+        d. SameRegion     -- same region, different DC
+        e. CrossRegion    -- different region entirely
+
+  3. Tier tie-break (only when distance is EQUAL):
+        prefer warm over the cold anchor HDD, to offload the slow
+        archive disk. NEVER overrides a strictly-nearer replica --
+        a local cold copy still beats a remote warm one.
 ```
 
-The selection function is in `dtfs_client::location::select_nearest_node`. If location data is unavailable for a node, the first address in the list is used as a fallback.
+The selection function is `dtfs_client::location::select_read_replica`. Each replica's tier comes from the manager in `GetFileLocations` (`ChunkLocationInfo.node_tiers`, positionally aligned with `node_addresses`); an older manager leaves it empty, in which case the tier tie-break is inert and selection is pure distance. `read_location_priority` is configured per client in `fuse.toml` (empty by default = distance-only). If location data is unavailable for a node, it is treated as `CrossRegion`; with no client location the first address is used as a fallback.
 
 ### Read-Ahead Prefetching
 

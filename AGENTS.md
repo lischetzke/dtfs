@@ -99,10 +99,16 @@ write (success=false, no Raft write) when any chunk lands fewer distinct
 `(node_id, disk_id)` replicas than the volume's
 `write_safety.min_replicas_before_ack` (`metadata::ack_floor_satisfied`).
 
-**Read:** lookup metadata (cached for ENTRY_TTL) → pick nearest healthy
-replica (location.rs distance heuristic) → stream GetChunk → optionally
-cache locally (P0-11) → readahead engine prefetches (folder- or
-file-sequential).
+**Read:** lookup metadata (cached for ENTRY_TTL) → pick the read replica
+(`location.rs::select_read_replica`, U4 order: (1) configured
+`read_location_priority` — first replica whose datacenter/host matches the
+earliest-listed entry, operator intent, beats distance; (2) physical distance
+(`Location::distance`); (3) tier tie-break on *equal* distance — prefer warm
+over the cold anchor HDD, never overriding a strictly-nearer replica) → stream
+GetChunk → optionally cache locally (P0-11) → readahead engine prefetches
+(folder- or file-sequential). `GetFileLocations` carries each replica's tier
+(`ChunkLocationInfo.node_tiers`, positional with `node_addresses`); an older
+manager leaves it empty (→ unknown tier → pure distance).
 
 ## A.3 Conventions — Do Not Break
 

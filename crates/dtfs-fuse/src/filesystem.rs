@@ -65,6 +65,29 @@ pub struct ChunkInfo {
     pub chunk_id: String,
     pub size: u64,
     pub node_addresses: Vec<String>,
+    /// U4 read-locality: per-replica storage tier (lowercase string),
+    /// positionally aligned 1:1 with `node_addresses`. Comes from the
+    /// manager's `ChunkLocationInfo.node_tiers`. Used as a distance tie-break
+    /// in read replica selection (prefer warm over the cold anchor HDD). An
+    /// older manager leaves this empty (or shorter); missing entries are
+    /// treated as unknown tier, falling back to pure distance.
+    pub node_tiers: Vec<String>,
+}
+
+impl ChunkInfo {
+    /// Pair each replica address with its tier string for read selection.
+    /// Tolerates a shorter/absent `node_tiers` (older manager) by treating
+    /// the missing positions as unknown (`""`).
+    fn replicas_with_tiers(&self) -> Vec<(String, String)> {
+        self.node_addresses
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                let tier = self.node_tiers.get(i).cloned().unwrap_or_default();
+                (addr.clone(), tier)
+            })
+            .collect()
+    }
 }
 
 /// File attributes (stat-like information).
@@ -563,10 +586,12 @@ impl DtfsFilesystem {
                 bail!("no data nodes available for chunk {}", chunk.chunk_id);
             }
 
-            // P0-2: build candidate list sorted by distance (nearest first),
-            // try each on failure until one succeeds. Single-replica clusters
-            // and single-address chunks degenerate to one attempt.
-            let candidates = self.sort_candidates(&chunk.node_addresses);
+            // P0-2 + U4: build the candidate list with the U4-preferred
+            // replica first (read_location_priority -> distance -> warm tie-
+            // break), then distance-ordered fallback. Try each on failure
+            // until one succeeds. Single-replica clusters and single-address
+            // chunks degenerate to one attempt.
+            let candidates = self.read_candidates(chunk);
 
             // Try read-ahead in-memory cache first: any candidate's cache
             // key works because chunks are content-addressed by chunk_id.
@@ -1374,6 +1399,7 @@ impl DtfsFilesystem {
                 chunk_id: c.chunk_id,
                 size: c.size,
                 node_addresses: c.node_addresses,
+                node_tiers: c.node_tiers,
             })
             .collect();
 
@@ -1481,6 +1507,48 @@ impl DtfsFilesystem {
             addresses,
             &known,
         )
+    }
+
+    /// U4: ordered read candidates for one chunk. The first element is the
+    /// U4-preferred replica (configured `read_location_priority` -> physical
+    /// distance -> warm-over-cold tier tie-break); the remaining elements are
+    /// distance-ordered fallback (P0-2), so a read that fails the preferred
+    /// replica still walks the rest nearest-first.
+    fn read_candidates(&self, chunk: &ChunkInfo) -> Vec<String> {
+        let addresses = &chunk.node_addresses;
+        if addresses.len() <= 1 {
+            return addresses.to_vec();
+        }
+
+        let known: HashMap<String, Location> = addresses
+            .iter()
+            .filter_map(|addr| {
+                self.known_locations
+                    .get(addr)
+                    .map(|loc| (addr.clone(), loc.clone()))
+            })
+            .collect();
+
+        let replicas = chunk.replicas_with_tiers();
+        let preferred = dtfs_client::location::select_read_replica(
+            Some(&self.client_location),
+            &replicas,
+            &known,
+            &self.config.read_location_priority,
+        );
+
+        // Distance-ordered fallback for the remaining replicas.
+        let mut ordered = dtfs_client::location::sort_nodes_by_distance(
+            Some(&self.client_location),
+            addresses,
+            &known,
+        );
+        if let Some(winner) = preferred {
+            // Hoist the U4 winner to the front, keeping the rest's order.
+            ordered.retain(|a| a != &winner);
+            ordered.insert(0, winner);
+        }
+        ordered
     }
 
     /// Flush chunk segments to the cluster.
