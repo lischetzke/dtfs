@@ -112,6 +112,15 @@ The read-ahead engine supports multiple modes configured via `fuse.toml`:
 
 Prefetched data is stored in a bounded in-memory cache (default 256 entries). Cache hits are logged at DEBUG level.
 
+### Serving GetChunk on the Data Node
+
+When a data node serves `GetChunk`, it never buffers the whole chunk in heap (Bug-I parity for the read side):
+
+- **Cache hit**: the chunk is already resident in the ARC cache, so it is sliced and streamed from that in-memory buffer in 8 MB pieces.
+- **Cache miss**: the node resolves the chunk's on-disk `.dat` path and size without reading the file, then streams it in 8 MB pieces via `read_exact` (one piece in RAM at a time). A cold miss does NOT repopulate the ARC cache, so a large-file read does not re-buffer the full chunk; a hot set re-promoted by tiering still lands in cache on later reads.
+
+When `verify_on_read` is enabled (the default), the miss path BLAKE3-hashes the on-disk file incrementally (one piece at a time, never the whole chunk) and compares against the stored `ChunkMeta.checksum` BEFORE any bytes leave the process. A mismatch returns `Status::data_loss` and serves nothing, so the FUSE client falls over to a healthy replica (P0-2); it then streams the file a second pass to send. Disabling `verify_on_read` (gated by an explicit API-boundary ack) skips the hash and streams the raw bytes — the only mode where a read can deliver corrupt bytes.
+
 ## Write Path
 
 A FUSE `write()` call follows this sequence:
