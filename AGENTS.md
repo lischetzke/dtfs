@@ -377,7 +377,16 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   `validate_task_target` (dispatch fast-fails tasks targeting
   non-Data/dead/tier-less nodes → `migration.invalid_target` audit),
   `check_misplaced_rebalance` / `plan_excess_spill_removal` (Bug BX-5
-  rebalance).
+  rebalance). `advance_tasks` drives the task state machine each 30s tick;
+  U3 made it multi-transition-per-tick (round loop until no progress, so a
+  chunk climbs Pending->Done in ONE tick) + bounded-parallel copy
+  (`MIGRATION_COPY_CONCURRENCY`=6 in-flight `ReplicateChunk` RPCs;
+  `MAX_ADVANCE_ROUNDS`=8 guard). The transition logic lives in the generic
+  `advance_migration_tasks` over the `MigrationOps` trait
+  (`TaskScheduler` is the live impl; unit-tested via a mock in
+  `advance_round_tests`); a task still attempts at most one copy + one
+  verify RPC per tick (preserves the pre-U3 retry cadence + verify-mismatch
+  re-copy-next-tick). Still ONE `save_migration_state` Raft write per tick.
 - `dtfs-manager/src/monitor.rs` — heartbeat health detection only
   (Bug CH): commits node-status transitions, fires NodeDown/SMART
   alerts. MUST NOT schedule repair — the 2026-06-06 storm came from a
