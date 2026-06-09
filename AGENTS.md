@@ -119,7 +119,11 @@ snapshots load cleanly. Add a regression test
 new field.
 
 **A.3.2 Memory discipline.** No `Vec<u8>` accumulation of full chunks on
-the hot path — stream to disk, hash incrementally (Bug I). Memory caps
+the hot path — stream to disk, hash incrementally (Bug I). The read-serve
+path has the same parity (U2): the data-node `GetChunk` handler streams
+the chunk off disk in 8 MB pieces (`read_exact`) and runs `verify_on_read`
+via an incremental BLAKE3 hash, so a cache MISS never holds the whole
+chunk in heap. Memory caps
 are best-effort; never reject requests by default (the RESOURCE_EXHAUSTED
 shed is opt-in, last resort — see § A.5). The `[memory]` block
 (`hard_cap_mb` etc.) is implemented on **all three roles** (CF-5): the
@@ -373,6 +377,13 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   state-mutation point.
 - `dtfs-raft/src/lib.rs::ClientRequest` — command enum; a new mutation =
   new variant + new arm in apply_request.
+- `dtfs-raft/src/network.rs::full_snapshot` — snapshot-stream RPC. Bug CL:
+  network failures here (peer unreachable / timeout / empty response) MUST map
+  to the transient `StreamingError::Unreachable` (openraft retries), NEVER to
+  `StreamingError::StorageError` — openraft treats StorageError as a fatal
+  local-storage failure and shuts down the leader's RaftCore (caused
+  cluster-wide quorum loss on dtfs-lm). Only genuine local snapshot reads use
+  StorageError.
 - `dtfs-manager/src/scheduler.rs` — migration/re-replication loop; the
   SOLE owner of replica repair (Bug AC leader gate + Bug CH).
   `schedule_path_migration` (operator moves), `flush_cache_for_path` +
@@ -383,7 +394,16 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   `validate_task_target` (dispatch fast-fails tasks targeting
   non-Data/dead/tier-less nodes → `migration.invalid_target` audit),
   `check_misplaced_rebalance` / `plan_excess_spill_removal` (Bug BX-5
-  rebalance).
+  rebalance). `advance_tasks` drives the task state machine each 30s tick;
+  U3 made it multi-transition-per-tick (round loop until no progress, so a
+  chunk climbs Pending->Done in ONE tick) + bounded-parallel copy
+  (`MIGRATION_COPY_CONCURRENCY`=6 in-flight `ReplicateChunk` RPCs;
+  `MAX_ADVANCE_ROUNDS`=8 guard). The transition logic lives in the generic
+  `advance_migration_tasks` over the `MigrationOps` trait
+  (`TaskScheduler` is the live impl; unit-tested via a mock in
+  `advance_round_tests`); a task still attempts at most one copy + one
+  verify RPC per tick (preserves the pre-U3 retry cadence + verify-mismatch
+  re-copy-next-tick). Still ONE `save_migration_state` Raft write per tick.
 - `dtfs-manager/src/monitor.rs` — heartbeat health detection only
   (Bug CH): commits node-status transitions, fires NodeDown/SMART
   alerts. MUST NOT schedule repair — the 2026-06-06 storm came from a
