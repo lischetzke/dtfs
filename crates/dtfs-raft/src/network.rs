@@ -241,13 +241,16 @@ impl RaftNetworkV2<TypeConfig> for DtfsNetwork {
 
         let resp_json = tokio::select! {
             result = &mut rpc_fut => {
-                result.map_err(|e| {
-                    StreamingError::StorageError(openraft::StorageError::from_io_error(
-                        openraft::ErrorSubject::Snapshot(None),
-                        openraft::ErrorVerb::Write,
-                        io::Error::new(io::ErrorKind::Other, e.to_string()),
-                    ))
-                })?
+                // Bug CL — a snapshot RPC that fails because the FOLLOWER is
+                // unreachable / timed out is a NETWORK error, not local
+                // storage. Mapping it to StreamingError::StorageError made
+                // openraft treat it as a fatal storage failure and SHUT DOWN
+                // the leader's RaftCore (prod 2026-06-09: "Write Snapshot(None):
+                // Unreachable node Timeout" -> Shutdown -> cluster-wide quorum
+                // loss). Route the RPCError through the transient
+                // Unreachable/Timeout/Network mapping so openraft just retries
+                // replication to that peer instead of dying.
+                result.map_err(StreamingError::from)?
             }
             closed = &mut cancel_fut => {
                 return Err(StreamingError::Closed(closed));
@@ -256,11 +259,15 @@ impl RaftNetworkV2<TypeConfig> for DtfsNetwork {
 
         let resp: SnapshotResponse<TypeConfig> =
             serde_json::from_str(&resp_json).map_err(|e| {
-                StreamingError::StorageError(openraft::StorageError::from_io_error(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Read,
-                    io::Error::new(io::ErrorKind::InvalidData, e),
-                ))
+                // Bug CL — an empty / garbage snapshot response means the peer
+                // returned nothing because it is down or unreachable, NOT local
+                // snapshot corruption. (Prod 2026-06-09: "Read Snapshot(None):
+                // EOF while parsing a value at line 1 column 0" -> fatal
+                // Shutdown.) Treat as a transient Unreachable so openraft
+                // retries, rather than a fatal StorageError.
+                StreamingError::from(unreachable_err(format!(
+                    "deserialize snapshot response: {e}"
+                )))
             })?;
 
         Ok(resp)
@@ -293,4 +300,26 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod cl_snapshot_error_tests {
+    use super::*;
+
+    // Bug CL — a snapshot-stream RPC failure (peer unreachable / timed out /
+    // empty response from a dead peer) MUST classify as a transient
+    // StreamingError so openraft retries replication. It must NEVER become a
+    // StorageError, which openraft treats as a fatal local-storage failure and
+    // responds to by shutting down the leader's RaftCore (prod 2026-06-09
+    // cluster-wide quorum loss). full_snapshot now routes RPC errors through
+    // `StreamingError::from(RPCError)`; this guards that mapping.
+    #[test]
+    fn snapshot_rpc_error_is_transient_not_fatal_storage() {
+        let e: StreamingError<TypeConfig> =
+            StreamingError::from(unreachable_err("peer down".into()));
+        assert!(
+            matches!(e, StreamingError::Unreachable(_)),
+            "snapshot RPC failure must be transient Unreachable, not fatal StorageError"
+        );
+    }
 }
