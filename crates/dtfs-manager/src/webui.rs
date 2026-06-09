@@ -2831,8 +2831,20 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     <span class="settings-val">${{tier.cold_threshold_days ?? '—'}}</span>
                 </div>
                 <div class="settings-row">
+                    <label>Frozen threshold (days)</label>
+                    <span class="settings-val">${{tier.frozen_threshold_days ?? '—'}}</span>
+                </div>
+                <div class="settings-row">
+                    <label>Evaluation interval (secs)</label>
+                    <span class="settings-val">${{tier.evaluation_interval_secs ?? '—'}}</span>
+                </div>
+                <div class="settings-row">
                     <label>Migration bandwidth (MB/s)</label>
                     <span class="settings-val">${{tier.migration_bandwidth_limit_mbps ?? '—'}}</span>
+                </div>
+                <div class="settings-row">
+                    <label>Cache redundancy escalation</label>
+                    <span class="settings-val">${{tier.enable_cache_redundancy_escalation ? '✅ Yes' : '❌ No'}}</span>
                 </div>
             </div>
 

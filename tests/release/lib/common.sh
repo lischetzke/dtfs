@@ -39,7 +39,10 @@ mgr_post_leader() {
     for h in $(mgrs_list); do
         local r=$(curl "${CURL_OPTS[@]}" -X POST -H 'content-type: application/json' \
                   -d "$body" "http://$h:$MGR_PORT$path" 2>/dev/null)
-        if echo "$r" | grep -q '"error"[^"]*has to forward request'; then
+        # Skip a non-leader: openraft surfaces the forward hint either bare
+        # or wrapped ("raft write failed: has to forward request to: ..."),
+        # so match the substring anywhere rather than right after "error".
+        if echo "$r" | grep -q 'has to forward request'; then
             continue
         fi
         echo "$r"
