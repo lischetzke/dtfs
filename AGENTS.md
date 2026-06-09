@@ -102,7 +102,11 @@ write (success=false, no Raft write) when any chunk lands fewer distinct
 **Read:** lookup metadata (cached for ENTRY_TTL) → pick nearest healthy
 replica (location.rs distance heuristic) → stream GetChunk → optionally
 cache locally (P0-11) → readahead engine prefetches (folder- or
-file-sequential).
+file-sequential). U2: the data-node GetChunk handler streams the chunk in
+8 MB pieces — a cache HIT slices the in-memory `Bytes`; a cache MISS
+resolves the on-disk `.dat` path+size via `store::chunk_file_path` (no
+read) and streams it with `read_exact`, never buffering the whole chunk
+(Bug-I parity). A cold miss does NOT repopulate the ARC cache.
 
 ## A.3 Conventions — Do Not Break
 
@@ -113,7 +117,11 @@ snapshots load cleanly. Add a regression test
 new field.
 
 **A.3.2 Memory discipline.** No `Vec<u8>` accumulation of full chunks on
-the hot path — stream to disk, hash incrementally (Bug I). Memory caps
+the hot path — stream to disk, hash incrementally (Bug I). The read-serve
+path has the same parity (U2): the data-node `GetChunk` handler streams
+the chunk off disk in 8 MB pieces (`read_exact`) and runs `verify_on_read`
+via an incremental BLAKE3 hash, so a cache MISS never holds the whole
+chunk in heap. Memory caps
 are best-effort; never reject requests by default (the RESOURCE_EXHAUSTED
 shed is opt-in, last resort — see § A.5). The `[memory]` block
 (`hard_cap_mb` etc.) is implemented on **all three roles** (CF-5): the
