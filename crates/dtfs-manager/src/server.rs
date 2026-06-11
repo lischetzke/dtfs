@@ -4,6 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dtfs_common::config::ManagerConfig;
 use dtfs_proto::dtfs::manager::manager_service_server::ManagerServiceServer;
+use dtfs_raft::network::base64_decode;
 use dtfs_raft::DtfsRaft;
 use http_body_util::BodyExt;
 use openraft::raft::{AppendEntriesRequest, VoteRequest};
@@ -117,6 +118,8 @@ impl RaftTransportHandler {
             Ok(snap) => {
                 debug!("RaftTransport: InstallSnapshot");
                 let data = base64_decode(&snap.data_base64);
+                // CNF-4: free the base64 copy before installing the snapshot.
+                drop(snap.data_base64);
                 let snapshot = openraft::storage::Snapshot {
                     meta: snap.meta,
                     snapshot: std::io::Cursor::new(data),
@@ -137,42 +140,8 @@ impl RaftTransportHandler {
     }
 }
 
-/// Minimal base64 decoder.
-fn base64_decode(input: &str) -> Vec<u8> {
-    const TABLE: [u8; 256] = {
-        let mut t = [255u8; 256];
-        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut i = 0;
-        while i < 64 {
-            t[chars[i] as usize] = i as u8;
-            i += 1;
-        }
-        t
-    };
-
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut buf: u32 = 0;
-    let mut bits: u32 = 0;
-
-    for &b in bytes {
-        if b == b'=' {
-            break;
-        }
-        let val = TABLE[b as usize];
-        if val == 255 {
-            continue;
-        }
-        buf = (buf << 6) | val as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-            buf &= (1 << bits) - 1;
-        }
-    }
-    out
-}
+// base64 decode lives in dtfs_raft::network (shared with the sender's
+// encoder so the pair is round-trip tested together — CNF-4).
 
 // ---------------------------------------------------------------------------
 // RaftTransport as a tonic-compatible service

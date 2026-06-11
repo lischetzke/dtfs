@@ -383,7 +383,13 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   `StreamingError::StorageError` — openraft treats StorageError as a fatal
   local-storage failure and shuts down the leader's RaftCore (caused
   cluster-wide quorum loss on dtfs-lm). Only genuine local snapshot reads use
-  StorageError.
+  StorageError. CNF-4: cross-peer snapshot sends are capped at 2 in flight
+  (`SNAPSHOT_SEND_PERMITS` semaphore — each send holds ~2.7x snapshot size in
+  heap as base64+JSON); the shared base64 encoder/decoder pair lives here
+  (`base64_encode`/`base64_decode`, used by the dtfs-manager snapshot
+  receiver). The transport is a JSON-string unary RPC — serde_bytes would
+  serialize as an int array (bigger than base64), so don't drop the base64
+  without a wire change.
 - `dtfs-manager/src/scheduler.rs` — migration/re-replication loop; the
   SOLE owner of replica repair (Bug AC leader gate + Bug CH).
   `schedule_path_migration` (operator moves), `flush_cache_for_path` +
