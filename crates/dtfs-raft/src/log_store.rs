@@ -24,7 +24,7 @@ use std::sync::Arc;
 use serde::{de::DeserializeOwned, Serialize};
 
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
-use rocksdb::{ColumnFamilyDescriptor, Options, DB};
+use rocksdb::{BlockBasedOptions, Cache, ColumnFamilyDescriptor, Options, DB};
 use tokio::sync::RwLock;
 use tracing::debug;
 
@@ -63,6 +63,12 @@ pub struct RocksDbLogOpts {
     pub keep_log_file_num: u64,
     /// `max_manifest_file_size` — MANIFEST rotates once it exceeds this.
     pub max_manifest_bytes: u64,
+    /// CNF-3 — per-CF memtable (write buffer) size in MiB. Bounds the
+    /// write-side memory of each column family.
+    pub write_buffer_mb: u64,
+    /// CNF-3 — LRU block-cache size in MiB. One cache instance is shared
+    /// across both column families so this is the total read-cache budget.
+    pub block_cache_mb: u64,
 }
 
 impl Default for RocksDbLogOpts {
@@ -70,6 +76,8 @@ impl Default for RocksDbLogOpts {
         Self {
             keep_log_file_num: 4,
             max_manifest_bytes: 64 * 1024 * 1024,
+            write_buffer_mb: 64,
+            block_cache_mb: 64,
         }
     }
 }
@@ -107,8 +115,22 @@ impl LogStore {
         // fsync'd before the append was acked.
         db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::TolerateCorruptedTailRecords);
 
-        let cf_logs = ColumnFamilyDescriptor::new(CF_LOGS, Options::default());
-        let cf_meta = ColumnFamilyDescriptor::new(CF_META, Options::default());
+        // CNF-3 — bound RocksDB memory: cap each CF's memtable and attach
+        // ONE shared LRU block cache to both CFs (a per-CF cache would
+        // double the budget). The rocksdb crate clones the cache into the
+        // DB's outlive set, so dropping our handle after open is fine.
+        let block_cache =
+            Cache::new_lru_cache((opts.block_cache_mb.max(1) * 1024 * 1024) as usize);
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(&block_cache);
+        let cf_opts = || {
+            let mut o = Options::default();
+            o.set_write_buffer_size((opts.write_buffer_mb.max(1) * 1024 * 1024) as usize);
+            o.set_block_based_table_factory(&block_opts);
+            o
+        };
+        let cf_logs = ColumnFamilyDescriptor::new(CF_LOGS, cf_opts());
+        let cf_meta = ColumnFamilyDescriptor::new(CF_META, cf_opts());
 
         let db = DB::open_cf_descriptors(&db_opts, path, vec![cf_logs, cf_meta])
             .map_err(|e| {
@@ -468,6 +490,7 @@ mod bug_av_5_2_recovery_tests {
         let opts = RocksDbLogOpts {
             keep_log_file_num: 4,
             max_manifest_bytes: 64 * 1024 * 1024,
+            ..RocksDbLogOpts::default()
         };
         {
             let store = LogStore::new_with_opts(&dir, opts).expect("open with bounded opts");
@@ -477,6 +500,61 @@ mod bug_av_5_2_recovery_tests {
         assert!(LogStore::new_with_opts(&dir, opts).is_ok(), "reopen with bounded opts");
         // Defaults also resolve to bounded values.
         assert_eq!(RocksDbLogOpts::default().keep_log_file_num, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CNF-3 — opening with explicit write-buffer / block-cache bounds must
+    /// survive a small write workload (append + read back log entries) and a
+    /// reopen, proving the bounded memtable + shared block cache do not break
+    /// the normal log path.
+    #[tokio::test]
+    async fn log_store_bounded_memory_write_workload() {
+        use openraft::vote::RaftLeaderId;
+
+        fn mk_entry(idx: u64) -> Entry {
+            let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+            Entry {
+                log_id: openraft::LogId::new(leader, idx),
+                payload: openraft::EntryPayload::Blank,
+            }
+        }
+
+        let dir = scratch_dir("cnf3");
+        let opts = RocksDbLogOpts {
+            write_buffer_mb: 8,
+            block_cache_mb: 8,
+            ..RocksDbLogOpts::default()
+        };
+        {
+            let store = LogStore::new_with_opts(&dir, opts).expect("open with memory bounds");
+            // Small write workload: append 100 log entries (same put+flush
+            // sequence as RaftLogStorage::append) and read them back.
+            let cf = store.db.cf_handle(CF_LOGS).expect("logs CF");
+            for idx in 0..100u64 {
+                let entry = mk_entry(idx);
+                let value = encode_value(&entry).expect("encode entry");
+                store
+                    .db
+                    .put_cf(&cf, index_to_key(idx), value)
+                    .expect("put entry");
+            }
+            store.db.flush_cf(&cf).expect("flush logs CF");
+
+            let mut reader = store.reader();
+            let entries = reader.try_get_log_entries(0..100).await.expect("read back");
+            assert_eq!(entries.len(), 100, "all appended entries read back");
+            assert_eq!(entries[99].log_id.index, 99);
+        }
+        // Reopen with the same bounds (process restart) and re-read.
+        {
+            let store = LogStore::new_with_opts(&dir, opts).expect("reopen with memory bounds");
+            let mut reader = store.reader();
+            let entries = reader.try_get_log_entries(0..100).await.expect("read after reopen");
+            assert_eq!(entries.len(), 100, "entries survive reopen");
+        }
+        // Defaults resolve to the conservative 64 MiB bounds.
+        assert_eq!(RocksDbLogOpts::default().write_buffer_mb, 64);
+        assert_eq!(RocksDbLogOpts::default().block_cache_mb, 64);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

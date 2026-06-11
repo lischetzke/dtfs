@@ -64,6 +64,8 @@ addr = "10.0.0.3:9401"
 #snapshot_threshold = 10000         # applied log entries per snapshot
 #rocksdb_keep_log_file_num = 4      # Bug BP-1: cap RocksDB info-LOG retention
 #rocksdb_max_manifest_bytes = 67108864   # Bug BP-1: rotate MANIFEST at 64 MiB
+#rocksdb_write_buffer_mb = 64        # CNF-3: per-CF memtable (write buffer) cap, MiB
+#rocksdb_block_cache_mb = 64         # CNF-3: block cache shared across both CFs, MiB
 #max_in_snapshot_log_to_keep = 1000 # Bug BP-1: purge raft log behind snapshot
 #node_liveness_secs = 30            # Bug BP-3: last_seen older than this -> Suspect
 

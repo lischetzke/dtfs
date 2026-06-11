@@ -104,7 +104,7 @@ test fast.
   55's node-stop pattern. Done when: configurable, case PASSes on Minicluster,
   surface synced, PR'd.
 
-### CNF-3 — RocksDB per-CF memory bound ⬜  (hardening)
+### CNF-3 — RocksDB per-CF memory bound ✅  (hardening)
 
 Raft log store CFs use `Options::default()` (`crates/dtfs-raft/src/log_store.rs
 :110-111`) — no write-buffer/block-cache cap. Extend `RocksDbLogOpts`
@@ -159,7 +159,22 @@ persisted; CM plan deleted post-merge.
 
 ## Verification log
 
-- (pending) per-task, as work proceeds.
+- **CNF-3** 2026-06-11 — `RocksDbLogOpts` gained `write_buffer_mb` /
+  `block_cache_mb` (default 64/64 MiB); `new_with_opts` builds per-CF
+  `Options` with `set_write_buffer_size` + ONE shared
+  `Cache::new_lru_cache` via `BlockBasedOptions::set_block_cache` on both
+  CFs (rocksdb 0.22 API verified in registry source; the crate clones the
+  cache into the DB outlive set). Threaded from `RaftConfig.
+  rocksdb_{write_buffer,block_cache}_mb` (main.rs); config surface synced
+  (deploy/examples/manager.toml + docs/src/configuration/manager.md).
+  Failing-first: new test `log_store_bounded_memory_write_workload`
+  (open with custom bounds, 100-entry append + read-back, reopen) failed
+  to compile (E0560/E0609 on the new fields), then passed after the
+  implementation. Builder runs: `cargo test -p dtfs-raft --release` (62
+  passed), `cargo test -p dtfs-common --release` (67 passed, incl.
+  `example_manager_toml_parses`), full `cargo test --release --workspace`
+  green. Internal hardening, no cluster-visible behaviour → no release
+  case (§ B.5).
 
 ## Deviations
 

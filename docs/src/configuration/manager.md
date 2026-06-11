@@ -121,6 +121,8 @@ addr = "10.0.0.3:9401"
 | `snapshot_threshold` | `raft.snapshot_threshold` | `u64` | `10000` | 100--1000000 | No | Number of applied Raft log entries before a snapshot is triggered. Lower values use more disk I/O; higher values increase recovery time after restart. |
 | `rocksdb_keep_log_file_num` | `raft.rocksdb_keep_log_file_num` | `u64` | `4` | >=1 | No | RocksDB info-LOG files kept for the Raft log store (Bug BP-1; unbounded logs once filled a manager partition). |
 | `rocksdb_max_manifest_bytes` | `raft.rocksdb_max_manifest_bytes` | `u64` | `67108864` | >=1 MiB | No | RocksDB MANIFEST size before rotation (Bug BP-1). |
+| `rocksdb_write_buffer_mb` | `raft.rocksdb_write_buffer_mb` | `u64` | `64` | >=1 | No | RocksDB memtable (write buffer) size per column family for the Raft log store, in MiB (CNF-3). |
+| `rocksdb_block_cache_mb` | `raft.rocksdb_block_cache_mb` | `u64` | `64` | >=1 | No | RocksDB block-cache size for the Raft log store, in MiB; one LRU cache shared across both column families (CNF-3). |
 | `max_in_snapshot_log_to_keep` | `raft.max_in_snapshot_log_to_keep` | `u64` | `1000` | >=0 | No | Committed Raft log entries kept after a snapshot (Bug BP-1; keeps the on-disk log small). |
 | `node_liveness_secs` | `raft.node_liveness_secs` | `u64` | `30` | >=5 | No | A node whose `last_seen` is older than this is projected `Suspect` (and `Down` past 4x) in the read API, regardless of stored health (Bug BP-3). |
 
