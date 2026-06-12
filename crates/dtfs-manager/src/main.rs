@@ -100,6 +100,8 @@ async fn main() -> anyhow::Result<()> {
         dtfs_raft::log_store::RocksDbLogOpts {
             keep_log_file_num: config.raft.rocksdb_keep_log_file_num,
             max_manifest_bytes: config.raft.rocksdb_max_manifest_bytes,
+            write_buffer_mb: config.raft.rocksdb_write_buffer_mb,
+            block_cache_mb: config.raft.rocksdb_block_cache_mb,
         },
     )?;
     tracing::info!("Raft log store opened at {:?}", log_store_path);
