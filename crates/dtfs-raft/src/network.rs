@@ -77,7 +77,11 @@ async fn acquire_snapshot_send_permit() -> tokio::sync::SemaphorePermit<'static>
 
 /// Factory that creates `DtfsNetwork` instances for each target node.
 #[derive(Debug, Clone)]
-pub struct NetworkFactory;
+pub struct NetworkFactory {
+    /// CF-6 — the manager's resolved `[tls]` context; peer channels speak
+    /// mTLS when it is enabled, plaintext otherwise.
+    pub tls: dtfs_common::tls::TlsContext,
+}
 
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     type Network = DtfsNetwork;
@@ -86,6 +90,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
         DtfsNetwork {
             addr: node.addr.clone(),
             channel: None,
+            tls: self.tls.clone(),
         }
     }
 }
@@ -101,6 +106,8 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
 pub struct DtfsNetwork {
     addr: String,
     channel: Option<Channel>,
+    /// CF-6 — TLS context applied when (re)opening the channel.
+    tls: dtfs_common::tls::TlsContext,
 }
 
 impl DtfsNetwork {
@@ -124,8 +131,11 @@ impl DtfsNetwork {
             return Ok(ch.clone());
         }
 
-        let endpoint = format!("http://{}", self.addr);
-        let channel = Channel::from_shared(endpoint.clone())
+        // CF-6 — scheme + client TLS come from the resolved [tls] context.
+        let endpoint = self.tls.endpoint_url(&self.addr);
+        let channel = self
+            .tls
+            .endpoint(&self.addr)
             .map_err(|e| unreachable_err(format!("invalid endpoint {endpoint}: {e}")))?
             .connect_timeout(Self::CONNECT_TIMEOUT)
             .timeout(Self::RPC_TIMEOUT)

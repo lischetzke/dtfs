@@ -130,6 +130,8 @@ pub struct HealthMonitor {
     voters: Vec<dtfs_common::config::InitialVoter>,
     /// P1-8: optional alert dispatcher. NodeDown / DiskFailed fire here.
     alerts: Option<Arc<crate::alerts::AlertDispatcher>>,
+    /// CF-6 — resolved `[tls]` context for leader-forwarded commits.
+    tls: dtfs_common::tls::TlsContext,
 }
 
 impl HealthMonitor {
@@ -138,6 +140,7 @@ impl HealthMonitor {
         state_data: Arc<RwLock<StateMachineData>>,
         raft: Arc<DtfsRaft>,
         voters: Vec<dtfs_common::config::InitialVoter>,
+        tls: dtfs_common::tls::TlsContext,
     ) -> Self {
         Self {
             check_interval,
@@ -145,6 +148,7 @@ impl HealthMonitor {
             raft,
             voters,
             alerts: None,
+            tls,
         }
     }
 
@@ -243,7 +247,7 @@ impl HealthMonitor {
             node_id,
             status: status.to_string(),
         };
-        match crate::metadata::write_via_leader(&self.raft, &self.voters, req).await {
+        match crate::metadata::write_via_leader(&self.raft, &self.voters, &self.tls, req).await {
             Ok(()) => info!("Committed UpdateNodeStatus({}, {}) to Raft", node_id, status),
             Err(e) => debug!(
                 "Could not write UpdateNodeStatus to Raft (no leader reachable?): {}",

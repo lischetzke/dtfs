@@ -114,6 +114,9 @@ pub struct TaskScheduler {
     /// from `raft.done_task_retention_secs` / `raft.failed_task_retention_secs`.
     done_task_retention_ms: u64,
     failed_task_retention_ms: u64,
+    /// CF-6 — resolved `[tls]` context; data-node RPCs speak mTLS when
+    /// enabled, plaintext otherwise.
+    tls: dtfs_common::tls::TlsContext,
 }
 
 impl TaskScheduler {
@@ -124,6 +127,7 @@ impl TaskScheduler {
         audit: Arc<AuditLog>,
         done_task_retention_secs: u64,
         failed_task_retention_secs: u64,
+        tls: dtfs_common::tls::TlsContext,
     ) -> Self {
         Self {
             raft,
@@ -135,6 +139,7 @@ impl TaskScheduler {
             // "effectively never prune", not a silent wrap to ~0.
             done_task_retention_ms: done_task_retention_secs.saturating_mul(1000),
             failed_task_retention_ms: failed_task_retention_secs.saturating_mul(1000),
+            tls,
         }
     }
 
@@ -880,10 +885,12 @@ impl TaskScheduler {
         let endpoint = normalize_endpoint(source_addr);
         // Bug CN — hard timeout the connect + streaming RPC so a stalled
         // source/target node can't hang the advance round (and the whole
-        // scheduler loop) indefinitely.
+        // scheduler loop) indefinitely. CF-6 — the connect goes through the
+        // resolved [tls] context (mTLS when enabled).
         let resp = tokio::time::timeout(MIGRATION_RPC_TIMEOUT, async {
-            let mut client = DataServiceClient::connect(endpoint)
+            let mut client = self.tls.connect(&endpoint)
                 .await
+                .map(DataServiceClient::new)
                 .map_err(|e| anyhow::anyhow!("connect to source {}: {}", source_addr, e))?;
             client
                 .replicate_chunk(ReplicateChunkRequest {
@@ -917,10 +924,12 @@ impl TaskScheduler {
         // Bug W (part 2) — same fix as `replicate_chunk`: NodeInfo.grpc_addr
         // already carries the scheme. Don't double-prefix.
         let endpoint = normalize_endpoint(target_addr);
-        // Bug CN — timeout, same rationale as `replicate_chunk`.
+        // Bug CN — timeout, same rationale as `replicate_chunk`. CF-6 —
+        // TLS-aware connect.
         let resp = tokio::time::timeout(MIGRATION_RPC_TIMEOUT, async {
-            let mut client = DataServiceClient::connect(endpoint)
+            let mut client = self.tls.connect(&endpoint)
                 .await
+                .map(DataServiceClient::new)
                 .map_err(|e| anyhow::anyhow!("connect to target {}: {}", target_addr, e))?;
             client
                 .verify_chunk(VerifyChunkRequest {
@@ -963,7 +972,8 @@ impl TaskScheduler {
         chunk_id: &str,
     ) -> anyhow::Result<(bool, u64)> {
         let endpoint = normalize_endpoint(node_addr);
-        let mut client = DataServiceClient::connect(endpoint).await
+        let mut client = self.tls.connect(&endpoint).await
+            .map(DataServiceClient::new)
             .map_err(|e| anyhow::anyhow!("connect to data node {}: {}", node_addr, e))?;
 
         let resp = client
@@ -1777,7 +1787,8 @@ impl TaskScheduler {
     ) -> anyhow::Result<std::collections::HashMap<String, u64>> {
         use dtfs_proto::dtfs::data::ListChunksRequest;
         let endpoint = normalize_endpoint(node_addr);
-        let mut client = DataServiceClient::connect(endpoint).await
+        let mut client = self.tls.connect(&endpoint).await
+            .map(DataServiceClient::new)
             .map_err(|e| anyhow::anyhow!("connect to data node {}: {}", node_addr, e))?;
         // Bug CB — value is the chunk's `.dat` mtime (Unix ms); a
         // pre-Bug-CB data node sends an empty `chunk_mtimes_ms`, so a

@@ -301,6 +301,11 @@ pub struct FuseConfig {
     /// so a legacy `fuse.toml` keeps working.
     #[serde(default)]
     pub read_location_priority: Vec<String>,
+    /// CF-6 — gRPC transport security toward managers and data nodes.
+    /// `#[serde(default)]` (mode "auto", no certs = plaintext) keeps a
+    /// legacy `fuse.toml` working unchanged.
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 // --- Sub-configs ---
@@ -478,6 +483,11 @@ pub struct ApiConfig {
     pub cors_origins: Vec<String>,
 }
 
+/// CF-6 — gRPC transport security. Resolved by
+/// `dtfs_common::tls::TlsContext::from_config`: `disabled` = plaintext;
+/// `require` = the three files must load or startup fails; `auto` (default)
+/// = mTLS when all three files are configured AND exist on disk, plaintext
+/// otherwise (back-compat for cert-less deployments).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     #[serde(default = "default_tls_mode")]
@@ -485,6 +495,17 @@ pub struct TlsConfig {
     pub cert_file: Option<PathBuf>,
     pub key_file: Option<PathBuf>,
     pub ca_file: Option<PathBuf>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_tls_mode(),
+            cert_file: None,
+            key_file: None,
+            ca_file: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

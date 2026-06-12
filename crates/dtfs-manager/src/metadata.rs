@@ -105,6 +105,9 @@ pub struct MetadataService {
     /// path. Optional so construction order stays simple; injected via
     /// `with_audit` from `main`.
     audit: Option<Arc<crate::audit::AuditLog>>,
+    /// CF-6 — resolved `[tls]` context; manager-to-manager forwards and
+    /// the delete fan-out to data nodes speak mTLS when enabled.
+    tls: dtfs_common::tls::TlsContext,
 }
 
 impl MetadataService {
@@ -114,6 +117,7 @@ impl MetadataService {
         sm_data: Arc<tokio::sync::RwLock<StateMachineData>>,
         placement: Arc<PlacementEngine>,
         cluster: Arc<ClusterManager>,
+        tls: dtfs_common::tls::TlsContext,
     ) -> Self {
         Self {
             config,
@@ -126,6 +130,7 @@ impl MetadataService {
                 std::collections::HashMap::new(),
             )),
             audit: None,
+            tls,
         }
     }
 
@@ -282,9 +287,11 @@ impl MetadataService {
                 return Ok(c.clone());
             }
         }
-        let endpoint = format!("http://{addr}");
-        let client = ManagerServiceClient::connect(endpoint)
+        let client = self
+            .tls
+            .connect(addr)
             .await
+            .map(ManagerServiceClient::new)
             .map_err(|e| Status::unavailable(format!("connect leader {addr}: {e}")))?;
         self.leader_clients
             .lock()
@@ -341,6 +348,7 @@ pub(crate) fn is_forward_to_leader_err(msg: &str) -> bool {
 pub(crate) async fn write_via_leader(
     raft: &DtfsRaft,
     voters: &[dtfs_common::config::InitialVoter],
+    tls: &dtfs_common::tls::TlsContext,
     req: ClientRequest,
 ) -> Result<(), String> {
     use openraft::async_runtime::watch::WatchReceiver;
@@ -358,8 +366,10 @@ pub(crate) async fn write_via_leader(
                 .ok_or_else(|| "no leader to forward to".to_string())?;
             let leader_addr = resolve_leader_addr(voters, leader_id)
                 .ok_or_else(|| format!("leader {leader_id} not in cluster.initial_voters"))?;
-            let mut client = ManagerServiceClient::connect(format!("http://{leader_addr}"))
+            let mut client = tls
+                .connect(&leader_addr)
                 .await
+                .map(ManagerServiceClient::new)
                 .map_err(|e| format!("connect leader {leader_addr}: {e}"))?;
             let body =
                 serde_json::to_vec(&req).map_err(|e| format!("serialize ClientRequest: {e}"))?;
@@ -1172,10 +1182,14 @@ impl ManagerService for MetadataService {
         // can recommit the SAME chunk ids before our DeleteChunk RPCs fire.
         // Carry a state handle and re-check liveness per chunk at dispatch.
         let sm_for_liveness = self.sm_data.clone();
+        // CF-6 — carry the TLS context into the spawned fan-out.
+        let tls = self.tls.clone();
         tokio::spawn(async move {
             let mut skipped_live: usize = 0;
             for (addr, chunks) in by_node {
-                let mut client = match dtfs_proto::dtfs::data::data_service_client::DataServiceClient::connect(addr.clone()).await {
+                let mut client = match tls.connect(&addr).await
+                    .map(dtfs_proto::dtfs::data::data_service_client::DataServiceClient::new)
+                {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!(

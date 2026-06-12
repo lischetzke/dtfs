@@ -62,6 +62,11 @@ async fn main() -> anyhow::Result<()> {
         config.location
     );
 
+    // CF-6 — resolve [tls] once; reused by the Raft transport, the gRPC
+    // server, and every manager-side client connection.
+    let tls_ctx = dtfs_common::tls::TlsContext::from_config(&config.tls)?;
+    tls_ctx.log_startup("dtfs-manager", &config.tls.mode);
+
     // --- Raft initialisation ---
 
     let log_store_path = config.node.data_dir.join("raft-log");
@@ -133,7 +138,9 @@ async fn main() -> anyhow::Result<()> {
     let raft_config = Arc::new(raft_config.validate()?);
 
     // 4. Create the Raft node.
-    let network_factory = dtfs_raft::network::NetworkFactory;
+    let network_factory = dtfs_raft::network::NetworkFactory {
+        tls: tls_ctx.clone(),
+    };
     let raft = openraft::Raft::new(
         // Use a deterministic node id derived from the hostname hash.
         dtfs_common::node_id_from_hostname(&config.node.hostname),
@@ -395,6 +402,7 @@ async fn main() -> anyhow::Result<()> {
         // CNF-2 — terminal-task retention windows for the Bug AE prune.
         config.raft.done_task_retention_secs,
         config.raft.failed_task_retention_secs,
+        tls_ctx.clone(),
     ));
     // CF-5 — let the scheduler skip ticks under memory pressure.
     task_scheduler.set_memory_budget(memory_budget.clone());
@@ -467,6 +475,7 @@ async fn main() -> anyhow::Result<()> {
         sm_data.clone(),
         raft.clone(),
         config.cluster.initial_voters.clone(),
+        tls_ctx.clone(),
     )
     .with_alerts(alert_dispatcher.clone()); // P1-8
     let monitor_handle = tokio::spawn(async move {
@@ -481,6 +490,7 @@ async fn main() -> anyhow::Result<()> {
         sm_data.clone(),
         placement_engine.clone(),
         cluster_mgr.clone(), // Fix #2: wire heartbeat tracking into the gRPC handler
+        tls_ctx.clone(),
     )
     .with_tiering(tiering_engine.clone()) // P0-9: receive per-chunk-per-DC reads
     .with_audit(audit_log.clone()); // Bug BX-10: placement.spill audit rows
@@ -495,6 +505,7 @@ async fn main() -> anyhow::Result<()> {
 
     let grpc_handle = tokio::spawn(server::run_grpc_server(
         config.clone(),
+        tls_ctx.clone(),
         metadata_service,
         raft.clone(),
         async move { grpc_shutdown.wait_for_shutdown().await },
@@ -525,8 +536,9 @@ async fn main() -> anyhow::Result<()> {
     // entries in sm.nodes: step-1 of the nodes projection renders their real
     // version and routes their health through effective_health (BP-3).
     let self_reg_config = config.clone();
+    let self_reg_tls = tls_ctx.clone();
     let _self_register_handle = tokio::spawn(async move {
-        manager_self_register_lifecycle(self_reg_config).await;
+        manager_self_register_lifecycle(self_reg_config, self_reg_tls).await;
     });
 
     // Bug U — spawn a dedicated signal watcher that flips the shutdown
@@ -648,7 +660,10 @@ async fn main() -> anyhow::Result<()> {
 /// (an upgrade) logs once. Registering against the peer pool converges as
 /// soon as a leader exists — a follower's raft_write returns Unavailable,
 /// so we walk to the next endpoint just like a data node does.
-async fn manager_self_register_lifecycle(config: dtfs_common::config::ManagerConfig) {
+async fn manager_self_register_lifecycle(
+    config: dtfs_common::config::ManagerConfig,
+    tls: dtfs_common::tls::TlsContext,
+) {
     use dtfs_proto::dtfs::manager::manager_service_client::ManagerServiceClient;
     use dtfs_proto::dtfs::manager::RegisterNodeRequest;
 
@@ -667,9 +682,9 @@ async fn manager_self_register_lifecycle(config: dtfs_common::config::ManagerCon
         .cluster
         .initial_voters
         .iter()
-        .map(|v| format!("http://{}", v.addr))
+        .map(|v| tls.endpoint_url(&v.addr))
         .collect();
-    let loopback = format!("http://127.0.0.1:{grpc_port}");
+    let loopback = tls.endpoint_url(&format!("127.0.0.1:{grpc_port}"));
     if !endpoints.iter().any(|e| e.ends_with(&format!(":{grpc_port}"))) {
         endpoints.push(loopback.clone());
     }
@@ -705,7 +720,7 @@ async fn manager_self_register_lifecycle(config: dtfs_common::config::ManagerCon
         let mut ok = false;
         for offset in 0..n {
             let ep = &endpoints[(idx + offset) % n];
-            match ManagerServiceClient::connect(ep.clone()).await {
+            match tls.connect(ep).await.map(ManagerServiceClient::new) {
                 Ok(mut c) => match c.register_node(tonic::Request::new(build_req())).await {
                     Ok(resp) => {
                         if resp.into_inner().accepted {
