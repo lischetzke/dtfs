@@ -5229,4 +5229,43 @@ mod advance_round_tests {
         let t = state.tasks.values().next().unwrap();
         assert_eq!(t.status, MigrationStatus::Verifying);
     }
+
+    // CO-3-4 — a persistently corrupt source (copy succeeds, VerifyChunk
+    // always mismatches) MUST eventually fail at MAX_MIGRATION_ATTEMPTS, not
+    // loop Copying<->Verifying forever. Today a mismatch flaps back to Copying
+    // WITHOUT bumping `attempts` (advance_round phase 3, `Ok(false)` arm), so
+    // the task never reaches the cap: it re-copies + re-mismatches every tick
+    // indefinitely, pinning a scheduler slot + a data node on garbage bytes.
+    // Correct behaviour: a verify mismatch is a failed attempt; after
+    // MAX_MIGRATION_ATTEMPTS the task lands Failed with the alert fired.
+    #[tokio::test]
+    async fn co_3_4_persistent_verify_mismatch_eventually_fails() {
+        let ops = MockOps {
+            verify_result: VerifyMode::Mismatch,
+            ..Default::default()
+        };
+        let mut state = state_with(1);
+
+        // Drive generously more than the attempt cap (one copy+verify per
+        // tick). A correct state machine fails within MAX_MIGRATION_ATTEMPTS
+        // ticks; the buggy one never does, so the extra ticks just confirm the
+        // infinite loop.
+        for _ in 0..(MAX_MIGRATION_ATTEMPTS + 4) {
+            advance_migration_tasks(&ops, &mut state, 1_000).await;
+        }
+
+        let t = state.tasks.values().next().unwrap();
+        assert_eq!(
+            t.status,
+            MigrationStatus::Failed,
+            "a persistently corrupt source must fail, not loop (status={:?}, attempts={})",
+            t.status,
+            t.attempts
+        );
+        assert_eq!(
+            ops.failed_alerts.load(Ordering::SeqCst),
+            1,
+            "exhausting retries must fire exactly one MigrationFailed alert"
+        );
+    }
 }

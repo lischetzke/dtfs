@@ -2025,3 +2025,184 @@ mod tests {
         assert_eq!(after_del.total_bytes_stored, 0);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Audit CO findings — RED tests that encode CORRECT behaviour and so
+// FAIL against the current (unfixed) code. Do not "fix" by relaxing the
+// asserts; fix the production code.
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod audit_co_tests {
+    use super::*;
+    use dtfs_common::types::DiskTier;
+    use tempfile::TempDir;
+
+    // Local clone of the tests-module helper (that one lives in a sibling
+    // module). Builds a ChunkStore over a single hot disk in a TempDir.
+    async fn make_store() -> (ChunkStore, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let disk_path = tmp.path().to_path_buf();
+        std::fs::create_dir_all(disk_path.join(".dtfs").join("wal")).unwrap();
+        std::fs::create_dir_all(disk_path.join("chunks")).unwrap();
+        std::fs::create_dir_all(disk_path.join("tmp")).unwrap();
+        let disk_configs = vec![dtfs_common::config::DiskConfig {
+            path: disk_path,
+            tier: DiskTier::Hot,
+        }];
+        let dm = DiskManager::new(&disk_configs).unwrap();
+        (ChunkStore::new(dm), tmp)
+    }
+
+    // CO-1-4(a) — a leftover DeleteChunk WAL must NOT delete a live chunk
+    // that was re-uploaded after the original delete. recover_from_wal
+    // currently unlinks unconditionally, destroying the re-uploaded copy.
+    #[tokio::test]
+    async fn co_1_4a_delete_wal_replay_must_not_drop_live_chunk() {
+        let (store, tmp) = make_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+        let data = b"content-addressed chunk re-uploaded after a delete";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+
+        // Chunk is live on disk right now (a fresh re-upload).
+        store
+            .put_chunk(&chunk_id, data, &volume_id, DiskTier::Hot)
+            .await
+            .unwrap();
+        let dat_path = chunk_data_path(tmp.path(), &chunk_id);
+        assert!(dat_path.exists(), "precondition: chunk is on disk");
+
+        // Hand-write a stale DeleteChunk WAL entry for that id (as if an
+        // earlier delete crashed before clearing its WAL).
+        let wal_dir_path = wal_dir(tmp.path());
+        let wal_entry = WalEntry {
+            operation: WalOperation::DeleteChunk,
+            chunk_id: chunk_id.as_hex(),
+            disk_path: tmp.path().to_string_lossy().to_string(),
+            timestamp_ms: now_millis(),
+        };
+        let wal_path =
+            wal_dir_path.join(format!("{}.wal.json", chunk_id.as_hex()));
+        write_wal_entry(&wal_path, &wal_entry).await.unwrap();
+
+        store.recover_from_wal().await.unwrap();
+
+        // CORRECT: replay must re-check that no live chunk references the
+        // id and skip the unlink. Today it deletes the .dat → this fails.
+        assert!(
+            dat_path.exists(),
+            "DeleteChunk WAL replay must not delete a re-uploaded live chunk"
+        );
+    }
+
+    // CO-1-4(b) — a crash between rename and .meta write leaves a committed
+    // .dat with no .meta companion. recover_from_wal's PutChunk arm only
+    // removes a `{id}.dat.tmp`; it must also clean the orphaned meta-less
+    // committed .dat (and clear the WAL).
+    #[tokio::test]
+    async fn co_1_4b_put_wal_replay_cleans_meta_less_committed_dat() {
+        let (store, tmp) = make_store().await;
+        let chunk_id = ChunkId::from_bytes([0xCDu8; 32]);
+
+        // Forge the crash residue: committed .dat under chunks/aa/bb/, no
+        // .meta, plus the PutChunk WAL entry that should drive cleanup.
+        let chunk_dir = chunk_data_dir(tmp.path(), &chunk_id);
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let dat_path = chunk_dir.join(format!("{}.dat", chunk_id.as_hex()));
+        std::fs::write(&dat_path, b"committed-but-meta-less").unwrap();
+        assert!(!chunk_meta_path(tmp.path(), &chunk_id).exists());
+
+        let wal_path =
+            wal_dir(tmp.path()).join(format!("{}.wal.json", chunk_id.as_hex()));
+        let wal_entry = WalEntry {
+            operation: WalOperation::PutChunk,
+            chunk_id: chunk_id.as_hex(),
+            disk_path: tmp.path().to_string_lossy().to_string(),
+            timestamp_ms: now_millis(),
+        };
+        write_wal_entry(&wal_path, &wal_entry).await.unwrap();
+
+        store.recover_from_wal().await.unwrap();
+
+        // CORRECT: an interrupted put left a half-committed chunk; recovery
+        // must roll it back. Today the PutChunk arm only touches *.dat.tmp
+        // so the orphan .dat survives → this fails.
+        assert!(
+            !dat_path.exists(),
+            "recover_from_wal must remove the meta-less committed .dat from an interrupted put"
+        );
+        assert!(!wal_path.exists(), "WAL entry must be cleared after replay");
+    }
+
+    // CO-4-2 — deep scrub must not abort the whole disk on the first
+    // unparseable .meta. With one chunk's .meta corrupted to invalid JSON,
+    // the scrub should COMPLETE, count the healthy chunk, and flag the bad
+    // one — never `?`-propagate the serde error out of scrub_disk.
+    #[tokio::test]
+    async fn co_4_2_deep_scrub_survives_one_bad_meta() {
+        let (store, tmp) = make_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+
+        let good = b"healthy chunk that must still be counted";
+        let good_id = ChunkId::from_bytes(checksum::compute(good));
+        store
+            .put_chunk(&good_id, good, &volume_id, DiskTier::Hot)
+            .await
+            .unwrap();
+
+        let bad = b"chunk whose meta we will corrupt to invalid json";
+        let bad_id = ChunkId::from_bytes(checksum::compute(bad));
+        store
+            .put_chunk(&bad_id, bad, &volume_id, DiskTier::Hot)
+            .await
+            .unwrap();
+        // Corrupt the bad chunk's .meta into non-JSON.
+        let bad_meta = chunk_meta_path(tmp.path(), &bad_id);
+        std::fs::write(&bad_meta, b"this is not valid json {{{").unwrap();
+
+        // CORRECT: scrub completes (no error bubbled out).
+        let result = store
+            .scrub_disk(tmp.path(), ScrubLevel::Deep)
+            .await
+            .expect("deep scrub must complete despite one unparseable .meta");
+
+        assert_eq!(
+            result.chunks_checked, 2,
+            "scrub must examine both chunks, not abort on the first bad one"
+        );
+        assert_eq!(
+            result.chunks_healthy, 1,
+            "the healthy chunk must still be counted after the bad one"
+        );
+    }
+
+    // CO-5-5 — committing the same content-addressed chunk twice must not
+    // double-count chunk_count/bytes_stored (the file is the same inode,
+    // re-uploaded). Today both put_chunk calls unconditionally fetch_add.
+    #[tokio::test]
+    async fn co_5_5_duplicate_put_must_not_double_count() {
+        let (store, _tmp) = make_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+        let data = b"identical re-upload of one content-addressed chunk";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+
+        store
+            .put_chunk(&chunk_id, data, &volume_id, DiskTier::Hot)
+            .await
+            .unwrap();
+        store
+            .put_chunk(&chunk_id, data, &volume_id, DiskTier::Hot)
+            .await
+            .unwrap();
+
+        let stats = store.stats();
+        assert_eq!(
+            stats.total_chunks, 1,
+            "re-putting the same content-addressed chunk must not inflate chunk_count"
+        );
+        assert_eq!(
+            stats.total_bytes_stored,
+            data.len() as u64,
+            "re-putting the same chunk must count its bytes once"
+        );
+    }
+}

@@ -3166,6 +3166,48 @@ mod config_scope_tests {
     }
 }
 
+#[cfg(test)]
+mod audit_co_tests {
+    use super::flatten_config;
+    use serde_json::{json, Value};
+
+    // CO-2-1 — the config read path (get_config_effective -> flatten_config)
+    // MUST NOT emit `manager.cluster.shared_secret` in cleartext. The WebUI
+    // config viewer renders every flattened row's `current` value, so a raw
+    // secret here leaks the cluster membership credential to anyone with
+    // read access to the config tab. Correct behaviour: the secret value is
+    // redacted (e.g. to "***") in the rendered row, never the real value.
+    #[test]
+    fn co_2_1_shared_secret_redacted_in_flattened_config() {
+        const SECRET: &str = "super-secret-cluster-token-9f3a";
+        let current = json!({
+            "cluster": {
+                "name": "plexmedia",
+                "shared_secret": SECRET,
+            },
+        });
+        let defaults = json!({
+            "cluster": {
+                "name": Value::Null,
+                "shared_secret": Value::Null,
+            },
+        });
+
+        let mut rows: Vec<Value> = Vec::new();
+        flatten_config(&current, &defaults, "manager", "", &mut rows);
+
+        let secret_row = rows
+            .iter()
+            .find(|r| r.get("name").and_then(|n| n.as_str()) == Some("manager.cluster.shared_secret"))
+            .expect("shared_secret row must be present");
+        assert_ne!(
+            secret_row.get("current").and_then(|v| v.as_str()),
+            Some(SECRET),
+            "shared_secret must be redacted, not emitted in cleartext: {secret_row}"
+        );
+    }
+}
+
 /// AZ-5-A1 helper — walk two parallel JSON values and produce one
 /// flat row per leaf. `scope` is the top-level prefix
 /// ("manager", "data", "fuse", or a hostname for per-host views).

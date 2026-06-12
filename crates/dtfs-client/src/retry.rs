@@ -191,3 +191,37 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 3);
     }
 }
+
+#[cfg(test)]
+mod audit_co_tests {
+    use super::*;
+
+    // CO-5-19: backoff multiplier `1u32.wrapping_shl(attempt)` wraps the shift
+    // amount mod 32, so attempt 32 multiplies by `1 << 0 == 1` (collapsing to
+    // base_delay) while attempt 31 multiplies by `1 << 31` (saturates → capped
+    // at max_delay). Backoff must be monotonic non-decreasing across attempts;
+    // delay_for_attempt(32) must be >= delay_for_attempt(31).
+    #[test]
+    fn co_5_19_backoff_does_not_collapse_at_attempt_32() {
+        // base*2^31 vastly exceeds max_delay, so attempt 31 caps at ~1000s.
+        // With the wrap bug, attempt 32 falls back to ~base_delay (100ms).
+        let config = RetryConfig::new(
+            5000, // above the 4096 cap, but only used to allow high attempts conceptually
+            Duration::from_millis(100),
+            Duration::from_secs(1000),
+        );
+
+        let d31 = config.delay_for_attempt(31);
+        let d32 = config.delay_for_attempt(32);
+
+        // Jitter adds at most 25% on top of the capped base, so comparing the
+        // capped portions is robust: d31 ~ 1000s, d32 (correct) should also be
+        // capped at 1000s; the bug makes d32 ~ 100ms.
+        assert!(
+            d32 >= d31,
+            "backoff must not collapse at attempt 32: d31={:?} d32={:?}",
+            d31,
+            d32
+        );
+    }
+}
