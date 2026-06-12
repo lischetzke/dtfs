@@ -194,6 +194,27 @@ pub struct NodeInfo {
     pub quarantine: Option<dtfs_common::types::QuarantineInfo>,
 }
 
+impl NodeInfo {
+    /// CNF-1 — resolve a disk by its `DiskInfo.disk_id` FIELD, the key
+    /// that `ChunkLocationEntry.disk_id` references. Never index
+    /// `disks` by position: nothing guarantees ids stay dense or in
+    /// Vec order, and a positional lookup silently resolves the wrong
+    /// disk the moment they diverge. Every lookup keyed by
+    /// `ChunkLocationEntry.disk_id` must go through this (or an
+    /// equivalent `find` on `disk_id`), never `Vec` indexing.
+    ///
+    /// Caveat (Bug BJ, `state_machine::disks_identity_eq`): registration
+    /// currently reassigns disk ids by enumeration order on every
+    /// RegisterNode, so `disk_id` is NOT stable across a re-register
+    /// with a changed disk config — this helper gives field-keyed
+    /// agreement between the projection and the planners, not
+    /// cross-restart disk identity (that would be the persisted BN-1
+    /// uuid).
+    pub fn disk(&self, disk_id: u32) -> Option<&DiskInfo> {
+        self.disks.iter().find(|d| d.disk_id == disk_id)
+    }
+}
+
 impl fmt::Display for NodeInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}({}, {:?})", self.hostname, self.grpc_addr, self.role)
