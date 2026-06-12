@@ -220,6 +220,13 @@ fn disk_status_proto(s: DiskStatus) -> String {
 /// verification even with healthy disk + network underneath.
 const GET_PIECE_SIZE: usize = 8 * 1024 * 1024;
 
+/// CO-4-1 — depth of the GetChunk piece channel feeding the gRPC response
+/// stream. A detached feeder spawn races ahead of a slow consumer, so the
+/// channel is the buffering bound: at depth 64 a stalled reader could pin
+/// ~64 * 8 MB = 512 MB in heap, violating the Bug-I streaming budget. Keep
+/// it tiny (2 pieces in flight) so peak buffering stays ~16 MB.
+const GET_CHANNEL_DEPTH: usize = 2;
+
 /// U2 — BLAKE3-hash an on-disk chunk file incrementally, holding at most
 /// one ~8 MB piece in RAM at a time (never the whole chunk). Used by the
 /// verify_on_read cache-MISS path so a corrupt on-disk chunk is detected
@@ -251,7 +258,7 @@ fn stream_file(
     total_size: u64,
 ) -> ReceiverStream<Result<GetChunkResponse, Status>> {
     use tokio::io::AsyncReadExt;
-    let (tx, rx) = mpsc::channel(64);
+    let (tx, rx) = mpsc::channel(GET_CHANNEL_DEPTH);
     tokio::spawn(async move {
         let mut f = match tokio::fs::File::open(&dat_path).await {
             Ok(f) => f,
@@ -297,7 +304,7 @@ impl DataServiceImpl {
         &self,
         data: bytes::Bytes,
     ) -> ReceiverStream<Result<GetChunkResponse, Status>> {
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(GET_CHANNEL_DEPTH);
         tokio::spawn(async move {
             let total = data.len();
             let mut offset = 0;
@@ -1332,6 +1339,21 @@ max_io_percent = 10
         assert!(
             !resp.valid,
             "VerifyChunk must report invalid when the chunk's .meta is missing"
+        );
+    }
+
+    // CO-4-1 — the GetChunk feeder channel must not let a slow consumer
+    // pin an unbounded pile of 8 MB pieces in heap. At the old depth of 64
+    // that was 64 * 8 MB = 512 MB; cap the worst-case buffering well under
+    // a sane ceiling.
+    #[test]
+    fn co_4_1_get_channel_buffering_is_bounded() {
+        const CEILING: usize = 32 * 1024 * 1024;
+        assert!(
+            GET_CHANNEL_DEPTH * GET_PIECE_SIZE <= CEILING,
+            "GetChunk channel can buffer {} bytes, over the {} ceiling",
+            GET_CHANNEL_DEPTH * GET_PIECE_SIZE,
+            CEILING
         );
     }
 }
