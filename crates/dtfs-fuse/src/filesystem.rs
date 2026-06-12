@@ -564,7 +564,7 @@ impl DtfsFilesystem {
         if offset >= file_size {
             return Ok(Bytes::new());
         }
-        let actual_size = size.min((file_size - offset) as u32);
+        let actual_size = effective_read_len(file_size, offset, size);
 
         // Determine which chunks we need to read.
         let start_chunk = (offset / chunk_size) as usize;
@@ -1830,6 +1830,19 @@ fn fuse_tier_for_placement(placement_tier: &str) -> &str {
     placement_tier
 }
 
+/// CO-1-6 — clamp a read length to the bytes actually available without
+/// the `(file_size - offset) as u32` mod-2^32 truncation that broke reads
+/// of files >= 4 GiB. `(file_size - offset)` can exceed `u32::MAX` for a
+/// large file read near its start; casting that straight to `u32` wraps
+/// (e.g. exactly 4 GiB -> 0), so the kernel saw a premature EOF and
+/// large-remux playback truncated ~4 GiB early. Clamp the available byte
+/// count to `u32::MAX` BEFORE the cast, then `min` with the requested size.
+/// Callers must guarantee `offset < file_size` (read() returns empty
+/// otherwise), so `file_size - offset` never underflows here.
+fn effective_read_len(file_size: u64, offset: u64, size: u32) -> u32 {
+    size.min((file_size - offset).min(u32::MAX as u64) as u32)
+}
+
 /// Bug BU-2 — did this write error originate from a data-node out-of-space
 /// (ENOSPC)? `client::write_chunk_bytes` surfaces the gRPC status code in
 /// its error message (`code=ResourceExhausted`) after exhausting the Bug G
@@ -1965,5 +1978,40 @@ mod tests {
         // A directory's logical size is moot — we report a placeholder
         // (4096 — one filesystem block) so `stat` doesn't say 0 bytes.
         assert_eq!(attr.size, 4096);
+    }
+
+    /// CO-1-6: the old `(file_size - offset) as u32` truncated mod 2^32, so a
+    /// read at the start of a >= 4 GiB file clamped to 0 (premature EOF). The
+    /// helper must clamp the available byte count to u32::MAX before the cast.
+    #[test]
+    fn co_1_6_effective_read_len_is_u32_safe() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // Exactly 4 GiB available, 128 KiB requested. Naive `(4*GIB) as u32`
+        // == 0, so the read returned nothing; the helper must return 131072.
+        assert_eq!(
+            effective_read_len(4 * GIB, 0, 131072),
+            131072,
+            "4 GiB available must not wrap to 0"
+        );
+        // 5 GiB file, read 128 KiB starting 64 bytes before the 4 GiB mark:
+        // available = 5 GiB - (4 GiB - 64) = 1 GiB + 64, still > u32::MAX, so
+        // the request size wins.
+        assert_eq!(
+            effective_read_len(5 * GIB, 4 * GIB - 64, 131072),
+            131072,
+            "available far exceeds the request; request size governs"
+        );
+        // Tail of a small file: only 10 bytes remain, request 4096 -> 10.
+        assert_eq!(
+            effective_read_len(100, 90, 4096),
+            10,
+            "near EOF the available remainder clamps the request"
+        );
+        // Available exactly u32::MAX is representable and must not wrap.
+        assert_eq!(
+            effective_read_len(u32::MAX as u64, 0, u32::MAX),
+            u32::MAX,
+            "u32::MAX bytes available is exact, not a wrap"
+        );
     }
 }
