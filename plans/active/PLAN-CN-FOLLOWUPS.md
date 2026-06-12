@@ -55,7 +55,7 @@ Finish the deferred items cleanly, each as an independent dev-build PR.
 
 ---
 
-### CNF-1 — Resolve `anchor_pending=1` ⬜  (correctness/observability)
+### CNF-1 — Resolve `anchor_pending=1` ✅  (correctness/observability)
 
 Prod persistently reports `anchor_pending=1` with an empty migration queue
 (count=0): the live scheduler is NOT scheduling an anchor repair for one chunk.
@@ -186,6 +186,30 @@ persisted; CM plan deleted post-merge.
   --release` → 238 passed; full `cargo test --release --workspace` → all
   suites ok, 0 failed. Wire format unchanged; live InstallSnapshot
   verification happens at the operator's next rolling deploy.
+- **CNF-1** (2026-06-11; suites re-verified green 2026-06-12): replica
+  disk/tier resolution indexed `info.disks`
+  by `e.disk_id as usize` (Vec position) instead of matching the
+  `DiskInfo.disk_id` field, so a non-dense/reordered disk list makes the
+  projection (and several planners) resolve the wrong disk or drop the
+  placement. Fixed via new `dtfs_raft::NodeInfo::disk(disk_id)`
+  (find-by-field) at ALL read sites keyed by `ChunkLocationEntry.disk_id`:
+  `api.rs::count_anchor_pending_files`, `scheduler.rs::check_anchor_lag`,
+  `check_misplaced_rebalance`, `live_replica_tier`,
+  `placement_state.rs::resolve_dc_tier`, tiering
+  `build_av_cache_snapshot` (id_to_tiers table dropped, uses the helper),
+  `state_machine.rs::apply_remove_chunk_location` (enforce_anchor), plus the
+  derived `FlushNodeSummary.disk_tiers` table (now `(disk_id, tier)` pairs).
+  The WRITE side was converted too: `scheduler.rs::register_replica_location`
+  (AV-5-9) recorded `resolved_disk_id` as a Vec POSITION
+  (`.position(|d| d.tier == tier)`); now `resolve_disk_id_for_tier` records
+  the matching disk's `disk_id` field, so reader and writer agree.
+  Failing-first on the builder: 4 sparse-disk_id read-side tests observed
+  red pre-fix (e.g. `anchor_projection_resolves_disk_by_stable_id`:
+  `left: 1, right: 0`; `cnf1_remove_chunk_location_anchor_resolves_disk_by_stable_id`:
+  `RemoveChunkLocation refused: would strand anchor`) and
+  `new_replica_records_disk_id_field_not_position` red pre-write-fix
+  (`left: 0, right: 1`), all green post-fix; full dtfs-manager + dtfs-raft
+  suites and the full workspace suite green.
 
 ## Deviations
 
@@ -200,3 +224,23 @@ persisted; CM plan deleted post-merge.
   (`dtfs_raft::network::base64_{encode,decode}`, receiver's local copy
   removed) so the pair is round-trip tested. Wire format byte-identical
   (mixed-version safe).
+- **CNF-1**: the live read-only inspection of the 13 prod files and the
+  post-deploy `anchor_pending=0` check are deferred to the operator (this
+  worker has no prod/Tailscale access). Cause 1 (projection/planner
+  false-negative on non-dense disk ids) is confirmed by unit test; cause 2
+  (Gate-3 node-level exclusion) was inspected and is NOT present — the
+  planner's target selection already excludes only tier-holders, so no
+  change there.
+- **CNF-1 caveat**: registration currently assigns `disk_id` positionally
+  (`dtfs-data/src/disk.rs` / `main.rs`: `disk_id: i as u32`, and
+  RegisterNode replaces `NodeInfo.disks` wholesale), so in states produced
+  by a single registration `disk_id == Vec index` and the fix is
+  behaviour-neutral. It removes the latent projection-vs-planner divergence
+  and makes reader+writer agree on the field-keyed contract, but the live
+  `anchor_pending=1` may have a different trigger (e.g. a stale
+  `ChunkLocationEntry.disk_id` from a since-shrunk disk config — invisible
+  to BOTH positional and field lookups). If `anchor_pending` is still 1
+  after deploy, the next suspect is disk-id reassignment on re-register
+  (Bug BJ; the persisted BN-1 uuid is the available stable identity) — do
+  NOT re-investigate the lookup sites.
+

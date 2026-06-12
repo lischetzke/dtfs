@@ -158,7 +158,8 @@ fn resolve_dc_tier(
 ) -> Option<(String, DiskTier)> {
     let nid = c.node_id.parse::<u64>().ok()?;
     let info = sm.nodes.get(&nid)?;
-    let tier = info.disks.get(c.disk_id as usize).map(|d| d.tier)?;
+    // CNF-1 — stable disk_id key, never Vec index.
+    let tier = info.disk(c.disk_id).map(|d| d.tier)?;
     Some((info.location.datacenter.clone(), tier))
 }
 
@@ -243,5 +244,52 @@ mod tests {
             ("dc-b".to_string(), DiskTier::Warm),
         ];
         assert_eq!(classify_chunk(&reps, &m, None, 2), PlacementState::Stable);
+    }
+
+    // CNF-1 — resolve_dc_tier must key the disk lookup on the stable
+    // `DiskInfo.disk_id`, not the Vec position: a reindexed disk list
+    // (only disk carries disk_id=1 at Vec index 0) must still resolve.
+    #[test]
+    fn cnf1_resolve_dc_tier_uses_stable_disk_id() {
+        use dtfs_common::types::{DiskInfo, DiskStatus};
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(7, dtfs_raft::NodeInfo {
+            role: dtfs_common::types::NodeRole::Data,
+            hostname: "d".into(),
+            grpc_addr: "d:9500".into(),
+            location: dtfs_common::topology::Location::new("lab", "dc-a", "r1", "d"),
+            disks: vec![DiskInfo {
+                disk_id: 1,
+                uuid: "u".into(),
+                mount_path: "/m".into(),
+                tier: DiskTier::Warm,
+                total_bytes: 1,
+                used_bytes: 0,
+                status: DiskStatus::Healthy,
+            }],
+            total_capacity: 0,
+            used_capacity: 0,
+            health: dtfs_common::types::HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        });
+        let entry = |disk_id: u32| dtfs_raft::ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: "h0".into(),
+            node_id: "7".into(),
+            disk_id,
+            size_bytes: 1,
+        };
+        assert_eq!(
+            resolve_dc_tier(&sm, &entry(1)),
+            Some(("dc-a".to_string(), DiskTier::Warm)),
+            "disk_id=1 lives at Vec index 0 and must resolve"
+        );
+        assert_eq!(resolve_dc_tier(&sm, &entry(0)), None, "no disk with id 0 exists");
     }
 }

@@ -568,7 +568,8 @@ impl TaskScheduler {
                         .filter_map(|e| {
                             let nid = e.node_id.parse::<u64>().ok()?;
                             let info = sm.nodes.get(&nid)?;
-                            let tier = info.disks.get(e.disk_id as usize).map(|d| d.tier)?;
+                            // CNF-1 — stable disk_id key, never Vec index.
+                            let tier = info.disk(e.disk_id).map(|d| d.tier)?;
                             Some((nid, info.location.datacenter.clone(), tier))
                         })
                         .collect();
@@ -679,7 +680,11 @@ impl TaskScheduler {
                     .filter_map(|e| {
                         let nid = e.node_id.parse::<u64>().ok()?;
                         let info = sm.nodes.get(&nid)?;
-                        let tier = info.disks.get(e.disk_id as usize).map(|d| d.tier)?;
+                        // CNF-1 — stable disk_id key, never Vec index (must
+                        // agree with api::count_anchor_pending_files, or the
+                        // projection reports anchor_pending the planner
+                        // never repairs).
+                        let tier = info.disk(e.disk_id).map(|d| d.tier)?;
                         Some(AnchorRepairPlacement {
                             node_id: nid,
                             dc: info.location.datacenter.clone(),
@@ -1017,16 +1022,8 @@ impl TaskScheduler {
             // AV-5-9 — pick the disk_id matching the task's tier on the
             // target (was hardcoded 0; mis-tiered the read-back entry).
             let target_str = target_node.to_string();
-            let resolved_disk_id: u32 = sm
-                .nodes
-                .get(&target_node)
-                .and_then(|n| {
-                    n.disks
-                        .iter()
-                        .position(|d| d.tier == tier)
-                        .map(|p| p as u32)
-                })
-                .unwrap_or(0);
+            let resolved_disk_id: u32 =
+                resolve_disk_id_for_tier(sm.nodes.get(&target_node), tier);
             // Bug BH — dedup by (node_id, disk_id), NOT node_id alone, so a
             // second-tier mandatory copy on the same node is recorded.
             if !replica_already_present(&entries, &target_str, resolved_disk_id) {
@@ -2310,7 +2307,9 @@ pub(crate) struct FlushSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct FlushNodeSummary {
     pub datacenter: String,
-    pub disk_tiers: Vec<DiskTier>, // by disk_id index
+    /// CNF-1 — `(stable disk_id, tier)` pairs; disk_id is a key, not a
+    /// Vec position (a reindexed disk list breaks positional lookups).
+    pub disk_tiers: Vec<(u32, DiskTier)>,
 }
 
 impl FlushSnapshot {
@@ -2323,7 +2322,7 @@ impl FlushSnapshot {
                     *id,
                     FlushNodeSummary {
                         datacenter: info.location.datacenter.clone(),
-                        disk_tiers: info.disks.iter().map(|d| d.tier).collect(),
+                        disk_tiers: info.disks.iter().map(|d| (d.disk_id, d.tier)).collect(),
                     },
                 )
             })
@@ -2463,7 +2462,11 @@ pub(crate) fn plan_flush_cache(
             let entry_tier = |e: &ChunkLocationEntry| -> Option<DiskTier> {
                 let nid: u64 = e.node_id.parse().ok()?;
                 let node = snapshot.nodes.get(&nid)?;
-                node.disk_tiers.get(e.disk_id as usize).copied()
+                // CNF-1 — stable disk_id key, never Vec index.
+                node.disk_tiers
+                    .iter()
+                    .find(|(id, _)| *id == e.disk_id)
+                    .map(|(_, t)| *t)
             };
 
             // Survivors AFTER the proposed flush. We refuse if no
@@ -3161,11 +3164,31 @@ pub(crate) fn live_replica_tier(
     if matches!(node.health, HealthStatus::Down | HealthStatus::Failed) {
         return None;
     }
-    let disk = node.disks.get(disk_id as usize)?;
+    // CNF-1 — stable disk_id key, never Vec index.
+    let disk = node.disk(disk_id)?;
     if matches!(disk.status, DiskStatus::Failed | DiskStatus::Removed) {
         return None;
     }
     Some(disk.tier)
+}
+
+/// CNF-1 — the disk_id recorded into a new `ChunkLocationEntry` (AV-5-9
+/// read-back registration) must be the matching disk's `disk_id` FIELD —
+/// the key every reader resolves via `NodeInfo::disk` — never its Vec
+/// position. Falls back to 0 when the target has no disk of the tier
+/// (pre-existing AV-5-9 behaviour).
+#[inline]
+pub(crate) fn resolve_disk_id_for_tier(
+    node: Option<&dtfs_raft::NodeInfo>,
+    tier: DiskTier,
+) -> u32 {
+    node.and_then(|n| {
+        n.disks
+            .iter()
+            .find(|d| d.tier == tier)
+            .map(|d| d.disk_id)
+    })
+    .unwrap_or(0)
 }
 
 /// Bug CH — dispatch-time guard: can this task's target possibly receive
@@ -3282,7 +3305,35 @@ mod bug_ch_live_replica_tests {
     fn unknown_node_or_disk_does_not_count() {
         assert_eq!(live_replica_tier(None, 0), None);
         let n = node(HealthStatus::Healthy, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]);
-        assert_eq!(live_replica_tier(Some(&n), 7), None); // disk index out of range
+        assert_eq!(live_replica_tier(Some(&n), 7), None); // no disk with id 7
+    }
+
+    // CNF-1 — `disk_id` is a STABLE key, not a Vec position. After a
+    // data node re-registers with a reindexed disk list, the only disk
+    // may carry disk_id=1 at Vec index 0; a positional lookup then
+    // resolves the wrong disk (or none) and coverage accounting lies.
+    #[test]
+    fn disk_resolved_by_stable_id_not_vec_index() {
+        let mut d = disk(DiskTier::Cold, DiskStatus::Healthy);
+        d.disk_id = 1;
+        let n = node(HealthStatus::Healthy, vec![d]);
+        assert_eq!(live_replica_tier(Some(&n), 1), Some(DiskTier::Cold));
+        assert_eq!(live_replica_tier(Some(&n), 0), None, "no disk with id 0 exists");
+    }
+
+    // CNF-1 — the WRITE side must agree: the disk_id recorded for a new
+    // replica (AV-5-9 read-back) is the matching disk's `disk_id` field,
+    // not its Vec position — otherwise on a sparse-id node the fresh
+    // replica is invisible to live_replica_tier and the repair
+    // re-schedules every tick.
+    #[test]
+    fn new_replica_records_disk_id_field_not_position() {
+        let mut d = disk(DiskTier::Cold, DiskStatus::Healthy);
+        d.disk_id = 1;
+        let n = node(HealthStatus::Healthy, vec![d]);
+        assert_eq!(super::resolve_disk_id_for_tier(Some(&n), DiskTier::Cold), 1);
+        // No disk of the tier → pre-existing fallback 0.
+        assert_eq!(super::resolve_disk_id_for_tier(Some(&n), DiskTier::Warm), 0);
     }
 }
 
@@ -3833,7 +3884,13 @@ mod bug_av_flush_cache_tests {
     fn node_summary(dc: &str, tiers: &[DiskTier]) -> FlushNodeSummary {
         FlushNodeSummary {
             datacenter: dc.to_string(),
-            disk_tiers: tiers.to_vec(),
+            // disk_id == position here; CNF-1 sparse-id coverage builds
+            // its own summary below.
+            disk_tiers: tiers
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (i as u32, *t))
+                .collect(),
         }
     }
 
@@ -3872,6 +3929,38 @@ mod bug_av_flush_cache_tests {
         assert_eq!(actions[0].chunk_id, "h");
         assert_eq!(actions[0].chunk_index, 0);
         assert_eq!(report.replicas_dropped, 0, "planner doesn't run the deletes — wrapper does");
+        assert_eq!(report.mandatory_refusals, 0);
+    }
+
+    /// CNF-1 — the flush planner resolves a replica's tier by the STABLE
+    /// disk_id key. Node 11's only disk carries disk_id=1 (reindexed
+    /// list); its warm cache replica must still be recognised and
+    /// flushed (pre-fix the positional lookup missed → replica treated
+    /// as non-cache and never flushed).
+    #[test]
+    fn cnf1_flush_resolves_tier_by_stable_disk_id() {
+        let snapshot = FlushSnapshot {
+            files: vec![(
+                "/movies/wicked.mkv".to_string(),
+                vec![
+                    ent(0, "h", 10, 0), // node 10 = cold
+                    ent(0, "h", 11, 1), // node 11 = warm on disk_id=1
+                ],
+                mandatory_cold_only(),
+            )],
+            nodes: HashMap::from([
+                (10u64, node_summary("leli", &[DiskTier::Cold])),
+                (11u64, FlushNodeSummary {
+                    datacenter: "toro".to_string(),
+                    disk_tiers: vec![(1, DiskTier::Warm)], // sparse: id 1 at index 0
+                }),
+            ]),
+            anchor: None,
+        };
+        let (actions, report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
+        assert_eq!(actions.len(), 1, "warm replica on disk_id=1 is flushed");
+        assert_eq!(actions[0].node_id, 11);
         assert_eq!(report.mandatory_refusals, 0);
     }
 

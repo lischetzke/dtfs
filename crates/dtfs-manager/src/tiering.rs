@@ -584,27 +584,20 @@ impl TieringEngine {
         // node_id → (dc, free_capacity, draining, tier set)
         let mut node_views: Vec<NodeSelectionView> = Vec::new();
         let mut id_to_dc: HashMap<u64, String> = HashMap::new();
-        let mut id_to_tiers: HashMap<u64, Vec<DiskTier>> = HashMap::new();
         for (id, info) in sm.nodes.iter() {
             id_to_dc.insert(*id, info.location.datacenter.clone());
-            let tiers: Vec<DiskTier> = info
-                .disks
-                .iter()
-                .map(|d| d.tier)
-                .collect();
-            id_to_tiers.insert(*id, tiers.clone());
             // The planner will set `has_target_tier_disk` per-call
             // when iterating tiers — we materialise one node view
             // per tier the node has below. Here we emit a baseline
             // view; the planner closure layers the per-call tier
             // check via the candidates iteration.
             let draining = matches!(info.health, dtfs_common::types::HealthStatus::Draining);
-            // For simplicity, emit one view per tier so the planner
-            // can pick the right one. Free capacity is shared
+            // For simplicity, emit one view per disk's tier so the
+            // planner can pick the right one. Free capacity is shared
             // across tiers on the same node; that's a small
             // approximation that's good enough for promotion
             // target picking.
-            for tier in &tiers {
+            for _disk in &info.disks {
                 node_views.push(NodeSelectionView {
                     node_id: *id,
                     datacenter: info.location.datacenter.clone(),
@@ -613,13 +606,6 @@ impl TieringEngine {
                     draining,
                     already_holds_chunk: false,
                 });
-                // Mark the tier on the most recent view so
-                // downstream filters work via the per-tier
-                // iteration; we just rely on
-                // `has_target_tier_disk = true` for any tier the
-                // node has, and the planner closure tier-matches
-                // via `select_promotion_target`'s caller.
-                let _ = tier;
             }
         }
 
@@ -687,9 +673,12 @@ impl TieringEngine {
                         Some(d) => d.clone(),
                         None => continue,
                     };
-                    let tier = id_to_tiers
+                    // CNF-1 — stable disk_id key, never Vec index.
+                    let tier = sm
+                        .nodes
                         .get(&nid)
-                        .and_then(|t| t.get(e.disk_id as usize).copied());
+                        .and_then(|n| n.disk(e.disk_id))
+                        .map(|d| d.tier);
                     let Some(t) = tier else { continue };
                     placements.push(TickPlacement { node_id: nid, dc, tier: t });
                 }
