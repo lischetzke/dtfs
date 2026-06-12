@@ -922,7 +922,14 @@ impl DtfsFilesystem {
         // Check if any complete chunks are ready to flush.
         let segments = self.write_buffer.flush(&path);
         if !segments.is_empty() {
-            self.flush_segments_to_cluster(&path, &segments).await?;
+            if let Err(e) = self.flush_segments_to_cluster(&path, &segments).await {
+                // CO-1-8 (a): `flush` already drained these complete chunks out
+                // of the buffer. Restore them on a cluster-write error so the
+                // bytes survive for the next flush instead of being dropped
+                // while the write call reports failure upstream.
+                self.write_buffer.restore_segments(&path, &segments);
+                return Err(e);
+            }
         }
 
         // Renew the write lease mid-stream so a long-running streaming
@@ -1068,6 +1075,13 @@ impl DtfsFilesystem {
                         );
                     }
                     self.metadata_cache.remove(&path);
+                } else {
+                    // CO-1-8 (a): `flush_all` already drained these bytes out of
+                    // the buffer. The cluster write failed, so put them back —
+                    // otherwise the bytes are gone and a later (retried) fsync
+                    // returns Ok with the data silently lost. The next flush
+                    // re-sends them.
+                    self.write_buffer.restore_segments(&path, &segments);
                 }
                 return Err(e);
             }
@@ -1102,10 +1116,16 @@ impl DtfsFilesystem {
     /// Flushes any remaining buffered writes, then removes the handle.
     #[instrument(skip(self), fields(fh))]
     pub async fn release(&self, fh: u64) -> Result<()> {
-        // Flush before closing.
-        if self.open_files.contains_key(&fh) {
-            self.flush(fh).await?;
-        }
+        // CO-1-8 (c): flush before closing, but DO NOT early-return on a flush
+        // error. The kernel closes the fd regardless, so we must always tear
+        // down the handle, its write lease, and its write buffer; otherwise the
+        // fh leaks and the stale buffer overlays (incorrectly) future reads of
+        // the same path. Capture the error and surface it AFTER cleanup.
+        let flush_result = if self.open_files.contains_key(&fh) {
+            self.flush(fh).await
+        } else {
+            Ok(())
+        };
 
         if let Some((_, file)) = self.open_files.remove(&fh) {
             // P0-1: release the write lease (if held). Best-effort: a
@@ -1124,12 +1144,15 @@ impl DtfsFilesystem {
                     );
                 }
             }
-            // Clean up write buffer for this path.
+            // Clean up write buffer for this path. On a flush failure the
+            // un-flushed bytes are dropped here (the data is lost on the
+            // cluster too) but the error is propagated below so the caller
+            // sees the failure rather than a silent success.
             self.write_buffer.remove(&file.path);
             debug!(path = %file.path, fh, "file released");
         }
 
-        Ok(())
+        flush_result
     }
 
     /// Create a new file in the DTFS namespace and return a file handle.
@@ -1293,12 +1316,10 @@ impl DtfsFilesystem {
             .set_file_size(path, new_size)
             .await
             .with_context(|| format!("truncate failed for {path}"))?;
-        // Clear any buffered writes past the new EOF.
-        if let Some(buffered_eof) = self.write_buffer.logical_size(path) {
-            if buffered_eof > new_size {
-                self.write_buffer.remove(path);
-            }
-        }
+        // CO-1-8 (b): clear buffered writes AT OR ABOVE the new EOF but keep
+        // buffered bytes below it. Removing the whole buffer (the old
+        // behaviour) lost un-flushed writes that the truncation never deleted.
+        self.write_buffer.truncate(path, new_size);
         // Refresh cached locations.
         self.metadata_cache.remove(path);
         if let Some(fh) = fh {
