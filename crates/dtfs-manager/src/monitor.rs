@@ -70,13 +70,42 @@ pub(crate) fn liveness_changes(
             continue;
         }
         let elapsed = now_ms.saturating_sub(info.last_seen_ms);
-        if elapsed > down_ms {
-            out.push((*id, NodeStatus::Down));
+        let target = if elapsed > down_ms {
+            Some(NodeStatus::Down)
         } else if elapsed > suspect_ms {
-            out.push((*id, NodeStatus::Suspect));
+            Some(NodeStatus::Suspect)
+        } else {
+            None
+        };
+        // CO-4-8 — only emit a transition when it actually changes the
+        // committed status. Without this an already-Down (or already-Suspect)
+        // node re-emits the same `(id, status)` every 10s tick, re-committing
+        // an identical `UpdateNodeStatus` to raft forever (leader write + audit
+        // churn per dead node).
+        if let Some(status) = target {
+            if !health_matches_status(info.health, status) {
+                out.push((*id, status));
+            }
         }
     }
     out
+}
+
+/// True when the node's current replicated `health` already equals the
+/// liveness `status` this monitor would commit, so re-emitting it is a no-op
+/// (CO-4-8). `NodeStatus` only models the liveness subset; richer health
+/// states (Quarantined, Maintenance, ...) never equal a liveness target.
+fn health_matches_status(
+    health: dtfs_common::types::HealthStatus,
+    status: NodeStatus,
+) -> bool {
+    use dtfs_common::types::HealthStatus;
+    matches!(
+        (status, health),
+        (NodeStatus::Down, HealthStatus::Down)
+            | (NodeStatus::Suspect, HealthStatus::Suspect)
+            | (NodeStatus::Healthy, HealthStatus::Healthy)
+    )
 }
 
 /// Bug CM — the monitor must only evaluate + commit liveness on the raft
