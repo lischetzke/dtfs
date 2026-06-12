@@ -118,7 +118,7 @@ small write workload; `cargo test -p dtfs-raft`/`-p dtfs-common`. Low urgency
 (8 GB), but correct defense-in-depth. Done when: bounded from config + docs +
 parse-tested, PR'd.
 
-### CNF-4 — Bound the snapshot-send heap ⬜  (hardening, simpler win)
+### CNF-4 — Bound the snapshot-send heap ✅  (hardening, simpler win)
 
 `full_snapshot` (`crates/dtfs-raft/src/network.rs:199-274`, `SnapshotPayload`)
 reads the whole snapshot into `Vec<u8>`, base64-encodes, JSON-serializes per
@@ -175,7 +175,28 @@ persisted; CM plan deleted post-merge.
   `example_manager_toml_parses`), full `cargo test --release --workspace`
   green. Internal hardening, no cluster-visible behaviour → no release
   case (§ B.5).
+- **CNF-4** 2026-06-11 — failing-first: added `network.rs`
+  `cnf4_snapshot_send_tests` (base64 round-trip vs the receiver decoder +
+  permit-bound test) before the impl; `cargo test -p dtfs-raft --release` on
+  dtfs-builder failed with E0425 (`base64_decode`,
+  `acquire_snapshot_send_permit`, `SNAPSHOT_SEND_CONCURRENCY` missing). After
+  impl: `cargo test -p dtfs-raft --release` → 63 passed, 0 failed (incl.
+  `snapshot_send_permits_bound_concurrency`,
+  `base64_round_trip_with_receiver_decoder`); `cargo test -p dtfs-manager
+  --release` → 238 passed; full `cargo test --release --workspace` → all
+  suites ok, 0 failed. Wire format unchanged; live InstallSnapshot
+  verification happens at the operator's next rolling deploy.
 
 ## Deviations
 
-- (none yet)
+- **CNF-4 step 1 (drop base64) rejected** — the transport is a JSON-*string*
+  RPC; serde_json serializes `serde_bytes` as an int array (larger than
+  base64), so dropping base64 is a net loss without a wire change. Shipped
+  instead: process-wide `SNAPSHOT_SEND_PERMITS` semaphore (2 concurrent
+  snapshot sends, permit held across the cancel select), copy reduction on
+  the send path (`Cursor::into_inner` instead of a `bytes_from_cursor` copy,
+  drop raw bytes after base64-encode, drop the payload struct after JSON
+  serialize, drop the RPC envelope after `to_vec`), shared encoder/decoder
+  (`dtfs_raft::network::base64_{encode,decode}`, receiver's local copy
+  removed) so the pair is round-trip tested. Wire format byte-identical
+  (mixed-version safe).
