@@ -722,12 +722,19 @@ impl TieringEngine {
     ///
     /// Logic:
     /// 1. Look up the file's `volume_id` from `sm.files[profile.file_path]`.
-    /// 2. Look up the volume's `anchor_datacenter`.
+    /// 2. Resolve the volume's anchor via `effective_anchor()` (CO-4-7:
+    ///    reads the resolved `AnchorPolicy` so a volume that set the new
+    ///    `anchor` field — not just the legacy `anchor_datacenter` string
+    ///    — is honoured). Only the anchor *datacenter* is enforced here;
+    ///    a tier-pinned anchor (`required_tier`) is still enforced solely
+    ///    on the source-removal path (`RemoveChunkLocation`
+    ///    `enforce_anchor`), since this additive copy never drops bytes.
     /// 3. If anchor is None → never violated (no constraint).
-    /// 4. Count current replicas of `profile.chunk_id` whose node lives in
-    ///    the anchor DC. Subtract 1 if the source node is in anchor DC
-    ///    (it's the one being moved). Add 1 if the target node is in anchor.
-    /// 5. If the resulting count would be 0 → violation.
+    /// 4. The tiering path schedules an ADDITIVE copy
+    ///    (`schedule_replication`, source never removed — § A.6 #6), so
+    ///    `anchor_violated_after_copy(.., is_additive=true)` does NOT
+    ///    subtract the source. Pre-CO-4-7 this modelled the copy as a
+    ///    move and a sole-anchor LELI->TORO promote was wrongly refused.
     async fn would_violate_anchor(
         &self,
         profile: &ChunkAccessProfile,
@@ -738,8 +745,12 @@ impl TieringEngine {
             Some(meta) => meta.volume_id.clone(),
             None => return false,
         };
-        let anchor = match sm.volumes.get(&volume_id).and_then(|v| v.anchor_datacenter.clone()) {
-            Some(a) if !a.is_empty() => a,
+        let anchor = match sm
+            .volumes
+            .get(&volume_id)
+            .and_then(|v| v.effective_anchor())
+        {
+            Some(a) if !a.datacenter.is_empty() => a.datacenter,
             _ => return false,
         };
         let file_meta = match sm.files.get(&profile.file_path) {
@@ -755,8 +766,8 @@ impl TieringEngine {
             id_to_dc.insert(*id, info.location.datacenter.clone());
         }
 
-        // Count anchor-DC replicas of this chunk.
-        let mut anchor_count: i64 = 0;
+        // Datacenter of every current replica of this chunk.
+        let mut replica_dcs: Vec<String> = Vec::new();
         for ent in file_meta.chunks.iter() {
             if ent.chunk_hash != profile.chunk_id {
                 continue;
@@ -770,22 +781,21 @@ impl TieringEngine {
             } else {
                 None
             };
-            if dc.as_deref() == Some(anchor.as_str()) {
-                anchor_count += 1;
+            if let Some(d) = dc {
+                replica_dcs.push(d);
             }
         }
 
-        // Adjust for the move.
         let source_dc = id_to_dc.get(&profile.current_node).cloned();
         let target_dc = id_to_dc.get(&target_node).cloned();
-        if source_dc.as_deref() == Some(anchor.as_str()) {
-            anchor_count -= 1;
-        }
-        if target_dc.as_deref() == Some(anchor.as_str()) {
-            anchor_count += 1;
-        }
-
-        anchor_count <= 0
+        anchor_violated_after_copy(
+            &replica_dcs,
+            &anchor,
+            source_dc.as_deref(),
+            target_dc.as_deref(),
+            // The tiering migration is additive (copy, no source removal).
+            true,
+        )
     }
 
     /// Find a target node that has disks of the specified tier,
@@ -1118,6 +1128,46 @@ pub(crate) struct NodeSelectionView {
     /// be promoting. The selector skips these so we don't duplicate
     /// a replica on the same node.
     pub already_holds_chunk: bool,
+}
+
+/// CO-4-7 — pure anchor check for a copy operation. `replica_dcs` is
+/// the datacenter of every current replica of the chunk. The result is
+/// whether the anchor-DC replica count *after* the copy would be 0:
+///
+/// - additive copy (`is_additive=true`, e.g. cache promotion via
+///   `schedule_replication` — the source is never removed, § A.6 #6):
+///   the source is NOT subtracted; only a target landing in the anchor
+///   DC adds one. Pre-CO-4-7 the promote path modelled this as a move
+///   and subtracted the source, so a sole-anchor LELI->TORO promote
+///   computed anchor_count 0 and was wrongly refused (+ AnchorViolated
+///   spam).
+/// - move/demote (`is_additive=false`): the source replica leaves, so a
+///   source in the anchor DC subtracts one (genuine anchor protection
+///   for tier-demote / migration — unchanged).
+///
+/// Returns true iff the post-copy anchor count would be 0 (violation).
+pub(crate) fn anchor_violated_after_copy(
+    replica_dcs: &[String],
+    anchor_dc: &str,
+    source_dc: Option<&str>,
+    target_dc: Option<&str>,
+    is_additive: bool,
+) -> bool {
+    if anchor_dc.is_empty() {
+        return false;
+    }
+    let mut anchor_count: i64 = replica_dcs
+        .iter()
+        .filter(|dc| dc.as_str() == anchor_dc)
+        .count() as i64;
+    // Only a move removes the source replica from its DC.
+    if !is_additive && source_dc == Some(anchor_dc) {
+        anchor_count -= 1;
+    }
+    if target_dc == Some(anchor_dc) {
+        anchor_count += 1;
+    }
+    anchor_count <= 0
 }
 
 /// CO-4-5 — project a node into a `NodeSelectionView` for a specific
@@ -2641,5 +2691,69 @@ mod audit_co_tests {
                 "{bad:?} node must not be selected as a promotion target"
             );
         }
+    }
+
+    /// CO-4-7 — a sole-anchor additive promote LELI->TORO is NOT a
+    /// violation: the cold LELI copy stays (additive), so the anchor DC
+    /// still has 1 replica afterwards. Pre-fix the source was subtracted
+    /// (modelled as a move) → anchor_count 0 → wrongly refused.
+    #[test]
+    fn co_4_7_additive_promote_does_not_strand_sole_anchor() {
+        let replica_dcs = vec!["leli".to_string()];
+        let violated = anchor_violated_after_copy(
+            &replica_dcs,
+            "leli",
+            Some("leli"), // source (cold anchor)
+            Some("toro"), // target (warm cache)
+            true,         // additive copy
+        );
+        assert!(!violated, "additive promote must not strand the LELI anchor");
+    }
+
+    /// CO-4-7 — guard: a genuine MOVE off the sole anchor IS a
+    /// violation (anchor protection for demote/migration preserved).
+    #[test]
+    fn co_4_7_move_off_sole_anchor_is_violation() {
+        let replica_dcs = vec!["leli".to_string()];
+        let violated = anchor_violated_after_copy(
+            &replica_dcs,
+            "leli",
+            Some("leli"),
+            Some("toro"),
+            false, // move: source leaves
+        );
+        assert!(violated, "moving the sole anchor copy away must be refused");
+    }
+
+    /// CO-4-7 — a copy that lands IN the anchor DC is fine; a non-anchor
+    /// move that keeps a second anchor replica is fine.
+    #[test]
+    fn co_4_7_anchor_count_arithmetic() {
+        // Two anchor replicas, move one away -> still 1 -> ok.
+        assert!(!anchor_violated_after_copy(
+            &["leli".into(), "leli".into()],
+            "leli",
+            Some("leli"),
+            Some("toro"),
+            false,
+        ));
+        // No anchor replica yet, additive copy lands in anchor -> ok.
+        assert!(!anchor_violated_after_copy(
+            &["toro".into()],
+            "leli",
+            Some("toro"),
+            Some("leli"),
+            true,
+        ));
+        // No anchor replica, copy does not land in anchor -> violation.
+        assert!(anchor_violated_after_copy(
+            &["toro".into()],
+            "leli",
+            Some("toro"),
+            Some("nrb"),
+            true,
+        ));
+        // Empty anchor dc -> never a constraint.
+        assert!(!anchor_violated_after_copy(&[], "", None, None, false));
     }
 }
