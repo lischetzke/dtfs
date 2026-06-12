@@ -782,10 +782,39 @@ impl DataService for DataServiceImpl {
         id_array.copy_from_slice(&chunk_id_bytes);
         let chunk_id = ChunkId::from_bytes(id_array);
 
-        match self.store.get_chunk(&chunk_id).await {
-            Ok(_) => Ok(Response::new(VerifyChunkResponse {
+        // CO-1-5 (§ A.6 #6) — VerifyChunk must BLAKE3 the on-disk bytes
+        // against the stored ChunkMeta.checksum, not merely confirm the
+        // .dat is readable. Migration marks a copy Done on this, so a
+        // false `valid:true` lets bit-rot propagate and tier-demote drop
+        // the only good source. Missing meta = unverifiable = invalid.
+        let meta = match self.store.get_chunk_meta(&chunk_id).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                return Ok(Response::new(VerifyChunkResponse {
+                    valid: false,
+                    error: e.to_string(),
+                }));
+            }
+        };
+        let dat_path = match self.store.chunk_file_path(&chunk_id) {
+            Some((path, _size)) => path,
+            None => {
+                return Ok(Response::new(VerifyChunkResponse {
+                    valid: false,
+                    error: format!("chunk {} .dat missing", req.chunk_id),
+                }));
+            }
+        };
+        // Stream-hash the on-disk file (one ~8 MB piece in RAM, never the
+        // whole chunk — Bug-I parity).
+        match hash_file_incrementally(&dat_path, meta.size).await {
+            Ok(digest) if digest == meta.checksum => Ok(Response::new(VerifyChunkResponse {
                 valid: true,
                 error: String::new(),
+            })),
+            Ok(_) => Ok(Response::new(VerifyChunkResponse {
+                valid: false,
+                error: format!("checksum mismatch for chunk {}", req.chunk_id),
             })),
             Err(e) => Ok(Response::new(VerifyChunkResponse {
                 valid: false,
