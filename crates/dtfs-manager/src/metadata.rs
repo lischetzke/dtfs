@@ -538,6 +538,39 @@ fn node_id_from_grpc_addr(sm: &StateMachineData, addr: &str) -> String {
         .unwrap_or_else(|| addr.to_string())
 }
 
+/// CO-4-13 — resolve the CF-3b ack floor for a `commit_chunk_locations`
+/// call as the STRICTER of two volume floors:
+///   * the floor of the volume the file is actually registered under
+///     (`sm.files[path].volume_id`), and
+///   * the floor of the volume named in the request (`req_volume_id`).
+///
+/// Resolving from the request volume alone (the pre-fix behaviour) let a
+/// wrong/unknown `req.volume_id` fall back to the manager default and
+/// silently bypass a stricter per-file floor — a CF-3b write-safety
+/// downgrade. An unregistered volume id contributes the `default_floor`,
+/// so an unknown id can only raise the floor, never lower it below the
+/// file's own.
+fn resolve_ack_floor(
+    sm: &StateMachineData,
+    path: &str,
+    req_volume_id: &str,
+    default_floor: u32,
+) -> u32 {
+    let floor_of = |vol_id: &str| -> u32 {
+        sm.volumes
+            .get(vol_id)
+            .map(|v| v.write_safety.min_replicas_before_ack)
+            .unwrap_or(default_floor)
+    };
+    let request_floor = floor_of(req_volume_id);
+    // The file may not exist yet on first commit; then only the request
+    // volume governs.
+    match sm.files.get(path) {
+        Some(file) => request_floor.max(floor_of(&file.volume_id)),
+        None => request_floor,
+    }
+}
+
 #[tonic::async_trait]
 impl ManagerService for MetadataService {
     async fn create_file(
@@ -1686,16 +1719,21 @@ impl ManagerService for MetadataService {
         // scheduler's `chunk_loc.node_id.parse::<u64>()` succeeds (fix #7).
         //
         // CF-3b — resolve the volume's `write_safety.min_replicas_before_ack`
-        // (falling back to the manager-config default when the volume isn't
-        // registered) in the same lock scope, so the ack-floor gate below
-        // decides on a consistent snapshot.
+        // in the same lock scope, so the ack-floor gate below decides on a
+        // consistent snapshot.
+        //
+        // CO-4-13 — resolve the floor as the STRICTER of the request volume
+        // and the volume the file is actually registered under, so a
+        // wrong/unknown `req.volume_id` can't fall back to the default and
+        // bypass a stricter per-file floor (a silent RF downgrade).
         let (chunks, ack_floor): (Vec<ChunkLocationEntry>, u32) = {
             let data = self.sm_data.read().await;
-            let ack_floor = data
-                .volumes
-                .get(&req.volume_id)
-                .map(|v| v.write_safety.min_replicas_before_ack)
-                .unwrap_or(self.config.defaults.write_safety.min_replicas_before_ack);
+            let ack_floor = resolve_ack_floor(
+                &data,
+                &req.path,
+                &req.volume_id,
+                self.config.defaults.write_safety.min_replicas_before_ack,
+            );
             let chunks = req
                 .chunks
                 .into_iter()
@@ -3007,5 +3045,81 @@ mod tests {
         assert!(!heartbeat_may_mark_healthy(HealthStatus::Maintenance));
         assert!(!heartbeat_may_mark_healthy(HealthStatus::Draining));
         assert!(!heartbeat_may_mark_healthy(HealthStatus::Quarantined));
+    }
+
+    /// CO-4-13 — a file registered under a floor=2 volume must enforce
+    /// floor 2 even when the commit request claims a different (or
+    /// unknown) volume that resolves to the default floor.
+    #[test]
+    fn co_4_13_resolve_ack_floor_uses_stricter_file_volume() {
+        use dtfs_raft::state_machine::FileMetadata;
+
+        let mut sm = StateMachineData::default();
+        // Register a "strict" volume with floor=2 and put the file on it.
+        sm.volumes.insert("strict".to_string(), vol_with_floor("strict", 2));
+        sm.files.insert(
+            "/movies/a.mkv".to_string(),
+            FileMetadata {
+                path: "/movies/a.mkv".to_string(),
+                volume_id: "strict".to_string(),
+                chunk_size: 4 * 1024 * 1024,
+                chunks: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                symlink_target: None,
+                logical_size: None,
+                is_directory: false,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            },
+        );
+
+        // Request claims the unknown/default volume (floor would be 1) but
+        // the file's stored volume floor (2) must win.
+        assert_eq!(
+            resolve_ack_floor(&sm, "/movies/a.mkv", "default", 1),
+            2,
+            "file's stored-volume floor (2) must override the request default (1)"
+        );
+
+        // Request volume is stricter than the file's volume → request wins.
+        sm.volumes.insert("stricter".to_string(), vol_with_floor("stricter", 3));
+        assert_eq!(
+            resolve_ack_floor(&sm, "/movies/a.mkv", "stricter", 1),
+            3,
+            "the stricter of the two volumes governs"
+        );
+
+        // Unknown file (first commit) → only the request volume governs.
+        assert_eq!(resolve_ack_floor(&sm, "/movies/new.mkv", "strict", 1), 2);
+        assert_eq!(resolve_ack_floor(&sm, "/movies/new.mkv", "default", 1), 1);
+    }
+
+    fn vol_with_floor(id: &str, floor: u32) -> dtfs_common::types::VolumeConfig {
+        use dtfs_common::types::*;
+        VolumeConfig {
+            id: VolumeId::new(id.to_string()),
+            name: id.to_string(),
+            chunk_size_bytes: 4 * 1024 * 1024,
+            replication: TierReplication { hot: 0, warm: 2, cold: 1, tape: 1 },
+            mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            cache_replicas: CacheReplication {
+                hot: CacheTierConfig::default(),
+                warm: CacheTierConfig::default(),
+                cold: CacheTierConfig::default(),
+                tape: CacheTierConfig::default(),
+                per_dc: true,
+                promote_reads: 2,
+                promote_window_secs: 60,
+                cooldown_secs: 30,
+            },
+            anchor: None,
+            schedules: VolumeSchedules::default(),
+            spill: SpillPolicy::default(),
+            anchor_datacenter: None,
+            write_safety: WriteSafety {
+                min_replicas_before_ack: floor,
+                write_timeout_secs: 30,
+            },
+        }
     }
 }
