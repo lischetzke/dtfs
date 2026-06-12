@@ -43,6 +43,9 @@ impl ChunkId {
         if s.len() != 64 {
             return Err(format!("expected 64 hex chars, got {}", s.len()));
         }
+        if !s.is_ascii() {
+            return Err("expected ASCII hex chars".to_string());
+        }
         let mut out = [0u8; 32];
         for i in 0..32 {
             let byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
