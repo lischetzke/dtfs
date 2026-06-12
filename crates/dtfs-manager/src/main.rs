@@ -392,6 +392,9 @@ async fn main() -> anyhow::Result<()> {
         raft.clone(),
         sm_data.clone(),
         audit_log.clone(),
+        // CNF-2 — terminal-task retention windows for the Bug AE prune.
+        config.raft.done_task_retention_secs,
+        config.raft.failed_task_retention_secs,
     ));
     // CF-5 — let the scheduler skip ticks under memory pressure.
     task_scheduler.set_memory_budget(memory_budget.clone());

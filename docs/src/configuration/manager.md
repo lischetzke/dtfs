@@ -125,6 +125,8 @@ addr = "10.0.0.3:9401"
 | `rocksdb_block_cache_mb` | `raft.rocksdb_block_cache_mb` | `u64` | `64` | >=1 | No | RocksDB block-cache size for the Raft log store, in MiB; one LRU cache shared across both column families (CNF-3). |
 | `max_in_snapshot_log_to_keep` | `raft.max_in_snapshot_log_to_keep` | `u64` | `1000` | >=0 | No | Committed Raft log entries kept after a snapshot (Bug BP-1; keeps the on-disk log small). |
 | `node_liveness_secs` | `raft.node_liveness_secs` | `u64` | `30` | >=5 | No | A node whose `last_seen` is older than this is projected `Suspect` (and `Down` past 4x) in the read API, regardless of stored health (Bug BP-3). |
+| `failed_task_retention_secs` | `raft.failed_task_retention_secs` | `u64` | `1800` | >=1 | No | How long a `Failed` migration task lingers before the scheduler's terminal-task prune drops it (CNF-2; long enough to inspect after a `migration.failed` alert, short enough that a mass-failure event does not bloat the Raft snapshot). |
+| `done_task_retention_secs` | `raft.done_task_retention_secs` | `u64` | `300` | >=1 | No | How long a `Done` migration task lingers before the scheduler's terminal-task prune drops it (CNF-2). |
 
 ### Example
 
