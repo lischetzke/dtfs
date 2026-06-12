@@ -70,13 +70,42 @@ pub(crate) fn liveness_changes(
             continue;
         }
         let elapsed = now_ms.saturating_sub(info.last_seen_ms);
-        if elapsed > down_ms {
-            out.push((*id, NodeStatus::Down));
+        let target = if elapsed > down_ms {
+            Some(NodeStatus::Down)
         } else if elapsed > suspect_ms {
-            out.push((*id, NodeStatus::Suspect));
+            Some(NodeStatus::Suspect)
+        } else {
+            None
+        };
+        // CO-4-8 — only emit a transition when it actually changes the
+        // committed status. Without this an already-Down (or already-Suspect)
+        // node re-emits the same `(id, status)` every 10s tick, re-committing
+        // an identical `UpdateNodeStatus` to raft forever (leader write + audit
+        // churn per dead node).
+        if let Some(status) = target {
+            if !health_matches_status(info.health, status) {
+                out.push((*id, status));
+            }
         }
     }
     out
+}
+
+/// True when the node's current replicated `health` already equals the
+/// liveness `status` this monitor would commit, so re-emitting it is a no-op
+/// (CO-4-8). `NodeStatus` only models the liveness subset; richer health
+/// states (Quarantined, Maintenance, ...) never equal a liveness target.
+fn health_matches_status(
+    health: dtfs_common::types::HealthStatus,
+    status: NodeStatus,
+) -> bool {
+    use dtfs_common::types::HealthStatus;
+    matches!(
+        (status, health),
+        (NodeStatus::Down, HealthStatus::Down)
+            | (NodeStatus::Suspect, HealthStatus::Suspect)
+            | (NodeStatus::Healthy, HealthStatus::Healthy)
+    )
 }
 
 /// Bug CM — the monitor must only evaluate + commit liveness on the raft
@@ -392,6 +421,68 @@ mod bug_cj_liveness_tests {
         assert_eq!(
             monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, true),
             vec![(1, NodeStatus::Suspect)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_co_tests {
+    use super::{liveness_changes, SUSPECT_MS, DOWN_MS};
+    use crate::cluster::NodeStatus;
+    use dtfs_common::types::{HealthStatus, NodeRole};
+
+    fn node(role: NodeRole, last_seen_ms: u64, health: HealthStatus) -> dtfs_raft::NodeInfo {
+        dtfs_raft::NodeInfo {
+            hostname: String::new(),
+            grpc_addr: String::new(),
+            role,
+            disks: Vec::new(),
+            location: dtfs_common::topology::Location::new("", "", "", ""),
+            health,
+            total_capacity: 0,
+            used_capacity: 0,
+            last_seen_ms,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    fn map(items: &[(u64, dtfs_raft::NodeInfo)]) -> std::collections::BTreeMap<u64, dtfs_raft::NodeInfo> {
+        items.iter().cloned().collect()
+    }
+
+    const NOW: u64 = 1_000_000_000;
+
+    // CO-4-8 — a node that is ALREADY Down with a stale last_seen must NOT
+    // re-emit a Down transition every tick. Today `liveness_changes` ignores
+    // `info.health` entirely, so a long-down node yields `(id, Down)` on every
+    // 10s monitor tick, re-committing the same `UpdateNodeStatus("down")` to
+    // raft forever (audit-log churn, needless leader writes). Correct
+    // behaviour: only emit a transition when the node is not already in the
+    // target status.
+    #[test]
+    fn co_4_8_already_down_node_emits_no_transition() {
+        let nodes = map(&[(1, node(NodeRole::Data, NOW - 60_000, HealthStatus::Down))]);
+        assert!(
+            liveness_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS).is_empty(),
+            "an already-Down node must not re-emit a Down transition"
+        );
+    }
+
+    // CO-4-8 companion — a genuinely Healthy node with a stale last_seen IS a
+    // real transition and must still surface as Down (guards against an
+    // over-broad fix that suppresses all stale nodes).
+    #[test]
+    fn co_4_8_healthy_stale_node_still_transitions_down() {
+        let nodes = map(&[(1, node(NodeRole::Data, NOW - 60_000, HealthStatus::Healthy))]);
+        assert_eq!(
+            liveness_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS),
+            vec![(1, NodeStatus::Down)],
+            "a Healthy node gone stale must transition to Down"
         );
     }
 }

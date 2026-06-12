@@ -538,6 +538,9 @@ impl StateMachineStore {
             sm.migration_state_json = snap.migration_state_json;
             sm.posix_locks = snap.posix_locks;
             sm.write_leases = snap.write_leases;
+            // CO-4-11 — assign even when None so a reloaded snapshot is the
+            // source of truth for pending_scrub on restart.
+            sm.pending_scrub = snap.pending_scrub;
             drop(sm);
             let mut slot = store
                 .snapshot
@@ -643,6 +646,7 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
             migration_state_json: sm.migration_state_json.clone(),
             posix_locks: sm.posix_locks.clone(),
             write_leases: sm.write_leases.clone(),
+            pending_scrub: sm.pending_scrub.clone(),
         };
 
         let cursor = snapshot::serialize_snapshot(&snap)?;
@@ -775,6 +779,9 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             sm.migration_state_json = snap_data.migration_state_json;
             sm.posix_locks = snap_data.posix_locks;
             sm.write_leases = snap_data.write_leases;
+            // CO-4-11 — assign even when None so an installed snapshot replaces
+            // a follower's stale pending_scrub with the source's value.
+            sm.pending_scrub = snap_data.pending_scrub;
         }
 
         // Store the snapshot blob for later retrieval.
@@ -966,27 +973,73 @@ fn apply_request(
             } else {
                 path.clone()
             };
-            sm.files.insert(
-                canonical.clone(),
-                FileMetadata {
-                    path: canonical.clone(),
-                    volume_id: volume_id.clone(),
-                    chunk_size: *chunk_size,
-                    chunks: Vec::new(),
-                    created_at_ms: now_ms,
-                    updated_at_ms: now_ms,
-                    symlink_target: None,
-                    logical_size: None,
-                    is_directory: is_dir,
-                    cache_cooldown_until_ms: std::collections::BTreeMap::new(),
-                },
-            );
+            // CO-3-1 — CreateFile must apply deterministically: two replicas
+            // (or a replay) applying the same log entry have to reach
+            // byte-identical state, so the timestamps it stamps cannot come
+            // from each machine's own `SystemTime::now()`. The CreateFile
+            // command carries no proposer wall-clock (the eventual real fix is
+            // to thread one in, like AcquireWriteLease.now_ms), so the
+            // committed `log_id.index` -- identical on every replica -- is used
+            // as a deterministic logical timestamp for the new entry + its
+            // audit row. NOTE: an empty file therefore reports a small
+            // (near-epoch) created/updated_at until the first
+            // UpdateChunkLocations stamps a real wall-clock; this is the
+            // accepted cost of making apply deterministic without a wire
+            // change.
+            let det_now = log_id.index;
+            // CO-4-9 — CreateFile on an existing non-empty regular file must
+            // NOT silently truncate it (a re-open / O_CREAT on an already-
+            // populated path). Keep the existing entry intact -- chunks,
+            // created_at_ms, chunk_size, volume_id, logical_size and cooldowns
+            // all stay consistent with the on-disk layout -- and only refresh
+            // updated_at_ms. Touching chunk_size/volume_id here would
+            // re-map chunk_index<->byte-offset for the preserved chunks and
+            // serve wrong bytes. A directory, symlink, or empty file is
+            // (re)created fresh as before.
+            let preserve = match sm.files.get(&canonical) {
+                Some(existing) => {
+                    !is_dir
+                        && !existing.is_directory
+                        && existing.symlink_target.is_none()
+                        && !existing.chunks.is_empty()
+                }
+                None => false,
+            };
+            if preserve {
+                let existing = sm.files.get_mut(&canonical).expect("checked above");
+                existing.updated_at_ms = det_now;
+            } else {
+                sm.files.insert(
+                    canonical.clone(),
+                    FileMetadata {
+                        path: canonical.clone(),
+                        volume_id: volume_id.clone(),
+                        chunk_size: *chunk_size,
+                        chunks: Vec::new(),
+                        created_at_ms: det_now,
+                        updated_at_ms: det_now,
+                        symlink_target: None,
+                        logical_size: None,
+                        is_directory: is_dir,
+                        cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+                    },
+                );
+            }
             push_audit_capped(
                 &mut sm.audit_log,
-                audit(format!(
-                    "CreateFile: {canonical}{}",
-                    if is_dir { " (directory)" } else { "" }
-                )),
+                AuditEntry {
+                    log_index: log_id.index,
+                    summary: format!(
+                        "CreateFile: {canonical}{}",
+                        if is_dir { " (directory)" } else { "" }
+                    ),
+                    timestamp_ms: det_now,
+                    actor: String::new(),
+                    action: String::new(),
+                    target: String::new(),
+                    result: String::new(),
+                    origin_manager: String::new(),
+                },
             );
             ClientResponse::FileCreated {
                 path: canonical,
@@ -1006,7 +1059,39 @@ fn apply_request(
             // stale writer whose lease had been GC'd could still commit
             // chunks alongside a fresh writer's, interleaving bytes.
             // Empty lease_id preserves legacy callers' behaviour.
-            if !lease_id.is_empty() {
+            // CO-4-15 — an empty lease_id must NOT let a foreign writer
+            // introduce NEW chunk content while another writer holds the
+            // lease. We reject only when the lease-less commit changes content
+            // (some incoming `(chunk_index, chunk_hash)` is not already
+            // present in the file). System-driven, lease-less replica
+            // backfills (scheduler re-replication / tiering) only re-register
+            // EXISTING `(index, hash)` pairs on new nodes, so they pass — they
+            // must keep working while a client holds the write lease, or
+            // under-replication loops forever (scheduler.rs Bug AB).
+            if lease_id.is_empty() {
+                if let Some(held) = sm.write_leases.get(path) {
+                    let introduces_new_content = match sm.files.get(path) {
+                        Some(file) => chunks.iter().any(|inc| {
+                            !file.chunks.iter().any(|cur| {
+                                cur.chunk_index == inc.chunk_index
+                                    && cur.chunk_hash == inc.chunk_hash
+                            })
+                        }),
+                        // No metadata yet => any incoming entry is new content.
+                        None => !chunks.is_empty(),
+                    };
+                    if introduces_new_content {
+                        warn!(
+                            "UpdateChunkLocations REJECTED for {path}: empty lease_id introduces new content while a lease is held (owner={})",
+                            held.owner_id
+                        );
+                        return ClientResponse::WriteLeaseConflict {
+                            owner_id: held.owner_id.clone(),
+                            expires_at_ms: held.expires_at_ms,
+                        };
+                    }
+                }
+            } else {
                 match sm.write_leases.get(path) {
                     Some(held) if held.lease_id == *lease_id => {
                         // OK — same writer.
@@ -1335,6 +1420,23 @@ fn apply_request(
                 if let Some(locks) = sm.posix_locks.remove(from) {
                     sm.posix_locks.insert(to.clone(), locks);
                 }
+                // CO-4-10 — the write lease must follow the rename so the
+                // holder can keep committing chunks on the new path under the
+                // same lease_id (mirrors the posix_locks migration above).
+                // The destination's metadata was just replaced, so drop any
+                // stale lease there first; then move the source's lease over
+                // (if any). Renaming a leased source onto a leased dest is a
+                // pathological collision -- the source writer wins, matching
+                // the metadata that now lives at `to`.
+                let moved = sm.write_leases.remove(from);
+                match moved {
+                    Some(lease) => {
+                        sm.write_leases.insert(to.clone(), lease);
+                    }
+                    None => {
+                        sm.write_leases.remove(to);
+                    }
+                }
                 push_audit_capped(
                     &mut sm.audit_log,
                     audit(format!("RenameFile: {from} -> {to}")),
@@ -1454,7 +1556,7 @@ fn apply_request(
                 start: *start,
                 end: *end,
                 write: *write,
-                expires_at_ms: *now_ms + *lease_ms,
+                expires_at_ms: now_ms.saturating_add(*lease_ms),
             });
             ClientResponse::LockGranted
         }
@@ -1504,7 +1606,7 @@ fn apply_request(
                 // keep the existing lease_id so the caller's prior token
                 // still validates (idempotency).
                 let lease_id = existing.lease_id.clone();
-                let new_expires = *now_ms + *lease_ms;
+                let new_expires = now_ms.saturating_add(*lease_ms);
                 sm.write_leases.insert(
                     path.clone(),
                     WriteLease {
@@ -1526,7 +1628,7 @@ fn apply_request(
             }
 
             // No conflict — grant fresh.
-            let expires_at_ms = *now_ms + *lease_ms;
+            let expires_at_ms = now_ms.saturating_add(*lease_ms);
             sm.write_leases.insert(
                 path.clone(),
                 WriteLease {
@@ -1567,7 +1669,7 @@ fn apply_request(
                         expires_at_ms: existing.expires_at_ms,
                     };
                 }
-                let new_expires = *now_ms + *extension_ms;
+                let new_expires = now_ms.saturating_add(*extension_ms);
                 existing.expires_at_ms = new_expires;
                 return ClientResponse::WriteLeaseGranted {
                     lease_id: lease_id.clone(),
@@ -2263,6 +2365,30 @@ mod posix_path_regression {
         let restored: StateMachineData =
             serde_json::from_value(v).expect("old snapshot loads");
         assert!(restored.pending_scrub.is_none());
+    }
+
+    /// CO-3-1 — CreateFile stamps a deterministic logical timestamp
+    /// (`log_id.index`) into the new entry + its audit row, NOT each
+    /// replica's wall-clock, so the same log entry yields byte-identical
+    /// state on every replica and across replay.
+    #[test]
+    fn co_3_1_create_file_timestamps_are_log_index_deterministic() {
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(7),
+            &ClientRequest::CreateFile {
+                path: "/det.bin".into(),
+                volume_id: "default".into(),
+                chunk_size: 1024,
+            },
+        );
+        let meta = sm.files.get("/det.bin").expect("created");
+        assert_eq!(meta.created_at_ms, 7);
+        assert_eq!(meta.updated_at_ms, 7);
+        let entry = sm.audit_log.last().expect("audit pushed");
+        assert_eq!(entry.timestamp_ms, 7);
+        assert_eq!(entry.log_index, 7);
     }
 
     /// Bug CD — `ReleaseLeasesByHost` must reap only EXPIRED host leases. A
@@ -3982,5 +4108,326 @@ mod posix_path_regression {
             &ClientRequest::UpdateNodeStatus { node_id: 7, status: "healthy".into() });
         assert_eq!(count_audit_prefix(&sm, "UpdateNodeStatus:"), 2,
             "Healthy->Suspect then Suspect->Healthy = two transitions = two rows");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit CO findings — red tests that encode the desired post-fix behaviour.
+// Each fn is prefixed with its finding id. These are written to FAIL against
+// the current (unfixed) code; a later fix turns them green. No production
+// code is modified by this module.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod audit_co_tests {
+    use super::*;
+    use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+
+    fn mk_log_id(idx: u64) -> LogId {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        openraft::LogId::new(leader, idx)
+    }
+
+    // ----- CO-1-1 ----------------------------------------------------------
+    // RemoveChunkLocation retains by (chunk_index, node_id) only, so when one
+    // chunk has two ChunkLocation entries on the SAME node_id but different
+    // disk_id/tier (allowed per AGENTS.md A.3.4), removing one drops BOTH.
+    // The variant has no disk_id field today (see "needs-fix-seam" in report
+    // for the precise disk-targeted test the fix enables). This test still
+    // FAILS today, by panic: the overbroad retain drops 2 entries, tripping
+    // the production `debug_assert_eq!(.., 1, "drop exactly one entry")` at the
+    // mutate site BEFORE this fn's own assert. Either way it is RED today and
+    // GREEN once removal stops nuking the co-located same-node entry.
+    #[test]
+    #[ignore = "CO-1-1 is GROUP B (deferred): needs the disk_id field on \
+                RemoveChunkLocation + a locked-in decision; see \
+                plans/active/PLAN-CO-CODE-AUDIT.md. Red by design until then."]
+    fn co_1_1_remove_chunk_location_overbroad_drops_colocated_entry() {
+        // One file, one chunk_index, two replicas on the SAME node_id (10)
+        // but different disk_id (0 cold anchor, 1 warm cache).
+        let mut sm = StateMachineData::default();
+        sm.files.insert("/x".to_string(), FileMetadata {
+            path: "/x".to_string(),
+            volume_id: "default".to_string(),
+            chunk_size: 1024,
+            chunks: vec![
+                ChunkLocationEntry {
+                    chunk_index: 0,
+                    chunk_hash: "h".to_string(),
+                    node_id: "10".to_string(),
+                    disk_id: 0,
+                    size_bytes: 1024,
+                },
+                ChunkLocationEntry {
+                    chunk_index: 0,
+                    chunk_hash: "h".to_string(),
+                    node_id: "10".to_string(),
+                    disk_id: 1,
+                    size_bytes: 1024,
+                },
+            ],
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+        });
+        let resp = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "10".into(),
+                enforce_anchor: None,
+            });
+        assert!(matches!(resp, ClientResponse::Success));
+        // CORRECT behaviour: only the targeted disk's entry is removed; the
+        // co-located same-node different-disk replica survives. Today removal
+        // is keyed by node_id only, so BOTH are dropped (and the production
+        // debug_assert "drop exactly one entry" panics first).
+        assert_eq!(
+            sm.files.get("/x").unwrap().chunks.len(),
+            1,
+            "RemoveChunkLocation must drop only the targeted (node,disk) entry, \
+             leaving the co-located same-node different-disk replica intact",
+        );
+    }
+
+    // ----- CO-3-1 ----------------------------------------------------------
+    // apply_request stamps SystemTime::now() into replicated state
+    // (FileMetadata.created_at_ms/updated_at_ms + AuditEntry.timestamp_ms)
+    // instead of a now_ms carried in the command. Two replicas applying the
+    // SAME CreateFile therefore diverge byte-for-byte. Correct: identical.
+    #[test]
+    fn co_3_1_create_file_apply_is_deterministic_across_replicas() {
+        let req = ClientRequest::CreateFile {
+            path: "/det.bin".into(),
+            volume_id: "default".into(),
+            chunk_size: 1024,
+        };
+        let mut a = StateMachineData::default();
+        apply_request(&mut a, &mk_log_id(1), &req);
+
+        // A real wall-clock gap between the two replays.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let mut b = StateMachineData::default();
+        apply_request(&mut b, &mk_log_id(1), &req);
+
+        let a_bytes = serde_json::to_vec(&a).expect("serialize a");
+        let b_bytes = serde_json::to_vec(&b).expect("serialize b");
+        assert_eq!(
+            a_bytes, b_bytes,
+            "two replicas applying the SAME CreateFile must reach byte-identical \
+             state; today now() is stamped at apply time so timestamps diverge",
+        );
+    }
+
+    // ----- CO-4-9 ----------------------------------------------------------
+    // CreateFile on an existing path inserts a fresh FileMetadata with empty
+    // chunks, wiping the chunk list. Correct: an existing file's chunks are
+    // preserved (CreateFile of an existing path must not silently truncate).
+    #[test]
+    fn co_4_9_create_file_existing_path_preserves_chunks() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/keep.bin".into(),
+            volume_id: "default".into(),
+            chunk_size: 1024,
+        });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::UpdateChunkLocations {
+            path: "/keep.bin".into(),
+            chunks: vec![ChunkLocationEntry {
+                chunk_index: 0,
+                chunk_hash: "h".into(),
+                node_id: "10".into(),
+                disk_id: 0,
+                size_bytes: 1024,
+            }],
+            lease_id: String::new(),
+        });
+        assert_eq!(sm.files.get("/keep.bin").unwrap().chunks.len(), 1);
+
+        // Re-create the same path.
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::CreateFile {
+            path: "/keep.bin".into(),
+            volume_id: "default".into(),
+            chunk_size: 1024,
+        });
+        assert_eq!(
+            sm.files.get("/keep.bin").unwrap().chunks.len(),
+            1,
+            "CreateFile on an existing path must not wipe the chunk list",
+        );
+    }
+
+    // ----- CO-4-10 ---------------------------------------------------------
+    // RenameFile moves posix_locks but NOT write_leases, so a commit on the
+    // new path under the still-valid lease is rejected with WriteLeaseConflict.
+    // Correct: the lease follows the rename and the commit succeeds.
+    #[test]
+    fn co_4_10_rename_file_migrates_write_lease() {
+        let mut sm = StateMachineData::default();
+        // Grant a lease on /a.
+        let granted = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::AcquireWriteLease {
+                path: "/a".into(),
+                owner_id: "host:1:7".into(),
+                lease_ms: 60_000,
+                now_ms: 1_000,
+                proposed_lease_id: "lease-xyz".into(),
+            });
+        let lease_id = match granted {
+            ClientResponse::WriteLeaseGranted { lease_id, .. } => lease_id,
+            other => panic!("expected WriteLeaseGranted, got {other:?}"),
+        };
+        // Create the file so UpdateChunkLocations has a target after rename.
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+            path: "/a".into(),
+            volume_id: "default".into(),
+            chunk_size: 1024,
+        });
+        // Rename /a -> /b.
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::RenameFile {
+            from: "/a".into(),
+            to: "/b".into(),
+        });
+        // Commit chunks on /b under the original lease.
+        let resp = apply_request(&mut sm, &mk_log_id(4),
+            &ClientRequest::UpdateChunkLocations {
+                path: "/b".into(),
+                chunks: vec![ChunkLocationEntry {
+                    chunk_index: 0,
+                    chunk_hash: "h".into(),
+                    node_id: "10".into(),
+                    disk_id: 0,
+                    size_bytes: 1024,
+                }],
+                lease_id,
+            });
+        assert!(
+            matches!(resp, ClientResponse::Success),
+            "the write lease must follow RenameFile so the holder can keep \
+             committing under it; got {resp:?}",
+        );
+    }
+
+    // ----- CO-4-11 ---------------------------------------------------------
+    // pending_scrub is not part of StateMachineSnapshot, so build_snapshot
+    // drops it and install_snapshot leaves the follower's stale value. Correct:
+    // an installed snapshot makes the follower's pending_scrub match the source.
+    #[tokio::test]
+    async fn co_4_11_pending_scrub_survives_snapshot_install() {
+        let src_dir = tempfile::tempdir().expect("tmp src");
+        let snapshot_bytes;
+        let snapshot_meta;
+        let source_pending;
+        {
+            let mut src = StateMachineStore::open_at(src_dir.path()).expect("open src");
+            {
+                let mut data = src.data.write().await;
+                apply_request(&mut data, &mk_log_id(1), &ClientRequest::TriggerScrub {
+                    id: "src-scrub".into(),
+                    level: "deep".into(),
+                    requested_at_ms: 9_999,
+                });
+                source_pending = data.pending_scrub.clone();
+            }
+            let mut builder = src.get_snapshot_builder().await;
+            let snap = builder.build_snapshot().await.expect("build");
+            snapshot_meta = snap.meta.clone();
+            snapshot_bytes = snap.snapshot.into_inner();
+        }
+        assert!(source_pending.is_some(), "precondition: source has a pending scrub");
+
+        // Follower pre-seeded with a DIFFERENT pending_scrub.
+        let fol_dir = tempfile::tempdir().expect("tmp follower");
+        let mut follower = StateMachineStore::open_at(fol_dir.path()).expect("open follower");
+        {
+            let mut data = follower.data.write().await;
+            apply_request(&mut data, &mk_log_id(1), &ClientRequest::TriggerScrub {
+                id: "stale-follower".into(),
+                level: "quick".into(),
+                requested_at_ms: 1,
+            });
+        }
+        follower
+            .install_snapshot(&snapshot_meta, Cursor::new(snapshot_bytes))
+            .await
+            .expect("install");
+
+        let data = follower.data.read().await;
+        assert_eq!(
+            data.pending_scrub, source_pending,
+            "installing the source's snapshot must replace the follower's \
+             pending_scrub with the source's value; today the field is not \
+             part of StateMachineSnapshot so the stale follower value survives",
+        );
+    }
+
+    // ----- CO-4-15 ---------------------------------------------------------
+    // An empty lease_id bypasses the write-lease check on UpdateChunkLocations,
+    // so a writer with no token can commit while holder A's lease is live.
+    // Correct: with a live lease held by A, a lease-less commit is rejected.
+    #[test]
+    fn co_4_15_empty_lease_id_does_not_bypass_held_lease() {
+        let mut sm = StateMachineData::default();
+        // Holder A acquires the lease on /f.
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::AcquireWriteLease {
+            path: "/f".into(),
+            owner_id: "hostA:1:7".into(),
+            lease_ms: 60_000,
+            now_ms: 1_000,
+            proposed_lease_id: "lease-A".into(),
+        });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+            path: "/f".into(),
+            volume_id: "default".into(),
+            chunk_size: 1024,
+        });
+        // A different writer commits with an EMPTY lease_id while A holds it.
+        let resp = apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::UpdateChunkLocations {
+                path: "/f".into(),
+                chunks: vec![ChunkLocationEntry {
+                    chunk_index: 0,
+                    chunk_hash: "h".into(),
+                    node_id: "10".into(),
+                    disk_id: 0,
+                    size_bytes: 1024,
+                }],
+                lease_id: String::new(),
+            });
+        assert!(
+            matches!(resp, ClientResponse::WriteLeaseConflict { .. }),
+            "a commit with an empty lease_id must NOT bypass a live lease held \
+             by another writer; got {resp:?}",
+        );
+    }
+
+    // ----- CO-5-1 ----------------------------------------------------------
+    // AcquireWriteLease computes `now_ms + lease_ms` unchecked, so lease_ms =
+    // u64::MAX panics (debug overflow). Correct: no panic; grant a finite,
+    // future expiry (saturating).
+    #[test]
+    fn co_5_1_acquire_write_lease_huge_lease_ms_does_not_overflow() {
+        let mut sm = StateMachineData::default();
+        let resp = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::AcquireWriteLease {
+                path: "/big".into(),
+                owner_id: "host:1:7".into(),
+                lease_ms: u64::MAX,
+                now_ms: 1_000,
+                proposed_lease_id: "lease-big".into(),
+            });
+        match resp {
+            ClientResponse::WriteLeaseGranted { expires_at_ms, .. } => {
+                assert!(
+                    expires_at_ms > 1_000,
+                    "expiry must be a finite future instant, got {expires_at_ms}",
+                );
+            }
+            other => panic!("expected WriteLeaseGranted, got {other:?}"),
+        }
     }
 }

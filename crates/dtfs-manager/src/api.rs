@@ -2831,11 +2831,18 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Json<Value> {
     let sm = state.sm_data.read().await;
     // Raft-stored cluster override (set via the WebUI editor / `dtfs-cli
     // config set`). May be sparse, e.g. `{"tiering":{"evaluation_interval_secs":60}}`.
-    let raw_override = if sm.cluster_config.config_json.is_empty() {
+    let mut raw_override = if sm.cluster_config.config_json.is_empty() {
         Value::Null
     } else {
         serde_json::from_str(&sm.cluster_config.config_json).unwrap_or(Value::Null)
     };
+    // CO-2-1 (security) — this endpoint is unauthenticated and echoes the
+    // stored override verbatim under `config`. If an operator ever saved
+    // `cluster.shared_secret` cluster-wide it lives here in cleartext; redact
+    // it to the "***" sentinel before serving, same as the flattened
+    // effective view. (The tiering merge below reads its own `tiering`
+    // sub-object, which carries no secrets.)
+    redact_secret_leaves(&mut raw_override);
     // BUG-CM — read-back MUST project the override onto the node's startup
     // config; otherwise a saved cluster-wide change is invisible here and the
     // editor looks broken. Serialise the whole TieringConfig (all fields, not a
@@ -2891,17 +2898,31 @@ async fn update_config(
     // out-of-range value returns 400 with the pre-attempt
     // (current) value, leaving the live config + on-disk file
     // untouched.
-    if !body.config_json.is_empty() {
-        if let Err(e) = serde_json::from_str::<serde_json::Value>(&body.config_json) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("invalid config JSON: {e}"),
-                    "preserved_current": true,
-                })),
-            ));
+    // CO-2-1 (security) — the read path redacts secret leaves to the "***"
+    // sentinel, so a round-tripped editor payload carries "***" for any secret
+    // the operator did not change. Strip those leaves from the override before
+    // it reaches Raft, so the deep-merge keeps the real shared_secret instead
+    // of overwriting it with the literal sentinel. Done first, so the parsed
+    // value below and the on-disk write both see the sanitised JSON.
+    let config_json = if body.config_json.is_empty() {
+        body.config_json.clone()
+    } else {
+        match serde_json::from_str::<serde_json::Value>(&body.config_json) {
+            Ok(mut v) => {
+                strip_secret_sentinels(&mut v);
+                serde_json::to_string(&v).unwrap_or_else(|_| body.config_json.clone())
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("invalid config JSON: {e}"),
+                        "preserved_current": true,
+                    })),
+                ));
+            }
         }
-    }
+    };
 
     // Bug BD-3 — guard cluster-wide writes. We treat any non-empty
     // payload that the WebUI would touch under the Cluster tab as
@@ -2927,7 +2948,7 @@ async fn update_config(
     };
 
     let req = ClientRequest::UpdateConfig {
-        config_json: body.config_json.clone(),
+        config_json: config_json.clone(),
         version,
     };
 
@@ -2942,18 +2963,19 @@ async fn update_config(
 
     // AZ-5-A2 — optionally persist to disk via atomic tmp+rename.
     let mut wrote_to_disk = false;
-    if body.write_to_disk && !body.config_json.is_empty() {
+    if body.write_to_disk && !config_json.is_empty() {
         let path = std::path::Path::new("/etc/dtfs/manager.toml");
         let tmp = path.with_extension("toml.az5.tmp");
         // Re-serialise the live ManagerConfig to TOML so the on-disk
         // file stays operator-readable. Fall back to the raw JSON if
-        // TOML serialisation fails.
+        // TOML serialisation fails. Uses the sentinel-stripped JSON so a
+        // "***" placeholder never lands on disk as the real secret.
         let new_toml = match serde_json::from_str::<dtfs_common::config::ManagerConfig>(
-            &body.config_json,
+            &config_json,
         ) {
             Ok(parsed) => toml::to_string_pretty(&parsed)
-                .unwrap_or_else(|_| body.config_json.clone()),
-            Err(_) => body.config_json.clone(),
+                .unwrap_or_else(|_| config_json.clone()),
+            Err(_) => config_json.clone(),
         };
         if let Err(e) = std::fs::write(&tmp, new_toml.as_bytes())
             .and_then(|_| std::fs::rename(&tmp, path))
@@ -3166,6 +3188,48 @@ mod config_scope_tests {
     }
 }
 
+#[cfg(test)]
+mod audit_co_tests {
+    use super::flatten_config;
+    use serde_json::{json, Value};
+
+    // CO-2-1 — the config read path (get_config_effective -> flatten_config)
+    // MUST NOT emit `manager.cluster.shared_secret` in cleartext. The WebUI
+    // config viewer renders every flattened row's `current` value, so a raw
+    // secret here leaks the cluster membership credential to anyone with
+    // read access to the config tab. Correct behaviour: the secret value is
+    // redacted (e.g. to "***") in the rendered row, never the real value.
+    #[test]
+    fn co_2_1_shared_secret_redacted_in_flattened_config() {
+        const SECRET: &str = "super-secret-cluster-token-9f3a";
+        let current = json!({
+            "cluster": {
+                "name": "plexmedia",
+                "shared_secret": SECRET,
+            },
+        });
+        let defaults = json!({
+            "cluster": {
+                "name": Value::Null,
+                "shared_secret": Value::Null,
+            },
+        });
+
+        let mut rows: Vec<Value> = Vec::new();
+        flatten_config(&current, &defaults, "manager", "", &mut rows);
+
+        let secret_row = rows
+            .iter()
+            .find(|r| r.get("name").and_then(|n| n.as_str()) == Some("manager.cluster.shared_secret"))
+            .expect("shared_secret row must be present");
+        assert_ne!(
+            secret_row.get("current").and_then(|v| v.as_str()),
+            Some(SECRET),
+            "shared_secret must be redacted, not emitted in cleartext: {secret_row}"
+        );
+    }
+}
+
 /// AZ-5-A1 helper — walk two parallel JSON values and produce one
 /// flat row per leaf. `scope` is the top-level prefix
 /// ("manager", "data", "fuse", or a hostname for per-host views).
@@ -3192,15 +3256,91 @@ fn flatten_config(
         _ => {
             let dotted = format!("{scope}.{prefix}");
             let kind = config_key_scope(&dotted);
+            // CO-2-1 (security) — the config read path is unauthenticated and
+            // the WebUI renders every row's `current` value. Never emit a
+            // secret leaf (the `shared_secret` that gates raft membership /
+            // node registration) in cleartext; render it as the sentinel
+            // "***", which the editor treats as "unchanged" on write-back.
+            // Only a non-empty secret is masked, so an unset key still reads
+            // as null and `is_default` stays meaningful.
+            let secret = config_key_is_secret(prefix);
+            let masked = secret && matches!(current, V::String(s) if !s.is_empty());
+            let current_out: V = if masked {
+                V::String(CONFIG_SECRET_SENTINEL.to_string())
+            } else {
+                current.clone()
+            };
+            // is_default compares the (possibly redacted) emitted value, so a
+            // masked secret never round-trips its cleartext via this flag.
+            let is_default = !masked && current == defaults;
             out.push(json!({
                 "name": dotted,
                 "scope": scope,
                 // Bug BD-1 — WebUI tab dispatch reads this field.
                 "scope_kind": kind,
-                "current": current,
+                "current": current_out,
                 "default": defaults,
-                "is_default": current == defaults,
+                "is_default": is_default,
             }));
+        }
+    }
+}
+
+/// CO-2-1 — sentinel rendered in place of a redacted secret in the config
+/// read path. A config WRITE that posts this value back means "keep the
+/// existing secret" (see `update_config` / the Raft `UpdateConfig` apply).
+pub(crate) const CONFIG_SECRET_SENTINEL: &str = "***";
+
+/// CO-2-1 — true when the flattened config leaf at `prefix` (the dotted path
+/// without the scope label, e.g. `cluster.shared_secret`) carries secret
+/// material that must never be emitted in cleartext. Today that is only the
+/// cluster membership secret; the TLS block holds file *paths*
+/// (`tls.cert_file` / `tls.key_file` / `tls.ca_file`), not inline key bytes,
+/// so no key material is serialised here. Extend this list if an inline-secret
+/// config field is ever added.
+fn config_key_is_secret(prefix: &str) -> bool {
+    let leaf = prefix.rsplit('.').next().unwrap_or(prefix);
+    matches!(leaf, "shared_secret")
+}
+
+/// CO-2-1 — recursively drop any secret leaf (per `config_key_is_secret`)
+/// whose value is the redaction sentinel `"***"` from an incoming config
+/// override. The read path renders unchanged secrets as the sentinel, so an
+/// editor round-trip posts "***" back; dropping the key here means the
+/// downstream deep-merge preserves the real stored secret instead of
+/// overwriting it with the literal placeholder. A genuinely new secret value
+/// (anything other than the sentinel) passes through untouched.
+fn strip_secret_sentinels(v: &mut Value) {
+    if let Value::Object(map) = v {
+        map.retain(|k, child| {
+            if config_key_is_secret(k)
+                && child.as_str() == Some(CONFIG_SECRET_SENTINEL)
+            {
+                return false;
+            }
+            true
+        });
+        for child in map.values_mut() {
+            strip_secret_sentinels(child);
+        }
+    }
+}
+
+/// CO-2-1 — recursively mask any non-empty secret leaf (per
+/// `config_key_is_secret`) to the redaction sentinel `"***"`, in place. Used
+/// by `get_config`, which echoes the raw Raft override verbatim, so a
+/// cluster-set `shared_secret` is never served in cleartext from this
+/// unauthenticated endpoint. An empty/non-string secret value is left as-is.
+fn redact_secret_leaves(v: &mut Value) {
+    if let Value::Object(map) = v {
+        for (k, child) in map.iter_mut() {
+            let masked = config_key_is_secret(k)
+                && matches!(child, Value::String(s) if !s.is_empty());
+            if masked {
+                *child = Value::String(CONFIG_SECRET_SENTINEL.to_string());
+            } else {
+                redact_secret_leaves(child);
+            }
         }
     }
 }

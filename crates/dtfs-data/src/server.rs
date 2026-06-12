@@ -782,10 +782,39 @@ impl DataService for DataServiceImpl {
         id_array.copy_from_slice(&chunk_id_bytes);
         let chunk_id = ChunkId::from_bytes(id_array);
 
-        match self.store.get_chunk(&chunk_id).await {
-            Ok(_) => Ok(Response::new(VerifyChunkResponse {
+        // CO-1-5 (§ A.6 #6) — VerifyChunk must BLAKE3 the on-disk bytes
+        // against the stored ChunkMeta.checksum, not merely confirm the
+        // .dat is readable. Migration marks a copy Done on this, so a
+        // false `valid:true` lets bit-rot propagate and tier-demote drop
+        // the only good source. Missing meta = unverifiable = invalid.
+        let meta = match self.store.get_chunk_meta(&chunk_id).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                return Ok(Response::new(VerifyChunkResponse {
+                    valid: false,
+                    error: e.to_string(),
+                }));
+            }
+        };
+        let dat_path = match self.store.chunk_file_path(&chunk_id) {
+            Some((path, _size)) => path,
+            None => {
+                return Ok(Response::new(VerifyChunkResponse {
+                    valid: false,
+                    error: format!("chunk {} .dat missing", req.chunk_id),
+                }));
+            }
+        };
+        // Stream-hash the on-disk file (one ~8 MB piece in RAM, never the
+        // whole chunk — Bug-I parity).
+        match hash_file_incrementally(&dat_path, meta.size).await {
+            Ok(digest) if digest == meta.checksum => Ok(Response::new(VerifyChunkResponse {
                 valid: true,
                 error: String::new(),
+            })),
+            Ok(_) => Ok(Response::new(VerifyChunkResponse {
+                valid: false,
+                error: format!("checksum mismatch for chunk {}", req.chunk_id),
             })),
             Err(e) => Ok(Response::new(VerifyChunkResponse {
                 valid: false,
@@ -1133,5 +1162,176 @@ max_io_percent = 10
 
         let got = collect_stream(&svc, &chunk_hex).await.unwrap();
         assert_eq!(got, data);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Audit CO findings — RED tests that encode CORRECT behaviour and so
+// FAIL against the current (unfixed) code. Do not "fix" by relaxing the
+// asserts; fix the production code.
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod audit_co_tests {
+    use super::*;
+    use crate::cache::ArcCache;
+    use crate::disk::DiskManager;
+    use crate::integrity::IntegrityFaultCollector;
+    use crate::metrics::DataMetrics;
+    use crate::store::ChunkStore;
+    use dtfs_common::config::ScrubConfig;
+
+    // Local copy of the tests-module service builder (that one is private
+    // to its sibling module). Single hot disk, verify_on_read on.
+    async fn make_service(disk_path: &std::path::Path) -> DataServiceImpl {
+        std::fs::create_dir_all(disk_path.join(".dtfs").join("wal")).unwrap();
+        std::fs::create_dir_all(disk_path.join("chunks")).unwrap();
+        std::fs::create_dir_all(disk_path.join("tmp")).unwrap();
+
+        let toml_str = format!(
+            r#"
+[node]
+id = "auto"
+hostname = "data-co.example.com"
+data_dir = "/var/lib/dtfs/data"
+
+[location]
+region = "eu"
+datacenter = "frankfurt"
+rack = "rack-a1"
+host = "data-co"
+
+[cluster]
+manager_addr = "mgr-01:9401"
+shared_secret = "test-secret"
+
+[grpc]
+listen_addr = "0.0.0.0:9500"
+
+[tls]
+mode = "auto"
+
+[[disks]]
+path = "{}"
+tier = "hot"
+
+[cache]
+max_memory_mb = 16
+policy = "arc"
+
+[scrub]
+quick_interval_hours = 6
+deep_interval_hours = 168
+max_io_percent = 10
+"#,
+            disk_path.display().to_string().replace('\\', "/")
+        );
+        let config: DataNodeConfig = toml::from_str(&toml_str).unwrap();
+
+        let disk_configs = vec![dtfs_common::config::DiskConfig {
+            path: disk_path.to_path_buf(),
+            tier: DiskTier::Hot,
+        }];
+        let dm = DiskManager::new(&disk_configs).unwrap();
+        let store = Arc::new(ChunkStore::new(dm));
+        let replication = Arc::new(ReplicationManager::new(
+            store.clone(),
+            config.clone(),
+            dtfs_common::tls::TlsContext::plaintext(),
+        ));
+        let scrub_config = ScrubConfig {
+            quick_interval_hours: 6,
+            deep_interval_hours: 168,
+            quick_cron: None,
+            deep_cron: None,
+            max_io_percent: 10,
+            verify_on_read: true,
+            quarantine_on_fault: true,
+        };
+        DataServiceImpl {
+            config,
+            store,
+            replication,
+            metrics: Arc::new(DataMetrics::new()),
+            cache: Arc::new(ArcCache::new(64)),
+            write_slots: Arc::new(Semaphore::new(8)),
+            memory: Arc::new(MemoryBudget::from_config(
+                &dtfs_common::config::MemoryConfig::default(),
+            )),
+            scrub_config: Arc::new(RwLock::new(scrub_config)),
+            integrity_faults: Arc::new(IntegrityFaultCollector::new(64)),
+        }
+    }
+
+    // CO-1-5(a) — VerifyChunk must BLAKE3 the on-disk bytes against the
+    // stored ChunkMeta.checksum. With one byte flipped in the .dat the
+    // handler must report invalid; today it only checks get_chunk() == Ok
+    // (no hashing) so it wrongly reports valid:true.
+    #[tokio::test]
+    async fn co_1_5a_verify_chunk_detects_flipped_byte() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path()).await;
+
+        let data = vec![5u8; 4096];
+        let chunk_id = ChunkId::from_bytes(checksum::compute(&data));
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+
+        // Flip one byte on disk so BLAKE3 no longer matches the meta.
+        let (dat_path, _size) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let mut corrupt = std::fs::read(&dat_path).unwrap();
+        corrupt[0] ^= 0xFF;
+        std::fs::write(&dat_path, &corrupt).unwrap();
+
+        let resp = svc
+            .verify_chunk(Request::new(VerifyChunkRequest {
+                chunk_id: chunk_hex,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(
+            !resp.valid,
+            "VerifyChunk must report invalid when on-disk bytes don't match the stored checksum"
+        );
+    }
+
+    // CO-1-5(b) — VerifyChunk must report invalid when the .meta is gone
+    // (no checksum to verify against / chunk no longer trustworthy).
+    // Today get_chunk() still returns the bytes (meta isn't consulted) so
+    // the handler wrongly reports valid:true.
+    #[tokio::test]
+    async fn co_1_5b_verify_chunk_detects_missing_meta() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path()).await;
+
+        let data = vec![9u8; 4096];
+        let chunk_id = ChunkId::from_bytes(checksum::compute(&data));
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+
+        // Remove only the .meta; the .dat is intact.
+        let (dat_path, _size) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let meta_path = dat_path.with_extension("meta");
+        std::fs::remove_file(&meta_path).unwrap();
+
+        let resp = svc
+            .verify_chunk(Request::new(VerifyChunkRequest {
+                chunk_id: chunk_hex,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(
+            !resp.valid,
+            "VerifyChunk must report invalid when the chunk's .meta is missing"
+        );
     }
 }

@@ -68,6 +68,7 @@ enum Commands {
     },
 
     /// Maintenance mode operations
+    #[command(group(clap::ArgGroup::new("maintenance_mode").required(true).args(["enable", "disable"])))]
     Maintenance {
         /// Node ID
         node_id: String,
@@ -1280,6 +1281,58 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        // Take whole chars whose cumulative byte length fits within the
+        // budget left for the "..." suffix, so we never slice mid-char
+        // (would panic on multi-byte UTF-8) and stay within `max` bytes.
+        let budget = max.saturating_sub(3);
+        let mut prefix = String::new();
+        for c in s.chars() {
+            if prefix.len() + c.len_utf8() > budget {
+                break;
+            }
+            prefix.push(c);
+        }
+        format!("{prefix}...")
+    }
+}
+
+#[cfg(test)]
+mod audit_co_tests {
+    use super::*;
+
+    // CO-5-11 — truncate() byte-slices `&s[..max-3]`, which panics when
+    // the cut index lands inside a multibyte UTF-8 char. It must instead
+    // truncate on a char boundary and return something ending in "...".
+    #[test]
+    fn co_5_11_truncate_handles_multibyte_boundary() {
+        // 40 x "é" (2 bytes each) = 80 bytes; max=10 -> cut at byte 7,
+        // which is mid-"é" -> panic on current byte-slicing code.
+        let s = "é".repeat(40);
+        let out = truncate(&s, 10);
+        assert!(out.ends_with("..."), "truncated string should end with ...: {out:?}");
+        assert!(out.len() <= 10, "result must respect the max byte budget: {out:?}");
+
+        // A real title that straddles the boundary.
+        let title = "Amélie (2001) Directors Cut Remastered";
+        let out2 = truncate(title, 6);
+        assert!(out2.ends_with("..."), "got {out2:?}");
+    }
+
+    // CO-5-13 — `maintenance <node>` with neither --enable nor --disable
+    // must be rejected by the parser (clap ArgGroup), not silently
+    // default to enable=false (= disable). Parsing with no flag succeeds
+    // today, so this fails (the parse is Ok when it should be Err).
+    #[test]
+    fn co_5_13_maintenance_requires_explicit_flag() {
+        let res = Args::try_parse_from(["dtfs-cli", "maintenance", "n1"]);
+        assert!(
+            res.is_err(),
+            "maintenance with no --enable/--disable must be rejected, got {:?}",
+            res.map(|_| "Ok(parsed)")
+        );
+
+        // The explicit forms still parse.
+        assert!(Args::try_parse_from(["dtfs-cli", "maintenance", "n1", "--enable"]).is_ok());
+        assert!(Args::try_parse_from(["dtfs-cli", "maintenance", "n1", "--disable"]).is_ok());
     }
 }

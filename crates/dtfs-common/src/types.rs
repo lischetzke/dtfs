@@ -43,6 +43,9 @@ impl ChunkId {
         if s.len() != 64 {
             return Err(format!("expected 64 hex chars, got {}", s.len()));
         }
+        if !s.is_ascii() {
+            return Err("expected ASCII hex chars".to_string());
+        }
         let mut out = [0u8; 32];
         for i in 0..32 {
             let byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
@@ -1176,5 +1179,30 @@ mod bug_av_types_tests {
             "warm not mandatory → under-replication scheduler stays out");
         assert_eq!(eff.for_tier(DiskTier::Hot),  0);
         assert_eq!(eff.for_tier(DiskTier::Tape), 0);
+    }
+}
+
+#[cfg(test)]
+mod audit_co_tests {
+    use super::*;
+
+    // CO-5-12 — ChunkId::from_hex must Err (never panic) on a 64-byte
+    // non-ASCII input; the byte-length check passes but `&s[i*2..i*2+2]`
+    // slices through a multibyte char boundary and panics today.
+    #[test]
+    fn co_5_12_from_hex_rejects_multibyte_64_bytes() {
+        // "€" is 3 bytes in UTF-8 (boundaries at 0,3,6,...). 21 of them =
+        // 63 bytes + one ASCII byte = 64 bytes, so the len==64 guard
+        // passes. The second slice `&s[2..4]` (i=1) straddles the first
+        // "€" (bytes 0..3) -> char-boundary panic on current code.
+        let s = format!("{}a", "€".repeat(21));
+        assert_eq!(s.len(), 64, "fixture must be 64 bytes to pass the length guard");
+        let res = ChunkId::from_hex(&s);
+        assert!(res.is_err(), "non-hex multibyte input must be a clean Err, not a panic");
+
+        // A genuine 64-hex string still parses Ok (no regression).
+        let valid = "ab".repeat(32);
+        assert_eq!(valid.len(), 64);
+        assert!(ChunkId::from_hex(&valid).is_ok());
     }
 }
