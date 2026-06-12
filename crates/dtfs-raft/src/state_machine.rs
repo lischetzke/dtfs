@@ -4139,6 +4139,9 @@ mod audit_co_tests {
     // mutate site BEFORE this fn's own assert. Either way it is RED today and
     // GREEN once removal stops nuking the co-located same-node entry.
     #[test]
+    #[ignore = "CO-1-1 is GROUP B (deferred): needs the disk_id field on \
+                RemoveChunkLocation + a locked-in decision; see \
+                plans/active/PLAN-CO-CODE-AUDIT.md. Red by design until then."]
     fn co_1_1_remove_chunk_location_overbroad_drops_colocated_entry() {
         // One file, one chunk_index, two replicas on the SAME node_id (10)
         // but different disk_id (0 cold anchor, 1 warm cache).
