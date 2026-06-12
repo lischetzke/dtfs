@@ -2,6 +2,11 @@
 
 Status: 🟦 wip. Owner: agent. Started 2026-06-04.
 
+**2026-06-11:** all code/docs merged in master and builder-verified; the only
+open leg is the operator's live 3dc lab run (REL-2-42..48). Plan is
+delete-ready once that run passes (§ B.2 retention: delete when every task ✅
+and merged).
+
 ## Goals
 
 Extend the existing release-gate suite (`tests/release/`) so a single
@@ -89,19 +94,18 @@ Linux builder VM + 3dc lab. Bash/pwsh are syntax-checked locally
   -Action help` parses + lists verbs.
 
 ### Phase 1 — Read-only observability APIs (builder-verified)
-- `REL-1-1` 🟨 `NodeResponse` +`total_bytes_read`/`total_bytes_written` (struct,
+- `REL-1-1` ✅ `NodeResponse` +`total_bytes_read`/`total_bytes_written` (struct,
   `from_entry`, both synthetic rows). Test `node_response_exposes_io_counters`
-  added. Authored; `cargo test -p dtfs-manager` pending on builder.
-- `REL-1-2` 🟨 `inspect_file_endpoint` per-replica `{node_id,disk_id,tier}` via
+  passes on the builder (2026-06-11).
+- `REL-1-2` ✅ `inspect_file_endpoint` per-replica `{node_id,disk_id,tier}` via
   `tier_of_disk`; keeps `node_ids`. Test
-  `inspect_tier_unknown_when_node_or_disk_missing` added (positive tier path via
-  cases 45/46/47). Authored; builder verify pending. Note: builder should add a
-  positive-tier unit test (needs a `DiskInfo` literal — not constructed here to
-  avoid a blind field mismatch).
-- `REL-1-5` 🟨 `cases/18-api-shape.sh` now asserts `total_bytes_read` on nodes.
+  `inspect_tier_unknown_when_node_or_disk_missing` passes on the builder
+  (2026-06-11); positive tier path covered live via cases 45/46/47.
+- `REL-1-5` ✅ `cases/18-api-shape.sh` now asserts `total_bytes_read` on nodes.
 
 ### Phase 2 — Cases (`tests/release/cases/`)
-All 7 authored + `bash -n` clean; live-lab verify pending on the 3dc cluster.
+All 7 authored + syntax-verified + merged in master; live 3dc lab
+verification pending (operator).
 - `REL-2-42` 🟨 `42-crossdc-read-routing.sh` (needs REL-1-1)
 - `REL-2-43` 🟨 `43-dc-poweroff-read-continuity.sh` (PVE)
 - `REL-2-44` 🟨 `44-dc-poweron-recovery-converge.sh` (PVE)
@@ -110,17 +114,18 @@ All 7 authored + `bash -n` clean; live-lab verify pending on the 3dc cluster.
 - `REL-2-47` 🟨 `47-cache-perdc-promote-demote.sh` (needs REL-1-2; non-PVE)
 - `REL-2-48` 🟨 `48-crossdc-read-under-shaping.sh` (PVE/ansible netshape)
 
-### Phase 3 — Harness + docs (authored 🟨)
-- `REL-3-1` 🟨 `run.sh` — `--chaos` + `CHAOS_CASES`; `--provision` wraps the
-  case loop with lifecycle provision/teardown. QUICK_CASES unchanged. `bash -n`
-  clean.
-- `REL-3-2` 🟨 `lib/common.sh` — env documented; sources dc.sh + pve.sh.
-- `REL-3-3` 🟨 docs: `release-testing.md` (env, chaos run, matrix, case rows) +
+### Phase 3 — Harness + docs
+- `REL-3-1` ✅ `run.sh` — `--chaos` + `CHAOS_CASES`; `--provision` wraps the
+  case loop with lifecycle provision/teardown. QUICK_CASES unchanged. Merged;
+  `bash -n` clean (re-verified 2026-06-11).
+- `REL-3-2` ✅ `lib/common.sh` — env documented; sources dc.sh + pve.sh.
+  Merged; `bash -n` clean (re-verified 2026-06-11).
+- `REL-3-3` ✅ docs: `release-testing.md` (env, chaos run, matrix, case rows) +
   new standalone `docs/src/operations/chaos-testing.md` (full reference:
   composition, control layer, cases, APIs, extension). Both registered in
   `docs/src/SUMMARY.md` (release-testing.md was previously orphaned);
-  `development/testing.md` cross-links the chaos doc.
-- `REL-3-4` 🟨 `changelog/UNRELEASED.md` — entry for the new inspection fields.
+  `development/testing.md` cross-links the chaos doc. Merged in master.
+- `REL-3-4` ❌ dropped — see Deviations (no in-repo changelog anymore).
 
 ## Cross-cutting invariants
 
@@ -142,6 +147,12 @@ All 7 authored + `bash -n` clean; live-lab verify pending on the 3dc cluster.
 - **REL-1-3 dropped** — `/api/v1/migrations` already exposes scheduler tasks.
 - **REL-1-2 reduced** to `disk_id`+`tier` (no explicit `class`/`cooldown`);
   cases derive class from tier because they set the policy under test.
+- **REL-3-4 dropped (2026-06-11).** The task referenced
+  `changelog/UNRELEASED.md`, but the repo has since dropped in-repo
+  changelogs entirely — release notes are auto-generated from merged PR
+  titles (`gh release create --generate-notes`, AGENTS.md § B.6) and the
+  file no longer exists. The inspection-field change is covered by its PR
+  title/description instead.
 
 ## Verification log
 
@@ -155,9 +166,20 @@ dev host cannot build the workspace, § A.4.)
   power_dc_off, attach_blank_disk, …). ✅ local syntax gate.
 - 2026-06-04 REL-1-1/1-2/1-5 + REL-2-42..48 + REL-3-*: authored. Rust (api.rs)
   NOT compiled here (`cargo check -p dtfs-manager` → link.exe 1104 on MINGW).
-  Builder verify pending:
-  1. `cargo test -p dtfs-manager --release` — expect new tests green, no
-     regressions.
-  2. deploy manager, then `ALLOW_PVE_CHAOS=1 PVE_TOKEN=… MGRS=mgr-01,mgr-02,
-     mgr-03 DATA=data-a1,…,data-c2 CLIENT=client-a bash tests/release/run.sh
-     --chaos --provision` on the 3dc lab; expect FAIL=0 (SKIP/KNOWN_ISSUE ok).
+- 2026-06-11 REL-1-1/1-2/1-5 + REL-3-1..3: builder + local verification
+  (operator decision this session: builder cargo-test verification only; no
+  3dc provisioning, no PVE chaos run — live leg stays with the operator).
+  - Builder (10.150.0.150, worktree synced to ~/batch-u6):
+    `cargo test -p dtfs-manager --release` → `test result: ok. 238 passed;
+    0 failed`; targeted run →
+    `test api::bug_al_io_rate_tests::inspect_tier_unknown_when_node_or_disk_missing ... ok`,
+    `test api::bug_al_io_rate_tests::node_response_exposes_io_counters ... ok`.
+    `cargo test -p dtfs-common --release` → `test result: ok. 67 passed;
+    0 failed`.
+  - Local syntax gate: `bash -n` clean on lib/{common,dc,pve,lifecycle}.sh,
+    run.sh, cases 42-48; `pwsh -NoProfile -File tests/proxmox/pve-chaos.ps1
+    -Action help` parses and lists all five verbs.
+- Remaining leg (operator, closes REL-2-42..48 and the plan):
+  `ALLOW_PVE_CHAOS=1 PVE_TOKEN=… bash tests/release/run.sh --chaos
+  --provision` on the 3dc lab; expect FAIL=0 (SKIP/KNOWN_ISSUE ok). Delete
+  this plan file once that run passes.
