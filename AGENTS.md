@@ -403,11 +403,31 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   (`TaskScheduler` is the live impl; unit-tested via a mock in
   `advance_round_tests`); a task still attempts at most one copy + one
   verify RPC per tick (preserves the pre-U3 retry cadence + verify-mismatch
-  re-copy-next-tick). Still ONE `save_migration_state` Raft write per tick.
+  re-copy-next-tick). **Bug CN — flood-aftermath robustness:** (a) `tick`
+  prunes terminal (Done/Failed past-retention) tasks FIRST via
+  `prune_terminal_tasks` and persists that immediately, BEFORE the
+  under-replication scan + advance — pre-CN the prune ran only at the end of
+  `advance_tasks`, so a large terminal backlog (prod 2026-06-10: 2439 Failed
+  tasks after the Bug CM wedge) starved its own GC and every leader reloaded
+  the poison; (b) each `replicate_chunk`/`verify_chunk` RPC is wall-clock
+  bounded by `MIGRATION_RPC_TIMEOUT` (60s) — without it a stalled data node
+  hung the `buffer_unordered` copy round and the whole scheduler loop after
+  one leader-onset pass. So the pre-tick prune may add a SECOND
+  `save_migration_state` Raft write when it drops tasks; steady-state is still
+  one.
 - `dtfs-manager/src/monitor.rs` — heartbeat health detection only
   (Bug CH): commits node-status transitions, fires NodeDown/SMART
   alerts. MUST NOT schedule repair — the 2026-06-06 storm came from a
-  monitor-owned evacuation path (PLAN-BUG-CH).
+  monitor-owned evacuation path (PLAN-BUG-CH). **Leader-gated (Bug CM):**
+  only the current leader evaluates liveness + commits `UpdateNodeStatus`
+  (and runs `check_disk_health`), via the same `metrics.current_leader ==
+  id` gate as the scheduler (Bug AC); `monitor_status_changes` returns
+  empty off-leader. Bug CJ moved liveness onto the replicated
+  `last_seen_ms`, but a non-leader reading its own bursty-stale replicated
+  view still committed `Down` and flapped the node (prod dtfs-lm v0.1.5,
+  2026-06-09, two cross-DC learner managers) — the leader's log is
+  authoritative + single-writer. Recovery stays the heartbeat handler's
+  `UpdateNodeStatus(healthy)` (any manager, forwarded).
 - `dtfs-manager/src/metadata.rs` — gRPC service; thin wrappers over
   `raft_write(ClientRequest::*)`.
 - `dtfs-manager/src/api.rs` — REST endpoints (WebUI + CLI); `get_stats`
