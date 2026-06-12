@@ -411,7 +411,13 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
 - `dtfs-manager/src/metadata.rs` — gRPC service; thin wrappers over
   `raft_write(ClientRequest::*)`.
 - `dtfs-manager/src/api.rs` — REST endpoints (WebUI + CLI); `get_stats`
-  is the WebUI home aggregator.
+  is the WebUI home aggregator. The config read endpoints (`get_config`,
+  `get_config_effective`) return the **effective** config = the node's
+  startup `state.config` with the Raft cluster override
+  (`cluster_config.config_json`) projected on top via `json_deep_merge`
+  (Bug CM) — a saved cluster-wide override MUST read back as `current`, or
+  the WebUI editor looks broken. Adding a config read path? Route it
+  through `effective_config_value`, never raw `state.config`.
 - `dtfs-manager/src/membership.rs` — CF-2 online raft membership: pure
   validation for the leader-only `/api/v1/raft/{add-learner,promote,
   remove}` endpoints (openraft `add_learner`/`change_membership`;

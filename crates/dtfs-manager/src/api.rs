@@ -2827,13 +2827,24 @@ async fn get_audit_log(
 
 async fn get_config(State(state): State<Arc<AppState>>) -> Json<Value> {
     let sm = state.sm_data.read().await;
+    // Raft-stored cluster override (set via the WebUI editor / `dtfs-cli
+    // config set`). May be sparse, e.g. `{"tiering":{"evaluation_interval_secs":60}}`.
+    let raw_override = if sm.cluster_config.config_json.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&sm.cluster_config.config_json).unwrap_or(Value::Null)
+    };
+    // BUG-CM — read-back MUST project the override onto the node's startup
+    // config; otherwise a saved cluster-wide change is invisible here and the
+    // editor looks broken. Serialise the whole TieringConfig (all fields, not a
+    // hand-picked subset) and overlay the override's `tiering` sub-object.
+    let mut tiering = serde_json::to_value(&state.config.tiering).unwrap_or(Value::Null);
+    if let Some(over_tiering) = raw_override.get("tiering") {
+        json_deep_merge(&mut tiering, over_tiering);
+    }
     Json(json!({
         "version": sm.cluster_config.version,
-        "config": if sm.cluster_config.config_json.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(&sm.cluster_config.config_json).unwrap_or(Value::Null)
-        },
+        "config": raw_override,
         "defaults": {
             "chunk_size_mb": state.config.defaults.chunk_size_mb,
             "write_safety": {
@@ -2846,12 +2857,7 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Json<Value> {
                 "cold": state.config.defaults.replication.cold,
             },
         },
-        "tiering": {
-            "enabled": state.config.tiering.enabled,
-            "hot_threshold_reads_per_hour": state.config.tiering.hot_threshold_reads_per_hour,
-            "cold_threshold_days": state.config.tiering.cold_threshold_days,
-            "migration_bandwidth_limit_mbps": state.config.tiering.migration_bandwidth_limit_mbps,
-        },
+        "tiering": tiering,
     }))
 }
 
@@ -2984,8 +2990,10 @@ async fn update_config(
 async fn get_config_effective(
     State(state): State<Arc<AppState>>,
 ) -> Json<Value> {
-    let current = serde_json::to_value(&state.config)
-        .unwrap_or(serde_json::Value::Null);
+    // BUG-CM — effective = startup config with the Raft cluster override
+    // projected on top, so saved cluster-wide changes read back as `current`
+    // (else the editor reports stale `is_default` values).
+    let current = effective_config_value(&state).await;
     let defaults = manager_config_defaults_baseline();
 
     let mut rows: Vec<Value> = Vec::new();
@@ -3195,6 +3203,43 @@ fn flatten_config(
     }
 }
 
+/// BUG-CM — recursively overlay `over` onto `base`. Objects merge key by
+/// key (recursing into shared keys, inserting keys only in `over`); every
+/// non-object value (scalar or array) is replaced wholesale by `over`. Keys
+/// present only in `base` are preserved, so a sparse override such as
+/// `{"tiering":{"evaluation_interval_secs":60}}` updates just that leaf and
+/// leaves its siblings intact.
+fn json_deep_merge(base: &mut Value, over: &Value) {
+    use serde_json::Value as V;
+    match (base, over) {
+        (V::Object(b), V::Object(o)) => {
+            for (k, ov) in o {
+                json_deep_merge(b.entry(k.clone()).or_insert(V::Null), ov);
+            }
+        }
+        (b, o) => *b = o.clone(),
+    }
+}
+
+/// BUG-CM — the effective manager config: the node's startup `state.config`
+/// with the Raft-stored cluster override (`cluster_config.config_json`, set
+/// via the editor) projected on top. The config read endpoints MUST go
+/// through this, or a saved cluster-wide change is invisible on read-back and
+/// the editor appears not to work.
+async fn effective_config_value(state: &Arc<AppState>) -> Value {
+    let mut current = serde_json::to_value(&state.config).unwrap_or(Value::Null);
+    let override_json = {
+        let sm = state.sm_data.read().await;
+        sm.cluster_config.config_json.clone()
+    };
+    if !override_json.is_empty() {
+        if let Ok(over) = serde_json::from_str::<Value>(&override_json) {
+            json_deep_merge(&mut current, &over);
+        }
+    }
+    current
+}
+
 // ---------------------------------------------------------------------------
 // Aggregate stats endpoint (consumed by WebUI home page)
 // ---------------------------------------------------------------------------
@@ -3369,6 +3414,76 @@ mod bug_bm3_tape_validation_tests {
         assert!(!cluster_has_tape_disk(&nodes), "only a cold disk → no tape");
         nodes.insert(2, mk_node(DiskTier::Tape));
         assert!(cluster_has_tape_disk(&nodes), "a tape disk is now present");
+    }
+}
+
+#[cfg(test)]
+mod bug_cm_config_readback_tests {
+    use super::*;
+
+    // BUG-CM — a sparse override updates only its leaf; the sibling in the
+    // same object and untouched sections survive the deep-merge.
+    #[test]
+    fn deep_merge_sparse_override_updates_leaf_only() {
+        let mut base = json!({
+            "tiering": {
+                "evaluation_interval_secs": 3600,
+                "migration_bandwidth_limit_mbps": 200,
+            },
+            "defaults": { "chunk_size_mb": 4 },
+        });
+        json_deep_merge(&mut base, &json!({ "tiering": { "evaluation_interval_secs": 60 } }));
+        assert_eq!(base["tiering"]["evaluation_interval_secs"], json!(60));
+        assert_eq!(base["tiering"]["migration_bandwidth_limit_mbps"], json!(200));
+        assert_eq!(base["defaults"]["chunk_size_mb"], json!(4));
+    }
+
+    // BUG-CM — the flattened effective view reports an overridden tiering key
+    // as `current` with is_default=false, while an un-overridden sibling stays
+    // is_default=true. This is exactly what the editor reads back.
+    #[test]
+    fn effective_flatten_reflects_override() {
+        // state.config tiering at its compiled defaults...
+        let mut current = json!({
+            "tiering": {
+                "enabled": true,
+                "hot_threshold_reads_per_hour": 5,
+                "cold_threshold_days": 14,
+                "frozen_threshold_days": 90,
+                "evaluation_interval_secs": 3600,
+                "migration_bandwidth_limit_mbps": 200,
+                "enable_cache_redundancy_escalation": false,
+            }
+        });
+        // ...with the operator's Raft-stored override projected on top.
+        json_deep_merge(&mut current, &json!({ "tiering": { "evaluation_interval_secs": 60 } }));
+
+        let defaults = manager_config_defaults_baseline();
+        let mut rows = Vec::new();
+        flatten_config(&current, &defaults, "manager", "", &mut rows);
+
+        let eval = rows
+            .iter()
+            .find(|r| r["name"] == "manager.tiering.evaluation_interval_secs")
+            .expect("evaluation_interval_secs row present");
+        assert_eq!(eval["current"], json!(60), "override projected as current");
+        assert_eq!(eval["is_default"], json!(false));
+
+        let bw = rows
+            .iter()
+            .find(|r| r["name"] == "manager.tiering.migration_bandwidth_limit_mbps")
+            .expect("migration_bandwidth_limit_mbps row present");
+        assert_eq!(bw["current"], json!(200));
+        assert_eq!(bw["is_default"], json!(true), "un-overridden sibling stays default");
+    }
+
+    // BUG-CM — an empty override is a no-op (every key keeps its startup value).
+    #[test]
+    fn empty_override_is_noop() {
+        let mut base = json!({ "tiering": { "evaluation_interval_secs": 3600 } });
+        let snapshot = base.clone();
+        json_deep_merge(&mut base, &json!({}));
+        assert_eq!(base, snapshot);
     }
 }
 
