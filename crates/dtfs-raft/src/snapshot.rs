@@ -68,6 +68,13 @@ pub struct StateMachineSnapshot {
     /// pre-existing snapshots loadable.
     #[serde(default)]
     pub write_leases: BTreeMap<String, WriteLease>,
+
+    /// CF-8 — the latest pending manual scrub request. `#[serde(default)]`
+    /// keeps pre-CO-4-11 snapshots loadable (they decode to `None`); without
+    /// it `build_snapshot` dropped the field, so a freshly-installed follower
+    /// kept its own stale `pending_scrub` instead of the source's.
+    #[serde(default)]
+    pub pending_scrub: Option<crate::PendingScrub>,
 }
 
 /// Serialize a `StateMachineSnapshot` into a `Cursor<Vec<u8>>`.
@@ -118,6 +125,7 @@ mod tests {
             migration_state_json: String::new(),
             posix_locks: BTreeMap::new(),
             write_leases: BTreeMap::new(),
+            pending_scrub: None,
         };
 
         let cursor = serialize_snapshot(&snap).unwrap();
@@ -125,5 +133,44 @@ mod tests {
         assert_eq!(snap.last_applied_log, restored.last_applied_log);
         assert_eq!(snap.scrub_results.len(), restored.scrub_results.len());
         assert_eq!(snap.migration_state_json, restored.migration_state_json);
+    }
+
+    /// CO-4-11 / § A.3.1 — a snapshot written before `pending_scrub` was
+    /// added (the field absent from the JSON) must still load, defaulting to
+    /// `None`; a present value round-trips intact.
+    #[test]
+    fn pending_scrub_old_snapshot_defaults_none_and_round_trips() {
+        let mut snap = StateMachineSnapshot {
+            last_applied_log: Some((1, 5)),
+            last_membership: None,
+            files: BTreeMap::new(),
+            nodes: BTreeMap::new(),
+            cluster_config: ClusterConfig::default(),
+            audit_log: Vec::new(),
+            scrub_results: BTreeMap::new(),
+            scrub_results_by_level: BTreeMap::new(),
+            client_count: 0,
+            volumes: BTreeMap::new(),
+            migration_state_json: String::new(),
+            posix_locks: BTreeMap::new(),
+            write_leases: BTreeMap::new(),
+            pending_scrub: None,
+        };
+
+        // Pre-CO-4-11 shape: the field is simply absent from the JSON object.
+        let mut value = serde_json::to_value(&snap).unwrap();
+        value.as_object_mut().unwrap().remove("pending_scrub");
+        let legacy: StateMachineSnapshot = serde_json::from_value(value).unwrap();
+        assert!(legacy.pending_scrub.is_none());
+
+        // A populated value survives a full serialize/deserialize round-trip.
+        snap.pending_scrub = Some(crate::PendingScrub {
+            id: "scrub-1".into(),
+            level: "deep".into(),
+            requested_at_ms: 42,
+        });
+        let cursor = serialize_snapshot(&snap).unwrap();
+        let restored = deserialize_snapshot(cursor).unwrap();
+        assert_eq!(restored.pending_scrub, snap.pending_scrub);
     }
 }

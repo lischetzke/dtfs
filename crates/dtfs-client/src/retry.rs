@@ -51,9 +51,12 @@ impl RetryConfig {
     /// thundering-herd effects.
     fn delay_for_attempt(&self, attempt: u32) -> Duration {
         // Exponential: base_delay * 2^attempt, capped at max_delay.
-        let exp_delay = self
-            .base_delay
-            .saturating_mul(1u32.wrapping_shl(attempt));
+        // `checked_shl` returns None once `attempt >= 32` (the shift would
+        // overflow a u32); saturate to `u32::MAX` there instead of wrapping
+        // the shift amount mod 32, which would collapse the delay back to
+        // base_delay and break monotonicity (fix for CO-5-19).
+        let multiplier = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+        let exp_delay = self.base_delay.saturating_mul(multiplier);
         let capped = exp_delay.min(self.max_delay);
 
         // Jitter: up to 25 % of the capped delay (minimum 1 ms when non-zero).
@@ -64,7 +67,11 @@ impl RetryConfig {
             0
         };
 
-        capped + Duration::from_millis(jitter_ms)
+        // Clamp the jittered result back to max_delay so the documented
+        // "backoff will never exceed this value" contract holds and so two
+        // already-capped attempts compare equal (monotonic) regardless of
+        // their independent jitter draws (CO-5-19).
+        (capped + Duration::from_millis(jitter_ms)).min(self.max_delay)
     }
 }
 
@@ -189,5 +196,39 @@ mod tests {
         assert!(result.is_err());
         // initial attempt + 2 retries = 3 total
         assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+}
+
+#[cfg(test)]
+mod audit_co_tests {
+    use super::*;
+
+    // CO-5-19: backoff multiplier `1u32.wrapping_shl(attempt)` wraps the shift
+    // amount mod 32, so attempt 32 multiplies by `1 << 0 == 1` (collapsing to
+    // base_delay) while attempt 31 multiplies by `1 << 31` (saturates → capped
+    // at max_delay). Backoff must be monotonic non-decreasing across attempts;
+    // delay_for_attempt(32) must be >= delay_for_attempt(31).
+    #[test]
+    fn co_5_19_backoff_does_not_collapse_at_attempt_32() {
+        // base*2^31 vastly exceeds max_delay, so attempt 31 caps at ~1000s.
+        // With the wrap bug, attempt 32 falls back to ~base_delay (100ms).
+        let config = RetryConfig::new(
+            5000, // above the 4096 cap, but only used to allow high attempts conceptually
+            Duration::from_millis(100),
+            Duration::from_secs(1000),
+        );
+
+        let d31 = config.delay_for_attempt(31);
+        let d32 = config.delay_for_attempt(32);
+
+        // Jitter adds at most 25% on top of the capped base, so comparing the
+        // capped portions is robust: d31 ~ 1000s, d32 (correct) should also be
+        // capped at 1000s; the bug makes d32 ~ 100ms.
+        assert!(
+            d32 >= d31,
+            "backoff must not collapse at attempt 32: d31={:?} d32={:?}",
+            d31,
+            d32
+        );
     }
 }

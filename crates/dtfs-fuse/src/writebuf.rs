@@ -313,33 +313,20 @@ impl FileWriteBuffer {
             }
             consumed = pos;
         } else {
-            // Buffer starts mid-chunk. The first complete chunk we can
-            // extract starts at `bytes_to_complete_first` offset in the
-            // buffer. But we must also include that first partial portion
-            // as part of the first chunk — so we extract it if we have
-            // enough data for a full chunk that starts at chunk boundary.
-
-            // Actually, for the first chunk we need to include the data
-            // from offset_in_chunk. We produce a segment with only our
-            // portion; the filesystem layer will need to handle combining
-            // with existing data. For simplicity, we just extract full
-            // chunks starting from the next boundary.
-            let mut pos = bytes_to_complete_first;
-            let next_chunk_idx = first_chunk_idx + 1;
-            let mut chunk_idx = next_chunk_idx;
-
-            while pos + chunk_size <= self.data.len() {
-                let chunk_data = Bytes::copy_from_slice(&self.data[pos..pos + chunk_size]);
-                segments.push(ChunkSegment {
-                    chunk_index: chunk_idx,
-                    data: chunk_data,
-                });
-                pos += chunk_size;
-                chunk_idx += 1;
-            }
-            // Don't consume the leading partial data — it stays in the
-            // buffer since we didn't extract a segment for it.
-            consumed = pos;
+            // Buffer starts mid-chunk (offset_in_chunk > 0). We cannot extract
+            // any inner full chunk early without breaking the buffer's core
+            // invariant: `data` is one contiguous run whose byte i maps to file
+            // offset dirty_offset + i. Emitting a middle slice would force us to
+            // either (a) drop the leading partial bytes
+            // (data[0..bytes_to_complete_first]) that were never emitted —
+            // silent data loss (CO-1-7) — or (b) drain that middle slice and
+            // leave a non-contiguous prefix+remainder behind, so any trailing
+            // remainder later flushes under the wrong chunk_index — silent
+            // corruption. Both are worse than holding the bytes. So extract
+            // nothing here and defer the whole mid-chunk buffer to
+            // extract_all_chunks (flush_all), which walks the contiguous buffer
+            // correctly and emits every byte under its true chunk_index.
+            return segments;
         }
 
         if consumed > 0 {
@@ -572,6 +559,50 @@ mod tests {
             wb.logical_size("x"),
             Some(60),
             "overlapping write does not shrink logical end"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_co_tests {
+    use super::*;
+
+    // CO-1-7: mid-chunk `extract_complete_chunks` sets `consumed = pos` and
+    // `data.drain(..consumed)`, dropping the leading partial bytes
+    // [0..bytes_to_complete_first] that were never emitted as a segment. Those
+    // bytes (file offsets in the first, partially-buffered chunk) are silently
+    // lost. The buffered bytes for every file offset MUST survive across the
+    // full flush()/flush_all() drain path.
+    #[test]
+    fn co_1_7_midchunk_flush_does_not_drop_leading_partial_bytes() {
+        // 10-byte chunks; write 20 bytes starting at file offset 5. This puts
+        // the buffer mid-chunk (offset_in_chunk = 5) with enough data to emit
+        // chunk 1 as a complete chunk, exercising the mid-chunk branch.
+        let chunk = 10;
+        let wb = WriteBuffer::new(chunk);
+        let pattern: Vec<u8> = (0u8..20).collect(); // distinct bytes 0..19
+        wb.write("/f", 5, &pattern);
+
+        // Drive the same flush path the production code uses: flush() extracts
+        // complete chunks, then flush_all() drains the remainder at close.
+        let mut emitted: Vec<u8> = Vec::new();
+        for seg in wb.flush("/f") {
+            emitted.extend_from_slice(seg.data.as_ref());
+        }
+        for seg in wb.flush_all("/f") {
+            emitted.extend_from_slice(seg.data.as_ref());
+        }
+
+        // The bytes written for file offsets 5..10 are pattern[0..5].
+        // Assert they appear somewhere in the emitted output; today they are
+        // drained without ever being emitted, so this fails (data loss).
+        let leading = &pattern[0..5];
+        let found = emitted
+            .windows(leading.len())
+            .any(|w| w == leading);
+        assert!(
+            found,
+            "leading partial-chunk bytes (file offsets 5..10) must be emitted, not silently dropped; emitted={emitted:?}"
         );
     }
 }

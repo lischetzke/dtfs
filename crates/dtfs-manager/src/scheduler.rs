@@ -2138,8 +2138,12 @@ async fn advance_round<O: MigrationOps>(
                             "Migration: Copying -> Verifying (ReplicateChunk OK)"
                         );
                         task.status = MigrationStatus::Verifying;
-                        task.attempts = 0;
-                        task.last_error = None;
+                        // CO-3-4 — do NOT reset `attempts` here. A successful
+                        // copy that is a re-copy after a verify mismatch must
+                        // keep the accumulated count, or a persistently corrupt
+                        // source loops Copying<->Verifying forever (the verify
+                        // mismatch bumps `attempts`, this reset wiped it). Fresh
+                        // tasks are already zeroed at Pending->Copying (Phase 1).
                         task.updated_at_ms = now_ms;
                     }
                 }
@@ -2186,31 +2190,52 @@ async fn advance_round<O: MigrationOps>(
                     progressed = true;
                 }
                 Ok(false) => {
+                    warn!(
+                        task_id = %task_id,
+                        chunk = %chunk_id,
+                        "VerifyChunk failed (checksum mismatch); retrying copy"
+                    );
+                    // CO-3-4 — a mismatch is a failed attempt: charge it (and
+                    // fail+alert at the cap) so a persistently corrupt source
+                    // can't loop Copying<->Verifying forever. The copy-success
+                    // path no longer resets `attempts`, so this count survives
+                    // the next tick's re-copy and climbs to the cap.
+                    record_copy_failure(
+                        ops,
+                        state,
+                        task_id,
+                        "VerifyChunk checksum mismatch".to_string(),
+                        now_ms,
+                    );
+                    // If not yet exhausted, flap back to Copying to re-copy
+                    // next tick. A flap is not forward progress; do NOT set
+                    // `progressed` (else MAX_ADVANCE_ROUNDS is the only brake
+                    // on a persistently-corrupt copy looping in one tick — the
+                    // round loop should fall through to the next tick instead).
                     if let Some(task) = state.tasks.get_mut(task_id) {
-                        warn!(
-                            task_id = %task.task_id,
-                            chunk = %chunk_id,
-                            "VerifyChunk failed (checksum mismatch); retrying copy"
-                        );
-                        task.status = MigrationStatus::Copying;
-                        task.updated_at_ms = now_ms;
+                        if task.status != MigrationStatus::Failed {
+                            task.status = MigrationStatus::Copying;
+                        }
                     }
-                    // A flap back to Copying is not forward progress; do NOT
-                    // set `progressed` (else MAX_ADVANCE_ROUNDS is the only
-                    // brake on a persistently-corrupt copy looping in one
-                    // tick — the round loop should fall through to the next
-                    // tick instead).
                 }
                 Err(e) => {
-                    if let Some(task) = state.tasks.get_mut(task_id) {
-                        warn!(
-                            task_id = %task.task_id,
-                            chunk = %chunk_id,
-                            "VerifyChunk RPC error, will retry: {}",
-                            e
-                        );
-                        task.updated_at_ms = now_ms;
-                    }
+                    warn!(
+                        task_id = %task_id,
+                        chunk = %chunk_id,
+                        "VerifyChunk RPC error, will retry: {}",
+                        e
+                    );
+                    // CO-3-4 — a verify RPC error is also a failed attempt
+                    // (don't leave `attempts` untouched). On exhaustion this
+                    // fails+alerts; otherwise the task stays Verifying and
+                    // retries the verify on the next tick.
+                    record_copy_failure(
+                        ops,
+                        state,
+                        task_id,
+                        format!("VerifyChunk RPC error: {e}"),
+                        now_ms,
+                    );
                 }
             },
             None => {
@@ -5228,5 +5253,44 @@ mod advance_round_tests {
 
         let t = state.tasks.values().next().unwrap();
         assert_eq!(t.status, MigrationStatus::Verifying);
+    }
+
+    // CO-3-4 — a persistently corrupt source (copy succeeds, VerifyChunk
+    // always mismatches) MUST eventually fail at MAX_MIGRATION_ATTEMPTS, not
+    // loop Copying<->Verifying forever. Today a mismatch flaps back to Copying
+    // WITHOUT bumping `attempts` (advance_round phase 3, `Ok(false)` arm), so
+    // the task never reaches the cap: it re-copies + re-mismatches every tick
+    // indefinitely, pinning a scheduler slot + a data node on garbage bytes.
+    // Correct behaviour: a verify mismatch is a failed attempt; after
+    // MAX_MIGRATION_ATTEMPTS the task lands Failed with the alert fired.
+    #[tokio::test]
+    async fn co_3_4_persistent_verify_mismatch_eventually_fails() {
+        let ops = MockOps {
+            verify_result: VerifyMode::Mismatch,
+            ..Default::default()
+        };
+        let mut state = state_with(1);
+
+        // Drive generously more than the attempt cap (one copy+verify per
+        // tick). A correct state machine fails within MAX_MIGRATION_ATTEMPTS
+        // ticks; the buggy one never does, so the extra ticks just confirm the
+        // infinite loop.
+        for _ in 0..(MAX_MIGRATION_ATTEMPTS + 4) {
+            advance_migration_tasks(&ops, &mut state, 1_000).await;
+        }
+
+        let t = state.tasks.values().next().unwrap();
+        assert_eq!(
+            t.status,
+            MigrationStatus::Failed,
+            "a persistently corrupt source must fail, not loop (status={:?}, attempts={})",
+            t.status,
+            t.attempts
+        );
+        assert_eq!(
+            ops.failed_alerts.load(Ordering::SeqCst),
+            1,
+            "exhausting retries must fire exactly one MigrationFailed alert"
+        );
     }
 }
