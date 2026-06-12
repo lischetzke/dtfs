@@ -50,6 +50,28 @@ fn unreachable_err(msg: String) -> RPCError<TypeConfig> {
 }
 
 // ---------------------------------------------------------------------------
+// CNF-4 — snapshot-send concurrency bound
+// ---------------------------------------------------------------------------
+
+/// Max snapshot sends in flight across all peers. Each in-flight send holds
+/// roughly 2.7x the snapshot size in heap (base64 string + JSON envelope);
+/// with several lagging learners the unbounded fan-out could stack N of
+/// those on an 8 GB manager.
+const SNAPSHOT_SEND_CONCURRENCY: usize = 2;
+
+static SNAPSHOT_SEND_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(SNAPSHOT_SEND_CONCURRENCY);
+
+/// Acquire a process-wide snapshot-send permit (CNF-4). Split out so tests
+/// can exercise the bound directly.
+async fn acquire_snapshot_send_permit() -> tokio::sync::SemaphorePermit<'static> {
+    SNAPSHOT_SEND_PERMITS
+        .acquire()
+        .await
+        .expect("snapshot-send semaphore is never closed")
+}
+
+// ---------------------------------------------------------------------------
 // NetworkFactory
 // ---------------------------------------------------------------------------
 
@@ -134,6 +156,9 @@ impl DtfsNetwork {
         };
         let body = serde_json::to_vec(&msg)
             .map_err(|e| unreachable_err(format!("serialize request: {e}")))?;
+        // CNF-4: for snapshot sends `msg.payload` is snapshot-sized; free it
+        // before the (potentially slow) network call so only `body` is held.
+        drop(msg);
 
         let request = tonic::Request::new(bytes::Bytes::from(body));
 
@@ -203,13 +228,24 @@ impl RaftNetworkV2<TypeConfig> for DtfsNetwork {
         cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
-        let snap_bytes = crate::snapshot::bytes_from_cursor(snapshot.snapshot).map_err(|e| {
-            StreamingError::StorageError(openraft::StorageError::from_io_error(
-                openraft::ErrorSubject::Snapshot(Some(snapshot.meta.signature())),
-                openraft::ErrorVerb::Read,
-                e,
-            ))
-        })?;
+        let cancel_fut = cancel;
+        tokio::pin!(cancel_fut);
+
+        // CNF-4 — bound cross-peer snapshot-send concurrency. openraft runs
+        // one replication task per peer (sends to the SAME peer are already
+        // serial); this process-wide semaphore caps how many peers' sends
+        // hold a snapshot-sized payload in heap at once. The RAII permit is
+        // held across the select! below, so cancellation releases it.
+        let _permit = tokio::select! {
+            permit = acquire_snapshot_send_permit() => permit,
+            closed = &mut cancel_fut => {
+                return Err(StreamingError::Closed(closed));
+            }
+        };
+
+        // The snapshot cursor already owns the bytes — take them without the
+        // extra full copy `bytes_from_cursor` would make (CNF-4).
+        let snap_bytes = snapshot.snapshot.into_inner();
 
         #[derive(Serialize)]
         struct SnapshotPayload {
@@ -218,10 +254,15 @@ impl RaftNetworkV2<TypeConfig> for DtfsNetwork {
             data_base64: String,
         }
 
+        let data_base64 = base64_encode(&snap_bytes);
+        // Free the raw bytes before JSON-serializing: peak heap per send is
+        // then base64 + JSON instead of raw + base64 + JSON (CNF-4).
+        drop(snap_bytes);
+
         let payload_struct = SnapshotPayload {
             vote,
             meta: snapshot.meta,
-            data_base64: base64_encode(&snap_bytes),
+            data_base64,
         };
 
         let payload = serde_json::to_string(&payload_struct).map_err(|e| {
@@ -231,13 +272,12 @@ impl RaftNetworkV2<TypeConfig> for DtfsNetwork {
                 io::Error::new(io::ErrorKind::InvalidData, e),
             ))
         })?;
+        // The base64 string lives on inside `payload`; drop the struct copy.
+        drop(payload_struct);
 
         // Use tokio::select to honour cancellation.
         let rpc_fut = self.send_rpc(RaftRpcKind::Snapshot, payload);
         tokio::pin!(rpc_fut);
-
-        let cancel_fut = cancel;
-        tokio::pin!(cancel_fut);
 
         let resp_json = tokio::select! {
             result = &mut rpc_fut => {
@@ -275,10 +315,12 @@ impl RaftNetworkV2<TypeConfig> for DtfsNetwork {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal base64 helper
+// Minimal base64 helpers — shared with the snapshot receiver
+// (dtfs-manager server.rs `handle_snapshot`). The wire format is part of the
+// raft transport contract; keep encode/decode exact inverses.
 // ---------------------------------------------------------------------------
 
-fn base64_encode(data: &[u8]) -> String {
+pub fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
@@ -300,6 +342,108 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Minimal base64 decoder — exact inverse of [`base64_encode`]. Moved here
+/// from dtfs-manager so sender and receiver share one implementation
+/// (CNF-4); behaviour unchanged.
+pub fn base64_decode(input: &str) -> Vec<u8> {
+    const TABLE: [u8; 256] = {
+        let mut t = [255u8; 256];
+        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut i = 0;
+        while i < 64 {
+            t[chars[i] as usize] = i as u8;
+            i += 1;
+        }
+        t
+    };
+
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+
+    for &b in bytes {
+        if b == b'=' {
+            break;
+        }
+        let val = TABLE[b as usize];
+        if val == 255 {
+            continue;
+        }
+        buf = (buf << 6) | val as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod cnf4_snapshot_send_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // CNF-4 — the sender's base64_encode and the receiver's base64_decode
+    // (shared from this module; dtfs-manager's handle_snapshot uses it) must
+    // invert each other for every length mod 3 (padding cases) and arbitrary
+    // binary data. The wire format must stay byte-identical across versions.
+    #[test]
+    fn base64_round_trip_with_receiver_decoder() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0],
+            vec![0, 255],
+            vec![1, 2, 3],
+            vec![251, 252, 253, 254],
+            (0..=255u8).collect(),
+            (0..4096u32).map(|i| (i * 31 % 256) as u8).collect(),
+        ];
+        for data in cases {
+            let encoded = base64_encode(&data);
+            assert_eq!(
+                base64_decode(&encoded),
+                data,
+                "round-trip failed for len {}",
+                data.len()
+            );
+        }
+    }
+
+    // CNF-4 — at most SNAPSHOT_SEND_CONCURRENCY snapshot sends may hold a
+    // permit at once; extra senders queue instead of stacking snapshot-sized
+    // buffers (~2.7x snapshot size each) in heap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_send_permits_bound_concurrency() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let in_flight = in_flight.clone();
+            let max_seen = max_seen.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = acquire_snapshot_send_permit().await;
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let max = max_seen.load(Ordering::SeqCst);
+        assert!(
+            max <= SNAPSHOT_SEND_CONCURRENCY,
+            "max in-flight snapshot sends {max} exceeded cap {SNAPSHOT_SEND_CONCURRENCY}"
+        );
+    }
 }
 
 #[cfg(test)]
