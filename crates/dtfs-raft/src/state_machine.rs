@@ -1337,7 +1337,29 @@ fn apply_request(
         ClientRequest::UpdateConfig {
             config_json,
             version,
+            expected_version,
         } => {
+            // CO-5-10 — compare-and-set on the cluster-config version. The
+            // proposer reads the current version, builds `version =
+            // current + 1` and carries `expected_version = current`. Two
+            // saves racing off the same base both carry the same
+            // `expected_version`; only the first to apply matches the live
+            // version, the second is rejected so its blind overwrite can't
+            // silently clobber the winner. The `UPDATE_CONFIG_NO_CAS`
+            // sentinel (a legacy/replayed entry pre-CO-5-10, serde default)
+            // skips the check; a real base version (incl. 0, a fresh
+            // cluster's first write) is always checked.
+            if *expected_version != crate::UPDATE_CONFIG_NO_CAS
+                && *expected_version != sm.cluster_config.version
+            {
+                return ClientResponse::Error {
+                    message: format!(
+                        "config version conflict: expected {expected_version}, \
+                         current {}",
+                        sm.cluster_config.version
+                    ),
+                };
+            }
             sm.cluster_config = ClusterConfig {
                 config_json: config_json.clone(),
                 version: *version,
@@ -4429,5 +4451,114 @@ mod audit_co_tests {
             }
             other => panic!("expected WriteLeaseGranted, got {other:?}"),
         }
+    }
+
+    // ----- CO-5-10 ---------------------------------------------------------
+    // update_config read-then-writes `version = current + 1` and the apply
+    // used to blind-overwrite. Two saves racing off the same base version
+    // both target the same new version; without a CAS the second silently
+    // loses the first's update. With `expected_version`, the apply rejects
+    // the loser instead of clobbering the winner.
+    #[test]
+    fn co_5_10_update_config_rejects_stale_expected_version() {
+        let mut sm = StateMachineData::default();
+        assert_eq!(sm.cluster_config.version, 0);
+
+        // Both writers read base version 0 and build version 1.
+        let first = ClientRequest::UpdateConfig {
+            config_json: r#"{"a":1}"#.into(),
+            version: 1,
+            expected_version: 0,
+        };
+        let second = ClientRequest::UpdateConfig {
+            config_json: r#"{"b":2}"#.into(),
+            version: 1,
+            expected_version: 0,
+        };
+
+        let r1 = apply_request(&mut sm, &mk_log_id(1), &first);
+        assert!(matches!(r1, ClientResponse::Success));
+        assert_eq!(sm.cluster_config.version, 1);
+        assert_eq!(sm.cluster_config.config_json, r#"{"a":1}"#);
+
+        // The loser carries expected_version 0, which no longer matches the
+        // live version 1 -> rejected, no overwrite.
+        let r2 = apply_request(&mut sm, &mk_log_id(2), &second);
+        assert!(
+            matches!(r2, ClientResponse::Error { .. }),
+            "stale-version UpdateConfig must be rejected, got {r2:?}",
+        );
+        assert_eq!(sm.cluster_config.version, 1, "loser must not bump version");
+        assert_eq!(
+            sm.cluster_config.config_json, r#"{"a":1}"#,
+            "loser must not clobber the winner's config",
+        );
+    }
+
+    // CO-5-10 compat (A.3.1): a UpdateConfig serialised before the
+    // `expected_version` field existed must still deserialise (defaulting to
+    // the UPDATE_CONFIG_NO_CAS sentinel) and apply WITHOUT a CAS check, so
+    // replaying an old Raft log / snapshot never wedges on a phantom version
+    // conflict.
+    #[test]
+    fn co_5_10_update_config_legacy_no_expected_version_applies() {
+        let legacy = r#"{"UpdateConfig":{"config_json":"{}","version":7}}"#;
+        let req: ClientRequest =
+            serde_json::from_str(legacy).expect("legacy UpdateConfig must deserialise");
+        match &req {
+            ClientRequest::UpdateConfig { expected_version, version, .. } => {
+                assert_eq!(
+                    *expected_version,
+                    crate::UPDATE_CONFIG_NO_CAS,
+                    "missing field defaults to the no-CAS sentinel",
+                );
+                assert_eq!(*version, 7);
+            }
+            other => panic!("expected UpdateConfig, got {other:?}"),
+        }
+
+        // Apply against a non-zero live version; legacy entry (sentinel)
+        // must skip the CAS and apply.
+        let mut sm = StateMachineData::default();
+        sm.cluster_config.version = 4;
+        let resp = apply_request(&mut sm, &mk_log_id(1), &req);
+        assert!(
+            matches!(resp, ClientResponse::Success),
+            "legacy entry must apply without a CAS check, got {resp:?}",
+        );
+        assert_eq!(sm.cluster_config.version, 7);
+    }
+
+    // CO-5-10 — the version-0 boundary: two writes racing off a fresh
+    // cluster both read base version 0 and carry expected_version 0. With a
+    // sentinel-based skip (not a 0-based skip), the second is still CAS-
+    // checked against the now-live version 1 and rejected, so the first
+    // write is not lost on a brand-new cluster.
+    #[test]
+    fn co_5_10_concurrent_first_write_from_version_zero_is_cas_checked() {
+        let mut sm = StateMachineData::default();
+        assert_eq!(sm.cluster_config.version, 0);
+
+        let first = ClientRequest::UpdateConfig {
+            config_json: r#"{"a":1}"#.into(),
+            version: 1,
+            expected_version: 0,
+        };
+        let second = ClientRequest::UpdateConfig {
+            config_json: r#"{"b":2}"#.into(),
+            version: 1,
+            expected_version: 0,
+        };
+
+        let r1 = apply_request(&mut sm, &mk_log_id(1), &first);
+        assert!(matches!(r1, ClientResponse::Success));
+        assert_eq!(sm.cluster_config.version, 1);
+
+        let r2 = apply_request(&mut sm, &mk_log_id(2), &second);
+        assert!(
+            matches!(r2, ClientResponse::Error { .. }),
+            "a second version-0-based write must be rejected once version is 1, got {r2:?}",
+        );
+        assert_eq!(sm.cluster_config.config_json, r#"{"a":1}"#);
     }
 }

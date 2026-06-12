@@ -2959,17 +2959,23 @@ async fn update_config(
             })),
         ));
     }
-    let version = {
+    // CO-5-10 — read the base version and carry it as `expected_version` so
+    // the apply can CAS. Two saves racing off the same base both target
+    // `base + 1`; the apply rejects the loser instead of letting it
+    // blind-overwrite the winner (the old read-then-write lost updates).
+    let base_version = {
         let sm = state.sm_data.read().await;
-        sm.cluster_config.version + 1
+        sm.cluster_config.version
     };
+    let version = base_version + 1;
 
     let req = ClientRequest::UpdateConfig {
         config_json: config_json.clone(),
         version,
+        expected_version: base_version,
     };
 
-    state
+    let resp = state
         .raft
         .client_write(req)
         .await
@@ -2977,6 +2983,20 @@ async fn update_config(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": format!("raft write failed: {e}")})),
         ))?;
+
+    // CO-5-10 — a version-conflict rejection comes back as a committed
+    // ClientResponse::Error (the apply ran, saw the mismatch, declined the
+    // overwrite). Surface it as 409 so the editor re-reads and retries
+    // instead of believing its lost write landed.
+    if let dtfs_raft::ClientResponse::Error { message } = resp.data {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": message,
+                "preserved_current": true,
+            })),
+        ));
+    }
 
     // AZ-5-A2 — optionally persist to disk via atomic tmp+rename.
     let mut wrote_to_disk = false;
