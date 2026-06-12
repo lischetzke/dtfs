@@ -431,6 +431,21 @@ pub struct RaftConfig {
     /// (ISSUE-SCAN-2026-06-02 F4). Read-path only — no raft write needed.
     #[serde(default = "default_node_liveness_secs")]
     pub node_liveness_secs: u64,
+    /// Bug CN (CNF-2) — how long a `Failed` migration task lingers in
+    /// `migration_state_json` before the scheduler's terminal-task prune
+    /// drops it. Long enough for an operator alerted on `migration.failed`
+    /// to inspect the task, short enough that a mass-failure event (the
+    /// 2026-06-10 flood aftermath) doesn't bloat the Raft snapshot for
+    /// hours. Configurable so the release suite can exercise the prune
+    /// without waiting the production 30 minutes.
+    #[serde(default = "default_failed_task_retention_secs")]
+    pub failed_task_retention_secs: u64,
+    /// Bug CN (CNF-2) — how long a `Done` migration task lingers before
+    /// the prune. Kept short: the new replica is already visible in the
+    /// file's chunk list and the historical task entry is operationally
+    /// uninteresting beyond a few minutes.
+    #[serde(default = "default_done_task_retention_secs")]
+    pub done_task_retention_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -888,6 +903,14 @@ fn default_rocksdb_block_cache_mb() -> u64 {
 fn default_max_in_snapshot_log_to_keep() -> u64 {
     1000
 }
+fn default_failed_task_retention_secs() -> u64 {
+    // Matches the pre-CNF-2 hardcoded FAILED_TASK_RETENTION_MS (30 min).
+    30 * 60
+}
+fn default_done_task_retention_secs() -> u64 {
+    // Matches the pre-CNF-2 hardcoded DONE_TASK_RETENTION_MS (5 min).
+    5 * 60
+}
 fn default_node_liveness_secs() -> u64 {
     // ~6 missed 5 s heartbeats. Long enough to ride out a brief GC pause or
     // leader election, short enough that a truly dead node is flagged fast.
@@ -1080,6 +1103,10 @@ mod tests {
         assert_eq!(cfg.memory.hard_cap_mb, 0);
         assert_eq!(cfg.memory.warn_threshold_pct, default_warn_pct());
         assert_eq!(cfg.memory.shed_threshold_pct, default_shed_pct());
+        // CNF-2 — the commented-out retention options keep the pre-CNF-2
+        // hardcoded behaviour (Failed 30 min, Done 5 min).
+        assert_eq!(cfg.raft.failed_task_retention_secs, 30 * 60);
+        assert_eq!(cfg.raft.done_task_retention_secs, 5 * 60);
     }
 
     #[test]

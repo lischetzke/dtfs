@@ -110,6 +110,10 @@ pub struct TaskScheduler {
     /// back instead of being OOM/cgroup-killed. None = no cap configured
     /// (the common case) and ticks always run.
     memory: parking_lot::RwLock<Option<Arc<dtfs_common::memory::MemoryBudget>>>,
+    /// CNF-2 — terminal-task retention windows for the Bug AE prune,
+    /// from `raft.done_task_retention_secs` / `raft.failed_task_retention_secs`.
+    done_task_retention_ms: u64,
+    failed_task_retention_ms: u64,
 }
 
 impl TaskScheduler {
@@ -118,6 +122,8 @@ impl TaskScheduler {
         raft: Arc<DtfsRaft>,
         state_data: Arc<RwLock<StateMachineData>>,
         audit: Arc<AuditLog>,
+        done_task_retention_secs: u64,
+        failed_task_retention_secs: u64,
     ) -> Self {
         Self {
             raft,
@@ -125,6 +131,10 @@ impl TaskScheduler {
             audit,
             alerts: parking_lot::RwLock::new(None),
             memory: parking_lot::RwLock::new(None),
+            // saturating_mul: an absurdly large configured value means
+            // "effectively never prune", not a silent wrap to ~0.
+            done_task_retention_ms: done_task_retention_secs.saturating_mul(1000),
+            failed_task_retention_ms: failed_task_retention_secs.saturating_mul(1000),
         }
     }
 
@@ -241,7 +251,12 @@ impl TaskScheduler {
         // the save never happened and every leader reloaded the same poison.
         // Persisting the prune up front guarantees the backlog drains in one
         // tick even if the rest of the tick stalls.
-        let pruned = prune_terminal_tasks(&mut migration_state, now_millis());
+        let pruned = prune_terminal_tasks(
+            &mut migration_state,
+            now_millis(),
+            self.done_task_retention_ms,
+            self.failed_task_retention_ms,
+        );
         if pruned > 0 {
             info!(
                 pruned,
@@ -642,8 +657,8 @@ impl TaskScheduler {
         // for in-progress tasks so we don't double-schedule.
         // Bug BO-2: keep Failed tasks in the fingerprint set so a chunk that
         // just exhausted its attempts is NOT immediately re-queued on the
-        // next 30s tick. A Failed task lingers for FAILED_TASK_RETENTION_MS
-        // (30 min, Bug AE prune); only after it is GC'd does check_anchor_lag
+        // next 30s tick. A Failed task lingers for failed_task_retention_ms
+        // (30 min default, Bug AE prune); only after GC does check_anchor_lag
         // schedule a fresh attempt. Previously Failed was excluded here, so
         // the same chunk was re-queued every tick → tight loop + audit spam.
         let existing_tasks: std::collections::HashSet<(String, u64)> =
@@ -2794,7 +2809,8 @@ pub(crate) fn anchor_copy_source_exclude(source_node: u64, target_node: u64) -> 
 
 /// Bug BO-2 — should a task with this status keep a chunk out of the
 /// anchor-lag re-queue set? Only non-Done tasks block a re-queue; a Failed
-/// task lingers (Bug AE 30-min retention) so the same chunk is NOT
+/// task lingers (Bug AE retention; `raft.failed_task_retention_secs`,
+/// 30 min default) so the same chunk is NOT
 /// immediately re-scheduled every 30s tick. (Previously Failed was excluded
 /// too → tight re-queue loop + audit spam.)
 pub(crate) fn task_blocks_requeue(status: MigrationStatus) -> bool {
@@ -3062,18 +3078,6 @@ pub(crate) fn plan_anchor_lag_repair(
 // Bug AE — orphan migration task helpers (pure logic, unit-tested below)
 // ---------------------------------------------------------------------------
 
-/// How long a `Failed` task lingers in `migration_state_json` before the
-/// scheduler garbage-collects it. 30 minutes is long enough for an operator
-/// alerted on `migration.failed` to inspect the task in the UI before it
-/// disappears, and short enough that a mass-orphan event (e.g. a data-node
-/// disk wipe) doesn't bloat the Raft snapshot for hours.
-const FAILED_TASK_RETENTION_MS: u64 = 30 * 60 * 1000;
-
-/// How long a `Done` task lingers — kept short because the new replica is
-/// already visible in the file's chunk list and the historical task entry
-/// is operationally uninteresting beyond a few minutes.
-const DONE_TASK_RETENTION_MS: u64 = 5 * 60 * 1000;
-
 /// Pure predicate for the scheduler's task-prune retain block. Returns true
 /// when the task should stay in the migration state, false when it should
 /// be dropped.
@@ -3083,18 +3087,24 @@ const DONE_TASK_RETENTION_MS: u64 = 5 * 60 * 1000;
 /// `Verifying`, `Completing`) are always kept — the state machine in
 /// `advance_tasks` is responsible for transitioning them onward, including
 /// the Bug AE orphan check that fast-forwards orphan tasks to `Failed`.
+///
+/// CNF-2 — the retention windows are parameters (fed from
+/// `raft.{done,failed}_task_retention_secs`, defaults 5 min / 30 min) so
+/// the release suite can exercise the Bug CN flood-aftermath prune fast.
 #[inline]
 pub(crate) fn should_retain_task(
     status: MigrationStatus,
     updated_at_ms: u64,
     now_ms: u64,
+    done_retention_ms: u64,
+    failed_retention_ms: u64,
 ) -> bool {
     match status {
         MigrationStatus::Done => {
-            now_ms.saturating_sub(updated_at_ms) < DONE_TASK_RETENTION_MS
+            now_ms.saturating_sub(updated_at_ms) < done_retention_ms
         }
         MigrationStatus::Failed => {
-            now_ms.saturating_sub(updated_at_ms) < FAILED_TASK_RETENTION_MS
+            now_ms.saturating_sub(updated_at_ms) < failed_retention_ms
         }
         _ => true,
     }
@@ -3105,11 +3115,22 @@ pub(crate) fn should_retain_task(
 /// and can run at the START of `advance_tasks` (before the advance round), so a
 /// large terminal backlog left by a flood cannot starve the very GC that
 /// exists to clear it.
-fn prune_terminal_tasks(state: &mut MigrationState, now_ms: u64) -> usize {
+fn prune_terminal_tasks(
+    state: &mut MigrationState,
+    now_ms: u64,
+    done_retention_ms: u64,
+    failed_retention_ms: u64,
+) -> usize {
     let before = state.tasks.len();
-    state
-        .tasks
-        .retain(|_, t| should_retain_task(t.status, t.updated_at_ms, now_ms));
+    state.tasks.retain(|_, t| {
+        should_retain_task(
+            t.status,
+            t.updated_at_ms,
+            now_ms,
+            done_retention_ms,
+            failed_retention_ms,
+        )
+    });
     before.saturating_sub(state.tasks.len())
 }
 
@@ -4411,6 +4432,10 @@ mod bug_ae_orphan_tests {
     use dtfs_raft::ChunkLocationEntry;
     use std::collections::BTreeMap;
 
+    /// The compiled-in defaults (raft.{done,failed}_task_retention_secs).
+    const DONE_MS: u64 = 5 * 60 * 1000;
+    const FAILED_MS: u64 = 30 * 60 * 1000;
+
     fn file_with_chunks(path: &str, chunk_hashes: &[&str]) -> FileMetadata {
         FileMetadata {
             path: path.to_string(),
@@ -4449,7 +4474,7 @@ mod bug_ae_orphan_tests {
         ] {
             // Even one full hour old — keep it.
             assert!(
-                should_retain_task(status, now - 60 * 60 * 1000, now),
+                should_retain_task(status, now - 60 * 60 * 1000, now, DONE_MS, FAILED_MS),
                 "non-terminal task ({status:?}) must be retained regardless of age",
             );
         }
@@ -4462,8 +4487,8 @@ mod bug_ae_orphan_tests {
         let just_completed = now - 30 * 1000; // 30s ago
         let stale = now - 6 * 60 * 1000;       // 6min ago — past cutoff
 
-        assert!(should_retain_task(MigrationStatus::Done, just_completed, now));
-        assert!(!should_retain_task(MigrationStatus::Done, stale, now));
+        assert!(should_retain_task(MigrationStatus::Done, just_completed, now, DONE_MS, FAILED_MS));
+        assert!(!should_retain_task(MigrationStatus::Done, stale, now, DONE_MS, FAILED_MS));
     }
 
     /// `Failed` task within the 30-minute window stays so operators can
@@ -4474,8 +4499,23 @@ mod bug_ae_orphan_tests {
         let recent_failure = now - 5 * 60 * 1000;  // 5min ago — keep
         let stale_failure  = now - 31 * 60 * 1000; // 31min ago — prune
 
-        assert!(should_retain_task(MigrationStatus::Failed, recent_failure, now));
-        assert!(!should_retain_task(MigrationStatus::Failed, stale_failure, now));
+        assert!(should_retain_task(MigrationStatus::Failed, recent_failure, now, DONE_MS, FAILED_MS));
+        assert!(!should_retain_task(MigrationStatus::Failed, stale_failure, now, DONE_MS, FAILED_MS));
+    }
+
+    /// CNF-2 — the retention windows are caller-supplied, not hardcoded:
+    /// a short configured window (Failed 45s / Done 30s, as the release
+    /// case sets) prunes terminal tasks on that schedule.
+    #[test]
+    fn cnf2_retention_windows_are_configurable() {
+        let now = 60 * 60 * 1000; // 1h
+        let done_ms = 30_000;
+        let failed_ms = 45_000;
+
+        assert!(should_retain_task(MigrationStatus::Failed, now - 44_000, now, done_ms, failed_ms));
+        assert!(!should_retain_task(MigrationStatus::Failed, now - 46_000, now, done_ms, failed_ms));
+        assert!(should_retain_task(MigrationStatus::Done, now - 29_000, now, done_ms, failed_ms));
+        assert!(!should_retain_task(MigrationStatus::Done, now - 31_000, now, done_ms, failed_ms));
     }
 
     /// Sanity: `updated_at_ms > now_ms` (clock drift / startup race) must
@@ -4485,8 +4525,8 @@ mod bug_ae_orphan_tests {
         let now = 1000;
         let future = 5000;
         // saturating_sub returns 0, < retention windows, so retained.
-        assert!(should_retain_task(MigrationStatus::Done, future, now));
-        assert!(should_retain_task(MigrationStatus::Failed, future, now));
+        assert!(should_retain_task(MigrationStatus::Done, future, now, DONE_MS, FAILED_MS));
+        assert!(should_retain_task(MigrationStatus::Failed, future, now, DONE_MS, FAILED_MS));
     }
 
     /// chunk_in_any_file returns true when a chunk hash matches any file.
@@ -4579,9 +4619,9 @@ mod bug_ae_orphan_tests {
         let stuck_copying = now - 31 * 60 * 1000;
 
         // Failed + stale → pruned.
-        assert!(!should_retain_task(MigrationStatus::Failed, stale_failed, now));
+        assert!(!should_retain_task(MigrationStatus::Failed, stale_failed, now, DONE_MS, FAILED_MS));
         // Copying + stale → retained; advance_tasks owns the fast-path.
-        assert!(should_retain_task(MigrationStatus::Copying, stuck_copying, now));
+        assert!(should_retain_task(MigrationStatus::Copying, stuck_copying, now, DONE_MS, FAILED_MS));
     }
 }
 
@@ -4989,6 +5029,9 @@ mod advance_round_tests {
     // backlog while keeping fresh-Failed (for operator inspection) + actives.
     #[test]
     fn prune_terminal_clears_stale_failed_backlog() {
+        // The compiled-in default windows (raft.{done,failed}_task_retention_secs).
+        const DONE_MS: u64 = 5 * 60 * 1000;
+        const FAILED_MS: u64 = 30 * 60 * 1000;
         let now = 60 * 60 * 1000; // 1h
         let mut s = MigrationState::default();
         for i in 0..100 {
@@ -5006,7 +5049,7 @@ mod advance_round_tests {
         for i in 105..108 {
             s.tasks.insert(format!("repl-{i}"), pending_task(i)); // Pending — keep
         }
-        let pruned = prune_terminal_tasks(&mut s, now);
+        let pruned = prune_terminal_tasks(&mut s, now, DONE_MS, FAILED_MS);
         assert_eq!(pruned, 100, "stale Failed backlog must be pruned");
         assert_eq!(s.tasks.len(), 8, "5 fresh-Failed + 3 Pending remain");
     }

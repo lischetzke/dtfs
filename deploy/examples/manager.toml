@@ -68,6 +68,8 @@ addr = "10.0.0.3:9401"
 #rocksdb_block_cache_mb = 64         # CNF-3: block cache shared across both CFs, MiB
 #max_in_snapshot_log_to_keep = 1000 # Bug BP-1: purge raft log behind snapshot
 #node_liveness_secs = 30            # Bug BP-3: last_seen older than this -> Suspect
+#failed_task_retention_secs = 1800  # CNF-2: prune Failed migration tasks after this
+#done_task_retention_secs = 300     # CNF-2: prune Done migration tasks after this
 
 [grpc]
 listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients

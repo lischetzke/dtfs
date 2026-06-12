@@ -83,26 +83,30 @@ Prod persistently reports `anchor_pending=1` with an empty migration queue
 - Tests: unit test the disk_id-robust resolution (pure). Live: `anchor_pending`
   → 0 after deploy. Done when: prod `anchor_pending=0`, cause known, PR'd.
 
-### CNF-2 — Bug CN release case + configurable task retention ⬜  (test discipline)
+### CNF-2 — Bug CN release case + configurable task retention ✅  (test discipline)
 
-Ship the § B.5 release-gate e2e for Bug CN. Blocked by the 30-min hardcoded
-`FAILED_TASK_RETENTION_MS` (`scheduler.rs:3035`), so make it configurable then
-test fast.
+Shipped (branch `batch/cnf-2-task-retention-config`):
 
-- Thread `failed_task_retention_secs` (+ opt. `done_task_retention_secs`) into
-  `RaftConfig` (`crates/dtfs-common/src/config.rs:~394`) with serde defaults =
-  the current consts (prod behaviour unchanged); consume in the scheduler;
-  populate in `main.rs:~98` like the existing `rocksdb_*` fields.
-- Config-surface sync (§ B.6, gated by `example_*_toml_parses`):
-  `deploy/examples/manager.toml` `[raft]` + `docs/src/configuration/`.
-- Release case `tests/release/cases/NN-scheduler-backlog-drains.sh`: short
-  failed-retention; stop a data node to force a Failed-task batch, restart it,
-  assert (a) the scheduler keeps ticking (RPC timeout → no hang) and (b) the
-  Failed backlog prunes to ~0 within a couple ticks. `trap case_cleanup EXIT`,
-  final `STATUS:` line, add the stem to `run.sh` `QUICK_CASES`.
-- Reuse `should_retain_task`/`prune_terminal_tasks` (pure, unit-tested) + case
-  55's node-stop pattern. Done when: configurable, case PASSes on Minicluster,
-  surface synced, PR'd.
+- `raft.failed_task_retention_secs` / `raft.done_task_retention_secs` in
+  `RaftConfig` (serde defaults 1800/300 = the old hardcoded consts, now
+  removed; prod behaviour unchanged), threaded via `main.rs` into
+  `TaskScheduler::new` (secs→ms with `saturating_mul`); `should_retain_task`
+  takes the windows as params (pure, unit-tested incl. a configurable-window
+  test) and the Bug CN pre-tick `prune_terminal_tasks` consumes them
+  (rebase over #36 moved the prune from `advance_tasks` to tick start).
+- Config-surface sync: `deploy/examples/manager.toml` `[raft]` +
+  `docs/src/configuration/manager.md` table rows; `example_manager_toml_parses`
+  + `default_manager_toml` assert the defaults.
+- Release case `tests/release/cases/61-scheduler-backlog-drains.sh`: short
+  retention (Done 30s / Failed 45s) on all managers (leader-last restart),
+  seed cold-born files, `set-mandatory warm=1` → real warm-backfill tasks →
+  Done batch; assert the Done backlog prunes within 150s of first
+  observation (discriminates the configured 30s window from the 300s
+  compiled-in default), then stop a data node and assert the second
+  backfill wave / any Failed stragglers still drain (Bug CN tick survival).
+  NOT in `QUICK_CASES` (2x rolling manager restarts, ~5-10 min; § B.5 caps
+  quick cases at cheap critical-path) — deviations from the original
+  sketch, see Deviations.
 
 ### CNF-3 — RocksDB per-CF memory bound ✅  (hardening)
 
@@ -210,6 +214,20 @@ persisted; CM plan deleted post-merge.
   `new_replica_records_disk_id_field_not_position` red pre-write-fix
   (`left: 0, right: 1`), all green post-fix; full dtfs-manager + dtfs-raft
   suites and the full workspace suite green.
+- **CNF-2** (2026-06-12): failing-first by construction — parameterising
+  `should_retain_task` breaks every pre-existing call site/test (E0061)
+  until updated (§ B.5: compile error counts). Builder:
+  `cargo test -p dtfs-common --release` 67/0 (incl.
+  `example_manager_toml_parses` + `default_manager_toml` asserting the
+  1800/300 defaults), `cargo test -p dtfs-manager --release` 239/0 (incl.
+  `cnf2_retention_windows_are_configurable`), full workspace 0 failed.
+  Live on the Minicluster (dev build 20260612-071946, rolling deploy
+  mgr02→mgr03→leader mgr01, quorum stable, term 230→231): case 61 PASS —
+  set-mandatory warm=1 produced 52 Done backfill tasks, Done backlog
+  drained 28s after first observation (configured 30s window; the 300s
+  default would still retain them at the 150s deadline), second backfill
+  wave with mini-data02 down also pruned (tick survival). Case 55 re-run
+  as regression (see PR).
 
 ## Deviations
 
@@ -243,4 +261,19 @@ persisted; CM plan deleted post-merge.
   after deploy, the next suspect is disk-id reassignment on re-register
   (Bug BJ; the persisted BN-1 uuid is the available stable identity) — do
   NOT re-investigate the lookup sites.
-
+- **CNF-2**: the sketch's Failed-batch generator ("stop a data node →
+  Failed tasks") is not provokable on the Minicluster: every data node
+  carries every tier, and `plan_path_migration`'s `already_satisfied`
+  check is node-tier-based, so `/api/v1/migrations` schedules nothing
+  (first run SKIPped). Case 61 instead drives REAL warm backfills via
+  `set-mandatory warm=1` and asserts the configured **Done** window
+  (discriminating 150s deadline); the Failed-window assert runs
+  opportunistically when the node-stop catches in-flight copies. Also
+  NOT added to `QUICK_CASES` (sketch said add it): two rolling manager
+  restarts put it at ~5-10 min, over the quick-case budget.
+- **CNF-2 incidental fix**: `tests/release/lib/common.sh::mgr_post_leader`
+  only recognised the bare `"error":"has to forward request"` follower
+  rejection; set-mandatory wraps it as `"raft write failed: has to
+  forward request …"`, so the helper returned the follower error instead
+  of walking on (observed live: first case-61 run FAILed on it). Match
+  loosened to the invariant substring.
