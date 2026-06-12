@@ -243,14 +243,18 @@ impl MetadataService {
             .current_leader
             .ok_or_else(|| Status::unavailable("no leader to forward heartbeat write to"))?;
 
-        // Resolve the leader's gRPC addr from the configured voter set
-        // (node_id_from_hostname matches the openraft node id).
-        let leader_addr = resolve_leader_addr(&self.config.cluster.initial_voters, leader_id)
-            .ok_or_else(|| {
-                Status::unavailable(format!(
-                    "leader {leader_id} not found in cluster.initial_voters"
-                ))
-            })?;
+        // CO-3-9 — resolve the leader's gRPC addr from the live Raft
+        // membership first (covers CF-2-promoted leaders absent from
+        // initial_voters), falling back to the configured voter set.
+        let leader_addr = {
+            let sm = self.sm_data.read().await;
+            resolve_leader_addr(&self.config.cluster.initial_voters, &sm.nodes, leader_id)
+        }
+        .ok_or_else(|| {
+            Status::unavailable(format!(
+                "leader {leader_id} not found in raft membership or cluster.initial_voters"
+            ))
+        })?;
 
         let mut client = self.leader_client(&leader_addr).await?;
         let body = serde_json::to_vec(&req)
@@ -339,18 +343,29 @@ fn heartbeat_may_mark_healthy(current: HealthStatus) -> bool {
     }
 }
 
-/// Bug BL — resolve the gRPC address of the current Raft leader from the
-/// configured voter set. The openraft node id is derived from the
-/// hostname via `node_id_from_hostname`, so a voter matches the leader
-/// when their derived id equals `leader_id`.
+/// Bug BL / CO-3-9 — resolve the gRPC address of the current Raft leader.
+///
+/// Prefers the live Raft membership (`StateMachineData::nodes`, keyed by
+/// the openraft node id): a CF-2-promoted leader was added online and is
+/// NOT in the bootstrap-only `cluster.initial_voters`, so resolving from
+/// voters alone returns `None` and heartbeat-originated writes on that
+/// follower silently drop. The configured voter set is the fallback (an
+/// early-boot leader may not yet be registered in the SM, and its node id
+/// is derived from the hostname via `node_id_from_hostname`).
 fn resolve_leader_addr(
     voters: &[dtfs_common::config::InitialVoter],
+    membership_nodes: &std::collections::BTreeMap<u64, RaftNodeInfo>,
     leader_id: u64,
 ) -> Option<String> {
-    voters
-        .iter()
-        .find(|v| dtfs_common::node_id_from_hostname(&v.hostname) == leader_id)
-        .map(|v| v.addr.clone())
+    membership_nodes
+        .get(&leader_id)
+        .map(|n| n.grpc_addr.clone())
+        .or_else(|| {
+            voters
+                .iter()
+                .find(|v| dtfs_common::node_id_from_hostname(&v.hostname) == leader_id)
+                .map(|v| v.addr.clone())
+        })
 }
 
 /// Bug CH — classify a raft `client_write` error as openraft's
@@ -392,8 +407,13 @@ pub(crate) async fn write_via_leader(
                 .borrow_watched()
                 .current_leader
                 .ok_or_else(|| "no leader to forward to".to_string())?;
-            let leader_addr = resolve_leader_addr(voters, leader_id)
-                .ok_or_else(|| format!("leader {leader_id} not in cluster.initial_voters"))?;
+            // CO-3-9 — this caller (the health monitor) does not hold the
+            // state-machine membership map, so it resolves from the voter
+            // set only. The membership-preferring path is the heartbeat
+            // forward (`proxy_to_leader`), which passes the live SM nodes.
+            let leader_addr =
+                resolve_leader_addr(voters, &std::collections::BTreeMap::new(), leader_id)
+                    .ok_or_else(|| format!("leader {leader_id} not in cluster.initial_voters"))?;
             let mut client = tls
                 .connect(&leader_addr)
                 .await
@@ -2892,7 +2912,8 @@ mod tests {
     }
 
     /// BL-1 — the leader's gRPC addr resolves from the voter set by
-    /// matching node_id_from_hostname against the openraft leader id.
+    /// matching node_id_from_hostname against the openraft leader id when
+    /// no membership entry exists.
     #[test]
     fn bl1_resolve_leader_addr_matches_by_hostname_id() {
         let voters = vec![
@@ -2900,13 +2921,76 @@ mod tests {
             mk_voter("mini-mgr02", "10.0.0.2:9401"),
             mk_voter("mini-mgr03", "10.0.0.3:9401"),
         ];
+        let empty = std::collections::BTreeMap::new();
         let leader_id = dtfs_common::node_id_from_hostname("mini-mgr02");
         assert_eq!(
-            resolve_leader_addr(&voters, leader_id),
+            resolve_leader_addr(&voters, &empty, leader_id),
             Some("10.0.0.2:9401".to_string())
         );
-        // Unknown leader id (not in voter set) → None.
-        assert_eq!(resolve_leader_addr(&voters, 0), None);
+        // Unknown leader id (not in voter set, not in membership) → None.
+        assert_eq!(resolve_leader_addr(&voters, &empty, 0), None);
+    }
+
+    fn mk_membership_node(grpc_addr: &str) -> RaftNodeInfo {
+        RaftNodeInfo {
+            role: NodeRole::Manager,
+            hostname: String::new(),
+            grpc_addr: grpc_addr.to_string(),
+            location: Location::default(),
+            disks: Vec::new(),
+            total_capacity: 0,
+            used_capacity: 0,
+            health: HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    /// CO-3-9 — a CF-2-promoted leader is present ONLY in the live Raft
+    /// membership (not in the bootstrap `initial_voters`); it must still
+    /// resolve, from its membership `grpc_addr`.
+    #[test]
+    fn co_3_9_leader_only_in_membership_resolves() {
+        let voters = vec![mk_voter("mini-mgr01", "10.0.0.1:9401")];
+        let leader_id = 42; // a promoted node, no matching voter hostname
+        let mut nodes = std::collections::BTreeMap::new();
+        nodes.insert(leader_id, mk_membership_node("http://10.0.0.9:9401"));
+        assert_eq!(
+            resolve_leader_addr(&voters, &nodes, leader_id),
+            Some("http://10.0.0.9:9401".to_string()),
+            "a promoted leader absent from initial_voters resolves via membership"
+        );
+    }
+
+    /// CO-3-9 — a leader present only in `initial_voters` (not yet in the
+    /// membership map, e.g. early boot) still resolves via the fallback.
+    #[test]
+    fn co_3_9_leader_only_in_voters_resolves() {
+        let voters = vec![mk_voter("mini-mgr02", "10.0.0.2:9401")];
+        let leader_id = dtfs_common::node_id_from_hostname("mini-mgr02");
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(
+            resolve_leader_addr(&voters, &empty, leader_id),
+            Some("10.0.0.2:9401".to_string())
+        );
+    }
+
+    /// CO-3-9 — membership is preferred over voters when both have the id.
+    #[test]
+    fn co_3_9_membership_preferred_over_voters() {
+        let voters = vec![mk_voter("mini-mgr02", "10.0.0.2:9401")];
+        let leader_id = dtfs_common::node_id_from_hostname("mini-mgr02");
+        let mut nodes = std::collections::BTreeMap::new();
+        nodes.insert(leader_id, mk_membership_node("http://10.0.0.99:9401"));
+        assert_eq!(
+            resolve_leader_addr(&voters, &nodes, leader_id),
+            Some("http://10.0.0.99:9401".to_string())
+        );
     }
 
     /// CO-3-8 — only the transient liveness states may be re-stamped to
