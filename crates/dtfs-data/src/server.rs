@@ -97,6 +97,9 @@ pub struct ServerContext {
 
 pub async fn run_grpc_server(
     config: DataNodeConfig,
+    // CF-6 — resolved [tls] context; when enabled the listener requires a
+    // mutual-TLS handshake and outbound replication speaks mTLS too.
+    tls: dtfs_common::tls::TlsContext,
     store: Arc<ChunkStore>,
     metrics: Arc<DataMetrics>,
     cache: Arc<ArcCache>,
@@ -107,7 +110,11 @@ pub async fn run_grpc_server(
     ctx_tx: Option<tokio::sync::oneshot::Sender<ServerContext>>,
 ) -> anyhow::Result<()> {
     let addr = config.grpc.listen_addr.parse()?;
-    let replication = Arc::new(ReplicationManager::new(store.clone(), config.clone()));
+    let replication = Arc::new(ReplicationManager::new(
+        store.clone(),
+        config.clone(),
+        tls.clone(),
+    ));
 
     // Bug D / Bug G — derive the put_chunk concurrency limit. If the
     // operator set a hard memory cap, recommend a slot count that fits
@@ -163,12 +170,25 @@ pub async fn run_grpc_server(
         integrity_faults,
     };
 
-    tracing::info!("Data node gRPC server listening on {}", addr);
+    tracing::info!(
+        "Data node gRPC server listening on {} ({})",
+        addr,
+        if tls.is_enabled() { "mTLS" } else { "plaintext" }
+    );
+
+    // CF-6 — when the [tls] context resolved certificates, every incoming
+    // connection must complete a mutual-TLS handshake against the cluster CA.
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(server_tls) = tls.server_tls() {
+        builder = builder
+            .tls_config(server_tls)
+            .map_err(|e| anyhow::anyhow!("data gRPC TLS config: {e}"))?;
+    }
 
     // Bug U — `serve_with_shutdown` lets tonic stop accepting new connections
     // when the signal fires, but in-flight requests keep running until they
     // complete (or until we abandon them in main).
-    tonic::transport::Server::builder()
+    builder
         .add_service(
             DataServiceServer::new(service)
                 // Allow the 8 MB streaming pieces in GetChunk (default cap
@@ -982,7 +1002,11 @@ max_io_percent = 10
         let dm = DiskManager::new(&disk_configs).unwrap();
         let store = Arc::new(ChunkStore::new(dm));
         let config = test_config(disk_path);
-        let replication = Arc::new(ReplicationManager::new(store.clone(), config.clone()));
+        let replication = Arc::new(ReplicationManager::new(
+            store.clone(),
+            config.clone(),
+            dtfs_common::tls::TlsContext::plaintext(),
+        ));
         DataServiceImpl {
             config,
             store,

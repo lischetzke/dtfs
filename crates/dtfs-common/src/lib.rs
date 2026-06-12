@@ -5,6 +5,7 @@ pub mod error;
 pub mod hash_ring;
 pub mod memory;
 pub mod reconfig;
+pub mod tls;
 pub mod topology;
 pub mod types;
 pub mod version;

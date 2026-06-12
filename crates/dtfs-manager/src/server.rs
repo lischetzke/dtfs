@@ -305,6 +305,7 @@ impl tower::Service<tonic::codegen::http::Request<tonic::body::Body>> for RaftTr
 
 pub async fn run_grpc_server(
     config: ManagerConfig,
+    tls: dtfs_common::tls::TlsContext,
     metadata_service: MetadataService,
     raft: Arc<DtfsRaft>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -312,15 +313,6 @@ pub async fn run_grpc_server(
     let addr: std::net::SocketAddr = config.grpc.listen_addr.parse().map_err(|e| {
         anyhow::anyhow!("invalid grpc.listen_addr '{}': {e}", config.grpc.listen_addr)
     })?;
-
-    if !config.tls.mode.eq_ignore_ascii_case("disabled")
-        && !config.tls.mode.eq_ignore_ascii_case("off")
-    {
-        tracing::warn!(
-            "TLS mode '{}' is set but manager gRPC still listens in plaintext (TLS not yet implemented)",
-            config.tls.mode
-        );
-    }
 
     let raft_svc = RaftTransportSvc {
         handler: RaftTransportHandler::new(raft),
@@ -336,12 +328,26 @@ pub async fn run_grpc_server(
         .await
         .map_err(|e| crate::bind_error("gRPC", addr, e))?;
 
-    tracing::info!("Manager gRPC server listening on {}", addr);
+    tracing::info!(
+        "Manager gRPC server listening on {} ({})",
+        addr,
+        if tls.is_enabled() { "mTLS" } else { "plaintext" }
+    );
+
+    // CF-6 — when the [tls] context resolved certificates, every incoming
+    // connection (ManagerService AND the Raft transport) must complete a
+    // mutual-TLS handshake against the cluster CA.
+    let mut builder = Server::builder();
+    if let Some(server_tls) = tls.server_tls() {
+        builder = builder
+            .tls_config(server_tls)
+            .map_err(|e| anyhow::anyhow!("manager gRPC TLS config: {e}"))?;
+    }
 
     // Bug U — stop accepting new connections when the shutdown signal fires.
     // In-flight requests continue until they complete; main is responsible
     // for any post-server cleanup (Raft snapshot, audit flush).
-    Server::builder()
+    builder
         .add_service(ManagerServiceServer::new(metadata_service))
         .add_service(raft_svc)
         .serve_with_incoming_shutdown(

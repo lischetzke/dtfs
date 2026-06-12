@@ -80,10 +80,13 @@ listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
 #cors_origins = ["*"]
 
 [tls]
-#mode = "auto"                      # "auto" | "require" | "disable"
-                                    # NOTE: TLS is not implemented yet — every
-                                    # mode currently serves PLAINTEXT and logs a
-                                    # warning. Do not rely on it.
+# CF-6: mutual TLS for ALL manager gRPC (ManagerService + Raft transport),
+# verified against the cluster CA. "auto" (default) enables TLS only when all
+# three files are configured AND exist on disk — otherwise plaintext (a
+# cert-less config keeps working unchanged). "require" fails startup without
+# them; "disabled" forces plaintext. Roll out only after every node runs a
+# TLS-capable build (docs/src/security/tls.md).
+#mode = "auto"                      # "auto" | "require" | "disabled"
 #cert_file = "/etc/dtfs/tls/server.crt"
 #key_file = "/etc/dtfs/tls/server.key"
 #ca_file = "/etc/dtfs/tls/ca.crt"

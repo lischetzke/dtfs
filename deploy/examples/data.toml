@@ -39,7 +39,10 @@ listen_addr = "10.0.0.4:9500"       # chunk-streaming gRPC. Use the ROUTABLE
                                     # (N in-flight writes x chunk size)
 
 [tls]
-#mode = "auto"                      # NOT implemented — plaintext today (see manager.toml)
+# CF-6: mutual TLS for the data gRPC listener + outbound replication and
+# manager connections. Semantics identical to manager.toml: "auto" (default)
+# = TLS only when all three files exist on disk, else plaintext.
+#mode = "auto"                      # "auto" | "require" | "disabled"
 #cert_file = "/etc/dtfs/tls/server.crt"
 #key_file = "/etc/dtfs/tls/server.key"
 #ca_file = "/etc/dtfs/tls/ca.crt"

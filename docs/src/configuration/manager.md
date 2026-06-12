@@ -176,9 +176,13 @@ cors_origins = ["https://dashboard.example.com"]
 
 ## `[tls]` -- TLS Settings
 
+Mutual TLS (CF-6) for ALL manager gRPC -- the `ManagerService` listener, the
+Raft transport, and every outbound manager connection. Roll out only after
+every node runs a TLS-capable build -- see [TLS](../security/tls.md).
+
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
-| `mode` | `tls.mode` | `String` | `"auto"` | `"auto"`, `"require"`, `"disable"` | No | TLS mode. `"auto"` enables TLS if cert/key files are present, `"require"` fails startup without them, `"disable"` turns off TLS entirely. |
+| `mode` | `tls.mode` | `String` | `"auto"` | `"auto"`, `"require"`, `"disabled"` | No | `"auto"` enables mTLS only when all three files are configured AND exist on disk, else plaintext (back-compat). `"require"` fails startup unless all three load. `"disabled"` forces plaintext. |
 | `cert_file` | `tls.cert_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Path to the TLS certificate file in PEM format. |
 | `key_file` | `tls.key_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Path to the TLS private key file in PEM format. |
 | `ca_file` | `tls.ca_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Path to the CA certificate bundle for verifying client certificates (mutual TLS). |

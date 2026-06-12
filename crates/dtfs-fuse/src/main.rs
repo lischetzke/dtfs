@@ -84,11 +84,17 @@ async fn main() -> Result<()> {
     // register *all* manager endpoints with the client so subsequent RPCs can
     // fail over to a healthy manager when the active one dies mid-session.
     let client = DtfsClient::new();
+    // CF-6 — resolve [tls] once and install it BEFORE the first connect so
+    // every cached channel (manager and data node) carries the right
+    // transport. Default config (mode "auto", no certs) stays plaintext.
+    let tls_ctx = dtfs_common::tls::TlsContext::from_config(&fuse_config.tls)?;
+    tls_ctx.log_startup("dtfs-fuse", &fuse_config.tls.mode);
+    client.set_tls(tls_ctx.clone());
     let endpoints: Vec<String> = fuse_config
         .client
         .all_manager_addrs()
         .into_iter()
-        .map(|a| format!("http://{}", a))
+        .map(|a| tls_ctx.endpoint_url(&a))
         .collect();
 
     client.connect_many(&endpoints).await.with_context(|| {
