@@ -145,8 +145,10 @@ PR'd.
    `/etc/systemd/system/dtfs-manager.service.d/` (e.g. voters `MemoryMax=6G`/
    `MemoryHigh=5G`; learners sized to RAM) so they survive reboots. `MemoryMax`
    stays the systemd backstop alongside the app `[memory]` ladder.
-2. **Delete `plans/active/PLAN-BUG-CM-monitor-leader-gate.md`** once PR #36 is
-   merged (§ B.2; git history retains it). After merge, small commit.
+2. ~~Delete `plans/active/PLAN-BUG-CM-monitor-leader-gate.md`~~ DONE
+   2026-06-12 (PR #36 merged; deleted together with the completed
+   PLAN-BUG-CF-PROD-HARDENING.md — § B.2, git history retains both).
+   Only item 1 (prod systemd drop-ins) remains in CNF-5.
 
 Verify: `systemctl show dtfs-manager -p MemoryMax -p MemoryHigh` per node shows
 the standardized values + survives `daemon-reload`. Done when: caps consistent +
