@@ -472,6 +472,13 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   builds via `dtfs-build.sh`, assembles the fixed-name
   `dtfs-linux-amd64.tar.gz` + `SHA256SUMS`, prints/`--publish`es
   `gh release create --generate-notes`.
+- `dtfs-common/src/tls.rs` — CF-6 `TlsContext`: resolves each role's
+  `[tls]` block once at startup (auto/require/disabled; default stays
+  plaintext for back-compat) and builds every tonic server/client TLS
+  config + scheme-aware endpoint. ALL gRPC listeners and connects (manager,
+  data, raft peers, FUSE via `DtfsClient::set_tls`) route through it; mixed
+  TLS state partitions the cluster, so enable only cluster-wide
+  (docs/src/security/tls.md rollout).
 - `plans/active/` — in-flight plans (see plans/README.md).
 - `tests/proxmox/abuse/` — numbered shell regression tests.
 

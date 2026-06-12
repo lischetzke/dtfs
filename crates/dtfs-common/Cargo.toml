@@ -29,3 +29,8 @@ rustls-pemfile = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 async-trait = { workspace = true }
+# CF-6 — TlsContext builds tonic Server/ClientTlsConfig + endpoints.
+tonic = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

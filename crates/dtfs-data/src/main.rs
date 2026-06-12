@@ -51,6 +51,11 @@ async fn main() -> anyhow::Result<()> {
         config.location
     );
 
+    // CF-6 — resolve [tls] once; reused by the gRPC server, the manager
+    // heartbeat lifecycle, and outbound chunk replication.
+    let tls_ctx = dtfs_common::tls::TlsContext::from_config(&config.tls)?;
+    tls_ctx.log_startup("dtfs-data", &config.tls.mode);
+
     // Initialize disk managers for each configured disk
     let disk_manager = disk::DiskManager::new(&config.disks)?;
     tracing::info!("Initialized {} disks", disk_manager.disk_count());
@@ -138,10 +143,12 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_metrics = data_metrics.clone();
     let heartbeat_scrub_config = scrub_config.clone();
     let heartbeat_integrity = integrity_faults.clone();
+    let heartbeat_tls = tls_ctx.clone();
     let process_start = Instant::now();
     tokio::spawn(async move {
         if let Err(e) = manager_lifecycle(
             heartbeat_config,
+            heartbeat_tls,
             heartbeat_store,
             heartbeat_metrics,
             process_start,
@@ -208,9 +215,11 @@ async fn main() -> anyhow::Result<()> {
         let memory = memory.clone();
         let scrub_config_for_server = scrub_config.clone();
         let integrity_for_server = integrity_faults.clone();
+        let tls = tls_ctx.clone();
         tokio::spawn(async move {
             server::run_grpc_server(
                 config,
+                tls,
                 store,
                 metrics,
                 cache,
@@ -308,6 +317,8 @@ async fn wait_for_terminate_signal() {
 /// compute `uptime_secs`.
 async fn manager_lifecycle(
     config: DataNodeConfig,
+    // CF-6 — resolved [tls] context for manager connections.
+    tls: dtfs_common::tls::TlsContext,
     chunk_store: Arc<ChunkStore>,
     data_metrics: Arc<metrics::DataMetrics>,
     process_start: Instant,
@@ -334,7 +345,7 @@ async fn manager_lifecycle(
         .cluster
         .all_manager_addrs()
         .into_iter()
-        .map(|a| format!("http://{}", a))
+        .map(|a| tls.endpoint_url(&a))
         .collect();
 
     let mut backoff = Duration::from_secs(1);
@@ -343,7 +354,7 @@ async fn manager_lifecycle(
     let (mut client, mut current_endpoint_idx) = loop {
         let mut connected = None;
         for (idx, ep) in manager_endpoints.iter().enumerate() {
-            match ManagerServiceClient::connect(ep.clone()).await {
+            match tls.connect(ep).await.map(ManagerServiceClient::new) {
                 Ok(c) => {
                     tracing::info!("Connected to manager at {}", ep);
                     connected = Some((c, idx));
@@ -468,7 +479,7 @@ async fn manager_lifecycle(
                 for offset in 1..=n {
                     let idx = (current_endpoint_idx + offset) % n;
                     let ep = &manager_endpoints[idx];
-                    if let Ok(c) = ManagerServiceClient::connect(ep.clone()).await {
+                    if let Ok(c) = tls.connect(ep).await.map(ManagerServiceClient::new) {
                         client = c;
                         current_endpoint_idx = idx;
                         tracing::info!("Switched to manager at {}", ep);
@@ -764,7 +775,7 @@ async fn manager_lifecycle(
                     for offset in 1..=n {
                         let idx = (current_endpoint_idx + offset) % n;
                         let ep = &manager_endpoints[idx];
-                        match ManagerServiceClient::connect(ep.clone()).await {
+                        match tls.connect(ep).await.map(ManagerServiceClient::new) {
                             Ok(new_client) => {
                                 client = new_client;
                                 current_endpoint_idx = idx;

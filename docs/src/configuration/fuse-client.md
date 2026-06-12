@@ -184,6 +184,23 @@ show_warning = true
 
 ---
 
+## `[tls]` -- TLS Settings
+
+Optional block (CF-6). gRPC transport security toward managers and data
+nodes: mutual TLS verified against the cluster CA. The block may be omitted
+entirely (mode `"auto"` with no certificate paths resolves to plaintext, so
+legacy configs keep working). Enable only after every manager and data node
+runs a TLS-capable build -- see [TLS](../security/tls.md).
+
+| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
+|--------|-----------|------|---------|-------------|-------------|-------------|
+| `mode` | `tls.mode` | `String` | `"auto"` | `"auto"`, `"require"`, `"disabled"` | No | `"auto"` enables mTLS only when all three files are configured AND exist on disk, else plaintext. `"require"` fails startup unless all three load. `"disabled"` forces plaintext. |
+| `cert_file` | `tls.cert_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Client certificate presented to servers (mutual TLS). |
+| `key_file` | `tls.key_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Private key for `cert_file`. |
+| `ca_file` | `tls.ca_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Cluster CA used to verify manager and data-node certificates. |
+
+---
+
 ## `[memory]` -- Process Memory Budget
 
 Optional block (CF-5). `hard_cap_mb = 0` (the default, and the behaviour when

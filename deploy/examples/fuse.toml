@@ -69,6 +69,18 @@ mountpoint = "/mnt/dtfs"
 #quorum_loss_timeout_secs = 10
 #show_warning = true
 
+#[tls]
+# CF-6: gRPC transport security toward managers and data nodes (mutual TLS
+# against the cluster CA). "auto" (default) enables TLS only when all three
+# files below are configured AND exist on disk — otherwise the client stays
+# plaintext, so a cert-less config keeps working. "require" fails startup
+# without them; "disabled" forces plaintext. Enable only after every manager
+# and data node runs a TLS-capable build (docs/src/security/tls.md).
+#mode = "auto"                      # "auto" | "require" | "disabled"
+#cert_file = "/etc/dtfs/tls/client.crt"
+#key_file = "/etc/dtfs/tls/client.key"
+#ca_file = "/etc/dtfs/tls/ca.crt"
+
 #[write]
 # Bug AV (AV-3-1): first-write chunk placement preference.
 #first_write_tier = "cold"          # "cold": ACK after the mandatory/anchor

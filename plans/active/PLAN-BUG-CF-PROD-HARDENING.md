@@ -177,13 +177,47 @@ Remaining in CF-1: `delete.fanout_failed` audit event (with CF-4b).
   non-zero cap from their toml; AGENTS.md § A.3.2/A.5 updated to "all
   roles".
 
-### CF-6: TLS implementation (stub) ⬜
+### CF-6: TLS implementation ✅
 
 - Wire the existing cert machinery (join-issued certs, TlsConfig) into
   tonic server/client builders for manager + data gRPC; remove the
   "plaintext (TLS not yet implemented)" warnings; update
   docs/src/security/tls.md status banner.
-- Large; schedule after CF-1..4. Interim risk accepted (tailscale).
+- Implemented (2026-06-11): `dtfs_common::tls::TlsContext` resolves each
+  role's `[tls]` once at startup (auto/require/disabled; default plaintext
+  for back-compat, partial config or unreadable files = hard error) and is
+  threaded to EVERY gRPC listener and connect site: manager server
+  (ManagerService + Raft transport), data server, raft peer channels
+  (`NetworkFactory`), manager self-register, scheduler replicate/verify/
+  delete/list-chunks, metadata leader-forward + delete fan-out +
+  `write_via_leader`, monitor status commits, data heartbeat lifecycle,
+  data-to-data replication, and `DtfsClient` (FUSE; `set_tls` before first
+  connect; new `FuseConfig.tls` field, `#[serde(default)]`). Servers run
+  mutual TLS (node cert + required client certs vs cluster CA); clients
+  verify the CA and present the node cert. crypto.rs fixes: node-cert
+  issuer reconstructed from the real CA PEM (rcgen `x509-parser` feature)
+  and IP-shaped hostnames get IP SANs. tonic feature `tls-ring` enabled
+  workspace-wide.
+- Tests: tls.rs unit matrix (mode resolution, scheme rewrite) +
+  `crates/dtfs-data/tests/tls_loopback.rs` in-process loopback (mTLS
+  roundtrip, wrong CA rejected, missing client cert rejected, plaintext
+  client vs TLS server fails, default config still plaintext). No release
+  case: flipping the shared lab to TLS would affect every other case;
+  loopback covers the handshake matrix. Operator follow-up: run the
+  docs/src/security/tls.md rollout on the lab, then consider a TLS release
+  case.
+- Gap: dtfs-cli is REST-only (no gRPC) — unaffected. WebUI/REST API (9402)
+  remains plain HTTP, out of CF-6 scope.
+- Review-pass gaps (2026-06-12, documented in tls.md, accepted for this
+  iteration): join-issued certs are NOT wired into `[tls]` (in-memory
+  only; operator provisions cert files); node certs need IP SANs for
+  every dialed address (single-SAN `generate_node_cert` insufficient for
+  multi-address nodes; single-node self-register fallback needs a
+  127.0.0.1 SAN); IPv6 bracketed literals fail the TLS server-name check;
+  `require`/partial `[tls]` blocks hard-fail startup on upgrade
+  (pre-CF-6 they were decorative — see tls.md upgrade notes). Code fix
+  from the review pass: PEM material Arc'd (the context is cloned per
+  component and per cached channel).
 
 ### CF-8: manual scrub trigger actually dispatches ✅
 

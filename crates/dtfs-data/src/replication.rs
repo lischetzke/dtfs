@@ -30,12 +30,19 @@ const STREAM_PIECE_SIZE: usize = 1024 * 1024;
 pub struct ReplicationManager {
     store: Arc<ChunkStore>,
     config: DataNodeConfig,
+    /// CF-6 — resolved [tls] context; node-to-node replication speaks
+    /// mTLS when enabled.
+    tls: dtfs_common::tls::TlsContext,
 }
 
 impl ReplicationManager {
     /// Create a new replication manager.
-    pub fn new(store: Arc<ChunkStore>, config: DataNodeConfig) -> Self {
-        Self { store, config }
+    pub fn new(
+        store: Arc<ChunkStore>,
+        config: DataNodeConfig,
+        tls: dtfs_common::tls::TlsContext,
+    ) -> Self {
+        Self { store, config, tls }
     }
 
     /// Replicate a chunk from this node to a remote target data node.
@@ -63,19 +70,16 @@ impl ReplicationManager {
 
         // Bug W (part 2) — `target_addr` comes from `NodeInfo.grpc_addr` via
         // the manager-relayed `ReplicateChunkRequest.target_address`. The
-        // manager stores grpc_addr already URL-formatted ("http://ip:port"),
-        // so prefixing "http://" again would produce `http://http://...`.
-        let endpoint = if target_addr.starts_with("http://") || target_addr.starts_with("https://") {
-            target_addr.to_string()
-        } else {
-            format!("http://{}", target_addr)
-        };
+        // manager stores grpc_addr already URL-formatted ("http://ip:port");
+        // `TlsContext::endpoint_url` accepts both forms and rewrites the
+        // scheme to match this node's TLS state (CF-6).
+        let endpoint = self.tls.endpoint_url(target_addr);
 
         let chunk_hex = chunk_id.as_hex();
         let tier = target_tier.to_string();
 
         let work = async {
-            let mut client = DataServiceClient::connect(endpoint).await?;
+            let mut client = self.tls.connect(&endpoint).await.map(DataServiceClient::new)?;
 
             let (tx, rx) = tokio::sync::mpsc::channel::<PutChunkRequest>(4);
 

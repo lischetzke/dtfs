@@ -51,7 +51,7 @@ pub fn generate_cluster_ca(cluster_name: &str) -> Result<(Vec<u8>, Vec<u8>)> {
 /// Generate a server certificate signed by the cluster CA.
 /// Takes the CA key pair and generates a new node cert signed by it.
 pub fn generate_node_cert(
-    _ca_cert_pem: &[u8],
+    ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
     hostname: &str,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -59,22 +59,29 @@ pub fn generate_node_cert(
     let ca_key = rcgen::KeyPair::from_pem(ca_key_str)
         .map_err(|e| anyhow::anyhow!("Failed to parse CA key: {}", e))?;
 
-    // Re-create the CA cert params to sign with
-    let mut ca_params = rcgen::CertificateParams::new(vec![])
-        .map_err(|e| anyhow::anyhow!("Failed to create CA params: {}", e))?;
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "DTFS CA".to_string());
+    // CF-6 — reconstruct the issuer from the REAL CA certificate. The
+    // previous code rebuilt CA params from scratch with CN "DTFS CA",
+    // which differs from the issued CA's CN ("DTFS CA - <cluster>"), so
+    // the node cert's issuer DN never matched the trust anchor and chain
+    // validation failed as soon as the certs were used for actual TLS.
+    let ca_cert_str = std::str::from_utf8(ca_cert_pem)?;
+    let ca_params = rcgen::CertificateParams::from_ca_cert_pem(ca_cert_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse CA cert: {}", e))?;
     let ca_cert = ca_params
         .self_signed(&ca_key)
         .map_err(|e| anyhow::anyhow!("Failed to recreate CA cert: {}", e))?;
 
-    let san = rcgen::SanType::DnsName(
-        hostname
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("Invalid hostname for SAN: {}", e))?,
-    );
+    // CF-6 — nodes are usually dialed by IP (registry grpc_addr), and
+    // rustls verifies the dialed host against the SAN list: an IP-shaped
+    // hostname must become an IP SAN, not a DNS SAN.
+    let san = match hostname.parse::<std::net::IpAddr>() {
+        Ok(ip) => rcgen::SanType::IpAddress(ip),
+        Err(_) => rcgen::SanType::DnsName(
+            hostname
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("Invalid hostname for SAN: {}", e))?,
+        ),
+    };
 
     let mut node_params = rcgen::CertificateParams::new(vec![])
         .map_err(|e| anyhow::anyhow!("Failed to create node cert params: {}", e))?;
@@ -138,6 +145,15 @@ mod tests {
     fn test_generate_node_cert() {
         let (ca_cert, ca_key) = generate_cluster_ca("test-cluster").unwrap();
         let (node_cert, node_key) = generate_node_cert(&ca_cert, &ca_key, "node-01.example.com").unwrap();
+        assert!(!node_cert.is_empty());
+        assert!(!node_key.is_empty());
+    }
+
+    #[test]
+    fn test_generate_node_cert_ip_hostname() {
+        // CF-6 — an IP-shaped hostname yields an IP SAN cert without error.
+        let (ca_cert, ca_key) = generate_cluster_ca("test-cluster").unwrap();
+        let (node_cert, node_key) = generate_node_cert(&ca_cert, &ca_key, "127.0.0.1").unwrap();
         assert!(!node_cert.is_empty());
         assert!(!node_key.is_empty());
     }

@@ -148,6 +148,11 @@ struct DtfsClientInner {
     requester_dc: parking_lot::RwLock<String>,
     /// Optional host name for the same purpose (mostly diagnostic).
     requester_host: parking_lot::RwLock<String>,
+    /// CF-6 — resolved `[tls]` context applied to every new channel
+    /// (manager and data node alike). Defaults to plaintext; set via
+    /// [`DtfsClient::set_tls`] BEFORE the first connect so no plaintext
+    /// channel gets cached.
+    tls: parking_lot::RwLock<dtfs_common::tls::TlsContext>,
 }
 
 /// High-level client for interacting with the DTFS cluster.
@@ -175,8 +180,18 @@ impl DtfsClient {
                 active_idx: parking_lot::RwLock::new(0),
                 requester_dc: parking_lot::RwLock::new(String::new()),
                 requester_host: parking_lot::RwLock::new(String::new()),
+                tls: parking_lot::RwLock::new(
+                    dtfs_common::tls::TlsContext::plaintext(),
+                ),
             }),
         }
+    }
+
+    /// CF-6 — install the resolved `[tls]` context. Must be called before
+    /// the first connect: channels are cached per address, so a channel
+    /// created earlier keeps its original (plaintext) transport.
+    pub fn set_tls(&self, tls: dtfs_common::tls::TlsContext) {
+        *self.inner.tls.write() = tls;
     }
 
     /// P0-9: set the client's DC/host labels for `read_chunk` telemetry.
@@ -855,8 +870,11 @@ impl DtfsClient {
             return Ok(entry.value().clone());
         }
 
-        // Slow path: create a new channel.
-        let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
+        // Slow path: create a new channel. CF-6 — the TLS context owns the
+        // scheme rewrite (http/https) and the client mTLS settings.
+        let tls = self.inner.tls.read().clone();
+        let endpoint = tls
+            .endpoint(addr)
             .context("invalid endpoint address")?
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(60));
