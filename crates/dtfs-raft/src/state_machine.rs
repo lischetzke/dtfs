@@ -1829,10 +1829,8 @@ fn apply_remove_chunk_location(
             };
             let Some(ninfo) = sm.nodes.get(&nid) else { return false };
             let dc = ninfo.location.datacenter.as_str();
-            let tier = ninfo
-                .disks
-                .get(c.disk_id as usize)
-                .map(|d| d.tier);
+            // CNF-1 — resolve by the stable disk_id key, never Vec index.
+            let tier = ninfo.disk(c.disk_id).map(|d| d.tier);
             policy.is_satisfied_by(dc, tier)
         });
         if !survives_anchor {
@@ -3176,6 +3174,42 @@ mod posix_path_regression {
             });
         assert!(matches!(resp, ClientResponse::Error { .. }));
         assert_eq!(sm.files.get("/x").unwrap().chunks.len(), 2, "unchanged");
+    }
+
+    /// CNF-1 — the enforce-anchor survivor check must resolve the disk by
+    /// the STABLE `DiskInfo.disk_id`, not Vec position. With the cold
+    /// survivor's only disk carrying disk_id=1 at Vec index 0 (reindexed
+    /// disk list), dropping the warm replica is safe and must succeed
+    /// (pre-fix the positional lookup missed, tier resolved to None, and
+    /// the safe removal was refused).
+    #[test]
+    fn cnf1_remove_chunk_location_anchor_resolves_disk_by_stable_id() {
+        use dtfs_common::types::{AnchorPolicy, DiskTier};
+        let mut sm = sm_with_chunk("/x", 0, "h", &[
+            (10, "leli", DiskTier::Cold),
+            (11, "leli", DiskTier::Warm),
+        ]);
+        // Reindex node 10's disk list: its only disk now carries the
+        // stable disk_id=1 (still at Vec index 0); the chunk entry
+        // references the stable id.
+        sm.nodes.get_mut(&10).unwrap().disks[0].disk_id = 1;
+        for c in &mut sm.files.get_mut("/x").unwrap().chunks {
+            if c.node_id == "10" {
+                c.disk_id = 1;
+            }
+        }
+        let resp = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "11".into(), // drop warm; cold survivor anchors
+                enforce_anchor: Some(AnchorPolicy {
+                    datacenter: "leli".into(),
+                    required_tier: Some(DiskTier::Cold),
+                }),
+            });
+        assert!(matches!(resp, ClientResponse::Success), "got {resp:?}");
+        assert_eq!(sm.files.get("/x").unwrap().chunks.len(), 1);
     }
 
     // ---- AV-1-4 — SetChunkCooldown tests --------------------------

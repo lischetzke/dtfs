@@ -735,7 +735,9 @@ fn count_anchor_pending_files(sm: &StateMachineData) -> usize {
                 .filter_map(|e| {
                     let nid = e.node_id.parse::<u64>().ok()?;
                     let info = sm.nodes.get(&nid)?;
-                    let tier = info.disks.get(e.disk_id as usize).map(|d| d.tier)?;
+                    // CNF-1 — stable disk_id key, never Vec index (must
+                    // agree with scheduler::check_anchor_lag's resolution).
+                    let tier = info.disk(e.disk_id).map(|d| d.tier)?;
                     Some((info.location.datacenter.clone(), tier))
                 })
                 .collect();
@@ -5385,5 +5387,96 @@ mod cf1b_integrity_feed_tests {
     #[test]
     fn matches_on_summary_when_action_empty() {
         assert!(action_is_integrity_fault("", "delete.fanout_failed: node_addr=..."));
+    }
+}
+
+#[cfg(test)]
+mod cnf1_stable_disk_id_tests {
+    use super::*;
+    use dtfs_common::types::{
+        AnchorPolicy, CacheReplication, DiskInfo, DiskStatus, DiskTier, TierReplication,
+        VolumeConfig, VolumeId, WriteSafety,
+    };
+
+    /// CNF-1 — the anchor projection must resolve a replica's disk by the
+    /// STABLE `DiskInfo.disk_id` key, never by Vec position. Prod symptom:
+    /// `anchor_pending=1` forever with an empty migration queue — the
+    /// node's disks Vec had been reindexed (disk removed/re-registered),
+    /// the positional `disks[disk_id]` lookup missed, and a satisfied
+    /// anchor looked missing.
+    #[test]
+    fn anchor_projection_resolves_disk_by_stable_id() {
+        let mut sm = dtfs_raft::state_machine::StateMachineData::default();
+
+        // One node in the anchor DC whose ONLY disk carries disk_id=1
+        // at Vec index 0 (reindexed disk list).
+        sm.nodes.insert(7, dtfs_raft::NodeInfo {
+            role: dtfs_common::types::NodeRole::Data,
+            hostname: "d".into(),
+            grpc_addr: "d:9500".into(),
+            location: dtfs_common::topology::Location::new("lab", "leli", "r1", "d"),
+            disks: vec![DiskInfo {
+                disk_id: 1,
+                uuid: "u".into(),
+                mount_path: "/m".into(),
+                tier: DiskTier::Cold,
+                total_bytes: 1,
+                used_bytes: 0,
+                status: DiskStatus::Healthy,
+            }],
+            total_capacity: 0,
+            used_capacity: 0,
+            health: HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        });
+
+        sm.volumes.insert("default".into(), VolumeConfig {
+            id: VolumeId::new("default".into()),
+            name: "default".into(),
+            chunk_size_bytes: 4 << 20,
+            replication: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            cache_replicas: CacheReplication::default(),
+            anchor: Some(AnchorPolicy {
+                datacenter: "leli".into(),
+                required_tier: Some(DiskTier::Cold),
+            }),
+            schedules: dtfs_common::types::VolumeSchedules::default(),
+            spill: dtfs_common::types::SpillPolicy::default(),
+            anchor_datacenter: None,
+            write_safety: WriteSafety { min_replicas_before_ack: 1, write_timeout_secs: 30 },
+        });
+
+        sm.files.insert("/f.bin".into(), dtfs_raft::state_machine::FileMetadata {
+            path: "/f.bin".into(),
+            volume_id: "default".into(),
+            chunk_size: 1024,
+            chunks: vec![dtfs_raft::ChunkLocationEntry {
+                chunk_index: 0,
+                chunk_hash: "h0".into(),
+                node_id: "7".into(),
+                disk_id: 1, // stable id, NOT a Vec index
+                size_bytes: 1,
+            }],
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+        });
+
+        assert_eq!(
+            count_anchor_pending_files(&sm),
+            0,
+            "cold replica on (node 7, disk_id 1) satisfies the anchor; \
+             a positional disks[1] lookup must not drop it"
+        );
     }
 }
