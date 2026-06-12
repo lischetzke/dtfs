@@ -410,6 +410,14 @@ pub struct RaftConfig {
     /// by default, the MANIFEST grew to ~207 MB. Rotating bounds it.
     #[serde(default = "default_rocksdb_max_manifest_bytes")]
     pub rocksdb_max_manifest_bytes: u64,
+    /// CNF-3 — RocksDB memtable (write buffer) size per column family for
+    /// the raft log store, in MiB. Bounds write-side memory.
+    #[serde(default = "default_rocksdb_write_buffer_mb")]
+    pub rocksdb_write_buffer_mb: u64,
+    /// CNF-3 — RocksDB block-cache size for the raft log store, in MiB.
+    /// One LRU cache shared across both column families.
+    #[serde(default = "default_rocksdb_block_cache_mb")]
+    pub rocksdb_block_cache_mb: u64,
     /// Bug BP-1 — how many committed raft-log entries openraft keeps after
     /// a snapshot. A large/implicit-default value let ~10 000 tiny `.sst`
     /// files accumulate, slowing RocksDB open to minutes. Bounded purge
@@ -870,6 +878,12 @@ fn default_rocksdb_keep_log_file_num() -> u64 {
 }
 fn default_rocksdb_max_manifest_bytes() -> u64 {
     64 * 1024 * 1024
+}
+fn default_rocksdb_write_buffer_mb() -> u64 {
+    64
+}
+fn default_rocksdb_block_cache_mb() -> u64 {
+    64
 }
 fn default_max_in_snapshot_log_to_keep() -> u64 {
     1000
