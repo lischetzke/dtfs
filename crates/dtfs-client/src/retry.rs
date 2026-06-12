@@ -51,9 +51,12 @@ impl RetryConfig {
     /// thundering-herd effects.
     fn delay_for_attempt(&self, attempt: u32) -> Duration {
         // Exponential: base_delay * 2^attempt, capped at max_delay.
-        let exp_delay = self
-            .base_delay
-            .saturating_mul(1u32.wrapping_shl(attempt));
+        // `checked_shl` returns None once `attempt >= 32` (the shift would
+        // overflow a u32); saturate to `u32::MAX` there instead of wrapping
+        // the shift amount mod 32, which would collapse the delay back to
+        // base_delay and break monotonicity (fix for CO-5-19).
+        let multiplier = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+        let exp_delay = self.base_delay.saturating_mul(multiplier);
         let capped = exp_delay.min(self.max_delay);
 
         // Jitter: up to 25 % of the capped delay (minimum 1 ms when non-zero).
@@ -64,7 +67,11 @@ impl RetryConfig {
             0
         };
 
-        capped + Duration::from_millis(jitter_ms)
+        // Clamp the jittered result back to max_delay so the documented
+        // "backoff will never exceed this value" contract holds and so two
+        // already-capped attempts compare equal (monotonic) regardless of
+        // their independent jitter draws (CO-5-19).
+        (capped + Duration::from_millis(jitter_ms)).min(self.max_delay)
     }
 }
 
