@@ -586,26 +586,21 @@ impl TieringEngine {
         let mut id_to_dc: HashMap<u64, String> = HashMap::new();
         for (id, info) in sm.nodes.iter() {
             id_to_dc.insert(*id, info.location.datacenter.clone());
-            // The planner will set `has_target_tier_disk` per-call
-            // when iterating tiers — we materialise one node view
-            // per tier the node has below. Here we emit a baseline
-            // view; the planner closure layers the per-call tier
-            // check via the candidates iteration.
-            let draining = matches!(info.health, dtfs_common::types::HealthStatus::Draining);
-            // For simplicity, emit one view per disk's tier so the
-            // planner can pick the right one. Free capacity is shared
-            // across tiers on the same node; that's a small
-            // approximation that's good enough for promotion
-            // target picking.
-            for _disk in &info.disks {
-                node_views.push(NodeSelectionView {
-                    node_id: *id,
-                    datacenter: info.location.datacenter.clone(),
-                    has_target_tier_disk: true,
-                    free_capacity: info.total_capacity.saturating_sub(info.used_capacity),
-                    draining,
-                    already_holds_chunk: false,
-                });
+            // CO-4-5 — emit one view per (node, distinct serviceable
+            // tier). `node_selection_view` computes `has_target_tier_disk`
+            // honestly per tier and excludes Draining/Down/Failed/
+            // Quarantined nodes, so the promotion planner only ever
+            // targets a node that can actually hold the cache replica.
+            let mut seen_tiers: std::collections::HashSet<DiskTier> =
+                std::collections::HashSet::new();
+            for disk in &info.disks {
+                if !seen_tiers.insert(disk.tier) {
+                    continue;
+                }
+                let view = node_selection_view(*id, info, disk.tier);
+                if view.has_target_tier_disk {
+                    node_views.push(view);
+                }
             }
         }
 
@@ -1103,8 +1098,14 @@ pub(crate) fn plan_cache_promotion(
 pub(crate) struct NodeSelectionView {
     pub node_id: u64,
     pub datacenter: String,
+    /// The tier this view was materialised for. The engine emits one
+    /// view per (node, serviceable tier); the promotion planner only
+    /// considers views whose `tier` matches the tier it is filling, so
+    /// a cold-only node is never offered as a warm-cache target.
+    pub tier: DiskTier,
     /// Set true when the engine has confirmed the node hosts at
-    /// least one disk of the desired tier and that disk is healthy.
+    /// least one disk of `tier` and that disk is serviceable (not
+    /// Failed/Removed).
     pub has_target_tier_disk: bool,
     /// Free-capacity proxy, in bytes. Larger = preferred. The
     /// engine derives this as
@@ -1117,6 +1118,45 @@ pub(crate) struct NodeSelectionView {
     /// be promoting. The selector skips these so we don't duplicate
     /// a replica on the same node.
     pub already_holds_chunk: bool,
+}
+
+/// CO-4-5 — project a node into a `NodeSelectionView` for a specific
+/// `target_tier`. `has_target_tier_disk` is true iff the node hosts at
+/// least one serviceable (not Failed/Removed) disk of that tier, and
+/// `draining` is set for any health state that disqualifies the node
+/// from receiving a new replica (Draining/Down/Failed/Quarantined) so
+/// the pure selector skips it. Pre-CO-4-5 the snapshot set
+/// `has_target_tier_disk` unconditionally and only excluded Draining,
+/// so promotions targeted cold-only or dead nodes and fast-failed
+/// forever (the cache replica was never created).
+pub(crate) fn node_selection_view(
+    node_id: u64,
+    info: &dtfs_raft::NodeInfo,
+    target_tier: DiskTier,
+) -> NodeSelectionView {
+    use dtfs_common::types::{DiskStatus, HealthStatus};
+    let has_target_tier_disk = info.disks.iter().any(|d| {
+        d.tier == target_tier
+            && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed)
+    });
+    // Any health state that means "don't place a new replica here".
+    // `draining` is the selector's catch-all exclusion flag.
+    let excluded = matches!(
+        info.health,
+        HealthStatus::Draining
+            | HealthStatus::Down
+            | HealthStatus::Failed
+            | HealthStatus::Quarantined
+    );
+    NodeSelectionView {
+        node_id,
+        datacenter: info.location.datacenter.clone(),
+        tier: target_tier,
+        has_target_tier_disk,
+        free_capacity: info.total_capacity.saturating_sub(info.used_capacity),
+        draining: excluded,
+        already_holds_chunk: false,
+    }
 }
 
 /// AV-2-3 pure kernel — pick the best cache-promotion target in
@@ -1404,8 +1444,12 @@ fn plan_chunk_promotions(
             // per placement of this chunk.
             let holders: std::collections::HashSet<u64> =
                 chunk.placements.iter().map(|p| p.node_id).collect();
+            // CO-4-5 — only consider node views materialised for the
+            // tier we're filling; a node's cold-disk view must never
+            // satisfy a warm-cache promotion.
             let candidates: Vec<NodeSelectionView> = nodes
                 .iter()
+                .filter(|n| n.tier == *tier)
                 .map(|n| {
                     let mut copy = n.clone();
                     if holders.contains(&n.node_id) {
@@ -1993,6 +2037,9 @@ mod bug_av_target_selection_tests {
         NodeSelectionView {
             node_id: id,
             datacenter: dc.to_string(),
+            // `select_promotion_target` ignores `tier`; the value is
+            // irrelevant to these direct-selector tests.
+            tier: DiskTier::Warm,
             has_target_tier_disk: has_tier,
             free_capacity: free,
             draining,
@@ -2089,6 +2136,8 @@ mod bug_av_tiering_tick_tests {
         NodeSelectionView {
             node_id: id,
             datacenter: dc.to_string(),
+            // The plex/tier tests in this module all promote to Warm.
+            tier: DiskTier::Warm,
             has_target_tier_disk: has_tier,
             free_capacity: free,
             draining: false,
@@ -2470,5 +2519,127 @@ mod bug_av_tiering_tick_tests {
         assert_eq!(plan.promotions.len(), 1);
         assert_eq!(plan.promotions[0].target_dc, "nrb",
             "global pool targets the DC with the most reads");
+    }
+}
+
+#[cfg(test)]
+mod audit_co_tests {
+    //! CO-4-5 — `node_selection_view` honest tier + health check, so
+    //! the cache-promotion planner stops targeting cold-only / dead
+    //! nodes (which fast-fail forever, never creating the replica).
+    use super::*;
+    use dtfs_common::topology::Location;
+    use dtfs_common::types::{DiskInfo, DiskStatus, DiskTier, HealthStatus, NodeRole};
+    use dtfs_raft::NodeInfo;
+
+    fn disk(disk_id: u32, tier: DiskTier, status: DiskStatus) -> DiskInfo {
+        DiskInfo {
+            disk_id,
+            uuid: format!("uuid-{disk_id}"),
+            mount_path: format!("/mnt/d{disk_id}"),
+            tier,
+            total_bytes: 1_000,
+            used_bytes: 0,
+            status,
+        }
+    }
+
+    // `dtfs_raft::NodeInfo` carries no `id` field (the node id is the
+    // `StateMachineData.nodes` map key, passed separately to
+    // `node_selection_view`).
+    fn node(id: u64, dc: &str, health: HealthStatus, disks: Vec<DiskInfo>) -> NodeInfo {
+        NodeInfo {
+            role: NodeRole::Data,
+            hostname: format!("node{id}"),
+            grpc_addr: format!("http://10.0.0.{id}:9500"),
+            location: Location::new("r", dc, "rack", &format!("host{id}")),
+            disks,
+            total_capacity: 1_000_000,
+            used_capacity: 0,
+            health,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    /// CO-4-5 — a cold-only node's Warm view reports
+    /// `has_target_tier_disk=false`; a node with a serviceable warm
+    /// disk reports true. Pre-fix the snapshot set this true
+    /// unconditionally, so cold-only A looked like a valid warm target.
+    #[test]
+    fn co_4_5_cold_only_node_has_no_warm_target_disk() {
+        let a = node(
+            10,
+            "leli",
+            HealthStatus::Healthy,
+            vec![disk(0, DiskTier::Cold, DiskStatus::Healthy)],
+        );
+        let b = node(
+            11,
+            "leli",
+            HealthStatus::Healthy,
+            vec![disk(0, DiskTier::Warm, DiskStatus::Healthy)],
+        );
+        let va = node_selection_view(10, &a, DiskTier::Warm);
+        let vb = node_selection_view(11, &b, DiskTier::Warm);
+        assert!(
+            !va.has_target_tier_disk,
+            "cold-only node must not advertise a warm target disk"
+        );
+        assert!(vb.has_target_tier_disk, "warm node must advertise warm");
+        // So the pure selector picks B, never the cold-only A.
+        let pick = select_promotion_target(&[va, vb], "leli");
+        assert_eq!(pick, Some(11));
+    }
+
+    /// CO-4-5 — a Failed/Removed disk of the target tier doesn't count.
+    #[test]
+    fn co_4_5_failed_warm_disk_is_not_serviceable() {
+        let n = node(
+            10,
+            "toro",
+            HealthStatus::Healthy,
+            vec![disk(0, DiskTier::Warm, DiskStatus::Failed)],
+        );
+        assert!(!node_selection_view(10, &n, DiskTier::Warm).has_target_tier_disk);
+        let n2 = node(
+            10,
+            "toro",
+            HealthStatus::Healthy,
+            vec![disk(0, DiskTier::Warm, DiskStatus::Removed)],
+        );
+        assert!(!node_selection_view(10, &n2, DiskTier::Warm).has_target_tier_disk);
+    }
+
+    /// CO-4-5 — Down/Failed/Quarantined nodes are excluded
+    /// (`draining=true` → selector skips). Only Draining was excluded
+    /// pre-fix, so promotions targeted dead nodes.
+    #[test]
+    fn co_4_5_dead_nodes_excluded_from_selection() {
+        for bad in [
+            HealthStatus::Down,
+            HealthStatus::Failed,
+            HealthStatus::Quarantined,
+            HealthStatus::Draining,
+        ] {
+            let n = node(
+                10,
+                "toro",
+                bad,
+                vec![disk(0, DiskTier::Warm, DiskStatus::Healthy)],
+            );
+            let v = node_selection_view(10, &n, DiskTier::Warm);
+            assert!(v.draining, "{bad:?} node must be flagged excluded");
+            assert_eq!(
+                select_promotion_target(&[v], "toro"),
+                None,
+                "{bad:?} node must not be selected as a promotion target"
+            );
+        }
     }
 }
