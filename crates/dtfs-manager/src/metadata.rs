@@ -311,6 +311,34 @@ fn compute_self_quarantine_cleared(is_quarantined: bool, reported_fault_count: u
     !is_quarantined && reported_fault_count == 0
 }
 
+/// CO-3-8 — may a heartbeat re-stamp this node's health back to Healthy?
+///
+/// The heartbeat handler raft-writes `UpdateNodeStatus(healthy)` every
+/// cycle, but the apply path only guards `Quarantined`. Without this gate,
+/// an operator-set `Maintenance` (or scheduler-set `Draining`) status
+/// self-clears within one heartbeat (≤5s), pulling the node back into
+/// serving/placement before the drain completes.
+///
+/// `Maintenance`/`Draining`/`Quarantined` are STICKY — they clear only via
+/// their own explicit paths (operator `set_maintenance(false)`, drain
+/// completion, `UnquarantineNode`), never via a liveness heartbeat. Every
+/// other state — the transient liveness states (Healthy/Suspect/Down) AND
+/// the disk-derived states (Degraded/Failed) — stays heartbeat-clearable,
+/// preserving the pre-CO-3-8 recovery path where a node that comes back
+/// healthy re-stamps itself on its next heartbeat. The explicit false-list
+/// (rather than an allow-list) keeps that recovery intact; a NEW sticky
+/// state must be added to the false arm here.
+fn heartbeat_may_mark_healthy(current: HealthStatus) -> bool {
+    match current {
+        HealthStatus::Maintenance | HealthStatus::Draining | HealthStatus::Quarantined => false,
+        HealthStatus::Healthy
+        | HealthStatus::Suspect
+        | HealthStatus::Down
+        | HealthStatus::Degraded
+        | HealthStatus::Failed => true,
+    }
+}
+
 /// Bug BL — resolve the gRPC address of the current Raft leader from the
 /// configured voter set. The openraft node id is derived from the
 /// hostname via `node_id_from_hostname`, so a voter matches the leader
@@ -804,12 +832,16 @@ impl ManagerService for MetadataService {
         // Bug BF (data-side self-quarantine clear) — also surfaces the
         // current Quarantined state so the heartbeat response can tell
         // the data node it is free again.
-        let is_quarantined = {
+        // CO-3-8 — surface the node's current health (not just the
+        // quarantine flag) so the heartbeat "healthy" write below can be
+        // suppressed for the sticky operator/drain states as well. An
+        // unregistered node defaults to Healthy (heartbeat may proceed).
+        let (is_quarantined, current_health) = {
             let sm = self.sm_data.read().await;
-            sm.nodes
-                .get(&node_id)
-                .map(|n| n.quarantine.is_some())
-                .unwrap_or(false)
+            match sm.nodes.get(&node_id) {
+                Some(n) => (n.quarantine.is_some(), n.health),
+                None => (false, HealthStatus::Healthy),
+            }
         };
         // Bug BL-3 — never tell a data node it is clear in the same cycle
         // it reported an integrity fault. Without this guard, a non-leader
@@ -821,7 +853,10 @@ impl ManagerService for MetadataService {
         // quarantine state correctly.
         let self_quarantine_cleared =
             compute_self_quarantine_cleared(is_quarantined, req.integrity_faults.len());
-        if !is_quarantined {
+        // CO-3-8 — only re-stamp Healthy for the transient liveness states.
+        // Maintenance/Draining (and Quarantined) are sticky: a heartbeat
+        // must not clear an operator drain within one cycle.
+        if heartbeat_may_mark_healthy(current_health) {
             let _ = self
                 .raft_write_or_forward(ClientRequest::UpdateNodeStatus {
                     node_id,
@@ -2872,5 +2907,21 @@ mod tests {
         );
         // Unknown leader id (not in voter set) → None.
         assert_eq!(resolve_leader_addr(&voters, 0), None);
+    }
+
+    /// CO-3-8 — only the transient liveness states may be re-stamped to
+    /// Healthy by a heartbeat; Maintenance/Draining/Quarantined are sticky.
+    #[test]
+    fn co_3_8_heartbeat_may_mark_healthy_truth_table() {
+        assert!(heartbeat_may_mark_healthy(HealthStatus::Healthy));
+        assert!(heartbeat_may_mark_healthy(HealthStatus::Suspect));
+        assert!(heartbeat_may_mark_healthy(HealthStatus::Down));
+        // Disk-derived states stay heartbeat-clearable (recovery path).
+        assert!(heartbeat_may_mark_healthy(HealthStatus::Degraded));
+        assert!(heartbeat_may_mark_healthy(HealthStatus::Failed));
+        // Sticky operator/drain/quarantine states are NOT.
+        assert!(!heartbeat_may_mark_healthy(HealthStatus::Maintenance));
+        assert!(!heartbeat_may_mark_healthy(HealthStatus::Draining));
+        assert!(!heartbeat_may_mark_healthy(HealthStatus::Quarantined));
     }
 }
