@@ -4,6 +4,11 @@
 //! detects failures, commits the status transitions to Raft, and fires
 //! operator alerts.
 //!
+//! Bug CM — this module is also LEADER-GATED: only the current raft leader
+//! evaluates liveness + commits `UpdateNodeStatus` (see `monitor_status_changes`
+//! / `run`), mirroring the scheduler's Bug AC gate. A non-leader committing off
+//! its own bursty-stale replicated view flapped nodes on prod (CJ's residual).
+//!
 //! Bug CH — this module DETECTS only; it never schedules repair. Replica
 //! repair (node loss, disk loss, under-replication) is owned exclusively
 //! by the leader-gated scheduler tick: `live_replica_tier` stops counting
@@ -74,6 +79,37 @@ pub(crate) fn liveness_changes(
     out
 }
 
+/// Bug CM — the monitor must only evaluate + commit liveness on the raft
+/// LEADER. Returns no changes on a follower/learner.
+///
+/// Bug CJ (#29) moved liveness off the per-manager heartbeat map onto the
+/// replicated `last_seen_ms`, on the assumption that "every manager observes
+/// the same freshness". That holds only while a manager's applied log is
+/// caught up. A learner on a flaky cross-DC link (prod `dtfs-dc1-mgr01` /
+/// `dtfs-dc2-mgr01`) is bursty-stale between catch-up rounds — the leader's
+/// `AppendEntries` to it times out — so its 10 s monitor tick reads an OLD
+/// `last_seen`, judges the data node Down, and commits `UpdateNodeStatus`
+/// via `write_via_leader`. That fights the heartbeat handler's `healthy`
+/// write and the node FLAPS (prod v0.1.5, 2026-06-09; CJ's residual case).
+///
+/// The scheduler already avoids this with its Bug AC leader gate. Mirror it:
+/// only the leader, whose log is authoritative and who is always a fast-link
+/// voter (learners never lead), judges data-node liveness. Recovery stays the
+/// heartbeat handler's `UpdateNodeStatus(healthy)` (any manager, forwarded),
+/// so a node still un-marks promptly after a real Down.
+pub(crate) fn monitor_status_changes(
+    nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+    now_ms: u64,
+    suspect_ms: u64,
+    down_ms: u64,
+    is_leader: bool,
+) -> Vec<(u64, NodeStatus)> {
+    if !is_leader {
+        return Vec::new();
+    }
+    liveness_changes(nodes, now_ms, suspect_ms, down_ms)
+}
+
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -130,13 +166,23 @@ impl HealthMonitor {
         loop {
             interval.tick().await;
 
-            // Bug CJ — judge liveness from the replicated `last_seen_ms`
-            // so every manager agrees (see `liveness_changes`); the old
-            // per-manager heartbeat map made followers flap the node.
+            // Bug CM — leader gate (mirrors the scheduler's Bug AC gate). Only
+            // the current leader judges + commits liveness; a follower/learner
+            // reading its own bursty-stale replicated view would otherwise
+            // flap the node (CJ's residual case). openraft's metrics watch is a
+            // Receiver — borrow_watched gives a borrow without consuming it.
+            let is_leader = {
+                use openraft::async_runtime::watch::WatchReceiver;
+                let m = self.raft.metrics().borrow_watched().clone();
+                m.current_leader.map(|leader| leader == m.id).unwrap_or(false)
+            };
+
+            // Bug CJ — judge liveness from the replicated `last_seen_ms` (not a
+            // per-manager heartbeat map). Bug CM — only on the leader.
             let changes = {
                 let now_ms = now_millis();
                 let sm = self.state_data.read().await;
-                liveness_changes(&sm.nodes, now_ms, SUSPECT_MS, DOWN_MS)
+                monitor_status_changes(&sm.nodes, now_ms, SUSPECT_MS, DOWN_MS, is_leader)
             };
 
             for (node_id, status) in &changes {
@@ -173,9 +219,12 @@ impl HealthMonitor {
                 }
             }
 
-            // Check for SMART-like disk health warnings in heartbeat reports and
-            // schedule re-replication for any newly-failed disks.
-            self.check_disk_health().await;
+            // Check for SMART-like disk health warnings in heartbeat reports.
+            // Bug CM — leader-only too: avoids duplicate alerts + follower log
+            // noise (repair is the leader's scheduler, Bug CH).
+            if is_leader {
+                self.check_disk_health().await;
+            }
         }
     }
 
@@ -238,7 +287,7 @@ impl HealthMonitor {
 
 #[cfg(test)]
 mod bug_cj_liveness_tests {
-    use super::{liveness_changes, SUSPECT_MS, DOWN_MS};
+    use super::{liveness_changes, monitor_status_changes, SUSPECT_MS, DOWN_MS};
     use crate::cluster::NodeStatus;
     use dtfs_common::types::NodeRole;
 
@@ -313,5 +362,32 @@ mod bug_cj_liveness_tests {
     fn never_heartbeated_data_node_skipped() {
         let nodes = map(&[(1, node(NodeRole::Data, 0))]);
         assert!(liveness_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS).is_empty());
+    }
+
+    // Bug CM — the same stale data node yields a Down transition on the
+    // leader but NOTHING on a follower/learner. A non-leader must never
+    // commit a status change: its replicated view can be bursty-stale and
+    // its Down write fights the heartbeat's healthy write, flapping the node.
+    #[test]
+    fn follower_emits_no_status_changes_even_when_stale() {
+        let nodes = map(&[(1, node(NodeRole::Data, NOW - 60_000))]);
+        // Leader: detects Down.
+        assert_eq!(
+            monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, true),
+            vec![(1, NodeStatus::Down)]
+        );
+        // Follower/learner: silent (no flap).
+        assert!(monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, false).is_empty());
+    }
+
+    // A non-leader stays silent for a SUSPECT-range node too.
+    #[test]
+    fn follower_silent_for_suspect_range() {
+        let nodes = map(&[(1, node(NodeRole::Data, NOW - 20_000))]);
+        assert!(monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, false).is_empty());
+        assert_eq!(
+            monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, true),
+            vec![(1, NodeStatus::Suspect)]
+        );
     }
 }

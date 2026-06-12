@@ -106,6 +106,38 @@ impl TieringEngine {
             if let Err(e) = self.evaluate().await {
                 warn!("Tiering evaluation failed: {}", e);
             }
+
+            // Bug CN — bound the tiering in-memory state to the live working
+            // set. `access_stats` + `read_windows` are append-keyed by chunk_id
+            // and were only pruned for chunks still present; a deleted /
+            // re-uploaded chunk (content-addressed → new id) left its entries
+            // behind forever, so a folder-readahead promote load over many
+            // chunks grew them without bound. Sweep dead-chunk entries each
+            // tick. Cheap (one sm.files pass) and off the request hot path.
+            self.sweep_dead_chunk_state().await;
+        }
+    }
+
+    /// Bug CN — drop `access_stats` / `read_windows` entries for chunks no
+    /// longer in the namespace, bounding both maps to the live working set.
+    async fn sweep_dead_chunk_state(&self) {
+        let live: std::collections::HashSet<String> = {
+            let sm = self.state_data.read().await;
+            sm.files
+                .values()
+                .flat_map(|fm| fm.chunks.iter().map(|c| c.chunk_hash.clone()))
+                .collect()
+        };
+        let (stats_pruned, windows_pruned) = {
+            let mut stats = self.access_stats.write().await;
+            let mut windows = self.read_windows.write().await;
+            retain_live_chunk_state(&mut stats, &mut windows, &live)
+        };
+        if stats_pruned > 0 || windows_pruned > 0 {
+            debug!(
+                stats_pruned,
+                windows_pruned, "Bug CN: swept dead-chunk tiering state"
+            );
         }
     }
 
@@ -983,6 +1015,25 @@ pub(crate) fn prune_read_window(
     samples.retain(|s| s.ts_ms >= lower);
 }
 
+/// Bug CN — retain only the tiering state for chunks still present in the
+/// namespace. `access_stats` (keyed chunk_id) and `read_windows` (keyed
+/// `(chunk_id, dc)`) both grow per chunk read and were only pruned for LIVE
+/// chunks during the tick, so entries for deleted / re-uploaded chunks
+/// (content-addressed → new id) leaked forever. Sweeping both against the live
+/// chunk set bounds them to the working set. Pure (no I/O) so the bound is
+/// unit-tested directly. Returns `(access_stats_pruned, read_windows_pruned)`.
+fn retain_live_chunk_state(
+    access_stats: &mut HashMap<String, ChunkAccessProfile>,
+    read_windows: &mut HashMap<(String, String), Vec<ReadSample>>,
+    live: &std::collections::HashSet<String>,
+) -> (usize, usize) {
+    let a0 = access_stats.len();
+    access_stats.retain(|cid, _| live.contains(cid));
+    let w0 = read_windows.len();
+    read_windows.retain(|(cid, _), _| live.contains(cid));
+    (a0 - access_stats.len(), w0 - read_windows.len())
+}
+
 // ---------------------------------------------------------------------------
 // Bug AV (AV-2-2) — pure cache-promotion decision kernel
 // ---------------------------------------------------------------------------
@@ -1614,6 +1665,49 @@ mod bug_av_read_window_tests {
 
     fn s(ts_ms: u64, count: u32) -> ReadSample {
         ReadSample { ts_ms, count }
+    }
+
+    // Bug CN — `retain_live_chunk_state` drops `access_stats` + `read_windows`
+    // entries for chunks no longer in the namespace, bounding both maps to the
+    // live working set (prod 2026-06-10: dead-chunk tiering state leaked under
+    // folder-readahead promote load and helped wedge the leader).
+    #[test]
+    fn bug_cn_retain_live_chunk_state_drops_dead_chunks() {
+        use std::collections::{HashMap, HashSet};
+        fn prof(cid: &str) -> ChunkAccessProfile {
+            ChunkAccessProfile {
+                chunk_id: cid.to_string(),
+                file_path: String::new(),
+                total_reads_1h: 0,
+                total_reads_24h: 0,
+                reads_by_dc: HashMap::new(),
+                last_access_ms: 0,
+                current_temperature: DataTemperature::Warm,
+                current_tier: DiskTier::Warm,
+                current_node: 0,
+            }
+        }
+        fn reads(dc: &str, n: u32) -> HashMap<String, u32> {
+            let mut m = HashMap::new();
+            m.insert(dc.to_string(), n);
+            m
+        }
+        let mut stats: HashMap<String, ChunkAccessProfile> = HashMap::new();
+        stats.insert("live".into(), prof("live"));
+        stats.insert("dead".into(), prof("dead"));
+
+        let mut windows: HashMap<(String, String), Vec<ReadSample>> = HashMap::new();
+        apply_heartbeat_reads("live", &reads("dc-a", 2), 1_000, &mut windows);
+        apply_heartbeat_reads("dead", &reads("dc-a", 3), 1_000, &mut windows);
+
+        let live: HashSet<String> = ["live".to_string()].into_iter().collect();
+        let (sp, wp) = retain_live_chunk_state(&mut stats, &mut windows, &live);
+
+        assert_eq!(sp, 1, "dead access_stats entry pruned");
+        assert_eq!(wp, 1, "dead read_windows entry pruned");
+        assert!(stats.contains_key("live") && !stats.contains_key("dead"));
+        assert!(windows.contains_key(&("live".into(), "dc-a".into())));
+        assert!(!windows.contains_key(&("dead".into(), "dc-a".into())));
     }
 
     /// AV-2-1 test 1 — samples inside the window contribute.

@@ -55,6 +55,18 @@ const MIGRATION_COPY_CONCURRENCY: usize = 6;
 /// the worst case.
 const MAX_ADVANCE_ROUNDS: usize = 8;
 
+/// Bug CN — hard wall-clock cap on a single ReplicateChunk / VerifyChunk RPC
+/// from the scheduler to a data node. WITHOUT this the orchestrating RPC could
+/// block forever when a source/target data node stalls mid-stream (cross-DC
+/// flaky link, swap-thrashing node): `buffer_unordered` then never drains, the
+/// advance round never finishes, the tick never reaches `save`, and the whole
+/// scheduler loop hangs after one leader-onset pass (prod 2026-06-10 — the
+/// 2439-task backlog wedged the scheduler this way). On timeout the copy is
+/// treated as a failed attempt and retried next tick, so the loop keeps
+/// breathing. Generous (a 4 MB chunk over the ≤40 Mbps LELI link is ~1 s; 60 s
+/// only trips on a genuine stall).
+const MIGRATION_RPC_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// A replication task tracked by the scheduler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationTask {
@@ -220,6 +232,24 @@ impl TaskScheduler {
         }
 
         let mut migration_state = self.load_migration_state().await;
+
+        // Bug CN — prune terminal tasks FIRST and persist immediately, before
+        // the under-replication scan + the (timeout-bounded but possibly slow)
+        // advance. A flood that leaves a large terminal backlog (prod
+        // 2026-06-10: 2439 Failed tasks) otherwise keeps itself alive: the old
+        // prune ran only at the end of `advance_tasks`, so if advance was slow
+        // the save never happened and every leader reloaded the same poison.
+        // Persisting the prune up front guarantees the backlog drains in one
+        // tick even if the rest of the tick stalls.
+        let pruned = prune_terminal_tasks(&mut migration_state, now_millis());
+        if pruned > 0 {
+            info!(
+                pruned,
+                remaining = migration_state.tasks.len(),
+                "Bug AE/CN: pruned terminal migration tasks (pre-tick)"
+            );
+            self.save_migration_state(&migration_state).await;
+        }
 
         // 1. Check for under-replicated chunks and schedule new tasks.
         self.check_under_replicated(&mut migration_state).await;
@@ -729,33 +759,11 @@ impl TaskScheduler {
         // U3 — drive the task state machine in rounds so a chunk can go
         // Pending -> Copying -> Verifying -> Completing -> Done within ONE
         // tick (pre-U3 each round was the whole 30s tick), and fan the
-        // Copying `replicate_chunk` calls out bounded-parallel. The generic
-        // orchestrator is unit-testable against a mock `MigrationOps`
-        // (advance_round_tests); this method just wires the live ops + the
-        // terminal-task prune.
+        // Copying `replicate_chunk` calls out bounded-parallel. Each copy /
+        // verify RPC is wall-clock bounded (Bug CN `MIGRATION_RPC_TIMEOUT`) so
+        // a stalled data node can't hang a round (and the loop). The terminal-
+        // task prune runs at the START of `tick` (Bug CN), not here.
         advance_migration_tasks(self, state, now_ms).await;
-
-        // Prune completed tasks older than 5 minutes.
-        //
-        // Bug AE — also prune Failed tasks older than 30 minutes. Before
-        // this fix, Failed tasks lived in migration_state_json forever
-        // (only Done was retained==false). After a disk wipe or other
-        // mass-orphan event, 100+ Failed tasks accumulated and bloated
-        // the Raft snapshot + cluttered the /api/v1/migrations UI. 30
-        // min is long enough for an operator alerted on
-        // `migration.failed` to inspect the task before it disappears
-        // and short enough to clear historical garbage within one snapshot
-        // interval (1 h default).
-        let before = state.tasks.len();
-        state.tasks.retain(|_, t| should_retain_task(t.status, t.updated_at_ms, now_ms));
-        let pruned = before.saturating_sub(state.tasks.len());
-        if pruned > 0 {
-            info!(
-                pruned,
-                remaining = state.tasks.len(),
-                "Bug AE: pruned terminal migration tasks"
-            );
-        }
     }
 
 
@@ -850,18 +858,31 @@ impl TaskScheduler {
         // `http://http://...:9500` — tonic rejected this with a generic
         // "transport error" that silenced every migration in Plexmedia.
         let endpoint = normalize_endpoint(source_addr);
-        let mut client = DataServiceClient::connect(endpoint).await
-            .map_err(|e| anyhow::anyhow!("connect to source {}: {}", source_addr, e))?;
-
-        let resp = client
-            .replicate_chunk(ReplicateChunkRequest {
-                chunk_id: chunk_id.to_string(),
-                target_address: target_addr.to_string(),
-                target_tier: target_tier.to_string(),
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("ReplicateChunk RPC: {}", e))?
-            .into_inner();
+        // Bug CN — hard timeout the connect + streaming RPC so a stalled
+        // source/target node can't hang the advance round (and the whole
+        // scheduler loop) indefinitely.
+        let resp = tokio::time::timeout(MIGRATION_RPC_TIMEOUT, async {
+            let mut client = DataServiceClient::connect(endpoint)
+                .await
+                .map_err(|e| anyhow::anyhow!("connect to source {}: {}", source_addr, e))?;
+            client
+                .replicate_chunk(ReplicateChunkRequest {
+                    chunk_id: chunk_id.to_string(),
+                    target_address: target_addr.to_string(),
+                    target_tier: target_tier.to_string(),
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("ReplicateChunk RPC: {}", e))
+                .map(|r| r.into_inner())
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "ReplicateChunk to {} timed out after {:?}",
+                target_addr,
+                MIGRATION_RPC_TIMEOUT
+            )
+        })??;
 
         if resp.success {
             Ok(())
@@ -876,16 +897,27 @@ impl TaskScheduler {
         // Bug W (part 2) — same fix as `replicate_chunk`: NodeInfo.grpc_addr
         // already carries the scheme. Don't double-prefix.
         let endpoint = normalize_endpoint(target_addr);
-        let mut client = DataServiceClient::connect(endpoint).await
-            .map_err(|e| anyhow::anyhow!("connect to target {}: {}", target_addr, e))?;
-
-        let resp = client
-            .verify_chunk(VerifyChunkRequest {
-                chunk_id: chunk_id.to_string(),
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("VerifyChunk RPC: {}", e))?
-            .into_inner();
+        // Bug CN — timeout, same rationale as `replicate_chunk`.
+        let resp = tokio::time::timeout(MIGRATION_RPC_TIMEOUT, async {
+            let mut client = DataServiceClient::connect(endpoint)
+                .await
+                .map_err(|e| anyhow::anyhow!("connect to target {}: {}", target_addr, e))?;
+            client
+                .verify_chunk(VerifyChunkRequest {
+                    chunk_id: chunk_id.to_string(),
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("VerifyChunk RPC: {}", e))
+                .map(|r| r.into_inner())
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "VerifyChunk to {} timed out after {:?}",
+                target_addr,
+                MIGRATION_RPC_TIMEOUT
+            )
+        })??;
 
         if resp.valid {
             Ok(true)
@@ -3065,6 +3097,19 @@ pub(crate) fn should_retain_task(
     }
 }
 
+/// Bug CN — drop terminal (Done/Failed) tasks past their retention window,
+/// returning the count pruned. Pure over the task map so it is unit-testable
+/// and can run at the START of `advance_tasks` (before the advance round), so a
+/// large terminal backlog left by a flood cannot starve the very GC that
+/// exists to clear it.
+fn prune_terminal_tasks(state: &mut MigrationState, now_ms: u64) -> usize {
+    let before = state.tasks.len();
+    state
+        .tasks
+        .retain(|_, t| should_retain_task(t.status, t.updated_at_ms, now_ms));
+    before.saturating_sub(state.tasks.len())
+}
+
 /// Bug AF — pure predicate: does this RPC error string indicate the source
 /// data node specifically said "Chunk not found"? When true, the scheduler
 /// fast-fails the migration task (bypasses MAX_MIGRATION_ATTEMPTS) so we
@@ -4845,6 +4890,36 @@ mod advance_round_tests {
         }
         s.next_task_id = n as u64;
         s
+    }
+
+    // Bug CN — a large terminal (Failed) backlog must be GC'd regardless of the
+    // advance round. Pre-CN the prune ran AFTER advance_migration_tasks, so a
+    // flood backlog starved its own GC (prod 2026-06-10: 2439 Failed cache-
+    // promote + warm-backfill tasks never aged out, bloating migration_state).
+    // prune_terminal_tasks now runs FIRST; this asserts it clears the stale
+    // backlog while keeping fresh-Failed (for operator inspection) + actives.
+    #[test]
+    fn prune_terminal_clears_stale_failed_backlog() {
+        let now = 60 * 60 * 1000; // 1h
+        let mut s = MigrationState::default();
+        for i in 0..100 {
+            let mut t = pending_task(i);
+            t.status = MigrationStatus::Failed;
+            t.updated_at_ms = now - 31 * 60 * 1000; // past 30min retention
+            s.tasks.insert(t.task_id.clone(), t);
+        }
+        for i in 100..105 {
+            let mut t = pending_task(i);
+            t.status = MigrationStatus::Failed;
+            t.updated_at_ms = now - 5 * 60 * 1000; // fresh — keep
+            s.tasks.insert(t.task_id.clone(), t);
+        }
+        for i in 105..108 {
+            s.tasks.insert(format!("repl-{i}"), pending_task(i)); // Pending — keep
+        }
+        let pruned = prune_terminal_tasks(&mut s, now);
+        assert_eq!(pruned, 100, "stale Failed backlog must be pruned");
+        assert_eq!(s.tasks.len(), 8, "5 fresh-Failed + 3 Pending remain");
     }
 
     // U3 core: every Pending task reaches Done within ONE advance_migration_tasks
