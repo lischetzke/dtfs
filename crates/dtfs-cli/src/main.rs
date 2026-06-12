@@ -68,6 +68,7 @@ enum Commands {
     },
 
     /// Maintenance mode operations
+    #[command(group(clap::ArgGroup::new("maintenance_mode").required(true).args(["enable", "disable"])))]
     Maintenance {
         /// Node ID
         node_id: String,
@@ -1280,7 +1281,18 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        // Take whole chars whose cumulative byte length fits within the
+        // budget left for the "..." suffix, so we never slice mid-char
+        // (would panic on multi-byte UTF-8) and stay within `max` bytes.
+        let budget = max.saturating_sub(3);
+        let mut prefix = String::new();
+        for c in s.chars() {
+            if prefix.len() + c.len_utf8() > budget {
+                break;
+            }
+            prefix.push(c);
+        }
+        format!("{prefix}...")
     }
 }
 
