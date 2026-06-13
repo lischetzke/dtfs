@@ -456,7 +456,10 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   hung the `buffer_unordered` copy round and the whole scheduler loop after
   one leader-onset pass. So the pre-tick prune may add a SECOND
   `save_migration_state` Raft write when it drops tasks; steady-state is still
-  one. The orphan_scrub (`orphan_scrub_tick`) reaps per-node in two cases,
+  one. **CO-3-5:** `tick` and `schedule_replication` both load-modify-save the
+  migration state; both hold the `migration_state_lock` (`tokio::Mutex`)
+  across the load..save so a concurrent schedule during a tick can't clobber a
+  task or regress `next_task_id`. The orphan_scrub (`orphan_scrub_tick`) reaps per-node in two cases,
   both gated by the Bug CB durable-mtime grace (`orphan_reap_due`): a HASH
   orphan (no file references the hash; `chunk_is_orphan`) AND **CO-3-2** a
   DE-LOCATED chunk (on a node's disk but the SM records no location entry

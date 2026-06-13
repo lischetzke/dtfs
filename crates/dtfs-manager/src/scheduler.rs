@@ -117,6 +117,14 @@ pub struct TaskScheduler {
     /// CF-6 — resolved `[tls]` context; data-node RPCs speak mTLS when
     /// enabled, plaintext otherwise.
     tls: dtfs_common::tls::TlsContext,
+    /// CO-3-5 — serialises every migration-state read-modify-write so a
+    /// `schedule_replication` call landing concurrently with a `tick`
+    /// cannot clobber a task or regress `next_task_id`. Both load the
+    /// state from Raft, mutate it in memory, and save it back; without
+    /// mutual exclusion the second save overwrites the first writer's
+    /// mutations (lost task / `next_task_id` regression). Held only across
+    /// the load..save critical section, never across an unrelated await.
+    migration_state_lock: tokio::sync::Mutex<()>,
 }
 
 impl TaskScheduler {
@@ -140,6 +148,7 @@ impl TaskScheduler {
             done_task_retention_ms: done_task_retention_secs.saturating_mul(1000),
             failed_task_retention_ms: failed_task_retention_secs.saturating_mul(1000),
             tls,
+            migration_state_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -246,6 +255,11 @@ impl TaskScheduler {
             return Ok(());
         }
 
+        // CO-3-5 — hold the migration-state lock across the entire
+        // load..save lifecycle of this tick so a concurrent
+        // `schedule_replication` cannot interleave its own
+        // load-modify-save and clobber a task / regress `next_task_id`.
+        let _ms_guard = self.migration_state_lock.lock().await;
         let mut migration_state = self.load_migration_state().await;
 
         // Bug CN — prune terminal tasks FIRST and persist immediately, before
@@ -308,6 +322,10 @@ impl TaskScheduler {
         target_node: u64,
         tier: DiskTier,
     ) {
+        // CO-3-5 — serialise with the tick's load-modify-save (and any
+        // other concurrent schedule) so neither writer clobbers the
+        // other's tasks or regresses `next_task_id`.
+        let _ms_guard = self.migration_state_lock.lock().await;
         let mut state = self.load_migration_state().await;
 
         // Avoid duplicate tasks for the same chunk + target.
@@ -5676,5 +5694,92 @@ mod advance_round_tests {
             1,
             "exhausting retries must fire exactly one MigrationFailed alert"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CO-3-5 — migration-state load-modify-save mutual exclusion.
+//
+// `schedule_replication` and `tick` both load the migration state, mutate it
+// in memory, then save it back. The live code stores the state in Raft and
+// needs a leader handle, so the production methods can't be unit-driven here;
+// instead this models the exact load->modify->save critical section against a
+// shared in-memory `MigrationState` and proves that serialising it under the
+// scheduler's `tokio::Mutex` (the field added by this fix) prevents the
+// lost-update race — a concurrent schedule during a tick would otherwise
+// clobber a task and regress `next_task_id`.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod co_3_5_migration_state_race_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, RwLock};
+
+    /// Run two concurrent load-modify-save "writers" against a shared
+    /// `MigrationState`, each inserting one new task and bumping
+    /// `next_task_id`, all under one shared mutex (the production pattern).
+    /// Both tasks must survive and `next_task_id` must advance by 2.
+    #[tokio::test]
+    async fn co_3_5_concurrent_rmw_under_mutex_keeps_both_tasks() {
+        // The shared "Raft" backing store + the serialising lock.
+        let store: Arc<RwLock<MigrationState>> =
+            Arc::new(RwLock::new(MigrationState::default()));
+        let lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+        // One writer mirrors schedule_replication's critical section: take
+        // the lock, load, modify (new task + next_task_id++), save. The
+        // `await` points inside model the real async load/save.
+        let writer = |store: Arc<RwLock<MigrationState>>,
+                      lock: Arc<Mutex<()>>,
+                      chunk: &'static str| async move {
+            let _guard = lock.lock().await;
+            // load
+            let mut state = store.read().await.clone();
+            // a yield between load and save widens the race window so an
+            // unguarded version would reliably lose an update.
+            tokio::task::yield_now().await;
+            // modify
+            let id = format!("repl-{}", state.next_task_id);
+            state.next_task_id += 1;
+            state.tasks.insert(
+                id.clone(),
+                ReplicationTask {
+                    task_id: id,
+                    chunk_id: chunk.to_string(),
+                    source_node: 1,
+                    target_node: 2,
+                    tier: DiskTier::Warm,
+                    status: MigrationStatus::Pending,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    attempts: 0,
+                    last_error: None,
+                },
+            );
+            // save
+            *store.write().await = state;
+        };
+
+        let a = tokio::spawn(writer(store.clone(), lock.clone(), "chunk-a"));
+        let b = tokio::spawn(writer(store.clone(), lock.clone(), "chunk-b"));
+        a.await.unwrap();
+        b.await.unwrap();
+
+        let final_state = store.read().await;
+        assert_eq!(
+            final_state.tasks.len(),
+            2,
+            "both concurrent schedules must survive (no lost update)"
+        );
+        assert_eq!(
+            final_state.next_task_id, 2,
+            "next_task_id must advance monotonically by 2, never regress"
+        );
+        let chunks: std::collections::HashSet<&str> = final_state
+            .tasks
+            .values()
+            .map(|t| t.chunk_id.as_str())
+            .collect();
+        assert!(chunks.contains("chunk-a") && chunks.contains("chunk-b"));
     }
 }
