@@ -161,6 +161,9 @@ pub struct HealthMonitor {
     alerts: Option<Arc<crate::alerts::AlertDispatcher>>,
     /// CF-6 — resolved `[tls]` context for leader-forwarded commits.
     tls: dtfs_common::tls::TlsContext,
+    /// CO-2-2 — cluster shared secret stamped onto leader-forwarded
+    /// status commits so the leader authenticates them.
+    shared_secret: String,
 }
 
 impl HealthMonitor {
@@ -170,6 +173,7 @@ impl HealthMonitor {
         raft: Arc<DtfsRaft>,
         voters: Vec<dtfs_common::config::InitialVoter>,
         tls: dtfs_common::tls::TlsContext,
+        shared_secret: String,
     ) -> Self {
         Self {
             check_interval,
@@ -178,6 +182,7 @@ impl HealthMonitor {
             voters,
             alerts: None,
             tls,
+            shared_secret,
         }
     }
 
@@ -276,7 +281,15 @@ impl HealthMonitor {
             node_id,
             status: status.to_string(),
         };
-        match crate::metadata::write_via_leader(&self.raft, &self.voters, &self.tls, req).await {
+        match crate::metadata::write_via_leader(
+            &self.raft,
+            &self.voters,
+            &self.tls,
+            &self.shared_secret,
+            req,
+        )
+        .await
+        {
             Ok(()) => info!("Committed UpdateNodeStatus({}, {}) to Raft", node_id, status),
             Err(e) => debug!(
                 "Could not write UpdateNodeStatus to Raft (no leader reachable?): {}",

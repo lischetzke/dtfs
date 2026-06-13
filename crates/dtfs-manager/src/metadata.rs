@@ -260,7 +260,11 @@ impl MetadataService {
         let body = serde_json::to_vec(&req)
             .map_err(|e| Status::internal(format!("serialize ClientRequest: {e}")))?;
         let resp = client
-            .forward_client_write(ForwardWriteRequest { client_request_json: body })
+            .forward_client_write(ForwardWriteRequest {
+                client_request_json: body,
+                // CO-2-2 — authenticate this forward to the leader.
+                shared_secret: self.config.cluster.shared_secret.clone(),
+            })
             .await
             .map_err(|e| {
                 // Drop the cached client on transport error so the next
@@ -375,6 +379,22 @@ pub(crate) fn is_forward_to_leader_err(msg: &str) -> bool {
     msg.contains("forward request to") || msg.contains("ForwardToLeader")
 }
 
+/// CO-2-2 — does a forwarded write carry an acceptable shared secret?
+///
+/// `configured` is the leader's `config.cluster.shared_secret`. When it is
+/// empty the cluster runs without a shared secret (back-compat for existing
+/// plaintext clusters) and ANY forward is accepted. Otherwise the presented
+/// secret must match in CONSTANT TIME — never `==`, which short-circuits on
+/// the first mismatching byte and leaks the matching-prefix length via
+/// timing. Reuses the audited `dtfs_common::crypto::constant_time_eq` (also
+/// used for the join-handshake HMAC) rather than a second hand-rolled copy.
+fn forward_secret_ok(configured: &str, presented: &str) -> bool {
+    if configured.is_empty() {
+        return true;
+    }
+    dtfs_common::crypto::constant_time_eq(configured.as_bytes(), presented.as_bytes())
+}
+
 /// Bug CH — commit a `ClientRequest` from ANY manager: local
 /// `client_write` when this node is the leader, `ForwardClientWrite`
 /// proxy to the leader otherwise.
@@ -392,6 +412,9 @@ pub(crate) async fn write_via_leader(
     raft: &DtfsRaft,
     voters: &[dtfs_common::config::InitialVoter],
     tls: &dtfs_common::tls::TlsContext,
+    // CO-2-2 — cluster shared secret stamped onto the forward so the
+    // leader authenticates it (see `forward_secret_ok`).
+    shared_secret: &str,
     req: ClientRequest,
 ) -> Result<(), String> {
     use openraft::async_runtime::watch::WatchReceiver;
@@ -424,11 +447,33 @@ pub(crate) async fn write_via_leader(
             client
                 .forward_client_write(ForwardWriteRequest {
                     client_request_json: body,
+                    shared_secret: shared_secret.to_string(),
                 })
                 .await
                 .map_err(|e| format!("forward to leader {leader_addr}: {e}"))?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod co_2_2_forward_auth_tests {
+    use super::forward_secret_ok;
+
+    #[test]
+    fn forward_secret_back_compat_empty_configured_accepts_anything() {
+        // Plaintext cluster: leader has no secret configured -> accept all,
+        // regardless of what (if anything) the forwarder presents.
+        assert!(forward_secret_ok("", ""));
+        assert!(forward_secret_ok("", "anything"));
+    }
+
+    #[test]
+    fn forward_secret_requires_match_when_configured() {
+        assert!(forward_secret_ok("s3cr3t", "s3cr3t"));
+        assert!(!forward_secret_ok("s3cr3t", "wrong"));
+        // Configured-but-missing (empty presented) is rejected.
+        assert!(!forward_secret_ok("s3cr3t", ""));
     }
 }
 
@@ -1204,6 +1249,18 @@ impl ManagerService for MetadataService {
         request: Request<ForwardWriteRequest>,
     ) -> Result<Response<ForwardWriteResponse>, Status> {
         let body = request.into_inner();
+        // CO-2-2 — authenticate the forwarding manager BEFORE applying any
+        // write. Without this a follower (which accepts forwards from any
+        // peer, including unauthenticated client writes like DeleteFile)
+        // could be driven by anyone who can reach its gRPC port. The check
+        // is skipped only when this leader has no configured shared secret
+        // (back-compat for plaintext clusters); the compare is constant-time.
+        if !forward_secret_ok(&self.config.cluster.shared_secret, &body.shared_secret) {
+            tracing::warn!("ForwardClientWrite rejected: shared-secret mismatch");
+            return Err(Status::permission_denied(
+                "forwarded write shared-secret mismatch",
+            ));
+        }
         let req: ClientRequest = serde_json::from_slice(&body.client_request_json)
             .map_err(|e| Status::invalid_argument(format!("bad ClientRequest json: {e}")))?;
         // Per-chunk read reports are NOT Raft state — they feed this (leader's)
