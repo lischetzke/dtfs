@@ -72,6 +72,14 @@ pub struct ChunkInfo {
     /// older manager leaves this empty (or shorter); missing entries are
     /// treated as unknown tier, falling back to pure distance.
     pub node_tiers: Vec<String>,
+    /// CO-3-10 read-locality: per-replica topology Location, positionally
+    /// aligned 1:1 with `node_addresses`. Comes from the manager's
+    /// `ChunkLocationInfo.node_locations`. Loaded into `known_locations` so
+    /// `select_read_replica` can rank replicas by physical distance +
+    /// `read_location_priority`. An older manager leaves this empty (or
+    /// shorter); a missing/all-empty entry is treated as an unknown location
+    /// (no insert -> arbitrary/pure-distance order).
+    pub node_locations: Vec<Location>,
 }
 
 impl ChunkInfo {
@@ -87,6 +95,32 @@ impl ChunkInfo {
                 (addr.clone(), tier)
             })
             .collect()
+    }
+}
+
+/// CO-3-10: a Location is "known" only if at least one field is non-empty.
+/// An all-empty Location is the manager's placeholder for an unknown replica
+/// node (or an older manager that sent nothing), so it must NOT be learned
+/// into `known_locations` — leaving it absent keeps the pre-CO-3-10
+/// arbitrary/pure-distance fallback for that replica.
+fn location_is_known(loc: &Location) -> bool {
+    !(loc.region.is_empty()
+        && loc.datacenter.is_empty()
+        && loc.rack.is_empty()
+        && loc.host.is_empty())
+}
+
+/// CO-3-10: learn each replica's Location (positionally aligned with
+/// `addrs`) into `known_locations`, keyed by node address. Skips any
+/// all-empty Location (unknown node / older manager) so the read path keeps
+/// its arbitrary/pure-distance fallback for that replica. `addrs` and `locs`
+/// may differ in length (older manager sends fewer/zero locations); `zip`
+/// stops at the shorter, leaving the surplus replicas unknown.
+fn learn_locations(known: &DashMap<String, Location>, addrs: &[String], locs: &[Location]) {
+    for (addr, loc) in addrs.iter().zip(locs.iter()) {
+        if location_is_known(loc) {
+            known.insert(addr.clone(), loc.clone());
+        }
     }
 }
 
@@ -1413,14 +1447,30 @@ impl DtfsFilesystem {
             .await
             .with_context(|| format!("get_file_locations failed for {path}"))?;
 
-        let chunks = response
+        let chunks: Vec<ChunkInfo> = response
             .chunks
             .into_iter()
-            .map(|c| ChunkInfo {
-                chunk_id: c.chunk_id,
-                size: c.size,
-                node_addresses: c.node_addresses,
-                node_tiers: c.node_tiers,
+            .map(|c| {
+                // CO-3-10: convert the manager's per-replica proto Locations
+                // (positionally aligned with node_addresses) into topology
+                // Locations and learn them into known_locations so read
+                // selection can rank by distance + read_location_priority.
+                // An older manager sends no node_locations (or fewer than
+                // node_addresses); a missing/all-empty entry is skipped, so
+                // that replica's location stays unknown (pre-CO-3-10 order).
+                let node_locations: Vec<Location> = c
+                    .node_locations
+                    .into_iter()
+                    .map(|l| Location::new(&l.region, &l.datacenter, &l.rack, &l.host))
+                    .collect();
+                learn_locations(&self.known_locations, &c.node_addresses, &node_locations);
+                ChunkInfo {
+                    chunk_id: c.chunk_id,
+                    size: c.size,
+                    node_addresses: c.node_addresses,
+                    node_tiers: c.node_tiers,
+                    node_locations,
+                }
             })
             .collect();
 
@@ -2033,6 +2083,114 @@ mod tests {
             effective_read_len(u32::MAX as u64, 0, u32::MAX),
             u32::MAX,
             "u32::MAX bytes available is exact, not a wrap"
+        );
+    }
+
+    // CO-3-10 helpers: mirror exactly how `read_candidates` builds the
+    // per-chunk `known_locations` HashMap from the populated DashMap, then
+    // drive `select_read_replica` through it. This is the populate-then-select
+    // path the bug killed (the map was never populated).
+    fn known_for(map: &DashMap<String, Location>, addrs: &[String]) -> HashMap<String, Location> {
+        addrs
+            .iter()
+            .filter_map(|a| map.get(a).map(|l| (a.clone(), l.clone())))
+            .collect()
+    }
+
+    /// CO-3-10: with the map populated from the manager's per-replica
+    /// locations, a NON-first replica that matches `read_location_priority`
+    /// is selected (operator intent beats list order). Before the fix the
+    /// map was empty, so every replica looked CrossRegion and the first one
+    /// won regardless of priority.
+    #[test]
+    fn co_3_10_populated_locations_select_priority_replica() {
+        let known: DashMap<String, Location> = DashMap::new();
+        let addrs = vec!["node-a:9500".to_string(), "node-b:9500".to_string()];
+        // Manager-sent locations, positionally aligned: node-a is far
+        // (us/east), node-b is in the operator-preferred datacenter.
+        let locs = vec![
+            Location::new("us", "east", "rack-1", "host-a"),
+            Location::new("eu", "fra", "rack-2", "host-b"),
+        ];
+        learn_locations(&known, &addrs, &locs);
+        assert_eq!(known.len(), 2, "both replica locations must be learned");
+
+        // Client far from both; only the priority list distinguishes them.
+        let client = Location::new("us", "west", "rack-9", "host-z");
+        let replicas: Vec<(String, String)> =
+            addrs.iter().map(|a| (a.clone(), String::new())).collect();
+        let priority = vec!["fra".to_string()];
+        let picked = dtfs_client::location::select_read_replica(
+            Some(&client),
+            &replicas,
+            &known_for(&known, &addrs),
+            &priority,
+        );
+        assert_eq!(
+            picked.as_deref(),
+            Some("node-b:9500"),
+            "the non-first replica matching read_location_priority must win"
+        );
+    }
+
+    /// CO-3-10: with the map populated, a strictly-nearer NON-first replica
+    /// wins on pure distance (no priority configured).
+    #[test]
+    fn co_3_10_populated_locations_select_nearer_replica() {
+        let known: DashMap<String, Location> = DashMap::new();
+        let addrs = vec!["far:9500".to_string(), "near:9500".to_string()];
+        let locs = vec![
+            Location::new("us", "east", "rack-1", "host-a"),
+            Location::new("eu", "fra", "rack-2", "host-b"),
+        ];
+        learn_locations(&known, &addrs, &locs);
+        let client = Location::new("eu", "fra", "rack-2", "host-c"); // same rack as "near"
+        let replicas: Vec<(String, String)> =
+            addrs.iter().map(|a| (a.clone(), String::new())).collect();
+        let picked = dtfs_client::location::select_read_replica(
+            Some(&client),
+            &replicas,
+            &known_for(&known, &addrs),
+            &[],
+        );
+        assert_eq!(
+            picked.as_deref(),
+            Some("near:9500"),
+            "the strictly-nearer non-first replica must win on distance"
+        );
+    }
+
+    /// CO-3-10: an older manager sends no node_locations (or all-empty
+    /// placeholders). `learn_locations` must insert nothing, and selection
+    /// must fall back to the first replica without panicking.
+    #[test]
+    fn co_3_10_older_manager_empty_locations_falls_back() {
+        let known: DashMap<String, Location> = DashMap::new();
+        let addrs = vec!["node-a:9500".to_string(), "node-b:9500".to_string()];
+
+        // Case 1: no locations at all (shorter vec).
+        learn_locations(&known, &addrs, &[]);
+        assert_eq!(known.len(), 0, "no locations -> nothing learned");
+
+        // Case 2: all-empty placeholders (manager has the addr but no
+        // registered Location for the node).
+        let empties = vec![Location::new("", "", "", ""), Location::new("", "", "", "")];
+        learn_locations(&known, &addrs, &empties);
+        assert_eq!(known.len(), 0, "all-empty locations must not be learned");
+
+        let client = Location::new("eu", "fra", "rack-1", "host-z");
+        let replicas: Vec<(String, String)> =
+            addrs.iter().map(|a| (a.clone(), String::new())).collect();
+        let picked = dtfs_client::location::select_read_replica(
+            Some(&client),
+            &replicas,
+            &known_for(&known, &addrs),
+            &["fra".to_string()],
+        );
+        assert_eq!(
+            picked.as_deref(),
+            Some("node-a:9500"),
+            "empty known_locations must fall back to the first replica"
         );
     }
 }

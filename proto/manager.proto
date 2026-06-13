@@ -293,6 +293,16 @@ message ChunkLocationInfo {
   // HDD). Additive/back-compatible: an older manager leaves this empty, in
   // which case the client falls back to pure distance.
   repeated string node_tiers = 4;
+  // CO-3-10 read-locality: per-replica topology Location, positionally
+  // aligned 1:1 with node_addresses, drawn from each replica node's
+  // registered Location in the manager node registry. The FUSE client
+  // loads these into its known_locations map so select_read_replica can
+  // rank replicas by physical distance + read_location_priority operator
+  // intent. Additive/back-compatible: an older manager leaves this empty
+  // (or shorter), in which case the missing replica's location is unknown
+  // and the client falls back to arbitrary/pure-distance order, exactly
+  // like node_tiers handles an older manager.
+  repeated dtfs.common.Location node_locations = 5;
 }
 
 message GetFileLocationsResponse {

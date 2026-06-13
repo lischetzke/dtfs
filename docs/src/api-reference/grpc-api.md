@@ -63,6 +63,8 @@ Each `ChunkLocationInfo` contains:
 | `chunk_id` | string | Hex-encoded chunk ID |
 | `size` | uint64 | Chunk size in bytes |
 | `node_addresses` | repeated string | Addresses of all nodes holding replicas |
+| `node_tiers` | repeated string | Per-replica storage tier (lowercase), positional with `node_addresses`; empty from an older manager |
+| `node_locations` | repeated Location | Per-replica topology Location, positional with `node_addresses`; the FUSE client learns these for distance/priority read routing. Empty/all-empty from an older manager or unknown node |
 
 ### DeleteFile
 
