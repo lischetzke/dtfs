@@ -187,16 +187,29 @@ independent replica classes:
   flush that would strand the mandatory copy → `cache.flush_refused`
   audit + `AnchorViolated` alert. The dispatcher records
   `cache.flush_replica` per drop and `cache.flush_complete` per call.
-- Every promote/demote must check `would_violate_anchor` against the
-  destination state. The AV-2-4 planner filters unsafe demotions; the
-  apply path (`RemoveChunkLocation` with `enforce_anchor`) re-checks as
-  defence-in-depth.
+- Every promote/demote must check the anchor against the destination
+  state. The legacy-temperature path checks `would_violate_anchor`;
+  the AV idle-demote planner checks `tiering::demote_preserves_anchor`
+  (CO-1-2 — refuses a cache-replica demote unless ANOTHER placement still
+  satisfies `effective_anchor`, recording it in `TickPlan.anchor_protected`
+  → the dispatcher emits a `tier.anchor_protected` audit + `AnchorViolated`
+  alert). The mandatory-tier survival check alone is NOT enough: a chunk's
+  ONLY anchor-DC replica can be a cache copy while the mandatory copy lives
+  in another DC. The apply path (`RemoveChunkLocation` with
+  `enforce_anchor`, threaded from the volume's `effective_anchor`)
+  re-checks as defence-in-depth.
 - Engine-driven demote ≠ operator flush: idle-decay demote clears the
   cooldown (next read re-promotes); operator flush sets a future cooldown
   (no immediate re-promote). Route demote-like paths through
   `should_clear_cooldown_on_demote(cooldown_until_ms, now_ms)` (past/
   absent → clear; future → preserve), never an unconditional
   `SetChunkCooldown(0)`.
+- A volume with an active AV cache policy (`cache_replicas`,
+  `tiering::volume_has_active_cache_policy`) is driven SOLELY by the AV
+  cache tick; the legacy temperature-profile demote/promote SKIPS its
+  chunks (CO-4-6). Otherwise, after an operator flush sets a future
+  cooldown, the legacy promote would re-create the warm replica during the
+  cooldown window, defeating the flush.
 - A mandatory replica MAY co-locate with a cache replica of the same
   chunk on one node (different tier). Replica presence is keyed by
   `(node_id, disk_id)` (≡ `(node, tier)`), never `node_id` alone (Bug BH,

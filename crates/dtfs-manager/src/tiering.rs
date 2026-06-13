@@ -39,6 +39,36 @@ pub struct ChunkAccessProfile {
     pub current_node: u64,
 }
 
+/// CO-4-4 — one legacy-temperature migration decision, collected under
+/// the `access_stats` lock and dispatched after the lock is dropped so the
+/// evaluate loop never holds the lock across a dispatch/query await.
+struct LegacyMigration {
+    chunk_id: String,
+    file_path: String,
+    current_node: u64,
+    current_tier: DiskTier,
+    target_tier: DiskTier,
+    reads_by_dc: HashMap<String, u32>,
+    /// true = demote (toward colder tier), false = promote.
+    demote: bool,
+    old_temp: DataTemperature,
+    new_temp: DataTemperature,
+}
+
+/// CO-4-6 — does this volume run an active AV cache policy? When true the
+/// volume's chunks are driven SOLELY by the AV cache tick; the legacy
+/// temperature-profile demote/promote SKIPS them so an operator flush
+/// (future cooldown) is not undone by a legacy promote re-creating the
+/// warm replica. Mirrors the `build_av_cache_snapshot` filter: at least
+/// one cache tier with `max > 0` AND a non-zero `promote_window_secs`.
+pub(crate) fn volume_has_active_cache_policy(
+    cache: &dtfs_common::types::CacheReplication,
+) -> bool {
+    let any_tier =
+        cache.hot.max > 0 || cache.warm.max > 0 || cache.cold.max > 0 || cache.tape.max > 0;
+    any_tier && cache.promote_window_secs > 0
+}
+
 /// Tiering engine that evaluates access patterns and triggers tier migrations.
 pub struct TieringEngine {
     config: RwLock<TieringConfig>,
@@ -217,41 +247,89 @@ impl TieringEngine {
     /// Schedules tier migration tasks for chunks whose temperature doesn't
     /// match their current tier.
     async fn evaluate(&self) -> anyhow::Result<()> {
-        let cfg = self.config.read().await;
-        let mut stats = self.access_stats.write().await;
         let now_ms = now_millis();
+
+        // CO-4-6 — resolve, once per tick, which volumes run an active AV
+        // cache policy and the file_path -> volume_id map. A volume with a
+        // live `cache_replicas` policy is driven SOLELY by `tick_av_cache`;
+        // the legacy temperature path must skip its chunks, or after an
+        // operator flush (which sets a FUTURE cooldown) the legacy promote
+        // re-creates the warm replica during the cooldown window. Read the
+        // SM once here so we never hold the SM lock across the dispatch
+        // awaits below.
+        let (av_cache_volumes, path_to_volume) = {
+            let sm = self.state_data.read().await;
+            let av: std::collections::HashSet<String> = sm
+                .volumes
+                .iter()
+                .filter(|(_, v)| volume_has_active_cache_policy(&v.cache_replicas))
+                .map(|(id, _)| id.clone())
+                .collect();
+            let paths: HashMap<String, String> = sm
+                .files
+                .iter()
+                .map(|(p, fm)| (p.clone(), fm.volume_id.clone()))
+                .collect();
+            (av, paths)
+        };
+
+        // CO-4-4 — collect every legacy migration decision UNDER the
+        // `access_stats` write lock (classification mutates the profile),
+        // then DROP the lock before any dispatch/query await. Pre-fix the
+        // loop held the write lock across `find_target_node` /
+        // `would_violate_anchor` / `schedule_replication` awaits, so a
+        // large evaluate stalled every concurrent `report_access`
+        // (heartbeat) for the whole dispatch duration.
+        let decisions: Vec<LegacyMigration> = {
+            let cfg = self.config.read().await;
+            let mut stats = self.access_stats.write().await;
+            let mut out = Vec::new();
+            for (_chunk_id, profile) in stats.iter_mut() {
+                let old_temp = profile.current_temperature;
+                let new_temp = classify_temperature(
+                    profile.total_reads_1h,
+                    profile.total_reads_24h,
+                    profile.last_access_ms,
+                    now_ms,
+                    cfg.hot_threshold_reads_per_hour,
+                    cfg.cold_threshold_days,
+                    cfg.frozen_threshold_days,
+                );
+                profile.current_temperature = new_temp;
+                if old_temp == new_temp {
+                    continue;
+                }
+                let target_tier = temperature_to_tier(new_temp);
+                if target_tier == profile.current_tier {
+                    continue;
+                }
+                // CO-4-6 — skip the legacy path for chunks whose volume has
+                // an active AV cache policy; `tick_av_cache` owns them.
+                if let Some(vid) = path_to_volume.get(&profile.file_path) {
+                    if av_cache_volumes.contains(vid) {
+                        continue;
+                    }
+                }
+                let demote = tier_rank(target_tier) > tier_rank(profile.current_tier);
+                out.push(LegacyMigration {
+                    chunk_id: profile.chunk_id.clone(),
+                    file_path: profile.file_path.clone(),
+                    current_node: profile.current_node,
+                    current_tier: profile.current_tier,
+                    target_tier,
+                    reads_by_dc: profile.reads_by_dc.clone(),
+                    demote,
+                    old_temp,
+                    new_temp,
+                });
+            }
+            out
+        };
 
         let mut tier_up = 0u32;
         let mut tier_down = 0u32;
-
-        for (_chunk_id, profile) in stats.iter_mut() {
-            let old_temp = profile.current_temperature;
-
-            // Classify temperature based on access patterns.
-            let new_temp = classify_temperature(
-                profile.total_reads_1h,
-                profile.total_reads_24h,
-                profile.last_access_ms,
-                now_ms,
-                cfg.hot_threshold_reads_per_hour,
-                cfg.cold_threshold_days,
-                cfg.frozen_threshold_days,
-            );
-
-            profile.current_temperature = new_temp;
-
-            if old_temp == new_temp {
-                continue;
-            }
-
-            let target_tier = temperature_to_tier(new_temp);
-
-            if target_tier == profile.current_tier {
-                continue;
-            }
-
-            // Need to migrate this chunk to a different tier.
-            let direction = if tier_rank(target_tier) > tier_rank(profile.current_tier) {
+        for d in &decisions {
+            let direction = if d.demote {
                 tier_down += 1;
                 "demote"
             } else {
@@ -262,23 +340,28 @@ impl TieringEngine {
             info!(
                 "Tiering {}: chunk {} ({:?} -> {:?}, tier {:?} -> {:?})",
                 direction,
-                profile.chunk_id,
-                old_temp,
-                new_temp,
-                profile.current_tier,
-                target_tier,
+                d.chunk_id,
+                d.old_temp,
+                d.new_temp,
+                d.current_tier,
+                d.target_tier,
             );
 
             // Find a target node with the right tier.
             let target_node = self
-                .find_target_node(target_tier, profile.current_node, &profile.reads_by_dc)
+                .find_target_node(d.target_tier, d.current_node, &d.reads_by_dc)
                 .await;
 
             if let Some(target) = target_node {
                 // P0-10: anchor-protect. If the volume has an anchor DC set,
                 // refuse migrations that would leave 0 replicas in that DC.
                 let anchor_violated = self
-                    .would_violate_anchor(profile, target)
+                    .would_violate_anchor_for(
+                        &d.file_path,
+                        &d.chunk_id,
+                        d.current_node,
+                        target,
+                    )
                     .await;
                 if anchor_violated {
                     self.audit.log(
@@ -286,8 +369,7 @@ impl TieringEngine {
                         "tier.anchor_protected",
                         &format!(
                             "chunk={} path={} refused {:?}->{:?}",
-                            profile.chunk_id, profile.file_path,
-                            profile.current_tier, target_tier
+                            d.chunk_id, d.file_path, d.current_tier, d.target_tier
                         ),
                         "refused",
                     );
@@ -296,10 +378,10 @@ impl TieringEngine {
                             crate::alerts::AlertKind::AnchorViolated,
                             "tier migration refused — would strand anchor DC",
                             serde_json::json!({
-                                "chunk_id": profile.chunk_id,
-                                "file_path": profile.file_path,
-                                "source_tier": format!("{:?}", profile.current_tier),
-                                "target_tier": format!("{:?}", target_tier),
+                                "chunk_id": d.chunk_id,
+                                "file_path": d.file_path,
+                                "source_tier": format!("{:?}", d.current_tier),
+                                "target_tier": format!("{:?}", d.target_tier),
                                 "target_node": target,
                             }),
                         );
@@ -309,10 +391,10 @@ impl TieringEngine {
 
                 self.scheduler
                     .schedule_replication(
-                        &profile.chunk_id,
-                        profile.current_node,
+                        &d.chunk_id,
+                        d.current_node,
                         target,
-                        target_tier,
+                        d.target_tier,
                     )
                     .await;
 
@@ -321,14 +403,14 @@ impl TieringEngine {
                     &format!("tier.{direction}"),
                     &format!(
                         "chunk={} {:?}->{:?}",
-                        profile.chunk_id, profile.current_tier, target_tier
+                        d.chunk_id, d.current_tier, d.target_tier
                     ),
                     "scheduled",
                 );
             } else {
                 warn!(
                     "No suitable target node found for tier {:?} migration of chunk {}",
-                    target_tier, profile.chunk_id
+                    d.target_tier, d.chunk_id
                 );
             }
         }
@@ -379,6 +461,40 @@ impl TieringEngine {
             .await
             .enable_cache_redundancy_escalation;
         let plan = plan_cache_tick(&snapshot, now_ms, enable_redundancy_escalation);
+
+        // CO-1-2 [HIGH anchor] — surface any demote the planner refused
+        // because it would have stranded the volume's anchor DC. The
+        // planner decides the refusal purely (`demote_preserves_anchor`);
+        // here we emit the `tier.anchor_protected` audit + AnchorViolated
+        // alert so an operator sees the protection fire. Logged before the
+        // early-return so a tick that ONLY produced refusals is still
+        // visible.
+        for r in &plan.anchor_protected {
+            self.audit.log(
+                "tiering",
+                "tier.anchor_protected",
+                &format!(
+                    "chunk={} file={} idx={} node={} disk={} tier={:?} refused idle-demote",
+                    r.chunk_id, r.file_path, r.chunk_index, r.node_id, r.disk_id, r.tier
+                ),
+                "refused",
+            );
+            if let Some(alerts) = &self.alerts {
+                alerts.fire(
+                    crate::alerts::AlertKind::AnchorViolated,
+                    "cache demote refused — would strand anchor DC",
+                    serde_json::json!({
+                        "chunk_id": r.chunk_id,
+                        "file_path": r.file_path,
+                        "chunk_index": r.chunk_index,
+                        "node_id": r.node_id,
+                        "disk_id": r.disk_id,
+                        "tier": format!("{:?}", r.tier),
+                    }),
+                );
+            }
+        }
+
         if plan.promotions.is_empty() && plan.demotions.is_empty() {
             return Ok(());
         }
@@ -546,10 +662,12 @@ impl TieringEngine {
                 node_id: d.node_id.to_string(),
                 // CO-1-1 — drop only this (node, disk) warm cache entry.
                 disk_id: d.disk_id,
-                // AV-2-4 ensures the planner only demotes when
-                // anchor survives, but pass the policy through so
-                // the apply path's defence-in-depth check confirms.
-                enforce_anchor: None,
+                // CO-1-2 — pass the volume anchor so the apply path
+                // re-checks (defence-in-depth, matches the AV-2-4
+                // pattern). The planner already refused any demote that
+                // would strand the anchor (`demote_preserves_anchor`);
+                // this catches an SM change between snapshot and apply.
+                enforce_anchor: d.enforce_anchor.clone(),
             };
             if let Err(e) = self.scheduler.raft().client_write(remove_req).await {
                 warn!(
@@ -727,11 +845,11 @@ impl TieringEngine {
         TickSnapshot { chunks, nodes: node_views, volumes }
     }
 
-    /// P0-10: return `true` if moving `profile`'s chunk to `target_node`
+    /// P0-10: return `true` if moving `file_path`'s chunk to `target_node`
     /// would leave the volume's anchor DC with zero replicas of this chunk.
     ///
     /// Logic:
-    /// 1. Look up the file's `volume_id` from `sm.files[profile.file_path]`.
+    /// 1. Look up the file's `volume_id` from `sm.files[file_path]`.
     /// 2. Resolve the volume's anchor via `effective_anchor()` (CO-4-7:
     ///    reads the resolved `AnchorPolicy` so a volume that set the new
     ///    `anchor` field — not just the legacy `anchor_datacenter` string
@@ -745,13 +863,19 @@ impl TieringEngine {
     ///    `anchor_violated_after_copy(.., is_additive=true)` does NOT
     ///    subtract the source. Pre-CO-4-7 this modelled the copy as a
     ///    move and a sole-anchor LELI->TORO promote was wrongly refused.
-    async fn would_violate_anchor(
+    ///
+    /// CO-4-4 — takes the chunk's identity by value (was `&ChunkAccessProfile`)
+    /// so the caller can drop the `access_stats` lock before this SM-reading
+    /// await runs.
+    async fn would_violate_anchor_for(
         &self,
-        profile: &ChunkAccessProfile,
+        file_path: &str,
+        chunk_id: &str,
+        current_node: u64,
         target_node: u64,
     ) -> bool {
         let sm = self.state_data.read().await;
-        let volume_id = match sm.files.get(&profile.file_path) {
+        let volume_id = match sm.files.get(file_path) {
             Some(meta) => meta.volume_id.clone(),
             None => return false,
         };
@@ -763,7 +887,7 @@ impl TieringEngine {
             Some(a) if !a.datacenter.is_empty() => a.datacenter,
             _ => return false,
         };
-        let file_meta = match sm.files.get(&profile.file_path) {
+        let file_meta = match sm.files.get(file_path) {
             Some(m) => m,
             None => return false,
         };
@@ -779,7 +903,7 @@ impl TieringEngine {
         // Datacenter of every current replica of this chunk.
         let mut replica_dcs: Vec<String> = Vec::new();
         for ent in file_meta.chunks.iter() {
-            if ent.chunk_hash != profile.chunk_id {
+            if ent.chunk_hash != chunk_id {
                 continue;
             }
             // node_id is sometimes a u64 string, sometimes a "http://..." URL.
@@ -796,7 +920,7 @@ impl TieringEngine {
             }
         }
 
-        let source_dc = id_to_dc.get(&profile.current_node).cloned();
+        let source_dc = id_to_dc.get(&current_node).cloned();
         let target_dc = id_to_dc.get(&target_node).cloned();
         anchor_violated_after_copy(
             &replica_dcs,
@@ -944,6 +1068,18 @@ pub(crate) struct ReadSample {
     pub count: u32,
 }
 
+/// CO-4-17 — hard cap on the number of `(chunk_id, dc)` rings the
+/// read-window store keeps, and on the samples retained per ring.
+/// `apply_heartbeat_reads` enforces both so a flood of distinct chunk
+/// reads (or a single hot chunk read every heartbeat) cannot grow the
+/// store without bound between the once-per-tick dead-chunk sweep. The
+/// key cap mirrors the data-node's `MAX_CHUNK_DC_ENTRIES`.
+pub(crate) const MAX_READ_WINDOW_KEYS: usize = 10_000;
+/// CO-4-17 — per-ring sample cap. A 30 s heartbeat over a 4 h promote
+/// window is ~480 samples; this keeps a runaway window (e.g. a stuck
+/// clock or a window never queried) from growing unbounded.
+pub(crate) const MAX_READ_WINDOW_SAMPLES: usize = 1_024;
+
 /// AV-2-1 pure kernel — count the total reads in
 /// `[now_ms - window_secs*1000, now_ms]`.
 ///
@@ -993,10 +1129,32 @@ pub(crate) fn apply_heartbeat_reads(
             continue;
         }
         let key = (chunk_id.to_string(), dc.clone());
-        windows
-            .entry(key)
-            .or_default()
-            .push(ReadSample { ts_ms: now_ms, count: *count });
+        // CO-4-17 — bound the number of rings. When the store is at the
+        // key cap and this is a NEW key, evict the ring whose newest
+        // sample is the oldest (least recently active). Without this the
+        // map only shrank in the once-per-tick dead-chunk sweep, so a
+        // flood of distinct chunk reads inside one tick grew it without
+        // bound.
+        if !windows.contains_key(&key) && windows.len() >= MAX_READ_WINDOW_KEYS {
+            if let Some(stalest) = windows
+                .iter()
+                .min_by_key(|(_, ring)| ring.iter().map(|s| s.ts_ms).max().unwrap_or(0))
+                .map(|(k, _)| k.clone())
+            {
+                windows.remove(&stalest);
+            }
+        }
+        let ring = windows.entry(key).or_default();
+        ring.push(ReadSample { ts_ms: now_ms, count: *count });
+        // CO-4-17 — bound the per-ring sample count. A ring is normally
+        // pruned to `window_secs` on query (`read_window_count`), but a
+        // window never queried (e.g. a chunk whose volume has no cache
+        // policy) would otherwise append forever. Drop the oldest
+        // samples once the ring exceeds the cap.
+        if ring.len() > MAX_READ_WINDOW_SAMPLES {
+            let drop_n = ring.len() - MAX_READ_WINDOW_SAMPLES;
+            ring.drain(0..drop_n);
+        }
     }
 }
 
@@ -1368,6 +1526,27 @@ pub(crate) struct TickDemotion {
     /// demote → clear so the next read re-promotes immediately;
     /// operator flush cooldown still active → leave alone).
     pub cooldown_until_ms_at_snapshot: u64,
+    /// CO-1-2 — the volume's resolved anchor policy, passed straight
+    /// through to the `RemoveChunkLocation` apply as `enforce_anchor`
+    /// (defence-in-depth). The planner already refuses any demote that
+    /// would strand the anchor (`demote_preserves_anchor`); this gives
+    /// the state-machine apply path a second chance to refuse if the SM
+    /// changed between snapshot and apply. `None` = no anchor policy.
+    pub enforce_anchor: Option<dtfs_common::types::AnchorPolicy>,
+}
+
+/// CO-1-2 — a demote the planner refused because it would have
+/// stranded the volume's anchor DC. Surfaced so the dispatcher (which
+/// holds the audit log) can emit a `tier.anchor_protected` audit; the
+/// refusal itself is decided purely in `demote_preserves_anchor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnchorProtectedDemote {
+    pub chunk_id: String,
+    pub chunk_index: u64,
+    pub file_path: String,
+    pub node_id: u64,
+    pub disk_id: u32,
+    pub tier: DiskTier,
 }
 
 /// AV-2-4 — output of the planner. Wrapped in a struct so the
@@ -1376,6 +1555,8 @@ pub(crate) struct TickDemotion {
 pub(crate) struct TickPlan {
     pub promotions: Vec<TickPromotion>,
     pub demotions: Vec<TickDemotion>,
+    /// CO-1-2 — demotes refused to protect the anchor DC.
+    pub anchor_protected: Vec<AnchorProtectedDemote>,
 }
 
 /// AV-2-4 — pure planner. Walks every chunk in the snapshot and
@@ -1415,7 +1596,13 @@ pub(crate) fn plan_cache_tick(
         );
 
         // -- Demotions --
-        plan_chunk_demotions(chunk, policy, now_ms, &mut plan.demotions);
+        plan_chunk_demotions(
+            chunk,
+            policy,
+            now_ms,
+            &mut plan.demotions,
+            &mut plan.anchor_protected,
+        );
     }
     plan
 }
@@ -1594,6 +1781,35 @@ fn plan_chunk_promotions(
     }
 }
 
+/// CO-1-2 pure kernel — would dropping `victim` from `chunk`'s
+/// placements still leave the volume's anchor satisfied?
+///
+/// Returns `true` when it is safe to demote (anchor preserved or no
+/// anchor policy), `false` when `victim` is the last placement that
+/// satisfies the anchor (so the demote MUST be refused). The check
+/// mirrors `would_violate_anchor_for` but operates on the planner's
+/// `TickPlacement` view and uses `AnchorPolicy::is_satisfied_by`
+/// (datacenter + optional `required_tier`).
+pub(crate) fn demote_preserves_anchor(
+    chunk: &TickChunk,
+    victim: &TickPlacement,
+    anchor: Option<&dtfs_common::types::AnchorPolicy>,
+) -> bool {
+    let Some(anchor) = anchor else {
+        return true; // no anchor policy → no constraint
+    };
+    if anchor.datacenter.is_empty() {
+        return true;
+    }
+    // Identity is (node_id, disk_id) — the demote removes exactly that
+    // replica (CO-1-1). Any OTHER placement that satisfies the anchor
+    // keeps the invariant.
+    chunk.placements.iter().any(|p| {
+        let is_victim = p.node_id == victim.node_id && p.disk_id == victim.disk_id;
+        !is_victim && anchor.is_satisfied_by(&p.dc, Some(p.tier))
+    })
+}
+
 /// AV-2-4 helper — demotion decisions for one chunk.
 ///
 /// A placement is demoted when ALL of:
@@ -1613,6 +1829,7 @@ fn plan_chunk_demotions(
     policy: &TickVolumePolicy,
     now_ms: u64,
     out: &mut Vec<TickDemotion>,
+    anchor_protected: &mut Vec<AnchorProtectedDemote>,
 ) {
     if policy.cache.promote_window_secs == 0 {
         // Cache disabled cluster-wide on this volume; demotions
@@ -1670,6 +1887,26 @@ fn plan_chunk_demotions(
         if !mandatory_still_present {
             continue;
         }
+        // CO-1-2 [HIGH anchor] — never strand the LELI cold anchor. The
+        // mandatory-tier check above does NOT cover the anchor invariant
+        // (§ A.3.4): a chunk's ONLY anchor-DC replica can sit on a cache
+        // tier while the mandatory copy lives in another DC, and the
+        // idle-demote would then drop the last anchor copy. Skip the
+        // placement-removal unless another placement still satisfies the
+        // volume's `effective_anchor`. The dispatcher additionally passes
+        // the anchor as `enforce_anchor` on the RemoveChunkLocation apply
+        // (defence-in-depth, matching the AV-2-4 pattern).
+        if !demote_preserves_anchor(chunk, placement, policy.anchor.as_ref()) {
+            anchor_protected.push(AnchorProtectedDemote {
+                chunk_id: chunk.chunk_id.clone(),
+                chunk_index: chunk.chunk_index,
+                file_path: chunk.file_path.clone(),
+                node_id: placement.node_id,
+                disk_id: placement.disk_id,
+                tier: placement.tier,
+            });
+            continue;
+        }
         out.push(TickDemotion {
             chunk_id: chunk.chunk_id.clone(),
             chunk_index: chunk.chunk_index,
@@ -1679,6 +1916,8 @@ fn plan_chunk_demotions(
             tier: placement.tier,
             reason: "idle_window",
             cooldown_until_ms_at_snapshot: chunk.cooldown_until_ms,
+            // CO-1-2 — carry the anchor through for the apply-path re-check.
+            enforce_anchor: policy.anchor.clone(),
         });
     }
 }
@@ -2782,5 +3021,211 @@ mod audit_co_tests {
         ));
         // Empty anchor dc -> never a constraint.
         assert!(!anchor_violated_after_copy(&[], "", None, None, false));
+    }
+
+    // ---- CO-1-2 [HIGH anchor] — demote must not strand the anchor ----
+
+    use dtfs_common::types::AnchorPolicy;
+
+    fn placement(node_id: u64, disk_id: u32, dc: &str, tier: DiskTier) -> TickPlacement {
+        TickPlacement { node_id, disk_id, dc: dc.to_string(), tier }
+    }
+
+    fn chunk_with(placements: Vec<TickPlacement>) -> TickChunk {
+        TickChunk {
+            chunk_id: "c1".into(),
+            chunk_index: 0,
+            file_path: "/f".into(),
+            volume_id: "v1".into(),
+            placements,
+            cooldown_until_ms: 0,
+            reads_in_window_by_dc: HashMap::new(),
+            file_updated_at_ms: 0,
+        }
+    }
+
+    /// CO-1-2 — the chunk's ONLY anchor-DC replica is the warm cache copy
+    /// (mandatory copy lives in another DC). Demoting it would strand the
+    /// LELI anchor, so `demote_preserves_anchor` must return false.
+    #[test]
+    fn co_1_2_demote_of_sole_anchor_replica_is_refused() {
+        // LELI warm cache copy (the only LELI replica) + TORO mandatory.
+        let leli_cache = placement(10, 1, "leli", DiskTier::Warm);
+        let toro_mand = placement(20, 0, "toro", DiskTier::Cold);
+        let chunk = chunk_with(vec![leli_cache.clone(), toro_mand]);
+        let anchor = AnchorPolicy { datacenter: "leli".into(), required_tier: None };
+        assert!(
+            !demote_preserves_anchor(&chunk, &leli_cache, Some(&anchor)),
+            "demoting the only LELI replica must be refused"
+        );
+    }
+
+    /// CO-1-2 — a second LELI replica keeps the anchor satisfied, so the
+    /// demote of one LELI cache copy is allowed.
+    #[test]
+    fn co_1_2_demote_safe_when_another_anchor_replica_survives() {
+        let leli_cache = placement(10, 1, "leli", DiskTier::Warm);
+        let leli_anchor = placement(11, 0, "leli", DiskTier::Cold);
+        let chunk = chunk_with(vec![leli_cache.clone(), leli_anchor]);
+        let anchor = AnchorPolicy { datacenter: "leli".into(), required_tier: None };
+        assert!(
+            demote_preserves_anchor(&chunk, &leli_cache, Some(&anchor)),
+            "another LELI replica keeps the anchor satisfied"
+        );
+    }
+
+    /// CO-1-2 — a tier-pinned anchor (cold in LELI) is not satisfied by a
+    /// surviving LELI WARM replica, so demoting the LELI cold copy is
+    /// refused even though another LELI replica exists.
+    #[test]
+    fn co_1_2_tier_pinned_anchor_respects_required_tier() {
+        let leli_cold = placement(10, 0, "leli", DiskTier::Cold);
+        let leli_warm = placement(10, 1, "leli", DiskTier::Warm);
+        let chunk = chunk_with(vec![leli_cold.clone(), leli_warm]);
+        let anchor = AnchorPolicy {
+            datacenter: "leli".into(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        assert!(
+            !demote_preserves_anchor(&chunk, &leli_cold, Some(&anchor)),
+            "the surviving LELI warm copy does not satisfy a cold-pinned anchor"
+        );
+    }
+
+    /// CO-1-2 — no anchor policy → never a constraint.
+    #[test]
+    fn co_1_2_no_anchor_policy_never_blocks() {
+        let leli = placement(10, 1, "leli", DiskTier::Warm);
+        let chunk = chunk_with(vec![leli.clone()]);
+        assert!(demote_preserves_anchor(&chunk, &leli, None));
+        let empty = AnchorPolicy { datacenter: String::new(), required_tier: None };
+        assert!(demote_preserves_anchor(&chunk, &leli, Some(&empty)));
+    }
+
+    /// CO-1-2 — the planner records the refused demote in
+    /// `anchor_protected` (so the dispatcher can audit it) and does NOT
+    /// emit it as a demotion.
+    #[test]
+    fn co_1_2_planner_refuses_and_records_anchor_protected() {
+        use dtfs_common::types::{CacheReplication, CacheTierConfig, TierReplication};
+        // Volume: warm cache enabled (max=1), TORO mandatory cold, anchor
+        // = LELI. The chunk's only LELI replica is the warm cache copy.
+        let mut cache = CacheReplication::default();
+        cache.warm = CacheTierConfig { min: 0, max: 1 };
+        cache.promote_window_secs = 60;
+        cache.promote_reads = 2;
+        // Mandatory = cold only (warm/hot/tape 0) so warm is a pure cache
+        // tier; TierReplication::default() is {3,2,1,1}, NOT all-zero.
+        let mandatory = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+        let policy = TickVolumePolicy {
+            mandatory,
+            cache,
+            anchor: Some(AnchorPolicy { datacenter: "leli".into(), required_tier: None }),
+        };
+        let mut volumes = HashMap::new();
+        volumes.insert("v1".to_string(), policy);
+
+        // Idle (no reads) chunk, file old enough to clear the grace window.
+        let mut chunk = chunk_with(vec![
+            placement(10, 1, "leli", DiskTier::Warm), // sole LELI = warm cache
+            placement(20, 0, "toro", DiskTier::Cold), // mandatory elsewhere
+        ]);
+        chunk.file_updated_at_ms = 1; // far in the past relative to now_ms
+        let snapshot = TickSnapshot {
+            chunks: vec![chunk],
+            nodes: Vec::new(),
+            volumes,
+        };
+        let plan = plan_cache_tick(&snapshot, 10_000_000, false);
+        assert!(
+            plan.demotions.is_empty(),
+            "the anchor-stranding demote must NOT be scheduled"
+        );
+        assert_eq!(
+            plan.anchor_protected.len(),
+            1,
+            "the refusal must be recorded for the dispatcher to audit"
+        );
+        assert_eq!(plan.anchor_protected[0].node_id, 10);
+        assert_eq!(plan.anchor_protected[0].disk_id, 1);
+    }
+
+    // ---- CO-4-6 — legacy temperature path skips AV-cache volumes ----
+
+    /// CO-4-6 — a volume with at least one cache tier (`max > 0`) and a
+    /// non-zero `promote_window_secs` is "active": the legacy temperature
+    /// path must skip its chunks. A volume with cache disabled (all
+    /// `max == 0`, or `promote_window_secs == 0`) is NOT active and the
+    /// legacy path still handles it.
+    #[test]
+    fn co_4_6_active_cache_policy_detection() {
+        use dtfs_common::types::{CacheReplication, CacheTierConfig};
+        // Active: warm cache max=1, window=60.
+        let mut active = CacheReplication::default();
+        active.warm = CacheTierConfig { min: 0, max: 1 };
+        active.promote_window_secs = 60;
+        assert!(volume_has_active_cache_policy(&active));
+
+        // Window 0 → not active even with a cache tier.
+        let mut no_window = CacheReplication::default();
+        no_window.warm = CacheTierConfig { min: 0, max: 1 };
+        no_window.promote_window_secs = 0;
+        assert!(!volume_has_active_cache_policy(&no_window));
+
+        // No cache tier (all max=0) → not active.
+        let mut no_tier = CacheReplication::default();
+        no_tier.promote_window_secs = 60;
+        assert!(!volume_has_active_cache_policy(&no_tier));
+
+        // Default (empty) → not active.
+        assert!(!volume_has_active_cache_policy(&CacheReplication::default()));
+    }
+
+    /// CO-4-17 — `apply_heartbeat_reads` bounds the read-window store.
+    /// A flood of distinct chunk ids must not grow the key set past the
+    /// cap, and a single hot chunk read every heartbeat must not grow
+    /// its ring past the per-ring sample cap. Pre-fix neither was
+    /// bounded inside `apply_heartbeat_reads` (only the once-per-tick
+    /// dead-chunk sweep + per-query prune touched the store).
+    #[test]
+    fn co_4_17_read_windows_key_set_stays_bounded() {
+        let mut windows: HashMap<(String, String), Vec<ReadSample>> = HashMap::new();
+        let total = MAX_READ_WINDOW_KEYS + 1_000;
+        for i in 0..total as u64 {
+            let chunk = format!("{i:064x}");
+            let mut reads = HashMap::new();
+            reads.insert("dc-a".to_string(), 1u32);
+            apply_heartbeat_reads(&chunk, &reads, 1_000 + i, &mut windows);
+        }
+        assert!(
+            windows.len() <= MAX_READ_WINDOW_KEYS,
+            "read_windows key set must stay <= MAX (got {})",
+            windows.len()
+        );
+    }
+
+    #[test]
+    fn co_4_17_read_window_ring_stays_bounded() {
+        let mut windows: HashMap<(String, String), Vec<ReadSample>> = HashMap::new();
+        let chunk = "hotchunk";
+        let mut reads = HashMap::new();
+        reads.insert("dc-a".to_string(), 1u32);
+        // 10k heartbeats for one hot chunk: without the per-ring cap the
+        // ring would hold 10k samples.
+        for i in 0..10_000u64 {
+            apply_heartbeat_reads(chunk, &reads, 1_000 + i, &mut windows);
+        }
+        let ring = windows.get(&(chunk.to_string(), "dc-a".to_string())).unwrap();
+        assert!(
+            ring.len() <= MAX_READ_WINDOW_SAMPLES,
+            "per-ring samples must stay <= MAX (got {})",
+            ring.len()
+        );
+        // The retained samples are the most recent ones (oldest dropped).
+        assert_eq!(
+            ring.last().unwrap().ts_ms,
+            1_000 + 9_999,
+            "newest sample must be retained"
+        );
     }
 }
