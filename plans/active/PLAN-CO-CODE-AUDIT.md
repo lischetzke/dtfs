@@ -359,7 +359,7 @@ via builder `10.150.0.150`); use `wait_for`, last line `STATUS: …`.
 | ID | Sev | Where | Fix | Release case asserts |
 |----|-----|-------|-----|----------------------|
 | CO-1-2 | HIGH | tiering.rs:1498 | demote planner skips a placement unless another satisfies `effective_anchor`; dispatcher passes the anchor as `enforce_anchor` | demote that would strand the LELI anchor is refused (`tier.anchor_protected` audit) |
-| CO-1-3 | HIGH | scheduler.rs:1380, tiering.rs:497 | reorder: Raft `RemoveChunkLocation` (enforce_anchor) FIRST, byte delete after; rely on CO-3-2 reap for RPC-failed leftovers | on a forced Raft-write failure, no `DeleteChunkReplica` RPC issued; no phantom replica |
+| CO-1-3 ✅ | HIGH | scheduler.rs:1380, tiering.rs:497 | reorder: Raft `RemoveChunkLocation` (enforce_anchor) FIRST, byte delete after; rely on CO-3-2 reap for RPC-failed leftovers | on a forced Raft-write failure, no `DeleteChunkReplica` RPC issued; no phantom replica |
 | CO-2-2 | HIGH(sec) | metadata.rs:1059 | add `shared_secret` to `ForwardWriteRequest` (proto), verify (constant-time) in `forward_client_write` | unauthorized `ForwardClientWrite(DeleteFile)` → PERMISSION_DENIED, file intact |
 | CO-2-3 | HIGH(sec) | join.rs:137, api.rs:914 | persist the phase-1 challenge (TTL), require `HMAC(secret, challenge)` in complete, derive `node_id = node_id_from_hostname(hostname)` server-side | forged `/join/complete` (no prior request / mismatched node_id) rejected; existing node's grpc_addr unchanged |
 | CO-2-4 ✅ | HIGH(sec) | dtfs-cli updater.rs:414,339 | `tempfile::tempdir()` for staging (fresh 0700 dir, bail on create failure); install via copy-to-`.new` + `rename` | (unit) install replaces dst wholesale + leaves no `.new`/truncated-dest window; release case 64 |
@@ -434,8 +434,42 @@ rescan; ArcCache never populated (wire-with-byte-accounting vs remove).
   a tonic Status -> `unreachable_err` -> `RPCError::Unreachable` ->
   `StreamingError::Unreachable`. Gate runs under the coordinator's build.
 
+- 2026-06-13 CO-1-3: flipped both byte-delete-bearing de-location dispatch
+  paths to Raft-remove-first. Extracted a shared `scheduler::delocate_replica`
+  over a `DelocateOps` seam (live impl `SchedulerDelocate`) so the ordering is
+  the single source of truth + unit-testable with a recording mock (mirrors
+  the `MigrationOps` pattern). `flush_cache_for_path` and the tiering demote
+  dispatch both construct `SchedulerDelocate` and match the `DelocateOutcome`:
+  RemoveFailed -> no byte delete, retry (`raft_failures`++ / `continue`);
+  Done / RemovedBytesLeftover -> SM entry gone, count dropped + run cooldown
+  bookkeeping, RemovedBytesLeftover additionally bumps `rpc_failures` +
+  audits `rpc_failed_after_remove`. `check_misplaced_rebalance` was already
+  Raft-remove-only (relies on the CO-3-2 reaper) and is untouched. Units:
+  `scheduler::co_1_3_delocate_order_tests` (3 cases: ordered happy path;
+  forced Raft failure issues NO byte delete; post-commit delete failure ->
+  RemovedBytesLeftover with no rollback) + `tiering::
+  co_1_3_demote_removes_before_byte_delete_carries_anchor` (enforce_anchor
+  threaded + ordering + no-delete-on-raft-fail). Release case
+  `tests/release/cases/67-demote-delocated-bytes-reaped.sh` (demote ->
+  de-locate -> reap end-to-end; also re-covers CO-3-2). A.6 #6/#8 + A.8
+  scheduler row updated. Gate runs under the coordinator's build.
+
 ## Deviations
 
+- CO-1-3 (2026-06-13): the live demote/flush RPC ordering can't be unit-tested
+  in-process (the dispatch makes real gRPC + needs a live Raft handle), so per
+  the "purest layer" rule the ordering was extracted into the pure-async
+  `delocate_replica` over a `DelocateOps` seam and tested with a recording
+  mock (the established `MigrationOps`/`advance_round_tests` pattern), rather
+  than driving the live `TaskScheduler`. The release case exercises the
+  happy-path end-to-end; the distinctive failure-path semantics (Raft remove
+  commits, byte delete fails -> reaper reclaims) are pinned by the unit tests
+  since a mid-demote RPC failure isn't reliably provokable live. Behaviour
+  note: when the byte-delete RPC fails after a committed remove, the new code
+  now runs the cooldown-clear bookkeeping (the replica IS de-located, so this
+  matches the Done case); pre-fix a delete-RPC failure short-circuited before
+  the remove, so no cooldown ran. This is the correct consequence of the
+  reorder, not a regression.
 - CO-2-4 (2026-06-13): the sketch said "tempfile::tempdir() (bail EEXIST)".
   Implemented with `tempfile::tempdir()`, which generates a fresh random
   dir name and bails on any creation failure — there is no fixed name left
