@@ -5,10 +5,11 @@
 //! `scripts/dtfs-update.sh`.
 //!
 //! Network/IO is delegated to the same tools the deploy layer already
-//! uses (`curl`, `tar`, `install`, `systemctl`) so there are no new Rust
-//! deps beyond `sha2` and the download streams to disk (bounded memory,
-//! AGENTS.md § A.3.2). Integrity gate is § A.3.3 / A.6: a single
-//! sha256 mismatch aborts the whole update before anything is installed.
+//! uses (`curl`, `tar`, `install`, `systemctl`); the only Rust deps are
+//! `sha2` (integrity) and `tempfile` (CO-2-4 unpredictable staging dir),
+//! and the download streams to disk (bounded memory, AGENTS.md § A.3.2).
+//! Integrity gate is § A.3.3 / A.6: a single sha256 mismatch aborts the
+//! whole update before anything is installed.
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -203,15 +204,18 @@ fn run_update(
     let bins = target_binaries(target);
     let url = tarball_url(repo_url, tag);
 
-    let tmp = make_tmp_dir()?;
-    let _guard = TmpGuard(tmp.clone());
+    // Stage into a fresh, unpredictable directory (CO-2-4): a fixed path
+    // under temp_dir() is a symlink/race/clobber target. tempfile creates
+    // it with 0700 and removes it on drop.
+    let staging = tempfile::tempdir().context("creating update staging dir")?;
+    let tmp = staging.path();
 
     let tarball = tmp.join(ASSET);
     eprintln!("Downloading {url}");
     curl_download(&url, &tarball)?;
 
     eprintln!("Extracting {ASSET}");
-    extract(&tarball, &tmp)?;
+    extract(&tarball, tmp)?;
 
     // Integrity gate: verify every target binary before installing any.
     let manifest_path = tmp.join("dtfs/MANIFEST");
@@ -386,15 +390,26 @@ fn extract(tarball: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Install `src` over `dst` without ever leaving a truncated destination
+/// (CO-2-4): install to a sibling `<dst>.new` first, then atomically
+/// rename it over `dst`. A crash/failed copy leaves the old `dst` intact
+/// (only the throwaway `.new` is partial). `rename(2)` within one
+/// directory is atomic, so a reader never sees a half-written binary.
 fn install_binary(src: &Path, dst: &str) -> Result<()> {
+    let staged = format!("{dst}.new");
     let status = Command::new("install")
         .args(["-m", "0755"])
         .arg(src)
-        .arg(dst)
+        .arg(&staged)
         .status()
         .context("running install")?;
     if !status.success() {
+        let _ = std::fs::remove_file(&staged);
         bail!("install failed for {dst} (run as root?)");
+    }
+    if let Err(e) = std::fs::rename(&staged, dst) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e).with_context(|| format!("atomically installing {dst}"));
     }
     Ok(())
 }
@@ -460,20 +475,6 @@ fn assert_active(unit: &str) -> Result<()> {
 }
 
 // ---- small utilities ----------------------------------------------------
-
-fn make_tmp_dir() -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("dtfs-update-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir)
-}
-
-struct TmpGuard(PathBuf);
-impl Drop for TmpGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn sha256_file(path: &Path) -> Result<String> {
     let mut f = std::fs::File::open(path)?;
@@ -602,6 +603,41 @@ mod tests {
         assert_eq!(manifest_sha(&manifest, "dtfs-manager"), None);
         // Header lines never match (first token isn't 64 hex chars).
         assert_eq!(manifest_sha(&manifest, "abc1234"), None);
+    }
+
+    #[test]
+    fn co_2_4_install_is_atomic_and_leaves_no_new_residue() {
+        // install_binary must replace dst via a sibling <dst>.new + rename,
+        // never truncate dst in place. On success the .new file is gone and
+        // dst has the new contents; an existing dst is fully overwritten,
+        // never observed half-written.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src-bin");
+        std::fs::write(&src, b"#!/bin/sh\necho new\n").unwrap();
+        let dst = dir.path().join("dtfs-cli");
+        // Pre-existing (old) dst that must be replaced wholesale.
+        std::fs::write(&dst, b"OLD-CONTENT-LONGER-THAN-NEW").unwrap();
+
+        install_binary(&src, dst.to_str().unwrap()).unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"#!/bin/sh\necho new\n");
+        // No leftover staging file -> no truncated-dest window artifact.
+        assert!(!dir.path().join("dtfs-cli.new").exists(), "<dst>.new must not linger");
+    }
+
+    #[test]
+    fn co_2_4_failed_install_leaves_old_dst_intact() {
+        // If the copy can't happen (missing source), the pre-existing dst
+        // must be untouched (no truncation) and no .new residue remains.
+        let dir = tempfile::tempdir().unwrap();
+        let missing_src = dir.path().join("does-not-exist");
+        let dst = dir.path().join("dtfs-cli");
+        std::fs::write(&dst, b"OLD-CONTENT").unwrap();
+
+        let err = install_binary(&missing_src, dst.to_str().unwrap());
+        assert!(err.is_err(), "install of a missing source must error");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"OLD-CONTENT", "dst must be untouched");
+        assert!(!dir.path().join("dtfs-cli.new").exists(), "<dst>.new must not linger");
     }
 
     #[test]
