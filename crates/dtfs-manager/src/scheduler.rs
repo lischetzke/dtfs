@@ -1427,7 +1427,9 @@ impl TaskScheduler {
                         node_id: action.node_id.to_string(),
                         // CO-1-1 — drop only this (node, disk) SM entry.
                         disk_id: action.disk_id,
-                        enforce_anchor: snapshot.anchor.clone(),
+                        // CO-5-7 — enforce the FILE's own volume anchor,
+                        // not the default volume's.
+                        enforce_anchor: action.anchor.clone(),
                     };
                     if let Err(e) = self.raft.client_write(req).await {
                         warn!(
@@ -2442,9 +2444,18 @@ fn record_copy_failure<O: MigrationOps>(
 /// under a single SM read lock by the async wrapper.
 #[derive(Debug, Clone)]
 pub(crate) struct FlushSnapshot {
-    pub files: Vec<(String, Vec<ChunkLocationEntry>, TierReplication)>, // (path, chunks, mandatory)
+    /// CO-5-7 — per-file `(path, chunks, mandatory, anchor)`. The anchor is
+    /// resolved from the file's OWN volume (not the default volume), so a
+    /// flush on a non-default volume enforces its own anchor invariant. The
+    /// planner copies it onto each `FlushAction` and the dispatcher threads
+    /// it into that action's `RemoveChunkLocation` `enforce_anchor`.
+    pub files: Vec<(
+        String,
+        Vec<ChunkLocationEntry>,
+        TierReplication,
+        Option<dtfs_common::types::AnchorPolicy>,
+    )>,
     pub nodes: HashMap<u64, FlushNodeSummary>,
-    pub anchor: Option<dtfs_common::types::AnchorPolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -2470,29 +2481,24 @@ impl FlushSnapshot {
                 )
             })
             .collect();
-        // Pick any one anchor — file-level overrides aren't a thing yet
-        // (each volume has its own policy; we honour the first matching
-        // file's volume in the dispatcher's per-action RemoveChunkLocation
-        // call).  For the snapshot we cache the most common (default
-        // volume's) anchor for simplicity.
-        let anchor = sm
-            .volumes
-            .get("default")
-            .and_then(|v| v.effective_anchor());
-
         let mut files = Vec::new();
         for (path, meta) in sm.files.iter() {
             if !path.starts_with(path_prefix) {
                 continue;
             }
-            let mandatory = sm
-                .volumes
-                .get(&meta.volume_id)
+            // CO-5-7 — resolve mandatory replicas AND the anchor from the
+            // file's OWN volume, so a flush on a non-default volume enforces
+            // its own anchor (pre-fix the anchor was the default volume's,
+            // which could either over-protect or fail to protect a
+            // non-default volume's actual anchor DC/tier).
+            let vol = sm.volumes.get(&meta.volume_id);
+            let mandatory = vol
                 .map(|v| v.effective_mandatory_replicas().clone())
                 .unwrap_or_else(TierReplication::default);
-            files.push((path.clone(), meta.chunks.clone(), mandatory));
+            let anchor = vol.and_then(|v| v.effective_anchor());
+            files.push((path.clone(), meta.chunks.clone(), mandatory, anchor));
         }
-        Self { files, nodes, anchor }
+        Self { files, nodes }
     }
 }
 
@@ -2514,6 +2520,11 @@ pub(crate) struct FlushAction {
     /// CO-1-1 — the tier of the disk being flushed, carried so the
     /// data-node delete can disambiguate by tier as well as disk_id.
     pub tier: DiskTier,
+    /// CO-5-7 — the anchor policy of the FILE's volume, threaded into the
+    /// dispatcher's `RemoveChunkLocation` `enforce_anchor` so the apply
+    /// path's defence-in-depth anchor check uses this file's own anchor,
+    /// not the default volume's.
+    pub anchor: Option<dtfs_common::types::AnchorPolicy>,
 }
 
 /// Bug AV (AV-1-11) — one entry per chunk the planner declined to
@@ -2593,7 +2604,7 @@ pub(crate) fn plan_flush_cache(
     let mut actions: Vec<FlushAction> = Vec::new();
     let mut report = FlushCacheReport::default();
 
-    'files: for (file_path, chunks, mandatory) in &snapshot.files {
+    'files: for (file_path, chunks, mandatory, anchor) in &snapshot.files {
         report.files_matched += 1;
         // Group by chunk_index so we evaluate each chunk as a unit.
         let mut by_index: std::collections::BTreeMap<u64, Vec<&ChunkLocationEntry>> =
@@ -2684,6 +2695,8 @@ pub(crate) fn plan_flush_cache(
                     node_id: nid,
                     disk_id: e.disk_id,
                     tier,
+                    // CO-5-7 — carry the file's own volume anchor.
+                    anchor: anchor.clone(),
                 });
             }
         }
@@ -4163,12 +4176,12 @@ mod bug_av_flush_cache_tests {
                     ent(0, "h", 11, 0), // node 11 = warm
                 ],
                 mandatory_cold_only(),
+                None,
             )],
             nodes: HashMap::from([
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
                 (11u64, node_summary("toro", &[DiskTier::Warm])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4195,6 +4208,7 @@ mod bug_av_flush_cache_tests {
                     ent(0, "h", 11, 1), // node 11 = warm on disk_id=1
                 ],
                 mandatory_cold_only(),
+                None,
             )],
             nodes: HashMap::from([
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
@@ -4203,7 +4217,6 @@ mod bug_av_flush_cache_tests {
                     disk_tiers: vec![(1, DiskTier::Warm)], // sparse: id 1 at index 0
                 }),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4230,12 +4243,12 @@ mod bug_av_flush_cache_tests {
                     ent(0, "h", 12, 0), // node 12 = warm (only)
                 ],
                 mandatory_cold_only(),
+                None,
             )],
             nodes: HashMap::from([
                 (11u64, node_summary("toro", &[DiskTier::Warm])),
                 (12u64, node_summary("nrb",  &[DiskTier::Warm])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4263,7 +4276,6 @@ mod bug_av_flush_cache_tests {
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
                 (11u64, node_summary("toro", &[DiskTier::Warm])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 3);
@@ -4279,11 +4291,11 @@ mod bug_av_flush_cache_tests {
                 "/movies/cold-only.mkv".to_string(),
                 vec![ent(0, "h", 10, 0)], // cold only
                 mandatory_cold_only(),
+                None,
             )],
             nodes: HashMap::from([
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4311,12 +4323,12 @@ mod bug_av_flush_cache_tests {
                     ent(1, "h1", 12, 0), // warm only
                 ],
                 mandatory_cold_only(),
+                None,
             )],
             nodes: HashMap::from([
                 (11u64, node_summary("toro", &[DiskTier::Warm])),
                 (12u64, node_summary("nrb",  &[DiskTier::Warm])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4343,12 +4355,12 @@ mod bug_av_flush_cache_tests {
                 "/movies/wicked.mkv".to_string(),
                 vec![ent(0, "h", 10, 0), ent(0, "h", 11, 0)],
                 mandatory_cold_only(),
+                None,
             )],
             nodes: HashMap::from([
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
                 (11u64, node_summary("toro", &[DiskTier::Warm])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4397,6 +4409,7 @@ mod bug_av_flush_cache_tests {
                     "/vol-default/foo.bin".to_string(),
                     vec![ent(0, "ha", 10, 0), ent(0, "ha", 11, 0)],
                     mandatory_cold_only(),
+                    None,
                 ),
                 // Volume "office": warm + cold both mandatory; warm
                 // protected from flush even though caller asked for it.
@@ -4404,13 +4417,13 @@ mod bug_av_flush_cache_tests {
                     "/vol-office/bar.docx".to_string(),
                     vec![ent(0, "hb", 10, 0), ent(0, "hb", 11, 0)],
                     mandatory_warm_and_cold(),
+                    None,
                 ),
             ],
             nodes: HashMap::from([
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
                 (11u64, node_summary("toro", &[DiskTier::Warm])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4419,6 +4432,58 @@ mod bug_av_flush_cache_tests {
         assert_eq!(actions[0].file_path, "/vol-default/foo.bin");
         assert_eq!(report.replicas_dropped, 0, "wrapper drives this");
         assert_eq!(report.files_matched, 2);
+    }
+
+    /// CO-5-7 — a flush on a NON-default volume carries that volume's OWN
+    /// anchor on the produced `FlushAction` (which the dispatcher threads
+    /// into `RemoveChunkLocation`'s `enforce_anchor`), not the default
+    /// volume's anchor. Two files in different volumes, each with a distinct
+    /// anchor DC; each action must reflect its own file's anchor.
+    #[test]
+    fn co_5_7_flush_action_uses_per_file_volume_anchor() {
+        let anchor_leli = dtfs_common::types::AnchorPolicy {
+            datacenter: "leli".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        let anchor_toro = dtfs_common::types::AnchorPolicy {
+            datacenter: "toro".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        let snapshot = FlushSnapshot {
+            files: vec![
+                (
+                    "/vol-default/foo.bin".to_string(),
+                    vec![ent(0, "ha", 10, 0), ent(0, "ha", 11, 0)],
+                    mandatory_cold_only(),
+                    Some(anchor_leli.clone()),
+                ),
+                (
+                    "/vol-other/bar.bin".to_string(),
+                    vec![ent(0, "hb", 10, 0), ent(0, "hb", 11, 0)],
+                    mandatory_cold_only(),
+                    Some(anchor_toro.clone()),
+                ),
+            ],
+            nodes: HashMap::from([
+                (10u64, node_summary("leli", &[DiskTier::Cold])),
+                (11u64, node_summary("toro", &[DiskTier::Warm])),
+            ]),
+        };
+        let (actions, _report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
+        assert_eq!(actions.len(), 2, "one warm drop per file");
+        let foo = actions.iter().find(|a| a.file_path == "/vol-default/foo.bin").unwrap();
+        let bar = actions.iter().find(|a| a.file_path == "/vol-other/bar.bin").unwrap();
+        assert_eq!(
+            foo.anchor.as_ref().map(|a| a.datacenter.as_str()),
+            Some("leli"),
+            "default-volume file keeps its own (leli) anchor"
+        );
+        assert_eq!(
+            bar.anchor.as_ref().map(|a| a.datacenter.as_str()),
+            Some("toro"),
+            "non-default-volume file enforces its OWN (toro) anchor, not the default's"
+        );
     }
 }
 

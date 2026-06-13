@@ -468,7 +468,9 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   (`current_expected_chunks_for_node` + `still_missing_after_recheck`) and
   drops any chunk a concurrent demote/unlink de-located between the tick's
   opening snapshot and the ListChunks reply — so a healthy node is never
-  quarantined for a demote race.
+  quarantined for a demote race. **CO-5-7:** `FlushSnapshot`/`FlushAction`
+  carry the file's OWN volume anchor (not the default volume's) so a
+  non-default-volume flush enforces its own anchor.
 - `dtfs-manager/src/monitor.rs` — heartbeat health detection only
   (Bug CH): commits node-status transitions, fires NodeDown/SMART
   alerts. MUST NOT schedule repair — the 2026-06-06 storm came from a
