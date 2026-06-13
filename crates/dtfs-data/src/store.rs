@@ -48,6 +48,18 @@ pub fn load_or_create_disk_uuid(mount_path: &Path) -> std::io::Result<String> {
     Ok(u)
 }
 
+/// CO-5-2 — filename for a streaming put's tmp file (chunk_id unknown until
+/// the stream finishes). The previous `streaming-{pid}-{nanos}` scheme
+/// collided whenever two concurrent puts on the same disk read the same
+/// coarse `nanos` clock, so both streams interleaved into one tmp and the
+/// committed chunk's checksum mismatched yet was acked success. A v4 UUID
+/// makes the name unique per call regardless of clock resolution. Keeps the
+/// `streaming-` prefix (recovery/reclaim sweeps `tmp/`) and the `.dat.tmp`
+/// suffix that `reclaim_orphan_streaming_tmps` matches on.
+fn streaming_tmp_name() -> String {
+    format!("streaming-{}.dat.tmp", uuid::Uuid::new_v4())
+}
+
 /// A lightweight stats snapshot for heartbeat reporting.
 #[derive(Debug, Clone, Default)]
 pub struct ChunkStoreStats {
@@ -390,15 +402,7 @@ impl ChunkStore {
         let tmp_root = tmp_dir(&mount);
         // Create the tmp directory if it doesn't exist (e.g. on a fresh disk).
         let _ = std::fs::create_dir_all(&tmp_root);
-        let uniq = format!(
-            "streaming-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        );
-        let tmp_path = tmp_root.join(format!("{uniq}.dat.tmp"));
+        let tmp_path = tmp_root.join(streaming_tmp_name());
         Ok((tmp_path, mount))
     }
 
@@ -1386,6 +1390,19 @@ mod tests {
         let mtime1 = std::fs::metadata(&f).unwrap().modified().unwrap();
         assert_eq!(first, second);
         assert_eq!(mtime0, mtime1, "valid UUID file must not be rewritten on read");
+    }
+
+    // CO-5-2 — two concurrent streaming puts must never share a tmp name,
+    // even when sampled back-to-back on a coarse clock. A pid+nanos name
+    // collided and let two streams interleave into one tmp (checksum
+    // mismatch acked success); the UUID-based name is unique per call.
+    #[test]
+    fn co_5_2_streaming_tmp_name_unique() {
+        let a = streaming_tmp_name();
+        let b = streaming_tmp_name();
+        assert_ne!(a, b, "two streaming tmp names must differ");
+        assert!(a.starts_with("streaming-"), "keeps the streaming- prefix: {a}");
+        assert!(a.ends_with(".dat.tmp"), "keeps the .dat.tmp suffix: {a}");
     }
 
     async fn make_test_store() -> (ChunkStore, TempDir) {

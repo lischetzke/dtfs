@@ -9,7 +9,7 @@ use std::time::Duration;
 use dtfs_common::config::DataNodeConfig;
 use dtfs_common::types::ChunkId;
 use dtfs_proto::dtfs::data::data_service_client::DataServiceClient;
-use dtfs_proto::dtfs::data::PutChunkRequest;
+use dtfs_proto::dtfs::data::{PutChunkRequest, PutChunkResponse};
 use tokio::io::AsyncReadExt;
 
 use crate::store::ChunkStore;
@@ -25,6 +25,33 @@ const REPLICATE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Streaming piece size — matches the put_chunk intake's expectation of
 /// ~1 MiB pieces (Bug I).
 const STREAM_PIECE_SIZE: usize = 1024 * 1024;
+
+/// CO-5-4 — validate a replication target's `PutChunkResponse` against the
+/// chunk we asked it to store. `resp.chunk_id` is the BLAKE3 hash the target
+/// independently computed over the bytes it received; if it differs from the
+/// source chunk's hash the target stored corrupt/wrong bytes, so the
+/// replication MUST fail even though the old code only checked `success`
+/// (which a target sets true after its own self-consistent commit). Integrity
+/// is the prime directive: a replica must be byte-identical or it is not a
+/// replica.
+///
+/// An EMPTY `chunk_id` means the target didn't echo its computed hash (proto3
+/// string default) — i.e. a pre-CO peer with no hash to compare. There we fall
+/// back to the old `success`-only check rather than fail a healthy replica
+/// across a version boundary; every current data node populates it.
+fn validate_put_response(expected_hex: &str, resp: &PutChunkResponse) -> anyhow::Result<()> {
+    if !resp.success {
+        anyhow::bail!("remote rejected the chunk (success=false)");
+    }
+    if !resp.chunk_id.is_empty() && resp.chunk_id != expected_hex {
+        anyhow::bail!(
+            "replicated chunk hash mismatch: target computed {}, expected {}",
+            resp.chunk_id,
+            expected_hex,
+        );
+    }
+    Ok(())
+}
 
 /// Manages chunk replication between data nodes.
 pub struct ReplicationManager {
@@ -131,21 +158,24 @@ impl ReplicationManager {
             let resp = response?.into_inner();
             fed?;
 
-            if resp.success {
-                tracing::info!(
-                    "Successfully replicated chunk {} ({} bytes) to {}",
-                    chunk_hex,
-                    resp.size,
-                    target_addr,
-                );
-                Ok(())
-            } else {
-                anyhow::bail!(
-                    "Replication of chunk {} to {} failed at remote side",
+            // CO-5-4 — verify the target stored byte-identical content
+            // (matching BLAKE3 hash), not merely that it self-reported
+            // success.
+            validate_put_response(&chunk_hex, &resp).map_err(|e| {
+                anyhow::anyhow!(
+                    "Replication of chunk {} to {} failed: {}",
                     chunk_hex,
                     target_addr,
+                    e,
                 )
-            }
+            })?;
+            tracing::info!(
+                "Successfully replicated chunk {} ({} bytes) to {}",
+                chunk_hex,
+                resp.size,
+                target_addr,
+            );
+            Ok(())
         };
 
         match tokio::time::timeout(REPLICATE_TIMEOUT, work).await {
@@ -162,5 +192,53 @@ impl ReplicationManager {
     /// Get a reference to the underlying config.
     pub fn config(&self) -> &DataNodeConfig {
         &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resp(chunk_id: &str, success: bool) -> PutChunkResponse {
+        PutChunkResponse {
+            chunk_id: chunk_id.to_string(),
+            size: 4096,
+            checksum: chunk_id.to_string(),
+            success,
+            disk_id: 0,
+        }
+    }
+
+    // CO-5-4 — a matching hash + success is the only Ok case.
+    #[test]
+    fn co_5_4_matching_chunk_id_ok() {
+        let hex = "a".repeat(64);
+        assert!(validate_put_response(&hex, &resp(&hex, true)).is_ok());
+    }
+
+    // CO-5-4 — a target that stored different bytes returns a different
+    // hash; that MUST fail even though success=true.
+    #[test]
+    fn co_5_4_wrong_chunk_id_errors() {
+        let expected = "a".repeat(64);
+        let wrong = "b".repeat(64);
+        assert!(validate_put_response(&expected, &resp(&wrong, true)).is_err());
+    }
+
+    // CO-5-4 — success=false fails regardless of the hash.
+    #[test]
+    fn co_5_4_unsuccessful_errors() {
+        let hex = "a".repeat(64);
+        assert!(validate_put_response(&hex, &resp(&hex, false)).is_err());
+    }
+
+    // CO-5-4 — an empty chunk_id (pre-CO target that doesn't echo its hash)
+    // falls back to the success-only check instead of failing a healthy
+    // replica across a version boundary.
+    #[test]
+    fn co_5_4_empty_chunk_id_falls_back_to_success() {
+        let expected = "a".repeat(64);
+        assert!(validate_put_response(&expected, &resp("", true)).is_ok());
+        assert!(validate_put_response(&expected, &resp("", false)).is_err());
     }
 }
