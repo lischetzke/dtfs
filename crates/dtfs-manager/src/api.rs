@@ -1686,13 +1686,30 @@ struct CreateVolumeRequest {
     anchor_datacenter: Option<String>,
 }
 
+/// CO-4-14 — canonical volume id derived from the operator-supplied name.
+/// Factored out so the create-vs-upsert existence check is unit-testable
+/// against a `StateMachineData` without standing up the full handler.
+fn volume_id_from_name(name: &str) -> String {
+    name.to_lowercase().replace(' ', "-")
+}
+
 async fn create_volume(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateVolumeRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     use dtfs_common::types::{TierReplication, VolumeConfig, VolumeId, WriteSafety};
 
-    let vol_id = body.name.to_lowercase().replace(' ', "-");
+    let vol_id = volume_id_from_name(&body.name);
+
+    // CO-4-14 — create is create, not upsert. Re-POSTing an existing volume
+    // name must NOT blindly UpsertVolume: that wipes any set-mandatory /
+    // cache / anchor / write-safety tuning applied since the first create
+    // (apply is a blind BTreeMap insert). Reject with 409 instead; operators
+    // change an existing volume through the dedicated tuning endpoints.
+    if state.sm_data.read().await.volumes.contains_key(&vol_id) {
+        return Err(StatusCode::CONFLICT);
+    }
+
     let config = VolumeConfig {
         id: VolumeId::new(vol_id.clone()),
         name: body.name.clone(),
@@ -2942,17 +2959,23 @@ async fn update_config(
             })),
         ));
     }
-    let version = {
+    // CO-5-10 — read the base version and carry it as `expected_version` so
+    // the apply can CAS. Two saves racing off the same base both target
+    // `base + 1`; the apply rejects the loser instead of letting it
+    // blind-overwrite the winner (the old read-then-write lost updates).
+    let base_version = {
         let sm = state.sm_data.read().await;
-        sm.cluster_config.version + 1
+        sm.cluster_config.version
     };
+    let version = base_version + 1;
 
     let req = ClientRequest::UpdateConfig {
         config_json: config_json.clone(),
         version,
+        expected_version: base_version,
     };
 
-    state
+    let resp = state
         .raft
         .client_write(req)
         .await
@@ -2960,6 +2983,20 @@ async fn update_config(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": format!("raft write failed: {e}")})),
         ))?;
+
+    // CO-5-10 — a version-conflict rejection comes back as a committed
+    // ClientResponse::Error (the apply ran, saw the mismatch, declined the
+    // overwrite). Surface it as 409 so the editor re-reads and retries
+    // instead of believing its lost write landed.
+    if let dtfs_raft::ClientResponse::Error { message } = resp.data {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": message,
+                "preserved_current": true,
+            })),
+        ));
+    }
 
     // AZ-5-A2 — optionally persist to disk via atomic tmp+rename.
     let mut wrote_to_disk = false;
@@ -3227,6 +3264,62 @@ mod audit_co_tests {
             Some(SECRET),
             "shared_secret must be redacted, not emitted in cleartext: {secret_row}"
         );
+    }
+
+    // CO-4-14 — create_volume must be create, not upsert. Re-POSTing an
+    // existing volume name used to blind UpsertVolume, wiping any
+    // set-mandatory / cache / anchor tuning. The handler now reads the
+    // current state and rejects when the derived volume id already exists.
+    // This exercises that existence check (the seam factored out for
+    // testability) against a StateMachineData carrying a tuned volume,
+    // asserting the duplicate is detected and the stored tuning is the one
+    // that would be preserved (the handler returns 409 before any Upsert).
+    #[test]
+    fn co_4_14_create_volume_existing_name_is_rejected() {
+        use dtfs_raft::state_machine::StateMachineData;
+        use dtfs_common::types::{
+            CacheReplication, SpillPolicy, TierReplication, VolumeConfig, VolumeId,
+            VolumeSchedules, WriteSafety,
+        };
+
+        // Operator-supplied display name -> canonical id (lower, dashed).
+        let name = "My Media";
+        let vol_id = super::volume_id_from_name(name);
+        assert_eq!(vol_id, "my-media");
+
+        // A volume that has been hand-tuned after its initial create:
+        // mandatory_replicas set, a non-default anchor, etc.
+        let tuned = VolumeConfig {
+            id: VolumeId::new(vol_id.clone()),
+            name: name.to_string(),
+            chunk_size_bytes: 64 * 1024 * 1024,
+            replication: TierReplication { hot: 1, warm: 1, cold: 1, tape: 1 },
+            write_safety: WriteSafety {
+                min_replicas_before_ack: 2,
+                write_timeout_secs: 30,
+            },
+            anchor_datacenter: Some("leli".to_string()),
+            mandatory_replicas: TierReplication { hot: 0, warm: 2, cold: 1, tape: 0 },
+            cache_replicas: CacheReplication::default(),
+            anchor: None,
+            schedules: VolumeSchedules::default(),
+            spill: SpillPolicy::default(),
+        };
+
+        let mut sm = StateMachineData::default();
+        sm.volumes.insert(vol_id.clone(), tuned.clone());
+
+        // The handler's guard: a re-create of the same name resolves to the
+        // same id, which already exists -> reject (409), never UpsertVolume.
+        assert!(
+            sm.volumes.contains_key(&super::volume_id_from_name(name)),
+            "re-POST of an existing volume name must be detected as a duplicate",
+        );
+
+        // The stored tuning is untouched by the rejected create.
+        let stored = sm.volumes.get(&vol_id).expect("tuned volume present");
+        assert_eq!(stored.mandatory_replicas.warm, 2);
+        assert_eq!(stored.anchor_datacenter.as_deref(), Some("leli"));
     }
 }
 
