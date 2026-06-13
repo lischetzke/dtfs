@@ -308,7 +308,8 @@ impl Filesystem for DtfsFuse3Adapter {
                     generation: 0,
                 })
             }
-            Err(_) => Err(Errno::from(libc::ENOENT)),
+            // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
+            Err(e) => Err(cluster_err_to_errno(&e)),
         }
     }
 
@@ -326,7 +327,8 @@ impl Filesystem for DtfsFuse3Adapter {
                 ttl: ATTR_TTL,
                 attr: self.to_fuse_attr(inode, &attrs),
             }),
-            Err(_) => Err(Errno::from(libc::ENOENT)),
+            // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
+            Err(e) => Err(cluster_err_to_errno(&e)),
         }
     }
 
@@ -366,7 +368,8 @@ impl Filesystem for DtfsFuse3Adapter {
                 ttl: ATTR_TTL,
                 attr: self.to_fuse_attr(inode, &attrs),
             }),
-            Err(_) => Err(Errno::from(libc::ENOENT)),
+            // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
+            Err(e) => Err(cluster_err_to_errno(&e)),
         }
     }
 
@@ -393,7 +396,8 @@ impl Filesystem for DtfsFuse3Adapter {
                     warn!("fuse3 open {}: write lease busy", path);
                     return Err(Errno::from(libc::EBUSY));
                 }
-                Err(Errno::from(libc::ENOENT))
+                // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
+                Err(cluster_err_to_errno(&e))
             }
         }
     }
@@ -756,7 +760,8 @@ impl Filesystem for DtfsFuse3Adapter {
         match self.fs.lookup(&path).await {
             Ok(a) if a.is_directory => Ok(ReplyOpen { fh: 0, flags }),
             Ok(_) => Err(Errno::from(libc::ENOTDIR)),
-            Err(_) => Err(Errno::from(libc::ENOENT)),
+            // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
+            Err(e) => Err(cluster_err_to_errno(&e)),
         }
     }
 
@@ -1082,7 +1087,8 @@ impl Filesystem for DtfsFuse3Adapter {
             Ok(t) => Ok(ReplyData {
                 data: t.into_bytes().into(),
             }),
-            Err(_) => Err(Errno::from(libc::ENOENT)),
+            // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
+            Err(e) => Err(cluster_err_to_errno(&e)),
         }
     }
 
@@ -1123,6 +1129,37 @@ impl Filesystem for DtfsFuse3Adapter {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// CO-4-16 — map a cluster-side error to the errno a metadata op should
+/// return. Return `ENOENT` ONLY for a genuine gRPC `NotFound`; map every
+/// other failure (manager outage, election window, timeout, internal error,
+/// or an error we can't classify) to `EIO`.
+///
+/// Why this matters: the old code mapped *every* error to `ENOENT`. During a
+/// manager blip a `lookup`/`getattr` then reported "file does not exist", and
+/// Plex treats that as a deleted file and drops the library entry — a
+/// transient outage turned into a permanent-looking data loss to the app.
+/// `EIO` is the correct "try again, the file may still be there" signal.
+///
+/// The `tonic::Status` is preserved in the anyhow error chain by the client
+/// (`call_manager` wraps it via `anyhow::Error::new(status).context(...)`),
+/// possibly under one or more `.context(...)` layers, so we walk the whole
+/// chain rather than only inspecting the top error.
+fn cluster_err_to_errno(err: &anyhow::Error) -> Errno {
+    for cause in err.chain() {
+        if let Some(status) = cause.downcast_ref::<tonic::Status>() {
+            if status.code() == tonic::Code::NotFound {
+                return Errno::from(libc::ENOENT);
+            }
+            // Any other status (Unavailable, DeadlineExceeded, Internal, ...)
+            // is transient or non-NotFound — never ENOENT.
+            return Errno::from(libc::EIO);
+        }
+    }
+    // No gRPC status in the chain: an error we can't classify. Treat as
+    // transient (EIO), never "file gone".
+    Errno::from(libc::EIO)
+}
 
 /// Convert a `SystemTime` to fuse3's `Timestamp`.
 fn to_timestamp(st: SystemTime) -> Timestamp {
@@ -1242,5 +1279,54 @@ mod audit_co_tests {
     #[test]
     fn co_5_18_default_mode_grows() {
         assert_eq!(fallocate_target_size(100, 50, 0).unwrap(), Some(150));
+    }
+
+    /// CO-4-16 — a genuine `NotFound` status maps to ENOENT (the file
+    /// really is gone).
+    #[test]
+    fn co_4_16_not_found_maps_to_enoent() {
+        let err = anyhow::Error::new(tonic::Status::not_found("no such file"));
+        assert_eq!(cluster_err_to_errno(&err), Errno::from(libc::ENOENT));
+    }
+
+    /// CO-4-16 — a transient manager outage (`Unavailable`) must NOT map to
+    /// ENOENT, or Plex sees "file does not exist" during a blip and drops
+    /// the library entry. It maps to EIO instead.
+    #[test]
+    fn co_4_16_transient_unavailable_maps_to_eio_not_enoent() {
+        let err = anyhow::Error::new(tonic::Status::unavailable("manager down"));
+        let errno = cluster_err_to_errno(&err);
+        assert_eq!(errno, Errno::from(libc::EIO));
+        assert_ne!(errno, Errno::from(libc::ENOENT));
+    }
+
+    /// CO-4-16 — a timeout (`DeadlineExceeded`) is also transient -> EIO.
+    #[test]
+    fn co_4_16_deadline_exceeded_maps_to_eio() {
+        let err = anyhow::Error::new(tonic::Status::deadline_exceeded("timed out"));
+        assert_eq!(cluster_err_to_errno(&err), Errno::from(libc::EIO));
+    }
+
+    /// CO-4-16 — the status is preserved under `.context(...)` layers (the
+    /// client wraps it that way, and `fetch_file_locations` adds another).
+    /// The helper must walk the whole chain, not just the top error.
+    #[test]
+    fn co_4_16_finds_status_under_context_layers() {
+        let not_found = anyhow::Error::new(tonic::Status::not_found("gone"))
+            .context("get_file_locations RPC failed")
+            .context("get_file_locations failed for /Movies/x.mkv");
+        assert_eq!(cluster_err_to_errno(&not_found), Errno::from(libc::ENOENT));
+
+        let unavailable = anyhow::Error::new(tonic::Status::unavailable("down"))
+            .context("get_file_locations RPC failed (all managers exhausted)");
+        assert_eq!(cluster_err_to_errno(&unavailable), Errno::from(libc::EIO));
+    }
+
+    /// CO-4-16 — an error with no gRPC status in the chain is unclassifiable
+    /// and must be treated as transient (EIO), never "file gone".
+    #[test]
+    fn co_4_16_unknown_error_maps_to_eio() {
+        let err = anyhow::anyhow!("some local error with no tonic status");
+        assert_eq!(cluster_err_to_errno(&err), Errno::from(libc::EIO));
     }
 }
