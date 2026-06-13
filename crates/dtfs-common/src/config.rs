@@ -226,6 +226,38 @@ impl Default for MemoryConfig {
     }
 }
 
+impl MemoryConfig {
+    /// CO-5-20 — reject a nonsensical pressure ladder before the role
+    /// daemons act on it. An inverted ladder (`warn >= shed`) makes the
+    /// Warn rung unreachable: the cheap mitigations (shrink cache, pause
+    /// background ticks) never fire and the last-resort shed (write
+    /// reject, RESOURCE_EXHAUSTED) is the first thing the operator sees.
+    /// Either threshold above 100% is meaningless (RSS is a percentage of
+    /// the cap). Called by the role config `validate()` on load.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.warn_threshold_pct > 100 {
+            return Err(format!(
+                "[memory] warn_threshold_pct = {} exceeds 100",
+                self.warn_threshold_pct
+            ));
+        }
+        if self.shed_threshold_pct > 100 {
+            return Err(format!(
+                "[memory] shed_threshold_pct = {} exceeds 100",
+                self.shed_threshold_pct
+            ));
+        }
+        if self.warn_threshold_pct >= self.shed_threshold_pct {
+            return Err(format!(
+                "[memory] warn_threshold_pct ({}) must be below shed_threshold_pct ({}); \
+                 an inverted ladder makes the Warn rung unreachable",
+                self.warn_threshold_pct, self.shed_threshold_pct
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn default_warn_pct() -> u8 {
     80
 }
@@ -1193,6 +1225,38 @@ mod tests {
         assert_eq!(cfg.warn_threshold_pct, 70);
         assert_eq!(cfg.shed_threshold_pct, 90);
         assert_eq!(cfg.sample_interval_secs, 3);
+    }
+
+    /// CO-5-20 — `MemoryConfig::validate` rejects an inverted/over-100
+    /// pressure ladder and accepts the compiled-in default.
+    #[test]
+    fn co_5_20_memory_config_validate() {
+        // Default ladder (warn 80, shed 92) is valid.
+        assert!(MemoryConfig::default().validate().is_ok());
+
+        // Inverted ladder: warn above shed → Warn rung unreachable.
+        let inverted = MemoryConfig {
+            warn_threshold_pct: 90,
+            shed_threshold_pct: 80,
+            ..Default::default()
+        };
+        assert!(inverted.validate().is_err());
+
+        // Equal thresholds are also rejected (warn must be strictly below).
+        let equal = MemoryConfig {
+            warn_threshold_pct: 85,
+            shed_threshold_pct: 85,
+            ..Default::default()
+        };
+        assert!(equal.validate().is_err());
+
+        // A threshold above 100% is meaningless.
+        let over = MemoryConfig {
+            warn_threshold_pct: 70,
+            shed_threshold_pct: 120,
+            ..Default::default()
+        };
+        assert!(over.validate().is_err());
     }
 
     // Bug BU — headroom classification at the threshold boundary.
