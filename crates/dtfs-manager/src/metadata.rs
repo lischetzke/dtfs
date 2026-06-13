@@ -2974,7 +2974,7 @@ mod tests {
             role: NodeRole::Manager,
             hostname: String::new(),
             grpc_addr: grpc_addr.to_string(),
-            location: Location::default(),
+            location: Location::new("", "", "", ""),
             disks: Vec::new(),
             total_capacity: 0,
             used_capacity: 0,
