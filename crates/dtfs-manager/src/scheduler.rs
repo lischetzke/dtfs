@@ -1304,10 +1304,13 @@ impl TaskScheduler {
     ///    AND not in any mandatory tier with rf > 0 for this volume.
     /// 3. Verify the chunk still has at least one mandatory-tier replica
     ///    after the proposed removals. If not, audit a refusal and skip.
-    /// 4. Issue `DeleteChunkReplica` on each candidate node (AV-1-6),
-    ///    then `RemoveChunkLocation` Raft writes (AV-1-3) to drop the
-    ///    SM entries, then a single `SetChunkCooldown` Raft write
-    ///    (AV-1-4) covering every affected chunk_index.
+    /// 4. CO-1-3 — Raft-remove-FIRST: issue `RemoveChunkLocation` Raft
+    ///    writes (AV-1-3) to drop the SM entries, THEN `DeleteChunkReplica`
+    ///    on each candidate node (AV-1-6), then a single `SetChunkCooldown`
+    ///    Raft write (AV-1-4) covering every affected chunk_index. A
+    ///    byte-delete RPC that fails after a committed remove only leaves
+    ///    de-located bytes the CO-3-2 orphan reaper reclaims; the Raft
+    ///    remove is never rolled back.
     ///
     /// Returns a [`FlushCacheReport`] mirroring `PathMigrationReport`'s
     /// shape so the REST + CLI handlers can present a uniform summary.
@@ -1410,18 +1413,54 @@ impl TaskScheduler {
                 report.unreachable_nodes += 1;
                 continue;
             };
-            match self
-                .delete_chunk_replica_on_node(
-                    &node_addr,
-                    &action.chunk_id,
-                    // CO-1-1 — flush the exact (node, disk) cache replica.
-                    Some(action.disk_id),
-                    &action.tier.to_string(),
-                )
-                .await
-            {
-                Ok((was_present, _freed)) => {
-                    // Audit each replica delete.
+            // CO-1-3 — Raft-remove-FIRST ordering via `delocate_replica`:
+            // drop the SM entry (with the FILE's own volume anchor as
+            // `enforce_anchor`, CO-5-7) BEFORE touching bytes, so the
+            // flush is atomic at the metadata layer. On a Raft failure no
+            // byte delete is issued (replica stays live); on a
+            // post-commit RPC failure the leftover bytes are reclaimed by
+            // the CO-3-2 orphan reaper.
+            let delocate = SchedulerDelocate {
+                sched: self,
+                remove_req: ClientRequest::RemoveChunkLocation {
+                    path: action.file_path.clone(),
+                    chunk_index: action.chunk_index,
+                    node_id: action.node_id.to_string(),
+                    // CO-1-1 — drop only this (node, disk) SM entry.
+                    disk_id: action.disk_id,
+                    enforce_anchor: action.anchor.clone(),
+                },
+                node_addr,
+                chunk_id: action.chunk_id.clone(),
+                disk_id: action.disk_id,
+                tier: action.tier.to_string(),
+            };
+            match delocate_replica(&delocate).await {
+                DelocateOutcome::RemoveFailed => {
+                    warn!(
+                        chunk = %action.chunk_id,
+                        "RemoveChunkLocation Raft write failed during flush"
+                    );
+                    report.raft_failures += 1;
+                    continue;
+                }
+                outcome => {
+                    // SM entry is gone -> the replica is de-located. Count
+                    // it dropped and schedule the cooldown regardless of
+                    // the byte-delete outcome.
+                    cooldowns
+                        .entry(action.file_path.clone())
+                        .or_default()
+                        .insert(action.chunk_index);
+                    report.replicas_dropped += 1;
+                    if outcome == DelocateOutcome::RemovedBytesLeftover {
+                        warn!(
+                            chunk = %action.chunk_id,
+                            node = action.node_id,
+                            "DeleteChunkReplica RPC failed after Raft remove during flush (orphan reaper will reclaim leftover bytes)"
+                        );
+                        report.rpc_failures += 1;
+                    }
                     self.audit.log(
                         "scheduler",
                         "cache.flush_replica",
@@ -1432,46 +1471,8 @@ impl TaskScheduler {
                             action.chunk_index,
                             action.node_id
                         ),
-                        if was_present { "success" } else { "noop" },
+                        if outcome == DelocateOutcome::Done { "success" } else { "rpc_failed_after_remove" },
                     );
-
-                    // Drop the SM entry. Anchor enforcement is threaded
-                    // through so the apply path refuses if a race left
-                    // us about to strand the anchor (defence in depth —
-                    // the planner already filtered).
-                    let req = ClientRequest::RemoveChunkLocation {
-                        path: action.file_path.clone(),
-                        chunk_index: action.chunk_index,
-                        node_id: action.node_id.to_string(),
-                        // CO-1-1 — drop only this (node, disk) SM entry.
-                        disk_id: action.disk_id,
-                        // CO-5-7 — enforce the FILE's own volume anchor,
-                        // not the default volume's.
-                        enforce_anchor: action.anchor.clone(),
-                    };
-                    if let Err(e) = self.raft.client_write(req).await {
-                        warn!(
-                            chunk = %action.chunk_id,
-                            error = %e,
-                            "RemoveChunkLocation Raft write failed during flush"
-                        );
-                        report.raft_failures += 1;
-                        continue;
-                    }
-                    cooldowns
-                        .entry(action.file_path.clone())
-                        .or_default()
-                        .insert(action.chunk_index);
-                    report.replicas_dropped += 1;
-                }
-                Err(e) => {
-                    warn!(
-                        chunk = %action.chunk_id,
-                        node = action.node_id,
-                        error = %e,
-                        "DeleteChunkReplica RPC failed during flush"
-                    );
-                    report.rpc_failures += 1;
                 }
             }
         }
@@ -2928,6 +2929,96 @@ pub(crate) fn normalize_endpoint(stored_addr: &str) -> String {
         stored_addr.to_string()
     } else {
         format!("http://{}", stored_addr)
+    }
+}
+
+/// CO-1-3 — the two ordered side effects of de-locating one replica, behind
+/// a trait so the ordering can be unit-tested with a recording mock (mirrors
+/// the `MigrationOps` seam). The live impls are the `TaskScheduler`
+/// (rebalance/excess-spill + cache-flush dispatch) and the tiering engine's
+/// demote dispatch.
+pub(crate) trait DelocateOps {
+    /// Commit the `RemoveChunkLocation` Raft write that drops this replica's
+    /// SM entry (with the volume `enforce_anchor`). MUST happen before any
+    /// byte delete.
+    async fn remove_location(&self) -> anyhow::Result<()>;
+    /// Issue the data-plane `DeleteChunkReplica` byte-delete RPC. Only ever
+    /// called AFTER `remove_location` succeeded.
+    async fn delete_bytes(&self) -> anyhow::Result<()>;
+}
+
+/// CO-1-3 — the outcome of `delocate_replica`, distinguishing the failure
+/// windows so callers can keep their report counters honest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DelocateOutcome {
+    /// Raft remove committed AND the byte delete succeeded.
+    Done,
+    /// Raft remove committed but the byte delete RPC failed. The SM entry is
+    /// gone (replica de-located); the leftover on-disk bytes are now a chunk
+    /// "on a node's disk with no location entry for that node", which the
+    /// CO-3-2 orphan reaper reclaims after the durable-mtime grace. The Raft
+    /// remove is NEVER rolled back.
+    RemovedBytesLeftover,
+    /// Raft remove failed; NO byte delete was issued, so the replica is still
+    /// live in the SM + on disk. Retry next tick.
+    RemoveFailed,
+}
+
+/// CO-1-3 — de-locate one replica with the LOCKED-IN ordering: Raft
+/// `RemoveChunkLocation` (with `enforce_anchor`) FIRST, then the data-plane
+/// byte delete. A byte-delete failure after a committed remove is tolerated
+/// (the reaper mops the bytes); a Raft-remove failure short-circuits before
+/// any byte is touched. This makes the de-location atomic at the metadata
+/// layer and crash-safe: no phantom replica is ever advertised as live while
+/// its bytes are gone, and no live replica is ever de-advertised while its
+/// bytes remain (the reverse-order hazard).
+pub(crate) async fn delocate_replica<O: DelocateOps>(ops: &O) -> DelocateOutcome {
+    if ops.remove_location().await.is_err() {
+        // Raft remove failed -> issue NO byte delete. The replica is
+        // untouched (still live in the SM + on disk).
+        return DelocateOutcome::RemoveFailed;
+    }
+    // SM entry is gone. A byte-delete failure now only leaves de-located
+    // bytes for the CO-3-2 reaper; never roll back the committed remove.
+    if ops.delete_bytes().await.is_err() {
+        return DelocateOutcome::RemovedBytesLeftover;
+    }
+    DelocateOutcome::Done
+}
+
+/// CO-1-3 — live `DelocateOps` impl shared by the scheduler's
+/// rebalance/excess-spill + cache-flush dispatch and the tiering demote
+/// dispatch. Captures the one `RemoveChunkLocation` Raft request and the
+/// target (node_addr, chunk_id, disk_id, tier) for the byte delete.
+pub(crate) struct SchedulerDelocate<'a> {
+    pub sched: &'a TaskScheduler,
+    pub remove_req: ClientRequest,
+    pub node_addr: String,
+    pub chunk_id: String,
+    pub disk_id: u32,
+    pub tier: String,
+}
+
+impl DelocateOps for SchedulerDelocate<'_> {
+    async fn remove_location(&self) -> anyhow::Result<()> {
+        self.sched
+            .raft()
+            .client_write(self.remove_req.clone())
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("RemoveChunkLocation Raft write: {}", e))
+    }
+
+    async fn delete_bytes(&self) -> anyhow::Result<()> {
+        self.sched
+            .delete_chunk_replica_on_node(
+                &self.node_addr,
+                &self.chunk_id,
+                Some(self.disk_id),
+                &self.tier,
+            )
+            .await
+            .map(|_| ())
     }
 }
 
@@ -5324,6 +5415,98 @@ mod bug_bo_tests {
         assert!(
             still.is_empty(),
             "a pure demote race must clear the missing set (no quarantine)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CO-1-3 — Raft-remove-FIRST de-location ordering tests.
+//
+// `delocate_replica` is the single ordered expression of the LOCKED-IN
+// contract used by BOTH the scheduler cache-flush dispatch and the tiering
+// demote dispatch. A recording mock asserts: (a) the Raft RemoveChunkLocation
+// runs before any byte delete; (b) on a forced Raft-write failure NO byte
+// delete is issued (no phantom replica); (c) a post-commit byte-delete
+// failure is reported as RemovedBytesLeftover (the SM entry is already gone;
+// the CO-3-2 orphan reaper reclaims the leftover bytes) and never rolls the
+// Raft remove back.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod co_1_3_delocate_order_tests {
+    use super::{delocate_replica, DelocateOps, DelocateOutcome};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingOps {
+        /// Ordered log of side effects: "remove" then "delete".
+        calls: Mutex<Vec<&'static str>>,
+        remove_fails: bool,
+        delete_fails: bool,
+    }
+
+    impl DelocateOps for RecordingOps {
+        async fn remove_location(&self) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push("remove");
+            if self.remove_fails {
+                Err(anyhow::anyhow!("forced raft remove failure"))
+            } else {
+                Ok(())
+            }
+        }
+        async fn delete_bytes(&self) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push("delete");
+            if self.delete_fails {
+                Err(anyhow::anyhow!("forced byte-delete RPC failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn happy_path_removes_then_deletes_in_order() {
+        let ops = RecordingOps::default();
+        let outcome = delocate_replica(&ops).await;
+        assert_eq!(outcome, DelocateOutcome::Done);
+        assert_eq!(
+            *ops.calls.lock().unwrap(),
+            vec!["remove", "delete"],
+            "Raft remove MUST precede the byte delete"
+        );
+    }
+
+    /// The plan's primary done-when: on a FORCED Raft-write failure, NO
+    /// DeleteChunkReplica/byte-delete RPC is issued, so no phantom replica
+    /// (bytes-gone-but-still-advertised) can ever result.
+    #[tokio::test]
+    async fn forced_raft_failure_issues_no_byte_delete() {
+        let ops = RecordingOps { remove_fails: true, ..Default::default() };
+        let outcome = delocate_replica(&ops).await;
+        assert_eq!(outcome, DelocateOutcome::RemoveFailed);
+        assert_eq!(
+            *ops.calls.lock().unwrap(),
+            vec!["remove"],
+            "a failed Raft remove must short-circuit BEFORE any byte delete"
+        );
+        assert!(
+            !ops.calls.lock().unwrap().contains(&"delete"),
+            "no byte-delete RPC may be issued when the Raft remove failed"
+        );
+    }
+
+    /// A byte-delete failure AFTER a committed remove de-locates the replica
+    /// in the SM (entry gone); the leftover on-disk bytes are reclaimed by
+    /// the CO-3-2 orphan reaper. The committed Raft remove is never rolled
+    /// back (only `remove` + `delete` were attempted, in that order).
+    #[tokio::test]
+    async fn post_commit_byte_delete_failure_leaves_reapable_bytes() {
+        let ops = RecordingOps { delete_fails: true, ..Default::default() };
+        let outcome = delocate_replica(&ops).await;
+        assert_eq!(outcome, DelocateOutcome::RemovedBytesLeftover);
+        assert_eq!(
+            *ops.calls.lock().unwrap(),
+            vec!["remove", "delete"],
+            "remove commits first; the failed delete is NOT rolled back"
         );
     }
 }
