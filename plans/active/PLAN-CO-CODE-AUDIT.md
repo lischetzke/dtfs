@@ -362,7 +362,7 @@ via builder `10.20.0.150`); use `wait_for`, last line `STATUS: …`.
 | CO-1-3 | HIGH | scheduler.rs:1380, tiering.rs:497 | reorder: Raft `RemoveChunkLocation` (enforce_anchor) FIRST, byte delete after; rely on CO-3-2 reap for RPC-failed leftovers | on a forced Raft-write failure, no `DeleteChunkReplica` RPC issued; no phantom replica |
 | CO-2-2 | HIGH(sec) | metadata.rs:1059 | add `shared_secret` to `ForwardWriteRequest` (proto), verify (constant-time) in `forward_client_write` | unauthorized `ForwardClientWrite(DeleteFile)` → PERMISSION_DENIED, file intact |
 | CO-2-3 | HIGH(sec) | join.rs:137, api.rs:914 | persist the phase-1 challenge (TTL), require `HMAC(secret, challenge)` in complete, derive `node_id = node_id_from_hostname(hostname)` server-side | forged `/join/complete` (no prior request / mismatched node_id) rejected; existing node's grpc_addr unchanged |
-| CO-2-4 | HIGH(sec) | dtfs-cli updater.rs:414,339 | `tempfile::tempdir()` (bail EEXIST) for staging; install via copy-to-`.new` + `rename` | (unit) pre-created dir errors; install leaves no truncated dest window |
+| CO-2-4 ✅ | HIGH(sec) | dtfs-cli updater.rs:414,339 | `tempfile::tempdir()` for staging (fresh 0700 dir, bail on create failure); install via copy-to-`.new` + `rename` | (unit) install replaces dst wholesale + leaves no `.new`/truncated-dest window; release case 64 |
 | CO-3-2 | HIGH | scheduler.rs:611 | rebalance must delete bytes after the Raft remove, OR teach the reaper a per-node "on disk, no location entry for this node + grace" rule (also mops CO-1-3) | over-replicated chunk: after rebalance the de-located on-disk copy is reaped |
 | CO-3-3 | HIGH | scheduler.rs:1623 | re-check current SM after detecting `missing` (or require 2 consecutive ticks) before `QuarantineNode` | demote mid-orphan-scan does NOT quarantine the healthy node |
 | CO-3-5 | MED | scheduler.rs:249 vs 304 | `tokio::Mutex` around migration-state load-modify-save | concurrent `schedule_replication` during a tick: task survives, `next_task_id` monotonic |
@@ -425,6 +425,17 @@ rescan; ArcCache never populated (wire-with-byte-accounting vs remove).
 
 ## Deviations
 
+- CO-2-4 (2026-06-13): the sketch said "tempfile::tempdir() (bail EEXIST)".
+  Implemented with `tempfile::tempdir()`, which generates a fresh random
+  dir name and bails on any creation failure — there is no fixed name left
+  to pre-create, so the "pre-created dir errors / EEXIST" sub-test is moot
+  and is dropped. The retained unit tests assert the atomic-install seam
+  (`install_binary` copies to `<dst>.new` then renames: dst replaced
+  wholesale, no `.new` residue, failed install leaves the old dst intact).
+  Added `tempfile = { workspace = true }` to dtfs-cli/Cargo.toml (runtime
+  dep — used by `run_update`, not just tests). Release case
+  `tests/release/cases/64-updater-atomic-install.sh` anchors the scenario
+  (local-node updater; unit-backed, self-SKIPs without the cli/deploy tools).
 - CO-1-1 unit test is a characterization test (proves the current
   overbroad drop via the production `debug_assert`); the surgical
   "drop exactly the right disk" test is added with the fix (needs the new
