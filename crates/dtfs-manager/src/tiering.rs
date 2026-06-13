@@ -944,6 +944,18 @@ pub(crate) struct ReadSample {
     pub count: u32,
 }
 
+/// CO-4-17 — hard cap on the number of `(chunk_id, dc)` rings the
+/// read-window store keeps, and on the samples retained per ring.
+/// `apply_heartbeat_reads` enforces both so a flood of distinct chunk
+/// reads (or a single hot chunk read every heartbeat) cannot grow the
+/// store without bound between the once-per-tick dead-chunk sweep. The
+/// key cap mirrors the data-node's `MAX_CHUNK_DC_ENTRIES`.
+pub(crate) const MAX_READ_WINDOW_KEYS: usize = 10_000;
+/// CO-4-17 — per-ring sample cap. A 30 s heartbeat over a 4 h promote
+/// window is ~480 samples; this keeps a runaway window (e.g. a stuck
+/// clock or a window never queried) from growing unbounded.
+pub(crate) const MAX_READ_WINDOW_SAMPLES: usize = 1_024;
+
 /// AV-2-1 pure kernel — count the total reads in
 /// `[now_ms - window_secs*1000, now_ms]`.
 ///
@@ -993,10 +1005,32 @@ pub(crate) fn apply_heartbeat_reads(
             continue;
         }
         let key = (chunk_id.to_string(), dc.clone());
-        windows
-            .entry(key)
-            .or_default()
-            .push(ReadSample { ts_ms: now_ms, count: *count });
+        // CO-4-17 — bound the number of rings. When the store is at the
+        // key cap and this is a NEW key, evict the ring whose newest
+        // sample is the oldest (least recently active). Without this the
+        // map only shrank in the once-per-tick dead-chunk sweep, so a
+        // flood of distinct chunk reads inside one tick grew it without
+        // bound.
+        if !windows.contains_key(&key) && windows.len() >= MAX_READ_WINDOW_KEYS {
+            if let Some(stalest) = windows
+                .iter()
+                .min_by_key(|(_, ring)| ring.iter().map(|s| s.ts_ms).max().unwrap_or(0))
+                .map(|(k, _)| k.clone())
+            {
+                windows.remove(&stalest);
+            }
+        }
+        let ring = windows.entry(key).or_default();
+        ring.push(ReadSample { ts_ms: now_ms, count: *count });
+        // CO-4-17 — bound the per-ring sample count. A ring is normally
+        // pruned to `window_secs` on query (`read_window_count`), but a
+        // window never queried (e.g. a chunk whose volume has no cache
+        // policy) would otherwise append forever. Drop the oldest
+        // samples once the ring exceeds the cap.
+        if ring.len() > MAX_READ_WINDOW_SAMPLES {
+            let drop_n = ring.len() - MAX_READ_WINDOW_SAMPLES;
+            ring.drain(0..drop_n);
+        }
     }
 }
 
@@ -2782,5 +2816,53 @@ mod audit_co_tests {
         ));
         // Empty anchor dc -> never a constraint.
         assert!(!anchor_violated_after_copy(&[], "", None, None, false));
+    }
+
+    /// CO-4-17 — `apply_heartbeat_reads` bounds the read-window store.
+    /// A flood of distinct chunk ids must not grow the key set past the
+    /// cap, and a single hot chunk read every heartbeat must not grow
+    /// its ring past the per-ring sample cap. Pre-fix neither was
+    /// bounded inside `apply_heartbeat_reads` (only the once-per-tick
+    /// dead-chunk sweep + per-query prune touched the store).
+    #[test]
+    fn co_4_17_read_windows_key_set_stays_bounded() {
+        let mut windows: HashMap<(String, String), Vec<ReadSample>> = HashMap::new();
+        let total = MAX_READ_WINDOW_KEYS + 1_000;
+        for i in 0..total as u64 {
+            let chunk = format!("{i:064x}");
+            let mut reads = HashMap::new();
+            reads.insert("dc-a".to_string(), 1u32);
+            apply_heartbeat_reads(&chunk, &reads, 1_000 + i, &mut windows);
+        }
+        assert!(
+            windows.len() <= MAX_READ_WINDOW_KEYS,
+            "read_windows key set must stay <= MAX (got {})",
+            windows.len()
+        );
+    }
+
+    #[test]
+    fn co_4_17_read_window_ring_stays_bounded() {
+        let mut windows: HashMap<(String, String), Vec<ReadSample>> = HashMap::new();
+        let chunk = "hotchunk";
+        let mut reads = HashMap::new();
+        reads.insert("dc-a".to_string(), 1u32);
+        // 10k heartbeats for one hot chunk: without the per-ring cap the
+        // ring would hold 10k samples.
+        for i in 0..10_000u64 {
+            apply_heartbeat_reads(chunk, &reads, 1_000 + i, &mut windows);
+        }
+        let ring = windows.get(&(chunk.to_string(), "dc-a".to_string())).unwrap();
+        assert!(
+            ring.len() <= MAX_READ_WINDOW_SAMPLES,
+            "per-ring samples must stay <= MAX (got {})",
+            ring.len()
+        );
+        // The retained samples are the most recent ones (oldest dropped).
+        assert_eq!(
+            ring.last().unwrap().ts_ms,
+            1_000 + 9_999,
+            "newest sample must be retained"
+        );
     }
 }
