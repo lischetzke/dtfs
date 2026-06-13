@@ -374,8 +374,8 @@ via builder `10.150.0.150`); use `wait_for`, last line `STATUS: …`.
 | CO-4-6 | MED | tiering.rs:227 | skip legacy-temperature profiles whose volume has an active AV cache policy | after operator flush (future cooldown), reads do NOT re-create the warm replica during cooldown |
 | CO-4-16 | MED | fuse_adapter.rs:311,329,369,759,1078 | map transient cluster errors to EIO, ENOENT only for genuine `NotFound` | lookup during manager outage does not report ENOENT |
 | CO-4-17 | MED | tiering.rs:193, metrics.rs:102 | prune `read_windows` in `apply_heartbeat_reads`; evict `per_chunk_last_access` alongside `per_chunk_reads` | (unit) 10k samples bounded; MAX+k chunks → len ≤ MAX |
-| CO-5-3 | LOW | server.rs:515 | surface `DtfsError::Io` from `commit_chunk_from_tmp` and map via `put_io_status` (ENOSPC → RESOURCE_EXHAUSTED) | (unit) raw_os_error(28) → RESOURCE_EXHAUSTED |
-| CO-5-6 | LOW | dtfs-data main.rs:515,548 | re-enqueue scrub results + per-chunk read counters on heartbeat failure (Bug O pattern) | (helper unit) re-enqueue restores counters |
+| CO-5-3 ✅ | LOW | server.rs:515 | surface `DtfsError::Io` from `commit_chunk_from_tmp` and map via `put_io_status` (ENOSPC → RESOURCE_EXHAUSTED) | (unit) raw_os_error(28) → RESOURCE_EXHAUSTED |
+| CO-5-6 ✅ | LOW | dtfs-data main.rs:515,548 | re-enqueue scrub results + per-chunk read counters on heartbeat failure (Bug O pattern) | (helper unit) re-enqueue restores counters |
 | CO-5-7 | LOW | scheduler.rs:2356 | resolve `FlushSnapshot.anchor` per the file's volume, not the default | (unit) non-default-volume flush enforces its own anchor |
 | CO-5-8 | LOW | scheduler.rs:2540 | flush "remaining" counter = count of remaining would-drop entries, not `examined - actions` | (unit) counter correct |
 | CO-5-9 | LOW-MED | api.rs:2847 | derive the `defaults` block of GET /config from `effective_config_value`, not raw `state.config` | (unit) a `defaults.*` cluster override is visible on read-back |
@@ -422,6 +422,21 @@ rescan; ArcCache never populated (wire-with-byte-accounting vs remove).
   builder 10.150.0.150 (per-crate `cargo test --no-run` compiles; named
   tests fail by panic/assertion as documented). Full-workspace
   `cargo test --workspace --no-run` gate: see commit / build log.
+- 2026-06-13 (CO-5-3, branch fix/co-c-data): commit-time `DtfsError::Io`
+  from `commit_chunk_from_tmp` now routes through `put_io_status`, so an
+  ENOSPC rename/fsync maps to RESOURCE_EXHAUSTED instead of Internal; the
+  tmp_guard Drop still reclaims the tmp on the error path (disarm runs only
+  on success). Test `server::tests::co_5_3_commit_enospc_maps_to_resource_exhausted`
+  (raw_os_error 28 → ResourceExhausted; EIO → Internal). Cargo gate run by
+  the coordinator.
+- 2026-06-13 (CO-5-6, branch fix/co-c-data): on a heartbeat send failure
+  (the `Err` arm) the data node now re-enqueues the drained scrub results
+  (`ChunkStore::restore_scrub_results`) and the harvested per-chunk read
+  counters (`DataMetrics::restore_per_chunk`) — both drain/zero their
+  sources while building the payload, so a dropped heartbeat previously lost
+  them. Tests `metrics::tests::co_5_6_restore_per_chunk_recovers_dropped_counters`
+  and `store::tests::co_5_6_restore_scrub_results_recovers_dropped_summaries`.
+  Cargo gate run by the coordinator.
 
 ## Deviations
 

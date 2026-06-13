@@ -189,6 +189,46 @@ impl DataMetrics {
         harvest
     }
 
+    /// CO-5-6 — fold a previously harvested batch back into the live
+    /// counters. `harvest_per_chunk` zeroes the per-(chunk,dc) counters as
+    /// it drains; if the heartbeat that was carrying them then fails to
+    /// send, the reads are lost and the manager's tiering view stalls.
+    /// On heartbeat failure the caller re-enqueues the drained batch here
+    /// so the next heartbeat ships it. Counts add onto any reads that
+    /// arrived since the drain; last_access is kept at the max so the LRU
+    /// keeps the chunk warm. Honours the same MAX_CHUNK_DC_ENTRIES cap.
+    pub fn restore_per_chunk(&self, harvested: Vec<PerChunkReadHarvest>) {
+        for entry in harvested {
+            // Respect the table cap — don't reinflate past the bound for
+            // chunks we no longer track.
+            if !self.per_chunk_reads.contains_key(&entry.chunk_id)
+                && self.per_chunk_reads.len() >= MAX_CHUNK_DC_ENTRIES
+            {
+                continue;
+            }
+            let by_dc = self
+                .per_chunk_reads
+                .entry(entry.chunk_id.clone())
+                .or_insert_with(DashMap::new);
+            for (dc, count) in entry.reads_by_dc {
+                by_dc
+                    .entry(dc)
+                    .or_insert_with(|| AtomicU64::new(0))
+                    .fetch_add(count as u64, Ordering::Relaxed);
+            }
+            drop(by_dc);
+            if entry.last_access_ms > 0 {
+                let last = self
+                    .per_chunk_last_access
+                    .entry(entry.chunk_id)
+                    .or_insert_with(|| AtomicU64::new(0));
+                if entry.last_access_ms > last.load(Ordering::Relaxed) {
+                    last.store(entry.last_access_ms, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     /// Record a write operation of `bytes` size.
     pub fn record_write(&self, bytes: u64) {
         self.total_writes.fetch_add(1, Ordering::Relaxed);
@@ -445,6 +485,39 @@ mod tests {
             harvest[0].reads_by_dc.get("dc-a").copied(),
             Some(2),
             "two reads spaced >= DEDUP_MS apart MUST count as 2",
+        );
+    }
+
+    /// CO-5-6 regression — a heartbeat that drained the per-chunk read
+    /// counters but then failed to send must not lose the reads. The
+    /// caller re-enqueues the drained harvest via `restore_per_chunk`,
+    /// and the next harvest must report the same counts.
+    #[test]
+    fn co_5_6_restore_per_chunk_recovers_dropped_counters() {
+        let m = DataMetrics::new();
+        let chunk = "c05c05c050000000000000000000000000000000000000000000000000005566";
+        m.record_chunk_read(chunk, "dc-a", 1_000_000);
+        m.record_chunk_read(chunk, "dc-a", 3_000_000);
+
+        // Harvest zeroes the live counters (as the heartbeat builder does).
+        let drained = m.harvest_per_chunk(100);
+        assert_eq!(drained[0].reads_by_dc.get("dc-a").copied(), Some(2));
+        // A second harvest now sees nothing — the counters were drained.
+        assert!(
+            m.harvest_per_chunk(100).is_empty(),
+            "harvest must zero the counters"
+        );
+
+        // Simulated heartbeat failure: re-enqueue the drained batch.
+        m.restore_per_chunk(drained);
+
+        let recovered = m.harvest_per_chunk(100);
+        assert_eq!(recovered.len(), 1, "the restored chunk reappears");
+        assert_eq!(
+            recovered[0].reads_by_dc.get("dc-a").copied(),
+            Some(2),
+            "restore_per_chunk must recover the full per-DC count lost \
+             to the failed heartbeat"
         );
     }
 }
