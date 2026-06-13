@@ -654,7 +654,33 @@ impl ChunkStore {
         &self,
         chunk_id: &ChunkId,
     ) -> DtfsResult<(bool, u64)> {
+        // Node-wide legacy first-found delete (no disk targeting).
+        self.delete_chunk_idempotent_on_disk(chunk_id, None).await
+    }
+
+    /// CO-1-1 — disk-targeted variant of `delete_chunk_idempotent`.
+    /// `disk_id = Some(id)` unlinks ONLY the copy on the matching disk,
+    /// so demoting a warm cache replica can never delete the cold anchor
+    /// bytes co-located on another disk of the same node (replica identity
+    /// is `(node_id, disk_id)`, A.3.4 / Bug BH). `disk_id = None` (an old
+    /// manager that doesn't send the field, or any caller without disk
+    /// context) keeps the legacy first-found-across-all-disks behaviour.
+    /// An unknown `disk_id` (no such disk) is a no-op `(false, 0)` rather
+    /// than a fall-through to first-found, so a stale id never deletes the
+    /// wrong copy.
+    pub async fn delete_chunk_idempotent_on_disk(
+        &self,
+        chunk_id: &ChunkId,
+        disk_id: Option<u32>,
+    ) -> DtfsResult<(bool, u64)> {
         for disk in self.disk_manager.all_disks() {
+            // CO-1-1 — when a specific disk is requested, skip every other
+            // disk so only the matching copy can be unlinked.
+            if let Some(want) = disk_id {
+                if disk.disk_id != want {
+                    continue;
+                }
+            }
             let dat_path = chunk_data_path(&disk.mount_path, chunk_id);
             let meta_path = chunk_meta_path(&disk.mount_path, chunk_id);
 
@@ -2109,6 +2135,103 @@ mod tests {
         assert!(was_present_1, "first delete sees chunk");
         assert!(!was_present_2, "second delete: gone");
         assert_eq!(freed_2, 0);
+    }
+
+    /// CO-1-1 — a two-disk store: disk 0 = Cold (anchor), disk 1 = Warm
+    /// (cache). disk_id is assigned by Vec position in `DiskManager::new`.
+    async fn make_two_disk_store() -> (ChunkStore, TempDir, TempDir) {
+        let cold = TempDir::new().unwrap();
+        let warm = TempDir::new().unwrap();
+        let disk_configs = vec![
+            dtfs_common::config::DiskConfig { path: cold.path().to_path_buf(), tier: DiskTier::Cold },
+            dtfs_common::config::DiskConfig { path: warm.path().to_path_buf(), tier: DiskTier::Warm },
+        ];
+        let dm = DiskManager::new(&disk_configs).unwrap();
+        (ChunkStore::new(dm), cold, warm)
+    }
+
+    /// CO-1-1 — the same chunk lives on the cold anchor (disk 0) AND the
+    /// warm cache (disk 1). Deleting with the WARM disk_id must unlink ONLY
+    /// the warm copy; the cold anchor `.dat` survives. This is the demote
+    /// scenario that pre-fix could delete the anchor (first-found ordering
+    /// returned the cold disk first).
+    #[tokio::test]
+    async fn co_1_1_disk_targeted_delete_preserves_cold_anchor() {
+        let (store, cold, warm) = make_two_disk_store().await;
+        let data = b"co-1-1-anchor-vs-cache";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+
+        // Land the chunk on BOTH disks (cold anchor + warm cache copy).
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Cold).await.unwrap();
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Warm).await.unwrap();
+
+        let cold_dat = chunk_data_path(cold.path(), &chunk_id);
+        let warm_dat = chunk_data_path(warm.path(), &chunk_id);
+        assert!(cold_dat.exists(), "cold anchor present pre-delete");
+        assert!(warm_dat.exists(), "warm cache present pre-delete");
+
+        // Demote: delete ONLY the warm disk (disk_id 1).
+        let (was_present, freed) = store
+            .delete_chunk_idempotent_on_disk(&chunk_id, Some(1))
+            .await
+            .unwrap();
+        assert!(was_present, "warm copy was present");
+        assert_eq!(freed, data.len() as u64);
+
+        assert!(cold_dat.exists(), "CO-1-1: cold anchor MUST survive a warm-disk delete");
+        assert!(!warm_dat.exists(), "warm cache copy unlinked");
+    }
+
+    /// CO-1-1 — `disk_id = None` keeps the legacy first-found behaviour
+    /// (used by the orphan reaper / unlink fan-out that reclaim the whole
+    /// chunk). First-found scans disks in Vec order, so it hits the cold
+    /// disk (disk 0) first here.
+    #[tokio::test]
+    async fn co_1_1_disk_none_is_legacy_first_found() {
+        let (store, cold, warm) = make_two_disk_store().await;
+        let data = b"co-1-1-legacy-first-found";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Cold).await.unwrap();
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Warm).await.unwrap();
+
+        let cold_dat = chunk_data_path(cold.path(), &chunk_id);
+        let warm_dat = chunk_data_path(warm.path(), &chunk_id);
+
+        let (was_present, _) = store
+            .delete_chunk_idempotent_on_disk(&chunk_id, None)
+            .await
+            .unwrap();
+        assert!(was_present);
+        // First-found removes exactly one copy (the disk-0 cold one); the
+        // warm copy remains. (Documented legacy single-copy-per-call shape.)
+        assert!(!cold_dat.exists(), "first-found removed the disk-0 copy");
+        assert!(warm_dat.exists(), "the other disk's copy remains (one per call)");
+    }
+
+    /// CO-1-1 — an unknown disk_id is a no-op, never a fall-through to
+    /// first-found. A stale id must not delete the wrong copy.
+    #[tokio::test]
+    async fn co_1_1_unknown_disk_id_is_noop() {
+        let (store, cold, warm) = make_two_disk_store().await;
+        let data = b"co-1-1-unknown-disk";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Cold).await.unwrap();
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Warm).await.unwrap();
+
+        let (was_present, freed) = store
+            .delete_chunk_idempotent_on_disk(&chunk_id, Some(99))
+            .await
+            .unwrap();
+        assert!(!was_present, "no disk 99 -> no-op");
+        assert_eq!(freed, 0);
+        assert!(chunk_data_path(cold.path(), &chunk_id).exists(), "cold copy untouched");
+        assert!(chunk_data_path(warm.path(), &chunk_id).exists(), "warm copy untouched");
     }
 
     /// AV-4-7 — WAL-recoverable delete. Resolves the AV-1-5

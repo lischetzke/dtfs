@@ -98,6 +98,17 @@ impl fmt::Display for ChunkLocationEntry {
     }
 }
 
+/// CO-1-1 — serde default for the `disk_id` field on the disk-targeted
+/// removal variants (`RemoveChunkLocation`, `RemoveCorruptChunkReplicas`).
+/// Old snapshots / replicated log entries predate the field, so they
+/// deserialize to this sentinel which the apply path interprets as
+/// "node-wide legacy removal" (match on `(chunk_index, node_id)` only,
+/// the pre-CO-1-1 behaviour). `u32::MAX` is never a real `disk_id`
+/// (disk_ids are small Vec-position ints assigned in `DiskManager::new`).
+pub fn legacy_disk_id() -> u32 {
+    u32::MAX
+}
+
 /// Merge `incoming` into `existing` without dropping unrelated chunk indices.
 ///
 /// F-030: the FUSE client sends the *complete* replica set for every chunk
@@ -272,6 +283,13 @@ pub enum ClientRequest {
         /// BLAKE3 hex chunk hashes that the data node confirmed are
         /// corrupt or missing on its disks.
         chunk_hashes: Vec<String>,
+        /// CO-1-1 — only drop entries on this `(node_id, disk_id)` slot.
+        /// `u32::MAX` (the `#[serde(default)]` for old snapshots/log
+        /// entries) means node-wide legacy behaviour: drop every matching
+        /// `(node_id, chunk_hash)` regardless of disk. A corrupt copy on
+        /// one disk must NOT drop the healthy co-located copy on another.
+        #[serde(default = "legacy_disk_id")]
+        disk_id: u32,
     },
 
     // ---- Cluster operations ----
@@ -557,6 +575,15 @@ pub enum ClientRequest {
         /// String form to match `ChunkLocationEntry.node_id` (u64 as
         /// string for protobuf interop).
         node_id: String,
+        /// CO-1-1 — the specific `(node_id, disk_id)` replica to drop.
+        /// Replica identity is `(node_id, disk_id)` (A.3.4 / Bug BH): a
+        /// chunk may legally hold a mandatory replica AND a cache replica
+        /// on ONE node across DIFFERENT disks/tiers, so keying removal on
+        /// `node_id` alone dropped BOTH. `u32::MAX` (the
+        /// `#[serde(default)]` for old snapshots/log entries) preserves the
+        /// pre-CO-1-1 node-wide match on `(chunk_index, node_id)`.
+        #[serde(default = "legacy_disk_id")]
+        disk_id: u32,
         /// When Some, refuse if the resulting state would strand the
         /// anchor for this chunk_index. Threading the policy through
         /// the apply path is cleaner than re-reading the volume here
@@ -601,9 +628,9 @@ impl fmt::Display for ClientRequest {
                 };
                 write!(f, "UpdateChunks({path}, {} chunks, {lease_marker})", chunks.len())
             }
-            Self::RemoveCorruptChunkReplicas { node_id, chunk_hashes } => write!(
+            Self::RemoveCorruptChunkReplicas { node_id, chunk_hashes, disk_id } => write!(
                 f,
-                "RemoveCorruptChunkReplicas(node={node_id}, {} chunks)",
+                "RemoveCorruptChunkReplicas(node={node_id}, disk={disk_id}, {} chunks)",
                 chunk_hashes.len()
             ),
             Self::RegisterNode { node_id, .. } => write!(f, "RegisterNode({node_id})"),
@@ -684,7 +711,7 @@ impl fmt::Display for ClientRequest {
             Self::UpdateNodeDiskUsage { node_id, per_disk } => {
                 write!(f, "UpdateNodeDiskUsage(node={node_id}, {} disks)", per_disk.len())
             }
-            Self::RemoveChunkLocation { path, chunk_index, node_id, enforce_anchor } => {
+            Self::RemoveChunkLocation { path, chunk_index, node_id, disk_id, enforce_anchor } => {
                 let anchor_marker = match enforce_anchor {
                     Some(p) => match p.required_tier {
                         Some(t) => format!(", anchor={}@{}", p.datacenter, t),
@@ -692,7 +719,12 @@ impl fmt::Display for ClientRequest {
                     },
                     None => String::new(),
                 };
-                write!(f, "RemoveChunkLocation({path}, idx={chunk_index}, node={node_id}{anchor_marker})")
+                let disk_marker = if *disk_id == legacy_disk_id() {
+                    String::new()
+                } else {
+                    format!(", disk={disk_id}")
+                };
+                write!(f, "RemoveChunkLocation({path}, idx={chunk_index}, node={node_id}{disk_marker}{anchor_marker})")
             }
             Self::SetChunkCooldown { path, chunk_indexes, expires_at_ms } => {
                 write!(f, "SetChunkCooldown({path}, {} chunks, until={expires_at_ms}ms)",

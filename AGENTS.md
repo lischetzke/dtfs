@@ -193,9 +193,26 @@ independent replica classes:
   `(node_id, disk_id)` (≡ `(node, tier)`), never `node_id` alone (Bug BH,
   `scheduler::replica_already_present`) — a node-only dedup drops the
   second-tier mandatory entry and loops the anchor-lag repair forever.
+- **Removal is disk-targeted too (CO-1-1).** Every replica-drop path now
+  carries the specific `disk_id` so it removes exactly the `(node_id,
+  disk_id)` copy, never a co-located anchor on another disk of the same
+  node. `ClientRequest::RemoveChunkLocation` and
+  `RemoveCorruptChunkReplicas` carry `#[serde(default = "legacy_disk_id")]
+  disk_id: u32`; the `u32::MAX` sentinel (old snapshots/log entries) means
+  legacy node-wide removal (match on `(chunk_index, node_id)` only). The
+  data-plane `DeleteChunkRequest.disk_id` is `optional uint32` (proto3
+  explicit presence): present → unlink only that disk's copy
+  (`store::delete_chunk_idempotent_on_disk`); absent (old manager / whole-
+  chunk reclaim) → legacy first-found across `all_disks()`. The three
+  cache/tiering removers thread the targeted disk:
+  `scheduler::plan_excess_spill_removal` (returns `(node, disk)`),
+  `scheduler::plan_flush_cache` (`FlushAction.disk_id`), and
+  `tiering::plan_chunk_demotions` (`TickDemotion.disk_id`). Whole-chunk
+  reclaimers (unlink fan-out, orphan reaper) intentionally stay node-wide
+  (`disk_id = None`).
 
-When a new code path creates replicas, make the class explicit in its
-name/doc and consult one of these checks.
+When a new code path creates OR removes replicas, make the class explicit
+in its name/doc and consult one of these checks.
 
 **A.3.5 Dev-build date freshness (hard requirement).** Every dev build
 MUST stamp its own build instant into `BUILD_DATE` — `VERSION` defaults

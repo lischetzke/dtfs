@@ -560,7 +560,7 @@ impl TaskScheduler {
         const MAX_REMOVALS_PER_TICK: usize = 50;
 
         // Phase 1 — under a read lock, decide the safe removals.
-        let removals: Vec<(String, u64, u64, Option<dtfs_common::types::AnchorPolicy>, String)> = {
+        let removals: Vec<(String, u64, u64, u32, Option<dtfs_common::types::AnchorPolicy>, String)> = {
             let sm = self.state_data.read().await;
             let mut out = Vec::new();
             'outer: for (path, fm) in &sm.files {
@@ -583,22 +583,25 @@ impl TaskScheduler {
                     by_idx.entry(c.chunk_index).or_default().push(c);
                 }
                 for (idx, entries) in by_idx {
-                    let reps: Vec<(u64, String, DiskTier)> = entries
+                    // CO-1-1 — carry disk_id alongside (node, dc, tier) so
+                    // the removal targets the exact (node, disk) replica,
+                    // never a co-located anchor copy on another disk.
+                    let reps: Vec<(u64, u32, String, DiskTier)> = entries
                         .iter()
                         .filter_map(|e| {
                             let nid = e.node_id.parse::<u64>().ok()?;
                             let info = sm.nodes.get(&nid)?;
                             // CNF-1 — stable disk_id key, never Vec index.
                             let tier = info.disk(e.disk_id).map(|d| d.tier)?;
-                            Some((nid, info.location.datacenter.clone(), tier))
+                            Some((nid, e.disk_id, info.location.datacenter.clone(), tier))
                         })
                         .collect();
-                    if let Some(node) =
+                    if let Some((node, disk_id)) =
                         plan_excess_spill_removal(&reps, &mandatory, anchor.as_ref(), cache_allow)
                     {
                         let chunk_hash =
                             entries.first().map(|e| e.chunk_hash.clone()).unwrap_or_default();
-                        out.push((path.clone(), idx, node, anchor.clone(), chunk_hash));
+                        out.push((path.clone(), idx, node, disk_id, anchor.clone(), chunk_hash));
                         if out.len() >= MAX_REMOVALS_PER_TICK {
                             break 'outer;
                         }
@@ -609,11 +612,13 @@ impl TaskScheduler {
         };
 
         // Phase 2 — issue the Raft removals (lock released).
-        for (path, idx, node, enforce, chunk_hash) in removals {
+        for (path, idx, node, disk_id, enforce, chunk_hash) in removals {
             let req = ClientRequest::RemoveChunkLocation {
                 path: path.clone(),
                 chunk_index: idx,
                 node_id: node.to_string(),
+                // CO-1-1 — target the exact (node, disk) spill replica.
+                disk_id,
                 enforce_anchor: enforce,
             };
             match self.raft.client_write(req).await {
@@ -622,13 +627,14 @@ impl TaskScheduler {
                         path = %path,
                         idx,
                         node,
+                        disk_id,
                         chunk = %chunk_hash,
                         "Bug BX-11 removed an excess spill replica (rebalance toward goal)"
                     );
                     self.audit.log(
                         "scheduler",
                         "rebalance.remove_excess",
-                        &format!("chunk={chunk_hash} path={path} idx={idx} node={node}"),
+                        &format!("chunk={chunk_hash} path={path} idx={idx} node={node} disk={disk_id}"),
                         "removed",
                     );
                 }
@@ -636,6 +642,7 @@ impl TaskScheduler {
                     path = %path,
                     idx,
                     node,
+                    disk_id,
                     error = %e,
                     "Bug BX-11 excess-replica removal failed"
                 ),
@@ -966,10 +973,16 @@ impl TaskScheduler {
     /// idempotent delete (AV-1-5). A `was_present == false` is a
     /// normal no-op (retry, or chunk never landed on this node) and
     /// must NOT be treated as an error.
+    /// CO-1-1 — `disk_id`/`tier` target a specific replica. `disk_id =
+    /// Some(id)` unlinks only that disk's copy (protects a co-located
+    /// anchor on another disk); `None` keeps the legacy first-found
+    /// behaviour for callers without a disk context.
     pub(crate) async fn delete_chunk_replica_on_node(
         &self,
         node_addr: &str,
         chunk_id: &str,
+        disk_id: Option<u32>,
+        tier: &str,
     ) -> anyhow::Result<(bool, u64)> {
         let endpoint = normalize_endpoint(node_addr);
         let mut client = self.tls.connect(&endpoint).await
@@ -979,6 +992,8 @@ impl TaskScheduler {
         let resp = client
             .delete_chunk(dtfs_proto::dtfs::data::DeleteChunkRequest {
                 chunk_id: chunk_id.to_string(),
+                disk_id,
+                tier: tier.to_string(),
             })
             .await
             .map_err(|e| anyhow::anyhow!("DeleteChunkReplica RPC: {}", e))?
@@ -1378,7 +1393,13 @@ impl TaskScheduler {
                 continue;
             };
             match self
-                .delete_chunk_replica_on_node(&node_addr, &action.chunk_id)
+                .delete_chunk_replica_on_node(
+                    &node_addr,
+                    &action.chunk_id,
+                    // CO-1-1 — flush the exact (node, disk) cache replica.
+                    Some(action.disk_id),
+                    &action.tier.to_string(),
+                )
                 .await
             {
                 Ok((was_present, _freed)) => {
@@ -1404,6 +1425,8 @@ impl TaskScheduler {
                         path: action.file_path.clone(),
                         chunk_index: action.chunk_index,
                         node_id: action.node_id.to_string(),
+                        // CO-1-1 — drop only this (node, disk) SM entry.
+                        disk_id: action.disk_id,
                         enforce_anchor: snapshot.anchor.clone(),
                     };
                     if let Err(e) = self.raft.client_write(req).await {
@@ -1751,7 +1774,10 @@ impl TaskScheduler {
                 let age_secs = now_ms.saturating_sub(*mtime_ms) / 1000;
 
                 // Past grace — reap.
-                match self.delete_chunk_replica_on_node(grpc_addr, cid).await {
+                // CO-1-1 — orphan reap removes the whole chunk from the
+                // node (the file is gone), so it stays node-wide: no disk
+                // targeting, legacy first-found.
+                match self.delete_chunk_replica_on_node(grpc_addr, cid, None, "").await {
                     Ok((was_present, freed)) => {
                         let result_msg = if was_present {
                             format!("freed_bytes={freed}")
@@ -2413,6 +2439,15 @@ pub(crate) struct FlushAction {
     pub chunk_index: u64,
     pub chunk_id: String,
     pub node_id: u64,
+    /// CO-1-1 — the specific disk this cache replica lives on. The
+    /// dispatcher passes it to both the data-node delete (so only this
+    /// disk's copy is unlinked) and `RemoveChunkLocation` (so only this
+    /// `(node, disk)` SM entry is dropped), protecting a co-located
+    /// mandatory anchor on another disk of the same node.
+    pub disk_id: u32,
+    /// CO-1-1 — the tier of the disk being flushed, carried so the
+    /// data-node delete can disambiguate by tier as well as disk_id.
+    pub tier: DiskTier,
 }
 
 /// Bug AV (AV-1-11) — one entry per chunk the planner declined to
@@ -2570,11 +2605,19 @@ pub(crate) fn plan_flush_cache(
                 let Ok(nid) = e.node_id.parse::<u64>() else {
                     continue;
                 };
+                // CO-1-1 — the tier was already resolved when we
+                // classified the entry as cache; an unresolvable tier
+                // would never have landed in `would_drop`.
+                let Some(tier) = entry_tier(e) else {
+                    continue;
+                };
                 actions.push(FlushAction {
                     file_path: file_path.clone(),
                     chunk_index,
                     chunk_id: e.chunk_hash.clone(),
                     node_id: nid,
+                    disk_id: e.disk_id,
+                    tier,
                 });
             }
         }
@@ -2937,32 +2980,36 @@ pub(crate) fn under_replicated_tiers<F: Fn(DiskTier) -> u32>(
 /// anchor remain satisfied afterwards, so this can never under-replicate
 /// or strand the anchor. Pure + deterministic (first safe candidate in
 /// replica order).
+// CO-1-1 — each replica is `(node_id, disk_id, dc, tier)`. The removal is
+// keyed on the exact `(node, disk)` slot so a co-located anchor copy on a
+// different disk of the same node is never the one dropped. Returns the
+// `(node_id, disk_id)` of the replica to remove.
 pub(crate) fn plan_excess_spill_removal(
-    replicas: &[(u64, String, DiskTier)],
+    replicas: &[(u64, u32, String, DiskTier)],
     mandatory: &TierReplication,
     anchor: Option<&dtfs_common::types::AnchorPolicy>,
     cache_allowance: u32,
-) -> Option<u64> {
+) -> Option<(u64, u32)> {
     let total = replicas.len() as u32;
     let mandatory_total = mandatory.hot + mandatory.warm + mandatory.cold + mandatory.tape;
     if total <= mandatory_total + cache_allowance {
         return None; // not over goal — leave cache/tiering alone
     }
-    for (idx, (node, _dc, _tier)) in replicas.iter().enumerate() {
-        let remaining: Vec<&(u64, String, DiskTier)> = replicas
+    for (idx, (node, disk_id, _dc, _tier)) in replicas.iter().enumerate() {
+        let remaining: Vec<&(u64, u32, String, DiskTier)> = replicas
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != idx)
             .map(|(_, r)| r)
             .collect();
-        let on_tier = |t: DiskTier| remaining.iter().filter(|(_, _, tt)| *tt == t).count() as u32;
+        let on_tier = |t: DiskTier| remaining.iter().filter(|(_, _, _, tt)| *tt == t).count() as u32;
         let tiers_ok = on_tier(DiskTier::Hot) >= mandatory.hot
             && on_tier(DiskTier::Warm) >= mandatory.warm
             && on_tier(DiskTier::Cold) >= mandatory.cold
             && on_tier(DiskTier::Tape) >= mandatory.tape;
         let anchor_ok = match anchor {
             None => true,
-            Some(a) => remaining.iter().any(|(_, dc, tt)| {
+            Some(a) => remaining.iter().any(|(_, _, dc, tt)| {
                 dc == &a.datacenter
                     && match a.required_tier {
                         Some(rt) => *tt == rt,
@@ -2971,7 +3018,7 @@ pub(crate) fn plan_excess_spill_removal(
             }),
         };
         if tiers_ok && anchor_ok {
-            return Some(*node);
+            return Some((*node, *disk_id));
         }
     }
     None
@@ -2982,8 +3029,14 @@ mod bx5_excess_removal_tests {
     use super::plan_excess_spill_removal;
     use dtfs_common::types::{AnchorPolicy, DiskTier, TierReplication};
 
-    fn rep(node: u64, dc: &str, tier: DiskTier) -> (u64, String, DiskTier) {
-        (node, dc.to_string(), tier)
+    // CO-1-1 — replica carries (node, disk_id, dc, tier). Default disk_id 0
+    // for the single-disk-per-node cases; the co-located test sets it.
+    fn rep(node: u64, dc: &str, tier: DiskTier) -> (u64, u32, String, DiskTier) {
+        (node, 0, dc.to_string(), tier)
+    }
+
+    fn rep_disk(node: u64, disk: u32, dc: &str, tier: DiskTier) -> (u64, u32, String, DiskTier) {
+        (node, disk, dc.to_string(), tier)
     }
 
     // Spilled extra copy beyond mandatory+cache is removed, keeping mandated
@@ -2995,7 +3048,26 @@ mod bx5_excess_removal_tests {
         // cold anchor (node 1) + a spilled hot copy (node 2). allowance 0 -> over.
         let reps = vec![rep(1, "dc-a", DiskTier::Cold), rep(2, "dc-b", DiskTier::Hot)];
         // The removable one is node 2 (removing node 1 would strand the anchor).
-        assert_eq!(plan_excess_spill_removal(&reps, &m, Some(&anchor), 0), Some(2));
+        assert_eq!(plan_excess_spill_removal(&reps, &m, Some(&anchor), 0), Some((2, 0)));
+    }
+
+    // CO-1-1 — a co-located (node 1, cold anchor on disk 0) + (node 1, warm
+    // spill on disk 1) must drop the WARM disk-1 spill, never the cold disk-0
+    // anchor. The plan must return the exact (node, disk) of the spill.
+    #[test]
+    fn drops_colocated_spill_not_anchor() {
+        let m = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 }; // total 1
+        let anchor = AnchorPolicy { datacenter: "dc-a".into(), required_tier: Some(DiskTier::Cold) };
+        let reps = vec![
+            rep_disk(1, 0, "dc-a", DiskTier::Cold), // anchor
+            rep_disk(1, 1, "dc-a", DiskTier::Warm), // spill on the SAME node
+        ];
+        // total 2 > mandatory 1 + allowance 0 -> over. Removing disk 0 strands
+        // the anchor, so the planner must target (node 1, disk 1).
+        assert_eq!(
+            plan_excess_spill_removal(&reps, &m, Some(&anchor), 0),
+            Some((1, 1)),
+        );
     }
 
     // Within mandatory+cache allowance -> nothing removed (don't fight tiering).
@@ -4018,6 +4090,10 @@ mod bug_av_flush_cache_tests {
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
         assert_eq!(actions.len(), 1, "warm replica on disk_id=1 is flushed");
         assert_eq!(actions[0].node_id, 11);
+        // CO-1-1 — the flush action carries the exact (node, disk) so the
+        // delete/RemoveChunkLocation target only this disk's copy.
+        assert_eq!(actions[0].disk_id, 1);
+        assert_eq!(actions[0].tier, DiskTier::Warm);
         assert_eq!(report.mandatory_refusals, 0);
     }
 

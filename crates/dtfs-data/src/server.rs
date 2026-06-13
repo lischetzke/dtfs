@@ -757,9 +757,14 @@ impl DataService for DataServiceImpl {
         // after a previously-successful delete) return success with
         // was_present=false rather than tearing down the whole flush
         // batch with an error.
+        //
+        // CO-1-1 — `disk_id` is `optional` on the wire: a present value
+        // unlinks ONLY that disk's copy (protects a co-located anchor on
+        // another disk); ABSENT (old manager, or a path with no disk
+        // context) falls back to the legacy first-found-across-all-disks.
         let (was_present, freed_bytes) = self
             .store
-            .delete_chunk_idempotent(&chunk_id)
+            .delete_chunk_idempotent_on_disk(&chunk_id, req.disk_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
