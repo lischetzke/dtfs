@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use dtfs_common::config::DataNodeConfig;
+use dtfs_common::error::DtfsError;
 use dtfs_common::types::{ChunkId, DiskStatus, DiskTier, VolumeId};
 use dtfs_proto::dtfs::data::data_service_server::{DataService, DataServiceServer};
 use dtfs_proto::dtfs::data::*;
@@ -523,7 +524,16 @@ impl DataService for DataServiceImpl {
             .store
             .commit_chunk_from_tmp(&chunk_id, &tmp_path, &vol_id, tier, total_size, hash)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            // CO-5-3 — a commit-time I/O failure (e.g. ENOSPC on the
+            // final rename/fsync) must surface through put_io_status so
+            // a disk-full error maps to RESOURCE_EXHAUSTED and the client
+            // backs off, not a generic Internal. The tmp_guard Drop still
+            // reclaims the tmp on this error path (disarm runs only on the
+            // success branch below).
+            .map_err(|e| match e {
+                DtfsError::Io(io) => put_io_status("commit chunk", io),
+                other => Status::internal(other.to_string()),
+            })?;
         // Commit renamed the tmp to its final path; nothing to clean up.
         tmp_guard.disarm();
 
@@ -1359,6 +1369,29 @@ max_io_percent = 10
             "GetChunk channel can buffer {} bytes, over the {} ceiling",
             GET_CHANNEL_DEPTH * GET_PIECE_SIZE,
             CEILING
+        );
+    }
+
+    // CO-5-3 — a commit-time ENOSPC (raw_os_error 28) must map to
+    // RESOURCE_EXHAUSTED via put_io_status so the client backs off and
+    // reroutes, not a generic Internal. The put path routes the
+    // commit_chunk_from_tmp DtfsError::Io through this helper.
+    #[test]
+    fn co_5_3_commit_enospc_maps_to_resource_exhausted() {
+        let enospc = std::io::Error::from_raw_os_error(28);
+        let status = put_io_status("commit chunk", enospc);
+        assert_eq!(
+            status.code(),
+            tonic::Code::ResourceExhausted,
+            "ENOSPC on commit must surface as RESOURCE_EXHAUSTED"
+        );
+
+        let other = std::io::Error::from_raw_os_error(5); // EIO
+        let status = put_io_status("commit chunk", other);
+        assert_eq!(
+            status.code(),
+            tonic::Code::Internal,
+            "non-ENOSPC commit I/O errors stay Internal"
         );
     }
 }
