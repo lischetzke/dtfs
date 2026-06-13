@@ -204,6 +204,12 @@ independent replica classes:
   `should_clear_cooldown_on_demote(cooldown_until_ms, now_ms)` (past/
   absent → clear; future → preserve), never an unconditional
   `SetChunkCooldown(0)`.
+- A volume with an active AV cache policy (`cache_replicas`,
+  `tiering::volume_has_active_cache_policy`) is driven SOLELY by the AV
+  cache tick; the legacy temperature-profile demote/promote SKIPS its
+  chunks (CO-4-6). Otherwise, after an operator flush sets a future
+  cooldown, the legacy promote would re-create the warm replica during the
+  cooldown window, defeating the flush.
 - A mandatory replica MAY co-locate with a cache replica of the same
   chunk on one node (different tier). Replica presence is keyed by
   `(node_id, disk_id)` (≡ `(node, tier)`), never `node_id` alone (Bug BH,

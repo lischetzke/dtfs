@@ -55,6 +55,20 @@ struct LegacyMigration {
     new_temp: DataTemperature,
 }
 
+/// CO-4-6 — does this volume run an active AV cache policy? When true the
+/// volume's chunks are driven SOLELY by the AV cache tick; the legacy
+/// temperature-profile demote/promote SKIPS them so an operator flush
+/// (future cooldown) is not undone by a legacy promote re-creating the
+/// warm replica. Mirrors the `build_av_cache_snapshot` filter: at least
+/// one cache tier with `max > 0` AND a non-zero `promote_window_secs`.
+pub(crate) fn volume_has_active_cache_policy(
+    cache: &dtfs_common::types::CacheReplication,
+) -> bool {
+    let any_tier =
+        cache.hot.max > 0 || cache.warm.max > 0 || cache.cold.max > 0 || cache.tape.max > 0;
+    any_tier && cache.promote_window_secs > 0
+}
+
 /// Tiering engine that evaluates access patterns and triggers tier migrations.
 pub struct TieringEngine {
     config: RwLock<TieringConfig>,
@@ -235,6 +249,30 @@ impl TieringEngine {
     async fn evaluate(&self) -> anyhow::Result<()> {
         let now_ms = now_millis();
 
+        // CO-4-6 — resolve, once per tick, which volumes run an active AV
+        // cache policy and the file_path -> volume_id map. A volume with a
+        // live `cache_replicas` policy is driven SOLELY by `tick_av_cache`;
+        // the legacy temperature path must skip its chunks, or after an
+        // operator flush (which sets a FUTURE cooldown) the legacy promote
+        // re-creates the warm replica during the cooldown window. Read the
+        // SM once here so we never hold the SM lock across the dispatch
+        // awaits below.
+        let (av_cache_volumes, path_to_volume) = {
+            let sm = self.state_data.read().await;
+            let av: std::collections::HashSet<String> = sm
+                .volumes
+                .iter()
+                .filter(|(_, v)| volume_has_active_cache_policy(&v.cache_replicas))
+                .map(|(id, _)| id.clone())
+                .collect();
+            let paths: HashMap<String, String> = sm
+                .files
+                .iter()
+                .map(|(p, fm)| (p.clone(), fm.volume_id.clone()))
+                .collect();
+            (av, paths)
+        };
+
         // CO-4-4 — collect every legacy migration decision UNDER the
         // `access_stats` write lock (classification mutates the profile),
         // then DROP the lock before any dispatch/query await. Pre-fix the
@@ -264,6 +302,13 @@ impl TieringEngine {
                 let target_tier = temperature_to_tier(new_temp);
                 if target_tier == profile.current_tier {
                     continue;
+                }
+                // CO-4-6 — skip the legacy path for chunks whose volume has
+                // an active AV cache policy; `tick_av_cache` owns them.
+                if let Some(vid) = path_to_volume.get(&profile.file_path) {
+                    if av_cache_volumes.contains(vid) {
+                        continue;
+                    }
                 }
                 let demote = tier_rank(target_tier) > tier_rank(profile.current_tier);
                 out.push(LegacyMigration {
@@ -3102,6 +3147,37 @@ mod audit_co_tests {
         );
         assert_eq!(plan.anchor_protected[0].node_id, 10);
         assert_eq!(plan.anchor_protected[0].disk_id, 1);
+    }
+
+    // ---- CO-4-6 — legacy temperature path skips AV-cache volumes ----
+
+    /// CO-4-6 — a volume with at least one cache tier (`max > 0`) and a
+    /// non-zero `promote_window_secs` is "active": the legacy temperature
+    /// path must skip its chunks. A volume with cache disabled (all
+    /// `max == 0`, or `promote_window_secs == 0`) is NOT active and the
+    /// legacy path still handles it.
+    #[test]
+    fn co_4_6_active_cache_policy_detection() {
+        use dtfs_common::types::{CacheReplication, CacheTierConfig};
+        // Active: warm cache max=1, window=60.
+        let mut active = CacheReplication::default();
+        active.warm = CacheTierConfig { min: 0, max: 1 };
+        active.promote_window_secs = 60;
+        assert!(volume_has_active_cache_policy(&active));
+
+        // Window 0 → not active even with a cache tier.
+        let mut no_window = CacheReplication::default();
+        no_window.warm = CacheTierConfig { min: 0, max: 1 };
+        no_window.promote_window_secs = 0;
+        assert!(!volume_has_active_cache_policy(&no_window));
+
+        // No cache tier (all max=0) → not active.
+        let mut no_tier = CacheReplication::default();
+        no_tier.promote_window_secs = 60;
+        assert!(!volume_has_active_cache_policy(&no_tier));
+
+        // Default (empty) → not active.
+        assert!(!volume_has_active_cache_policy(&CacheReplication::default()));
     }
 
     /// CO-4-17 — `apply_heartbeat_reads` bounds the read-window store.
