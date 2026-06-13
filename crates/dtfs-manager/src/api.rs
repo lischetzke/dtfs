@@ -2882,21 +2882,19 @@ async fn get_config(State(state): State<Arc<AppState>>) -> Json<Value> {
     if let Some(over_tiering) = raw_override.get("tiering") {
         json_deep_merge(&mut tiering, over_tiering);
     }
+    // CO-5-9 — the `defaults` block MUST also project the override on top,
+    // exactly like `tiering` above (BUG-CM pattern). Pre-fix it was built from
+    // raw `state.config.defaults`, so a cluster-wide `defaults.*` override was
+    // invisible on read-back. Serialise the whole VolumeDefaults and overlay
+    // the override's `defaults` sub-object.
+    let mut defaults = serde_json::to_value(&state.config.defaults).unwrap_or(Value::Null);
+    if let Some(over_defaults) = raw_override.get("defaults") {
+        json_deep_merge(&mut defaults, over_defaults);
+    }
     Json(json!({
         "version": sm.cluster_config.version,
         "config": raw_override,
-        "defaults": {
-            "chunk_size_mb": state.config.defaults.chunk_size_mb,
-            "write_safety": {
-                "min_replicas_before_ack": state.config.defaults.write_safety.min_replicas_before_ack,
-                "write_timeout_secs": state.config.defaults.write_safety.write_timeout_secs,
-            },
-            "replication": {
-                "hot": state.config.defaults.replication.hot,
-                "warm": state.config.defaults.replication.warm,
-                "cold": state.config.defaults.replication.cold,
-            },
-        },
+        "defaults": defaults,
         "tiering": tiering,
     }))
 }
@@ -3867,6 +3865,47 @@ mod co_4_3_config_override_validation_tests {
         let err = merge_and_validate_override(&base, "{not json")
             .expect_err("malformed JSON must fail");
         assert!(err.contains("invalid config JSON"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod co_5_9_defaults_readback_tests {
+    use super::*;
+
+    // CO-5-9 — the GET /config `defaults` block must project a cluster-wide
+    // `defaults.*` override on top of the startup config (BUG-CM pattern),
+    // mirroring the production handler's merge. Pre-fix the block was built
+    // from raw state.config.defaults, so the override was invisible.
+    #[test]
+    fn defaults_override_visible_on_readback() {
+        // Startup defaults serialised, as the handler does.
+        let startup = dtfs_common::config::DefaultsConfig {
+            chunk_size_mb: 128,
+            write_safety: dtfs_common::types::WriteSafety {
+                min_replicas_before_ack: 1,
+                write_timeout_secs: 30,
+            },
+            replication: dtfs_common::types::TierReplication {
+                hot: 0,
+                warm: 2,
+                cold: 1,
+                tape: 1,
+            },
+            anchor_datacenter: None,
+        };
+        let mut defaults = serde_json::to_value(&startup).unwrap();
+
+        // Cluster-wide override (as stored in cluster_config.config_json),
+        // bumping a single defaults leaf.
+        let raw_override = json!({ "defaults": { "chunk_size_mb": 256 } });
+        if let Some(over_defaults) = raw_override.get("defaults") {
+            json_deep_merge(&mut defaults, over_defaults);
+        }
+
+        assert_eq!(defaults["chunk_size_mb"], json!(256), "override projected");
+        // Un-overridden siblings keep their startup values.
+        assert_eq!(defaults["write_safety"]["min_replicas_before_ack"], json!(1));
+        assert_eq!(defaults["replication"]["warm"], json!(2));
     }
 }
 
