@@ -3114,8 +3114,9 @@ mod audit_co_tests {
         cache.warm = CacheTierConfig { min: 0, max: 1 };
         cache.promote_window_secs = 60;
         cache.promote_reads = 2;
-        let mut mandatory = TierReplication::default();
-        mandatory.cold = 1;
+        // Mandatory = cold only (warm/hot/tape 0) so warm is a pure cache
+        // tier; TierReplication::default() is {3,2,1,1}, NOT all-zero.
+        let mandatory = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
         let policy = TickVolumePolicy {
             mandatory,
             cache,
