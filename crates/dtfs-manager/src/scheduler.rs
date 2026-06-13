@@ -1739,8 +1739,9 @@ impl TaskScheduler {
                 }
             }
 
+            let node_expected = expected_by_node.get(node_id);
             for (cid, mtime_ms) in &on_disk {
-                // Bug BP-4 — a chunk is an orphan candidate ONLY when NO
+                // Bug BP-4 — a chunk is an orphan candidate when NO
                 // FileMetadata references its hash (`in_state_chunks` is the
                 // union of every file's chunk hashes). Never reap a chunk a
                 // file still points at, even if its location record looks
@@ -1748,6 +1749,20 @@ impl TaskScheduler {
                 // dropped location bindings; the hash-referenced guard here
                 // is the defence-in-depth backstop). AGENTS.md §A.6 #8.
                 let is_orphan = chunk_is_orphan(&in_state_chunks, cid);
+
+                // CO-3-2 — a chunk on this node's disk for which the SM
+                // records NO location entry naming this node is a phantom
+                // replica (the rebalance / excess-spill path drops the SM
+                // entry via `RemoveChunkLocation` but never deletes the
+                // de-located bytes). Reap it node-wide after the same
+                // durable-mtime grace. This supersets `is_orphan` (a
+                // hash-orphan is named by no node), but we keep both signals
+                // explicit. Both are safe: a chunk a file still points at on
+                // THIS node stays in `node_expected`, and the mtime grace
+                // protects an in-flight put whose `commit_chunk_locations`
+                // Raft write has not yet applied.
+                let de_located = chunk_delocated_on_node(node_expected, cid);
+                let reap_candidate = is_orphan || de_located;
 
                 // Bug CB — measure the reap grace against the chunk's
                 // DURABLE on-disk mtime, not a manager-local "first
@@ -1758,11 +1773,11 @@ impl TaskScheduler {
                 // usage of deleted files never dropped). The mtime survives
                 // restarts; a freshly-written chunk (recent mtime) is still
                 // protected against the in-flight put/promote race.
-                if !orphan_reap_due(is_orphan, *mtime_ms, now_ms, grace_secs) {
-                    // Surface a known-orphan we are deferring only because
-                    // its age is unknown (mtime 0 = pre-Bug-CB data node),
-                    // so a permanently-stalled reap is diagnosable.
-                    if is_orphan && *mtime_ms == 0 {
+                if !orphan_reap_due(reap_candidate, *mtime_ms, now_ms, grace_secs) {
+                    // Surface a known reap candidate we are deferring only
+                    // because its age is unknown (mtime 0 = pre-Bug-CB data
+                    // node), so a permanently-stalled reap is diagnosable.
+                    if reap_candidate && *mtime_ms == 0 {
                         debug!(
                             node = %node_id, chunk = %cid,
                             "Bug CB: orphan deferred — data node reported no \
@@ -1774,9 +1789,11 @@ impl TaskScheduler {
                 let age_secs = now_ms.saturating_sub(*mtime_ms) / 1000;
 
                 // Past grace — reap.
-                // CO-1-1 — orphan reap removes the whole chunk from the
-                // node (the file is gone), so it stays node-wide: no disk
-                // targeting, legacy first-found.
+                // CO-1-1 / CO-3-2 — the reap removes the whole chunk from
+                // the node (the file is gone, or the node was de-located),
+                // so it stays node-wide: no disk targeting, legacy
+                // first-found.
+                let cause = if is_orphan { "orphan" } else { "delocated" };
                 match self.delete_chunk_replica_on_node(grpc_addr, cid, None, "").await {
                     Ok((was_present, freed)) => {
                         let result_msg = if was_present {
@@ -1787,7 +1804,7 @@ impl TaskScheduler {
                         self.audit.log(
                             "scheduler",
                             "orphan.reaped",
-                            &format!("node={node_id} chunk={cid} age_secs={age_secs}"),
+                            &format!("node={node_id} chunk={cid} cause={cause} age_secs={age_secs}"),
                             &result_msg,
                         );
                         reaped += 1;
@@ -2842,6 +2859,40 @@ pub(crate) fn chunk_is_orphan(
     chunk_hash: &str,
 ) -> bool {
     !in_state_chunks.contains(chunk_hash)
+}
+
+/// CO-3-2 — is an on-disk chunk a reap candidate for THIS node because the
+/// state machine no longer records any location entry naming the node for
+/// that chunk? This is the "de-located bytes" condition: the rebalance /
+/// excess-spill path (`check_misplaced_rebalance`) commits a
+/// `RemoveChunkLocation` to drop a replica from the SM but never deletes the
+/// on-disk `.dat` on the de-located node, so the bytes linger forever as a
+/// phantom replica. After the durable-mtime grace (`orphan_reap_due`), the
+/// orphan_scrub reaps them here.
+///
+/// `node_expected` is the set of chunk hashes the SM believes this node
+/// holds (the union across all of the node's disks; built from every file's
+/// chunk locations). A chunk on the node's disk that is NOT in that set has
+/// no live location entry naming the node, so the bytes are safe to reap
+/// (node-wide — a de-located node should hold no copy at all).
+///
+/// This strictly supersets `chunk_is_orphan`: a chunk referenced by NO file
+/// is named by no node either, so it is also absent from every
+/// `node_expected`. The hash-orphan check is kept as the explicit primary
+/// signal; this adds the per-node de-location case (AGENTS.md §A.6 #8). The
+/// caller still gates the actual delete behind the mtime grace, so an
+/// in-flight put/promote whose `commit_chunk_locations` Raft write has not
+/// yet applied (recent mtime) is never dropped.
+pub(crate) fn chunk_delocated_on_node(
+    node_expected: Option<&std::collections::HashSet<String>>,
+    chunk_hash: &str,
+) -> bool {
+    match node_expected {
+        Some(expected) => !expected.contains(chunk_hash),
+        // The SM records no chunks at all for this node -> nothing here is
+        // expected -> every on-disk chunk is de-located.
+        None => true,
+    }
 }
 
 /// Bug CB — is an on-disk chunk due to be reaped this tick? A chunk is
@@ -4997,6 +5048,55 @@ mod bug_bo_tests {
         assert!(
             orphan_reap_due(true, mtime_ms, now_2, grace_secs),
             "reap verdict must not reset across a manager restart"
+        );
+    }
+
+    /// CO-3-2 — a chunk on a node's disk whose SM has NO location entry
+    /// naming that node is "de-located" and a reap candidate, even though
+    /// the chunk hash may still be referenced elsewhere (so it is NOT a
+    /// hash-orphan). This is the rebalance / excess-spill leftover: the
+    /// `RemoveChunkLocation` dropped the SM entry on this node, but the
+    /// bytes linger on disk. Verifies the per-node predicate and that it
+    /// supersets the hash-orphan signal.
+    #[test]
+    fn co_3_2_delocated_chunk_is_reap_candidate() {
+        // Node 10 is expected (per current SM) to hold only "keep".
+        let mut node10: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        node10.insert("keep".to_string());
+
+        // "keep" stays on node 10 -> NOT de-located.
+        assert!(
+            !chunk_delocated_on_node(Some(&node10), "keep"),
+            "a chunk the SM still names this node for is not de-located"
+        );
+
+        // "spilled" was de-located by rebalance: the chunk hash is still
+        // referenced by another replica elsewhere (so chunk_is_orphan would
+        // be false against the global union), but node 10 no longer holds an
+        // entry for it -> de-located on this node -> reap candidate.
+        assert!(
+            chunk_delocated_on_node(Some(&node10), "spilled"),
+            "a chunk no SM entry names on this node IS de-located"
+        );
+
+        // A node the SM records nothing for: every on-disk chunk is
+        // de-located (e.g. a fully drained node still holding leftover bytes).
+        assert!(chunk_delocated_on_node(None, "anything"));
+
+        // CO-3-2 + Bug CB — the de-located candidate is still gated by the
+        // durable-mtime grace, so a recently-written chunk whose
+        // commit_chunk_locations Raft write has not yet applied is protected.
+        let now_ms: u64 = 1_700_000_000_000;
+        let grace_secs: u64 = 86_400;
+        let reap_candidate = chunk_delocated_on_node(Some(&node10), "spilled");
+        assert!(
+            !orphan_reap_due(reap_candidate, now_ms - 60_000, now_ms, grace_secs),
+            "a freshly-written de-located chunk is still protected by grace"
+        );
+        assert!(
+            orphan_reap_due(reap_candidate, now_ms - (grace_secs + 10) * 1000, now_ms, grace_secs),
+            "an aged de-located chunk past grace is reaped"
         );
     }
 }

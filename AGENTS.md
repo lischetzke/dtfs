@@ -456,7 +456,14 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   hung the `buffer_unordered` copy round and the whole scheduler loop after
   one leader-onset pass. So the pre-tick prune may add a SECOND
   `save_migration_state` Raft write when it drops tasks; steady-state is still
-  one.
+  one. The orphan_scrub (`orphan_scrub_tick`) reaps per-node in two cases,
+  both gated by the Bug CB durable-mtime grace (`orphan_reap_due`): a HASH
+  orphan (no file references the hash; `chunk_is_orphan`) AND **CO-3-2** a
+  DE-LOCATED chunk (on a node's disk but the SM records no location entry
+  naming that node — the rebalance / excess-spill path drops the SM entry via
+  `RemoveChunkLocation` but never deletes the bytes; `chunk_delocated_on_node`);
+  the reap audits `cause=orphan|delocated`. The reap stays node-wide (legacy
+  first-found delete; ListChunks carries no disk_id).
 - `dtfs-manager/src/monitor.rs` — heartbeat health detection only
   (Bug CH): commits node-status transitions, fires NodeDown/SMART
   alerts. MUST NOT schedule repair — the 2026-06-06 storm came from a
