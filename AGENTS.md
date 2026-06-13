@@ -108,7 +108,16 @@ over the cold anchor HDD, never overriding a strictly-nearer replica) → stream
 GetChunk → optionally cache locally (P0-11) → readahead engine prefetches
 (folder- or file-sequential). `GetFileLocations` carries each replica's tier
 (`ChunkLocationInfo.node_tiers`, positional with `node_addresses`); an older
-manager leaves it empty (→ unknown tier → pure distance).
+manager leaves it empty (→ unknown tier → pure distance). It also carries each
+replica's topology `Location` (`ChunkLocationInfo.node_locations`, positional
+with `node_addresses`, CO-3-10) — the manager fills it from each replica node's
+registered Location and the FUSE client learns it into `known_locations`
+(keyed by node address, `filesystem.rs::learn_locations` on metadata refresh)
+so `select_read_replica` can actually rank by distance + `read_location_priority`
+(before CO-3-10 the map was never populated, so read routing was dead). An older
+manager (or an unknown replica node) leaves an entry empty/all-empty → not
+learned → that replica falls back to arbitrary/pure-distance order, exactly like
+`node_tiers`.
 
 ## A.3 Conventions — Do Not Break
 
