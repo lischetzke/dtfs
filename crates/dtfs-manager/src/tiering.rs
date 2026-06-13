@@ -39,6 +39,22 @@ pub struct ChunkAccessProfile {
     pub current_node: u64,
 }
 
+/// CO-4-4 — one legacy-temperature migration decision, collected under
+/// the `access_stats` lock and dispatched after the lock is dropped so the
+/// evaluate loop never holds the lock across a dispatch/query await.
+struct LegacyMigration {
+    chunk_id: String,
+    file_path: String,
+    current_node: u64,
+    current_tier: DiskTier,
+    target_tier: DiskTier,
+    reads_by_dc: HashMap<String, u32>,
+    /// true = demote (toward colder tier), false = promote.
+    demote: bool,
+    old_temp: DataTemperature,
+    new_temp: DataTemperature,
+}
+
 /// Tiering engine that evaluates access patterns and triggers tier migrations.
 pub struct TieringEngine {
     config: RwLock<TieringConfig>,
@@ -217,41 +233,58 @@ impl TieringEngine {
     /// Schedules tier migration tasks for chunks whose temperature doesn't
     /// match their current tier.
     async fn evaluate(&self) -> anyhow::Result<()> {
-        let cfg = self.config.read().await;
-        let mut stats = self.access_stats.write().await;
         let now_ms = now_millis();
+
+        // CO-4-4 — collect every legacy migration decision UNDER the
+        // `access_stats` write lock (classification mutates the profile),
+        // then DROP the lock before any dispatch/query await. Pre-fix the
+        // loop held the write lock across `find_target_node` /
+        // `would_violate_anchor` / `schedule_replication` awaits, so a
+        // large evaluate stalled every concurrent `report_access`
+        // (heartbeat) for the whole dispatch duration.
+        let decisions: Vec<LegacyMigration> = {
+            let cfg = self.config.read().await;
+            let mut stats = self.access_stats.write().await;
+            let mut out = Vec::new();
+            for (_chunk_id, profile) in stats.iter_mut() {
+                let old_temp = profile.current_temperature;
+                let new_temp = classify_temperature(
+                    profile.total_reads_1h,
+                    profile.total_reads_24h,
+                    profile.last_access_ms,
+                    now_ms,
+                    cfg.hot_threshold_reads_per_hour,
+                    cfg.cold_threshold_days,
+                    cfg.frozen_threshold_days,
+                );
+                profile.current_temperature = new_temp;
+                if old_temp == new_temp {
+                    continue;
+                }
+                let target_tier = temperature_to_tier(new_temp);
+                if target_tier == profile.current_tier {
+                    continue;
+                }
+                let demote = tier_rank(target_tier) > tier_rank(profile.current_tier);
+                out.push(LegacyMigration {
+                    chunk_id: profile.chunk_id.clone(),
+                    file_path: profile.file_path.clone(),
+                    current_node: profile.current_node,
+                    current_tier: profile.current_tier,
+                    target_tier,
+                    reads_by_dc: profile.reads_by_dc.clone(),
+                    demote,
+                    old_temp,
+                    new_temp,
+                });
+            }
+            out
+        };
 
         let mut tier_up = 0u32;
         let mut tier_down = 0u32;
-
-        for (_chunk_id, profile) in stats.iter_mut() {
-            let old_temp = profile.current_temperature;
-
-            // Classify temperature based on access patterns.
-            let new_temp = classify_temperature(
-                profile.total_reads_1h,
-                profile.total_reads_24h,
-                profile.last_access_ms,
-                now_ms,
-                cfg.hot_threshold_reads_per_hour,
-                cfg.cold_threshold_days,
-                cfg.frozen_threshold_days,
-            );
-
-            profile.current_temperature = new_temp;
-
-            if old_temp == new_temp {
-                continue;
-            }
-
-            let target_tier = temperature_to_tier(new_temp);
-
-            if target_tier == profile.current_tier {
-                continue;
-            }
-
-            // Need to migrate this chunk to a different tier.
-            let direction = if tier_rank(target_tier) > tier_rank(profile.current_tier) {
+        for d in &decisions {
+            let direction = if d.demote {
                 tier_down += 1;
                 "demote"
             } else {
@@ -262,23 +295,28 @@ impl TieringEngine {
             info!(
                 "Tiering {}: chunk {} ({:?} -> {:?}, tier {:?} -> {:?})",
                 direction,
-                profile.chunk_id,
-                old_temp,
-                new_temp,
-                profile.current_tier,
-                target_tier,
+                d.chunk_id,
+                d.old_temp,
+                d.new_temp,
+                d.current_tier,
+                d.target_tier,
             );
 
             // Find a target node with the right tier.
             let target_node = self
-                .find_target_node(target_tier, profile.current_node, &profile.reads_by_dc)
+                .find_target_node(d.target_tier, d.current_node, &d.reads_by_dc)
                 .await;
 
             if let Some(target) = target_node {
                 // P0-10: anchor-protect. If the volume has an anchor DC set,
                 // refuse migrations that would leave 0 replicas in that DC.
                 let anchor_violated = self
-                    .would_violate_anchor(profile, target)
+                    .would_violate_anchor_for(
+                        &d.file_path,
+                        &d.chunk_id,
+                        d.current_node,
+                        target,
+                    )
                     .await;
                 if anchor_violated {
                     self.audit.log(
@@ -286,8 +324,7 @@ impl TieringEngine {
                         "tier.anchor_protected",
                         &format!(
                             "chunk={} path={} refused {:?}->{:?}",
-                            profile.chunk_id, profile.file_path,
-                            profile.current_tier, target_tier
+                            d.chunk_id, d.file_path, d.current_tier, d.target_tier
                         ),
                         "refused",
                     );
@@ -296,10 +333,10 @@ impl TieringEngine {
                             crate::alerts::AlertKind::AnchorViolated,
                             "tier migration refused — would strand anchor DC",
                             serde_json::json!({
-                                "chunk_id": profile.chunk_id,
-                                "file_path": profile.file_path,
-                                "source_tier": format!("{:?}", profile.current_tier),
-                                "target_tier": format!("{:?}", target_tier),
+                                "chunk_id": d.chunk_id,
+                                "file_path": d.file_path,
+                                "source_tier": format!("{:?}", d.current_tier),
+                                "target_tier": format!("{:?}", d.target_tier),
                                 "target_node": target,
                             }),
                         );
@@ -309,10 +346,10 @@ impl TieringEngine {
 
                 self.scheduler
                     .schedule_replication(
-                        &profile.chunk_id,
-                        profile.current_node,
+                        &d.chunk_id,
+                        d.current_node,
                         target,
-                        target_tier,
+                        d.target_tier,
                     )
                     .await;
 
@@ -321,14 +358,14 @@ impl TieringEngine {
                     &format!("tier.{direction}"),
                     &format!(
                         "chunk={} {:?}->{:?}",
-                        profile.chunk_id, profile.current_tier, target_tier
+                        d.chunk_id, d.current_tier, d.target_tier
                     ),
                     "scheduled",
                 );
             } else {
                 warn!(
                     "No suitable target node found for tier {:?} migration of chunk {}",
-                    target_tier, profile.chunk_id
+                    d.target_tier, d.chunk_id
                 );
             }
         }
@@ -763,11 +800,11 @@ impl TieringEngine {
         TickSnapshot { chunks, nodes: node_views, volumes }
     }
 
-    /// P0-10: return `true` if moving `profile`'s chunk to `target_node`
+    /// P0-10: return `true` if moving `file_path`'s chunk to `target_node`
     /// would leave the volume's anchor DC with zero replicas of this chunk.
     ///
     /// Logic:
-    /// 1. Look up the file's `volume_id` from `sm.files[profile.file_path]`.
+    /// 1. Look up the file's `volume_id` from `sm.files[file_path]`.
     /// 2. Resolve the volume's anchor via `effective_anchor()` (CO-4-7:
     ///    reads the resolved `AnchorPolicy` so a volume that set the new
     ///    `anchor` field — not just the legacy `anchor_datacenter` string
@@ -781,13 +818,19 @@ impl TieringEngine {
     ///    `anchor_violated_after_copy(.., is_additive=true)` does NOT
     ///    subtract the source. Pre-CO-4-7 this modelled the copy as a
     ///    move and a sole-anchor LELI->TORO promote was wrongly refused.
-    async fn would_violate_anchor(
+    ///
+    /// CO-4-4 — takes the chunk's identity by value (was `&ChunkAccessProfile`)
+    /// so the caller can drop the `access_stats` lock before this SM-reading
+    /// await runs.
+    async fn would_violate_anchor_for(
         &self,
-        profile: &ChunkAccessProfile,
+        file_path: &str,
+        chunk_id: &str,
+        current_node: u64,
         target_node: u64,
     ) -> bool {
         let sm = self.state_data.read().await;
-        let volume_id = match sm.files.get(&profile.file_path) {
+        let volume_id = match sm.files.get(file_path) {
             Some(meta) => meta.volume_id.clone(),
             None => return false,
         };
@@ -799,7 +842,7 @@ impl TieringEngine {
             Some(a) if !a.datacenter.is_empty() => a.datacenter,
             _ => return false,
         };
-        let file_meta = match sm.files.get(&profile.file_path) {
+        let file_meta = match sm.files.get(file_path) {
             Some(m) => m,
             None => return false,
         };
@@ -815,7 +858,7 @@ impl TieringEngine {
         // Datacenter of every current replica of this chunk.
         let mut replica_dcs: Vec<String> = Vec::new();
         for ent in file_meta.chunks.iter() {
-            if ent.chunk_hash != profile.chunk_id {
+            if ent.chunk_hash != chunk_id {
                 continue;
             }
             // node_id is sometimes a u64 string, sometimes a "http://..." URL.
@@ -832,7 +875,7 @@ impl TieringEngine {
             }
         }
 
-        let source_dc = id_to_dc.get(&profile.current_node).cloned();
+        let source_dc = id_to_dc.get(&current_node).cloned();
         let target_dc = id_to_dc.get(&target_node).cloned();
         anchor_violated_after_copy(
             &replica_dcs,
