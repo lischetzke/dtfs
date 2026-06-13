@@ -576,18 +576,25 @@ impl DtfsFilesystem {
     /// available.
     #[instrument(skip(self), fields(fh, offset, size))]
     pub async fn read(&self, fh: u64, offset: u64, size: u32) -> Result<Bytes> {
-        let file = self
-            .open_files
-            .get(&fh)
-            .context("invalid file handle")?;
-
-        let locations = file
-            .locations
-            .as_ref()
-            .context("file has no location data")?;
-        let chunk_size = file.chunk_size;
-        let file_path = file.path.clone();
-        let volume_id = locations.volume_id.clone();
+        // CO-3-12: clone everything the chunk loop needs out of the DashMap
+        // entry, then DROP the guard before the per-chunk network loop. A
+        // stalled chunk fetch must not hold the open_files entry guard, or it
+        // serializes / deadlocks concurrent opens of the same file. Mirrors
+        // the write()/flush() idiom.
+        let (locations, chunk_size, file_path, volume_id) = {
+            let file = self
+                .open_files
+                .get(&fh)
+                .context("invalid file handle")?;
+            let locations = file
+                .locations
+                .clone()
+                .context("file has no location data")?;
+            let chunk_size = file.chunk_size;
+            let file_path = file.path.clone();
+            let volume_id = locations.volume_id.clone();
+            (locations, chunk_size, file_path, volume_id)
+        }; // guard dropped here, before the await loop below
 
         // F-029: effective file size = max(persisted size, buffered logical
         // size). Without this, every read of bytes that have only been

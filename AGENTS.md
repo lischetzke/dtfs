@@ -485,7 +485,12 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
 - `dtfs-data/src/memory.rs` — Bug G data-node rung: re-exports the common
   core + the ARC-cache shrinker monitor (`run_monitor_with_cache`).
 - `dtfs-fuse/src/filesystem.rs` — FUSE↔cluster bridge: write leases,
-  readahead engine, local disk cache.
+  readahead engine, local disk cache. CO-3-12: `read()` clones the
+  per-call data (path/chunk_size/volume_id/locations) out of the
+  `open_files` entry and DROPS the DashMap guard BEFORE the per-chunk
+  network loop (same idiom as `write()`/`flush()`) — never hold an
+  `open_files` guard across an `.await`, or a stalled chunk fetch
+  serializes concurrent opens of the same file.
 - `dtfs-fuse/src/fuse_adapter.rs` — fuse3 trait impl; cookie scheme at
   `dir_entry_cookie()` — don't diverge readdir/readdirplus (Bug F).
 - `dtfs-common/build.rs` + `src/version.rs` — VERSION (default

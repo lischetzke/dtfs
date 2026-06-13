@@ -368,7 +368,7 @@ via builder `10.150.0.150`); use `wait_for`, last line `STATUS: …`.
 | CO-3-5 | MED | scheduler.rs:249 vs 304 | `tokio::Mutex` around migration-state load-modify-save | concurrent `schedule_replication` during a tick: task survives, `next_task_id` monotonic |
 | CO-3-6 | HIGH | network.rs:120,141,289 | per-request snapshot RPC timeout (`Request::set_timeout` from `option.hard_ttl()` / size-scaled), not the 5 s channel default | `tests/proxmox/abuse/`: >25 MB snapshot installs to a learner behind the 40 Mbps shape |
 | CO-3-7 | HIGH | metadata.rs:1024,1041 | `raft_write_or_forward` + `accepted:false` on failure (don't `let _ =`) | corrupt-chunk report to a FOLLOWER manager still drops the replica + queues re-replication |
-| CO-3-12 | MED | filesystem.rs:545 | clone path/chunk_size/volume_id/locations, drop the DashMap guard before the chunk loop (match write()/flush()) | (loom/integration) stalled read + 4 concurrent opens all complete |
+| CO-3-12 ✅ | MED | filesystem.rs:545 | clone path/chunk_size/volume_id/locations, drop the DashMap guard before the chunk loop (match write()/flush()) | (loom/integration) stalled read + 4 concurrent opens all complete |
 | CO-4-3 | MED-HIGH | api.rs:2889,2951 | strict-validate the override (deep-merge onto effective, require it deserializes as `ManagerConfig`); persist `toml::to_string_pretty` of the merge, never raw JSON into `.toml` | sparse override round-trips through `load_config`; bad-type override → 400 |
 | CO-4-4 | MED | tiering.rs:221,585 | collect decisions under the lock, drop it, then dispatch/query (no lock across await) | (timed) heartbeat latency during a large `evaluate` stays bounded |
 | CO-4-6 | MED | tiering.rs:227 | skip legacy-temperature profiles whose volume has an active AV cache policy | after operator flush (future cooldown), reads do NOT re-create the warm replica during cooldown |
@@ -422,6 +422,16 @@ rescan; ArcCache never populated (wire-with-byte-accounting vs remove).
   builder 10.150.0.150 (per-crate `cargo test --no-run` compiles; named
   tests fail by panic/assertion as documented). Full-workspace
   `cargo test --workspace --no-run` gate: see commit / build log.
+- 2026-06-13 (branch fix/co-c-fuse): CO-3-12 — read() now binds
+  locations/chunk_size/file_path/volume_id in a scoped block and drops the
+  open_files DashMap guard BEFORE the per-chunk await loop (mirrors
+  write()/flush()), so a stalled chunk fetch no longer serializes concurrent
+  opens of the same file. `locations` is now owned (`FileLocations`, was a
+  borrow into the guard). Release case
+  tests/release/cases/65-concurrent-read-no-guard-serialize.sh is a SKIP stub
+  (no live stall-injection seam); the guard-drop is enforced structurally by
+  the scoped block (a borrow held past the block is a compile error). cargo
+  gate run by the coordinator.
 
 ## Deviations
 
