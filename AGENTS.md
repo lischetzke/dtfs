@@ -469,7 +469,26 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   hung the `buffer_unordered` copy round and the whole scheduler loop after
   one leader-onset pass. So the pre-tick prune may add a SECOND
   `save_migration_state` Raft write when it drops tasks; steady-state is still
-  one.
+  one. **CO-3-5:** `tick` and `schedule_replication` both load-modify-save the
+  migration state; both hold the `migration_state_lock` (`tokio::Mutex`)
+  across the load..save so a concurrent schedule during a tick can't clobber a
+  task or regress `next_task_id`. The orphan_scrub (`orphan_scrub_tick`) reaps per-node in two cases,
+  both gated by the Bug CB durable-mtime grace (`orphan_reap_due`): a HASH
+  orphan (no file references the hash; `chunk_is_orphan`) AND **CO-3-2** a
+  DE-LOCATED chunk (on a node's disk but the SM records no location entry
+  naming that node — the rebalance / excess-spill path drops the SM entry via
+  `RemoveChunkLocation` but never deletes the bytes; `chunk_delocated_on_node`);
+  the reap audits `cause=orphan|delocated`. The reap stays node-wide (legacy
+  first-found delete; ListChunks carries no disk_id). **CO-3-3:** before the
+  BF-8 in-state-missing quarantine fires, it re-reads the CURRENT SM
+  (`current_expected_chunks_for_node` + `still_missing_after_recheck`) and
+  drops any chunk a concurrent demote/unlink de-located between the tick's
+  opening snapshot and the ListChunks reply — so a healthy node is never
+  quarantined for a demote race. **CO-5-7:** `FlushSnapshot`/`FlushAction`
+  carry the file's OWN volume anchor (not the default volume's) so a
+  non-default-volume flush enforces its own anchor. **CO-5-8:** the flush
+  `truncated` counter counts the remaining would-drop replica entries
+  directly, not `chunks_examined - actions.len()`.
 - `dtfs-manager/src/monitor.rs` — heartbeat health detection only
   (Bug CH): commits node-status transitions, fires NodeDown/SMART
   alerts. MUST NOT schedule repair — the 2026-06-06 storm came from a

@@ -117,6 +117,14 @@ pub struct TaskScheduler {
     /// CF-6 — resolved `[tls]` context; data-node RPCs speak mTLS when
     /// enabled, plaintext otherwise.
     tls: dtfs_common::tls::TlsContext,
+    /// CO-3-5 — serialises every migration-state read-modify-write so a
+    /// `schedule_replication` call landing concurrently with a `tick`
+    /// cannot clobber a task or regress `next_task_id`. Both load the
+    /// state from Raft, mutate it in memory, and save it back; without
+    /// mutual exclusion the second save overwrites the first writer's
+    /// mutations (lost task / `next_task_id` regression). Held only across
+    /// the load..save critical section, never across an unrelated await.
+    migration_state_lock: tokio::sync::Mutex<()>,
 }
 
 impl TaskScheduler {
@@ -140,6 +148,7 @@ impl TaskScheduler {
             done_task_retention_ms: done_task_retention_secs.saturating_mul(1000),
             failed_task_retention_ms: failed_task_retention_secs.saturating_mul(1000),
             tls,
+            migration_state_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -246,6 +255,11 @@ impl TaskScheduler {
             return Ok(());
         }
 
+        // CO-3-5 — hold the migration-state lock across the entire
+        // load..save lifecycle of this tick so a concurrent
+        // `schedule_replication` cannot interleave its own
+        // load-modify-save and clobber a task / regress `next_task_id`.
+        let _ms_guard = self.migration_state_lock.lock().await;
         let mut migration_state = self.load_migration_state().await;
 
         // Bug CN — prune terminal tasks FIRST and persist immediately, before
@@ -308,6 +322,10 @@ impl TaskScheduler {
         target_node: u64,
         tier: DiskTier,
     ) {
+        // CO-3-5 — serialise with the tick's load-modify-save (and any
+        // other concurrent schedule) so neither writer clobbers the
+        // other's tasks or regresses `next_task_id`.
+        let _ms_guard = self.migration_state_lock.lock().await;
         let mut state = self.load_migration_state().await;
 
         // Avoid duplicate tasks for the same chunk + target.
@@ -1427,7 +1445,9 @@ impl TaskScheduler {
                         node_id: action.node_id.to_string(),
                         // CO-1-1 — drop only this (node, disk) SM entry.
                         disk_id: action.disk_id,
-                        enforce_anchor: snapshot.anchor.clone(),
+                        // CO-5-7 — enforce the FILE's own volume anchor,
+                        // not the default volume's.
+                        enforce_anchor: action.anchor.clone(),
                     };
                     if let Err(e) = self.raft.client_write(req).await {
                         warn!(
@@ -1697,6 +1717,32 @@ impl TaskScheduler {
                 if let Some(expected) = expected_by_node.get(node_id) {
                     let missing: Vec<&String> =
                         expected.iter().filter(|c| !on_disk.contains_key(*c)).collect();
+                    // CO-3-3 — the `expected_by_node` set was snapshotted at
+                    // the top of this tick under one read lock, but the
+                    // ListChunks reply arrives later. A demote / unlink /
+                    // rebalance that committed `RemoveChunkLocation` between
+                    // the snapshot and now leaves the stale snapshot still
+                    // naming the node for a chunk it no longer holds
+                    // (legitimately) — quarantining a healthy node. Re-read
+                    // the CURRENT SM and keep only chunks the node is STILL
+                    // expected to hold; if none remain, the "missing" set was
+                    // a demote race, not a fault — skip the quarantine (but
+                    // still fall through to the on-disk reap below).
+                    let missing: Vec<&String> = if missing.is_empty() {
+                        missing
+                    } else {
+                        let still_expected =
+                            self.current_expected_chunks_for_node(*node_id).await;
+                        let filtered = still_missing_after_recheck(&missing, &still_expected);
+                        if filtered.is_empty() {
+                            debug!(
+                                node = %node_id,
+                                "CO-3-3: in-state-missing cleared on SM re-check \
+                                 (demote/unlink race) — node not quarantined"
+                            );
+                        }
+                        filtered
+                    };
                     if !missing.is_empty() {
                         let first = missing[0].clone();
                         let info = dtfs_common::types::QuarantineInfo {
@@ -1739,8 +1785,9 @@ impl TaskScheduler {
                 }
             }
 
+            let node_expected = expected_by_node.get(node_id);
             for (cid, mtime_ms) in &on_disk {
-                // Bug BP-4 — a chunk is an orphan candidate ONLY when NO
+                // Bug BP-4 — a chunk is an orphan candidate when NO
                 // FileMetadata references its hash (`in_state_chunks` is the
                 // union of every file's chunk hashes). Never reap a chunk a
                 // file still points at, even if its location record looks
@@ -1748,6 +1795,20 @@ impl TaskScheduler {
                 // dropped location bindings; the hash-referenced guard here
                 // is the defence-in-depth backstop). AGENTS.md §A.6 #8.
                 let is_orphan = chunk_is_orphan(&in_state_chunks, cid);
+
+                // CO-3-2 — a chunk on this node's disk for which the SM
+                // records NO location entry naming this node is a phantom
+                // replica (the rebalance / excess-spill path drops the SM
+                // entry via `RemoveChunkLocation` but never deletes the
+                // de-located bytes). Reap it node-wide after the same
+                // durable-mtime grace. This supersets `is_orphan` (a
+                // hash-orphan is named by no node), but we keep both signals
+                // explicit. Both are safe: a chunk a file still points at on
+                // THIS node stays in `node_expected`, and the mtime grace
+                // protects an in-flight put whose `commit_chunk_locations`
+                // Raft write has not yet applied.
+                let de_located = chunk_delocated_on_node(node_expected, cid);
+                let reap_candidate = is_orphan || de_located;
 
                 // Bug CB — measure the reap grace against the chunk's
                 // DURABLE on-disk mtime, not a manager-local "first
@@ -1758,11 +1819,11 @@ impl TaskScheduler {
                 // usage of deleted files never dropped). The mtime survives
                 // restarts; a freshly-written chunk (recent mtime) is still
                 // protected against the in-flight put/promote race.
-                if !orphan_reap_due(is_orphan, *mtime_ms, now_ms, grace_secs) {
-                    // Surface a known-orphan we are deferring only because
-                    // its age is unknown (mtime 0 = pre-Bug-CB data node),
-                    // so a permanently-stalled reap is diagnosable.
-                    if is_orphan && *mtime_ms == 0 {
+                if !orphan_reap_due(reap_candidate, *mtime_ms, now_ms, grace_secs) {
+                    // Surface a known reap candidate we are deferring only
+                    // because its age is unknown (mtime 0 = pre-Bug-CB data
+                    // node), so a permanently-stalled reap is diagnosable.
+                    if reap_candidate && *mtime_ms == 0 {
                         debug!(
                             node = %node_id, chunk = %cid,
                             "Bug CB: orphan deferred — data node reported no \
@@ -1774,9 +1835,11 @@ impl TaskScheduler {
                 let age_secs = now_ms.saturating_sub(*mtime_ms) / 1000;
 
                 // Past grace — reap.
-                // CO-1-1 — orphan reap removes the whole chunk from the
-                // node (the file is gone), so it stays node-wide: no disk
-                // targeting, legacy first-found.
+                // CO-1-1 / CO-3-2 — the reap removes the whole chunk from
+                // the node (the file is gone, or the node was de-located),
+                // so it stays node-wide: no disk targeting, legacy
+                // first-found.
+                let cause = if is_orphan { "orphan" } else { "delocated" };
                 match self.delete_chunk_replica_on_node(grpc_addr, cid, None, "").await {
                     Ok((was_present, freed)) => {
                         let result_msg = if was_present {
@@ -1787,7 +1850,7 @@ impl TaskScheduler {
                         self.audit.log(
                             "scheduler",
                             "orphan.reaped",
-                            &format!("node={node_id} chunk={cid} age_secs={age_secs}"),
+                            &format!("node={node_id} chunk={cid} cause={cause} age_secs={age_secs}"),
                             &result_msg,
                         );
                         reaped += 1;
@@ -1803,6 +1866,29 @@ impl TaskScheduler {
         }
 
         Ok(reaped)
+    }
+
+    /// CO-3-3 — the set of chunk hashes the CURRENT state machine records a
+    /// location entry for on `node_id` (the union across all of the node's
+    /// disks). Used by `orphan_scrub_tick` to re-confirm an "in-state but
+    /// not on disk" finding against fresh SM state before quarantining: a
+    /// demote / unlink that committed `RemoveChunkLocation` after the tick's
+    /// opening snapshot drops the chunk from this set, so a stale-snapshot
+    /// false positive is filtered out.
+    async fn current_expected_chunks_for_node(
+        &self,
+        node_id: u64,
+    ) -> std::collections::HashSet<String> {
+        let sm = self.state_data.read().await;
+        let mut out = std::collections::HashSet::new();
+        for f in sm.files.values() {
+            for c in &f.chunks {
+                if c.node_id.parse::<u64>().ok() == Some(node_id) {
+                    out.insert(c.chunk_hash.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Bug BC-6 — invoke `ListChunks` on a single data node, drain all
@@ -2376,9 +2462,18 @@ fn record_copy_failure<O: MigrationOps>(
 /// under a single SM read lock by the async wrapper.
 #[derive(Debug, Clone)]
 pub(crate) struct FlushSnapshot {
-    pub files: Vec<(String, Vec<ChunkLocationEntry>, TierReplication)>, // (path, chunks, mandatory)
+    /// CO-5-7 — per-file `(path, chunks, mandatory, anchor)`. The anchor is
+    /// resolved from the file's OWN volume (not the default volume), so a
+    /// flush on a non-default volume enforces its own anchor invariant. The
+    /// planner copies it onto each `FlushAction` and the dispatcher threads
+    /// it into that action's `RemoveChunkLocation` `enforce_anchor`.
+    pub files: Vec<(
+        String,
+        Vec<ChunkLocationEntry>,
+        TierReplication,
+        Option<dtfs_common::types::AnchorPolicy>,
+    )>,
     pub nodes: HashMap<u64, FlushNodeSummary>,
-    pub anchor: Option<dtfs_common::types::AnchorPolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -2404,29 +2499,24 @@ impl FlushSnapshot {
                 )
             })
             .collect();
-        // Pick any one anchor — file-level overrides aren't a thing yet
-        // (each volume has its own policy; we honour the first matching
-        // file's volume in the dispatcher's per-action RemoveChunkLocation
-        // call).  For the snapshot we cache the most common (default
-        // volume's) anchor for simplicity.
-        let anchor = sm
-            .volumes
-            .get("default")
-            .and_then(|v| v.effective_anchor());
-
         let mut files = Vec::new();
         for (path, meta) in sm.files.iter() {
             if !path.starts_with(path_prefix) {
                 continue;
             }
-            let mandatory = sm
-                .volumes
-                .get(&meta.volume_id)
+            // CO-5-7 — resolve mandatory replicas AND the anchor from the
+            // file's OWN volume, so a flush on a non-default volume enforces
+            // its own anchor (pre-fix the anchor was the default volume's,
+            // which could either over-protect or fail to protect a
+            // non-default volume's actual anchor DC/tier).
+            let vol = sm.volumes.get(&meta.volume_id);
+            let mandatory = vol
                 .map(|v| v.effective_mandatory_replicas().clone())
                 .unwrap_or_else(TierReplication::default);
-            files.push((path.clone(), meta.chunks.clone(), mandatory));
+            let anchor = vol.and_then(|v| v.effective_anchor());
+            files.push((path.clone(), meta.chunks.clone(), mandatory, anchor));
         }
-        Self { files, nodes, anchor }
+        Self { files, nodes }
     }
 }
 
@@ -2448,6 +2538,11 @@ pub(crate) struct FlushAction {
     /// CO-1-1 — the tier of the disk being flushed, carried so the
     /// data-node delete can disambiguate by tier as well as disk_id.
     pub tier: DiskTier,
+    /// CO-5-7 — the anchor policy of the FILE's volume, threaded into the
+    /// dispatcher's `RemoveChunkLocation` `enforce_anchor` so the apply
+    /// path's defence-in-depth anchor check uses this file's own anchor,
+    /// not the default volume's.
+    pub anchor: Option<dtfs_common::types::AnchorPolicy>,
 }
 
 /// Bug AV (AV-1-11) — one entry per chunk the planner declined to
@@ -2527,7 +2622,7 @@ pub(crate) fn plan_flush_cache(
     let mut actions: Vec<FlushAction> = Vec::new();
     let mut report = FlushCacheReport::default();
 
-    'files: for (file_path, chunks, mandatory) in &snapshot.files {
+    for (file_path, chunks, mandatory, anchor) in &snapshot.files {
         report.files_matched += 1;
         // Group by chunk_index so we evaluate each chunk as a unit.
         let mut by_index: std::collections::BTreeMap<u64, Vec<&ChunkLocationEntry>> =
@@ -2596,11 +2691,14 @@ pub(crate) fn plan_flush_cache(
             // we stop enqueueing — operator re-runs the call to pick up
             // remaining work.
             for e in would_drop {
+                // CO-5-8 — once capped, count each remaining would-drop
+                // entry directly into `truncated` (the count of replicas
+                // we declined to flush this call), not the old
+                // `chunks_examined - actions.len()` which mixed chunk and
+                // replica-action units and double-/under-counted.
                 if actions.len() >= max_tasks {
-                    // Count remaining unseen as truncated and bail.
-                    report.truncated +=
-                        report.chunks_examined.saturating_sub(actions.len());
-                    break 'files;
+                    report.truncated += 1;
+                    continue;
                 }
                 let Ok(nid) = e.node_id.parse::<u64>() else {
                     continue;
@@ -2618,6 +2716,8 @@ pub(crate) fn plan_flush_cache(
                     node_id: nid,
                     disk_id: e.disk_id,
                     tier,
+                    // CO-5-7 — carry the file's own volume anchor.
+                    anchor: anchor.clone(),
                 });
             }
         }
@@ -2842,6 +2942,59 @@ pub(crate) fn chunk_is_orphan(
     chunk_hash: &str,
 ) -> bool {
     !in_state_chunks.contains(chunk_hash)
+}
+
+/// CO-3-2 — is an on-disk chunk a reap candidate for THIS node because the
+/// state machine no longer records any location entry naming the node for
+/// that chunk? This is the "de-located bytes" condition: the rebalance /
+/// excess-spill path (`check_misplaced_rebalance`) commits a
+/// `RemoveChunkLocation` to drop a replica from the SM but never deletes the
+/// on-disk `.dat` on the de-located node, so the bytes linger forever as a
+/// phantom replica. After the durable-mtime grace (`orphan_reap_due`), the
+/// orphan_scrub reaps them here.
+///
+/// `node_expected` is the set of chunk hashes the SM believes this node
+/// holds (the union across all of the node's disks; built from every file's
+/// chunk locations). A chunk on the node's disk that is NOT in that set has
+/// no live location entry naming the node, so the bytes are safe to reap
+/// (node-wide — a de-located node should hold no copy at all).
+///
+/// This strictly supersets `chunk_is_orphan`: a chunk referenced by NO file
+/// is named by no node either, so it is also absent from every
+/// `node_expected`. The hash-orphan check is kept as the explicit primary
+/// signal; this adds the per-node de-location case (AGENTS.md §A.6 #8). The
+/// caller still gates the actual delete behind the mtime grace, so an
+/// in-flight put/promote whose `commit_chunk_locations` Raft write has not
+/// yet applied (recent mtime) is never dropped.
+pub(crate) fn chunk_delocated_on_node(
+    node_expected: Option<&std::collections::HashSet<String>>,
+    chunk_hash: &str,
+) -> bool {
+    match node_expected {
+        Some(expected) => !expected.contains(chunk_hash),
+        // The SM records no chunks at all for this node -> nothing here is
+        // expected -> every on-disk chunk is de-located.
+        None => true,
+    }
+}
+
+/// CO-3-3 — given a set of chunks the tick's OPENING snapshot expected on a
+/// node but the node's ListChunks reply omitted (`snapshot_missing`), and
+/// the set the CURRENT state machine still expects on that node
+/// (`current_expected`), return only the chunks that are still genuinely
+/// missing (in both sets). A chunk that dropped out of `current_expected`
+/// between the snapshot and the re-check was de-located by a concurrent
+/// demote / unlink / rebalance — not a fault — so it must NOT trigger a
+/// quarantine. When the result is empty the caller skips the quarantine.
+pub(crate) fn still_missing_after_recheck<'a>(
+    snapshot_missing: &[&'a String],
+    current_expected: &std::collections::HashSet<String>,
+) -> Vec<&'a String> {
+    snapshot_missing
+        .iter()
+        .copied()
+        .filter(|c| current_expected.contains(*c))
+        .collect()
 }
 
 /// Bug CB — is an on-disk chunk due to be reaped this tick? A chunk is
@@ -4044,12 +4197,12 @@ mod bug_av_flush_cache_tests {
                     ent(0, "h", 11, 0), // node 11 = warm
                 ],
                 mandatory_cold_only(),
+                None,
             )],
             nodes: HashMap::from([
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
                 (11u64, node_summary("toro", &[DiskTier::Warm])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4076,6 +4229,7 @@ mod bug_av_flush_cache_tests {
                     ent(0, "h", 11, 1), // node 11 = warm on disk_id=1
                 ],
                 mandatory_cold_only(),
+                None,
             )],
             nodes: HashMap::from([
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
@@ -4084,7 +4238,6 @@ mod bug_av_flush_cache_tests {
                     disk_tiers: vec![(1, DiskTier::Warm)], // sparse: id 1 at index 0
                 }),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4111,12 +4264,12 @@ mod bug_av_flush_cache_tests {
                     ent(0, "h", 12, 0), // node 12 = warm (only)
                 ],
                 mandatory_cold_only(),
+                None,
             )],
             nodes: HashMap::from([
                 (11u64, node_summary("toro", &[DiskTier::Warm])),
                 (12u64, node_summary("nrb",  &[DiskTier::Warm])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4135,6 +4288,7 @@ mod bug_av_flush_cache_tests {
                     format!("/movies/f{i}.bin"),
                     vec![ent(0, &format!("h{i}"), 10, 0), ent(0, &format!("h{i}"), 11, 0)],
                     mandatory_cold_only(),
+                    None,
                 )
             })
             .collect();
@@ -4144,7 +4298,6 @@ mod bug_av_flush_cache_tests {
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
                 (11u64, node_summary("toro", &[DiskTier::Warm])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 3);
@@ -4160,11 +4313,11 @@ mod bug_av_flush_cache_tests {
                 "/movies/cold-only.mkv".to_string(),
                 vec![ent(0, "h", 10, 0)], // cold only
                 mandatory_cold_only(),
+                None,
             )],
             nodes: HashMap::from([
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4192,12 +4345,12 @@ mod bug_av_flush_cache_tests {
                     ent(1, "h1", 12, 0), // warm only
                 ],
                 mandatory_cold_only(),
+                None,
             )],
             nodes: HashMap::from([
                 (11u64, node_summary("toro", &[DiskTier::Warm])),
                 (12u64, node_summary("nrb",  &[DiskTier::Warm])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4224,12 +4377,12 @@ mod bug_av_flush_cache_tests {
                 "/movies/wicked.mkv".to_string(),
                 vec![ent(0, "h", 10, 0), ent(0, "h", 11, 0)],
                 mandatory_cold_only(),
+                None,
             )],
             nodes: HashMap::from([
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
                 (11u64, node_summary("toro", &[DiskTier::Warm])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4278,6 +4431,7 @@ mod bug_av_flush_cache_tests {
                     "/vol-default/foo.bin".to_string(),
                     vec![ent(0, "ha", 10, 0), ent(0, "ha", 11, 0)],
                     mandatory_cold_only(),
+                    None,
                 ),
                 // Volume "office": warm + cold both mandatory; warm
                 // protected from flush even though caller asked for it.
@@ -4285,13 +4439,13 @@ mod bug_av_flush_cache_tests {
                     "/vol-office/bar.docx".to_string(),
                     vec![ent(0, "hb", 10, 0), ent(0, "hb", 11, 0)],
                     mandatory_warm_and_cold(),
+                    None,
                 ),
             ],
             nodes: HashMap::from([
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
                 (11u64, node_summary("toro", &[DiskTier::Warm])),
             ]),
-            anchor: None,
         };
         let (actions, report) =
             plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
@@ -4300,6 +4454,94 @@ mod bug_av_flush_cache_tests {
         assert_eq!(actions[0].file_path, "/vol-default/foo.bin");
         assert_eq!(report.replicas_dropped, 0, "wrapper drives this");
         assert_eq!(report.files_matched, 2);
+    }
+
+    /// CO-5-7 — a flush on a NON-default volume carries that volume's OWN
+    /// anchor on the produced `FlushAction` (which the dispatcher threads
+    /// into `RemoveChunkLocation`'s `enforce_anchor`), not the default
+    /// volume's anchor. Two files in different volumes, each with a distinct
+    /// anchor DC; each action must reflect its own file's anchor.
+    #[test]
+    fn co_5_7_flush_action_uses_per_file_volume_anchor() {
+        let anchor_leli = dtfs_common::types::AnchorPolicy {
+            datacenter: "leli".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        let anchor_toro = dtfs_common::types::AnchorPolicy {
+            datacenter: "toro".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        let snapshot = FlushSnapshot {
+            files: vec![
+                (
+                    "/vol-default/foo.bin".to_string(),
+                    vec![ent(0, "ha", 10, 0), ent(0, "ha", 11, 0)],
+                    mandatory_cold_only(),
+                    Some(anchor_leli.clone()),
+                ),
+                (
+                    "/vol-other/bar.bin".to_string(),
+                    vec![ent(0, "hb", 10, 0), ent(0, "hb", 11, 0)],
+                    mandatory_cold_only(),
+                    Some(anchor_toro.clone()),
+                ),
+            ],
+            nodes: HashMap::from([
+                (10u64, node_summary("leli", &[DiskTier::Cold])),
+                (11u64, node_summary("toro", &[DiskTier::Warm])),
+            ]),
+        };
+        let (actions, _report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
+        assert_eq!(actions.len(), 2, "one warm drop per file");
+        let foo = actions.iter().find(|a| a.file_path == "/vol-default/foo.bin").unwrap();
+        let bar = actions.iter().find(|a| a.file_path == "/vol-other/bar.bin").unwrap();
+        assert_eq!(
+            foo.anchor.as_ref().map(|a| a.datacenter.as_str()),
+            Some("leli"),
+            "default-volume file keeps its own (leli) anchor"
+        );
+        assert_eq!(
+            bar.anchor.as_ref().map(|a| a.datacenter.as_str()),
+            Some("toro"),
+            "non-default-volume file enforces its OWN (toro) anchor, not the default's"
+        );
+    }
+
+    /// CO-5-8 — when `max_tasks` caps the plan, `truncated` is the count of
+    /// the remaining would-drop REPLICA entries we declined to enqueue, not
+    /// the old `chunks_examined - actions.len()` (which mixed chunk and
+    /// action units). Mixed set: 4 chunks, each with one warm cache replica
+    /// to drop; cap at 1 -> 1 action, 3 truncated.
+    #[test]
+    fn co_5_8_truncated_counts_remaining_would_drop_entries() {
+        let chunks: Vec<ChunkLocationEntry> = (0..4u64)
+            .flat_map(|i| {
+                vec![
+                    ent(i, &format!("h{i}"), 10, 0), // cold (mandatory, kept)
+                    ent(i, &format!("h{i}"), 11, 0), // warm (cache, would-drop)
+                ]
+            })
+            .collect();
+        let snapshot = FlushSnapshot {
+            files: vec![(
+                "/movies/season.mkv".to_string(),
+                chunks,
+                mandatory_cold_only(),
+                None,
+            )],
+            nodes: HashMap::from([
+                (10u64, node_summary("leli", &[DiskTier::Cold])),
+                (11u64, node_summary("toro", &[DiskTier::Warm])),
+            ]),
+        };
+        let (actions, report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 1);
+        assert_eq!(actions.len(), 1, "cap honoured: only 1 action enqueued");
+        assert_eq!(
+            report.truncated, 3,
+            "the other 3 would-drop warm replicas are counted as truncated"
+        );
     }
 }
 
@@ -4999,6 +5241,91 @@ mod bug_bo_tests {
             "reap verdict must not reset across a manager restart"
         );
     }
+
+    /// CO-3-2 — a chunk on a node's disk whose SM has NO location entry
+    /// naming that node is "de-located" and a reap candidate, even though
+    /// the chunk hash may still be referenced elsewhere (so it is NOT a
+    /// hash-orphan). This is the rebalance / excess-spill leftover: the
+    /// `RemoveChunkLocation` dropped the SM entry on this node, but the
+    /// bytes linger on disk. Verifies the per-node predicate and that it
+    /// supersets the hash-orphan signal.
+    #[test]
+    fn co_3_2_delocated_chunk_is_reap_candidate() {
+        // Node 10 is expected (per current SM) to hold only "keep".
+        let mut node10: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        node10.insert("keep".to_string());
+
+        // "keep" stays on node 10 -> NOT de-located.
+        assert!(
+            !chunk_delocated_on_node(Some(&node10), "keep"),
+            "a chunk the SM still names this node for is not de-located"
+        );
+
+        // "spilled" was de-located by rebalance: the chunk hash is still
+        // referenced by another replica elsewhere (so chunk_is_orphan would
+        // be false against the global union), but node 10 no longer holds an
+        // entry for it -> de-located on this node -> reap candidate.
+        assert!(
+            chunk_delocated_on_node(Some(&node10), "spilled"),
+            "a chunk no SM entry names on this node IS de-located"
+        );
+
+        // A node the SM records nothing for: every on-disk chunk is
+        // de-located (e.g. a fully drained node still holding leftover bytes).
+        assert!(chunk_delocated_on_node(None, "anything"));
+
+        // CO-3-2 + Bug CB — the de-located candidate is still gated by the
+        // durable-mtime grace, so a recently-written chunk whose
+        // commit_chunk_locations Raft write has not yet applied is protected.
+        let now_ms: u64 = 1_700_000_000_000;
+        let grace_secs: u64 = 86_400;
+        let reap_candidate = chunk_delocated_on_node(Some(&node10), "spilled");
+        assert!(
+            !orphan_reap_due(reap_candidate, now_ms - 60_000, now_ms, grace_secs),
+            "a freshly-written de-located chunk is still protected by grace"
+        );
+        assert!(
+            orphan_reap_due(reap_candidate, now_ms - (grace_secs + 10) * 1000, now_ms, grace_secs),
+            "an aged de-located chunk past grace is reaped"
+        );
+    }
+
+    /// CO-3-3 — the in-state-missing quarantine guard re-checks the CURRENT
+    /// state machine before quarantining. A chunk that dropped out of the
+    /// node's expected set between the tick's opening snapshot and the
+    /// re-check (a concurrent demote / unlink / rebalance) is filtered out,
+    /// so a healthy node is NOT quarantined for losing a chunk it was
+    /// legitimately told to drop. A chunk still expected stays in the set
+    /// and DOES justify a quarantine.
+    #[test]
+    fn co_3_3_recheck_filters_demote_race() {
+        // The tick snapshot saw two chunks expected-but-missing on the node.
+        let a = "a".to_string();
+        let b = "b".to_string();
+        let snapshot_missing: Vec<&String> = vec![&a, &b];
+
+        // Re-check: the CURRENT SM still expects "a" (genuine fault) but no
+        // longer expects "b" (a demote committed RemoveChunkLocation between
+        // the snapshot and now).
+        let mut current_expected: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        current_expected.insert("a".to_string());
+
+        let still = still_missing_after_recheck(&snapshot_missing, &current_expected);
+        assert_eq!(still.len(), 1, "only the genuinely-missing chunk survives");
+        assert_eq!(still[0], "a");
+
+        // Pure demote race: every "missing" chunk was de-located -> empty ->
+        // no quarantine.
+        let none_expected: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let still = still_missing_after_recheck(&snapshot_missing, &none_expected);
+        assert!(
+            still.is_empty(),
+            "a pure demote race must clear the missing set (no quarantine)"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5368,5 +5695,92 @@ mod advance_round_tests {
             1,
             "exhausting retries must fire exactly one MigrationFailed alert"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CO-3-5 — migration-state load-modify-save mutual exclusion.
+//
+// `schedule_replication` and `tick` both load the migration state, mutate it
+// in memory, then save it back. The live code stores the state in Raft and
+// needs a leader handle, so the production methods can't be unit-driven here;
+// instead this models the exact load->modify->save critical section against a
+// shared in-memory `MigrationState` and proves that serialising it under the
+// scheduler's `tokio::Mutex` (the field added by this fix) prevents the
+// lost-update race — a concurrent schedule during a tick would otherwise
+// clobber a task and regress `next_task_id`.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod co_3_5_migration_state_race_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, RwLock};
+
+    /// Run two concurrent load-modify-save "writers" against a shared
+    /// `MigrationState`, each inserting one new task and bumping
+    /// `next_task_id`, all under one shared mutex (the production pattern).
+    /// Both tasks must survive and `next_task_id` must advance by 2.
+    #[tokio::test]
+    async fn co_3_5_concurrent_rmw_under_mutex_keeps_both_tasks() {
+        // The shared "Raft" backing store + the serialising lock.
+        let store: Arc<RwLock<MigrationState>> =
+            Arc::new(RwLock::new(MigrationState::default()));
+        let lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+        // One writer mirrors schedule_replication's critical section: take
+        // the lock, load, modify (new task + next_task_id++), save. The
+        // `await` points inside model the real async load/save.
+        let writer = |store: Arc<RwLock<MigrationState>>,
+                      lock: Arc<Mutex<()>>,
+                      chunk: &'static str| async move {
+            let _guard = lock.lock().await;
+            // load
+            let mut state = store.read().await.clone();
+            // a yield between load and save widens the race window so an
+            // unguarded version would reliably lose an update.
+            tokio::task::yield_now().await;
+            // modify
+            let id = format!("repl-{}", state.next_task_id);
+            state.next_task_id += 1;
+            state.tasks.insert(
+                id.clone(),
+                ReplicationTask {
+                    task_id: id,
+                    chunk_id: chunk.to_string(),
+                    source_node: 1,
+                    target_node: 2,
+                    tier: DiskTier::Warm,
+                    status: MigrationStatus::Pending,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    attempts: 0,
+                    last_error: None,
+                },
+            );
+            // save
+            *store.write().await = state;
+        };
+
+        let a = tokio::spawn(writer(store.clone(), lock.clone(), "chunk-a"));
+        let b = tokio::spawn(writer(store.clone(), lock.clone(), "chunk-b"));
+        a.await.unwrap();
+        b.await.unwrap();
+
+        let final_state = store.read().await;
+        assert_eq!(
+            final_state.tasks.len(),
+            2,
+            "both concurrent schedules must survive (no lost update)"
+        );
+        assert_eq!(
+            final_state.next_task_id, 2,
+            "next_task_id must advance monotonically by 2, never regress"
+        );
+        let chunks: std::collections::HashSet<&str> = final_state
+            .tasks
+            .values()
+            .map(|t| t.chunk_id.as_str())
+            .collect();
+        assert!(chunks.contains("chunk-a") && chunks.contains("chunk-b"));
     }
 }
