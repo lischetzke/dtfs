@@ -415,7 +415,17 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   (`base64_encode`/`base64_decode`, used by the dtfs-manager snapshot
   receiver). The transport is a JSON-string unary RPC — serde_bytes would
   serialize as an int array (bigger than base64), so don't drop the base64
-  without a wire change.
+  without a wire change. CO-3-6: the peer channel sets NO channel-level
+  `.timeout()` (tonic's GrpcTimeout layer takes the MIN of channel + per-request
+  timeout, so a fixed channel timeout would clamp the snapshot RPC back down);
+  every `send_rpc` sets its own per-request timeout via
+  `tonic::Request::set_timeout`. AppendEntries/Vote pass the 5s `RPC_TIMEOUT`;
+  the snapshot send passes `snapshot_rpc_timeout(bytes, option.hard_ttl())` =
+  max(openraft's hard_ttl, snapshot_bytes / 1 MBps floored at 5s), so a >25 MB
+  snapshot to a learner behind the 40 Mbps LELI shape gets enough wall-clock to
+  land instead of dying at the old 5s default. A fired timeout is still a tonic
+  Status -> `unreachable_err` -> `RPCError::Unreachable` -> `StreamingError::
+  Unreachable` (transient), preserving the Bug CL mapping above.
 - `dtfs-manager/src/scheduler.rs` — migration/re-replication loop; the
   SOLE owner of replica repair (Bug AC leader gate + Bug CH).
   `schedule_path_migration` (operator moves), `flush_cache_for_path` +
@@ -469,11 +479,28 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   (`cluster_config.config_json`) projected on top via `json_deep_merge`
   (Bug CM) — a saved cluster-wide override MUST read back as `current`, or
   the WebUI editor looks broken. Adding a config read path? Route it
-  through `effective_config_value`, never raw `state.config`.
+  through `effective_config_value`, never raw `state.config` (CO-5-9 — the
+  `get_config` `defaults` block follows the same merge). The write path
+  (`update_config`) deep-merges the override onto the startup config (which,
+  since `UpdateConfig` replaces the override wholesale, IS the post-save
+  effective config) and REQUIRES the merge to deserialize as `ManagerConfig`
+  (`merge_and_validate_override`, 400 on type error, CO-4-3), then persists
+  `toml::to_string_pretty` of the validated merge — never raw override JSON
+  into the `.toml`.
 - `dtfs-manager/src/membership.rs` — CF-2 online raft membership: pure
   validation for the leader-only `/api/v1/raft/{add-learner,promote,
   remove}` endpoints (openraft `add_learner`/`change_membership`;
   `initial_voters` is bootstrap-only).
+- `dtfs-manager/src/join.rs` — two-phase data-node join (HMAC handshake;
+  `/api/v1/join/{request,complete}` in api.rs). Phase-1 `handle_join_request`
+  verifies HMAC(secret, nonce), issues a challenge, and persists it with a
+  60s single-use TTL (`challenges` map). Phase-2 `complete_join` (CO-2-3
+  security) requires `HMAC(secret, challenge)` (constant-time
+  `verify_completion_inner`, consumes the challenge), derives
+  `node_id = node_id_from_hostname(hostname)` SERVER-SIDE (never trust a
+  client id), then does the `RegisterNode` Raft write. Empty
+  `cluster.shared_secret` = documented unauthenticated downgrade (skips the
+  challenge/HMAC checks). docs/src/security/cluster-join.md.
 - `dtfs-manager/src/webui.rs` — embedded SPA, format-string HTML
   (`{{`/`}}` for literal braces).
 - `dtfs-data/src/server.rs::put_chunk` — streaming put path.
@@ -485,9 +512,19 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
 - `dtfs-data/src/memory.rs` — Bug G data-node rung: re-exports the common
   core + the ARC-cache shrinker monitor (`run_monitor_with_cache`).
 - `dtfs-fuse/src/filesystem.rs` — FUSE↔cluster bridge: write leases,
-  readahead engine, local disk cache.
+  readahead engine, local disk cache. CO-3-12: `read()` clones the
+  per-call data (path/chunk_size/volume_id/locations) out of the
+  `open_files` entry and DROPS the DashMap guard BEFORE the per-chunk
+  network loop (same idiom as `write()`/`flush()`) — never hold an
+  `open_files` guard across an `.await`, or a stalled chunk fetch
+  serializes concurrent opens of the same file.
 - `dtfs-fuse/src/fuse_adapter.rs` — fuse3 trait impl; cookie scheme at
   `dir_entry_cookie()` — don't diverge readdir/readdirplus (Bug F).
+  CO-4-16: metadata ops map cluster errors via `cluster_err_to_errno` —
+  ENOENT ONLY for a genuine gRPC `NotFound`, EIO for transient/unknown
+  (manager outage, election, timeout). Mapping a blip to ENOENT makes Plex
+  drop the library entry. New error-returning op? Route it through the
+  helper, never a bare `Err(_) => ENOENT`.
 - `dtfs-common/build.rs` + `src/version.rs` — VERSION (default
   `v0.0.0-dev`, overridable via `DTFS_VERSION`) + BUILD_DATE (§ A.3.5);
   every binary reports these via RegisterNode.
