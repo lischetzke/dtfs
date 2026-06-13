@@ -135,6 +135,65 @@ impl WriteBuffer {
         self.buffers.remove(path);
     }
 
+    /// CO-1-8 (b) — drop buffered bytes at or above `new_size`, keeping the
+    /// buffered prefix `[0..new_size)` intact.
+    ///
+    /// `truncate()` on the filesystem used to `remove()` the whole buffer
+    /// whenever the buffered EOF exceeded `new_size`, which also discarded
+    /// buffered bytes BELOW the new EOF (silent data loss when an app
+    /// truncated to a length that still covered un-flushed writes). This keeps
+    /// every buffered byte the truncation does not delete; a later `flush_all`
+    /// still emits them. If the buffer lies entirely above `new_size` it
+    /// becomes empty (removed); if entirely below, it is untouched.
+    pub fn truncate(&self, path: &str, new_size: u64) {
+        let mut entry = match self.buffers.get_mut(path) {
+            Some(e) => e,
+            None => return,
+        };
+        let buf = entry.value_mut();
+        let buf_start = buf.dirty_offset;
+        let buf_end = buf_start + buf.data.len() as u64;
+
+        if new_size <= buf_start {
+            // Entire buffer is at/above the cut — nothing survives.
+            buf.data.clear();
+            buf.dirty_offset = 0;
+            drop(entry);
+            self.buffers.remove(path);
+            return;
+        }
+        if new_size >= buf_end {
+            // Cut is at/above the buffered end — keep everything.
+            return;
+        }
+        // Cut falls inside the buffer: keep [buf_start, new_size).
+        let keep = (new_size - buf_start) as usize;
+        buf.data.truncate(keep);
+    }
+
+    /// CO-1-8 (a) — re-insert segments that were extracted by `flush` /
+    /// `flush_all` but failed to reach the cluster, so a later flush re-sends
+    /// them instead of dropping the bytes.
+    ///
+    /// `flush_segments_to_cluster` is called AFTER the bytes have already been
+    /// drained out of the buffer; if the cluster write errors the bytes are
+    /// gone and a retried fsync would return Ok with data silently lost. The
+    /// cluster stores each segment as the whole content of chunk
+    /// `chunk_index`, so re-buffering it at `chunk_index * chunk_size` makes
+    /// the next `flush_all` re-emit the same `(chunk_index, data)` pair the
+    /// cluster expects. (For the rare mid-chunk leading-partial segment this
+    /// offset can differ from the original `dirty_offset` by the in-chunk
+    /// offset — harmless for re-flushing, since the cluster keys on
+    /// `chunk_index`; only the transient overlay/logical-size view during the
+    /// error-retry window is approximate.)
+    pub fn restore_segments(&self, path: &str, segments: &[ChunkSegment]) {
+        let chunk_size = self.chunk_size as u64;
+        for seg in segments {
+            let abs_offset = seg.chunk_index as u64 * chunk_size;
+            self.write(path, abs_offset, seg.data.as_ref());
+        }
+    }
+
     /// Check whether a file has any buffered dirty data.
     pub fn has_dirty_data(&self, path: &str) -> bool {
         self.buffers
@@ -604,5 +663,76 @@ mod audit_co_tests {
             found,
             "leading partial-chunk bytes (file offsets 5..10) must be emitted, not silently dropped; emitted={emitted:?}"
         );
+    }
+
+    // CO-1-8 (b): truncate must keep buffered bytes BELOW the new EOF. The old
+    // filesystem path removed the whole buffer whenever buffered_eof > new_size,
+    // discarding bytes the truncation never deleted.
+    #[test]
+    fn co_1_8b_truncate_keeps_bytes_below_new_size() {
+        let wb = WriteBuffer::new(4096);
+        let data: Vec<u8> = (0u8..100).collect(); // 100 distinct bytes @ offset 0
+        wb.write("/f", 0, &data);
+        assert_eq!(wb.logical_size("/f"), Some(100));
+
+        wb.truncate("/f", 50);
+        assert_eq!(
+            wb.logical_size("/f"),
+            Some(50),
+            "buffer must shrink to the new size, not vanish"
+        );
+
+        // flush_all must still emit exactly the first 50 bytes, in order.
+        let mut emitted: Vec<u8> = Vec::new();
+        for seg in wb.flush_all("/f") {
+            emitted.extend_from_slice(seg.data.as_ref());
+        }
+        assert_eq!(emitted, (0u8..50).collect::<Vec<u8>>());
+    }
+
+    // CO-1-8 (b): a truncate at/below the buffer start drops everything; a
+    // truncate at/above the buffer end is a no-op.
+    #[test]
+    fn co_1_8b_truncate_edges() {
+        let wb = WriteBuffer::new(4096);
+        wb.write("/f", 10, &[1u8; 20]); // buffer covers [10, 30)
+
+        // Cut at 10 (== buf_start) removes the whole buffer.
+        wb.truncate("/f", 10);
+        assert!(!wb.has_dirty_data("/f"), "cut at buffer start clears it");
+
+        // Re-populate, then cut above the end: untouched.
+        wb.write("/f", 10, &[2u8; 20]);
+        wb.truncate("/f", 1000);
+        assert_eq!(wb.logical_size("/f"), Some(30), "cut above end is a no-op");
+    }
+
+    // CO-1-8 (a): on a cluster-flush error the FUSE layer must restore the
+    // already-drained segments into the buffer so a later flush re-sends them
+    // (a dropped restore loses the bytes while fsync returns Ok). Restoring the
+    // segments must reproduce exactly the bytes a subsequent flush_all emits.
+    #[test]
+    fn co_1_8a_restore_segments_round_trips_through_flush() {
+        let chunk = 10;
+        let wb = WriteBuffer::new(chunk);
+        let data: Vec<u8> = (0u8..25).collect(); // 2 full chunks + a 5-byte tail
+        wb.write("/f", 0, &data);
+
+        // Drain everything as the flush path does.
+        let segments = wb.flush_all("/f");
+        assert!(!segments.is_empty());
+        assert!(!wb.has_dirty_data("/f"), "flush_all drained the buffer");
+
+        // Simulate the cluster write failing: restore the drained segments.
+        wb.restore_segments("/f", &segments);
+        assert!(wb.has_dirty_data("/f"), "restored bytes are buffered again");
+        assert_eq!(wb.logical_size("/f"), Some(25));
+
+        // A retry flush must emit the original bytes, in order.
+        let mut emitted: Vec<u8> = Vec::new();
+        for seg in wb.flush_all("/f") {
+            emitted.extend_from_slice(seg.data.as_ref());
+        }
+        assert_eq!(emitted, data, "restored buffer re-sends every original byte");
     }
 }
