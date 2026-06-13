@@ -586,26 +586,21 @@ impl TieringEngine {
         let mut id_to_dc: HashMap<u64, String> = HashMap::new();
         for (id, info) in sm.nodes.iter() {
             id_to_dc.insert(*id, info.location.datacenter.clone());
-            // The planner will set `has_target_tier_disk` per-call
-            // when iterating tiers — we materialise one node view
-            // per tier the node has below. Here we emit a baseline
-            // view; the planner closure layers the per-call tier
-            // check via the candidates iteration.
-            let draining = matches!(info.health, dtfs_common::types::HealthStatus::Draining);
-            // For simplicity, emit one view per disk's tier so the
-            // planner can pick the right one. Free capacity is shared
-            // across tiers on the same node; that's a small
-            // approximation that's good enough for promotion
-            // target picking.
-            for _disk in &info.disks {
-                node_views.push(NodeSelectionView {
-                    node_id: *id,
-                    datacenter: info.location.datacenter.clone(),
-                    has_target_tier_disk: true,
-                    free_capacity: info.total_capacity.saturating_sub(info.used_capacity),
-                    draining,
-                    already_holds_chunk: false,
-                });
+            // CO-4-5 — emit one view per (node, distinct serviceable
+            // tier). `node_selection_view` computes `has_target_tier_disk`
+            // honestly per tier and excludes Draining/Down/Failed/
+            // Quarantined nodes, so the promotion planner only ever
+            // targets a node that can actually hold the cache replica.
+            let mut seen_tiers: std::collections::HashSet<DiskTier> =
+                std::collections::HashSet::new();
+            for disk in &info.disks {
+                if !seen_tiers.insert(disk.tier) {
+                    continue;
+                }
+                let view = node_selection_view(*id, info, disk.tier);
+                if view.has_target_tier_disk {
+                    node_views.push(view);
+                }
             }
         }
 
@@ -727,12 +722,19 @@ impl TieringEngine {
     ///
     /// Logic:
     /// 1. Look up the file's `volume_id` from `sm.files[profile.file_path]`.
-    /// 2. Look up the volume's `anchor_datacenter`.
+    /// 2. Resolve the volume's anchor via `effective_anchor()` (CO-4-7:
+    ///    reads the resolved `AnchorPolicy` so a volume that set the new
+    ///    `anchor` field — not just the legacy `anchor_datacenter` string
+    ///    — is honoured). Only the anchor *datacenter* is enforced here;
+    ///    a tier-pinned anchor (`required_tier`) is still enforced solely
+    ///    on the source-removal path (`RemoveChunkLocation`
+    ///    `enforce_anchor`), since this additive copy never drops bytes.
     /// 3. If anchor is None → never violated (no constraint).
-    /// 4. Count current replicas of `profile.chunk_id` whose node lives in
-    ///    the anchor DC. Subtract 1 if the source node is in anchor DC
-    ///    (it's the one being moved). Add 1 if the target node is in anchor.
-    /// 5. If the resulting count would be 0 → violation.
+    /// 4. The tiering path schedules an ADDITIVE copy
+    ///    (`schedule_replication`, source never removed — § A.6 #6), so
+    ///    `anchor_violated_after_copy(.., is_additive=true)` does NOT
+    ///    subtract the source. Pre-CO-4-7 this modelled the copy as a
+    ///    move and a sole-anchor LELI->TORO promote was wrongly refused.
     async fn would_violate_anchor(
         &self,
         profile: &ChunkAccessProfile,
@@ -743,8 +745,12 @@ impl TieringEngine {
             Some(meta) => meta.volume_id.clone(),
             None => return false,
         };
-        let anchor = match sm.volumes.get(&volume_id).and_then(|v| v.anchor_datacenter.clone()) {
-            Some(a) if !a.is_empty() => a,
+        let anchor = match sm
+            .volumes
+            .get(&volume_id)
+            .and_then(|v| v.effective_anchor())
+        {
+            Some(a) if !a.datacenter.is_empty() => a.datacenter,
             _ => return false,
         };
         let file_meta = match sm.files.get(&profile.file_path) {
@@ -760,8 +766,8 @@ impl TieringEngine {
             id_to_dc.insert(*id, info.location.datacenter.clone());
         }
 
-        // Count anchor-DC replicas of this chunk.
-        let mut anchor_count: i64 = 0;
+        // Datacenter of every current replica of this chunk.
+        let mut replica_dcs: Vec<String> = Vec::new();
         for ent in file_meta.chunks.iter() {
             if ent.chunk_hash != profile.chunk_id {
                 continue;
@@ -775,22 +781,21 @@ impl TieringEngine {
             } else {
                 None
             };
-            if dc.as_deref() == Some(anchor.as_str()) {
-                anchor_count += 1;
+            if let Some(d) = dc {
+                replica_dcs.push(d);
             }
         }
 
-        // Adjust for the move.
         let source_dc = id_to_dc.get(&profile.current_node).cloned();
         let target_dc = id_to_dc.get(&target_node).cloned();
-        if source_dc.as_deref() == Some(anchor.as_str()) {
-            anchor_count -= 1;
-        }
-        if target_dc.as_deref() == Some(anchor.as_str()) {
-            anchor_count += 1;
-        }
-
-        anchor_count <= 0
+        anchor_violated_after_copy(
+            &replica_dcs,
+            &anchor,
+            source_dc.as_deref(),
+            target_dc.as_deref(),
+            // The tiering migration is additive (copy, no source removal).
+            true,
+        )
     }
 
     /// Find a target node that has disks of the specified tier,
@@ -1103,8 +1108,14 @@ pub(crate) fn plan_cache_promotion(
 pub(crate) struct NodeSelectionView {
     pub node_id: u64,
     pub datacenter: String,
+    /// The tier this view was materialised for. The engine emits one
+    /// view per (node, serviceable tier); the promotion planner only
+    /// considers views whose `tier` matches the tier it is filling, so
+    /// a cold-only node is never offered as a warm-cache target.
+    pub tier: DiskTier,
     /// Set true when the engine has confirmed the node hosts at
-    /// least one disk of the desired tier and that disk is healthy.
+    /// least one disk of `tier` and that disk is serviceable (not
+    /// Failed/Removed).
     pub has_target_tier_disk: bool,
     /// Free-capacity proxy, in bytes. Larger = preferred. The
     /// engine derives this as
@@ -1117,6 +1128,85 @@ pub(crate) struct NodeSelectionView {
     /// be promoting. The selector skips these so we don't duplicate
     /// a replica on the same node.
     pub already_holds_chunk: bool,
+}
+
+/// CO-4-7 — pure anchor check for a copy operation. `replica_dcs` is
+/// the datacenter of every current replica of the chunk. The result is
+/// whether the anchor-DC replica count *after* the copy would be 0:
+///
+/// - additive copy (`is_additive=true`, e.g. cache promotion via
+///   `schedule_replication` — the source is never removed, § A.6 #6):
+///   the source is NOT subtracted; only a target landing in the anchor
+///   DC adds one. Pre-CO-4-7 the promote path modelled this as a move
+///   and subtracted the source, so a sole-anchor LELI->TORO promote
+///   computed anchor_count 0 and was wrongly refused (+ AnchorViolated
+///   spam).
+/// - move/demote (`is_additive=false`): the source replica leaves, so a
+///   source in the anchor DC subtracts one (genuine anchor protection
+///   for tier-demote / migration — unchanged).
+///
+/// Returns true iff the post-copy anchor count would be 0 (violation).
+pub(crate) fn anchor_violated_after_copy(
+    replica_dcs: &[String],
+    anchor_dc: &str,
+    source_dc: Option<&str>,
+    target_dc: Option<&str>,
+    is_additive: bool,
+) -> bool {
+    if anchor_dc.is_empty() {
+        return false;
+    }
+    let mut anchor_count: i64 = replica_dcs
+        .iter()
+        .filter(|dc| dc.as_str() == anchor_dc)
+        .count() as i64;
+    // Only a move removes the source replica from its DC.
+    if !is_additive && source_dc == Some(anchor_dc) {
+        anchor_count -= 1;
+    }
+    if target_dc == Some(anchor_dc) {
+        anchor_count += 1;
+    }
+    anchor_count <= 0
+}
+
+/// CO-4-5 — project a node into a `NodeSelectionView` for a specific
+/// `target_tier`. `has_target_tier_disk` is true iff the node hosts at
+/// least one serviceable (not Failed/Removed) disk of that tier, and
+/// `draining` is set for any health state that disqualifies the node
+/// from receiving a new replica (Draining/Down/Failed/Quarantined) so
+/// the pure selector skips it. Pre-CO-4-5 the snapshot set
+/// `has_target_tier_disk` unconditionally and only excluded Draining,
+/// so promotions targeted cold-only or dead nodes and fast-failed
+/// forever (the cache replica was never created).
+pub(crate) fn node_selection_view(
+    node_id: u64,
+    info: &dtfs_raft::NodeInfo,
+    target_tier: DiskTier,
+) -> NodeSelectionView {
+    use dtfs_common::types::{DiskStatus, HealthStatus};
+    let has_target_tier_disk = info.disks.iter().any(|d| {
+        d.tier == target_tier
+            && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed)
+    });
+    // Any health state that means "don't place a new replica here".
+    // `draining` is the selector's catch-all exclusion flag.
+    let excluded = matches!(
+        info.health,
+        HealthStatus::Draining
+            | HealthStatus::Down
+            | HealthStatus::Failed
+            | HealthStatus::Quarantined
+    );
+    NodeSelectionView {
+        node_id,
+        datacenter: info.location.datacenter.clone(),
+        tier: target_tier,
+        has_target_tier_disk,
+        free_capacity: info.total_capacity.saturating_sub(info.used_capacity),
+        draining: excluded,
+        already_holds_chunk: false,
+    }
 }
 
 /// AV-2-3 pure kernel — pick the best cache-promotion target in
@@ -1404,8 +1494,12 @@ fn plan_chunk_promotions(
             // per placement of this chunk.
             let holders: std::collections::HashSet<u64> =
                 chunk.placements.iter().map(|p| p.node_id).collect();
+            // CO-4-5 — only consider node views materialised for the
+            // tier we're filling; a node's cold-disk view must never
+            // satisfy a warm-cache promotion.
             let candidates: Vec<NodeSelectionView> = nodes
                 .iter()
+                .filter(|n| n.tier == *tier)
                 .map(|n| {
                     let mut copy = n.clone();
                     if holders.contains(&n.node_id) {
@@ -1993,6 +2087,9 @@ mod bug_av_target_selection_tests {
         NodeSelectionView {
             node_id: id,
             datacenter: dc.to_string(),
+            // `select_promotion_target` ignores `tier`; the value is
+            // irrelevant to these direct-selector tests.
+            tier: DiskTier::Warm,
             has_target_tier_disk: has_tier,
             free_capacity: free,
             draining,
@@ -2089,6 +2186,8 @@ mod bug_av_tiering_tick_tests {
         NodeSelectionView {
             node_id: id,
             datacenter: dc.to_string(),
+            // The plex/tier tests in this module all promote to Warm.
+            tier: DiskTier::Warm,
             has_target_tier_disk: has_tier,
             free_capacity: free,
             draining: false,
@@ -2470,5 +2569,191 @@ mod bug_av_tiering_tick_tests {
         assert_eq!(plan.promotions.len(), 1);
         assert_eq!(plan.promotions[0].target_dc, "nrb",
             "global pool targets the DC with the most reads");
+    }
+}
+
+#[cfg(test)]
+mod audit_co_tests {
+    //! CO-4-5 — `node_selection_view` honest tier + health check, so
+    //! the cache-promotion planner stops targeting cold-only / dead
+    //! nodes (which fast-fail forever, never creating the replica).
+    use super::*;
+    use dtfs_common::topology::Location;
+    use dtfs_common::types::{DiskInfo, DiskStatus, DiskTier, HealthStatus, NodeRole};
+    use dtfs_raft::NodeInfo;
+
+    fn disk(disk_id: u32, tier: DiskTier, status: DiskStatus) -> DiskInfo {
+        DiskInfo {
+            disk_id,
+            uuid: format!("uuid-{disk_id}"),
+            mount_path: format!("/mnt/d{disk_id}"),
+            tier,
+            total_bytes: 1_000,
+            used_bytes: 0,
+            status,
+        }
+    }
+
+    // `dtfs_raft::NodeInfo` carries no `id` field (the node id is the
+    // `StateMachineData.nodes` map key, passed separately to
+    // `node_selection_view`).
+    fn node(id: u64, dc: &str, health: HealthStatus, disks: Vec<DiskInfo>) -> NodeInfo {
+        NodeInfo {
+            role: NodeRole::Data,
+            hostname: format!("node{id}"),
+            grpc_addr: format!("http://10.0.0.{id}:9500"),
+            location: Location::new("r", dc, "rack", &format!("host{id}")),
+            disks,
+            total_capacity: 1_000_000,
+            used_capacity: 0,
+            health,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    /// CO-4-5 — a cold-only node's Warm view reports
+    /// `has_target_tier_disk=false`; a node with a serviceable warm
+    /// disk reports true. Pre-fix the snapshot set this true
+    /// unconditionally, so cold-only A looked like a valid warm target.
+    #[test]
+    fn co_4_5_cold_only_node_has_no_warm_target_disk() {
+        let a = node(
+            10,
+            "leli",
+            HealthStatus::Healthy,
+            vec![disk(0, DiskTier::Cold, DiskStatus::Healthy)],
+        );
+        let b = node(
+            11,
+            "leli",
+            HealthStatus::Healthy,
+            vec![disk(0, DiskTier::Warm, DiskStatus::Healthy)],
+        );
+        let va = node_selection_view(10, &a, DiskTier::Warm);
+        let vb = node_selection_view(11, &b, DiskTier::Warm);
+        assert!(
+            !va.has_target_tier_disk,
+            "cold-only node must not advertise a warm target disk"
+        );
+        assert!(vb.has_target_tier_disk, "warm node must advertise warm");
+        // So the pure selector picks B, never the cold-only A.
+        let pick = select_promotion_target(&[va, vb], "leli");
+        assert_eq!(pick, Some(11));
+    }
+
+    /// CO-4-5 — a Failed/Removed disk of the target tier doesn't count.
+    #[test]
+    fn co_4_5_failed_warm_disk_is_not_serviceable() {
+        let n = node(
+            10,
+            "toro",
+            HealthStatus::Healthy,
+            vec![disk(0, DiskTier::Warm, DiskStatus::Failed)],
+        );
+        assert!(!node_selection_view(10, &n, DiskTier::Warm).has_target_tier_disk);
+        let n2 = node(
+            10,
+            "toro",
+            HealthStatus::Healthy,
+            vec![disk(0, DiskTier::Warm, DiskStatus::Removed)],
+        );
+        assert!(!node_selection_view(10, &n2, DiskTier::Warm).has_target_tier_disk);
+    }
+
+    /// CO-4-5 — Down/Failed/Quarantined nodes are excluded
+    /// (`draining=true` → selector skips). Only Draining was excluded
+    /// pre-fix, so promotions targeted dead nodes.
+    #[test]
+    fn co_4_5_dead_nodes_excluded_from_selection() {
+        for bad in [
+            HealthStatus::Down,
+            HealthStatus::Failed,
+            HealthStatus::Quarantined,
+            HealthStatus::Draining,
+        ] {
+            let n = node(
+                10,
+                "toro",
+                bad,
+                vec![disk(0, DiskTier::Warm, DiskStatus::Healthy)],
+            );
+            let v = node_selection_view(10, &n, DiskTier::Warm);
+            assert!(v.draining, "{bad:?} node must be flagged excluded");
+            assert_eq!(
+                select_promotion_target(&[v], "toro"),
+                None,
+                "{bad:?} node must not be selected as a promotion target"
+            );
+        }
+    }
+
+    /// CO-4-7 — a sole-anchor additive promote LELI->TORO is NOT a
+    /// violation: the cold LELI copy stays (additive), so the anchor DC
+    /// still has 1 replica afterwards. Pre-fix the source was subtracted
+    /// (modelled as a move) → anchor_count 0 → wrongly refused.
+    #[test]
+    fn co_4_7_additive_promote_does_not_strand_sole_anchor() {
+        let replica_dcs = vec!["leli".to_string()];
+        let violated = anchor_violated_after_copy(
+            &replica_dcs,
+            "leli",
+            Some("leli"), // source (cold anchor)
+            Some("toro"), // target (warm cache)
+            true,         // additive copy
+        );
+        assert!(!violated, "additive promote must not strand the LELI anchor");
+    }
+
+    /// CO-4-7 — guard: a genuine MOVE off the sole anchor IS a
+    /// violation (anchor protection for demote/migration preserved).
+    #[test]
+    fn co_4_7_move_off_sole_anchor_is_violation() {
+        let replica_dcs = vec!["leli".to_string()];
+        let violated = anchor_violated_after_copy(
+            &replica_dcs,
+            "leli",
+            Some("leli"),
+            Some("toro"),
+            false, // move: source leaves
+        );
+        assert!(violated, "moving the sole anchor copy away must be refused");
+    }
+
+    /// CO-4-7 — a copy that lands IN the anchor DC is fine; a non-anchor
+    /// move that keeps a second anchor replica is fine.
+    #[test]
+    fn co_4_7_anchor_count_arithmetic() {
+        // Two anchor replicas, move one away -> still 1 -> ok.
+        assert!(!anchor_violated_after_copy(
+            &["leli".into(), "leli".into()],
+            "leli",
+            Some("leli"),
+            Some("toro"),
+            false,
+        ));
+        // No anchor replica yet, additive copy lands in anchor -> ok.
+        assert!(!anchor_violated_after_copy(
+            &["toro".into()],
+            "leli",
+            Some("toro"),
+            Some("leli"),
+            true,
+        ));
+        // No anchor replica, copy does not land in anchor -> violation.
+        assert!(anchor_violated_after_copy(
+            &["toro".into()],
+            "leli",
+            Some("toro"),
+            Some("nrb"),
+            true,
+        ));
+        // Empty anchor dc -> never a constraint.
+        assert!(!anchor_violated_after_copy(&[], "", None, None, false));
     }
 }
