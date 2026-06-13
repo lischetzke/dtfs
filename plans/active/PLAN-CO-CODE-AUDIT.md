@@ -372,7 +372,7 @@ via builder `10.150.0.150`); use `wait_for`, last line `STATUS: …`.
 | CO-4-3 | MED-HIGH | api.rs:2889,2951 | strict-validate the override (deep-merge onto effective, require it deserializes as `ManagerConfig`); persist `toml::to_string_pretty` of the merge, never raw JSON into `.toml` | sparse override round-trips through `load_config`; bad-type override → 400 |
 | CO-4-4 | MED | tiering.rs:221,585 | collect decisions under the lock, drop it, then dispatch/query (no lock across await) | (timed) heartbeat latency during a large `evaluate` stays bounded |
 | CO-4-6 | MED | tiering.rs:227 | skip legacy-temperature profiles whose volume has an active AV cache policy | after operator flush (future cooldown), reads do NOT re-create the warm replica during cooldown |
-| CO-4-16 | MED | fuse_adapter.rs:311,329,369,759,1078 | map transient cluster errors to EIO, ENOENT only for genuine `NotFound` | lookup during manager outage does not report ENOENT |
+| CO-4-16 ✅ | MED | fuse_adapter.rs:311,329,369,759,1078 | map transient cluster errors to EIO, ENOENT only for genuine `NotFound` | lookup during manager outage does not report ENOENT |
 | CO-4-17 | MED | tiering.rs:193, metrics.rs:102 | prune `read_windows` in `apply_heartbeat_reads`; evict `per_chunk_last_access` alongside `per_chunk_reads` | (unit) 10k samples bounded; MAX+k chunks → len ≤ MAX |
 | CO-5-3 | LOW | server.rs:515 | surface `DtfsError::Io` from `commit_chunk_from_tmp` and map via `put_io_status` (ENOSPC → RESOURCE_EXHAUSTED) | (unit) raw_os_error(28) → RESOURCE_EXHAUSTED |
 | CO-5-6 | LOW | dtfs-data main.rs:515,548 | re-enqueue scrub results + per-chunk read counters on heartbeat failure (Bug O pattern) | (helper unit) re-enqueue restores counters |
@@ -432,6 +432,16 @@ rescan; ArcCache never populated (wire-with-byte-accounting vs remove).
   (no live stall-injection seam); the guard-drop is enforced structurally by
   the scoped block (a borrow held past the block is a compile error). cargo
   gate run by the coordinator.
+- 2026-06-13 (branch fix/co-c-fuse): CO-4-16 — added
+  `fuse_adapter::cluster_err_to_errno`, which walks the anyhow chain for a
+  `tonic::Status` and returns ENOENT only on `Code::NotFound`, EIO for every
+  other (transient/unclassifiable) error. Applied at lookup, getattr, setattr,
+  open (post-LeaseBusy), opendir, readlink. readdir/readdirplus left untouched
+  (Bug F cookie scope). Added `tonic` (workspace, already in lockfile) to
+  dtfs-fuse deps. Unit tests co_4_16_* (NotFound->ENOENT, Unavailable/
+  DeadlineExceeded->EIO, status-under-context-layers, unknown->EIO) +
+  release case tests/release/cases/64-lookup-errno-notfound-vs-transient.sh.
+  cargo gate run by the coordinator.
 
 ## Deviations
 

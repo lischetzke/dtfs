@@ -493,6 +493,11 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   serializes concurrent opens of the same file.
 - `dtfs-fuse/src/fuse_adapter.rs` — fuse3 trait impl; cookie scheme at
   `dir_entry_cookie()` — don't diverge readdir/readdirplus (Bug F).
+  CO-4-16: metadata ops map cluster errors via `cluster_err_to_errno` —
+  ENOENT ONLY for a genuine gRPC `NotFound`, EIO for transient/unknown
+  (manager outage, election, timeout). Mapping a blip to ENOENT makes Plex
+  drop the library entry. New error-returning op? Route it through the
+  helper, never a bare `Err(_) => ENOENT`.
 - `dtfs-common/build.rs` + `src/version.rs` — VERSION (default
   `v0.0.0-dev`, overridable via `DTFS_VERSION`) + BUILD_DATE (§ A.3.5);
   every binary reports these via RegisterNode.
