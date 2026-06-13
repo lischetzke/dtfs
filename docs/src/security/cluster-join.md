@@ -40,9 +40,12 @@ The join handshake consists of two gRPC calls defined in `cluster.proto` via the
        |                                          |
        |  (Node configures TLS with CA cert)       |
        |                                          |
-       |  3. CompleteJoin(node_id, challenge_resp) |
+       |  3. CompleteJoin(challenge,               |
+       |       HMAC(secret, challenge), node_info) |
        |----------------------------------------->|
-       |                                          |  Verify challenge response
+       |                                          |  Look up challenge (TTL, single-use)
+       |                                          |  Verify HMAC(secret, challenge)
+       |                                          |  Derive node_id from hostname
        |                                          |  Register node in Raft state
        |  4. JoinCompletionResponse(success,       |
        |     config_version, config_json)          |
@@ -93,16 +96,32 @@ If validation passes, the manager:
 
 ## Phase 2: CompleteJoin
 
-After receiving the CA certificate, the joining node configures its TLS stack to trust the cluster CA. It then sends a `JoinCompletionRequest` containing:
+After receiving the CA certificate, the joining node configures its TLS stack to trust the cluster CA. It then computes a completion HMAC over the manager-issued `challenge` and sends a `JoinCompletionRequest` containing:
+
+```text
+completion_hmac = HMAC-SHA256(key=shared_secret, message=challenge)
+```
 
 | Field | Description |
 |-------|-------------|
-| `node_id` | The node's assigned or self-generated ID |
-| `challenge_response` | Response to the manager's challenge |
+| `challenge` | The server-issued challenge string returned in Phase 1 |
+| `completion_hmac` | `HMAC-SHA256(shared_secret, challenge)`, hex-encoded |
+| `node_info` | Node metadata: role, hostname, gRPC address, location, disk inventory |
+
+> **The client does not supply a `node_id`.** The manager derives the id server-side as `node_id_from_hostname(hostname)`, so a caller can never register under (or hijack) an id it does not own.
 
 ### Manager Completion
 
-The manager verifies the challenge response and, if valid, registers the node in the Raft state machine via a `RegisterNode` write. This ensures the new node's membership is replicated across all manager nodes.
+The manager (CO-2-3):
+
+1. Looks up the `challenge` in its short-lived challenge store (60 s TTL, **single-use** — consumed on lookup so a replay finds nothing). An unknown or expired challenge is rejected.
+2. Verifies `completion_hmac == HMAC-SHA256(shared_secret, challenge)` in constant time. A mismatch is rejected.
+3. Derives `node_id = node_id_from_hostname(hostname)`.
+4. Registers the node in the Raft state machine via a `RegisterNode` write, replicating membership across all managers.
+
+A rejected completion performs **no Raft write**, so a forged or replayed `CompleteJoin` cannot change an existing node's registered `grpc_addr`. Rejections are recorded as `node.join.complete` with the reason in the audit log.
+
+> **Back-compat downgrade.** When `cluster.shared_secret` is **empty** (a legacy plaintext cluster), the challenge/HMAC checks in Phase 2 are skipped and the join is unauthenticated, exactly as before. Configure a non-empty shared secret on every manager and node to require proof of possession on completion.
 
 On success, the manager returns:
 
@@ -122,8 +141,10 @@ Nonces are generated using 32 bytes from the system's cryptographically secure r
 
 | Property | Mechanism |
 |----------|-----------|
-| Secret never transmitted | Only HMAC(secret, nonce) crosses the wire |
-| Replay prevention | Fresh random nonce per request; each nonce is single-use |
+| Secret never transmitted | Only HMAC(secret, nonce/challenge) crosses the wire |
+| Proof of possession on completion | Phase 2 requires HMAC(secret, challenge) over the server-issued, TTL-bounded, single-use challenge |
+| No client-trusted identity | `node_id` is derived server-side from the hostname; the client cannot choose it |
+| Replay prevention | Fresh random nonce per request; each nonce/challenge is single-use |
 | Timing attack resistance | Constant-time HMAC comparison |
 | Man-in-the-middle prevention | CA certificate distributed during join; subsequent connections use mTLS |
 | Audit trail | All join attempts (accepted and rejected) are recorded in the audit log |
@@ -132,9 +153,9 @@ Nonces are generated using 32 bytes from the system's cryptographically secure r
 
 A join request is rejected if:
 
-- The HMAC does not match (wrong shared secret).
+- The HMAC does not match (wrong shared secret) — Phase 1 over the nonce, or Phase 2 over the challenge.
+- The Phase 2 challenge is unknown or expired (no matching Phase 1, TTL elapsed, or already consumed).
 - The manager cluster has no elected leader (request cannot be processed).
-- The node ID is already registered with a different hostname.
 
 Rejected join attempts are logged as `node.join.request` with result `rejected` in the audit log.
 

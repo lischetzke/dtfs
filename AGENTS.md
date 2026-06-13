@@ -479,11 +479,28 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   (`cluster_config.config_json`) projected on top via `json_deep_merge`
   (Bug CM) — a saved cluster-wide override MUST read back as `current`, or
   the WebUI editor looks broken. Adding a config read path? Route it
-  through `effective_config_value`, never raw `state.config`.
+  through `effective_config_value`, never raw `state.config` (CO-5-9 — the
+  `get_config` `defaults` block follows the same merge). The write path
+  (`update_config`) deep-merges the override onto the startup config (which,
+  since `UpdateConfig` replaces the override wholesale, IS the post-save
+  effective config) and REQUIRES the merge to deserialize as `ManagerConfig`
+  (`merge_and_validate_override`, 400 on type error, CO-4-3), then persists
+  `toml::to_string_pretty` of the validated merge — never raw override JSON
+  into the `.toml`.
 - `dtfs-manager/src/membership.rs` — CF-2 online raft membership: pure
   validation for the leader-only `/api/v1/raft/{add-learner,promote,
   remove}` endpoints (openraft `add_learner`/`change_membership`;
   `initial_voters` is bootstrap-only).
+- `dtfs-manager/src/join.rs` — two-phase data-node join (HMAC handshake;
+  `/api/v1/join/{request,complete}` in api.rs). Phase-1 `handle_join_request`
+  verifies HMAC(secret, nonce), issues a challenge, and persists it with a
+  60s single-use TTL (`challenges` map). Phase-2 `complete_join` (CO-2-3
+  security) requires `HMAC(secret, challenge)` (constant-time
+  `verify_completion_inner`, consumes the challenge), derives
+  `node_id = node_id_from_hostname(hostname)` SERVER-SIDE (never trust a
+  client id), then does the `RegisterNode` Raft write. Empty
+  `cluster.shared_secret` = documented unauthenticated downgrade (skips the
+  challenge/HMAC checks). docs/src/security/cluster-join.md.
 - `dtfs-manager/src/webui.rs` — embedded SPA, format-string HTML
   (`{{`/`}}` for literal braces).
 - `dtfs-data/src/server.rs::put_chunk` — streaming put path.
