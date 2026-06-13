@@ -4288,6 +4288,7 @@ mod bug_av_flush_cache_tests {
                     format!("/movies/f{i}.bin"),
                     vec![ent(0, &format!("h{i}"), 10, 0), ent(0, &format!("h{i}"), 11, 0)],
                     mandatory_cold_only(),
+                    None,
                 )
             })
             .collect();
