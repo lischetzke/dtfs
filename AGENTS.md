@@ -377,7 +377,18 @@ by <test>" in the commit.
 5. commit_chunk_from_tmp removes the tmp on any error path.
 6. Migration marks a task Done only after VerifyChunk on the target
    succeeds; the scheduler never removes the source (only tier-demote /
-   unlink delete a chunk).
+   unlink delete a chunk). CO-1-3 — every de-location-with-byte-delete
+   path (tiering demote dispatch, scheduler cache-flush dispatch) issues
+   the Raft `RemoveChunkLocation` (with `enforce_anchor`) FIRST and the
+   data-plane `DeleteChunkReplica` byte delete AFTER, via the shared
+   `scheduler::delocate_replica` (over the `DelocateOps` seam). On a
+   Raft-remove failure NO byte delete is issued (the replica stays live in
+   the SM + on disk; retry next tick). A byte-delete RPC that fails after
+   a committed remove is NEVER rolled back — the leftover on-disk bytes
+   are now a chunk de-located on that node, which the CO-3-2 reaper
+   reclaims (item 8). This makes de-location atomic at the metadata layer:
+   no phantom replica (bytes gone but still advertised live) and no
+   stranded anchor can result from a crash/RPC failure in the window.
 7. Scrub BLAKE3s the disk file vs chunk.meta.checksum; mismatch →
    chunks_corrupt + ScrubCorruption alert; auto-repair via
    replicate_chunk.
@@ -390,7 +401,12 @@ by <test>" in the commit.
    manager restarts / leadership changes (pre-CB the in-memory clock
    reset every restart and deleted-file disk was never freed under
    rolling-restart churn). An unknown mtime (pre-CB data node) defers
-   the reap rather than dropping a possibly in-flight chunk.
+   the reap rather than dropping a possibly in-flight chunk. CO-3-2
+   generalised the reaper to also reclaim a chunk present on a node's disk
+   for which the SM records NO location entry naming that node ("de-
+   located"; `scheduler::chunk_delocated_on_node`), after the same grace —
+   this is what mops the byte-delete-failed leftovers produced by the
+   CO-1-3 Raft-remove-first ordering (item 6).
 9. rename is a single Raft command; open handles keep reading the same
    chunks (path updated, chunk_id binding unchanged).
 10. Reads use replica-fallback (P0-2): try the next replica on error,
@@ -488,7 +504,17 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   carry the file's OWN volume anchor (not the default volume's) so a
   non-default-volume flush enforces its own anchor. **CO-5-8:** the flush
   `truncated` counter counts the remaining would-drop replica entries
-  directly, not `chunks_examined - actions.len()`.
+  directly, not `chunks_examined - actions.len()`. **CO-1-3:** the
+  cache-flush dispatch (and the tiering demote dispatch) de-locate each
+  replica Raft-remove-FIRST via the shared `delocate_replica` over the
+  `DelocateOps` seam (live impl `SchedulerDelocate`): `RemoveChunkLocation`
+  (with `enforce_anchor`) commits BEFORE the `DeleteChunkReplica` byte
+  delete. A Raft-remove failure issues no byte delete (`raft_failures`++,
+  retry); a post-commit byte-delete failure is NOT rolled back
+  (`rpc_failures`++, audit `rpc_failed_after_remove`) — the leftover bytes
+  are reclaimed by the CO-3-2 reaper. `check_misplaced_rebalance` is
+  already Raft-remove-only (it never deletes bytes; the reaper mops the
+  excess-spill leftover). Ordering covered by `co_1_3_delocate_order_tests`.
 - `dtfs-manager/src/monitor.rs` — heartbeat health detection only
   (Bug CH): commits node-status transitions, fires NodeDown/SMART
   alerts. MUST NOT schedule repair — the 2026-06-06 storm came from a

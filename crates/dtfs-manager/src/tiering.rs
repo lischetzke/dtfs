@@ -532,11 +532,21 @@ impl TieringEngine {
             );
         }
 
-        // -- AV-2-5 — Dispatch demotions: DeleteChunkReplica RPC →
-        // RemoveChunkLocation Raft write → conditional cooldown
-        // clear. The conditional check (`should_clear_cooldown_on_
-        // demote`) honours an operator flush whose cooldown is
-        // still in the future.
+        // -- AV-2-5 — Dispatch demotions. CO-1-3 — Raft-remove-FIRST
+        // ordering: RemoveChunkLocation Raft write → DeleteChunkReplica
+        // RPC → conditional cooldown clear. De-locating in the SM before
+        // touching bytes makes the demote atomic at the metadata layer:
+        // on a Raft failure we issue no byte delete (the live replica is
+        // untouched), and on a post-commit RPC failure the leftover
+        // on-disk bytes are now a "chunk on a node's disk with no
+        // location entry for that node" that the CO-3-2 orphan reaper
+        // (`chunk_delocated_on_node` / `orphan_scrub_tick`) collects
+        // after the durable-mtime grace. We NEVER roll back a committed
+        // Raft remove. The reverse order (byte-delete first) could leave
+        // bytes gone but the location still advertised as live, which
+        // mis-serves reads / strands the anchor. The conditional check
+        // (`should_clear_cooldown_on_demote`) honours an operator flush
+        // whose cooldown is still in the future.
         // AV-5-5 — grace window must cover the full replication
         // cycle plus a margin so a just-completed PutChunk has time
         // to be observed (or operator-flushed) before the next
@@ -608,22 +618,42 @@ impl TieringEngine {
                 }
             };
 
-            // 2. DeleteChunkReplica RPC (idempotent shape from
-            //    AV-1-5: returns was_present + freed_bytes).
-            match self
-                .scheduler
-                .delete_chunk_replica_on_node(
-                    &node_addr,
-                    &d.chunk_id,
-                    // CO-1-1 — demote the EXACT (node, disk) warm cache
-                    // replica, never a cold anchor co-located on another
-                    // disk of the same node.
-                    Some(d.disk_id),
-                    &d.tier.to_string(),
-                )
-                .await
-            {
-                Ok((was_present, _freed)) => {
+            // 2+3. Raft-remove-FIRST de-location via `delocate_replica`
+            //    (CO-1-3): RemoveChunkLocation Raft write (with the volume
+            //    anchor as `enforce_anchor`, CO-1-2 defence-in-depth)
+            //    THEN the DeleteChunkReplica byte delete. On a Raft
+            //    failure NO byte delete is issued (the replica is
+            //    untouched in the SM + on disk); on a post-commit RPC
+            //    failure the leftover bytes are now "on a node's disk
+            //    with no location entry for that node" and the CO-3-2
+            //    orphan reaper reclaims them after the mtime grace. The
+            //    committed Raft remove is NEVER rolled back.
+            let delocate = crate::scheduler::SchedulerDelocate {
+                sched: &*self.scheduler,
+                remove_req: dtfs_raft::ClientRequest::RemoveChunkLocation {
+                    path: d.file_path.clone(),
+                    chunk_index: d.chunk_index,
+                    node_id: d.node_id.to_string(),
+                    // CO-1-1 — drop only this (node, disk) warm cache entry.
+                    disk_id: d.disk_id,
+                    enforce_anchor: d.enforce_anchor.clone(),
+                },
+                node_addr,
+                chunk_id: d.chunk_id.clone(),
+                disk_id: d.disk_id,
+                tier: d.tier.to_string(),
+            };
+            match crate::scheduler::delocate_replica(&delocate).await {
+                crate::scheduler::DelocateOutcome::RemoveFailed => {
+                    warn!(
+                        chunk = %d.chunk_id,
+                        "Bug AV demote: RemoveChunkLocation Raft write failed"
+                    );
+                    // Raft remove failed: replica still live, retry next
+                    // tick. Skip the cooldown bookkeeping below.
+                    continue;
+                }
+                crate::scheduler::DelocateOutcome::Done => {
                     self.audit.log(
                         "tiering",
                         "cache.demote",
@@ -631,51 +661,27 @@ impl TieringEngine {
                             "chunk={} file={} idx={} node={} tier={:?}",
                             d.chunk_id, d.file_path, d.chunk_index, d.node_id, d.tier
                         ),
-                        if was_present { d.reason } else { "noop_already_absent" },
+                        d.reason,
                     );
                 }
-                Err(e) => {
+                crate::scheduler::DelocateOutcome::RemovedBytesLeftover => {
                     warn!(
                         chunk = %d.chunk_id,
                         node = d.node_id,
-                        error = %e,
-                        "Bug AV demote: DeleteChunkReplica failed"
+                        "Bug AV demote: DeleteChunkReplica failed after Raft remove (orphan reaper will reclaim leftover bytes)"
                     );
                     self.audit.log(
                         "tiering",
                         "cache.demote",
                         &format!(
-                            "chunk={} file={} idx={} node={} tier={:?} err={}",
-                            d.chunk_id, d.file_path, d.chunk_index, d.node_id, d.tier, e
+                            "chunk={} file={} idx={} node={} tier={:?}",
+                            d.chunk_id, d.file_path, d.chunk_index, d.node_id, d.tier
                         ),
-                        "rpc_failed",
+                        "rpc_failed_after_remove",
                     );
-                    continue;
+                    // Fall through: the SM entry is gone (de-located), so
+                    // the cooldown bookkeeping below still applies.
                 }
-            };
-
-            // 3. RemoveChunkLocation Raft write so the SM no longer
-            //    lists this replica.
-            let remove_req = dtfs_raft::ClientRequest::RemoveChunkLocation {
-                path: d.file_path.clone(),
-                chunk_index: d.chunk_index,
-                node_id: d.node_id.to_string(),
-                // CO-1-1 — drop only this (node, disk) warm cache entry.
-                disk_id: d.disk_id,
-                // CO-1-2 — pass the volume anchor so the apply path
-                // re-checks (defence-in-depth, matches the AV-2-4
-                // pattern). The planner already refused any demote that
-                // would strand the anchor (`demote_preserves_anchor`);
-                // this catches an SM change between snapshot and apply.
-                enforce_anchor: d.enforce_anchor.clone(),
-            };
-            if let Err(e) = self.scheduler.raft().client_write(remove_req).await {
-                warn!(
-                    chunk = %d.chunk_id,
-                    error = %e,
-                    "Bug AV demote: RemoveChunkLocation Raft write failed"
-                );
-                continue;
             }
 
             // 4. Conditional cooldown clear. Only fire when the
@@ -3148,6 +3154,72 @@ mod audit_co_tests {
         );
         assert_eq!(plan.anchor_protected[0].node_id, 10);
         assert_eq!(plan.anchor_protected[0].disk_id, 1);
+    }
+
+    // ---- CO-1-3 — demote dispatch de-location ordering ----
+
+    /// CO-1-3 — the demote dispatch routes its de-location through the same
+    /// `delocate_replica` contract the scheduler uses: the
+    /// `RemoveChunkLocation` Raft write (carrying the volume `enforce_anchor`)
+    /// commits BEFORE any byte delete, and on a forced Raft-write failure NO
+    /// `DeleteChunkReplica` RPC is issued (no phantom replica). A recording
+    /// mock stands in for the live `SchedulerDelocate`, capturing the anchor
+    /// the demote would thread through.
+    #[tokio::test]
+    async fn co_1_3_demote_removes_before_byte_delete_carries_anchor() {
+        use crate::scheduler::{delocate_replica, DelocateOps, DelocateOutcome};
+        use std::sync::Mutex;
+
+        struct DemoteDelocate {
+            calls: Mutex<Vec<&'static str>>,
+            // The anchor the demote dispatch threads into RemoveChunkLocation.
+            enforce_anchor: Option<AnchorPolicy>,
+            remove_fails: bool,
+        }
+        impl DelocateOps for DemoteDelocate {
+            async fn remove_location(&self) -> anyhow::Result<()> {
+                self.calls.lock().unwrap().push("remove");
+                // The demote MUST carry the volume anchor for the apply-path
+                // defence-in-depth re-check (CO-1-2).
+                assert!(
+                    self.enforce_anchor.is_some(),
+                    "demote RemoveChunkLocation must carry enforce_anchor"
+                );
+                if self.remove_fails {
+                    Err(anyhow::anyhow!("forced raft remove failure"))
+                } else {
+                    Ok(())
+                }
+            }
+            async fn delete_bytes(&self) -> anyhow::Result<()> {
+                self.calls.lock().unwrap().push("delete");
+                Ok(())
+            }
+        }
+
+        let anchor = Some(AnchorPolicy { datacenter: "leli".into(), required_tier: None });
+
+        // Happy path: remove then delete, in order.
+        let ok = DemoteDelocate {
+            calls: Mutex::new(Vec::new()),
+            enforce_anchor: anchor.clone(),
+            remove_fails: false,
+        };
+        assert_eq!(delocate_replica(&ok).await, DelocateOutcome::Done);
+        assert_eq!(*ok.calls.lock().unwrap(), vec!["remove", "delete"]);
+
+        // Forced Raft failure: no byte delete is issued (no phantom replica).
+        let fail = DemoteDelocate {
+            calls: Mutex::new(Vec::new()),
+            enforce_anchor: anchor,
+            remove_fails: true,
+        };
+        assert_eq!(delocate_replica(&fail).await, DelocateOutcome::RemoveFailed);
+        assert_eq!(
+            *fail.calls.lock().unwrap(),
+            vec!["remove"],
+            "a failed demote Raft remove must not delete any bytes"
+        );
     }
 
     // ---- CO-4-6 — legacy temperature path skips AV-cache volumes ----
