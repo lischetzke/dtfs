@@ -116,6 +116,11 @@ impl DataMetrics {
 
         // Eviction: if the table is at capacity AND this chunk isn't already
         // tracked, drop the entry with the oldest last_access to make room.
+        // CO-4-17 — evict `per_chunk_last_access` in lockstep with
+        // `per_chunk_reads`. Pre-fix only `per_chunk_reads` was removed, so
+        // `per_chunk_last_access` (inserted above for EVERY chunk read,
+        // including dedup early-returns that never touch `per_chunk_reads`)
+        // grew without bound. Both maps are now capped at MAX_CHUNK_DC_ENTRIES.
         if !self.per_chunk_reads.contains_key(chunk_id)
             && self.per_chunk_reads.len() >= MAX_CHUNK_DC_ENTRIES
         {
@@ -127,7 +132,28 @@ impl DataMetrics {
                 .map(|e| e.key().clone())
             {
                 self.per_chunk_reads.remove(&oldest);
+                self.per_chunk_last_access.remove(&oldest);
             }
+        }
+        // CO-4-17 — bound `per_chunk_last_access` on its own growth. It is
+        // inserted for every chunk read (including the dedup early-return
+        // path that never reaches `per_chunk_reads`), so the lockstep
+        // eviction above is not enough on its own: evict the globally-oldest
+        // last-access entry until the map is back under the cap.
+        while self.per_chunk_last_access.len() > MAX_CHUNK_DC_ENTRIES {
+            // Never evict the chunk we just recorded (guards against a
+            // backward clock jump making `now_ms` the global minimum).
+            let Some(oldest) = self
+                .per_chunk_last_access
+                .iter()
+                .filter(|e| e.key() != chunk_id)
+                .min_by_key(|e| e.value().load(Ordering::Relaxed))
+                .map(|e| e.key().clone())
+            else {
+                break;
+            };
+            self.per_chunk_last_access.remove(&oldest);
+            self.per_chunk_reads.remove(&oldest);
         }
 
         let by_dc = self
@@ -485,6 +511,34 @@ mod tests {
             harvest[0].reads_by_dc.get("dc-a").copied(),
             Some(2),
             "two reads spaced >= DEDUP_MS apart MUST count as 2",
+        );
+    }
+
+    /// CO-4-17 regression — both per-chunk read-tracking maps stay
+    /// bounded under a flood of distinct chunk ids. Pre-fix the eviction
+    /// removed only from `per_chunk_reads`, so `per_chunk_last_access`
+    /// (inserted for every read) grew without bound. After inserting
+    /// MAX + k distinct chunks, BOTH maps must be <= MAX.
+    #[test]
+    fn co_4_17_read_tracking_maps_stay_bounded() {
+        let m = DataMetrics::new();
+        let total = MAX_CHUNK_DC_ENTRIES + 1_000;
+        for i in 0..total as u64 {
+            // Distinct chunk id per read; monotonically increasing ts so
+            // the LRU has a well-defined oldest. First read of each chunk
+            // has prev==0, so it never hits the dedup early-return.
+            let chunk = format!("{i:064x}");
+            m.record_chunk_read(&chunk, "dc-a", 1_000 + i);
+        }
+        assert!(
+            m.per_chunk_reads.len() <= MAX_CHUNK_DC_ENTRIES,
+            "per_chunk_reads must stay <= MAX (got {})",
+            m.per_chunk_reads.len()
+        );
+        assert!(
+            m.per_chunk_last_access.len() <= MAX_CHUNK_DC_ENTRIES,
+            "per_chunk_last_access must stay <= MAX (got {})",
+            m.per_chunk_last_access.len()
         );
     }
 
