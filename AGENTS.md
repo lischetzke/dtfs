@@ -469,7 +469,14 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   (`cluster_config.config_json`) projected on top via `json_deep_merge`
   (Bug CM) — a saved cluster-wide override MUST read back as `current`, or
   the WebUI editor looks broken. Adding a config read path? Route it
-  through `effective_config_value`, never raw `state.config`.
+  through `effective_config_value`, never raw `state.config` (CO-5-9 — the
+  `get_config` `defaults` block follows the same merge). The write path
+  (`update_config`) deep-merges the override onto the startup config (which,
+  since `UpdateConfig` replaces the override wholesale, IS the post-save
+  effective config) and REQUIRES the merge to deserialize as `ManagerConfig`
+  (`merge_and_validate_override`, 400 on type error, CO-4-3), then persists
+  `toml::to_string_pretty` of the validated merge — never raw override JSON
+  into the `.toml`.
 - `dtfs-manager/src/membership.rs` — CF-2 online raft membership: pure
   validation for the leader-only `/api/v1/raft/{add-learner,promote,
   remove}` endpoints (openraft `add_learner`/`change_membership`;

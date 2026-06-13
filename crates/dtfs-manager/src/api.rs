@@ -2955,6 +2955,34 @@ async fn update_config(
         }
     };
 
+    // CO-4-3 — strict-validate the override by deep-merging it onto the node's
+    // startup config and requiring the MERGED result to deserialize as a full
+    // `ManagerConfig`. `UpdateConfig` REPLACES the cluster override wholesale
+    // (see state_machine.rs), so `startup + this override` is exactly the
+    // effective config that this save produces — and exactly what we persist.
+    // A sparse override on its own can never parse as ManagerConfig (required
+    // identity fields are absent), so the pre-fix code's lone
+    // `from_str::<ManagerConfig>(override)` always failed and fell back to
+    // writing raw JSON into the .toml. Validating the merge instead catches a
+    // bad-type / out-of-range value (-> 400, live + on-disk config untouched)
+    // and yields the canonical TOML to persist below.
+    let merged_config: Option<dtfs_common::config::ManagerConfig> = if config_json.is_empty() {
+        None
+    } else {
+        match merge_and_validate_override(&state.config, &config_json) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": e,
+                        "preserved_current": true,
+                    })),
+                ));
+            }
+        }
+    };
+
     // Bug BD-3 — guard cluster-wide writes. We treat any non-empty
     // payload that the WebUI would touch under the Cluster tab as
     // cluster-wide; the ack flag confirms the operator understands
@@ -3012,28 +3040,31 @@ async fn update_config(
         ));
     }
 
-    // AZ-5-A2 — optionally persist to disk via atomic tmp+rename.
+    // AZ-5-A2 / CO-4-3 — optionally persist to disk via atomic tmp+rename.
+    // Always serialise the validated MERGED `ManagerConfig` (set above) to
+    // TOML — never the raw override JSON, which is sparse and not a valid
+    // manager.toml. The merge already type-checked, so a TOML serialisation
+    // failure here is a serializer bug, not operator input; skip the write
+    // rather than poison the file with non-TOML.
     let mut wrote_to_disk = false;
-    if body.write_to_disk && !config_json.is_empty() {
-        let path = std::path::Path::new("/etc/dtfs/manager.toml");
-        let tmp = path.with_extension("toml.az5.tmp");
-        // Re-serialise the live ManagerConfig to TOML so the on-disk
-        // file stays operator-readable. Fall back to the raw JSON if
-        // TOML serialisation fails. Uses the sentinel-stripped JSON so a
-        // "***" placeholder never lands on disk as the real secret.
-        let new_toml = match serde_json::from_str::<dtfs_common::config::ManagerConfig>(
-            &config_json,
-        ) {
-            Ok(parsed) => toml::to_string_pretty(&parsed)
-                .unwrap_or_else(|_| config_json.clone()),
-            Err(_) => config_json.clone(),
-        };
-        if let Err(e) = std::fs::write(&tmp, new_toml.as_bytes())
-            .and_then(|_| std::fs::rename(&tmp, path))
-        {
-            warn!(error = %e, "AZ-5-A2 write_to_disk failed");
-        } else {
-            wrote_to_disk = true;
+    if body.write_to_disk {
+        if let Some(ref cfg) = merged_config {
+            match toml::to_string_pretty(cfg) {
+                Ok(new_toml) => {
+                    let path = std::path::Path::new("/etc/dtfs/manager.toml");
+                    let tmp = path.with_extension("toml.az5.tmp");
+                    if let Err(e) = std::fs::write(&tmp, new_toml.as_bytes())
+                        .and_then(|_| std::fs::rename(&tmp, path))
+                    {
+                        warn!(error = %e, "AZ-5-A2 write_to_disk failed");
+                    } else {
+                        wrote_to_disk = true;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "CO-4-3 merged config failed TOML serialisation; skipping disk write");
+                }
+            }
         }
     }
 
@@ -3470,6 +3501,26 @@ fn json_deep_merge(base: &mut Value, over: &Value) {
     }
 }
 
+/// CO-4-3 — deep-merge a (possibly sparse) override JSON onto a base
+/// `ManagerConfig` (the node's startup config) and require the MERGED result
+/// to deserialize as a full `ManagerConfig`. Returns the typed merge on
+/// success, or a human-readable 400 reason on bad JSON / type error. The
+/// caller persists `toml::to_string_pretty` of the returned config — never the
+/// raw override. Because `UpdateConfig` replaces the cluster override
+/// wholesale, `startup + override` is the post-save effective config.
+fn merge_and_validate_override(
+    base: &dtfs_common::config::ManagerConfig,
+    override_json: &str,
+) -> Result<dtfs_common::config::ManagerConfig, String> {
+    let over: Value = serde_json::from_str(override_json)
+        .map_err(|e| format!("invalid config JSON: {e}"))?;
+    let mut merged = serde_json::to_value(base)
+        .map_err(|e| format!("could not serialise base config: {e}"))?;
+    json_deep_merge(&mut merged, &over);
+    serde_json::from_value::<dtfs_common::config::ManagerConfig>(merged)
+        .map_err(|e| format!("config override does not type-check as ManagerConfig: {e}"))
+}
+
 /// BUG-CM — the effective manager config: the node's startup `state.config`
 /// with the Raft-stored cluster override (`cluster_config.config_json`, set
 /// via the editor) projected on top. The config read endpoints MUST go
@@ -3733,6 +3784,89 @@ mod bug_cm_config_readback_tests {
         let snapshot = base.clone();
         json_deep_merge(&mut base, &json!({}));
         assert_eq!(base, snapshot);
+    }
+}
+
+#[cfg(test)]
+mod co_4_3_config_override_validation_tests {
+    use super::*;
+
+    fn base_config() -> dtfs_common::config::ManagerConfig {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/examples/manager.toml");
+        dtfs_common::config::load_config(&path)
+            .expect("deploy/examples/manager.toml must parse as ManagerConfig")
+    }
+
+    // CO-4-3 — a sparse, well-typed override deep-merges onto the base, the
+    // merge type-checks as ManagerConfig, and the persisted TOML round-trips
+    // back through load_config (proving we never write raw JSON into a .toml).
+    #[test]
+    fn sparse_override_round_trips_through_load_config() {
+        let base = base_config();
+        let merged = merge_and_validate_override(
+            &base,
+            r#"{"tiering":{"evaluation_interval_secs":60}}"#,
+        )
+        .expect("sparse well-typed override must validate");
+        assert_eq!(merged.tiering.evaluation_interval_secs, 60);
+        // Untouched sibling survives the merge.
+        assert_eq!(
+            merged.tiering.migration_bandwidth_limit_mbps,
+            base.tiering.migration_bandwidth_limit_mbps,
+        );
+
+        // Persisted exactly as update_config does: pretty TOML of the merge.
+        let toml_str = toml::to_string_pretty(&merged).expect("merge serialises to TOML");
+        let tmp = std::env::temp_dir().join(format!(
+            "dtfs-co43-{}.toml",
+            std::process::id(),
+        ));
+        std::fs::write(&tmp, toml_str.as_bytes()).unwrap();
+        let reloaded: dtfs_common::config::ManagerConfig =
+            dtfs_common::config::load_config(&tmp).expect("persisted TOML must reload");
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(reloaded.tiering.evaluation_interval_secs, 60);
+    }
+
+    // CO-4-3 — the validate-on-every-write gate must not spuriously 400 a
+    // legitimate config: an empty-object override (no change) round-trips the
+    // full base config through to_value -> from_value cleanly, proving the
+    // ManagerConfig JSON round-trip is symmetric for the canonical example.
+    #[test]
+    fn empty_object_override_revalidates_base() {
+        let base = base_config();
+        let merged = merge_and_validate_override(&base, "{}")
+            .expect("base config must survive a no-op override round-trip");
+        assert_eq!(
+            merged.tiering.evaluation_interval_secs,
+            base.tiering.evaluation_interval_secs,
+        );
+    }
+
+    // CO-4-3 — a wrong-type override is rejected (would be a 400) instead of
+    // being persisted as raw JSON.
+    #[test]
+    fn bad_type_override_is_rejected() {
+        let base = base_config();
+        let err = merge_and_validate_override(
+            &base,
+            r#"{"tiering":{"evaluation_interval_secs":"not-a-number"}}"#,
+        )
+        .expect_err("a string where a u64 is expected must fail validation");
+        assert!(
+            err.contains("type-check"),
+            "error should explain the type failure, got: {err}",
+        );
+    }
+
+    // CO-4-3 — malformed JSON is rejected up front.
+    #[test]
+    fn invalid_json_is_rejected() {
+        let base = base_config();
+        let err = merge_and_validate_override(&base, "{not json")
+            .expect_err("malformed JSON must fail");
+        assert!(err.contains("invalid config JSON"), "got: {err}");
     }
 }
 
