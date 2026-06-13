@@ -2604,7 +2604,7 @@ pub(crate) fn plan_flush_cache(
     let mut actions: Vec<FlushAction> = Vec::new();
     let mut report = FlushCacheReport::default();
 
-    'files: for (file_path, chunks, mandatory, anchor) in &snapshot.files {
+    for (file_path, chunks, mandatory, anchor) in &snapshot.files {
         report.files_matched += 1;
         // Group by chunk_index so we evaluate each chunk as a unit.
         let mut by_index: std::collections::BTreeMap<u64, Vec<&ChunkLocationEntry>> =
@@ -2673,11 +2673,14 @@ pub(crate) fn plan_flush_cache(
             // we stop enqueueing — operator re-runs the call to pick up
             // remaining work.
             for e in would_drop {
+                // CO-5-8 — once capped, count each remaining would-drop
+                // entry directly into `truncated` (the count of replicas
+                // we declined to flush this call), not the old
+                // `chunks_examined - actions.len()` which mixed chunk and
+                // replica-action units and double-/under-counted.
                 if actions.len() >= max_tasks {
-                    // Count remaining unseen as truncated and bail.
-                    report.truncated +=
-                        report.chunks_examined.saturating_sub(actions.len());
-                    break 'files;
+                    report.truncated += 1;
+                    continue;
                 }
                 let Ok(nid) = e.node_id.parse::<u64>() else {
                     continue;
@@ -4483,6 +4486,42 @@ mod bug_av_flush_cache_tests {
             bar.anchor.as_ref().map(|a| a.datacenter.as_str()),
             Some("toro"),
             "non-default-volume file enforces its OWN (toro) anchor, not the default's"
+        );
+    }
+
+    /// CO-5-8 — when `max_tasks` caps the plan, `truncated` is the count of
+    /// the remaining would-drop REPLICA entries we declined to enqueue, not
+    /// the old `chunks_examined - actions.len()` (which mixed chunk and
+    /// action units). Mixed set: 4 chunks, each with one warm cache replica
+    /// to drop; cap at 1 -> 1 action, 3 truncated.
+    #[test]
+    fn co_5_8_truncated_counts_remaining_would_drop_entries() {
+        let chunks: Vec<ChunkLocationEntry> = (0..4u64)
+            .flat_map(|i| {
+                vec![
+                    ent(i, &format!("h{i}"), 10, 0), // cold (mandatory, kept)
+                    ent(i, &format!("h{i}"), 11, 0), // warm (cache, would-drop)
+                ]
+            })
+            .collect();
+        let snapshot = FlushSnapshot {
+            files: vec![(
+                "/movies/season.mkv".to_string(),
+                chunks,
+                mandatory_cold_only(),
+                None,
+            )],
+            nodes: HashMap::from([
+                (10u64, node_summary("leli", &[DiskTier::Cold])),
+                (11u64, node_summary("toro", &[DiskTier::Warm])),
+            ]),
+        };
+        let (actions, report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 1);
+        assert_eq!(actions.len(), 1, "cap honoured: only 1 action enqueued");
+        assert_eq!(
+            report.truncated, 3,
+            "the other 3 would-drop warm replicas are counted as truncated"
         );
     }
 }

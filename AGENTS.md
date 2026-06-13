@@ -470,7 +470,9 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   opening snapshot and the ListChunks reply — so a healthy node is never
   quarantined for a demote race. **CO-5-7:** `FlushSnapshot`/`FlushAction`
   carry the file's OWN volume anchor (not the default volume's) so a
-  non-default-volume flush enforces its own anchor.
+  non-default-volume flush enforces its own anchor. **CO-5-8:** the flush
+  `truncated` counter counts the remaining would-drop replica entries
+  directly, not `chunks_examined - actions.len()`.
 - `dtfs-manager/src/monitor.rs` — heartbeat health detection only
   (Bug CH): commits node-status transitions, fires NodeDown/SMART
   alerts. MUST NOT schedule repair — the 2026-06-06 storm came from a
