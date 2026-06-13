@@ -366,7 +366,7 @@ via builder `10.20.0.150`); use `wait_for`, last line `STATUS: …`.
 | CO-3-2 | HIGH | scheduler.rs:611 | rebalance must delete bytes after the Raft remove, OR teach the reaper a per-node "on disk, no location entry for this node + grace" rule (also mops CO-1-3) | over-replicated chunk: after rebalance the de-located on-disk copy is reaped |
 | CO-3-3 | HIGH | scheduler.rs:1623 | re-check current SM after detecting `missing` (or require 2 consecutive ticks) before `QuarantineNode` | demote mid-orphan-scan does NOT quarantine the healthy node |
 | CO-3-5 | MED | scheduler.rs:249 vs 304 | `tokio::Mutex` around migration-state load-modify-save | concurrent `schedule_replication` during a tick: task survives, `next_task_id` monotonic |
-| CO-3-6 | HIGH | network.rs:120,141,289 | per-request snapshot RPC timeout (`Request::set_timeout` from `option.hard_ttl()` / size-scaled), not the 5 s channel default | `tests/proxmox/abuse/`: >25 MB snapshot installs to a learner behind the 40 Mbps shape |
+| CO-3-6 ✅ done | HIGH | network.rs:120,141,289 | per-request snapshot RPC timeout (`Request::set_timeout` from `option.hard_ttl()` / size-scaled), not the 5 s channel default | `tests/proxmox/abuse/`: >25 MB snapshot installs to a learner behind the 40 Mbps shape |
 | CO-3-7 | HIGH | metadata.rs:1024,1041 | `raft_write_or_forward` + `accepted:false` on failure (don't `let _ =`) | corrupt-chunk report to a FOLLOWER manager still drops the replica + queues re-replication |
 | CO-3-12 | MED | filesystem.rs:545 | clone path/chunk_size/volume_id/locations, drop the DashMap guard before the chunk loop (match write()/flush()) | (loom/integration) stalled read + 4 concurrent opens all complete |
 | CO-4-3 | MED-HIGH | api.rs:2889,2951 | strict-validate the override (deep-merge onto effective, require it deserializes as `ManagerConfig`); persist `toml::to_string_pretty` of the merge, never raw JSON into `.toml` | sparse override round-trips through `load_config`; bad-type override → 400 |
@@ -422,6 +422,17 @@ rescan; ArcCache never populated (wire-with-byte-accounting vs remove).
   builder 10.20.0.150 (per-crate `cargo test --no-run` compiles; named
   tests fail by panic/assertion as documented). Full-workspace
   `cargo test --workspace --no-run` gate: see commit / build log.
+- 2026-06-13 CO-3-6: removed the 5s channel-level `.timeout()` (tonic
+  GrpcTimeout takes the MIN of channel + per-request, so it clamped the
+  snapshot RPC); `send_rpc` now sets a per-request `set_timeout`. Snapshot
+  uses `snapshot_rpc_timeout(bytes, option.hard_ttl())` = max(hard_ttl,
+  bytes / 1 MBps floored at 5s). Unit: `co36_snapshot_timeout_tests` (4
+  cases — min floor, size-scaled, hard_ttl-wins, size-wins). Cross-process:
+  `tests/release/cases/64-snapshot-learner-under-shaping.sh` (shaped learner
+  snapshot install, SKIPs off-lab) + abuse `21-co36-...` delegates to it.
+  Unreachable-vs-StorageError mapping (Bug CL) preserved: a fired timeout is
+  a tonic Status -> `unreachable_err` -> `RPCError::Unreachable` ->
+  `StreamingError::Unreachable`. Gate runs under the coordinator's build.
 
 ## Deviations
 
