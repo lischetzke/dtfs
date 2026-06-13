@@ -1697,6 +1697,32 @@ impl TaskScheduler {
                 if let Some(expected) = expected_by_node.get(node_id) {
                     let missing: Vec<&String> =
                         expected.iter().filter(|c| !on_disk.contains_key(*c)).collect();
+                    // CO-3-3 — the `expected_by_node` set was snapshotted at
+                    // the top of this tick under one read lock, but the
+                    // ListChunks reply arrives later. A demote / unlink /
+                    // rebalance that committed `RemoveChunkLocation` between
+                    // the snapshot and now leaves the stale snapshot still
+                    // naming the node for a chunk it no longer holds
+                    // (legitimately) — quarantining a healthy node. Re-read
+                    // the CURRENT SM and keep only chunks the node is STILL
+                    // expected to hold; if none remain, the "missing" set was
+                    // a demote race, not a fault — skip the quarantine (but
+                    // still fall through to the on-disk reap below).
+                    let missing: Vec<&String> = if missing.is_empty() {
+                        missing
+                    } else {
+                        let still_expected =
+                            self.current_expected_chunks_for_node(*node_id).await;
+                        let filtered = still_missing_after_recheck(&missing, &still_expected);
+                        if filtered.is_empty() {
+                            debug!(
+                                node = %node_id,
+                                "CO-3-3: in-state-missing cleared on SM re-check \
+                                 (demote/unlink race) — node not quarantined"
+                            );
+                        }
+                        filtered
+                    };
                     if !missing.is_empty() {
                         let first = missing[0].clone();
                         let info = dtfs_common::types::QuarantineInfo {
@@ -1820,6 +1846,29 @@ impl TaskScheduler {
         }
 
         Ok(reaped)
+    }
+
+    /// CO-3-3 — the set of chunk hashes the CURRENT state machine records a
+    /// location entry for on `node_id` (the union across all of the node's
+    /// disks). Used by `orphan_scrub_tick` to re-confirm an "in-state but
+    /// not on disk" finding against fresh SM state before quarantining: a
+    /// demote / unlink that committed `RemoveChunkLocation` after the tick's
+    /// opening snapshot drops the chunk from this set, so a stale-snapshot
+    /// false positive is filtered out.
+    async fn current_expected_chunks_for_node(
+        &self,
+        node_id: u64,
+    ) -> std::collections::HashSet<String> {
+        let sm = self.state_data.read().await;
+        let mut out = std::collections::HashSet::new();
+        for f in sm.files.values() {
+            for c in &f.chunks {
+                if c.node_id.parse::<u64>().ok() == Some(node_id) {
+                    out.insert(c.chunk_hash.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Bug BC-6 — invoke `ListChunks` on a single data node, drain all
@@ -2893,6 +2942,25 @@ pub(crate) fn chunk_delocated_on_node(
         // expected -> every on-disk chunk is de-located.
         None => true,
     }
+}
+
+/// CO-3-3 — given a set of chunks the tick's OPENING snapshot expected on a
+/// node but the node's ListChunks reply omitted (`snapshot_missing`), and
+/// the set the CURRENT state machine still expects on that node
+/// (`current_expected`), return only the chunks that are still genuinely
+/// missing (in both sets). A chunk that dropped out of `current_expected`
+/// between the snapshot and the re-check was de-located by a concurrent
+/// demote / unlink / rebalance — not a fault — so it must NOT trigger a
+/// quarantine. When the result is empty the caller skips the quarantine.
+pub(crate) fn still_missing_after_recheck<'a>(
+    snapshot_missing: &[&'a String],
+    current_expected: &std::collections::HashSet<String>,
+) -> Vec<&'a String> {
+    snapshot_missing
+        .iter()
+        .copied()
+        .filter(|c| current_expected.contains(*c))
+        .collect()
 }
 
 /// Bug CB — is an on-disk chunk due to be reaped this tick? A chunk is
@@ -5097,6 +5165,42 @@ mod bug_bo_tests {
         assert!(
             orphan_reap_due(reap_candidate, now_ms - (grace_secs + 10) * 1000, now_ms, grace_secs),
             "an aged de-located chunk past grace is reaped"
+        );
+    }
+
+    /// CO-3-3 — the in-state-missing quarantine guard re-checks the CURRENT
+    /// state machine before quarantining. A chunk that dropped out of the
+    /// node's expected set between the tick's opening snapshot and the
+    /// re-check (a concurrent demote / unlink / rebalance) is filtered out,
+    /// so a healthy node is NOT quarantined for losing a chunk it was
+    /// legitimately told to drop. A chunk still expected stays in the set
+    /// and DOES justify a quarantine.
+    #[test]
+    fn co_3_3_recheck_filters_demote_race() {
+        // The tick snapshot saw two chunks expected-but-missing on the node.
+        let a = "a".to_string();
+        let b = "b".to_string();
+        let snapshot_missing: Vec<&String> = vec![&a, &b];
+
+        // Re-check: the CURRENT SM still expects "a" (genuine fault) but no
+        // longer expects "b" (a demote committed RemoveChunkLocation between
+        // the snapshot and now).
+        let mut current_expected: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        current_expected.insert("a".to_string());
+
+        let still = still_missing_after_recheck(&snapshot_missing, &current_expected);
+        assert_eq!(still.len(), 1, "only the genuinely-missing chunk survives");
+        assert_eq!(still[0], "a");
+
+        // Pure demote race: every "missing" chunk was de-located -> empty ->
+        // no quarantine.
+        let none_expected: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let still = still_missing_after_recheck(&snapshot_missing, &none_expected);
+        assert!(
+            still.is_empty(),
+            "a pure demote race must clear the missing set (no quarantine)"
         );
     }
 }

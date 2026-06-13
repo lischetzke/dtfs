@@ -463,7 +463,12 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   naming that node — the rebalance / excess-spill path drops the SM entry via
   `RemoveChunkLocation` but never deletes the bytes; `chunk_delocated_on_node`);
   the reap audits `cause=orphan|delocated`. The reap stays node-wide (legacy
-  first-found delete; ListChunks carries no disk_id).
+  first-found delete; ListChunks carries no disk_id). **CO-3-3:** before the
+  BF-8 in-state-missing quarantine fires, it re-reads the CURRENT SM
+  (`current_expected_chunks_for_node` + `still_missing_after_recheck`) and
+  drops any chunk a concurrent demote/unlink de-located between the tick's
+  opening snapshot and the ListChunks reply — so a healthy node is never
+  quarantined for a demote race.
 - `dtfs-manager/src/monitor.rs` — heartbeat health detection only
   (Bug CH): commits node-status transitions, fires NodeDown/SMART
   alerts. MUST NOT schedule repair — the 2026-06-06 storm came from a
