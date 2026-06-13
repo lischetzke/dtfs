@@ -130,6 +130,23 @@ pub(crate) fn manager_walk_retry_backoff(
     Some(std::time::Duration::from_millis(ms))
 }
 
+/// CO-4-18 — decide whether a failed manager RPC may be transparently
+/// retried (failed over to another manager / re-walked).
+///
+/// `Unavailable` means the RPC never reached the server (channel-level
+/// failure), so it is always safe to retry — even for a mutation. By
+/// contrast `DeadlineExceeded` and `Unknown` can fire *after* the server
+/// applied the write, so retrying a non-idempotent mutation (rename,
+/// lease acquire, commit, ...) risks double-applying it. Those two codes
+/// are only retryable when the caller marks the RPC idempotent.
+pub(crate) fn is_retryable(code: tonic::Code, idempotent: bool) -> bool {
+    match code {
+        tonic::Code::Unavailable => true,
+        tonic::Code::DeadlineExceeded | tonic::Code::Unknown => idempotent,
+        _ => false,
+    }
+}
+
 /// Inner shared state for the client, wrapped in Arc for cheap cloning.
 struct DtfsClientInner {
     /// Cached manager gRPC channels, keyed by address.
@@ -282,7 +299,7 @@ impl DtfsClient {
             volume_id: volume_id.map(|v| v.to_string()),
         };
         let response = self
-            .call_manager("create_file", |mut c| {
+            .call_manager("create_file", false, |mut c| {
                 let r = request.clone();
                 async move { c.create_file(r).await }
             })
@@ -297,7 +314,7 @@ impl DtfsClient {
             path: path.to_string(),
         };
         let response = self
-            .call_manager("get_file_locations", |mut c| {
+            .call_manager("get_file_locations", true, |mut c| {
                 let r = request.clone();
                 async move { c.get_file_locations(r).await }
             })
@@ -312,7 +329,7 @@ impl DtfsClient {
             path: path.to_string(),
         };
         let response = self
-            .call_manager("delete_file", |mut c| {
+            .call_manager("delete_file", false, |mut c| {
                 let r = request.clone();
                 async move { c.delete_file(r).await }
             })
@@ -327,7 +344,7 @@ impl DtfsClient {
             path: path.to_string(),
         };
         let response = self
-            .call_manager("list_directory", |mut c| {
+            .call_manager("list_directory", true, |mut c| {
                 let r = request.clone();
                 async move { c.list_directory(r).await }
             })
@@ -406,7 +423,7 @@ impl DtfsClient {
             requester_location,
         };
         let response = self
-            .call_manager("allocate_chunks", |mut c| {
+            .call_manager("allocate_chunks", false, |mut c| {
                 let r = request.clone();
                 async move { c.allocate_chunks(r).await }
             })
@@ -436,7 +453,7 @@ impl DtfsClient {
             lease_id: lease_id.to_string(),
         };
         let response = self
-            .call_manager("commit_chunk_locations", |mut c| {
+            .call_manager("commit_chunk_locations", false, |mut c| {
                 let r = request.clone();
                 async move { c.commit_chunk_locations(r).await }
             })
@@ -763,7 +780,19 @@ impl DtfsClient {
     /// cluster do not surface as EIO. Application-level errors
     /// (FailedPrecondition, NotFound, AlreadyExists, etc.) surface
     /// immediately.
-    pub(crate) async fn call_manager<F, Fut, T>(&self, op_name: &'static str, mut f: F) -> Result<T>
+    ///
+    /// CO-4-18 — `idempotent` controls retry classification for the
+    /// ambiguous codes (`DeadlineExceeded`/`Unknown`, which can fire after
+    /// the server applied the write). Pass `false` for mutations so a
+    /// possibly-applied write is not retried; read-only RPCs pass `true`.
+    /// `Unavailable` is always retried regardless (the RPC never reached
+    /// the server). See [`is_retryable`].
+    pub(crate) async fn call_manager<F, Fut, T>(
+        &self,
+        op_name: &'static str,
+        idempotent: bool,
+        mut f: F,
+    ) -> Result<T>
     where
         F: FnMut(ManagerServiceClient<Channel>) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<T, tonic::Status>>,
@@ -792,12 +821,7 @@ impl DtfsClient {
                     Ok(v) => return Ok(v),
                     Err(status) => {
                         let code = status.code();
-                        if matches!(
-                            code,
-                            tonic::Code::Unavailable
-                                | tonic::Code::DeadlineExceeded
-                                | tonic::Code::Unknown
-                        ) {
+                        if is_retryable(code, idempotent) {
                             tracing::warn!(
                                 rpc = op_name,
                                 code = ?code,
@@ -897,7 +921,7 @@ impl DtfsClient {
             to: to.to_string(),
         };
         let resp = self
-            .call_manager("rename_file", |mut c| {
+            .call_manager("rename_file", false, |mut c| {
                 let r = request.clone();
                 async move { c.rename_file(r).await }
             })
@@ -916,7 +940,7 @@ impl DtfsClient {
             new_size,
         };
         let resp = self
-            .call_manager("set_file_size", |mut c| {
+            .call_manager("set_file_size", false, |mut c| {
                 let r = request.clone();
                 async move { c.set_file_size(r).await }
             })
@@ -935,7 +959,7 @@ impl DtfsClient {
             target: target.to_string(),
         };
         let resp = self
-            .call_manager("create_symlink", |mut c| {
+            .call_manager("create_symlink", false, |mut c| {
                 let r = request.clone();
                 async move { c.create_symlink(r).await }
             })
@@ -953,7 +977,7 @@ impl DtfsClient {
             path: path.to_string(),
         };
         let resp = self
-            .call_manager("read_symlink", |mut c| {
+            .call_manager("read_symlink", true, |mut c| {
                 let r = request.clone();
                 async move { c.read_symlink(r).await }
             })
@@ -972,7 +996,7 @@ impl DtfsClient {
             dest: dest.to_string(),
         };
         let resp = self
-            .call_manager("create_link", |mut c| {
+            .call_manager("create_link", false, |mut c| {
                 let r = request.clone();
                 async move { c.create_link(r).await }
             })
@@ -988,7 +1012,7 @@ impl DtfsClient {
     pub async fn cluster_capacity(&self) -> Result<(u64, u64, u64)> {
         let request = ClusterCapacityRequest {};
         let resp = self
-            .call_manager("cluster_capacity", |mut c| {
+            .call_manager("cluster_capacity", true, |mut c| {
                 let r = request.clone();
                 async move { c.cluster_capacity(r).await }
             })
@@ -1019,7 +1043,7 @@ impl DtfsClient {
             lease_ms,
         };
         let resp = self
-            .call_manager("acquire_lock", |mut c| {
+            .call_manager("acquire_lock", false, |mut c| {
                 let r = request.clone();
                 async move { c.acquire_lock(r).await }
             })
@@ -1042,7 +1066,7 @@ impl DtfsClient {
             end,
         };
         let _ = self
-            .call_manager("release_lock", |mut c| {
+            .call_manager("release_lock", false, |mut c| {
                 let r = request.clone();
                 async move { c.release_lock(r).await }
             })
@@ -1066,7 +1090,7 @@ impl DtfsClient {
             write,
         };
         let resp = self
-            .call_manager("probe_lock", |mut c| {
+            .call_manager("probe_lock", true, |mut c| {
                 let r = request.clone();
                 async move { c.probe_lock(r).await }
             })
@@ -1089,7 +1113,7 @@ impl DtfsClient {
             lease_ms,
         };
         let resp = self
-            .call_manager("acquire_write_lease", |mut c| {
+            .call_manager("acquire_write_lease", false, |mut c| {
                 let r = request.clone();
                 async move { c.acquire_write_lease(r).await }
             })
@@ -1110,7 +1134,7 @@ impl DtfsClient {
             extension_ms,
         };
         let resp = self
-            .call_manager("renew_write_lease", |mut c| {
+            .call_manager("renew_write_lease", false, |mut c| {
                 let r = request.clone();
                 async move { c.renew_write_lease(r).await }
             })
@@ -1129,7 +1153,7 @@ impl DtfsClient {
             lease_id: lease_id.to_string(),
         };
         let _ = self
-            .call_manager("release_write_lease", |mut c| {
+            .call_manager("release_write_lease", false, |mut c| {
                 let r = request.clone();
                 async move { c.release_write_lease(r).await }
             })
@@ -1147,7 +1171,7 @@ impl DtfsClient {
             except_pid,
         };
         let resp = self
-            .call_manager("release_leases_by_host", |mut c| {
+            .call_manager("release_leases_by_host", false, |mut c| {
                 let r = request.clone();
                 async move { c.release_leases_by_host(r).await }
             })
@@ -1183,7 +1207,7 @@ impl DtfsClient {
             build_date: dtfs_common::version::BUILD_DATE.to_string(),
         };
         let _ = self
-            .call_manager("register_node", |mut c| {
+            .call_manager("register_node", true, |mut c| {
                 let r = request.clone();
                 async move { c.register_node(r).await }
             })
@@ -1339,6 +1363,37 @@ mod bug_cf_manager_walk_retry_tests {
         );
     }
 
+    /// CO-4-18 — `DeadlineExceeded`/`Unknown` are ambiguous (may fire
+    /// after the server applied the write), so they are only retryable
+    /// for idempotent RPCs. `Unavailable` (RPC never reached the server)
+    /// is always retryable; other codes never are.
+    #[test]
+    fn co_4_18_is_retryable_respects_idempotency() {
+        // Ambiguous codes: retry only when idempotent.
+        assert!(!is_retryable(tonic::Code::DeadlineExceeded, false));
+        assert!(is_retryable(tonic::Code::DeadlineExceeded, true));
+        assert!(!is_retryable(tonic::Code::Unknown, false));
+        assert!(is_retryable(tonic::Code::Unknown, true));
+
+        // Unavailable: always retryable, even for a mutation.
+        assert!(is_retryable(tonic::Code::Unavailable, false));
+        assert!(is_retryable(tonic::Code::Unavailable, true));
+
+        // Application-level errors are never retried.
+        for code in [
+            tonic::Code::NotFound,
+            tonic::Code::AlreadyExists,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::InvalidArgument,
+            tonic::Code::PermissionDenied,
+            tonic::Code::Internal,
+            tonic::Code::DataLoss,
+        ] {
+            assert!(!is_retryable(code, true), "{code:?} must not retry");
+            assert!(!is_retryable(code, false), "{code:?} must not retry");
+        }
+    }
+
     /// Bug CF — once the overall deadline is spent, give up so FUSE ops
     /// cannot hang forever against a genuinely-down cluster.
     #[test]
@@ -1385,7 +1440,7 @@ mod bug_cf_manager_walk_retry_tests {
         let calls = Arc::new(AtomicU32::new(0));
         let calls_in = calls.clone();
         let res = client
-            .call_manager("bug_cf_test", move |_c| {
+            .call_manager("bug_cf_test", false, move |_c| {
                 let n = calls_in.fetch_add(1, Ordering::SeqCst);
                 async move {
                     if n < 3 {
@@ -1424,7 +1479,7 @@ mod bug_cf_manager_walk_retry_tests {
         let calls_in = calls.clone();
         let started = std::time::Instant::now();
         let res: Result<u32> = client
-            .call_manager("bug_cf_test_app_err", move |_c| {
+            .call_manager("bug_cf_test_app_err", false, move |_c| {
                 calls_in.fetch_add(1, Ordering::SeqCst);
                 async move { Err(tonic::Status::not_found("no such file")) }
             })
