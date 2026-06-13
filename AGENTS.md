@@ -471,7 +471,22 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   authoritative + single-writer. Recovery stays the heartbeat handler's
   `UpdateNodeStatus(healthy)` (any manager, forwarded).
 - `dtfs-manager/src/metadata.rs` — gRPC service; thin wrappers over
-  `raft_write(ClientRequest::*)`.
+  `raft_write(ClientRequest::*)`. Follower-originated writes proxy to the
+  leader via `ForwardClientWrite`; CO-2-2 authenticates that RPC — the
+  forwarder stamps `ForwardWriteRequest.shared_secret` (field 2) from
+  `config.cluster.shared_secret` and the leader rejects a mismatch with
+  `permission_denied` via a CONSTANT-TIME compare (`forward_secret_ok`,
+  which reuses `dtfs_common::crypto::constant_time_eq` — never `==` on the
+  secret); an empty configured secret skips the check (back-compat for
+  plaintext clusters). Any new forward site MUST populate that field.
+  CO-3-7: `report_chunk_status` commits its
+  corrupt/missing handling (UpdateNodeStatus + RemoveCorruptChunkReplicas)
+  through `raft_write_or_forward` and returns `accepted: false` on failure —
+  never `let _ = raft_write(...)`, which on a follower silently dropped the
+  de-location so the bad replica stayed advertised healthy and
+  re-replication never queued. The dtfs-data heartbeat loop re-enqueues the
+  drained corrupt ids when the ack is `accepted == false` (same as a
+  transport error), so the retry actually happens.
 - `dtfs-manager/src/api.rs` — REST endpoints (WebUI + CLI); `get_stats`
   is the WebUI home aggregator. The config read endpoints (`get_config`,
   `get_config_effective`) return the **effective** config = the node's
