@@ -221,6 +221,17 @@ impl fmt::Display for NodeInfo {
     }
 }
 
+/// CO-5-10 — sentinel `expected_version` meaning "skip the config CAS".
+/// A legacy `UpdateConfig` log entry serialised before the field existed
+/// deserialises to this via `update_config_no_cas`; the apply skips the
+/// compare-and-set so old entries replay unchanged. A real version (incl. 0)
+/// is always CAS-checked.
+pub const UPDATE_CONFIG_NO_CAS: u64 = u64::MAX;
+
+fn update_config_no_cas() -> u64 {
+    UPDATE_CONFIG_NO_CAS
+}
+
 /// Commands that mutate the cluster state machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ClientRequest {
@@ -321,6 +332,17 @@ pub enum ClientRequest {
     UpdateConfig {
         config_json: String,
         version: u64,
+        /// CO-5-10 — the cluster-config version the proposer read before
+        /// building this write. The apply rejects the command when this no
+        /// longer matches `sm.cluster_config.version`, closing the
+        /// read-then-write TOCTOU that silently lost concurrent saves.
+        /// Defaults to the `u64::MAX` sentinel (A.3.1) so a pre-CO-5-10 log
+        /// entry / snapshot (serialised without this field) loads and replays
+        /// with the CAS skipped. The sentinel is used instead of 0 because 0
+        /// is a real base version (a fresh cluster's first write reads
+        /// `version 0`), and that write MUST still be CAS-checked.
+        #[serde(default = "update_config_no_cas")]
+        expected_version: u64,
     },
 
     /// Create or update a volume configuration.
