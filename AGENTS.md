@@ -474,6 +474,16 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   validation for the leader-only `/api/v1/raft/{add-learner,promote,
   remove}` endpoints (openraft `add_learner`/`change_membership`;
   `initial_voters` is bootstrap-only).
+- `dtfs-manager/src/join.rs` — two-phase data-node join (HMAC handshake;
+  `/api/v1/join/{request,complete}` in api.rs). Phase-1 `handle_join_request`
+  verifies HMAC(secret, nonce), issues a challenge, and persists it with a
+  60s single-use TTL (`challenges` map). Phase-2 `complete_join` (CO-2-3
+  security) requires `HMAC(secret, challenge)` (constant-time
+  `verify_completion_inner`, consumes the challenge), derives
+  `node_id = node_id_from_hostname(hostname)` SERVER-SIDE (never trust a
+  client id), then does the `RegisterNode` Raft write. Empty
+  `cluster.shared_secret` = documented unauthenticated downgrade (skips the
+  challenge/HMAC checks). docs/src/security/cluster-join.md.
 - `dtfs-manager/src/webui.rs` — embedded SPA, format-string HTML
   (`{{`/`}}` for literal braces).
 - `dtfs-data/src/server.rs::put_chunk` — streaming put path.

@@ -877,7 +877,14 @@ struct JoinDiskApi {
 
 #[derive(Debug, Deserialize)]
 struct JoinCompleteApi {
-    node_id: u64,
+    // CO-2-3 — the server-issued challenge from phase-1 and
+    // HMAC(cluster.shared_secret, challenge) proving possession of the secret.
+    // `node_id` is NO LONGER accepted from the client; it is derived
+    // server-side from `hostname` (node_id_from_hostname).
+    #[serde(default)]
+    challenge: String,
+    #[serde(default)]
+    completion_hmac_hex: String,
     hostname: String,
     grpc_addr: String,
     #[serde(default)]
@@ -957,9 +964,16 @@ async fn join_complete_api(
         quarantine: None,
     };
 
+    let completion_hmac = hex::decode(body.completion_hmac_hex.trim()).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid completion_hmac_hex: {e}")})),
+        )
+    })?;
+
     let completion = state
         .join
-        .complete_join(body.node_id, info)
+        .complete_join(&body.challenge, &completion_hmac, info)
         .await
         .map_err(|e| {
             (
