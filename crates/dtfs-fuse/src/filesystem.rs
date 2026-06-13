@@ -564,7 +564,7 @@ impl DtfsFilesystem {
         if offset >= file_size {
             return Ok(Bytes::new());
         }
-        let actual_size = size.min((file_size - offset) as u32);
+        let actual_size = effective_read_len(file_size, offset, size);
 
         // Determine which chunks we need to read.
         let start_chunk = (offset / chunk_size) as usize;
@@ -922,7 +922,14 @@ impl DtfsFilesystem {
         // Check if any complete chunks are ready to flush.
         let segments = self.write_buffer.flush(&path);
         if !segments.is_empty() {
-            self.flush_segments_to_cluster(&path, &segments).await?;
+            if let Err(e) = self.flush_segments_to_cluster(&path, &segments).await {
+                // CO-1-8 (a): `flush` already drained these complete chunks out
+                // of the buffer. Restore them on a cluster-write error so the
+                // bytes survive for the next flush instead of being dropped
+                // while the write call reports failure upstream.
+                self.write_buffer.restore_segments(&path, &segments);
+                return Err(e);
+            }
         }
 
         // Renew the write lease mid-stream so a long-running streaming
@@ -1068,6 +1075,13 @@ impl DtfsFilesystem {
                         );
                     }
                     self.metadata_cache.remove(&path);
+                } else {
+                    // CO-1-8 (a): `flush_all` already drained these bytes out of
+                    // the buffer. The cluster write failed, so put them back —
+                    // otherwise the bytes are gone and a later (retried) fsync
+                    // returns Ok with the data silently lost. The next flush
+                    // re-sends them.
+                    self.write_buffer.restore_segments(&path, &segments);
                 }
                 return Err(e);
             }
@@ -1102,10 +1116,16 @@ impl DtfsFilesystem {
     /// Flushes any remaining buffered writes, then removes the handle.
     #[instrument(skip(self), fields(fh))]
     pub async fn release(&self, fh: u64) -> Result<()> {
-        // Flush before closing.
-        if self.open_files.contains_key(&fh) {
-            self.flush(fh).await?;
-        }
+        // CO-1-8 (c): flush before closing, but DO NOT early-return on a flush
+        // error. The kernel closes the fd regardless, so we must always tear
+        // down the handle, its write lease, and its write buffer; otherwise the
+        // fh leaks and the stale buffer overlays (incorrectly) future reads of
+        // the same path. Capture the error and surface it AFTER cleanup.
+        let flush_result = if self.open_files.contains_key(&fh) {
+            self.flush(fh).await
+        } else {
+            Ok(())
+        };
 
         if let Some((_, file)) = self.open_files.remove(&fh) {
             // P0-1: release the write lease (if held). Best-effort: a
@@ -1124,12 +1144,15 @@ impl DtfsFilesystem {
                     );
                 }
             }
-            // Clean up write buffer for this path.
+            // Clean up write buffer for this path. On a flush failure the
+            // un-flushed bytes are dropped here (the data is lost on the
+            // cluster too) but the error is propagated below so the caller
+            // sees the failure rather than a silent success.
             self.write_buffer.remove(&file.path);
             debug!(path = %file.path, fh, "file released");
         }
 
-        Ok(())
+        flush_result
     }
 
     /// Create a new file in the DTFS namespace and return a file handle.
@@ -1293,12 +1316,10 @@ impl DtfsFilesystem {
             .set_file_size(path, new_size)
             .await
             .with_context(|| format!("truncate failed for {path}"))?;
-        // Clear any buffered writes past the new EOF.
-        if let Some(buffered_eof) = self.write_buffer.logical_size(path) {
-            if buffered_eof > new_size {
-                self.write_buffer.remove(path);
-            }
-        }
+        // CO-1-8 (b): clear buffered writes AT OR ABOVE the new EOF but keep
+        // buffered bytes below it. Removing the whole buffer (the old
+        // behaviour) lost un-flushed writes that the truncation never deleted.
+        self.write_buffer.truncate(path, new_size);
         // Refresh cached locations.
         self.metadata_cache.remove(path);
         if let Some(fh) = fh {
@@ -1830,6 +1851,19 @@ fn fuse_tier_for_placement(placement_tier: &str) -> &str {
     placement_tier
 }
 
+/// CO-1-6 — clamp a read length to the bytes actually available without
+/// the `(file_size - offset) as u32` mod-2^32 truncation that broke reads
+/// of files >= 4 GiB. `(file_size - offset)` can exceed `u32::MAX` for a
+/// large file read near its start; casting that straight to `u32` wraps
+/// (e.g. exactly 4 GiB -> 0), so the kernel saw a premature EOF and
+/// large-remux playback truncated ~4 GiB early. Clamp the available byte
+/// count to `u32::MAX` BEFORE the cast, then `min` with the requested size.
+/// Callers must guarantee `offset < file_size` (read() returns empty
+/// otherwise), so `file_size - offset` never underflows here.
+fn effective_read_len(file_size: u64, offset: u64, size: u32) -> u32 {
+    size.min((file_size - offset).min(u32::MAX as u64) as u32)
+}
+
 /// Bug BU-2 — did this write error originate from a data-node out-of-space
 /// (ENOSPC)? `client::write_chunk_bytes` surfaces the gRPC status code in
 /// its error message (`code=ResourceExhausted`) after exhausting the Bug G
@@ -1965,5 +1999,40 @@ mod tests {
         // A directory's logical size is moot — we report a placeholder
         // (4096 — one filesystem block) so `stat` doesn't say 0 bytes.
         assert_eq!(attr.size, 4096);
+    }
+
+    /// CO-1-6: the old `(file_size - offset) as u32` truncated mod 2^32, so a
+    /// read at the start of a >= 4 GiB file clamped to 0 (premature EOF). The
+    /// helper must clamp the available byte count to u32::MAX before the cast.
+    #[test]
+    fn co_1_6_effective_read_len_is_u32_safe() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // Exactly 4 GiB available, 128 KiB requested. Naive `(4*GIB) as u32`
+        // == 0, so the read returned nothing; the helper must return 131072.
+        assert_eq!(
+            effective_read_len(4 * GIB, 0, 131072),
+            131072,
+            "4 GiB available must not wrap to 0"
+        );
+        // 5 GiB file, read 128 KiB starting 64 bytes before the 4 GiB mark:
+        // available = 5 GiB - (4 GiB - 64) = 1 GiB + 64, still > u32::MAX, so
+        // the request size wins.
+        assert_eq!(
+            effective_read_len(5 * GIB, 4 * GIB - 64, 131072),
+            131072,
+            "available far exceeds the request; request size governs"
+        );
+        // Tail of a small file: only 10 bytes remain, request 4096 -> 10.
+        assert_eq!(
+            effective_read_len(100, 90, 4096),
+            10,
+            "near EOF the available remainder clamps the request"
+        );
+        // Available exactly u32::MAX is representable and must not wrap.
+        assert_eq!(
+            effective_read_len(u32::MAX as u64, 0, u32::MAX),
+            u32::MAX,
+            "u32::MAX bytes available is exact, not a wrap"
+        );
     }
 }
