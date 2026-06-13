@@ -307,7 +307,21 @@ impl ReadAheadEngine {
         let pending_ref = Arc::clone(&self.pending);
         let local_cache = self.local_cache.read().clone();
 
+        // CO-5-17 — gate the spawned task on a one-shot `started` signal so
+        // its terminal `pending.remove(key)` cannot run before the parent has
+        // installed the real handle. Pre-fix the task removed the key at its
+        // end while the parent inserted it AFTER the spawn; a fast task could
+        // remove before the insert landed, stranding the handle in `pending`
+        // forever and permanently suppressing this chunk's prefetch (the
+        // `pending.contains_key` guard in `on_chunk_read` then always skips
+        // it). With the gate, the parent inserts, then releases the task, so
+        // the remove is always well-ordered after the insert — no leak.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let pending_key2 = pending_key.clone();
+
         let handle = tokio::spawn(async move {
+            // Wait until the parent has installed our handle in `pending`.
+            let _ = started_rx.await;
             match client.read_chunk(&node_addr, &chunk_id).await {
                 Ok(data) => {
                     debug!(
@@ -349,11 +363,15 @@ impl ReadAheadEngine {
                     );
                 }
             }
-            // Remove from pending set.
-            pending_ref.remove(&pending_key);
+            // Remove from pending set. Ordered strictly after the parent's
+            // insert via the `started` gate above, so it can never leak.
+            pending_ref.remove(&pending_key2);
         });
 
+        // Install the handle, THEN release the task so its terminal remove
+        // is well-ordered after this insert.
         self.pending.insert(key, handle);
+        let _ = started_tx.send(());
     }
 }
 
@@ -541,5 +559,49 @@ mod tests {
         // Normal rung — restore the operator budget.
         ctrl.shrink_to_bytes(ctrl.configured_budget());
         assert_eq!(ctrl.current_budget(), 8 * 1024 * 1024);
+    }
+
+    /// CO-5-17 — a prefetch task must not leave a stranded key in `pending`.
+    /// Pre-fix the parent inserted the handle AFTER the spawn while the task
+    /// removed the key at its end; a fast task (here the read fails instantly
+    /// against an unreachable node) removed before the insert landed, so the
+    /// handle leaked and the `pending.contains_key` guard then permanently
+    /// suppressed that chunk's prefetch. With the started-gate fix the
+    /// remove is ordered strictly after the insert, so `pending` drains.
+    #[tokio::test]
+    async fn co_5_17_completed_prefetch_does_not_leak_pending_key() {
+        let client = DtfsClient::new();
+        let engine =
+            ReadAheadEngine::new(ReadAheadMode::FileSequential { prefetch_chunks: 1 }, client, 64 * 1024 * 1024);
+
+        // Two chunks; reading index 0 prefetches index 1 from an
+        // unreachable node so `read_chunk` errors out near-instantly.
+        let locations = vec![
+            ("chunk0".to_string(), vec!["127.0.0.1:1".to_string()]),
+            ("chunk1".to_string(), vec!["127.0.0.1:1".to_string()]),
+        ];
+        engine.on_chunk_read("/movie.mkv", 0, 2, &locations);
+
+        // The prefetch task should run to completion and remove its own
+        // pending entry. Wait (bounded) for the map to drain.
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if engine.pending.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            drained.is_ok(),
+            "pending map never drained — a completed prefetch leaked its key"
+        );
+        assert_eq!(
+            engine.pending.len(),
+            0,
+            "pending must be empty after the prefetch task completes"
+        );
     }
 }
