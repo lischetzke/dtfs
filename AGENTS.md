@@ -415,7 +415,17 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   (`base64_encode`/`base64_decode`, used by the dtfs-manager snapshot
   receiver). The transport is a JSON-string unary RPC — serde_bytes would
   serialize as an int array (bigger than base64), so don't drop the base64
-  without a wire change.
+  without a wire change. CO-3-6: the peer channel sets NO channel-level
+  `.timeout()` (tonic's GrpcTimeout layer takes the MIN of channel + per-request
+  timeout, so a fixed channel timeout would clamp the snapshot RPC back down);
+  every `send_rpc` sets its own per-request timeout via
+  `tonic::Request::set_timeout`. AppendEntries/Vote pass the 5s `RPC_TIMEOUT`;
+  the snapshot send passes `snapshot_rpc_timeout(bytes, option.hard_ttl())` =
+  max(openraft's hard_ttl, snapshot_bytes / 1 MBps floored at 5s), so a >25 MB
+  snapshot to a learner behind the 40 Mbps LELI shape gets enough wall-clock to
+  land instead of dying at the old 5s default. A fired timeout is still a tonic
+  Status -> `unreachable_err` -> `RPCError::Unreachable` -> `StreamingError::
+  Unreachable` (transient), preserving the Bug CL mapping above.
 - `dtfs-manager/src/scheduler.rs` — migration/re-replication loop; the
   SOLE owner of replica repair (Bug AC leader gate + Bug CH).
   `schedule_path_migration` (operator moves), `flush_cache_for_path` +
