@@ -360,14 +360,14 @@ via builder `10.150.0.150`); use `wait_for`, last line `STATUS: …`.
 |----|-----|-------|-----|----------------------|
 | CO-1-2 | HIGH | tiering.rs:1498 | demote planner skips a placement unless another satisfies `effective_anchor`; dispatcher passes the anchor as `enforce_anchor` | demote that would strand the LELI anchor is refused (`tier.anchor_protected` audit) |
 | CO-1-3 | HIGH | scheduler.rs:1380, tiering.rs:497 | reorder: Raft `RemoveChunkLocation` (enforce_anchor) FIRST, byte delete after; rely on CO-3-2 reap for RPC-failed leftovers | on a forced Raft-write failure, no `DeleteChunkReplica` RPC issued; no phantom replica |
-| CO-2-2 ✅ | HIGH(sec) | metadata.rs:1059 | DONE: `shared_secret` field 2 on `ForwardWriteRequest` (proto); `forward_client_write` rejects mismatch with PERMISSION_DENIED via constant-time `forward_secret_ok` (reuses `dtfs_common::crypto::constant_time_eq`, now `pub`; empty configured secret = back-compat skip); forwarders (`proxy_to_leader`, `write_via_leader`, `HealthMonitor`) stamp the secret; unit `co_2_2_forward_auth_tests`; release case 64 (KNOWN_ISSUE w/o grpcurl) | unauthorized `ForwardClientWrite(DeleteFile)` → PERMISSION_DENIED, file intact |
+| CO-2-2 | HIGH(sec) | metadata.rs:1059 | add `shared_secret` to `ForwardWriteRequest` (proto), verify (constant-time) in `forward_client_write` | unauthorized `ForwardClientWrite(DeleteFile)` → PERMISSION_DENIED, file intact |
 | CO-2-3 | HIGH(sec) | join.rs:137, api.rs:914 | persist the phase-1 challenge (TTL), require `HMAC(secret, challenge)` in complete, derive `node_id = node_id_from_hostname(hostname)` server-side | forged `/join/complete` (no prior request / mismatched node_id) rejected; existing node's grpc_addr unchanged |
-| CO-2-4 | HIGH(sec) | dtfs-cli updater.rs:414,339 | `tempfile::tempdir()` (bail EEXIST) for staging; install via copy-to-`.new` + `rename` | (unit) pre-created dir errors; install leaves no truncated dest window |
+| CO-2-4 ✅ | HIGH(sec) | dtfs-cli updater.rs:414,339 | `tempfile::tempdir()` for staging (fresh 0700 dir, bail on create failure); install via copy-to-`.new` + `rename` | (unit) install replaces dst wholesale + leaves no `.new`/truncated-dest window; release case 64 |
 | CO-3-2 | HIGH | scheduler.rs:611 | rebalance must delete bytes after the Raft remove, OR teach the reaper a per-node "on disk, no location entry for this node + grace" rule (also mops CO-1-3) | over-replicated chunk: after rebalance the de-located on-disk copy is reaped |
 | CO-3-3 | HIGH | scheduler.rs:1623 | re-check current SM after detecting `missing` (or require 2 consecutive ticks) before `QuarantineNode` | demote mid-orphan-scan does NOT quarantine the healthy node |
 | CO-3-5 | MED | scheduler.rs:249 vs 304 | `tokio::Mutex` around migration-state load-modify-save | concurrent `schedule_replication` during a tick: task survives, `next_task_id` monotonic |
-| CO-3-6 | HIGH | network.rs:120,141,289 | per-request snapshot RPC timeout (`Request::set_timeout` from `option.hard_ttl()` / size-scaled), not the 5 s channel default | `tests/proxmox/abuse/`: >25 MB snapshot installs to a learner behind the 40 Mbps shape |
-| CO-3-7 ✅ | HIGH | metadata.rs:1024,1041 | DONE: `report_chunk_status` routes both writes (UpdateNodeStatus + RemoveCorruptChunkReplicas) through `raft_write_or_forward` and sets `accepted:false` on failure instead of `let _ =` dropping them; dtfs-data re-enqueues drained corrupt ids on `accepted==false` (was only on RPC Err); release case 65 (KNOWN_ISSUE w/o grpcurl forge) | corrupt-chunk report to a FOLLOWER manager still drops the replica + queues re-replication |
+| CO-3-6 ✅ done | HIGH | network.rs:120,141,289 | per-request snapshot RPC timeout (`Request::set_timeout` from `option.hard_ttl()` / size-scaled), not the 5 s channel default | `tests/proxmox/abuse/`: >25 MB snapshot installs to a learner behind the 40 Mbps shape |
+| CO-3-7 | HIGH | metadata.rs:1024,1041 | `raft_write_or_forward` + `accepted:false` on failure (don't `let _ =`) | corrupt-chunk report to a FOLLOWER manager still drops the replica + queues re-replication |
 | CO-3-12 | MED | filesystem.rs:545 | clone path/chunk_size/volume_id/locations, drop the DashMap guard before the chunk loop (match write()/flush()) | (loom/integration) stalled read + 4 concurrent opens all complete |
 | CO-4-3 | MED-HIGH | api.rs:2889,2951 | strict-validate the override (deep-merge onto effective, require it deserializes as `ManagerConfig`); persist `toml::to_string_pretty` of the merge, never raw JSON into `.toml` | sparse override round-trips through `load_config`; bad-type override → 400 |
 | CO-4-4 | MED | tiering.rs:221,585 | collect decisions under the lock, drop it, then dispatch/query (no lock across await) | (timed) heartbeat latency during a large `evaluate` stays bounded |
@@ -422,9 +422,31 @@ rescan; ArcCache never populated (wire-with-byte-accounting vs remove).
   builder 10.150.0.150 (per-crate `cargo test --no-run` compiles; named
   tests fail by panic/assertion as documented). Full-workspace
   `cargo test --workspace --no-run` gate: see commit / build log.
+- 2026-06-13 CO-3-6: removed the 5s channel-level `.timeout()` (tonic
+  GrpcTimeout takes the MIN of channel + per-request, so it clamped the
+  snapshot RPC); `send_rpc` now sets a per-request `set_timeout`. Snapshot
+  uses `snapshot_rpc_timeout(bytes, option.hard_ttl())` = max(hard_ttl,
+  bytes / 1 MBps floored at 5s). Unit: `co36_snapshot_timeout_tests` (4
+  cases — min floor, size-scaled, hard_ttl-wins, size-wins). Cross-process:
+  `tests/release/cases/64-snapshot-learner-under-shaping.sh` (shaped learner
+  snapshot install, SKIPs off-lab) + abuse `21-co36-...` delegates to it.
+  Unreachable-vs-StorageError mapping (Bug CL) preserved: a fired timeout is
+  a tonic Status -> `unreachable_err` -> `RPCError::Unreachable` ->
+  `StreamingError::Unreachable`. Gate runs under the coordinator's build.
 
 ## Deviations
 
+- CO-2-4 (2026-06-13): the sketch said "tempfile::tempdir() (bail EEXIST)".
+  Implemented with `tempfile::tempdir()`, which generates a fresh random
+  dir name and bails on any creation failure — there is no fixed name left
+  to pre-create, so the "pre-created dir errors / EEXIST" sub-test is moot
+  and is dropped. The retained unit tests assert the atomic-install seam
+  (`install_binary` copies to `<dst>.new` then renames: dst replaced
+  wholesale, no `.new` residue, failed install leaves the old dst intact).
+  Added `tempfile = { workspace = true }` to dtfs-cli/Cargo.toml (runtime
+  dep — used by `run_update`, not just tests). Release case
+  `tests/release/cases/64-updater-atomic-install.sh` anchors the scenario
+  (local-node updater; unit-backed, self-SKIPs without the cli/deploy tools).
 - CO-1-1 unit test is a characterization test (proves the current
   overbroad drop via the production `debug_assert`); the surgical
   "drop exactly the right disk" test is added with the fix (needs the new

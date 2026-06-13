@@ -72,6 +72,46 @@ async fn acquire_snapshot_send_permit() -> tokio::sync::SemaphorePermit<'static>
 }
 
 // ---------------------------------------------------------------------------
+// CO-3-6 — per-request snapshot RPC timeout
+// ---------------------------------------------------------------------------
+
+/// Conservative floor bandwidth (bytes/sec) used to size the snapshot RPC
+/// timeout. LELI is shaped to 40 Mbps (~5 MB/s) but a learner behind that
+/// link shares it with playback egress and Raft heartbeats, so we budget a
+/// much smaller effective throughput (1 MB/s) for the snapshot transfer. A
+/// larger snapshot therefore gets proportionally longer to land before
+/// openraft would otherwise time it out at the 5s channel default.
+const SNAPSHOT_FLOOR_BYTES_PER_SEC: u64 = 1_024 * 1_024;
+
+/// Lower bound on the snapshot RPC timeout. A tiny snapshot still gets at
+/// least this long (matches the previous channel default so behaviour for
+/// small snapshots is unchanged).
+const SNAPSHOT_MIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Choose the per-request timeout for a snapshot send (CO-3-6).
+///
+/// The snapshot stream RPC used to inherit the 5s channel default
+/// (`RPC_TIMEOUT`), so a >25 MB snapshot to a learner behind the 40 Mbps
+/// LELI shape could never complete in time and the learner never caught up.
+///
+/// We use the larger of two budgets so neither under-shoots:
+/// - `hard_ttl`: openraft's own cancellation deadline for the RPC. openraft
+///   aborts the call at `hard_ttl` regardless, so honouring it keeps the
+///   transport timeout from firing *before* openraft's own.
+/// - a size-scaled budget: `snapshot_bytes / SNAPSHOT_FLOOR_BYTES_PER_SEC`,
+///   floored at `SNAPSHOT_MIN_TIMEOUT`, so a large snapshot over a slow link
+///   gets enough wall-clock to land.
+fn snapshot_rpc_timeout(
+    snapshot_bytes: usize,
+    hard_ttl: std::time::Duration,
+) -> std::time::Duration {
+    let scaled_secs = snapshot_bytes as u64 / SNAPSHOT_FLOOR_BYTES_PER_SEC;
+    let size_scaled =
+        std::time::Duration::from_secs(scaled_secs).max(SNAPSHOT_MIN_TIMEOUT);
+    size_scaled.max(hard_ttl)
+}
+
+// ---------------------------------------------------------------------------
 // NetworkFactory
 // ---------------------------------------------------------------------------
 
@@ -117,6 +157,9 @@ impl DtfsNetwork {
     /// election storms this monopolized the openraft tick budget
     /// and prevented vote responses from being processed.
     const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    /// Default per-request timeout for the small, fixed-size Raft RPCs
+    /// (AppendEntries, Vote). The snapshot RPC overrides this with a
+    /// size-scaled timeout (CO-3-6) since it can be arbitrarily large.
     const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     /// HTTP/2 keep-alive — pokes the peer every 30s with a ping. If
     /// the peer doesn't respond, the connection is dropped and the
@@ -138,7 +181,11 @@ impl DtfsNetwork {
             .endpoint(&self.addr)
             .map_err(|e| unreachable_err(format!("invalid endpoint {endpoint}: {e}")))?
             .connect_timeout(Self::CONNECT_TIMEOUT)
-            .timeout(Self::RPC_TIMEOUT)
+            // CO-3-6: NO channel-level `.timeout()`. tonic's GrpcTimeout layer
+            // takes the MIN of the channel timeout and the per-request
+            // `grpc-timeout` header, so a fixed 5s channel timeout would clamp
+            // the snapshot RPC's larger per-request timeout back down to 5s.
+            // Each `send_rpc` call sets its own per-request timeout instead.
             .http2_keep_alive_interval(Self::KEEPALIVE_INTERVAL)
             .keep_alive_timeout(Self::KEEPALIVE_TIMEOUT)
             .keep_alive_while_idle(true)
@@ -157,6 +204,7 @@ impl DtfsNetwork {
         &mut self,
         kind: RaftRpcKind,
         payload_json: String,
+        timeout: std::time::Duration,
     ) -> Result<String, RPCError<TypeConfig>> {
         let channel = self.ensure_channel().await?;
 
@@ -170,7 +218,10 @@ impl DtfsNetwork {
         // before the (potentially slow) network call so only `body` is held.
         drop(msg);
 
-        let request = tonic::Request::new(bytes::Bytes::from(body));
+        let mut request = tonic::Request::new(bytes::Bytes::from(body));
+        // CO-3-6: per-request timeout (the channel no longer sets one). Small
+        // RPCs pass RPC_TIMEOUT; the snapshot send passes a size-scaled value.
+        request.set_timeout(timeout);
 
         // Use a raw gRPC call to `dtfs.manager.RaftTransport/RaftRpc`.
         let mut client = tonic::client::Grpc::new(channel);
@@ -211,7 +262,9 @@ impl RaftNetworkV2<TypeConfig> for DtfsNetwork {
         let payload = serde_json::to_string(&rpc)
             .map_err(|e| unreachable_err(format!("serialize append_entries: {e}")))?;
 
-        let resp_json = self.send_rpc(RaftRpcKind::AppendEntries, payload).await?;
+        let resp_json = self
+            .send_rpc(RaftRpcKind::AppendEntries, payload, Self::RPC_TIMEOUT)
+            .await?;
 
         serde_json::from_str(&resp_json)
             .map_err(|e| unreachable_err(format!("deserialize append_entries response: {e}")))
@@ -225,7 +278,9 @@ impl RaftNetworkV2<TypeConfig> for DtfsNetwork {
         let payload = serde_json::to_string(&rpc)
             .map_err(|e| unreachable_err(format!("serialize vote: {e}")))?;
 
-        let resp_json = self.send_rpc(RaftRpcKind::Vote, payload).await?;
+        let resp_json = self
+            .send_rpc(RaftRpcKind::Vote, payload, Self::RPC_TIMEOUT)
+            .await?;
 
         serde_json::from_str(&resp_json)
             .map_err(|e| unreachable_err(format!("deserialize vote response: {e}")))
@@ -236,7 +291,7 @@ impl RaftNetworkV2<TypeConfig> for DtfsNetwork {
         vote: VoteOf<TypeConfig>,
         snapshot: SnapshotOf<TypeConfig>,
         cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
         let cancel_fut = cancel;
         tokio::pin!(cancel_fut);
@@ -256,6 +311,9 @@ impl RaftNetworkV2<TypeConfig> for DtfsNetwork {
         // The snapshot cursor already owns the bytes — take them without the
         // extra full copy `bytes_from_cursor` would make (CNF-4).
         let snap_bytes = snapshot.snapshot.into_inner();
+        // CO-3-6: pick the per-request RPC timeout from the snapshot size +
+        // openraft's hard_ttl BEFORE we drop the raw bytes below.
+        let rpc_timeout = snapshot_rpc_timeout(snap_bytes.len(), option.hard_ttl());
 
         #[derive(Serialize)]
         struct SnapshotPayload {
@@ -286,7 +344,7 @@ impl RaftNetworkV2<TypeConfig> for DtfsNetwork {
         drop(payload_struct);
 
         // Use tokio::select to honour cancellation.
-        let rpc_fut = self.send_rpc(RaftRpcKind::Snapshot, payload);
+        let rpc_fut = self.send_rpc(RaftRpcKind::Snapshot, payload, rpc_timeout);
         tokio::pin!(rpc_fut);
 
         let resp_json = tokio::select! {
@@ -453,6 +511,53 @@ mod cnf4_snapshot_send_tests {
             max <= SNAPSHOT_SEND_CONCURRENCY,
             "max in-flight snapshot sends {max} exceeded cap {SNAPSHOT_SEND_CONCURRENCY}"
         );
+    }
+}
+
+#[cfg(test)]
+mod co36_snapshot_timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // CO-3-6 — a tiny snapshot still gets at least the minimum timeout, even
+    // when openraft passes a zero hard_ttl. (Pre-fix it inherited the 5s
+    // channel default; the minimum preserves that floor.)
+    #[test]
+    fn small_snapshot_uses_minimum() {
+        let t = snapshot_rpc_timeout(1_024, Duration::ZERO);
+        assert_eq!(t, SNAPSHOT_MIN_TIMEOUT);
+    }
+
+    // CO-3-6 — a large snapshot's timeout scales with its size at the
+    // conservative floor bandwidth, so a >25 MB snapshot gets far longer than
+    // the old 5s default. 30 MB / 1 MBps = 30s.
+    #[test]
+    fn large_snapshot_scales_with_size() {
+        let thirty_mb = 30 * 1_024 * 1_024;
+        let t = snapshot_rpc_timeout(thirty_mb, Duration::ZERO);
+        assert_eq!(t, Duration::from_secs(30));
+        assert!(
+            t > SNAPSHOT_MIN_TIMEOUT,
+            "a 30 MB snapshot must exceed the 5s channel default"
+        );
+    }
+
+    // CO-3-6 — when openraft's hard_ttl is larger than the size-scaled
+    // budget, honour it: openraft cancels the RPC at hard_ttl anyway, so the
+    // transport timeout must not fire first.
+    #[test]
+    fn hard_ttl_wins_when_larger() {
+        let t = snapshot_rpc_timeout(1_024, Duration::from_secs(120));
+        assert_eq!(t, Duration::from_secs(120));
+    }
+
+    // CO-3-6 — size-scaled budget wins when it exceeds hard_ttl, so a slow
+    // link still gets the wall-clock the bytes need.
+    #[test]
+    fn size_scaled_wins_when_larger_than_hard_ttl() {
+        let hundred_mb = 100 * 1_024 * 1_024;
+        let t = snapshot_rpc_timeout(hundred_mb, Duration::from_secs(10));
+        assert_eq!(t, Duration::from_secs(100));
     }
 }
 

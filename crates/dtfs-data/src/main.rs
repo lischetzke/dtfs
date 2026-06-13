@@ -512,13 +512,16 @@ async fn manager_lifecycle(
         // P0-9: harvest per-chunk-per-DC counters for the heartbeat payload.
         // Cap to 1000 entries to keep the payload bounded; manager-side
         // tiering tolerates a partial view (it ages-out old chunks anyway).
+        // CO-5-6 — keep the drained harvest so we can re-enqueue it if the
+        // heartbeat carrying these counters fails to send (harvest zeroes
+        // the live counters, so a dropped heartbeat loses the reads).
         let per_chunk = data_metrics.harvest_per_chunk(1000);
         let chunk_reads: Vec<dtfs_proto::dtfs::manager::PerChunkReadCounter> = per_chunk
-            .into_iter()
+            .iter()
             .map(|h| dtfs_proto::dtfs::manager::PerChunkReadCounter {
-                chunk_id: h.chunk_id,
+                chunk_id: h.chunk_id.clone(),
                 reads_by_dc_1h: h.reads_by_dc.clone(),
-                reads_by_dc_24h: h.reads_by_dc,
+                reads_by_dc_24h: h.reads_by_dc.clone(),
                 last_access_ms: h.last_access_ms,
             })
             .collect();
@@ -771,6 +774,17 @@ async fn manager_lifecycle(
                 // line 514.
                 if !drained_faults.is_empty() {
                     integrity_faults.re_enqueue(drained_faults.clone());
+                }
+                // CO-5-6 — the same heartbeat carried drained scrub
+                // results and harvested per-chunk read counters; both
+                // drain (zero) their sources as the payload is built, so
+                // a failed send loses them. Re-enqueue both so the next
+                // heartbeat ships them. Mirrors the Bug O / BF-5 pattern.
+                if !drained_scrubs.is_empty() {
+                    chunk_store.restore_scrub_results(drained_scrubs);
+                }
+                if !per_chunk.is_empty() {
+                    data_metrics.restore_per_chunk(per_chunk);
                 }
                 consecutive_failures += 1;
                 if consecutive_failures <= 3 {

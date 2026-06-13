@@ -160,6 +160,21 @@ impl ChunkStore {
         std::mem::take(&mut *self.pending_scrub_results.lock())
     }
 
+    /// CO-5-6 — re-queue a drained batch of scrub results after a failed
+    /// heartbeat so they aren't lost. `drain_scrub_results` empties the
+    /// queue as it builds the heartbeat payload; if that send fails the
+    /// summaries would otherwise vanish and the WebUI "Last Scrub" card
+    /// would never populate. Prepended so they retain priority over any
+    /// results enqueued since the drain.
+    pub fn restore_scrub_results(&self, mut summaries: Vec<ScrubResultSummary>) {
+        if summaries.is_empty() {
+            return;
+        }
+        let mut q = self.pending_scrub_results.lock();
+        summaries.append(&mut q);
+        *q = summaries;
+    }
+
     /// Bug O — append chunk_ids that have been quarantined locally
     /// (failed checksum or missing meta) so the next heartbeat can
     /// report them to the manager. Called by the scrub scheduler.
@@ -1447,6 +1462,40 @@ mod tests {
         }];
         let dm = DiskManager::new(&disk_configs).unwrap();
         (ChunkStore::new(dm), tmp)
+    }
+
+    // CO-5-6 — a heartbeat that drained the pending scrub results but then
+    // failed to send must not lose them. `restore_scrub_results` re-queues
+    // the drained batch (with priority) so the next heartbeat ships it.
+    #[tokio::test]
+    async fn co_5_6_restore_scrub_results_recovers_dropped_summaries() {
+        let (store, _tmp) = make_test_store().await;
+        let mk = |path: &str| ScrubResultSummary {
+            disk_path: path.to_string(),
+            level: "quick".to_string(),
+            completed_at_ms: 1_000,
+            chunks_checked: 10,
+            chunks_healthy: 10,
+            chunks_corrupt: 0,
+            chunks_missing: 0,
+            duration_secs: 1.5,
+        };
+        store.enqueue_scrub_result(mk("/disk/a"));
+
+        // Heartbeat builder drains the queue.
+        let drained = store.drain_scrub_results();
+        assert_eq!(drained.len(), 1);
+        assert!(store.drain_scrub_results().is_empty(), "drain empties the queue");
+
+        // A fresh result lands while the failed heartbeat is in flight.
+        store.enqueue_scrub_result(mk("/disk/b"));
+        // Simulated heartbeat failure: re-enqueue the drained batch.
+        store.restore_scrub_results(drained);
+
+        let after = store.drain_scrub_results();
+        assert_eq!(after.len(), 2, "restored + newly enqueued are both present");
+        assert_eq!(after[0].disk_path, "/disk/a", "restored batch keeps priority");
+        assert_eq!(after[1].disk_path, "/disk/b");
     }
 
     #[tokio::test]
