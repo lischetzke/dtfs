@@ -966,17 +966,24 @@ impl Filesystem for DtfsFuse3Adapter {
         fh: u64,
         offset: u64,
         length: u64,
-        _mode: u32,
+        mode: u32,
     ) -> FuseResult<()> {
-        debug!("fuse3:fallocate fh={} off={} len={}", fh, offset, length);
-        // Grow the file via setattr-style size update if the request asks
-        // for actual space. We use a single zero byte at the end which the
-        // sparse-fill path turns into a hole + 1 byte, matching what other
-        // filesystems do for default-mode fallocate.
+        debug!(
+            "fuse3:fallocate fh={} off={} len={} mode={}",
+            fh, offset, length, mode
+        );
         if length == 0 {
             return Ok(());
         }
-        let new_size = offset + length;
+        // CO-5-18 — honour the mode: FALLOC_FL_KEEP_SIZE must NOT grow the
+        // file, and `offset + length` must not silently overflow u64.
+        let new_size = match fallocate_target_size(offset, length, mode)? {
+            Some(size) => size,
+            None => return Ok(()), // KEEP_SIZE: reserve space, don't grow.
+        };
+        // Grow the file via setattr-style size update. The sparse-fill path
+        // turns the trailing bytes into a hole, matching what other
+        // filesystems do for default-mode fallocate.
         if let Err(e) = self.fs.set_size(fh, new_size).await {
             warn!("fuse3 fallocate set_size: {}", e);
             return Err(Errno::from(libc::EIO));
@@ -1145,6 +1152,31 @@ pub(crate) fn dir_entry_cookie(idx: usize) -> u64 {
     (idx as u64) + 1
 }
 
+/// CO-5-18 — resolve the target file size for a `fallocate(2)` request.
+///
+/// Returns:
+///   * `Ok(None)`   when `FALLOC_FL_KEEP_SIZE` is set — space is reserved
+///     but the file MUST NOT grow, so the caller skips the `set_size`.
+///   * `Err(EINVAL)` when `offset + length` overflows `u64`.
+///   * `Ok(Some(offset + length))` otherwise — the new file size.
+///
+/// The kernel passes other mode bits (e.g. PUNCH_HOLE) too, but DTFS only
+/// distinguishes "grow" vs "keep size"; KEEP_SIZE is the only bit that
+/// suppresses the grow.
+pub(crate) fn fallocate_target_size(
+    offset: u64,
+    length: u64,
+    mode: u32,
+) -> Result<Option<u64>, Errno> {
+    if mode & (libc::FALLOC_FL_KEEP_SIZE as u32) != 0 {
+        return Ok(None);
+    }
+    match offset.checked_add(length) {
+        Some(size) => Ok(Some(size)),
+        None => Err(Errno::from(libc::EINVAL)),
+    }
+}
+
 #[cfg(test)]
 mod fuse_readdir_regression {
     use super::*;
@@ -1176,5 +1208,39 @@ mod fuse_readdir_regression {
                 "cookie scheme must remain `idx + 1` for both readdir and \
                  readdirplus — see Bug F in SOAK-RECOVERY-2026-05-18.md");
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_co_tests {
+    use super::*;
+
+    /// CO-5-18 — FALLOC_FL_KEEP_SIZE reserves space without growing the
+    /// file, so the helper returns `None` and the caller skips `set_size`.
+    /// Pre-fix `fallocate` always grew to `offset + length`, wrongly
+    /// extending the file.
+    #[test]
+    fn co_5_18_keep_size_does_not_grow() {
+        let mode = libc::FALLOC_FL_KEEP_SIZE as u32;
+        assert_eq!(fallocate_target_size(100, 50, mode).unwrap(), None);
+        // KEEP_SIZE combined with other bits still suppresses the grow.
+        let combined = (libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE) as u32;
+        assert_eq!(fallocate_target_size(100, 50, combined).unwrap(), None);
+    }
+
+    /// CO-5-18 — `offset + length` overflowing u64 must surface as EINVAL,
+    /// not wrap around to a tiny/zero size. Pre-fix `offset + length`
+    /// panicked in debug or wrapped in release.
+    #[test]
+    fn co_5_18_overflow_is_einval() {
+        let err = fallocate_target_size(u64::MAX, 1, 0).unwrap_err();
+        assert_eq!(err, Errno::from(libc::EINVAL));
+    }
+
+    /// CO-5-18 — a normal default-mode request grows the file to
+    /// `offset + length`.
+    #[test]
+    fn co_5_18_default_mode_grows() {
+        assert_eq!(fallocate_target_size(100, 50, 0).unwrap(), Some(150));
     }
 }
