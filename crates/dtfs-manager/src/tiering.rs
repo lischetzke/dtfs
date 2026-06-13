@@ -496,7 +496,15 @@ impl TieringEngine {
             //    AV-1-5: returns was_present + freed_bytes).
             match self
                 .scheduler
-                .delete_chunk_replica_on_node(&node_addr, &d.chunk_id)
+                .delete_chunk_replica_on_node(
+                    &node_addr,
+                    &d.chunk_id,
+                    // CO-1-1 — demote the EXACT (node, disk) warm cache
+                    // replica, never a cold anchor co-located on another
+                    // disk of the same node.
+                    Some(d.disk_id),
+                    &d.tier.to_string(),
+                )
                 .await
             {
                 Ok((was_present, _freed)) => {
@@ -536,6 +544,8 @@ impl TieringEngine {
                 path: d.file_path.clone(),
                 chunk_index: d.chunk_index,
                 node_id: d.node_id.to_string(),
+                // CO-1-1 — drop only this (node, disk) warm cache entry.
+                disk_id: d.disk_id,
                 // AV-2-4 ensures the planner only demotes when
                 // anchor survives, but pass the policy through so
                 // the apply path's defence-in-depth check confirms.
@@ -675,7 +685,7 @@ impl TieringEngine {
                         .and_then(|n| n.disk(e.disk_id))
                         .map(|d| d.tier);
                     let Some(t) = tier else { continue };
-                    placements.push(TickPlacement { node_id: nid, dc, tier: t });
+                    placements.push(TickPlacement { node_id: nid, disk_id: e.disk_id, dc, tier: t });
                 }
                 let Some(chunk_id) = chunk_id_opt else { continue };
 
@@ -1302,6 +1312,10 @@ pub(crate) struct TickChunk {
 #[derive(Debug, Clone)]
 pub(crate) struct TickPlacement {
     pub node_id: u64,
+    /// CO-1-1 — the disk this placement lives on. Replica identity is
+    /// (node_id, disk_id); a demote must target this exact disk so the
+    /// cold anchor co-located on another disk of the same node survives.
+    pub disk_id: u32,
     pub dc: String,
     pub tier: DiskTier,
 }
@@ -1340,6 +1354,11 @@ pub(crate) struct TickDemotion {
     pub chunk_index: u64,
     pub file_path: String,
     pub node_id: u64,
+    /// CO-1-1 — the disk holding the cache replica being demoted. The
+    /// dispatcher passes it to the data-node delete and RemoveChunkLocation
+    /// so only this (node, disk) copy is removed; a co-located cold anchor
+    /// on a different disk of the same node is never touched.
+    pub disk_id: u32,
     pub tier: DiskTier,
     pub reason: &'static str,
     /// AV-2-5 — the chunk's cooldown timestamp as observed in the
@@ -1656,6 +1675,7 @@ fn plan_chunk_demotions(
             chunk_index: chunk.chunk_index,
             file_path: chunk.file_path.clone(),
             node_id: placement.node_id,
+            disk_id: placement.disk_id,
             tier: placement.tier,
             reason: "idle_window",
             cooldown_until_ms_at_snapshot: chunk.cooldown_until_ms,
@@ -2237,6 +2257,7 @@ mod bug_av_tiering_tick_tests {
                 volume_id: "default".to_string(),
                 placements: vec![TickPlacement {
                     node_id: 10,
+                    disk_id: 0,
                     dc: "leli".to_string(),
                     tier: DiskTier::Cold,
                 }],
@@ -2276,21 +2297,27 @@ mod bug_av_tiering_tick_tests {
                 chunk_index: 0,
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
+                // CO-1-1 / Bug BH — the cold anchor (disk 0) and the warm
+                // cache copy (disk 1) are CO-LOCATED on node 10. The demote
+                // must target the exact (node 10, disk 1) warm copy.
                 placements: vec![
-                    TickPlacement { node_id: 10, dc: "leli".into(), tier: DiskTier::Cold },
-                    TickPlacement { node_id: 11, dc: "toro".into(), tier: DiskTier::Warm },
+                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold },
+                    TickPlacement { node_id: 10, disk_id: 1, dc: "leli".into(), tier: DiskTier::Warm },
                 ],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
                 file_updated_at_ms: 0,
             }],
-            nodes: vec![node(11, "toro", 500_000, true)],
+            nodes: vec![node(10, "leli", 500_000, true)],
             volumes: vols(plex_policy()),
         };
         let plan = plan_cache_tick(&snapshot, 1_000_000, false);
         assert!(plan.promotions.is_empty(), "no promotions when reads = 0");
         assert_eq!(plan.demotions.len(), 1);
-        assert_eq!(plan.demotions[0].node_id, 11);
+        assert_eq!(plan.demotions[0].node_id, 10);
+        // CO-1-1 — the demote targets the warm disk (1), never the cold
+        // anchor disk (0) on the same node.
+        assert_eq!(plan.demotions[0].disk_id, 1);
         assert_eq!(plan.demotions[0].tier, DiskTier::Warm);
         assert_eq!(plan.demotions[0].reason, "idle_window");
     }
@@ -2307,7 +2334,7 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![TickPlacement {
-                    node_id: 10, dc: "leli".into(), tier: DiskTier::Cold,
+                    node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold,
                 }],
                 cooldown_until_ms: 2_000_000, // future, still in cooldown
                 reads_in_window_by_dc: reads,
@@ -2335,7 +2362,7 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![TickPlacement {
-                    node_id: 10, dc: "leli".into(), tier: DiskTier::Cold,
+                    node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold,
                 }],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
@@ -2375,8 +2402,8 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![
-                    TickPlacement { node_id: 10, dc: "leli".into(), tier: DiskTier::Cold },
-                    TickPlacement { node_id: 11, dc: "toro".into(), tier: DiskTier::Warm },
+                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold },
+                    TickPlacement { node_id: 11, disk_id: 0, dc: "toro".into(), tier: DiskTier::Warm },
                 ],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
@@ -2412,8 +2439,8 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![
-                    TickPlacement { node_id: 10, dc: "leli".into(), tier: DiskTier::Cold },
-                    TickPlacement { node_id: 11, dc: "toro".into(), tier: DiskTier::Warm },
+                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold },
+                    TickPlacement { node_id: 11, disk_id: 0, dc: "toro".into(), tier: DiskTier::Warm },
                 ],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
@@ -2453,8 +2480,8 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![
-                    TickPlacement { node_id: 10, dc: "leli".into(), tier: DiskTier::Cold },
-                    TickPlacement { node_id: 11, dc: "toro".into(), tier: DiskTier::Warm },
+                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold },
+                    TickPlacement { node_id: 11, disk_id: 0, dc: "toro".into(), tier: DiskTier::Warm },
                 ],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
@@ -2513,8 +2540,8 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![
-                    TickPlacement { node_id: 10, dc: "leli".into(), tier: DiskTier::Cold },
-                    TickPlacement { node_id: 11, dc: "toro".into(), tier: DiskTier::Warm },
+                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold },
+                    TickPlacement { node_id: 11, disk_id: 0, dc: "toro".into(), tier: DiskTier::Warm },
                 ],
                 cooldown_until_ms: 1_500_000, // future operator cooldown
                 reads_in_window_by_dc: reads,
@@ -2553,7 +2580,7 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![TickPlacement {
-                    node_id: 10, dc: "leli".into(), tier: DiskTier::Cold,
+                    node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold,
                 }],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,

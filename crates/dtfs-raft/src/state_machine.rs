@@ -19,7 +19,8 @@ use dtfs_common::types::{AnchorPolicy, VolumeConfig};
 
 use crate::snapshot::{self, StateMachineSnapshot};
 use crate::{
-    merge_chunk_location_entries, ChunkLocationEntry, ClientRequest, ClientResponse, TypeConfig,
+    legacy_disk_id, merge_chunk_location_entries, ChunkLocationEntry, ClientRequest,
+    ClientResponse, TypeConfig,
 };
 
 // Re-export type aliases for convenience.
@@ -1135,11 +1136,18 @@ fn apply_request(
             }
         }
 
-        ClientRequest::RemoveCorruptChunkReplicas { node_id, chunk_hashes } => {
+        ClientRequest::RemoveCorruptChunkReplicas { node_id, chunk_hashes, disk_id } => {
             // Bug O — sweep every file's chunk list, dropping any entry
             // that matches (this node_id, one of these chunk_hashes).
             // The scheduler's check_under_replicated pass will then
             // queue re-replication from a healthy peer.
+            //
+            // CO-1-1 — replica identity is `(node_id, disk_id)`. The data
+            // node reports corruption per disk, so drop only the corrupt
+            // disk's copy; a healthy co-located copy on another disk/tier
+            // of the same node MUST survive. `u32::MAX` (legacy / pre-CO-1-1
+            // log entry) keeps the old node-wide sweep.
+            let legacy_node_wide = *disk_id == crate::legacy_disk_id();
             let needle: std::collections::HashSet<&str> =
                 chunk_hashes.iter().map(|s| s.as_str()).collect();
             let mut dropped: u64 = 0;
@@ -1147,7 +1155,9 @@ fn apply_request(
             for (_path, file) in sm.files.iter_mut() {
                 let before = file.chunks.len();
                 file.chunks.retain(|c| {
-                    !(c.node_id == *node_id && needle.contains(c.chunk_hash.as_str()))
+                    !(c.node_id == *node_id
+                        && needle.contains(c.chunk_hash.as_str())
+                        && (legacy_node_wide || c.disk_id == *disk_id))
                 });
                 let after = file.chunks.len();
                 if after < before {
@@ -1159,7 +1169,7 @@ fn apply_request(
             push_audit_capped(
                 &mut sm.audit_log,
                 audit(format!(
-                    "RemoveCorruptChunkReplicas: node={node_id} chunks={} dropped_entries={} affected_files={}",
+                    "RemoveCorruptChunkReplicas: node={node_id} disk={disk_id} chunks={} dropped_entries={} affected_files={}",
                     chunk_hashes.len(),
                     dropped,
                     affected_files,
@@ -1860,12 +1870,21 @@ fn apply_request(
             path,
             chunk_index,
             node_id,
+            disk_id,
             enforce_anchor,
         } => {
             // Bug AV — operator-driven cache replica removal. Mutates
             // `FileMetadata.chunks` to drop a single entry, with an
-            // optional anchor-strand check.
-            apply_remove_chunk_location(sm, path, *chunk_index, node_id, enforce_anchor.as_ref())
+            // optional anchor-strand check. CO-1-1 — keyed on the exact
+            // (node_id, disk_id) replica; `u32::MAX` = legacy node-wide.
+            apply_remove_chunk_location(
+                sm,
+                path,
+                *chunk_index,
+                node_id,
+                *disk_id,
+                enforce_anchor.as_ref(),
+            )
         }
 
         ClientRequest::SetChunkCooldown {
@@ -1915,6 +1934,7 @@ fn apply_remove_chunk_location(
     path: &str,
     chunk_index: u64,
     node_id: &str,
+    disk_id: u32,
     enforce_anchor: Option<&AnchorPolicy>,
 ) -> ClientResponse {
     let file = match sm.files.get(path) {
@@ -1924,10 +1944,21 @@ fn apply_remove_chunk_location(
         None => return ClientResponse::Success,
     };
 
+    // CO-1-1 — replica identity is `(node_id, disk_id)` (A.3.4 / Bug BH).
+    // A chunk may legally hold a mandatory replica AND a cache replica on
+    // ONE node across DIFFERENT disks/tiers; matching on `node_id` alone
+    // dropped BOTH. Match the exact disk when one is given; the legacy
+    // sentinel (`u32::MAX`, from a pre-CO-1-1 snapshot/log entry) falls
+    // back to the old node-wide match on `(chunk_index, node_id)`.
+    let legacy_node_wide = disk_id == crate::legacy_disk_id();
+    let matches = |c: &ChunkLocationEntry| -> bool {
+        c.chunk_index == chunk_index
+            && c.node_id == node_id
+            && (legacy_node_wide || c.disk_id == disk_id)
+    };
+
     // Check the entry is even present. Idempotent on absent.
-    let entry_present = file.chunks.iter().any(|c| {
-        c.chunk_index == chunk_index && c.node_id == node_id
-    });
+    let entry_present = file.chunks.iter().any(matches);
     if !entry_present {
         return ClientResponse::Success;
     }
@@ -1937,8 +1968,8 @@ fn apply_remove_chunk_location(
     // at least one remaining replica.
     if let Some(policy) = enforce_anchor {
         let survives_anchor = file.chunks.iter().any(|c| {
-            // The entry we're about to drop doesn't count.
-            if c.chunk_index == chunk_index && c.node_id == node_id {
+            // The entry/entries we're about to drop don't count.
+            if matches(c) {
                 return false;
             }
             // Only same chunk_index entries are relevant — different
@@ -1975,9 +2006,15 @@ fn apply_remove_chunk_location(
     // Safe to drop. Mutate.
     let file_mut = sm.files.get_mut(path).expect("checked above");
     let before = file_mut.chunks.len();
-    file_mut.chunks.retain(|c| !(c.chunk_index == chunk_index && c.node_id == node_id));
+    file_mut.chunks.retain(|c| !matches(c));
     let after = file_mut.chunks.len();
-    debug_assert_eq!(before.saturating_sub(after), 1, "drop exactly one entry");
+    // CO-1-1 — a disk-targeted removal drops EXACTLY the one (node,disk)
+    // entry; only the legacy node-wide sentinel may drop several
+    // co-located entries at once.
+    debug_assert!(
+        before.saturating_sub(after) == 1 || legacy_node_wide,
+        "disk-targeted RemoveChunkLocation must drop exactly one entry"
+    );
     file_mut.updated_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2792,6 +2829,7 @@ mod posix_path_regression {
             &ClientRequest::RemoveCorruptChunkReplicas {
                 node_id: "10".into(),
                 chunk_hashes: vec!["corrupt-hash".into()],
+                disk_id: legacy_disk_id(),
             },
         );
 
@@ -2993,6 +3031,7 @@ mod posix_path_regression {
             &ClientRequest::RemoveCorruptChunkReplicas {
                 node_id: "20".into(),
                 chunk_hashes: vec!["h-bad".into()],
+                disk_id: legacy_disk_id(),
             },
         );
         let c = sm.files.get("/c.bin").unwrap();
@@ -3206,6 +3245,7 @@ mod posix_path_regression {
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
+                disk_id: legacy_disk_id(),
                 enforce_anchor: None,
             });
         assert!(matches!(resp, ClientResponse::Success));
@@ -3223,6 +3263,7 @@ mod posix_path_regression {
                 path: "/nope".into(),
                 chunk_index: 0,
                 node_id: "10".into(),
+                disk_id: legacy_disk_id(),
                 enforce_anchor: None,
             });
         assert!(matches!(resp, ClientResponse::Success));
@@ -3239,6 +3280,7 @@ mod posix_path_regression {
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "99".into(),  // not present
+                disk_id: legacy_disk_id(),
                 enforce_anchor: None,
             });
         assert!(matches!(resp, ClientResponse::Success));
@@ -3261,6 +3303,7 @@ mod posix_path_regression {
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "10".into(),
+                disk_id: legacy_disk_id(),
                 enforce_anchor: Some(AnchorPolicy {
                     datacenter: "leli".into(),
                     required_tier: None,  // any-tier-in-leli policy
@@ -3302,6 +3345,7 @@ mod posix_path_regression {
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(), // warm
+                disk_id: legacy_disk_id(),
                 enforce_anchor: Some(policy.clone()),
             });
         assert!(matches!(resp, ClientResponse::Success));
@@ -3318,6 +3362,7 @@ mod posix_path_regression {
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "10".into(),  // cold
+                disk_id: legacy_disk_id(),
                 enforce_anchor: Some(policy),
             });
         assert!(matches!(resp, ClientResponse::Error { .. }));
@@ -3351,6 +3396,7 @@ mod posix_path_regression {
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(), // drop warm; cold survivor anchors
+                disk_id: legacy_disk_id(),
                 enforce_anchor: Some(AnchorPolicy {
                     datacenter: "leli".into(),
                     required_tier: Some(DiskTier::Cold),
@@ -3464,6 +3510,7 @@ mod posix_path_regression {
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
+                disk_id: legacy_disk_id(),
                 enforce_anchor: Some(AnchorPolicy {
                     datacenter: "leli".into(),
                     required_tier: None,  // any tier
@@ -4151,20 +4198,14 @@ mod audit_co_tests {
     }
 
     // ----- CO-1-1 ----------------------------------------------------------
-    // RemoveChunkLocation retains by (chunk_index, node_id) only, so when one
-    // chunk has two ChunkLocation entries on the SAME node_id but different
-    // disk_id/tier (allowed per AGENTS.md A.3.4), removing one drops BOTH.
-    // The variant has no disk_id field today (see "needs-fix-seam" in report
-    // for the precise disk-targeted test the fix enables). This test still
-    // FAILS today, by panic: the overbroad retain drops 2 entries, tripping
-    // the production `debug_assert_eq!(.., 1, "drop exactly one entry")` at the
-    // mutate site BEFORE this fn's own assert. Either way it is RED today and
-    // GREEN once removal stops nuking the co-located same-node entry.
-    #[test]
-    #[ignore = "CO-1-1 is GROUP B (deferred): needs the disk_id field on \
-                RemoveChunkLocation + a locked-in decision; see \
-                plans/active/PLAN-CO-CODE-AUDIT.md. Red by design until then."]
-    fn co_1_1_remove_chunk_location_overbroad_drops_colocated_entry() {
+    // RemoveChunkLocation now carries a `disk_id`. A chunk may legally hold a
+    // mandatory replica AND a cache replica on the SAME node_id across
+    // DIFFERENT disks/tiers (AGENTS.md A.3.4 / Bug BH); pre-fix the retain
+    // keyed on (chunk_index, node_id) only and dropped BOTH (and the
+    // production `debug_assert "drop exactly one entry"` panicked first).
+    // Post-fix removal targets the exact (node, disk) and the co-located
+    // replica survives.
+    fn sm_with_colocated_disks() -> StateMachineData {
         // One file, one chunk_index, two replicas on the SAME node_id (10)
         // but different disk_id (0 cold anchor, 1 warm cache).
         let mut sm = StateMachineData::default();
@@ -4195,23 +4236,77 @@ mod audit_co_tests {
             is_directory: false,
             cache_cooldown_until_ms: std::collections::BTreeMap::new(),
         });
+        sm
+    }
+
+    #[test]
+    fn co_1_1_remove_chunk_location_overbroad_drops_colocated_entry() {
+        // Drop the WARM disk-1 replica; the cold disk-0 anchor must survive.
+        let mut sm = sm_with_colocated_disks();
         let resp = apply_request(&mut sm, &mk_log_id(1),
             &ClientRequest::RemoveChunkLocation {
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "10".into(),
+                disk_id: 1,
                 enforce_anchor: None,
             });
         assert!(matches!(resp, ClientResponse::Success));
-        // CORRECT behaviour: only the targeted disk's entry is removed; the
-        // co-located same-node different-disk replica survives. Today removal
-        // is keyed by node_id only, so BOTH are dropped (and the production
-        // debug_assert "drop exactly one entry" panics first).
+        // Only the targeted (node 10, disk 1) entry is removed; the
+        // co-located same-node disk-0 cold anchor survives.
+        let chunks = &sm.files.get("/x").unwrap().chunks;
         assert_eq!(
-            sm.files.get("/x").unwrap().chunks.len(),
+            chunks.len(),
             1,
             "RemoveChunkLocation must drop only the targeted (node,disk) entry, \
              leaving the co-located same-node different-disk replica intact",
+        );
+        assert_eq!(chunks[0].disk_id, 0, "the disk-0 cold anchor must be the survivor");
+    }
+
+    #[test]
+    fn co_1_1_remove_chunk_location_legacy_sentinel_is_node_wide() {
+        // The legacy sentinel (u32::MAX, what an old snapshot/log entry
+        // deserializes to) keeps the pre-CO-1-1 node-wide behaviour: both
+        // co-located entries on node 10 are dropped.
+        let mut sm = sm_with_colocated_disks();
+        let resp = apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "10".into(),
+                disk_id: crate::legacy_disk_id(),
+                enforce_anchor: None,
+            });
+        assert!(matches!(resp, ClientResponse::Success));
+        assert_eq!(
+            sm.files.get("/x").unwrap().chunks.len(),
+            0,
+            "legacy node-wide removal drops every (chunk_index, node) entry",
+        );
+    }
+
+    #[test]
+    fn co_1_1_remove_chunk_location_disk_id_defaults_to_legacy_sentinel() {
+        // A.3.1 snapshot/log compat — a RemoveChunkLocation deserialized from
+        // a pre-CO-1-1 log entry (no disk_id field) gets legacy_disk_id()
+        // = u32::MAX and therefore applies node-wide.
+        let json = r#"{"RemoveChunkLocation":{"path":"/x","chunk_index":0,"node_id":"10","enforce_anchor":null}}"#;
+        let req: ClientRequest = serde_json::from_str(json).expect("legacy RemoveChunkLocation decodes");
+        match &req {
+            ClientRequest::RemoveChunkLocation { disk_id, .. } => {
+                assert_eq!(*disk_id, crate::legacy_disk_id());
+                assert_eq!(*disk_id, u32::MAX);
+            }
+            other => panic!("expected RemoveChunkLocation, got {other:?}"),
+        }
+        let mut sm = sm_with_colocated_disks();
+        let resp = apply_request(&mut sm, &mk_log_id(1), &req);
+        assert!(matches!(resp, ClientResponse::Success));
+        assert_eq!(
+            sm.files.get("/x").unwrap().chunks.len(),
+            0,
+            "a legacy (no disk_id) RemoveChunkLocation must apply node-wide",
         );
     }
 

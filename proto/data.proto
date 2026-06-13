@@ -122,6 +122,23 @@ message GetChunkResponse {
 // --- DeleteChunk ---
 message DeleteChunkRequest {
   string chunk_id = 1;
+  // CO-1-1 — delete ONLY the copy on this specific disk. Replica
+  // identity is (node_id, disk_id): a chunk may legally hold a
+  // mandatory anchor copy and a cache copy on ONE node across
+  // DIFFERENT disks/tiers, so a node-wide "delete first copy found"
+  // could unlink the cold anchor when demoting the warm cache copy.
+  //
+  // `optional` gives proto3 explicit presence: ABSENT (an old manager,
+  // or a path with no disk context) -> legacy first-found across all
+  // disks; PRESENT -> unlink only the matching disk's copy. A pre-CO-1-1
+  // data node ignores the unknown field and keeps doing first-found,
+  // which is the documented legacy behaviour.
+  optional uint32 disk_id = 2;
+  // CO-1-1 — informational tier hint of the copy being deleted
+  // ("hot"/"warm"/"cold"/"tape"); empty when unset. Carried for audit
+  // parity with the manager-side action; the store resolves the disk by
+  // disk_id, not by tier.
+  string tier = 3;
 }
 
 message DeleteChunkResponse {
