@@ -243,14 +243,18 @@ impl MetadataService {
             .current_leader
             .ok_or_else(|| Status::unavailable("no leader to forward heartbeat write to"))?;
 
-        // Resolve the leader's gRPC addr from the configured voter set
-        // (node_id_from_hostname matches the openraft node id).
-        let leader_addr = resolve_leader_addr(&self.config.cluster.initial_voters, leader_id)
-            .ok_or_else(|| {
-                Status::unavailable(format!(
-                    "leader {leader_id} not found in cluster.initial_voters"
-                ))
-            })?;
+        // CO-3-9 — resolve the leader's gRPC addr from the live Raft
+        // membership first (covers CF-2-promoted leaders absent from
+        // initial_voters), falling back to the configured voter set.
+        let leader_addr = {
+            let sm = self.sm_data.read().await;
+            resolve_leader_addr(&self.config.cluster.initial_voters, &sm.nodes, leader_id)
+        }
+        .ok_or_else(|| {
+            Status::unavailable(format!(
+                "leader {leader_id} not found in raft membership or cluster.initial_voters"
+            ))
+        })?;
 
         let mut client = self.leader_client(&leader_addr).await?;
         let body = serde_json::to_vec(&req)
@@ -311,18 +315,57 @@ fn compute_self_quarantine_cleared(is_quarantined: bool, reported_fault_count: u
     !is_quarantined && reported_fault_count == 0
 }
 
-/// Bug BL — resolve the gRPC address of the current Raft leader from the
-/// configured voter set. The openraft node id is derived from the
-/// hostname via `node_id_from_hostname`, so a voter matches the leader
-/// when their derived id equals `leader_id`.
+/// CO-3-8 — may a heartbeat re-stamp this node's health back to Healthy?
+///
+/// The heartbeat handler raft-writes `UpdateNodeStatus(healthy)` every
+/// cycle, but the apply path only guards `Quarantined`. Without this gate,
+/// an operator-set `Maintenance` (or scheduler-set `Draining`) status
+/// self-clears within one heartbeat (≤5s), pulling the node back into
+/// serving/placement before the drain completes.
+///
+/// `Maintenance`/`Draining`/`Quarantined` are STICKY — they clear only via
+/// their own explicit paths (operator `set_maintenance(false)`, drain
+/// completion, `UnquarantineNode`), never via a liveness heartbeat. Every
+/// other state — the transient liveness states (Healthy/Suspect/Down) AND
+/// the disk-derived states (Degraded/Failed) — stays heartbeat-clearable,
+/// preserving the pre-CO-3-8 recovery path where a node that comes back
+/// healthy re-stamps itself on its next heartbeat. The explicit false-list
+/// (rather than an allow-list) keeps that recovery intact; a NEW sticky
+/// state must be added to the false arm here.
+fn heartbeat_may_mark_healthy(current: HealthStatus) -> bool {
+    match current {
+        HealthStatus::Maintenance | HealthStatus::Draining | HealthStatus::Quarantined => false,
+        HealthStatus::Healthy
+        | HealthStatus::Suspect
+        | HealthStatus::Down
+        | HealthStatus::Degraded
+        | HealthStatus::Failed => true,
+    }
+}
+
+/// Bug BL / CO-3-9 — resolve the gRPC address of the current Raft leader.
+///
+/// Prefers the live Raft membership (`StateMachineData::nodes`, keyed by
+/// the openraft node id): a CF-2-promoted leader was added online and is
+/// NOT in the bootstrap-only `cluster.initial_voters`, so resolving from
+/// voters alone returns `None` and heartbeat-originated writes on that
+/// follower silently drop. The configured voter set is the fallback (an
+/// early-boot leader may not yet be registered in the SM, and its node id
+/// is derived from the hostname via `node_id_from_hostname`).
 fn resolve_leader_addr(
     voters: &[dtfs_common::config::InitialVoter],
+    membership_nodes: &std::collections::BTreeMap<u64, RaftNodeInfo>,
     leader_id: u64,
 ) -> Option<String> {
-    voters
-        .iter()
-        .find(|v| dtfs_common::node_id_from_hostname(&v.hostname) == leader_id)
-        .map(|v| v.addr.clone())
+    membership_nodes
+        .get(&leader_id)
+        .map(|n| n.grpc_addr.clone())
+        .or_else(|| {
+            voters
+                .iter()
+                .find(|v| dtfs_common::node_id_from_hostname(&v.hostname) == leader_id)
+                .map(|v| v.addr.clone())
+        })
 }
 
 /// Bug CH — classify a raft `client_write` error as openraft's
@@ -364,8 +407,13 @@ pub(crate) async fn write_via_leader(
                 .borrow_watched()
                 .current_leader
                 .ok_or_else(|| "no leader to forward to".to_string())?;
-            let leader_addr = resolve_leader_addr(voters, leader_id)
-                .ok_or_else(|| format!("leader {leader_id} not in cluster.initial_voters"))?;
+            // CO-3-9 — this caller (the health monitor) does not hold the
+            // state-machine membership map, so it resolves from the voter
+            // set only. The membership-preferring path is the heartbeat
+            // forward (`proxy_to_leader`), which passes the live SM nodes.
+            let leader_addr =
+                resolve_leader_addr(voters, &std::collections::BTreeMap::new(), leader_id)
+                    .ok_or_else(|| format!("leader {leader_id} not in cluster.initial_voters"))?;
             let mut client = tls
                 .connect(&leader_addr)
                 .await
@@ -488,6 +536,39 @@ fn node_id_from_grpc_addr(sm: &StateMachineData, addr: &str) -> String {
         .find(|(_, n)| n.grpc_addr == addr)
         .map(|(id, _)| id.to_string())
         .unwrap_or_else(|| addr.to_string())
+}
+
+/// CO-4-13 — resolve the CF-3b ack floor for a `commit_chunk_locations`
+/// call as the STRICTER of two volume floors:
+///   * the floor of the volume the file is actually registered under
+///     (`sm.files[path].volume_id`), and
+///   * the floor of the volume named in the request (`req_volume_id`).
+///
+/// Resolving from the request volume alone (the pre-fix behaviour) let a
+/// wrong/unknown `req.volume_id` fall back to the manager default and
+/// silently bypass a stricter per-file floor — a CF-3b write-safety
+/// downgrade. An unregistered volume id contributes the `default_floor`,
+/// so an unknown id can only raise the floor, never lower it below the
+/// file's own.
+fn resolve_ack_floor(
+    sm: &StateMachineData,
+    path: &str,
+    req_volume_id: &str,
+    default_floor: u32,
+) -> u32 {
+    let floor_of = |vol_id: &str| -> u32 {
+        sm.volumes
+            .get(vol_id)
+            .map(|v| v.write_safety.min_replicas_before_ack)
+            .unwrap_or(default_floor)
+    };
+    let request_floor = floor_of(req_volume_id);
+    // The file may not exist yet on first commit; then only the request
+    // volume governs.
+    match sm.files.get(path) {
+        Some(file) => request_floor.max(floor_of(&file.volume_id)),
+        None => request_floor,
+    }
 }
 
 #[tonic::async_trait]
@@ -804,12 +885,16 @@ impl ManagerService for MetadataService {
         // Bug BF (data-side self-quarantine clear) — also surfaces the
         // current Quarantined state so the heartbeat response can tell
         // the data node it is free again.
-        let is_quarantined = {
+        // CO-3-8 — surface the node's current health (not just the
+        // quarantine flag) so the heartbeat "healthy" write below can be
+        // suppressed for the sticky operator/drain states as well. An
+        // unregistered node defaults to Healthy (heartbeat may proceed).
+        let (is_quarantined, current_health) = {
             let sm = self.sm_data.read().await;
-            sm.nodes
-                .get(&node_id)
-                .map(|n| n.quarantine.is_some())
-                .unwrap_or(false)
+            match sm.nodes.get(&node_id) {
+                Some(n) => (n.quarantine.is_some(), n.health),
+                None => (false, HealthStatus::Healthy),
+            }
         };
         // Bug BL-3 — never tell a data node it is clear in the same cycle
         // it reported an integrity fault. Without this guard, a non-leader
@@ -821,7 +906,10 @@ impl ManagerService for MetadataService {
         // quarantine state correctly.
         let self_quarantine_cleared =
             compute_self_quarantine_cleared(is_quarantined, req.integrity_faults.len());
-        if !is_quarantined {
+        // CO-3-8 — only re-stamp Healthy for the transient liveness states.
+        // Maintenance/Draining (and Quarantined) are sticky: a heartbeat
+        // must not clear an operator drain within one cycle.
+        if heartbeat_may_mark_healthy(current_health) {
             let _ = self
                 .raft_write_or_forward(ClientRequest::UpdateNodeStatus {
                     node_id,
@@ -1631,16 +1719,21 @@ impl ManagerService for MetadataService {
         // scheduler's `chunk_loc.node_id.parse::<u64>()` succeeds (fix #7).
         //
         // CF-3b — resolve the volume's `write_safety.min_replicas_before_ack`
-        // (falling back to the manager-config default when the volume isn't
-        // registered) in the same lock scope, so the ack-floor gate below
-        // decides on a consistent snapshot.
+        // in the same lock scope, so the ack-floor gate below decides on a
+        // consistent snapshot.
+        //
+        // CO-4-13 — resolve the floor as the STRICTER of the request volume
+        // and the volume the file is actually registered under, so a
+        // wrong/unknown `req.volume_id` can't fall back to the default and
+        // bypass a stricter per-file floor (a silent RF downgrade).
         let (chunks, ack_floor): (Vec<ChunkLocationEntry>, u32) = {
             let data = self.sm_data.read().await;
-            let ack_floor = data
-                .volumes
-                .get(&req.volume_id)
-                .map(|v| v.write_safety.min_replicas_before_ack)
-                .unwrap_or(self.config.defaults.write_safety.min_replicas_before_ack);
+            let ack_floor = resolve_ack_floor(
+                &data,
+                &req.path,
+                &req.volume_id,
+                self.config.defaults.write_safety.min_replicas_before_ack,
+            );
             let chunks = req
                 .chunks
                 .into_iter()
@@ -2857,7 +2950,8 @@ mod tests {
     }
 
     /// BL-1 — the leader's gRPC addr resolves from the voter set by
-    /// matching node_id_from_hostname against the openraft leader id.
+    /// matching node_id_from_hostname against the openraft leader id when
+    /// no membership entry exists.
     #[test]
     fn bl1_resolve_leader_addr_matches_by_hostname_id() {
         let voters = vec![
@@ -2865,12 +2959,167 @@ mod tests {
             mk_voter("mini-mgr02", "10.0.0.2:9401"),
             mk_voter("mini-mgr03", "10.0.0.3:9401"),
         ];
+        let empty = std::collections::BTreeMap::new();
         let leader_id = dtfs_common::node_id_from_hostname("mini-mgr02");
         assert_eq!(
-            resolve_leader_addr(&voters, leader_id),
+            resolve_leader_addr(&voters, &empty, leader_id),
             Some("10.0.0.2:9401".to_string())
         );
-        // Unknown leader id (not in voter set) → None.
-        assert_eq!(resolve_leader_addr(&voters, 0), None);
+        // Unknown leader id (not in voter set, not in membership) → None.
+        assert_eq!(resolve_leader_addr(&voters, &empty, 0), None);
+    }
+
+    fn mk_membership_node(grpc_addr: &str) -> RaftNodeInfo {
+        RaftNodeInfo {
+            role: NodeRole::Manager,
+            hostname: String::new(),
+            grpc_addr: grpc_addr.to_string(),
+            location: Location::new("", "", "", ""),
+            disks: Vec::new(),
+            total_capacity: 0,
+            used_capacity: 0,
+            health: HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    /// CO-3-9 — a CF-2-promoted leader is present ONLY in the live Raft
+    /// membership (not in the bootstrap `initial_voters`); it must still
+    /// resolve, from its membership `grpc_addr`.
+    #[test]
+    fn co_3_9_leader_only_in_membership_resolves() {
+        let voters = vec![mk_voter("mini-mgr01", "10.0.0.1:9401")];
+        let leader_id = 42; // a promoted node, no matching voter hostname
+        let mut nodes = std::collections::BTreeMap::new();
+        nodes.insert(leader_id, mk_membership_node("http://10.0.0.9:9401"));
+        assert_eq!(
+            resolve_leader_addr(&voters, &nodes, leader_id),
+            Some("http://10.0.0.9:9401".to_string()),
+            "a promoted leader absent from initial_voters resolves via membership"
+        );
+    }
+
+    /// CO-3-9 — a leader present only in `initial_voters` (not yet in the
+    /// membership map, e.g. early boot) still resolves via the fallback.
+    #[test]
+    fn co_3_9_leader_only_in_voters_resolves() {
+        let voters = vec![mk_voter("mini-mgr02", "10.0.0.2:9401")];
+        let leader_id = dtfs_common::node_id_from_hostname("mini-mgr02");
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(
+            resolve_leader_addr(&voters, &empty, leader_id),
+            Some("10.0.0.2:9401".to_string())
+        );
+    }
+
+    /// CO-3-9 — membership is preferred over voters when both have the id.
+    #[test]
+    fn co_3_9_membership_preferred_over_voters() {
+        let voters = vec![mk_voter("mini-mgr02", "10.0.0.2:9401")];
+        let leader_id = dtfs_common::node_id_from_hostname("mini-mgr02");
+        let mut nodes = std::collections::BTreeMap::new();
+        nodes.insert(leader_id, mk_membership_node("http://10.0.0.99:9401"));
+        assert_eq!(
+            resolve_leader_addr(&voters, &nodes, leader_id),
+            Some("http://10.0.0.99:9401".to_string())
+        );
+    }
+
+    /// CO-3-8 — only the transient liveness states may be re-stamped to
+    /// Healthy by a heartbeat; Maintenance/Draining/Quarantined are sticky.
+    #[test]
+    fn co_3_8_heartbeat_may_mark_healthy_truth_table() {
+        assert!(heartbeat_may_mark_healthy(HealthStatus::Healthy));
+        assert!(heartbeat_may_mark_healthy(HealthStatus::Suspect));
+        assert!(heartbeat_may_mark_healthy(HealthStatus::Down));
+        // Disk-derived states stay heartbeat-clearable (recovery path).
+        assert!(heartbeat_may_mark_healthy(HealthStatus::Degraded));
+        assert!(heartbeat_may_mark_healthy(HealthStatus::Failed));
+        // Sticky operator/drain/quarantine states are NOT.
+        assert!(!heartbeat_may_mark_healthy(HealthStatus::Maintenance));
+        assert!(!heartbeat_may_mark_healthy(HealthStatus::Draining));
+        assert!(!heartbeat_may_mark_healthy(HealthStatus::Quarantined));
+    }
+
+    /// CO-4-13 — a file registered under a floor=2 volume must enforce
+    /// floor 2 even when the commit request claims a different (or
+    /// unknown) volume that resolves to the default floor.
+    #[test]
+    fn co_4_13_resolve_ack_floor_uses_stricter_file_volume() {
+        use dtfs_raft::state_machine::FileMetadata;
+
+        let mut sm = StateMachineData::default();
+        // Register a "strict" volume with floor=2 and put the file on it.
+        sm.volumes.insert("strict".to_string(), vol_with_floor("strict", 2));
+        sm.files.insert(
+            "/movies/a.mkv".to_string(),
+            FileMetadata {
+                path: "/movies/a.mkv".to_string(),
+                volume_id: "strict".to_string(),
+                chunk_size: 4 * 1024 * 1024,
+                chunks: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                symlink_target: None,
+                logical_size: None,
+                is_directory: false,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            },
+        );
+
+        // Request claims the unknown/default volume (floor would be 1) but
+        // the file's stored volume floor (2) must win.
+        assert_eq!(
+            resolve_ack_floor(&sm, "/movies/a.mkv", "default", 1),
+            2,
+            "file's stored-volume floor (2) must override the request default (1)"
+        );
+
+        // Request volume is stricter than the file's volume → request wins.
+        sm.volumes.insert("stricter".to_string(), vol_with_floor("stricter", 3));
+        assert_eq!(
+            resolve_ack_floor(&sm, "/movies/a.mkv", "stricter", 1),
+            3,
+            "the stricter of the two volumes governs"
+        );
+
+        // Unknown file (first commit) → only the request volume governs.
+        assert_eq!(resolve_ack_floor(&sm, "/movies/new.mkv", "strict", 1), 2);
+        assert_eq!(resolve_ack_floor(&sm, "/movies/new.mkv", "default", 1), 1);
+    }
+
+    fn vol_with_floor(id: &str, floor: u32) -> dtfs_common::types::VolumeConfig {
+        use dtfs_common::types::*;
+        VolumeConfig {
+            id: VolumeId::new(id.to_string()),
+            name: id.to_string(),
+            chunk_size_bytes: 4 * 1024 * 1024,
+            replication: TierReplication { hot: 0, warm: 2, cold: 1, tape: 1 },
+            mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            cache_replicas: CacheReplication {
+                hot: CacheTierConfig::default(),
+                warm: CacheTierConfig::default(),
+                cold: CacheTierConfig::default(),
+                tape: CacheTierConfig::default(),
+                per_dc: true,
+                promote_reads: 2,
+                promote_window_secs: 60,
+                cooldown_secs: 30,
+            },
+            anchor: None,
+            schedules: VolumeSchedules::default(),
+            spill: SpillPolicy::default(),
+            anchor_datacenter: None,
+            write_safety: WriteSafety {
+                min_replicas_before_ack: floor,
+                write_timeout_secs: 30,
+            },
+        }
     }
 }
