@@ -596,10 +596,27 @@ async fn manager_lifecycle(
                     .collect(),
             };
             match client.report_chunk_status(tonic::Request::new(report)).await {
-                Ok(_) => tracing::info!(
-                    count = corrupt_ids.len(),
-                    "Bug O reported quarantined chunks to manager"
-                ),
+                Ok(resp) => {
+                    if resp.into_inner().accepted {
+                        tracing::info!(
+                            count = corrupt_ids.len(),
+                            "Bug O reported quarantined chunks to manager"
+                        );
+                    } else {
+                        // CO-3-7 — `accepted == false` means the manager could
+                        // not commit the de-location (e.g. a follower failed to
+                        // forward to the leader). Treat it exactly like a
+                        // transport error: we drained these ids, so re-enqueue
+                        // or the corrupt replica stays advertised healthy and
+                        // re-replication never queues until scrub independently
+                        // re-detects it.
+                        chunk_store.enqueue_pending_corruption(corrupt_ids.iter().cloned());
+                        tracing::warn!(
+                            count = corrupt_ids.len(),
+                            "Bug O / CO-3-7 ChunkStatusReport not accepted — will retry next heartbeat"
+                        );
+                    }
+                }
                 Err(e) => {
                     // Re-enqueue on RPC failure so we try again next heartbeat.
                     chunk_store.enqueue_pending_corruption(corrupt_ids.iter().cloned());

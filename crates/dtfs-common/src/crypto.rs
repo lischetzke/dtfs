@@ -103,8 +103,11 @@ pub fn generate_node_cert(
     ))
 }
 
-/// Constant-time comparison to prevent timing attacks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// Constant-time byte-slice comparison to prevent timing attacks. Used for
+/// HMAC verification (join handshake) and shared-secret checks (CO-2-2
+/// forwarded-write auth). Compares content in constant time; a length
+/// mismatch short-circuits (length is not itself secret here).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

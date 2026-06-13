@@ -476,6 +476,7 @@ async fn main() -> anyhow::Result<()> {
         raft.clone(),
         config.cluster.initial_voters.clone(),
         tls_ctx.clone(),
+        config.cluster.shared_secret.clone(),
     )
     .with_alerts(alert_dispatcher.clone()); // P1-8
     let monitor_handle = tokio::spawn(async move {
