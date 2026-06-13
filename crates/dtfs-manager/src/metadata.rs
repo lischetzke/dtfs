@@ -988,6 +988,11 @@ impl ManagerService for MetadataService {
                     .raft_write_or_forward(ClientRequest::RemoveCorruptChunkReplicas {
                         node_id: node_id.to_string(),
                         chunk_hashes: vec![fault.chunk_id.clone()],
+                        // CO-1-1 — the heartbeat integrity-fault report
+                        // (IntegrityFault) carries no disk_id, so keep the
+                        // node-wide legacy sweep. Wiring per-disk corruption
+                        // would need a proto change and is out of scope here.
+                        disk_id: dtfs_raft::legacy_disk_id(),
                     })
                     .await;
             }
@@ -1130,6 +1135,10 @@ impl ManagerService for MetadataService {
                 .raft_write(ClientRequest::RemoveCorruptChunkReplicas {
                     node_id: req.node_id.clone(),
                     chunk_hashes: corrupt_ids,
+                    // CO-1-1 — the scrub ChunkStatusReport carries no
+                    // disk_id, so keep the node-wide legacy sweep (Bug O
+                    // behaviour). Per-disk would need a proto change.
+                    disk_id: dtfs_raft::legacy_disk_id(),
                 })
                 .await;
         }
@@ -1313,8 +1322,13 @@ impl ManagerService for MetadataService {
                         );
                         continue;
                     }
+                    // CO-1-1 — the unlink fan-out reclaims the chunk
+                    // entirely (the file is gone), so it stays node-wide:
+                    // disk_id absent -> legacy first-found.
                     let req = dtfs_proto::dtfs::data::DeleteChunkRequest {
                         chunk_id: chunk_id.clone(),
+                        disk_id: None,
+                        tier: String::new(),
                     };
                     match client.delete_chunk(req).await {
                         Ok(_) => {

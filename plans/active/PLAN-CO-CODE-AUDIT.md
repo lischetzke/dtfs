@@ -115,7 +115,26 @@ against a naive/no-op impl), (3) implement the fix and route the
 production code through the helper. Where a Raft variant grows a field,
 add `#[serde(default)]` + a snapshot-compat test.
 
-### CO-1-1 ✅-test-partial — disk-targeted replica removal [CRITICAL]
+### CO-1-1 ✅ done — disk-targeted replica removal [CRITICAL]
+- DONE 2026-06-13 (branch fix/co-1-1-disk-targeted). Added
+  `legacy_disk_id()` + `#[serde(default = "legacy_disk_id")] disk_id: u32`
+  on `RemoveChunkLocation` + `RemoveCorruptChunkReplicas`; apply matches
+  `(chunk_index, node_id, disk_id)` unless the `u32::MAX` sentinel (then
+  node-wide). `DeleteChunkRequest` gained `optional uint32 disk_id` +
+  `string tier`; `store::delete_chunk_idempotent_on_disk(Some(id))` unlinks
+  only the matching disk (None = legacy first-found). Threaded the disk
+  through excess-spill (`plan_excess_spill_removal` → `(node,disk)`), flush
+  (`FlushAction.disk_id/tier`), and demote (`TickDemotion.disk_id`). Whole-
+  chunk reclaimers (unlink fan-out, orphan reaper) stay node-wide (None).
+  Tests: state_machine `co_1_1_remove_chunk_location_overbroad_drops_colocated_entry`
+  (un-ignored, now drops disk-1 only), `_legacy_sentinel_is_node_wide`,
+  `_disk_id_defaults_to_legacy_sentinel` (serde compat); scheduler
+  `drops_colocated_spill_not_anchor` + cnf1 flush disk assertion; tiering
+  demote test now BH-co-located on one node asserting disk_id=1; store
+  `co_1_1_disk_targeted_delete_preserves_cold_anchor`, `_disk_none_is_legacy_first_found`,
+  `_unknown_disk_id_is_noop`. Release case
+  `tests/release/cases/62-demote-colocated-anchor-survives.sh`. AGENTS.md
+  § A.3.4 updated. (Build+test gate run by the coordinator.)
 - Bug: `state_machine.rs:1854` retains by `(chunk_index, node_id)` →
   drops BOTH entries when a chunk has a mandatory + cache replica
   co-located on one node (legal, § A.3.4 / Bug BH). `DeleteChunkRequest`
