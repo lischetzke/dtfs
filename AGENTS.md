@@ -187,10 +187,17 @@ independent replica classes:
   flush that would strand the mandatory copy → `cache.flush_refused`
   audit + `AnchorViolated` alert. The dispatcher records
   `cache.flush_replica` per drop and `cache.flush_complete` per call.
-- Every promote/demote must check `would_violate_anchor` against the
-  destination state. The AV-2-4 planner filters unsafe demotions; the
-  apply path (`RemoveChunkLocation` with `enforce_anchor`) re-checks as
-  defence-in-depth.
+- Every promote/demote must check the anchor against the destination
+  state. The legacy-temperature path checks `would_violate_anchor`;
+  the AV idle-demote planner checks `tiering::demote_preserves_anchor`
+  (CO-1-2 — refuses a cache-replica demote unless ANOTHER placement still
+  satisfies `effective_anchor`, recording it in `TickPlan.anchor_protected`
+  → the dispatcher emits a `tier.anchor_protected` audit + `AnchorViolated`
+  alert). The mandatory-tier survival check alone is NOT enough: a chunk's
+  ONLY anchor-DC replica can be a cache copy while the mandatory copy lives
+  in another DC. The apply path (`RemoveChunkLocation` with
+  `enforce_anchor`, threaded from the volume's `effective_anchor`)
+  re-checks as defence-in-depth.
 - Engine-driven demote ≠ operator flush: idle-decay demote clears the
   cooldown (next read re-promotes); operator flush sets a future cooldown
   (no immediate re-promote). Route demote-like paths through

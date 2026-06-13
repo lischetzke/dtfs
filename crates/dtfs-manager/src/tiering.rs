@@ -379,6 +379,40 @@ impl TieringEngine {
             .await
             .enable_cache_redundancy_escalation;
         let plan = plan_cache_tick(&snapshot, now_ms, enable_redundancy_escalation);
+
+        // CO-1-2 [HIGH anchor] — surface any demote the planner refused
+        // because it would have stranded the volume's anchor DC. The
+        // planner decides the refusal purely (`demote_preserves_anchor`);
+        // here we emit the `tier.anchor_protected` audit + AnchorViolated
+        // alert so an operator sees the protection fire. Logged before the
+        // early-return so a tick that ONLY produced refusals is still
+        // visible.
+        for r in &plan.anchor_protected {
+            self.audit.log(
+                "tiering",
+                "tier.anchor_protected",
+                &format!(
+                    "chunk={} file={} idx={} node={} disk={} tier={:?} refused idle-demote",
+                    r.chunk_id, r.file_path, r.chunk_index, r.node_id, r.disk_id, r.tier
+                ),
+                "refused",
+            );
+            if let Some(alerts) = &self.alerts {
+                alerts.fire(
+                    crate::alerts::AlertKind::AnchorViolated,
+                    "cache demote refused — would strand anchor DC",
+                    serde_json::json!({
+                        "chunk_id": r.chunk_id,
+                        "file_path": r.file_path,
+                        "chunk_index": r.chunk_index,
+                        "node_id": r.node_id,
+                        "disk_id": r.disk_id,
+                        "tier": format!("{:?}", r.tier),
+                    }),
+                );
+            }
+        }
+
         if plan.promotions.is_empty() && plan.demotions.is_empty() {
             return Ok(());
         }
@@ -546,10 +580,12 @@ impl TieringEngine {
                 node_id: d.node_id.to_string(),
                 // CO-1-1 — drop only this (node, disk) warm cache entry.
                 disk_id: d.disk_id,
-                // AV-2-4 ensures the planner only demotes when
-                // anchor survives, but pass the policy through so
-                // the apply path's defence-in-depth check confirms.
-                enforce_anchor: None,
+                // CO-1-2 — pass the volume anchor so the apply path
+                // re-checks (defence-in-depth, matches the AV-2-4
+                // pattern). The planner already refused any demote that
+                // would strand the anchor (`demote_preserves_anchor`);
+                // this catches an SM change between snapshot and apply.
+                enforce_anchor: d.enforce_anchor.clone(),
             };
             if let Err(e) = self.scheduler.raft().client_write(remove_req).await {
                 warn!(
@@ -1402,6 +1438,27 @@ pub(crate) struct TickDemotion {
     /// demote → clear so the next read re-promotes immediately;
     /// operator flush cooldown still active → leave alone).
     pub cooldown_until_ms_at_snapshot: u64,
+    /// CO-1-2 — the volume's resolved anchor policy, passed straight
+    /// through to the `RemoveChunkLocation` apply as `enforce_anchor`
+    /// (defence-in-depth). The planner already refuses any demote that
+    /// would strand the anchor (`demote_preserves_anchor`); this gives
+    /// the state-machine apply path a second chance to refuse if the SM
+    /// changed between snapshot and apply. `None` = no anchor policy.
+    pub enforce_anchor: Option<dtfs_common::types::AnchorPolicy>,
+}
+
+/// CO-1-2 — a demote the planner refused because it would have
+/// stranded the volume's anchor DC. Surfaced so the dispatcher (which
+/// holds the audit log) can emit a `tier.anchor_protected` audit; the
+/// refusal itself is decided purely in `demote_preserves_anchor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnchorProtectedDemote {
+    pub chunk_id: String,
+    pub chunk_index: u64,
+    pub file_path: String,
+    pub node_id: u64,
+    pub disk_id: u32,
+    pub tier: DiskTier,
 }
 
 /// AV-2-4 — output of the planner. Wrapped in a struct so the
@@ -1410,6 +1467,8 @@ pub(crate) struct TickDemotion {
 pub(crate) struct TickPlan {
     pub promotions: Vec<TickPromotion>,
     pub demotions: Vec<TickDemotion>,
+    /// CO-1-2 — demotes refused to protect the anchor DC.
+    pub anchor_protected: Vec<AnchorProtectedDemote>,
 }
 
 /// AV-2-4 — pure planner. Walks every chunk in the snapshot and
@@ -1449,7 +1508,13 @@ pub(crate) fn plan_cache_tick(
         );
 
         // -- Demotions --
-        plan_chunk_demotions(chunk, policy, now_ms, &mut plan.demotions);
+        plan_chunk_demotions(
+            chunk,
+            policy,
+            now_ms,
+            &mut plan.demotions,
+            &mut plan.anchor_protected,
+        );
     }
     plan
 }
@@ -1628,6 +1693,35 @@ fn plan_chunk_promotions(
     }
 }
 
+/// CO-1-2 pure kernel — would dropping `victim` from `chunk`'s
+/// placements still leave the volume's anchor satisfied?
+///
+/// Returns `true` when it is safe to demote (anchor preserved or no
+/// anchor policy), `false` when `victim` is the last placement that
+/// satisfies the anchor (so the demote MUST be refused). The check
+/// mirrors `would_violate_anchor_for` but operates on the planner's
+/// `TickPlacement` view and uses `AnchorPolicy::is_satisfied_by`
+/// (datacenter + optional `required_tier`).
+pub(crate) fn demote_preserves_anchor(
+    chunk: &TickChunk,
+    victim: &TickPlacement,
+    anchor: Option<&dtfs_common::types::AnchorPolicy>,
+) -> bool {
+    let Some(anchor) = anchor else {
+        return true; // no anchor policy → no constraint
+    };
+    if anchor.datacenter.is_empty() {
+        return true;
+    }
+    // Identity is (node_id, disk_id) — the demote removes exactly that
+    // replica (CO-1-1). Any OTHER placement that satisfies the anchor
+    // keeps the invariant.
+    chunk.placements.iter().any(|p| {
+        let is_victim = p.node_id == victim.node_id && p.disk_id == victim.disk_id;
+        !is_victim && anchor.is_satisfied_by(&p.dc, Some(p.tier))
+    })
+}
+
 /// AV-2-4 helper — demotion decisions for one chunk.
 ///
 /// A placement is demoted when ALL of:
@@ -1647,6 +1741,7 @@ fn plan_chunk_demotions(
     policy: &TickVolumePolicy,
     now_ms: u64,
     out: &mut Vec<TickDemotion>,
+    anchor_protected: &mut Vec<AnchorProtectedDemote>,
 ) {
     if policy.cache.promote_window_secs == 0 {
         // Cache disabled cluster-wide on this volume; demotions
@@ -1704,6 +1799,26 @@ fn plan_chunk_demotions(
         if !mandatory_still_present {
             continue;
         }
+        // CO-1-2 [HIGH anchor] — never strand the LELI cold anchor. The
+        // mandatory-tier check above does NOT cover the anchor invariant
+        // (§ A.3.4): a chunk's ONLY anchor-DC replica can sit on a cache
+        // tier while the mandatory copy lives in another DC, and the
+        // idle-demote would then drop the last anchor copy. Skip the
+        // placement-removal unless another placement still satisfies the
+        // volume's `effective_anchor`. The dispatcher additionally passes
+        // the anchor as `enforce_anchor` on the RemoveChunkLocation apply
+        // (defence-in-depth, matching the AV-2-4 pattern).
+        if !demote_preserves_anchor(chunk, placement, policy.anchor.as_ref()) {
+            anchor_protected.push(AnchorProtectedDemote {
+                chunk_id: chunk.chunk_id.clone(),
+                chunk_index: chunk.chunk_index,
+                file_path: chunk.file_path.clone(),
+                node_id: placement.node_id,
+                disk_id: placement.disk_id,
+                tier: placement.tier,
+            });
+            continue;
+        }
         out.push(TickDemotion {
             chunk_id: chunk.chunk_id.clone(),
             chunk_index: chunk.chunk_index,
@@ -1713,6 +1828,8 @@ fn plan_chunk_demotions(
             tier: placement.tier,
             reason: "idle_window",
             cooldown_until_ms_at_snapshot: chunk.cooldown_until_ms,
+            // CO-1-2 — carry the anchor through for the apply-path re-check.
+            enforce_anchor: policy.anchor.clone(),
         });
     }
 }
@@ -2816,6 +2933,132 @@ mod audit_co_tests {
         ));
         // Empty anchor dc -> never a constraint.
         assert!(!anchor_violated_after_copy(&[], "", None, None, false));
+    }
+
+    // ---- CO-1-2 [HIGH anchor] — demote must not strand the anchor ----
+
+    use dtfs_common::types::AnchorPolicy;
+
+    fn placement(node_id: u64, disk_id: u32, dc: &str, tier: DiskTier) -> TickPlacement {
+        TickPlacement { node_id, disk_id, dc: dc.to_string(), tier }
+    }
+
+    fn chunk_with(placements: Vec<TickPlacement>) -> TickChunk {
+        TickChunk {
+            chunk_id: "c1".into(),
+            chunk_index: 0,
+            file_path: "/f".into(),
+            volume_id: "v1".into(),
+            placements,
+            cooldown_until_ms: 0,
+            reads_in_window_by_dc: HashMap::new(),
+            file_updated_at_ms: 0,
+        }
+    }
+
+    /// CO-1-2 — the chunk's ONLY anchor-DC replica is the warm cache copy
+    /// (mandatory copy lives in another DC). Demoting it would strand the
+    /// LELI anchor, so `demote_preserves_anchor` must return false.
+    #[test]
+    fn co_1_2_demote_of_sole_anchor_replica_is_refused() {
+        // LELI warm cache copy (the only LELI replica) + TORO mandatory.
+        let leli_cache = placement(10, 1, "leli", DiskTier::Warm);
+        let toro_mand = placement(20, 0, "toro", DiskTier::Cold);
+        let chunk = chunk_with(vec![leli_cache.clone(), toro_mand]);
+        let anchor = AnchorPolicy { datacenter: "leli".into(), required_tier: None };
+        assert!(
+            !demote_preserves_anchor(&chunk, &leli_cache, Some(&anchor)),
+            "demoting the only LELI replica must be refused"
+        );
+    }
+
+    /// CO-1-2 — a second LELI replica keeps the anchor satisfied, so the
+    /// demote of one LELI cache copy is allowed.
+    #[test]
+    fn co_1_2_demote_safe_when_another_anchor_replica_survives() {
+        let leli_cache = placement(10, 1, "leli", DiskTier::Warm);
+        let leli_anchor = placement(11, 0, "leli", DiskTier::Cold);
+        let chunk = chunk_with(vec![leli_cache.clone(), leli_anchor]);
+        let anchor = AnchorPolicy { datacenter: "leli".into(), required_tier: None };
+        assert!(
+            demote_preserves_anchor(&chunk, &leli_cache, Some(&anchor)),
+            "another LELI replica keeps the anchor satisfied"
+        );
+    }
+
+    /// CO-1-2 — a tier-pinned anchor (cold in LELI) is not satisfied by a
+    /// surviving LELI WARM replica, so demoting the LELI cold copy is
+    /// refused even though another LELI replica exists.
+    #[test]
+    fn co_1_2_tier_pinned_anchor_respects_required_tier() {
+        let leli_cold = placement(10, 0, "leli", DiskTier::Cold);
+        let leli_warm = placement(10, 1, "leli", DiskTier::Warm);
+        let chunk = chunk_with(vec![leli_cold.clone(), leli_warm]);
+        let anchor = AnchorPolicy {
+            datacenter: "leli".into(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        assert!(
+            !demote_preserves_anchor(&chunk, &leli_cold, Some(&anchor)),
+            "the surviving LELI warm copy does not satisfy a cold-pinned anchor"
+        );
+    }
+
+    /// CO-1-2 — no anchor policy → never a constraint.
+    #[test]
+    fn co_1_2_no_anchor_policy_never_blocks() {
+        let leli = placement(10, 1, "leli", DiskTier::Warm);
+        let chunk = chunk_with(vec![leli.clone()]);
+        assert!(demote_preserves_anchor(&chunk, &leli, None));
+        let empty = AnchorPolicy { datacenter: String::new(), required_tier: None };
+        assert!(demote_preserves_anchor(&chunk, &leli, Some(&empty)));
+    }
+
+    /// CO-1-2 — the planner records the refused demote in
+    /// `anchor_protected` (so the dispatcher can audit it) and does NOT
+    /// emit it as a demotion.
+    #[test]
+    fn co_1_2_planner_refuses_and_records_anchor_protected() {
+        use dtfs_common::types::{CacheReplication, CacheTierConfig, TierReplication};
+        // Volume: warm cache enabled (max=1), TORO mandatory cold, anchor
+        // = LELI. The chunk's only LELI replica is the warm cache copy.
+        let mut cache = CacheReplication::default();
+        cache.warm = CacheTierConfig { min: 0, max: 1 };
+        cache.promote_window_secs = 60;
+        cache.promote_reads = 2;
+        let mut mandatory = TierReplication::default();
+        mandatory.cold = 1;
+        let policy = TickVolumePolicy {
+            mandatory,
+            cache,
+            anchor: Some(AnchorPolicy { datacenter: "leli".into(), required_tier: None }),
+        };
+        let mut volumes = HashMap::new();
+        volumes.insert("v1".to_string(), policy);
+
+        // Idle (no reads) chunk, file old enough to clear the grace window.
+        let mut chunk = chunk_with(vec![
+            placement(10, 1, "leli", DiskTier::Warm), // sole LELI = warm cache
+            placement(20, 0, "toro", DiskTier::Cold), // mandatory elsewhere
+        ]);
+        chunk.file_updated_at_ms = 1; // far in the past relative to now_ms
+        let snapshot = TickSnapshot {
+            chunks: vec![chunk],
+            nodes: Vec::new(),
+            volumes,
+        };
+        let plan = plan_cache_tick(&snapshot, 10_000_000, false);
+        assert!(
+            plan.demotions.is_empty(),
+            "the anchor-stranding demote must NOT be scheduled"
+        );
+        assert_eq!(
+            plan.anchor_protected.len(),
+            1,
+            "the refusal must be recorded for the dispatcher to audit"
+        );
+        assert_eq!(plan.anchor_protected[0].node_id, 10);
+        assert_eq!(plan.anchor_protected[0].disk_id, 1);
     }
 
     /// CO-4-17 — `apply_heartbeat_reads` bounds the read-window store.
