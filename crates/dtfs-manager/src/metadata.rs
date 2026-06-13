@@ -526,6 +526,26 @@ fn replica_tier_string(sm: &StateMachineData, node_id: &str, disk_id: u32) -> St
         .unwrap_or_default()
 }
 
+/// CO-3-10: resolve a chunk replica's topology `Location` (proto form) from
+/// the node it lives on, so `GetFileLocations` can carry it positionally
+/// alongside `node_addresses`. The FUSE client loads these into
+/// `known_locations` to rank read replicas by distance + operator intent.
+/// Returns `None` when the node is not (yet) known, which the client treats
+/// as an unknown location (arbitrary/pure-distance order).
+fn replica_location_proto(
+    sm: &StateMachineData,
+    node_id: &str,
+) -> Option<dtfs_proto::dtfs::common::Location> {
+    let id = node_id.parse::<u64>().ok()?;
+    let n = sm.nodes.get(&id)?;
+    Some(dtfs_proto::dtfs::common::Location {
+        region: n.location.region.clone(),
+        datacenter: n.location.datacenter.clone(),
+        rack: n.location.rack.clone(),
+        host: n.location.host.clone(),
+    })
+}
+
 /// Reverse-lookup the numeric node ID for a given gRPC address.
 ///
 /// Storing numeric IDs in `ChunkLocationEntry.node_id` keeps the field type
@@ -639,6 +659,12 @@ impl ManagerService for MetadataService {
             // on (node.disks[disk_id].tier), positionally aligned with
             // node_addresses so the client can use it as a read tie-break.
             let tier = replica_tier_string(&data, &c.node_id, c.disk_id);
+            // CO-3-10: the replica's registered Location, positionally
+            // aligned with node_addresses so the FUSE client can load it
+            // into known_locations for distance/priority read ranking. An
+            // unknown node yields a default (all-empty) Location, which the
+            // client skips (unknown -> arbitrary/pure-distance order).
+            let location = replica_location_proto(&data, &c.node_id).unwrap_or_default();
             let e = by_chunk
                 .entry(c.chunk_index)
                 .or_insert_with(|| ChunkLocationInfo {
@@ -646,11 +672,13 @@ impl ManagerService for MetadataService {
                     size: c.size_bytes,
                     node_addresses: Vec::new(),
                     node_tiers: Vec::new(),
+                    node_locations: Vec::new(),
                 });
             e.size = e.size.max(c.size_bytes);
             if !e.node_addresses.contains(&addr) {
                 e.node_addresses.push(addr);
                 e.node_tiers.push(tier);
+                e.node_locations.push(location);
             }
         }
 

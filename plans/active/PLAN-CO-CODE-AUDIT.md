@@ -199,7 +199,20 @@ add `#[serde(default)]` + a snapshot-compat test.
   NodeInfo>, leader_id) -> Option<String>` preferring membership, falling
   back to voters. Test: leader present only in membership resolves.
 
-### CO-3-10 — FUSE known_locations never populated [HIGH]
+### CO-3-10 ✅ done — FUSE known_locations never populated [HIGH]
+- DONE 2026-06-13 (branch fix/co-3-10-read-routing). WIRE-FIELD: added
+  positional `ChunkLocationInfo.node_locations` (`repeated dtfs.common.Location`,
+  field 5) to `proto/manager.proto`; manager fills it from each replica node's
+  registered Location (`metadata.rs::replica_location_proto`, pushed in lockstep
+  with node_addresses/node_tiers under the same dedup guard); FUSE converts
+  proto->topology Location and learns it into `known_locations` keyed by node
+  addr on metadata refresh (`filesystem.rs::learn_locations`; all-empty/older-
+  manager entries skipped -> existing fallback). Tests:
+  `co_3_10_populated_locations_select_priority_replica`,
+  `co_3_10_populated_locations_select_nearer_replica`,
+  `co_3_10_older_manager_empty_locations_falls_back` (filesystem.rs) +
+  release case `tests/release/cases/63-read-distance-routing.sh`. AGENTS.md A.2
+  + grpc-api.md updated.
 - Bug: `filesystem.rs:222,288` the map is only ever `.get()` (no `.insert`
   anywhere in dtfs-fuse) → distance + `read_location_priority` dead,
   `migration.on_remote_read` never fires. `location.rs::select_read_replica`
