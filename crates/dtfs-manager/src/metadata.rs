@@ -1142,12 +1142,26 @@ impl ManagerService for MetadataService {
         } else {
             "healthy"
         };
-        let _ = self
-            .raft_write(ClientRequest::UpdateNodeStatus {
+        // CO-3-7 — route through `raft_write_or_forward` (not the
+        // ForwardToLeader-dropping `raft_write`). A corrupt/missing report
+        // can land on ANY manager; a data node heartbeats one arbitrary
+        // peer, so the receiver is usually a FOLLOWER. With a bare
+        // `let _ = raft_write(...)` the follower silently dropped both the
+        // status downgrade AND the replica de-location, so the replica was
+        // never dropped and re-replication never queued — the corrupt copy
+        // stayed advertised as healthy. We now forward to the leader and
+        // surface failure as `accepted: false` so the data node retries.
+        let mut accepted = true;
+        if let Err(e) = self
+            .raft_write_or_forward(ClientRequest::UpdateNodeStatus {
                 node_id: node_id_u64,
                 status: status.to_string(),
             })
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "CO-3-7 failed to commit node-status from chunk report");
+            accepted = false;
+        }
 
         // Bug O — drop the (this-node, chunk_hash) replica entries so
         // the scheduler's under-replication pass queues a copy from a
@@ -1159,8 +1173,8 @@ impl ManagerService for MetadataService {
                 count = corrupt_ids.len(),
                 "Bug O dropping corrupt-replica entries + queueing re-replication"
             );
-            let _ = self
-                .raft_write(ClientRequest::RemoveCorruptChunkReplicas {
+            if let Err(e) = self
+                .raft_write_or_forward(ClientRequest::RemoveCorruptChunkReplicas {
                     node_id: req.node_id.clone(),
                     chunk_hashes: corrupt_ids,
                     // CO-1-1 — the scrub ChunkStatusReport carries no
@@ -1168,10 +1182,14 @@ impl ManagerService for MetadataService {
                     // behaviour). Per-disk would need a proto change.
                     disk_id: dtfs_raft::legacy_disk_id(),
                 })
-                .await;
+                .await
+            {
+                tracing::warn!(error = %e, "CO-3-7 failed to commit corrupt-replica removal");
+                accepted = false;
+            }
         }
 
-        Ok(Response::new(ChunkStatusAck { accepted: true }))
+        Ok(Response::new(ChunkStatusAck { accepted }))
     }
 
     /// Bug BL — leader-side handler for writes forwarded by a non-leader

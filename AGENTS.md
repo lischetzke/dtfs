@@ -461,7 +461,14 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   authoritative + single-writer. Recovery stays the heartbeat handler's
   `UpdateNodeStatus(healthy)` (any manager, forwarded).
 - `dtfs-manager/src/metadata.rs` — gRPC service; thin wrappers over
-  `raft_write(ClientRequest::*)`.
+  `raft_write(ClientRequest::*)`. CO-3-7: `report_chunk_status` commits its
+  corrupt/missing handling (UpdateNodeStatus + RemoveCorruptChunkReplicas)
+  through `raft_write_or_forward` and returns `accepted: false` on failure —
+  never `let _ = raft_write(...)`, which on a follower silently dropped the
+  de-location so the bad replica stayed advertised healthy and
+  re-replication never queued. The dtfs-data heartbeat loop re-enqueues the
+  drained corrupt ids when the ack is `accepted == false` (same as a
+  transport error), so the retry actually happens.
 - `dtfs-manager/src/api.rs` — REST endpoints (WebUI + CLI); `get_stats`
   is the WebUI home aggregator. The config read endpoints (`get_config`,
   `get_config_effective`) return the **effective** config = the node's
