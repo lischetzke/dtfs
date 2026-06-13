@@ -151,6 +151,9 @@ impl LogStore {
         let db = Arc::new(db);
 
         // Restore cached `last_purged` from the meta column family.
+        // CO-4-12 — a read error here must surface (fail the open) rather
+        // than silently resetting last_purged to None, which would make a
+        // restarted node re-serve already-purged indices as live log.
         let last_purged = {
             let cf = db.cf_handle(CF_META).expect("meta CF must exist");
             match db.get_cf(&cf, META_KEY_LAST_PURGED) {
@@ -158,7 +161,8 @@ impl LogStore {
                     let lid: Option<LogId> = decode_value(&bytes)?;
                     lid
                 }
-                _ => None,
+                Ok(None) => None,
+                Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
             }
         };
 
@@ -195,13 +199,9 @@ impl LogStore {
     pub fn peek_last_log_id(&self) -> Result<Option<LogId>, io::Error> {
         let cf = self.db.cf_handle(CF_LOGS).expect("logs CF");
         let mut iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::End);
-        match iter.next() {
-            Some(Ok((_key, value))) => {
-                let entry: Entry = decode_value(&value)?;
-                Ok(Some(entry.log_id.clone()))
-            }
-            _ => Ok(None),
-        }
+        // CO-4-12 — a storage error here must propagate, not collapse to
+        // an empty-log result.
+        last_log_id_from_iter_item(iter.next())
     }
 
     fn persist_last_purged(&self, lid: &Option<LogId>) -> Result<(), io::Error> {
@@ -247,6 +247,37 @@ fn decode_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, io::Error> {
                 format!("json={json_err}; bincode_fallback={bin_err}"),
             )
         }),
+    }
+}
+
+/// CO-4-12 — map the last-entry iterator step to its decoded `LogId`.
+///
+/// A RocksDB iterator yields `None` only when the column family is
+/// genuinely empty; a `Some(Err(_))` means the iterator hit a storage
+/// error (a corrupt block, an I/O fault) and the log MUST NOT be treated
+/// as empty/purged. Folding that error into "absence" silently drops
+/// committed entries (`get_log_state` would report a shorter log than is
+/// on disk). So:
+/// - `None`            -> `Ok(None)` (truly empty CF)
+/// - `Some(Ok(value))` -> decode the entry, return `Ok(Some(log_id))`
+/// - `Some(Err(e))`    -> `Err(io::Error)` (propagate, never swallow)
+///
+/// `item` is the iterator's `Option<Result<(key, value), rocksdb::Error>>`
+/// so the same mapping is unit-testable with a forced error in place of a
+/// real DB fault.
+fn last_log_id_from_iter_item<K, V>(
+    item: Option<Result<(K, V), rocksdb::Error>>,
+) -> Result<Option<LogId>, io::Error>
+where
+    V: AsRef<[u8]>,
+{
+    match item {
+        Some(Ok((_key, value))) => {
+            let entry: Entry = decode_value(value.as_ref())?;
+            Ok(Some(entry.log_id.clone()))
+        }
+        Some(Err(e)) => Err(io::Error::new(io::ErrorKind::Other, e)),
+        None => Ok(None),
     }
 }
 
@@ -321,14 +352,15 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 
         let cf = self.db.cf_handle(CF_LOGS).expect("logs CF");
 
-        // Find the last log entry by reverse iteration.
+        // Find the last log entry by reverse iteration. CO-4-12 — an
+        // iterator storage error propagates (`?`); only a genuinely empty
+        // CF (Ok(None)) falls back to last_purged. Folding a storage error
+        // into the empty case fabricated a shorter log and lost committed
+        // entries.
         let mut iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::End);
-        let last_log_id = match iter.next() {
-            Some(Ok((_key, value))) => {
-                let entry: Entry = decode_value(&value)?;
-                Some(entry.log_id.clone())
-            }
-            _ => last_purged.clone(),
+        let last_log_id = match last_log_id_from_iter_item(iter.next())? {
+            Some(lid) => Some(lid),
+            None => last_purged.clone(),
         };
 
         Ok(LogState {
@@ -399,18 +431,18 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             start_index.saturating_sub(1)
         );
 
-        // Delete entries from start_index onward.
-        let keys_to_delete: Vec<Box<[u8]>> = self
-            .db
-            .iterator_cf(
-                &cf,
-                rocksdb::IteratorMode::From(
-                    &index_to_key(start_index),
-                    rocksdb::Direction::Forward,
-                ),
-            )
-            .filter_map(|item| item.ok().map(|(k, _)| k))
-            .collect();
+        // Delete entries from start_index onward. CO-4-12 — propagate an
+        // iterator storage error instead of `filter_map`-dropping it; a
+        // dropped errored item would leave a conflicting log suffix the
+        // leader asked us to truncate (Raft safety violation).
+        let mut keys_to_delete: Vec<Box<[u8]>> = Vec::new();
+        for item in self.db.iterator_cf(
+            &cf,
+            rocksdb::IteratorMode::From(&index_to_key(start_index), rocksdb::Direction::Forward),
+        ) {
+            let (key, _value) = item.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            keys_to_delete.push(key);
+        }
 
         for key in keys_to_delete {
             self.db
@@ -555,6 +587,98 @@ mod bug_av_5_2_recovery_tests {
         // Defaults resolve to the conservative 64 MiB bounds.
         assert_eq!(RocksDbLogOpts::default().write_buffer_mb, 64);
         assert_eq!(RocksDbLogOpts::default().block_cache_mb, 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod audit_co_tests {
+    use super::*;
+
+    /// Produce a genuine `rocksdb::Error` (its constructor is private, so we
+    /// trigger a real one). Opening a DB at a non-existent path with the
+    /// default options (`create_if_missing` defaults to false) fails — this
+    /// is the same `rocksdb::Error` type an iterator would surface on a
+    /// corrupt block / I/O fault, so it exercises the exact `Some(Err(_))`
+    /// arm of the production iterator step.
+    fn forced_rocksdb_error() -> rocksdb::Error {
+        let missing = std::env::temp_dir().join(format!(
+            "dtfs-co412-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let opts = Options::default(); // create_if_missing = false
+        rocksdb::DB::open(&opts, &missing).expect_err("open of a missing DB must error")
+    }
+
+    /// CO-4-12 — a `Some(Err(rocksdb_error))` from the last-entry iterator
+    /// MUST propagate as `Err`, never collapse to an empty-log result. The
+    /// pre-fix `_ => Ok(None)` catch-all fabricated an empty log here and
+    /// lost committed entries.
+    #[test]
+    fn co_4_12_iter_error_propagates_not_empty() {
+        let item: Option<Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>> =
+            Some(Err(forced_rocksdb_error()));
+        let mapped = last_log_id_from_iter_item(item);
+        assert!(
+            mapped.is_err(),
+            "iterator storage error must propagate as Err, got {:?}",
+            mapped.ok()
+        );
+        assert_eq!(mapped.unwrap_err().kind(), io::ErrorKind::Other);
+    }
+
+    /// CO-4-12 — a genuinely empty CF (`None` from the iterator) is the only
+    /// case that legitimately maps to absence. Must NOT be turned into an
+    /// error.
+    #[test]
+    fn co_4_12_empty_iter_maps_to_none() {
+        let item: Option<Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>> = None;
+        let mapped = last_log_id_from_iter_item(item).expect("empty CF is not an error");
+        assert!(mapped.is_none(), "empty CF must map to None");
+    }
+
+    /// CO-4-12 — `get_log_state` on a populated log returns the real last
+    /// log id (happy path unchanged by the error-propagation fix).
+    #[tokio::test]
+    async fn co_4_12_get_log_state_reports_last_entry() {
+        use openraft::vote::RaftLeaderId;
+
+        fn mk_entry(idx: u64) -> Entry {
+            let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+            Entry {
+                log_id: openraft::LogId::new(leader, idx),
+                payload: openraft::EntryPayload::Blank,
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "dtfs-co412-state-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut store = LogStore::new(&dir).expect("open");
+            let cf = store.db.cf_handle(CF_LOGS).expect("logs CF");
+            for idx in 0..5u64 {
+                let value = encode_value(&mk_entry(idx)).expect("encode");
+                store.db.put_cf(&cf, index_to_key(idx), value).expect("put");
+            }
+            store.db.flush_cf(&cf).expect("flush");
+
+            let state = store.get_log_state().await.expect("get_log_state");
+            assert_eq!(
+                state.last_log_id.map(|l| l.index),
+                Some(4),
+                "last_log_id must be the highest committed index"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
