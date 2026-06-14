@@ -559,7 +559,13 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   effective config) and REQUIRES the merge to deserialize as `ManagerConfig`
   (`merge_and_validate_override`, 400 on type error, CO-4-3), then persists
   `toml::to_string_pretty` of the validated merge — never raw override JSON
-  into the `.toml`.
+  into the `.toml`. Operator node decommission
+  (`POST /api/v1/nodes/{id}/decommission` -> `decommission_node_endpoint` ->
+  Raft `ClientRequest::DeregisterNode`) removes a drained/dead node from the
+  registry; the apply REFUSES (`ClientResponse::Error`) if the node still
+  holds any chunk replica (`sm.files[*].chunks[*].node_id`) — integrity
+  guard A.6 #5, drain/re-replicate first. The endpoint pre-checks the same
+  and the apply re-checks authoritatively (TOCTOU-safe).
 - `dtfs-manager/src/membership.rs` — CF-2 online raft membership: pure
   validation for the leader-only `/api/v1/raft/{add-learner,promote,
   remove}` endpoints (openraft `add_learner`/`change_membership`;

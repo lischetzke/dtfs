@@ -1198,9 +1198,33 @@ fn apply_request(
         }
 
         ClientRequest::DeregisterNode { node_id } => {
-            sm.nodes.remove(node_id);
-            push_audit_capped(&mut sm.audit_log, audit(format!("DeregisterNode: {node_id}")));
-            ClientResponse::Success
+            // Integrity (A.6 #5): never drop a node that still holds chunk
+            // replicas. Removing it from sm.nodes would dangle its location
+            // entries and silently lower the replication factor with no
+            // re-replication — the operator must drain (migrate the replicas
+            // off) first. The decommission API pre-checks the same, but the
+            // apply is the single authoritative writer, so re-check here to
+            // close the TOCTOU window.
+            // ChunkLocationEntry.node_id is the stringified node id.
+            let nid_str = node_id.to_string();
+            let holds_replica = sm
+                .files
+                .values()
+                .any(|f| f.chunks.iter().any(|c| c.node_id == nid_str));
+            if holds_replica {
+                ClientResponse::Error {
+                    message: format!(
+                        "DeregisterNode refused: node {node_id} still holds chunk replicas; drain/re-replicate first"
+                    ),
+                }
+            } else if sm.nodes.remove(node_id).is_some() {
+                push_audit_capped(&mut sm.audit_log, audit(format!("DeregisterNode: {node_id}")));
+                ClientResponse::Success
+            } else {
+                ClientResponse::Error {
+                    message: format!("DeregisterNode: unknown node {node_id}"),
+                }
+            }
         }
 
         ClientRequest::UpdateNodeStatus { node_id, status } => {
@@ -2675,6 +2699,75 @@ mod posix_path_regression {
             .lookup_path("/movies")
             .expect("parent dir lookup after rename");
         assert!(parent.is_directory);
+    }
+
+    /// DeregisterNode integrity guard: a node that still holds chunk replicas
+    /// MUST NOT be removed (would dangle its location entries and silently
+    /// lower the replication factor). Once drained it deregisters cleanly;
+    /// an unknown node is a no-op Error.
+    #[test]
+    fn deregister_node_refuses_while_holding_replicas_then_succeeds_when_drained() {
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 10, info: mk_data_node_with_disk(0) },
+        );
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::CreateFile {
+                path: "/f.bin".into(),
+                volume_id: "default".into(),
+                chunk_size: 4 * 1024 * 1024,
+            },
+        );
+        apply_request(
+            &mut sm,
+            &mk_log_id(3),
+            &ClientRequest::UpdateChunkLocations {
+                path: "/f.bin".into(),
+                chunks: vec![ChunkLocationEntry {
+                    chunk_index: 0,
+                    chunk_hash: "h0".into(),
+                    node_id: "10".into(),
+                    disk_id: 0,
+                    size_bytes: 4096,
+                }],
+                lease_id: String::new(),
+            },
+        );
+
+        // Refused while node 10 still holds the replica.
+        let refused =
+            apply_request(&mut sm, &mk_log_id(4), &ClientRequest::DeregisterNode { node_id: 10 });
+        match refused {
+            ClientResponse::Error { message } => {
+                assert!(message.contains("still holds chunk replicas"), "got: {message}")
+            }
+            other => panic!("expected Error while holding replicas, got {other:?}"),
+        }
+        assert!(sm.nodes.contains_key(&10), "node must remain while it holds replicas");
+
+        // Drain the replica, then deregister succeeds and removes the node.
+        apply_request(
+            &mut sm,
+            &mk_log_id(5),
+            &ClientRequest::RemoveCorruptChunkReplicas {
+                node_id: "10".into(),
+                chunk_hashes: vec!["h0".into()],
+                disk_id: crate::legacy_disk_id(),
+            },
+        );
+        let ok =
+            apply_request(&mut sm, &mk_log_id(6), &ClientRequest::DeregisterNode { node_id: 10 });
+        assert!(matches!(ok, ClientResponse::Success), "drained node must deregister");
+        assert!(!sm.nodes.contains_key(&10), "node removed after deregister");
+
+        // Unknown node -> Error (idempotent safety, no panic).
+        let unknown =
+            apply_request(&mut sm, &mk_log_id(7), &ClientRequest::DeregisterNode { node_id: 99 });
+        assert!(matches!(unknown, ClientResponse::Error { .. }), "unknown node deregister is Error");
     }
 
     /// Bug E — `list_directory_entries` must report a path as a directory
