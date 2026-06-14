@@ -117,6 +117,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/nodes/{node_id}/maintenance",
             post(set_maintenance),
         )
+        // Operator decommission: remove a drained/dead node from the registry.
+        .route(
+            "/api/v1/nodes/{node_id}/decommission",
+            post(decommission_node_endpoint),
+        )
         // Files
         .route("/api/v1/files", get(list_files))
         // Volumes
@@ -1488,6 +1493,74 @@ async fn unquarantine_node_endpoint(
         "node_id": nid.to_string(),
         "ok": true,
     })))
+}
+
+/// Body for `POST /api/v1/nodes/{id}/decommission`. `operator_id` is a
+/// free-form actor label (initials / ticket) so the audit row has a name;
+/// `reason` is the written justification for removing the node.
+#[derive(Deserialize)]
+struct DecommissionRequest {
+    operator_id: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// Remove a drained/dead node from the cluster registry. Integrity guard
+/// (A.6 #5): the node MUST hold no chunk replicas, else removing it would
+/// dangle its location entries and silently lower the replication factor —
+/// drain (re-replicate the chunks off) first. Leader-gated via the Raft
+/// `DeregisterNode` command, whose apply re-checks the same invariant
+/// authoritatively (so a chunk landing between this pre-check and the apply
+/// is still refused).
+async fn decommission_node_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(node_id): axum::extract::Path<String>,
+    Json(body): Json<DecommissionRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let nid: u64 = node_id.parse().map_err(|_| (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "node_id must be u64"})),
+    ))?;
+    let op = body.operator_id.trim();
+    if op.is_empty() {
+        return Err((StatusCode::BAD_REQUEST,
+            Json(json!({"error": "operator_id required"}))));
+    }
+
+    // Pre-check: node exists + holds no chunk replicas (the apply re-checks).
+    {
+        let sm = state.sm_data.read().await;
+        if !sm.nodes.contains_key(&nid) {
+            return Err((StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("node {nid} not found")}))));
+        }
+        let nid_str = nid.to_string();
+        let holds = sm.files.values()
+            .any(|f| f.chunks.iter().any(|c| c.node_id == nid_str));
+        if holds {
+            return Err((StatusCode::CONFLICT, Json(json!({
+                "error": format!("node {nid} still holds chunk replicas; \
+                                  drain/re-replicate before decommission")
+            }))));
+        }
+    }
+
+    let resp = state
+        .raft
+        .client_write(ClientRequest::DeregisterNode { node_id: nid })
+        .await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": format!("raft write failed: {e}")}))))?;
+
+    // The apply is the authoritative writer; surface a committed refusal.
+    if let dtfs_raft::ClientResponse::Error { message } = resp.data {
+        return Err((StatusCode::CONFLICT, Json(json!({"error": message}))));
+    }
+
+    state.audit_log.log("api", "node.decommission",
+        &format!("node={nid} by={op}"), &body.reason);
+    info!("node {nid} decommissioned by {op}");
+    Ok(Json(json!({"node_id": nid.to_string(), "ok": true})))
 }
 
 #[derive(Deserialize)]
