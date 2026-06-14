@@ -2223,7 +2223,14 @@ async fn set_volume_write_safety_endpoint(
 /// optional; supplied fields are merged onto the current
 /// `mandatory_replicas`. Omitted fields keep their current value
 /// (consistent with AV-3-5's `set-cache` semantics).
+///
+/// `deny_unknown_fields` so a wrong-shape body (e.g. a nested
+/// `{"mandatory_replicas":{...}}` object) is a loud 422 rather than
+/// deserializing to all-None and silently no-op'ing away a
+/// durability-policy change. An empty `{}` body still deserializes
+/// (all-None -> dispatcher detects no-op and skips the Raft write).
 #[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SetMandatoryRequest {
     pub hot_replicas: Option<u32>,
     pub warm_replicas: Option<u32>,
@@ -5711,6 +5718,26 @@ mod bug_av_set_mandatory_tests {
         let err = apply_set_mandatory(&current, &req).unwrap_err();
         assert!(err.contains("all-zero"),
             "error must explain the all-zero rejection: {err}");
+    }
+
+    /// The wrong body shape (a nested {"mandatory_replicas":{...}} object
+    /// instead of the flat *_replicas fields) must FAIL to deserialize rather
+    /// than silently map to all-None and no-op away a durability-policy change.
+    /// `#[serde(deny_unknown_fields)]` on SetMandatoryRequest enforces this;
+    /// an empty {} body still deserializes (all-None -> dispatcher no-op).
+    #[test]
+    fn set_mandatory_wrong_nested_shape_is_rejected() {
+        let nested = r#"{"mandatory_replicas":{"hot":0,"warm":2,"cold":1}}"#;
+        assert!(
+            serde_json::from_str::<SetMandatoryRequest>(nested).is_err(),
+            "nested mandatory_replicas body must be rejected, not silently ignored"
+        );
+        // Empty body stays valid (all-None -> no-op, preserved contract).
+        assert!(serde_json::from_str::<SetMandatoryRequest>("{}").is_ok());
+        // Correct flat shape deserializes.
+        let ok: SetMandatoryRequest =
+            serde_json::from_str(r#"{"warm_replicas":2,"cold_replicas":1}"#).expect("flat ok");
+        assert_eq!(ok.warm_replicas, Some(2));
     }
 
     /// AV-4-1a test 3 — rejecting an update that would make

@@ -15,7 +15,7 @@ PATHF="$MOUNT/release/48-shaped-$$.bin"; LOCAL=/tmp/48-src-$$.bin
 SHAPED=0; SAVED=0
 restore_policy() {
     [ "$SAVED" = "1" ] || return 0
-    mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"mandatory_replicas":{"hot":2,"warm":2,"cold":1}}' >/dev/null 2>&1 || true
+    mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"hot_replicas":2,"warm_replicas":2,"cold_replicas":1}' >/dev/null 2>&1 || true
 }
 case_cleanup() {
     [ "$SHAPED" = "1" ] && ansible-playbook -i "$INV3DC" "$ANSIBLE_DIR/playbooks/revert-shaping.yml" >/dev/null 2>&1 || true
@@ -26,7 +26,7 @@ trap case_cleanup EXIT
 
 echo "[1/4] pin the only replica to dc-a (cold=1, cache off) and write 16 MB"
 mgr_post_leader /api/v1/volumes/$VOL/set-anchor '{"datacenter":"dc-a","tier":"cold","mandatory_replicas":1}' >/dev/null
-mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"mandatory_replicas":{"hot":0,"warm":0,"cold":1}}' >/dev/null; SAVED=1
+mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"hot_replicas":0,"warm_replicas":0,"cold_replicas":1}' >/dev/null; SAVED=1
 mgr_post_leader /api/v1/volumes/$VOL/set-cache '{"warm_min":0,"warm_max":0,"hot_min":0,"hot_max":0,"per_dc":true}' >/dev/null
 head -c $((16 * 1024 * 1024)) /dev/urandom > "$LOCAL"
 SRC=$(sha256sum "$LOCAL" | awk '{print $1}')
