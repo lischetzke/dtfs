@@ -24,7 +24,7 @@ APIF="${PATHF#$MOUNT}"  # mount-relative path for manager API calls
 SAVED=0
 restore_policy() {
     [ "$SAVED" = "1" ] || return 0
-    mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"mandatory_replicas":{"hot":2,"warm":2,"cold":1}}' >/dev/null 2>&1 || true
+    mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"hot_replicas":2,"warm_replicas":2,"cold_replicas":1}' >/dev/null 2>&1 || true
     mgr_post_leader /api/v1/volumes/$VOL/set-cache '{"warm_min":0,"warm_max":0,"per_dc":false}' >/dev/null 2>&1 || true
 }
 case_cleanup() { restore_policy; client_run "sudo rm -rf ${MOUNT}${PREFIX}" >/dev/null 2>&1 || true; rm -f "$LOCAL"; }
@@ -36,7 +36,7 @@ CW=$(client_for_dc dc-a)
 
 echo "[1/5] anchor cold=1 (dc-a) + short-window warm cache so idle-demote fires fast"
 mgr_post_leader /api/v1/volumes/$VOL/set-anchor '{"datacenter":"dc-a","tier":"cold","mandatory_replicas":1}' >/dev/null
-mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"mandatory_replicas":{"hot":0,"warm":0,"cold":1}}' >/dev/null; SAVED=1
+mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"hot_replicas":0,"warm_replicas":0,"cold_replicas":1}' >/dev/null; SAVED=1
 # Short promote_window so a brief idle period triggers the engine demote.
 mgr_post_leader /api/v1/volumes/$VOL/set-cache '{"warm_min":1,"warm_max":1,"per_dc":false,"promote_reads":1,"promote_window_secs":30,"cooldown_secs":0}' >/dev/null
 
@@ -57,17 +57,18 @@ if ! wait_for_soft 90 _warm_present; then
 fi
 echo "  warm cache copy present"
 
-echo "[4/5] go idle past the 30s promote_window -> engine idle-demotes the warm copy"
-# No reads for > promote_window_secs so the AV tick demotes the idle warm copy.
-sleep 50
+echo "[4/5] go idle past the demote grace -> engine idle-demotes the warm copy"
+# The AV cache dispatcher (tick_av_cache, AV-5-5) defers a demote while the
+# file was updated within grace = (max promote_window across volumes + 180s);
+# adding the warm replica bumps file.updated_at_ms, so the idle-demote only
+# fires ~promote_window+180s after the warm landed (here 30+180 = 210s). Wait
+# past that. If the warm never promoted (topology) we KNOWN_ISSUE; the
+# anchor-survival guarantee is also unit-covered (co_1_2_*) + the flush path
+# (case 62).
+sleep 60
 _warm_gone() { [ "$(count_replicas_in_tier "$APIF" warm)" -eq 0 ]; }
-# Engine idle-demote depends on the read-window/DC accounting clearing, which
-# does not reliably fire for every cache-replica placement/topology in a bounded
-# window. If it does not demote, we cannot exercise the demote path here; the
-# anchor-survival-under-demote guarantee is still covered by the dtfs-manager
-# tiering unit tests (co_1_2_*) and by the operator-flush path (case 62).
-if ! wait_for_soft 120 _warm_gone; then
-    known_issue CO-1-2 "engine idle-demote did not fire within 120s in this topology; \
+if ! wait_for_soft 240 _warm_gone; then
+    known_issue CO-1-2 "engine idle-demote did not fire within the grace window; \
 anchor-survival-under-demote is unit-covered (co_1_2_*) + exercised by the flush path (case 62)"
 fi
 

@@ -13,7 +13,7 @@ PATHF="$MOUNT/release/46-balance-$$.bin"; LOCAL=/tmp/46-src-$$.bin
 SAVED=0
 restore_policy() {
     [ "$SAVED" = "1" ] || return 0
-    mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"mandatory_replicas":{"hot":2,"warm":2,"cold":1}}' >/dev/null 2>&1 || true
+    mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"hot_replicas":2,"warm_replicas":2,"cold_replicas":1}' >/dev/null 2>&1 || true
     mgr_post_leader /api/v1/volumes/$VOL/set-cache '{"warm_min":0,"warm_max":0,"hot_min":0,"hot_max":0,"per_dc":true}' >/dev/null 2>&1 || true
 }
 case_cleanup() { restore_policy; rm_fuse_file "$PATHF"; rm -f "$LOCAL"; }
@@ -34,7 +34,7 @@ _converged()  {
 
 echo "[1/5] set target: mandatory cold=1 (anchor dc-a) + warm cache per-dc 1/1"
 mgr_post_leader /api/v1/volumes/$VOL/set-anchor '{"datacenter":"dc-a","tier":"cold","mandatory_replicas":1}' >/dev/null
-_post_ok /api/v1/volumes/$VOL/set-mandatory '{"mandatory_replicas":{"hot":0,"warm":0,"cold":1}}' set-mandatory
+_post_ok /api/v1/volumes/$VOL/set-mandatory '{"hot_replicas":0,"warm_replicas":0,"cold_replicas":1}' set-mandatory
 SAVED=1
 _post_ok /api/v1/volumes/$VOL/set-cache '{"warm_min":1,"warm_max":1,"per_dc":true,"promote_reads":1,"promote_window_secs":3600,"cooldown_secs":0}' set-cache
 
