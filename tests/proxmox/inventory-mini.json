@@ -13,7 +13,7 @@
     "cluster_name": "Minicluster",
     "shared_secret": "minicluster-test-secret",
     "anchor_datacenter": "dc-a",
-    "_note": "dc-a has 3 racks (mgr01+data01 in rack-1, mgr02+data02 in rack-2, client01 in rack-3) so Topology page horizontal-rack layout (Bug AO) is exercised. dc-b has 1 rack with mgr03."
+    "_note": "Two DCs with data so cross-DC read-distance routing is testable: dc-a = mgr01(rack-1)+mgr02(rack-2)+data01(rack-1)+client01(rack-3); dc-b = mgr03+data02+client02 (rack-2; data02 and client02 co-located on .175). Runtime [memory] caps are applied to every role (mgr 400/512M, data 500/640M, fuse 256/320M) for the RAM-tight VMs; see deploy. data02 moved dc-a->dc-b during the PLAN-CO live verification (2026-06-14)."
   },
   "vms": [
     {
@@ -43,7 +43,7 @@
     {
       "role": "data", "vmid": 305, "name": "mini-data02", "ip": "10.150.0.175",
       "cores": 2, "memory_mb": 2048, "os_disk_gb": 16,
-      "dc": "dc-a", "rack": "rack-2",
+      "dc": "dc-b", "rack": "rack-2",
       "extra_disks": [
         { "storage": "pve01_ssd02", "size_gb": 20, "tier": "warm", "mount": "/mnt/data02-warm" },
         { "storage": "pve01_ssd02", "size_gb": 20, "tier": "cold", "mount": "/mnt/data02-cold" }
@@ -54,6 +54,13 @@
       "cores": 2, "memory_mb": 1024, "os_disk_gb": 16,
       "dc": "dc-a", "rack": "rack-3",
       "mount": "/mnt/dtfs"
+    },
+    {
+      "role": "client", "vmid": 305, "name": "mini-client02", "ip": "10.150.0.175",
+      "cores": 2, "memory_mb": 1024, "os_disk_gb": 16,
+      "dc": "dc-b", "rack": "rack-2",
+      "mount": "/mnt/dtfs",
+      "_note": "Co-located on the data02 box (dc-b). Gives a second-DC reader so cross-DC read-distance routing (CO-3-10, case 63) is exercisable. Not in lab DNS: add '10.150.0.175 mini-client02' to the runner's /etc/hosts."
     }
   ]
 }

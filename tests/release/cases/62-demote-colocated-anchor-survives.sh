@@ -17,6 +17,7 @@ source "$(dirname "$0")/../lib/dc.sh"
 
 PREFIX=/release/62-co11-$$/
 PATHF="${MOUNT}${PREFIX}f.bin"; LOCAL=/tmp/62-src-$$.bin
+APIF="${PATHF#$MOUNT}"  # mount-relative path for manager API calls
 SAVED=0
 restore_policy() {
     [ "$SAVED" = "1" ] || return 0
@@ -61,13 +62,13 @@ head -c $((8 * 1024 * 1024)) /dev/urandom > "$LOCAL"
 scp "${SSH_OPTS[@]}" "$LOCAL" "debian@$CW:/tmp/62-src.bin" >/dev/null 2>&1 || skip "cannot stage src"
 ssh_run "$CW" "sudo mkdir -p ${MOUNT}${PREFIX} && sudo cp /tmp/62-src.bin '$PATHF' && sudo sync" || fail "write failed"
 ssh_run "$CW" "sudo rm -f /tmp/62-src.bin"
-inspect_has_replicas "$PATHF" || known_issue REL-1-2 "inspect lacks per-replica tier (REL-1-2)"
-_anchor_ok() { [ "$(count_replicas_in_dc_tier "$PATHF" dc-a cold)" -ge 1 ]; }
+wait_for_soft 45 inspect_has_replicas "$APIF" || known_issue REL-1-2 "inspect lacks per-replica tier (REL-1-2)"
+_anchor_ok() { [ "$(count_replicas_in_dc_tier "$APIF" dc-a cold)" -ge 1 ]; }
 wait_for 60 "cold anchor present" _anchor_ok
 
 echo "[3/5] read repeatedly -> promote a warm cache copy co-located on $CO_NODE"
 for _ in 1 2 3; do ssh_run "$CW" "sudo cat '$PATHF' > /dev/null"; sleep 2; done
-_warm_present() { [ "$(count_replicas_in_tier "$PATHF" warm)" -ge 1 ]; }
+_warm_present() { [ "$(count_replicas_in_tier "$APIF" warm)" -ge 1 ]; }
 if ! wait_for_soft 90 _warm_present; then
     known_issue CO-1-1 "warm cache copy did not promote on the co-located node within 90s"
 fi
@@ -76,11 +77,11 @@ echo "  warm cache copy present"
 echo "[4/5] flush_cache (warm) -> drop the warm copy only"
 RESP=$(mgr_post_leader /api/v1/files/flush_cache "{\"path_prefix\":\"$PREFIX\",\"cache_tiers\":[\"warm\"]}")
 echo "  flush: $(echo "$RESP" | head -c 200)"
-_warm_gone() { [ "$(count_replicas_in_tier "$PATHF" warm)" -eq 0 ]; }
+_warm_gone() { [ "$(count_replicas_in_tier "$APIF" warm)" -eq 0 ]; }
 wait_for 60 "warm cache flushed" _warm_gone
 
 echo "[5/5] cold anchor MUST survive + no AnchorViolated + readable"
-[ "$(count_replicas_in_dc_tier "$PATHF" dc-a cold)" -ge 1 ] || fail "CO-1-1 REGRESSION: cold anchor deleted by warm-cache flush"
+[ "$(count_replicas_in_dc_tier "$APIF" dc-a cold)" -ge 1 ] || fail "CO-1-1 REGRESSION: cold anchor deleted by warm-cache flush"
 ssh_run "$CW" "sudo cat '$PATHF' > /dev/null" || fail "file no longer readable after flush (anchor gone)"
 AUDIT=$(mgr_get_any "/api/v1/audit?limit=200")
 echo "$AUDIT" | grep -q "AnchorViolated" && fail "AnchorViolated raised during co-located flush"

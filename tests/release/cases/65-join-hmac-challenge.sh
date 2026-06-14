@@ -18,6 +18,29 @@
 
 JOIN_HOST="co23-join-test-$$"
 
+# Test hygiene: the legit join (step 4) registers JOIN_HOST in the cluster
+# registry; it never heartbeats again, so without cleanup it lingers as a
+# Down phantom and drives cluster health to "degraded" across release runs.
+# Decommission it on exit via the leader-gated /decommission endpoint (the
+# node holds no chunk replicas, so the integrity guard allows removal).
+case_cleanup() {
+    local nid
+    nid=$(mgr_get_any /api/v1/nodes | python3 -c "
+import json,sys
+host='$JOIN_HOST'
+for n in json.load(sys.stdin):
+    if n.get('hostname')==host:
+        print(n.get('node_id','')); break" 2>/dev/null)
+    [ -n "$nid" ] || return 0
+    for h in $(mgrs_list); do
+        curl "${CURL_OPTS[@]}" -X POST -H 'content-type: application/json' \
+            -d '{"operator_id":"release-suite","reason":"CO-2-3 join test cleanup: remove ephemeral test node"}' \
+            "http://$h:$MGR_PORT/api/v1/nodes/$nid/decommission" 2>/dev/null \
+            | grep -q '"ok":true' && break
+    done
+}
+trap case_cleanup EXIT
+
 first_mgr=$(mgrs_list | awk '{print $1}')
 
 SECRET=$(ssh_run "$first_mgr" "python3 - <<'EOF'
