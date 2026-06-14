@@ -77,7 +77,7 @@ CONFIGS_TOUCHED=0
 POLICY_SAVED=0
 restore_policy() {
     [ "$POLICY_SAVED" = "1" ] || return 0
-    mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"mandatory_replicas":{"hot":2,"warm":2,"cold":1}}' >/dev/null 2>&1 || true
+    mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"hot_replicas":2,"warm_replicas":2,"cold_replicas":1}' >/dev/null 2>&1 || true
     mgr_post_leader /api/v1/volumes/$VOL/set-cache '{"warm_min":0,"warm_max":0,"per_dc":false}' >/dev/null 2>&1 || true
 }
 case_cleanup() {
@@ -128,7 +128,7 @@ wait_for 90 "raft re-elected a leader" mgr_leader
 # ── 2. Anchor cold=1 (dc-a) + short-window warm cache ────────────
 echo "[2/5] anchor cold=1 (dc-a) + short-window warm cache so idle-demote fires fast"
 mgr_post_leader /api/v1/volumes/$VOL/set-anchor '{"datacenter":"dc-a","tier":"cold","mandatory_replicas":1}' >/dev/null
-mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"mandatory_replicas":{"hot":0,"warm":0,"cold":1}}' >/dev/null; POLICY_SAVED=1
+mgr_post_leader /api/v1/volumes/$VOL/set-mandatory '{"hot_replicas":0,"warm_replicas":0,"cold_replicas":1}' >/dev/null; POLICY_SAVED=1
 mgr_post_leader /api/v1/volumes/$VOL/set-cache '{"warm_min":1,"warm_max":1,"per_dc":false,"promote_reads":1,"promote_window_secs":30,"cooldown_secs":0}' >/dev/null
 
 # ── 3. Write + promote a warm cache copy; record its host ────────
@@ -175,8 +175,12 @@ fi
 echo "  warm cache copy on $WARM_HOST (node $WARM_ID) holds $FIRST_CID on disk"
 
 # ── 4. Go idle -> engine demotes; assert the warm SM entry de-locates ──
-echo "[4/5] go idle past the 30s promote_window -> engine demotes (Raft-remove-first de-location)"
-sleep 50
+echo "[4/5] go idle past the demote grace -> engine demotes (Raft-remove-first de-location)"
+# The dispatcher (tick_av_cache, AV-5-5) defers a demote while the file was
+# updated within grace = (max promote_window across volumes + 180s). Adding the
+# warm replica bumps file.updated_at_ms, so the demote only fires ~210s after
+# the warm landed (promote_window 30 + 180). Wait past that.
+sleep 60
 warm_delocated() {  # SM no longer names the warm node for this chunk
     mgr_get_any "/api/v1/files/inspect?path=$APIF" | python3 -c "
 import json,sys
@@ -189,12 +193,11 @@ for c in d.get('chunks',[]):
 sys.exit(0)
 "
 }
-# Engine idle-demote depends on read-window/DC accounting clearing and does not
-# reliably fire for every cache-replica placement/topology in a bounded window.
-# If it never de-locates we cannot exercise the reaper here; CO-1-3's de-location
-# ordering is unit-covered (co_1_3_*) and the reaper itself by case 73.
-if ! wait_for_soft 120 warm_delocated; then
-    known_issue CO-1-3 "engine idle-demote did not de-locate the warm copy within 120s in this topology; \
+# If the warm never promoted / never de-locates within the grace window we
+# cannot exercise the reaper here; CO-1-3's de-location ordering is unit-covered
+# (co_1_3_*) and the reaper itself by case 73.
+if ! wait_for_soft 240 warm_delocated; then
+    known_issue CO-1-3 "engine idle-demote did not de-locate the warm copy within the grace window; \
 de-location ordering is unit-covered (co_1_3_*) and the reaper by case 73"
 fi
 echo "  warm location entry de-located from the SM (RemoveChunkLocation committed)"
