@@ -26,6 +26,7 @@ CLN=$(client_for_dc "$NEAR_DC")
 nodes_expose_io || known_issue REL-1-1 "/api/v1/nodes lacks total_bytes_read"
 
 PATHF="$MOUNT/release/63-distance-$$.bin"
+APIF="${PATHF#$MOUNT}"  # mount-relative path for manager API calls
 LOCAL=/tmp/63-src-$$.bin
 
 case_cleanup() {
@@ -43,8 +44,8 @@ snap_dc() {  # <dc> -> summed total_bytes_read over its data hosts
     done
     echo "$tot"
 }
-_path_has_far_replica()  { [ "$(count_replicas_in_dc "$PATHF" "$FAR_DC")" -ge 1 ]; }
-_path_has_near_replica() { [ "$(count_replicas_in_dc "$PATHF" "$NEAR_DC")" -ge 1 ]; }
+_path_has_far_replica()  { [ "$(count_replicas_in_dc "$APIF" "$FAR_DC")" -ge 1 ]; }
+_path_has_near_replica() { [ "$(count_replicas_in_dc "$APIF" "$NEAR_DC")" -ge 1 ]; }
 
 SIZE=$((8 * 1024 * 1024))
 echo "[1/5] write ${SIZE}B from $CLN ($NEAR_DC)"
