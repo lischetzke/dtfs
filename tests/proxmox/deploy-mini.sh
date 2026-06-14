@@ -14,12 +14,16 @@ KEY=$HOME/.ssh/dtfs-lab/id_ed25519
 SSHOPTS="-i $KEY -o StrictHostKeyChecking=no -o BatchMode=yes"
 SHARED_SECRET="minicluster-test-secret"
 
+# Two DCs WITH data so cross-DC read-distance routing is exercisable:
+# dc-a = mgr01/mgr02 + data01 + client01; dc-b = mgr03 + data02 + client02.
+# client02 is co-located on the data02 box (.175) — a second-DC reader.
 declare -A IP=(
     [mgr01]=10.150.0.171 [mgr02]=10.150.0.172 [mgr03]=10.150.0.173
     [data01]=10.150.0.174 [data02]=10.150.0.175 [client01]=10.150.0.176
+    [client02]=10.150.0.175
 )
-declare -A DC=(   [mgr01]=dc-a [mgr02]=dc-a [mgr03]=dc-b [data01]=dc-a [data02]=dc-a [client01]=dc-a )
-declare -A RACK=( [mgr01]=rack-1 [mgr02]=rack-2 [mgr03]=rack-1 [data01]=rack-1 [data02]=rack-2 [client01]=rack-3 )
+declare -A DC=(   [mgr01]=dc-a [mgr02]=dc-a [mgr03]=dc-b [data01]=dc-a [data02]=dc-b [client01]=dc-a [client02]=dc-b )
+declare -A RACK=( [mgr01]=rack-1 [mgr02]=rack-2 [mgr03]=rack-1 [data01]=rack-1 [data02]=rack-2 [client01]=rack-3 [client02]=rack-2 )
 
 # --- Helpers ---------------------------------------------------------------
 
@@ -120,7 +124,10 @@ enabled = true
 hot_threshold_reads_per_hour = 5
 cold_threshold_days = 14
 frozen_threshold_days = 90
-evaluation_interval_secs = 3600
+# Short eval interval so the tiering engine promote/demote ticks are
+# observable within a release-test window (the release suite's tiering
+# cases depend on this). Bump for a quieter/production-like cadence.
+evaluation_interval_secs = 20
 migration_bandwidth_limit_mbps = 200
 
 [monitoring]
@@ -134,6 +141,14 @@ down_after_missed = 6
 # same view from every manager.
 [audit]
 replicate_via_raft = true
+
+# CF-5 — per-role memory cap (RAM-tight VMs; ~1.4 GB each). systemd
+# MemoryMax (deploy_manager drop-in) is the hard backstop.
+[memory]
+hard_cap_mb = 400
+warn_threshold_pct = 75
+shed_threshold_pct = 88
+sample_interval_secs = 5
 TOML
 }
 
@@ -179,6 +194,15 @@ policy = "arc"
 quick_interval_hours = 6
 deep_interval_hours = 168
 max_io_percent = 10
+
+# CF-5 — per-role memory cap. On the composite dc-b box (.175 runs data02
+# + client02) the data cap + the fuse cap must fit under host RAM; systemd
+# MemoryMax (deploy_data drop-in) is the hard backstop.
+[memory]
+hard_cap_mb = 500
+warn_threshold_pct = 75
+shed_threshold_pct = 88
+sample_interval_secs = 5
 TOML
 }
 
@@ -214,6 +238,14 @@ prune_interval_secs = 3600
 mode = "localreadonly"
 quorum_loss_timeout_secs = 30
 show_warning = true
+
+# CF-5 — per-role memory cap (FUSE holds writebuf + readahead + local
+# cache index). systemd MemoryMax (deploy_client drop-in) is the backstop.
+[memory]
+hard_cap_mb = 256
+warn_threshold_pct = 75
+shed_threshold_pct = 88
+sample_interval_secs = 5
 TOML
 }
 
@@ -224,6 +256,9 @@ deploy_manager() {
     setup_common $host
     push_binary $host dtfs-manager
     push_systemd_unit $host dtfs-manager.service
+    # CF-5 hard backstop: cap manager RSS via systemd.
+    remote $host "sudo mkdir -p /etc/systemd/system/dtfs-manager.service.d
+printf '[Service]\\nMemoryMax=512M\\n' | sudo tee /etc/systemd/system/dtfs-manager.service.d/memory.conf >/dev/null"
     render_manager_toml $host $is_bootstrap > /tmp/manager-$host.toml
     push $host /tmp/manager-$host.toml /tmp/manager.toml
     remote $host "sudo install -m 644 /tmp/manager.toml /etc/dtfs/manager.toml && sudo chown dtfs:dtfs /etc/dtfs/manager.toml"
@@ -241,7 +276,8 @@ deploy_data() {
     push_systemd_unit $host dtfs-data.service
     # Need ReadWritePaths for the mounts; drop a unit-override file.
     remote $host "sudo mkdir -p /etc/systemd/system/dtfs-data.service.d
-echo -e '[Service]\\nReadWritePaths=/mnt/${host}-warm /mnt/${host}-cold' | sudo tee /etc/systemd/system/dtfs-data.service.d/disks.conf"
+echo -e '[Service]\\nReadWritePaths=/mnt/${host}-warm /mnt/${host}-cold' | sudo tee /etc/systemd/system/dtfs-data.service.d/disks.conf
+printf '[Service]\\nMemoryMax=640M\\n' | sudo tee /etc/systemd/system/dtfs-data.service.d/memory.conf >/dev/null"
     render_data_toml $host > /tmp/data-$host.toml
     push $host /tmp/data-$host.toml /tmp/data.toml
     remote $host "sudo install -m 644 /tmp/data.toml /etc/dtfs/data.toml && sudo chown dtfs:dtfs /etc/dtfs/data.toml"
@@ -260,6 +296,9 @@ sudo mkdir -p /mnt/dtfs /etc/dtfs
 echo 'user_allow_other' | sudo tee /etc/fuse.conf >/dev/null"
     push_binary $host dtfs-fuse
     push_systemd_unit $host 'dtfs-fuse@.service'
+    # CF-5 hard backstop: cap FUSE RSS (tight on the .175 composite box).
+    remote $host "sudo mkdir -p /etc/systemd/system/dtfs-fuse@.service.d
+printf '[Service]\\nMemoryMax=320M\\n' | sudo tee /etc/systemd/system/dtfs-fuse@.service.d/memory.conf >/dev/null"
     render_fuse_toml $host > /tmp/fuse-$host.toml
     push $host /tmp/fuse-$host.toml /tmp/fuse.toml
     remote $host "sudo install -m 644 /tmp/fuse.toml /etc/dtfs/fuse.toml"
@@ -289,8 +328,9 @@ deploy_data data02
 sleep 4
 
 echo
-echo "=== Phase 5: FUSE client01 ==="
+echo "=== Phase 5: FUSE clients (client01 dc-a, client02 dc-b co-located on data02) ==="
 deploy_client client01
+deploy_client client02
 
 echo
 echo "=== Done. Verifying cluster status... ==="
