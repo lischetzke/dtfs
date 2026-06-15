@@ -1,80 +1,60 @@
-# FUSE mount serializes ALL operations — one stalled read freezes the whole mount
+# FUSE read can hang indefinitely on a dead/hung data node (FUSE-HOL)
 
-**Found:** 2026-06-14, while wiring the CO-3-12 live release case (69) on the
-minicluster. **Severity: HIGH** (directly hits the prime Plex workload).
+**Found:** 2026-06-14 wiring the CO-3-12 live case. **Corrected 2026-06-15**
+after clean re-measurement. **Severity: HIGH.** Fix: PLAN-FUSE-HOL-read-timeout.
 
-## Summary
+## Correction to the original write-up
 
-A single slow/stalled chunk read blocks **every** other FUSE operation on the
-mount — not just other reads of the same file, but `open`/`getattr`/`ls` of
-**unrelated** files. The DTFS FUSE client processes kernel requests serially
-(head-of-line blocking), so any one slow `GetChunk` (e.g. a cold chunk served
-from the 40 Mbps LELI archive) stalls all concurrent playback and library
-browsing until it completes.
+The original version claimed the FUSE mount serializes **all** operations
+(one stalled read freezes the whole mount). That was a **measurement artifact**:
+the latency probes used `/usr/bin/time -p ...`, which is **absent** on the
+client VMs, so every probe exited non-zero and was misread as a timeout. Clean
+re-measurement (`date +%s%N` deltas) shows the mount is NOT globally serialized.
 
-## Evidence (live, minicluster, deployed build 20260614-145804)
+## Accurate findings (clean measurements, deployed build)
 
-Setup: single cold replica of a 4 MiB file on data01; `tc tbf rate 1mbit` on
-data01 `eth0` so a cold read stalls ~30 s in the fetch; read issued from the
-dc-b client (cold cache).
-
-While that read is stalled:
-- 40/40 concurrent metadata-only opens (`: < file`) of the **same** file blocked
-  (each hit the 8 s timeout).
-- `open` of a **different** file B: TIMEOUT.
-- `getattr`/`stat` of a **different** file B: TIMEOUT.
-
-A blocked `getattr` on an unrelated file proves the bottleneck is **global**
-request dispatch, not the per-file `open_files` DashMap guard.
-
-## Root cause
-
-- `crates/dtfs-fuse/src/main.rs` mounts with `fuse3::raw::Session::new(MountOptions::default())`
-  (fuse3 0.7). Requests are dispatched serially — a handler future that `.await`s
-  a slow network fetch holds up the next request.
-- The `[io]` concurrency knobs the docs advertise
-  (`docs/src/access/fuse-mount.md`: `max_read_concurrency`, `max_write_concurrency`,
-  `fuse_threads`) are **not implemented** — no such fields exist in
-  `crates/dtfs-common/src/config.rs`. Documentation describes config that does
-  nothing.
+- fuse3 0.7.3 dispatches every handler on its own task (`spawn` per request);
+  the runtime is multi-thread (4 workers). During a stalled read, operations on
+  OTHER files are fast: `stat`/`open` of a different file = 3-5 ms; `stat` of the
+  same file = 4 ms. **No mount-wide freeze.**
+- The real bug: `DtfsFilesystem::read` fetches each chunk with
+  `self.client.read_chunk(cand, id).await` (filesystem.rs ~715) with **no
+  timeout**. The P0-2 replica fallback only triggers on a transport `Err`, NOT
+  on a hang. A data node that is reachable but never returns the chunk (hung, or
+  egress black-holed) makes the read await **indefinitely** — the application's
+  FUSE read syscall never returns. Confirmed: with data01's chunk-port responses
+  dropped on an established channel, a cold read hung >35 s with no fallover.
+- Secondary: a concurrent `open` of the SAME file blocks for the in-flight
+  read's fetch duration (~the stall). Bounding the fetch also bounds this.
 
 ## Impact
 
-Target workload is multi-stream Plex playback + browsing over an asymmetric WAN
-where cold chunks come from a 40 Mbps archive. One cold/slow chunk read freezes
-the whole mount → all streams + `ls`/stat stall. This is the workload DTFS
-exists to serve, so it is high priority.
+Prime Plex-over-WAN workload: a hung/dead archive data node makes every read
+whose chosen replica is that node hang forever (app freezes on that file) until
+the node recovers or is evicted. P0-2 does not help because a hang produces no
+error.
+
+## Fix (PLAN-FUSE-HOL-read-timeout)
+
+Bound each per-replica `read_chunk` with a configurable timeout
+(`client.chunk_read_timeout_secs`, default 60 s, `0` = disabled) and fail over
+to the next candidate on timeout — extending P0-2 to cover hangs, not just
+errors. Read-only path, so timeout/fallover is safe; all-candidates-failed =>
+EIO (existing). **VERIFIED LIVE (2026-06-15):** with the data node's chunk-port
+responses dropped on an established channel (hung mid-stream — the case P0-2
+cannot catch), a cold read fell over to the healthy replica in exactly the
+configured timeout (8 s test value) and returned correct bytes; pre-fix the same
+scenario hung >35 s. The connect-error path also recovers (~5 s). Release case
+`69-read-hung-node-fallover.sh` asserts this.
+
+Operational note: simulate a hung node with `tc`/`iptables` scoped to the gRPC
+port (`--sport 9500`), NEVER the NIC root qdisc (`dev eth0 root netem delay`) —
+the latter delays the node's own SSH past sshd's kex grace and bricks
+management (it stranded data01 once; required a VM reboot to clear).
 
 ## Relation to CO-3-12
 
-CO-3-12 (drop the `open_files` guard before the read chunk loop) is correct and
-necessary, but its benefit is entirely masked by this global serialization: even
-with the guard dropped, the serial session dispatch blocks concurrent ops. So
-CO-3-12 cannot be verified in isolation on a live mount until this is fixed —
-release case 69 stays KNOWN_ISSUE pinned here (CO-3-12 remains unit/structural-
-covered).
-
-## Repro (scripted)
-
-`tests/release/cases/69-concurrent-read-no-guard-serialize.sh` contains the
-throttle + stalled-read + concurrent-open harness. As-is it FAILS on the current
-build (40/40 opens blocked) — kept as KNOWN_ISSUE rather than FAIL because it is
-exposing this larger defect, not a CO-3-12 regression.
-
-## Fix options (not yet done — needs a decision; likely non-trivial)
-
-1. Dispatch each FUSE request on its own task so a stalled handler does not block
-   the session loop (spawn per request in the adapter, or a bounded worker
-   pool). Verify fuse3 0.7 actually serializes vs whether a newer fuse3 / a mount
-   option enables concurrency.
-2. Implement the documented `[io]` config (`fuse_threads`, `max_read_concurrency`,
-   `max_write_concurrency`) and wire it to the dispatch + the read/write fan-out,
-   OR remove the vaporware config from the docs.
-3. Bound the per-chunk fetch with a timeout + replica fallback so a single slow
-   node cannot stall a read indefinitely (defence-in-depth, complements 1).
-
-## Recommendation
-
-Treat as a new HIGH bug (suggest next free plan letter). Option 1 is the core
-fix; 2 aligns docs with reality; 3 hardens the read path. Re-enable case 69 to a
-real PASS once dispatch is concurrent.
+CO-3-12 (drop the `open_files` guard before the read loop) is correct and
+unit-covered. It is not the cause of the hang. Release case 69 stays
+KNOWN_ISSUE [FUSE-HOL] until the timeout fix lands + is live-verified, then it
+asserts hung-node fallover.

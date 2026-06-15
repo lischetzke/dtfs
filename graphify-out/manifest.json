@@ -1,0 +1,1817 @@
+{
+  "crates/dtfs-cli/src/main.rs": {
+    "mtime": 1781335469.7784762,
+    "ast_hash": "1965aef10f2266fc31359c89c1c6cda9",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-cli/src/updater.rs": {
+    "mtime": 1781340918.9838307,
+    "ast_hash": "d65be2e315c8315023e0246a62570c74",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-client/src/client.rs": {
+    "mtime": 1781335470.182234,
+    "ast_hash": "a8f21587eb70cb97b4d28a641315048f",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-client/src/lib.rs": {
+    "mtime": 1781257936.4089093,
+    "ast_hash": "806155935aff7582e7a3e10ef15fd72f",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-client/src/location.rs": {
+    "mtime": 1781257936.409908,
+    "ast_hash": "7c151848bc9af481f651b770650ef1d8",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-client/src/retry.rs": {
+    "mtime": 1781335469.77948,
+    "ast_hash": "a96e1e68ef1caf6ffe016cc94742a8aa",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/build.rs": {
+    "mtime": 1781257936.4109077,
+    "ast_hash": "231b8910b5eb823d198594ca61af6d0f",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/src/checksum.rs": {
+    "mtime": 1781257936.4109077,
+    "ast_hash": "ea9af3f0a5546f5c3de904062e0c0e16",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/src/config.rs": {
+    "mtime": 1781473557.2893636,
+    "ast_hash": "192de8d749b73bdd7ef78d87a944b58f",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/src/crypto.rs": {
+    "mtime": 1781340993.016355,
+    "ast_hash": "710979475567f8705e0a7e34d6654d5d",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/src/error.rs": {
+    "mtime": 1781257936.411908,
+    "ast_hash": "cb4fcee84c80d19f9c4cd7a4d6274605",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/src/hash_ring.rs": {
+    "mtime": 1781335470.2599182,
+    "ast_hash": "a525dc0b9cfff5a2d7bc78c01c7e0818",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/src/lib.rs": {
+    "mtime": 1781257936.4134123,
+    "ast_hash": "066eca820615d3de8e421d04a1791bd0",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/src/memory.rs": {
+    "mtime": 1781257936.4134123,
+    "ast_hash": "ccb92d2fe08fe1c2a2e7227f72a552c5",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/src/reconfig.rs": {
+    "mtime": 1781257936.4144168,
+    "ast_hash": "5c2a21ca9089177f6a2237386a866003",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/src/tls.rs": {
+    "mtime": 1781257936.4144168,
+    "ast_hash": "74e47d4dc8e0a2bffda78b698b2b57ed",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/src/topology.rs": {
+    "mtime": 1781257936.4154172,
+    "ast_hash": "0db8a1fa1e153b2aa36b14ec1f6ebab4",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/src/types.rs": {
+    "mtime": 1781335469.78048,
+    "ast_hash": "b251a91120cc35f2924c5c70bac211e4",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-common/src/version.rs": {
+    "mtime": 1781257936.4154172,
+    "ast_hash": "a4f154245ff73cf01a90f65b7b505b01",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-data/src/cache.rs": {
+    "mtime": 1781257936.417473,
+    "ast_hash": "46a6760c50fd9873fd25769f0dfb1939",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-data/src/disk.rs": {
+    "mtime": 1781257936.417473,
+    "ast_hash": "ee15b016f0928d96edcf92990c1eb0af",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-data/src/integrity.rs": {
+    "mtime": 1781257936.418471,
+    "ast_hash": "c98494bd69158ac016c42576bfbf7bcb",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-data/src/main.rs": {
+    "mtime": 1781341137.3357828,
+    "ast_hash": "fa74c8534cb4b5fb2613c9ccdaa88b34",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-data/src/memory.rs": {
+    "mtime": 1781257936.418471,
+    "ast_hash": "881cfa2cea785ab3e8f7288158e07d29",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-data/src/metrics.rs": {
+    "mtime": 1781343247.213473,
+    "ast_hash": "a47f2ef365ac4c5a9a3a81559d44f3df",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-data/src/replication.rs": {
+    "mtime": 1781335470.3530016,
+    "ast_hash": "2f86b854b813badd4a9293a6612ec41e",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-data/src/scrub.rs": {
+    "mtime": 1781257936.420014,
+    "ast_hash": "cc0845ce81fd9079fac997880ca3e97d",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-data/src/server.rs": {
+    "mtime": 1781340982.919967,
+    "ast_hash": "a09ea1cce59ccdb918a9162b1196a60e",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-data/src/shutdown.rs": {
+    "mtime": 1781257936.421019,
+    "ast_hash": "4eb80ba3f78d215ad989700a0161aa3b",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-data/src/store.rs": {
+    "mtime": 1781340982.9214826,
+    "ast_hash": "9ab73d00a10f12a3fd6c04ab9de2e7ee",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-data/tests/tls_loopback.rs": {
+    "mtime": 1781257936.422019,
+    "ast_hash": "773983b4911806cde15c9863c8d6bb9f",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-fuse/src/filesystem.rs": {
+    "mtime": 1781473557.2893636,
+    "ast_hash": "465ca920355136757aa53fcaa9df1705",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-fuse/src/fuse_adapter.rs": {
+    "mtime": 1781340919.1985424,
+    "ast_hash": "f3bfdb4ad189be199b1c174fe8f6ce71",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-fuse/src/local_cache.rs": {
+    "mtime": 1781257936.4241378,
+    "ast_hash": "f1204534d7241deb9586976cbaba2073",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-fuse/src/main.rs": {
+    "mtime": 1781257936.425139,
+    "ast_hash": "bc595180d60fbd8d865e1ce6201557df",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-fuse/src/migration.rs": {
+    "mtime": 1781257936.425139,
+    "ast_hash": "da0172a8c73104e91e9635178bc67f78",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-fuse/src/readahead.rs": {
+    "mtime": 1781335470.0885313,
+    "ast_hash": "9aa56ac5b90655a6cd8f9f08388d1c25",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-fuse/src/writebuf.rs": {
+    "mtime": 1781335469.983626,
+    "ast_hash": "262f90fb4775de6b8dd6c1f6d8d645c5",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/alerts.rs": {
+    "mtime": 1781257936.4271371,
+    "ast_hash": "a4894a135322ca2a0080dd6acba02f71",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/api.rs": {
+    "mtime": 1781449008.904497,
+    "ast_hash": "706a83c97c1466d1a83da3d6534cda74",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/audit.rs": {
+    "mtime": 1781257936.429707,
+    "ast_hash": "5e7fdb957a050d08fbdf57eb256beef2",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/cluster.rs": {
+    "mtime": 1781257936.4302275,
+    "ast_hash": "943fe4e681b6ee8323a8e70607d5d7b9",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/join.rs": {
+    "mtime": 1781340982.8137555,
+    "ast_hash": "177c3e1ae8dc5b87f656aac68a52ccc1",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/main.rs": {
+    "mtime": 1781340993.0173564,
+    "ast_hash": "05a28a80d751855d21c630164b94bccf",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/membership.rs": {
+    "mtime": 1781257936.4312315,
+    "ast_hash": "444feef313402a5b44b30d1c24a1b722",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/metadata.rs": {
+    "mtime": 1781340993.0183554,
+    "ast_hash": "3539018c53d4429213751acc7f919042",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/monitor.rs": {
+    "mtime": 1781340993.0183554,
+    "ast_hash": "1e72b6394dd9da8b4a3d63d2a7566f6c",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/placement.rs": {
+    "mtime": 1781257936.4322338,
+    "ast_hash": "3eee16a96f9541d2f28fc319a88dc6b7",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/placement_state.rs": {
+    "mtime": 1781257936.4332316,
+    "ast_hash": "570f1a960404b5cc0f4638be932a74b4",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/scheduler.rs": {
+    "mtime": 1781344929.4251988,
+    "ast_hash": "974b28a102771cf5937e3ac45bba5b12",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/server.rs": {
+    "mtime": 1781257936.4342313,
+    "ast_hash": "29707ef7bbe9ebccf47ed54e376ac768",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/shutdown.rs": {
+    "mtime": 1781257936.4352326,
+    "ast_hash": "32ed6280c62981de5d2564a04e0d501f",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/tiering.rs": {
+    "mtime": 1781344929.4261994,
+    "ast_hash": "90978243b953a945b983df70ae3f1de1",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-manager/src/webui.rs": {
+    "mtime": 1781257936.4362316,
+    "ast_hash": "e340c86cb15280160b6d1b693eb570d5",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-proto/build.rs": {
+    "mtime": 1781257936.4382353,
+    "ast_hash": "6a3b900c4fc46ca7b7d383fff4b5c872",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-proto/src/lib.rs": {
+    "mtime": 1781257936.4392357,
+    "ast_hash": "788f4b3b8a419199bb9f938e1b3abbaf",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-raft/src/lib.rs": {
+    "mtime": 1781340917.530748,
+    "ast_hash": "ff8f24bbcb5da1f8291f813dae023f9e",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-raft/src/log_store.rs": {
+    "mtime": 1781335470.742635,
+    "ast_hash": "e6f845fdc18e5c83169cc19dd0675fc6",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-raft/src/network.rs": {
+    "mtime": 1781340919.0866,
+    "ast_hash": "87a89fd5077187e3d0e00cd4ac2c3d06",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-raft/src/snapshot.rs": {
+    "mtime": 1781335469.7864804,
+    "ast_hash": "ede1904c667201e3ff2434b4ace3a845",
+    "semantic_hash": ""
+  },
+  "crates/dtfs-raft/src/state_machine.rs": {
+    "mtime": 1781443230.7169502,
+    "ast_hash": "b49b84acd35b52d611b8e0312478e9b5",
+    "semantic_hash": ""
+  },
+  "scripts/build-docs.sh": {
+    "mtime": 1781257936.4814858,
+    "ast_hash": "02d73fb0d526cb052f61eb8e3a263c33",
+    "semantic_hash": ""
+  },
+  "scripts/build-linux-amd64.sh": {
+    "mtime": 1781257936.4814858,
+    "ast_hash": "7b267197fbcbb7a532aba6572b55b955",
+    "semantic_hash": ""
+  },
+  "scripts/dtfs-build.sh": {
+    "mtime": 1781257936.4824858,
+    "ast_hash": "3597f42255c59bf73255e8bfee6a5b9e",
+    "semantic_hash": ""
+  },
+  "scripts/dtfs-install.sh": {
+    "mtime": 1781257936.48299,
+    "ast_hash": "e8b03f4a88b100ecaaa45d226c701eba",
+    "semantic_hash": ""
+  },
+  "scripts/dtfs-release.sh": {
+    "mtime": 1781257936.48299,
+    "ast_hash": "933c361c1fa0d095a6828987a1828457",
+    "semantic_hash": ""
+  },
+  "scripts/dtfs-update.sh": {
+    "mtime": 1781257936.4839952,
+    "ast_hash": "608678fced4b30b0386d07c6d79112bc",
+    "semantic_hash": ""
+  },
+  "scripts/tests/test-build-date-fresh.sh": {
+    "mtime": 1781257936.4839952,
+    "ast_hash": "9e39627d24b201c51fef1171037572a7",
+    "semantic_hash": ""
+  },
+  "scripts/tests/test-dtfs-install.sh": {
+    "mtime": 1781257936.4851248,
+    "ast_hash": "06dad0b8aefeeb11ddd390aa044c1d5f",
+    "semantic_hash": ""
+  },
+  "scripts/tests/test-release-version-stamp.sh": {
+    "mtime": 1781257936.4851248,
+    "ast_hash": "dc9e1b1973b24418c36c2aeed5386c6c",
+    "semantic_hash": ""
+  },
+  "scripts/tests/test-scripts.sh": {
+    "mtime": 1781257936.4861252,
+    "ast_hash": "33a6a26a892994ff407a6b4565665990",
+    "semantic_hash": ""
+  },
+  "tests/integration/01_basic_io.sh": {
+    "mtime": 1781257936.5001318,
+    "ast_hash": "34ba8f6b61c2de4411aff38c5b4e36fe",
+    "semantic_hash": ""
+  },
+  "tests/integration/02_replication.sh": {
+    "mtime": 1781257936.501132,
+    "ast_hash": "6ebf0f8408d5f5cff89319673fd1563e",
+    "semantic_hash": ""
+  },
+  "tests/integration/03_network_disconnect.sh": {
+    "mtime": 1781257936.501132,
+    "ast_hash": "afb2d32de7647c51bcd53b9db48fdbe7",
+    "semantic_hash": ""
+  },
+  "tests/integration/04_service_crash.sh": {
+    "mtime": 1781257936.501132,
+    "ast_hash": "0d2ba46bd9a558edc041d58963e89f81",
+    "semantic_hash": ""
+  },
+  "tests/integration/05_disk_failure.sh": {
+    "mtime": 1781257936.5021305,
+    "ast_hash": "7e9bf788d71d72d189f38d6dc979d377",
+    "semantic_hash": ""
+  },
+  "tests/integration/06_reconnect.sh": {
+    "mtime": 1781257936.5021305,
+    "ast_hash": "212506fe6b46eb44c9b771ff9b887f44",
+    "semantic_hash": ""
+  },
+  "tests/integration/07_election_quorum.sh": {
+    "mtime": 1781257936.5021305,
+    "ast_hash": "0c91247516abc3ced7252739206a8c3d",
+    "semantic_hash": ""
+  },
+  "tests/integration/08_client_reconnect.sh": {
+    "mtime": 1781257936.5031288,
+    "ast_hash": "ca4c2a95a300d5cac2649d15bb954220",
+    "semantic_hash": ""
+  },
+  "tests/integration/09_tiering.sh": {
+    "mtime": 1781257936.5031288,
+    "ast_hash": "b48b9cecfd0ab96b1b846fcf788da8b2",
+    "semantic_hash": ""
+  },
+  "tests/integration/10_scrub.sh": {
+    "mtime": 1781257936.5031288,
+    "ast_hash": "7d181bf25ca9cd98cd97cd7ac56ea540",
+    "semantic_hash": ""
+  },
+  "tests/integration/11_feature_validation.sh": {
+    "mtime": 1781257936.5042574,
+    "ast_hash": "96388bdb51bc4faa8f21c7d6dabee995",
+    "semantic_hash": ""
+  },
+  "tests/integration/lib/common.sh": {
+    "mtime": 1781257936.505257,
+    "ast_hash": "bd58253cfb4cec691286d828d7bcc382",
+    "semantic_hash": ""
+  },
+  "tests/integration/run_all.sh": {
+    "mtime": 1781257936.505257,
+    "ast_hash": "645477b944ef075dacbe9aecf28e8a13",
+    "semantic_hash": ""
+  },
+  "tests/performance/bench_cross_dc.sh": {
+    "mtime": 1781257936.50626,
+    "ast_hash": "588384a4629c19f64b0e0338685440d6",
+    "semantic_hash": ""
+  },
+  "tests/performance/bench_random_read.sh": {
+    "mtime": 1781257936.50626,
+    "ast_hash": "28f7fd4128d953a1cc8bfa2e466b235a",
+    "semantic_hash": ""
+  },
+  "tests/performance/bench_random_write.sh": {
+    "mtime": 1781257936.50626,
+    "ast_hash": "0f682e2ae29ce849b7d5b82eed0447b9",
+    "semantic_hash": ""
+  },
+  "tests/performance/bench_sequential_read.sh": {
+    "mtime": 1781257936.5072575,
+    "ast_hash": "9f77ad0573f9c5c2c43561db7ee38da0",
+    "semantic_hash": ""
+  },
+  "tests/performance/bench_sequential_write.sh": {
+    "mtime": 1781257936.5072575,
+    "ast_hash": "9ee323181659b3c8260804d62c782106",
+    "semantic_hash": ""
+  },
+  "tests/performance/lib/common.sh": {
+    "mtime": 1781257936.5082593,
+    "ast_hash": "de3b290a54ca270a2af9123e74df445c",
+    "semantic_hash": ""
+  },
+  "tests/performance/run_all.sh": {
+    "mtime": 1781257936.5082593,
+    "ast_hash": "f7e3fabf68eedefbf89fbc4dc5d38e22",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/01-sanity.sh": {
+    "mtime": 1781257936.5092583,
+    "ast_hash": "7129e2e893d13404bb0c6aa92a3b7037",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/02-fuse-ops.sh": {
+    "mtime": 1781257936.5092583,
+    "ast_hash": "e5727dcc5f1074ce3f29bf216e875459",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/03-many-files.sh": {
+    "mtime": 1781257936.5092583,
+    "ast_hash": "3984050d0124eb41aee13e873e764571",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/04-concurrency.sh": {
+    "mtime": 1781257936.510259,
+    "ast_hash": "5e43fb5fdfb878ead41454903b9f4232",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/05-data-node-chaos.sh": {
+    "mtime": 1781257936.510259,
+    "ast_hash": "b044d631a372ac0d619f9f9a78949203",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/06-manager-chaos.sh": {
+    "mtime": 1781257936.510259,
+    "ast_hash": "9220478a0c63182979d9a33addf860d1",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/07-corruption.sh": {
+    "mtime": 1781257936.5112574,
+    "ast_hash": "39be422276484bf0318a018e982522f0",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/08-disk-full.sh": {
+    "mtime": 1781257936.5112574,
+    "ast_hash": "1c0d57cfd79e76aac5561d5d3ace3b97",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/09-path-edges.sh": {
+    "mtime": 1781257936.5112574,
+    "ast_hash": "6b6b083b8ddbf82683d694424d591a20",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/10-soak.sh": {
+    "mtime": 1781257936.512258,
+    "ast_hash": "bcfa4d92def6998538225f86a1921f3e",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/12-fuse-restart-after-crash.sh": {
+    "mtime": 1781257936.512258,
+    "ast_hash": "415ec79573c941e17ed084c1da5038dd",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/15-bug-av-cache-lifecycle.sh": {
+    "mtime": 1781257936.512258,
+    "ast_hash": "c5174cb1bb48c1300c47e3e027776266",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/16-bug-az-chunk-size-shrink.sh": {
+    "mtime": 1781257936.512258,
+    "ast_hash": "b499c72e7b18d09ba872f1707d54300a",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/17-bug-ba-soak.sh": {
+    "mtime": 1781257936.5137632,
+    "ast_hash": "38559f4d79b477c2a19656a73462744f",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/18-bug-bc-bitrot.sh": {
+    "mtime": 1781257936.5137632,
+    "ast_hash": "7e9cd0cc972e066024b36ccac06eb533",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/19-bug-bh-anchor-multitier.sh": {
+    "mtime": 1781257936.5137632,
+    "ast_hash": "62c4c5ffcbcec1f6628d1c3bcf3a4b70",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/20-bug-bl-heartbeat-nonleader.sh": {
+    "mtime": 1781257936.514771,
+    "ast_hash": "af0f6b911fcc592c3616c8d9727bf021",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/chunk-size-stats.sh": {
+    "mtime": 1781257936.514771,
+    "ast_hash": "2880d61c3ba32101b74a4e84afaba472",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/harness.sh": {
+    "mtime": 1781257936.514771,
+    "ast_hash": "7eb9681a5a667b437d52e0006b2bb18d",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/raft-stress.sh": {
+    "mtime": 1781257936.515769,
+    "ast_hash": "a5f9187864325c7657ddc16f0fed9d16",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/run-all.sh": {
+    "mtime": 1781257936.5162752,
+    "ast_hash": "546036f670cefabd8e3cd6a5e85f8bf0",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/deploy-mini.sh": {
+    "mtime": 1781455742.819121,
+    "ast_hash": "bbedcaf579a415562ee3934094478676",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/inventory-3dc.json": {
+    "mtime": 1781257936.52843,
+    "ast_hash": "8db9344da555170e79f8a38af9663e3b",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/inventory-mini.json": {
+    "mtime": 1781444299.4565313,
+    "ast_hash": "22f75dcb6568b33b40980f2cbac44f92",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/inventory-plexmedia.json": {
+    "mtime": 1781257936.5294306,
+    "ast_hash": "14f6610a030d5418303c43f0cd370fe1",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/inventory.json": {
+    "mtime": 1781257936.5304348,
+    "ast_hash": "4f4d2419d9005f2652addbefaa450898",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/node-stats.sh": {
+    "mtime": 1781257936.5304348,
+    "ast_hash": "7747f5574580311a0b32d43bc417ae7a",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/provision-3dc-continue.ps1": {
+    "mtime": 1781257936.5304348,
+    "ast_hash": "92ceb1477109bca21df905c4b3bf0a65",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/provision-3dc.ps1": {
+    "mtime": 1781257936.5314364,
+    "ast_hash": "fb9674610184a77e0978534bba16229c",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/provision-mini.sh": {
+    "mtime": 1781257936.5314364,
+    "ast_hash": "835f700c42acc58af177b2d013f4d459",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/provision-plexmedia.ps1": {
+    "mtime": 1781257936.5314364,
+    "ast_hash": "23b3fa32f00eb96f085fed7dbf92b059",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/pve-chaos.ps1": {
+    "mtime": 1781257936.532434,
+    "ast_hash": "8ad8faa66bcb1d83c5e8f69326b97165",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/pve.ps1": {
+    "mtime": 1781257936.532434,
+    "ast_hash": "030984a2939554f97e1b861aecda7c3a",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/bootstrap-cluster.sh": {
+    "mtime": 1781257936.5334349,
+    "ast_hash": "5e04637142e9b2fac0ec9edb637cc543",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/collect-metrics.py": {
+    "mtime": 1781257936.5334349,
+    "ast_hash": "43f72b746381fd2e596230a797cf790c",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/compute-baseline.sh": {
+    "mtime": 1781257936.5344348,
+    "ast_hash": "16ffdb6568f538179e13467d84d9f163",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/render-report.py": {
+    "mtime": 1781257936.5344348,
+    "ast_hash": "638731a92f5828438f42f3e83b1d87fe",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/run-plexmedia.sh": {
+    "mtime": 1781257936.5354345,
+    "ast_hash": "d67649d6c2aced7928aef5e3e932f136",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/run-soak.sh": {
+    "mtime": 1781257936.5354345,
+    "ast_hash": "b3f78904a0b7c99d3d6eaf2d8baf9fd6",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S01-baseline-write.sh": {
+    "mtime": 1781257936.5364347,
+    "ast_hash": "9f41891f354873068014ecc79bf88fe5",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S02-baseline-read-a.sh": {
+    "mtime": 1781257936.5364347,
+    "ast_hash": "4f8f7a51cbc9b5603dbba3ac1c1c4fc9",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S03-baseline-read-c.sh": {
+    "mtime": 1781257936.5364347,
+    "ast_hash": "28f34376573cc0a415c5ef7e2db85ae7",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S04-folder-readahead.sh": {
+    "mtime": 1781257936.537434,
+    "ast_hash": "0298601344052d7b12dee556e429c931",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S06-tier-promote.sh": {
+    "mtime": 1781257936.537434,
+    "ast_hash": "1ad11a68f1413c2e16723b35e1b2dfbe",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S07-tier-demote.sh": {
+    "mtime": 1781257936.5384386,
+    "ast_hash": "d6b5ba9484f3d8b298bfb573257c4eb8",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S08-anchor-protect.sh": {
+    "mtime": 1781257936.5384386,
+    "ast_hash": "4746983422c880720a7940a74cb13086",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S09-replica-fallback.sh": {
+    "mtime": 1781257936.5384386,
+    "ast_hash": "e61f8d809f922955e84a13ea6f07e91a",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S10-lease-busy.sh": {
+    "mtime": 1781257936.5384386,
+    "ast_hash": "91b15a056e310dd044e445a7fd239708",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S13-partition-dc-a.sh": {
+    "mtime": 1781257936.5399969,
+    "ast_hash": "0b4a9eddae1958b7c4cb6e66ccb77ed8",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S14-disk-full.sh": {
+    "mtime": 1781257936.5399969,
+    "ast_hash": "c9c53b90ed26f65d7251361d46aac163",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S15-scrub-corruption.sh": {
+    "mtime": 1781257936.5399969,
+    "ast_hash": "bf58fc932dd587e9a1eca87dbd430c5c",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S16-clock-skew.sh": {
+    "mtime": 1781257936.5399969,
+    "ast_hash": "134853de17f0949a66adae9ad4c76248",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S17-rolling-mgr-restart.sh": {
+    "mtime": 1781257936.541005,
+    "ast_hash": "20941a55e74de06a1e8fbb42a19d6dc4",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S20-cross-dc-streaming.sh": {
+    "mtime": 1781257936.541005,
+    "ast_hash": "63c1fddc565626c680dbb6d29c337fcc",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S24-anchor-violation-webhook.sh": {
+    "mtime": 1781257936.541005,
+    "ast_hash": "e496262d35f624b77e7eee0edec0ee47",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S25-graceful-decommission.sh": {
+    "mtime": 1781257936.5420048,
+    "ast_hash": "639f4e2a45d633d3bd82ad6046f86d6c",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S26-backup-mid-soak.sh": {
+    "mtime": 1781257936.5420048,
+    "ast_hash": "b5ecbe46c290759f3d707b1447157f98",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S27-cert-rotation.sh": {
+    "mtime": 1781257936.5430048,
+    "ast_hash": "fdcd361e18ec8182b4d23dd4ad296f32",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/S28-smart-degrade.sh": {
+    "mtime": 1781257936.5430048,
+    "ast_hash": "7c06df0e129adfbbcda2d40581edada8",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/_stub.sh": {
+    "mtime": 1781257936.5430048,
+    "ast_hash": "be76909bf8a8636a7a0eeb78bfa1c1a4",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/scenarios/post-verify-blake3.sh": {
+    "mtime": 1781257936.5440047,
+    "ast_hash": "e4e7fbb346cdb817cb0b8f2e5aeaf7f5",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/smoke.sh": {
+    "mtime": 1781257936.5440047,
+    "ast_hash": "41df882893f0bd021125854e2c41d868",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/workloads/playback-client-a.sh": {
+    "mtime": 1781257936.5440047,
+    "ast_hash": "ade68bdf902c104a5b5eca6b0281e50a",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/workloads/playback-client-b.sh": {
+    "mtime": 1781257936.5451477,
+    "ast_hash": "c32fb2b123686b3c57c263d57974052b",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/workloads/playback-client-c.sh": {
+    "mtime": 1781257936.5451477,
+    "ast_hash": "b7a993cc22fed0a74790ae8abe41077e",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/sqlite/01-coherency.sh": {
+    "mtime": 1781257936.5451477,
+    "ast_hash": "533ed8cb37556213bd788d573ff7feec",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/sqlite/02-single-process.sh": {
+    "mtime": 1781257936.5461557,
+    "ast_hash": "7f48f83cbb208987c152358d044079bc",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/sqlite/03-journal-modes.sh": {
+    "mtime": 1781257936.5461557,
+    "ast_hash": "8316916c26a0fe40eea888d7a1b9a0bc",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/sqlite/04-concurrent-noretry.sh": {
+    "mtime": 1781257936.5461557,
+    "ast_hash": "d2198bf1595d903cb932afab92f130ec",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/sqlite/05-concurrent-with-timeout.sh": {
+    "mtime": 1781257936.5471566,
+    "ast_hash": "cf5d88456641482f7e1739ae46c607b5",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/verify-fixes.sh": {
+    "mtime": 1781257936.5471566,
+    "ast_hash": "4dee5fdace1126b4b054775d466d89e8",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/00-prereqs.sh": {
+    "mtime": 1781257936.5481565,
+    "ast_hash": "07936497b869bf31375cc4e95c05c123",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/01-basic-write-read.sh": {
+    "mtime": 1781257936.5481565,
+    "ast_hash": "50ad76d4b010c1893b2bbf81e770744d",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/02-replica-placement.sh": {
+    "mtime": 1781257936.5481565,
+    "ast_hash": "d836f1d0008a2c3d6d70729f5ee2d89d",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/03-scrub-quick.sh": {
+    "mtime": 1781257936.549156,
+    "ast_hash": "d299e55291301d238842259ddb52ea8f",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/04-scrub-deep.sh": {
+    "mtime": 1781257936.549156,
+    "ast_hash": "847f8b630a487d3353064bcf5a285704",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/05-migration.sh": {
+    "mtime": 1781257936.549156,
+    "ast_hash": "e8d768a4ef663a23f6bd16660f895f9f",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/06-flush-cache.sh": {
+    "mtime": 1781257936.5501523,
+    "ast_hash": "10dd2c217b2df1222aa5c95cdb37d7c7",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/07-set-schedules.sh": {
+    "mtime": 1781257936.5501523,
+    "ast_hash": "1674d96fe23c5208b99651b43b5c1942",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/08-set-anchor.sh": {
+    "mtime": 1781257936.5501523,
+    "ast_hash": "15c555ef3b5ace6c58ccaefec82ce69d",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/09-set-mandatory.sh": {
+    "mtime": 1781257936.5501523,
+    "ast_hash": "aee7feda35023c28e7258f55bf07b431",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/10-leader-rotation.sh": {
+    "mtime": 1781257936.5511515,
+    "ast_hash": "e9eb8a0b71e8fd4d9c73538fc87120dc",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/11-data-node-restart.sh": {
+    "mtime": 1781257936.5511515,
+    "ast_hash": "ccda9f34948b33a5e007c48be500f207",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/12-fuse-restart.sh": {
+    "mtime": 1781257936.5511515,
+    "ast_hash": "759abbd0de5e0af41f6ca2aad72557a3",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/13-integrity-corruption.sh": {
+    "mtime": 1781257936.5521529,
+    "ast_hash": "ee5e06e130be923011a34a63dcb02dec",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/14-orphan-reap.sh": {
+    "mtime": 1781257936.5521529,
+    "ast_hash": "6ceef6b881cf80b3efc525c07791d94c",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/15-soak-15min.sh": {
+    "mtime": 1781257936.553152,
+    "ast_hash": "862ef5545ab0df6c41f839cf719e558c",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/16-version-report.sh": {
+    "mtime": 1781257936.553152,
+    "ast_hash": "eaa8c4427d9dbb6c34b213d0c7418ac7",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/17-stats-correctness.sh": {
+    "mtime": 1781257936.553152,
+    "ast_hash": "b5bbd029c4683b4569b85365c2f78d27",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/18-api-shape.sh": {
+    "mtime": 1781257936.5541537,
+    "ast_hash": "4ff5b5eeefa6998e15b25ec041a60de1",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/19-config-effective.sh": {
+    "mtime": 1781257936.5541537,
+    "ast_hash": "50ea11c2ffd6720b5acdbd6c01f6e82e",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/20-quarantine-flow.sh": {
+    "mtime": 1781257936.5541537,
+    "ast_hash": "2a4f53c01eabe5fca8c70a3b7c8df0ee",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/21-anchor-lag-repair-converges.sh": {
+    "mtime": 1781257936.5541537,
+    "ast_hash": "25466c38cdecc20bc6cb98f69639da0e",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/22-register-audit-idempotent.sh": {
+    "mtime": 1781257936.5551522,
+    "ast_hash": "0e5892d4c25a27a61dbb0b7589e6caa0",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/23-scrub-quick-deep-listed.sh": {
+    "mtime": 1781257936.5551522,
+    "ast_hash": "5b9c917e697118a2f110c672441d67d5",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/24-heartbeat-nonleader-forward.sh": {
+    "mtime": 1781257936.5561564,
+    "ast_hash": "bab5958918de65b9453ab77c583c942d",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/25-tape-constraint-rejected.sh": {
+    "mtime": 1781257936.5561564,
+    "ast_hash": "1ec97136686734667e4480183d5fb564",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/26-disk-uuid-stable.sh": {
+    "mtime": 1781257936.5561564,
+    "ast_hash": "613bc9fd3ff0e0df09ea0b41e6ce037d",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/27-heartbeat-audit-suppressed.sh": {
+    "mtime": 1781257936.5571558,
+    "ast_hash": "11a0c5fbf4a70adade7cf2e59a607c33",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/28-anchor-lag-no-loop.sh": {
+    "mtime": 1781257936.5571558,
+    "ast_hash": "b4703afb50351c0f909f95b144bdb88c",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/29-raft-storage-bounded.sh": {
+    "mtime": 1781257936.5571558,
+    "ast_hash": "a8df7aad130042947facab297bdabbdb",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/30-stale-liveness-downgrade.sh": {
+    "mtime": 1781257936.5581577,
+    "ast_hash": "3e55bbe61f195636a3b0842a2c69b03e",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/31-stats-tier-usage-fidelity.sh": {
+    "mtime": 1781257936.5581577,
+    "ast_hash": "bb00156a2207d39719b9e5b31f625c4e",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/32-client-liveness.sh": {
+    "mtime": 1781257936.5581577,
+    "ast_hash": "007caf4eecf992b4b73a6fcb5ab6ec38",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/33-manager-version-visible.sh": {
+    "mtime": 1781257936.5591557,
+    "ast_hash": "39c839630cc62023d9ad5dedadbe7025",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/34-write-fallback-disk-full.sh": {
+    "mtime": 1781257936.5591557,
+    "ast_hash": "0c670351aef76e616c67fd19f663f28a",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/35-cluster-counts-anchor-pending.sh": {
+    "mtime": 1781257936.5601575,
+    "ast_hash": "f804a980249d4925a254d15cedaf0538",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/36-placement-distribution.sh": {
+    "mtime": 1781257936.5601575,
+    "ast_hash": "2d5c6dbacb7d9a56bf87ba0047757e45",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/37-spill-rebalance.sh": {
+    "mtime": 1781257936.561156,
+    "ast_hash": "e6f924473ff1dfd977ff398e4a39b4aa",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/38-multichunk-integrity.sh": {
+    "mtime": 1781257936.561156,
+    "ast_hash": "3c40d9f4811f901d47b3da60cb8980fe",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/39-webui-replica-and-placement.sh": {
+    "mtime": 1781257936.561156,
+    "ast_hash": "06d1f36a31ba9d4a8248dfcb1b235ee4",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/40-readahead-read-no-oom.sh": {
+    "mtime": 1781257936.561156,
+    "ast_hash": "4e85cd3010be3962f4c00b948ac76825",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/40-scrub-report.sh": {
+    "mtime": 1781257936.5621555,
+    "ast_hash": "aad3a14be79d7c020fceab2c7242ecda",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/41-lease-release-spares-live-writer.sh": {
+    "mtime": 1781257936.5621555,
+    "ast_hash": "6d15264e55974c789fd5bf5f75486e9f",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/41-spill-policy.sh": {
+    "mtime": 1781257936.563156,
+    "ast_hash": "42d5474b318c4445ddd9228b967eef26",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/42-crossdc-read-routing.sh": {
+    "mtime": 1781257936.563156,
+    "ast_hash": "3190c1b53bd251b6d88183495f7e0ab3",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/42-updater-local-install.sh": {
+    "mtime": 1781257936.563156,
+    "ast_hash": "925cfd01ff971f2ddc9b37d933b3ead3",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/43-dc-poweroff-read-continuity.sh": {
+    "mtime": 1781257936.563156,
+    "ast_hash": "ae96c3d8e2ab211d144c6bb78e1b1d0f",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/44-dc-poweron-recovery-converge.sh": {
+    "mtime": 1781257936.5642717,
+    "ast_hash": "e4daa38182f7971260b7eebb1ade3b30",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/45-disk-failure-and-backfill.sh": {
+    "mtime": 1781257936.5642717,
+    "ast_hash": "45db2ebdbdd9ed208b7de0e9108b93a4",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/46-autobalance-convergence.sh": {
+    "mtime": 1781448755.0974622,
+    "ast_hash": "98b50efe9b243653a676fb4f428ddca6",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/47-cache-perdc-promote-demote.sh": {
+    "mtime": 1781448755.1612074,
+    "ast_hash": "3153909fc1059dc7fa95862630424920",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/48-crossdc-read-under-shaping.sh": {
+    "mtime": 1781448755.2337108,
+    "ast_hash": "1489a0177c2a95025105559cdc223a59",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/49-delete-fanout-reclaims.sh": {
+    "mtime": 1781257936.5662692,
+    "ast_hash": "5412aff54be81889a94c74574019fcef",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/49-write-during-leader-restart.sh": {
+    "mtime": 1781257936.5662692,
+    "ast_hash": "83b435810135d4159ae7ede26d167350",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/50-raft-add-learner.sh": {
+    "mtime": 1781257936.5662692,
+    "ast_hash": "9e3c9ca719a56804936af9a249893542",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/51-audit-limit-ordering.sh": {
+    "mtime": 1781257936.5672696,
+    "ast_hash": "bc3da7e9818386695e06bec6f328b0c1",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/52-delete-fanout-audit.sh": {
+    "mtime": 1781257936.5672696,
+    "ast_hash": "37e5cad5a5f7736302b7327cf5f59e5d",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/53-set-write-safety.sh": {
+    "mtime": 1781257936.5672696,
+    "ast_hash": "50d6c1010261fe76993bbef03992fae9",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/54-write-ack-floor.sh": {
+    "mtime": 1781257936.5672696,
+    "ast_hash": "ed2492043780c0f14cde8946e073c23b",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/55-node-down-no-task-storm.sh": {
+    "mtime": 1781257936.5682702,
+    "ast_hash": "32f96bbb6a0322d822974d93ea2559f0",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/56-unlink-shared-content-survives.sh": {
+    "mtime": 1781257936.5682702,
+    "ast_hash": "9efed8431b7d5fca656f249e818b2764",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/57-config-readback.sh": {
+    "mtime": 1781257936.5692704,
+    "ast_hash": "088b98863d90d21aeb9d072c72daa8c5",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/57-getchunk-streaming.sh": {
+    "mtime": 1781257936.5692704,
+    "ast_hash": "e56d651a9bfa6fee470db1f4a013df46",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/58-backfill-incremental.sh": {
+    "mtime": 1781257936.5696661,
+    "ast_hash": "1fdfe426f2d7e13de85973c9e73614b1",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/59-read-priority-routing.sh": {
+    "mtime": 1781257936.5699844,
+    "ast_hash": "0cb8f46834f8a4975be9589cb6af0685",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/60-monitor-leader-gate-no-flap.sh": {
+    "mtime": 1781257936.5699844,
+    "ast_hash": "b06ce06b8f4a2e9a12b137d4281a3690",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/61-scheduler-backlog-drains.sh": {
+    "mtime": 1781257936.5706675,
+    "ast_hash": "49079a146692ba1cca78493f7c280dae",
+    "semantic_hash": ""
+  },
+  "tests/release/lib/common.sh": {
+    "mtime": 1781257936.5706675,
+    "ast_hash": "9f0d3bf94f581f458e08e7466c18cd3a",
+    "semantic_hash": ""
+  },
+  "tests/release/lib/dc.sh": {
+    "mtime": 1781257936.5716724,
+    "ast_hash": "d03223d06244519f51233a2ba70dc7e4",
+    "semantic_hash": ""
+  },
+  "tests/release/lib/fixtures.sh": {
+    "mtime": 1781257936.5716724,
+    "ast_hash": "75c668394f3e14019f114eba7f14d05e",
+    "semantic_hash": ""
+  },
+  "tests/release/lib/health.sh": {
+    "mtime": 1781257936.5716724,
+    "ast_hash": "11794ccf99a5044a4b97e2927ca367d0",
+    "semantic_hash": ""
+  },
+  "tests/release/lib/lifecycle.sh": {
+    "mtime": 1781257936.5716724,
+    "ast_hash": "4c4ae0d836f859c4dc3ec1812c327134",
+    "semantic_hash": ""
+  },
+  "tests/release/lib/pve.sh": {
+    "mtime": 1781257936.572672,
+    "ast_hash": "b108297340262759c6194532cf2b3dfd",
+    "semantic_hash": ""
+  },
+  "tests/release/patch.py": {
+    "mtime": 1781257936.572672,
+    "ast_hash": "28cf40f459202fe4f39973917fcd7bd3",
+    "semantic_hash": ""
+  },
+  "tests/release/run.sh": {
+    "mtime": 1781257936.5736716,
+    "ast_hash": "7ff6f484f7d358bfd04bd2923aa63c42",
+    "semantic_hash": ""
+  },
+  ".claude/skills/dtfs-proactive-issue-finder/SKILL.md": {
+    "mtime": 1781257936.4007094,
+    "ast_hash": "e3c1b05aeb1634246f648aea82bca6a8",
+    "semantic_hash": ""
+  },
+  ".claude/skills/dtfs-proactive-issue-finder/references/cluster-surfaces.md": {
+    "mtime": 1781257936.4007094,
+    "ast_hash": "9e8e35c8f4ab56556bfaf9d283822d44",
+    "semantic_hash": ""
+  },
+  ".github/release.yml": {
+    "mtime": 1781257936.4027102,
+    "ast_hash": "64e13bc7fdc77abaef24cce5f59b9ca6",
+    "semantic_hash": ""
+  },
+  "AGENTS.md": {
+    "mtime": 1781443080.7267041,
+    "ast_hash": "3104d84700013b322f3dab1603c8fb50",
+    "semantic_hash": ""
+  },
+  "CLAUDE.md": {
+    "mtime": 1781257936.4037094,
+    "ast_hash": "771faa62feb60b7de901a397aebb29b0",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1781257936.4058409,
+    "ast_hash": "471b70fe5336e49a039e613a3ecb454a",
+    "semantic_hash": ""
+  },
+  "deploy/docker-compose.yml": {
+    "mtime": 1781257936.4468906,
+    "ast_hash": "950b9485500bce874674ccb200569141",
+    "semantic_hash": ""
+  },
+  "docs/src/SUMMARY.md": {
+    "mtime": 1781257936.4513955,
+    "ast_hash": "372079e9c0d7e26be17c928cf8a81a7a",
+    "semantic_hash": ""
+  },
+  "docs/src/access/fuse-mount.md": {
+    "mtime": 1781257936.4513955,
+    "ast_hash": "35d4c38a5e056caebf198a813043c2d5",
+    "semantic_hash": ""
+  },
+  "docs/src/access/partition-behavior.md": {
+    "mtime": 1781257936.4524007,
+    "ast_hash": "e5836651cd656462a70ea6d3cd490d69",
+    "semantic_hash": ""
+  },
+  "docs/src/access/read-ahead.md": {
+    "mtime": 1781257936.4524007,
+    "ast_hash": "2534b9e5a92ec11e88b4b96a4982c060",
+    "semantic_hash": ""
+  },
+  "docs/src/api-reference/cli-reference.md": {
+    "mtime": 1781257936.4534,
+    "ast_hash": "73a7ac03ad823ce5c2e1d8ec8e90305f",
+    "semantic_hash": ""
+  },
+  "docs/src/api-reference/grpc-api.md": {
+    "mtime": 1781340917.5321105,
+    "ast_hash": "d6362aee81b4e935fcc484abfd652857",
+    "semantic_hash": ""
+  },
+  "docs/src/api-reference/rest-api.md": {
+    "mtime": 1781257936.4544003,
+    "ast_hash": "243a287d5d993d31f0286e4d80324213",
+    "semantic_hash": ""
+  },
+  "docs/src/architecture/consensus.md": {
+    "mtime": 1781257936.4544003,
+    "ast_hash": "c6fdc9cdacf66ed63d1c2ea437049db1",
+    "semantic_hash": ""
+  },
+  "docs/src/architecture/data-distribution.md": {
+    "mtime": 1781257936.4554005,
+    "ast_hash": "efd0d6b6139f9865de0db038c08dff1c",
+    "semantic_hash": ""
+  },
+  "docs/src/architecture/data-flow.md": {
+    "mtime": 1781257936.4554005,
+    "ast_hash": "5379595314a08b95ed02b32b37e9a62a",
+    "semantic_hash": ""
+  },
+  "docs/src/architecture/overview.md": {
+    "mtime": 1781257936.4564002,
+    "ast_hash": "b78d0b88efa381335326dab21d1fc5e5",
+    "semantic_hash": ""
+  },
+  "docs/src/configuration/cluster-config.md": {
+    "mtime": 1781257936.4564002,
+    "ast_hash": "371028cd111a3e289fc061231ce966a3",
+    "semantic_hash": ""
+  },
+  "docs/src/configuration/data-node.md": {
+    "mtime": 1781257936.4564002,
+    "ast_hash": "e7a88018b7cf9dcab959803cd687c3a5",
+    "semantic_hash": ""
+  },
+  "docs/src/configuration/fuse-client.md": {
+    "mtime": 1781473557.2908678,
+    "ast_hash": "54c0809538c720d99a9c786a0edab48d",
+    "semantic_hash": ""
+  },
+  "docs/src/configuration/live-reload.md": {
+    "mtime": 1781257936.4574,
+    "ast_hash": "3b0a912f8937be63095e7adbebf20959",
+    "semantic_hash": ""
+  },
+  "docs/src/configuration/manager.md": {
+    "mtime": 1781257936.4584014,
+    "ast_hash": "c150e3a14e4fd725f93b895bbbff0c53",
+    "semantic_hash": ""
+  },
+  "docs/src/configuration/scope.md": {
+    "mtime": 1781257936.4584014,
+    "ast_hash": "93ace9588513cdd1cadaf9c9f8b87f06",
+    "semantic_hash": ""
+  },
+  "docs/src/configuration/volume-config.md": {
+    "mtime": 1781257936.4594007,
+    "ast_hash": "3cc5c7dc0ec74ed1857215a7991b8a71",
+    "semantic_hash": ""
+  },
+  "docs/src/development/building.md": {
+    "mtime": 1781257936.4594007,
+    "ast_hash": "0d530fd7b54d0511e3de2ce09a60e531",
+    "semantic_hash": ""
+  },
+  "docs/src/development/contributing.md": {
+    "mtime": 1781257936.4594007,
+    "ast_hash": "72b87a9a006ef3694b4e6380b6e464af",
+    "semantic_hash": ""
+  },
+  "docs/src/development/testing.md": {
+    "mtime": 1781257936.4604018,
+    "ast_hash": "044adcd766e2ebb81624874e2804cfed",
+    "semantic_hash": ""
+  },
+  "docs/src/getting-started/first-cluster.md": {
+    "mtime": 1781257936.461401,
+    "ast_hash": "4637adafb272fe58cd2fdee795c88505",
+    "semantic_hash": ""
+  },
+  "docs/src/getting-started/installation.md": {
+    "mtime": 1781257936.461401,
+    "ast_hash": "6a5c99e9001dff112e6d6698371c4066",
+    "semantic_hash": ""
+  },
+  "docs/src/getting-started/quickstart.md": {
+    "mtime": 1781257936.461401,
+    "ast_hash": "08ccf39f4f3466396859f78c40ea7c85",
+    "semantic_hash": ""
+  },
+  "docs/src/getting-started/system-requirements.md": {
+    "mtime": 1781257936.4624012,
+    "ast_hash": "f96c98be8bda3b675b6cfbde64039f4c",
+    "semantic_hash": ""
+  },
+  "docs/src/introduction.md": {
+    "mtime": 1781257936.4624012,
+    "ast_hash": "e290261484dc9216b3445917d893c459",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/alerting.md": {
+    "mtime": 1781257936.4634013,
+    "ast_hash": "605d052d6104224fac961c032d74f891",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/backup-recovery.md": {
+    "mtime": 1781257936.4634013,
+    "ast_hash": "1e879714d95debc1125aaa4bb9f864f9",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/chaos-testing.md": {
+    "mtime": 1781257936.464481,
+    "ast_hash": "d32af54410dc89bb33e69202e13e7421",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/cluster-management.md": {
+    "mtime": 1781257936.464481,
+    "ast_hash": "0df762e2d6326e598c65b6db4c7b6e9f",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/disk-management.md": {
+    "mtime": 1781257936.464481,
+    "ast_hash": "95fc7c85037a4218b9f2a0664fab4d39",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/failure-scenarios.md": {
+    "mtime": 1781257936.4654815,
+    "ast_hash": "808276be078825899fffad1eaf22dfa0",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/log-shipping.md": {
+    "mtime": 1781257936.4654815,
+    "ast_hash": "51b15ea8f974e37486e5b31319c81321",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/maintenance-mode.md": {
+    "mtime": 1781257936.4664807,
+    "ast_hash": "658ecc00eed20baaa828d36ddad8513f",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/monitoring.md": {
+    "mtime": 1781257936.4664807,
+    "ast_hash": "f1c324cd354d54f8309bcdeb51f02123",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/orphan-cleanup-runbook.md": {
+    "mtime": 1781257936.4664807,
+    "ast_hash": "038dad5371990de930048ef38264438e",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/production-deployment.md": {
+    "mtime": 1781257936.4674814,
+    "ast_hash": "c0d23fa6362a6e3a093e73bbbcfa5fca",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/release-testing.md": {
+    "mtime": 1781257936.4674814,
+    "ast_hash": "adfc08db3cb3ef91e2236f1cacd886d2",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/time-sync.md": {
+    "mtime": 1781257936.4684856,
+    "ast_hash": "f1b98c5dad5d4466b62138797d2846f0",
+    "semantic_hash": ""
+  },
+  "docs/src/operations/troubleshooting.md": {
+    "mtime": 1781257936.4684856,
+    "ast_hash": "ffdea8f8003081118922a8c6b7a0a91f",
+    "semantic_hash": ""
+  },
+  "docs/src/security/audit-log.md": {
+    "mtime": 1781257936.469486,
+    "ast_hash": "afa3f99cde2a7fb47121b44e51eb75a8",
+    "semantic_hash": ""
+  },
+  "docs/src/security/authentication.md": {
+    "mtime": 1781257936.469486,
+    "ast_hash": "c5b6063eb9a71743ca53e6d6d68ec770",
+    "semantic_hash": ""
+  },
+  "docs/src/security/cluster-join.md": {
+    "mtime": 1781340982.8137555,
+    "ast_hash": "66c6825ba716c7a21edeb5261d8b4a11",
+    "semantic_hash": ""
+  },
+  "docs/src/security/tls.md": {
+    "mtime": 1781257936.470485,
+    "ast_hash": "5b7709e918d2cbf95dbf4df145b16e43",
+    "semantic_hash": ""
+  },
+  "docs/src/storage/caching.md": {
+    "mtime": 1781257936.470485,
+    "ast_hash": "ffdf760c819a9fcecbdbd7afa0b93e64",
+    "semantic_hash": ""
+  },
+  "docs/src/storage/migration.md": {
+    "mtime": 1781257936.4714842,
+    "ast_hash": "684fd1bdf5c87f6ba166bfe334ca72c7",
+    "semantic_hash": ""
+  },
+  "docs/src/storage/replication.md": {
+    "mtime": 1781257936.4714842,
+    "ast_hash": "c9253cda45ee2f4721b9c854955125bd",
+    "semantic_hash": ""
+  },
+  "docs/src/storage/scrubbing.md": {
+    "mtime": 1781257936.472484,
+    "ast_hash": "49451931ec30b9ab0aeaf93db8f0fc55",
+    "semantic_hash": ""
+  },
+  "docs/src/storage/tape.md": {
+    "mtime": 1781257936.472484,
+    "ast_hash": "f82d63c9d43c10b58edba5f2f39e5bda",
+    "semantic_hash": ""
+  },
+  "docs/src/storage/tiering.md": {
+    "mtime": 1781257936.472484,
+    "ast_hash": "78175ceb1b1e028454599156b6f5c16a",
+    "semantic_hash": ""
+  },
+  "plans/README.md": {
+    "mtime": 1781257936.4734857,
+    "ast_hash": "408e2f98959fe723d49742be7b300300",
+    "semantic_hash": ""
+  },
+  "plans/active/PLAN-CN-FOLLOWUPS.md": {
+    "mtime": 1781257936.4744854,
+    "ast_hash": "9a1ef8928ea3c8f9c1771bcce985d1b0",
+    "semantic_hash": ""
+  },
+  "plans/active/PLAN-REL-CHAOS-SUITE.md": {
+    "mtime": 1781257936.475485,
+    "ast_hash": "c5a9be57b0c5cf0883110d7fbe4a7356",
+    "semantic_hash": ""
+  },
+  "plans/reports/DATA-LOSS-BUG-CI-2026-06-07.md": {
+    "mtime": 1781257936.4764855,
+    "ast_hash": "f5a47e5c04befd74e51df1e061c23fca",
+    "semantic_hash": ""
+  },
+  "plans/reports/ISSUE-SCAN-2026-06-06-1550.md": {
+    "mtime": 1781257936.4764855,
+    "ast_hash": "c9127156e70ee3bf60e06262c8463c47",
+    "semantic_hash": ""
+  },
+  "plans/reports/ISSUE-SCAN-2026-06-06-1832.md": {
+    "mtime": 1781257936.4774861,
+    "ast_hash": "e4ec6af2d07f5ff3c3cbbae005f9728d",
+    "semantic_hash": ""
+  },
+  "plans/reports/ISSUE-SCAN-2026-06-06-2335.md": {
+    "mtime": 1781257936.4774861,
+    "ast_hash": "169595c33b7877392f156b869fb4b715",
+    "semantic_hash": ""
+  },
+  "plans/reports/ISSUE-SCAN-2026-06-09-2124.md": {
+    "mtime": 1781257936.478485,
+    "ast_hash": "e62c12671326db06ec07a2d0eb3a6955",
+    "semantic_hash": ""
+  },
+  "tests/ansible/inventory/group_vars/all.yml": {
+    "mtime": 1781257936.4871247,
+    "ast_hash": "06a94da3179197009c7bc1f2aebf8b54",
+    "semantic_hash": ""
+  },
+  "tests/ansible/inventory/group_vars/clients.yml": {
+    "mtime": 1781257936.4871247,
+    "ast_hash": "980785c563c26a6b2e78e1eac1a91225",
+    "semantic_hash": ""
+  },
+  "tests/ansible/inventory/group_vars/data_nodes.yml": {
+    "mtime": 1781257936.4881241,
+    "ast_hash": "598d3748427dc1b25d6fd4496fd49bbd",
+    "semantic_hash": ""
+  },
+  "tests/ansible/inventory/group_vars/managers.yml": {
+    "mtime": 1781257936.4881241,
+    "ast_hash": "a2751a0aef50767ace7f2ccbd3e0fde9",
+    "semantic_hash": ""
+  },
+  "tests/ansible/inventory/hosts.yml": {
+    "mtime": 1781257936.4881241,
+    "ast_hash": "895ab39925f122798d9e208cbb9ea6db",
+    "semantic_hash": ""
+  },
+  "tests/ansible/playbooks/collect-logs.yml": {
+    "mtime": 1781257936.4891243,
+    "ast_hash": "1c256e371970d6975c41ae0eb9c92445",
+    "semantic_hash": ""
+  },
+  "tests/ansible/playbooks/deploy.yml": {
+    "mtime": 1781257936.4891243,
+    "ast_hash": "a6b350375e27b89b6acd862a1c7b470c",
+    "semantic_hash": ""
+  },
+  "tests/ansible/playbooks/redeploy-clean.yml": {
+    "mtime": 1781257936.490125,
+    "ast_hash": "66eb73334204321a2d6c219be8cc3629",
+    "semantic_hash": ""
+  },
+  "tests/ansible/playbooks/restart.yml": {
+    "mtime": 1781257936.490125,
+    "ast_hash": "668ef1dbf3054c50a8e8a7da19634b9e",
+    "semantic_hash": ""
+  },
+  "tests/ansible/playbooks/setup.yml": {
+    "mtime": 1781257936.490125,
+    "ast_hash": "7ac8b5f906d4fd1f45eea7a985293090",
+    "semantic_hash": ""
+  },
+  "tests/ansible/playbooks/teardown.yml": {
+    "mtime": 1781257936.4911244,
+    "ast_hash": "0335918b4c45d76cac0e9bfb5dba942b",
+    "semantic_hash": ""
+  },
+  "tests/ansible/roles/dtfs-client/handlers/main.yml": {
+    "mtime": 1781257936.4911244,
+    "ast_hash": "05f169a879f5925f018007f068754754",
+    "semantic_hash": ""
+  },
+  "tests/ansible/roles/dtfs-client/tasks/main.yml": {
+    "mtime": 1781257936.492124,
+    "ast_hash": "02eed862d6576269b1a3d47ced34b895",
+    "semantic_hash": ""
+  },
+  "tests/ansible/roles/dtfs-common/handlers/main.yml": {
+    "mtime": 1781257936.494128,
+    "ast_hash": "6cce51e44caba7dfff6c5f522cc78fe6",
+    "semantic_hash": ""
+  },
+  "tests/ansible/roles/dtfs-common/tasks/main.yml": {
+    "mtime": 1781257936.494128,
+    "ast_hash": "a1864b8a393fbe78654a67d30c9ba108",
+    "semantic_hash": ""
+  },
+  "tests/ansible/roles/dtfs-data/handlers/main.yml": {
+    "mtime": 1781257936.495124,
+    "ast_hash": "b0683df61250939d52de2eb151ffa4a8",
+    "semantic_hash": ""
+  },
+  "tests/ansible/roles/dtfs-data/tasks/main.yml": {
+    "mtime": 1781257936.4961255,
+    "ast_hash": "8b09d94d5bd11a8d3e8697a721abadc8",
+    "semantic_hash": ""
+  },
+  "tests/ansible/roles/dtfs-manager/handlers/main.yml": {
+    "mtime": 1781257936.4981253,
+    "ast_hash": "f38aa3ac3639cf6e6213292825b9d979",
+    "semantic_hash": ""
+  },
+  "tests/ansible/roles/dtfs-manager/tasks/main.yml": {
+    "mtime": 1781257936.4981253,
+    "ast_hash": "4baf0b7b3a95f6414e01448abd56e038",
+    "semantic_hash": ""
+  },
+  "tests/chaos/README.md": {
+    "mtime": 1781257936.5001318,
+    "ast_hash": "7f747231f5b191d57b415c73681c06f9",
+    "semantic_hash": ""
+  },
+  "tests/integration/README.md": {
+    "mtime": 1781257936.5042574,
+    "ast_hash": "8e6fc5af8e1c5e5f24df0de1ec57b7d0",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/group_vars/all.yml": {
+    "mtime": 1781257936.517284,
+    "ast_hash": "0741455b160db8ae2614f1abee84ca1c",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/hosts.yml": {
+    "mtime": 1781257936.517284,
+    "ast_hash": "544d3a178c6b20e601070f5088625d44",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/inventories/3dc/group_vars/all.yml": {
+    "mtime": 1781257936.5182831,
+    "ast_hash": "90a5b69271d1366acc3b4b9a5ce49f9b",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/inventories/3dc/group_vars/dc_a.yml": {
+    "mtime": 1781257936.5182831,
+    "ast_hash": "a4801d092640a115acc49f2fb3402cac",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/inventories/3dc/group_vars/dc_b.yml": {
+    "mtime": 1781257936.5182831,
+    "ast_hash": "43c60bfbd7784ac0870807550523a792",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/inventories/3dc/group_vars/dc_c.yml": {
+    "mtime": 1781257936.5192833,
+    "ast_hash": "fd33046c60078e3fb3e045999912490f",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/inventories/3dc/hosts.yml": {
+    "mtime": 1781257936.5192833,
+    "ast_hash": "b74fd7af470fb6f6da2468a461c289f4",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/inventories/plexmedia/group_vars/all.yml": {
+    "mtime": 1781257936.5202832,
+    "ast_hash": "71c22ed33c954ef91a12767c07ecd2a4",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/inventories/plexmedia/group_vars/dc_leli.yml": {
+    "mtime": 1781257936.5202832,
+    "ast_hash": "725226f0c5dd0138d5d0125cbf6cf251",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/inventories/plexmedia/group_vars/dc_nrb.yml": {
+    "mtime": 1781257936.5202832,
+    "ast_hash": "15ec5fec8dbcd79f0990d51569df5ac9",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/inventories/plexmedia/group_vars/dc_toro.yml": {
+    "mtime": 1781257936.5212834,
+    "ast_hash": "57a822c56da35e7f39be1978505a3583",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/inventories/plexmedia/hosts.yml": {
+    "mtime": 1781257936.5212834,
+    "ast_hash": "c4dd3918382665b18e07b13b73b35dc6",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/playbooks/apply-shaping.yml": {
+    "mtime": 1781257936.5222812,
+    "ast_hash": "d548978620fe1f14da17dff1e4a5b8c8",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/playbooks/full-deploy-plexmedia.yml": {
+    "mtime": 1781257936.5222812,
+    "ast_hash": "7ac5b1089eaf71d40293e4672c2b8b1e",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/playbooks/full-deploy.yml": {
+    "mtime": 1781257936.5232809,
+    "ast_hash": "8fe9f40d75611ac3f3a8445a2261102e",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/playbooks/hosts-file.yml": {
+    "mtime": 1781257936.5232809,
+    "ast_hash": "7e7f2b83c8e92787185c0ee25f855764",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/playbooks/mount-data-disks.yml": {
+    "mtime": 1781257936.5232809,
+    "ast_hash": "bf7d8f9ff9fef77e9192374a86832507",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/playbooks/prep-disks.yml": {
+    "mtime": 1781257936.5244308,
+    "ast_hash": "d9cbc89b43734c5bb2ee18f3e720d768",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/playbooks/revert-shaping.yml": {
+    "mtime": 1781257936.5244308,
+    "ast_hash": "1e7a9ee80b84111b4e26545d9c339926",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/roles/dtfs-netshape/defaults/main.yml": {
+    "mtime": 1781257936.5254302,
+    "ast_hash": "056ea15a596a7fb2e0585c742bec3d55",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/ansible/roles/dtfs-netshape/tasks/main.yml": {
+    "mtime": 1781257936.5264313,
+    "ast_hash": "6c3751bcda43ef01547fe749ae1e6740",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/corpus-subset.txt": {
+    "mtime": 1781257936.5274315,
+    "ast_hash": "00c6495772be22ab37bfe41ab9207789",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/soak/README.md": {
+    "mtime": 1781257936.5334349,
+    "ast_hash": "4f50982f34006b00357037e3f0b0a2e6",
+    "semantic_hash": ""
+  },
+  "tests/proxmox/abuse/21-co36-snapshot-shaped-learner.sh": {
+    "mtime": 1781340919.0881035,
+    "ast_hash": "717a8f580c43fe3453637456d9f45c93",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/62-demote-colocated-anchor-survives.sh": {
+    "mtime": 1781448755.296624,
+    "ast_hash": "a37651d4e5d46ce2822694e4f3644578",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/63-read-distance-routing.sh": {
+    "mtime": 1781442983.1452847,
+    "ast_hash": "d9ef46b167b666019a114962e15b0ccd",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/64-forward-write-auth.sh": {
+    "mtime": 1781456005.1404722,
+    "ast_hash": "d28475cd959f46ed1a3183d9a2ca0450",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/65-join-hmac-challenge.sh": {
+    "mtime": 1781443008.6108918,
+    "ast_hash": "c68aad05db2f6c15abf3c5f54249e8bf",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/66-updater-atomic-install.sh": {
+    "mtime": 1781442455.4210062,
+    "ast_hash": "0cf82524b7734d0465100487b2e30e8d",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/67-snapshot-learner-under-shaping.sh": {
+    "mtime": 1781442455.4210062,
+    "ast_hash": "b6302e66e9a70d8ae24b2094a114ec06",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/68-lookup-errno-notfound-vs-transient.sh": {
+    "mtime": 1781442455.4210062,
+    "ast_hash": "d38b6bcf963e7afaf793ff9e2e7035e6",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/69-concurrent-read-no-guard-serialize.sh": {
+    "mtime": 1781470279.5270665,
+    "ast_hash": "ab6cbe4fc17103c82d61ebd5c7401ad0",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/70-commit-enospc-resource-exhausted.sh": {
+    "mtime": 1781442455.4220111,
+    "ast_hash": "54494824aff652b2ce2528d7dceace6d",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/71-corrupt-report-to-follower.sh": {
+    "mtime": 1781467701.275466,
+    "ast_hash": "26f24c45cd158035e355306e340230e4",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/72-idle-demote-anchor-survives.sh": {
+    "mtime": 1781448795.3925705,
+    "ast_hash": "0eee65dc2189a0fcb3645b1a74c15fb6",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/73-rebalance-delocated-bytes-reaped.sh": {
+    "mtime": 1781442455.423015,
+    "ast_hash": "10128e998320f21f0f0ea1ef9867d43a",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/74-demote-delocated-bytes-reaped.sh": {
+    "mtime": 1781448825.3680165,
+    "ast_hash": "9fe5e5478ba45aec023ce0b076dc1829",
+    "semantic_hash": ""
+  },
+  "tests/release/cases/75-node-decommission-guarded.sh": {
+    "mtime": 1781443053.5367653,
+    "ast_hash": "e8426bba20b698f851269b6aaa8a489d",
+    "semantic_hash": ""
+  },
+  "plans/reports/ISSUE-FUSE-MOUNT-SERIALIZATION-2026-06-14.md": {
+    "mtime": 1781470259.1018279,
+    "ast_hash": "fe4e6f7e9b64a79ab833caee914d12e0",
+    "semantic_hash": ""
+  },
+  "plans/active/PLAN-FUSE-HOL-read-timeout.md": {
+    "mtime": 1781473557.3308985,
+    "ast_hash": "6d8972f10ae54f2b0595373cea49218e",
+    "semantic_hash": ""
+  }
+}

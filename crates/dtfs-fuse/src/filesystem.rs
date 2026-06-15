@@ -709,10 +709,42 @@ impl DtfsFilesystem {
             } else {
                 // Cache miss: fetch from data node, falling back through
                 // candidates on transport / not-found errors.
+                // FUSE-HOL — bound each per-replica fetch with a timeout so a
+                // hung/dead node (accepts the connection but never responds, so
+                // no transport error fires) cannot stall the read — and the
+                // application's FUSE op — indefinitely. On timeout we fail over
+                // to the next candidate exactly like a transport error. `0`
+                // disables the bound (legacy unbounded await).
+                let fetch_timeout_secs = self.config.client.chunk_read_timeout_secs;
                 let mut last_err: Option<anyhow::Error> = None;
                 let mut fetched: Option<(String, bytes::Bytes)> = None;
                 for cand in &candidates {
-                    match self.client.read_chunk(cand, &chunk.chunk_id).await {
+                    let fetch = self.client.read_chunk(cand, &chunk.chunk_id);
+                    let result = if fetch_timeout_secs == 0 {
+                        fetch.await
+                    } else {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(fetch_timeout_secs),
+                            fetch,
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => {
+                                tracing::warn!(
+                                    chunk_id = %chunk.chunk_id,
+                                    node = %cand,
+                                    timeout_secs = fetch_timeout_secs,
+                                    "FUSE-HOL: chunk fetch timed out, failing over to next replica"
+                                );
+                                last_err = Some(anyhow::anyhow!(
+                                    "chunk fetch from {cand} timed out after {fetch_timeout_secs}s"
+                                ));
+                                continue;
+                            }
+                        }
+                    };
+                    match result {
                         Ok(d) => {
                             fetched = Some((cand.clone(), d));
                             break;
