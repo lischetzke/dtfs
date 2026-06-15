@@ -40,11 +40,17 @@ Bound each per-replica `read_chunk` with a configurable timeout
 (`client.chunk_read_timeout_secs`, default 60 s, `0` = disabled) and fail over
 to the next candidate on timeout — extending P0-2 to cover hangs, not just
 errors. Read-only path, so timeout/fallover is safe; all-candidates-failed =>
-EIO (existing). Verified: the connect-error fallover path works live (read
-recovered in ~5 s with correct bytes when the first candidate's node was
-unreachable). The hung-after-connect timeout path is code-correct + builds; its
-live netem test is pending (the test's `netem delay 25s` made the target node's
-SSH unmanageable — recover by rebooting the VM).
+EIO (existing). **VERIFIED LIVE (2026-06-15):** with the data node's chunk-port
+responses dropped on an established channel (hung mid-stream — the case P0-2
+cannot catch), a cold read fell over to the healthy replica in exactly the
+configured timeout (8 s test value) and returned correct bytes; pre-fix the same
+scenario hung >35 s. The connect-error path also recovers (~5 s). Release case
+`69-read-hung-node-fallover.sh` asserts this.
+
+Operational note: simulate a hung node with `tc`/`iptables` scoped to the gRPC
+port (`--sport 9500`), NEVER the NIC root qdisc (`dev eth0 root netem delay`) —
+the latter delays the node's own SSH past sshd's kex grace and bricks
+management (it stranded data01 once; required a VM reboot to clear).
 
 ## Relation to CO-3-12
 
