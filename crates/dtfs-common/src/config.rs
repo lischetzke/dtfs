@@ -785,6 +785,16 @@ pub struct FuseClientConfig {
     /// returned garbage. Default 4 to match the workspace volume default.
     #[serde(default = "default_client_chunk_size_mb")]
     pub chunk_size_mb: u32,
+    /// FUSE-HOL — per-replica chunk-fetch timeout (seconds). A `read_chunk`
+    /// that does not complete within this is abandoned and the read fails over
+    /// to the next replica (extends the P0-2 fallback to cover a hung/dead node
+    /// that never returns an error, not just transport errors). Without it a
+    /// hung data node stalls the read — and the application's FUSE op —
+    /// indefinitely. Generous default (60 s) vs a 4 MB chunk at 40 Mbps
+    /// (~0.8 s); raise for very large chunks on very slow links. `0` disables
+    /// the timeout (legacy unbounded behavior).
+    #[serde(default = "default_chunk_read_timeout_secs")]
+    pub chunk_read_timeout_secs: u64,
 }
 
 impl FuseClientConfig {
@@ -1038,6 +1048,11 @@ fn default_client_chunk_size_mb() -> u32 {
     // Bug BW — match the workspace volume default (`default_chunk_size` = 4 MB)
     // so client chunking agrees with the chunk size recorded in file metadata.
     4
+}
+fn default_chunk_read_timeout_secs() -> u64 {
+    // FUSE-HOL — generous vs a 4 MB chunk at 40 Mbps (~0.8 s) but bounds a
+    // hung/dead replica so a read fails over instead of hanging forever.
+    60
 }
 fn default_client_heartbeat_secs() -> u64 {
     // Bug BQ-1 — well under default_node_liveness_secs (30) so an idle
