@@ -75,6 +75,15 @@ Re-running it is a no-op. The corresponding REST endpoint is
 and
 [REST API](../api-reference/rest-api.md#post-apiv1volumesidmigrate-policy).
 
+`set-mandatory` on a legacy volume (one whose `mandatory_replicas` is
+still all-zero) seeds the new field from the **effective** floor first —
+i.e. the legacy `replication` values — and *then* applies the tiers you
+supplied. So bumping one tier never silently drops the others: setting
+`cold=2` on a `warm=2 cold=1` legacy volume yields `warm=2 cold=2`, not
+`warm=0 cold=2`. A volume already on the new schema is edited in place
+(only the supplied tiers change). The anchor's required tier still cannot
+be set to `0`, and an all-zero result is rejected.
+
 ### Example A — Plexmedia (the canonical use case)
 
 3 DCs, asymmetric bandwidth. Cold tier in LELI is the archive; warm

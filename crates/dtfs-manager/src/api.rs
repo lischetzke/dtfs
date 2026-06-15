@@ -2261,6 +2261,21 @@ pub(crate) fn apply_set_mandatory(
 ) -> Result<dtfs_common::types::VolumeConfig, String> {
     let mut next = current.clone();
 
+    // AV-4-1a hardening — on a legacy volume (mandatory_replicas still
+    // all-zero, so effective_mandatory_replicas() falls back to the legacy
+    // `replication` floor), seed the mandatory map from that EFFECTIVE floor
+    // BEFORE applying the partial overwrite. Otherwise a partial edit (e.g.
+    // bump cold) silently zeroes every un-set tier's legacy floor (e.g. drops
+    // the warm working-set RF) by shadowing the fallback. Seeding makes the
+    // partial update layer onto the real floor instead of onto zeros; a volume
+    // already on the new schema (any tier > 0) is left untouched.
+    {
+        let m = &current.mandatory_replicas;
+        if m.hot == 0 && m.warm == 0 && m.cold == 0 && m.tape == 0 {
+            next.mandatory_replicas = current.effective_mandatory_replicas().clone();
+        }
+    }
+
     if let Some(v) = req.hot_replicas  { next.mandatory_replicas.hot  = v; }
     if let Some(v) = req.warm_replicas { next.mandatory_replicas.warm = v; }
     if let Some(v) = req.cold_replicas { next.mandatory_replicas.cold = v; }
@@ -5765,14 +5780,15 @@ mod bug_av_set_mandatory_tests {
     }
 
     /// AV-4-1a test 4 — calling set-mandatory on a legacy
-    /// volume (current mandatory all-zero) populates the new
-    /// field without disturbing legacy `replication`. The
-    /// operator can use this as an alternative to
-    /// migrate-policy when they want different mandatory
-    /// values than the legacy field carries.
+    /// volume (current mandatory all-zero) seeds the new field
+    /// from the EFFECTIVE legacy floor first, then applies the
+    /// partial edit. A supplied tier overwrites; an UN-set tier
+    /// keeps its legacy-floor value instead of silently dropping
+    /// to 0. Legacy `replication` itself stays untouched
+    /// (rollback safety).
     #[test]
     fn bug_av_set_mandatory_legacy_volume_round_trips() {
-        let current = legacy_volume(); // mandatory all-zero
+        let current = legacy_volume(); // mandatory all-zero, replication warm2/cold1
         assert_eq!(current.mandatory_replicas.hot,  0);
         assert_eq!(current.mandatory_replicas.warm, 0);
         assert_eq!(current.mandatory_replicas.cold, 0);
@@ -5784,16 +5800,43 @@ mod bug_av_set_mandatory_tests {
         };
         let next = apply_set_mandatory(&current, &req).expect("valid");
 
-        // New mandatory_replicas populated.
+        // Supplied tier set; un-set warm seeded from the legacy floor (=2),
+        // NOT zeroed.
         assert_eq!(next.mandatory_replicas.cold, 1);
+        assert_eq!(next.mandatory_replicas.warm, 2);
         // Legacy replication untouched (rollback safety).
         assert_eq!(next.replication.warm, 2);
         assert_eq!(next.replication.cold, 1);
-        // effective_mandatory_replicas now returns the new field
-        // (cold=1) rather than the legacy fallback (warm=2, cold=1).
+        // effective now reads the populated mandatory map, which preserves the
+        // warm floor that the legacy fallback carried.
         assert_eq!(next.effective_mandatory_replicas().cold, 1);
-        assert_eq!(next.effective_mandatory_replicas().warm, 0,
-            "new mandatory_replicas takes precedence over legacy");
+        assert_eq!(next.effective_mandatory_replicas().warm, 2,
+            "un-set tier keeps the legacy floor (seeded), not silently dropped");
+    }
+
+    /// AV-4-1a hardening — partial set-mandatory on a legacy volume layers
+    /// onto the effective legacy floor: bumping ONE tier must not drop the
+    /// others. Regression for the silent-warm-floor-loss footgun.
+    #[test]
+    fn bug_av_set_mandatory_legacy_seeds_from_effective_floor() {
+        let current = legacy_volume(); // mandatory all-zero, replication warm2/cold1
+        // Operator bumps cold durability only.
+        let req = SetMandatoryRequest {
+            cold_replicas: Some(2),
+            ..Default::default()
+        };
+        let next = apply_set_mandatory(&current, &req).expect("valid");
+        // cold bumped to 2, warm floor (2) preserved, not dropped to 0.
+        assert_eq!(next.effective_mandatory_replicas().cold, 2);
+        assert_eq!(next.effective_mandatory_replicas().warm, 2,
+            "un-set warm tier must keep its legacy floor, not silently vanish");
+        // A volume already on the new schema is NOT reseeded.
+        let mut migrated = legacy_volume();
+        migrated.mandatory_replicas = TierReplication { hot: 0, warm: 1, cold: 1, tape: 0 };
+        let req2 = SetMandatoryRequest { cold_replicas: Some(2), ..Default::default() };
+        let n2 = apply_set_mandatory(&migrated, &req2).expect("valid");
+        assert_eq!(n2.mandatory_replicas.warm, 1, "already-set tiers untouched");
+        assert_eq!(n2.mandatory_replicas.cold, 2);
     }
 
     /// AV-4-1a defensive — empty request body produces an
