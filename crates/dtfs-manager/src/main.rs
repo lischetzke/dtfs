@@ -54,6 +54,11 @@ async fn main() -> anyhow::Result<()> {
 
     let config: dtfs_common::config::ManagerConfig =
         dtfs_common::config::load_config(std::path::Path::new(&args.config))?;
+    // LIS-20 / Sec R3 — fail-closed empty shared_secret (no silent admit).
+    config
+        .cluster
+        .validate_shared_secret()
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!(
         "Manager {} at {} ({})",

@@ -29,6 +29,10 @@ host = "example-box1"
 [cluster]
 name = "dtfs"                       # must be identical on all managers
 shared_secret = "change-me"         # must be identical on all nodes (managers, data, fuse)
+                                    # Empty is refused at startup (LIS-20 / Sec R3)
+                                    # unless allow_insecure_empty_secret = true.
+#allow_insecure_empty_secret = false # lab-only: permit empty shared_secret (fail-open
+                                    # RegisterNode). Never set in production.
 #bootstrap = false                  # true on EXACTLY ONE manager, only for the
                                     # very first cluster start. Never set true on
                                     # a node joining an existing cluster — it

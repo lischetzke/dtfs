@@ -366,11 +366,16 @@ struct MembershipChangeRequest {
 }
 
 /// Gate 1: membership changes require the cluster shared secret.
+/// LIS-20 — uses the same fail-closed helper as RegisterNode.
 fn check_membership_secret(
     state: &AppState,
     provided: &str,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    if provided != state.config.cluster.shared_secret {
+    if !state
+        .config
+        .cluster
+        .accepts_shared_secret(Some(provided))
+    {
         return Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error": "shared_secret mismatch"})),

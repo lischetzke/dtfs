@@ -56,7 +56,8 @@ host = "mgr-01"
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
 | `name` | `cluster.name` | `String` | *(required)* | Any non-empty string | No | Human-readable cluster name. All managers in a cluster must share the same name. |
-| `shared_secret` | `cluster.shared_secret` | `String` | *(required)* | Any non-empty string | No | Pre-shared key used to authenticate nodes joining the cluster. Must be identical on all nodes. |
+| `shared_secret` | `cluster.shared_secret` | `String` | *(required)* | Any non-empty string | No | Pre-shared key used to authenticate nodes joining the cluster. Must be identical on all nodes. Empty is refused at manager startup unless `allow_insecure_empty_secret` is set (LIS-20 / Sec R3). |
+| `allow_insecure_empty_secret` | `cluster.allow_insecure_empty_secret` | `bool` | `false` | `true` or `false` | No | Lab-only escape hatch. When `true`, an empty `shared_secret` is permitted and RegisterNode fail-opens. Never enable in production. |
 | `bootstrap` | `cluster.bootstrap` | `bool` | `false` | `true` or `false` | No | Set to `true` on exactly one manager during initial cluster creation, and only for the very first start. **Never** set it on a node meant to join an existing cluster: it initializes a second, divergent Raft group that never federates (metadata split-brain). |
 | `initial_voters` | `[[cluster.initial_voters]]` | array of tables | `[]` | — | No | The full expected voter set. See below. |
 
