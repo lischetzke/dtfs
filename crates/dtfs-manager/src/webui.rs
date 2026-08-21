@@ -3119,8 +3119,20 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     <span class="settings-val">${{tier.cold_threshold_days ?? '—'}}</span>
                 </div>
                 <div class="settings-row">
+                    <label>Frozen threshold (days)</label>
+                    <span class="settings-val">${{tier.frozen_threshold_days ?? '—'}}</span>
+                </div>
+                <div class="settings-row">
+                    <label>Evaluation interval (secs)</label>
+                    <span class="settings-val">${{tier.evaluation_interval_secs ?? '—'}}</span>
+                </div>
+                <div class="settings-row">
                     <label>Migration bandwidth (MB/s)</label>
                     <span class="settings-val">${{tier.migration_bandwidth_limit_mbps ?? '—'}}</span>
+                </div>
+                <div class="settings-row">
+                    <label>Cache redundancy escalation</label>
+                    <span class="settings-val">${{tier.enable_cache_redundancy_escalation ? '✅ Yes' : '❌ No'}}</span>
                 </div>
             </div>
 
@@ -3358,6 +3370,17 @@ mod bug_bk_scrub_tests {
             html.contains("id=\"auth-badge\""),
             "header auth badge must be present"
         );
+        // Riv LIS-65: Settings tier readouts must stay (not a LIS-35 regression).
+        for needle in [
+            "tier.frozen_threshold_days",
+            "tier.evaluation_interval_secs",
+            "tier.enable_cache_redundancy_escalation",
+        ] {
+            assert!(
+                html.contains(needle),
+                "Settings must retain tier readout: {needle}"
+            );
+        }
         // Mutating endpoints must be invoked via mutateFetch.
         for needle in [
             "mutateFetch('/api/v1/migrations'",
