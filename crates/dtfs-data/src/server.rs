@@ -942,7 +942,18 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<ReplicateChunkRequest>,
     ) -> Result<Response<ReplicateChunkResponse>, Status> {
+        // LIS-62 / LIS-60 — unauthenticated ReplicateChunk is exfil + I/O
+        // DoS: any peer on :9500 can compel a Healthy node to push local
+        // chunks to an attacker-chosen target_address. Bind MAC to
+        // chunk_id (DeleteChunk pattern) before decode / outbound I/O.
+        let md = request.metadata().clone();
         let req = request.into_inner();
+        require_data_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "ReplicateChunk",
+            &req.chunk_id,
+            &md,
+        )?;
 
         let chunk_id_bytes = chunk_hex::decode(&req.chunk_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid chunk ID: {}", e)))?;
@@ -1319,6 +1330,78 @@ max_io_percent = 10
         let resp = svc.delete_chunk(req).await.expect("authed delete");
         assert!(resp.into_inner().success);
         assert!(svc.store.chunk_file_path(&chunk_id).is_none());
+    }
+
+    // LIS-62 — unauthenticated ReplicateChunk must be PermissionDenied
+    // before any outbound stream (exfil / bandwidth DoS).
+    #[tokio::test]
+    async fn replicate_chunk_rejects_missing_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"lis62-replicate-auth";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(
+                &chunk_id,
+                data,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+            )
+            .await
+            .unwrap();
+
+        let err = svc
+            .replicate_chunk(Request::new(ReplicateChunkRequest {
+                chunk_id: chunk_hex.clone(),
+                target_address: "http://127.0.0.1:19999".into(),
+                target_tier: "warm".into(),
+            }))
+            .await
+            .expect_err("unauthenticated ReplicateChunk must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(svc.store.chunk_file_path(&chunk_id).is_some());
+    }
+
+    // LIS-62 — valid stamp allows ReplicateChunk past the auth gate
+    // (outbound Put may still fail on an unreachable target).
+    #[tokio::test]
+    async fn replicate_chunk_accepts_valid_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"lis62-replicate-ok";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(
+                &chunk_id,
+                data,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+            )
+            .await
+            .unwrap();
+
+        let mut req = Request::new(ReplicateChunkRequest {
+            chunk_id: chunk_hex.clone(),
+            target_address: "http://127.0.0.1:19999".into(),
+            target_tier: "warm".into(),
+        });
+        attach_data_rpc_auth(
+            &mut req,
+            &svc.config.cluster.shared_secret,
+            "ReplicateChunk",
+            &chunk_hex,
+        );
+        let resp = svc
+            .replicate_chunk(req)
+            .await
+            .expect("authed ReplicateChunk must pass auth gate");
+        // Unreachable target → success=false, but not PermissionDenied.
+        assert!(!resp.into_inner().success);
+        assert!(svc.store.chunk_file_path(&chunk_id).is_some());
     }
 }
 

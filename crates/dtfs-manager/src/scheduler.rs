@@ -125,7 +125,8 @@ pub struct TaskScheduler {
     /// mutations (lost task / `next_task_id` regression). Held only across
     /// the load..save critical section, never across an unrelated await.
     migration_state_lock: tokio::sync::Mutex<()>,
-    /// LIS-19 — cluster shared secret for DeleteChunk auth stamps.
+    /// LIS-19 / LIS-62 — cluster shared secret for DeleteChunk /
+    /// ReplicateChunk auth stamps.
     shared_secret: parking_lot::RwLock<String>,
 }
 
@@ -925,12 +926,28 @@ impl TaskScheduler {
                 .await
                 .map(DataServiceClient::new)
                 .map_err(|e| anyhow::anyhow!("connect to source {}: {}", source_addr, e))?;
+            // LIS-62 — stamp ReplicateChunk like DeleteChunk (LIS-19).
+            let mut req = tonic::Request::new(ReplicateChunkRequest {
+                chunk_id: chunk_id.to_string(),
+                target_address: target_addr.to_string(),
+                target_tier: target_tier.to_string(),
+            });
+            {
+                use dtfs_common::crypto::{
+                    stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+                };
+                let secret = self.shared_secret.read().clone();
+                if let Some((ts, mac)) =
+                    stamp_data_rpc_auth(&secret, "ReplicateChunk", chunk_id)
+                {
+                    if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                        req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                        req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                    }
+                }
+            }
             client
-                .replicate_chunk(ReplicateChunkRequest {
-                    chunk_id: chunk_id.to_string(),
-                    target_address: target_addr.to_string(),
-                    target_tier: target_tier.to_string(),
-                })
+                .replicate_chunk(req)
                 .await
                 .map_err(|e| anyhow::anyhow!("ReplicateChunk RPC: {}", e))
                 .map(|r| r.into_inner())

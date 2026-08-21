@@ -167,14 +167,16 @@ bytes must:
    (BC-12e). Disabling verify_on_read needs an explicit ack at the API
    boundary (BC-8 ack guard) and is the only mode where reads can deliver
    corrupt bytes. Scrub (quick+deep+orphan) still runs.
-7. LIS-19 / Sec R2 — when `cluster.shared_secret` is non-empty, data-plane
-   `PutChunk` / `DeleteChunk` require gRPC metadata `x-dtfs-rpc-ts` +
-   `x-dtfs-rpc-mac` (HMAC-SHA256 over
-   `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n`; DeleteChunk binds
-   `chunk_id`). Missing/invalid → `PermissionDenied`. Empty secret =
-   legacy skip (join parity). Callers that stamp: FUSE/client put,
-   data→data replication put, manager unlink fan-out + scheduler flush.
-   Deploy data+manager+fuse together. mTLS (CF-6) is complementary.
+7. LIS-19 / Sec R2 / LIS-62 — when `cluster.shared_secret` is non-empty,
+   data-plane `PutChunk` / `DeleteChunk` / `ReplicateChunk` require gRPC
+   metadata `x-dtfs-rpc-ts` + `x-dtfs-rpc-mac` (HMAC-SHA256 over
+   `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n`; DeleteChunk and
+   ReplicateChunk bind `chunk_id`). Missing/invalid → `PermissionDenied`.
+   Empty secret = legacy skip (join parity). Callers that stamp:
+   FUSE/client put, data→data replication put, manager scheduler
+   ReplicateChunk, manager unlink fan-out + scheduler flush. Deploy
+   data+manager+fuse together (update-required). mTLS (CF-6) is
+   complementary.
 
 Full audit checklist: § A.6.
 
@@ -601,7 +603,7 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
 - `dtfs-manager/src/webui.rs` — embedded SPA, format-string HTML
   (`{{`/`}}` for literal braces).
 - `dtfs-data/src/server.rs::put_chunk` — streaming put path; LIS-19
-  `require_data_rpc_auth` gates PutChunk/DeleteChunk.
+  `require_data_rpc_auth` gates PutChunk/DeleteChunk/ReplicateChunk.
 - `dtfs-common/src/crypto.rs` — join HMAC + LIS-19
   `stamp_data_rpc_auth` / `verify_data_rpc_auth`.
 - `dtfs-data/src/store.rs::commit_chunk_from_tmp` — atomic commit

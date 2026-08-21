@@ -25,8 +25,8 @@ An empty manager `shared_secret` is refused at startup (LIS-20 / Sec R3) unless
 `cluster.allow_insecure_empty_secret = true` is set for lab-only insecure mode.
 
 The same secret also authenticates data-plane `PutChunk` / `DeleteChunk`
-RPCs when set (LIS-19); see [Authentication → Data-plane PutChunk /
-DeleteChunk](./authentication.md#data-plane-putchunk--deletechunk-lis-19--sec-r2).
+/ `ReplicateChunk` RPCs when set (LIS-19 / LIS-62); see
+[Authentication → Data-plane PutChunk / DeleteChunk / ReplicateChunk](./authentication.md#data-plane-putchunk--deletechunk--replicatechunk-lis-19--lis-62).
 
 ## Protocol Overview
 

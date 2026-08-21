@@ -63,7 +63,7 @@ header. Until the UI/UX agent wires a session secret prompt, use
 `dtfs-cli` (or curl with the header) for mutations on clusters that
 have `shared_secret` set. Read-only WebUI pages continue to work.
 
-## Data-plane PutChunk / DeleteChunk (LIS-19 / Sec R2)
+## Data-plane PutChunk / DeleteChunk / ReplicateChunk (LIS-19 / LIS-62)
 
 When `[cluster].shared_secret` is **non-empty**, data nodes require
 authenticated gRPC metadata on mutating RPCs:
@@ -73,16 +73,17 @@ authenticated gRPC metadata on mutating RPCs:
 | `x-dtfs-rpc-ts` | Unix seconds |
 | `x-dtfs-rpc-mac` | Hex HMAC-SHA256 over `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n` |
 
-- `method` is `PutChunk` or `DeleteChunk`.
-- `binding` is the `chunk_id` for DeleteChunk (binds the stamp to the
-  destructive target); empty for PutChunk.
+- `method` is `PutChunk`, `DeleteChunk`, or `ReplicateChunk`.
+- `binding` is the `chunk_id` for DeleteChunk and ReplicateChunk (binds
+  the stamp to the target chunk); empty for PutChunk.
 - Max skew 300 seconds. Missing/invalid → `PermissionDenied`.
 - Empty `shared_secret` skips verification (join / legacy plaintext parity).
 
 Callers that stamp: FUSE/client put, data→data replication put, manager
-unlink fan-out, scheduler flush/orphan delete. **Deploy data + manager +
-fuse together** when enabling a non-empty secret (update-required). mTLS
-(CF-6) is complementary transport auth, not a substitute for this MAC.
+scheduler ReplicateChunk, manager unlink fan-out, scheduler flush/orphan
+delete. **Deploy data + manager + fuse together** when enabling a
+non-empty secret (update-required). mTLS (CF-6) is complementary
+transport auth, not a substitute for this MAC.
 
 ## Node join / register
 
