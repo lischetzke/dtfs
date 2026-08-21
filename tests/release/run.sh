@@ -28,12 +28,15 @@ for arg in "$@"; do
 done
 
 # Quick subset = the fast critical-path cases.
+# Security / live-coverage stems (LIS-18/19/20/41): unique numbers after the
+# former triple collision under 60- (monitor-leader-gate stays at 60).
 QUICK_CASES="00-prereqs 01-basic-write-read 02-replica-placement \
              05-migration 06-flush-cache 13-integrity-corruption \
              15-soak-15min 17-stats-correctness 18-api-shape \
              49-delete-fanout-reclaims 51-audit-limit-ordering \
              53-set-write-safety 57-config-readback 60-monitor-leader-gate-no-flap \
-             60-mutating-rest-auth"
+             76-empty-shared-secret-refused 78-down-replica-not-live-coverage \
+             79-mutating-rest-auth 80-data-rpc-auth"
 
 # Chaos subset = hypervisor-level + cross-DC + balance cases. Needs the 3dc
 # lab; the PVE-destructive ones additionally need ALLOW_PVE_CHAOS=1 + PVE_TOKEN
