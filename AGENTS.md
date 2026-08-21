@@ -167,18 +167,19 @@ bytes must:
    (BC-12e). Disabling verify_on_read needs an explicit ack at the API
    boundary (BC-8 ack guard) and is the only mode where reads can deliver
    corrupt bytes. Scrub (quick+deep+orphan) still runs.
-7. LIS-19 / LIS-55 — when `cluster.shared_secret` is non-empty, data-plane
-   `PutChunk` / `DeleteChunk` / `ReplicateChunk` require gRPC metadata
-   `x-dtfs-rpc-ts` + `x-dtfs-rpc-mac` (HMAC-SHA256 over
-   `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n`; DeleteChunk binds
-   `chunk_id`; ReplicateChunk binds `chunk_id|target_address`).
+7. LIS-19 / LIS-55 / LIS-83 — when `cluster.shared_secret` is non-empty, data-plane
+   `PutChunk` / `DeleteChunk` / `ReplicateChunk` / `GetChunk` / `ListChunks` /
+   `VerifyChunk` require gRPC metadata `x-dtfs-rpc-ts` + `x-dtfs-rpc-mac`
+   (HMAC-SHA256 over `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n`;
+   DeleteChunk/GetChunk/VerifyChunk bind `chunk_id`; ReplicateChunk binds
+   `chunk_id|target_address`; PutChunk/ListChunks empty binding).
    Missing/invalid → `PermissionDenied`. Empty secret = legacy skip
    (join parity); data-node startup refuses empty secret unless
-   `allow_insecure_empty_secret` (LIS-20 parity). Callers that stamp:
-   FUSE/client put, data→data replication put, manager scheduler
-   ReplicateChunk, manager unlink fan-out + scheduler flush. Deploy
-   data+manager+fuse together. GetChunk/ListChunks/VerifyChunk remain
-   open (network + TLS compensate). mTLS (CF-6) is complementary.
+   `allow_insecure_empty_secret` (LIS-20 parity).    Callers that stamp:
+   FUSE/client put+get, data→data replication put, manager scheduler
+   ReplicateChunk/VerifyChunk/ListChunks, manager unlink fan-out +
+   scheduler flush. Deploy data+manager+fuse together. mTLS (CF-6) is
+   complementary.
 8. LIS-56 — when `cluster.shared_secret` is non-empty, mutating
    ManagerService RPCs require the same header keys over the
    `dtfs-mgr-rpc` plane (`metadata::require_mgr_rpc_auth`); `dtfs-client`
@@ -617,9 +618,9 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   (`{{`/`}}` for literal braces). LIS-35: mutating POSTs send
   `X-Dtfs-Shared-Secret` from `sessionStorage` (Settings field / header
   badge prompt); GETs stay open; 401/403 surfaced in-page.
-- `dtfs-data/src/server.rs::put_chunk` — streaming put path; LIS-19/LIS-55
-  `require_data_rpc_auth` gates PutChunk/DeleteChunk/ReplicateChunk.
-- `dtfs-common/src/crypto.rs` — join HMAC + LIS-19/LIS-55
+- `dtfs-data/src/server.rs::put_chunk` — streaming put path; LIS-19/LIS-55/LIS-83
+  `require_data_rpc_auth` gates Put/Delete/Replicate/Get/List/VerifyChunk.
+- `dtfs-common/src/crypto.rs` — join HMAC + LIS-19/LIS-55/LIS-83
   `stamp_data_rpc_auth` / `verify_data_rpc_auth` /
   `data_rpc_replicate_binding` + LIS-56 `stamp_mgr_rpc_auth` /
   `verify_mgr_rpc_auth`.

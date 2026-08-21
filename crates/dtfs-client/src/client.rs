@@ -558,11 +558,23 @@ impl DtfsClient {
     #[instrument(skip(self))]
     pub async fn read_chunk(&self, node_addr: &str, chunk_id: &str) -> Result<Bytes> {
         let mut client = self.data_client(node_addr).await?;
-        let request = GetChunkRequest {
+        let mut request = tonic::Request::new(GetChunkRequest {
             chunk_id: chunk_id.to_string(),
             requester_dc: self.inner.requester_dc.read().clone(),
             requester_host: self.inner.requester_host.read().clone(),
-        };
+        });
+        {
+            use dtfs_common::crypto::{
+                stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+            };
+            let secret = self.inner.shared_secret.read().clone();
+            if let Some((ts, mac)) = stamp_data_rpc_auth(&secret, "GetChunk", chunk_id) {
+                if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                    request.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                    request.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                }
+            }
+        }
         let response = match client.get_chunk(request).await {
             Ok(r) => r,
             // Bug BC-9 — classify integrity faults distinctly from
