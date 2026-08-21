@@ -603,7 +603,9 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   `cluster.shared_secret` = documented unauthenticated downgrade (skips the
   challenge/HMAC checks). docs/src/security/cluster-join.md.
 - `dtfs-manager/src/webui.rs` — embedded SPA, format-string HTML
-  (`{{`/`}}` for literal braces).
+  (`{{`/`}}` for literal braces). LIS-35: mutating POSTs send
+  `X-Dtfs-Shared-Secret` from `sessionStorage` (Settings field / header
+  badge prompt); GETs stay open; 401/403 surfaced in-page.
 - `dtfs-data/src/server.rs::put_chunk` — streaming put path; LIS-19/LIS-55
   `require_data_rpc_auth` gates PutChunk/DeleteChunk/ReplicateChunk.
 - `dtfs-common/src/crypto.rs` — join HMAC + LIS-19/LIS-55
