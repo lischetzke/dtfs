@@ -58,10 +58,13 @@ sends it as `X-Dtfs-Shared-Secret`.
 
 ## WebUI
 
-The embedded WebUI currently issues mutating `fetch` calls without the
-header. Until the UI/UX agent wires a session secret prompt, use
-`dtfs-cli` (or curl with the header) for mutations on clusters that
-have `shared_secret` set. Read-only WebUI pages continue to work.
+The embedded WebUI stores the cluster `shared_secret` in browser
+`sessionStorage` only (header badge prompt or **Settings → Session
+shared secret**). Mutating `fetch` POSTs attach
+`X-Dtfs-Shared-Secret`; the secret is never embedded in HTML. GETs stay
+open. Missing secret → HTTP 401 with an actionable message; wrong secret
+→ HTTP 403. Clear the session value via Settings → Clear (or close the
+tab).
 
 ## Data-plane PutChunk / DeleteChunk / ReplicateChunk (LIS-19 / LIS-55)
 
