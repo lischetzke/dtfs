@@ -68,6 +68,28 @@ impl ReadAheadMode {
     }
 }
 
+/// REV-2-3 — pick what to prefetch for chunk index `idx`.
+///
+/// Two things used to be wrong here. The list was indexed POSITIONALLY, but
+/// the manager's array is dense while a file's chunk index space may be sparse
+/// (see REV-2-1), so a prefetch could fetch a completely different chunk and
+/// cache it under this index. And the address was always `node_addresses[0]`,
+/// the manager's arbitrary first replica, ignoring every locality rule the
+/// foreground read applies — which both wasted a WAN link and cached the chunk
+/// under a key the foreground read never looks up.
+///
+/// The caller now supplies `(chunk_index, chunk_id, candidates)` where
+/// `candidates` is exactly `read_candidates`' output, so the first entry is
+/// the same replica the foreground read would pick.
+fn prefetch_target(
+    chunk_locations: &[(u64, String, Vec<String>)],
+    idx: u64,
+) -> Option<(&String, &String)> {
+    let (_, chunk_id, addrs) = chunk_locations.iter().find(|(i, _, _)| *i == idx)?;
+    let addr = addrs.first()?;
+    Some((chunk_id, addr))
+}
+
 /// Key for cached chunk data: "node_addr|chunk_id".
 fn cache_key(node_addr: &str, chunk_id: &str) -> String {
     format!("{node_addr}|{chunk_id}")
@@ -191,15 +213,24 @@ impl ReadAheadEngine {
     /// - `file_path`: path of the file being read
     /// - `chunk_index`: zero-based index of the chunk just read
     /// - `total_chunks`: total number of chunks in the file
-    /// - `chunk_locations`: list of `(chunk_id, node_addresses)` for all chunks
-    ///   in the file, ordered by chunk index
+    /// - `chunk_locations`: `(chunk_index, chunk_id, node_addresses)` for the
+    ///   chunks of this file. REV-2-3 — `node_addresses` arrives already
+    ///   ordered by the caller's `read_candidates`, i.e. by the same U4 rules
+    ///   the foreground read applies (`read_location_priority`, then physical
+    ///   distance, then the tier tie-break), so taking the first entry here
+    ///   prefetches from the same replica the foreground read would choose and
+    ///   caches it under the key that read looks up. It used to be a bare
+    ///   positional `(chunk_id, addrs)` list from which this function took
+    ///   `addrs[0]`. The explicit index also removes the positional aliasing
+    ///   REV-2-1 fixed on the foreground path: a sparse file's
+    ///   `chunk_locations[i]` is not chunk `i`.
     #[instrument(skip(self, chunk_locations), fields(path = %file_path, chunk = chunk_index, total = total_chunks))]
     pub fn on_chunk_read(
         &self,
         file_path: &str,
         chunk_index: u32,
         total_chunks: u32,
-        chunk_locations: &[(String, Vec<String>)],
+        chunk_locations: &[(u64, String, Vec<String>)],
     ) {
         let n = self.mode.prefetch_chunks();
         if n == 0 {
@@ -211,13 +242,7 @@ impl ReadAheadEngine {
         let end = total_chunks.min(start + n);
 
         for idx in start..end {
-            if let Some((chunk_id, node_addrs)) = chunk_locations.get(idx as usize) {
-                if node_addrs.is_empty() {
-                    continue;
-                }
-                // Pick the first available node address (location-aware
-                // selection happens at a higher level).
-                let addr = &node_addrs[0];
+            if let Some((chunk_id, addr)) = prefetch_target(chunk_locations, idx as u64) {
                 let key = cache_key(addr, chunk_id);
 
                 // Skip if already cached or being fetched.
@@ -455,6 +480,53 @@ impl ReadAheadCacheController {
 }
 
 #[cfg(test)]
+mod rev_2_3_prefetch_target_tests {
+    use super::prefetch_target;
+
+    fn locs() -> Vec<(u64, String, Vec<String>)> {
+        vec![
+            (
+                0,
+                "h0".to_string(),
+                vec!["http://near:9500".to_string(), "http://far:9500".to_string()],
+            ),
+            // index 1 is a hole — a sparse file, or a chunk whose only
+            // location row was removed.
+            (2, "h2".to_string(), vec!["http://near2:9500".to_string()]),
+            (3, "h3".to_string(), Vec::new()),
+        ]
+    }
+
+    /// REV-2-3: the caller pre-orders candidates with the same U4 rules the
+    /// foreground read applies, so the head is the replica the read would
+    /// pick — not the manager's arbitrary `node_addresses[0]`.
+    #[test]
+    fn rev_2_3_prefetches_the_locality_winner_not_the_managers_first_replica() {
+        let l = locs();
+        let (id, addr) = prefetch_target(&l, 0).unwrap();
+        assert_eq!(id, "h0");
+        assert_eq!(addr, "http://near:9500");
+    }
+
+    /// REV-2-3: the same positional aliasing REV-2-1 fixed on the read path.
+    #[test]
+    fn rev_2_3_a_hole_prefetches_nothing_rather_than_a_neighbour() {
+        let l = locs();
+        assert!(
+            prefetch_target(&l, 1).is_none(),
+            "positional lookup used to return h2 for index 1"
+        );
+        assert_eq!(prefetch_target(&l, 2).unwrap().0, "h2");
+    }
+
+    #[test]
+    fn rev_2_3_a_chunk_with_no_replicas_is_skipped() {
+        let l = locs();
+        assert!(prefetch_target(&l, 3).is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -577,8 +649,8 @@ mod tests {
         // Two chunks; reading index 0 prefetches index 1 from an
         // unreachable node so `read_chunk` errors out near-instantly.
         let locations = vec![
-            ("chunk0".to_string(), vec!["127.0.0.1:1".to_string()]),
-            ("chunk1".to_string(), vec!["127.0.0.1:1".to_string()]),
+            (0u64, "chunk0".to_string(), vec!["127.0.0.1:1".to_string()]),
+            (1u64, "chunk1".to_string(), vec!["127.0.0.1:1".to_string()]),
         ];
         engine.on_chunk_read("/movie.mkv", 0, 2, &locations);
 
