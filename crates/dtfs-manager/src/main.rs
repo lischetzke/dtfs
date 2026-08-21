@@ -692,31 +692,32 @@ fn self_register_endpoints(
     let (listen_host, grpc_port) = split_host_port(listen_addr, 9401);
     let mut endpoints: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut push = |bare: &str| {
-        let ep = endpoint_url(bare);
-        if seen.insert(ep.clone()) {
-            endpoints.push(ep);
+    // Push helpers scoped so the mut borrow of `endpoints` ends before return
+    // (rustc 1.94 E0502: closure live across `endpoints` use → ICE otherwise).
+    {
+        let mut push = |bare: &str| {
+            let ep = endpoint_url(bare);
+            if seen.insert(ep.clone()) {
+                endpoints.push(ep);
+            }
+        };
+
+        if let Some(self_v) = voters.iter().find(|v| v.hostname == hostname) {
+            push(&self_v.addr);
         }
-    };
-
-    if let Some(self_v) = voters.iter().find(|v| v.hostname == hostname) {
-        push(&self_v.addr);
-    }
-    for v in voters {
-        if v.hostname != hostname {
-            push(&v.addr);
+        for v in voters {
+            if v.hostname != hostname {
+                push(&v.addr);
+            }
         }
-    }
 
-    let local_bare = if is_wildcard_listen_host(&listen_host) {
-        format!("127.0.0.1:{grpc_port}")
-    } else {
-        format!("{listen_host}:{grpc_port}")
-    };
-    push(&local_bare);
-
-    if endpoints.is_empty() {
-        push(&format!("127.0.0.1:{grpc_port}"));
+        let local_bare = if is_wildcard_listen_host(&listen_host) {
+            format!("127.0.0.1:{grpc_port}")
+        } else {
+            format!("{listen_host}:{grpc_port}")
+        };
+        push(&local_bare);
+        // local_bare always lands at least one entry; no empty fallback needed.
     }
     endpoints
 }
