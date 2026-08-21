@@ -85,46 +85,49 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
   77 (follower loops dispatch nothing), 78 (unaligned writes lose no bytes).
   76 and 78 in `QUICK_CASES`. Authored, not yet executed.
 
-### In flight (parallel ports)
+### Ported (all five areas complete)
 
-- `REV-1-1` ⬜ leader-gate `TieringEngine::run`, `run_orphan_scrub`,
-  `run_auto_unquarantine_sweep`, `run_lease_gc`, `POST /api/v1/cache/flush`.
-- `REV-1-2` ⬜ orphan-reaper freshness gate.
+- `REV-1-1` ✅ leader-gate `TieringEngine::run`, `run_orphan_scrub`,
+  `run_auto_unquarantine_sweep`, `run_lease_gc`, `POST /api/v1/files/flush_cache` (the route moved on this base).
+- `REV-1-2` ✅ orphan-reaper freshness gate.
 - `REV-1-6` ✅ **not ported — already fixed upstream.** The mid-chunk branch
   returns early and defers the buffer to `flush_all`; `co_1_7_*` PASSES on this
   base and only its comment is stale. Release case 78 keeps it pinned.
 - `REV-2-1b` ✅ client half: resolve chunks by `chunk_index`, not array position.
 - `REV-2-3` ✅ readahead prefetches via the foreground read's candidate order.
 - `REV-2-4` ✅ verify the FUSE local cache against the chunk id before serving.
-- `REV-3-2` ⬜ incremental `ListChunks` paging.
-- `REV-3-4` ⬜ cap scheduler task creation per tick and overall.
-- `REV-3-5` ⬜ memory rung gates on Shed and is self-limiting.
-- `REV-3-7` ⬜ one liveness definition across backfill / rebalance / anchor-lag /
+- `REV-3-2` ✅ incremental `ListChunks` paging.
+- `REV-3-4` ✅ cap scheduler task creation per tick and overall.
+- `REV-3-5` ✅ memory rung gates on Shed and is self-limiting.
+- `REV-3-7` ✅ one liveness definition across backfill / rebalance / anchor-lag /
   the anchor-survivor scan.
-- `REV-3-8` ⬜ batch the heartbeat integrity-fault handler.
-- `REV-3-9` ⬜ operator maintenance survives a heartbeat.
-- `REV-3-10` ⬜ reconcile a stale location row instead of quarantining the node.
-- `REV-3-11` ⬜ three-way merge for `migration_state_json`.
+- `REV-3-8` ✅ batch the heartbeat integrity-fault handler.
+- `REV-3-9` ✅ **not ported — already fixed upstream (CO-3-8).** operator maintenance survives a heartbeat.
+- `REV-3-10` ✅ reconcile a stale location row instead of quarantining the node.
+- `REV-3-11` ✅ **not ported — already fixed upstream (CO-3-5 `migration_state_lock`).** three-way merge for `migration_state_json`.
 - `REV-3-12` ✅ single-sweep cache eviction, off the read path.
-- `REV-4-1` ⬜ WebUI escaping + CSP.
-- `REV-4-2` ⬜ cap `AllocateChunks.num_chunks` at the boundary.
-- `REV-4-3` ⬜ config write validates by re-parsing, atomic rename.
-- `REV-4-4` ⬜ scrub survives one bad file.
-- `REV-4-5` ⬜ phantom ARC cache no longer throttles `put_chunk`.
-- `REV-4-6` ⬜ register a completed replica against every referencing file.
-- `REV-4-8` ⬜ bound the legacy temperature path; fix its anchor guard.
-- `REV-4-10` ⬜ clamp allocation RF up to the ack floor.
+- `REV-4-1` ✅ WebUI escaping + CSP.
+- `REV-4-2` ✅ cap `AllocateChunks.num_chunks` at the boundary.
+- `REV-4-3` ✅ config write validates by re-parsing, atomic rename.
+- `REV-4-4` ✅ scrub survives one bad file.
+- `REV-4-5` ✅ phantom ARC cache no longer throttles `put_chunk`.
+- `REV-4-6` ✅ register a completed replica against every referencing file.
+- `REV-4-8` ✅ bound the legacy temperature path; fix its anchor guard.
+- `REV-4-10` ✅ clamp allocation RF up to the ack floor.
 
 ### Follow-ups opened while executing
 
 - `REV-4-11` ⬜ release cases for REV-3-2, REV-4-4, REV-4-5 (all cluster-visible
   per § B.5).
-- `REV-4-12` ⬜ the WebUI "Apply + write to disk" button posts a SPARSE patch, so
-  after REV-4-3 it gets a clean 4xx instead of corrupting the file. Making it
-  work needs the patch merged onto the running config server-side.
-- `REV-4-13` ⬜ if REV-4-5 removes the ARC cache from the live path, sync the
-  config surface (`deploy/examples/data.toml`, `docs/src/configuration/`) and
-  drop the dead `ArcCache` / `run_monitor_with_cache`.
+- `REV-4-12` ✅ **moot on this base.** CO-4-3 already merges the sparse patch
+  onto the running config and validates the merged whole, so the "Apply + write
+  to disk" button still works; REV-4-3 only refuses payloads whose merged result
+  would not render to re-parsable TOML.
+- `REV-4-13` ✅ config surface synced (`deploy/examples/data.toml`,
+  `docs/src/configuration/data-node.md` mark `[cache]` inert; AGENTS.md A.3.2 /
+  A.8 updated; `run_monitor_with_cache` deleted). `cache.rs` itself is kept,
+  unwired, with a header explaining why it must not be re-wired for whole
+  chunks.
 - `REV-4-14` ⬜ `docs/src/access/fuse-mount.md:139` claims a volume without warm
   caching ignores the `first_write_tier` hint. No such check exists. Fix the doc
   or implement the valve.
@@ -166,6 +169,32 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
     fixture, since verify-on-read makes id == BLAKE3(content) load-bearing.
   - REV-3-12 discriminates: with the counter moved back into the victim loop it
     reports `left: 3  right: 1` for three victims.
+
+- **Port complete** — 2026-08-21. `cargo test --workspace --release`:
+  dtfs-manager 326, dtfs-raft 88, dtfs-data 89, dtfs-fuse 61, dtfs-common 81,
+  dtfs-client 31, dtfs-cli 12; 0 failed anywhere. Four more findings turned out
+  to be already fixed on this base and were NOT ported - REV-1-6, REV-3-9
+  (CO-3-8), REV-3-11 (CO-3-5's `migration_state_lock` serialises both
+  load-modify-save paths, so the three-way merge would be dead machinery) and
+  REV-4-8's anchor half (CO-4-7). Each was confirmed by reading the code, not
+  by grep alone.
+  Adaptations worth recording:
+  - the tiering state sweep had to move ABOVE the new leader gate: followers
+    ingest `report_access` without ever evaluating, so gating the sweep would
+    have leaked `access_stats`/`read_windows` on exactly those nodes;
+  - REV-3-10's reconcile is itself bounded by `should_quarantine_for_missing`,
+    so a wiped 50 TB disk quarantines directly instead of issuing one Raft
+    write per chunk - which would have re-created the flood REV-3-4 bounds;
+  - REV-4-4 was partly fixed by CO-4-2; the residue was the directory walk
+    still using `?` (one unreadable bucket killed the pass) and a chunk removed
+    by GC mid-scan being reported as corrupt, making the manager repair a
+    deliberately deleted chunk;
+  - `list_all_chunks_with_mtime` and `find_file_for_chunk` are now unused in
+    production and kept only as test oracles.
+  Deviation from § B.7: AGENTS.md A.3.2 / A.5 / A.8 were updated in the FIRST
+  commit of the series rather than split across all four, because the four
+  commits are one logical change to a single file and git offers no clean way
+  to split a paragraph across commits.
 
 ## Deviations
 
