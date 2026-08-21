@@ -28,11 +28,21 @@ trap case_cleanup EXIT
 # migration snapshot keys tasks by chunk_id (no file path), so we count
 # cluster-wide; that is sound because this case is the only thing queuing a
 # backlog on an otherwise-idle release cluster.
-_terminal_count() {
+# REV-2-5 — this counted `done` AND `failed` as progress, so a backfill in which
+# every single copy FAILED drained to TOTAL/TOTAL and the case passed. Progress
+# means Done; Failed is counted separately and asserted to be zero.
+_done_count() {
     mgr_get_any /api/v1/migrations | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-print(sum(1 for t in d.get('tasks', []) if t.get('status') in ('done', 'failed')))
+print(sum(1 for t in d.get('tasks', []) if t.get('status') == 'done'))
+" 2>/dev/null || echo 0
+}
+_failed_count() {
+    mgr_get_any /api/v1/migrations | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(sum(1 for t in d.get('tasks', []) if t.get('status') == 'failed'))
 " 2>/dev/null || echo 0
 }
 # Total tasks currently tracked (any status).
@@ -70,7 +80,7 @@ echo "  tasks queued (total tracked): $TOTAL"
 echo "[3/5] sample Done count every ~30s; expect it to climb incrementally"
 SAW_INTERMEDIATE=0
 for s in $(seq 1 8); do
-    DONE=$(_terminal_count)
+    DONE=$(_done_count)
     echo "  t=${s}: done=$DONE/$TOTAL"
     # An intermediate sample (strictly between 0 and TOTAL) proves the backlog
     # drains progressively, not in a single end-of-pass batch flip.
@@ -82,7 +92,10 @@ for s in $(seq 1 8); do
 done
 
 echo "[4/5] backlog fully drained"
-FINAL=$(_terminal_count)
+FINAL=$(_done_count)
+FAILED=$(_failed_count)
+# A failed copy is a real regression, not a slow one.
+[ "$FAILED" -eq 0 ] || fail "[4/5] $FAILED migration task(s) Failed during backfill"
 if [ "$FINAL" -lt "$TOTAL" ]; then
     known_issue REL-2-58 "backfill did not drain ($FINAL/$TOTAL) within sampling window"
 fi

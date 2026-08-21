@@ -82,6 +82,22 @@ ssh_run "$QUARANTINED_HOST" "sudo cp '$DATFILE' '$BACKUP' && \
     sudo dd if=/dev/urandom of='$DATFILE' bs=1 count=1 seek=4096 conv=notrunc status=none"
 
 # ── G: read still succeeds via fallback ──────────────────────────
+# REV-2-5 — the point of this step is to exercise verify_on_read on the data
+# node plus the P0-2 replica fallback in the client. Steps B and E already read
+# the file, so the FUSE client holds the chunk in its readahead cache AND in the
+# P0-11 local disk cache; dropping the kernel page cache alone leaves both
+# intact, the read is served locally, no data node is ever contacted, and this
+# assertion passes no matter what verify_on_read does. Purge the client's own
+# caches first: stop the mount, delete the local cache directory, restart.
+echo "[G] Purge the FUSE client caches so the read really reaches a data node"
+CACHE_DIR=$(client_run "sudo awk -F'\"' '/^[[:space:]]*local_cache_dir/ {print \$2}' /etc/dtfs/fuse.toml 2>/dev/null | head -1" || true)
+client_run "sudo systemctl stop dtfs-fuse@mnt-dtfs.service" >/dev/null 2>&1 || true
+if [ -n "$CACHE_DIR" ]; then
+    client_run "sudo rm -rf '${CACHE_DIR:?}'/*" >/dev/null 2>&1 || true
+fi
+client_run "sudo systemctl start dtfs-fuse@mnt-dtfs.service" >/dev/null 2>&1 || true
+wait_for "FUSE mount back after cache purge" 60 "client_run 'sudo mountpoint -q /mnt/dtfs' >/dev/null 2>&1"
+
 echo "[G] Read after corruption — must still match via replica fallback"
 client_run "sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'" >/dev/null 2>&1 || true
 NEWHASH=$(sha256_via_fuse "$F")
