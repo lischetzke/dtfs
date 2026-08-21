@@ -167,14 +167,18 @@ bytes must:
    (BC-12e). Disabling verify_on_read needs an explicit ack at the API
    boundary (BC-8 ack guard) and is the only mode where reads can deliver
    corrupt bytes. Scrub (quick+deep+orphan) still runs.
-7. LIS-19 / Sec R2 — when `cluster.shared_secret` is non-empty, data-plane
-   `PutChunk` / `DeleteChunk` require gRPC metadata `x-dtfs-rpc-ts` +
-   `x-dtfs-rpc-mac` (HMAC-SHA256 over
+7. LIS-19 / LIS-55 — when `cluster.shared_secret` is non-empty, data-plane
+   `PutChunk` / `DeleteChunk` / `ReplicateChunk` require gRPC metadata
+   `x-dtfs-rpc-ts` + `x-dtfs-rpc-mac` (HMAC-SHA256 over
    `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n`; DeleteChunk binds
-   `chunk_id`). Missing/invalid → `PermissionDenied`. Empty secret =
-   legacy skip (join parity). Callers that stamp: FUSE/client put,
-   data→data replication put, manager unlink fan-out + scheduler flush.
-   Deploy data+manager+fuse together. mTLS (CF-6) is complementary.
+   `chunk_id`; ReplicateChunk binds `chunk_id|target_address`).
+   Missing/invalid → `PermissionDenied`. Empty secret = legacy skip
+   (join parity); data-node startup refuses empty secret unless
+   `allow_insecure_empty_secret` (LIS-20 parity). Callers that stamp:
+   FUSE/client put, data→data replication put, manager scheduler
+   ReplicateChunk, manager unlink fan-out + scheduler flush. Deploy
+   data+manager+fuse together. GetChunk/ListChunks/VerifyChunk remain
+   open (network + TLS compensate). mTLS (CF-6) is complementary.
 
 Full audit checklist: § A.6.
 
@@ -600,10 +604,11 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   challenge/HMAC checks). docs/src/security/cluster-join.md.
 - `dtfs-manager/src/webui.rs` — embedded SPA, format-string HTML
   (`{{`/`}}` for literal braces).
-- `dtfs-data/src/server.rs::put_chunk` — streaming put path; LIS-19
-  `require_data_rpc_auth` gates PutChunk/DeleteChunk.
-- `dtfs-common/src/crypto.rs` — join HMAC + LIS-19
-  `stamp_data_rpc_auth` / `verify_data_rpc_auth`.
+- `dtfs-data/src/server.rs::put_chunk` — streaming put path; LIS-19/LIS-55
+  `require_data_rpc_auth` gates PutChunk/DeleteChunk/ReplicateChunk.
+- `dtfs-common/src/crypto.rs` — join HMAC + LIS-19/LIS-55
+  `stamp_data_rpc_auth` / `verify_data_rpc_auth` /
+  `data_rpc_replicate_binding`.
 - `dtfs-data/src/store.rs::commit_chunk_from_tmp` — atomic commit
   (§ A.6).
 - `dtfs-common/src/memory.rs` — CF-5 role-agnostic memory budget core

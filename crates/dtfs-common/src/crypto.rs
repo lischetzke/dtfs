@@ -133,7 +133,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// LIS-19 / Sec R2 — data-plane PutChunk / DeleteChunk request authentication
+// LIS-19 / LIS-55 — data-plane PutChunk / DeleteChunk / ReplicateChunk auth
 // ---------------------------------------------------------------------------
 
 /// gRPC metadata key: unix-seconds timestamp for the data-RPC MAC.
@@ -145,11 +145,18 @@ pub const DATA_RPC_MAX_SKEW_SECS: u64 = 300;
 
 /// Canonical MAC message for a data-plane mutating RPC.
 ///
-/// `method` is `PutChunk` or `DeleteChunk`. `binding` is the chunk id for
-/// DeleteChunk (binds the MAC to the destructive target) and empty for
-/// PutChunk (chunk id is not known until the stream starts).
+/// `method` is `PutChunk`, `DeleteChunk`, or `ReplicateChunk`. `binding` is:
+/// - empty for PutChunk (chunk id is not known until the stream starts)
+/// - `chunk_id` for DeleteChunk
+/// - [`data_rpc_replicate_binding`] for ReplicateChunk (`chunk_id|target_address`)
 pub fn data_rpc_mac_message(method: &str, ts_unix: u64, binding: &str) -> String {
     format!("dtfs-data-rpc\nv1\n{method}\n{ts_unix}\n{binding}\n")
+}
+
+/// MAC binding for `ReplicateChunk` — pins both chunk and outbound target
+/// so a stolen stamp cannot retarget SSRF within the skew window (LIS-55).
+pub fn data_rpc_replicate_binding(chunk_id: &str, target_address: &str) -> String {
+    format!("{chunk_id}|{target_address}")
 }
 
 /// Compute hex HMAC-SHA256 for a data-plane RPC auth stamp.
@@ -344,6 +351,31 @@ mod tests {
         let now: u64 = ts.parse().unwrap();
         assert!(verify_data_rpc_auth(
             secret, "PutChunk", &ts, &mac, "", now
+        ));
+    }
+
+    #[test]
+    fn data_rpc_replicate_binding_pins_target() {
+        let secret = "s";
+        let ts = 1_700_000_000u64;
+        let binding = data_rpc_replicate_binding("cid", "http://peer:9500");
+        let mac = compute_data_rpc_mac_hex(secret, "ReplicateChunk", ts, &binding);
+        assert!(verify_data_rpc_auth(
+            secret,
+            "ReplicateChunk",
+            &ts.to_string(),
+            &mac,
+            &binding,
+            ts
+        ));
+        let wrong = data_rpc_replicate_binding("cid", "http://evil:9500");
+        assert!(!verify_data_rpc_auth(
+            secret,
+            "ReplicateChunk",
+            &ts.to_string(),
+            &mac,
+            &wrong,
+            ts
         ));
     }
 }

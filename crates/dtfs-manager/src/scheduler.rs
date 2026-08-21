@@ -925,12 +925,29 @@ impl TaskScheduler {
                 .await
                 .map(DataServiceClient::new)
                 .map_err(|e| anyhow::anyhow!("connect to source {}: {}", source_addr, e))?;
+            let mut req = tonic::Request::new(ReplicateChunkRequest {
+                chunk_id: chunk_id.to_string(),
+                target_address: target_addr.to_string(),
+                target_tier: target_tier.to_string(),
+            });
+            {
+                use dtfs_common::crypto::{
+                    data_rpc_replicate_binding, stamp_data_rpc_auth, DATA_RPC_AUTH_MAC,
+                    DATA_RPC_AUTH_TS,
+                };
+                let secret = self.shared_secret.read().clone();
+                let binding = data_rpc_replicate_binding(chunk_id, target_addr);
+                if let Some((ts, mac)) =
+                    stamp_data_rpc_auth(&secret, "ReplicateChunk", &binding)
+                {
+                    if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                        req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                        req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                    }
+                }
+            }
             client
-                .replicate_chunk(ReplicateChunkRequest {
-                    chunk_id: chunk_id.to_string(),
-                    target_address: target_addr.to_string(),
-                    target_tier: target_tier.to_string(),
-                })
+                .replicate_chunk(req)
                 .await
                 .map_err(|e| anyhow::anyhow!("ReplicateChunk RPC: {}", e))
                 .map(|r| r.into_inner())
