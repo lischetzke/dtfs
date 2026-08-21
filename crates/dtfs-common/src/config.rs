@@ -444,9 +444,27 @@ pub struct DataClusterConfig {
     /// Endpoints are formatted the same way as `manager_addr` (`host:port`).
     #[serde(default)]
     pub manager_addrs: Vec<String>,
+    /// LIS-55 / LIS-20 parity — lab-only escape hatch. When `true`, an empty
+    /// `shared_secret` is permitted at data-node startup (auth gates skip).
+    /// Never enable in production.
+    #[serde(default)]
+    pub allow_insecure_empty_secret: bool,
 }
 
 impl DataClusterConfig {
+    /// LIS-55 / LIS-20 — refuse empty `shared_secret` unless the operator
+    /// explicitly opts into insecure lab mode.
+    pub fn validate_shared_secret(&self) -> Result<(), String> {
+        if self.shared_secret.is_empty() && !self.allow_insecure_empty_secret {
+            return Err(
+                "cluster.shared_secret is empty; set a non-empty secret, or set \
+                 cluster.allow_insecure_empty_secret = true for lab-only insecure mode"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     /// All manager endpoints in priority order: the primary first, followed
     /// by any extras. Duplicates are removed but order is preserved.
     pub fn all_manager_addrs(&self) -> Vec<String> {
@@ -1282,6 +1300,41 @@ mod tests {
             .expect("deploy/examples/data.toml must parse against DataNodeConfig");
         assert_eq!(cfg.node.hostname, "dtfs-example-data01");
         assert!(!cfg.disks.is_empty());
+        // LIS-55 / LIS-20 — example ships a non-empty secret; escape hatch off.
+        assert!(!cfg.cluster.shared_secret.is_empty());
+        assert!(!cfg.cluster.allow_insecure_empty_secret);
+        cfg.cluster
+            .validate_shared_secret()
+            .expect("example data.toml must pass shared_secret validate");
+    }
+
+    /// LIS-55 — data-node empty shared_secret refused without escape hatch.
+    #[test]
+    fn lis55_data_empty_shared_secret_rejected_by_default() {
+        let cfg = DataClusterConfig {
+            manager_addr: "mgr:9401".into(),
+            shared_secret: String::new(),
+            manager_addrs: vec![],
+            allow_insecure_empty_secret: false,
+        };
+        let err = cfg.validate_shared_secret().expect_err("empty must fail");
+        assert!(
+            err.contains("shared_secret is empty"),
+            "unexpected err: {err}"
+        );
+    }
+
+    /// LIS-55 — data-node lab escape hatch allows empty secret.
+    #[test]
+    fn lis55_data_allow_insecure_empty_secret_escape_hatch() {
+        let cfg = DataClusterConfig {
+            manager_addr: "mgr:9401".into(),
+            shared_secret: String::new(),
+            manager_addrs: vec![],
+            allow_insecure_empty_secret: true,
+        };
+        cfg.validate_shared_secret()
+            .expect("escape hatch must allow empty");
     }
 
     #[test]
