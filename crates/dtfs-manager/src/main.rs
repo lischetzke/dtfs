@@ -411,6 +411,8 @@ async fn main() -> anyhow::Result<()> {
     ));
     // CF-5 — let the scheduler skip ticks under memory pressure.
     task_scheduler.set_memory_budget(memory_budget.clone());
+    // LIS-19 — stamp DeleteChunk RPCs (flush / orphan reap) with the cluster secret.
+    task_scheduler.set_shared_secret(config.cluster.shared_secret.clone());
 
     let scheduler_ref = task_scheduler.clone();
     let scheduler_handle = tokio::spawn(async move {
