@@ -21,6 +21,7 @@ mod metadata;
 mod monitor;
 mod placement;
 mod placement_state;
+mod rest_auth;
 mod scheduler;
 mod server;
 mod shutdown;

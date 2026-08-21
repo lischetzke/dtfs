@@ -19,6 +19,11 @@ struct Args {
     #[arg(short, long, default_value = "localhost:9402", env = "DTFS_MANAGER")]
     manager: String,
 
+    /// Cluster shared secret for mutating REST (`X-Dtfs-Shared-Secret`).
+    /// Required when the manager has `[cluster].shared_secret` set (LIS-18).
+    #[arg(long, global = true, default_value = "", env = "DTFS_SHARED_SECRET", hide_env_values = true)]
+    secret: String,
+
     /// Output format
     #[arg(long, default_value = "table", global = true)]
     format: OutputFormat,
@@ -314,10 +319,12 @@ enum RaftCmd {
 struct ApiClient {
     base_url: String,
     client: reqwest::Client,
+    /// LIS-18 — sent as `X-Dtfs-Shared-Secret` on every POST when non-empty.
+    shared_secret: String,
 }
 
 impl ApiClient {
-    fn new(manager_addr: &str) -> Self {
+    fn new(manager_addr: &str, shared_secret: String) -> Self {
         let base_url = if manager_addr.starts_with("http") {
             manager_addr.to_string()
         } else {
@@ -327,6 +334,25 @@ impl ApiClient {
         Self {
             base_url,
             client: reqwest::Client::new(),
+            shared_secret,
+        }
+    }
+
+    fn apply_mutation_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.shared_secret.is_empty() {
+            req
+        } else {
+            req.header("X-Dtfs-Shared-Secret", &self.shared_secret)
+        }
+    }
+
+    /// Clone with an explicit secret (CF-2 raft subcommands take `--secret`
+    /// per-command; that value must also ride the LIS-18 header).
+    fn with_secret(&self, secret: &str) -> Self {
+        Self {
+            base_url: self.base_url.clone(),
+            client: self.client.clone(),
+            shared_secret: secret.to_string(),
         }
     }
 
@@ -346,8 +372,7 @@ impl ApiClient {
     async fn post(&self, path: &str, body: &Value) -> anyhow::Result<Value> {
         let url = format!("{}{}", self.base_url, path);
         let resp = self
-            .client
-            .post(&url)
+            .apply_mutation_auth(self.client.post(&url))
             .json(body)
             .send()
             .await?
@@ -366,7 +391,11 @@ impl ApiClient {
         body: &Value,
     ) -> anyhow::Result<(reqwest::StatusCode, Value)> {
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.client.post(&url).json(body).send().await?;
+        let resp = self
+            .apply_mutation_auth(self.client.post(&url))
+            .json(body)
+            .send()
+            .await?;
         let status = resp.status();
         let value = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
         Ok((status, value))
@@ -376,7 +405,7 @@ impl ApiClient {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let api = ApiClient::new(&args.manager);
+    let api = ApiClient::new(&args.manager, args.secret.clone());
 
     match args.command {
         Commands::Status => cmd_status(&api, &args.format).await?,
@@ -454,6 +483,7 @@ async fn main() -> anyhow::Result<()> {
                 addr,
                 secret,
             } => {
+                let api = api.with_secret(&secret);
                 cmd_raft_change(
                     &api,
                     "/api/v1/raft/add-learner",
@@ -462,6 +492,7 @@ async fn main() -> anyhow::Result<()> {
                 .await?
             }
             RaftCmd::Promote { hostname, secret } => {
+                let api = api.with_secret(&secret);
                 cmd_raft_change(
                     &api,
                     "/api/v1/raft/promote",
@@ -470,6 +501,7 @@ async fn main() -> anyhow::Result<()> {
                 .await?
             }
             RaftCmd::Remove { hostname, secret } => {
+                let api = api.with_secret(&secret);
                 cmd_raft_change(
                     &api,
                     "/api/v1/raft/remove",

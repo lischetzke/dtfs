@@ -39,6 +39,7 @@ post_leader_raft() {
     local path="$1" body="$2"
     for h in $(mgrs_list); do
         local r=$(curl "${CURL_OPTS[@]}" -X POST -H 'content-type: application/json' \
+                  -H "X-Dtfs-Shared-Secret: $SECRET" \
                   -d "$body" "http://$h:$MGR_PORT$path" 2>/dev/null)
         if [ -n "$r" ] && ! echo "$r" | grep -q 'not the leader'; then
             echo "$r"
@@ -141,6 +142,7 @@ for h in $(mgrs_list); do
     s=$(curl "${CURL_OPTS[@]}" "http://$h:$MGR_PORT/api/v1/raft/state" 2>/dev/null)
     if ! echo "$s" | grep -q "\"is_leader\":true"; then
         hint=$(curl "${CURL_OPTS[@]}" -X POST -H 'content-type: application/json' \
+            -H "X-Dtfs-Shared-Secret: $SECRET" \
             -d "{\"hostname\":\"x\",\"shared_secret\":\"$SECRET\"}" \
             "http://$h:$MGR_PORT/api/v1/raft/promote" 2>/dev/null)
         assert_match 'not the leader' "$hint" "follower 409"
