@@ -90,6 +90,8 @@ async fn main() -> Result<()> {
     let tls_ctx = dtfs_common::tls::TlsContext::from_config(&fuse_config.tls)?;
     tls_ctx.log_startup("dtfs-fuse", &fuse_config.tls.mode);
     client.set_tls(tls_ctx.clone());
+    // LIS-19 — stamp PutChunk with the same cluster secret the data node verifies.
+    client.set_shared_secret(&fuse_config.client.shared_secret);
     let endpoints: Vec<String> = fuse_config
         .client
         .all_manager_addrs()

@@ -125,6 +125,8 @@ pub struct TaskScheduler {
     /// mutations (lost task / `next_task_id` regression). Held only across
     /// the load..save critical section, never across an unrelated await.
     migration_state_lock: tokio::sync::Mutex<()>,
+    /// LIS-19 — cluster shared secret for DeleteChunk auth stamps.
+    shared_secret: parking_lot::RwLock<String>,
 }
 
 impl TaskScheduler {
@@ -149,12 +151,18 @@ impl TaskScheduler {
             failed_task_retention_ms: failed_task_retention_secs.saturating_mul(1000),
             tls,
             migration_state_lock: tokio::sync::Mutex::new(()),
+            shared_secret: parking_lot::RwLock::new(String::new()),
         }
     }
 
     /// Inject the alert dispatcher (called after main.rs has wired one).
     pub fn set_alerts(&self, alerts: Arc<crate::alerts::AlertDispatcher>) {
         *self.alerts.write() = Some(alerts);
+    }
+
+    /// LIS-19 — inject the cluster shared secret for DeleteChunk stamps.
+    pub fn set_shared_secret(&self, secret: String) {
+        *self.shared_secret.write() = secret;
     }
 
     /// CF-5 — inject the memory budget so the scheduler can skip background
@@ -1007,12 +1015,27 @@ impl TaskScheduler {
             .map(DataServiceClient::new)
             .map_err(|e| anyhow::anyhow!("connect to data node {}: {}", node_addr, e))?;
 
+        let mut req = tonic::Request::new(dtfs_proto::dtfs::data::DeleteChunkRequest {
+            chunk_id: chunk_id.to_string(),
+            disk_id,
+            tier: tier.to_string(),
+        });
+        {
+            use dtfs_common::crypto::{
+                stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+            };
+            let secret = self.shared_secret.read().clone();
+            if let Some((ts, mac)) =
+                stamp_data_rpc_auth(&secret, "DeleteChunk", chunk_id)
+            {
+                if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                    req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                    req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                }
+            }
+        }
         let resp = client
-            .delete_chunk(dtfs_proto::dtfs::data::DeleteChunkRequest {
-                chunk_id: chunk_id.to_string(),
-                disk_id,
-                tier: tier.to_string(),
-            })
+            .delete_chunk(req)
             .await
             .map_err(|e| anyhow::anyhow!("DeleteChunkReplica RPC: {}", e))?
             .into_inner();

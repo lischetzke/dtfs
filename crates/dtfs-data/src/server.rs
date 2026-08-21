@@ -16,6 +16,9 @@ use crate::replication::ReplicationManager;
 use crate::store::ChunkStore;
 use dtfs_common::checksum;
 use dtfs_common::config::ScrubConfig;
+use dtfs_common::crypto::{
+    stamp_data_rpc_auth, verify_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+};
 use tokio::sync::RwLock;
 
 /// Bug BU-6 — RAII guard that removes a streaming `.tmp` file unless
@@ -214,6 +217,54 @@ fn disk_status_proto(s: DiskStatus) -> String {
     .to_string()
 }
 
+/// LIS-19 / Sec R2 — fail-closed auth for mutating data-plane RPCs when
+/// `cluster.shared_secret` is configured. Empty secret = legacy plaintext
+/// cluster (same skip as join / ForwardClientWrite).
+fn require_data_rpc_auth(
+    secret: &str,
+    method: &str,
+    binding: &str,
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<(), Status> {
+    if secret.is_empty() {
+        return Ok(());
+    }
+    let ts = metadata
+        .get(DATA_RPC_AUTH_TS)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Status::permission_denied("missing x-dtfs-rpc-ts"))?;
+    let mac = metadata
+        .get(DATA_RPC_AUTH_MAC)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Status::permission_denied("missing x-dtfs-rpc-mac"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if !verify_data_rpc_auth(secret, method, ts, mac, binding, now) {
+        return Err(Status::permission_denied(
+            "invalid data-plane RPC auth (LIS-19)",
+        ));
+    }
+    Ok(())
+}
+
+/// Insert `x-dtfs-rpc-*` metadata onto a tonic request when a shared secret
+/// is configured. Used by callers (tests, replication) that build Requests.
+pub fn attach_data_rpc_auth<T>(
+    request: &mut Request<T>,
+    secret: &str,
+    method: &str,
+    binding: &str,
+) {
+    if let Some((ts, mac)) = stamp_data_rpc_auth(secret, method, binding) {
+        if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+            request.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+            request.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+        }
+    }
+}
+
 /// GetChunk streaming piece size. 8 MB gives tonic enough room to keep
 /// the HTTP/2 send window full on a multi-gigabit LAN (the client side
 /// bumps `max_decoding_message_size` to match — default is only 4 MB).
@@ -392,6 +443,13 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<Streaming<PutChunkRequest>>,
     ) -> Result<Response<PutChunkResponse>, Status> {
+        // LIS-19 — authenticate before allocating a write slot / tmp.
+        require_data_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "PutChunk",
+            "",
+            request.metadata(),
+        )?;
         // Bug BF-4 — self-reject ALL writes while this node has at least
         // one un-acked integrity fault outstanding. The mgr's
         // auto-quarantine path (BF-6) clears the flag via ConfigUpdate
@@ -752,7 +810,16 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<DeleteChunkRequest>,
     ) -> Result<Response<DeleteChunkResponse>, Status> {
+        // LIS-19 — bind MAC to chunk_id so a stolen stamp cannot delete
+        // an arbitrary other chunk within the skew window.
+        let md = request.metadata().clone();
         let req = request.into_inner();
+        require_data_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "DeleteChunk",
+            &req.chunk_id,
+            &md,
+        )?;
         let chunk_id_bytes = chunk_hex::decode(&req.chunk_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid chunk ID: {}", e)))?;
         if chunk_id_bytes.len() != 32 {
@@ -1184,6 +1251,74 @@ max_io_percent = 10
 
         let got = collect_stream(&svc, &chunk_hex).await.unwrap();
         assert_eq!(got, data);
+    }
+
+    // LIS-19 — unauthenticated DeleteChunk must be rejected when a
+    // shared_secret is configured (test_config uses "test-secret").
+    #[tokio::test]
+    async fn delete_chunk_rejects_missing_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"lis19-delete-auth";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(
+                &chunk_id,
+                data,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+            )
+            .await
+            .unwrap();
+
+        let err = svc
+            .delete_chunk(Request::new(DeleteChunkRequest {
+                chunk_id: chunk_hex.clone(),
+                disk_id: None,
+                tier: String::new(),
+            }))
+            .await
+            .expect_err("unauthenticated DeleteChunk must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        // Bytes must still be on disk.
+        assert!(svc.store.chunk_file_path(&chunk_id).is_some());
+    }
+
+    // LIS-19 — valid stamp allows DeleteChunk.
+    #[tokio::test]
+    async fn delete_chunk_accepts_valid_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"lis19-delete-ok";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(
+                &chunk_id,
+                data,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+            )
+            .await
+            .unwrap();
+
+        let mut req = Request::new(DeleteChunkRequest {
+            chunk_id: chunk_hex.clone(),
+            disk_id: None,
+            tier: String::new(),
+        });
+        attach_data_rpc_auth(
+            &mut req,
+            &svc.config.cluster.shared_secret,
+            "DeleteChunk",
+            &chunk_hex,
+        );
+        let resp = svc.delete_chunk(req).await.expect("authed delete");
+        assert!(resp.into_inner().success);
+        assert!(svc.store.chunk_file_path(&chunk_id).is_none());
     }
 }
 

@@ -1384,6 +1384,8 @@ impl ManagerService for MetadataService {
         let sm_for_liveness = self.sm_data.clone();
         // CF-6 — carry the TLS context into the spawned fan-out.
         let tls = self.tls.clone();
+        // LIS-19 — capture secret before spawn (self is not 'static).
+        let delete_secret = self.config.cluster.shared_secret.clone();
         tokio::spawn(async move {
             let mut skipped_live: usize = 0;
             for (addr, chunks) in by_node {
@@ -1428,11 +1430,24 @@ impl ManagerService for MetadataService {
                     // CO-1-1 — the unlink fan-out reclaims the chunk
                     // entirely (the file is gone), so it stays node-wide:
                     // disk_id absent -> legacy first-found.
-                    let req = dtfs_proto::dtfs::data::DeleteChunkRequest {
+                    let mut req = tonic::Request::new(dtfs_proto::dtfs::data::DeleteChunkRequest {
                         chunk_id: chunk_id.clone(),
                         disk_id: None,
                         tier: String::new(),
-                    };
+                    });
+                    {
+                        use dtfs_common::crypto::{
+                            stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+                        };
+                        if let Some((ts, mac)) =
+                            stamp_data_rpc_auth(&delete_secret, "DeleteChunk", &chunk_id)
+                        {
+                            if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                                req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                                req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                            }
+                        }
+                    }
                     match client.delete_chunk(req).await {
                         Ok(_) => {
                             tracing::debug!(
