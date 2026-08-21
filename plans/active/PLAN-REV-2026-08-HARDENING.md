@@ -90,8 +90,9 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
 - `REV-1-1` ⬜ leader-gate `TieringEngine::run`, `run_orphan_scrub`,
   `run_auto_unquarantine_sweep`, `run_lease_gc`, `POST /api/v1/cache/flush`.
 - `REV-1-2` ⬜ orphan-reaper freshness gate.
-- `REV-1-6` ✅ write buffer must not drain bytes it never emitted (upstream
-  already carries the failing-by-design test `co_1_7_*`).
+- `REV-1-6` ✅ **not ported — already fixed upstream.** The mid-chunk branch
+  returns early and defers the buffer to `flush_all`; `co_1_7_*` PASSES on this
+  base and only its comment is stale. Release case 78 keeps it pinned.
 - `REV-2-1b` ✅ client half: resolve chunks by `chunk_index`, not array position.
 - `REV-2-3` ✅ readahead prefetches via the foreground read's candidate order.
 - `REV-2-4` ✅ verify the FUSE local cache against the chunk id before serving.
