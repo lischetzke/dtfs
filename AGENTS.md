@@ -178,7 +178,11 @@ independent replica classes:
   configured count. Coverage counts only serviceable replicas (node not
   Down/Failed, disk not Failed/Removed — `live_replica_tier`, Bug CH),
   so node/disk loss surfaces as a tier deficit and backfills here; the
-  health monitor never schedules repair.
+  health monitor never schedules repair. The same live gate applies to
+  `stats`/`cluster_status` `anchor_pending` (`api::count_anchor_pending_files`),
+  `chunk_placement` (`placement_state::resolve_dc_tier`), and
+  `check_anchor_lag` placement builds (LIS-41) — Down-node cold must not
+  keep those counters false-green.
 - `cache_replicas.<tier>.{min,max}` — demand-driven, evictable. **Only
   the tiering engine creates them, and only when the promotion threshold
   fires** (`promote_reads` / `promote_window_secs`). The under-

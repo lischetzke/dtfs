@@ -719,17 +719,17 @@ impl TaskScheduler {
             }
 
             for (chunk_index, entries) in by_idx {
-                // Resolve the placements + tiers for this chunk.
+                // Resolve placements for this chunk. LIS-41 / Bug CH —
+                // only serviceable replicas count toward Gate 1
+                // satisfaction; a Down dc3/cold must not suppress
+                // anchor.lag_repair (and must not keep metrics green).
+                // CNF-1 disk_id keying lives inside live_replica_tier.
                 let placements: Vec<AnchorRepairPlacement> = entries
                     .iter()
                     .filter_map(|e| {
                         let nid = e.node_id.parse::<u64>().ok()?;
                         let info = sm.nodes.get(&nid)?;
-                        // CNF-1 — stable disk_id key, never Vec index (must
-                        // agree with api::count_anchor_pending_files, or the
-                        // projection reports anchor_pending the planner
-                        // never repairs).
-                        let tier = info.disk(e.disk_id).map(|d| d.tier)?;
+                        let tier = live_replica_tier(Some(info), e.disk_id)?;
                         Some(AnchorRepairPlacement {
                             node_id: nid,
                             dc: info.location.datacenter.clone(),

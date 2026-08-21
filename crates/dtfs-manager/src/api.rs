@@ -700,9 +700,10 @@ fn count_data_nodes(sm: &StateMachineData) -> usize {
 /// the anchor-pending state honest WITHOUT changing ack timing.
 ///
 /// A file is anchor-pending when its volume has an effective anchor and
-/// at least one of its chunks has no replica in the anchor DC on the
-/// required tier (mirrors `scheduler::plan_anchor_lag_repair`'s gate-1
-/// satisfaction check). Counted once per file.
+/// at least one of its chunks has no *serviceable* replica in the anchor
+/// DC on the required tier (mirrors `scheduler::plan_anchor_lag_repair`'s
+/// gate-1 after the LIS-41 live_replica_tier filter — Down/Failed nodes
+/// do not count). Counted once per file.
 /// Bug BV-1 — does any replica satisfy the anchor? A `(datacenter, tier)`
 /// list satisfies an `AnchorPolicy` when some replica sits in the anchor
 /// DC and (if `required_tier` is set) on that tier. Mirrors gate-1 of
@@ -735,14 +736,15 @@ fn count_anchor_pending_files(sm: &StateMachineData) -> usize {
             by_idx.entry(c.chunk_index).or_default().push(c);
         }
         let any_chunk_unanchored = by_idx.values().any(|entries| {
+            // LIS-41 / Bug CH — only serviceable replicas count. A Down
+            // node's dc3/cold row must not keep anchor_pending at 0.
+            // CNF-1 disk_id keying lives inside live_replica_tier.
             let placements: Vec<(String, dtfs_common::types::DiskTier)> = entries
                 .iter()
                 .filter_map(|e| {
                     let nid = e.node_id.parse::<u64>().ok()?;
                     let info = sm.nodes.get(&nid)?;
-                    // CNF-1 — stable disk_id key, never Vec index (must
-                    // agree with scheduler::check_anchor_lag's resolution).
-                    let tier = info.disk(e.disk_id).map(|d| d.tier)?;
+                    let tier = crate::scheduler::live_replica_tier(Some(info), e.disk_id)?;
                     Some((info.location.datacenter.clone(), tier))
                 })
                 .collect();
@@ -5921,6 +5923,120 @@ mod bug_bv3_data_node_count_tests {
         let any_tier = AnchorPolicy { datacenter: "dc-a".into(), required_tier: None };
         assert!(anchor_satisfied_by(&[("dc-a".into(), DiskTier::Warm)], &any_tier));
         assert!(!anchor_satisfied_by(&[("dc-b".into(), DiskTier::Cold)], &any_tier));
+    }
+
+    /// LIS-41 — Down dc3/cold must not keep `anchor_pending` at 0
+    /// when the only live replica is warm on a non-anchor DC (DC1).
+    #[test]
+    fn lis41_down_cold_counts_as_anchor_pending() {
+        use dtfs_common::types::{
+            AnchorPolicy, CacheReplication, DiskInfo, DiskStatus, DiskTier, HealthStatus,
+            NodeRole, TierReplication, VolumeConfig, VolumeId, WriteSafety,
+        };
+        use dtfs_raft::state_machine::{FileMetadata, StateMachineData};
+
+        fn disk(tier: DiskTier) -> DiskInfo {
+            DiskInfo {
+                disk_id: 0,
+                uuid: String::new(),
+                mount_path: String::new(),
+                tier,
+                total_bytes: 0,
+                used_bytes: 0,
+                status: DiskStatus::Healthy,
+            }
+        }
+        fn node(health: HealthStatus, dc: &str, tier: DiskTier) -> dtfs_raft::NodeInfo {
+            dtfs_raft::NodeInfo {
+                hostname: String::new(),
+                grpc_addr: String::new(),
+                role: NodeRole::Data,
+                disks: vec![disk(tier)],
+                location: dtfs_common::topology::Location::new("", dc, "", ""),
+                health,
+                total_capacity: 0,
+                used_capacity: 0,
+                last_seen_ms: 0,
+                total_bytes_read: 0,
+                total_bytes_written: 0,
+                client_ip: None,
+                version: String::new(),
+                build_date: String::new(),
+                quarantine: None,
+            }
+        }
+
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(1, node(HealthStatus::Healthy, "dc1", DiskTier::Warm));
+        sm.nodes.insert(2, node(HealthStatus::Down, "dc3", DiskTier::Cold));
+        sm.volumes.insert(
+            "default".into(),
+            VolumeConfig {
+                id: VolumeId::new("default".into()),
+                name: "default".into(),
+                chunk_size_bytes: 4 << 20,
+                replication: TierReplication {
+                    hot: 0,
+                    warm: 1,
+                    cold: 1,
+                    tape: 0,
+                },
+                mandatory_replicas: TierReplication {
+                    hot: 0,
+                    warm: 1,
+                    cold: 1,
+                    tape: 0,
+                },
+                cache_replicas: CacheReplication::default(),
+                anchor: Some(AnchorPolicy {
+                    datacenter: "dc3".into(),
+                    required_tier: Some(DiskTier::Cold),
+                }),
+                schedules: dtfs_common::types::VolumeSchedules::default(),
+                spill: dtfs_common::types::SpillPolicy::default(),
+                anchor_datacenter: None,
+                write_safety: WriteSafety {
+                    min_replicas_before_ack: 1,
+                    write_timeout_secs: 30,
+                },
+            },
+        );
+        sm.files.insert(
+            "/media.bin".into(),
+            FileMetadata {
+                path: "/media.bin".into(),
+                volume_id: "default".into(),
+                chunk_size: 4 << 20,
+                chunks: vec![
+                    dtfs_raft::ChunkLocationEntry {
+                        chunk_index: 0,
+                        chunk_hash: "h0".into(),
+                        node_id: "1".into(),
+                        disk_id: 0,
+                        size_bytes: 1,
+                    },
+                    dtfs_raft::ChunkLocationEntry {
+                        chunk_index: 0,
+                        chunk_hash: "h0".into(),
+                        node_id: "2".into(),
+                        disk_id: 0,
+                        size_bytes: 1,
+                    },
+                ],
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                symlink_target: None,
+                logical_size: None,
+                is_directory: false,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            },
+        );
+
+        assert_eq!(
+            count_anchor_pending_files(&sm),
+            1,
+            "Down dc3/cold must not satisfy the anchor"
+        );
     }
 }
 
