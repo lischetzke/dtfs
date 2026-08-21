@@ -151,15 +151,18 @@ pub fn count_placement_states(sm: &StateMachineData) -> PlacementCounts {
 
 /// Resolve a chunk-location row to its `(datacenter, tier)` via the node
 /// registry + the node's disk list. Returns None if the node or disk is
-/// no longer known (the replica doesn't count toward satisfaction).
+/// no longer known, **or** if the replica is not serviceable (Bug CH /
+/// LIS-41: Down/Failed node or Failed/Removed disk). Pre-LIS-41 this
+/// ignored health, so a wiped Limburg cold still counted as Stable /
+/// anchor-satisfied and `undergoal`/`anchor_pending` stayed false-green.
 fn resolve_dc_tier(
     sm: &StateMachineData,
     c: &dtfs_raft::ChunkLocationEntry,
 ) -> Option<(String, DiskTier)> {
     let nid = c.node_id.parse::<u64>().ok()?;
     let info = sm.nodes.get(&nid)?;
-    // CNF-1 — stable disk_id key, never Vec index.
-    let tier = info.disk(c.disk_id).map(|d| d.tier)?;
+    // CNF-1 disk_id keying + health gate both live in live_replica_tier.
+    let tier = crate::scheduler::live_replica_tier(Some(info), c.disk_id)?;
     Some((info.location.datacenter.clone(), tier))
 }
 
@@ -291,5 +294,136 @@ mod tests {
             "disk_id=1 lives at Vec index 0 and must resolve"
         );
         assert_eq!(resolve_dc_tier(&sm, &entry(0)), None, "no disk with id 0 exists");
+    }
+
+    // ── LIS-41 — Down-node replicas must not satisfy live coverage ──
+
+    fn lis41_disk(tier: DiskTier) -> dtfs_common::types::DiskInfo {
+        dtfs_common::types::DiskInfo {
+            disk_id: 0,
+            uuid: String::new(),
+            mount_path: String::new(),
+            tier,
+            total_bytes: 0,
+            used_bytes: 0,
+            status: dtfs_common::types::DiskStatus::Healthy,
+        }
+    }
+
+    fn lis41_node(
+        health: dtfs_common::types::HealthStatus,
+        dc: &str,
+        tier: DiskTier,
+    ) -> dtfs_raft::NodeInfo {
+        dtfs_raft::NodeInfo {
+            hostname: String::new(),
+            grpc_addr: String::new(),
+            role: dtfs_common::types::NodeRole::Data,
+            disks: vec![lis41_disk(tier)],
+            location: dtfs_common::topology::Location::new("", dc, "", ""),
+            health,
+            total_capacity: 0,
+            used_capacity: 0,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    /// LIS-41 — production post-wipe shape: warm live on FSN + cold only
+    /// on Down limburg. Pre-fix both rows resolved → Stable; post-fix
+    /// Down cold drops out → total 1 < mandatory 2 → Undergoal.
+    #[test]
+    fn lis41_down_cold_does_not_count_as_stable() {
+        use dtfs_common::types::{
+            AnchorPolicy, CacheReplication, HealthStatus, TierReplication, VolumeConfig,
+            VolumeId, WriteSafety,
+        };
+        use dtfs_raft::state_machine::FileMetadata;
+
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(
+            1,
+            lis41_node(HealthStatus::Healthy, "fsn", DiskTier::Warm),
+        );
+        sm.nodes.insert(
+            2,
+            lis41_node(HealthStatus::Down, "limburg", DiskTier::Cold),
+        );
+        sm.volumes.insert(
+            "default".into(),
+            VolumeConfig {
+                id: VolumeId::new("default".into()),
+                name: "default".into(),
+                chunk_size_bytes: 4 << 20,
+                replication: TierReplication {
+                    hot: 0,
+                    warm: 1,
+                    cold: 1,
+                    tape: 0,
+                },
+                mandatory_replicas: TierReplication {
+                    hot: 0,
+                    warm: 1,
+                    cold: 1,
+                    tape: 0,
+                },
+                cache_replicas: CacheReplication::default(),
+                anchor: Some(AnchorPolicy {
+                    datacenter: "limburg".into(),
+                    required_tier: Some(DiskTier::Cold),
+                }),
+                schedules: dtfs_common::types::VolumeSchedules::default(),
+                spill: dtfs_common::types::SpillPolicy::default(),
+                anchor_datacenter: None,
+                write_safety: WriteSafety {
+                    min_replicas_before_ack: 1,
+                    write_timeout_secs: 30,
+                },
+            },
+        );
+        sm.files.insert(
+            "/media.bin".into(),
+            FileMetadata {
+                path: "/media.bin".into(),
+                volume_id: "default".into(),
+                chunk_size: 4 << 20,
+                chunks: vec![
+                    dtfs_raft::ChunkLocationEntry {
+                        chunk_index: 0,
+                        chunk_hash: "h0".into(),
+                        node_id: "1".into(),
+                        disk_id: 0,
+                        size_bytes: 1,
+                    },
+                    dtfs_raft::ChunkLocationEntry {
+                        chunk_index: 0,
+                        chunk_hash: "h0".into(),
+                        node_id: "2".into(),
+                        disk_id: 0,
+                        size_bytes: 1,
+                    },
+                ],
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                symlink_target: None,
+                logical_size: None,
+                is_directory: false,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            },
+        );
+
+        let c = count_placement_states(&sm);
+        assert_eq!(c.stable, 0, "Down cold must not keep the chunk Stable");
+        assert_eq!(
+            c.undergoal, 1,
+            "live warm-only must be Undergoal vs warm=1+cold=1"
+        );
+        assert_eq!(c.misplaced, 0);
+        assert_eq!(c.missing, 0);
     }
 }
