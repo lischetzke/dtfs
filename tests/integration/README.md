@@ -12,18 +12,21 @@ Integration tests for DTFS use a multi-node cluster spun up via docker-compose.
 There is **no** Cargo integration test binary named `integration` in this workspace. Tests are the **shell scripts** under this directory (see numbered `*.sh` files and `run_all.sh` where present).
 
 ```bash
-# Build the docker images
-cd deploy && docker compose build
+# Small lab (1 manager + 2 data) — preferred for local Docker verification
+cd deploy && docker compose -f docker-compose.lab.yml up -d --build
 
-# Start the test cluster
-docker compose up -d
+# Full multi-DC compose (3 managers + 4 data); needs cross-network join config
+# to form a real Raft quorum — see docker-compose.yml
+docker compose up -d --build
 
 # Run shell integration scripts (example — see scripts for exact usage)
-cd tests/integration && ./run_all.sh
+cd ../tests/integration && ./run_all.sh
 
 # Tear down
-cd ../../deploy && docker compose down -v
+cd ../../deploy && docker compose -f docker-compose.lab.yml down -v
 ```
+
+Builder image is `rust:1.88-bookworm` (Cargo.lock needs ≥1.88). Data services run as root in compose so named volumes can accept disk UUID writes.
 
 ## Test Categories
 
