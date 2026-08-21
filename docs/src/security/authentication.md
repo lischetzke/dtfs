@@ -19,6 +19,8 @@ Accepted presentation (either):
 - Header `X-Dtfs-Shared-Secret: <secret>`
 - Header `Authorization: Bearer <secret>`
 
+Comparisons use constant-time equality (same helper as join / ForwardWrite).
+
 Read-only `GET` endpoints stay open so operator dashboards on a
 trusted network can poll status without embedding the secret in the
 browser. **This does not replace TLS** (R5 / CF-6).
@@ -56,6 +58,30 @@ dtfs-cli --manager mgr01:9402 scrub --level quick
 Raft membership still takes `--secret` for the JSON body; the CLI also
 sends it as `X-Dtfs-Shared-Secret`.
 
+## Mutating manager metadata gRPC (LIS-56)
+
+When `shared_secret` is **non-empty**, client-facing mutating
+`ManagerService` RPCs (`CreateFile`, `DeleteFile`, `RenameFile`,
+`AllocateChunks`, `CommitChunkLocations`, write leases, locks, …)
+require HMAC metadata (same header names as LIS-19 data-plane auth):
+
+| Metadata | Meaning |
+|----------|---------|
+| `x-dtfs-rpc-ts` | unix seconds |
+| `x-dtfs-rpc-mac` | hex HMAC-SHA256 |
+
+MAC message plane is `dtfs-mgr-rpc` (not `dtfs-data-rpc`) so a data-plane
+stamp cannot be replayed against the manager. Binding is typically the
+target path. Missing/invalid → gRPC `PERMISSION_DENIED`. Empty secret →
+legacy skip.
+
+`dtfs-client` (FUSE / CLI) stamps these from `[client].shared_secret`.
+Read-only RPCs (`GetFileLocations`, `ListDirectory`, …) stay open.
+`RegisterNode` keeps its body `shared_secret` field; `ForwardClientWrite`
+keeps CO-2-2 body auth; heartbeats stay on the data-node trust path.
+
+**REST and gRPC are independent gates** — securing only `:9402` leaves
+`:9401` open to anyone who can dial the leader.
 ## WebUI
 
 The embedded WebUI stores the cluster `shared_secret` in browser

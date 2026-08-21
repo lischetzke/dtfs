@@ -395,6 +395,43 @@ fn forward_secret_ok(configured: &str, presented: &str) -> bool {
     dtfs_common::crypto::constant_time_eq(configured.as_bytes(), presented.as_bytes())
 }
 
+/// LIS-56 — fail-closed auth for mutating ManagerService client RPCs when
+/// `cluster.shared_secret` is configured. Empty secret = legacy plaintext
+/// skip (same contract as LIS-19 / ForwardClientWrite). Uses the
+/// `dtfs-mgr-rpc` MAC plane so data-plane stamps cannot be replayed here.
+fn require_mgr_rpc_auth(
+    secret: &str,
+    method: &str,
+    binding: &str,
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<(), Status> {
+    use dtfs_common::crypto::{
+        verify_mgr_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+    };
+    if secret.is_empty() {
+        return Ok(());
+    }
+    let ts = metadata
+        .get(DATA_RPC_AUTH_TS)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Status::permission_denied("missing x-dtfs-rpc-ts"))?;
+    let mac = metadata
+        .get(DATA_RPC_AUTH_MAC)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Status::permission_denied("missing x-dtfs-rpc-mac"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if !verify_mgr_rpc_auth(secret, method, ts, mac, binding, now) {
+        tracing::warn!(method, "ManagerService mutation rejected: invalid RPC auth (LIS-56)");
+        return Err(Status::permission_denied(
+            "invalid manager metadata RPC auth (LIS-56)",
+        ));
+    }
+    Ok(())
+}
+
 /// Bug CH — commit a `ClientRequest` from ANY manager: local
 /// `client_write` when this node is the leader, `ForwardClientWrite`
 /// proxy to the leader otherwise.
@@ -474,6 +511,52 @@ mod co_2_2_forward_auth_tests {
         assert!(!forward_secret_ok("s3cr3t", "wrong"));
         // Configured-but-missing (empty presented) is rejected.
         assert!(!forward_secret_ok("s3cr3t", ""));
+    }
+}
+
+#[cfg(test)]
+mod lis56_mgr_rpc_auth_tests {
+    use super::require_mgr_rpc_auth;
+    use dtfs_common::crypto::{
+        stamp_mgr_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+    };
+    use tonic::metadata::MetadataMap;
+
+    fn meta_with(ts: &str, mac: &str) -> MetadataMap {
+        let mut m = MetadataMap::new();
+        m.insert(DATA_RPC_AUTH_TS, ts.parse().unwrap());
+        m.insert(DATA_RPC_AUTH_MAC, mac.parse().unwrap());
+        m
+    }
+
+    #[test]
+    fn empty_secret_allows_without_headers() {
+        assert!(require_mgr_rpc_auth("", "DeleteFile", "/x", &MetadataMap::new()).is_ok());
+    }
+
+    #[test]
+    fn missing_headers_denied_when_secret_set() {
+        let err = require_mgr_rpc_auth("s3cret", "DeleteFile", "/x", &MetadataMap::new())
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("missing x-dtfs-rpc-ts"));
+    }
+
+    #[test]
+    fn valid_stamp_accepted() {
+        let secret = "s3cret";
+        let (ts, mac) = stamp_mgr_rpc_auth(secret, "DeleteFile", "/media/a").unwrap();
+        let meta = meta_with(&ts, &mac);
+        assert!(require_mgr_rpc_auth(secret, "DeleteFile", "/media/a", &meta).is_ok());
+    }
+
+    #[test]
+    fn wrong_binding_denied() {
+        let secret = "s3cret";
+        let (ts, mac) = stamp_mgr_rpc_auth(secret, "DeleteFile", "/a").unwrap();
+        let meta = meta_with(&ts, &mac);
+        let err = require_mgr_rpc_auth(secret, "DeleteFile", "/b", &meta).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 }
 
@@ -642,6 +725,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<CreateFileRequest>,
     ) -> Result<Response<CreateFileResponse>, Status> {
+        let binding = request.get_ref().path.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "CreateFile",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         info!("CreateFile: {}", req.path);
 
@@ -1316,6 +1406,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<DeleteFileRequest>,
     ) -> Result<Response<DeleteFileResponse>, Status> {
+        let binding = request.get_ref().path.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "DeleteFile",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         info!("DeleteFile: {}", req.path);
 
@@ -1536,6 +1633,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<AllocateChunksRequest>,
     ) -> Result<Response<AllocateChunksResponse>, Status> {
+        let binding = request.get_ref().path.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "AllocateChunks",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         info!(
             "AllocateChunks for file: {}, count: {}",
@@ -1844,6 +1948,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<CommitChunkLocationsRequest>,
     ) -> Result<Response<CommitChunkLocationsResponse>, Status> {
+        let binding = request.get_ref().path.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "CommitChunkLocations",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
 
         // Reverse-look up numeric node IDs from gRPC addresses before storing.
@@ -1963,6 +2074,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<RenameFileRequest>,
     ) -> Result<Response<RenameFileResponse>, Status> {
+        let binding = format!("{}\n{}", request.get_ref().from, request.get_ref().to);
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "RenameFile",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         tracing::info!("RenameFile: {} -> {}", req.from, req.to);
         let resp = self
@@ -1991,6 +2109,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<SetFileSizeRequest>,
     ) -> Result<Response<SetFileSizeResponse>, Status> {
+        let binding = request.get_ref().path.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "SetFileSize",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         tracing::debug!("SetFileSize: {} -> {}", req.path, req.new_size);
         let resp = self
@@ -2019,6 +2144,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<CreateSymlinkRequest>,
     ) -> Result<Response<CreateSymlinkResponse>, Status> {
+        let binding = request.get_ref().path.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "CreateSymlink",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         tracing::info!("Symlink: {} -> {}", req.path, req.target);
         let resp = self
@@ -2067,6 +2199,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<CreateLinkRequest>,
     ) -> Result<Response<CreateLinkResponse>, Status> {
+        let binding = format!("{}\n{}", request.get_ref().source, request.get_ref().dest);
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "CreateLink",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         tracing::info!("Link: {} -> {}", req.source, req.dest);
         let resp = self
@@ -2116,6 +2255,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<AcquireLockRequest>,
     ) -> Result<Response<AcquireLockResponse>, Status> {
+        let binding = request.get_ref().path.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "AcquireLock",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2158,6 +2304,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<ReleaseLockRequest>,
     ) -> Result<Response<ReleaseLockResponse>, Status> {
+        let binding = request.get_ref().path.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "ReleaseLock",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         let _ = self
             .raft_write(ClientRequest::ReleaseLock {
@@ -2207,6 +2360,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<AcquireWriteLeaseRequest>,
     ) -> Result<Response<AcquireWriteLeaseResponse>, Status> {
+        let binding = request.get_ref().path.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "AcquireWriteLease",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2254,6 +2414,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<RenewWriteLeaseRequest>,
     ) -> Result<Response<RenewWriteLeaseResponse>, Status> {
+        let binding = request.get_ref().path.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "RenewWriteLease",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2289,6 +2456,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<ReleaseWriteLeaseRequest>,
     ) -> Result<Response<ReleaseWriteLeaseResponse>, Status> {
+        let binding = request.get_ref().path.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "ReleaseWriteLease",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         let _ = self
             .raft_write(ClientRequest::ReleaseWriteLease {
@@ -2303,6 +2477,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<ReleaseLeasesByHostRequest>,
     ) -> Result<Response<ReleaseLeasesByHostResponse>, Status> {
+        let binding = request.get_ref().hostname.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "ReleaseLeasesByHost",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         // Bug CD — supply now_ms so the apply reaps only expired host leases
         // (a live, renewing concurrent client is never expired, never dropped).

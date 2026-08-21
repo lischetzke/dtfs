@@ -210,9 +210,31 @@ impl DtfsClient {
 
     /// LIS-19 — set the cluster shared secret used to stamp PutChunk
     /// metadata. Call once after construction from fuse.toml
-    /// `[client].shared_secret`.
+    /// `[client].shared_secret`. Also used by LIS-56 to stamp mutating
+    /// ManagerService RPCs (`dtfs-mgr-rpc` plane).
     pub fn set_shared_secret(&self, secret: &str) {
         *self.inner.shared_secret.write() = secret.to_string();
+    }
+
+    /// LIS-56 — attach `x-dtfs-rpc-*` metadata for a mutating manager RPC.
+    fn stamp_mgr_mutation<T>(
+        &self,
+        method: &str,
+        binding: &str,
+        body: T,
+    ) -> tonic::Request<T> {
+        use dtfs_common::crypto::{
+            stamp_mgr_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+        };
+        let mut req = tonic::Request::new(body);
+        let secret = self.inner.shared_secret.read().clone();
+        if let Some((ts, mac)) = stamp_mgr_rpc_auth(&secret, method, binding) {
+            if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+            }
+        }
+        req
     }
 
     /// CF-6 — install the resolved `[tls]` context. Must be called before
@@ -311,7 +333,7 @@ impl DtfsClient {
         };
         let response = self
             .call_manager("create_file", false, |mut c| {
-                let r = request.clone();
+                let r = self.stamp_mgr_mutation("CreateFile", &request.path, request.clone());
                 async move { c.create_file(r).await }
             })
             .await?;
@@ -341,7 +363,7 @@ impl DtfsClient {
         };
         let response = self
             .call_manager("delete_file", false, |mut c| {
-                let r = request.clone();
+                let r = self.stamp_mgr_mutation("DeleteFile", &request.path, request.clone());
                 async move { c.delete_file(r).await }
             })
             .await?;
@@ -435,7 +457,7 @@ impl DtfsClient {
         };
         let response = self
             .call_manager("allocate_chunks", false, |mut c| {
-                let r = request.clone();
+                let r = self.stamp_mgr_mutation("AllocateChunks", &request.path, request.clone());
                 async move { c.allocate_chunks(r).await }
             })
             .await?;
@@ -465,7 +487,11 @@ impl DtfsClient {
         };
         let response = self
             .call_manager("commit_chunk_locations", false, |mut c| {
-                let r = request.clone();
+                let r = self.stamp_mgr_mutation(
+                    "CommitChunkLocations",
+                    &request.path,
+                    request.clone(),
+                );
                 async move { c.commit_chunk_locations(r).await }
             })
             .await?;
@@ -946,7 +972,8 @@ impl DtfsClient {
         };
         let resp = self
             .call_manager("rename_file", false, |mut c| {
-                let r = request.clone();
+                let binding = format!("{}\n{}", request.from, request.to);
+                let r = self.stamp_mgr_mutation("RenameFile", &binding, request.clone());
                 async move { c.rename_file(r).await }
             })
             .await?
@@ -965,7 +992,7 @@ impl DtfsClient {
         };
         let resp = self
             .call_manager("set_file_size", false, |mut c| {
-                let r = request.clone();
+                let r = self.stamp_mgr_mutation("SetFileSize", &request.path, request.clone());
                 async move { c.set_file_size(r).await }
             })
             .await?
@@ -984,7 +1011,7 @@ impl DtfsClient {
         };
         let resp = self
             .call_manager("create_symlink", false, |mut c| {
-                let r = request.clone();
+                let r = self.stamp_mgr_mutation("CreateSymlink", &request.path, request.clone());
                 async move { c.create_symlink(r).await }
             })
             .await?
@@ -1021,7 +1048,8 @@ impl DtfsClient {
         };
         let resp = self
             .call_manager("create_link", false, |mut c| {
-                let r = request.clone();
+                let binding = format!("{}\n{}", request.source, request.dest);
+                let r = self.stamp_mgr_mutation("CreateLink", &binding, request.clone());
                 async move { c.create_link(r).await }
             })
             .await?
@@ -1068,7 +1096,7 @@ impl DtfsClient {
         };
         let resp = self
             .call_manager("acquire_lock", false, |mut c| {
-                let r = request.clone();
+                let r = self.stamp_mgr_mutation("AcquireLock", &request.path, request.clone());
                 async move { c.acquire_lock(r).await }
             })
             .await?
@@ -1091,7 +1119,7 @@ impl DtfsClient {
         };
         let _ = self
             .call_manager("release_lock", false, |mut c| {
-                let r = request.clone();
+                let r = self.stamp_mgr_mutation("ReleaseLock", &request.path, request.clone());
                 async move { c.release_lock(r).await }
             })
             .await?;
@@ -1138,7 +1166,11 @@ impl DtfsClient {
         };
         let resp = self
             .call_manager("acquire_write_lease", false, |mut c| {
-                let r = request.clone();
+                let r = self.stamp_mgr_mutation(
+                    "AcquireWriteLease",
+                    &request.path,
+                    request.clone(),
+                );
                 async move { c.acquire_write_lease(r).await }
             })
             .await?
@@ -1159,7 +1191,11 @@ impl DtfsClient {
         };
         let resp = self
             .call_manager("renew_write_lease", false, |mut c| {
-                let r = request.clone();
+                let r = self.stamp_mgr_mutation(
+                    "RenewWriteLease",
+                    &request.path,
+                    request.clone(),
+                );
                 async move { c.renew_write_lease(r).await }
             })
             .await?
@@ -1178,7 +1214,11 @@ impl DtfsClient {
         };
         let _ = self
             .call_manager("release_write_lease", false, |mut c| {
-                let r = request.clone();
+                let r = self.stamp_mgr_mutation(
+                    "ReleaseWriteLease",
+                    &request.path,
+                    request.clone(),
+                );
                 async move { c.release_write_lease(r).await }
             })
             .await?;
@@ -1196,7 +1236,11 @@ impl DtfsClient {
         };
         let resp = self
             .call_manager("release_leases_by_host", false, |mut c| {
-                let r = request.clone();
+                let r = self.stamp_mgr_mutation(
+                    "ReleaseLeasesByHost",
+                    &request.hostname,
+                    request.clone(),
+                );
                 async move { c.release_leases_by_host(r).await }
             })
             .await?

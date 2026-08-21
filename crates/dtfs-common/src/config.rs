@@ -395,16 +395,17 @@ impl ClusterConfig {
 
     /// Whether a provided RegisterNode / join secret is acceptable.
     ///
-    /// Non-empty cluster secret: equality check (missing provided → reject).
-    /// Empty cluster secret: only when `allow_insecure_empty_secret` was set
-    /// at load (lab fail-open).
+    /// Non-empty cluster secret: constant-time equality check (missing
+    /// provided → reject). Empty cluster secret: only when
+    /// `allow_insecure_empty_secret` was set at load (lab fail-open).
     pub fn accepts_shared_secret(&self, provided: Option<&str>) -> bool {
         if self.shared_secret.is_empty() {
             return self.allow_insecure_empty_secret;
         }
-        provided
-            .map(|s| s == self.shared_secret.as_str())
-            .unwrap_or(false)
+        match provided {
+            Some(s) => crate::crypto::constant_time_eq(s.as_bytes(), self.shared_secret.as_bytes()),
+            None => false,
+        }
     }
 }
 
