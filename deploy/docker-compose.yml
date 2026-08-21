@@ -64,6 +64,8 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.data
     container_name: dtfs-data-1
+    # Named volumes are root-owned; USER dtfs in the image cannot write disk UUID/dirs.
+    user: "0:0"
     volumes:
       - ./configs/data-1.toml:/etc/dtfs/data.toml:ro
       - data1-ssd:/mnt/ssd-a
@@ -79,6 +81,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.data
     container_name: dtfs-data-2
+    user: "0:0"
     volumes:
       - ./configs/data-2.toml:/etc/dtfs/data.toml:ro
       - data2-ssd:/mnt/ssd-a
@@ -94,6 +97,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.data
     container_name: dtfs-data-3
+    user: "0:0"
     volumes:
       - ./configs/data-3.toml:/etc/dtfs/data.toml:ro
       - data3-ssd:/mnt/ssd-a
@@ -109,6 +113,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.data
     container_name: dtfs-data-4
+    user: "0:0"
     volumes:
       - ./configs/data-4.toml:/etc/dtfs/data.toml:ro
       - data4-hdd-a:/mnt/hdd-a
