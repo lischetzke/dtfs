@@ -99,6 +99,21 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .header-title span {{ color: var(--primary); }}
         .header-meta {{ font-size: .8rem; color: var(--text-muted); text-align: right; }}
         .header-meta b {{ color: var(--text); }}
+        /* LIS-35 — session shared_secret status (not the secret value) */
+        .auth-badge {{
+            display: inline-block; margin-top: .25rem;
+            font-size: .72rem; font-weight: 600; letter-spacing: .02em;
+            padding: .15rem .45rem; border-radius: .25rem; cursor: pointer;
+            border: 1px solid var(--border); background: var(--surface2);
+            color: var(--text-muted); font-family: inherit;
+        }}
+        .auth-badge.auth-set {{
+            border-color: #166534; color: var(--success); background: #14532d33;
+        }}
+        .auth-badge.auth-missing {{
+            border-color: #92400e; color: var(--warning); background: #78350f33;
+        }}
+        .auth-badge:hover {{ border-color: var(--primary); color: var(--text); }}
 
         /* ── Nav ── */
         .nav {{
@@ -498,7 +513,10 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     </div>
     <div class="header-meta">
         Manager: <b>{hostname}</b><br>
-        <span id="refresh-time">Loading…</span>
+        <span id="refresh-time">Loading…</span><br>
+        <button type="button" class="auth-badge auth-missing" id="auth-badge"
+                title="Mutating POSTs need X-Dtfs-Shared-Secret when the cluster secret is set"
+                onclick="promptSharedSecret('Set session shared_secret for mutating WebUI actions')">Secret: not set</button>
     </div>
 </div>
 
@@ -860,6 +878,112 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         const sy = window.scrollY;
         el.innerHTML = html;
         window.scrollTo(sx, sy);
+    }}
+
+    // ── LIS-35: session shared_secret for mutating REST ─────────────────────
+    // Secret lives in sessionStorage only — never embedded in HTML/page source.
+    // GETs stay unauthenticated; POSTs attach X-Dtfs-Shared-Secret when set.
+    const DTFS_SECRET_KEY = 'dtfs.shared_secret';
+
+    function getSharedSecret() {{
+        try {{ return sessionStorage.getItem(DTFS_SECRET_KEY) || ''; }}
+        catch (_) {{ return ''; }}
+    }}
+
+    function setSharedSecret(value) {{
+        try {{
+            const v = (value || '').trim();
+            if (v) sessionStorage.setItem(DTFS_SECRET_KEY, v);
+            else sessionStorage.removeItem(DTFS_SECRET_KEY);
+        }} catch (_) {{}}
+        updateAuthBadge();
+        const status = document.getElementById('session-secret-status');
+        if (status) {{
+            status.textContent = getSharedSecret()
+                ? 'Stored in sessionStorage for this browser tab.'
+                : 'Not set - mutating POSTs will 401 if the cluster secret is configured.';
+            status.style.color = getSharedSecret() ? 'var(--success)' : 'var(--text-muted)';
+        }}
+    }}
+
+    function clearSharedSecret() {{
+        setSharedSecret('');
+        const input = document.getElementById('session-secret-input');
+        if (input) input.value = '';
+    }}
+
+    function updateAuthBadge() {{
+        const el = document.getElementById('auth-badge');
+        if (!el) return;
+        const set = !!getSharedSecret();
+        el.textContent = set ? 'Secret: session' : 'Secret: not set';
+        el.classList.toggle('auth-set', set);
+        el.classList.toggle('auth-missing', !set);
+        el.title = set
+            ? 'X-Dtfs-Shared-Secret will be sent on mutating POSTs (sessionStorage). Click to change.'
+            : 'Mutating POSTs get 401 if shared_secret is set. Click to store secret in sessionStorage.';
+    }}
+
+    function promptSharedSecret(reason) {{
+        const msg = (reason || 'Cluster shared_secret')
+            + '\n\nStored in sessionStorage only (cleared when the tab closes). Not written into the page.';
+        const entered = window.prompt(msg, '');
+        if (entered === null) return getSharedSecret();
+        setSharedSecret(entered);
+        return getSharedSecret();
+    }}
+
+    function saveSessionSecretFromSettings() {{
+        const input = document.getElementById('session-secret-input');
+        setSharedSecret(input ? input.value : '');
+        if (input) input.value = '';
+    }}
+
+    /** Merge Content-Type + X-Dtfs-Shared-Secret when a session secret exists. */
+    function authHeaders(extra) {{
+        const h = Object.assign({{ 'Content-Type': 'application/json' }}, extra || {{}});
+        const s = getSharedSecret();
+        if (s) h['X-Dtfs-Shared-Secret'] = s;
+        return h;
+    }}
+
+    /**
+     * Human-readable 401/403 copy for operators (Recognition over Recall).
+     * Returns null when status is not an auth denial.
+     */
+    function formatAuthError(status, bodyText, parsed) {{
+        if (status === 401) {{
+            return '401 Unauthorized - shared_secret required. '
+                + 'Set Session secret (header badge or Settings), then retry.';
+        }}
+        if (status === 403) {{
+            let detail = '';
+            if (parsed && parsed.error) detail = ' (' + parsed.error + ')';
+            else if (bodyText && bodyText.length < 200 && bodyText.indexOf('<') === -1)
+                detail = ' (' + bodyText + ')';
+            return '403 Forbidden - shared_secret mismatch' + detail + '. '
+                + 'Update Session secret (header badge or Settings), then retry.';
+        }}
+        return null;
+    }}
+
+    /**
+     * Mutating fetch: prompt once if secret empty, attach auth header, return
+     * {{ resp, text, json, authError }}. Body is consumed once.
+     */
+    async function mutateFetch(url, options) {{
+        if (!getSharedSecret()) {{
+            promptSharedSecret('Mutating API call needs the cluster shared_secret.');
+        }}
+        const opts = Object.assign({{}}, options || {{}});
+        opts.method = opts.method || 'POST';
+        opts.headers = authHeaders(opts.headers);
+        const resp = await fetch(url, opts);
+        const text = await resp.text();
+        let json = null;
+        try {{ json = text ? JSON.parse(text) : null; }} catch (_) {{}}
+        const authError = formatAuthError(resp.status, text, json);
+        return {{ resp, text, json, authError }};
     }}
 
     function fmtDuration(secs) {{
@@ -1856,11 +1980,17 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     }}
 
     async function toggleMaintenance(nodeId, enable) {{
-        await fetch('/api/v1/nodes/' + nodeId + '/maintenance', {{
-            method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{ enable }}),
-        }}).catch(() => {{}});
+        try {{
+            const {{ resp, text, json, authError }} = await mutateFetch(
+                '/api/v1/nodes/' + nodeId + '/maintenance',
+                {{ body: JSON.stringify({{ enable }}) }}
+            );
+            if (!resp.ok) {{
+                alert(authError || ((json && json.error) ? json.error : (text || ('HTTP ' + resp.status))));
+            }}
+        }} catch (e) {{
+            alert('Maintenance toggle failed: ' + e);
+        }}
         await refreshNodesList();
     }}
 
@@ -1892,15 +2022,13 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             operator_id:        document.getElementById('uq-operator').value.trim(),
             reason_acknowledged: document.getElementById('uq-ack').value.trim(),
         }};
-        const r = await fetch('/api/v1/nodes/' + nid + '/unquarantine', {{
-            method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify(body),
-        }});
-        const txt = await r.text();
+        const {{ resp, text, json, authError }} = await mutateFetch(
+            '/api/v1/nodes/' + nid + '/unquarantine',
+            {{ body: JSON.stringify(body) }}
+        );
         const result = document.getElementById('uq-result');
         result.style.display = 'block';
-        if (r.ok) {{
+        if (resp.ok) {{
             result.style.color = 'var(--success)';
             result.textContent = 'Unquarantined.';
             setTimeout(async () => {{
@@ -1909,7 +2037,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             }}, 800);
         }} else {{
             result.style.color = 'var(--danger)';
-            result.textContent = 'Failed: ' + txt;
+            result.textContent = authError || ('Failed: ' + (text || JSON.stringify(json)));
         }}
     }}
     window.openUnquarantineModal = openUnquarantineModal;
@@ -2157,14 +2285,15 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         // surfaces its own server-side validation error (BM-3 tape, anchor).
         const post = async (suffix, body) => {{
             try {{
-                const r = await fetch(`/api/v1/volumes/${{encodeURIComponent(vid)}}/${{suffix}}`, {{
-                    method: 'POST',
-                    headers: {{'Content-Type': 'application/json'}},
-                    body: JSON.stringify(body),
-                }});
-                const j = await r.json().catch(() => ({{error: 'invalid JSON response'}}));
-                if (!r.ok) return `${{suffix}}: Error ${{r.status}}: ${{j.error || JSON.stringify(j)}}`;
-                return `${{suffix}}: ${{j.changed ? 'updated' : 'no change'}}`;
+                const {{ resp, json, authError }} = await mutateFetch(
+                    `/api/v1/volumes/${{encodeURIComponent(vid)}}/${{suffix}}`,
+                    {{ body: JSON.stringify(body) }}
+                );
+                if (!resp.ok) {{
+                    return `${{suffix}}: ` + (authError
+                        || (`Error ${{resp.status}}: ${{(json && json.error) || JSON.stringify(json)}}`));
+                }}
+                return `${{suffix}}: ${{json && json.changed ? 'updated' : 'no change'}}`;
             }} catch (e) {{
                 return `${{suffix}}: network error: ${{e}}`;
             }}
@@ -2225,17 +2354,16 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         result.textContent = 'Submitting…';
 
         try {{
-            const r = await fetch(`/api/v1/volumes/${{encodeURIComponent(vid)}}/set-schedules`, {{
-                method: 'POST',
-                headers: {{'Content-Type': 'application/json'}},
-                body: JSON.stringify(body),
-            }});
-            const j = await r.json().catch(() => ({{error: 'invalid JSON response'}}));
-            if (!r.ok) {{
-                result.textContent = 'Error ' + r.status + ': ' + (j.error || JSON.stringify(j));
+            const {{ resp, json, authError }} = await mutateFetch(
+                `/api/v1/volumes/${{encodeURIComponent(vid)}}/set-schedules`,
+                {{ body: JSON.stringify(body) }}
+            );
+            if (!resp.ok) {{
+                result.textContent = authError
+                    || ('Error ' + resp.status + ': ' + ((json && json.error) || JSON.stringify(json)));
             }} else {{
-                result.textContent = j.changed
-                    ? 'Updated. New schedules:\n' + JSON.stringify(j.config.schedules, null, 2)
+                result.textContent = json && json.changed
+                    ? 'Updated. New schedules:\n' + JSON.stringify(json.config.schedules, null, 2)
                     : 'No change (request was a no-op).';
                 await renderVolumes();
             }}
@@ -2490,15 +2618,14 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         if (dcRaw) body.target_dc = dcRaw;
 
         try {{
-            const resp = await fetch('/api/v1/migrations', {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'application/json' }},
+            const {{ resp, json, authError }} = await mutateFetch('/api/v1/migrations', {{
                 body: JSON.stringify(body),
             }});
-            const data = await resp.json();
+            const data = json || {{}};
             if (!resp.ok) {{
                 result.className = 'modal-result error';
-                result.textContent = (data && data.error) ? data.error : ('HTTP ' + resp.status);
+                result.textContent = authError
+                    || ((data && data.error) ? data.error : ('HTTP ' + resp.status));
                 submitBtn.disabled = false;
                 return;
             }}
@@ -2565,15 +2692,14 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         }};
 
         try {{
-            const resp = await fetch('/api/v1/files/flush_cache', {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'application/json' }},
+            const {{ resp, json, authError }} = await mutateFetch('/api/v1/files/flush_cache', {{
                 body: JSON.stringify(body),
             }});
-            const data = await resp.json();
+            const data = json || {{}};
             if (!resp.ok) {{
                 result.className = 'modal-result error';
-                result.textContent = (data && data.error) ? data.error : ('HTTP ' + resp.status);
+                result.textContent = authError
+                    || ((data && data.error) ? data.error : ('HTTP ' + resp.status));
                 submitBtn.disabled = false;
                 return;
             }}
@@ -2881,17 +3007,16 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         result.style.display = 'block';
         result.textContent = 'Submitting…';
         try {{
-            const r = await fetch('/api/v1/config', {{
-                method: 'POST',
-                headers: {{'Content-Type': 'application/json'}},
+            const {{ resp, json, authError }} = await mutateFetch('/api/v1/config', {{
                 body: JSON.stringify({{
                     config_json: JSON.stringify(merged),
                     write_to_disk: writeToDisk,
                 }}),
             }});
-            const j = await r.json().catch(() => ({{error: 'invalid JSON response'}}));
-            if (!r.ok) {{
-                result.textContent = 'Error ' + r.status + ': ' + (j.error || JSON.stringify(j))
+            const j = json || {{error: 'invalid JSON response'}};
+            if (!resp.ok) {{
+                result.textContent = (authError
+                    || ('Error ' + resp.status + ': ' + (j.error || JSON.stringify(j))))
                     + (j.preserved_current ? ' (current values preserved)' : '');
                 // AZ-5-A3 — reload to revert pending UI state to
                 // server's current values.
@@ -2929,6 +3054,23 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         const tier = cfg.tiering || {{}};
 
         el.innerHTML = `
+        <div class="settings-section" style="margin-bottom:1.25rem">
+            <h3>Session shared secret</h3>
+            <p class="settings-desc">Required for mutating WebUI actions when the cluster
+            <code>[cluster].shared_secret</code> is set. Stored in <code>sessionStorage</code>
+            only - never embedded in HTML. GETs stay open without it.</p>
+            <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:.5rem;border-bottom:none">
+                <label for="session-secret-input">Shared secret</label>
+                <input id="session-secret-input" class="form-input" type="password"
+                       autocomplete="off" placeholder="Paste cluster shared_secret">
+                <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+                    <button type="button" class="btn-primary" onclick="saveSessionSecretFromSettings()">Save to session</button>
+                    <button type="button" class="btn-secondary" onclick="clearSharedSecret()">Clear</button>
+                    <span id="session-secret-status" class="settings-note" style="margin:0;font-style:normal"></span>
+                </div>
+            </div>
+            <p class="settings-note">401 = missing header · 403 = wrong secret. Header badge shows whether a session secret is set (not the value).</p>
+        </div>
         <div class="settings-grid">
             <div class="settings-section">
                 <h3>Write Safety</h3>
@@ -2977,20 +3119,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     <span class="settings-val">${{tier.cold_threshold_days ?? '—'}}</span>
                 </div>
                 <div class="settings-row">
-                    <label>Frozen threshold (days)</label>
-                    <span class="settings-val">${{tier.frozen_threshold_days ?? '—'}}</span>
-                </div>
-                <div class="settings-row">
-                    <label>Evaluation interval (secs)</label>
-                    <span class="settings-val">${{tier.evaluation_interval_secs ?? '—'}}</span>
-                </div>
-                <div class="settings-row">
                     <label>Migration bandwidth (MB/s)</label>
                     <span class="settings-val">${{tier.migration_bandwidth_limit_mbps ?? '—'}}</span>
-                </div>
-                <div class="settings-row">
-                    <label>Cache redundancy escalation</label>
-                    <span class="settings-val">${{tier.enable_cache_redundancy_escalation ? '✅ Yes' : '❌ No'}}</span>
                 </div>
             </div>
 
@@ -3016,6 +3146,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <span id="cfg-save-status" style="font-size:.8rem;color:var(--text-muted)"></span>
             </div>
         </div>`;
+        // Refresh session-secret status after Settings DOM is built.
+        setSharedSecret(getSharedSecret());
     }}
 
     async function saveConfigJson() {{
@@ -3025,21 +3157,19 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         try {{
             // Validate JSON first
             JSON.parse(json === '(empty)' ? '{{}}' : json);
-            const resp = await fetch('/api/v1/config', {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'application/json' }},
+            const {{ resp, json: result, authError }} = await mutateFetch('/api/v1/config', {{
                 body: JSON.stringify({{ config_json: json === '(empty)' ? '' : json }}),
             }});
-            const result = await resp.json();
             if (status) status.textContent = resp.ok
-                ? '✅ Applied (v' + result.version + ')'
-                : '❌ Error: ' + JSON.stringify(result);
+                ? 'Applied (v' + (result && result.version) + ')'
+                : (authError || ('Error: ' + JSON.stringify(result)));
         }} catch(e) {{
-            if (status) status.textContent = '❌ ' + e.message;
+            if (status) status.textContent = String(e.message || e);
         }}
     }}
 
     // ── Bootstrap ────────────────────────────────────────────────────────────
+    updateAuthBadge();
     route();
 </script>
 </body>
@@ -3187,6 +3317,80 @@ mod bug_bk_scrub_tests {
         assert!(
             html.contains("id=\"mig-summary\""),
             "Migrations page must show a status summary strip"
+        );
+    }
+
+    /// LIS-35 — mutating POSTs must send X-Dtfs-Shared-Secret from
+    /// sessionStorage (never embedded in HTML); GETs stay plain fetch;
+    /// 401/403 get actionable copy.
+    #[test]
+    fn lis35_session_secret_on_mutating_fetches() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        assert!(
+            html.contains("DTFS_SECRET_KEY = 'dtfs.shared_secret'"),
+            "sessionStorage key constant present"
+        );
+        assert!(
+            html.contains("sessionStorage.setItem(DTFS_SECRET_KEY"),
+            "secret must be written to sessionStorage"
+        );
+        assert!(
+            html.contains("h['X-Dtfs-Shared-Secret'] = s"),
+            "authHeaders must attach X-Dtfs-Shared-Secret"
+        );
+        assert!(
+            html.contains("async function mutateFetch"),
+            "mutateFetch helper must exist"
+        );
+        assert!(
+            html.contains("401 Unauthorized - shared_secret required"),
+            "401 copy must be actionable"
+        );
+        assert!(
+            html.contains("403 Forbidden - shared_secret mismatch"),
+            "403 copy must be actionable"
+        );
+        assert!(
+            html.contains("id=\"session-secret-input\""),
+            "Settings must expose a session secret field"
+        );
+        assert!(
+            html.contains("id=\"auth-badge\""),
+            "header auth badge must be present"
+        );
+        // Mutating endpoints must be invoked via mutateFetch.
+        for needle in [
+            "mutateFetch('/api/v1/migrations'",
+            "mutateFetch('/api/v1/files/flush_cache'",
+            "mutateFetch('/api/v1/config'",
+            "'/api/v1/nodes/' + nodeId + '/maintenance'",
+            "'/api/v1/nodes/' + nid + '/unquarantine'",
+            "/set-schedules`",
+            "/${suffix}`",
+        ] {
+            assert!(html.contains(needle), "expected mutate path fragment: {needle}");
+        }
+        assert!(
+            html.contains("await mutateFetch("),
+            "maintenance/unquarantine/volume posts must await mutateFetch"
+        );
+        // No bare POST fetch left for the gated paths.
+        assert!(
+            !html.contains("method: 'POST'"),
+            "all POSTs should go through mutateFetch (no inline method: POST)"
+        );
+        // GETs must remain unauthenticated plain fetch.
+        assert!(
+            html.contains("fetch('/api/v1/stats')"),
+            "GET /api/v1/stats must stay a plain fetch"
+        );
+        assert!(
+            !html.contains("mutateFetch('/api/v1/stats'"),
+            "GET stats must not go through mutateFetch"
+        );
+        assert!(
+            !html.contains("shared_secret = \""),
+            "must not embed a shared_secret value in HTML"
         );
     }
 }
