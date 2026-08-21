@@ -126,17 +126,6 @@ impl TieringEngine {
         loop {
             interval.tick().await;
 
-            let cfg = self.config.read().await;
-            if !cfg.enabled {
-                debug!("Tiering disabled, skipping evaluation");
-                continue;
-            }
-            drop(cfg);
-
-            if let Err(e) = self.evaluate().await {
-                warn!("Tiering evaluation failed: {}", e);
-            }
-
             // Bug CN — bound the tiering in-memory state to the live working
             // set. `access_stats` + `read_windows` are append-keyed by chunk_id
             // and were only pruned for chunks still present; a deleted /
@@ -144,7 +133,36 @@ impl TieringEngine {
             // behind forever, so a folder-readahead promote load over many
             // chunks grew them without bound. Sweep dead-chunk entries each
             // tick. Cheap (one sm.files pass) and off the request hot path.
+            //
+            // REV-1-1 — the sweep runs FIRST and UNCONDITIONALLY, ahead of
+            // both the `enabled` gate and the new leader gate. `report_access`
+            // feeds these maps on every manager that serves a heartbeat,
+            // whether or not tiering is enabled and whether or not this node
+            // is the leader, so gating the prune on either would leave them
+            // growing forever on exactly the nodes that never evaluate.
             self.sweep_dead_chunk_state().await;
+
+            let cfg = self.config.read().await;
+            if !cfg.enabled {
+                debug!("Tiering disabled, skipping evaluation");
+                continue;
+            }
+            drop(cfg);
+
+            // REV-1-1 — leader-only. `evaluate` / `tick_av_cache` dispatch
+            // DIRECT data-node delete RPCs (the AV demote path) that no Raft
+            // rejection can undo, and a follower's read-window is always
+            // empty — so an ungated follower plans an idle demote for every
+            // cache replica cluster-wide, deletes the bytes, and then fails
+            // to record the removal.
+            if !self.scheduler.is_leader() {
+                debug!("REV-1-1: tiering evaluation skipped: not leader");
+                continue;
+            }
+
+            if let Err(e) = self.evaluate().await {
+                warn!("Tiering evaluation failed: {}", e);
+            }
         }
     }
 
@@ -280,10 +298,11 @@ impl TieringEngine {
         // `would_violate_anchor` / `schedule_replication` awaits, so a
         // large evaluate stalled every concurrent `report_access`
         // (heartbeat) for the whole dispatch duration.
-        let decisions: Vec<LegacyMigration> = {
+        let (decisions, deferred): (Vec<LegacyMigration>, usize) = {
             let cfg = self.config.read().await;
             let mut stats = self.access_stats.write().await;
             let mut out = Vec::new();
+            let mut deferred = 0usize;
             for (_chunk_id, profile) in stats.iter_mut() {
                 let old_temp = profile.current_temperature;
                 let new_temp = classify_temperature(
@@ -310,6 +329,25 @@ impl TieringEngine {
                         continue;
                     }
                 }
+                // REV-4-8 — bound the legacy path. It schedules a migration
+                // for essentially every chunk that gets read at all: on the
+                // Plex workload a chunk crosses Cold -> Warm on its FIRST
+                // read, so one tick could enqueue one migration per chunk read
+                // since the last tick, an unbounded flood driven straight off
+                // read traffic. The AV cache engine (`tick_av_cache`) owns
+                // demand-driven placement; this path only covers volumes with
+                // no `cache_replicas` policy, so a slow trickle is enough.
+                //
+                // The deferral is deliberately NOT recorded in the profile:
+                // restoring `old_temp` makes the next tick re-derive exactly
+                // this decision, so the backlog drains at a fixed rate instead
+                // of being silently dropped.
+                if out.len() >= MAX_LEGACY_MIGRATIONS_PER_TICK {
+                    profile.current_temperature = old_temp;
+                    deferred += 1;
+                    continue;
+                }
+
                 let demote = tier_rank(target_tier) > tier_rank(profile.current_tier);
                 out.push(LegacyMigration {
                     chunk_id: profile.chunk_id.clone(),
@@ -323,8 +361,19 @@ impl TieringEngine {
                     new_temp,
                 });
             }
-            out
+            (out, deferred)
         };
+
+        if deferred > 0 {
+            // AGENTS.md: never cap silently.
+            warn!(
+                planned = decisions.len(),
+                deferred,
+                max = MAX_LEGACY_MIGRATIONS_PER_TICK,
+                "REV-4-8: legacy tier-migration budget reached for this tick; \
+                 the remaining decisions re-derive on the next tick"
+            );
+        }
 
         let mut tier_up = 0u32;
         let mut tier_down = 0u32;
@@ -1038,6 +1087,21 @@ fn tier_rank(tier: DiskTier) -> u8 {
         DiskTier::Tape => 3,  // Coldest / archival tier
     }
 }
+
+/// REV-4-8 — maximum legacy (temperature-based) tier migrations planned in
+/// one tick.
+///
+/// The legacy path classifies every profile the heartbeats reported and, on
+/// any temperature change that implies a different tier, schedules a
+/// replication. On the Plex workload nearly every chunk that gets read at all
+/// crosses Cold -> Warm on its first read, so a single tick could enqueue one
+/// migration per chunk read since the last tick — an unbounded flood off read
+/// traffic, straight into the (now bounded) scheduler task map.
+///
+/// The path is bounded rather than removed: `build_av_cache_snapshot` skips
+/// volumes without a `cache_replicas` policy, so deleting it would silently
+/// strip tiering from those volumes.
+pub(crate) const MAX_LEGACY_MIGRATIONS_PER_TICK: usize = 8;
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()

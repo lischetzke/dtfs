@@ -168,10 +168,43 @@ impl TaskScheduler {
     /// each tick and skips the work to give RAM back (the cheapest ladder rung
     /// for the manager: re-replication/migration scans hold the largest
     /// transient state). Returns false when no cap is configured.
+    ///
+    /// REV-1-1 — true when this manager is the current raft leader.
+    ///
+    /// Bug AC leader-gated `tick()` only; every other background loop
+    /// (orphan scrub, auto-unquarantine, lease GC, and the tiering engine
+    /// via `TieringEngine::run`) ran on every manager, including cross-DC
+    /// learners. Those loops issue direct data-node delete RPCs, which no
+    /// Raft rejection can undo, so a follower's stale view physically
+    /// deletes live bytes. All of them now share this gate.
+    pub fn is_leader(&self) -> bool {
+        use openraft::async_runtime::watch::WatchReceiver;
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        leader_gate_open(metrics.current_leader, metrics.id)
+    }
+
+    /// REV-1-2 — `(last_applied, last_log_index)` for the freshness gate.
+    /// A state machine that has not applied its own log tail is not a safe
+    /// basis for deciding that a chunk is unreferenced.
+    fn applied_and_log_index(&self) -> (u64, u64) {
+        use openraft::async_runtime::watch::WatchReceiver;
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        let applied = metrics.last_applied.map(|l| l.index).unwrap_or(0);
+        let last_log = metrics.last_log_index.unwrap_or(applied);
+        (applied, last_log)
+    }
+
     fn under_memory_pressure(&self) -> bool {
         use dtfs_common::memory::PressureLevel;
         match &*self.memory.read() {
-            Some(b) => b.pressure_level() != PressureLevel::Normal,
+            // REV-3-5 — gate on Shed, not on "anything above Normal".
+            // The scheduler is the SOLE owner of mandatory-replica repair
+            // (A.3.4), and the memory that keeps a manager at Warn belongs to
+            // components this pause does not stop (the state machine, the
+            // resident snapshot blob, the tiering maps, the orphan-scrub
+            // buffers). Pausing at Warn therefore latched forever on a small
+            // manager and durability repair simply never ran again.
+            Some(b) => b.pressure_level() == PressureLevel::Shed,
             None => false,
         }
     }
@@ -181,19 +214,41 @@ impl TaskScheduler {
         info!("Task scheduler started (tick interval: {:?})", SCHEDULER_TICK);
 
         let mut interval = tokio::time::interval(SCHEDULER_TICK);
+        let mut consecutive_pressure_skips: u32 = 0;
         loop {
             interval.tick().await;
 
             // CF-5 — under memory pressure, skip the tick. Re-replication
             // and migration scans build the largest transient state in the
             // manager; pausing them is the cheapest ladder rung to give RAM
-            // back before the systemd cgroup kills us. Work resumes
-            // automatically once RSS drops back below the warn threshold.
+            // back before the systemd cgroup kills us.
+            //
+            // REV-3-5 — but the pause must be self-limiting. A.5's rule is
+            // "slow down, never OOM-kill"; skipping durability repair
+            // indefinitely is not slowing down, it is stopping. If RSS never
+            // drops (because the memory belongs to something this pause does
+            // not release) the old code paused forever and a node loss never
+            // healed. Force a tick every MAX_CONSECUTIVE_PRESSURE_SKIPS and
+            // make the state visible.
             if self.under_memory_pressure() {
-                tracing::warn!(
-                    "Scheduler tick skipped: under memory pressure (CF-5 ladder)"
-                );
-                continue;
+                let skips = consecutive_pressure_skips + 1;
+                if force_tick_after_skips(skips) {
+                    tracing::error!(
+                        skips,
+                        "Scheduler running a tick DESPITE memory pressure: \
+                         durability repair outranks the soft cap (REV-3-5)"
+                    );
+                    consecutive_pressure_skips = 0;
+                } else {
+                    consecutive_pressure_skips = skips;
+                    tracing::warn!(
+                        skips,
+                        "Scheduler tick skipped: under memory pressure (CF-5 ladder)"
+                    );
+                    continue;
+                }
+            } else {
+                consecutive_pressure_skips = 0;
             }
 
             if let Err(e) = self.tick().await {
@@ -211,6 +266,15 @@ impl TaskScheduler {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
+            // REV-1-1 — skip on followers instead of proposing a write once a
+            // second that can only come back as ForwardToLeader.
+            {
+                use openraft::async_runtime::watch::WatchReceiver;
+                let metrics = raft.metrics().borrow_watched().clone();
+                if !leader_gate_open(metrics.current_leader, metrics.id) {
+                    continue;
+                }
+            }
             let now_ms = now_millis();
             if let Err(e) = raft
                 .client_write(dtfs_raft::ClientRequest::SweepExpiredLeases { now_ms })
@@ -238,20 +302,9 @@ impl TaskScheduler {
     /// half-finished state on stale followers) until the next election.
     async fn tick(&self) -> anyhow::Result<()> {
         // Skip on followers — only the current leader drives migrations.
-        // openraft's metrics watch is a Receiver — borrow_watched gives
-        // a borrow without consuming the receiver.
-        use openraft::async_runtime::watch::WatchReceiver;
-        let metrics = self.raft.metrics().borrow_watched().clone();
-        let self_id = metrics.id;
-        let is_leader = metrics
-            .current_leader
-            .map(|leader| leader == self_id)
-            .unwrap_or(false);
-        if !is_leader {
-            tracing::trace!(
-                "Scheduler tick skipped: not leader (current_leader={:?})",
-                metrics.current_leader
-            );
+        // REV-1-1: shared with every other background loop via `is_leader()`.
+        if !self.is_leader() {
+            tracing::trace!("Scheduler tick skipped: not leader");
             return Ok(());
         }
 
@@ -405,6 +458,19 @@ impl TaskScheduler {
     async fn check_under_replicated(&self, migration_state: &mut MigrationState) {
         let sm = self.state_data.read().await;
 
+        // REV-3-4 — bound the work this tick can queue, and build the dedup
+        // index ONCE. The old dedup was a full scan of the task map for every
+        // candidate, i.e. quadratic in exactly the situation that produced the
+        // backlog. `created` tracks what this pass adds.
+        let mut created: usize = 0;
+        let mut live_index: std::collections::HashSet<(String, u64, DiskTier)> = migration_state
+            .tasks
+            .values()
+            .filter(|t| t.status != MigrationStatus::Done && t.status != MigrationStatus::Failed)
+            .map(|t| (t.chunk_id.clone(), t.target_node, t.tier))
+            .collect();
+        let mut live_tasks = live_index.len();
+
         // Collect healthy DATA nodes and their live tiers. Bug CH — the
         // role filter is explicit (managers/clients register with no
         // disks, but relying on the empty tier list alone is fragile),
@@ -510,15 +576,28 @@ impl TaskScheduler {
                         continue;
                     };
 
-                    let already = migration_state.tasks.values().any(|t| {
-                        t.chunk_id == chunk_hash
-                            && t.target_node == *target
-                            && t.tier == tier
-                            && t.status != MigrationStatus::Done
-                            && t.status != MigrationStatus::Failed
-                    });
-                    if already {
+                    // REV-3-4 — O(1) against the index built once per tick.
+                    // This used to be a full scan of every task for every
+                    // candidate, so a large backlog made the pass quadratic in
+                    // exactly the situation that produced the backlog.
+                    if live_index.contains(&(chunk_hash.clone(), *target, tier)) {
                         continue;
+                    }
+
+                    if !task_budget_available(created, live_tasks) {
+                        // The scan is idempotent — whatever is left is picked
+                        // up next tick. Say so once, loudly, so an operator
+                        // watching a node loss knows the backlog is paced and
+                        // not stuck (AGENTS.md: no silent caps).
+                        warn!(
+                            created,
+                            live_tasks,
+                            max_new = MAX_NEW_TASKS_PER_TICK,
+                            max_live = MAX_LIVE_TASKS,
+                            "REV-3-4: re-replication task budget reached for this tick; \
+                             remaining deficits resume next tick"
+                        );
+                        return;
                     }
 
                     let now_ms = now_millis();
@@ -545,6 +624,9 @@ impl TaskScheduler {
                         "Bug BX-4 auto-scheduled re-replication for a short mandated tier"
                     );
                     migration_state.tasks.insert(task_id, task);
+                    live_index.insert((chunk_hash.clone(), *target, tier));
+                    created += 1;
+                    live_tasks += 1;
                 }
             }
         }
@@ -610,7 +692,12 @@ impl TaskScheduler {
                             let nid = e.node_id.parse::<u64>().ok()?;
                             let info = sm.nodes.get(&nid)?;
                             // CNF-1 — stable disk_id key, never Vec index.
-                            let tier = info.disk(e.disk_id).map(|d| d.tier)?;
+                            // REV-3-7 — count only SERVICEABLE replicas, the
+                            // same rule `check_under_replicated` uses. Counting
+                            // a replica on a dead node as "excess" is how a
+                            // freshly-backfilled copy got removed again on the
+                            // very next tick, forever.
+                            let tier = live_replica_tier(Some(info), e.disk_id)?;
                             Some((nid, e.disk_id, info.location.datacenter.clone(), tier))
                         })
                         .collect();
@@ -666,6 +753,90 @@ impl TaskScheduler {
                 ),
             }
         }
+    }
+
+    /// REV-3-10 — drop the stale location rows for chunks the state machine
+    /// thinks `node_id` holds but which are not on its disks.
+    ///
+    /// Returns the number of rows that could NOT be dropped because they were
+    /// the last live copy of that chunk — genuine data loss, which the caller
+    /// escalates instead of healing.
+    async fn reconcile_missing_replicas(&self, node_id: u64, missing: &[&String]) -> usize {
+        let node_str = node_id.to_string();
+        let mut unreconcilable = 0usize;
+        let wanted: std::collections::HashSet<&str> =
+            missing.iter().map(|h| h.as_str()).collect();
+
+        // Re-derive the rows to drop from the CURRENT state: the caller's
+        // snapshot predates this node's ListChunks reply. ONE pass over the
+        // namespace (not one per missing hash).
+        let targets: Vec<(String, u64, u32, Option<dtfs_common::types::AnchorPolicy>)> = {
+            let sm = self.state_data.read().await;
+            let mut out = Vec::new();
+            for (path, fm) in &sm.files {
+                let anchor = sm
+                    .volumes
+                    .get(&fm.volume_id)
+                    .and_then(|v| v.effective_anchor());
+                for c in fm
+                    .chunks
+                    .iter()
+                    .filter(|c| c.node_id == node_str && wanted.contains(c.chunk_hash.as_str()))
+                {
+                    // Never drop the last live copy: that would leave the
+                    // file's chunk index with no locations at all.
+                    let live_elsewhere = fm.chunks.iter().any(|o| {
+                        o.chunk_index == c.chunk_index
+                            && !(o.node_id == node_str && o.disk_id == c.disk_id)
+                            && o.node_id
+                                .parse::<u64>()
+                                .ok()
+                                .map(|nid| {
+                                    live_replica_tier(sm.nodes.get(&nid), o.disk_id).is_some()
+                                })
+                                .unwrap_or(false)
+                    });
+                    if live_elsewhere {
+                        out.push((path.clone(), c.chunk_index, c.disk_id, anchor.clone()));
+                    } else {
+                        unreconcilable += 1;
+                    }
+                }
+            }
+            out
+        };
+
+        for (path, chunk_index, disk_id, anchor) in targets {
+            let req = ClientRequest::RemoveChunkLocation {
+                path: path.clone(),
+                chunk_index,
+                node_id: node_str.clone(),
+                // CO-1-1 — target the exact (node, disk) row we found stale.
+                disk_id,
+                enforce_anchor: anchor,
+            };
+            match self.raft.client_write(req).await {
+                Ok(_) => debug!(
+                    node = node_id,
+                    path = %path,
+                    chunk_index,
+                    "REV-3-10: dropped a location row whose bytes are not on disk"
+                ),
+                Err(e) => {
+                    // Refused (would strand the anchor) or the write failed:
+                    // escalate rather than silently leaving a lie in place.
+                    warn!(
+                        node = node_id,
+                        path = %path,
+                        chunk_index,
+                        error = %e,
+                        "REV-3-10: could not reconcile a missing replica row"
+                    );
+                    unreconcilable += 1;
+                }
+            }
+        }
+        unreconcilable
     }
 
     async fn check_anchor_lag(&self, migration_state: &mut MigrationState) {
@@ -729,7 +900,15 @@ impl TaskScheduler {
                         // agree with api::count_anchor_pending_files, or the
                         // projection reports anchor_pending the planner
                         // never repairs).
-                        let tier = info.disk(e.disk_id).map(|d| d.tier)?;
+                        // REV-3-7 — one liveness definition. This used to
+                        // resolve the tier straight off the disk list, so a
+                        // replica on a Down/Failed node or a Failed/Removed
+                        // disk still counted as satisfying the anchor, while
+                        // check_under_replicated (which uses live_replica_tier)
+                        // counted it as missing. The two passes then fought:
+                        // the backfill scheduled a copy and the anchor/rebalance
+                        // logic saw no deficit, forever, over the 40 Mbps link.
+                        let tier = live_replica_tier(Some(info), e.disk_id)?;
                         Some(AnchorRepairPlacement {
                             node_id: nid,
                             dc: info.location.datacenter.clone(),
@@ -1031,13 +1210,22 @@ impl TaskScheduler {
 
     /// Find the file path that contains a given chunk hash.
     async fn find_file_for_chunk(&self, chunk_hash: &str) -> Option<String> {
+        self.find_files_for_chunk(chunk_hash).await.into_iter().next()
+    }
+
+    /// REV-4-6 — EVERY file that references this chunk hash.
+    ///
+    /// Chunks are content-addressed, so identical content in two files (a
+    /// re-download, a copy, two episodes sharing a segment) is ONE chunk id
+    /// referenced from several `FileMetadata.chunks` lists. Registering a
+    /// completed replica against only the first match left every other
+    /// referencing file still short of its mandatory count, so
+    /// `check_under_replicated` scheduled the same copy again on the next
+    /// tick, forever — the copy succeeded every time and the deficit never
+    /// closed.
+    async fn find_files_for_chunk(&self, chunk_hash: &str) -> Vec<String> {
         let sm = self.state_data.read().await;
-        for (path, file_meta) in &sm.files {
-            if file_meta.chunks.iter().any(|c| c.chunk_hash == chunk_hash) {
-                return Some(path.clone());
-            }
-        }
-        None
+        files_referencing_chunk(&sm.files, chunk_hash)
     }
 
     /// Completing-stage replica registration (U3 — extracted verbatim from
@@ -1049,9 +1237,31 @@ impl TaskScheduler {
     /// through Raft. No-op when the file is gone (next round's Bug AE guard
     /// catches the orphan).
     async fn register_replica_location(&self, chunk_id: &str, target_node: u64, tier: DiskTier) {
-        let Some(path) = self.find_file_for_chunk(chunk_id).await else {
-            return;
-        };
+        // REV-4-6 — register against every referencing file, not just the
+        // first. The replica physically exists and serves all of them.
+        let paths = self.find_files_for_chunk(chunk_id).await;
+        if paths.len() > 1 {
+            debug!(
+                chunk = %chunk_id,
+                files = paths.len(),
+                "REV-4-6: chunk is shared; registering the new replica for every referencing file"
+            );
+        }
+        for path in paths {
+            self.register_replica_location_for_path(&path, chunk_id, target_node, tier)
+                .await;
+        }
+    }
+
+    /// REV-4-6 — the single-file half of `register_replica_location`.
+    async fn register_replica_location_for_path(
+        &self,
+        path: &str,
+        chunk_id: &str,
+        target_node: u64,
+        tier: DiskTier,
+    ) {
+        let path = path.to_string();
 
         // Bug AB — read the chunk's existing replicas, ADD the new target,
         // dedup, and pass the FULL set (merge_chunk_location_entries
@@ -1535,6 +1745,11 @@ impl TaskScheduler {
         tick.tick().await; // skip immediate
         loop {
             tick.tick().await;
+            // REV-1-1 — leader-only: the sweep commits UpdateNodeStatus.
+            if !self.is_leader() {
+                debug!("Bug BF-7: auto-unquarantine tick skipped: not leader");
+                continue;
+            }
             match self.auto_unquarantine_tick(cooldown_secs).await {
                 Ok(n) if n > 0 => info!(
                     cleared = n,
@@ -1640,6 +1855,14 @@ impl TaskScheduler {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(60)));
         loop {
             tick.tick().await;
+            // REV-1-1 — followers must not reap. The reap is a direct
+            // DeleteChunkReplica RPC to the data node; a follower's view of
+            // `sm.files` can be arbitrarily stale and every missing file
+            // reads as "all its chunks are orphans".
+            if !self.is_leader() {
+                debug!("Bug BC-7: orphan_scrub tick skipped: not leader");
+                continue;
+            }
             match self.orphan_scrub_tick(grace_secs).await {
                 Ok(reaped) => {
                     if reaped > 0 {
@@ -1696,6 +1919,23 @@ impl TaskScheduler {
             (nodes, chunks, expected, quarantined)
         };
 
+        // REV-1-2 — freshness gate. The reap deletes anything on disk that
+        // this manager cannot see in `sm.files`, so a state machine that is
+        // still replaying (a manager that was down, or one that just loaded
+        // an old on-disk snapshot) would classify every file created since as
+        // an orphan. An empty in-state chunk set alongside live data nodes is
+        // never a legitimate "everything is an orphan" either.
+        let (applied, last_log) = self.applied_and_log_index();
+        if !orphan_sweep_allowed(self.is_leader(), applied, last_log, in_state_chunks.len()) {
+            debug!(
+                applied,
+                last_log,
+                in_state_chunks = in_state_chunks.len(),
+                "REV-1-2: orphan_scrub sweep skipped (not leader / state not caught up / empty view)"
+            );
+            return Ok(0);
+        }
+
         let mut reaped: usize = 0;
 
         for (node_id, grpc_addr) in &data_nodes {
@@ -1746,41 +1986,60 @@ impl TaskScheduler {
                     };
                     if !missing.is_empty() {
                         let first = missing[0].clone();
-                        let info = dtfs_common::types::QuarantineInfo {
-                            since_ms: now_ms,
-                            reason: dtfs_common::types::QuarantineReason::OrphanScrubInStateMissing,
-                            triggering_chunk_id: Some(first.clone()),
-                            fault_count_total: 0,
-                            last_fault_at_ms: now_ms,
-                            last_fault_summary: format!(
-                                "orphan_scrub: {} chunk(s) in state but not on disk; first={}",
-                                missing.len(),
-                                first
-                            ),
-                        };
-                        let req = ClientRequest::QuarantineNode {
-                            node_id: *node_id,
-                            info,
-                        };
-                        if let Err(e) = self.raft.client_write(req).await {
-                            warn!(
-                                node = %node_id, error = %e,
-                                "Bug BF-8: QuarantineNode raft write failed"
-                            );
+
+                        // REV-3-10 — RECONCILE before blaming. The state
+                        // machine claims this node holds bytes it does not,
+                        // and while that stale row stands `live_replica_tier`
+                        // still counts it as coverage, so
+                        // `check_under_replicated` sees no deficit and never
+                        // backfills: the chunk is genuinely down one replica
+                        // and nothing heals it. Quarantining the node does not
+                        // fix that — it just stops using an otherwise healthy
+                        // node forever.
+                        //
+                        // Drop the stale row (never the last live one, always
+                        // anchor-checked on apply) so the backfill can see the
+                        // deficit and re-copy from a replica that really
+                        // exists. Rows are re-derived from the CURRENT state
+                        // inside the helper: the `expected` snapshot predates
+                        // this node's ListChunks.
+                        //
+                        // Only for a SMALL miss set, though: a node-scale miss
+                        // quarantines regardless of what reconciliation finds
+                        // (`should_quarantine_for_missing` is already true on
+                        // volume alone), and issuing one Raft write per chunk
+                        // of a wiped 50 TB disk is exactly the flood REV-3-4
+                        // exists to prevent.
+                        let unreconcilable = if should_quarantine_for_missing(missing.len(), 0) {
+                            0
                         } else {
-                            self.audit.log(
-                                "scheduler",
-                                "orphan.in_state_missing",
-                                &format!(
-                                    "node={node_id} missing={} first={}",
-                                    missing.len(),
-                                    first
-                                ),
-                                "quarantined",
-                            );
+                            self.reconcile_missing_replicas(*node_id, &missing).await
+                        };
+
+                        if should_quarantine_for_missing(missing.len(), unreconcilable) {
+                            self.quarantine_for_in_state_missing(
+                                *node_id,
+                                &first,
+                                missing.len(),
+                                now_ms,
+                            )
+                            .await;
                             // Continue to reap on-disk-not-in-state below
                             // — even a Quarantined node can have orphans
                             // that the reaper should still clear.
+                        } else {
+                            info!(
+                                node = %node_id,
+                                missing = missing.len(),
+                                "REV-3-10: reconciled stale location rows; backfill will \
+                                 re-replicate. Node not quarantined."
+                            );
+                            self.audit.log(
+                                "scheduler",
+                                "orphan.in_state_missing_reconciled",
+                                &format!("node={node_id} rows={} first={first}", missing.len()),
+                                "reconciled",
+                            );
                         }
                     }
                 }
@@ -1867,6 +2126,43 @@ impl TaskScheduler {
         }
 
         Ok(reaped)
+    }
+
+    /// Bug BF-8 / REV-3-10 — quarantine `node_id` for an unreconcilable
+    /// in-state-missing finding. Extracted from `orphan_scrub_tick` so the
+    /// `QuarantineInfo` struct literal lives at method top level (the deeply
+    /// nested form tripped a rustc 1.94 typeck ICE).
+    async fn quarantine_for_in_state_missing(
+        &self,
+        node_id: u64,
+        first: &str,
+        missing: usize,
+        now_ms: u64,
+    ) {
+        let summary =
+            format!("orphan_scrub: {missing} chunk(s) in state but not on disk; first={first}");
+        let info = dtfs_common::types::QuarantineInfo {
+            since_ms: now_ms,
+            reason: dtfs_common::types::QuarantineReason::OrphanScrubInStateMissing,
+            triggering_chunk_id: Some(first.to_string()),
+            fault_count_total: 0,
+            last_fault_at_ms: now_ms,
+            last_fault_summary: summary,
+        };
+        let req = ClientRequest::QuarantineNode { node_id, info };
+        if let Err(e) = self.raft.client_write(req).await {
+            warn!(
+                node = %node_id, error = %e,
+                "Bug BF-8: QuarantineNode raft write failed"
+            );
+            return;
+        }
+        self.audit.log(
+            "scheduler",
+            "orphan.in_state_missing",
+            &format!("node={node_id} missing={missing} first={first}"),
+            "quarantined",
+        );
     }
 
     /// CO-3-3 — the set of chunk hashes the CURRENT state machine records a
@@ -3266,6 +3562,201 @@ pub(crate) fn plan_excess_spill_removal(
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// REV wave-1 hardening — pure predicates for the manager background loops.
+// ---------------------------------------------------------------------------
+
+/// REV-1-1 — pure leader predicate. Every manager background loop must
+/// consult this before dispatching work; only `tick()` used to.
+///
+/// Followers that keep running these loops issue **direct data-node RPCs**
+/// (DeleteChunk / DeleteChunkReplica) that no Raft rejection can undo, so a
+/// follower's stale or empty view physically deletes live bytes. Kept as a
+/// free function over the two metrics fields so it is unit-testable without a
+/// live raft instance.
+pub(crate) fn leader_gate_open(current_leader: Option<u64>, self_id: u64) -> bool {
+    current_leader == Some(self_id)
+}
+
+/// REV-1-2 — pure freshness predicate for the orphan reaper.
+///
+/// The reaper deletes any on-disk chunk that is absent from *its own* view of
+/// `sm.files`. A manager that is elected while still replaying (or that just
+/// loaded an old on-disk snapshot) has a view that is missing every file
+/// created since, so every one of those chunks looks like an orphan. Require
+/// the local state machine to be caught up, and refuse to sweep when the
+/// in-state chunk set is empty while data nodes still report chunks — that
+/// combination is never legitimately "everything is an orphan".
+pub(crate) fn orphan_sweep_allowed(
+    is_leader: bool,
+    last_applied: u64,
+    last_log_index: u64,
+    in_state_chunks: usize,
+) -> bool {
+    if !is_leader {
+        return false;
+    }
+    if last_applied < last_log_index {
+        return false;
+    }
+    in_state_chunks > 0
+}
+
+/// REV-3-5 — how many consecutive memory-pressure skips the scheduler
+/// tolerates before it runs a tick anyway.
+///
+/// At the 30 s tick interval this is 10 minutes of paused repair, which is a
+/// real ladder rung; beyond that the pause has stopped being backpressure and
+/// has become an outage of the only component that maintains mandatory
+/// replicas.
+pub(crate) const MAX_CONSECUTIVE_PRESSURE_SKIPS: u32 = 20;
+
+/// REV-3-5 — true when the scheduler must run despite memory pressure.
+pub(crate) fn force_tick_after_skips(consecutive_skips: u32) -> bool {
+    consecutive_skips >= MAX_CONSECUTIVE_PRESSURE_SKIPS
+}
+
+/// REV-3-4 — how many NEW replication tasks one scheduler tick may create.
+///
+/// `check_under_replicated` had no cap at all: losing the ~50 TB LELI anchor
+/// node makes every one of its chunks short of its cold tier, so a single tick
+/// inserted one task per chunk (hundreds of thousands), and
+/// `save_migration_state` then serialised the whole map into ONE Raft entry —
+/// a multi-megabyte proposal replicated to every voter and learner, over the
+/// 40 Mbps archive link, every tick. The scan is idempotent, so capping simply
+/// spreads the same work over subsequent ticks.
+pub(crate) const MAX_NEW_TASKS_PER_TICK: usize = 200;
+
+/// REV-3-4 — ceiling on live (non-terminal) tasks. Beyond this the scheduler
+/// stops adding work until the backlog drains, so the persisted state stays a
+/// bounded Raft payload no matter how much of the cluster is missing.
+pub(crate) const MAX_LIVE_TASKS: usize = 2_000;
+
+/// REV-3-4 — may the tick create another task?
+pub(crate) fn task_budget_available(created_this_tick: usize, live_tasks: usize) -> bool {
+    created_this_tick < MAX_NEW_TASKS_PER_TICK && live_tasks < MAX_LIVE_TASKS
+}
+
+/// REV-3-10 — how many unreconcilable missing replicas justify quarantining
+/// the node.
+///
+/// A single missing chunk is almost always a race (the `expected` snapshot is
+/// taken before this node's `ListChunks`, so anything legitimately deleted in
+/// that window looks missing — the CO-3-3 re-check catches most of those) or a
+/// stale row we just healed. Real node-level loss shows up as many at once.
+pub(crate) const IN_STATE_MISSING_QUARANTINE_THRESHOLD: usize = 8;
+
+/// REV-3-10 — quarantine only when the situation is not self-healing.
+///
+/// `unreconcilable` counts missing replicas whose location row could NOT be
+/// dropped because it was the last live copy of that chunk — i.e. genuine data
+/// loss that a human has to look at. Everything else is a stale row the
+/// scheduler has already removed so the backfill can re-copy from a replica
+/// that really exists; blaming the node for those left an otherwise healthy
+/// node quarantined forever while the chunk stayed under-replicated.
+pub(crate) fn should_quarantine_for_missing(missing: usize, unreconcilable: usize) -> bool {
+    unreconcilable > 0 || missing >= IN_STATE_MISSING_QUARANTINE_THRESHOLD
+}
+
+/// REV-4-6 — every file that references `chunk_hash`, in path order.
+///
+/// Chunks are content-addressed, so identical content in two files (a
+/// re-download, a copy, two episodes sharing a segment) is ONE chunk id
+/// referenced from several `FileMetadata.chunks` lists.
+pub(crate) fn files_referencing_chunk(
+    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
+    chunk_hash: &str,
+) -> Vec<String> {
+    files
+        .iter()
+        .filter(|(_, fm)| fm.chunks.iter().any(|c| c.chunk_hash == chunk_hash))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod rev_leader_gate_tests {
+    use super::{
+        force_tick_after_skips, leader_gate_open, orphan_sweep_allowed,
+        should_quarantine_for_missing, task_budget_available,
+        IN_STATE_MISSING_QUARANTINE_THRESHOLD, MAX_CONSECUTIVE_PRESSURE_SKIPS, MAX_LIVE_TASKS,
+        MAX_NEW_TASKS_PER_TICK,
+    };
+
+    #[test]
+    fn only_the_leader_passes_the_gate() {
+        assert!(leader_gate_open(Some(7), 7));
+        assert!(!leader_gate_open(Some(9), 7), "follower must not dispatch");
+        assert!(!leader_gate_open(None, 7), "no quorum: nobody dispatches");
+    }
+
+    #[test]
+    fn orphan_sweep_requires_leadership() {
+        assert!(!orphan_sweep_allowed(false, 100, 100, 5));
+    }
+
+    #[test]
+    fn orphan_sweep_requires_a_caught_up_state_machine() {
+        // The two-week-old manager: elected, but still replaying.
+        assert!(!orphan_sweep_allowed(true, 10, 5_000, 5));
+        assert!(orphan_sweep_allowed(true, 5_000, 5_000, 5));
+    }
+
+    #[test]
+    fn orphan_sweep_refuses_an_empty_namespace_view() {
+        // "Every chunk on every disk is an orphan" is never a real answer.
+        assert!(!orphan_sweep_allowed(true, 100, 100, 0));
+    }
+
+    #[test]
+    fn rev_3_4_task_creation_is_bounded_per_tick_and_overall() {
+        // Room in both budgets.
+        assert!(task_budget_available(0, 0));
+        assert!(task_budget_available(MAX_NEW_TASKS_PER_TICK - 1, MAX_LIVE_TASKS - 1));
+        // Per-tick budget exhausted: the rest waits for the next tick. Losing
+        // the 50 TB anchor node must not queue one task per chunk in one pass
+        // and serialise them all into a single Raft entry.
+        assert!(!task_budget_available(MAX_NEW_TASKS_PER_TICK, 0));
+        // Total live backlog ceiling, independent of this tick.
+        assert!(!task_budget_available(0, MAX_LIVE_TASKS));
+    }
+
+    #[test]
+    fn rev_3_5_memory_pause_is_self_limiting() {
+        assert!(!force_tick_after_skips(0));
+        assert!(!force_tick_after_skips(MAX_CONSECUTIVE_PRESSURE_SKIPS - 1));
+        assert!(
+            force_tick_after_skips(MAX_CONSECUTIVE_PRESSURE_SKIPS),
+            "a pause that never ends is an outage of the only owner of \
+             mandatory-replica repair, not backpressure"
+        );
+        assert!(force_tick_after_skips(MAX_CONSECUTIVE_PRESSURE_SKIPS + 5));
+    }
+
+    /// REV-3-10 — a stale location row (state says the node holds bytes it
+    /// does not) is self-healing: drop the row and the backfill re-copies from
+    /// a replica that really exists. Quarantining the node for it left an
+    /// otherwise healthy node unusable forever AND left the chunk
+    /// under-replicated, because the stale row still counted as coverage.
+    #[test]
+    fn rev_3_10_a_reconciled_row_does_not_blame_the_node() {
+        // One stale row, healed: nothing to escalate.
+        assert!(!should_quarantine_for_missing(1, 0));
+        assert!(!should_quarantine_for_missing(
+            IN_STATE_MISSING_QUARANTINE_THRESHOLD - 1,
+            0
+        ));
+        // Genuine data loss (the row was the LAST live copy) always escalates,
+        // even if it is only one chunk.
+        assert!(should_quarantine_for_missing(1, 1));
+        // Node-scale loss escalates on volume alone.
+        assert!(should_quarantine_for_missing(
+            IN_STATE_MISSING_QUARANTINE_THRESHOLD,
+            0
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -4972,6 +5463,26 @@ mod bug_ae_orphan_tests {
         // saturating_sub returns 0, < retention windows, so retained.
         assert!(should_retain_task(MigrationStatus::Done, future, now, DONE_MS, FAILED_MS));
         assert!(should_retain_task(MigrationStatus::Failed, future, now, DONE_MS, FAILED_MS));
+    }
+
+    /// REV-4-6 — chunks are content-addressed, so identical content in two
+    /// files is ONE chunk id referenced from both. Registering a completed
+    /// replica against only the first match left every other referencing file
+    /// short of its mandatory count, so the same copy was scheduled again on
+    /// every tick — it succeeded every time and the deficit never closed.
+    #[test]
+    fn rev_4_6_a_shared_chunk_resolves_to_every_referencing_file() {
+        let mut files: BTreeMap<String, FileMetadata> = BTreeMap::new();
+        files.insert("/a.mkv".into(), file_with_chunks("/a.mkv", &["hh", "other"]));
+        files.insert("/b.mkv".into(), file_with_chunks("/b.mkv", &["hh"]));
+        files.insert("/c.mkv".into(), file_with_chunks("/c.mkv", &["unrelated"]));
+
+        assert_eq!(
+            files_referencing_chunk(&files, "hh"),
+            vec!["/a.mkv".to_string(), "/b.mkv".to_string()],
+            "both referencing files must be registered, not just the first"
+        );
+        assert!(files_referencing_chunk(&files, "nope").is_empty());
     }
 
     /// chunk_in_any_file returns true when a chunk hash matches any file.

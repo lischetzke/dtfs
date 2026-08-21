@@ -2007,9 +2007,30 @@ fn apply_remove_chunk_location(
                 Err(_) => return false,
             };
             let Some(ninfo) = sm.nodes.get(&nid) else { return false };
+            // REV-3-7 — a replica on a Down/Failed node, or on a
+            // Failed/Removed disk, cannot satisfy the anchor: the bytes are
+            // not servable. The scheduler's coverage counting
+            // (`live_replica_tier`) has always said so; this survivor scan
+            // used to disagree, which let a removal through on the strength
+            // of a replica that no longer exists.
+            if matches!(
+                ninfo.health,
+                dtfs_common::types::HealthStatus::Down | dtfs_common::types::HealthStatus::Failed
+            ) {
+                return false;
+            }
             let dc = ninfo.location.datacenter.as_str();
             // CNF-1 — resolve by the stable disk_id key, never Vec index.
-            let tier = ninfo.disk(c.disk_id).map(|d| d.tier);
+            let tier = ninfo.disk(c.disk_id).filter(|d| {
+                !matches!(
+                    d.status,
+                    dtfs_common::types::DiskStatus::Failed
+                        | dtfs_common::types::DiskStatus::Removed
+                )
+            }).map(|d| d.tier);
+            if tier.is_none() {
+                return false;
+            }
             policy.is_satisfied_by(dc, tier)
         });
         if !survives_anchor {
@@ -3323,6 +3344,74 @@ mod posix_path_regression {
             cache_cooldown_until_ms: std::collections::BTreeMap::new(),
         });
         sm
+    }
+
+    /// REV-3-7 — the anchor survivor scan must use the same liveness rule as
+    /// the scheduler's coverage counting (`live_replica_tier`). A replica on a
+    /// Down node is not servable, so it cannot be the thing that makes a
+    /// removal safe. Pre-fix the two disagreed: `check_under_replicated` saw a
+    /// deficit and scheduled a backfill, and this scan let the rebalance drop
+    /// the fresh copy again on the strength of the dead anchor — forever.
+    #[test]
+    fn rev_3_7_a_dead_replica_cannot_satisfy_the_anchor() {
+        use dtfs_common::types::{AnchorPolicy, DiskTier, HealthStatus};
+        let mut sm = sm_with_chunk("/x", 0, "h", &[
+            (10, "limburg", DiskTier::Cold), // the anchor copy
+            (11, "toro", DiskTier::Warm),
+        ]);
+        let policy = AnchorPolicy {
+            datacenter: "limburg".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+
+        // With the anchor node healthy, dropping the warm copy is fine.
+        let mut healthy = sm.clone();
+        let resp = apply_request(&mut healthy, &mk_log_id(1),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "11".into(),
+                disk_id: 0,
+                enforce_anchor: Some(policy.clone()),
+            });
+        assert!(matches!(resp, ClientResponse::Success));
+
+        // Now the anchor node is Down: its replica is not servable, so the
+        // same removal must be refused instead of counting on it.
+        sm.nodes.get_mut(&10).unwrap().health = HealthStatus::Down;
+        let resp = apply_request(&mut sm, &mk_log_id(2),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "11".into(),
+                disk_id: 0,
+                enforce_anchor: Some(policy.clone()),
+            });
+        match resp {
+            ClientResponse::Error { message } => {
+                assert!(message.contains("would strand anchor"), "got: {message}");
+            }
+            other => panic!("expected refusal while the anchor node is Down, got {other:?}"),
+        }
+        assert_eq!(sm.files.get("/x").unwrap().chunks.len(), 2, "nothing removed");
+
+        // Same rule for a Failed/Removed DISK under a healthy node.
+        let mut bad_disk = sm.clone();
+        bad_disk.nodes.get_mut(&10).unwrap().health = HealthStatus::Healthy;
+        bad_disk.nodes.get_mut(&10).unwrap().disks[0].status =
+            dtfs_common::types::DiskStatus::Failed;
+        let resp = apply_request(&mut bad_disk, &mk_log_id(3),
+            &ClientRequest::RemoveChunkLocation {
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "11".into(),
+                disk_id: 0,
+                enforce_anchor: Some(policy),
+            });
+        assert!(
+            matches!(resp, ClientResponse::Error { .. }),
+            "a Failed anchor disk cannot authorise the removal either"
+        );
     }
 
     /// AV-1-3 test 1 — happy path: drop one entry, others survive.
