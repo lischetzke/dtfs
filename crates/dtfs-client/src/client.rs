@@ -165,6 +165,9 @@ struct DtfsClientInner {
     requester_dc: parking_lot::RwLock<String>,
     /// Optional host name for the same purpose (mostly diagnostic).
     requester_host: parking_lot::RwLock<String>,
+    /// LIS-19 — cluster shared secret for data-plane PutChunk auth.
+    /// Empty = legacy plaintext (server skips verification).
+    shared_secret: parking_lot::RwLock<String>,
     /// CF-6 — resolved `[tls]` context applied to every new channel
     /// (manager and data node alike). Defaults to plaintext; set via
     /// [`DtfsClient::set_tls`] BEFORE the first connect so no plaintext
@@ -197,11 +200,19 @@ impl DtfsClient {
                 active_idx: parking_lot::RwLock::new(0),
                 requester_dc: parking_lot::RwLock::new(String::new()),
                 requester_host: parking_lot::RwLock::new(String::new()),
+                shared_secret: parking_lot::RwLock::new(String::new()),
                 tls: parking_lot::RwLock::new(
                     dtfs_common::tls::TlsContext::plaintext(),
                 ),
             }),
         }
+    }
+
+    /// LIS-19 — set the cluster shared secret used to stamp PutChunk
+    /// metadata. Call once after construction from fuse.toml
+    /// `[client].shared_secret`.
+    pub fn set_shared_secret(&self, secret: &str) {
+        *self.inner.shared_secret.write() = secret.to_string();
     }
 
     /// CF-6 — install the resolved `[tls]` context. Must be called before
@@ -713,7 +724,20 @@ impl DtfsClient {
         });
 
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let response = client.put_chunk(stream).await?;
+        let mut request = tonic::Request::new(stream);
+        {
+            use dtfs_common::crypto::{
+                stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+            };
+            let secret = self.inner.shared_secret.read().clone();
+            if let Some((ts, mac)) = stamp_data_rpc_auth(&secret, "PutChunk", "") {
+                if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                    request.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                    request.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                }
+            }
+        }
+        let response = client.put_chunk(request).await?;
         let put_resp = response.into_inner();
         debug!(
             chunk_id = chunk_id_owned,

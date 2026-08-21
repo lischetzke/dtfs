@@ -137,3 +137,24 @@ For interactive use, the CLI can obtain a token by prompting for credentials, th
 - Enable TLS on the API server to protect tokens in transit (see [TLS](./tls.md)).
 - In production, always set `auth.enabled = true`.
 - Rotate the `jwt_secret` periodically; note that this invalidates all existing tokens.
+
+## Data-plane PutChunk / DeleteChunk (LIS-19 / Sec R2)
+
+When `[cluster].shared_secret` is **non-empty**, data nodes require
+authenticated gRPC metadata on mutating RPCs:
+
+| Metadata | Meaning |
+|----------|---------|
+| `x-dtfs-rpc-ts` | Unix seconds |
+| `x-dtfs-rpc-mac` | Hex HMAC-SHA256 over `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n` |
+
+- `method` is `PutChunk` or `DeleteChunk`.
+- `binding` is the `chunk_id` for DeleteChunk (binds the stamp to the
+  destructive target); empty for PutChunk.
+- Max skew 300 seconds. Missing/invalid → `PermissionDenied`.
+- Empty `shared_secret` skips verification (join / legacy plaintext parity).
+
+Callers that stamp: FUSE/client put, data→data replication put, manager
+unlink fan-out, scheduler flush/orphan delete. **Deploy data + manager +
+fuse together** when enabling a non-empty secret (update-required). mTLS
+(CF-6) is complementary transport auth, not a substitute for this MAC.

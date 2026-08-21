@@ -148,7 +148,24 @@ impl ReplicationManager {
             };
 
             let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-            let put = client.put_chunk(stream);
+            // LIS-19 — stamp PutChunk so the target rejects unauthenticated puts.
+            let mut put_req = tonic::Request::new(stream);
+            {
+                use dtfs_common::crypto::{
+                    stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+                };
+                if let Some((ts, mac)) = stamp_data_rpc_auth(
+                    &self.config.cluster.shared_secret,
+                    "PutChunk",
+                    "",
+                ) {
+                    if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                        put_req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                        put_req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                    }
+                }
+            }
+            let put = client.put_chunk(put_req);
             // Drive feeder + RPC together so a feeder I/O error surfaces
             // instead of the RPC hanging on a silently-dropped sender.
             let (fed, response) = tokio::join!(feeder, put);
