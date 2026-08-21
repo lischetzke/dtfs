@@ -981,10 +981,23 @@ impl TaskScheduler {
                 .await
                 .map(DataServiceClient::new)
                 .map_err(|e| anyhow::anyhow!("connect to target {}: {}", target_addr, e))?;
+            let mut req = tonic::Request::new(VerifyChunkRequest {
+                chunk_id: chunk_id.to_string(),
+            });
+            {
+                use dtfs_common::crypto::{
+                    stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+                };
+                let secret = self.shared_secret.read().clone();
+                if let Some((ts, mac)) = stamp_data_rpc_auth(&secret, "VerifyChunk", chunk_id) {
+                    if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                        req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                        req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                    }
+                }
+            }
             client
-                .verify_chunk(VerifyChunkRequest {
-                    chunk_id: chunk_id.to_string(),
-                })
+                .verify_chunk(req)
                 .await
                 .map_err(|e| anyhow::anyhow!("VerifyChunk RPC: {}", e))
                 .map(|r| r.into_inner())
@@ -1951,11 +1964,24 @@ impl TaskScheduler {
             std::collections::HashMap::new();
         let mut token = String::new();
         loop {
+            let mut req = tonic::Request::new(ListChunksRequest {
+                page_token: token.clone(),
+                limit: 1000,
+            });
+            {
+                use dtfs_common::crypto::{
+                    stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+                };
+                let secret = self.shared_secret.read().clone();
+                if let Some((ts, mac)) = stamp_data_rpc_auth(&secret, "ListChunks", "") {
+                    if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                        req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                        req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                    }
+                }
+            }
             let resp = client
-                .list_chunks(ListChunksRequest {
-                    page_token: token.clone(),
-                    limit: 1000,
-                })
+                .list_chunks(req)
                 .await
                 .map_err(|e| anyhow::anyhow!("ListChunks RPC: {}", e))?
                 .into_inner();

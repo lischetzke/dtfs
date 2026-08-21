@@ -92,35 +92,31 @@ open. Missing secret → HTTP 401 with an actionable message; wrong secret
 → HTTP 403. Clear the session value via Settings → Clear (or close the
 tab).
 
-## Data-plane PutChunk / DeleteChunk / ReplicateChunk (LIS-19 / LIS-55)
+## Data-plane PutChunk / DeleteChunk / ReplicateChunk / GetChunk / ListChunks / VerifyChunk (LIS-19 / LIS-55 / LIS-83)
 
 When `[cluster].shared_secret` is **non-empty**, data nodes require
-authenticated gRPC metadata on mutating RPCs:
+authenticated gRPC metadata on mutating **and** read RPCs:
 
 | Metadata | Meaning |
 |----------|---------|
 | `x-dtfs-rpc-ts` | Unix seconds |
 | `x-dtfs-rpc-mac` | Hex HMAC-SHA256 over `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n` |
 
-- `method` is `PutChunk`, `DeleteChunk`, or `ReplicateChunk`.
-- `binding` is empty for PutChunk; `chunk_id` for DeleteChunk;
-  `chunk_id|target_address` for ReplicateChunk (LIS-55 — pins outbound
-  SSRF target).
+- `method` is `PutChunk`, `DeleteChunk`, `ReplicateChunk`, `GetChunk`,
+  `ListChunks`, or `VerifyChunk`.
+- `binding` is empty for PutChunk / ListChunks; `chunk_id` for
+  DeleteChunk / GetChunk / VerifyChunk; `chunk_id|target_address` for
+  ReplicateChunk (LIS-55 — pins outbound SSRF target).
 - Max skew 300 seconds. Missing/invalid → `PermissionDenied`.
 - Empty `shared_secret` skips verification (join / legacy plaintext parity).
   Data-node startup refuses empty secret unless
   `allow_insecure_empty_secret = true` (LIS-55 / LIS-20).
 
-Callers that stamp: FUSE/client put, data→data replication put, manager
-scheduler `ReplicateChunk`, manager unlink fan-out, scheduler flush/orphan
-delete. **Deploy data + manager + fuse together** when enabling a
-non-empty secret (update-required). mTLS (CF-6) is complementary transport
-auth, not a substitute for this MAC.
-
-**Residual (read path):** `GetChunk` / `ListChunks` / `VerifyChunk` are
-not MAC-gated. Compensating control: keep data gRPC off the public
-internet and prefer TLS `mode = require` across DCs when certs are
-available. Auth-gating reads is a follow-up.
+Callers that stamp: FUSE/client put + get, data→data replication put,
+manager scheduler `ReplicateChunk` / `VerifyChunk` / `ListChunks`, manager
+unlink fan-out, scheduler flush/orphan delete. **Deploy data + manager +
+fuse together** when enabling a non-empty secret (update-required). mTLS
+(CF-6) is complementary transport auth, not a substitute for this MAC.
 
 ## Node join / register
 
