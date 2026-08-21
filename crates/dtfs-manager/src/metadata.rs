@@ -766,20 +766,20 @@ impl ManagerService for MetadataService {
             req.hostname, peer_addr
         );
 
-        let secret_required = !self.config.cluster.shared_secret.is_empty();
-        if secret_required {
-            let ok = req
-                .shared_secret
-                .as_deref()
-                .map(|s| s == self.config.cluster.shared_secret)
-                .unwrap_or(false);
-            if !ok {
-                return Ok(Response::new(RegisterNodeResponse {
-                    accepted: false,
-                    node_id: String::new(),
-                    config_version: 0,
-                }));
-            }
+        // LIS-20 / Sec R3 — never silently admit when shared_secret is empty.
+        // Empty secret is only accepted when allow_insecure_empty_secret was
+        // set at config load (lab escape hatch); otherwise validate_shared_secret
+        // already refused startup.
+        if !self
+            .config
+            .cluster
+            .accepts_shared_secret(req.shared_secret.as_deref())
+        {
+            return Ok(Response::new(RegisterNodeResponse {
+                accepted: false,
+                node_id: String::new(),
+                config_version: 0,
+            }));
         }
 
         let node_id = dtfs_common::node_id_from_hostname(&req.hostname);
