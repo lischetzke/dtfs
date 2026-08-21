@@ -50,7 +50,8 @@ host = "data-01"
 |--------|-----------|------|---------|-------------|-------------|-------------|
 | `manager_addr` | `cluster.manager_addr` | `String` | *(required)* | `host:port` | No | Primary manager gRPC endpoint to register with on startup. |
 | `manager_addrs` | `cluster.manager_addrs` | `Vec<String>` | `[]` | List of `host:port` | No | Additional manager endpoints, walked in order when the primary is unreachable (F-024). List every manager so a rolling manager restart never strands the node. |
-| `shared_secret` | `cluster.shared_secret` | `String` | *(required)* | Any non-empty string | No | Pre-shared key used to authenticate with the manager cluster. Must match the `cluster.shared_secret` in the manager configuration. |
+| `shared_secret` | `cluster.shared_secret` | `String` | *(required)* | Any non-empty string | No | Pre-shared key used to authenticate with the manager cluster and to MAC data-plane mutating RPCs (Put/Delete/ReplicateChunk). Must match the managers. Empty is refused at data-node startup unless `allow_insecure_empty_secret` is set (LIS-55 / LIS-20). |
+| `allow_insecure_empty_secret` | `cluster.allow_insecure_empty_secret` | `bool` | `false` | `true` or `false` | No | Lab-only escape hatch. When `true`, an empty `shared_secret` is permitted and data-RPC auth skips. Never enable in production. |
 
 ### Example
 

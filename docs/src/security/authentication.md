@@ -63,7 +63,7 @@ header. Until the UI/UX agent wires a session secret prompt, use
 `dtfs-cli` (or curl with the header) for mutations on clusters that
 have `shared_secret` set. Read-only WebUI pages continue to work.
 
-## Data-plane PutChunk / DeleteChunk (LIS-19 / Sec R2)
+## Data-plane PutChunk / DeleteChunk / ReplicateChunk (LIS-19 / LIS-55)
 
 When `[cluster].shared_secret` is **non-empty**, data nodes require
 authenticated gRPC metadata on mutating RPCs:
@@ -73,16 +73,25 @@ authenticated gRPC metadata on mutating RPCs:
 | `x-dtfs-rpc-ts` | Unix seconds |
 | `x-dtfs-rpc-mac` | Hex HMAC-SHA256 over `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n` |
 
-- `method` is `PutChunk` or `DeleteChunk`.
-- `binding` is the `chunk_id` for DeleteChunk (binds the stamp to the
-  destructive target); empty for PutChunk.
+- `method` is `PutChunk`, `DeleteChunk`, or `ReplicateChunk`.
+- `binding` is empty for PutChunk; `chunk_id` for DeleteChunk;
+  `chunk_id|target_address` for ReplicateChunk (LIS-55 — pins outbound
+  SSRF target).
 - Max skew 300 seconds. Missing/invalid → `PermissionDenied`.
 - Empty `shared_secret` skips verification (join / legacy plaintext parity).
+  Data-node startup refuses empty secret unless
+  `allow_insecure_empty_secret = true` (LIS-55 / LIS-20).
 
 Callers that stamp: FUSE/client put, data→data replication put, manager
-unlink fan-out, scheduler flush/orphan delete. **Deploy data + manager +
-fuse together** when enabling a non-empty secret (update-required). mTLS
-(CF-6) is complementary transport auth, not a substitute for this MAC.
+scheduler `ReplicateChunk`, manager unlink fan-out, scheduler flush/orphan
+delete. **Deploy data + manager + fuse together** when enabling a
+non-empty secret (update-required). mTLS (CF-6) is complementary transport
+auth, not a substitute for this MAC.
+
+**Residual (read path):** `GetChunk` / `ListChunks` / `VerifyChunk` are
+not MAC-gated. Compensating control: keep data gRPC off the public
+internet and prefer TLS `mode = require` across DCs when certs are
+available. Auth-gating reads is a follow-up.
 
 ## Node join / register
 
