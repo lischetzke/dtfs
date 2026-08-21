@@ -133,7 +133,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// LIS-19 / LIS-55 — data-plane PutChunk / DeleteChunk / ReplicateChunk auth
+// LIS-19 / LIS-55 / LIS-83 — data-plane RPC auth (mutate + read)
 // ---------------------------------------------------------------------------
 
 /// gRPC metadata key: unix-seconds timestamp for the data-RPC MAC.
@@ -143,11 +143,12 @@ pub const DATA_RPC_AUTH_MAC: &str = "x-dtfs-rpc-mac";
 /// Reject MACs whose timestamp is older/newer than this many seconds.
 pub const DATA_RPC_MAX_SKEW_SECS: u64 = 300;
 
-/// Canonical MAC message for a data-plane mutating RPC.
+/// Canonical MAC message for a data-plane RPC.
 ///
-/// `method` is `PutChunk`, `DeleteChunk`, or `ReplicateChunk`. `binding` is:
-/// - empty for PutChunk (chunk id is not known until the stream starts)
-/// - `chunk_id` for DeleteChunk
+/// `method` is `PutChunk`, `DeleteChunk`, `ReplicateChunk`, `GetChunk`,
+/// `ListChunks`, or `VerifyChunk`. `binding` is:
+/// - empty for PutChunk / ListChunks
+/// - `chunk_id` for DeleteChunk / GetChunk / VerifyChunk
 /// - [`data_rpc_replicate_binding`] for ReplicateChunk (`chunk_id|target_address`)
 pub fn data_rpc_mac_message(method: &str, ts_unix: u64, binding: &str) -> String {
     format!("dtfs-data-rpc\nv1\n{method}\n{ts_unix}\n{binding}\n")
