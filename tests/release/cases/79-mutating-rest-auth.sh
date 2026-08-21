@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 60-mutating-rest-auth.sh — LIS-18 / Sec R1: mutating manager REST
+# 79-mutating-rest-auth.sh — LIS-18 / Sec R1: mutating manager REST
 # requires cluster shared_secret when configured.
 #
 # Asserts:

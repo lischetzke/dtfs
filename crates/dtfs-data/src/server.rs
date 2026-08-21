@@ -1286,6 +1286,25 @@ max_io_percent = 10
         assert!(svc.store.chunk_file_path(&chunk_id).is_some());
     }
 
+    // LIS-19 — PutChunk uses the same require_data_rpc_auth gate before any
+    // stream I/O. tonic::Streaming is not constructible without a server, so
+    // this exercises the exact call put_chunk makes with empty metadata.
+    #[tokio::test]
+    async fn put_chunk_rejects_missing_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let md = tonic::metadata::MetadataMap::new();
+        let err = require_data_rpc_auth(
+            &svc.config.cluster.shared_secret,
+            "PutChunk",
+            "",
+            &md,
+        )
+        .expect_err("unauthenticated PutChunk must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("missing x-dtfs-rpc"));
+    }
+
     // LIS-19 — valid stamp allows DeleteChunk.
     #[tokio::test]
     async fn delete_chunk_accepts_valid_auth() {
