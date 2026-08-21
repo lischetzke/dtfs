@@ -1364,6 +1364,47 @@ max_io_percent = 10
         assert!(svc.store.chunk_file_path(&chunk_id).is_some());
     }
 
+    // LIS-62 — wrong MAC (stamp for a different chunk binding) → PermissionDenied.
+    // Same pattern as DeleteChunk auth: MAC must verify against the request's
+    // chunk_id binding, not an attacker-chosen alternate.
+    #[tokio::test]
+    async fn replicate_chunk_rejects_bad_mac() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"lis62-replicate-badmac";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(
+                &chunk_id,
+                data,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+            )
+            .await
+            .unwrap();
+
+        let mut req = Request::new(ReplicateChunkRequest {
+            chunk_id: chunk_hex.clone(),
+            target_address: "http://127.0.0.1:19999".into(),
+            target_tier: "warm".into(),
+        });
+        // Stamp for a different binding so verify fails.
+        attach_data_rpc_auth(
+            &mut req,
+            &svc.config.cluster.shared_secret,
+            "ReplicateChunk",
+            "deadbeef_wrong_chunk_id",
+        );
+        let err = svc
+            .replicate_chunk(req)
+            .await
+            .expect_err("bad MAC ReplicateChunk must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(svc.store.chunk_file_path(&chunk_id).is_some());
+    }
+
     // LIS-62 — valid stamp allows ReplicateChunk past the auth gate
     // (outbound Put may still fail on an unreachable target).
     #[tokio::test]
