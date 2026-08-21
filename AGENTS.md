@@ -661,7 +661,9 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   config + scheme-aware endpoint. ALL gRPC listeners and connects (manager,
   data, raft peers, FUSE via `DtfsClient::set_tls`) route through it; mixed
   TLS state partitions the cluster, so enable only cluster-wide
-  (docs/src/security/tls.md rollout).
+  (docs/src/security/tls.md rollout). `TlsContext::connect` applies a 3s
+  `CONNECT_TIMEOUT` (LIS-77 / BR-1) so blackhole peers fail fast; Raft
+  still uses `endpoint()` + its own timeout chain.
 - `plans/active/` — in-flight plans (see plans/README.md).
 - `tests/proxmox/abuse/` — numbered shell regression tests.
 
