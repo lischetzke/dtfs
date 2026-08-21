@@ -64,7 +64,11 @@ pub fn check_mutation_auth(
     let provided = extract_provided_secret(headers);
     match provided {
         None => Err(MutationAuthError::Missing),
-        Some(p) if p == expected_secret => Ok(()),
+        Some(p)
+            if dtfs_common::crypto::constant_time_eq(p.as_bytes(), expected_secret.as_bytes()) =>
+        {
+            Ok(())
+        }
         Some(_) => Err(MutationAuthError::Mismatch),
     }
 }

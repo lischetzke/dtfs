@@ -179,6 +179,11 @@ bytes must:
    ReplicateChunk, manager unlink fan-out + scheduler flush. Deploy
    data+manager+fuse together. GetChunk/ListChunks/VerifyChunk remain
    open (network + TLS compensate). mTLS (CF-6) is complementary.
+8. LIS-56 — when `cluster.shared_secret` is non-empty, mutating
+   ManagerService RPCs require the same header keys over the
+   `dtfs-mgr-rpc` plane (`metadata::require_mgr_rpc_auth`); `dtfs-client`
+   stamps from `[client].shared_secret`. REST mutations remain LIS-18.
+   Deploy manager+fuse together.
 
 Full audit checklist: § A.6.
 
@@ -565,7 +570,11 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   is the WebUI home aggregator. LIS-18 / Sec R1: mutating `/api/v1/*`
   requires `[cluster].shared_secret` via `X-Dtfs-Shared-Secret` (or
   `Authorization: Bearer`) when configured (`rest_auth.rs`); GETs stay
-  open; join HMAC exempt. Denied calls audit as `auth.denied`. The config
+  open; join HMAC exempt. Denied calls audit as `auth.denied`. LIS-56:
+  mutating ManagerService gRPC (`CreateFile`/`DeleteFile`/leases/…)
+  requires `x-dtfs-rpc-*` HMAC over the `dtfs-mgr-rpc` plane when the
+  secret is set (`metadata::require_mgr_rpc_auth`); reads stay open;
+  `dtfs-client` stamps from `[client].shared_secret`. The config
   read endpoints (`get_config`, `get_config_effective`) return the
   **effective** config = the node's startup `state.config` with the Raft
   cluster override (`cluster_config.config_json`) projected on top via
@@ -587,7 +596,9 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   drain/re-replicate first. The endpoint pre-checks the same and the apply
   re-checks authoritatively (TOCTOU-safe).
 - `dtfs-manager/src/rest_auth.rs` — pure mutation-auth check + axum
-  middleware for LIS-18.
+  middleware for LIS-18 (constant-time compare).
+- `dtfs-manager/src/metadata.rs` — ManagerService gRPC; LIS-56
+  `require_mgr_rpc_auth` on mutating client RPCs.
 - `dtfs-manager/src/membership.rs` — CF-2 online raft membership: pure
   validation for the leader-only `/api/v1/raft/{add-learner,promote,
   remove}` endpoints (openraft `add_learner`/`change_membership`;
@@ -608,7 +619,8 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   `require_data_rpc_auth` gates PutChunk/DeleteChunk/ReplicateChunk.
 - `dtfs-common/src/crypto.rs` — join HMAC + LIS-19/LIS-55
   `stamp_data_rpc_auth` / `verify_data_rpc_auth` /
-  `data_rpc_replicate_binding`.
+  `data_rpc_replicate_binding` + LIS-56 `stamp_mgr_rpc_auth` /
+  `verify_mgr_rpc_auth`.
 - `dtfs-data/src/store.rs::commit_chunk_from_tmp` — atomic commit
   (§ A.6).
 - `dtfs-common/src/memory.rs` — CF-5 role-agnostic memory budget core
