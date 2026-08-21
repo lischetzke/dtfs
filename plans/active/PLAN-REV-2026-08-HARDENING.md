@@ -90,11 +90,11 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
 - `REV-1-1` ⬜ leader-gate `TieringEngine::run`, `run_orphan_scrub`,
   `run_auto_unquarantine_sweep`, `run_lease_gc`, `POST /api/v1/cache/flush`.
 - `REV-1-2` ⬜ orphan-reaper freshness gate.
-- `REV-1-6` ⬜ write buffer must not drain bytes it never emitted (upstream
+- `REV-1-6` ✅ write buffer must not drain bytes it never emitted (upstream
   already carries the failing-by-design test `co_1_7_*`).
-- `REV-2-1b` ⬜ client half: resolve chunks by `chunk_index`, not array position.
-- `REV-2-3` ⬜ readahead prefetches via the foreground read's candidate order.
-- `REV-2-4` ⬜ verify the FUSE local cache against the chunk id before serving.
+- `REV-2-1b` ✅ client half: resolve chunks by `chunk_index`, not array position.
+- `REV-2-3` ✅ readahead prefetches via the foreground read's candidate order.
+- `REV-2-4` ✅ verify the FUSE local cache against the chunk id before serving.
 - `REV-3-2` ⬜ incremental `ListChunks` paging.
 - `REV-3-4` ⬜ cap scheduler task creation per tick and overall.
 - `REV-3-5` ⬜ memory rung gates on Shed and is self-limiting.
@@ -104,7 +104,7 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
 - `REV-3-9` ⬜ operator maintenance survives a heartbeat.
 - `REV-3-10` ⬜ reconcile a stale location row instead of quarantining the node.
 - `REV-3-11` ⬜ three-way merge for `migration_state_json`.
-- `REV-3-12` ⬜ single-sweep cache eviction, off the read path.
+- `REV-3-12` ✅ single-sweep cache eviction, off the read path.
 - `REV-4-1` ⬜ WebUI escaping + CSP.
 - `REV-4-2` ⬜ cap `AllocateChunks.num_chunks` at the boundary.
 - `REV-4-3` ⬜ config write validates by re-parsing, atomic rename.
@@ -140,6 +140,31 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
 - **REV-2-1a / REV-2-5 / REV-2-6** — 2026-08-21. `cargo test -p dtfs-manager
   --release`: 300 passed after the proto change. All touched shell scripts
   `bash -n` clean. Live half 🟨 deferred to the campaign.
+
+- **dtfs-fuse port** — 2026-08-21. `cargo test -p dtfs-fuse --release`: 61 passed
+  (baseline 52 + 9). Findings that changed the plan:
+  - **REV-1-6 was already fixed upstream** and this review was wrong to call it
+    open: the mid-chunk branch now returns early and defers the whole buffer to
+    `flush_all`, and `co_1_7_midchunk_flush_does_not_drop_leading_partial_bytes`
+    PASSES on the unmodified base. Only that test's comment is stale. Nothing
+    ported; release case 78 keeps it pinned.
+  - **A second positional-indexing site was found**, not in the original review:
+    the read-modify-write seed in `filesystem.rs::write` resolved its chunk with
+    `chunks.get(chunk_idx)`, so on a gapped file it seeded from a NEIGHBOURING
+    chunk and wrote those bytes back under this chunk's index - a persistent,
+    write-side version of T3. Fixed with the same `chunk_at` lookup.
+  - **The reference patch for REV-2-1 was itself buggy**: it kept
+    `result.extend_from_slice(...)`, so skipping a hole slid every later chunk's
+    bytes down into it. The port pre-zeroes the read buffer and copies each
+    chunk at its own offset instead.
+  - REV-2-4 verifies via `read_verified` (8 MiB `read_exact` pieces hashed with
+    `IncrementalHasher` straight into the destination buffer - no second
+    whole-chunk copy, A.3.2); observed failing first with "corrupt cache entry
+    must report a MISS, never serve rotten bytes". The pre-existing cache tests
+    used synthetic non-content-addressed ids and had to move to a `cid(data)`
+    fixture, since verify-on-read makes id == BLAKE3(content) load-bearing.
+  - REV-3-12 discriminates: with the counter moved back into the victim loop it
+    reports `left: 3  right: 1` for three victims.
 
 ## Deviations
 

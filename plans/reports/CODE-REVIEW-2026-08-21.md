@@ -81,14 +81,21 @@ is undetectable by the system itself.
 `effective_read_len`.
 
 **T4.2 `WriteBuffer::extract_complete_chunks` drops bytes it never emitted —
-OPEN.** The mid-chunk branch starts `pos` at `bytes_to_complete_first`, emits
-only whole chunks from there, then drains from the front up to `pos` — so the
-leading partial region is discarded without ever becoming a segment, and
-`dirty_offset` advances past it. Silent loss of acked writes, up to
-`chunk_size - 1` bytes. Upstream is aware: it carries a test
-`audit_co_tests::co_1_7_midchunk_flush_does_not_drop_leading_partial_bytes`
-whose own comment says "today they are drained without ever being emitted, so
-this fails (data loss)".
+FIXED UPSTREAM.** Corrected after first publication: the mid-chunk branch now
+returns early, emitting and draining nothing and leaving `dirty_offset`
+untouched, so the whole contiguous buffer defers to `extract_all_chunks` /
+`flush_all`, which already emits the leading partial region. The
+`co_1_7_midchunk_flush_does_not_drop_leading_partial_bytes` test **passes** on
+current master; only its comment is stale (it still says "today they are
+drained without ever being emitted, so this fails"), which is what made this
+review call it open. Release case 78 keeps it pinned anyway.
+
+**T4.2b — a SECOND positional-indexing site, found while porting T3 — OPEN.**
+The read-modify-write seed in `filesystem.rs::write` resolved its chunk with
+`loc.chunks.get(chunk_idx as usize)`, i.e. positionally. On a sparse or gapped
+file that seeds the buffer with a *neighbouring* chunk's bytes and then writes
+them back **under this chunk's index** — a write-side corruption path, worse
+than T3's read-side one because it persists. Fixed with the same index lookup.
 
 **T4.3 sparse-hole fill materialises the whole hole — OPEN, re-check needed.**
 The `FILL_CHUNK` cap bounds only the temporary zero buffer; every iteration
