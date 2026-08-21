@@ -2,6 +2,11 @@
 //!
 //! Provides cluster management endpoints consumed by the WebUI, CLI,
 //! and external integrations.
+//!
+//! LIS-18 / Sec R1: mutating `/api/v1/*` routes require
+//! `[cluster].shared_secret` via `X-Dtfs-Shared-Secret` (or
+//! `Authorization: Bearer`) when the secret is configured. Read-only
+//! GETs stay open for trusted-network dashboards. See `rest_auth`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -15,6 +20,7 @@ use openraft::Instant as _;
 use axum::{
     extract::{Json, Query, State},
     http::StatusCode,
+    middleware,
     routing::{get, post},
     Router,
 };
@@ -191,6 +197,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // HMAC join (phase 1: challenge, phase 2: Raft register)
         .route("/api/v1/join/request", post(join_request_api))
         .route("/api/v1/join/complete", post(join_complete_api))
+        // LIS-18 — shared-secret gate on mutating REST (fail closed when
+        // `[cluster].shared_secret` is set). Join HMAC + GET probes exempt.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::rest_auth::require_mutation_auth,
+        ))
         .with_state(state);
 
     // Merge API routes (higher priority) with WebUI (fallback).

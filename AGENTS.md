@@ -558,26 +558,32 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   drained corrupt ids when the ack is `accepted == false` (same as a
   transport error), so the retry actually happens.
 - `dtfs-manager/src/api.rs` — REST endpoints (WebUI + CLI); `get_stats`
-  is the WebUI home aggregator. The config read endpoints (`get_config`,
-  `get_config_effective`) return the **effective** config = the node's
-  startup `state.config` with the Raft cluster override
-  (`cluster_config.config_json`) projected on top via `json_deep_merge`
-  (Bug CM) — a saved cluster-wide override MUST read back as `current`, or
-  the WebUI editor looks broken. Adding a config read path? Route it
-  through `effective_config_value`, never raw `state.config` (CO-5-9 — the
-  `get_config` `defaults` block follows the same merge). The write path
-  (`update_config`) deep-merges the override onto the startup config (which,
-  since `UpdateConfig` replaces the override wholesale, IS the post-save
-  effective config) and REQUIRES the merge to deserialize as `ManagerConfig`
-  (`merge_and_validate_override`, 400 on type error, CO-4-3), then persists
-  `toml::to_string_pretty` of the validated merge — never raw override JSON
-  into the `.toml`. Operator node decommission
-  (`POST /api/v1/nodes/{id}/decommission` -> `decommission_node_endpoint` ->
-  Raft `ClientRequest::DeregisterNode`) removes a drained/dead node from the
-  registry; the apply REFUSES (`ClientResponse::Error`) if the node still
-  holds any chunk replica (`sm.files[*].chunks[*].node_id`) — integrity
-  guard A.6 #5, drain/re-replicate first. The endpoint pre-checks the same
-  and the apply re-checks authoritatively (TOCTOU-safe).
+  is the WebUI home aggregator. LIS-18 / Sec R1: mutating `/api/v1/*`
+  requires `[cluster].shared_secret` via `X-Dtfs-Shared-Secret` (or
+  `Authorization: Bearer`) when configured (`rest_auth.rs`); GETs stay
+  open; join HMAC exempt. Denied calls audit as `auth.denied`. The config
+  read endpoints (`get_config`, `get_config_effective`) return the
+  **effective** config = the node's startup `state.config` with the Raft
+  cluster override (`cluster_config.config_json`) projected on top via
+  `json_deep_merge` (Bug CM) — a saved cluster-wide override MUST read
+  back as `current`, or the WebUI editor looks broken. Adding a config
+  read path? Route it through `effective_config_value`, never raw
+  `state.config` (CO-5-9 — the `get_config` `defaults` block follows the
+  same merge). The write path (`update_config`) deep-merges the override
+  onto the startup config (which, since `UpdateConfig` replaces the
+  override wholesale, IS the post-save effective config) and REQUIRES the
+  merge to deserialize as `ManagerConfig` (`merge_and_validate_override`,
+  400 on type error, CO-4-3), then persists `toml::to_string_pretty` of
+  the validated merge — never raw override JSON into the `.toml`. Operator
+  node decommission (`POST /api/v1/nodes/{id}/decommission` ->
+  `decommission_node_endpoint` -> Raft `ClientRequest::DeregisterNode`)
+  removes a drained/dead node from the registry; the apply REFUSES
+  (`ClientResponse::Error`) if the node still holds any chunk replica
+  (`sm.files[*].chunks[*].node_id`) — integrity guard A.6 #5,
+  drain/re-replicate first. The endpoint pre-checks the same and the apply
+  re-checks authoritatively (TOCTOU-safe).
+- `dtfs-manager/src/rest_auth.rs` — pure mutation-auth check + axum
+  middleware for LIS-18.
 - `dtfs-manager/src/membership.rs` — CF-2 online raft membership: pure
   validation for the leader-only `/api/v1/raft/{add-learner,promote,
   remove}` endpoints (openraft `add_learner`/`change_membership`;

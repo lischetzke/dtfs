@@ -7,6 +7,8 @@
 //!
 //! **Home page sections (matching the plan):**
 //! - Health overview banner (HEALTHY / DEGRADED / CRITICAL)
+//! - Production Signals strip (anchor pending, missing chunks, quarantine,
+//!   failed migrations, placement undergoal/missing) — real API fields only
 //! - Summary counters: Managers, Data Nodes, Disks, FUSE Clients
 //! - Capacity cards: Raw (total/used), Net usable, I/O throughput
 //! - Last scrub card (level, time, results)
@@ -174,6 +176,36 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         @keyframes pulse-fast {{ 0%,100% {{ opacity:1 }} 50% {{ opacity:.3 }} }}
         .health-label {{ font-size: 1rem; text-transform: uppercase; letter-spacing: .08em; }}
         .health-right {{ font-size: .8rem; color: var(--text-muted); font-weight: 400; }}
+
+        /* ── Production signals (Home) ── */
+        .signal-strip {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: .5rem; margin-bottom: 1rem;
+        }}
+        .signal-chip {{
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: .4rem; padding: .55rem .7rem;
+            cursor: pointer; text-align: left; font-family: inherit; color: inherit;
+            min-height: 3.4rem;
+        }}
+        .signal-chip:hover {{ border-color: var(--primary); }}
+        .signal-chip .signal-val {{
+            font-size: 1.25rem; font-weight: 700; line-height: 1.1;
+            font-variant-numeric: tabular-nums;
+        }}
+        .signal-chip .signal-lbl {{
+            font-size: .7rem; color: var(--text-muted); margin-top: .2rem;
+            text-transform: uppercase; letter-spacing: .04em;
+        }}
+        .signal-chip.ok .signal-val {{ color: var(--text-muted); }}
+        .signal-chip.warn {{ border-color: #92400e88; background: #78350f22; }}
+        .signal-chip.warn .signal-val {{ color: var(--warning); }}
+        .signal-chip.danger {{ border-color: #7f1d1d88; background: #7f1d1d22; }}
+        .signal-chip.danger .signal-val {{ color: var(--danger); }}
+        .signal-chip .signal-hint {{
+            font-size: .65rem; color: var(--text-muted); margin-top: .15rem;
+        }}
 
         /* ── Main layout ── */
         .container {{ max-width: none; margin: 0; padding: 1rem 1.25rem; }}
@@ -856,9 +888,11 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     // ── Stats fetch ──────────────────────────────────────────────────────────
 
     async function fetchStats() {{
-        const [stats, nodes] = await Promise.all([
+        const [stats, nodes, migrations, cluster] = await Promise.all([
             fetch('/api/v1/stats').then(r => r.json()).catch(() => null),
             fetch('/api/v1/nodes').then(r => r.json()).catch(() => []),
+            fetch('/api/v1/migrations').then(r => r.json()).catch(() => ({{count:0,tasks:[]}})),
+            fetch('/api/v1/cluster/status').then(r => r.json()).catch(() => null),
         ]);
 
         document.getElementById('refresh-time').textContent =
@@ -866,6 +900,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
         if (!stats) {{
             setHealthBanner('unknown', 'Unknown', 'Could not reach API', '');
+            renderProductionSignals(null, null, null);
             return;
         }}
 
@@ -880,6 +915,9 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         const right = 'Config v' + (stats.config_version || 0) +
                       ' · ' + (stats.file_count || 0) + ' files';
         setHealthBanner(h, h.toUpperCase(), detail, right);
+
+        // ── Production signals (anchor / integrity / migrations)
+        renderProductionSignals(stats, migrations, cluster);
 
         // ── Count cards
         document.getElementById('cnt-managers').textContent  = stats.manager_count   ?? '0';
@@ -949,6 +987,85 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
         // ── Nodes table
         renderNodes(nodes);
+    }}
+
+    // Home strip: surface production lies from real API fields only.
+    // Clicking a chip navigates to the page that owns the drill-down.
+    function renderProductionSignals(stats, migrations, cluster) {{
+        const el = document.getElementById('signal-strip');
+        if (!el) return;
+        if (!stats) {{
+            el.innerHTML = '<div class="placeholder">Signals unavailable (stats fetch failed).</div>';
+            return;
+        }}
+        const tasks = (migrations && migrations.tasks) || [];
+        const failedMig = tasks.filter(t => (t.status||'').toLowerCase() === 'failed').length;
+        const activeMig = tasks.filter(t => {{
+            const s = (t.status||'').toLowerCase();
+            return s && s !== 'done' && s !== 'failed';
+        }}).length;
+        const cp = stats.chunk_placement || {{}};
+        const missingChunks = (cluster && typeof cluster.files_missing_chunks === 'number')
+            ? cluster.files_missing_chunks : null;
+        const chips = [
+            {{
+                id: 'sig-anchor',
+                val: stats.anchor_pending ?? 0,
+                lbl: 'Anchor pending',
+                hint: 'Files missing mandatory anchor copy',
+                sev: (stats.anchor_pending || 0) > 0 ? 'warn' : 'ok',
+                href: '/ui/volumes',
+            }},
+            {{
+                id: 'sig-missing-files',
+                val: missingChunks === null ? '—' : missingChunks,
+                lbl: 'Files missing chunks',
+                hint: missingChunks === null
+                    ? 'cluster/status unavailable'
+                    : 'Realized data loss (chunk bindings empty)',
+                sev: (missingChunks || 0) > 0 ? 'danger' : (missingChunks === null ? 'ok' : 'ok'),
+                href: '/ui/integrity',
+            }},
+            {{
+                id: 'sig-quarantine',
+                val: stats.quarantined_nodes ?? 0,
+                lbl: 'Quarantined nodes',
+                hint: 'Excluded from serving paths',
+                sev: (stats.quarantined_nodes || 0) > 0 ? 'danger' : 'ok',
+                href: '/ui/integrity',
+            }},
+            {{
+                id: 'sig-mig-failed',
+                val: failedMig,
+                lbl: 'Migrations failed',
+                hint: activeMig ? (activeMig + ' in flight') : 'Exhausted retries',
+                sev: failedMig > 0 ? 'danger' : 'ok',
+                href: '/ui/migrations',
+            }},
+            {{
+                id: 'sig-undergoal',
+                val: cp.undergoal ?? 0,
+                lbl: 'Undergoal chunks',
+                hint: 'Below volume replica goal',
+                sev: (cp.undergoal || 0) > 0 ? 'warn' : 'ok',
+                href: '/ui/',
+            }},
+            {{
+                id: 'sig-missing-chunks',
+                val: cp.missing ?? 0,
+                lbl: 'Missing chunks',
+                hint: 'Placement state: missing',
+                sev: (cp.missing || 0) > 0 ? 'danger' : 'ok',
+                href: '/ui/',
+            }},
+        ];
+        el.innerHTML = chips.map(c => `
+            <button type="button" class="signal-chip ${{c.sev}}" id="${{c.id}}"
+                    title="${{c.hint}}" onclick="navigate('${{c.href}}')">
+                <div class="signal-val">${{c.val}}</div>
+                <div class="signal-lbl">${{c.lbl}}</div>
+                <div class="signal-hint">${{c.hint}}</div>
+            </button>`).join('');
     }}
 
     // render the chunk placement-state distribution
@@ -1325,6 +1442,10 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
     function renderHome() {{
         document.getElementById('page-content').innerHTML = `
+        <div class="section-title">Production signals</div>
+        <div class="signal-strip" id="signal-strip">
+            <div class="placeholder">Loading signals…</div>
+        </div>
         <div class="counts-row">
             <div class="count-card">
                 <div class="count-icon managers">⬡</div>
@@ -2484,6 +2605,9 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <h2>Migrations</h2>
                 <p class="page-desc">Manual + automatic chunk migration tasks (refreshed every 5s)</p>
             </div>
+            <div id="mig-summary" class="signal-strip" style="margin-bottom:.75rem">
+                <div class="placeholder">Counting…</div>
+            </div>
             <div style="display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap">
                 <button class="btn-primary"   onclick="loadMigrations()">Refresh</button>
                 <button class="btn-secondary" onclick="openMigrate('')">+ New migration</button>
@@ -2498,6 +2622,28 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         const el = document.getElementById('migrations-list');
         if (!el) return;
         const tasks = data.tasks || [];
+        const sumEl = document.getElementById('mig-summary');
+        if (sumEl) {{
+            let failed = 0, done = 0, active = 0, pending = 0;
+            for (const t of tasks) {{
+                const s = (t.status||'').toLowerCase();
+                if (s === 'failed') failed++;
+                else if (s === 'done') done++;
+                else if (s === 'pending') pending++;
+                else active++;
+            }}
+            const chip = (val, lbl, sev) =>
+                `<div class="signal-chip ${{sev}}" style="cursor:default">
+                    <div class="signal-val">${{val}}</div>
+                    <div class="signal-lbl">${{lbl}}</div>
+                </div>`;
+            sumEl.innerHTML =
+                chip(failed, 'Failed', failed > 0 ? 'danger' : 'ok') +
+                chip(active, 'In flight', active > 0 ? 'warn' : 'ok') +
+                chip(pending, 'Pending', 'ok') +
+                chip(done, 'Done', 'ok') +
+                chip(tasks.length, 'Total tracked', 'ok');
+        }}
         if (tasks.length === 0) {{
             setHtmlPreserveScroll(el, '<div class="placeholder">No migration tasks. Schedule one from Data Explorer or the “+ New migration” button.</div>');
             return;
@@ -3007,6 +3153,41 @@ mod bug_bk_scrub_tests {
             assert!(html.contains(id), "modal must contain spill control {id}");
         }
         assert!(html.contains("post('set-spill'"), "submit posts set-spill");
+    }
+
+    /// Home Production Signals strip: real API fields only so operators
+    /// see anchor pending / quarantine / failed migrations without logs.
+    #[test]
+    fn production_signals_strip_present() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        assert!(
+            html.contains("id=\"signal-strip\""),
+            "Home must render the production-signals container"
+        );
+        assert!(
+            html.contains("renderProductionSignals(stats, migrations, cluster)"),
+            "fetchStats must pass stats + migrations + cluster/status into the strip"
+        );
+        assert!(
+            html.contains("stats.anchor_pending"),
+            "strip must read stats.anchor_pending"
+        );
+        assert!(
+            html.contains("stats.quarantined_nodes"),
+            "strip must read stats.quarantined_nodes"
+        );
+        assert!(
+            html.contains("files_missing_chunks"),
+            "strip must read cluster/status.files_missing_chunks"
+        );
+        assert!(
+            html.contains("sig-anchor") && html.contains("sig-mig-failed"),
+            "chip ids for anchor + failed migrations must be present"
+        );
+        assert!(
+            html.contains("id=\"mig-summary\""),
+            "Migrations page must show a status summary strip"
+        );
     }
 }
 
