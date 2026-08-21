@@ -347,6 +347,104 @@ fn heartbeat_may_mark_healthy(current: HealthStatus) -> bool {
     }
 }
 
+/// REV-3-8 — hard cap on how many integrity faults ONE heartbeat may
+/// carry into the manager's fault-processing path.
+///
+/// The data node's fault collector holds up to 1024 entries and ships
+/// them all on a single 5s heartbeat. Pre-fix the handler issued three
+/// serially-awaited Raft writes PER FAULT (audit + QuarantineNode +
+/// a single-id `RemoveCorruptChunkReplicas`, the last of which sweeps
+/// the whole namespace), i.e. ~3072 round-trips each taking the
+/// state-machine write lock while the collector refilled — self-
+/// sustaining, and it stalled every other metadata operation.
+///
+/// 128 distinct chunks is far above what any healthy node reports in one
+/// heartbeat window, and it bounds the single batched removal's Raft
+/// payload. Nothing is lost past the cap: the node is quarantined off
+/// every serving path on the FIRST fault, and the remaining faults
+/// arrive on a later heartbeat (the data-side collector keeps them) or
+/// are found by scrub.
+pub(crate) const MAX_INTEGRITY_FAULTS_PER_HEARTBEAT: usize = 128;
+
+/// REV-3-8 — the deduped, capped result of one heartbeat's integrity
+/// faults. Shaped so the handler performs exactly ONE summary audit row,
+/// ONE `QuarantineNode` and ONE batched
+/// `RemoveCorruptChunkReplicas { chunk_hashes }` per heartbeat — the same
+/// batched shape `report_chunk_status` already uses for the Bug O scrub
+/// path, so no `dtfs-raft` change is needed.
+pub(crate) struct IntegrityFaultBatch<'a> {
+    /// Distinct chunk ids, first-seen order, at most `cap` entries.
+    pub chunk_ids: Vec<String>,
+    /// First fault in the report — drives the QuarantineInfo + audit row.
+    pub representative: Option<&'a IntegrityFault>,
+    /// Faults examined before the cap stopped the scan.
+    pub scanned: usize,
+    /// Faults left unexamined because of the cap.
+    pub dropped: usize,
+}
+
+/// REV-3-8 — dedupe `faults` by chunk_id and stop once `cap` distinct
+/// ids have been collected. Pure, so it is unit-tested directly.
+pub(crate) fn batch_integrity_faults(
+    faults: &[IntegrityFault],
+    cap: usize,
+) -> IntegrityFaultBatch<'_> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut chunk_ids: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    for f in faults {
+        if chunk_ids.len() >= cap {
+            break;
+        }
+        scanned += 1;
+        if f.chunk_id.is_empty() {
+            continue;
+        }
+        if seen.insert(f.chunk_id.as_str()) {
+            chunk_ids.push(f.chunk_id.clone());
+        }
+    }
+    IntegrityFaultBatch {
+        chunk_ids,
+        representative: faults.first(),
+        scanned,
+        dropped: faults.len().saturating_sub(scanned),
+    }
+}
+
+/// REV-4-2 — upper bound on `AllocateChunksRequest.num_chunks`.
+///
+/// `num_chunks` is peer-controlled: pre-fix the handler fed it straight
+/// into `place_chunks_with_anchor` (one placement allocated per chunk)
+/// and into two `0..num_chunks`-shaped loops, all under the
+/// state-machine READ lock — so one malformed request with
+/// `num_chunks = u32::MAX` allocated unbounded memory and blocked every
+/// writer for the duration.
+///
+/// The bound is derived from the workload, not picked for looks. DTFS
+/// serves one household Plex library; the largest single file it can
+/// contain is a full 4K UHD Blu-ray remux, which tops out near 100 GB.
+/// The default chunk size is 4 MiB (`DefaultsConfig::chunk_size_mb` = 4),
+/// so 65536 chunks x 4 MiB = 256 GiB in ONE allocate call — ~2.5x the
+/// largest file the workload implies, while capping the handler's work
+/// at a few MB of placements. A file larger than that is still writable:
+/// the client splits it across several allocate_chunks calls.
+pub(crate) const MAX_CHUNKS_PER_ALLOCATION: u32 = 65_536;
+
+/// REV-4-2 — validate the untrusted chunk count at the API boundary,
+/// BEFORE any allocation or lock acquisition. Pure, so it is unit-tested
+/// directly.
+pub(crate) fn validate_num_chunks(num_chunks: u32, max: u32) -> Result<(), String> {
+    if num_chunks > max {
+        return Err(format!(
+            "num_chunks {num_chunks} exceeds the per-request maximum {max} \
+             (256 GiB at the 4 MiB default chunk size); split the file across \
+             several allocate_chunks calls"
+        ));
+    }
+    Ok(())
+}
+
 /// Bug BL / CO-3-9 — resolve the gRPC address of the current Raft leader.
 ///
 /// Prefers the live Raft membership (`StateMachineData::nodes`, keyed by
@@ -560,6 +658,23 @@ fn resolve_node_contact(sm: &StateMachineData, stored: &str) -> String {
 /// to populate `ChunkLocationInfo.node_tiers` so the read client can prefer
 /// warm over the cold anchor HDD on a distance tie. Returns `""` when the
 /// node/disk is not (yet) known, which the client treats as "no tie-break".
+/// REV-2-1 — an empty `ChunkLocationInfo` for one chunk index.
+///
+/// The `chunk_index` label is what lets the client resolve a chunk by index
+/// instead of by array position: the manager emits only the BTreeMap values, so
+/// the array is dense even when the file's index space is not, and a positional
+/// read served a different chunk's bytes at a valid offset.
+fn new_chunk_location(chunk_hash: &str, size: u64, chunk_index: u64) -> ChunkLocationInfo {
+    ChunkLocationInfo {
+        chunk_id: chunk_hash.to_string(),
+        size,
+        node_addresses: Vec::new(),
+        node_tiers: Vec::new(),
+        node_locations: Vec::new(),
+        chunk_index,
+    }
+}
+
 fn replica_tier_string(sm: &StateMachineData, node_id: &str, disk_id: u32) -> String {
     let Ok(id) = node_id.parse::<u64>() else {
         return String::new();
@@ -710,15 +825,13 @@ impl ManagerService for MetadataService {
             // unknown node yields a default (all-empty) Location, which the
             // client skips (unknown -> arbitrary/pure-distance order).
             let location = replica_location_proto(&data, &c.node_id).unwrap_or_default();
-            let e = by_chunk
-                .entry(c.chunk_index)
-                .or_insert_with(|| ChunkLocationInfo {
-                    chunk_id: c.chunk_hash.clone(),
-                    size: c.size_bytes,
-                    node_addresses: Vec::new(),
-                    node_tiers: Vec::new(),
-                    node_locations: Vec::new(),
-                });
+            let e = by_chunk.entry(c.chunk_index).or_insert_with(|| {
+                // REV-2-1 — built by a free fn rather than an inline struct
+                // literal: the literal form ICEs rustc 1.94 while type-checking
+                // this function (same compiler as the dead-code ICE workaround
+                // noted in AGENTS.md A.4).
+                new_chunk_location(&c.chunk_hash, c.size_bytes, c.chunk_index)
+            });
             e.size = e.size.max(c.size_bytes);
             if !e.node_addresses.contains(&addr) {
                 e.node_addresses.push(addr);
@@ -991,76 +1104,103 @@ impl ManagerService for MetadataService {
                 .await;
         }
 
-        // Bug BF-6 — process every integrity_fault the data node
-        // reported since its last heartbeat. For each fault:
-        //   1. raft-write QuarantineNode (state_machine apply path
-        //      accumulates fault_count_total across faults).
-        //   2. raft-write RemoveCorruptChunkReplicas so the under-
-        //      replication scheduler re-replicates the chunk from a
-        //      healthy node immediately.
+        // Bug BF-6 / REV-3-8 — process the integrity faults the data node
+        // reported since its last heartbeat as ONE batch:
+        //   1. one `read.integrity_fault` audit summary row,
+        //   2. one QuarantineNode (the apply path accumulates
+        //      fault_count_total),
+        //   3. one BATCHED RemoveCorruptChunkReplicas so the under-
+        //      replication scheduler re-replicates every reported chunk
+        //      from a healthy node immediately.
+        // Pre-REV-3-8 this was three serially-awaited Raft writes PER
+        // FAULT (the last of them a full-namespace sweep). A node with a
+        // damaged `.meta` directory fills its collector (cap 1024) and
+        // ships them all on one 5s heartbeat, so the manager took the
+        // state-machine write lock ~3072 times while the collector
+        // refilled — self-sustaining, and it stalled every other
+        // metadata operation for the duration.
         // Older data nodes don't emit field 10; for them the vec is
-        // empty + this loop is a no-op (back-compat with pre-BF data).
+        // empty + this block is a no-op (back-compat with pre-BF data).
         if !req.integrity_faults.is_empty() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            // Bug BO-4 (BC-12e remainder) — the data node's verify-on-read
-            // mismatch surfaces only as a node.quarantine row today. Emit a
-            // distinct `read.integrity_fault` audit per fault so the
-            // /api/v1/integrity/faults feed shows the raw read event (chunk
-            // + hashes) separately from the node-quarantine action.
             let hostname = {
                 let sm = self.sm_data.read().await;
                 sm.nodes.get(&node_id).map(|n| n.hostname.clone()).unwrap_or_default()
             };
             let origin_manager = self.config.node.hostname.clone();
-            for fault in &req.integrity_faults {
-                let _ = self
-                    .raft_write_or_forward(ClientRequest::AppendAudit {
-                        actor: "system".to_string(),
-                        action: "read.integrity_fault".to_string(),
-                        target: format!("{node_id} ({hostname})"),
-                        result: format!(
-                            "detector={} chunk={} expected={} actual={}",
-                            fault.detector,
-                            fault.chunk_id,
-                            if fault.expected_hash.is_empty() { "?" } else { &fault.expected_hash },
-                            if fault.actual_hash.is_empty() { "?" } else { &fault.actual_hash },
-                        ),
-                        origin_manager: origin_manager.clone(),
-                        timestamp_ms: now_ms,
-                    })
-                    .await;
-                let reason = match fault.detector.as_str() {
-                    "verify_on_read" => dtfs_common::types::QuarantineReason::VerifyOnReadMismatch,
-                    "verify_on_read_meta_absent" => dtfs_common::types::QuarantineReason::VerifyOnReadMismatch,
-                    _ => dtfs_common::types::QuarantineReason::VerifyOnReadMismatch,
-                };
-                let info = dtfs_common::types::QuarantineInfo {
-                    since_ms: now_ms,
-                    reason,
-                    triggering_chunk_id: Some(fault.chunk_id.clone()),
-                    fault_count_total: 0,  // apply path accumulates
-                    last_fault_at_ms: fault.observed_at_ms,
-                    last_fault_summary: format!(
-                        "{}: expected={} actual={}",
-                        fault.detector,
-                        if fault.expected_hash.is_empty() { "?" } else { &fault.expected_hash },
-                        if fault.actual_hash.is_empty() { "?" } else { &fault.actual_hash },
+            // REV-3-8 — dedupe by chunk_id and cap the scan, then emit
+            // exactly three Raft writes for the WHOLE heartbeat.
+            let batch = batch_integrity_faults(
+                &req.integrity_faults,
+                MAX_INTEGRITY_FAULTS_PER_HEARTBEAT,
+            );
+            let rep = batch.representative;
+            let rep_detector = rep.map(|f| f.detector.as_str()).unwrap_or("unknown");
+            let rep_chunk = rep.map(|f| f.chunk_id.as_str()).unwrap_or("");
+            let rep_expected = rep
+                .map(|f| f.expected_hash.as_str())
+                .filter(|h| !h.is_empty())
+                .unwrap_or("?");
+            let rep_actual = rep
+                .map(|f| f.actual_hash.as_str())
+                .filter(|h| !h.is_empty())
+                .unwrap_or("?");
+            let rep_observed = rep.map(|f| f.observed_at_ms).unwrap_or(now_ms);
+            let reported = req.integrity_faults.len();
+            let distinct = batch.chunk_ids.len();
+            // Bug BO-4 (BC-12e remainder) — the data node's verify-on-read
+            // mismatch surfaces only as a node.quarantine row today, so the
+            // /api/v1/integrity/faults feed needs its own raw read event.
+            // REV-3-8 makes it ONE summary row per heartbeat; the action
+            // name is unchanged because `api.rs::action_is_integrity_fault`
+            // matches on it.
+            let _ = self
+                .raft_write_or_forward(ClientRequest::AppendAudit {
+                    actor: "system".to_string(),
+                    action: "read.integrity_fault".to_string(),
+                    target: format!("{node_id} ({hostname})"),
+                    result: format!(
+                        "detector={rep_detector} faults={reported} chunks={distinct} \
+                         dropped={} chunk={rep_chunk} expected={rep_expected} \
+                         actual={rep_actual}",
+                        batch.dropped,
                     ),
-                };
-                let _ = self
-                    .raft_write_or_forward(ClientRequest::QuarantineNode { node_id, info })
-                    .await;
-                // Drop the (node, chunk) replica entry so the
-                // under-replication scheduler immediately picks a
-                // healthy source + re-replicates. RemoveCorruptChunkReplicas
-                // is the existing apply path used by Bug O scrub.
+                    origin_manager,
+                    timestamp_ms: now_ms,
+                })
+                .await;
+            let reason = match rep_detector {
+                "verify_on_read" => dtfs_common::types::QuarantineReason::VerifyOnReadMismatch,
+                "verify_on_read_meta_absent" => dtfs_common::types::QuarantineReason::VerifyOnReadMismatch,
+                _ => dtfs_common::types::QuarantineReason::VerifyOnReadMismatch,
+            };
+            let info = dtfs_common::types::QuarantineInfo {
+                since_ms: now_ms,
+                reason,
+                triggering_chunk_id: rep.map(|f| f.chunk_id.to_string()),
+                fault_count_total: 0,  // apply path accumulates
+                last_fault_at_ms: rep_observed,
+                last_fault_summary: format!(
+                    "{rep_detector}: expected={rep_expected} actual={rep_actual} \
+                     (faults={reported} chunks={distinct})"
+                ),
+            };
+            let _ = self
+                .raft_write_or_forward(ClientRequest::QuarantineNode { node_id, info })
+                .await;
+            // Drop the (node, chunk) replica entries so the
+            // under-replication scheduler immediately picks a healthy
+            // source + re-replicates. RemoveCorruptChunkReplicas takes a
+            // batch (the same shape `report_chunk_status` uses for the
+            // Bug O scrub path), so ONE write covers every reported chunk.
+            if !batch.chunk_ids.is_empty() {
                 let _ = self
                     .raft_write_or_forward(ClientRequest::RemoveCorruptChunkReplicas {
                         node_id: node_id.to_string(),
-                        chunk_hashes: vec![fault.chunk_id.clone()],
+                        chunk_hashes: batch.chunk_ids,
                         // CO-1-1 — the heartbeat integrity-fault report
                         // (IntegrityFault) carries no disk_id, so keep the
                         // node-wide legacy sweep. Wiring per-disk corruption
@@ -1071,8 +1211,10 @@ impl ManagerService for MetadataService {
             }
             tracing::warn!(
                 node_id,
-                count = req.integrity_faults.len(),
-                "Bug BF-6: auto-quarantined node after integrity faults reported via heartbeat"
+                count = reported,
+                distinct_chunks = distinct,
+                dropped = batch.dropped,
+                "Bug BF-6/REV-3-8: auto-quarantined node after integrity faults reported via heartbeat"
             );
         }
 
@@ -1527,6 +1669,14 @@ impl ManagerService for MetadataService {
             req.path, req.num_chunks
         );
 
+        // REV-4-2 — `num_chunks` is peer-controlled. Bound it BEFORE the
+        // ring rebuild, before the placement allocation and before the
+        // state-machine read lock, so a malformed/malicious count can
+        // neither allocate unbounded memory nor hold the lock across a
+        // huge loop while every writer waits behind it.
+        validate_num_chunks(req.num_chunks, MAX_CHUNKS_PER_ALLOCATION)
+            .map_err(Status::invalid_argument)?;
+
         self.placement.rebuild_ring(&self.sm_data).await;
 
         let data = self.sm_data.read().await;
@@ -1584,7 +1734,13 @@ impl ManagerService for MetadataService {
                 );
                 (
                     tier,
-                    rf.max(self.config.defaults.replication.hot.max(1)),
+                    // REV-4-10 — same clamp on the not-yet-registered
+                    // volume path: `commit_chunk_locations` falls back to
+                    // `defaults.write_safety.min_replicas_before_ack` for
+                    // the ack floor, so the allocation must reach it too
+                    // or the write is rejected after streaming in full.
+                    rf.max(self.config.defaults.replication.hot.max(1))
+                        .max(self.config.defaults.write_safety.min_replicas_before_ack),
                     self.config.defaults.anchor_datacenter.clone(),
                 )
             }
@@ -2371,11 +2527,20 @@ pub(crate) fn resolve_volume_placement(
     hint: &str,
     available_tiers: &[dtfs_common::types::DiskTier],
 ) -> (dtfs_common::types::DiskTier, u32) {
-    resolve_preferred_tier(
+    let (tier, rf) = resolve_preferred_tier(
         hint,
         volume.effective_mandatory_replicas(),
         available_tiers,
-    )
+    );
+    // REV-4-10 — the hint chooses the TIER, not the replica count. An
+    // honoured hint hard-returns rf=1, but `commit_chunk_locations`
+    // enforces `write_safety.min_replicas_before_ack` (default 2) via
+    // `ack_floor_satisfied`, so with `first_write_tier = "nearest-warm"`
+    // every write was streamed in FULL and only then rejected at commit
+    // (the FUSE client's fresh-file cleanup then unlinked it). Clamp UP
+    // to the floor; never down, so a mandatory-driven rf is untouched
+    // and a volume whose floor is 1 keeps the pre-fix behaviour.
+    (tier, rf.max(volume.write_safety.min_replicas_before_ack))
 }
 
 /// Bug AV (AV-4-1d) — wire-format string we put into
@@ -2687,6 +2852,205 @@ mod bug_av_preferred_tier_tests {
         // pick_effective_tier prefers higher tiers → returns Warm.
         assert_eq!(tier, DiskTier::Warm, "legacy fallback uses replication.warm=2");
         assert_eq!(rf, 2);
+    }
+}
+
+#[cfg(test)]
+mod rev_4_10_hint_ack_floor_tests {
+    //! REV-4-10 — an honoured `preferred_tier` hint hard-returned rf=1,
+    //! but `commit_chunk_locations` enforces the volume's
+    //! `write_safety.min_replicas_before_ack` (default 2) via
+    //! `ack_floor_satisfied`. With `first_write_tier = "nearest-warm"`
+    //! (what the docs recommend for the fast-uplink download DC) EVERY
+    //! write was streamed in FULL and only then rejected at commit, and
+    //! the FUSE client's fresh-file cleanup unlinked the file. The hint
+    //! must choose the TIER, not the replica count.
+    use super::*;
+    use dtfs_common::types::*;
+
+    fn vol_with_ack_floor(floor: u32) -> VolumeConfig {
+        VolumeConfig {
+            id: VolumeId::new("default".to_string()),
+            name: "default".to_string(),
+            chunk_size_bytes: 4 * 1024 * 1024,
+            replication: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            cache_replicas: CacheReplication {
+                hot: CacheTierConfig::default(),
+                warm: CacheTierConfig { min: 1, max: 2 },
+                cold: CacheTierConfig::default(),
+                tape: CacheTierConfig::default(),
+                per_dc: true,
+                promote_reads: 2,
+                promote_window_secs: 60,
+                cooldown_secs: 30,
+            },
+            anchor: None,
+            schedules: VolumeSchedules::default(),
+            spill: SpillPolicy::default(),
+            anchor_datacenter: Some("dc-a".to_string()),
+            write_safety: WriteSafety {
+                min_replicas_before_ack: floor,
+                write_timeout_secs: 30,
+            },
+        }
+    }
+
+    /// The hint is still honoured (tier = Warm) but rf is clamped UP to
+    /// the volume's ack floor, so the commit gate can be satisfied.
+    #[test]
+    fn rev_4_10_hint_rf_clamped_to_ack_floor() {
+        let v = vol_with_ack_floor(2);
+        let available = vec![DiskTier::Warm, DiskTier::Cold];
+        let (tier, rf) = resolve_volume_placement(&v, "warm", &available);
+        assert_eq!(tier, DiskTier::Warm, "the hint still selects the tier");
+        assert!(
+            rf >= 2,
+            "rf must reach write_safety.min_replicas_before_ack=2, got {rf}"
+        );
+    }
+
+    /// One-directional: a volume whose ack floor is 1 keeps the pre-fix
+    /// rf=1 hint behaviour. The clamp only ever RAISES rf to the floor.
+    #[test]
+    fn rev_4_10_ack_floor_one_leaves_hint_unchanged() {
+        let v = vol_with_ack_floor(1);
+        let available = vec![DiskTier::Warm, DiskTier::Cold];
+        assert_eq!(
+            resolve_volume_placement(&v, "warm", &available),
+            (DiskTier::Warm, 1)
+        );
+    }
+
+    /// The clamped rf must actually satisfy the gate that rejected the
+    /// write — pin the two helpers against each other.
+    #[test]
+    fn rev_4_10_clamped_rf_satisfies_the_commit_gate() {
+        let v = vol_with_ack_floor(2);
+        let (_, rf) = resolve_volume_placement(&v, "warm", &[DiskTier::Warm, DiskTier::Cold]);
+        let commits: Vec<ChunkLocationEntry> = (0..rf)
+            .map(|i| ChunkLocationEntry {
+                chunk_index: 0,
+                chunk_hash: "c0".to_string(),
+                node_id: format!("node-{i}"),
+                disk_id: 0,
+                size_bytes: 1,
+            })
+            .collect();
+        assert!(ack_floor_satisfied(&commits, v.write_safety.min_replicas_before_ack));
+    }
+}
+
+#[cfg(test)]
+mod rev_3_8_integrity_fault_batch_tests {
+    //! REV-3-8 — one heartbeat's integrity faults collapse into ONE
+    //! audit row + ONE QuarantineNode + ONE batched
+    //! RemoveCorruptChunkReplicas, capped, instead of three unbatched
+    //! Raft writes PER FAULT.
+    use super::*;
+
+    fn fault(chunk: &str) -> IntegrityFault {
+        IntegrityFault {
+            chunk_id: chunk.to_string(),
+            observed_at_ms: 7,
+            detector: "verify_on_read".to_string(),
+            expected_len: 4,
+            actual_len: 4,
+            expected_hash: "aaaa".to_string(),
+            actual_hash: "bbbb".to_string(),
+        }
+    }
+
+    /// N faults across M distinct chunk ids collapse to ONE batch of M
+    /// ids — the handler then issues 3 Raft writes total, not 3N.
+    #[test]
+    fn rev_3_8_dedupes_faults_to_distinct_chunk_ids() {
+        let faults: Vec<IntegrityFault> =
+            (0..9).map(|i| fault(&format!("chunk-{}", i % 3))).collect();
+        let batch = batch_integrity_faults(&faults, MAX_INTEGRITY_FAULTS_PER_HEARTBEAT);
+        assert_eq!(batch.chunk_ids, vec!["chunk-0", "chunk-1", "chunk-2"]);
+        assert_eq!(batch.dropped, 0);
+        assert_eq!(batch.scanned, 9);
+        assert_eq!(
+            batch.representative.map(|f| f.chunk_id.as_str()),
+            Some("chunk-0")
+        );
+    }
+
+    /// A node whose whole `.meta` directory is damaged fills the
+    /// data-side collector to its 1024 cap; the manager must examine
+    /// only MAX_INTEGRITY_FAULTS_PER_HEARTBEAT of them.
+    #[test]
+    fn rev_3_8_honours_per_heartbeat_cap() {
+        let faults: Vec<IntegrityFault> =
+            (0..1024).map(|i| fault(&format!("chunk-{i}"))).collect();
+        let batch = batch_integrity_faults(&faults, MAX_INTEGRITY_FAULTS_PER_HEARTBEAT);
+        assert_eq!(batch.chunk_ids.len(), MAX_INTEGRITY_FAULTS_PER_HEARTBEAT);
+        assert_eq!(batch.scanned, MAX_INTEGRITY_FAULTS_PER_HEARTBEAT);
+        assert_eq!(batch.dropped, 1024 - MAX_INTEGRITY_FAULTS_PER_HEARTBEAT);
+    }
+
+    /// A fault with no chunk id still quarantines the node but must not
+    /// put an empty hash into the batched removal.
+    #[test]
+    fn rev_3_8_skips_empty_chunk_ids() {
+        let faults = vec![fault(""), fault("chunk-a")];
+        let batch = batch_integrity_faults(&faults, MAX_INTEGRITY_FAULTS_PER_HEARTBEAT);
+        assert_eq!(batch.chunk_ids, vec!["chunk-a"]);
+        assert!(batch.representative.is_some());
+    }
+
+    /// An empty report produces no batch at all — the handler skips the
+    /// whole block, exactly as before.
+    #[test]
+    fn rev_3_8_empty_report_is_a_noop() {
+        let batch = batch_integrity_faults(&[], MAX_INTEGRITY_FAULTS_PER_HEARTBEAT);
+        assert!(batch.chunk_ids.is_empty());
+        assert!(batch.representative.is_none());
+        assert_eq!(batch.dropped, 0);
+    }
+}
+
+#[cfg(test)]
+mod rev_4_2_allocate_bound_tests {
+    //! REV-4-2 — `AllocateChunksRequest.num_chunks` is peer-controlled
+    //! and used to size an allocation + drive loops under the
+    //! state-machine read lock.
+    use super::*;
+
+    /// An oversized count is refused at the boundary — nothing is
+    /// allocated and the state-machine lock is never taken.
+    #[test]
+    fn rev_4_2_rejects_oversized_num_chunks() {
+        assert!(
+            validate_num_chunks(MAX_CHUNKS_PER_ALLOCATION + 1, MAX_CHUNKS_PER_ALLOCATION).is_err()
+        );
+        assert!(validate_num_chunks(u32::MAX, MAX_CHUNKS_PER_ALLOCATION).is_err());
+    }
+
+    /// Real writes still go through: a 30 GB season file at the 4 MiB
+    /// default chunk size is 7680 chunks, well inside the cap, and so is
+    /// a ~100 GB UHD remux (25600 chunks).
+    #[test]
+    fn rev_4_2_accepts_normal_num_chunks() {
+        for n in [0u32, 1, 7_680, 25_600, MAX_CHUNKS_PER_ALLOCATION] {
+            assert!(
+                validate_num_chunks(n, MAX_CHUNKS_PER_ALLOCATION).is_ok(),
+                "num_chunks {n} must be accepted"
+            );
+        }
+    }
+
+    /// Pins the derivation: the cap is 256 GiB of 4 MiB chunks, which is
+    /// the `DefaultsConfig::chunk_size_mb` default.
+    #[test]
+    fn rev_4_2_cap_covers_largest_workload_file() {
+        // `DefaultsConfig::chunk_size_mb` defaults to 4 (pinned by
+        // dtfs-common's own `defaults_chunk_size_is_four` test).
+        assert_eq!(
+            MAX_CHUNKS_PER_ALLOCATION as u64 * 4 * 1024 * 1024,
+            256 * 1024 * 1024 * 1024
+        );
     }
 }
 
