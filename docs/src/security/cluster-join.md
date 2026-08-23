@@ -21,6 +21,14 @@ shared_secret = "a-strong-random-secret-at-least-32-characters"
 ```
 
 The same `shared_secret` value must be present on the manager and on every node that will join the cluster.
+An empty manager `shared_secret` is refused at startup (LIS-20 / Sec R3) unless
+`cluster.allow_insecure_empty_secret = true` is set for lab-only insecure mode.
+Data nodes apply the same refuse at startup (LIS-55) so Put/Delete/ReplicateChunk
+auth cannot silently skip.
+
+The same secret also authenticates data-plane `PutChunk` / `DeleteChunk`
+RPCs when set (LIS-19); see [Authentication → Data-plane PutChunk /
+DeleteChunk](./authentication.md#data-plane-putchunk--deletechunk-lis-19--sec-r2).
 
 ## Protocol Overview
 

@@ -25,7 +25,11 @@ host = "example-box1"
 
 [cluster]
 manager_addr = "10.0.0.1:9401"      # primary manager gRPC endpoint
-shared_secret = "change-me"         # same secret as the managers
+shared_secret = "change-me"         # same secret as the managers; empty is
+                                    # refused at startup unless
+                                    # allow_insecure_empty_secret = true (LIS-55).
+#allow_insecure_empty_secret = false # lab-only: permit empty shared_secret
+                                    # (Put/Delete/ReplicateChunk auth skip).
 # Fallback managers, walked in order when the primary is unreachable (F-024).
 # List every manager here so a rolling manager restart never strands the node.
 #manager_addrs = ["10.0.0.2:9401", "10.0.0.3:9401"]

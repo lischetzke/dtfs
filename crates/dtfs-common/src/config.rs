@@ -355,6 +355,11 @@ pub struct NodeConfig {
 pub struct ClusterConfig {
     pub name: String,
     pub shared_secret: String,
+    /// LIS-20 / Sec R3 — lab-only escape hatch. When `false` (default), an
+    /// empty `shared_secret` is refused at manager startup and RegisterNode
+    /// never fail-opens. Set `true` only for intentional insecure lab runs.
+    #[serde(default)]
+    pub allow_insecure_empty_secret: bool,
     #[serde(default)]
     pub bootstrap: bool,
     /// Optional list of manager peers to seed the Raft cluster with.
@@ -372,6 +377,36 @@ pub struct ClusterConfig {
     /// cluster and no follower ever joins (see FINDINGS.md F-009).
     #[serde(default)]
     pub initial_voters: Vec<InitialVoter>,
+}
+
+impl ClusterConfig {
+    /// LIS-20 / Sec R3 — refuse empty `shared_secret` unless the operator
+    /// explicitly opts into insecure lab mode.
+    pub fn validate_shared_secret(&self) -> Result<(), String> {
+        if self.shared_secret.is_empty() && !self.allow_insecure_empty_secret {
+            return Err(
+                "cluster.shared_secret is empty; set a non-empty secret, or set \
+                 cluster.allow_insecure_empty_secret = true for lab-only insecure mode"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether a provided RegisterNode / join secret is acceptable.
+    ///
+    /// Non-empty cluster secret: constant-time equality check (missing
+    /// provided → reject). Empty cluster secret: only when
+    /// `allow_insecure_empty_secret` was set at load (lab fail-open).
+    pub fn accepts_shared_secret(&self, provided: Option<&str>) -> bool {
+        if self.shared_secret.is_empty() {
+            return self.allow_insecure_empty_secret;
+        }
+        match provided {
+            Some(s) => crate::crypto::constant_time_eq(s.as_bytes(), self.shared_secret.as_bytes()),
+            None => false,
+        }
+    }
 }
 
 /// Pre-bootstrap description of a manager peer for `[cluster].initial_voters`.
@@ -410,9 +445,27 @@ pub struct DataClusterConfig {
     /// Endpoints are formatted the same way as `manager_addr` (`host:port`).
     #[serde(default)]
     pub manager_addrs: Vec<String>,
+    /// LIS-55 / LIS-20 parity — lab-only escape hatch. When `true`, an empty
+    /// `shared_secret` is permitted at data-node startup (auth gates skip).
+    /// Never enable in production.
+    #[serde(default)]
+    pub allow_insecure_empty_secret: bool,
 }
 
 impl DataClusterConfig {
+    /// LIS-55 / LIS-20 — refuse empty `shared_secret` unless the operator
+    /// explicitly opts into insecure lab mode.
+    pub fn validate_shared_secret(&self) -> Result<(), String> {
+        if self.shared_secret.is_empty() && !self.allow_insecure_empty_secret {
+            return Err(
+                "cluster.shared_secret is empty; set a non-empty secret, or set \
+                 cluster.allow_insecure_empty_secret = true for lab-only insecure mode"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     /// All manager endpoints in priority order: the primary first, followed
     /// by any extras. Duplicates are removed but order is preserved.
     pub fn all_manager_addrs(&self) -> Vec<String> {
@@ -1175,6 +1228,71 @@ mod tests {
         // hardcoded behaviour (Failed 30 min, Done 5 min).
         assert_eq!(cfg.raft.failed_task_retention_secs, 30 * 60);
         assert_eq!(cfg.raft.done_task_retention_secs, 5 * 60);
+        // LIS-20 — example ships a non-empty secret; escape hatch off.
+        assert!(!cfg.cluster.shared_secret.is_empty());
+        assert!(!cfg.cluster.allow_insecure_empty_secret);
+        cfg.cluster
+            .validate_shared_secret()
+            .expect("example manager.toml must pass shared_secret validate");
+    }
+
+    /// LIS-20 / Sec R3 — empty shared_secret without the escape hatch is
+    /// refused (fail-closed). Silent admit of any RegisterNode is the bug.
+    #[test]
+    fn lis20_empty_shared_secret_rejected_by_default() {
+        let cfg = ClusterConfig {
+            name: "t".into(),
+            shared_secret: String::new(),
+            allow_insecure_empty_secret: false,
+            bootstrap: false,
+            initial_voters: vec![],
+        };
+        let err = cfg.validate_shared_secret().expect_err("empty must fail");
+        assert!(
+            err.contains("shared_secret is empty"),
+            "unexpected err: {err}"
+        );
+        assert!(
+            !cfg.accepts_shared_secret(None),
+            "RegisterNode must reject when secret unset"
+        );
+        assert!(
+            !cfg.accepts_shared_secret(Some("anything")),
+            "RegisterNode must reject any provided secret when unset"
+        );
+    }
+
+    /// LIS-20 — explicit lab escape hatch allows empty secret; RegisterNode
+    /// then fail-opens by design (operator opted in).
+    #[test]
+    fn lis20_allow_insecure_empty_secret_escape_hatch() {
+        let cfg = ClusterConfig {
+            name: "t".into(),
+            shared_secret: String::new(),
+            allow_insecure_empty_secret: true,
+            bootstrap: false,
+            initial_voters: vec![],
+        };
+        cfg.validate_shared_secret()
+            .expect("escape hatch must allow empty");
+        assert!(cfg.accepts_shared_secret(None));
+        assert!(cfg.accepts_shared_secret(Some("x")));
+    }
+
+    /// LIS-20 — non-empty secret still requires an exact match.
+    #[test]
+    fn lis20_nonempty_secret_requires_match() {
+        let cfg = ClusterConfig {
+            name: "t".into(),
+            shared_secret: "s3cret".into(),
+            allow_insecure_empty_secret: false,
+            bootstrap: false,
+            initial_voters: vec![],
+        };
+        cfg.validate_shared_secret().unwrap();
+        assert!(cfg.accepts_shared_secret(Some("s3cret")));
+        assert!(!cfg.accepts_shared_secret(Some("wrong")));
+        assert!(!cfg.accepts_shared_secret(None));
     }
 
     #[test]
@@ -1183,6 +1301,41 @@ mod tests {
             .expect("deploy/examples/data.toml must parse against DataNodeConfig");
         assert_eq!(cfg.node.hostname, "dtfs-example-data01");
         assert!(!cfg.disks.is_empty());
+        // LIS-55 / LIS-20 — example ships a non-empty secret; escape hatch off.
+        assert!(!cfg.cluster.shared_secret.is_empty());
+        assert!(!cfg.cluster.allow_insecure_empty_secret);
+        cfg.cluster
+            .validate_shared_secret()
+            .expect("example data.toml must pass shared_secret validate");
+    }
+
+    /// LIS-55 — data-node empty shared_secret refused without escape hatch.
+    #[test]
+    fn lis55_data_empty_shared_secret_rejected_by_default() {
+        let cfg = DataClusterConfig {
+            manager_addr: "mgr:9401".into(),
+            shared_secret: String::new(),
+            manager_addrs: vec![],
+            allow_insecure_empty_secret: false,
+        };
+        let err = cfg.validate_shared_secret().expect_err("empty must fail");
+        assert!(
+            err.contains("shared_secret is empty"),
+            "unexpected err: {err}"
+        );
+    }
+
+    /// LIS-55 — data-node lab escape hatch allows empty secret.
+    #[test]
+    fn lis55_data_allow_insecure_empty_secret_escape_hatch() {
+        let cfg = DataClusterConfig {
+            manager_addr: "mgr:9401".into(),
+            shared_secret: String::new(),
+            manager_addrs: vec![],
+            allow_insecure_empty_secret: true,
+        };
+        cfg.validate_shared_secret()
+            .expect("escape hatch must allow empty");
     }
 
     #[test]

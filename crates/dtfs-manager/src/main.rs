@@ -21,6 +21,7 @@ mod metadata;
 mod monitor;
 mod placement;
 mod placement_state;
+mod rest_auth;
 mod scheduler;
 mod server;
 mod shutdown;
@@ -54,6 +55,11 @@ async fn main() -> anyhow::Result<()> {
 
     let config: dtfs_common::config::ManagerConfig =
         dtfs_common::config::load_config(std::path::Path::new(&args.config))?;
+    // LIS-20 / Sec R3 — fail-closed empty shared_secret (no silent admit).
+    config
+        .cluster
+        .validate_shared_secret()
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!(
         "Manager {} at {} ({})",
@@ -406,6 +412,8 @@ async fn main() -> anyhow::Result<()> {
     ));
     // CF-5 — let the scheduler skip ticks under memory pressure.
     task_scheduler.set_memory_budget(memory_budget.clone());
+    // LIS-19 — stamp DeleteChunk RPCs (flush / orphan reap) with the cluster secret.
+    task_scheduler.set_shared_secret(config.cluster.shared_secret.clone());
 
     let scheduler_ref = task_scheduler.clone();
     let scheduler_handle = tokio::spawn(async move {
@@ -645,6 +653,75 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// True when `host` is a wildcard bind (not dialable by peers or self via
+/// that literal). Used by Bug BR-1 local-endpoint selection.
+fn is_wildcard_listen_host(host: &str) -> bool {
+    matches!(host, "0.0.0.0" | "::" | "[::]" | "*")
+}
+
+/// Parse `host:port` (IPv6 bracket form ok) into `(host, port)`. Falls back
+/// to `(raw, default_port)` when no colon is present.
+fn split_host_port(addr: &str, default_port: u32) -> (String, u32) {
+    if let Some((host, port)) = addr.rsplit_once(':') {
+        // Avoid treating bare IPv6 without brackets as host:port.
+        if host.contains(':') && !host.starts_with('[') {
+            return (addr.to_string(), default_port);
+        }
+        let port = port.parse().unwrap_or(default_port);
+        (host.to_string(), port)
+    } else {
+        (addr.to_string(), default_port)
+    }
+}
+
+/// Bug BR-1 / LIS-77 — ordered manager endpoints for self-register.
+///
+/// Order matters: dead `initial_voters` entries earlier in config used to
+/// blackhole the keepalive forever (no connect timeout). Prefer:
+/// 1. this node's own voter addr (hostname match),
+/// 2. remaining voters (config order),
+/// 3. a local dial target — the specific `listen_addr` IP when not a
+///    wildcard (loopback fails when gRPC binds only the Tailscale IP),
+///    otherwise `127.0.0.1:<port>`.
+fn self_register_endpoints(
+    hostname: &str,
+    listen_addr: &str,
+    voters: &[dtfs_common::config::InitialVoter],
+    endpoint_url: impl Fn(&str) -> String,
+) -> Vec<String> {
+    let (listen_host, grpc_port) = split_host_port(listen_addr, 9401);
+    let mut endpoints: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Push helpers scoped so the mut borrow of `endpoints` ends before return
+    // (rustc 1.94 E0502: closure live across `endpoints` use → ICE otherwise).
+    {
+        let mut push = |bare: &str| {
+            let ep = endpoint_url(bare);
+            if seen.insert(ep.clone()) {
+                endpoints.push(ep);
+            }
+        };
+
+        if let Some(self_v) = voters.iter().find(|v| v.hostname == hostname) {
+            push(&self_v.addr);
+        }
+        for v in voters {
+            if v.hostname != hostname {
+                push(&v.addr);
+            }
+        }
+
+        let local_bare = if is_wildcard_listen_host(&listen_host) {
+            format!("127.0.0.1:{grpc_port}")
+        } else {
+            format!("{listen_host}:{grpc_port}")
+        };
+        push(&local_bare);
+        // local_bare always lands at least one entry; no empty fallback needed.
+    }
+    endpoints
+}
+
 /// Bug BR-1 — publish this manager's version/build_date + a live
 /// last_seen_ms into shared Raft state.
 ///
@@ -661,6 +738,11 @@ async fn main() -> anyhow::Result<()> {
 /// (an upgrade) logs once. Registering against the peer pool converges as
 /// soon as a leader exists — a follower's raft_write returns Unavailable,
 /// so we walk to the next endpoint just like a data node does.
+///
+/// LIS-77: each connect is bounded by [`dtfs_common::tls::CONNECT_TIMEOUT`];
+/// each RegisterNode RPC is wall-clock bounded so a hung peer cannot stall
+/// the whole walk. Endpoint order prefers self (see
+/// [`self_register_endpoints`]).
 async fn manager_self_register_lifecycle(
     config: dtfs_common::config::ManagerConfig,
     tls: dtfs_common::tls::TlsContext,
@@ -668,30 +750,15 @@ async fn manager_self_register_lifecycle(
     use dtfs_proto::dtfs::manager::manager_service_client::ManagerServiceClient;
     use dtfs_proto::dtfs::manager::RegisterNodeRequest;
 
-    let grpc_port: u32 = config
-        .grpc
-        .listen_addr
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9401);
+    let (_, grpc_port) = split_host_port(&config.grpc.listen_addr, 9401);
+    let endpoints = self_register_endpoints(
+        &config.node.hostname,
+        &config.grpc.listen_addr,
+        &config.cluster.initial_voters,
+        |bare| tls.endpoint_url(bare),
+    );
 
-    // Manager peer endpoints to register through, plus a loopback fallback
-    // so a single-node / legacy config (no initial_voters) still registers
-    // itself against its own listener.
-    let mut endpoints: Vec<String> = config
-        .cluster
-        .initial_voters
-        .iter()
-        .map(|v| tls.endpoint_url(&v.addr))
-        .collect();
-    let loopback = tls.endpoint_url(&format!("127.0.0.1:{grpc_port}"));
-    if !endpoints.iter().any(|e| e.ends_with(&format!(":{grpc_port}"))) {
-        endpoints.push(loopback.clone());
-    }
-    if endpoints.is_empty() {
-        endpoints.push(loopback);
-    }
+    const REGISTER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
     let build_req = || RegisterNodeRequest {
         hostname: config.node.hostname.clone(),
@@ -722,24 +789,28 @@ async fn manager_self_register_lifecycle(
         for offset in 0..n {
             let ep = &endpoints[(idx + offset) % n];
             match tls.connect(ep).await.map(ManagerServiceClient::new) {
-                Ok(mut c) => match c.register_node(tonic::Request::new(build_req())).await {
-                    Ok(resp) => {
-                        if resp.into_inner().accepted {
-                            idx = (idx + offset) % n;
-                            ok = true;
-                            break;
+                Ok(mut c) => {
+                    let mut req = tonic::Request::new(build_req());
+                    req.set_timeout(REGISTER_RPC_TIMEOUT);
+                    match c.register_node(req).await {
+                        Ok(resp) => {
+                            if resp.into_inner().accepted {
+                                idx = (idx + offset) % n;
+                                ok = true;
+                                break;
+                            }
+                            tracing::debug!(
+                                endpoint = %ep,
+                                "Bug BR-1 self-register rejected (shared_secret mismatch?)"
+                            );
                         }
-                        tracing::debug!(
+                        Err(e) => tracing::debug!(
                             endpoint = %ep,
-                            "Bug BR-1 self-register rejected (shared_secret mismatch?)"
-                        );
+                            error = %e,
+                            "Bug BR-1 self-register RPC failed; trying next manager"
+                        ),
                     }
-                    Err(e) => tracing::debug!(
-                        endpoint = %ep,
-                        error = %e,
-                        "Bug BR-1 self-register RPC failed; trying next manager"
-                    ),
-                },
+                }
                 Err(e) => tracing::debug!(
                     endpoint = %ep,
                     error = %e,
@@ -947,5 +1018,72 @@ mod bug_ck_bind_error_tests {
             bind_error("REST API", "0.0.0.0:9402", Error::from(ErrorKind::AddrInUse)).to_string();
         assert!(msg.contains("already in use"), "{msg}");
         assert!(msg.contains("REST API"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod lis77_br1_self_register_endpoints_tests {
+    use super::{is_wildcard_listen_host, self_register_endpoints};
+    use dtfs_common::config::InitialVoter;
+
+    fn voter(hostname: &str, addr: &str) -> InitialVoter {
+        InitialVoter {
+            hostname: hostname.to_string(),
+            addr: addr.to_string(),
+            region: String::new(),
+            datacenter: String::new(),
+            rack: String::new(),
+        }
+    }
+
+    #[test]
+    fn prefers_self_before_dead_earlier_voters() {
+        // Config order: dead LELI peers first (the FSN incident shape), then
+        // the live local voter. Self-register must dial self first.
+        let voters = vec![
+            voter("dead-mgr01", "192.0.2.1:9401"),
+            voter("dead-mgr02", "192.0.2.2:9401"),
+            voter("fsn-mgr01", "100.127.84.26:9401"),
+        ];
+        let eps = self_register_endpoints("fsn-mgr01", "100.127.84.26:9401", &voters, |a| {
+            format!("http://{a}")
+        });
+        assert_eq!(
+            eps.first().map(String::as_str),
+            Some("http://100.127.84.26:9401"),
+            "self voter must be first: {eps:?}"
+        );
+        assert!(eps.iter().any(|e| e.contains("192.0.2.1")), "{eps:?}");
+        // Specific listen IP is the local dial target — not 127.0.0.1
+        // (gRPC binds only the Tailscale IP on FSN).
+        assert!(
+            !eps.iter().any(|e| e.contains("127.0.0.1")),
+            "must not prefer loopback when listen_addr is specific: {eps:?}"
+        );
+    }
+
+    #[test]
+    fn wildcard_listen_falls_back_to_loopback() {
+        let voters = vec![voter("mgr01", "10.0.0.1:9401")];
+        let eps = self_register_endpoints("mgr01", "0.0.0.0:9401", &voters, |a| {
+            format!("http://{a}")
+        });
+        assert!(
+            eps.iter().any(|e| e == "http://127.0.0.1:9401"),
+            "wildcard listen needs loopback fallback: {eps:?}"
+        );
+    }
+
+    #[test]
+    fn empty_voters_still_has_local_endpoint() {
+        let eps = self_register_endpoints("solo", "10.1.2.3:9401", &[], |a| format!("http://{a}"));
+        assert_eq!(eps, vec!["http://10.1.2.3:9401".to_string()]);
+    }
+
+    #[test]
+    fn wildcard_helper() {
+        assert!(is_wildcard_listen_host("0.0.0.0"));
+        assert!(is_wildcard_listen_host("::"));
+        assert!(!is_wildcard_listen_host("100.127.84.26"));
     }
 }

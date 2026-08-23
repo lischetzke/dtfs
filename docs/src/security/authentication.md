@@ -1,139 +1,125 @@
 # Authentication
 
-DTFS uses JWT (JSON Web Token) authentication for the REST API and WebUI. Passwords are hashed with bcrypt before storage.
+DTFS authenticates control-plane mutations with the cluster
+`[cluster].shared_secret`. This is a shared-secret gate, not per-user
+JWT (TLS for transport is separate — see [tls.md](./tls.md)).
 
-## WebUI and REST API Authentication
+## Mutating manager REST (LIS-18 / Sec R1)
 
-The manager's REST API (default port 9402) serves both the WebUI dashboard and programmatic API endpoints. Access to state-mutating endpoints requires a valid JWT token in the `Authorization` header.
+When `shared_secret` is **non-empty**, every state-mutating call under
+`/api/v1/*` must present that secret. Fail closed:
 
-### Login Flow
+| Condition | HTTP |
+|-----------|------|
+| Header missing | 401 |
+| Header present but wrong | 403 |
 
-```text
-  Browser / CLI                          Manager REST API
-       |                                       |
-       |  POST /api/v1/auth/login              |
-       |  {"username": "admin",                |
-       |   "password": "..."}                  |
-       |-------------------------------------->|
-       |                                       |  Verify password against bcrypt hash
-       |                                       |  Generate JWT with claims
-       |  200 OK                               |
-       |  {"token": "eyJ..."}                  |
-       |<--------------------------------------|
-       |                                       |
-       |  GET /api/v1/cluster/status           |
-       |  Authorization: Bearer eyJ...         |
-       |-------------------------------------->|
-       |                                       |  Validate JWT signature and expiry
-       |  200 OK                               |
-       |  {...}                                |
-       |<--------------------------------------|
-```
+Accepted presentation (either):
 
-### JWT Token Structure
+- Header `X-Dtfs-Shared-Secret: <secret>`
+- Header `Authorization: Bearer <secret>`
 
-Tokens are signed using HMAC-SHA256 with a server-side secret. The payload contains:
+Comparisons use constant-time equality (same helper as join / ForwardWrite).
 
-| Claim | Description |
-|-------|-------------|
-| `sub` | Username |
-| `role` | User role (`admin` or `readonly`) |
-| `iat` | Issued-at timestamp (Unix epoch) |
-| `exp` | Expiration timestamp (default: 24 hours after issuance) |
+Read-only `GET` endpoints stay open so operator dashboards on a
+trusted network can poll status without embedding the secret in the
+browser. **This does not replace TLS** (R5 / CF-6).
 
-### Token Configuration
+Exempt from the header gate (own proof of the secret):
 
-JWT behavior is configured in the manager TOML file:
+- `POST /api/v1/join/request` and `/api/v1/join/complete` (HMAC)
+- CF-2 raft membership endpoints still also require `shared_secret` in
+  the JSON body (defense in depth) **and** the header when the secret
+  is configured
 
-```toml
-[auth]
-enabled = true
-jwt_secret = "a-strong-random-secret-for-signing-tokens"
-token_expiry_hours = 24
-```
+When `shared_secret` is **empty**, mutations stay open (legacy plaintext
+/ lab downgrade — same contract as `RegisterNode`). Production clusters
+must set a non-empty secret. (LIS-20 separately refuses empty secrets at
+startup unless an explicit lab escape hatch is set.)
 
-When `auth.enabled` is `false`, all API endpoints are accessible without authentication. This is intended for development only.
+Denied attempts are audited as `auth.denied`.
 
-## Password Hashing
-
-User passwords are hashed with bcrypt using the `bcrypt` crate. Bcrypt is a deliberately slow hashing algorithm that makes brute-force attacks impractical.
-
-| Parameter | Value |
-|-----------|-------|
-| Algorithm | bcrypt |
-| Cost factor | Default (currently 12 rounds) |
-| Salt | Randomly generated per password |
-
-Plaintext passwords are never stored or logged.
-
-## Admin Credentials
-
-### Default Admin Account
-
-On first startup, the manager creates a default admin account if no users exist:
-
-| Field | Default Value |
-|-------|---------------|
-| Username | `admin` |
-| Password | `admin` |
-| Role | `admin` |
-
-The default password should be changed immediately after the first login.
-
-### Changing the Admin Password
-
-The admin password can be set in the manager configuration file:
-
-```toml
-[auth]
-admin_username = "admin"
-admin_password_hash = "$2b$12$..."  # bcrypt hash
-```
-
-To generate a bcrypt hash for a new password, use the `dtfs-cli` or any bcrypt tool:
+### Example
 
 ```bash
-# Using htpasswd (Apache utilities)
-htpasswd -nbBC 12 "" "new-password" | cut -d: -f2
-
-# Or set the plaintext password (hashed on first startup)
-[auth]
-admin_password = "new-secure-password"
+curl -X POST -H 'content-type: application/json' \
+  -H "X-Dtfs-Shared-Secret: $DTFS_SHARED_SECRET" \
+  -d '{"level":"quick"}' \
+  http://mgr01:9402/api/v1/scrub
 ```
 
-When `admin_password` is set as plaintext, the manager hashes it with bcrypt on startup and uses the hash for all subsequent comparisons.
-
-## Authorization
-
-DTFS supports two roles:
-
-| Role | Permissions |
-|------|-------------|
-| `admin` | Full access: read, write, configuration changes, maintenance operations |
-| `readonly` | Read-only access: cluster status, node info, file listings, audit log queries |
-
-State-mutating operations (maintenance mode, configuration updates, scrub triggers) require the `admin` role.
-
-## API Authentication with dtfs-cli
-
-The CLI tool authenticates against the manager REST API. The manager address and credentials can be provided via command-line flags or environment variables:
+### dtfs-cli
 
 ```bash
-# Via environment variables
-export DTFS_MANAGER="manager-01:9402"
-export DTFS_TOKEN="eyJ..."
-
-# Via command-line flags
-dtfs-cli --manager manager-01:9402 status
+export DTFS_SHARED_SECRET='...'   # or --secret on each command
+dtfs-cli --manager mgr01:9402 scrub --level quick
 ```
 
-For interactive use, the CLI can obtain a token by prompting for credentials, then caches the token for subsequent commands.
+Raft membership still takes `--secret` for the JSON body; the CLI also
+sends it as `X-Dtfs-Shared-Secret`.
 
-## Security Recommendations
+## Mutating manager metadata gRPC (LIS-56)
 
-- Change the default admin password immediately after installation.
-- Use a strong, randomly generated `jwt_secret` (at least 32 characters).
-- Set `token_expiry_hours` to the shortest practical duration for your environment.
-- Enable TLS on the API server to protect tokens in transit (see [TLS](./tls.md)).
-- In production, always set `auth.enabled = true`.
-- Rotate the `jwt_secret` periodically; note that this invalidates all existing tokens.
+When `shared_secret` is **non-empty**, client-facing mutating
+`ManagerService` RPCs (`CreateFile`, `DeleteFile`, `RenameFile`,
+`AllocateChunks`, `CommitChunkLocations`, write leases, locks, …)
+require HMAC metadata (same header names as LIS-19 data-plane auth):
+
+| Metadata | Meaning |
+|----------|---------|
+| `x-dtfs-rpc-ts` | unix seconds |
+| `x-dtfs-rpc-mac` | hex HMAC-SHA256 |
+
+MAC message plane is `dtfs-mgr-rpc` (not `dtfs-data-rpc`) so a data-plane
+stamp cannot be replayed against the manager. Binding is typically the
+target path. Missing/invalid → gRPC `PERMISSION_DENIED`. Empty secret →
+legacy skip.
+
+`dtfs-client` (FUSE / CLI) stamps these from `[client].shared_secret`.
+Read-only RPCs (`GetFileLocations`, `ListDirectory`, …) stay open.
+`RegisterNode` keeps its body `shared_secret` field; `ForwardClientWrite`
+keeps CO-2-2 body auth; heartbeats stay on the data-node trust path.
+
+**REST and gRPC are independent gates** — securing only `:9402` leaves
+`:9401` open to anyone who can dial the leader.
+## WebUI
+
+The embedded WebUI stores the cluster `shared_secret` in browser
+`sessionStorage` only (header badge prompt or **Settings → Session
+shared secret**). Mutating `fetch` POSTs attach
+`X-Dtfs-Shared-Secret`; the secret is never embedded in HTML. GETs stay
+open. Missing secret → HTTP 401 with an actionable message; wrong secret
+→ HTTP 403. Clear the session value via Settings → Clear (or close the
+tab).
+
+## Data-plane PutChunk / DeleteChunk / ReplicateChunk / GetChunk / ListChunks / VerifyChunk (LIS-19 / LIS-55 / LIS-83)
+
+When `[cluster].shared_secret` is **non-empty**, data nodes require
+authenticated gRPC metadata on mutating **and** read RPCs:
+
+| Metadata | Meaning |
+|----------|---------|
+| `x-dtfs-rpc-ts` | Unix seconds |
+| `x-dtfs-rpc-mac` | Hex HMAC-SHA256 over `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n` |
+
+- `method` is `PutChunk`, `DeleteChunk`, `ReplicateChunk`, `GetChunk`,
+  `ListChunks`, or `VerifyChunk`.
+- `binding` is empty for PutChunk / ListChunks; `chunk_id` for
+  DeleteChunk / GetChunk / VerifyChunk; `chunk_id|target_address` for
+  ReplicateChunk (LIS-55 — pins outbound SSRF target).
+- Max skew 300 seconds. Missing/invalid → `PermissionDenied`.
+- Empty `shared_secret` skips verification (join / legacy plaintext parity).
+  Data-node startup refuses empty secret unless
+  `allow_insecure_empty_secret = true` (LIS-55 / LIS-20).
+
+Callers that stamp: FUSE/client put + get, data→data replication put,
+manager scheduler `ReplicateChunk` / `VerifyChunk` / `ListChunks`, manager
+unlink fan-out, scheduler flush/orphan delete. **Deploy data + manager +
+fuse together** when enabling a non-empty secret (update-required). mTLS
+(CF-6) is complementary transport auth, not a substitute for this MAC.
+
+## Node join / register
+
+Data nodes and FUSE clients prove the secret via gRPC `RegisterNode`
+(`shared_secret` field) or the HMAC join handshake — see
+[cluster-join.md](./cluster-join.md).

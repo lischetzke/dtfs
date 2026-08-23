@@ -36,8 +36,18 @@ mgr_get_any() {
 
 mgr_post_leader() {
     local path="$1" body="$2"
+    # LIS-18 — mutating REST requires cluster shared_secret when configured.
+    local secret="${DTFS_SHARED_SECRET:-}"
+    if [ -z "$secret" ]; then
+        secret=$(mgr_shared_secret 2>/dev/null || true)
+    fi
+    local -a auth_hdr=()
+    if [ -n "$secret" ]; then
+        auth_hdr=(-H "X-Dtfs-Shared-Secret: $secret")
+    fi
     for h in $(mgrs_list); do
         local r=$(curl "${CURL_OPTS[@]}" -X POST -H 'content-type: application/json' \
+                  "${auth_hdr[@]}" \
                   -d "$body" "http://$h:$MGR_PORT$path" 2>/dev/null)
         # Skip a non-leader: openraft surfaces the forward hint either bare
         # or wrapped ("raft write failed: has to forward request to: ..."),
@@ -49,6 +59,27 @@ mgr_post_leader() {
         return 0
     done
     return 1
+}
+
+# Read `[cluster].shared_secret` from the first manager's on-disk config
+# (cached for the case lifetime). Empty string when unset / unreadable.
+mgr_shared_secret() {
+    if [ -n "${_MGR_SHARED_SECRET_CACHED+x}" ]; then
+        echo "$_MGR_SHARED_SECRET_CACHED"
+        return 0
+    fi
+    local h
+    h=$(mgrs_list | awk '{print $1}')
+    _MGR_SHARED_SECRET_CACHED=$(ssh_run "$h" "python3 - <<'EOF'
+import tomllib
+try:
+    with open('/etc/dtfs/manager.toml','rb') as f:
+        print(tomllib.load(f).get('cluster',{}).get('shared_secret',''))
+except Exception:
+    print('')
+EOF
+" 2>/dev/null | tr -d '\r' || true)
+    echo "$_MGR_SHARED_SECRET_CACHED"
 }
 
 # ─── Remote-host helpers ─────────────────────────────────────────

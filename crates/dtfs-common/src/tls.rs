@@ -23,6 +23,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tonic::transport::{
@@ -30,6 +31,14 @@ use tonic::transport::{
 };
 
 use crate::config::TlsConfig;
+
+/// Default TCP/TLS connect budget for [`TlsContext::connect`].
+///
+/// Matches the Raft peer channel (Bug AC): a blackhole / unroutable peer
+/// must fail fast so callers can walk the next endpoint. Bug BR-1's manager
+/// self-register keepalive hung forever on dead `initial_voters` entries
+/// when this was unbounded (LIS-77 / FSN sole-voter restart).
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Resolved per-process TLS material. Cheap to clone — the PEM blobs sit
 /// behind one `Arc` (the context is cloned per component at startup and per
@@ -183,9 +192,14 @@ impl TlsContext {
     }
 
     /// Connect a channel to `addr` (scheme + TLS handled here).
+    ///
+    /// Applies [`CONNECT_TIMEOUT`] so unreachable peers fail fast. Callers
+    /// that need a different budget should use [`Self::endpoint`] and chain
+    /// their own `.connect_timeout(...)` before `.connect()` (Raft does).
     pub async fn connect(&self, addr: &str) -> Result<Channel> {
         let url = self.endpoint_url(addr);
         self.endpoint(addr)?
+            .connect_timeout(CONNECT_TIMEOUT)
             .connect()
             .await
             .with_context(|| format!("connect to {url}"))
@@ -310,5 +324,27 @@ mod tests {
         assert_eq!(tls.endpoint_url("10.0.0.1:9500"), "https://10.0.0.1:9500");
         assert_eq!(tls.endpoint_url("http://10.0.0.1:9500"), "https://10.0.0.1:9500");
         assert_eq!(tls.endpoint_url("https://host:9500"), "https://host:9500");
+    }
+
+    /// LIS-77 / BR-1 — connecting to an unroutable TEST-NET address must
+    /// fail within a small multiple of CONNECT_TIMEOUT, not hang for the
+    /// OS TCP blackhole (often minutes).
+    #[tokio::test]
+    async fn connect_to_blackhole_fails_within_bound() {
+        use std::time::Instant;
+
+        let ctx = TlsContext::plaintext();
+        let start = Instant::now();
+        let result = ctx.connect("192.0.2.1:9401").await;
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "blackhole connect should fail, got Ok");
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "connect hung longer than CONNECT_TIMEOUT slack: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "expected a real connect attempt, elapsed={elapsed:?}"
+        );
     }
 }
