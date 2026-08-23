@@ -1,5 +1,10 @@
 # DTFS Manager Node - Multi-stage build
-FROM rust:1.85-bookworm AS builder
+# rustc must be new enough for Cargo.lock (time crate needs >= 1.88).
+FROM rust:1.88-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang libclang-dev cmake protobuf-compiler pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./

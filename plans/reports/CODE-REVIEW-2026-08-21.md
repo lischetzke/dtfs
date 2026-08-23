@@ -113,7 +113,7 @@ workload) grows it to ~30 GB.
 | tiering `read_windows` / `access_stats` never pruned | **FIXED UPSTREAM** |
 | `ListChunks` re-walks and re-sorts the whole chunk tree **per 1000-item page** | **OPEN** — at ~12.5M chunks that is ~12.5k full walks per orphan sweep; the scrub never finishes and pins the anchor HDD |
 | `check_under_replicated` has no per-tick task cap; one node loss queues one task per chunk into a single Raft entry | **OPEN** |
-| snapshot build/send/receive amplifies the state machine several times in heap | tracked as CNF-4 |
+| snapshot build/send/receive amplifies the state machine several times in heap | **OPEN, untracked** — was CNF-4, but PLAN-CN-FOLLOWUPS was retired upstream (#89) after its other tasks closed; the heap amplification itself was never fixed |
 | FUSE `evict_to_size` full stat sweep per evicted chunk, inline on the read path | **OPEN** |
 
 ---
@@ -230,3 +230,23 @@ already merged. Before the next audit: fetch and re-check the remote, and
 diff the finding set against `tests/release/cases/` — the upstream case files
 are well commented and name the mechanism they pin, which makes them the
 cheapest way to tell an open finding from a closed one.
+
+---
+
+## Addendum — merged with origin/master at ef78945 (2026-08-23)
+
+Twelve further upstream commits landed while this work was in flight, mostly a
+security push (HMAC auth on the data-plane RPCs, auth-gated mutating REST and
+manager metadata gRPC, a WebUI session secret). Effects on this report:
+
+- **T6.2 was independently re-found upstream as LIS-41** and fixed in
+  `check_anchor_lag`. The other two sites this review identified -
+  `check_misplaced_rebalance` and the `RemoveChunkLocation` anchor-survivor
+  scan - were not covered there and are fixed here; all three now agree.
+- **T9's XSS finding stands and is fixed here.** The upstream security push
+  added authentication, not output encoding, so the stored-XSS path was
+  untouched by it. The two are complementary: auth stops an outsider reaching
+  the API, escaping stops a *filename* from executing in the operator's
+  browser once inside.
+- The release-suite numbering collided (upstream took 76-82 for the security
+  cases); this review's cases moved to 83-86.

@@ -18,6 +18,9 @@ use crate::store::ChunkStore;
 #[cfg(test)]
 use dtfs_common::checksum;
 use dtfs_common::config::ScrubConfig;
+use dtfs_common::crypto::{
+    stamp_data_rpc_auth, verify_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+};
 use tokio::sync::RwLock;
 
 /// Bug BU-6 — RAII guard that removes a streaming `.tmp` file unless
@@ -225,6 +228,55 @@ fn disk_status_proto(s: DiskStatus) -> String {
     .to_string()
 }
 
+/// LIS-19 / LIS-55 / LIS-83 — fail-closed auth for data-plane RPCs when
+/// `cluster.shared_secret` is configured. Empty secret = legacy plaintext
+/// cluster (same skip as join / ForwardClientWrite). Covers PutChunk,
+/// DeleteChunk, ReplicateChunk, GetChunk, ListChunks, and VerifyChunk.
+fn require_data_rpc_auth(
+    secret: &str,
+    method: &str,
+    binding: &str,
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<(), Status> {
+    if secret.is_empty() {
+        return Ok(());
+    }
+    let ts = metadata
+        .get(DATA_RPC_AUTH_TS)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Status::permission_denied("missing x-dtfs-rpc-ts"))?;
+    let mac = metadata
+        .get(DATA_RPC_AUTH_MAC)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| Status::permission_denied("missing x-dtfs-rpc-mac"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if !verify_data_rpc_auth(secret, method, ts, mac, binding, now) {
+        return Err(Status::permission_denied(
+            "invalid data-plane RPC auth (LIS-19)",
+        ));
+    }
+    Ok(())
+}
+
+/// Insert `x-dtfs-rpc-*` metadata onto a tonic request when a shared secret
+/// is configured. Used by callers (tests, replication) that build Requests.
+pub fn attach_data_rpc_auth<T>(
+    request: &mut Request<T>,
+    secret: &str,
+    method: &str,
+    binding: &str,
+) {
+    if let Some((ts, mac)) = stamp_data_rpc_auth(secret, method, binding) {
+        if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+            request.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+            request.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+        }
+    }
+}
+
 /// GetChunk streaming piece size. 8 MB gives tonic enough room to keep
 /// the HTTP/2 send window full on a multi-gigabit LAN (the client side
 /// bumps `max_decoding_message_size` to match — default is only 4 MB).
@@ -316,6 +368,13 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<Streaming<PutChunkRequest>>,
     ) -> Result<Response<PutChunkResponse>, Status> {
+        // LIS-19 — authenticate before allocating a write slot / tmp.
+        require_data_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "PutChunk",
+            "",
+            request.metadata(),
+        )?;
         // Bug BF-4 — self-reject ALL writes while this node has at least
         // one un-acked integrity fault outstanding. The mgr's
         // auto-quarantine path (BF-6) clears the flag via ConfigUpdate
@@ -489,6 +548,14 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<ListChunksRequest>,
     ) -> Result<Response<ListChunksResponse>, Status> {
+        // LIS-83 — inventory disclose; empty binding (no single chunk id).
+        let md = request.metadata().clone();
+        require_data_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "ListChunks",
+            "",
+            &md,
+        )?;
         let req = request.into_inner();
         let limit = if req.limit == 0 { 1000 } else { req.limit as usize };
 
@@ -532,7 +599,16 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<GetChunkRequest>,
     ) -> Result<Response<Self::GetChunkStream>, Status> {
+        // LIS-83 — bind MAC to chunk_id so a stolen stamp cannot exfil
+        // an arbitrary other chunk within the skew window.
+        let md = request.metadata().clone();
         let req = request.into_inner();
+        require_data_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "GetChunk",
+            &req.chunk_id,
+            &md,
+        )?;
 
         let chunk_id_bytes = chunk_hex::decode(&req.chunk_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid chunk ID: {}", e)))?;
@@ -654,7 +730,16 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<DeleteChunkRequest>,
     ) -> Result<Response<DeleteChunkResponse>, Status> {
+        // LIS-19 — bind MAC to chunk_id so a stolen stamp cannot delete
+        // an arbitrary other chunk within the skew window.
+        let md = request.metadata().clone();
         let req = request.into_inner();
+        require_data_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "DeleteChunk",
+            &req.chunk_id,
+            &md,
+        )?;
         let chunk_id_bytes = chunk_hex::decode(&req.chunk_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid chunk ID: {}", e)))?;
         if chunk_id_bytes.len() != 32 {
@@ -696,7 +781,15 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<VerifyChunkRequest>,
     ) -> Result<Response<VerifyChunkResponse>, Status> {
+        // LIS-83 — bind MAC to chunk_id (presence / integrity oracle).
+        let md = request.metadata().clone();
         let req = request.into_inner();
+        require_data_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "VerifyChunk",
+            &req.chunk_id,
+            &md,
+        )?;
         let chunk_id_bytes = chunk_hex::decode(&req.chunk_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid chunk ID: {}", e)))?;
         if chunk_id_bytes.len() != 32 {
@@ -777,7 +870,21 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<ReplicateChunkRequest>,
     ) -> Result<Response<ReplicateChunkResponse>, Status> {
+        // LIS-55 — unauthenticated ReplicateChunk is exfil/SSRF: the
+        // handler streams chunk bytes via PutChunk to a caller-chosen
+        // target_address. Bind MAC to chunk_id|target_address.
+        let md = request.metadata().clone();
         let req = request.into_inner();
+        let binding = dtfs_common::crypto::data_rpc_replicate_binding(
+            &req.chunk_id,
+            &req.target_address,
+        );
+        require_data_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "ReplicateChunk",
+            &binding,
+            &md,
+        )?;
 
         let chunk_id_bytes = chunk_hex::decode(&req.chunk_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid chunk ID: {}", e)))?;
@@ -1047,13 +1154,18 @@ max_io_percent = 10
         svc: &DataServiceImpl,
         chunk_hex: &str,
     ) -> Result<Vec<u8>, Status> {
-        let resp = svc
-            .get_chunk(Request::new(GetChunkRequest {
-                chunk_id: chunk_hex.to_string(),
-                requester_dc: String::new(),
-                requester_host: String::new(),
-            }))
-            .await?;
+        let mut req = Request::new(GetChunkRequest {
+            chunk_id: chunk_hex.to_string(),
+            requester_dc: String::new(),
+            requester_host: String::new(),
+        });
+        attach_data_rpc_auth(
+            &mut req,
+            &svc.config.cluster.shared_secret,
+            "GetChunk",
+            chunk_hex,
+        );
+        let resp = svc.get_chunk(req).await?;
         let mut stream = resp.into_inner();
         let mut out: Vec<u8> = Vec::new();
         let mut expected_offset: u64 = 0;
@@ -1153,6 +1265,249 @@ max_io_percent = 10
             .unwrap();
 
         let got = collect_stream(&svc, &chunk_hex).await.unwrap();
+        assert_eq!(got, data);
+    }
+
+    // LIS-19 — unauthenticated DeleteChunk must be rejected when a
+    // shared_secret is configured (test_config uses "test-secret").
+    #[tokio::test]
+    async fn delete_chunk_rejects_missing_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"lis19-delete-auth";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(
+                &chunk_id,
+                data,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+            )
+            .await
+            .unwrap();
+
+        let err = svc
+            .delete_chunk(Request::new(DeleteChunkRequest {
+                chunk_id: chunk_hex.clone(),
+                disk_id: None,
+                tier: String::new(),
+            }))
+            .await
+            .expect_err("unauthenticated DeleteChunk must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        // Bytes must still be on disk.
+        assert!(svc.store.chunk_file_path(&chunk_id).is_some());
+    }
+
+    // LIS-19 — PutChunk uses the same require_data_rpc_auth gate before any
+    // stream I/O. tonic::Streaming is not constructible without a server, so
+    // this exercises the exact call put_chunk makes with empty metadata.
+    #[tokio::test]
+    async fn put_chunk_rejects_missing_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let md = tonic::metadata::MetadataMap::new();
+        let err = require_data_rpc_auth(
+            &svc.config.cluster.shared_secret,
+            "PutChunk",
+            "",
+            &md,
+        )
+        .expect_err("unauthenticated PutChunk must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("missing x-dtfs-rpc"));
+    }
+
+    // LIS-19 — valid stamp allows DeleteChunk.
+    #[tokio::test]
+    async fn delete_chunk_accepts_valid_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"lis19-delete-ok";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(
+                &chunk_id,
+                data,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+            )
+            .await
+            .unwrap();
+
+        let mut req = Request::new(DeleteChunkRequest {
+            chunk_id: chunk_hex.clone(),
+            disk_id: None,
+            tier: String::new(),
+        });
+        attach_data_rpc_auth(
+            &mut req,
+            &svc.config.cluster.shared_secret,
+            "DeleteChunk",
+            &chunk_hex,
+        );
+        let resp = svc.delete_chunk(req).await.expect("authed delete");
+        assert!(resp.into_inner().success);
+        assert!(svc.store.chunk_file_path(&chunk_id).is_none());
+    }
+
+    // LIS-55 — unauthenticated ReplicateChunk must be PermissionDenied
+    // before any outbound stream (exfil/SSRF).
+    #[tokio::test]
+    async fn replicate_chunk_rejects_missing_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"lis55-replicate-auth";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(
+                &chunk_id,
+                data,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+            )
+            .await
+            .unwrap();
+
+        let err = svc
+            .replicate_chunk(Request::new(ReplicateChunkRequest {
+                chunk_id: chunk_hex.clone(),
+                target_address: "http://127.0.0.1:19999".into(),
+                target_tier: "warm".into(),
+            }))
+            .await
+            .expect_err("unauthenticated ReplicateChunk must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(svc.store.chunk_file_path(&chunk_id).is_some());
+    }
+
+    // LIS-55 — stamp for a different target_address must not authorize.
+    #[tokio::test]
+    async fn replicate_chunk_rejects_wrong_target_binding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"lis55-replicate-bind";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(
+                &chunk_id,
+                data,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+            )
+            .await
+            .unwrap();
+
+        let stamped_target = "http://peer-a:9500";
+        let actual_target = "http://evil:9500";
+        let binding =
+            dtfs_common::crypto::data_rpc_replicate_binding(&chunk_hex, stamped_target);
+        let mut req = Request::new(ReplicateChunkRequest {
+            chunk_id: chunk_hex.clone(),
+            target_address: actual_target.into(),
+            target_tier: "warm".into(),
+        });
+        attach_data_rpc_auth(
+            &mut req,
+            &svc.config.cluster.shared_secret,
+            "ReplicateChunk",
+            &binding,
+        );
+        let err = svc
+            .replicate_chunk(req)
+            .await
+            .expect_err("wrong target binding must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(svc.store.chunk_file_path(&chunk_id).is_some());
+    }
+
+    // LIS-83 — unauthenticated GetChunk must be PermissionDenied (exfil).
+    #[tokio::test]
+    async fn get_chunk_rejects_missing_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"lis83-get-auth";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(
+                &chunk_id,
+                data,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+            )
+            .await
+            .unwrap();
+
+        let err = svc
+            .get_chunk(Request::new(GetChunkRequest {
+                chunk_id: chunk_hex.clone(),
+                requester_dc: String::new(),
+                requester_host: String::new(),
+            }))
+            .await
+            .expect_err("unauthenticated GetChunk must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    // LIS-83 — unauthenticated ListChunks must be PermissionDenied (inventory).
+    #[tokio::test]
+    async fn list_chunks_rejects_missing_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let err = svc
+            .list_chunks(Request::new(ListChunksRequest {
+                page_token: String::new(),
+                limit: 10,
+            }))
+            .await
+            .expect_err("unauthenticated ListChunks must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    // LIS-83 — unauthenticated VerifyChunk must be PermissionDenied (oracle).
+    #[tokio::test]
+    async fn verify_chunk_rejects_missing_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let err = svc
+            .verify_chunk(Request::new(VerifyChunkRequest {
+                chunk_id: "00".repeat(32),
+            }))
+            .await
+            .expect_err("unauthenticated VerifyChunk must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    // LIS-83 — valid stamp allows GetChunk past the auth gate.
+    #[tokio::test]
+    async fn get_chunk_accepts_valid_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"lis83-get-ok";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(
+                &chunk_id,
+                data,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+            )
+            .await
+            .unwrap();
+
+        let got = collect_stream(&svc, &chunk_hex).await.expect("authed get");
         assert_eq!(got, data);
     }
 }
@@ -1275,10 +1630,17 @@ max_io_percent = 10
         corrupt[0] ^= 0xFF;
         std::fs::write(&dat_path, &corrupt).unwrap();
 
+        let mut req = Request::new(VerifyChunkRequest {
+            chunk_id: chunk_hex.clone(),
+        });
+        attach_data_rpc_auth(
+            &mut req,
+            &svc.config.cluster.shared_secret,
+            "VerifyChunk",
+            &chunk_hex,
+        );
         let resp = svc
-            .verify_chunk(Request::new(VerifyChunkRequest {
-                chunk_id: chunk_hex,
-            }))
+            .verify_chunk(req)
             .await
             .unwrap()
             .into_inner();
@@ -1311,10 +1673,17 @@ max_io_percent = 10
         let meta_path = dat_path.with_extension("meta");
         std::fs::remove_file(&meta_path).unwrap();
 
+        let mut req = Request::new(VerifyChunkRequest {
+            chunk_id: chunk_hex.clone(),
+        });
+        attach_data_rpc_auth(
+            &mut req,
+            &svc.config.cluster.shared_secret,
+            "VerifyChunk",
+            &chunk_hex,
+        );
         let resp = svc
-            .verify_chunk(Request::new(VerifyChunkRequest {
-                chunk_id: chunk_hex,
-            }))
+            .verify_chunk(req)
             .await
             .unwrap()
             .into_inner();

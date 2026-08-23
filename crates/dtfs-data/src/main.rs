@@ -44,6 +44,14 @@ async fn main() -> anyhow::Result<()> {
     let config: DataNodeConfig =
         dtfs_common::config::load_config(std::path::Path::new(&args.config))?;
 
+    // LIS-55 / LIS-20 — fail-closed empty shared_secret (no silent admit
+    // on Put/Delete/ReplicateChunk auth skip). Lab escape hatch:
+    // cluster.allow_insecure_empty_secret = true.
+    config
+        .cluster
+        .validate_shared_secret()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     tracing::info!(
         "Data node {} at {} ({})",
         config.node.hostname,

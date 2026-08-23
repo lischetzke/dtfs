@@ -177,6 +177,24 @@ bytes must:
    (BC-12e). Disabling verify_on_read needs an explicit ack at the API
    boundary (BC-8 ack guard) and is the only mode where reads can deliver
    corrupt bytes. Scrub (quick+deep+orphan) still runs.
+7. LIS-19 / LIS-55 / LIS-83 — when `cluster.shared_secret` is non-empty, data-plane
+   `PutChunk` / `DeleteChunk` / `ReplicateChunk` / `GetChunk` / `ListChunks` /
+   `VerifyChunk` require gRPC metadata `x-dtfs-rpc-ts` + `x-dtfs-rpc-mac`
+   (HMAC-SHA256 over `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n`;
+   DeleteChunk/GetChunk/VerifyChunk bind `chunk_id`; ReplicateChunk binds
+   `chunk_id|target_address`; PutChunk/ListChunks empty binding).
+   Missing/invalid → `PermissionDenied`. Empty secret = legacy skip
+   (join parity); data-node startup refuses empty secret unless
+   `allow_insecure_empty_secret` (LIS-20 parity).    Callers that stamp:
+   FUSE/client put+get, data→data replication put, manager scheduler
+   ReplicateChunk/VerifyChunk/ListChunks, manager unlink fan-out +
+   scheduler flush. Deploy data+manager+fuse together. mTLS (CF-6) is
+   complementary.
+8. LIS-56 — when `cluster.shared_secret` is non-empty, mutating
+   ManagerService RPCs require the same header keys over the
+   `dtfs-mgr-rpc` plane (`metadata::require_mgr_rpc_auth`); `dtfs-client`
+   stamps from `[client].shared_secret`. REST mutations remain LIS-18.
+   Deploy manager+fuse together.
 
 Full audit checklist: § A.6.
 
@@ -188,7 +206,11 @@ independent replica classes:
   configured count. Coverage counts only serviceable replicas (node not
   Down/Failed, disk not Failed/Removed — `live_replica_tier`, Bug CH),
   so node/disk loss surfaces as a tier deficit and backfills here; the
-  health monitor never schedules repair.
+  health monitor never schedules repair. The same live gate applies to
+  `stats`/`cluster_status` `anchor_pending` (`api::count_anchor_pending_files`),
+  `chunk_placement` (`placement_state::resolve_dc_tier`), and
+  `check_anchor_lag` placement builds (LIS-41) — Down-node cold must not
+  keep those counters false-green.
 - `cache_replicas.<tier>.{min,max}` — demand-driven, evictable. **Only
   the tiering engine creates them, and only when the promotion threshold
   fires** (`promote_reads` / `promote_window_secs`). The under-
@@ -575,26 +597,38 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   drained corrupt ids when the ack is `accepted == false` (same as a
   transport error), so the retry actually happens.
 - `dtfs-manager/src/api.rs` — REST endpoints (WebUI + CLI); `get_stats`
-  is the WebUI home aggregator. The config read endpoints (`get_config`,
-  `get_config_effective`) return the **effective** config = the node's
-  startup `state.config` with the Raft cluster override
-  (`cluster_config.config_json`) projected on top via `json_deep_merge`
-  (Bug CM) — a saved cluster-wide override MUST read back as `current`, or
-  the WebUI editor looks broken. Adding a config read path? Route it
-  through `effective_config_value`, never raw `state.config` (CO-5-9 — the
-  `get_config` `defaults` block follows the same merge). The write path
-  (`update_config`) deep-merges the override onto the startup config (which,
-  since `UpdateConfig` replaces the override wholesale, IS the post-save
-  effective config) and REQUIRES the merge to deserialize as `ManagerConfig`
-  (`merge_and_validate_override`, 400 on type error, CO-4-3), then persists
-  `toml::to_string_pretty` of the validated merge — never raw override JSON
-  into the `.toml`. Operator node decommission
-  (`POST /api/v1/nodes/{id}/decommission` -> `decommission_node_endpoint` ->
-  Raft `ClientRequest::DeregisterNode`) removes a drained/dead node from the
-  registry; the apply REFUSES (`ClientResponse::Error`) if the node still
-  holds any chunk replica (`sm.files[*].chunks[*].node_id`) — integrity
-  guard A.6 #5, drain/re-replicate first. The endpoint pre-checks the same
-  and the apply re-checks authoritatively (TOCTOU-safe).
+  is the WebUI home aggregator. LIS-18 / Sec R1: mutating `/api/v1/*`
+  requires `[cluster].shared_secret` via `X-Dtfs-Shared-Secret` (or
+  `Authorization: Bearer`) when configured (`rest_auth.rs`); GETs stay
+  open; join HMAC exempt. Denied calls audit as `auth.denied`. LIS-56:
+  mutating ManagerService gRPC (`CreateFile`/`DeleteFile`/leases/…)
+  requires `x-dtfs-rpc-*` HMAC over the `dtfs-mgr-rpc` plane when the
+  secret is set (`metadata::require_mgr_rpc_auth`); reads stay open;
+  `dtfs-client` stamps from `[client].shared_secret`. The config
+  read endpoints (`get_config`, `get_config_effective`) return the
+  **effective** config = the node's startup `state.config` with the Raft
+  cluster override (`cluster_config.config_json`) projected on top via
+  `json_deep_merge` (Bug CM) — a saved cluster-wide override MUST read
+  back as `current`, or the WebUI editor looks broken. Adding a config
+  read path? Route it through `effective_config_value`, never raw
+  `state.config` (CO-5-9 — the `get_config` `defaults` block follows the
+  same merge). The write path (`update_config`) deep-merges the override
+  onto the startup config (which, since `UpdateConfig` replaces the
+  override wholesale, IS the post-save effective config) and REQUIRES the
+  merge to deserialize as `ManagerConfig` (`merge_and_validate_override`,
+  400 on type error, CO-4-3), then persists `toml::to_string_pretty` of
+  the validated merge — never raw override JSON into the `.toml`. Operator
+  node decommission (`POST /api/v1/nodes/{id}/decommission` ->
+  `decommission_node_endpoint` -> Raft `ClientRequest::DeregisterNode`)
+  removes a drained/dead node from the registry; the apply REFUSES
+  (`ClientResponse::Error`) if the node still holds any chunk replica
+  (`sm.files[*].chunks[*].node_id`) — integrity guard A.6 #5,
+  drain/re-replicate first. The endpoint pre-checks the same and the apply
+  re-checks authoritatively (TOCTOU-safe).
+- `dtfs-manager/src/rest_auth.rs` — pure mutation-auth check + axum
+  middleware for LIS-18 (constant-time compare).
+- `dtfs-manager/src/metadata.rs` — ManagerService gRPC; LIS-56
+  `require_mgr_rpc_auth` on mutating client RPCs.
 - `dtfs-manager/src/membership.rs` — CF-2 online raft membership: pure
   validation for the leader-only `/api/v1/raft/{add-learner,promote,
   remove}` endpoints (openraft `add_learner`/`change_membership`;
@@ -610,8 +644,15 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   `cluster.shared_secret` = documented unauthenticated downgrade (skips the
   challenge/HMAC checks). docs/src/security/cluster-join.md.
 - `dtfs-manager/src/webui.rs` — embedded SPA, format-string HTML
-  (`{{`/`}}` for literal braces).
-- `dtfs-data/src/server.rs::put_chunk` — streaming put path.
+  (`{{`/`}}` for literal braces). LIS-35: mutating POSTs send
+  `X-Dtfs-Shared-Secret` from `sessionStorage` (Settings field / header
+  badge prompt); GETs stay open; 401/403 surfaced in-page.
+- `dtfs-data/src/server.rs::put_chunk` — streaming put path; LIS-19/LIS-55/LIS-83
+  `require_data_rpc_auth` gates Put/Delete/Replicate/Get/List/VerifyChunk.
+- `dtfs-common/src/crypto.rs` — join HMAC + LIS-19/LIS-55/LIS-83
+  `stamp_data_rpc_auth` / `verify_data_rpc_auth` /
+  `data_rpc_replicate_binding` + LIS-56 `stamp_mgr_rpc_auth` /
+  `verify_mgr_rpc_auth`.
 - `dtfs-data/src/store.rs::commit_chunk_from_tmp` — atomic commit
   (§ A.6).
 - `dtfs-common/src/memory.rs` — CF-5 role-agnostic memory budget core
@@ -652,7 +693,9 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   config + scheme-aware endpoint. ALL gRPC listeners and connects (manager,
   data, raft peers, FUSE via `DtfsClient::set_tls`) route through it; mixed
   TLS state partitions the cluster, so enable only cluster-wide
-  (docs/src/security/tls.md rollout).
+  (docs/src/security/tls.md rollout). `TlsContext::connect` applies a 3s
+  `CONNECT_TIMEOUT` (LIS-77 / BR-1) so blackhole peers fail fast; Raft
+  still uses `endpoint()` + its own timeout chain.
 - `plans/active/` — in-flight plans (see plans/README.md).
 - `tests/proxmox/abuse/` — numbered shell regression tests.
 

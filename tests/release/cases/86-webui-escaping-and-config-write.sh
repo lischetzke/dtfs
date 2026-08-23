@@ -60,12 +60,19 @@ echo "$PAGE" | grep -q 'function escArg(' || fail "page script has no escArg() h
 echo "[4/4] a config write that would not parse is refused, file untouched"
 BEFORE=$(ssh_run "$LEADER" "sudo sha256sum /etc/dtfs/manager.toml 2>/dev/null | awk '{print \$1}'" | tr -d '\r')
 [ -n "$BEFORE" ] || skip "no /etc/dtfs/manager.toml on $LEADER"
+# LIS-18 — mutating REST is auth-gated, so this must carry the cluster secret
+# or it would be refused as unauthenticated and we would never reach the
+# validation path this case exists to test.
+SECRET="${DTFS_SHARED_SECRET:-$(mgr_shared_secret 2>/dev/null || true)}"
+AUTH_HDR=()
+[ -n "$SECRET" ] && AUTH_HDR=(-H "X-Dtfs-Shared-Secret: $SECRET")
 CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' \
-    -X POST -H 'Content-Type: application/json' \
+    -X POST -H 'Content-Type: application/json' "${AUTH_HDR[@]}" \
     -d '{"config_json":"{\"raft\":{\"heartbeat_interval_ms\":\"not-a-number\"}}","write_to_disk":true}' \
     "http://$LEADER:$MGR_PORT/api/v1/config" 2>/dev/null)
 case "$CODE" in
     400|422) echo "  refused with HTTP $CODE" ;;
+    401|403) fail "request was rejected as unauthenticated ($CODE) - the case never reached the config validation path" ;;
     *) fail "expected a 4xx refusal for an invalid write_to_disk body, got $CODE" ;;
 esac
 AFTER=$(ssh_run "$LEADER" "sudo sha256sum /etc/dtfs/manager.toml 2>/dev/null | awk '{print \$1}'" | tr -d '\r')

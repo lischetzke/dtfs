@@ -125,6 +125,8 @@ pub struct TaskScheduler {
     /// mutations (lost task / `next_task_id` regression). Held only across
     /// the load..save critical section, never across an unrelated await.
     migration_state_lock: tokio::sync::Mutex<()>,
+    /// LIS-19 — cluster shared secret for DeleteChunk auth stamps.
+    shared_secret: parking_lot::RwLock<String>,
 }
 
 impl TaskScheduler {
@@ -149,12 +151,18 @@ impl TaskScheduler {
             failed_task_retention_ms: failed_task_retention_secs.saturating_mul(1000),
             tls,
             migration_state_lock: tokio::sync::Mutex::new(()),
+            shared_secret: parking_lot::RwLock::new(String::new()),
         }
     }
 
     /// Inject the alert dispatcher (called after main.rs has wired one).
     pub fn set_alerts(&self, alerts: Arc<crate::alerts::AlertDispatcher>) {
         *self.alerts.write() = Some(alerts);
+    }
+
+    /// LIS-19 — inject the cluster shared secret for DeleteChunk stamps.
+    pub fn set_shared_secret(&self, secret: String) {
+        *self.shared_secret.write() = secret;
     }
 
     /// CF-5 — inject the memory budget so the scheduler can skip background
@@ -890,24 +898,16 @@ impl TaskScheduler {
             }
 
             for (chunk_index, entries) in by_idx {
-                // Resolve the placements + tiers for this chunk.
+                // Resolve placements for this chunk. LIS-41 / Bug CH —
+                // only serviceable replicas count toward Gate 1
+                // satisfaction; a Down dc3/cold must not suppress
+                // anchor.lag_repair (and must not keep metrics green).
+                // CNF-1 disk_id keying lives inside live_replica_tier.
                 let placements: Vec<AnchorRepairPlacement> = entries
                     .iter()
                     .filter_map(|e| {
                         let nid = e.node_id.parse::<u64>().ok()?;
                         let info = sm.nodes.get(&nid)?;
-                        // CNF-1 — stable disk_id key, never Vec index (must
-                        // agree with api::count_anchor_pending_files, or the
-                        // projection reports anchor_pending the planner
-                        // never repairs).
-                        // REV-3-7 — one liveness definition. This used to
-                        // resolve the tier straight off the disk list, so a
-                        // replica on a Down/Failed node or a Failed/Removed
-                        // disk still counted as satisfying the anchor, while
-                        // check_under_replicated (which uses live_replica_tier)
-                        // counted it as missing. The two passes then fought:
-                        // the backfill scheduled a copy and the anchor/rebalance
-                        // logic saw no deficit, forever, over the 40 Mbps link.
                         let tier = live_replica_tier(Some(info), e.disk_id)?;
                         Some(AnchorRepairPlacement {
                             node_id: nid,
@@ -1096,12 +1096,29 @@ impl TaskScheduler {
                 .await
                 .map(DataServiceClient::new)
                 .map_err(|e| anyhow::anyhow!("connect to source {}: {}", source_addr, e))?;
+            let mut req = tonic::Request::new(ReplicateChunkRequest {
+                chunk_id: chunk_id.to_string(),
+                target_address: target_addr.to_string(),
+                target_tier: target_tier.to_string(),
+            });
+            {
+                use dtfs_common::crypto::{
+                    data_rpc_replicate_binding, stamp_data_rpc_auth, DATA_RPC_AUTH_MAC,
+                    DATA_RPC_AUTH_TS,
+                };
+                let secret = self.shared_secret.read().clone();
+                let binding = data_rpc_replicate_binding(chunk_id, target_addr);
+                if let Some((ts, mac)) =
+                    stamp_data_rpc_auth(&secret, "ReplicateChunk", &binding)
+                {
+                    if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                        req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                        req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                    }
+                }
+            }
             client
-                .replicate_chunk(ReplicateChunkRequest {
-                    chunk_id: chunk_id.to_string(),
-                    target_address: target_addr.to_string(),
-                    target_tier: target_tier.to_string(),
-                })
+                .replicate_chunk(req)
                 .await
                 .map_err(|e| anyhow::anyhow!("ReplicateChunk RPC: {}", e))
                 .map(|r| r.into_inner())
@@ -1135,10 +1152,23 @@ impl TaskScheduler {
                 .await
                 .map(DataServiceClient::new)
                 .map_err(|e| anyhow::anyhow!("connect to target {}: {}", target_addr, e))?;
+            let mut req = tonic::Request::new(VerifyChunkRequest {
+                chunk_id: chunk_id.to_string(),
+            });
+            {
+                use dtfs_common::crypto::{
+                    stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+                };
+                let secret = self.shared_secret.read().clone();
+                if let Some((ts, mac)) = stamp_data_rpc_auth(&secret, "VerifyChunk", chunk_id) {
+                    if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                        req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                        req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                    }
+                }
+            }
             client
-                .verify_chunk(VerifyChunkRequest {
-                    chunk_id: chunk_id.to_string(),
-                })
+                .verify_chunk(req)
                 .await
                 .map_err(|e| anyhow::anyhow!("VerifyChunk RPC: {}", e))
                 .map(|r| r.into_inner())
@@ -1186,12 +1216,27 @@ impl TaskScheduler {
             .map(DataServiceClient::new)
             .map_err(|e| anyhow::anyhow!("connect to data node {}: {}", node_addr, e))?;
 
+        let mut req = tonic::Request::new(dtfs_proto::dtfs::data::DeleteChunkRequest {
+            chunk_id: chunk_id.to_string(),
+            disk_id,
+            tier: tier.to_string(),
+        });
+        {
+            use dtfs_common::crypto::{
+                stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+            };
+            let secret = self.shared_secret.read().clone();
+            if let Some((ts, mac)) =
+                stamp_data_rpc_auth(&secret, "DeleteChunk", chunk_id)
+            {
+                if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                    req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                    req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                }
+            }
+        }
         let resp = client
-            .delete_chunk(dtfs_proto::dtfs::data::DeleteChunkRequest {
-                chunk_id: chunk_id.to_string(),
-                disk_id,
-                tier: tier.to_string(),
-            })
+            .delete_chunk(req)
             .await
             .map_err(|e| anyhow::anyhow!("DeleteChunkReplica RPC: {}", e))?
             .into_inner();
@@ -2207,11 +2252,24 @@ impl TaskScheduler {
             std::collections::HashMap::new();
         let mut token = String::new();
         loop {
+            let mut req = tonic::Request::new(ListChunksRequest {
+                page_token: token.clone(),
+                limit: 1000,
+            });
+            {
+                use dtfs_common::crypto::{
+                    stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+                };
+                let secret = self.shared_secret.read().clone();
+                if let Some((ts, mac)) = stamp_data_rpc_auth(&secret, "ListChunks", "") {
+                    if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                        req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                        req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+                    }
+                }
+            }
             let resp = client
-                .list_chunks(ListChunksRequest {
-                    page_token: token.clone(),
-                    limit: 1000,
-                })
+                .list_chunks(req)
                 .await
                 .map_err(|e| anyhow::anyhow!("ListChunks RPC: {}", e))?
                 .into_inner();

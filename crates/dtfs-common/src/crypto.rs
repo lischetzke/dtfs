@@ -122,6 +122,204 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// LIS-19 / LIS-55 / LIS-83 — data-plane RPC auth (mutate + read)
+// ---------------------------------------------------------------------------
+
+/// gRPC metadata key: unix-seconds timestamp for the data-RPC MAC.
+pub const DATA_RPC_AUTH_TS: &str = "x-dtfs-rpc-ts";
+/// gRPC metadata key: hex-encoded HMAC-SHA256 of the canonical message.
+pub const DATA_RPC_AUTH_MAC: &str = "x-dtfs-rpc-mac";
+/// Reject MACs whose timestamp is older/newer than this many seconds.
+pub const DATA_RPC_MAX_SKEW_SECS: u64 = 300;
+
+/// Canonical MAC message for a data-plane RPC.
+///
+/// `method` is `PutChunk`, `DeleteChunk`, `ReplicateChunk`, `GetChunk`,
+/// `ListChunks`, or `VerifyChunk`. `binding` is:
+/// - empty for PutChunk / ListChunks
+/// - `chunk_id` for DeleteChunk / GetChunk / VerifyChunk
+/// - [`data_rpc_replicate_binding`] for ReplicateChunk (`chunk_id|target_address`)
+pub fn data_rpc_mac_message(method: &str, ts_unix: u64, binding: &str) -> String {
+    format!("dtfs-data-rpc\nv1\n{method}\n{ts_unix}\n{binding}\n")
+}
+
+/// MAC binding for `ReplicateChunk` — pins both chunk and outbound target
+/// so a stolen stamp cannot retarget SSRF within the skew window (LIS-55).
+pub fn data_rpc_replicate_binding(chunk_id: &str, target_address: &str) -> String {
+    format!("{chunk_id}|{target_address}")
+}
+
+/// Compute hex HMAC-SHA256 for a data-plane RPC auth stamp.
+pub fn compute_data_rpc_mac_hex(
+    secret: &str,
+    method: &str,
+    ts_unix: u64,
+    binding: &str,
+) -> String {
+    let msg = data_rpc_mac_message(method, ts_unix, binding);
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC can take key of any size");
+    mac.update(msg.as_bytes());
+    hex_encode(&mac.finalize().into_bytes())
+}
+
+/// Stamp headers for an authenticated data-plane RPC.
+///
+/// Returns `None` when `secret` is empty (legacy plaintext cluster — callers
+/// skip stamping; the server skips verification). Otherwise
+/// `(ts_unix_string, mac_hex)`.
+pub fn stamp_data_rpc_auth(
+    secret: &str,
+    method: &str,
+    binding: &str,
+) -> Option<(String, String)> {
+    if secret.is_empty() {
+        return None;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mac = compute_data_rpc_mac_hex(secret, method, ts, binding);
+    Some((ts.to_string(), mac))
+}
+
+/// Verify data-plane RPC auth headers.
+///
+/// Empty `secret` → always true (legacy skip). Otherwise requires a parseable
+/// timestamp within [`DATA_RPC_MAX_SKEW_SECS`] of `now_unix` and a matching
+/// constant-time MAC.
+pub fn verify_data_rpc_auth(
+    secret: &str,
+    method: &str,
+    ts_str: &str,
+    mac_hex: &str,
+    binding: &str,
+    now_unix: u64,
+) -> bool {
+    if secret.is_empty() {
+        return true;
+    }
+    let Ok(ts) = ts_str.parse::<u64>() else {
+        return false;
+    };
+    let skew = if now_unix >= ts {
+        now_unix - ts
+    } else {
+        ts - now_unix
+    };
+    if skew > DATA_RPC_MAX_SKEW_SECS {
+        return false;
+    }
+    let Some(provided) = hex_decode(mac_hex) else {
+        return false;
+    };
+    let expected_hex = compute_data_rpc_mac_hex(secret, method, ts, binding);
+    let Some(expected) = hex_decode(&expected_hex) else {
+        return false;
+    };
+    constant_time_eq(&provided, &expected)
+}
+
+// ---------------------------------------------------------------------------
+// LIS-56 / Sec HIGH — manager metadata mutating-RPC authentication
+// ---------------------------------------------------------------------------
+//
+// Same header keys + skew as LIS-19 (`x-dtfs-rpc-ts` / `x-dtfs-rpc-mac`), but
+// a distinct MAC plane (`dtfs-mgr-rpc`) so a data-plane stamp cannot be
+// replayed against ManagerService (and vice versa).
+
+/// Canonical MAC message for a manager metadata mutating RPC.
+///
+/// `method` is the ManagerService RPC name (`DeleteFile`, `CreateFile`, …).
+/// `binding` is typically the target path (or `from\\nto` for RenameFile) so a
+/// stamp cannot be replayed against a different object within the skew window.
+pub fn mgr_rpc_mac_message(method: &str, ts_unix: u64, binding: &str) -> String {
+    format!("dtfs-mgr-rpc\nv1\n{method}\n{ts_unix}\n{binding}\n")
+}
+
+/// Compute hex HMAC-SHA256 for a manager metadata RPC auth stamp.
+pub fn compute_mgr_rpc_mac_hex(
+    secret: &str,
+    method: &str,
+    ts_unix: u64,
+    binding: &str,
+) -> String {
+    let msg = mgr_rpc_mac_message(method, ts_unix, binding);
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC can take key of any size");
+    mac.update(msg.as_bytes());
+    hex_encode(&mac.finalize().into_bytes())
+}
+
+/// Stamp headers for an authenticated manager metadata RPC.
+///
+/// Returns `None` when `secret` is empty (legacy plaintext cluster). Otherwise
+/// `(ts_unix_string, mac_hex)`.
+pub fn stamp_mgr_rpc_auth(
+    secret: &str,
+    method: &str,
+    binding: &str,
+) -> Option<(String, String)> {
+    if secret.is_empty() {
+        return None;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mac = compute_mgr_rpc_mac_hex(secret, method, ts, binding);
+    Some((ts.to_string(), mac))
+}
+
+/// Verify manager metadata RPC auth headers.
+///
+/// Empty `secret` → always true (legacy skip). Otherwise requires a parseable
+/// timestamp within [`DATA_RPC_MAX_SKEW_SECS`] of `now_unix` and a matching
+/// constant-time MAC over the `dtfs-mgr-rpc` plane.
+pub fn verify_mgr_rpc_auth(
+    secret: &str,
+    method: &str,
+    ts_str: &str,
+    mac_hex: &str,
+    binding: &str,
+    now_unix: u64,
+) -> bool {
+    if secret.is_empty() {
+        return true;
+    }
+    let Ok(ts) = ts_str.parse::<u64>() else {
+        return false;
+    };
+    let skew = if now_unix >= ts {
+        now_unix - ts
+    } else {
+        ts - now_unix
+    };
+    if skew > DATA_RPC_MAX_SKEW_SECS {
+        return false;
+    }
+    let Some(provided) = hex_decode(mac_hex) else {
+        return false;
+    };
+    let expected_hex = compute_mgr_rpc_mac_hex(secret, method, ts, binding);
+    let Some(expected) = hex_decode(&expected_hex) else {
+        return false;
+    };
+    constant_time_eq(&provided, &expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +364,156 @@ mod tests {
         let n1 = generate_nonce();
         let n2 = generate_nonce();
         assert_ne!(n1, n2);
+    }
+
+    #[test]
+    fn data_rpc_mac_roundtrip_accepts_valid() {
+        let secret = "cluster-secret";
+        let method = "DeleteChunk";
+        let binding = "aabbccdd";
+        let ts = 1_700_000_000u64;
+        let mac = compute_data_rpc_mac_hex(secret, method, ts, binding);
+        assert!(verify_data_rpc_auth(
+            secret,
+            method,
+            &ts.to_string(),
+            &mac,
+            binding,
+            ts
+        ));
+    }
+
+    #[test]
+    fn data_rpc_mac_rejects_wrong_secret() {
+        let ts = 1_700_000_000u64;
+        let mac = compute_data_rpc_mac_hex("right", "DeleteChunk", ts, "cid");
+        assert!(!verify_data_rpc_auth(
+            "wrong",
+            "DeleteChunk",
+            &ts.to_string(),
+            &mac,
+            "cid",
+            ts
+        ));
+    }
+
+    #[test]
+    fn data_rpc_mac_rejects_wrong_binding() {
+        let secret = "s";
+        let ts = 1_700_000_000u64;
+        let mac = compute_data_rpc_mac_hex(secret, "DeleteChunk", ts, "cid-a");
+        assert!(!verify_data_rpc_auth(
+            secret,
+            "DeleteChunk",
+            &ts.to_string(),
+            &mac,
+            "cid-b",
+            ts
+        ));
+    }
+
+    #[test]
+    fn data_rpc_mac_rejects_skew() {
+        let secret = "s";
+        let ts = 1_700_000_000u64;
+        let mac = compute_data_rpc_mac_hex(secret, "PutChunk", ts, "");
+        assert!(!verify_data_rpc_auth(
+            secret,
+            "PutChunk",
+            &ts.to_string(),
+            &mac,
+            "",
+            ts + DATA_RPC_MAX_SKEW_SECS + 1
+        ));
+    }
+
+    #[test]
+    fn data_rpc_mac_empty_secret_is_legacy_skip() {
+        assert!(verify_data_rpc_auth("", "DeleteChunk", "", "", "x", 0));
+        assert!(stamp_data_rpc_auth("", "PutChunk", "").is_none());
+    }
+
+    #[test]
+    fn stamp_data_rpc_auth_produces_verifiable_pair() {
+        let secret = "live-secret";
+        let (ts, mac) = stamp_data_rpc_auth(secret, "PutChunk", "").unwrap();
+        let now: u64 = ts.parse().unwrap();
+        assert!(verify_data_rpc_auth(
+            secret, "PutChunk", &ts, &mac, "", now
+        ));
+    }
+
+    #[test]
+    fn data_rpc_replicate_binding_pins_target() {
+        let secret = "s";
+        let ts = 1_700_000_000u64;
+        let binding = data_rpc_replicate_binding("cid", "http://peer:9500");
+        let mac = compute_data_rpc_mac_hex(secret, "ReplicateChunk", ts, &binding);
+        assert!(verify_data_rpc_auth(
+            secret,
+            "ReplicateChunk",
+            &ts.to_string(),
+            &mac,
+            &binding,
+            ts
+        ));
+        let wrong = data_rpc_replicate_binding("cid", "http://evil:9500");
+        assert!(!verify_data_rpc_auth(
+            secret,
+            "ReplicateChunk",
+            &ts.to_string(),
+            &mac,
+            &wrong,
+            ts
+        ));
+    }
+
+    #[test]
+    fn mgr_rpc_mac_roundtrip_accepts_valid() {
+        let secret = "cluster-secret";
+        let method = "DeleteFile";
+        let binding = "/media/a.mkv";
+        let ts = 1_700_000_000u64;
+        let mac = compute_mgr_rpc_mac_hex(secret, method, ts, binding);
+        assert!(verify_mgr_rpc_auth(
+            secret,
+            method,
+            &ts.to_string(),
+            &mac,
+            binding,
+            ts
+        ));
+    }
+
+    #[test]
+    fn mgr_rpc_mac_rejects_data_plane_replay() {
+        // A valid data-plane MAC must not verify under the mgr plane.
+        let secret = "s";
+        let ts = 1_700_000_000u64;
+        let mac = compute_data_rpc_mac_hex(secret, "DeleteChunk", ts, "cid");
+        assert!(!verify_mgr_rpc_auth(
+            secret,
+            "DeleteFile",
+            &ts.to_string(),
+            &mac,
+            "/x",
+            ts
+        ));
+    }
+
+    #[test]
+    fn mgr_rpc_mac_empty_secret_is_legacy_skip() {
+        assert!(verify_mgr_rpc_auth("", "DeleteFile", "", "", "/x", 0));
+        assert!(stamp_mgr_rpc_auth("", "CreateFile", "/x").is_none());
+    }
+
+    #[test]
+    fn stamp_mgr_rpc_auth_produces_verifiable_pair() {
+        let secret = "s";
+        let (ts, mac) = stamp_mgr_rpc_auth(secret, "CreateFile", "/y").unwrap();
+        let now: u64 = ts.parse().unwrap();
+        assert!(verify_mgr_rpc_auth(
+            secret, "CreateFile", &ts, &mac, "/y", now
+        ));
     }
 }

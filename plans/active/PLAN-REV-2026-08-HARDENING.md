@@ -196,6 +196,31 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
   commits are one logical change to a single file and git offers no clean way
   to split a paragraph across commits.
 
+- **Merged origin/master @ ef78945** — 2026-08-23. Twelve upstream commits,
+  mostly the LIS security push. Two textual conflicts, both resolved in
+  upstream's favour where the code was identical:
+  - `scheduler.rs` — comment-only. LIS-41 made the SAME `live_replica_tier`
+    change in `check_anchor_lag` that REV-3-7 did, so upstream's comment was
+    kept and the duplicate dropped. REV-3-7's other two sites
+    (`check_misplaced_rebalance`, the state-machine anchor-survivor scan) were
+    NOT covered by LIS-41 and remain this branch's contribution; verified all
+    three are health-aware exactly once.
+  - `tests/release/run.sh` — `QUICK_CASES`, resolved as the union.
+  Non-conflict fixups the merge could not see:
+  - release cases renumbered 76/77/78/79 -> **83/84/85/86**: upstream took
+    76-82 for the security cases and had just cleaned up a numbering collision;
+    reintroducing one would have been rude. Docs table updated.
+  - case 86 now sends `X-Dtfs-Shared-Secret` (LIS-18 auth-gates mutating REST),
+    otherwise its config POST would be refused as unauthenticated and the case
+    would never reach the validation path it exists to test. It fails loudly on
+    401/403 rather than silently passing.
+  - verified the WebUI escaping survived: zero unescaped `${...}` in the
+    production half of `webui.rs` (the apparent hits are the assertion list
+    inside the test module), including upstream's new session-secret code.
+  Merged tree green: `cargo test --workspace --release` — dtfs-manager 345,
+  dtfs-raft 88, dtfs-data 98, dtfs-common 98, dtfs-fuse 61, dtfs-client 31,
+  dtfs-cli 12; 0 failed.
+
 ## Deviations
 
 - 2026-08-21: builder VM unreachable; verification moved to local WSL Ubuntu.
