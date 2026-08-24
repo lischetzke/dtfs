@@ -38,7 +38,8 @@ QUICK_CASES="00-prereqs 01-basic-write-read 02-replica-placement \
              76-empty-shared-secret-refused 78-down-replica-not-live-coverage \
              79-mutating-rest-auth 80-data-rpc-auth \
              81-mgr-metadata-grpc-auth 82-data-rpc-auth-reads \
-             83-sparse-chunk-index-read 85-unaligned-write-integrity"
+             83-sparse-chunk-index-read 85-unaligned-write-integrity \
+             87-listchunks-paging-incremental 89-write-slots-no-phantom-cache"
 
 # Chaos subset = hypervisor-level + cross-DC + balance cases. Needs the 3dc
 # lab; the PVE-destructive ones additionally need ALLOW_PVE_CHAOS=1 + PVE_TOKEN
