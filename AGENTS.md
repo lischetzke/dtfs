@@ -519,8 +519,16 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   rebalance). `advance_tasks` drives the task state machine each 30s tick;
   U3 made it multi-transition-per-tick (round loop until no progress, so a
   chunk climbs Pending->Done in ONE tick) + bounded-parallel copy
-  (`MIGRATION_COPY_CONCURRENCY`=6 in-flight `ReplicateChunk` RPCs;
-  `MAX_ADVANCE_ROUNDS`=8 guard). The transition logic lives in the generic
+  (`MIGRATION_COPY_CONCURRENCY`=6 in-flight `ReplicateChunk` RPCs globally;
+  WI-04 added `MIGRATION_COPIES_PER_TARGET`=2 in-flight against any ONE
+  target address, gated by a per-round `HashMap<tgt_addr, Semaphore>` built
+  fresh in `advance_round` — every anchor-repair copy targets the single
+  LELI anchor node, so without the per-target gate the global cap
+  fair-shared one 40 Mbps link 6 ways and no single copy finished before its
+  deadline; the permit is acquired BEFORE the RPC so the deadline starts
+  only once the copy actually begins, and the gate queues surplus jobs, it
+  never drops them; `MAX_ADVANCE_ROUNDS`=8 guard). The transition logic
+  lives in the generic
   `advance_migration_tasks` over the `MigrationOps` trait
   (`TaskScheduler` is the live impl; unit-tested via a mock in
   `advance_round_tests`); a task still attempts at most one copy + one
@@ -532,9 +540,33 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   `advance_tasks`, so a large terminal backlog (prod 2026-06-10: 2439 Failed
   tasks after the Bug CM wedge) starved its own GC and every leader reloaded
   the poison; (b) each `replicate_chunk`/`verify_chunk` RPC is wall-clock
-  bounded by `MIGRATION_RPC_TIMEOUT` (60s) — without it a stalled data node
-  hung the `buffer_unordered` copy round and the whole scheduler loop after
-  one leader-onset pass. So the pre-tick prune may add a SECOND
+  bounded — without it a stalled data node hung the `buffer_unordered` copy
+  round and the whole scheduler loop after one leader-onset pass. WI-04:
+  `verify_chunk` stays on the fixed `MIGRATION_RPC_TIMEOUT` (60s — it
+  re-hashes a file already local to the target, no bytes cross the wire, so
+  it doesn't scale with the link); `replicate_chunk` is bounded by
+  `dtfs_common::replication::migration_rpc_timeout(chunk_bytes)`, sized from
+  the chunk's own byte count (`chunk_size_in_any_file`, looked up alongside
+  the Bug AE orphan guard) = **60s at the 4 MB default chunk (Bug CN's bound
+  preserved exactly)**, scaling at 1 MiB/s to a hard **300s** ceiling, and
+  always strictly greater than the data node's own inner
+  `replicate_transfer_timeout(chunk_bytes)` budget for the same copy
+  (`dtfs-data/src/replication.rs::replicate_to`; **30s** floor, **270s**
+  ceiling). **B4:** PRE-WI-04 the two were unrelated fixed
+  constants and INVERTED — a fixed 60s outer deadline under a fixed 120s
+  inner one made the callee's own timeout dead code at every chunk size,
+  since the manager always aborted first (dropping a partial transfer the
+  source still considered healthy). WI-04's first cut removed the inversion
+  the wrong way round: it kept the 120s inner floor and derived the outer
+  from it (>= 150s for every chunk, including the 4 MB default), which
+  restored outer > inner but walked back Bug CN's bound. The landed fix
+  LOWERED the inner floor (120s -> 30s) rather than raising the outer, so
+  Bug CN's 60s bound holds again at the default chunk size;
+  both budgets are additionally capped (inner 270s, outer 300s) so a
+  128 MB-chunk volume can't park an advance round for minutes either. The
+  inner deadline MUST stay strictly below the outer at every chunk size,
+  including at the cap boundary — that inversion must never come back. So
+  the pre-tick prune may add a SECOND
   `save_migration_state` Raft write when it drops tasks; steady-state is still
   one. **CO-3-5:** `tick` and `schedule_replication` both load-modify-save the
   migration state; both hold the `migration_state_lock` (`tokio::Mutex`)
@@ -649,6 +681,21 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   badge prompt); GETs stay open; 401/403 surfaced in-page.
 - `dtfs-data/src/server.rs::put_chunk` — streaming put path; LIS-19/LIS-55/LIS-83
   `require_data_rpc_auth` gates Put/Delete/Replicate/Get/List/VerifyChunk.
+- `dtfs-data/src/replication.rs::replicate_to` — push-replication engine
+  (source node streams a chunk to a replica target in ~1 MiB pieces, Bug CI).
+  WI-04: its own transfer timeout (connect + stream + remote commit + CO-5-4
+  hash validation) is `dtfs_common::replication::replicate_transfer_timeout
+  (total)`, sized from the chunk's on-disk byte count (30s floor, 270s
+  ceiling, B4), not a fixed constant.
+- `dtfs-common/src/replication.rs` — WI-04 shared replication-deadline
+  helpers (`replicate_transfer_timeout`, `migration_rpc_timeout`); the one
+  home for the outer(manager)-vs-inner(data node) deadline pair since
+  `dtfs-manager` does not depend on `dtfs-data`. Mirrors
+  `dtfs-raft/src/network.rs::snapshot_rpc_timeout` (CO-3-6). B4: inner budget
+  `REPLICATE_TIMEOUT_FLOOR` 30s / `REPLICATE_TIMEOUT_CEILING` 270s; outer
+  adds the unchanged 30s `MIGRATION_RPC_MARGIN`, capped at
+  `MIGRATION_RPC_CEILING` 300s — 60s outer at the 4 MB default chunk, 300s
+  outer at >=270 MB, strictly above the inner at every size.
 - `dtfs-common/src/crypto.rs` — join HMAC + LIS-19/LIS-55/LIS-83
   `stamp_data_rpc_auth` / `verify_data_rpc_auth` /
   `data_rpc_replicate_binding` + LIS-56 `stamp_mgr_rpc_auth` /

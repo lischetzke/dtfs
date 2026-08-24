@@ -46,6 +46,15 @@ const MAX_MIGRATION_ATTEMPTS: u32 = 6;
 /// (cheap, and Completing writes Raft).
 const MIGRATION_COPY_CONCURRENCY: usize = 6;
 
+/// WI-04 — max concurrent `ReplicateChunk` RPCs aimed at ONE target node
+/// address, on top of the global `MIGRATION_COPY_CONCURRENCY` cap. Anchor
+/// repair sends every copy to the single LELI `data-primary01` (A.3.4), so
+/// without a per-target cap the global cap of 6 fair-shares one 40 Mbps
+/// link six ways and no single copy ever finishes before the (now
+/// size-scaled) RPC deadline. 2 keeps each copy at ~2.5 MB/s, a 2.5x margin
+/// over the 1 MiB/s budget `dtfs_common::replication` assumes.
+const MIGRATION_COPIES_PER_TARGET: usize = 2;
+
 /// U3 — hard cap on `advance_tasks` rounds within one tick. The round loop
 /// normally terminates when a pass makes no progress; this cap is a
 /// belt-and-braces guard against an unforeseen oscillation (e.g. a chunk
@@ -55,16 +64,24 @@ const MIGRATION_COPY_CONCURRENCY: usize = 6;
 /// the worst case.
 const MAX_ADVANCE_ROUNDS: usize = 8;
 
-/// Bug CN — hard wall-clock cap on a single ReplicateChunk / VerifyChunk RPC
-/// from the scheduler to a data node. WITHOUT this the orchestrating RPC could
-/// block forever when a source/target data node stalls mid-stream (cross-DC
-/// flaky link, swap-thrashing node): `buffer_unordered` then never drains, the
-/// advance round never finishes, the tick never reaches `save`, and the whole
-/// scheduler loop hangs after one leader-onset pass (prod 2026-06-10 — the
-/// 2439-task backlog wedged the scheduler this way). On timeout the copy is
-/// treated as a failed attempt and retried next tick, so the loop keeps
-/// breathing. Generous (a 4 MB chunk over the ≤40 Mbps LELI link is ~1 s; 60 s
-/// only trips on a genuine stall).
+/// Bug CN — hard wall-clock cap on a VerifyChunk RPC from the scheduler to a
+/// data node. WITHOUT this the orchestrating RPC could block forever when a
+/// target data node stalls (cross-DC flaky link, swap-thrashing node):
+/// `buffer_unordered` then never drains, the advance round never finishes,
+/// the tick never reaches `save`, and the whole scheduler loop hangs after
+/// one leader-onset pass (prod 2026-06-10 — the 2439-task backlog wedged the
+/// scheduler this way). On timeout the attempt is treated as failed and
+/// retried next tick, so the loop keeps breathing.
+///
+/// WI-04 / B4 — VerifyChunk only. `ReplicateChunk` moved off this fixed
+/// constant onto `dtfs_common::replication::migration_rpc_timeout(chunk_bytes)`
+/// = 60s at the 4 MB default chunk, scaling at 1 MiB/s to a hard 300s
+/// ceiling — always strictly above the data node's own inner
+/// `replicate_transfer_timeout(chunk_bytes)` (30s floor, 270s ceiling) for
+/// the same copy, so the callee always gives up first. VerifyChunk
+/// re-hashes a file already local to the target — no chunk bytes cross the
+/// wire — so it does not scale with the link and stays on this fixed,
+/// generous (60s) cap.
 const MIGRATION_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A replication task tracked by the scheduler.
@@ -988,10 +1005,12 @@ impl TaskScheduler {
         // U3 — drive the task state machine in rounds so a chunk can go
         // Pending -> Copying -> Verifying -> Completing -> Done within ONE
         // tick (pre-U3 each round was the whole 30s tick), and fan the
-        // Copying `replicate_chunk` calls out bounded-parallel. Each copy /
-        // verify RPC is wall-clock bounded (Bug CN `MIGRATION_RPC_TIMEOUT`) so
-        // a stalled data node can't hang a round (and the loop). The terminal-
-        // task prune runs at the START of `tick` (Bug CN), not here.
+        // Copying `replicate_chunk` calls out bounded-parallel (globally, and
+        // WI-04 per-target). Each copy RPC is wall-clock bounded by
+        // `dtfs_common::replication::migration_rpc_timeout`; each verify RPC
+        // by the fixed `MIGRATION_RPC_TIMEOUT` (Bug CN) — so a stalled data
+        // node can't hang a round (and the loop). The terminal-task prune
+        // runs at the START of `tick` (Bug CN), not here.
         advance_migration_tasks(self, state, now_ms).await;
     }
 
@@ -1080,6 +1099,7 @@ impl TaskScheduler {
         chunk_id: &str,
         target_addr: &str,
         target_tier: &str,
+        chunk_bytes: u64,
     ) -> anyhow::Result<()> {
         // Bug W (part 2) — `source_addr` is `NodeInfo.grpc_addr`, which the
         // RegisterNode path stores already as a full URL ("http://ip:port").
@@ -1087,11 +1107,16 @@ impl TaskScheduler {
         // `http://http://...:9500` — tonic rejected this with a generic
         // "transport error" that silenced every migration in Plexmedia.
         let endpoint = normalize_endpoint(source_addr);
-        // Bug CN — hard timeout the connect + streaming RPC so a stalled
-        // source/target node can't hang the advance round (and the whole
-        // scheduler loop) indefinitely. CF-6 — the connect goes through the
-        // resolved [tls] context (mTLS when enabled).
-        let resp = tokio::time::timeout(MIGRATION_RPC_TIMEOUT, async {
+        // Bug CN / WI-04 — hard timeout the connect + streaming RPC so a
+        // stalled source/target node can't hang the advance round (and the
+        // whole scheduler loop) indefinitely. The budget scales with
+        // `chunk_bytes` and is always strictly greater than the data node's
+        // own inner transfer budget for the same copy (see
+        // `dtfs_common::replication`), so the callee always gives up first.
+        // CF-6 — the connect goes through the resolved [tls] context (mTLS
+        // when enabled).
+        let budget = dtfs_common::replication::migration_rpc_timeout(chunk_bytes);
+        let resp = tokio::time::timeout(budget, async {
             let mut client = self.tls.connect(&endpoint)
                 .await
                 .map(DataServiceClient::new)
@@ -1128,7 +1153,7 @@ impl TaskScheduler {
             anyhow::anyhow!(
                 "ReplicateChunk to {} timed out after {:?}",
                 target_addr,
-                MIGRATION_RPC_TIMEOUT
+                budget
             )
         })??;
 
@@ -1367,16 +1392,18 @@ impl TaskScheduler {
         }
     }
 
-    /// Bug AE — quick existence check for a chunk hash across every file in
-    /// the metadata tree. Returns true iff at least one `FileMetadata`
-    /// references the chunk. Used to detect orphan migration tasks: when
-    /// the underlying file has been unlinked or the source disk wiped, the
-    /// task's chunk_id is no longer reachable from any live file and we
-    /// should stop retrying it. Delegates to the pure helper
-    /// `chunk_in_any_file` so the predicate logic is unit-testable.
-    async fn chunk_exists_anywhere(&self, chunk_hash: &str) -> bool {
+    /// Bug AE / WI-04 — quick existence + size lookup for a chunk hash
+    /// across every file in the metadata tree. `None` iff no
+    /// `FileMetadata` references the chunk (orphan); `Some(bytes)` is the
+    /// chunk's recorded size, used to size the replication RPC deadlines.
+    /// Used to detect orphan migration tasks: when the underlying file has
+    /// been unlinked or the source disk wiped, the task's chunk_id is no
+    /// longer reachable from any live file and we should stop retrying it.
+    /// Delegates to the pure helper `chunk_size_in_any_file` so the
+    /// predicate logic is unit-testable.
+    async fn chunk_bytes_anywhere(&self, chunk_hash: &str) -> Option<u64> {
         let sm = self.state_data.read().await;
-        chunk_in_any_file(chunk_hash, &sm.files)
+        chunk_size_in_any_file(chunk_hash, &sm.files)
     }
 
     /// Persist the migration state via the dedicated `UpdateMigrationState`
@@ -2304,21 +2331,27 @@ trait MigrationOps {
     /// Bug CH dispatch guard: can `target_node` possibly receive a copy on
     /// `tier`? `Err(reason)` fast-fails the task to Failed.
     async fn validate_target(&self, target_node: u64, tier: DiskTier) -> Result<(), String>;
-    /// Bug AE orphan guard: is `chunk_id` still referenced by some file?
-    async fn chunk_exists(&self, chunk_id: &str) -> bool;
+    /// Bug AE orphan guard + WI-04 RPC-deadline sizing: is `chunk_id` still
+    /// referenced by some file, and if so how big is it? `None` fast-fails
+    /// the task exactly as the old `chunk_exists() -> false` did (same
+    /// audit, same reason string); `Some(0)` (unknown/legacy size) falls
+    /// back to the floor in `dtfs_common::replication`.
+    async fn chunk_bytes(&self, chunk_id: &str) -> Option<u64>;
     /// F-015: pick a healthy node holding `chunk_id` (optionally excluding
     /// one), returning `(node_id, grpc_addr)`.
     async fn resolve_source(&self, chunk_id: &str, exclude: Option<u64>) -> Option<(u64, String)>;
     /// gRPC address of `node_id`, if registered.
     async fn target_addr(&self, node_id: u64) -> Option<String>;
-    /// The parallelizable RPC: copy `chunk_id` from `src_addr` to
-    /// `tgt_addr`, landing on `tier_str`. Independent per task.
+    /// The parallelizable RPC: copy `chunk_id` (`chunk_bytes` long) from
+    /// `src_addr` to `tgt_addr`, landing on `tier_str`. Independent per
+    /// task.
     async fn replicate(
         &self,
         src_addr: &str,
         chunk_id: &str,
         tgt_addr: &str,
         tier_str: &str,
+        chunk_bytes: u64,
     ) -> Result<(), String>;
     /// VerifyChunk on the target. `Ok(false)` = checksum mismatch.
     async fn verify(&self, tgt_addr: &str, chunk_id: &str) -> Result<bool, String>;
@@ -2336,8 +2369,8 @@ impl MigrationOps for TaskScheduler {
         validate_task_target(sm.nodes.get(&target_node), tier).map_err(|s| s.to_string())
     }
 
-    async fn chunk_exists(&self, chunk_id: &str) -> bool {
-        self.chunk_exists_anywhere(chunk_id).await
+    async fn chunk_bytes(&self, chunk_id: &str) -> Option<u64> {
+        self.chunk_bytes_anywhere(chunk_id).await
     }
 
     async fn resolve_source(&self, chunk_id: &str, exclude: Option<u64>) -> Option<(u64, String)> {
@@ -2354,8 +2387,9 @@ impl MigrationOps for TaskScheduler {
         chunk_id: &str,
         tgt_addr: &str,
         tier_str: &str,
+        chunk_bytes: u64,
     ) -> Result<(), String> {
-        self.replicate_chunk(src_addr, chunk_id, tgt_addr, tier_str)
+        self.replicate_chunk(src_addr, chunk_id, tgt_addr, tier_str, chunk_bytes)
             .await
             .map_err(|e| format!("ReplicateChunk error: {e}"))
     }
@@ -2403,6 +2437,10 @@ struct CopyJob {
     src_addr: String,
     tgt_addr: String,
     tier_str: String,
+    /// WI-04 — the chunk's byte count, looked up once (alongside the Bug AE
+    /// orphan guard) and carried through to `replicate` so the RPC deadline
+    /// scales with it.
+    chunk_bytes: u64,
 }
 
 /// U3 — drive every non-terminal task through its state machine, looping in
@@ -2512,29 +2550,34 @@ async fn advance_round<O: MigrationOps>(
         }
 
         // Bug AE — drop orphan tasks whose chunk no longer exists anywhere.
-        if !ops.chunk_exists(&chunk_id).await {
-            let reason = "chunk no longer exists (orphan task from \
-                          pre-wipe or unlinked file)"
-                .to_string();
-            warn!(
-                task_id = %task_id,
-                chunk = %chunk_id,
-                "Bug AE: dropping orphan migration task — {}",
-                reason
-            );
-            if let Some(task) = state.tasks.get_mut(task_id) {
-                task.status = MigrationStatus::Failed;
-                task.last_error = Some(reason.clone());
-                task.updated_at_ms = now_ms;
+        // WI-04: this lookup also gives us the chunk's byte count, carried
+        // into the CopyJob to size the replication RPC deadline.
+        let chunk_bytes = match ops.chunk_bytes(&chunk_id).await {
+            Some(b) => b,
+            None => {
+                let reason = "chunk no longer exists (orphan task from \
+                              pre-wipe or unlinked file)"
+                    .to_string();
+                warn!(
+                    task_id = %task_id,
+                    chunk = %chunk_id,
+                    "Bug AE: dropping orphan migration task — {}",
+                    reason
+                );
+                if let Some(task) = state.tasks.get_mut(task_id) {
+                    task.status = MigrationStatus::Failed;
+                    task.last_error = Some(reason.clone());
+                    task.updated_at_ms = now_ms;
+                }
+                ops.audit(
+                    "migration.orphan_dropped",
+                    &format!("task={task_id} chunk={chunk_id}"),
+                    &reason,
+                );
+                progressed = true;
+                continue;
             }
-            ops.audit(
-                "migration.orphan_dropped",
-                &format!("task={task_id} chunk={chunk_id}"),
-                &reason,
-            );
-            progressed = true;
-            continue;
-        }
+        };
 
         let target_addr = ops.target_addr(target_node).await;
         // Bug BO-1: for a same-node cross-tier anchor copy, don't exclude
@@ -2551,6 +2594,7 @@ async fn advance_round<O: MigrationOps>(
                     src_addr,
                     tgt_addr,
                     tier_str: tier.to_string(),
+                    chunk_bytes,
                 });
             }
             (None, _) => {
@@ -2571,14 +2615,51 @@ async fn advance_round<O: MigrationOps>(
     }
 
     // Dispatch the planned copies, at most MIGRATION_COPY_CONCURRENCY in
-    // flight. Each future is independent (distinct task/chunk/target).
+    // flight globally, and at most MIGRATION_COPIES_PER_TARGET against any
+    // one target address (WI-04) — every anchor-repair copy targets the
+    // single LELI anchor node, so without the per-target gate the global
+    // cap fair-shares one 40 Mbps link N ways and no copy finishes before
+    // its deadline. Each future is independent (distinct task/chunk/target).
     if !jobs.is_empty() {
+        // CO-3-5 — this map is local to the round, never scheduler state;
+        // it does not outlive this call and holds no lock across an await
+        // taken elsewhere. Permits are per-round, not per-tick: a fresh
+        // Semaphore is built here (not carried across `advance_round`
+        // calls), which is fine because a task gets at most one copy
+        // attempt per call (the `copied` guard) — there is no cross-round
+        // contention to preserve.
+        let mut gates: std::collections::HashMap<String, Arc<tokio::sync::Semaphore>> =
+            std::collections::HashMap::new();
+        for job in &jobs {
+            gates
+                .entry(job.tgt_addr.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MIGRATION_COPIES_PER_TARGET)));
+        }
+
         let results: Vec<(String, u64, Result<(), String>)> = stream::iter(jobs)
-            .map(|job| async move {
-                let r = ops
-                    .replicate(&job.src_addr, &job.chunk_id, &job.tgt_addr, &job.tier_str)
-                    .await;
-                (job.task_id, job.resolved_source, r)
+            .map(|job| {
+                // Safe to unwrap: every job's tgt_addr was inserted above.
+                let gate = gates.get(&job.tgt_addr).expect("gate for tgt_addr").clone();
+                async move {
+                    // Acquiring the per-target permit BEFORE dispatching the
+                    // RPC is load-bearing: the RPC's own deadline must start
+                    // only once the copy actually begins, not while queued
+                    // behind other copies to the same target.
+                    let _permit = gate
+                        .acquire_owned()
+                        .await
+                        .expect("gate semaphore is never closed");
+                    let r = ops
+                        .replicate(
+                            &job.src_addr,
+                            &job.chunk_id,
+                            &job.tgt_addr,
+                            &job.tier_str,
+                            job.chunk_bytes,
+                        )
+                        .await;
+                    (job.task_id, job.resolved_source, r)
+                }
             })
             .buffer_unordered(MIGRATION_COPY_CONCURRENCY)
             .collect()
@@ -4048,10 +4129,13 @@ pub(crate) fn rpc_error_indicates_chunk_missing(error_message: &str) -> bool {
     error_message.contains("Chunk not found")
 }
 
-/// Pure helper for `chunk_exists_anywhere`. Returns true iff `chunk_hash`
-/// appears in any `FileMetadata.chunks` entry across the supplied `files`
-/// map. The async caller pulls the state-machine read lock; this function
-/// stays sync so it's trivially unit-testable without a tokio runtime.
+/// Returns true iff `chunk_hash` appears in any `FileMetadata.chunks` entry
+/// across the supplied `files` map. The async caller pulls the
+/// state-machine read lock; this function stays sync so it's trivially
+/// unit-testable without a tokio runtime. Retained for its test coverage
+/// and as the orphan predicate `chunk_size_in_any_file` mirrors (WI-04's
+/// `chunk_bytes_anywhere` now uses that instead, since it also needs the
+/// chunk's size).
 #[inline]
 pub(crate) fn chunk_in_any_file(
     chunk_hash: &str,
@@ -4060,6 +4144,25 @@ pub(crate) fn chunk_in_any_file(
     files
         .values()
         .any(|f| f.chunks.iter().any(|c| c.chunk_hash == chunk_hash))
+}
+
+/// WI-04 — pure helper for `chunk_bytes_anywhere`. Returns the largest
+/// `size_bytes` recorded for `chunk_hash` across every `ChunkLocationEntry`
+/// row that references it in `files`, or `None` if no file references the
+/// chunk at all (the same orphan predicate as `chunk_in_any_file`). `max`
+/// is a defensive, never-under-estimate choice — chunks are
+/// content-addressed, so distinct rows for the same hash should agree.
+#[inline]
+pub(crate) fn chunk_size_in_any_file(
+    chunk_hash: &str,
+    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
+) -> Option<u64> {
+    files
+        .values()
+        .flat_map(|f| f.chunks.iter())
+        .filter(|c| c.chunk_hash == chunk_hash)
+        .map(|c| c.size_bytes)
+        .max()
 }
 
 // ---------------------------------------------------------------------------
@@ -6106,13 +6209,18 @@ mod advance_round_tests {
         verify_calls: AtomicUsize,
         register_calls: AtomicUsize,
         /// Per-stage overrides for failure-path tests.
-        chunk_missing: bool,          // chunk_exists -> false (Bug AE)
+        chunk_missing: bool,          // chunk_bytes -> None (Bug AE)
         invalid_target: bool,         // validate_target -> Err (Bug CH)
         no_source: bool,              // resolve_source -> None
         verify_result: VerifyMode,
         replicate_err: Option<String>,
         audited: Mutex<Vec<(String, String)>>, // (action, outcome)
         failed_alerts: AtomicUsize,
+        /// WI-04 — when true, `target_addr` returns a distinct address per
+        /// `node_id` (`http://tgt{n}:9500`) instead of one shared address,
+        /// so `copies_across_targets_use_the_global_cap` can prove the
+        /// per-target gate doesn't degrade into a global throttle.
+        distinct_targets: bool,
     }
 
     #[derive(Clone, Copy, Default)]
@@ -6131,8 +6239,12 @@ mod advance_round_tests {
                 Ok(())
             }
         }
-        async fn chunk_exists(&self, _c: &str) -> bool {
-            !self.chunk_missing
+        async fn chunk_bytes(&self, _c: &str) -> Option<u64> {
+            if self.chunk_missing {
+                None
+            } else {
+                Some(4 << 20)
+            }
         }
         async fn resolve_source(&self, _c: &str, _ex: Option<u64>) -> Option<(u64, String)> {
             if self.no_source {
@@ -6141,8 +6253,12 @@ mod advance_round_tests {
                 Some((1, "http://src:9500".to_string()))
             }
         }
-        async fn target_addr(&self, _n: u64) -> Option<String> {
-            Some("http://tgt:9500".to_string())
+        async fn target_addr(&self, n: u64) -> Option<String> {
+            if self.distinct_targets {
+                Some(format!("http://tgt{n}:9500"))
+            } else {
+                Some("http://tgt:9500".to_string())
+            }
         }
         async fn replicate(
             &self,
@@ -6150,6 +6266,7 @@ mod advance_round_tests {
             _chunk: &str,
             _tgt: &str,
             _tier: &str,
+            _bytes: u64,
         ) -> Result<(), String> {
             self.replicate_calls.fetch_add(1, Ordering::SeqCst);
             // Track peak concurrency: enter, yield enough that buffer_unordered
@@ -6212,6 +6329,28 @@ mod advance_round_tests {
         s
     }
 
+    /// WI-04 — like `pending_task`, but pinned to an explicit `target_node`
+    /// so a test can control how many distinct targets a batch spreads
+    /// over (with `MockOps::distinct_targets`, `target_addr` derives a
+    /// unique address per node id).
+    fn pending_task_to(n: usize, target_node: u64) -> ReplicationTask {
+        let mut t = pending_task(n);
+        t.target_node = target_node;
+        t
+    }
+
+    /// WI-04 — `n` tasks, each targeting a DISTINCT node id (100..100+n),
+    /// for `copies_across_targets_use_the_global_cap`.
+    fn state_with_targets(n: usize) -> MigrationState {
+        let mut s = MigrationState::default();
+        for i in 0..n {
+            let t = pending_task_to(i, 100 + i as u64);
+            s.tasks.insert(t.task_id.clone(), t);
+        }
+        s.next_task_id = n as u64;
+        s
+    }
+
     // Bug CN — a large terminal (Failed) backlog must be GC'd regardless of the
     // advance round. Pre-CN the prune ran AFTER advance_migration_tasks, so a
     // flood backlog starved its own GC (prod 2026-06-10: 2439 Failed cache-
@@ -6265,20 +6404,57 @@ mod advance_round_tests {
         assert_eq!(ops.register_calls.load(Ordering::SeqCst), 10);
     }
 
-    // U3 bounded concurrency: with far more Copying tasks than the cap, no
-    // more than MIGRATION_COPY_CONCURRENCY copies are ever in flight at once.
+    // WI-04 — at most MIGRATION_COPIES_PER_TARGET ReplicateChunk RPCs are
+    // ever in flight against ONE target address, even with far more Copying
+    // tasks than that cap all aimed at the same target (the anchor-repair
+    // shape: every copy lands on the single LELI anchor node). The gate
+    // queues rather than drops: all 50 tasks still reach Done in one call.
     #[tokio::test]
-    async fn copy_concurrency_is_bounded() {
+    async fn copies_to_one_target_are_bounded() {
         let ops = MockOps::default();
-        let mut state = state_with(50);
+        let mut state = state_with(50); // all target_node: 2 -> one tgt_addr
 
         advance_migration_tasks(&ops, &mut state, 1_000).await;
 
         let peak = ops.max_in_flight.load(Ordering::SeqCst);
-        assert!(peak > 1, "copies should run in parallel, peak={peak}");
+        assert!(
+            peak <= MIGRATION_COPIES_PER_TARGET,
+            "peak in-flight to one target {peak} exceeded per-target cap {MIGRATION_COPIES_PER_TARGET}"
+        );
+        assert!(
+            state.tasks.values().all(|t| t.status == MigrationStatus::Done),
+            "all tasks should still reach Done in one call, got {:?}",
+            state.tasks.values().map(|t| t.status).collect::<Vec<_>>()
+        );
+        assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), 50);
+    }
+
+    // WI-04 — the per-target gate must not become a global throttle: spread
+    // the same 50 copies over 50 distinct targets and the peak climbs back
+    // up past the per-target cap, bounded only by the global
+    // MIGRATION_COPY_CONCURRENCY cap.
+    // Supersedes the U3 `copy_concurrency_is_bounded` test, which after
+    // WI-04's per-target gate could only ever observe a peak of 2 (all of
+    // `state_with`'s tasks share `target_node: 2`).
+    #[tokio::test]
+    async fn copies_across_targets_use_the_global_cap() {
+        let ops = MockOps {
+            distinct_targets: true,
+            ..Default::default()
+        };
+        let mut state = state_with_targets(50);
+
+        advance_migration_tasks(&ops, &mut state, 1_000).await;
+
+        let peak = ops.max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak > MIGRATION_COPIES_PER_TARGET,
+            "peak {peak} did not exceed the per-target cap {MIGRATION_COPIES_PER_TARGET} \
+             across distinct targets — the per-target gate degenerated into a global throttle"
+        );
         assert!(
             peak <= MIGRATION_COPY_CONCURRENCY,
-            "peak in-flight {peak} exceeded cap {MIGRATION_COPY_CONCURRENCY}"
+            "peak in-flight {peak} exceeded the global cap {MIGRATION_COPY_CONCURRENCY}"
         );
     }
 
