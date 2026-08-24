@@ -113,7 +113,7 @@ workload) grows it to ~30 GB.
 | tiering `read_windows` / `access_stats` never pruned | **FIXED UPSTREAM** |
 | `ListChunks` re-walks and re-sorts the whole chunk tree **per 1000-item page** | **OPEN** — at ~12.5M chunks that is ~12.5k full walks per orphan sweep; the scrub never finishes and pins the anchor HDD |
 | `check_under_replicated` has no per-tick task cap; one node loss queues one task per chunk into a single Raft entry | **OPEN** |
-| snapshot build/send/receive amplifies the state machine several times in heap | **OPEN, untracked** — was CNF-4, but PLAN-CN-FOLLOWUPS was retired upstream (#89) after its other tasks closed; the heap amplification itself was never fixed |
+| snapshot build/send/receive amplifies the state machine several times in heap | **FIXED UPSTREAM** (CNF-4) — a process-wide `SNAPSHOT_SEND_PERMITS` semaphore caps concurrent sends at 2, and the raw bytes are dropped before the JSON encode so peak heap per send is base64 + JSON rather than raw + base64 + JSON. The base64 double-encode itself was deliberately kept: CNF-4 sanctioned shipping only the concurrency bound if dropping base64 proved wire-incompatible, and the ~2.7x-per-send cost is documented at the constant |
 | FUSE `evict_to_size` full stat sweep per evicted chunk, inline on the read path | **OPEN** |
 
 ---
