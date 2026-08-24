@@ -136,9 +136,29 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
   A.8 updated; `run_monitor_with_cache` deleted). `cache.rs` itself is kept,
   unwired, with a header explaining why it must not be re-wired for whole
   chunks.
-- `REV-4-14` ⬜ `docs/src/access/fuse-mount.md:139` claims a volume without warm
-  caching ignores the `first_write_tier` hint. No such check exists. Fix the doc
-  or implement the valve.
+- `REV-4-14` ✅ docs corrected (the valve was NOT implemented: adding one would
+  be an unrequested behaviour change, and the durability guarantee the doc
+  claimed it provided is already provided by the anchor requirement plus the
+  ack floor). Probing the code turned up two further false claims on the same
+  two pages, all three now fixed in `docs/src/access/fuse-mount.md` and
+  `docs/src/configuration/fuse-client.md`:
+  1. **No `cache_replicas` valve.** `resolve_preferred_tier` looks only at
+     which tiers healthy nodes advertise; it never reads the volume cache
+     policy, so `cache_replicas.warm.max = 0` does not veto a hint.
+  2. **No datacenter affinity.** `place_chunks_with_anchor` builds its rule
+     with `prefer_client_locations: false` and the allocate path never carries
+     the writing client’s location, so `"nearest-warm"` cannot prefer the
+     client’s own DC. The name is aspirational.
+  3. **The anchor copy is usually NOT deferred.** `anchor_datacenter` is passed
+     to the ring as `required_datacenter`, which swaps one slot to an anchor-DC
+     node (tier constraint relaxed for that slot). With an anchor set and an ack
+     floor >= 2 the anchor copy lands in the same allocation; the AV-3-3
+     anchor-lag-repair path only applies when no anchor-DC candidate exists.
+
+  Open gap left deliberately: if DC-local first writes are actually wanted, that
+  is a placement change (thread the requester location into `allocate_chunks`
+  and set `prefer_client_locations`), not a client config change. Not in scope
+  here; the docs now say so instead of implying it already works.
 
 ## Cross-cutting invariants
 
