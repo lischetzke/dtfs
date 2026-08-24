@@ -96,7 +96,8 @@ if [ -n "$CACHE_DIR" ]; then
     client_run "sudo rm -rf '${CACHE_DIR:?}'/*" >/dev/null 2>&1 || true
 fi
 client_run "sudo systemctl start dtfs-fuse@mnt-dtfs.service" >/dev/null 2>&1 || true
-wait_for "FUSE mount back after cache purge" 60 "client_run 'sudo mountpoint -q /mnt/dtfs' >/dev/null 2>&1"
+mount_back() { client_run "sudo mountpoint -q /mnt/dtfs" >/dev/null 2>&1; }
+wait_for 60 "FUSE mount back after cache purge" mount_back
 
 echo "[G] Read after corruption — must still match via replica fallback"
 client_run "sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'" >/dev/null 2>&1 || true
