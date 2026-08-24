@@ -1,4 +1,21 @@
 // ARC (Adaptive Replacement Cache) implementation.
+//
+// REV-4-5 — NOT WIRED INTO THE DATA NODE. `put` has no caller on any
+// live path and never had one: both put_chunk (Bug I) and get_chunk (U2)
+// stream to/from disk in 8 MB pieces precisely so a whole chunk is never
+// held in heap, which is the opposite of what populating this cache
+// would do. It was therefore always empty — the CF-5 ladder's "shrink
+// ARC cache" rung could only evict zero entries, while
+// `[cache] max_memory_mb` was still reserved out of `memory.hard_cap_mb`
+// when sizing put_chunk concurrency (server.rs::plan_write_slots).
+// main.rs no longer constructs it and the budget line is gone.
+//
+// The implementation is kept (self-contained and unit-tested) because
+// it is the obvious building block if the data node ever grows a
+// bounded, small-object cache — e.g. `.meta` records, which are tiny and
+// re-read on every verify_on_read. Do NOT re-wire it for whole chunks
+// without revisiting § A.3.2.
+//
 // Provides in-memory caching for hot chunks with configurable memory limit.
 //
 // ARC uses four lists:

@@ -25,7 +25,12 @@ ensure_client_healthy() {
 
 START=$(date +%s)
 
-for s in "$SCRIPT_DIR"/0[1-9]-*.sh "$SCRIPT_DIR"/10-*.sh; do
+# REV-2-5 — was `0[1-9]-*.sh 10-*.sh`, which silently orphaned every
+# bug-specific regression script from 11 upward (12-fuse-restart-after-crash,
+# 15-bug-av, 16-bug-az, 17-bug-ba, 18-bug-bc, 19-bug-bh, 20-bug-bl, ...).
+# Those are precisely the scripts that pin previously-shipped data-loss fixes,
+# and nothing was running them.
+for s in $(ls "$SCRIPT_DIR"/[0-9][0-9]-*.sh 2>/dev/null | sort); do
     [ -f "$s" ] || continue
     ensure_client_healthy client-01
     ensure_client_healthy client-02

@@ -60,9 +60,16 @@ tier = "cold"
 #path = "/mnt/ssd0"
 #tier = "warm"
 
+# REV-4-5 — INERT for the data role. The in-memory ARC chunk cache is not wired
+# into the read path (every GetChunk streams from disk in pieces, § A.3.2), so
+# these keys are parsed for back-compat and have no effect. They also no longer
+# consume the memory budget: before REV-4-5 the phantom 8 GB default was
+# subtracted when sizing put_chunk slots and collapsed write concurrency to a
+# single slot on a memory-capped node. Client-side read caching is the FUSE
+# local disk cache (`local_cache_dir` in fuse.toml).
 [cache]
-#max_memory_mb = 8192               # ARC read-cache budget
-#policy = "arc"
+#max_memory_mb = 8192               # inert
+#policy = "arc"                     # inert
 
 [scrub]
 # Local fallback only — the manager's [scrub] (ClusterScrubConfig) overrides

@@ -3,10 +3,13 @@
 // Originally lived in dtfs-data (Bug G / Bug V). CF-5 hoisted the
 // role-agnostic core here so dtfs-manager and dtfs-fuse can run the same
 // RSS sampler + pressure ladder without a copy-paste second sampler. The
-// data node keeps its ARC-cache-specific monitor (`run_monitor_with_cache`)
-// in `dtfs-data/src/memory.rs`; manager + fuse poll `pressure_level()` and
-// drive their own cheap ladder rung (skip scheduler ticks / shrink the
-// readahead cache).
+// data node USED to keep an ARC-cache-specific monitor
+// (`run_monitor_with_cache`) in `dtfs-data/src/memory.rs`; REV-4-5 removed it,
+// because the in-memory chunk cache had no `put` caller anywhere in the
+// workspace, so that rung could only ever evict zero bytes while its budget
+// still throttled `put_chunk` slot sizing. Every role now polls
+// `pressure_level()` and drives its own cheap ladder rung (data sheds
+// put_chunk, manager skips scheduler ticks, fuse shrinks the readahead cache).
 //
 // Operators set a per-process RAM ceiling (e.g. `hard_cap_mb = 2048`). A
 // background sampler reads `/proc/self/status` every few seconds and

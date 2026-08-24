@@ -9,11 +9,13 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::cache::ArcCache;
 use crate::memory::MemoryBudget;
 use crate::metrics::DataMetrics;
 use crate::replication::ReplicationManager;
 use crate::store::ChunkStore;
+// REV-4-5 — the last production user of this was the cache-HIT verify
+// path, removed with the phantom ARC cache; the test modules still use it.
+#[cfg(test)]
 use dtfs_common::checksum;
 use dtfs_common::config::ScrubConfig;
 use dtfs_common::crypto::{
@@ -66,7 +68,6 @@ pub struct DataServiceImpl {
     store: Arc<ChunkStore>,
     replication: Arc<ReplicationManager>,
     metrics: Arc<DataMetrics>,
-    cache: Arc<ArcCache>,
     /// Bug D — caps in-flight `put_chunk` operations so peak memory is
     /// bounded. Each in-flight write buffers up to one chunk
     /// (~128 MB by default), so an unbounded gRPC stream count is fatal
@@ -99,6 +100,34 @@ pub struct ServerContext {
     pub max_writes: usize,
 }
 
+/// Bug D / Bug G — worst-case in-memory cost charged per in-flight
+/// put_chunk. The data node has no per-volume chunk-size visibility here,
+/// so this is a conservative 16 MB: 4x the workspace default chunk size
+/// (4 MB) so larger volumes still get a sensible (smaller) slot count
+/// rather than over-allocating slots that would breach the budget.
+/// Streaming put_chunk (Bug I) means the real cost per slot is ~1 MB, so
+/// the estimate is mostly defensive.
+const PUT_CHUNK_SLOT_ESTIMATE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// REV-4-5 — non-put_chunk heap the node must leave headroom for: tonic,
+/// raft and kernel pages. This deliberately does NOT include
+/// `cache.max_memory_mb`: the data node has no server-side chunk cache
+/// (see the module docs on `crate::cache`), so reserving its configured
+/// budget was pure phantom accounting that strangled write concurrency —
+/// a 768 MB cache line against a 1 GB cap left put_chunk with 1 slot.
+const STATIC_OVERHEAD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Bug D / Bug G — how many put_chunk streams may run concurrently. With
+/// a hard memory cap set, size it from the cap; otherwise fall back to
+/// `grpc.max_concurrent_chunk_writes` (default 8).
+fn plan_write_slots(config: &DataNodeConfig, memory: &MemoryBudget) -> usize {
+    memory.recommend_chunk_write_slots(
+        PUT_CHUNK_SLOT_ESTIMATE_BYTES,
+        STATIC_OVERHEAD_BYTES,
+        config.grpc.max_concurrent_chunk_writes.max(1),
+    )
+}
+
 pub async fn run_grpc_server(
     config: DataNodeConfig,
     // CF-6 — resolved [tls] context; when enabled the listener requires a
@@ -106,7 +135,6 @@ pub async fn run_grpc_server(
     tls: dtfs_common::tls::TlsContext,
     store: Arc<ChunkStore>,
     metrics: Arc<DataMetrics>,
-    cache: Arc<ArcCache>,
     memory: Arc<MemoryBudget>,
     scrub_config: Arc<RwLock<ScrubConfig>>,
     integrity_faults: Arc<crate::integrity::IntegrityFaultCollector>,
@@ -120,29 +148,13 @@ pub async fn run_grpc_server(
         tls.clone(),
     ));
 
-    // Bug D / Bug G — derive the put_chunk concurrency limit. If the
-    // operator set a hard memory cap, recommend a slot count that fits
-    // alongside the ARC cache + tonic + raft overhead. Otherwise fall
-    // back to whatever they configured in `grpc.max_concurrent_chunk_writes`
-    // (default 8). The data node doesn't have per-volume chunk size
-    // visibility here, so we use a conservative worst-case estimate of
-    // 16 MB: 4× the workspace default chunk size (4 MB) so larger
-    // volumes still get a sensible (smaller) slot count rather than
-    // over-allocating slots that would breach the memory budget.
-    // Streaming put_chunk (Bug I) means the actual in-memory cost per
-    // slot is ~1 MB, so this estimate is mostly defensive.
-    let chunk_size_bytes: u64 = 16 * 1024 * 1024;
-    // Overhead estimate: ARC cache + 256 MB for tonic/raft/kernel pages.
-    let static_overhead_bytes =
-        (config.cache.max_memory_mb as u64) * 1024 * 1024 + 256 * 1024 * 1024;
-    let fallback_slots = config.grpc.max_concurrent_chunk_writes.max(1);
-    let max_writes =
-        memory.recommend_chunk_write_slots(chunk_size_bytes, static_overhead_bytes, fallback_slots);
+    // Bug D / Bug G — derive the put_chunk concurrency limit.
+    let max_writes = plan_write_slots(&config, &memory);
     if memory.hard_cap_bytes() > 0 {
         tracing::info!(
             cap_mb = memory.hard_cap_bytes() / 1024 / 1024,
-            chunk_mb = chunk_size_bytes / 1024 / 1024,
-            overhead_mb = static_overhead_bytes / 1024 / 1024,
+            chunk_mb = PUT_CHUNK_SLOT_ESTIMATE_BYTES / 1024 / 1024,
+            overhead_mb = STATIC_OVERHEAD_BYTES / 1024 / 1024,
             slots = max_writes,
             "Bug G memory budget engaged: sized put_chunk slots from hard cap"
         );
@@ -167,7 +179,6 @@ pub async fn run_grpc_server(
         store,
         replication,
         metrics,
-        cache,
         write_slots,
         memory,
         scrub_config,
@@ -349,93 +360,6 @@ fn stream_file(
     ReceiverStream::new(rx)
 }
 
-impl DataServiceImpl {
-    /// U2 — stream an already-resident in-memory chunk (cache HIT) in
-    /// `GET_PIECE_SIZE` pieces. The buffer already exists in heap, so
-    /// slicing it costs nothing extra.
-    fn stream_bytes(
-        &self,
-        data: bytes::Bytes,
-    ) -> ReceiverStream<Result<GetChunkResponse, Status>> {
-        let (tx, rx) = mpsc::channel(GET_CHANNEL_DEPTH);
-        tokio::spawn(async move {
-            let total = data.len();
-            let mut offset = 0;
-            while offset < total {
-                let end = std::cmp::min(offset + GET_PIECE_SIZE, total);
-                let resp = GetChunkResponse {
-                    data: data.slice(offset..end).to_vec(),
-                    offset: offset as u64,
-                    total_size: total as u64,
-                };
-                if tx.send(Ok(resp)).await.is_err() {
-                    break;
-                }
-                offset = end;
-            }
-        });
-        ReceiverStream::new(rx)
-    }
-
-    /// Bug BC-8 — verify a cache-HIT chunk against its stored meta before
-    /// the bytes leave the process. Records the integrity fault (BF-3) and
-    /// returns DATA_LOSS on mismatch / missing meta so the FUSE client
-    /// falls over to a healthy replica (P0-2).
-    async fn verify_cached_or_fault(
-        &self,
-        chunk_id: &ChunkId,
-        chunk_hex: &str,
-        data: &[u8],
-    ) -> Result<(), Status> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let expected = match self.store.get_chunk_meta(chunk_id).await {
-            Ok(m) => m.checksum,
-            Err(_) => {
-                self.integrity_faults.record(crate::integrity::IntegrityFault {
-                    chunk_id: chunk_hex.to_string(),
-                    observed_at_ms: now_ms,
-                    detector: "verify_on_read_meta_absent".into(),
-                    expected_len: 0,
-                    actual_len: data.len() as u64,
-                    expected_hash: String::new(),
-                    actual_hash: String::new(),
-                });
-                return Err(Status::data_loss(format!(
-                    "verify_on_read: meta absent for chunk {chunk_hex}"
-                )));
-            }
-        };
-        if !checksum::verify(data, &expected) {
-            let actual_hex = hex::encode(checksum::compute(data));
-            tracing::error!(
-                chunk_id = %chunk_hex,
-                actual = %actual_hex,
-                "Bug BC-8: read.integrity_fault — BLAKE3 mismatch \
-                 against stored meta (cached). Refusing to serve."
-            );
-            self.integrity_faults.record(crate::integrity::IntegrityFault {
-                chunk_id: chunk_hex.to_string(),
-                observed_at_ms: now_ms,
-                detector: "verify_on_read".into(),
-                expected_len: 0,
-                actual_len: data.len() as u64,
-                expected_hash: hex::encode(expected),
-                actual_hash: actual_hex,
-            });
-            // Note: ArcCache has no per-key invalidate. The cached entry
-            // ages out via LRU; meanwhile every subsequent read hits this
-            // same check and refuses, so a corrupt byte never escapes.
-            return Err(Status::data_loss(format!(
-                "verify_on_read mismatch on chunk {chunk_hex}"
-            )));
-        }
-        Ok(())
-    }
-}
-
 #[tonic::async_trait]
 impl DataService for DataServiceImpl {
     type GetChunkStream = ReceiverStream<Result<GetChunkResponse, Status>>;
@@ -603,13 +527,7 @@ impl DataService for DataServiceImpl {
         // and the dashboard "↑ Write" showed 0 B/s under any load.
         self.metrics.record_write(total_size);
 
-        // Bug I — do NOT insert the just-written chunk into the ARC
-        // cache. Caching every write defeats the streaming-to-disk
-        // memory win (it puts the whole chunk back in RAM). Cold-read
-        // performance is unchanged; the first reader pulls from disk
-        // and populates the cache then.
         let id_hex = chunk_id.as_hex();
-        let _ = &self.cache; // intentionally unused on the write path
 
         Ok(Response::new(PutChunkResponse {
             chunk_id: id_hex,
@@ -620,10 +538,11 @@ impl DataService for DataServiceImpl {
         }))
     }
 
-    /// Bug BC-6 — enumerate every chunk_id this data node holds.
-    /// Walks each configured disk's `chunks/aa/bb/<id>.dat` tree,
-    /// collects stems whose `.meta` companion also exists, applies
-    /// the page_token cursor + limit, and returns the slice.
+    /// Bug BC-6 — enumerate the chunk_ids this data node holds, one page
+    /// at a time. Walks each configured disk's `chunks/aa/bb/<id>.dat`
+    /// tree in id order starting from `page_token` (exclusive), collects
+    /// stems whose `.meta` companion also exists, and stops at `limit`
+    /// (REV-3-2: only the buckets the page touches are read).
     /// Used by the manager's orphan_scrub tick (BC-7).
     async fn list_chunks(
         &self,
@@ -640,31 +559,35 @@ impl DataService for DataServiceImpl {
         let req = request.into_inner();
         let limit = if req.limit == 0 { 1000 } else { req.limit as usize };
 
-        // Cheap implementation: enumerate everything, sort, then slice.
-        // A future revision can cache the listing between paged calls
-        // (orphan_scrub typically iterates all pages back-to-back).
-        // Bug CB — carry each chunk's `.dat` mtime alongside its id so the
-        // manager's orphan reaper has a durable grace clock. Sort by id so
-        // the opaque page_token cursor stays stable; the mtime rides along.
-        let mut all: Vec<(String, u64)> = self.store.list_all_chunks_with_mtime().await
+        // REV-3-2 — incremental walk. The pre-fix implementation
+        // enumerated + sorted the ENTIRE chunk tree on every page, so the
+        // manager's orphan scrub (which pages through the whole node) cost
+        // O(N^2) syscalls and spiked an N-sized Vec per page. The on-disk
+        // layout `chunks/<aa>/<bb>/<id>.dat` is already id-sorted, so the
+        // page token maps straight to a position in the walk and a page
+        // reads only the buckets it actually needs.
+        //
+        // Bug CB — each chunk's `.dat` mtime rides along positionally with
+        // its id so the manager's orphan reaper has a durable grace clock.
+        //
+        // Ask for one extra entry so we can tell "page is full and more
+        // remain" (→ emit a token) from "page ends the listing" (→ empty
+        // token), preserving the exact pre-fix page-token semantics.
+        let mut page: Vec<(String, u64)> = self
+            .store
+            .list_chunks_page(&req.page_token, limit.saturating_add(1))
+            .await
             .map_err(|e| Status::internal(format!("list chunks failed: {e}")))?;
-        all.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let start_idx = if req.page_token.is_empty() {
-            0
-        } else {
-            all.binary_search_by(|c| c.0.as_str().cmp(req.page_token.as_str()))
-                .map(|i| i + 1)
-                .unwrap_or_else(|i| i)
-        };
-        let end_idx = (start_idx + limit).min(all.len());
-        let next = if end_idx < all.len() {
-            all[end_idx - 1].0.clone()
+        let has_more = page.len() > limit;
+        if has_more {
+            page.truncate(limit);
+        }
+        let next = if has_more {
+            page.last().map(|c| c.0.clone()).unwrap_or_default()
         } else {
             String::new()
         };
 
-        let page = &all[start_idx..end_idx];
         Ok(Response::new(ListChunksResponse {
             chunk_ids: page.iter().map(|c| c.0.clone()).collect(),
             chunk_mtimes_ms: page.iter().map(|c| c.1).collect(),
@@ -695,7 +618,6 @@ impl DataService for DataServiceImpl {
         let mut id_array = [0u8; 32];
         id_array.copy_from_slice(&chunk_id_bytes);
         let chunk_id = ChunkId::from_bytes(id_array);
-        let key = req.chunk_id.clone();
 
         // P0-9: record this read against the requester's DC for tiering's
         // auto-move-replica-toward-active-DC decisions.
@@ -708,33 +630,13 @@ impl DataService for DataServiceImpl {
 
         let verify_on_read = self.scrub_config.read().await.verify_on_read;
 
-        // Cache HIT — the chunk is already resident in the ARC cache, so
-        // serving it from the in-memory `Bytes` costs no extra heap (the
-        // buffer already exists). Verify against meta (BC-8) before any
-        // bytes leave the process, then stream the in-memory buffer in
-        // 8 MB pieces.
-        if let Some(cached) = self.cache.get(&key) {
-            self.metrics.record_cache_hit();
-
-            if verify_on_read {
-                self.verify_cached_or_fault(&chunk_id, &req.chunk_id, &cached)
-                    .await?;
-            }
-
-            // Bug AL — count this as read traffic (cache hits are still
-            // real reads to the requesting FUSE client).
-            self.metrics.record_read(cached.len() as u64);
-            return Ok(Response::new(self.stream_bytes(cached)));
-        }
-
-        // Cache MISS — U2 (Bug-I parity for the read side). Resolve the
-        // on-disk `.dat` path + size WITHOUT reading the file into heap,
-        // then stream it in pieces. We never hold the whole chunk in RAM
-        // and (like put_chunk, Bug I) do NOT populate the ARC cache here:
-        // caching every cold read would re-buffer the full chunk and
-        // defeat the streaming-to-disk memory win. A hot set re-promoted
-        // by tiering still lands in cache via the HIT path above on
-        // subsequent reads.
+        // REV-4-5 — there is no server-side chunk cache on the data node;
+        // every read streams from disk. U2 (Bug-I parity for the read
+        // side): resolve the on-disk `.dat` path + size WITHOUT reading
+        // the file into heap, then stream it in pieces, so we never hold
+        // a whole chunk in RAM. The client-side caches (FUSE readahead +
+        // local disk cache) are what absorb repeat reads; they report
+        // back via the RecordCacheHit RPC.
         self.metrics.record_cache_miss();
         let (dat_path, total_size) = self
             .store
@@ -1081,7 +983,6 @@ mod chunk_hex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::ArcCache;
     use crate::disk::DiskManager;
     use crate::integrity::IntegrityFaultCollector;
     use crate::metrics::DataMetrics;
@@ -1170,7 +1071,6 @@ max_io_percent = 10
             store,
             replication,
             metrics: Arc::new(DataMetrics::new()),
-            cache: Arc::new(ArcCache::new(64)),
             write_slots: Arc::new(Semaphore::new(8)),
             memory: Arc::new(MemoryBudget::from_config(
                 &dtfs_common::config::MemoryConfig::default(),
@@ -1178,6 +1078,76 @@ max_io_percent = 10
             scrub_config: Arc::new(RwLock::new(scrub_cfg(verify_on_read))),
             integrity_faults: Arc::new(IntegrityFaultCollector::new(64)),
         }
+    }
+
+    // ── REV-4-5 — no phantom ARC-cache budget ──────────────────────
+
+    /// REV-4-5 regression.
+    ///
+    /// Nothing in the workspace ever called `ArcCache::put`, so the
+    /// data-node ARC cache was permanently empty: the CF-5 ladder's
+    /// "shrink ARC cache" rung was a no-op AND `cache.max_memory_mb`
+    /// (512 MB in the shipped examples) was still reserved out of
+    /// `memory.hard_cap_mb` when sizing put_chunk concurrency. On a
+    /// 1 GB-capped node that phantom reservation collapsed the write
+    /// path to a single in-flight chunk.
+    ///
+    /// Invariant: **put_chunk slot sizing does not depend on
+    /// `cache.max_memory_mb`.**
+    #[test]
+    fn rev_4_5_write_slots_ignore_phantom_arc_cache_budget() {
+        let mut small = test_config(std::path::Path::new("/tmp/rev-4-5"));
+        small.memory.hard_cap_mb = 1024;
+        small.cache.max_memory_mb = 16;
+        let mut large = small.clone();
+        large.cache.max_memory_mb = 768;
+
+        let budget = MemoryBudget::from_config(&small.memory);
+        let with_small = plan_write_slots(&small, &budget);
+        let with_large = plan_write_slots(&large, &budget);
+
+        assert_eq!(
+            with_small, with_large,
+            "put_chunk concurrency must not change with the (unused) ARC \
+             cache budget: {with_small} vs {with_large}"
+        );
+        assert!(
+            with_large > 1,
+            "a 1 GB cap must still allow parallel streaming writes; got \
+             {with_large} slot(s) — the phantom cache reservation is back"
+        );
+    }
+
+    /// REV-4-5 — the data node no longer carries a server-side chunk
+    /// cache, so `get_chunk` always streams from disk (Bug I / U2 memory
+    /// parity) and repeat reads of the same chunk stay byte-identical.
+    #[tokio::test]
+    async fn rev_4_5_repeat_reads_stream_from_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+
+        let data = vec![42u8; 4096];
+        let chunk_id = ChunkId::from_bytes(dtfs_common::checksum::compute(&data));
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(
+                &chunk_id,
+                &data,
+                &VolumeId::new("default".to_string()),
+                DiskTier::Hot,
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(collect_stream(&svc, &chunk_hex).await.unwrap(), data);
+        }
+        let snap = svc.metrics.snapshot();
+        assert_eq!(
+            snap.cache_hits, 0,
+            "the data node has no server-side chunk cache; hits must stay 0"
+        );
+        assert_eq!(snap.cache_misses, 3, "every read is served from disk");
     }
 
     async fn collect_stream(
@@ -1550,7 +1520,6 @@ max_io_percent = 10
 #[cfg(test)]
 mod audit_co_tests {
     use super::*;
-    use crate::cache::ArcCache;
     use crate::disk::DiskManager;
     use crate::integrity::IntegrityFaultCollector;
     use crate::metrics::DataMetrics;
@@ -1629,7 +1598,6 @@ max_io_percent = 10
             store,
             replication,
             metrics: Arc::new(DataMetrics::new()),
-            cache: Arc::new(ArcCache::new(64)),
             write_slots: Arc::new(Semaphore::new(8)),
             memory: Arc::new(MemoryBudget::from_config(
                 &dtfs_common::config::MemoryConfig::default(),

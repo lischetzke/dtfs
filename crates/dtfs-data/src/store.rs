@@ -858,6 +858,83 @@ impl ChunkStore {
         Ok(out)
     }
 
+    /// REV-3-2 — return ONE page of this node's chunk listing without
+    /// walking the whole chunk tree.
+    ///
+    /// The on-disk layout is `chunks/<aa>/<bb>/<id>.dat` where `aa`/`bb`
+    /// are the first four hex chars of the id, so the directory tree is
+    /// already sorted by chunk id and a page token maps directly to a
+    /// position in the walk: skip every `aa`/`bb` bucket that sorts
+    /// before the token, then emit ids strictly greater than it until
+    /// `limit` is reached. Only the buckets a page actually touches are
+    /// read (and stat'd), so a page costs O(limit) syscalls instead of
+    /// O(N) — the pre-fix `list_all_chunks_with_mtime()` + sort ran per
+    /// page, making a full orphan-scrub pass O(N^2).
+    ///
+    /// `after` is exclusive; pass `""` to start at the beginning. The
+    /// result is ascending by id and deduplicated across this node's
+    /// disks (a chunk held on two tiers of the same node appears once,
+    /// carrying the NEWEST `.dat` mtime — the conservative choice for
+    /// the orphan reaper's grace clock, Bug CB). As before, only chunks
+    /// whose `.meta` companion exists are surfaced, and an unreadable
+    /// mtime yields 0 ("age unknown"), which the manager treats as
+    /// not-yet-due.
+    pub async fn list_chunks_page(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> DtfsResult<Vec<(String, u64)>> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mut out: Vec<(String, u64)> = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+
+        let roots: Vec<PathBuf> = self
+            .disk_manager
+            .all_disks()
+            .iter()
+            .map(|d| d.mount_path.join("chunks"))
+            .collect();
+
+        // The token's own bucket coordinates; "" means "from the start".
+        let after_l1 = after.get(0..2).unwrap_or("");
+        let after_l2 = after.get(2..4).unwrap_or("");
+
+        let mut level1: BTreeSet<String> = BTreeSet::new();
+        for root in &roots {
+            collect_subdir_names(root, &mut level1).await?;
+        }
+
+        for aa in level1.iter().filter(|a| a.as_str() >= after_l1) {
+            let mut level2: BTreeSet<String> = BTreeSet::new();
+            for root in &roots {
+                collect_subdir_names(&root.join(aa), &mut level2).await?;
+            }
+            // Only the token's own `aa` needs its earlier `bb` buckets
+            // skipped; every later `aa` starts from its first bucket.
+            let lower = if aa.as_str() == after_l1 { after_l2 } else { "" };
+            for bb in level2.iter().filter(|b| b.as_str() >= lower) {
+                let mut bucket: BTreeMap<String, u64> = BTreeMap::new();
+                for root in &roots {
+                    collect_chunk_bucket(&root.join(aa).join(bb), &mut bucket).await?;
+                }
+                for (id, mtime) in bucket {
+                    if id.as_str() <= after {
+                        continue;
+                    }
+                    out.push((id, mtime));
+                    if out.len() == limit {
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Recover from WAL after a crash.
     ///
     /// Replays all WAL entries found across all disks:
@@ -1073,125 +1150,138 @@ impl ChunkStore {
             return Ok(result);
         }
 
-        // Walk the chunk directory tree
-        let mut dir1_entries = fs::read_dir(&chunks_dir).await.map_err(DtfsError::Io)?;
-        while let Some(dir1) = dir1_entries.next_entry().await.map_err(DtfsError::Io)? {
-            if !dir1.file_type().await.map_err(DtfsError::Io)?.is_dir() {
+        // REV-4-4 — only a failure to enumerate the DISK ROOT is fatal.
+        // Everything below is per-bucket / per-chunk: an unreadable
+        // `chunks/<aa>[/<bb>]` directory, a torn `.meta`, an EIO on the
+        // data file, or a chunk unlinked by GC mid-scan is counted and
+        // reported, never propagated. Pre-fix the directory walk used
+        // `?`, so ONE bad bucket aborted the whole disk pass and silently
+        // disabled the only mechanism that finds bit-rot (§ A.6 #7).
+        let mut level1 = std::collections::BTreeSet::new();
+        collect_subdir_names(&chunks_dir, &mut level1).await?;
+
+        let mut io_errors: u64 = 0;
+        let mut vanished: u64 = 0;
+
+        for l1 in &level1 {
+            let l1_dir = chunks_dir.join(l1);
+            let mut level2 = std::collections::BTreeSet::new();
+            if let Err(e) = collect_subdir_names(&l1_dir, &mut level2).await {
+                io_errors += 1;
+                tracing::warn!(
+                    dir = %l1_dir.display(), error = %e,
+                    "scrub: cannot enumerate level-1 directory; skipping it"
+                );
                 continue;
             }
-            let mut dir2_entries = fs::read_dir(dir1.path()).await.map_err(DtfsError::Io)?;
-            while let Some(dir2) = dir2_entries.next_entry().await.map_err(DtfsError::Io)? {
-                if !dir2.file_type().await.map_err(DtfsError::Io)?.is_dir() {
-                    continue;
-                }
-                let mut file_entries = fs::read_dir(dir2.path()).await.map_err(DtfsError::Io)?;
-                while let Some(entry) =
-                    file_entries.next_entry().await.map_err(DtfsError::Io)?
-                {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "dat") {
-                        // P0-5: skip chunks with an outstanding WAL entry.
-                        // The WAL is written before a put_chunk starts and
-                        // removed only once the .meta has been fsynced, so its
-                        // presence reliably indicates an in-flight write or
-                        // replication into the destination disk.
-                        let chunk_hex_name = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or_default();
-                        if !chunk_hex_name.is_empty() {
-                            let wal_path = wal.join(format!("{}.wal.json", chunk_hex_name));
-                            if wal_path.exists() {
-                                skipped_in_flight += 1;
-                                tracing::debug!(
-                                    chunk = %chunk_hex_name,
-                                    "scrub: skipping in-flight chunk (WAL entry present)"
-                                );
-                                continue;
-                            }
+            for l2 in &level2 {
+                let bucket = l1_dir.join(l2);
+                let files = match collect_dat_files(&bucket).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        io_errors += 1;
+                        tracing::warn!(
+                            dir = %bucket.display(), error = %e,
+                            "scrub: cannot enumerate chunk bucket; skipping it"
+                        );
+                        continue;
+                    }
+                };
+                for path in files {
+                    // Stem of the .dat file is the chunk_id hex.
+                    let chunk_hex = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+
+                    // P0-5: skip chunks with an outstanding WAL entry.
+                    // The WAL is written before a put_chunk starts and
+                    // removed only once the .meta has been fsynced, so its
+                    // presence reliably indicates an in-flight write or
+                    // replication into the destination disk.
+                    if !chunk_hex.is_empty()
+                        && wal.join(format!("{}.wal.json", chunk_hex)).exists()
+                    {
+                        skipped_in_flight += 1;
+                        tracing::debug!(
+                            chunk = %chunk_hex,
+                            "scrub: skipping in-flight chunk (WAL entry present)"
+                        );
+                        continue;
+                    }
+
+                    // CO-4-2 / REV-4-4 — a single unreadable/unparseable
+                    // chunk must NOT abort the whole disk scan (that
+                    // aborts exactly when corruption exists). Handle each
+                    // chunk's errors locally: count it corrupt and
+                    // continue.
+                    //
+                    // Quick scrub: existence + size. Stat FIRST — a chunk
+                    // the unlink GC removed between `read_dir` and here
+                    // was never part of this pass, so it is neither
+                    // checked nor reported as corrupt (a needless repair
+                    // of a deliberately deleted chunk is worse than
+                    // skipping it).
+                    let file_meta = match fs::metadata(&path).await {
+                        Ok(m) => m,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            vanished += 1;
+                            continue;
                         }
+                        Err(e) => {
+                            io_errors += 1;
+                            result.chunks_checked += 1;
+                            record_scrub_fault(&mut result, &chunk_hex, "stat", &e);
+                            continue;
+                        }
+                    };
 
-                        result.chunks_checked += 1;
+                    result.chunks_checked += 1;
 
-                        // Stem of the .dat file is the chunk_id hex.
-                        let chunk_hex = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or_default()
-                            .to_string();
-
-                        let meta_path = path.with_extension("meta");
-                        if !meta_path.exists() {
+                    let meta_path = path.with_extension("meta");
+                    let chunk_meta_json = match fs::read_to_string(&meta_path).await {
+                        Ok(s) => s,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            // No `.meta` companion — the chunk is
+                            // unusable; existing accounting calls this
+                            // "missing".
                             result.chunks_missing += 1;
                             if !chunk_hex.is_empty() {
                                 result.corrupt_chunk_ids.push(chunk_hex.clone());
                             }
                             continue;
                         }
-
-                        // CO-4-2 — a single unreadable/unparseable chunk must
-                        // NOT abort the whole disk scan (that aborts exactly
-                        // when corruption exists). Handle each chunk's errors
-                        // locally: count it corrupt and continue.
-                        let file_meta = match fs::metadata(&path).await {
-                            Ok(m) => m,
-                            Err(e) => {
-                                tracing::warn!(chunk = %chunk_hex, error = %e, "scrub: stat failed");
-                                result.chunks_corrupt += 1;
-                                if !chunk_hex.is_empty() {
-                                    result.corrupt_chunk_ids.push(chunk_hex.clone());
-                                }
-                                continue;
-                            }
-                        };
-                        let chunk_meta_json = match fs::read_to_string(&meta_path).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::warn!(chunk = %chunk_hex, error = %e, "scrub: meta read failed");
-                                result.chunks_corrupt += 1;
-                                if !chunk_hex.is_empty() {
-                                    result.corrupt_chunk_ids.push(chunk_hex.clone());
-                                }
-                                continue;
-                            }
-                        };
-                        let chunk_meta: ChunkMeta =
-                            match serde_json::from_str(&chunk_meta_json) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    tracing::warn!(chunk = %chunk_hex, error = %e, "scrub: meta parse failed");
-                                    result.chunks_corrupt += 1;
-                                    if !chunk_hex.is_empty() {
-                                        result.corrupt_chunk_ids.push(chunk_hex.clone());
-                                    }
-                                    continue;
-                                }
-                            };
-
-                        if file_meta.len() != chunk_meta.size {
-                            result.chunks_size_mismatch += 1;
-                            if !chunk_hex.is_empty() {
-                                result.corrupt_chunk_ids.push(chunk_hex.clone());
-                            }
+                        Err(e) => {
+                            io_errors += 1;
+                            record_scrub_fault(&mut result, &chunk_hex, "meta_read", &e);
                             continue;
                         }
+                    };
+                    let chunk_meta: ChunkMeta = match serde_json::from_str(&chunk_meta_json) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            io_errors += 1;
+                            record_scrub_fault(&mut result, &chunk_hex, "meta_parse", &e);
+                            continue;
+                        }
+                    };
 
-                        // Deep scrub: full checksum verification. Hash the file
-                        // incrementally (A.3.2 — never load a whole chunk into
-                        // heap) rather than fs::read of the entire chunk.
-                        if level == ScrubLevel::Deep {
-                            match hash_chunk_file_incrementally(&path, file_meta.len()).await {
-                                Ok(digest) => {
-                                    if digest != chunk_meta.checksum {
-                                        result.chunks_corrupt += 1;
-                                        if !chunk_hex.is_empty() {
-                                            result.corrupt_chunk_ids.push(chunk_hex.clone());
-                                        }
-                                        continue;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(chunk = %chunk_hex, error = %e, "scrub: read failed during hash");
+                    if file_meta.len() != chunk_meta.size {
+                        result.chunks_size_mismatch += 1;
+                        if !chunk_hex.is_empty() {
+                            result.corrupt_chunk_ids.push(chunk_hex.clone());
+                        }
+                        continue;
+                    }
+
+                    // Deep scrub: full checksum verification. Hash the file
+                    // incrementally (A.3.2 — never load a whole chunk into
+                    // heap) rather than fs::read of the entire chunk.
+                    if level == ScrubLevel::Deep {
+                        match hash_chunk_file_incrementally(&path, file_meta.len()).await {
+                            Ok(digest) => {
+                                if digest != chunk_meta.checksum {
                                     result.chunks_corrupt += 1;
                                     if !chunk_hex.is_empty() {
                                         result.corrupt_chunk_ids.push(chunk_hex.clone());
@@ -1199,10 +1289,22 @@ impl ChunkStore {
                                     continue;
                                 }
                             }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                // GC unlinked it between the stat above
+                                // and the hash — same race as before.
+                                result.chunks_checked = result.chunks_checked.saturating_sub(1);
+                                vanished += 1;
+                                continue;
+                            }
+                            Err(e) => {
+                                io_errors += 1;
+                                record_scrub_fault(&mut result, &chunk_hex, "data_read", &e);
+                                continue;
+                            }
                         }
-
-                        result.chunks_healthy += 1;
                     }
+
+                    result.chunks_healthy += 1;
                 }
             }
         }
@@ -1214,10 +1316,133 @@ impl ChunkStore {
                 "scrub skipped in-flight chunks (P0-5)"
             );
         }
+        if vanished > 0 {
+            tracing::info!(
+                disk = %disk_path.display(),
+                vanished,
+                "REV-4-4 scrub skipped chunks removed by GC mid-scan"
+            );
+        }
+        if io_errors > 0 {
+            tracing::warn!(
+                disk = %disk_path.display(),
+                errors = io_errors,
+                "REV-4-4 scrub hit per-chunk/per-bucket failures; \
+                 the disk pass completed"
+            );
+        }
 
         result.duration_secs = start.elapsed().as_secs_f64();
         Ok(result)
     }
+}
+
+/// REV-4-4 — count one per-chunk scrub failure as corruption and report
+/// its id so the manager auto-repairs it via replicate_chunk (§ A.6 #7),
+/// instead of aborting the whole disk pass. An unreadable/unparsable
+/// `.meta` or an EIO on the data file IS damage to that chunk; the
+/// existing corruption accounting is the right channel for it.
+fn record_scrub_fault(
+    result: &mut ScrubResult,
+    chunk_hex: &str,
+    detector: &str,
+    err: &dyn std::fmt::Display,
+) {
+    result.chunks_corrupt += 1;
+    if !chunk_hex.is_empty() {
+        result.corrupt_chunk_ids.push(chunk_hex.to_string());
+    }
+    tracing::warn!(
+        chunk = %chunk_hex,
+        detector,
+        error = %err,
+        "REV-4-4 scrub: per-chunk failure counted as corrupt; disk pass continues"
+    );
+}
+
+/// REV-4-4 — list the `.dat` files in one `chunks/<aa>/<bb>` bucket. A
+/// bucket that disappeared between levels is not an error.
+async fn collect_dat_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut rd = match fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    while let Some(f) = rd.next_entry().await? {
+        let p = f.path();
+        if p.extension().map_or(false, |e| e == "dat") {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+/// REV-3-2 — collect the immediate sub-directory names of `dir` into
+/// `out`. A missing directory is not an error (a disk may hold no chunks
+/// yet, or the bucket may have been reaped between levels).
+async fn collect_subdir_names(
+    dir: &Path,
+    out: &mut std::collections::BTreeSet<String>,
+) -> DtfsResult<()> {
+    let mut rd = match fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(DtfsError::Io(e)),
+    };
+    while let Some(entry) = rd.next_entry().await.map_err(DtfsError::Io)? {
+        if !entry.file_type().await.map_err(DtfsError::Io)?.is_dir() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            out.insert(name.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// REV-3-2 — merge one `chunks/<aa>/<bb>` bucket into `out` as
+/// `id -> .dat mtime (Unix ms)`. Only chunks with a `.meta` companion
+/// are surfaced so a half-written chunk never reaches the orphan reaper.
+/// When the same id is present on more than one disk of this node the
+/// newest mtime wins (most conservative grace clock, Bug CB).
+async fn collect_chunk_bucket(
+    dir: &Path,
+    out: &mut std::collections::BTreeMap<String, u64>,
+) -> DtfsResult<()> {
+    let mut rd = match fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(DtfsError::Io(e)),
+    };
+    while let Some(f) = rd.next_entry().await.map_err(DtfsError::Io)? {
+        let p = f.path();
+        if p.extension().map_or(false, |x| x == "dat") {
+            let stem = match p.file_stem().and_then(|s| s.to_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => continue,
+            };
+            if !p.with_extension("meta").exists() {
+                continue;
+            }
+            let mtime_ms = f
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            out.entry(stem)
+                .and_modify(|m| {
+                    if mtime_ms > *m {
+                        *m = mtime_ms;
+                    }
+                })
+                .or_insert(mtime_ms);
+        }
+    }
+    Ok(())
 }
 
 /// Build the directory path for a chunk's data files.
@@ -1462,6 +1687,212 @@ mod tests {
         }];
         let dm = DiskManager::new(&disk_configs).unwrap();
         (ChunkStore::new(dm), tmp)
+    }
+
+    // ── REV-4-4 — one bad chunk/bucket must not abort the disk pass ─
+
+    /// REV-4-4 — a chunk that vanishes mid-scan (the unlink GC racing
+    /// the scrub) is not corruption and must not be reported as such;
+    /// scheduling a needless repair for a deliberately deleted chunk is
+    /// worse than skipping it. Simulated with a dangling `.dat` symlink,
+    /// which `fs::metadata` resolves to NotFound exactly like a file
+    /// removed between `read_dir` and `stat`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rev_4_4_scrub_skips_chunk_that_vanished_mid_scan() {
+        let (store, _tmp) = make_test_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+        let disk = store.disk_paths()[0].clone();
+
+        for i in 0..3u32 {
+            let data = format!("rev-4-4-live-{i}");
+            let hash = checksum::compute(data.as_bytes());
+            let cid = ChunkId::from_bytes(hash);
+            store
+                .put_chunk(&cid, data.as_bytes(), &volume_id, DiskTier::Hot)
+                .await
+                .unwrap();
+        }
+
+        // A 4th chunk whose .dat disappeared under us.
+        let ghost = ChunkId::from_bytes(checksum::compute(b"rev-4-4-ghost"));
+        let dir = chunk_data_dir(&disk, &ghost);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(chunk_meta_path(&disk, &ghost), b"{}").unwrap();
+        std::os::unix::fs::symlink(dir.join("gone.dat"), chunk_data_path(&disk, &ghost)).unwrap();
+
+        let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+        assert_eq!(res.chunks_healthy, 3, "the live chunks must all verify");
+        assert_eq!(res.chunks_checked, 3, "the vanished chunk must not be counted");
+        assert_eq!(res.chunks_corrupt, 0, "a GC race is not corruption");
+        assert!(res.corrupt_chunk_ids.is_empty());
+    }
+
+    /// REV-4-4 — only failing to enumerate the DISK ROOT is fatal. An
+    /// unreadable `chunks/<aa>/<bb>` bucket (bad sector, EACCES) used to
+    /// propagate out of the `read_dir` `?` and abort the whole disk pass,
+    /// silently disabling the only mechanism that finds bit-rot
+    /// (§ A.6 #7). Every chunk in the *other* buckets must still scrub.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rev_4_4_scrub_survives_unreadable_bucket_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, _tmp) = make_test_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+        let disk = store.disk_paths()[0].clone();
+
+        let mut ids = Vec::new();
+        for i in 0..8u32 {
+            let data = format!("rev-4-4-bucket-{i}");
+            let cid = ChunkId::from_bytes(checksum::compute(data.as_bytes()));
+            store
+                .put_chunk(&cid, data.as_bytes(), &volume_id, DiskTier::Hot)
+                .await
+                .unwrap();
+            ids.push(cid);
+        }
+
+        // Make ONE chunk's bucket unreadable.
+        let blocked_dir = chunk_data_dir(&disk, &ids[3]);
+        let restore = std::fs::metadata(&blocked_dir).unwrap().permissions();
+        std::fs::set_permissions(&blocked_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let res = store.scrub_disk(&disk, ScrubLevel::Deep).await;
+        // Restore before asserting so the TempDir can always be cleaned up.
+        std::fs::set_permissions(&blocked_dir, restore).unwrap();
+
+        let res = res.expect("an unreadable bucket must not abort the disk pass");
+        assert!(
+            res.chunks_healthy >= 7,
+            "every chunk outside the unreadable bucket must still be \
+             scrubbed; got {} healthy",
+            res.chunks_healthy
+        );
+    }
+
+    // ── REV-3-2 — incremental (non-O(N)-per-page) chunk listing ────
+
+    /// REV-3-2 regression.
+    ///
+    /// `list_chunks` used to call `list_all_chunks_with_mtime()` (a full
+    /// walk of the chunk tree with 2 stat calls per entry) and sort the
+    /// whole thing on EVERY page. The manager's orphan scrub pages
+    /// through the entire node, so at ~12.5M chunks that is ~12,500 full
+    /// walks — O(N^2) syscalls plus an N-sized heap spike per page.
+    ///
+    /// The on-disk layout `chunks/<aa>/<bb>/<id>.dat` is already sorted
+    /// by chunk id (aa/bb are the first four hex chars of the id), so a
+    /// page token maps directly to a position in the walk.
+    ///
+    /// Invariants pinned here:
+    /// - a page returns at most `limit` entries (it does NOT materialise
+    ///   the whole set),
+    /// - ids are strictly increasing across pages,
+    /// - the union of all pages equals the full on-disk set,
+    /// - each mtime stays aligned with its own id.
+    #[tokio::test]
+    async fn rev_3_2_list_chunks_page_is_incremental_and_ordered() {
+        use std::collections::HashMap;
+
+        let (store, _tmp) = make_test_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+
+        // 25 chunks — blake3 spreads them over many aa/bb buckets, so
+        // paging has to skip forward through the directory tree.
+        let mut dat_paths: HashMap<String, PathBuf> = HashMap::new();
+        let disk = store.disk_paths()[0].clone();
+        for i in 0..25u32 {
+            let data = format!("rev-3-2-chunk-{i}");
+            let hash = checksum::compute(data.as_bytes());
+            let chunk_id = ChunkId::from_bytes(hash);
+            store
+                .put_chunk(&chunk_id, data.as_bytes(), &volume_id, DiskTier::Hot)
+                .await
+                .unwrap();
+            dat_paths.insert(chunk_id.as_hex(), chunk_data_path(&disk, &chunk_id));
+        }
+
+        let mut expected: Vec<String> = store
+            .list_all_chunks_with_mtime()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        expected.sort();
+        assert_eq!(expected.len(), 25);
+
+        const LIMIT: usize = 4;
+        let mut seen: Vec<String> = Vec::new();
+        let mut token = String::new();
+        loop {
+            let page = store.list_chunks_page(&token, LIMIT).await.unwrap();
+            assert!(
+                page.len() <= LIMIT,
+                "a page must return at most `limit` entries, not the whole \
+                 set (got {})",
+                page.len()
+            );
+            if page.is_empty() {
+                break;
+            }
+            for (id, mtime) in &page {
+                assert!(
+                    seen.last().map_or(true, |prev| prev < id),
+                    "ids must be strictly increasing across pages: {:?} then {}",
+                    seen.last(),
+                    id
+                );
+                // The mtime must belong to THIS id's .dat file.
+                let on_disk = std::fs::metadata(dat_paths.get(id).expect("known id"))
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                assert_eq!(*mtime, on_disk, "mtime must stay aligned with its id");
+                seen.push(id.clone());
+            }
+            token = page.last().unwrap().0.clone();
+            if page.len() < LIMIT {
+                break;
+            }
+        }
+
+        assert_eq!(seen, expected, "union of all pages must equal the full set");
+    }
+
+    /// REV-3-2 — page-token semantics: an empty token starts at the
+    /// beginning, a token returns only ids strictly greater than it, and
+    /// a token past the last id yields an empty page.
+    #[tokio::test]
+    async fn rev_3_2_list_chunks_page_token_is_exclusive() {
+        let (store, _tmp) = make_test_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+        for i in 0..10u32 {
+            let data = format!("rev-3-2-token-{i}");
+            let hash = checksum::compute(data.as_bytes());
+            let chunk_id = ChunkId::from_bytes(hash);
+            store
+                .put_chunk(&chunk_id, data.as_bytes(), &volume_id, DiskTier::Hot)
+                .await
+                .unwrap();
+        }
+        let first = store.list_chunks_page("", 10).await.unwrap();
+        assert_eq!(first.len(), 10);
+
+        // Token = 3rd id → page starts at the 4th.
+        let after = first[2].0.clone();
+        let rest = store.list_chunks_page(&after, 10).await.unwrap();
+        assert_eq!(rest.len(), 7);
+        assert_eq!(rest[0].0, first[3].0);
+        assert!(rest.iter().all(|(id, _)| id > &after));
+
+        // Token = last id → exhausted.
+        let last = first.last().unwrap().0.clone();
+        assert!(store.list_chunks_page(&last, 10).await.unwrap().is_empty());
     }
 
     // CO-5-6 — a heartbeat that drained the pending scrub results but then

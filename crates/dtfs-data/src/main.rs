@@ -106,16 +106,14 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Initialize ARC cache with configured memory limit.
-    // Estimate max entries from max_memory_mb assuming ~128KB average chunk size.
-    let avg_chunk_kb = 128;
-    let max_entries = ((config.cache.max_memory_mb * 1024) / avg_chunk_kb) as usize;
-    let cache = Arc::new(cache::ArcCache::new(max_entries.max(64)));
-    tracing::info!(
-        "Initialized ARC cache: max_memory={}MB, max_entries={}",
-        config.cache.max_memory_mb,
-        max_entries,
-    );
+    // REV-4-5 — no server-side ARC cache is constructed. Nothing in the
+    // workspace ever populated it (`ArcCache::put` had no caller): reads
+    // stream straight off disk for Bug-I/U2 memory parity, so the cache
+    // was permanently empty. That made the CF-5 ladder's "shrink ARC
+    // cache" rung a no-op while `cache.max_memory_mb` was still reserved
+    // out of `memory.hard_cap_mb` when sizing put_chunk concurrency —
+    // phantom accounting that collapsed writes to one in-flight chunk on
+    // a 1 GB-capped node. `config.cache` is now inert on this role.
 
     // Initialize I/O metrics.
     let data_metrics = Arc::new(metrics::DataMetrics::new());
@@ -184,16 +182,16 @@ async fn main() -> anyhow::Result<()> {
             "Bug G memory budget configured"
         );
     }
-    // Bug V — drive the cooperative strategy ladder: under memory
-    // pressure shrink the ARC cache (level 1) before refusing writes
-    // (level 2 — Bug G's existing reject behavior). Matches Ceph OSD's
-    // best-effort autotuner pattern: give back RAM without making the
-    // client see errors.
+    // REV-4-5 — plain RSS sampler. The Bug V rung this used to drive
+    // (`run_monitor_with_cache`) shrank a cache nothing ever populated,
+    // so it could only ever evict zero entries; spawning it advertised a
+    // ladder step the node does not have. The data node's real
+    // cheapest-first rungs are streaming-to-disk on both the write and
+    // read paths (Bug I / U2) and, last resort, the opt-in put_chunk
+    // shed (Bug G) that this sampler drives.
     let mon = memory.clone();
-    let mon_cache = cache.clone();
-    let mon_cache_max = max_entries.max(64);
     tokio::spawn(async move {
-        crate::memory::run_monitor_with_cache(mon, mon_cache, mon_cache_max).await;
+        mon.run_monitor().await;
     });
 
     // Bug U — graceful shutdown wiring.
@@ -219,7 +217,6 @@ async fn main() -> anyhow::Result<()> {
         let config = config.clone();
         let store = chunk_store.clone();
         let metrics = data_metrics.clone();
-        let cache = cache.clone();
         let memory = memory.clone();
         let scrub_config_for_server = scrub_config.clone();
         let integrity_for_server = integrity_faults.clone();
@@ -230,7 +227,6 @@ async fn main() -> anyhow::Result<()> {
                 tls,
                 store,
                 metrics,
-                cache,
                 memory,
                 scrub_config_for_server,
                 integrity_for_server,

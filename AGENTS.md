@@ -138,8 +138,18 @@ shed is opt-in, last resort — see § A.5). The `[memory]` block
 (`hard_cap_mb` etc.) is implemented on **all three roles** (CF-5): the
 role-agnostic core (`MemoryBudget`, `PressureLevel`, RSS sampler) lives in
 `dtfs-common/src/memory.rs`; each role wires its own cheap ladder rung —
-dtfs-data sheds put_chunk + shrinks ARC, dtfs-manager pauses scheduler
-ticks at Warn, dtfs-fuse halves the readahead `cache_mb` at Warn / drops
+dtfs-data sheds put_chunk (REV-4-5 — the "shrink ARC" rung is **gone**: the
+in-memory chunk cache had no `put` caller anywhere in the workspace, so it was
+always empty and the rung could only ever evict zero bytes, while its default
+budget was still subtracted when sizing put_chunk slots and collapsed write
+concurrency on a capped node. Do NOT re-wire it for whole chunks — that puts a
+chunk back in heap on the read path, which this section's first rule forbids),
+dtfs-manager pauses scheduler
+ticks at **Shed** (REV-3-5 — it was Warn, but the memory holding a manager at
+Warn belongs to components the pause does not stop, so the pause latched and
+the sole owner of mandatory-replica repair never ran again; it is also
+self-limiting, forcing a tick after `MAX_CONSECUTIVE_PRESSURE_SKIPS`, because
+A.5 says slow down, not stop), dtfs-fuse halves the readahead `cache_mb` at Warn / drops
 unconsumed prefetch at Shed. systemd `MemoryMax` remains the hard backstop
 for all roles.
 
@@ -479,6 +489,25 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   Unreachable` (transient), preserving the Bug CL mapping above.
 - `dtfs-manager/src/scheduler.rs` — migration/re-replication loop; the
   SOLE owner of replica repair (Bug AC leader gate + Bug CH).
+  **REV-1-1 — every manager background loop is leader-gated, not just
+  `tick()`.** `TaskScheduler::is_leader()` is the single gate;
+  `run_orphan_scrub`, `run_auto_unquarantine_sweep`, `run_lease_gc`,
+  `TieringEngine::run` and `POST /api/v1/files/flush_cache` all take it. These
+  loops dispatch *direct data-node delete RPCs*, which no Raft rejection can
+  undo, so a follower running them physically deletes live bytes (a follower's
+  tiering read-window is always empty, so it reads every cache replica as
+  idle). Any new background loop MUST take this gate. Note the tiering state
+  sweep runs BEFORE the gate: it must keep pruning on followers, which are
+  exactly the nodes that ingest `report_access` without ever evaluating.
+  REV-1-2: the orphan reaper additionally requires a caught-up state machine
+  (`orphan_sweep_allowed`) — reaping against a still-replaying view classifies
+  every file created during the outage as an orphan. REV-3-4: task creation is
+  bounded (`MAX_NEW_TASKS_PER_TICK`, `MAX_LIVE_TASKS`) with an O(1) per-tick
+  dedup index; the scan is idempotent so the remainder resumes next tick, and
+  the cap is logged, never silent. REV-3-10: a location row whose bytes are
+  missing is RECONCILED (dropped, never the last live copy, anchor-checked) so
+  the backfill sees the real deficit; the node is quarantined only when a row
+  cannot be reconciled or the miss count is node-scale.
   `schedule_path_migration` (operator moves), `flush_cache_for_path` +
   `plan_flush_cache` (drop cache replicas; emit cache.flush_* audit +
   AnchorViolated on refusal), `check_under_replicated` (counts coverage
@@ -630,7 +659,10 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   (`MemoryBudget`, `PressureLevel`, RSS sampler, `run_monitor`); shared by
   all three roles.
 - `dtfs-data/src/memory.rs` — Bug G data-node rung: re-exports the common
-  core + the ARC-cache shrinker monitor (`run_monitor_with_cache`).
+  core. REV-4-5 deleted `run_monitor_with_cache` and unwired `cache.rs`: the
+  in-memory ARC chunk cache had no `put` caller anywhere, so the "shrink ARC"
+  rung evicted nothing while its budget still throttled `put_chunk` slot
+  sizing. `[cache]` is parsed but inert for this role.
 - `dtfs-fuse/src/filesystem.rs` — FUSE↔cluster bridge: write leases,
   readahead engine, local disk cache. CO-3-12: `read()` clones the
   per-call data (path/chunk_size/volume_id/locations) out of the

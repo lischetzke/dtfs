@@ -81,8 +81,12 @@ scenario depends on un-shipped functionality.
 | 18 | api-shape | endpoint schema keys present | yes |
 | 19 | config-effective | scope_kind on every row; scrub keys present | — |
 | 20 | quarantine-flow | unquarantine endpoint validation | — |
+| 83 | sparse-chunk-index-read | a gap in the chunk index space reads as zeros, never as a later chunk's bytes (REV-2-1) | yes |
+| 84 | follower-loops-inert | non-leader managers dispatch no background-loop work and delete nothing (REV-1-1/1-2) | — |
+| 85 | unaligned-write-integrity | non-chunk-aligned writes lose no bytes (REV-1-6) | yes |
+| 86 | webui-escaping-and-config-write | CSP + both escapers present, hostile filename not rendered raw; a config write that would not parse is refused and leaves no temp (REV-4-1/4-3) | — |
 
-(cases 21–41 cover later bug-fix regressions; see `tests/release/cases/`.)
+(cases 21–82 cover later bug-fix and security regressions; see `tests/release/cases/`.)
 
 ## Chaos / cross-DC / balance run (3dc lab)
 

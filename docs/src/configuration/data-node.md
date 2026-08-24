@@ -140,12 +140,12 @@ tier = "cold"
 
 ## `[cache]` -- Read Cache
 
-Controls the in-memory read cache on the data node. This cache stores recently and frequently accessed chunks to reduce disk I/O.
+**Inert since REV-4-5.** The in-memory ARC read cache is not wired into the read path: every `GetChunk` streams the chunk off disk in pieces so a read never holds a whole chunk in heap (AGENTS.md § A.3.2). These keys are still parsed for back-compatibility but have no effect, and they no longer consume the data node's memory budget - previously the 8 GB default was subtracted when sizing `put_chunk` slots and collapsed write concurrency to a single slot on a memory-capped node. Client-side read caching is provided by the FUSE local disk cache (`local_cache_dir`) instead.
 
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
-| `max_memory_mb` | `cache.max_memory_mb` | `u64` | `8192` | 256--1048576 | Yes | Maximum memory in megabytes allocated to the read cache. Size this based on available system RAM minus what the OS and other processes need. |
-| `policy` | `cache.policy` | `String` | `"arc"` | `"arc"`, `"lru"`, `"lfu"` | Yes | Cache eviction policy. `"arc"` (Adaptive Replacement Cache) automatically balances between recency and frequency. `"lru"` evicts least recently used entries. `"lfu"` evicts least frequently used entries. |
+| `max_memory_mb` | `cache.max_memory_mb` | `u64` | `8192` | 256--1048576 | Yes | **Inert** (REV-4-5). Parsed, ignored. |
+| `policy` | `cache.policy` | `String` | `"arc"` | `"arc"`, `"lru"`, `"lfu"` | Yes | **Inert** (REV-4-5). Parsed, ignored. |
 
 ### Example
 

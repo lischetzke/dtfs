@@ -309,6 +309,17 @@ message ChunkLocationInfo {
   // and the client falls back to arbitrary/pure-distance order, exactly
   // like node_tiers handles an older manager.
   repeated dtfs.common.Location node_locations = 5;
+  // REV-2-1: this entry's chunk index within the file. The manager groups
+  // replicas into a BTreeMap keyed by chunk_index and then emits only the
+  // VALUES, so this repeated field is DENSE while a file's index space may be
+  // sparse (a truncate followed by a tail write, a partial multi-chunk commit,
+  // a location row removed for a whole index). The client indexed it
+  // POSITIONALLY by offset/chunk_size, so any gap shifted every later chunk and
+  // the reader was served a different chunk's bytes at a valid offset -
+  // checksum-clean, with no error anywhere. Additive/back-compatible: an older
+  // manager leaves this 0 for every entry, which the client detects (all-zero
+  // across a multi-chunk file) and falls back to positional indexing.
+  uint64 chunk_index = 6;
 }
 
 message GetFileLocationsResponse {

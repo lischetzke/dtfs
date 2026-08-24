@@ -25,15 +25,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use dtfs_common::checksum::IncrementalHasher;
+use dtfs_common::types::ChunkId;
 use parking_lot::RwLock;
 use tokio::fs as tfs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Reads below this byte count don't refresh the cached chunk's atime
 /// (scanner/header-only access). Set to 1 MiB by default: a Plex library
 /// scanner typically reads just the file header (a few hundred KB) while
 /// a media playback session pulls megabytes of contiguous data.
 pub const ATIME_UPDATE_MIN_BYTES: usize = 1024 * 1024;
+
+/// REV-2-4: piece size for the verify-on-read hash. We hash straight out of
+/// the destination buffer in slices of this size, so verification adds NO
+/// extra whole-chunk (or even piece-sized) allocation — A.3.2 parity with the
+/// data node's incremental read-serve hash.
+const VERIFY_PIECE_SIZE: usize = 8 * 1024 * 1024;
 
 /// One disk-backed chunk cache.
 pub struct LocalChunkCache {
@@ -48,6 +56,10 @@ pub struct LocalChunkCache {
     /// Aggregate bytes stored. AtomicU64 because put/evict can run from
     /// different tasks.
     total_bytes: AtomicU64,
+    /// REV-3-12: number of full stat sweeps of the tracked entry set that
+    /// `evict_to_size` has performed. One call must cost at most ONE sweep no
+    /// matter how many victims it drops.
+    eviction_sweeps: AtomicU64,
 }
 
 impl LocalChunkCache {
@@ -67,6 +79,7 @@ impl LocalChunkCache {
             lru: RwLock::new(BTreeMap::new()),
             sizes: dashmap::DashMap::new(),
             total_bytes: AtomicU64::new(0),
+            eviction_sweeps: AtomicU64::new(0),
         };
         cache.reindex_from_disk().await?;
         Ok(cache)
@@ -131,6 +144,87 @@ impl LocalChunkCache {
         self.dir.join(aa).join(bb).join(format!("{chunk_id}.dat"))
     }
 
+    /// REV-2-4 — read a cached chunk file and BLAKE3-verify it before it is
+    /// handed to any reader.
+    ///
+    /// The data node BLAKE3s every chunk it serves (`verify_on_read`, A.3.3
+    /// §6) precisely so bit rot never reaches the reader. This cache sits IN
+    /// FRONT of the cluster, so without the same check a chunk that rotted in
+    /// the client's own cache dir — or was truncated by a full disk, or left
+    /// behind by a crashed writer — would be served as good data and the
+    /// healthy replicas would never be consulted. Chunks are content-addressed,
+    /// so the chunk id IS the expected hash; no extra metadata is needed.
+    ///
+    /// Hashing is incremental over the destination buffer (the one
+    /// chunk-sized allocation we have to make anyway — no second copy, no
+    /// scratch buffer), keeping A.3.2 parity. On mismatch the entry is evicted
+    /// and `None` is returned so the caller treats it as a MISS and falls
+    /// through to the cluster.
+    async fn read_verified(&self, chunk_id: &str, path: &Path) -> Option<Bytes> {
+        let expected = match ChunkId::from_hex(chunk_id) {
+            Ok(c) => c.0,
+            Err(e) => {
+                tracing::warn!(
+                    chunk_id,
+                    error = %e,
+                    "local cache: chunk id is not a content address; refusing to serve unverifiable cache entry"
+                );
+                return None;
+            }
+        };
+
+        let mut f = tfs::File::open(path).await.ok()?;
+        let total = f.metadata().await.ok()?.len() as usize;
+        let mut data = vec![0u8; total];
+        let mut hasher = IncrementalHasher::new();
+        let mut off = 0usize;
+        while off < total {
+            let want = (total - off).min(VERIFY_PIECE_SIZE);
+            if f.read_exact(&mut data[off..off + want]).await.is_err() {
+                return None;
+            }
+            hasher.update(&data[off..off + want]);
+            off += want;
+        }
+
+        if hasher.finalize() != expected {
+            // Integrity fault, NOT an ordinary cache miss.
+            tracing::error!(
+                chunk_id,
+                path = %path.display(),
+                bytes = total,
+                "local cache INTEGRITY FAULT: cached chunk failed BLAKE3 verify (bit rot / torn write); evicting entry and falling through to a cluster replica"
+            );
+            self.evict_entry(chunk_id).await;
+            return None;
+        }
+        Some(Bytes::from(data))
+    }
+
+    /// Remove one entry from disk and from the size/LRU accounting.
+    /// Returns false only when the file exists but could not be removed.
+    async fn evict_entry(&self, chunk_id: &str) -> bool {
+        let path = self.path_for(chunk_id);
+        match tfs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+        if let Some((_, len)) = self.sizes.remove(chunk_id) {
+            self.total_bytes.fetch_sub(len, Ordering::Relaxed);
+        }
+        let mut lru = self.lru.write();
+        let stale: Vec<u64> = lru
+            .iter()
+            .filter(|(_, v)| v.as_str() == chunk_id)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in stale {
+            lru.remove(&k);
+        }
+        true
+    }
+
     /// Retrieve a cached chunk WITHOUT updating its LRU position.
     /// Use this for scanner-style accesses (header reads, stat-walks).
     ///
@@ -143,16 +237,14 @@ impl LocalChunkCache {
             return None;
         }
         let pre = tfs::metadata(&path).await.ok().and_then(|m| m.accessed().ok());
-        let data = match tfs::read(&path).await {
-            Ok(d) => d,
-            Err(_) => return None,
-        };
+        // REV-2-4 — verify before serving; a rotten entry is a MISS.
+        let data = self.read_verified(chunk_id, &path).await?;
         if let Some(t) = pre {
             // Restore the pre-read atime so the OS read-side update
             // doesn't leak into LRU ordering.
             let _ = filetime::set_file_atime(&path, filetime::FileTime::from_system_time(t));
         }
-        Some(Bytes::from(data))
+        Some(data)
     }
 
     /// Retrieve a cached chunk and (conditionally) refresh its atime so
@@ -170,10 +262,8 @@ impl LocalChunkCache {
             return None;
         }
         let pre = tfs::metadata(&path).await.ok().and_then(|m| m.accessed().ok());
-        let data = match tfs::read(&path).await {
-            Ok(d) => d,
-            Err(_) => return None,
-        };
+        // REV-2-4 — verify before serving; a rotten entry is a MISS.
+        let data = self.read_verified(chunk_id, &path).await?;
         if bytes_hint >= ATIME_UPDATE_MIN_BYTES {
             // Viewer read — set atime to now.
             let now = SystemTime::now();
@@ -186,7 +276,7 @@ impl LocalChunkCache {
             // stays anchored to last VIEWER access.
             let _ = filetime::set_file_atime(&path, filetime::FileTime::from_system_time(t));
         }
-        Some(Bytes::from(data))
+        Some(data)
     }
 
     /// Insert a chunk into the cache. Atomic via tmp+rename. Triggers
@@ -240,55 +330,44 @@ impl LocalChunkCache {
     /// authoritative source of truth for "most recently viewed". This
     /// makes LRU robust to scanner storms — a Plex library walk doesn't
     /// move recently-viewed chunks toward eviction.
+    ///
+    /// REV-3-12: the atime snapshot is taken ONCE per call. The previous shape
+    /// re-stat'ed every tracked entry for every victim, so a burst of
+    /// insertions cost O(N*M) stat syscalls awaited inline on the FUSE read
+    /// path (a visible stall mid-playback with a large cache). Policy is
+    /// unchanged — same oldest-atime-first order, just computed in one sweep
+    /// and then applied to as many victims as the cap needs.
     async fn evict_to_size(&self) {
-        while self.total_bytes.load(Ordering::Relaxed) > self.max_bytes {
-            // Build a snapshot of (atime, chunk_id) for everything we
-            // know about, pick the oldest, and drop it.
-            let ids: Vec<String> = self.sizes.iter().map(|e| e.key().clone()).collect();
-            if ids.is_empty() {
-                break;
-            }
-            let mut oldest: Option<(SystemTime, String, u64)> = None;
-            for id in &ids {
-                let path = self.path_for(id);
-                let meta = match tfs::metadata(&path).await {
-                    Ok(m) => m,
-                    Err(_) => {
-                        // File missing under our tracking; drop from index.
-                        self.sizes.remove(id);
-                        continue;
+        if self.total_bytes.load(Ordering::Relaxed) <= self.max_bytes {
+            return;
+        }
+        self.eviction_sweeps.fetch_add(1, Ordering::Relaxed);
+
+        // ONE sweep: stat every tracked entry exactly once.
+        let ids: Vec<String> = self.sizes.iter().map(|e| e.key().clone()).collect();
+        let mut candidates: Vec<(SystemTime, String)> = Vec::with_capacity(ids.len());
+        for id in ids {
+            match tfs::metadata(self.path_for(&id)).await {
+                Ok(m) => candidates.push((m.accessed().unwrap_or(UNIX_EPOCH), id)),
+                Err(_) => {
+                    // Tracked but gone from disk: drop it from the index AND
+                    // from the byte total, otherwise the cap could never be
+                    // reached again.
+                    if let Some((_, len)) = self.sizes.remove(&id) {
+                        self.total_bytes.fetch_sub(len, Ordering::Relaxed);
                     }
-                };
-                let atime = meta.accessed().unwrap_or(UNIX_EPOCH);
-                let len = meta.len();
-                if oldest.as_ref().map_or(true, |(ta, _, _)| atime < *ta) {
-                    oldest = Some((atime, id.clone(), len));
                 }
             }
-            let (_, chunk_id, len) = match oldest {
-                Some(v) => v,
-                None => break,
-            };
-            let path = self.path_for(&chunk_id);
-            if tfs::remove_file(&path).await.is_ok() {
-                self.total_bytes.fetch_sub(len, Ordering::Relaxed);
-                self.sizes.remove(&chunk_id);
-                // Also drop any matching entry from the in-memory `lru`
-                // map (best-effort housekeeping; the map is no longer
-                // authoritative but we keep it tidy).
-                let mut lru = self.lru.write();
-                let stale: Vec<u64> = lru
-                    .iter()
-                    .filter(|(_, v)| **v == chunk_id)
-                    .map(|(k, _)| *k)
-                    .collect();
-                for k in stale {
-                    lru.remove(&k);
-                }
-            } else {
-                // Couldn't remove; bail to avoid an infinite loop.
+        }
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (_, id) in candidates {
+            if self.total_bytes.load(Ordering::Relaxed) <= self.max_bytes {
                 break;
             }
+            // A failed removal (permissions, busy) just leaves the entry in
+            // place; move on to the next-oldest instead of spinning.
+            let _ = self.evict_entry(&id).await;
         }
     }
 
@@ -337,6 +416,12 @@ impl LocalChunkCache {
     pub fn entry_count(&self) -> usize {
         self.sizes.len()
     }
+
+    /// REV-3-12 observability: total full stat sweeps performed by
+    /// `evict_to_size` since startup.
+    pub(crate) fn eviction_sweeps(&self) -> u64 {
+        self.eviction_sweeps.load(Ordering::Relaxed)
+    }
 }
 
 /// Spawn a background task that periodically prunes age-expired entries.
@@ -363,8 +448,117 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn chunk_id(n: u32) -> String {
-        format!("{:064x}", n as u128)
+    /// Content-addressed id for `data` — a chunk id IS the BLAKE3 of the
+    /// chunk bytes, which is what the cache verifies on read (REV-2-4).
+    fn cid(data: &[u8]) -> String {
+        dtfs_common::checksum::compute(data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// REV-2-4: a cached chunk whose bytes rotted on the client's own disk
+    /// MUST NOT be served. Chunks are content-addressed, so the id is the
+    /// expected BLAKE3 — a mismatch is an integrity fault: evict the entry
+    /// and report a MISS so the caller falls through to a healthy replica.
+    #[tokio::test]
+    async fn rev_2_4_corrupt_cached_chunk_is_evicted_and_returns_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = LocalChunkCache::new(tmp.path().to_path_buf(), 10 * 1024 * 1024, None)
+            .await
+            .unwrap();
+
+        let good = vec![7u8; 4096];
+        let good_id = cid(&good);
+        cache.put(&good_id, &good).await.unwrap();
+
+        let rotten = vec![9u8; 8192];
+        let rotten_id = cid(&rotten);
+        cache.put(&rotten_id, &rotten).await.unwrap();
+
+        // Flip a single bit on disk, as bit rot / a torn write would.
+        let path = cache.path_for(&rotten_id);
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[1234] ^= 0xff;
+        std::fs::write(&path, &raw).unwrap();
+
+        assert!(
+            cache.get(&rotten_id, rotten.len()).await.is_none(),
+            "corrupt cache entry must report a MISS, never serve rotten bytes"
+        );
+        assert!(
+            !path.exists(),
+            "corrupt cache entry must be evicted from disk"
+        );
+        assert!(
+            cache.peek(&rotten_id).await.is_none(),
+            "evicted corrupt entry must stay gone"
+        );
+
+        // The healthy neighbour is untouched and still byte-exact.
+        let got = cache.get(&good_id, good.len()).await.unwrap();
+        assert_eq!(got.as_ref(), &good[..]);
+        assert_eq!(cache.entry_count(), 1);
+        assert_eq!(cache.current_bytes(), 4096);
+    }
+
+    /// REV-3-12: one `evict_to_size` call that must drop several victims
+    /// performs exactly ONE stat sweep of the tracked set, not one sweep per
+    /// victim (the O(N*M) stall on the FUSE read path).
+    #[tokio::test]
+    async fn rev_3_12_evict_to_size_sweeps_once_for_many_victims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = LocalChunkCache::new(tmp.path().to_path_buf(), 10_000, None)
+            .await
+            .unwrap();
+
+        // Six 1500-byte entries = 9000 bytes, under the 10 KB cap so no
+        // eviction happens yet. Distinct atimes, oldest first.
+        let mut ids = Vec::new();
+        for i in 0..6u8 {
+            let data = vec![i; 1500];
+            let id = cid(&data);
+            cache.put(&id, &data).await.unwrap();
+            ids.push(id);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(cache.entry_count(), 6);
+        let sweeps_before = cache.eviction_sweeps();
+
+        // One 5000-byte insert pushes the total to 14000 → three of the
+        // oldest entries must go in this single call.
+        let big = vec![200u8; 5000];
+        let big_id = cid(&big);
+        cache.put(&big_id, &big).await.unwrap();
+
+        assert!(
+            cache.current_bytes() <= 10_000,
+            "eviction must bring the cache under the cap, got {}",
+            cache.current_bytes()
+        );
+        assert_eq!(
+            cache.eviction_sweeps() - sweeps_before,
+            1,
+            "evict_to_size must sweep once per call, not once per victim"
+        );
+        // LRU policy unchanged: the three oldest atimes went, the three
+        // newest plus the fresh insert survived.
+        for old in &ids[..3] {
+            assert!(
+                cache.peek(old).await.is_none(),
+                "oldest-atime entry should have been evicted"
+            );
+        }
+        for keep in &ids[3..] {
+            assert!(
+                cache.peek(keep).await.is_some(),
+                "newer entry must survive eviction"
+            );
+        }
+        assert!(
+            cache.peek(&big_id).await.is_some(),
+            "fresh insert must survive"
+        );
     }
 
     #[tokio::test]
@@ -373,8 +567,8 @@ mod tests {
         let cache = LocalChunkCache::new(tmp.path().to_path_buf(), 10 * 1024 * 1024, None)
             .await
             .unwrap();
-        let id = chunk_id(1);
         let data = vec![42u8; 4096];
+        let id = cid(&data);
         cache.put(&id, &data).await.unwrap();
         let got = cache.get(&id, data.len()).await.unwrap();
         assert_eq!(got.as_ref(), &data[..]);
@@ -396,8 +590,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let id = chunk_id(1);
-        cache.put(&id, &vec![1u8; 4096]).await.unwrap();
+        let data = vec![1u8; 4096];
+        let id = cid(&data);
+        cache.put(&id, &data).await.unwrap();
 
         // Read the atime right after put.
         let path = cache.path_for(&id);
@@ -437,8 +632,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let id = chunk_id(1);
-        cache.put(&id, &vec![1u8; 4096]).await.unwrap();
+        let data = vec![1u8; 4096];
+        let id = cid(&data);
+        cache.put(&id, &data).await.unwrap();
 
         let path = cache.path_for(&id);
         let atime_before = tfs::metadata(&path).await.unwrap().accessed().unwrap();
@@ -467,8 +663,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let id = chunk_id(1);
-        cache.put(&id, &vec![1u8; 4096]).await.unwrap();
+        let data = vec![1u8; 4096];
+        let id = cid(&data);
+        cache.put(&id, &data).await.unwrap();
         let path = cache.path_for(&id);
         let atime_before = tfs::metadata(&path).await.unwrap().accessed().unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -489,34 +686,35 @@ mod tests {
             .await
             .unwrap();
 
-        cache.put(&chunk_id(1), &vec![1u8; 2500]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        cache.put(&chunk_id(2), &vec![2u8; 2500]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        cache.put(&chunk_id(3), &vec![3u8; 2500]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        cache.put(&chunk_id(4), &vec![4u8; 2500]).await.unwrap();
+        let ids: Vec<String> = (1..=5u8).map(|i| cid(&vec![i; 2500])).collect();
+        for i in 0..4usize {
+            cache
+                .put(&ids[i], &vec![(i + 1) as u8; 2500])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         // Scanner reads chunk 1 (smallest read). atime stays old.
-        let _ = cache.get(&chunk_id(1), 32 * 1024).await.unwrap();
+        let _ = cache.get(&ids[0], 32 * 1024).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         // Real viewer reads chunk 2 (refreshes atime).
         let _ = cache
-            .get(&chunk_id(2), ATIME_UPDATE_MIN_BYTES + 1)
+            .get(&ids[1], ATIME_UPDATE_MIN_BYTES + 1)
             .await
             .unwrap();
 
         // Now put chunk 5 → eviction must drop the OLDEST viewer atime,
         // which is chunk 1 (despite the scanner having "touched" it just
         // before the viewer read of chunk 2).
-        cache.put(&chunk_id(5), &vec![5u8; 2500]).await.unwrap();
+        cache.put(&ids[4], &vec![5u8; 2500]).await.unwrap();
 
         assert!(cache.current_bytes() <= 10_000);
         // The viewer-warm chunk 2 must survive; the scanner-only chunk 1
         // must be the one evicted.
-        assert!(cache.peek(&chunk_id(2)).await.is_some(), "viewer-warm chunk must stay");
-        assert!(cache.peek(&chunk_id(1)).await.is_none(), "scanner-only chunk should be evicted");
+        assert!(cache.peek(&ids[1]).await.is_some(), "viewer-warm chunk must stay");
+        assert!(cache.peek(&ids[0]).await.is_none(), "scanner-only chunk should be evicted");
     }
 
     #[tokio::test]
@@ -526,9 +724,9 @@ mod tests {
             .await
             .unwrap();
         // Put 5 × 3 KB = 15 KB total → ought to evict at least 2 oldest.
-        for i in 0..5 {
-            let data = vec![i as u8; 3000];
-            cache.put(&chunk_id(i), &data).await.unwrap();
+        for i in 0..5u8 {
+            let data = vec![i; 3000];
+            cache.put(&cid(&data), &data).await.unwrap();
         }
         assert!(cache.current_bytes() <= 10_000);
         assert!(cache.entry_count() < 5);
@@ -546,7 +744,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        cache.put(&chunk_id(1), b"hello").await.unwrap();
+        cache.put(&cid(b"hello"), b"hello").await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let removed = cache.prune_by_age().await.unwrap();
         assert_eq!(removed, 1);
@@ -560,8 +758,10 @@ mod tests {
             let cache = LocalChunkCache::new(tmp.path().to_path_buf(), 1 << 20, None)
                 .await
                 .unwrap();
-            cache.put(&chunk_id(7), &vec![1u8; 2048]).await.unwrap();
-            cache.put(&chunk_id(8), &vec![2u8; 4096]).await.unwrap();
+            let a = vec![1u8; 2048];
+            let b = vec![2u8; 4096];
+            cache.put(&cid(&a), &a).await.unwrap();
+            cache.put(&cid(&b), &b).await.unwrap();
             assert_eq!(cache.entry_count(), 2);
         }
         // Re-open: should rediscover.
