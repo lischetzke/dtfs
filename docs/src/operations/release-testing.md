@@ -85,6 +85,9 @@ scenario depends on un-shipped functionality.
 | 84 | follower-loops-inert | non-leader managers dispatch no background-loop work and delete nothing (REV-1-1/1-2) | — |
 | 85 | unaligned-write-integrity | non-chunk-aligned writes lose no bytes (REV-1-6) | yes |
 | 86 | webui-escaping-and-config-write | CSP + both escapers present, hostile filename not rendered raw; a config write that would not parse is refused and leaves no temp (REV-4-1/4-3) | — |
+| 87 | listchunks-paging-incremental | ListChunks pages incrementally: ascending ids, exclusive cursor, mtimes positionally aligned (REV-3-2) | yes |
+| 88 | scrub-survives-bad-chunk | a torn `.meta` and an unreadable bucket are counted, not fatal — the disk pass still completes (REV-4-4) | — |
+| 89 | write-slots-no-phantom-cache | put_chunk slots sized from the memory cap alone, with no `[cache]` budget reserved (REV-4-5) | yes |
 
 (cases 21–82 cover later bug-fix and security regressions; see `tests/release/cases/`.)
 
