@@ -122,10 +122,10 @@ Lower TTL values provide stronger consistency but increase metadata traffic. For
 
 ### First-write tier preference (Bug AV)
 
-The FUSE client can request a specific tier for the first chunk of a write via the `[write] first_write_tier` config option. Two modes:
+The FUSE client can request a specific tier for the first chunk of a write via the `[write] first_write_tier` config option. The hint selects a **tier** and nothing else. Two modes:
 
-* **`"cold"` (default)** — first-chunk placement targets the volume's effective cold tier (the mandatory anchor). The write ACK blocks until the cold replica confirms. Safer and no anchor-lag window, but slower when the client's DC has a slow uplink to the anchor DC.
-* **`"nearest-warm"`** — first-chunk placement targets a warm-tier node in the client's own DC. The write ACK comes back as soon as the warm replica confirms; the manager's anchor-lag-repair pass (Bug AV AV-3-3) schedules the mandatory cold copy asynchronously within one tiering tick (default 5 min).
+* **`"cold"` (default)** — the client sends no tier hint at all, so the manager places the chunk on the volume’s own effective tier (`pick_effective_tier` over `mandatory_replicas`: the first non-zero of hot, warm, cold) at the volume’s replica count. No anchor-lag window, but slower when the client’s DC has a slow uplink to the DC that ends up holding the copy.
+* **`"nearest-warm"`** — the client asks for the warm tier. The manager honours the hint whenever *any* healthy node advertises a warm disk, and falls back to the volume’s effective tier when none does. The replica count is then clamped up to `write_safety.min_replicas_before_ack` (REV-4-10) so the write is not streamed in full only to be rejected at commit.
 
 Configure in `fuse.toml`:
 
@@ -136,7 +136,11 @@ first_write_tier = "nearest-warm"
 
 See [FUSE Client Configuration → `[write]`](../configuration/fuse-client.md#write----write-path-preferences-bug-av) for the full reference and trade-off discussion.
 
-> The mode interacts with the volume's `cache_replicas` policy at the manager. A volume that doesn't enable warm caching (`cache_replicas.warm.max = 0`) ignores the `nearest-warm` request — the manager falls back to the volume default tier. This is intentional so a client misconfiguration can't bypass a volume's durability requirements.
+> **The hint carries no datacenter affinity.** The allocation path walks the hash ring with `prefer_client_locations = false` and never learns where the writing client is, so `"nearest-warm"` selects *a* warm node, not necessarily one in the client’s own DC. Read the name as "the warm tier", not as "nearby".
+
+> **The volume’s anchor still applies to the same allocation.** `anchor_datacenter` is handed to the ring as a required DC, so if none of the chosen replicas lives there one slot is swapped for an anchor-DC node — with the tier constraint relaxed for that slot, which is how a warm-tier write still lands a copy on a cold-only anchor node. On a volume that has an anchor and an ack floor of 2 or more, the anchor copy is therefore placed in the *same* allocation rather than deferred; the asynchronous anchor-lag-repair path (AV-3-3) only comes into play when the ring cannot find an anchor-DC candidate at all.
+
+> **There is no `cache_replicas` safety valve.** `resolve_preferred_tier` consults only which tiers are available on healthy nodes; it never looks at the volume’s cache policy. A volume with `cache_replicas.warm.max = 0` still honours a `"nearest-warm"` hint. Durability is protected by the anchor requirement and the ack floor above, not by the cache policy.
 
 ### Write Buffering
 

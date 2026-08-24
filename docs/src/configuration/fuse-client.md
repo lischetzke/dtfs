@@ -141,7 +141,7 @@ Controls how the FUSE client requests chunk placement at write time. Combined wi
 
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
-| `first_write_tier` | `write.first_write_tier` | `string` | `"cold"` | `"cold"`, `"nearest-warm"` | No (restart FUSE) | Tier preference for first-chunk placement. `"cold"` (default) blocks the ACK on the mandatory cold (anchor) copy — slower in DCs with slow uplinks to the anchor DC but no anchor-lag window. `"nearest-warm"` places the first chunk on a warm-tier node in the client's own DC and ACKs immediately; the manager's anchor-lag-repair pass (AV-3-3) schedules the mandatory cold copy asynchronously within one tiering tick (default 5 min). Any unrecognised value falls back to `"cold"` for forward-compat safety. |
+| `first_write_tier` | `write.first_write_tier` | `string` | `"cold"` | `"cold"`, `"nearest-warm"` | No (restart FUSE) | Tier preference for first-chunk placement, and a tier preference only. `"cold"` (default) sends no hint, so the manager uses the volume’s own effective tier at the volume’s replica count. `"nearest-warm"` asks for the warm tier; the manager honours it whenever any healthy node advertises a warm disk, and the replica count is clamped up to `write_safety.min_replicas_before_ack` (REV-4-10). The hint has NO datacenter affinity — placement runs with `prefer_client_locations = false` and never sees the writing client’s location — and the volume’s `anchor_datacenter` still forces one replica slot into the anchor DC in the same allocation. Any unrecognised value falls back to `"cold"` for forward-compat safety. |
 
 ### Example
 
@@ -152,15 +152,17 @@ first_write_tier = "nearest-warm"
 
 ### When to use `"nearest-warm"`
 
-* **Fresh-download landing zones** — the NRB Plexmedia DC has a 1 Gbps uplink and the operator wants torrent finishes to ACK in seconds, not block on the 40 Mbps LELI anchor link. The anchor copy lands asynchronously.
-* **Office writes** — small frequent edits where the warm-tier SSD in the user's own DC is the fastest target; the cold anchor copy can lag by a tick.
+* **Fresh-download landing zones** — the NRB Plexmedia DC wants torrent finishes to ACK against fast warm SSD rather than the volume’s default tier. Note the anchor requirement is unchanged: with an `anchor_datacenter` set, one replica of the allocation still goes to the anchor DC, so the slow link is only avoided for the *other* replicas.
+* **Volumes whose default tier is the archive HDD** — steering first writes at the warm tier keeps the fast disks in the write path.
+
+> The mode does **not** steer placement toward the writing client’s own datacenter; see the note in [FUSE mount → First-write tier preference](../access/fuse-mount.md#first-write-tier-preference-bug-av). If you need DC-local writes, that is a placement change, not a client setting.
 
 ### When to keep the default `"cold"`
 
-* **Compliance / DR workloads** — the write must be durably on the anchor before the application sees ACK. The anchor-lag window is a real durability gap; `"cold"` closes it.
+* **Compliance / DR workloads** — you want placement decided entirely by the volume policy, with no client-side input at all.
 * **Tiny clusters without a fast warm tier** — picking the wrong tier just adds a hop.
 
-> See [Tiering → Promotion math](../storage/tiering.md#promotion-math) for what happens *after* the first chunk lands. The anchor-lag repair fires from the manager's normal tiering tick, so the cold copy typically lands within one tick interval.
+> An anchor-lag window opens only when the allocation cannot place an anchor-DC replica (no healthy candidate in `anchor_datacenter`). In that case the manager’s anchor-lag-repair pass (AV-3-3) schedules the missing copy from the normal tiering tick. See [Tiering → Promotion math](../storage/tiering.md#promotion-math) for what happens *after* the first chunk lands.
 
 ---
 
