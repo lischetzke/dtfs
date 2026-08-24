@@ -30,7 +30,7 @@ data_active() { ssh_run "$1" "systemctl is-active dtfs-data" 2>/dev/null | grep 
 data_rss_mb() { local kb=$(ssh_run "$1" "ps -o rss= -p $2 2>/dev/null | tr -d ' '"); echo $(( ${kb:-0} / 1024 )); }
 
 echo "[1/6] write a ${SIZE_MB} MB file through the mount"
-F=$(make_fuse_file "release/57-u2-$$.bin" "$SIZE_MB")
+F=$(make_fuse_file "release/93-u2-$$.bin" "$SIZE_MB")
 [ -n "$F" ] || fail "could not create fixture"
 HASH=$(sha256_via_fuse "$F")
 [ -n "$HASH" ] || fail "could not checksum fixture"

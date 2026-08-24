@@ -7,8 +7,8 @@
 # leader>" for the ~2.5 s election window.
 source "$(dirname "$0")/../lib/common.sh"
 
-F="$MOUNT/release/49-leader-restart-$$.bin"
-RCF="/tmp/49-write-rc-$$"
+F="$MOUNT/release/92-leader-restart-$$.bin"
+RCF="/tmp/92-write-rc-$$"
 SIZE_MB=1024   # single sustained stream, ~10s+ on the lab clusters
 LEADER_HOST=""
 
