@@ -23,6 +23,44 @@ use axum::{
 };
 use std::sync::Arc;
 
+/// Content-Security-Policy sent with every WebUI document.
+///
+/// The dashboard is fully self-contained: no remote scripts, styles, fonts
+/// or images, and no `eval`. The policy therefore names no remote origin at
+/// all, which blocks script loading and pixel exfiltration even if markup
+/// were ever injected. `script-src 'unsafe-inline'` is required because the
+/// page is a single inline bundle *and* wires its controls through inline
+/// `on*` attributes; a nonce would not cover those (nonces apply to script
+/// elements, not event handlers), so escaping — not CSP — is the primary
+/// control against injected markup here.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+script-src 'unsafe-inline'; \
+style-src 'self' 'unsafe-inline'; \
+img-src 'self' data:; \
+font-src 'self'; \
+connect-src 'self'; \
+object-src 'none'; \
+base-uri 'none'; \
+form-action 'none'; \
+frame-ancestors 'none'";
+
+/// HTML-escape a value for interpolation into element text or a quoted
+/// attribute. Used for every value the manager does not itself control.
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Shared state for WebUI routes.
 #[derive(Clone)]
 pub struct WebUiState {
@@ -41,13 +79,31 @@ pub fn router(state: Arc<WebUiState>) -> Router {
         .with_state(state)
 }
 
-async fn index_page(State(state): State<Arc<WebUiState>>) -> Html<String> {
-    Html(render_dashboard(&state.cluster_name, &state.manager_hostname))
+async fn index_page(State(state): State<Arc<WebUiState>>) -> Response {
+    let body = render_dashboard(&state.cluster_name, &state.manager_hostname);
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        Html(body),
+    )
+        .into_response()
 }
 
 async fn stylesheet() -> Response {
     let css = include_str!("webui_assets/styles.css");
-    (StatusCode::OK, [(header::CONTENT_TYPE, "text/css")], css.to_string()).into_response()
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/css"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        css.to_string(),
+    )
+        .into_response()
 }
 
 async fn favicon() -> Response {
@@ -55,7 +111,15 @@ async fn favicon() -> Response {
         <rect width="64" height="64" rx="12" fill="#2563eb"/>
         <text x="32" y="44" font-size="32" fill="white" text-anchor="middle" font-family="monospace">D</text>
     </svg>"##;
-    (StatusCode::OK, [(header::CONTENT_TYPE, "image/svg+xml")], svg.to_string()).into_response()
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        svg.to_string(),
+    )
+        .into_response()
 }
 
 fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
@@ -839,6 +903,28 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 <script>
     // ── Utilities ────────────────────────────────────────────────────────────
 
+    // Escape a value for interpolation into element text or into a quoted
+    // HTML attribute. EVERY value that originates outside the manager
+    // (file paths, hostnames, mount paths, volume ids, audit fields,
+    // error strings) must pass through this before it reaches innerHTML.
+    function esc(v) {{
+        if (v === null || v === undefined) return '';
+        return String(v).replace(/[&<>"']/g, c => (
+            {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]
+        ));
+    }}
+
+    // Escape a value that is embedded in a single-quoted JS string which
+    // itself sits inside a double-quoted HTML attribute, e.g.
+    // onclick="fn('...')". JS-escape first, then HTML-escape, so the HTML
+    // parser hands the JS parser a properly terminated string literal.
+    // esc() alone is not enough here: a backslash would escape the closing
+    // quote of the JS literal and let the argument run into code.
+    function escArg(v) {{
+        return esc(String(v === null || v === undefined ? '' : v)
+            .replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
+    }}
+
     function fmtBytes(b) {{
         if (b === 0) return '0 B';
         const u = ['B','KB','MB','GB','TB','PB'];
@@ -1238,7 +1324,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             const used  = t.used_bytes  || 0;
             const pct   = total ? Math.round(used / total * 100) : 0;
             const color = barColor(pct) || 'var(--primary)';
-            const badge = `<span class="badge badge-${{t.tier}}" style="text-transform:capitalize">${{t.tier}}</span>`;
+            const badge = `<span class="badge badge-${{esc(t.tier)}}" style="text-transform:capitalize">${{esc(t.tier)}}</span>`;
             html += `<tr>
                 <td style="padding:.4rem">${{badge}}</td>
                 <td style="padding:.4rem">${{t.disks||0}}</td>
@@ -1278,8 +1364,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <div class="scrub-result">
             <div class="scrub-meta">
                 <div class="scrub-meta-item">${{lvlBadge}}</div>
-                <div class="scrub-meta-item"><span>Node:</span> ${{s.node_id}}</div>
-                <div class="scrub-meta-item"><span>Disk:</span> ${{s.disk_path}}</div>
+                <div class="scrub-meta-item"><span>Node:</span> ${{esc(s.node_id)}}</div>
+                <div class="scrub-meta-item"><span>Disk:</span> ${{esc(s.disk_path)}}</div>
                 <div class="scrub-meta-item"><span>Completed:</span> ${{when}} (${{ago}})</div>
                 <div class="scrub-meta-item"><span>Duration:</span> ${{dur}}</div>
             </div>
@@ -1393,7 +1479,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             // width) so the full location string and the version+build
             // pair fit without truncation or wrapping.
             const versionText = (n.version || n.build_date)
-                ? `${{n.version || '—'}}${{n.build_date ? ' / ' + n.build_date : ''}}`
+                ? `${{esc(n.version || '—')}}${{n.build_date ? ' / ' + esc(n.build_date) : ''}}`
                 : '—';
             // CF-4c — a manager that's not a raft voter/learner is
             // configured/registered but never joined; flag it so it doesn't
@@ -1403,16 +1489,16 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 : '';
             return `<tr>
                 <td style="font-size:.75rem;color:var(--text-muted);font-family:monospace;white-space:nowrap">
-                    ${{n.node_id||'—'}}</td>
-                <td><b>${{n.hostname||'—'}}</b></td>
-                <td><span class="${{rc}}">${{role}}</span></td>
-                <td style="font-size:.78rem;color:var(--text-muted);white-space:nowrap">${{n.location||'—'}}</td>
-                <td style="font-size:.78rem;color:var(--text-muted);white-space:nowrap">${{versionText}}</td>
+                    ${{esc(n.node_id||'—')}}</td>
+                <td><b>${{esc(n.hostname||'—')}}</b></td>
+                <td><span class="${{esc(rc)}}">${{esc(role)}}</span></td>
+                <td style="font-size:.78rem;color:var(--text-muted);white-space:nowrap">${{esc(n.location||'—')}}</td>
+                <td style="font-size:.78rem;color:var(--text-muted);white-space:nowrap">${{esc(versionText)}}</td>
                 ${{diskCell}}
                 ${{capCell}}
                 ${{usedBarCell}}
                 ${{usedValCell}}
-                <td>${{unjoinedBadge}}<span class="${{hc}}">${{n.health||'unknown'}}</span></td>
+                <td>${{unjoinedBadge}}<span class="${{esc(hc)}}">${{esc(n.health||'unknown')}}</span></td>
             </tr>`;
         }}).join('');
     }}
@@ -1486,16 +1572,16 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             sum.textContent = rows.length + ' event(s); newest first';
             body.innerHTML = rows.map(r => {{
                 const ts = new Date((r.timestamp||0)*1000).toISOString().replace('T',' ').replace(/\..*/, '');
-                const action = (r.action||'').replace(/'/g, '&#39;');
+                const action = r.action||'';
                 const isQuar = action.startsWith('node.quarantine');
                 const isUnq  = action.startsWith('node.unquarantine');
                 const rowStyle = isQuar ? 'background:#b91c1c14' : (isUnq ? 'background:#22c55e10' : '');
                 return `<tr style="${{rowStyle}}">
                     <td style="font-family:monospace;font-size:.78rem">${{ts}}</td>
-                    <td><b>${{action}}</b></td>
-                    <td style="font-size:.78rem;color:var(--text-muted)">${{r.actor||'—'}}</td>
-                    <td style="font-size:.78rem;font-family:monospace">${{r.target||'—'}}</td>
-                    <td style="font-size:.78rem">${{r.summary||r.result||'—'}}</td>
+                    <td><b>${{esc(action)}}</b></td>
+                    <td style="font-size:.78rem;color:var(--text-muted)">${{esc(r.actor||'—')}}</td>
+                    <td style="font-size:.78rem;font-family:monospace">${{esc(r.target||'—')}}</td>
+                    <td style="font-size:.78rem">${{esc(r.summary||r.result||'—')}}</td>
                 </tr>`;
             }}).join('');
         }};
@@ -1736,7 +1822,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
         let html = '';
         for (const [region, dcs] of sortedEntries(tree)) {{
-            html += `<div class="topo-region"><div class="topo-region-label">🌐 Region: <b>${{region}}</b></div>`;
+            html += `<div class="topo-region"><div class="topo-region-label">🌐 Region: <b>${{esc(region)}}</b></div>`;
             for (const [dc, racks] of sortedEntries(dcs)) {{
                 // wrap all racks of this DC in a horizontal flex
                 // container (.topo-racks); each .topo-rack inside is a
@@ -1748,9 +1834,9 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 //
                 // Matches operator mental model: racks are physical
                 // siblings; hosts within a rack are stacked.
-                html += `<div class="topo-dc"><div class="topo-dc-label">🏢 Datacenter: <b>${{dc}}</b></div><div class="topo-racks">`;
+                html += `<div class="topo-dc"><div class="topo-dc-label">🏢 Datacenter: <b>${{esc(dc)}}</b></div><div class="topo-racks">`;
                 for (const [rack, rnodes] of sortedEntries(racks)) {{
-                    html += `<div class="topo-rack"><div class="topo-rack-label">🗄 Rack: <b>${{rack}}</b></div><div class="topo-nodes">`;
+                    html += `<div class="topo-rack"><div class="topo-rack-label">🗄 Rack: <b>${{esc(rack)}}</b></div><div class="topo-nodes">`;
                     // Sort hosts (nodes) inside the rack by hostname ASC.
                     const sortedNodes = [...rnodes].sort((a, b) =>
                         (a.hostname || '').localeCompare(b.hostname || '', undefined,
@@ -1760,11 +1846,11 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                         const role = (n.role||'data').toLowerCase();
                         html += `<div class="topo-node">
                             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.4rem">
-                                <b>${{n.hostname||'—'}}</b>
-                                <span class="badge badge-${{h}}">${{n.health||'unknown'}}</span>
+                                <b>${{esc(n.hostname||'—')}}</b>
+                                <span class="badge badge-${{esc(h)}}">${{esc(n.health||'unknown')}}</span>
                             </div>
                             <div style="font-size:.75rem;color:var(--text-muted);margin-bottom:.3rem">
-                                <span class="badge badge-${{role}}">${{role}}</span>
+                                <span class="badge badge-${{esc(role)}}">${{esc(role)}}</span>
                                 &nbsp; ${{n.disk_count||0}} disk${{n.disk_count!==1?'s':''}}
                             </div>
                             <div style="font-size:.75rem;color:var(--text-muted)">
@@ -1870,9 +1956,9 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                                    const dcol = dpct>90?'var(--danger)':dpct>75?'var(--warning)':'var(--primary)';
                                    const dstatus = (d.status||'healthy').toLowerCase();
                                    return `<tr>
-                                       <td style="padding:.25rem .4rem;font-family:monospace">${{d.disk_id}}</td>
-                                       <td style="padding:.25rem .4rem"><span class="badge badge-${{(d.tier||'').toLowerCase()}}">${{d.tier||'—'}}</span></td>
-                                       <td style="padding:.25rem .4rem;font-family:monospace;color:var(--text-muted);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{d.mount_path||''}}">${{d.mount_path||'—'}}</td>
+                                       <td style="padding:.25rem .4rem;font-family:monospace">${{esc(d.disk_id)}}</td>
+                                       <td style="padding:.25rem .4rem"><span class="badge badge-${{esc((d.tier||'').toLowerCase())}}">${{esc(d.tier||'—')}}</span></td>
+                                       <td style="padding:.25rem .4rem;font-family:monospace;color:var(--text-muted);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{esc(d.mount_path||'')}}">${{esc(d.mount_path||'—')}}</td>
                                        <td style="padding:.25rem .4rem">${{fmtBytes(d.total_bytes||0)}}</td>
                                        <td style="padding:.25rem .4rem">${{fmtBytes(d.used_bytes||0)}}</td>
                                        <td style="padding:.25rem .4rem">
@@ -1883,7 +1969,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                                                <span style="font-size:.72rem;color:var(--text-muted);min-width:2.5em;text-align:right">${{dpct}}%</span>
                                            </div>
                                        </td>
-                                       <td style="padding:.25rem .4rem"><span class="badge badge-${{dstatus}}">${{d.status||'—'}}</span></td>
+                                       <td style="padding:.25rem .4rem"><span class="badge badge-${{esc(dstatus)}}">${{esc(d.status||'—')}}</span></td>
                                    </tr>`;
                                }}).join('')}}
                            </tbody>
@@ -1905,8 +1991,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 ? '<span class="badge badge-unjoined" style="margin-right:.4rem" title="Manager is not a raft member (voter or learner)">UNJOINED</span>'
                 : '';
             const addrRow = isClient
-                ? `<div class="node-meta-item"><span>Client IP</span>${{n.client_ip || '—'}}</div>`
-                : `<div class="node-meta-item"><span>gRPC</span>${{n.grpc_addr||'—'}}</div>`;
+                ? `<div class="node-meta-item"><span>Client IP</span>${{esc(n.client_ip || '—')}}</div>`
+                : `<div class="node-meta-item"><span>gRPC</span>${{esc(n.grpc_addr||'—')}}</div>`;
             const lastSeenRow = n.last_seen_ms
                 ? `<div class="node-meta-item"><span>Last seen</span>${{timeAgo(n.last_seen_ms)}}</div>`
                 : `<div class="node-meta-item"><span>Last seen</span>—</div>`;
@@ -1914,7 +2000,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             // mean the node pre-dates that field or wasn't queried directly
             // (older clients, peer managers).
             const versionRow = (n.version || n.build_date)
-                ? `<div class="node-meta-item"><span>Version</span>${{n.version || '—'}}${{n.build_date ? ' / ' + n.build_date : ''}}</div>`
+                ? `<div class="node-meta-item"><span>Version</span>${{esc(n.version || '—')}}${{n.build_date ? ' / ' + esc(n.build_date) : ''}}</div>`
                 : '';
             // Quarantined badge + details panel. The
             // operator never needs to curl: the reason, triggering
@@ -1929,15 +2015,15 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     <div style="font-weight:700;color:var(--danger);margin-bottom:.3rem">
                         Integrity fault — node excluded from all serving paths.
                     </div>
-                    <div class="node-meta-item"><span>Reason</span><b>${{n.quarantine.reason}}</b></div>
-                    ${{n.quarantine.triggering_chunk_id ? `<div class="node-meta-item"><span>Triggering chunk</span><span style="font-family:monospace;font-size:.75rem">${{n.quarantine.triggering_chunk_id}}</span></div>` : ''}}
+                    <div class="node-meta-item"><span>Reason</span><b>${{esc(n.quarantine.reason)}}</b></div>
+                    ${{n.quarantine.triggering_chunk_id ? `<div class="node-meta-item"><span>Triggering chunk</span><span style="font-family:monospace;font-size:.75rem">${{esc(n.quarantine.triggering_chunk_id)}}</span></div>` : ''}}
                     <div class="node-meta-item"><span>Since</span>${{new Date(n.quarantine.since_ms).toISOString()}}</div>
                     <div class="node-meta-item"><span>Last fault</span>${{new Date(n.quarantine.last_fault_at_ms).toISOString()}}</div>
                     <div class="node-meta-item"><span>Total faults</span>${{n.quarantine.fault_count_total||0}}</div>
-                    <div class="node-meta-item"><span>Summary</span>${{n.quarantine.last_fault_summary||'—'}}</div>
+                    <div class="node-meta-item"><span>Summary</span>${{esc(n.quarantine.last_fault_summary||'—')}}</div>
                     <div style="margin-top:.6rem;display:flex;gap:.4rem">
                         <button class="btn-primary" style="background:#b91c1c"
-                            onclick="openUnquarantineModal('${{n.node_id}}','${{(n.hostname||'').replace(/'/g,'&#39;')}}','${{n.quarantine.reason}}','${{(n.quarantine.triggering_chunk_id||'').replace(/'/g,'&#39;')}}','${{n.quarantine.fault_count_total||0}}','${{(n.quarantine.last_fault_summary||'').replace(/'/g,'&#39;')}}')">
+                            onclick="openUnquarantineModal('${{escArg(n.node_id)}}','${{escArg(n.hostname||'')}}','${{escArg(n.quarantine.reason)}}','${{escArg(n.quarantine.triggering_chunk_id||'')}}','${{escArg(n.quarantine.fault_count_total||0)}}','${{escArg(n.quarantine.last_fault_summary||'')}}')">
                             Unquarantine…
                         </button>
                     </div>
@@ -1945,18 +2031,18 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             return `<div class="node-card">
                 <div class="node-card-header">
                     <div>
-                        <span class="badge badge-${{role}}" style="margin-right:.4rem">${{role}}</span>
+                        <span class="badge badge-${{esc(role)}}" style="margin-right:.4rem">${{esc(role)}}</span>
                         ${{leaderBadge}}
                         ${{unjoinedBadge}}
-                        <b style="font-size:1rem">${{n.hostname||'—'}}</b>
+                        <b style="font-size:1rem">${{esc(n.hostname||'—')}}</b>
                         <span style="font-size:.78rem;color:var(--text-muted);margin-left:.5rem;font-family:monospace">
-                            id:${{(n.node_id||'').slice(0,12)}}…
+                            id:${{esc((n.node_id||'').slice(0,12))}}…
                         </span>
                     </div>
                     <div style="display:flex;gap:.5rem;align-items:center">
                         ${{quarBadge}}
-                        ${{isQuarantined ? '' : `<span class="badge badge-${{h}}">${{n.health||'unknown'}}</span>`}}
-                        ${{isStorageRole ? `<button class="btn-maint" onclick="toggleMaintenance('${{n.node_id}}', ${{!isMaintenance}})">
+                        ${{isQuarantined ? '' : `<span class="badge badge-${{esc(h)}}">${{esc(n.health||'unknown')}}</span>`}}
+                        ${{isStorageRole ? `<button class="btn-maint" onclick="toggleMaintenance('${{escArg(n.node_id)}}', ${{!isMaintenance}})">
                             ${{isMaintenance ? 'Exit Maintenance' : 'Set Maintenance'}}
                         </button>` : ''}}
                     </div>
@@ -1964,7 +2050,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <div class="node-card-body">
                     <div class="node-meta">
                         ${{addrRow}}
-                        <div class="node-meta-item"><span>Location</span>${{n.location||'—'}}</div>
+                        <div class="node-meta-item"><span>Location</span>${{esc(n.location||'—')}}</div>
                         ${{lastSeenRow}}
                         ${{versionRow}}
                         ${{sizeMetaRows}}
@@ -2062,7 +2148,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         }};
         const cr = v.cache_replicas || {{}};
         const anchor = v.anchor
-            ? `dc=${{v.anchor.datacenter||'—'}}, required_tier=${{v.anchor.required_tier||'(any)'}}`
+            ? `dc=${{esc(v.anchor.datacenter||'—')}}, required_tier=${{esc(v.anchor.required_tier||'(any)')}}`
             : '(none)';
         // AZ-1 — per-volume background-job schedules.
         const sch = v.schedules || {{}};
@@ -2075,7 +2161,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         const customMap = sch.custom || {{}};
         const customCount = Object.keys(customMap).length;
         return `<div class="placeholder" style="text-align:left;padding:1rem;background:rgba(0,0,0,.04);border-radius:.5rem">
-            <div style="font-weight:bold;margin-bottom:.5rem">Policy for ${{v.volume_id}}</div>
+            <div style="font-weight:bold;margin-bottom:.5rem">Policy for ${{esc(v.volume_id)}}</div>
             <div style="font-family:monospace;font-size:.78rem;line-height:1.6">
                 <div>Mandatory replicas: hot=${{(v.mandatory_replicas||{{}}).hot||0}}, warm=${{(v.mandatory_replicas||{{}}).warm||0}}, cold=${{(v.mandatory_replicas||{{}}).cold||0}}, tape=${{(v.mandatory_replicas||{{}}).tape||0}}</div>
                 <div>Cache replicas (per_dc=${{cr.per_dc===true?'true':'false'}}, promote_reads=${{cr.promote_reads||0}}, promote_window_secs=${{cr.promote_window_secs||0}}, cooldown_secs=${{cr.cooldown_secs||0}}):</div>
@@ -2135,14 +2221,14 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             '</tr></thead><tbody>' +
             vols.flatMap(v => {{
                 const vid = v.volume_id||'—';
-                const safeVid = vid.replace(/'/g, "&#39;");
+                const safeVid = escArg(vid);
                 const cacheLabel = (v.cache_replicas && v.cache_replicas.warm)
                     ? `warm min=${{v.cache_replicas.warm.min||0}}/max=${{v.cache_replicas.warm.max||0}}${{v.cache_replicas.per_dc?' per-dc':''}}`
                     : '—';
-                const anchorLabel = v.anchor ? (v.anchor.datacenter||'—') : '—';
+                const anchorLabel = esc(v.anchor ? (v.anchor.datacenter||'—') : '—');
                 const isOpen = window._volumesExpanded.has(vid);
                 const rows = [`<tr>
-                    <td><b style="font-family:monospace">${{vid}}</b></td>
+                    <td><b style="font-family:monospace">${{esc(vid)}}</b></td>
                     <td>${{(v.file_count||0).toLocaleString()}}</td>
                     <td>${{fmtBytes(v.total_size||0)}}</td>
                     <td>${{v.file_count ? fmtBytes(Math.round((v.total_size||0)/v.file_count)) : '—'}}</td>
@@ -2447,8 +2533,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 return `<a href="#" onclick="${{onClick}}" style="color:var(--primary);text-decoration:none">/</a>`;
             }}
             const full = '/' + crumbs.slice(1, idx + 1).join('/') + '/';
-            const onClick = `event.preventDefault();explorerNavigate('${{full.replace(/'/g, "&#39;")}}')`;
-            return `<a href="#" onclick="${{onClick}}" style="color:var(--primary);text-decoration:none">${{seg}}</a>/`;
+            const onClick = `event.preventDefault();explorerNavigate('${{escArg(full)}}')`;
+            return `<a href="#" onclick="${{onClick}}" style="color:var(--primary);text-decoration:none">${{esc(seg)}}</a>/`;
         }}).join('');
 
         // Group direct children: folders (have at least one descendant) vs files.
@@ -2486,30 +2572,30 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
         if (folderList.length === 0 && files.length === 0) {{
             el.innerHTML = '<div class="placeholder">' +
-                (filter ? `No entries match "${{filter}}" in ${{cwd}}.` : `Empty folder: ${{cwd}}`) +
+                (filter ? `No entries match "${{esc(filter)}}" in ${{esc(cwd)}}.` : `Empty folder: ${{esc(cwd)}}`) +
                 '</div>';
             return;
         }}
 
-        const folderRows = folderList.map(d => `<tr class="explorer-row" oncontextmenu="event.preventDefault();showCtxMenu(event,'${{d.path.replace(/'/g, "&#39;")}}',true)">
+        const folderRows = folderList.map(d => `<tr class="explorer-row" oncontextmenu="event.preventDefault();showCtxMenu(event,'${{escArg(d.path)}}',true)">
             <td style="font-size:1rem;width:1.5rem">📁</td>
             <td>
-                <a href="#" onclick="event.preventDefault();explorerNavigate('${{d.path.replace(/'/g, "&#39;")}}')" style="color:var(--primary);text-decoration:none;font-family:monospace">${{d.name}}/</a>
+                <a href="#" onclick="event.preventDefault();explorerNavigate('${{escArg(d.path)}}')" style="color:var(--primary);text-decoration:none;font-family:monospace">${{esc(d.name)}}/</a>
             </td>
             <td style="font-size:.78rem;color:var(--text-muted)">${{d.fileCount.toLocaleString()}} file${{d.fileCount!==1?'s':''}}</td>
             <td>${{fmtBytes(d.totalSize)}}</td>
             <td></td>
             <td style="white-space:nowrap">
                 <button class="btn-secondary" style="font-size:.72rem;padding:.2rem .5rem"
-                        onclick="openMigrate('${{d.path.replace(/'/g, "&#39;")}}')" title="Migrate this folder">⋯</button>
+                        onclick="openMigrate('${{escArg(d.path)}}')" title="Migrate this folder">⋯</button>
             </td>
         </tr>`).join('');
 
         const fileRows = files.map(f => {{
-            const safePath = (f.path || '').replace(/'/g, "&#39;");
+            const safePath = escArg(f.path || '');
             return `<tr class="explorer-row" oncontextmenu="event.preventDefault();showCtxMenu(event,'${{safePath}}',false)">
                 <td style="font-size:1rem;width:1.5rem">📄</td>
-                <td style="font-family:monospace;font-size:.85rem;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{f.path||''}}">${{f.name}}</td>
+                <td style="font-family:monospace;font-size:.85rem;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{esc(f.path||'')}}">${{esc(f.name)}}</td>
                 <td style="font-size:.78rem;color:var(--text-muted)">${{f.chunk_count||0}} chunk${{(f.chunk_count||0)!==1?'s':''}}</td>
                 <td>${{fmtBytes(f.total_size||0)}}</td>
                 <td style="font-size:.78rem;color:var(--text-muted)">${{f.created_at ? timeAgo(f.created_at) : '—'}}</td>
@@ -2526,7 +2612,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             folderRows + fileRows +
             `</tbody></table>` +
             `<div style="padding:.75rem 1.25rem;font-size:.78rem;color:var(--text-muted);border-top:1px solid var(--border)">
-                ${{folderList.length}} folder${{folderList.length!==1?'s':''}} · ${{files.length}} file${{files.length!==1?'s':''}} in <code>${{cwd}}</code> · right-click for actions
+                ${{folderList.length}} folder${{folderList.length!==1?'s':''}} · ${{files.length}} file${{files.length!==1?'s':''}} in <code>${{esc(cwd)}}</code> · right-click for actions
             </div></div>`;
         window.scrollTo(0, savedScroll);
     }}
@@ -2539,9 +2625,9 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     function showCtxMenu(evt, path, isFolder) {{
         const menu = document.getElementById('explorer-ctxmenu');
         if (!menu) return;
-        const safe = (path || '').replace(/'/g, "&#39;");
+        const safe = escArg(path || '');
         const parent = isFolder ? path : path.replace(/[^/]*$/, '');
-        const safeParent = parent.replace(/'/g, "&#39;");
+        const safeParent = escArg(parent);
         const items = isFolder
             ? [
                 {{ label: 'Open folder',           onClick: `explorerNavigate('${{safe}}')` }},
@@ -2581,7 +2667,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         )).sort();
         const dcSel = document.getElementById('m-dc');
         dcSel.innerHTML = '<option value="">Any datacenter</option>' +
-            dcs.map(dc => `<option value="${{dc}}">${{dc}}</option>`).join('');
+            dcs.map(dc => `<option value="${{esc(dc)}}">${{esc(dc)}}</option>`).join('');
 
         document.getElementById('m-path').value = prefix || '';
         document.getElementById('m-result').style.display = 'none';
@@ -2789,14 +2875,14 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             '<div class="table-card"><table>' +
             '<thead><tr><th>Task</th><th>Chunk</th><th>Src → Tgt</th><th>Tier</th><th>Status</th><th>Attempts</th><th>Updated</th><th>Last error</th></tr></thead><tbody>' +
             tasks.map(t => `<tr>
-                <td style="font-family:monospace;font-size:.75rem">${{t.task_id||'—'}}</td>
-                <td style="font-family:monospace;font-size:.75rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{t.chunk_id||''}}">${{(t.chunk_id||'').slice(0,16)}}…</td>
-                <td style="font-family:monospace;font-size:.78rem">${{t.source_node||'?'}} → ${{t.target_node||'?'}}</td>
-                <td><span class="badge badge-${{(t.tier||'').toLowerCase()}}">${{t.tier||'—'}}</span></td>
-                <td style="color:${{statusColor((t.status||'').toLowerCase())}};font-weight:600">${{t.status||'—'}}</td>
+                <td style="font-family:monospace;font-size:.75rem">${{esc(t.task_id||'—')}}</td>
+                <td style="font-family:monospace;font-size:.75rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{esc(t.chunk_id||'')}}">${{esc((t.chunk_id||'').slice(0,16))}}…</td>
+                <td style="font-family:monospace;font-size:.78rem">${{esc(t.source_node||'?')}} → ${{esc(t.target_node||'?')}}</td>
+                <td><span class="badge badge-${{esc((t.tier||'').toLowerCase())}}">${{esc(t.tier||'—')}}</span></td>
+                <td style="color:${{statusColor((t.status||'').toLowerCase())}};font-weight:600">${{esc(t.status||'—')}}</td>
                 <td>${{t.attempts ?? 0}}</td>
                 <td style="font-size:.75rem;color:var(--text-muted)">${{t.updated_at_ms ? timeAgo(t.updated_at_ms) : '—'}}</td>
-                <td style="font-size:.75rem;color:var(--text-muted);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{t.last_error||''}}">${{t.last_error||'—'}}</td>
+                <td style="font-size:.75rem;color:var(--text-muted);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{esc(t.last_error||'')}}">${{esc(t.last_error||'—')}}</td>
             </tr>`).join('') +
             `</tbody></table>` +
             `<div style="padding:.75rem 1.25rem;font-size:.78rem;color:var(--text-muted);border-top:1px solid var(--border)">
@@ -2851,12 +2937,12 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     <td style="font-size:.78rem;color:var(--text-muted);white-space:nowrap">
                         ${{/* AuditEntry.timestamp is SECONDS-since-epoch (chrono::Utc::now().timestamp() in audit.rs). JS new Date() expects MS. Without *1000 every entry rendered as 1970-01-2x. */ e.timestamp ? new Date(e.timestamp * 1000).toLocaleString() : '—'}}
                     </td>
-                    <td style="font-size:.8rem">${{e.actor||'—'}}</td>
-                    <td style="font-family:monospace;font-size:.78rem">${{e.action||'—'}}</td>
-                    <td style="font-size:.78rem;color:var(--text-muted);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{e.target||''}}">
-                        ${{e.target||'—'}}
+                    <td style="font-size:.8rem">${{esc(e.actor||'—')}}</td>
+                    <td style="font-family:monospace;font-size:.78rem">${{esc(e.action||'—')}}</td>
+                    <td style="font-size:.78rem;color:var(--text-muted);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{esc(e.target||'')}}">
+                        ${{esc(e.target||'—')}}
                     </td>
-                    <td style="font-size:.78rem;color:${{resultColor}}">${{e.result||'—'}}</td>
+                    <td style="font-size:.78rem;color:${{resultColor}}">${{esc(e.result||'—')}}</td>
                 </tr>`;
             }}).join('') +
             '</tbody></table></div>';
@@ -2904,7 +2990,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         const cn = window._configRows.filter(r => r.scope_kind === 'cluster').length;
         const nn = window._configRows.filter(r => r.scope_kind === 'node').length;
         document.getElementById('cfg-tab-cluster').textContent = 'Cluster (' + cn + ')';
-        document.getElementById('cfg-tab-node').innerHTML =
+        document.getElementById('cfg-tab-node').textContent =
             'Node: ' + window._configHost + ' (' + nn + ')';
         rerenderConfigTable();
     }}
@@ -2944,7 +3030,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         el.innerHTML = '<div class="table-card"><table>' +
             '<thead><tr><th>Name</th><th>Scope</th><th>Current</th><th>Default</th><th>Edit</th></tr></thead><tbody>' +
             filtered.map(r => {{
-                const safeName = r.name.replace(/"/g, '&quot;');
+                const safeName = escArg(r.name);
                 const cur = (r.current === null || r.current === undefined)
                     ? '' : JSON.stringify(r.current);
                 const def = (r.default === null || r.default === undefined)
@@ -2955,12 +3041,12 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 const isDefault = r.is_default
                     ? `<span style="color:var(--text-muted);font-size:.75rem">(default)</span>` : '';
                 return `<tr>
-                    <td style="font-family:monospace;font-size:.78rem">${{r.name}} ${{pendingFlag}} ${{isDefault}}</td>
-                    <td>${{r.scope}}</td>
-                    <td style="font-family:monospace;font-size:.78rem">${{cur||'(null)'}}</td>
-                    <td style="font-family:monospace;font-size:.78rem;color:var(--text-muted)">${{def}}</td>
+                    <td style="font-family:monospace;font-size:.78rem">${{esc(r.name)}} ${{pendingFlag}} ${{isDefault}}</td>
+                    <td>${{esc(r.scope)}}</td>
+                    <td style="font-family:monospace;font-size:.78rem">${{esc(cur||'(null)')}}</td>
+                    <td style="font-family:monospace;font-size:.78rem;color:var(--text-muted)">${{esc(def)}}</td>
                     <td><input class="form-input" style="font-family:monospace;font-size:.78rem;width:14rem"
-                               value="${{pending !== undefined ? String(pending).replace(/"/g,'&quot;') : cur}}"
+                               value="${{esc(pending !== undefined ? String(pending) : cur)}}"
                                oninput="onConfigEdit('${{safeName}}', this.value)"></td>
                 </tr>`;
             }}).join('') +
@@ -3151,7 +3237,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <h3>Raw Config JSON</h3>
             <p class="settings-desc">Current cluster config blob stored in Raft state. Edit carefully.</p>
             <textarea id="cfg-json" class="form-textarea" rows="6">${{
-                cfg.config ? JSON.stringify(cfg.config, null, 2) : '(empty)'
+                esc(cfg.config ? JSON.stringify(cfg.config, null, 2) : '(empty)')
             }}</textarea>
             <div style="margin-top:.75rem;display:flex;gap:.75rem;align-items:center">
                 <button class="btn-primary" onclick="saveConfigJson()">Apply Config JSON</button>
@@ -3186,8 +3272,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 </script>
 </body>
 </html>"##,
-        cluster_name = cluster_name,
-        hostname = hostname,
+        cluster_name = escape_html(cluster_name),
+        hostname = escape_html(hostname),
         repo = dtfs_common::REPO_URL,
     )
 }
@@ -3434,6 +3520,244 @@ mod rendered_text_no_bug_refs {
         assert!(
             !html.contains("Bug "),
             "internal bug-tracker IDs must not appear in the served WebUI (rendered text or shipped comments)"
+        );
+    }
+}
+
+/// REV-4-1 — the WebUI is served to an operator whose browser session holds
+/// unauthenticated control of the whole REST API, and it renders strings the
+/// cluster does not control: file paths (anything that can write to the FUSE
+/// mount picks the filename), node hostnames, disk mount paths, volume ids,
+/// audit actor/action/target, quarantine reasons and migration errors.
+/// Every one of those must be escaped before it reaches `innerHTML`.
+#[cfg(test)]
+mod xss_escaping_tests {
+    use super::*;
+
+    /// The server-side escape helper must neutralise every character that
+    /// can break out of an HTML text node or a quoted attribute.
+    #[test]
+    fn escape_html_neutralises_markup() {
+        assert_eq!(escape_html("<script>"), "&lt;script&gt;");
+        assert_eq!(escape_html("\""), "&quot;");
+        assert_eq!(escape_html("'"), "&#39;");
+        assert_eq!(escape_html("&"), "&amp;");
+        assert_eq!(escape_html("a&b"), "a&amp;b");
+        let hostile = "/media/<img src=x onerror=alert(1)>.mkv";
+        let out = escape_html(hostile);
+        assert_eq!(
+            out,
+            "/media/&lt;img src=x onerror=alert(1)&gt;.mkv",
+            "path markup must be escaped"
+        );
+        assert!(!out.contains('<'), "no raw < may survive escaping");
+        assert!(!out.contains('>'), "no raw > may survive escaping");
+        // Escaping never manufactures new markup.
+        assert!(!escape_html("&lt;").contains('<'));
+    }
+
+    /// A hostile cluster name / manager hostname must not be able to inject
+    /// markup into the server-rendered shell.
+    #[test]
+    fn hostile_identity_strings_render_escaped() {
+        let html = render_dashboard(
+            "<script>alert(1)</script>",
+            "\"><img src=x onerror=alert(2)>",
+        );
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "hostile cluster name must not render as live markup"
+        );
+        assert!(
+            !html.contains("onerror=alert(2)>"),
+            "hostile hostname must not render an event handler"
+        );
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "hostile cluster name must render escaped"
+        );
+        // Exactly one real <script element: the page's own bundle.
+        assert_eq!(
+            html.matches("<script").count(),
+            1,
+            "the page must contain exactly one script element"
+        );
+    }
+
+    /// Every value that originates outside the manager must be routed
+    /// through the client-side escape helper before it is concatenated into
+    /// innerHTML. Each entry below is a raw interpolation form that was
+    /// previously injected verbatim; its continued absence from the served
+    /// page is the regression guard.
+    #[test]
+    fn tainted_interpolations_are_escaped_in_page_script() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        assert!(
+            html.contains("function esc("),
+            "the page must define the client-side escape helper"
+        );
+        assert!(
+            html.contains("function escArg("),
+            "the page must define the inline-handler-argument escape helper"
+        );
+        // escArg must JS-escape the backslash BEFORE the quote, then hand
+        // the result to esc(). Reversing the order lets a trailing
+        // backslash escape the closing quote of the JS string literal and
+        // run the rest of the filename as code, and skipping esc() leaves
+        // the attribute itself breakable.
+        let arg_body = html
+            .split("function escArg(")
+            .nth(1)
+            .expect("escArg body")
+            .split("}")
+            .next()
+            .expect("escArg body end");
+        let bs = arg_body.find(r"/\\/g").expect("escArg must escape backslashes");
+        let quote = arg_body.find(r"/'/g").expect("escArg must escape quotes");
+        assert!(bs < quote, "escArg must escape backslash before quote");
+        assert!(
+            arg_body.contains("return esc("),
+            "escArg must HTML-escape its JS-escaped result: {arg_body}"
+        );
+        let raw_forms = [
+            // Storage overview + scrub card
+            "${t.tier}",
+            "${s.node_id}",
+            "${s.disk_path}",
+            // Node table
+            "${n.node_id||'—'}",
+            "${n.hostname||'—'}",
+            "${n.location||'—'}",
+            "${versionText}",
+            "${n.health||'unknown'}",
+            "${n.version || '—'}",
+            "' / ' + n.build_date",
+            "${rc}",
+            "${hc}",
+            // Integrity feed
+            "${action}",
+            "${r.actor||'—'}",
+            "${r.target||'—'}",
+            "${r.summary||r.result||'—'}",
+            // Topology
+            "${region}",
+            "${dc}",
+            "${rack}",
+            "${h}",
+            "${role}",
+            // Node cards + disk table
+            "${d.disk_id}",
+            "${d.tier||'—'}",
+            "${d.mount_path||''}",
+            "${d.mount_path||'—'}",
+            "${d.status||'—'}",
+            "${dstatus}",
+            "${(d.tier||'').toLowerCase()}",
+            "${n.client_ip || '—'}",
+            "${n.grpc_addr||'—'}",
+            "${n.quarantine.reason}",
+            "${n.quarantine.triggering_chunk_id}",
+            "${n.quarantine.last_fault_summary||'—'}",
+            "${(n.node_id||'').slice(0,12)}",
+            "${n.node_id}",
+            // Volumes
+            "${v.anchor.datacenter||'—'}",
+            "${v.anchor.required_tier||'(any)'}",
+            "${v.volume_id}",
+            "${vid}",
+            // Explorer
+            "${seg}",
+            "${filter}",
+            "${cwd}",
+            "${d.name}",
+            "${f.name}",
+            "${f.path||''}",
+            "${d.path.replace",
+            "${full.replace",
+            // Migration tasks
+            "${t.task_id||'—'}",
+            "${t.chunk_id||''}",
+            "${(t.chunk_id||'').slice(0,16)}",
+            "${t.source_node||'?'}",
+            "${t.target_node||'?'}",
+            "${t.tier||'—'}",
+            "${(t.tier||'').toLowerCase()}",
+            "${t.status||'—'}",
+            "${t.last_error||''}",
+            "${t.last_error||'—'}",
+            // Audit log
+            "${e.actor||'—'}",
+            "${e.action||'—'}",
+            "${e.target||''}",
+            "${e.target||'—'}",
+            "${e.result||'—'}",
+            // Config table
+            "${r.name}",
+            "${r.scope}",
+            "${cur||'(null)'}",
+            "${def}",
+            "String(pending).replace(/\"/g,'&quot;')",
+        ];
+        for form in raw_forms {
+            assert!(
+                !html.contains(form),
+                "unescaped interpolation still present in page script: {form}"
+            );
+        }
+        // Locals interpolated into inline handler arguments must be escaped
+        // where they are built, not where they are used.
+        for construction in [
+            "const safePath = escArg(",
+            "const safe = escArg(",
+            "const safeParent = escArg(",
+            "const safeVid = escArg(",
+            "const safeName = escArg(",
+        ] {
+            assert!(
+                html.contains(construction),
+                "handler argument must be escaped at construction: {construction}"
+            );
+        }
+        // The old hand-rolled quote-stripping is not an escaper: it leaves
+        // `<` and `"` intact. None of it may survive.
+        assert!(
+            !html.contains(".replace(/'/g, \"&#39;\")")
+                && !html.contains(".replace(/'/g,'&#39;')"),
+            "hand-rolled quote stripping must be replaced by escArg()"
+        );
+    }
+
+    /// A hostile filename flowing through the explorer row builder must not
+    /// be able to open a script element.
+    #[test]
+    fn hostile_filename_produces_no_script_element() {
+        let hostile = "/media/<script>alert(1)</script>.mkv";
+        let row = format!(
+            "<td title=\"{}\">{}</td>",
+            escape_html(hostile),
+            escape_html(hostile)
+        );
+        assert!(
+            !row.contains("<script"),
+            "escaped filename must not contain an unescaped script element: {row}"
+        );
+        assert!(row.contains("&lt;script&gt;"));
+    }
+
+    /// The WebUI response must carry a Content-Security-Policy that blocks
+    /// remote script, plugins, framing and cross-origin form posts.
+    #[test]
+    fn dashboard_declares_restrictive_csp() {
+        let csp = CONTENT_SECURITY_POLICY;
+        assert!(csp.contains("default-src 'self'"), "csp: {csp}");
+        assert!(csp.contains("object-src 'none'"), "csp: {csp}");
+        assert!(csp.contains("base-uri 'none'"), "csp: {csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "csp: {csp}");
+        assert!(csp.contains("connect-src 'self'"), "csp: {csp}");
+        assert!(!csp.contains("unsafe-eval"), "csp must not permit eval: {csp}");
+        assert!(
+            !csp.contains("http:") && !csp.contains("https:") && !csp.contains('*'),
+            "csp must not allow any remote origin: {csp}"
         );
     }
 }

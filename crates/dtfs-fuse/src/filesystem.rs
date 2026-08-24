@@ -59,6 +59,40 @@ pub struct FileLocations {
     pub is_directory: bool,
 }
 
+impl FileLocations {
+    /// REV-2-1 — true when the manager labelled its chunk entries, so the
+    /// index carried by each entry can be trusted.
+    ///
+    /// A manager that predates `ChunkLocationInfo.chunk_index` sends 0 for
+    /// every entry, which is indistinguishable from a real index 0. Treat the
+    /// labels as authoritative only when at least one is non-zero, or when
+    /// there is at most one chunk (where labelled and positional lookup agree
+    /// anyway).
+    fn indices_are_authoritative(&self) -> bool {
+        self.chunks.len() <= 1 || self.chunks.iter().any(|c| c.chunk_index.unwrap_or(0) != 0)
+    }
+
+    /// REV-2-1 — the chunk covering file offset `index * chunk_size`.
+    ///
+    /// The manager builds its response from a `BTreeMap<chunk_index, _>` and
+    /// emits only the VALUES, so the array is DENSE while a file's index space
+    /// may be sparse (a truncate followed by a tail write, a partial
+    /// multi-chunk commit, a location row removed for a whole index). Indexing
+    /// that array by position therefore returned a DIFFERENT chunk's bytes at
+    /// a valid offset — silently, with a valid checksum. Resolve by index
+    /// instead, and report a genuine hole as absent rather than serving a
+    /// neighbour.
+    pub fn chunk_at(&self, index: u64) -> Option<&ChunkInfo> {
+        if self.indices_are_authoritative() {
+            self.chunks
+                .iter()
+                .find(|c| c.chunk_index.unwrap_or(0) == index)
+        } else {
+            self.chunks.get(index as usize)
+        }
+    }
+}
+
 /// Information about a single chunk within a file.
 #[derive(Debug, Clone)]
 pub struct ChunkInfo {
@@ -80,6 +114,12 @@ pub struct ChunkInfo {
     /// shorter); a missing/all-empty entry is treated as an unknown location
     /// (no insert -> arbitrary/pure-distance order).
     pub node_locations: Vec<Location>,
+    /// REV-2-1: this entry's chunk index within the file, straight from the
+    /// manager's `ChunkLocationInfo.chunk_index`. `None` means the entry was
+    /// synthesised locally; an older manager sends 0 for every entry, which
+    /// `FileLocations::indices_are_authoritative` detects so the caller falls
+    /// back to positional lookup.
+    pub chunk_index: Option<u64>,
 }
 
 impl ChunkInfo {
@@ -612,17 +652,48 @@ impl DtfsFilesystem {
         let end_offset = offset + actual_size as u64;
         let end_chunk = ((end_offset + chunk_size - 1) / chunk_size) as usize;
 
-        let mut result = Vec::with_capacity(actual_size as usize);
+        // REV-2-1 — the buffer is pre-zeroed and each chunk is copied to its
+        // OWN offset within the read, not appended. A sparse file may have a
+        // hole in the middle of the requested range; appending would slide
+        // every later chunk's bytes down into the hole.
+        let mut result = vec![0u8; actual_size as usize];
 
-        // Build chunk locations list for readahead.
-        let chunk_locs: Vec<(String, Vec<String>)> = locations
-            .chunks
-            .iter()
-            .map(|c| (c.chunk_id.clone(), c.node_addresses.clone()))
-            .collect();
+        // REV-2-3 — readahead needs each chunk's REAL index (the manager's
+        // array is dense, the index space may be sparse — REV-2-1) plus a
+        // candidate list in the same order the foreground read uses. Both are
+        // built lazily at the cache-miss point below: `chunk_locs` is only
+        // consumed there, and `read_candidates` sorts per chunk, so building
+        // it for every chunk of the file on every 128 KB read would be pure
+        // waste on the (common) cache-hit path.
+        let indices_trusted = locations.indices_are_authoritative();
+        let total_chunks = if indices_trusted {
+            locations
+                .chunks
+                .iter()
+                .filter_map(|c| c.chunk_index)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0) as u32
+        } else {
+            locations.chunks.len() as u32
+        };
 
-        for chunk_idx in start_chunk..end_chunk.min(locations.chunks.len()) {
-            let chunk = &locations.chunks[chunk_idx];
+        for chunk_idx in start_chunk..end_chunk {
+            // REV-2-1 — resolve by chunk index, never by array position. The
+            // manager's array is dense while the file's index space may be
+            // sparse, so positional lookup served a different chunk's bytes.
+            let Some(chunk) = locations.chunk_at(chunk_idx as u64) else {
+                // A genuine hole. Sparse regions read as zeros: `result` is
+                // resized to `actual_size` below, so skipping leaves this
+                // chunk's span zero-filled rather than shifting a later
+                // chunk's bytes into it.
+                debug!(
+                    path = %file_path,
+                    chunk_idx,
+                    "REV-2-1: no chunk entry for this index; serving zeros for the hole"
+                );
+                continue;
+            };
             if chunk.node_addresses.is_empty() {
                 bail!("no data nodes available for chunk {}", chunk.chunk_id);
             }
@@ -806,11 +877,28 @@ impl DtfsFilesystem {
                     }
                 }
 
-                // Trigger readahead for upcoming chunks.
+                // Trigger readahead for upcoming chunks. REV-2-3 — label each
+                // entry with its real index and pre-order its replicas with
+                // `read_candidates`, so the prefetch hits the same replica the
+                // foreground read would pick and caches under the key that
+                // read looks up.
+                let chunk_locs: Vec<(u64, String, Vec<String>)> = locations
+                    .chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, c)| {
+                        let idx = if indices_trusted {
+                            c.chunk_index.unwrap_or(pos as u64)
+                        } else {
+                            pos as u64
+                        };
+                        (idx, c.chunk_id.clone(), self.read_candidates(c))
+                    })
+                    .collect();
                 self.readahead.on_chunk_read(
                     &file_path,
                     chunk_idx as u32,
-                    locations.chunks.len() as u32,
+                    total_chunks,
                     &chunk_locs,
                 );
 
@@ -846,7 +934,16 @@ impl DtfsFilesystem {
             .min(chunk_data.len());
 
             if slice_start < slice_end {
-                result.extend_from_slice(&chunk_data[slice_start..slice_end]);
+                // Destination is this chunk's position within the read, so a
+                // skipped hole stays zero-filled instead of shifting bytes.
+                let dest_start =
+                    (chunk_start_byte + slice_start as u64).saturating_sub(offset) as usize;
+                let dest_end = (dest_start + (slice_end - slice_start)).min(result.len());
+                if dest_start < dest_end {
+                    let take = dest_end - dest_start;
+                    result[dest_start..dest_end]
+                        .copy_from_slice(&chunk_data[slice_start..slice_start + take]);
+                }
             }
         }
 
@@ -940,7 +1037,10 @@ impl DtfsFilesystem {
             };
             if need_seed {
                 if let Some(loc) = &locations_snapshot {
-                    if let Some(chunk) = loc.chunks.get(chunk_idx as usize) {
+                    // REV-2-1 — resolve by index, not by array position:
+                    // seeding the RMW buffer from a NEIGHBOURING chunk would
+                    // write that chunk's bytes back under this chunk's index.
+                    if let Some(chunk) = loc.chunk_at(chunk_idx) {
                         if !chunk.node_addresses.is_empty() {
                             let node = self.select_nearest_node(&chunk.node_addresses);
                             match self.client.read_chunk(&node, &chunk.chunk_id).await {
@@ -1509,6 +1609,10 @@ impl DtfsFilesystem {
                     node_addresses: c.node_addresses,
                     node_tiers: c.node_tiers,
                     node_locations,
+                    // REV-2-1 — carry the manager's label. An older manager
+                    // sends 0 for every entry; `indices_are_authoritative`
+                    // spots that and keeps the positional fallback.
+                    chunk_index: Some(c.chunk_index),
                 }
             })
             .collect();
@@ -1987,6 +2091,86 @@ mod bu2_reroute_tests {
     fn exhausted_chain() -> anyhow::Error {
         let base = anyhow::anyhow!("put_chunk RPC failed (code=ResourceExhausted): full");
         base.context("write_chunk failed on replica data01:9500")
+    }
+}
+
+#[cfg(test)]
+mod rev_2_1_chunk_index_tests {
+    use super::{ChunkInfo, FileLocations};
+
+    /// Built through a free function on purpose: an inline struct literal in
+    /// each test tripped a rustc 1.94 typeck ICE.
+    fn locs(entries: &[(u64, &str)]) -> FileLocations {
+        let chunks = entries
+            .iter()
+            .map(|(idx, id)| ChunkInfo {
+                chunk_id: (*id).to_string(),
+                size: 4 * 1024 * 1024,
+                node_addresses: vec!["http://n1:9500".to_string()],
+                node_tiers: vec!["cold".to_string()],
+                node_locations: Vec::new(),
+                chunk_index: Some(*idx),
+            })
+            .collect();
+        FileLocations {
+            path: "/movies/x.mkv".to_string(),
+            total_size: 0,
+            chunks,
+            volume_id: "default".to_string(),
+            chunk_size: 4 * 1024 * 1024,
+            created_at_ms: 0,
+            modified_at_ms: 0,
+            is_directory: false,
+        }
+    }
+
+    /// REV-2-1: a truncate followed by a tail write leaves a single entry at a
+    /// high index. Positional lookup handed that entry back for offset 0.
+    #[test]
+    fn rev_2_1_sparse_file_never_serves_a_neighbouring_chunk() {
+        let l = locs(&[(25, "h25")]);
+        assert_eq!(l.chunk_at(25).unwrap().chunk_id, "h25");
+        assert!(
+            l.chunk_at(0).is_none(),
+            "offset 0 has no chunk; positional indexing used to hand back h25"
+        );
+    }
+
+    /// REV-2-1: a gap in the index space must not shift later chunks.
+    #[test]
+    fn rev_2_1_a_gap_does_not_shift_later_chunks() {
+        let l = locs(&[(0, "h0"), (2, "h2"), (3, "h3")]);
+        assert_eq!(l.chunk_at(0).unwrap().chunk_id, "h0");
+        assert!(l.chunk_at(1).is_none(), "index 1 is a hole");
+        assert_eq!(
+            l.chunk_at(2).unwrap().chunk_id,
+            "h2",
+            "positional lookup would have returned h2 for index 1 and h3 for 2"
+        );
+        assert_eq!(l.chunk_at(3).unwrap().chunk_id, "h3");
+    }
+
+    /// The common dense case must behave exactly as before.
+    #[test]
+    fn rev_2_1_dense_files_are_unaffected() {
+        let l = locs(&[(0, "h0"), (1, "h1"), (2, "h2")]);
+        for (i, id) in [(0u64, "h0"), (1, "h1"), (2, "h2")] {
+            assert_eq!(l.chunk_at(i).unwrap().chunk_id, id);
+        }
+    }
+
+    /// Back-compat: an older manager sends 0 for EVERY entry, which is
+    /// indistinguishable from a real index 0. Those labels must not be
+    /// trusted, or a multi-chunk file would resolve every index to entry 0.
+    #[test]
+    fn rev_2_1_an_older_manager_falls_back_to_positional() {
+        let mut l = locs(&[(0, "h0"), (0, "h1"), (0, "h2")]);
+        for c in &mut l.chunks {
+            c.chunk_index = Some(0);
+        }
+        assert_eq!(l.chunk_at(1).unwrap().chunk_id, "h1");
+        assert_eq!(l.chunk_at(2).unwrap().chunk_id, "h2");
+        assert!(l.chunk_at(3).is_none(), "past the end is still absent");
     }
 }
 

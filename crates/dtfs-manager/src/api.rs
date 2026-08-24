@@ -3032,6 +3032,47 @@ struct ConfigUpdateRequest {
     acknowledge_cluster_wide: bool,
 }
 
+/// Path of the manager config file rewritten by `write_to_disk`.
+const MANAGER_CONFIG_PATH: &str = "/etc/dtfs/manager.toml";
+
+/// REV-4-3 — render the validated merged config as the TOML that would
+/// replace `manager.toml`, and prove it parses back through the SAME
+/// deserialiser the daemon uses at startup (`load_config` is
+/// `toml::from_str`).
+///
+/// Returns the TOML text, or a human-readable reason to refuse the write.
+/// Anything that cannot be re-parsed here would make the manager fail to
+/// load its own config on the next restart, so it never reaches the disk.
+fn render_manager_toml(cfg: &dtfs_common::config::ManagerConfig) -> Result<String, String> {
+    let rendered = toml::to_string_pretty(cfg)
+        .map_err(|e| format!("config could not be serialised to TOML: {e}"))?;
+    toml::from_str::<dtfs_common::config::ManagerConfig>(&rendered)
+        .map_err(|e| format!("rendered TOML does not parse back as a manager config: {e}"))?;
+    Ok(rendered)
+}
+
+/// REV-4-3 — replace the config file at `path` with `rendered`.
+///
+/// The write goes to a sibling temp file that is `sync_all`ed before the
+/// rename, so a crash mid-write can never leave a truncated config the
+/// manager cannot start from. Any error removes the temp file and leaves
+/// the target exactly as it was.
+fn write_manager_toml_atomic(path: &std::path::Path, rendered: &str) -> Result<(), String> {
+    let tmp = path.with_extension("toml.az5.tmp");
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(rendered.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not write {}: {e}", path.display())
+    })
+}
+
 async fn update_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ConfigUpdateRequest>,
@@ -3113,6 +3154,27 @@ async fn update_config(
             })),
         ));
     }
+    // REV-4-3 — a write_to_disk request replaces the file the manager parses
+    // at startup, so render the TOML and prove it re-parses through the
+    // daemon's own deserialiser BEFORE the Raft write. Refusing here leaves
+    // both the live config and the file on disk exactly as they were; a
+    // rendering that cannot be read back is a manager that does not restart.
+    let pending_toml: Option<String> = match (body.write_to_disk, merged_config.as_ref()) {
+        (true, Some(cfg)) => match render_manager_toml(cfg) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("refusing write_to_disk: {e}"),
+                        "preserved_current": true,
+                    })),
+                ));
+            }
+        },
+        _ => None,
+    };
+
     // CO-5-10 — read the base version and carry it as `expected_version` so
     // the apply can CAS. Two saves racing off the same base both target
     // `base + 1`; the apply rejects the loser instead of letting it
@@ -3152,31 +3214,18 @@ async fn update_config(
         ));
     }
 
-    // AZ-5-A2 / CO-4-3 — optionally persist to disk via atomic tmp+rename.
-    // Always serialise the validated MERGED `ManagerConfig` (set above) to
-    // TOML — never the raw override JSON, which is sparse and not a valid
-    // manager.toml. The merge already type-checked, so a TOML serialisation
-    // failure here is a serializer bug, not operator input; skip the write
-    // rather than poison the file with non-TOML.
+    // AZ-5-A2 / CO-4-3 / REV-4-3 — persist to disk via temp file + fsync +
+    // atomic rename. The text is the validated MERGED `ManagerConfig`
+    // rendered above — never the raw override JSON, which is sparse and not
+    // a valid manager.toml — and it has already been proven to re-parse
+    // through the startup deserialiser, so the manager can always restart
+    // from what we write.
     let mut wrote_to_disk = false;
-    if body.write_to_disk {
-        if let Some(ref cfg) = merged_config {
-            match toml::to_string_pretty(cfg) {
-                Ok(new_toml) => {
-                    let path = std::path::Path::new("/etc/dtfs/manager.toml");
-                    let tmp = path.with_extension("toml.az5.tmp");
-                    if let Err(e) = std::fs::write(&tmp, new_toml.as_bytes())
-                        .and_then(|_| std::fs::rename(&tmp, path))
-                    {
-                        warn!(error = %e, "AZ-5-A2 write_to_disk failed");
-                    } else {
-                        wrote_to_disk = true;
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "CO-4-3 merged config failed TOML serialisation; skipping disk write");
-                }
-            }
+    if let Some(ref rendered) = pending_toml {
+        let path = std::path::Path::new(MANAGER_CONFIG_PATH);
+        match write_manager_toml_atomic(path, rendered) {
+            Ok(()) => wrote_to_disk = true,
+            Err(e) => warn!(error = %e, "AZ-5-A2 write_to_disk failed"),
         }
     }
 
@@ -3982,6 +4031,89 @@ mod co_4_3_config_override_validation_tests {
     }
 }
 
+/// REV-4-3 — `write_to_disk` replaces the file the manager parses at
+/// startup. CO-4-3 stopped the raw-JSON fallback; these cover what was
+/// still missing: proving the *rendered TOML* re-parses through the
+/// startup deserialiser, fsyncing before the rename, and never leaving a
+/// temp file (or a truncated config) behind on an error path.
+#[cfg(test)]
+mod config_persist_tests {
+    use super::*;
+
+    fn base_config() -> dtfs_common::config::ManagerConfig {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/examples/manager.toml");
+        dtfs_common::config::load_config(&path)
+            .expect("deploy/examples/manager.toml must parse as ManagerConfig")
+    }
+
+    fn scratch_file(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("dtfs-config-persist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir.join(name)
+    }
+
+    /// The rendered text must be real TOML that the daemon's own startup
+    /// deserialiser accepts — never JSON, and never a rendering that only
+    /// serialises one way.
+    #[test]
+    fn render_validates_by_reparsing_its_own_output() {
+        let rendered = render_manager_toml(&base_config()).expect("example config renders");
+        assert!(
+            !rendered.trim_start().starts_with('{'),
+            "manager.toml must never be handed raw JSON: {}",
+            &rendered[..rendered.len().min(80)],
+        );
+        assert!(rendered.contains("[node]"), "expected TOML sections");
+        toml::from_str::<dtfs_common::config::ManagerConfig>(&rendered)
+            .expect("rendered TOML must parse back as a ManagerConfig");
+    }
+
+    /// The happy path: the file is replaced atomically, reloads through
+    /// `load_config`, and no temp file survives the call.
+    #[test]
+    fn atomic_write_reloads_and_leaves_no_temp() {
+        let path = scratch_file("valid.toml");
+        std::fs::write(&path, b"# previous operator config\n").unwrap();
+        let mut cfg = base_config();
+        cfg.tiering.evaluation_interval_secs = 61;
+        let rendered = render_manager_toml(&cfg).expect("renders");
+        write_manager_toml_atomic(&path, &rendered).expect("write succeeds");
+
+        let reloaded: dtfs_common::config::ManagerConfig =
+            dtfs_common::config::load_config(&path).expect("written file parses at startup");
+        assert_eq!(reloaded.tiering.evaluation_interval_secs, 61);
+        assert_eq!(reloaded.node.hostname, cfg.node.hostname);
+        assert!(
+            !path.with_extension("toml.az5.tmp").exists(),
+            "temp file must not survive a successful write",
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A write that cannot complete must leave the existing config exactly
+    /// as it was and drop its temp file — the pre-fix path left
+    /// `manager.toml.az5.tmp` residue next to the real config.
+    #[test]
+    fn failed_write_leaves_no_temp_residue() {
+        // A directory in place of the target file makes the rename fail
+        // after the temp file has already been created and fsynced.
+        let path = scratch_file("as-a-directory.toml");
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir_all(&path).expect("occupy the target path with a directory");
+        let rendered = render_manager_toml(&base_config()).expect("renders");
+        let err = write_manager_toml_atomic(&path, &rendered)
+            .expect_err("renaming over a directory must fail");
+        assert!(err.contains("could not write"), "got: {err}");
+        assert!(
+            !path.with_extension("toml.az5.tmp").exists(),
+            "temp file must be cleaned up on the error path",
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
 #[cfg(test)]
 mod co_5_9_defaults_readback_tests {
     use super::*;
@@ -4752,6 +4884,12 @@ async fn flush_cache_endpoint(
     Json(body): Json<FlushCacheRequest>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     use axum::http::StatusCode;
+
+    // REV-1-1 — leader-only. The flush deletes chunk bytes with a direct
+    // data-node RPC and then records the removal through Raft; served by a
+    // follower the delete lands and the metadata write does not, so the
+    // location entries survive pointing at bytes that are gone.
+    check_is_leader(&state)?;
 
     // Safety gate: empty prefix matches every file.
     if body.path_prefix.is_empty() && !body.allow_empty_prefix {
