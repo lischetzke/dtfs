@@ -82,6 +82,45 @@ EOF
     echo "$_MGR_SHARED_SECRET_CACHED"
 }
 
+# LIS-19 / LIS-55 / LIS-83 � build the gRPC metadata a data-plane RPC needs
+# when `cluster.shared_secret` is set, as grpcurl `-H` arguments in the global
+# array DATA_RPC_HDRS. The canonical MAC message is
+#   "dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n"
+# hashed HMAC-SHA256 with the cluster secret (dtfs_common::crypto).
+# `binding` is empty for PutChunk/ListChunks, the chunk_id for
+# DeleteChunk/GetChunk/VerifyChunk, and "chunk_id|target" for ReplicateChunk.
+#
+# On a cluster with no secret the array is left EMPTY on purpose: the data node
+# skips verification entirely there, so an unstamped call is the correct call.
+# The stamp stays valid for DATA_RPC_MAX_SKEW_SECS (300s), so one call covers a
+# whole page walk.
+#   data_rpc_stamp ListChunks ""
+#   grpcurl "${DATA_RPC_HDRS[@]}" ...
+data_rpc_stamp() {
+    local method="$1" binding="${2:-}"
+    DATA_RPC_HDRS=()
+    local secret="${DTFS_SHARED_SECRET:-}"
+    if [ -z "$secret" ]; then
+        secret=$(mgr_shared_secret 2>/dev/null || true)
+    fi
+    [ -n "$secret" ] || return 0
+    local out
+    out=$(python3 - "$secret" "$method" "$binding" <<'PYSTAMP'
+import hashlib, hmac, sys, time
+secret, method, binding = sys.argv[1], sys.argv[2], sys.argv[3]
+ts = int(time.time())
+msg = "dtfs-data-rpc\nv1\n{}\n{}\n{}\n".format(method, ts, binding).encode()
+print(ts)
+print(hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest())
+PYSTAMP
+) || return 1
+    local ts mac
+    ts=$(printf '%s\n' "$out" | sed -n 1p)
+    mac=$(printf '%s\n' "$out" | sed -n 2p)
+    [ -n "$ts" ] && [ -n "$mac" ] || return 1
+    DATA_RPC_HDRS=(-H "x-dtfs-rpc-ts: $ts" -H "x-dtfs-rpc-mac: $mac")
+}
+
 # ─── Remote-host helpers ─────────────────────────────────────────
 ssh_run()    { ssh "${SSH_OPTS[@]}" "debian@$1" "$2"; }
 client_run() { ssh_run "$CLIENT" "$1"; }

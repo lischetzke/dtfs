@@ -117,8 +117,16 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
 
 ### Follow-ups opened while executing
 
-- `REV-4-11` ⬜ release cases for REV-3-2, REV-4-4, REV-4-5 (all cluster-visible
-  per § B.5).
+- `REV-4-11` ✅ release cases for REV-3-2, REV-4-4, REV-4-5 (all cluster-visible
+  per § B.5): `87-listchunks-paging-incremental` (ascending ids, exclusive
+  cursor, `chunk_mtimes_ms` alignment), `88-scrub-survives-bad-chunk` (torn
+  `.meta` + unreadable bucket counted, disk pass still reports a result), and
+  `89-write-slots-no-phantom-cache` (`overhead_mb` = 256 with no `[cache]`
+  term; `slots` recomputed from the node's own config). 87/89 are in
+  `QUICK_CASES`; 88 waits on a scrub pass so it stays out. New shared helper
+  `data_rpc_stamp` in `tests/release/lib/common.sh` builds the LIS-19/55/83
+  data-plane HMAC as grpcurl `-H` args (empty on a no-secret cluster, which is
+  the correct call there).
 - `REV-4-12` ✅ **moot on this base.** CO-4-3 already merges the sparse patch
   onto the running config and validates the merged whole, so the "Apply + write
   to disk" button still works; REV-4-3 only refuses payloads whose merged result
@@ -128,9 +136,29 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
   A.8 updated; `run_monitor_with_cache` deleted). `cache.rs` itself is kept,
   unwired, with a header explaining why it must not be re-wired for whole
   chunks.
-- `REV-4-14` ⬜ `docs/src/access/fuse-mount.md:139` claims a volume without warm
-  caching ignores the `first_write_tier` hint. No such check exists. Fix the doc
-  or implement the valve.
+- `REV-4-14` ✅ docs corrected (the valve was NOT implemented: adding one would
+  be an unrequested behaviour change, and the durability guarantee the doc
+  claimed it provided is already provided by the anchor requirement plus the
+  ack floor). Probing the code turned up two further false claims on the same
+  two pages, all three now fixed in `docs/src/access/fuse-mount.md` and
+  `docs/src/configuration/fuse-client.md`:
+  1. **No `cache_replicas` valve.** `resolve_preferred_tier` looks only at
+     which tiers healthy nodes advertise; it never reads the volume cache
+     policy, so `cache_replicas.warm.max = 0` does not veto a hint.
+  2. **No datacenter affinity.** `place_chunks_with_anchor` builds its rule
+     with `prefer_client_locations: false` and the allocate path never carries
+     the writing client’s location, so `"nearest-warm"` cannot prefer the
+     client’s own DC. The name is aspirational.
+  3. **The anchor copy is usually NOT deferred.** `anchor_datacenter` is passed
+     to the ring as `required_datacenter`, which swaps one slot to an anchor-DC
+     node (tier constraint relaxed for that slot). With an anchor set and an ack
+     floor >= 2 the anchor copy lands in the same allocation; the AV-3-3
+     anchor-lag-repair path only applies when no anchor-DC candidate exists.
+
+  Open gap left deliberately: if DC-local first writes are actually wanted, that
+  is a placement change (thread the requester location into `allocate_chunks`
+  and set `prefer_client_locations`), not a client config change. Not in scope
+  here; the docs now say so instead of implying it already works.
 
 ## Cross-cutting invariants
 
@@ -140,6 +168,21 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
 - No `--no-verify`, no amending pushed commits.
 
 ## Verification log
+
+- **REV-4-11** — 2026-08-24. Release cases 87/88/89 added plus the
+  `data_rpc_stamp` helper. `bash -n` clean on all four touched scripts; the
+  helper was smoke-run locally and emits
+  `x-dtfs-rpc-ts` / `x-dtfs-rpc-mac` matching
+  `crypto::data_rpc_mac_message` framing byte for byte. **Not yet executed
+  against a cluster** — the lab was unreachable for this session, so the live
+  half stays 🟨 until `tests/release/run.sh --quick` runs on the campaign
+  cluster.
+
+- **case 13 wait_for** — 2026-08-24. The REV-2-5 cache-purge step called
+  `wait_for <desc> <secs> <cmd-string>` against a
+  `wait_for <secs> <desc> <cmd...>` helper, so the poll never ran an iteration
+  and the case failed immediately. Fixed; every other `wait_for` call site in
+  `tests/release/` was audited and this was the only misuse.
 
 - **REV-2-1a / REV-2-5 / REV-2-6** — 2026-08-21. `cargo test -p dtfs-manager
   --release`: 300 passed after the proto change. All touched shell scripts
