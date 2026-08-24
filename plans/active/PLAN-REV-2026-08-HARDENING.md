@@ -117,8 +117,16 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
 
 ### Follow-ups opened while executing
 
-- `REV-4-11` ⬜ release cases for REV-3-2, REV-4-4, REV-4-5 (all cluster-visible
-  per § B.5).
+- `REV-4-11` ✅ release cases for REV-3-2, REV-4-4, REV-4-5 (all cluster-visible
+  per § B.5): `87-listchunks-paging-incremental` (ascending ids, exclusive
+  cursor, `chunk_mtimes_ms` alignment), `88-scrub-survives-bad-chunk` (torn
+  `.meta` + unreadable bucket counted, disk pass still reports a result), and
+  `89-write-slots-no-phantom-cache` (`overhead_mb` = 256 with no `[cache]`
+  term; `slots` recomputed from the node's own config). 87/89 are in
+  `QUICK_CASES`; 88 waits on a scrub pass so it stays out. New shared helper
+  `data_rpc_stamp` in `tests/release/lib/common.sh` builds the LIS-19/55/83
+  data-plane HMAC as grpcurl `-H` args (empty on a no-secret cluster, which is
+  the correct call there).
 - `REV-4-12` ✅ **moot on this base.** CO-4-3 already merges the sparse patch
   onto the running config and validates the merged whole, so the "Apply + write
   to disk" button still works; REV-4-3 only refuses payloads whose merged result
@@ -140,6 +148,21 @@ Status: ⬜ todo / 🟦 wip / ✅ done / 🟥 blocked / 🟨 review (authored, n
 - No `--no-verify`, no amending pushed commits.
 
 ## Verification log
+
+- **REV-4-11** — 2026-08-24. Release cases 87/88/89 added plus the
+  `data_rpc_stamp` helper. `bash -n` clean on all four touched scripts; the
+  helper was smoke-run locally and emits
+  `x-dtfs-rpc-ts` / `x-dtfs-rpc-mac` matching
+  `crypto::data_rpc_mac_message` framing byte for byte. **Not yet executed
+  against a cluster** — the lab was unreachable for this session, so the live
+  half stays 🟨 until `tests/release/run.sh --quick` runs on the campaign
+  cluster.
+
+- **case 13 wait_for** — 2026-08-24. The REV-2-5 cache-purge step called
+  `wait_for <desc> <secs> <cmd-string>` against a
+  `wait_for <secs> <desc> <cmd...>` helper, so the poll never ran an iteration
+  and the case failed immediately. Fixed; every other `wait_for` call site in
+  `tests/release/` was audited and this was the only misuse.
 
 - **REV-2-1a / REV-2-5 / REV-2-6** — 2026-08-21. `cargo test -p dtfs-manager
   --release`: 300 passed after the proto change. All touched shell scripts
