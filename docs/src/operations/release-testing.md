@@ -42,7 +42,7 @@ that bug closes.
 
 ## Adding a case
 
-1. Add `tests/release/cases/NN-name.sh`.
+1. Add `tests/release/cases/NN-name.sh`. **`NN` must be unique across the whole directory** — take the next free number, do not reuse one. Two cases sharing a number both still run (the harness globs full filenames), but the number stops identifying a scenario, which is how seven collisions accumulated across parallel bug series.
 2. Source `tests/release/lib/common.sh` at the top.
 3. Register `trap case_cleanup EXIT` and define `case_cleanup`.
 4. Last line of stdout MUST be `STATUS: PASS|FAIL|SKIP|KNOWN_ISSUE [<bug>]`.
@@ -89,7 +89,7 @@ scenario depends on un-shipped functionality.
 | 88 | scrub-survives-bad-chunk | a torn `.meta` and an unreadable bucket are counted, not fatal — the disk pass still completes (REV-4-4) | — |
 | 89 | write-slots-no-phantom-cache | put_chunk slots sized from the memory cap alone, with no `[cache]` budget reserved (REV-4-5) | yes |
 
-(cases 21–82 cover later bug-fix and security regressions; see `tests/release/cases/`.)
+(cases 21–82 and 90–95 cover later bug-fix and security regressions; see `tests/release/cases/`.)
 
 ## Chaos / cross-DC / balance run (3dc lab)
 

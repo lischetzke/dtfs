@@ -36,7 +36,7 @@ echo "[1/5] preconditions: two FUSE mounts active on $CLIENT"
 fuse2_active || skip "second FUSE unit $FUSE_UNIT2 not active on $CLIENT"
 
 echo "[2/5] start a live write on the SECOND mount (holds a lease, host=$CLIENT)"
-B="$MOUNT2/release/41-cd-live-$$.bin"
+B="$MOUNT2/release/90-cd-live-$$.bin"
 # Long-running streaming write keeps the lease held + renewing for the window.
 ssh_run "$CLIENT" "sudo sh -c 'dd if=/dev/zero of=\"$B\" bs=1M count=2048 oflag=direct status=none' >/dev/null 2>&1 &"
 sleep 3

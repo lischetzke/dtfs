@@ -27,6 +27,16 @@ for arg in "$@"; do
     esac
 done
 
+# A case number is how an operator refers to a scenario in a report, so it has
+# to identify exactly one. Duplicates still RUN (the loop below globs full
+# filenames and logs per stem), which is why seven of them accumulated unnoticed
+# across parallel bug series -- warn loudly instead of failing the suite.
+DUP_NUMS=$(ls "$HERE"/cases/*.sh 2>/dev/null | xargs -n1 basename | cut -d- -f1 \
+           | sort | uniq -d | tr '\n' ' ')
+if [ -n "${DUP_NUMS// /}" ]; then
+    echo "==> WARNING: duplicate release-case numbers: $DUP_NUMS" >&2
+fi
+
 # Quick subset = the fast critical-path cases.
 # Security / live-coverage stems (LIS-18/19/20/41): unique numbers after the
 # former triple collision under 60- (monitor-leader-gate stays at 60).
