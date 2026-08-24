@@ -289,8 +289,11 @@ pub struct DtfsFilesystem {
     readahead: ReadAheadEngine,
     /// Write buffer for coalescing writes.
     write_buffer: WriteBuffer,
-    /// Migration trigger for requesting closer replicas.
-    migration: MigrationTrigger,
+    /// Migration trigger for requesting closer replicas. WI-09 — held as an
+    /// `Arc` so `read()` can spawn the advisory RPC (`spawn_on_remote_read`)
+    /// instead of awaiting it inline while holding a `known_locations`
+    /// DashMap guard (CO-3-12 anti-pattern).
+    migration: std::sync::Arc<MigrationTrigger>,
     /// Known node locations for nearest-node selection.
     /// Populated as we discover node addresses from metadata responses.
     known_locations: DashMap<String, Location>,
@@ -331,14 +334,24 @@ impl DtfsFilesystem {
             // Bug CE — byte budget, not entry count. 256 entries x whole
             // chunks OOM-killed the 1 GB client; bound by config bytes now.
             (config.readahead.cache_mb.max(1) as usize) * 1024 * 1024,
+            // WI-05 — cap on concurrent prefetch GetChunk streams so the
+            // near chunk isn't starved by an uncapped fan-out on a slow
+            // link (e.g. the 40 Mbps LELI path).
+            config.readahead.prefetch_max_inflight.max(1) as usize,
         );
 
-        let write_buffer = WriteBuffer::new(chunk_size_bytes);
+        // WI-01 — hold back complete chunks until `flush_batch_chunks` of
+        // them exist, amortizing the allocate+commit round trip over a
+        // batch instead of firing once per chunk (default 4).
+        let write_buffer = WriteBuffer::new_with_batch(
+            chunk_size_bytes,
+            config.write.flush_batch_chunks as usize,
+        );
 
-        let migration = MigrationTrigger::new(
+        let migration = std::sync::Arc::new(MigrationTrigger::new(
             client.clone(),
             client_location.clone(),
-        );
+        ));
 
         // P0-1: lease owner = "<topology host>:<pid>:". Using the topology
         // host (set via fuse.toml) keeps the identity stable across PID
@@ -751,6 +764,38 @@ impl DtfsFilesystem {
                 }
             }
 
+            // WI-05 (Step 4) + B2 — a chunk already ON THE WIRE as a
+            // prefetch is JOINED, not duplicated. Only the FIRST candidate
+            // is tried: prefetch targets `read_candidates`' head (REV-2-3),
+            // the same replica this read would pick, so no other key can
+            // hold a pending entry for this chunk — and trying only one
+            // candidate keeps the worst case at exactly one
+            // `readahead::PREFETCH_JOIN_TIMEOUT` per chunk. `join_pending`
+            // returns `None` immediately for a queued-but-not-started
+            // prefetch, and after 2s for a stalled one, so the
+            // unconditional fall-through below always runs the ordinary
+            // candidate loop (P0-2 replica fallback stays reachable) well
+            // inside case 69's `ELAPSED <= TMO*3` budget.
+            if chunk_data.is_none() {
+                if let Some(cand) = candidates.first() {
+                    if let Some(joined) = self
+                        .readahead
+                        .join_pending(cand, &chunk.chunk_id, crate::readahead::PREFETCH_JOIN_TIMEOUT)
+                        .await
+                    {
+                        debug!(
+                            chunk_id = %chunk.chunk_id,
+                            node = %cand,
+                            "readahead prefetch join hit"
+                        );
+                        chunk_data = Some(joined);
+                        if cache_hit_notify_addr.is_none() {
+                            cache_hit_notify_addr = Some(cand.clone());
+                        }
+                    }
+                }
+            }
+
             // Bug AV (AV-4-1c) — fire-and-forget notification so the
             // data-node's per-DC counter sees this read. The actual
             // I/O completed via the cache; the RPC is purely metrics.
@@ -853,6 +898,12 @@ impl DtfsFilesystem {
                         )
                     })
                 })?;
+                debug!(
+                    chunk_id = %chunk.chunk_id,
+                    node = %node_addr,
+                    size = data.len(),
+                    "chunk fetch complete (foreground miss)"
+                );
 
                 // CRITICAL: store the just-fetched chunk in the cache so
                 // subsequent FUSE reads (which arrive in 128 KB pieces
@@ -905,15 +956,24 @@ impl DtfsFilesystem {
                 // Trigger migration check using the actually-served node so
                 // tiering sees the real cross-DC traffic, not the nearest
                 // candidate we wished we'd used.
-                if let Some(node_loc) = self.known_locations.get(&node_addr) {
-                    let node_loc = node_loc.clone();
-                    let chunk_id = chunk.chunk_id.clone();
-                    let file_path = file_path.clone();
-                    let volume_id = volume_id.clone();
-                    let migration = &self.migration;
-                    migration
-                        .on_remote_read(&chunk_id, &node_loc, &file_path, &volume_id)
-                        .await;
+                //
+                // WI-09 (CO-3-12) — `.map(|r| r.clone())` drops the
+                // DashMap `Ref` guard at the end of this statement, before
+                // `spawn_on_remote_read` runs, so no `known_locations`
+                // shard guard is held across the spawn (previously the
+                // if-let bound the guard itself for the whole body and an
+                // inline `.await` on the migration RPC could hold it for
+                // up to the ~15s manager-walk deadline, blocking any
+                // concurrent `learn_locations` insert into that shard).
+                // The RPC is fire-and-forget: its result is advisory only.
+                let node_loc = self.known_locations.get(&node_addr).map(|r| r.clone());
+                if let Some(node_loc) = node_loc {
+                    self.migration.clone().spawn_on_remote_read(
+                        &chunk.chunk_id,
+                        node_loc,
+                        &file_path,
+                        &volume_id,
+                    );
                 }
 
                 data

@@ -7,6 +7,7 @@
 // Requests are rate-limited per chunk to avoid flooding the manager with
 // duplicate migration requests.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -22,6 +23,18 @@ const MIGRATION_COOLDOWN: Duration = Duration::from_secs(5 * 60); // 5 minutes
 /// trigger a migration request. Reads from the same rack or same host
 /// are considered local.
 const MIGRATION_DISTANCE_THRESHOLD: LocationDistance = LocationDistance::SameDatacenter;
+
+/// WI-09 / H4 — hard bound on the cooldown map. Its entries are only
+/// useful for `MIGRATION_COOLDOWN`, and this crate runs no periodic
+/// pruner (`prune_expired` had no caller), so without a bound the map
+/// grows one entry per remote-read chunk for the process lifetime — an
+/// unbounded heap leak on the client whose whole point is a
+/// `hard_cap_mb` budget (A.3.2). 4096 entries is ~0.5 MB and covers far
+/// more than one `MIGRATION_COOLDOWN` window of cross-DC misses. The
+/// cooldown is an advisory rate limiter, not correctness state, so
+/// dropping it at the ceiling costs at most one extra advisory RPC per
+/// chunk.
+const MAX_PENDING_MIGRATIONS: usize = 4096;
 
 /// Triggers background data migration when remote reads are detected.
 ///
@@ -46,6 +59,40 @@ impl MigrationTrigger {
             client_location,
             pending_migrations: DashMap::new(),
         }
+    }
+
+    /// WI-09 — fire-and-forget wrapper around [`on_remote_read`](Self::on_remote_read).
+    ///
+    /// This is an advisory hint: the manager RPC it issues
+    /// (`allocate_chunks`) is read-only on the manager side and its
+    /// response is discarded here, so it triggers no actual data movement
+    /// by itself. It must never block the caller's read path — the RPC
+    /// runs through `DtfsClient::call_manager`, which sets no per-call
+    /// deadline and retries `Unavailable` by walking the manager pool for
+    /// up to `MANAGER_WALK_DEADLINE_MS` (15s), against a channel connect
+    /// timeout of 5s and a request timeout of 60s. Awaiting it inline
+    /// after the chunk bytes are already in hand can stall a completed
+    /// read for that long during an election or against a blackholed
+    /// manager. Spawn it instead and let it run to completion (or fail) in
+    /// the background.
+    ///
+    /// Takes an owned `Arc<Self>` (rather than `&self`) so it can move a
+    /// live handle into the spawned task; callers hold the trigger behind
+    /// an `Arc` and pass a cheap `Arc::clone`.
+    pub fn spawn_on_remote_read(
+        self: Arc<Self>,
+        chunk_id: &str,
+        node_location: Location,
+        file_path: &str,
+        volume_id: &str,
+    ) {
+        let chunk_id = chunk_id.to_string();
+        let file_path = file_path.to_string();
+        let volume_id = volume_id.to_string();
+        tokio::spawn(async move {
+            self.on_remote_read(&chunk_id, &node_location, &file_path, &volume_id)
+                .await;
+        });
     }
 
     /// Called after a chunk is read from a data node. Determines whether the
@@ -90,6 +137,24 @@ impl MigrationTrigger {
             }
         }
 
+        // H4 — bound the map before growing it further. Try a prune first
+        // (cheap, and the common case where the ceiling is mostly expired
+        // entries); if it's still at the ceiling with live entries, the
+        // cooldown is doing its job under sustained cross-DC traffic and
+        // there's nothing more useful to prune, so clear it outright. This
+        // is an advisory rate limiter, not correctness state (see the Err
+        // arm below), so losing cooldowns at the ceiling is harmless.
+        if self.pending_migrations.len() >= MAX_PENDING_MIGRATIONS {
+            self.prune_expired();
+            if self.pending_migrations.len() >= MAX_PENDING_MIGRATIONS {
+                warn!(
+                    entries = self.pending_migrations.len(),
+                    "migration cooldown map at its ceiling with live entries; clearing (advisory rate limiter only)"
+                );
+                self.pending_migrations.clear();
+            }
+        }
+
         // Record the request timestamp (before the async call to prevent
         // concurrent duplicate requests).
         self.pending_migrations
@@ -119,8 +184,16 @@ impl MigrationTrigger {
                     error = %e,
                     "migration allocation request failed"
                 );
-                // Remove from pending so it can be retried sooner.
-                self.pending_migrations.remove(chunk_id);
+                // WI-09 — do NOT remove the pending entry here. This is a
+                // fire-and-forget advisory hint now (see
+                // spawn_on_remote_read); a manager outage means every
+                // concurrent remote cache miss for this chunk hits this
+                // Err arm, and clearing the cooldown on failure would spawn
+                // one RPC per miss instead of one per chunk per
+                // MIGRATION_COOLDOWN. The entry was already inserted above
+                // regardless of outcome, so leaving it in place here is a
+                // no-op for the success path and a rate limiter for the
+                // failure path.
             }
         }
     }
@@ -138,7 +211,8 @@ impl MigrationTrigger {
         self.pending_migrations.len()
     }
 
-    /// Prune expired cooldown entries to free memory. Call periodically.
+    /// Prune expired cooldown entries to free memory. Called from
+    /// `on_remote_read` when the map reaches `MAX_PENDING_MIGRATIONS`.
     pub fn prune_expired(&self) {
         let mut to_remove = Vec::new();
         for entry in self.pending_migrations.iter() {
@@ -206,5 +280,138 @@ mod tests {
         assert_eq!(trigger.pending_count(), 1);
         assert!(!trigger.is_pending("old-chunk"));
         assert!(trigger.is_pending("new-chunk"));
+    }
+
+    /// WI-09 / M2 — `spawn_on_remote_read` must run none of
+    /// `on_remote_read`'s body on the caller's stack; it must only spawn a
+    /// task that runs it in the background.
+    ///
+    /// This is an ORDERING check, deterministic on the current-thread test
+    /// runtime (`#[tokio::test]` default): a `tokio::spawn`ed task is not
+    /// polled until this function's next `.await`. So if any of
+    /// `on_remote_read` ran inline, its FIRST side effect — the cooldown
+    /// insert, which happens before the RPC — would already be visible
+    /// immediately when `spawn_on_remote_read` returns, before this test
+    /// ever yields. Do NOT add `flavor = "multi_thread"`: the determinism
+    /// depends on the current-thread runtime, where nothing else can run
+    /// the spawned task ahead of schedule.
+    ///
+    /// The `known_locations` half of the WI-09 root cause (the caller must
+    /// drop its DashMap `Ref` guard before spawning) is structural, not
+    /// testable here — `filesystem.rs` binds the location with
+    /// `.map(|r| r.clone())` so the guard drops before the spawn (AGENTS.md
+    /// A.8 / CO-3-12) — and is gated live by
+    /// `tests/release/cases/99-read-survives-manager-outage.sh`.
+    #[tokio::test]
+    async fn wi09_spawn_on_remote_read_runs_nothing_inline() {
+        // No managers configured: `call_manager` bails instantly with "no
+        // managers configured" — no sockets touched.
+        let client = DtfsClient::new();
+        let trigger = Arc::new(MigrationTrigger::new(client, make_location("us", "east")));
+        // A different datacenter (same region) is >= MIGRATION_DISTANCE_THRESHOLD
+        // (SameDatacenter), so the RPC path is taken rather than the
+        // early-return "local read" path.
+        let node_location = make_location("us", "west");
+
+        trigger
+            .clone()
+            .spawn_on_remote_read("chunk-1", node_location, "/movie.mkv", "vol1");
+
+        assert!(
+            !trigger.is_pending("chunk-1"),
+            "on_remote_read ran on the caller's stack - spawn_on_remote_read must not execute any of it inline"
+        );
+
+        for _ in 0..64 {
+            if trigger.is_pending("chunk-1") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            trigger.is_pending("chunk-1"),
+            "the spawned task never ran - the hint must still be issued in the background, not dropped"
+        );
+    }
+
+    /// WI-09 — a failed RPC (manager unreachable) must NOT clear the
+    /// cooldown entry, or a manager outage turns the 5-minute
+    /// `MIGRATION_COOLDOWN` into a spawn-per-remote-cache-miss storm.
+    #[tokio::test]
+    async fn failed_request_keeps_cooldown() {
+        // No managers configured: `call_manager` bails instantly with "no
+        // managers configured" — no socket touched, no delay.
+        let client = DtfsClient::new();
+        let trigger = MigrationTrigger::new(client, make_location("us", "east"));
+        let node_location = make_location("us", "west");
+
+        trigger
+            .on_remote_read("chunk-1", &node_location, "/movie.mkv", "vol1")
+            .await;
+
+        assert!(
+            trigger.is_pending("chunk-1"),
+            "a failed migration RPC must not clear the cooldown entry"
+        );
+        assert_eq!(trigger.pending_count(), 1);
+    }
+
+    /// H4 — `pending_migrations` must never grow past `MAX_PENDING_MIGRATIONS`,
+    /// whether the ceiling is reached with mostly-expired entries (the prune
+    /// path keeps the map bounded without losing the fresh entry) or with
+    /// mostly-live entries (the clear path fires; the cooldown is advisory
+    /// only, so losing it is acceptable).
+    #[tokio::test]
+    async fn h4_pending_migrations_is_bounded() {
+        // No managers configured, so on_remote_read's RPC returns fast.
+        let client = DtfsClient::new();
+        let trigger = MigrationTrigger::new(client, make_location("us", "east"));
+        let node_location = make_location("us", "west");
+
+        // Fill the map to the ceiling with expired entries.
+        for i in 0..MAX_PENDING_MIGRATIONS {
+            trigger.pending_migrations.insert(
+                format!("expired-{i}"),
+                Instant::now() - Duration::from_secs(600),
+            );
+        }
+        assert_eq!(trigger.pending_count(), MAX_PENDING_MIGRATIONS);
+
+        trigger
+            .on_remote_read("fresh", &node_location, "/f", "vol1")
+            .await;
+
+        assert!(
+            trigger.pending_count() <= MAX_PENDING_MIGRATIONS,
+            "prune path should have kept the map at or under the ceiling, got {}",
+            trigger.pending_count()
+        );
+        assert!(
+            trigger.is_pending("fresh"),
+            "the prune path must keep the newly inserted entry"
+        );
+
+        // Refill the map to the ceiling with live (non-expired) entries.
+        trigger.clear();
+        for i in 0..MAX_PENDING_MIGRATIONS {
+            trigger
+                .pending_migrations
+                .insert(format!("live-{i}"), Instant::now());
+        }
+        assert_eq!(trigger.pending_count(), MAX_PENDING_MIGRATIONS);
+
+        trigger
+            .on_remote_read("fresh2", &node_location, "/f", "vol1")
+            .await;
+
+        assert!(
+            trigger.pending_count() <= MAX_PENDING_MIGRATIONS,
+            "clear path should have kept the map at or under the ceiling, got {}",
+            trigger.pending_count()
+        );
+        assert!(
+            trigger.is_pending("fresh2"),
+            "the clear path must still leave the newly inserted entry pending"
+        );
     }
 }
