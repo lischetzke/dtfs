@@ -10,7 +10,7 @@
 source "$(dirname "$0")/../lib/common.sh"
 
 PROTO_DIR="$(cd "$(dirname "$0")/../../../proto" 2>/dev/null && pwd)"
-PREFIX=/release/79-data-rpc-auth-replicate-$$/
+PREFIX=/release/94-data-rpc-auth-replicate-$$/
 PATHF="${MOUNT}${PREFIX}f.bin"
 APIF="${PATHF#$MOUNT}"
 
