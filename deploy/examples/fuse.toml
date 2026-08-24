@@ -62,6 +62,9 @@ mountpoint = "/mnt/dtfs"
 #prefetch_next_files = 3
 #cache_mb = 64                      # Bug CE: byte budget for the in-memory
                                     # prefetch cache (eviction, not a hard fail)
+#prefetch_max_inflight = 2          # WI-05: cap on concurrent prefetch GetChunk
+                                    # streams; keeps the near chunk from starving
+                                    # on slow links (e.g. the 40 Mbps LELI link)
 
 [cache]
 # Local on-disk read cache (P0-11). Omit local_cache_dir to disable.
@@ -93,6 +96,15 @@ mountpoint = "/mnt/dtfs"
                                     # tier holds the chunk (safe, slower).
                                     # "nearest-warm": ACK on a warm replica,
                                     # anchor copy follows asynchronously.
+# WI-01: number of complete chunks the write buffer holds back before
+# flushing, amortizing the AllocateChunks + CommitChunkLocations round trip
+# over a batch instead of firing once per chunk. Effective range 1..=32
+# (values outside are clamped). WI-01 / H1: effective batch is additionally
+# capped so batch * chunk_size <= 64 MB, so the un-committed ceiling per
+# open write never exceeds 64 MB (default 4 x 4 MB = 16 MB; a 128 MB-chunk
+# volume falls back to per-chunk flushing). 1 restores the pre-WI-01
+# per-chunk-flush behaviour exactly.
+#flush_batch_chunks = 4
 
 #[memory]
 # CF-5: per-process RAM budget + pressure ladder. 0 = unbounded (legacy).

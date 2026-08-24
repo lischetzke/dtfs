@@ -102,6 +102,7 @@ Controls speculative prefetching of chunks and files to reduce read latency for 
 | `prefetch_chunks` | `readahead.prefetch_chunks` | `u32` | `8` | 0--64 | Yes | Number of subsequent chunks to prefetch when sequential access is detected. Set to `0` to disable chunk-level prefetching while keeping file-level prefetching active. |
 | `prefetch_next_files` | `readahead.prefetch_next_files` | `u32` | `3` | 0--20 | Yes | Number of subsequent files in the same directory to prefetch. Only applies when `mode` is `"folder-sequential"`. |
 | `cache_mb` | `readahead.cache_mb` | `u64` | `64` | >=1 | Yes | Byte budget (MB) for the in-memory prefetch cache (Bug CE). The cache evicts to stay under this regardless of chunk size, so whole-file reads cannot OOM the FUSE process. |
+| `prefetch_max_inflight` | `readahead.prefetch_max_inflight` | `u32` | `2` | >=1 (`0` degrades to `1`) | Yes | WI-05: maximum number of prefetch `GetChunk` streams allowed on the wire at once. The prefetch window stays `prefetch_chunks` deep; this only bounds concurrency, nearest chunk first. Keep `cache_mb >= (prefetch_chunks + prefetch_max_inflight) * client.chunk_size_mb` so the prefetch window cannot evict itself mid-flight. |
 
 ### Example
 
@@ -110,6 +111,7 @@ Controls speculative prefetching of chunks and files to reduce read latency for 
 mode = "folder-sequential"
 prefetch_chunks = 8
 prefetch_next_files = 3
+prefetch_max_inflight = 2
 ```
 
 ---
@@ -142,6 +144,7 @@ Controls how the FUSE client requests chunk placement at write time. Combined wi
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
 | `first_write_tier` | `write.first_write_tier` | `string` | `"cold"` | `"cold"`, `"nearest-warm"` | No (restart FUSE) | Tier preference for first-chunk placement, and a tier preference only. `"cold"` (default) sends no hint, so the manager uses the volume’s own effective tier at the volume’s replica count. `"nearest-warm"` asks for the warm tier; the manager honours it whenever any healthy node advertises a warm disk, and the replica count is clamped up to `write_safety.min_replicas_before_ack` (REV-4-10). The hint has NO datacenter affinity — placement runs with `prefer_client_locations = false` and never sees the writing client’s location — and the volume’s `anchor_datacenter` still forces one replica slot into the anchor DC in the same allocation. Any unrecognised value falls back to `"cold"` for forward-compat safety. |
+| `flush_batch_chunks` | `write.flush_batch_chunks` | `integer` | `4` | `1`-`32` (clamped, and further clamped so `flush_batch_chunks * chunk_size_mb <= 64`) | No (restart FUSE) | WI-01 — number of complete, chunk-aligned chunks the write buffer holds back before issuing one `AllocateChunks` + `CommitChunkLocations` round trip, instead of one round trip per chunk. Divides both RPC counts by roughly this factor on a sequential streaming write. WI-01 / H1 — the effective batch is additionally capped so `batch * chunk_size <= 64 MB`, so the client's un-committed buffer ceiling per open write never exceeds 64 MB regardless of `chunk_size_mb` (default `4 * 4 MB = 16 MB`; a 128 MB-chunk volume falls back to per-chunk flushing) — size it against the client's `[memory] hard_cap_mb`. `flush(fh)`/close always drains any held-back chunks regardless of this setting, so nothing is stranded past fsync. `1` reproduces the pre-WI-01 per-chunk-flush behaviour exactly (the rollback value). |
 
 ### Example
 
