@@ -17,7 +17,7 @@
 source "$(dirname "$0")/../lib/common.sh"
 
 MGR_TOML=/etc/dtfs/manager.toml
-BAK=$MGR_TOML.case81.bak
+BAK=$MGR_TOML.case95.bak
 DEAD_ADDR=192.0.2.1:9401
 
 TARGET=$(mgrs_list | awk '{print $1}')

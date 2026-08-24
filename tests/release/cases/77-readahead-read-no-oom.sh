@@ -33,7 +33,7 @@ PID0=$(fuse_pid)
 echo "  fuse pid=$PID0"
 
 echo "[2/6] write a ${SIZE_MB} MB file through the mount"
-F=$(make_fuse_file "release/40-ce-$$.bin" "$SIZE_MB")
+F=$(make_fuse_file "release/77-ce-$$.bin" "$SIZE_MB")
 [ -n "$F" ] || fail "could not create fixture"
 
 echo "[3/6] drop client cache so the read re-fetches chunks from data nodes"
