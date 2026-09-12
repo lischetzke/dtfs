@@ -238,13 +238,27 @@ impl LocalChunkCache {
     /// Retrieve a cached chunk and (conditionally) refresh its atime so
     /// the size-based LRU eviction sees it as recently used.
     ///
-    /// `bytes_hint` is the byte count the caller intends to consume from
-    /// this fetch. If `bytes_hint >= ATIME_UPDATE_MIN_BYTES` we treat the
-    /// read as a "view" event and bump atime to now. Otherwise it's a
-    /// scanner read and we explicitly RESTORE the pre-read atime — the
-    /// OS auto-updates atime on read() so without the restore even
-    /// scanner reads would refresh LRU position and defeat the design.
+    /// `bytes_hint` is the byte count of the CURRENT kernel read call, so
+    /// with 128 KB FUSE reads (no `max_read`/`max_pages` configured) this
+    /// is always well under `ATIME_UPDATE_MIN_BYTES` (1 MiB) and every
+    /// playback read gets classified as a scanner (FUSE-11). Kept for
+    /// compatibility; new callers should use [`get_with_hint`](Self::get_with_hint)
+    /// with a viewer/scanner decision that accounts for per-fh cumulative
+    /// consumption, not one kernel call's length.
     pub async fn get(&self, chunk_id: &str, bytes_hint: usize) -> Option<Bytes> {
+        self.get_with_hint(chunk_id, bytes_hint >= ATIME_UPDATE_MIN_BYTES).await
+    }
+
+    /// Retrieve a cached chunk and (conditionally) refresh its atime so the
+    /// size-based LRU eviction sees it as recently used.
+    ///
+    /// `is_viewer` is the caller's own viewer/scanner classification (see
+    /// [`crate::filesystem::is_viewer_read`] — FUSE-11): `true` treats the
+    /// read as a "view" event and bumps atime to now; `false` is a scanner
+    /// read, so the pre-read atime is explicitly RESTORED — the OS
+    /// auto-updates atime on read() so without the restore even scanner
+    /// reads would refresh LRU position and defeat the design.
+    pub async fn get_with_hint(&self, chunk_id: &str, is_viewer: bool) -> Option<Bytes> {
         let path = self.path_for(chunk_id);
         if !path.exists() {
             return None;
@@ -252,7 +266,7 @@ impl LocalChunkCache {
         let pre = tfs::metadata(&path).await.ok().and_then(|m| m.accessed().ok());
         // REV-2-4 — verify before serving; a rotten entry is a MISS.
         let data = self.read_verified(chunk_id, &path).await?;
-        if bytes_hint >= ATIME_UPDATE_MIN_BYTES {
+        if is_viewer {
             // Viewer read — set atime to now.
             let now = SystemTime::now();
             let _ = filetime::set_file_atime(
