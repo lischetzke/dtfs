@@ -138,15 +138,15 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR-4-1 | ⬜ | DATA-1 | `crates/dtfs-data/src/store.rs` `quarantine_chunk_on_disk` ~1502, scrub fault classification ~1226-1301 | `quarantine_chunk_on_disk`: `rename` `.dat` → `.dtfs/quarantine/<id>.dat.bad` (never `remove_file`). Before quarantining a `stat`/`meta_read`/`meta_parse`/missing-meta fault: hash the `.dat` incrementally; digest == id → rewrite `.meta` (tmp+rename, see CR-4-2), count healthy, do NOT push to `corrupt_chunk_ids`. Only a hash mismatch or unreadable `.dat` quarantines. Quarantine dir size is reported in the heartbeat disk usage (best effort; note if skipped). | store unit: (a) good `.dat` + 0-byte `.meta` → scrub repairs meta, no corrupt id; (b) bad `.dat` → quarantined, `.dat.bad` exists with original bytes; (c) `.dat` missing → corrupt id (unchanged). | Tests fail before, pass after. |
-| CR-4-2 | ⬜ | DATA-2 | `store.rs` `commit_chunk_from_tmp_inner` meta write ~566, `recover_from_wal` PutChunk arm ~1007 | Write `.meta` to `tmp/<uuid>.meta.tmp`, `sync_all`, `rename` over final, `fsync_dir`. Recovery: WAL(Put) present + `.meta` unparseable → same as meta-missing (rebuild from `.dat` hash or roll back per CO-1-4b). | store unit: inject a 0-byte `.meta` + WAL → recovery repairs/rolls back; concurrent duplicate put while `get_chunk_meta` loops → never a parse error. | Tests fail before, pass after. |
-| CR-4-3 | ⬜ | DATA-4 | `store.rs` `commit_chunk_from_tmp_inner` ~544-579 | On any error AFTER the `rename(tmp → final_dat)`: remove `final_dat`, `final_meta` (if any), `wal_path`, then return the error. | store unit: fail the meta write (inject via a read-only chunk dir or a size-limited tmpfs shim) → no `.dat`, no WAL left. | Test fails before, passes after. |
-| CR-4-4 | ⬜ | DATA-3 | `store.rs` `ChunkStore` (new `chunk_locks`), `commit_chunk_from_tmp_inner`, `delete_chunk_idempotent_on_disk`, WAL naming ~538/~723, `recover_from_wal` | Striped per-chunk `tokio::sync::Mutex<()>` (256 stripes by first byte of the id) held across commit and delete. WAL files `<id>.put.wal.json` / `<id>.delete.wal.json`; recovery reads both plus legacy `<id>.wal.json`. | store unit: interleaved put/delete of the same id under a barrier → final state is either (dat+meta) or (neither), never one without the other; recovery test with both WAL kinds present. | Tests pass; property-style loop (≥ 200 iterations) never observes a torn state. |
-| CR-4-5 | ⬜ | DATA-5 (server half) | `crates/dtfs-data/src/server.rs` `put_chunk` ~428-508 | After `finalize()`: `if !first.chunk_id.is_empty() && first.chunk_id != computed_hex → Status::data_loss("declared chunk_id does not match received bytes")`; tmp guard cleans up, nothing committed. | server unit: declared id mismatch → `data_loss`, no `.dat`; empty declared id → accepted (compat). | Tests fail before, pass after. |
-| CR-4-6 | ⬜ | DATA-7, DATA-9 | `store.rs` ~585 counters, `server.rs` `verify_chunk` ~816 | Counters: check `final_dat && final_meta` exist before the rename, skip step 5 when already present (repoint the CO-5-5 test at `commit_chunk_from_tmp`). VerifyChunk: `if stat_size != meta.size → valid:false, error:"size mismatch"` before hashing. | store unit: duplicate commit leaves counters unchanged; server unit: `.dat` with trailing garbage → `valid:false`. | Tests fail before, pass after. |
-| CR-4-7 | ⬜ | DATA-10 | `server.rs` `chunk_hex::decode` ~964 | Replace with `ChunkId::from_hex` (or `s.get(i..i+2)`); non-ASCII → `invalid_argument`. | unit: `"a\u{e9}a"` → Err, no panic. | Test fails (panics) before, passes after. |
-| CR-4-8 | ⬜ | — | `tests/release/cases/107-scrub-repairs-torn-meta.sh` | Truncate a `.meta` on a data node, trigger scrub, assert chunk still readable and `.dat.bad` absent. | `bash -n` clean. | Present, unexecuted. |
-| CR-4-9 | ⬜ | — | `AGENTS.md` A.3.3 #4, A.6 items 2-5 | Quarantine-by-rename, atomic `.meta`, post-rename cleanup, per-chunk lock + op-keyed WAL. | — | Same commit. |
+| CR-4-1 | ✅ | DATA-1 | `crates/dtfs-data/src/store.rs` `quarantine_chunk_on_disk` ~1502, scrub fault classification ~1226-1301 | `quarantine_chunk_on_disk`: `rename` `.dat` → `.dtfs/quarantine/<id>.dat.bad` (never `remove_file`). Before quarantining a `stat`/`meta_read`/`meta_parse`/missing-meta fault: hash the `.dat` incrementally; digest == id → rewrite `.meta` (tmp+rename, see CR-4-2), count healthy, do NOT push to `corrupt_chunk_ids`. Only a hash mismatch or unreadable `.dat` quarantines. Quarantine dir size is reported in the heartbeat disk usage (best effort; note if skipped). | store unit: (a) good `.dat` + 0-byte `.meta` → scrub repairs meta, no corrupt id; (b) bad `.dat` → quarantined, `.dat.bad` exists with original bytes; (c) `.dat` missing → corrupt id (unchanged). | Tests fail before, pass after. |
+| CR-4-2 | ✅ | DATA-2 | `store.rs` `commit_chunk_from_tmp_inner` meta write ~566, `recover_from_wal` PutChunk arm ~1007 | Write `.meta` to `tmp/<uuid>.meta.tmp`, `sync_all`, `rename` over final, `fsync_dir`. Recovery: WAL(Put) present + `.meta` unparseable → same as meta-missing (rebuild from `.dat` hash or roll back per CO-1-4b). | store unit: inject a 0-byte `.meta` + WAL → recovery repairs/rolls back; concurrent duplicate put while `get_chunk_meta` loops → never a parse error. | Tests fail before, pass after. |
+| CR-4-3 | ✅ | DATA-4 | `store.rs` `commit_chunk_from_tmp_inner` ~544-579 | On any error AFTER the `rename(tmp → final_dat)`: remove `final_dat`, `final_meta` (if any), `wal_path`, then return the error. | store unit: fail the meta write (inject via a read-only chunk dir or a size-limited tmpfs shim) → no `.dat`, no WAL left. | Test fails before, passes after. |
+| CR-4-4 | ✅ | DATA-3 | `store.rs` `ChunkStore` (new `chunk_locks`), `commit_chunk_from_tmp_inner`, `delete_chunk_idempotent_on_disk`, WAL naming ~538/~723, `recover_from_wal` | Striped per-chunk `tokio::sync::Mutex<()>` (256 stripes by first byte of the id) held across commit and delete. WAL files `<id>.put.wal.json` / `<id>.delete.wal.json`; recovery reads both plus legacy `<id>.wal.json`. | store unit: interleaved put/delete of the same id under a barrier → final state is either (dat+meta) or (neither), never one without the other; recovery test with both WAL kinds present. | Tests pass; property-style loop (≥ 200 iterations) never observes a torn state. |
+| CR-4-5 | ✅ | DATA-5 (server half) | `crates/dtfs-data/src/server.rs` `put_chunk` ~428-508 | After `finalize()`: `if !first.chunk_id.is_empty() && first.chunk_id != computed_hex → Status::data_loss("declared chunk_id does not match received bytes")`; tmp guard cleans up, nothing committed. | server unit: declared id mismatch → `data_loss`, no `.dat`; empty declared id → accepted (compat). | Tests fail before, pass after. |
+| CR-4-6 | ✅ | DATA-7, DATA-9 | `store.rs` ~585 counters, `server.rs` `verify_chunk` ~816 | Counters: check `final_dat && final_meta` exist before the rename, skip step 5 when already present (repoint the CO-5-5 test at `commit_chunk_from_tmp`). VerifyChunk: `if stat_size != meta.size → valid:false, error:"size mismatch"` before hashing. | store unit: duplicate commit leaves counters unchanged; server unit: `.dat` with trailing garbage → `valid:false`. | Tests fail before, pass after. |
+| CR-4-7 | ✅ | DATA-10 | `server.rs` `chunk_hex::decode` ~964 | Replace with `ChunkId::from_hex` (or `s.get(i..i+2)`); non-ASCII → `invalid_argument`. | unit: `"a\u{e9}a"` → Err, no panic. | Test fails (panics) before, passes after. |
+| CR-4-8 | ✅ | — | `tests/release/cases/107-scrub-repairs-torn-meta.sh` | Truncate a `.meta` on a data node, trigger scrub, assert chunk still readable and `.dat.bad` absent. | `bash -n` clean. | Present, unexecuted. |
+| CR-4-9 | ✅ | — | `AGENTS.md` A.3.3 #4, A.6 items 2-5 | Quarantine-by-rename, atomic `.meta`, post-rename cleanup, per-chunk lock + op-keyed WAL. | — | Same commit. |
 
 ### Group 5 — Auth + control-plane hardening (branch `bug/cr-5-control-plane`)
 
@@ -685,3 +685,108 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   pointing at a new `### dtfs-raft/src/state_machine.rs` section in
   `docs/src/internals/invariants.md` § A.8 carrying the full CR-2-1..2-6
   narrative.
+
+## Deviations (Group 4)
+
+- **Commits grouped by file, not strictly one-per-task.** CR-4-2, CR-4-3,
+  CR-4-4, CR-4-1, and the store half of CR-4-6 all edit the SAME two
+  functions in `crates/dtfs-data/src/store.rs`
+  (`commit_chunk_from_tmp_inner`, `delete_chunk_idempotent_on_disk`) plus
+  `recover_from_wal` and the `scrub_disk` fault-classification loop —
+  each later task's diff lands inside code the previous task just
+  changed (CR-4-3's post-rename cleanup wraps CR-4-2's
+  `write_meta_atomic` call; CR-4-4's per-chunk lock wraps the whole of
+  both; CR-4-6's dedup check sits right next to CR-4-2/4-3's edits in the
+  same function). They were implemented and tested in the plan's stated
+  order (4-2, 4-3, 4-4, 4-1, then 4-6) — each layer's tests pass before
+  the next is added, per the verification log below — but landed as ONE
+  commit (`store.rs` + `dtfs-common/src/types.rs`) because splitting the
+  final interleaved diff back into non-overlapping per-task hunks after
+  the fact would cut lines that belong to more than one task. Similarly,
+  CR-4-5, the server half of CR-4-6, and CR-4-7 all land in one
+  `server.rs`-only commit (these three genuinely don't overlap each
+  other in the file, but are grouped with the store-layer split for a
+  consistent one-commit-per-file shape across Group 4). `chunks_meta_
+  repaired` (CR-4-1) is a NEW field on `dtfs_common::types::ScrubResult`,
+  `#[serde(default)]`-guarded per A.3.1, even though `ScrubResult` isn't
+  itself Raft-snapshotted (only `ScrubResultSummary`, which CR-4-1 does
+  not touch, is); the guard is cheap and keeps the struct's back-compat
+  story uniform.
+- **CR-4-1 quarantine dir size in heartbeat disk usage**: not implemented
+  (noted in the sketch as "best effort; note if skipped"). The disk-usage
+  heartbeat payload reports `df`-level free/used bytes already inclusive
+  of `.dtfs/quarantine/`, so a quarantined `.dat.bad` already counts
+  against capacity the operator sees — a separate quarantine-only figure
+  would be a new metric, not a fix to an existing gap, and is out of
+  scope for "smallest fix that turns the test green."
+- **CR-4-8 release case not executed** — no lab session in this run, per
+  the plan's Build/verify environment section; `bash -n` clean, follows
+  the `tests/release/README.md` contract (`source lib/common.sh`, `trap
+  case_cleanup EXIT`, `pass`/`fail`/`skip` helpers, single `STATUS:` line).
+
+## Verification log (Group 4)
+
+- **CR-4-2 / CR-4-3 / CR-4-4 / CR-4-1** 2026-09-12, Docker
+  `dtfs-buildenv:latest`, `cargo test -p dtfs-data --release`: 98 -> 106
+  passed, 0 failed (8 new: `cr_4_2_write_meta_atomic_leaves_no_partial_
+  on_rename_failure`, `cr_4_2_put_wal_replay_rolls_back_torn_meta`,
+  `cr_4_3_meta_write_failure_after_rename_leaves_no_residue`,
+  `cr_4_4_concurrent_commit_and_delete_never_tears_chunk` (200-iteration
+  property loop racing `commit_chunk_from_tmp`/`delete_chunk_idempotent`
+  on one id via `tokio::join!`), `cr_4_4_recovery_reads_put_delete_and_
+  legacy_wal_names`, `cr_4_1_scrub_repairs_torn_meta_from_good_dat`,
+  `cr_4_1_bad_dat_quarantined_by_rename_not_delete`, `cr_4_1_dat_hash_
+  mismatch_with_bad_meta_stays_corrupt`). Repointed the existing
+  `co_4_2_deep_scrub_survives_one_bad_meta` test at the new behaviour
+  (a torn-but-verifiable `.meta` is now repaired, not quarantined:
+  `chunks_healthy` 1 -> 2, `chunks_meta_repaired` 1, `corrupt_chunk_ids`
+  empty). Verified by the above tests: A.6 #2 (atomic `.meta`), #4/#5
+  (never delete-by-id without checking; quarantine-by-rename), #5
+  (`commit_chunk_from_tmp` removes residue on any error path, before AND
+  after rename).
+- **CR-4-5** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-data --release`: 106 -> 109 passed, 0 failed (3 new, real
+  in-process gRPC round trip via a new `run_put_chunk` test helper since
+  `tonic::Streaming` can't be hand-constructed:
+  `cr_4_5_put_chunk_declared_id_mismatch_rejected` (asserts
+  `Code::DataLoss`, no chunk under either id), `cr_4_5_put_chunk_empty_
+  declared_id_accepted`, `cr_4_5_put_chunk_matching_declared_id_
+  accepted`). Verified by the above: A.3.3 #1 (end-to-end checksum
+  actually enforced against the caller's own declaration, not just
+  computed and trusted).
+- **CR-4-6** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-data --release`: 109 -> 111 passed, 0 failed (2 new:
+  `cr_4_6_duplicate_commit_from_tmp_must_not_double_count` (repoints
+  CO-5-5's invariant at `commit_chunk_from_tmp`, the path `put_chunk`
+  RPC actually calls), `cr_4_6_verify_chunk_detects_size_mismatch`).
+  Verified by the above: A.6 #4 (counters only for a genuinely new
+  chunk, now also on the streaming commit path).
+- **CR-4-7** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-data --release`: 111 -> 112 passed, 0 failed (1 new:
+  `cr_4_7_non_ascii_chunk_id_rejected_not_panicked`). All four
+  `chunk_hex::decode` call sites (GetChunk/DeleteChunk/VerifyChunk/
+  ReplicateChunk) replaced with `ChunkId::from_hex`, which rejects
+  non-ASCII input before any byte-index slicing; the now-dead
+  `chunk_hex` module was removed.
+- **Workspace** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test
+  --release --workspace`: dtfs-cli 12, dtfs-client 31, dtfs-common 106
+  (unchanged — `chunks_meta_repaired` needed no new test, covered by the
+  CR-4-1 store tests via `ScrubResult`), dtfs-data 112, dtfs-fuse 99
+  (untouched), dtfs-manager 367 (untouched), dtfs-raft 105 (untouched);
+  all passed, 0 failed. No regressions against baseline + Group 1-3
+  counts.
+- **CR-4-8** 2026-09-12. `tests/release/cases/107-scrub-repairs-torn-
+  meta.sh` added: finds a real committed chunk on a live data node,
+  truncates its `.meta` to 0 bytes via ssh, triggers a manager-driven
+  deep scrub, asserts the `.meta` is repaired (non-empty) and no
+  `.dtfs/quarantine/<id>.dat.bad`/`.meta.bad` breadcrumb was created.
+  `bash -n` clean; not executed (no lab session this run).
+- **CR-4-9** 2026-09-12. AGENTS.md A.3.3 #4 gained the quarantine-by-
+  rename + repair-before-quarantine sentence; the A.6 checklist summary
+  line gained clauses for CR-4-1 (#7), CR-4-2 (#2-3), CR-4-3/CR-4-4 (#5).
+  `.claude/rules/integrity.md` items 3, 5, and 7 gained the full
+  CR-4-1..4-4 narrative (atomic `.meta`, post-rename cleanup, per-chunk
+  lock + op-keyed WAL, quarantine-by-rename + scrub repair).
+  `docs/src/internals/invariants.md` gained a new `## A.6 — Data-node
+  durability hardening (CR-4)` section carrying the full narrative for
+  all four fixes. No code change; docs-only commit.
