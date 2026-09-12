@@ -1049,7 +1049,27 @@ fn apply_request(
         }
 
         ClientRequest::DeleteFile { path } => {
+            // RAFT-7 — a bare `sm.files.remove(path)` leaked the file's
+            // write lease + posix locks forever (re-creating the same path
+            // within `lease_ms` hit a stale WriteLeaseConflict), and never
+            // checked for children, so FUSE's `rmdir` -> `unlink` deleted
+            // only the directory marker while the tree underneath stayed
+            // live — `rm -r` reported success with files remaining.
+            let prefix = format!("{path}/");
+            let has_children = sm
+                .files
+                .range(prefix.clone()..)
+                .take_while(|(k, _)| k.starts_with(&prefix))
+                .next()
+                .is_some();
+            if has_children {
+                return ClientResponse::Error {
+                    message: format!("DeleteFile: '{path}' directory not empty"),
+                };
+            }
             sm.files.remove(path);
+            sm.write_leases.remove(path);
+            sm.posix_locks.remove(path);
             push_audit_capped(&mut sm.audit_log, audit(format!("DeleteFile: {path}")));
             ClientResponse::Success
         }
@@ -4679,6 +4699,45 @@ mod posix_path_regression {
             Some(six_mb),
             "a sparse-grow size ahead of the committed chunks must not shrink"
         );
+    }
+
+    // ── RAFT-7 — DeleteFile must drop lease/locks and refuse a non-empty
+    // directory ──────────────────────────────────────────────────────
+
+    #[test]
+    fn raft_7_delete_file_removes_lease_and_locks() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/f".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::AcquireWriteLease {
+            path: "/f".into(), owner_id: "writer-1".into(), lease_ms: 60_000, now_ms: 1_000,
+            proposed_lease_id: "lease-1".into(),
+        });
+        assert!(sm.write_leases.contains_key("/f"));
+        let resp = apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::DeleteFile { path: "/f".into() });
+        assert!(matches!(resp, ClientResponse::Success));
+        assert!(!sm.files.contains_key("/f"));
+        assert!(!sm.write_leases.contains_key("/f"),
+            "lease must be dropped, or a re-create within lease_ms hits a stale WriteLeaseConflict");
+    }
+
+    #[test]
+    fn raft_7_delete_nonempty_directory_is_refused() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/a/".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+            path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        let resp = apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::DeleteFile { path: "/a".into() });
+        assert!(matches!(resp, ClientResponse::Error { .. }),
+            "rmdir of a non-empty directory must be refused, got {resp:?}");
+        assert!(sm.files.contains_key("/a"), "dir survives refusal");
+        assert!(sm.files.contains_key("/a/x"), "child survives refusal");
     }
 }
 

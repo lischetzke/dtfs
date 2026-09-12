@@ -1604,6 +1604,15 @@ impl ManagerService for MetadataService {
             })
             .await?;
 
+        // CR-2-4 (RAFT-7) — DeleteFile now refuses a non-empty directory
+        // (ClientResponse::Error). The chunk fan-out below must NOT run in
+        // that case: the file was never removed, so its chunks are still
+        // live and deleting them would corrupt a tree the apply just
+        // refused to touch. Bail out before computing/spawning the fan-out.
+        if let ClientResponse::Error { message } = &resp {
+            return Err(Status::failed_precondition(message.clone()));
+        }
+
         // Now best-effort fan-out chunk deletes. Group by node so we
         // open one connection per target. `plan_delete_fanout` returns
         // tonic-ready endpoints (Bug N fix: the registry grpc_addr is
@@ -1735,11 +1744,8 @@ impl ManagerService for MetadataService {
             }
         });
 
-        match resp {
-            ClientResponse::Success => Ok(Response::new(DeleteFileResponse { success: true })),
-            ClientResponse::Error { message } => Err(Status::not_found(message)),
-            _ => Ok(Response::new(DeleteFileResponse { success: true })),
-        }
+        // Only Success reaches here — Error already returned above.
+        Ok(Response::new(DeleteFileResponse { success: true }))
     }
 
     async fn list_directory(
