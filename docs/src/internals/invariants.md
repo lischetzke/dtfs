@@ -451,15 +451,43 @@ temperature path ran on every reported chunk regardless of its volume's
 cache policy — bypassing `promote_reads`/the operator-flush cooldown and,
 for chunks with zero total reads, misclassifying as Frozen and
 scheduling a doomed Tape migration every tick. The intercept now
-resolves the real `file_path` (`scheduler::files_referencing_chunk`) and
-the replica's real tier on `node_id` (`scheduler::live_replica_tier`,
-looked up via the file's chunk row for that node) through a pure
-`resolve_chunk_read_context(sm, chunk_id, node_id)`, skipping the report
-entirely when the chunk resolves to no known file. `tiering::evaluate`
-also gained its own defence: a new pure `legacy_path_should_skip(
-file_path, path_to_volume, av_cache_volumes)` skips a profile whose
-`file_path` doesn't resolve to any known file at all (as `""` never
-does), in addition to the existing CO-4-6 AV-volume skip.
+resolves the real `file_path` and the replica's real tier on `node_id`
+via `scheduler::live_replica_tier`. `tiering::evaluate` also gained its
+own defence: a new pure `legacy_path_should_skip(file_path,
+path_to_volume, av_cache_volumes)` skips a profile whose `file_path`
+doesn't resolve to any known file at all (as `""` never does), in
+addition to the existing CO-4-6 AV-volume skip.
+
+**R1/MGR-3 (PR #107 review):** the first cut resolved each entry
+one-by-one via a single-chunk `resolve_chunk_read_context(sm, chunk_id,
+node_id)` — an O(files x chunks) `files_referencing_chunk` scan per
+entry — while holding `self.sm_data.read()` across every
+`tiering.report_access(...).await` call in the loop (each of which
+takes tiering's own `access_stats` write lock). An N-entry
+`ReportChunkReads` batch therefore cost O(N x total_chunks) work under
+the SM read lock, and — because `tokio::sync::RwLock` is fair — blocked
+the Raft apply writer (and every other SM reader) for the duration: the
+same MGR-3 anti-pattern already flagged for `build_av_cache_snapshot`.
+Fixed by a new pure `build_chunk_read_context_index(files, nodes,
+wanted, node_id)` that resolves every wanted chunk hash in ONE pass
+over `sm.files` (first-referencing-file semantics preserved: the path
+comes from the first file whose BTreeMap/lexicographic position holds
+any row of that hash; the tier comes from a row in that SAME file whose
+`node_id` matches the reporter). The intercept now builds this index
+under one short `sm_data.read()`, drops the lock, then loops
+`report_access` with no SM lock held at all.
+
+**R2/MGR-1 (PR #107 review):** `resolve_chunk_read_context` (kept as
+the single-chunk helper the unit tests exercise directly) and the new
+batch index both used to fall back to `DiskTier::Hot` when the
+reporting node's replica couldn't be resolved as live (unknown disk, or
+the node/disk Down/Failed/Removed) — reintroducing exactly the
+fabricated-tier bug this task fixed: `evaluate` would still plan a
+bogus Hot->Warm "demote" off a tier that was never actually being
+served. Both now resolve to `None` (no entry / no tier) for an
+unresolvable replica, and the intercept skips `report_access` entirely
+for such an entry (logged at `debug`) instead of feeding the engine a
+synthetic tier.
 
 **CR-3-6 (MGR-7):** the heartbeat's integrity-fault-batch block
 (sibling to the `ReportChunkReads` handling above) had the same

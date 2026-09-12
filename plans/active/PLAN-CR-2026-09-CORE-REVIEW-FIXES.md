@@ -651,6 +651,33 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   CR-3-3/CR-3-6 block under the `metadata.rs` A.8 entry. No code change;
   docs-only commit.
 
+- **CR-3-3 review fixups (R1/R2, coordinator PR #107 review)** 2026-09-12,
+  Docker `dtfs-buildenv:latest`, `cargo test -p dtfs-manager --release`:
+  365 -> 367 passed (net +2: removed
+  `cr_3_3_dead_replica_falls_back_to_hot_tier`, added
+  `metadata::tests::cr_3_3_dead_replica_resolves_to_none`,
+  `metadata::tests::cr_3_3_batch_index_resolves_only_wanted_hashes`,
+  `metadata::tests::cr_3_3_batch_index_omits_unresolvable_hash`),
+  0 failed. **R1/MGR-3** — the `ReportChunkReads` intercept held the SM
+  read lock across every `tiering.report_access(...).await` in the loop
+  (each of which takes tiering's own `access_stats` write lock) and
+  called `resolve_chunk_read_context` (an O(files x chunks)
+  `files_referencing_chunk` scan) per entry, so an N-entry heartbeat
+  cost O(N x total_chunks) under the SM read lock while blocking the
+  fair Raft apply writer. Replaced with a new pure
+  `build_chunk_read_context_index(files, nodes, wanted, node_id)` that
+  resolves every wanted chunk hash in ONE pass over `sm.files`; the
+  intercept now builds the index under one short `sm_data.read()`,
+  drops the lock, then loops `report_access` with no SM lock held.
+  **R2/MGR-1** — `resolve_chunk_read_context` (kept as the single-chunk
+  helper for direct testing) and the new batch index both stopped
+  falling back to `DiskTier::Hot` when a replica's tier can't be
+  resolved as live; that reintroduced the fabricated-tier bug CR-3-3
+  set out to fix. Both now resolve to `None`/no-entry for a dead
+  replica, and the intercept skips `report_access` entirely for such an
+  entry (`tracing::debug!` on the skip) instead of feeding the engine a
+  synthetic tier.
+
 - **CR-2-8** 2026-09-12. Added one sentence each to AGENTS.md A.3.1
   (the `now_ms` convention for a `ClientRequest` field that lands in
   replicated state) and the A.8 `state_machine.rs` table row (sticky-

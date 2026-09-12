@@ -823,15 +823,23 @@ fn node_id_from_grpc_addr(sm: &StateMachineData, addr: &str) -> String {
         .unwrap_or_else(|| addr.to_string())
 }
 
-/// CR-3-3/MGR-1 — resolve the real `file_path` + the replica's real tier
-/// on `node_id` for a `ReportChunkReads` entry, so the tiering intercept
-/// stops feeding the engine a synthetic `""` / `DiskTier::Hot` profile.
-/// Returns `None` for a chunk that references no known file (already
-/// deleted/GC'd, or never existed) — the caller skips the report rather
-/// than fabricate data. Tier resolution goes through
-/// `scheduler::live_replica_tier` so a Down/Failed node or Failed/
-/// Removed disk resolves to `None` (falls back to `Hot`, same as the
-/// unknown-tier case) rather than a serviceable-looking tier.
+/// CR-3-3/MGR-1 — resolve the real `file_path` + the replica's real,
+/// LIVE tier on `node_id` for a single `ReportChunkReads` entry, so the
+/// tiering intercept stops feeding the engine a synthetic `""` /
+/// `DiskTier::Hot` profile. Returns `None` when the chunk references no
+/// known file (already deleted/GC'd, or never existed) OR when the
+/// reporting node's replica cannot be resolved as LIVE via
+/// `scheduler::live_replica_tier` (unknown disk, or the node/disk is
+/// Down/Failed/Removed) — R2/MGR-1 review: falling back to a fake
+/// `DiskTier::Hot` here reintroduces exactly the fabricated-tier bug
+/// this task set out to fix (`evaluate` would plan a bogus Hot->Warm
+/// "demote" for an unresolvable replica). The caller skips the report
+/// entirely on `None` rather than fabricate data.
+///
+/// This single-chunk helper stays for direct unit testing; the real
+/// `ReportChunkReads` intercept uses the batch
+/// `build_chunk_read_context_index` below (R1/MGR-3) so a heartbeat with
+/// N entries costs one pass over `sm.files`, not N.
 fn resolve_chunk_read_context(
     sm: &StateMachineData,
     chunk_id: &str,
@@ -847,10 +855,67 @@ fn resolve_chunk_read_context(
             .find(|c| c.chunk_hash == chunk_id && c.node_id == node_id_str)
             .map(|c| c.disk_id)
     });
-    let tier = disk_id
-        .and_then(|d| crate::scheduler::live_replica_tier(sm.nodes.get(&node_id), d))
-        .unwrap_or(DiskTier::Hot);
+    let tier = disk_id.and_then(|d| crate::scheduler::live_replica_tier(sm.nodes.get(&node_id), d))?;
     Some((file_path, tier))
+}
+
+/// R1/MGR-3 — build the `(file_path, live_tier)` lookup for exactly the
+/// chunk ids in `wanted` (one `ReportChunkReads` batch) with a SINGLE
+/// pass over `sm.files`, instead of one `files_referencing_chunk`
+/// O(files x chunks) scan per reported chunk. Pre-fix, the intercept
+/// held the SM read lock across every `tiering.report_access(...).await`
+/// in the per-entry loop (each of which takes tiering's own
+/// `access_stats` write lock) AND re-scanned the whole file tree per
+/// entry — O(N x total_chunks) work under the SM read lock for an
+/// N-entry heartbeat, blocking the (fair) Raft apply writer for the
+/// duration (the MGR-3 anti-pattern).
+///
+/// For each wanted `chunk_hash`, records the FIRST referencing file's
+/// path (by `sm.files`' BTreeMap/lexicographic order, matching
+/// `files_referencing_chunk`'s "first match" semantics) and, within
+/// THAT SAME file's rows, the live tier of the row whose `node_id`
+/// matches the reporting node (`None` when no such row exists or its
+/// replica cannot be resolved as live — R2: never a fabricated tier).
+/// A `None` tier entry is still returned (with the resolved path) so
+/// the caller can log the skip; it must NOT be fed to `report_access`.
+pub(crate) fn build_chunk_read_context_index(
+    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
+    nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+    wanted: &std::collections::HashSet<String>,
+    node_id: u64,
+) -> std::collections::HashMap<String, (String, Option<DiskTier>)> {
+    use std::collections::hash_map::Entry;
+    let node_id_str = node_id.to_string();
+    let mut out: std::collections::HashMap<String, (String, Option<DiskTier>)> = std::collections::HashMap::new();
+    for (path, fm) in files.iter() {
+        for c in &fm.chunks {
+            if !wanted.contains(&c.chunk_hash) {
+                continue;
+            }
+            match out.entry(c.chunk_hash.clone()) {
+                Entry::Occupied(mut o) => {
+                    // Path already fixed by the first referencing file.
+                    // Only fill in the tier if it's still unresolved AND
+                    // this row belongs to that SAME file AND matches the
+                    // reporting node — a later file's rows never
+                    // override the first file's path (matches
+                    // files_referencing_chunk's "first match" pick).
+                    if o.get().1.is_none() && o.get().0 == *path && c.node_id == node_id_str {
+                        o.get_mut().1 = crate::scheduler::live_replica_tier(nodes.get(&node_id), c.disk_id);
+                    }
+                }
+                Entry::Vacant(v) => {
+                    let tier = if c.node_id == node_id_str {
+                        crate::scheduler::live_replica_tier(nodes.get(&node_id), c.disk_id)
+                    } else {
+                        None
+                    };
+                    v.insert((path.clone(), tier));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// CO-4-13 — resolve the CF-3b ack floor for a `commit_chunk_locations`
@@ -1596,30 +1661,58 @@ impl ManagerService for MetadataService {
                 // AV-volume skip a no-op (`path_to_volume.get("")` is
                 // always `None`) and fed the legacy temperature path
                 // fabricated data for every reported chunk.
-                let sm = self.sm_data.read().await;
+                //
+                // R1/MGR-3 review fix — build the whole batch's lookup
+                // under ONE short SM read lock (one pass over
+                // `sm.files`), then DROP the lock before awaiting
+                // `report_access` (which takes tiering's own
+                // `access_stats` write lock per call). Pre-fix this held
+                // the SM read lock across every `report_access(...).await`
+                // in the loop AND re-scanned the whole file tree per
+                // entry via `resolve_chunk_read_context` — O(N x
+                // total_chunks) work under the SM lock for an N-entry
+                // heartbeat, blocking the Raft apply writer (tokio
+                // RwLock is fair) for the duration.
+                let wanted: std::collections::HashSet<String> =
+                    entries.iter().map(|(id, _)| id.clone()).collect();
+                let index = {
+                    let sm = self.sm_data.read().await;
+                    build_chunk_read_context_index(&sm.files, &sm.nodes, &wanted, *node_id)
+                };
                 for (chunk_id, reads_by_dc) in entries {
                     let total: u32 = reads_by_dc.values().sum();
-                    // Unknown chunk (already deleted/GC'd) — skip rather
-                    // than feed the engine a synthetic profile for
-                    // content that no longer exists.
-                    let Some((file_path, tier)) =
-                        resolve_chunk_read_context(&sm, chunk_id, *node_id)
-                    else {
-                        continue;
-                    };
-                    tiering
-                        .report_access(
-                            chunk_id,
-                            &file_path,
-                            total,
-                            total,
-                            reads_by_dc.clone(),
-                            tier,
-                            *node_id,
-                        )
-                        .await;
+                    match index.get(chunk_id) {
+                        // Unknown chunk (already deleted/GC'd) — skip
+                        // rather than feed the engine a synthetic
+                        // profile for content that no longer exists.
+                        None => {
+                            tracing::debug!(chunk_id, node_id, "CR-3-3: unknown chunk in ReportChunkReads, skipping");
+                            continue;
+                        }
+                        // R2/MGR-1 — the replica's tier could not be
+                        // resolved as LIVE (unknown disk, or the node/
+                        // disk is Down/Failed/Removed). NEVER fall back
+                        // to a fake tier here — that is exactly the
+                        // fabricated-Hot-tier bug this task fixed.
+                        Some((_, None)) => {
+                            tracing::debug!(chunk_id, node_id, "CR-3-3/R2: replica tier not live, skipping report_access");
+                            continue;
+                        }
+                        Some((file_path, Some(tier))) => {
+                            tiering
+                                .report_access(
+                                    chunk_id,
+                                    file_path,
+                                    total,
+                                    total,
+                                    reads_by_dc.clone(),
+                                    *tier,
+                                    *node_id,
+                                )
+                                .await;
+                        }
+                    }
                 }
-                drop(sm);
             }
             let response_json = serde_json::to_vec(&ClientResponse::Success)
                 .map_err(|e| Status::internal(format!("serialize ClientResponse: {e}")))?;
@@ -3972,12 +4065,14 @@ mod tests {
         assert_eq!(tier, DiskTier::Warm);
     }
 
-    /// CR-3-3/MGR-1 — a replica on a Down node cannot be resolved to a
-    /// serviceable tier via `live_replica_tier`, so it falls back to
-    /// `Hot` (same fallback as an unresolvable tier) rather than
-    /// reporting a tier that isn't actually being served.
+    /// R2/MGR-1 review fix — a replica on a Down node cannot be resolved
+    /// to a serviceable tier via `live_replica_tier`. It must resolve to
+    /// `None` (skip the report), NEVER fall back to a fake `Hot` tier —
+    /// that reintroduces the exact fabricated-tier bug this task fixed
+    /// (`evaluate` would plan a bogus Hot->Warm "demote" for a replica
+    /// that isn't actually being served).
     #[test]
-    fn cr_3_3_dead_replica_falls_back_to_hot_tier() {
+    fn cr_3_3_dead_replica_resolves_to_none() {
         let mut sm = StateMachineData::default();
         let mut node = mk_data_node(DiskTier::Cold);
         node.health = HealthStatus::Down;
@@ -3986,9 +4081,56 @@ mod tests {
             "/movies/x.mkv".to_string(),
             file_with_chunk("/movies/x.mkv", "h0", 1, 0),
         );
-        let (path, tier) = resolve_chunk_read_context(&sm, "h0", 1).expect("known chunk");
-        assert_eq!(path, "/movies/x.mkv");
-        assert_eq!(tier, DiskTier::Hot);
+        assert!(
+            resolve_chunk_read_context(&sm, "h0", 1).is_none(),
+            "a dead replica must never fabricate a Hot tier"
+        );
+    }
+
+    /// R1/MGR-3 review fix — `build_chunk_read_context_index` resolves
+    /// every wanted chunk with ONE pass over `sm.files`: 3 files, 2
+    /// wanted hashes -> both resolve to their correct path + live tier;
+    /// an unrelated hash present in the tree but NOT wanted is absent
+    /// from the index.
+    #[test]
+    fn cr_3_3_batch_index_resolves_only_wanted_hashes() {
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(1, mk_data_node(DiskTier::Warm));
+        sm.nodes.insert(2, mk_data_node(DiskTier::Cold));
+        sm.files.insert("/a.mkv".to_string(), file_with_chunk("/a.mkv", "ha", 1, 0));
+        sm.files.insert("/b.mkv".to_string(), file_with_chunk("/b.mkv", "hb", 2, 0));
+        sm.files.insert("/c.mkv".to_string(), file_with_chunk("/c.mkv", "hc-unwanted", 1, 0));
+
+        let wanted: std::collections::HashSet<String> =
+            ["ha".to_string(), "hb".to_string()].into_iter().collect();
+        let index = build_chunk_read_context_index(&sm.files, &sm.nodes, &wanted, 1);
+
+        // "ha" was reported by node 1 (matches) -> resolves live Warm.
+        let (path_a, tier_a) = index.get("ha").expect("ha present");
+        assert_eq!(path_a, "/a.mkv");
+        assert_eq!(*tier_a, Some(DiskTier::Warm));
+
+        // "hb" only has a row for node 2; this batch is reported by node 1,
+        // so no row in "/b.mkv" matches the reporting node -> tier None,
+        // but the path is still resolved (first referencing file).
+        let (path_b, tier_b) = index.get("hb").expect("hb present");
+        assert_eq!(path_b, "/b.mkv");
+        assert_eq!(*tier_b, None);
+
+        // Unrelated/unwanted hash never enters the index at all.
+        assert!(index.get("hc-unwanted").is_none());
+        assert_eq!(index.len(), 2, "only the wanted hashes are indexed");
+    }
+
+    /// R1/MGR-3 — a wanted hash with no referencing file at all is
+    /// simply absent from the index (mirrors
+    /// `resolve_chunk_read_context`'s None for an unknown chunk).
+    #[test]
+    fn cr_3_3_batch_index_omits_unresolvable_hash() {
+        let sm = StateMachineData::default();
+        let wanted: std::collections::HashSet<String> = ["ghost".to_string()].into_iter().collect();
+        let index = build_chunk_read_context_index(&sm.files, &sm.nodes, &wanted, 1);
+        assert!(index.get("ghost").is_none());
     }
 
     fn vol_with_floor(id: &str, floor: u32) -> dtfs_common::types::VolumeConfig {
