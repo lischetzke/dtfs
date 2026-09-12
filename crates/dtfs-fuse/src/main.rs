@@ -273,6 +273,24 @@ async fn main() -> Result<()> {
         }
     }
 
+    // CR-6-5 (FUSE-5) — wrap the filesystem in an `Arc` now that its
+    // `&mut self` setup (`set_local_cache`) is done, so a small always-on
+    // task can hold a clone and periodically sweep expired
+    // `metadata_cache` entries (bounded eviction on insert handles the
+    // size cap; this handles the staleness the size cap alone can't).
+    let fs = std::sync::Arc::new(fs);
+    {
+        let sweep_fs = fs.clone();
+        let sweep_interval = fs.metadata_ttl();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(sweep_interval);
+            loop {
+                ticker.tick().await;
+                sweep_fs.sweep_expired_metadata_cache();
+            }
+        });
+    }
+
     // CF-5 — per-process memory budget + RSS sampler. When the operator sets
     // [memory] hard_cap_mb > 0 the sampler watches RSS and publishes a
     // pressure level; a small ladder task halves the readahead/prefetch byte
@@ -312,7 +330,7 @@ async fn main() -> Result<()> {
         #[allow(unused_imports)]
         use libc;
 
-        let adapter = DtfsFuse3Adapter::new(fs);
+        let adapter = DtfsFuse3Adapter::from_shared(fs);
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
 
