@@ -933,19 +933,22 @@ impl ChunkStore {
         &self,
         after: &str,
         limit: usize,
-    ) -> DtfsResult<Vec<(String, u64)>> {
+    ) -> DtfsResult<Vec<(String, u64, u32)>> {
         use std::collections::{BTreeMap, BTreeSet};
 
-        let mut out: Vec<(String, u64)> = Vec::new();
+        let mut out: Vec<(String, u64, u32)> = Vec::new();
         if limit == 0 {
             return Ok(out);
         }
 
-        let roots: Vec<PathBuf> = self
+        // CR2-7-2 / MGR-10 — keep each disk's id alongside its chunks root
+        // so collect_chunk_bucket can tag every chunk with the disk it was
+        // found on.
+        let roots: Vec<(PathBuf, u32)> = self
             .disk_manager
             .all_disks()
             .iter()
-            .map(|d| d.mount_path.join("chunks"))
+            .map(|d| (d.mount_path.join("chunks"), d.disk_id))
             .collect();
 
         // The token's own bucket coordinates; "" means "from the start".
@@ -953,28 +956,28 @@ impl ChunkStore {
         let after_l2 = after.get(2..4).unwrap_or("");
 
         let mut level1: BTreeSet<String> = BTreeSet::new();
-        for root in &roots {
+        for (root, _) in &roots {
             collect_subdir_names(root, &mut level1).await?;
         }
 
         for aa in level1.iter().filter(|a| a.as_str() >= after_l1) {
             let mut level2: BTreeSet<String> = BTreeSet::new();
-            for root in &roots {
+            for (root, _) in &roots {
                 collect_subdir_names(&root.join(aa), &mut level2).await?;
             }
             // Only the token's own `aa` needs its earlier `bb` buckets
             // skipped; every later `aa` starts from its first bucket.
             let lower = if aa.as_str() == after_l1 { after_l2 } else { "" };
             for bb in level2.iter().filter(|b| b.as_str() >= lower) {
-                let mut bucket: BTreeMap<String, u64> = BTreeMap::new();
-                for root in &roots {
-                    collect_chunk_bucket(&root.join(aa).join(bb), &mut bucket).await?;
+                let mut bucket: BTreeMap<String, (u64, u32)> = BTreeMap::new();
+                for (root, disk_id) in &roots {
+                    collect_chunk_bucket(&root.join(aa).join(bb), *disk_id, &mut bucket).await?;
                 }
-                for (id, mtime) in bucket {
+                for (id, (mtime, disk_id)) in bucket {
                     if id.as_str() <= after {
                         continue;
                     }
-                    out.push((id, mtime));
+                    out.push((id, mtime, disk_id));
                     if out.len() == limit {
                         return Ok(out);
                     }
@@ -1535,13 +1538,16 @@ async fn collect_subdir_names(
 }
 
 /// REV-3-2 — merge one `chunks/<aa>/<bb>` bucket into `out` as
-/// `id -> .dat mtime (Unix ms)`. Only chunks with a `.meta` companion
-/// are surfaced so a half-written chunk never reaches the orphan reaper.
-/// When the same id is present on more than one disk of this node the
-/// newest mtime wins (most conservative grace clock, Bug CB).
+/// `id -> (.dat mtime (Unix ms), disk_id)`. Only chunks with a `.meta`
+/// companion are surfaced so a half-written chunk never reaches the
+/// orphan reaper. When the same id is present on more than one disk of
+/// this node the newest mtime wins (most conservative grace clock, Bug
+/// CB); CR2-7-2 / MGR-10 carries the disk_id of whichever mtime wins,
+/// so the manager can key its reap by (node, disk) instead of node-wide.
 async fn collect_chunk_bucket(
     dir: &Path,
-    out: &mut std::collections::BTreeMap<String, u64>,
+    disk_id: u32,
+    out: &mut std::collections::BTreeMap<String, (u64, u32)>,
 ) -> DtfsResult<()> {
     let mut rd = match fs::read_dir(dir).await {
         Ok(rd) => rd,
@@ -1567,12 +1573,13 @@ async fn collect_chunk_bucket(
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             out.entry(stem)
-                .and_modify(|m| {
+                .and_modify(|(m, d)| {
                     if mtime_ms > *m {
                         *m = mtime_ms;
+                        *d = disk_id;
                     }
                 })
-                .or_insert(mtime_ms);
+                .or_insert((mtime_ms, disk_id));
         }
     }
     Ok(())
@@ -2185,7 +2192,7 @@ mod tests {
             if page.is_empty() {
                 break;
             }
-            for (id, mtime) in &page {
+            for (id, mtime, _disk_id) in &page {
                 assert!(
                     seen.last().map_or(true, |prev| prev < id),
                     "ids must be strictly increasing across pages: {:?} then {}",
@@ -2236,11 +2243,44 @@ mod tests {
         let rest = store.list_chunks_page(&after, 10).await.unwrap();
         assert_eq!(rest.len(), 7);
         assert_eq!(rest[0].0, first[3].0);
-        assert!(rest.iter().all(|(id, _)| id > &after));
+        assert!(rest.iter().all(|(id, _, _)| id > &after));
 
         // Token = last id → exhausted.
         let last = first.last().unwrap().0.clone();
         assert!(store.list_chunks_page(&last, 10).await.unwrap().is_empty());
+    }
+
+    /// CR2-7-2 / MGR-10 — `list_chunks_page` tags each chunk with the
+    /// disk_id it was actually found on, not just its mtime. A chunk that
+    /// exists on only one of two disks reports that disk's id; a chunk
+    /// present on both disks (cold anchor + warm cache) reports the disk
+    /// whose mtime wins the "newest wins" tie-break.
+    #[tokio::test]
+    async fn cr2_7_2_list_chunks_page_reports_disk_id_per_chunk() {
+        let (store, _cold, _warm) = make_two_disk_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+
+        // Cold-only chunk (disk 0).
+        let cold_only = ChunkId::from_bytes(checksum::compute(b"cr2-7-2-cold-only"));
+        store.put_chunk(&cold_only, b"cr2-7-2-cold-only", &volume_id, DiskTier::Cold).await.unwrap();
+
+        // Warm-only chunk (disk 1).
+        let warm_only = ChunkId::from_bytes(checksum::compute(b"cr2-7-2-warm-only"));
+        store.put_chunk(&warm_only, b"cr2-7-2-warm-only", &volume_id, DiskTier::Warm).await.unwrap();
+
+        // Co-located on both disks — warm write lands second, so its mtime
+        // wins and the reported disk_id must be 1 (warm).
+        let both = ChunkId::from_bytes(checksum::compute(b"cr2-7-2-both"));
+        store.put_chunk(&both, b"cr2-7-2-both", &volume_id, DiskTier::Cold).await.unwrap();
+        store.put_chunk(&both, b"cr2-7-2-both", &volume_id, DiskTier::Warm).await.unwrap();
+
+        let page = store.list_chunks_page("", 100).await.unwrap();
+        let by_id: std::collections::HashMap<String, u32> =
+            page.into_iter().map(|(id, _, disk_id)| (id, disk_id)).collect();
+
+        assert_eq!(by_id.get(&cold_only.as_hex()), Some(&0));
+        assert_eq!(by_id.get(&warm_only.as_hex()), Some(&1));
+        assert_eq!(by_id.get(&both.as_hex()), Some(&1), "newest mtime (warm, written last) wins");
     }
 
     // CO-5-6 — a heartbeat that drained the pending scrub results but then

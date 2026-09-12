@@ -586,7 +586,7 @@ impl DataService for DataServiceImpl {
         // Ask for one extra entry so we can tell "page is full and more
         // remain" (→ emit a token) from "page ends the listing" (→ empty
         // token), preserving the exact pre-fix page-token semantics.
-        let mut page: Vec<(String, u64)> = self
+        let mut page: Vec<(String, u64, u32)> = self
             .store
             .list_chunks_page(&req.page_token, limit.saturating_add(1))
             .await
@@ -604,6 +604,9 @@ impl DataService for DataServiceImpl {
         Ok(Response::new(ListChunksResponse {
             chunk_ids: page.iter().map(|c| c.0.clone()).collect(),
             chunk_mtimes_ms: page.iter().map(|c| c.1).collect(),
+            // CR2-7-2 / MGR-10 — index-aligned with chunk_ids, same
+            // positional convention as chunk_mtimes_ms.
+            chunk_disk_ids: page.iter().map(|c| c.2).collect(),
             next_page_token: next,
         }))
     }
