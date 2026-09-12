@@ -508,6 +508,44 @@ pub(crate) fn is_forward_to_leader_err(msg: &str) -> bool {
 /// the first mismatching byte and leaks the matching-prefix length via
 /// timing. Reuses the audited `dtfs_common::crypto::constant_time_eq` (also
 /// used for the join-handshake HMAC) rather than a second hand-rolled copy.
+/// MGR-11 — a follower's `ForwardClientWrite` may only carry the
+/// `ClientRequest` variants a legitimate background path (heartbeat
+/// forward, health monitor, tiering read-report) actually proposes today.
+/// Built from `grep -n "raft_write_or_forward\|proxy_to_leader\|write_via_leader"`
+/// over metadata.rs / monitor.rs: `UpdateNodeUsage`, `UpdateNodeDiskUsage`,
+/// `UpdateNodeStatus` (heartbeat + health monitor), `AppendAudit`,
+/// `QuarantineNode`, `RemoveCorruptChunkReplicas`, `ReportScrubResult`,
+/// `ReportChunkReads`. Pure so it is unit-testable without a live service.
+fn forwardable(req: &ClientRequest) -> bool {
+    matches!(
+        req,
+        ClientRequest::UpdateNodeUsage { .. }
+            | ClientRequest::UpdateNodeDiskUsage { .. }
+            | ClientRequest::UpdateNodeStatus { .. }
+            | ClientRequest::AppendAudit { .. }
+            | ClientRequest::QuarantineNode { .. }
+            | ClientRequest::RemoveCorruptChunkReplicas { .. }
+            | ClientRequest::ReportScrubResult { .. }
+            | ClientRequest::ReportChunkReads { .. }
+    )
+}
+
+/// Short variant name for logging/auditing a denied forward without
+/// dumping the (potentially large) request body.
+fn client_request_variant_name(req: &ClientRequest) -> &'static str {
+    match req {
+        ClientRequest::UpdateNodeUsage { .. } => "UpdateNodeUsage",
+        ClientRequest::UpdateNodeDiskUsage { .. } => "UpdateNodeDiskUsage",
+        ClientRequest::UpdateNodeStatus { .. } => "UpdateNodeStatus",
+        ClientRequest::AppendAudit { .. } => "AppendAudit",
+        ClientRequest::QuarantineNode { .. } => "QuarantineNode",
+        ClientRequest::RemoveCorruptChunkReplicas { .. } => "RemoveCorruptChunkReplicas",
+        ClientRequest::ReportScrubResult { .. } => "ReportScrubResult",
+        ClientRequest::ReportChunkReads { .. } => "ReportChunkReads",
+        _ => "other",
+    }
+}
+
 fn forward_secret_ok(configured: &str, presented: &str) -> bool {
     if configured.is_empty() {
         return true;
@@ -610,6 +648,41 @@ pub(crate) async fn write_via_leader(
                 .map_err(|e| format!("forward to leader {leader_addr}: {e}"))?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod mgr_11_forward_allow_list_tests {
+    use super::forwardable;
+    use dtfs_raft::ClientRequest;
+
+    #[test]
+    fn update_config_is_not_forwardable() {
+        assert!(!forwardable(&ClientRequest::UpdateConfig {
+            config_json: "{}".into(),
+            version: 0,
+            expected_version: u64::MAX,
+        }));
+    }
+
+    #[test]
+    fn update_node_usage_is_forwardable() {
+        assert!(forwardable(&ClientRequest::UpdateNodeUsage {
+            node_id: 1,
+            used_capacity: 0,
+            chunk_count: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            observed_at_ms: 0,
+        }));
+    }
+
+    #[test]
+    fn update_node_status_is_forwardable() {
+        assert!(forwardable(&ClientRequest::UpdateNodeStatus {
+            node_id: 1,
+            status: "Healthy".into(),
+        }));
     }
 }
 
@@ -1718,6 +1791,31 @@ impl ManagerService for MetadataService {
         }
         let req: ClientRequest = serde_json::from_slice(&body.client_request_json)
             .map_err(|e| Status::invalid_argument(format!("bad ClientRequest json: {e}")))?;
+        // MGR-11 — CO-2-2 only authenticates WHO is forwarding, not WHAT is
+        // forwarded: any ClientRequest variant round-tripped through this
+        // RPC previously reached `self.raft.client_write` unchecked, so an
+        // authenticated-but-compromised/buggy follower could propose any
+        // mutation (e.g. UpdateConfig) as if it were a legitimate heartbeat/
+        // monitor forward. Allow-list exactly the variants a follower
+        // legitimately proposes via `raft_write_or_forward` / `proxy_to_leader`
+        // / `write_via_leader` today; anything else is denied + audited.
+        if !forwardable(&req) {
+            tracing::warn!(
+                variant = client_request_variant_name(&req),
+                "ForwardClientWrite rejected: variant not forwardable (MGR-11)"
+            );
+            if let Some(audit) = &self.audit {
+                audit.log(
+                    "raft",
+                    "auth.denied",
+                    &format!("variant={}", client_request_variant_name(&req)),
+                    "forward_client_write: variant not in forward allow-list",
+                );
+            }
+            return Err(Status::permission_denied(
+                "forwarded write variant not allowed (MGR-11)",
+            ));
+        }
         // Per-chunk read reports are NOT Raft state — they feed this (leader's)
         // in-memory tiering read-window. Intercept BEFORE Raft and apply
         // directly so reads forwarded from a follower reach the engine that
