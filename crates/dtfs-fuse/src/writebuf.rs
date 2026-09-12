@@ -335,6 +335,31 @@ impl WriteBuffer {
         segments
     }
 
+    /// R1 (FUSE-1 memory half) — drain EVERY complete chunk right now,
+    /// ignoring `flush_batch_chunks`. Unlike `flush()`, which deliberately
+    /// holds back below the batch threshold to amortize the
+    /// allocate+commit round trip, this exists purely as a memory-pressure
+    /// release valve: a caller nearing `DIRTY_BYTES_CAP` (e.g. the F-022
+    /// sparse-hole fill loop in `filesystem.rs::write()`) needs to commit
+    /// and drop whatever is already flushable RIGHT NOW, not wait for a
+    /// batch to fill. Partial (incomplete) chunks are left resident.
+    #[instrument(skip(self), fields(path = %path))]
+    pub fn flush_complete(&self, path: &str) -> Vec<ChunkSegment> {
+        let mut entry = match self.buffers.get_mut(path) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        let buf = entry.value_mut();
+        let segments = buf.extract_complete_chunks(self.chunk_size);
+        debug!(
+            path,
+            num_segments = segments.len(),
+            remaining = buf.chunks.len(),
+            "flush_complete: force-drained complete chunks (memory pressure)"
+        );
+        segments
+    }
+
     /// Extract every buffered chunk, including partial (not fully covered)
     /// ones. This should be called when the file is being closed or when
     /// all buffered data must be persisted regardless of alignment.
@@ -903,6 +928,31 @@ mod tests {
     fn wi01_h1_large_chunk_volume_flushes_per_chunk() {
         assert_eq!(WriteBuffer::new_with_batch(128 * 1024 * 1024, 4).flush_batch_chunks, 1);
         assert_eq!(WriteBuffer::new_with_batch(4 * 1024 * 1024, 4).flush_batch_chunks, 4);
+    }
+
+    // R1 (FUSE-1 memory half) — flush_complete() must drain EVERY complete
+    // chunk immediately, ignoring flush_batch_chunks entirely. A caller
+    // reacting to memory pressure (DIRTY_BYTES_CAP) can't wait for a batch
+    // to fill.
+    #[test]
+    fn r1_flush_complete_ignores_batch_threshold() {
+        let chunk = 4 * 1024 * 1024;
+        let wb = WriteBuffer::new_with_batch(chunk, 4);
+        for i in 0..40u32 {
+            wb.write("/f", (i as u64) * chunk as u64, &vec![i as u8; chunk]);
+        }
+        assert_eq!(wb.dirty_bytes("/f"), 40 * chunk);
+
+        // A normal flush() would emit exactly one batch of 4 (holding back
+        // the rest); flush_complete() must take everything at once.
+        let segs = wb.flush_complete("/f");
+        assert_eq!(segs.len(), 40, "flush_complete must drain every complete chunk");
+        for (idx, seg) in segs.iter().enumerate() {
+            assert_eq!(seg.chunk_index, idx as u32);
+            assert!(!seg.needs_seed);
+        }
+        assert_eq!(wb.dirty_bytes("/f"), 0, "nothing left resident");
+        assert!(!wb.has_dirty_data("/f"));
     }
 
     // CR-1-1 (FUSE-1) test (a): after a flushed sequential write of 3

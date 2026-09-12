@@ -333,3 +333,19 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   and the `fuse_adapter.rs` entry (CR-1-6: `readdir`/`readdirplus`/
   `mkdir`/`unlink`/`rmdir`/`create`/`rename`/`symlink`/`link` now route
   through `cluster_err_to_errno`). Own commit per the task instructions.
+
+- **R1 (PR #105 review, FUSE-1 memory half)** 2026-09-12,
+  `cargo test -p dtfs-fuse --release`: 91 -> 95 passed (4 new:
+  `writebuf::tests::r1_flush_complete_ignores_batch_threshold`,
+  `filesystem::r1_dirty_cap_tests::under_cap_is_not_exceeded`,
+  `filesystem::r1_dirty_cap_tests::meeting_or_crossing_cap_is_exceeded`,
+  `filesystem::r1_dirty_cap_tests::saturates_instead_of_overflowing`),
+  0 failed. Added `WriteBuffer::flush_complete()` (drains every complete
+  chunk immediately, ignoring `flush_batch_chunks`) and wired
+  `DIRTY_BYTES_CAP` into `write()`'s F-022 sparse-hole fill loop (checked
+  after each 64 MiB slice) and once more before merging the caller's own
+  bytes, via the extracted pure `dirty_cap_exceeded(dirty, incoming)`
+  predicate. On a cap hit, `flush_complete()` + `flush_segments_to_cluster`
+  runs immediately; a failure there `restore_segments`s and returns Err
+  (same CO-1-8(a) contract as the batch flush path). AGENTS.md A.3.2
+  documents the cap next to the WI-01/H1 sentence.

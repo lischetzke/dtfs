@@ -157,7 +157,14 @@ for all roles. WI-05 — FUSE prefetch fan-out is also bounded by
 holds a whole chunk in heap, and before this an uncapped `prefetch_chunks`-
 wide fan-out (default 8) shared one pooled HTTP/2 channel per node, so N
 concurrent streams split a slow link (e.g. the 40 Mbps LELI path) and
-starved the nearest chunk instead of adding bounded heap.
+starved the nearest chunk instead of adding bounded heap. R1 (FUSE-1
+memory half) — the FUSE write buffer (WI-01/H1's `FLUSH_BATCH_MAX_BYTES`
+governs the batching side; `writebuf::DIRTY_BYTES_CAP` = 2x that governs
+total dirty bytes per open file) is force-drained via
+`WriteBuffer::flush_complete()` whenever a sparse-hole zero-fill or an
+incoming write would meet or exceed the cap, so a write far past EOF
+(e.g. a torrent client's first piece landing at offset 100 MB) can no
+longer materialise the whole hole into heap before committing anything.
 
 **A.3.3 Integrity is the prime directive.** Every path that touches
 bytes must:
