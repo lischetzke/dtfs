@@ -116,7 +116,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-2-4 | ✅ | RAFT-7 | `state_machine.rs` `DeleteFile` arm ~1051; `crates/dtfs-fuse/src/fuse_adapter.rs` rmdir | `DeleteFile`: also `write_leases.remove(path)`, `posix_locks.remove(path)`; if `files.range("{path}/"..)` has a child → `Error("directory not empty")`. FUSE rmdir maps that error to ENOTEMPTY (extend `cluster_err_to_errno` or match the message via a dedicated gRPC code `FailedPrecondition`). | SM unit: delete with live lease → lease gone; delete dir with child → Error, child intact. | Tests fail before, pass after. |
 | CR-2-5 | ✅ | RAFT-4 | `crates/dtfs-raft/src/lib.rs` `ClientRequest`, `state_machine.rs`, proposers in `dtfs-manager/src/metadata.rs`, `scheduler.rs`, `tiering.rs` | Add `#[serde(default)] now_ms: u64` to the seven variants listed in Data-model changes. In apply: `let now_ms = if req.now_ms == 0 { log_id.index /* CO-3-1 fallback */ } else { req.now_ms }`; pass it into `audit()` for those arms. Every proposer stamps `now_ms` from `SystemTime::now()`. Remove the top-of-apply `SystemTime::now()` once no arm needs it (leave it if any arm not in scope still does; note in Deviations). | SM unit: apply the same `RenameFile{now_ms: 1234}` on two fresh SMs → `serde_json::to_vec` identical; old-format entry (no `now_ms`) still deserialises. Snapshot compat test per § A.3.1. | Tests pass; `grep -n "SystemTime::now" state_machine.rs` shows only the fallback-free sites documented in Deviations. |
 | CR-2-6 | ✅ | RAFT-8, RAFT-9 | `state_machine.rs` `UpdateConfig` ~1386, `ReportScrubResult` ~1429 | UpdateConfig: `version = sm.cluster_config.version + 1`, ignore wire value (keep CAS check). ScrubRecord: `duration_secs = if x.is_finite() { x } else { 0.0 }`. | SM unit: UpdateConfig with wire version 1 after current 5 → stored 6; ScrubResult with NaN → snapshot round-trips. | Tests fail before, pass after. |
-| CR-2-7 | ⬜ | — | `tests/release/cases/102-rename-directory-moves-children.sh`, `103-truncate-rewrite-reports-size.sh`, `104-quarantined-node-restart-stays-quarantined.sh` | Shell cases for RAFT-2/3/1 via FUSE + REST. | `bash -n` clean. | Present, unexecuted. |
+| CR-2-7 | ✅ | — | `tests/release/cases/102-rename-directory-moves-children.sh`, `103-truncate-rewrite-reports-size.sh`, `104-quarantined-node-restart-stays-quarantined.sh` | Shell cases for RAFT-2/3/1 via FUSE + REST. | `bash -n` clean. | Present, unexecuted. |
 | CR-2-8 | ⬜ | — | `AGENTS.md` A.8 `state_machine.rs` entry, A.3.1 | Document `now_ms` convention, RenameFile prefix semantics, sticky-state carry-forward. | — | Same commit. |
 
 ### Group 3 — Anchor / replica liveness in manager + tiering (branch `bug/cr-3-anchor-liveness`)
@@ -455,3 +455,20 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   `grep -n "SystemTime::now" state_machine.rs` shows it only at the
   top-of-apply definition, the read-only `lookup_path` synthetic-dir
   helper (not persisted, out of scope), and in comments.
+
+- **CR-2-7** 2026-09-12. Added three release cases, `bash -n` clean on
+  all three, none executed (no lab, per the Build/verify environment
+  section): `tests/release/cases/102-rename-directory-moves-children.sh`
+  (mkdir + nested child, `mv` through the FUSE mount, asserts children
+  and content land under the new path and the old path is fully gone,
+  CR-2-2/RAFT-2); `103-truncate-rewrite-reports-size.sh` (write 8 MiB,
+  shell `>` truncate to 0, rewrite 3 MiB, asserts `stat` reports the
+  rewritten size rather than staying pinned at 0, CR-2-3/RAFT-3);
+  `104-quarantined-node-restart-stays-quarantined.sh` (corrupt a live
+  replica, read it through FUSE so verify_on_read's heartbeat
+  IntegrityFault auto-quarantines the node, `systemctl restart dtfs-data`,
+  asserts health is still `quarantined` after the re-register rather than
+  reverted to `healthy`, CR-2-1/RAFT-1). Modeled on `20-quarantine-flow.sh`
+  and `22-register-audit-idempotent.sh` for the corrupt/restart idiom and
+  `100-fuse-rewrite-offset-zero.sh` for the FUSE probe shape; none added
+  to `QUICK_CASES`.
