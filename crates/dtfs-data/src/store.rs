@@ -1270,9 +1270,7 @@ impl ChunkStore {
                     // removed only once the .meta has been fsynced, so its
                     // presence reliably indicates an in-flight write or
                     // replication into the destination disk.
-                    if !chunk_hex.is_empty()
-                        && wal.join(format!("{}.wal.json", chunk_hex)).exists()
-                    {
+                    if !chunk_hex.is_empty() && wal_entry_exists(&wal, &chunk_hex) {
                         skipped_in_flight += 1;
                         tracing::debug!(
                             chunk = %chunk_hex,
@@ -1606,6 +1604,20 @@ fn tmp_dir(disk_path: &Path) -> PathBuf {
 /// Build the WAL directory path for a disk.
 fn wal_dir(disk_path: &Path) -> PathBuf {
     disk_path.join(".dtfs").join("wal")
+}
+
+/// CR-4-4 follow-up — does ANY WAL entry exist for this chunk id, under
+/// either the op-keyed names (`<id>.put.wal.json` / `<id>.delete.wal.json`)
+/// or the legacy `<id>.wal.json`? `commit_chunk_from_tmp_inner` and
+/// `delete_chunk_idempotent_on_disk` write the op-keyed names; anything
+/// that needs to detect "this chunk has an in-flight write/delete"
+/// (currently just the scrub P0-5 skip) must check all three names, not
+/// just the legacy one, or CR-4-4's WAL rename silently broke the
+/// detection.
+fn wal_entry_exists(wal_dir: &Path, chunk_hex: &str) -> bool {
+    wal_dir.join(format!("{chunk_hex}.put.wal.json")).exists()
+        || wal_dir.join(format!("{chunk_hex}.delete.wal.json")).exists()
+        || wal_dir.join(format!("{chunk_hex}.wal.json")).exists()
 }
 
 /// Write a WAL entry to disk with fsync. Also fsyncs the parent
@@ -1988,6 +2000,64 @@ mod tests {
         // The .meta is parseable again and matches the .dat.
         let repaired = store.get_chunk_meta(&chunk_id).await.unwrap();
         assert_eq!(repaired.checksum, chunk_id.0);
+    }
+
+    // ── CR-4-4 follow-up — P0-5 in-flight skip must recognise every WAL
+    // name CR-4-4 introduced, not just the legacy one. Without this, a
+    // chunk whose `.dat` has just been renamed into place but whose
+    // `.meta` isn't written yet (put_chunk mid-commit, WAL still present)
+    // is no longer skipped by scrub: CR-4-1's repair-from-dat path then
+    // races commit_chunk_from_tmp_inner's own write_meta_atomic call.
+
+    /// `.dat` present, no `.meta`, and an op-keyed `<id>.put.wal.json`
+    /// present (the name `commit_chunk_from_tmp_inner` actually writes)
+    /// must still be skipped as in-flight: not checked, not repaired, not
+    /// reported corrupt, and scrub must not touch `.meta` at all.
+    #[tokio::test]
+    async fn cr_4_4_scrub_skips_in_flight_chunk_with_put_wal_name() {
+        let (store, tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+
+        let data = b"cr-4-4-in-flight-put-wal";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        let dir = chunk_data_dir(&disk, &chunk_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(chunk_data_path(&disk, &chunk_id), data).unwrap();
+        // No .meta — mid-commit, exactly the window write_meta_atomic
+        // hasn't reached yet.
+        let wal_path = wal_dir(tmp.path()).join(format!("{}.put.wal.json", chunk_id.as_hex()));
+        std::fs::create_dir_all(wal_path.parent().unwrap()).unwrap();
+        std::fs::write(&wal_path, b"{}").unwrap();
+
+        let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+        assert_eq!(res.chunks_checked, 0, "in-flight chunk must not be examined at all");
+        assert_eq!(res.chunks_meta_repaired, 0, "must not race write_meta_atomic with a repair");
+        assert!(res.corrupt_chunk_ids.is_empty());
+        assert!(!chunk_meta_path(&disk, &chunk_id).exists(), "scrub must not write a .meta here");
+    }
+
+    /// Same scenario, but with the legacy `<id>.wal.json` name (an older
+    /// data node build, or a WAL entry the streaming test-only `put_chunk`
+    /// path still writes) — must be skipped identically.
+    #[tokio::test]
+    async fn cr_4_4_scrub_skips_in_flight_chunk_with_legacy_wal_name() {
+        let (store, tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+
+        let data = b"cr-4-4-in-flight-legacy-wal";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        let dir = chunk_data_dir(&disk, &chunk_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(chunk_data_path(&disk, &chunk_id), data).unwrap();
+        let wal_path = wal_dir(tmp.path()).join(format!("{}.wal.json", chunk_id.as_hex()));
+        std::fs::create_dir_all(wal_path.parent().unwrap()).unwrap();
+        std::fs::write(&wal_path, b"{}").unwrap();
+
+        let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+        assert_eq!(res.chunks_checked, 0, "in-flight chunk must not be examined at all");
+        assert_eq!(res.chunks_meta_repaired, 0, "must not race write_meta_atomic with a repair");
+        assert!(res.corrupt_chunk_ids.is_empty());
+        assert!(!chunk_meta_path(&disk, &chunk_id).exists(), "scrub must not write a .meta here");
     }
 
     /// A `.dat` whose bytes do NOT hash to its own filename id (real

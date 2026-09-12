@@ -768,10 +768,28 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   ReplicateChunk) replaced with `ChunkId::from_hex`, which rejects
   non-ASCII input before any byte-index slicing; the now-dead
   `chunk_hex` module was removed.
+- **CR-4-4 review fixup (R1, coordinator review of PR #108)** 2026-09-12,
+  Docker `dtfs-buildenv:latest`, `cargo test -p dtfs-data --release`:
+  112 -> 114 passed, 0 failed (2 new:
+  `cr_4_4_scrub_skips_in_flight_chunk_with_put_wal_name`,
+  `cr_4_4_scrub_skips_in_flight_chunk_with_legacy_wal_name`). The
+  `scrub_disk` P0-5 in-flight skip (`wal.join(format!("{}.wal.json",
+  chunk_hex)).exists()`) still checked only the legacy WAL name after
+  CR-4-4 moved the streaming commit/delete paths to op-keyed
+  `<id>.put.wal.json`/`<id>.delete.wal.json`. A `.dat` renamed into place
+  mid-commit (WAL present, `.meta` not yet written) was therefore no
+  longer skipped: scrub would hash it, see the id match, and have
+  CR-4-1's repair race `commit_chunk_from_tmp_inner`'s own
+  `write_meta_atomic` call. Added `wal_entry_exists(wal_dir, chunk_hex)`
+  (checks `.put.wal.json`, `.delete.wal.json`, and legacy `.wal.json`)
+  and pointed the P0-5 site at it; grepped every non-test `wal.json`
+  reference in `store.rs`/`server.rs` and confirmed no other production
+  site checks a WAL by name (the remaining ones either WRITE a specific
+  op-keyed name or are inside `#[cfg(test)]`).
 - **Workspace** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test
   --release --workspace`: dtfs-cli 12, dtfs-client 31, dtfs-common 106
   (unchanged — `chunks_meta_repaired` needed no new test, covered by the
-  CR-4-1 store tests via `ScrubResult`), dtfs-data 112, dtfs-fuse 99
+  CR-4-1 store tests via `ScrubResult`), dtfs-data 114, dtfs-fuse 99
   (untouched), dtfs-manager 367 (untouched), dtfs-raft 105 (untouched);
   all passed, 0 failed. No regressions against baseline + Group 1-3
   counts.
