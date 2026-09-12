@@ -431,7 +431,7 @@ every turn, becomes noise); a `SessionStart` hook that prints cluster state
 | AIWF-2-2 | Author `dtfs-planner`, `dtfs-implementer` | `.claude/agents/*.md` | Implementer's build block matches the Docker command verbatim | ✅ |
 | AIWF-2-3 | Author `dtfs-reviewer`, `dtfs-integrity-auditor` | `.claude/agents/*.md` | Output matches the CORE-REVIEW-2026-09-12 finding shape | ✅ |
 | AIWF-2-4 | Author `dtfs-release-case-author` | `.claude/agents/*.md` | Produces a `bash -n`-clean case for a known past change | ✅ |
-| AIWF-3-1 | Add `.claude/settings.json` + `guard-git.sh` | `.claude/{settings.json,hooks/guard-git.sh}` | A `git commit --no-verify` attempt is blocked with a readable reason | ⬜ |
+| AIWF-3-1 | Add `.claude/settings.json` + `guard-git.sh` | `.claude/{settings.json,hooks/guard-git.sh}` | A `git commit --no-verify` attempt is blocked with a readable reason | ✅ |
 | AIWF-3-2 | Add `check-release-case.sh` | `.claude/hooks/check-release-case.sh` | Blocks a staged `dtfs-data/src` change with no case; passes with the trailer | ⬜ |
 | AIWF-3-3 | Add `rustfmt-check.sh` (advisory) | `.claude/hooks/rustfmt-check.sh` | Prints a diff on a deliberately mis-formatted edit; never blocks; no-ops without docker | ⬜ |
 | AIWF-4-1 | Release-note mechanism decision (D3) | `.github/cliff.toml`, `scripts/dtfs-release.sh` | `git-cliff` reproduces the current section grouping from commit subjects on the last 30 commits — or the task is closed as "keep PRs" | ⬜ |
@@ -477,6 +477,30 @@ roster is cheaper, not just tidier.
   (sonnet); numbering/STATUS-line/trap/wait_for rules point at
   `tests/release/README.md`. Verified by manual review against that
   contract, not a live dispatch -- see Deviations.
+
+- AIWF-3-1 (2026-09-12): added `.claude/settings.json` (PreToolUse
+  Bash -> guard-git.sh + check-release-case.sh; PostToolUse Edit|Write
+  -> rustfmt-check.sh) and `.claude/hooks/guard-git.sh`. First cut
+  matched `--no-verify`/`--force`/`--amend` anywhere in the raw command
+  string; as soon as settings.json activated, the live hook blocked
+  this session's own diagnostic Bash calls that merely mentioned those
+  flags as TEXT (e.g. `grep -- "--no-verify"`) -- a real false-positive
+  caught by dogfooding, not a crafted test. Fixed by splitting the
+  command on shell control operators (`;`, `&&`, `||`, `|`) and
+  requiring `git commit`/`git push`/`git checkout` and the flag to
+  co-occur in the SAME segment. Re-tested via stdin-file payloads (to
+  avoid the live hook itself intercepting a test command that quotes
+  the trigger text) run through `bash .claude/hooks/guard-git.sh <
+  payload.json`: `git commit --no-verify` blocked (exit 2); a `grep`
+  for the string `--no-verify` in unrelated output allowed (exit 0,
+  the fixed false-positive); `git push --force` blocked, `git push
+  --force-with-lease` allowed; `git checkout -- <dirty file>` blocked
+  in a scratch repo, allowed once the file was clean; `git commit
+  --amend` allowed while HEAD is ahead of the pushed upstream tip and
+  blocked in a scratch repo where HEAD equals that tip. Also grepped
+  the bodies of the last 5 real commits on master for the four trigger
+  patterns -- zero matches, so the hook would not have blocked any of
+  them.
 
 ## Deviations
 
