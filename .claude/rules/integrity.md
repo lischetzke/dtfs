@@ -90,16 +90,48 @@ long form of AGENTS.md A.3.3/A.6, loaded only for the crates it governs.
 ## Data-plane RPC auth (LIS-19/55/83, AGENTS.md § A.3.3 #7)
 
 When `cluster.shared_secret` is non-empty, `PutChunk` / `DeleteChunk` /
-`ReplicateChunk` / `GetChunk` / `ListChunks` / `VerifyChunk` require gRPC
-metadata `x-dtfs-rpc-ts` + `x-dtfs-rpc-mac` (HMAC-SHA256 over
+`ReplicateChunk` / `GetChunk` / `ListChunks` / `VerifyChunk` / **`Record-
+CacheHit`** (CR-5-5/DATA-11) require gRPC metadata `x-dtfs-rpc-ts` +
+`x-dtfs-rpc-mac` (HMAC-SHA256 over
 `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n`; DeleteChunk/GetChunk/
-VerifyChunk bind `chunk_id`; ReplicateChunk binds
+VerifyChunk/RecordCacheHit bind `chunk_id`; ReplicateChunk binds
 `chunk_id|target_address`; PutChunk/ListChunks empty binding). Missing or
 invalid → `PermissionDenied`. Empty secret = legacy skip; data-node
 startup refuses empty secret unless `allow_insecure_empty_secret`.
-Callers that stamp: FUSE/client put+get, data→data replication put,
-manager scheduler ReplicateChunk/VerifyChunk/ListChunks, manager unlink
-fan-out + scheduler flush.
+Callers that stamp: FUSE/client put+get+record_cache_hit, data→data
+replication put, manager scheduler ReplicateChunk/VerifyChunk/
+ListChunks, manager unlink fan-out + scheduler flush. `RecordCacheHit`
+was the last mutating data-plane RPC left ungated pre-CR-5-5 — an
+unauthenticated caller could inflate a chunk's read counter and its
+tiering promotion score.
+
+## Manager-plane RPC auth (LIS-56, AGENTS.md § A.3.3 #8)
+
+When `cluster.shared_secret` is non-empty, mutating `ManagerService`
+gRPC RPCs (`CreateFile`/`DeleteFile`/leases/…, and since **CR-5-1**
+also `Heartbeat` and `ReportChunkStatus`) require the same header shape
+over the `dtfs-mgr-rpc` plane (`metadata::require_mgr_rpc_auth`); reads
+stay open. Pre-CR-5-1, Heartbeat/ReportChunkStatus were the only two
+mutating RPCs not gated — any caller who knew a node id could poison
+node health or drop replica entries without the secret. Data nodes
+stamp both from `[cluster].shared_secret` (`dtfs-data/src/main.rs::
+stamp_mgr_rpc_request`); deploy manager + data together.
+
+A follower's `ForwardClientWrite` (used by the heartbeat/health-monitor
+forward path when a write lands on a non-leader) is authenticated by
+`forward_secret_ok` (CO-2-2, constant-time) but that only checks WHO is
+forwarding. **CR-5-2 (MGR-11)** added a second gate on WHAT is
+forwarded: `forwardable(&ClientRequest)` allow-lists exactly the
+variants a follower legitimately proposes today (`UpdateNodeUsage`,
+`UpdateNodeDiskUsage`, `UpdateNodeStatus`, `AppendAudit`,
+`QuarantineNode`, `RemoveCorruptChunkReplicas`, `ReportScrubResult`,
+`ReportChunkReads`); anything else is denied + audited
+(`auth.denied`) before it ever reaches `raft.client_write`. **CR-5-3
+(MGR-12)** — the caller side (`write_via_leader`) now inspects
+`ForwardWriteResponse.success`/`.error` via `forward_result` instead of
+discarding the response body, so a forward rejected by the leader (bad
+secret, a disallowed MGR-11 variant, or a failed Raft apply) is no
+longer silently treated as a successful write.
 
 ## Mandatory vs cache replicas (Bug AV invariant, AGENTS.md § A.3.4)
 
