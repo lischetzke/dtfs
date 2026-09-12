@@ -433,7 +433,7 @@ every turn, becomes noise); a `SessionStart` hook that prints cluster state
 | AIWF-2-4 | Author `dtfs-release-case-author` | `.claude/agents/*.md` | Produces a `bash -n`-clean case for a known past change | ✅ |
 | AIWF-3-1 | Add `.claude/settings.json` + `guard-git.sh` | `.claude/{settings.json,hooks/guard-git.sh}` | A `git commit --no-verify` attempt is blocked with a readable reason | ✅ |
 | AIWF-3-2 | Add `check-release-case.sh` | `.claude/hooks/check-release-case.sh` | Blocks a staged `dtfs-data/src` change with no case; passes with the trailer | ✅ |
-| AIWF-3-3 | Add `rustfmt-check.sh` (advisory) | `.claude/hooks/rustfmt-check.sh` | Prints a diff on a deliberately mis-formatted edit; never blocks; no-ops without docker | ⬜ |
+| AIWF-3-3 | Add `rustfmt-check.sh` (advisory) | `.claude/hooks/rustfmt-check.sh` | Prints a diff on a deliberately mis-formatted edit; never blocks; no-ops without docker | ✅ |
 | AIWF-4-1 | Release-note mechanism decision (D3) | `.github/cliff.toml`, `scripts/dtfs-release.sh` | `git-cliff` reproduces the current section grouping from commit subjects on the last 30 commits — or the task is closed as "keep PRs" | ⬜ |
 | AIWF-5-1 | Dry run: one real small fix end-to-end through the roster | any | A deferred LOW finding from CORE-REVIEW (e.g. CMN-4 `hex_decode` ASCII guard) lands via intake → implementer → auditor; record total tokens and compare against a same-fix baseline done inline | ⬜ |
 
@@ -514,6 +514,19 @@ roster is cheaper, not just tidier.
   (touches `dtfs-fuse/src/*`) and confirmed it DID stage
   `tests/release/cases/96-write-batch-flush.sh`, so the hook would have
   passed it too.
+- AIWF-3-3 (2026-09-12): added `.claude/hooks/rustfmt-check.sh`
+  (PostToolUse Edit|Write). Tested via stdin-file payloads: a `Read`
+  tool call no-ops (exit 0, no output); an `Edit` on a non-`.rs` file
+  no-ops; an `Edit` on a `crates/**/*.rs` file with `docker` stripped
+  from `PATH` no-ops silently; an `Edit` on a real, deliberately
+  misformatted throwaway `.rs` file with the real `dtfs-buildenv:latest`
+  image present printed advisory output and still exited 0. Deviation:
+  the printed output was rustfmt's own "rustfmt is not installed for
+  this toolchain" error rather than a real formatting diff -- the local
+  `dtfs-buildenv:latest` image lacks the `rustfmt` component. The
+  print-on-nonzero-exit / never-block mechanism is confirmed correct;
+  fixing the image (adding `rustup component add rustfmt` to its build)
+  is out of this plan's scope and left for whoever maintains that image.
 
 ## Deviations
 
