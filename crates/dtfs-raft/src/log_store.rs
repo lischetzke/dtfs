@@ -194,6 +194,21 @@ impl LogStore {
         }
     }
 
+    /// RAFT-6 / CR2-7-6 — peek the persisted `last_purged` log id
+    /// straight from the meta CF, without going through the full
+    /// `RaftLogStorage` trait or the cached `Arc<RwLock<..>>`. Used by
+    /// `main.rs` startup (via `blank_sm_startup_allowed`) to detect the
+    /// corrupt-snapshot-discard-with-purged-log hazard before handing the
+    /// log store to openraft.
+    pub fn peek_last_purged(&self) -> Result<Option<LogId>, io::Error> {
+        let cf = self.db.cf_handle(CF_META).expect("meta CF");
+        match self.db.get_cf(&cf, META_KEY_LAST_PURGED) {
+            Ok(Some(bytes)) => decode_value(&bytes),
+            Ok(None) => Ok(None),
+            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+        }
+    }
+
     /// Bug AC — peek the last log entry's `LogId` without consuming
     /// any iterator state. Used for poisoned-state detection.
     pub fn peek_last_log_id(&self) -> Result<Option<LogId>, io::Error> {
@@ -241,6 +256,43 @@ fn key_to_index(key: &[u8]) -> u64 {
 /// enumerating keys.
 fn key_upper_bound() -> [u8; 9] {
     [0xFF; 9]
+}
+
+/// RAFT-6 / CR2-7-6 — refuse to start as a voter when the local state
+/// machine came up BLANK (its snapshot was corrupt/unreadable and
+/// `state_machine.rs::open_at`'s BP-2 discard returned a fresh
+/// `StateMachineData::default()`) AND this node's log has already been
+/// purged past some point (`last_purged.is_some()`).
+///
+/// That combination means the discarded snapshot was the ONLY surviving
+/// copy of everything before the purge point: if this node then wins an
+/// election (openraft elects on log freshness, not on state-machine
+/// content), it applies only the log's surviving suffix onto an empty
+/// state machine — every file created before the purge point vanishes
+/// cluster-wide as soon as this node's next snapshot propagates. A
+/// genuinely fresh, never-bootstrapped node has `last_purged == None` and
+/// is unaffected; only a snapshot discard "colliding" with a real purge
+/// point is refused.
+///
+/// Pure so `main.rs` can call it right after opening the log store +
+/// state machine, before handing either to openraft.
+pub fn blank_sm_startup_allowed(sm_is_blank: bool, last_purged: Option<LogId>) -> Result<(), String> {
+    match (sm_is_blank, last_purged) {
+        (true, Some(lp)) => Err(format!(
+            "Raft state machine snapshot was corrupt/unreadable and was \
+             discarded (blank state), but this node's log has already \
+             been purged up to index {} — the discarded snapshot was the \
+             ONLY surviving copy of everything before that point. \
+             Refusing to start as a voter: an election win here would \
+             apply only the log's surviving suffix onto an empty state \
+             machine and lose everything before the purge point, \
+             cluster-wide, on this node's next snapshot. See the manager \
+             recovery runbook: stop this node, wipe raft-log + raft-sm, \
+             and re-bootstrap it as a learner from a healthy peer.",
+            lp.index
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// RAFT-5 / CR2-7-5 — `WriteOptions` with `set_sync(true)`. Every durable
@@ -689,6 +741,50 @@ mod audit_co_tests {
         let item: Option<Result<(Box<[u8]>, Box<[u8]>), rocksdb::Error>> = None;
         let mapped = last_log_id_from_iter_item(item).expect("empty CF is not an error");
         assert!(mapped.is_none(), "empty CF must map to None");
+    }
+
+    /// RAFT-6 / CR2-7-6 — the dangerous combination: a blank state
+    /// machine (snapshot discarded) AND a log already purged past some
+    /// point. This is the ONLY case that must refuse startup.
+    #[test]
+    fn raft_6_blank_sm_with_purged_log_refuses_startup() {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        let purge_id = openraft::LogId::new(leader, 42);
+
+        let result = blank_sm_startup_allowed(true, Some(purge_id));
+        assert!(result.is_err(), "blank SM + purged log must refuse startup");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("42"), "message should name the purge index: {msg}");
+        assert!(
+            msg.contains("wipe raft-log + raft-sm"),
+            "message must point at the recovery runbook: {msg}"
+        );
+    }
+
+    /// RAFT-6 / CR2-7-6 — a genuinely fresh, never-bootstrapped node has
+    /// a blank SM but `last_purged == None` (nothing has ever been
+    /// purged). This is normal and must be allowed.
+    #[test]
+    fn raft_6_blank_sm_with_no_purge_is_a_fresh_node_and_allowed() {
+        assert!(
+            blank_sm_startup_allowed(true, None).is_ok(),
+            "a fresh node (blank SM, never purged) must be allowed to start"
+        );
+    }
+
+    /// RAFT-6 / CR2-7-6 — a non-blank SM (successfully loaded a real
+    /// snapshot, or replayed the log into one over its lifetime) is
+    /// always allowed to start, regardless of purge history — it is not
+    /// missing anything.
+    #[test]
+    fn raft_6_non_blank_sm_is_always_allowed() {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        let purge_id = openraft::LogId::new(leader, 42);
+
+        assert!(blank_sm_startup_allowed(false, Some(purge_id)).is_ok());
+        assert!(blank_sm_startup_allowed(false, None).is_ok());
     }
 
     /// CO-4-12 — `get_log_state` on a populated log returns the real last

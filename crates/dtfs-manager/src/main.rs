@@ -130,6 +130,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Raft state machine snapshot dir: {:?}", sm_dir);
     let sm_data = state_machine.data().clone();
 
+    // RAFT-6 / CR2-7-6 — refuse to boot as a voter if `open_at` just
+    // discarded a corrupt/unreadable snapshot (blank state machine, BP-2)
+    // AND this node's log has already been purged past some point. That
+    // combination means the discarded snapshot was the only surviving
+    // copy of everything before the purge point; winning an election in
+    // that state would apply only the log's surviving suffix onto an
+    // empty state machine and lose it cluster-wide on the next snapshot.
+    // A genuinely fresh, never-bootstrapped node (blank SM, log never
+    // purged) is unaffected.
+    let sm_is_blank = { sm_data.read().await.last_applied_log.is_none() };
+    let last_purged = log_store.peek_last_purged()?;
+    if let Err(msg) = dtfs_raft::log_store::blank_sm_startup_allowed(sm_is_blank, last_purged) {
+        anyhow::bail!(msg);
+    }
+
     // 3. Build the OpenRaft config.
     let raft_config = openraft::Config {
         cluster_name: config.cluster.name.clone(),
