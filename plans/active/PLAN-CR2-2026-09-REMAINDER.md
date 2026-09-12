@@ -51,7 +51,7 @@ Status: ⬜ / 🟦 / ✅ / 🟥
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR2-8-1 | ⬜ | CMN-3 | `dtfs-common/src/config.rs`, `dtfs-data/src/server.rs`, `dtfs-client/src/client.rs`, `deploy/examples/*.toml`, `docs/src/configuration/*.md` | Wire `grpc.max_message_size_mb` into the tonic builders (`max_decoding_message_size` / `max_encoding_message_size`) everywhere a `32 * 1024 * 1024` literal is used today. | config unit: value propagates; `example_*_toml_parses` green. | Tests pass; docs row true. |
+| CR2-8-1 | ✅ | CMN-3 | `dtfs-common/src/config.rs`, `dtfs-data/src/server.rs`, `dtfs-client/src/client.rs`, `deploy/examples/*.toml`, `docs/src/configuration/*.md` | Wire `grpc.max_message_size_mb` into the tonic builders (`max_decoding_message_size` / `max_encoding_message_size`) everywhere a `32 * 1024 * 1024` literal is used today. | config unit: value propagates; `example_*_toml_parses` green. | Tests pass; docs row true. |
 | CR2-8-2 | ✅ | CMN-6 | `dtfs-common/src/memory.rs` table, `config.rs` docs, `docs/src/configuration/manager.md` | Manager rung: Warn = no action; Shed = pause scheduler ticks (self-limiting). | — | Doc sites agree with `scheduler.rs`. |
 | CR2-8-3 | ⬜ | FUSE-11 | `dtfs-fuse/src/filesystem.rs` read path, `local_cache.rs` | Viewer-read hint from per-fh consumption (≥ 1 MiB read on this fh, or readahead active) instead of the kernel's per-call length; keep `ATIME_UPDATE_MIN_BYTES` semantics for the hint. | unit on the pure hint helper. | Tests pass. |
 | CR2-8-4 | ⬜ | FUSE-12 | `dtfs-fuse/src/local_cache.rs` | Evict with hysteresis (down to 90 % of `max_bytes`) so the stat sweep is rare; either make `lru` the atime index (update on viewer get, remove on prune) or delete it. | unit: 1000 puts at a full cache → sweeps ≤ 1000/10; `lru` never exceeds `sizes.len()`. | Tests pass. |
@@ -91,6 +91,12 @@ Status: ⬜ / 🟦 / ✅ / 🟥
   `cargo test -p <crate> --release` via Docker `dtfs-buildenv`:
   - CR2-8-2 (CMN-6): doc-only (memory.rs table, config.rs doc comment,
     docs/src/configuration/manager.md); no test count change.
+  - CR2-8-1 (CMN-3): common 110 -> 113 (+3: `max_message_bytes`
+    conversion, `GrpcConfig::validate` rejects 0,
+    `FuseClientConfig::max_message_size_mb` default+validate).
+    data 122 -> 122 (wiring only, no new test), client 31 -> 31, fuse
+    110 -> 110. `example_*_toml_parses` green.
+    `cargo build --release --workspace` clean.
 
 ## Deviations
 

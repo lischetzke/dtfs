@@ -173,6 +173,12 @@ struct DtfsClientInner {
     /// [`DtfsClient::set_tls`] BEFORE the first connect so no plaintext
     /// channel gets cached.
     tls: parking_lot::RwLock<dtfs_common::tls::TlsContext>,
+    /// CMN-3 — max gRPC message size (MB) for data-node channels, from
+    /// `[client].max_message_size_mb`. Set via
+    /// [`DtfsClient::set_max_message_size_mb`] BEFORE the first connect
+    /// (channels are cached per address). Defaults to the same 256 MB the
+    /// manager/data-node `[grpc]` block defaults to.
+    max_message_size_mb: parking_lot::RwLock<u32>,
 }
 
 /// High-level client for interacting with the DTFS cluster.
@@ -203,6 +209,9 @@ impl DtfsClient {
                 shared_secret: parking_lot::RwLock::new(String::new()),
                 tls: parking_lot::RwLock::new(
                     dtfs_common::tls::TlsContext::plaintext(),
+                ),
+                max_message_size_mb: parking_lot::RwLock::new(
+                    dtfs_common::config::default_max_message_size(),
                 ),
             }),
         }
@@ -242,6 +251,13 @@ impl DtfsClient {
     /// created earlier keeps its original (plaintext) transport.
     pub fn set_tls(&self, tls: dtfs_common::tls::TlsContext) {
         *self.inner.tls.write() = tls;
+    }
+
+    /// CMN-3 — install `[client].max_message_size_mb`. Must be called
+    /// before the first connect: channels are cached per address, so a
+    /// channel created earlier keeps its original cap.
+    pub fn set_max_message_size_mb(&self, max_message_size_mb: u32) {
+        *self.inner.max_message_size_mb.write() = max_message_size_mb;
     }
 
     /// P0-9: set the client's DC/host labels for `read_chunk` telemetry.
@@ -949,12 +965,17 @@ impl DtfsClient {
             .get_or_create_channel(&self.inner.data_channels, addr)
             .await?;
         // Tonic's default max_decoding_message_size is 4 MB; the data node
-        // streams chunk payloads in 8 MB pieces, so bump the cap (32 MB is
-        // safely above the piece size and matches the encode cap on the
-        // server side).
+        // streams chunk payloads in 8 MB pieces, so bump the cap. CMN-3:
+        // this used to be a hardcoded 32 MB literal ignoring
+        // `[client].max_message_size_mb`; now it matches the configured
+        // value (default 256 MB), which also matches the data-node encode
+        // cap on the server side (`dtfs-data/src/server.rs`).
+        let max_bytes = dtfs_common::config::max_message_bytes(
+            *self.inner.max_message_size_mb.read(),
+        );
         Ok(DataServiceClient::new(channel)
-            .max_decoding_message_size(32 * 1024 * 1024)
-            .max_encoding_message_size(32 * 1024 * 1024))
+            .max_decoding_message_size(max_bytes)
+            .max_encoding_message_size(max_bytes))
     }
 
     /// Get an existing channel from the pool or create a new one.
