@@ -11,6 +11,50 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use tracing::{debug, instrument};
 
+/// WI-01 — upper clamp on `flush_batch_chunks`. Far below the manager's
+/// `MAX_CHUNKS_PER_ALLOCATION` (65_536, `metadata.rs`), it just bounds how
+/// much un-committed data one open file can hold in client heap
+/// (`flush_batch_chunks * chunk_size`; see AGENTS.md A.3.2).
+const MAX_FLUSH_BATCH_CHUNKS: usize = 32;
+
+/// WI-01 / H1 — hard byte ceiling on un-committed data one open file may hold
+/// because of batching. `flush_batch_chunks` bounds a chunk COUNT, so at a
+/// 128 MB volume chunk size the default batch of 4 would buffer 512 MB per
+/// open write and the count clamp would permit 4 GB — with nothing in the
+/// dtfs-fuse memory ladder (A.3.2 / A.5) shedding write buffers and several
+/// files open at once during a torrent landing. 64 MB keeps the default
+/// 4 x 4 MB batch intact and degrades a large-chunk volume to per-chunk
+/// flushing (the pre-WI-01 behaviour) instead of to an OOM.
+const FLUSH_BATCH_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// WI-01 / H1 — resolve the effective `flush_batch_chunks` for a given
+/// configured value and chunk size: clamp the count into
+/// `1..=MAX_FLUSH_BATCH_CHUNKS`, then clamp again so `batch * chunk_size`
+/// never exceeds `FLUSH_BATCH_MAX_BYTES`. Never goes below 1 — a single
+/// chunk always flushes whatever its size (pre-WI-01 behaviour); holding it
+/// back would strand the write.
+pub(crate) fn effective_batch_chunks(configured: usize, chunk_size: usize) -> usize {
+    let by_count = configured.clamp(1, MAX_FLUSH_BATCH_CHUNKS);
+    if chunk_size == 0 {
+        // Degenerate; complete_chunks_available already returns 0. Also
+        // avoids a divide by zero.
+        return by_count;
+    }
+    by_count.min(FLUSH_BATCH_MAX_BYTES / chunk_size).max(1)
+}
+
+/// WI-01 — number of whole, chunk-aligned chunks currently extractable from
+/// a buffer that starts at `dirty_offset` and holds `len` bytes. Mirrors the
+/// extraction rule in `FileWriteBuffer::extract_complete_chunks`: a buffer
+/// that starts mid-chunk yields 0 regardless of `len` (CO-1-7 — those bytes
+/// only ever leave via `flush_all`, never an early `flush`).
+pub(crate) fn complete_chunks_available(dirty_offset: u64, len: usize, chunk_size: usize) -> usize {
+    if chunk_size == 0 || dirty_offset % chunk_size as u64 != 0 {
+        return 0;
+    }
+    len / chunk_size
+}
+
 /// Write buffer that accumulates data and flushes chunk-aligned segments.
 ///
 /// Each file path gets an independent [`FileWriteBuffer`] that tracks dirty
@@ -20,6 +64,11 @@ use tracing::{debug, instrument};
 pub struct WriteBuffer {
     /// Chunk size in bytes (default 128 MB).
     chunk_size: usize,
+    /// WI-01 — `flush()` holds back complete chunks until at least this many
+    /// are available, amortizing the allocate+commit round trip over
+    /// several chunks. `1` (the default from `new()`) reproduces the
+    /// pre-WI-01 per-chunk-flush behaviour exactly.
+    flush_batch_chunks: usize,
     /// Per-file write buffers, keyed by file path.
     buffers: DashMap<String, FileWriteBuffer>,
 }
@@ -48,9 +97,33 @@ pub struct ChunkSegment {
 
 impl WriteBuffer {
     /// Create a new write buffer with the given chunk size in bytes.
+    ///
+    /// Flushes one complete chunk at a time (`flush_batch_chunks = 1`) — the
+    /// original behaviour. Use [`new_with_batch`](Self::new_with_batch) to
+    /// hold back several complete chunks per flush.
     pub fn new(chunk_size: usize) -> Self {
         Self {
             chunk_size,
+            flush_batch_chunks: 1,
+            buffers: DashMap::new(),
+        }
+    }
+
+    /// WI-01 — create a new write buffer that holds back complete chunks
+    /// until at least `flush_batch_chunks` are available, so `flush()`
+    /// amortizes the allocate+commit round trip over a batch instead of
+    /// firing once per chunk. Clamped into `1..=MAX_FLUSH_BATCH_CHUNKS` AND
+    /// down to whatever keeps `batch * chunk_size` within
+    /// `FLUSH_BATCH_MAX_BYTES` (64 MB), so a large-chunk volume degrades to
+    /// per-chunk flushing rather than buffering hundreds of MB per open
+    /// file. `1` reproduces `new()`'s exact behaviour (the rollback value)
+    /// at the default 4 MB chunk size. `flush_all` is unaffected — it
+    /// always drains everything, batched or not, so held-back chunks still
+    /// leave at fsync/close.
+    pub fn new_with_batch(chunk_size: usize, flush_batch_chunks: usize) -> Self {
+        Self {
+            chunk_size,
+            flush_batch_chunks: effective_batch_chunks(flush_batch_chunks, chunk_size),
             buffers: DashMap::new(),
         }
     }
@@ -97,6 +170,18 @@ impl WriteBuffer {
         };
 
         let buf = entry.value_mut();
+
+        // WI-01 — hold back until at least `flush_batch_chunks` complete
+        // chunks are available, so the caller's allocate+commit round trip
+        // amortizes over a batch instead of firing once per chunk. `1`
+        // (the `new()` default) makes this check pass at the first complete
+        // chunk, exactly like the pre-batching behaviour.
+        if complete_chunks_available(buf.dirty_offset, buf.data.len(), self.chunk_size)
+            < self.flush_batch_chunks
+        {
+            return Vec::new();
+        }
+
         let segments = buf.extract_complete_chunks(self.chunk_size);
 
         debug!(
@@ -619,6 +704,171 @@ mod tests {
             Some(60),
             "overlapping write does not shrink logical end"
         );
+    }
+
+    // WI-01 — direct unit on the pure batch-threshold helper: a buffer that
+    // starts mid-chunk must report 0 available chunks regardless of how much
+    // data it holds (mirrors the CO-1-7 rule in extract_complete_chunks).
+    #[test]
+    fn wi01_complete_chunks_available_is_zero_when_midchunk() {
+        let chunk = 10;
+        // Aligned start: 25 bytes -> 2 complete chunks.
+        assert_eq!(complete_chunks_available(0, 25, chunk), 2);
+        assert_eq!(complete_chunks_available(20, 25, chunk), 2);
+        // Mid-chunk start (dirty_offset % chunk_size != 0) -> always 0.
+        assert_eq!(complete_chunks_available(5, 25, chunk), 0);
+        assert_eq!(complete_chunks_available(5, 1000, chunk), 0);
+    }
+
+    // WI-01 — flush() must hold back complete chunks until the batch
+    // threshold is reached, then emit exactly the batch, ascending, and
+    // leave nothing dirty.
+    #[test]
+    fn wi01_flush_holds_chunks_until_batch_is_full() {
+        let chunk = 4 * 1024 * 1024; // 4 MiB
+        let wb = WriteBuffer::new_with_batch(chunk, 4);
+        let mib = 1024 * 1024;
+
+        // Feed 16 MiB as 16 sequential 1 MiB writes, byte value = write index.
+        for i in 0..16u8 {
+            let data = vec![i; mib];
+            wb.write("/f", (i as u64) * mib as u64, &data);
+            let segs = wb.flush("/f");
+            if i < 15 {
+                assert!(
+                    segs.is_empty(),
+                    "flush after write {} must hold back (only {} complete chunk(s) so far)",
+                    i + 1,
+                    (i as usize + 1) * mib / chunk
+                );
+            } else {
+                assert_eq!(segs.len(), 4, "batch of 4 emitted once the 16th MiB completes it");
+                let mibs_per_chunk = chunk / mib; // 4
+                for (idx, seg) in segs.iter().enumerate() {
+                    assert_eq!(seg.chunk_index, idx as u32);
+                    assert_eq!(seg.data.len(), chunk);
+                    // Each chunk is `mibs_per_chunk` sequential 1 MiB writes,
+                    // each filled with its own write index as the byte value.
+                    for k in 0..mibs_per_chunk {
+                        let write_idx = (idx * mibs_per_chunk + k) as u8;
+                        let piece = &seg.data.as_ref()[k * mib..(k + 1) * mib];
+                        assert!(
+                            piece.iter().all(|&b| b == write_idx),
+                            "chunk {idx} sub-piece {k} must carry write-index byte {write_idx}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(!wb.has_dirty_data("/f"), "batch fully drained, nothing left dirty");
+    }
+
+    // WI-01 — flush_all must still drain held-back chunks at fsync/close,
+    // even when the batch threshold was never reached.
+    #[test]
+    fn wi01_flush_all_drains_held_back_chunks() {
+        let chunk = 4 * 1024 * 1024;
+        let wb = WriteBuffer::new_with_batch(chunk, 8);
+        let data = vec![9u8; chunk * 3]; // 3 complete chunks, batch is 8
+        wb.write("/f", 0, &data);
+
+        let held = wb.flush("/f");
+        assert!(held.is_empty(), "3 < 8, flush must hold back");
+
+        let drained = wb.flush_all("/f");
+        assert_eq!(drained.len(), 3, "flush_all must not strand held-back chunks");
+        for (idx, seg) in drained.iter().enumerate() {
+            assert_eq!(seg.chunk_index, idx as u32);
+        }
+        assert!(!wb.has_dirty_data("/f"));
+    }
+
+    // WI-01 / CO-1-8a — restore_segments must round-trip a MULTI-segment
+    // batch (previously only a single held-back chunk, or the final
+    // flush_all drain, exercised this path). Write 4 full chunks + a
+    // partial 5th, flush the batch out, restore it, then flush_all and
+    // confirm the exact byte sequence comes back.
+    #[test]
+    fn wi01_restore_segments_round_trips_a_batch() {
+        let chunk = 4 * 1024 * 1024;
+        let wb = WriteBuffer::new_with_batch(chunk, 4);
+
+        let mut full = Vec::new();
+        for i in 0..4u8 {
+            full.extend(std::iter::repeat(i).take(chunk));
+        }
+        let tail = vec![4u8; 1024 * 1024]; // partial 5th chunk
+        wb.write("/f", 0, &full);
+        wb.write("/f", full.len() as u64, &tail);
+
+        let segments = wb.flush("/f");
+        assert_eq!(segments.len(), 4, "batch of 4 full chunks emitted");
+        assert!(wb.has_dirty_data("/f"), "partial 5th chunk still buffered");
+
+        // Simulate a cluster-write failure: restore the drained batch.
+        wb.restore_segments("/f", &segments);
+        assert!(wb.has_dirty_data("/f"));
+
+        let mut emitted: Vec<(u32, Vec<u8>)> = Vec::new();
+        for seg in wb.flush_all("/f") {
+            emitted.push((seg.chunk_index, seg.data.to_vec()));
+        }
+
+        assert_eq!(emitted.len(), 5, "4 restored full chunks + the partial 5th");
+        let mut expected: Vec<u8> = full.clone();
+        expected.extend_from_slice(&tail);
+        let mut got: Vec<u8> = Vec::new();
+        for (idx, (chunk_index, bytes)) in emitted.iter().enumerate() {
+            assert_eq!(*chunk_index, idx as u32, "chunk indices ascend 0..=4");
+            got.extend_from_slice(bytes);
+        }
+        assert_eq!(got, expected, "restored batch re-emits every original byte");
+        assert!(!wb.has_dirty_data("/f"));
+    }
+
+    // WI-01 / H1 — effective_batch_chunks must clamp both by count
+    // (1..=MAX_FLUSH_BATCH_CHUNKS) and by byte budget (FLUSH_BATCH_MAX_BYTES),
+    // and the resulting batch * chunk_size must never exceed the budget for
+    // any chunk size up to the budget itself.
+    #[test]
+    fn wi01_h1_effective_batch_is_byte_bounded() {
+        let mib = 1024 * 1024;
+        assert_eq!(effective_batch_chunks(4, 4 * mib), 4);
+        assert_eq!(effective_batch_chunks(32, 4 * mib), 16);
+        assert_eq!(effective_batch_chunks(4, 32 * mib), 2);
+        assert_eq!(effective_batch_chunks(4, 64 * mib), 1);
+        assert_eq!(effective_batch_chunks(4, 128 * mib), 1);
+        assert_eq!(effective_batch_chunks(64, 4 * mib), 16);
+        assert_eq!(effective_batch_chunks(0, 4 * mib), 1);
+        assert_eq!(effective_batch_chunks(4, 0), 4);
+
+        let cases: &[(usize, usize)] = &[
+            (4, 4 * mib),
+            (32, 4 * mib),
+            (4, 32 * mib),
+            (4, 64 * mib),
+            (4, 128 * mib),
+            (64, 4 * mib),
+        ];
+        for &(configured, size) in cases {
+            if size == 0 || size > FLUSH_BATCH_MAX_BYTES {
+                continue;
+            }
+            let effective = effective_batch_chunks(configured, size);
+            assert!(
+                effective * size <= FLUSH_BATCH_MAX_BYTES,
+                "batch {effective} * chunk_size {size} must stay within {FLUSH_BATCH_MAX_BYTES}"
+            );
+        }
+    }
+
+    // WI-01 / H1 — a large-chunk volume (>= 64 MB) must degrade to per-chunk
+    // flushing regardless of the configured batch; the reference-deployment
+    // 4 MB chunk size keeps the configured default of 4.
+    #[test]
+    fn wi01_h1_large_chunk_volume_flushes_per_chunk() {
+        assert_eq!(WriteBuffer::new_with_batch(128 * 1024 * 1024, 4).flush_batch_chunks, 1);
+        assert_eq!(WriteBuffer::new_with_batch(4 * 1024 * 1024, 4).flush_batch_chunks, 4);
     }
 }
 

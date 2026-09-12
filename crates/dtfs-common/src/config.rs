@@ -888,6 +888,15 @@ pub struct ReadAheadConfig {
     /// unbounded 256-entry count cap.
     #[serde(default = "default_readahead_cache_mb")]
     pub cache_mb: u64,
+    /// WI-05 — maximum simultaneous prefetch `GetChunk` streams. The
+    /// prefetch WINDOW stays `prefetch_chunks` deep; this bounds how many
+    /// of those fetches are on the wire at once. On a 40 Mbps cross-DC path
+    /// 8 concurrent 4 MB streams delay the nearest chunk about 8x (about
+    /// 6.4 s instead of about 0.8 s) and hold `prefetch_chunks * chunk_size`
+    /// in heap at once. `0` degrades to serial prefetch (`.max(1)`), never
+    /// "unbounded".
+    #[serde(default = "default_prefetch_max_inflight")]
+    pub prefetch_max_inflight: u32,
 }
 
 /// Bug AV (AV-3-1) — FUSE write-path preference for first-write
@@ -914,12 +923,27 @@ pub struct ReadAheadConfig {
 pub struct FuseWriteConfig {
     #[serde(default = "default_first_write_tier")]
     pub first_write_tier: String,
+    /// WI-01 — number of complete, chunk-aligned chunks the write buffer
+    /// holds back before flushing to the cluster, amortizing the manager
+    /// `AllocateChunks` RPC + `CommitChunkLocations` Raft write over a batch
+    /// instead of firing once per chunk. Clamped into `1..=32` by
+    /// `WriteBuffer::new_with_batch`; `1` reproduces the pre-WI-01
+    /// per-chunk-flush behaviour exactly (the rollback value). WI-01 / H1 —
+    /// the EFFECTIVE batch is additionally clamped to
+    /// `min(configured, 64 MB / chunk_size_mb)`
+    /// (`writebuf::effective_batch_chunks`, `FLUSH_BATCH_MAX_BYTES` = 64 MB),
+    /// so the un-committed ceiling per open write is AT MOST 64 MB regardless
+    /// of `chunk_size_mb` (default 4 * 4 MB = 16 MB), and a volume with
+    /// chunks of 64 MB or more flushes per chunk — see AGENTS.md A.3.2.
+    #[serde(default = "default_flush_batch_chunks")]
+    pub flush_batch_chunks: u32,
 }
 
 impl Default for FuseWriteConfig {
     fn default() -> Self {
         Self {
             first_write_tier: default_first_write_tier(),
+            flush_batch_chunks: default_flush_batch_chunks(),
         }
     }
 }
@@ -954,6 +978,10 @@ impl FuseWriteConfig {
 
 fn default_first_write_tier() -> String {
     "cold".to_string()
+}
+
+fn default_flush_batch_chunks() -> u32 {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1165,6 +1193,9 @@ fn default_prefetch_chunks() -> u32 {
 }
 fn default_prefetch_files() -> u32 {
     3
+}
+fn default_prefetch_max_inflight() -> u32 {
+    2
 }
 fn default_readahead_cache_mb() -> u64 {
     64
@@ -1702,6 +1733,34 @@ max_io_percent = 10
             FirstWriteTier::Cold,
             "unknown values must fall back to the safe default"
         );
+    }
+
+    /// WI-01 — when `[write]` omits `flush_batch_chunks` (legacy config or
+    /// only `first_write_tier` set), `serde(default)` must produce `4`.
+    #[test]
+    fn wi01_flush_batch_chunks_defaults_to_four() {
+        let cfg: FuseWriteConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.flush_batch_chunks, 4);
+
+        let cfg: FuseWriteConfig =
+            toml::from_str("first_write_tier = \"nearest-warm\"").unwrap();
+        assert_eq!(
+            cfg.flush_batch_chunks, 4,
+            "setting first_write_tier alone must not disturb the batch default"
+        );
+
+        let dflt = FuseWriteConfig::default();
+        assert_eq!(dflt.flush_batch_chunks, 4);
+    }
+
+    /// WI-01 — an explicit `flush_batch_chunks` parses through untouched;
+    /// clamping into `1..=32` happens in `WriteBuffer::new_with_batch`, not
+    /// at parse time.
+    #[test]
+    fn wi01_flush_batch_chunks_parses_explicit_value() {
+        let cfg: FuseWriteConfig =
+            toml::from_str("flush_batch_chunks = 1").unwrap();
+        assert_eq!(cfg.flush_batch_chunks, 1, "1 is the documented rollback value");
     }
 
     /// Bug BC-1 — an empty `[scrub]` block (or its complete absence)

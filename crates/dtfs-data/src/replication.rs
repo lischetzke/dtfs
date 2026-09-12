@@ -4,7 +4,6 @@
 // all replication through `ReplicateChunk` on the source node.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use dtfs_common::config::DataNodeConfig;
 use dtfs_common::types::ChunkId;
@@ -14,13 +13,15 @@ use tokio::io::AsyncReadExt;
 
 use crate::store::ChunkStore;
 
-/// Bug CI follow-up — hard ceiling for one outbound replication (connect +
-/// stream + remote commit). Pre-fix there was NO deadline anywhere on the
-/// path: a memory-throttled target stalled `put_chunk` indefinitely, the
-/// in-flight RPC pinned its buffers, and the manager's sequential dispatch
-/// tick wedged behind it (2026-06-06). 120s is ~9x the worst legit case
-/// (a 64 MiB chunk over the 40 Mbps LELI uplink ≈ 13s).
-const REPLICATE_TIMEOUT: Duration = Duration::from_secs(120);
+// Bug CI follow-up — hard ceiling for one outbound replication (connect +
+// stream + remote commit). Pre-fix there was NO deadline anywhere on the
+// path: a memory-throttled target stalled `put_chunk` indefinitely, the
+// in-flight RPC pinned its buffers, and the manager's sequential dispatch
+// tick wedged behind it (2026-06-06). WI-04: the budget now scales with the
+// chunk's own byte count via `dtfs_common::replication::replicate_transfer_timeout`
+// (floored at 30s, capped at 270s (B4), always strictly below the manager's
+// outer deadline for the same copy). See that module's doc comment for the
+// full outer-vs-inner rationale and the B4 inversion-fix history.
 
 /// Streaming piece size — matches the put_chunk intake's expectation of
 /// ~1 MiB pieces (Bug I).
@@ -78,8 +79,8 @@ impl ReplicationManager {
     /// `.dat` file in ~1 MiB pieces (Bug I parity: the pre-fix version
     /// buffered the WHOLE chunk in memory and copied every piece again
     /// via `to_vec`, which pinned the node at its memory cap during the
-    /// 2026-06-06 storm). The entire operation is bounded by
-    /// `REPLICATE_TIMEOUT`.
+    /// 2026-06-06 storm). The entire operation is bounded by a size-scaled
+    /// budget (WI-04, `dtfs_common::replication::replicate_transfer_timeout`).
     pub async fn replicate_to(
         &self,
         chunk_id: &ChunkId,
@@ -195,13 +196,19 @@ impl ReplicationManager {
             Ok(())
         };
 
-        match tokio::time::timeout(REPLICATE_TIMEOUT, work).await {
+        // WI-04 — the budget scales with this chunk's own byte count so a
+        // large chunk over a slow link gets proportionally longer, floored
+        // at REPLICATE_TIMEOUT_FLOOR (30s) for small chunks and capped at
+        // REPLICATE_TIMEOUT_CEILING (270s). The pre-WI-04 value was a fixed
+        // 120s, which the manager's fixed 60s outer deadline made dead code.
+        let budget = dtfs_common::replication::replicate_transfer_timeout(total);
+        match tokio::time::timeout(budget, work).await {
             Ok(res) => res,
             Err(_) => anyhow::bail!(
                 "replication of chunk {} to {} timed out after {:?}",
                 chunk_hex,
                 target_addr,
-                REPLICATE_TIMEOUT,
+                budget,
             ),
         }
     }
