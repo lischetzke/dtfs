@@ -41,6 +41,21 @@ pub fn manual_scrub_due(
     now_ms.saturating_sub(requested_at_ms) <= max_age_secs.saturating_mul(1000)
 }
 
+/// CR-6-3 (PROTO-2) — prefer an exact-seconds cadence over the legacy
+/// hours field: `secs` is non-zero only when the manager's heartbeat
+/// carried the CR-6-3 `ScrubConfigOverride.quick_interval_secs` /
+/// `deep_interval_secs` fields (a manager on this build or newer); an
+/// older manager (or before the first heartbeat) leaves `secs` at `0`,
+/// falling back to the pre-existing `hours * 3600` (ceil-to-1h)
+/// behaviour.
+pub fn effective_interval_secs(secs: u64, hours: u64) -> u64 {
+    if secs > 0 {
+        secs
+    } else {
+        hours.saturating_mul(3600)
+    }
+}
+
 /// Background scrub scheduler that runs quick and deep scrubs on configured
 /// intervals against all disks managed by the chunk store. AZ-1: the
 /// `config` field is an `Arc<RwLock<ScrubConfig>>` so the manager's
@@ -97,10 +112,8 @@ impl ScrubScheduler {
                 _ = ticker.tick() => {
                     let (quick_secs, deep_secs) = {
                         let c = self.config.read().await;
-                        (
-                            c.quick_interval_hours.saturating_mul(3600),
-                            c.deep_interval_hours.saturating_mul(3600),
-                        )
+                        (effective_interval_secs(c.quick_interval_secs, c.quick_interval_hours),
+                         effective_interval_secs(c.deep_interval_secs, c.deep_interval_hours))
                     };
                     let now = std::time::Instant::now();
                     let quick_due = match last_quick {
@@ -263,5 +276,23 @@ mod cf8_manual_scrub_tests {
     #[test]
     fn empty_id_never_runs() {
         assert!(!manual_scrub_due("", 1_000, None, 2_000, 3600));
+    }
+}
+
+#[cfg(test)]
+mod cr_6_3_effective_interval_secs_tests {
+    use super::effective_interval_secs;
+
+    #[test]
+    fn nonzero_secs_wins_over_hours() {
+        // manager sent quick_interval_secs = 600 (10 min) — must NOT be
+        // ceiled to 1h via the legacy hours field.
+        assert_eq!(effective_interval_secs(600, 6), 600);
+    }
+
+    #[test]
+    fn zero_secs_falls_back_to_hours() {
+        // older manager / no override yet: secs is 0, derive from hours.
+        assert_eq!(effective_interval_secs(0, 6), 6 * 3600);
     }
 }

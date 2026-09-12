@@ -60,6 +60,11 @@ async fn main() -> anyhow::Result<()> {
         .cluster
         .validate_shared_secret()
         .map_err(|e| anyhow::anyhow!(e))?;
+    // CR-6-1 (CMN-1, CMN-8) — reject an unusable memory ladder or
+    // placement headroom pct at startup instead of flapping/misplacing
+    // at runtime.
+    config.memory.validate().map_err(|e| anyhow::anyhow!(e))?;
+    config.placement.validate().map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!(
         "Manager {} at {} ({})",

@@ -175,6 +175,14 @@ Controls the background scrubbing process that verifies chunk integrity by recal
 > manager's cluster-wide `[scrub]` policy (see the manager page) overrides it
 > via heartbeat.
 
+CR-6-3 (PROTO-2): `quick_interval_secs`/`deep_interval_secs` are internal,
+not meant to be hand-set in `data.toml` (default `0` = unused). The manager's
+heartbeat `ScrubConfigOverride` populates them with the exact configured
+cadence so a sub-hour quick/deep interval takes effect precisely instead of
+silently rounding up to the nearest hour via `*_interval_hours`; an older
+manager leaves them `0` and this data node falls back to the hours field
+exactly as before.
+
 ### Example
 
 ```toml
@@ -224,6 +232,10 @@ roles' caps must stay under host RAM.
 | `warn_threshold_pct` | `memory.warn_threshold_pct` | `u8` | `80` | Log a warning when RSS crosses this fraction of the cap. |
 | `shed_threshold_pct` | `memory.shed_threshold_pct` | `u8` | `92` | Above this, new `put_chunk` requests get `RESOURCE_EXHAUSTED` (clients retry with backoff) instead of risking an OOM kill. |
 | `sample_interval_secs` | `memory.sample_interval_secs` | `u64` | `5` | RSS sampling cadence. |
+
+CR-6-1: `dtfs-data` calls `MemoryConfig::validate()` right after config
+load and exits non-zero if `warn_threshold_pct >= shed_threshold_pct` or
+either is `> 100`.
 
 ---
 
