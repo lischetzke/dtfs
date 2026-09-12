@@ -147,6 +147,14 @@ impl ConsistentHashRing {
             .range(start_position..)
             .chain(self.ring.range(..start_position));
 
+        // CMN-7 — the ring is immutable across this walk, so the unique
+        // DC/rack counts for this tier are the same on every visited
+        // vnode. Hoist both out of the strict-pass loop instead of
+        // re-scanning + sorting + deduping the whole ring (~1500 vnodes/
+        // disk at weight 10) on every skipped vnode.
+        let dc_count_for_tier = self.unique_dc_count_for_tier(rule.tier);
+        let rack_count_for_tier = self.unique_rack_count_for_tier(rule.tier);
+
         for (_, vn) in iter {
             if selected.len() >= rule.replica_count as usize {
                 break;
@@ -169,8 +177,7 @@ impl ConsistentHashRing {
                         && selected.len() < rule.replica_count as usize
                     {
                         // Try to spread across DCs, but don't block if we can't
-                        let all_dcs_covered = selected_dcs.len()
-                            >= self.unique_dc_count_for_tier(rule.tier);
+                        let all_dcs_covered = selected_dcs.len() >= dc_count_for_tier;
                         if !all_dcs_covered {
                             continue;
                         }
@@ -184,8 +191,7 @@ impl ConsistentHashRing {
                     if selected_racks.contains(&rack_key)
                         && selected.len() < rule.replica_count as usize
                     {
-                        let all_racks_covered = selected_racks.len()
-                            >= self.unique_rack_count_for_tier(rule.tier);
+                        let all_racks_covered = selected_racks.len() >= rack_count_for_tier;
                         if !all_racks_covered {
                             continue;
                         }
@@ -598,5 +604,60 @@ mod tests {
         // Racks are stored canonically as "{dc}:{rack}".
         assert!(placement.racks.contains(&"dc-a:rack-1".to_string()));
         assert!(placement.racks.contains(&"dc-b:rack-1".to_string()));
+    }
+
+    /// CMN-7 — hoisting `unique_dc_count_for_tier`/`unique_rack_count_for_tier`
+    /// out of the strict-pass loop must not change the placement result: the
+    /// ring is immutable during the walk, so both counts are constant across
+    /// every visited vnode for a fixed tier. Multi-DC, multi-rack ring with a
+    /// DC-scoped rule exercises both hoisted counts.
+    #[test]
+    fn cmn_7_hoisted_dc_rack_counts_dont_change_placement() {
+        let mut ring = ConsistentHashRing::new(256);
+        ring.add_node(
+            &NodeId::from_string("n-a".to_string()),
+            0,
+            DiskTier::Warm,
+            &make_location("dc-a", "rack-1", "host-a"),
+            1.0,
+        );
+        ring.add_node(
+            &NodeId::from_string("n-b".to_string()),
+            0,
+            DiskTier::Warm,
+            &make_location("dc-b", "rack-1", "host-b"),
+            1.0,
+        );
+        ring.add_node(
+            &NodeId::from_string("n-c".to_string()),
+            0,
+            DiskTier::Warm,
+            &make_location("dc-c", "rack-2", "host-c"),
+            1.0,
+        );
+
+        let dc_rule = PlacementRule {
+            tier: DiskTier::Warm,
+            replica_count: 3,
+            failure_domain: FailureDomain::Datacenter,
+            prefer_client_locations: false,
+            required_datacenter: None,
+        };
+        let placement = ring.find_placement_for_pg(7, &dc_rule, &[]);
+        assert_eq!(placement.nodes.len(), 3, "one replica per DC");
+        let unique_dcs: std::collections::HashSet<_> = placement.datacenters.iter().collect();
+        assert_eq!(unique_dcs.len(), 3, "all three DCs represented");
+
+        let rack_rule = PlacementRule {
+            tier: DiskTier::Warm,
+            replica_count: 3,
+            failure_domain: FailureDomain::Rack,
+            prefer_client_locations: false,
+            required_datacenter: None,
+        };
+        let placement2 = ring.find_placement_for_pg(7, &rack_rule, &[]);
+        assert_eq!(placement2.nodes.len(), 3, "one replica per rack");
+        let unique_racks: std::collections::HashSet<_> = placement2.racks.iter().collect();
+        assert_eq!(unique_racks.len(), 3, "all three dc-scoped racks represented");
     }
 }

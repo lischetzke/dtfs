@@ -37,15 +37,15 @@ Status: ⬜ / 🟦 / ✅ / 🟥
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR2-7-1 | ⬜ | MGR-3 | `crates/dtfs-manager/src/tiering.rs::build_av_cache_snapshot` | Under the SM read lock collect per-chunk inputs (`chunk_id, idx, placements, cooldown, volume_id, updated_at, unique_dcs`) into a Vec, `drop(sm)`, then take `read_windows.write()` ONCE and compute every `reads_in_window_by_dc`; no `.await` while `sm` is held. | unit: a pure `fn window_counts_for(...)` over a prebuilt read-window map, plus an existing `build_av_cache_snapshot` test still green; grep proves no `read_window_count(...).await` between `state_data.read()` and `drop(sm)`. | Tests pass; grep clean. |
-| CR2-7-2 | ⬜ | MGR-10 | `proto/data.proto` `ListChunksResponse`, `dtfs-data/src/server.rs::list_chunks`, `dtfs-manager/src/scheduler.rs` orphan/de-located reap | Add `repeated uint32 chunk_disk_ids = N;` positional with `chunk_ids`; data node fills it; reaper keys `expected_by_node` on `(node, disk)` (`chunk_delocated_on_node` → per-disk) and passes `Some(disk_id)` to the reap delete. Empty field (old data node) → legacy node-wide behaviour. | scheduler unit: warm leftover + cold live row on one node → reaped on the warm disk only; legacy empty field → node-wide as before. | Tests pass; compat path covered. |
-| CR2-7-3 | ⬜ | MGR-13 | `scheduler.rs` orphan sweep loop | Re-check `is_leader()` + `orphan_sweep_allowed` at the top of each per-node iteration and before each delete batch; stop the sweep (audit `orphan.sweep_aborted_not_leader`) when either fails. | unit on the pure gate helper; mock-driven test that a leadership loss mid-sweep stops further deletes. | Tests pass. |
-| CR2-7-4 | ⬜ | MGR-14 | `dtfs-manager/src/audit.rs` | Bound fan-out with a `Semaphore(16)` (skip + counter when exhausted, never block the caller) and switch the ring to `VecDeque`. | unit: 100 concurrent `log()` calls → at most 16 in flight (counting mock fanout); ring eviction order unchanged. | Tests pass. |
-| CR2-7-5 | ⬜ | RAFT-5 | `crates/dtfs-raft/src/log_store.rs` | `WriteOptions::set_sync(true)` on append/save_vote instead of `flush_cf`; `truncate_after` = one `delete_range_cf(start, u64::MAX key)`; `purge` = one synced `WriteBatch` (delete_range + last_purged put). Keep the test helpers that call `flush_cf` if they exist (tests only). | existing log_store tests green; new: truncate_after leaves no hole (indices contiguous), purge persists `last_purged` atomically (reopen store → value present). | Tests pass. |
-| CR2-7-6 | ⬜ | RAFT-6 | `state_machine.rs::open_at` corrupt-snapshot path + `dtfs-manager/src/main.rs` startup | After discarding a corrupt snapshot, if `LogStore::last_purged` is `Some`, refuse to start (error with the recovery-runbook message already used at `log_store.rs` ~140-145) instead of booting a blank voter. | unit: blank SM + `last_purged = Some(..)` → startup helper returns Err; `last_purged = None` → Ok. | Tests pass; docs/src recovery page gets one sentence. |
-| CR2-7-7 | ⬜ | PROTO-3 | `proto/common.proto` | Delete the unused messages (`TierReplication`, `VolumeConfig`, `NodeId`, `ChunkId`, `ChunkMeta`, `WriteSafety` — confirm zero Rust users first with grep across crates) or mark `// UNUSED — do not add fields`; fix the `DiskInfo.tier` (add `tape`) and `NodeInfo.role` (add `client`) comments. | workspace builds. | Builds; grep shows no user. |
-| CR2-7-8 | ⬜ | CMN-7 | `crates/dtfs-common/src/hash_ring.rs` | Hoist `unique_dc_count_for_tier` / `unique_rack_count_for_tier` out of the strict-pass loop (compute once per placement). | existing ring tests green; one test asserting placement result identical before/after on a fixed ring. | Tests pass. |
-| CR2-7-9 | ⬜ | — | `AGENTS.md`, `.claude/rules/integrity.md`, `docs/src/internals/invariants.md` | One sentence each for MGR-10 disk-keyed reap, RAFT-5 synced writes, RAFT-6 refusal, MGR-3 lock scope. | — | Same commit as the code. |
+| CR2-7-1 | ✅ | MGR-3 | `crates/dtfs-manager/src/tiering.rs::build_av_cache_snapshot` | Under the SM read lock collect per-chunk inputs (`chunk_id, idx, placements, cooldown, volume_id, updated_at, unique_dcs`) into a Vec, `drop(sm)`, then take `read_windows.write()` ONCE and compute every `reads_in_window_by_dc`; no `.await` while `sm` is held. | unit: a pure `fn window_counts_for(...)` over a prebuilt read-window map, plus an existing `build_av_cache_snapshot` test still green; grep proves no `read_window_count(...).await` between `state_data.read()` and `drop(sm)`. | Tests pass; grep clean. |
+| CR2-7-2 | ✅ | MGR-10 | `proto/data.proto` `ListChunksResponse`, `dtfs-data/src/server.rs::list_chunks`, `dtfs-manager/src/scheduler.rs` orphan/de-located reap | Add `repeated uint32 chunk_disk_ids = N;` positional with `chunk_ids`; data node fills it; reaper keys `expected_by_node` on `(node, disk)` (`chunk_delocated_on_node` → per-disk) and passes `Some(disk_id)` to the reap delete. Empty field (old data node) → legacy node-wide behaviour. | scheduler unit: warm leftover + cold live row on one node → reaped on the warm disk only; legacy empty field → node-wide as before. | Tests pass; compat path covered. |
+| CR2-7-3 | ✅ | MGR-13 | `scheduler.rs` orphan sweep loop | Re-check `is_leader()` + `orphan_sweep_allowed` at the top of each per-node iteration and before each delete batch; stop the sweep (audit `orphan.sweep_aborted_not_leader`) when either fails. | unit on the pure gate helper; mock-driven test that a leadership loss mid-sweep stops further deletes. | Tests pass. |
+| CR2-7-4 | ✅ | MGR-14 | `dtfs-manager/src/audit.rs` | Bound fan-out with a `Semaphore(16)` (skip + counter when exhausted, never block the caller) and switch the ring to `VecDeque`. | unit: 100 concurrent `log()` calls → at most 16 in flight (counting mock fanout); ring eviction order unchanged. | Tests pass. |
+| CR2-7-5 | ✅ | RAFT-5 | `crates/dtfs-raft/src/log_store.rs` | `WriteOptions::set_sync(true)` on append/save_vote instead of `flush_cf`; `truncate_after` = one `delete_range_cf(start, u64::MAX key)`; `purge` = one synced `WriteBatch` (delete_range + last_purged put). Keep the test helpers that call `flush_cf` if they exist (tests only). | existing log_store tests green; new: truncate_after leaves no hole (indices contiguous), purge persists `last_purged` atomically (reopen store → value present). | Tests pass. |
+| CR2-7-6 | ✅ | RAFT-6 | `state_machine.rs::open_at` corrupt-snapshot path + `dtfs-manager/src/main.rs` startup | After discarding a corrupt snapshot, if `LogStore::last_purged` is `Some`, refuse to start (error with the recovery-runbook message already used at `log_store.rs` ~140-145) instead of booting a blank voter. | unit: blank SM + `last_purged = Some(..)` → startup helper returns Err; `last_purged = None` → Ok. | Tests pass; docs/src recovery page gets one sentence. |
+| CR2-7-7 | ✅ | PROTO-3 | `proto/common.proto` | Delete the unused messages (`TierReplication`, `VolumeConfig`, `NodeId`, `ChunkId`, `ChunkMeta`, `WriteSafety` — confirm zero Rust users first with grep across crates) or mark `// UNUSED — do not add fields`; fix the `DiskInfo.tier` (add `tape`) and `NodeInfo.role` (add `client`) comments. | workspace builds. | Builds; grep shows no user. |
+| CR2-7-8 | ✅ | CMN-7 | `crates/dtfs-common/src/hash_ring.rs` | Hoist `unique_dc_count_for_tier` / `unique_rack_count_for_tier` out of the strict-pass loop (compute once per placement). | existing ring tests green; one test asserting placement result identical before/after on a fixed ring. | Tests pass. |
+| CR2-7-9 | ✅ | — | `AGENTS.md`, `.claude/rules/integrity.md`, `docs/src/internals/invariants.md` | One sentence each for MGR-10 disk-keyed reap, RAFT-5 synced writes, RAFT-6 refusal, MGR-3 lock scope. | — | Same commit as the code. |
 
 ### Group 8 — common + fuse (branch `bug/cr2-8-common-fuse`)
 
@@ -61,5 +61,52 @@ Status: ⬜ / 🟦 / ✅ / 🟥
 
 - Baseline 2026-09-12 master 6f949a8: manager 382, data 121, fuse 110,
   raft 105, common 109, client 31, cli 12 (Docker `dtfs-buildenv`).
+- Group 7 complete (branch `bug/cr2-7-manager-raft`), 2026-09-12,
+  `cargo test -p <crate> --release` via Docker `dtfs-buildenv`:
+  - CR2-7-1 (MGR-3): manager 382 -> 384 (+2). grep proof of no
+    `.await` between `state_data.read()` and `drop(sm)` in
+    `build_av_cache_snapshot` other than the acquire itself.
+  - CR2-7-8 (CMN-7): common 109 -> 110 (+1).
+  - CR2-7-7 (PROTO-3): workspace `cargo build --release --workspace`
+    clean; `grep -rn "dtfs::common::\(TierReplication\|VolumeConfig\|
+    NodeId\|ChunkId\|ChunkMeta\|WriteSafety\)" crates/` empty before
+    deletion.
+  - CR2-7-4 (MGR-14): manager 384 -> 386 (+2).
+  - CR2-7-3 (MGR-13): manager 386 -> 389 (+3).
+  - CR2-7-2 (MGR-10): data 121 -> 122 (+1), manager 389 -> 390 (+1).
+  - CR2-7-5 (RAFT-5): raft 105 -> 108 (+3); rocksdb 0.22.0 API
+    (`WriteOptions::set_sync`, `DB::put_cf_opt`/`write_opt`,
+    `WriteBatch::{put_cf,delete_range_cf}`) verified against the
+    vendored crate source before writing.
+  - CR2-7-6 (RAFT-6): raft 108 -> 111 (+3); `dtfs-manager` builds
+    clean with the new `main.rs` startup check wired in (no dedicated
+    manager-side unit test — the decision logic is tested in
+    dtfs-raft; the integration point is a straight-line call).
+  - CR2-7-9: doc-only, no test count change.
+  - Final full-workspace counts: manager 390, data 122, fuse 110
+    (untouched), raft 111, common 110, client 31 (untouched), cli 12
+    (untouched). `cargo build --release --workspace` clean throughout.
 
 ## Deviations
+
+- CR2-7-3: `orphan_scrub_tick` is tightly coupled to live gRPC calls
+  (`list_chunks_on_node`, `delete_chunk_replica_on_node`), so the
+  "mock-driven test that a leadership loss mid-sweep stops further
+  deletes" is a pure model (`first_sweep_abort_index`) of the repeated
+  `orphan_sweep_allowed` checkpoint calls the real loop makes, rather
+  than a full async mock of the loop itself. The production loop was
+  changed to match exactly (re-check + `break 'nodes` at the same two
+  checkpoints the model represents).
+- CR2-7-4: the plan's "counting mock fanout" is `CountingSink`
+  implementing a new `FanoutSink` trait extracted from the Raft
+  dispatch, rather than a mock of `RaftFanout` itself (which held the
+  dispatch inline pre-fix).
+- CR2-7-6: added one sentence to
+  `docs/src/operations/backup-recovery.md` (not listed in the task's
+  file list) pointing an operator at the new startup refusal in the
+  single-manager recovery flow, since that is the doc page an operator
+  would actually be reading when this fires.
+- CR2-7-9: also updated `docs/src/internals/invariants.md` for RAFT-6
+  (in addition to the three files the task names) since that page
+  already carried a forward-reference to RAFT-6 from the RAFT-9 entry
+  that needed the corresponding fix noted.

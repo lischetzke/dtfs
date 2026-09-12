@@ -67,6 +67,15 @@ message ListChunksResponse {
   // mtime as "age unknown -> not yet due" and defers the reap rather
   // than risk dropping an in-flight write.
   repeated uint64 chunk_mtimes_ms = 3;
+  // CR2-7-2 / MGR-10 — the disk_id each chunk_ids[i] was found on,
+  // index-aligned with chunk_ids (same positional convention as
+  // chunk_mtimes_ms). Lets the manager key its expected/on-disk sets by
+  // (node_id, disk_id) instead of node-wide, so a de-located leftover on
+  // one disk of a node still holding another-tier replica of the same
+  // chunk is reaped on the RIGHT disk. A pre-CR2-7-2 data node leaves this
+  // empty; the manager falls back to today's node-wide (disk_id=None)
+  // reap semantics exactly.
+  repeated uint32 chunk_disk_ids = 4;
 }
 
 // AV-4-1c — body for RecordCacheHit. Same shape as the

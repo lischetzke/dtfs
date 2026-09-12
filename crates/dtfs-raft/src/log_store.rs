@@ -24,7 +24,7 @@ use std::sync::Arc;
 use serde::{de::DeserializeOwned, Serialize};
 
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
-use rocksdb::{BlockBasedOptions, Cache, ColumnFamilyDescriptor, Options, DB};
+use rocksdb::{BlockBasedOptions, Cache, ColumnFamilyDescriptor, Options, WriteBatch, WriteOptions, DB};
 use tokio::sync::RwLock;
 use tracing::debug;
 
@@ -194,6 +194,21 @@ impl LogStore {
         }
     }
 
+    /// RAFT-6 / CR2-7-6 — peek the persisted `last_purged` log id
+    /// straight from the meta CF, without going through the full
+    /// `RaftLogStorage` trait or the cached `Arc<RwLock<..>>`. Used by
+    /// `main.rs` startup (via `blank_sm_startup_allowed`) to detect the
+    /// corrupt-snapshot-discard-with-purged-log hazard before handing the
+    /// log store to openraft.
+    pub fn peek_last_purged(&self) -> Result<Option<LogId>, io::Error> {
+        let cf = self.db.cf_handle(CF_META).expect("meta CF");
+        match self.db.get_cf(&cf, META_KEY_LAST_PURGED) {
+            Ok(Some(bytes)) => decode_value(&bytes),
+            Ok(None) => Ok(None),
+            Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+        }
+    }
+
     /// Bug AC — peek the last log entry's `LogId` without consuming
     /// any iterator state. Used for poisoned-state detection.
     pub fn peek_last_log_id(&self) -> Result<Option<LogId>, io::Error> {
@@ -204,11 +219,17 @@ impl LogStore {
         last_log_id_from_iter_item(iter.next())
     }
 
+    // RAFT-5 / CR2-7-5 — `purge` now writes `last_purged` inline as part of
+    // its single atomic WriteBatch (see the `RaftLogStorage::purge` impl
+    // below), so this standalone setter is no longer on the production
+    // write path. Kept for test scaffolding (`log_store_reopens_clean_db`,
+    // `log_store_opens_with_bounded_opts` use it to touch the meta CF).
+    #[allow(dead_code)]
     fn persist_last_purged(&self, lid: &Option<LogId>) -> Result<(), io::Error> {
         let cf = self.db.cf_handle(CF_META).expect("meta CF");
         let bytes = encode_value(lid)?;
         self.db
-            .put_cf(&cf, META_KEY_LAST_PURGED, bytes)
+            .put_cf_opt(&cf, META_KEY_LAST_PURGED, bytes, &synced_write_opts())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
     }
 }
@@ -225,6 +246,66 @@ fn key_to_index(key: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(key);
     u64::from_be_bytes(buf)
+}
+
+/// RAFT-5 / CR2-7-5 — an upper-bound key strictly greater than any 8-byte
+/// big-endian index key, including `index_to_key(u64::MAX)`. RocksDB's
+/// `delete_range_cf` end is exclusive; comparing bytes lexicographically,
+/// a 9-byte all-`0xFF` key sorts after every possible 8-byte key. Used to
+/// delete "everything from index X onward" in a single call instead of
+/// enumerating keys.
+fn key_upper_bound() -> [u8; 9] {
+    [0xFF; 9]
+}
+
+/// RAFT-6 / CR2-7-6 — refuse to start as a voter when the local state
+/// machine came up BLANK (its snapshot was corrupt/unreadable and
+/// `state_machine.rs::open_at`'s BP-2 discard returned a fresh
+/// `StateMachineData::default()`) AND this node's log has already been
+/// purged past some point (`last_purged.is_some()`).
+///
+/// That combination means the discarded snapshot was the ONLY surviving
+/// copy of everything before the purge point: if this node then wins an
+/// election (openraft elects on log freshness, not on state-machine
+/// content), it applies only the log's surviving suffix onto an empty
+/// state machine — every file created before the purge point vanishes
+/// cluster-wide as soon as this node's next snapshot propagates. A
+/// genuinely fresh, never-bootstrapped node has `last_purged == None` and
+/// is unaffected; only a snapshot discard "colliding" with a real purge
+/// point is refused.
+///
+/// Pure so `main.rs` can call it right after opening the log store +
+/// state machine, before handing either to openraft.
+pub fn blank_sm_startup_allowed(sm_is_blank: bool, last_purged: Option<LogId>) -> Result<(), String> {
+    match (sm_is_blank, last_purged) {
+        (true, Some(lp)) => Err(format!(
+            "Raft state machine snapshot was corrupt/unreadable and was \
+             discarded (blank state), but this node's log has already \
+             been purged up to index {} — the discarded snapshot was the \
+             ONLY surviving copy of everything before that point. \
+             Refusing to start as a voter: an election win here would \
+             apply only the log's surviving suffix onto an empty state \
+             machine and lose everything before the purge point, \
+             cluster-wide, on this node's next snapshot. See the manager \
+             recovery runbook: stop this node, wipe raft-log + raft-sm, \
+             and re-bootstrap it as a learner from a healthy peer.",
+            lp.index
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// RAFT-5 / CR2-7-5 — `WriteOptions` with `set_sync(true)`. Every durable
+/// Raft log/meta write (append, save_vote, truncate, purge) must fsync
+/// before returning; a per-write `flush_cf` only flushes RocksDB's
+/// in-memory memtable to an SST/WAL buffer, it does not itself fsync, and
+/// running it after every single append created one L0 SST per commit
+/// (heartbeat usage updates, the 1 s lease sweep, per-tick migration
+/// state), driving continuous compaction (Bug BP-1).
+fn synced_write_opts() -> WriteOptions {
+    let mut wo = WriteOptions::default();
+    wo.set_sync(true);
+    wo
 }
 
 /// AV-5-11 — encode a Raft log value (entry / vote / last_purged).
@@ -376,12 +457,12 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     async fn save_vote(&mut self, vote: &Vote) -> Result<(), io::Error> {
         let cf = self.db.cf_handle(CF_META).expect("meta CF");
         let bytes = encode_value(vote)?;
+        // RAFT-5 / CR2-7-5 — a synced write guarantees durability directly;
+        // a plain `put_cf` + `flush_cf` only pushes the memtable to an
+        // SST/WAL buffer (no fsync) and additionally forces a flush (one
+        // L0 SST) on every single vote write.
         self.db
-            .put_cf(&cf, META_KEY_VOTE, bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        // Flush to guarantee durability before returning.
-        self.db
-            .flush_cf(&cf)
+            .put_cf_opt(&cf, META_KEY_VOTE, bytes, &synced_write_opts())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         Ok(())
     }
@@ -397,23 +478,30 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     {
         let cf = self.db.cf_handle(CF_LOGS).expect("logs CF");
 
+        // RAFT-5 / CR2-7-5 — batch every entry in this call into one
+        // WriteBatch and commit it with a single synced write instead of
+        // N unsynced `put_cf` calls followed by a `flush_cf`. `flush_cf`
+        // pushes RocksDB's memtable to a new SST on every call — every
+        // Raft commit (heartbeat usage updates, the 1 s lease sweep,
+        // per-tick migration state) created one L0 SST, driving
+        // continuous compaction (Bug BP-1 fought the SYMPTOM; this fixes
+        // the cause). `set_sync(true)` fsyncs the WAL before `write_opt`
+        // returns, which is the actual durability guarantee openraft
+        // needs before invoking `callback.io_completed`.
+        let mut batch = WriteBatch::default();
         for entry in entries {
             let key = index_to_key(entry.log_id.index);
             let value = encode_value(&entry)?;
-            self.db
-                .put_cf(&cf, key, value)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
+            batch.put_cf(&cf, key, value);
             debug!("append log: {}", entry.log_id);
         }
 
-        // Flush to disk, then signal completion.
-        let flush_result = self
+        let write_result = self
             .db
-            .flush_cf(&cf)
+            .write_opt(batch, &synced_write_opts())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
 
-        callback.io_completed(flush_result);
+        callback.io_completed(write_result);
 
         Ok(())
     }
@@ -431,24 +519,22 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             start_index.saturating_sub(1)
         );
 
-        // Delete entries from start_index onward. CO-4-12 — propagate an
-        // iterator storage error instead of `filter_map`-dropping it; a
-        // dropped errored item would leave a conflicting log suffix the
-        // leader asked us to truncate (Raft safety violation).
-        let mut keys_to_delete: Vec<Box<[u8]>> = Vec::new();
-        for item in self.db.iterator_cf(
-            &cf,
-            rocksdb::IteratorMode::From(&index_to_key(start_index), rocksdb::Direction::Forward),
-        ) {
-            let (key, _value) = item.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            keys_to_delete.push(key);
-        }
-
-        for key in keys_to_delete {
-            self.db
-                .delete_cf(&cf, &key)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        }
+        // RAFT-5 / CR2-7-5 — a single `delete_range_cf` instead of
+        // enumerate-then-delete-key-by-key. The old loop was not atomic:
+        // a crash between two `delete_cf` calls left a HOLE in the middle
+        // of the deleted range (some higher indices gone, some lower ones
+        // in the range still present), which is a fatal storage
+        // inconsistency for openraft (the log is no longer a contiguous
+        // prefix). `delete_range_cf` is one RocksDB write; the on-disk
+        // result is always either "not yet applied" or "fully applied",
+        // never torn.
+        self.db
+            .delete_range_cf(
+                &cf,
+                index_to_key(start_index).as_slice(),
+                key_upper_bound().as_slice(),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         Ok(())
     }
@@ -456,22 +542,38 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     async fn purge(&mut self, log_id: LogId) -> Result<(), io::Error> {
         debug!("purge up to: {}", log_id);
 
-        // Delete entries up to and including `log_id.index`.
-        // Scope the CF reference so it doesn't live across any .await.
+        // RAFT-5 / CR2-7-5 — the range delete and the `last_purged` meta
+        // write commit as ONE WriteBatch with a single synced write,
+        // instead of two separate calls (a `delete_range_cf` followed by
+        // an unsynced `put_cf`). Pre-fix, a crash between the two left the
+        // deleted range durable but `last_purged` still `None` (or stale)
+        // for a log that now starts above index 0 — `get_log_state` would
+        // report a `last_purged_log_id` that undercounts what was actually
+        // purged. Bundling them means either both are durable or neither
+        // is.
+        let last_purged_bytes = encode_value(&Some(log_id.clone()))?;
+
+        // Scope the CF handles so neither lives across the `.await` below
+        // (`ColumnFamily` is not `Send`; openraft requires `purge`'s
+        // future to be `Send`).
         {
-            let cf = self.db.cf_handle(CF_LOGS).expect("logs CF");
-            let end_key = index_to_key(log_id.index + 1);
+            let logs_cf = self.db.cf_handle(CF_LOGS).expect("logs CF");
+            let meta_cf = self.db.cf_handle(CF_META).expect("meta CF");
+
+            let mut batch = WriteBatch::default();
+            batch.delete_range_cf(&logs_cf, index_to_key(0), index_to_key(log_id.index + 1));
+            batch.put_cf(&meta_cf, META_KEY_LAST_PURGED, last_purged_bytes);
+
             self.db
-                .delete_range_cf(&cf, index_to_key(0), end_key)
+                .write_opt(batch, &synced_write_opts())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         }
 
-        // Update the cached last_purged and persist it.
+        // Update the cached last_purged to match the now-durable write.
         {
             let mut lp = self.last_purged.write().await;
-            *lp = Some(log_id.clone());
+            *lp = Some(log_id);
         }
-        self.persist_last_purged(&Some(log_id))?;
 
         Ok(())
     }
@@ -641,6 +743,50 @@ mod audit_co_tests {
         assert!(mapped.is_none(), "empty CF must map to None");
     }
 
+    /// RAFT-6 / CR2-7-6 — the dangerous combination: a blank state
+    /// machine (snapshot discarded) AND a log already purged past some
+    /// point. This is the ONLY case that must refuse startup.
+    #[test]
+    fn raft_6_blank_sm_with_purged_log_refuses_startup() {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        let purge_id = openraft::LogId::new(leader, 42);
+
+        let result = blank_sm_startup_allowed(true, Some(purge_id));
+        assert!(result.is_err(), "blank SM + purged log must refuse startup");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("42"), "message should name the purge index: {msg}");
+        assert!(
+            msg.contains("wipe raft-log + raft-sm"),
+            "message must point at the recovery runbook: {msg}"
+        );
+    }
+
+    /// RAFT-6 / CR2-7-6 — a genuinely fresh, never-bootstrapped node has
+    /// a blank SM but `last_purged == None` (nothing has ever been
+    /// purged). This is normal and must be allowed.
+    #[test]
+    fn raft_6_blank_sm_with_no_purge_is_a_fresh_node_and_allowed() {
+        assert!(
+            blank_sm_startup_allowed(true, None).is_ok(),
+            "a fresh node (blank SM, never purged) must be allowed to start"
+        );
+    }
+
+    /// RAFT-6 / CR2-7-6 — a non-blank SM (successfully loaded a real
+    /// snapshot, or replayed the log into one over its lifetime) is
+    /// always allowed to start, regardless of purge history — it is not
+    /// missing anything.
+    #[test]
+    fn raft_6_non_blank_sm_is_always_allowed() {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        let purge_id = openraft::LogId::new(leader, 42);
+
+        assert!(blank_sm_startup_allowed(false, Some(purge_id)).is_ok());
+        assert!(blank_sm_startup_allowed(false, None).is_ok());
+    }
+
     /// CO-4-12 — `get_log_state` on a populated log returns the real last
     /// log id (happy path unchanged by the error-propagation fix).
     #[tokio::test]
@@ -672,13 +818,137 @@ mod audit_co_tests {
             }
             store.db.flush_cf(&cf).expect("flush");
 
-            let state = store.get_log_state().await.expect("get_log_state");
+    let state = store.get_log_state().await.expect("get_log_state");
             assert_eq!(
                 state.last_log_id.map(|l| l.index),
                 Some(4),
                 "last_log_id must be the highest committed index"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn mk_entry(idx: u64) -> Entry {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        Entry {
+            log_id: openraft::LogId::new(leader, idx),
+            payload: openraft::EntryPayload::Blank,
+        }
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "dtfs-cr2-7-5-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// RAFT-5 / CR2-7-5 — `truncate_after` must leave the log a
+    /// contiguous prefix: every index up to and including the kept
+    /// `last_log_id` survives, and nothing beyond it does. Guards the
+    /// switch from a key-by-key delete loop to a single `delete_range_cf`.
+    #[tokio::test]
+    async fn cr2_7_5_truncate_after_leaves_contiguous_prefix() {
+        use openraft::storage::RaftLogStorage;
+
+        let dir = scratch("truncate");
+        let mut store = LogStore::new(&dir).expect("open");
+
+        // Append indices 0..10 directly through the RaftLogStorage trait
+        // (exercises the new WriteBatch + synced-write append path).
+        let entries: Vec<Entry> = (0..10).map(mk_entry).collect();
+        let callback = IOFlushed::<TypeConfig>::noop();
+        RaftLogStorage::append(&mut store, entries, callback)
+            .await
+            .expect("append");
+
+        // Truncate after index 4 -> keep 0..=4, drop 5..=9.
+        let keep = mk_entry(4).log_id;
+        RaftLogStorage::truncate_after(&mut store, Some(keep))
+            .await
+            .expect("truncate_after");
+
+        let mut reader = store.reader();
+        let remaining = reader.try_get_log_entries(0..100).await.expect("read back");
+        let indices: Vec<u64> = remaining.iter().map(|e| e.log_id.index).collect();
+        assert_eq!(
+            indices,
+            (0..=4).collect::<Vec<u64>>(),
+            "truncate_after must leave a contiguous 0..=4 prefix, no hole and nothing beyond it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RAFT-5 / CR2-7-5 — `truncate_after(None)` drops the entire log
+    /// (start_index = 0) in one call.
+    #[tokio::test]
+    async fn cr2_7_5_truncate_after_none_drops_everything() {
+        use openraft::storage::RaftLogStorage;
+
+        let dir = scratch("truncate-none");
+        let mut store = LogStore::new(&dir).expect("open");
+        let entries: Vec<Entry> = (0..5).map(mk_entry).collect();
+        let callback = IOFlushed::<TypeConfig>::noop();
+        RaftLogStorage::append(&mut store, entries, callback)
+            .await
+            .expect("append");
+
+        RaftLogStorage::truncate_after(&mut store, None)
+            .await
+            .expect("truncate_after(None)");
+
+        let mut reader = store.reader();
+        let remaining = reader.try_get_log_entries(0..100).await.expect("read back");
+        assert!(remaining.is_empty(), "truncate_after(None) must drop every entry");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RAFT-5 / CR2-7-5 — `purge` commits the range delete and the
+    /// `last_purged` meta write as one atomic batch: after purging and
+    /// reopening the store (simulating a restart), `last_purged` must be
+    /// present and the purged range gone.
+    #[tokio::test]
+    async fn cr2_7_5_purge_persists_last_purged_atomically_across_reopen() {
+        use openraft::storage::RaftLogStorage;
+
+        let dir = scratch("purge");
+        {
+            let mut store = LogStore::new(&dir).expect("open");
+            let entries: Vec<Entry> = (0..10).map(mk_entry).collect();
+            let callback = IOFlushed::<TypeConfig>::noop();
+            RaftLogStorage::append(&mut store, entries, callback)
+                .await
+                .expect("append");
+
+            let purge_id = mk_entry(4).log_id;
+            RaftLogStorage::purge(&mut store, purge_id)
+                .await
+                .expect("purge");
+
+            let mut reader = store.reader();
+            let remaining = reader.try_get_log_entries(0..100).await.expect("read back");
+            let indices: Vec<u64> = remaining.iter().map(|e| e.log_id.index).collect();
+            assert_eq!(
+                indices,
+                (5..10).collect::<Vec<u64>>(),
+                "purge must remove indices 0..=4"
+            );
+        }
+
+        // Reopen — the meta write must have survived alongside the range
+        // delete (both committed in the same WriteBatch).
+        let mut reopened = LogStore::new(&dir).expect("reopen after purge");
+        let state = reopened.get_log_state().await.expect("get_log_state");
+        assert_eq!(
+            state.last_purged_log_id.map(|l| l.index),
+            Some(4),
+            "last_purged must survive a reopen"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
