@@ -54,7 +54,7 @@ Status: ⬜ / 🟦 / ✅ / 🟥
 | CR2-8-1 | ✅ | CMN-3 | `dtfs-common/src/config.rs`, `dtfs-data/src/server.rs`, `dtfs-client/src/client.rs`, `deploy/examples/*.toml`, `docs/src/configuration/*.md` | Wire `grpc.max_message_size_mb` into the tonic builders (`max_decoding_message_size` / `max_encoding_message_size`) everywhere a `32 * 1024 * 1024` literal is used today. | config unit: value propagates; `example_*_toml_parses` green. | Tests pass; docs row true. |
 | CR2-8-2 | ✅ | CMN-6 | `dtfs-common/src/memory.rs` table, `config.rs` docs, `docs/src/configuration/manager.md` | Manager rung: Warn = no action; Shed = pause scheduler ticks (self-limiting). | — | Doc sites agree with `scheduler.rs`. |
 | CR2-8-3 | ⬜ | FUSE-11 | `dtfs-fuse/src/filesystem.rs` read path, `local_cache.rs` | Viewer-read hint from per-fh consumption (≥ 1 MiB read on this fh, or readahead active) instead of the kernel's per-call length; keep `ATIME_UPDATE_MIN_BYTES` semantics for the hint. | unit on the pure hint helper. | Tests pass. |
-| CR2-8-4 | ⬜ | FUSE-12 | `dtfs-fuse/src/local_cache.rs` | Evict with hysteresis (down to 90 % of `max_bytes`) so the stat sweep is rare; either make `lru` the atime index (update on viewer get, remove on prune) or delete it. | unit: 1000 puts at a full cache → sweeps ≤ 1000/10; `lru` never exceeds `sizes.len()`. | Tests pass. |
+| CR2-8-4 | ✅ | FUSE-12 | `dtfs-fuse/src/local_cache.rs` | Evict with hysteresis (down to 90 % of `max_bytes`) so the stat sweep is rare; either make `lru` the atime index (update on viewer get, remove on prune) or delete it. | unit: 1000 puts at a full cache → sweeps ≤ 1000/10; `lru` never exceeds `sizes.len()`. | Tests pass. |
 | CR2-8-5 | ⬜ | — | `AGENTS.md`, `.claude/rules/fuse.md`, `.claude/rules/config-surface.md` | One sentence each. | — | Same commit. |
 
 ## Verification log
@@ -97,6 +97,15 @@ Status: ⬜ / 🟦 / ✅ / 🟥
     data 122 -> 122 (wiring only, no new test), client 31 -> 31, fuse
     110 -> 110. `example_*_toml_parses` green.
     `cargo build --release --workspace` clean.
+  - CR2-8-4 (FUSE-12): fuse 110 -> 111 (+1: `cr2_8_4_hysteresis_bounds_
+    sweep_frequency_at_steady_state`, 1000 puts at a full 10 KB cache ->
+    <= 100 sweeps). Deleted the dead `lru: BTreeMap<u64, String>` index
+    entirely (smaller diff than wiring it up as the real atime index —
+    `evict_to_size` already re-derives recency from on-disk atime, so the
+    index had no reader); added `EVICT_TARGET_PCT = 90` hysteresis to
+    `evict_to_size`. Updated `rev_3_12_evict_to_size_sweeps_once_for_
+    many_victims`'s hardcoded victim count (3 -> 4) to match the new 90%
+    target on the same fixture.
 
 ## Deviations
 
