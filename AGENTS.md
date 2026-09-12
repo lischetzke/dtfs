@@ -157,7 +157,14 @@ for all roles. WI-05 — FUSE prefetch fan-out is also bounded by
 holds a whole chunk in heap, and before this an uncapped `prefetch_chunks`-
 wide fan-out (default 8) shared one pooled HTTP/2 channel per node, so N
 concurrent streams split a slow link (e.g. the 40 Mbps LELI path) and
-starved the nearest chunk instead of adding bounded heap.
+starved the nearest chunk instead of adding bounded heap. R1 (FUSE-1
+memory half) — the FUSE write buffer (WI-01/H1's `FLUSH_BATCH_MAX_BYTES`
+governs the batching side; `writebuf::DIRTY_BYTES_CAP` = 2x that governs
+total dirty bytes per open file) is force-drained via
+`WriteBuffer::flush_complete()` whenever a sparse-hole zero-fill or an
+incoming write would meet or exceed the cap, so a write far past EOF
+(e.g. a torrent client's first piece landing at offset 100 MB) can no
+longer materialise the whole hole into heap before committing anything.
 
 **A.3.3 Integrity is the prime directive.** Every path that touches
 bytes must:
@@ -745,7 +752,46 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   batch is additionally byte-clamped (`writebuf::effective_batch_chunks`,
   `FLUSH_BATCH_MAX_BYTES` = 64 MB) so batching can never hold more than
   64 MB of un-committed data per open file — the dtfs-fuse ladder (A.3.2)
-  sheds readahead, not write buffers. WI-05 / B2: `read()`'s
+  sheds readahead, not write buffers. CR-1-1: `writebuf.rs`'s
+  `FileWriteBuffer` is `BTreeMap<u32, ChunkBuf>` (per chunk index), NOT one
+  contiguous `Vec<u8>` spanning the file — `write()` splits at chunk
+  boundaries before merging, so a write below an already-flushed chunk or
+  past the resident high-water mark can never zero-fill (and later
+  re-emit as real data) a chunk it doesn't touch; a chunk whose buffered
+  range doesn't cover `0..chunk_size` is tagged `needs_seed` on the
+  emitted `ChunkSegment` instead of being gap-filled. CR-1-2: `write()`'s
+  RMW seed (`chunks_needing_seed()`) runs over EVERY chunk index the
+  write touches, including index 0 (no more `effective_offset > 0`
+  gate), and a seed-read failure propagates as an error (`?` -> EIO)
+  instead of a `warn!` that let a truncated chunk get committed; the
+  O_APPEND pre-seed in `open_with_append` runs AFTER the write lease is
+  granted and resolves the tail chunk via `chunk_at(max_idx)`, never a
+  positional index. CR-1-3: `flush()` returns `Ok(())` immediately for a
+  non-writable fh (the kernel issues FUSE flush on every close(2),
+  including read-only opens) before touching the path-keyed write
+  buffer; `release()` only drops that buffer when the fh being released
+  is writable AND no other writable fh remains open on the same path
+  (`other_writer_open()`). CR-1-4: `OpenFile.committed_any` is set on
+  every open handle sharing a path the moment `flush_segments_to_cluster`
+  first commits a chunk for it; `flush()` now ALWAYS
+  `write_buffer.restore_segments()` on a cluster-write failure (never
+  unlinks), and the F-013 ghost-unlink moved to `release()`
+  (`should_ghost_unlink(flush_failed, committed_any)`), firing only when
+  the path has NEVER committed anything — a file with any committed
+  chunk is never unlinked on a later flush failure. CR-1-5 (DATA-5 FUSE
+  half): `flush_segments_to_cluster` hashes each segment once
+  (`blake3_hex`, BLAKE3 hex digest) and sends it as the declared
+  `chunk_id` on every `write_chunk_bytes` call (previously always
+  `""`); a reply whose `chunk_id` disagrees is treated as a failed
+  replica (excluded from `successes`), never committed as a location. R2:
+  `flush_segments_to_cluster` also refuses (`segments_committable()`) to
+  commit ANY segment with `offset_in_chunk > 0` — reachable whenever the
+  RMW seed in `write()` was skipped because there was nothing cheap to
+  seed FROM (no cached `locations_snapshot`, no `chunk_at(idx)` entry, or
+  an empty `node_addresses` list; each now `warn!`s at the skip site) —
+  since the data node stores a `PutChunkRequest`'s bytes as the chunk's
+  whole content from byte 0, and a partial segment would land shifted.
+  WI-05 / B2: `read()`'s
   foreground miss tries `readahead.join_pending()` against ONLY the FIRST
   candidate (prefetch targets `read_candidates`' head, REV-2-3, so no other
   key can hold a pending entry for this chunk), bounded by the fixed
@@ -800,7 +846,11 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   ENOENT ONLY for a genuine gRPC `NotFound`, EIO for transient/unknown
   (manager outage, election, timeout). Mapping a blip to ENOENT makes Plex
   drop the library entry. New error-returning op? Route it through the
-  helper, never a bare `Err(_) => ENOENT`.
+  helper, never a bare `Err(_) => ENOENT`. CR-1-6 extended this to
+  `readdir`/`readdirplus` (were a bare `|_| ENOENT`) and to
+  `mkdir`/`unlink`/`rmdir`/`create`/`rename`/`symlink`/`link` (were a
+  bare `EIO`) — every metadata op's error arm now goes through
+  `cluster_err_to_errno`.
 - `dtfs-common/build.rs` + `src/version.rs` — VERSION (default
   `v0.0.0-dev`, overridable via `DTFS_VERSION`) + BUILD_DATE (§ A.3.5);
   every binary reports these via RegisterNode.

@@ -97,14 +97,14 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR-1-1 | ⬜ | FUSE-1 | `crates/dtfs-fuse/src/writebuf.rs`, `filesystem.rs` | Replace the contiguous `FileWriteBuffer` (`data: Vec<u8>` + `dirty_offset`) with a per-chunk map `BTreeMap<u32, ChunkBuf { data: Vec<u8>, dirty: Range<usize>, seeded: bool }>`. `merge_write` writes into the affected chunk(s) only; never zero-fills a gap to another chunk. A write into a chunk that is not resident and does not cover the whole chunk sets `needs_seed` (returned to the caller) instead of gap-filling. `extract_complete_chunks` / `extract_all_chunks` / `restore_segments` / `logical_size` / `truncate_at` / `effective_batch_chunks` keep their signatures and semantics (CO-1-7, CO-1-8, H1 byte clamp). Total dirty bytes per file capped at `FLUSH_BATCH_MAX_BYTES * 2`; a write that would exceed it forces a flush first (caller side). | writebuf unit: (a) seq write 0..3 chunks, flush, write 100 B at offset 0 → extract yields ONLY chunk 0 marked `needs_seed`, chunks 1..2 NOT re-emitted; (b) write at 100 MB then at 4 MB → buffer holds two chunk entries, `dirty_bytes() < 2*chunk_size`; (c) all existing writebuf tests pass unchanged (or updated with a one-line reason in the commit). | Tests (a),(b) fail on current code, pass after; `cargo test -p dtfs-fuse --release` green. |
-| CR-1-2 | ⬜ | FUSE-7 | `filesystem.rs` (`write()` seed block ~1091-1129, O_APPEND pre-seed ~536-561), `writebuf.rs` | Seed EVERY chunk the write touches that is not fully covered by buffered data, including index 0 (drop the `effective_offset > 0` gate). Seed read failure returns `Err` (→ EIO), never `warn!` + continue. O_APPEND pre-seed: use `chunk_at(max chunk_index)` and `index * chunk_size`, and run it AFTER the lease is acquired. | fuse unit with a mock client: (a) write 100 B at offset 0 of a 1-chunk existing file → flushed chunk 0 is `chunk_size` bytes with the patched prefix; (b) write straddling chunk 0→1 seeds both; (c) seed error → `write()` returns Err. | Tests fail before, pass after; `cargo test -p dtfs-fuse --release` green. |
-| CR-1-3 | ⬜ | FUSE-2 | `filesystem.rs` `flush()` ~1234, `release()` ~1357 | `flush(fh)`: if `!file.flags.is_writable()` return `Ok(())` before touching `write_buffer`. `release(fh)`: only `write_buffer.remove(&path)` when this fh is writable AND no other open writable fh on the same path remains (scan `open_files`). | unit: open RO + RW on same path, write via RW, flush RO → buffer untouched; release RO → buffer still present; release RW → removed. | Test fails before, passes after. |
-| CR-1-4 | ⬜ | FUSE-3 | `filesystem.rs` (`OpenFile`, `flush()` error branch ~1296-1320, `flush_segments_to_cluster`) | Add `committed_any: bool` to `OpenFile`, set true on first successful `flush_segments_to_cluster` for that path (set on every OpenFile of the path). `was_fresh` = `!committed_any && locations empty`. On flush failure ALWAYS `restore_segments` first; ghost-unlink only from `release()` when `!committed_any`. | unit: create, write 2 chunks (batch flush commits them), write tail, force flush error → file NOT deleted, segments restored, next flush succeeds and commits the tail. | Test fails before, passes after. |
-| CR-1-5 | ⬜ | DATA-5 (FUSE half) | `filesystem.rs` `write_chunk_bytes(&addr, "", ..)` ~1927, `crates/dtfs-client/src/client.rs` put path | FUSE hashes each segment (BLAKE3, `dtfs_common::checksum`) before the put and sends the hex in `PutChunkRequest.chunk_id` of the first piece. After the put, compare `put_resp.chunk_id` to the local hex; mismatch → treat as put failure (retry next replica / return Err), never commit the location. | unit: mock data node returning a different id → segment not committed, error surfaced. | Test fails before, passes after. |
-| CR-1-6 | ⬜ | FUSE-4 | `crates/dtfs-fuse/src/fuse_adapter.rs` readdir ~793, readdirplus ~865, unlink/rmdir/mkdir/rename/link/symlink bare EIO/ENOENT sites | Route every `map_err` through `cluster_err_to_errno`. | fuse_adapter unit: `cluster_err_to_errno` already tested; add a test that readdir on a mock returning `Unavailable` yields EIO not ENOENT. | grep shows zero `Errno::from(libc::ENOENT)` in error-mapping closures outside the helper. |
-| CR-1-7 | ⬜ | — | `tests/release/cases/100-fuse-rewrite-offset-zero.sh`, `101-fuse-reader-close-does-not-drain-writer.sh` | Case 100: write 12 MB file, `dd conv=notrunc` 1 KB at offset 0 and at offset 4 MB−512, `cmp` against a local reference. Case 101: writer streams 20 MB with `pv -L`, reader `cat file > /dev/null` mid-stream, `cmp` after writer closes. | `bash -n` clean. | Cases present; STATUS line; documented as unexecuted in the verification log. |
-| CR-1-8 | ⬜ | — | `AGENTS.md` A.8 `filesystem.rs`/`writebuf.rs` entries | Document the per-chunk buffer, fh-gated flush/release, `committed_any`, end-to-end `chunk_id`. | — | Same commit as the code it describes. |
+| CR-1-1 | ✅ | FUSE-1 | `crates/dtfs-fuse/src/writebuf.rs`, `filesystem.rs` | Replace the contiguous `FileWriteBuffer` (`data: Vec<u8>` + `dirty_offset`) with a per-chunk map `BTreeMap<u32, ChunkBuf { data: Vec<u8>, dirty: Range<usize>, seeded: bool }>`. `merge_write` writes into the affected chunk(s) only; never zero-fills a gap to another chunk. A write into a chunk that is not resident and does not cover the whole chunk sets `needs_seed` (returned to the caller) instead of gap-filling. `extract_complete_chunks` / `extract_all_chunks` / `restore_segments` / `logical_size` / `truncate_at` / `effective_batch_chunks` keep their signatures and semantics (CO-1-7, CO-1-8, H1 byte clamp). Total dirty bytes per file capped at `FLUSH_BATCH_MAX_BYTES * 2`; a write that would exceed it forces a flush first (caller side). | writebuf unit: (a) seq write 0..3 chunks, flush, write 100 B at offset 0 → extract yields ONLY chunk 0 marked `needs_seed`, chunks 1..2 NOT re-emitted; (b) write at 100 MB then at 4 MB → buffer holds two chunk entries, `dirty_bytes() < 2*chunk_size`; (c) all existing writebuf tests pass unchanged (or updated with a one-line reason in the commit). | Tests (a),(b) fail on current code, pass after; `cargo test -p dtfs-fuse --release` green. |
+| CR-1-2 | ✅ | FUSE-7 | `filesystem.rs` (`write()` seed block ~1091-1129, O_APPEND pre-seed ~536-561), `writebuf.rs` | Seed EVERY chunk the write touches that is not fully covered by buffered data, including index 0 (drop the `effective_offset > 0` gate). Seed read failure returns `Err` (→ EIO), never `warn!` + continue. O_APPEND pre-seed: use `chunk_at(max chunk_index)` and `index * chunk_size`, and run it AFTER the lease is acquired. | fuse unit with a mock client: (a) write 100 B at offset 0 of a 1-chunk existing file → flushed chunk 0 is `chunk_size` bytes with the patched prefix; (b) write straddling chunk 0→1 seeds both; (c) seed error → `write()` returns Err. | Tests fail before, pass after; `cargo test -p dtfs-fuse --release` green. |
+| CR-1-3 | ✅ | FUSE-2 | `filesystem.rs` `flush()` ~1234, `release()` ~1357 | `flush(fh)`: if `!file.flags.is_writable()` return `Ok(())` before touching `write_buffer`. `release(fh)`: only `write_buffer.remove(&path)` when this fh is writable AND no other open writable fh on the same path remains (scan `open_files`). | unit: open RO + RW on same path, write via RW, flush RO → buffer untouched; release RO → buffer still present; release RW → removed. | Test fails before, passes after. |
+| CR-1-4 | ✅ | FUSE-3 | `filesystem.rs` (`OpenFile`, `flush()` error branch ~1296-1320, `flush_segments_to_cluster`) | Add `committed_any: bool` to `OpenFile`, set true on first successful `flush_segments_to_cluster` for that path (set on every OpenFile of the path). `was_fresh` = `!committed_any && locations empty`. On flush failure ALWAYS `restore_segments` first; ghost-unlink only from `release()` when `!committed_any`. | unit: create, write 2 chunks (batch flush commits them), write tail, force flush error → file NOT deleted, segments restored, next flush succeeds and commits the tail. | Test fails before, passes after. |
+| CR-1-5 | ✅ | DATA-5 (FUSE half) | `filesystem.rs` `write_chunk_bytes(&addr, "", ..)` ~1927, `crates/dtfs-client/src/client.rs` put path | FUSE hashes each segment (BLAKE3, `dtfs_common::checksum`) before the put and sends the hex in `PutChunkRequest.chunk_id` of the first piece. After the put, compare `put_resp.chunk_id` to the local hex; mismatch → treat as put failure (retry next replica / return Err), never commit the location. | unit: mock data node returning a different id → segment not committed, error surfaced. | Test fails before, passes after. |
+| CR-1-6 | ✅ | FUSE-4 | `crates/dtfs-fuse/src/fuse_adapter.rs` readdir ~793, readdirplus ~865, unlink/rmdir/mkdir/rename/link/symlink bare EIO/ENOENT sites | Route every `map_err` through `cluster_err_to_errno`. | fuse_adapter unit: `cluster_err_to_errno` already tested; add a test that readdir on a mock returning `Unavailable` yields EIO not ENOENT. | grep shows zero `Errno::from(libc::ENOENT)` in error-mapping closures outside the helper. |
+| CR-1-7 | ✅ | — | `tests/release/cases/100-fuse-rewrite-offset-zero.sh`, `101-fuse-reader-close-does-not-drain-writer.sh` | Case 100: write 12 MB file, `dd conv=notrunc` 1 KB at offset 0 and at offset 4 MB−512, `cmp` against a local reference. Case 101: writer streams 20 MB with `pv -L`, reader `cat file > /dev/null` mid-stream, `cmp` after writer closes. | `bash -n` clean. | Cases present; STATUS line; documented as unexecuted in the verification log. |
+| CR-1-8 | ✅ | — | `AGENTS.md` A.8 `filesystem.rs`/`writebuf.rs` entries | Document the per-chunk buffer, fh-gated flush/release, `committed_any`, end-to-end `chunk_id`. | — | Same commit as the code it describes. |
 
 ### Group 2 — Raft state-machine correctness (branch `bug/cr-2-raft-sm`)
 
@@ -202,4 +202,167 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 
 ## Deviations
 
-(filled in as work proceeds)
+- CR-1-1: `ChunkBuf`'s coverage flag is named `is_complete`/tracked via the
+  `needs_seed` field on `ChunkSegment` (not a `seeded: bool` on `ChunkBuf`
+  as the data-model table sketched) — the consumer (filesystem.rs, CR-1-2)
+  only ever needs the derived per-segment signal, not per-chunk mutable
+  state, so a stored bool would just be recomputed from `dirty` anyway.
+  `complete_chunks_available(dirty_offset, len, chunk_size)` is kept
+  unchanged (still directly unit-tested) but is no longer called by the
+  new sparse `flush()`/`extract_complete_chunks`, which count complete
+  `ChunkBuf` entries directly — noted as the "one-line justification" for
+  an unchanged-but-now-orphaned pure helper per the task instructions.
+  Added `WriteBuffer::dirty_bytes()` and `chunk_is_fully_buffered()` (not
+  in the original method list) because CR-1-2/CR-1-3 need them; both are
+  additive, no existing signature changed.
+
+## Verification log
+
+- **CR-1-1** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-fuse --release`: 76 -> 78 passed (2 new:
+  `cr_1_1_rewrite_offset_zero_marks_only_that_chunk_needs_seed`,
+  `cr_1_1_scattered_writes_hold_only_touched_chunks`), 0 failed. Rewrote
+  `FileWriteBuffer` from a contiguous `Vec<u8>` to `BTreeMap<u32, ChunkBuf>`
+  (`crates/dtfs-fuse/src/writebuf.rs`); every existing test passed
+  unchanged (no semantic rewrite needed) once `write()` splits at chunk
+  boundaries before merging into the per-chunk buffer.
+
+- **CR-1-2** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-fuse --release`: 78 -> 82 passed (4 new, module
+  `cr_1_2_seed_tests`: `offset_zero_is_flagged_for_seeding`,
+  `straddling_write_flags_both_chunks`, `fully_buffered_chunk_is_not_flagged`,
+  `only_incomplete_chunks_are_flagged`), 0 failed. `write()`'s RMW seed
+  block now calls the extracted `chunks_needing_seed()` helper over EVERY
+  chunk index the write touches (dropped the `effective_offset > 0` gate)
+  and a seed-read failure propagates via `?` (EIO) instead of `warn!` +
+  continue. The O_APPEND pre-seed in `open_with_append` now runs AFTER the
+  write lease is granted and resolves the tail chunk via
+  `chunk_at(max_idx)` (REV-2-1 index resolution) instead of positional
+  `chunks[len-1]`.
+  Deviation: (c) "seed error -> write() returns Err" from the task's test
+  list is enforced structurally by the `?` on `read_chunk(...)` in
+  `write()` (a compile-time control-flow guarantee — any `Err` from the
+  seed read now aborts the write before the caller's bytes are merged),
+  but is not exercised by a unit test: dtfs-fuse has no `DtfsClient` mock/
+  trait double, so a real network-error-path test would need either a
+  mock gRPC data-node server or a client trait abstraction, both out of
+  scope for "smallest fix" here. (a)/(b) are covered at the exact decision
+  boundary (`chunks_needing_seed`), which is the only new logic `write()`
+  added — the actual seed I/O (`read_chunk` + `write_buffer.write`) is
+  unchanged, already-tested plumbing.
+
+- **CR-1-3** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-fuse --release`: 82 -> 85 passed (3 new, module
+  `cr_1_3_flush_release_gating_tests`), 0 failed. `flush()` now returns
+  `Ok(())` immediately for a non-writable fh, before touching the
+  path-keyed write buffer or the lease. `release()`'s buffer-drop is now
+  gated on `file.flags.is_writable()` AND no other writable fh remaining
+  open on the same path (extracted as the pure, directly-tested
+  `other_writer_open()` helper, since standing up a live `DtfsFilesystem`/
+  `DtfsClient` in a unit test isn't practical here — no mock/trait double
+  exists for the client, and `FuseConfig` has no `Default` impl to build
+  one cheaply).
+
+- **CR-1-4** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-fuse --release`: 85 -> 87 passed (2 new, module
+  `cr_1_4_ghost_unlink_tests`), 0 failed. Added `OpenFile.committed_any`,
+  set true on every `OpenFile` sharing a path the moment
+  `flush_segments_to_cluster` first succeeds for it. `flush()` now
+  UNCONDITIONALLY calls `restore_segments` on a cluster-write failure
+  (the old `was_fresh` branch that skipped the restore and unlinked
+  instead is gone from `flush()` entirely). The ghost-unlink moved to
+  `release()`, gated by the extracted `should_ghost_unlink(flush_failed,
+  committed_any)` and firing only when nothing was EVER committed for the
+  path. Deviation: the full end-to-end scenario in the task's test
+  column (create, batch-commit 2 chunks, write a tail, force a flush
+  error, assert not-deleted + tail retried) needs a live
+  `flush_segments_to_cluster` failure, which needs a `DtfsClient`/network
+  mock this crate doesn't have (same gap noted under CR-1-2/CR-1-3);
+  covered instead at the exact decision boundary the fix introduces
+  (`should_ghost_unlink`), which is the only new control-flow `release()`
+  gained.
+
+- **CR-1-5** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-fuse --release`: 87 -> 90 passed (3 new, module
+  `cr_1_5_chunk_id_tests`), 0 failed. `flush_segments_to_cluster` now
+  hashes each segment once (`blake3_hex`, extracted for testability) and
+  sends the hex digest as the declared `chunk_id` on every
+  `write_chunk_bytes` call (previously always `""`); a reply whose
+  `chunk_id` does not match is treated as a failed replica (excluded from
+  `successes`, contributes to `last_err`) so a mismatched write is never
+  committed as a location. No dtfs-data change in this group (Group 4
+  does the server-side compare per the plan). Deviation: same client-mock
+  gap as CR-1-2/3/4 — the task's "mock data node returning a different
+  id" test is covered at the hashing/comparison boundary
+  (`blake3_hex` + the `!=` check that feeds the mismatch branch), not via
+  a live RPC round trip.
+
+- **CR-1-6** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-fuse --release`: 90 -> 91 passed (1 new,
+  `cr_1_6_transient_manager_error_is_not_enoent`), 0 failed. Routed
+  `readdir`, `readdirplus`, `mkdir`, `unlink`, `rmdir`, `create`,
+  `rename`, `symlink`, and `link` through `cluster_err_to_errno` (was a
+  bare `Errno::from(libc::ENOENT)`/`EIO)` in each `map_err`/`Err(e) =>`
+  arm). `grep -c "Errno::from(libc::ENOENT)"` shows 6 remaining hits, all
+  inside the helper itself, `child_path`/`path_for`'s unrelated
+  `ok_or_else`, and tests — zero in a `map_err` closure outside the
+  helper. No fuse3 test harness exists to drive `readdir`/`readdirplus`
+  directly (pre-existing comment on `fuse_readdir_regression`), so the
+  new test locks the mapping function both now call instead.
+
+- **CR-1-7** 2026-09-12. Added
+  `tests/release/cases/100-fuse-rewrite-offset-zero.sh` (patches offset 0
+  and the chunk-0/chunk-1 boundary of an already-flushed file, cmp against
+  a locally-patched reference) and
+  `tests/release/cases/101-fuse-reader-close-does-not-drain-writer.sh`
+  (paces a background streaming write, repeatedly open-read-closes the
+  same path read-only while it's in flight, then checks the writer still
+  finishes with the byte-correct content). Both modeled on
+  `96-write-batch-flush.sh` / `85-unaligned-write-integrity.sh` /
+  `90-lease-release-spares-live-writer.sh`; `trap case_cleanup EXIT`,
+  last line `pass` (-> `STATUS: PASS`), not in `QUICK_CASES`.
+  `bash -n` clean on both (verified: `bash -n
+  tests/release/cases/100-fuse-rewrite-offset-zero.sh` and `...101-...sh`
+  -> no output, exit 0). NOT executed — no lab, per the plan's Build/verify
+  environment section.
+
+- **CR-1-8** 2026-09-12. Updated `AGENTS.md` A.8's `filesystem.rs` entry
+  (added CR-1-1..CR-1-5 paragraphs: per-chunk `ChunkBuf` map, RMW seed
+  scope + O_APPEND ordering, flush/release writable-fh gating,
+  `committed_any` + relocated ghost-unlink, end-to-end BLAKE3 `chunk_id`)
+  and the `fuse_adapter.rs` entry (CR-1-6: `readdir`/`readdirplus`/
+  `mkdir`/`unlink`/`rmdir`/`create`/`rename`/`symlink`/`link` now route
+  through `cluster_err_to_errno`). Own commit per the task instructions.
+
+- **R1 (PR #105 review, FUSE-1 memory half)** 2026-09-12,
+  `cargo test -p dtfs-fuse --release`: 91 -> 95 passed (4 new:
+  `writebuf::tests::r1_flush_complete_ignores_batch_threshold`,
+  `filesystem::r1_dirty_cap_tests::under_cap_is_not_exceeded`,
+  `filesystem::r1_dirty_cap_tests::meeting_or_crossing_cap_is_exceeded`,
+  `filesystem::r1_dirty_cap_tests::saturates_instead_of_overflowing`),
+  0 failed. Added `WriteBuffer::flush_complete()` (drains every complete
+  chunk immediately, ignoring `flush_batch_chunks`) and wired
+  `DIRTY_BYTES_CAP` into `write()`'s F-022 sparse-hole fill loop (checked
+  after each 64 MiB slice) and once more before merging the caller's own
+  bytes, via the extracted pure `dirty_cap_exceeded(dirty, incoming)`
+  predicate. On a cap hit, `flush_complete()` + `flush_segments_to_cluster`
+  runs immediately; a failure there `restore_segments`s and returns Err
+  (same CO-1-8(a) contract as the batch flush path). AGENTS.md A.3.2
+  documents the cap next to the WI-01/H1 sentence.
+
+- **R2 (PR #105 review, FUSE-7(c) still reachable)** 2026-09-12,
+  `cargo test -p dtfs-fuse --release`: 95 -> 98 passed (3 new,
+  `filesystem::r2_segments_committable_tests::*`), 0 failed.
+  `flush_segments_to_cluster` now refuses (before `allocate_chunks_with_hint`)
+  to commit any segment with `offset_in_chunk > 0` via the extracted pure
+  `segments_committable()` helper, returning an `Err` naming the
+  offending chunk; every caller already `restore_segments`s on `Err`, so
+  the bytes survive for a retry instead of being stored shifted. Also
+  added a `warn!` at each of the three `continue` sites in `write()`'s
+  RMW seed loop (no cached `locations_snapshot`, no `chunk_at(idx)`
+  entry, empty `node_addresses`) noting the seed was skipped and that the
+  commit-time guard above is the backstop — left as a `warn!` rather than
+  a hard error there because `write()` cannot cheaply determine whether
+  the chunk genuinely doesn't exist yet (legitimate) vs. the snapshot
+  being stale (needs the guard), so the decision is deferred to
+  `segments_committable()` at commit time, per the review note.
