@@ -123,6 +123,21 @@ chunk already ON THE WIRE as a *prefetch*) is untouched and still tried
 before the miss branch; `foreground_inflight` only covers the foreground
 fetch loop itself.
 
+## Disk-cache viewer-read hint + eviction hysteresis (CR2-8-3/CR2-8-4)
+
+`local_cache.rs`'s viewer/scanner atime hint can no longer be driven by
+one kernel read's length (FUSE-11): FUSE reads arrive in ~128 KB pieces,
+always under `ATIME_UPDATE_MIN_BYTES` (1 MiB), so `read()` now tracks
+`OpenFile.bytes_read_on_fh` and combines it with
+`ReadAheadEngine::is_active()` via the pure `filesystem::is_viewer_read`
+helper, passed into the new `LocalChunkCache::get_with_hint(id,
+is_viewer)` (the old `get(id, bytes_hint)` delegates to it). FUSE-12:
+`evict_to_size` targets `EVICT_TARGET_PCT` (90%) of `max_bytes` instead
+of exactly `max_bytes`, so a cache at steady state pays a full O(N) stat
+sweep roughly once per 10% of the cap's worth of new data instead of on
+almost every single `put()`; the dead `lru: BTreeMap` index (inserted,
+never read) is gone.
+
 ## FUSE error mapping (CO-4-16)
 
 `fuse_adapter.rs` metadata ops map cluster errors via
