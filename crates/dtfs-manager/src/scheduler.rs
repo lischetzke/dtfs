@@ -2044,7 +2044,23 @@ impl TaskScheduler {
 
         let mut reaped: usize = 0;
 
-        for (node_id, grpc_addr) in &data_nodes {
+        'nodes: for (node_id, grpc_addr) in &data_nodes {
+            // CR2-7-3 / MGR-13 — re-check leadership + freshness at the top
+            // of EVERY node iteration, not just once before the loop. A
+            // sweep over a 50 TB anchor node can span an election; without
+            // this a follower that just lost (or a leader that just lost)
+            // leadership kept issuing direct data-node delete RPCs for the
+            // rest of the sweep, which no Raft rejection can undo.
+            let (applied_now, last_log_now) = self.applied_and_log_index();
+            if !orphan_sweep_allowed(self.is_leader(), applied_now, last_log_now, in_state_chunks.len()) {
+                self.audit.log(
+                    "scheduler",
+                    "orphan.sweep_aborted_not_leader",
+                    &format!("aborted before node={node_id}; reaped_so_far={reaped}"),
+                    "aborted",
+                );
+                break 'nodes;
+            }
             if grpc_addr.is_empty() { continue; }
             let on_disk = match self.list_chunks_on_node(grpc_addr).await {
                 Ok(s) => s,
@@ -2199,6 +2215,29 @@ impl TaskScheduler {
                     continue;
                 }
                 let age_secs = now_ms.saturating_sub(*mtime_ms) / 1000;
+
+                // CR2-7-3 / MGR-13 — re-check leadership + freshness again
+                // immediately before EACH delete batch (not just once per
+                // node): a per-node on_disk listing can itself carry many
+                // reap candidates, and an election can land between two of
+                // them just as easily as between two nodes.
+                let (applied_batch, last_log_batch) = self.applied_and_log_index();
+                if !orphan_sweep_allowed(
+                    self.is_leader(),
+                    applied_batch,
+                    last_log_batch,
+                    in_state_chunks.len(),
+                ) {
+                    self.audit.log(
+                        "scheduler",
+                        "orphan.sweep_aborted_not_leader",
+                        &format!(
+                            "aborted before delete node={node_id} chunk={cid}; reaped_so_far={reaped}"
+                        ),
+                        "aborted",
+                    );
+                    break 'nodes;
+                }
 
                 // Past grace — reap.
                 // CO-1-1 / CO-3-2 — the reap removes the whole chunk from
@@ -3896,6 +3935,19 @@ pub(crate) fn orphan_sweep_allowed(
     in_state_chunks > 0
 }
 
+/// CR2-7-3 / MGR-13 — pure model of the abort decision `orphan_scrub_tick`
+/// makes at every per-node and per-delete-batch checkpoint: given the
+/// sequence of `(is_leader, last_applied, last_log_index, in_state_chunks)`
+/// samples observed at each checkpoint (in order), return the index of the
+/// FIRST one that fails `orphan_sweep_allowed`, or `None` if every
+/// checkpoint stayed clear. The real loop `break`s at exactly that point,
+/// so no delete batch after it is ever attempted.
+pub(crate) fn first_sweep_abort_index(checks: &[(bool, u64, u64, usize)]) -> Option<usize> {
+    checks
+        .iter()
+        .position(|&(leader, applied, last_log, n)| !orphan_sweep_allowed(leader, applied, last_log, n))
+}
+
 /// REV-3-5 — how many consecutive memory-pressure skips the scheduler
 /// tolerates before it runs a tick anyway.
 ///
@@ -3971,7 +4023,7 @@ pub(crate) fn files_referencing_chunk(
 #[cfg(test)]
 mod rev_leader_gate_tests {
     use super::{
-        force_tick_after_skips, leader_gate_open, orphan_sweep_allowed,
+        first_sweep_abort_index, force_tick_after_skips, leader_gate_open, orphan_sweep_allowed,
         should_quarantine_for_missing, task_budget_available,
         IN_STATE_MISSING_QUARANTINE_THRESHOLD, MAX_CONSECUTIVE_PRESSURE_SKIPS, MAX_LIVE_TASKS,
         MAX_NEW_TASKS_PER_TICK,
@@ -4000,6 +4052,39 @@ mod rev_leader_gate_tests {
     fn orphan_sweep_refuses_an_empty_namespace_view() {
         // "Every chunk on every disk is an orphan" is never a real answer.
         assert!(!orphan_sweep_allowed(true, 100, 100, 0));
+    }
+
+    /// CR2-7-3 / MGR-13 — a leadership loss mid-sweep (third checkpoint)
+    /// must stop the sweep at that checkpoint; nothing after it runs.
+    #[test]
+    fn mgr_13_leadership_loss_mid_sweep_aborts_at_that_checkpoint() {
+        let checks = vec![
+            (true, 100, 100, 5),  // node 1: ok
+            (true, 100, 100, 5),  // node 1's delete batch: ok
+            (false, 100, 100, 5), // node 2: leadership lost -> abort here
+            (true, 100, 100, 5),  // never reached
+        ];
+        assert_eq!(first_sweep_abort_index(&checks), Some(2));
+    }
+
+    /// CR2-7-3 / MGR-13 — a sweep that never loses the gate never aborts.
+    #[test]
+    fn mgr_13_sweep_with_no_gate_failure_never_aborts() {
+        let checks = vec![(true, 100, 100, 5); 6];
+        assert_eq!(first_sweep_abort_index(&checks), None);
+    }
+
+    /// CR2-7-3 / MGR-13 — a freshness regression (state machine falls
+    /// behind mid-sweep, e.g. after a snapshot install) aborts exactly like
+    /// a leadership loss.
+    #[test]
+    fn mgr_13_freshness_regression_mid_sweep_aborts_at_that_checkpoint() {
+        let checks = vec![
+            (true, 100, 100, 5),
+            (true, 50, 5_000, 5), // fell behind -> abort here
+            (true, 5_000, 5_000, 5),
+        ];
+        assert_eq!(first_sweep_abort_index(&checks), Some(1));
     }
 
     #[test]
