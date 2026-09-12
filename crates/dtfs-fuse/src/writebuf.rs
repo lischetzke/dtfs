@@ -4,8 +4,20 @@
 // ready to be sent to data nodes. This allows small writes to be coalesced
 // and chunk boundaries to be respected without requiring callers to manage
 // alignment.
+//
+// CR-1-1 (FUSE-1): the buffer is keyed PER CHUNK (`BTreeMap<u32, ChunkBuf>`),
+// never one contiguous `Vec<u8>` spanning the whole file. A write is split
+// at chunk boundaries before it is merged, so a write below an
+// already-flushed chunk, or one that lands past the highest resident chunk,
+// can never zero-fill (and therefore re-emit as real data) a chunk it did
+// not touch. A write that lands in a chunk which is not yet resident, or
+// does not cover that chunk in full, marks the chunk `needs_seed` instead
+// of gap-filling — the caller (filesystem.rs, CR-1-2) is responsible for
+// reading the cluster's existing bytes and seeding the chunk before it is
+// safe to commit as the chunk's whole content.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -27,6 +39,18 @@ const MAX_FLUSH_BATCH_CHUNKS: usize = 32;
 /// flushing (the pre-WI-01 behaviour) instead of to an OOM.
 const FLUSH_BATCH_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// CR-1-1 — hard ceiling on total dirty bytes buffered per file, independent
+/// of how many distinct chunk indices are touched (a write far into a large
+/// sparse file plus a write near offset 0 now holds two small `ChunkBuf`
+/// entries rather than a multi-hundred-MB contiguous `Vec`, but callers must
+/// still not be able to pin unbounded heap by scattering tiny writes across
+/// many chunk indices). Set to twice `FLUSH_BATCH_MAX_BYTES` — comfortably
+/// above one batch's worth of complete chunks plus whatever partial chunks
+/// are still accumulating. Enforcement is caller-side (filesystem.rs forces
+/// a flush before a write that would exceed it); `dirty_bytes()` is the
+/// query callers use to check.
+pub const DIRTY_BYTES_CAP: usize = FLUSH_BATCH_MAX_BYTES * 2;
+
 /// WI-01 / H1 — resolve the effective `flush_batch_chunks` for a given
 /// configured value and chunk size: clamp the count into
 /// `1..=MAX_FLUSH_BATCH_CHUNKS`, then clamp again so `batch * chunk_size`
@@ -43,11 +67,13 @@ pub(crate) fn effective_batch_chunks(configured: usize, chunk_size: usize) -> us
     by_count.min(FLUSH_BATCH_MAX_BYTES / chunk_size).max(1)
 }
 
-/// WI-01 — number of whole, chunk-aligned chunks currently extractable from
-/// a buffer that starts at `dirty_offset` and holds `len` bytes. Mirrors the
-/// extraction rule in `FileWriteBuffer::extract_complete_chunks`: a buffer
-/// that starts mid-chunk yields 0 regardless of `len` (CO-1-7 — those bytes
-/// only ever leave via `flush_all`, never an early `flush`).
+/// Pre-CR-1-1 pure helper retained for its direct unit test and any external
+/// caller: number of whole, chunk-aligned chunks extractable from a
+/// contiguous run that starts at `dirty_offset` and holds `len` bytes. The
+/// sparse per-chunk buffer below no longer uses this internally (batching
+/// now counts complete `ChunkBuf` entries directly — see
+/// `FileWriteBuffer::complete_chunk_count`), but the single-buffer semantics
+/// this encodes are still a useful, independently-testable invariant.
 pub(crate) fn complete_chunks_available(dirty_offset: u64, len: usize, chunk_size: usize) -> usize {
     if chunk_size == 0 || dirty_offset % chunk_size as u64 != 0 {
         return 0;
@@ -58,9 +84,10 @@ pub(crate) fn complete_chunks_available(dirty_offset: u64, len: usize, chunk_siz
 /// Write buffer that accumulates data and flushes chunk-aligned segments.
 ///
 /// Each file path gets an independent [`FileWriteBuffer`] that tracks dirty
-/// data. When enough data has been accumulated to fill one or more complete
-/// chunks, those chunks can be extracted via [`flush`](Self::flush). A final
-/// partial chunk can be extracted with [`flush_all`](Self::flush_all).
+/// data per chunk index. When enough complete chunks have accumulated,
+/// those chunks can be extracted via [`flush`](Self::flush). Remaining
+/// (possibly partial) chunks can be extracted with
+/// [`flush_all`](Self::flush_all).
 pub struct WriteBuffer {
     /// Chunk size in bytes (default 128 MB).
     chunk_size: usize,
@@ -73,17 +100,104 @@ pub struct WriteBuffer {
     buffers: DashMap<String, FileWriteBuffer>,
 }
 
-/// Internal per-file write buffer.
-///
-/// Data is stored in a `BTreeMap<u64, u8>` sparse representation would be
-/// wasteful, so we keep a contiguous `Vec<u8>` and track the starting offset
-/// of the dirty region.
+/// Internal per-file write buffer: a sparse map from chunk index to the
+/// dirty bytes buffered for that chunk (CR-1-1).
 struct FileWriteBuffer {
+    #[allow(dead_code)] // kept for parity/debuggability; not read internally
     path: String,
-    /// Contiguous buffer of dirty data.
+    chunks: BTreeMap<u32, ChunkBuf>,
+}
+
+/// CR-1-1 — buffered bytes for one chunk index. `data.len() == dirty.end -
+/// dirty.start`; bytes outside `dirty` within the chunk are simply not
+/// resident (never materialised as zeros), so a partially-written chunk
+/// costs only the bytes actually written, not a full `chunk_size` Vec.
+struct ChunkBuf {
+    /// Bytes covering `dirty`.
     data: Vec<u8>,
-    /// The byte offset in the file where `data[0]` maps to.
-    dirty_offset: u64,
+    /// Byte range within the chunk (`0..chunk_size`) that `data` covers.
+    dirty: Range<usize>,
+}
+
+impl ChunkBuf {
+    /// True iff this chunk's buffered data fully covers `0..chunk_size` —
+    /// i.e. it is safe to commit as the chunk's whole content without an
+    /// RMW seed first.
+    fn is_complete(&self, chunk_size: usize) -> bool {
+        self.dirty.start == 0 && self.dirty.end == chunk_size
+    }
+
+    /// Merge a write at `offset_in_chunk` (always `< chunk_size`; the caller
+    /// splits writes at chunk boundaries before calling this) into this
+    /// chunk's buffer. Mirrors the pre-CR-1-1 contiguous-buffer merge logic,
+    /// but every gap it can zero-fill is bounded to `0..chunk_size` — it can
+    /// never reach into a neighbouring chunk.
+    fn merge(&mut self, offset_in_chunk: usize, data: &[u8]) {
+        let write_end = offset_in_chunk + data.len();
+
+        if self.data.is_empty() {
+            self.dirty = offset_in_chunk..write_end;
+            self.data = data.to_vec();
+            return;
+        }
+
+        let cur_start = self.dirty.start;
+        let cur_end = self.dirty.end;
+
+        if offset_in_chunk >= cur_start && offset_in_chunk <= cur_end {
+            // Write starts within or immediately after the current range.
+            let rel = offset_in_chunk - cur_start;
+            let needed = rel + data.len();
+            if needed > self.data.len() {
+                self.data.resize(needed, 0);
+            }
+            self.data[rel..rel + data.len()].copy_from_slice(data);
+            self.dirty = cur_start..cur_end.max(write_end);
+        } else if offset_in_chunk < cur_start {
+            // Write starts before the current range.
+            if write_end >= cur_start {
+                // Overlaps or is adjacent: merge into one contiguous range.
+                let new_start = offset_in_chunk;
+                let new_end = cur_end.max(write_end);
+                let new_len = new_end - new_start;
+                let mut new_data = vec![0u8; new_len];
+                new_data[0..data.len()].copy_from_slice(data);
+
+                let existing_offset = cur_start - new_start;
+                let overwritten_end = write_end - cur_start;
+                if overwritten_end < self.data.len() {
+                    let dest_start = existing_offset + overwritten_end;
+                    new_data[dest_start..existing_offset + self.data.len()]
+                        .copy_from_slice(&self.data[overwritten_end..]);
+                }
+
+                self.dirty = new_start..new_end;
+                self.data = new_data;
+            } else {
+                // Disjoint gap, but bounded within this one chunk (never
+                // crosses a chunk boundary) — zero-fill just this gap.
+                let new_start = offset_in_chunk;
+                let new_end = cur_end;
+                let new_len = new_end - new_start;
+                let mut new_data = vec![0u8; new_len];
+                new_data[0..data.len()].copy_from_slice(data);
+                let existing_offset = cur_start - new_start;
+                new_data[existing_offset..existing_offset + self.data.len()]
+                    .copy_from_slice(&self.data);
+                self.dirty = new_start..new_end;
+                self.data = new_data;
+            }
+        } else {
+            // Write starts strictly after the current range, with a gap —
+            // again bounded within this chunk.
+            let new_end = write_end;
+            let new_len = new_end - cur_start;
+            self.data.resize(new_len, 0);
+            let rel = offset_in_chunk - cur_start;
+            self.data[rel..rel + data.len()].copy_from_slice(data);
+            self.dirty.end = new_end;
+        }
+    }
 }
 
 /// A chunk-aligned segment ready for writing to a data node.
@@ -91,8 +205,20 @@ struct FileWriteBuffer {
 pub struct ChunkSegment {
     /// Zero-based chunk index within the file.
     pub chunk_index: u32,
-    /// The data for this chunk (up to `chunk_size` bytes).
+    /// The data for this chunk. Covers `[offset_in_chunk, offset_in_chunk +
+    /// data.len())` within the chunk — the whole chunk when `needs_seed` is
+    /// false.
     pub data: Bytes,
+    /// Byte offset within the chunk where `data` begins. Always 0 for a
+    /// complete (fully-covered) chunk; may be non-zero for a partial chunk
+    /// drained by `flush_all` without full coverage.
+    pub offset_in_chunk: usize,
+    /// CR-1-1 (FUSE-1/FUSE-7) — true when `data` does NOT fully cover
+    /// `0..chunk_size`. The caller must never commit a segment with
+    /// `needs_seed == true` as the chunk's whole content without first
+    /// RMW-seeding it against the cluster's existing bytes (CR-1-2) — doing
+    /// so would silently truncate or shift already-committed data.
+    pub needs_seed: bool,
 }
 
 impl WriteBuffer {
@@ -133,26 +259,45 @@ impl WriteBuffer {
         Self::new(128 * 1024 * 1024)
     }
 
-    /// Write data into the buffer for the given file path at the specified offset.
+    /// Write data into the buffer for the given file path at the specified
+    /// offset. Splits the write at chunk boundaries and merges each piece
+    /// into its own chunk's buffer — never touching, let alone zero-filling,
+    /// a chunk the write doesn't overlap.
     ///
     /// Returns the number of bytes buffered (always equal to `data.len()`).
     #[instrument(skip(self, data), fields(path = %path, offset, len = data.len()))]
     pub fn write(&self, path: &str, offset: u64, data: &[u8]) -> usize {
         let len = data.len();
-        if len == 0 {
+        if len == 0 || self.chunk_size == 0 {
             return 0;
         }
 
         let mut entry = self.buffers.entry(path.to_string()).or_insert_with(|| {
             FileWriteBuffer {
                 path: path.to_string(),
-                data: Vec::new(),
-                dirty_offset: offset,
+                chunks: BTreeMap::new(),
             }
         });
-
         let buf = entry.value_mut();
-        buf.merge_write(offset, data);
+
+        let chunk_size = self.chunk_size as u64;
+        let mut remaining = data;
+        let mut cur_offset = offset;
+        while !remaining.is_empty() {
+            let chunk_index = (cur_offset / chunk_size) as u32;
+            let offset_in_chunk = (cur_offset % chunk_size) as usize;
+            let take = remaining.len().min(self.chunk_size - offset_in_chunk);
+            let (piece, rest) = remaining.split_at(take);
+            buf.chunks
+                .entry(chunk_index)
+                .or_insert_with(|| ChunkBuf {
+                    data: Vec::new(),
+                    dirty: 0..0,
+                })
+                .merge(offset_in_chunk, piece);
+            remaining = rest;
+            cur_offset += take as u64;
+        }
 
         debug!(path, offset, len, "buffered write");
         len
@@ -160,53 +305,72 @@ impl WriteBuffer {
 
     /// Extract all complete (chunk-aligned) segments from the buffer.
     ///
-    /// Any trailing data that does not fill a complete chunk remains in the
-    /// buffer. Returns an empty `Vec` if no complete chunks are available.
+    /// Any chunk that is not yet fully covered remains in the buffer.
+    /// Returns an empty `Vec` if fewer than `flush_batch_chunks` complete
+    /// chunks are available.
     #[instrument(skip(self), fields(path = %path))]
     pub fn flush(&self, path: &str) -> Vec<ChunkSegment> {
         let mut entry = match self.buffers.get_mut(path) {
             Some(e) => e,
             None => return Vec::new(),
         };
-
         let buf = entry.value_mut();
 
-        // WI-01 — hold back until at least `flush_batch_chunks` complete
-        // chunks are available, so the caller's allocate+commit round trip
-        // amortizes over a batch instead of firing once per chunk. `1`
-        // (the `new()` default) makes this check pass at the first complete
-        // chunk, exactly like the pre-batching behaviour.
-        if complete_chunks_available(buf.dirty_offset, buf.data.len(), self.chunk_size)
-            < self.flush_batch_chunks
-        {
+        let ready = buf
+            .chunks
+            .values()
+            .filter(|cb| cb.is_complete(self.chunk_size))
+            .count();
+        if ready < self.flush_batch_chunks {
             return Vec::new();
         }
 
         let segments = buf.extract_complete_chunks(self.chunk_size);
-
         debug!(
             path,
             num_segments = segments.len(),
-            remaining = buf.data.len(),
+            remaining = buf.chunks.len(),
             "flushed complete chunks"
         );
         segments
     }
 
-    /// Extract all data from the buffer, including a partial final chunk.
-    ///
-    /// This should be called when the file is being closed or when all
-    /// buffered data must be persisted regardless of alignment.
+    /// R1 (FUSE-1 memory half) — drain EVERY complete chunk right now,
+    /// ignoring `flush_batch_chunks`. Unlike `flush()`, which deliberately
+    /// holds back below the batch threshold to amortize the
+    /// allocate+commit round trip, this exists purely as a memory-pressure
+    /// release valve: a caller nearing `DIRTY_BYTES_CAP` (e.g. the F-022
+    /// sparse-hole fill loop in `filesystem.rs::write()`) needs to commit
+    /// and drop whatever is already flushable RIGHT NOW, not wait for a
+    /// batch to fill. Partial (incomplete) chunks are left resident.
+    #[instrument(skip(self), fields(path = %path))]
+    pub fn flush_complete(&self, path: &str) -> Vec<ChunkSegment> {
+        let mut entry = match self.buffers.get_mut(path) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        let buf = entry.value_mut();
+        let segments = buf.extract_complete_chunks(self.chunk_size);
+        debug!(
+            path,
+            num_segments = segments.len(),
+            remaining = buf.chunks.len(),
+            "flush_complete: force-drained complete chunks (memory pressure)"
+        );
+        segments
+    }
+
+    /// Extract every buffered chunk, including partial (not fully covered)
+    /// ones. This should be called when the file is being closed or when
+    /// all buffered data must be persisted regardless of alignment.
     #[instrument(skip(self), fields(path = %path))]
     pub fn flush_all(&self, path: &str) -> Vec<ChunkSegment> {
         let mut entry = match self.buffers.get_mut(path) {
             Some(e) => e,
             None => return Vec::new(),
         };
-
         let buf = entry.value_mut();
         let segments = buf.extract_all_chunks(self.chunk_size);
-
         debug!(
             path,
             num_segments = segments.len(),
@@ -222,59 +386,61 @@ impl WriteBuffer {
 
     /// CO-1-8 (b) — drop buffered bytes at or above `new_size`, keeping the
     /// buffered prefix `[0..new_size)` intact.
-    ///
-    /// `truncate()` on the filesystem used to `remove()` the whole buffer
-    /// whenever the buffered EOF exceeded `new_size`, which also discarded
-    /// buffered bytes BELOW the new EOF (silent data loss when an app
-    /// truncated to a length that still covered un-flushed writes). This keeps
-    /// every buffered byte the truncation does not delete; a later `flush_all`
-    /// still emits them. If the buffer lies entirely above `new_size` it
-    /// becomes empty (removed); if entirely below, it is untouched.
     pub fn truncate(&self, path: &str, new_size: u64) {
         let mut entry = match self.buffers.get_mut(path) {
             Some(e) => e,
             None => return,
         };
         let buf = entry.value_mut();
-        let buf_start = buf.dirty_offset;
-        let buf_end = buf_start + buf.data.len() as u64;
+        let chunk_size = self.chunk_size;
+        if chunk_size == 0 {
+            return;
+        }
+        let cutoff_chunk = (new_size / chunk_size as u64) as u32;
+        let cutoff_in_chunk = (new_size % chunk_size as u64) as usize;
 
-        if new_size <= buf_start {
-            // Entire buffer is at/above the cut — nothing survives.
-            buf.data.clear();
-            buf.dirty_offset = 0;
+        let at_or_above: Vec<u32> = buf
+            .chunks
+            .range(cutoff_chunk..)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in at_or_above {
+            if k == cutoff_chunk && cutoff_in_chunk > 0 {
+                let mut drop_entirely = false;
+                if let Some(cb) = buf.chunks.get_mut(&k) {
+                    if cb.dirty.start >= cutoff_in_chunk {
+                        drop_entirely = true;
+                    } else {
+                        let keep_end = cutoff_in_chunk.min(cb.dirty.end);
+                        let keep_len = keep_end - cb.dirty.start;
+                        cb.data.truncate(keep_len);
+                        cb.dirty.end = keep_end;
+                    }
+                }
+                if drop_entirely {
+                    buf.chunks.remove(&k);
+                }
+            } else {
+                buf.chunks.remove(&k);
+            }
+        }
+
+        if buf.chunks.is_empty() {
             drop(entry);
             self.buffers.remove(path);
-            return;
         }
-        if new_size >= buf_end {
-            // Cut is at/above the buffered end — keep everything.
-            return;
-        }
-        // Cut falls inside the buffer: keep [buf_start, new_size).
-        let keep = (new_size - buf_start) as usize;
-        buf.data.truncate(keep);
     }
 
     /// CO-1-8 (a) — re-insert segments that were extracted by `flush` /
     /// `flush_all` but failed to reach the cluster, so a later flush re-sends
-    /// them instead of dropping the bytes.
-    ///
-    /// `flush_segments_to_cluster` is called AFTER the bytes have already been
-    /// drained out of the buffer; if the cluster write errors the bytes are
-    /// gone and a retried fsync would return Ok with data silently lost. The
-    /// cluster stores each segment as the whole content of chunk
-    /// `chunk_index`, so re-buffering it at `chunk_index * chunk_size` makes
-    /// the next `flush_all` re-emit the same `(chunk_index, data)` pair the
-    /// cluster expects. (For the rare mid-chunk leading-partial segment this
-    /// offset can differ from the original `dirty_offset` by the in-chunk
-    /// offset — harmless for re-flushing, since the cluster keys on
-    /// `chunk_index`; only the transient overlay/logical-size view during the
-    /// error-retry window is approximate.)
+    /// them instead of dropping the bytes. Restores each segment at its
+    /// original absolute offset (`chunk_index * chunk_size +
+    /// offset_in_chunk`), so a partial (needs_seed) segment round-trips to
+    /// exactly the range it covered, not the whole chunk.
     pub fn restore_segments(&self, path: &str, segments: &[ChunkSegment]) {
         let chunk_size = self.chunk_size as u64;
         for seg in segments {
-            let abs_offset = seg.chunk_index as u64 * chunk_size;
+            let abs_offset = seg.chunk_index as u64 * chunk_size + seg.offset_in_chunk as u64;
             self.write(path, abs_offset, seg.data.as_ref());
         }
     }
@@ -283,20 +449,51 @@ impl WriteBuffer {
     pub fn has_dirty_data(&self, path: &str) -> bool {
         self.buffers
             .get(path)
-            .map(|e| !e.value().data.is_empty())
+            .map(|e| !e.value().chunks.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Total buffered bytes for `path`, summed across every resident chunk
+    /// (CR-1-1) — used by callers to enforce `DIRTY_BYTES_CAP`.
+    pub fn dirty_bytes(&self, path: &str) -> usize {
+        self.buffers
+            .get(path)
+            .map(|e| e.value().chunks.values().map(|cb| cb.data.len()).sum())
+            .unwrap_or(0)
+    }
+
+    /// CR-1-1/CR-1-2 — true iff `chunk_index` is currently buffered AND its
+    /// buffered range fully covers `0..chunk_size`, i.e. it is already safe
+    /// to commit without an RMW seed.
+    pub fn chunk_is_fully_buffered(&self, path: &str, chunk_index: u32) -> bool {
+        self.buffers
+            .get(path)
+            .and_then(|e| {
+                e.value()
+                    .chunks
+                    .get(&chunk_index)
+                    .map(|cb| cb.is_complete(self.chunk_size))
+            })
             .unwrap_or(false)
     }
 
     /// Logical end of the file as seen by the buffer (i.e. the highest
-    /// `offset + data.len()` of any write merged so far). Returns `None` if
-    /// the buffer has never seen a write for this path.
+    /// `chunk_index * chunk_size + dirty.end` of any resident chunk).
+    /// Returns `None` if the buffer has never seen a write for this path.
     ///
     /// Used by the F-021/F-022 fix to decide where O_APPEND writes land and
     /// to size sparse-hole zero fills.
     pub fn logical_size(&self, path: &str) -> Option<u64> {
-        self.buffers
-            .get(path)
-            .map(|e| e.value().dirty_offset + e.value().data.len() as u64)
+        let entry = self.buffers.get(path)?;
+        let buf = entry.value();
+        if buf.chunks.is_empty() {
+            return None;
+        }
+        let chunk_size = self.chunk_size as u64;
+        buf.chunks
+            .iter()
+            .map(|(idx, cb)| *idx as u64 * chunk_size + cb.dirty.end as u64)
+            .max()
     }
 
     /// Overlay any buffered data for `path` that overlaps the byte range
@@ -309,30 +506,40 @@ impl WriteBuffer {
     /// breaks on the very first `CREATE TABLE` because the schema page is
     /// written, then read back, then nothing is there.
     ///
-    /// Returns the number of bytes the buffer covered. Callers can use this
-    /// to decide whether to short-circuit cluster fetches (when buffered
-    /// data fully covers the request, no chunk read is needed).
+    /// Returns the number of bytes the buffer covered.
     pub fn overlay(&self, path: &str, abs_offset: u64, dst: &mut [u8]) -> usize {
+        if dst.is_empty() {
+            return 0;
+        }
         let Some(entry) = self.buffers.get(path) else { return 0 };
         let buf = entry.value();
-        if buf.data.is_empty() {
+        if buf.chunks.is_empty() {
             return 0;
         }
-        let buf_start = buf.dirty_offset;
-        let buf_end = buf_start + buf.data.len() as u64;
+        let chunk_size = self.chunk_size as u64;
         let req_start = abs_offset;
         let req_end = abs_offset + dst.len() as u64;
-        let overlap_start = req_start.max(buf_start);
-        let overlap_end = req_end.min(buf_end);
-        if overlap_end <= overlap_start {
-            return 0;
+        let start_chunk = (req_start / chunk_size) as u32;
+        let end_chunk = ((req_end - 1) / chunk_size) as u32;
+
+        let mut total = 0usize;
+        for chunk_index in start_chunk..=end_chunk {
+            let Some(cb) = buf.chunks.get(&chunk_index) else { continue };
+            let chunk_base = chunk_index as u64 * chunk_size;
+            let buf_start = chunk_base + cb.dirty.start as u64;
+            let buf_end = chunk_base + cb.dirty.end as u64;
+            let overlap_start = req_start.max(buf_start);
+            let overlap_end = req_end.min(buf_end);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+            let src_off = (overlap_start - buf_start) as usize;
+            let dst_off = (overlap_start - req_start) as usize;
+            let n = (overlap_end - overlap_start) as usize;
+            dst[dst_off..dst_off + n].copy_from_slice(&cb.data[src_off..src_off + n]);
+            total += n;
         }
-        let src_off = (overlap_start - buf_start) as usize;
-        let dst_off = (overlap_start - req_start) as usize;
-        let n = (overlap_end - overlap_start) as usize;
-        dst[dst_off..dst_off + n]
-            .copy_from_slice(&buf.data[src_off..src_off + n]);
-        n
+        total
     }
 
     /// Get the current chunk size.
@@ -342,197 +549,46 @@ impl WriteBuffer {
 }
 
 impl FileWriteBuffer {
-    /// Merge a write at `offset` into the contiguous buffer.
-    ///
-    /// If the write is contiguous with (or overlaps) the existing dirty
-    /// region, the buffer is extended or overwritten as needed. If the write
-    /// is entirely disjoint, the gap is zero-filled (this is the simplest
-    /// approach; a sparse representation could be used for very large gaps
-    /// but is not needed for the typical sequential-write pattern).
-    fn merge_write(&mut self, offset: u64, data: &[u8]) {
-        if self.data.is_empty() {
-            // First write — just store it.
-            self.dirty_offset = offset;
-            self.data = data.to_vec();
-            return;
-        }
-
-        let buf_start = self.dirty_offset;
-        let buf_end = buf_start + self.data.len() as u64;
-        let write_end = offset + data.len() as u64;
-
-        if offset >= buf_start && offset <= buf_end {
-            // Write starts within or immediately after current buffer.
-            let relative = (offset - buf_start) as usize;
-            let needed = relative + data.len();
-            if needed > self.data.len() {
-                self.data.resize(needed, 0);
-            }
-            self.data[relative..relative + data.len()].copy_from_slice(data);
-        } else if offset < buf_start {
-            // Write starts before the current buffer — prepend.
-            if write_end >= buf_start {
-                // Overlaps: merge.
-                let new_start = offset;
-                let new_end = buf_end.max(write_end);
-                let new_len = (new_end - new_start) as usize;
-                let mut new_data = vec![0u8; new_len];
-
-                // Copy the new write data.
-                new_data[0..data.len()].copy_from_slice(data);
-
-                // Copy existing buffer data into the correct position.
-                let existing_offset = (buf_start - new_start) as usize;
-                // Only copy the part of the existing buffer that is not
-                // overwritten by the new write.
-                let overwritten_end = (write_end - buf_start) as usize;
-                if overwritten_end < self.data.len() {
-                    let dest_start = existing_offset + overwritten_end;
-                    new_data[dest_start..existing_offset + self.data.len()]
-                        .copy_from_slice(&self.data[overwritten_end..]);
-                }
-
-                self.dirty_offset = new_start;
-                self.data = new_data;
-            } else {
-                // Disjoint before — zero-fill the gap.
-                let new_start = offset;
-                let new_end = buf_end;
-                let new_len = (new_end - new_start) as usize;
-                let mut new_data = vec![0u8; new_len];
-                new_data[0..data.len()].copy_from_slice(data);
-                let existing_offset = (buf_start - new_start) as usize;
-                new_data[existing_offset..existing_offset + self.data.len()]
-                    .copy_from_slice(&self.data);
-                self.dirty_offset = new_start;
-                self.data = new_data;
-            }
-        } else {
-            // Write starts after the current buffer with a gap — zero-fill.
-            let new_end = write_end;
-            let new_len = (new_end - buf_start) as usize;
-            self.data.resize(new_len, 0);
-            let relative = (offset - buf_start) as usize;
-            self.data[relative..relative + data.len()].copy_from_slice(data);
-        }
-    }
-
-    /// Extract complete chunk-aligned segments from the front of the buffer.
+    /// Extract complete (fully-covered) chunk-aligned segments, ascending
+    /// by chunk index, removing them from the map.
     fn extract_complete_chunks(&mut self, chunk_size: usize) -> Vec<ChunkSegment> {
-        let mut segments = Vec::new();
+        let complete_keys: Vec<u32> = self
+            .chunks
+            .iter()
+            .filter(|(_, cb)| cb.is_complete(chunk_size))
+            .map(|(k, _)| *k)
+            .collect();
 
-        // Calculate which chunk the dirty_offset falls into, and how much
-        // data is needed before we complete that first chunk.
-        let first_chunk_idx = (self.dirty_offset / chunk_size as u64) as u32;
-        let offset_in_chunk = (self.dirty_offset % chunk_size as u64) as usize;
-
-        // Bytes needed to complete the first (partial) chunk.
-        let bytes_to_complete_first = chunk_size - offset_in_chunk;
-
-        if self.data.len() < bytes_to_complete_first {
-            // Not enough data to complete even the first chunk.
-            return segments;
-        }
-
-        // If offset_in_chunk > 0, we cannot extract the first chunk as a
-        // "complete" chunk because we only have partial data for it.
-        // We can only extract chunks where we have the full chunk_size bytes.
-        //
-        // Strategy: find the first chunk boundary within the buffer, then
-        // extract all full chunks from that point onward.
-        let mut consumed = 0usize;
-
-        if offset_in_chunk == 0 {
-            // Buffer starts on a chunk boundary — extract full chunks.
-            let mut pos = 0usize;
-            let mut chunk_idx = first_chunk_idx;
-            while pos + chunk_size <= self.data.len() {
-                let chunk_data = Bytes::copy_from_slice(&self.data[pos..pos + chunk_size]);
+        let mut segments = Vec::with_capacity(complete_keys.len());
+        for k in complete_keys {
+            if let Some(cb) = self.chunks.remove(&k) {
                 segments.push(ChunkSegment {
-                    chunk_index: chunk_idx,
-                    data: chunk_data,
+                    chunk_index: k,
+                    data: Bytes::from(cb.data),
+                    offset_in_chunk: 0,
+                    needs_seed: false,
                 });
-                pos += chunk_size;
-                chunk_idx += 1;
             }
-            consumed = pos;
-        } else {
-            // Buffer starts mid-chunk (offset_in_chunk > 0). We cannot extract
-            // any inner full chunk early without breaking the buffer's core
-            // invariant: `data` is one contiguous run whose byte i maps to file
-            // offset dirty_offset + i. Emitting a middle slice would force us to
-            // either (a) drop the leading partial bytes
-            // (data[0..bytes_to_complete_first]) that were never emitted —
-            // silent data loss (CO-1-7) — or (b) drain that middle slice and
-            // leave a non-contiguous prefix+remainder behind, so any trailing
-            // remainder later flushes under the wrong chunk_index — silent
-            // corruption. Both are worse than holding the bytes. So extract
-            // nothing here and defer the whole mid-chunk buffer to
-            // extract_all_chunks (flush_all), which walks the contiguous buffer
-            // correctly and emits every byte under its true chunk_index.
-            return segments;
         }
-
-        if consumed > 0 {
-            // Remove consumed data from the front of the buffer.
-            self.data.drain(..consumed);
-            self.dirty_offset += consumed as u64;
-        }
-
         segments
     }
 
-    /// Extract all segments, including partial final chunk.
+    /// Extract every resident chunk (complete or partial), ascending by
+    /// chunk index, draining the map entirely.
     fn extract_all_chunks(&mut self, chunk_size: usize) -> Vec<ChunkSegment> {
-        if self.data.is_empty() {
-            return Vec::new();
-        }
-
-        let mut segments = Vec::new();
-        let first_chunk_idx = (self.dirty_offset / chunk_size as u64) as u32;
-        let offset_in_chunk = (self.dirty_offset % chunk_size as u64) as usize;
-
-        if offset_in_chunk == 0 {
-            // Aligned start — straightforward.
-            let mut pos = 0usize;
-            let mut chunk_idx = first_chunk_idx;
-            while pos < self.data.len() {
-                let end = (pos + chunk_size).min(self.data.len());
-                let chunk_data = Bytes::copy_from_slice(&self.data[pos..end]);
+        let keys: Vec<u32> = self.chunks.keys().copied().collect();
+        let mut segments = Vec::with_capacity(keys.len());
+        for k in keys {
+            if let Some(cb) = self.chunks.remove(&k) {
+                let complete = cb.is_complete(chunk_size);
                 segments.push(ChunkSegment {
-                    chunk_index: chunk_idx,
-                    data: chunk_data,
+                    chunk_index: k,
+                    offset_in_chunk: cb.dirty.start,
+                    needs_seed: !complete,
+                    data: Bytes::from(cb.data),
                 });
-                pos = end;
-                chunk_idx += 1;
-            }
-        } else {
-            // Starts mid-chunk. Emit the leading partial piece as a
-            // segment for the first chunk.
-            let first_end = (chunk_size - offset_in_chunk).min(self.data.len());
-            segments.push(ChunkSegment {
-                chunk_index: first_chunk_idx,
-                data: Bytes::copy_from_slice(&self.data[..first_end]),
-            });
-
-            let mut pos = first_end;
-            let mut chunk_idx = first_chunk_idx + 1;
-            while pos < self.data.len() {
-                let end = (pos + chunk_size).min(self.data.len());
-                let chunk_data = Bytes::copy_from_slice(&self.data[pos..end]);
-                segments.push(ChunkSegment {
-                    chunk_index: chunk_idx,
-                    data: chunk_data,
-                });
-                pos = end;
-                chunk_idx += 1;
             }
         }
-
-        // Clear the buffer.
-        self.data.clear();
-        self.dirty_offset = 0;
-
         segments
     }
 }
@@ -709,6 +765,9 @@ mod tests {
     // WI-01 — direct unit on the pure batch-threshold helper: a buffer that
     // starts mid-chunk must report 0 available chunks regardless of how much
     // data it holds (mirrors the CO-1-7 rule in extract_complete_chunks).
+    // Retained unchanged post-CR-1-1: this exercises the pure
+    // single-contiguous-buffer helper directly, not the sparse per-chunk
+    // buffer's own (now internal) batching count.
     #[test]
     fn wi01_complete_chunks_available_is_zero_when_midchunk() {
         let chunk = 10;
@@ -870,6 +929,82 @@ mod tests {
         assert_eq!(WriteBuffer::new_with_batch(128 * 1024 * 1024, 4).flush_batch_chunks, 1);
         assert_eq!(WriteBuffer::new_with_batch(4 * 1024 * 1024, 4).flush_batch_chunks, 4);
     }
+
+    // R1 (FUSE-1 memory half) — flush_complete() must drain EVERY complete
+    // chunk immediately, ignoring flush_batch_chunks entirely. A caller
+    // reacting to memory pressure (DIRTY_BYTES_CAP) can't wait for a batch
+    // to fill.
+    #[test]
+    fn r1_flush_complete_ignores_batch_threshold() {
+        let chunk = 4 * 1024 * 1024;
+        let wb = WriteBuffer::new_with_batch(chunk, 4);
+        for i in 0..40u32 {
+            wb.write("/f", (i as u64) * chunk as u64, &vec![i as u8; chunk]);
+        }
+        assert_eq!(wb.dirty_bytes("/f"), 40 * chunk);
+
+        // A normal flush() would emit exactly one batch of 4 (holding back
+        // the rest); flush_complete() must take everything at once.
+        let segs = wb.flush_complete("/f");
+        assert_eq!(segs.len(), 40, "flush_complete must drain every complete chunk");
+        for (idx, seg) in segs.iter().enumerate() {
+            assert_eq!(seg.chunk_index, idx as u32);
+            assert!(!seg.needs_seed);
+        }
+        assert_eq!(wb.dirty_bytes("/f"), 0, "nothing left resident");
+        assert!(!wb.has_dirty_data("/f"));
+    }
+
+    // CR-1-1 (FUSE-1) test (a): after a flushed sequential write of 3
+    // chunks, a NEW write of 100 bytes at offset 0 must create ONLY a
+    // chunk-0 entry marked `needs_seed`; chunks 1 and 2 (already flushed and
+    // gone from the buffer) must never be re-emitted or re-materialised.
+    #[test]
+    fn cr_1_1_rewrite_offset_zero_marks_only_that_chunk_needs_seed() {
+        let chunk = 1024;
+        let wb = WriteBuffer::new(chunk);
+        let data = vec![1u8; chunk * 3];
+        wb.write("/f", 0, &data);
+        let flushed = wb.flush_all("/f");
+        assert_eq!(flushed.len(), 3, "3 full chunks flushed and drained");
+        assert!(!wb.has_dirty_data("/f"));
+
+        // Simulate a patch write at offset 0 after the flush (e.g.
+        // `dd conv=notrunc` rewriting a header).
+        wb.write("/f", 0, &vec![2u8; 100]);
+
+        let segs = wb.flush_all("/f");
+        assert_eq!(segs.len(), 1, "only chunk 0 is resident again");
+        assert_eq!(segs[0].chunk_index, 0);
+        assert!(segs[0].needs_seed, "partial rewrite must be marked needs_seed");
+        assert_eq!(segs[0].data.len(), 100);
+        assert!(
+            segs.iter().all(|s| s.chunk_index != 1 && s.chunk_index != 2),
+            "already-flushed chunks 1 and 2 must never be re-emitted"
+        );
+    }
+
+    // CR-1-1 (FUSE-1) test (b): a write far into a large sparse file
+    // followed by a write near the start must hold exactly two small
+    // chunk-buf entries — never a multi-hundred-MB contiguous allocation.
+    #[test]
+    fn cr_1_1_scattered_writes_hold_only_touched_chunks() {
+        let chunk = 4 * 1024 * 1024; // 4 MiB
+        let wb = WriteBuffer::new(chunk);
+        wb.write("/f", 100 * 1024 * 1024, &[9u8; 16]); // far chunk
+        wb.write("/f", 4 * 1024 * 1024, &[8u8; 16]); // near chunk
+
+        assert!(wb.dirty_bytes("/f") < 2 * chunk, "must not materialise the gap between them");
+        assert_eq!(wb.dirty_bytes("/f"), 32, "only the actually-written bytes are resident");
+
+        let segs = wb.flush_all("/f");
+        assert_eq!(segs.len(), 2, "exactly the two touched chunks, nothing in between");
+        let far_idx = (100 * 1024 * 1024u64) / chunk as u64;
+        let near_idx = (4 * 1024 * 1024u64) / chunk as u64;
+        let indices: Vec<u32> = segs.iter().map(|s| s.chunk_index).collect();
+        assert!(indices.contains(&(far_idx as u32)));
+        assert!(indices.contains(&(near_idx as u32)));
+    }
 }
 
 #[cfg(test)]
@@ -885,8 +1020,7 @@ mod audit_co_tests {
     #[test]
     fn co_1_7_midchunk_flush_does_not_drop_leading_partial_bytes() {
         // 10-byte chunks; write 20 bytes starting at file offset 5. This puts
-        // the buffer mid-chunk (offset_in_chunk = 5) with enough data to emit
-        // chunk 1 as a complete chunk, exercising the mid-chunk branch.
+        // the first touched chunk mid-chunk (offset_in_chunk = 5).
         let chunk = 10;
         let wb = WriteBuffer::new(chunk);
         let pattern: Vec<u8> = (0u8..20).collect(); // distinct bytes 0..19

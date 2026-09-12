@@ -252,6 +252,17 @@ struct OpenFile {
     lease_expires_at_ms: Option<u64>,
     /// P0-1: owner_id used to acquire the lease (for renew/release).
     lease_owner_id: Option<String>,
+    /// CR-1-4 (FUSE-3): true once `flush_segments_to_cluster` has
+    /// successfully committed at least one chunk for this path, ever. Set
+    /// on EVERY `OpenFile` sharing the path (mirrors the F-029 locations
+    /// refresh), so a stale per-fh snapshot can never wrongly report
+    /// "nothing committed yet" for a file another fh already flushed.
+    /// `release()` uses `!committed_any` (never the transient per-flush
+    /// `locations` snapshot) to decide whether a flush failure may
+    /// ghost-unlink the file — a file with any committed chunk must never
+    /// be unlinked, and its drained-but-unsent segments must always be
+    /// restored instead.
+    committed_any: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -524,42 +535,6 @@ impl DtfsFilesystem {
         let locations = self.fetch_file_locations(path).await?;
         let chunk_size = self.resolve_chunk_size(&locations);
 
-        // F-021: when opened with O_APPEND, pre-seed the write buffer with
-        // the file's existing tail chunk so the subsequent write(s) extend
-        // it instead of replacing the chunk wholesale. Without this, the
-        // next flush emits a chunk-0 segment containing ONLY the appended
-        // bytes, which silently truncates the file at the append offset.
-        //
-        // For media-server workloads we expect append to be small and rare;
-        // the memory cost (= size of the last chunk, capped at chunk_size)
-        // is acceptable.
-        if append && !locations.chunks.is_empty() {
-            let last_idx = locations.chunks.len() - 1;
-            let last_chunk = &locations.chunks[last_idx];
-            if !last_chunk.node_addresses.is_empty() {
-                let node = self.select_nearest_node(&last_chunk.node_addresses);
-                match self.client.read_chunk(&node, &last_chunk.chunk_id).await {
-                    Ok(existing) => {
-                        let offset_in_file = (last_idx as u64) * chunk_size;
-                        self.write_buffer.write(path, offset_in_file, &existing);
-                        debug!(
-                            path,
-                            offset_in_file,
-                            len = existing.len(),
-                            "O_APPEND: pre-seeded tail chunk into write buffer"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            path,
-                            error = %e,
-                            "O_APPEND: failed to pre-seed tail chunk; append may truncate"
-                        );
-                    }
-                }
-            }
-        }
-
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
 
         // P0-1: for writable opens, acquire the single-writer lease BEFORE
@@ -601,6 +576,53 @@ impl DtfsFilesystem {
             (None, None, None)
         };
 
+        // F-021 / CR-1-2 (FUSE-7): when opened with O_APPEND, pre-seed the
+        // write buffer with the file's existing tail chunk so the
+        // subsequent write(s) extend it instead of replacing the chunk
+        // wholesale. Without this, the next flush emits a chunk segment
+        // containing ONLY the appended bytes, which silently truncates the
+        // file at the append offset. Runs AFTER the write lease is
+        // acquired, so a losing racer never seeds a buffer it will not be
+        // allowed to write through; resolves the tail chunk by its real
+        // index (`chunk_at(max index)`), never by array position, since the
+        // manager's array is dense while the file's index space may be
+        // sparse (REV-2-1).
+        if append {
+            let max_idx = if locations.indices_are_authoritative() {
+                locations.chunks.iter().filter_map(|c| c.chunk_index).max()
+            } else if locations.chunks.is_empty() {
+                None
+            } else {
+                Some(locations.chunks.len() as u64 - 1)
+            };
+            if let Some(last_idx) = max_idx {
+                if let Some(last_chunk) = locations.chunk_at(last_idx) {
+                    if !last_chunk.node_addresses.is_empty() {
+                        let node = self.select_nearest_node(&last_chunk.node_addresses);
+                        match self.client.read_chunk(&node, &last_chunk.chunk_id).await {
+                            Ok(existing) => {
+                                let offset_in_file = last_idx * chunk_size;
+                                self.write_buffer.write(path, offset_in_file, &existing);
+                                debug!(
+                                    path,
+                                    offset_in_file,
+                                    len = existing.len(),
+                                    "O_APPEND: pre-seeded tail chunk into write buffer"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    path,
+                                    error = %e,
+                                    "O_APPEND: failed to pre-seed tail chunk; append may truncate"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         self.open_files.insert(
             fh,
             OpenFile {
@@ -612,6 +634,7 @@ impl DtfsFilesystem {
                 lease_id,
                 lease_expires_at_ms,
                 lease_owner_id,
+                committed_any: false,
             },
         );
 
@@ -1086,44 +1109,75 @@ impl DtfsFilesystem {
         // earlier content (bash `echo line1 > f; echo line2 >> f`).
         //
         // To prevent that, seed the buffer with the existing chunk content
-        // when we're about to write at a position that isn't already covered
-        // by buffered data.
-        if chunk_size > 0 && effective_offset > 0 {
-            let chunk_idx = effective_offset / chunk_size;
-            let chunk_start = chunk_idx * chunk_size;
-            let need_seed = match self.write_buffer.logical_size(&path) {
-                Some(end_in_buffer) => end_in_buffer <= chunk_start,
-                None => true,
-            };
-            if need_seed {
-                if let Some(loc) = &locations_snapshot {
-                    // REV-2-1 — resolve by index, not by array position:
-                    // seeding the RMW buffer from a NEIGHBOURING chunk would
-                    // write that chunk's bytes back under this chunk's index.
-                    if let Some(chunk) = loc.chunk_at(chunk_idx) {
-                        if !chunk.node_addresses.is_empty() {
-                            let node = self.select_nearest_node(&chunk.node_addresses);
-                            match self.client.read_chunk(&node, &chunk.chunk_id).await {
-                                Ok(existing) if !existing.is_empty() => {
-                                    self.write_buffer
-                                        .write(&path, chunk_start, &existing);
-                                    debug!(
-                                        path = %path,
-                                        chunk_idx,
-                                        len = existing.len(),
-                                        "RMW: seeded existing chunk before partial write"
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(e) => warn!(
-                                    path = %path,
-                                    chunk_idx,
-                                    error = %e,
-                                    "RMW: failed to read existing chunk — partial write may truncate"
-                                ),
-                            }
-                        }
-                    }
+        // for EVERY chunk this write touches (including index 0 — CR-1-2
+        // drops the old `effective_offset > 0` gate, which left chunk 0
+        // truncated on a header-patch write such as `dd conv=notrunc` or
+        // `mkvpropedit`) that isn't already fully covered by buffered data.
+        // A seed read failure is fatal (`?` -> EIO) rather than a warning:
+        // continuing would let `write()` merge the caller's bytes into a
+        // chunk buffer that still doesn't cover the whole chunk, which the
+        // next flush would then commit as the chunk's complete (truncated)
+        // content — silent data loss, not just a truncated append.
+        if chunk_size > 0 && !data.is_empty() {
+            for chunk_idx in
+                chunks_needing_seed(&self.write_buffer, &path, chunk_size, effective_offset, data.len())
+            {
+                // R2 (FUSE-7(c)) — each of these three `continue`s skips
+                // the seed because there is nothing (cheap) to seed FROM:
+                // no cached locations snapshot, no chunk_at() entry for
+                // this index, or no live replica address. That is only
+                // safe when the chunk genuinely doesn't exist on the
+                // cluster yet; if it DOES (this OpenFile's `locations`
+                // snapshot is merely stale/missing), the resulting
+                // still-partial ChunkBuf must never be committed as the
+                // chunk's whole content — `flush_segments_to_cluster`'s
+                // `segments_committable()` guard is the backstop that
+                // catches that case at commit time and returns EIO instead
+                // of silently shifting bytes.
+                let Some(loc) = &locations_snapshot else {
+                    warn!(
+                        path = %path,
+                        chunk_idx,
+                        "RMW: no cached locations snapshot; seed skipped, relying on the commit-time partial-segment guard"
+                    );
+                    continue;
+                };
+                // REV-2-1 — resolve by index, not by array position:
+                // seeding the RMW buffer from a NEIGHBOURING chunk would
+                // write that chunk's bytes back under this chunk's index.
+                let Some(chunk) = loc.chunk_at(chunk_idx) else {
+                    warn!(
+                        path = %path,
+                        chunk_idx,
+                        "RMW: no chunk_at() entry for this index; seed skipped, relying on the commit-time partial-segment guard"
+                    );
+                    continue;
+                };
+                if chunk.node_addresses.is_empty() {
+                    warn!(
+                        path = %path,
+                        chunk_idx,
+                        "RMW: chunk has no live replica address; seed skipped, relying on the commit-time partial-segment guard"
+                    );
+                    continue;
+                }
+                let chunk_start = chunk_idx * chunk_size;
+                let node = self.select_nearest_node(&chunk.node_addresses);
+                let existing = self
+                    .client
+                    .read_chunk(&node, &chunk.chunk_id)
+                    .await
+                    .with_context(|| {
+                        format!("RMW seed read failed for {path} chunk {chunk_idx}")
+                    })?;
+                if !existing.is_empty() {
+                    self.write_buffer.write(&path, chunk_start, &existing);
+                    debug!(
+                        path = %path,
+                        chunk_idx,
+                        len = existing.len(),
+                        "RMW: seeded existing chunk before partial write"
+                    );
                 }
             }
         }
@@ -1142,12 +1196,44 @@ impl DtfsFilesystem {
             let mut at = logical_size;
             while remaining > 0 {
                 let n = remaining.min(FILL_CHUNK);
+                // R1 (FUSE-1 memory half) — a torrent client writing its
+                // first piece at, say, offset 100 MB used to materialise
+                // the WHOLE hole into the write buffer (64 MiB at a time,
+                // uncapped in total) before the caller's actual bytes ever
+                // landed. Check the cap BEFORE adding this slice and, if
+                // it would be met or exceeded, force-drain whatever is
+                // already flushable (every all-zero chunk this hole fill
+                // has already completed) to the cluster right now instead
+                // of accumulating further.
+                if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), n) {
+                    let segs = self.write_buffer.flush_complete(&path);
+                    if !segs.is_empty() {
+                        if let Err(e) = self.flush_segments_to_cluster(&path, &segs).await {
+                            self.write_buffer.restore_segments(&path, &segs);
+                            return Err(e);
+                        }
+                    }
+                }
                 let zeros = vec![0u8; n];
                 self.write_buffer.write(&path, at, &zeros);
                 at += n as u64;
                 remaining -= n;
             }
             debug!(path = %path, hole, "zero-filled sparse gap");
+        }
+
+        // R1 — one more check before merging the caller's own bytes: a hole
+        // fill that landed exactly at the cap boundary, or a write with no
+        // hole at all into an already-near-cap buffer, must not be allowed
+        // to push it further over.
+        if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), data.len()) {
+            let segs = self.write_buffer.flush_complete(&path);
+            if !segs.is_empty() {
+                if let Err(e) = self.flush_segments_to_cluster(&path, &segs).await {
+                    self.write_buffer.restore_segments(&path, &segs);
+                    return Err(e);
+                }
+            }
         }
 
         let written = self.write_buffer.write(&path, effective_offset, data);
@@ -1237,12 +1323,17 @@ impl DtfsFilesystem {
             .get(&fh)
             .context("invalid file handle")?;
 
+        // CR-1-3 (FUSE-2): the kernel issues FUSE flush on every close(2),
+        // including a read-only open. A reader closing a file a writer is
+        // still streaming into must never touch the writer's path-keyed
+        // write buffer — that forced a mid-stream partial commit of the
+        // writer's tail and could drop bytes the writer buffered in the
+        // meantime. Bail out before doing anything for a non-writable fh.
+        if !file.flags.is_writable() {
+            return Ok(());
+        }
+
         let path = file.path.clone();
-        let was_fresh = file
-            .locations
-            .as_ref()
-            .map(|l| l.total_size == 0 && l.chunks.is_empty())
-            .unwrap_or(true);
         // P0-1: capture lease state for renewal-before-flush.
         let lease_id = file.lease_id.clone();
         let lease_expires_at_ms = file.lease_expires_at_ms;
@@ -1294,29 +1385,32 @@ impl DtfsFilesystem {
         let had_segments = !segments.is_empty();
         if had_segments {
             if let Err(e) = self.flush_segments_to_cluster(&path, &segments).await {
-                if was_fresh {
-                    warn!(
-                        path = %path,
-                        error = %e,
-                        "flush of fresh file failed; unlinking ghost entry to surface error",
-                    );
-                    if let Err(unlink_err) = self.client.delete_file(&path).await {
-                        warn!(
-                            path = %path,
-                            error = %unlink_err,
-                            "failed to unlink ghost file after flush failure",
-                        );
-                    }
-                    self.metadata_cache.remove(&path);
-                } else {
-                    // CO-1-8 (a): `flush_all` already drained these bytes out of
-                    // the buffer. The cluster write failed, so put them back —
-                    // otherwise the bytes are gone and a later (retried) fsync
-                    // returns Ok with the data silently lost. The next flush
-                    // re-sends them.
-                    self.write_buffer.restore_segments(&path, &segments);
-                }
+                // CR-1-4 (FUSE-3): ALWAYS restore the drained segments on a
+                // cluster-write failure, regardless of whether this file
+                // has ever committed anything before. `flush_all` already
+                // drained these bytes out of the buffer; without restoring
+                // them here, a file that already had chunks committed
+                // would silently lose its newest (uncommitted) tail on a
+                // transient failure (e.g. an election taking longer than
+                // the manager-walk deadline) — the ghost-unlink decision
+                // belongs to `release()`, not here, and must never run
+                // instead of this restore.
+                self.write_buffer.restore_segments(&path, &segments);
                 return Err(e);
+            }
+            // CR-1-4: mark every OpenFile sharing this path as having
+            // committed at least once, ever — this is what makes
+            // `release()`'s ghost-unlink decision safe. A per-fh snapshot
+            // of `locations` was stale between write-driven batch flushes
+            // (only refreshed by `flush()` itself), so a file that HAD
+            // committed several chunks via mid-stream batch flushes could
+            // still read as "fresh" (was_fresh) at a later `flush()` if a
+            // fresh OpenFile's `locations` snapshot predated those
+            // commits.
+            for mut entry in self.open_files.iter_mut() {
+                if entry.value().path == path {
+                    entry.value_mut().committed_any = true;
+                }
             }
         }
 
@@ -1377,11 +1471,53 @@ impl DtfsFilesystem {
                     );
                 }
             }
-            // Clean up write buffer for this path. On a flush failure the
-            // un-flushed bytes are dropped here (the data is lost on the
-            // cluster too) but the error is propagated below so the caller
-            // sees the failure rather than a silent success.
-            self.write_buffer.remove(&file.path);
+            // CR-1-3 (FUSE-2): only a writable fh may drop the path-keyed
+            // write buffer, and only when no OTHER writable fh on the same
+            // path remains open. Without this, a reader's release() (e.g.
+            // a Plex scanner closing a file a downloader is still
+            // streaming into) drained the writer's buffer — bytes the
+            // writer had buffered, or that CO-1-8's `restore_segments` had
+            // just put back, vanished with no error surfaced to the
+            // writer. `file` (this fh) has already been removed from
+            // `open_files` above, so the scan below only sees OTHER fhs.
+            if file.flags.is_writable() {
+                let remaining: Vec<(String, OpenFlags)> = self
+                    .open_files
+                    .iter()
+                    .map(|e| (e.value().path.clone(), e.value().flags))
+                    .collect();
+                if !other_writer_open(&remaining, &file.path) {
+                    // On a flush failure the un-flushed bytes are dropped
+                    // here (the data is lost on the cluster too) but the
+                    // error is propagated below so the caller sees the
+                    // failure rather than a silent success.
+                    self.write_buffer.remove(&file.path);
+                }
+            }
+
+            // CR-1-4 (FUSE-3): the ghost-unlink now lives here, not in
+            // flush(), and fires ONLY when this path has NEVER committed a
+            // single chunk (`!committed_any` — tracked across every
+            // OpenFile of the path, so it can't go stale between
+            // write()-driven batch flushes). A file with any committed
+            // chunk is never unlinked on a flush failure; `flush()` always
+            // restores the drained segments instead so the next flush can
+            // retry them.
+            if should_ghost_unlink(flush_result.is_err(), file.committed_any) {
+                warn!(
+                    path = %file.path,
+                    "flush of never-committed file failed at release; unlinking ghost entry",
+                );
+                if let Err(unlink_err) = self.client.delete_file(&file.path).await {
+                    warn!(
+                        path = %file.path,
+                        error = %unlink_err,
+                        "failed to unlink ghost file after flush failure",
+                    );
+                }
+                self.metadata_cache.remove(&file.path);
+            }
+
             debug!(path = %file.path, fh, "file released");
         }
 
@@ -1457,6 +1593,7 @@ impl DtfsFilesystem {
                 lease_id: Some(lease_resp.lease_id),
                 lease_expires_at_ms: Some(lease_resp.expires_at_ms),
                 lease_owner_id: Some(owner_id),
+                committed_any: false,
             },
         );
 
@@ -1838,6 +1975,22 @@ impl DtfsFilesystem {
             return Ok(());
         }
 
+        // R2 (FUSE-7(c)) — refuse up front to commit a segment that starts
+        // mid-chunk (`offset_in_chunk > 0`, or equivalently `needs_seed`):
+        // the data node stores whatever bytes it's handed as the chunk's
+        // WHOLE content starting at byte 0, so a segment that only covers
+        // a sub-range would land shifted by `offset_in_chunk` — this is
+        // reachable whenever `write()`'s RMW seed was skipped (no cached
+        // `locations_snapshot`, no `chunk_at(idx)` entry, or an empty
+        // `node_addresses` list), not just on a seed I/O error. Every
+        // caller of this method already `restore_segments`s on `Err`, so
+        // refusing here trades silent corruption for EIO with the bytes
+        // intact for a retry.
+        if let Err(msg) = segments_committable(segments) {
+            warn!(path, error = %msg, "refusing to commit a partial (needs_seed) segment");
+            return Err(anyhow::anyhow!(msg));
+        }
+
         // Determine the volume_id. Check if we have it cached from an
         // open file handle, otherwise default.
         let volume_id = self
@@ -1899,6 +2052,15 @@ impl DtfsFilesystem {
             let mut excluded: Vec<String> = Vec::new();
             let mut reroute = 0usize;
 
+            // CR-1-5 (DATA-5 FUSE half) — hash the segment once and send the
+            // hex digest as the declared `chunk_id` on the wire, so the
+            // data node's PutChunk handler (Group 4's server-side half) can
+            // reject a bit-flip between this buffer and its own
+            // incremental hasher instead of silently committing whatever
+            // bytes arrived under a self-consistent id. Computed once per
+            // segment — identical across every reroute attempt below.
+            let expected_chunk_id = blake3_hex(segment.data.as_ref());
+
             let successes = loop {
                 let mut targets: Vec<String> =
                     Vec::with_capacity(1 + placement.replica_addresses.len());
@@ -1922,9 +2084,10 @@ impl DtfsFilesystem {
                     let volume_id = volume_id.clone();
                     let data = segment.data.clone();
                     let tier = tier.clone();
+                    let expected_chunk_id = expected_chunk_id.clone();
                     async move {
                         let res = client
-                            .write_chunk_bytes(&addr, "", &volume_id, &tier, data)
+                            .write_chunk_bytes(&addr, &expected_chunk_id, &volume_id, &tier, data)
                             .await;
                         (addr, res)
                     }
@@ -1936,6 +2099,31 @@ impl DtfsFilesystem {
                 let mut exhausted_addrs: Vec<String> = Vec::new();
                 for (addr, res) in results {
                     match res {
+                        // CR-1-5 — a data node that returns a DIFFERENT
+                        // chunk_id than what we declared and hashed
+                        // ourselves means the bytes it stored don't match
+                        // what we sent (or it silently ignored our
+                        // declared id). Never commit a location under
+                        // that mismatch: treat it exactly like a failed
+                        // replica so this node is excluded from `successes`
+                        // and the quorum check below can still succeed on
+                        // the other replicas, or fail the whole segment.
+                        Ok(put_resp) if put_resp.chunk_id != expected_chunk_id => {
+                            warn!(
+                                chunk_index = segment.chunk_index,
+                                node = %addr,
+                                expected = %expected_chunk_id,
+                                got = %put_resp.chunk_id,
+                                "write_chunk returned a mismatched chunk_id; not committing this replica"
+                            );
+                            last_err = Some(anyhow::anyhow!(
+                                "chunk_id mismatch for chunk_index {} on {}: expected {}, got {}",
+                                segment.chunk_index,
+                                addr,
+                                expected_chunk_id,
+                                put_resp.chunk_id
+                            ));
+                        }
                         Ok(put_resp) => successes.push((addr, put_resp)),
                         Err(e) => {
                             if is_resource_exhausted(&e) {
@@ -2117,6 +2305,89 @@ fn effective_read_len(file_size: u64, offset: u64, size: u32) -> u32 {
     size.min((file_size - offset).min(u32::MAX as u64) as u32)
 }
 
+/// R1 (FUSE-1 memory half) — true when a buffer already holding `dirty`
+/// bytes would meet or exceed `writebuf::DIRTY_BYTES_CAP` after `incoming`
+/// more bytes are added. Extracted as a pure predicate so the cap check in
+/// `write()`'s hole-fill loop (and the one guarding the caller's own
+/// bytes) is directly testable without a live `WriteBuffer`/network call.
+fn dirty_cap_exceeded(dirty: usize, incoming: usize) -> bool {
+    dirty.saturating_add(incoming) >= crate::writebuf::DIRTY_BYTES_CAP
+}
+
+/// CR-1-2 (FUSE-7) — chunk indices a write of `len` bytes at `offset`
+/// touches that are NOT already fully covered by buffered data, and
+/// therefore need an RMW seed read before the write proceeds. Pure w.r.t.
+/// the network: the caller still needs the manager's existing chunk
+/// metadata to know whether there is anything to seed FROM (a brand-new
+/// chunk the cluster has never seen has nothing to seed).
+///
+/// Deliberately includes chunk index 0 — the pre-CR-1-2 code gated this on
+/// `effective_offset > 0`, which left chunk 0 unseeded on a header-patch
+/// write (`dd conv=notrunc`, `mkvpropedit`) starting at offset 0.
+fn chunks_needing_seed(
+    write_buffer: &WriteBuffer,
+    path: &str,
+    chunk_size: u64,
+    offset: u64,
+    len: usize,
+) -> Vec<u64> {
+    if chunk_size == 0 || len == 0 {
+        return Vec::new();
+    }
+    let start_chunk = offset / chunk_size;
+    let end_chunk = (offset + len as u64 - 1) / chunk_size;
+    (start_chunk..=end_chunk)
+        .filter(|&idx| !write_buffer.chunk_is_fully_buffered(path, idx as u32))
+        .collect()
+}
+
+/// R2 (FUSE-7(c)) — refuse to commit any segment that starts mid-chunk.
+/// The data node stores `PutChunkRequest` bytes as the chunk's WHOLE
+/// content starting at offset 0, so a segment whose `offset_in_chunk > 0`
+/// (equivalently `needs_seed`) would be stored shifted, silently
+/// corrupting (truncating/offsetting) whatever the cluster already had
+/// for that chunk. Returns the first offending chunk's error message.
+fn segments_committable(segments: &[crate::writebuf::ChunkSegment]) -> Result<(), String> {
+    for seg in segments {
+        if seg.offset_in_chunk > 0 {
+            return Err(format!(
+                "segment for chunk {} starts at offset {} — cannot commit a partial chunk without seeding",
+                seg.chunk_index, seg.offset_in_chunk
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// CR-1-5 (DATA-5 FUSE half) — hex BLAKE3 digest of `data`, in the same
+/// form the data node's own incremental hasher produces as
+/// `ChunkMeta.checksum` / the committed `ChunkId`. Extracted so the exact
+/// hashing code `flush_segments_to_cluster` sends on the wire as the
+/// declared `chunk_id` is directly unit-testable.
+fn blake3_hex(data: &[u8]) -> String {
+    dtfs_common::types::ChunkId::from_bytes(dtfs_common::checksum::compute(data)).as_hex()
+}
+
+/// CR-1-4 (FUSE-3) — should `release()` ghost-unlink the path after a
+/// failed flush? Only when the flush actually failed AND the path has
+/// NEVER committed a single chunk. A file with any committed chunk must
+/// never be unlinked; `flush()` always restores its drained segments on
+/// failure instead, regardless of this decision.
+fn should_ghost_unlink(flush_failed: bool, committed_any: bool) -> bool {
+    flush_failed && !committed_any
+}
+
+/// CR-1-3 (FUSE-2) — true iff `remaining` (the OTHER open file handles,
+/// i.e. with the fh being released already excluded) contains a writable
+/// handle on `path`. Extracted so `release()`'s "who owns the write
+/// buffer" decision is testable without a live `DtfsFilesystem`/
+/// `DtfsClient`.
+fn other_writer_open(remaining: &[(String, OpenFlags)], path: &str) -> bool {
+    remaining
+        .iter()
+        .any(|(p, flags)| p == path && flags.is_writable())
+}
+
 /// Bug BU-2 — did this write error originate from a data-node out-of-space
 /// (ENOSPC)? `client::write_chunk_bytes` surfaces the gRPC status code in
 /// its error message (`code=ResourceExhausted`) after exhausting the Bug G
@@ -2125,6 +2396,205 @@ fn effective_read_len(file_size: u64, offset: u64, size: u32) -> u32 {
 /// independent of the error's concrete type.
 fn is_resource_exhausted(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("ResourceExhausted")
+}
+
+#[cfg(test)]
+mod r1_dirty_cap_tests {
+    use super::dirty_cap_exceeded;
+    use crate::writebuf::DIRTY_BYTES_CAP;
+
+    #[test]
+    fn under_cap_is_not_exceeded() {
+        assert!(!dirty_cap_exceeded(0, 100));
+        assert!(!dirty_cap_exceeded(DIRTY_BYTES_CAP - 1024, 100));
+    }
+
+    #[test]
+    fn meeting_or_crossing_cap_is_exceeded() {
+        assert!(dirty_cap_exceeded(DIRTY_BYTES_CAP, 1));
+        assert!(dirty_cap_exceeded(DIRTY_BYTES_CAP - 10, 10), "meeting the cap exactly counts");
+        assert!(dirty_cap_exceeded(DIRTY_BYTES_CAP, 0), "already at the cap with nothing incoming");
+    }
+
+    #[test]
+    fn saturates_instead_of_overflowing() {
+        assert!(dirty_cap_exceeded(usize::MAX, usize::MAX));
+    }
+}
+
+#[cfg(test)]
+mod cr_1_2_seed_tests {
+    use super::{chunks_needing_seed, WriteBuffer};
+
+    // (a) CR-1-2 drops the old `effective_offset > 0` gate: a write at
+    // offset 0 of an as-yet-unbuffered chunk must still be flagged for
+    // seeding, not skipped just because it starts at the beginning.
+    #[test]
+    fn offset_zero_is_flagged_for_seeding() {
+        let wb = WriteBuffer::new(4096);
+        let touched = chunks_needing_seed(&wb, "/f", 4096, 0, 100);
+        assert_eq!(touched, vec![0], "chunk 0 must be seeded, not skipped");
+    }
+
+    // (b) a write straddling two chunks must flag BOTH for seeding when
+    // neither is already fully buffered.
+    #[test]
+    fn straddling_write_flags_both_chunks() {
+        let wb = WriteBuffer::new(4096);
+        let touched = chunks_needing_seed(&wb, "/f", 4096, 4096 - 50, 100);
+        assert_eq!(touched, vec![0, 1], "both straddled chunks need seeding");
+    }
+
+    // A chunk that is already fully buffered (e.g. a previous seed + write
+    // already completed it) must NOT be flagged again.
+    #[test]
+    fn fully_buffered_chunk_is_not_flagged() {
+        let wb = WriteBuffer::new(4096);
+        wb.write("/f", 0, &vec![0u8; 4096]); // fully covers chunk 0
+        let touched = chunks_needing_seed(&wb, "/f", 4096, 0, 100);
+        assert!(touched.is_empty(), "already-complete chunk needs no seed");
+    }
+
+    // A write spanning three chunks where only the middle one is already
+    // resident-and-complete must flag exactly the other two.
+    #[test]
+    fn only_incomplete_chunks_are_flagged() {
+        let wb = WriteBuffer::new(4096);
+        wb.write("/f", 4096, &vec![0u8; 4096]); // chunk 1 fully buffered
+        let touched = chunks_needing_seed(&wb, "/f", 4096, 0, 4096 * 3);
+        assert_eq!(touched, vec![0, 2]);
+    }
+}
+
+#[cfg(test)]
+mod r2_segments_committable_tests {
+    use super::segments_committable;
+    use crate::writebuf::ChunkSegment;
+
+    fn seg(chunk_index: u32, offset_in_chunk: usize, needs_seed: bool) -> ChunkSegment {
+        ChunkSegment {
+            chunk_index,
+            data: bytes::Bytes::from_static(b"x"),
+            offset_in_chunk,
+            needs_seed,
+        }
+    }
+
+    #[test]
+    fn all_aligned_segments_are_committable() {
+        let segs = vec![seg(0, 0, false), seg(1, 0, false), seg(2, 0, false)];
+        assert!(segments_committable(&segs).is_ok());
+    }
+
+    #[test]
+    fn a_single_mid_chunk_segment_is_refused() {
+        let segs = vec![seg(0, 0, false), seg(1, 4096, true), seg(2, 0, false)];
+        let err = segments_committable(&segs).unwrap_err();
+        assert!(err.contains("chunk 1"), "error must name the offending chunk: {err}");
+        assert!(err.contains("4096"));
+    }
+
+    #[test]
+    fn empty_segments_are_committable() {
+        assert!(segments_committable(&[]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod cr_1_5_chunk_id_tests {
+    use super::blake3_hex;
+
+    #[test]
+    fn is_deterministic_and_64_hex_chars() {
+        let a = blake3_hex(b"hello world");
+        let b = blake3_hex(b"hello world");
+        assert_eq!(a, b, "same bytes must hash to the same id every time");
+        assert_eq!(a.len(), 64, "BLAKE3 hex digest is 64 chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn differs_for_different_content() {
+        assert_ne!(blake3_hex(b"hello world"), blake3_hex(b"hello world!"));
+    }
+
+    // The core CR-1-5 contract: a data node that returns a chunk_id other
+    // than the one this segment actually hashes to must be rejected — the
+    // comparison `write_chunk_bytes` result feeds is exactly `blake3_hex(data)
+    // != put_resp.chunk_id`.
+    #[test]
+    fn mismatch_against_declared_id_is_detectable() {
+        let data = b"segment bytes";
+        let declared = blake3_hex(data);
+        let node_returned = blake3_hex(b"different bytes entirely");
+        assert_ne!(
+            declared, node_returned,
+            "a tampered/mismatched response must not equal what we declared and hashed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cr_1_4_ghost_unlink_tests {
+    use super::should_ghost_unlink;
+
+    // A file that already committed at least one chunk must NEVER be
+    // ghost-unlinked, no matter how the flush fails — this is the FUSE-3
+    // regression: a 20 MB file with 4 chunks already committed via
+    // write()-driven batch flushes was unlinked (tail dropped) because a
+    // stale per-fh `was_fresh` snapshot said "fresh".
+    #[test]
+    fn never_unlinks_a_file_with_any_committed_chunk() {
+        assert!(!should_ghost_unlink(true, true), "committed_any must veto the unlink");
+        assert!(!should_ghost_unlink(false, true));
+    }
+
+    // A brand-new file (create()'d, never committed) whose only flush
+    // attempt fails is the one case the ghost-unlink exists for.
+    #[test]
+    fn unlinks_only_a_never_committed_file_on_flush_failure() {
+        assert!(should_ghost_unlink(true, false));
+        assert!(!should_ghost_unlink(false, false), "a successful flush is never unlinked");
+    }
+}
+
+#[cfg(test)]
+mod cr_1_3_flush_release_gating_tests {
+    use super::{other_writer_open, OpenFlags};
+
+    // open RO + RW on the same path: releasing the RO fh must NOT drop the
+    // write buffer while the RW fh (a writer still mid-stream) is open.
+    #[test]
+    fn ro_release_must_not_win_when_a_writer_is_still_open() {
+        let remaining_after_ro_removed =
+            vec![("/f".to_string(), OpenFlags::ReadWrite)];
+        assert!(
+            other_writer_open(&remaining_after_ro_removed, "/f"),
+            "the RW fh is still open, so the RO release must not drop the buffer"
+        );
+    }
+
+    // Releasing the RW fh (the last writer) with no other writable fh left
+    // open must clear the way to drop the write buffer.
+    #[test]
+    fn rw_release_with_no_other_writer_frees_the_buffer() {
+        let remaining_after_rw_removed: Vec<(String, OpenFlags)> = vec![];
+        assert!(!other_writer_open(&remaining_after_rw_removed, "/f"));
+
+        // A remaining READ-ONLY fh on the same path must not count as a
+        // writer either.
+        let remaining_with_only_a_reader =
+            vec![("/f".to_string(), OpenFlags::ReadOnly)];
+        assert!(!other_writer_open(&remaining_with_only_a_reader, "/f"));
+    }
+
+    // A writable fh on a DIFFERENT path must never block this path's
+    // buffer from being dropped.
+    #[test]
+    fn other_path_writer_is_irrelevant() {
+        let remaining = vec![("/other".to_string(), OpenFlags::ReadWrite)];
+        assert!(!other_writer_open(&remaining, "/f"));
+    }
 }
 
 #[cfg(test)]
