@@ -789,6 +789,12 @@ pub struct ScrubResult {
     /// snapshots / heartbeat payloads load.
     #[serde(default)]
     pub corrupt_chunk_ids: Vec<String>,
+    /// CR-4-1 (DATA-1) — chunks whose `.dat` hashed correctly to the
+    /// chunk id but whose `.meta` was missing or unparseable; the scrub
+    /// rewrote `.meta` from the verified `.dat` instead of quarantining
+    /// them. `#[serde(default)]` so older payloads still deserialize.
+    #[serde(default)]
+    pub chunks_meta_repaired: u64,
 }
 
 /// Migration task status.

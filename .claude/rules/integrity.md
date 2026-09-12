@@ -16,10 +16,29 @@ long form of AGENTS.md A.3.3/A.6, loaded only for the crates it governs.
 2. On-disk `.dat` written to `tmp/<uuid>.dat.tmp`, atomic-renamed to
    `chunks/<aa>/<bb>/<id>.dat` only after `sync_all()`.
 3. `.meta` JSON written with `sync_all()` before the put's WAL entry is
-   cleared.
+   cleared. **CR-4-2** — the write itself is tmp+rename (`write_meta_
+   atomic`: tmp file in the disk's `tmp/` dir, `sync_all`, rename over
+   the final `.meta` path, fsync the directory), never a direct
+   `File::create` at the final path, so a crash mid-write can never leave
+   a torn (partial/0-byte) `.meta` where readers look for it.
+   `recover_from_wal`'s `PutChunk` arm treats a present-but-unparseable
+   `.meta` the same as a missing one (CO-1-4b) and rolls the half-
+   committed chunk back.
 4. Counter updates (`bytes_stored`, `chunk_count`) happen after meta is
    durable, so a crash mid-put leaves a reconcilable tmp+wal residue.
-5. `commit_chunk_from_tmp` removes the tmp on any error path.
+5. `commit_chunk_from_tmp` removes the tmp on any error path. **CR-4-3**
+   — a failure AFTER the `.dat` rename (typically the `.meta` write) is
+   cleaned up by `cleanup_after_dat_committed`, which removes the `.dat`,
+   any `.meta`, and the WAL entry before returning the error, so a
+   committed `.dat` never survives without its `.meta` companion.
+   **CR-4-4** — `commit_chunk_from_tmp_inner` and
+   `delete_chunk_idempotent_on_disk` each hold a 256-way striped
+   per-chunk `tokio::sync::Mutex<()>` (indexed by the id's first byte)
+   for their whole operation, so a concurrent put and delete of the SAME
+   chunk id can never interleave into a torn state; the WAL filename is
+   op-keyed (`<id>.put.wal.json` / `<id>.delete.wal.json`, plus the
+   legacy `<id>.wal.json` still replayed) so they never contend over one
+   WAL file either.
 6. Migration marks a task Done only after `VerifyChunk` on the target
    succeeds; the scheduler never removes the source (only tier-demote /
    unlink delete a chunk). **CO-1-3** — every de-location-with-byte-delete
@@ -36,7 +55,18 @@ long form of AGENTS.md A.3.3/A.6, loaded only for the crates it governs.
    stranded anchor can result from a crash/RPC failure in the window.
 7. Scrub BLAKE3s the disk file vs `chunk.meta.checksum`; mismatch →
    `chunks_corrupt` + `ScrubCorruption` alert; auto-repair via
-   `replicate_chunk`.
+   `replicate_chunk`. **CR-4-1** — before recording a `meta_read` /
+   `meta_parse` / missing-`.meta` fault as corrupt, the scrub re-hashes
+   the already-stat'd `.dat` and, on a match against the id encoded in
+   the filename, rewrites `.meta` from the verified `.dat`
+   (`try_repair_meta_from_dat` + `write_meta_atomic`) and counts the
+   chunk healthy (`ScrubResult.chunks_meta_repaired`) instead of
+   quarantining it — only a digest mismatch or an unreadable `.dat`
+   still quarantines. `quarantine_chunk_on_disk` itself now RENAMES the
+   `.dat` to `.dtfs/quarantine/<id>.dat.bad` (overwriting an earlier
+   quarantine of the same id) instead of `remove_file`ing it, so a
+   genuinely corrupt chunk's bytes are preserved for forensics rather
+   than destroyed.
 8. Unlink removes manager-side `FileMetadata` first, then GC deletes
    chunks async; a crash between leaves orphans (reclaimed by scrub),
    never dangling pointers. **Bug CB** — the orphan reaper measures its
