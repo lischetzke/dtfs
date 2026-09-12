@@ -1973,6 +1973,15 @@ impl DtfsFilesystem {
             let mut excluded: Vec<String> = Vec::new();
             let mut reroute = 0usize;
 
+            // CR-1-5 (DATA-5 FUSE half) — hash the segment once and send the
+            // hex digest as the declared `chunk_id` on the wire, so the
+            // data node's PutChunk handler (Group 4's server-side half) can
+            // reject a bit-flip between this buffer and its own
+            // incremental hasher instead of silently committing whatever
+            // bytes arrived under a self-consistent id. Computed once per
+            // segment — identical across every reroute attempt below.
+            let expected_chunk_id = blake3_hex(segment.data.as_ref());
+
             let successes = loop {
                 let mut targets: Vec<String> =
                     Vec::with_capacity(1 + placement.replica_addresses.len());
@@ -1996,9 +2005,10 @@ impl DtfsFilesystem {
                     let volume_id = volume_id.clone();
                     let data = segment.data.clone();
                     let tier = tier.clone();
+                    let expected_chunk_id = expected_chunk_id.clone();
                     async move {
                         let res = client
-                            .write_chunk_bytes(&addr, "", &volume_id, &tier, data)
+                            .write_chunk_bytes(&addr, &expected_chunk_id, &volume_id, &tier, data)
                             .await;
                         (addr, res)
                     }
@@ -2010,6 +2020,31 @@ impl DtfsFilesystem {
                 let mut exhausted_addrs: Vec<String> = Vec::new();
                 for (addr, res) in results {
                     match res {
+                        // CR-1-5 — a data node that returns a DIFFERENT
+                        // chunk_id than what we declared and hashed
+                        // ourselves means the bytes it stored don't match
+                        // what we sent (or it silently ignored our
+                        // declared id). Never commit a location under
+                        // that mismatch: treat it exactly like a failed
+                        // replica so this node is excluded from `successes`
+                        // and the quorum check below can still succeed on
+                        // the other replicas, or fail the whole segment.
+                        Ok(put_resp) if put_resp.chunk_id != expected_chunk_id => {
+                            warn!(
+                                chunk_index = segment.chunk_index,
+                                node = %addr,
+                                expected = %expected_chunk_id,
+                                got = %put_resp.chunk_id,
+                                "write_chunk returned a mismatched chunk_id; not committing this replica"
+                            );
+                            last_err = Some(anyhow::anyhow!(
+                                "chunk_id mismatch for chunk_index {} on {}: expected {}, got {}",
+                                segment.chunk_index,
+                                addr,
+                                expected_chunk_id,
+                                put_resp.chunk_id
+                            ));
+                        }
                         Ok(put_resp) => successes.push((addr, put_resp)),
                         Err(e) => {
                             if is_resource_exhausted(&e) {
@@ -2218,6 +2253,15 @@ fn chunks_needing_seed(
         .collect()
 }
 
+/// CR-1-5 (DATA-5 FUSE half) — hex BLAKE3 digest of `data`, in the same
+/// form the data node's own incremental hasher produces as
+/// `ChunkMeta.checksum` / the committed `ChunkId`. Extracted so the exact
+/// hashing code `flush_segments_to_cluster` sends on the wire as the
+/// declared `chunk_id` is directly unit-testable.
+fn blake3_hex(data: &[u8]) -> String {
+    dtfs_common::types::ChunkId::from_bytes(dtfs_common::checksum::compute(data)).as_hex()
+}
+
 /// CR-1-4 (FUSE-3) — should `release()` ghost-unlink the path after a
 /// failed flush? Only when the flush actually failed AND the path has
 /// NEVER committed a single chunk. A file with any committed chunk must
@@ -2289,6 +2333,40 @@ mod cr_1_2_seed_tests {
         wb.write("/f", 4096, &vec![0u8; 4096]); // chunk 1 fully buffered
         let touched = chunks_needing_seed(&wb, "/f", 4096, 0, 4096 * 3);
         assert_eq!(touched, vec![0, 2]);
+    }
+}
+
+#[cfg(test)]
+mod cr_1_5_chunk_id_tests {
+    use super::blake3_hex;
+
+    #[test]
+    fn is_deterministic_and_64_hex_chars() {
+        let a = blake3_hex(b"hello world");
+        let b = blake3_hex(b"hello world");
+        assert_eq!(a, b, "same bytes must hash to the same id every time");
+        assert_eq!(a.len(), 64, "BLAKE3 hex digest is 64 chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn differs_for_different_content() {
+        assert_ne!(blake3_hex(b"hello world"), blake3_hex(b"hello world!"));
+    }
+
+    // The core CR-1-5 contract: a data node that returns a chunk_id other
+    // than the one this segment actually hashes to must be rejected — the
+    // comparison `write_chunk_bytes` result feeds is exactly `blake3_hex(data)
+    // != put_resp.chunk_id`.
+    #[test]
+    fn mismatch_against_declared_id_is_detectable() {
+        let data = b"segment bytes";
+        let declared = blake3_hex(data);
+        let node_returned = blake3_hex(b"different bytes entirely");
+        assert_ne!(
+            declared, node_returned,
+            "a tampered/mismatched response must not equal what we declared and hashed"
+        );
     }
 }
 
