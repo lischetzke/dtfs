@@ -323,6 +323,11 @@ of all roles' caps must stay under host RAM.
 | `shed_threshold_pct` | `memory.shed_threshold_pct` | `u8` | `92` | Reserved for the higher rung; the manager has no request-shed today, so ticks stay paused. |
 | `sample_interval_secs` | `memory.sample_interval_secs` | `u64` | `5` | RSS sampling cadence. |
 
+CR-6-1: `dtfs-manager` calls `MemoryConfig::validate()` right after config
+load and exits non-zero if `warn_threshold_pct >= shed_threshold_pct` or
+either is `> 100` -- an inverted/degenerate ladder used to flap Warn/Shed on
+every sample instead of being rejected at startup.
+
 ---
 
 ## `[updater]` -- Self-Updater Source
@@ -376,6 +381,11 @@ overriding their local `[scrub]` fallback.
 | `[placement]` | `min_free_bytes` | `1073741824` (1 GiB) | Per-disk free-space reserve (Bug BU). |
 | | `min_free_pct` | `5.0` | Reserve = `max(min_free_bytes, total * pct%)`. |
 | | `allow_capacity_spill` | `true` | Spill a write to the fastest tier with room when the mandated tier is full, instead of failing it (Bug BX; the anchor copy is never spilled). `false` = fail-loud. |
+
+CR-6-1 (CMN-8): `dtfs-manager` calls `PlacementConfig::validate()` at
+startup and exits non-zero when `min_free_pct` is outside `0.0..=100.0`
+(or NaN) -- a value `>100` excludes every disk from the placement ring,
+and a negative/NaN value silently disables the reserve.
 
 ---
 

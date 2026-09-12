@@ -225,6 +225,10 @@ roles' caps must stay under host RAM.
 | `shed_threshold_pct` | `memory.shed_threshold_pct` | `u8` | `92` | Above this, new `put_chunk` requests get `RESOURCE_EXHAUSTED` (clients retry with backoff) instead of risking an OOM kill. |
 | `sample_interval_secs` | `memory.sample_interval_secs` | `u64` | `5` | RSS sampling cadence. |
 
+CR-6-1: `dtfs-data` calls `MemoryConfig::validate()` right after config
+load and exits non-zero if `warn_threshold_pct >= shed_threshold_pct` or
+either is `> 100`.
+
 ---
 
 ## `[placement]` -- Free-Space Headroom

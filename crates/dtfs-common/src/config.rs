@@ -97,6 +97,21 @@ impl PlacementConfig {
         let free = total_bytes.saturating_sub(used_bytes);
         free > self.headroom_bytes(total_bytes)
     }
+
+    /// CMN-8: `min_free_pct` outside `0.0..=100.0` (or NaN) silently
+    /// breaks placement — `>100` makes `headroom_bytes` exceed the disk's
+    /// total size (every disk excluded from the ring); negative/NaN
+    /// saturate to 0 in `headroom_bytes`' `as u64` cast, disabling the
+    /// reserve entirely. Called from `main.rs` right after config load.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(0.0..=100.0).contains(&self.min_free_pct) {
+            return Err(format!(
+                "[placement] min_free_pct = {} must be within 0.0..=100.0",
+                self.min_free_pct
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Bug AH — audit log replication configuration.
@@ -1456,6 +1471,31 @@ mod tests {
             ..Default::default()
         };
         assert!(over.validate().is_err());
+    }
+
+    /// CR-6-1 (CMN-8) — `PlacementConfig::validate` rejects a `min_free_pct`
+    /// outside `0.0..=100.0` and accepts the compiled-in default.
+    #[test]
+    fn cr_6_1_placement_config_validate() {
+        assert!(PlacementConfig::default().validate().is_ok());
+
+        let too_high = PlacementConfig {
+            min_free_pct: 150.0,
+            ..Default::default()
+        };
+        assert!(too_high.validate().is_err());
+
+        let negative = PlacementConfig {
+            min_free_pct: -1.0,
+            ..Default::default()
+        };
+        assert!(negative.validate().is_err());
+
+        let nan = PlacementConfig {
+            min_free_pct: f64::NAN,
+            ..Default::default()
+        };
+        assert!(nan.validate().is_err());
     }
 
     // Bug BU — headroom classification at the threshold boundary.

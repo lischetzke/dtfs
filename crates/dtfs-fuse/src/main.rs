@@ -59,6 +59,13 @@ async fn main() -> Result<()> {
     let fuse_config: FuseConfig = config::load_config(Path::new(&args.config))
         .with_context(|| format!("failed to load config from {}", args.config))?;
 
+    // CR-6-1 (CMN-1) — reject an unusable memory ladder at startup
+    // instead of flapping Warn/Shed on every sample.
+    fuse_config
+        .memory
+        .validate()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let mountpoint = args
         .mountpoint
         .clone()
