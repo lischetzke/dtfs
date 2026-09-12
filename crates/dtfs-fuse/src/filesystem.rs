@@ -1122,12 +1122,43 @@ impl DtfsFilesystem {
             for chunk_idx in
                 chunks_needing_seed(&self.write_buffer, &path, chunk_size, effective_offset, data.len())
             {
-                let Some(loc) = &locations_snapshot else { continue };
+                // R2 (FUSE-7(c)) — each of these three `continue`s skips
+                // the seed because there is nothing (cheap) to seed FROM:
+                // no cached locations snapshot, no chunk_at() entry for
+                // this index, or no live replica address. That is only
+                // safe when the chunk genuinely doesn't exist on the
+                // cluster yet; if it DOES (this OpenFile's `locations`
+                // snapshot is merely stale/missing), the resulting
+                // still-partial ChunkBuf must never be committed as the
+                // chunk's whole content — `flush_segments_to_cluster`'s
+                // `segments_committable()` guard is the backstop that
+                // catches that case at commit time and returns EIO instead
+                // of silently shifting bytes.
+                let Some(loc) = &locations_snapshot else {
+                    warn!(
+                        path = %path,
+                        chunk_idx,
+                        "RMW: no cached locations snapshot; seed skipped, relying on the commit-time partial-segment guard"
+                    );
+                    continue;
+                };
                 // REV-2-1 — resolve by index, not by array position:
                 // seeding the RMW buffer from a NEIGHBOURING chunk would
                 // write that chunk's bytes back under this chunk's index.
-                let Some(chunk) = loc.chunk_at(chunk_idx) else { continue };
+                let Some(chunk) = loc.chunk_at(chunk_idx) else {
+                    warn!(
+                        path = %path,
+                        chunk_idx,
+                        "RMW: no chunk_at() entry for this index; seed skipped, relying on the commit-time partial-segment guard"
+                    );
+                    continue;
+                };
                 if chunk.node_addresses.is_empty() {
+                    warn!(
+                        path = %path,
+                        chunk_idx,
+                        "RMW: chunk has no live replica address; seed skipped, relying on the commit-time partial-segment guard"
+                    );
                     continue;
                 }
                 let chunk_start = chunk_idx * chunk_size;
@@ -1944,6 +1975,22 @@ impl DtfsFilesystem {
             return Ok(());
         }
 
+        // R2 (FUSE-7(c)) — refuse up front to commit a segment that starts
+        // mid-chunk (`offset_in_chunk > 0`, or equivalently `needs_seed`):
+        // the data node stores whatever bytes it's handed as the chunk's
+        // WHOLE content starting at byte 0, so a segment that only covers
+        // a sub-range would land shifted by `offset_in_chunk` — this is
+        // reachable whenever `write()`'s RMW seed was skipped (no cached
+        // `locations_snapshot`, no `chunk_at(idx)` entry, or an empty
+        // `node_addresses` list), not just on a seed I/O error. Every
+        // caller of this method already `restore_segments`s on `Err`, so
+        // refusing here trades silent corruption for EIO with the bytes
+        // intact for a retry.
+        if let Err(msg) = segments_committable(segments) {
+            warn!(path, error = %msg, "refusing to commit a partial (needs_seed) segment");
+            return Err(anyhow::anyhow!(msg));
+        }
+
         // Determine the volume_id. Check if we have it cached from an
         // open file handle, otherwise default.
         let volume_id = self
@@ -2294,6 +2341,24 @@ fn chunks_needing_seed(
         .collect()
 }
 
+/// R2 (FUSE-7(c)) — refuse to commit any segment that starts mid-chunk.
+/// The data node stores `PutChunkRequest` bytes as the chunk's WHOLE
+/// content starting at offset 0, so a segment whose `offset_in_chunk > 0`
+/// (equivalently `needs_seed`) would be stored shifted, silently
+/// corrupting (truncating/offsetting) whatever the cluster already had
+/// for that chunk. Returns the first offending chunk's error message.
+fn segments_committable(segments: &[crate::writebuf::ChunkSegment]) -> Result<(), String> {
+    for seg in segments {
+        if seg.offset_in_chunk > 0 {
+            return Err(format!(
+                "segment for chunk {} starts at offset {} — cannot commit a partial chunk without seeding",
+                seg.chunk_index, seg.offset_in_chunk
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// CR-1-5 (DATA-5 FUSE half) — hex BLAKE3 digest of `data`, in the same
 /// form the data node's own incremental hasher produces as
 /// `ChunkMeta.checksum` / the committed `ChunkId`. Extracted so the exact
@@ -2398,6 +2463,40 @@ mod cr_1_2_seed_tests {
         wb.write("/f", 4096, &vec![0u8; 4096]); // chunk 1 fully buffered
         let touched = chunks_needing_seed(&wb, "/f", 4096, 0, 4096 * 3);
         assert_eq!(touched, vec![0, 2]);
+    }
+}
+
+#[cfg(test)]
+mod r2_segments_committable_tests {
+    use super::segments_committable;
+    use crate::writebuf::ChunkSegment;
+
+    fn seg(chunk_index: u32, offset_in_chunk: usize, needs_seed: bool) -> ChunkSegment {
+        ChunkSegment {
+            chunk_index,
+            data: bytes::Bytes::from_static(b"x"),
+            offset_in_chunk,
+            needs_seed,
+        }
+    }
+
+    #[test]
+    fn all_aligned_segments_are_committable() {
+        let segs = vec![seg(0, 0, false), seg(1, 0, false), seg(2, 0, false)];
+        assert!(segments_committable(&segs).is_ok());
+    }
+
+    #[test]
+    fn a_single_mid_chunk_segment_is_refused() {
+        let segs = vec![seg(0, 0, false), seg(1, 4096, true), seg(2, 0, false)];
+        let err = segments_committable(&segs).unwrap_err();
+        assert!(err.contains("chunk 1"), "error must name the offending chunk: {err}");
+        assert!(err.contains("4096"));
+    }
+
+    #[test]
+    fn empty_segments_are_committable() {
+        assert!(segments_committable(&[]).is_ok());
     }
 }
 

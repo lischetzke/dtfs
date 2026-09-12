@@ -349,3 +349,20 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   runs immediately; a failure there `restore_segments`s and returns Err
   (same CO-1-8(a) contract as the batch flush path). AGENTS.md A.3.2
   documents the cap next to the WI-01/H1 sentence.
+
+- **R2 (PR #105 review, FUSE-7(c) still reachable)** 2026-09-12,
+  `cargo test -p dtfs-fuse --release`: 95 -> 98 passed (3 new,
+  `filesystem::r2_segments_committable_tests::*`), 0 failed.
+  `flush_segments_to_cluster` now refuses (before `allocate_chunks_with_hint`)
+  to commit any segment with `offset_in_chunk > 0` via the extracted pure
+  `segments_committable()` helper, returning an `Err` naming the
+  offending chunk; every caller already `restore_segments`s on `Err`, so
+  the bytes survive for a retry instead of being stored shifted. Also
+  added a `warn!` at each of the three `continue` sites in `write()`'s
+  RMW seed loop (no cached `locations_snapshot`, no `chunk_at(idx)`
+  entry, empty `node_addresses`) noting the seed was skipped and that the
+  commit-time guard above is the backstop — left as a `warn!` rather than
+  a hard error there because `write()` cannot cheaply determine whether
+  the chunk genuinely doesn't exist yet (legitimate) vs. the snapshot
+  being stale (needs the guard), so the decision is deferred to
+  `segments_committable()` at commit time, per the review note.
