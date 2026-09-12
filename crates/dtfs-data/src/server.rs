@@ -959,7 +959,18 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<RecordCacheHitRequest>,
     ) -> Result<Response<RecordCacheHitResponse>, Status> {
+        // DATA-11 — this was the last mutating data-plane RPC not gated
+        // by LIS-19/55/83: any caller could inflate a chunk's read
+        // counter (and so its tiering promotion score) without the
+        // cluster secret. Bind MAC to chunk_id, same as GetChunk.
+        let md = request.metadata().clone();
         let req = request.into_inner();
+        require_data_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "RecordCacheHit",
+            &req.chunk_id,
+            &md,
+        )?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1484,6 +1495,24 @@ max_io_percent = 10
             }))
             .await
             .expect_err("unauthenticated VerifyChunk must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    // DATA-11 — unauthenticated RecordCacheHit must be PermissionDenied
+    // (unauthenticated callers must not be able to inflate a chunk's
+    // read counter / tiering promotion score).
+    #[tokio::test]
+    async fn record_cache_hit_rejects_missing_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let err = svc
+            .record_cache_hit(Request::new(RecordCacheHitRequest {
+                chunk_id: "00".repeat(32),
+                requester_dc: String::new(),
+                requester_host: String::new(),
+            }))
+            .await
+            .expect_err("unauthenticated RecordCacheHit must fail");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
