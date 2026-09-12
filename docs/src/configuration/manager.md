@@ -213,7 +213,7 @@ These defaults apply to newly created volumes unless overridden at volume creati
 
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
-| `min_replicas_before_ack` | `defaults.write_safety.min_replicas_before_ack` | `u32` | `2` | 1--replication factor | Yes | Minimum number of replicas that must acknowledge a write before the client receives success. Setting this to 1 gives lower latency but risks data loss on node failure. |
+| `min_replicas_before_ack` | `defaults.write_safety.min_replicas_before_ack` | `u32` | `2` | 1--replication factor | Yes | Minimum number of replicas that must acknowledge a write before the client receives success. Setting this to 1 gives lower latency but risks data loss on node failure. CR-6-2: clamped down (never raised) to the HIGHEST effective mandatory RF of any tier the chunks actually landed on -- a configured floor above every placed tier's own RF (e.g. the default 2 above cold's default RF 1) would otherwise reject every commit to that tier forever; a multi-tier placement (e.g. warm RF 3 + cold RF 1) still enforces the stricter warm RF, never downgrading to the weakest placed tier. The clamp is logged once per volume and audited as `write_safety.floor_clamped`. |
 | `write_timeout_secs` | `defaults.write_safety.write_timeout_secs` | `u32` | `30` | 1--3600 | Yes | Maximum time in seconds to wait for write acknowledgements before returning an error to the client. |
 
 > **Topology prerequisite.** `min_replicas_before_ack = N` is only a durable
@@ -323,6 +323,11 @@ of all roles' caps must stay under host RAM.
 | `shed_threshold_pct` | `memory.shed_threshold_pct` | `u8` | `92` | Reserved for the higher rung; the manager has no request-shed today, so ticks stay paused. |
 | `sample_interval_secs` | `memory.sample_interval_secs` | `u64` | `5` | RSS sampling cadence. |
 
+CR-6-1: `dtfs-manager` calls `MemoryConfig::validate()` right after config
+load and exits non-zero if `warn_threshold_pct >= shed_threshold_pct` or
+either is `> 100` -- an inverted/degenerate ladder used to flap Warn/Shed on
+every sample instead of being rejected at startup.
+
 ---
 
 ## `[updater]` -- Self-Updater Source
@@ -376,6 +381,11 @@ overriding their local `[scrub]` fallback.
 | `[placement]` | `min_free_bytes` | `1073741824` (1 GiB) | Per-disk free-space reserve (Bug BU). |
 | | `min_free_pct` | `5.0` | Reserve = `max(min_free_bytes, total * pct%)`. |
 | | `allow_capacity_spill` | `true` | Spill a write to the fastest tier with room when the mandated tier is full, instead of failing it (Bug BX; the anchor copy is never spilled). `false` = fail-loud. |
+
+CR-6-1 (CMN-8): `dtfs-manager` calls `PlacementConfig::validate()` at
+startup and exits non-zero when `min_free_pct` is outside `0.0..=100.0`
+(or NaN) -- a value `>100` excludes every disk from the placement ring,
+and a negative/NaN value silently disables the reserve.
 
 ---
 

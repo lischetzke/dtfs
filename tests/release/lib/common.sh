@@ -82,7 +82,7 @@ EOF
     echo "$_MGR_SHARED_SECRET_CACHED"
 }
 
-# LIS-19 / LIS-55 / LIS-83 � build the gRPC metadata a data-plane RPC needs
+# LIS-19 / LIS-55 / LIS-83 � build the gRPC metadata a data-plane RPC needs
 # when `cluster.shared_secret` is set, as grpcurl `-H` arguments in the global
 # array DATA_RPC_HDRS. The canonical MAC message is
 #   "dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n"
@@ -119,6 +119,40 @@ PYSTAMP
     mac=$(printf '%s\n' "$out" | sed -n 2p)
     [ -n "$ts" ] && [ -n "$mac" ] || return 1
     DATA_RPC_HDRS=(-H "x-dtfs-rpc-ts: $ts" -H "x-dtfs-rpc-mac: $mac")
+}
+
+# LIS-56 — build the gRPC metadata a mutating ManagerService RPC needs when
+# `cluster.shared_secret` is set, as grpcurl `-H` arguments in the global
+# array MGR_RPC_HDRS. Same shape as data_rpc_stamp but over the
+# `dtfs-mgr-rpc` MAC plane (dtfs_common::crypto::stamp_mgr_rpc_auth /
+# require_mgr_rpc_auth). `binding` is the RPC's own binding value (e.g. the
+# file path for CreateFile). Empty secret -> empty array (manager skips
+# verification, so an unstamped call is correct there too).
+#   mgr_rpc_stamp CreateFile "/release/109-foo.bin"
+#   grpcurl "${MGR_RPC_HDRS[@]}" ...
+mgr_rpc_stamp() {
+    local method="$1" binding="${2:-}"
+    MGR_RPC_HDRS=()
+    local secret="${DTFS_SHARED_SECRET:-}"
+    if [ -z "$secret" ]; then
+        secret=$(mgr_shared_secret 2>/dev/null || true)
+    fi
+    [ -n "$secret" ] || return 0
+    local out
+    out=$(python3 - "$secret" "$method" "$binding" <<'PYSTAMP'
+import hashlib, hmac, sys, time
+secret, method, binding = sys.argv[1], sys.argv[2], sys.argv[3]
+ts = int(time.time())
+msg = "dtfs-mgr-rpc\nv1\n{}\n{}\n{}\n".format(method, ts, binding).encode()
+print(ts)
+print(hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest())
+PYSTAMP
+) || return 1
+    local ts mac
+    ts=$(printf '%s\n' "$out" | sed -n 1p)
+    mac=$(printf '%s\n' "$out" | sed -n 2p)
+    [ -n "$ts" ] && [ -n "$mac" ] || return 1
+    MGR_RPC_HDRS=(-H "x-dtfs-rpc-ts: $ts" -H "x-dtfs-rpc-mac: $mac")
 }
 
 # ─── Remote-host helpers ─────────────────────────────────────────

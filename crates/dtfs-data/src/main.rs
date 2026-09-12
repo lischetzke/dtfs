@@ -95,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
         .cluster
         .validate_shared_secret()
         .map_err(|e| anyhow::anyhow!(e))?;
+    // CR-6-1 (CMN-1) — reject an unusable memory ladder at startup
+    // instead of flapping Warn/Shed on every sample.
+    config.memory.validate().map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!(
         "Data node {} at {} ({})",
@@ -801,6 +804,8 @@ async fn manager_lifecycle(
                         let mut sc = scrub_config.write().await;
                         if sc.quick_interval_hours != s.quick_interval_hours
                             || sc.deep_interval_hours != s.deep_interval_hours
+                            || sc.quick_interval_secs != s.quick_interval_secs
+                            || sc.deep_interval_secs != s.deep_interval_secs
                         {
                             tracing::info!(
                                 "AZ-1 scrub override: quick {}h -> {}h, deep {}h -> {}h",
@@ -811,6 +816,11 @@ async fn manager_lifecycle(
                             );
                             sc.quick_interval_hours = s.quick_interval_hours;
                             sc.deep_interval_hours = s.deep_interval_hours;
+                            // CR-6-3 (PROTO-2) — exact-secs companions; `0`
+                            // from an older manager means "not sent", so
+                            // the scheduler falls back to the hours field.
+                            sc.quick_interval_secs = s.quick_interval_secs;
+                            sc.deep_interval_secs = s.deep_interval_secs;
                         }
                     }
                     if !config_update.config_json.is_empty() {

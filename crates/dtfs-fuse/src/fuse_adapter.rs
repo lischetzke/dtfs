@@ -168,8 +168,15 @@ impl HeldLock {
 
 impl DtfsFuse3Adapter {
     pub fn new(fs: DtfsFilesystem) -> Self {
+        Self::from_shared(Arc::new(fs))
+    }
+
+    /// CR-6-5 — accept an already-`Arc`-wrapped filesystem so callers can
+    /// keep a clone (e.g. to spawn the metadata-cache sweep task) before
+    /// handing ownership to the adapter.
+    pub fn from_shared(fs: Arc<DtfsFilesystem>) -> Self {
         Self {
-            fs: Arc::new(fs),
+            fs,
             inodes: InodeMap::new(),
             mode_overrides: DashMap::new(),
             locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),

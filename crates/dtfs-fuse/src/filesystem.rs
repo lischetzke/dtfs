@@ -164,6 +164,127 @@ fn learn_locations(known: &DashMap<String, Location>, addrs: &[String], locs: &[
     }
 }
 
+/// CR-6-5 (FUSE-5) — default bound on `metadata_cache` entries.
+pub const METADATA_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// CR-6-6 (FUSE-8) — bound on in-flight `record_cache_hit` notify tasks.
+pub const CACHE_HIT_NOTIFY_MAX_INFLIGHT: usize = 8;
+
+/// CR-6-6 (FUSE-8 / FUSE-10) — true iff `current` is a genuinely new
+/// chunk index for this fh (never seen, or different from the last one),
+/// i.e. a transition. Pure decision boundary shared by the cache-hit
+/// notify dedup (fire at most once per transition) and the
+/// `readahead.on_chunk_read` call (fire on every transition, hit or
+/// miss) — both care about the exact same event, just gate different
+/// actions on it.
+fn should_notify(last: Option<u32>, current: u32) -> bool {
+    last != Some(current)
+}
+
+/// CR-6-6 (FUSE-9) — outcome of trying to claim ownership of a
+/// foreground chunk fetch. `Owner` must perform the real fetch and
+/// resolve it via `complete_foreground_fetch`; `Waiter` should await the
+/// receiver instead of fetching.
+enum ForegroundFetchClaim {
+    Owner(tokio::sync::watch::Sender<Option<bytes::Bytes>>),
+    Waiter(tokio::sync::watch::Receiver<Option<bytes::Bytes>>),
+}
+
+/// CR-6-6 (FUSE-9) — single-flight claim: the first caller for a given
+/// `chunk_id` becomes the `Owner` (and is responsible for calling
+/// `complete_foreground_fetch` exactly once when done); every concurrent
+/// caller for the SAME `chunk_id` before that becomes a `Waiter` holding
+/// a receiver that resolves to the Owner's result (or `None` if the
+/// Owner's fetch failed).
+fn claim_foreground_fetch(
+    inflight: &DashMap<String, tokio::sync::watch::Receiver<Option<bytes::Bytes>>>,
+    chunk_id: &str,
+) -> ForegroundFetchClaim {
+    use dashmap::mapref::entry::Entry;
+    match inflight.entry(chunk_id.to_string()) {
+        Entry::Occupied(e) => ForegroundFetchClaim::Waiter(e.get().clone()),
+        Entry::Vacant(e) => {
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            e.insert(rx);
+            ForegroundFetchClaim::Owner(tx)
+        }
+    }
+}
+
+/// CR-6-6 (FUSE-9) — the Owner calls this exactly once when its fetch is
+/// done (success or failure) to publish the result to any Waiters and
+/// remove the in-flight entry so the next miss of this chunk_id starts a
+/// fresh fetch instead of joining a stale one.
+fn complete_foreground_fetch(
+    inflight: &DashMap<String, tokio::sync::watch::Receiver<Option<bytes::Bytes>>>,
+    chunk_id: &str,
+    tx: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+    result: Option<bytes::Bytes>,
+) {
+    let _ = tx.send(result);
+    inflight.remove(chunk_id);
+}
+
+/// CR-6-5 (FUSE-5) — evict the oldest-inserted entries from
+/// `metadata_cache` until it is at or under `max_entries`. `order` is the
+/// insertion-order queue (may contain a path more than once, from
+/// repeated re-caches); a popped key that is already absent, or that no
+/// longer names the entry it was pushed for, is simply a no-op removal
+/// (lazy stale-key skip) — cheap and correct without extra per-entry
+/// bookkeeping. Also drains far-stale queue entries once `order` itself
+/// grows well past the bound, so a long-lived process re-caching the same
+/// hot paths forever doesn't leak the queue itself.
+fn evict_metadata_cache(
+    cache: &DashMap<String, (FileLocations, Instant)>,
+    order: &mut std::collections::VecDeque<String>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        match order.pop_front() {
+            Some(k) => {
+                cache.remove(&k);
+            }
+            None => break,
+        }
+    }
+    let order_cap = max_entries.saturating_mul(4);
+    while order.len() > order_cap {
+        match order.pop_front() {
+            Some(k) => {
+                cache.remove(&k);
+            }
+            None => break,
+        }
+    }
+}
+
+/// CR-6-5 (FUSE-5) — remove every entry whose TTL has elapsed. Pure over
+/// the cache handle so it's directly testable without a full
+/// `DtfsFilesystem`.
+fn sweep_expired_metadata_cache_entries(
+    cache: &DashMap<String, (FileLocations, Instant)>,
+    ttl: Duration,
+) {
+    cache.retain(|_, (_, cached_at)| cached_at.elapsed() < ttl);
+}
+
+/// CR-6-4 (FUSE-6) — resolve the volume_id to store after a
+/// `GetFileLocationsResponse` refresh. A non-empty response value (a
+/// manager on this build or newer) always wins. An empty response value
+/// (an older manager, field absent) means "keep whatever this client
+/// already believes" rather than falling back to the default volume,
+/// which would silently apply the wrong RF/tier/anchor to every later
+/// write of a non-default-volume file. Only a path with no prior cached
+/// value (never seen before) falls back to `"default"`.
+fn resolve_refreshed_volume_id(response_volume_id: &str, cached_volume_id: Option<&str>) -> String {
+    if !response_volume_id.is_empty() {
+        return response_volume_id.to_string();
+    }
+    cached_volume_id
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "default".to_string())
+}
+
 /// File attributes (stat-like information).
 #[derive(Debug, Clone)]
 pub struct FileAttr {
@@ -263,6 +384,14 @@ struct OpenFile {
     /// be unlinked, and its drained-but-unsent segments must always be
     /// restored instead.
     committed_any: bool,
+    /// CR-6-6 (FUSE-8/FUSE-10) — the last chunk index `read()` touched on
+    /// THIS fh. Gates both: (a) `record_cache_hit` fires only on the
+    /// first read of a new chunk index, not once per 128 KB kernel read
+    /// (pre-fix: ~32 RPCs per 4 MB chunk); (b) `readahead.on_chunk_read`
+    /// fires on every genuine chunk-index transition (hit or miss), not
+    /// only on a miss, so the prefetch window advances continuously
+    /// instead of stalling every `prefetch_chunks+1` chunks.
+    last_read_chunk: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +419,11 @@ pub struct DtfsFilesystem {
     config: FuseConfig,
     /// Metadata cache: path -> (FileLocations, cached_at).
     metadata_cache: DashMap<String, (FileLocations, Instant)>,
+    /// CR-6-5 (FUSE-5) — insertion-order queue backing bounded eviction of
+    /// `metadata_cache`. A path can appear more than once (re-cached); a
+    /// popped entry whose key is no longer the live one is a harmless
+    /// no-op remove (lazy stale-key skip) — see `evict_metadata_cache`.
+    metadata_cache_order: std::sync::Mutex<std::collections::VecDeque<String>>,
     /// Metadata TTL.
     metadata_ttl: Duration,
     /// Open file handles: fh -> OpenFile.
@@ -305,6 +439,20 @@ pub struct DtfsFilesystem {
     /// instead of awaiting it inline while holding a `known_locations`
     /// DashMap guard (CO-3-12 anti-pattern).
     migration: std::sync::Arc<MigrationTrigger>,
+    /// CR-6-6 (FUSE-8) — bounds the number of in-flight `record_cache_hit`
+    /// notify RPCs (fire-and-forget metrics pings). Without a bound, a
+    /// slow data node could accumulate unbounded outstanding notify
+    /// tasks; a permit-less notify is simply skipped (a missed metrics
+    /// ping is acceptable, per the existing comment on this call site).
+    cache_hit_notify_permits: std::sync::Arc<tokio::sync::Semaphore>,
+    /// CR-6-6 (FUSE-9) — single-flights foreground chunk-miss fetches by
+    /// chunk_id (content-addressed, so any candidate node's fetch is
+    /// interchangeable). The first reader to miss becomes the Owner and
+    /// does the real `GetChunk`; concurrent readers of the SAME chunk
+    /// (e.g. two kernel 128 KB reads that both land on the same cold
+    /// chunk before the first one completes) become Waiters and receive
+    /// the Owner's result instead of each issuing their own fetch.
+    foreground_inflight: DashMap<String, tokio::sync::watch::Receiver<Option<bytes::Bytes>>>,
     /// Known node locations for nearest-node selection.
     /// Populated as we discover node addresses from metadata responses.
     known_locations: DashMap<String, Location>,
@@ -377,12 +525,17 @@ impl DtfsFilesystem {
             client_location,
             config,
             metadata_cache: DashMap::new(),
+            metadata_cache_order: std::sync::Mutex::new(std::collections::VecDeque::new()),
             metadata_ttl: DEFAULT_METADATA_TTL,
             open_files: DashMap::new(),
             next_fh: AtomicU64::new(1),
             readahead,
             write_buffer,
             migration,
+            cache_hit_notify_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                CACHE_HIT_NOTIFY_MAX_INFLIGHT,
+            )),
+            foreground_inflight: DashMap::new(),
             known_locations: DashMap::new(),
             lease_owner_prefix,
             local_cache: None,
@@ -635,6 +788,7 @@ impl DtfsFilesystem {
                 lease_expires_at_ms,
                 lease_owner_id,
                 committed_any: false,
+                last_read_chunk: None,
             },
         );
 
@@ -741,6 +895,20 @@ impl DtfsFilesystem {
             // chunks degenerate to one attempt.
             let candidates = self.read_candidates(chunk);
 
+            // CR-6-6 (FUSE-8/FUSE-10): decide (and record) whether this is
+            // a genuinely new chunk index for THIS fh, before touching any
+            // cache. Gates the cache-hit notify dedup below and the
+            // prefetch-window advance after chunk_data is resolved.
+            let is_new_chunk_for_fh = match self.open_files.get_mut(&fh) {
+                Some(mut of) => {
+                    let is_new = should_notify(of.last_read_chunk, chunk_idx as u32);
+                    of.last_read_chunk = Some(chunk_idx as u32);
+                    is_new
+                }
+                // fh closed concurrently mid-read — be conservative.
+                None => true,
+            };
+
             // Try read-ahead in-memory cache first: any candidate's cache
             // key works because chunks are content-addressed by chunk_id.
             let mut chunk_data: Option<bytes::Bytes> = None;
@@ -825,22 +993,41 @@ impl DtfsFilesystem {
             // Errors are logged but never propagated (a missed
             // metrics ping is acceptable; an aborted user read is
             // not).
-            if let Some(notify_addr) = cache_hit_notify_addr.clone() {
-                let client = self.client.clone();
-                let chunk_id_clone = chunk.chunk_id.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = client
-                        .record_cache_hit(&notify_addr, &chunk_id_clone)
-                        .await
-                    {
-                        debug!(
-                            chunk_id = %chunk_id_clone,
-                            node = %notify_addr,
-                            error = %e,
-                            "record_cache_hit notify failed (non-fatal)"
-                        );
+            //
+            // CR-6-6 (FUSE-8): only on a genuine chunk-index transition
+            // for this fh — a 4 MB chunk read in 128 KB kernel pieces
+            // used to fire ~32 of these RPCs per chunk. Also bounded by
+            // a semaphore: a permit-less notify is simply skipped (a
+            // missed metrics ping is acceptable, unlike a stalled read).
+            if is_new_chunk_for_fh {
+                if let Some(notify_addr) = cache_hit_notify_addr.clone() {
+                    match self.cache_hit_notify_permits.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            let client = self.client.clone();
+                            let chunk_id_clone = chunk.chunk_id.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                if let Err(e) = client
+                                    .record_cache_hit(&notify_addr, &chunk_id_clone)
+                                    .await
+                                {
+                                    debug!(
+                                        chunk_id = %chunk_id_clone,
+                                        node = %notify_addr,
+                                        error = %e,
+                                        "record_cache_hit notify failed (non-fatal)"
+                                    );
+                                }
+                            });
+                        }
+                        Err(_) => {
+                            debug!(
+                                chunk_id = %chunk.chunk_id,
+                                "CR-6-6: cache-hit notify skipped, no permit available"
+                            );
+                        }
                     }
-                });
+                }
             }
 
             let chunk_data = if let Some(d) = chunk_data {
@@ -848,114 +1035,132 @@ impl DtfsFilesystem {
             } else {
                 // Cache miss: fetch from data node, falling back through
                 // candidates on transport / not-found errors.
-                // FUSE-HOL — bound each per-replica fetch with a timeout so a
-                // hung/dead node (accepts the connection but never responds, so
-                // no transport error fires) cannot stall the read — and the
-                // application's FUSE op — indefinitely. On timeout we fail over
-                // to the next candidate exactly like a transport error. `0`
-                // disables the bound (legacy unbounded await).
-                let fetch_timeout_secs = self.config.client.chunk_read_timeout_secs;
-                let mut last_err: Option<anyhow::Error> = None;
-                let mut fetched: Option<(String, bytes::Bytes)> = None;
-                for cand in &candidates {
-                    let fetch = self.client.read_chunk(cand, &chunk.chunk_id);
-                    let result = if fetch_timeout_secs == 0 {
-                        fetch.await
-                    } else {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(fetch_timeout_secs),
-                            fetch,
-                        )
-                        .await
-                        {
-                            Ok(r) => r,
-                            Err(_) => {
-                                tracing::warn!(
+                //
+                // CR-6-6 (FUSE-9): single-flight this chunk_id so
+                // concurrent kernel reads racing into the same cold chunk
+                // (content-addressed, so any candidate is interchangeable)
+                // fetch it exactly once, not N times over the (possibly
+                // 40 Mbps) link.
+                match claim_foreground_fetch(&self.foreground_inflight, &chunk.chunk_id) {
+                    ForegroundFetchClaim::Waiter(mut rx) => {
+                        let joined = if rx.changed().await.is_ok() {
+                            rx.borrow().clone()
+                        } else {
+                            None
+                        };
+                        match joined {
+                            Some(d) => {
+                                debug!(
                                     chunk_id = %chunk.chunk_id,
-                                    node = %cand,
-                                    timeout_secs = fetch_timeout_secs,
-                                    "FUSE-HOL: chunk fetch timed out, failing over to next replica"
+                                    "foreground fetch single-flight join hit"
                                 );
-                                last_err = Some(anyhow::anyhow!(
-                                    "chunk fetch from {cand} timed out after {fetch_timeout_secs}s"
-                                ));
-                                continue;
+                                d
                             }
-                        }
-                    };
-                    match result {
-                        Ok(d) => {
-                            fetched = Some((cand.clone(), d));
-                            break;
-                        }
-                        Err(e) => {
-                            // Bug BC-9 — distinguish a verify_on_read
-                            // integrity fault from a transport error so
-                            // operators see corruption fail-over clearly.
-                            if e.downcast_ref::<dtfs_client::client::IntegrityFaultError>()
-                                .is_some()
-                            {
-                                tracing::warn!(
-                                    chunk_id = %chunk.chunk_id,
-                                    node = %cand,
-                                    error = %e,
-                                    "Bug BC-9: integrity fault on replica, failing over to next"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    chunk_id = %chunk.chunk_id,
-                                    node = %cand,
-                                    error = %e,
-                                    "replica read failed, trying next"
-                                );
+                            None => {
+                                // Owner's fetch failed (or its entry was
+                                // dropped before publishing a result) —
+                                // fetch it ourselves rather than failing
+                                // this read outright.
+                                let (_, d) = self
+                                    .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id)
+                                    .await?;
+                                d
                             }
-                            last_err = Some(e);
                         }
                     }
-                }
-                let (node_addr, data) = fetched.ok_or_else(|| {
-                    last_err.unwrap_or_else(|| {
-                        anyhow::anyhow!(
-                            "no replicas available for chunk {} (candidates exhausted)",
-                            chunk.chunk_id
-                        )
-                    })
-                })?;
-                debug!(
-                    chunk_id = %chunk.chunk_id,
-                    node = %node_addr,
-                    size = data.len(),
-                    "chunk fetch complete (foreground miss)"
-                );
-
-                // CRITICAL: store the just-fetched chunk in the cache so
-                // subsequent FUSE reads (which arrive in 128 KB pieces
-                // for a 128 MB chunk = ~1024 reads per chunk) hit the
-                // cache instead of re-issuing the full fetch. Without
-                // this the readahead cache only ever contained chunks
-                // fetched by `on_chunk_read` prefetch, and cold reads
-                // ran at ~1.2 MB/s because every kernel page read
-                // triggered a fresh 128 MB chunk fetch.
-                self.readahead
-                    .insert_cached(&node_addr, &chunk.chunk_id, data.clone());
-
-                // P0-11: also write to the disk cache so the chunk
-                // survives readahead-cache eviction + FUSE restarts.
-                if let Some(lc) = &self.local_cache {
-                    if let Err(e) = lc.put(&chunk.chunk_id, &data).await {
-                        tracing::warn!(
-                            chunk_id = %chunk.chunk_id,
-                            error = %e,
-                            "local disk cache put failed"
+                    ForegroundFetchClaim::Owner(tx) => {
+                        let fetch_result = self
+                            .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id)
+                            .await;
+                        let (node_addr, data) = match fetch_result {
+                            Ok(v) => v,
+                            Err(e) => {
+                                complete_foreground_fetch(
+                                    &self.foreground_inflight,
+                                    &chunk.chunk_id,
+                                    tx,
+                                    None,
+                                );
+                                return Err(e);
+                            }
+                        };
+                        complete_foreground_fetch(
+                            &self.foreground_inflight,
+                            &chunk.chunk_id,
+                            tx,
+                            Some(data.clone()),
                         );
+                        debug!(
+                            chunk_id = %chunk.chunk_id,
+                            node = %node_addr,
+                            size = data.len(),
+                            "chunk fetch complete (foreground miss)"
+                        );
+
+                        // CRITICAL: store the just-fetched chunk in the cache so
+                        // subsequent FUSE reads (which arrive in 128 KB pieces
+                        // for a 128 MB chunk = ~1024 reads per chunk) hit the
+                        // cache instead of re-issuing the full fetch. Without
+                        // this the readahead cache only ever contained chunks
+                        // fetched by `on_chunk_read` prefetch, and cold reads
+                        // ran at ~1.2 MB/s because every kernel page read
+                        // triggered a fresh 128 MB chunk fetch.
+                        self.readahead
+                            .insert_cached(&node_addr, &chunk.chunk_id, data.clone());
+
+                        // P0-11: also write to the disk cache so the chunk
+                        // survives readahead-cache eviction + FUSE restarts.
+                        if let Some(lc) = &self.local_cache {
+                            if let Err(e) = lc.put(&chunk.chunk_id, &data).await {
+                                tracing::warn!(
+                                    chunk_id = %chunk.chunk_id,
+                                    error = %e,
+                                    "local disk cache put failed"
+                                );
+                            }
+                        }
+
+                        // Trigger migration check using the actually-served node so
+                        // tiering sees the real cross-DC traffic, not the nearest
+                        // candidate we wished we'd used.
+                        //
+                        // WI-09 (CO-3-12) — `.map(|r| r.clone())` drops the
+                        // DashMap `Ref` guard at the end of this statement, before
+                        // `spawn_on_remote_read` runs, so no `known_locations`
+                        // shard guard is held across the spawn (previously the
+                        // if-let bound the guard itself for the whole body and an
+                        // inline `.await` on the migration RPC could hold it for
+                        // up to the ~15s manager-walk deadline, blocking any
+                        // concurrent `learn_locations` insert into that shard).
+                        // The RPC is fire-and-forget: its result is advisory only.
+                        let node_loc = self.known_locations.get(&node_addr).map(|r| r.clone());
+                        if let Some(node_loc) = node_loc {
+                            self.migration.clone().spawn_on_remote_read(
+                                &chunk.chunk_id,
+                                node_loc,
+                                &file_path,
+                                &volume_id,
+                            );
+                        }
+
+                        data
                     }
                 }
+            };
 
-                // Trigger readahead for upcoming chunks. REV-2-3 — label each
-                // entry with its real index and pre-order its replicas with
-                // `read_candidates`, so the prefetch hits the same replica the
-                // foreground read would pick and caches under the key that
-                // read looks up.
+            // CR-6-6 (FUSE-10): advance the prefetch window on every
+            // genuine chunk-index transition for this fh, whether this
+            // chunk was a hit or a miss — previously this only fired on a
+            // miss, so a synchronous foreground fetch (~0.8s at 40 Mbps)
+            // sat between two runs of already-prefetched chunks instead
+            // of a continuously sliding window, stalling playback every
+            // `prefetch_chunks+1` chunks. `pending`/cache dedup inside
+            // `on_chunk_read` is unchanged.
+            if is_new_chunk_for_fh {
+                // REV-2-3 — label each entry with its real index and
+                // pre-order its replicas with `read_candidates`, so the
+                // prefetch hits the same replica the foreground read
+                // would pick and caches under the key that read looks up.
                 let chunk_locs: Vec<(u64, String, Vec<String>)> = locations
                     .chunks
                     .iter()
@@ -975,32 +1180,7 @@ impl DtfsFilesystem {
                     total_chunks,
                     &chunk_locs,
                 );
-
-                // Trigger migration check using the actually-served node so
-                // tiering sees the real cross-DC traffic, not the nearest
-                // candidate we wished we'd used.
-                //
-                // WI-09 (CO-3-12) — `.map(|r| r.clone())` drops the
-                // DashMap `Ref` guard at the end of this statement, before
-                // `spawn_on_remote_read` runs, so no `known_locations`
-                // shard guard is held across the spawn (previously the
-                // if-let bound the guard itself for the whole body and an
-                // inline `.await` on the migration RPC could hold it for
-                // up to the ~15s manager-walk deadline, blocking any
-                // concurrent `learn_locations` insert into that shard).
-                // The RPC is fire-and-forget: its result is advisory only.
-                let node_loc = self.known_locations.get(&node_addr).map(|r| r.clone());
-                if let Some(node_loc) = node_loc {
-                    self.migration.clone().spawn_on_remote_read(
-                        &chunk.chunk_id,
-                        node_loc,
-                        &file_path,
-                        &volume_id,
-                    );
-                }
-
-                data
-            };
+            }
 
             // Extract the relevant byte range from this chunk.
             let chunk_start_byte = chunk_idx as u64 * chunk_size;
@@ -1594,6 +1774,7 @@ impl DtfsFilesystem {
                 lease_expires_at_ms: Some(lease_resp.expires_at_ms),
                 lease_owner_id: Some(owner_id),
                 committed_any: false,
+                last_read_chunk: None,
             },
         );
 
@@ -1822,15 +2003,36 @@ impl DtfsFilesystem {
             128 * 1024 * 1024
         };
 
+        // CR-6-4 (FUSE-6) — the manager now returns the file's actual
+        // volume_id (proto field 8). An older manager sends "" (field
+        // absent); in that case, KEEP whatever volume_id this path
+        // already believes rather than silently falling back to
+        // "default", which would apply the wrong volume's RF/tier/
+        // anchor on every subsequent write. The refresh call sites in
+        // `flush()`/`truncate()` invalidate `metadata_cache` BEFORE
+        // calling this, so the fallback checks any still-open
+        // `OpenFile` for this path first (its `locations` isn't
+        // cleared by that invalidation) and only then the metadata
+        // cache; a path never seen before falls back to "default".
+        let existing_volume_id = self
+            .open_files
+            .iter()
+            .find_map(|e| {
+                if e.value().path == path {
+                    e.value().locations.as_ref().map(|l| l.volume_id.clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| self.get_cached_metadata(path).map(|loc| loc.volume_id));
+        let volume_id =
+            resolve_refreshed_volume_id(&response.volume_id, existing_volume_id.as_deref());
+
         Ok(FileLocations {
             path: response.path,
             total_size: response.total_size,
             chunks,
-            // The manager response doesn't include volume_id directly in
-            // GetFileLocationsResponse. We default to "default" and it
-            // gets overridden when the file is created or opened with
-            // a known volume.
-            volume_id: "default".to_string(),
+            volume_id,
             chunk_size,
             created_at_ms: response.created_at_ms,
             modified_at_ms: response.modified_at_ms,
@@ -1852,10 +2054,34 @@ impl DtfsFilesystem {
         }
     }
 
-    /// Store metadata in the cache.
+    /// Store metadata in the cache. CR-6-5 (FUSE-5): bounds the cache at
+    /// `METADATA_CACHE_MAX_ENTRIES` by evicting the oldest-inserted paths
+    /// first (FIFO, not strict LRU — simplest correct structure for a
+    /// getattr-heavy scan workload, per AGENTS.md § B.1's "smallest fix").
+    /// Before this, a Plex library scan pinned one full chunk-location list
+    /// per path ever stat'ed, unboundedly.
     fn cache_metadata(&self, path: &str, locations: FileLocations) {
         self.metadata_cache
             .insert(path.to_string(), (locations, Instant::now()));
+        let mut order = self.metadata_cache_order.lock().unwrap();
+        order.push_back(path.to_string());
+        evict_metadata_cache(&self.metadata_cache, &mut order, METADATA_CACHE_MAX_ENTRIES);
+    }
+
+    /// CR-6-5 (FUSE-5) — return this client's configured metadata TTL, so
+    /// the sweep task in `main.rs` can run on the same cadence entries
+    /// naturally expire.
+    pub fn metadata_ttl(&self) -> Duration {
+        self.metadata_ttl
+    }
+
+    /// CR-6-5 (FUSE-5) — remove every `metadata_cache` entry whose TTL has
+    /// elapsed. `get_cached_metadata` already does this lazily per-path on
+    /// read, but a path that stops being read (e.g. Plex finished scanning
+    /// it) would otherwise pin its full chunk-location list forever;
+    /// called periodically from `main.rs` on the `metadata_ttl` cadence.
+    pub fn sweep_expired_metadata_cache(&self) {
+        sweep_expired_metadata_cache_entries(&self.metadata_cache, self.metadata_ttl);
     }
 
     /// Resolve the logical chunk size for a file.
@@ -1918,6 +2144,81 @@ impl DtfsFilesystem {
             addresses,
             &known,
         )
+    }
+
+    /// CR-6-6 (FUSE-9) — extracted foreground fetch loop: try each
+    /// candidate node in order, bounded per-replica by
+    /// `client.chunk_read_timeout_secs` (0 = unbounded, FUSE-HOL),
+    /// returning the serving node's address + bytes on the first success.
+    /// Shared by the single-flight Owner and by a Waiter whose Owner's
+    /// fetch failed (fallback: fetch it ourselves rather than fail the
+    /// read outright).
+    async fn fetch_chunk_from_candidates(
+        &self,
+        candidates: &[String],
+        chunk_id: &str,
+    ) -> Result<(String, bytes::Bytes)> {
+        let fetch_timeout_secs = self.config.client.chunk_read_timeout_secs;
+        let mut last_err: Option<anyhow::Error> = None;
+        for cand in candidates {
+            let fetch = self.client.read_chunk(cand, chunk_id);
+            let result = if fetch_timeout_secs == 0 {
+                fetch.await
+            } else {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(fetch_timeout_secs),
+                    fetch,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tracing::warn!(
+                            chunk_id = %chunk_id,
+                            node = %cand,
+                            timeout_secs = fetch_timeout_secs,
+                            "FUSE-HOL: chunk fetch timed out, failing over to next replica"
+                        );
+                        last_err = Some(anyhow::anyhow!(
+                            "chunk fetch from {cand} timed out after {fetch_timeout_secs}s"
+                        ));
+                        continue;
+                    }
+                }
+            };
+            match result {
+                Ok(d) => return Ok((cand.clone(), d)),
+                Err(e) => {
+                    // Bug BC-9 — distinguish a verify_on_read integrity
+                    // fault from a transport error so operators see
+                    // corruption fail-over clearly.
+                    if e.downcast_ref::<dtfs_client::client::IntegrityFaultError>()
+                        .is_some()
+                    {
+                        tracing::warn!(
+                            chunk_id = %chunk_id,
+                            node = %cand,
+                            error = %e,
+                            "Bug BC-9: integrity fault on replica, failing over to next"
+                        );
+                    } else {
+                        tracing::warn!(
+                            chunk_id = %chunk_id,
+                            node = %cand,
+                            error = %e,
+                            "replica read failed, trying next"
+                        );
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "no replicas available for chunk {} (candidates exhausted)",
+                chunk_id
+            )
+        }))
     }
 
     /// U4: ordered read candidates for one chunk. The first element is the
@@ -2396,6 +2697,199 @@ fn other_writer_open(remaining: &[(String, OpenFlags)], path: &str) -> bool {
 /// independent of the error's concrete type.
 fn is_resource_exhausted(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("ResourceExhausted")
+}
+
+#[cfg(test)]
+mod cr_6_6_should_notify_tests {
+    use super::should_notify;
+
+    #[test]
+    fn first_read_of_any_chunk_notifies() {
+        assert!(should_notify(None, 0));
+        assert!(should_notify(None, 7));
+    }
+
+    #[test]
+    fn sequential_hits_on_the_same_chunk_notify_once() {
+        // 32 sequential 128 KB reads of one 4 MB chunk: only the FIRST
+        // transition into chunk 0 should notify.
+        let mut last: Option<u32> = None;
+        let mut notify_count = 0;
+        for _ in 0..32 {
+            if should_notify(last, 0) {
+                notify_count += 1;
+            }
+            last = Some(0);
+        }
+        assert_eq!(notify_count, 1);
+    }
+
+    #[test]
+    fn a_new_chunk_index_notifies_again() {
+        assert!(!should_notify(Some(3), 3));
+        assert!(should_notify(Some(3), 4));
+    }
+}
+
+#[cfg(test)]
+mod cr_6_6_foreground_single_flight_tests {
+    use super::{claim_foreground_fetch, complete_foreground_fetch, ForegroundFetchClaim};
+    use dashmap::DashMap;
+
+    /// Two concurrent misses on the SAME chunk_id: the first claim must be
+    /// the Owner, the second (before the Owner completes) must be a
+    /// Waiter — i.e. only one caller is ever responsible for the real
+    /// fetch, which is the property that keeps a single `GetChunk` in
+    /// flight for the chunk regardless of how many kernel reads race
+    /// into it.
+    #[test]
+    fn second_concurrent_claim_is_a_waiter_not_a_second_owner() {
+        let inflight: DashMap<String, tokio::sync::watch::Receiver<Option<bytes::Bytes>>> =
+            DashMap::new();
+
+        let first = claim_foreground_fetch(&inflight, "chunk-a");
+        assert!(matches!(first, ForegroundFetchClaim::Owner(_)));
+
+        let second = claim_foreground_fetch(&inflight, "chunk-a");
+        assert!(matches!(second, ForegroundFetchClaim::Waiter(_)));
+
+        // A different chunk_id is unaffected — its own Owner.
+        let other = claim_foreground_fetch(&inflight, "chunk-b");
+        assert!(matches!(other, ForegroundFetchClaim::Owner(_)));
+    }
+
+    /// The Waiter's receiver resolves to the Owner's published bytes, and
+    /// `complete_foreground_fetch` removes the entry so the NEXT miss of
+    /// this chunk_id starts a fresh single-flight round rather than
+    /// joining a stale, already-resolved one.
+    #[tokio::test]
+    async fn waiter_receives_owners_result_and_entry_is_cleared() {
+        let inflight: DashMap<String, tokio::sync::watch::Receiver<Option<bytes::Bytes>>> =
+            DashMap::new();
+
+        let owner_tx = match claim_foreground_fetch(&inflight, "chunk-a") {
+            ForegroundFetchClaim::Owner(tx) => tx,
+            ForegroundFetchClaim::Waiter(_) => panic!("first claim must be Owner"),
+        };
+        let mut waiter_rx = match claim_foreground_fetch(&inflight, "chunk-a") {
+            ForegroundFetchClaim::Waiter(rx) => rx,
+            ForegroundFetchClaim::Owner(_) => panic!("second claim must be Waiter"),
+        };
+
+        let payload = bytes::Bytes::from_static(b"chunk bytes");
+        complete_foreground_fetch(&inflight, "chunk-a", owner_tx, Some(payload.clone()));
+
+        waiter_rx.changed().await.expect("owner published a result");
+        assert_eq!(waiter_rx.borrow().as_ref(), Some(&payload));
+
+        // Entry cleared: the next claim for this chunk_id is a fresh Owner.
+        assert!(!inflight.contains_key("chunk-a"));
+        let next = claim_foreground_fetch(&inflight, "chunk-a");
+        assert!(matches!(next, ForegroundFetchClaim::Owner(_)));
+    }
+
+    /// The Owner's fetch failing (published as `None`) must let the
+    /// Waiter distinguish "no bytes" from "still fetching" so it falls
+    /// back to its own fetch instead of returning zero-length data.
+    #[tokio::test]
+    async fn waiter_sees_none_when_owners_fetch_failed() {
+        let inflight: DashMap<String, tokio::sync::watch::Receiver<Option<bytes::Bytes>>> =
+            DashMap::new();
+
+        let owner_tx = match claim_foreground_fetch(&inflight, "chunk-a") {
+            ForegroundFetchClaim::Owner(tx) => tx,
+            ForegroundFetchClaim::Waiter(_) => panic!("first claim must be Owner"),
+        };
+        let mut waiter_rx = match claim_foreground_fetch(&inflight, "chunk-a") {
+            ForegroundFetchClaim::Waiter(rx) => rx,
+            ForegroundFetchClaim::Owner(_) => panic!("second claim must be Waiter"),
+        };
+
+        complete_foreground_fetch(&inflight, "chunk-a", owner_tx, None);
+
+        waiter_rx.changed().await.expect("owner published a (failure) result");
+        assert_eq!(waiter_rx.borrow().as_ref(), None);
+    }
+}
+
+#[cfg(test)]
+mod cr_6_5_metadata_cache_bound_tests {
+    use super::{evict_metadata_cache, sweep_expired_metadata_cache_entries, FileLocations};
+    use dashmap::DashMap;
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    /// Built through a free function on purpose (same rustc 1.94 struct-
+    /// literal ICE workaround as `rev_2_1_chunk_index_tests::locs`).
+    fn empty_locations(path: &str) -> FileLocations {
+        FileLocations {
+            path: path.to_string(),
+            total_size: 0,
+            chunks: Vec::new(),
+            volume_id: "default".to_string(),
+            chunk_size: 4 * 1024 * 1024,
+            created_at_ms: 0,
+            modified_at_ms: 0,
+            is_directory: false,
+        }
+    }
+
+    #[test]
+    fn insert_5000_stays_bounded() {
+        let cache: DashMap<String, (FileLocations, Instant)> = DashMap::new();
+        let mut order: VecDeque<String> = VecDeque::new();
+        for i in 0..5000 {
+            let path = format!("/movies/{i}.mkv");
+            cache.insert(path.clone(), (empty_locations(&path), Instant::now()));
+            order.push_back(path);
+            evict_metadata_cache(&cache, &mut order, 4096);
+        }
+        assert!(cache.len() <= 4096, "cache grew past the bound: {}", cache.len());
+        // The most recently inserted path must still be present (FIFO
+        // evicts the oldest, never the newest).
+        assert!(cache.contains_key("/movies/4999.mkv"));
+        // An early path must have been evicted.
+        assert!(!cache.contains_key("/movies/0.mkv"));
+    }
+
+    #[test]
+    fn expired_entry_gone_after_sweep() {
+        let cache: DashMap<String, (FileLocations, Instant)> = DashMap::new();
+        cache.insert(
+            "/stale.mkv".to_string(),
+            (empty_locations("/stale.mkv"), Instant::now() - Duration::from_secs(120)),
+        );
+        cache.insert(
+            "/fresh.mkv".to_string(),
+            (empty_locations("/fresh.mkv"), Instant::now()),
+        );
+        sweep_expired_metadata_cache_entries(&cache, Duration::from_secs(60));
+        assert!(!cache.contains_key("/stale.mkv"), "expired entry must be swept");
+        assert!(cache.contains_key("/fresh.mkv"), "fresh entry must survive the sweep");
+    }
+}
+
+#[cfg(test)]
+mod cr_6_4_resolve_refreshed_volume_id_tests {
+    use super::resolve_refreshed_volume_id;
+
+    #[test]
+    fn nonempty_response_wins() {
+        assert_eq!(resolve_refreshed_volume_id("strict", Some("default")), "strict");
+        assert_eq!(resolve_refreshed_volume_id("strict", None), "strict");
+    }
+
+    #[test]
+    fn empty_response_keeps_cached_value() {
+        // an older manager sends "" — never silently downgrade to "default"
+        // when this client already believes the file is on "strict".
+        assert_eq!(resolve_refreshed_volume_id("", Some("strict")), "strict");
+    }
+
+    #[test]
+    fn empty_response_and_no_cache_falls_back_to_default() {
+        assert_eq!(resolve_refreshed_volume_id("", None), "default");
+    }
 }
 
 #[cfg(test)]

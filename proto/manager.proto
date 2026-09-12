@@ -338,6 +338,13 @@ message GetFileLocationsResponse {
   // the "mkdir then stat returns ENOENT" bug seen during the 2026-05-18
   // soak recovery (SOAK-RECOVERY-2026-05-18.md, bugs A & B).
   bool is_directory = 7;
+  // CR-6-4 (FUSE-6) — the volume this file is actually registered
+  // under (`FileMetadata.volume_id`). An older manager leaves this
+  // `""`; the FUSE client then keeps whatever volume_id it already
+  // has cached for the path rather than falling back to "default"
+  // (which silently applies default-volume RF/tier/anchor to a
+  // non-default-volume file on every refresh after the first).
+  string volume_id = 8;
 }
 
 // --- DeleteFile ---
@@ -589,6 +596,16 @@ message ScrubConfigOverride {
   bool   verify_on_read         = 6;
   bool   quarantine_on_fault    = 7;
   uint64 auto_unquarantine_secs = 8;
+
+  // CR-6-3 (PROTO-2) — sub-hour secs companions for fields 1/2. The
+  // manager fills BOTH the hours field (rounded up, unchanged
+  // back-compat behaviour) and the exact secs field; a data node that
+  // understands secs prefers it (no more silent ceil-to-1h on a
+  // sub-hour override), an older data node ignores the new fields and
+  // keeps working off hours exactly as before. `0` = fall back to
+  // `*_hours * 3600`.
+  uint64 quick_interval_secs = 9;
+  uint64 deep_interval_secs  = 10;
 }
 
 message HeartbeatResponse {
