@@ -158,7 +158,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-5-4 | ⬜ | DATA-6 | `crates/dtfs-data/src/main.rs` control RPCs, `crates/dtfs-common/src/tls.rs` `endpoint()` ~182 | `req.set_timeout(Duration::from_secs(10))` on heartbeat / report_chunk_status / register_node. `TlsContext::endpoint`: `.http2_keep_alive_interval(10s).keep_alive_timeout(5s).keep_alive_while_idle(true)`. | tls unit: endpoint builder sets keepalive (inspect via `Endpoint` debug or a builder-recording shim); data main: a mock manager that accepts then never answers → heartbeat loop advances within 15 s. | Tests pass. |
 | CR-5-5 | ⬜ | DATA-11 | `crates/dtfs-data/src/server.rs` `record_cache_hit` ~940; `crates/dtfs-client/src/client.rs` | Gate with `require_data_rpc_auth(secret, "RecordCacheHit", &req.chunk_id, md)`; client stamps. | server unit: secret set + no header → denied. | Test fails before, passes after. |
 | CR-5-6 | ⬜ | DATA-8 | `dtfs-data/src/main.rs` ~589-634 | Send `ChunkStatusReport` in batches of 1000 ids; re-enqueue only the unsent remainder + the failed batch. | unit on the batching helper: 2500 ids → 3 calls; failure on call 2 → 1500 re-enqueued. | Test passes. |
-| CR-5-7 | ⬜ | CMN-4 | `crates/dtfs-common/src/crypto.rs` `hex_decode` ~125 | `if !s.is_ascii() { return None; }`. | unit: `"€€"` → None, no panic. | Test fails (panics) before, passes after. |
+| CR-5-7 | ✅ | CMN-4 | `crates/dtfs-common/src/crypto.rs` `hex_decode` ~125 | `if !s.is_ascii() { return None; }`. | unit: `"€€"` → None, no panic. | Test fails (panics) before, passes after. |
 | CR-5-8 | ⬜ | — | `tests/release/cases/108-heartbeat-requires-mgr-rpc-auth.sh` | grpcurl (or dtfs-cli debug) Heartbeat without headers → PermissionDenied when secret set. | `bash -n` clean. | Present, unexecuted. |
 | CR-5-9 | ⬜ | — | `AGENTS.md` A.3.3 #7/#8, A.8 metadata entry | Heartbeat/ReportChunkStatus/RecordCacheHit gated; forward allow-list; control-plane deadlines + keepalive. | — | Same commit. |
 
@@ -808,3 +808,14 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   `docs/src/internals/invariants.md` gained a new `## A.6 — Data-node
   durability hardening (CR-4)` section carrying the full narrative for
   all four fixes. No code change; docs-only commit.
+
+## Verification log (Group 5)
+
+- **CR-5-7** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-common --release`: 106 -> 107 passed, 0 failed (1 new:
+  `test_hex_decode_non_ascii_returns_none`). Before the fix, the test
+  panicked (`byte index 2 is not a char boundary`) because `hex_decode`
+  sliced the input by byte offset without checking ASCII-ness first, so
+  a multi-byte-UTF8 MAC/nonce header could crash the process instead of
+  cleanly failing verification. Fix adds an `is_ascii()` guard before
+  the byte-slicing loop.
