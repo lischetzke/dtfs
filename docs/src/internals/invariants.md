@@ -267,6 +267,15 @@ the CAS base matched. `ReportScrubResult` clamps a non-finite
 snapshot load then fails to deserialize (discarding the whole snapshot —
 see RAFT-6).
 
+CR2-7-6 (RAFT-6) closes the hazard that discard opens: `main.rs` startup
+now calls `log_store::blank_sm_startup_allowed(sm_is_blank, last_purged)`
+right after opening the log store and state machine — a blank state
+machine (BP-2 discarded a corrupt snapshot) combined with a log already
+purged past some point refuses to start as a voter, since the discarded
+snapshot was the only surviving copy of everything before the purge
+point. A genuinely fresh, never-bootstrapped node (`last_purged ==
+None`) is unaffected.
+
 ### `dtfs-manager/src/scheduler.rs`
 
 **REV-1-1 — every manager background loop is leader-gated, not just

@@ -81,7 +81,14 @@ long form of AGENTS.md A.3.3/A.6, loaded only for the crates it governs.
    for which the SM records NO location entry naming that node
    ("de-located"; `scheduler::chunk_delocated_on_node`), after the same
    grace — this is what mops the byte-delete-failed leftovers produced by
-   the CO-1-3 Raft-remove-first ordering (item 6).
+   the CO-1-3 Raft-remove-first ordering (item 6). **CR2-7-2 (MGR-10)** —
+   when the data node's `ListChunks` reply carries `chunk_disk_ids`, the
+   de-located check and the reap delete are keyed by `(node_id, disk_id)`
+   instead of node-wide, so a leftover on ONE disk of a node is reaped
+   correctly even when another disk of the SAME node still holds a live
+   replica of the same chunk (the cold-anchor + warm-cache co-location);
+   an older data node reporting no disk ids falls back to the prior
+   node-wide behaviour exactly.
 9. Rename is a single Raft command; open handles keep reading the same
    chunks (path updated, chunk_id binding unchanged).
 10. Reads use replica-fallback (P0-2): try the next replica on error, fail

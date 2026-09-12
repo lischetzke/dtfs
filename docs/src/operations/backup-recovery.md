@@ -119,6 +119,13 @@ It rejoins as a follower on its own and catches up from the leader (log
 replay, or an `InstallSnapshot` if it fell far behind). No membership
 change and no backup restoration are needed.
 
+If startup instead logs a refusal naming a purged log index (RAFT-6 /
+CR2-7-6: the on-disk snapshot was corrupt/unreadable and this node's log
+has already been purged past it, so no local copy of the pre-purge
+history survives), treat it like Case B below — do not force a restart.
+
+
+
 **Case B -- the member lost its state** (disk failure, fresh host, wiped
 `data_dir`). A manager with empty Raft state does **not** auto-join: it
 comes up as an inert, empty learner (term 0, no leader, empty namespace)

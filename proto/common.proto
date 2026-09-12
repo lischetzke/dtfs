@@ -1,13 +1,13 @@
 syntax = "proto3";
 package dtfs.common;
 
-message NodeId {
-  string uuid = 1;
-}
-
-message ChunkId {
-  bytes hash = 1; // BLAKE3 content hash (32 bytes)
-}
+// PROTO-3 / CR2-7-7 — NodeId, ChunkId, ChunkMeta, TierReplication,
+// WriteSafety and VolumeConfig were removed: `grep -rn
+// "dtfs::common::\(TierReplication\|VolumeConfig\|NodeId\|ChunkId\|
+// ChunkMeta\|WriteSafety\)" crates/` returned zero Rust callers (the
+// runtime replication/volume-config shapes live in
+// dtfs-common/src/types.rs, not on this wire). Do not re-add a message
+// here without a Rust caller — see AGENTS.md § A.8 PROTO-3 entry.
 
 message Location {
   string region = 1;
@@ -20,7 +20,7 @@ message DiskInfo {
   uint32 disk_id = 1;
   string uuid = 2;
   string mount_path = 3;
-  string tier = 4; // "hot", "warm", "cold"
+  string tier = 4; // "hot", "warm", "cold", "tape"
   uint64 total_bytes = 5;
   uint64 used_bytes = 6;
   string status = 7; // "healthy", "degraded", "draining", "failed", "removed"
@@ -28,7 +28,7 @@ message DiskInfo {
 
 message NodeInfo {
   string id = 1;
-  string role = 2; // "manager" or "data"
+  string role = 2; // "manager", "data" or "client"
   string hostname = 3;
   uint32 grpc_port = 4;
   Location location = 5;
@@ -36,32 +36,4 @@ message NodeInfo {
   uint64 total_capacity = 7;
   uint64 used_capacity = 8;
   string health_status = 9;
-}
-
-message ChunkMeta {
-  string chunk_id = 1;
-  uint64 size = 2;
-  bytes checksum = 3;
-  int64 created_at = 4;
-  string volume_id = 5;
-  uint32 replication_factor = 6;
-}
-
-message TierReplication {
-  uint32 hot = 1;
-  uint32 warm = 2;
-  uint32 cold = 3;
-}
-
-message WriteSafety {
-  uint32 min_replicas_before_ack = 1;
-  uint32 write_timeout_secs = 2;
-}
-
-message VolumeConfig {
-  string id = 1;
-  string name = 2;
-  uint64 chunk_size_bytes = 3;
-  TierReplication replication = 4;
-  WriteSafety write_safety = 5;
 }

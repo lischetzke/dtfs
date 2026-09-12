@@ -20,12 +20,22 @@
 //!    in-memory + JSONL paths still capture the event durably for
 //!    forensics if Raft is unhealthy.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+/// CR2-7-4 / MGR-14 — cap on concurrent in-flight `AppendAudit` Raft
+/// proposals spawned by `AuditLog::log()`. Without a bound, flushing a
+/// 10k-entry backlog (e.g. after a Raft outage) spawned thousands of
+/// concurrent `client_write`s over the 40 Mbps LELI link at once. A `log()`
+/// call whose fan-out slot is exhausted is dropped (never blocked) — the
+/// local ring + JSONL archive stay authoritative for that event.
+const AUDIT_FANOUT_MAX_INFLIGHT: usize = 16;
 
 /// A single audit log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,7 +63,9 @@ pub struct AuditFilter {
 /// In-memory ring-buffer audit log with optional disk archive AND optional
 /// cluster-wide Raft fan-out (Bug AH).
 pub struct AuditLog {
-    entries: parking_lot::RwLock<Vec<AuditEntry>>,
+    // CR2-7-4 / MGR-14 — a VecDeque ring so eviction is O(1)
+    // pop_front() instead of Vec::remove(0)'s O(n) shift.
+    entries: parking_lot::RwLock<VecDeque<AuditEntry>>,
     max_entries: usize,
     /// If set, every `log()` call appends the entry to
     /// `<archive_dir>/audit-YYYYMMDD.jsonl` so events survive ring-buffer
@@ -69,18 +81,24 @@ pub struct AuditLog {
     fanout: Option<RaftFanout>,
 }
 
-/// Bug AH — bundle of state needed to propose an `AppendAudit` Raft write.
-/// Cloned into the spawned fan-out task so the public `AuditLog::log()` stays
-/// non-async and non-blocking.
-#[derive(Clone)]
-struct RaftFanout {
+/// CR2-7-4 / MGR-14 — the actual Raft dispatch is abstracted behind this
+/// trait so the bounded-fan-out semaphore gate in `RaftFanout`/`AuditLog`
+/// is unit-testable with a mock sink, without a live Raft node.
+#[async_trait::async_trait]
+trait FanoutSink: Send + Sync {
+    async fn dispatch(&self, entry: &AuditEntry);
+}
+
+/// Bug AH — sends `AppendAudit` through the real Raft node.
+struct RaftSink {
     raft: Arc<dtfs_raft::DtfsRaft>,
     /// Hostname of this manager, embedded as `origin_manager` so operators
     /// can tell which voter produced the event.
     origin_manager: String,
 }
 
-impl RaftFanout {
+#[async_trait::async_trait]
+impl FanoutSink for RaftSink {
     /// Propose `ClientRequest::AppendAudit` and wait up to 5 s for the
     /// Raft commit. On any error (ForwardToLeader on a follower, transport
     /// failure, timeout) we log at debug level and drop — the originator's
@@ -120,11 +138,41 @@ impl RaftFanout {
     }
 }
 
+/// Bug AH — bundle of state needed to propose an `AppendAudit` Raft write.
+/// Cloned into the spawned fan-out task so the public `AuditLog::log()` stays
+/// non-async and non-blocking.
+///
+/// CR2-7-4 / MGR-14 — `semaphore` bounds the number of `dispatch` tasks
+/// in flight at once to `AUDIT_FANOUT_MAX_INFLIGHT`; `dropped` counts
+/// `log()` calls that skipped fan-out because the bound was reached.
+/// Both are `Arc`-shared so every clone (one per `log()` call) sees the
+/// same bound and the same counter.
+#[derive(Clone)]
+struct RaftFanout {
+    sink: Arc<dyn FanoutSink>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl RaftFanout {
+    fn new(sink: Arc<dyn FanoutSink>) -> Self {
+        Self {
+            sink,
+            semaphore: Arc::new(tokio::sync::Semaphore::new(AUDIT_FANOUT_MAX_INFLIGHT)),
+            dropped: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn new_raft(raft: Arc<dtfs_raft::DtfsRaft>, origin_manager: String) -> Self {
+        Self::new(Arc::new(RaftSink { raft, origin_manager }))
+    }
+}
+
 impl AuditLog {
     /// Create a new audit log with the given maximum capacity (in-memory only).
     pub fn new(max_entries: usize) -> Self {
         Self {
-            entries: parking_lot::RwLock::new(Vec::with_capacity(
+            entries: parking_lot::RwLock::new(VecDeque::with_capacity(
                 max_entries.min(1024),
             )),
             max_entries,
@@ -137,7 +185,7 @@ impl AuditLog {
     /// JSONL file under `archive_dir`. The directory is created on first use.
     pub fn new_with_archive(max_entries: usize, archive_dir: PathBuf) -> Self {
         Self {
-            entries: parking_lot::RwLock::new(Vec::with_capacity(
+            entries: parking_lot::RwLock::new(VecDeque::with_capacity(
                 max_entries.min(1024),
             )),
             max_entries,
@@ -159,7 +207,7 @@ impl AuditLog {
     /// the cleaner path: build raft first, then build AuditLog with the
     /// raft handle (see `new_with_archive_and_fanout`).
     pub fn enable_raft_fanout(&mut self, raft: Arc<dtfs_raft::DtfsRaft>, origin_manager: String) {
-        self.fanout = Some(RaftFanout { raft, origin_manager });
+        self.fanout = Some(RaftFanout::new_raft(raft, origin_manager));
     }
 
     /// Bug AH — convenience constructor: archive + Raft fan-out wired
@@ -173,13 +221,24 @@ impl AuditLog {
         origin_manager: String,
     ) -> Self {
         Self {
-            entries: parking_lot::RwLock::new(Vec::with_capacity(
+            entries: parking_lot::RwLock::new(VecDeque::with_capacity(
                 max_entries.min(1024),
             )),
             max_entries,
             archive_dir: Some(archive_dir),
-            fanout: Some(RaftFanout { raft, origin_manager }),
+            fanout: Some(RaftFanout::new_raft(raft, origin_manager)),
         }
+    }
+
+    /// Return the number of `log()` calls that skipped Raft fan-out because
+    /// `AUDIT_FANOUT_MAX_INFLIGHT` in-flight `dispatch` tasks were already
+    /// running. `0` when Raft fan-out is disabled or never saturated.
+    /// CR2-7-4 / MGR-14 observability hook.
+    pub fn fanout_dropped_count(&self) -> u64 {
+        self.fanout
+            .as_ref()
+            .map(|f| f.dropped.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Record an audit event.
@@ -212,18 +271,38 @@ impl AuditLog {
         // Spawn-and-forget; the local ring + archive keep the event safe
         // even if the Raft write never completes (split-brain, network
         // partition, etc.).
+        //
+        // CR2-7-4 / MGR-14 — bound concurrent in-flight dispatch tasks via
+        // `try_acquire_owned`. A permit-holding `log()` spawns exactly one
+        // task; a `log()` that finds the bound exhausted skips fan-out
+        // entirely rather than queuing (never block the caller) — the
+        // local ring + JSONL archive remain authoritative for that event.
         if let Some(fanout) = self.fanout.clone() {
-            let entry_for_fanout = entry.clone();
-            tokio::spawn(async move {
-                fanout.dispatch(&entry_for_fanout).await;
-            });
+            match fanout.semaphore.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    let entry_for_fanout = entry.clone();
+                    let sink = fanout.sink.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        sink.dispatch(&entry_for_fanout).await;
+                    });
+                }
+                Err(_) => {
+                    fanout.dropped.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        action = %entry.action,
+                        "CR2-7-4 audit fan-out in-flight bound reached; \
+                         skipping Raft replication for this entry"
+                    );
+                }
+            }
         }
 
         let mut entries = self.entries.write();
         if entries.len() >= self.max_entries {
-            entries.remove(0);
+            entries.pop_front();
         }
-        entries.push(entry);
+        entries.push_back(entry);
     }
 
     /// Query audit entries using an optional filter.
@@ -486,5 +565,86 @@ mod tests {
             vec!["config.8", "config.6"],
             "newest matching entries first, filtered before limit"
         );
+    }
+
+    /// CR2-7-4 / MGR-14 — a mock `FanoutSink` that tracks how many
+    /// `dispatch` calls are concurrently in flight, so the semaphore bound
+    /// is testable without a live Raft node.
+    struct CountingSink {
+        current: Arc<std::sync::atomic::AtomicUsize>,
+        max_seen: Arc<std::sync::atomic::AtomicUsize>,
+        total_dispatched: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl FanoutSink for CountingSink {
+        async fn dispatch(&self, _entry: &AuditEntry) {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.current.fetch_add(1, SeqCst) + 1;
+            self.max_seen.fetch_max(now, SeqCst);
+            // Hold the "slot" long enough that a burst of log() calls
+            // overlaps in flight.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            self.current.fetch_sub(1, SeqCst);
+            self.total_dispatched.fetch_add(1, SeqCst);
+        }
+    }
+
+    /// CR2-7-4 / MGR-14 — 100 concurrent `log()` calls with Raft fan-out
+    /// enabled must never have more than `AUDIT_FANOUT_MAX_INFLIGHT`
+    /// dispatch tasks running at once, and every call that could not get a
+    /// slot must be counted as dropped rather than blocking `log()` (all
+    /// 100 calls return immediately, synchronously, below).
+    #[tokio::test]
+    async fn mgr_14_fanout_bounded_to_semaphore_capacity() {
+        let current = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let total_dispatched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = Arc::new(CountingSink {
+            current: current.clone(),
+            max_seen: max_seen.clone(),
+            total_dispatched: total_dispatched.clone(),
+        });
+
+        let mut log = AuditLog::new(1000);
+        log.fanout = Some(RaftFanout::new(sink));
+
+        for i in 0..100 {
+            // Synchronous call — must never block waiting for a fan-out slot.
+            log.log("api", &format!("action.{i}"), "tgt", "ok");
+        }
+
+        // Let the spawned dispatch tasks (and their sleeps) run to completion.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            max_seen.load(std::sync::atomic::Ordering::SeqCst) <= AUDIT_FANOUT_MAX_INFLIGHT,
+            "at most {AUDIT_FANOUT_MAX_INFLIGHT} dispatch tasks may run concurrently, saw {}",
+            max_seen.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let dispatched = total_dispatched.load(std::sync::atomic::Ordering::SeqCst) as u64;
+        let dropped = log.fanout_dropped_count();
+        assert_eq!(
+            dispatched + dropped,
+            100,
+            "every log() call either dispatched or was counted as dropped"
+        );
+        assert!(dropped > 0, "a burst of 100 calls must exhaust the {AUDIT_FANOUT_MAX_INFLIGHT}-slot bound");
+        assert_eq!(log.len(), 100, "the local ring keeps every entry regardless of fan-out");
+    }
+
+    /// CR2-7-4 / MGR-14 — the ring eviction order is unchanged by the
+    /// `Vec` -> `VecDeque` swap: the OLDEST entry is dropped first.
+    #[test]
+    fn mgr_14_vecdeque_ring_evicts_oldest_first() {
+        let log = AuditLog::new(3);
+        log.log("t", "a", "t", "r");
+        log.log("t", "b", "t", "r");
+        log.log("t", "c", "t", "r");
+        log.log("t", "d", "t", "r"); // evicts "a"
+
+        let all = log.query(&AuditFilter::default());
+        let actions: Vec<&str> = all.iter().map(|e| e.action.as_str()).collect();
+        assert_eq!(actions, vec!["d", "c", "b"], "newest-first, oldest ('a') evicted");
     }
 }
