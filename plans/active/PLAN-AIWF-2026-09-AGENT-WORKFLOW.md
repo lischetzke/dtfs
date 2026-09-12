@@ -432,7 +432,7 @@ every turn, becomes noise); a `SessionStart` hook that prints cluster state
 | AIWF-2-3 | Author `dtfs-reviewer`, `dtfs-integrity-auditor` | `.claude/agents/*.md` | Output matches the CORE-REVIEW-2026-09-12 finding shape | ✅ |
 | AIWF-2-4 | Author `dtfs-release-case-author` | `.claude/agents/*.md` | Produces a `bash -n`-clean case for a known past change | ✅ |
 | AIWF-3-1 | Add `.claude/settings.json` + `guard-git.sh` | `.claude/{settings.json,hooks/guard-git.sh}` | A `git commit --no-verify` attempt is blocked with a readable reason | ✅ |
-| AIWF-3-2 | Add `check-release-case.sh` | `.claude/hooks/check-release-case.sh` | Blocks a staged `dtfs-data/src` change with no case; passes with the trailer | ⬜ |
+| AIWF-3-2 | Add `check-release-case.sh` | `.claude/hooks/check-release-case.sh` | Blocks a staged `dtfs-data/src` change with no case; passes with the trailer | ✅ |
 | AIWF-3-3 | Add `rustfmt-check.sh` (advisory) | `.claude/hooks/rustfmt-check.sh` | Prints a diff on a deliberately mis-formatted edit; never blocks; no-ops without docker | ⬜ |
 | AIWF-4-1 | Release-note mechanism decision (D3) | `.github/cliff.toml`, `scripts/dtfs-release.sh` | `git-cliff` reproduces the current section grouping from commit subjects on the last 30 commits — or the task is closed as "keep PRs" | ⬜ |
 | AIWF-5-1 | Dry run: one real small fix end-to-end through the roster | any | A deferred LOW finding from CORE-REVIEW (e.g. CMN-4 `hex_decode` ASCII guard) lands via intake → implementer → auditor; record total tokens and compare against a same-fix baseline done inline | ⬜ |
@@ -501,6 +501,19 @@ roster is cheaper, not just tidier.
   the bodies of the last 5 real commits on master for the four trigger
   patterns -- zero matches, so the hook would not have blocked any of
   them.
+- AIWF-3-2 (2026-09-12): added `.claude/hooks/check-release-case.sh`,
+  gated per commit-segment like guard-git.sh. Tested via stdin-file
+  payloads in a scratch repo: a staged `crates/dtfs-data/src/store.rs`
+  change with a plain commit message blocked (exit 2); the same with a
+  `tests/release/cases/99-x.sh` also staged passed (exit 0); the same
+  with the file unstaged again but a `Release-case: none (pure
+  refactor)` trailer in the message passed (exit 0); a non-commit
+  command (`git status`) passed (exit 0). Regression-checked the last 5
+  real commits on master: none touched cluster-visible code, so none
+  would have been blocked; walked back further to commit `2740c16`
+  (touches `dtfs-fuse/src/*`) and confirmed it DID stage
+  `tests/release/cases/96-write-batch-flush.sh`, so the hook would have
+  passed it too.
 
 ## Deviations
 
