@@ -329,6 +329,18 @@ fn compute_self_quarantine_cleared(is_quarantined: bool, reported_fault_count: u
     !is_quarantined && reported_fault_count == 0
 }
 
+/// CR-3-6/MGR-7 — both forwarded Raft writes for a heartbeat's
+/// integrity-fault batch (`QuarantineNode` and, when the batch carries
+/// chunk ids, `RemoveCorruptChunkReplicas`) must succeed for the batch
+/// to count as accepted. Either failure means the node is not
+/// quarantined and/or the corrupt replica is not de-located, so the
+/// caller must surface `HeartbeatResponse.accepted = false` — the data
+/// node already re-enqueues its drained faults on that (Bug BF-5),
+/// mirroring the CO-3-7 contract `report_chunk_status` already has.
+fn integrity_fault_batch_accepted(quarantine_ok: bool, remove_corrupt_ok: bool) -> bool {
+    quarantine_ok && remove_corrupt_ok
+}
+
 /// CO-3-8 — may a heartbeat re-stamp this node's health back to Healthy?
 ///
 /// The heartbeat handler raft-writes `UpdateNodeStatus(healthy)` every
@@ -1251,6 +1263,11 @@ impl ManagerService for MetadataService {
         // metadata operation for the duration.
         // Older data nodes don't emit field 10; for them the vec is
         // empty + this block is a no-op (back-compat with pre-BF data).
+        // CR-3-6/MGR-7 — surfaced to the caller as `HeartbeatResponse.
+        // accepted`; the data node re-enqueues its drained faults / any
+        // dropped ChunkStatusReport-equivalent state when this comes back
+        // false (CO-3-7 parity).
+        let mut accepted = true;
         if !req.integrity_faults.is_empty() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1318,16 +1335,35 @@ impl ManagerService for MetadataService {
                      (faults={reported} chunks={distinct})"
                 ),
             };
-            let _ = self
+            // CR-3-6/MGR-7 — capture failures from BOTH forwarded writes
+            // and surface them as `accepted: false` via
+            // `integrity_fault_batch_accepted` (mirrors the CO-3-7 fix
+            // for `report_chunk_status`, which this heartbeat path
+            // previously lacked). During an election (or any transient
+            // forward failure) a `let _ =` here left the node neither
+            // quarantined nor de-located, and the corrupt replica stayed
+            // advertised healthy until the next scrub; the data node
+            // already re-enqueues drained faults when the ack is
+            // `accepted == false` (Bug BF-5, CO-3-7 parity).
+            let quarantine_ok = match self
                 .raft_write_or_forward(ClientRequest::QuarantineNode { node_id, info })
-                .await;
+                .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, node_id, "CR-3-6: failed to commit QuarantineNode from heartbeat integrity fault");
+                    false
+                }
+            };
             // Drop the (node, chunk) replica entries so the
             // under-replication scheduler immediately picks a healthy
             // source + re-replicates. RemoveCorruptChunkReplicas takes a
             // batch (the same shape `report_chunk_status` uses for the
             // Bug O scrub path), so ONE write covers every reported chunk.
-            if !batch.chunk_ids.is_empty() {
-                let _ = self
+            let remove_corrupt_ok = if batch.chunk_ids.is_empty() {
+                true
+            } else {
+                match self
                     .raft_write_or_forward(ClientRequest::RemoveCorruptChunkReplicas { now_ms: stamp_now_ms(),
                         node_id: node_id.to_string(),
                         chunk_hashes: batch.chunk_ids,
@@ -1337,7 +1373,17 @@ impl ManagerService for MetadataService {
                         // would need a proto change and is out of scope here.
                         disk_id: dtfs_raft::legacy_disk_id(),
                     })
-                    .await;
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::warn!(error = %e, node_id, "CR-3-6: failed to commit RemoveCorruptChunkReplicas from heartbeat integrity fault");
+                        false
+                    }
+                }
+            };
+            if !integrity_fault_batch_accepted(quarantine_ok, remove_corrupt_ok) {
+                accepted = false;
             }
             tracing::warn!(
                 node_id,
@@ -1422,7 +1468,7 @@ impl ManagerService for MetadataService {
         });
 
         Ok(Response::new(HeartbeatResponse {
-            accepted: true,
+            accepted,
             config_version: cfg_version,
             config_update,
             self_quarantine_cleared,
@@ -3785,6 +3831,19 @@ mod tests {
         assert!(!heartbeat_may_mark_healthy(HealthStatus::Maintenance));
         assert!(!heartbeat_may_mark_healthy(HealthStatus::Draining));
         assert!(!heartbeat_may_mark_healthy(HealthStatus::Quarantined));
+    }
+
+    /// CR-3-6/MGR-7 — the heartbeat integrity-fault batch is accepted
+    /// only when BOTH forwarded writes succeed; either failure means the
+    /// node is neither quarantined nor de-located, so the caller must
+    /// report `accepted = false` (CO-3-7 parity: the data node
+    /// re-enqueues drained faults on that).
+    #[test]
+    fn cr_3_6_integrity_fault_batch_accepted_truth_table() {
+        assert!(integrity_fault_batch_accepted(true, true));
+        assert!(!integrity_fault_batch_accepted(false, true), "QuarantineNode failed");
+        assert!(!integrity_fault_batch_accepted(true, false), "RemoveCorruptChunkReplicas failed");
+        assert!(!integrity_fault_batch_accepted(false, false), "both failed");
     }
 
     /// CO-4-13 — a file registered under a floor=2 volume must enforce

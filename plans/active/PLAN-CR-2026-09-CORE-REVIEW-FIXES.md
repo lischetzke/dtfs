@@ -128,7 +128,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-3-3 | ✅ | MGR-1 | `crates/dtfs-manager/src/metadata.rs` ReportChunkReads intercept ~1500; `tiering.rs` `evaluate` ~327 | Intercept: look up `sm_data` for the file(s) referencing `chunk_id` and the replica tier on `node_id` (`live_replica_tier`); pass real `file_path` + tier; skip `report_access` when the chunk is unknown. `evaluate`: `continue` when `path_to_volume.get(&profile.file_path).is_none()` (defence). | tiering unit: profile with `file_path: ""` yields zero legacy decisions; AV-volume chunk reported through the intercept yields zero legacy decisions; non-AV volume chunk still classifies. | Tests fail before, pass after. |
 | CR-3-4 | ✅ | MGR-4, MGR-8, MGR-9 | `scheduler.rs` `register_replica_location_for_path` ~1338, `register_replica` (`MigrationOps`), Completing transition ~2814, `resolve_disk_id_for_tier` ~4206 | (a) `register_replica` returns `Result<(), String>`; on `Err` task stays `Completing`, `attempts += 1`, retry next tick, `Failed` + alert at the existing cap. (b) path lookup + index lookup under ONE SM read lock; hash not found in the file → skip + warn, never `unwrap_or(0)`. (c) register the new row for EVERY `chunk_index` in the file whose rows carry the hash. (d) `resolve_disk_id_for_tier` filters `DiskStatus::{Failed, Removed}`; none live → return `Err`, task not Done. | `advance_round_tests` mock: register error → task stays Completing, Done after retry succeeds; unit for (b): hash absent → no `UpdateChunkLocations` proposed; unit for (c): two indexes same hash → both rows added; unit for (d). | Tests fail before, pass after. |
 | CR-3-5 | ✅ | MGR-5, MGR-6 | `scheduler.rs` `check_under_replicated` ~491/570, `schedule_replication`, `check_anchor_lag` ~867 | Use `task_blocks_requeue` in `check_under_replicated`'s dedup index and in `schedule_replication`. Source via `live_replica_tier`; target must satisfy `placement_cfg.has_room`. `check_anchor_lag`: honour `task_budget_available` (thread `created`/`live_tasks`), insert `(chunk, target)` into `existing_tasks` after each schedule. | scheduler unit: chunk with a recent Failed task → not re-queued; source on Failed disk not chosen; anchor-lag over N > budget chunks creates exactly budget tasks; two files same hash → one task. | Tests fail before, pass after. |
-| CR-3-6 | ⬜ | MGR-7 | `metadata.rs` heartbeat ~1250-1300, ~1385 | Capture `Err` from the `QuarantineNode` and `RemoveCorruptChunkReplicas` forwards; any failure → `accepted: false` in `HeartbeatResponse` (data node already re-enqueues on that, CO-3-7). Keep `AppendAudit` best-effort. | metadata unit (existing CO-3-7 test as template): forced forward failure → `accepted == false`. | Test fails before, passes after. |
+| CR-3-6 | ✅ | MGR-7 | `metadata.rs` heartbeat ~1250-1300, ~1385 | Capture `Err` from the `QuarantineNode` and `RemoveCorruptChunkReplicas` forwards; any failure → `accepted: false` in `HeartbeatResponse` (data node already re-enqueues on that, CO-3-7). Keep `AppendAudit` best-effort. | metadata unit (existing CO-3-7 test as template): forced forward failure → `accepted == false`. | Test fails before, passes after. |
 | CR-3-7 | ✅ | CMN-5 | `crates/dtfs-common/src/types.rs` `AnchorPolicy::is_satisfied_by` ~494, `hash_ring.rs` ~255/282 | `eq_ignore_ascii_case` at the three sites. | types unit: `anchor "leli"` satisfied by `"LELI"`; ring test with mixed case. | Tests fail before, pass after. |
 | CR-3-8 | ⬜ | MGR-10 (optional, do if time) | `proto/data.proto` `ListChunksResponse`, `dtfs-data/src/server.rs` list_chunks, `scheduler.rs` orphan reap | Add positional `chunk_disk_ids`; key `expected_by_node` on `(node, disk)`; pass `Some(disk_id)` to the reap delete. Empty field → legacy node-wide. | scheduler unit: warm leftover + cold live row on one node → reaped on warm disk only. | Test passes; old-manager compat path covered. |
 | CR-3-9 | ⬜ | — | `tests/release/cases/105-demote-refused-when-anchor-node-down.sh`, `106-legacy-tiering-skips-av-volume.sh` | Shell cases. | `bash -n` clean. | Present, unexecuted. |
@@ -593,6 +593,24 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   `check_under_replicated` methods directly (no `TaskScheduler`+`DtfsRaft`
   test harness exists in this crate); each new decision point is
   covered at the pure-function boundary it now goes through instead.
+
+- **CR-3-6** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-manager --release`: 364 -> 365 passed (1 new:
+  `metadata::tests::cr_3_6_integrity_fault_batch_accepted_truth_table`),
+  0 failed. The heartbeat handler's integrity-fault-batch block now
+  captures `Err` from both the `QuarantineNode` and (when the batch
+  carries chunk ids) `RemoveCorruptChunkReplicas` forwards and combines
+  them through a new pure `integrity_fault_batch_accepted(quarantine_ok,
+  remove_corrupt_ok)`; either failure sets the outer `accepted` (now a
+  `let mut` seeded true, returned as `HeartbeatResponse.accepted`
+  instead of the previous hardcoded `true`) to false. The data node
+  already re-enqueues drained faults on `!accepted` (Bug BF-5), so this
+  closes the same class of election-window drop that CO-3-7 fixed for
+  `report_chunk_status`. `AppendAudit` stays best-effort (`let _ =`),
+  unchanged. No test exercises the full `heartbeat` gRPC handler (no
+  `MetadataService`+`DtfsRaft` test harness exists in this crate, same
+  gap noted for CR-3-3); the new decision point
+  (`integrity_fault_batch_accepted`) is covered directly.
 
 - **CR-2-8** 2026-09-12. Added one sentence each to AGENTS.md A.3.1
   (the `now_ms` convention for a `ClientRequest` field that lands in
