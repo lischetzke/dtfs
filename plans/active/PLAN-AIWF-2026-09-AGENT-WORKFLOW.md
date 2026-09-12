@@ -422,11 +422,11 @@ every turn, becomes noise); a `SessionStart` hook that prints cluster state
 
 | ID | Task | Files | Done when | Status |
 |---|---|---|---|---|
-| AIWF-1-1 | Rewrite Part B from §3 | `AGENTS.md` | Part B ≤ 55 lines; every deleted rule has a new home or is deliberately dropped in this plan | ⬜ |
-| AIWF-1-2 | Move A.6 + FUSE/memory + config-surface invariants into path-scoped rules | `.claude/rules/{integrity,fuse,config-surface}.md`, `AGENTS.md` | `/context` shows the rules load only for matching paths; AGENTS.md keeps a one-line pointer each | ⬜ |
-| AIWF-1-3 | Condense Part A narratives into docs | `docs/src/internals/invariants.md`, `AGENTS.md`, `docs/src/SUMMARY.md` | AGENTS.md ≤ 250 lines; no invariant text lost (diff-reviewed) | ⬜ |
-| AIWF-1-4 | Split the release-case contract out of Part B | `tests/release/README.md` | Contains STATUS line, `trap case_cleanup`, `wait_for`, numbering, QUICK_CASES rules | ⬜ |
-| AIWF-1-5 | Update `plans/README.md` for D4/D5 | `plans/README.md` | States the ≥3-task trigger and the one-line verification-log form | ⬜ |
+| AIWF-1-1 | Rewrite Part B from §3 | `AGENTS.md` | Part B ≤ 55 lines; every deleted rule has a new home or is deliberately dropped in this plan | ✅ |
+| AIWF-1-2 | Move A.6 + FUSE/memory + config-surface invariants into path-scoped rules | `.claude/rules/{integrity,fuse,config-surface}.md`, `AGENTS.md` | `/context` shows the rules load only for matching paths; AGENTS.md keeps a one-line pointer each | ✅ |
+| AIWF-1-3 | Condense Part A narratives into docs | `docs/src/internals/invariants.md`, `AGENTS.md`, `docs/src/SUMMARY.md` | AGENTS.md ≤ 250 lines; no invariant text lost (diff-reviewed) | ✅ |
+| AIWF-1-4 | Split the release-case contract out of Part B | `tests/release/README.md` | Contains STATUS line, `trap case_cleanup`, `wait_for`, numbering, QUICK_CASES rules | ✅ |
+| AIWF-1-5 | Update `plans/README.md` for D4/D5 | `plans/README.md` | States the ≥3-task trigger and the one-line verification-log form | ✅ |
 | AIWF-2-1 | Author `dtfs-explore`, `dtfs-intake` | `.claude/agents/*.md` | Each routes on `description` alone in a trial prompt | ⬜ |
 | AIWF-2-2 | Author `dtfs-planner`, `dtfs-implementer` | `.claude/agents/*.md` | Implementer's build block matches the Docker command verbatim | ⬜ |
 | AIWF-2-3 | Author `dtfs-reviewer`, `dtfs-integrity-auditor` | `.claude/agents/*.md` | Output matches the CORE-REVIEW-2026-09-12 finding shape | ⬜ |
@@ -441,6 +441,24 @@ Ordering rationale: the AGENTS.md rewrite lands first because every agent
 prompt cites its sections; hooks land after the agents so the agents are the
 thing being guarded; the dry run is last and is the only evidence that the
 roster is cheaper, not just tidier.
+
+## Verification log
+
+- AIWF-1-1 (2026-09-12): `git log --oneline -1` -> `int: rewrite AGENTS.md
+  Part B for a single-developer workflow`; Part B 65 lines added / 156
+  removed net, section itself 51 lines.
+- AIWF-1-2 (2026-09-12): confirmed `.claude/rules/*.md` `paths:` frontmatter
+  against https://code.claude.com/docs/en/memory ("Path-specific rules")
+  before moving content; added `.claude/rules/{integrity,fuse,config-surface}.md`
+  and un-ignored them in `.gitignore`.
+- AIWF-1-3 (2026-09-12): `wc -l AGENTS.md` -> 188 (was 1041 at session start);
+  Part B span 34 lines; bug-archaeology narrative moved to
+  `docs/src/internals/invariants.md` + `docs/src/SUMMARY.md` entry.
+- AIWF-1-4 (2026-09-12): created `tests/release/README.md` with the STATUS
+  line / `trap case_cleanup` / `wait_for` / numbering / QUICK_CASES rules
+  extracted from the old B.5 prose.
+- AIWF-1-5 (2026-09-12): `plans/README.md` now states the >=3-task/
+  multi-session/cross-crate trigger and the one-line verification-log form.
 
 ## 8. Risks / open questions
 
