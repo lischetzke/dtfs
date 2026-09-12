@@ -130,8 +130,8 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-3-5 | ✅ | MGR-5, MGR-6 | `scheduler.rs` `check_under_replicated` ~491/570, `schedule_replication`, `check_anchor_lag` ~867 | Use `task_blocks_requeue` in `check_under_replicated`'s dedup index and in `schedule_replication`. Source via `live_replica_tier`; target must satisfy `placement_cfg.has_room`. `check_anchor_lag`: honour `task_budget_available` (thread `created`/`live_tasks`), insert `(chunk, target)` into `existing_tasks` after each schedule. | scheduler unit: chunk with a recent Failed task → not re-queued; source on Failed disk not chosen; anchor-lag over N > budget chunks creates exactly budget tasks; two files same hash → one task. | Tests fail before, pass after. |
 | CR-3-6 | ✅ | MGR-7 | `metadata.rs` heartbeat ~1250-1300, ~1385 | Capture `Err` from the `QuarantineNode` and `RemoveCorruptChunkReplicas` forwards; any failure → `accepted: false` in `HeartbeatResponse` (data node already re-enqueues on that, CO-3-7). Keep `AppendAudit` best-effort. | metadata unit (existing CO-3-7 test as template): forced forward failure → `accepted == false`. | Test fails before, passes after. |
 | CR-3-7 | ✅ | CMN-5 | `crates/dtfs-common/src/types.rs` `AnchorPolicy::is_satisfied_by` ~494, `hash_ring.rs` ~255/282 | `eq_ignore_ascii_case` at the three sites. | types unit: `anchor "leli"` satisfied by `"LELI"`; ring test with mixed case. | Tests fail before, pass after. |
-| CR-3-8 | ⬜ | MGR-10 (optional, do if time) | `proto/data.proto` `ListChunksResponse`, `dtfs-data/src/server.rs` list_chunks, `scheduler.rs` orphan reap | Add positional `chunk_disk_ids`; key `expected_by_node` on `(node, disk)`; pass `Some(disk_id)` to the reap delete. Empty field → legacy node-wide. | scheduler unit: warm leftover + cold live row on one node → reaped on warm disk only. | Test passes; old-manager compat path covered. |
-| CR-3-9 | ⬜ | — | `tests/release/cases/105-demote-refused-when-anchor-node-down.sh`, `106-legacy-tiering-skips-av-volume.sh` | Shell cases. | `bash -n` clean. | Present, unexecuted. |
+| CR-3-8 | 🟥 | MGR-10 (optional, do if time) | `proto/data.proto` `ListChunksResponse`, `dtfs-data/src/server.rs` list_chunks, `scheduler.rs` orphan reap | Add positional `chunk_disk_ids`; key `expected_by_node` on `(node, disk)`; pass `Some(disk_id)` to the reap delete. Empty field → legacy node-wide. | scheduler unit: warm leftover + cold live row on one node → reaped on warm disk only. | Test passes; old-manager compat path covered. |
+| CR-3-9 | ✅ | — | `tests/release/cases/105-demote-refused-when-anchor-node-down.sh`, `106-legacy-tiering-skips-av-volume.sh` | Shell cases. | `bash -n` clean. | Present, unexecuted. |
 | CR-3-10 | ⬜ | — | `AGENTS.md` A.3.4, A.8 scheduler/tiering entries | Document liveness in planners, register_replica Result, per-index registration, budget in anchor-lag, case-insensitive DC. | — | Same commit. |
 
 ### Group 4 — Data-node durability (branch `bug/cr-4-data-durability`)
@@ -191,6 +191,14 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 3. Implementer finishes with workspace suite green, pushes, opens a PR titled `bug: <group summary ≤72 chars>` labelled `bug`, and reports: tasks done, tasks 🟥 with reason, test counts before/after per crate, deviations.
 4. Lead reviews the diff against each finding's "Done when", runs the crate suites once more, merges (merge commit), and starts the next group from the updated `master`.
 5. After Group 6: lead re-reads every HIGH/MEDIUM finding against `master` and records OPEN/FIXED in the report's summary table; then deletes this plan file (§ B.2 retention).
+
+## Deviations (Group 3)
+
+- CR-3-8 (MGR-10, optional): deferred — proto change (`ListChunksResponse`
+  positional `chunk_disk_ids`) + data-node fill + reaper re-keying is a
+  multi-file, cross-crate change (proto/dtfs-data/dtfs-manager) explicitly
+  marked "optional, do if time" in the task brief; skipped to land the
+  required CR-3-1..3-7, 3-9, 3-10 tasks. MGR-10 stays open in the report.
 
 ## Verification log
 
@@ -611,6 +619,26 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   `MetadataService`+`DtfsRaft` test harness exists in this crate, same
   gap noted for CR-3-3); the new decision point
   (`integrity_fault_batch_accepted`) is covered directly.
+
+- **CR-3-9** 2026-09-12. Added
+  `tests/release/cases/105-demote-refused-when-anchor-node-down.sh`
+  (CR-3-1/CR-3-2/MGR-2: anchor cold=1 dc-a + warm cache, promote a warm
+  copy, stop the cold anchor's data node, assert `flush_cache(warm)` is
+  refused — warm copy survives — while the anchor is Down, then
+  succeeds once the node is healthy again) and
+  `tests/release/cases/106-legacy-tiering-skips-av-volume.sh`
+  (CR-3-3/MGR-1: active AV cache policy, write+read a file to generate
+  `ReportChunkReads`, assert the audit log carries no legacy
+  `Bug BX-4`/Tape-migration rows for that file's chunks). Both modeled
+  on `62-demote-colocated-anchor-survives.sh` (anchor+cache setup,
+  `set-anchor`/`set-mandatory`/`set-cache`, `count_replicas_in_dc_tier`/
+  `count_replicas_in_tier`) and `30-stale-liveness-downgrade.sh`
+  (stop/restart a data node, poll for health transition); `trap
+  case_cleanup EXIT`, last line `pass` (-> `STATUS: PASS`), `known_issue`
+  fallbacks for lab-topology gaps (no dc-a cold node, promotion not
+  landing in the poll window), not in `QUICK_CASES`. `bash -n` clean on
+  both. NOT executed — no lab, per the plan's Build/verify environment
+  section.
 
 - **CR-2-8** 2026-09-12. Added one sentence each to AGENTS.md A.3.1
   (the `now_ms` convention for a `ClientRequest` field that lands in
