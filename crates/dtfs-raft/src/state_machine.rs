@@ -1500,8 +1500,49 @@ fn apply_request(
             if from == to {
                 return ClientResponse::Success;
             }
-            // Remove the source's metadata, rewrite its path, re-insert under the new key.
-            if let Some(mut meta) = sm.files.remove(from) {
+            // RAFT-2 — a plain FUSE `rename_file(from, to)` used to move only
+            // the exact `from` key; a directory's children (stored under
+            // `from/...` keys, real or synthetic) were left stranded under
+            // the old prefix. Renaming a directory into its own subtree, or
+            // onto an existing non-empty directory, must be refused rather
+            // than silently corrupt the tree.
+            let from_prefix = format!("{from}/");
+            if to.starts_with(&from_prefix) {
+                return ClientResponse::Error {
+                    message: format!(
+                        "RenameFile: cannot rename '{from}' into its own subtree '{to}'"
+                    ),
+                };
+            }
+            let to_prefix = format!("{to}/");
+            let to_has_children = sm
+                .files
+                .range(to_prefix.clone()..)
+                .take_while(|(k, _)| k.starts_with(&to_prefix))
+                .next()
+                .is_some();
+            if to_has_children {
+                return ClientResponse::Error {
+                    message: format!(
+                        "RenameFile: destination '{to}' is a non-empty directory"
+                    ),
+                };
+            }
+            // Collect the child keys BEFORE mutating sm.files (BTreeMap
+            // iteration must not overlap a removal/insertion into itself).
+            let child_keys: Vec<String> = sm
+                .files
+                .range(from_prefix.clone()..)
+                .take_while(|(k, _)| k.starts_with(&from_prefix))
+                .map(|(k, _)| k.clone())
+                .collect();
+            let exact_source = sm.files.remove(from);
+            if exact_source.is_none() && child_keys.is_empty() {
+                return ClientResponse::Error {
+                    message: format!("RenameFile: source '{from}' not found"),
+                };
+            }
+            if let Some(mut meta) = exact_source {
                 meta.path = to.clone();
                 meta.updated_at_ms = now_ms;
                 sm.files.insert(to.clone(), meta);
@@ -1526,16 +1567,38 @@ fn apply_request(
                         sm.write_leases.remove(to);
                     }
                 }
-                push_audit_capped(
-                    &mut sm.audit_log,
-                    audit(format!("RenameFile: {from} -> {to}")),
-                );
-                ClientResponse::Success
-            } else {
-                ClientResponse::Error {
-                    message: format!("RenameFile: source '{from}' not found"),
-                }
             }
+            // Re-key every child (real or a synthetic sub-directory's own
+            // children) from `from/<suffix>` to `to/<suffix>`.
+            let mut moved_children: u64 = 0;
+            for old_key in child_keys {
+                let suffix = &old_key[from.len()..];
+                let new_key = format!("{to}{suffix}");
+                if let Some(mut meta) = sm.files.remove(&old_key) {
+                    meta.path = new_key.clone();
+                    meta.updated_at_ms = now_ms;
+                    sm.files.insert(new_key.clone(), meta);
+                }
+                if let Some(locks) = sm.posix_locks.remove(&old_key) {
+                    sm.posix_locks.insert(new_key.clone(), locks);
+                }
+                match sm.write_leases.remove(&old_key) {
+                    Some(lease) => {
+                        sm.write_leases.insert(new_key.clone(), lease);
+                    }
+                    None => {
+                        sm.write_leases.remove(&new_key);
+                    }
+                }
+                moved_children += 1;
+            }
+            push_audit_capped(
+                &mut sm.audit_log,
+                audit(format!(
+                    "RenameFile: {from} -> {to} ({moved_children} children moved)"
+                )),
+            );
+            ClientResponse::Success
         }
 
         ClientRequest::SetFileSize { path, new_size } => {
@@ -4469,6 +4532,85 @@ mod posix_path_regression {
             &ClientRequest::UpdateNodeStatus { node_id: 7, status: "healthy".into() });
         assert_eq!(count_audit_prefix(&sm, "UpdateNodeStatus:"), 2,
             "Healthy->Suspect then Suspect->Healthy = two transitions = two rows");
+    }
+
+    // ── RAFT-2 — RenameFile must move directory children, not just the
+    // exact key ──────────────────────────────────────────────────────
+
+    #[test]
+    fn raft_2_rename_directory_moves_children() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/a/".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+            path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::CreateFile {
+            path: "/a/b/y".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(4),
+            &ClientRequest::RenameFile { from: "/a".into(), to: "/c".into() });
+
+        assert!(sm.files.contains_key("/c"), "dir marker moved");
+        assert!(sm.files.contains_key("/c/x"), "child file moved");
+        assert!(sm.files.contains_key("/c/b/y"), "grandchild moved");
+        assert_eq!(sm.files.get("/c/x").unwrap().path, "/c/x",
+            "moved child's own path field must be updated");
+        assert!(!sm.files.contains_key("/a"), "old dir marker gone");
+        assert!(!sm.files.contains_key("/a/x"), "old child gone");
+        assert!(!sm.files.contains_key("/a/b/y"), "old grandchild gone");
+    }
+
+    #[test]
+    fn raft_2_rename_synthetic_directory_moves_children() {
+        let mut sm = StateMachineData::default();
+        // No mkdir marker for "/a" — only a file underneath it, so "/a" is
+        // a synthetic directory (Bug B).
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        let resp = apply_request(&mut sm, &mk_log_id(2),
+            &ClientRequest::RenameFile { from: "/a".into(), to: "/c".into() });
+        assert!(matches!(resp, ClientResponse::Success),
+            "synthetic-dir source with children must succeed, got {resp:?}");
+        assert!(sm.files.contains_key("/c/x"));
+        assert!(!sm.files.contains_key("/a/x"));
+    }
+
+    #[test]
+    fn raft_2_rename_onto_nonempty_directory_is_refused() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+            path: "/b/y".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        let resp = apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::RenameFile { from: "/a".into(), to: "/b".into() });
+        assert!(matches!(resp, ClientResponse::Error { .. }),
+            "renaming onto a non-empty directory must be refused, got {resp:?}");
+        assert!(sm.files.contains_key("/a/x"), "source untouched on refusal");
+        assert!(sm.files.contains_key("/b/y"), "destination untouched on refusal");
+    }
+
+    #[test]
+    fn raft_2_rename_lease_follows_child() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::AcquireWriteLease {
+            path: "/a/x".into(), owner_id: "writer-1".into(), lease_ms: 60_000, now_ms: 1_000,
+            proposed_lease_id: "lease-1".into(),
+        });
+        assert!(sm.write_leases.contains_key("/a/x"));
+        apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::RenameFile { from: "/a".into(), to: "/c".into() });
+        assert!(!sm.write_leases.contains_key("/a/x"), "old lease key gone");
+        let lease = sm.write_leases.get("/c/x").expect("lease follows the renamed child");
+        assert_eq!(lease.owner_id, "writer-1");
     }
 }
 
