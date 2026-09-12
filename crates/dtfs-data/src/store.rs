@@ -122,6 +122,15 @@ pub struct ChunkStore {
     /// cycle). The manager issues a `ReportScrubResult` Raft write per
     /// entry so the WebUI "Last Scrub" card populates.
     pending_scrub_results: Arc<parking_lot::Mutex<Vec<ScrubResultSummary>>>,
+    /// CR-4-4 (DATA-3) — striped per-chunk locks (256 stripes, indexed by
+    /// the chunk id's first byte) held across `commit_chunk_from_tmp_inner`
+    /// and `delete_chunk_idempotent_on_disk` so a concurrent put and delete
+    /// of the SAME chunk id can never interleave into a torn state (a
+    /// `.dat` with no `.meta`, or vice versa). In-memory only — a fresh
+    /// process starts with every stripe unlocked, which is fine because
+    /// the WAL (not the lock) is what makes recovery correct across a
+    /// restart.
+    chunk_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
 }
 
 /// Bug BY — a completed scrub result queued for the next heartbeat. The
@@ -147,7 +156,13 @@ impl ChunkStore {
             bytes_stored: Arc::new(AtomicU64::new(0)),
             pending_corruption: Arc::new(parking_lot::Mutex::new(Vec::new())),
             pending_scrub_results: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            chunk_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
         }
+    }
+
+    /// CR-4-4 (DATA-3) — the lock stripe for a chunk id (first byte).
+    fn chunk_lock_index(chunk_id: &ChunkId) -> usize {
+        chunk_id.0[0] as usize
     }
 
     /// Bug BY — queue a completed scrub result for the next heartbeat.
@@ -496,6 +511,12 @@ impl ChunkStore {
         size: u64,
         checksum: [u8; 32],
     ) -> DtfsResult<(ChunkMeta, u32)> {
+        // CR-4-4 (DATA-3) — hold this chunk id's stripe for the whole
+        // commit so a concurrent delete of the same id can't interleave.
+        let _chunk_guard = self.chunk_locks[Self::chunk_lock_index(chunk_id)]
+            .lock()
+            .await;
+
         // Look up the disk that owns this tmp path.
         let disk = self
             .disk_manager
@@ -535,12 +556,23 @@ impl ChunkStore {
             disk_path: disk.mount_path.to_string_lossy().to_string(),
             timestamp_ms: now_millis(),
         };
-        let wal_path = wal_dir_path.join(format!("{}.wal.json", chunk_id.as_hex()));
+        // CR-4-4 — op-keyed WAL name so a same-id put and delete never
+        // share (and clobber) one WAL file.
+        let wal_path = wal_dir_path.join(format!("{}.put.wal.json", chunk_id.as_hex()));
         write_wal_entry(&wal_path, &wal_entry).await?;
 
         // 2. Atomic rename tmp → final.
         let final_dat_path = chunk_dir.join(format!("{}.dat", chunk_id.as_hex()));
         let final_meta_path = chunk_dir.join(format!("{}.meta", chunk_id.as_hex()));
+
+        // CR-4-6 (DATA-7) — same CO-5-5 dedup this store's whole-buffer
+        // `put_chunk` already applies, now also on the production streaming
+        // commit path: a re-upload of the same content-addressed chunk
+        // must not double-count `chunk_count`/`bytes_stored`. Must be
+        // captured BEFORE the rename below, which would otherwise
+        // overwrite (and hide) any pre-existing `.dat`.
+        let already_present = final_dat_path.exists() && final_meta_path.exists();
+
         fs::rename(tmp_path, &final_dat_path)
             .await
             .map_err(DtfsError::Io)?;
@@ -552,7 +584,13 @@ impl ChunkStore {
         // a missing chunk from the manager's perspective.
         fsync_dir(&chunk_dir).await?;
 
-        // 3. Write the meta sidecar.
+        // 3. Write the meta sidecar. CR-4-2 (DATA-2) — atomic tmp+rename
+        // instead of a direct `File::create` at the final path: a crash
+        // mid-write of the direct create left a torn (partial/0-byte)
+        // `.meta` at the path readers use, which `get_chunk_meta` would
+        // then fail to parse. `write_meta_atomic` writes to this disk's
+        // `tmp/` dir, fsyncs, and renames over the final path so readers
+        // only ever see a complete `.meta` or none at all.
         let meta = ChunkMeta {
             id: chunk_id.clone(),
             size,
@@ -561,19 +599,21 @@ impl ChunkStore {
             volume_id: volume_id.clone(),
             replication_factor: 1,
         };
-        let meta_json = serde_json::to_string_pretty(&meta)
-            .map_err(|e| DtfsError::Serialization(e.to_string()))?;
-        {
-            let mut file = fs::File::create(&final_meta_path)
-                .await
-                .map_err(DtfsError::Io)?;
-            file.write_all(meta_json.as_bytes())
-                .await
-                .map_err(DtfsError::Io)?;
-            file.sync_all().await.map_err(DtfsError::Io)?;
+        let meta_json = match serde_json::to_string_pretty(&meta) {
+            Ok(j) => j,
+            Err(e) => {
+                cleanup_after_dat_committed(&final_dat_path, &final_meta_path, &wal_path).await;
+                return Err(DtfsError::Serialization(e.to_string()));
+            }
+        };
+        if let Err(e) = write_meta_atomic(&disk.mount_path, &final_meta_path, &meta_json).await {
+            // CR-4-3 (DATA-4) — the `.dat` is already committed (renamed)
+            // at this point; a failure writing its `.meta` companion must
+            // not leave a `.dat` with no matching `.meta` (nor a stale WAL
+            // entry) behind.
+            cleanup_after_dat_committed(&final_dat_path, &final_meta_path, &wal_path).await;
+            return Err(e);
         }
-        // Bug L — fsync the parent directory after .meta creation too.
-        fsync_dir(&chunk_dir).await?;
 
         // 4. Clear WAL.
         let _ = fs::remove_file(&wal_path).await;
@@ -582,9 +622,12 @@ impl ChunkStore {
         // for recover_from_wal.
         let _ = fsync_dir(&wal_dir_path).await;
 
-        // 5. Counters.
-        self.chunk_count.fetch_add(1, Ordering::Relaxed);
-        self.bytes_stored.fetch_add(size, Ordering::Relaxed);
+        // 5. Counters — skip for a re-upload of an already-complete chunk
+        // (CR-4-6 / CO-5-5 parity).
+        if !already_present {
+            self.chunk_count.fetch_add(1, Ordering::Relaxed);
+            self.bytes_stored.fetch_add(size, Ordering::Relaxed);
+        }
 
         tracing::debug!(
             "Streamed chunk {} ({} bytes) onto disk {} (disk_id={})",
@@ -688,6 +731,12 @@ impl ChunkStore {
         chunk_id: &ChunkId,
         disk_id: Option<u32>,
     ) -> DtfsResult<(bool, u64)> {
+        // CR-4-4 (DATA-3) — hold this chunk id's stripe for the whole
+        // delete so a concurrent commit of the same id can't interleave.
+        let _chunk_guard = self.chunk_locks[Self::chunk_lock_index(chunk_id)]
+            .lock()
+            .await;
+
         for disk in self.disk_manager.all_disks() {
             // CO-1-1 — when a specific disk is requested, skip every other
             // disk so only the matching copy can be unlinked.
@@ -720,8 +769,9 @@ impl ChunkStore {
                     disk_path: disk.mount_path.to_string_lossy().to_string(),
                     timestamp_ms: now_millis(),
                 };
+                // CR-4-4 — op-keyed WAL name (see commit_chunk_from_tmp_inner).
                 let wal_path = wal_dir_path
-                    .join(format!("{}.wal.json", chunk_id.as_hex()));
+                    .join(format!("{}.delete.wal.json", chunk_id.as_hex()));
                 write_wal_entry(&wal_path, &wal_entry).await?;
 
                 // CO-1-4(a) — clear the DeleteChunk WAL on the error path
@@ -1004,10 +1054,29 @@ impl ChunkStore {
                                                     &disk.mount_path,
                                                     &cid,
                                                 );
-                                                if dat.exists() && !meta.exists() {
+                                                // CO-1-4b / CR-4-2 — a
+                                                // missing `.meta` and a
+                                                // present-but-unparseable
+                                                // (torn/0-byte) `.meta` are
+                                                // the same failure mode: an
+                                                // interrupted put that never
+                                                // reached a complete meta
+                                                // sidecar. Roll both back
+                                                // the same way.
+                                                let meta_missing_or_torn = if !meta.exists() {
+                                                    true
+                                                } else {
+                                                    match fs::read_to_string(&meta).await {
+                                                        Ok(s) => serde_json::from_str::<ChunkMeta>(&s)
+                                                            .is_err(),
+                                                        Err(_) => true,
+                                                    }
+                                                };
+                                                if dat.exists() && meta_missing_or_torn {
                                                     let _ = fs::remove_file(&dat).await;
+                                                    let _ = fs::remove_file(&meta).await;
                                                     tracing::info!(
-                                                        "Rolled back meta-less committed chunk {} (interrupted put)",
+                                                        "Rolled back meta-less/torn-meta committed chunk {} (interrupted put)",
                                                         wal_entry.chunk_id
                                                     );
                                                 }
@@ -1141,6 +1210,7 @@ impl ChunkStore {
             chunks_size_mismatch: 0,
             duration_secs: 0.0,
             corrupt_chunk_ids: Vec::new(),
+            chunks_meta_repaired: 0,
         };
         let mut skipped_in_flight: u64 = 0;
 
@@ -1200,9 +1270,7 @@ impl ChunkStore {
                     // removed only once the .meta has been fsynced, so its
                     // presence reliably indicates an in-flight write or
                     // replication into the destination disk.
-                    if !chunk_hex.is_empty()
-                        && wal.join(format!("{}.wal.json", chunk_hex)).exists()
-                    {
+                    if !chunk_hex.is_empty() && wal_entry_exists(&wal, &chunk_hex) {
                         skipped_in_flight += 1;
                         tracing::debug!(
                             chunk = %chunk_hex,
@@ -1243,9 +1311,23 @@ impl ChunkStore {
                     let chunk_meta_json = match fs::read_to_string(&meta_path).await {
                         Ok(s) => s,
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            // No `.meta` companion — the chunk is
-                            // unusable; existing accounting calls this
-                            // "missing".
+                            // CR-4-1 (DATA-1) — no `.meta` companion, but
+                            // the `.dat` is readable (we already stat'd it
+                            // above). Before treating this as a corrupt/
+                            // missing chunk, hash the `.dat` and check it
+                            // against the id encoded in its filename: if
+                            // they match, the bytes are fine and only the
+                            // sidecar was lost (e.g. CR-4-2's window before
+                            // this fix), so repair `.meta` instead of
+                            // quarantining a healthy chunk.
+                            if let Some(meta) = try_repair_meta_from_dat(
+                                disk_path, &path, &chunk_hex, file_meta.len(),
+                            ).await {
+                                result.chunks_meta_repaired += 1;
+                                result.chunks_healthy += 1;
+                                let _ = meta;
+                                continue;
+                            }
                             result.chunks_missing += 1;
                             if !chunk_hex.is_empty() {
                                 result.corrupt_chunk_ids.push(chunk_hex.clone());
@@ -1261,6 +1343,18 @@ impl ChunkStore {
                     let chunk_meta: ChunkMeta = match serde_json::from_str(&chunk_meta_json) {
                         Ok(m) => m,
                         Err(e) => {
+                            // CR-4-1 (DATA-1) — same repair-before-quarantine
+                            // logic for a `.meta` that exists but fails to
+                            // parse (torn/0-byte, CR-4-2's window before
+                            // this fix).
+                            if let Some(meta) = try_repair_meta_from_dat(
+                                disk_path, &path, &chunk_hex, file_meta.len(),
+                            ).await {
+                                result.chunks_meta_repaired += 1;
+                                result.chunks_healthy += 1;
+                                let _ = meta;
+                                continue;
+                            }
                             io_errors += 1;
                             record_scrub_fault(&mut result, &chunk_hex, "meta_parse", &e);
                             continue;
@@ -1335,6 +1429,45 @@ impl ChunkStore {
         result.duration_secs = start.elapsed().as_secs_f64();
         Ok(result)
     }
+}
+
+/// CR-4-1 (DATA-1) — attempt to repair a missing/unparseable `.meta` by
+/// re-hashing the already-stat'd `.dat` and comparing the digest to the id
+/// encoded in the filename. Returns the rebuilt `ChunkMeta` (already
+/// written atomically to `path`'s `.meta` companion) on a match, or `None`
+/// when the id is malformed, the hash doesn't match (real corruption — the
+/// caller must still quarantine), or the write itself failed. Never mutates
+/// `result`; the caller updates its own counters based on the outcome.
+async fn try_repair_meta_from_dat(
+    disk_root: &Path,
+    dat_path: &Path,
+    chunk_hex: &str,
+    size: u64,
+) -> Option<ChunkMeta> {
+    let chunk_id = ChunkId::from_hex(chunk_hex).ok()?;
+    let digest = hash_chunk_file_incrementally(dat_path, size).await.ok()?;
+    if digest != chunk_id.0 {
+        return None;
+    }
+    let meta = ChunkMeta {
+        id: chunk_id,
+        size,
+        checksum: digest,
+        created_at: chrono::Utc::now().timestamp(),
+        // The real volume can't be recovered from the `.dat` alone; the
+        // "default" volume is a best-effort placeholder purely so the
+        // sidecar is complete and parseable again.
+        volume_id: VolumeId::new("default".to_string()),
+        replication_factor: 1,
+    };
+    let meta_json = serde_json::to_string_pretty(&meta).ok()?;
+    let final_meta_path = dat_path.with_extension("meta");
+    write_meta_atomic(disk_root, &final_meta_path, &meta_json).await.ok()?;
+    tracing::info!(
+        chunk = %chunk_hex,
+        "CR-4-1 scrub repaired missing/torn .meta from a verified .dat"
+    );
+    Some(meta)
 }
 
 /// REV-4-4 — count one per-chunk scrub failure as corruption and report
@@ -1473,6 +1606,20 @@ fn wal_dir(disk_path: &Path) -> PathBuf {
     disk_path.join(".dtfs").join("wal")
 }
 
+/// CR-4-4 follow-up — does ANY WAL entry exist for this chunk id, under
+/// either the op-keyed names (`<id>.put.wal.json` / `<id>.delete.wal.json`)
+/// or the legacy `<id>.wal.json`? `commit_chunk_from_tmp_inner` and
+/// `delete_chunk_idempotent_on_disk` write the op-keyed names; anything
+/// that needs to detect "this chunk has an in-flight write/delete"
+/// (currently just the scrub P0-5 skip) must check all three names, not
+/// just the legacy one, or CR-4-4's WAL rename silently broke the
+/// detection.
+fn wal_entry_exists(wal_dir: &Path, chunk_hex: &str) -> bool {
+    wal_dir.join(format!("{chunk_hex}.put.wal.json")).exists()
+        || wal_dir.join(format!("{chunk_hex}.delete.wal.json")).exists()
+        || wal_dir.join(format!("{chunk_hex}.wal.json")).exists()
+}
+
 /// Write a WAL entry to disk with fsync. Also fsyncs the parent
 /// directory so the entry-creation is durable (Bug L).
 async fn write_wal_entry(path: &Path, entry: &WalEntry) -> DtfsResult<()> {
@@ -1494,11 +1641,60 @@ async fn write_wal_entry(path: &Path, entry: &WalEntry) -> DtfsResult<()> {
     Ok(())
 }
 
-/// Bug O — quarantine a chunk whose on-disk bytes have failed scrub
-/// verification. We delete the `.dat` so future reads naturally fall
-/// back to other replicas (the FUSE client's replica-fallback loop is
-/// already correct). We KEEP the `.meta` for forensics under the
-/// disk's `.dtfs/quarantine/` directory so an operator can investigate.
+/// CR-4-2 (DATA-2) — write a `.meta` sidecar atomically: tmp file in this
+/// disk's `tmp/` dir, `sync_all`, rename over `final_meta_path`, fsync the
+/// destination directory. On any failure the tmp file is removed, so a
+/// crash or error mid-write never leaves a torn `.meta` at `final_meta_path`
+/// — the final path either has the complete previous content (rename not
+/// yet reached) or the complete new content (rename succeeded).
+async fn write_meta_atomic(
+    disk_root: &Path,
+    final_meta_path: &Path,
+    meta_json: &str,
+) -> DtfsResult<()> {
+    let tmp = tmp_dir(disk_root);
+    fs::create_dir_all(&tmp).await.map_err(DtfsError::Io)?;
+    let tmp_path = tmp.join(format!("{}.meta.tmp", uuid::Uuid::new_v4()));
+
+    {
+        let mut file = fs::File::create(&tmp_path).await.map_err(DtfsError::Io)?;
+        file.write_all(meta_json.as_bytes())
+            .await
+            .map_err(DtfsError::Io)?;
+        file.sync_all().await.map_err(DtfsError::Io)?;
+    }
+
+    if let Err(e) = fs::rename(&tmp_path, final_meta_path).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(DtfsError::Io(e));
+    }
+    if let Some(parent) = final_meta_path.parent() {
+        fsync_dir(parent).await?;
+    }
+    Ok(())
+}
+
+/// CR-4-3 (DATA-4) — after `.dat` has been renamed into place, any later
+/// failure (writing `.meta`, etc.) must not leave a committed `.dat`
+/// without its `.meta` companion, nor a stale WAL entry that would
+/// re-trigger recovery against a chunk that no longer exists. Removing all
+/// three is safe even when some of them were never created.
+async fn cleanup_after_dat_committed(final_dat_path: &Path, final_meta_path: &Path, wal_path: &Path) {
+    let _ = fs::remove_file(final_dat_path).await;
+    let _ = fs::remove_file(final_meta_path).await;
+    let _ = fs::remove_file(wal_path).await;
+}
+
+/// Bug O / CR-4-1 (DATA-1) — quarantine a chunk whose on-disk bytes have
+/// failed scrub verification (checksum mismatch or unreadable `.dat`).
+///
+/// The `.dat` is RENAMED (never `remove_file`d) to
+/// `.dtfs/quarantine/<id>.dat.bad` so the corrupt bytes are preserved for
+/// forensics instead of being destroyed outright — an operator can pull
+/// the file and inspect it before it's ever overwritten. If a `.dat.bad`
+/// from an earlier quarantine of the same id already exists, it is
+/// overwritten (the newer failure is what matters). The `.meta` moves to
+/// `.dtfs/quarantine/<id>.meta.bad` as a breadcrumb, same as before.
 pub async fn quarantine_chunk_on_disk(
     disk_mount: &Path,
     chunk_id_hex: &str,
@@ -1512,16 +1708,22 @@ pub async fn quarantine_chunk_on_disk(
     let q_root = disk_mount.join(".dtfs").join("quarantine");
     fs::create_dir_all(&q_root).await.map_err(DtfsError::Io)?;
     let q_meta = q_root.join(format!("{}.meta.bad", chunk_id_hex));
+    let q_dat = q_root.join(format!("{}.dat.bad", chunk_id_hex));
 
     // Move the .meta as a breadcrumb (operators can correlate with logs).
     if meta.exists() {
+        // Overwrite any earlier quarantine breadcrumb for this id.
+        let _ = fs::remove_file(&q_meta).await;
         let _ = fs::rename(&meta, &q_meta).await;
     }
-    // Drop the .dat outright — it failed checksum, there's no point keeping it.
+    // Preserve the corrupt .dat instead of destroying it: rename it into
+    // quarantine so it survives for forensics.
     if dat.exists() {
-        let _ = fs::remove_file(&dat).await;
+        let _ = fs::remove_file(&q_dat).await;
+        let _ = fs::rename(&dat, &q_dat).await;
     }
     let _ = fsync_dir(&chunk_dir).await;
+    let _ = fsync_dir(&q_root).await;
     Ok(())
 }
 
@@ -1769,6 +1971,152 @@ mod tests {
              scrubbed; got {} healthy",
             res.chunks_healthy
         );
+    }
+
+    // ── CR-4-1 (DATA-1) — quarantine-by-rename + scrub meta repair ──
+
+    /// A `.dat` whose bytes still hash to the id, but whose `.meta` is
+    /// torn (0 bytes), must be REPAIRED by scrub, not quarantined: no
+    /// corrupt id, `chunks_meta_repaired` counts it, and the `.meta` is
+    /// readable again afterwards.
+    #[tokio::test]
+    async fn cr_4_1_scrub_repairs_torn_meta_from_good_dat() {
+        let (store, _tmp) = make_test_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+        let disk = store.disk_paths()[0].clone();
+
+        let data = b"cr-4-1-good-dat-torn-meta";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Hot).await.unwrap();
+
+        // Tear the .meta.
+        std::fs::write(chunk_meta_path(&disk, &chunk_id), b"").unwrap();
+
+        let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+        assert_eq!(res.chunks_meta_repaired, 1, "torn-but-verifiable meta must be repaired");
+        assert_eq!(res.chunks_healthy, 1);
+        assert!(res.corrupt_chunk_ids.is_empty(), "a repaired chunk is not corrupt");
+
+        // The .meta is parseable again and matches the .dat.
+        let repaired = store.get_chunk_meta(&chunk_id).await.unwrap();
+        assert_eq!(repaired.checksum, chunk_id.0);
+    }
+
+    // ── CR-4-4 follow-up — P0-5 in-flight skip must recognise every WAL
+    // name CR-4-4 introduced, not just the legacy one. Without this, a
+    // chunk whose `.dat` has just been renamed into place but whose
+    // `.meta` isn't written yet (put_chunk mid-commit, WAL still present)
+    // is no longer skipped by scrub: CR-4-1's repair-from-dat path then
+    // races commit_chunk_from_tmp_inner's own write_meta_atomic call.
+
+    /// `.dat` present, no `.meta`, and an op-keyed `<id>.put.wal.json`
+    /// present (the name `commit_chunk_from_tmp_inner` actually writes)
+    /// must still be skipped as in-flight: not checked, not repaired, not
+    /// reported corrupt, and scrub must not touch `.meta` at all.
+    #[tokio::test]
+    async fn cr_4_4_scrub_skips_in_flight_chunk_with_put_wal_name() {
+        let (store, tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+
+        let data = b"cr-4-4-in-flight-put-wal";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        let dir = chunk_data_dir(&disk, &chunk_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(chunk_data_path(&disk, &chunk_id), data).unwrap();
+        // No .meta — mid-commit, exactly the window write_meta_atomic
+        // hasn't reached yet.
+        let wal_path = wal_dir(tmp.path()).join(format!("{}.put.wal.json", chunk_id.as_hex()));
+        std::fs::create_dir_all(wal_path.parent().unwrap()).unwrap();
+        std::fs::write(&wal_path, b"{}").unwrap();
+
+        let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+        assert_eq!(res.chunks_checked, 0, "in-flight chunk must not be examined at all");
+        assert_eq!(res.chunks_meta_repaired, 0, "must not race write_meta_atomic with a repair");
+        assert!(res.corrupt_chunk_ids.is_empty());
+        assert!(!chunk_meta_path(&disk, &chunk_id).exists(), "scrub must not write a .meta here");
+    }
+
+    /// Same scenario, but with the legacy `<id>.wal.json` name (an older
+    /// data node build, or a WAL entry the streaming test-only `put_chunk`
+    /// path still writes) — must be skipped identically.
+    #[tokio::test]
+    async fn cr_4_4_scrub_skips_in_flight_chunk_with_legacy_wal_name() {
+        let (store, tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+
+        let data = b"cr-4-4-in-flight-legacy-wal";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        let dir = chunk_data_dir(&disk, &chunk_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(chunk_data_path(&disk, &chunk_id), data).unwrap();
+        let wal_path = wal_dir(tmp.path()).join(format!("{}.wal.json", chunk_id.as_hex()));
+        std::fs::create_dir_all(wal_path.parent().unwrap()).unwrap();
+        std::fs::write(&wal_path, b"{}").unwrap();
+
+        let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+        assert_eq!(res.chunks_checked, 0, "in-flight chunk must not be examined at all");
+        assert_eq!(res.chunks_meta_repaired, 0, "must not race write_meta_atomic with a repair");
+        assert!(res.corrupt_chunk_ids.is_empty());
+        assert!(!chunk_meta_path(&disk, &chunk_id).exists(), "scrub must not write a .meta here");
+    }
+
+    /// A `.dat` whose bytes do NOT hash to its own filename id (real
+    /// corruption) must still be quarantined — by RENAME, not deletion:
+    /// `.dtfs/quarantine/<id>.dat.bad` exists with the original bytes and
+    /// the live `.dat` is gone.
+    #[tokio::test]
+    async fn cr_4_1_bad_dat_quarantined_by_rename_not_delete() {
+        let (store, _tmp) = make_test_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+        let disk = store.disk_paths()[0].clone();
+
+        let data = b"cr-4-1-corrupt-me";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Hot).await.unwrap();
+
+        // Corrupt the bytes in place (size unchanged so the quick
+        // size-check passes and the deep hash check is what catches it).
+        let dat_path = chunk_data_path(&disk, &chunk_id);
+        let mut corrupted = data.to_vec();
+        corrupted[0] ^= 0xFF;
+        std::fs::write(&dat_path, &corrupted).unwrap();
+
+        let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+        assert_eq!(res.corrupt_chunk_ids, vec![chunk_id.as_hex()]);
+        assert_eq!(res.chunks_meta_repaired, 0);
+
+        crate::store::quarantine_chunk_on_disk(&disk, &chunk_id.as_hex())
+            .await
+            .unwrap();
+
+        assert!(!dat_path.exists(), ".dat removed from its live location");
+        let q_dat = disk.join(".dtfs").join("quarantine").join(format!("{}.dat.bad", chunk_id.as_hex()));
+        assert!(q_dat.exists(), "corrupt bytes preserved under quarantine, not deleted");
+        assert_eq!(std::fs::read(&q_dat).unwrap(), corrupted, "quarantined bytes are the original (corrupt) bytes");
+    }
+
+    /// A chunk whose `.dat` bytes do NOT hash to its own filename id AND
+    /// whose `.meta` is unparseable must stay corrupt — the repair-from-dat
+    /// path only fires on a verified hash match, so a genuinely wrong
+    /// `.dat` is correctly declined and still counted (unchanged behaviour
+    /// for real corruption; CR-4-1 only adds a repair path, it does not
+    /// weaken the corruption check).
+    #[tokio::test]
+    async fn cr_4_1_dat_hash_mismatch_with_bad_meta_stays_corrupt() {
+        let (store, _tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+
+        let ghost = ChunkId::from_bytes(checksum::compute(b"cr-4-1-real-content"));
+        let dir = chunk_data_dir(&disk, &ghost);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(chunk_meta_path(&disk, &ghost), b"not valid json").unwrap();
+        // .dat filename says `ghost`, but its bytes hash to something else
+        // entirely — a genuine mismatch the repair path must decline.
+        std::fs::write(chunk_data_path(&disk, &ghost), b"unrelated bytes").unwrap();
+
+        let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+        assert_eq!(res.corrupt_chunk_ids, vec![ghost.as_hex()]);
+        assert_eq!(res.chunks_meta_repaired, 0, "a hash mismatch must not be repaired");
     }
 
     // ── REV-3-2 — incremental (non-O(N)-per-page) chunk listing ────
@@ -2802,6 +3150,171 @@ mod tests {
         assert_eq!(after_del.total_chunks, 0);
         assert_eq!(after_del.total_bytes_stored, 0);
     }
+
+    // ── CR-4-2 (DATA-2) — atomic `.meta` write ─────────────────────
+
+    /// `write_meta_atomic` must never leave a partial `.meta` at the final
+    /// path: force the rename to fail (target directory doesn't exist) and
+    /// assert nothing landed at `final_meta_path` and no tmp leftover
+    /// remains in the disk's `tmp/` dir.
+    #[tokio::test]
+    async fn cr_4_2_write_meta_atomic_leaves_no_partial_on_rename_failure() {
+        let tmp = TempDir::new().unwrap();
+        let disk_root = tmp.path().to_path_buf();
+        fs::create_dir_all(disk_root.join("tmp")).await.unwrap();
+
+        let final_meta = disk_root.join("nonexistent-dir").join("x.meta");
+        let res = write_meta_atomic(&disk_root, &final_meta, "{}").await;
+        assert!(res.is_err(), "rename over a missing directory must fail");
+        assert!(!final_meta.exists(), "no partial .meta at the final path");
+
+        let mut left = fs::read_dir(disk_root.join("tmp")).await.unwrap();
+        assert!(
+            left.next_entry().await.unwrap().is_none(),
+            "failed rename must not leave a .meta.tmp leftover"
+        );
+    }
+
+    /// A WAL(Put) entry whose `.dat` is committed but whose `.meta` is
+    /// present-but-torn (0 bytes, unparseable) must be rolled back exactly
+    /// like the meta-missing case (CO-1-4b) — no torn `.meta` survives.
+    #[tokio::test]
+    async fn cr_4_2_put_wal_replay_rolls_back_torn_meta() {
+        let (store, tmp) = make_test_store().await;
+        let chunk_id = ChunkId::from_bytes([0xABu8; 32]);
+
+        let chunk_dir = chunk_data_dir(tmp.path(), &chunk_id);
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let dat_path = chunk_dir.join(format!("{}.dat", chunk_id.as_hex()));
+        std::fs::write(&dat_path, b"committed-but-torn-meta").unwrap();
+        let meta_path = chunk_dir.join(format!("{}.meta", chunk_id.as_hex()));
+        std::fs::write(&meta_path, b"").unwrap(); // 0-byte: unparseable
+
+        let wal_path = wal_dir(tmp.path()).join(format!("{}.wal.json", chunk_id.as_hex()));
+        let wal_entry = WalEntry {
+            operation: WalOperation::PutChunk,
+            chunk_id: chunk_id.as_hex(),
+            disk_path: tmp.path().to_string_lossy().to_string(),
+            timestamp_ms: now_millis(),
+        };
+        write_wal_entry(&wal_path, &wal_entry).await.unwrap();
+
+        store.recover_from_wal().await.unwrap();
+
+        assert!(!dat_path.exists(), "torn meta must roll back like meta-missing");
+        assert!(!meta_path.exists());
+        assert!(!wal_path.exists(), "WAL entry must be cleared after replay");
+    }
+
+    // ── CR-4-3 (DATA-4) — post-rename failure leaves no residue ────
+
+    /// If writing the `.meta` companion fails AFTER the `.dat` rename has
+    /// already committed, `commit_chunk_from_tmp` must remove the `.dat`,
+    /// any `.meta` and the WAL entry rather than leaving a `.dat` with no
+    /// matching `.meta`. Forced by pre-creating `final_meta_path` as a
+    /// non-empty directory so the rename in `write_meta_atomic` fails.
+    #[tokio::test]
+    async fn cr_4_3_meta_write_failure_after_rename_leaves_no_residue() {
+        let (store, tmp) = make_test_store().await;
+        let data = b"cr-4-3-payload";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+
+        let chunk_dir = chunk_data_dir(tmp.path(), &chunk_id);
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let final_meta_path = chunk_dir.join(format!("{}.meta", chunk_id.as_hex()));
+        // Pre-create the final .meta path as a non-empty directory so the
+        // tmp->final rename inside write_meta_atomic fails.
+        std::fs::create_dir_all(&final_meta_path).unwrap();
+        std::fs::write(final_meta_path.join("blocker"), b"x").unwrap();
+
+        let tmp_path = tmp.path().join("tmp").join(format!("{}.dat.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp_path, data).unwrap();
+
+        let res = store
+            .commit_chunk_from_tmp(&chunk_id, &tmp_path, &volume_id, DiskTier::Hot, data.len() as u64, hash)
+            .await;
+        assert!(res.is_err(), "meta write must fail while final_meta_path is a directory");
+
+        let final_dat_path = chunk_dir.join(format!("{}.dat", chunk_id.as_hex()));
+        assert!(!final_dat_path.exists(), "no orphan .dat left behind");
+        let wal_path = wal_dir(tmp.path()).join(format!("{}.wal.json", chunk_id.as_hex()));
+        assert!(!wal_path.exists(), "no stale WAL entry left behind");
+    }
+
+    // ── CR-4-4 (DATA-3) — per-chunk lock across commit/delete ──────
+
+    /// Racing `commit_chunk_from_tmp` against `delete_chunk_idempotent` on
+    /// the same chunk id, 200 times, must never observe a torn state: the
+    /// `.dat` and `.meta` companions always agree on presence.
+    #[tokio::test]
+    async fn cr_4_4_concurrent_commit_and_delete_never_tears_chunk() {
+        let (store, tmp) = make_test_store().await;
+        let store = Arc::new(store);
+        let disk_root = tmp.path().to_path_buf();
+        let data: &[u8] = b"cr-4-4-race-payload-bytes";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+
+        for i in 0..200u32 {
+            let tmp_path = disk_root.join("tmp").join(format!("race-{i}.dat.tmp"));
+            std::fs::write(&tmp_path, data).unwrap();
+
+            let s1 = store.clone();
+            let cid1 = chunk_id.clone();
+            let vol1 = volume_id.clone();
+            let tp = tmp_path.clone();
+            let h1 = tokio::spawn(async move {
+                let _ = s1
+                    .commit_chunk_from_tmp(&cid1, &tp, &vol1, DiskTier::Hot, data.len() as u64, hash)
+                    .await;
+            });
+            let s2 = store.clone();
+            let cid2 = chunk_id.clone();
+            let h2 = tokio::spawn(async move {
+                let _ = s2.delete_chunk_idempotent(&cid2).await;
+            });
+            let _ = tokio::join!(h1, h2);
+
+            let dat = chunk_data_path(&disk_root, &chunk_id);
+            let meta = chunk_meta_path(&disk_root, &chunk_id);
+            assert_eq!(
+                dat.exists(),
+                meta.exists(),
+                "iteration {i}: .dat and .meta must never diverge"
+            );
+
+            let _ = std::fs::remove_file(&dat);
+            let _ = std::fs::remove_file(&meta);
+        }
+    }
+
+    /// Recovery must process WAL entries under the new `.put.wal.json` /
+    /// `.delete.wal.json` names as well as the legacy `<id>.wal.json` name
+    /// (it matches on the `.json` extension and reads the operation out of
+    /// the JSON body, so all three co-exist during a rolling upgrade).
+    #[tokio::test]
+    async fn cr_4_4_recovery_reads_put_delete_and_legacy_wal_names() {
+        let (store, tmp) = make_test_store().await;
+        let wd = wal_dir(tmp.path());
+
+        for (suffix, id_byte) in [("put.wal.json", 0x11u8), ("delete.wal.json", 0x22u8), ("wal.json", 0x33u8)] {
+            let cid = ChunkId::from_bytes([id_byte; 32]);
+            let entry = WalEntry {
+                operation: WalOperation::PutChunk,
+                chunk_id: cid.as_hex(),
+                disk_path: tmp.path().to_string_lossy().to_string(),
+                timestamp_ms: now_millis(),
+            };
+            let path = wd.join(format!("{}.{}", cid.as_hex(), suffix));
+            write_wal_entry(&path, &entry).await.unwrap();
+        }
+
+        let n = store.recover_from_wal().await.unwrap();
+        assert_eq!(n, 3, "put/delete/legacy-named WAL files must all be recovered");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2947,10 +3460,17 @@ mod audit_co_tests {
             result.chunks_checked, 2,
             "scrub must examine both chunks, not abort on the first bad one"
         );
+        // CR-4-1 (DATA-1) — `bad_id`'s `.dat` is genuine (written by a real
+        // `put_chunk`), only its `.meta` was corrupted; the scrub now
+        // repairs a torn `.meta` from a verified `.dat` instead of
+        // quarantining an otherwise-healthy chunk, so BOTH chunks end up
+        // healthy and none are reported corrupt.
         assert_eq!(
-            result.chunks_healthy, 1,
-            "the healthy chunk must still be counted after the bad one"
+            result.chunks_healthy, 2,
+            "the .dat-verified chunk must be repaired, not quarantined"
         );
+        assert_eq!(result.chunks_meta_repaired, 1);
+        assert!(result.corrupt_chunk_ids.is_empty());
     }
 
     // CO-5-5 — committing the same content-addressed chunk twice must not
@@ -2981,6 +3501,40 @@ mod audit_co_tests {
             stats.total_bytes_stored,
             data.len() as u64,
             "re-putting the same chunk must count its bytes once"
+        );
+    }
+
+    // CR-4-6 (DATA-7) — CO-5-5's dedup, but on the PRODUCTION streaming
+    // commit path (`commit_chunk_from_tmp`), which is what `put_chunk`
+    // RPC actually calls in server.rs. `put_chunk` (whole-buffer) already
+    // had the dedup guard; this repoints the same invariant at the path
+    // that matters in production.
+    #[tokio::test]
+    async fn cr_4_6_duplicate_commit_from_tmp_must_not_double_count() {
+        let (store, tmp) = make_store().await;
+        let volume_id = VolumeId::new("default".to_string());
+        let data = b"identical re-upload via the streaming commit path";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+
+        for i in 0..2u32 {
+            let tmp_path = tmp.path().join("tmp").join(format!("dup-{i}.dat.tmp"));
+            std::fs::write(&tmp_path, data).unwrap();
+            store
+                .commit_chunk_from_tmp(&chunk_id, &tmp_path, &volume_id, DiskTier::Hot, data.len() as u64, hash)
+                .await
+                .unwrap();
+        }
+
+        let stats = store.stats();
+        assert_eq!(
+            stats.total_chunks, 1,
+            "re-committing the same content-addressed chunk must not inflate chunk_count"
+        );
+        assert_eq!(
+            stats.total_bytes_stored,
+            data.len() as u64,
+            "re-committing the same chunk must count its bytes once"
         );
     }
 }
