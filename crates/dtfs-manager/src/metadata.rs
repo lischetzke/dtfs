@@ -1155,10 +1155,14 @@ static WARNED_FLOOR_CLAMPED: std::sync::OnceLock<
 /// mandatory RF of the tier the chunks actually landed on (e.g. cold
 /// RF 1), which made `commit_chunk_locations` reject every write to
 /// that tier forever (CF-3b never re-checks, so the write buffer just
-/// keeps retrying and failing). Clamp the floor to the minimum
+/// keeps retrying and failing). Clamp the floor to the MAXIMUM
 /// `effective_mandatory_replicas().for_tier()` across the distinct
-/// tiers the committed chunks resolved to (conservative: never demand
-/// more replicas than the weakest placed tier's own RF promises). A
+/// tiers the committed chunks resolved to — R1 review fix: taking the
+/// minimum let a multi-tier placement (e.g. warm RF 3 + cold RF 1) with
+/// one warm + one cold replica clamp the floor down to 1 and ack at 2
+/// replicas, silently downgrading warm's own RF 3 requirement (exactly
+/// the RF downgrade A.3.3 #5 forbids). The floor may only be lowered to
+/// the HIGHEST RF any placed tier actually demands, never below it. A
 /// chunk whose node/disk can't be resolved to a live tier (unknown
 /// node, e.g. an old/rejoining data node) is skipped — it doesn't
 /// weaken the clamp, since it isn't evidence of a real placement tier.
@@ -1175,15 +1179,23 @@ fn clamp_ack_floor_to_rf(
         None => return floor,
     };
     let mandatory = volume.effective_mandatory_replicas();
-    let min_rf = chunks
+    // R1 review fix — MAX, not min, across the distinct tiers the chunks
+    // actually landed on. A multi-tier volume (e.g. warm RF 3 + cold RF 1)
+    // with a chunk placed 1 warm + 1 cold must still enforce warm's RF 3;
+    // taking the min silently downgraded the floor to 1 and acked the
+    // write at 2 replicas, exactly the RF downgrade the floor exists to
+    // prevent (A.3.3 #5). The floor may only be lowered to the HIGHEST RF
+    // any placed tier actually requires — never below what any placed
+    // tier itself demands.
+    let max_rf = chunks
         .iter()
         .filter_map(|c| {
             let node_id: u64 = c.node_id.parse().ok()?;
             let tier = live_replica_tier(sm.nodes.get(&node_id), c.disk_id)?;
             Some(mandatory.for_tier(tier))
         })
-        .min();
-    let Some(rf) = min_rf else {
+        .max();
+    let Some(rf) = max_rf else {
         return floor;
     };
     if rf >= floor {
@@ -4438,6 +4450,48 @@ mod tests {
         assert_eq!(
             clamp_ack_floor_to_rf(2, &sm, &unknown_chunks, "strict", "/movies/c.mkv", None),
             2
+        );
+    }
+
+    /// R1 review fix — a chunk placed on MULTIPLE tiers (warm RF 3 + cold
+    /// RF 1) must clamp to the HIGHEST placed tier's RF (3), never the
+    /// lowest (1). Taking the min silently downgraded the floor to 1 and
+    /// let a write ack at 2 replicas even though warm's own policy
+    /// demands 3 — exactly the RF downgrade the ack floor exists to
+    /// prevent (A.3.3 #5).
+    #[test]
+    fn cr_6_2_ack_floor_clamp_uses_highest_placed_tier_rf_not_lowest() {
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(1, mk_data_node(DiskTier::Warm));
+        sm.nodes.insert(2, mk_data_node(DiskTier::Cold));
+        let mut vol = vol_with_floor("mixed", 3);
+        vol.mandatory_replicas = dtfs_common::types::TierReplication {
+            hot: 0,
+            warm: 3,
+            cold: 1,
+            tape: 0,
+        };
+        sm.volumes.insert("mixed".to_string(), vol);
+        let mixed_chunks = vec![
+            dtfs_raft::ChunkLocationEntry {
+                chunk_index: 0,
+                chunk_hash: "abc".to_string(),
+                node_id: "1".to_string(),
+                disk_id: 0,
+                size_bytes: 1024,
+            },
+            dtfs_raft::ChunkLocationEntry {
+                chunk_index: 0,
+                chunk_hash: "abc".to_string(),
+                node_id: "2".to_string(),
+                disk_id: 0,
+                size_bytes: 1024,
+            },
+        ];
+        assert_eq!(
+            clamp_ack_floor_to_rf(3, &sm, &mixed_chunks, "mixed", "/movies/d.mkv", None),
+            3,
+            "warm's RF (3) must govern, not cold's RF (1) — the floor stays unchanged"
         );
     }
 
