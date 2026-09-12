@@ -502,6 +502,21 @@ impl DataService for DataServiceImpl {
         }
         let hash = hasher.finalize();
         let chunk_id = ChunkId::from_bytes(hash);
+        let computed_hex = chunk_id.as_hex();
+
+        // CR-4-5 (DATA-5, server half) — the FUSE/client caller declares
+        // the chunk_id it expects (BLAKE3 of the bytes it's about to
+        // stream) in the FIRST piece; reject a mismatch between that
+        // declaration and what we actually hashed off the wire BEFORE
+        // committing anything. An empty declared id is the documented
+        // compat case (older callers that don't declare one) and is
+        // accepted unconditionally. `tmp_guard` (not yet disarmed) cleans
+        // up the tmp file on this early return.
+        if !first.chunk_id.is_empty() && first.chunk_id != computed_hex {
+            return Err(Status::data_loss(
+                "declared chunk_id does not match received bytes",
+            ));
+        }
 
         let (meta, disk_id) = self
             .store
@@ -527,10 +542,8 @@ impl DataService for DataServiceImpl {
         // and the dashboard "↑ Write" showed 0 B/s under any load.
         self.metrics.record_write(total_size);
 
-        let id_hex = chunk_id.as_hex();
-
         Ok(Response::new(PutChunkResponse {
-            chunk_id: id_hex,
+            chunk_id: computed_hex,
             size: meta.size,
             checksum: hex::encode(&meta.checksum),
             success: true,
@@ -610,14 +623,12 @@ impl DataService for DataServiceImpl {
             &md,
         )?;
 
-        let chunk_id_bytes = chunk_hex::decode(&req.chunk_id)
+        // CR-4-7 (DATA-10) — ChunkId::from_hex byte-slices by hex-digit
+        // PAIR, not by raw string index, so a non-ASCII chunk_id (e.g. one
+        // containing a multi-byte UTF-8 char) is rejected as invalid_argument
+        // instead of panicking on a str-slice-not-a-char-boundary.
+        let chunk_id = ChunkId::from_hex(&req.chunk_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid chunk ID: {}", e)))?;
-        if chunk_id_bytes.len() != 32 {
-            return Err(Status::invalid_argument("Chunk ID must be 32 bytes"));
-        }
-        let mut id_array = [0u8; 32];
-        id_array.copy_from_slice(&chunk_id_bytes);
-        let chunk_id = ChunkId::from_bytes(id_array);
 
         // P0-9: record this read against the requester's DC for tiering's
         // auto-move-replica-toward-active-DC decisions.
@@ -740,14 +751,12 @@ impl DataService for DataServiceImpl {
             &req.chunk_id,
             &md,
         )?;
-        let chunk_id_bytes = chunk_hex::decode(&req.chunk_id)
+        // CR-4-7 (DATA-10) — ChunkId::from_hex byte-slices by hex-digit
+        // PAIR, not by raw string index, so a non-ASCII chunk_id (e.g. one
+        // containing a multi-byte UTF-8 char) is rejected as invalid_argument
+        // instead of panicking on a str-slice-not-a-char-boundary.
+        let chunk_id = ChunkId::from_hex(&req.chunk_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid chunk ID: {}", e)))?;
-        if chunk_id_bytes.len() != 32 {
-            return Err(Status::invalid_argument("Chunk ID must be 32 bytes"));
-        }
-        let mut id_array = [0u8; 32];
-        id_array.copy_from_slice(&chunk_id_bytes);
-        let chunk_id = ChunkId::from_bytes(id_array);
 
         // Bug AV — idempotent delete. The cache-flush scheduler routine
         // (AV-1-7) calls this directly; missing chunks (e.g. a retry
@@ -790,14 +799,12 @@ impl DataService for DataServiceImpl {
             &req.chunk_id,
             &md,
         )?;
-        let chunk_id_bytes = chunk_hex::decode(&req.chunk_id)
+        // CR-4-7 (DATA-10) — ChunkId::from_hex byte-slices by hex-digit
+        // PAIR, not by raw string index, so a non-ASCII chunk_id (e.g. one
+        // containing a multi-byte UTF-8 char) is rejected as invalid_argument
+        // instead of panicking on a str-slice-not-a-char-boundary.
+        let chunk_id = ChunkId::from_hex(&req.chunk_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid chunk ID: {}", e)))?;
-        if chunk_id_bytes.len() != 32 {
-            return Err(Status::invalid_argument("Chunk ID must be 32 bytes"));
-        }
-        let mut id_array = [0u8; 32];
-        id_array.copy_from_slice(&chunk_id_bytes);
-        let chunk_id = ChunkId::from_bytes(id_array);
 
         // CO-1-5 (§ A.6 #6) — VerifyChunk must BLAKE3 the on-disk bytes
         // against the stored ChunkMeta.checksum, not merely confirm the
@@ -814,7 +821,20 @@ impl DataService for DataServiceImpl {
             }
         };
         let dat_path = match self.store.chunk_file_path(&chunk_id) {
-            Some((path, _size)) => path,
+            Some((path, stat_size)) => {
+                // CR-4-6 (DATA-9) — a size mismatch is corruption/truncation
+                // that a checksum over the WRONG number of bytes can't
+                // reliably catch (e.g. a truncated file can still hash to
+                // a codepath that reads short and "succeeds"). Catch it
+                // before spending an I/O pass hashing the file.
+                if stat_size != meta.size {
+                    return Ok(Response::new(VerifyChunkResponse {
+                        valid: false,
+                        error: "size mismatch".to_string(),
+                    }));
+                }
+                path
+            }
             None => {
                 return Ok(Response::new(VerifyChunkResponse {
                     valid: false,
@@ -886,14 +906,12 @@ impl DataService for DataServiceImpl {
             &md,
         )?;
 
-        let chunk_id_bytes = chunk_hex::decode(&req.chunk_id)
+        // CR-4-7 (DATA-10) — ChunkId::from_hex byte-slices by hex-digit
+        // PAIR, not by raw string index, so a non-ASCII chunk_id (e.g. one
+        // containing a multi-byte UTF-8 char) is rejected as invalid_argument
+        // instead of panicking on a str-slice-not-a-char-boundary.
+        let chunk_id = ChunkId::from_hex(&req.chunk_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid chunk ID: {}", e)))?;
-        if chunk_id_bytes.len() != 32 {
-            return Err(Status::invalid_argument("Chunk ID must be 32 bytes"));
-        }
-        let mut id_array = [0u8; 32];
-        id_array.copy_from_slice(&chunk_id_bytes);
-        let chunk_id = ChunkId::from_bytes(id_array);
 
         match self
             .replication
@@ -958,25 +976,6 @@ impl DataService for DataServiceImpl {
         // data node. Recording the read for tiering is the
         // semantic we care about.)
         Ok(Response::new(RecordCacheHitResponse {}))
-    }
-}
-
-mod chunk_hex {
-    pub fn decode(s: &str) -> Result<Vec<u8>, String> {
-        if s.len() % 2 != 0 {
-            return Err("Hex string must have even length".to_string());
-        }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| {
-                u8::from_str_radix(&s[i..i + 2], 16)
-                    .map_err(|e| format!("Invalid hex char: {}", e))
-            })
-            .collect()
-    }
-
-    pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 
@@ -1510,6 +1509,114 @@ max_io_percent = 10
         let got = collect_stream(&svc, &chunk_hex).await.expect("authed get");
         assert_eq!(got, data);
     }
+
+    // ── CR-4-5 (DATA-5, server half) — declared chunk_id vs bytes ───
+
+    /// Start the real `DataServiceImpl` behind a plaintext in-process gRPC
+    /// server and drive a real streaming `PutChunk` RPC (a `Streaming<T>`
+    /// can't be constructed by hand outside a real transport). Returns
+    /// the RPC result and the store used, so callers can assert on-disk
+    /// state afterwards.
+    async fn run_put_chunk(
+        disk_path: &std::path::Path,
+        declared_chunk_id: &str,
+        data: &[u8],
+    ) -> (Result<PutChunkResponse, Status>, Arc<ChunkStore>) {
+        use dtfs_proto::dtfs::data::data_service_client::DataServiceClient;
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let svc = make_service(disk_path, true).await;
+        let store = svc.store.clone();
+        let secret = svc.config.cluster.shared_secret.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(DataServiceServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = DataServiceClient::new(channel);
+
+        let req = PutChunkRequest {
+            chunk_id: declared_chunk_id.to_string(),
+            volume_id: String::new(),
+            tier: "hot".to_string(),
+            data: data.to_vec(),
+        };
+        let mut request = Request::new(tokio_stream::iter(vec![req]));
+        if let Some((ts, mac)) = stamp_data_rpc_auth(&secret, "PutChunk", "") {
+            request
+                .metadata_mut()
+                .insert(DATA_RPC_AUTH_TS, ts.parse().unwrap());
+            request
+                .metadata_mut()
+                .insert(DATA_RPC_AUTH_MAC, mac.parse().unwrap());
+        }
+
+        let result = client
+            .put_chunk(request)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(|e| e);
+        (result, store)
+    }
+
+    /// A declared `chunk_id` that doesn't match the BLAKE3 of the bytes
+    /// actually streamed must be rejected with `data_loss` BEFORE
+    /// anything is committed — no `.dat` for either id ends up on disk.
+    #[tokio::test]
+    async fn cr_4_5_put_chunk_declared_id_mismatch_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = b"cr-4-5-real-bytes";
+        let wrong_id = "ab".repeat(32);
+
+        let (result, store) = run_put_chunk(tmp.path(), &wrong_id, data).await;
+        let err = result.expect_err("declared id mismatch must fail");
+        assert_eq!(err.code(), tonic::Code::DataLoss);
+
+        let real_id = ChunkId::from_bytes(checksum::compute(data));
+        assert!(!store.has_chunk(&real_id).await, "no chunk committed under the real hash");
+        assert!(
+            store.get_chunk_meta(&ChunkId::from_hex(&wrong_id).unwrap()).await.is_err(),
+            "no chunk committed under the (wrong) declared id either"
+        );
+    }
+
+    /// An empty declared `chunk_id` is the documented back-compat case
+    /// (older callers that never declared one) and must still be
+    /// accepted, with the response carrying the server-computed id.
+    #[tokio::test]
+    async fn cr_4_5_put_chunk_empty_declared_id_accepted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = b"cr-4-5-empty-declared-id";
+
+        let (result, store) = run_put_chunk(tmp.path(), "", data).await;
+        let resp = result.expect("empty declared id must be accepted (compat)");
+        let real_id = ChunkId::from_bytes(checksum::compute(data));
+        assert_eq!(resp.chunk_id, real_id.as_hex());
+        assert!(store.has_chunk(&real_id).await);
+    }
+
+    /// A declared `chunk_id` that DOES match the streamed bytes is
+    /// accepted, same as before this check existed.
+    #[tokio::test]
+    async fn cr_4_5_put_chunk_matching_declared_id_accepted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = b"cr-4-5-matching-declared-id";
+        let real_id = ChunkId::from_bytes(checksum::compute(data));
+
+        let (result, store) = run_put_chunk(tmp.path(), &real_id.as_hex(), data).await;
+        let resp = result.expect("matching declared id must be accepted");
+        assert_eq!(resp.chunk_id, real_id.as_hex());
+        assert!(store.has_chunk(&real_id).await);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1692,6 +1799,66 @@ max_io_percent = 10
             !resp.valid,
             "VerifyChunk must report invalid when the chunk's .meta is missing"
         );
+    }
+
+    // CR-4-6 (DATA-9) — a size mismatch between the on-disk .dat and
+    // ChunkMeta.size must be caught up front as "size mismatch", before
+    // spending an I/O pass hashing a file that can't possibly match.
+    #[tokio::test]
+    async fn cr_4_6_verify_chunk_detects_size_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path()).await;
+
+        let data = vec![7u8; 4096];
+        let chunk_id = ChunkId::from_bytes(checksum::compute(&data));
+        let chunk_hex = chunk_id.as_hex();
+        svc.store
+            .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+
+        // Append trailing garbage: the .meta still claims the original size.
+        let (dat_path, _size) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let mut with_garbage = data.clone();
+        with_garbage.extend_from_slice(b"trailing-garbage");
+        std::fs::write(&dat_path, &with_garbage).unwrap();
+
+        let mut req = Request::new(VerifyChunkRequest {
+            chunk_id: chunk_hex.clone(),
+        });
+        attach_data_rpc_auth(
+            &mut req,
+            &svc.config.cluster.shared_secret,
+            "VerifyChunk",
+            &chunk_hex,
+        );
+        let resp = svc
+            .verify_chunk(req)
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!resp.valid, "size mismatch must report invalid");
+        assert_eq!(resp.error, "size mismatch");
+    }
+
+    // CR-4-7 (DATA-10) — a non-ASCII chunk_id must be rejected as
+    // invalid_argument, never panic. The old hand-rolled `chunk_hex::decode`
+    // byte-sliced a `&str` by raw index, which panics on a str-slice that
+    // doesn't land on a UTF-8 char boundary; `ChunkId::from_hex` rejects
+    // non-ASCII input up front instead of slicing it.
+    #[tokio::test]
+    async fn cr_4_7_non_ascii_chunk_id_rejected_not_panicked() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path()).await;
+
+        let bad_id = "a\u{e9}a".to_string();
+        let mut req = Request::new(VerifyChunkRequest { chunk_id: bad_id.clone() });
+        attach_data_rpc_auth(&mut req, &svc.config.cluster.shared_secret, "VerifyChunk", &bad_id);
+
+        let result = svc.verify_chunk(req).await;
+        let err = result.expect_err("non-ASCII chunk_id must be rejected, not accepted");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     // CO-4-1 — the GetChunk feeder channel must not let a slow consumer
