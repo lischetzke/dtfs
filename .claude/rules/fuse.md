@@ -87,6 +87,42 @@ the instant a prefetch task acquires its `prefetch_slots` permit,
 letting `join_pending()` above distinguish a fetch genuinely in flight
 from one still queued. systemd `MemoryMax` remains the hard backstop.
 
+## Per-chunk cache-hit notify, single-flight misses, continuous prefetch (CR-6-6)
+
+`read()` tracks `OpenFile.last_read_chunk: Option<u32>` per fh; the pure
+`should_notify(last, current)` decides whether the CURRENT chunk index is
+a transition from the last one this fh touched. Three things gate on the
+same transition signal (computed once, right after building read
+candidates, before any cache lookup):
+
+- **FUSE-8** — `record_cache_hit` fires at most once per (fh, chunk)
+  transition, not once per 128 KB kernel read (a 4 MB chunk read in
+  128 KB pieces used to fire ~32 of these RPCs). In-flight notify tasks
+  are additionally bounded by a `Semaphore(CACHE_HIT_NOTIFY_MAX_INFLIGHT
+  = 8)`; a permit-less notify is simply skipped (a missed metrics ping
+  is acceptable, unlike a stalled read).
+- **FUSE-10** — `readahead.on_chunk_read` fires on every transition, hit
+  or miss (previously only on a miss), so the prefetch window slides
+  continuously instead of stalling for one synchronous foreground fetch
+  every `prefetch_chunks+1` chunks.
+- **FUSE-9** — a foreground cache MISS is single-flighted by chunk_id
+  (content-addressed, so any candidate node is interchangeable) via
+  `claim_foreground_fetch`/`complete_foreground_fetch` over a
+  `foreground_inflight: DashMap<String, watch::Receiver<Option<Bytes>>>`.
+  The first miss becomes the `Owner` (does the real `GetChunk` via the
+  extracted `fetch_chunk_from_candidates`, then publishes the result and
+  clears the entry); a concurrent miss on the SAME chunk_id becomes a
+  `Waiter` that awaits the Owner's `watch::Receiver` instead of issuing
+  its own fetch. A `Waiter` whose Owner's fetch failed (published `None`)
+  falls back to fetching it itself rather than failing the read. This
+  keeps N concurrent kernel reads into one cold chunk down to exactly one
+  `GetChunk` over the link instead of N.
+
+New WI-05/B2/H2 test coverage is unaffected: the join-pending path (a
+chunk already ON THE WIRE as a *prefetch*) is untouched and still tried
+before the miss branch; `foreground_inflight` only covers the foreground
+fetch loop itself.
+
 ## FUSE error mapping (CO-4-16)
 
 `fuse_adapter.rs` metadata ops map cluster errors via
