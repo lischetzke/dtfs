@@ -117,7 +117,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-2-5 | ✅ | RAFT-4 | `crates/dtfs-raft/src/lib.rs` `ClientRequest`, `state_machine.rs`, proposers in `dtfs-manager/src/metadata.rs`, `scheduler.rs`, `tiering.rs` | Add `#[serde(default)] now_ms: u64` to the seven variants listed in Data-model changes. In apply: `let now_ms = if req.now_ms == 0 { log_id.index /* CO-3-1 fallback */ } else { req.now_ms }`; pass it into `audit()` for those arms. Every proposer stamps `now_ms` from `SystemTime::now()`. Remove the top-of-apply `SystemTime::now()` once no arm needs it (leave it if any arm not in scope still does; note in Deviations). | SM unit: apply the same `RenameFile{now_ms: 1234}` on two fresh SMs → `serde_json::to_vec` identical; old-format entry (no `now_ms`) still deserialises. Snapshot compat test per § A.3.1. | Tests pass; `grep -n "SystemTime::now" state_machine.rs` shows only the fallback-free sites documented in Deviations. |
 | CR-2-6 | ✅ | RAFT-8, RAFT-9 | `state_machine.rs` `UpdateConfig` ~1386, `ReportScrubResult` ~1429 | UpdateConfig: `version = sm.cluster_config.version + 1`, ignore wire value (keep CAS check). ScrubRecord: `duration_secs = if x.is_finite() { x } else { 0.0 }`. | SM unit: UpdateConfig with wire version 1 after current 5 → stored 6; ScrubResult with NaN → snapshot round-trips. | Tests fail before, pass after. |
 | CR-2-7 | ✅ | — | `tests/release/cases/102-rename-directory-moves-children.sh`, `103-truncate-rewrite-reports-size.sh`, `104-quarantined-node-restart-stays-quarantined.sh` | Shell cases for RAFT-2/3/1 via FUSE + REST. | `bash -n` clean. | Present, unexecuted. |
-| CR-2-8 | ⬜ | — | `AGENTS.md` A.8 `state_machine.rs` entry, A.3.1 | Document `now_ms` convention, RenameFile prefix semantics, sticky-state carry-forward. | — | Same commit. |
+| CR-2-8 | ✅ | — | `AGENTS.md` A.8 `state_machine.rs` entry, A.3.1 | Document `now_ms` convention, RenameFile prefix semantics, sticky-state carry-forward. | — | Same commit. |
 
 ### Group 3 — Anchor / replica liveness in manager + tiering (branch `bug/cr-3-anchor-liveness`)
 
@@ -472,3 +472,11 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   and `22-register-audit-idempotent.sh` for the corrupt/restart idiom and
   `100-fuse-rewrite-offset-zero.sh` for the FUSE probe shape; none added
   to `QUICK_CASES`.
+
+- **CR-2-8** 2026-09-12. Added one sentence each to AGENTS.md A.3.1
+  (the `now_ms` convention for a `ClientRequest` field that lands in
+  replicated state) and the A.8 `state_machine.rs` table row (sticky-
+  state carry-forward, prefix rename, `logical_size` extent), both
+  pointing at a new `### dtfs-raft/src/state_machine.rs` section in
+  `docs/src/internals/invariants.md` § A.8 carrying the full CR-2-1..2-6
+  narrative.

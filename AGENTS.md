@@ -47,7 +47,7 @@ Non-goals: multi-tenant isolation, POSIX completeness (Plex's FUSE read + occasi
 
 ## A.3 Conventions — Do Not Break
 
-**A.3.1 Snapshot compat.** `StateMachineData` serialises to disk on snapshot. Every new field MUST carry `#[serde(default)]` so old snapshots load cleanly. Add a regression test (`state_machine::posix_path_regression` or `snapshot_persistence_tests`) per new field.
+**A.3.1 Snapshot compat.** `StateMachineData` serialises to disk on snapshot. Every new field MUST carry `#[serde(default)]` so old snapshots load cleanly. Add a regression test (`state_machine::posix_path_regression` or `snapshot_persistence_tests`) per new field. CR-2-5 — a `ClientRequest` field that lands in replicated state (e.g. a timestamp) MUST also carry `#[serde(default)] now_ms: u64`, stamped by the proposer, with the apply falling back to `log_id.index` when it's `0` (legacy entry) — see `docs/src/internals/invariants.md` § A.8.
 
 **A.3.2 Memory discipline.** No `Vec<u8>` accumulation of full chunks on the hot path, read or write — stream to/off disk, hash incrementally (Bug I, U2). Memory caps are best-effort, never reject by default (§ A.5). `[memory]` (CF-5) runs on all three roles, shared core `dtfs-common/src/memory.rs`, each with its own ladder rung (data sheds put_chunk; manager pauses scheduler ticks at Shed; fuse halves readahead at Warn, stops prefetch at Shed). systemd `MemoryMax` backstops all roles. FUSE detail: `.claude/rules/fuse.md`.
 
@@ -132,7 +132,7 @@ Full narrative (bug/task-ID reasoning behind each row) moved to `docs/src/intern
 
 | File | Responsibility |
 |---|---|
-| `dtfs-raft/src/state_machine.rs` | `apply_request`, the authoritative state-mutation point |
+| `dtfs-raft/src/state_machine.rs` | `apply_request`, the authoritative state-mutation point. CR-2-1..2-6 (RAFT-1/2/3/4/8/9): `RegisterNode` carries forward sticky Quarantined/Maintenance/Draining state instead of resetting to Healthy, `RenameFile` re-keys every child under a renamed directory (not just the exact key), `UpdateChunkLocations` grows `logical_size` to cover chunks committed past a truncate, and the seven `now_ms`-carrying variants apply deterministically — see `docs/src/internals/invariants.md` § A.8 |
 | `dtfs-raft/src/lib.rs::ClientRequest` | Command enum; new mutation = new variant + arm |
 | `dtfs-raft/src/network.rs::full_snapshot` | Snapshot-stream RPC; unreachable-vs-storage error mapping (Bug CL), bounded in-flight sends (CNF-4) |
 | `dtfs-manager/src/scheduler.rs` | Migration/re-replication loop, SOLE owner of replica repair; leader-gated, bounded, Raft-remove-before-byte-delete |
