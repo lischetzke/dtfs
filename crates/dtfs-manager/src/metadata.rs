@@ -312,11 +312,19 @@ impl MetadataService {
                 return Ok(c.clone());
             }
         }
+        // CR2-8-1 (CMN-3) — size this manager-to-manager forward client
+        // from the configured cap rather than tonic's 4 MB default.
+        let max_bytes =
+            dtfs_common::config::max_message_bytes(self.config.grpc.max_message_size_mb);
         let client = self
             .tls
             .connect(addr)
             .await
-            .map(ManagerServiceClient::new)
+            .map(|ch| {
+                ManagerServiceClient::new(ch)
+                    .max_decoding_message_size(max_bytes)
+                    .max_encoding_message_size(max_bytes)
+            })
             .map_err(|e| Status::unavailable(format!("connect leader {addr}: {e}")))?;
         self.leader_clients
             .lock()
@@ -617,6 +625,9 @@ pub(crate) async fn write_via_leader(
     // CO-2-2 — cluster shared secret stamped onto the forward so the
     // leader authenticates it (see `forward_secret_ok`).
     shared_secret: &str,
+    // CR2-8-1 (CMN-3) — size this forward client the same as the
+    // listener it calls into, rather than tonic's 4 MB default.
+    max_message_size_mb: u32,
     req: ClientRequest,
 ) -> Result<(), String> {
     use openraft::async_runtime::watch::WatchReceiver;
@@ -639,10 +650,15 @@ pub(crate) async fn write_via_leader(
             let leader_addr =
                 resolve_leader_addr(voters, &std::collections::BTreeMap::new(), leader_id)
                     .ok_or_else(|| format!("leader {leader_id} not in cluster.initial_voters"))?;
+            let max_bytes = dtfs_common::config::max_message_bytes(max_message_size_mb);
             let mut client = tls
                 .connect(&leader_addr)
                 .await
-                .map(ManagerServiceClient::new)
+                .map(|ch| {
+                    ManagerServiceClient::new(ch)
+                        .max_decoding_message_size(max_bytes)
+                        .max_encoding_message_size(max_bytes)
+                })
                 .map_err(|e| format!("connect leader {leader_addr}: {e}"))?;
             let body =
                 serde_json::to_vec(&req).map_err(|e| format!("serialize ClientRequest: {e}"))?;

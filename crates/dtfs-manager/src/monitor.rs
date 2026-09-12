@@ -164,6 +164,10 @@ pub struct HealthMonitor {
     /// CO-2-2 — cluster shared secret stamped onto leader-forwarded
     /// status commits so the leader authenticates them.
     shared_secret: String,
+    /// CR2-8-1 (CMN-3) — configured cap for the leader-forwarded
+    /// `ForwardClientWrite` client, sized the same as the listener it
+    /// calls into rather than tonic's 4 MB default.
+    max_message_size_mb: u32,
 }
 
 impl HealthMonitor {
@@ -174,6 +178,7 @@ impl HealthMonitor {
         voters: Vec<dtfs_common::config::InitialVoter>,
         tls: dtfs_common::tls::TlsContext,
         shared_secret: String,
+        max_message_size_mb: u32,
     ) -> Self {
         Self {
             check_interval,
@@ -183,6 +188,7 @@ impl HealthMonitor {
             alerts: None,
             tls,
             shared_secret,
+            max_message_size_mb,
         }
     }
 
@@ -286,6 +292,7 @@ impl HealthMonitor {
             &self.voters,
             &self.tls,
             &self.shared_secret,
+            self.max_message_size_mb,
             req,
         )
         .await
