@@ -1122,6 +1122,24 @@ fn apply_request(
             if let Some(file) = sm.files.get_mut(path) {
                 file.chunks = merge_chunk_location_entries(&file.chunks, chunks);
                 file.updated_at_ms = now_ms;
+                // RAFT-3 — `logical_size` is set once by SetFileSize (e.g.
+                // O_TRUNC → SetFileSize(0)) and never revisited, so a
+                // truncate-then-rewrite (cp, rsync --inplace, shell `>`,
+                // SQLite journal recycle) committed chunks past the
+                // truncated size but every reader kept seeing the stale
+                // (usually 0) size. Grow logical_size to cover the extent
+                // implied by the merged chunks, but never derive a size out
+                // of thin air for a file that has none set yet (None stays
+                // None; a chunk-only file still reports the summed-chunks
+                // fallback in metadata.rs).
+                let extent = file
+                    .chunks
+                    .iter()
+                    .map(|c| c.chunk_index * file.chunk_size + c.size_bytes)
+                    .max();
+                if let Some(extent) = extent {
+                    file.logical_size = file.logical_size.map(|l| l.max(extent));
+                }
                 push_audit_capped(&mut sm.audit_log, audit(format!(
                     "UpdateChunks: {path} (merged {} incoming -> {} total)",
                     chunks.len(),
@@ -1607,9 +1625,8 @@ fn apply_request(
                 meta.updated_at_ms = now_ms;
                 // Truncate-shrink: drop chunks fully past the new EOF.
                 let chunk_size = meta.chunk_size.max(1);
-                let keep_idx = ((*new_size).div_ceil(chunk_size)).saturating_sub(0);
-                meta.chunks
-                    .retain(|c| (c.chunk_index as u64) < keep_idx || *new_size == 0 && false);
+                let keep_idx = (*new_size).div_ceil(chunk_size);
+                meta.chunks.retain(|c| c.chunk_index < keep_idx);
                 push_audit_capped(
                     &mut sm.audit_log,
                     audit(format!("SetFileSize: {path} -> {new_size}")),
@@ -4611,6 +4628,57 @@ mod posix_path_regression {
         assert!(!sm.write_leases.contains_key("/a/x"), "old lease key gone");
         let lease = sm.write_leases.get("/c/x").expect("lease follows the renamed child");
         assert_eq!(lease.owner_id, "writer-1");
+    }
+
+    // ── RAFT-3 — logical_size must grow to cover chunks committed after a
+    // truncate, not stay pinned at the truncated size forever ──────────
+
+    #[test]
+    fn raft_3_truncate_zero_then_commit_grows_logical_size() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/f".into(), volume_id: "default".into(), chunk_size: 4 * 1024 * 1024,
+        });
+        apply_request(&mut sm, &mk_log_id(2),
+            &ClientRequest::SetFileSize { path: "/f".into(), new_size: 0 });
+        assert_eq!(sm.files.get("/f").unwrap().logical_size, Some(0));
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::UpdateChunkLocations {
+            path: "/f".into(),
+            chunks: vec![ChunkLocationEntry {
+                chunk_index: 0, chunk_hash: "h".into(), node_id: "10".into(),
+                disk_id: 0, size_bytes: 4 * 1024 * 1024,
+            }],
+            lease_id: String::new(),
+        });
+        assert_eq!(
+            sm.files.get("/f").unwrap().logical_size,
+            Some(4 * 1024 * 1024),
+            "committing a chunk past the truncated size must grow logical_size"
+        );
+    }
+
+    #[test]
+    fn raft_3_sparse_grow_size_is_preserved_over_a_smaller_chunk_extent() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/f".into(), volume_id: "default".into(), chunk_size: 4 * 1024 * 1024,
+        });
+        let six_mb = 6 * 1024 * 1024u64;
+        apply_request(&mut sm, &mk_log_id(2),
+            &ClientRequest::SetFileSize { path: "/f".into(), new_size: six_mb });
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::UpdateChunkLocations {
+            path: "/f".into(),
+            chunks: vec![ChunkLocationEntry {
+                chunk_index: 0, chunk_hash: "h".into(), node_id: "10".into(),
+                disk_id: 0, size_bytes: 4 * 1024 * 1024,
+            }],
+            lease_id: String::new(),
+        });
+        assert_eq!(
+            sm.files.get("/f").unwrap().logical_size,
+            Some(six_mb),
+            "a sparse-grow size ahead of the committed chunks must not shrink"
+        );
     }
 }
 
