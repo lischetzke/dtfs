@@ -1089,3 +1089,19 @@ step; no regressions. Deviations: none beyond the per-task notes above
 (CR-6-2's clamp source volume, CR-6-4's fallback chain, CR-6-5's
 FIFO-not-strict-LRU, CR-6-6's client-mock-gap testing-at-the-boundary
 pattern carried over from Group 1).
+
+- **CR-6-2 R1 (PR #110 review)** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-manager --release`: 381 -> 382 passed, 0 failed
+  (1 new: `cr_6_2_ack_floor_clamp_uses_highest_placed_tier_rf_not_lowest`).
+  `clamp_ack_floor_to_rf` took `.min()` over the placed chunks' resolved
+  tiers, which for a multi-tier volume (warm RF 3 + cold RF 1) with one
+  warm + one cold replica clamped the floor down to 1 and acked at 2
+  replicas — a silent RF downgrade of warm's own RF 3 requirement
+  (A.3.3 #5), exactly what the floor exists to prevent. Switched to
+  `.max()`: the floor may only be lowered to the HIGHEST RF any placed
+  tier actually demands. CMN-2's original single-tier case (cold-only,
+  cold RF 1, floor 2 -> clamps to 1) is unchanged since min==max when
+  only one tier is placed. Updated the doc comment and the `manager.md`
+  `min_replicas_before_ack` row wording (was ambiguous "the tier", now
+  explicit "HIGHEST ... of any tier"). `cargo build --workspace
+  --release`: clean.
