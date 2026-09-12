@@ -678,6 +678,64 @@ mod lis56_mgr_rpc_auth_tests {
         let err = require_mgr_rpc_auth(secret, "DeleteFile", "/b", &meta).unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
+
+    // CR-5-1 (PROTO-1) — Heartbeat and ReportChunkStatus were the only two
+    // mutating ManagerService RPCs NOT gated by LIS-56: any node id could
+    // send them (poison node status / drop replica entries) without the
+    // cluster secret.
+    #[test]
+    fn heartbeat_empty_secret_allows_without_headers() {
+        assert!(require_mgr_rpc_auth("", "Heartbeat", "42", &MetadataMap::new()).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_missing_headers_denied_when_secret_set() {
+        let err = require_mgr_rpc_auth("s3cret", "Heartbeat", "42", &MetadataMap::new())
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn heartbeat_valid_stamp_accepted() {
+        let secret = "s3cret";
+        let (ts, mac) = stamp_mgr_rpc_auth(secret, "Heartbeat", "42").unwrap();
+        let meta = meta_with(&ts, &mac);
+        assert!(require_mgr_rpc_auth(secret, "Heartbeat", "42", &meta).is_ok());
+    }
+
+    #[test]
+    fn report_chunk_status_empty_secret_allows_without_headers() {
+        assert!(
+            require_mgr_rpc_auth("", "ReportChunkStatus", "42", &MetadataMap::new()).is_ok()
+        );
+    }
+
+    #[test]
+    fn report_chunk_status_missing_headers_denied_when_secret_set() {
+        let err = require_mgr_rpc_auth("s3cret", "ReportChunkStatus", "42", &MetadataMap::new())
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn report_chunk_status_valid_stamp_accepted() {
+        let secret = "s3cret";
+        let (ts, mac) = stamp_mgr_rpc_auth(secret, "ReportChunkStatus", "42").unwrap();
+        let meta = meta_with(&ts, &mac);
+        assert!(require_mgr_rpc_auth(secret, "ReportChunkStatus", "42", &meta).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_mac_not_valid_for_report_chunk_status() {
+        // Method name is part of the MAC input, so a Heartbeat-stamped
+        // header must not authenticate a ReportChunkStatus call.
+        let secret = "s3cret";
+        let (ts, mac) = stamp_mgr_rpc_auth(secret, "Heartbeat", "42").unwrap();
+        let meta = meta_with(&ts, &mac);
+        let err =
+            require_mgr_rpc_auth(secret, "ReportChunkStatus", "42", &meta).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
 }
 
 #[cfg(test)]
@@ -1179,6 +1237,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        let binding = request.get_ref().node_id.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "Heartbeat",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         tracing::debug!("Heartbeat from node: {}", req.node_id);
 
@@ -1545,6 +1610,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<ChunkStatusReport>,
     ) -> Result<Response<ChunkStatusAck>, Status> {
+        let binding = request.get_ref().node_id.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "ReportChunkStatus",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         tracing::debug!("ChunkStatusReport: {} chunks", req.chunks.len());
 

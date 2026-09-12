@@ -24,6 +24,22 @@ use dtfs_proto::dtfs::manager::manager_service_client::ManagerServiceClient;
 use dtfs_proto::dtfs::manager::{HeartbeatRequest, RegisterNodeRequest};
 use store::ChunkStore;
 
+/// CR-5-1 (PROTO-1) / LIS-56 — stamp `x-dtfs-rpc-*` metadata on a mutating
+/// `dtfs-mgr-rpc` request (Heartbeat / ReportChunkStatus) from this data
+/// node's own `[cluster].shared_secret`. Empty secret = no-op (legacy skip,
+/// matches `require_mgr_rpc_auth`'s empty-secret bypass on the manager).
+fn stamp_mgr_rpc_request<T>(secret: &str, method: &str, binding: &str, body: T) -> tonic::Request<T> {
+    use dtfs_common::crypto::{stamp_mgr_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS};
+    let mut req = tonic::Request::new(body);
+    if let Some((ts, mac)) = stamp_mgr_rpc_auth(secret, method, binding) {
+        if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+            req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+            req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+        }
+    }
+    req
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "dtfs-data", about = "DTFS Data Node", version = dtfs_common::version::VERSION_STRING)]
 struct Args {
@@ -599,7 +615,13 @@ async fn manager_lifecycle(
                     })
                     .collect(),
             };
-            match client.report_chunk_status(tonic::Request::new(report)).await {
+            let report_req = stamp_mgr_rpc_request(
+                &config.cluster.shared_secret,
+                "ReportChunkStatus",
+                &node_id,
+                report,
+            );
+            match client.report_chunk_status(report_req).await {
                 Ok(resp) => {
                     if resp.into_inner().accepted {
                         tracing::info!(
@@ -633,8 +655,14 @@ async fn manager_lifecycle(
             }
         }
 
+        let heartbeat_req = stamp_mgr_rpc_request(
+            &config.cluster.shared_secret,
+            "Heartbeat",
+            &node_id,
+            heartbeat,
+        );
         match client
-            .heartbeat(tonic::Request::new(heartbeat))
+            .heartbeat(heartbeat_req)
             .await
         {
             Ok(resp) => {
