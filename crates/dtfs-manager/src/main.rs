@@ -508,6 +508,7 @@ async fn main() -> anyhow::Result<()> {
         config.cluster.initial_voters.clone(),
         tls_ctx.clone(),
         config.cluster.shared_secret.clone(),
+        config.grpc.max_message_size_mb,
     )
     .with_alerts(alert_dispatcher.clone()); // P1-8
     let monitor_handle = tokio::spawn(async move {
@@ -805,13 +806,21 @@ async fn manager_self_register_lifecycle(
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut idx = 0usize;
+    // CR2-8-1 (CMN-3) — this manager-to-manager RegisterNode client used
+    // tonic's 4 MB default; size it from the same configured cap as the
+    // listener it's calling into.
+    let max_bytes = dtfs_common::config::max_message_bytes(config.grpc.max_message_size_mb);
     loop {
         ticker.tick().await;
         let n = endpoints.len();
         let mut ok = false;
         for offset in 0..n {
             let ep = &endpoints[(idx + offset) % n];
-            match tls.connect(ep).await.map(ManagerServiceClient::new) {
+            match tls.connect(ep).await.map(|ch| {
+                ManagerServiceClient::new(ch)
+                    .max_decoding_message_size(max_bytes)
+                    .max_encoding_message_size(max_bytes)
+            }) {
                 Ok(mut c) => {
                     let mut req = tonic::Request::new(build_req());
                     req.set_timeout(REGISTER_RPC_TIMEOUT);
