@@ -679,7 +679,7 @@ impl TieringEngine {
             //    committed Raft remove is NEVER rolled back.
             let delocate = crate::scheduler::SchedulerDelocate {
                 sched: &*self.scheduler,
-                remove_req: dtfs_raft::ClientRequest::RemoveChunkLocation {
+                remove_req: dtfs_raft::ClientRequest::RemoveChunkLocation { now_ms: now_millis(),
                     path: d.file_path.clone(),
                     chunk_index: d.chunk_index,
                     node_id: d.node_id.to_string(),
