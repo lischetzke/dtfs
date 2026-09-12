@@ -127,7 +127,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-3-2 | ✅ | MGR-2 (defence) | `crates/dtfs-raft/src/state_machine.rs` `apply_remove_chunk_location` ~2040 | Independent of anchor: refuse (`Error("last live replica")`) when the row being removed is the last live replica of `(path, chunk_index)` (`live` = node not Down/Failed, disk not Failed/Removed, using the existing survivor scan). Keep `enforce_anchor` logic. | SM unit: two rows, one on Down node; remove the live one → Error; remove the Down one → ok. | Test fails before, passes after. |
 | CR-3-3 | ✅ | MGR-1 | `crates/dtfs-manager/src/metadata.rs` ReportChunkReads intercept ~1500; `tiering.rs` `evaluate` ~327 | Intercept: look up `sm_data` for the file(s) referencing `chunk_id` and the replica tier on `node_id` (`live_replica_tier`); pass real `file_path` + tier; skip `report_access` when the chunk is unknown. `evaluate`: `continue` when `path_to_volume.get(&profile.file_path).is_none()` (defence). | tiering unit: profile with `file_path: ""` yields zero legacy decisions; AV-volume chunk reported through the intercept yields zero legacy decisions; non-AV volume chunk still classifies. | Tests fail before, pass after. |
 | CR-3-4 | ✅ | MGR-4, MGR-8, MGR-9 | `scheduler.rs` `register_replica_location_for_path` ~1338, `register_replica` (`MigrationOps`), Completing transition ~2814, `resolve_disk_id_for_tier` ~4206 | (a) `register_replica` returns `Result<(), String>`; on `Err` task stays `Completing`, `attempts += 1`, retry next tick, `Failed` + alert at the existing cap. (b) path lookup + index lookup under ONE SM read lock; hash not found in the file → skip + warn, never `unwrap_or(0)`. (c) register the new row for EVERY `chunk_index` in the file whose rows carry the hash. (d) `resolve_disk_id_for_tier` filters `DiskStatus::{Failed, Removed}`; none live → return `Err`, task not Done. | `advance_round_tests` mock: register error → task stays Completing, Done after retry succeeds; unit for (b): hash absent → no `UpdateChunkLocations` proposed; unit for (c): two indexes same hash → both rows added; unit for (d). | Tests fail before, pass after. |
-| CR-3-5 | ⬜ | MGR-5, MGR-6 | `scheduler.rs` `check_under_replicated` ~491/570, `schedule_replication`, `check_anchor_lag` ~867 | Use `task_blocks_requeue` in `check_under_replicated`'s dedup index and in `schedule_replication`. Source via `live_replica_tier`; target must satisfy `placement_cfg.has_room`. `check_anchor_lag`: honour `task_budget_available` (thread `created`/`live_tasks`), insert `(chunk, target)` into `existing_tasks` after each schedule. | scheduler unit: chunk with a recent Failed task → not re-queued; source on Failed disk not chosen; anchor-lag over N > budget chunks creates exactly budget tasks; two files same hash → one task. | Tests fail before, pass after. |
+| CR-3-5 | ✅ | MGR-5, MGR-6 | `scheduler.rs` `check_under_replicated` ~491/570, `schedule_replication`, `check_anchor_lag` ~867 | Use `task_blocks_requeue` in `check_under_replicated`'s dedup index and in `schedule_replication`. Source via `live_replica_tier`; target must satisfy `placement_cfg.has_room`. `check_anchor_lag`: honour `task_budget_available` (thread `created`/`live_tasks`), insert `(chunk, target)` into `existing_tasks` after each schedule. | scheduler unit: chunk with a recent Failed task → not re-queued; source on Failed disk not chosen; anchor-lag over N > budget chunks creates exactly budget tasks; two files same hash → one task. | Tests fail before, pass after. |
 | CR-3-6 | ⬜ | MGR-7 | `metadata.rs` heartbeat ~1250-1300, ~1385 | Capture `Err` from the `QuarantineNode` and `RemoveCorruptChunkReplicas` forwards; any failure → `accepted: false` in `HeartbeatResponse` (data node already re-enqueues on that, CO-3-7). Keep `AppendAudit` best-effort. | metadata unit (existing CO-3-7 test as template): forced forward failure → `accepted == false`. | Test fails before, passes after. |
 | CR-3-7 | ✅ | CMN-5 | `crates/dtfs-common/src/types.rs` `AnchorPolicy::is_satisfied_by` ~494, `hash_ring.rs` ~255/282 | `eq_ignore_ascii_case` at the three sites. | types unit: `anchor "leli"` satisfied by `"LELI"`; ring test with mixed case. | Tests fail before, pass after. |
 | CR-3-8 | ⬜ | MGR-10 (optional, do if time) | `proto/data.proto` `ListChunksResponse`, `dtfs-data/src/server.rs` list_chunks, `scheduler.rs` orphan reap | Add positional `chunk_disk_ids`; key `expected_by_node` on `(node, disk)`; pass `Some(disk_id)` to the reap delete. Empty field → legacy node-wide. | scheduler unit: warm leftover + cold live row on one node → reaped on warm disk only. | Test passes; old-manager compat path covered. |
@@ -564,6 +564,35 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   `register_replica_location` before any write is attempted. Existing
   callers/tests of `resolve_disk_id_for_tier` updated for the new
   `Option` return.
+
+- **CR-3-5** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-manager --release`: 359 -> 364 passed (5 new:
+  `scheduler::bug_ch_live_replica_tests::{pick_live_source_skips_dead_disk,
+  pick_live_source_none_when_all_dead, pick_backfill_target_skips_full_disk,
+  pick_backfill_target_respects_exclude}`,
+  `scheduler::bug_av_anchor_lag_tests::cr_3_5_anchor_lag_dedup_within_one_pass`),
+  0 failed. `check_under_replicated`'s dedup index and
+  `schedule_replication`'s `already_scheduled` check now both use
+  `task_blocks_requeue` (covers the pre-existing
+  `task_blocks_requeue(Failed) == true` unit test) instead of a bespoke
+  `!= Done && != Failed`, so a lingering Failed task's retention window
+  also blocks an immediate re-queue. Source selection now goes through
+  a new pure `pick_live_source` (first entry whose `live_replica_tier`
+  resolves, not "any row on a healthy node"); target selection through
+  a new pure `pick_backfill_target`, requiring `placement_cfg.has_room`
+  on the candidate disk — `TaskScheduler` gained a `placement_cfg`
+  field (constructor parameter, wired from `config.placement.clone()`
+  in `main.rs`; the sole call site). `check_anchor_lag` now threads a
+  `created`/`live_tasks` pair through `task_budget_available` (same
+  bound as `check_under_replicated`) and inserts the just-scheduled
+  `(chunk_id, target_node)` into `existing_tasks` immediately after
+  each schedule, not only once at the top of the pass — proven by the
+  new `cr_3_5_anchor_lag_dedup_within_one_pass` test, which shows a
+  second file sharing the hash is refused once the set is updated
+  inline. No test exercises the full async `check_anchor_lag`/
+  `check_under_replicated` methods directly (no `TaskScheduler`+`DtfsRaft`
+  test harness exists in this crate); each new decision point is
+  covered at the pure-function boundary it now goes through instead.
 
 - **CR-2-8** 2026-09-12. Added one sentence each to AGENTS.md A.3.1
   (the `now_ms` convention for a `ClientRequest` field that lands in
