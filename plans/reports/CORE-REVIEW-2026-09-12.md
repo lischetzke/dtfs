@@ -327,3 +327,45 @@ Clean: `select_read_replica` U4 order + `learn_locations`; P0-2 fallover uniform
 6. **Config/docs sync + perf** — CMN-1, CMN-2, CMN-3, CMN-6, CMN-8, PROTO-2, PROTO-3, CMN-7, RAFT-5, RAFT-6, MGR-3, MGR-13, MGR-14, FUSE-5, FUSE-6, FUSE-8..12.
 
 FUSE-6 (volume_id) needs a proto field and belongs with group 3 or its own small task; FUSE-5 (metadata_cache) and FUSE-8/9/10 are the client-side perf items most visible to Plex playback.
+
+---
+
+## Status after PLAN-CR-2026-09 (re-verified against `master` 57ae8ed, 2026-09-12)
+
+Every HIGH/MEDIUM finding was re-checked against master by locating the fix
+in source after all six group PRs (#105-#110) merged. Workspace suite at
+57ae8ed: manager 382, data 121, fuse 110, common 109, raft 105, client 31,
+cli 12 — all green (Docker `dtfs-buildenv`). Release cases 100-109 authored,
+`bash -n` clean, NOT executed (no lab).
+
+| Finding | Status | Landed in |
+|---|---|---|
+| PROTO-1 | FIXED | #109 CR-5-1 |
+| CMN-1, CMN-8 | FIXED | #110 CR-6-1 |
+| CMN-2 | FIXED (clamp to highest placed-tier RF) | #110 CR-6-2 |
+| CMN-4 | FIXED | #109 CR-5-7 |
+| CMN-5 | FIXED | #107 CR-3-7 |
+| PROTO-2 | FIXED | #110 CR-6-3 |
+| RAFT-1, RAFT-2, RAFT-3, RAFT-4, RAFT-7, RAFT-8, RAFT-9 | FIXED | #106 CR-2-1..2-6 |
+| DATA-1, DATA-2, DATA-3, DATA-4, DATA-7, DATA-9, DATA-10 | FIXED | #108 CR-4-1..4-7 |
+| DATA-5 | FIXED (FUSE half #105 CR-1-5, server half #108 CR-4-5) | #105, #108 |
+| DATA-6, DATA-8, DATA-11 | FIXED | #109 CR-5-4..5-6 |
+| MGR-1, MGR-2 (+ SM last-live-replica guard), MGR-4, MGR-5, MGR-6, MGR-7, MGR-8, MGR-9 | FIXED | #107 CR-3-1..3-6 |
+| MGR-11, MGR-12 | FIXED | #109 CR-5-2, 5-3 |
+| FUSE-1, FUSE-2, FUSE-3, FUSE-4, FUSE-7 | FIXED (incl. review follow-ups R1 dirty-bytes cap, R2 partial-segment refusal) | #105 |
+| FUSE-5, FUSE-6, FUSE-8, FUSE-9, FUSE-10 | FIXED | #110 CR-6-4..6-6 |
+| **MGR-3** | **OPEN** — `build_av_cache_snapshot` still holds the SM read lock across the per-chunk `read_window_count().await` loop. Slipped from the plan's task tables. Reserved as the AIWF-5-1 roster dry-run fix (next session; project agents register at session start). | — |
+| **MGR-10** | **OPEN** — deferred (optional CR-3-8: `ListChunksResponse.chunk_disk_ids` + disk-keyed reaper). | — |
+| CMN-3, CMN-6, CMN-7, PROTO-3, RAFT-5, RAFT-6, MGR-13, MGR-14, FUSE-11, FUSE-12 | OPEN (LOW, deferred by plan decision) | — |
+
+Review follow-ups raised by the lead during the group reviews and fixed before
+merge: Group 1 R1/R2 (hole-fill memory cap, unseeded partial segment), Group 3
+R1/R2 (intercept lock scope + batch index, no `Hot` tier fallback), Group 4 R1
+(scrub P0-5 skip recognises op-keyed WAL names), Group 6 R1 (ack-floor clamp
+`max` not `min`).
+
+Rollout note for the next deploy: manager + data + fuse together (LIS-56 HMAC
+now covers Heartbeat/ReportChunkStatus; data-plane RecordCacheHit gated;
+`GetFileLocationsResponse.volume_id` and `ScrubConfigOverride` secs fields are
+additive). Plan file `PLAN-CR-2026-09-CORE-REVIEW-FIXES.md` retired (git
+history keeps it); this table is the record.
