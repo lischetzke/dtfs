@@ -157,7 +157,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-5-3 | ✅ | MGR-12 | `metadata.rs` `write_via_leader` ~578 | Inspect `ForwardWriteResponse.success`; false → `Err(resp.error)`. | unit with mock leader returning `success:false`. | Test fails before, passes after. |
 | CR-5-4 | ✅ | DATA-6 | `crates/dtfs-data/src/main.rs` control RPCs, `crates/dtfs-common/src/tls.rs` `endpoint()` ~182 | `req.set_timeout(Duration::from_secs(10))` on heartbeat / report_chunk_status / register_node. `TlsContext::endpoint`: `.http2_keep_alive_interval(10s).keep_alive_timeout(5s).keep_alive_while_idle(true)`. | tls unit: endpoint builder sets keepalive (inspect via `Endpoint` debug or a builder-recording shim); data main: a mock manager that accepts then never answers → heartbeat loop advances within 15 s. | Tests pass. |
 | CR-5-5 | ✅ | DATA-11 | `crates/dtfs-data/src/server.rs` `record_cache_hit` ~940; `crates/dtfs-client/src/client.rs` | Gate with `require_data_rpc_auth(secret, "RecordCacheHit", &req.chunk_id, md)`; client stamps. | server unit: secret set + no header → denied. | Test fails before, passes after. |
-| CR-5-6 | ⬜ | DATA-8 | `dtfs-data/src/main.rs` ~589-634 | Send `ChunkStatusReport` in batches of 1000 ids; re-enqueue only the unsent remainder + the failed batch. | unit on the batching helper: 2500 ids → 3 calls; failure on call 2 → 1500 re-enqueued. | Test passes. |
+| CR-5-6 | ✅ | DATA-8 | `dtfs-data/src/main.rs` ~589-634 | Send `ChunkStatusReport` in batches of 1000 ids; re-enqueue only the unsent remainder + the failed batch. | unit on the batching helper: 2500 ids → 3 calls; failure on call 2 → 1500 re-enqueued. | Test passes. |
 | CR-5-7 | ✅ | CMN-4 | `crates/dtfs-common/src/crypto.rs` `hex_decode` ~125 | `if !s.is_ascii() { return None; }`. | unit: `"€€"` → None, no panic. | Test fails (panics) before, passes after. |
 | CR-5-8 | ⬜ | — | `tests/release/cases/108-heartbeat-requires-mgr-rpc-auth.sh` | grpcurl (or dtfs-cli debug) Heartbeat without headers → PermissionDenied when secret set. | `bash -n` clean. | Present, unexecuted. |
 | CR-5-9 | ⬜ | — | `AGENTS.md` A.3.3 #7/#8, A.8 metadata entry | Heartbeat/ReportChunkStatus/RecordCacheHit gated; forward allow-list; control-plane deadlines + keepalive. | — | Same commit. |
@@ -897,3 +897,19 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   &req.chunk_id, md)` before touching the metrics counter.
   `dtfs-client/src/client.rs::record_cache_hit` stamps `x-dtfs-rpc-*`
   from `[client].shared_secret`, same pattern as `get_chunk`.
+- **CR-5-6** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-data --release`: 116 -> 119 passed, 0 failed (3 new:
+  `splits_into_expected_batch_count`, `empty_input_yields_no_batches`,
+  `failure_at_batch_2_of_3_reenqueues_exactly_the_unsent_remainder`).
+  Added a pure `fn batches(ids: Vec<String>, n: usize) -> Vec<Vec<String>>`
+  (`CHUNK_STATUS_REPORT_BATCH_SIZE = 1000`) and reworked the
+  `ChunkStatusReport` send in `manager_lifecycle` to loop over batches
+  instead of sending every drained corrupt id in one message; on the
+  first failed batch (RPC error or `accepted == false`) it re-enqueues
+  that batch plus every unsent batch after it via
+  `chunk_store.enqueue_pending_corruption`, leaving already-accepted
+  batches alone (previously a re-enqueue always re-sent the WHOLE
+  drained set, so an accepted-then-later-failed prefix would be
+  reported to the manager twice on retry — harmless functionally
+  since `RemoveCorruptChunkReplicas` is idempotent, but this closes the
+  batch-size gap DATA-8 flagged).
