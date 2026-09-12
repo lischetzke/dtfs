@@ -2915,9 +2915,13 @@ pub(crate) struct FlushSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct FlushNodeSummary {
     pub datacenter: String,
-    /// CNF-1 — `(stable disk_id, tier)` pairs; disk_id is a key, not a
-    /// Vec position (a reindexed disk list breaks positional lookups).
-    pub disk_tiers: Vec<(u32, DiskTier)>,
+    /// CNF-1 — `(stable disk_id, tier, live)` triples; disk_id is a key,
+    /// not a Vec position (a reindexed disk list breaks positional
+    /// lookups). CR-3-1/MGR-2 — `live` is `live_replica_tier(node,
+    /// disk_id).is_some()`, resolved once at snapshot-build time: false
+    /// when the node is Down/Failed or the disk is Failed/Removed, so a
+    /// dead replica never counts as the surviving mandatory copy.
+    pub disk_tiers: Vec<(u32, DiskTier, bool)>,
 }
 
 impl FlushSnapshot {
@@ -2930,7 +2934,14 @@ impl FlushSnapshot {
                     *id,
                     FlushNodeSummary {
                         datacenter: info.location.datacenter.clone(),
-                        disk_tiers: info.disks.iter().map(|d| (d.disk_id, d.tier)).collect(),
+                        disk_tiers: info
+                            .disks
+                            .iter()
+                            .map(|d| {
+                                let live = live_replica_tier(Some(info), d.disk_id).is_some();
+                                (d.disk_id, d.tier, live)
+                            })
+                            .collect(),
                     },
                 )
             })
@@ -3082,8 +3093,23 @@ pub(crate) fn plan_flush_cache(
                 // CNF-1 — stable disk_id key, never Vec index.
                 node.disk_tiers
                     .iter()
-                    .find(|(id, _)| *id == e.disk_id)
-                    .map(|(_, t)| *t)
+                    .find(|(id, _, _)| *id == e.disk_id)
+                    .map(|(_, t, _)| *t)
+            };
+            // CR-3-1/MGR-2 — true only when the replica is on a live
+            // (node not Down/Failed, disk not Failed/Removed) placement.
+            // A dead replica must never count as the surviving mandatory
+            // copy that lets the planner drop the cache replica.
+            let entry_live = |e: &ChunkLocationEntry| -> bool {
+                let Ok(nid) = e.node_id.parse::<u64>() else {
+                    return false;
+                };
+                let Some(node) = snapshot.nodes.get(&nid) else {
+                    return false;
+                };
+                node.disk_tiers
+                    .iter()
+                    .any(|(id, _, live)| *id == e.disk_id && *live)
             };
 
             // Survivors AFTER the proposed flush. We refuse if no
@@ -3107,9 +3133,12 @@ pub(crate) fn plan_flush_cache(
                 continue;
             }
 
-            // Refuse if no mandatory-tier replica survives.
+            // Refuse if no LIVE mandatory-tier replica survives (CR-3-1/
+            // MGR-2: a replica on a Down/Failed node or Failed/Removed
+            // disk cannot serve reads, so it must not be treated as the
+            // surviving anchor for this refusal check).
             let mandatory_survives = would_remain.iter().any(|e| {
-                entry_tier(e).map(mandatory_tier).unwrap_or(false)
+                entry_live(e) && entry_tier(e).map(mandatory_tier).unwrap_or(false)
             });
             if !mandatory_survives {
                 report.mandatory_refusals += 1;
@@ -4907,14 +4936,23 @@ mod bug_av_flush_cache_tests {
     }
 
     fn node_summary(dc: &str, tiers: &[DiskTier]) -> FlushNodeSummary {
+        // disk_id == position here; CNF-1 sparse-id coverage builds its
+        // own summary below. All disks live by default (see
+        // node_summary_dead for the CR-3-1 liveness tests).
+        node_summary_with_liveness(dc, &tiers.iter().map(|t| (*t, true)).collect::<Vec<_>>())
+    }
+
+    /// CR-3-1/MGR-2 — build a node summary where each disk's liveness is
+    /// specified explicitly, so tests can put a mandatory-tier replica on
+    /// a dead placement and assert it is excluded from
+    /// `mandatory_survives`.
+    fn node_summary_with_liveness(dc: &str, tiers: &[(DiskTier, bool)]) -> FlushNodeSummary {
         FlushNodeSummary {
             datacenter: dc.to_string(),
-            // disk_id == position here; CNF-1 sparse-id coverage builds
-            // its own summary below.
             disk_tiers: tiers
                 .iter()
                 .enumerate()
-                .map(|(i, t)| (i as u32, *t))
+                .map(|(i, (t, live))| (i as u32, *t, *live))
                 .collect(),
         }
     }
@@ -4957,6 +4995,43 @@ mod bug_av_flush_cache_tests {
         assert_eq!(report.mandatory_refusals, 0);
     }
 
+    /// CR-3-1/MGR-2 — a cold (mandatory) replica on a Down node must NOT
+    /// count as the surviving anchor: flushing the warm cache replica
+    /// would leave zero LIVE replicas, so the planner must refuse.
+    #[test]
+    fn cr_3_1_flush_refused_when_mandatory_replica_is_on_dead_node() {
+        let snapshot = FlushSnapshot {
+            files: vec![(
+                "/movies/wicked.mkv".to_string(),
+                vec![
+                    ent(0, "h", 10, 0), // node 10 = cold, but DOWN
+                    ent(0, "h", 11, 0), // node 11 = warm (cache)
+                ],
+                mandatory_cold_only(),
+                None,
+            )],
+            nodes: HashMap::from([
+                (
+                    10u64,
+                    node_summary_with_liveness("leli", &[(DiskTier::Cold, false)]),
+                ),
+                (11u64, node_summary("toro", &[DiskTier::Warm])),
+            ]),
+        };
+        let (actions, report) =
+            plan_flush_cache(&snapshot, &[DiskTier::Warm], 1000);
+        assert!(actions.is_empty(), "refused: mandatory copy is dead");
+        assert_eq!(report.mandatory_refusals, 1);
+
+        // Same layout, but the cold node is healthy → flush proceeds.
+        let mut healthy_snapshot = snapshot.clone();
+        healthy_snapshot.nodes.insert(10u64, node_summary("leli", &[DiskTier::Cold]));
+        let (actions, report) =
+            plan_flush_cache(&healthy_snapshot, &[DiskTier::Warm], 1000);
+        assert_eq!(actions.len(), 1, "allowed: mandatory copy is live");
+        assert_eq!(report.mandatory_refusals, 0);
+    }
+
     /// CNF-1 — the flush planner resolves a replica's tier by the STABLE
     /// disk_id key. Node 11's only disk carries disk_id=1 (reindexed
     /// list); its warm cache replica must still be recognised and
@@ -4978,7 +5053,7 @@ mod bug_av_flush_cache_tests {
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
                 (11u64, FlushNodeSummary {
                     datacenter: "toro".to_string(),
-                    disk_tiers: vec![(1, DiskTier::Warm)], // sparse: id 1 at index 0
+                    disk_tiers: vec![(1, DiskTier::Warm, true)], // sparse: id 1 at index 0
                 }),
             ]),
         };

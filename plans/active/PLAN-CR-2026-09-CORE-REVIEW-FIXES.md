@@ -123,7 +123,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR-3-1 | ⬜ | MGR-2 | `crates/dtfs-manager/src/tiering.rs` `build_av_cache_snapshot` ~853, `plan_chunk_demotions` ~1953; `scheduler.rs` `FlushSnapshot::from_sm` ~2933, `plan_flush_cache` ~3108 | Resolve every placement tier through `scheduler::live_replica_tier(sm, node_id, disk_id)` (returns `None` for Down/Failed node or Failed/Removed disk). `None` → placement excluded from `mandatory_still_present` / `mandatory_survives` (still listed so it can be dropped itself). | planner unit tests (existing `co_1_2_*`, `plan_flush_cache` tests as templates): cold anchor on Down node + warm cache → demote/flush REFUSED with `anchor_protected` / `mandatory_refusals`; same with node Healthy → allowed. | Tests fail before, pass after. |
+| CR-3-1 | ✅ | MGR-2 | `crates/dtfs-manager/src/tiering.rs` `build_av_cache_snapshot` ~853, `plan_chunk_demotions` ~1953; `scheduler.rs` `FlushSnapshot::from_sm` ~2933, `plan_flush_cache` ~3108 | Resolve every placement tier through `scheduler::live_replica_tier(sm, node_id, disk_id)` (returns `None` for Down/Failed node or Failed/Removed disk). `None` → placement excluded from `mandatory_still_present` / `mandatory_survives` (still listed so it can be dropped itself). | planner unit tests (existing `co_1_2_*`, `plan_flush_cache` tests as templates): cold anchor on Down node + warm cache → demote/flush REFUSED with `anchor_protected` / `mandatory_refusals`; same with node Healthy → allowed. | Tests fail before, pass after. |
 | CR-3-2 | ⬜ | MGR-2 (defence) | `crates/dtfs-raft/src/state_machine.rs` `apply_remove_chunk_location` ~2040 | Independent of anchor: refuse (`Error("last live replica")`) when the row being removed is the last live replica of `(path, chunk_index)` (`live` = node not Down/Failed, disk not Failed/Removed, using the existing survivor scan). Keep `enforce_anchor` logic. | SM unit: two rows, one on Down node; remove the live one → Error; remove the Down one → ok. | Test fails before, passes after. |
 | CR-3-3 | ⬜ | MGR-1 | `crates/dtfs-manager/src/metadata.rs` ReportChunkReads intercept ~1500; `tiering.rs` `evaluate` ~327 | Intercept: look up `sm_data` for the file(s) referencing `chunk_id` and the replica tier on `node_id` (`live_replica_tier`); pass real `file_path` + tier; skip `report_access` when the chunk is unknown. `evaluate`: `continue` when `path_to_volume.get(&profile.file_path).is_none()` (defence). | tiering unit: profile with `file_path: ""` yields zero legacy decisions; AV-volume chunk reported through the intercept yields zero legacy decisions; non-AV volume chunk still classifies. | Tests fail before, pass after. |
 | CR-3-4 | ⬜ | MGR-4, MGR-8, MGR-9 | `scheduler.rs` `register_replica_location_for_path` ~1338, `register_replica` (`MigrationOps`), Completing transition ~2814, `resolve_disk_id_for_tier` ~4206 | (a) `register_replica` returns `Result<(), String>`; on `Err` task stays `Completing`, `attempts += 1`, retry next tick, `Failed` + alert at the existing cap. (b) path lookup + index lookup under ONE SM read lock; hash not found in the file → skip + warn, never `unwrap_or(0)`. (c) register the new row for EVERY `chunk_index` in the file whose rows carry the hash. (d) `resolve_disk_id_for_tier` filters `DiskStatus::{Failed, Removed}`; none live → return `Err`, task not Done. | `advance_round_tests` mock: register error → task stays Completing, Done after retry succeeds; unit for (b): hash absent → no `UpdateChunkLocations` proposed; unit for (c): two indexes same hash → both rows added; unit for (d). | Tests fail before, pass after. |
@@ -481,6 +481,24 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   `hash_ring.rs` (`already_in_anchor`'s zip and the swap-candidate scan)
   now use `eq_ignore_ascii_case` instead of `==`/`!=`, matching the
   existing `SpillPolicy`/`read_location_priority` convention.
+
+- **CR-3-1** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-manager --release`: 346 -> 348 passed (2 new:
+  `scheduler::bug_av_flush_cache_tests::cr_3_1_flush_refused_when_mandatory_replica_is_on_dead_node`,
+  `tiering::audit_co_tests::cr_3_1_demote_refused_when_only_surviving_mandatory_replica_is_dead`),
+  0 failed. `FlushNodeSummary.disk_tiers` is now `Vec<(u32, DiskTier,
+  bool)>` — the bool is `live_replica_tier(node, disk_id).is_some()`
+  resolved once in `FlushSnapshot::from_sm`; `plan_flush_cache`'s
+  `mandatory_survives` now requires the surviving entry to also be
+  live (`entry_live`). `tiering::TickPlacement` gained a `live: bool`
+  field, resolved the same way in `build_av_cache_snapshot`;
+  `plan_chunk_demotions`'s `mandatory_still_present` now requires the
+  other placement to be `live`. Test helpers `node_summary` (scheduler)
+  and `placement` (tiering) default to live; added
+  `node_summary_with_liveness` / `dead_placement` for the dead-replica
+  cases. `demote_preserves_anchor` (the separate anchor check) is
+  untouched — MGR-2's finding and fix scope are the two named
+  "mandatory" functions only.
 
 - **CR-2-8** 2026-09-12. Added one sentence each to AGENTS.md A.3.1
   (the `now_ms` convention for a `ClientRequest` field that lands in
