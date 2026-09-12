@@ -36,9 +36,11 @@ pub struct ManagerConfig {
     #[serde(default)]
     pub placement: PlacementConfig,
     /// CF-5 — per-process RAM cap + pressure ladder. When `hard_cap_mb > 0`
-    /// a background sampler watches RSS and, at the Warn level, the
+    /// a background sampler watches RSS; Warn takes no manager action
+    /// (only data/FUSE roles react there), and at the Shed level the
     /// scheduler skips its background ticks (re-replication / migration /
-    /// rebalance) so the manager gives RAM back instead of being
+    /// rebalance, self-limiting via `MAX_CONSECUTIVE_PRESSURE_SKIPS` — see
+    /// REV-3-5) so the manager gives RAM back instead of being
     /// OOM/cgroup-killed. `#[serde(default)]` so old config files keep
     /// working (cap 0 = unbounded, no ladder).
     #[serde(default)]
