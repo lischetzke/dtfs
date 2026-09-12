@@ -173,7 +173,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-6-5 | ✅ | FUSE-5 | `dtfs-fuse/src/filesystem.rs` `metadata_cache` ~281/449 | Bound the cache: `max_entries` (default 4096) with LRU eviction on insert (simple: `VecDeque` of keys + DashMap, or the `lru` crate if already a dependency — check Cargo.lock; do NOT add a new dependency without noting it). Expired entries also swept every `metadata_ttl` by the existing readahead pressure ladder task or a tiny interval task. | unit: insert 5000 paths → `len() <= 4096`; expired entry gone after sweep. | Test fails before, passes after. |
 | CR-6-6 | ✅ | FUSE-8, FUSE-9, FUSE-10 | `filesystem.rs` `read()` ~725-980, `readahead.rs` | (FUSE-8) notify `record_cache_hit` once per `(fh, chunk_id)` transition (store `last_notified_chunk` in `OpenFile`), in-flight bounded by a `Semaphore(8)`. (FUSE-9) foreground miss registers itself in a per-chunk in-flight `DashMap<String, watch::Receiver>` so concurrent readers of the same chunk await one fetch. (FUSE-10) call `readahead.on_chunk_read` on every chunk-index transition per fh (hit or miss); `pending`/cache dedup unchanged. | fuse unit: 32 sequential 128 KB reads of one cached chunk → exactly 1 notify; two concurrent reads of an uncached chunk with a counting mock client → 1 `GetChunk`; sequential hits keep `pending.len()` at the window depth. | Tests fail before, pass after; existing WI-05/B2 tests unchanged. |
 | CR-6-7 | ✅ | — | `tests/release/cases/109-non-default-volume-placement-after-reopen.sh` | Create file in a non-default volume, close, reopen, append, assert every chunk's replicas match that volume's RF/anchor via `/api/v1/files/inspect`. | `bash -n` clean. | Present, unexecuted. |
-| CR-6-8 | ⬜ | — | `AGENTS.md` A.2 read path, A.3.2, A.8 fuse entries; `deploy/examples/*.toml` + `docs/src/configuration/*` for any new key | Document volume_id on the wire, metadata cache bound, single-flight reads, per-chunk cache-hit notify, config validation at startup. | `cargo test -p dtfs-common` (`example_*_toml_parses`). | Same commit. |
+| CR-6-8 | ✅ | — | `AGENTS.md` A.2 read path, A.3.2, A.8 fuse entries; `deploy/examples/*.toml` + `docs/src/configuration/*` for any new key | Document volume_id on the wire, metadata cache bound, single-flight reads, per-chunk cache-hit notify, config validation at startup. | `cargo test -p dtfs-common` (`example_*_toml_parses`). | Same commit. |
 
 ## Cross-cutting invariants (every group)
 
@@ -1066,3 +1066,26 @@ failed at every step; no regressions.
   Owner's fetch failed falls back to its own fetch. `.claude/rules/
   fuse.md` documents the shared transition signal and the single-flight
   contract.
+
+- **CR-6-8** 2026-09-12. `AGENTS.md` A.2 read path gained the CR-6-4
+  (volume_id on the wire) and CR-6-6 (single-flight foreground fetch)
+  clauses; A.3.2 gained the CR-6-1 (`MemoryConfig`/`PlacementConfig`
+  `validate()` at startup) and CR-6-5 (bounded/swept `metadata_cache`)
+  clauses; A.8's `metadata.rs` row gained CR-6-2/CR-6-4, and
+  `filesystem.rs`'s row gained CR-6-5/CR-6-6. `docs/src/configuration/
+  {manager,data-node,fuse-client}.md` and `deploy/examples/data.toml`
+  were already updated per-task (CR-6-1, CR-6-3) in the same commits as
+  the code; no further config-surface changes needed for CR-6-5/6-6
+  (constants, not new config keys, per the plan). `cargo test -p
+  dtfs-common --release`: 109 passed, 0 failed (`example_*_toml_parses`
+  green).
+
+## Group 6 summary
+
+CR-6-1 .. CR-6-8 all ✅. Baselines: dtfs-common 108 -> 109, dtfs-manager
+380 -> 381, dtfs-data 119 -> 121, dtfs-fuse 99 -> 110, dtfs-raft 105,
+dtfs-client 31, dtfs-cli 12 untouched. All passed, 0 failed at every
+step; no regressions. Deviations: none beyond the per-task notes above
+(CR-6-2's clamp source volume, CR-6-4's fallback chain, CR-6-5's
+FIFO-not-strict-LRU, CR-6-6's client-mock-gap testing-at-the-boundary
+pattern carried over from Group 1).
