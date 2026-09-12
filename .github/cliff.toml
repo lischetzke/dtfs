@@ -1,0 +1,44 @@
+# git-cliff config for DTFS release notes (AIWF-4-1).
+#
+# Reproduces the section grouping .github/release.yml applies to PR
+# labels, but driven off commit SUBJECTS/trailers instead of PR labels
+# (AGENTS.md B.1 defaults to committing straight to master, so most
+# user-visible work never gets a PR to label). Convention:
+#   - subject prefix `bug:` / `feat:` / `int:` (`int:` is excluded from
+#     the notes entirely, same as the `int` PR label today).
+#   - a `Breaking:` or `Update-required:` trailer anywhere in the
+#     commit body routes it into that section regardless of prefix.
+#   - a `Known-issue:` trailer routes it into Known Issues.
+# scripts/dtfs-release.sh runs `git-cliff` (when installed) to produce
+# `notes.md` for `gh release create --notes-file`; without git-cliff it
+# falls back to `--generate-notes` (GitHub's PR-label grouping) with a
+# warning.
+
+[changelog]
+header = ""
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\n") | first }} ({{ commit.id | truncate(length=7, end="") }})
+{% endfor %}
+{% endfor %}
+"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = false
+filter_unconventional = false
+filter_commits = false
+tag_pattern = "v[0-9]*"
+commit_preprocessors = []
+commit_parsers = [
+  { message = "Breaking:", group = "Breaking Changes" },
+  { message = "Update-required:", group = "Special Requirements for Updates" },
+  { message = "Known-issue:", group = "Known Issues" },
+  { message = "^feat:", group = "New Features" },
+  { message = "^bug:", group = "Bug Fixes" },
+  { message = "^int:", skip = true },
+  { message = ".*", group = "Other Changes" },
+]

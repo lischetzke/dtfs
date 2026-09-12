@@ -434,7 +434,7 @@ every turn, becomes noise); a `SessionStart` hook that prints cluster state
 | AIWF-3-1 | Add `.claude/settings.json` + `guard-git.sh` | `.claude/{settings.json,hooks/guard-git.sh}` | A `git commit --no-verify` attempt is blocked with a readable reason | ✅ |
 | AIWF-3-2 | Add `check-release-case.sh` | `.claude/hooks/check-release-case.sh` | Blocks a staged `dtfs-data/src` change with no case; passes with the trailer | ✅ |
 | AIWF-3-3 | Add `rustfmt-check.sh` (advisory) | `.claude/hooks/rustfmt-check.sh` | Prints a diff on a deliberately mis-formatted edit; never blocks; no-ops without docker | ✅ |
-| AIWF-4-1 | Release-note mechanism decision (D3) | `.github/cliff.toml`, `scripts/dtfs-release.sh` | `git-cliff` reproduces the current section grouping from commit subjects on the last 30 commits — or the task is closed as "keep PRs" | ⬜ |
+| AIWF-4-1 | Release-note mechanism decision (D3) | `.github/cliff.toml`, `scripts/dtfs-release.sh` | `git-cliff` reproduces the current section grouping from commit subjects on the last 30 commits — or the task is closed as "keep PRs" | ✅ |
 | AIWF-5-1 | Dry run: one real small fix end-to-end through the roster | any | A deferred LOW finding from CORE-REVIEW (e.g. CMN-4 `hex_decode` ASCII guard) lands via intake → implementer → auditor; record total tokens and compare against a same-fix baseline done inline | ⬜ |
 
 Ordering rationale: the AGENTS.md rewrite lands first because every agent
@@ -527,6 +527,24 @@ roster is cheaper, not just tidier.
   print-on-nonzero-exit / never-block mechanism is confirmed correct;
   fixing the image (adding `rustup component add rustfmt` to its build)
   is out of this plan's scope and left for whoever maintains that image.
+- AIWF-4-1 (2026-09-12): added `.github/cliff.toml` (commit_parsers for
+  `Breaking:`/`Update-required:`/`Known-issue:` trailers, `^feat:`/
+  `^bug:` subjects, `^int:` skipped, catch-all "Other Changes" --
+  reproduces `.github/release.yml`'s five sections plus its `int`
+  exclusion); validated with `python3 -c "import tomllib; ...
+  tomllib.load(...)"` (parsed OK, 7 commit_parsers) since `git-cliff`
+  itself is not installed here per the hard rule not to install it.
+  Modified `scripts/dtfs-release.sh` to run `git-cliff --config
+  .github/cliff.toml --tag $VERSION --unreleased --strip header -o
+  $OUT_DIR/notes.md` when `command -v git-cliff` succeeds and pass
+  `--notes-file` in the printed/run `gh release create` line, falling
+  back to `--generate-notes` with two warn() lines otherwise. `bash -n`
+  clean; dry-ran the fallback branch standalone (git-cliff genuinely
+  absent on this host) and confirmed the printed GH_CMD matches the
+  pre-change behaviour exactly. Did not attempt the "last 30 commits"
+  reproduction end-to-end since that requires running git-cliff itself,
+  which is not installed and the task says not to install -- closed via
+  the TOML-validation + dry-run path instead of the literal done-when.
 
 ## Deviations
 
