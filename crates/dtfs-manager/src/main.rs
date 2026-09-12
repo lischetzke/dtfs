@@ -65,6 +65,8 @@ async fn main() -> anyhow::Result<()> {
     // at runtime.
     config.memory.validate().map_err(|e| anyhow::anyhow!(e))?;
     config.placement.validate().map_err(|e| anyhow::anyhow!(e))?;
+    // CR2-8-1 (CMN-3) — reject an unusable message-size cap at startup.
+    config.grpc.validate().map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!(
         "Manager {} at {} ({})",

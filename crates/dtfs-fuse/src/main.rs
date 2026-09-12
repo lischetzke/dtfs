@@ -65,6 +65,11 @@ async fn main() -> Result<()> {
         .memory
         .validate()
         .map_err(|e| anyhow::anyhow!(e))?;
+    // CR2-8-1 (CMN-3) — reject an unusable message-size cap at startup.
+    fuse_config
+        .client
+        .validate()
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let mountpoint = args
         .mountpoint
@@ -99,6 +104,9 @@ async fn main() -> Result<()> {
     client.set_tls(tls_ctx.clone());
     // LIS-19 — stamp PutChunk with the same cluster secret the data node verifies.
     client.set_shared_secret(&fuse_config.client.shared_secret);
+    // CMN-3 — install the configured gRPC message-size cap before the
+    // first connect (channels are cached per address).
+    client.set_max_message_size_mb(fuse_config.client.max_message_size_mb);
     let endpoints: Vec<String> = fuse_config
         .client
         .all_manager_addrs()

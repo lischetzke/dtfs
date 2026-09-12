@@ -37,6 +37,7 @@ read_location_priority = ["falkenstein", "limburg"]
 | `heartbeat_interval_secs` | `client.heartbeat_interval_secs` | `u64` | `10` | 0--liveness window | No | Keepalive re-register cadence (Bug BQ-1). Keep well under the manager's `raft.node_liveness_secs` (default 30) or the client flaps `Down`. `0` = register once. |
 | `chunk_size_mb` | `client.chunk_size_mb` | `u32` | `4` | Must match volume | No | Chunk size the write buffer splits files into (Bug BW). **Must equal the volume's chunk size** (manager `defaults.chunk_size_mb`); a mismatch corrupts multi-chunk reads. |
 | `chunk_read_timeout_secs` | `client.chunk_read_timeout_secs` | `u64` | `60` | `0` = disabled | No | Per-replica chunk-fetch timeout (FUSE-HOL). A hung/dead data node that never returns a transport error would otherwise stall the read — and the app's FUSE op — indefinitely; on timeout the read fails over to the next replica. Generous vs a 4 MB chunk at 40 Mbps (~0.8 s); raise for very large chunks on very slow links. `0` keeps the legacy unbounded await. |
+| `max_message_size_mb` | `client.max_message_size_mb` | `u32` | `256` | 1--1024 | No | Maximum gRPC message size (MB) for the client's manager and data-node channels (CMN-3). Must be at least as large as the manager/data-node `[grpc].max_message_size_mb`, or a large response from a raised server-side cap gets rejected client-side. Must be > 0. |
 
 ### Example
 
