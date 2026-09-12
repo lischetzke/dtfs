@@ -1,8 +1,10 @@
 # `plans/` — Work Plans
 
 Canonical home for multi-step work planning in DTFS. See
-[AGENTS.md § B.2](../AGENTS.md#b2-plan-driven-workflow); mandatory for
-any non-trivial change.
+[AGENTS.md § B.2](../AGENTS.md#b2-plans). Write a plan file when the work
+has **≥ 3 tasks, spans sessions, or crosses crates**; a single fix uses
+the session's todo list instead — the file costs more tokens than it
+saves for one task.
 
 ## Layout
 
@@ -20,12 +22,15 @@ or fewer. Example: `plans/active/PLAN-BUG-BL-HEARTBEAT-NONLEADER-FORWARD.md`.
 
 ## Lifecycle
 
-1. **Author** under `active/` before writing code, with everything
-   [AGENTS.md § B.2](../AGENTS.md#b2-plan-driven-workflow) requires:
-   goals, non-goals, tasks with stable IDs, implementation sketches,
-   tests, acceptance criteria, verification log, deviations.
+1. **Author** under `active/` before writing code: goals, non-goals,
+   data-model shapes, tasks with stable IDs (`<plan-id>-<phase>-<n>`,
+   each with files/sketch/tests/done-when/status), cross-cutting
+   invariants, and empty Verification log + Deviations sections.
 2. **Iterate** as work proceeds. The plan is the source of truth; if
    reality diverges, update the Deviations section before continuing.
+   Verification log entries are one line per task (command + result),
+   not a paragraph — the failing→passing test output belongs in the
+   commit body instead (see AGENTS.md § B.3/B.4).
 3. **Delete** the plan file once every task is ✅ and merged. Git history
    keeps it — nothing is archived.
 
