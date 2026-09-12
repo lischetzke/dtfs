@@ -344,11 +344,23 @@ pub async fn run_grpc_server(
             .map_err(|e| anyhow::anyhow!("manager gRPC TLS config: {e}"))?;
     }
 
+    // CR2-8-1 (CMN-3) — the listener docs/src/configuration/manager.md
+    // documents as governed by [grpc].max_message_size_mb had never
+    // actually applied it (tonic's 4 MB default silently stayed in
+    // force). Size it from the same shared helper the data-node listener
+    // and every gRPC client stub in this crate use.
+    let max_message_bytes =
+        dtfs_common::config::max_message_bytes(config.grpc.max_message_size_mb);
+
     // Bug U — stop accepting new connections when the shutdown signal fires.
     // In-flight requests continue until they complete; main is responsible
     // for any post-server cleanup (Raft snapshot, audit flush).
     builder
-        .add_service(ManagerServiceServer::new(metadata_service))
+        .add_service(
+            ManagerServiceServer::new(metadata_service)
+                .max_decoding_message_size(max_message_bytes)
+                .max_encoding_message_size(max_message_bytes),
+        )
         .add_service(raft_svc)
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
@@ -357,4 +369,27 @@ pub async fn run_grpc_server(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cr2_8_1_manager_listener_tests {
+    /// CR2-8-1 (CMN-3) — the manager listener wiring is a straight-line
+    /// call into the shared `dtfs_common::config::max_message_bytes`
+    /// helper (already unit-tested generically in dtfs-common); this
+    /// pins the specific value `run_grpc_server` derives from a
+    /// `GrpcConfig` shaped like the manager's, so a future edit that
+    /// swaps in a different field or drops the `* 1024 * 1024` factor
+    /// fails here rather than only at a live listener.
+    #[test]
+    fn max_message_bytes_matches_manager_grpc_config() {
+        let cfg = dtfs_common::config::GrpcConfig {
+            listen_addr: "0.0.0.0:9401".to_string(),
+            max_message_size_mb: 256,
+            max_concurrent_chunk_writes: 8,
+        };
+        assert_eq!(
+            dtfs_common::config::max_message_bytes(cfg.max_message_size_mb),
+            256 * 1024 * 1024
+        );
+    }
 }

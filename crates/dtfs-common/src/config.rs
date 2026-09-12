@@ -36,9 +36,11 @@ pub struct ManagerConfig {
     #[serde(default)]
     pub placement: PlacementConfig,
     /// CF-5 — per-process RAM cap + pressure ladder. When `hard_cap_mb > 0`
-    /// a background sampler watches RSS and, at the Warn level, the
+    /// a background sampler watches RSS; Warn takes no manager action
+    /// (only data/FUSE roles react there), and at the Shed level the
     /// scheduler skips its background ticks (re-replication / migration /
-    /// rebalance) so the manager gives RAM back instead of being
+    /// rebalance, self-limiting via `MAX_CONSECUTIVE_PRESSURE_SKIPS` — see
+    /// REV-3-5) so the manager gives RAM back instead of being
     /// OOM/cgroup-killed. `#[serde(default)]` so old config files keep
     /// working (cap 0 = unbounded, no ladder).
     #[serde(default)]
@@ -568,6 +570,26 @@ pub struct GrpcConfig {
     pub max_concurrent_chunk_writes: usize,
 }
 
+impl GrpcConfig {
+    /// CMN-3 — reject an unusable message-size cap at startup instead of
+    /// silently falling back to tonic's 4 MB default.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_message_size_mb == 0 {
+            return Err("[grpc] max_message_size_mb must be > 0".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// CMN-3 — pure conversion from a configured MB cap to the byte count
+/// tonic's `max_decoding_message_size`/`max_encoding_message_size` want.
+/// Takes the raw `u32` (rather than `&GrpcConfig`) so it also serves
+/// `FuseClientConfig::max_message_size_mb`, which has no `[grpc]` block of
+/// its own.
+pub fn max_message_bytes(max_message_size_mb: u32) -> usize {
+    max_message_size_mb as usize * 1024 * 1024
+}
+
 fn default_max_concurrent_chunk_writes() -> usize {
     // 8 concurrent × 128 MB chunks = ~1 GB buffer ceiling. Leaves
     // plenty of headroom on an 8 GB data-node VM after the 512 MB ARC
@@ -876,9 +898,25 @@ pub struct FuseClientConfig {
     /// the timeout (legacy unbounded behavior).
     #[serde(default = "default_chunk_read_timeout_secs")]
     pub chunk_read_timeout_secs: u64,
+    /// CMN-3 — max gRPC message size (MB) for the client's manager and
+    /// data-node channels. Mirrors `GrpcConfig::max_message_size_mb`
+    /// (manager/data servers); the client has no `[grpc]` block of its own
+    /// so this lives directly on `[client]`. `#[serde(default)]` so a
+    /// legacy `fuse.toml` keeps working.
+    #[serde(default = "default_max_message_size")]
+    pub max_message_size_mb: u32,
 }
 
 impl FuseClientConfig {
+    /// CMN-3 — reject an unusable message-size cap at startup instead of
+    /// silently falling back to tonic's 4 MB default.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_message_size_mb == 0 {
+            return Err("[client] max_message_size_mb must be > 0".to_string());
+        }
+        Ok(())
+    }
+
     pub fn all_manager_addrs(&self) -> Vec<String> {
         let mut out = Vec::with_capacity(1 + self.manager_addrs.len());
         out.push(self.manager_addr.clone());
@@ -1088,7 +1126,10 @@ fn default_node_liveness_secs() -> u64 {
     // leader election, short enough that a truly dead node is flagged fast.
     30
 }
-fn default_max_message_size() -> u32 {
+/// CMN-3 — shared MB default for every gRPC message-size cap (manager/data
+/// `[grpc]`, fuse `[client]`). `pub` so `dtfs-client` can seed
+/// `DtfsClient`'s in-memory default without duplicating the literal.
+pub fn default_max_message_size() -> u32 {
     256
 }
 fn default_api_listen() -> String {
@@ -1866,5 +1907,43 @@ auto_unquarantine_secs = 3600
              (Bug BC-8) is what protects against silent toggles");
         assert!(!cfg.quarantine_on_fault);
         assert_eq!(cfg.auto_unquarantine_secs, 3600);
+    }
+
+    // CR2-8-1 (CMN-3) — grpc.max_message_size_mb propagation + validation.
+
+    #[test]
+    fn cr2_8_1_max_message_bytes_converts_mb_to_bytes() {
+        assert_eq!(max_message_bytes(256), 256 * 1024 * 1024);
+        assert_eq!(max_message_bytes(32), 32 * 1024 * 1024);
+        assert_eq!(max_message_bytes(0), 0);
+    }
+
+    #[test]
+    fn cr2_8_1_grpc_config_validate_rejects_zero() {
+        let mut cfg = GrpcConfig {
+            listen_addr: "0.0.0.0:9500".to_string(),
+            max_message_size_mb: 0,
+            max_concurrent_chunk_writes: default_max_concurrent_chunk_writes(),
+        };
+        assert!(cfg.validate().is_err());
+        cfg.max_message_size_mb = 32;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn cr2_8_1_fuse_client_config_max_message_size_mb_defaults_and_validates() {
+        let cfg: FuseClientConfig = toml::from_str(r#"
+manager_addr = "mgr-01:9401"
+shared_secret = "s"
+"#).unwrap();
+        assert_eq!(cfg.max_message_size_mb, default_max_message_size());
+        assert!(cfg.validate().is_ok());
+
+        let bad: FuseClientConfig = toml::from_str(r#"
+manager_addr = "mgr-01:9401"
+shared_secret = "s"
+max_message_size_mb = 0
+"#).unwrap();
+        assert!(bad.validate().is_err());
     }
 }

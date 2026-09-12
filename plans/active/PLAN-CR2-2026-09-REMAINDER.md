@@ -51,11 +51,11 @@ Status: ⬜ / 🟦 / ✅ / 🟥
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR2-8-1 | ⬜ | CMN-3 | `dtfs-common/src/config.rs`, `dtfs-data/src/server.rs`, `dtfs-client/src/client.rs`, `deploy/examples/*.toml`, `docs/src/configuration/*.md` | Wire `grpc.max_message_size_mb` into the tonic builders (`max_decoding_message_size` / `max_encoding_message_size`) everywhere a `32 * 1024 * 1024` literal is used today. | config unit: value propagates; `example_*_toml_parses` green. | Tests pass; docs row true. |
-| CR2-8-2 | ⬜ | CMN-6 | `dtfs-common/src/memory.rs` table, `config.rs` docs, `docs/src/configuration/manager.md` | Manager rung: Warn = no action; Shed = pause scheduler ticks (self-limiting). | — | Doc sites agree with `scheduler.rs`. |
-| CR2-8-3 | ⬜ | FUSE-11 | `dtfs-fuse/src/filesystem.rs` read path, `local_cache.rs` | Viewer-read hint from per-fh consumption (≥ 1 MiB read on this fh, or readahead active) instead of the kernel's per-call length; keep `ATIME_UPDATE_MIN_BYTES` semantics for the hint. | unit on the pure hint helper. | Tests pass. |
-| CR2-8-4 | ⬜ | FUSE-12 | `dtfs-fuse/src/local_cache.rs` | Evict with hysteresis (down to 90 % of `max_bytes`) so the stat sweep is rare; either make `lru` the atime index (update on viewer get, remove on prune) or delete it. | unit: 1000 puts at a full cache → sweeps ≤ 1000/10; `lru` never exceeds `sizes.len()`. | Tests pass. |
-| CR2-8-5 | ⬜ | — | `AGENTS.md`, `.claude/rules/fuse.md`, `.claude/rules/config-surface.md` | One sentence each. | — | Same commit. |
+| CR2-8-1 | ✅ | CMN-3 | `dtfs-common/src/config.rs`, `dtfs-data/src/server.rs`, `dtfs-client/src/client.rs`, `deploy/examples/*.toml`, `docs/src/configuration/*.md` | Wire `grpc.max_message_size_mb` into the tonic builders (`max_decoding_message_size` / `max_encoding_message_size`) everywhere a `32 * 1024 * 1024` literal is used today. | config unit: value propagates; `example_*_toml_parses` green. | Tests pass; docs row true. |
+| CR2-8-2 | ✅ | CMN-6 | `dtfs-common/src/memory.rs` table, `config.rs` docs, `docs/src/configuration/manager.md` | Manager rung: Warn = no action; Shed = pause scheduler ticks (self-limiting). | — | Doc sites agree with `scheduler.rs`. |
+| CR2-8-3 | ✅ | FUSE-11 | `dtfs-fuse/src/filesystem.rs` read path, `local_cache.rs` | Viewer-read hint from per-fh consumption (≥ 1 MiB read on this fh, or readahead active) instead of the kernel's per-call length; keep `ATIME_UPDATE_MIN_BYTES` semantics for the hint. | unit on the pure hint helper. | Tests pass. |
+| CR2-8-4 | ✅ | FUSE-12 | `dtfs-fuse/src/local_cache.rs` | Evict with hysteresis (down to 90 % of `max_bytes`) so the stat sweep is rare; either make `lru` the atime index (update on viewer get, remove on prune) or delete it. | unit: 1000 puts at a full cache → sweeps ≤ 1000/10; `lru` never exceeds `sizes.len()`. | Tests pass. |
+| CR2-8-5 | ✅ | — | `AGENTS.md`, `.claude/rules/fuse.md`, `.claude/rules/config-surface.md` | One sentence each. | — | Same commit. |
 
 ## Verification log
 
@@ -86,6 +86,61 @@ Status: ⬜ / 🟦 / ✅ / 🟥
   - Final full-workspace counts: manager 390, data 122, fuse 110
     (untouched), raft 111, common 110, client 31 (untouched), cli 12
     (untouched). `cargo build --release --workspace` clean throughout.
+
+- Group 8 (branch `bug/cr2-8-common-fuse`), 2026-09-12,
+  `cargo test -p <crate> --release` via Docker `dtfs-buildenv`:
+  - CR2-8-2 (CMN-6): doc-only (memory.rs table, config.rs doc comment,
+    docs/src/configuration/manager.md); no test count change.
+  - CR2-8-1 (CMN-3): common 110 -> 113 (+3: `max_message_bytes`
+    conversion, `GrpcConfig::validate` rejects 0,
+    `FuseClientConfig::max_message_size_mb` default+validate).
+    data 122 -> 122 (wiring only, no new test), client 31 -> 31, fuse
+    110 -> 110. `example_*_toml_parses` green.
+    `cargo build --release --workspace` clean.
+  - CR2-8-4 (FUSE-12): fuse 110 -> 111 (+1: `cr2_8_4_hysteresis_bounds_
+    sweep_frequency_at_steady_state`, 1000 puts at a full 10 KB cache ->
+    <= 100 sweeps). Deleted the dead `lru: BTreeMap<u64, String>` index
+    entirely (smaller diff than wiring it up as the real atime index —
+    `evict_to_size` already re-derives recency from on-disk atime, so the
+    index had no reader); added `EVICT_TARGET_PCT = 90` hysteresis to
+    `evict_to_size`. Updated `rev_3_12_evict_to_size_sweeps_once_for_
+    many_victims`'s hardcoded victim count (3 -> 4) to match the new 90%
+    target on the same fixture.
+  - CR2-8-3 (FUSE-11): fuse 111 -> 114 (+3: `cr2_8_3_is_viewer_read_tests`).
+    Added `OpenFile.bytes_read_on_fh`, the pure helper
+    `filesystem::is_viewer_read(bytes_on_fh, readahead_active)`, and
+    `ReadAheadEngine::is_active()`; `read()` accumulates
+    `bytes_read_on_fh` once per call (no `.await` while the `open_files`
+    guard is held, CO-3-12) and passes the resulting hint to the new
+    `LocalChunkCache::get_with_hint`, which the old `get(id, bytes_hint)`
+    now delegates to.
+  - CR2-8-1 follow-up (review R1): the ManagerService gRPC listener
+    (`dtfs-manager/src/server.rs::run_grpc_server`) still had no
+    `max_decoding/encoding_message_size` — tonic's 4 MB default applied
+    even though `docs/src/configuration/manager.md`'s `[grpc]` row
+    documented the manager row as the CMN-3 evidence. Wired via the
+    same `dtfs_common::config::max_message_bytes` helper. Also wired the
+    manager-to-manager gRPC clients this crate creates: the cached
+    `ForwardClientWrite` client (`metadata.rs::leader_client`, used by
+    the heartbeat hot path `raft_write_or_forward`), the uncached
+    `write_via_leader` forward client (health-monitor status commits;
+    added a `max_message_size_mb: u32` param, threaded through
+    `HealthMonitor::new`), and the manager self-registration
+    `RegisterNode` client (`main.rs::manager_self_register_lifecycle`).
+    Left the scheduler's `DataServiceClient` stubs (ReplicateChunk/
+    ListChunks/VerifyChunk trigger RPCs) and the unlink fan-out's
+    `DeleteChunkReplica` client at tonic's default: their payloads
+    (chunk ids/addresses, a 1000-row ListChunks page) stay well under
+    4 MB regardless of the configured cap, so there was no hardcoded-
+    literal-ignoring-config bug to fix there. manager 390 -> 391 (+1:
+    `cr2_8_1_manager_listener_tests::max_message_bytes_matches_manager_
+    grpc_config`). Full workspace suite green; `cargo build --release
+    --workspace` clean.
+  - CR2-8-5: doc-only. One-sentence additions to AGENTS.md (A.3.2 for
+    FUSE-11/12, A.5 for the CMN-3 message-size wiring),
+    `.claude/rules/fuse.md`, `.claude/rules/config-surface.md`. No
+    matching section in docs/src/internals/invariants.md for these
+    finding ids, so left untouched.
 
 ## Deviations
 

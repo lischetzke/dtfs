@@ -98,6 +98,8 @@ async fn main() -> anyhow::Result<()> {
     // CR-6-1 (CMN-1) — reject an unusable memory ladder at startup
     // instead of flapping Warn/Shed on every sample.
     config.memory.validate().map_err(|e| anyhow::anyhow!(e))?;
+    // CR2-8-1 (CMN-3) — reject an unusable message-size cap at startup.
+    config.grpc.validate().map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!(
         "Data node {} at {} ({})",

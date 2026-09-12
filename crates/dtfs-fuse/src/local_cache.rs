@@ -19,7 +19,6 @@
 // written to `<...>.partial`, fsynced, and renamed. Reads only look at
 // `.dat` files so partial writes are never observed.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,7 +26,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use dtfs_common::checksum::IncrementalHasher;
 use dtfs_common::types::ChunkId;
-use parking_lot::RwLock;
 use tokio::fs as tfs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -43,14 +41,22 @@ pub const ATIME_UPDATE_MIN_BYTES: usize = 1024 * 1024;
 /// data node's incremental read-serve hash.
 const VERIFY_PIECE_SIZE: usize = 8 * 1024 * 1024;
 
+/// FUSE-12 — eviction target as a percentage of `max_bytes`. `evict_to_size`
+/// only fires when `total_bytes > max_bytes` (unchanged trigger), but drops
+/// entries until usage is back down to this fraction of the cap rather than
+/// exactly at it. Without the headroom, a cache sitting right at the cap
+/// re-triggers a full O(N) stat sweep (REV-3-12 made each sweep single-pass,
+/// but every `put()` at steady state still paid one) on almost every single
+/// `put()`; at a 1 TB/4 MB cache that is ~260k stat syscalls per foreground
+/// miss on the read path. 90% headroom means roughly one sweep per ~10%
+/// of the cap's worth of new data instead of one per put.
+const EVICT_TARGET_PCT: u64 = 90;
+
 /// One disk-backed chunk cache.
 pub struct LocalChunkCache {
     dir: PathBuf,
     max_bytes: u64,
     max_age: Option<Duration>,
-    /// LRU index: mtime_ms -> chunk_id. We use BTreeMap so the oldest entry
-    /// is at the head and eviction is O(log N).
-    lru: RwLock<BTreeMap<u64, String>>,
     /// Per-chunk size in bytes (drives total-bytes accounting).
     sizes: dashmap::DashMap<String, u64>,
     /// Aggregate bytes stored. AtomicU64 because put/evict can run from
@@ -76,7 +82,6 @@ impl LocalChunkCache {
             dir,
             max_bytes,
             max_age,
-            lru: RwLock::new(BTreeMap::new()),
             sizes: dashmap::DashMap::new(),
             total_bytes: AtomicU64::new(0),
             eviction_sweeps: AtomicU64::new(0),
@@ -89,7 +94,6 @@ impl LocalChunkCache {
     /// startup so the size/age accounting is correct after a restart.
     async fn reindex_from_disk(&self) -> anyhow::Result<()> {
         let mut total: u64 = 0;
-        let mut lru = self.lru.write();
         let mut dirs1 = match tfs::read_dir(&self.dir).await {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -110,16 +114,9 @@ impl LocalChunkCache {
                     if path.extension().map_or(false, |x| x == "dat") {
                         let meta = e.metadata().await?;
                         let size = meta.len();
-                        let mtime_ms = meta
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
                         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                             let id = stem.to_string();
-                            self.sizes.insert(id.clone(), size);
-                            lru.insert(mtime_ms.saturating_mul(1000).saturating_add(0), id);
+                            self.sizes.insert(id, size);
                             total += size;
                         }
                     }
@@ -201,7 +198,7 @@ impl LocalChunkCache {
         Some(Bytes::from(data))
     }
 
-    /// Remove one entry from disk and from the size/LRU accounting.
+    /// Remove one entry from disk and from the size accounting.
     /// Returns false only when the file exists but could not be removed.
     async fn evict_entry(&self, chunk_id: &str) -> bool {
         let path = self.path_for(chunk_id);
@@ -212,15 +209,6 @@ impl LocalChunkCache {
         }
         if let Some((_, len)) = self.sizes.remove(chunk_id) {
             self.total_bytes.fetch_sub(len, Ordering::Relaxed);
-        }
-        let mut lru = self.lru.write();
-        let stale: Vec<u64> = lru
-            .iter()
-            .filter(|(_, v)| v.as_str() == chunk_id)
-            .map(|(k, _)| *k)
-            .collect();
-        for k in stale {
-            lru.remove(&k);
         }
         true
     }
@@ -250,13 +238,27 @@ impl LocalChunkCache {
     /// Retrieve a cached chunk and (conditionally) refresh its atime so
     /// the size-based LRU eviction sees it as recently used.
     ///
-    /// `bytes_hint` is the byte count the caller intends to consume from
-    /// this fetch. If `bytes_hint >= ATIME_UPDATE_MIN_BYTES` we treat the
-    /// read as a "view" event and bump atime to now. Otherwise it's a
-    /// scanner read and we explicitly RESTORE the pre-read atime — the
-    /// OS auto-updates atime on read() so without the restore even
-    /// scanner reads would refresh LRU position and defeat the design.
+    /// `bytes_hint` is the byte count of the CURRENT kernel read call, so
+    /// with 128 KB FUSE reads (no `max_read`/`max_pages` configured) this
+    /// is always well under `ATIME_UPDATE_MIN_BYTES` (1 MiB) and every
+    /// playback read gets classified as a scanner (FUSE-11). Kept for
+    /// compatibility; new callers should use [`get_with_hint`](Self::get_with_hint)
+    /// with a viewer/scanner decision that accounts for per-fh cumulative
+    /// consumption, not one kernel call's length.
     pub async fn get(&self, chunk_id: &str, bytes_hint: usize) -> Option<Bytes> {
+        self.get_with_hint(chunk_id, bytes_hint >= ATIME_UPDATE_MIN_BYTES).await
+    }
+
+    /// Retrieve a cached chunk and (conditionally) refresh its atime so the
+    /// size-based LRU eviction sees it as recently used.
+    ///
+    /// `is_viewer` is the caller's own viewer/scanner classification (see
+    /// [`crate::filesystem::is_viewer_read`] — FUSE-11): `true` treats the
+    /// read as a "view" event and bumps atime to now; `false` is a scanner
+    /// read, so the pre-read atime is explicitly RESTORED — the OS
+    /// auto-updates atime on read() so without the restore even scanner
+    /// reads would refresh LRU position and defeat the design.
+    pub async fn get_with_hint(&self, chunk_id: &str, is_viewer: bool) -> Option<Bytes> {
         let path = self.path_for(chunk_id);
         if !path.exists() {
             return None;
@@ -264,7 +266,7 @@ impl LocalChunkCache {
         let pre = tfs::metadata(&path).await.ok().and_then(|m| m.accessed().ok());
         // REV-2-4 — verify before serving; a rotten entry is a MISS.
         let data = self.read_verified(chunk_id, &path).await?;
-        if bytes_hint >= ATIME_UPDATE_MIN_BYTES {
+        if is_viewer {
             // Viewer read — set atime to now.
             let now = SystemTime::now();
             let _ = filetime::set_file_atime(
@@ -295,10 +297,6 @@ impl LocalChunkCache {
         }
         tfs::rename(&tmp_path, &final_path).await?;
 
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
         let len = data.len() as u64;
 
         // Update accounting.
@@ -307,41 +305,35 @@ impl LocalChunkCache {
             self.total_bytes.fetch_add(len, Ordering::Relaxed);
             self.total_bytes.fetch_sub(prev, Ordering::Relaxed);
         }
-        {
-            let mut lru = self.lru.write();
-            // Use mtime_ms * 1000 + small jitter to avoid collisions when
-            // multiple chunks land in the same ms.
-            let key = now_ms.saturating_mul(1000).saturating_add(
-                xxhash_rust::xxh3::xxh3_64(chunk_id.as_bytes()) % 1000,
-            );
-            lru.insert(key, chunk_id.to_string());
-        }
 
         self.evict_to_size().await;
         Ok(())
     }
 
-    /// Evict entries until total_bytes ≤ max_bytes, oldest atime first.
+    /// Evict entries until total_bytes drops to `EVICT_TARGET_PCT` of
+    /// `max_bytes`, oldest atime first.
     ///
-    /// We deliberately query each candidate's actual file atime rather
-    /// than rely on the in-memory `lru` BTreeMap's insertion order:
-    /// atime is what `get()` updates on viewer reads (and intentionally
-    /// does NOT update on scanner reads), so the on-disk atime is the
-    /// authoritative source of truth for "most recently viewed". This
-    /// makes LRU robust to scanner storms — a Plex library walk doesn't
-    /// move recently-viewed chunks toward eviction.
+    /// We query each candidate's actual file atime rather than keeping a
+    /// separate in-memory LRU index: atime is what `get()` updates on
+    /// viewer reads (and intentionally does NOT update on scanner reads),
+    /// so the on-disk atime is the authoritative source of truth for "most
+    /// recently viewed". This makes LRU robust to scanner storms — a Plex
+    /// library walk doesn't move recently-viewed chunks toward eviction.
     ///
-    /// REV-3-12: the atime snapshot is taken ONCE per call. The previous shape
-    /// re-stat'ed every tracked entry for every victim, so a burst of
-    /// insertions cost O(N*M) stat syscalls awaited inline on the FUSE read
-    /// path (a visible stall mid-playback with a large cache). Policy is
-    /// unchanged — same oldest-atime-first order, just computed in one sweep
-    /// and then applied to as many victims as the cap needs.
+    /// REV-3-12: the atime snapshot is taken ONCE per call, not once per
+    /// victim. FUSE-12: eviction targets `EVICT_TARGET_PCT` of `max_bytes`
+    /// (hysteresis) rather than exactly `max_bytes`, so a cache sitting
+    /// right at the cap does not pay a full stat sweep on almost every
+    /// single `put()` — it now takes roughly `(100 - EVICT_TARGET_PCT)%`
+    /// of the cap's worth of new data to re-trigger a sweep. Policy is
+    /// otherwise unchanged — same oldest-atime-first order, computed in one
+    /// sweep and applied to as many victims as the target needs.
     async fn evict_to_size(&self) {
         if self.total_bytes.load(Ordering::Relaxed) <= self.max_bytes {
             return;
         }
         self.eviction_sweeps.fetch_add(1, Ordering::Relaxed);
+        let target_bytes = self.max_bytes.saturating_mul(EVICT_TARGET_PCT) / 100;
 
         // ONE sweep: stat every tracked entry exactly once.
         let ids: Vec<String> = self.sizes.iter().map(|e| e.key().clone()).collect();
@@ -362,7 +354,7 @@ impl LocalChunkCache {
         candidates.sort_by(|a, b| a.0.cmp(&b.0));
 
         for (_, id) in candidates {
-            if self.total_bytes.load(Ordering::Relaxed) <= self.max_bytes {
+            if self.total_bytes.load(Ordering::Relaxed) <= target_bytes {
                 break;
             }
             // A failed removal (permissions, busy) just leaves the entry in
@@ -525,15 +517,17 @@ mod tests {
         assert_eq!(cache.entry_count(), 6);
         let sweeps_before = cache.eviction_sweeps();
 
-        // One 5000-byte insert pushes the total to 14000 → three of the
-        // oldest entries must go in this single call.
+        // One 5000-byte insert pushes the total to 14000. FUSE-12 hysteresis
+        // targets 90% of the 10 KB cap (9000 bytes), so four of the oldest
+        // entries must go in this single call (14000 - 4*1500 = 8000 <= 9000;
+        // three alone would leave 9500 > 9000).
         let big = vec![200u8; 5000];
         let big_id = cid(&big);
         cache.put(&big_id, &big).await.unwrap();
 
         assert!(
-            cache.current_bytes() <= 10_000,
-            "eviction must bring the cache under the cap, got {}",
+            cache.current_bytes() <= 9_000,
+            "eviction must bring the cache down to the FUSE-12 hysteresis target, got {}",
             cache.current_bytes()
         );
         assert_eq!(
@@ -541,15 +535,15 @@ mod tests {
             1,
             "evict_to_size must sweep once per call, not once per victim"
         );
-        // LRU policy unchanged: the three oldest atimes went, the three
+        // LRU policy unchanged: the four oldest atimes went, the two
         // newest plus the fresh insert survived.
-        for old in &ids[..3] {
+        for old in &ids[..4] {
             assert!(
                 cache.peek(old).await.is_none(),
                 "oldest-atime entry should have been evicted"
             );
         }
-        for keep in &ids[3..] {
+        for keep in &ids[4..] {
             assert!(
                 cache.peek(keep).await.is_some(),
                 "newer entry must survive eviction"
@@ -558,6 +552,39 @@ mod tests {
         assert!(
             cache.peek(&big_id).await.is_some(),
             "fresh insert must survive"
+        );
+    }
+
+    /// FUSE-12: eviction targets 90% of `max_bytes`, not exactly
+    /// `max_bytes`, so a cache running at steady state (puts roughly
+    /// matching evictions) pays a full stat sweep only once per ~10% of
+    /// the cap's worth of new data, not on almost every single `put()`.
+    #[tokio::test]
+    async fn cr2_8_4_hysteresis_bounds_sweep_frequency_at_steady_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 10 KB cap, 50-byte entries: 200 entries fill the cap exactly.
+        let max_bytes = 10_000u64;
+        let cache = LocalChunkCache::new(tmp.path().to_path_buf(), max_bytes, None)
+            .await
+            .unwrap();
+
+        for i in 0u32..1000 {
+            let mut data = vec![0u8; 50];
+            data[0..4].copy_from_slice(&i.to_le_bytes());
+            let id = cid(&data);
+            cache.put(&id, &data).await.unwrap();
+        }
+
+        assert!(
+            cache.current_bytes() <= max_bytes,
+            "cache must stay under the cap, got {}",
+            cache.current_bytes()
+        );
+        assert!(
+            cache.eviction_sweeps() <= 100,
+            "1000 puts at a full cache must trigger at most 100 sweeps (got {}); \
+             hysteresis should space sweeps roughly every 10% of the cap",
+            cache.eviction_sweeps()
         );
     }
 

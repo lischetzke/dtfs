@@ -36,6 +36,10 @@ manager_addr = "10.0.0.1:9401"      # primary manager gRPC endpoint
                                     # the read fails over to the next replica.
                                     # 0 = disabled (unbounded). Raise for very
                                     # large chunks on very slow links.
+#max_message_size_mb = 256          # CMN-3: max gRPC message size for the
+                                    # client's manager + data-node channels.
+                                    # Must be >= the manager/data-node [grpc]
+                                    # max_message_size_mb. Must be > 0.
 
 [location]
 # region/datacenter/rack: real topology of this client (drives nearest-replica

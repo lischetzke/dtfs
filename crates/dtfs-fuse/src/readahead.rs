@@ -253,6 +253,16 @@ impl ReadAheadEngine {
         self.cache_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// CR2-8-3 (FUSE-11) — whether readahead is actively prefetching for
+    /// this mount: the configured mode isn't `Disabled` AND the memory
+    /// ladder hasn't pinned prefetch off at Shed. Used as a viewer-read
+    /// signal for the disk cache's atime hint (a scanner's stat+header
+    /// access never drives sequential prefetch).
+    pub fn is_active(&self) -> bool {
+        !matches!(self.mode, ReadAheadMode::Disabled)
+            && self.prefetch_enabled.load(Ordering::Relaxed)
+    }
+
     /// Attach a disk-backed cache. Prefetched chunks will be mirrored to
     /// it after a successful fetch.
     pub fn set_local_cache(&self, cache: Arc<crate::local_cache::LocalChunkCache>) {

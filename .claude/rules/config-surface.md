@@ -24,3 +24,12 @@ example. A field documented but not wired to anything real (see CMN-3 in
 `plans/reports/CORE-REVIEW-2026-09-12.md` for the shape of that bug) is
 worse than no field: either wire it or delete it, the example, and the
 docs row together.
+
+CR2-8-1 fixed CMN-3 itself: `grpc.max_message_size_mb` was parsed and
+documented (default 256) but every tonic builder hardcoded a 32 MB
+literal instead of reading it. The fix added the shared pure helper
+`dtfs_common::config::max_message_bytes(mb)` and a matching
+`[client].max_message_size_mb` on `FuseClientConfig` (the client had no
+`[grpc]` block of its own) — when a config value has no natural home in
+an existing per-role struct, mirror the sibling role's field name/default
+rather than inventing a new shape.

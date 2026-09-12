@@ -203,13 +203,17 @@ pub async fn run_grpc_server(
     // Bug U — `serve_with_shutdown` lets tonic stop accepting new connections
     // when the signal fires, but in-flight requests keep running until they
     // complete (or until we abandon them in main).
+    // CMN-3 — the cap was previously a hardcoded 32 MB literal, making
+    // `[grpc].max_message_size_mb` a documented no-op; now the configured
+    // value (default 256 MB, docs/src/configuration/data-node.md) actually
+    // governs the wire limit for the 8 MB GetChunk streaming pieces
+    // (default tonic cap is 4 MB).
+    let max_message_bytes = dtfs_common::config::max_message_bytes(config.grpc.max_message_size_mb);
     builder
         .add_service(
             DataServiceServer::new(service)
-                // Allow the 8 MB streaming pieces in GetChunk (default cap
-                // is 4 MB).
-                .max_decoding_message_size(32 * 1024 * 1024)
-                .max_encoding_message_size(32 * 1024 * 1024),
+                .max_decoding_message_size(max_message_bytes)
+                .max_encoding_message_size(max_message_bytes),
         )
         .serve_with_shutdown(addr, shutdown)
         .await?;
