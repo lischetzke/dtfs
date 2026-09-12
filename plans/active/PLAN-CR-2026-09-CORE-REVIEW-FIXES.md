@@ -160,7 +160,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-5-6 | ✅ | DATA-8 | `dtfs-data/src/main.rs` ~589-634 | Send `ChunkStatusReport` in batches of 1000 ids; re-enqueue only the unsent remainder + the failed batch. | unit on the batching helper: 2500 ids → 3 calls; failure on call 2 → 1500 re-enqueued. | Test passes. |
 | CR-5-7 | ✅ | CMN-4 | `crates/dtfs-common/src/crypto.rs` `hex_decode` ~125 | `if !s.is_ascii() { return None; }`. | unit: `"€€"` → None, no panic. | Test fails (panics) before, passes after. |
 | CR-5-8 | ✅ | — | `tests/release/cases/108-heartbeat-requires-mgr-rpc-auth.sh` | grpcurl (or dtfs-cli debug) Heartbeat without headers → PermissionDenied when secret set. | `bash -n` clean. | Present, unexecuted. |
-| CR-5-9 | ⬜ | — | `AGENTS.md` A.3.3 #7/#8, A.8 metadata entry | Heartbeat/ReportChunkStatus/RecordCacheHit gated; forward allow-list; control-plane deadlines + keepalive. | — | Same commit. |
+| CR-5-9 | ✅ | — | `AGENTS.md` A.3.3 #7/#8, A.8 metadata entry | Heartbeat/ReportChunkStatus/RecordCacheHit gated; forward allow-list; control-plane deadlines + keepalive. | — | Same commit. |
 
 ### Group 6 — Config/proto sync + client perf (branch `bug/cr-6-config-client-perf`)
 
@@ -920,3 +920,21 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   `KNOWN_ISSUE PROTO-1` when grpcurl/manager.proto are unavailable
   (gate is unit-tested in `lis56_mgr_rpc_auth_tests`). `bash -n` clean;
   not executed (no lab session this run).
+- **CR-5-9** 2026-09-12. AGENTS.md A.3.3 #7 gained the RecordCacheHit
+  clause (DATA-11); #8 gained the Heartbeat/ReportChunkStatus clause
+  (CR-5-1); the A.8 metadata.rs row gained the MGR-11 allow-list and
+  MGR-12 response-check clauses. `.claude/rules/integrity.md` gained a
+  RecordCacheHit mention in the data-plane section and a new
+  "Manager-plane RPC auth (LIS-56)" section carrying the CR-5-1/5-2/5-3
+  narrative. `docs/src/internals/invariants.md` gained CR-5-1/5-2/5-3
+  paragraphs under `dtfs-manager/src/metadata.rs` and two new sections
+  (`dtfs-data/src/main.rs` control-plane hardening for CR-5-4/5-6;
+  `dtfs-data/src/server.rs::record_cache_hit` for CR-5-5). Docs-only
+  commit, no code change.
+
+## Group 5 summary
+
+CR-5-1 .. CR-5-9 all ✅. Baselines: dtfs-manager 367 -> 379, dtfs-data
+114 -> 119, dtfs-common 106 -> 108, dtfs-client 31 -> 31 (unchanged);
+dtfs-raft 105, dtfs-fuse 99, dtfs-cli 12 untouched. All passed, 0
+failed at every step; no regressions.

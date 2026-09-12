@@ -551,6 +551,48 @@ quarantine_ok, remove_corrupt_ok)`; either `Err` sets `accepted = false`,
 and the data node's heartbeat loop already re-enqueues its drained
 faults on that (Bug BF-5) — same retry contract as CO-3-7.
 
+**CR-5-1 (PROTO-1):** `heartbeat` and `report_chunk_status` were the
+only two mutating `ManagerService` RPCs not gated by
+`require_mgr_rpc_auth` — any caller who knew (or guessed) a node id
+could poison that node's health status or drop replica entries via
+`report_chunk_status` without the cluster secret. Both handlers now
+call `require_mgr_rpc_auth(secret, "Heartbeat"|"ReportChunkStatus",
+&req.node_id, request.metadata())` before `into_inner()`, matching the
+`delete_file` template. `dtfs-data/src/main.rs` stamps both outbound
+calls via a new `stamp_mgr_rpc_request` (mirrors
+`dtfs-client::stamp_mgr_mutation`) from `[cluster].shared_secret`;
+`RegisterNode` is untouched — it carries its own `shared_secret` field.
+Empty secret still skips on both sides (legacy back-compat). Deploy
+manager and data together.
+
+**CR-5-2 (MGR-11):** CO-2-2's `forward_secret_ok` authenticates WHO
+forwards a write via `ForwardClientWrite` but never checked WHAT was
+forwarded — an authenticated caller (a compromised or buggy follower,
+or anyone holding the shared secret) could smuggle an arbitrary
+`ClientRequest` (e.g. `UpdateConfig`) through the leader's
+`raft.client_write` as if it were a legitimate heartbeat or
+health-monitor forward. A new pure `fn forwardable(&ClientRequest) ->
+bool` allow-lists exactly the variants a follower legitimately
+proposes today (grepped from `raft_write_or_forward` /
+`proxy_to_leader` / `write_via_leader`): `UpdateNodeUsage`,
+`UpdateNodeDiskUsage`, `UpdateNodeStatus`, `AppendAudit`,
+`QuarantineNode`, `RemoveCorruptChunkReplicas`, `ReportScrubResult`,
+`ReportChunkReads`. `forward_client_write` checks it immediately after
+deserializing the forwarded request (before the `ReportChunkReads`
+fast path and before any Raft write) and denies + audits
+(`category=raft, event=auth.denied`) anything else.
+
+**CR-5-3 (MGR-12):** `write_via_leader` mapped only the transport
+`Result` of `forward_client_write`, so a forward that transported fine
+but was REJECTED by the leader (bad shared secret, an MGR-11
+disallowed variant, or a failed Raft apply) came back `Ok(Response)`
+at the tonic layer with `ForwardWriteResponse.success == false` and was
+silently treated as a successful write — the caller (health monitor,
+heartbeat forward) believed the write landed when it never did. A new
+pure `fn forward_result(&ForwardWriteResponse) -> Result<(), String>`
+inspects `.success`/`.error`; `write_via_leader` now returns its
+verdict instead of discarding the response body.
+
 ### `dtfs-manager/src/api.rs`
 
 REST endpoints (WebUI + CLI); `get_stats` is the WebUI home aggregator.
@@ -588,6 +630,39 @@ node_id_from_hostname(hostname)` SERVER-SIDE (never trust a client id),
 then does the `RegisterNode` Raft write. Empty `cluster.shared_secret` =
 documented unauthenticated downgrade (skips the challenge/HMAC checks).
 See `docs/src/security/cluster-join.md`.
+
+### `dtfs-data/src/main.rs` — control-plane hardening (CR-5-4/5-6)
+
+**CR-5-4 (DATA-6):** the data node's `Heartbeat`/`ReportChunkStatus`/
+`RegisterNode` calls carried no per-request deadline, and no manager
+peer channel set an HTTP/2 keepalive, so a manager that accepted the
+TCP connection but stopped answering (wedged leader, partition) could
+hang the heartbeat loop indefinitely; a half-open connection was only
+detected by the OS-level TCP timeout (minutes). `dtfs-common/src/
+tls.rs::apply_keepalive` (`http2_keep_alive_interval(10s)`,
+`keep_alive_timeout(5s)`, `keep_alive_while_idle(true)`) is now wired
+into every `TlsContext::endpoint()`, and a new `control_request<T>`
+(`set_timeout(10s)`) wraps `register_node` directly and, via
+`stamp_mgr_rpc_request`, `heartbeat`/`report_chunk_status`.
+
+**CR-5-6 (DATA-8):** `ChunkStatusReport` sent every drained corrupt id
+in one gRPC message — after a large scrub or a rolling-restart-sized
+backlog this could be an oversized report. A pure `fn batches(ids,
+n) -> Vec<Vec<String>>` (`CHUNK_STATUS_REPORT_BATCH_SIZE = 1000`)
+splits the send into fixed-size batches; on the first failed batch
+(transport error or `accepted == false`) the loop re-enqueues that
+batch plus every unsent batch after it — not the whole original set —
+so a batch the manager already accepted is never re-sent on retry.
+
+### `dtfs-data/src/server.rs::record_cache_hit` (CR-5-5, DATA-11)
+
+The last mutating data-plane RPC not gated by LIS-19/55/83: any caller
+who could reach a data node's gRPC port could inflate a chunk's read
+counter (and so its tiering promotion score) without the cluster
+secret. Now gated by `require_data_rpc_auth(secret, "RecordCacheHit",
+&req.chunk_id, md)`, bound to `chunk_id` exactly like `GetChunk`.
+`dtfs-client/src/client.rs::record_cache_hit` stamps `x-dtfs-rpc-*`
+from `[client].shared_secret`, mirroring `get_chunk`'s stamp block.
 
 ### `dtfs-data/src/replication.rs::replicate_to`
 
