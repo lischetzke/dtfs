@@ -16,6 +16,7 @@ use tracing::info;
 
 use crate::cluster::ClusterManager;
 use crate::placement::PlacementEngine;
+use crate::scheduler::live_replica_tier;
 
 /// Bug BF-9 / BF-10 — warn-once gates for the three deprecated
 /// `VolumeSchedules` fields. Each AtomicBool flips on first observation
@@ -1123,6 +1124,81 @@ fn resolve_ack_floor(
         Some(file) => request_floor.max(floor_of(&file.volume_id)),
         None => request_floor,
     }
+}
+
+/// CR-6-2 (CMN-2) — warn-once-per-volume gate for the ack-floor clamp
+/// below, so a volume whose floor exceeds its RF doesn't spam a warning
+/// on every commit.
+static WARNED_FLOOR_CLAMPED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+/// CR-6-2 (CMN-2) — the volume's `write_safety.min_replicas_before_ack`
+/// floor (e.g. the compiled-in default of 2) can exceed the effective
+/// mandatory RF of the tier the chunks actually landed on (e.g. cold
+/// RF 1), which made `commit_chunk_locations` reject every write to
+/// that tier forever (CF-3b never re-checks, so the write buffer just
+/// keeps retrying and failing). Clamp the floor to the minimum
+/// `effective_mandatory_replicas().for_tier()` across the distinct
+/// tiers the committed chunks resolved to (conservative: never demand
+/// more replicas than the weakest placed tier's own RF promises). A
+/// chunk whose node/disk can't be resolved to a live tier (unknown
+/// node, e.g. an old/rejoining data node) is skipped — it doesn't
+/// weaken the clamp, since it isn't evidence of a real placement tier.
+fn clamp_ack_floor_to_rf(
+    floor: u32,
+    sm: &StateMachineData,
+    chunks: &[ChunkLocationEntry],
+    volume_id: &str,
+    path: &str,
+    audit: Option<&crate::audit::AuditLog>,
+) -> u32 {
+    let volume = match sm.volumes.get(volume_id) {
+        Some(v) => v,
+        None => return floor,
+    };
+    let mandatory = volume.effective_mandatory_replicas();
+    let min_rf = chunks
+        .iter()
+        .filter_map(|c| {
+            let node_id: u64 = c.node_id.parse().ok()?;
+            let tier = live_replica_tier(sm.nodes.get(&node_id), c.disk_id)?;
+            Some(mandatory.for_tier(tier))
+        })
+        .min();
+    let Some(rf) = min_rf else {
+        return floor;
+    };
+    if rf >= floor {
+        return floor;
+    }
+    let first_time = {
+        let set =
+            WARNED_FLOOR_CLAMPED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        set.lock().unwrap().insert(volume_id.to_string())
+    };
+    if first_time {
+        tracing::warn!(
+            volume_id,
+            configured_floor = floor,
+            effective_rf = rf,
+            "CR-6-2 (CMN-2): write_safety.min_replicas_before_ack exceeds the \
+             effective mandatory RF of a placed tier; clamping the ack floor \
+             to the RF so writes to that tier can commit"
+        );
+    }
+    if let Some(audit) = audit {
+        audit.log(
+            "write_safety",
+            "write_safety.floor_clamped",
+            &format!(
+                "path={} volume={} configured_floor={} effective_rf={}",
+                path, volume_id, floor, rf
+            ),
+            "clamped",
+        );
+    }
+    rf
 }
 
 #[tonic::async_trait]
@@ -2548,7 +2624,7 @@ impl ManagerService for MetadataService {
                 &req.volume_id,
                 self.config.defaults.write_safety.min_replicas_before_ack,
             );
-            let chunks = req
+            let chunks: Vec<ChunkLocationEntry> = req
                 .chunks
                 .into_iter()
                 .map(|c| ChunkLocationEntry {
@@ -2559,6 +2635,23 @@ impl ManagerService for MetadataService {
                     size_bytes: c.size_bytes,
                 })
                 .collect();
+            // CR-6-2 (CMN-2) — clamp the floor to the effective RF of the
+            // tier the chunks actually landed on (the file's own volume
+            // when it exists, matching the STRICTER-volume resolution
+            // above; the request volume otherwise).
+            let effective_volume_id = data
+                .files
+                .get(&req.path)
+                .map(|f| f.volume_id.clone())
+                .unwrap_or_else(|| req.volume_id.clone());
+            let ack_floor = clamp_ack_floor_to_rf(
+                ack_floor,
+                &data,
+                &chunks,
+                &effective_volume_id,
+                &req.path,
+                self.audit.as_deref(),
+            );
             (chunks, ack_floor)
         }; // sm_data lock released here
 
@@ -4197,6 +4290,72 @@ mod tests {
         // Unknown file (first commit) → only the request volume governs.
         assert_eq!(resolve_ack_floor(&sm, "/movies/new.mkv", "strict", 1), 2);
         assert_eq!(resolve_ack_floor(&sm, "/movies/new.mkv", "default", 1), 1);
+    }
+
+    /// CR-6-2 (CMN-2) — a volume floor (2) that exceeds the effective
+    /// mandatory RF of the tier the chunks landed on (cold, RF 1 via
+    /// `vol_with_floor`) is clamped down to that RF, not left to reject
+    /// every commit forever.
+    #[test]
+    fn cr_6_2_ack_floor_clamped_to_placed_tier_rf() {
+        let mut sm = StateMachineData::default();
+        sm.volumes.insert("strict".to_string(), vol_with_floor("strict", 2));
+        sm.nodes.insert(1, mk_data_node(DiskTier::Cold));
+        let chunks = vec![dtfs_raft::ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: "abc".to_string(),
+            node_id: "1".to_string(),
+            disk_id: 0,
+            size_bytes: 1024,
+        }];
+        assert_eq!(
+            clamp_ack_floor_to_rf(2, &sm, &chunks, "strict", "/movies/a.mkv", None),
+            1,
+            "cold RF is 1, so the floor of 2 must clamp down to 1"
+        );
+
+        // A floor already at or below the RF is left untouched.
+        assert_eq!(
+            clamp_ack_floor_to_rf(1, &sm, &chunks, "strict", "/movies/a.mkv", None),
+            1
+        );
+
+        // A tier that resolves to a higher RF than the floor doesn't
+        // raise the floor.
+        sm.nodes.insert(2, mk_data_node(DiskTier::Warm));
+        let mut vol_warm = vol_with_floor("warm-strict", 2);
+        vol_warm.mandatory_replicas = dtfs_common::types::TierReplication {
+            hot: 0,
+            warm: 3,
+            cold: 1,
+            tape: 0,
+        };
+        sm.volumes.insert("warm-strict".to_string(), vol_warm);
+        let warm_chunks = vec![dtfs_raft::ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: "abc".to_string(),
+            node_id: "2".to_string(),
+            disk_id: 0,
+            size_bytes: 1024,
+        }];
+        assert_eq!(
+            clamp_ack_floor_to_rf(2, &sm, &warm_chunks, "warm-strict", "/movies/b.mkv", None),
+            2,
+            "warm RF (3) exceeds the floor (2); the floor is never raised"
+        );
+
+        // Unknown node → tier unresolved → clamp is a no-op.
+        let unknown_chunks = vec![dtfs_raft::ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: "abc".to_string(),
+            node_id: "999".to_string(),
+            disk_id: 0,
+            size_bytes: 1024,
+        }];
+        assert_eq!(
+            clamp_ack_floor_to_rf(2, &sm, &unknown_chunks, "strict", "/movies/c.mkv", None),
+            2
+        );
     }
 
     /// CR-3-3/MGR-1 helper — a Data node with one disk of the given tier.
