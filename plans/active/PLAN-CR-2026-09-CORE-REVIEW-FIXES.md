@@ -125,7 +125,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 |---|---|---|---|---|---|---|
 | CR-3-1 | ✅ | MGR-2 | `crates/dtfs-manager/src/tiering.rs` `build_av_cache_snapshot` ~853, `plan_chunk_demotions` ~1953; `scheduler.rs` `FlushSnapshot::from_sm` ~2933, `plan_flush_cache` ~3108 | Resolve every placement tier through `scheduler::live_replica_tier(sm, node_id, disk_id)` (returns `None` for Down/Failed node or Failed/Removed disk). `None` → placement excluded from `mandatory_still_present` / `mandatory_survives` (still listed so it can be dropped itself). | planner unit tests (existing `co_1_2_*`, `plan_flush_cache` tests as templates): cold anchor on Down node + warm cache → demote/flush REFUSED with `anchor_protected` / `mandatory_refusals`; same with node Healthy → allowed. | Tests fail before, pass after. |
 | CR-3-2 | ✅ | MGR-2 (defence) | `crates/dtfs-raft/src/state_machine.rs` `apply_remove_chunk_location` ~2040 | Independent of anchor: refuse (`Error("last live replica")`) when the row being removed is the last live replica of `(path, chunk_index)` (`live` = node not Down/Failed, disk not Failed/Removed, using the existing survivor scan). Keep `enforce_anchor` logic. | SM unit: two rows, one on Down node; remove the live one → Error; remove the Down one → ok. | Test fails before, passes after. |
-| CR-3-3 | ⬜ | MGR-1 | `crates/dtfs-manager/src/metadata.rs` ReportChunkReads intercept ~1500; `tiering.rs` `evaluate` ~327 | Intercept: look up `sm_data` for the file(s) referencing `chunk_id` and the replica tier on `node_id` (`live_replica_tier`); pass real `file_path` + tier; skip `report_access` when the chunk is unknown. `evaluate`: `continue` when `path_to_volume.get(&profile.file_path).is_none()` (defence). | tiering unit: profile with `file_path: ""` yields zero legacy decisions; AV-volume chunk reported through the intercept yields zero legacy decisions; non-AV volume chunk still classifies. | Tests fail before, pass after. |
+| CR-3-3 | ✅ | MGR-1 | `crates/dtfs-manager/src/metadata.rs` ReportChunkReads intercept ~1500; `tiering.rs` `evaluate` ~327 | Intercept: look up `sm_data` for the file(s) referencing `chunk_id` and the replica tier on `node_id` (`live_replica_tier`); pass real `file_path` + tier; skip `report_access` when the chunk is unknown. `evaluate`: `continue` when `path_to_volume.get(&profile.file_path).is_none()` (defence). | tiering unit: profile with `file_path: ""` yields zero legacy decisions; AV-volume chunk reported through the intercept yields zero legacy decisions; non-AV volume chunk still classifies. | Tests fail before, pass after. |
 | CR-3-4 | ⬜ | MGR-4, MGR-8, MGR-9 | `scheduler.rs` `register_replica_location_for_path` ~1338, `register_replica` (`MigrationOps`), Completing transition ~2814, `resolve_disk_id_for_tier` ~4206 | (a) `register_replica` returns `Result<(), String>`; on `Err` task stays `Completing`, `attempts += 1`, retry next tick, `Failed` + alert at the existing cap. (b) path lookup + index lookup under ONE SM read lock; hash not found in the file → skip + warn, never `unwrap_or(0)`. (c) register the new row for EVERY `chunk_index` in the file whose rows carry the hash. (d) `resolve_disk_id_for_tier` filters `DiskStatus::{Failed, Removed}`; none live → return `Err`, task not Done. | `advance_round_tests` mock: register error → task stays Completing, Done after retry succeeds; unit for (b): hash absent → no `UpdateChunkLocations` proposed; unit for (c): two indexes same hash → both rows added; unit for (d). | Tests fail before, pass after. |
 | CR-3-5 | ⬜ | MGR-5, MGR-6 | `scheduler.rs` `check_under_replicated` ~491/570, `schedule_replication`, `check_anchor_lag` ~867 | Use `task_blocks_requeue` in `check_under_replicated`'s dedup index and in `schedule_replication`. Source via `live_replica_tier`; target must satisfy `placement_cfg.has_room`. `check_anchor_lag`: honour `task_budget_available` (thread `created`/`live_tasks`), insert `(chunk, target)` into `existing_tasks` after each schedule. | scheduler unit: chunk with a recent Failed task → not re-queued; source on Failed disk not chosen; anchor-lag over N > budget chunks creates exactly budget tasks; two files same hash → one task. | Tests fail before, pass after. |
 | CR-3-6 | ⬜ | MGR-7 | `metadata.rs` heartbeat ~1250-1300, ~1385 | Capture `Err` from the `QuarantineNode` and `RemoveCorruptChunkReplicas` forwards; any failure → `accepted: false` in `HeartbeatResponse` (data node already re-enqueues on that, CO-3-7). Keep `AppendAudit` best-effort. | metadata unit (existing CO-3-7 test as template): forced forward failure → `accepted == false`. | Test fails before, passes after. |
@@ -515,6 +515,27 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   the check ordered before the anchor block; reordering, not the test,
   was the fix, since the anchor-specific message is more informative
   for an anchor volume).
+
+- **CR-3-3** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-manager --release`: 348 -> 352 passed (4 new:
+  `metadata::tests::cr_3_3_unknown_chunk_resolves_to_none`,
+  `metadata::tests::cr_3_3_known_chunk_resolves_real_path_and_tier`,
+  `metadata::tests::cr_3_3_dead_replica_falls_back_to_hot_tier`,
+  `tiering::audit_co_tests::cr_3_3_legacy_path_should_skip_truth_table`),
+  0 failed. The `ReportChunkReads` intercept in
+  `forward_client_write` now resolves the real `file_path` (via
+  `scheduler::files_referencing_chunk`) and the replica's real tier on
+  `node_id` (via `scheduler::live_replica_tier`) through a new pure
+  `metadata::resolve_chunk_read_context` helper, instead of always
+  passing `""` / `DiskTier::Hot`; an unknown chunk is skipped entirely.
+  `tiering::evaluate` now runs the CO-4-6 AV-volume skip through a new
+  pure `legacy_path_should_skip(file_path, path_to_volume,
+  av_cache_volumes)` helper that also skips when `file_path` resolves
+  to no known file (closing the case an unresolvable path used to fall
+  through to the legacy path). No test stands up a full `TieringEngine`
+  (no scaffold exists in this crate for that, same gap noted in Group 1
+  for `DtfsClient`); both fixes are covered at the exact new decision
+  boundary each introduced, which is what actually changed.
 
 - **CR-2-8** 2026-09-12. Added one sentence each to AGENTS.md A.3.1
   (the `now_ms` convention for a `ClientRequest` field that lands in

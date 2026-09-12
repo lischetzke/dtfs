@@ -811,6 +811,36 @@ fn node_id_from_grpc_addr(sm: &StateMachineData, addr: &str) -> String {
         .unwrap_or_else(|| addr.to_string())
 }
 
+/// CR-3-3/MGR-1 — resolve the real `file_path` + the replica's real tier
+/// on `node_id` for a `ReportChunkReads` entry, so the tiering intercept
+/// stops feeding the engine a synthetic `""` / `DiskTier::Hot` profile.
+/// Returns `None` for a chunk that references no known file (already
+/// deleted/GC'd, or never existed) — the caller skips the report rather
+/// than fabricate data. Tier resolution goes through
+/// `scheduler::live_replica_tier` so a Down/Failed node or Failed/
+/// Removed disk resolves to `None` (falls back to `Hot`, same as the
+/// unknown-tier case) rather than a serviceable-looking tier.
+fn resolve_chunk_read_context(
+    sm: &StateMachineData,
+    chunk_id: &str,
+    node_id: u64,
+) -> Option<(String, DiskTier)> {
+    let file_path = crate::scheduler::files_referencing_chunk(&sm.files, chunk_id)
+        .into_iter()
+        .next()?;
+    let node_id_str = node_id.to_string();
+    let disk_id = sm.files.get(&file_path).and_then(|fm| {
+        fm.chunks
+            .iter()
+            .find(|c| c.chunk_hash == chunk_id && c.node_id == node_id_str)
+            .map(|c| c.disk_id)
+    });
+    let tier = disk_id
+        .and_then(|d| crate::scheduler::live_replica_tier(sm.nodes.get(&node_id), d))
+        .unwrap_or(DiskTier::Hot);
+    Some((file_path, tier))
+}
+
 /// CO-4-13 — resolve the CF-3b ack floor for a `commit_chunk_locations`
 /// call as the STRICTER of two volume floors:
 ///   * the floor of the volume the file is actually registered under
@@ -1513,20 +1543,37 @@ impl ManagerService for MetadataService {
         // chunks served via other managers never promote.
         if let ClientRequest::ReportChunkReads { node_id, entries } = &req {
             if let Some(tiering) = &self.tiering {
+                // CR-3-3/MGR-1 — resolve the REAL file_path + the
+                // replica's REAL tier on `node_id` before feeding the
+                // tiering engine. Pre-fix this always passed `""` /
+                // `DiskTier::Hot`, which made `evaluate`'s CO-4-6
+                // AV-volume skip a no-op (`path_to_volume.get("")` is
+                // always `None`) and fed the legacy temperature path
+                // fabricated data for every reported chunk.
+                let sm = self.sm_data.read().await;
                 for (chunk_id, reads_by_dc) in entries {
                     let total: u32 = reads_by_dc.values().sum();
+                    // Unknown chunk (already deleted/GC'd) — skip rather
+                    // than feed the engine a synthetic profile for
+                    // content that no longer exists.
+                    let Some((file_path, tier)) =
+                        resolve_chunk_read_context(&sm, chunk_id, *node_id)
+                    else {
+                        continue;
+                    };
                     tiering
                         .report_access(
                             chunk_id,
-                            "",
+                            &file_path,
                             total,
                             total,
                             reads_by_dc.clone(),
-                            dtfs_common::types::DiskTier::Hot,
+                            tier,
                             *node_id,
                         )
                         .await;
                 }
+                drop(sm);
             }
             let response_json = serde_json::to_vec(&ClientResponse::Success)
                 .map_err(|e| Status::internal(format!("serialize ClientResponse: {e}")))?;
@@ -3785,6 +3832,104 @@ mod tests {
         // Unknown file (first commit) → only the request volume governs.
         assert_eq!(resolve_ack_floor(&sm, "/movies/new.mkv", "strict", 1), 2);
         assert_eq!(resolve_ack_floor(&sm, "/movies/new.mkv", "default", 1), 1);
+    }
+
+    /// CR-3-3/MGR-1 helper — a Data node with one disk of the given tier.
+    fn mk_data_node(tier: DiskTier) -> RaftNodeInfo {
+        RaftNodeInfo {
+            role: NodeRole::Data,
+            hostname: "data-1".to_string(),
+            grpc_addr: String::new(),
+            location: Location::new("lab", "leli", "rack-1", "data-1"),
+            disks: vec![dtfs_common::types::DiskInfo {
+                disk_id: 0,
+                uuid: String::new(),
+                mount_path: String::new(),
+                tier,
+                total_bytes: 0,
+                used_bytes: 0,
+                status: DiskStatus::Healthy,
+            }],
+            total_capacity: 0,
+            used_capacity: 0,
+            health: HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    fn file_with_chunk(
+        path: &str,
+        chunk_hash: &str,
+        node_id: u64,
+        disk_id: u32,
+    ) -> dtfs_raft::state_machine::FileMetadata {
+        dtfs_raft::state_machine::FileMetadata {
+            path: path.to_string(),
+            volume_id: "default".to_string(),
+            chunk_size: 4 * 1024 * 1024,
+            chunks: vec![dtfs_raft::ChunkLocationEntry {
+                chunk_index: 0,
+                chunk_hash: chunk_hash.to_string(),
+                node_id: node_id.to_string(),
+                disk_id,
+                size_bytes: 1024,
+            }],
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// CR-3-3/MGR-1 — an unknown chunk (no file references it) resolves
+    /// to `None`, so the intercept skips the report instead of feeding
+    /// the tiering engine a synthetic `""` file_path / `Hot` tier.
+    #[test]
+    fn cr_3_3_unknown_chunk_resolves_to_none() {
+        let sm = StateMachineData::default();
+        assert!(resolve_chunk_read_context(&sm, "no-such-hash", 1).is_none());
+    }
+
+    /// CR-3-3/MGR-1 — a known chunk resolves to its real file_path and
+    /// the replica's real tier on the reporting node.
+    #[test]
+    fn cr_3_3_known_chunk_resolves_real_path_and_tier() {
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(1, mk_data_node(DiskTier::Warm));
+        sm.files.insert(
+            "/movies/x.mkv".to_string(),
+            file_with_chunk("/movies/x.mkv", "h0", 1, 0),
+        );
+        let (path, tier) = resolve_chunk_read_context(&sm, "h0", 1).expect("known chunk");
+        assert_eq!(path, "/movies/x.mkv");
+        assert_eq!(tier, DiskTier::Warm);
+    }
+
+    /// CR-3-3/MGR-1 — a replica on a Down node cannot be resolved to a
+    /// serviceable tier via `live_replica_tier`, so it falls back to
+    /// `Hot` (same fallback as an unresolvable tier) rather than
+    /// reporting a tier that isn't actually being served.
+    #[test]
+    fn cr_3_3_dead_replica_falls_back_to_hot_tier() {
+        let mut sm = StateMachineData::default();
+        let mut node = mk_data_node(DiskTier::Cold);
+        node.health = HealthStatus::Down;
+        sm.nodes.insert(1, node);
+        sm.files.insert(
+            "/movies/x.mkv".to_string(),
+            file_with_chunk("/movies/x.mkv", "h0", 1, 0),
+        );
+        let (path, tier) = resolve_chunk_read_context(&sm, "h0", 1).expect("known chunk");
+        assert_eq!(path, "/movies/x.mkv");
+        assert_eq!(tier, DiskTier::Hot);
     }
 
     fn vol_with_floor(id: &str, floor: u32) -> dtfs_common::types::VolumeConfig {

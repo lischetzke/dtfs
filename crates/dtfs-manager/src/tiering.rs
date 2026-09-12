@@ -69,6 +69,25 @@ pub(crate) fn volume_has_active_cache_policy(
     any_tier && cache.promote_window_secs > 0
 }
 
+/// CR-3-3/MGR-1 — should the legacy temperature path skip this profile?
+/// True in two cases: (a) `file_path` isn't (or is no longer) a known
+/// file at all — CO-4-6's AV-volume skip below can never see an
+/// unresolvable path, so an unknown/empty file_path (the pre-fix
+/// `ReportChunkReads` intercept always passed `""`) must be skipped
+/// outright rather than fall through to the legacy path; (b) the file's
+/// volume has an active AV cache policy (CO-4-6 — `tick_av_cache` owns
+/// those chunks).
+pub(crate) fn legacy_path_should_skip(
+    file_path: &str,
+    path_to_volume: &HashMap<String, String>,
+    av_cache_volumes: &std::collections::HashSet<String>,
+) -> bool {
+    match path_to_volume.get(file_path) {
+        None => true,
+        Some(vid) => av_cache_volumes.contains(vid),
+    }
+}
+
 /// Tiering engine that evaluates access patterns and triggers tier migrations.
 pub struct TieringEngine {
     config: RwLock<TieringConfig>,
@@ -322,12 +341,8 @@ impl TieringEngine {
                 if target_tier == profile.current_tier {
                     continue;
                 }
-                // CO-4-6 — skip the legacy path for chunks whose volume has
-                // an active AV cache policy; `tick_av_cache` owns them.
-                if let Some(vid) = path_to_volume.get(&profile.file_path) {
-                    if av_cache_volumes.contains(vid) {
-                        continue;
-                    }
+                if legacy_path_should_skip(&profile.file_path, &path_to_volume, &av_cache_volumes) {
+                    continue;
                 }
                 // REV-4-8 — bound the legacy path. It schedules a migration
                 // for essentially every chunk that gets read at all: on the
@@ -3375,6 +3390,32 @@ mod audit_co_tests {
 
         // Default (empty) → not active.
         assert!(!volume_has_active_cache_policy(&CacheReplication::default()));
+    }
+
+    /// CR-3-3/MGR-1 — `legacy_path_should_skip` is the decision boundary
+    /// `evaluate` now consults before scheduling a legacy migration.
+    /// (a) an empty/unknown file_path (the pre-fix `ReportChunkReads`
+    /// intercept always passed `""`) yields zero legacy decisions —
+    /// skip, regardless of any AV volume set; (b) a known path on an
+    /// AV-cache volume also skips (CO-4-6); (c) a known path on a
+    /// plain (non-AV) volume still classifies.
+    #[test]
+    fn cr_3_3_legacy_path_should_skip_truth_table() {
+        let mut path_to_volume = HashMap::new();
+        path_to_volume.insert("/movies/av.mkv".to_string(), "av-vol".to_string());
+        path_to_volume.insert("/movies/plain.mkv".to_string(), "plain-vol".to_string());
+        let mut av_cache_volumes = std::collections::HashSet::new();
+        av_cache_volumes.insert("av-vol".to_string());
+
+        // (a) unknown/empty file_path → always skip.
+        assert!(legacy_path_should_skip("", &path_to_volume, &av_cache_volumes));
+        assert!(legacy_path_should_skip("/no/such/file", &path_to_volume, &av_cache_volumes));
+
+        // (b) known path, AV-cache volume → skip.
+        assert!(legacy_path_should_skip("/movies/av.mkv", &path_to_volume, &av_cache_volumes));
+
+        // (c) known path, plain volume → does NOT skip (still classifies).
+        assert!(!legacy_path_should_skip("/movies/plain.mkv", &path_to_volume, &av_cache_volumes));
     }
 
     /// CO-4-17 — `apply_heartbeat_reads` bounds the read-window store.
