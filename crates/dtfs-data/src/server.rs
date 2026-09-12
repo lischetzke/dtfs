@@ -1047,6 +1047,8 @@ max_io_percent = 10
         ScrubConfig {
             quick_interval_hours: 6,
             deep_interval_hours: 168,
+            quick_interval_secs: 0,
+            deep_interval_secs: 0,
             quick_cron: None,
             deep_cron: None,
             max_io_percent: 10,
@@ -1723,6 +1725,8 @@ max_io_percent = 10
         let scrub_config = ScrubConfig {
             quick_interval_hours: 6,
             deep_interval_hours: 168,
+            quick_interval_secs: 0,
+            deep_interval_secs: 0,
             quick_cron: None,
             deep_cron: None,
             max_io_percent: 10,

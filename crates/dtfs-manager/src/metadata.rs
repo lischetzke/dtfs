@@ -28,6 +28,12 @@ static WARNED_FSCK_INTERVAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static WARNED_CUSTOM_SCHEDULE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// CR-6-3 (PROTO-2) — warn once per manager process when a sub-hour
+/// quick/deep scrub cadence is configured, since an older data node
+/// can't honour it (rounds up to the nearest hour via the legacy
+/// `*_interval_hours` fields).
+static WARNED_SUBHOUR_SCRUB_CADENCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// RAFT-4 — proposer wall-clock stamped into the `now_ms` field of the
 /// seven ClientRequest variants apply now applies deterministically
@@ -1477,13 +1483,32 @@ impl ManagerService for MetadataService {
             let cfg_version = sm.cluster_config.version;
             warn_once_on_dead_schedule_fields(&sm.volumes);
             let effective_quick_secs = scrub_cfg.quick_interval_secs.max(60);
+            let effective_deep_secs = scrub_cfg.deep_interval_secs.max(60);
             let quick_h = (effective_quick_secs + 3599) / 3600;
-            let deep_h = (scrub_cfg.deep_interval_secs.max(60) + 3599) / 3600;
+            let deep_h = (effective_deep_secs + 3599) / 3600;
+            // CR-6-3 (PROTO-2) — warn once at startup that a sub-hour
+            // quick/deep cadence needs a data node on this build or newer
+            // to actually honour the sub-hour value; older data nodes
+            // silently round up to the nearest hour via the legacy
+            // *_hours fields (still filled below, unchanged).
+            if (quick_h * 3600 != effective_quick_secs || deep_h * 3600 != effective_deep_secs)
+                && !WARNED_SUBHOUR_SCRUB_CADENCE.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::info!(
+                    quick_interval_secs = effective_quick_secs,
+                    deep_interval_secs = effective_deep_secs,
+                    "CR-6-3 (PROTO-2): sub-hour scrub cadence configured; \
+                     data nodes on this build or newer honour the exact \
+                     secs value, older data nodes round up to the nearest hour"
+                );
+            }
             (
                 cfg_version,
                 Some(dtfs_proto::dtfs::manager::ScrubConfigOverride {
                     quick_interval_hours:   quick_h.max(1),
                     deep_interval_hours:    deep_h.max(1),
+                    quick_interval_secs:    effective_quick_secs,
+                    deep_interval_secs:     effective_deep_secs,
                     orphan_interval_secs:   scrub_cfg.orphan_interval_secs,
                     orphan_grace_secs:      scrub_cfg.orphan_grace_secs,
                     max_io_percent:         scrub_cfg.max_io_percent,

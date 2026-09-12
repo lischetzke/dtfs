@@ -724,6 +724,19 @@ pub struct ScrubConfig {
     pub quick_interval_hours: u64,
     #[serde(default = "default_deep_interval")]
     pub deep_interval_hours: u64,
+    /// CR-6-3 (PROTO-2) — exact-seconds companion to `quick_interval_hours`,
+    /// populated by the manager's heartbeat `ScrubConfigOverride` (proto
+    /// fields 9/10) on a build that sends them; `0` means "not set", so
+    /// the scheduler falls back to `quick_interval_hours * 3600` (the
+    /// pre-existing ceil-to-1h behaviour). Not meant to be hand-set in
+    /// `data.toml` -- the manager's `[scrub]` cluster policy is the
+    /// source of truth once the manager sends it.
+    #[serde(default)]
+    pub quick_interval_secs: u64,
+    /// CR-6-3 (PROTO-2) — exact-seconds companion to `deep_interval_hours`.
+    /// See `quick_interval_secs`.
+    #[serde(default)]
+    pub deep_interval_secs: u64,
     pub quick_cron: Option<String>,
     pub deep_cron: Option<String>,
     #[serde(default = "default_scrub_io")]
