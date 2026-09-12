@@ -168,7 +168,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 |---|---|---|---|---|---|---|
 | CR-6-1 | ✅ | CMN-1, CMN-8 | `crates/dtfs-common/src/config.rs` (`PlacementConfig::validate` new), `dtfs-manager/src/main.rs`, `dtfs-data/src/main.rs`, `dtfs-fuse/src/main.rs` | `PlacementConfig::validate` rejects `!(0.0..=100.0).contains(&min_free_pct)`. All three mains call `config.memory.validate()` (and manager `config.placement.validate()`) right after load; error → exit non-zero with the message. Docs: note the new startup rejection in `docs/src/configuration/{manager,data-node,fuse-client}.md` memory rows. | config unit: `warn 95 / shed 90` → Err; `min_free_pct 150` → Err. | Tests fail before, pass after; `example_*_toml_parses` green. |
 | CR-6-2 | ✅ | CMN-2 | `crates/dtfs-manager/src/metadata.rs` `resolve_ack_floor` ~816 | Clamp: `min(floor, effective_mandatory_replicas of the tier the chunks were placed on)`; when clamped, `warn!` once per volume (dedup by volume id) and audit `write_safety.floor_clamped`. Docs row manager.md:216: "clamped to the effective RF". | metadata unit (`resolve_ack_floor` tests at ~3756 as template): volume floor 2, cold RF 1, cold placement → floor 1. | Test fails before, passes after. |
-| CR-6-3 | ⬜ | PROTO-2 | `proto/manager.proto` `ScrubConfigOverride`, `metadata.rs` ~1105, `dtfs-data/src/scrub.rs` ~101 | Add `quick_interval_secs = 9`, `deep_interval_secs = 10`; manager fills both (secs exact, hours as before); data node prefers non-zero secs; manager `warn!` when hour rounding changes the value and the peer is old (cannot know → log once at startup instead: "sub-hour scrub cadence requires data nodes ≥ this build"). | data scrub unit: override with `quick_interval_secs=600` → 600 s cadence; secs=0 → hours×3600. | Tests fail before, pass after. |
+| CR-6-3 | ✅ | PROTO-2 | `proto/manager.proto` `ScrubConfigOverride`, `metadata.rs` ~1105, `dtfs-data/src/scrub.rs` ~101 | Add `quick_interval_secs = 9`, `deep_interval_secs = 10`; manager fills both (secs exact, hours as before); data node prefers non-zero secs; manager `warn!` when hour rounding changes the value and the peer is old (cannot know → log once at startup instead: "sub-hour scrub cadence requires data nodes ≥ this build"). | data scrub unit: override with `quick_interval_secs=600` → 600 s cadence; secs=0 → hours×3600. | Tests fail before, pass after. |
 | CR-6-4 | ⬜ | FUSE-6 | `proto/manager.proto` `GetFileLocationsResponse`, `metadata.rs` `get_file_locations` ~940, `allocate_chunks` ~1822, `dtfs-fuse/src/filesystem.rs` `fetch_file_locations` ~1692 | Add `volume_id` to the response; FUSE stores it in `FileLocations.volume_id` (`""` → keep current value, not `"default"`). Manager `allocate_chunks`: when `sm.files[req.path]` exists, use ITS `volume_id` for placement and ignore the request value (log at debug when they differ). | metadata unit: file in volume "strict", request says "default" → placement uses strict RF/anchor; fuse unit: refresh keeps volume id. | Tests fail before, pass after. |
 | CR-6-5 | ⬜ | FUSE-5 | `dtfs-fuse/src/filesystem.rs` `metadata_cache` ~281/449 | Bound the cache: `max_entries` (default 4096) with LRU eviction on insert (simple: `VecDeque` of keys + DashMap, or the `lru` crate if already a dependency — check Cargo.lock; do NOT add a new dependency without noting it). Expired entries also swept every `metadata_ttl` by the existing readahead pressure ladder task or a tiny interval task. | unit: insert 5000 paths → `len() <= 4096`; expired entry gone after sweep. | Test fails before, passes after. |
 | CR-6-6 | ⬜ | FUSE-8, FUSE-9, FUSE-10 | `filesystem.rs` `read()` ~725-980, `readahead.rs` | (FUSE-8) notify `record_cache_hit` once per `(fh, chunk_id)` transition (store `last_notified_chunk` in `OpenFile`), in-flight bounded by a `Semaphore(8)`. (FUSE-9) foreground miss registers itself in a per-chunk in-flight `DashMap<String, watch::Receiver>` so concurrent readers of the same chunk await one fetch. (FUSE-10) call `readahead.on_chunk_read` on every chunk-index transition per fh (hit or miss); `pending`/cache dedup unchanged. | fuse unit: 32 sequential 128 KB reads of one cached chunk → exactly 1 notify; two concurrent reads of an uncached chunk with a counting mock client → 1 `GetChunk`; sequential hits keep `pending.len()` at the window depth. | Tests fail before, pass after; existing WI-05/B2 tests unchanged. |
@@ -970,3 +970,25 @@ failed at every step; no regressions.
   using the file's own volume when the file already exists (matching
   the CO-4-13 stricter-volume resolution), else the request volume.
   Docs row `manager.md:216` updated. No proto/data-model change.
+
+- **CR-6-3** 2026-09-12, Docker `dtfs-buildenv:latest`: `cargo test -p
+  dtfs-data --release`: 119 -> 121 passed, 0 failed (2 new,
+  `cr_6_3_effective_interval_secs_tests`); `cargo test -p dtfs-common
+  --release`: 109 -> 109 passed (no new common test, struct-only
+  additive field), `cargo test -p dtfs-manager --release`: 380 -> 380
+  passed. `cargo build --workspace --release`: clean. Added
+  `quick_interval_secs`/`deep_interval_secs` (proto tags 9/10) to
+  `ScrubConfigOverride`; manager `heartbeat` fills both the exact secs
+  and the legacy hours (unchanged), and warns once at startup
+  (`WARNED_SUBHOUR_SCRUB_CADENCE`) when a sub-hour cadence is
+  configured (data nodes on this build honour it exactly; older ones
+  round up). Added the same two fields (default 0, `#[serde(default)]`)
+  to `dtfs-common::config::ScrubConfig` (data-side, wire-populated only)
+  and a pure `scrub::effective_interval_secs(secs, hours)` helper that
+  the scrub loop now calls instead of always deriving from hours;
+  `main.rs`'s heartbeat handler copies the two new override fields into
+  the live `ScrubConfig`. Two `ScrubConfig` struct literals in
+  `dtfs-data/src/server.rs` tests needed the two new fields (compile
+  fix, no behaviour change there). Docs: `data-node.md` `[scrub]`
+  section + `deploy/examples/data.toml` (commented, default 0, marked
+  internal/manager-populated).

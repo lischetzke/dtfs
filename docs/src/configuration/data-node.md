@@ -175,6 +175,14 @@ Controls the background scrubbing process that verifies chunk integrity by recal
 > manager's cluster-wide `[scrub]` policy (see the manager page) overrides it
 > via heartbeat.
 
+CR-6-3 (PROTO-2): `quick_interval_secs`/`deep_interval_secs` are internal,
+not meant to be hand-set in `data.toml` (default `0` = unused). The manager's
+heartbeat `ScrubConfigOverride` populates them with the exact configured
+cadence so a sub-hour quick/deep interval takes effect precisely instead of
+silently rounding up to the nearest hour via `*_interval_hours`; an older
+manager leaves them `0` and this data node falls back to the hours field
+exactly as before.
+
 ### Example
 
 ```toml

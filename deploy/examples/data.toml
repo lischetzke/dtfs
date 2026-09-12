@@ -81,6 +81,10 @@ tier = "cold"
 #max_io_percent = 10
 #verify_on_read = true              # startup fallback before first heartbeat
 #quarantine_on_fault = true
+# CR-6-3: internal, set by the manager's heartbeat ScrubConfigOverride, not
+# meant to be hand-set here. 0 = unused, falls back to *_interval_hours.
+#quick_interval_secs = 0
+#deep_interval_secs = 0
 
 # Optional sections below — whole block may be omitted.
 
