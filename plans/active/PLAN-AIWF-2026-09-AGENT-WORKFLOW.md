@@ -429,7 +429,7 @@ every turn, becomes noise); a `SessionStart` hook that prints cluster state
 | AIWF-1-5 | Update `plans/README.md` for D4/D5 | `plans/README.md` | States the ≥3-task trigger and the one-line verification-log form | ✅ |
 | AIWF-2-1 | Author `dtfs-explore`, `dtfs-intake` | `.claude/agents/*.md` | Each routes on `description` alone in a trial prompt | ✅ |
 | AIWF-2-2 | Author `dtfs-planner`, `dtfs-implementer` | `.claude/agents/*.md` | Implementer's build block matches the Docker command verbatim | ✅ |
-| AIWF-2-3 | Author `dtfs-reviewer`, `dtfs-integrity-auditor` | `.claude/agents/*.md` | Output matches the CORE-REVIEW-2026-09-12 finding shape | ⬜ |
+| AIWF-2-3 | Author `dtfs-reviewer`, `dtfs-integrity-auditor` | `.claude/agents/*.md` | Output matches the CORE-REVIEW-2026-09-12 finding shape | ✅ |
 | AIWF-2-4 | Author `dtfs-release-case-author` | `.claude/agents/*.md` | Produces a `bash -n`-clean case for a known past change | ⬜ |
 | AIWF-3-1 | Add `.claude/settings.json` + `guard-git.sh` | `.claude/{settings.json,hooks/guard-git.sh}` | A `git commit --no-verify` attempt is blocked with a readable reason | ⬜ |
 | AIWF-3-2 | Add `check-release-case.sh` | `.claude/hooks/check-release-case.sh` | Blocks a staged `dtfs-data/src` change with no case; passes with the trailer | ⬜ |
@@ -469,6 +469,10 @@ roster is cheaper, not just tidier.
   PLAN-CR-2026-09-CORE-REVIEW-FIXES.md command verbatim, parameterised
   with `DTFS_REPO_HOST_PATH` (default `C:/Users/<user>/git_github.com/dtfs2`,
   SS8-6).
+- AIWF-2-3 (2026-09-12): added `.claude/agents/dtfs-reviewer.md` and
+  `.claude/agents/dtfs-integrity-auditor.md` (both opus per SS8-5);
+  finding/table shapes copied from
+  `plans/reports/CORE-REVIEW-2026-09-12.md`.
 
 ## 8. Risks / open questions
 
