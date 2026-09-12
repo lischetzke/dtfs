@@ -164,6 +164,52 @@ fn learn_locations(known: &DashMap<String, Location>, addrs: &[String], locs: &[
     }
 }
 
+/// CR-6-5 (FUSE-5) — default bound on `metadata_cache` entries.
+pub const METADATA_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// CR-6-5 (FUSE-5) — evict the oldest-inserted entries from
+/// `metadata_cache` until it is at or under `max_entries`. `order` is the
+/// insertion-order queue (may contain a path more than once, from
+/// repeated re-caches); a popped key that is already absent, or that no
+/// longer names the entry it was pushed for, is simply a no-op removal
+/// (lazy stale-key skip) — cheap and correct without extra per-entry
+/// bookkeeping. Also drains far-stale queue entries once `order` itself
+/// grows well past the bound, so a long-lived process re-caching the same
+/// hot paths forever doesn't leak the queue itself.
+fn evict_metadata_cache(
+    cache: &DashMap<String, (FileLocations, Instant)>,
+    order: &mut std::collections::VecDeque<String>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        match order.pop_front() {
+            Some(k) => {
+                cache.remove(&k);
+            }
+            None => break,
+        }
+    }
+    let order_cap = max_entries.saturating_mul(4);
+    while order.len() > order_cap {
+        match order.pop_front() {
+            Some(k) => {
+                cache.remove(&k);
+            }
+            None => break,
+        }
+    }
+}
+
+/// CR-6-5 (FUSE-5) — remove every entry whose TTL has elapsed. Pure over
+/// the cache handle so it's directly testable without a full
+/// `DtfsFilesystem`.
+fn sweep_expired_metadata_cache_entries(
+    cache: &DashMap<String, (FileLocations, Instant)>,
+    ttl: Duration,
+) {
+    cache.retain(|_, (_, cached_at)| cached_at.elapsed() < ttl);
+}
+
 /// CR-6-4 (FUSE-6) — resolve the volume_id to store after a
 /// `GetFileLocationsResponse` refresh. A non-empty response value (a
 /// manager on this build or newer) always wins. An empty response value
@@ -307,6 +353,11 @@ pub struct DtfsFilesystem {
     config: FuseConfig,
     /// Metadata cache: path -> (FileLocations, cached_at).
     metadata_cache: DashMap<String, (FileLocations, Instant)>,
+    /// CR-6-5 (FUSE-5) — insertion-order queue backing bounded eviction of
+    /// `metadata_cache`. A path can appear more than once (re-cached); a
+    /// popped entry whose key is no longer the live one is a harmless
+    /// no-op remove (lazy stale-key skip) — see `evict_metadata_cache`.
+    metadata_cache_order: std::sync::Mutex<std::collections::VecDeque<String>>,
     /// Metadata TTL.
     metadata_ttl: Duration,
     /// Open file handles: fh -> OpenFile.
@@ -394,6 +445,7 @@ impl DtfsFilesystem {
             client_location,
             config,
             metadata_cache: DashMap::new(),
+            metadata_cache_order: std::sync::Mutex::new(std::collections::VecDeque::new()),
             metadata_ttl: DEFAULT_METADATA_TTL,
             open_files: DashMap::new(),
             next_fh: AtomicU64::new(1),
@@ -1890,10 +1942,34 @@ impl DtfsFilesystem {
         }
     }
 
-    /// Store metadata in the cache.
+    /// Store metadata in the cache. CR-6-5 (FUSE-5): bounds the cache at
+    /// `METADATA_CACHE_MAX_ENTRIES` by evicting the oldest-inserted paths
+    /// first (FIFO, not strict LRU — simplest correct structure for a
+    /// getattr-heavy scan workload, per AGENTS.md § B.1's "smallest fix").
+    /// Before this, a Plex library scan pinned one full chunk-location list
+    /// per path ever stat'ed, unboundedly.
     fn cache_metadata(&self, path: &str, locations: FileLocations) {
         self.metadata_cache
             .insert(path.to_string(), (locations, Instant::now()));
+        let mut order = self.metadata_cache_order.lock().unwrap();
+        order.push_back(path.to_string());
+        evict_metadata_cache(&self.metadata_cache, &mut order, METADATA_CACHE_MAX_ENTRIES);
+    }
+
+    /// CR-6-5 (FUSE-5) — return this client's configured metadata TTL, so
+    /// the sweep task in `main.rs` can run on the same cadence entries
+    /// naturally expire.
+    pub fn metadata_ttl(&self) -> Duration {
+        self.metadata_ttl
+    }
+
+    /// CR-6-5 (FUSE-5) — remove every `metadata_cache` entry whose TTL has
+    /// elapsed. `get_cached_metadata` already does this lazily per-path on
+    /// read, but a path that stops being read (e.g. Plex finished scanning
+    /// it) would otherwise pin its full chunk-location list forever;
+    /// called periodically from `main.rs` on the `metadata_ttl` cadence.
+    pub fn sweep_expired_metadata_cache(&self) {
+        sweep_expired_metadata_cache_entries(&self.metadata_cache, self.metadata_ttl);
     }
 
     /// Resolve the logical chunk size for a file.
@@ -2434,6 +2510,63 @@ fn other_writer_open(remaining: &[(String, OpenFlags)], path: &str) -> bool {
 /// independent of the error's concrete type.
 fn is_resource_exhausted(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("ResourceExhausted")
+}
+
+#[cfg(test)]
+mod cr_6_5_metadata_cache_bound_tests {
+    use super::{evict_metadata_cache, sweep_expired_metadata_cache_entries, FileLocations};
+    use dashmap::DashMap;
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    /// Built through a free function on purpose (same rustc 1.94 struct-
+    /// literal ICE workaround as `rev_2_1_chunk_index_tests::locs`).
+    fn empty_locations(path: &str) -> FileLocations {
+        FileLocations {
+            path: path.to_string(),
+            total_size: 0,
+            chunks: Vec::new(),
+            volume_id: "default".to_string(),
+            chunk_size: 4 * 1024 * 1024,
+            created_at_ms: 0,
+            modified_at_ms: 0,
+            is_directory: false,
+        }
+    }
+
+    #[test]
+    fn insert_5000_stays_bounded() {
+        let cache: DashMap<String, (FileLocations, Instant)> = DashMap::new();
+        let mut order: VecDeque<String> = VecDeque::new();
+        for i in 0..5000 {
+            let path = format!("/movies/{i}.mkv");
+            cache.insert(path.clone(), (empty_locations(&path), Instant::now()));
+            order.push_back(path);
+            evict_metadata_cache(&cache, &mut order, 4096);
+        }
+        assert!(cache.len() <= 4096, "cache grew past the bound: {}", cache.len());
+        // The most recently inserted path must still be present (FIFO
+        // evicts the oldest, never the newest).
+        assert!(cache.contains_key("/movies/4999.mkv"));
+        // An early path must have been evicted.
+        assert!(!cache.contains_key("/movies/0.mkv"));
+    }
+
+    #[test]
+    fn expired_entry_gone_after_sweep() {
+        let cache: DashMap<String, (FileLocations, Instant)> = DashMap::new();
+        cache.insert(
+            "/stale.mkv".to_string(),
+            (empty_locations("/stale.mkv"), Instant::now() - Duration::from_secs(120)),
+        );
+        cache.insert(
+            "/fresh.mkv".to_string(),
+            (empty_locations("/fresh.mkv"), Instant::now()),
+        );
+        sweep_expired_metadata_cache_entries(&cache, Duration::from_secs(60));
+        assert!(!cache.contains_key("/stale.mkv"), "expired entry must be swept");
+        assert!(cache.contains_key("/fresh.mkv"), "fresh entry must survive the sweep");
+    }
 }
 
 #[cfg(test)]
