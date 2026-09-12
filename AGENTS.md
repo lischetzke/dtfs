@@ -76,6 +76,16 @@ cargo test  --release --workspace
 cargo test -p dtfs-data --release   # per-crate
 ```
 
+**Builder unreachable → Docker.** The local image `dtfs-buildenv:latest` (rust toolchain at `/usr/local/cargo/bin`, protoc, clang, libfuse3-dev) builds the Windows checkout in place, with the cache in the named volumes `dtfs-target` (`/target`) and `dtfs-registry`; from Git Bash `MSYS_NO_PATHCONV=1` is required and `bash -lc` must not be used inside the image (it drops cargo from `PATH`):
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "${DTFS_REPO_HOST_PATH:-C:/Users/<user>/git_github.com/dtfs2}:/build" \
+  -v dtfs-target:/target -v dtfs-registry:/usr/local/cargo/registry \
+  -w /build dtfs-buildenv:latest cargo test -p <crate> --release
+```
+
+Unit and crate suites are verifiable this way; live lab verification is not. Release cases authored without a lab are `bash -n` clean and marked unexecuted in the plan.
+
 Stale-artifact trap (Bug CF): the tar sync preserves mtimes, so a just-synced edit can land older than cached build artifacts and cargo silently reuses a stale rlib — `touch` the edited file(s) before a deploy build and confirm the binary carries the change. Full narrative: `docs/src/internals/invariants.md` § A.4.
 
 Deploy builds MUST go through a wrapper so `BUILD_DATE` is fresh (§ A.3.5); a bare `cargo build --release` stamps stale. `scripts/dtfs-release.sh <tag>` stamps `DTFS_VERSION`, builds, writes `target/release-artifacts/<tag>/` + prints the `gh release create` line (AIWF-4-1: `git-cliff` notes when available, `--generate-notes` fallback). A crate-level `#![allow(dead_code)]` on dtfs-manager/dtfs-data works around a rustc 1.94 dead-code ICE — don't remove without re-verifying the ICE first.
@@ -177,7 +187,7 @@ Co-Authored-By: <model> <noreply@<vendor>.com>
 
 ## B.4 Tests
 
-Observe fail → implement → observe pass → full crate suite (new durability/anchor invariants: a property-style test over random ops). Cluster-visible behaviour ships a `tests/release/cases/NN-name.sh` in the same commit (`tests/release/README.md`), or a `Release-case: none (<reason>)` trailer — a commit hook enforces this.
+Observe fail → implement → observe pass → full crate suite (new durability/anchor invariants: a property-style test over random ops). Cluster-visible behaviour ships a `tests/release/cases/NN-name.sh` in the same commit (`tests/release/README.md`), or a `Release-case:` trailer — `none (<reason>)` for a pure internal change, or `tests/release/cases/NNN-name.sh (<task-id>)` when the case lands in a later commit of the same plan — a commit hook enforces this.
 
 ## B.5 Where things live
 

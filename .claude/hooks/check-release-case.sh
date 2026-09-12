@@ -68,6 +68,7 @@ while IFS= read -r f; do
         crates/dtfs-manager/src/api.rs|crates/dtfs-manager/src/metadata.rs|crates/dtfs-manager/src/scheduler.rs) CLUSTER_TOUCHED=1 ;;
         crates/dtfs-data/src/*) CLUSTER_TOUCHED=1 ;;
         crates/dtfs-fuse/src/*) CLUSTER_TOUCHED=1 ;;
+        crates/dtfs-raft/src/*) CLUSTER_TOUCHED=1 ;;
         proto/*) CLUSTER_TOUCHED=1 ;;
     esac
 done <<< "$STAGED"
@@ -81,7 +82,10 @@ while IFS= read -r f; do
 done <<< "$STAGED"
 [ "$CASE_STAGED" = "1" ] && exit 0
 
-if printf '%s' "$CMD" | grep -Eq 'Release-case:[[:space:]]*none'; then
+# Any `Release-case:` trailer satisfies the hook: `none (<reason>)` for a
+# pure internal change, or `tests/release/cases/NNN-*.sh (<task-id>)` when
+# the case lands in a later commit of the same plan (one commit per task).
+if printf '%s' "$CMD" | grep -Eq 'Release-case:[[:space:]]*[^[:space:]]'; then
     exit 0
 fi
 
@@ -89,7 +93,9 @@ fi
     echo "check-release-case: staged changes touch cluster-visible code"
     echo "  (dtfs-manager api/metadata/scheduler, dtfs-data/src, dtfs-fuse/src, or proto/)"
     echo "  but no tests/release/cases/NN-*.sh is staged and the commit message"
-    echo "  carries no 'Release-case: none (<reason>)' trailer (AGENTS.md B.4 / tests/release/README.md)."
-    echo "  Add a case, or add the trailer if this is a pure internal refactor."
+    echo "  carries no 'Release-case:' trailer (AGENTS.md B.4 / tests/release/README.md)."
+    echo "  Add a case, or a trailer: 'Release-case: none (<reason>)' for a pure internal"
+    echo "  change, or 'Release-case: tests/release/cases/NNN-name.sh (<task-id>)' when the"
+    echo "  case lands in a later commit of the same plan."
 } >&2
 exit 2
