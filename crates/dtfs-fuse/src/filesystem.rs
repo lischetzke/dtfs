@@ -524,42 +524,6 @@ impl DtfsFilesystem {
         let locations = self.fetch_file_locations(path).await?;
         let chunk_size = self.resolve_chunk_size(&locations);
 
-        // F-021: when opened with O_APPEND, pre-seed the write buffer with
-        // the file's existing tail chunk so the subsequent write(s) extend
-        // it instead of replacing the chunk wholesale. Without this, the
-        // next flush emits a chunk-0 segment containing ONLY the appended
-        // bytes, which silently truncates the file at the append offset.
-        //
-        // For media-server workloads we expect append to be small and rare;
-        // the memory cost (= size of the last chunk, capped at chunk_size)
-        // is acceptable.
-        if append && !locations.chunks.is_empty() {
-            let last_idx = locations.chunks.len() - 1;
-            let last_chunk = &locations.chunks[last_idx];
-            if !last_chunk.node_addresses.is_empty() {
-                let node = self.select_nearest_node(&last_chunk.node_addresses);
-                match self.client.read_chunk(&node, &last_chunk.chunk_id).await {
-                    Ok(existing) => {
-                        let offset_in_file = (last_idx as u64) * chunk_size;
-                        self.write_buffer.write(path, offset_in_file, &existing);
-                        debug!(
-                            path,
-                            offset_in_file,
-                            len = existing.len(),
-                            "O_APPEND: pre-seeded tail chunk into write buffer"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            path,
-                            error = %e,
-                            "O_APPEND: failed to pre-seed tail chunk; append may truncate"
-                        );
-                    }
-                }
-            }
-        }
-
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
 
         // P0-1: for writable opens, acquire the single-writer lease BEFORE
@@ -600,6 +564,53 @@ impl DtfsFilesystem {
         } else {
             (None, None, None)
         };
+
+        // F-021 / CR-1-2 (FUSE-7): when opened with O_APPEND, pre-seed the
+        // write buffer with the file's existing tail chunk so the
+        // subsequent write(s) extend it instead of replacing the chunk
+        // wholesale. Without this, the next flush emits a chunk segment
+        // containing ONLY the appended bytes, which silently truncates the
+        // file at the append offset. Runs AFTER the write lease is
+        // acquired, so a losing racer never seeds a buffer it will not be
+        // allowed to write through; resolves the tail chunk by its real
+        // index (`chunk_at(max index)`), never by array position, since the
+        // manager's array is dense while the file's index space may be
+        // sparse (REV-2-1).
+        if append {
+            let max_idx = if locations.indices_are_authoritative() {
+                locations.chunks.iter().filter_map(|c| c.chunk_index).max()
+            } else if locations.chunks.is_empty() {
+                None
+            } else {
+                Some(locations.chunks.len() as u64 - 1)
+            };
+            if let Some(last_idx) = max_idx {
+                if let Some(last_chunk) = locations.chunk_at(last_idx) {
+                    if !last_chunk.node_addresses.is_empty() {
+                        let node = self.select_nearest_node(&last_chunk.node_addresses);
+                        match self.client.read_chunk(&node, &last_chunk.chunk_id).await {
+                            Ok(existing) => {
+                                let offset_in_file = last_idx * chunk_size;
+                                self.write_buffer.write(path, offset_in_file, &existing);
+                                debug!(
+                                    path,
+                                    offset_in_file,
+                                    len = existing.len(),
+                                    "O_APPEND: pre-seeded tail chunk into write buffer"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    path,
+                                    error = %e,
+                                    "O_APPEND: failed to pre-seed tail chunk; append may truncate"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         self.open_files.insert(
             fh,
@@ -1086,44 +1097,44 @@ impl DtfsFilesystem {
         // earlier content (bash `echo line1 > f; echo line2 >> f`).
         //
         // To prevent that, seed the buffer with the existing chunk content
-        // when we're about to write at a position that isn't already covered
-        // by buffered data.
-        if chunk_size > 0 && effective_offset > 0 {
-            let chunk_idx = effective_offset / chunk_size;
-            let chunk_start = chunk_idx * chunk_size;
-            let need_seed = match self.write_buffer.logical_size(&path) {
-                Some(end_in_buffer) => end_in_buffer <= chunk_start,
-                None => true,
-            };
-            if need_seed {
-                if let Some(loc) = &locations_snapshot {
-                    // REV-2-1 — resolve by index, not by array position:
-                    // seeding the RMW buffer from a NEIGHBOURING chunk would
-                    // write that chunk's bytes back under this chunk's index.
-                    if let Some(chunk) = loc.chunk_at(chunk_idx) {
-                        if !chunk.node_addresses.is_empty() {
-                            let node = self.select_nearest_node(&chunk.node_addresses);
-                            match self.client.read_chunk(&node, &chunk.chunk_id).await {
-                                Ok(existing) if !existing.is_empty() => {
-                                    self.write_buffer
-                                        .write(&path, chunk_start, &existing);
-                                    debug!(
-                                        path = %path,
-                                        chunk_idx,
-                                        len = existing.len(),
-                                        "RMW: seeded existing chunk before partial write"
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(e) => warn!(
-                                    path = %path,
-                                    chunk_idx,
-                                    error = %e,
-                                    "RMW: failed to read existing chunk — partial write may truncate"
-                                ),
-                            }
-                        }
-                    }
+        // for EVERY chunk this write touches (including index 0 — CR-1-2
+        // drops the old `effective_offset > 0` gate, which left chunk 0
+        // truncated on a header-patch write such as `dd conv=notrunc` or
+        // `mkvpropedit`) that isn't already fully covered by buffered data.
+        // A seed read failure is fatal (`?` -> EIO) rather than a warning:
+        // continuing would let `write()` merge the caller's bytes into a
+        // chunk buffer that still doesn't cover the whole chunk, which the
+        // next flush would then commit as the chunk's complete (truncated)
+        // content — silent data loss, not just a truncated append.
+        if chunk_size > 0 && !data.is_empty() {
+            for chunk_idx in
+                chunks_needing_seed(&self.write_buffer, &path, chunk_size, effective_offset, data.len())
+            {
+                let Some(loc) = &locations_snapshot else { continue };
+                // REV-2-1 — resolve by index, not by array position:
+                // seeding the RMW buffer from a NEIGHBOURING chunk would
+                // write that chunk's bytes back under this chunk's index.
+                let Some(chunk) = loc.chunk_at(chunk_idx) else { continue };
+                if chunk.node_addresses.is_empty() {
+                    continue;
+                }
+                let chunk_start = chunk_idx * chunk_size;
+                let node = self.select_nearest_node(&chunk.node_addresses);
+                let existing = self
+                    .client
+                    .read_chunk(&node, &chunk.chunk_id)
+                    .await
+                    .with_context(|| {
+                        format!("RMW seed read failed for {path} chunk {chunk_idx}")
+                    })?;
+                if !existing.is_empty() {
+                    self.write_buffer.write(&path, chunk_start, &existing);
+                    debug!(
+                        path = %path,
+                        chunk_idx,
+                        len = existing.len(),
+                        "RMW: seeded existing chunk before partial write"
+                    );
                 }
             }
         }
@@ -2117,6 +2128,33 @@ fn effective_read_len(file_size: u64, offset: u64, size: u32) -> u32 {
     size.min((file_size - offset).min(u32::MAX as u64) as u32)
 }
 
+/// CR-1-2 (FUSE-7) — chunk indices a write of `len` bytes at `offset`
+/// touches that are NOT already fully covered by buffered data, and
+/// therefore need an RMW seed read before the write proceeds. Pure w.r.t.
+/// the network: the caller still needs the manager's existing chunk
+/// metadata to know whether there is anything to seed FROM (a brand-new
+/// chunk the cluster has never seen has nothing to seed).
+///
+/// Deliberately includes chunk index 0 — the pre-CR-1-2 code gated this on
+/// `effective_offset > 0`, which left chunk 0 unseeded on a header-patch
+/// write (`dd conv=notrunc`, `mkvpropedit`) starting at offset 0.
+fn chunks_needing_seed(
+    write_buffer: &WriteBuffer,
+    path: &str,
+    chunk_size: u64,
+    offset: u64,
+    len: usize,
+) -> Vec<u64> {
+    if chunk_size == 0 || len == 0 {
+        return Vec::new();
+    }
+    let start_chunk = offset / chunk_size;
+    let end_chunk = (offset + len as u64 - 1) / chunk_size;
+    (start_chunk..=end_chunk)
+        .filter(|&idx| !write_buffer.chunk_is_fully_buffered(path, idx as u32))
+        .collect()
+}
+
 /// Bug BU-2 — did this write error originate from a data-node out-of-space
 /// (ENOSPC)? `client::write_chunk_bytes` surfaces the gRPC status code in
 /// its error message (`code=ResourceExhausted`) after exhausting the Bug G
@@ -2125,6 +2163,50 @@ fn effective_read_len(file_size: u64, offset: u64, size: u32) -> u32 {
 /// independent of the error's concrete type.
 fn is_resource_exhausted(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("ResourceExhausted")
+}
+
+#[cfg(test)]
+mod cr_1_2_seed_tests {
+    use super::{chunks_needing_seed, WriteBuffer};
+
+    // (a) CR-1-2 drops the old `effective_offset > 0` gate: a write at
+    // offset 0 of an as-yet-unbuffered chunk must still be flagged for
+    // seeding, not skipped just because it starts at the beginning.
+    #[test]
+    fn offset_zero_is_flagged_for_seeding() {
+        let wb = WriteBuffer::new(4096);
+        let touched = chunks_needing_seed(&wb, "/f", 4096, 0, 100);
+        assert_eq!(touched, vec![0], "chunk 0 must be seeded, not skipped");
+    }
+
+    // (b) a write straddling two chunks must flag BOTH for seeding when
+    // neither is already fully buffered.
+    #[test]
+    fn straddling_write_flags_both_chunks() {
+        let wb = WriteBuffer::new(4096);
+        let touched = chunks_needing_seed(&wb, "/f", 4096, 4096 - 50, 100);
+        assert_eq!(touched, vec![0, 1], "both straddled chunks need seeding");
+    }
+
+    // A chunk that is already fully buffered (e.g. a previous seed + write
+    // already completed it) must NOT be flagged again.
+    #[test]
+    fn fully_buffered_chunk_is_not_flagged() {
+        let wb = WriteBuffer::new(4096);
+        wb.write("/f", 0, &vec![0u8; 4096]); // fully covers chunk 0
+        let touched = chunks_needing_seed(&wb, "/f", 4096, 0, 100);
+        assert!(touched.is_empty(), "already-complete chunk needs no seed");
+    }
+
+    // A write spanning three chunks where only the middle one is already
+    // resident-and-complete must flag exactly the other two.
+    #[test]
+    fn only_incomplete_chunks_are_flagged() {
+        let wb = WriteBuffer::new(4096);
+        wb.write("/f", 4096, &vec![0u8; 4096]); // chunk 1 fully buffered
+        let touched = chunks_needing_seed(&wb, "/f", 4096, 0, 4096 * 3);
+        assert_eq!(touched, vec![0, 2]);
+    }
 }
 
 #[cfg(test)]
