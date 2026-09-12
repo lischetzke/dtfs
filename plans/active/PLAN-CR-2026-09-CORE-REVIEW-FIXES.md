@@ -97,7 +97,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR-1-1 | ⬜ | FUSE-1 | `crates/dtfs-fuse/src/writebuf.rs`, `filesystem.rs` | Replace the contiguous `FileWriteBuffer` (`data: Vec<u8>` + `dirty_offset`) with a per-chunk map `BTreeMap<u32, ChunkBuf { data: Vec<u8>, dirty: Range<usize>, seeded: bool }>`. `merge_write` writes into the affected chunk(s) only; never zero-fills a gap to another chunk. A write into a chunk that is not resident and does not cover the whole chunk sets `needs_seed` (returned to the caller) instead of gap-filling. `extract_complete_chunks` / `extract_all_chunks` / `restore_segments` / `logical_size` / `truncate_at` / `effective_batch_chunks` keep their signatures and semantics (CO-1-7, CO-1-8, H1 byte clamp). Total dirty bytes per file capped at `FLUSH_BATCH_MAX_BYTES * 2`; a write that would exceed it forces a flush first (caller side). | writebuf unit: (a) seq write 0..3 chunks, flush, write 100 B at offset 0 → extract yields ONLY chunk 0 marked `needs_seed`, chunks 1..2 NOT re-emitted; (b) write at 100 MB then at 4 MB → buffer holds two chunk entries, `dirty_bytes() < 2*chunk_size`; (c) all existing writebuf tests pass unchanged (or updated with a one-line reason in the commit). | Tests (a),(b) fail on current code, pass after; `cargo test -p dtfs-fuse --release` green. |
+| CR-1-1 | ✅ | FUSE-1 | `crates/dtfs-fuse/src/writebuf.rs`, `filesystem.rs` | Replace the contiguous `FileWriteBuffer` (`data: Vec<u8>` + `dirty_offset`) with a per-chunk map `BTreeMap<u32, ChunkBuf { data: Vec<u8>, dirty: Range<usize>, seeded: bool }>`. `merge_write` writes into the affected chunk(s) only; never zero-fills a gap to another chunk. A write into a chunk that is not resident and does not cover the whole chunk sets `needs_seed` (returned to the caller) instead of gap-filling. `extract_complete_chunks` / `extract_all_chunks` / `restore_segments` / `logical_size` / `truncate_at` / `effective_batch_chunks` keep their signatures and semantics (CO-1-7, CO-1-8, H1 byte clamp). Total dirty bytes per file capped at `FLUSH_BATCH_MAX_BYTES * 2`; a write that would exceed it forces a flush first (caller side). | writebuf unit: (a) seq write 0..3 chunks, flush, write 100 B at offset 0 → extract yields ONLY chunk 0 marked `needs_seed`, chunks 1..2 NOT re-emitted; (b) write at 100 MB then at 4 MB → buffer holds two chunk entries, `dirty_bytes() < 2*chunk_size`; (c) all existing writebuf tests pass unchanged (or updated with a one-line reason in the commit). | Tests (a),(b) fail on current code, pass after; `cargo test -p dtfs-fuse --release` green. |
 | CR-1-2 | ⬜ | FUSE-7 | `filesystem.rs` (`write()` seed block ~1091-1129, O_APPEND pre-seed ~536-561), `writebuf.rs` | Seed EVERY chunk the write touches that is not fully covered by buffered data, including index 0 (drop the `effective_offset > 0` gate). Seed read failure returns `Err` (→ EIO), never `warn!` + continue. O_APPEND pre-seed: use `chunk_at(max chunk_index)` and `index * chunk_size`, and run it AFTER the lease is acquired. | fuse unit with a mock client: (a) write 100 B at offset 0 of a 1-chunk existing file → flushed chunk 0 is `chunk_size` bytes with the patched prefix; (b) write straddling chunk 0→1 seeds both; (c) seed error → `write()` returns Err. | Tests fail before, pass after; `cargo test -p dtfs-fuse --release` green. |
 | CR-1-3 | ⬜ | FUSE-2 | `filesystem.rs` `flush()` ~1234, `release()` ~1357 | `flush(fh)`: if `!file.flags.is_writable()` return `Ok(())` before touching `write_buffer`. `release(fh)`: only `write_buffer.remove(&path)` when this fh is writable AND no other open writable fh on the same path remains (scan `open_files`). | unit: open RO + RW on same path, write via RW, flush RO → buffer untouched; release RO → buffer still present; release RW → removed. | Test fails before, passes after. |
 | CR-1-4 | ⬜ | FUSE-3 | `filesystem.rs` (`OpenFile`, `flush()` error branch ~1296-1320, `flush_segments_to_cluster`) | Add `committed_any: bool` to `OpenFile`, set true on first successful `flush_segments_to_cluster` for that path (set on every OpenFile of the path). `was_fresh` = `!committed_any && locations empty`. On flush failure ALWAYS `restore_segments` first; ghost-unlink only from `release()` when `!committed_any`. | unit: create, write 2 chunks (batch flush commits them), write tail, force flush error → file NOT deleted, segments restored, next flush succeeds and commits the tail. | Test fails before, passes after. |
@@ -202,4 +202,27 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 
 ## Deviations
 
-(filled in as work proceeds)
+- CR-1-1: `ChunkBuf`'s coverage flag is named `is_complete`/tracked via the
+  `needs_seed` field on `ChunkSegment` (not a `seeded: bool` on `ChunkBuf`
+  as the data-model table sketched) — the consumer (filesystem.rs, CR-1-2)
+  only ever needs the derived per-segment signal, not per-chunk mutable
+  state, so a stored bool would just be recomputed from `dirty` anyway.
+  `complete_chunks_available(dirty_offset, len, chunk_size)` is kept
+  unchanged (still directly unit-tested) but is no longer called by the
+  new sparse `flush()`/`extract_complete_chunks`, which count complete
+  `ChunkBuf` entries directly — noted as the "one-line justification" for
+  an unchanged-but-now-orphaned pure helper per the task instructions.
+  Added `WriteBuffer::dirty_bytes()` and `chunk_is_fully_buffered()` (not
+  in the original method list) because CR-1-2/CR-1-3 need them; both are
+  additive, no existing signature changed.
+
+## Verification log
+
+- **CR-1-1** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-fuse --release`: 76 -> 78 passed (2 new:
+  `cr_1_1_rewrite_offset_zero_marks_only_that_chunk_needs_seed`,
+  `cr_1_1_scattered_writes_hold_only_touched_chunks`), 0 failed. Rewrote
+  `FileWriteBuffer` from a contiguous `Vec<u8>` to `BTreeMap<u32, ChunkBuf>`
+  (`crates/dtfs-fuse/src/writebuf.rs`); every existing test passed
+  unchanged (no semantic rewrite needed) once `write()` splits at chunk
+  boundaries before merging into the per-chunk buffer.
