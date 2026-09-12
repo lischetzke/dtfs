@@ -1132,6 +1132,17 @@ fn resolve_ack_floor(
     }
 }
 
+/// CR-6-4 (FUSE-6) — the volume that governs placement for
+/// `AllocateChunks`: the file's OWN registered volume when it already
+/// exists (a client can send a stale/wrong `req.volume_id`, e.g. it
+/// never learned the real one, or defaulted to "default"), otherwise
+/// the request's volume (first write, file doesn't exist yet).
+fn resolve_placement_volume_id(existing_file_volume_id: Option<&str>, req_volume_id: &str) -> String {
+    existing_file_volume_id
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| req_volume_id.to_string())
+}
+
 /// CR-6-2 (CMN-2) — warn-once-per-volume gate for the ack-floor clamp
 /// below, so a volume whose floor exceeds its RF doesn't spam a warning
 /// on every commit.
@@ -1323,6 +1334,9 @@ impl ManagerService for MetadataService {
             created_at_ms: file.created_at_ms as i64,
             modified_at_ms: file.updated_at_ms as i64,
             is_directory: file.is_directory,
+            // CR-6-4 (FUSE-6) — the file's ACTUAL volume, so the client
+            // stops hardcoding "default" on every refresh.
+            volume_id: file.volume_id.clone(),
         }))
     }
 
@@ -2335,7 +2349,29 @@ impl ManagerService for MetadataService {
         // replica on that tier. The anchor migration to cold (if
         // needed) happens asynchronously via AV-3-3's
         // `check_anchor_lag` pass.
-        let volume_cfg = data.volumes.get(&req.volume_id).cloned();
+        // CR-6-4 (FUSE-6) — when the file already exists, its OWN
+        // registered volume governs placement, never the request's
+        // `volume_id`. Before this, a stale/wrong client-cached
+        // volume_id (e.g. a client that never learned the real one, or
+        // hardcoded "default") silently placed every later write of a
+        // non-default-volume file with the DEFAULT volume's RF/tier/
+        // anchor. Only a brand-new file (no `files` entry yet) uses the
+        // request value.
+        let existing_file_volume_id = data.files.get(&req.path).map(|f| f.volume_id.as_str());
+        if let Some(fv) = existing_file_volume_id {
+            if fv != req.volume_id {
+                tracing::debug!(
+                    path = %req.path,
+                    request_volume_id = %req.volume_id,
+                    file_volume_id = %fv,
+                    "CR-6-4: AllocateChunks request volume_id differs from \
+                     the file's registered volume; using the file's volume"
+                );
+            }
+        }
+        let effective_volume_id =
+            resolve_placement_volume_id(existing_file_volume_id, &req.volume_id);
+        let volume_cfg = data.volumes.get(&effective_volume_id).cloned();
         let available_tiers: Vec<DiskTier> = {
             // DiskTier doesn't impl Ord (and adding it ripples through
             // the workspace), so dedup via HashSet then collect.
@@ -2399,7 +2435,7 @@ impl ManagerService for MetadataService {
         // the capacity + exclude-filtered round-robin below.
         let placed = if exclude_set.is_empty() {
             self.placement.place_chunks_with_anchor(
-                &req.volume_id,
+                &effective_volume_id,
                 &req.path, // Bug BO-3 — per-file seed so chunk-0 doesn't collide cross-file
                 req.num_chunks,
                 effective_tier,
@@ -4315,6 +4351,28 @@ mod tests {
         // Unknown file (first commit) → only the request volume governs.
         assert_eq!(resolve_ack_floor(&sm, "/movies/new.mkv", "strict", 1), 2);
         assert_eq!(resolve_ack_floor(&sm, "/movies/new.mkv", "default", 1), 1);
+    }
+
+    /// CR-6-4 (FUSE-6) — a file already registered under volume
+    /// "strict" governs placement even when the AllocateChunks request
+    /// claims "default" (a client that hasn't learned or has forgotten
+    /// the real volume_id); only an unknown/new file uses the request
+    /// value.
+    #[test]
+    fn cr_6_4_resolve_placement_volume_id_prefers_existing_file() {
+        assert_eq!(
+            resolve_placement_volume_id(Some("strict"), "default"),
+            "strict"
+        );
+        assert_eq!(
+            resolve_placement_volume_id(None, "strict"),
+            "strict",
+            "new file (no existing entry) uses the request volume"
+        );
+        assert_eq!(
+            resolve_placement_volume_id(Some("default"), "default"),
+            "default"
+        );
     }
 
     /// CR-6-2 (CMN-2) — a volume floor (2) that exceeds the effective

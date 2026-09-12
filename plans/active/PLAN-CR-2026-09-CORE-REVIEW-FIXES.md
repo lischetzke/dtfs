@@ -169,10 +169,10 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-6-1 | ✅ | CMN-1, CMN-8 | `crates/dtfs-common/src/config.rs` (`PlacementConfig::validate` new), `dtfs-manager/src/main.rs`, `dtfs-data/src/main.rs`, `dtfs-fuse/src/main.rs` | `PlacementConfig::validate` rejects `!(0.0..=100.0).contains(&min_free_pct)`. All three mains call `config.memory.validate()` (and manager `config.placement.validate()`) right after load; error → exit non-zero with the message. Docs: note the new startup rejection in `docs/src/configuration/{manager,data-node,fuse-client}.md` memory rows. | config unit: `warn 95 / shed 90` → Err; `min_free_pct 150` → Err. | Tests fail before, pass after; `example_*_toml_parses` green. |
 | CR-6-2 | ✅ | CMN-2 | `crates/dtfs-manager/src/metadata.rs` `resolve_ack_floor` ~816 | Clamp: `min(floor, effective_mandatory_replicas of the tier the chunks were placed on)`; when clamped, `warn!` once per volume (dedup by volume id) and audit `write_safety.floor_clamped`. Docs row manager.md:216: "clamped to the effective RF". | metadata unit (`resolve_ack_floor` tests at ~3756 as template): volume floor 2, cold RF 1, cold placement → floor 1. | Test fails before, passes after. |
 | CR-6-3 | ✅ | PROTO-2 | `proto/manager.proto` `ScrubConfigOverride`, `metadata.rs` ~1105, `dtfs-data/src/scrub.rs` ~101 | Add `quick_interval_secs = 9`, `deep_interval_secs = 10`; manager fills both (secs exact, hours as before); data node prefers non-zero secs; manager `warn!` when hour rounding changes the value and the peer is old (cannot know → log once at startup instead: "sub-hour scrub cadence requires data nodes ≥ this build"). | data scrub unit: override with `quick_interval_secs=600` → 600 s cadence; secs=0 → hours×3600. | Tests fail before, pass after. |
-| CR-6-4 | ⬜ | FUSE-6 | `proto/manager.proto` `GetFileLocationsResponse`, `metadata.rs` `get_file_locations` ~940, `allocate_chunks` ~1822, `dtfs-fuse/src/filesystem.rs` `fetch_file_locations` ~1692 | Add `volume_id` to the response; FUSE stores it in `FileLocations.volume_id` (`""` → keep current value, not `"default"`). Manager `allocate_chunks`: when `sm.files[req.path]` exists, use ITS `volume_id` for placement and ignore the request value (log at debug when they differ). | metadata unit: file in volume "strict", request says "default" → placement uses strict RF/anchor; fuse unit: refresh keeps volume id. | Tests fail before, pass after. |
+| CR-6-4 | ✅ | FUSE-6 | `proto/manager.proto` `GetFileLocationsResponse`, `metadata.rs` `get_file_locations` ~940, `allocate_chunks` ~1822, `dtfs-fuse/src/filesystem.rs` `fetch_file_locations` ~1692 | Add `volume_id` to the response; FUSE stores it in `FileLocations.volume_id` (`""` → keep current value, not `"default"`). Manager `allocate_chunks`: when `sm.files[req.path]` exists, use ITS `volume_id` for placement and ignore the request value (log at debug when they differ). | metadata unit: file in volume "strict", request says "default" → placement uses strict RF/anchor; fuse unit: refresh keeps volume id. | Tests fail before, pass after. |
 | CR-6-5 | ⬜ | FUSE-5 | `dtfs-fuse/src/filesystem.rs` `metadata_cache` ~281/449 | Bound the cache: `max_entries` (default 4096) with LRU eviction on insert (simple: `VecDeque` of keys + DashMap, or the `lru` crate if already a dependency — check Cargo.lock; do NOT add a new dependency without noting it). Expired entries also swept every `metadata_ttl` by the existing readahead pressure ladder task or a tiny interval task. | unit: insert 5000 paths → `len() <= 4096`; expired entry gone after sweep. | Test fails before, passes after. |
 | CR-6-6 | ⬜ | FUSE-8, FUSE-9, FUSE-10 | `filesystem.rs` `read()` ~725-980, `readahead.rs` | (FUSE-8) notify `record_cache_hit` once per `(fh, chunk_id)` transition (store `last_notified_chunk` in `OpenFile`), in-flight bounded by a `Semaphore(8)`. (FUSE-9) foreground miss registers itself in a per-chunk in-flight `DashMap<String, watch::Receiver>` so concurrent readers of the same chunk await one fetch. (FUSE-10) call `readahead.on_chunk_read` on every chunk-index transition per fh (hit or miss); `pending`/cache dedup unchanged. | fuse unit: 32 sequential 128 KB reads of one cached chunk → exactly 1 notify; two concurrent reads of an uncached chunk with a counting mock client → 1 `GetChunk`; sequential hits keep `pending.len()` at the window depth. | Tests fail before, pass after; existing WI-05/B2 tests unchanged. |
-| CR-6-7 | ⬜ | — | `tests/release/cases/109-non-default-volume-placement-after-reopen.sh` | Create file in a non-default volume, close, reopen, append, assert every chunk's replicas match that volume's RF/anchor via `/api/v1/files/inspect`. | `bash -n` clean. | Present, unexecuted. |
+| CR-6-7 | ✅ | — | `tests/release/cases/109-non-default-volume-placement-after-reopen.sh` | Create file in a non-default volume, close, reopen, append, assert every chunk's replicas match that volume's RF/anchor via `/api/v1/files/inspect`. | `bash -n` clean. | Present, unexecuted. |
 | CR-6-8 | ⬜ | — | `AGENTS.md` A.2 read path, A.3.2, A.8 fuse entries; `deploy/examples/*.toml` + `docs/src/configuration/*` for any new key | Document volume_id on the wire, metadata cache bound, single-flight reads, per-chunk cache-hit notify, config validation at startup. | `cargo test -p dtfs-common` (`example_*_toml_parses`). | Same commit. |
 
 ## Cross-cutting invariants (every group)
@@ -992,3 +992,38 @@ failed at every step; no regressions.
   fix, no behaviour change there). Docs: `data-node.md` `[scrub]`
   section + `deploy/examples/data.toml` (commented, default 0, marked
   internal/manager-populated).
+
+- **CR-6-4** 2026-09-12, Docker `dtfs-buildenv:latest`: `cargo test -p
+  dtfs-manager --release`: 380 -> 381 passed, 0 failed (1 new:
+  `cr_6_4_resolve_placement_volume_id_prefers_existing_file`); `cargo
+  test -p dtfs-fuse --release`: 99 -> 102 passed, 0 failed (3 new,
+  `cr_6_4_resolve_refreshed_volume_id_tests`); `cargo build --workspace
+  --release`: clean. Added `GetFileLocationsResponse.volume_id` (proto
+  tag 8); manager `get_file_locations` fills it from `file.volume_id`.
+  `allocate_chunks` now resolves placement through
+  `resolve_placement_volume_id`: the file's OWN registered volume when
+  it already exists, ignoring a stale/wrong `req.volume_id` (debug log
+  when they differ); a brand-new file still uses the request value.
+  The `place_chunks_with_anchor` seed also switched to the resolved
+  volume for consistency. FUSE `fetch_file_locations` now resolves via
+  `resolve_refreshed_volume_id`: a non-empty response value always wins;
+  an empty one (older manager) keeps whatever this client already
+  believes (checked against any still-open `OpenFile` on the path
+  first, since `flush()`/`truncate()` invalidate `metadata_cache`
+  BEFORE calling this, then the metadata cache), falling back to
+  "default" only for a path never seen before.
+
+- **CR-6-7** 2026-09-12. Added
+  `tests/release/cases/109-non-default-volume-placement-after-reopen.sh`.
+  FUSE has no client-side way to select a volume at create time
+  (always `CreateFile(path, None)`), so the case creates the file
+  directly via the manager's `CreateFile` gRPC with an explicit
+  `volume_id` (grpcurl, LIS-56-stamped via a new `mgr_rpc_stamp` helper
+  added to `tests/release/lib/common.sh`, mirroring `data_rpc_stamp`
+  over the `dtfs-mgr-rpc` MAC plane), then drives the initial write AND
+  a close+reopen+append entirely through the real FUSE mount, and
+  asserts via `/api/v1/files/inspect` that every chunk (including the
+  post-reopen one) carries the created volume's RF, not the default
+  volume's. `KNOWN_ISSUE FUSE-6` when grpcurl/manager.proto are
+  unavailable. `bash -n` clean on both the case and the updated
+  `common.sh`; not executed (no lab this run).
