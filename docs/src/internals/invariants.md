@@ -54,6 +54,31 @@ detail not in that copy:
   chunks (CO-4-6) — otherwise, after an operator flush sets a future
   cooldown, the legacy promote would re-create the warm replica during
   the cooldown window, defeating the flush.
+- **CR-3-1 (MGR-2)** — pre-fix, `build_av_cache_snapshot`
+  (`TickPlacement`) and `FlushSnapshot::from_sm` resolved a placement's
+  tier from the node table alone (disk existence, not liveness), so
+  `plan_chunk_demotions`'s `mandatory_still_present` and
+  `plan_flush_cache`'s `mandatory_survives` could count a cold anchor
+  replica sitting on a Down node (or a Failed disk) as the surviving
+  mandatory copy and let the LAST live replica (a warm cache copy) be
+  dropped. Both snapshot builders now resolve each placement through
+  `scheduler::live_replica_tier`, and `TickPlacement`/
+  `FlushNodeSummary.disk_tiers` carry a `live: bool` alongside the tier;
+  the "still present" / "survives" checks additionally require
+  `live == true`. The dead placement is still LISTED (so it can itself
+  be dropped/repaired), just never counted as a survivor.
+- **CR-3-2 (MGR-2 defence)** — `apply_remove_chunk_location` gained a
+  second, anchor-independent guard: before mutating, it scans whether
+  the row being removed is itself live (node not Down/Failed, disk not
+  Failed/Removed) and, if so, whether any OTHER live row of the same
+  `(path, chunk_index)` would remain. If not, the removal is refused
+  with `"...would remove the last live replica..."`. This runs AFTER
+  the existing anchor survivor scan, so an anchor-policy volume keeps
+  the more specific "would strand anchor" message when both checks
+  would refuse the same removal; a volume with no anchor policy (or an
+  anchor-irrelevant removal) is still protected by this second guard.
+  A row that is itself dead can always be removed — it wasn't serving
+  anything.
 
 ## A.3.5 — Build-date / version stamp mechanism (Bug BS, AZ-5)
 
@@ -232,6 +257,56 @@ fast-fails tasks targeting non-Data/dead/tier-less nodes →
 `migration.invalid_target` audit), `check_misplaced_rebalance` /
 `plan_excess_spill_removal` (Bug BX-5 rebalance).
 
+**CR-3-1..3-6 (MGR-1/2/4/5/6/7/8/9), 2026-09-12 core-review fixes:**
+
+- CR-3-1/MGR-2: see § A.3.4 above (`plan_flush_cache`/`plan_chunk_demotions`
+  liveness-gated survivors).
+- CR-3-4/MGR-4/8/9: `MigrationOps::register_replica` returns
+  `Result<(), String>` — the Completing dispatch (Phase 4 of
+  `advance_round`) routes `Err` through the existing `record_copy_failure`
+  helper (bumps `attempts`, stays Completing, Failed+alert only at
+  `MAX_MIGRATION_ATTEMPTS`) instead of unconditionally advancing to Done.
+  `register_replica_location` collapsed two separately-acquired SM read
+  locks into one and delegates to a pure `plan_replica_registration(files,
+  chunk_hash, target_node, resolved_disk_id)`, which registers the new
+  replica at EVERY chunk_index in EVERY referencing file that carries the
+  hash (not just the first file/first index under the old two-lock split,
+  which could observe two different snapshots of the file tree between
+  the lock acquisitions and default a vanished hash to chunk_index 0 —
+  MGR-9) and returns no writes at all when the hash is unresolvable.
+  `resolve_disk_id_for_tier` now returns `Option<u32>`, filtering
+  Failed/Removed disks (MGR-8): a dead disk of the right tier is never a
+  valid registration target.
+- CR-3-5/MGR-5/6: `check_under_replicated`'s dedup index and
+  `schedule_replication`'s `already_scheduled` check both use
+  `task_blocks_requeue` (not a bespoke `!= Done && != Failed`), so a
+  lingering Failed task's retention window also blocks an immediate
+  re-queue — pre-fix, a deterministically-failing chunk (its only source
+  replica on a Failed disk) got a fresh task every 30s tick forever.
+  Source selection now goes through a pure `pick_live_source` (first
+  entry whose `live_replica_tier` resolves, not "any row on a healthy
+  node" — a copy on a Failed disk of an otherwise-healthy node is not
+  readable); target selection through a pure `pick_backfill_target`,
+  which additionally requires `placement_cfg.has_room` on the candidate
+  disk (`TaskScheduler` gained a `placement_cfg` field, wired from
+  `config.placement.clone()` in `main.rs`). `check_anchor_lag` now
+  threads a `created`/`live_tasks` pair through the same
+  `task_budget_available` bound `check_under_replicated` uses (pre-fix
+  it had NO bound at all) and inserts the just-scheduled `(chunk_id,
+  target_node)` into `existing_tasks` immediately after each schedule
+  instead of only once at the top of the pass, closing the window where
+  two files sharing a hash (content-addressed re-download/copy) could
+  both schedule a task against the same `(chunk, target)`.
+- CR-3-6/MGR-7: the heartbeat handler's integrity-fault-batch block
+  (`metadata.rs`) now captures `Err` from both the `QuarantineNode` and
+  `RemoveCorruptChunkReplicas` forwards via a pure
+  `integrity_fault_batch_accepted(quarantine_ok, remove_corrupt_ok)` and
+  surfaces either failure as `HeartbeatResponse.accepted = false`
+  (previously hardcoded `true`); the data node already re-enqueues
+  drained faults on `!accepted` (Bug BF-5), closing the same
+  election-window drop class CO-3-7 fixed for `report_chunk_status`.
+  `AppendAudit` in the same block stays best-effort.
+
 `advance_tasks` drives the task state machine each 30s tick. U3 made it
 multi-transition-per-tick (round loop until no progress, so a chunk
 climbs Pending->Done in ONE tick) + bounded-parallel copy
@@ -365,6 +440,40 @@ de-location so the bad replica stayed advertised healthy and
 re-replication never queued. The dtfs-data heartbeat loop re-enqueues the
 drained corrupt ids when the ack is `accepted == false` (same as a
 transport error), so the retry actually happens.
+
+**CR-3-3 (MGR-1):** the `ReportChunkReads` intercept in
+`forward_client_write` (runs before Raft, applying directly to the
+LEADER's in-memory tiering engine) used to call `tiering.report_access`
+with a hardcoded `file_path=""` and `DiskTier::Hot` for every reported
+chunk. `path_to_volume.get("")` in `tiering::evaluate` is always `None`,
+so the CO-4-6 AV-cache-volume skip could never see it, and the legacy
+temperature path ran on every reported chunk regardless of its volume's
+cache policy — bypassing `promote_reads`/the operator-flush cooldown and,
+for chunks with zero total reads, misclassifying as Frozen and
+scheduling a doomed Tape migration every tick. The intercept now
+resolves the real `file_path` (`scheduler::files_referencing_chunk`) and
+the replica's real tier on `node_id` (`scheduler::live_replica_tier`,
+looked up via the file's chunk row for that node) through a pure
+`resolve_chunk_read_context(sm, chunk_id, node_id)`, skipping the report
+entirely when the chunk resolves to no known file. `tiering::evaluate`
+also gained its own defence: a new pure `legacy_path_should_skip(
+file_path, path_to_volume, av_cache_volumes)` skips a profile whose
+`file_path` doesn't resolve to any known file at all (as `""` never
+does), in addition to the existing CO-4-6 AV-volume skip.
+
+**CR-3-6 (MGR-7):** the heartbeat's integrity-fault-batch block
+(sibling to the `ReportChunkReads` handling above) had the same
+silent-forward-failure shape CO-3-7 fixed for `report_chunk_status`,
+just not yet fixed here: `let _ = raft_write_or_forward(QuarantineNode
+{..})` and the batched `RemoveCorruptChunkReplicas` forward were both
+fire-and-forget, and `HeartbeatResponse.accepted` was hardcoded `true`
+regardless. During an election (or any transient forward failure) the
+node ended up neither quarantined nor de-located, and the corrupt
+replica stayed advertised healthy until the next scrub cycle. Both
+writes now route through a pure `integrity_fault_batch_accepted(
+quarantine_ok, remove_corrupt_ok)`; either `Err` sets `accepted = false`,
+and the data node's heartbeat loop already re-enqueues its drained
+faults on that (Bug BF-5) — same retry contract as CO-3-7.
 
 ### `dtfs-manager/src/api.rs`
 

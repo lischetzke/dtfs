@@ -132,7 +132,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-3-7 | ✅ | CMN-5 | `crates/dtfs-common/src/types.rs` `AnchorPolicy::is_satisfied_by` ~494, `hash_ring.rs` ~255/282 | `eq_ignore_ascii_case` at the three sites. | types unit: `anchor "leli"` satisfied by `"LELI"`; ring test with mixed case. | Tests fail before, pass after. |
 | CR-3-8 | 🟥 | MGR-10 (optional, do if time) | `proto/data.proto` `ListChunksResponse`, `dtfs-data/src/server.rs` list_chunks, `scheduler.rs` orphan reap | Add positional `chunk_disk_ids`; key `expected_by_node` on `(node, disk)`; pass `Some(disk_id)` to the reap delete. Empty field → legacy node-wide. | scheduler unit: warm leftover + cold live row on one node → reaped on warm disk only. | Test passes; old-manager compat path covered. |
 | CR-3-9 | ✅ | — | `tests/release/cases/105-demote-refused-when-anchor-node-down.sh`, `106-legacy-tiering-skips-av-volume.sh` | Shell cases. | `bash -n` clean. | Present, unexecuted. |
-| CR-3-10 | ⬜ | — | `AGENTS.md` A.3.4, A.8 scheduler/tiering entries | Document liveness in planners, register_replica Result, per-index registration, budget in anchor-lag, case-insensitive DC. | — | Same commit. |
+| CR-3-10 | ✅ | — | `AGENTS.md` A.3.4, A.8 scheduler/tiering entries | Document liveness in planners, register_replica Result, per-index registration, budget in anchor-lag, case-insensitive DC. | — | Same commit. |
 
 ### Group 4 — Data-node durability (branch `bug/cr-4-data-durability`)
 
@@ -639,6 +639,17 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   landing in the poll window), not in `QUICK_CASES`. `bash -n` clean on
   both. NOT executed — no lab, per the plan's Build/verify environment
   section.
+
+- **CR-3-10** 2026-09-12. AGENTS.md A.3.4 gained one sentence on
+  liveness-gated planner survivors (CR-3-1/CR-3-2) and one on the
+  case-insensitive anchor-DC compare (CR-3-7); the A.8 scheduler.rs row
+  gained a summary sentence covering CR-3-1..3-6. `.claude/rules/
+  integrity.md`'s Mandatory-vs-cache-replicas section gained the
+  CR-3-1/CR-3-2 liveness-planner paragraph. `docs/src/internals/
+  invariants.md` gained the full narrative: a CR-3-1/CR-3-2 block under
+  § A.3.4, a CR-3-1..3-6 block under the `scheduler.rs` A.8 entry, and a
+  CR-3-3/CR-3-6 block under the `metadata.rs` A.8 entry. No code change;
+  docs-only commit.
 
 - **CR-2-8** 2026-09-12. Added one sentence each to AGENTS.md A.3.1
   (the `now_ms` convention for a `ClientRequest` field that lands in
