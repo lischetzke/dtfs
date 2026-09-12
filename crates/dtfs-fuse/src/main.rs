@@ -517,9 +517,15 @@ async fn run_readahead_pressure_ladder(
             continue;
         }
         let target = pressure_target_budget(level, controller.configured_budget());
-        // Pin the live budget first so no new prefetch can refill past the
-        // target while we are under pressure (Shed -> 0 stops prefetch
-        // entirely; spawn_prefetch skips once cache_bytes >= max_cache_bytes).
+        // H2 — pin `prefetch_enabled` BEFORE shrinking/dropping, so Shed's
+        // `drop_unconsumed()` below is not immediately undone by a read
+        // that lands between the drop and the next tick: `on_chunk_read`
+        // stops spawning new prefetch entirely at Shed. `shrink_to_bytes`
+        // alone only evicts already-stored bytes, it does not stop new
+        // spawns.
+        controller.set_prefetch_enabled(level != PressureLevel::Shed);
+        // Pin the live budget so no new prefetch can refill past the
+        // target while we are under pressure.
         let evicted = controller.shrink_to_bytes(target);
         if level == PressureLevel::Shed {
             // Also abort in-flight prefetch tasks — shrink_to_bytes only
@@ -531,6 +537,7 @@ async fn run_readahead_pressure_ladder(
             target_bytes = target,
             evicted,
             cache_bytes = controller.cache_bytes(),
+            prefetch_enabled = controller.prefetch_enabled(),
             "CF-5 memory pressure ladder adjusted readahead budget"
         );
         last_level = level;
