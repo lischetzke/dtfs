@@ -37,11 +37,11 @@ use crate::config::MemoryConfig;
 /// so a role defends its memory budget without rejecting requests until the
 /// very last rung:
 ///
-/// | Level    | RSS                  | Data action            | Manager action  | FUSE action                |
-/// |----------|----------------------|------------------------|-----------------|----------------------------|
-/// | Normal   | < warn_threshold     | Full ARC cache         | Run ticks       | Full readahead budget      |
-/// | Warn     | [warn, shed)         | Shrink ARC to 50%      | Skip ticks      | Half readahead budget      |
-/// | Shed     | >= shed_threshold    | Shrink ARC to 10%      | Skip ticks      | Drop unconsumed readahead  |
+/// | Level    | RSS                  | Data action            | Manager action        | FUSE action                |
+/// |----------|----------------------|------------------------|------------------------|-----------------------------|
+/// | Normal   | < warn_threshold     | Full ARC cache         | Run ticks              | Full readahead budget      |
+/// | Warn     | [warn, shed)         | Shrink ARC to 50%      | No action (run ticks) | Half readahead budget      |
+/// | Shed     | >= shed_threshold    | Shrink ARC to 10%      | Skip ticks (self-limiting via `MAX_CONSECUTIVE_PRESSURE_SKIPS`) | Drop unconsumed readahead  |
 ///
 /// Levels are stored as a `u8` in atomic memory so all observers see the
 /// same snapshot without locking. The current ordering MUST stay stable

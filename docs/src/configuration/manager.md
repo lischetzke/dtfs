@@ -310,17 +310,20 @@ down_after_missed = 6
 
 Optional block (CF-5). `hard_cap_mb = 0` (the default, and the behaviour when
 the block is absent) means unbounded -- no pressure ladder. When non-zero, a
-background sampler watches RSS and, once it reaches the warn level, the
-scheduler skips its background ticks (re-replication / migration / rebalance)
-so the manager gives RAM back instead of being OOM/cgroup-killed. systemd
-`MemoryHigh`/`MemoryMax` remain the hard backstop; on a composite host the sum
-of all roles' caps must stay under host RAM.
+background sampler watches RSS. Warn takes no manager action (only the data
+and FUSE roles react at Warn); once RSS reaches the Shed level, the scheduler
+skips its background ticks (re-replication / migration / rebalance) so the
+manager gives RAM back instead of being OOM/cgroup-killed -- self-limiting via
+`MAX_CONSECUTIVE_PRESSURE_SKIPS` (REV-3-5), which forces a tick periodically so
+mandatory-replica repair can't wedge indefinitely. systemd `MemoryHigh`/
+`MemoryMax` remain the hard backstop; on a composite host the sum of all
+roles' caps must stay under host RAM.
 
 | Option | TOML Path | Type | Default | Description |
 |--------|-----------|------|---------|-------------|
 | `hard_cap_mb` | `memory.hard_cap_mb` | `u64` | `0` | Total RAM budget for the manager process in MB. `0` disables the ladder. |
-| `warn_threshold_pct` | `memory.warn_threshold_pct` | `u8` | `80` | At/above this fraction of the cap the scheduler pauses background ticks until RSS recovers. |
-| `shed_threshold_pct` | `memory.shed_threshold_pct` | `u8` | `92` | Reserved for the higher rung; the manager has no request-shed today, so ticks stay paused. |
+| `warn_threshold_pct` | `memory.warn_threshold_pct` | `u8` | `80` | At/above this fraction of the cap the manager logs Warn but takes no scheduler action. |
+| `shed_threshold_pct` | `memory.shed_threshold_pct` | `u8` | `92` | At/above this fraction of the cap the scheduler pauses background ticks (self-limiting, see above) until RSS recovers. |
 | `sample_interval_secs` | `memory.sample_interval_secs` | `u64` | `5` | RSS sampling cadence. |
 
 CR-6-1: `dtfs-manager` calls `MemoryConfig::validate()` right after config
