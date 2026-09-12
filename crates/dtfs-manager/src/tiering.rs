@@ -835,9 +835,20 @@ impl TieringEngine {
             };
         }
 
-        // Walk every file's chunks, building TickChunk entries for
-        // chunks whose volume has a cache policy.
-        let mut chunks: Vec<TickChunk> = Vec::new();
+        // Walk every file's chunks, collecting the SM-derived inputs for
+        // each chunk whose volume has a cache policy. The per-DC read-window
+        // count is computed AFTER the SM lock is dropped (CR2-7-1 / MGR-3).
+        #[allow(clippy::type_complexity)]
+        let mut raw_chunks: Vec<(
+            String,
+            u64,
+            String,
+            String,
+            Vec<TickPlacement>,
+            u64,
+            u64,
+            u64,
+        )> = Vec::new();
         for (path, fm) in sm.files.iter() {
             let Some(policy) = volumes.get(&fm.volume_id) else {
                 continue;
@@ -884,40 +895,64 @@ impl TieringEngine {
                 }
                 let Some(chunk_id) = chunk_id_opt else { continue };
 
-                // Per-DC reads in the volume's promote_window_secs.
-                let mut reads_in_window_by_dc: HashMap<String, u32> = HashMap::new();
-                // Heuristic: query every DC that appears in nodes.
-                let unique_dcs: std::collections::HashSet<String> =
-                    id_to_dc.values().cloned().collect();
-                for dc in unique_dcs {
-                    let cnt = self
-                        .read_window_count(&chunk_id, &dc, now_ms,
-                                           policy.cache.promote_window_secs)
-                        .await;
-                    if cnt > 0 {
-                        reads_in_window_by_dc.insert(dc, cnt);
-                    }
-                }
-
                 let cooldown = fm
                     .cache_cooldown_until_ms
                     .get(&idx)
                     .copied()
                     .unwrap_or(0);
 
-                chunks.push(TickChunk {
+                // CR2-7-1 / MGR-3 — defer the per-DC read-window lookup
+                // (which takes `self.read_windows.write()`) until after the
+                // SM lock is dropped below; collect only the SM-derived
+                // inputs here, plus the promote_window_secs needed to
+                // compute the count later.
+                raw_chunks.push((
                     chunk_id,
-                    chunk_index: idx,
-                    file_path: path.clone(),
-                    volume_id: fm.volume_id.clone(),
+                    idx,
+                    path.clone(),
+                    fm.volume_id.clone(),
                     placements,
-                    cooldown_until_ms: cooldown,
-                    reads_in_window_by_dc,
-                    file_updated_at_ms: fm.updated_at_ms,
-                });
+                    cooldown,
+                    fm.updated_at_ms,
+                    policy.cache.promote_window_secs,
+                ));
             }
         }
         drop(sm);
+
+        // Heuristic: query every DC that appears in nodes. Computed once,
+        // outside the SM lock, and reused for every chunk below.
+        let unique_dcs: std::collections::HashSet<String> = id_to_dc.values().cloned().collect();
+
+        // CR2-7-1 / MGR-3 — take `read_windows` ONCE for the whole batch
+        // instead of once per (chunk, dc) while the SM read lock was held.
+        // A fair `RwLock` means every gRPC/REST reader of the SM would
+        // otherwise block behind this snapshot for its entire duration.
+        let mut chunks: Vec<TickChunk> = Vec::with_capacity(raw_chunks.len());
+        {
+            let mut windows = self.read_windows.write().await;
+            for (chunk_id, idx, path, volume_id, placements, cooldown, updated_at_ms, window_secs) in
+                raw_chunks
+            {
+                let reads_in_window_by_dc = window_counts_for_chunk(
+                    &chunk_id,
+                    &unique_dcs,
+                    now_ms,
+                    window_secs,
+                    &mut windows,
+                );
+                chunks.push(TickChunk {
+                    chunk_id,
+                    chunk_index: idx,
+                    file_path: path,
+                    volume_id,
+                    placements,
+                    cooldown_until_ms: cooldown,
+                    reads_in_window_by_dc,
+                    file_updated_at_ms: updated_at_ms,
+                });
+            }
+        }
 
         TickSnapshot { chunks, nodes: node_views, volumes }
     }
@@ -1248,6 +1283,32 @@ pub(crate) fn apply_heartbeat_reads(
             ring.drain(0..drop_n);
         }
     }
+}
+
+/// CR2-7-1 / MGR-3 — pure kernel: compute `reads_in_window_by_dc` for one
+/// chunk against every DC in `dcs`, pruning each visited ring in place.
+/// Extracted so `build_av_cache_snapshot` can take `read_windows.write()`
+/// ONCE for a whole batch of chunks after dropping the SM read lock,
+/// instead of once per (chunk, dc) pair while still holding it.
+pub(crate) fn window_counts_for_chunk(
+    chunk_id: &str,
+    dcs: &std::collections::HashSet<String>,
+    now_ms: u64,
+    window_secs: u64,
+    windows: &mut HashMap<(String, String), Vec<ReadSample>>,
+) -> HashMap<String, u32> {
+    let mut out = HashMap::new();
+    for dc in dcs {
+        let key = (chunk_id.to_string(), dc.clone());
+        if let Some(ring) = windows.get_mut(&key) {
+            prune_read_window(ring, now_ms, window_secs);
+            let cnt = count_reads_in_window(ring, now_ms, window_secs);
+            if cnt > 0 {
+                out.insert(dc.clone(), cnt);
+            }
+        }
+    }
+    out
 }
 
 /// AV-2-1 housekeeping helper — drop samples older than the window.
@@ -2186,6 +2247,50 @@ mod bug_av_read_window_tests {
         let mut empty: Vec<ReadSample> = Vec::new();
         prune_read_window(&mut empty, 1_000_000, 60);
         assert!(empty.is_empty());
+    }
+
+    /// CR2-7-1 / MGR-3 — `window_counts_for_chunk` computes the same
+    /// per-DC counts as the old per-(chunk, dc) `read_window_count` calls,
+    /// over a prebuilt read-window map, with a single lock acquisition
+    /// modelled by the `&mut HashMap` argument.
+    #[test]
+    fn cr2_7_1_window_counts_for_chunk_matches_per_dc_lookup() {
+        fn reads(dc: &str, n: u32) -> HashMap<String, u32> {
+            let mut m = HashMap::new();
+            m.insert(dc.to_string(), n);
+            m
+        }
+        let now = 1_000_000;
+        let mut windows: HashMap<(String, String), Vec<ReadSample>> = HashMap::new();
+        apply_heartbeat_reads("c1", &reads("dc-a", 5), now, &mut windows);
+        apply_heartbeat_reads("c1", &reads("dc-b", 2), now, &mut windows);
+        // dc-c never reported reads for this chunk.
+        let dcs: std::collections::HashSet<String> =
+            ["dc-a".to_string(), "dc-b".to_string(), "dc-c".to_string()]
+                .into_iter()
+                .collect();
+
+        let out = window_counts_for_chunk("c1", &dcs, now, 60, &mut windows);
+
+        assert_eq!(out.get("dc-a"), Some(&5));
+        assert_eq!(out.get("dc-b"), Some(&2));
+        assert!(!out.contains_key("dc-c"), "zero-count DC must be absent");
+    }
+
+    /// CR2-7-1 / MGR-3 — a sample outside the window is pruned in place
+    /// by `window_counts_for_chunk`, same as the old per-call path.
+    #[test]
+    fn cr2_7_1_window_counts_for_chunk_prunes_stale_samples() {
+        let now = 1_000_000;
+        let mut windows: HashMap<(String, String), Vec<ReadSample>> = HashMap::new();
+        windows.insert(("c1".into(), "dc-a".into()), vec![s(1, 9), s(now, 3)]);
+        let dcs: std::collections::HashSet<String> = ["dc-a".to_string()].into_iter().collect();
+
+        let out = window_counts_for_chunk("c1", &dcs, now, 60, &mut windows);
+
+        assert_eq!(out.get("dc-a"), Some(&3), "the ts=1 sample is outside the 60s window");
+        let ring = windows.get(&("c1".to_string(), "dc-a".to_string())).unwrap();
+        assert_eq!(ring.len(), 1, "prune must remove the stale sample from the map");
     }
 
     /// AV-2-1 test 4 — unsorted input is handled correctly. The
