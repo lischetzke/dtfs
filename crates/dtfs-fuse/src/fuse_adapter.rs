@@ -656,9 +656,12 @@ impl Filesystem for DtfsFuse3Adapter {
                     generation: 0,
                 })
             }
+            // CR-1-6 (FUSE-4/CO-4-16): route through cluster_err_to_errno,
+            // never a bare EIO/ENOENT — a manager blip during a mkdir must
+            // not be misreported.
             Err(e) => {
                 warn!("fuse3 mkdir {}: {}", path, e);
-                Err(Errno::from(libc::EIO))
+                Err(cluster_err_to_errno(&e))
             }
         }
     }
@@ -684,9 +687,12 @@ impl Filesystem for DtfsFuse3Adapter {
                 }
                 Ok(())
             }
+            // CR-1-6 (FUSE-4/CO-4-16): a transient manager error must map
+            // to EIO, not ENOENT — `cluster_err_to_errno` makes ENOENT
+            // conditional on a genuine NotFound.
             Err(e) => {
                 warn!("fuse3 unlink {}: {}", path, e);
-                Err(Errno::from(libc::EIO))
+                Err(cluster_err_to_errno(&e))
             }
         }
     }
@@ -704,9 +710,10 @@ impl Filesystem for DtfsFuse3Adapter {
                 self.inodes.remove(&path);
                 Ok(())
             }
+            // CR-1-6 (FUSE-4/CO-4-16): same rationale as unlink above.
             Err(e) => {
                 warn!("fuse3 rmdir {}: {}", path, e);
-                Err(Errno::from(libc::EIO))
+                Err(cluster_err_to_errno(&e))
             }
         }
     }
@@ -743,8 +750,10 @@ impl Filesystem for DtfsFuse3Adapter {
                 // see the actual manager-side reject (e.g. Raft proposal
                 // failure, no eligible data node, etc.) instead of just
                 // "create_file failed".
+                // CR-1-6 (FUSE-4/CO-4-16): route the generic case through
+                // cluster_err_to_errno too.
                 warn!("fuse3 create {}: {:#}", path, e);
-                Err(Errno::from(libc::EIO))
+                Err(cluster_err_to_errno(&e))
             }
         }
     }
@@ -790,11 +799,14 @@ impl Filesystem for DtfsFuse3Adapter {
         let path = self.inodes.path_for(inode)?;
         debug!("fuse3:readdir {} (ino={}, offset={})", path, inode, offset);
 
+        // CR-1-6 (FUSE-4/CO-4-16): a manager blip during a Plex library
+        // scan must not read as "directory does not exist" — only a
+        // genuine NotFound may map to ENOENT.
         let entries = self
             .fs
             .readdir(&path)
             .await
-            .map_err(|_| Errno::from(libc::ENOENT))?;
+            .map_err(|e| cluster_err_to_errno(&e))?;
 
         // Cookie scheme — Bug F fix:
         //
@@ -862,11 +874,12 @@ impl Filesystem for DtfsFuse3Adapter {
     ) -> FuseResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>> {
         let path = self.inodes.path_for(inode)?;
         debug!("fuse3:readdirplus {} (ino={}, offset={})", path, inode, offset);
+        // CR-1-6 (FUSE-4/CO-4-16): same rationale as readdir above.
         let entries = self
             .fs
             .readdir(&path)
             .await
-            .map_err(|_| Errno::from(libc::ENOENT))?;
+            .map_err(|e| cluster_err_to_errno(&e))?;
 
         let mut items: Vec<FuseResult<DirectoryEntryPlus>> = Vec::new();
         // Defensive dedup by name (see F-027 comment in readdir above).
@@ -1028,9 +1041,10 @@ impl Filesystem for DtfsFuse3Adapter {
                 }
                 Ok(())
             }
+            // CR-1-6 (FUSE-4/CO-4-16): route through cluster_err_to_errno.
             Err(e) => {
                 warn!("fuse3 rename {} -> {}: {}", from, to, e);
-                Err(Errno::from(libc::EIO))
+                Err(cluster_err_to_errno(&e))
             }
         }
     }
@@ -1073,9 +1087,10 @@ impl Filesystem for DtfsFuse3Adapter {
                     generation: 0,
                 })
             }
+            // CR-1-6 (FUSE-4/CO-4-16): route through cluster_err_to_errno.
             Err(e) => {
                 warn!("fuse3 symlink {}: {}", path, e);
-                Err(Errno::from(libc::EIO))
+                Err(cluster_err_to_errno(&e))
             }
         }
     }
@@ -1118,9 +1133,10 @@ impl Filesystem for DtfsFuse3Adapter {
                     generation: 0,
                 })
             }
+            // CR-1-6 (FUSE-4/CO-4-16): route through cluster_err_to_errno.
             Err(e) => {
                 warn!("fuse3 link {} -> {}: {}", src, dst, e);
-                Err(Errno::from(libc::EIO))
+                Err(cluster_err_to_errno(&e))
             }
         }
     }
@@ -1245,6 +1261,21 @@ mod fuse_readdir_regression {
                 "cookie scheme must remain `idx + 1` for both readdir and \
                  readdirplus — see Bug F in SOAK-RECOVERY-2026-05-18.md");
         }
+    }
+
+    // CR-1-6 (FUSE-4) — readdir/readdirplus now map their manager error
+    // through `cluster_err_to_errno` instead of a bare `|_| ENOENT`. There
+    // is no fuse3 test harness to drive the trait methods themselves (see
+    // the comment above), so this locks the mapping function they now both
+    // call: a transient `Unavailable` (manager blip during a Plex library
+    // scan) must surface as EIO, never ENOENT — the old code reported
+    // "directory does not exist" for ANY error, including this one.
+    #[test]
+    fn cr_1_6_transient_manager_error_is_not_enoent() {
+        let transient = anyhow::Error::new(tonic::Status::unavailable("manager unreachable"))
+            .context("readdir failed for /movies");
+        assert_eq!(cluster_err_to_errno(&transient), Errno::from(libc::EIO));
+        assert_ne!(cluster_err_to_errno(&transient), Errno::from(libc::ENOENT));
     }
 }
 
