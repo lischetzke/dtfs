@@ -1179,6 +1179,7 @@ fn apply_request(
         }
 
         ClientRequest::RegisterNode { node_id, info } => {
+            use dtfs_common::types::HealthStatus;
             // Bug BJ — audit only on a NEW node or a materially-changed
             // re-registration. node_id is deterministic
             // (node_id_from_hostname), so a re-register reuses the id and
@@ -1186,13 +1187,45 @@ fn apply_request(
             // unconditionally spammed the feed and evicted real events
             // against the MAX_AUDIT_LOG_ENTRIES cap. Still refresh
             // sm.nodes so last_seen_ms / usage update.
+            //
+            // RAFT-1 — the sole producer of RegisterNode (metadata.rs) always
+            // builds `health: Healthy, quarantine: None`, so a re-register
+            // (every process restart) wiped a Quarantined/Maintenance/
+            // Draining node back to Healthy, bypassing BF-6 (only
+            // UnquarantineNode may clear Quarantined) and re-entering the
+            // node into read/allocate/replication pools with its integrity
+            // fault unresolved. Carry the sticky state forward from `prior`
+            // before inserting.
+            let prior_state = sm.nodes.get(node_id).cloned();
+            let mut info = info.clone();
+            let mut sticky_state: Option<&'static str> = None;
+            if let Some(p) = &prior_state {
+                if p.quarantine.is_some() {
+                    info.quarantine = p.quarantine.clone();
+                    info.health = HealthStatus::Quarantined;
+                    sticky_state = Some("Quarantined");
+                } else if matches!(p.health, HealthStatus::Maintenance | HealthStatus::Draining) {
+                    info.health = p.health.clone();
+                    sticky_state = Some(if p.health == HealthStatus::Maintenance {
+                        "Maintenance"
+                    } else {
+                        "Draining"
+                    });
+                }
+            }
             let prior = sm.nodes.insert(*node_id, info.clone());
             let materially_changed = match &prior {
                 None => true,
-                Some(old) => !node_info_material_eq(old, info),
+                Some(old) => !node_info_material_eq(old, &info),
             };
             if materially_changed {
                 push_audit_capped(&mut sm.audit_log, audit(format!("RegisterNode: {node_id}")));
+            }
+            if let Some(state) = sticky_state {
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit(format!("RegisterNode: {node_id} (sticky state preserved: {state})")),
+                );
             }
             ClientResponse::Success
         }
@@ -3852,6 +3885,83 @@ mod posix_path_regression {
             2,
             "a materially-changed re-register (version) must add exactly one row"
         );
+    }
+
+    // ── RAFT-1 — RegisterNode must carry forward sticky Quarantined/
+    // Maintenance/Draining state instead of resetting to Healthy ─────
+
+    #[test]
+    fn raft_1_reregister_keeps_quarantined() {
+        use dtfs_common::types::{HealthStatus, QuarantineReason};
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::QuarantineNode {
+                node_id: 7,
+                info: mk_quarantine_info(QuarantineReason::DeepScrubHashMismatch),
+            },
+        );
+        assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Quarantined);
+
+        // Re-register (e.g. process restart) with the producer's
+        // unconditional health: Healthy, quarantine: None.
+        apply_request(
+            &mut sm,
+            &mk_log_id(3),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        let node = sm.nodes.get(&7).expect("node still registered");
+        assert_eq!(node.health, HealthStatus::Quarantined,
+            "re-register must not clear Quarantined");
+        assert!(node.quarantine.is_some(),
+            "QuarantineInfo must survive re-register");
+    }
+
+    #[test]
+    fn raft_1_reregister_keeps_maintenance() {
+        use dtfs_common::types::HealthStatus;
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::UpdateNodeStatus { node_id: 7, status: "maintenance".into() },
+        );
+        assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Maintenance);
+        apply_request(
+            &mut sm,
+            &mk_log_id(3),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Maintenance,
+            "re-register must not clear Maintenance");
+    }
+
+    #[test]
+    fn raft_1_reregister_healthy_stays_healthy() {
+        use dtfs_common::types::HealthStatus;
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Healthy);
     }
 
     // Bug BR-1 — managers now self-register (role="manager") to publish

@@ -110,7 +110,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR-2-1 | ⬜ | RAFT-1 | `crates/dtfs-raft/src/state_machine.rs` `RegisterNode` arm ~1189 | Carry forward from `prior`: if `prior.quarantine.is_some()` → `info.quarantine = prior.quarantine.clone(); info.health = Quarantined`; if `prior.health ∈ {Maintenance, Draining}` → keep `prior.health`. Audit `RegisterNode: <id> (sticky state preserved: <state>)` when it fires. | SM unit (`posix_path_regression` or new `sticky_state_tests`): quarantine node → RegisterNode → still Quarantined with same `QuarantineInfo`; Maintenance → RegisterNode → still Maintenance; Healthy → RegisterNode → Healthy. | Tests fail before, pass after. |
+| CR-2-1 | ✅ | RAFT-1 | `crates/dtfs-raft/src/state_machine.rs` `RegisterNode` arm ~1189 | Carry forward from `prior`: if `prior.quarantine.is_some()` → `info.quarantine = prior.quarantine.clone(); info.health = Quarantined`; if `prior.health ∈ {Maintenance, Draining}` → keep `prior.health`. Audit `RegisterNode: <id> (sticky state preserved: <state>)` when it fires. | SM unit (`posix_path_regression` or new `sticky_state_tests`): quarantine node → RegisterNode → still Quarantined with same `QuarantineInfo`; Maintenance → RegisterNode → still Maintenance; Healthy → RegisterNode → Healthy. | Tests fail before, pass after. |
 | CR-2-2 | ⬜ | RAFT-2 | `state_machine.rs` `RenameFile` arm ~1466 | After moving `from` (or when `from` has no exact key but `files.range("{from}/"..)` has children → synthetic dir, success), re-key every child `k` with `k.starts_with("{from}/")` to `to + &k[from.len()..]`, updating `meta.path`; move matching `write_leases` and `posix_locks` too. Refuse (`Error`) when `to` exists as a directory with children. Collect keys first, then mutate (BTreeMap). | SM unit: (a) mkdir /a, create /a/x, /a/b/y; rename /a→/c → /c/x, /c/b/y exist, /a/* gone, `meta.path` updated; (b) synthetic dir rename works; (c) rename onto non-empty dir → Error; (d) lease on /a/x follows to /c/x. | Tests fail before, pass after. |
 | CR-2-3 | ⬜ | RAFT-3 | `state_machine.rs` `UpdateChunkLocations` arm ~1122, `SetFileSize` arm ~1508 | After merge: `extent = chunks.iter().map(|c| c.chunk_index*chunk_size + c.size_bytes).max()`; `file.logical_size = file.logical_size.map(|l| l.max(extent))` (None stays None — derived). Delete dead code at ~1516 (`|| *new_size == 0 && false`, `.saturating_sub(0)`). | SM unit: create, commit 1 chunk (4 MB), SetFileSize(0), commit chunk → `logical_size == Some(4 MB)`; SetFileSize(6 MB) then commit chunk idx 0 → stays 6 MB (sparse-grow preserved). | Tests fail before, pass after. |
 | CR-2-4 | ⬜ | RAFT-7 | `state_machine.rs` `DeleteFile` arm ~1051; `crates/dtfs-fuse/src/fuse_adapter.rs` rmdir | `DeleteFile`: also `write_leases.remove(path)`, `posix_locks.remove(path)`; if `files.range("{path}/"..)` has a child → `Error("directory not empty")`. FUSE rmdir maps that error to ENOTEMPTY (extend `cluster_err_to_errno` or match the message via a dedicated gRPC code `FailedPrecondition`). | SM unit: delete with live lease → lease gone; delete dir with child → Error, child intact. | Tests fail before, pass after. |
@@ -366,3 +366,14 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   the chunk genuinely doesn't exist yet (legitimate) vs. the snapshot
   being stale (needs the guard), so the decision is deferred to
   `segments_committable()` at commit time, per the review note.
+
+- **CR-2-1** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-raft --release`: 88 -> 91 passed (3 new:
+  `raft_1_reregister_keeps_quarantined`, `raft_1_reregister_keeps_maintenance`,
+  `raft_1_reregister_healthy_stays_healthy`), 0 failed. `RegisterNode`'s apply
+  now reads `prior = sm.nodes.get(node_id)` before inserting and carries
+  `quarantine`/`Quarantined` or `Maintenance`/`Draining` forward onto the
+  incoming `info` before it overwrites `sm.nodes`; `node_info_material_eq`
+  already excludes health/quarantine so audit dedup is unaffected. Emits an
+  extra `RegisterNode: <id> (sticky state preserved: <state>)` audit row
+  when carry-forward fires.
