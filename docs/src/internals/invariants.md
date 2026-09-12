@@ -80,6 +80,54 @@ detail not in that copy:
   A row that is itself dead can always be removed — it wasn't serving
   anything.
 
+## A.6 — Data-node durability hardening (CR-4)
+
+Four related fixes to `dtfs-data/src/store.rs`'s commit/delete/scrub
+paths, landed together because each one closes a window the others'
+tests would otherwise exercise against half-fixed code.
+
+- **CR-4-1 (DATA-1) quarantine by rename, scrub-repairs-forward.**
+  `quarantine_chunk_on_disk` used to `remove_file` the `.dat` outright;
+  it now renames it to `.dtfs/quarantine/<id>.dat.bad` (overwriting a
+  stale one from an earlier quarantine of the same id), so a genuinely
+  corrupt chunk's bytes survive for forensics instead of being
+  destroyed. Separately, `scrub_disk`'s `meta_read` / `meta_parse` /
+  missing-`.meta` branches no longer jump straight to
+  `corrupt_chunk_ids`: they first re-hash the already-stat'd `.dat`
+  (`try_repair_meta_from_dat`) and, on a match against the id encoded in
+  the filename, rewrite `.meta` via `write_meta_atomic` and count the
+  chunk healthy (`ScrubResult.chunks_meta_repaired`) instead of
+  quarantining a chunk whose bytes were never actually wrong — only a
+  digest mismatch or an unreadable `.dat` still quarantines.
+- **CR-4-2 (DATA-2) atomic `.meta` write.** `commit_chunk_from_tmp_inner`
+  used to `File::create` the `.meta` directly at its final path; a crash
+  mid-write left a torn (partial/0-byte) sidecar right where readers
+  look for it. `write_meta_atomic` writes to this disk's `tmp/` dir,
+  `sync_all`s, renames over the final path, and fsyncs the destination
+  directory, so the final path only ever holds a complete `.meta` or
+  none. `recover_from_wal`'s `PutChunk` arm treats a present-but-
+  unparseable `.meta` exactly like a missing one (CO-1-4b) and rolls the
+  half-committed chunk back.
+- **CR-4-3 (DATA-4) post-rename cleanup.** Once `commit_chunk_from_tmp_
+  inner` has renamed the tmp `.dat` into place, any LATER failure (most
+  likely the `.meta` write) is cleaned up by `cleanup_after_dat_
+  committed`: it removes the `.dat`, the `.meta` (if any), and the WAL
+  entry before returning the error, so a `.dat` never survives without
+  its `.meta` companion.
+- **CR-4-4 (DATA-3) per-chunk lock + op-keyed WAL.** `ChunkStore` now
+  holds 256 striped `tokio::sync::Mutex<()>` (indexed by the chunk id's
+  first byte, in-memory only — a fresh process starts every stripe
+  unlocked, which is fine because the WAL is what makes recovery correct
+  across a restart, not the lock). `commit_chunk_from_tmp_inner` and
+  `delete_chunk_idempotent_on_disk` each hold their chunk's stripe for
+  the whole operation, so a same-id put and delete can never interleave
+  into a torn state. The WAL filename also moved from the single
+  `<id>.wal.json` to op-keyed `<id>.put.wal.json` / `<id>.delete.wal.
+  json`, so a put and a delete never contend over (and clobber) one WAL
+  file; `recover_from_wal` matches on the `.json` extension and reads the
+  operation out of the JSON body, so it keeps replaying the legacy
+  `<id>.wal.json` name unchanged.
+
 ## A.3.5 — Build-date / version stamp mechanism (Bug BS, AZ-5)
 
 `dtfs-common/build.rs` emits `DTFS_BUILD_DATE` from `SOURCE_DATE_EPOCH`
