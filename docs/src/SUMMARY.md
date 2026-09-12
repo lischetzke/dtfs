@@ -74,3 +74,7 @@
 - [Building from Source](./development/building.md)
 - [Testing](./development/testing.md)
 - [Contributing](./development/contributing.md)
+
+# Internals
+
+- [Invariants & Bug Archaeology](./internals/invariants.md)
