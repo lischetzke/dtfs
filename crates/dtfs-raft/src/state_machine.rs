@@ -1465,11 +1465,17 @@ fn apply_request(
                     ),
                 };
             }
+            // RAFT-8 — the CAS check above only pins the EXPECTED base
+            // version; the stored `version` came straight from the wire, so
+            // a buggy/malicious proposer could regress it (e.g. resubmit an
+            // old value) even though the base matched. The apply is the
+            // sole authority: it always derives the new version itself.
+            let new_version = sm.cluster_config.version + 1;
             sm.cluster_config = ClusterConfig {
                 config_json: config_json.clone(),
-                version: *version,
+                version: new_version,
             };
-            push_audit_capped(&mut sm.audit_log, audit(format!("UpdateConfig: v{version}")));
+            push_audit_capped(&mut sm.audit_log, audit(format!("UpdateConfig: v{new_version}")));
             ClientResponse::Success
         }
 
@@ -1497,6 +1503,13 @@ fn apply_request(
             chunks_missing,
             duration_secs,
         } => {
+            // RAFT-9 — serde_json serialises NaN/inf as `null`, which then
+            // fails to deserialise as f64 on the very next snapshot load
+            // (every `install_snapshot` fails, discarding the whole
+            // snapshot -> RAFT-6). The RPC is CLI/REST-injectable, so clamp
+            // any non-finite value at the apply boundary rather than trust
+            // the reporter (the real data node always sends finite values).
+            let duration_secs = if duration_secs.is_finite() { *duration_secs } else { 0.0 };
             let record = ScrubRecord {
                 node_id: *node_id,
                 disk_path: disk_path.clone(),
@@ -1506,7 +1519,7 @@ fn apply_request(
                 chunks_healthy: *chunks_healthy,
                 chunks_corrupt: *chunks_corrupt,
                 chunks_missing: *chunks_missing,
-                duration_secs: *duration_secs,
+                duration_secs,
             };
             // BK — store per (node, level) so a deep scrub does not
             // overwrite the quick result (and vice versa). The legacy
@@ -4739,6 +4752,48 @@ mod posix_path_regression {
         assert!(sm.files.contains_key("/a"), "dir survives refusal");
         assert!(sm.files.contains_key("/a/x"), "child survives refusal");
     }
+
+    // ── RAFT-8 — UpdateConfig must always derive its own version, never
+    // trust the wire value ──────────────────────────────────────────
+
+    #[test]
+    fn raft_8_update_config_version_always_current_plus_one() {
+        let mut sm = StateMachineData::default();
+        sm.cluster_config = ClusterConfig { config_json: "{}".into(), version: 5 };
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::UpdateConfig {
+            config_json: "{\"a\":1}".into(),
+            version: 1, // stale/regressive wire value
+            expected_version: 5,
+        });
+        assert_eq!(sm.cluster_config.version, 6,
+            "apply must derive version = current + 1, ignoring the wire value");
+    }
+
+    // ── RAFT-9 — a non-finite duration_secs must never reach the SM, or
+    // the next snapshot fails to deserialize and gets discarded ────────
+
+    #[test]
+    fn raft_9_non_finite_duration_is_clamped_to_zero() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::ReportScrubResult {
+            node_id: 7,
+            disk_path: "/data".into(),
+            level: "quick".into(),
+            completed_at_ms: 1_000,
+            chunks_checked: 10,
+            chunks_healthy: 10,
+            chunks_corrupt: 0,
+            chunks_missing: 0,
+            duration_secs: f64::NAN,
+        });
+        let rec = sm.scrub_results.get(&7).expect("scrub result stored");
+        assert_eq!(rec.duration_secs, 0.0, "NaN must be clamped to 0.0");
+        // Round-trip through the same JSON encoding a snapshot would use.
+        let json = serde_json::to_vec(&sm).expect("serialize");
+        let restored: StateMachineData =
+            serde_json::from_slice(&json).expect("must deserialize without a non-finite f64");
+        assert_eq!(restored.scrub_results.get(&7).unwrap().duration_secs, 0.0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5182,7 +5237,12 @@ mod audit_co_tests {
             matches!(resp, ClientResponse::Success),
             "legacy entry must apply without a CAS check, got {resp:?}",
         );
-        assert_eq!(sm.cluster_config.version, 7);
+        // RAFT-8 — the apply now ALWAYS derives version = current + 1 and
+        // ignores the wire value (previously stored verbatim), closing a
+        // version-regression hole a buggy/malicious proposer could hit even
+        // when the CAS base matched. The legacy wire value of 7 here is
+        // deliberately stale/irrelevant post-fix.
+        assert_eq!(sm.cluster_config.version, 5);
     }
 
     // CO-5-10 — the version-0 boundary: two writes racing off a fresh
