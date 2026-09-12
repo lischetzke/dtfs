@@ -144,6 +144,12 @@ pub struct TaskScheduler {
     migration_state_lock: tokio::sync::Mutex<()>,
     /// LIS-19 — cluster shared secret for DeleteChunk auth stamps.
     shared_secret: parking_lot::RwLock<String>,
+    /// CR-3-5/MGR-5 — placement capacity policy, so the under-replication
+    /// backfill and anchor-lag repair only target a disk with room
+    /// (`has_room`), not just one of the right tier. Defaults to
+    /// `PlacementConfig::default()`; `set_placement_cfg` (main.rs) wires
+    /// the operator's `[placement]` config after construction.
+    placement_cfg: dtfs_common::config::PlacementConfig,
 }
 
 impl TaskScheduler {
@@ -155,6 +161,7 @@ impl TaskScheduler {
         done_task_retention_secs: u64,
         failed_task_retention_secs: u64,
         tls: dtfs_common::tls::TlsContext,
+        placement_cfg: dtfs_common::config::PlacementConfig,
     ) -> Self {
         Self {
             raft,
@@ -169,6 +176,7 @@ impl TaskScheduler {
             tls,
             migration_state_lock: tokio::sync::Mutex::new(()),
             shared_secret: parking_lot::RwLock::new(String::new()),
+            placement_cfg,
         }
     }
 
@@ -406,12 +414,14 @@ impl TaskScheduler {
         let _ms_guard = self.migration_state_lock.lock().await;
         let mut state = self.load_migration_state().await;
 
-        // Avoid duplicate tasks for the same chunk + target.
+        // Avoid duplicate tasks for the same chunk + target. CR-3-5/MGR-5
+        // — `task_blocks_requeue` so a lingering Failed task (within its
+        // retention window) also blocks an immediate re-schedule here,
+        // matching `check_under_replicated`'s dedup.
         let already_scheduled = state.tasks.values().any(|t| {
             t.chunk_id == chunk_id
                 && t.target_node == target_node
-                && t.status != MigrationStatus::Done
-                && t.status != MigrationStatus::Failed
+                && task_blocks_requeue(t.status)
         });
 
         if already_scheduled {
@@ -488,10 +498,16 @@ impl TaskScheduler {
         // candidate, i.e. quadratic in exactly the situation that produced the
         // backlog. `created` tracks what this pass adds.
         let mut created: usize = 0;
+        // CR-3-5/MGR-5 — `task_blocks_requeue` (not a bespoke `!= Done &&
+        // != Failed`) so a Failed task's retention window also blocks an
+        // immediate re-queue here: pre-fix, a deterministically-failing
+        // chunk (e.g. its only source replica sits on a Failed disk) got
+        // a fresh task every 30s tick forever, growing an unbounded Failed
+        // backlog for the same chunk.
         let mut live_index: std::collections::HashSet<(String, u64, DiskTier)> = migration_state
             .tasks
             .values()
-            .filter(|t| t.status != MigrationStatus::Done && t.status != MigrationStatus::Failed)
+            .filter(|t| task_blocks_requeue(t.status))
             .map(|t| (t.chunk_id.clone(), t.target_node, t.tier))
             .collect();
         let mut live_tasks = live_index.len();
@@ -501,18 +517,22 @@ impl TaskScheduler {
         // disks, but relying on the empty tier list alone is fragile),
         // and a Failed/Removed disk no longer advertises its tier as a
         // placement target.
-        let healthy_nodes: Vec<(u64, Vec<DiskTier>)> = sm
+        // CR-3-5/MGR-5 — carry each live disk's capacity so the target
+        // pick below can also require `placement_cfg.has_room`; a
+        // healthy node whose disk of the mandated tier is already full
+        // is not a valid backfill target either.
+        let healthy_nodes: Vec<(u64, Vec<(DiskTier, bool)>)> = sm
             .nodes
             .iter()
             .filter(|(_, info)| {
                 info.role == NodeRole::Data && info.health == HealthStatus::Healthy
             })
             .map(|(id, info)| {
-                let tiers: Vec<DiskTier> = info
+                let tiers: Vec<(DiskTier, bool)> = info
                     .disks
                     .iter()
                     .filter(|d| !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed))
-                    .map(|d| d.tier)
+                    .map(|d| (d.tier, self.placement_cfg.has_room(d.total_bytes, d.used_bytes)))
                     .collect();
                 (*id, tiers)
             })
@@ -564,23 +584,14 @@ impl TaskScheduler {
                     Some(e) => e.chunk_hash.clone(),
                     None => continue,
                 };
-                let existing_nodes: Vec<u64> =
-                    entries.iter().filter_map(|e| e.node_id.parse().ok()).collect();
-
-                // Healthy source = any existing replica on a healthy node.
-                let source_node_id: u64 = existing_nodes
-                    .iter()
-                    .copied()
-                    .find(|nid| {
-                        sm.nodes
-                            .get(nid)
-                            .map(|n| n.health == HealthStatus::Healthy)
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(0);
-                if source_node_id == 0 {
-                    continue; // no healthy source to copy from
-                }
+                // CR-3-5/MGR-5 — the source must be LIVE (`live_replica_tier`,
+                // node not Down/Failed AND its specific disk not Failed/
+                // Removed), not merely "some row parses and the node
+                // happens to be healthy": a copy sitting on a Failed disk
+                // of an otherwise-healthy node is not actually readable.
+                let Some(source_node_id) = pick_live_source(entries, &sm.nodes) else {
+                    continue; // no live source to copy from
+                };
 
                 // Schedule a copy for every mandated tier that is short.
                 for (tier, _deficit) in under_replicated_tiers(count_on, &mandatory) {
@@ -594,9 +605,7 @@ impl TaskScheduler {
                         .filter_map(|e| e.node_id.parse().ok())
                         .collect();
 
-                    let Some((target, _)) = healthy_nodes
-                        .iter()
-                        .find(|(id, tiers)| !tier_holders.contains(id) && tiers.contains(&tier))
+                    let Some(target) = pick_backfill_target(&healthy_nodes, tier, &tier_holders)
                     else {
                         continue;
                     };
@@ -605,7 +614,7 @@ impl TaskScheduler {
                     // This used to be a full scan of every task for every
                     // candidate, so a large backlog made the pass quadratic in
                     // exactly the situation that produced the backlog.
-                    if live_index.contains(&(chunk_hash.clone(), *target, tier)) {
+                    if live_index.contains(&(chunk_hash.clone(), target, tier)) {
                         continue;
                     }
 
@@ -632,7 +641,7 @@ impl TaskScheduler {
                         task_id: task_id.clone(),
                         chunk_id: chunk_hash.clone(),
                         source_node: source_node_id,
-                        target_node: *target,
+                        target_node: target,
                         tier,
                         status: MigrationStatus::Pending,
                         created_at_ms: now_ms,
@@ -644,12 +653,12 @@ impl TaskScheduler {
                         task_id = %task_id,
                         chunk = %chunk_hash,
                         source = source_node_id,
-                        target = *target,
+                        target = target,
                         tier = ?tier,
                         "Bug BX-4 auto-scheduled re-replication for a short mandated tier"
                     );
                     migration_state.tasks.insert(task_id, task);
-                    live_index.insert((chunk_hash.clone(), *target, tier));
+                    live_index.insert((chunk_hash.clone(), target, tier));
                     created += 1;
                     live_tasks += 1;
                 }
@@ -887,13 +896,23 @@ impl TaskScheduler {
         // (30 min default, Bug AE prune); only after GC does check_anchor_lag
         // schedule a fresh attempt. Previously Failed was excluded here, so
         // the same chunk was re-queued every tick → tight loop + audit spam.
-        let existing_tasks: std::collections::HashSet<(String, u64)> =
+        let mut existing_tasks: std::collections::HashSet<(String, u64)> =
             migration_state
                 .tasks
                 .values()
                 .filter(|t| task_blocks_requeue(t.status))
                 .map(|t| (t.chunk_id.clone(), t.target_node))
                 .collect();
+
+        // CR-3-5/MGR-6 — this pass must obey the same REV-3-4 per-tick
+        // budget as `check_under_replicated`; pre-fix it created one task
+        // per un-anchored chunk with NO bound at all.
+        let mut created: usize = 0;
+        let mut live_tasks: usize = migration_state
+            .tasks
+            .values()
+            .filter(|t| task_blocks_requeue(t.status))
+            .count();
 
         // Walk every file and run the per-chunk planner.
         for (file_path, file_meta) in &sm.files {
@@ -947,6 +966,20 @@ impl TaskScheduler {
                     &chunk_id,
                     &existing_tasks,
                 ) {
+                    // CR-3-5/MGR-6 — same per-tick budget as
+                    // `check_under_replicated`; the scan is idempotent so
+                    // whatever's left resumes next tick.
+                    if !task_budget_available(created, live_tasks) {
+                        warn!(
+                            created,
+                            live_tasks,
+                            max_new = MAX_NEW_TASKS_PER_TICK,
+                            max_live = MAX_LIVE_TASKS,
+                            "CR-3-5/MGR-6: anchor-lag task budget reached for this tick; \
+                             remaining deficits resume next tick"
+                        );
+                        return;
+                    }
                     // Source picks a healthy existing replica (any
                     // tier); the dispatcher tolerates cross-tier
                     // copies.
@@ -990,6 +1023,14 @@ impl TaskScheduler {
                         "scheduled",
                     );
                     migration_state.tasks.insert(task_id, task);
+                    // CR-3-5/MGR-6 — update the dedup set + budget
+                    // counters WITHIN this pass, so two files sharing a
+                    // hash (content-addressed re-download/copy) don't
+                    // both schedule a task against the same
+                    // (chunk, target) before either lands.
+                    existing_tasks.insert((chunk_id.clone(), action.target_node));
+                    created += 1;
+                    live_tasks += 1;
                 }
             }
         }
@@ -4309,6 +4350,40 @@ pub(crate) fn live_replica_tier(
     Some(disk.tier)
 }
 
+/// CR-3-5/MGR-5 — pick a LIVE replica to copy from: the first entry
+/// whose `(node, disk)` resolves to a live tier via `live_replica_tier`
+/// (node not Down/Failed, disk not Failed/Removed). `None` when every
+/// entry is dead — a replica sitting on a Failed disk of an otherwise-
+/// healthy node is not actually readable, so it must never be picked as
+/// the copy source.
+pub(crate) fn pick_live_source(
+    entries: &[&ChunkLocationEntry],
+    nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+) -> Option<u64> {
+    entries.iter().find_map(|e| {
+        let nid: u64 = e.node_id.parse().ok()?;
+        live_replica_tier(nodes.get(&nid), e.disk_id)?;
+        Some(nid)
+    })
+}
+
+/// CR-3-5/MGR-5 — pick a backfill target from `healthy_nodes` (built by
+/// `check_under_replicated`): the first node exposing a live disk of
+/// `tier` with `has_room`, excluding any node in `exclude` (e.g. one
+/// that already holds this chunk on the target tier).
+pub(crate) fn pick_backfill_target(
+    healthy_nodes: &[(u64, Vec<(DiskTier, bool)>)],
+    tier: DiskTier,
+    exclude: &std::collections::HashSet<u64>,
+) -> Option<u64> {
+    healthy_nodes
+        .iter()
+        .find(|(id, tiers)| {
+            !exclude.contains(id) && tiers.iter().any(|(t, has_room)| *t == tier && *has_room)
+        })
+        .map(|(id, _)| *id)
+}
+
 /// CNF-1 — the disk_id recorded into a new `ChunkLocationEntry` (AV-5-9
 /// read-back registration) must be the matching disk's `disk_id` FIELD —
 /// the key every reader resolves via `NodeInfo::disk` — never its Vec
@@ -4500,6 +4575,78 @@ mod bug_ch_live_replica_tests {
         only_failed.disk_id = 0;
         let n2 = node(HealthStatus::Healthy, vec![only_failed]);
         assert_eq!(super::resolve_disk_id_for_tier(Some(&n2), DiskTier::Cold), None);
+    }
+
+    fn entry(hash: &str, node: &str, disk_id: u32) -> super::ChunkLocationEntry {
+        super::ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: hash.to_string(),
+            node_id: node.to_string(),
+            disk_id,
+            size_bytes: 1024,
+        }
+    }
+
+    /// CR-3-5/MGR-5 — `pick_live_source` must skip a replica sitting on
+    /// a Failed disk of an otherwise-healthy node, and pick the next
+    /// live one instead of defaulting to the first row in the list.
+    #[test]
+    fn pick_live_source_skips_dead_disk() {
+        let mut nodes = std::collections::BTreeMap::new();
+        // Node 1: healthy node, but its ONLY disk (id 0) is Failed.
+        nodes.insert(1u64, node(HealthStatus::Healthy, vec![disk(DiskTier::Cold, DiskStatus::Failed)]));
+        // Node 2: healthy node, healthy disk.
+        nodes.insert(2u64, node(HealthStatus::Healthy, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]));
+
+        let e1 = entry("h", "1", 0);
+        let e2 = entry("h", "2", 0);
+        let entries: Vec<&super::ChunkLocationEntry> = vec![&e1, &e2];
+
+        assert_eq!(
+            super::pick_live_source(&entries, &nodes),
+            Some(2),
+            "must skip node 1 (dead disk) and pick node 2 (live)"
+        );
+    }
+
+    /// CR-3-5/MGR-5 — when every candidate replica is dead, there is no
+    /// source to copy from.
+    #[test]
+    fn pick_live_source_none_when_all_dead() {
+        let mut nodes = std::collections::BTreeMap::new();
+        nodes.insert(1u64, node(HealthStatus::Down, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]));
+        let e1 = entry("h", "1", 0);
+        let entries: Vec<&super::ChunkLocationEntry> = vec![&e1];
+        assert_eq!(super::pick_live_source(&entries, &nodes), None);
+    }
+
+    /// CR-3-5/MGR-5 — `pick_backfill_target` must skip a node whose only
+    /// disk of the mandated tier has no room, and pick a node that does.
+    #[test]
+    fn pick_backfill_target_skips_full_disk() {
+        let healthy_nodes: Vec<(u64, Vec<(DiskTier, bool)>)> = vec![
+            (1, vec![(DiskTier::Cold, false)]), // right tier, no room
+            (2, vec![(DiskTier::Cold, true)]),  // right tier, has room
+        ];
+        let exclude = std::collections::HashSet::new();
+        assert_eq!(
+            super::pick_backfill_target(&healthy_nodes, DiskTier::Cold, &exclude),
+            Some(2)
+        );
+    }
+
+    /// CR-3-5/MGR-5 — an excluded node (already holds the chunk on the
+    /// target tier) is never picked even if it has room.
+    #[test]
+    fn pick_backfill_target_respects_exclude() {
+        let healthy_nodes: Vec<(u64, Vec<(DiskTier, bool)>)> =
+            vec![(1, vec![(DiskTier::Cold, true)])];
+        let mut exclude = std::collections::HashSet::new();
+        exclude.insert(1u64);
+        assert_eq!(
+            super::pick_backfill_target(&healthy_nodes, DiskTier::Cold, &exclude),
+            None
+        );
     }
 }
 
@@ -5710,6 +5857,42 @@ mod bug_av_anchor_lag_tests {
             plan_anchor_lag_repair(&anchor, &placements, &nodes, "h0", &existing);
         assert!(action.is_none(),
             "task already in-flight → no duplicate");
+    }
+
+    /// CR-3-5/MGR-6 — proves the exact fix in `check_anchor_lag`: it now
+    /// inserts `(chunk_id, target_node)` into `existing_tasks` right
+    /// after scheduling a repair, WITHIN the same pass, instead of only
+    /// building the set once at the top. Two files sharing a hash
+    /// (content-addressed re-download/copy) evaluated in the same pass
+    /// must produce exactly ONE task, not two.
+    #[test]
+    fn cr_3_5_anchor_lag_dedup_within_one_pass() {
+        let anchor = AnchorPolicy {
+            datacenter: "leli".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        let placements = vec![placement(11, "toro", DiskTier::Warm)];
+        let nodes = vec![
+            node(10, "leli", true, &[DiskTier::Cold]),
+            node(11, "toro", true, &[DiskTier::Warm]),
+        ];
+        let mut existing = HashSet::new();
+
+        // First file referencing hash "h0": schedules a repair.
+        let action1 = plan_anchor_lag_repair(&anchor, &placements, &nodes, "h0", &existing)
+            .expect("first file schedules the repair");
+        assert_eq!(action1.target_node, 10);
+        // check_anchor_lag now does this immediately (CR-3-5 fix), not
+        // only at the top of the pass.
+        existing.insert(("h0".to_string(), action1.target_node));
+
+        // Second file, SAME hash, evaluated later in the SAME pass: must
+        // be refused now that the set was updated inline.
+        let action2 = plan_anchor_lag_repair(&anchor, &placements, &nodes, "h0", &existing);
+        assert!(
+            action2.is_none(),
+            "second file sharing the hash must not double-schedule within one pass"
+        );
     }
 
     /// AV-3-3 defensive — Draining / unhealthy nodes are
