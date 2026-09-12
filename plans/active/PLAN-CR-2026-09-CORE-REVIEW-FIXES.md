@@ -156,7 +156,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-5-2 | ✅ | MGR-11 | `metadata.rs` `forward_client_write` ~1479 | Allow-list: `UpdateNodeUsage, UpdateNodeDiskUsage, UpdateNodeStatus, AppendAudit, QuarantineNode, RemoveCorruptChunkReplicas, ReportScrubResult, ReportChunkReads` + any variant `grep -n "raft_write_or_forward\|write_via_leader"` proves a follower proposes today (list them in the commit). Anything else → `permission_denied` + `auth.denied` audit. | unit: `UpdateConfig` via forward → denied; `UpdateNodeUsage` → applied. | Tests fail before, pass after. |
 | CR-5-3 | ✅ | MGR-12 | `metadata.rs` `write_via_leader` ~578 | Inspect `ForwardWriteResponse.success`; false → `Err(resp.error)`. | unit with mock leader returning `success:false`. | Test fails before, passes after. |
 | CR-5-4 | ✅ | DATA-6 | `crates/dtfs-data/src/main.rs` control RPCs, `crates/dtfs-common/src/tls.rs` `endpoint()` ~182 | `req.set_timeout(Duration::from_secs(10))` on heartbeat / report_chunk_status / register_node. `TlsContext::endpoint`: `.http2_keep_alive_interval(10s).keep_alive_timeout(5s).keep_alive_while_idle(true)`. | tls unit: endpoint builder sets keepalive (inspect via `Endpoint` debug or a builder-recording shim); data main: a mock manager that accepts then never answers → heartbeat loop advances within 15 s. | Tests pass. |
-| CR-5-5 | ⬜ | DATA-11 | `crates/dtfs-data/src/server.rs` `record_cache_hit` ~940; `crates/dtfs-client/src/client.rs` | Gate with `require_data_rpc_auth(secret, "RecordCacheHit", &req.chunk_id, md)`; client stamps. | server unit: secret set + no header → denied. | Test fails before, passes after. |
+| CR-5-5 | ✅ | DATA-11 | `crates/dtfs-data/src/server.rs` `record_cache_hit` ~940; `crates/dtfs-client/src/client.rs` | Gate with `require_data_rpc_auth(secret, "RecordCacheHit", &req.chunk_id, md)`; client stamps. | server unit: secret set + no header → denied. | Test fails before, passes after. |
 | CR-5-6 | ⬜ | DATA-8 | `dtfs-data/src/main.rs` ~589-634 | Send `ChunkStatusReport` in batches of 1000 ids; re-enqueue only the unsent remainder + the failed batch. | unit on the batching helper: 2500 ids → 3 calls; failure on call 2 → 1500 re-enqueued. | Test passes. |
 | CR-5-7 | ✅ | CMN-4 | `crates/dtfs-common/src/crypto.rs` `hex_decode` ~125 | `if !s.is_ascii() { return None; }`. | unit: `"€€"` → None, no panic. | Test fails (panics) before, passes after. |
 | CR-5-8 | ⬜ | — | `tests/release/cases/108-heartbeat-requires-mgr-rpc-auth.sh` | grpcurl (or dtfs-cli debug) Heartbeat without headers → PermissionDenied when secret set. | `bash -n` clean. | Present, unexecuted. |
@@ -886,3 +886,14 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   exercised end-to-end by the existing `tls_loopback` integration
   suite, which already routes through `TlsContext::connect ->
   endpoint()`.
+- **CR-5-5** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-data --release`: 115 -> 116 passed, 0 failed (1 new:
+  `record_cache_hit_rejects_missing_auth`). `cargo test -p dtfs-client
+  --release`: 31 -> 31 passed, 0 failed (no dtfs-client unit test
+  exercises `record_cache_hit`'s stamping directly; verified by mirroring
+  the exact `get_chunk` stamp block). `server.rs::record_cache_hit`
+  (DATA-11 — the last mutating data-plane RPC not gated by LIS-19/55/83)
+  now calls `require_data_rpc_auth(secret, "RecordCacheHit",
+  &req.chunk_id, md)` before touching the metrics counter.
+  `dtfs-client/src/client.rs::record_cache_hit` stamps `x-dtfs-rpc-*`
+  from `[client].shared_secret`, same pattern as `get_chunk`.
