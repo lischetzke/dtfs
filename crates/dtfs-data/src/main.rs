@@ -95,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
         .cluster
         .validate_shared_secret()
         .map_err(|e| anyhow::anyhow!(e))?;
+    // CR-6-1 (CMN-1) — reject an unusable memory ladder at startup
+    // instead of flapping Warn/Shed on every sample.
+    config.memory.validate().map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!(
         "Data node {} at {} ({})",

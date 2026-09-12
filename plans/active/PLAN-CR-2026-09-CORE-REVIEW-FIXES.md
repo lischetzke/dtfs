@@ -166,7 +166,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR-6-1 | ⬜ | CMN-1, CMN-8 | `crates/dtfs-common/src/config.rs` (`PlacementConfig::validate` new), `dtfs-manager/src/main.rs`, `dtfs-data/src/main.rs`, `dtfs-fuse/src/main.rs` | `PlacementConfig::validate` rejects `!(0.0..=100.0).contains(&min_free_pct)`. All three mains call `config.memory.validate()` (and manager `config.placement.validate()`) right after load; error → exit non-zero with the message. Docs: note the new startup rejection in `docs/src/configuration/{manager,data-node,fuse-client}.md` memory rows. | config unit: `warn 95 / shed 90` → Err; `min_free_pct 150` → Err. | Tests fail before, pass after; `example_*_toml_parses` green. |
+| CR-6-1 | ✅ | CMN-1, CMN-8 | `crates/dtfs-common/src/config.rs` (`PlacementConfig::validate` new), `dtfs-manager/src/main.rs`, `dtfs-data/src/main.rs`, `dtfs-fuse/src/main.rs` | `PlacementConfig::validate` rejects `!(0.0..=100.0).contains(&min_free_pct)`. All three mains call `config.memory.validate()` (and manager `config.placement.validate()`) right after load; error → exit non-zero with the message. Docs: note the new startup rejection in `docs/src/configuration/{manager,data-node,fuse-client}.md` memory rows. | config unit: `warn 95 / shed 90` → Err; `min_free_pct 150` → Err. | Tests fail before, pass after; `example_*_toml_parses` green. |
 | CR-6-2 | ⬜ | CMN-2 | `crates/dtfs-manager/src/metadata.rs` `resolve_ack_floor` ~816 | Clamp: `min(floor, effective_mandatory_replicas of the tier the chunks were placed on)`; when clamped, `warn!` once per volume (dedup by volume id) and audit `write_safety.floor_clamped`. Docs row manager.md:216: "clamped to the effective RF". | metadata unit (`resolve_ack_floor` tests at ~3756 as template): volume floor 2, cold RF 1, cold placement → floor 1. | Test fails before, passes after. |
 | CR-6-3 | ⬜ | PROTO-2 | `proto/manager.proto` `ScrubConfigOverride`, `metadata.rs` ~1105, `dtfs-data/src/scrub.rs` ~101 | Add `quick_interval_secs = 9`, `deep_interval_secs = 10`; manager fills both (secs exact, hours as before); data node prefers non-zero secs; manager `warn!` when hour rounding changes the value and the peer is old (cannot know → log once at startup instead: "sub-hour scrub cadence requires data nodes ≥ this build"). | data scrub unit: override with `quick_interval_secs=600` → 600 s cadence; secs=0 → hours×3600. | Tests fail before, pass after. |
 | CR-6-4 | ⬜ | FUSE-6 | `proto/manager.proto` `GetFileLocationsResponse`, `metadata.rs` `get_file_locations` ~940, `allocate_chunks` ~1822, `dtfs-fuse/src/filesystem.rs` `fetch_file_locations` ~1692 | Add `volume_id` to the response; FUSE stores it in `FileLocations.volume_id` (`""` → keep current value, not `"default"`). Manager `allocate_chunks`: when `sm.files[req.path]` exists, use ITS `volume_id` for placement and ignore the request value (log at debug when they differ). | metadata unit: file in volume "strict", request says "default" → placement uses strict RF/anchor; fuse unit: refresh keeps volume id. | Tests fail before, pass after. |
@@ -938,3 +938,20 @@ CR-5-1 .. CR-5-9 all ✅. Baselines: dtfs-manager 367 -> 379, dtfs-data
 114 -> 119, dtfs-common 106 -> 108, dtfs-client 31 -> 31 (unchanged);
 dtfs-raft 105, dtfs-fuse 99, dtfs-cli 12 untouched. All passed, 0
 failed at every step; no regressions.
+
+## Verification log (Group 6)
+
+- **CR-6-1** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-common --release`: 108 -> 109 passed, 0 failed (1 new:
+  `cr_6_1_placement_config_validate`). `MemoryConfig::validate` already
+  existed (CO-5-20) and was tested but never called from any `main.rs`
+  (CMN-1); added `PlacementConfig::validate` rejecting `min_free_pct`
+  outside `0.0..=100.0`/NaN (CMN-8). Wired `config.memory.validate()`
+  into all three `main.rs` (manager, data, fuse) and
+  `config.placement.validate()` into the manager `main.rs` only, right
+  after `load_config`, mapped to `anyhow::anyhow!` on error (non-zero
+  exit). `cargo build -p dtfs-manager -p dtfs-data -p dtfs-fuse
+  --release`: all three build clean. Docs: added the startup-rejection
+  sentence to the `[memory]` section of `docs/src/configuration/
+  {manager,data-node,fuse-client}.md` and the `[placement]` row of
+  `manager.md`.
