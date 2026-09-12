@@ -1165,12 +1165,44 @@ impl DtfsFilesystem {
             let mut at = logical_size;
             while remaining > 0 {
                 let n = remaining.min(FILL_CHUNK);
+                // R1 (FUSE-1 memory half) — a torrent client writing its
+                // first piece at, say, offset 100 MB used to materialise
+                // the WHOLE hole into the write buffer (64 MiB at a time,
+                // uncapped in total) before the caller's actual bytes ever
+                // landed. Check the cap BEFORE adding this slice and, if
+                // it would be met or exceeded, force-drain whatever is
+                // already flushable (every all-zero chunk this hole fill
+                // has already completed) to the cluster right now instead
+                // of accumulating further.
+                if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), n) {
+                    let segs = self.write_buffer.flush_complete(&path);
+                    if !segs.is_empty() {
+                        if let Err(e) = self.flush_segments_to_cluster(&path, &segs).await {
+                            self.write_buffer.restore_segments(&path, &segs);
+                            return Err(e);
+                        }
+                    }
+                }
                 let zeros = vec![0u8; n];
                 self.write_buffer.write(&path, at, &zeros);
                 at += n as u64;
                 remaining -= n;
             }
             debug!(path = %path, hole, "zero-filled sparse gap");
+        }
+
+        // R1 — one more check before merging the caller's own bytes: a hole
+        // fill that landed exactly at the cap boundary, or a write with no
+        // hole at all into an already-near-cap buffer, must not be allowed
+        // to push it further over.
+        if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), data.len()) {
+            let segs = self.write_buffer.flush_complete(&path);
+            if !segs.is_empty() {
+                if let Err(e) = self.flush_segments_to_cluster(&path, &segs).await {
+                    self.write_buffer.restore_segments(&path, &segs);
+                    return Err(e);
+                }
+            }
         }
 
         let written = self.write_buffer.write(&path, effective_offset, data);
@@ -2226,6 +2258,15 @@ fn effective_read_len(file_size: u64, offset: u64, size: u32) -> u32 {
     size.min((file_size - offset).min(u32::MAX as u64) as u32)
 }
 
+/// R1 (FUSE-1 memory half) — true when a buffer already holding `dirty`
+/// bytes would meet or exceed `writebuf::DIRTY_BYTES_CAP` after `incoming`
+/// more bytes are added. Extracted as a pure predicate so the cap check in
+/// `write()`'s hole-fill loop (and the one guarding the caller's own
+/// bytes) is directly testable without a live `WriteBuffer`/network call.
+fn dirty_cap_exceeded(dirty: usize, incoming: usize) -> bool {
+    dirty.saturating_add(incoming) >= crate::writebuf::DIRTY_BYTES_CAP
+}
+
 /// CR-1-2 (FUSE-7) — chunk indices a write of `len` bytes at `offset`
 /// touches that are NOT already fully covered by buffered data, and
 /// therefore need an RMW seed read before the write proceeds. Pure w.r.t.
@@ -2290,6 +2331,30 @@ fn other_writer_open(remaining: &[(String, OpenFlags)], path: &str) -> bool {
 /// independent of the error's concrete type.
 fn is_resource_exhausted(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("ResourceExhausted")
+}
+
+#[cfg(test)]
+mod r1_dirty_cap_tests {
+    use super::dirty_cap_exceeded;
+    use crate::writebuf::DIRTY_BYTES_CAP;
+
+    #[test]
+    fn under_cap_is_not_exceeded() {
+        assert!(!dirty_cap_exceeded(0, 100));
+        assert!(!dirty_cap_exceeded(DIRTY_BYTES_CAP - 1024, 100));
+    }
+
+    #[test]
+    fn meeting_or_crossing_cap_is_exceeded() {
+        assert!(dirty_cap_exceeded(DIRTY_BYTES_CAP, 1));
+        assert!(dirty_cap_exceeded(DIRTY_BYTES_CAP - 10, 10), "meeting the cap exactly counts");
+        assert!(dirty_cap_exceeded(DIRTY_BYTES_CAP, 0), "already at the cap with nothing incoming");
+    }
+
+    #[test]
+    fn saturates_instead_of_overflowing() {
+        assert!(dirty_cap_exceeded(usize::MAX, usize::MAX));
+    }
 }
 
 #[cfg(test)]
