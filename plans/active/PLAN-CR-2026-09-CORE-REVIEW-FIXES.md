@@ -159,7 +159,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-5-5 | ✅ | DATA-11 | `crates/dtfs-data/src/server.rs` `record_cache_hit` ~940; `crates/dtfs-client/src/client.rs` | Gate with `require_data_rpc_auth(secret, "RecordCacheHit", &req.chunk_id, md)`; client stamps. | server unit: secret set + no header → denied. | Test fails before, passes after. |
 | CR-5-6 | ✅ | DATA-8 | `dtfs-data/src/main.rs` ~589-634 | Send `ChunkStatusReport` in batches of 1000 ids; re-enqueue only the unsent remainder + the failed batch. | unit on the batching helper: 2500 ids → 3 calls; failure on call 2 → 1500 re-enqueued. | Test passes. |
 | CR-5-7 | ✅ | CMN-4 | `crates/dtfs-common/src/crypto.rs` `hex_decode` ~125 | `if !s.is_ascii() { return None; }`. | unit: `"€€"` → None, no panic. | Test fails (panics) before, passes after. |
-| CR-5-8 | ⬜ | — | `tests/release/cases/108-heartbeat-requires-mgr-rpc-auth.sh` | grpcurl (or dtfs-cli debug) Heartbeat without headers → PermissionDenied when secret set. | `bash -n` clean. | Present, unexecuted. |
+| CR-5-8 | ✅ | — | `tests/release/cases/108-heartbeat-requires-mgr-rpc-auth.sh` | grpcurl (or dtfs-cli debug) Heartbeat without headers → PermissionDenied when secret set. | `bash -n` clean. | Present, unexecuted. |
 | CR-5-9 | ⬜ | — | `AGENTS.md` A.3.3 #7/#8, A.8 metadata entry | Heartbeat/ReportChunkStatus/RecordCacheHit gated; forward allow-list; control-plane deadlines + keepalive. | — | Same commit. |
 
 ### Group 6 — Config/proto sync + client perf (branch `bug/cr-6-config-client-perf`)
@@ -913,3 +913,10 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   reported to the manager twice on retry — harmless functionally
   since `RemoveCorruptChunkReplicas` is idempotent, but this closes the
   batch-size gap DATA-8 flagged).
+- **CR-5-8** 2026-09-12. `tests/release/cases/108-heartbeat-requires-mgr-
+  rpc-auth.sh` added, mirroring case 94's grpcurl-forge pattern: with
+  `cluster.shared_secret` set, forges an unauthenticated Heartbeat via
+  grpcurl against manager gRPC port 9401 and asserts PermissionDenied;
+  `KNOWN_ISSUE PROTO-1` when grpcurl/manager.proto are unavailable
+  (gate is unit-tested in `lis56_mgr_rpc_auth_tests`). `bash -n` clean;
+  not executed (no lab session this run).
