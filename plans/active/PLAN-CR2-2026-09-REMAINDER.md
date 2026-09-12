@@ -55,7 +55,7 @@ Status: ⬜ / 🟦 / ✅ / 🟥
 | CR2-8-2 | ✅ | CMN-6 | `dtfs-common/src/memory.rs` table, `config.rs` docs, `docs/src/configuration/manager.md` | Manager rung: Warn = no action; Shed = pause scheduler ticks (self-limiting). | — | Doc sites agree with `scheduler.rs`. |
 | CR2-8-3 | ✅ | FUSE-11 | `dtfs-fuse/src/filesystem.rs` read path, `local_cache.rs` | Viewer-read hint from per-fh consumption (≥ 1 MiB read on this fh, or readahead active) instead of the kernel's per-call length; keep `ATIME_UPDATE_MIN_BYTES` semantics for the hint. | unit on the pure hint helper. | Tests pass. |
 | CR2-8-4 | ✅ | FUSE-12 | `dtfs-fuse/src/local_cache.rs` | Evict with hysteresis (down to 90 % of `max_bytes`) so the stat sweep is rare; either make `lru` the atime index (update on viewer get, remove on prune) or delete it. | unit: 1000 puts at a full cache → sweeps ≤ 1000/10; `lru` never exceeds `sizes.len()`. | Tests pass. |
-| CR2-8-5 | ⬜ | — | `AGENTS.md`, `.claude/rules/fuse.md`, `.claude/rules/config-surface.md` | One sentence each. | — | Same commit. |
+| CR2-8-5 | ✅ | — | `AGENTS.md`, `.claude/rules/fuse.md`, `.claude/rules/config-surface.md` | One sentence each. | — | Same commit. |
 
 ## Verification log
 
@@ -114,6 +114,11 @@ Status: ⬜ / 🟦 / ✅ / 🟥
     guard is held, CO-3-12) and passes the resulting hint to the new
     `LocalChunkCache::get_with_hint`, which the old `get(id, bytes_hint)`
     now delegates to.
+  - CR2-8-5: doc-only. One-sentence additions to AGENTS.md (A.3.2 for
+    FUSE-11/12, A.5 for the CMN-3 message-size wiring),
+    `.claude/rules/fuse.md`, `.claude/rules/config-surface.md`. No
+    matching section in docs/src/internals/invariants.md for these
+    finding ids, so left untouched.
 
 ## Deviations
 
