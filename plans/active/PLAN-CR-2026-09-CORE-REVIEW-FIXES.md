@@ -154,7 +154,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 |---|---|---|---|---|---|---|
 | CR-5-1 | ✅ | PROTO-1 | `crates/dtfs-manager/src/metadata.rs` `heartbeat` ~1061, `report_chunk_status` ~1393; `crates/dtfs-data/src/main.rs` heartbeat loop ~458/602/636 | Gate both handlers with `require_mgr_rpc_auth(secret, "Heartbeat"|"ReportChunkStatus", &req.node_id, request.metadata())` BEFORE `into_inner()`. Data node stamps via `dtfs_common::crypto::stamp_mgr_rpc_auth` with `[cluster].shared_secret` (data config already has it). Also stamp `RegisterNode`? No — it carries its own `shared_secret` field; leave. | metadata unit (LIS-56 tests as template): secret set + no header → `PermissionDenied`; valid header → ok; empty secret → ok. | Tests fail before, pass after; AGENTS.md A.3.3 #8 lists both RPCs + "deploy manager+data together". |
 | CR-5-2 | ✅ | MGR-11 | `metadata.rs` `forward_client_write` ~1479 | Allow-list: `UpdateNodeUsage, UpdateNodeDiskUsage, UpdateNodeStatus, AppendAudit, QuarantineNode, RemoveCorruptChunkReplicas, ReportScrubResult, ReportChunkReads` + any variant `grep -n "raft_write_or_forward\|write_via_leader"` proves a follower proposes today (list them in the commit). Anything else → `permission_denied` + `auth.denied` audit. | unit: `UpdateConfig` via forward → denied; `UpdateNodeUsage` → applied. | Tests fail before, pass after. |
-| CR-5-3 | ⬜ | MGR-12 | `metadata.rs` `write_via_leader` ~578 | Inspect `ForwardWriteResponse.success`; false → `Err(resp.error)`. | unit with mock leader returning `success:false`. | Test fails before, passes after. |
+| CR-5-3 | ✅ | MGR-12 | `metadata.rs` `write_via_leader` ~578 | Inspect `ForwardWriteResponse.success`; false → `Err(resp.error)`. | unit with mock leader returning `success:false`. | Test fails before, passes after. |
 | CR-5-4 | ⬜ | DATA-6 | `crates/dtfs-data/src/main.rs` control RPCs, `crates/dtfs-common/src/tls.rs` `endpoint()` ~182 | `req.set_timeout(Duration::from_secs(10))` on heartbeat / report_chunk_status / register_node. `TlsContext::endpoint`: `.http2_keep_alive_interval(10s).keep_alive_timeout(5s).keep_alive_while_idle(true)`. | tls unit: endpoint builder sets keepalive (inspect via `Endpoint` debug or a builder-recording shim); data main: a mock manager that accepts then never answers → heartbeat loop advances within 15 s. | Tests pass. |
 | CR-5-5 | ⬜ | DATA-11 | `crates/dtfs-data/src/server.rs` `record_cache_hit` ~940; `crates/dtfs-client/src/client.rs` | Gate with `require_data_rpc_auth(secret, "RecordCacheHit", &req.chunk_id, md)`; client stamps. | server unit: secret set + no header → denied. | Test fails before, passes after. |
 | CR-5-6 | ⬜ | DATA-8 | `dtfs-data/src/main.rs` ~589-634 | Send `ChunkStatusReport` in batches of 1000 ids; re-enqueue only the unsent remainder + the failed batch. | unit on the batching helper: 2500 ids → 3 calls; failure on call 2 → 1500 re-enqueued. | Test passes. |
@@ -854,3 +854,14 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   fast path and before `self.raft.client_write`); a denied variant is
   logged + audited (`category=raft, event=auth.denied`) and returns
   `Status::permission_denied`.
+- **CR-5-3** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-manager --release`: 377 -> 379 passed, 0 failed (2 new:
+  `success_response_is_ok`, `rejected_response_is_err`). `write_via_leader`
+  previously mapped only the transport `Result` from
+  `forward_client_write`, so a call that transported fine but was
+  REJECTED by the leader (bad shared secret, MGR-11 variant denied, or
+  the Raft apply itself failing) came back `Ok(Response)` at the tonic
+  layer and was silently treated as a successful write. Added a pure
+  `fn forward_result(&ForwardWriteResponse) -> Result<(), String>` that
+  inspects `.success`/`.error`, and `write_via_leader` now returns its
+  result instead of discarding the response body.

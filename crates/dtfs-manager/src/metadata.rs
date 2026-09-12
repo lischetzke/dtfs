@@ -639,15 +639,31 @@ pub(crate) async fn write_via_leader(
                 .map_err(|e| format!("connect leader {leader_addr}: {e}"))?;
             let body =
                 serde_json::to_vec(&req).map_err(|e| format!("serialize ClientRequest: {e}"))?;
-            client
+            let resp = client
                 .forward_client_write(ForwardWriteRequest {
                     client_request_json: body,
                     shared_secret: shared_secret.to_string(),
                 })
                 .await
                 .map_err(|e| format!("forward to leader {leader_addr}: {e}"))?;
-            Ok(())
+            forward_result(&resp.into_inner())
         }
+    }
+}
+
+/// MGR-12 — a `ForwardClientWrite` that transports fine but is REJECTED by
+/// the leader (bad shared secret, MGR-11 variant not allow-listed, or the
+/// underlying Raft apply itself failed) comes back as `Ok(Response)` at the
+/// tonic layer with `ForwardWriteResponse.success == false`. Pre-fix,
+/// `write_via_leader` only mapped the transport `Result`, so a rejected
+/// forward was silently treated as success — the caller (health monitor,
+/// heartbeat forward) believed the write landed when it never did. Pure so
+/// it is unit-testable against the response struct directly.
+fn forward_result(resp: &ForwardWriteResponse) -> Result<(), String> {
+    if resp.success {
+        Ok(())
+    } else {
+        Err(resp.error.clone())
     }
 }
 
@@ -683,6 +699,33 @@ mod mgr_11_forward_allow_list_tests {
             node_id: 1,
             status: "Healthy".into(),
         }));
+    }
+}
+
+#[cfg(test)]
+mod mgr_12_forward_result_tests {
+    use super::forward_result;
+    use dtfs_proto::dtfs::manager::ForwardWriteResponse;
+
+    #[test]
+    fn success_response_is_ok() {
+        let resp = ForwardWriteResponse {
+            success: true,
+            response_json: Vec::new(),
+            error: String::new(),
+        };
+        assert!(forward_result(&resp).is_ok());
+    }
+
+    #[test]
+    fn rejected_response_is_err() {
+        let resp = ForwardWriteResponse {
+            success: false,
+            response_json: Vec::new(),
+            error: "forwarded write variant not allowed (MGR-11)".into(),
+        };
+        let err = forward_result(&resp).unwrap_err();
+        assert_eq!(err, "forwarded write variant not allowed (MGR-11)");
     }
 }
 
