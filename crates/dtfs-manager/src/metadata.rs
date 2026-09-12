@@ -508,6 +508,44 @@ pub(crate) fn is_forward_to_leader_err(msg: &str) -> bool {
 /// the first mismatching byte and leaks the matching-prefix length via
 /// timing. Reuses the audited `dtfs_common::crypto::constant_time_eq` (also
 /// used for the join-handshake HMAC) rather than a second hand-rolled copy.
+/// MGR-11 — a follower's `ForwardClientWrite` may only carry the
+/// `ClientRequest` variants a legitimate background path (heartbeat
+/// forward, health monitor, tiering read-report) actually proposes today.
+/// Built from `grep -n "raft_write_or_forward\|proxy_to_leader\|write_via_leader"`
+/// over metadata.rs / monitor.rs: `UpdateNodeUsage`, `UpdateNodeDiskUsage`,
+/// `UpdateNodeStatus` (heartbeat + health monitor), `AppendAudit`,
+/// `QuarantineNode`, `RemoveCorruptChunkReplicas`, `ReportScrubResult`,
+/// `ReportChunkReads`. Pure so it is unit-testable without a live service.
+fn forwardable(req: &ClientRequest) -> bool {
+    matches!(
+        req,
+        ClientRequest::UpdateNodeUsage { .. }
+            | ClientRequest::UpdateNodeDiskUsage { .. }
+            | ClientRequest::UpdateNodeStatus { .. }
+            | ClientRequest::AppendAudit { .. }
+            | ClientRequest::QuarantineNode { .. }
+            | ClientRequest::RemoveCorruptChunkReplicas { .. }
+            | ClientRequest::ReportScrubResult { .. }
+            | ClientRequest::ReportChunkReads { .. }
+    )
+}
+
+/// Short variant name for logging/auditing a denied forward without
+/// dumping the (potentially large) request body.
+fn client_request_variant_name(req: &ClientRequest) -> &'static str {
+    match req {
+        ClientRequest::UpdateNodeUsage { .. } => "UpdateNodeUsage",
+        ClientRequest::UpdateNodeDiskUsage { .. } => "UpdateNodeDiskUsage",
+        ClientRequest::UpdateNodeStatus { .. } => "UpdateNodeStatus",
+        ClientRequest::AppendAudit { .. } => "AppendAudit",
+        ClientRequest::QuarantineNode { .. } => "QuarantineNode",
+        ClientRequest::RemoveCorruptChunkReplicas { .. } => "RemoveCorruptChunkReplicas",
+        ClientRequest::ReportScrubResult { .. } => "ReportScrubResult",
+        ClientRequest::ReportChunkReads { .. } => "ReportChunkReads",
+        _ => "other",
+    }
+}
+
 fn forward_secret_ok(configured: &str, presented: &str) -> bool {
     if configured.is_empty() {
         return true;
@@ -601,15 +639,93 @@ pub(crate) async fn write_via_leader(
                 .map_err(|e| format!("connect leader {leader_addr}: {e}"))?;
             let body =
                 serde_json::to_vec(&req).map_err(|e| format!("serialize ClientRequest: {e}"))?;
-            client
+            let resp = client
                 .forward_client_write(ForwardWriteRequest {
                     client_request_json: body,
                     shared_secret: shared_secret.to_string(),
                 })
                 .await
                 .map_err(|e| format!("forward to leader {leader_addr}: {e}"))?;
-            Ok(())
+            forward_result(&resp.into_inner())
         }
+    }
+}
+
+/// MGR-12 — a `ForwardClientWrite` that transports fine but is REJECTED by
+/// the leader (bad shared secret, MGR-11 variant not allow-listed, or the
+/// underlying Raft apply itself failed) comes back as `Ok(Response)` at the
+/// tonic layer with `ForwardWriteResponse.success == false`. Pre-fix,
+/// `write_via_leader` only mapped the transport `Result`, so a rejected
+/// forward was silently treated as success — the caller (health monitor,
+/// heartbeat forward) believed the write landed when it never did. Pure so
+/// it is unit-testable against the response struct directly.
+fn forward_result(resp: &ForwardWriteResponse) -> Result<(), String> {
+    if resp.success {
+        Ok(())
+    } else {
+        Err(resp.error.clone())
+    }
+}
+
+#[cfg(test)]
+mod mgr_11_forward_allow_list_tests {
+    use super::forwardable;
+    use dtfs_raft::ClientRequest;
+
+    #[test]
+    fn update_config_is_not_forwardable() {
+        assert!(!forwardable(&ClientRequest::UpdateConfig {
+            config_json: "{}".into(),
+            version: 0,
+            expected_version: u64::MAX,
+        }));
+    }
+
+    #[test]
+    fn update_node_usage_is_forwardable() {
+        assert!(forwardable(&ClientRequest::UpdateNodeUsage {
+            node_id: 1,
+            used_capacity: 0,
+            chunk_count: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            observed_at_ms: 0,
+        }));
+    }
+
+    #[test]
+    fn update_node_status_is_forwardable() {
+        assert!(forwardable(&ClientRequest::UpdateNodeStatus {
+            node_id: 1,
+            status: "Healthy".into(),
+        }));
+    }
+}
+
+#[cfg(test)]
+mod mgr_12_forward_result_tests {
+    use super::forward_result;
+    use dtfs_proto::dtfs::manager::ForwardWriteResponse;
+
+    #[test]
+    fn success_response_is_ok() {
+        let resp = ForwardWriteResponse {
+            success: true,
+            response_json: Vec::new(),
+            error: String::new(),
+        };
+        assert!(forward_result(&resp).is_ok());
+    }
+
+    #[test]
+    fn rejected_response_is_err() {
+        let resp = ForwardWriteResponse {
+            success: false,
+            response_json: Vec::new(),
+            error: "forwarded write variant not allowed (MGR-11)".into(),
+        };
+        let err = forward_result(&resp).unwrap_err();
+        assert_eq!(err, "forwarded write variant not allowed (MGR-11)");
     }
 }
 
@@ -676,6 +792,64 @@ mod lis56_mgr_rpc_auth_tests {
         let (ts, mac) = stamp_mgr_rpc_auth(secret, "DeleteFile", "/a").unwrap();
         let meta = meta_with(&ts, &mac);
         let err = require_mgr_rpc_auth(secret, "DeleteFile", "/b", &meta).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    // CR-5-1 (PROTO-1) — Heartbeat and ReportChunkStatus were the only two
+    // mutating ManagerService RPCs NOT gated by LIS-56: any node id could
+    // send them (poison node status / drop replica entries) without the
+    // cluster secret.
+    #[test]
+    fn heartbeat_empty_secret_allows_without_headers() {
+        assert!(require_mgr_rpc_auth("", "Heartbeat", "42", &MetadataMap::new()).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_missing_headers_denied_when_secret_set() {
+        let err = require_mgr_rpc_auth("s3cret", "Heartbeat", "42", &MetadataMap::new())
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn heartbeat_valid_stamp_accepted() {
+        let secret = "s3cret";
+        let (ts, mac) = stamp_mgr_rpc_auth(secret, "Heartbeat", "42").unwrap();
+        let meta = meta_with(&ts, &mac);
+        assert!(require_mgr_rpc_auth(secret, "Heartbeat", "42", &meta).is_ok());
+    }
+
+    #[test]
+    fn report_chunk_status_empty_secret_allows_without_headers() {
+        assert!(
+            require_mgr_rpc_auth("", "ReportChunkStatus", "42", &MetadataMap::new()).is_ok()
+        );
+    }
+
+    #[test]
+    fn report_chunk_status_missing_headers_denied_when_secret_set() {
+        let err = require_mgr_rpc_auth("s3cret", "ReportChunkStatus", "42", &MetadataMap::new())
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn report_chunk_status_valid_stamp_accepted() {
+        let secret = "s3cret";
+        let (ts, mac) = stamp_mgr_rpc_auth(secret, "ReportChunkStatus", "42").unwrap();
+        let meta = meta_with(&ts, &mac);
+        assert!(require_mgr_rpc_auth(secret, "ReportChunkStatus", "42", &meta).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_mac_not_valid_for_report_chunk_status() {
+        // Method name is part of the MAC input, so a Heartbeat-stamped
+        // header must not authenticate a ReportChunkStatus call.
+        let secret = "s3cret";
+        let (ts, mac) = stamp_mgr_rpc_auth(secret, "Heartbeat", "42").unwrap();
+        let meta = meta_with(&ts, &mac);
+        let err =
+            require_mgr_rpc_auth(secret, "ReportChunkStatus", "42", &meta).unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 }
@@ -1179,6 +1353,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        let binding = request.get_ref().node_id.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "Heartbeat",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         tracing::debug!("Heartbeat from node: {}", req.node_id);
 
@@ -1545,6 +1726,13 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<ChunkStatusReport>,
     ) -> Result<Response<ChunkStatusAck>, Status> {
+        let binding = request.get_ref().node_id.clone();
+        require_mgr_rpc_auth(
+            &self.config.cluster.shared_secret,
+            "ReportChunkStatus",
+            &binding,
+            request.metadata(),
+        )?;
         let req = request.into_inner();
         tracing::debug!("ChunkStatusReport: {} chunks", req.chunks.len());
 
@@ -1646,6 +1834,31 @@ impl ManagerService for MetadataService {
         }
         let req: ClientRequest = serde_json::from_slice(&body.client_request_json)
             .map_err(|e| Status::invalid_argument(format!("bad ClientRequest json: {e}")))?;
+        // MGR-11 — CO-2-2 only authenticates WHO is forwarding, not WHAT is
+        // forwarded: any ClientRequest variant round-tripped through this
+        // RPC previously reached `self.raft.client_write` unchecked, so an
+        // authenticated-but-compromised/buggy follower could propose any
+        // mutation (e.g. UpdateConfig) as if it were a legitimate heartbeat/
+        // monitor forward. Allow-list exactly the variants a follower
+        // legitimately proposes via `raft_write_or_forward` / `proxy_to_leader`
+        // / `write_via_leader` today; anything else is denied + audited.
+        if !forwardable(&req) {
+            tracing::warn!(
+                variant = client_request_variant_name(&req),
+                "ForwardClientWrite rejected: variant not forwardable (MGR-11)"
+            );
+            if let Some(audit) = &self.audit {
+                audit.log(
+                    "raft",
+                    "auth.denied",
+                    &format!("variant={}", client_request_variant_name(&req)),
+                    "forward_client_write: variant not in forward allow-list",
+                );
+            }
+            return Err(Status::permission_denied(
+                "forwarded write variant not allowed (MGR-11)",
+            ));
+        }
         // Per-chunk read reports are NOT Raft state — they feed this (leader's)
         // in-memory tiering read-window. Intercept BEFORE Raft and apply
         // directly so reads forwarded from a follower reach the engine that

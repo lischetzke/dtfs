@@ -24,6 +24,50 @@ use dtfs_proto::dtfs::manager::manager_service_client::ManagerServiceClient;
 use dtfs_proto::dtfs::manager::{HeartbeatRequest, RegisterNodeRequest};
 use store::ChunkStore;
 
+/// DATA-6 — bound every control-plane RPC (Heartbeat, ReportChunkStatus,
+/// RegisterNode) with a deadline so a manager that accepts the TCP
+/// connection but never answers (partition, wedged leader, etc.) doesn't
+/// hang the heartbeat loop indefinitely — it times out and the loop's
+/// existing reconnect/backoff logic takes over.
+const CONTROL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// DATA-8 — `ChunkStatusReport` is unbounded: after a large scrub finds
+/// many corrupt chunks (or a rolling-restart backlog), a single report
+/// could carry tens of thousands of ids in one gRPC message. Split into
+/// fixed-size batches so no single call is oversized.
+const CHUNK_STATUS_REPORT_BATCH_SIZE: usize = 1000;
+
+/// Split `ids` into chunks of at most `n` each, preserving order. `n == 0`
+/// degenerates to one batch (never divides by zero / infinite-loops).
+fn batches(ids: Vec<String>, n: usize) -> Vec<Vec<String>> {
+    if n == 0 {
+        return vec![ids];
+    }
+    ids.chunks(n).map(|c| c.to_vec()).collect()
+}
+
+fn control_request<T>(body: T) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(body);
+    req.set_timeout(CONTROL_RPC_TIMEOUT);
+    req
+}
+
+/// CR-5-1 (PROTO-1) / LIS-56 — stamp `x-dtfs-rpc-*` metadata on a mutating
+/// `dtfs-mgr-rpc` request (Heartbeat / ReportChunkStatus) from this data
+/// node's own `[cluster].shared_secret`. Empty secret = no-op (legacy skip,
+/// matches `require_mgr_rpc_auth`'s empty-secret bypass on the manager).
+fn stamp_mgr_rpc_request<T>(secret: &str, method: &str, binding: &str, body: T) -> tonic::Request<T> {
+    use dtfs_common::crypto::{stamp_mgr_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS};
+    let mut req = control_request(body);
+    if let Some((ts, mac)) = stamp_mgr_rpc_auth(secret, method, binding) {
+        if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+            req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+            req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+        }
+    }
+    req
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "dtfs-data", about = "DTFS Data Node", version = dtfs_common::version::VERSION_STRING)]
 struct Args {
@@ -455,7 +499,7 @@ async fn manager_lifecycle(
     let mut reg_backoff = Duration::from_secs(1);
     let node_id = loop {
         let req = build_register_req();
-        match client.register_node(tonic::Request::new(req)).await {
+        match client.register_node(control_request(req)).await {
             Ok(resp) => {
                 let resp = resp.into_inner();
                 if resp.accepted {
@@ -588,53 +632,88 @@ async fn manager_lifecycle(
         // wakes the scheduler's under-replication check.
         let corrupt_ids = chunk_store.drain_pending_corruption();
         if !corrupt_ids.is_empty() {
-            let report = dtfs_proto::dtfs::manager::ChunkStatusReport {
-                node_id: node_id.clone(),
-                chunks: corrupt_ids
-                    .iter()
-                    .map(|id| dtfs_proto::dtfs::manager::ChunkStatus {
-                        chunk_id: id.clone(),
-                        status: "corrupt".into(),
-                        size: 0,
-                    })
-                    .collect(),
-            };
-            match client.report_chunk_status(tonic::Request::new(report)).await {
-                Ok(resp) => {
-                    if resp.into_inner().accepted {
-                        tracing::info!(
-                            count = corrupt_ids.len(),
-                            "Bug O reported quarantined chunks to manager"
-                        );
-                    } else {
-                        // CO-3-7 — `accepted == false` means the manager could
-                        // not commit the de-location (e.g. a follower failed to
-                        // forward to the leader). Treat it exactly like a
-                        // transport error: we drained these ids, so re-enqueue
-                        // or the corrupt replica stays advertised healthy and
-                        // re-replication never queues until scrub independently
-                        // re-detects it.
-                        chunk_store.enqueue_pending_corruption(corrupt_ids.iter().cloned());
-                        tracing::warn!(
-                            count = corrupt_ids.len(),
-                            "Bug O / CO-3-7 ChunkStatusReport not accepted — will retry next heartbeat"
-                        );
+            // DATA-8 — send in fixed-size batches; on the first failed
+            // batch, re-enqueue that batch plus every batch after it
+            // (the unsent remainder) so nothing is lost and nothing
+            // already accepted by the manager is re-sent.
+            let batch_count = corrupt_ids.len().div_ceil(CHUNK_STATUS_REPORT_BATCH_SIZE);
+            let mut batch_iter = batches(corrupt_ids.clone(), CHUNK_STATUS_REPORT_BATCH_SIZE).into_iter();
+            let mut sent_ok = 0usize;
+            while let Some(batch) = batch_iter.next() {
+                let batch_len = batch.len();
+                let report = dtfs_proto::dtfs::manager::ChunkStatusReport {
+                    node_id: node_id.clone(),
+                    chunks: batch
+                        .iter()
+                        .map(|id| dtfs_proto::dtfs::manager::ChunkStatus {
+                            chunk_id: id.clone(),
+                            status: "corrupt".into(),
+                            size: 0,
+                        })
+                        .collect(),
+                };
+                let report_req = stamp_mgr_rpc_request(
+                    &config.cluster.shared_secret,
+                    "ReportChunkStatus",
+                    &node_id,
+                    report,
+                );
+                match client.report_chunk_status(report_req).await {
+                    Ok(resp) => {
+                        if resp.into_inner().accepted {
+                            sent_ok += 1;
+                            tracing::info!(
+                                count = batch_len,
+                                batch = sent_ok,
+                                total_batches = batch_count,
+                                "Bug O reported quarantined chunks to manager"
+                            );
+                        } else {
+                            // CO-3-7 — `accepted == false` means the manager could
+                            // not commit the de-location (e.g. a follower failed to
+                            // forward to the leader). Treat it exactly like a
+                            // transport error: re-enqueue this batch plus every
+                            // batch after it (unsent remainder), or the corrupt
+                            // replica stays advertised healthy and re-replication
+                            // never queues until scrub independently re-detects it.
+                            let mut remainder = batch;
+                            remainder.extend(batch_iter.by_ref().flatten());
+                            let remainder_len = remainder.len();
+                            chunk_store.enqueue_pending_corruption(remainder.into_iter());
+                            tracing::warn!(
+                                count = remainder_len,
+                                "Bug O / CO-3-7 ChunkStatusReport not accepted — will retry next heartbeat"
+                            );
+                            break;
+                        }
                     }
-                }
-                Err(e) => {
-                    // Re-enqueue on RPC failure so we try again next heartbeat.
-                    chunk_store.enqueue_pending_corruption(corrupt_ids.iter().cloned());
-                    tracing::warn!(
-                        error = %e,
-                        count = corrupt_ids.len(),
-                        "Bug O ChunkStatusReport failed — will retry next heartbeat"
-                    );
+                    Err(e) => {
+                        // Re-enqueue this batch plus the unsent remainder on
+                        // RPC failure so we try again next heartbeat, without
+                        // re-sending batches the manager already accepted.
+                        let mut remainder = batch;
+                        remainder.extend(batch_iter.by_ref().flatten());
+                        let remainder_len = remainder.len();
+                        chunk_store.enqueue_pending_corruption(remainder.into_iter());
+                        tracing::warn!(
+                            error = %e,
+                            count = remainder_len,
+                            "Bug O ChunkStatusReport failed — will retry next heartbeat"
+                        );
+                        break;
+                    }
                 }
             }
         }
 
+        let heartbeat_req = stamp_mgr_rpc_request(
+            &config.cluster.shared_secret,
+            "Heartbeat",
+            &node_id,
+            heartbeat,
+        );
         match client
-            .heartbeat(tonic::Request::new(heartbeat))
+            .heartbeat(heartbeat_req)
             .await
         {
             Ok(resp) => {
@@ -833,5 +912,60 @@ async fn manager_lifecycle(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod data_6_control_deadline_tests {
+    use super::control_request;
+
+    #[test]
+    fn control_request_carries_a_grpc_timeout_deadline() {
+        // DATA-6 — `set_timeout` stamps the `grpc-timeout` metadata key
+        // tonic reads to enforce the deadline; assert it is actually
+        // present so a future refactor can't silently drop the timeout.
+        let req = control_request(42u32);
+        assert!(req.metadata().get("grpc-timeout").is_some());
+    }
+}
+
+#[cfg(test)]
+mod data_8_batches_tests {
+    use super::batches;
+
+    fn ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| i.to_string()).collect()
+    }
+
+    #[test]
+    fn splits_into_expected_batch_count() {
+        let out = batches(ids(2500), 1000);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].len(), 1000);
+        assert_eq!(out[1].len(), 1000);
+        assert_eq!(out[2].len(), 500);
+        // Order preserved.
+        assert_eq!(out[0][0], "0");
+        assert_eq!(out[2][499], "2499");
+    }
+
+    #[test]
+    fn empty_input_yields_no_batches() {
+        assert!(batches(Vec::new(), 1000).is_empty());
+    }
+
+    #[test]
+    fn failure_at_batch_2_of_3_reenqueues_exactly_the_unsent_remainder() {
+        // 2500 ids -> 3 batches of 1000/1000/500. A failure ON batch 2
+        // (index 1) must re-enqueue batch 2 + batch 3 = 1000 + 500 = 1500,
+        // never batch 1 (already accepted by the manager).
+        let all = batches(ids(2500), 1000);
+        assert_eq!(all.len(), 3);
+        let mut iter = all.into_iter();
+        let _batch1_sent_ok = iter.next().unwrap();
+        let failed_batch = iter.next().unwrap();
+        let mut remainder = failed_batch;
+        remainder.extend(iter.flatten());
+        assert_eq!(remainder.len(), 1500);
     }
 }
