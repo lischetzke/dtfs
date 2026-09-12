@@ -102,7 +102,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-1-3 | ✅ | FUSE-2 | `filesystem.rs` `flush()` ~1234, `release()` ~1357 | `flush(fh)`: if `!file.flags.is_writable()` return `Ok(())` before touching `write_buffer`. `release(fh)`: only `write_buffer.remove(&path)` when this fh is writable AND no other open writable fh on the same path remains (scan `open_files`). | unit: open RO + RW on same path, write via RW, flush RO → buffer untouched; release RO → buffer still present; release RW → removed. | Test fails before, passes after. |
 | CR-1-4 | ✅ | FUSE-3 | `filesystem.rs` (`OpenFile`, `flush()` error branch ~1296-1320, `flush_segments_to_cluster`) | Add `committed_any: bool` to `OpenFile`, set true on first successful `flush_segments_to_cluster` for that path (set on every OpenFile of the path). `was_fresh` = `!committed_any && locations empty`. On flush failure ALWAYS `restore_segments` first; ghost-unlink only from `release()` when `!committed_any`. | unit: create, write 2 chunks (batch flush commits them), write tail, force flush error → file NOT deleted, segments restored, next flush succeeds and commits the tail. | Test fails before, passes after. |
 | CR-1-5 | ✅ | DATA-5 (FUSE half) | `filesystem.rs` `write_chunk_bytes(&addr, "", ..)` ~1927, `crates/dtfs-client/src/client.rs` put path | FUSE hashes each segment (BLAKE3, `dtfs_common::checksum`) before the put and sends the hex in `PutChunkRequest.chunk_id` of the first piece. After the put, compare `put_resp.chunk_id` to the local hex; mismatch → treat as put failure (retry next replica / return Err), never commit the location. | unit: mock data node returning a different id → segment not committed, error surfaced. | Test fails before, passes after. |
-| CR-1-6 | ⬜ | FUSE-4 | `crates/dtfs-fuse/src/fuse_adapter.rs` readdir ~793, readdirplus ~865, unlink/rmdir/mkdir/rename/link/symlink bare EIO/ENOENT sites | Route every `map_err` through `cluster_err_to_errno`. | fuse_adapter unit: `cluster_err_to_errno` already tested; add a test that readdir on a mock returning `Unavailable` yields EIO not ENOENT. | grep shows zero `Errno::from(libc::ENOENT)` in error-mapping closures outside the helper. |
+| CR-1-6 | ✅ | FUSE-4 | `crates/dtfs-fuse/src/fuse_adapter.rs` readdir ~793, readdirplus ~865, unlink/rmdir/mkdir/rename/link/symlink bare EIO/ENOENT sites | Route every `map_err` through `cluster_err_to_errno`. | fuse_adapter unit: `cluster_err_to_errno` already tested; add a test that readdir on a mock returning `Unavailable` yields EIO not ENOENT. | grep shows zero `Errno::from(libc::ENOENT)` in error-mapping closures outside the helper. |
 | CR-1-7 | ⬜ | — | `tests/release/cases/100-fuse-rewrite-offset-zero.sh`, `101-fuse-reader-close-does-not-drain-writer.sh` | Case 100: write 12 MB file, `dd conv=notrunc` 1 KB at offset 0 and at offset 4 MB−512, `cmp` against a local reference. Case 101: writer streams 20 MB with `pv -L`, reader `cat file > /dev/null` mid-stream, `cmp` after writer closes. | `bash -n` clean. | Cases present; STATUS line; documented as unexecuted in the verification log. |
 | CR-1-8 | ⬜ | — | `AGENTS.md` A.8 `filesystem.rs`/`writebuf.rs` entries | Document the per-chunk buffer, fh-gated flush/release, `committed_any`, end-to-end `chunk_id`. | — | Same commit as the code it describes. |
 
@@ -296,3 +296,16 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   id" test is covered at the hashing/comparison boundary
   (`blake3_hex` + the `!=` check that feeds the mismatch branch), not via
   a live RPC round trip.
+
+- **CR-1-6** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-fuse --release`: 90 -> 91 passed (1 new,
+  `cr_1_6_transient_manager_error_is_not_enoent`), 0 failed. Routed
+  `readdir`, `readdirplus`, `mkdir`, `unlink`, `rmdir`, `create`,
+  `rename`, `symlink`, and `link` through `cluster_err_to_errno` (was a
+  bare `Errno::from(libc::ENOENT)`/`EIO)` in each `map_err`/`Err(e) =>`
+  arm). `grep -c "Errno::from(libc::ENOENT)"` shows 6 remaining hits, all
+  inside the helper itself, `child_path`/`path_for`'s unrelated
+  `ok_or_else`, and tests — zero in a `map_err` closure outside the
+  helper. No fuse3 test harness exists to drive `readdir`/`readdirplus`
+  directly (pre-existing comment on `fuse_readdir_regression`), so the
+  new test locks the mapping function both now call instead.
