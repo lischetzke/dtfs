@@ -338,6 +338,13 @@ message GetFileLocationsResponse {
   // the "mkdir then stat returns ENOENT" bug seen during the 2026-05-18
   // soak recovery (SOAK-RECOVERY-2026-05-18.md, bugs A & B).
   bool is_directory = 7;
+  // CR-6-4 (FUSE-6) — the volume this file is actually registered
+  // under (`FileMetadata.volume_id`). An older manager leaves this
+  // `""`; the FUSE client then keeps whatever volume_id it already
+  // has cached for the path rather than falling back to "default"
+  // (which silently applies default-volume RF/tier/anchor to a
+  // non-default-volume file on every refresh after the first).
+  string volume_id = 8;
 }
 
 // --- DeleteFile ---

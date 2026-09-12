@@ -164,6 +164,23 @@ fn learn_locations(known: &DashMap<String, Location>, addrs: &[String], locs: &[
     }
 }
 
+/// CR-6-4 (FUSE-6) — resolve the volume_id to store after a
+/// `GetFileLocationsResponse` refresh. A non-empty response value (a
+/// manager on this build or newer) always wins. An empty response value
+/// (an older manager, field absent) means "keep whatever this client
+/// already believes" rather than falling back to the default volume,
+/// which would silently apply the wrong RF/tier/anchor to every later
+/// write of a non-default-volume file. Only a path with no prior cached
+/// value (never seen before) falls back to `"default"`.
+fn resolve_refreshed_volume_id(response_volume_id: &str, cached_volume_id: Option<&str>) -> String {
+    if !response_volume_id.is_empty() {
+        return response_volume_id.to_string();
+    }
+    cached_volume_id
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "default".to_string())
+}
+
 /// File attributes (stat-like information).
 #[derive(Debug, Clone)]
 pub struct FileAttr {
@@ -1822,15 +1839,36 @@ impl DtfsFilesystem {
             128 * 1024 * 1024
         };
 
+        // CR-6-4 (FUSE-6) — the manager now returns the file's actual
+        // volume_id (proto field 8). An older manager sends "" (field
+        // absent); in that case, KEEP whatever volume_id this path
+        // already believes rather than silently falling back to
+        // "default", which would apply the wrong volume's RF/tier/
+        // anchor on every subsequent write. The refresh call sites in
+        // `flush()`/`truncate()` invalidate `metadata_cache` BEFORE
+        // calling this, so the fallback checks any still-open
+        // `OpenFile` for this path first (its `locations` isn't
+        // cleared by that invalidation) and only then the metadata
+        // cache; a path never seen before falls back to "default".
+        let existing_volume_id = self
+            .open_files
+            .iter()
+            .find_map(|e| {
+                if e.value().path == path {
+                    e.value().locations.as_ref().map(|l| l.volume_id.clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| self.get_cached_metadata(path).map(|loc| loc.volume_id));
+        let volume_id =
+            resolve_refreshed_volume_id(&response.volume_id, existing_volume_id.as_deref());
+
         Ok(FileLocations {
             path: response.path,
             total_size: response.total_size,
             chunks,
-            // The manager response doesn't include volume_id directly in
-            // GetFileLocationsResponse. We default to "default" and it
-            // gets overridden when the file is created or opened with
-            // a known volume.
-            volume_id: "default".to_string(),
+            volume_id,
             chunk_size,
             created_at_ms: response.created_at_ms,
             modified_at_ms: response.modified_at_ms,
@@ -2396,6 +2434,29 @@ fn other_writer_open(remaining: &[(String, OpenFlags)], path: &str) -> bool {
 /// independent of the error's concrete type.
 fn is_resource_exhausted(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("ResourceExhausted")
+}
+
+#[cfg(test)]
+mod cr_6_4_resolve_refreshed_volume_id_tests {
+    use super::resolve_refreshed_volume_id;
+
+    #[test]
+    fn nonempty_response_wins() {
+        assert_eq!(resolve_refreshed_volume_id("strict", Some("default")), "strict");
+        assert_eq!(resolve_refreshed_volume_id("strict", None), "strict");
+    }
+
+    #[test]
+    fn empty_response_keeps_cached_value() {
+        // an older manager sends "" — never silently downgrade to "default"
+        // when this client already believes the file is on "strict".
+        assert_eq!(resolve_refreshed_volume_id("", Some("strict")), "strict");
+    }
+
+    #[test]
+    fn empty_response_and_no_cache_falls_back_to_default() {
+        assert_eq!(resolve_refreshed_volume_id("", None), "default");
+    }
 }
 
 #[cfg(test)]
