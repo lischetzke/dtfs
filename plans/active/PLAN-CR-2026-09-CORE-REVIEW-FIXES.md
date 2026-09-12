@@ -103,7 +103,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-1-4 | ✅ | FUSE-3 | `filesystem.rs` (`OpenFile`, `flush()` error branch ~1296-1320, `flush_segments_to_cluster`) | Add `committed_any: bool` to `OpenFile`, set true on first successful `flush_segments_to_cluster` for that path (set on every OpenFile of the path). `was_fresh` = `!committed_any && locations empty`. On flush failure ALWAYS `restore_segments` first; ghost-unlink only from `release()` when `!committed_any`. | unit: create, write 2 chunks (batch flush commits them), write tail, force flush error → file NOT deleted, segments restored, next flush succeeds and commits the tail. | Test fails before, passes after. |
 | CR-1-5 | ✅ | DATA-5 (FUSE half) | `filesystem.rs` `write_chunk_bytes(&addr, "", ..)` ~1927, `crates/dtfs-client/src/client.rs` put path | FUSE hashes each segment (BLAKE3, `dtfs_common::checksum`) before the put and sends the hex in `PutChunkRequest.chunk_id` of the first piece. After the put, compare `put_resp.chunk_id` to the local hex; mismatch → treat as put failure (retry next replica / return Err), never commit the location. | unit: mock data node returning a different id → segment not committed, error surfaced. | Test fails before, passes after. |
 | CR-1-6 | ✅ | FUSE-4 | `crates/dtfs-fuse/src/fuse_adapter.rs` readdir ~793, readdirplus ~865, unlink/rmdir/mkdir/rename/link/symlink bare EIO/ENOENT sites | Route every `map_err` through `cluster_err_to_errno`. | fuse_adapter unit: `cluster_err_to_errno` already tested; add a test that readdir on a mock returning `Unavailable` yields EIO not ENOENT. | grep shows zero `Errno::from(libc::ENOENT)` in error-mapping closures outside the helper. |
-| CR-1-7 | ⬜ | — | `tests/release/cases/100-fuse-rewrite-offset-zero.sh`, `101-fuse-reader-close-does-not-drain-writer.sh` | Case 100: write 12 MB file, `dd conv=notrunc` 1 KB at offset 0 and at offset 4 MB−512, `cmp` against a local reference. Case 101: writer streams 20 MB with `pv -L`, reader `cat file > /dev/null` mid-stream, `cmp` after writer closes. | `bash -n` clean. | Cases present; STATUS line; documented as unexecuted in the verification log. |
+| CR-1-7 | ✅ | — | `tests/release/cases/100-fuse-rewrite-offset-zero.sh`, `101-fuse-reader-close-does-not-drain-writer.sh` | Case 100: write 12 MB file, `dd conv=notrunc` 1 KB at offset 0 and at offset 4 MB−512, `cmp` against a local reference. Case 101: writer streams 20 MB with `pv -L`, reader `cat file > /dev/null` mid-stream, `cmp` after writer closes. | `bash -n` clean. | Cases present; STATUS line; documented as unexecuted in the verification log. |
 | CR-1-8 | ⬜ | — | `AGENTS.md` A.8 `filesystem.rs`/`writebuf.rs` entries | Document the per-chunk buffer, fh-gated flush/release, `committed_any`, end-to-end `chunk_id`. | — | Same commit as the code it describes. |
 
 ### Group 2 — Raft state-machine correctness (branch `bug/cr-2-raft-sm`)
@@ -309,3 +309,19 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   helper. No fuse3 test harness exists to drive `readdir`/`readdirplus`
   directly (pre-existing comment on `fuse_readdir_regression`), so the
   new test locks the mapping function both now call instead.
+
+- **CR-1-7** 2026-09-12. Added
+  `tests/release/cases/100-fuse-rewrite-offset-zero.sh` (patches offset 0
+  and the chunk-0/chunk-1 boundary of an already-flushed file, cmp against
+  a locally-patched reference) and
+  `tests/release/cases/101-fuse-reader-close-does-not-drain-writer.sh`
+  (paces a background streaming write, repeatedly open-read-closes the
+  same path read-only while it's in flight, then checks the writer still
+  finishes with the byte-correct content). Both modeled on
+  `96-write-batch-flush.sh` / `85-unaligned-write-integrity.sh` /
+  `90-lease-release-spares-live-writer.sh`; `trap case_cleanup EXIT`,
+  last line `pass` (-> `STATUS: PASS`), not in `QUICK_CASES`.
+  `bash -n` clean on both (verified: `bash -n
+  tests/release/cases/100-fuse-rewrite-offset-zero.sh` and `...101-...sh`
+  -> no output, exit 0). NOT executed — no lab, per the plan's Build/verify
+  environment section.
