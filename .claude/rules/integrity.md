@@ -81,6 +81,17 @@ Two independent, never-mixed replica classes:
 - `cache_replicas.<tier>.{min,max}` — demand-driven, evictable; only the
   tiering engine creates them, only on the promotion threshold. The
   under-replication scheduler MUST NOT backfill cache replicas.
+- **CR-3-1 (MGR-2)** — a "surviving" mandatory/anchor replica must be
+  LIVE to count: `plan_chunk_demotions`'s `mandatory_still_present` and
+  `plan_flush_cache`'s `mandatory_survives` resolve every placement's
+  liveness through `live_replica_tier` before treating it as the
+  survivor that authorises dropping another replica. A replica on a
+  Down/Failed node or Failed/Removed disk is not servable and must
+  never be the reason a demote/flush is allowed to proceed.
+  **CR-3-2** — independent of anchor policy, `apply_remove_chunk_location`
+  also refuses to remove the last LIVE replica of a `(path,
+  chunk_index)`; a dead row can always be removed, but the removal of a
+  live row is refused when no other live row of that chunk survives.
 - `scheduler::plan_flush_cache` refuses any flush that would strand the
   mandatory copy → `cache.flush_refused` audit + `AnchorViolated` alert.
 - Every promote/demote checks the anchor against the destination state:
