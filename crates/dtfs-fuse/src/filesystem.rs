@@ -252,6 +252,17 @@ struct OpenFile {
     lease_expires_at_ms: Option<u64>,
     /// P0-1: owner_id used to acquire the lease (for renew/release).
     lease_owner_id: Option<String>,
+    /// CR-1-4 (FUSE-3): true once `flush_segments_to_cluster` has
+    /// successfully committed at least one chunk for this path, ever. Set
+    /// on EVERY `OpenFile` sharing the path (mirrors the F-029 locations
+    /// refresh), so a stale per-fh snapshot can never wrongly report
+    /// "nothing committed yet" for a file another fh already flushed.
+    /// `release()` uses `!committed_any` (never the transient per-flush
+    /// `locations` snapshot) to decide whether a flush failure may
+    /// ghost-unlink the file — a file with any committed chunk must never
+    /// be unlinked, and its drained-but-unsent segments must always be
+    /// restored instead.
+    committed_any: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -623,6 +634,7 @@ impl DtfsFilesystem {
                 lease_id,
                 lease_expires_at_ms,
                 lease_owner_id,
+                committed_any: false,
             },
         );
 
@@ -1259,11 +1271,6 @@ impl DtfsFilesystem {
         }
 
         let path = file.path.clone();
-        let was_fresh = file
-            .locations
-            .as_ref()
-            .map(|l| l.total_size == 0 && l.chunks.is_empty())
-            .unwrap_or(true);
         // P0-1: capture lease state for renewal-before-flush.
         let lease_id = file.lease_id.clone();
         let lease_expires_at_ms = file.lease_expires_at_ms;
@@ -1315,29 +1322,32 @@ impl DtfsFilesystem {
         let had_segments = !segments.is_empty();
         if had_segments {
             if let Err(e) = self.flush_segments_to_cluster(&path, &segments).await {
-                if was_fresh {
-                    warn!(
-                        path = %path,
-                        error = %e,
-                        "flush of fresh file failed; unlinking ghost entry to surface error",
-                    );
-                    if let Err(unlink_err) = self.client.delete_file(&path).await {
-                        warn!(
-                            path = %path,
-                            error = %unlink_err,
-                            "failed to unlink ghost file after flush failure",
-                        );
-                    }
-                    self.metadata_cache.remove(&path);
-                } else {
-                    // CO-1-8 (a): `flush_all` already drained these bytes out of
-                    // the buffer. The cluster write failed, so put them back —
-                    // otherwise the bytes are gone and a later (retried) fsync
-                    // returns Ok with the data silently lost. The next flush
-                    // re-sends them.
-                    self.write_buffer.restore_segments(&path, &segments);
-                }
+                // CR-1-4 (FUSE-3): ALWAYS restore the drained segments on a
+                // cluster-write failure, regardless of whether this file
+                // has ever committed anything before. `flush_all` already
+                // drained these bytes out of the buffer; without restoring
+                // them here, a file that already had chunks committed
+                // would silently lose its newest (uncommitted) tail on a
+                // transient failure (e.g. an election taking longer than
+                // the manager-walk deadline) — the ghost-unlink decision
+                // belongs to `release()`, not here, and must never run
+                // instead of this restore.
+                self.write_buffer.restore_segments(&path, &segments);
                 return Err(e);
+            }
+            // CR-1-4: mark every OpenFile sharing this path as having
+            // committed at least once, ever — this is what makes
+            // `release()`'s ghost-unlink decision safe. A per-fh snapshot
+            // of `locations` was stale between write-driven batch flushes
+            // (only refreshed by `flush()` itself), so a file that HAD
+            // committed several chunks via mid-stream batch flushes could
+            // still read as "fresh" (was_fresh) at a later `flush()` if a
+            // fresh OpenFile's `locations` snapshot predated those
+            // commits.
+            for mut entry in self.open_files.iter_mut() {
+                if entry.value().path == path {
+                    entry.value_mut().committed_any = true;
+                }
             }
         }
 
@@ -1421,6 +1431,30 @@ impl DtfsFilesystem {
                     self.write_buffer.remove(&file.path);
                 }
             }
+
+            // CR-1-4 (FUSE-3): the ghost-unlink now lives here, not in
+            // flush(), and fires ONLY when this path has NEVER committed a
+            // single chunk (`!committed_any` — tracked across every
+            // OpenFile of the path, so it can't go stale between
+            // write()-driven batch flushes). A file with any committed
+            // chunk is never unlinked on a flush failure; `flush()` always
+            // restores the drained segments instead so the next flush can
+            // retry them.
+            if should_ghost_unlink(flush_result.is_err(), file.committed_any) {
+                warn!(
+                    path = %file.path,
+                    "flush of never-committed file failed at release; unlinking ghost entry",
+                );
+                if let Err(unlink_err) = self.client.delete_file(&file.path).await {
+                    warn!(
+                        path = %file.path,
+                        error = %unlink_err,
+                        "failed to unlink ghost file after flush failure",
+                    );
+                }
+                self.metadata_cache.remove(&file.path);
+            }
+
             debug!(path = %file.path, fh, "file released");
         }
 
@@ -1496,6 +1530,7 @@ impl DtfsFilesystem {
                 lease_id: Some(lease_resp.lease_id),
                 lease_expires_at_ms: Some(lease_resp.expires_at_ms),
                 lease_owner_id: Some(owner_id),
+                committed_any: false,
             },
         );
 
@@ -2183,6 +2218,15 @@ fn chunks_needing_seed(
         .collect()
 }
 
+/// CR-1-4 (FUSE-3) — should `release()` ghost-unlink the path after a
+/// failed flush? Only when the flush actually failed AND the path has
+/// NEVER committed a single chunk. A file with any committed chunk must
+/// never be unlinked; `flush()` always restores its drained segments on
+/// failure instead, regardless of this decision.
+fn should_ghost_unlink(flush_failed: bool, committed_any: bool) -> bool {
+    flush_failed && !committed_any
+}
+
 /// CR-1-3 (FUSE-2) — true iff `remaining` (the OTHER open file handles,
 /// i.e. with the fh being released already excluded) contains a writable
 /// handle on `path`. Extracted so `release()`'s "who owns the write
@@ -2245,6 +2289,30 @@ mod cr_1_2_seed_tests {
         wb.write("/f", 4096, &vec![0u8; 4096]); // chunk 1 fully buffered
         let touched = chunks_needing_seed(&wb, "/f", 4096, 0, 4096 * 3);
         assert_eq!(touched, vec![0, 2]);
+    }
+}
+
+#[cfg(test)]
+mod cr_1_4_ghost_unlink_tests {
+    use super::should_ghost_unlink;
+
+    // A file that already committed at least one chunk must NEVER be
+    // ghost-unlinked, no matter how the flush fails — this is the FUSE-3
+    // regression: a 20 MB file with 4 chunks already committed via
+    // write()-driven batch flushes was unlinked (tail dropped) because a
+    // stale per-fh `was_fresh` snapshot said "fresh".
+    #[test]
+    fn never_unlinks_a_file_with_any_committed_chunk() {
+        assert!(!should_ghost_unlink(true, true), "committed_any must veto the unlink");
+        assert!(!should_ghost_unlink(false, true));
+    }
+
+    // A brand-new file (create()'d, never committed) whose only flush
+    // attempt fails is the one case the ghost-unlink exists for.
+    #[test]
+    fn unlinks_only_a_never_committed_file_on_flush_failure() {
+        assert!(should_ghost_unlink(true, false));
+        assert!(!should_ghost_unlink(false, false), "a successful flush is never unlinked");
     }
 }
 
