@@ -427,7 +427,7 @@ every turn, becomes noise); a `SessionStart` hook that prints cluster state
 | AIWF-1-3 | Condense Part A narratives into docs | `docs/src/internals/invariants.md`, `AGENTS.md`, `docs/src/SUMMARY.md` | AGENTS.md ≤ 250 lines; no invariant text lost (diff-reviewed) | ✅ |
 | AIWF-1-4 | Split the release-case contract out of Part B | `tests/release/README.md` | Contains STATUS line, `trap case_cleanup`, `wait_for`, numbering, QUICK_CASES rules | ✅ |
 | AIWF-1-5 | Update `plans/README.md` for D4/D5 | `plans/README.md` | States the ≥3-task trigger and the one-line verification-log form | ✅ |
-| AIWF-2-1 | Author `dtfs-explore`, `dtfs-intake` | `.claude/agents/*.md` | Each routes on `description` alone in a trial prompt | ⬜ |
+| AIWF-2-1 | Author `dtfs-explore`, `dtfs-intake` | `.claude/agents/*.md` | Each routes on `description` alone in a trial prompt | ✅ |
 | AIWF-2-2 | Author `dtfs-planner`, `dtfs-implementer` | `.claude/agents/*.md` | Implementer's build block matches the Docker command verbatim | ⬜ |
 | AIWF-2-3 | Author `dtfs-reviewer`, `dtfs-integrity-auditor` | `.claude/agents/*.md` | Output matches the CORE-REVIEW-2026-09-12 finding shape | ⬜ |
 | AIWF-2-4 | Author `dtfs-release-case-author` | `.claude/agents/*.md` | Produces a `bash -n`-clean case for a known past change | ⬜ |
@@ -459,6 +459,10 @@ roster is cheaper, not just tidier.
   extracted from the old B.5 prose.
 - AIWF-1-5 (2026-09-12): `plans/README.md` now states the >=3-task/
   multi-session/cross-crate trigger and the one-line verification-log form.
+- AIWF-2-1 (2026-09-12): added `.claude/agents/dtfs-explore.md` (haiku,
+  Read/Grep/Glob) and `.claude/agents/dtfs-intake.md` (sonnet, +
+  Bash(git log/show)); frontmatter checked against
+  https://code.claude.com/docs/en/sub-agents.
 
 ## 8. Risks / open questions
 
