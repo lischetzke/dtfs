@@ -491,7 +491,7 @@ impl AnchorPolicy {
     /// this anchor policy. `tier=None` is treated as "tier unknown" and
     /// fails any policy that requires a specific tier.
     pub fn is_satisfied_by(&self, dc: &str, tier: Option<DiskTier>) -> bool {
-        if dc != self.datacenter {
+        if !dc.eq_ignore_ascii_case(&self.datacenter) {
             return false;
         }
         match self.required_tier {
@@ -1016,6 +1016,19 @@ mod bug_av_types_tests {
         assert!(p.is_satisfied_by("leli", Some(DiskTier::Cold)));
         assert!(p.is_satisfied_by("leli", None));   // tier-unknown ok
         // But not other DCs.
+        assert!(!p.is_satisfied_by("toro", Some(DiskTier::Warm)));
+    }
+
+    /// CR-3-7 / CMN-5 — the datacenter compare is case-insensitive, so an
+    /// anchor configured as "leli" is satisfied by a node registered under
+    /// "LELI" (or any other casing). Without this, the anchor invariant is
+    /// permanently unsatisfiable whenever config/registration casing
+    /// diverges.
+    #[test]
+    fn cr_3_7_anchor_policy_dc_compare_is_case_insensitive() {
+        let p = AnchorPolicy::from_legacy("leli".to_string());
+        assert!(p.is_satisfied_by("LELI", Some(DiskTier::Cold)));
+        assert!(p.is_satisfied_by("LeLi", None));
         assert!(!p.is_satisfied_by("toro", Some(DiskTier::Warm)));
     }
 

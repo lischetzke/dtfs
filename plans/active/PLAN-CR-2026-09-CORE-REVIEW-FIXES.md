@@ -129,7 +129,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-3-4 | ⬜ | MGR-4, MGR-8, MGR-9 | `scheduler.rs` `register_replica_location_for_path` ~1338, `register_replica` (`MigrationOps`), Completing transition ~2814, `resolve_disk_id_for_tier` ~4206 | (a) `register_replica` returns `Result<(), String>`; on `Err` task stays `Completing`, `attempts += 1`, retry next tick, `Failed` + alert at the existing cap. (b) path lookup + index lookup under ONE SM read lock; hash not found in the file → skip + warn, never `unwrap_or(0)`. (c) register the new row for EVERY `chunk_index` in the file whose rows carry the hash. (d) `resolve_disk_id_for_tier` filters `DiskStatus::{Failed, Removed}`; none live → return `Err`, task not Done. | `advance_round_tests` mock: register error → task stays Completing, Done after retry succeeds; unit for (b): hash absent → no `UpdateChunkLocations` proposed; unit for (c): two indexes same hash → both rows added; unit for (d). | Tests fail before, pass after. |
 | CR-3-5 | ⬜ | MGR-5, MGR-6 | `scheduler.rs` `check_under_replicated` ~491/570, `schedule_replication`, `check_anchor_lag` ~867 | Use `task_blocks_requeue` in `check_under_replicated`'s dedup index and in `schedule_replication`. Source via `live_replica_tier`; target must satisfy `placement_cfg.has_room`. `check_anchor_lag`: honour `task_budget_available` (thread `created`/`live_tasks`), insert `(chunk, target)` into `existing_tasks` after each schedule. | scheduler unit: chunk with a recent Failed task → not re-queued; source on Failed disk not chosen; anchor-lag over N > budget chunks creates exactly budget tasks; two files same hash → one task. | Tests fail before, pass after. |
 | CR-3-6 | ⬜ | MGR-7 | `metadata.rs` heartbeat ~1250-1300, ~1385 | Capture `Err` from the `QuarantineNode` and `RemoveCorruptChunkReplicas` forwards; any failure → `accepted: false` in `HeartbeatResponse` (data node already re-enqueues on that, CO-3-7). Keep `AppendAudit` best-effort. | metadata unit (existing CO-3-7 test as template): forced forward failure → `accepted == false`. | Test fails before, passes after. |
-| CR-3-7 | ⬜ | CMN-5 | `crates/dtfs-common/src/types.rs` `AnchorPolicy::is_satisfied_by` ~494, `hash_ring.rs` ~255/282 | `eq_ignore_ascii_case` at the three sites. | types unit: `anchor "leli"` satisfied by `"LELI"`; ring test with mixed case. | Tests fail before, pass after. |
+| CR-3-7 | ✅ | CMN-5 | `crates/dtfs-common/src/types.rs` `AnchorPolicy::is_satisfied_by` ~494, `hash_ring.rs` ~255/282 | `eq_ignore_ascii_case` at the three sites. | types unit: `anchor "leli"` satisfied by `"LELI"`; ring test with mixed case. | Tests fail before, pass after. |
 | CR-3-8 | ⬜ | MGR-10 (optional, do if time) | `proto/data.proto` `ListChunksResponse`, `dtfs-data/src/server.rs` list_chunks, `scheduler.rs` orphan reap | Add positional `chunk_disk_ids`; key `expected_by_node` on `(node, disk)`; pass `Some(disk_id)` to the reap delete. Empty field → legacy node-wide. | scheduler unit: warm leftover + cold live row on one node → reaped on warm disk only. | Test passes; old-manager compat path covered. |
 | CR-3-9 | ⬜ | — | `tests/release/cases/105-demote-refused-when-anchor-node-down.sh`, `106-legacy-tiering-skips-av-volume.sh` | Shell cases. | `bash -n` clean. | Present, unexecuted. |
 | CR-3-10 | ⬜ | — | `AGENTS.md` A.3.4, A.8 scheduler/tiering entries | Document liveness in planners, register_replica Result, per-index registration, budget in anchor-lag, case-insensitive DC. | — | Same commit. |
@@ -472,6 +472,15 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   and `22-register-audit-idempotent.sh` for the corrupt/restart idiom and
   `100-fuse-rewrite-offset-zero.sh` for the FUSE probe shape; none added
   to `QUICK_CASES`.
+
+- **CR-3-7** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-common --release`: 104 -> 106 passed (2 new:
+  `types::bug_av_types_tests::cr_3_7_anchor_policy_dc_compare_is_case_insensitive`,
+  `hash_ring::tests::cr_3_7_anchor_dc_swap_is_case_insensitive`), 0 failed.
+  `AnchorPolicy::is_satisfied_by` and the two anchor-DC compares in
+  `hash_ring.rs` (`already_in_anchor`'s zip and the swap-candidate scan)
+  now use `eq_ignore_ascii_case` instead of `==`/`!=`, matching the
+  existing `SpillPolicy`/`read_location_priority` convention.
 
 - **CR-2-8** 2026-09-12. Added one sentence each to AGENTS.md A.3.1
   (the `now_ms` convention for a `ClientRequest` field that lands in
