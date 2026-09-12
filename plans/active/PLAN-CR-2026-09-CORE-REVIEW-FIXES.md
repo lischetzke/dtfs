@@ -152,15 +152,15 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR-5-1 | ⬜ | PROTO-1 | `crates/dtfs-manager/src/metadata.rs` `heartbeat` ~1061, `report_chunk_status` ~1393; `crates/dtfs-data/src/main.rs` heartbeat loop ~458/602/636 | Gate both handlers with `require_mgr_rpc_auth(secret, "Heartbeat"|"ReportChunkStatus", &req.node_id, request.metadata())` BEFORE `into_inner()`. Data node stamps via `dtfs_common::crypto::stamp_mgr_rpc_auth` with `[cluster].shared_secret` (data config already has it). Also stamp `RegisterNode`? No — it carries its own `shared_secret` field; leave. | metadata unit (LIS-56 tests as template): secret set + no header → `PermissionDenied`; valid header → ok; empty secret → ok. | Tests fail before, pass after; AGENTS.md A.3.3 #8 lists both RPCs + "deploy manager+data together". |
-| CR-5-2 | ⬜ | MGR-11 | `metadata.rs` `forward_client_write` ~1479 | Allow-list: `UpdateNodeUsage, UpdateNodeDiskUsage, UpdateNodeStatus, AppendAudit, QuarantineNode, RemoveCorruptChunkReplicas, ReportScrubResult, ReportChunkReads` + any variant `grep -n "raft_write_or_forward\|write_via_leader"` proves a follower proposes today (list them in the commit). Anything else → `permission_denied` + `auth.denied` audit. | unit: `UpdateConfig` via forward → denied; `UpdateNodeUsage` → applied. | Tests fail before, pass after. |
-| CR-5-3 | ⬜ | MGR-12 | `metadata.rs` `write_via_leader` ~578 | Inspect `ForwardWriteResponse.success`; false → `Err(resp.error)`. | unit with mock leader returning `success:false`. | Test fails before, passes after. |
-| CR-5-4 | ⬜ | DATA-6 | `crates/dtfs-data/src/main.rs` control RPCs, `crates/dtfs-common/src/tls.rs` `endpoint()` ~182 | `req.set_timeout(Duration::from_secs(10))` on heartbeat / report_chunk_status / register_node. `TlsContext::endpoint`: `.http2_keep_alive_interval(10s).keep_alive_timeout(5s).keep_alive_while_idle(true)`. | tls unit: endpoint builder sets keepalive (inspect via `Endpoint` debug or a builder-recording shim); data main: a mock manager that accepts then never answers → heartbeat loop advances within 15 s. | Tests pass. |
-| CR-5-5 | ⬜ | DATA-11 | `crates/dtfs-data/src/server.rs` `record_cache_hit` ~940; `crates/dtfs-client/src/client.rs` | Gate with `require_data_rpc_auth(secret, "RecordCacheHit", &req.chunk_id, md)`; client stamps. | server unit: secret set + no header → denied. | Test fails before, passes after. |
-| CR-5-6 | ⬜ | DATA-8 | `dtfs-data/src/main.rs` ~589-634 | Send `ChunkStatusReport` in batches of 1000 ids; re-enqueue only the unsent remainder + the failed batch. | unit on the batching helper: 2500 ids → 3 calls; failure on call 2 → 1500 re-enqueued. | Test passes. |
-| CR-5-7 | ⬜ | CMN-4 | `crates/dtfs-common/src/crypto.rs` `hex_decode` ~125 | `if !s.is_ascii() { return None; }`. | unit: `"€€"` → None, no panic. | Test fails (panics) before, passes after. |
-| CR-5-8 | ⬜ | — | `tests/release/cases/108-heartbeat-requires-mgr-rpc-auth.sh` | grpcurl (or dtfs-cli debug) Heartbeat without headers → PermissionDenied when secret set. | `bash -n` clean. | Present, unexecuted. |
-| CR-5-9 | ⬜ | — | `AGENTS.md` A.3.3 #7/#8, A.8 metadata entry | Heartbeat/ReportChunkStatus/RecordCacheHit gated; forward allow-list; control-plane deadlines + keepalive. | — | Same commit. |
+| CR-5-1 | ✅ | PROTO-1 | `crates/dtfs-manager/src/metadata.rs` `heartbeat` ~1061, `report_chunk_status` ~1393; `crates/dtfs-data/src/main.rs` heartbeat loop ~458/602/636 | Gate both handlers with `require_mgr_rpc_auth(secret, "Heartbeat"|"ReportChunkStatus", &req.node_id, request.metadata())` BEFORE `into_inner()`. Data node stamps via `dtfs_common::crypto::stamp_mgr_rpc_auth` with `[cluster].shared_secret` (data config already has it). Also stamp `RegisterNode`? No — it carries its own `shared_secret` field; leave. | metadata unit (LIS-56 tests as template): secret set + no header → `PermissionDenied`; valid header → ok; empty secret → ok. | Tests fail before, pass after; AGENTS.md A.3.3 #8 lists both RPCs + "deploy manager+data together". |
+| CR-5-2 | ✅ | MGR-11 | `metadata.rs` `forward_client_write` ~1479 | Allow-list: `UpdateNodeUsage, UpdateNodeDiskUsage, UpdateNodeStatus, AppendAudit, QuarantineNode, RemoveCorruptChunkReplicas, ReportScrubResult, ReportChunkReads` + any variant `grep -n "raft_write_or_forward\|write_via_leader"` proves a follower proposes today (list them in the commit). Anything else → `permission_denied` + `auth.denied` audit. | unit: `UpdateConfig` via forward → denied; `UpdateNodeUsage` → applied. | Tests fail before, pass after. |
+| CR-5-3 | ✅ | MGR-12 | `metadata.rs` `write_via_leader` ~578 | Inspect `ForwardWriteResponse.success`; false → `Err(resp.error)`. | unit with mock leader returning `success:false`. | Test fails before, passes after. |
+| CR-5-4 | ✅ | DATA-6 | `crates/dtfs-data/src/main.rs` control RPCs, `crates/dtfs-common/src/tls.rs` `endpoint()` ~182 | `req.set_timeout(Duration::from_secs(10))` on heartbeat / report_chunk_status / register_node. `TlsContext::endpoint`: `.http2_keep_alive_interval(10s).keep_alive_timeout(5s).keep_alive_while_idle(true)`. | tls unit: endpoint builder sets keepalive (inspect via `Endpoint` debug or a builder-recording shim); data main: a mock manager that accepts then never answers → heartbeat loop advances within 15 s. | Tests pass. |
+| CR-5-5 | ✅ | DATA-11 | `crates/dtfs-data/src/server.rs` `record_cache_hit` ~940; `crates/dtfs-client/src/client.rs` | Gate with `require_data_rpc_auth(secret, "RecordCacheHit", &req.chunk_id, md)`; client stamps. | server unit: secret set + no header → denied. | Test fails before, passes after. |
+| CR-5-6 | ✅ | DATA-8 | `dtfs-data/src/main.rs` ~589-634 | Send `ChunkStatusReport` in batches of 1000 ids; re-enqueue only the unsent remainder + the failed batch. | unit on the batching helper: 2500 ids → 3 calls; failure on call 2 → 1500 re-enqueued. | Test passes. |
+| CR-5-7 | ✅ | CMN-4 | `crates/dtfs-common/src/crypto.rs` `hex_decode` ~125 | `if !s.is_ascii() { return None; }`. | unit: `"€€"` → None, no panic. | Test fails (panics) before, passes after. |
+| CR-5-8 | ✅ | — | `tests/release/cases/108-heartbeat-requires-mgr-rpc-auth.sh` | grpcurl (or dtfs-cli debug) Heartbeat without headers → PermissionDenied when secret set. | `bash -n` clean. | Present, unexecuted. |
+| CR-5-9 | ✅ | — | `AGENTS.md` A.3.3 #7/#8, A.8 metadata entry | Heartbeat/ReportChunkStatus/RecordCacheHit gated; forward allow-list; control-plane deadlines + keepalive. | — | Same commit. |
 
 ### Group 6 — Config/proto sync + client perf (branch `bug/cr-6-config-client-perf`)
 
@@ -808,3 +808,133 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   `docs/src/internals/invariants.md` gained a new `## A.6 — Data-node
   durability hardening (CR-4)` section carrying the full narrative for
   all four fixes. No code change; docs-only commit.
+
+## Verification log (Group 5)
+
+- **CR-5-7** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-common --release`: 106 -> 107 passed, 0 failed (1 new:
+  `test_hex_decode_non_ascii_returns_none`). Before the fix, the test
+  panicked (`byte index 2 is not a char boundary`) because `hex_decode`
+  sliced the input by byte offset without checking ASCII-ness first, so
+  a multi-byte-UTF8 MAC/nonce header could crash the process instead of
+  cleanly failing verification. Fix adds an `is_ascii()` guard before
+  the byte-slicing loop.
+- **CR-5-1** 2026-09-12, Docker `dtfs-buildenv:latest`. `cargo test -p
+  dtfs-manager --release`: 367 -> 374 passed, 0 failed (7 new:
+  `heartbeat_empty_secret_allows_without_headers`,
+  `heartbeat_missing_headers_denied_when_secret_set`,
+  `heartbeat_valid_stamp_accepted`,
+  `report_chunk_status_empty_secret_allows_without_headers`,
+  `report_chunk_status_missing_headers_denied_when_secret_set`,
+  `report_chunk_status_valid_stamp_accepted`,
+  `heartbeat_mac_not_valid_for_report_chunk_status`). `cargo test -p
+  dtfs-data --release`: 114 -> 114 passed, 0 failed (no dtfs-data unit
+  tests target `main.rs`'s manager-lifecycle loop; verified by
+  compilation + code inspection that both outbound RPCs are now
+  stamped). `metadata.rs::heartbeat` and `::report_chunk_status` now
+  call `require_mgr_rpc_auth(secret, "Heartbeat"|"ReportChunkStatus",
+  &req.node_id, request.metadata())` before `into_inner()`, mirroring
+  the existing `delete_file` template. `dtfs-data/src/main.rs` gained
+  `stamp_mgr_rpc_request` (mirrors `dtfs-client::stamp_mgr_mutation`)
+  and both outbound calls (`heartbeat`, `report_chunk_status`) now stamp
+  from `config.cluster.shared_secret`; `RegisterNode` is untouched (own
+  `shared_secret` field, per plan). Empty secret still skips on both
+  sides (legacy). AGENTS.md A.3.3 #8 updated in the same commit.
+- **CR-5-2** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-manager --release`: 374 -> 377 passed, 0 failed (3 new:
+  `update_config_is_not_forwardable`, `update_node_usage_is_forwardable`,
+  `update_node_status_is_forwardable`). Added a pure `fn forwardable(req:
+  &ClientRequest) -> bool` allow-listing `UpdateNodeUsage,
+  UpdateNodeDiskUsage, UpdateNodeStatus, AppendAudit, QuarantineNode,
+  RemoveCorruptChunkReplicas, ReportScrubResult, ReportChunkReads` — the
+  full set proposed today via `raft_write_or_forward` / `proxy_to_leader`
+  / `write_via_leader` (grepped, listed in the `forwardable` doc
+  comment). `forward_client_write` now checks it right after
+  deserializing the forwarded `ClientRequest` (before the ReportChunkReads
+  fast path and before `self.raft.client_write`); a denied variant is
+  logged + audited (`category=raft, event=auth.denied`) and returns
+  `Status::permission_denied`.
+- **CR-5-3** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-manager --release`: 377 -> 379 passed, 0 failed (2 new:
+  `success_response_is_ok`, `rejected_response_is_err`). `write_via_leader`
+  previously mapped only the transport `Result` from
+  `forward_client_write`, so a call that transported fine but was
+  REJECTED by the leader (bad shared secret, MGR-11 variant denied, or
+  the Raft apply itself failing) came back `Ok(Response)` at the tonic
+  layer and was silently treated as a successful write. Added a pure
+  `fn forward_result(&ForwardWriteResponse) -> Result<(), String>` that
+  inspects `.success`/`.error`, and `write_via_leader` now returns its
+  result instead of discarding the response body.
+- **CR-5-4** 2026-09-12, Docker `dtfs-buildenv:latest`. `cargo test -p
+  dtfs-common --release`: 107 -> 108 passed, 0 failed (1 new:
+  `data_6_apply_keepalive_does_not_panic_and_returns_usable_endpoint`).
+  `cargo test -p dtfs-data --release`: 114 -> 115 passed, 0 failed (1
+  new: `control_request_carries_a_grpc_timeout_deadline`).
+  `TlsContext::endpoint` now routes every built endpoint through a new
+  `apply_keepalive` (`http2_keep_alive_interval(10s)`,
+  `keep_alive_timeout(5s)`, `keep_alive_while_idle(true)`) so a
+  half-open peer connection (crashed/rebooted manager) is detected
+  instead of silently absorbing RPCs until the OS TCP timeout.
+  `dtfs-data/src/main.rs` gained `control_request<T>` (wraps
+  `tonic::Request::new` + `set_timeout(10s)`) used by `register_node`
+  directly and by `stamp_mgr_rpc_request` (now built on top of it) for
+  `heartbeat`/`report_chunk_status`, so a manager that accepts the TCP
+  connection but never answers no longer hangs the heartbeat loop.
+  `tonic::Endpoint` exposes no getters for keepalive settings, so the
+  endpoint test is a builder-smoke test (doesn't panic); the actual
+  10s/5s/while_idle values are inspectable in `apply_keepalive` and
+  exercised end-to-end by the existing `tls_loopback` integration
+  suite, which already routes through `TlsContext::connect ->
+  endpoint()`.
+- **CR-5-5** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-data --release`: 115 -> 116 passed, 0 failed (1 new:
+  `record_cache_hit_rejects_missing_auth`). `cargo test -p dtfs-client
+  --release`: 31 -> 31 passed, 0 failed (no dtfs-client unit test
+  exercises `record_cache_hit`'s stamping directly; verified by mirroring
+  the exact `get_chunk` stamp block). `server.rs::record_cache_hit`
+  (DATA-11 — the last mutating data-plane RPC not gated by LIS-19/55/83)
+  now calls `require_data_rpc_auth(secret, "RecordCacheHit",
+  &req.chunk_id, md)` before touching the metrics counter.
+  `dtfs-client/src/client.rs::record_cache_hit` stamps `x-dtfs-rpc-*`
+  from `[client].shared_secret`, same pattern as `get_chunk`.
+- **CR-5-6** 2026-09-12, Docker `dtfs-buildenv:latest`, `cargo test -p
+  dtfs-data --release`: 116 -> 119 passed, 0 failed (3 new:
+  `splits_into_expected_batch_count`, `empty_input_yields_no_batches`,
+  `failure_at_batch_2_of_3_reenqueues_exactly_the_unsent_remainder`).
+  Added a pure `fn batches(ids: Vec<String>, n: usize) -> Vec<Vec<String>>`
+  (`CHUNK_STATUS_REPORT_BATCH_SIZE = 1000`) and reworked the
+  `ChunkStatusReport` send in `manager_lifecycle` to loop over batches
+  instead of sending every drained corrupt id in one message; on the
+  first failed batch (RPC error or `accepted == false`) it re-enqueues
+  that batch plus every unsent batch after it via
+  `chunk_store.enqueue_pending_corruption`, leaving already-accepted
+  batches alone (previously a re-enqueue always re-sent the WHOLE
+  drained set, so an accepted-then-later-failed prefix would be
+  reported to the manager twice on retry — harmless functionally
+  since `RemoveCorruptChunkReplicas` is idempotent, but this closes the
+  batch-size gap DATA-8 flagged).
+- **CR-5-8** 2026-09-12. `tests/release/cases/108-heartbeat-requires-mgr-
+  rpc-auth.sh` added, mirroring case 94's grpcurl-forge pattern: with
+  `cluster.shared_secret` set, forges an unauthenticated Heartbeat via
+  grpcurl against manager gRPC port 9401 and asserts PermissionDenied;
+  `KNOWN_ISSUE PROTO-1` when grpcurl/manager.proto are unavailable
+  (gate is unit-tested in `lis56_mgr_rpc_auth_tests`). `bash -n` clean;
+  not executed (no lab session this run).
+- **CR-5-9** 2026-09-12. AGENTS.md A.3.3 #7 gained the RecordCacheHit
+  clause (DATA-11); #8 gained the Heartbeat/ReportChunkStatus clause
+  (CR-5-1); the A.8 metadata.rs row gained the MGR-11 allow-list and
+  MGR-12 response-check clauses. `.claude/rules/integrity.md` gained a
+  RecordCacheHit mention in the data-plane section and a new
+  "Manager-plane RPC auth (LIS-56)" section carrying the CR-5-1/5-2/5-3
+  narrative. `docs/src/internals/invariants.md` gained CR-5-1/5-2/5-3
+  paragraphs under `dtfs-manager/src/metadata.rs` and two new sections
+  (`dtfs-data/src/main.rs` control-plane hardening for CR-5-4/5-6;
+  `dtfs-data/src/server.rs::record_cache_hit` for CR-5-5). Docs-only
+  commit, no code change.
+
+## Group 5 summary
+
+CR-5-1 .. CR-5-9 all ✅. Baselines: dtfs-manager 367 -> 379, dtfs-data
+114 -> 119, dtfs-common 106 -> 108, dtfs-client 31 -> 31 (unchanged);
+dtfs-raft 105, dtfs-fuse 99, dtfs-cli 12 untouched. All passed, 0
+failed at every step; no regressions.

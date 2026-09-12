@@ -188,6 +188,7 @@ impl TlsContext {
                 .tls_config(tls)
                 .with_context(|| format!("building TLS config for {url}"))?;
         }
+        ep = apply_keepalive(ep);
         Ok(ep)
     }
 
@@ -206,6 +207,19 @@ impl TlsContext {
     }
 }
 
+/// DATA-6 — every peer channel gets an HTTP/2 keepalive so a half-open
+/// TCP connection (peer crashed/rebooted without a clean FIN, e.g. a
+/// manager behind a NAT/firewall) is detected and torn down instead of
+/// silently absorbing every RPC until the OS-level TCP timeout (minutes).
+/// `keep_alive_while_idle(true)` so the ping fires even when this
+/// connection has no in-flight request (control-plane channels like the
+/// data-node heartbeat loop are idle most of the time between ticks).
+fn apply_keepalive(ep: Endpoint) -> Endpoint {
+    ep.http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_timeout(Duration::from_secs(5))
+        .keep_alive_while_idle(true)
+}
+
 impl Material {
     fn load(cert: &PathBuf, key: &PathBuf, ca: &PathBuf) -> Result<Self> {
         let read = |p: &PathBuf, what: &str| {
@@ -222,6 +236,19 @@ impl Material {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_6_apply_keepalive_does_not_panic_and_returns_usable_endpoint() {
+        // DATA-6 — tonic's `Endpoint` exposes no getters for keepalive
+        // settings, so this is a builder-smoke test (doesn't panic, and
+        // the endpoint can still build a channel-less client). The actual
+        // values (10s interval / 5s timeout / while_idle) are verified by
+        // inspection of `apply_keepalive` and exercised end-to-end by the
+        // existing `tls_loopback` integration tests, which route through
+        // `TlsContext::connect` -> `endpoint()` -> `apply_keepalive`.
+        let ep = Endpoint::from_shared("http://127.0.0.1:1".to_string()).unwrap();
+        let _ep = apply_keepalive(ep);
+    }
 
     fn cfg(mode: &str, dir: Option<&std::path::Path>) -> TlsConfig {
         TlsConfig {

@@ -123,6 +123,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.is_ascii() {
+        return None;
+    }
     if s.len() % 2 != 0 {
         return None;
     }
@@ -323,6 +326,13 @@ pub fn verify_mgr_rpc_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hex_decode_non_ascii_returns_none() {
+        // CMN-4: a non-ASCII MAC header must not panic on the byte-slice
+        // indexing inside hex_decode (char boundaries != byte offsets).
+        assert_eq!(hex_decode("\u{20ac}\u{20ac}"), None);
+    }
 
     #[test]
     fn test_hmac_roundtrip() {
