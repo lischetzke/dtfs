@@ -1248,6 +1248,16 @@ impl DtfsFilesystem {
             .get(&fh)
             .context("invalid file handle")?;
 
+        // CR-1-3 (FUSE-2): the kernel issues FUSE flush on every close(2),
+        // including a read-only open. A reader closing a file a writer is
+        // still streaming into must never touch the writer's path-keyed
+        // write buffer — that forced a mid-stream partial commit of the
+        // writer's tail and could drop bytes the writer buffered in the
+        // meantime. Bail out before doing anything for a non-writable fh.
+        if !file.flags.is_writable() {
+            return Ok(());
+        }
+
         let path = file.path.clone();
         let was_fresh = file
             .locations
@@ -1388,11 +1398,29 @@ impl DtfsFilesystem {
                     );
                 }
             }
-            // Clean up write buffer for this path. On a flush failure the
-            // un-flushed bytes are dropped here (the data is lost on the
-            // cluster too) but the error is propagated below so the caller
-            // sees the failure rather than a silent success.
-            self.write_buffer.remove(&file.path);
+            // CR-1-3 (FUSE-2): only a writable fh may drop the path-keyed
+            // write buffer, and only when no OTHER writable fh on the same
+            // path remains open. Without this, a reader's release() (e.g.
+            // a Plex scanner closing a file a downloader is still
+            // streaming into) drained the writer's buffer — bytes the
+            // writer had buffered, or that CO-1-8's `restore_segments` had
+            // just put back, vanished with no error surfaced to the
+            // writer. `file` (this fh) has already been removed from
+            // `open_files` above, so the scan below only sees OTHER fhs.
+            if file.flags.is_writable() {
+                let remaining: Vec<(String, OpenFlags)> = self
+                    .open_files
+                    .iter()
+                    .map(|e| (e.value().path.clone(), e.value().flags))
+                    .collect();
+                if !other_writer_open(&remaining, &file.path) {
+                    // On a flush failure the un-flushed bytes are dropped
+                    // here (the data is lost on the cluster too) but the
+                    // error is propagated below so the caller sees the
+                    // failure rather than a silent success.
+                    self.write_buffer.remove(&file.path);
+                }
+            }
             debug!(path = %file.path, fh, "file released");
         }
 
@@ -2155,6 +2183,17 @@ fn chunks_needing_seed(
         .collect()
 }
 
+/// CR-1-3 (FUSE-2) — true iff `remaining` (the OTHER open file handles,
+/// i.e. with the fh being released already excluded) contains a writable
+/// handle on `path`. Extracted so `release()`'s "who owns the write
+/// buffer" decision is testable without a live `DtfsFilesystem`/
+/// `DtfsClient`.
+fn other_writer_open(remaining: &[(String, OpenFlags)], path: &str) -> bool {
+    remaining
+        .iter()
+        .any(|(p, flags)| p == path && flags.is_writable())
+}
+
 /// Bug BU-2 — did this write error originate from a data-node out-of-space
 /// (ENOSPC)? `client::write_chunk_bytes` surfaces the gRPC status code in
 /// its error message (`code=ResourceExhausted`) after exhausting the Bug G
@@ -2206,6 +2245,45 @@ mod cr_1_2_seed_tests {
         wb.write("/f", 4096, &vec![0u8; 4096]); // chunk 1 fully buffered
         let touched = chunks_needing_seed(&wb, "/f", 4096, 0, 4096 * 3);
         assert_eq!(touched, vec![0, 2]);
+    }
+}
+
+#[cfg(test)]
+mod cr_1_3_flush_release_gating_tests {
+    use super::{other_writer_open, OpenFlags};
+
+    // open RO + RW on the same path: releasing the RO fh must NOT drop the
+    // write buffer while the RW fh (a writer still mid-stream) is open.
+    #[test]
+    fn ro_release_must_not_win_when_a_writer_is_still_open() {
+        let remaining_after_ro_removed =
+            vec![("/f".to_string(), OpenFlags::ReadWrite)];
+        assert!(
+            other_writer_open(&remaining_after_ro_removed, "/f"),
+            "the RW fh is still open, so the RO release must not drop the buffer"
+        );
+    }
+
+    // Releasing the RW fh (the last writer) with no other writable fh left
+    // open must clear the way to drop the write buffer.
+    #[test]
+    fn rw_release_with_no_other_writer_frees_the_buffer() {
+        let remaining_after_rw_removed: Vec<(String, OpenFlags)> = vec![];
+        assert!(!other_writer_open(&remaining_after_rw_removed, "/f"));
+
+        // A remaining READ-ONLY fh on the same path must not count as a
+        // writer either.
+        let remaining_with_only_a_reader =
+            vec![("/f".to_string(), OpenFlags::ReadOnly)];
+        assert!(!other_writer_open(&remaining_with_only_a_reader, "/f"));
+    }
+
+    // A writable fh on a DIFFERENT path must never block this path's
+    // buffer from being dropped.
+    #[test]
+    fn other_path_writer_is_irrelevant() {
+        let remaining = vec![("/other".to_string(), OpenFlags::ReadWrite)];
+        assert!(!other_writer_open(&remaining, "/f"));
     }
 }
 
