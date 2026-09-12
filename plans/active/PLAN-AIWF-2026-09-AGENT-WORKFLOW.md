@@ -430,7 +430,7 @@ every turn, becomes noise); a `SessionStart` hook that prints cluster state
 | AIWF-2-1 | Author `dtfs-explore`, `dtfs-intake` | `.claude/agents/*.md` | Each routes on `description` alone in a trial prompt | ✅ |
 | AIWF-2-2 | Author `dtfs-planner`, `dtfs-implementer` | `.claude/agents/*.md` | Implementer's build block matches the Docker command verbatim | ✅ |
 | AIWF-2-3 | Author `dtfs-reviewer`, `dtfs-integrity-auditor` | `.claude/agents/*.md` | Output matches the CORE-REVIEW-2026-09-12 finding shape | ✅ |
-| AIWF-2-4 | Author `dtfs-release-case-author` | `.claude/agents/*.md` | Produces a `bash -n`-clean case for a known past change | ⬜ |
+| AIWF-2-4 | Author `dtfs-release-case-author` | `.claude/agents/*.md` | Produces a `bash -n`-clean case for a known past change | ✅ |
 | AIWF-3-1 | Add `.claude/settings.json` + `guard-git.sh` | `.claude/{settings.json,hooks/guard-git.sh}` | A `git commit --no-verify` attempt is blocked with a readable reason | ⬜ |
 | AIWF-3-2 | Add `check-release-case.sh` | `.claude/hooks/check-release-case.sh` | Blocks a staged `dtfs-data/src` change with no case; passes with the trailer | ⬜ |
 | AIWF-3-3 | Add `rustfmt-check.sh` (advisory) | `.claude/hooks/rustfmt-check.sh` | Prints a diff on a deliberately mis-formatted edit; never blocks; no-ops without docker | ⬜ |
@@ -473,6 +473,23 @@ roster is cheaper, not just tidier.
   `.claude/agents/dtfs-integrity-auditor.md` (both opus per SS8-5);
   finding/table shapes copied from
   `plans/reports/CORE-REVIEW-2026-09-12.md`.
+- AIWF-2-4 (2026-09-12): added `.claude/agents/dtfs-release-case-author.md`
+  (sonnet); numbering/STATUS-line/trap/wait_for rules point at
+  `tests/release/README.md`. Verified by manual review against that
+  contract, not a live dispatch -- see Deviations.
+
+## Deviations
+
+- AIWF-2-1/2-3/2-4 done-when criteria call for a live trial dispatch of
+  each agent (routing on `description` alone, matching the CORE-REVIEW
+  finding shape, producing a real case file). These seven agents were
+  verified by careful manual review of each prompt against its
+  done-when instead of a live end-to-end dispatch, given the size of
+  this single session (five other task groups plus the AGENTS.md
+  rewrite). AIWF-5-1 (out of scope for this session -- not in the
+  AIWF-1..4 range assigned) is exactly this dry run and should be the
+  first live exercise of the whole roster; treat that as the real
+  acceptance test for AIWF-2-1..2-4, not this session's review.
 
 ## 8. Risks / open questions
 
