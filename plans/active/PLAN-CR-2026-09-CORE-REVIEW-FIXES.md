@@ -123,16 +123,16 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR-3-1 | ⬜ | MGR-2 | `crates/dtfs-manager/src/tiering.rs` `build_av_cache_snapshot` ~853, `plan_chunk_demotions` ~1953; `scheduler.rs` `FlushSnapshot::from_sm` ~2933, `plan_flush_cache` ~3108 | Resolve every placement tier through `scheduler::live_replica_tier(sm, node_id, disk_id)` (returns `None` for Down/Failed node or Failed/Removed disk). `None` → placement excluded from `mandatory_still_present` / `mandatory_survives` (still listed so it can be dropped itself). | planner unit tests (existing `co_1_2_*`, `plan_flush_cache` tests as templates): cold anchor on Down node + warm cache → demote/flush REFUSED with `anchor_protected` / `mandatory_refusals`; same with node Healthy → allowed. | Tests fail before, pass after. |
-| CR-3-2 | ⬜ | MGR-2 (defence) | `crates/dtfs-raft/src/state_machine.rs` `apply_remove_chunk_location` ~2040 | Independent of anchor: refuse (`Error("last live replica")`) when the row being removed is the last live replica of `(path, chunk_index)` (`live` = node not Down/Failed, disk not Failed/Removed, using the existing survivor scan). Keep `enforce_anchor` logic. | SM unit: two rows, one on Down node; remove the live one → Error; remove the Down one → ok. | Test fails before, passes after. |
-| CR-3-3 | ⬜ | MGR-1 | `crates/dtfs-manager/src/metadata.rs` ReportChunkReads intercept ~1500; `tiering.rs` `evaluate` ~327 | Intercept: look up `sm_data` for the file(s) referencing `chunk_id` and the replica tier on `node_id` (`live_replica_tier`); pass real `file_path` + tier; skip `report_access` when the chunk is unknown. `evaluate`: `continue` when `path_to_volume.get(&profile.file_path).is_none()` (defence). | tiering unit: profile with `file_path: ""` yields zero legacy decisions; AV-volume chunk reported through the intercept yields zero legacy decisions; non-AV volume chunk still classifies. | Tests fail before, pass after. |
-| CR-3-4 | ⬜ | MGR-4, MGR-8, MGR-9 | `scheduler.rs` `register_replica_location_for_path` ~1338, `register_replica` (`MigrationOps`), Completing transition ~2814, `resolve_disk_id_for_tier` ~4206 | (a) `register_replica` returns `Result<(), String>`; on `Err` task stays `Completing`, `attempts += 1`, retry next tick, `Failed` + alert at the existing cap. (b) path lookup + index lookup under ONE SM read lock; hash not found in the file → skip + warn, never `unwrap_or(0)`. (c) register the new row for EVERY `chunk_index` in the file whose rows carry the hash. (d) `resolve_disk_id_for_tier` filters `DiskStatus::{Failed, Removed}`; none live → return `Err`, task not Done. | `advance_round_tests` mock: register error → task stays Completing, Done after retry succeeds; unit for (b): hash absent → no `UpdateChunkLocations` proposed; unit for (c): two indexes same hash → both rows added; unit for (d). | Tests fail before, pass after. |
-| CR-3-5 | ⬜ | MGR-5, MGR-6 | `scheduler.rs` `check_under_replicated` ~491/570, `schedule_replication`, `check_anchor_lag` ~867 | Use `task_blocks_requeue` in `check_under_replicated`'s dedup index and in `schedule_replication`. Source via `live_replica_tier`; target must satisfy `placement_cfg.has_room`. `check_anchor_lag`: honour `task_budget_available` (thread `created`/`live_tasks`), insert `(chunk, target)` into `existing_tasks` after each schedule. | scheduler unit: chunk with a recent Failed task → not re-queued; source on Failed disk not chosen; anchor-lag over N > budget chunks creates exactly budget tasks; two files same hash → one task. | Tests fail before, pass after. |
-| CR-3-6 | ⬜ | MGR-7 | `metadata.rs` heartbeat ~1250-1300, ~1385 | Capture `Err` from the `QuarantineNode` and `RemoveCorruptChunkReplicas` forwards; any failure → `accepted: false` in `HeartbeatResponse` (data node already re-enqueues on that, CO-3-7). Keep `AppendAudit` best-effort. | metadata unit (existing CO-3-7 test as template): forced forward failure → `accepted == false`. | Test fails before, passes after. |
-| CR-3-7 | ⬜ | CMN-5 | `crates/dtfs-common/src/types.rs` `AnchorPolicy::is_satisfied_by` ~494, `hash_ring.rs` ~255/282 | `eq_ignore_ascii_case` at the three sites. | types unit: `anchor "leli"` satisfied by `"LELI"`; ring test with mixed case. | Tests fail before, pass after. |
-| CR-3-8 | ⬜ | MGR-10 (optional, do if time) | `proto/data.proto` `ListChunksResponse`, `dtfs-data/src/server.rs` list_chunks, `scheduler.rs` orphan reap | Add positional `chunk_disk_ids`; key `expected_by_node` on `(node, disk)`; pass `Some(disk_id)` to the reap delete. Empty field → legacy node-wide. | scheduler unit: warm leftover + cold live row on one node → reaped on warm disk only. | Test passes; old-manager compat path covered. |
-| CR-3-9 | ⬜ | — | `tests/release/cases/105-demote-refused-when-anchor-node-down.sh`, `106-legacy-tiering-skips-av-volume.sh` | Shell cases. | `bash -n` clean. | Present, unexecuted. |
-| CR-3-10 | ⬜ | — | `AGENTS.md` A.3.4, A.8 scheduler/tiering entries | Document liveness in planners, register_replica Result, per-index registration, budget in anchor-lag, case-insensitive DC. | — | Same commit. |
+| CR-3-1 | ✅ | MGR-2 | `crates/dtfs-manager/src/tiering.rs` `build_av_cache_snapshot` ~853, `plan_chunk_demotions` ~1953; `scheduler.rs` `FlushSnapshot::from_sm` ~2933, `plan_flush_cache` ~3108 | Resolve every placement tier through `scheduler::live_replica_tier(sm, node_id, disk_id)` (returns `None` for Down/Failed node or Failed/Removed disk). `None` → placement excluded from `mandatory_still_present` / `mandatory_survives` (still listed so it can be dropped itself). | planner unit tests (existing `co_1_2_*`, `plan_flush_cache` tests as templates): cold anchor on Down node + warm cache → demote/flush REFUSED with `anchor_protected` / `mandatory_refusals`; same with node Healthy → allowed. | Tests fail before, pass after. |
+| CR-3-2 | ✅ | MGR-2 (defence) | `crates/dtfs-raft/src/state_machine.rs` `apply_remove_chunk_location` ~2040 | Independent of anchor: refuse (`Error("last live replica")`) when the row being removed is the last live replica of `(path, chunk_index)` (`live` = node not Down/Failed, disk not Failed/Removed, using the existing survivor scan). Keep `enforce_anchor` logic. | SM unit: two rows, one on Down node; remove the live one → Error; remove the Down one → ok. | Test fails before, passes after. |
+| CR-3-3 | ✅ | MGR-1 | `crates/dtfs-manager/src/metadata.rs` ReportChunkReads intercept ~1500; `tiering.rs` `evaluate` ~327 | Intercept: look up `sm_data` for the file(s) referencing `chunk_id` and the replica tier on `node_id` (`live_replica_tier`); pass real `file_path` + tier; skip `report_access` when the chunk is unknown. `evaluate`: `continue` when `path_to_volume.get(&profile.file_path).is_none()` (defence). | tiering unit: profile with `file_path: ""` yields zero legacy decisions; AV-volume chunk reported through the intercept yields zero legacy decisions; non-AV volume chunk still classifies. | Tests fail before, pass after. |
+| CR-3-4 | ✅ | MGR-4, MGR-8, MGR-9 | `scheduler.rs` `register_replica_location_for_path` ~1338, `register_replica` (`MigrationOps`), Completing transition ~2814, `resolve_disk_id_for_tier` ~4206 | (a) `register_replica` returns `Result<(), String>`; on `Err` task stays `Completing`, `attempts += 1`, retry next tick, `Failed` + alert at the existing cap. (b) path lookup + index lookup under ONE SM read lock; hash not found in the file → skip + warn, never `unwrap_or(0)`. (c) register the new row for EVERY `chunk_index` in the file whose rows carry the hash. (d) `resolve_disk_id_for_tier` filters `DiskStatus::{Failed, Removed}`; none live → return `Err`, task not Done. | `advance_round_tests` mock: register error → task stays Completing, Done after retry succeeds; unit for (b): hash absent → no `UpdateChunkLocations` proposed; unit for (c): two indexes same hash → both rows added; unit for (d). | Tests fail before, pass after. |
+| CR-3-5 | ✅ | MGR-5, MGR-6 | `scheduler.rs` `check_under_replicated` ~491/570, `schedule_replication`, `check_anchor_lag` ~867 | Use `task_blocks_requeue` in `check_under_replicated`'s dedup index and in `schedule_replication`. Source via `live_replica_tier`; target must satisfy `placement_cfg.has_room`. `check_anchor_lag`: honour `task_budget_available` (thread `created`/`live_tasks`), insert `(chunk, target)` into `existing_tasks` after each schedule. | scheduler unit: chunk with a recent Failed task → not re-queued; source on Failed disk not chosen; anchor-lag over N > budget chunks creates exactly budget tasks; two files same hash → one task. | Tests fail before, pass after. |
+| CR-3-6 | ✅ | MGR-7 | `metadata.rs` heartbeat ~1250-1300, ~1385 | Capture `Err` from the `QuarantineNode` and `RemoveCorruptChunkReplicas` forwards; any failure → `accepted: false` in `HeartbeatResponse` (data node already re-enqueues on that, CO-3-7). Keep `AppendAudit` best-effort. | metadata unit (existing CO-3-7 test as template): forced forward failure → `accepted == false`. | Test fails before, passes after. |
+| CR-3-7 | ✅ | CMN-5 | `crates/dtfs-common/src/types.rs` `AnchorPolicy::is_satisfied_by` ~494, `hash_ring.rs` ~255/282 | `eq_ignore_ascii_case` at the three sites. | types unit: `anchor "leli"` satisfied by `"LELI"`; ring test with mixed case. | Tests fail before, pass after. |
+| CR-3-8 | 🟥 | MGR-10 (optional, do if time) | `proto/data.proto` `ListChunksResponse`, `dtfs-data/src/server.rs` list_chunks, `scheduler.rs` orphan reap | Add positional `chunk_disk_ids`; key `expected_by_node` on `(node, disk)`; pass `Some(disk_id)` to the reap delete. Empty field → legacy node-wide. | scheduler unit: warm leftover + cold live row on one node → reaped on warm disk only. | Test passes; old-manager compat path covered. |
+| CR-3-9 | ✅ | — | `tests/release/cases/105-demote-refused-when-anchor-node-down.sh`, `106-legacy-tiering-skips-av-volume.sh` | Shell cases. | `bash -n` clean. | Present, unexecuted. |
+| CR-3-10 | ✅ | — | `AGENTS.md` A.3.4, A.8 scheduler/tiering entries | Document liveness in planners, register_replica Result, per-index registration, budget in anchor-lag, case-insensitive DC. | — | Same commit. |
 
 ### Group 4 — Data-node durability (branch `bug/cr-4-data-durability`)
 
@@ -191,6 +191,14 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 3. Implementer finishes with workspace suite green, pushes, opens a PR titled `bug: <group summary ≤72 chars>` labelled `bug`, and reports: tasks done, tasks 🟥 with reason, test counts before/after per crate, deviations.
 4. Lead reviews the diff against each finding's "Done when", runs the crate suites once more, merges (merge commit), and starts the next group from the updated `master`.
 5. After Group 6: lead re-reads every HIGH/MEDIUM finding against `master` and records OPEN/FIXED in the report's summary table; then deletes this plan file (§ B.2 retention).
+
+## Deviations (Group 3)
+
+- CR-3-8 (MGR-10, optional): deferred — proto change (`ListChunksResponse`
+  positional `chunk_disk_ids`) + data-node fill + reaper re-keying is a
+  multi-file, cross-crate change (proto/dtfs-data/dtfs-manager) explicitly
+  marked "optional, do if time" in the task brief; skipped to land the
+  required CR-3-1..3-7, 3-9, 3-10 tasks. MGR-10 stays open in the report.
 
 ## Verification log
 
@@ -472,6 +480,203 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   and `22-register-audit-idempotent.sh` for the corrupt/restart idiom and
   `100-fuse-rewrite-offset-zero.sh` for the FUSE probe shape; none added
   to `QUICK_CASES`.
+
+- **CR-3-7** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-common --release`: 104 -> 106 passed (2 new:
+  `types::bug_av_types_tests::cr_3_7_anchor_policy_dc_compare_is_case_insensitive`,
+  `hash_ring::tests::cr_3_7_anchor_dc_swap_is_case_insensitive`), 0 failed.
+  `AnchorPolicy::is_satisfied_by` and the two anchor-DC compares in
+  `hash_ring.rs` (`already_in_anchor`'s zip and the swap-candidate scan)
+  now use `eq_ignore_ascii_case` instead of `==`/`!=`, matching the
+  existing `SpillPolicy`/`read_location_priority` convention.
+
+- **CR-3-1** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-manager --release`: 346 -> 348 passed (2 new:
+  `scheduler::bug_av_flush_cache_tests::cr_3_1_flush_refused_when_mandatory_replica_is_on_dead_node`,
+  `tiering::audit_co_tests::cr_3_1_demote_refused_when_only_surviving_mandatory_replica_is_dead`),
+  0 failed. `FlushNodeSummary.disk_tiers` is now `Vec<(u32, DiskTier,
+  bool)>` — the bool is `live_replica_tier(node, disk_id).is_some()`
+  resolved once in `FlushSnapshot::from_sm`; `plan_flush_cache`'s
+  `mandatory_survives` now requires the surviving entry to also be
+  live (`entry_live`). `tiering::TickPlacement` gained a `live: bool`
+  field, resolved the same way in `build_av_cache_snapshot`;
+  `plan_chunk_demotions`'s `mandatory_still_present` now requires the
+  other placement to be `live`. Test helpers `node_summary` (scheduler)
+  and `placement` (tiering) default to live; added
+  `node_summary_with_liveness` / `dead_placement` for the dead-replica
+  cases. `demote_preserves_anchor` (the separate anchor check) is
+  untouched — MGR-2's finding and fix scope are the two named
+  "mandatory" functions only.
+
+- **CR-3-2** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-raft --release`: 104 -> 105 passed (1 new:
+  `state_machine::posix_path_regression::cr_3_2_last_live_replica_guard_is_independent_of_anchor`),
+  0 failed. `apply_remove_chunk_location` now refuses (`Error("...would
+  remove the last live replica...")`) when the row being removed is
+  live and no other live replica of the same `(path, chunk_index)`
+  survives, regardless of whether `enforce_anchor` is set. The check
+  runs AFTER the existing anchor survivor scan (not before) so a
+  volume with an anchor policy keeps the more specific "would strand
+  anchor" message when both checks would refuse the same removal —
+  needed to keep `rev_3_7_a_dead_replica_cannot_satisfy_the_anchor`'s
+  message assertions passing unchanged (it failed on first pass with
+  the check ordered before the anchor block; reordering, not the test,
+  was the fix, since the anchor-specific message is more informative
+  for an anchor volume).
+
+- **CR-3-3** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-manager --release`: 348 -> 352 passed (4 new:
+  `metadata::tests::cr_3_3_unknown_chunk_resolves_to_none`,
+  `metadata::tests::cr_3_3_known_chunk_resolves_real_path_and_tier`,
+  `metadata::tests::cr_3_3_dead_replica_falls_back_to_hot_tier`,
+  `tiering::audit_co_tests::cr_3_3_legacy_path_should_skip_truth_table`),
+  0 failed. The `ReportChunkReads` intercept in
+  `forward_client_write` now resolves the real `file_path` (via
+  `scheduler::files_referencing_chunk`) and the replica's real tier on
+  `node_id` (via `scheduler::live_replica_tier`) through a new pure
+  `metadata::resolve_chunk_read_context` helper, instead of always
+  passing `""` / `DiskTier::Hot`; an unknown chunk is skipped entirely.
+  `tiering::evaluate` now runs the CO-4-6 AV-volume skip through a new
+  pure `legacy_path_should_skip(file_path, path_to_volume,
+  av_cache_volumes)` helper that also skips when `file_path` resolves
+  to no known file (closing the case an unresolvable path used to fall
+  through to the legacy path). No test stands up a full `TieringEngine`
+  (no scaffold exists in this crate for that, same gap noted in Group 1
+  for `DtfsClient`); both fixes are covered at the exact new decision
+  boundary each introduced, which is what actually changed.
+
+- **CR-3-4** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-manager --release`: 352 -> 359 passed (7 new:
+  `scheduler::advance_round_tests::cr_3_4_register_failure_keeps_task_completing_then_succeeds`,
+  `scheduler::advance_round_tests::cr_3_4_register_failure_fails_task_at_attempt_cap`,
+  `scheduler::bug_ch_live_replica_tests::dead_disk_of_the_tier_is_not_resolved`,
+  `scheduler::cr_3_4_plan_replica_registration_tests::{unresolvable_hash_yields_no_writes,
+  duplicate_hash_within_one_file_registers_every_index,
+  already_present_replica_is_not_duplicated,
+  shared_hash_registers_against_every_file}`), 0 failed.
+  (a) `MigrationOps::register_replica` now returns `Result<(), String>`;
+  the Completing dispatch routes `Err` through the existing
+  `record_copy_failure` helper (bumps `attempts`, stays Completing,
+  Failed+alert only at `MAX_MIGRATION_ATTEMPTS` — message text still
+  says "Copying retry queued", a cosmetic mismatch noted rather than
+  forking the helper). (b)/(c) `register_replica_location` collapsed to
+  ONE SM read lock and delegates to a new pure
+  `plan_replica_registration(files, chunk_hash, target_node,
+  resolved_disk_id)`, which registers the new replica at EVERY
+  chunk_index in EVERY referencing file that carries the hash (was:
+  first file, first index, under two separately-acquired locks) and
+  returns no writes at all when the hash is unresolvable (was:
+  `unwrap_or(0)`, silently mis-registering at index 0). (d)
+  `resolve_disk_id_for_tier` now returns `Option<u32>`, filtering
+  Failed/Removed disks; `None` propagates as an `Err` from
+  `register_replica_location` before any write is attempted. Existing
+  callers/tests of `resolve_disk_id_for_tier` updated for the new
+  `Option` return.
+
+- **CR-3-5** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-manager --release`: 359 -> 364 passed (5 new:
+  `scheduler::bug_ch_live_replica_tests::{pick_live_source_skips_dead_disk,
+  pick_live_source_none_when_all_dead, pick_backfill_target_skips_full_disk,
+  pick_backfill_target_respects_exclude}`,
+  `scheduler::bug_av_anchor_lag_tests::cr_3_5_anchor_lag_dedup_within_one_pass`),
+  0 failed. `check_under_replicated`'s dedup index and
+  `schedule_replication`'s `already_scheduled` check now both use
+  `task_blocks_requeue` (covers the pre-existing
+  `task_blocks_requeue(Failed) == true` unit test) instead of a bespoke
+  `!= Done && != Failed`, so a lingering Failed task's retention window
+  also blocks an immediate re-queue. Source selection now goes through
+  a new pure `pick_live_source` (first entry whose `live_replica_tier`
+  resolves, not "any row on a healthy node"); target selection through
+  a new pure `pick_backfill_target`, requiring `placement_cfg.has_room`
+  on the candidate disk — `TaskScheduler` gained a `placement_cfg`
+  field (constructor parameter, wired from `config.placement.clone()`
+  in `main.rs`; the sole call site). `check_anchor_lag` now threads a
+  `created`/`live_tasks` pair through `task_budget_available` (same
+  bound as `check_under_replicated`) and inserts the just-scheduled
+  `(chunk_id, target_node)` into `existing_tasks` immediately after
+  each schedule, not only once at the top of the pass — proven by the
+  new `cr_3_5_anchor_lag_dedup_within_one_pass` test, which shows a
+  second file sharing the hash is refused once the set is updated
+  inline. No test exercises the full async `check_anchor_lag`/
+  `check_under_replicated` methods directly (no `TaskScheduler`+`DtfsRaft`
+  test harness exists in this crate); each new decision point is
+  covered at the pure-function boundary it now goes through instead.
+
+- **CR-3-6** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-manager --release`: 364 -> 365 passed (1 new:
+  `metadata::tests::cr_3_6_integrity_fault_batch_accepted_truth_table`),
+  0 failed. The heartbeat handler's integrity-fault-batch block now
+  captures `Err` from both the `QuarantineNode` and (when the batch
+  carries chunk ids) `RemoveCorruptChunkReplicas` forwards and combines
+  them through a new pure `integrity_fault_batch_accepted(quarantine_ok,
+  remove_corrupt_ok)`; either failure sets the outer `accepted` (now a
+  `let mut` seeded true, returned as `HeartbeatResponse.accepted`
+  instead of the previous hardcoded `true`) to false. The data node
+  already re-enqueues drained faults on `!accepted` (Bug BF-5), so this
+  closes the same class of election-window drop that CO-3-7 fixed for
+  `report_chunk_status`. `AppendAudit` stays best-effort (`let _ =`),
+  unchanged. No test exercises the full `heartbeat` gRPC handler (no
+  `MetadataService`+`DtfsRaft` test harness exists in this crate, same
+  gap noted for CR-3-3); the new decision point
+  (`integrity_fault_batch_accepted`) is covered directly.
+
+- **CR-3-9** 2026-09-12. Added
+  `tests/release/cases/105-demote-refused-when-anchor-node-down.sh`
+  (CR-3-1/CR-3-2/MGR-2: anchor cold=1 dc-a + warm cache, promote a warm
+  copy, stop the cold anchor's data node, assert `flush_cache(warm)` is
+  refused — warm copy survives — while the anchor is Down, then
+  succeeds once the node is healthy again) and
+  `tests/release/cases/106-legacy-tiering-skips-av-volume.sh`
+  (CR-3-3/MGR-1: active AV cache policy, write+read a file to generate
+  `ReportChunkReads`, assert the audit log carries no legacy
+  `Bug BX-4`/Tape-migration rows for that file's chunks). Both modeled
+  on `62-demote-colocated-anchor-survives.sh` (anchor+cache setup,
+  `set-anchor`/`set-mandatory`/`set-cache`, `count_replicas_in_dc_tier`/
+  `count_replicas_in_tier`) and `30-stale-liveness-downgrade.sh`
+  (stop/restart a data node, poll for health transition); `trap
+  case_cleanup EXIT`, last line `pass` (-> `STATUS: PASS`), `known_issue`
+  fallbacks for lab-topology gaps (no dc-a cold node, promotion not
+  landing in the poll window), not in `QUICK_CASES`. `bash -n` clean on
+  both. NOT executed — no lab, per the plan's Build/verify environment
+  section.
+
+- **CR-3-10** 2026-09-12. AGENTS.md A.3.4 gained one sentence on
+  liveness-gated planner survivors (CR-3-1/CR-3-2) and one on the
+  case-insensitive anchor-DC compare (CR-3-7); the A.8 scheduler.rs row
+  gained a summary sentence covering CR-3-1..3-6. `.claude/rules/
+  integrity.md`'s Mandatory-vs-cache-replicas section gained the
+  CR-3-1/CR-3-2 liveness-planner paragraph. `docs/src/internals/
+  invariants.md` gained the full narrative: a CR-3-1/CR-3-2 block under
+  § A.3.4, a CR-3-1..3-6 block under the `scheduler.rs` A.8 entry, and a
+  CR-3-3/CR-3-6 block under the `metadata.rs` A.8 entry. No code change;
+  docs-only commit.
+
+- **CR-3-3 review fixups (R1/R2, coordinator PR #107 review)** 2026-09-12,
+  Docker `dtfs-buildenv:latest`, `cargo test -p dtfs-manager --release`:
+  365 -> 367 passed (net +2: removed
+  `cr_3_3_dead_replica_falls_back_to_hot_tier`, added
+  `metadata::tests::cr_3_3_dead_replica_resolves_to_none`,
+  `metadata::tests::cr_3_3_batch_index_resolves_only_wanted_hashes`,
+  `metadata::tests::cr_3_3_batch_index_omits_unresolvable_hash`),
+  0 failed. **R1/MGR-3** — the `ReportChunkReads` intercept held the SM
+  read lock across every `tiering.report_access(...).await` in the loop
+  (each of which takes tiering's own `access_stats` write lock) and
+  called `resolve_chunk_read_context` (an O(files x chunks)
+  `files_referencing_chunk` scan) per entry, so an N-entry heartbeat
+  cost O(N x total_chunks) under the SM read lock while blocking the
+  fair Raft apply writer. Replaced with a new pure
+  `build_chunk_read_context_index(files, nodes, wanted, node_id)` that
+  resolves every wanted chunk hash in ONE pass over `sm.files`; the
+  intercept now builds the index under one short `sm_data.read()`,
+  drops the lock, then loops `report_access` with no SM lock held.
+  **R2/MGR-1** — `resolve_chunk_read_context` (kept as the single-chunk
+  helper for direct testing) and the new batch index both stopped
+  falling back to `DiskTier::Hot` when a replica's tier can't be
+  resolved as live; that reintroduced the fabricated-tier bug CR-3-3
+  set out to fix. Both now resolve to `None`/no-entry for a dead
+  replica, and the intercept skips `report_access` entirely for such an
+  entry (`tracing::debug!` on the skip) instead of feeding the engine a
+  synthetic tier.
 
 - **CR-2-8** 2026-09-12. Added one sentence each to AGENTS.md A.3.1
   (the `now_ms` convention for a `ClientRequest` field that lands in
