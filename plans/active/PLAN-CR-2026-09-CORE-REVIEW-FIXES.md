@@ -104,7 +104,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-1-5 | ✅ | DATA-5 (FUSE half) | `filesystem.rs` `write_chunk_bytes(&addr, "", ..)` ~1927, `crates/dtfs-client/src/client.rs` put path | FUSE hashes each segment (BLAKE3, `dtfs_common::checksum`) before the put and sends the hex in `PutChunkRequest.chunk_id` of the first piece. After the put, compare `put_resp.chunk_id` to the local hex; mismatch → treat as put failure (retry next replica / return Err), never commit the location. | unit: mock data node returning a different id → segment not committed, error surfaced. | Test fails before, passes after. |
 | CR-1-6 | ✅ | FUSE-4 | `crates/dtfs-fuse/src/fuse_adapter.rs` readdir ~793, readdirplus ~865, unlink/rmdir/mkdir/rename/link/symlink bare EIO/ENOENT sites | Route every `map_err` through `cluster_err_to_errno`. | fuse_adapter unit: `cluster_err_to_errno` already tested; add a test that readdir on a mock returning `Unavailable` yields EIO not ENOENT. | grep shows zero `Errno::from(libc::ENOENT)` in error-mapping closures outside the helper. |
 | CR-1-7 | ✅ | — | `tests/release/cases/100-fuse-rewrite-offset-zero.sh`, `101-fuse-reader-close-does-not-drain-writer.sh` | Case 100: write 12 MB file, `dd conv=notrunc` 1 KB at offset 0 and at offset 4 MB−512, `cmp` against a local reference. Case 101: writer streams 20 MB with `pv -L`, reader `cat file > /dev/null` mid-stream, `cmp` after writer closes. | `bash -n` clean. | Cases present; STATUS line; documented as unexecuted in the verification log. |
-| CR-1-8 | ⬜ | — | `AGENTS.md` A.8 `filesystem.rs`/`writebuf.rs` entries | Document the per-chunk buffer, fh-gated flush/release, `committed_any`, end-to-end `chunk_id`. | — | Same commit as the code it describes. |
+| CR-1-8 | ✅ | — | `AGENTS.md` A.8 `filesystem.rs`/`writebuf.rs` entries | Document the per-chunk buffer, fh-gated flush/release, `committed_any`, end-to-end `chunk_id`. | — | Same commit as the code it describes. |
 
 ### Group 2 — Raft state-machine correctness (branch `bug/cr-2-raft-sm`)
 
@@ -325,3 +325,11 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   tests/release/cases/100-fuse-rewrite-offset-zero.sh` and `...101-...sh`
   -> no output, exit 0). NOT executed — no lab, per the plan's Build/verify
   environment section.
+
+- **CR-1-8** 2026-09-12. Updated `AGENTS.md` A.8's `filesystem.rs` entry
+  (added CR-1-1..CR-1-5 paragraphs: per-chunk `ChunkBuf` map, RMW seed
+  scope + O_APPEND ordering, flush/release writable-fh gating,
+  `committed_any` + relocated ghost-unlink, end-to-end BLAKE3 `chunk_id`)
+  and the `fuse_adapter.rs` entry (CR-1-6: `readdir`/`readdirplus`/
+  `mkdir`/`unlink`/`rmdir`/`create`/`rename`/`symlink`/`link` now route
+  through `cluster_err_to_errno`). Own commit per the task instructions.
