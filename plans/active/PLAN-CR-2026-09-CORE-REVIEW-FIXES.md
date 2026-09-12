@@ -152,7 +152,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR-5-1 | ⬜ | PROTO-1 | `crates/dtfs-manager/src/metadata.rs` `heartbeat` ~1061, `report_chunk_status` ~1393; `crates/dtfs-data/src/main.rs` heartbeat loop ~458/602/636 | Gate both handlers with `require_mgr_rpc_auth(secret, "Heartbeat"|"ReportChunkStatus", &req.node_id, request.metadata())` BEFORE `into_inner()`. Data node stamps via `dtfs_common::crypto::stamp_mgr_rpc_auth` with `[cluster].shared_secret` (data config already has it). Also stamp `RegisterNode`? No — it carries its own `shared_secret` field; leave. | metadata unit (LIS-56 tests as template): secret set + no header → `PermissionDenied`; valid header → ok; empty secret → ok. | Tests fail before, pass after; AGENTS.md A.3.3 #8 lists both RPCs + "deploy manager+data together". |
+| CR-5-1 | ✅ | PROTO-1 | `crates/dtfs-manager/src/metadata.rs` `heartbeat` ~1061, `report_chunk_status` ~1393; `crates/dtfs-data/src/main.rs` heartbeat loop ~458/602/636 | Gate both handlers with `require_mgr_rpc_auth(secret, "Heartbeat"|"ReportChunkStatus", &req.node_id, request.metadata())` BEFORE `into_inner()`. Data node stamps via `dtfs_common::crypto::stamp_mgr_rpc_auth` with `[cluster].shared_secret` (data config already has it). Also stamp `RegisterNode`? No — it carries its own `shared_secret` field; leave. | metadata unit (LIS-56 tests as template): secret set + no header → `PermissionDenied`; valid header → ok; empty secret → ok. | Tests fail before, pass after; AGENTS.md A.3.3 #8 lists both RPCs + "deploy manager+data together". |
 | CR-5-2 | ⬜ | MGR-11 | `metadata.rs` `forward_client_write` ~1479 | Allow-list: `UpdateNodeUsage, UpdateNodeDiskUsage, UpdateNodeStatus, AppendAudit, QuarantineNode, RemoveCorruptChunkReplicas, ReportScrubResult, ReportChunkReads` + any variant `grep -n "raft_write_or_forward\|write_via_leader"` proves a follower proposes today (list them in the commit). Anything else → `permission_denied` + `auth.denied` audit. | unit: `UpdateConfig` via forward → denied; `UpdateNodeUsage` → applied. | Tests fail before, pass after. |
 | CR-5-3 | ⬜ | MGR-12 | `metadata.rs` `write_via_leader` ~578 | Inspect `ForwardWriteResponse.success`; false → `Err(resp.error)`. | unit with mock leader returning `success:false`. | Test fails before, passes after. |
 | CR-5-4 | ⬜ | DATA-6 | `crates/dtfs-data/src/main.rs` control RPCs, `crates/dtfs-common/src/tls.rs` `endpoint()` ~182 | `req.set_timeout(Duration::from_secs(10))` on heartbeat / report_chunk_status / register_node. `TlsContext::endpoint`: `.http2_keep_alive_interval(10s).keep_alive_timeout(5s).keep_alive_while_idle(true)`. | tls unit: endpoint builder sets keepalive (inspect via `Endpoint` debug or a builder-recording shim); data main: a mock manager that accepts then never answers → heartbeat loop advances within 15 s. | Tests pass. |
@@ -819,3 +819,24 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   a multi-byte-UTF8 MAC/nonce header could crash the process instead of
   cleanly failing verification. Fix adds an `is_ascii()` guard before
   the byte-slicing loop.
+- **CR-5-1** 2026-09-12, Docker `dtfs-buildenv:latest`. `cargo test -p
+  dtfs-manager --release`: 367 -> 374 passed, 0 failed (7 new:
+  `heartbeat_empty_secret_allows_without_headers`,
+  `heartbeat_missing_headers_denied_when_secret_set`,
+  `heartbeat_valid_stamp_accepted`,
+  `report_chunk_status_empty_secret_allows_without_headers`,
+  `report_chunk_status_missing_headers_denied_when_secret_set`,
+  `report_chunk_status_valid_stamp_accepted`,
+  `heartbeat_mac_not_valid_for_report_chunk_status`). `cargo test -p
+  dtfs-data --release`: 114 -> 114 passed, 0 failed (no dtfs-data unit
+  tests target `main.rs`'s manager-lifecycle loop; verified by
+  compilation + code inspection that both outbound RPCs are now
+  stamped). `metadata.rs::heartbeat` and `::report_chunk_status` now
+  call `require_mgr_rpc_auth(secret, "Heartbeat"|"ReportChunkStatus",
+  &req.node_id, request.metadata())` before `into_inner()`, mirroring
+  the existing `delete_file` template. `dtfs-data/src/main.rs` gained
+  `stamp_mgr_rpc_request` (mirrors `dtfs-client::stamp_mgr_mutation`)
+  and both outbound calls (`heartbeat`, `report_chunk_status`) now stamp
+  from `config.cluster.shared_secret`; `RegisterNode` is untouched (own
+  `shared_secret` field, per plan). Empty secret still skips on both
+  sides (legacy). AGENTS.md A.3.3 #8 updated in the same commit.
