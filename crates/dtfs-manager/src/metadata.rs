@@ -329,6 +329,18 @@ fn compute_self_quarantine_cleared(is_quarantined: bool, reported_fault_count: u
     !is_quarantined && reported_fault_count == 0
 }
 
+/// CR-3-6/MGR-7 — both forwarded Raft writes for a heartbeat's
+/// integrity-fault batch (`QuarantineNode` and, when the batch carries
+/// chunk ids, `RemoveCorruptChunkReplicas`) must succeed for the batch
+/// to count as accepted. Either failure means the node is not
+/// quarantined and/or the corrupt replica is not de-located, so the
+/// caller must surface `HeartbeatResponse.accepted = false` — the data
+/// node already re-enqueues its drained faults on that (Bug BF-5),
+/// mirroring the CO-3-7 contract `report_chunk_status` already has.
+fn integrity_fault_batch_accepted(quarantine_ok: bool, remove_corrupt_ok: bool) -> bool {
+    quarantine_ok && remove_corrupt_ok
+}
+
 /// CO-3-8 — may a heartbeat re-stamp this node's health back to Healthy?
 ///
 /// The heartbeat handler raft-writes `UpdateNodeStatus(healthy)` every
@@ -811,6 +823,101 @@ fn node_id_from_grpc_addr(sm: &StateMachineData, addr: &str) -> String {
         .unwrap_or_else(|| addr.to_string())
 }
 
+/// CR-3-3/MGR-1 — resolve the real `file_path` + the replica's real,
+/// LIVE tier on `node_id` for a single `ReportChunkReads` entry, so the
+/// tiering intercept stops feeding the engine a synthetic `""` /
+/// `DiskTier::Hot` profile. Returns `None` when the chunk references no
+/// known file (already deleted/GC'd, or never existed) OR when the
+/// reporting node's replica cannot be resolved as LIVE via
+/// `scheduler::live_replica_tier` (unknown disk, or the node/disk is
+/// Down/Failed/Removed) — R2/MGR-1 review: falling back to a fake
+/// `DiskTier::Hot` here reintroduces exactly the fabricated-tier bug
+/// this task set out to fix (`evaluate` would plan a bogus Hot->Warm
+/// "demote" for an unresolvable replica). The caller skips the report
+/// entirely on `None` rather than fabricate data.
+///
+/// This single-chunk helper stays for direct unit testing; the real
+/// `ReportChunkReads` intercept uses the batch
+/// `build_chunk_read_context_index` below (R1/MGR-3) so a heartbeat with
+/// N entries costs one pass over `sm.files`, not N.
+fn resolve_chunk_read_context(
+    sm: &StateMachineData,
+    chunk_id: &str,
+    node_id: u64,
+) -> Option<(String, DiskTier)> {
+    let file_path = crate::scheduler::files_referencing_chunk(&sm.files, chunk_id)
+        .into_iter()
+        .next()?;
+    let node_id_str = node_id.to_string();
+    let disk_id = sm.files.get(&file_path).and_then(|fm| {
+        fm.chunks
+            .iter()
+            .find(|c| c.chunk_hash == chunk_id && c.node_id == node_id_str)
+            .map(|c| c.disk_id)
+    });
+    let tier = disk_id.and_then(|d| crate::scheduler::live_replica_tier(sm.nodes.get(&node_id), d))?;
+    Some((file_path, tier))
+}
+
+/// R1/MGR-3 — build the `(file_path, live_tier)` lookup for exactly the
+/// chunk ids in `wanted` (one `ReportChunkReads` batch) with a SINGLE
+/// pass over `sm.files`, instead of one `files_referencing_chunk`
+/// O(files x chunks) scan per reported chunk. Pre-fix, the intercept
+/// held the SM read lock across every `tiering.report_access(...).await`
+/// in the per-entry loop (each of which takes tiering's own
+/// `access_stats` write lock) AND re-scanned the whole file tree per
+/// entry — O(N x total_chunks) work under the SM read lock for an
+/// N-entry heartbeat, blocking the (fair) Raft apply writer for the
+/// duration (the MGR-3 anti-pattern).
+///
+/// For each wanted `chunk_hash`, records the FIRST referencing file's
+/// path (by `sm.files`' BTreeMap/lexicographic order, matching
+/// `files_referencing_chunk`'s "first match" semantics) and, within
+/// THAT SAME file's rows, the live tier of the row whose `node_id`
+/// matches the reporting node (`None` when no such row exists or its
+/// replica cannot be resolved as live — R2: never a fabricated tier).
+/// A `None` tier entry is still returned (with the resolved path) so
+/// the caller can log the skip; it must NOT be fed to `report_access`.
+pub(crate) fn build_chunk_read_context_index(
+    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
+    nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+    wanted: &std::collections::HashSet<String>,
+    node_id: u64,
+) -> std::collections::HashMap<String, (String, Option<DiskTier>)> {
+    use std::collections::hash_map::Entry;
+    let node_id_str = node_id.to_string();
+    let mut out: std::collections::HashMap<String, (String, Option<DiskTier>)> = std::collections::HashMap::new();
+    for (path, fm) in files.iter() {
+        for c in &fm.chunks {
+            if !wanted.contains(&c.chunk_hash) {
+                continue;
+            }
+            match out.entry(c.chunk_hash.clone()) {
+                Entry::Occupied(mut o) => {
+                    // Path already fixed by the first referencing file.
+                    // Only fill in the tier if it's still unresolved AND
+                    // this row belongs to that SAME file AND matches the
+                    // reporting node — a later file's rows never
+                    // override the first file's path (matches
+                    // files_referencing_chunk's "first match" pick).
+                    if o.get().1.is_none() && o.get().0 == *path && c.node_id == node_id_str {
+                        o.get_mut().1 = crate::scheduler::live_replica_tier(nodes.get(&node_id), c.disk_id);
+                    }
+                }
+                Entry::Vacant(v) => {
+                    let tier = if c.node_id == node_id_str {
+                        crate::scheduler::live_replica_tier(nodes.get(&node_id), c.disk_id)
+                    } else {
+                        None
+                    };
+                    v.insert((path.clone(), tier));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// CO-4-13 — resolve the CF-3b ack floor for a `commit_chunk_locations`
 /// call as the STRICTER of two volume floors:
 ///   * the floor of the volume the file is actually registered under
@@ -1221,6 +1328,11 @@ impl ManagerService for MetadataService {
         // metadata operation for the duration.
         // Older data nodes don't emit field 10; for them the vec is
         // empty + this block is a no-op (back-compat with pre-BF data).
+        // CR-3-6/MGR-7 — surfaced to the caller as `HeartbeatResponse.
+        // accepted`; the data node re-enqueues its drained faults / any
+        // dropped ChunkStatusReport-equivalent state when this comes back
+        // false (CO-3-7 parity).
+        let mut accepted = true;
         if !req.integrity_faults.is_empty() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1288,16 +1400,35 @@ impl ManagerService for MetadataService {
                      (faults={reported} chunks={distinct})"
                 ),
             };
-            let _ = self
+            // CR-3-6/MGR-7 — capture failures from BOTH forwarded writes
+            // and surface them as `accepted: false` via
+            // `integrity_fault_batch_accepted` (mirrors the CO-3-7 fix
+            // for `report_chunk_status`, which this heartbeat path
+            // previously lacked). During an election (or any transient
+            // forward failure) a `let _ =` here left the node neither
+            // quarantined nor de-located, and the corrupt replica stayed
+            // advertised healthy until the next scrub; the data node
+            // already re-enqueues drained faults when the ack is
+            // `accepted == false` (Bug BF-5, CO-3-7 parity).
+            let quarantine_ok = match self
                 .raft_write_or_forward(ClientRequest::QuarantineNode { node_id, info })
-                .await;
+                .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, node_id, "CR-3-6: failed to commit QuarantineNode from heartbeat integrity fault");
+                    false
+                }
+            };
             // Drop the (node, chunk) replica entries so the
             // under-replication scheduler immediately picks a healthy
             // source + re-replicates. RemoveCorruptChunkReplicas takes a
             // batch (the same shape `report_chunk_status` uses for the
             // Bug O scrub path), so ONE write covers every reported chunk.
-            if !batch.chunk_ids.is_empty() {
-                let _ = self
+            let remove_corrupt_ok = if batch.chunk_ids.is_empty() {
+                true
+            } else {
+                match self
                     .raft_write_or_forward(ClientRequest::RemoveCorruptChunkReplicas { now_ms: stamp_now_ms(),
                         node_id: node_id.to_string(),
                         chunk_hashes: batch.chunk_ids,
@@ -1307,7 +1438,17 @@ impl ManagerService for MetadataService {
                         // would need a proto change and is out of scope here.
                         disk_id: dtfs_raft::legacy_disk_id(),
                     })
-                    .await;
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::warn!(error = %e, node_id, "CR-3-6: failed to commit RemoveCorruptChunkReplicas from heartbeat integrity fault");
+                        false
+                    }
+                }
+            };
+            if !integrity_fault_batch_accepted(quarantine_ok, remove_corrupt_ok) {
+                accepted = false;
             }
             tracing::warn!(
                 node_id,
@@ -1392,7 +1533,7 @@ impl ManagerService for MetadataService {
         });
 
         Ok(Response::new(HeartbeatResponse {
-            accepted: true,
+            accepted,
             config_version: cfg_version,
             config_update,
             self_quarantine_cleared,
@@ -1513,19 +1654,64 @@ impl ManagerService for MetadataService {
         // chunks served via other managers never promote.
         if let ClientRequest::ReportChunkReads { node_id, entries } = &req {
             if let Some(tiering) = &self.tiering {
+                // CR-3-3/MGR-1 — resolve the REAL file_path + the
+                // replica's REAL tier on `node_id` before feeding the
+                // tiering engine. Pre-fix this always passed `""` /
+                // `DiskTier::Hot`, which made `evaluate`'s CO-4-6
+                // AV-volume skip a no-op (`path_to_volume.get("")` is
+                // always `None`) and fed the legacy temperature path
+                // fabricated data for every reported chunk.
+                //
+                // R1/MGR-3 review fix — build the whole batch's lookup
+                // under ONE short SM read lock (one pass over
+                // `sm.files`), then DROP the lock before awaiting
+                // `report_access` (which takes tiering's own
+                // `access_stats` write lock per call). Pre-fix this held
+                // the SM read lock across every `report_access(...).await`
+                // in the loop AND re-scanned the whole file tree per
+                // entry via `resolve_chunk_read_context` — O(N x
+                // total_chunks) work under the SM lock for an N-entry
+                // heartbeat, blocking the Raft apply writer (tokio
+                // RwLock is fair) for the duration.
+                let wanted: std::collections::HashSet<String> =
+                    entries.iter().map(|(id, _)| id.clone()).collect();
+                let index = {
+                    let sm = self.sm_data.read().await;
+                    build_chunk_read_context_index(&sm.files, &sm.nodes, &wanted, *node_id)
+                };
                 for (chunk_id, reads_by_dc) in entries {
                     let total: u32 = reads_by_dc.values().sum();
-                    tiering
-                        .report_access(
-                            chunk_id,
-                            "",
-                            total,
-                            total,
-                            reads_by_dc.clone(),
-                            dtfs_common::types::DiskTier::Hot,
-                            *node_id,
-                        )
-                        .await;
+                    match index.get(chunk_id) {
+                        // Unknown chunk (already deleted/GC'd) — skip
+                        // rather than feed the engine a synthetic
+                        // profile for content that no longer exists.
+                        None => {
+                            tracing::debug!(chunk_id, node_id, "CR-3-3: unknown chunk in ReportChunkReads, skipping");
+                            continue;
+                        }
+                        // R2/MGR-1 — the replica's tier could not be
+                        // resolved as LIVE (unknown disk, or the node/
+                        // disk is Down/Failed/Removed). NEVER fall back
+                        // to a fake tier here — that is exactly the
+                        // fabricated-Hot-tier bug this task fixed.
+                        Some((_, None)) => {
+                            tracing::debug!(chunk_id, node_id, "CR-3-3/R2: replica tier not live, skipping report_access");
+                            continue;
+                        }
+                        Some((file_path, Some(tier))) => {
+                            tiering
+                                .report_access(
+                                    chunk_id,
+                                    file_path,
+                                    total,
+                                    total,
+                                    reads_by_dc.clone(),
+                                    *tier,
+                                    *node_id,
+                                )
+                                .await;
+                        }
+                    }
                 }
             }
             let response_json = serde_json::to_vec(&ClientResponse::Success)
@@ -3740,6 +3926,19 @@ mod tests {
         assert!(!heartbeat_may_mark_healthy(HealthStatus::Quarantined));
     }
 
+    /// CR-3-6/MGR-7 — the heartbeat integrity-fault batch is accepted
+    /// only when BOTH forwarded writes succeed; either failure means the
+    /// node is neither quarantined nor de-located, so the caller must
+    /// report `accepted = false` (CO-3-7 parity: the data node
+    /// re-enqueues drained faults on that).
+    #[test]
+    fn cr_3_6_integrity_fault_batch_accepted_truth_table() {
+        assert!(integrity_fault_batch_accepted(true, true));
+        assert!(!integrity_fault_batch_accepted(false, true), "QuarantineNode failed");
+        assert!(!integrity_fault_batch_accepted(true, false), "RemoveCorruptChunkReplicas failed");
+        assert!(!integrity_fault_batch_accepted(false, false), "both failed");
+    }
+
     /// CO-4-13 — a file registered under a floor=2 volume must enforce
     /// floor 2 even when the commit request claims a different (or
     /// unknown) volume that resolves to the default floor.
@@ -3785,6 +3984,153 @@ mod tests {
         // Unknown file (first commit) → only the request volume governs.
         assert_eq!(resolve_ack_floor(&sm, "/movies/new.mkv", "strict", 1), 2);
         assert_eq!(resolve_ack_floor(&sm, "/movies/new.mkv", "default", 1), 1);
+    }
+
+    /// CR-3-3/MGR-1 helper — a Data node with one disk of the given tier.
+    fn mk_data_node(tier: DiskTier) -> RaftNodeInfo {
+        RaftNodeInfo {
+            role: NodeRole::Data,
+            hostname: "data-1".to_string(),
+            grpc_addr: String::new(),
+            location: Location::new("lab", "leli", "rack-1", "data-1"),
+            disks: vec![dtfs_common::types::DiskInfo {
+                disk_id: 0,
+                uuid: String::new(),
+                mount_path: String::new(),
+                tier,
+                total_bytes: 0,
+                used_bytes: 0,
+                status: DiskStatus::Healthy,
+            }],
+            total_capacity: 0,
+            used_capacity: 0,
+            health: HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    fn file_with_chunk(
+        path: &str,
+        chunk_hash: &str,
+        node_id: u64,
+        disk_id: u32,
+    ) -> dtfs_raft::state_machine::FileMetadata {
+        dtfs_raft::state_machine::FileMetadata {
+            path: path.to_string(),
+            volume_id: "default".to_string(),
+            chunk_size: 4 * 1024 * 1024,
+            chunks: vec![dtfs_raft::ChunkLocationEntry {
+                chunk_index: 0,
+                chunk_hash: chunk_hash.to_string(),
+                node_id: node_id.to_string(),
+                disk_id,
+                size_bytes: 1024,
+            }],
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// CR-3-3/MGR-1 — an unknown chunk (no file references it) resolves
+    /// to `None`, so the intercept skips the report instead of feeding
+    /// the tiering engine a synthetic `""` file_path / `Hot` tier.
+    #[test]
+    fn cr_3_3_unknown_chunk_resolves_to_none() {
+        let sm = StateMachineData::default();
+        assert!(resolve_chunk_read_context(&sm, "no-such-hash", 1).is_none());
+    }
+
+    /// CR-3-3/MGR-1 — a known chunk resolves to its real file_path and
+    /// the replica's real tier on the reporting node.
+    #[test]
+    fn cr_3_3_known_chunk_resolves_real_path_and_tier() {
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(1, mk_data_node(DiskTier::Warm));
+        sm.files.insert(
+            "/movies/x.mkv".to_string(),
+            file_with_chunk("/movies/x.mkv", "h0", 1, 0),
+        );
+        let (path, tier) = resolve_chunk_read_context(&sm, "h0", 1).expect("known chunk");
+        assert_eq!(path, "/movies/x.mkv");
+        assert_eq!(tier, DiskTier::Warm);
+    }
+
+    /// R2/MGR-1 review fix — a replica on a Down node cannot be resolved
+    /// to a serviceable tier via `live_replica_tier`. It must resolve to
+    /// `None` (skip the report), NEVER fall back to a fake `Hot` tier —
+    /// that reintroduces the exact fabricated-tier bug this task fixed
+    /// (`evaluate` would plan a bogus Hot->Warm "demote" for a replica
+    /// that isn't actually being served).
+    #[test]
+    fn cr_3_3_dead_replica_resolves_to_none() {
+        let mut sm = StateMachineData::default();
+        let mut node = mk_data_node(DiskTier::Cold);
+        node.health = HealthStatus::Down;
+        sm.nodes.insert(1, node);
+        sm.files.insert(
+            "/movies/x.mkv".to_string(),
+            file_with_chunk("/movies/x.mkv", "h0", 1, 0),
+        );
+        assert!(
+            resolve_chunk_read_context(&sm, "h0", 1).is_none(),
+            "a dead replica must never fabricate a Hot tier"
+        );
+    }
+
+    /// R1/MGR-3 review fix — `build_chunk_read_context_index` resolves
+    /// every wanted chunk with ONE pass over `sm.files`: 3 files, 2
+    /// wanted hashes -> both resolve to their correct path + live tier;
+    /// an unrelated hash present in the tree but NOT wanted is absent
+    /// from the index.
+    #[test]
+    fn cr_3_3_batch_index_resolves_only_wanted_hashes() {
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(1, mk_data_node(DiskTier::Warm));
+        sm.nodes.insert(2, mk_data_node(DiskTier::Cold));
+        sm.files.insert("/a.mkv".to_string(), file_with_chunk("/a.mkv", "ha", 1, 0));
+        sm.files.insert("/b.mkv".to_string(), file_with_chunk("/b.mkv", "hb", 2, 0));
+        sm.files.insert("/c.mkv".to_string(), file_with_chunk("/c.mkv", "hc-unwanted", 1, 0));
+
+        let wanted: std::collections::HashSet<String> =
+            ["ha".to_string(), "hb".to_string()].into_iter().collect();
+        let index = build_chunk_read_context_index(&sm.files, &sm.nodes, &wanted, 1);
+
+        // "ha" was reported by node 1 (matches) -> resolves live Warm.
+        let (path_a, tier_a) = index.get("ha").expect("ha present");
+        assert_eq!(path_a, "/a.mkv");
+        assert_eq!(*tier_a, Some(DiskTier::Warm));
+
+        // "hb" only has a row for node 2; this batch is reported by node 1,
+        // so no row in "/b.mkv" matches the reporting node -> tier None,
+        // but the path is still resolved (first referencing file).
+        let (path_b, tier_b) = index.get("hb").expect("hb present");
+        assert_eq!(path_b, "/b.mkv");
+        assert_eq!(*tier_b, None);
+
+        // Unrelated/unwanted hash never enters the index at all.
+        assert!(index.get("hc-unwanted").is_none());
+        assert_eq!(index.len(), 2, "only the wanted hashes are indexed");
+    }
+
+    /// R1/MGR-3 — a wanted hash with no referencing file at all is
+    /// simply absent from the index (mirrors
+    /// `resolve_chunk_read_context`'s None for an unknown chunk).
+    #[test]
+    fn cr_3_3_batch_index_omits_unresolvable_hash() {
+        let sm = StateMachineData::default();
+        let wanted: std::collections::HashSet<String> = ["ghost".to_string()].into_iter().collect();
+        let index = build_chunk_read_context_index(&sm.files, &sm.nodes, &wanted, 1);
+        assert!(index.get("ghost").is_none());
     }
 
     fn vol_with_floor(id: &str, floor: u32) -> dtfs_common::types::VolumeConfig {

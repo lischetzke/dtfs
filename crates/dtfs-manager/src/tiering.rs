@@ -69,6 +69,25 @@ pub(crate) fn volume_has_active_cache_policy(
     any_tier && cache.promote_window_secs > 0
 }
 
+/// CR-3-3/MGR-1 — should the legacy temperature path skip this profile?
+/// True in two cases: (a) `file_path` isn't (or is no longer) a known
+/// file at all — CO-4-6's AV-volume skip below can never see an
+/// unresolvable path, so an unknown/empty file_path (the pre-fix
+/// `ReportChunkReads` intercept always passed `""`) must be skipped
+/// outright rather than fall through to the legacy path; (b) the file's
+/// volume has an active AV cache policy (CO-4-6 — `tick_av_cache` owns
+/// those chunks).
+pub(crate) fn legacy_path_should_skip(
+    file_path: &str,
+    path_to_volume: &HashMap<String, String>,
+    av_cache_volumes: &std::collections::HashSet<String>,
+) -> bool {
+    match path_to_volume.get(file_path) {
+        None => true,
+        Some(vid) => av_cache_volumes.contains(vid),
+    }
+}
+
 /// Tiering engine that evaluates access patterns and triggers tier migrations.
 pub struct TieringEngine {
     config: RwLock<TieringConfig>,
@@ -322,12 +341,8 @@ impl TieringEngine {
                 if target_tier == profile.current_tier {
                     continue;
                 }
-                // CO-4-6 — skip the legacy path for chunks whose volume has
-                // an active AV cache policy; `tick_av_cache` owns them.
-                if let Some(vid) = path_to_volume.get(&profile.file_path) {
-                    if av_cache_volumes.contains(vid) {
-                        continue;
-                    }
+                if legacy_path_should_skip(&profile.file_path, &path_to_volume, &av_cache_volumes) {
+                    continue;
                 }
                 // REV-4-8 — bound the legacy path. It schedules a migration
                 // for essentially every chunk that gets read at all: on the
@@ -852,13 +867,20 @@ impl TieringEngine {
                         None => continue,
                     };
                     // CNF-1 — stable disk_id key, never Vec index.
-                    let tier = sm
-                        .nodes
-                        .get(&nid)
-                        .and_then(|n| n.disk(e.disk_id))
-                        .map(|d| d.tier);
+                    let node_info = sm.nodes.get(&nid);
+                    let tier = node_info.and_then(|n| n.disk(e.disk_id)).map(|d| d.tier);
                     let Some(t) = tier else { continue };
-                    placements.push(TickPlacement { node_id: nid, disk_id: e.disk_id, dc, tier: t });
+                    // CR-3-1/MGR-2 — resolve liveness through the shared
+                    // helper so Down/Failed nodes and Failed/Removed
+                    // disks never count as a surviving replica.
+                    let live = crate::scheduler::live_replica_tier(node_info, e.disk_id).is_some();
+                    placements.push(TickPlacement {
+                        node_id: nid,
+                        disk_id: e.disk_id,
+                        dc,
+                        tier: t,
+                        live,
+                    });
                 }
                 let Some(chunk_id) = chunk_id_opt else { continue };
 
@@ -1546,6 +1568,13 @@ pub(crate) struct TickPlacement {
     pub disk_id: u32,
     pub dc: String,
     pub tier: DiskTier,
+    /// CR-3-1/MGR-2 — `live_replica_tier(node, disk_id).is_some()`,
+    /// resolved once when the snapshot is built: false when the node is
+    /// Down/Failed or the disk is Failed/Removed. The placement is still
+    /// listed (so it can itself be dropped/repaired), but a dead
+    /// placement must never count as the surviving mandatory/anchor
+    /// replica that lets another placement be demoted.
+    pub live: bool,
 }
 
 /// AV-2-4 — full snapshot input to the planner.
@@ -1948,10 +1977,13 @@ fn plan_chunk_demotions(
         if dc_reads > 0 {
             continue;
         }
-        // Mandatory survives the drop iff at least one OTHER
-        // placement is on a mandatory tier.
+        // Mandatory survives the drop iff at least one OTHER, LIVE
+        // placement is on a mandatory tier (CR-3-1/MGR-2: a replica on a
+        // Down/Failed node or Failed/Removed disk cannot serve reads and
+        // must not be treated as the surviving copy).
         let mandatory_still_present = chunk.placements.iter().any(|p| {
             (p.node_id != placement.node_id || p.tier != placement.tier)
+                && p.live
                 && policy.mandatory.for_tier(p.tier) > 0
         });
         if !mandatory_still_present {
@@ -2569,6 +2601,7 @@ mod bug_av_tiering_tick_tests {
                     disk_id: 0,
                     dc: "leli".to_string(),
                     tier: DiskTier::Cold,
+                    live: true,
                 }],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
@@ -2610,8 +2643,8 @@ mod bug_av_tiering_tick_tests {
                 // cache copy (disk 1) are CO-LOCATED on node 10. The demote
                 // must target the exact (node 10, disk 1) warm copy.
                 placements: vec![
-                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold },
-                    TickPlacement { node_id: 10, disk_id: 1, dc: "leli".into(), tier: DiskTier::Warm },
+                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold, live: true },
+                    TickPlacement { node_id: 10, disk_id: 1, dc: "leli".into(), tier: DiskTier::Warm, live: true },
                 ],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
@@ -2643,7 +2676,7 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![TickPlacement {
-                    node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold,
+                    node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold, live: true,
                 }],
                 cooldown_until_ms: 2_000_000, // future, still in cooldown
                 reads_in_window_by_dc: reads,
@@ -2671,7 +2704,7 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![TickPlacement {
-                    node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold,
+                    node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold, live: true,
                 }],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
@@ -2711,8 +2744,8 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![
-                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold },
-                    TickPlacement { node_id: 11, disk_id: 0, dc: "toro".into(), tier: DiskTier::Warm },
+                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold, live: true },
+                    TickPlacement { node_id: 11, disk_id: 0, dc: "toro".into(), tier: DiskTier::Warm, live: true },
                 ],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
@@ -2748,8 +2781,8 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![
-                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold },
-                    TickPlacement { node_id: 11, disk_id: 0, dc: "toro".into(), tier: DiskTier::Warm },
+                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold, live: true },
+                    TickPlacement { node_id: 11, disk_id: 0, dc: "toro".into(), tier: DiskTier::Warm, live: true },
                 ],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
@@ -2789,8 +2822,8 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![
-                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold },
-                    TickPlacement { node_id: 11, disk_id: 0, dc: "toro".into(), tier: DiskTier::Warm },
+                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold, live: true },
+                    TickPlacement { node_id: 11, disk_id: 0, dc: "toro".into(), tier: DiskTier::Warm, live: true },
                 ],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
@@ -2849,8 +2882,8 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![
-                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold },
-                    TickPlacement { node_id: 11, disk_id: 0, dc: "toro".into(), tier: DiskTier::Warm },
+                    TickPlacement { node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold, live: true },
+                    TickPlacement { node_id: 11, disk_id: 0, dc: "toro".into(), tier: DiskTier::Warm, live: true },
                 ],
                 cooldown_until_ms: 1_500_000, // future operator cooldown
                 reads_in_window_by_dc: reads,
@@ -2889,7 +2922,7 @@ mod bug_av_tiering_tick_tests {
                 file_path: "/movies/x.mkv".to_string(),
                 volume_id: "default".to_string(),
                 placements: vec![TickPlacement {
-                    node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold,
+                    node_id: 10, disk_id: 0, dc: "leli".into(), tier: DiskTier::Cold, live: true,
                 }],
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
@@ -3098,7 +3131,15 @@ mod audit_co_tests {
     use dtfs_common::types::AnchorPolicy;
 
     fn placement(node_id: u64, disk_id: u32, dc: &str, tier: DiskTier) -> TickPlacement {
-        TickPlacement { node_id, disk_id, dc: dc.to_string(), tier }
+        TickPlacement { node_id, disk_id, dc: dc.to_string(), tier, live: true }
+    }
+
+    /// CR-3-1/MGR-2 — same as `placement`, but marked dead (on a
+    /// Down/Failed node or Failed/Removed disk), so tests can assert a
+    /// dead mandatory-tier replica does not count as the survivor that
+    /// lets another placement be demoted.
+    fn dead_placement(node_id: u64, disk_id: u32, dc: &str, tier: DiskTier) -> TickPlacement {
+        TickPlacement { node_id, disk_id, dc: dc.to_string(), tier, live: false }
     }
 
     fn chunk_with(placements: Vec<TickPlacement>) -> TickChunk {
@@ -3170,6 +3211,40 @@ mod audit_co_tests {
         assert!(demote_preserves_anchor(&chunk, &leli, None));
         let empty = AnchorPolicy { datacenter: String::new(), required_tier: None };
         assert!(demote_preserves_anchor(&chunk, &leli, Some(&empty)));
+    }
+
+    /// CR-3-1/MGR-2 — a mandatory (cold) replica on a Down/Failed node or
+    /// Failed/Removed disk (`live: false`) must not count as the
+    /// surviving copy: demoting the sole warm cache replica would leave
+    /// zero live replicas, so `plan_chunk_demotions` must refuse it (no
+    /// anchor policy involved — this is the plain mandatory-tier check).
+    #[test]
+    fn cr_3_1_demote_refused_when_only_surviving_mandatory_replica_is_dead() {
+        use dtfs_common::types::{CacheReplication, CacheTierConfig, TierReplication};
+        let mut cache = CacheReplication::default();
+        cache.warm = CacheTierConfig { min: 0, max: 1 };
+        cache.promote_window_secs = 60;
+        let policy = TickVolumePolicy {
+            mandatory: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            cache,
+            anchor: None,
+        };
+        let warm_cache = placement(10, 1, "toro", DiskTier::Warm);
+        let dead_cold = dead_placement(11, 0, "leli", DiskTier::Cold);
+        let chunk = chunk_with(vec![warm_cache, dead_cold]);
+
+        let mut demotions = Vec::new();
+        let mut anchor_protected = Vec::new();
+        plan_chunk_demotions(&chunk, &policy, 1_000_000, &mut demotions, &mut anchor_protected);
+        assert!(demotions.is_empty(), "dead mandatory copy must not count as a survivor");
+
+        // Same layout, but the cold node is live → demote proceeds.
+        let live_cold = placement(11, 0, "leli", DiskTier::Cold);
+        let chunk2 = chunk_with(vec![placement(10, 1, "toro", DiskTier::Warm), live_cold]);
+        let mut demotions2 = Vec::new();
+        let mut anchor_protected2 = Vec::new();
+        plan_chunk_demotions(&chunk2, &policy, 1_000_000, &mut demotions2, &mut anchor_protected2);
+        assert_eq!(demotions2.len(), 1, "live mandatory copy allows the demote");
     }
 
     /// CO-1-2 — the planner records the refused demote in
@@ -3315,6 +3390,32 @@ mod audit_co_tests {
 
         // Default (empty) → not active.
         assert!(!volume_has_active_cache_policy(&CacheReplication::default()));
+    }
+
+    /// CR-3-3/MGR-1 — `legacy_path_should_skip` is the decision boundary
+    /// `evaluate` now consults before scheduling a legacy migration.
+    /// (a) an empty/unknown file_path (the pre-fix `ReportChunkReads`
+    /// intercept always passed `""`) yields zero legacy decisions —
+    /// skip, regardless of any AV volume set; (b) a known path on an
+    /// AV-cache volume also skips (CO-4-6); (c) a known path on a
+    /// plain (non-AV) volume still classifies.
+    #[test]
+    fn cr_3_3_legacy_path_should_skip_truth_table() {
+        let mut path_to_volume = HashMap::new();
+        path_to_volume.insert("/movies/av.mkv".to_string(), "av-vol".to_string());
+        path_to_volume.insert("/movies/plain.mkv".to_string(), "plain-vol".to_string());
+        let mut av_cache_volumes = std::collections::HashSet::new();
+        av_cache_volumes.insert("av-vol".to_string());
+
+        // (a) unknown/empty file_path → always skip.
+        assert!(legacy_path_should_skip("", &path_to_volume, &av_cache_volumes));
+        assert!(legacy_path_should_skip("/no/such/file", &path_to_volume, &av_cache_volumes));
+
+        // (b) known path, AV-cache volume → skip.
+        assert!(legacy_path_should_skip("/movies/av.mkv", &path_to_volume, &av_cache_volumes));
+
+        // (c) known path, plain volume → does NOT skip (still classifies).
+        assert!(!legacy_path_should_skip("/movies/plain.mkv", &path_to_volume, &av_cache_volumes));
     }
 
     /// CO-4-17 — `apply_heartbeat_reads` bounds the read-window store.

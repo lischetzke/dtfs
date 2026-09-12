@@ -252,7 +252,7 @@ impl ConsistentHashRing {
             let already_in_anchor = selected
                 .iter()
                 .zip(selected_dcs.iter())
-                .any(|(_, dc)| dc == anchor);
+                .any(|(_, dc)| dc.eq_ignore_ascii_case(anchor));
             if !already_in_anchor {
                 // Find a candidate in the anchor DC. Bug Z — relax the tier
                 // constraint for the anchor swap: in Plexmedia the warm tier
@@ -279,7 +279,7 @@ impl ConsistentHashRing {
                 let mut anchor_host: Option<String> = None;
                 let mut anchor_rack: Option<String> = None;
                 for (_, vn) in iter {
-                    if vn.location.datacenter != *anchor {
+                    if !vn.location.datacenter.eq_ignore_ascii_case(anchor) {
                         continue;
                     }
                     // The anchor candidate must not collide with any *retained*
@@ -518,6 +518,47 @@ mod tests {
         assert_eq!(unique.len(), placement.nodes.len(), "no duplicate NodeId");
         // The anchor DC is actually represented (the zip can see it now).
         assert!(placement.datacenters.iter().any(|d| d == "dc-a"));
+    }
+
+    /// CR-3-7 / CMN-5 — the anchor-DC swap compares case-insensitively: a
+    /// `required_datacenter` of "DC-A" is satisfied by a node registered
+    /// under "dc-a" (mixed casing between config and registration must not
+    /// make the anchor permanently unsatisfiable).
+    #[test]
+    fn cr_3_7_anchor_dc_swap_is_case_insensitive() {
+        let mut ring = ConsistentHashRing::new(256);
+        ring.add_node(
+            &NodeId::from_string("n-a".to_string()),
+            0,
+            DiskTier::Warm,
+            &make_location("dc-a", "rack-1", "host-a"),
+            1.0,
+        );
+        ring.add_node(
+            &NodeId::from_string("n-b".to_string()),
+            0,
+            DiskTier::Warm,
+            &make_location("dc-b", "rack-1", "host-b"),
+            1.0,
+        );
+
+        let rule = PlacementRule {
+            tier: DiskTier::Warm,
+            replica_count: 2,
+            failure_domain: FailureDomain::Datacenter,
+            prefer_client_locations: true,
+            required_datacenter: Some("DC-A".to_string()),
+        };
+        let client = make_location("dc-z", "rack-9", "client-1");
+
+        let placement = ring.find_placement_for_pg(0, &rule, &[client]);
+        assert_eq!(placement.nodes.len(), 2);
+        // The anchor DC ("dc-a") must be represented even though the rule
+        // spelled it "DC-A".
+        assert!(placement
+            .datacenters
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case("dc-a")));
     }
 
     /// FailureDomain::Rack must scope rack names by datacenter: two DCs each

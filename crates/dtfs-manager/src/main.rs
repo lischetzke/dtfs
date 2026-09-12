@@ -409,6 +409,7 @@ async fn main() -> anyhow::Result<()> {
         config.raft.done_task_retention_secs,
         config.raft.failed_task_retention_secs,
         tls_ctx.clone(),
+        config.placement.clone(),
     ));
     // CF-5 — let the scheduler skip ticks under memory pressure.
     task_scheduler.set_memory_budget(memory_budget.clone());

@@ -2224,6 +2224,54 @@ fn apply_remove_chunk_location(
         }
     }
 
+    // CR-3-2/MGR-2 (defence-in-depth, independent of enforce_anchor) —
+    // a replica is "live" when its node is not Down/Failed and its disk
+    // is not Failed/Removed (same test as the scheduler's
+    // `live_replica_tier` / the anchor scan above). If the row being
+    // removed IS live, refuse when no OTHER live replica of this
+    // chunk_index survives — a dead row can always be removed (it isn't
+    // serving anything), but the last serviceable copy must never be
+    // dropped, anchor policy or not. Runs after the anchor check so a
+    // volume with an anchor policy keeps its more specific "would strand
+    // anchor" message when both checks would refuse the same removal.
+    let is_live = |c: &ChunkLocationEntry| -> bool {
+        let Ok(nid) = c.node_id.parse::<u64>() else {
+            return false;
+        };
+        let Some(ninfo) = sm.nodes.get(&nid) else {
+            return false;
+        };
+        if matches!(
+            ninfo.health,
+            dtfs_common::types::HealthStatus::Down | dtfs_common::types::HealthStatus::Failed
+        ) {
+            return false;
+        }
+        ninfo
+            .disk(c.disk_id)
+            .map(|d| {
+                !matches!(
+                    d.status,
+                    dtfs_common::types::DiskStatus::Failed | dtfs_common::types::DiskStatus::Removed
+                )
+            })
+            .unwrap_or(false)
+    };
+    let removing_a_live_replica = file.chunks.iter().any(|c| matches(c) && is_live(c));
+    if removing_a_live_replica {
+        let other_live_survives = file
+            .chunks
+            .iter()
+            .any(|c| !matches(c) && c.chunk_index == chunk_index && is_live(c));
+        if !other_live_survives {
+            return ClientResponse::Error {
+                message: format!(
+                    "RemoveChunkLocation refused: would remove the last live replica of {path}#{chunk_index}"
+                ),
+            };
+        }
+    }
+
     // Safe to drop. Mutate.
     let file_mut = sm.files.get_mut(path).expect("checked above");
     let before = file_mut.chunks.len();
@@ -3587,6 +3635,52 @@ mod posix_path_regression {
             matches!(resp, ClientResponse::Error { .. }),
             "a Failed anchor disk cannot authorise the removal either"
         );
+    }
+
+    /// CR-3-2/MGR-2 (defence) — the last-live-replica guard fires
+    /// independent of `enforce_anchor`: two rows, one on a Down node.
+    /// Removing the LIVE row (no anchor policy passed at all) must be
+    /// refused because it is the only servable copy; removing the Down
+    /// row is fine (it wasn't serving anything).
+    #[test]
+    fn cr_3_2_last_live_replica_guard_is_independent_of_anchor() {
+        use dtfs_common::types::{DiskTier, HealthStatus};
+        let mut sm = sm_with_chunk("/x", 0, "h", &[
+            (10, "leli", DiskTier::Cold),
+            (11, "toro", DiskTier::Warm),
+        ]);
+        sm.nodes.get_mut(&10).unwrap().health = HealthStatus::Down;
+
+        // Removing the live (toro) row would leave zero live replicas.
+        let mut sm_try_live = sm.clone();
+        let resp = apply_request(&mut sm_try_live, &mk_log_id(1),
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "11".into(),
+                disk_id: 0,
+                enforce_anchor: None,
+            });
+        match resp {
+            ClientResponse::Error { message } => {
+                assert!(message.contains("last live replica"), "got: {message}");
+            }
+            other => panic!("expected refusal removing the last live replica, got {other:?}"),
+        }
+        assert_eq!(sm_try_live.files.get("/x").unwrap().chunks.len(), 2, "nothing removed");
+
+        // Removing the Down (leli) row is fine — it wasn't live anyway.
+        let mut sm_try_dead = sm.clone();
+        let resp = apply_request(&mut sm_try_dead, &mk_log_id(2),
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+                path: "/x".into(),
+                chunk_index: 0,
+                node_id: "10".into(),
+                disk_id: 0,
+                enforce_anchor: None,
+            });
+        assert!(matches!(resp, ClientResponse::Success));
+        assert_eq!(sm_try_dead.files.get("/x").unwrap().chunks.len(), 1, "dead row removed");
     }
 
     /// AV-1-3 test 1 — happy path: drop one entry, others survive.
