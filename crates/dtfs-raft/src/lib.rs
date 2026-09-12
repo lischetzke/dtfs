@@ -266,6 +266,12 @@ pub enum ClientRequest {
         /// snapshots / older clients continue to work.
         #[serde(default)]
         lease_id: String,
+        /// RAFT-4 — proposer wall-clock, so apply is a pure function of
+        /// (req, state) instead of stamping each replica's own
+        /// `SystemTime::now()`. `0` (legacy/pre-RAFT-4 entry) falls back
+        /// to `log_id.index` (CO-3-1 pattern) in the apply.
+        #[serde(default)]
+        now_ms: u64,
     },
 
     /// Bug O — remove every (node_id, chunk_hash) entry the data node
@@ -290,6 +296,9 @@ pub enum ClientRequest {
         /// one disk must NOT drop the healthy co-located copy on another.
         #[serde(default = "legacy_disk_id")]
         disk_id: u32,
+        /// RAFT-4 — see `UpdateChunkLocations.now_ms`.
+        #[serde(default)]
+        now_ms: u64,
     },
 
     // ---- Cluster operations ----
@@ -405,16 +414,40 @@ pub enum ClientRequest {
     // ---- Extended POSIX surface (F-034 .. F-038) ----
 
     /// Atomically rename a file in the namespace.
-    RenameFile { from: String, to: String },
+    RenameFile {
+        from: String,
+        to: String,
+        /// RAFT-4 — see `UpdateChunkLocations.now_ms`.
+        #[serde(default)]
+        now_ms: u64,
+    },
     /// Set the logical size of a file. Trailing chunks past `new_size`
     /// are dropped from metadata; the truncate path also clears them on
     /// the data nodes.
-    SetFileSize { path: String, new_size: u64 },
+    SetFileSize {
+        path: String,
+        new_size: u64,
+        /// RAFT-4 — see `UpdateChunkLocations.now_ms`.
+        #[serde(default)]
+        now_ms: u64,
+    },
     /// Create a symbolic link.
-    CreateSymlink { path: String, target: String },
+    CreateSymlink {
+        path: String,
+        target: String,
+        /// RAFT-4 — see `UpdateChunkLocations.now_ms`.
+        #[serde(default)]
+        now_ms: u64,
+    },
     /// Create a hard link from `source` to `dest`. The FSM duplicates the
     /// source's chunk list under the new path.
-    CreateLink { source: String, dest: String },
+    CreateLink {
+        source: String,
+        dest: String,
+        /// RAFT-4 — see `UpdateChunkLocations.now_ms`.
+        #[serde(default)]
+        now_ms: u64,
+    },
 
     // ---- Distributed fcntl coordination (F-039) ----
 
@@ -589,6 +622,9 @@ pub enum ClientRequest {
         /// the apply path is cleaner than re-reading the volume here
         /// (apply is meant to be a pure function of `req + state`).
         enforce_anchor: Option<AnchorPolicy>,
+        /// RAFT-4 — see `UpdateChunkLocations.now_ms`.
+        #[serde(default)]
+        now_ms: u64,
     },
 
     /// Bug AV — set or extend cache cooldown for one or more
@@ -620,7 +656,7 @@ impl fmt::Display for ClientRequest {
                 write!(f, "CreateFile({path}, vol={volume_id})")
             }
             Self::DeleteFile { path } => write!(f, "DeleteFile({path})"),
-            Self::UpdateChunkLocations { path, chunks, lease_id } => {
+            Self::UpdateChunkLocations { path, chunks, lease_id, .. } => {
                 let lease_marker = if lease_id.is_empty() {
                     "no-lease".to_string()
                 } else {
@@ -628,7 +664,7 @@ impl fmt::Display for ClientRequest {
                 };
                 write!(f, "UpdateChunks({path}, {} chunks, {lease_marker})", chunks.len())
             }
-            Self::RemoveCorruptChunkReplicas { node_id, chunk_hashes, disk_id } => write!(
+            Self::RemoveCorruptChunkReplicas { node_id, chunk_hashes, disk_id, .. } => write!(
                 f,
                 "RemoveCorruptChunkReplicas(node={node_id}, disk={disk_id}, {} chunks)",
                 chunk_hashes.len()
@@ -664,14 +700,14 @@ impl fmt::Display for ClientRequest {
                 write!(f, "ReportScrubResult(node={node_id}, {level}, checked={chunks_checked}, corrupt={chunks_corrupt})")
             }
             Self::UpdateMigrationState { .. } => write!(f, "UpdateMigrationState"),
-            Self::RenameFile { from, to } => write!(f, "RenameFile({from} -> {to})"),
-            Self::SetFileSize { path, new_size } => {
+            Self::RenameFile { from, to, .. } => write!(f, "RenameFile({from} -> {to})"),
+            Self::SetFileSize { path, new_size, .. } => {
                 write!(f, "SetFileSize({path}, {new_size})")
             }
-            Self::CreateSymlink { path, target } => {
+            Self::CreateSymlink { path, target, .. } => {
                 write!(f, "CreateSymlink({path} -> {target})")
             }
-            Self::CreateLink { source, dest } => {
+            Self::CreateLink { source, dest, .. } => {
                 write!(f, "CreateLink({source} -> {dest})")
             }
             Self::AcquireLock { path, owner_id, start, end, write, .. } => write!(
@@ -711,7 +747,7 @@ impl fmt::Display for ClientRequest {
             Self::UpdateNodeDiskUsage { node_id, per_disk } => {
                 write!(f, "UpdateNodeDiskUsage(node={node_id}, {} disks)", per_disk.len())
             }
-            Self::RemoveChunkLocation { path, chunk_index, node_id, disk_id, enforce_anchor } => {
+            Self::RemoveChunkLocation { path, chunk_index, node_id, disk_id, enforce_anchor, .. } => {
                 let anchor_marker = match enforce_anchor {
                     Some(p) => match p.required_tier {
                         Some(t) => format!(", anchor={}@{}", p.datacenter, t),

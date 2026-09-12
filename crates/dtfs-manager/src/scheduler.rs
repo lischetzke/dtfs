@@ -743,7 +743,7 @@ impl TaskScheduler {
 
         // Phase 2 — issue the Raft removals (lock released).
         for (path, idx, node, disk_id, enforce, chunk_hash) in removals {
-            let req = ClientRequest::RemoveChunkLocation {
+            let req = ClientRequest::RemoveChunkLocation { now_ms: now_millis(),
                 path: path.clone(),
                 chunk_index: idx,
                 node_id: node.to_string(),
@@ -832,7 +832,7 @@ impl TaskScheduler {
         };
 
         for (path, chunk_index, disk_id, anchor) in targets {
-            let req = ClientRequest::RemoveChunkLocation {
+            let req = ClientRequest::RemoveChunkLocation { now_ms: now_millis(),
                 path: path.clone(),
                 chunk_index,
                 node_id: node_str.clone(),
@@ -1376,7 +1376,7 @@ impl TaskScheduler {
             entries
         };
 
-        let req = ClientRequest::UpdateChunkLocations {
+        let req = ClientRequest::UpdateChunkLocations { now_ms: now_millis(),
             path,
             chunks: full_chunks,
             // Bug P — system-driven, so no client lease applies.
@@ -1704,7 +1704,7 @@ impl TaskScheduler {
             // the CO-3-2 orphan reaper.
             let delocate = SchedulerDelocate {
                 sched: self,
-                remove_req: ClientRequest::RemoveChunkLocation {
+                remove_req: ClientRequest::RemoveChunkLocation { now_ms: now_millis(),
                     path: action.file_path.clone(),
                     chunk_index: action.chunk_index,
                     node_id: action.node_id.to_string(),

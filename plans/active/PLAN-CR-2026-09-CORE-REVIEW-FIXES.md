@@ -114,7 +114,7 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 | CR-2-2 | ✅ | RAFT-2 | `state_machine.rs` `RenameFile` arm ~1466 | After moving `from` (or when `from` has no exact key but `files.range("{from}/"..)` has children → synthetic dir, success), re-key every child `k` with `k.starts_with("{from}/")` to `to + &k[from.len()..]`, updating `meta.path`; move matching `write_leases` and `posix_locks` too. Refuse (`Error`) when `to` exists as a directory with children. Collect keys first, then mutate (BTreeMap). | SM unit: (a) mkdir /a, create /a/x, /a/b/y; rename /a→/c → /c/x, /c/b/y exist, /a/* gone, `meta.path` updated; (b) synthetic dir rename works; (c) rename onto non-empty dir → Error; (d) lease on /a/x follows to /c/x. | Tests fail before, pass after. |
 | CR-2-3 | ✅ | RAFT-3 | `state_machine.rs` `UpdateChunkLocations` arm ~1122, `SetFileSize` arm ~1508 | After merge: `extent = chunks.iter().map(|c| c.chunk_index*chunk_size + c.size_bytes).max()`; `file.logical_size = file.logical_size.map(|l| l.max(extent))` (None stays None — derived). Delete dead code at ~1516 (`|| *new_size == 0 && false`, `.saturating_sub(0)`). | SM unit: create, commit 1 chunk (4 MB), SetFileSize(0), commit chunk → `logical_size == Some(4 MB)`; SetFileSize(6 MB) then commit chunk idx 0 → stays 6 MB (sparse-grow preserved). | Tests fail before, pass after. |
 | CR-2-4 | ✅ | RAFT-7 | `state_machine.rs` `DeleteFile` arm ~1051; `crates/dtfs-fuse/src/fuse_adapter.rs` rmdir | `DeleteFile`: also `write_leases.remove(path)`, `posix_locks.remove(path)`; if `files.range("{path}/"..)` has a child → `Error("directory not empty")`. FUSE rmdir maps that error to ENOTEMPTY (extend `cluster_err_to_errno` or match the message via a dedicated gRPC code `FailedPrecondition`). | SM unit: delete with live lease → lease gone; delete dir with child → Error, child intact. | Tests fail before, pass after. |
-| CR-2-5 | ⬜ | RAFT-4 | `crates/dtfs-raft/src/lib.rs` `ClientRequest`, `state_machine.rs`, proposers in `dtfs-manager/src/metadata.rs`, `scheduler.rs`, `tiering.rs` | Add `#[serde(default)] now_ms: u64` to the seven variants listed in Data-model changes. In apply: `let now_ms = if req.now_ms == 0 { log_id.index /* CO-3-1 fallback */ } else { req.now_ms }`; pass it into `audit()` for those arms. Every proposer stamps `now_ms` from `SystemTime::now()`. Remove the top-of-apply `SystemTime::now()` once no arm needs it (leave it if any arm not in scope still does; note in Deviations). | SM unit: apply the same `RenameFile{now_ms: 1234}` on two fresh SMs → `serde_json::to_vec` identical; old-format entry (no `now_ms`) still deserialises. Snapshot compat test per § A.3.1. | Tests pass; `grep -n "SystemTime::now" state_machine.rs` shows only the fallback-free sites documented in Deviations. |
+| CR-2-5 | ✅ | RAFT-4 | `crates/dtfs-raft/src/lib.rs` `ClientRequest`, `state_machine.rs`, proposers in `dtfs-manager/src/metadata.rs`, `scheduler.rs`, `tiering.rs` | Add `#[serde(default)] now_ms: u64` to the seven variants listed in Data-model changes. In apply: `let now_ms = if req.now_ms == 0 { log_id.index /* CO-3-1 fallback */ } else { req.now_ms }`; pass it into `audit()` for those arms. Every proposer stamps `now_ms` from `SystemTime::now()`. Remove the top-of-apply `SystemTime::now()` once no arm needs it (leave it if any arm not in scope still does; note in Deviations). | SM unit: apply the same `RenameFile{now_ms: 1234}` on two fresh SMs → `serde_json::to_vec` identical; old-format entry (no `now_ms`) still deserialises. Snapshot compat test per § A.3.1. | Tests pass; `grep -n "SystemTime::now" state_machine.rs` shows only the fallback-free sites documented in Deviations. |
 | CR-2-6 | ✅ | RAFT-8, RAFT-9 | `state_machine.rs` `UpdateConfig` ~1386, `ReportScrubResult` ~1429 | UpdateConfig: `version = sm.cluster_config.version + 1`, ignore wire value (keep CAS check). ScrubRecord: `duration_secs = if x.is_finite() { x } else { 0.0 }`. | SM unit: UpdateConfig with wire version 1 after current 5 → stored 6; ScrubResult with NaN → snapshot round-trips. | Tests fail before, pass after. |
 | CR-2-7 | ⬜ | — | `tests/release/cases/102-rename-directory-moves-children.sh`, `103-truncate-rewrite-reports-size.sh`, `104-quarantined-node-restart-stays-quarantined.sh` | Shell cases for RAFT-2/3/1 via FUSE + REST. | `bash -n` clean. | Present, unexecuted. |
 | CR-2-8 | ⬜ | — | `AGENTS.md` A.8 `state_machine.rs` entry, A.3.1 | Document `now_ms` convention, RenameFile prefix semantics, sticky-state carry-forward. | — | Same commit. |
@@ -428,3 +428,30 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   (asserted the wire value 7 was stored verbatim for a legacy/no-CAS
   entry -- exactly the regression path this fix closes) to expect
   `current + 1 = 5` instead.
+
+- **CR-2-5** 2026-09-12, Docker `dtfs-buildenv:latest`. dtfs-raft
+  `cargo test -p dtfs-raft --release`: 101 -> 104 passed (3 new:
+  `raft_4_rename_file_apply_is_deterministic_across_replicas`,
+  `raft_4_legacy_rename_file_without_now_ms_falls_back_to_log_index`,
+  `raft_4_update_chunk_locations_apply_is_deterministic_across_replicas`);
+  dtfs-manager `cargo test -p dtfs-manager --release`: 346 passed
+  (unchanged, no unit test scaffold touches the proposer call sites).
+  0 failed. Added `#[serde(default)] now_ms: u64` to `UpdateChunkLocations`,
+  `RemoveCorruptChunkReplicas`, `RenameFile`, `SetFileSize`,
+  `CreateSymlink`, `CreateLink`, `RemoveChunkLocation`. The apply for each
+  now computes `eff_now_ms = if now_ms == 0 { log_id.index } else { now_ms }`
+  (CO-3-1 fallback) and routes both `updated_at_ms` and that arm's own
+  audit row through a new `audit_at(summary, ts)` closure (the shared
+  `audit` closure still captures the top-of-apply wall clock for every
+  arm NOT in this list). `apply_remove_chunk_location` (factored out of
+  the `RemoveChunkLocation` arm) took an explicit `now_ms: u64` parameter
+  in place of its own inline `SystemTime::now()`. Every proposer
+  (`dtfs-manager/src/metadata.rs` via a new `stamp_now_ms()` helper;
+  `scheduler.rs`/`tiering.rs` via the pre-existing `now_millis()`) now
+  stamps `now_ms` instead of leaving it at the serde default. Left the
+  top-of-apply `SystemTime::now()` in place (see Deviations) since arms
+  outside the seven-variant scope (DeleteFile, RegisterNode,
+  QuarantineNode, ...) still call the wall-clock `audit` closure;
+  `grep -n "SystemTime::now" state_machine.rs` shows it only at the
+  top-of-apply definition, the read-only `lookup_path` synthetic-dir
+  helper (not persisted, out of scope), and in comments.
