@@ -1167,8 +1167,16 @@ fn cluster_err_to_errno(err: &anyhow::Error) -> Errno {
             if status.code() == tonic::Code::NotFound {
                 return Errno::from(libc::ENOENT);
             }
+            // CR-2-4 (RAFT-7) — DeleteFile refuses to remove a directory
+            // that still has children with FailedPrecondition; rmdir must
+            // surface that as ENOTEMPTY, not a generic EIO, or `rm -r`
+            // reports the tree gone while it is still there.
+            if status.code() == tonic::Code::FailedPrecondition {
+                return Errno::from(libc::ENOTEMPTY);
+            }
             // Any other status (Unavailable, DeadlineExceeded, Internal, ...)
-            // is transient or non-NotFound — never ENOENT.
+            // is transient or non-NotFound/non-FailedPrecondition — never
+            // ENOENT.
             return Errno::from(libc::EIO);
         }
     }
@@ -1276,6 +1284,17 @@ mod fuse_readdir_regression {
             .context("readdir failed for /movies");
         assert_eq!(cluster_err_to_errno(&transient), Errno::from(libc::EIO));
         assert_ne!(cluster_err_to_errno(&transient), Errno::from(libc::ENOENT));
+    }
+
+    // CR-2-4 (RAFT-7) — DeleteFile refuses a non-empty directory with
+    // FailedPrecondition; rmdir must map that to ENOTEMPTY so `rm -r`
+    // reports the tree is still there instead of a generic I/O error.
+    #[test]
+    fn cr_2_4_failed_precondition_maps_to_enotempty() {
+        let refused =
+            anyhow::Error::new(tonic::Status::failed_precondition("directory not empty"))
+                .context("rmdir failed for /movies");
+        assert_eq!(cluster_err_to_errno(&refused), Errno::from(libc::ENOTEMPTY));
     }
 }
 

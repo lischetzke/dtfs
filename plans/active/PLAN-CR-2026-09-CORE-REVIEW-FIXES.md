@@ -110,14 +110,14 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
 
 | ID | St | Finding | Files | Sketch | Tests | Done when |
 |---|---|---|---|---|---|---|
-| CR-2-1 | ⬜ | RAFT-1 | `crates/dtfs-raft/src/state_machine.rs` `RegisterNode` arm ~1189 | Carry forward from `prior`: if `prior.quarantine.is_some()` → `info.quarantine = prior.quarantine.clone(); info.health = Quarantined`; if `prior.health ∈ {Maintenance, Draining}` → keep `prior.health`. Audit `RegisterNode: <id> (sticky state preserved: <state>)` when it fires. | SM unit (`posix_path_regression` or new `sticky_state_tests`): quarantine node → RegisterNode → still Quarantined with same `QuarantineInfo`; Maintenance → RegisterNode → still Maintenance; Healthy → RegisterNode → Healthy. | Tests fail before, pass after. |
-| CR-2-2 | ⬜ | RAFT-2 | `state_machine.rs` `RenameFile` arm ~1466 | After moving `from` (or when `from` has no exact key but `files.range("{from}/"..)` has children → synthetic dir, success), re-key every child `k` with `k.starts_with("{from}/")` to `to + &k[from.len()..]`, updating `meta.path`; move matching `write_leases` and `posix_locks` too. Refuse (`Error`) when `to` exists as a directory with children. Collect keys first, then mutate (BTreeMap). | SM unit: (a) mkdir /a, create /a/x, /a/b/y; rename /a→/c → /c/x, /c/b/y exist, /a/* gone, `meta.path` updated; (b) synthetic dir rename works; (c) rename onto non-empty dir → Error; (d) lease on /a/x follows to /c/x. | Tests fail before, pass after. |
-| CR-2-3 | ⬜ | RAFT-3 | `state_machine.rs` `UpdateChunkLocations` arm ~1122, `SetFileSize` arm ~1508 | After merge: `extent = chunks.iter().map(|c| c.chunk_index*chunk_size + c.size_bytes).max()`; `file.logical_size = file.logical_size.map(|l| l.max(extent))` (None stays None — derived). Delete dead code at ~1516 (`|| *new_size == 0 && false`, `.saturating_sub(0)`). | SM unit: create, commit 1 chunk (4 MB), SetFileSize(0), commit chunk → `logical_size == Some(4 MB)`; SetFileSize(6 MB) then commit chunk idx 0 → stays 6 MB (sparse-grow preserved). | Tests fail before, pass after. |
-| CR-2-4 | ⬜ | RAFT-7 | `state_machine.rs` `DeleteFile` arm ~1051; `crates/dtfs-fuse/src/fuse_adapter.rs` rmdir | `DeleteFile`: also `write_leases.remove(path)`, `posix_locks.remove(path)`; if `files.range("{path}/"..)` has a child → `Error("directory not empty")`. FUSE rmdir maps that error to ENOTEMPTY (extend `cluster_err_to_errno` or match the message via a dedicated gRPC code `FailedPrecondition`). | SM unit: delete with live lease → lease gone; delete dir with child → Error, child intact. | Tests fail before, pass after. |
-| CR-2-5 | ⬜ | RAFT-4 | `crates/dtfs-raft/src/lib.rs` `ClientRequest`, `state_machine.rs`, proposers in `dtfs-manager/src/metadata.rs`, `scheduler.rs`, `tiering.rs` | Add `#[serde(default)] now_ms: u64` to the seven variants listed in Data-model changes. In apply: `let now_ms = if req.now_ms == 0 { log_id.index /* CO-3-1 fallback */ } else { req.now_ms }`; pass it into `audit()` for those arms. Every proposer stamps `now_ms` from `SystemTime::now()`. Remove the top-of-apply `SystemTime::now()` once no arm needs it (leave it if any arm not in scope still does; note in Deviations). | SM unit: apply the same `RenameFile{now_ms: 1234}` on two fresh SMs → `serde_json::to_vec` identical; old-format entry (no `now_ms`) still deserialises. Snapshot compat test per § A.3.1. | Tests pass; `grep -n "SystemTime::now" state_machine.rs` shows only the fallback-free sites documented in Deviations. |
-| CR-2-6 | ⬜ | RAFT-8, RAFT-9 | `state_machine.rs` `UpdateConfig` ~1386, `ReportScrubResult` ~1429 | UpdateConfig: `version = sm.cluster_config.version + 1`, ignore wire value (keep CAS check). ScrubRecord: `duration_secs = if x.is_finite() { x } else { 0.0 }`. | SM unit: UpdateConfig with wire version 1 after current 5 → stored 6; ScrubResult with NaN → snapshot round-trips. | Tests fail before, pass after. |
-| CR-2-7 | ⬜ | — | `tests/release/cases/102-rename-directory-moves-children.sh`, `103-truncate-rewrite-reports-size.sh`, `104-quarantined-node-restart-stays-quarantined.sh` | Shell cases for RAFT-2/3/1 via FUSE + REST. | `bash -n` clean. | Present, unexecuted. |
-| CR-2-8 | ⬜ | — | `AGENTS.md` A.8 `state_machine.rs` entry, A.3.1 | Document `now_ms` convention, RenameFile prefix semantics, sticky-state carry-forward. | — | Same commit. |
+| CR-2-1 | ✅ | RAFT-1 | `crates/dtfs-raft/src/state_machine.rs` `RegisterNode` arm ~1189 | Carry forward from `prior`: if `prior.quarantine.is_some()` → `info.quarantine = prior.quarantine.clone(); info.health = Quarantined`; if `prior.health ∈ {Maintenance, Draining}` → keep `prior.health`. Audit `RegisterNode: <id> (sticky state preserved: <state>)` when it fires. | SM unit (`posix_path_regression` or new `sticky_state_tests`): quarantine node → RegisterNode → still Quarantined with same `QuarantineInfo`; Maintenance → RegisterNode → still Maintenance; Healthy → RegisterNode → Healthy. | Tests fail before, pass after. |
+| CR-2-2 | ✅ | RAFT-2 | `state_machine.rs` `RenameFile` arm ~1466 | After moving `from` (or when `from` has no exact key but `files.range("{from}/"..)` has children → synthetic dir, success), re-key every child `k` with `k.starts_with("{from}/")` to `to + &k[from.len()..]`, updating `meta.path`; move matching `write_leases` and `posix_locks` too. Refuse (`Error`) when `to` exists as a directory with children. Collect keys first, then mutate (BTreeMap). | SM unit: (a) mkdir /a, create /a/x, /a/b/y; rename /a→/c → /c/x, /c/b/y exist, /a/* gone, `meta.path` updated; (b) synthetic dir rename works; (c) rename onto non-empty dir → Error; (d) lease on /a/x follows to /c/x. | Tests fail before, pass after. |
+| CR-2-3 | ✅ | RAFT-3 | `state_machine.rs` `UpdateChunkLocations` arm ~1122, `SetFileSize` arm ~1508 | After merge: `extent = chunks.iter().map(|c| c.chunk_index*chunk_size + c.size_bytes).max()`; `file.logical_size = file.logical_size.map(|l| l.max(extent))` (None stays None — derived). Delete dead code at ~1516 (`|| *new_size == 0 && false`, `.saturating_sub(0)`). | SM unit: create, commit 1 chunk (4 MB), SetFileSize(0), commit chunk → `logical_size == Some(4 MB)`; SetFileSize(6 MB) then commit chunk idx 0 → stays 6 MB (sparse-grow preserved). | Tests fail before, pass after. |
+| CR-2-4 | ✅ | RAFT-7 | `state_machine.rs` `DeleteFile` arm ~1051; `crates/dtfs-fuse/src/fuse_adapter.rs` rmdir | `DeleteFile`: also `write_leases.remove(path)`, `posix_locks.remove(path)`; if `files.range("{path}/"..)` has a child → `Error("directory not empty")`. FUSE rmdir maps that error to ENOTEMPTY (extend `cluster_err_to_errno` or match the message via a dedicated gRPC code `FailedPrecondition`). | SM unit: delete with live lease → lease gone; delete dir with child → Error, child intact. | Tests fail before, pass after. |
+| CR-2-5 | ✅ | RAFT-4 | `crates/dtfs-raft/src/lib.rs` `ClientRequest`, `state_machine.rs`, proposers in `dtfs-manager/src/metadata.rs`, `scheduler.rs`, `tiering.rs` | Add `#[serde(default)] now_ms: u64` to the seven variants listed in Data-model changes. In apply: `let now_ms = if req.now_ms == 0 { log_id.index /* CO-3-1 fallback */ } else { req.now_ms }`; pass it into `audit()` for those arms. Every proposer stamps `now_ms` from `SystemTime::now()`. Remove the top-of-apply `SystemTime::now()` once no arm needs it (leave it if any arm not in scope still does; note in Deviations). | SM unit: apply the same `RenameFile{now_ms: 1234}` on two fresh SMs → `serde_json::to_vec` identical; old-format entry (no `now_ms`) still deserialises. Snapshot compat test per § A.3.1. | Tests pass; `grep -n "SystemTime::now" state_machine.rs` shows only the fallback-free sites documented in Deviations. |
+| CR-2-6 | ✅ | RAFT-8, RAFT-9 | `state_machine.rs` `UpdateConfig` ~1386, `ReportScrubResult` ~1429 | UpdateConfig: `version = sm.cluster_config.version + 1`, ignore wire value (keep CAS check). ScrubRecord: `duration_secs = if x.is_finite() { x } else { 0.0 }`. | SM unit: UpdateConfig with wire version 1 after current 5 → stored 6; ScrubResult with NaN → snapshot round-trips. | Tests fail before, pass after. |
+| CR-2-7 | ✅ | — | `tests/release/cases/102-rename-directory-moves-children.sh`, `103-truncate-rewrite-reports-size.sh`, `104-quarantined-node-restart-stays-quarantined.sh` | Shell cases for RAFT-2/3/1 via FUSE + REST. | `bash -n` clean. | Present, unexecuted. |
+| CR-2-8 | ✅ | — | `AGENTS.md` A.8 `state_machine.rs` entry, A.3.1 | Document `now_ms` convention, RenameFile prefix semantics, sticky-state carry-forward. | — | Same commit. |
 
 ### Group 3 — Anchor / replica liveness in manager + tiering (branch `bug/cr-3-anchor-liveness`)
 
@@ -366,3 +366,117 @@ Order matters: CR-1-1 first (buffer shape), then 1-2..1-5 build on it.
   the chunk genuinely doesn't exist yet (legitimate) vs. the snapshot
   being stale (needs the guard), so the decision is deferred to
   `segments_committable()` at commit time, per the review note.
+
+- **CR-2-1** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-raft --release`: 88 -> 91 passed (3 new:
+  `raft_1_reregister_keeps_quarantined`, `raft_1_reregister_keeps_maintenance`,
+  `raft_1_reregister_healthy_stays_healthy`), 0 failed. `RegisterNode`'s apply
+  now reads `prior = sm.nodes.get(node_id)` before inserting and carries
+  `quarantine`/`Quarantined` or `Maintenance`/`Draining` forward onto the
+  incoming `info` before it overwrites `sm.nodes`; `node_info_material_eq`
+  already excludes health/quarantine so audit dedup is unaffected. Emits an
+  extra `RegisterNode: <id> (sticky state preserved: <state>)` audit row
+  when carry-forward fires.
+
+- **CR-2-2** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-raft --release`: 91 -> 95 passed (4 new:
+  `raft_2_rename_directory_moves_children`,
+  `raft_2_rename_synthetic_directory_moves_children`,
+  `raft_2_rename_onto_nonempty_directory_is_refused`,
+  `raft_2_rename_lease_follows_child`), 0 failed. `RenameFile`'s apply now
+  collects every `from/...` child key (BTreeMap range, collected before any
+  mutation) and re-keys each to `to/...`, moving its `posix_locks`/
+  `write_leases` entry too; a synthetic-dir source (no exact key, but
+  children exist) now succeeds instead of erroring; refuses when `to`
+  already has children (real or synthetic) or is inside `from`'s own
+  subtree.
+
+- **CR-2-3** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-raft --release`: 95 -> 97 passed (2 new:
+  `raft_3_truncate_zero_then_commit_grows_logical_size`,
+  `raft_3_sparse_grow_size_is_preserved_over_a_smaller_chunk_extent`),
+  0 failed. `UpdateChunkLocations`'s apply now computes
+  `extent = max(chunk_index*chunk_size + size_bytes)` over the merged
+  chunks and grows (never shrinks) an already-set `logical_size` to cover
+  it; `None` stays `None`. Deleted the dead `|| *new_size == 0 && false`
+  branch and the no-op `.saturating_sub(0)` in `SetFileSize`.
+
+- **CR-2-4** 2026-09-12, Docker `dtfs-buildenv:latest`. dtfs-raft
+  `cargo test -p dtfs-raft --release`: 97 -> 99 passed (2 new:
+  `raft_7_delete_file_removes_lease_and_locks`,
+  `raft_7_delete_nonempty_directory_is_refused`); dtfs-fuse
+  `cargo test -p dtfs-fuse --release`: 98 -> 99 passed (1 new:
+  `cr_2_4_failed_precondition_maps_to_enotempty`); dtfs-manager
+  `cargo test -p dtfs-manager --release`: 346 passed (no regression, no
+  new unit -- delete_file is a gRPC handler with no test scaffold, same
+  gap as the CR-1 group). 0 failed across all three. `DeleteFile`'s
+  apply now drops `write_leases`/`posix_locks` for the path and refuses
+  (`Error`) when a child key exists under `path/`. `cluster_err_to_errno`
+  maps gRPC `FailedPrecondition` to `ENOTEMPTY`. `metadata.rs::delete_file`
+  now checks the Raft response BEFORE computing/spawning the chunk
+  fan-out (previously the fan-out was scheduled unconditionally even on a
+  refusal) and maps `ClientResponse::Error` to `Status::failed_precondition`.
+
+- **CR-2-6** 2026-09-12, Docker `dtfs-buildenv:latest`,
+  `cargo test -p dtfs-raft --release`: 99 -> 101 passed (2 new:
+  `raft_8_update_config_version_always_current_plus_one`,
+  `raft_9_non_finite_duration_is_clamped_to_zero`), 0 failed. `UpdateConfig`
+  now always stores `sm.cluster_config.version + 1` (ignoring the wire
+  `version`, CAS check unchanged); `ReportScrubResult` clamps a non-finite
+  `duration_secs` to `0.0` before it reaches `ScrubRecord`. Updated the
+  pre-existing `co_5_10_update_config_legacy_no_expected_version_applies`
+  (asserted the wire value 7 was stored verbatim for a legacy/no-CAS
+  entry -- exactly the regression path this fix closes) to expect
+  `current + 1 = 5` instead.
+
+- **CR-2-5** 2026-09-12, Docker `dtfs-buildenv:latest`. dtfs-raft
+  `cargo test -p dtfs-raft --release`: 101 -> 104 passed (3 new:
+  `raft_4_rename_file_apply_is_deterministic_across_replicas`,
+  `raft_4_legacy_rename_file_without_now_ms_falls_back_to_log_index`,
+  `raft_4_update_chunk_locations_apply_is_deterministic_across_replicas`);
+  dtfs-manager `cargo test -p dtfs-manager --release`: 346 passed
+  (unchanged, no unit test scaffold touches the proposer call sites).
+  0 failed. Added `#[serde(default)] now_ms: u64` to `UpdateChunkLocations`,
+  `RemoveCorruptChunkReplicas`, `RenameFile`, `SetFileSize`,
+  `CreateSymlink`, `CreateLink`, `RemoveChunkLocation`. The apply for each
+  now computes `eff_now_ms = if now_ms == 0 { log_id.index } else { now_ms }`
+  (CO-3-1 fallback) and routes both `updated_at_ms` and that arm's own
+  audit row through a new `audit_at(summary, ts)` closure (the shared
+  `audit` closure still captures the top-of-apply wall clock for every
+  arm NOT in this list). `apply_remove_chunk_location` (factored out of
+  the `RemoveChunkLocation` arm) took an explicit `now_ms: u64` parameter
+  in place of its own inline `SystemTime::now()`. Every proposer
+  (`dtfs-manager/src/metadata.rs` via a new `stamp_now_ms()` helper;
+  `scheduler.rs`/`tiering.rs` via the pre-existing `now_millis()`) now
+  stamps `now_ms` instead of leaving it at the serde default. Left the
+  top-of-apply `SystemTime::now()` in place (see Deviations) since arms
+  outside the seven-variant scope (DeleteFile, RegisterNode,
+  QuarantineNode, ...) still call the wall-clock `audit` closure;
+  `grep -n "SystemTime::now" state_machine.rs` shows it only at the
+  top-of-apply definition, the read-only `lookup_path` synthetic-dir
+  helper (not persisted, out of scope), and in comments.
+
+- **CR-2-7** 2026-09-12. Added three release cases, `bash -n` clean on
+  all three, none executed (no lab, per the Build/verify environment
+  section): `tests/release/cases/102-rename-directory-moves-children.sh`
+  (mkdir + nested child, `mv` through the FUSE mount, asserts children
+  and content land under the new path and the old path is fully gone,
+  CR-2-2/RAFT-2); `103-truncate-rewrite-reports-size.sh` (write 8 MiB,
+  shell `>` truncate to 0, rewrite 3 MiB, asserts `stat` reports the
+  rewritten size rather than staying pinned at 0, CR-2-3/RAFT-3);
+  `104-quarantined-node-restart-stays-quarantined.sh` (corrupt a live
+  replica, read it through FUSE so verify_on_read's heartbeat
+  IntegrityFault auto-quarantines the node, `systemctl restart dtfs-data`,
+  asserts health is still `quarantined` after the re-register rather than
+  reverted to `healthy`, CR-2-1/RAFT-1). Modeled on `20-quarantine-flow.sh`
+  and `22-register-audit-idempotent.sh` for the corrupt/restart idiom and
+  `100-fuse-rewrite-offset-zero.sh` for the FUSE probe shape; none added
+  to `QUICK_CASES`.
+
+- **CR-2-8** 2026-09-12. Added one sentence each to AGENTS.md A.3.1
+  (the `now_ms` convention for a `ClientRequest` field that lands in
+  replicated state) and the A.8 `state_machine.rs` table row (sticky-
+  state carry-forward, prefix rename, `logical_size` extent), both
+  pointing at a new `### dtfs-raft/src/state_machine.rs` section in
+  `docs/src/internals/invariants.md` § A.8 carrying the full CR-2-1..2-6
+  narrative.

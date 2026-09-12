@@ -952,6 +952,26 @@ fn apply_request(
             origin_manager: String::new(),
         };
 
+    // RAFT-4 — `audit` above stamps the replica-local wall clock, which is
+    // fine for arms that don't otherwise need determinism. The seven
+    // proposer-stamped arms (UpdateChunkLocations, RemoveCorruptChunkReplicas,
+    // RenameFile, SetFileSize, CreateSymlink, CreateLink, RemoveChunkLocation)
+    // must apply as a pure function of (req, state): `audit_at` takes an
+    // explicit timestamp instead of capturing the outer `now_ms`, so those
+    // arms can route both `updated_at_ms` and their own audit row through the
+    // proposer's `now_ms` (falling back to `log_id.index` for a legacy/`0`
+    // entry, CO-3-1 pattern) and stay byte-identical across replicas.
+    let audit_at = |summary: String, ts: u64| AuditEntry {
+        log_index: log_id.index,
+        summary,
+        timestamp_ms: ts,
+        actor: String::new(),
+        action: String::new(),
+        target: String::new(),
+        result: String::new(),
+        origin_manager: String::new(),
+    };
+
     match req {
         ClientRequest::CreateFile {
             path,
@@ -1049,12 +1069,33 @@ fn apply_request(
         }
 
         ClientRequest::DeleteFile { path } => {
+            // RAFT-7 — a bare `sm.files.remove(path)` leaked the file's
+            // write lease + posix locks forever (re-creating the same path
+            // within `lease_ms` hit a stale WriteLeaseConflict), and never
+            // checked for children, so FUSE's `rmdir` -> `unlink` deleted
+            // only the directory marker while the tree underneath stayed
+            // live — `rm -r` reported success with files remaining.
+            let prefix = format!("{path}/");
+            let has_children = sm
+                .files
+                .range(prefix.clone()..)
+                .take_while(|(k, _)| k.starts_with(&prefix))
+                .next()
+                .is_some();
+            if has_children {
+                return ClientResponse::Error {
+                    message: format!("DeleteFile: '{path}' directory not empty"),
+                };
+            }
             sm.files.remove(path);
+            sm.write_leases.remove(path);
+            sm.posix_locks.remove(path);
             push_audit_capped(&mut sm.audit_log, audit(format!("DeleteFile: {path}")));
             ClientResponse::Success
         }
 
-        ClientRequest::UpdateChunkLocations { path, chunks, lease_id } => {
+        ClientRequest::UpdateChunkLocations { path, chunks, lease_id, now_ms: req_now_ms } => {
+            let eff_now_ms = if *req_now_ms == 0 { log_id.index } else { *req_now_ms };
             // Bug P — when the writer carries a lease_id, the manager
             // verifies it matches the currently-held lease. Pre-fix a
             // stale writer whose lease had been GC'd could still commit
@@ -1121,12 +1162,30 @@ fn apply_request(
 
             if let Some(file) = sm.files.get_mut(path) {
                 file.chunks = merge_chunk_location_entries(&file.chunks, chunks);
-                file.updated_at_ms = now_ms;
-                push_audit_capped(&mut sm.audit_log, audit(format!(
+                file.updated_at_ms = eff_now_ms;
+                // RAFT-3 — `logical_size` is set once by SetFileSize (e.g.
+                // O_TRUNC → SetFileSize(0)) and never revisited, so a
+                // truncate-then-rewrite (cp, rsync --inplace, shell `>`,
+                // SQLite journal recycle) committed chunks past the
+                // truncated size but every reader kept seeing the stale
+                // (usually 0) size. Grow logical_size to cover the extent
+                // implied by the merged chunks, but never derive a size out
+                // of thin air for a file that has none set yet (None stays
+                // None; a chunk-only file still reports the summed-chunks
+                // fallback in metadata.rs).
+                let extent = file
+                    .chunks
+                    .iter()
+                    .map(|c| c.chunk_index * file.chunk_size + c.size_bytes)
+                    .max();
+                if let Some(extent) = extent {
+                    file.logical_size = file.logical_size.map(|l| l.max(extent));
+                }
+                push_audit_capped(&mut sm.audit_log, audit_at(format!(
                     "UpdateChunks: {path} (merged {} incoming -> {} total)",
                     chunks.len(),
                     file.chunks.len()
-                )));
+                ), eff_now_ms));
                 ClientResponse::Success
             } else {
                 warn!("UpdateChunkLocations: file not found: {path}");
@@ -1136,7 +1195,8 @@ fn apply_request(
             }
         }
 
-        ClientRequest::RemoveCorruptChunkReplicas { node_id, chunk_hashes, disk_id } => {
+        ClientRequest::RemoveCorruptChunkReplicas { node_id, chunk_hashes, disk_id, now_ms: req_now_ms } => {
+            let eff_now_ms = if *req_now_ms == 0 { log_id.index } else { *req_now_ms };
             // Bug O — sweep every file's chunk list, dropping any entry
             // that matches (this node_id, one of these chunk_hashes).
             // The scheduler's check_under_replicated pass will then
@@ -1163,22 +1223,23 @@ fn apply_request(
                 if after < before {
                     dropped += (before - after) as u64;
                     affected_files += 1;
-                    file.updated_at_ms = now_ms;
+                    file.updated_at_ms = eff_now_ms;
                 }
             }
             push_audit_capped(
                 &mut sm.audit_log,
-                audit(format!(
+                audit_at(format!(
                     "RemoveCorruptChunkReplicas: node={node_id} disk={disk_id} chunks={} dropped_entries={} affected_files={}",
                     chunk_hashes.len(),
                     dropped,
                     affected_files,
-                )),
+                ), eff_now_ms),
             );
             ClientResponse::Success
         }
 
         ClientRequest::RegisterNode { node_id, info } => {
+            use dtfs_common::types::HealthStatus;
             // Bug BJ — audit only on a NEW node or a materially-changed
             // re-registration. node_id is deterministic
             // (node_id_from_hostname), so a re-register reuses the id and
@@ -1186,13 +1247,45 @@ fn apply_request(
             // unconditionally spammed the feed and evicted real events
             // against the MAX_AUDIT_LOG_ENTRIES cap. Still refresh
             // sm.nodes so last_seen_ms / usage update.
+            //
+            // RAFT-1 — the sole producer of RegisterNode (metadata.rs) always
+            // builds `health: Healthy, quarantine: None`, so a re-register
+            // (every process restart) wiped a Quarantined/Maintenance/
+            // Draining node back to Healthy, bypassing BF-6 (only
+            // UnquarantineNode may clear Quarantined) and re-entering the
+            // node into read/allocate/replication pools with its integrity
+            // fault unresolved. Carry the sticky state forward from `prior`
+            // before inserting.
+            let prior_state = sm.nodes.get(node_id).cloned();
+            let mut info = info.clone();
+            let mut sticky_state: Option<&'static str> = None;
+            if let Some(p) = &prior_state {
+                if p.quarantine.is_some() {
+                    info.quarantine = p.quarantine.clone();
+                    info.health = HealthStatus::Quarantined;
+                    sticky_state = Some("Quarantined");
+                } else if matches!(p.health, HealthStatus::Maintenance | HealthStatus::Draining) {
+                    info.health = p.health.clone();
+                    sticky_state = Some(if p.health == HealthStatus::Maintenance {
+                        "Maintenance"
+                    } else {
+                        "Draining"
+                    });
+                }
+            }
             let prior = sm.nodes.insert(*node_id, info.clone());
             let materially_changed = match &prior {
                 None => true,
-                Some(old) => !node_info_material_eq(old, info),
+                Some(old) => !node_info_material_eq(old, &info),
             };
             if materially_changed {
                 push_audit_capped(&mut sm.audit_log, audit(format!("RegisterNode: {node_id}")));
+            }
+            if let Some(state) = sticky_state {
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit(format!("RegisterNode: {node_id} (sticky state preserved: {state})")),
+                );
             }
             ClientResponse::Success
         }
@@ -1370,7 +1463,7 @@ fn apply_request(
 
         ClientRequest::UpdateConfig {
             config_json,
-            version,
+            version: _, // RAFT-8 — apply always derives its own version.
             expected_version,
         } => {
             // CO-5-10 — compare-and-set on the cluster-config version. The
@@ -1394,11 +1487,17 @@ fn apply_request(
                     ),
                 };
             }
+            // RAFT-8 — the CAS check above only pins the EXPECTED base
+            // version; the stored `version` came straight from the wire, so
+            // a buggy/malicious proposer could regress it (e.g. resubmit an
+            // old value) even though the base matched. The apply is the
+            // sole authority: it always derives the new version itself.
+            let new_version = sm.cluster_config.version + 1;
             sm.cluster_config = ClusterConfig {
                 config_json: config_json.clone(),
-                version: *version,
+                version: new_version,
             };
-            push_audit_capped(&mut sm.audit_log, audit(format!("UpdateConfig: v{version}")));
+            push_audit_capped(&mut sm.audit_log, audit(format!("UpdateConfig: v{new_version}")));
             ClientResponse::Success
         }
 
@@ -1426,6 +1525,13 @@ fn apply_request(
             chunks_missing,
             duration_secs,
         } => {
+            // RAFT-9 — serde_json serialises NaN/inf as `null`, which then
+            // fails to deserialise as f64 on the very next snapshot load
+            // (every `install_snapshot` fails, discarding the whole
+            // snapshot -> RAFT-6). The RPC is CLI/REST-injectable, so clamp
+            // any non-finite value at the apply boundary rather than trust
+            // the reporter (the real data node always sends finite values).
+            let duration_secs = if duration_secs.is_finite() { *duration_secs } else { 0.0 };
             let record = ScrubRecord {
                 node_id: *node_id,
                 disk_path: disk_path.clone(),
@@ -1435,7 +1541,7 @@ fn apply_request(
                 chunks_healthy: *chunks_healthy,
                 chunks_corrupt: *chunks_corrupt,
                 chunks_missing: *chunks_missing,
-                duration_secs: *duration_secs,
+                duration_secs,
             };
             // BK — store per (node, level) so a deep scrub does not
             // overwrite the quick result (and vice versa). The legacy
@@ -1463,14 +1569,56 @@ fn apply_request(
 
         // ---- Extended POSIX surface (F-034 .. F-038) ----
 
-        ClientRequest::RenameFile { from, to } => {
+        ClientRequest::RenameFile { from, to, now_ms: req_now_ms } => {
+            let eff_now_ms = if *req_now_ms == 0 { log_id.index } else { *req_now_ms };
             if from == to {
                 return ClientResponse::Success;
             }
-            // Remove the source's metadata, rewrite its path, re-insert under the new key.
-            if let Some(mut meta) = sm.files.remove(from) {
+            // RAFT-2 — a plain FUSE `rename_file(from, to)` used to move only
+            // the exact `from` key; a directory's children (stored under
+            // `from/...` keys, real or synthetic) were left stranded under
+            // the old prefix. Renaming a directory into its own subtree, or
+            // onto an existing non-empty directory, must be refused rather
+            // than silently corrupt the tree.
+            let from_prefix = format!("{from}/");
+            if to.starts_with(&from_prefix) {
+                return ClientResponse::Error {
+                    message: format!(
+                        "RenameFile: cannot rename '{from}' into its own subtree '{to}'"
+                    ),
+                };
+            }
+            let to_prefix = format!("{to}/");
+            let to_has_children = sm
+                .files
+                .range(to_prefix.clone()..)
+                .take_while(|(k, _)| k.starts_with(&to_prefix))
+                .next()
+                .is_some();
+            if to_has_children {
+                return ClientResponse::Error {
+                    message: format!(
+                        "RenameFile: destination '{to}' is a non-empty directory"
+                    ),
+                };
+            }
+            // Collect the child keys BEFORE mutating sm.files (BTreeMap
+            // iteration must not overlap a removal/insertion into itself).
+            let child_keys: Vec<String> = sm
+                .files
+                .range(from_prefix.clone()..)
+                .take_while(|(k, _)| k.starts_with(&from_prefix))
+                .map(|(k, _)| k.clone())
+                .collect();
+            let exact_source = sm.files.remove(from);
+            if exact_source.is_none() && child_keys.is_empty() {
+                return ClientResponse::Error {
+                    message: format!("RenameFile: source '{from}' not found"),
+                };
+            }
+            if let Some(mut meta) = exact_source {
                 meta.path = to.clone();
-                meta.updated_at_ms = now_ms;
+                meta.updated_at_ms = eff_now_ms;
                 sm.files.insert(to.clone(), meta);
                 // Migrate any active locks on the path too.
                 if let Some(locks) = sm.posix_locks.remove(from) {
@@ -1493,30 +1641,52 @@ fn apply_request(
                         sm.write_leases.remove(to);
                     }
                 }
-                push_audit_capped(
-                    &mut sm.audit_log,
-                    audit(format!("RenameFile: {from} -> {to}")),
-                );
-                ClientResponse::Success
-            } else {
-                ClientResponse::Error {
-                    message: format!("RenameFile: source '{from}' not found"),
-                }
             }
+            // Re-key every child (real or a synthetic sub-directory's own
+            // children) from `from/<suffix>` to `to/<suffix>`.
+            let mut moved_children: u64 = 0;
+            for old_key in child_keys {
+                let suffix = &old_key[from.len()..];
+                let new_key = format!("{to}{suffix}");
+                if let Some(mut meta) = sm.files.remove(&old_key) {
+                    meta.path = new_key.clone();
+                    meta.updated_at_ms = eff_now_ms;
+                    sm.files.insert(new_key.clone(), meta);
+                }
+                if let Some(locks) = sm.posix_locks.remove(&old_key) {
+                    sm.posix_locks.insert(new_key.clone(), locks);
+                }
+                match sm.write_leases.remove(&old_key) {
+                    Some(lease) => {
+                        sm.write_leases.insert(new_key.clone(), lease);
+                    }
+                    None => {
+                        sm.write_leases.remove(&new_key);
+                    }
+                }
+                moved_children += 1;
+            }
+            push_audit_capped(
+                &mut sm.audit_log,
+                audit_at(format!(
+                    "RenameFile: {from} -> {to} ({moved_children} children moved)"
+                ), eff_now_ms),
+            );
+            ClientResponse::Success
         }
 
-        ClientRequest::SetFileSize { path, new_size } => {
+        ClientRequest::SetFileSize { path, new_size, now_ms: req_now_ms } => {
+            let eff_now_ms = if *req_now_ms == 0 { log_id.index } else { *req_now_ms };
             if let Some(meta) = sm.files.get_mut(path) {
                 meta.logical_size = Some(*new_size);
-                meta.updated_at_ms = now_ms;
+                meta.updated_at_ms = eff_now_ms;
                 // Truncate-shrink: drop chunks fully past the new EOF.
                 let chunk_size = meta.chunk_size.max(1);
-                let keep_idx = ((*new_size).div_ceil(chunk_size)).saturating_sub(0);
-                meta.chunks
-                    .retain(|c| (c.chunk_index as u64) < keep_idx || *new_size == 0 && false);
+                let keep_idx = (*new_size).div_ceil(chunk_size);
+                meta.chunks.retain(|c| c.chunk_index < keep_idx);
                 push_audit_capped(
                     &mut sm.audit_log,
-                    audit(format!("SetFileSize: {path} -> {new_size}")),
+                    audit_at(format!("SetFileSize: {path} -> {new_size}"), eff_now_ms),
                 );
                 ClientResponse::Success
             } else {
@@ -1526,7 +1696,8 @@ fn apply_request(
             }
         }
 
-        ClientRequest::CreateSymlink { path, target } => {
+        ClientRequest::CreateSymlink { path, target, now_ms: req_now_ms } => {
+            let eff_now_ms = if *req_now_ms == 0 { log_id.index } else { *req_now_ms };
             sm.files.insert(
                 path.clone(),
                 FileMetadata {
@@ -1534,8 +1705,8 @@ fn apply_request(
                     volume_id: "default".to_string(),
                     chunk_size: 0,
                     chunks: Vec::new(),
-                    created_at_ms: now_ms,
-                    updated_at_ms: now_ms,
+                    created_at_ms: eff_now_ms,
+                    updated_at_ms: eff_now_ms,
                     symlink_target: Some(target.clone()),
                     logical_size: Some(target.len() as u64),
                     is_directory: false,
@@ -1544,24 +1715,25 @@ fn apply_request(
             );
             push_audit_capped(
                 &mut sm.audit_log,
-                audit(format!("Symlink: {path} -> {target}")),
+                audit_at(format!("Symlink: {path} -> {target}"), eff_now_ms),
             );
             ClientResponse::Success
         }
 
-        ClientRequest::CreateLink { source, dest } => {
+        ClientRequest::CreateLink { source, dest, now_ms: req_now_ms } => {
+            let eff_now_ms = if *req_now_ms == 0 { log_id.index } else { *req_now_ms };
             // Hard link: clone the source metadata under the dest path.
             // The chunk list is shared by value (chunk_ids are content-addressed
             // so the same bytes remain accessible from both names).
             if let Some(src_meta) = sm.files.get(source).cloned() {
                 let mut new_meta = src_meta;
                 new_meta.path = dest.clone();
-                new_meta.created_at_ms = now_ms;
-                new_meta.updated_at_ms = now_ms;
+                new_meta.created_at_ms = eff_now_ms;
+                new_meta.updated_at_ms = eff_now_ms;
                 sm.files.insert(dest.clone(), new_meta);
                 push_audit_capped(
                     &mut sm.audit_log,
-                    audit(format!("Link: {source} -> {dest}")),
+                    audit_at(format!("Link: {source} -> {dest}"), eff_now_ms),
                 );
                 ClientResponse::Success
             } else {
@@ -1896,7 +2068,9 @@ fn apply_request(
             node_id,
             disk_id,
             enforce_anchor,
+            now_ms: req_now_ms,
         } => {
+            let eff_now_ms = if *req_now_ms == 0 { log_id.index } else { *req_now_ms };
             // Bug AV — operator-driven cache replica removal. Mutates
             // `FileMetadata.chunks` to drop a single entry, with an
             // optional anchor-strand check. CO-1-1 — keyed on the exact
@@ -1908,6 +2082,7 @@ fn apply_request(
                 node_id,
                 *disk_id,
                 enforce_anchor.as_ref(),
+                eff_now_ms,
             )
         }
 
@@ -1960,6 +2135,7 @@ fn apply_remove_chunk_location(
     node_id: &str,
     disk_id: u32,
     enforce_anchor: Option<&AnchorPolicy>,
+    now_ms: u64,
 ) -> ClientResponse {
     let file = match sm.files.get(path) {
         Some(f) => f,
@@ -2060,10 +2236,9 @@ fn apply_remove_chunk_location(
         before.saturating_sub(after) == 1 || legacy_node_wide,
         "disk-targeted RemoveChunkLocation must drop exactly one entry"
     );
-    file_mut.updated_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    // RAFT-4 — was a fresh `SystemTime::now()` per replica; now the
+    // proposer-stamped (or `log_id.index`-fallback) deterministic value.
+    file_mut.updated_at_ms = now_ms;
     ClientResponse::Success
 }
 
@@ -2663,7 +2838,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(5),
-            &ClientRequest::UpdateChunkLocations {
+            &ClientRequest::UpdateChunkLocations { now_ms: 0,
                 path: "/movies/.foo.GQhlto".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -2686,7 +2861,7 @@ mod posix_path_regression {
         let resp = apply_request(
             &mut sm,
             &mk_log_id(6),
-            &ClientRequest::RenameFile {
+            &ClientRequest::RenameFile { now_ms: 0,
                 from: "/movies/.foo.GQhlto".into(),
                 to: "/movies/foo.mkv".into(),
             },
@@ -2746,7 +2921,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(3),
-            &ClientRequest::UpdateChunkLocations {
+            &ClientRequest::UpdateChunkLocations { now_ms: 0,
                 path: "/f.bin".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -2774,7 +2949,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(5),
-            &ClientRequest::RemoveCorruptChunkReplicas {
+            &ClientRequest::RemoveCorruptChunkReplicas { now_ms: 0,
                 node_id: "10".into(),
                 chunk_hashes: vec!["h0".into()],
                 disk_id: crate::legacy_disk_id(),
@@ -2824,7 +2999,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(12),
-            &ClientRequest::UpdateChunkLocations {
+            &ClientRequest::UpdateChunkLocations { now_ms: 0,
                 path: "/series/episode-01.mkv".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -2940,7 +3115,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(99),
-            &ClientRequest::RemoveCorruptChunkReplicas {
+            &ClientRequest::RemoveCorruptChunkReplicas { now_ms: 0,
                 node_id: "10".into(),
                 chunk_hashes: vec!["corrupt-hash".into()],
                 disk_id: legacy_disk_id(),
@@ -3023,7 +3198,7 @@ mod posix_path_regression {
         let resp = apply_request(
             &mut sm,
             &mk_log_id(5),
-            &ClientRequest::UpdateChunkLocations {
+            &ClientRequest::UpdateChunkLocations { now_ms: 0,
                 path: "/x.bin".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -3051,7 +3226,7 @@ mod posix_path_regression {
         let resp = apply_request(
             &mut sm,
             &mk_log_id(6),
-            &ClientRequest::UpdateChunkLocations {
+            &ClientRequest::UpdateChunkLocations { now_ms: 0,
                 path: "/x.bin".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -3087,7 +3262,7 @@ mod posix_path_regression {
         let resp = apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::UpdateChunkLocations {
+            &ClientRequest::UpdateChunkLocations { now_ms: 0,
                 path: "/y.bin".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -3142,7 +3317,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(100),
-            &ClientRequest::RemoveCorruptChunkReplicas {
+            &ClientRequest::RemoveCorruptChunkReplicas { now_ms: 0,
                 node_id: "20".into(),
                 chunk_hashes: vec!["h-bad".into()],
                 disk_id: legacy_disk_id(),
@@ -3367,7 +3542,7 @@ mod posix_path_regression {
         // With the anchor node healthy, dropping the warm copy is fine.
         let mut healthy = sm.clone();
         let resp = apply_request(&mut healthy, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
@@ -3380,7 +3555,7 @@ mod posix_path_regression {
         // same removal must be refused instead of counting on it.
         sm.nodes.get_mut(&10).unwrap().health = HealthStatus::Down;
         let resp = apply_request(&mut sm, &mk_log_id(2),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
@@ -3401,7 +3576,7 @@ mod posix_path_regression {
         bad_disk.nodes.get_mut(&10).unwrap().disks[0].status =
             dtfs_common::types::DiskStatus::Failed;
         let resp = apply_request(&mut bad_disk, &mk_log_id(3),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
@@ -3423,7 +3598,7 @@ mod posix_path_regression {
             (11, "dc-b", DiskTier::Warm),
         ]);
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
@@ -3441,7 +3616,7 @@ mod posix_path_regression {
     fn bug_av_remove_chunk_location_unknown_file_is_noop() {
         let mut sm = StateMachineData::default();
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/nope".into(),
                 chunk_index: 0,
                 node_id: "10".into(),
@@ -3458,7 +3633,7 @@ mod posix_path_regression {
         use dtfs_common::types::DiskTier;
         let mut sm = sm_with_chunk("/x", 0, "h", &[(10, "dc-a", DiskTier::Cold)]);
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "99".into(),  // not present
@@ -3481,7 +3656,7 @@ mod posix_path_regression {
         ]);
         // Attempt to drop the only leli-resident replica — last anchor copy.
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "10".into(),
@@ -3523,7 +3698,7 @@ mod posix_path_regression {
             (11, "leli", DiskTier::Warm),
         ]);
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(), // warm
@@ -3540,7 +3715,7 @@ mod posix_path_regression {
             (11, "leli", DiskTier::Warm),
         ]);
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "10".into(),  // cold
@@ -3574,7 +3749,7 @@ mod posix_path_regression {
             }
         }
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(), // drop warm; cold survivor anchors
@@ -3688,7 +3863,7 @@ mod posix_path_regression {
             (11, "leli", DiskTier::Warm),  // dropping this
         ]);
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
@@ -3852,6 +4027,83 @@ mod posix_path_regression {
             2,
             "a materially-changed re-register (version) must add exactly one row"
         );
+    }
+
+    // ── RAFT-1 — RegisterNode must carry forward sticky Quarantined/
+    // Maintenance/Draining state instead of resetting to Healthy ─────
+
+    #[test]
+    fn raft_1_reregister_keeps_quarantined() {
+        use dtfs_common::types::{HealthStatus, QuarantineReason};
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::QuarantineNode {
+                node_id: 7,
+                info: mk_quarantine_info(QuarantineReason::DeepScrubHashMismatch),
+            },
+        );
+        assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Quarantined);
+
+        // Re-register (e.g. process restart) with the producer's
+        // unconditional health: Healthy, quarantine: None.
+        apply_request(
+            &mut sm,
+            &mk_log_id(3),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        let node = sm.nodes.get(&7).expect("node still registered");
+        assert_eq!(node.health, HealthStatus::Quarantined,
+            "re-register must not clear Quarantined");
+        assert!(node.quarantine.is_some(),
+            "QuarantineInfo must survive re-register");
+    }
+
+    #[test]
+    fn raft_1_reregister_keeps_maintenance() {
+        use dtfs_common::types::HealthStatus;
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::UpdateNodeStatus { node_id: 7, status: "maintenance".into() },
+        );
+        assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Maintenance);
+        apply_request(
+            &mut sm,
+            &mk_log_id(3),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Maintenance,
+            "re-register must not clear Maintenance");
+    }
+
+    #[test]
+    fn raft_1_reregister_healthy_stays_healthy() {
+        use dtfs_common::types::HealthStatus;
+        let mut sm = StateMachineData::default();
+        apply_request(
+            &mut sm,
+            &mk_log_id(1),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        apply_request(
+            &mut sm,
+            &mk_log_id(2),
+            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+        );
+        assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Healthy);
     }
 
     // Bug BR-1 — managers now self-register (role="manager") to publish
@@ -4360,6 +4612,282 @@ mod posix_path_regression {
         assert_eq!(count_audit_prefix(&sm, "UpdateNodeStatus:"), 2,
             "Healthy->Suspect then Suspect->Healthy = two transitions = two rows");
     }
+
+    // ── RAFT-2 — RenameFile must move directory children, not just the
+    // exact key ──────────────────────────────────────────────────────
+
+    #[test]
+    fn raft_2_rename_directory_moves_children() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/a/".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+            path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::CreateFile {
+            path: "/a/b/y".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(4),
+            &ClientRequest::RenameFile { now_ms: 0, from: "/a".into(), to: "/c".into() });
+
+        assert!(sm.files.contains_key("/c"), "dir marker moved");
+        assert!(sm.files.contains_key("/c/x"), "child file moved");
+        assert!(sm.files.contains_key("/c/b/y"), "grandchild moved");
+        assert_eq!(sm.files.get("/c/x").unwrap().path, "/c/x",
+            "moved child's own path field must be updated");
+        assert!(!sm.files.contains_key("/a"), "old dir marker gone");
+        assert!(!sm.files.contains_key("/a/x"), "old child gone");
+        assert!(!sm.files.contains_key("/a/b/y"), "old grandchild gone");
+    }
+
+    #[test]
+    fn raft_2_rename_synthetic_directory_moves_children() {
+        let mut sm = StateMachineData::default();
+        // No mkdir marker for "/a" — only a file underneath it, so "/a" is
+        // a synthetic directory (Bug B).
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        let resp = apply_request(&mut sm, &mk_log_id(2),
+            &ClientRequest::RenameFile { now_ms: 0, from: "/a".into(), to: "/c".into() });
+        assert!(matches!(resp, ClientResponse::Success),
+            "synthetic-dir source with children must succeed, got {resp:?}");
+        assert!(sm.files.contains_key("/c/x"));
+        assert!(!sm.files.contains_key("/a/x"));
+    }
+
+    #[test]
+    fn raft_2_rename_onto_nonempty_directory_is_refused() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+            path: "/b/y".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        let resp = apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::RenameFile { now_ms: 0, from: "/a".into(), to: "/b".into() });
+        assert!(matches!(resp, ClientResponse::Error { .. }),
+            "renaming onto a non-empty directory must be refused, got {resp:?}");
+        assert!(sm.files.contains_key("/a/x"), "source untouched on refusal");
+        assert!(sm.files.contains_key("/b/y"), "destination untouched on refusal");
+    }
+
+    #[test]
+    fn raft_2_rename_lease_follows_child() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::AcquireWriteLease {
+            path: "/a/x".into(), owner_id: "writer-1".into(), lease_ms: 60_000, now_ms: 1_000,
+            proposed_lease_id: "lease-1".into(),
+        });
+        assert!(sm.write_leases.contains_key("/a/x"));
+        apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::RenameFile { now_ms: 0, from: "/a".into(), to: "/c".into() });
+        assert!(!sm.write_leases.contains_key("/a/x"), "old lease key gone");
+        let lease = sm.write_leases.get("/c/x").expect("lease follows the renamed child");
+        assert_eq!(lease.owner_id, "writer-1");
+    }
+
+    // ── RAFT-3 — logical_size must grow to cover chunks committed after a
+    // truncate, not stay pinned at the truncated size forever ──────────
+
+    #[test]
+    fn raft_3_truncate_zero_then_commit_grows_logical_size() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/f".into(), volume_id: "default".into(), chunk_size: 4 * 1024 * 1024,
+        });
+        apply_request(&mut sm, &mk_log_id(2),
+            &ClientRequest::SetFileSize { now_ms: 0, path: "/f".into(), new_size: 0 });
+        assert_eq!(sm.files.get("/f").unwrap().logical_size, Some(0));
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::UpdateChunkLocations { now_ms: 0,
+            path: "/f".into(),
+            chunks: vec![ChunkLocationEntry {
+                chunk_index: 0, chunk_hash: "h".into(), node_id: "10".into(),
+                disk_id: 0, size_bytes: 4 * 1024 * 1024,
+            }],
+            lease_id: String::new(),
+        });
+        assert_eq!(
+            sm.files.get("/f").unwrap().logical_size,
+            Some(4 * 1024 * 1024),
+            "committing a chunk past the truncated size must grow logical_size"
+        );
+    }
+
+    #[test]
+    fn raft_3_sparse_grow_size_is_preserved_over_a_smaller_chunk_extent() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/f".into(), volume_id: "default".into(), chunk_size: 4 * 1024 * 1024,
+        });
+        let six_mb = 6 * 1024 * 1024u64;
+        apply_request(&mut sm, &mk_log_id(2),
+            &ClientRequest::SetFileSize { now_ms: 0, path: "/f".into(), new_size: six_mb });
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::UpdateChunkLocations { now_ms: 0,
+            path: "/f".into(),
+            chunks: vec![ChunkLocationEntry {
+                chunk_index: 0, chunk_hash: "h".into(), node_id: "10".into(),
+                disk_id: 0, size_bytes: 4 * 1024 * 1024,
+            }],
+            lease_id: String::new(),
+        });
+        assert_eq!(
+            sm.files.get("/f").unwrap().logical_size,
+            Some(six_mb),
+            "a sparse-grow size ahead of the committed chunks must not shrink"
+        );
+    }
+
+    // ── RAFT-7 — DeleteFile must drop lease/locks and refuse a non-empty
+    // directory ──────────────────────────────────────────────────────
+
+    #[test]
+    fn raft_7_delete_file_removes_lease_and_locks() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/f".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::AcquireWriteLease {
+            path: "/f".into(), owner_id: "writer-1".into(), lease_ms: 60_000, now_ms: 1_000,
+            proposed_lease_id: "lease-1".into(),
+        });
+        assert!(sm.write_leases.contains_key("/f"));
+        let resp = apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::DeleteFile { path: "/f".into() });
+        assert!(matches!(resp, ClientResponse::Success));
+        assert!(!sm.files.contains_key("/f"));
+        assert!(!sm.write_leases.contains_key("/f"),
+            "lease must be dropped, or a re-create within lease_ms hits a stale WriteLeaseConflict");
+    }
+
+    #[test]
+    fn raft_7_delete_nonempty_directory_is_refused() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/a/".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+            path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        let resp = apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::DeleteFile { path: "/a".into() });
+        assert!(matches!(resp, ClientResponse::Error { .. }),
+            "rmdir of a non-empty directory must be refused, got {resp:?}");
+        assert!(sm.files.contains_key("/a"), "dir survives refusal");
+        assert!(sm.files.contains_key("/a/x"), "child survives refusal");
+    }
+
+    // ── RAFT-8 — UpdateConfig must always derive its own version, never
+    // trust the wire value ──────────────────────────────────────────
+
+    #[test]
+    fn raft_8_update_config_version_always_current_plus_one() {
+        let mut sm = StateMachineData::default();
+        sm.cluster_config = ClusterConfig { config_json: "{}".into(), version: 5 };
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::UpdateConfig {
+            config_json: "{\"a\":1}".into(),
+            version: 1, // stale/regressive wire value
+            expected_version: 5,
+        });
+        assert_eq!(sm.cluster_config.version, 6,
+            "apply must derive version = current + 1, ignoring the wire value");
+    }
+
+    // ── RAFT-4 — apply of the seven now_ms-carrying variants must be a
+    // pure function of (req, state), not each replica's own wall clock ──
+
+    #[test]
+    fn raft_4_rename_file_apply_is_deterministic_across_replicas() {
+        let req = ClientRequest::RenameFile {
+            from: "/a".into(), to: "/b".into(), now_ms: 1_234,
+        };
+        let mut sm1 = StateMachineData::default();
+        apply_request(&mut sm1, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/a".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        let mut sm2 = sm1.clone();
+        apply_request(&mut sm1, &mk_log_id(2), &req);
+        apply_request(&mut sm2, &mk_log_id(2), &req);
+        assert_eq!(
+            serde_json::to_vec(&sm1).unwrap(),
+            serde_json::to_vec(&sm2).unwrap(),
+            "two replicas applying the same now_ms-stamped entry must be byte-identical"
+        );
+        assert_eq!(sm1.files.get("/b").unwrap().updated_at_ms, 1_234);
+    }
+
+    #[test]
+    fn raft_4_legacy_rename_file_without_now_ms_falls_back_to_log_index() {
+        let legacy = r#"{"RenameFile":{"from":"/a","to":"/b"}}"#;
+        let req: ClientRequest =
+            serde_json::from_str(legacy).expect("legacy RenameFile (no now_ms) must deserialise");
+        match &req {
+            ClientRequest::RenameFile { now_ms, .. } => assert_eq!(*now_ms, 0),
+            other => panic!("expected RenameFile, got {other:?}"),
+        }
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/a".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        apply_request(&mut sm, &mk_log_id(7), &req);
+        assert_eq!(
+            sm.files.get("/b").unwrap().updated_at_ms, 7,
+            "now_ms == 0 (legacy entry) must fall back to log_id.index"
+        );
+    }
+
+    #[test]
+    fn raft_4_update_chunk_locations_apply_is_deterministic_across_replicas() {
+        let req = ClientRequest::UpdateChunkLocations {
+            path: "/f".into(),
+            chunks: vec![ChunkLocationEntry {
+                chunk_index: 0, chunk_hash: "h".into(), node_id: "10".into(),
+                disk_id: 0, size_bytes: 4096,
+            }],
+            lease_id: String::new(),
+            now_ms: 5_000,
+        };
+        let mut sm1 = StateMachineData::default();
+        apply_request(&mut sm1, &mk_log_id(1), &ClientRequest::CreateFile {
+            path: "/f".into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        let mut sm2 = sm1.clone();
+        apply_request(&mut sm1, &mk_log_id(2), &req);
+        apply_request(&mut sm2, &mk_log_id(2), &req);
+        assert_eq!(serde_json::to_vec(&sm1).unwrap(), serde_json::to_vec(&sm2).unwrap());
+        assert_eq!(sm1.files.get("/f").unwrap().updated_at_ms, 5_000);
+    }
+
+    // ── RAFT-9 — a non-finite duration_secs must never reach the SM, or
+    // the next snapshot fails to deserialize and gets discarded ────────
+
+    #[test]
+    fn raft_9_non_finite_duration_is_clamped_to_zero() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::ReportScrubResult {
+            node_id: 7,
+            disk_path: "/data".into(),
+            level: "quick".into(),
+            completed_at_ms: 1_000,
+            chunks_checked: 10,
+            chunks_healthy: 10,
+            chunks_corrupt: 0,
+            chunks_missing: 0,
+            duration_secs: f64::NAN,
+        });
+        let rec = sm.scrub_results.get(&7).expect("scrub result stored");
+        assert_eq!(rec.duration_secs, 0.0, "NaN must be clamped to 0.0");
+        // Round-trip through the same JSON encoding a snapshot would use.
+        let json = serde_json::to_vec(&sm).expect("serialize");
+        let restored: StateMachineData =
+            serde_json::from_slice(&json).expect("must deserialize without a non-finite f64");
+        assert_eq!(restored.scrub_results.get(&7).unwrap().duration_secs, 0.0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4426,7 +4954,7 @@ mod audit_co_tests {
         // Drop the WARM disk-1 replica; the cold disk-0 anchor must survive.
         let mut sm = sm_with_colocated_disks();
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "10".into(),
@@ -4453,7 +4981,7 @@ mod audit_co_tests {
         // co-located entries on node 10 are dropped.
         let mut sm = sm_with_colocated_disks();
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation {
+            &ClientRequest::RemoveChunkLocation { now_ms: 0,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "10".into(),
@@ -4534,7 +5062,7 @@ mod audit_co_tests {
             volume_id: "default".into(),
             chunk_size: 1024,
         });
-        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::UpdateChunkLocations {
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::UpdateChunkLocations { now_ms: 0,
             path: "/keep.bin".into(),
             chunks: vec![ChunkLocationEntry {
                 chunk_index: 0,
@@ -4587,13 +5115,13 @@ mod audit_co_tests {
             chunk_size: 1024,
         });
         // Rename /a -> /b.
-        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::RenameFile {
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::RenameFile { now_ms: 0,
             from: "/a".into(),
             to: "/b".into(),
         });
         // Commit chunks on /b under the original lease.
         let resp = apply_request(&mut sm, &mk_log_id(4),
-            &ClientRequest::UpdateChunkLocations {
+            &ClientRequest::UpdateChunkLocations { now_ms: 0,
                 path: "/b".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -4686,7 +5214,7 @@ mod audit_co_tests {
         });
         // A different writer commits with an EMPTY lease_id while A holds it.
         let resp = apply_request(&mut sm, &mk_log_id(3),
-            &ClientRequest::UpdateChunkLocations {
+            &ClientRequest::UpdateChunkLocations { now_ms: 0,
                 path: "/f".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -4803,7 +5331,12 @@ mod audit_co_tests {
             matches!(resp, ClientResponse::Success),
             "legacy entry must apply without a CAS check, got {resp:?}",
         );
-        assert_eq!(sm.cluster_config.version, 7);
+        // RAFT-8 — the apply now ALWAYS derives version = current + 1 and
+        // ignores the wire value (previously stored verbatim), closing a
+        // version-regression hole a buggy/malicious proposer could hit even
+        // when the CAS base matched. The legacy wire value of 7 here is
+        // deliberately stale/irrelevant post-fix.
+        assert_eq!(sm.cluster_config.version, 5);
     }
 
     // CO-5-10 — the version-0 boundary: two writes racing off a fresh
