@@ -877,165 +877,74 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
 
 # Part B — Operating Discipline
 
-Applies to every non-trivial change (new feature, multi-bug wave,
-refactor touching >3 files, anything >1 day). For trivial work
-(one-liners, single doc edits) use judgement and just do it. The fixing
-procedure (§ B.1), plan workflow (§ B.2), commit discipline incl. the
-`Co-Authored-By:` trailer (§ B.4), and test discipline (§ B.5) are
-mandatory for non-trivial work; commits that bypass them get reverted. If
-a session instruction conflicts with a rule here, the user wins — flag
-it so this file gets updated (§ B.7).
+## B.1 How a change lands
 
-## B.1 Fixing procedure
+1. Reproduce / locate. 2. Write the failing test in the purest layer that
+shows it (pure helper > state-machine apply > manager aggregator > FUSE
+helper > shell case). 3. Smallest fix that turns it green, no bundled
+cleanup. 4. `cargo test -p <crate> --release` in the build env, plus the
+full workspace suite before anything is deployed. 5. Commit.
 
-Every fix, no matter how small:
-1. **Write a failing test** in the purest layer that shows the bug
-   (§ B.5). Run it, observe the failure.
-2. **Implement** the smallest fix that turns it green. No bundled
-   cleanup.
-3. **Verify**: the new test passes, the crate's suite has no
-   regressions, and live-verify on the lab if the bug is operational.
-   Quote the failing-then-passing run in the commit.
+Default: commit straight to `master`. Use a branch only if the change
+touches a wire or on-disk format (`proto/*.proto`, `ClientRequest`,
+`apply_request`, any `#[serde]`-persisted struct), touches > 6 files, or
+spans more than one session. Open a PR only when the change needs a
+release-note line (`bug:` / `feat:` subjects; label it).
 
-On a new bug: reproduce → check `plans/active/` for an existing plan that
-covers it (add a task there if so) → else pick the next bug letter
-(alphabetical from the highest in `plans/active/`) → create
-`plans/active/PLAN-BUG-<letter>-<name>.md` (§ B.2) → follow the three
-steps.
+## B.2 Plans
 
-## B.2 Plan-driven workflow
+Write `plans/active/PLAN-<id>-<short-name>.md` when the work has ≥ 3
+tasks, spans sessions, or crosses crates — otherwise use the session todo
+list. Template and rules: `plans/README.md`. The plan is the source of
+truth; when reality diverges, record it under Deviations before
+continuing. Delete the file when every task is done — git keeps it.
 
-Before code for a non-trivial change, write
-`plans/active/PLAN-<id>-<short-name>.md`. Keep it lean. It must contain:
-- Goals + non-goals.
-- Locked-in decisions from the user.
-- Data-model changes with concrete shapes (struct fields, proto
-  messages, Raft variants, config keys).
-- Task list with stable IDs (`<plan-id>-<phase>-<n>`), each listing:
-  files, implementation sketch, required tests, "done when" acceptance
-  criteria, and a status marker (⬜ todo / 🟦 wip / ✅ done / 🟥 blocked /
-  🟨 review).
-- Cross-cutting invariants.
-- Verification log + Deviations sections (filled in as work proceeds).
-
-The plan is the source of truth. When reality diverges, update the plan
-(Deviations) first, then continue. Material design changes (new
-field/task, dropped task) need user review before being committed.
-**Retention: delete the plan file once every task is ✅ and merged — git
-history keeps it.** Do not archive plans or leave stale plan files
-around.
-
-## B.3 Per-task loop
-
-Mark 🟦 → implement the smallest change for the listed tests + done-when
-→ `cargo test -p <crate> --release` green → full crate suite green on the
-build host → deploy the affected binary → live-verify the "done when" →
-add a verification-log entry to the plan (task ID, date, commands run,
-output snippet) → commit (§ B.4) → mark ✅. The verification-log entry and
-status flip land in the **same commit** as the code.
-
-## B.4 Commit discipline
-
-Work on a branch and merge via PR when the change is user-visible — the
-PR title becomes the release-note line (§ B.6); label it for its
-release-notes section. Committing small internal work directly to
-master is fine. Commit format:
+## B.3 Commits
 
 ```
-<plan-id>-<phase>-<n>: <one-line summary, <72 chars>
+<type or task-id>: <summary ≤72 chars>
 
-<2-3 sentence body: what changed, what tests cover it, any deviation
-from the plan sketch.>
+What changed, which test covers it, the failing→passing output, any
+deviation from the plan.
 
-Plan: <relative-path-to-plan> (<task-id> ✅)
-Co-Authored-By: <model-name> <noreply@<vendor>.com>
+Plan: <path> (<task-id>)        # only when a plan file exists
+Co-Authored-By: <model> <noreply@<vendor>.com>
 ```
 
-The `Plan:` trailer (so `git log --grep "Plan:"` filters agent-driven
-work) and the `Co-Authored-By:` trailer are mandatory. One commit per
-task; co-locate doc updates with the code they describe. Never
-`--no-verify` (fix the failing hook, don't bypass), never `--amend` a
-pushed commit, never bypass GPG signing if the repo requires it.
+`<type>` is `bug` / `feat` / `int` and becomes the release-note line
+(`git-cliff`, `.github/cliff.toml`; a `Breaking:` or `Update-required:`
+trailer routes a commit into those sections). One commit per task; doc
+updates ride with the code. Never `--no-verify`, never `--amend` a pushed
+commit, never bypass signing.
 
-## B.5 Test discipline
+## B.4 Tests
 
-- Write the failing test in the purest layer: pure helper / state-machine
-  apply (unit, ms) > manager aggregator (unit vs StateMachineData) > FUSE
-  helper (unit) > cross-process (shell under
-  `tests/proxmox/abuse/NN-name.sh`). A compile error counts as the
-  failing test.
-- Observe fail → implement → observe pass → run the full crate suite →
-  live-verify if operational.
-- New durability/anchor invariants warrant a property-style test over
-  many random op sequences.
+Observe fail → implement → observe pass → full crate suite. New
+durability/anchor invariants get a property-style test over random op
+sequences. Every change with cluster-visible behaviour also ships a case
+under `tests/release/cases/NN-name.sh` in the same commit (rules:
+`tests/release/README.md`); a pure internal refactor may skip it with a
+`Release-case: none (<reason>)` trailer. A commit hook enforces this.
 
-**Release-suite registration (mandatory).** Every test exercising
-cluster-visible behaviour (new API, operator action, WebUI flow hitting
-the manager, failure/recovery path, or a placement/integrity/scrub/
-quarantine/routing invariant) MUST also ship a case under
-`tests/release/cases/NN-name.sh` in the **same commit**.
-`tests/release/run.sh` is the single artefact the operator runs before a
-release tag — anything not in it isn't release-gated. Rules: one case per
-scenario, numbered + named for the behaviour; last stdout line
-`STATUS: PASS|FAIL|SKIP|KNOWN_ISSUE [<bug-id>]`; `trap case_cleanup
-EXIT`; no operator interaction (use `wait_for` from
-`tests/release/lib/common.sh`); KNOWN_ISSUE pins to a bug id and
-auto-promotes when it closes; cheap critical-path cases list their stem
-in `QUICK_CASES`. A pure internal refactor with no behaviour change may
-skip release coverage — note that in the commit.
+## B.5 Where things live
 
-## B.6 Structure discipline
+`plans/active/` in-flight plans · `plans/reports/` scans and reviews ·
+`docs/src/` operator + architecture reference (bug-archaeology narratives
+in `docs/src/internals/invariants.md`) · `crates/<crate>/src/` code ·
+`proto/` wire · `tests/release/cases/` release gate ·
+`tests/proxmox/abuse/` lab tests · `scripts/` operator scripts ·
+`deploy/examples/*.toml` canonical configs · `.claude/agents/` agent
+roster · `.claude/rules/` path-scoped invariants (A.6 integrity, FUSE
+memory ladder, config-surface sync). No root status files, no loose `.md`
+under `crates/` or `tests/`, no in-repo changelog.
 
-Where a file lives is part of its meaning. Canonical locations:
+Config-surface sync: any change to `dtfs-common/src/config.rs` updates
+`deploy/examples/*.toml` and `docs/src/configuration/*` in the same
+commit (`example_*_toml_parses` gates the first).
 
-| Artefact | Location |
-|---|---|
-| In-flight work plan | `plans/active/PLAN-<id>-<name>.md` (delete when done, § B.2) |
-| Cluster scan / lab report | `plans/reports/<NAME>-<date>.md` (e.g. `ISSUE-SCAN-…`) |
-| Release note (user-visible change) | PR title + description — GitHub auto-generates release notes from merged PRs (`gh release create --generate-notes`, grouped via `.github/release.yml`); no in-repo changelog |
-| GitHub repo config (release-notes grouping, workflows) | `.github/` |
-| Architecture / config / ops reference | `docs/src/...` (mdBook), same commit as the behaviour change |
-| Code | `crates/<crate>/src/...` (new crate → workspace `Cargo.toml` entry) |
-| Protobuf | `proto/<file>.proto` (rebuild dtfs-proto after edits) |
-| Unit tests | inline `#[cfg(test)]` modules |
-| Integration / shell tests | `tests/integration/`, `tests/proxmox/abuse/NN-name.sh` |
-| Release-gate e2e | `tests/release/cases/NN-name.sh` + `lib/` + `run.sh` (§ B.5) |
-| Operator scripts | `scripts/` |
-| Deployment surface | `deploy/` |
-| Canonical example configs | `deploy/examples/{manager,data,fuse}.toml` — every option, optional ones commented out with their compiled-in default |
-| Agent guide | `AGENTS.md` (CLAUDE.md is just the `@AGENTS.md` shim — don't add content there) |
+## B.6 Updating this file
 
-**Config-surface sync (mandatory).** Any change to a config struct in
-`crates/dtfs-common/src/config.rs` (new/renamed/removed option, changed
-default) MUST, in the **same commit**, update (1) the matching
-`deploy/examples/*.toml` and (2) the matching reference page under
-`docs/src/configuration/`. The `example_*_toml_parses` tests in
-dtfs-common gate (1); keep the docs streamlined — one table row per
-option, no duplicated complete-example blocks (the example files are the
-single source for those).
-
-Don't: invent a top-level directory without adding a row here first;
-check in a root PROGRESS/status file (git log + plans are the status
-sources); scatter loose `.md` notes through `crates/` or `tests/` (work
-→ `plans/`, user-visible → the PR description, subsystem → `docs/`).
-Release notes are auto-generated from merged PR titles at release time;
-there is no in-repo changelog. PR title: `<type>: <short description>`
-with type one of `bug` / `feat` / `int` (internal); the description is
-an imperative, user-visible summary ≤72 chars, written for the operator
-reading the release page. Label the PR with its type (`bug` / `feat` /
-`int` — `int` is excluded from the notes: refactors, tests, CI,
-docs-only); add `breaking` / `update-required` / `known-issue` when one
-of those sections applies instead. Unlabeled PRs land in "Other
-Changes". Grouping lives in `.github/release.yml`.
-
-## B.7 Updating this file
-
-This file is canonical; stale guidance is worse than none. When you
-change operator-, agent-, or data-plane-visible behaviour, update
-AGENTS.md in the **same commit**: § A.1 (topology), § A.3 (conventions/
-invariants), § A.5 (memory strategy), § A.6 (integrity contract), § A.8
-(file responsibilities / new crate), § B.4 (commit conventions), § B.5
-(test conventions), § B.6 (new doc surface or moved artefact), § B.1-B.3
-(workflow shape). If a session instruction overrode a rule, fold the
-resolution in here. Note "AGENTS.md updated" or "no change needed
-because …" in the commit description.
+Behaviour change visible to an operator, an agent, or the data plane →
+update AGENTS.md in the same commit, and say "AGENTS.md updated" or "no
+change needed because …" in the body. If a session instruction overrode a
+rule here, fold the resolution in.
