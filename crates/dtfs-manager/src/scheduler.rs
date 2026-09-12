@@ -1306,89 +1306,82 @@ impl TaskScheduler {
     /// — pick the disk matching `tier` — AV-5-9), and writes the full set
     /// through Raft. No-op when the file is gone (next round's Bug AE guard
     /// catches the orphan).
-    async fn register_replica_location(&self, chunk_id: &str, target_node: u64, tier: DiskTier) {
-        // REV-4-6 — register against every referencing file, not just the
-        // first. The replica physically exists and serves all of them.
-        let paths = self.find_files_for_chunk(chunk_id).await;
-        if paths.len() > 1 {
-            debug!(
-                chunk = %chunk_id,
-                files = paths.len(),
-                "REV-4-6: chunk is shared; registering the new replica for every referencing file"
-            );
-        }
-        for path in paths {
-            self.register_replica_location_for_path(&path, chunk_id, target_node, tier)
-                .await;
-        }
-    }
-
-    /// REV-4-6 — the single-file half of `register_replica_location`.
-    async fn register_replica_location_for_path(
+    /// CR-3-4/MGR-4/MGR-8/MGR-9 — returns `Err` (instead of silently
+    /// warning) when the target has no LIVE disk of `tier`, or when
+    /// `chunk_id` no longer resolves to any row in any file (both
+    /// resolved under ONE SM read lock via `plan_replica_registration`,
+    /// so a lease-holder rewrite or corrupt-replica sweep landing between
+    /// two separate lock acquisitions can no longer make a vanished hash
+    /// default to chunk_index 0 — MGR-9), or when any `UpdateChunkLocations`
+    /// Raft write fails. The Completing dispatcher (below) keeps the task
+    /// Completing and retries on `Err` instead of marking it Done.
+    async fn register_replica_location(
         &self,
-        path: &str,
         chunk_id: &str,
         target_node: u64,
         tier: DiskTier,
-    ) {
-        let path = path.to_string();
-
-        // Bug AB — read the chunk's existing replicas, ADD the new target,
-        // dedup, and pass the FULL set (merge_chunk_location_entries
-        // REPLACES the chunk_index's entries). Passing only the new entry
-        // wiped prior replicas and looped under-replication forever.
-        let full_chunks = {
+    ) -> Result<(), String> {
+        let writes = {
             let sm = self.state_data.read().await;
-            let file = sm.files.get(&path);
-            let chunk_index = file
-                .and_then(|f| {
-                    f.chunks
-                        .iter()
-                        .find(|c| c.chunk_hash == chunk_id)
-                        .map(|c| c.chunk_index)
-                })
-                .unwrap_or(0);
-            let mut entries: Vec<ChunkLocationEntry> = file
-                .map(|f| {
-                    f.chunks
-                        .iter()
-                        .filter(|c| c.chunk_index == chunk_index)
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            // AV-5-9 — pick the disk_id matching the task's tier on the
-            // target (was hardcoded 0; mis-tiered the read-back entry).
-            let target_str = target_node.to_string();
-            let resolved_disk_id: u32 =
-                resolve_disk_id_for_tier(sm.nodes.get(&target_node), tier);
-            // Bug BH — dedup by (node_id, disk_id), NOT node_id alone, so a
-            // second-tier mandatory copy on the same node is recorded.
-            if !replica_already_present(&entries, &target_str, resolved_disk_id) {
-                entries.push(ChunkLocationEntry {
-                    chunk_index,
-                    chunk_hash: chunk_id.to_string(),
-                    node_id: target_str,
-                    disk_id: resolved_disk_id,
-                    size_bytes: 0,
-                });
-            }
-            entries
+            // AV-5-9 / CR-3-4/MGR-8 — pick a LIVE disk_id matching the
+            // task's tier on the target; a Failed/Removed disk of the
+            // right tier must not be resolved (the fresh replica would
+            // record a location `live_replica_tier` can never see).
+            let Some(resolved_disk_id) = resolve_disk_id_for_tier(sm.nodes.get(&target_node), tier)
+            else {
+                warn!(
+                    chunk = %chunk_id,
+                    target_node,
+                    ?tier,
+                    "CR-3-4/MGR-8: target has no live disk of this tier; not registering"
+                );
+                return Err(format!(
+                    "no live disk of tier {tier:?} on target node {target_node}"
+                ));
+            };
+            // REV-4-6 / CR-3-4/MGR-9 — register against every referencing
+            // file AND every chunk_index within it whose rows carry the
+            // hash, under this ONE lock (no second acquisition, no
+            // unwrap_or(0) fallback for a hash that isn't there).
+            plan_replica_registration(&sm.files, chunk_id, target_node, resolved_disk_id)
         };
-
-        let req = ClientRequest::UpdateChunkLocations { now_ms: now_millis(),
-            path,
-            chunks: full_chunks,
-            // Bug P — system-driven, so no client lease applies.
-            lease_id: String::new(),
-        };
-        // Bug AB diagnostic — WARN so a stuck-in-loop scheduler is visible.
-        if let Err(e) = self.raft.client_write(req).await {
+        if writes.is_empty() {
             warn!(
                 chunk = %chunk_id,
-                error = %e,
-                "Bug AB UpdateChunkLocations Raft write failed; new replica not registered yet"
+                "CR-3-4/MGR-9: chunk hash not found in any file; not registering"
             );
+            return Err(format!("chunk {chunk_id} hash not found in any file"));
+        }
+        if writes.len() > 1 {
+            debug!(
+                chunk = %chunk_id,
+                files = writes.len(),
+                "REV-4-6: chunk is shared; registering the new replica for every referencing file"
+            );
+        }
+        let mut first_err: Option<String> = None;
+        for (path, chunks) in writes {
+            let req = ClientRequest::UpdateChunkLocations { now_ms: now_millis(),
+                path,
+                chunks,
+                // Bug P — system-driven, so no client lease applies.
+                lease_id: String::new(),
+            };
+            // Bug AB diagnostic — WARN so a stuck-in-loop scheduler is visible.
+            if let Err(e) = self.raft.client_write(req).await {
+                warn!(
+                    chunk = %chunk_id,
+                    error = %e,
+                    "Bug AB UpdateChunkLocations Raft write failed; new replica not registered yet"
+                );
+                if first_err.is_none() {
+                    first_err = Some(format!("UpdateChunkLocations failed: {e}"));
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 
@@ -2356,7 +2349,14 @@ trait MigrationOps {
     /// VerifyChunk on the target. `Ok(false)` = checksum mismatch.
     async fn verify(&self, tgt_addr: &str, chunk_id: &str) -> Result<bool, String>;
     /// Completing: register the new replica location through Raft.
-    async fn register_replica(&self, chunk_id: &str, target_node: u64, tier: DiskTier);
+    /// CR-3-4/MGR-4 — `Err` keeps the task Completing (retry next tick)
+    /// instead of unconditionally advancing to Done.
+    async fn register_replica(
+        &self,
+        chunk_id: &str,
+        target_node: u64,
+        tier: DiskTier,
+    ) -> Result<(), String>;
     /// Append an audit-log line (scheduler actor).
     fn audit(&self, action: &str, detail: &str, outcome: &str);
     /// Fire the MigrationFailed alert for an exhausted task.
@@ -2400,8 +2400,13 @@ impl MigrationOps for TaskScheduler {
             .map_err(|e| e.to_string())
     }
 
-    async fn register_replica(&self, chunk_id: &str, target_node: u64, tier: DiskTier) {
-        self.register_replica_location(chunk_id, target_node, tier).await;
+    async fn register_replica(
+        &self,
+        chunk_id: &str,
+        target_node: u64,
+        tier: DiskTier,
+    ) -> Result<(), String> {
+        self.register_replica_location(chunk_id, target_node, tier).await
     }
 
     fn audit(&self, action: &str, detail: &str, outcome: &str) {
@@ -2811,24 +2816,42 @@ async fn advance_round<O: MigrationOps>(
             (task.chunk_id.clone(), task.target_node, task.tier, task.source_node)
         };
 
-        ops.register_replica(&chunk_id, target_node, tier).await;
-
-        if let Some(task) = state.tasks.get_mut(task_id) {
-            info!(
-                task_id = %task.task_id,
-                chunk = %chunk_id,
-                target_node,
-                tier = ?tier,
-                "Migration: Completing -> Done (new replica registered)"
-            );
-            task.status = MigrationStatus::Done;
-            task.updated_at_ms = now_ms;
+        match ops.register_replica(&chunk_id, target_node, tier).await {
+            Ok(()) => {
+                if let Some(task) = state.tasks.get_mut(task_id) {
+                    info!(
+                        task_id = %task.task_id,
+                        chunk = %chunk_id,
+                        target_node,
+                        tier = ?tier,
+                        "Migration: Completing -> Done (new replica registered)"
+                    );
+                    task.status = MigrationStatus::Done;
+                    task.updated_at_ms = now_ms;
+                }
+                ops.audit(
+                    "replication.complete",
+                    &format!("chunk={chunk_id} src={source_node} dst={target_node}"),
+                    "success",
+                );
+            }
+            Err(reason) => {
+                // CR-3-4/MGR-4 — a failed registration (Raft write error,
+                // leader change, unresolvable hash, or no live disk of
+                // the tier) must NOT advance to Done: the bytes may be on
+                // the target but no row exists, so leaving the task
+                // Completing lets it retry next tick instead of silently
+                // losing coverage. `record_copy_failure` bumps `attempts`
+                // and only fails+alerts at the existing cap.
+                record_copy_failure(
+                    ops,
+                    state,
+                    task_id,
+                    format!("register_replica: {reason}"),
+                    now_ms,
+                );
+            }
         }
-        ops.audit(
-            "replication.complete",
-            &format!("chunk={chunk_id} src={source_node} dst={target_node}"),
-            "success",
-        );
         progressed = true;
     }
 
@@ -3050,6 +3073,66 @@ pub(crate) fn replica_already_present(
     entries
         .iter()
         .any(|c| c.node_id == node_id && c.disk_id == disk_id)
+}
+
+/// CR-3-4/MGR-9 — pure planner for `register_replica_location`. For
+/// EVERY (file, chunk_index) pair whose existing rows carry
+/// `chunk_hash` (not just the first match — MGR-8's intra-file
+/// duplicate-hash case, e.g. zero-filled padding sharing a chunk),
+/// builds the FULL post-registration entry set for that index: existing
+/// rows plus the new target replica, deduped by `(node_id, disk_id)`
+/// (Bug BH). Returns one `(path, entries)` per referencing file; empty
+/// when the hash resolves to no row anywhere (caller treats that as an
+/// error rather than defaulting to chunk_index 0 — MGR-9).
+pub(crate) fn plan_replica_registration(
+    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
+    chunk_hash: &str,
+    target_node: u64,
+    resolved_disk_id: u32,
+) -> Vec<(String, Vec<ChunkLocationEntry>)> {
+    let target_str = target_node.to_string();
+    let mut writes = Vec::new();
+    for (path, fm) in files.iter() {
+        let mut indices: Vec<u64> = fm
+            .chunks
+            .iter()
+            .filter(|c| c.chunk_hash == chunk_hash)
+            .map(|c| c.chunk_index)
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        if indices.is_empty() {
+            continue;
+        }
+        // Bug AB — carry every EXISTING row of each touched index, then
+        // add the new one; merge_chunk_location_entries REPLACES a
+        // chunk_index's rows wholesale, so passing only the new entry
+        // would wipe prior replicas and loop under-replication forever.
+        let mut entries: Vec<ChunkLocationEntry> = fm
+            .chunks
+            .iter()
+            .filter(|c| indices.contains(&c.chunk_index))
+            .cloned()
+            .collect();
+        for idx in &indices {
+            // Bug BH — dedup by (node_id, disk_id), NOT node_id alone, so
+            // a second-tier mandatory copy on the same node is recorded.
+            let already = entries
+                .iter()
+                .any(|c| c.chunk_index == *idx && c.node_id == target_str && c.disk_id == resolved_disk_id);
+            if !already {
+                entries.push(ChunkLocationEntry {
+                    chunk_index: *idx,
+                    chunk_hash: chunk_hash.to_string(),
+                    node_id: target_str.clone(),
+                    disk_id: resolved_disk_id,
+                    size_bytes: 0,
+                });
+            }
+        }
+        writes.push((path.clone(), entries));
+    }
+    writes
 }
 
 /// Bug AV — pure planner kernel. Walks the snapshot, identifies cache-
@@ -4229,20 +4312,26 @@ pub(crate) fn live_replica_tier(
 /// CNF-1 — the disk_id recorded into a new `ChunkLocationEntry` (AV-5-9
 /// read-back registration) must be the matching disk's `disk_id` FIELD —
 /// the key every reader resolves via `NodeInfo::disk` — never its Vec
-/// position. Falls back to 0 when the target has no disk of the tier
-/// (pre-existing AV-5-9 behaviour).
+/// position. CR-3-4/MGR-8 — also filters out Failed/Removed disks: a
+/// dead disk of the right tier is not a valid registration target
+/// (the fresh replica would record a location `live_replica_tier` can
+/// never see, and the repair loop would re-copy it forever). Returns
+/// `None` when the target has no LIVE disk of the tier (pre-fix this
+/// silently fell back to disk_id 0, mis-registering a copy that may
+/// have actually landed on a different, live disk).
 #[inline]
 pub(crate) fn resolve_disk_id_for_tier(
     node: Option<&dtfs_raft::NodeInfo>,
     tier: DiskTier,
-) -> u32 {
+) -> Option<u32> {
     node.and_then(|n| {
         n.disks
             .iter()
-            .find(|d| d.tier == tier)
+            .find(|d| {
+                d.tier == tier && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed)
+            })
             .map(|d| d.disk_id)
     })
-    .unwrap_or(0)
 }
 
 /// Bug CH — dispatch-time guard: can this task's target possibly receive
@@ -4385,9 +4474,32 @@ mod bug_ch_live_replica_tests {
         let mut d = disk(DiskTier::Cold, DiskStatus::Healthy);
         d.disk_id = 1;
         let n = node(HealthStatus::Healthy, vec![d]);
-        assert_eq!(super::resolve_disk_id_for_tier(Some(&n), DiskTier::Cold), 1);
-        // No disk of the tier → pre-existing fallback 0.
-        assert_eq!(super::resolve_disk_id_for_tier(Some(&n), DiskTier::Warm), 0);
+        assert_eq!(super::resolve_disk_id_for_tier(Some(&n), DiskTier::Cold), Some(1));
+        // No disk of the tier → None.
+        assert_eq!(super::resolve_disk_id_for_tier(Some(&n), DiskTier::Warm), None);
+    }
+
+    /// CR-3-4/MGR-8 — a Failed/Removed disk of the right tier must not be
+    /// resolved as a registration target; only a LIVE disk of the tier
+    /// counts.
+    #[test]
+    fn dead_disk_of_the_tier_is_not_resolved() {
+        let mut failed = disk(DiskTier::Cold, DiskStatus::Failed);
+        failed.disk_id = 0;
+        let mut live = disk(DiskTier::Cold, DiskStatus::Healthy);
+        live.disk_id = 1;
+        let n = node(HealthStatus::Healthy, vec![failed, live]);
+        assert_eq!(
+            super::resolve_disk_id_for_tier(Some(&n), DiskTier::Cold),
+            Some(1),
+            "must skip the Failed disk and resolve the live one"
+        );
+
+        // Only a Failed disk of the tier exists → None.
+        let mut only_failed = disk(DiskTier::Cold, DiskStatus::Failed);
+        only_failed.disk_id = 0;
+        let n2 = node(HealthStatus::Healthy, vec![only_failed]);
+        assert_eq!(super::resolve_disk_id_for_tier(Some(&n2), DiskTier::Cold), None);
     }
 }
 
@@ -4581,6 +4693,102 @@ mod bug_bh_dedup_tests {
         // Integrity invariant (A.3.3): existing warm entries untouched.
         assert!(entries.iter().any(|e| e.node_id == "A" && e.disk_id == 0));
         assert!(entries.iter().any(|e| e.node_id == "B" && e.disk_id == 0));
+    }
+}
+
+#[cfg(test)]
+mod cr_3_4_plan_replica_registration_tests {
+    //! CR-3-4/MGR-9 — pure-planner tests for `plan_replica_registration`,
+    //! the single-lock replacement for the old two-lock
+    //! `register_replica_location`/`register_replica_location_for_path`
+    //! split (which could observe two different snapshots of the file
+    //! tree and default a vanished hash to chunk_index 0).
+    use super::*;
+
+    fn file_with(chunks: Vec<ChunkLocationEntry>) -> dtfs_raft::state_machine::FileMetadata {
+        dtfs_raft::state_machine::FileMetadata {
+            path: "/f".to_string(),
+            volume_id: "default".to_string(),
+            chunk_size: 4 * 1024 * 1024,
+            chunks,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn entry(idx: u64, hash: &str, node: &str, disk: u32) -> ChunkLocationEntry {
+        ChunkLocationEntry {
+            chunk_index: idx,
+            chunk_hash: hash.to_string(),
+            node_id: node.to_string(),
+            disk_id: disk,
+            size_bytes: 1024,
+        }
+    }
+
+    /// CR-3-4/MGR-9 — a hash that resolves to no row anywhere yields NO
+    /// writes at all (never a fabricated chunk_index-0 registration).
+    #[test]
+    fn unresolvable_hash_yields_no_writes() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("/f".to_string(), file_with(vec![entry(0, "other-hash", "1", 0)]));
+        let writes = plan_replica_registration(&files, "missing-hash", 5, 0);
+        assert!(writes.is_empty(), "no proposal for an unresolvable hash");
+    }
+
+    /// CR-3-4/MGR-8 — an intra-file duplicate hash (e.g. two indexes with
+    /// identical zero-filled padding content) registers the new replica
+    /// at EVERY carrying index, not just the first.
+    #[test]
+    fn duplicate_hash_within_one_file_registers_every_index() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            "/f".to_string(),
+            file_with(vec![entry(0, "h", "1", 0), entry(2, "h", "1", 0)]),
+        );
+        let writes = plan_replica_registration(&files, "h", 9, 0);
+        assert_eq!(writes.len(), 1, "one referencing file");
+        let (path, entries) = &writes[0];
+        assert_eq!(path, "/f");
+        assert!(
+            entries.iter().any(|c| c.chunk_index == 0 && c.node_id == "9"),
+            "index 0 must get the new replica"
+        );
+        assert!(
+            entries.iter().any(|c| c.chunk_index == 2 && c.node_id == "9"),
+            "index 2 must ALSO get the new replica"
+        );
+        // Existing rows at both indexes survive.
+        assert!(entries.iter().any(|c| c.chunk_index == 0 && c.node_id == "1"));
+        assert!(entries.iter().any(|c| c.chunk_index == 2 && c.node_id == "1"));
+    }
+
+    /// Bug BH — dedup by (node_id, disk_id): registering a replica the
+    /// file already carries at that exact slot is a no-op, not a
+    /// duplicate row.
+    #[test]
+    fn already_present_replica_is_not_duplicated() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("/f".to_string(), file_with(vec![entry(0, "h", "9", 2)]));
+        let writes = plan_replica_registration(&files, "h", 9, 2);
+        assert_eq!(writes.len(), 1);
+        let (_, entries) = &writes[0];
+        assert_eq!(entries.len(), 1, "no duplicate row for an already-present (node,disk)");
+    }
+
+    /// REV-4-6 — a hash shared by two files registers the new replica
+    /// against BOTH.
+    #[test]
+    fn shared_hash_registers_against_every_file() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("/a".to_string(), file_with(vec![entry(0, "h", "1", 0)]));
+        files.insert("/b".to_string(), file_with(vec![entry(0, "h", "2", 0)]));
+        let writes = plan_replica_registration(&files, "h", 9, 0);
+        assert_eq!(writes.len(), 2);
     }
 }
 
@@ -6283,6 +6491,11 @@ mod advance_round_tests {
         replicate_calls: AtomicUsize,
         verify_calls: AtomicUsize,
         register_calls: AtomicUsize,
+        /// CR-3-4/MGR-4 — when > 0, `register_replica` returns
+        /// `Err` and decrements; once it reaches 0, calls succeed. Lets a
+        /// test assert the task stays Completing across N failures and
+        /// reaches Done once the underlying registration succeeds.
+        register_fail_times: AtomicUsize,
         /// Per-stage overrides for failure-path tests.
         chunk_missing: bool,          // chunk_bytes -> None (Bug AE)
         invalid_target: bool,         // validate_target -> Err (Bug CH)
@@ -6365,8 +6578,22 @@ mod advance_round_tests {
                 VerifyMode::RpcErr => Err("verify rpc down".to_string()),
             }
         }
-        async fn register_replica(&self, _c: &str, _t: u64, _tier: DiskTier) {
+        async fn register_replica(&self, _c: &str, _t: u64, _tier: DiskTier) -> Result<(), String> {
             self.register_calls.fetch_add(1, Ordering::SeqCst);
+            // CR-3-4/MGR-4 — decrement-and-fail while > 0.
+            let mut remaining = self.register_fail_times.load(Ordering::SeqCst);
+            while remaining > 0 {
+                match self.register_fail_times.compare_exchange(
+                    remaining,
+                    remaining - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => return Err("mock register_replica failure".to_string()),
+                    Err(actual) => remaining = actual,
+                }
+            }
+            Ok(())
         }
         fn audit(&self, action: &str, _detail: &str, outcome: &str) {
             self.audited
@@ -6477,6 +6704,68 @@ mod advance_round_tests {
         assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), 10);
         assert_eq!(ops.verify_calls.load(Ordering::SeqCst), 10);
         assert_eq!(ops.register_calls.load(Ordering::SeqCst), 10);
+    }
+
+    /// CR-3-4/MGR-4 — a `register_replica` failure (Raft write error,
+    /// unresolvable hash, no live disk of the tier) must keep the task
+    /// Completing (bumping `attempts`) instead of unconditionally
+    /// advancing to Done; once registration succeeds, the SAME task
+    /// reaches Done and no bytes/coverage are silently lost in between.
+    #[tokio::test]
+    async fn cr_3_4_register_failure_keeps_task_completing_then_succeeds() {
+        let ops = MockOps {
+            register_fail_times: AtomicUsize::new(1),
+            ..Default::default()
+        };
+        let mut state = MigrationState::default();
+        let mut t = pending_task(0);
+        t.status = MigrationStatus::Completing;
+        let task_id = t.task_id.clone();
+        state.tasks.insert(task_id.clone(), t);
+
+        let mut copied = std::collections::HashSet::new();
+        let mut verified = std::collections::HashSet::new();
+
+        // Round 1: register_replica fails -> task stays Completing, attempts+=1.
+        let progressed = advance_round(&ops, &mut state, 1_000, &mut copied, &mut verified).await;
+        assert!(progressed, "a failed registration still counts as progress (attempts bumped)");
+        let task = state.tasks.get(&task_id).unwrap();
+        assert_eq!(task.status, MigrationStatus::Completing, "must NOT advance to Done on Err");
+        assert_eq!(task.attempts, 1);
+
+        // Round 2: register_replica succeeds -> task reaches Done.
+        let progressed = advance_round(&ops, &mut state, 2_000, &mut copied, &mut verified).await;
+        assert!(progressed);
+        let task = state.tasks.get(&task_id).unwrap();
+        assert_eq!(task.status, MigrationStatus::Done, "retry succeeds once the failure clears");
+
+        assert_eq!(ops.register_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// CR-3-4/MGR-4 — a `register_replica` failure that never clears
+    /// eventually fails the task at the same cap as a Copying-stage
+    /// failure, so a permanently-stuck registration doesn't retry
+    /// forever either.
+    #[tokio::test]
+    async fn cr_3_4_register_failure_fails_task_at_attempt_cap() {
+        let ops = MockOps {
+            register_fail_times: AtomicUsize::new(usize::MAX),
+            ..Default::default()
+        };
+        let mut state = MigrationState::default();
+        let mut t = pending_task(0);
+        t.status = MigrationStatus::Completing;
+        let task_id = t.task_id.clone();
+        state.tasks.insert(task_id.clone(), t);
+
+        let mut copied = std::collections::HashSet::new();
+        let mut verified = std::collections::HashSet::new();
+        for _ in 0..MAX_MIGRATION_ATTEMPTS {
+            advance_round(&ops, &mut state, 1_000, &mut copied, &mut verified).await;
+        }
+        let task = state.tasks.get(&task_id).unwrap();
+        assert_eq!(task.status, MigrationStatus::Failed);
+        assert_eq!(ops.failed_alerts.load(Ordering::SeqCst), 1);
     }
 
     // WI-04 — at most MIGRATION_COPIES_PER_TARGET ReplicateChunk RPCs are
