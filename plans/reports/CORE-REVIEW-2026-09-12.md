@@ -369,3 +369,26 @@ now covers Heartbeat/ReportChunkStatus; data-plane RecordCacheHit gated;
 `GetFileLocationsResponse.volume_id` and `ScrubConfigOverride` secs fields are
 additive). Plan file `PLAN-CR-2026-09-CORE-REVIEW-FIXES.md` retired (git
 history keeps it); this table is the record.
+
+### Update after PLAN-CR2-2026-09 (master 98a15f1, 2026-09-12)
+
+The remainder plan closed every code finding that was still OPEN above.
+Workspace suite at 98a15f1: manager 391, data 122, fuse 114, raft 111,
+common 113, client 31, cli 12 — all green (Docker `dtfs-buildenv`).
+
+| Finding | Status | Landed in |
+|---|---|---|
+| MGR-3 | FIXED (SM lock dropped before the per-DC read-window pass) | #111 CR2-7-1 |
+| MGR-10 | FIXED (`ListChunksResponse.chunk_disk_ids`, reaper keyed by `(node, disk)`; empty field = legacy node-wide) | #111 CR2-7-2 |
+| MGR-13, MGR-14 | FIXED | #111 CR2-7-3, 7-4 |
+| RAFT-5 | FIXED (synced `WriteOptions`, single `delete_range` truncate, one `WriteBatch` purge) | #111 CR2-7-5 |
+| RAFT-6 | FIXED (`blank_sm_startup_allowed` refuses a blank-SM voter when the log is purged) | #111 CR2-7-6 |
+| PROTO-3, CMN-7 | FIXED | #111 CR2-7-7, 7-8 |
+| CMN-3 | FIXED (`grpc.max_message_size_mb` wired into data, manager and client tonic builders) | #112 CR2-8-1 |
+| CMN-6 | FIXED (docs) | #112 CR2-8-2 |
+| FUSE-11, FUSE-12 | FIXED | #112 CR2-8-3, 8-4 |
+
+**No code finding from this review remains open.** Still outstanding and
+lab-gated: executing release cases 100-109 against a cluster, PERF-SWEEP-5-7,
+the REL/REV 🟨 verification items. Plan file `PLAN-CR2-2026-09-REMAINDER.md`
+retired.
