@@ -783,7 +783,14 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
   (`blake3_hex`, BLAKE3 hex digest) and sends it as the declared
   `chunk_id` on every `write_chunk_bytes` call (previously always
   `""`); a reply whose `chunk_id` disagrees is treated as a failed
-  replica (excluded from `successes`), never committed as a location.
+  replica (excluded from `successes`), never committed as a location. R2:
+  `flush_segments_to_cluster` also refuses (`segments_committable()`) to
+  commit ANY segment with `offset_in_chunk > 0` — reachable whenever the
+  RMW seed in `write()` was skipped because there was nothing cheap to
+  seed FROM (no cached `locations_snapshot`, no `chunk_at(idx)` entry, or
+  an empty `node_addresses` list; each now `warn!`s at the skip site) —
+  since the data node stores a `PutChunkRequest`'s bytes as the chunk's
+  whole content from byte 0, and a partial segment would land shifted.
   WI-05 / B2: `read()`'s
   foreground miss tries `readahead.join_pending()` against ONLY the FIRST
   candidate (prefetch targets `read_candidates`' head, REV-2-3, so no other
