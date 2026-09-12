@@ -181,6 +181,26 @@ fn should_notify(last: Option<u32>, current: u32) -> bool {
     last != Some(current)
 }
 
+/// CR2-8-3 (FUSE-11) — decide whether a read looks like a viewer
+/// (playback) rather than a scanner (stat + header read) for the disk
+/// cache's atime hint.
+///
+/// The kernel hands FUSE reads in ~128 KB pieces (no `max_read`/
+/// `max_pages` configured), well under
+/// `local_cache::ATIME_UPDATE_MIN_BYTES` (1 MiB) — passing that per-call
+/// length straight to the cache meant every playback read was
+/// misclassified as a scanner, so the LRU degraded to put-order and
+/// watched chunks got evicted like scanned ones. Instead we look at
+/// cumulative consumption on THIS fh (`bytes_on_fh`, updated after each
+/// read — so it crosses the threshold after a handful of 128 KB pieces,
+/// same as one contiguous >=1 MiB read would) OR whether readahead is
+/// actively prefetching for this mount (a scanner's stat+header access
+/// never drives sequential prefetch, so an active readahead engine is
+/// itself a viewer signal).
+pub(crate) fn is_viewer_read(bytes_on_fh: u64, readahead_active: bool) -> bool {
+    bytes_on_fh >= crate::local_cache::ATIME_UPDATE_MIN_BYTES as u64 || readahead_active
+}
+
 /// CR-6-6 (FUSE-9) — outcome of trying to claim ownership of a
 /// foreground chunk fetch. `Owner` must perform the real fetch and
 /// resolve it via `complete_foreground_fetch`; `Waiter` should await the
@@ -392,6 +412,11 @@ struct OpenFile {
     /// only on a miss, so the prefetch window advances continuously
     /// instead of stalling every `prefetch_chunks+1` chunks.
     last_read_chunk: Option<u32>,
+    /// CR2-8-3 (FUSE-11) — cumulative bytes served by `read()` on THIS fh.
+    /// Feeds `is_viewer_read` so the disk-cache atime hint reflects actual
+    /// consumption on this handle rather than one kernel call's (~128 KB)
+    /// length.
+    bytes_read_on_fh: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -789,6 +814,7 @@ impl DtfsFilesystem {
                 lease_owner_id,
                 committed_any: false,
                 last_read_chunk: None,
+                bytes_read_on_fh: 0,
             },
         );
 
@@ -836,6 +862,24 @@ impl DtfsFilesystem {
             return Ok(Bytes::new());
         }
         let actual_size = effective_read_len(file_size, offset, size);
+
+        // CR2-8-3 (FUSE-11) — accumulate this fh's cumulative consumption
+        // and combine it with whether readahead is actively prefetching to
+        // decide the disk-cache viewer/scanner hint for every chunk this
+        // call touches. No `.await` between the DashMap lookup and the
+        // update (CO-3-12).
+        let is_viewer = {
+            match self.open_files.get_mut(&fh) {
+                Some(mut of) => {
+                    of.bytes_read_on_fh =
+                        of.bytes_read_on_fh.saturating_add(actual_size as u64);
+                    is_viewer_read(of.bytes_read_on_fh, self.readahead.is_active())
+                }
+                // fh closed concurrently mid-read — be conservative and
+                // treat it as a scanner (never touch atime).
+                None => false,
+            }
+        };
 
         // Determine which chunks we need to read.
         let start_chunk = (offset / chunk_size) as usize;
@@ -933,12 +977,14 @@ impl DtfsFilesystem {
             // accessed in the last 90 days).
             if chunk_data.is_none() {
                 if let Some(lc) = &self.local_cache {
-                    // `size` is the kernel's requested read length for this
-                    // call. Pass it as bytes_hint so the cache can
-                    // distinguish viewer reads (refresh atime) from scanner
-                    // reads (preserve last-viewer atime for LRU).
+                    // CR2-8-3 (FUSE-11) — `is_viewer` reflects cumulative
+                    // consumption on this fh (plus active readahead), not
+                    // this single kernel call's ~128 KB length, so the
+                    // cache can actually distinguish viewer reads (refresh
+                    // atime) from scanner reads (preserve last-viewer
+                    // atime for LRU).
                     if let Some(cached) =
-                        lc.get(&chunk.chunk_id, size as usize).await
+                        lc.get_with_hint(&chunk.chunk_id, is_viewer).await
                     {
                         debug!(chunk_id = %chunk.chunk_id, "local-disk cache hit");
                         chunk_data = Some(cached);
@@ -1775,6 +1821,7 @@ impl DtfsFilesystem {
                 lease_owner_id: Some(owner_id),
                 committed_any: false,
                 last_read_chunk: None,
+                bytes_read_on_fh: 0,
             },
         );
 
@@ -2728,6 +2775,34 @@ mod cr_6_6_should_notify_tests {
     fn a_new_chunk_index_notifies_again() {
         assert!(!should_notify(Some(3), 3));
         assert!(should_notify(Some(3), 4));
+    }
+}
+
+#[cfg(test)]
+mod cr2_8_3_is_viewer_read_tests {
+    use super::is_viewer_read;
+    use crate::local_cache::ATIME_UPDATE_MIN_BYTES;
+
+    #[test]
+    fn below_threshold_and_no_readahead_is_scanner() {
+        assert!(!is_viewer_read(0, false));
+        assert!(!is_viewer_read((ATIME_UPDATE_MIN_BYTES - 1) as u64, false));
+    }
+
+    #[test]
+    fn cumulative_bytes_crossing_the_threshold_is_viewer() {
+        // A handful of 128 KB kernel reads accumulating past 1 MiB on one
+        // fh must be classified as a viewer even though no single call
+        // ever reached the threshold (the FUSE-11 bug: the old code
+        // passed only the per-call length).
+        assert!(is_viewer_read(ATIME_UPDATE_MIN_BYTES as u64, false));
+        assert!(is_viewer_read(ATIME_UPDATE_MIN_BYTES as u64 + 1, false));
+    }
+
+    #[test]
+    fn active_readahead_is_viewer_regardless_of_bytes_so_far() {
+        assert!(is_viewer_read(0, true));
+        assert!(is_viewer_read(128 * 1024, true));
     }
 }
 
