@@ -24,13 +24,26 @@ use dtfs_proto::dtfs::manager::manager_service_client::ManagerServiceClient;
 use dtfs_proto::dtfs::manager::{HeartbeatRequest, RegisterNodeRequest};
 use store::ChunkStore;
 
+/// DATA-6 — bound every control-plane RPC (Heartbeat, ReportChunkStatus,
+/// RegisterNode) with a deadline so a manager that accepts the TCP
+/// connection but never answers (partition, wedged leader, etc.) doesn't
+/// hang the heartbeat loop indefinitely — it times out and the loop's
+/// existing reconnect/backoff logic takes over.
+const CONTROL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn control_request<T>(body: T) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(body);
+    req.set_timeout(CONTROL_RPC_TIMEOUT);
+    req
+}
+
 /// CR-5-1 (PROTO-1) / LIS-56 — stamp `x-dtfs-rpc-*` metadata on a mutating
 /// `dtfs-mgr-rpc` request (Heartbeat / ReportChunkStatus) from this data
 /// node's own `[cluster].shared_secret`. Empty secret = no-op (legacy skip,
 /// matches `require_mgr_rpc_auth`'s empty-secret bypass on the manager).
 fn stamp_mgr_rpc_request<T>(secret: &str, method: &str, binding: &str, body: T) -> tonic::Request<T> {
     use dtfs_common::crypto::{stamp_mgr_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS};
-    let mut req = tonic::Request::new(body);
+    let mut req = control_request(body);
     if let Some((ts, mac)) = stamp_mgr_rpc_auth(secret, method, binding) {
         if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
             req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
@@ -471,7 +484,7 @@ async fn manager_lifecycle(
     let mut reg_backoff = Duration::from_secs(1);
     let node_id = loop {
         let req = build_register_req();
-        match client.register_node(tonic::Request::new(req)).await {
+        match client.register_node(control_request(req)).await {
             Ok(resp) => {
                 let resp = resp.into_inner();
                 if resp.accepted {
@@ -861,5 +874,19 @@ async fn manager_lifecycle(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod data_6_control_deadline_tests {
+    use super::control_request;
+
+    #[test]
+    fn control_request_carries_a_grpc_timeout_deadline() {
+        // DATA-6 — `set_timeout` stamps the `grpc-timeout` metadata key
+        // tonic reads to enforce the deadline; assert it is actually
+        // present so a future refactor can't silently drop the timeout.
+        let req = control_request(42u32);
+        assert!(req.metadata().get("grpc-timeout").is_some());
     }
 }
