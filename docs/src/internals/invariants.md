@@ -121,6 +121,79 @@ timeout is still a tonic Status -> `unreachable_err` ->
 `RPCError::Unreachable` -> `StreamingError::Unreachable` (transient),
 preserving the Bug CL mapping above.
 
+### `dtfs-raft/src/state_machine.rs`
+
+CR-2-1 (RAFT-1): `RegisterNode`'s apply reads the prior `NodeInfo` before
+overwriting `sm.nodes` and carries `Quarantined` (+ its `QuarantineInfo`)
+or `Maintenance`/`Draining` forward onto the incoming `info`. The sole
+producer (`metadata.rs`) always builds `health: Healthy, quarantine:
+None`, so every process restart (a plain re-register) used to silently
+clear an integrity quarantine or an operator's maintenance/drain state
+and re-admit the node into read/allocate/replication pools. Fires an
+extra `RegisterNode: <id> (sticky state preserved: <state>)` audit row
+when carry-forward actually happens; `node_info_material_eq` already
+excludes health/quarantine from its comparison, so this doesn't disturb
+the Bug BJ audit-dedup.
+
+CR-2-2 (RAFT-2): `RenameFile`'s apply collects every `from/...` child key
+(a `BTreeMap` range, collected into a `Vec` BEFORE any mutation, since a
+`BTreeMap` can't be iterated and mutated at once) and re-keys each to
+`to/...`, moving its `posix_locks`/`write_leases` entry along with it. A
+synthetic-dir source (no exact `from` key, but children exist under
+`from/`) now succeeds instead of erroring. The rename is refused
+(`ClientResponse::Error`) when the destination already has children
+(real or synthetic) or when `to` lies inside `from`'s own subtree
+(`to.starts_with("{from}/")`). Pre-fix, only the exact `from` key moved;
+a directory's children stayed stranded under the old prefix, so `mv
+/Movies/Old /Movies/New` silently "lost" every file in the moved
+directory (still visible as a synthetic dir at the old path).
+
+CR-2-3 (RAFT-3): `UpdateChunkLocations`'s apply computes `extent =
+max(chunk_index * chunk_size + size_bytes)` over the merged chunks and
+grows (never shrinks) an already-set `logical_size` to at least that
+extent (`None` stays `None` — a chunk-only file still falls back to the
+summed-chunks size in `metadata.rs`). Pre-fix, `SetFileSize` set
+`logical_size` once and nothing ever revisited it, so `open(O_TRUNC)`
+then rewrite (cp, rsync `--inplace`, shell `>`, SQLite journal recycle)
+committed chunks past the truncated size while every reader kept seeing
+the stale (usually 0) size forever.
+
+CR-2-4 (RAFT-7): `DeleteFile`'s apply also removes the path's
+`write_leases`/`posix_locks` entry and refuses (`Error`) when a child
+key exists under `path/`, instead of leaking the lease (a re-create
+within `lease_ms` hit a stale `WriteLeaseConflict`) and letting `rm -r`
+report success on a still-populated tree. `cluster_err_to_errno` in
+`dtfs-fuse/src/fuse_adapter.rs` maps gRPC `FailedPrecondition` to
+`ENOTEMPTY`, and `metadata.rs::delete_file` checks the Raft response
+BEFORE computing/spawning the chunk-delete fan-out (previously the
+fan-out ran unconditionally, which would have deleted live chunks on a
+refused delete) and maps the refusal to `Status::failed_precondition`.
+
+CR-2-5 (RAFT-4): `UpdateChunkLocations`, `RemoveCorruptChunkReplicas`,
+`RenameFile`, `SetFileSize`, `CreateSymlink`, `CreateLink`, and
+`RemoveChunkLocation` each carry `#[serde(default)] now_ms: u64`. Their
+apply arms compute `eff_now_ms = if now_ms == 0 { log_id.index } else {
+now_ms }` (the CO-3-1 fallback pattern) and route both `updated_at_ms`
+and their own audit row through a dedicated `audit_at(summary, ts)`
+closure instead of the shared wall-clock `audit` closure, so two
+replicas applying the same log entry produce byte-identical state.
+`apply_remove_chunk_location` took an explicit `now_ms: u64` parameter
+in place of an inline `SystemTime::now()` call that used to diverge per
+replica. The top-of-apply `SystemTime::now()` stays for arms outside
+this seven-variant scope (`DeleteFile`, `RegisterNode`, `QuarantineNode`,
+...), which still route through the wall-clock `audit` closure — closing
+their determinism gap is future work, not part of RAFT-4's scope.
+
+CR-2-6 (RAFT-8, RAFT-9): `UpdateConfig`'s apply always derives `version
+= sm.cluster_config.version + 1` and ignores the wire-supplied `version`
+(the CAS `expected_version` check is unchanged), closing a
+version-regression hole a buggy/malicious proposer could hit even when
+the CAS base matched. `ReportScrubResult` clamps a non-finite
+`duration_secs` to `0.0` before it reaches `ScrubRecord`, since
+`serde_json` turns NaN/inf into `null` on serialize and every later
+snapshot load then fails to deserialize (discarding the whole snapshot —
+see RAFT-6).
+
 ### `dtfs-manager/src/scheduler.rs`
 
 **REV-1-1 — every manager background loop is leader-gated, not just
