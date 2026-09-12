@@ -130,41 +130,21 @@ new field.
 **A.3.2 Memory discipline.** No `Vec<u8>` accumulation of full chunks on
 the hot path — stream to disk, hash incrementally (Bug I). The read-serve
 path has the same parity (U2): the data-node `GetChunk` handler streams
-the chunk off disk in 8 MB pieces (`read_exact`) and runs `verify_on_read`
-via an incremental BLAKE3 hash, so a cache MISS never holds the whole
-chunk in heap. Memory caps
-are best-effort; never reject requests by default (the RESOURCE_EXHAUSTED
-shed is opt-in, last resort — see § A.5). The `[memory]` block
-(`hard_cap_mb` etc.) is implemented on **all three roles** (CF-5): the
-role-agnostic core (`MemoryBudget`, `PressureLevel`, RSS sampler) lives in
+the chunk off disk in 8 MB pieces and runs `verify_on_read` via an
+incremental BLAKE3 hash, so a cache MISS never holds the whole chunk in
+heap. Memory caps are best-effort; never reject requests by default (the
+RESOURCE_EXHAUSTED shed is opt-in, last resort — § A.5). The `[memory]`
+block is implemented on **all three roles** (CF-5): the role-agnostic
+core (`MemoryBudget`, `PressureLevel`, RSS sampler) lives in
 `dtfs-common/src/memory.rs`; each role wires its own cheap ladder rung —
-dtfs-data sheds put_chunk (REV-4-5 — the "shrink ARC" rung is **gone**: the
-in-memory chunk cache had no `put` caller anywhere in the workspace, so it was
-always empty and the rung could only ever evict zero bytes, while its default
-budget was still subtracted when sizing put_chunk slots and collapsed write
-concurrency on a capped node. Do NOT re-wire it for whole chunks — that puts a
-chunk back in heap on the read path, which this section's first rule forbids),
-dtfs-manager pauses scheduler
-ticks at **Shed** (REV-3-5 — it was Warn, but the memory holding a manager at
-Warn belongs to components the pause does not stop, so the pause latched and
-the sole owner of mandatory-replica repair never ran again; it is also
-self-limiting, forcing a tick after `MAX_CONSECUTIVE_PRESSURE_SKIPS`, because
-A.5 says slow down, not stop), dtfs-fuse halves the readahead `cache_mb` at Warn / drops
-unconsumed prefetch AND stops spawning new prefetch (`prefetch_enabled`) at Shed. systemd
-`MemoryMax` remains the hard backstop
-for all roles. WI-05 — FUSE prefetch fan-out is also bounded by
-`readahead.prefetch_max_inflight` (default 2): each in-flight prefetch
-holds a whole chunk in heap, and before this an uncapped `prefetch_chunks`-
-wide fan-out (default 8) shared one pooled HTTP/2 channel per node, so N
-concurrent streams split a slow link (e.g. the 40 Mbps LELI path) and
-starved the nearest chunk instead of adding bounded heap. R1 (FUSE-1
-memory half) — the FUSE write buffer (WI-01/H1's `FLUSH_BATCH_MAX_BYTES`
-governs the batching side; `writebuf::DIRTY_BYTES_CAP` = 2x that governs
-total dirty bytes per open file) is force-drained via
-`WriteBuffer::flush_complete()` whenever a sparse-hole zero-fill or an
-incoming write would meet or exceed the cap, so a write far past EOF
-(e.g. a torrent client's first piece landing at offset 100 MB) can no
-longer materialise the whole hole into heap before committing anything.
+dtfs-data sheds put_chunk (REV-4-5 removed the dead "shrink ARC" rung —
+do NOT re-add a whole-chunk in-memory cache, that violates this
+section's first rule), dtfs-manager pauses scheduler ticks at **Shed**
+(REV-3-5; self-limiting via `MAX_CONSECUTIVE_PRESSURE_SKIPS`), dtfs-fuse
+halves readahead `cache_mb` at Warn and stops prefetch at Shed. systemd
+`MemoryMax` is the hard backstop for all roles. FUSE-specific detail
+(prefetch fan-out bound, write-buffer dirty-byte cap, await-guard rules)
+is in `.claude/rules/fuse.md`, loaded only for `crates/dtfs-fuse/**`.
 
 **A.3.3 Integrity is the prime directive.** Every path that touches
 bytes must:
@@ -411,51 +391,21 @@ under `[location].host` (`<data-hostname>_cln` convention) — see
 ## A.6 Data-integrity audit checklist
 
 Run when you touch a write/migrate/delete/scrub path; mark each "Verified
-by <test>" in the commit.
-1. BLAKE3 via IncrementalHasher; final hash in ChunkMeta.checksum.
-2. On-disk `.dat` written to `tmp/<uuid>.dat.tmp`, atomic-renamed to
-   `chunks/<aa>/<bb>/<id>.dat` only after `sync_all()`.
-3. `.meta` JSON written with `sync_all()` before the put's WAL entry is
-   cleared.
-4. Counter updates (bytes_stored, chunk_count) happen after meta is
-   durable, so a crash mid-put leaves a reconcilable tmp+wal residue.
-5. commit_chunk_from_tmp removes the tmp on any error path.
-6. Migration marks a task Done only after VerifyChunk on the target
-   succeeds; the scheduler never removes the source (only tier-demote /
-   unlink delete a chunk). CO-1-3 — every de-location-with-byte-delete
-   path (tiering demote dispatch, scheduler cache-flush dispatch) issues
-   the Raft `RemoveChunkLocation` (with `enforce_anchor`) FIRST and the
-   data-plane `DeleteChunkReplica` byte delete AFTER, via the shared
-   `scheduler::delocate_replica` (over the `DelocateOps` seam). On a
-   Raft-remove failure NO byte delete is issued (the replica stays live in
-   the SM + on disk; retry next tick). A byte-delete RPC that fails after
-   a committed remove is NEVER rolled back — the leftover on-disk bytes
-   are now a chunk de-located on that node, which the CO-3-2 reaper
-   reclaims (item 8). This makes de-location atomic at the metadata layer:
-   no phantom replica (bytes gone but still advertised live) and no
-   stranded anchor can result from a crash/RPC failure in the window.
-7. Scrub BLAKE3s the disk file vs chunk.meta.checksum; mismatch →
-   chunks_corrupt + ScrubCorruption alert; auto-repair via
-   replicate_chunk.
-8. unlink removes manager-side FileMetadata first, then GC deletes chunks
-   async; a crash between leaves orphans (reclaimed by scrub), never
-   dangling pointers. Bug CB — the orphan reaper measures its grace
-   against each chunk's durable on-disk `.dat` mtime
-   (`scheduler::orphan_reap_due`, fed by `ListChunks.chunk_mtimes_ms`),
-   NOT a manager-local first-observed clock, so reclamation survives
-   manager restarts / leadership changes (pre-CB the in-memory clock
-   reset every restart and deleted-file disk was never freed under
-   rolling-restart churn). An unknown mtime (pre-CB data node) defers
-   the reap rather than dropping a possibly in-flight chunk. CO-3-2
-   generalised the reaper to also reclaim a chunk present on a node's disk
-   for which the SM records NO location entry naming that node ("de-
-   located"; `scheduler::chunk_delocated_on_node`), after the same grace —
-   this is what mops the byte-delete-failed leftovers produced by the
-   CO-1-3 Raft-remove-first ordering (item 6).
-9. rename is a single Raft command; open handles keep reading the same
-   chunks (path updated, chunk_id binding unchanged).
-10. Reads use replica-fallback (P0-2): try the next replica on error,
-    fail only after all candidates fail.
+by <test>" in the commit. Full checklist with narrative context (why
+each item exists, CO-1-3/CO-3-2/Bug CB reasoning, the LIS-19/55/83
+data-plane auth stamp shape, the Bug AV mandatory-vs-cache replica
+invariant) lives in `.claude/rules/integrity.md`, loaded automatically
+for `dtfs-data/**`, `dtfs-manager/src/scheduler.rs`, `dtfs-raft/**`.
+Summary: (1) BLAKE3 checksum end-to-end into `ChunkMeta.checksum`; (2-3)
+tmp+atomic-rename+`sync_all()` for both `.dat` and `.meta`; (4) counters
+update only after meta is durable; (5) tmp removed on any put error
+path; (6) migration verifies before marking Done, de-location is
+Raft-remove-then-byte-delete (never rolled back after commit — the
+CO-3-2 reaper mops a failed byte-delete); (7) scrub BLAKE3-checks vs
+`checksum`, auto-repairs via `replicate_chunk`; (8) unlink deletes
+metadata before bytes, orphan reap keys off durable on-disk mtime
+(Bug CB), not a manager-local clock; (9) rename is one Raft command,
+chunk_id binding unchanged; (10) reads use replica-fallback (P0-2).
 
 ## A.7 Bandwidth + network shaping
 
@@ -940,7 +890,8 @@ under `crates/` or `tests/`, no in-repo changelog.
 
 Config-surface sync: any change to `dtfs-common/src/config.rs` updates
 `deploy/examples/*.toml` and `docs/src/configuration/*` in the same
-commit (`example_*_toml_parses` gates the first).
+commit (`example_*_toml_parses` gates the first; full rule:
+`.claude/rules/config-surface.md`).
 
 ## B.6 Updating this file
 
