@@ -1,10 +1,6 @@
 # AGENTS.md — Operating Guide for AI Agents on DTFS
 
-DTFS is a Raft-managed tiered distributed filesystem in Rust. This file
-is the canonical contract: keep it accurate and update it in the **same
-commit** as any behaviour, convention, or workload change. `CLAUDE.md`
-is just `@AGENTS.md` — edit this file, not that one. Other tools (Codex,
-Cursor, …) read AGENTS.md directly.
+DTFS is a Raft-managed tiered distributed filesystem in Rust. This file is the canonical contract: keep it accurate and update it in the **same commit** as any behaviour, convention, or workload change. `CLAUDE.md` is just `@AGENTS.md` — edit this file, not that one. Other tools (Codex, Cursor, …) read AGENTS.md directly.
 
 Part A = what to know about DTFS. Part B = how to work on it.
 
@@ -12,26 +8,12 @@ Part A = what to know about DTFS. Part B = how to work on it.
 
 ## Quick rules (every response)
 
-- Read a file before editing; don't re-read unchanged files. Skip files
-  >100KB unless required.
-- Thorough reasoning, concise output. Code first; short explanation only
-  if non-obvious. No sycophancy, no emojis, no em-dashes, straight
-  quotes only, copy-paste-safe code.
-- Don't guess APIs, versions, flags, commit SHAs, or package names —
-  verify in code/docs first.
-- Token-efficient: targeted Grep/Read with `offset`/`limit` over
-  full-file reads; narrow edits over re-emitting whole files; reuse
-  already-read context; batch independent tool calls into one message.
-- Don't over-engineer. Simplest solution that works, for code and for
-  actions alike — fewest moving parts, smallest diff, least new
-  machinery. Solve the problem in front of you, not an imagined future
-  one. No speculative features, no abstractions for single-use code, no
-  error handling for impossible cases, no docstrings/types on code you
-  aren't changing. Three similar lines beat a premature abstraction. When
-  in doubt, do the smaller thing.
-- Reviews and debugging: state the finding, show the fix, stop. Never
-  speculate about a bug without reading the code first; if the cause is
-  unclear, say so.
+- Read a file before editing; don't re-read unchanged files; skip >100KB files unless required.
+- Thorough reasoning, concise output. Code first, explain only if non-obvious. No sycophancy, no emojis, no em-dashes, straight quotes, copy-paste-safe code.
+- Don't guess APIs/versions/flags/SHAs/package names — verify first.
+- Token-efficient: targeted Grep/Read with `offset`/`limit`, narrow edits, batch independent tool calls into one message.
+- Don't over-engineer: simplest solution, fewest moving parts, solve what's in front of you. No speculative features, no premature abstraction, no error handling for impossible cases.
+- Reviews/debugging: state the finding, show the fix, stop. Never speculate without reading the code; say so if the cause is unclear.
 
 ---
 
@@ -39,275 +21,47 @@ Part A = what to know about DTFS. Part B = how to work on it.
 
 ## A.1 Mission & target workload
 
-DTFS serves **one household-scale Plex media library across multiple
-datacenters with asymmetric bandwidth**. Every design decision anchors
-to this.
+DTFS serves **one household-scale Plex media library across multiple datacenters with asymmetric bandwidth**. Every design decision anchors to this.
 
 Reference deployment ("Plexmedia"), three DCs:
 
-| DC | Link | Role |
-|----|------|------|
-| LELI | ≤40 Mbps | Primary archive — holds every chunk at least once |
-| TORO | ~400 Mbps | Working set + read-ahead cache for playback |
-| NRB | ~1 Gbps | Fresh-download landing, replicates to LELI |
+| DC | Link | Role | Key nodes |
+|----|------|------|-----------|
+| LELI | ≤40 Mbps | Primary archive — every chunk anchored here | mgr01-03 (Raft quorum), data-primary01 (~50 TB HDD), client01 |
+| TORO | ~400 Mbps | Working set + read-ahead cache | mgr04, data-warm01 (~1 TB SSD), client02 |
+| NRB | ~1 Gbps | Fresh-download landing, replicates to LELI | mgr05, data-warm02 (~1 TB HDD), client03 |
 
-Nodes: **LELI** = mgr01-03 (Raft quorum, write durability),
-data-primary01 (~50 TB HDD, anchor copy of every chunk — may be N
-nodes), client01 (Plex read). **TORO** = mgr04, data-warm01 (~1 TB SSD,
-active set, empty at bootstrap), client02 (Plex read). **NRB** = mgr05,
-data-warm02 (~1 TB HDD, fresh downloads), client03 (download write). A
-node may host several roles (toro-plex = mgr04+data-warm01+client02+Plex
-on one box), so memory budgets are **per-role with a host-wide ceiling**
-so DTFS never starves a co-resident app.
+A node may host several roles (e.g. `toro-plex` = mgr04+data-warm01+client02+Plex on one box), so memory budgets are **per-role with a host-wide ceiling** — DTFS never starves a co-resident app.
 
-Workload: Plex playback ≤60 Mbps/stream, ~5 streams/instance (~300 Mbps
-egress peak at TORO/LELI). Reads dominate — most chunks read once or
-twice ever; a small hot set rolls every few weeks as new media arrives.
-Writes are bursty — a finished torrent lands a 30 GB season in minutes;
-absorb it without OOM-killing anything. **Anchor invariant: every chunk
-MUST have ≥1 replica on LELI's data-primary01.** Tiering/migration may
-move *other* replicas freely; the LELI copy is sacred.
+Workload: Plex playback ≤60 Mbps/stream, ~5 streams/instance. Reads dominate (most chunks read once or twice ever); writes are bursty (a finished torrent lands a 30 GB season in minutes — absorb without OOM-killing anything). **Anchor invariant: every chunk MUST have ≥1 replica on LELI's data-primary01.** Tiering/migration may move *other* replicas freely; the LELI copy is sacred.
 
-Non-goals: multi-tenant isolation; POSIX completeness (target Plex's
-FUSE read + occasional write; xattrs/mmap/open-unlink races are
-best-effort); online hot-rebalance across reconfigs (use
-drain-then-replace).
+Non-goals: multi-tenant isolation, POSIX completeness (Plex's FUSE read + occasional write is the target; xattrs/mmap/open-unlink races are best-effort), online hot-rebalance across reconfigs (drain-then-replace instead).
 
 ## A.2 Architecture
 
-- **dtfs-manager** — Raft peer + REST/gRPC frontend. Owns metadata: file
-  metadata, chunk locations, node registry, volume configs, write
-  leases, scrub schedules, alerts, migration tasks.
-- **dtfs-data** — data plane. Stores chunks per-tier (hot/warm/cold/
-  tape), streams put/get over gRPC, reports per-disk usage + SMART.
-- **dtfs-fuse** — FUSE client mounting the namespace at /mnt/dtfs. gRPC
-  to managers (metadata) and data nodes (chunk I/O). Local disk cache
-  for read-ahead.
-- **dtfs-client** — shared client crate used by dtfs-fuse and dtfs-cli.
-- **dtfs-raft** — openraft state machine. The log is the source of
-  truth; all metadata mutations go through it.
-- **dtfs-common** — shared types + helpers (BLAKE3 checksums, hash ring,
-  build.rs version string).
-- **dtfs-proto** — protobuf/tonic codegen.
+**dtfs-manager** Raft peer + REST/gRPC frontend, owns metadata (files, chunk locations, node registry, volumes, leases, scrub, migration). **dtfs-data** data plane, stores chunks per-tier, streams put/get, reports usage+SMART. **dtfs-fuse** FUSE client at `/mnt/dtfs`, gRPC to managers+data nodes, local read-ahead cache. **dtfs-client** shared client crate (dtfs-fuse + dtfs-cli). **dtfs-raft** openraft state machine — the log is the source of truth. **dtfs-common** shared types (BLAKE3, hash ring, version). **dtfs-proto** protobuf/tonic codegen.
 
-**Write:** acquire write_lease → allocate_chunks (returns target node
-addrs) → per chunk, stream PutChunk pieces to a tmp file on the target
-disk (no full-chunk `Vec`, see Bug I) → commit_chunk_from_tmp (rename +
-meta + WAL clear) → commit_chunk_locations (durable file entry). All
-manager steps go through Raft. CF-3b: commit_chunk_locations rejects the
-write (success=false, no Raft write) when any chunk lands fewer distinct
-`(node_id, disk_id)` replicas than the volume's
-`write_safety.min_replicas_before_ack` (`metadata::ack_floor_satisfied`).
+**Write:** acquire write_lease → allocate_chunks (target node addrs) → per chunk, stream PutChunk pieces to a tmp file on the target disk (no full-chunk `Vec`, Bug I) → commit_chunk_from_tmp (rename + meta + WAL clear) → commit_chunk_locations (durable file entry), all through Raft. CF-3b: commit_chunk_locations rejects the write when any chunk lands fewer distinct `(node_id, disk_id)` replicas than `write_safety.min_replicas_before_ack`.
 
-**Read:** lookup metadata (cached for ENTRY_TTL) → pick the read replica
-(`location.rs::select_read_replica`, U4 order: (1) configured
-`read_location_priority` — first replica whose datacenter/host matches the
-earliest-listed entry, operator intent, beats distance; (2) physical distance
-(`Location::distance`); (3) tier tie-break on *equal* distance — prefer warm
-over the cold anchor HDD, never overriding a strictly-nearer replica) → stream
-GetChunk → optionally cache locally (P0-11) → readahead engine prefetches
-(folder- or file-sequential). `GetFileLocations` carries each replica's tier
-(`ChunkLocationInfo.node_tiers`, positional with `node_addresses`); an older
-manager leaves it empty (→ unknown tier → pure distance). It also carries each
-replica's topology `Location` (`ChunkLocationInfo.node_locations`, positional
-with `node_addresses`, CO-3-10) — the manager fills it from each replica node's
-registered Location and the FUSE client learns it into `known_locations`
-(keyed by node address, `filesystem.rs::learn_locations` on metadata refresh)
-so `select_read_replica` can actually rank by distance + `read_location_priority`
-(before CO-3-10 the map was never populated, so read routing was dead). An older
-manager (or an unknown replica node) leaves an entry empty/all-empty → not
-learned → that replica falls back to arbitrary/pure-distance order, exactly like
-`node_tiers`.
+**Read:** lookup metadata (cached ENTRY_TTL) → pick the read replica (`location.rs::select_read_replica`: configured `read_location_priority` beats physical distance beats a tier tie-break on equal distance only) → stream GetChunk → optionally cache locally (P0-11) → readahead prefetches. Full U4/CO-3-10 detail (how tier + topology reach the FUSE client's `known_locations`): `docs/src/internals/invariants.md` § A.2.
 
 ## A.3 Conventions — Do Not Break
 
-**A.3.1 Snapshot compat.** `StateMachineData` serialises to disk on
-snapshot. Every new field MUST carry `#[serde(default)]` so old
-snapshots load cleanly. Add a regression test
-(state_machine::posix_path_regression or snapshot_persistence_tests) per
-new field.
+**A.3.1 Snapshot compat.** `StateMachineData` serialises to disk on snapshot. Every new field MUST carry `#[serde(default)]` so old snapshots load cleanly. Add a regression test (`state_machine::posix_path_regression` or `snapshot_persistence_tests`) per new field.
 
-**A.3.2 Memory discipline.** No `Vec<u8>` accumulation of full chunks on
-the hot path — stream to disk, hash incrementally (Bug I). The read-serve
-path has the same parity (U2): the data-node `GetChunk` handler streams
-the chunk off disk in 8 MB pieces and runs `verify_on_read` via an
-incremental BLAKE3 hash, so a cache MISS never holds the whole chunk in
-heap. Memory caps are best-effort; never reject requests by default (the
-RESOURCE_EXHAUSTED shed is opt-in, last resort — § A.5). The `[memory]`
-block is implemented on **all three roles** (CF-5): the role-agnostic
-core (`MemoryBudget`, `PressureLevel`, RSS sampler) lives in
-`dtfs-common/src/memory.rs`; each role wires its own cheap ladder rung —
-dtfs-data sheds put_chunk (REV-4-5 removed the dead "shrink ARC" rung —
-do NOT re-add a whole-chunk in-memory cache, that violates this
-section's first rule), dtfs-manager pauses scheduler ticks at **Shed**
-(REV-3-5; self-limiting via `MAX_CONSECUTIVE_PRESSURE_SKIPS`), dtfs-fuse
-halves readahead `cache_mb` at Warn and stops prefetch at Shed. systemd
-`MemoryMax` is the hard backstop for all roles. FUSE-specific detail
-(prefetch fan-out bound, write-buffer dirty-byte cap, await-guard rules)
-is in `.claude/rules/fuse.md`, loaded only for `crates/dtfs-fuse/**`.
+**A.3.2 Memory discipline.** No `Vec<u8>` accumulation of full chunks on the hot path, read or write — stream to/off disk, hash incrementally (Bug I, U2). Memory caps are best-effort, never reject by default (§ A.5). `[memory]` (CF-5) runs on all three roles, shared core `dtfs-common/src/memory.rs`, each with its own ladder rung (data sheds put_chunk; manager pauses scheduler ticks at Shed; fuse halves readahead at Warn, stops prefetch at Shed). systemd `MemoryMax` backstops all roles. FUSE detail: `.claude/rules/fuse.md`.
 
-**A.3.3 Integrity is the prime directive.** Every path that touches
-bytes must:
-1. Compute/carry a BLAKE3 checksum end-to-end (IncrementalHasher → stored
-   in ChunkMeta.checksum).
-2. Write new chunks to tmp + atomic rename after `sync_all()`
-   (store::commit_chunk_from_tmp).
-3. WAL the op before performing it; clear the WAL only after fsync.
-   Recovery scans the WAL on startup.
-4. Never delete a chunk until either a replacement replica is verified by
-   the receiving data node, or the chunk's file has been unlinked at the
-   manager and policy allows it. Chunks are content-addressed and may be
-   referenced by several files (or re-created by an identical re-upload),
-   so every delete-by-id path MUST re-check at dispatch time that no live
-   file still references the id (Bug CI: `fanout_delete_allowed` in the
-   unlink fan-out; skipped ids audit as `delete.fanout_skipped_live`).
-5. Never silently downgrade replication factor — if RF=N can't be placed,
-   queue migration tasks; don't accept the write at RF<N.
-6. Verify on every read and on scrub (Bug BC-8). `verify_on_read=true`
-   (default) makes the data node BLAKE3-hash each chunk before serving;
-   mismatch → `Status::data_loss` → FUSE falls over to a healthy replica
-   (P0-2), and the fault is pushed to the WebUI /ui/integrity feed
-   (BC-12e). Disabling verify_on_read needs an explicit ack at the API
-   boundary (BC-8 ack guard) and is the only mode where reads can deliver
-   corrupt bytes. Scrub (quick+deep+orphan) still runs.
-7. LIS-19 / LIS-55 / LIS-83 — when `cluster.shared_secret` is non-empty, data-plane
-   `PutChunk` / `DeleteChunk` / `ReplicateChunk` / `GetChunk` / `ListChunks` /
-   `VerifyChunk` require gRPC metadata `x-dtfs-rpc-ts` + `x-dtfs-rpc-mac`
-   (HMAC-SHA256 over `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n`;
-   DeleteChunk/GetChunk/VerifyChunk bind `chunk_id`; ReplicateChunk binds
-   `chunk_id|target_address`; PutChunk/ListChunks empty binding).
-   Missing/invalid → `PermissionDenied`. Empty secret = legacy skip
-   (join parity); data-node startup refuses empty secret unless
-   `allow_insecure_empty_secret` (LIS-20 parity).    Callers that stamp:
-   FUSE/client put+get, data→data replication put, manager scheduler
-   ReplicateChunk/VerifyChunk/ListChunks, manager unlink fan-out +
-   scheduler flush. Deploy data+manager+fuse together. mTLS (CF-6) is
-   complementary.
-8. LIS-56 — when `cluster.shared_secret` is non-empty, mutating
-   ManagerService RPCs require the same header keys over the
-   `dtfs-mgr-rpc` plane (`metadata::require_mgr_rpc_auth`); `dtfs-client`
-   stamps from `[client].shared_secret`. REST mutations remain LIS-18.
-   Deploy manager+fuse together.
+**A.3.3 Integrity is the prime directive.** Every path that touches bytes must: (1) carry a BLAKE3 checksum end-to-end into `ChunkMeta.checksum`; (2) write new chunks to tmp + atomic rename after `sync_all()`; (3) WAL the op before performing it, clear only after fsync; (4) never delete a chunk until a replacement is verified or the referencing file is unlinked and no other live file references the id (Bug CI `fanout_delete_allowed`); (5) never silently downgrade replication factor; (6) verify on every read and on scrub (Bug BC-8) — a mismatch is `Status::data_loss`, FUSE falls over (P0-2), disabling `verify_on_read` needs an explicit API-boundary ack; (7) LIS-19/55/83 — when `cluster.shared_secret` is set, every data-plane RPC requires an HMAC-SHA256 `x-dtfs-rpc-ts`+`x-dtfs-rpc-mac` pair (empty secret = legacy skip); (8) LIS-56 — mutating ManagerService RPCs require the same HMAC shape over `dtfs-mgr-rpc`; REST mutations stay on LIS-18. Full checklist + HMAC shape: § A.6 / `.claude/rules/integrity.md`.
 
-Full audit checklist: § A.6.
+**A.3.4 Mandatory vs cache replicas (Bug AV invariant).** Two independent classes, never conflated: `mandatory_replicas.<tier>` (protected, only the under-replication scheduler maintains them) and `cache_replicas.<tier>.{min,max}` (demand-driven, evictable, only the tiering engine creates them). Every promote/demote checks the anchor against the destination first (CO-1-2). Replica presence/removal is keyed by `(node_id, disk_id)`, never `node_id` alone (Bug BH, CO-1-1). New code that creates/removes replicas: consult `.claude/rules/integrity.md` / `docs/src/internals/invariants.md` § A.3.4.
 
-**A.3.4 Mandatory vs cache replicas (Bug AV invariant).** Two
-independent replica classes:
-- `mandatory_replicas.<tier>` — protected. **Only the under-replication
-  scheduler maintains them** (`scheduler::check_under_replicated`, reads
-  `effective_mandatory_replicas()`); it refuses to drop below the
-  configured count. Coverage counts only serviceable replicas (node not
-  Down/Failed, disk not Failed/Removed — `live_replica_tier`, Bug CH),
-  so node/disk loss surfaces as a tier deficit and backfills here; the
-  health monitor never schedules repair. The same live gate applies to
-  `stats`/`cluster_status` `anchor_pending` (`api::count_anchor_pending_files`),
-  `chunk_placement` (`placement_state::resolve_dc_tier`), and
-  `check_anchor_lag` placement builds (LIS-41) — Down-node cold must not
-  keep those counters false-green.
-- `cache_replicas.<tier>.{min,max}` — demand-driven, evictable. **Only
-  the tiering engine creates them, and only when the promotion threshold
-  fires** (`promote_reads` / `promote_window_secs`). The under-
-  replication scheduler MUST NOT backfill cache replicas.
-- The cache-flush planner (`scheduler::plan_flush_cache`) refuses any
-  flush that would strand the mandatory copy → `cache.flush_refused`
-  audit + `AnchorViolated` alert. The dispatcher records
-  `cache.flush_replica` per drop and `cache.flush_complete` per call.
-- Every promote/demote must check the anchor against the destination
-  state. The legacy-temperature path checks `would_violate_anchor`;
-  the AV idle-demote planner checks `tiering::demote_preserves_anchor`
-  (CO-1-2 — refuses a cache-replica demote unless ANOTHER placement still
-  satisfies `effective_anchor`, recording it in `TickPlan.anchor_protected`
-  → the dispatcher emits a `tier.anchor_protected` audit + `AnchorViolated`
-  alert). The mandatory-tier survival check alone is NOT enough: a chunk's
-  ONLY anchor-DC replica can be a cache copy while the mandatory copy lives
-  in another DC. The apply path (`RemoveChunkLocation` with
-  `enforce_anchor`, threaded from the volume's `effective_anchor`)
-  re-checks as defence-in-depth.
-- Engine-driven demote ≠ operator flush: idle-decay demote clears the
-  cooldown (next read re-promotes); operator flush sets a future cooldown
-  (no immediate re-promote). Route demote-like paths through
-  `should_clear_cooldown_on_demote(cooldown_until_ms, now_ms)` (past/
-  absent → clear; future → preserve), never an unconditional
-  `SetChunkCooldown(0)`.
-- A volume with an active AV cache policy (`cache_replicas`,
-  `tiering::volume_has_active_cache_policy`) is driven SOLELY by the AV
-  cache tick; the legacy temperature-profile demote/promote SKIPS its
-  chunks (CO-4-6). Otherwise, after an operator flush sets a future
-  cooldown, the legacy promote would re-create the warm replica during the
-  cooldown window, defeating the flush.
-- A mandatory replica MAY co-locate with a cache replica of the same
-  chunk on one node (different tier). Replica presence is keyed by
-  `(node_id, disk_id)` (≡ `(node, tier)`), never `node_id` alone (Bug BH,
-  `scheduler::replica_already_present`) — a node-only dedup drops the
-  second-tier mandatory entry and loops the anchor-lag repair forever.
-- **Removal is disk-targeted too (CO-1-1).** Every replica-drop path now
-  carries the specific `disk_id` so it removes exactly the `(node_id,
-  disk_id)` copy, never a co-located anchor on another disk of the same
-  node. `ClientRequest::RemoveChunkLocation` and
-  `RemoveCorruptChunkReplicas` carry `#[serde(default = "legacy_disk_id")]
-  disk_id: u32`; the `u32::MAX` sentinel (old snapshots/log entries) means
-  legacy node-wide removal (match on `(chunk_index, node_id)` only). The
-  data-plane `DeleteChunkRequest.disk_id` is `optional uint32` (proto3
-  explicit presence): present → unlink only that disk's copy
-  (`store::delete_chunk_idempotent_on_disk`); absent (old manager / whole-
-  chunk reclaim) → legacy first-found across `all_disks()`. The three
-  cache/tiering removers thread the targeted disk:
-  `scheduler::plan_excess_spill_removal` (returns `(node, disk)`),
-  `scheduler::plan_flush_cache` (`FlushAction.disk_id`), and
-  `tiering::plan_chunk_demotions` (`TickDemotion.disk_id`). Whole-chunk
-  reclaimers (unlink fan-out, orphan reaper) intentionally stay node-wide
-  (`disk_id = None`).
-
-When a new code path creates OR removes replicas, make the class explicit
-in its name/doc and consult one of these checks.
-
-**A.3.5 Dev-build date freshness (hard requirement).** Every dev build
-MUST stamp its own build instant into `BUILD_DATE` — `VERSION` defaults
-to `v0.0.0-dev` (release builds override it via `DTFS_VERSION`, see
-below), so for two *dev* builds `BUILD_DATE` is the only distinguishing
-field (WebUI node table, logs, node registry). Mechanism (Bug BS):
-`dtfs-common/build.rs` emits `DTFS_BUILD_DATE` from `SOURCE_DATE_EPOCH`
-(falls back to `SystemTime::now()` when unset) and declares
-`cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH`. The build wrappers
-(`scripts/build-linux-amd64.sh`, `scripts/dtfs-build.sh`) export
-`SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date -u +%s)}"` before cargo
-build, so each wrapper run re-stamps. A bare `cargo build` with the var
-unset keeps the cached stamp (fast local incremental, but stale — never
-deploy it). **Deploy builds MUST go through a wrapper** (or export the
-var). Confirm a binary's stamp with `dtfs-<bin> --version`. Guard:
-`scripts/tests/test-build-date-fresh.sh`. Reproducible-build envs that
-pin `SOURCE_DATE_EPOCH` are the sanctioned exception (wrappers honour a
-caller-set value).
-
-**Release version stamp (AZ-5).** `build.rs` also emits `DTFS_VERSION`
-(default `v0.0.0-dev`, with `rerun-if-env-changed`); `version.rs` reads
-it for `VERSION`/`VERSION_STRING`. `scripts/dtfs-release.sh <tag>`
-exports `DTFS_VERSION=<tag>` before the build so a release binary's
-`--version` (and the WebUI/node table) reports the real tag; plain/dev
-builds stay `v0.0.0-dev`. `dtfs-cli update --check` compares that
-installed version against the latest GitHub release tag. Guard:
-`scripts/tests/test-release-version-stamp.sh`.
+**A.3.5 Build-date / version stamp.** Every dev build MUST stamp `BUILD_DATE` fresh (the only distinguishing field between two dev builds) — deploy builds MUST go through a wrapper (`scripts/build-linux-amd64.sh`, `scripts/dtfs-build.sh`, `scripts/dtfs-release.sh <tag>`); confirm with `dtfs-<bin> --version`. Release builds additionally stamp real `DTFS_VERSION`. Guards: `scripts/tests/test-{build-date-fresh,release-version-stamp}.sh`. Mechanism (Bug BS, AZ-5): `docs/src/internals/invariants.md` § A.3.5.
 
 ## A.4 Build / test / deploy
 
-The workspace builds on **Linux/WSL** only (the Windows host can't build
-rocksdb + fuse3). The `dtfs-builder` VM hosts the build chain at
-**10.20.0.150** (the hostname `dtfs-builder` resolves only inside the
-lab DNS 10.20.0.2/3 — from the operator host, use the IP). Access:
-`ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.20.0.150`. The builder has
-rustup (`source ~/.cargo/env` first — login shells don't auto-add
-`~/.cargo/bin`), protoc, fuse3, `mdbook`, and `clang`/`libclang-dev`
-(needed by the rocksdb bindgen in dtfs-manager/dtfs-data), so the full
-workspace builds. `debian` has passwordless sudo.
-
-The builder is **not** a git checkout — sync the working tree to
-`~/dtfs2` (the operator host has no `rsync`; use `tar` over SSH), then
-build over SSH:
+Linux/WSL only (Windows host can't build rocksdb + fuse3). Build VM: `dtfs-builder` at 10.20.0.150 (`ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.20.0.150`, `source ~/.cargo/env` first). Not a git checkout — sync via `tar` over SSH (exclude `./target`, `./.git`, `./.claude`, `./dummy_files`), then build over SSH:
 
 ```bash
-# from the operator host, in the worktree root; exclude build/VCS/agent
-# dirs AND ./dummy_files (a ~255 GB gitignored local fixture dir — the
-# builder disk is 32 GB; syncing it fills the disk mid-tar)
 tar czf - --exclude=./target --exclude=./.git --exclude=./.claude \
     --exclude=./dummy_files . \
   | ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.20.0.150 \
@@ -322,90 +76,33 @@ cargo test  --release --workspace
 cargo test -p dtfs-data --release   # per-crate
 ```
 
-**Stale-artifact trap (Bug CF deploy hiccup).** The tar sync preserves
-source mtimes, so a just-synced edit can land OLDER than cached build
-artifacts and cargo will silently reuse a stale rlib (a lib's
-`#[cfg(test)]` tests can still pass — the lib-test binary rebuilds
-independently — while downstream binaries link the pre-edit lib).
-Before deploying a binary that must contain a fresh change: `touch` the
-edited file(s) on the builder (or rebuild after a marker change) and
-verify the binary actually carries the change (`grep -ac "<new log
-string>" target/release/<bin>` or the `--version` stamp).
+Stale-artifact trap (Bug CF): the tar sync preserves mtimes, so a just-synced edit can land older than cached build artifacts and cargo silently reuses a stale rlib — `touch` the edited file(s) before a deploy build and confirm the binary carries the change. Full narrative: `docs/src/internals/invariants.md` § A.4.
 
-Deploy builds MUST go through a wrapper (`scripts/build-linux-amd64.sh`,
-`scripts/dtfs-build.sh`, or `scripts/dtfs-release.sh <tag>` for a tagged
-release) so `BUILD_DATE` is fresh (§ A.3.5). Bare `cargo build --release`
-is fine for iteration but stamps stale; re-stamp with
-`SOURCE_DATE_EPOCH=$(date -u +%s) cargo build --release …`. Cutting a
-release: `scripts/dtfs-release.sh <tag>` stamps `DTFS_VERSION`, builds,
-and writes `target/release-artifacts/<tag>/` (the `dtfs-linux-amd64.tar.gz`
-the updater pulls, `SHA256SUMS`) + the `gh release create` line (release
-notes auto-generated from merged PRs via `--generate-notes`).
+Deploy builds MUST go through a wrapper so `BUILD_DATE` is fresh (§ A.3.5); a bare `cargo build --release` stamps stale. `scripts/dtfs-release.sh <tag>` stamps `DTFS_VERSION`, builds, writes `target/release-artifacts/<tag>/` + prints the `gh release create` line (AIWF-4-1: `git-cliff` notes when available, `--generate-notes` fallback). A crate-level `#![allow(dead_code)]` on dtfs-manager/dtfs-data works around a rustc 1.94 dead-code ICE — don't remove without re-verifying the ICE first.
 
-A crate-level `#![allow(dead_code)]` on the dtfs-manager and dtfs-data
-binaries works around a rustc 1.94 dead-code ICE — don't remove it
-without first verifying the ICE no longer reproduces on the current
-toolchain.
+Rolling deploy: scp the binary, `install -m 755`, `systemctl restart`. Managers leader-last, then data nodes, then FUSE clients.
 
-Rolling deploy: scp the new binary, `install -m 755`,
-`systemctl restart`. Roll managers leader-last, then data nodes, then
-FUSE clients.
-
-Lab: Proxmox on 10.20.0.0/24. PVE host root `ssh root@10.20.0.121`
-(password-only; store via sshpass only on the operator's WSL home, never
-committed). VM key `~/.ssh/dtfs-lab/id_ed25519`. Bandwidth shaping in
-`tests/proxmox/ansible/roles/dtfs-netshape/`.
+Lab: Proxmox on 10.20.0.0/24, PVE host root `ssh root@10.20.0.121` (password-only, sshpass on the operator's WSL home only, never committed). VM key `~/.ssh/dtfs-lab/id_ed25519`. Bandwidth shaping: `tests/proxmox/ansible/roles/dtfs-netshape/`.
 
 ## A.5 Memory model
 
-Deterministic, bounded, best-effort: under pathological load we slow
-down, never OOM-kill. All three role configs accept an optional `[memory]`
-block (CF-5; shared core in `dtfs-common/src/memory.rs`, per-role ladder
-rung — § A.3.2; defaults warn 80 / shed 92 / sample 5):
+Deterministic, bounded, best-effort: slow down under pathological load, never OOM-kill. All three roles accept an optional `[memory]` block (CF-5, core in `dtfs-common/src/memory.rs`, per-role ladder — § A.3.2; defaults warn 80 / shed 92 / sample 5):
 
 ```toml
 [memory]
-hard_cap_mb          = 1500   # 0 = unbounded (back-compat; new deploys non-zero)
+hard_cap_mb          = 1500   # 0 = unbounded (back-compat)
 warn_threshold_pct   = 75
 shed_threshold_pct   = 88     # last-resort write reject (Bug G), opt-in
 sample_interval_secs = 3
 ```
 
-Strategy ladder when RSS nears the cap (cheapest first; goal: stay under
-*without* rejecting): 1) stream to disk, never buffer whole chunks
-(Bug I); 2) shrink ARC cache (data) / FUSE local cache (client); 3) drop
-unconsumed readahead chunks; 4) pause background tasks (scrub, tiering,
-metrics); 5) throttle write acceptance via TCP backpressure; 6) (opt-in,
-last resort) return RESOURCE_EXHAUSTED to new put_chunk, client retries
-with backoff.
+Ladder (cheapest first, goal: stay under without rejecting): stream to disk not heap → shrink data/FUSE caches → drop unconsumed readahead → pause background tasks → TCP backpressure → (opt-in) RESOURCE_EXHAUSTED.
 
-Composite host (toro-plex = mgr04+data-warm01+client02+Plex): set
-`hard_cap_mb` per role where supported (else systemd `MemoryMax`); total
-≤ host RAM − Plex headroom − OS overhead.
-`tests/proxmox/abuse/14-composite-host-budget.sh` validates the sum.
-Composite-host identity rule: every daemon needs its own unique
-`[node].hostname` (node_id = hash(hostname)); the FUSE client registers
-under `[location].host` (`<data-hostname>_cln` convention) — see
-`docs/src/configuration/` and `deploy/examples/`.
+Composite host (e.g. `toro-plex`): set `hard_cap_mb` per role (else systemd `MemoryMax`); total ≤ host RAM − Plex headroom − OS overhead (`tests/proxmox/abuse/14-composite-host-budget.sh`). Every daemon needs its own unique `[node].hostname`; FUSE registers under `[location].host` (`<data-hostname>_cln`) — see `docs/src/configuration/`.
 
 ## A.6 Data-integrity audit checklist
 
-Run when you touch a write/migrate/delete/scrub path; mark each "Verified
-by <test>" in the commit. Full checklist with narrative context (why
-each item exists, CO-1-3/CO-3-2/Bug CB reasoning, the LIS-19/55/83
-data-plane auth stamp shape, the Bug AV mandatory-vs-cache replica
-invariant) lives in `.claude/rules/integrity.md`, loaded automatically
-for `dtfs-data/**`, `dtfs-manager/src/scheduler.rs`, `dtfs-raft/**`.
-Summary: (1) BLAKE3 checksum end-to-end into `ChunkMeta.checksum`; (2-3)
-tmp+atomic-rename+`sync_all()` for both `.dat` and `.meta`; (4) counters
-update only after meta is durable; (5) tmp removed on any put error
-path; (6) migration verifies before marking Done, de-location is
-Raft-remove-then-byte-delete (never rolled back after commit — the
-CO-3-2 reaper mops a failed byte-delete); (7) scrub BLAKE3-checks vs
-`checksum`, auto-repairs via `replicate_chunk`; (8) unlink deletes
-metadata before bytes, orphan reap keys off durable on-disk mtime
-(Bug CB), not a manager-local clock; (9) rename is one Raft command,
-chunk_id binding unchanged; (10) reads use replica-fallback (P0-2).
+Run when you touch a write/migrate/delete/scrub path; mark each "Verified by <test>" in the commit. Full checklist with narrative context lives in `.claude/rules/integrity.md`, loaded automatically for `dtfs-data/**`, `dtfs-manager/src/scheduler.rs`, `dtfs-raft/**`. Summary: (1) BLAKE3 checksum end-to-end into `ChunkMeta.checksum`; (2-3) tmp+atomic-rename+`sync_all()` for both `.dat` and `.meta`; (4) counters update only after meta is durable; (5) tmp removed on any put error path; (6) migration verifies before marking Done, de-location is Raft-remove-then-byte-delete (the CO-3-2 reaper mops a failed byte-delete); (7) scrub BLAKE3-checks vs `checksum`, auto-repairs via `replicate_chunk`; (8) unlink deletes metadata before bytes, orphan reap keys off durable on-disk mtime (Bug CB), not a manager-local clock; (9) rename is one Raft command, chunk_id binding unchanged; (10) reads use replica-fallback (P0-2).
 
 ## A.7 Bandwidth + network shaping
 
@@ -417,411 +114,41 @@ chunk_id binding unchanged; (10) reads use replica-fallback (P0-2).
 | TORO | 400 Mbps | 5±1 ms |
 | NRB | 1 Gbps | 1±0.5 ms |
 
-Apply via apply-shaping.yml, revert via revert-shaping.yml. **Exempt:
-SSH/22, manager gRPC/9401, manager API/9402, data gRPC/9500, NTP/123** —
-otherwise Raft heartbeats fail under jitter and the cluster can't elect.
+Apply via apply-shaping.yml, revert via revert-shaping.yml. **Exempt: SSH/22, manager gRPC/9401, manager API/9402, data gRPC/9500, NTP/123** — otherwise Raft heartbeats fail under jitter and the cluster can't elect.
 
 ## A.8 File map
 
-- `dtfs-raft/src/state_machine.rs` — `apply_request`, the authoritative
-  state-mutation point.
-- `dtfs-raft/src/lib.rs::ClientRequest` — command enum; a new mutation =
-  new variant + new arm in apply_request.
-- `dtfs-raft/src/network.rs::full_snapshot` — snapshot-stream RPC. Bug CL:
-  network failures here (peer unreachable / timeout / empty response) MUST map
-  to the transient `StreamingError::Unreachable` (openraft retries), NEVER to
-  `StreamingError::StorageError` — openraft treats StorageError as a fatal
-  local-storage failure and shuts down the leader's RaftCore (caused
-  cluster-wide quorum loss on prod-cluster). Only genuine local snapshot reads use
-  StorageError. CNF-4: cross-peer snapshot sends are capped at 2 in flight
-  (`SNAPSHOT_SEND_PERMITS` semaphore — each send holds ~2.7x snapshot size in
-  heap as base64+JSON); the shared base64 encoder/decoder pair lives here
-  (`base64_encode`/`base64_decode`, used by the dtfs-manager snapshot
-  receiver). The transport is a JSON-string unary RPC — serde_bytes would
-  serialize as an int array (bigger than base64), so don't drop the base64
-  without a wire change. CO-3-6: the peer channel sets NO channel-level
-  `.timeout()` (tonic's GrpcTimeout layer takes the MIN of channel + per-request
-  timeout, so a fixed channel timeout would clamp the snapshot RPC back down);
-  every `send_rpc` sets its own per-request timeout via
-  `tonic::Request::set_timeout`. AppendEntries/Vote pass the 5s `RPC_TIMEOUT`;
-  the snapshot send passes `snapshot_rpc_timeout(bytes, option.hard_ttl())` =
-  max(openraft's hard_ttl, snapshot_bytes / 1 MBps floored at 5s), so a >25 MB
-  snapshot to a learner behind the 40 Mbps LELI shape gets enough wall-clock to
-  land instead of dying at the old 5s default. A fired timeout is still a tonic
-  Status -> `unreachable_err` -> `RPCError::Unreachable` -> `StreamingError::
-  Unreachable` (transient), preserving the Bug CL mapping above.
-- `dtfs-manager/src/scheduler.rs` — migration/re-replication loop; the
-  SOLE owner of replica repair (Bug AC leader gate + Bug CH).
-  **REV-1-1 — every manager background loop is leader-gated, not just
-  `tick()`.** `TaskScheduler::is_leader()` is the single gate;
-  `run_orphan_scrub`, `run_auto_unquarantine_sweep`, `run_lease_gc`,
-  `TieringEngine::run` and `POST /api/v1/files/flush_cache` all take it. These
-  loops dispatch *direct data-node delete RPCs*, which no Raft rejection can
-  undo, so a follower running them physically deletes live bytes (a follower's
-  tiering read-window is always empty, so it reads every cache replica as
-  idle). Any new background loop MUST take this gate. Note the tiering state
-  sweep runs BEFORE the gate: it must keep pruning on followers, which are
-  exactly the nodes that ingest `report_access` without ever evaluating.
-  REV-1-2: the orphan reaper additionally requires a caught-up state machine
-  (`orphan_sweep_allowed`) — reaping against a still-replaying view classifies
-  every file created during the outage as an orphan. REV-3-4: task creation is
-  bounded (`MAX_NEW_TASKS_PER_TICK`, `MAX_LIVE_TASKS`) with an O(1) per-tick
-  dedup index; the scan is idempotent so the remainder resumes next tick, and
-  the cap is logged, never silent. REV-3-10: a location row whose bytes are
-  missing is RECONCILED (dropped, never the last live copy, anchor-checked) so
-  the backfill sees the real deficit; the node is quarantined only when a row
-  cannot be reconciled or the miss count is node-scale.
-  `schedule_path_migration` (operator moves), `flush_cache_for_path` +
-  `plan_flush_cache` (drop cache replicas; emit cache.flush_* audit +
-  AnchorViolated on refusal), `check_under_replicated` (counts coverage
-  via `live_replica_tier` — replicas on Down/Failed nodes or
-  Failed/Removed disks don't count, so node/disk loss backfills here),
-  `validate_task_target` (dispatch fast-fails tasks targeting
-  non-Data/dead/tier-less nodes → `migration.invalid_target` audit),
-  `check_misplaced_rebalance` / `plan_excess_spill_removal` (Bug BX-5
-  rebalance). `advance_tasks` drives the task state machine each 30s tick;
-  U3 made it multi-transition-per-tick (round loop until no progress, so a
-  chunk climbs Pending->Done in ONE tick) + bounded-parallel copy
-  (`MIGRATION_COPY_CONCURRENCY`=6 in-flight `ReplicateChunk` RPCs globally;
-  WI-04 added `MIGRATION_COPIES_PER_TARGET`=2 in-flight against any ONE
-  target address, gated by a per-round `HashMap<tgt_addr, Semaphore>` built
-  fresh in `advance_round` — every anchor-repair copy targets the single
-  LELI anchor node, so without the per-target gate the global cap
-  fair-shared one 40 Mbps link 6 ways and no single copy finished before its
-  deadline; the permit is acquired BEFORE the RPC so the deadline starts
-  only once the copy actually begins, and the gate queues surplus jobs, it
-  never drops them; `MAX_ADVANCE_ROUNDS`=8 guard). The transition logic
-  lives in the generic
-  `advance_migration_tasks` over the `MigrationOps` trait
-  (`TaskScheduler` is the live impl; unit-tested via a mock in
-  `advance_round_tests`); a task still attempts at most one copy + one
-  verify RPC per tick (preserves the pre-U3 retry cadence + verify-mismatch
-  re-copy-next-tick). **Bug CN — flood-aftermath robustness:** (a) `tick`
-  prunes terminal (Done/Failed past-retention) tasks FIRST via
-  `prune_terminal_tasks` and persists that immediately, BEFORE the
-  under-replication scan + advance — pre-CN the prune ran only at the end of
-  `advance_tasks`, so a large terminal backlog (prod 2026-06-10: 2439 Failed
-  tasks after the Bug CM wedge) starved its own GC and every leader reloaded
-  the poison; (b) each `replicate_chunk`/`verify_chunk` RPC is wall-clock
-  bounded — without it a stalled data node hung the `buffer_unordered` copy
-  round and the whole scheduler loop after one leader-onset pass. WI-04:
-  `verify_chunk` stays on the fixed `MIGRATION_RPC_TIMEOUT` (60s — it
-  re-hashes a file already local to the target, no bytes cross the wire, so
-  it doesn't scale with the link); `replicate_chunk` is bounded by
-  `dtfs_common::replication::migration_rpc_timeout(chunk_bytes)`, sized from
-  the chunk's own byte count (`chunk_size_in_any_file`, looked up alongside
-  the Bug AE orphan guard) = **60s at the 4 MB default chunk (Bug CN's bound
-  preserved exactly)**, scaling at 1 MiB/s to a hard **300s** ceiling, and
-  always strictly greater than the data node's own inner
-  `replicate_transfer_timeout(chunk_bytes)` budget for the same copy
-  (`dtfs-data/src/replication.rs::replicate_to`; **30s** floor, **270s**
-  ceiling). **B4:** PRE-WI-04 the two were unrelated fixed
-  constants and INVERTED — a fixed 60s outer deadline under a fixed 120s
-  inner one made the callee's own timeout dead code at every chunk size,
-  since the manager always aborted first (dropping a partial transfer the
-  source still considered healthy). WI-04's first cut removed the inversion
-  the wrong way round: it kept the 120s inner floor and derived the outer
-  from it (>= 150s for every chunk, including the 4 MB default), which
-  restored outer > inner but walked back Bug CN's bound. The landed fix
-  LOWERED the inner floor (120s -> 30s) rather than raising the outer, so
-  Bug CN's 60s bound holds again at the default chunk size;
-  both budgets are additionally capped (inner 270s, outer 300s) so a
-  128 MB-chunk volume can't park an advance round for minutes either. The
-  inner deadline MUST stay strictly below the outer at every chunk size,
-  including at the cap boundary — that inversion must never come back. So
-  the pre-tick prune may add a SECOND
-  `save_migration_state` Raft write when it drops tasks; steady-state is still
-  one. **CO-3-5:** `tick` and `schedule_replication` both load-modify-save the
-  migration state; both hold the `migration_state_lock` (`tokio::Mutex`)
-  across the load..save so a concurrent schedule during a tick can't clobber a
-  task or regress `next_task_id`. The orphan_scrub (`orphan_scrub_tick`) reaps per-node in two cases,
-  both gated by the Bug CB durable-mtime grace (`orphan_reap_due`): a HASH
-  orphan (no file references the hash; `chunk_is_orphan`) AND **CO-3-2** a
-  DE-LOCATED chunk (on a node's disk but the SM records no location entry
-  naming that node — the rebalance / excess-spill path drops the SM entry via
-  `RemoveChunkLocation` but never deletes the bytes; `chunk_delocated_on_node`);
-  the reap audits `cause=orphan|delocated`. The reap stays node-wide (legacy
-  first-found delete; ListChunks carries no disk_id). **CO-3-3:** before the
-  BF-8 in-state-missing quarantine fires, it re-reads the CURRENT SM
-  (`current_expected_chunks_for_node` + `still_missing_after_recheck`) and
-  drops any chunk a concurrent demote/unlink de-located between the tick's
-  opening snapshot and the ListChunks reply — so a healthy node is never
-  quarantined for a demote race. **CO-5-7:** `FlushSnapshot`/`FlushAction`
-  carry the file's OWN volume anchor (not the default volume's) so a
-  non-default-volume flush enforces its own anchor. **CO-5-8:** the flush
-  `truncated` counter counts the remaining would-drop replica entries
-  directly, not `chunks_examined - actions.len()`. **CO-1-3:** the
-  cache-flush dispatch (and the tiering demote dispatch) de-locate each
-  replica Raft-remove-FIRST via the shared `delocate_replica` over the
-  `DelocateOps` seam (live impl `SchedulerDelocate`): `RemoveChunkLocation`
-  (with `enforce_anchor`) commits BEFORE the `DeleteChunkReplica` byte
-  delete. A Raft-remove failure issues no byte delete (`raft_failures`++,
-  retry); a post-commit byte-delete failure is NOT rolled back
-  (`rpc_failures`++, audit `rpc_failed_after_remove`) — the leftover bytes
-  are reclaimed by the CO-3-2 reaper. `check_misplaced_rebalance` is
-  already Raft-remove-only (it never deletes bytes; the reaper mops the
-  excess-spill leftover). Ordering covered by `co_1_3_delocate_order_tests`.
-- `dtfs-manager/src/monitor.rs` — heartbeat health detection only
-  (Bug CH): commits node-status transitions, fires NodeDown/SMART
-  alerts. MUST NOT schedule repair — the 2026-06-06 storm came from a
-  monitor-owned evacuation path (PLAN-BUG-CH). **Leader-gated (Bug CM):**
-  only the current leader evaluates liveness + commits `UpdateNodeStatus`
-  (and runs `check_disk_health`), via the same `metrics.current_leader ==
-  id` gate as the scheduler (Bug AC); `monitor_status_changes` returns
-  empty off-leader. Bug CJ moved liveness onto the replicated
-  `last_seen_ms`, but a non-leader reading its own bursty-stale replicated
-  view still committed `Down` and flapped the node (prod prod-cluster v0.1.5,
-  2026-06-09, two cross-DC learner managers) — the leader's log is
-  authoritative + single-writer. Recovery stays the heartbeat handler's
-  `UpdateNodeStatus(healthy)` (any manager, forwarded).
-- `dtfs-manager/src/metadata.rs` — gRPC service; thin wrappers over
-  `raft_write(ClientRequest::*)`. Follower-originated writes proxy to the
-  leader via `ForwardClientWrite`; CO-2-2 authenticates that RPC — the
-  forwarder stamps `ForwardWriteRequest.shared_secret` (field 2) from
-  `config.cluster.shared_secret` and the leader rejects a mismatch with
-  `permission_denied` via a CONSTANT-TIME compare (`forward_secret_ok`,
-  which reuses `dtfs_common::crypto::constant_time_eq` — never `==` on the
-  secret); an empty configured secret skips the check (back-compat for
-  plaintext clusters). Any new forward site MUST populate that field.
-  CO-3-7: `report_chunk_status` commits its
-  corrupt/missing handling (UpdateNodeStatus + RemoveCorruptChunkReplicas)
-  through `raft_write_or_forward` and returns `accepted: false` on failure —
-  never `let _ = raft_write(...)`, which on a follower silently dropped the
-  de-location so the bad replica stayed advertised healthy and
-  re-replication never queued. The dtfs-data heartbeat loop re-enqueues the
-  drained corrupt ids when the ack is `accepted == false` (same as a
-  transport error), so the retry actually happens.
-- `dtfs-manager/src/api.rs` — REST endpoints (WebUI + CLI); `get_stats`
-  is the WebUI home aggregator. LIS-18 / Sec R1: mutating `/api/v1/*`
-  requires `[cluster].shared_secret` via `X-Dtfs-Shared-Secret` (or
-  `Authorization: Bearer`) when configured (`rest_auth.rs`); GETs stay
-  open; join HMAC exempt. Denied calls audit as `auth.denied`. LIS-56:
-  mutating ManagerService gRPC (`CreateFile`/`DeleteFile`/leases/…)
-  requires `x-dtfs-rpc-*` HMAC over the `dtfs-mgr-rpc` plane when the
-  secret is set (`metadata::require_mgr_rpc_auth`); reads stay open;
-  `dtfs-client` stamps from `[client].shared_secret`. The config
-  read endpoints (`get_config`, `get_config_effective`) return the
-  **effective** config = the node's startup `state.config` with the Raft
-  cluster override (`cluster_config.config_json`) projected on top via
-  `json_deep_merge` (Bug CM) — a saved cluster-wide override MUST read
-  back as `current`, or the WebUI editor looks broken. Adding a config
-  read path? Route it through `effective_config_value`, never raw
-  `state.config` (CO-5-9 — the `get_config` `defaults` block follows the
-  same merge). The write path (`update_config`) deep-merges the override
-  onto the startup config (which, since `UpdateConfig` replaces the
-  override wholesale, IS the post-save effective config) and REQUIRES the
-  merge to deserialize as `ManagerConfig` (`merge_and_validate_override`,
-  400 on type error, CO-4-3), then persists `toml::to_string_pretty` of
-  the validated merge — never raw override JSON into the `.toml`. Operator
-  node decommission (`POST /api/v1/nodes/{id}/decommission` ->
-  `decommission_node_endpoint` -> Raft `ClientRequest::DeregisterNode`)
-  removes a drained/dead node from the registry; the apply REFUSES
-  (`ClientResponse::Error`) if the node still holds any chunk replica
-  (`sm.files[*].chunks[*].node_id`) — integrity guard A.6 #5,
-  drain/re-replicate first. The endpoint pre-checks the same and the apply
-  re-checks authoritatively (TOCTOU-safe).
-- `dtfs-manager/src/rest_auth.rs` — pure mutation-auth check + axum
-  middleware for LIS-18 (constant-time compare).
-- `dtfs-manager/src/metadata.rs` — ManagerService gRPC; LIS-56
-  `require_mgr_rpc_auth` on mutating client RPCs.
-- `dtfs-manager/src/membership.rs` — CF-2 online raft membership: pure
-  validation for the leader-only `/api/v1/raft/{add-learner,promote,
-  remove}` endpoints (openraft `add_learner`/`change_membership`;
-  `initial_voters` is bootstrap-only).
-- `dtfs-manager/src/join.rs` — two-phase data-node join (HMAC handshake;
-  `/api/v1/join/{request,complete}` in api.rs). Phase-1 `handle_join_request`
-  verifies HMAC(secret, nonce), issues a challenge, and persists it with a
-  60s single-use TTL (`challenges` map). Phase-2 `complete_join` (CO-2-3
-  security) requires `HMAC(secret, challenge)` (constant-time
-  `verify_completion_inner`, consumes the challenge), derives
-  `node_id = node_id_from_hostname(hostname)` SERVER-SIDE (never trust a
-  client id), then does the `RegisterNode` Raft write. Empty
-  `cluster.shared_secret` = documented unauthenticated downgrade (skips the
-  challenge/HMAC checks). docs/src/security/cluster-join.md.
-- `dtfs-manager/src/webui.rs` — embedded SPA, format-string HTML
-  (`{{`/`}}` for literal braces). LIS-35: mutating POSTs send
-  `X-Dtfs-Shared-Secret` from `sessionStorage` (Settings field / header
-  badge prompt); GETs stay open; 401/403 surfaced in-page.
-- `dtfs-data/src/server.rs::put_chunk` — streaming put path; LIS-19/LIS-55/LIS-83
-  `require_data_rpc_auth` gates Put/Delete/Replicate/Get/List/VerifyChunk.
-- `dtfs-data/src/replication.rs::replicate_to` — push-replication engine
-  (source node streams a chunk to a replica target in ~1 MiB pieces, Bug CI).
-  WI-04: its own transfer timeout (connect + stream + remote commit + CO-5-4
-  hash validation) is `dtfs_common::replication::replicate_transfer_timeout
-  (total)`, sized from the chunk's on-disk byte count (30s floor, 270s
-  ceiling, B4), not a fixed constant.
-- `dtfs-common/src/replication.rs` — WI-04 shared replication-deadline
-  helpers (`replicate_transfer_timeout`, `migration_rpc_timeout`); the one
-  home for the outer(manager)-vs-inner(data node) deadline pair since
-  `dtfs-manager` does not depend on `dtfs-data`. Mirrors
-  `dtfs-raft/src/network.rs::snapshot_rpc_timeout` (CO-3-6). B4: inner budget
-  `REPLICATE_TIMEOUT_FLOOR` 30s / `REPLICATE_TIMEOUT_CEILING` 270s; outer
-  adds the unchanged 30s `MIGRATION_RPC_MARGIN`, capped at
-  `MIGRATION_RPC_CEILING` 300s — 60s outer at the 4 MB default chunk, 300s
-  outer at >=270 MB, strictly above the inner at every size.
-- `dtfs-common/src/crypto.rs` — join HMAC + LIS-19/LIS-55/LIS-83
-  `stamp_data_rpc_auth` / `verify_data_rpc_auth` /
-  `data_rpc_replicate_binding` + LIS-56 `stamp_mgr_rpc_auth` /
-  `verify_mgr_rpc_auth`.
-- `dtfs-data/src/store.rs::commit_chunk_from_tmp` — atomic commit
-  (§ A.6).
-- `dtfs-common/src/memory.rs` — CF-5 role-agnostic memory budget core
-  (`MemoryBudget`, `PressureLevel`, RSS sampler, `run_monitor`); shared by
-  all three roles.
-- `dtfs-data/src/memory.rs` — Bug G data-node rung: re-exports the common
-  core. REV-4-5 deleted `run_monitor_with_cache` and unwired `cache.rs`: the
-  in-memory ARC chunk cache had no `put` caller anywhere, so the "shrink ARC"
-  rung evicted nothing while its budget still throttled `put_chunk` slot
-  sizing. `[cache]` is parsed but inert for this role.
-- `dtfs-fuse/src/filesystem.rs` — FUSE↔cluster bridge: write leases,
-  readahead engine, local disk cache. CO-3-12: `read()` clones the
-  per-call data (path/chunk_size/volume_id/locations) out of the
-  `open_files` entry and DROPS the DashMap guard BEFORE the per-chunk
-  network loop (same idiom as `write()`/`flush()`) — never hold an
-  `open_files` guard across an `.await`, or a stalled chunk fetch
-  serializes concurrent opens of the same file. The same rule covers
-  `known_locations`: WI-09 — the post-fetch migration-hint lookup
-  (`known_locations.get(&node_addr)`) uses `.map(|r| r.clone())` so the
-  `Ref` guard drops at the end of that statement, before the migration
-  trigger runs, never across an `.await`/spawn. `migration`
-  (`MigrationTrigger`, held as `Arc<MigrationTrigger>`) is fire-and-forget:
-  `read()` calls `spawn_on_remote_read` (`tokio::spawn`, never `.await`s
-  `on_remote_read` inline) because the RPC it issues
-  (`DtfsClient::allocate_chunks`) sets no per-call deadline and retries
-  `Unavailable` for up to the 15s manager walk deadline — awaiting it
-  inline after the chunk bytes are already in hand could stall a
-  completed read for that long, while (pre-WI-09) holding the
-  `known_locations` guard above for the same window. WI-01: the write buffer
-  (`writebuf.rs`) holds back complete chunks until `write.flush_batch_chunks`
-  (default 4, clamp `1..=32`) are available before `flush()` fires, so
-  `flush_segments_to_cluster` amortizes one `AllocateChunks` +
-  `CommitChunkLocations` round trip over a batch of chunks instead of paying
-  it per chunk; `flush_all` (fsync/close) always drains held-back chunks
-  regardless of the batch state, and `flush_batch_chunks = 1` reproduces the
-  pre-WI-01 per-chunk-flush behaviour exactly. WI-01 / H1: the effective
-  batch is additionally byte-clamped (`writebuf::effective_batch_chunks`,
-  `FLUSH_BATCH_MAX_BYTES` = 64 MB) so batching can never hold more than
-  64 MB of un-committed data per open file — the dtfs-fuse ladder (A.3.2)
-  sheds readahead, not write buffers. CR-1-1: `writebuf.rs`'s
-  `FileWriteBuffer` is `BTreeMap<u32, ChunkBuf>` (per chunk index), NOT one
-  contiguous `Vec<u8>` spanning the file — `write()` splits at chunk
-  boundaries before merging, so a write below an already-flushed chunk or
-  past the resident high-water mark can never zero-fill (and later
-  re-emit as real data) a chunk it doesn't touch; a chunk whose buffered
-  range doesn't cover `0..chunk_size` is tagged `needs_seed` on the
-  emitted `ChunkSegment` instead of being gap-filled. CR-1-2: `write()`'s
-  RMW seed (`chunks_needing_seed()`) runs over EVERY chunk index the
-  write touches, including index 0 (no more `effective_offset > 0`
-  gate), and a seed-read failure propagates as an error (`?` -> EIO)
-  instead of a `warn!` that let a truncated chunk get committed; the
-  O_APPEND pre-seed in `open_with_append` runs AFTER the write lease is
-  granted and resolves the tail chunk via `chunk_at(max_idx)`, never a
-  positional index. CR-1-3: `flush()` returns `Ok(())` immediately for a
-  non-writable fh (the kernel issues FUSE flush on every close(2),
-  including read-only opens) before touching the path-keyed write
-  buffer; `release()` only drops that buffer when the fh being released
-  is writable AND no other writable fh remains open on the same path
-  (`other_writer_open()`). CR-1-4: `OpenFile.committed_any` is set on
-  every open handle sharing a path the moment `flush_segments_to_cluster`
-  first commits a chunk for it; `flush()` now ALWAYS
-  `write_buffer.restore_segments()` on a cluster-write failure (never
-  unlinks), and the F-013 ghost-unlink moved to `release()`
-  (`should_ghost_unlink(flush_failed, committed_any)`), firing only when
-  the path has NEVER committed anything — a file with any committed
-  chunk is never unlinked on a later flush failure. CR-1-5 (DATA-5 FUSE
-  half): `flush_segments_to_cluster` hashes each segment once
-  (`blake3_hex`, BLAKE3 hex digest) and sends it as the declared
-  `chunk_id` on every `write_chunk_bytes` call (previously always
-  `""`); a reply whose `chunk_id` disagrees is treated as a failed
-  replica (excluded from `successes`), never committed as a location. R2:
-  `flush_segments_to_cluster` also refuses (`segments_committable()`) to
-  commit ANY segment with `offset_in_chunk > 0` — reachable whenever the
-  RMW seed in `write()` was skipped because there was nothing cheap to
-  seed FROM (no cached `locations_snapshot`, no `chunk_at(idx)` entry, or
-  an empty `node_addresses` list; each now `warn!`s at the skip site) —
-  since the data node stores a `PutChunkRequest`'s bytes as the chunk's
-  whole content from byte 0, and a partial segment would land shifted.
-  WI-05 / B2: `read()`'s
-  foreground miss tries `readahead.join_pending()` against ONLY the FIRST
-  candidate (prefetch targets `read_candidates`' head, REV-2-3, so no other
-  key can hold a pending entry for this chunk), bounded by the fixed
-  `readahead::PREFETCH_JOIN_TIMEOUT` (2s) — deliberately NOT
-  `client.chunk_read_timeout_secs` — and refuses to wait on a prefetch that
-  has not yet acquired its `prefetch_slots` permit (still queued behind the
-  `prev_acquired` chain), returning `None` immediately in that case. A chunk
-  genuinely on the wire is JOINED rather than re-fetched with a second
-  `GetChunk` over the same link; `None` (nothing pending, not yet started,
-  prefetch failed, or 2s elapsed) falls through to the unchanged candidate
-  loop, so the P0-2 fallover budget
-  (`tests/release/cases/69-read-hung-node-fallover.sh`, `ELAPSED <= TMO*3`)
-  is untouched.
-- `dtfs-fuse/src/readahead.rs` — `ReadAheadEngine`. WI-05: prefetch fan-out
-  is bounded by a `prefetch_slots` semaphore sized from
-  `readahead.prefetch_max_inflight` (default 2) — the prefetch WINDOW stays
-  `prefetch_chunks` deep (default 8), but fetches acquire their slot chained
-  in ascending order (`spawn_prefetch`'s `prev_acquired` oneshot) so at most
-  `prefetch_max_inflight` `GetChunk` streams are ever on the wire at once,
-  nearest chunk first. The old `cache_bytes() >= max_cache_bytes` dormancy
-  gate in `spawn_prefetch` is gone. It only ever saw STORED bytes, never
-  in-flight ones, so it could not bound concurrency; and because
-  `store_in_cache` always evicts down to at most the budget, the stored
-  total lands exactly ON the budget under the shipped power-of-two defaults
-  (64 MB `readahead.cache_mb` / 4 MB `client.chunk_size_mb` = sixteen 4 MB
-  entries), which made the old `>=` gate go true and stay true from the
-  first `cache_mb` of reads onward, silently killing all further prefetch —
-  **for the default sizing only**. With ragged sizes (a file's short final
-  chunk, or a `cache_mb` not a multiple of the chunk size) the stored total
-  settles just below the budget and the old gate never fired at all, so
-  "permanently true" was never an unconditional property of
-  `store_in_cache`. Memory now stays bounded by that same byte eviction
-  (Bug CE, unchanged) plus the `prefetch_slots` in-flight cap; do NOT
-  re-add a byte gate. The CF-5 Shed rung (A.3.2) is served instead by B1's
-  `ReadAheadEngine.prefetch_enabled: Arc<AtomicBool>` (H2) — `on_chunk_read`
-  early-returns while it is false, so `drop_unconsumed()` is not undone by
-  the very next read; `ReadAheadCacheController::set_prefetch_enabled()` is
-  pinned false at Shed and true at Normal/Warn by
-  `main.rs::run_readahead_pressure_ladder`. B1: the old
-  `started_fetches: Arc<Mutex<Vec<String>>>` test-observability field
-  (pushed on every prefetch, never drained — an unbounded production heap
-  leak) is gone; `pending` now holds `PendingPrefetch { handle, done:
-  watch::Receiver<bool>, started: Arc<AtomicBool> }`, where `started` is set
-  true by the prefetch task the instant it acquires its `prefetch_slots`
-  permit (genuinely on the wire), letting both a test and `join_pending()`
-  (B2, see the `filesystem.rs` entry above) distinguish a fetch actually in
-  flight from one still queued behind the `prev_acquired` chain, with the
-  flag's lifetime bounded by the pending entry rather than by uptime.
-- `dtfs-fuse/src/fuse_adapter.rs` — fuse3 trait impl; cookie scheme at
-  `dir_entry_cookie()` — don't diverge readdir/readdirplus (Bug F).
-  CO-4-16: metadata ops map cluster errors via `cluster_err_to_errno` —
-  ENOENT ONLY for a genuine gRPC `NotFound`, EIO for transient/unknown
-  (manager outage, election, timeout). Mapping a blip to ENOENT makes Plex
-  drop the library entry. New error-returning op? Route it through the
-  helper, never a bare `Err(_) => ENOENT`. CR-1-6 extended this to
-  `readdir`/`readdirplus` (were a bare `|_| ENOENT`) and to
-  `mkdir`/`unlink`/`rmdir`/`create`/`rename`/`symlink`/`link` (were a
-  bare `EIO`) — every metadata op's error arm now goes through
-  `cluster_err_to_errno`.
-- `dtfs-common/build.rs` + `src/version.rs` — VERSION (default
-  `v0.0.0-dev`, overridable via `DTFS_VERSION`) + BUILD_DATE (§ A.3.5);
-  every binary reports these via RegisterNode.
-- `dtfs-cli/src/updater.rs` — `dtfs-cli update <target>` (download →
-  sha256-verify vs MANIFEST → atomic install → restart) + the
-  `[updater]` config; local-node only. Pairs with the release builder.
-- `scripts/dtfs-release.sh` — release builder: stamps `DTFS_VERSION`,
-  builds via `dtfs-build.sh`, assembles the fixed-name
-  `dtfs-linux-amd64.tar.gz` + `SHA256SUMS`, prints/`--publish`es
-  `gh release create --generate-notes`.
-- `dtfs-common/src/tls.rs` — CF-6 `TlsContext`: resolves each role's
-  `[tls]` block once at startup (auto/require/disabled; default stays
-  plaintext for back-compat) and builds every tonic server/client TLS
-  config + scheme-aware endpoint. ALL gRPC listeners and connects (manager,
-  data, raft peers, FUSE via `DtfsClient::set_tls`) route through it; mixed
-  TLS state partitions the cluster, so enable only cluster-wide
-  (docs/src/security/tls.md rollout). `TlsContext::connect` applies a 3s
-  `CONNECT_TIMEOUT` (LIS-77 / BR-1) so blackhole peers fail fast; Raft
-  still uses `endpoint()` + its own timeout chain.
-- `plans/active/` — in-flight plans (see plans/README.md).
-- `tests/proxmox/abuse/` — numbered shell regression tests.
+Full narrative (bug/task-ID reasoning behind each row) moved to `docs/src/internals/invariants.md` § A.8; this table is the load-bearing summary.
+
+| File | Responsibility |
+|---|---|
+| `dtfs-raft/src/state_machine.rs` | `apply_request`, the authoritative state-mutation point |
+| `dtfs-raft/src/lib.rs::ClientRequest` | Command enum; new mutation = new variant + arm |
+| `dtfs-raft/src/network.rs::full_snapshot` | Snapshot-stream RPC; unreachable-vs-storage error mapping (Bug CL), bounded in-flight sends (CNF-4) |
+| `dtfs-manager/src/scheduler.rs` | Migration/re-replication loop, SOLE owner of replica repair; leader-gated, bounded, Raft-remove-before-byte-delete |
+| `dtfs-manager/src/monitor.rs` | Heartbeat health detection only (Bug CH); MUST NOT schedule repair; leader-gated (Bug CM) |
+| `dtfs-manager/src/metadata.rs` | ManagerService gRPC over `raft_write`; follower writes forward with HMAC; LIS-56 auth |
+| `dtfs-manager/src/api.rs` | REST endpoints; LIS-18 auth; effective-config merge; decommission refuses while replicas remain |
+| `dtfs-manager/src/rest_auth.rs` | LIS-18 mutation-auth check + axum middleware |
+| `dtfs-manager/src/membership.rs` | CF-2 online raft membership validation |
+| `dtfs-manager/src/join.rs` | Two-phase data-node join (HMAC handshake); node_id derived server-side |
+| `dtfs-manager/src/webui.rs` | Embedded SPA; LIS-35 mutating POSTs carry the shared secret |
+| `dtfs-data/src/server.rs::put_chunk` | Streaming put path; LIS-19/55/83 auth gates all data-plane RPCs |
+| `dtfs-data/src/replication.rs::replicate_to` | Push-replication engine; timeout sized from chunk bytes |
+| `dtfs-common/src/replication.rs` | Shared manager/data-node replication-deadline helpers |
+| `dtfs-common/src/crypto.rs` | Join HMAC + data-rpc/mgr-rpc stamp/verify |
+| `dtfs-data/src/store.rs::commit_chunk_from_tmp` | Atomic commit (§ A.6) |
+| `dtfs-common/src/memory.rs` | CF-5 role-agnostic memory budget core |
+| `dtfs-data/src/memory.rs` | Data-node rung; `[cache]` is parsed but inert (REV-4-5) |
+| `dtfs-fuse/src/filesystem.rs` | FUSE↔cluster bridge; await-guard + write-batching rules in `.claude/rules/fuse.md` |
+| `dtfs-fuse/src/readahead.rs` | `ReadAheadEngine`; prefetch bound + Shed-rung, `.claude/rules/fuse.md` |
+| `dtfs-fuse/src/fuse_adapter.rs` | fuse3 trait impl; every op error routes through `cluster_err_to_errno` |
+| `dtfs-common/build.rs` + `src/version.rs` | `VERSION`/`BUILD_DATE` stamps (§ A.3.5) |
+| `dtfs-cli/src/updater.rs` | `dtfs-cli update` — download, verify, atomic install, restart |
+| `scripts/dtfs-release.sh` | Release builder; stamps version, assembles tarball, prints `gh release create` |
+| `dtfs-common/src/tls.rs` | CF-6 `TlsContext`; all gRPC routes through it; enable only cluster-wide |
+| `plans/active/` | In-flight plans (`plans/README.md`) |
+| `tests/proxmox/abuse/` | Numbered shell regression tests |
 
 ---
 
@@ -829,73 +156,33 @@ otherwise Raft heartbeats fail under jitter and the cluster can't elect.
 
 ## B.1 How a change lands
 
-1. Reproduce / locate. 2. Write the failing test in the purest layer that
-shows it (pure helper > state-machine apply > manager aggregator > FUSE
-helper > shell case). 3. Smallest fix that turns it green, no bundled
-cleanup. 4. `cargo test -p <crate> --release` in the build env, plus the
-full workspace suite before anything is deployed. 5. Commit.
-
-Default: commit straight to `master`. Use a branch only if the change
-touches a wire or on-disk format (`proto/*.proto`, `ClientRequest`,
-`apply_request`, any `#[serde]`-persisted struct), touches > 6 files, or
-spans more than one session. Open a PR only when the change needs a
-release-note line (`bug:` / `feat:` subjects; label it).
+Reproduce/locate → failing test in the purest layer (pure helper > state-machine apply > manager aggregator > FUSE helper > shell case) → smallest fix → `cargo test -p <crate> --release` + full workspace suite → commit to `master`. Branch only for a wire/on-disk format change (`proto/*.proto`, `ClientRequest`, `apply_request`, `#[serde]`-persisted structs), >6 files, or multi-session work; PR only for a release-note line (`bug:`/`feat:` subjects, labeled).
 
 ## B.2 Plans
 
-Write `plans/active/PLAN-<id>-<short-name>.md` when the work has ≥ 3
-tasks, spans sessions, or crosses crates — otherwise use the session todo
-list. Template and rules: `plans/README.md`. The plan is the source of
-truth; when reality diverges, record it under Deviations before
-continuing. Delete the file when every task is done — git keeps it.
+`plans/active/PLAN-<id>-<short-name>.md` (template: `plans/README.md`) for ≥3-task/multi-session/cross-crate work, else the session todo list. Record divergence under Deviations; delete when done.
 
 ## B.3 Commits
 
 ```
 <type or task-id>: <summary ≤72 chars>
 
-What changed, which test covers it, the failing→passing output, any
-deviation from the plan.
+What changed, which test covers it, failing->passing output, deviation.
 
 Plan: <path> (<task-id>)        # only when a plan file exists
 Co-Authored-By: <model> <noreply@<vendor>.com>
 ```
 
-`<type>` is `bug` / `feat` / `int` and becomes the release-note line
-(`git-cliff`, `.github/cliff.toml`; a `Breaking:` or `Update-required:`
-trailer routes a commit into those sections). One commit per task; doc
-updates ride with the code. Never `--no-verify`, never `--amend` a pushed
-commit, never bypass signing.
+`<type>` is `bug`/`feat`/`int`, becomes the release-note line via `git-cliff`/`.github/cliff.toml` (`Breaking:`/`Update-required:` trailers route sections). One commit per task. Never `--no-verify`, never `--amend` a pushed commit, never bypass signing.
 
 ## B.4 Tests
 
-Observe fail → implement → observe pass → full crate suite. New
-durability/anchor invariants get a property-style test over random op
-sequences. Every change with cluster-visible behaviour also ships a case
-under `tests/release/cases/NN-name.sh` in the same commit (rules:
-`tests/release/README.md`); a pure internal refactor may skip it with a
-`Release-case: none (<reason>)` trailer. A commit hook enforces this.
+Observe fail → implement → observe pass → full crate suite (new durability/anchor invariants: a property-style test over random ops). Cluster-visible behaviour ships a `tests/release/cases/NN-name.sh` in the same commit (`tests/release/README.md`), or a `Release-case: none (<reason>)` trailer — a commit hook enforces this.
 
 ## B.5 Where things live
 
-`plans/active/` in-flight plans · `plans/reports/` scans and reviews ·
-`docs/src/` operator + architecture reference (bug-archaeology narratives
-in `docs/src/internals/invariants.md`) · `crates/<crate>/src/` code ·
-`proto/` wire · `tests/release/cases/` release gate ·
-`tests/proxmox/abuse/` lab tests · `scripts/` operator scripts ·
-`deploy/examples/*.toml` canonical configs · `.claude/agents/` agent
-roster · `.claude/rules/` path-scoped invariants (A.6 integrity, FUSE
-memory ladder, config-surface sync). No root status files, no loose `.md`
-under `crates/` or `tests/`, no in-repo changelog.
-
-Config-surface sync: any change to `dtfs-common/src/config.rs` updates
-`deploy/examples/*.toml` and `docs/src/configuration/*` in the same
-commit (`example_*_toml_parses` gates the first; full rule:
-`.claude/rules/config-surface.md`).
+`plans/{active,reports}/` · `docs/src/` (archaeology: `docs/src/internals/invariants.md`) · `crates/<crate>/src/` · `proto/` · `tests/release/cases/` · `tests/proxmox/abuse/` · `scripts/` · `deploy/examples/*.toml` · `.claude/{agents,rules}/`. No root status files, no loose `.md` under `crates/`/`tests/`, no in-repo changelog. Config-surface sync (`.claude/rules/config-surface.md`): `dtfs-common/src/config.rs` changes update the examples + docs together.
 
 ## B.6 Updating this file
 
-Behaviour change visible to an operator, an agent, or the data plane →
-update AGENTS.md in the same commit, and say "AGENTS.md updated" or "no
-change needed because …" in the body. If a session instruction overrode a
-rule here, fold the resolution in.
+A behaviour change visible to an operator, agent, or the data plane updates AGENTS.md in the same commit (say so, or why not); fold in any session instruction that overrode a rule here.
