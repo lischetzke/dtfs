@@ -260,6 +260,25 @@ enum VolumesCmd {
         #[arg(long)]
         required_tier: Option<String>,
     },
+    /// UIP-3-2 — set or update the volume's spill policy (Bug BZ:
+    /// which tiers/datacenters a chunk may spill onto beyond its
+    /// mandatory placement). Every flag is optional; omitted flags
+    /// keep the current value.
+    SetSpill {
+        /// Volume id to update.
+        volume_id: String,
+        /// Whether spill is allowed at all. Default keep current.
+        #[arg(long)]
+        allow: Option<bool>,
+        /// Tiers spill must never land on. Comma-separated;
+        /// an empty list clears the exclusion. Default keep current.
+        #[arg(long, value_delimiter = ',')]
+        forbidden_tiers: Option<Vec<String>>,
+        /// Datacenters spill must never land on. Comma-separated;
+        /// an empty list clears the exclusion. Default keep current.
+        #[arg(long, value_delimiter = ',')]
+        forbidden_datacenters: Option<Vec<String>>,
+    },
 }
 
 /// Bug AV (AV-3-5) — file-level commands. The legacy
@@ -475,6 +494,15 @@ async fn main() -> anyhow::Result<()> {
                 cmd_volumes_set_anchor(
                     &api, &args.format, &volume_id,
                     datacenter, required_tier,
+                ).await?
+            }
+            VolumesCmd::SetSpill {
+                volume_id,
+                allow, forbidden_tiers, forbidden_datacenters,
+            } => {
+                cmd_volumes_set_spill(
+                    &api, &args.format, &volume_id,
+                    allow, forbidden_tiers, forbidden_datacenters,
                 ).await?
             }
         },
@@ -990,6 +1018,44 @@ async fn cmd_volumes_set_anchor(
     Ok(())
 }
 
+/// UIP-3-2 — `dtfs-cli volumes set-spill <id> [--allow BOOL]
+/// [--forbidden-tiers a,b] [--forbidden-datacenters a,b]`: patch the
+/// volume's spill policy. Only supplied flags are merged; others
+/// keep current values.
+async fn cmd_volumes_set_spill(
+    api: &ApiClient,
+    format: &OutputFormat,
+    volume_id: &str,
+    allow: Option<bool>,
+    forbidden_tiers: Option<Vec<String>>,
+    forbidden_datacenters: Option<Vec<String>>,
+) -> anyhow::Result<()> {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = allow { body.insert("allow".into(), v.into()); }
+    if let Some(v) = forbidden_tiers { body.insert("forbidden_tiers".into(), v.into()); }
+    if let Some(v) = forbidden_datacenters { body.insert("forbidden_datacenters".into(), v.into()); }
+    let body = serde_json::Value::Object(body);
+
+    let url = format!("/api/v1/volumes/{}/set-spill", volume_id);
+    let resp = api.post(&url, &body).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => {
+            let changed = resp["changed"].as_bool().unwrap_or(false);
+            let s = &resp["config"]["spill"];
+            println!(
+                "Volume '{}' set-spill: {}",
+                volume_id,
+                if changed { "applied" } else { "no-op" },
+            );
+            println!("  allow:                  {}", s["allow"].as_bool().unwrap_or(true));
+            println!("  forbidden_tiers:        {:?}", s["forbidden_tiers"]);
+            println!("  forbidden_datacenters:  {:?}", s["forbidden_datacenters"]);
+        }
+    }
+    Ok(())
+}
+
 /// AV-3-5 — `dtfs-cli files flush-cache <path> [--cache-tiers warm,hot]`:
 /// drop cache replicas under a path prefix. Thin wrapper over
 /// `POST /api/v1/files/flush_cache` (AV-1-9).
@@ -1452,6 +1518,32 @@ mod audit_co_tests {
                 assert_eq!(required_tier, None);
             }
             other => panic!("expected VolumesCmd::SetAnchor, got {other:?}"),
+        }
+    }
+
+    // UIP-3-2 — `volumes set-spill <id> --allow true --forbidden-tiers
+    // hot,warm` parses into the expected variant/fields, including
+    // comma-delimited list splitting.
+    #[test]
+    fn uip_3_2_volumes_set_spill_parses() {
+        let args = Args::try_parse_from([
+            "dtfs-cli", "volumes", "set-spill", "default",
+            "--allow", "true", "--forbidden-tiers", "hot,warm",
+        ])
+        .expect("set-spill should parse");
+        match args.command {
+            Commands::Volumes(VolumesCmd::SetSpill {
+                volume_id,
+                allow,
+                forbidden_tiers,
+                forbidden_datacenters,
+            }) => {
+                assert_eq!(volume_id, "default");
+                assert_eq!(allow, Some(true));
+                assert_eq!(forbidden_tiers, Some(vec!["hot".to_string(), "warm".to_string()]));
+                assert_eq!(forbidden_datacenters, None);
+            }
+            other => panic!("expected VolumesCmd::SetSpill, got {other:?}"),
         }
     }
 }

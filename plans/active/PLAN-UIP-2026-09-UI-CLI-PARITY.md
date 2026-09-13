@@ -141,7 +141,7 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
 
 | ID | Files | Sketch | Test | Done when | Status |
 |---|---|---|---|---|---|
-| UIP-1-1 | `crates/dtfs-manager/src/webui.rs` | Replace the "No volumes yet… `dtfs-cli volume create`" placeholder (webui.rs:2196) with a create-volume modal (name, chunk_size_mb, replication_hot/warm/cold, anchor_datacenter fields) that POSTs `CreateVolumeRequest` to `/api/v1/volumes` via `mutateFetch`, then re-renders the volumes table. | `#[cfg(test)]` `html.contains(...)` on `render_dashboard(...)` output: asserts the new modal markup exists and the placeholder string is gone; anti-inline-POST test (webui.rs:3488) still passes. | Volumes page shows a working "Create volume" button/modal; no volumes-page text references `dtfs-cli` for creation. | ⬜ |
+| UIP-1-1 | `crates/dtfs-manager/src/webui.rs` | Replace the "No volumes yet… `dtfs-cli volume create`" placeholder (webui.rs:2196) with a create-volume modal (name, chunk_size_mb, replication_hot/warm/cold, anchor_datacenter fields) that POSTs `CreateVolumeRequest` to `/api/v1/volumes` via `mutateFetch`, then re-renders the volumes table. | `#[cfg(test)]` `html.contains(...)` on `render_dashboard(...)` output: asserts the new modal markup exists and the placeholder string is gone; anti-inline-POST test (webui.rs:3488) still passes. | Volumes page shows a working "Create volume" button/modal; no volumes-page text references `dtfs-cli` for creation. | ✅ |
 | UIP-1-2 | `crates/dtfs-manager/src/webui.rs` | Add a "Write safety" section to the volume-edit modal (webui.rs:704-830, `openVolumeEdit`/`submitVolumeEdit` at 2264-2406): two fields (`min_replicas_before_ack`, `write_timeout_secs`), prefilled from `v.write_safety`, posted via the same `post(suffix, body)` helper (webui.rs:2372) to `set-write-safety` only when the operator touched a field. | `html.contains` test asserting the new field ids (`ve-write-safety-*` or similar) exist in the modal markup. | Editing a volume can change `min_replicas_before_ack`/`write_timeout_secs` from the webui without the CLI. | ⬜ |
 | UIP-1-3 | `crates/dtfs-manager/src/webui.rs` | Add a "Migrate policy" action button next to (or inside) the volume-edit modal that POSTs (no body) to `/volumes/{id}/migrate-policy` via `mutateFetch` and shows the returned `status`/`config` summary — this is a one-shot action, not a modal field, since the endpoint takes no request body. | `html.contains` test asserting the button markup and its `mutateFetch('/api/v1/volumes/.../migrate-policy'` call target exist. | An operator can run Bug AV's legacy→mandatory migration from the webui. | ⬜ |
 
@@ -160,7 +160,7 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
 | ID | Files | Sketch | Test | Done when | Status |
 |---|---|---|---|---|---|
 | UIP-3-1 | `crates/dtfs-cli/src/main.rs` | Add `VolumesCmd::SetAnchor { volume_id, #[arg(long)] datacenter: Option<String>, #[arg(long)] required_tier: Option<String> }`; handler builds a `serde_json::Map` (pattern at main.rs:795-810) and `api.post(format!("/api/v1/volumes/{}/set-anchor", volume_id), &body)`. | `#[cfg(test)]` `Args::try_parse_from(["dtfs-cli","volumes","set-anchor","default","--datacenter","leli"])` parses into the expected variant/fields (pattern at main.rs:1359-1368). | `dtfs-cli volumes set-anchor <id> [--datacenter D] [--required-tier T]` round-trips against the existing endpoint. | ✅ |
-| UIP-3-2 | `crates/dtfs-cli/src/main.rs` | Add `VolumesCmd::SetSpill { volume_id, #[arg(long)] allow: Option<bool>, #[arg(long, value_delimiter=',')] forbidden_tiers: Option<Vec<String>>, #[arg(long, value_delimiter=',')] forbidden_datacenters: Option<Vec<String>> }`; same POST-body pattern as UIP-3-1. | `try_parse_from` test covering `--allow true --forbidden-tiers hot,warm`. | `dtfs-cli volumes set-spill` exercises the endpoint. | ⬜ |
+| UIP-3-2 | `crates/dtfs-cli/src/main.rs` | Add `VolumesCmd::SetSpill { volume_id, #[arg(long)] allow: Option<bool>, #[arg(long, value_delimiter=',')] forbidden_tiers: Option<Vec<String>>, #[arg(long, value_delimiter=',')] forbidden_datacenters: Option<Vec<String>> }`; same POST-body pattern as UIP-3-1. | `try_parse_from` test covering `--allow true --forbidden-tiers hot,warm`. | `dtfs-cli volumes set-spill` exercises the endpoint. | ✅ |
 | UIP-3-3 | `crates/dtfs-cli/src/main.rs` | Add `VolumesCmd::SetSchedules { volume_id, #[arg(long)] scrub_interval_secs: Option<u64>, #[arg(long)] fsck_interval_secs: Option<u64>, #[arg(long)] clear_unspecified: bool }` (skip `custom` — no other CLI command exposes an arbitrary BTreeMap flag; document as JSON-only via webui/direct API for now). POST to `set-schedules`; surface the server's `>= 60 or 0` validation error verbatim on 400. | `try_parse_from` test covering the interval flags plus a rejected `--scrub-interval-secs 5` (parses fine at the CLI layer; server 400 is exercised only by the existing REST test, not re-tested here). | `dtfs-cli volumes set-schedules` matches the webui's AZ-1 modal capability. | ⬜ |
 
 ### Group 4 — dtfs-cli nodes lifecycle + migrations
@@ -220,6 +220,12 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
 
 - UIP-3-1: `cargo test -p dtfs-cli --release` (Docker buildenv) — before:
   12 passed; after: 13 passed (new `uip_3_1_volumes_set_anchor_parses`).
+- UIP-3-2: `cargo test -p dtfs-cli --release` (Docker buildenv) — before:
+  13 passed; after: 14 passed (new `uip_3_2_volumes_set_spill_parses`).
+- UIP-1-1: `cargo test -p dtfs-manager --release webui` (Docker buildenv) —
+  before: 13 passed; after: 15 passed (new
+  `create_volume_modal_tests::create_volume_modal_present_and_wired_through_mutate_fetch`,
+  `create_volume_modal_tests::old_cli_creation_placeholder_is_gone`).
 
 ## Deviations
 
