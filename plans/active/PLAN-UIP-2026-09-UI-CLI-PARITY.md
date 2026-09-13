@@ -142,7 +142,7 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
 | ID | Files | Sketch | Test | Done when | Status |
 |---|---|---|---|---|---|
 | UIP-1-1 | `crates/dtfs-manager/src/webui.rs` | Replace the "No volumes yet… `dtfs-cli volume create`" placeholder (webui.rs:2196) with a create-volume modal (name, chunk_size_mb, replication_hot/warm/cold, anchor_datacenter fields) that POSTs `CreateVolumeRequest` to `/api/v1/volumes` via `mutateFetch`, then re-renders the volumes table. | `#[cfg(test)]` `html.contains(...)` on `render_dashboard(...)` output: asserts the new modal markup exists and the placeholder string is gone; anti-inline-POST test (webui.rs:3488) still passes. | Volumes page shows a working "Create volume" button/modal; no volumes-page text references `dtfs-cli` for creation. | ✅ |
-| UIP-1-2 | `crates/dtfs-manager/src/webui.rs` | Add a "Write safety" section to the volume-edit modal (webui.rs:704-830, `openVolumeEdit`/`submitVolumeEdit` at 2264-2406): two fields (`min_replicas_before_ack`, `write_timeout_secs`), prefilled from `v.write_safety`, posted via the same `post(suffix, body)` helper (webui.rs:2372) to `set-write-safety` only when the operator touched a field. | `html.contains` test asserting the new field ids (`ve-write-safety-*` or similar) exist in the modal markup. | Editing a volume can change `min_replicas_before_ack`/`write_timeout_secs` from the webui without the CLI. | ⬜ |
+| UIP-1-2 | `crates/dtfs-manager/src/webui.rs` | Add a "Write safety" section to the volume-edit modal (webui.rs:704-830, `openVolumeEdit`/`submitVolumeEdit` at 2264-2406): two fields (`min_replicas_before_ack`, `write_timeout_secs`), prefilled from `v.write_safety`, posted via the same `post(suffix, body)` helper (webui.rs:2372) to `set-write-safety` only when the operator touched a field. | `html.contains` test asserting the new field ids (`ve-write-safety-*` or similar) exist in the modal markup. | Editing a volume can change `min_replicas_before_ack`/`write_timeout_secs` from the webui without the CLI. | ✅ |
 | UIP-1-3 | `crates/dtfs-manager/src/webui.rs` | Add a "Migrate policy" action button next to (or inside) the volume-edit modal that POSTs (no body) to `/volumes/{id}/migrate-policy` via `mutateFetch` and shows the returned `status`/`config` summary — this is a one-shot action, not a modal field, since the endpoint takes no request body. | `html.contains` test asserting the button markup and its `mutateFetch('/api/v1/volumes/.../migrate-policy'` call target exist. | An operator can run Bug AV's legacy→mandatory migration from the webui. | ⬜ |
 
 ### Group 2 — webui scrub, health, raft, decommission
@@ -230,6 +230,9 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
   `create_volume_modal_tests::old_cli_creation_placeholder_is_gone`).
 - UIP-4-1: `cargo test -p dtfs-cli --release` (Docker buildenv) — before:
   15 passed; after: 16 passed (new `uip_4_1_unquarantine_parses`).
+- UIP-1-2: `cargo test -p dtfs-manager --release webui` (Docker buildenv) —
+  before: 15 passed; after: 16 passed (new
+  `bug_bk_scrub_tests::volume_modal_edits_write_safety`).
 
 ## Deviations
 

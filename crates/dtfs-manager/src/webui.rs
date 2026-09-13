@@ -749,8 +749,9 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         <h3>Edit volume policy</h3>
         <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:1rem">
             Edits mandatory replicas (<code>set-mandatory</code>), the anchor
-            policy (<code>set-anchor</code>) and cache replicas
-            (<code>set-cache</code>). Empty fields are left unchanged; each
+            policy (<code>set-anchor</code>), cache replicas
+            (<code>set-cache</code>) and write safety
+            (<code>set-write-safety</code>). Empty fields are left unchanged; each
             section posts only when you change it. Server-side validation
             (e.g. unsatisfiable tape / anchor) is shown below.
         </div>
@@ -862,6 +863,15 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         <div class="modal-row">
             <label>cooldown_secs</label>
             <input id="ve-cooldown" class="form-input" type="number" min="0" step="1">
+        </div>
+        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Write safety</div>
+        <div class="modal-row">
+            <label>min_replicas_before_ack</label>
+            <input id="ve-write-safety-min-replicas" class="form-input" type="number" min="1" step="1">
+        </div>
+        <div class="modal-row">
+            <label>write_timeout_secs</label>
+            <input id="ve-write-safety-timeout" class="form-input" type="number" min="1" step="1">
         </div>
         <div class="modal-actions">
             <button class="btn-secondary" onclick="closeVolumeEdit()">Cancel</button>
@@ -2408,6 +2418,16 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             document.getElementById('ve-spill-forbid-tape').checked = ft.includes('tape');
             document.getElementById('ve-spill-forbid-dcs').value =
                 (sp.forbidden_datacenters || []).join(', ');
+            // prefill write safety; remember the prefilled strings so
+            // submit only posts a field the operator actually edited
+            // (never silently reasserts/resets an untouched value).
+            const ws = v.write_safety || {{}};
+            const wsMinEl = document.getElementById('ve-write-safety-min-replicas');
+            const wsTimeoutEl = document.getElementById('ve-write-safety-timeout');
+            wsMinEl.value = (ws.min_replicas_before_ack != null) ? ws.min_replicas_before_ack : '';
+            wsTimeoutEl.value = (ws.write_timeout_secs != null) ? ws.write_timeout_secs : '';
+            wsMinEl.dataset.orig = wsMinEl.value;
+            wsTimeoutEl.dataset.orig = wsTimeoutEl.value;
         }}
         document.getElementById('ve-result').style.display = 'none';
         document.getElementById('volume-edit-modal').classList.remove('hidden');
@@ -2469,6 +2489,19 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             forbidden_tiers: forbidTiers,
             forbidden_datacenters: forbidDcs,
         }};
+        // write safety: only include a field the operator actually
+        // changed from what was prefilled — these fields always carry
+        // a concrete current value (never blank), so an unconditional
+        // post would silently reassert/reset them on every save.
+        const wsMinEl = document.getElementById('ve-write-safety-min-replicas');
+        const wsTimeoutEl = document.getElementById('ve-write-safety-timeout');
+        const writeSafetyBody = {{}};
+        if (wsMinEl.value.trim() !== (wsMinEl.dataset.orig || '')) {{
+            writeSafetyBody.min_replicas_before_ack = intOrNull('ve-write-safety-min-replicas');
+        }}
+        if (wsTimeoutEl.value.trim() !== (wsTimeoutEl.dataset.orig || '')) {{
+            writeSafetyBody.write_timeout_secs = intOrNull('ve-write-safety-timeout');
+        }}
 
         const btn = document.getElementById('ve-submit');
         btn.disabled = true; btn.textContent = 'Applying…';
@@ -2506,6 +2539,9 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         // post spill policy when the operator set anything.
         if (spillBody.allow !== null || forbidTiers.length > 0 || forbidDcs.length > 0) {{
             lines.push(await post('set-spill', spillBody));
+        }}
+        if (Object.keys(writeSafetyBody).length > 0) {{
+            lines.push(await post('set-write-safety', writeSafetyBody));
         }}
         lines.push(await post('set-cache', cacheBody));
 
@@ -3490,6 +3526,26 @@ mod bug_bk_scrub_tests {
             assert!(html.contains(id), "modal must contain spill control {id}");
         }
         assert!(html.contains("post('set-spill'"), "submit posts set-spill");
+    }
+
+    /// UIP-1-2 — the volume-edit modal exposes a write-safety section
+    /// (min_replicas_before_ack + write_timeout_secs) and the submit
+    /// posts to set-write-safety only when one of those fields was
+    /// actually touched by the operator.
+    #[test]
+    fn volume_modal_edits_write_safety() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        for id in ["ve-write-safety-min-replicas", "ve-write-safety-timeout"] {
+            assert!(html.contains(id), "modal must contain write-safety input {id}");
+        }
+        assert!(
+            html.contains("post('set-write-safety'"),
+            "submit posts set-write-safety"
+        );
+        assert!(
+            html.contains("wsMinEl.dataset.orig"),
+            "write-safety fields must be tracked against their prefilled value"
+        );
     }
 
     /// Home Production Signals strip: real API fields only so operators
