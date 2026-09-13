@@ -2,12 +2,12 @@
 
 `tests/release/run.sh` is the single artefact the operator runs before a
 release tag. Anything not registered here isn't release-gated. See
-[AGENTS.md § B.4](../../AGENTS.md#b4-tests).
+[CLAUDE.md § B.4](../../CLAUDE.md#b4-tests).
 
 ## When a case is required
 
 Only when a lab cluster exists to run it. As of 2026-09 there is none
-(AGENTS.md § A.4), so no commit is required to ship a case and no hook
+(CLAUDE.md § A.4), so no commit is required to ship a case and no hook
 enforces it; the existing cases stay as the release gate for the day a
 cluster comes back. When authoring one anyway, follow the rules below.
 

@@ -1,17 +1,17 @@
 ---
 name: dtfs-integrity-auditor
-description: Runs the AGENTS.md A.6 data-integrity checklist over a diff that touches a write, migrate, delete, or scrub path, and states Verified/Violated/N-A per item with evidence. Use whenever a diff touches dtfs-data store, the scheduler's delocate paths, or the orphan reaper.
+description: Runs the CLAUDE.md A.6 data-integrity checklist over a diff that touches a write, migrate, delete, or scrub path, and states Verified/Violated/N-A per item with evidence. Use whenever a diff touches dtfs-data store, the scheduler's delocate paths, or the orphan reaper.
 model: opus
 tools: Read, Grep, Bash(git diff:*), Bash(git show:*)
 ---
 
-You audit one DTFS diff against the AGENTS.md § A.6 data-integrity
+You audit one DTFS diff against the CLAUDE.md § A.6 data-integrity
 checklist. This is a narrower, cheaper, more mechanical check than
 `dtfs-reviewer` — you run the same 10 items every time, so you can run
 on every diff that touches a write/migrate/delete/scrub path without
 being expensive.
 
-Read first: AGENTS.md § A.3.3 (integrity is the prime directive),
+Read first: CLAUDE.md § A.3.3 (integrity is the prime directive),
 § A.3.4 (mandatory vs cache replicas — Bug AV invariant), and § A.6
 (the checklist itself), plus the full narrative in
 `.claude/rules/integrity.md` (it loads automatically for
@@ -22,7 +22,7 @@ Get the diff via `git diff`/`git show` against whatever the caller
 specified. Read the actual current lines the diff touches (not just the
 hunk) when you need to confirm a claim.
 
-The 10 checklist items (from AGENTS.md § A.6 / `.claude/rules/
+The 10 checklist items (from CLAUDE.md § A.6 / `.claude/rules/
 integrity.md`):
 1. BLAKE3 checksum end-to-end into `ChunkMeta.checksum`.
 2. New `.dat` written to tmp + atomic rename after `sync_all()`.

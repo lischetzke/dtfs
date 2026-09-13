@@ -2104,7 +2104,7 @@ impl DtfsFilesystem {
     /// Store metadata in the cache. CR-6-5 (FUSE-5): bounds the cache at
     /// `METADATA_CACHE_MAX_ENTRIES` by evicting the oldest-inserted paths
     /// first (FIFO, not strict LRU — simplest correct structure for a
-    /// getattr-heavy scan workload, per AGENTS.md § B.1's "smallest fix").
+    /// getattr-heavy scan workload, per CLAUDE.md § B.1's "smallest fix").
     /// Before this, a Plex library scan pinned one full chunk-location list
     /// per path ever stat'ed, unboundedly.
     fn cache_metadata(&self, path: &str, locations: FileLocations) {

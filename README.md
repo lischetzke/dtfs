@@ -35,24 +35,24 @@ Full table of contents: [`docs/src/SUMMARY.md`](docs/src/SUMMARY.md).
 - `docs/` — mdBook documentation source
 - `plans/` — active work plans (see [plans/README.md](plans/README.md))
 - `tests/` — integration, chaos, performance, and lab harness
-- [`AGENTS.md`](AGENTS.md) — canonical guide for contributors and AI agents (Part A: codebase knowledge — architecture, integrity invariants, memory model; Part B: operating discipline)
-- [`CLAUDE.md`](CLAUDE.md) — single-line `@AGENTS.md` import shim for Claude Code (do not add content here)
+- [`CLAUDE.md`](CLAUDE.md) — canonical guide for contributors and AI agents (Part A: codebase knowledge — architecture, integrity invariants, memory model; Part B: operating discipline)
+- [`CLAUDE.md`](CLAUDE.md) — loaded by Claude Code at session start (do not duplicate it elsewhere)
 
-The authoritative table of *where each kind of artefact lives* is in [AGENTS.md § Structure Discipline](AGENTS.md#b6-structure-discipline). Read that before adding a file at a new path.
+The authoritative table of *where each kind of artefact lives* is in [CLAUDE.md § Structure Discipline](CLAUDE.md#b6-structure-discipline). Read that before adding a file at a new path.
 
 ## Contribution
 
-Contributions are welcome. **Every fix must come with a working test case that demonstrates the bug and proves the fix is correct.** The procedure is defined in [AGENTS.md § Fixing Procedure](AGENTS.md#b1-fixing-procedure):
+Contributions are welcome. **Every fix must come with a working test case that demonstrates the bug and proves the fix is correct.** The procedure is defined in [CLAUDE.md § Fixing Procedure](CLAUDE.md#b1-fixing-procedure):
 
 1. Write a test that fails because of the issue.
 2. Implement the fix.
 3. Verify the test now passes (and that existing tests still pass).
 
-Before any non-trivial change, read [AGENTS.md](AGENTS.md) — it is the single source of truth for both the codebase (Part A: architecture, invariants, file map) and the operating discipline (Part B: fixing procedure, plan-driven workflow, commit/test discipline). For style, PR process, and where things live, see the [Contribution Guide](docs/src/development/contributing.md).
+Before any non-trivial change, read [CLAUDE.md](CLAUDE.md) — it is the single source of truth for both the codebase (Part A: architecture, invariants, file map) and the operating discipline (Part B: fixing procedure, plan-driven workflow, commit/test discipline). For style, PR process, and where things live, see the [Contribution Guide](docs/src/development/contributing.md).
 
 ## Use of AI
 
-AI is allowed and encouraged on this project. DTFS is **primarily authored by Claude Opus**. Any AI agent — and any human using one — contributing code or docs **must follow every rule defined in [AGENTS.md](AGENTS.md)**, including the fixing procedure above, the plan-driven workflow, and the commit / test discipline.
+AI is allowed and encouraged on this project. DTFS is **primarily authored by Claude Opus**. Any AI agent — and any human using one — contributing code or docs **must follow every rule defined in [CLAUDE.md](CLAUDE.md)**, including the fixing procedure above, the plan-driven workflow, and the commit / test discipline.
 
 ## License
 

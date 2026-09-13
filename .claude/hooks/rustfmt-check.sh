@@ -3,7 +3,7 @@
 #
 # PostToolUse hook on Edit|Write. Advisory only: for an edited
 # crates/**/*.rs file, runs `rustfmt --check --edition 2021` inside the
-# dtfs-buildenv Docker image (AGENTS.md A.4) and prints the diff if it's
+# dtfs-buildenv Docker image (CLAUDE.md A.4) and prints the diff if it's
 # not clean. Never blocks (always exits 0) -- a formatting nit mid-task
 # is more disruptive than letting it through; `cargo fmt` cleans it up
 # later. No-ops silently if docker, or the dtfs-buildenv image, isn't

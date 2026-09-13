@@ -11,7 +11,7 @@ tiered distributed filesystem in Rust; crates live under `crates/`
 (dtfs-manager, dtfs-data, dtfs-fuse, dtfs-client, dtfs-raft, dtfs-common,
 dtfs-proto).
 
-Read first: AGENTS.md § A.3 (conventions you must not break —
+Read first: CLAUDE.md § A.3 (conventions you must not break —
 snapshot compat, memory discipline, integrity, mandatory-vs-cache
 replicas, build-date stamping) and the task you were handed (a
 checklist line from a `plans/active/PLAN-*.md` file, or a one-task fix
@@ -38,7 +38,7 @@ line-oriented rewrite tool.
 
 ## Build / verify environment
 
-Docker only (AGENTS.md § A.4): no build VM, no cluster. The local
+Docker only (CLAUDE.md § A.4): no build VM, no cluster. The local
 `dtfs-buildenv:latest` image has the rust toolchain, protoc,
 clang/libclang, libfuse3-dev; the named volumes `dtfs-target`
 (`/target`) and `dtfs-registry` persist the cache. The checkout is
@@ -73,7 +73,7 @@ change (`example_*_toml_parses`). Another agent may share the
 3. Run the crate test (full workspace suite only for cross-crate
    changes) before declaring done.
 4. If a plan file exists, tick its checklist line in the same commit.
-5. Commit per AGENTS.md § B.3 (type-prefixed subject, short body, the
+5. Commit per CLAUDE.md § B.3 (type-prefixed subject, short body, the
    `Co-Authored-By:` trailer the caller gave you). Never `--no-verify`,
    never `--amend` a pushed commit, never bypass signing.
 

@@ -17,7 +17,7 @@ use dtfs_common::types::NodeRole;
 ///
 /// `registered_role` is the node-registry role already stored under the
 /// derived node id, if any. `node_id = hash(hostname)` (composite-host
-/// identity rule, AGENTS.md § A.5), so a hostname that already belongs to a
+/// identity rule, CLAUDE.md § A.5), so a hostname that already belongs to a
 /// Data/Client daemon means the operator passed the wrong name (e.g. the data
 /// daemon's hostname on a composite host) — joining it would fuse two
 /// daemons' identities. Refuse.

@@ -3,7 +3,7 @@
 //!
 //! `VERSION` defaults to `v0.0.0-dev`; release builds stamp it via the
 //! `DTFS_VERSION` env var (see `build.rs` + `scripts/dtfs-release.sh`,
-//! AGENTS.md § A.3.5). `BUILD_DATE` (emitted by `build.rs` from
+//! CLAUDE.md § A.3.5). `BUILD_DATE` (emitted by `build.rs` from
 //! `SystemTime::now()` / `SOURCE_DATE_EPOCH`) still distinguishes two
 //! dev builds with the same version. `version_string()` glues them
 //! together for display.

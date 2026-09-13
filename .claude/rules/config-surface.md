@@ -3,7 +3,7 @@ paths:
   - "crates/dtfs-common/src/config.rs"
 ---
 
-# Config-surface sync (AGENTS.md § B.5)
+# Config-surface sync (CLAUDE.md § B.5)
 
 Any change to a config struct here (new/renamed/removed option, changed
 default) MUST, in the **same commit**:

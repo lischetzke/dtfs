@@ -10,7 +10,7 @@ invariants. DTFS is a Raft-managed tiered distributed filesystem in
 Rust; crates: dtfs-manager, dtfs-data, dtfs-fuse, dtfs-client,
 dtfs-raft, dtfs-common, dtfs-proto.
 
-Read first: AGENTS.md § A.3 (conventions — snapshot compat, memory
+Read first: CLAUDE.md § A.3 (conventions — snapshot compat, memory
 discipline, integrity, mandatory-vs-cache replicas) and § A.6 (integrity
 checklist), plus `.claude/rules/integrity.md` if the diff touches
 `dtfs-data/**`, `dtfs-manager/src/scheduler.rs`, or `dtfs-raft/**`
@@ -27,7 +27,7 @@ suspect is broken, RE-READ the actual current line before reporting it
 — do not report from a diff hunk's `+`/`-` markers alone, the
 surrounding unchanged code often changes the verdict. Report "no
 finding" rather than manufacture one; a fabricated finding costs more
-than a missed one (AGENTS.md's over-engineering rule applies to reviews
+than a missed one (CLAUDE.md's over-engineering rule applies to reviews
 too — don't pad the list).
 
 Severity ladder (exactly as CORE-REVIEW-2026-09-12.md defines it):

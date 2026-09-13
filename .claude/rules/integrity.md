@@ -5,7 +5,7 @@ paths:
   - "crates/dtfs-raft/**"
 ---
 
-# Data-integrity checklist (AGENTS.md § A.3.3 / § A.6)
+# Data-integrity checklist (CLAUDE.md § A.3.3 / § A.6)
 
 Check every item that applies to the path you touch. Narrative and bug
 history: `docs/src/internals/invariants.md` § A.6 and the archived rule

@@ -1,34 +1,34 @@
 # Archive: contract text removed on 2026-09-13
 
-Moved here verbatim during the token-efficiency pass so the load-bearing files stay short. Nothing below is a live rule on its own; the condensed rules in AGENTS.md and `.claude/rules/` are authoritative.
+Moved here verbatim during the token-efficiency pass so the load-bearing files stay short. Nothing below is a live rule on its own; the condensed rules in CLAUDE.md and `.claude/rules/` are authoritative.
 
-## AGENTS.md A.2 Read paragraph (pre-2026-09-13)
+## CLAUDE.md A.2 Read paragraph (pre-2026-09-13)
 
 **Read:** lookup metadata (cached ENTRY_TTL) → pick the read replica (`location.rs::select_read_replica`: configured `read_location_priority` beats physical distance beats a tier tie-break on equal distance only) → stream GetChunk → optionally cache locally (P0-11) → readahead prefetches. Full U4/CO-3-10 detail (how tier + topology reach the FUSE client's `known_locations`): `docs/src/internals/invariants.md` § A.2. CR-6-4 (FUSE-6): `GetFileLocationsResponse` carries the file's `volume_id` on the wire; the FUSE client's `fetch_file_locations` keeps whatever volume_id it already believes when an older manager sends `""`, never silently downgrading to `"default"` — and `allocate_chunks` always resolves placement from the file's OWN registered volume when it already exists, ignoring a stale/wrong request value. CR-6-6 (FUSE-9): a foreground chunk-miss is single-flighted by chunk_id (content-addressed) — the first miss becomes the fetch Owner, a concurrent miss on the same chunk_id joins the Owner's result instead of issuing its own `GetChunk`.
 
-## AGENTS.md A.3.2 (pre-2026-09-13)
+## CLAUDE.md A.3.2 (pre-2026-09-13)
 
 **A.3.2 Memory discipline.** No `Vec<u8>` accumulation of full chunks on the hot path, read or write — stream to/off disk, hash incrementally (Bug I, U2). Memory caps are best-effort, never reject by default (§ A.5). `[memory]` (CF-5) runs on all three roles, shared core `dtfs-common/src/memory.rs`, each with its own ladder rung (data sheds put_chunk; manager pauses scheduler ticks at Shed; fuse halves readahead at Warn, stops prefetch at Shed). `MemoryConfig::validate()` (CR-6-1/CMN-1) is called by all three `main.rs` right after config load, rejecting `warn_threshold_pct >= shed_threshold_pct` or either `> 100` at startup instead of flapping the ladder at runtime; the manager also calls the new `PlacementConfig::validate()` (CMN-8) rejecting a `min_free_pct` outside `0.0..=100.0`. systemd `MemoryMax` backstops all roles. FUSE detail: `.claude/rules/fuse.md`. CR-6-5 (FUSE-5): the FUSE client's `metadata_cache` is bounded (`METADATA_CACHE_MAX_ENTRIES = 4096`, FIFO eviction via a DashMap + insertion-order queue) and periodically swept for expired entries on the `metadata_ttl` cadence — before this, one full chunk-location list per path ever stat'ed was retained forever, pinning hundreds of MB during a Plex library scan on a 1 GB client. CR2-8-3/CR2-8-4 (FUSE-11/12): `local_cache.rs`'s disk cache now classifies a viewer read from cumulative per-fh consumption (`OpenFile.bytes_read_on_fh`) or active readahead rather than one 128 KB kernel call's length, and `evict_to_size` targets 90% of `max_bytes` (hysteresis) instead of a full O(N) stat sweep on almost every `put()`.
 
-## AGENTS.md A.3.3 (pre-2026-09-13)
+## CLAUDE.md A.3.3 (pre-2026-09-13)
 
 **A.3.3 Integrity is the prime directive.** Every path that touches bytes must: (1) carry a BLAKE3 checksum end-to-end into `ChunkMeta.checksum`; (2) write new chunks to tmp + atomic rename after `sync_all()`; (3) WAL the op before performing it, clear only after fsync; (4) never delete a chunk until a replacement is verified or the referencing file is unlinked and no other live file references the id (Bug CI `fanout_delete_allowed`) — a scrub-detected fault quarantines by RENAMING the `.dat` to `.dtfs/quarantine/<id>.dat.bad` (CR-4-1), never `remove_file`, and only after a re-hash of the `.dat` against its own id fails to repair the `.meta` in place; (5) never silently downgrade replication factor; (6) verify on every read and on scrub (Bug BC-8) — a mismatch is `Status::data_loss`, FUSE falls over (P0-2), disabling `verify_on_read` needs an explicit API-boundary ack; (7) LIS-19/55/83 — when `cluster.shared_secret` is set, every mutating data-plane RPC requires an HMAC-SHA256 `x-dtfs-rpc-ts`+`x-dtfs-rpc-mac` pair (empty secret = legacy skip), including `RecordCacheHit` (DATA-11 — previously ungated, letting any caller inflate a chunk's tiering promotion score); (8) LIS-56 — mutating ManagerService RPCs require the same HMAC shape over `dtfs-mgr-rpc`, including CR-5-1's `Heartbeat` and `ReportChunkStatus` (previously ungated: any node id could poison node status or drop replica entries without the cluster secret) — data nodes stamp both from `[cluster].shared_secret`; deploy manager+data together; REST mutations stay on LIS-18. Full checklist + HMAC shape: § A.6 / `.claude/rules/integrity.md`.
 
-## AGENTS.md A.3.4 (pre-2026-09-13)
+## CLAUDE.md A.3.4 (pre-2026-09-13)
 
 **A.3.4 Mandatory vs cache replicas (Bug AV invariant).** Two independent classes, never conflated: `mandatory_replicas.<tier>` (protected, only the under-replication scheduler maintains them) and `cache_replicas.<tier>.{min,max}` (demand-driven, evictable, only the tiering engine creates them). Every promote/demote checks the anchor against the destination first (CO-1-2). Replica presence/removal is keyed by `(node_id, disk_id)`, never `node_id` alone (Bug BH, CO-1-1). CR-3-1 (MGR-2) — every planner that decides whether a "surviving" mandatory/anchor replica justifies dropping another one (`plan_chunk_demotions`'s `mandatory_still_present`, `plan_flush_cache`'s `mandatory_survives`) must resolve that survivor's liveness through `live_replica_tier` first; a replica on a Down/Failed node or Failed/Removed disk can never be the thing that authorises the drop, and the state-machine's `apply_remove_chunk_location` (CR-3-2) independently refuses to remove the last live replica of a chunk regardless of anchor policy. CR-3-7 (CMN-5) — an anchor `datacenter` string and a node's registered `datacenter` are compared with `eq_ignore_ascii_case` (`AnchorPolicy::is_satisfied_by`, the two `hash_ring.rs` anchor-DC compares), matching `SpillPolicy`/`read_location_priority`: a casing mismatch must never make the anchor permanently unsatisfiable. New code that creates/removes replicas: consult `.claude/rules/integrity.md` / `docs/src/internals/invariants.md` § A.3.4.
 
-## AGENTS.md A.5 tail (pre-2026-09-13)
+## CLAUDE.md A.5 tail (pre-2026-09-13)
 
 CR2-8-1 (CMN-3): `[grpc].max_message_size_mb` (manager/data) and the mirrored `[client].max_message_size_mb` (fuse) now actually govern the tonic `max_decoding/encoding_message_size` caps via the shared `dtfs_common::config::max_message_bytes` helper — previously a hardcoded 32 MB literal ignored the parsed config value — and each role's `main.rs` calls the matching `validate()` (reject `0`) alongside `memory.validate()`.
 
-## AGENTS.md A.6 (pre-2026-09-13)
+## CLAUDE.md A.6 (pre-2026-09-13)
 
 ## A.6 Data-integrity audit checklist
 
 Run mentally when you touch a write/migrate/delete/scrub path; name the covering test in the commit body only where it isn't obvious. Full checklist with narrative context lives in `.claude/rules/integrity.md`, loaded automatically for `dtfs-data/**`, `dtfs-manager/src/scheduler.rs`, `dtfs-raft/**`. Summary: (1) BLAKE3 checksum end-to-end into `ChunkMeta.checksum`; (2-3) tmp+atomic-rename+`sync_all()` for both `.dat` and `.meta` — `.meta` is written via a `write_meta_atomic` tmp+rename helper (CR-4-2), never a direct create at the final path, so a crash never leaves a torn sidecar; (4) counters update only after meta is durable, and only for a genuinely new chunk (a re-upload of an already-complete chunk is not double-counted, CR-4-6); (5) tmp removed on any put error path, and any failure AFTER the `.dat` rename also removes the `.dat`/`.meta`/WAL entry it just committed (CR-4-3) — a 256-way striped per-chunk lock plus op-keyed WAL names (`.put.wal.json`/`.delete.wal.json`, legacy `.wal.json` still replayed) keep a same-id put and delete from interleaving into a torn state (CR-4-4); (6) migration verifies before marking Done, de-location is Raft-remove-then-byte-delete (the CO-3-2 reaper mops a failed byte-delete); (7) scrub BLAKE3-checks vs `checksum`, auto-repairs via `replicate_chunk` — but first tries to repair a missing/unparseable `.meta` by re-hashing the `.dat` against its own id (CR-4-1); only a genuine mismatch or unreadable `.dat` quarantines; (8) unlink deletes metadata before bytes, orphan reap keys off durable on-disk mtime (Bug CB), not a manager-local clock — CR2-7-2 (MGR-10): when the data node's `ListChunks` reply carries `chunk_disk_ids`, the reap is keyed by `(node_id, disk_id)` instead of node-wide, so a de-located leftover on one disk of a node is reaped correctly even when another disk of the SAME node still holds a live replica of the same chunk; an older data node reporting no disk ids falls back to the prior node-wide behaviour; (9) rename is one Raft command, chunk_id binding unchanged; (10) reads use replica-fallback (P0-2).
 
-## AGENTS.md A.8 table (pre-2026-09-13)
+## CLAUDE.md A.8 table (pre-2026-09-13)
 
 | File | Responsibility |
 |---|---|
@@ -72,12 +72,12 @@ paths:
   - "crates/dtfs-raft/**"
 ---
 
-# Data-integrity audit checklist (AGENTS.md § A.6)
+# Data-integrity audit checklist (CLAUDE.md § A.6)
 
 Run this whenever you touch a write/migrate/delete/scrub path; mark each
 "Verified by `<test>`" in the commit. Full narrative context (why each
 item exists, the bugs that motivated it) is inline below — this is the
-long form of AGENTS.md A.3.3/A.6, loaded only for the crates it governs.
+long form of CLAUDE.md A.3.3/A.6, loaded only for the crates it governs.
 
 1. BLAKE3 via `IncrementalHasher`; final hash in `ChunkMeta.checksum`.
 2. On-disk `.dat` written to `tmp/<uuid>.dat.tmp`, atomic-renamed to
@@ -161,7 +161,7 @@ long form of AGENTS.md A.3.3/A.6, loaded only for the crates it governs.
 10. Reads use replica-fallback (P0-2): try the next replica on error, fail
     only after all candidates fail.
 
-## Data-plane RPC auth (LIS-19/55/83, AGENTS.md § A.3.3 #7)
+## Data-plane RPC auth (LIS-19/55/83, CLAUDE.md § A.3.3 #7)
 
 When `cluster.shared_secret` is non-empty, `PutChunk` / `DeleteChunk` /
 `ReplicateChunk` / `GetChunk` / `ListChunks` / `VerifyChunk` / **`Record-
@@ -179,7 +179,7 @@ was the last mutating data-plane RPC left ungated pre-CR-5-5 — an
 unauthenticated caller could inflate a chunk's read counter and its
 tiering promotion score.
 
-## Manager-plane RPC auth (LIS-56, AGENTS.md § A.3.3 #8)
+## Manager-plane RPC auth (LIS-56, CLAUDE.md § A.3.3 #8)
 
 When `cluster.shared_secret` is non-empty, mutating `ManagerService`
 gRPC RPCs (`CreateFile`/`DeleteFile`/leases/…, and since **CR-5-1**
@@ -207,7 +207,7 @@ discarding the response body, so a forward rejected by the leader (bad
 secret, a disallowed MGR-11 variant, or a failed Raft apply) is no
 longer silently treated as a successful write.
 
-## Mandatory vs cache replicas (Bug AV invariant, AGENTS.md § A.3.4)
+## Mandatory vs cache replicas (Bug AV invariant, CLAUDE.md § A.3.4)
 
 Two independent, never-mixed replica classes:
 - `mandatory_replicas.<tier>` — protected; only
@@ -256,7 +256,7 @@ paths:
   - "crates/dtfs-fuse/**"
 ---
 
-# dtfs-fuse memory ladder + await-guard rules (AGENTS.md § A.3.2, § A.8)
+# dtfs-fuse memory ladder + await-guard rules (CLAUDE.md § A.3.2, § A.8)
 
 ## Never hold a DashMap guard across an `.await`
 

@@ -380,7 +380,7 @@ impl TieringEngine {
         };
 
         if deferred > 0 {
-            // AGENTS.md: never cap silently.
+            // CLAUDE.md: never cap silently.
             warn!(
                 planned = decisions.len(),
                 deferred,

@@ -140,7 +140,7 @@ tier = "cold"
 
 ## `[cache]` -- Read Cache
 
-**Inert since REV-4-5.** The in-memory ARC read cache is not wired into the read path: every `GetChunk` streams the chunk off disk in pieces so a read never holds a whole chunk in heap (AGENTS.md § A.3.2). These keys are still parsed for back-compatibility but have no effect, and they no longer consume the data node's memory budget - previously the 8 GB default was subtracted when sizing `put_chunk` slots and collapsed write concurrency to a single slot on a memory-capped node. Client-side read caching is provided by the FUSE local disk cache (`local_cache_dir`) instead.
+**Inert since REV-4-5.** The in-memory ARC read cache is not wired into the read path: every `GetChunk` streams the chunk off disk in pieces so a read never holds a whole chunk in heap (CLAUDE.md § A.3.2). These keys are still parsed for back-compatibility but have no effect, and they no longer consume the data node's memory budget - previously the 8 GB default was subtracted when sizing `put_chunk` slots and collapsed write concurrency to a single slot on a memory-capped node. Client-side read caching is provided by the FUSE local disk cache (`local_cache_dir`) instead.
 
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|

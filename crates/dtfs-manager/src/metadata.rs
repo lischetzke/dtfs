@@ -1128,7 +1128,7 @@ impl ManagerService for MetadataService {
                 // REV-2-1 — built by a free fn rather than an inline struct
                 // literal: the literal form ICEs rustc 1.94 while type-checking
                 // this function (same compiler as the dead-code ICE workaround
-                // noted in AGENTS.md A.4).
+                // noted in CLAUDE.md A.4).
                 new_chunk_location(&c.chunk_hash, c.size_bytes, c.chunk_index)
             });
             e.size = e.size.max(c.size_bytes);
@@ -3148,7 +3148,7 @@ pub(crate) fn chunk_placement_tier_string(tier: dtfs_common::types::DiskTier) ->
 /// `ChunkLocationEntry` per replica that actually landed, so the per-
 /// chunk distinct-target count is the durable replica count for that
 /// chunk at commit time. Replica identity is `(node_id, disk_id)`,
-/// never `node_id` alone (AGENTS.md A.3.4, Bug BH): two copies on one
+/// never `node_id` alone (CLAUDE.md A.3.4, Bug BH): two copies on one
 /// node but different disks/tiers count as two.
 ///
 /// `floor <= 1` is always satisfied (a single durable copy is enough,

@@ -673,7 +673,7 @@ impl DataService for DataServiceImpl {
         // Disabling this flag is gated by an explicit-acknowledgement
         // boundary at the manager API (BC-8 ack guard). Once disabled,
         // this code path skips the hash and streams the raw bytes —
-        // operator-acknowledged risk, AGENTS.md flags the false branch as
+        // operator-acknowledged risk, CLAUDE.md flags the false branch as
         // the only mode where reads can deliver corrupt bytes.
         if verify_on_read {
             let now_ms = std::time::SystemTime::now()

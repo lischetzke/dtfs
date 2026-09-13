@@ -2,7 +2,7 @@
 # .claude/hooks/guard-git.sh
 #
 # PreToolUse hook on the Bash tool. Encodes the three "never" rules from
-# AGENTS.md B.3 as a hard block instead of prose Claude has to remember:
+# CLAUDE.md B.3 as a hard block instead of prose Claude has to remember:
 #   - never --no-verify
 #   - never push --force (without --force-with-lease)
 #   - never `commit --amend` a commit that has already been pushed
@@ -64,13 +64,13 @@ check_segment() {
 
     if printf '%s' "$seg" | grep -Eq 'git[[:space:]]+commit' \
        && printf '%s' "$seg" | grep -Eq -- '--no-verify'; then
-        block "git commit --no-verify is blocked (AGENTS.md B.3). Fix the failing hook instead of bypassing it."
+        block "git commit --no-verify is blocked (CLAUDE.md B.3). Fix the failing hook instead of bypassing it."
     fi
 
     if printf '%s' "$seg" | grep -Eq 'git[[:space:]]+push' \
        && printf '%s' "$seg" | grep -Eq '(^|[[:space:]])--force([[:space:]]|$)' \
        && ! printf '%s' "$seg" | grep -Eq -- '--force-with-lease'; then
-        block "git push --force is blocked; use --force-with-lease, or get explicit user sign-off for a raw --force (AGENTS.md B.3)."
+        block "git push --force is blocked; use --force-with-lease, or get explicit user sign-off for a raw --force (CLAUDE.md B.3)."
     fi
 
     if printf '%s' "$seg" | grep -Eq 'git[[:space:]]+commit' \
@@ -78,7 +78,7 @@ check_segment() {
         HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || true)"
         UPSTREAM_SHA="$(git rev-parse '@{u}' 2>/dev/null || git rev-parse origin/master 2>/dev/null || true)"
         if [ -n "$HEAD_SHA" ] && [ -n "$UPSTREAM_SHA" ] && [ "$HEAD_SHA" = "$UPSTREAM_SHA" ]; then
-            block "HEAD ($HEAD_SHA) matches the pushed upstream tip; --amend would rewrite a pushed commit (AGENTS.md B.3). Create a new commit instead."
+            block "HEAD ($HEAD_SHA) matches the pushed upstream tip; --amend would rewrite a pushed commit (CLAUDE.md B.3). Create a new commit instead."
         fi
     fi
 

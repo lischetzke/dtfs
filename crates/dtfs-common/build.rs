@@ -8,14 +8,14 @@
 // declare `rerun-if-env-changed=SOURCE_DATE_EPOCH`, cargo re-runs this
 // script (and re-stamps) whenever that value changes — i.e. every wrapper
 // invocation — so two wrapper builds a minute apart get two distinct
-// stamps (AGENTS.md §A.3.6). A plain `cargo build` with the var unset
+// stamps (CLAUDE.md §A.3.6). A plain `cargo build` with the var unset
 // leaves the cached stamp untouched, keeping local incremental builds
 // fast (the broken pre-BS `rerun-if-changed=build.rs` gating froze the
 // stamp at the first-ever build instead).
 //
 // SOURCE_DATE_EPOCH is ALSO the reproducible-build pin: a caller that
 // exports a fixed value gets a fixed, deterministic stamp (the sanctioned
-// exception in AGENTS.md §A.3.6).
+// exception in CLAUDE.md §A.3.6).
 
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -8,11 +8,11 @@ tools: Read, Grep, Glob, Write, Bash(git log:*), Agent(dtfs-explore)
 You write short DTFS plan files for work that spans sessions. DTFS is a Raft-managed
 tiered distributed filesystem in Rust (crates: dtfs-manager, dtfs-data,
 dtfs-fuse, dtfs-client, dtfs-raft, dtfs-common, dtfs-proto — see
-AGENTS.md § A.2 for the write/read path). You are invoked after intake
+CLAUDE.md § A.2 for the write/read path). You are invoked after intake
 has produced a spec, or when the user directly asks for a plan.
 
 Read first, in this order:
-1. AGENTS.md § A.3 (conventions — snapshot compat, memory discipline,
+1. CLAUDE.md § A.3 (conventions — snapshot compat, memory discipline,
    integrity, mandatory-vs-cache replicas, build-date stamping) and § A.6
    (integrity checklist).
 2. `plans/README.md` for the plan-file template and lifecycle rules.
@@ -28,7 +28,7 @@ whole large file (`scheduler.rs`, `metadata.rs`, `filesystem.rs`,
 `state_machine.rs` are each thousands of lines); that is exactly what
 `dtfs-explore` is for.
 
-Decide branch-vs-master up front against AGENTS.md § B.1's threshold
+Decide branch-vs-master up front against CLAUDE.md § B.1's threshold
 (branch only for a wire/on-disk format change — `proto/*.proto`,
 `ClientRequest`, `apply_request`, any `#[serde]`-persisted struct — or
 multi-session work) and state the decision in one line.
@@ -43,8 +43,8 @@ with:
   sentence of sketch, the test and its layer (pure helper >
   state-machine apply > manager aggregator > FUSE helper). Flag any
   task that touches a `#[serde]`-persisted struct or adds a Raft
-  variant with the AGENTS.md § A.3.1 `#[serde(default)]` requirement.
-- One line naming which AGENTS.md § A.3.3 / § A.3.4 / § A.6 items the
+  variant with the CLAUDE.md § A.3.1 `#[serde(default)]` requirement.
+- One line naming which CLAUDE.md § A.3.3 / § A.3.4 / § A.6 items the
   tasks must not violate (specific item numbers, not whole sections).
 - Open questions.
 
@@ -53,7 +53,7 @@ section. Keep the file under ~80 lines.
 
 Do NOT write or edit any code file. Do NOT invent a task just to pad the
 list. If the work turns out to be single-task after all, say so and
-recommend the session todo list instead of a plan file (AGENTS.md § B.2) —
+recommend the session todo list instead of a plan file (CLAUDE.md § B.2) —
 that is also the default for anything that finishes within one session.
 
 Output: the plan file path, plus a summary <= 10 lines (task count,

@@ -1,9 +1,9 @@
 # Internals: bug archaeology and detailed invariants
 
-This page holds the detailed "why" behind AGENTS.md Part A's condensed
+This page holds the detailed "why" behind CLAUDE.md Part A's condensed
 rules: the bug/task IDs (Bug-letter, CO-\*, REV-\*, WI-\*, U\*, R\*, CR-\*)
-that motivated each invariant, kept here so AGENTS.md itself stays under
-its 250-line budget. AGENTS.md keeps a one-line pointer at each section;
+that motivated each invariant, kept here so CLAUDE.md itself stays under
+its 250-line budget. CLAUDE.md keeps a one-line pointer at each section;
 this is the full narrative. Read it when you need to understand *why* a
 rule exists, are touching the exact code path it describes, or are
 reviewing a diff against it — not by default.

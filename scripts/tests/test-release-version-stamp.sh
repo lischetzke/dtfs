@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# AZ-5 — guard the DTFS_VERSION release stamp (AGENTS.md § A.3.5).
+# AZ-5 — guard the DTFS_VERSION release stamp (CLAUDE.md § A.3.5).
 #
 # Proves:
 #   1. Unset DTFS_VERSION -> `dtfs-cli --version` reports v0.0.0-dev

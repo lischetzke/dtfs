@@ -4,7 +4,7 @@
 # Required options are set; optional options are commented out and show
 # their compiled-in default. Source of truth: crates/dtfs-common/src/config.rs
 # (DataNodeConfig). Keep this file in sync with that struct in the same commit
-# (AGENTS.md § B.6).
+# (CLAUDE.md § B.6).
 
 [node]
 # hostname is this data node's IDENTITY: node_id = hash(hostname). MUST be
@@ -91,7 +91,7 @@ tier = "cold"
 #[memory]
 # Bug G: per-process RAM budget with proactive backpressure. 0 = unbounded
 # (legacy). Set non-zero on every production deploy; on a composite host the
-# sum of all roles' caps must stay under host RAM (AGENTS.md § A.5).
+# sum of all roles' caps must stay under host RAM (CLAUDE.md § A.5).
 #hard_cap_mb = 0
 #warn_threshold_pct = 80
 #shed_threshold_pct = 92            # above this, new put_chunk -> RESOURCE_EXHAUSTED

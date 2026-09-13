@@ -622,7 +622,7 @@ impl TaskScheduler {
                         // The scan is idempotent — whatever is left is picked
                         // up next tick. Say so once, loudly, so an operator
                         // watching a node loss knows the backlog is paced and
-                        // not stuck (AGENTS.md: no silent caps).
+                        // not stuck (CLAUDE.md: no silent caps).
                         warn!(
                             created,
                             live_tasks,
@@ -2190,7 +2190,7 @@ impl TaskScheduler {
                 // file still points at, even if its location record looks
                 // stale — that was the data-loss vector (BN-1 UUID rotation
                 // dropped location bindings; the hash-referenced guard here
-                // is the defence-in-depth backstop). AGENTS.md §A.6 #8.
+                // is the defence-in-depth backstop). CLAUDE.md §A.6 #8.
                 let is_orphan = chunk_is_orphan(&in_state_chunks, cid);
 
                 // CO-3-2 / CR2-7-2 (MGR-10) — a chunk on this node's disk
@@ -3702,7 +3702,7 @@ impl DelocateOps for SchedulerDelocate<'_> {
 /// `in_state_chunks` is the union of every file's chunk hashes. Keying on
 /// the hash (not on a per-disk location/UUID match) is the load-bearing
 /// safety invariant: a chunk a file still points at must never be deleted,
-/// even if its location record looks stale. AGENTS.md §A.3.3 #4 / §A.6 #8.
+/// even if its location record looks stale. CLAUDE.md §A.3.3 #4 / §A.6 #8.
 pub(crate) fn chunk_is_orphan(
     in_state_chunks: &std::collections::HashSet<String>,
     chunk_hash: &str,
@@ -3728,7 +3728,7 @@ pub(crate) fn chunk_is_orphan(
 /// This strictly supersets `chunk_is_orphan`: a chunk referenced by NO file
 /// is named by no node either, so it is also absent from every
 /// `node_expected`. The hash-orphan check is kept as the explicit primary
-/// signal; this adds the per-node de-location case (AGENTS.md §A.6 #8). The
+/// signal; this adds the per-node de-location case (CLAUDE.md §A.6 #8). The
 /// caller still gates the actual delete behind the mtime grace, so an
 /// in-flight put/promote whose `commit_chunk_locations` Raft write has not
 /// yet applied (recent mtime) is never dropped.

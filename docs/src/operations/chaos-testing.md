@@ -48,7 +48,7 @@ Key consequences:
 
 - **Anchor DC = dc-a.** dc-a is the only DC with a `cold` disk, so the anchor
   invariant under test is "every chunk keeps at least one cold replica in dc-a"
-  (§ A.3.4 in `AGENTS.md`).
+  (§ A.3.4 in `CLAUDE.md`).
 - **Cache tier = warm.** dc-b and dc-c are warm-only by design (dc-c is the
   "no cache, fast burst" path in the reference deployment). The per-DC cache
   cases therefore use `warm` as the cache tier — it exists in every DC — which

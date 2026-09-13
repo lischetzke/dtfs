@@ -3,7 +3,7 @@ paths:
   - "crates/dtfs-fuse/**"
 ---
 
-# dtfs-fuse rules (AGENTS.md § A.3.2)
+# dtfs-fuse rules (CLAUDE.md § A.3.2)
 
 Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 (`dtfs-fuse/*`) and the archived rule text there.

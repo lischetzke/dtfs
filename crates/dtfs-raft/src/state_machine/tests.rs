@@ -2678,7 +2678,7 @@ mod audit_co_tests {
     // ----- CO-1-1 ----------------------------------------------------------
     // RemoveChunkLocation now carries a `disk_id`. A chunk may legally hold a
     // mandatory replica AND a cache replica on the SAME node_id across
-    // DIFFERENT disks/tiers (AGENTS.md A.3.4 / Bug BH); pre-fix the retain
+    // DIFFERENT disks/tiers (CLAUDE.md A.3.4 / Bug BH); pre-fix the retain
     // keyed on (chunk_index, node_id) only and dropped BOTH (and the
     // production `debug_assert "drop exactly one entry"` panicked first).
     // Post-fix removal targets the exact (node, disk) and the co-located

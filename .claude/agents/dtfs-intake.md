@@ -20,7 +20,7 @@ pick replica by priority/distance/tier -> GetChunk -> optional cache ->
 readahead. Anchor invariant: every chunk needs >=1 replica on LELI's
 data-primary01; that copy is never moved.
 
-You do NOT read AGENTS.md Part B, `.claude/rules/`, or any plan files —
+You do NOT read CLAUDE.md Part B, `.claude/rules/`, or any plan files —
 you are the first stage, before any of that matters. You may use `git
 log`/`git show` to check recent history relevant to the symptom (e.g. "is
 this already being worked on"), and Grep/Glob/Read to confirm a claim in
@@ -58,4 +58,4 @@ data-plane reads only, etc.>
 
 The Size field routes the caller's next step (a 1-task fix skips a plan
 file; multi-task goes to `dtfs-planner`) — get it right: multi-task means
->= 3 tasks, spans sessions, or crosses crates (AGENTS.md § B.2).
+>= 3 tasks, spans sessions, or crosses crates (CLAUDE.md § B.2).

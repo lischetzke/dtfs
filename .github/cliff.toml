@@ -2,7 +2,7 @@
 #
 # Reproduces the section grouping .github/release.yml applies to PR
 # labels, but driven off commit SUBJECTS/trailers instead of PR labels
-# (AGENTS.md B.1 defaults to committing straight to master, so most
+# (CLAUDE.md B.1 defaults to committing straight to master, so most
 # user-visible work never gets a PR to label). Convention:
 #   - subject prefix `bug:` / `feat:` / `int:` (`int:` is excluded from
 #     the notes entirely, same as the `int` PR label today).

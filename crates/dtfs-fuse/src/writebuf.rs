@@ -26,7 +26,7 @@ use tracing::{debug, instrument};
 /// WI-01 — upper clamp on `flush_batch_chunks`. Far below the manager's
 /// `MAX_CHUNKS_PER_ALLOCATION` (65_536, `metadata.rs`), it just bounds how
 /// much un-committed data one open file can hold in client heap
-/// (`flush_batch_chunks * chunk_size`; see AGENTS.md A.3.2).
+/// (`flush_batch_chunks * chunk_size`; see CLAUDE.md A.3.2).
 const MAX_FLUSH_BATCH_CHUNKS: usize = 32;
 
 /// WI-01 / H1 — hard byte ceiling on un-committed data one open file may hold

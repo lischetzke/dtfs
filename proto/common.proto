@@ -7,7 +7,7 @@ package dtfs.common;
 // ChunkMeta\|WriteSafety\)" crates/` returned zero Rust callers (the
 // runtime replication/volume-config shapes live in
 // dtfs-common/src/types.rs, not on this wire). Do not re-add a message
-// here without a Rust caller — see AGENTS.md § A.8 PROTO-3 entry.
+// here without a Rust caller — see CLAUDE.md § A.8 PROTO-3 entry.
 
 message Location {
   string region = 1;

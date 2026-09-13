@@ -821,7 +821,7 @@ pub struct ClusterScrubConfig {
     /// Data consistency knob: hash-verify every read at the data
     /// node before bytes leave the process. Default **true**.
     /// Operator can set to `false` only with explicit ack at the
-    /// API boundary (BC-8). Disabling is a footgun; AGENTS.md flags
+    /// API boundary (BC-8). Disabling is a footgun; CLAUDE.md flags
     /// the false branch as the only DTFS-supported mode where
     /// reads can deliver corrupt bytes.
     #[serde(default = "default_cluster_verify_on_read")]
@@ -1000,7 +1000,7 @@ pub struct FuseWriteConfig {
     /// (`writebuf::effective_batch_chunks`, `FLUSH_BATCH_MAX_BYTES` = 64 MB),
     /// so the un-committed ceiling per open write is AT MOST 64 MB regardless
     /// of `chunk_size_mb` (default 4 * 4 MB = 16 MB), and a volume with
-    /// chunks of 64 MB or more flushes per chunk — see AGENTS.md A.3.2.
+    /// chunks of 64 MB or more flushes per chunk — see CLAUDE.md A.3.2.
     #[serde(default = "default_flush_batch_chunks")]
     pub flush_batch_chunks: u32,
 }
@@ -1294,7 +1294,7 @@ mod tests {
     // deploy/examples/*.toml parse guard
     //
     // The example configs are the operator-facing canonical reference
-    // (AGENTS.md § B.6): every option, optional ones commented out.
+    // (CLAUDE.md § B.6): every option, optional ones commented out.
     // They MUST parse against the current structs — if a config struct
     // gains a required field or renames a section, these tests fail
     // until the matching example (and docs) are updated in the same

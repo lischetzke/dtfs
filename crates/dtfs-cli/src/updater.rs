@@ -7,7 +7,7 @@
 //! Network/IO is delegated to the same tools the deploy layer already
 //! uses (`curl`, `tar`, `install`, `systemctl`); the only Rust deps are
 //! `sha2` (integrity) and `tempfile` (CO-2-4 unpredictable staging dir),
-//! and the download streams to disk (bounded memory, AGENTS.md § A.3.2).
+//! and the download streams to disk (bounded memory, CLAUDE.md § A.3.2).
 //! Integrity gate is § A.3.3 / A.6: a single sha256 mismatch aborts the
 //! whole update before anything is installed.
 

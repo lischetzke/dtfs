@@ -4,7 +4,7 @@
 # Required options are set; optional options are commented out and show
 # their compiled-in default. Source of truth: crates/dtfs-common/src/config.rs
 # (FuseConfig). Keep this file in sync with that struct in the same commit
-# (AGENTS.md § B.6).
+# (CLAUDE.md § B.6).
 #
 # NOTE: a config that fails to parse (syntax error, missing required field)
 # makes the service exit at startup — under systemd that is a restart loop.
@@ -116,7 +116,7 @@ mountpoint = "/mnt/dtfs"
 # halves the [readahead] cache_mb prefetch budget; at the shed level it drops
 # all unconsumed prefetch. systemd MemoryHigh/MemoryMax stay the hard backstop;
 # on a composite host the sum of all roles' caps must stay under host RAM
-# (AGENTS.md § A.5).
+# (CLAUDE.md § A.5).
 #hard_cap_mb = 0
 #warn_threshold_pct = 80            # at/above this -> readahead budget halved
 #shed_threshold_pct = 92            # at/above this -> drop unconsumed prefetch

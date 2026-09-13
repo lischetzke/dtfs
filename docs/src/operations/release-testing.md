@@ -51,7 +51,7 @@ that bug closes.
 6. If the case is cheap (≤ 2 min) and a critical path, append its
    stem to `QUICK_CASES` in `run.sh`.
 
-Required per AGENTS.md § B.5.1: every test that exercises
+Required per CLAUDE.md § B.5.1: every test that exercises
 cluster-visible behaviour SHIPS a release-suite case in the same
 commit as the unit/abuse test. KNOWN_ISSUE is fine when the
 scenario depends on un-shipped functionality.

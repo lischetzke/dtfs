@@ -2,7 +2,7 @@
 
 Optional. Default planning tool is the session todo list. Write a plan
 file only for work that must survive across sessions (see
-[AGENTS.md § B.2](../AGENTS.md#b2-plans)).
+[CLAUDE.md § B.2](../CLAUDE.md#b2-plans)).
 
 ## Layout
 

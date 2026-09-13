@@ -299,7 +299,7 @@ mod tests {
     /// The `known_locations` half of the WI-09 root cause (the caller must
     /// drop its DashMap `Ref` guard before spawning) is structural, not
     /// testable here — `filesystem.rs` binds the location with
-    /// `.map(|r| r.clone())` so the guard drops before the spawn (AGENTS.md
+    /// `.map(|r| r.clone())` so the guard drops before the spawn (CLAUDE.md
     /// A.8 / CO-3-12) — and is gated live by
     /// `tests/release/cases/99-read-survives-manager-outage.sh`.
     #[tokio::test]

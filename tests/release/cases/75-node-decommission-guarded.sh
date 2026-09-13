@@ -3,7 +3,7 @@
 # (POST /api/v1/nodes/{id}/decommission, Raft DeregisterNode) must REFUSE to
 # remove a node that still holds chunk replicas. Removing it would dangle the
 # node's location entries and silently lower the replication factor with no
-# re-replication (integrity prime directive, AGENTS.md A.6 #5). A drained node
+# re-replication (integrity prime directive, CLAUDE.md A.6 #5). A drained node
 # removes cleanly (covered by the CO-2-3 join-test cleanup + the dtfs-raft unit
 # test deregister_node_refuses_while_holding_replicas_then_succeeds_when_drained).
 # This case gates the LIVE guard: a replica-holding node is not removable and

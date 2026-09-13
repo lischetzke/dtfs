@@ -67,7 +67,7 @@ This clones the Debian 13 cloud-init template into 13 VMs at
 ## Build & deploy
 
 ```bash
-# Build via the Docker image (AGENTS.md § A.4); the historical builder VM no longer exists:
+# Build via the Docker image (CLAUDE.md § A.4); the historical builder VM no longer exists:
 cd ~/dtfs2 && git pull
 cargo build --release --workspace
 # Releases at target/release/dtfs-{manager,data,fuse,cli}
