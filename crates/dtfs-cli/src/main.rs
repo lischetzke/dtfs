@@ -149,6 +149,10 @@ enum Commands {
     /// Check manager health
     Health,
 
+    /// UIP-5-5 — aggregate cluster stats (`GET /api/v1/stats`): node
+    /// counts, capacity, per-tier breakdown, last scrub.
+    Stats,
+
     /// CF-2 — raft membership operations. Membership lives in the raft
     /// log (`[[cluster.initial_voters]]` is consulted at bootstrap
     /// only); growing/shrinking a live cluster goes through these.
@@ -725,6 +729,7 @@ async fn main() -> anyhow::Result<()> {
             Some(ConfigAction::Effective) => cmd_config_effective(&api, &args.format).await?,
         },
         Commands::Health => cmd_health(&api).await?,
+        Commands::Stats => cmd_stats(&api, &args.format).await?,
         Commands::Raft(sub) => match sub {
             RaftCmd::Members => cmd_raft_members(&api, &args.format).await?,
             RaftCmd::AddLearner {
@@ -1826,6 +1831,94 @@ async fn cmd_config_effective(api: &ApiClient, format: &OutputFormat) -> anyhow:
     Ok(())
 }
 
+/// UIP-5-5 — `dtfs-cli stats`: the aggregate the webui Home page
+/// renders from `GET /api/v1/stats`.
+async fn cmd_stats(api: &ApiClient, format: &OutputFormat) -> anyhow::Result<()> {
+    let s = api.get("/api/v1/stats").await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&s)?),
+        OutputFormat::Table => {
+            let u = |k: &str| s[k].as_u64().unwrap_or(0);
+            println!("DTFS Cluster Stats");
+            println!("==================");
+            println!("Health:            {}", s["health"].as_str().unwrap_or("—"));
+            println!(
+                "Nodes:             {} total, {} healthy, {} quarantined",
+                u("total_nodes"),
+                u("healthy_nodes"),
+                u("quarantined_nodes")
+            );
+            println!(
+                "Roles:             {} manager, {} data, {} client",
+                u("manager_count"),
+                u("data_node_count"),
+                u("client_count")
+            );
+            println!("Disks:             {}", u("disk_count"));
+            println!("Files:             {}", u("file_count"));
+            println!(
+                "Raw capacity:      {} used / {}",
+                format_bytes(u("raw_used_bytes")),
+                format_bytes(u("raw_total_bytes"))
+            );
+            println!(
+                "Net capacity:      {} used / {}",
+                format_bytes(u("net_used_bytes")),
+                format_bytes(u("net_usable_bytes"))
+            );
+            println!("Logical bytes:     {}", format_bytes(u("logical_bytes")));
+            println!(
+                "I/O:               {}/s read, {}/s write",
+                format_bytes(u("io_read_bytes_per_sec")),
+                format_bytes(u("io_write_bytes_per_sec"))
+            );
+            println!("Anchor pending:    {}", u("anchor_pending"));
+
+            let tiers = s["tier_breakdown"].as_array().cloned().unwrap_or_default();
+            if !tiers.is_empty() {
+                println!();
+                println!("{:<6} {:<6} {:<12} {:<12}", "TIER", "DISKS", "USED", "TOTAL");
+                println!("{}", "-".repeat(40));
+                for t in &tiers {
+                    println!(
+                        "{:<6} {:<6} {:<12} {:<12}",
+                        t["tier"].as_str().unwrap_or("—"),
+                        t["disks"].as_u64().unwrap_or(0),
+                        format_bytes(t["used_bytes"].as_u64().unwrap_or(0)),
+                        format_bytes(t["total_bytes"].as_u64().unwrap_or(0)),
+                    );
+                }
+            }
+
+            let ls = &s["last_scrub"];
+            println!();
+            if ls.is_null() {
+                println!("Last scrub:        none recorded");
+            } else {
+                let at = ls["completed_at_ms"].as_i64().unwrap_or(0) / 1000;
+                let when = chrono::DateTime::from_timestamp(at, 0)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                println!(
+                    "Last scrub:        {} level={} node={} disk={}",
+                    when,
+                    ls["level"].as_str().unwrap_or("—"),
+                    ls["node_id"],
+                    ls["disk_path"].as_str().unwrap_or("—")
+                );
+                println!(
+                    "                   checked={} healthy={} corrupt={} missing={}",
+                    ls["chunks_checked"].as_u64().unwrap_or(0),
+                    ls["chunks_healthy"].as_u64().unwrap_or(0),
+                    ls["chunks_corrupt"].as_u64().unwrap_or(0),
+                    ls["chunks_missing"].as_u64().unwrap_or(0)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_health(api: &ApiClient) -> anyhow::Result<()> {
     let health = api.get("/api/v1/health").await?;
     let status = health["status"].as_str().unwrap_or("unknown");
@@ -2292,5 +2385,12 @@ mod audit_co_tests {
     fn uip_5_4_percent_encode_query_escapes_reserved() {
         assert_eq!(percent_encode_query("/tv/a b&c=d.mkv"), "/tv/a%20b%26c%3Dd.mkv");
         assert_eq!(percent_encode_query("/plain-path_1.mkv"), "/plain-path_1.mkv");
+    }
+
+    // UIP-5-5 — bare `stats` parses.
+    #[test]
+    fn uip_5_5_stats_parses() {
+        let args = Args::try_parse_from(["dtfs-cli", "stats"]).expect("stats should parse");
+        assert!(matches!(args.command, Commands::Stats));
     }
 }
