@@ -1458,12 +1458,42 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         const el = document.getElementById('scrub-content');
         if (!list || !list.length) {{
             el.innerHTML = '<div class="scrub-placeholder">No scrub result recorded yet. ' +
-                'Run <code>dtfs-cli scrub --level deep</code> to trigger one.</div>';
+                'Use "Scrub all" above to trigger one.</div>';
             return;
         }}
         const sorted = [...list].sort((a, b) =>
             (a.node_id - b.node_id) || String(a.level).localeCompare(String(b.level)));
         el.innerHTML = sorted.map(renderScrubCard).join('');
+    }}
+
+    // UIP-2-1 — cluster-wide scrub trigger. The API only accepts a
+    // whole-cluster target ("*"/"all"); per-target scrub stays a 400 at
+    // the API layer, so the webui never offers a per-target control.
+    async function runScrubAll() {{
+        const level = document.getElementById('scrub-all-level').value;
+        const btn = document.getElementById('scrub-all-btn');
+        const result = document.getElementById('scrub-all-result');
+        btn.disabled = true; btn.textContent = 'Scrubbing…';
+        result.style.display = 'block';
+        result.className = '';
+        result.textContent = 'Starting scrub…';
+        try {{
+            const {{ resp, json, authError }} = await mutateFetch(
+                '/api/v1/scrub',
+                {{ body: JSON.stringify({{ target: '*', target_type: 'all', level }}) }}
+            );
+            if (!resp.ok) {{
+                result.textContent = authError
+                    || ('Error ' + resp.status + ': ' + ((json && json.error) || JSON.stringify(json)));
+            }} else {{
+                result.textContent = 'Scrub ' + (json && json.status || 'started')
+                    + ' (level: ' + (json && json.level || level) + ')';
+            }}
+        }} catch (e) {{
+            result.textContent = 'Network error: ' + e;
+        }} finally {{
+            btn.disabled = false; btn.textContent = 'Scrub all';
+        }}
     }}
 
     // stable sort + per-role grouping for the Home page "Data &
@@ -1812,7 +1842,20 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             </div>
             <div id="chunk-placement-content"><div class="placeholder">Loading…</div></div>
         </div>
-        <div class="scrub-card"><h3>Last Scrub</h3><div id="scrub-content"><div class="scrub-placeholder">No scrub result recorded yet.</div></div></div>
+        <div class="scrub-card">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem">
+                <h3 style="margin:0">Last Scrub</h3>
+                <div style="display:flex;align-items:center;gap:.4rem">
+                    <select id="scrub-all-level" class="form-input" style="width:auto">
+                        <option value="quick">Quick</option>
+                        <option value="deep">Deep</option>
+                    </select>
+                    <button class="btn-primary" onclick="runScrubAll()" id="scrub-all-btn">Scrub all</button>
+                </div>
+            </div>
+            <div id="scrub-all-result" style="display:none;margin:.5rem 0;font-size:.8rem"></div>
+            <div id="scrub-content"><div class="scrub-placeholder">No scrub result recorded yet.</div></div>
+        </div>
         <div class="table-card">
             <div class="table-card-header">
                 <h3>Data &amp; Manager Nodes</h3>
@@ -3786,6 +3829,47 @@ mod create_volume_modal_tests {
         assert!(
             !html.contains("Create one with <code>dtfs-cli volume create</code>"),
             "old dtfs-cli-only volume creation placeholder must be removed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod uip_2_webui_ops_tests {
+    use super::*;
+
+    /// UIP-2-1 — Integrity page carries a "Scrub all" control wired
+    /// through mutateFetch; the old CLI-punting placeholder is gone.
+    #[test]
+    fn scrub_all_button_present_and_wired_through_mutate_fetch() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        for needle in [
+            "id=\"scrub-all-level\"",
+            "<option value=\"quick\">",
+            "<option value=\"deep\">",
+            "id=\"scrub-all-btn\"",
+            "onclick=\"runScrubAll()\"",
+            "id=\"scrub-all-result\"",
+        ] {
+            assert!(html.contains(needle), "scrub-all control missing: {needle}");
+        }
+        let fn_body = html
+            .split("async function runScrubAll()")
+            .nth(1)
+            .expect("runScrubAll must be defined")
+            .split("finally")
+            .next()
+            .unwrap();
+        assert!(
+            fn_body.contains("mutateFetch(") && fn_body.contains("'/api/v1/scrub'"),
+            "runScrubAll must POST /api/v1/scrub through mutateFetch"
+        );
+        assert!(
+            fn_body.contains("target: '*'") && fn_body.contains("target_type: 'all'"),
+            "scrub-all must send the whole-cluster target the API accepts"
+        );
+        assert!(
+            !html.contains("Run <code>dtfs-cli scrub --level deep</code>"),
+            "CLI-punting scrub placeholder must be gone"
         );
     }
 }
