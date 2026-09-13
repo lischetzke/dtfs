@@ -244,6 +244,22 @@ enum VolumesCmd {
         #[arg(long)]
         write_timeout_secs: Option<u32>,
     },
+    /// UIP-3-1 — set or update the volume's anchor policy (Bug AV
+    /// anchor invariant: every chunk keeps >=1 replica on the
+    /// anchor datacenter). Every flag is optional; omitted flags
+    /// keep the current value.
+    SetAnchor {
+        /// Volume id to update.
+        volume_id: String,
+        /// Anchor datacenter (matched case-insensitively against a
+        /// node's registered datacenter). Default keep current.
+        #[arg(long)]
+        datacenter: Option<String>,
+        /// Required tier for the anchor replica. Default keep
+        /// current.
+        #[arg(long)]
+        required_tier: Option<String>,
+    },
 }
 
 /// Bug AV (AV-3-5) — file-level commands. The legacy
@@ -450,6 +466,15 @@ async fn main() -> anyhow::Result<()> {
                 cmd_volumes_set_write_safety(
                     &api, &args.format, &volume_id,
                     min_replicas_before_ack, write_timeout_secs,
+                ).await?
+            }
+            VolumesCmd::SetAnchor {
+                volume_id,
+                datacenter, required_tier,
+            } => {
+                cmd_volumes_set_anchor(
+                    &api, &args.format, &volume_id,
+                    datacenter, required_tier,
                 ).await?
             }
         },
@@ -925,6 +950,46 @@ async fn cmd_volumes_set_write_safety(
     Ok(())
 }
 
+/// UIP-3-1 — `dtfs-cli volumes set-anchor <id> [--datacenter D]
+/// [--required-tier T]`: patch the volume's anchor policy. Only
+/// supplied flags are merged; others keep current values.
+async fn cmd_volumes_set_anchor(
+    api: &ApiClient,
+    format: &OutputFormat,
+    volume_id: &str,
+    datacenter: Option<String>,
+    required_tier: Option<String>,
+) -> anyhow::Result<()> {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = datacenter { body.insert("datacenter".into(), v.into()); }
+    if let Some(v) = required_tier { body.insert("required_tier".into(), v.into()); }
+    let body = serde_json::Value::Object(body);
+
+    let url = format!("/api/v1/volumes/{}/set-anchor", volume_id);
+    let resp = api.post(&url, &body).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => {
+            let changed = resp["changed"].as_bool().unwrap_or(false);
+            let a = &resp["config"]["anchor"];
+            println!(
+                "Volume '{}' set-anchor: {}",
+                volume_id,
+                if changed { "applied" } else { "no-op" },
+            );
+            println!(
+                "  datacenter:     {}",
+                a["datacenter"].as_str().unwrap_or(""),
+            );
+            println!(
+                "  required_tier:  {}",
+                a["required_tier"].as_str().unwrap_or(""),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// AV-3-5 — `dtfs-cli files flush-cache <path> [--cache-tiers warm,hot]`:
 /// drop cache replicas under a path prefix. Thin wrapper over
 /// `POST /api/v1/files/flush_cache` (AV-1-9).
@@ -1366,5 +1431,27 @@ mod audit_co_tests {
         // The explicit forms still parse.
         assert!(Args::try_parse_from(["dtfs-cli", "maintenance", "n1", "--enable"]).is_ok());
         assert!(Args::try_parse_from(["dtfs-cli", "maintenance", "n1", "--disable"]).is_ok());
+    }
+
+    // UIP-3-1 — `volumes set-anchor <id> --datacenter D` parses into the
+    // expected variant/fields.
+    #[test]
+    fn uip_3_1_volumes_set_anchor_parses() {
+        let args = Args::try_parse_from([
+            "dtfs-cli", "volumes", "set-anchor", "default", "--datacenter", "leli",
+        ])
+        .expect("set-anchor should parse");
+        match args.command {
+            Commands::Volumes(VolumesCmd::SetAnchor {
+                volume_id,
+                datacenter,
+                required_tier,
+            }) => {
+                assert_eq!(volume_id, "default");
+                assert_eq!(datacenter.as_deref(), Some("leli"));
+                assert_eq!(required_tier, None);
+            }
+            other => panic!("expected VolumesCmd::SetAnchor, got {other:?}"),
+        }
     }
 }
