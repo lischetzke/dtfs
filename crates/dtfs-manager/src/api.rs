@@ -5704,6 +5704,7 @@ mod bug_av_set_cache_tests {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // VolumeSchedules fields are deprecated for the scheduler, still the set-schedules wire shape
 mod bug_az_set_schedules_tests {
     //! AZ-1 — pure tests for `apply_set_schedules`. Axum handler
     //! is live-only per the AV-3-5 convention.

@@ -19,9 +19,10 @@ use dtfs_common::types::{AnchorPolicy, VolumeConfig};
 
 use crate::snapshot::{self, StateMachineSnapshot};
 use crate::{
-    legacy_disk_id, merge_chunk_location_entries, ChunkLocationEntry, ClientRequest,
-    ClientResponse, TypeConfig,
+    merge_chunk_location_entries, ChunkLocationEntry, ClientRequest, ClientResponse, TypeConfig,
 };
+#[cfg(test)]
+use crate::legacy_disk_id;
 
 // Re-export type aliases for convenience.
 type LogId = crate::LogId;

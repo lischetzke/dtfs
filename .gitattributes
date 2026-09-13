@@ -1,5 +1,10 @@
-# Shell scripts must stay LF: the Windows operator host syncs its
-# working tree verbatim (tar over SSH) to the Linux builder, and bash
-# chokes on CRLF ("$'\r': command not found" — broke the build wrappers
-# under core.autocrlf=true checkouts).
-*.sh text eol=lf
+# Everything is LF in the repo and in the working tree (the Docker build
+# image is Linux; bash chokes on CRLF). Also silences git's per-file
+# "LF will be replaced by CRLF" warning under core.autocrlf=true.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
