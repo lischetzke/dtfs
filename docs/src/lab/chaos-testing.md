@@ -230,5 +230,25 @@ regardless.
 - [Release testing](./release-testing.md) — the full release gate and its env.
 - [Failure Scenarios](./failure-scenarios.md) — the behaviours these cases
   exercise.
-- `plans/active/PLAN-REL-CHAOS-SUITE.md` — design, task status, verification
-  log.
+
+## Design notes (from the 2026-06 chaos-suite work)
+
+- Topology is `3dc` (`tests/proxmox/inventory-3dc.json`: one Raft voter
+  per DC, two data nodes per DC, one client per DC, dc-a is the anchor DC
+  and holds `cold`). One DC can fail with quorum intact, so recovery is
+  observable; a LELI-style total outage (all voters plus the anchor in
+  one DC) is deliberately not part of the gate.
+- The suite provisions a clean cluster per run and tears it down
+  (`--provision`, kept alive with `KEEP_CLUSTER=1`). Hypervisor chaos
+  (power a DC off/on, detach/attach a disk) goes through
+  `tests/proxmox/pve-chaos.ps1`, gated by `ALLOW_PVE_CHAOS`.
+- Cases assert true end state through read-only manager APIs added for
+  this purpose: `NodeResponse.total_bytes_read/_written` and the
+  per-replica `{node_id, disk_id, tier}` list in the file inspect
+  endpoint; `/api/v1/migrations` exposes the scheduler's tasks directly.
+- Cases 42 (cross-DC read routing), 43 (DC power-off read continuity),
+  44 (DC power-on recovery), 45 (disk failure + backfill), 46
+  (auto-balance convergence), 47 (per-DC cache promote/demote) and 48
+  (cross-DC read under shaping) were authored and syntax-checked; their
+  live run on the 3dc lab was never completed before the lab went away,
+  so they remain unverified.

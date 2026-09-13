@@ -132,7 +132,6 @@ One line per file. Bug/task history per row: `docs/src/internals/invariants.md` 
 | `dtfs-cli/src/updater.rs` | `dtfs-cli update` — download, verify, atomic install, restart |
 | `scripts/dtfs-release.sh` | Release builder; stamps version, assembles tarball, prints `gh release create` |
 | `dtfs-common/src/tls.rs` | `TlsContext`; all gRPC routes through it; enable only cluster-wide |
-| `plans/active/` | Optional short plans for multi-session work (`plans/README.md`) |
 | `tests/release/`, `tests/proxmox/` | Cluster-only harnesses, dormant without a lab |
 
 ---
@@ -145,7 +144,7 @@ Reproduce/locate → failing test in the purest layer (pure helper > state-machi
 
 ## B.2 Plans
 
-Default: the session todo list. Write `plans/active/PLAN-<short-name>.md` only for work that must survive across sessions: goals, non-goals, a checklist of tasks, open questions. No task IDs, no status columns, no verification log — tick the checklist, delete the file when done. Git history is the archive; there is no `plans/reports/`.
+The session todo list is the only planning tool; there is no plans directory and no plan file format. Work that must outlive a session is carried by what already persists: the commit body (what changed, why, what is still open), `docs/src/internals/invariants.md` § A.8 for behaviour and bug history, and the final chat report for deferred findings (file:line, numbers, fix direction). If the user wants a written plan, they ask for one.
 
 ## B.3 Commits
 
@@ -166,7 +165,7 @@ Observe fail → implement → observe pass → crate suite. New durability/anch
 
 ## B.5 Where things live
 
-`plans/active/` · `docs/src/` (archaeology: `docs/src/internals/invariants.md`) · `crates/<crate>/src/` · `proto/` · `tests/release/` + `tests/proxmox/` (dormant) · `scripts/` · `deploy/examples/*.toml` · `.claude/{agents,rules,hooks}/`. No root status files, no loose `.md` under `crates/`/`tests/`, no in-repo changelog. Config-surface sync (`.claude/rules/config-surface.md`): `dtfs-common/src/config.rs` changes update the examples + docs together.
+`docs/src/` (archaeology: `docs/src/internals/invariants.md`) · `crates/<crate>/src/` · `proto/` · `tests/release/` + `tests/proxmox/` (dormant) · `scripts/` · `deploy/examples/*.toml` · `.claude/{agents,rules,hooks}/`. No root status files, no loose `.md` under `crates/`/`tests/`, no in-repo changelog. Config-surface sync (`.claude/rules/config-surface.md`): `dtfs-common/src/config.rs` changes update the examples + docs together.
 
 ## B.6 Updating this file
 

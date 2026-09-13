@@ -33,7 +33,6 @@ Full table of contents: [`docs/src/SUMMARY.md`](docs/src/SUMMARY.md).
 - `proto/` — Protobuf / gRPC definitions
 - `deploy/` — Docker Compose, sample configs, systemd units
 - `docs/` — mdBook documentation source
-- `plans/` — active work plans (see [plans/README.md](plans/README.md))
 - `tests/` — integration, chaos, performance, and lab harness
 - [`CLAUDE.md`](CLAUDE.md) — canonical guide for contributors and AI agents (Part A: codebase knowledge — architecture, integrity invariants, memory model; Part B: operating discipline)
 - [`CLAUDE.md`](CLAUDE.md) — loaded by Claude Code at session start (do not duplicate it elsewhere)

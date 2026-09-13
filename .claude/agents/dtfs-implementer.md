@@ -14,8 +14,8 @@ dtfs-proto).
 Read first: CLAUDE.md § A.3 (conventions you must not break —
 snapshot compat, memory discipline, integrity, mandatory-vs-cache
 replicas, build-date stamping) and the task you were handed (a
-checklist line from a `plans/active/PLAN-*.md` file, or a one-task fix
-description). If the task touches `dtfs-data/**`, `dtfs-manager/src/
+one-task fix description, or a single item from the caller's todo
+list). If the task touches `dtfs-data/**`, `dtfs-manager/src/
 scheduler.rs`, or `dtfs-raft/**`, also read `.claude/rules/integrity.md`
 (it loads automatically once you read a matching file, but read it
 deliberately first so you don't violate it while writing the fix). Same
@@ -72,8 +72,7 @@ change (`example_*_toml_parses`). Another agent may share the
    notice one nearby — note it instead.
 3. Run the crate test (full workspace suite only for cross-crate
    changes) before declaring done.
-4. If a plan file exists, tick its checklist line in the same commit.
-5. Commit per CLAUDE.md § B.3 (type-prefixed subject, short body, the
+4. Commit per CLAUDE.md § B.3 (type-prefixed subject, short body, the
    `Co-Authored-By:` trailer the caller gave you). Never `--no-verify`,
    never `--amend` a pushed commit, never bypass signing.
 

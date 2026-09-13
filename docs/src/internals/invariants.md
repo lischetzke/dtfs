@@ -466,7 +466,11 @@ Ordering covered by `co_1_3_delocate_order_tests`.
 Heartbeat health detection only (Bug CH): commits node-status
 transitions, fires NodeDown/SMART alerts. MUST NOT schedule repair — the
 2026-06-06 storm came from a monitor-owned evacuation path
-(PLAN-BUG-CH). **Leader-gated (Bug CM):** only the current leader
+(`handle_node_down` queued a replication task per replica of every
+chunk on a node it judged Down, 36k tasks in minutes, leader
+swap-wedged; fixed in PR #27 by making the monitor detection-only,
+counting only live replicas in the scheduler, and fast-failing tasks
+whose target is invalid). **Leader-gated (Bug CM):** only the current leader
 evaluates liveness + commits `UpdateNodeStatus` (and runs
 `check_disk_health`), via the same `metrics.current_leader == id` gate
 as the scheduler (Bug AC); `monitor_status_changes` returns empty
