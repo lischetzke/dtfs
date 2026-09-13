@@ -701,6 +701,48 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     </div>
 </div>
 
+<!-- ── Create volume dialog (UIP-1-1) ── -->
+<div id="create-volume-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeCreateVolume()">
+    <div class="modal-card">
+        <h3>Create volume</h3>
+        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:1rem">
+            Posts <code>CreateVolumeRequest</code> to <code>/api/v1/volumes</code>.
+            Only <code>name</code> is required; every other field falls back
+            to the cluster default when left empty.
+        </div>
+        <div class="modal-row">
+            <label>name</label>
+            <input id="cv-name" class="form-input" type="text" placeholder="e.g. media">
+        </div>
+        <div class="modal-row">
+            <label>chunk_size_mb</label>
+            <input id="cv-chunk-size-mb" class="form-input" type="number" min="1" step="1" placeholder="(cluster default)">
+        </div>
+        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Replication</div>
+        <div class="modal-row">
+            <label>replication_hot</label>
+            <input id="cv-replication-hot" class="form-input" type="number" min="0" max="9" step="1" placeholder="(default)">
+        </div>
+        <div class="modal-row">
+            <label>replication_warm</label>
+            <input id="cv-replication-warm" class="form-input" type="number" min="0" max="9" step="1" placeholder="(default)">
+        </div>
+        <div class="modal-row">
+            <label>replication_cold</label>
+            <input id="cv-replication-cold" class="form-input" type="number" min="0" max="9" step="1" placeholder="(default)">
+        </div>
+        <div class="modal-row">
+            <label>anchor_datacenter</label>
+            <input id="cv-anchor-datacenter" class="form-input" type="text" placeholder="e.g. dc-a">
+        </div>
+        <div class="modal-actions">
+            <button class="btn-secondary" onclick="closeCreateVolume()">Cancel</button>
+            <button class="btn-primary"  onclick="submitCreateVolume()" id="cv-submit">Create volume</button>
+        </div>
+        <div id="cv-result" class="modal-result" style="display:none"></div>
+    </div>
+</div>
+
 <!-- ── Volume edit dialog (inline policy editor) ── -->
 <div id="volume-edit-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeVolumeEdit()">
     <div class="modal-card">
@@ -2193,7 +2235,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         if (!el) return;
         const vols = window._volumesData;
         if (!vols.length) {{
-            el.innerHTML = '<div class="placeholder">No volumes yet. Create one with <code>dtfs-cli volume create</code>.</div>';
+            el.innerHTML = '<div class="placeholder">No volumes yet. Use "+ New volume" above to create one.</div>';
             return;
         }}
         // Actions layout — each action gets its own column so the
@@ -2254,10 +2296,77 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     async function renderVolumes() {{
         document.getElementById('page-content').innerHTML =
             '<div class="page-header"><h2>Volumes</h2><p class="page-desc">Storage volumes, file distribution, and cache policy</p></div>' +
+            '<div style="display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap">' +
+                '<button class="btn-secondary" onclick="openCreateVolume()">+ New volume</button>' +
+            '</div>' +
             '<div id="volumes-list"><div class="placeholder">Loading…</div></div>';
         const data = await fetch('/api/v1/volumes').then(r => r.json()).catch(() => ({{count:0, volumes:[]}}));
         window._volumesData = data.volumes || [];
         rerenderVolumesTable();
+    }}
+
+    // ── Create volume modal (UIP-1-1) ───────────────────────────────
+    function openCreateVolume() {{
+        document.getElementById('cv-name').value = '';
+        document.getElementById('cv-chunk-size-mb').value = '';
+        document.getElementById('cv-replication-hot').value = '';
+        document.getElementById('cv-replication-warm').value = '';
+        document.getElementById('cv-replication-cold').value = '';
+        document.getElementById('cv-anchor-datacenter').value = '';
+        document.getElementById('cv-result').style.display = 'none';
+        document.getElementById('create-volume-modal').classList.remove('hidden');
+    }}
+
+    function closeCreateVolume() {{
+        document.getElementById('create-volume-modal').classList.add('hidden');
+    }}
+
+    async function submitCreateVolume() {{
+        const name = document.getElementById('cv-name').value.trim();
+        if (!name) {{ alert('name is required'); return; }}
+
+        const intOrNull = (id) => {{
+            const raw = document.getElementById(id).value.trim();
+            return raw === '' ? null : parseInt(raw, 10);
+        }};
+        const dc = document.getElementById('cv-anchor-datacenter').value.trim();
+        const body = {{
+            name: name,
+            chunk_size_mb: intOrNull('cv-chunk-size-mb'),
+            replication_hot: intOrNull('cv-replication-hot'),
+            replication_warm: intOrNull('cv-replication-warm'),
+            replication_cold: intOrNull('cv-replication-cold'),
+            anchor_datacenter: dc === '' ? null : dc,
+        }};
+
+        const btn = document.getElementById('cv-submit');
+        btn.disabled = true; btn.textContent = 'Creating…';
+        const result = document.getElementById('cv-result');
+        result.style.display = 'block';
+        result.textContent = 'Submitting…';
+
+        try {{
+            const {{ resp, text, json, authError }} = await mutateFetch(
+                '/api/v1/volumes',
+                {{ body: JSON.stringify(body) }}
+            );
+            if (resp.ok) {{
+                result.style.color = 'var(--success)';
+                result.textContent = 'Created volume ' + ((json && json.volume_id) || name) + '.';
+                setTimeout(async () => {{
+                    closeCreateVolume();
+                    await renderVolumes();
+                }}, 800);
+            }} else {{
+                result.style.color = 'var(--danger)';
+                result.textContent = authError || ('Failed: ' + (text || JSON.stringify(json)));
+            }}
+        }} catch (e) {{
+            result.style.color = 'var(--danger)';
+            result.textContent = 'network error: ' + e;
+        }} finally {{
+            btn.disabled = false; btn.textContent = 'Create volume';
+        }}
     }}
 
     // ── Volume policy edit modal (AV-4-4) ─────────────────────────
@@ -3500,6 +3609,54 @@ mod bug_bk_scrub_tests {
         assert!(
             !html.contains("shared_secret = \""),
             "must not embed a shared_secret value in HTML"
+        );
+    }
+}
+
+/// UIP-1-1 — the Volumes page's old placeholder pointed operators at
+/// `dtfs-cli volume create`, but the webui had no create-volume path of its
+/// own. Replaced with a modal that POSTs `CreateVolumeRequest` to
+/// `/api/v1/volumes` via `mutateFetch`.
+#[cfg(test)]
+mod create_volume_modal_tests {
+    use super::*;
+
+    #[test]
+    fn create_volume_modal_present_and_wired_through_mutate_fetch() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        // Modal container + every CreateVolumeRequest field must be present.
+        for needle in [
+            "id=\"create-volume-modal\"",
+            "id=\"cv-name\"",
+            "id=\"cv-chunk-size-mb\"",
+            "id=\"cv-replication-hot\"",
+            "id=\"cv-replication-warm\"",
+            "id=\"cv-replication-cold\"",
+            "id=\"cv-anchor-datacenter\"",
+        ] {
+            assert!(html.contains(needle), "create-volume modal missing: {needle}");
+        }
+        // The submit path must go through mutateFetch, not an inline fetch.
+        assert!(
+            html.contains("mutateFetch(\n                '/api/v1/volumes',"),
+            "create-volume submit must POST via mutateFetch"
+        );
+        assert!(
+            html.contains("function submitCreateVolume"),
+            "expected a submitCreateVolume() handler"
+        );
+        assert!(
+            html.contains("openCreateVolume()"),
+            "Volumes page must expose a way to open the create-volume modal"
+        );
+    }
+
+    #[test]
+    fn old_cli_creation_placeholder_is_gone() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        assert!(
+            !html.contains("Create one with <code>dtfs-cli volume create</code>"),
+            "old dtfs-cli-only volume creation placeholder must be removed"
         );
     }
 }
