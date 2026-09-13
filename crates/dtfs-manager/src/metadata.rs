@@ -460,6 +460,26 @@ pub(crate) fn is_forward_to_leader_err(msg: &str) -> bool {
     msg.contains("forward request to") || msg.contains("ForwardToLeader")
 }
 
+/// MGR-HB-1 — map the outcome of a heartbeat liveness write
+/// (`UpdateNodeUsage` / `UpdateNodeStatus(healthy)`) onto the gRPC status
+/// the data node sees. Transport/forward failures pass through unchanged
+/// (they are already `unavailable`); an apply-level "node not found"
+/// becomes `NOT_FOUND` so the data node re-registers instead of
+/// heartbeating an id the state machine no longer knows; any other apply
+/// error is `internal`. Pure so it is unit-testable.
+pub(crate) fn liveness_write_status(
+    res: Result<ClientResponse, Status>,
+) -> Result<(), Status> {
+    match res {
+        Ok(ClientResponse::Error { message }) if message.contains("node not found") => {
+            Err(Status::not_found(message))
+        }
+        Ok(ClientResponse::Error { message }) => Err(Status::internal(message)),
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// CO-2-2 — does a forwarded write carry an acceptable shared secret?
 ///
 /// `configured` is the leader's `config.cluster.shared_secret`. When it is
@@ -567,6 +587,9 @@ fn require_mgr_rpc_auth(
 pub(crate) async fn write_via_leader(
     raft: &DtfsRaft,
     voters: &[dtfs_common::config::InitialVoter],
+    // MGR-MON-3 — live raft membership (the monitor's SM snapshot) so a
+    // CF-2-promoted leader absent from `initial_voters` still resolves.
+    membership_nodes: &std::collections::BTreeMap<u64, RaftNodeInfo>,
     tls: &dtfs_common::tls::TlsContext,
     // CO-2-2 — cluster shared secret stamped onto the forward so the
     // leader authenticates it (see `forward_secret_ok`).
@@ -589,13 +612,12 @@ pub(crate) async fn write_via_leader(
                 .borrow_watched()
                 .current_leader
                 .ok_or_else(|| "no leader to forward to".to_string())?;
-            // CO-3-9 — this caller (the health monitor) does not hold the
-            // state-machine membership map, so it resolves from the voter
-            // set only. The membership-preferring path is the heartbeat
-            // forward (`proxy_to_leader`), which passes the live SM nodes.
-            let leader_addr =
-                resolve_leader_addr(voters, &std::collections::BTreeMap::new(), leader_id)
-                    .ok_or_else(|| format!("leader {leader_id} not in cluster.initial_voters"))?;
+            // CO-3-9 / MGR-MON-3 — membership first (covers a leader
+            // promoted after bootstrap), `initial_voters` as the fallback.
+            let leader_addr = resolve_leader_addr(voters, membership_nodes, leader_id)
+                .ok_or_else(|| {
+                    format!("leader {leader_id} not in raft membership or cluster.initial_voters")
+                })?;
             let max_bytes = dtfs_common::config::max_message_bytes(max_message_size_mb);
             let mut client = tls
                 .connect(&leader_addr)
@@ -717,6 +739,35 @@ fn new_chunk_location(chunk_hash: &str, size: u64, chunk_index: u64) -> ChunkLoc
         node_tiers: Vec::new(),
         node_locations: Vec::new(),
         chunk_index,
+    }
+}
+
+/// MGR-LOC-1 — is this chunk row servable right now? Same test as the
+/// scheduler's `live_replica_tier`: node registered and not Down/Failed,
+/// disk present and not Failed/Removed. A legacy row with the `u32::MAX`
+/// disk sentinel is judged on the node alone.
+pub(crate) fn replica_is_live(sm: &StateMachineData, c: &ChunkLocationEntry) -> bool {
+    let Ok(id) = c.node_id.parse::<u64>() else {
+        return true; // pre-numeric row: nothing to judge against
+    };
+    let Some(n) = sm.nodes.get(&id) else {
+        return false;
+    };
+    if matches!(
+        n.health,
+        dtfs_common::types::HealthStatus::Down | dtfs_common::types::HealthStatus::Failed
+    ) {
+        return false;
+    }
+    if c.disk_id == dtfs_raft::legacy_disk_id() {
+        return true;
+    }
+    match n.disks.iter().find(|d| d.disk_id == c.disk_id) {
+        Some(d) => !matches!(
+            d.status,
+            dtfs_common::types::DiskStatus::Failed | dtfs_common::types::DiskStatus::Removed
+        ),
+        None => false,
     }
 }
 
@@ -1057,8 +1108,30 @@ impl ManagerService for MetadataService {
         // chunks that happen to share a hash are never merged into one entry,
         // which would cause the client to see fewer chunks than the file has
         // (fix for issue #12).
+        // MGR-LOC-1 — hand the client only replicas it can actually read:
+        // a row whose node is Down/Failed or whose disk is Failed/Removed
+        // (`live_replica_tier`, the scheduler's own definition) is dropped.
+        // Pre-fix every row was returned and the FUSE client walked the
+        // dead ones with a full `chunk_read_timeout_secs` (60 s) each
+        // before reaching a live copy. If NO row of a chunk is live the
+        // dead rows are kept (a stale health mark must not turn a readable
+        // chunk into ENOENT), so the change only ever prunes, never empties.
         let mut by_chunk: BTreeMap<u64, ChunkLocationInfo> = BTreeMap::new();
+        let mut live_by_index: std::collections::HashMap<u64, bool> =
+            std::collections::HashMap::new();
         for c in &file.chunks {
+            let live = replica_is_live(&data, c);
+            live_by_index
+                .entry(c.chunk_index)
+                .and_modify(|l| *l |= live)
+                .or_insert(live);
+        }
+        for c in &file.chunks {
+            if live_by_index.get(&c.chunk_index).copied().unwrap_or(false)
+                && !replica_is_live(&data, c)
+            {
+                continue;
+            }
             let addr = resolve_node_contact(&data, &c.node_id);
             // U4: derive this replica's storage tier from the disk it lives
             // on (node.disks[disk_id].tier), positionally aligned with
@@ -1295,8 +1368,18 @@ impl ManagerService for MetadataService {
             )
         };
 
-        let _ = self
-            .raft_write_or_forward(ClientRequest::UpdateNodeUsage {
+        // MGR-HB-1 — the liveness write is the whole point of a heartbeat:
+        // `last_seen_ms` only advances through this commit, and the leader's
+        // monitor judges Down from it. Pre-fix this was `let _ =`, so a
+        // data node heartbeating a follower/learner that could not reach the
+        // leader (cross-DC learner on a flaky link) saw `Ok` forever while
+        // the leader marked it Down after 30 s; the node never counted a
+        // failure and never walked its manager list. Surface the failure as
+        // a gRPC error so the data node's failure counter trips and it
+        // reconnects elsewhere; a "node not found" apply error becomes
+        // NOT_FOUND so the data node re-registers.
+        liveness_write_status(
+            self.raft_write_or_forward(ClientRequest::UpdateNodeUsage {
                 node_id,
                 used_capacity: req.total_bytes_used,
                 chunk_count: req.total_chunks,
@@ -1307,7 +1390,8 @@ impl ManagerService for MetadataService {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0),
             })
-            .await;
+            .await,
+        )?;
 
         // Bug AU — refresh per-disk usage from the heartbeat so the
         // Nodes-page disk table (Bug AR) tracks reality across the
@@ -1357,12 +1441,15 @@ impl ManagerService for MetadataService {
         // Maintenance/Draining (and Quarantined) are sticky: a heartbeat
         // must not clear an operator drain within one cycle.
         if heartbeat_may_mark_healthy(current_health) {
-            let _ = self
-                .raft_write_or_forward(ClientRequest::UpdateNodeStatus {
+            // MGR-HB-1 — same contract as the UpdateNodeUsage write above:
+            // a dropped `healthy` commit leaves a recovered node Down.
+            liveness_write_status(
+                self.raft_write_or_forward(ClientRequest::UpdateNodeStatus {
                     node_id,
                     status: "healthy".to_string(),
                 })
-                .await;
+                .await,
+            )?;
         }
 
         // Bug BF-6 / REV-3-8 — process the integrity faults the data node

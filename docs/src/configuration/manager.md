@@ -287,13 +287,13 @@ evaluation_interval_secs = 3600
 
 ## `[monitoring]` -- Node Health Monitoring
 
-Controls how the manager monitors the health of data nodes through heartbeats.
+Controls how the manager monitors the health of data nodes through heartbeats. The leader's health monitor derives its thresholds from this block at startup: `suspect = heartbeat_interval_secs * suspect_after_missed`, `down = heartbeat_interval_secs * down_after_missed` (clamped to at least one interval above suspect). Data nodes heartbeat every 5 s (fixed); keep `heartbeat_interval_secs` at 5 unless that changes.
 
 | Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
 |--------|-----------|------|---------|-------------|-------------|-------------|
-| `heartbeat_interval_secs` | `monitoring.heartbeat_interval_secs` | `u64` | `5` | 1--300 | Yes | Expected interval in seconds between data node heartbeats. |
-| `suspect_after_missed` | `monitoring.suspect_after_missed` | `u32` | `3` | 1--100 | Yes | Number of consecutive missed heartbeats before a node is marked as suspect. A suspect node is still considered available but may be experiencing issues. |
-| `down_after_missed` | `monitoring.down_after_missed` | `u32` | `6` | 1--100 | Yes | Number of consecutive missed heartbeats before a node is marked as down. A down node triggers re-replication of its chunks. Must be greater than `suspect_after_missed`. |
+| `heartbeat_interval_secs` | `monitoring.heartbeat_interval_secs` | `u64` | `5` | 1--300 | No (restart) | Expected interval in seconds between data node heartbeats. |
+| `suspect_after_missed` | `monitoring.suspect_after_missed` | `u32` | `3` | 1--100 | No (restart) | Number of consecutive missed heartbeats before a node is marked as suspect. A suspect node is still considered available but may be experiencing issues. |
+| `down_after_missed` | `monitoring.down_after_missed` | `u32` | `6` | 1--100 | No (restart) | Number of consecutive missed heartbeats before a node is marked as down. A down node triggers re-replication of its chunks. Must be greater than `suspect_after_missed`. |
 
 ### Example
 

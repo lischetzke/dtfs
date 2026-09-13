@@ -136,11 +136,24 @@ async fn main() -> anyhow::Result<()> {
     // (heartbeats then under-report used_capacity to the manager, which
     // diverges from df). Runs in startup so the first heartbeat carries
     // accurate numbers.
-    if let Err(e) = chunk_store.rescan_existing_chunks().await {
-        tracing::warn!(
-            error = %e,
-            "rescan_existing_chunks failed; bytes_stored counter starts at 0"
-        );
+    // DATA-START-1 — the rescan stat()s every `.dat` on every disk. On the
+    // 50 TB LELI archive that is millions of stats on an HDD, i.e. minutes
+    // to hours during which (pre-fix) the gRPC server had not bound and the
+    // node had not registered — the whole node read as Down for the length
+    // of an inventory walk on every restart. Run it in the background: the
+    // server binds and heartbeats immediately with counters that start at
+    // 0 and snap to the on-disk truth when the walk completes
+    // (`rescan_existing_chunks` folds in puts that landed meanwhile).
+    {
+        let rescan_store = chunk_store.clone();
+        tokio::spawn(async move {
+            if let Err(e) = rescan_store.rescan_existing_chunks().await {
+                tracing::warn!(
+                    error = %e,
+                    "rescan_existing_chunks failed; bytes_stored counter stays at the live delta"
+                );
+            }
+        });
     }
 
     // Bug BU-6 — reclaim any leftover streaming *.dat.tmp files. At startup
@@ -362,6 +375,71 @@ async fn wait_for_terminate_signal() {
     }
 }
 
+/// DATA-REG-1 — register (or re-register) with the manager cluster until
+/// accepted, rotating endpoints on RPC failure. Returns the assigned node
+/// id. Called once at startup and again whenever a heartbeat answers
+/// NOT_FOUND (the state machine no longer knows this node: a rebuilt
+/// cluster, a decommission that was later reverted, a rolled-back
+/// snapshot). Pre-fix registration ran exactly once per process, so a node
+/// dropped from `sm.nodes` heartbeated an unknown id until someone
+/// restarted the daemon.
+async fn register_with_manager(
+    client: &mut ManagerServiceClient<tonic::transport::Channel>,
+    current_endpoint_idx: &mut usize,
+    manager_endpoints: &[String],
+    tls: &dtfs_common::tls::TlsContext,
+    build_register_req: &(dyn Fn() -> RegisterNodeRequest + Sync),
+    max_backoff: Duration,
+) -> String {
+    let mut reg_backoff = Duration::from_secs(1);
+    loop {
+        let req = build_register_req();
+        match client.register_node(control_request(req)).await {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                if resp.accepted {
+                    tracing::info!(
+                        "Registered with manager, assigned node_id: {}",
+                        resp.node_id
+                    );
+                    return resp.node_id;
+                } else {
+                    tracing::warn!(
+                        "Manager rejected registration; retrying in {:?}",
+                        reg_backoff
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "RegisterNode RPC failed: {} — walking manager list in {:?}",
+                    e,
+                    reg_backoff
+                );
+                // Try the other endpoints before backing off.
+                let n = manager_endpoints.len();
+                let mut switched = false;
+                for offset in 1..=n {
+                    let idx = (*current_endpoint_idx + offset) % n;
+                    let ep = &manager_endpoints[idx];
+                    if let Ok(c) = tls.connect(ep).await.map(ManagerServiceClient::new) {
+                        *client = c;
+                        *current_endpoint_idx = idx;
+                        tracing::info!("Switched to manager at {}", ep);
+                        switched = true;
+                        break;
+                    }
+                }
+                if !switched {
+                    tracing::debug!("no alternate manager reachable yet");
+                }
+            }
+        }
+        tokio::time::sleep(reg_backoff).await;
+        reg_backoff = (reg_backoff * 2).min(max_backoff);
+    }
+}
+
 /// Register with the manager and send periodic heartbeats.
 ///
 /// `chunk_store` is used to read live chunk/byte counts for each heartbeat.
@@ -500,53 +578,15 @@ async fn manager_lifecycle(
         build_date: dtfs_common::version::BUILD_DATE.to_string(),
     };
 
-    let mut reg_backoff = Duration::from_secs(1);
-    let node_id = loop {
-        let req = build_register_req();
-        match client.register_node(control_request(req)).await {
-            Ok(resp) => {
-                let resp = resp.into_inner();
-                if resp.accepted {
-                    tracing::info!(
-                        "Registered with manager, assigned node_id: {}",
-                        resp.node_id
-                    );
-                    break resp.node_id;
-                } else {
-                    tracing::warn!(
-                        "Manager rejected registration; retrying in {:?}",
-                        reg_backoff
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "RegisterNode RPC failed: {} — walking manager list in {:?}",
-                    e,
-                    reg_backoff
-                );
-                // Try the other endpoints before backing off.
-                let n = manager_endpoints.len();
-                let mut switched = false;
-                for offset in 1..=n {
-                    let idx = (current_endpoint_idx + offset) % n;
-                    let ep = &manager_endpoints[idx];
-                    if let Ok(c) = tls.connect(ep).await.map(ManagerServiceClient::new) {
-                        client = c;
-                        current_endpoint_idx = idx;
-                        tracing::info!("Switched to manager at {}", ep);
-                        switched = true;
-                        break;
-                    }
-                }
-                if !switched {
-                    tracing::debug!("no alternate manager reachable yet");
-                }
-            }
-        }
-        tokio::time::sleep(reg_backoff).await;
-        reg_backoff = (reg_backoff * 2).min(max_backoff);
-    };
+    let mut node_id = register_with_manager(
+        &mut client,
+        &mut current_endpoint_idx,
+        &manager_endpoints,
+        &tls,
+        &build_register_req,
+        max_backoff,
+    )
+    .await;
 
     // Heartbeat loop.
     let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -868,6 +908,33 @@ async fn manager_lifecycle(
                 // line 514.
                 if !drained_faults.is_empty() {
                     integrity_faults.re_enqueue(drained_faults.clone());
+                }
+                // DATA-REG-1 — the manager no longer knows this node id
+                // (MGR-HB-1 maps the apply-level "node not found" to
+                // NOT_FOUND). Re-register instead of heartbeating a ghost.
+                if e.code() == tonic::Code::NotFound {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        error = %e,
+                        "DATA-REG-1: manager does not know this node any more; re-registering"
+                    );
+                    if !drained_scrubs.is_empty() {
+                        chunk_store.restore_scrub_results(drained_scrubs);
+                    }
+                    if !per_chunk.is_empty() {
+                        data_metrics.restore_per_chunk(per_chunk);
+                    }
+                    node_id = register_with_manager(
+                        &mut client,
+                        &mut current_endpoint_idx,
+                        &manager_endpoints,
+                        &tls,
+                        &build_register_req,
+                        max_backoff,
+                    )
+                    .await;
+                    consecutive_failures = 0;
+                    continue;
                 }
                 // CO-5-6 — the same heartbeat carried drained scrub
                 // results and harvested per-chunk read counters; both

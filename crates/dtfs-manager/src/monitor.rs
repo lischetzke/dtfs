@@ -33,9 +33,48 @@ use tracing::{debug, info, warn};
 use crate::cluster::NodeStatus;
 
 /// Default liveness thresholds (mirror the historical ClusterManager
-/// values). A data node heartbeats every 5 s.
+/// values). A data node heartbeats every 5 s. MGR-MON-1 — the live values
+/// come from `[monitoring]` (`heartbeat_interval_secs *
+/// suspect_after_missed` / `* down_after_missed`, see
+/// `liveness_thresholds_ms`); these constants are the test defaults.
 const SUSPECT_MS: u64 = 15_000;
 const DOWN_MS: u64 = 30_000;
+
+/// MGR-MON-1 — derive the monitor's `(suspect_ms, down_ms)` from the
+/// operator's `[monitoring]` block. Pre-fix the block was parsed and shown
+/// by `/api/v1/config` but never read: the monitor hardcoded 15 s / 30 s,
+/// so tuning it had no effect. `down` is clamped to be strictly above
+/// `suspect` so a misordered pair cannot skip the Suspect state.
+pub(crate) fn liveness_thresholds_ms(cfg: &dtfs_common::config::MonitoringConfig) -> (u64, u64) {
+    let hb_ms = cfg.heartbeat_interval_secs.max(1).saturating_mul(1000);
+    let suspect = hb_ms.saturating_mul(u64::from(cfg.suspect_after_missed.max(1)));
+    let down = hb_ms
+        .saturating_mul(u64::from(cfg.down_after_missed.max(1)))
+        .max(suspect.saturating_add(hb_ms));
+    (suspect, down)
+}
+
+/// MGR-MON-2 — `last_seen_ms` is stamped by whichever manager received the
+/// heartbeat, but judged against THIS (leader) manager's clock. A receiver
+/// clock ahead of the leader's by more than this hides staleness; one
+/// behind it fakes staleness and can mark a live node Suspect/Down. Log
+/// the ahead case (the only one observable from here) so an operator sees
+/// the skew instead of an unexplained flap.
+const CLOCK_SKEW_WARN_MS: u64 = 5_000;
+
+pub(crate) fn clock_skew_suspects(
+    nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+    now_ms: u64,
+) -> Vec<(u64, u64)> {
+    nodes
+        .iter()
+        .filter(|(_, i)| i.role == NodeRole::Data && i.last_seen_ms > 0)
+        .filter_map(|(id, i)| {
+            let ahead = i.last_seen_ms.saturating_sub(now_ms);
+            (ahead > CLOCK_SKEW_WARN_MS).then_some((*id, ahead))
+        })
+        .collect()
+}
 
 /// Bug CJ — compute health transitions from the REPLICATED `last_seen_ms`
 /// in the state machine, not a per-manager in-memory heartbeat map.
@@ -149,6 +188,9 @@ fn now_millis() -> u64 {
 /// Periodic health monitoring loop.
 pub struct HealthMonitor {
     check_interval: Duration,
+    /// MGR-MON-1 — liveness thresholds derived from `[monitoring]`.
+    suspect_ms: u64,
+    down_ms: u64,
     state_data: Arc<RwLock<StateMachineData>>,
     /// Raft handle used to commit node-status changes to the cluster state machine.
     raft: Arc<DtfsRaft>,
@@ -173,6 +215,7 @@ pub struct HealthMonitor {
 impl HealthMonitor {
     pub fn new(
         check_interval: Duration,
+        monitoring: &dtfs_common::config::MonitoringConfig,
         state_data: Arc<RwLock<StateMachineData>>,
         raft: Arc<DtfsRaft>,
         voters: Vec<dtfs_common::config::InitialVoter>,
@@ -180,8 +223,11 @@ impl HealthMonitor {
         shared_secret: String,
         max_message_size_mb: u32,
     ) -> Self {
+        let (suspect_ms, down_ms) = liveness_thresholds_ms(monitoring);
         Self {
             check_interval,
+            suspect_ms,
+            down_ms,
             state_data,
             raft,
             voters,
@@ -202,8 +248,10 @@ impl HealthMonitor {
     /// tokio task and runs indefinitely.
     pub async fn run(&self) {
         info!(
-            "Health monitor started (interval: {:?})",
-            self.check_interval
+            interval = ?self.check_interval,
+            suspect_ms = self.suspect_ms,
+            down_ms = self.down_ms,
+            "Health monitor started"
         );
 
         let mut interval = tokio::time::interval(self.check_interval);
@@ -223,10 +271,36 @@ impl HealthMonitor {
 
             // Bug CJ — judge liveness from the replicated `last_seen_ms` (not a
             // per-manager heartbeat map). Bug CM — only on the leader.
-            let changes = {
+            let (changes, membership_nodes) = {
                 let now_ms = now_millis();
                 let sm = self.state_data.read().await;
-                monitor_status_changes(&sm.nodes, now_ms, SUSPECT_MS, DOWN_MS, is_leader)
+                if is_leader {
+                    for (node_id, ahead_ms) in clock_skew_suspects(&sm.nodes, now_ms) {
+                        warn!(
+                            node_id,
+                            ahead_ms,
+                            "MGR-MON-2: data node last_seen_ms is ahead of this leader's clock; \
+                             the receiving manager's clock is skewed (check NTP) - liveness \
+                             judgements for this node are unreliable"
+                        );
+                    }
+                }
+                let changes = monitor_status_changes(
+                    &sm.nodes,
+                    now_ms,
+                    self.suspect_ms,
+                    self.down_ms,
+                    is_leader,
+                );
+                // MGR-MON-3 — snapshot the raft membership only when there is
+                // something to commit, so the leader-forward below can resolve
+                // a CF-2-promoted leader absent from `initial_voters`.
+                let membership_nodes = if changes.is_empty() {
+                    std::collections::BTreeMap::new()
+                } else {
+                    sm.nodes.clone()
+                };
+                (changes, membership_nodes)
             };
 
             for (node_id, status) in &changes {
@@ -238,7 +312,7 @@ impl HealthMonitor {
                         );
                         // Commit the suspect status to the cluster state machine so
                         // placement can avoid new writes to this node.
-                        self.update_node_status_in_raft(*node_id, "suspect").await;
+                        self.update_node_status_in_raft(*node_id, "suspect", &membership_nodes).await;
                     }
                     NodeStatus::Down => {
                         warn!("Node {} is DOWN", node_id);
@@ -247,7 +321,7 @@ impl HealthMonitor {
                         // stops counting its replicas (Bug CH:
                         // live_replica_tier) and backfills the lost
                         // copies. No repair is scheduled from here.
-                        self.update_node_status_in_raft(*node_id, "down").await;
+                        self.update_node_status_in_raft(*node_id, "down", &membership_nodes).await;
                         if let Some(alerts) = &self.alerts {
                             alerts.fire(
                                 crate::alerts::AlertKind::NodeDown,
@@ -258,7 +332,7 @@ impl HealthMonitor {
                     }
                     NodeStatus::Healthy => {
                         // Node recovered — restore healthy status in Raft.
-                        self.update_node_status_in_raft(*node_id, "healthy").await;
+                        self.update_node_status_in_raft(*node_id, "healthy", &membership_nodes).await;
                     }
                 }
             }
@@ -282,7 +356,12 @@ impl HealthMonitor {
     /// heartbeat receiver happened to be the leader — caught by release
     /// case 55). Failures stay at debug: with no leader at all there is
     /// nobody to commit to, and the next 10s tick retries.
-    async fn update_node_status_in_raft(&self, node_id: u64, status: &str) {
+    async fn update_node_status_in_raft(
+        &self,
+        node_id: u64,
+        status: &str,
+        membership_nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+    ) {
         let req = ClientRequest::UpdateNodeStatus {
             node_id,
             status: status.to_string(),
@@ -290,6 +369,7 @@ impl HealthMonitor {
         match crate::metadata::write_via_leader(
             &self.raft,
             &self.voters,
+            membership_nodes,
             &self.tls,
             &self.shared_secret,
             self.max_message_size_mb,
@@ -335,6 +415,74 @@ impl HealthMonitor {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mgr_mon_threshold_tests {
+    use super::{clock_skew_suspects, liveness_thresholds_ms};
+    use dtfs_common::config::MonitoringConfig;
+    use dtfs_common::types::NodeRole;
+
+    #[test]
+    fn defaults_reproduce_the_historical_15s_30s() {
+        let cfg = MonitoringConfig {
+            heartbeat_interval_secs: 5,
+            suspect_after_missed: 3,
+            down_after_missed: 6,
+        };
+        assert_eq!(liveness_thresholds_ms(&cfg), (15_000, 30_000));
+    }
+
+    #[test]
+    fn operator_values_are_honoured() {
+        let cfg = MonitoringConfig {
+            heartbeat_interval_secs: 10,
+            suspect_after_missed: 2,
+            down_after_missed: 9,
+        };
+        assert_eq!(liveness_thresholds_ms(&cfg), (20_000, 90_000));
+    }
+
+    #[test]
+    fn down_is_always_strictly_above_suspect() {
+        let cfg = MonitoringConfig {
+            heartbeat_interval_secs: 5,
+            suspect_after_missed: 6,
+            down_after_missed: 3,
+        };
+        let (s, d) = liveness_thresholds_ms(&cfg);
+        assert!(d > s, "suspect={s} down={d}");
+    }
+
+    fn node(role: NodeRole, last_seen_ms: u64) -> dtfs_raft::NodeInfo {
+        dtfs_raft::NodeInfo {
+            hostname: String::new(),
+            grpc_addr: String::new(),
+            role,
+            disks: Vec::new(),
+            location: dtfs_common::topology::Location::new("", "", "", ""),
+            health: dtfs_common::types::HealthStatus::Healthy,
+            total_capacity: 0,
+            used_capacity: 0,
+            last_seen_ms,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    #[test]
+    fn skew_flags_only_data_nodes_ahead_of_the_leader_clock() {
+        let mut nodes = std::collections::BTreeMap::new();
+        nodes.insert(1, node(NodeRole::Data, 100_000 + 6_000));
+        nodes.insert(2, node(NodeRole::Data, 100_000 + 1_000));
+        nodes.insert(3, node(NodeRole::Manager, 100_000 + 60_000));
+        let out = clock_skew_suspects(&nodes, 100_000);
+        assert_eq!(out, vec![(1, 6_000)]);
     }
 }
 

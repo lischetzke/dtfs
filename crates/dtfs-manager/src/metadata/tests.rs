@@ -1389,3 +1389,119 @@ mod tests {
         }
     }
 }
+
+mod mgr_hb_liveness_write_status {
+    use super::super::liveness_write_status;
+    use dtfs_raft::ClientResponse;
+    use tonic::{Code, Status};
+
+    #[test]
+    fn success_is_ok() {
+        assert!(liveness_write_status(Ok(ClientResponse::Success)).is_ok());
+    }
+
+    #[test]
+    fn unknown_node_apply_error_is_not_found() {
+        let r = liveness_write_status(Ok(ClientResponse::Error {
+            message: "node not found: 42".into(),
+        }));
+        assert_eq!(r.unwrap_err().code(), Code::NotFound);
+    }
+
+    #[test]
+    fn other_apply_error_is_internal() {
+        let r = liveness_write_status(Ok(ClientResponse::Error {
+            message: "boom".into(),
+        }));
+        assert_eq!(r.unwrap_err().code(), Code::Internal);
+    }
+
+    #[test]
+    fn forward_failure_passes_through_unavailable() {
+        let r = liveness_write_status(Err(Status::unavailable("no leader")));
+        assert_eq!(r.unwrap_err().code(), Code::Unavailable);
+    }
+}
+
+mod mgr_loc_replica_is_live {
+    use super::super::replica_is_live;
+    use dtfs_common::types::{DiskStatus, DiskTier, HealthStatus, NodeRole};
+    use dtfs_raft::state_machine::StateMachineData;
+    use dtfs_common::types::DiskInfo;
+    use dtfs_raft::{ChunkLocationEntry, NodeInfo};
+
+    fn sm_with(health: HealthStatus, disk_status: DiskStatus) -> StateMachineData {
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(
+            7,
+            NodeInfo {
+                hostname: "d".into(),
+                grpc_addr: "http://d:9500".into(),
+                role: NodeRole::Data,
+                disks: vec![DiskInfo {
+                    disk_id: 0,
+                    uuid: String::new(),
+                    mount_path: "/d0".into(),
+                    tier: DiskTier::Cold,
+                    total_bytes: 1,
+                    used_bytes: 0,
+                    status: disk_status,
+                }],
+                location: dtfs_common::topology::Location::new("", "", "", ""),
+                health,
+                total_capacity: 0,
+                used_capacity: 0,
+                last_seen_ms: 0,
+                total_bytes_read: 0,
+                total_bytes_written: 0,
+                client_ip: None,
+                version: String::new(),
+                build_date: String::new(),
+                quarantine: None,
+            },
+        );
+        sm
+    }
+
+    fn row(disk_id: u32) -> ChunkLocationEntry {
+        ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: "h".into(),
+            node_id: "7".into(),
+            disk_id,
+            size_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn healthy_node_healthy_disk_is_live() {
+        assert!(replica_is_live(&sm_with(HealthStatus::Healthy, DiskStatus::Healthy), &row(0)));
+    }
+
+    #[test]
+    fn down_node_is_dead() {
+        assert!(!replica_is_live(&sm_with(HealthStatus::Down, DiskStatus::Healthy), &row(0)));
+    }
+
+    #[test]
+    fn failed_disk_is_dead_even_on_healthy_node() {
+        assert!(!replica_is_live(&sm_with(HealthStatus::Healthy, DiskStatus::Failed), &row(0)));
+    }
+
+    #[test]
+    fn suspect_node_still_counts_as_live() {
+        assert!(replica_is_live(&sm_with(HealthStatus::Suspect, DiskStatus::Healthy), &row(0)));
+    }
+
+    #[test]
+    fn unknown_node_is_dead() {
+        let sm = StateMachineData::default();
+        assert!(!replica_is_live(&sm, &row(0)));
+    }
+
+    #[test]
+    fn legacy_disk_sentinel_judges_node_only() {
+        let sm = sm_with(HealthStatus::Healthy, DiskStatus::Failed);
+        assert!(replica_is_live(&sm, &row(dtfs_raft::legacy_disk_id())));
+    }
+}

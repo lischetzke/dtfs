@@ -230,6 +230,11 @@ impl ChunkStore {
     /// process startup right after disk init, before the heartbeat loop
     /// fires.
     pub async fn rescan_existing_chunks(&self) -> DtfsResult<()> {
+        // DATA-START-1 — the walk now runs concurrently with live traffic.
+        // Remember the counters at the start so puts that commit during
+        // the walk are folded back in at the end instead of being clobbered.
+        let start_count = self.chunk_count.load(Ordering::Relaxed);
+        let start_bytes = self.bytes_stored.load(Ordering::Relaxed);
         let mut total_count: u64 = 0;
         let mut total_bytes: u64 = 0;
 
@@ -270,11 +275,19 @@ impl ChunkStore {
             }
         }
 
-        self.chunk_count.store(total_count, Ordering::Relaxed);
-        self.bytes_stored.store(total_bytes, Ordering::Relaxed);
+        let (final_count, final_bytes) = rescan_totals_with_live_delta(
+            (total_count, total_bytes),
+            (start_count, start_bytes),
+            (
+                self.chunk_count.load(Ordering::Relaxed),
+                self.bytes_stored.load(Ordering::Relaxed),
+            ),
+        );
+        self.chunk_count.store(final_count, Ordering::Relaxed);
+        self.bytes_stored.store(final_bytes, Ordering::Relaxed);
         tracing::info!(
-            chunks = total_count,
-            bytes = total_bytes,
+            chunks = final_count,
+            bytes = final_bytes,
             "ChunkStore startup rescan complete"
         );
         Ok(())
@@ -1609,6 +1622,43 @@ fn tmp_dir(disk_path: &Path) -> PathBuf {
 }
 
 /// Build the WAL directory path for a disk.
+/// DATA-START-1 — combine the on-disk totals a background rescan walked up
+/// with whatever the live counters gained while the walk ran. A chunk that
+/// committed mid-walk may or may not have been seen by the walk; folding in
+/// the delta over-counts by at most those chunks, whereas a plain `store`
+/// silently dropped every one of them. Saturating so a concurrent decrement
+/// can never underflow.
+pub(crate) fn rescan_totals_with_live_delta(
+    walked: (u64, u64),
+    at_start: (u64, u64),
+    now: (u64, u64),
+) -> (u64, u64) {
+    (
+        walked.0.saturating_add(now.0.saturating_sub(at_start.0)),
+        walked.1.saturating_add(now.1.saturating_sub(at_start.1)),
+    )
+}
+
+#[cfg(test)]
+mod data_start_1_rescan_delta_tests {
+    use super::rescan_totals_with_live_delta;
+
+    #[test]
+    fn idle_walk_reports_the_walked_totals() {
+        assert_eq!(rescan_totals_with_live_delta((10, 100), (0, 0), (0, 0)), (10, 100));
+    }
+
+    #[test]
+    fn puts_during_the_walk_are_folded_in() {
+        assert_eq!(rescan_totals_with_live_delta((10, 100), (0, 0), (3, 30)), (13, 130));
+    }
+
+    #[test]
+    fn counters_that_shrank_never_underflow() {
+        assert_eq!(rescan_totals_with_live_delta((10, 100), (5, 50), (2, 20)), (10, 100));
+    }
+}
+
 fn wal_dir(disk_path: &Path) -> PathBuf {
     disk_path.join(".dtfs").join("wal")
 }

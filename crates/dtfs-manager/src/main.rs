@@ -468,8 +468,9 @@ async fn main() -> anyhow::Result<()> {
 
     // P0-1: Lease GC — sweeps expired write leases every 1s through Raft.
     let lease_gc_raft = raft.clone();
+    let lease_gc_sm = sm_data.clone();
     let _lease_gc_handle = tokio::spawn(async move {
-        TaskScheduler::run_lease_gc(lease_gc_raft).await;
+        TaskScheduler::run_lease_gc(lease_gc_raft, lease_gc_sm).await;
     });
 
     // --- Tiering engine background task ---
@@ -502,6 +503,7 @@ async fn main() -> anyhow::Result<()> {
     // ClusterManager heartbeat map.
     let health_monitor = HealthMonitor::new(
         Duration::from_secs(10),
+        &config.monitoring,
         sm_data.clone(),
         raft.clone(),
         config.cluster.initial_voters.clone(),

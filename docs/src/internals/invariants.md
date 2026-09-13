@@ -477,6 +477,17 @@ two cross-DC learner managers) — the leader's log is authoritative +
 single-writer. Recovery stays the heartbeat handler's
 `UpdateNodeStatus(healthy)` (any manager, forwarded).
 
+**MGR-MON-1/2/3 (2026-09-13 core review):** the Suspect/Down thresholds
+come from `[monitoring]` via `liveness_thresholds_ms` (they were parsed,
+shown by `/api/v1/config`, and never read: 15 s / 30 s were hardcoded).
+`last_seen_ms` is stamped by the RECEIVING manager's clock and judged by
+the leader's; `clock_skew_suspects` warns when a data node's stamp runs
+ahead of the leader by more than 5 s (the observable half of a skew —
+NTP is mandatory on every manager). The monitor's `write_via_leader`
+now resolves the leader from the live membership first, so a
+CF-2-promoted leader absent from `initial_voters` still receives
+`UpdateNodeStatus`.
+
 ### `dtfs-manager/src/metadata.rs`
 
 gRPC service; thin wrappers over `raft_write(ClientRequest::*)`.
@@ -602,6 +613,29 @@ pure `fn forward_result(&ForwardWriteResponse) -> Result<(), String>`
 inspects `.success`/`.error`; `write_via_leader` now returns its
 verdict instead of discarding the response body.
 
+**MGR-HB-1 (2026-09-13):** the heartbeat handler's `UpdateNodeUsage` and
+`UpdateNodeStatus(healthy)` writes were `let _ =`. A data node whose
+heartbeat landed on a follower/learner that could not reach the leader
+(prod: dc2-data01 -> dc2-mgr01 over Tailscale) saw `Ok` on every beat
+while its replicated `last_seen_ms` froze; the leader marked it Down
+after 30 s, placement and repair treated its replicas as gone, and the
+data node — counting no failures — never walked its manager list.
+`liveness_write_status` now fails the RPC (`unavailable`/`internal`) so
+the data node's failure counter trips, and maps the apply-level "node
+not found" to NOT_FOUND so the data node re-registers (DATA-REG-1).
+
+**MGR-LOC-1 (2026-09-13):** `get_file_locations` returned every chunk
+row including replicas on Down/Failed nodes and Failed/Removed disks;
+the FUSE client walked each dead one for a full `chunk_read_timeout_secs`
+(60 s) before a live copy. `replica_is_live` (the scheduler's
+`live_replica_tier` test) prunes them, keeping every row only when a
+chunk has no live replica at all.
+
+**MGR-GC-1 (2026-09-13):** lease GC proposed `SweepExpiredLeases` once a
+second unconditionally — ~86k fsynced no-op log entries a day and a
+snapshot every ~2.8 h from GC alone. `lease_sweep_due` checks the
+leader's own view first and proposes only when a lease has expired.
+
 ### `dtfs-manager/src/api.rs`
 
 REST endpoints (WebUI + CLI); `get_stats` is the WebUI home aggregator.
@@ -662,6 +696,17 @@ splits the send into fixed-size batches; on the first failed batch
 (transport error or `accepted == false`) the loop re-enqueues that
 batch plus every unsent batch after it — not the whole original set —
 so a batch the manager already accepted is never re-sent on retry.
+
+**DATA-REG-1 / DATA-START-1 (2026-09-13):** registration ran exactly
+once per process; a node dropped from `sm.nodes` (rebuilt cluster,
+rolled-back snapshot) heartbeated an unknown id forever. The heartbeat
+loop now re-runs `register_with_manager` on NOT_FOUND (MGR-HB-1). The
+startup `rescan_existing_chunks` — one `stat` per `.dat`, minutes to
+hours on the 50 TB LELI HDD — ran before the gRPC server bound and before
+registration, so every restart read as a Down node for the length of an
+inventory walk. It now runs in the background after the WAL replay;
+`rescan_totals_with_live_delta` folds puts that landed mid-walk into the
+final counters.
 
 ### `dtfs-data/src/server.rs::record_cache_hit` (CR-5-5, DATA-11)
 
@@ -752,6 +797,16 @@ empty `node_addresses` list; each now `warn!`s at the skip site) — since
 the data node stores a `PutChunkRequest`'s bytes as the chunk's whole
 content from byte 0, and a partial segment would land shifted.
 
+**FUSE-1 (2026-09-13):** the write lease (120 s) was renewed only from
+`write()`/`flush()`; a handle idle past that had its lease swept, the
+next renewal answered conflict, and both arms `bail!`ed with no way
+back. `release()` then dropped the buffer and ghost-unlinked a never-
+committed file: data and namespace entry gone, EIO at close. Both arms
+now call `reacquire_write_lease` under the stored `lease_owner_id`;
+only a lease genuinely held by another writer aborts. The former
+`MigrationTrigger` (one discarded `AllocateChunks` per cross-DC miss,
+manager ring rebuild per call, nothing ever migrated) is deleted.
+
 ### `dtfs-fuse/src/readahead.rs`
 
 See `.claude/rules/fuse.md` for the current prefetch-fan-out and
@@ -773,6 +828,12 @@ cap; do NOT re-add a byte gate. B1: the old `started_fetches:
 Arc<Mutex<Vec<String>>>` test-observability field (pushed on every
 prefetch, never drained — an unbounded production heap leak) is gone.
 
+**FUSE-2 (2026-09-13):** the prefetch `read_chunk` had no deadline; two
+hung replicas pinned both `prefetch_max_inflight` permits for the life
+of the mount. `ReadAheadEngine::new` now takes
+`client.chunk_read_timeout_secs` (`prefetch_timeout`, `0` = unbounded)
+and bounds every background fetch.
+
 ### `dtfs-fuse/src/fuse_adapter.rs`
 
 Cookie scheme at `dir_entry_cookie()` — don't diverge readdir/
@@ -781,6 +842,13 @@ readdirplus (Bug F). CR-1-6 extended the CO-4-16 error-mapping rule (see
 `|_| ENOENT`) and to `mkdir`/`unlink`/`rmdir`/`create`/`rename`/
 `symlink`/`link` (were a bare `EIO`) — every metadata op's error arm now
 goes through `cluster_err_to_errno`.
+
+**FUSE-3/4 (2026-09-13):** `flush()` ignored the kernel's `lock_owner`,
+so a writer that exited holding an `fcntl` lock left it resident and the
+next `F_SETLKW` blocked forever (a mount hang with no cluster fault);
+`release_posix_locks_for_owner` now runs on every flush. `InodeMap::
+inode_for` was get-then-insert, letting two concurrent lookups mint two
+inodes for one path; it mints under the DashMap entry lock.
 
 ## Archive
 

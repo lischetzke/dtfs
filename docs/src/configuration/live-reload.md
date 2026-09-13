@@ -23,9 +23,9 @@ The following tables summarize every option that can be changed at runtime. Opti
 | `[tiering]` | `frozen_threshold_days` | `tiering.frozen_threshold_days` |
 | `[tiering]` | `migration_bandwidth_limit_mbps` | `tiering.migration_bandwidth_limit_mbps` |
 | `[tiering]` | `evaluation_interval_secs` | `tiering.evaluation_interval_secs` |
-| `[monitoring]` | `heartbeat_interval_secs` | `monitoring.heartbeat_interval_secs` |
-| `[monitoring]` | `suspect_after_missed` | `monitoring.suspect_after_missed` |
-| `[monitoring]` | `down_after_missed` | `monitoring.down_after_missed` |
+| `[monitoring]` | `heartbeat_interval_secs` | `monitoring.heartbeat_interval_secs` (accepted, but the health monitor reads it at startup: restart the managers) |
+| `[monitoring]` | `suspect_after_missed` | `monitoring.suspect_after_missed` (same) |
+| `[monitoring]` | `down_after_missed` | `monitoring.down_after_missed` (same) |
 
 ### Data Node (`data.toml`)
 

@@ -304,7 +304,10 @@ impl TaskScheduler {
     /// every second by proposing `SweepExpiredLeases` through Raft. Without
     /// this, an orphan lease (FUSE crashed, network partition, kill -9)
     /// blocks all writers to that path until the lease's lease_ms elapses.
-    pub async fn run_lease_gc(raft: Arc<DtfsRaft>) {
+    pub async fn run_lease_gc(
+        raft: Arc<DtfsRaft>,
+        state_data: Arc<RwLock<StateMachineData>>,
+    ) {
         info!("Lease GC started (1s tick)");
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -319,6 +322,18 @@ impl TaskScheduler {
                 }
             }
             let now_ms = now_millis();
+            // MGR-GC-1 — only propose when the local (leader, hence
+            // authoritative) view holds a lease that has actually expired.
+            // Pre-fix every second appended a synced no-op `SweepExpiredLeases`
+            // entry: ~86k fsynced log writes a day on an idle cluster and a
+            // snapshot every ~2.8 h from lease GC alone.
+            let any_expired = {
+                let sm = state_data.read().await;
+                lease_sweep_due(sm.write_leases.values().map(|l| l.expires_at_ms), now_ms)
+            };
+            if !any_expired {
+                continue;
+            }
             if let Err(e) = raft
                 .client_write(dtfs_raft::ClientRequest::SweepExpiredLeases { now_ms })
                 .await
@@ -405,6 +420,33 @@ impl TaskScheduler {
         self.save_migration_state(&migration_state).await;
 
         Ok(())
+    }
+}
+
+/// MGR-GC-1 — does any lease expiry lie at or before `now_ms`? Mirrors the
+/// apply-side predicate (`expires_at_ms <= now_ms`) so a due sweep is never
+/// skipped and an idle table never proposes.
+pub(crate) fn lease_sweep_due(expiries: impl IntoIterator<Item = u64>, now_ms: u64) -> bool {
+    expiries.into_iter().any(|e| e <= now_ms)
+}
+
+#[cfg(test)]
+mod mgr_gc_lease_sweep_due_tests {
+    use super::lease_sweep_due;
+
+    #[test]
+    fn empty_table_never_sweeps() {
+        assert!(!lease_sweep_due(Vec::<u64>::new(), 1_000));
+    }
+
+    #[test]
+    fn future_leases_do_not_sweep() {
+        assert!(!lease_sweep_due([2_000, 3_000], 1_000));
+    }
+
+    #[test]
+    fn an_expired_lease_sweeps() {
+        assert!(lease_sweep_due([5_000, 1_000], 1_000));
     }
 }
 
