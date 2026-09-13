@@ -134,6 +134,11 @@ enum Commands {
         /// Show current config
         #[arg(long)]
         show: bool,
+        /// UIP-5-1/5-2 (D2) — optional nested subcommand. Bare
+        /// `dtfs-cli config` (action = None) keeps today's GET-and-
+        /// render behaviour byte-for-byte.
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
     },
 
     /// Check manager health
@@ -370,6 +375,31 @@ enum FilesCmd {
         /// Safety gate: must be set to flush an empty prefix.
         #[arg(long)]
         allow_empty_prefix: bool,
+    },
+}
+
+/// UIP-5-1/5-2 (D2) — `dtfs-cli config`'s optional nested subcommand.
+/// `None` (bare `dtfs-cli config`) keeps the existing GET-and-render
+/// behaviour; these are new mutating/read leaves.
+#[derive(clap::Subcommand, Debug)]
+enum ConfigAction {
+    /// UIP-5-1 — apply a config override via `POST /api/v1/config`.
+    /// Mirrors the WebUI Cluster tab's save action.
+    Set {
+        /// Config override as a JSON object string (e.g. the sparse
+        /// `{"defaults":{"chunk_size_mb":64}}` shape `update_config`
+        /// deep-merges onto the startup config).
+        #[arg(long)]
+        config_json: String,
+        /// AZ-5 — also persist the merged config to
+        /// `/etc/dtfs/manager.toml` so the change survives a restart.
+        #[arg(long)]
+        write_to_disk: bool,
+        /// Bug BD-3 — required when `write_to_disk` is set, to
+        /// confirm the operator understands a cluster-wide key
+        /// propagates to every manager.
+        #[arg(long)]
+        acknowledge_cluster_wide: bool,
     },
 }
 
@@ -648,7 +678,16 @@ async fn main() -> anyhow::Result<()> {
             reason,
         } => cmd_decommission(&api, &node_id, &operator_id, &reason).await?,
         Commands::Audit { limit, action } => cmd_audit(&api, &args.format, limit, action).await?,
-        Commands::Config { show: _ } => cmd_config(&api, &args.format).await?,
+        Commands::Config { show: _, action } => match action {
+            None => cmd_config(&api, &args.format).await?,
+            Some(ConfigAction::Set {
+                config_json,
+                write_to_disk,
+                acknowledge_cluster_wide,
+            }) => {
+                cmd_config_set(&api, &config_json, write_to_disk, acknowledge_cluster_wide).await?
+            }
+        },
         Commands::Health => cmd_health(&api).await?,
         Commands::Raft(sub) => match sub {
             RaftCmd::Members => cmd_raft_members(&api, &args.format).await?,
@@ -1617,6 +1656,30 @@ async fn cmd_config(api: &ApiClient, format: &OutputFormat) -> anyhow::Result<()
     Ok(())
 }
 
+/// UIP-5-1 — `dtfs-cli config set --config-json '...' [--write-to-disk]
+/// [--acknowledge-cluster-wide]`: apply a config override via `POST
+/// /api/v1/config`. Surfaces the server's JSON verbatim (including a
+/// 400 "preserved_current" body) and exits non-zero on failure, same
+/// shape as `cmd_unquarantine`/`cmd_decommission`.
+async fn cmd_config_set(
+    api: &ApiClient,
+    config_json: &str,
+    write_to_disk: bool,
+    acknowledge_cluster_wide: bool,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "config_json": config_json,
+        "write_to_disk": write_to_disk,
+        "acknowledge_cluster_wide": acknowledge_cluster_wide,
+    });
+    let (status, value) = api.post_with_status("/api/v1/config", &body).await?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    if !status.is_success() {
+        anyhow::bail!("config set failed: HTTP {}", status);
+    }
+    Ok(())
+}
+
 async fn cmd_health(api: &ApiClient) -> anyhow::Result<()> {
     let health = api.get("/api/v1/health").await?;
     let status = health["status"].as_str().unwrap_or("unknown");
@@ -1986,5 +2049,41 @@ mod audit_co_tests {
         assert!(is_valid_target_tier("tape"));
         assert!(!is_valid_target_tier("lukewarm"));
         assert!(!is_valid_target_tier(""));
+    }
+
+    // UIP-5-1 — bare `config` still parses to `action: None`, preserving
+    // today's GET-and-render behaviour byte-for-byte.
+    #[test]
+    fn uip_5_1_bare_config_has_no_action() {
+        let args = Args::try_parse_from(["dtfs-cli", "config"]).expect("bare config should parse");
+        match args.command {
+            Commands::Config { action, .. } => assert!(action.is_none()),
+            other => panic!("expected Commands::Config, got {other:?}"),
+        }
+    }
+
+    // UIP-5-1 — `config set --config-json '{}' --write-to-disk` parses
+    // into `Some(ConfigAction::Set{..})` with the expected fields.
+    #[test]
+    fn uip_5_1_config_set_parses() {
+        let args = Args::try_parse_from([
+            "dtfs-cli", "config", "set", "--config-json", "{}", "--write-to-disk",
+        ])
+        .expect("config set should parse");
+        match args.command {
+            Commands::Config { action, .. } => match action {
+                Some(ConfigAction::Set {
+                    config_json,
+                    write_to_disk,
+                    acknowledge_cluster_wide,
+                }) => {
+                    assert_eq!(config_json, "{}");
+                    assert!(write_to_disk);
+                    assert!(!acknowledge_cluster_wide);
+                }
+                other => panic!("expected Some(ConfigAction::Set), got {other:?}"),
+            },
+            other => panic!("expected Commands::Config, got {other:?}"),
+        }
     }
 }
