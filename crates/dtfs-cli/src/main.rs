@@ -58,6 +58,11 @@ enum Commands {
     #[command(subcommand)]
     Files(FilesCmd),
 
+    /// UIP-4-3 (D3) — manual data migration (operator-triggered
+    /// tier/DC moves of a path prefix).
+    #[command(subcommand)]
+    Migrations(MigrationsCmd),
+
     /// Trigger or view scrub operations
     Scrub {
         /// Target: --disk /path, --file /path, or --chunk <id>
@@ -368,6 +373,43 @@ enum FilesCmd {
     },
 }
 
+/// UIP-4-3 (D3) — manual data migration subcommands.
+#[derive(clap::Subcommand, Debug)]
+enum MigrationsCmd {
+    /// Start a migration of every chunk under `path_prefix` to
+    /// `target_tier` (optionally constrained to `target_dc`).
+    Create {
+        /// Path prefix to match. Empty string means "every file" —
+        /// requires `--allow-empty-prefix` to confirm.
+        path_prefix: String,
+        /// Target tier: one of hot, warm, cold, tape. Validated
+        /// client-side before the POST.
+        #[arg(long)]
+        target_tier: String,
+        /// Optional target datacenter; the chosen target node must
+        /// be in this DC.
+        #[arg(long)]
+        target_dc: Option<String>,
+        /// Required when `path_prefix` is empty, to avoid an
+        /// accidental whole-volume migration.
+        #[arg(long)]
+        allow_empty_prefix: bool,
+        /// Soft cap on tasks scheduled in this call.
+        #[arg(long)]
+        max_tasks: Option<usize>,
+    },
+}
+
+/// UIP-4-3 — the four valid `target_tier` values for `migrations
+/// create`, matching `StartMigrationRequest`'s server-side
+/// `parse_tier` (api.rs). Checked client-side so a typo fails fast
+/// without a network round-trip.
+const VALID_TARGET_TIERS: &[&str] = &["hot", "warm", "cold", "tape"];
+
+fn is_valid_target_tier(tier: &str) -> bool {
+    VALID_TARGET_TIERS.contains(&tier.to_ascii_lowercase().as_str())
+}
+
 /// CF-2 — raft membership subcommands. The mutating ones must be sent
 /// to the LEADER's API (`--manager <leader>:9402`); a follower answers
 /// 409 with a leader hint.
@@ -574,6 +616,14 @@ async fn main() -> anyhow::Result<()> {
             } => cmd_files_flush_cache(
                 &api, &args.format, &path, &cache_tiers,
                 cooldown_secs, max_tasks, allow_empty_prefix,
+            ).await?,
+        },
+        Commands::Migrations(sub) => match sub {
+            MigrationsCmd::Create {
+                path_prefix, target_tier, target_dc, allow_empty_prefix, max_tasks,
+            } => cmd_migrations_create(
+                &api, &args.format, &path_prefix, &target_tier, target_dc,
+                allow_empty_prefix, max_tasks,
             ).await?,
         },
         Commands::Scrub {
@@ -1241,6 +1291,51 @@ async fn cmd_files_flush_cache(
     Ok(())
 }
 
+/// UIP-4-3 — `dtfs-cli migrations create <path-prefix> --target-tier
+/// T [--target-dc DC] [--allow-empty-prefix] [--max-tasks N]`: start
+/// a manual data migration. `target_tier` is validated client-side
+/// against hot|warm|cold|tape before any network call, matching the
+/// enum `StartMigrationRequest` accepts server-side.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_migrations_create(
+    api: &ApiClient,
+    format: &OutputFormat,
+    path_prefix: &str,
+    target_tier: &str,
+    target_dc: Option<String>,
+    allow_empty_prefix: bool,
+    max_tasks: Option<usize>,
+) -> anyhow::Result<()> {
+    if !is_valid_target_tier(target_tier) {
+        anyhow::bail!(
+            "invalid --target-tier '{}': expected one of {}",
+            target_tier,
+            VALID_TARGET_TIERS.join("|"),
+        );
+    }
+
+    let mut body = serde_json::Map::new();
+    body.insert("path_prefix".into(), path_prefix.into());
+    body.insert("target_tier".into(), target_tier.into());
+    if let Some(v) = target_dc { body.insert("target_dc".into(), v.into()); }
+    body.insert("allow_empty_prefix".into(), allow_empty_prefix.into());
+    if let Some(v) = max_tasks { body.insert("max_tasks".into(), v.into()); }
+    let body = serde_json::Value::Object(body);
+
+    let resp = api.post("/api/v1/migrations", &body).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => {
+            println!(
+                "migrations create prefix={} target_tier={}",
+                path_prefix, target_tier
+            );
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_volumes(api: &ApiClient, format: &OutputFormat) -> anyhow::Result<()> {
     let resp = api.get("/api/v1/volumes").await?;
     match format {
@@ -1832,5 +1927,64 @@ mod audit_co_tests {
             .is_err(),
             "missing --reason must be rejected"
         );
+    }
+
+    // UIP-4-3 — `migrations create <prefix> --target-tier T
+    // [--target-dc DC] [--allow-empty-prefix] [--max-tasks N]` parses
+    // into the expected variant/fields, required/optional flags.
+    #[test]
+    fn uip_4_3_migrations_create_parses() {
+        let args = Args::try_parse_from([
+            "dtfs-cli", "migrations", "create", "/movies/",
+            "--target-tier", "cold", "--target-dc", "dc-a",
+            "--allow-empty-prefix", "--max-tasks", "500",
+        ])
+        .expect("migrations create should parse");
+        match args.command {
+            Commands::Migrations(MigrationsCmd::Create {
+                path_prefix,
+                target_tier,
+                target_dc,
+                allow_empty_prefix,
+                max_tasks,
+            }) => {
+                assert_eq!(path_prefix, "/movies/");
+                assert_eq!(target_tier, "cold");
+                assert_eq!(target_dc.as_deref(), Some("dc-a"));
+                assert!(allow_empty_prefix);
+                assert_eq!(max_tasks, Some(500));
+            }
+            other => panic!("expected MigrationsCmd::Create, got {other:?}"),
+        }
+
+        // Optional flags omitted still parse.
+        let minimal = Args::try_parse_from([
+            "dtfs-cli", "migrations", "create", "/movies/",
+            "--target-tier", "hot",
+        ])
+        .expect("minimal migrations create should parse");
+        match minimal.command {
+            Commands::Migrations(MigrationsCmd::Create {
+                target_dc, allow_empty_prefix, max_tasks, ..
+            }) => {
+                assert_eq!(target_dc, None);
+                assert!(!allow_empty_prefix);
+                assert_eq!(max_tasks, None);
+            }
+            other => panic!("expected MigrationsCmd::Create, got {other:?}"),
+        }
+    }
+
+    // UIP-4-3 — client-side `target_tier` validation rejects an
+    // invalid tier name before any network call; the four real tiers
+    // (case-insensitively) are accepted.
+    #[test]
+    fn uip_4_3_invalid_target_tier_rejected_client_side() {
+        assert!(is_valid_target_tier("hot"));
+        assert!(is_valid_target_tier("Warm"));
+        assert!(is_valid_target_tier("COLD"));
+        assert!(is_valid_target_tier("tape"));
+        assert!(!is_valid_target_tier("lukewarm"));
+        assert!(!is_valid_target_tier(""));
     }
 }

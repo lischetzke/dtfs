@@ -169,7 +169,7 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
 |---|---|---|---|---|---|
 | UIP-4-1 | `crates/dtfs-cli/src/main.rs` | New top-level `Commands::Unquarantine { node_id: String, #[arg(long)] operator_id: String, #[arg(long)] reason_acknowledged: String }` (flat, mirrors `Maintenance`'s shape — see D1). POST `UnquarantineRequest` to `/nodes/{id}/unquarantine`; print the 409 "not quarantined" message verbatim on failure. | `try_parse_from` test: required `--operator-id`/`--reason-acknowledged` present → Ok; either missing → `Err`. | `dtfs-cli unquarantine <node-id> --operator-id X --reason-acknowledged "..."` works; `dtfs-cli nodes`/`nodes --id` unchanged. | ✅ |
 | UIP-4-2 | `crates/dtfs-cli/src/main.rs` | New top-level `Commands::Decommission { node_id: String, #[arg(long)] operator_id: String, #[arg(long)] reason: String }`. POST `DecommissionRequest` to `/nodes/{id}/decommission`; print the 409 "replicas remain" message verbatim on failure. | `try_parse_from` test analogous to UIP-4-1. | `dtfs-cli decommission <node-id> --operator-id X --reason "..."` works. | ✅ |
-| UIP-4-3 | `crates/dtfs-cli/src/main.rs` | New `Commands::Migrations(MigrationsCmd)` with `MigrationsCmd::Create { path_prefix: String, #[arg(long)] target_tier: String, #[arg(long)] target_dc: Option<String>, #[arg(long)] allow_empty_prefix: bool, #[arg(long)] max_tasks: Option<usize> }` (`target_tier` validated client-side against `hot`\|`warm`\|`cold`\|`tape` before the POST, matching the enum in `StartMigrationRequest`). POST to `/api/v1/migrations`. | `try_parse_from` test for the required/optional flags; a unit test rejecting an invalid `--target-tier` value before any network call. | `dtfs-cli migrations create /movies/ --target-tier cold` starts a migration; an invalid tier name fails fast client-side. | ⬜ |
+| UIP-4-3 | `crates/dtfs-cli/src/main.rs` | New `Commands::Migrations(MigrationsCmd)` with `MigrationsCmd::Create { path_prefix: String, #[arg(long)] target_tier: String, #[arg(long)] target_dc: Option<String>, #[arg(long)] allow_empty_prefix: bool, #[arg(long)] max_tasks: Option<usize> }` (`target_tier` validated client-side against `hot`\|`warm`\|`cold`\|`tape` before the POST, matching the enum in `StartMigrationRequest`). POST to `/api/v1/migrations`. | `try_parse_from` test for the required/optional flags; a unit test rejecting an invalid `--target-tier` value before any network call. | `dtfs-cli migrations create /movies/ --target-tier cold` starts a migration; an invalid tier name fails fast client-side. | ✅ |
 
 ### Group 5 — dtfs-cli config / integrity / files / stats
 
@@ -232,6 +232,9 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
   15 passed; after: 16 passed (new `uip_4_1_unquarantine_parses`).
 - UIP-4-2: `cargo test -p dtfs-cli --release` (Docker buildenv) — before:
   16 passed; after: 17 passed (new `uip_4_2_decommission_parses`).
+- UIP-4-3: `cargo test -p dtfs-cli --release` (Docker buildenv) — before:
+  17 passed; after: 19 passed (new `uip_4_3_migrations_create_parses`,
+  `uip_4_3_invalid_target_tier_rejected_client_side`).
 - UIP-1-2: `cargo test -p dtfs-manager --release webui` (Docker buildenv) —
   before: 15 passed; after: 16 passed (new
   `bug_bk_scrub_tests::volume_modal_edits_write_safety`).
