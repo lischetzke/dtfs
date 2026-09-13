@@ -57,7 +57,7 @@ Non-goals: multi-tenant isolation, POSIX completeness (Plex's FUSE read + occasi
 
 **A.3.4 Mandatory vs cache replicas.** Two independent classes, never conflated: `mandatory_replicas.<tier>` (protected, only the under-replication scheduler maintains them) and `cache_replicas.<tier>.{min,max}` (demand-driven, evictable, only the tiering engine creates them). Every promote/demote checks the anchor against the destination first. Replica presence/removal is keyed by `(node_id, disk_id)`, never `node_id` alone. A "surviving" replica that justifies dropping another must be LIVE (`live_replica_tier`), and `apply_remove_chunk_location` refuses to remove the last live replica regardless of policy. Anchor datacenter strings compare case-insensitively. Detail: `.claude/rules/integrity.md`, `docs/src/internals/invariants.md` § A.3.4.
 
-**A.3.5 Build-date / version stamp.** Every dev build MUST stamp `BUILD_DATE` fresh (the only distinguishing field between two dev builds) — deploy builds MUST go through a wrapper (`scripts/build-linux-amd64.sh`, `scripts/dtfs-build.sh`, `scripts/dtfs-release.sh <tag>`); confirm with `dtfs-<bin> --version`. Release builds additionally stamp real `DTFS_VERSION`. Guards: `scripts/tests/test-{build-date-fresh,release-version-stamp}.sh`. Mechanism (Bug BS, AZ-5): `docs/src/internals/invariants.md` § A.3.5.
+**A.3.5 Build-date / version stamp.** Every dev build MUST stamp `BUILD_DATE` fresh (the only distinguishing field between two dev builds) — deploy builds MUST go through a wrapper (`scripts/build-linux-amd64.sh`, `scripts/dtfs-build.sh`, `scripts/dtfs-release.sh <tag>`); confirm with `dtfs-<bin> --version`. Release builds additionally stamp real `DTFS_VERSION`. Cluster deploys go through the GitLab pipeline (`.gitlab-ci.yml`): a commit whose subject starts with `release vX.Y.Z` ships that version, one starting with `deploy` ships an alpha `v<base>_<YYYYMMDDHHmm>`; both create a GitLab release and run `deploy/ansible/update-cluster.yml` (managers learners → followers → leader, then data nodes, then clients, health wait + delay per node) followed by `scripts/dtfs-cluster-healthcheck.sh`. Detail: `docs/src/operations/ci-pipeline.md`. Guards: `scripts/tests/test-{build-date-fresh,release-version-stamp}.sh`. Mechanism (Bug BS, AZ-5): `docs/src/internals/invariants.md` § A.3.5.
 
 ## A.4 Build / test
 
@@ -71,7 +71,7 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "${DTFS_REPO_HOST_PATH:-C:/Users/<user>/gi
 
 Always `--release`. Run `cargo test -p dtfs-common --release` after any config/example change (`example_*_toml_parses`). Parallel agents share the `dtfs-target` volume, so cargo may block on the build lock; rerun a flaked `example_*_toml_parses` once. A crate-level `#![allow(dead_code)]` on dtfs-manager/dtfs-data works around a rustc 1.94 dead-code ICE — don't remove without re-verifying.
 
-Deploy/release builds MUST go through a wrapper so `BUILD_DATE` is fresh (§ A.3.5); a bare `cargo build --release` stamps stale. `scripts/dtfs-release.sh <tag>` stamps `DTFS_VERSION`, builds, writes `target/release-artifacts/<tag>/` + prints the `gh release create` line.
+Deploy/release builds MUST go through a wrapper so `BUILD_DATE` is fresh (§ A.3.5); a bare `cargo build --release` stamps stale. `scripts/dtfs-release.sh <tag>` stamps `DTFS_VERSION`, builds, writes `target/release-artifacts/<tag>/`; the pipeline's `release` job uploads that directory to the GitLab package registry and creates the release (`scripts/ci/gitlab-release.sh`).
 
 `tests/release/cases/*.sh` and `tests/proxmox/` are cluster-only harnesses kept for when a lab exists again; they are not part of the current verification loop and no change is required to ship one.
 
@@ -130,7 +130,10 @@ One line per file. Bug/task history per row: `docs/src/internals/invariants.md` 
 | `dtfs-common/build.rs` + `src/version.rs` | `VERSION`/`BUILD_DATE` stamps (§ A.3.5) |
 | `dtfs-cli/src/main.rs` | REST client (clap), full parity with the webui; mutations print the server error body and exit non-zero. List: `docs/src/api-reference/cli-reference.md` |
 | `dtfs-cli/src/updater.rs` | `dtfs-cli update` — download, verify, atomic install, restart |
-| `scripts/dtfs-release.sh` | Release builder; stamps version, assembles tarball, prints `gh release create` |
+| `scripts/dtfs-release.sh` | Release builder; stamps version, assembles tarball + SHA256SUMS + git-cliff notes |
+| `.gitlab-ci.yml` + `scripts/ci/{version,gitlab-release}.sh` | Pipeline: keyword gate on the commit subject, version resolution, package upload + GitLab release |
+| `deploy/ansible/update-cluster.yml` + `tasks/update-node.yml` | Rolling cluster update used by the pipeline's deploy stage; order from live Raft state, per-node health wait + delay |
+| `scripts/dtfs-cluster-healthcheck.sh` | Read-only post-deploy gate: leader agreement, status ok, all data nodes healthy, version stamps |
 | `dtfs-common/src/tls.rs` | `TlsContext`; all gRPC routes through it; enable only cluster-wide |
 | `tests/release/`, `tests/proxmox/` | Cluster-only harnesses, dormant without a lab |
 

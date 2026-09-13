@@ -1,0 +1,53 @@
+---
+# Production inventory shape for deploy/ansible/update-cluster.yml.
+#
+# The real file lives OUTSIDE the repository on the GitLab runner host and
+# is referenced by the CI variable DTFS_ANSIBLE_INVENTORY. Groups are
+# fixed (managers / data_nodes / clients); host names must equal the
+# node's `[node].hostname` in its dtfs config (or set dtfs_hostname).
+#
+# Per-host variables the playbook reads:
+#   ansible_host            IP / DNS name to SSH to (required)
+#   dtfs_hostname           node identity as registered with the managers
+#                           (default: the inventory host name)
+#   dtfs_api_port           manager REST port (managers only, default 9402)
+#   dtfs_mount_point        FUSE mount path (clients only, default /mnt/dtfs)
+#
+# Restart order is computed at run time: learner managers first, then
+# follower voters, the Raft leader last; then data nodes; then clients.
+all:
+  vars:
+    ansible_user: debian
+    ansible_ssh_private_key_file: ~/.ssh/dtfs-deploy/id_ed25519
+  children:
+    managers:
+      hosts:
+        mgr01:
+          ansible_host: 100.64.0.11
+        mgr02:
+          ansible_host: 100.64.0.12
+        mgr03:
+          ansible_host: 100.64.0.13
+        mgr04:
+          ansible_host: 100.64.0.14
+        mgr05:
+          ansible_host: 100.64.0.15
+    data_nodes:
+      hosts:
+        data-primary01:
+          ansible_host: 100.64.0.21
+        data-warm01:
+          ansible_host: 100.64.0.22
+        data-warm02:
+          ansible_host: 100.64.0.23
+    clients:
+      hosts:
+        client01:
+          ansible_host: 100.64.0.31
+          dtfs_mount_point: /mnt/dtfs
+        client02:
+          ansible_host: 100.64.0.32
+          dtfs_mount_point: /mnt/dtfs
+        client03:
+          ansible_host: 100.64.0.33
+          dtfs_mount_point: /mnt/dtfs

@@ -28,6 +28,7 @@
 # Operations
 
 - [Cluster Management](./operations/cluster-management.md)
+- [CI Pipeline: Test, Release, Deploy](./operations/ci-pipeline.md)
 - [Disk Management](./operations/disk-management.md)
 - [Maintenance Mode](./operations/maintenance-mode.md)
 - [Monitoring](./operations/monitoring.md)

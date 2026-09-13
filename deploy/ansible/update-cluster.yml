@@ -1,0 +1,162 @@
+---
+# DTFS rolling cluster update (run by the GitLab deploy stage, or by hand).
+#
+#   ansible-playbook -i <inventory> deploy/ansible/update-cluster.yml \
+#       -e dtfs_tarball=/path/dtfs-linux-amd64.tar.gz -e dtfs_version=v0.2.0
+#
+# Order, one node at a time with a health wait + delay after each:
+#   1. managers: learners, then follower voters, then the Raft leader
+#      (the order is read from /api/v1/raft/state at run time);
+#   2. data nodes;
+#   3. FUSE clients.
+# A node whose health wait fails stops the run; the previous binary is kept
+# as /usr/local/bin/<bin>.<timestamp> by the copy backup for a manual
+# rollback. The final play runs scripts/dtfs-cluster-healthcheck.sh.
+#
+# Variables (override with -e):
+#   dtfs_tarball               tarball from scripts/dtfs-release.sh (required)
+#   dtfs_version               expected `dtfs-* --version` stamp (required)
+#   dtfs_restart_delay_secs    pause after each node (default 30)
+#   dtfs_health_timeout_secs   per-node wait budget (default 300)
+#   dtfs_api_port              manager REST port (default 9402)
+
+- name: Preflight — unpack the build, verify the stamp, learn the Raft roles
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    dtfs_restart_delay_secs: 30
+    dtfs_health_timeout_secs: 300
+    dtfs_api_port: 9402
+  tasks:
+    - name: Require dtfs_tarball and dtfs_version
+      ansible.builtin.assert:
+        that:
+          - dtfs_tarball is defined
+          - dtfs_version is defined
+        fail_msg: "pass -e dtfs_tarball=<tarball> -e dtfs_version=<version>"
+
+    - name: Tarball exists
+      ansible.builtin.stat:
+        path: "{{ dtfs_tarball }}"
+      register: tarball_stat
+      failed_when: not tarball_stat.stat.exists
+
+    - name: Staging directory on the control host
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: "dtfs-update-"
+      register: stage
+
+    - name: Unpack the tarball
+      ansible.builtin.unarchive:
+        src: "{{ dtfs_tarball }}"
+        dest: "{{ stage.path }}"
+        remote_src: true
+
+    - name: Read the version stamp from the packaged dtfs-cli
+      ansible.builtin.command: "{{ stage.path }}/dtfs/bin/dtfs-cli --version"
+      register: stamp
+      changed_when: false
+
+    - name: Stamp matches dtfs_version
+      ansible.builtin.assert:
+        that: stamp.stdout is match('^dtfs-cli ' ~ (dtfs_version | regex_escape) ~ ' ')
+        fail_msg: "tarball reports '{{ stamp.stdout }}', expected version {{ dtfs_version }}"
+
+    - name: Query every manager's Raft state
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[item].ansible_host }}:{{ hostvars[item].dtfs_api_port | default(dtfs_api_port) }}/api/v1/raft/state"
+        return_content: true
+        timeout: 10
+      loop: "{{ groups['managers'] }}"
+      register: raft_states
+      ignore_errors: true
+
+    - name: Every manager answered
+      ansible.builtin.assert:
+        that: raft_states.results | selectattr('failed', 'defined') | selectattr('failed') | list | length == 0
+        fail_msg: >-
+          unreachable managers: {{ raft_states.results | selectattr('failed', 'defined') | selectattr('failed')
+          | map(attribute='item') | list | join(', ') }} — fix them before updating
+
+    - name: Classify managers (learner / follower voter / leader)
+      ansible.builtin.set_fact:
+        dtfs_leaders: >-
+          {{ raft_states.results | selectattr('json.is_leader') | map(attribute='item') | list }}
+        dtfs_learners: >-
+          {{ raft_states.results | rejectattr('json.is_leader')
+             | selectattr('json.state', 'search', 'Learner') | map(attribute='item') | list }}
+
+    - name: Exactly one leader
+      ansible.builtin.assert:
+        that: dtfs_leaders | length == 1
+        fail_msg: "expected one Raft leader, found {{ dtfs_leaders }} — cluster is electing; retry later"
+
+    - name: Manager restart order — learners, follower voters, leader last
+      ansible.builtin.set_fact:
+        dtfs_manager_order: >-
+          {{ dtfs_learners
+             + (groups['managers'] | difference(dtfs_learners) | difference(dtfs_leaders))
+             + dtfs_leaders }}
+        dtfs_leader_api: >-
+          http://{{ hostvars[dtfs_leaders[0]].ansible_host }}:{{ hostvars[dtfs_leaders[0]].dtfs_api_port | default(dtfs_api_port) }}
+        dtfs_stage_dir: "{{ stage.path }}"
+        dtfs_manager_endpoints: >-
+          {% for m in groups['managers'] -%}
+          {{ hostvars[m].ansible_host }}:{{ hostvars[m].dtfs_api_port | default(dtfs_api_port) }}{{ ',' if not loop.last else '' }}
+          {%- endfor %}
+
+    - name: Show the plan
+      ansible.builtin.debug:
+        msg:
+          - "version: {{ dtfs_version }}"
+          - "managers (in order): {{ dtfs_manager_order | join(' -> ') }}"
+          - "data nodes: {{ groups['data_nodes'] | default([]) | join(', ') }}"
+          - "clients: {{ groups['clients'] | default([]) | join(', ') }}"
+          - "delay between nodes: {{ dtfs_restart_delay_secs }}s, health wait: {{ dtfs_health_timeout_secs }}s"
+
+    - name: Update managers one at a time
+      ansible.builtin.include_tasks: tasks/update-node.yml
+      loop: "{{ dtfs_manager_order }}"
+      loop_control:
+        loop_var: node
+      vars:
+        role: manager
+
+    - name: Update data nodes one at a time
+      ansible.builtin.include_tasks: tasks/update-node.yml
+      loop: "{{ groups['data_nodes'] | default([]) }}"
+      loop_control:
+        loop_var: node
+      vars:
+        role: data
+
+    - name: Update FUSE clients one at a time
+      ansible.builtin.include_tasks: tasks/update-node.yml
+      loop: "{{ groups['clients'] | default([]) }}"
+      loop_control:
+        loop_var: node
+      vars:
+        role: client
+
+    - name: Final cluster health check
+      ansible.builtin.command:
+        argv:
+          - bash
+          - "{{ playbook_dir }}/../../scripts/dtfs-cluster-healthcheck.sh"
+          - --managers
+          - "{{ dtfs_manager_endpoints }}"
+          - --expect-version
+          - "{{ dtfs_version }}"
+          - --min-data-nodes
+          - "{{ groups['data_nodes'] | default([]) | length }}"
+          - --timeout
+          - "{{ dtfs_health_timeout_secs }}"
+      changed_when: false
+
+    - name: Remove the staging directory
+      ansible.builtin.file:
+        path: "{{ stage.path }}"
+        state: absent

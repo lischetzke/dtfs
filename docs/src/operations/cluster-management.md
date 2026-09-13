@@ -386,11 +386,13 @@ For details on the planner's refusal logic, see
 
 ## Rolling Upgrades
 
-To upgrade the cluster with zero downtime:
+The GitLab pipeline does this for every `release`/`deploy` commit via
+`deploy/ansible/update-cluster.yml` (see [CI Pipeline](./ci-pipeline.md)).
+The order it implements, and the order to follow by hand:
 
-1. Upgrade manager nodes one at a time, starting with non-leaders. After each upgrade, wait for the node to rejoin the Raft group and catch up.
-2. Upgrade data nodes one at a time. Place each in maintenance mode, upgrade, restart, then disable maintenance mode.
-3. Upgrade FUSE clients last. They reconnect to managers automatically.
+1. Manager nodes one at a time: learners first, then follower voters, the Raft leader last. After each restart wait until the node's `/api/v1/raft/state` reports `running_state: ok` and a known leader.
+2. Data nodes one at a time. Wait until the leader's `/api/v1/nodes` shows the node `Healthy` on the new version. Maintenance mode is not required for a plain binary restart; use it for work that keeps the node down longer than the liveness window.
+3. FUSE clients last. They reconnect to managers automatically; wait until the mount point is back.
 
 ## Best Practices
 

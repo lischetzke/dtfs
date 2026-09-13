@@ -24,6 +24,7 @@ for the schema and worked examples.
 | Tune managers, data nodes, FUSE, volumes | [Advanced Configuration](docs/src/configuration/) |
 | Diagnose problems on a live cluster | [Debugging / Troubleshooting](docs/src/operations/troubleshooting.md) |
 | Contribute code or docs | [Contribution Guide](docs/src/development/contributing.md) |
+| Ship a build to the cluster | [CI Pipeline](docs/src/operations/ci-pipeline.md) |
 
 Full table of contents: [`docs/src/SUMMARY.md`](docs/src/SUMMARY.md).
 
@@ -31,7 +32,7 @@ Full table of contents: [`docs/src/SUMMARY.md`](docs/src/SUMMARY.md).
 
 - `crates/` — Rust workspace (`dtfs-manager`, `dtfs-data`, `dtfs-client`, `dtfs-fuse`, `dtfs-raft`, …)
 - `proto/` — Protobuf / gRPC definitions
-- `deploy/` — Docker Compose, sample configs, systemd units
+- `deploy/` — Docker Compose, sample configs, systemd units, the Ansible rolling-update playbook the CI deploy stage runs
 - `docs/` — mdBook documentation source
 - `tests/` — integration, chaos, performance, and lab harness
 - [`CLAUDE.md`](CLAUDE.md) — canonical guide for contributors and AI agents (Part A: codebase knowledge — architecture, integrity invariants, memory model; Part B: operating discipline)

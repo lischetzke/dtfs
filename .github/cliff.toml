@@ -31,7 +31,9 @@ trim = true
 conventional_commits = false
 filter_unconventional = false
 filter_commits = false
-tag_pattern = "v[0-9]*"
+# Full releases only: alpha tags (vX.Y.Z_YYYYMMDDHHmm from GitLab "deploy"
+# commits) must not cut the "since the last release" range of the notes.
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
 commit_preprocessors = []
 commit_parsers = [
   { message = "Breaking:", group = "Breaking Changes" },
