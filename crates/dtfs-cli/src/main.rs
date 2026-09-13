@@ -362,6 +362,12 @@ enum FilesCmd {
         #[arg(long, default_value = "50")]
         limit: usize,
     },
+    /// UIP-5-4 — show a file's chunk layout and per-replica
+    /// placement (`GET /api/v1/files/inspect?path=...`).
+    Inspect {
+        /// Full file path inside the cluster namespace.
+        path: String,
+    },
     /// Drop cache replicas under a path prefix. Mandatory
     /// (anchor) replicas are always preserved.
     FlushCache {
@@ -664,6 +670,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Files(sub) => match sub {
             FilesCmd::List { limit } => cmd_files(&api, &args.format, limit).await?,
+            FilesCmd::Inspect { path } => cmd_files_inspect(&api, &args.format, &path).await?,
             FilesCmd::FlushCache {
                 path, cache_tiers, cooldown_secs, max_tasks, allow_empty_prefix,
             } => cmd_files_flush_cache(
@@ -1573,6 +1580,60 @@ async fn cmd_decommission(
     Ok(())
 }
 
+/// UIP-5-4 — `dtfs-cli files inspect <path>`: chunk layout + replica
+/// placement of one file via `GET /api/v1/files/inspect?path=...`.
+async fn cmd_files_inspect(api: &ApiClient, format: &OutputFormat, path: &str) -> anyhow::Result<()> {
+    let url = format!("/api/v1/files/inspect?path={}", percent_encode_query(path));
+    let resp = api.get(&url).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => {
+            println!("Path:        {}", resp["path"].as_str().unwrap_or(path));
+            println!("Volume:      {}", resp["volume_id"].as_str().unwrap_or("—"));
+            println!(
+                "Size:        {}",
+                format_bytes(resp["total_size"].as_u64().unwrap_or(0))
+            );
+            println!(
+                "Chunk size:  {}",
+                format_bytes(resp["chunk_size"].as_u64().unwrap_or(0))
+            );
+            println!("Chunks:      {}", resp["chunk_count"].as_u64().unwrap_or(0));
+            let chunks = resp["chunks"].as_array().cloned().unwrap_or_default();
+            if chunks.is_empty() {
+                return Ok(());
+            }
+            println!();
+            println!("{:<6} {:<20} {:<10} {}", "INDEX", "CHUNK_ID", "SIZE", "REPLICAS (node/disk tier)");
+            println!("{}", "-".repeat(90));
+            for c in &chunks {
+                let replicas: Vec<String> = c["replicas"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{}/{} {}",
+                            r["node_id"],
+                            r["disk_id"],
+                            r["tier"].as_str().unwrap_or("?")
+                        )
+                    })
+                    .collect();
+                println!(
+                    "{:<6} {:<20} {:<10} {}",
+                    c["chunk_index"].as_u64().unwrap_or(0),
+                    truncate(c["chunk_id"].as_str().unwrap_or("—"), 18),
+                    format_bytes(c["size"].as_u64().unwrap_or(0)),
+                    replicas.join(", "),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_audit(
     api: &ApiClient,
     format: &OutputFormat,
@@ -1848,6 +1909,21 @@ fn format_bytes(bytes: u64) -> String {
     let exp = exp.min(UNITS.len() - 1);
     let value = bytes as f64 / 1024_f64.powi(exp as i32);
     format!("{:.1} {}", value, UNITS[exp])
+}
+
+/// Minimal RFC 3986 query-component percent-encoding (unreserved chars
+/// and `/` pass through). Avoids pulling a crate in for one call site.
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2199,5 +2275,22 @@ mod audit_co_tests {
             }
             other => panic!("expected Commands::Integrity, got {other:?}"),
         }
+    }
+
+    // UIP-5-4 — `files inspect <path>` parses.
+    #[test]
+    fn uip_5_4_files_inspect_parses() {
+        let args = Args::try_parse_from(["dtfs-cli", "files", "inspect", "/movies/x.mkv"])
+            .expect("files inspect should parse");
+        match args.command {
+            Commands::Files(FilesCmd::Inspect { path }) => assert_eq!(path, "/movies/x.mkv"),
+            other => panic!("expected Commands::Files(Inspect), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uip_5_4_percent_encode_query_escapes_reserved() {
+        assert_eq!(percent_encode_query("/tv/a b&c=d.mkv"), "/tv/a%20b%26c%3Dd.mkv");
+        assert_eq!(percent_encode_query("/plain-path_1.mkv"), "/plain-path_1.mkv");
     }
 }

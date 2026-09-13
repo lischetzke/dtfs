@@ -178,7 +178,7 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
 | UIP-5-1 | `crates/dtfs-cli/src/main.rs` | Per D2: `Commands::Config { show: bool, #[command(subcommand)] action: Option<ConfigAction> }`; `ConfigAction::Set { #[arg(long)] config_json: String, #[arg(long)] write_to_disk: bool, #[arg(long)] acknowledge_cluster_wide: bool }`. `action = None` keeps today's `cmd_config` (GET) behaviour byte-for-byte; `Some(Set{..})` POSTs `ConfigUpdateRequest` to `/api/v1/config`. Confirm webui.rs:3172's "Change via `dtfs-cli config set`" text is still accurate once this lands (fix the text in the same commit if the final flag names diverge). | `try_parse_from` tests: bare `["dtfs-cli","config"]` still parses to `action: None`; `["...","config","set","--config-json","{}","--write-to-disk"]` parses to `Some(Set{..})`. | `dtfs-cli config` unchanged; `dtfs-cli config set --config-json '...' --write-to-disk` applies a config update; webui text confirmed accurate. | ✅ |
 | UIP-5-2 | `crates/dtfs-cli/src/main.rs` | `ConfigAction::Effective` → GET `/config/effective`, render `{name, current, default, is_default}` rows as a table (or raw JSON with `--format json`). | `try_parse_from` test for `config effective`. | `dtfs-cli config effective` lists every effective config key with its default/current values. | ✅ |
 | UIP-5-3 | `crates/dtfs-cli/src/main.rs` | New `Commands::Integrity(IntegrityCmd)` with `IntegrityCmd::Faults { #[arg(long, default_value="20")] limit: usize, #[arg(long)] action: Option<String> }` (same query shape as the existing `audit` command) → GET `/integrity/faults`. | `try_parse_from` test mirroring the existing `audit` test. | `dtfs-cli integrity faults [--limit N] [--action PREFIX]` lists integrity faults. | ✅ |
-| UIP-5-4 | `crates/dtfs-cli/src/main.rs` | Add `FilesCmd::Inspect { path: String }` (alongside `List`/`FlushCache`) → GET `/files/inspect?path=...`, render the chunk/replica table. | `try_parse_from` test: `files inspect /movies/x.mkv` parses. | `dtfs-cli files inspect <path>` shows a file's chunk layout and replica placement. | ⬜ |
+| UIP-5-4 | `crates/dtfs-cli/src/main.rs` | Add `FilesCmd::Inspect { path: String }` (alongside `List`/`FlushCache`) → GET `/files/inspect?path=...`, render the chunk/replica table. | `try_parse_from` test: `files inspect /movies/x.mkv` parses. | `dtfs-cli files inspect <path>` shows a file's chunk layout and replica placement. | ✅ |
 | UIP-5-5 | `crates/dtfs-cli/src/main.rs` | New flat `Commands::Stats` (no args, mirrors `Health`) → GET `/api/v1/stats`, render the summary fields already shown in `status`/`nodes` plus tier breakdown and scrub results. | `try_parse_from` test: `["dtfs-cli","stats"]` parses. | `dtfs-cli stats` surfaces cluster stats the webui already shows. | ⬜ |
 
 ### Group 6 — docs
@@ -248,6 +248,9 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
   21 passed; after: 22 passed (new `uip_5_2_config_effective_parses`).
 - UIP-5-3: `cargo test -p dtfs-cli --release` (Docker buildenv) — before:
   22 passed; after: 23 passed (new `uip_5_3_integrity_faults_parses`).
+- UIP-5-4: `cargo test -p dtfs-cli --release` (Docker buildenv) — before:
+  23 passed; after: 25 passed (new `uip_5_4_files_inspect_parses`,
+  `uip_5_4_percent_encode_query_escapes_reserved`).
 
 ## Deviations
 
