@@ -251,6 +251,10 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         .health-dot.degraded {{ background: var(--warning); box-shadow: 0 0 8px var(--warning); }}
         .health-dot.critical {{ background: var(--danger);  box-shadow: 0 0 8px var(--danger);  animation: pulse-fast 1s infinite; }}
         .health-dot.unknown  {{ background: var(--text-muted); animation: none; }}
+        .manager-health {{ font-size: .75rem; font-weight: 600; padding: .1rem .5rem; border-radius: 999px; margin-left: .6rem; border: 1px solid transparent; }}
+        .manager-health.healthy  {{ color: var(--success); border-color: var(--success); }}
+        .manager-health.degraded {{ color: var(--warning); border-color: var(--warning); }}
+        .manager-health.unknown  {{ color: var(--text-muted); border-color: var(--text-muted); }}
         @keyframes pulse      {{ 0%,100% {{ opacity:1 }} 50% {{ opacity:.5 }} }}
         @keyframes pulse-fast {{ 0%,100% {{ opacity:1 }} 50% {{ opacity:.3 }} }}
         .health-label {{ font-size: 1rem; text-transform: uppercase; letter-spacing: .08em; }}
@@ -613,6 +617,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         <div class="health-dot unknown" id="health-dot"></div>
         <span class="health-label" id="health-label">Loading…</span>
         <span id="health-detail" style="font-weight:400;color:var(--text-muted);font-size:.85rem"></span>
+        <span id="manager-health" class="manager-health unknown" title="GET /api/v1/health on this manager, independent of /api/v1/stats">manager: …</span>
     </div>
     <div class="health-right" id="health-right">Fetching cluster status…</div>
 </div>
@@ -1158,16 +1163,30 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
 
     // ── Stats fetch ──────────────────────────────────────────────────────────
 
+    // UIP-2-2 — manager reachability indicator fed by GET /api/v1/health
+    // (read-only, plain fetch). Independent of /api/v1/stats so an
+    // aggregate-stats failure and a dead manager look different.
+    function setManagerHealth(health) {{
+        const el = document.getElementById('manager-health');
+        if (!el) return;
+        const status = health && health.status ? String(health.status) : 'unreachable';
+        const cls = status === 'healthy' ? 'healthy' : (health ? 'degraded' : 'unknown');
+        el.className = 'manager-health ' + cls;
+        el.textContent = 'manager: ' + status;
+    }}
+
     async function fetchStats() {{
-        const [stats, nodes, migrations, cluster] = await Promise.all([
+        const [stats, nodes, migrations, cluster, health] = await Promise.all([
             fetch('/api/v1/stats').then(r => r.json()).catch(() => null),
             fetch('/api/v1/nodes').then(r => r.json()).catch(() => []),
             fetch('/api/v1/migrations').then(r => r.json()).catch(() => ({{count:0,tasks:[]}})),
             fetch('/api/v1/cluster/status').then(r => r.json()).catch(() => null),
+            fetch('/api/v1/health').then(r => r.json()).catch(() => null),
         ]);
 
         document.getElementById('refresh-time').textContent =
             'Updated ' + new Date().toLocaleTimeString();
+        setManagerHealth(health);
 
         if (!stats) {{
             setHealthBanner('unknown', 'Unknown', 'Could not reach API', '');
@@ -3836,6 +3855,23 @@ mod create_volume_modal_tests {
 #[cfg(test)]
 mod uip_2_webui_ops_tests {
     use super::*;
+
+    /// UIP-2-2 — manager reachability comes from a plain GET
+    /// /api/v1/health next to the stats poll, never via mutateFetch.
+    #[test]
+    fn manager_health_indicator_uses_plain_fetch() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        assert!(html.contains("id=\"manager-health\""), "indicator span missing");
+        assert!(
+            html.contains("fetch('/api/v1/health')"),
+            "GET /api/v1/health must be a plain fetch"
+        );
+        assert!(
+            !html.contains("mutateFetch('/api/v1/health'"),
+            "GET health must not go through mutateFetch"
+        );
+        assert!(html.contains("function setManagerHealth("), "indicator setter missing");
+    }
 
     /// UIP-2-1 — Integrity page carries a "Scrub all" control wired
     /// through mutateFetch; the old CLI-punting placeholder is gone.
