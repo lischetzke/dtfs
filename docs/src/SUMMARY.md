@@ -78,3 +78,4 @@
 # Internals
 
 - [Invariants & Bug Archaeology](./internals/invariants.md)
+  - [Archive: removed contract text (2026-09)](./internals/archive/agents-md-2026-09.md)
