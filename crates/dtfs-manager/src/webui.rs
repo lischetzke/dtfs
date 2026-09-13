@@ -3217,10 +3217,79 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <button class="btn-primary" onclick="loadRaft()">Refresh</button>
             </div>
             <div id="raft-state"><div class="placeholder">Loading…</div></div>
-            <div id="raft-members"></div>`;
+            <div id="raft-members"></div>
+            <div class="table-card" style="padding:.8rem 1rem;margin-top:1rem" id="raft-membership-ops">
+                <h3 style="margin:0 0 .4rem 0">Membership changes</h3>
+                <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:.8rem">
+                    Grow or shrink the manager quorum. Accepted only by the current leader; a follower
+                    answers with the leader's address. Add a manager as a learner first, promote it once
+                    its log has caught up, remove a learner or voter to retire it. Requires the session
+                    secret (it is sent both as the request header and in the request body).
+                </div>
+                <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end">
+                    <div class="modal-row" style="margin:0;min-width:14rem">
+                        <label>Manager hostname ([node].hostname)</label>
+                        <input id="raft-op-hostname" class="form-input" placeholder="mgr04">
+                    </div>
+                    <div class="modal-row" style="margin:0;min-width:14rem">
+                        <label>Raft addr host:port (add-learner only)</label>
+                        <input id="raft-op-addr" class="form-input" placeholder="10.0.0.4:9401">
+                    </div>
+                    <button class="btn-primary"   id="raft-add-learner-btn" onclick="raftMembershipOp('add-learner')">Add learner</button>
+                    <button class="btn-primary"   id="raft-promote-btn"     onclick="raftMembershipOp('promote')">Promote</button>
+                    <button class="btn-secondary" id="raft-remove-btn"      style="color:var(--danger)" onclick="raftMembershipOp('remove')">Remove</button>
+                </div>
+                <div id="raft-op-result" class="modal-result" style="display:none;margin-top:.6rem"></div>
+            </div>`;
         await loadRaft();
         refreshTimer = setInterval(loadRaft, 10000);
     }}
+
+    // UIP-2-4 — POST /api/v1/raft/add-learner, /promote, /remove. The
+    // body carries shared_secret as a second check on top of the
+    // LIS-35 header mutateFetch adds; both come from the session secret.
+    // A 409 means "not the leader": show the leader hint verbatim.
+    async function raftMembershipOp(op) {{
+        const hostname = document.getElementById('raft-op-hostname').value.trim();
+        const addr     = document.getElementById('raft-op-addr').value.trim();
+        const result   = document.getElementById('raft-op-result');
+        result.style.display = 'block';
+        result.style.color = 'var(--danger)';
+        if (!hostname) {{ result.textContent = 'hostname is required'; return; }}
+        if (op === 'add-learner' && !addr) {{ result.textContent = 'addr is required for add-learner'; return; }}
+        if (op === 'remove' && !window.confirm('Remove ' + hostname + ' from the raft membership?')) {{
+            result.style.display = 'none';
+            return;
+        }}
+        const body = {{ hostname: hostname, shared_secret: getSharedSecret() }};
+        if (op === 'add-learner') body.addr = addr;
+        result.style.color = 'var(--text-muted)';
+        result.textContent = op + ' ' + hostname + '…';
+        const {{ resp, text, json, authError }} = await mutateFetch(
+            '/api/v1/raft/' + op,
+            {{ body: JSON.stringify(body) }}
+        );
+        if (resp.ok) {{
+            result.style.color = 'var(--success)';
+            result.textContent = op + ' ' + hostname + ': ' + (json && json.status ? json.status : 'ok');
+            await loadRaft();
+            return;
+        }}
+        result.style.color = 'var(--danger)';
+        if (resp.status === 409 && json && json.leader) {{
+            const l = json.leader;
+            result.textContent = 'This manager is not the leader. Leader: '
+                + (l.leader_hostname || '?') + ' (' + (l.leader_addr || '?') + ', id ' + (l.leader_id || '?')
+                + '). Open its web UI and retry there.';
+            return;
+        }}
+        if (resp.status === 409) {{
+            result.textContent = 'Not the leader and no leader known: ' + ((json && json.error) || text);
+            return;
+        }}
+        result.textContent = authError || ('Failed (' + resp.status + '): ' + ((json && json.error) || text || ''));
+    }}
+    window.raftMembershipOp = raftMembershipOp;
 
     async function loadRaft() {{
         const st = await fetch('/api/v1/raft/state').then(r => r.json()).catch(() => null);
@@ -3926,6 +3995,42 @@ mod create_volume_modal_tests {
 #[cfg(test)]
 mod uip_2_webui_ops_tests {
     use super::*;
+
+    /// UIP-2-4 — membership forms POST the three raft endpoints through
+    /// mutateFetch and surface the 409 leader hint.
+    #[test]
+    fn raft_membership_forms_wired_through_mutate_fetch() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        for needle in [
+            "id=\"raft-op-hostname\"",
+            "id=\"raft-op-addr\"",
+            "onclick=\"raftMembershipOp('add-learner')\"",
+            "onclick=\"raftMembershipOp('promote')\"",
+            "onclick=\"raftMembershipOp('remove')\"",
+            "id=\"raft-op-result\"",
+        ] {
+            assert!(html.contains(needle), "raft membership form missing: {needle}");
+        }
+        let fn_body = html
+            .split("async function raftMembershipOp(op)")
+            .nth(1)
+            .expect("raftMembershipOp must be defined")
+            .split("window.raftMembershipOp")
+            .next()
+            .unwrap();
+        assert!(
+            fn_body.contains("mutateFetch(") && fn_body.contains("'/api/v1/raft/' + op"),
+            "membership ops must POST /api/v1/raft/<op> through mutateFetch"
+        );
+        assert!(
+            fn_body.contains("shared_secret: getSharedSecret()"),
+            "body must carry the session secret for the API's second check"
+        );
+        assert!(
+            fn_body.contains("resp.status === 409") && fn_body.contains("leader_hostname"),
+            "409 must surface the leader hint, not a generic error"
+        );
+    }
 
     /// UIP-2-3 — read-only Raft page: nav entry, route, state/members
     /// containers and table headers; GET raft/state is a plain fetch.
