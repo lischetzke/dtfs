@@ -873,6 +873,15 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             <label>write_timeout_secs</label>
             <input id="ve-write-safety-timeout" class="form-input" type="number" min="1" step="1">
         </div>
+        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Legacy policy migration</div>
+        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:.4rem">
+            One-shot: clones the legacy <code>replication</code> field into
+            <code>mandatory_replicas</code>. Idempotent — safe to run again.
+        </div>
+        <div class="modal-row">
+            <button class="btn-secondary" onclick="migrateVolumePolicy()" id="ve-migrate-btn">Migrate policy…</button>
+        </div>
+        <div id="ve-migrate-result" class="modal-result" style="display:none"></div>
         <div class="modal-actions">
             <button class="btn-secondary" onclick="closeVolumeEdit()">Cancel</button>
             <button class="btn-primary"  onclick="submitVolumeEdit()" id="ve-submit">Apply</button>
@@ -2550,6 +2559,42 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         btn.disabled = false; btn.textContent = 'Apply';
     }}
 
+    // UIP-1-3 — legacy→mandatory policy migration, one-shot (no request body).
+    async function migrateVolumePolicy() {{
+        const vid = document.getElementById('ve-volume-id').value.trim();
+        if (!vid) {{ alert('volume id is required'); return; }}
+
+        const btn = document.getElementById('ve-migrate-btn');
+        const result = document.getElementById('ve-migrate-result');
+        btn.disabled = true; btn.textContent = 'Migrating…';
+        result.style.display = 'block';
+        result.className = 'modal-result';
+        result.textContent = 'Migrating…';
+
+        try {{
+            const {{ resp, json, authError }} = await mutateFetch(
+                `/api/v1/volumes/${{encodeURIComponent(vid)}}/migrate-policy`,
+                {{}}
+            );
+            if (!resp.ok) {{
+                result.className = 'modal-result error';
+                result.textContent = authError
+                    || ('Error ' + resp.status + ': ' + ((json && json.error) || JSON.stringify(json)));
+            }} else {{
+                result.className = 'modal-result success';
+                result.textContent = json && json.changed
+                    ? 'Migrated. mandatory_replicas: ' + JSON.stringify(json.mandatory_replicas)
+                    : 'No change (already migrated). mandatory_replicas: ' + JSON.stringify(json && json.mandatory_replicas);
+                await renderVolumes();
+            }}
+        }} catch (e) {{
+            result.className = 'modal-result error';
+            result.textContent = 'Network error: ' + e;
+        }} finally {{
+            btn.disabled = false; btn.textContent = 'Migrate policy…';
+        }}
+    }}
+
     // ── AZ-1 Schedules modal ──────────────────────────────────────
     function openVolumeSchedules(volumeId) {{
         const v = (window._volumesData||[]).find(x => x.volume_id === volumeId);
@@ -3545,6 +3590,34 @@ mod bug_bk_scrub_tests {
         assert!(
             html.contains("wsMinEl.dataset.orig"),
             "write-safety fields must be tracked against their prefilled value"
+        );
+    }
+
+    /// UIP-1-3 — the volume-edit modal exposes a one-shot "Migrate policy"
+    /// action button (Bug AV legacy→mandatory migration) that POSTs (no
+    /// body) to `/api/v1/volumes/{id}/migrate-policy` via `mutateFetch`.
+    #[test]
+    fn volume_modal_migrate_policy_button_present() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        assert!(
+            html.contains(r#"id="ve-migrate-btn""#),
+            "modal must contain the migrate-policy button"
+        );
+        assert!(
+            html.contains("onclick=\"migrateVolumePolicy()\""),
+            "migrate-policy button must be wired to migrateVolumePolicy()"
+        );
+        assert!(
+            html.contains("async function migrateVolumePolicy"),
+            "migrateVolumePolicy handler must exist"
+        );
+        assert!(
+            html.contains("mutateFetch(\n                `/api/v1/volumes/${encodeURIComponent(vid)}/migrate-policy`"),
+            "migrate-policy must POST via mutateFetch with a template-literal volume id"
+        );
+        assert!(
+            html.contains("json.mandatory_replicas"),
+            "migrate-policy result must surface the returned mandatory_replicas summary"
         );
     }
 
