@@ -135,6 +135,12 @@ struct PendingPrefetch {
 pub struct ReadAheadEngine {
     mode: ReadAheadMode,
     client: DtfsClient,
+    /// FUSE-2 — per-fetch bound for a background prefetch (`None` =
+    /// unbounded, the operator's `chunk_read_timeout_secs = 0`). Pre-fix
+    /// the prefetch `read_chunk` had no deadline at all, so two hung data
+    /// nodes pinned both `prefetch_max_inflight` permits for the life of
+    /// the mount and readahead was silently off from then on.
+    fetch_timeout: Option<std::time::Duration>,
     /// Currently pending prefetch tasks keyed by cache key.
     pending: Arc<DashMap<String, PendingPrefetch>>,
     /// Cached prefetched chunk data keyed by cache key.
@@ -173,6 +179,27 @@ pub struct ReadAheadEngine {
     prefetch_enabled: Arc<AtomicBool>,
 }
 
+/// FUSE-2 — `0` keeps the documented "unbounded" meaning of
+/// `client.chunk_read_timeout_secs`; anything else is the prefetch bound.
+pub(crate) fn prefetch_timeout(secs: u64) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod fuse_2_prefetch_timeout_tests {
+    use super::prefetch_timeout;
+
+    #[test]
+    fn zero_means_unbounded() {
+        assert_eq!(prefetch_timeout(0), None);
+    }
+
+    #[test]
+    fn positive_is_the_bound() {
+        assert_eq!(prefetch_timeout(7), Some(std::time::Duration::from_secs(7)));
+    }
+}
+
 impl ReadAheadEngine {
     /// Create a new read-ahead engine. `max_cache_bytes` is the soft byte
     /// budget for the in-memory prefetch cache (Bug CE). `max_inflight` is
@@ -181,12 +208,14 @@ impl ReadAheadEngine {
     pub fn new(
         mode: ReadAheadMode,
         client: DtfsClient,
+        fetch_timeout_secs: u64,
         max_cache_bytes: usize,
         max_inflight: usize,
     ) -> Self {
         Self {
             mode,
             client,
+            fetch_timeout: prefetch_timeout(fetch_timeout_secs),
             pending: Arc::new(DashMap::new()),
             cache: Arc::new(DashMap::new()),
             cache_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -457,6 +486,7 @@ impl ReadAheadEngine {
         prev_acquired: Option<oneshot::Receiver<()>>,
     ) -> oneshot::Receiver<()> {
         let client = self.client.clone();
+        let fetch_timeout = self.fetch_timeout;
         let cache = Arc::clone(&self.cache);
         let cache_bytes = Arc::clone(&self.cache_bytes);
         let max_cache_bytes = self.max_cache_bytes.load(Ordering::Relaxed);
@@ -526,7 +556,17 @@ impl ReadAheadEngine {
             // held — its own `acquire` call can now queue behind ours.
             let _ = acquired_tx.send(());
 
-            let fetch = client.read_chunk(&node_addr, &chunk_id).await;
+            // FUSE-2 — bound the fetch so a hung replica releases the permit.
+            let fetch = match fetch_timeout {
+                None => client.read_chunk(&node_addr, &chunk_id).await,
+                Some(t) => match tokio::time::timeout(t, client.read_chunk(&node_addr, &chunk_id)).await {
+                    Ok(res) => res,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "prefetch of {chunk_id} from {node_addr} timed out after {}s",
+                        t.as_secs()
+                    )),
+                },
+            };
             // Free the slot before the (purely local) cache store + disk
             // mirror below, so the next queued fetch can start immediately.
             drop(permit);
@@ -788,7 +828,7 @@ mod tests {
     #[test]
     fn bug_ce_cache_is_byte_bounded() {
         let client = DtfsClient::new();
-        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, client, 4 * 1024 * 1024, 2);
+        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, client, 60, 4 * 1024 * 1024, 2);
         let one_mb = Bytes::from(vec![0u8; 1024 * 1024]);
         for i in 0..8 {
             engine.insert_cached("node:9000", &format!("chunk{i}"), one_mb.clone());
@@ -816,7 +856,7 @@ mod tests {
     #[test]
     fn cf5_controller_shrink_and_drop() {
         let client = DtfsClient::new();
-        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, client, 8 * 1024 * 1024, 2);
+        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, client, 60, 8 * 1024 * 1024, 2);
         let one_mb = Bytes::from(vec![0u8; 1024 * 1024]);
         for i in 0..8 {
             engine.insert_cached("node:9000", &format!("chunk{i}"), one_mb.clone());
@@ -855,7 +895,7 @@ mod tests {
     async fn co_5_17_completed_prefetch_does_not_leak_pending_key() {
         let client = DtfsClient::new();
         let engine =
-            ReadAheadEngine::new(ReadAheadMode::FileSequential { prefetch_chunks: 1 }, client, 64 * 1024 * 1024, 2);
+            ReadAheadEngine::new(ReadAheadMode::FileSequential { prefetch_chunks: 1 }, client, 60, 64 * 1024 * 1024, 2);
 
         // Two chunks; reading index 0 prefetches index 1 from an
         // unreachable node so `read_chunk` errors out near-instantly.
@@ -921,6 +961,7 @@ mod wi_05_prefetch_cap_tests {
         let engine = ReadAheadEngine::new(
             ReadAheadMode::FileSequential { prefetch_chunks: 8 },
             client,
+            60,
             64 * 1024 * 1024,
             2,
         );
@@ -972,6 +1013,7 @@ mod wi_05_prefetch_cap_tests {
         let engine = ReadAheadEngine::new(
             ReadAheadMode::FileSequential { prefetch_chunks: 2 },
             client,
+            60,
             4 * 1024 * 1024,
             2,
         );
@@ -1005,7 +1047,7 @@ mod wi_05_prefetch_cap_tests {
     #[tokio::test]
     async fn wi_05_foreground_join_returns_prefetched_bytes() {
         let client = DtfsClient::new();
-        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, client, 4 * 1024 * 1024, 2);
+        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, client, 60, 4 * 1024 * 1024, 2);
 
         // Success case: the watch sender flips AFTER the bytes land in the
         // cache, mirroring spawn_prefetch's own ordering.
@@ -1066,7 +1108,7 @@ mod wi_05_prefetch_cap_tests {
     #[tokio::test]
     async fn b2_join_pending_refuses_a_queued_prefetch() {
         let client = DtfsClient::new();
-        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, client, 4 * 1024 * 1024, 2);
+        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, client, 60, 4 * 1024 * 1024, 2);
 
         let (_done_tx, done_rx) = watch::channel(false);
         let handle = tokio::spawn(async {});
@@ -1101,7 +1143,7 @@ mod wi_05_prefetch_cap_tests {
     #[tokio::test]
     async fn b2_join_pending_is_bounded_by_the_two_second_constant() {
         let client = DtfsClient::new();
-        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, client, 4 * 1024 * 1024, 2);
+        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, client, 60, 4 * 1024 * 1024, 2);
 
         let (_done_tx, done_rx) = watch::channel(false);
         let handle = tokio::spawn(async {});
@@ -1141,6 +1183,7 @@ mod wi_05_prefetch_cap_tests {
         let engine = ReadAheadEngine::new(
             ReadAheadMode::FileSequential { prefetch_chunks: 2 },
             client,
+            60,
             4 * 1024 * 1024,
             2,
         );

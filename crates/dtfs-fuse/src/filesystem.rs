@@ -23,7 +23,6 @@ use dtfs_proto::dtfs::manager::ChunkLocationCommit;
 use dtfs_common::config::FuseConfig;
 use dtfs_common::topology::Location;
 
-use crate::migration::MigrationTrigger;
 use crate::readahead::{ReadAheadEngine, ReadAheadMode};
 use crate::writebuf::WriteBuffer;
 
@@ -463,7 +462,6 @@ pub struct DtfsFilesystem {
     /// `Arc` so `read()` can spawn the advisory RPC (`spawn_on_remote_read`)
     /// instead of awaiting it inline while holding a `known_locations`
     /// DashMap guard (CO-3-12 anti-pattern).
-    migration: std::sync::Arc<MigrationTrigger>,
     /// CR-6-6 (FUSE-8) — bounds the number of in-flight `record_cache_hit`
     /// notify RPCs (fire-and-forget metrics pings). Without a bound, a
     /// slow data node could accumulate unbounded outstanding notify
@@ -515,6 +513,8 @@ impl DtfsFilesystem {
         let readahead = ReadAheadEngine::new(
             readahead_mode,
             client.clone(),
+            // FUSE-2 — same per-fetch bound the foreground read uses.
+            config.client.chunk_read_timeout_secs,
             // Bug CE — byte budget, not entry count. 256 entries x whole
             // chunks OOM-killed the 1 GB client; bound by config bytes now.
             (config.readahead.cache_mb.max(1) as usize) * 1024 * 1024,
@@ -531,11 +531,6 @@ impl DtfsFilesystem {
             chunk_size_bytes,
             config.write.flush_batch_chunks as usize,
         );
-
-        let migration = std::sync::Arc::new(MigrationTrigger::new(
-            client.clone(),
-            client_location.clone(),
-        ));
 
         // P0-1: lease owner = "<topology host>:<pid>:". Using the topology
         // host (set via fuse.toml) keeps the identity stable across PID
@@ -556,7 +551,6 @@ impl DtfsFilesystem {
             next_fh: AtomicU64::new(1),
             readahead,
             write_buffer,
-            migration,
             cache_hit_notify_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 CACHE_HIT_NOTIFY_MAX_INFLIGHT,
             )),
@@ -837,7 +831,7 @@ impl DtfsFilesystem {
         // stalled chunk fetch must not hold the open_files entry guard, or it
         // serializes / deadlocks concurrent opens of the same file. Mirrors
         // the write()/flush() idiom.
-        let (locations, chunk_size, file_path, volume_id) = {
+        let (locations, chunk_size, file_path) = {
             let file = self
                 .open_files
                 .get(&fh)
@@ -848,8 +842,7 @@ impl DtfsFilesystem {
                 .context("file has no location data")?;
             let chunk_size = file.chunk_size;
             let file_path = file.path.clone();
-            let volume_id = locations.volume_id.clone();
-            (locations, chunk_size, file_path, volume_id)
+            (locations, chunk_size, file_path)
         }; // guard dropped here, before the await loop below
 
         // F-029: effective file size = max(persisted size, buffered logical
@@ -1166,28 +1159,13 @@ impl DtfsFilesystem {
                             }
                         }
 
-                        // Trigger migration check using the actually-served node so
-                        // tiering sees the real cross-DC traffic, not the nearest
-                        // candidate we wished we'd used.
-                        //
-                        // WI-09 (CO-3-12) — `.map(|r| r.clone())` drops the
-                        // DashMap `Ref` guard at the end of this statement, before
-                        // `spawn_on_remote_read` runs, so no `known_locations`
-                        // shard guard is held across the spawn (previously the
-                        // if-let bound the guard itself for the whole body and an
-                        // inline `.await` on the migration RPC could hold it for
-                        // up to the ~15s manager-walk deadline, blocking any
-                        // concurrent `learn_locations` insert into that shard).
-                        // The RPC is fire-and-forget: its result is advisory only.
-                        let node_loc = self.known_locations.get(&node_addr).map(|r| r.clone());
-                        if let Some(node_loc) = node_loc {
-                            self.migration.clone().spawn_on_remote_read(
-                                &chunk.chunk_id,
-                                node_loc,
-                                &file_path,
-                                &volume_id,
-                            );
-                        }
+                        // FUSE-5 — the former "migration trigger" fired one
+                        // full `AllocateChunks` RPC per cross-DC miss and
+                        // discarded the reply; the manager rebuilt its
+                        // placement ring per call and nothing was ever
+                        // migrated. Demand reaches the tiering engine through
+                        // the data node's per-DC read counters and
+                        // `RecordCacheHit` instead. Removed.
 
                         data
                     }
@@ -1303,6 +1281,7 @@ impl DtfsFilesystem {
         // dedups same-token renewals.
         let lease_id_for_renew = file.lease_id.clone();
         let lease_expires_for_renew = file.lease_expires_at_ms;
+        let lease_owner_for_renew = file.lease_owner_id.clone();
         // For O_APPEND we ignore the kernel-supplied offset and target the
         // *current* end of file. Use the cached file size; the buffer may
         // already have unflushed data, in which case the buffer reports a
@@ -1502,13 +1481,19 @@ impl DtfsFilesystem {
                         }
                     }
                     Ok(_) => {
-                        // Lease lost — abort writes so we don't corrupt
-                        // another writer's data. The buffered bytes from
-                        // this call have already been accepted, but the
-                        // caller will see the error and stop pushing more.
-                        bail!(
-                            "write lease lost for {path} during streaming write"
-                        );
+                        // FUSE-1 — the lease was swept (handle idle past
+                        // WRITE_LEASE_MS, or a manager-side GC race). Try
+                        // once to take it back under our own owner id
+                        // before declaring it lost; only a lease genuinely
+                        // held by ANOTHER writer aborts. Pre-fix this arm
+                        // was terminal: every later write/flush on the fh
+                        // failed and release() ghost-unlinked a never-
+                        // committed file.
+                        self.reacquire_write_lease(fh, &path, lease_owner_for_renew.as_deref())
+                            .await
+                            .with_context(|| {
+                                format!("write lease lost for {path} during streaming write")
+                            })?;
                     }
                     Err(e) => {
                         // Manager unreachable. Continue best-effort; the
@@ -1563,6 +1548,7 @@ impl DtfsFilesystem {
         // P0-1: capture lease state for renewal-before-flush.
         let lease_id = file.lease_id.clone();
         let lease_expires_at_ms = file.lease_expires_at_ms;
+        let lease_owner_id = file.lease_owner_id.clone();
         drop(file);
 
         // P0-1: if a lease is held and is past the renewal threshold,
@@ -1588,11 +1574,13 @@ impl DtfsFilesystem {
                         }
                     }
                     Ok(_) => {
-                        // Lease lost (someone else took it). Abort the flush
-                        // so we don't write past another writer's data.
-                        return Err(anyhow::anyhow!(
-                            "write lease lost for {path} during flush — aborting"
-                        ));
+                        // FUSE-1 — see write(): re-acquire under our owner
+                        // id first; abort only if another writer holds it.
+                        self.reacquire_write_lease(fh, &path, lease_owner_id.as_deref())
+                            .await
+                            .with_context(|| {
+                                format!("write lease lost for {path} during flush - aborting")
+                            })?;
                     }
                     Err(e) => {
                         // Manager unreachable. Continue best-effort: the
@@ -2200,6 +2188,45 @@ impl DtfsFilesystem {
     /// Shared by the single-flight Owner and by a Waiter whose Owner's
     /// fetch failed (fallback: fetch it ourselves rather than fail the
     /// read outright).
+    /// FUSE-1 — take the write lease on `path` back under this handle's
+    /// own `owner_id` after a renewal reported it gone. The manager grants
+    /// a fresh lease when nobody else holds one (or re-issues ours when
+    /// the same owner still does), and we store the new token/expiry on
+    /// the fh so subsequent renewals validate. `Err` only when another
+    /// writer holds the path (`LeaseBusy`) or the manager is unreachable.
+    async fn reacquire_write_lease(
+        &self,
+        fh: u64,
+        path: &str,
+        owner_id: Option<&str>,
+    ) -> Result<()> {
+        let owner_id = owner_id
+            .ok_or_else(|| anyhow::anyhow!("no lease owner recorded for fh {fh}"))?;
+        let resp = self
+            .client
+            .acquire_write_lease(path, owner_id, WRITE_LEASE_MS)
+            .await
+            .with_context(|| format!("re-acquire write lease for {path}"))?;
+        if !resp.granted {
+            return Err(anyhow::Error::new(LeaseBusy {
+                path: path.to_string(),
+                conflict_owner: resp.conflict_owner,
+                expires_at_ms: resp.conflict_expires_at_ms,
+            }));
+        }
+        if let Some(mut entry) = self.open_files.get_mut(&fh) {
+            let f = entry.value_mut();
+            f.lease_id = Some(resp.lease_id);
+            f.lease_expires_at_ms = Some(resp.expires_at_ms);
+        }
+        tracing::warn!(
+            path = %path,
+            owner = %owner_id,
+            "FUSE-1: write lease had lapsed; re-acquired under the same owner"
+        );
+        Ok(())
+    }
+
     async fn fetch_chunk_from_candidates(
         &self,
         candidates: &[String],

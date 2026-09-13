@@ -12,8 +12,12 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 
 - Never hold a DashMap guard (`open_files`, `known_locations`) across an
   `.await` or a spawn: clone what you need, drop the guard, then await.
-- `MigrationTrigger` is fire-and-forget (`spawn_on_remote_read`), never
-  awaited inline in `read()`.
+- A lapsed write lease is re-acquired once under the handle's own
+  `lease_owner_id` (`reacquire_write_lease`) before `write()`/`flush()`
+  gives up; only a lease held by another writer aborts.
+- Background prefetch is bounded by `client.chunk_read_timeout_secs`
+  like the foreground fetch (`0` = unbounded).
+- `flush()` drops the `lock_owner`'s POSIX locks (kernel close contract).
 
 ## Writes
 

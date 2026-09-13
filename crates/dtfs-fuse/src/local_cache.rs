@@ -94,6 +94,7 @@ impl LocalChunkCache {
     /// startup so the size/age accounting is correct after a restart.
     async fn reindex_from_disk(&self) -> anyhow::Result<()> {
         let mut total: u64 = 0;
+        let mut partials_removed: u64 = 0;
         let mut dirs1 = match tfs::read_dir(&self.dir).await {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -119,6 +120,17 @@ impl LocalChunkCache {
                             self.sizes.insert(id, size);
                             total += size;
                         }
+                    } else if path.extension().map_or(false, |x| x == "partial") {
+                        // FUSE-7 — a `.partial` is a `put` that never reached
+                        // its rename (crash, ENOSPC). It was neither indexed
+                        // nor counted, so eviction could never reclaim it and
+                        // the cache crept past `local_cache_max_gb` on the
+                        // disk it shares with Plex. Reclaim it here.
+                        if let Err(err) = tfs::remove_file(&path).await {
+                            tracing::debug!(path = %path.display(), error = %err, "stale .partial not removed");
+                        } else {
+                            partials_removed += 1;
+                        }
                     }
                 }
             }
@@ -127,6 +139,7 @@ impl LocalChunkCache {
         tracing::info!(
             count = self.sizes.len(),
             bytes = total,
+            partials_removed,
             "local cache reindexed"
         );
         Ok(())

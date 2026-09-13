@@ -67,13 +67,19 @@ impl InodeMap {
 
     /// Get or mint an inode for `path`.
     fn inode_for(&self, path: &str) -> u64 {
-        if let Some(ino) = self.path_to_inode.get(path) {
-            return *ino;
+        // FUSE-4 — mint under the entry lock. The old get-then-insert let
+        // two concurrent lookups (Plex scanning directories in parallel)
+        // both miss and both mint, handing the kernel two nodeids for one
+        // name: two page caches, stale reads through the loser.
+        match self.path_to_inode.entry(path.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(e) => *e.get(),
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let ino = self.next.fetch_add(1, Ordering::Relaxed);
+                self.inode_to_path.insert(ino, path.to_string());
+                v.insert(ino);
+                ino
+            }
         }
-        let ino = self.next.fetch_add(1, Ordering::Relaxed);
-        self.path_to_inode.insert(path.to_string(), ino);
-        self.inode_to_path.insert(ino, path.to_string());
-        ino
     }
 
     /// Resolve an inode to its path, or return ENOENT.
@@ -181,6 +187,25 @@ impl DtfsFuse3Adapter {
             mode_overrides: DashMap::new(),
             locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             lock_notify: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// FUSE-3 — drop every POSIX lock `owner` holds on `inode` and wake
+    /// blocked `F_SETLKW` waiters. No-op when the owner holds none.
+    async fn release_posix_locks_for_owner(&self, inode: u64, owner: u64) {
+        let released = {
+            let mut guard = self.locks.lock().await;
+            match guard.get_mut(&inode) {
+                Some(t) => {
+                    let before = t.posix.len();
+                    t.posix.retain(|h| h.owner != owner);
+                    before != t.posix.len()
+                }
+                None => false,
+            }
+        };
+        if released {
+            self.notify_for(inode).notify_waiters();
         }
     }
 
@@ -475,11 +500,18 @@ impl Filesystem for DtfsFuse3Adapter {
     async fn flush(
         &self,
         _req: Request,
-        _inode: u64,
+        inode: u64,
         fh: u64,
-        _lock_owner: u64,
+        lock_owner: u64,
     ) -> FuseResult<()> {
         debug!("fuse3:flush fh={}", fh);
+        // FUSE-3 — the kernel sends FUSE_FLUSH with `lock_owner` on every
+        // close(2) precisely so the server drops that owner's POSIX record
+        // locks. Pre-fix nothing did, so a writer that exited while holding
+        // an fcntl lock left it resident forever and the next F_SETLKW on
+        // the inode blocked without end (a mount hang with no cluster
+        // fault). Same shape as the F_UNLCK arm of `setlk`.
+        self.release_posix_locks_for_owner(inode, lock_owner).await;
         self.fs.flush(fh).await.map_err(|e| {
             warn!("fuse3 flush fh={}: {}", fh, e);
             Errno::from(libc::EIO)
