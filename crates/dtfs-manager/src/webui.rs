@@ -3394,7 +3394,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                 <div class="node-meta-item"><span>Leader</span>${{leaderRow}}</div>
                 <div class="node-meta-item"><span>Last log / applied</span>${{esc(st.last_log_index ?? '—')}} / ${{esc(st.last_applied_index ?? '—')}} (lag ${{esc(st.applied_log_lag ?? 0)}})</div>
                 <div class="node-meta-item"><span>Snapshot index</span>${{esc(st.snapshot_index ?? '—')}}</div>
-                <div class="node-meta-item"><span>Quorum ack</span>${{ack}}</div>
+                <div class="node-meta-item"><span>Quorum ack</span>${{esc(ack)}}</div>
             </div>
         </div>`;
         const members = Array.isArray(st.membership) ? st.membership : [];

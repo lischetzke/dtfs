@@ -592,6 +592,23 @@ impl ApiClient {
         let value = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
         Ok((status, value))
     }
+
+    /// POST that returns the JSON body on 2xx and otherwise fails with
+    /// the server's `error` message (UIP audit follow-up: `post()`'s
+    /// `error_for_status()` discarded validation 400s such as "interval
+    /// below 60s" or "anchor unsatisfiable", leaving the operator with
+    /// only the status line).
+    async fn post_checked(&self, path: &str, body: &Value) -> anyhow::Result<Value> {
+        let (status, value) = self.post_with_status(path, body).await?;
+        if !status.is_success() {
+            let msg = value["error"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string());
+            anyhow::bail!("HTTP {}: {}", status, msg);
+        }
+        Ok(value)
+    }
 }
 
 #[tokio::main]
@@ -1195,7 +1212,7 @@ async fn cmd_volumes_set_anchor(
     let body = serde_json::Value::Object(body);
 
     let url = format!("/api/v1/volumes/{}/set-anchor", volume_id);
-    let resp = api.post(&url, &body).await?;
+    let resp = api.post_checked(&url, &body).await?;
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
         OutputFormat::Table => {
@@ -1238,7 +1255,7 @@ async fn cmd_volumes_set_spill(
     let body = serde_json::Value::Object(body);
 
     let url = format!("/api/v1/volumes/{}/set-spill", volume_id);
-    let resp = api.post(&url, &body).await?;
+    let resp = api.post_checked(&url, &body).await?;
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
         OutputFormat::Table => {
@@ -1262,8 +1279,8 @@ async fn cmd_volumes_set_spill(
 /// [--clear-unspecified]`: patch the volume's scrub/fsck schedule
 /// overrides (AZ-1). `custom` is not exposed here (JSON-only via
 /// webui/direct API). Server-side validation rejects a nonzero
-/// interval below 60s; that 400 is surfaced verbatim by `api.post`'s
-/// caller-visible response, not re-validated client-side.
+/// interval below 60s; that 400's `error` message is surfaced by
+/// `api.post_checked`, not re-validated client-side.
 async fn cmd_volumes_set_schedules(
     api: &ApiClient,
     format: &OutputFormat,
@@ -1279,7 +1296,7 @@ async fn cmd_volumes_set_schedules(
     let body = serde_json::Value::Object(body);
 
     let url = format!("/api/v1/volumes/{}/set-schedules", volume_id);
-    let resp = api.post(&url, &body).await?;
+    let resp = api.post_checked(&url, &body).await?;
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
         OutputFormat::Table => {
@@ -1402,7 +1419,7 @@ async fn cmd_migrations_create(
     if let Some(v) = max_tasks { body.insert("max_tasks".into(), v.into()); }
     let body = serde_json::Value::Object(body);
 
-    let resp = api.post("/api/v1/migrations", &body).await?;
+    let resp = api.post_checked("/api/v1/migrations", &body).await?;
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
         OutputFormat::Table => {
@@ -2392,5 +2409,19 @@ mod audit_co_tests {
     fn uip_5_5_stats_parses() {
         let args = Args::try_parse_from(["dtfs-cli", "stats"]).expect("stats should parse");
         assert!(matches!(args.command, Commands::Stats));
+    }
+
+    // Audit follow-up — `post_checked` must surface the server's `error`
+    // string; exercised via the same extraction on a synthetic body.
+    #[test]
+    fn post_checked_error_extraction_prefers_error_field() {
+        let value = serde_json::json!({"error": "interval must be >= 60 or 0"});
+        let msg = value["error"].as_str().map(str::to_string)
+            .unwrap_or_else(|| value.to_string());
+        assert_eq!(msg, "interval must be >= 60 or 0");
+        let value = serde_json::json!({"leader": null});
+        let msg = value["error"].as_str().map(str::to_string)
+            .unwrap_or_else(|| value.to_string());
+        assert_eq!(msg, "{\"leader\":null}");
     }
 }
