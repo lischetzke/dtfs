@@ -40,5 +40,6 @@ commit_parsers = [
   { message = "^feat:", group = "New Features" },
   { message = "^bug:", group = "Bug Fixes" },
   { message = "^int:", skip = true },
+  { message = "^docs:", skip = true },
   { message = ".*", group = "Other Changes" },
 ]

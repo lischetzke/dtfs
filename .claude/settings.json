@@ -4,8 +4,7 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "bash .claude/hooks/guard-git.sh" },
-          { "type": "command", "command": "bash .claude/hooks/check-release-case.sh" }
+          { "type": "command", "command": "bash .claude/hooks/guard-git.sh" }
         ]
       }
     ],

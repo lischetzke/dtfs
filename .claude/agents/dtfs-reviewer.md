@@ -22,8 +22,7 @@ whole files end to end — pull the diff, then `Read` with `offset`/
 `limit` around each changed region when you need surrounding context
 (e.g. to check a caller of a changed function).
 
-Method (from `plans/reports/CORE-REVIEW-2026-09-12.md`, the reference
-review this project has already run): for every invariant candidate you
+Method: for every invariant candidate you
 suspect is broken, RE-READ the actual current line before reporting it
 — do not report from a diff hunk's `+`/`-` markers alone, the
 surrounding unchanged code often changes the verdict. Report "no

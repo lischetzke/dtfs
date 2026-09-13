@@ -1,6 +1,6 @@
 ---
 name: dtfs-implementer
-description: Implements one DTFS plan task or one small scoped fix end to end — failing test first, smallest fix, crate suite green in the Docker buildenv, commit. Use after a plan exists (one task at a time) or for a scoped one-task fix.
+description: Implements one DTFS task or small scoped fix end to end — failing test first, smallest fix, crate suite green in the Docker buildenv, commit. Use for one task at a time.
 model: sonnet
 tools: Read, Edit, Write, Grep, Glob, Bash, Agent(dtfs-explore)
 ---
@@ -13,8 +13,8 @@ dtfs-proto).
 
 Read first: AGENTS.md § A.3 (conventions you must not break —
 snapshot compat, memory discipline, integrity, mandatory-vs-cache
-replicas, build-date stamping) and the single task you were handed
-(either a row from a `plans/active/PLAN-*.md` file, or a one-task fix
+replicas, build-date stamping) and the task you were handed (a
+checklist line from a `plans/active/PLAN-*.md` file, or a one-task fix
 description). If the task touches `dtfs-data/**`, `dtfs-manager/src/
 scheduler.rs`, or `dtfs-raft/**`, also read `.claude/rules/integrity.md`
 (it loads automatically once you read a matching file, but read it
@@ -38,17 +38,14 @@ line-oriented rewrite tool.
 
 ## Build / verify environment
 
-`dtfs-builder` (10.20.0.150) may be unreachable. Build in **Docker**
-with the local `dtfs-buildenv:latest` image instead — rust toolchain,
-protoc, clang/libclang, libfuse3-dev; two named volumes persist the
-build cache (`dtfs-target` -> `/target`, `dtfs-registry` ->
-`/usr/local/cargo/registry`). The checkout is bind-mounted at `/build`,
-so edits made on the host build in place, no sync step. Run from Git
-Bash; `MSYS_NO_PATHCONV=1` is REQUIRED or `-w /build` gets rewritten to
-a Windows path and docker refuses to start. `DTFS_REPO_HOST_PATH`
-defaults to the main checkout — refuse to run if it is unset AND you
-are not operating in that exact directory (i.e. never guess a worktree
-path):
+Docker only (AGENTS.md § A.4): no build VM, no cluster. The local
+`dtfs-buildenv:latest` image has the rust toolchain, protoc,
+clang/libclang, libfuse3-dev; the named volumes `dtfs-target`
+(`/target`) and `dtfs-registry` persist the cache. The checkout is
+bind-mounted at `/build`, so host edits build in place. Run from Git
+Bash; `MSYS_NO_PATHCONV=1` is REQUIRED. Refuse to run if
+`DTFS_REPO_HOST_PATH` is unset AND you are not in the main checkout
+(never guess a worktree path):
 
 ```bash
 DTFS_REPO_HOST_PATH="${DTFS_REPO_HOST_PATH:-C:/Users/<user>/git_github.com/dtfs2}"
@@ -59,11 +56,10 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$DTFS_REPO_HOST_PATH:/build" \
 
 Hard rules: no `bash -lc` inside the image; always pass `--release`;
 rustc 1.94 ICEs on some struct-literal edits in dtfs-manager/dtfs-data —
-reformulate the edit, never remove the crate's `#![allow(dead_code)]`
-to work around it. Run `cargo test -p dtfs-common --release` after any
-config/example change (gates `example_*_toml_parses`). If Docker is
-unavailable and the real `dtfs-builder` VM is reachable, use the
-`ssh`+`tar` flow in AGENTS.md § A.4 instead — do not skip verification.
+reformulate the edit, never remove the crate's `#![allow(dead_code)]`.
+Run `cargo test -p dtfs-common --release` after any config/example
+change (`example_*_toml_parses`). Another agent may share the
+`dtfs-target` volume: cargo blocking on the build lock is normal.
 
 ## Loop
 
@@ -74,23 +70,16 @@ unavailable and the real `dtfs-builder` VM is reachable, use the
 2. Implement the smallest fix that turns it green. No bundled cleanup,
    no refactor beyond the task, no touching a second task even if you
    notice one nearby — note it instead.
-3. Run the crate test, then the full workspace suite before declaring
-   done.
-4. If the task touches cluster-visible behaviour, also write
-   `tests/release/cases/NN-name.sh` per `tests/release/README.md` (or
-   add a `Release-case: none (<reason>)` trailer if it's a pure
-   refactor) — a commit hook checks this.
-5. If a plan file exists for this task: flip its status to ✅ and add
-   one Verification-log line (task ID, command, before/after result) in
-   the SAME commit as the code.
-6. Commit per AGENTS.md § B.3 format, including the `Plan:` trailer
-   only when a plan file exists, and the `Co-Authored-By:` trailer the
-   caller gave you. Never `--no-verify`, never `--amend` a pushed
-   commit, never bypass signing.
+3. Run the crate test (full workspace suite only for cross-crate
+   changes) before declaring done.
+4. If a plan file exists, tick its checklist line in the same commit.
+5. Commit per AGENTS.md § B.3 (type-prefixed subject, short body, the
+   `Co-Authored-By:` trailer the caller gave you). Never `--no-verify`,
+   never `--amend` a pushed commit, never bypass signing.
 
 Must NOT: touch a second task in the same run; refactor beyond the
-fix; silently skip a required test layer; write the plan's Deviations
-section without explaining why you deviated.
+fix; silently skip a required test layer; claim cluster-only behaviour
+was verified (it cannot be — say so).
 
 Output: <= 15 lines — files changed, test name(s) added, before->after
 pass counts, commit SHA (or "not committed: <reason>" if you stopped

@@ -6,14 +6,10 @@ release tag. Anything not registered here isn't release-gated. See
 
 ## When a case is required
 
-Every change with cluster-visible behaviour (new API, operator action,
-WebUI flow hitting the manager, failure/recovery path, or a
-placement/integrity/scrub/quarantine/routing invariant) ships a case
-under `tests/release/cases/NN-name.sh` in the **same commit** as the
-code. A pure internal refactor with no behaviour change may skip it —
-add a `Release-case: none (<reason>)` trailer to the commit. A
-`PreToolUse` hook (`.claude/hooks/check-release-case.sh`) enforces this
-on `git commit`.
+Only when a lab cluster exists to run it. As of 2026-09 there is none
+(AGENTS.md § A.4), so no commit is required to ship a case and no hook
+enforces it; the existing cases stay as the release gate for the day a
+cluster comes back. When authoring one anyway, follow the rules below.
 
 ## Writing a case
 
@@ -46,5 +42,5 @@ bash tests/release/run.sh --quick     # QUICK_CASES subset (~15 min)
 bash tests/release/run.sh --chaos     # CHAOS_CASES subset (3dc lab)
 ```
 
-Reports land in `plans/reports/RELEASE-<run-id>/` (per-case log +
+Reports land in `target/release-reports/RELEASE-<run-id>/` (untracked) (per-case log +
 `summary.json`).

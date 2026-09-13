@@ -62,7 +62,7 @@ CHAOS_CASES="42-crossdc-read-routing 43-dc-poweroff-read-continuity \
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 [ "$QUICK" = "1" ] && RUN_ID="${RUN_ID}-quick"
 [ "$CHAOS" = "1" ] && RUN_ID="${RUN_ID}-chaos"
-REPORT_DIR="$ROOT/plans/reports/RELEASE-$RUN_ID"
+REPORT_DIR="$ROOT/target/release-reports/RELEASE-$RUN_ID"
 mkdir -p "$REPORT_DIR"
 JSON="$REPORT_DIR/summary.json"
 

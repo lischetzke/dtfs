@@ -30,7 +30,7 @@ Required env (defaults match the lab minicluster):
 
 ## Output
 
-Per run, `plans/reports/RELEASE-<id>/`:
+Per run, `target/release-reports/RELEASE-<id>/` (untracked):
 
 - `<case>.log` — per-case stdout
 - `summary.json` — counts + per-case status (PASS / FAIL / SKIP /

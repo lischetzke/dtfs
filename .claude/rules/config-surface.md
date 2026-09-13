@@ -20,8 +20,8 @@ default) MUST, in the **same commit**:
 
 Run `cargo test -p dtfs-common --release` after any config/example
 change — it is cheap and is exactly what would have caught a stale
-example. A field documented but not wired to anything real (see CMN-3 in
-`plans/reports/CORE-REVIEW-2026-09-12.md` for the shape of that bug) is
+example. A field documented but not wired to anything real (CMN-3,
+`grpc.max_message_size_mb` before CR2-8-1, was exactly that) is
 worse than no field: either wire it or delete it, the example, and the
 docs row together.
 

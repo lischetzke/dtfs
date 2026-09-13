@@ -1,6 +1,8 @@
 # AGENTS.md — Operating Guide for AI Agents on DTFS
 
-DTFS is a Raft-managed tiered distributed filesystem in Rust. This file is the canonical contract: keep it accurate and update it in the **same commit** as any behaviour, convention, or workload change. `CLAUDE.md` is just `@AGENTS.md` — edit this file, not that one. Other tools (Codex, Cursor, …) read AGENTS.md directly.
+DTFS is a Raft-managed tiered distributed filesystem in Rust. This file is the canonical contract: keep it accurate and update it in the same commit as any behaviour or convention change. `CLAUDE.md` is just `@AGENTS.md` — edit this file, not that one. Other tools (Codex, Cursor, …) read AGENTS.md directly.
+
+Environment (2026-09): no build VM, no lab or production cluster reachable. Everything is verified with unit/crate tests in the local Docker build image (§ A.4). Cluster-only behaviour is reasoned about, not executed.
 
 Part A = what to know about DTFS. Part B = how to work on it.
 
@@ -57,26 +59,9 @@ Non-goals: multi-tenant isolation, POSIX completeness (Plex's FUSE read + occasi
 
 **A.3.5 Build-date / version stamp.** Every dev build MUST stamp `BUILD_DATE` fresh (the only distinguishing field between two dev builds) — deploy builds MUST go through a wrapper (`scripts/build-linux-amd64.sh`, `scripts/dtfs-build.sh`, `scripts/dtfs-release.sh <tag>`); confirm with `dtfs-<bin> --version`. Release builds additionally stamp real `DTFS_VERSION`. Guards: `scripts/tests/test-{build-date-fresh,release-version-stamp}.sh`. Mechanism (Bug BS, AZ-5): `docs/src/internals/invariants.md` § A.3.5.
 
-## A.4 Build / test / deploy
+## A.4 Build / test
 
-Linux/WSL only (Windows host can't build rocksdb + fuse3). Build VM: `dtfs-builder` at 10.20.0.150 (`ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.20.0.150`, `source ~/.cargo/env` first). Not a git checkout — sync via `tar` over SSH (exclude `./target`, `./.git`, `./.claude`, `./dummy_files`), then build over SSH:
-
-```bash
-tar czf - --exclude=./target --exclude=./.git --exclude=./.claude \
-    --exclude=./dummy_files . \
-  | ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.20.0.150 \
-      'mkdir -p ~/dtfs2 && tar xzf - -C ~/dtfs2'
-ssh -i ~/.ssh/dtfs-lab/id_ed25519 debian@10.20.0.150 \
-  'source ~/.cargo/env && cd ~/dtfs2 && cargo test -p dtfs-cli --release'
-```
-
-```bash
-cargo build --release --workspace
-cargo test  --release --workspace
-cargo test -p dtfs-data --release   # per-crate
-```
-
-**Builder unreachable → Docker.** The local image `dtfs-buildenv:latest` (rust toolchain at `/usr/local/cargo/bin`, protoc, clang, libfuse3-dev) builds the Windows checkout in place, with the cache in the named volumes `dtfs-target` (`/target`) and `dtfs-registry`; from Git Bash `MSYS_NO_PATHCONV=1` is required and `bash -lc` must not be used inside the image (it drops cargo from `PATH`):
+Linux toolchain only (Windows host can't build rocksdb + fuse3). Build and test in the local Docker image `dtfs-buildenv:latest` (rust toolchain at `/usr/local/cargo/bin`, protoc, clang, libfuse3-dev). The checkout is bind-mounted at `/build`; the cache lives in the named volumes `dtfs-target` (`/target`) and `dtfs-registry`. From Git Bash `MSYS_NO_PATHCONV=1` is required and `bash -lc` must not be used inside the image (it drops cargo from `PATH`):
 
 ```bash
 MSYS_NO_PATHCONV=1 docker run --rm -v "${DTFS_REPO_HOST_PATH:-C:/Users/<user>/git_github.com/dtfs2}:/build" \
@@ -84,15 +69,11 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "${DTFS_REPO_HOST_PATH:-C:/Users/<user>/gi
   -w /build dtfs-buildenv:latest cargo test -p <crate> --release
 ```
 
-Unit and crate suites are verifiable this way; live lab verification is not. Release cases authored without a lab are `bash -n` clean and marked unexecuted in the plan.
+Always `--release`. Run `cargo test -p dtfs-common --release` after any config/example change (`example_*_toml_parses`). Parallel agents share the `dtfs-target` volume, so cargo may block on the build lock; rerun a flaked `example_*_toml_parses` once. A crate-level `#![allow(dead_code)]` on dtfs-manager/dtfs-data works around a rustc 1.94 dead-code ICE — don't remove without re-verifying.
 
-Stale-artifact trap (Bug CF): the tar sync preserves mtimes, so a just-synced edit can land older than cached build artifacts and cargo silently reuses a stale rlib — `touch` the edited file(s) before a deploy build and confirm the binary carries the change. Full narrative: `docs/src/internals/invariants.md` § A.4.
+Deploy/release builds MUST go through a wrapper so `BUILD_DATE` is fresh (§ A.3.5); a bare `cargo build --release` stamps stale. `scripts/dtfs-release.sh <tag>` stamps `DTFS_VERSION`, builds, writes `target/release-artifacts/<tag>/` + prints the `gh release create` line.
 
-Deploy builds MUST go through a wrapper so `BUILD_DATE` is fresh (§ A.3.5); a bare `cargo build --release` stamps stale. `scripts/dtfs-release.sh <tag>` stamps `DTFS_VERSION`, builds, writes `target/release-artifacts/<tag>/` + prints the `gh release create` line (AIWF-4-1: `git-cliff` notes when available, `--generate-notes` fallback). A crate-level `#![allow(dead_code)]` on dtfs-manager/dtfs-data works around a rustc 1.94 dead-code ICE — don't remove without re-verifying the ICE first.
-
-Rolling deploy: scp the binary, `install -m 755`, `systemctl restart`. Managers leader-last, then data nodes, then FUSE clients.
-
-Lab: Proxmox on 10.20.0.0/24, PVE host root `ssh root@10.20.0.121` (password-only, sshpass on the operator's WSL home only, never committed). VM key `~/.ssh/dtfs-lab/id_ed25519`. Bandwidth shaping: `tests/proxmox/ansible/roles/dtfs-netshape/`.
+`tests/release/cases/*.sh` and `tests/proxmox/` are cluster-only harnesses kept for when a lab exists again; they are not part of the current verification loop and no change is required to ship one.
 
 ## A.5 Memory model
 
@@ -114,19 +95,7 @@ CR2-8-1 (CMN-3): `[grpc].max_message_size_mb` (manager/data) and the mirrored `[
 
 ## A.6 Data-integrity audit checklist
 
-Run when you touch a write/migrate/delete/scrub path; mark each "Verified by <test>" in the commit. Full checklist with narrative context lives in `.claude/rules/integrity.md`, loaded automatically for `dtfs-data/**`, `dtfs-manager/src/scheduler.rs`, `dtfs-raft/**`. Summary: (1) BLAKE3 checksum end-to-end into `ChunkMeta.checksum`; (2-3) tmp+atomic-rename+`sync_all()` for both `.dat` and `.meta` — `.meta` is written via a `write_meta_atomic` tmp+rename helper (CR-4-2), never a direct create at the final path, so a crash never leaves a torn sidecar; (4) counters update only after meta is durable, and only for a genuinely new chunk (a re-upload of an already-complete chunk is not double-counted, CR-4-6); (5) tmp removed on any put error path, and any failure AFTER the `.dat` rename also removes the `.dat`/`.meta`/WAL entry it just committed (CR-4-3) — a 256-way striped per-chunk lock plus op-keyed WAL names (`.put.wal.json`/`.delete.wal.json`, legacy `.wal.json` still replayed) keep a same-id put and delete from interleaving into a torn state (CR-4-4); (6) migration verifies before marking Done, de-location is Raft-remove-then-byte-delete (the CO-3-2 reaper mops a failed byte-delete); (7) scrub BLAKE3-checks vs `checksum`, auto-repairs via `replicate_chunk` — but first tries to repair a missing/unparseable `.meta` by re-hashing the `.dat` against its own id (CR-4-1); only a genuine mismatch or unreadable `.dat` quarantines; (8) unlink deletes metadata before bytes, orphan reap keys off durable on-disk mtime (Bug CB), not a manager-local clock — CR2-7-2 (MGR-10): when the data node's `ListChunks` reply carries `chunk_disk_ids`, the reap is keyed by `(node_id, disk_id)` instead of node-wide, so a de-located leftover on one disk of a node is reaped correctly even when another disk of the SAME node still holds a live replica of the same chunk; an older data node reporting no disk ids falls back to the prior node-wide behaviour; (9) rename is one Raft command, chunk_id binding unchanged; (10) reads use replica-fallback (P0-2).
-
-## A.7 Bandwidth + network shaping
-
-`tests/proxmox/ansible/roles/dtfs-netshape/`. Per-class `tc qdisc` + IFB:
-
-| Class | Up/Down | Jitter |
-|-------|---------|--------|
-| LELI | 40 Mbps | 25±5 ms |
-| TORO | 400 Mbps | 5±1 ms |
-| NRB | 1 Gbps | 1±0.5 ms |
-
-Apply via apply-shaping.yml, revert via revert-shaping.yml. **Exempt: SSH/22, manager gRPC/9401, manager API/9402, data gRPC/9500, NTP/123** — otherwise Raft heartbeats fail under jitter and the cluster can't elect.
+Run mentally when you touch a write/migrate/delete/scrub path; name the covering test in the commit body only where it isn't obvious. Full checklist with narrative context lives in `.claude/rules/integrity.md`, loaded automatically for `dtfs-data/**`, `dtfs-manager/src/scheduler.rs`, `dtfs-raft/**`. Summary: (1) BLAKE3 checksum end-to-end into `ChunkMeta.checksum`; (2-3) tmp+atomic-rename+`sync_all()` for both `.dat` and `.meta` — `.meta` is written via a `write_meta_atomic` tmp+rename helper (CR-4-2), never a direct create at the final path, so a crash never leaves a torn sidecar; (4) counters update only after meta is durable, and only for a genuinely new chunk (a re-upload of an already-complete chunk is not double-counted, CR-4-6); (5) tmp removed on any put error path, and any failure AFTER the `.dat` rename also removes the `.dat`/`.meta`/WAL entry it just committed (CR-4-3) — a 256-way striped per-chunk lock plus op-keyed WAL names (`.put.wal.json`/`.delete.wal.json`, legacy `.wal.json` still replayed) keep a same-id put and delete from interleaving into a torn state (CR-4-4); (6) migration verifies before marking Done, de-location is Raft-remove-then-byte-delete (the CO-3-2 reaper mops a failed byte-delete); (7) scrub BLAKE3-checks vs `checksum`, auto-repairs via `replicate_chunk` — but first tries to repair a missing/unparseable `.meta` by re-hashing the `.dat` against its own id (CR-4-1); only a genuine mismatch or unreadable `.dat` quarantines; (8) unlink deletes metadata before bytes, orphan reap keys off durable on-disk mtime (Bug CB), not a manager-local clock — CR2-7-2 (MGR-10): when the data node's `ListChunks` reply carries `chunk_disk_ids`, the reap is keyed by `(node_id, disk_id)` instead of node-wide, so a de-located leftover on one disk of a node is reaped correctly even when another disk of the SAME node still holds a live replica of the same chunk; an older data node reporting no disk ids falls back to the prior node-wide behaviour; (9) rename is one Raft command, chunk_id binding unchanged; (10) reads use replica-fallback (P0-2).
 
 ## A.8 File map
 
@@ -162,8 +131,8 @@ Full narrative (bug/task-ID reasoning behind each row) moved to `docs/src/intern
 | `dtfs-cli/src/updater.rs` | `dtfs-cli update` — download, verify, atomic install, restart |
 | `scripts/dtfs-release.sh` | Release builder; stamps version, assembles tarball, prints `gh release create` |
 | `dtfs-common/src/tls.rs` | CF-6 `TlsContext`; all gRPC routes through it; enable only cluster-wide |
-| `plans/active/` | In-flight plans (`plans/README.md`) |
-| `tests/proxmox/abuse/` | Numbered shell regression tests |
+| `plans/active/` | Optional short plans for multi-session work (`plans/README.md`) |
+| `tests/release/`, `tests/proxmox/` | Cluster-only harnesses, dormant without a lab |
 
 ---
 
@@ -171,33 +140,33 @@ Full narrative (bug/task-ID reasoning behind each row) moved to `docs/src/intern
 
 ## B.1 How a change lands
 
-Reproduce/locate → failing test in the purest layer (pure helper > state-machine apply > manager aggregator > FUSE helper > shell case) → smallest fix → `cargo test -p <crate> --release` + full workspace suite → commit to `master`. Branch only for a wire/on-disk format change (`proto/*.proto`, `ClientRequest`, `apply_request`, `#[serde]`-persisted structs), >6 files, or multi-session work; PR only for a release-note line (`bug:`/`feat:` subjects, labeled).
+Reproduce/locate → failing test in the purest layer (pure helper > state-machine apply > manager aggregator > FUSE helper) → smallest fix → `cargo test -p <crate> --release` in Docker (§ A.4), full workspace suite for cross-crate changes → commit to `master`. Branch only for a wire/on-disk format change (`proto/*.proto`, `ClientRequest`, `apply_request`, `#[serde]`-persisted structs) or work that spans sessions. PR only when a release-note line is wanted (`bug:`/`feat:` subjects).
 
 ## B.2 Plans
 
-`plans/active/PLAN-<id>-<short-name>.md` (template: `plans/README.md`) for ≥3-task/multi-session/cross-crate work, else the session todo list. Record divergence under Deviations; delete when done.
+Default: the session todo list. Write `plans/active/PLAN-<short-name>.md` only for work that must survive across sessions: goals, non-goals, a checklist of tasks, open questions. No task IDs, no status columns, no verification log — tick the checklist, delete the file when done. Git history is the archive; there is no `plans/reports/`.
 
 ## B.3 Commits
 
 ```
-<type or task-id>: <summary ≤72 chars>
+<type>: <summary ≤72 chars>
 
-What changed, which test covers it, failing->passing output, deviation.
+What changed and why, in a few lines. Name the covering test only when
+it isn't obvious from the diff.
 
-Plan: <path> (<task-id>)        # only when a plan file exists
 Co-Authored-By: <model> <noreply@<vendor>.com>
 ```
 
-`<type>` is `bug`/`feat`/`int`, becomes the release-note line via `git-cliff`/`.github/cliff.toml` (`Breaking:`/`Update-required:` trailers route sections). One commit per task. Never `--no-verify`, never `--amend` a pushed commit, never bypass signing.
+`<type>` is `bug`/`feat`/`int`/`docs` and becomes the release-note line via `git-cliff`/`.github/cliff.toml` (`Breaking:`/`Update-required:` trailers route sections). Group related edits into one commit; don't split a fix into per-file commits. Never `--no-verify`, never `--amend` a pushed commit, never bypass signing (`.claude/hooks/guard-git.sh` blocks these).
 
 ## B.4 Tests
 
-Observe fail → implement → observe pass → full crate suite (new durability/anchor invariants: a property-style test over random ops). Cluster-visible behaviour ships a `tests/release/cases/NN-name.sh` in the same commit (`tests/release/README.md`), or a `Release-case:` trailer — `none (<reason>)` for a pure internal change, or `tests/release/cases/NNN-name.sh (<task-id>)` when the case lands in a later commit of the same plan — a commit hook enforces this.
+Observe fail → implement → observe pass → crate suite. New durability/anchor invariants get a property-style test over random ops. Cluster-only behaviour cannot be executed here: say so in the commit body instead of authoring an unrunnable release case.
 
 ## B.5 Where things live
 
-`plans/{active,reports}/` · `docs/src/` (archaeology: `docs/src/internals/invariants.md`) · `crates/<crate>/src/` · `proto/` · `tests/release/cases/` · `tests/proxmox/abuse/` · `scripts/` · `deploy/examples/*.toml` · `.claude/{agents,rules}/`. No root status files, no loose `.md` under `crates/`/`tests/`, no in-repo changelog. Config-surface sync (`.claude/rules/config-surface.md`): `dtfs-common/src/config.rs` changes update the examples + docs together.
+`plans/active/` · `docs/src/` (archaeology: `docs/src/internals/invariants.md`) · `crates/<crate>/src/` · `proto/` · `tests/release/` + `tests/proxmox/` (dormant) · `scripts/` · `deploy/examples/*.toml` · `.claude/{agents,rules,hooks}/`. No root status files, no loose `.md` under `crates/`/`tests/`, no in-repo changelog. Config-surface sync (`.claude/rules/config-surface.md`): `dtfs-common/src/config.rs` changes update the examples + docs together.
 
 ## B.6 Updating this file
 
-A behaviour change visible to an operator, agent, or the data plane updates AGENTS.md in the same commit (say so, or why not); fold in any session instruction that overrode a rule here.
+A behaviour change visible to an operator, agent, or the data plane updates AGENTS.md in the same commit; fold in any session instruction that overrode a rule here.
