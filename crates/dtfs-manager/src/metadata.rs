@@ -18,16 +18,6 @@ use crate::cluster::ClusterManager;
 use crate::placement::PlacementEngine;
 use crate::scheduler::live_replica_tier;
 
-/// Bug BF-9 / BF-10 — warn-once gates for the three deprecated
-/// `VolumeSchedules` fields. Each AtomicBool flips on first observation
-/// so the warn lands once per manager process lifetime instead of every
-/// heartbeat.
-static WARNED_SCRUB_INTERVAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static WARNED_FSCK_INTERVAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static WARNED_CUSTOM_SCHEDULE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 /// CR-6-3 (PROTO-2) — warn once per manager process when a sub-hour
 /// quick/deep scrub cadence is configured, since an older data node
 /// can't honour it (rounds up to the nearest hour via the legacy
@@ -43,50 +33,6 @@ fn stamp_now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-// The helper itself MUST read the deprecated fields to detect
-// them. Suppress the deprecation warning at the read site only.
-#[allow(deprecated)]
-fn warn_once_on_dead_schedule_fields(
-    volumes: &std::collections::BTreeMap<String, dtfs_common::types::VolumeConfig>,
-) {
-    use std::sync::atomic::Ordering;
-    for v in volumes.values() {
-        if v.schedules.scrub_interval_secs.is_some()
-            && !WARNED_SCRUB_INTERVAL.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                volume_id = %v.id,
-                value = ?v.schedules.scrub_interval_secs,
-                "Bug BF-9: VolumeSchedules.scrub_interval_secs is removed from \
-                 the active path. Cluster-wide [scrub] block governs cadence. \
-                 The field is preserved for snapshot compatibility but has no \
-                 effect. Remove it from your volume config."
-            );
-        }
-        if v.schedules.fsck_interval_secs.is_some()
-            && !WARNED_FSCK_INTERVAL.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                volume_id = %v.id,
-                value = ?v.schedules.fsck_interval_secs,
-                "Bug BF-10: VolumeSchedules.fsck_interval_secs is reserved \
-                 but never consumed. No fsck scheduler exists. Scheduled for \
-                 removal in next minor release."
-            );
-        }
-        if !v.schedules.custom.is_empty()
-            && !WARNED_CUSTOM_SCHEDULE.swap(true, Ordering::Relaxed)
-        {
-            tracing::warn!(
-                volume_id = %v.id,
-                count = v.schedules.custom.len(),
-                "Bug BF-10: VolumeSchedules.custom map is reserved but no \
-                 scheduler consumes named-job entries. Scheduled for removal."
-            );
-        }
-    }
 }
 
 /// gRPC metadata service backed by Raft-replicated state.
@@ -1304,23 +1250,10 @@ impl ManagerService for MetadataService {
         // The new fields (orphan + verify_on_read + quarantine +
         // auto-unquarantine) are populated from the same
         // ClusterScrubConfig source of truth.
-        //
-        // Per-volume `VolumeSchedules.scrub_interval_secs` is now
-        // Bug BF-9 — per-volume `scrub_interval_secs` removed from the
-        // active path. Cluster-wide `manager.scrub.quick_interval_secs`
-        // is now the only source. The serde field on VolumeSchedules
-        // stays for back-compat reads of older snapshots but no longer
-        // influences the heartbeat override.
-        //
-        // Bug BF-10 — `fsck_interval_secs` + `custom` schedule fields
-        // are reserved-but-unused. We warn-once per process on first
-        // observation so operators see the deprecation in journalctl
-        // without the noise of a per-heartbeat warn.
         let scrub_cfg = &self.config.scrub;
         let (cfg_version, scrub_override, pending_scrub) = {
             let sm = self.sm_data.read().await;
             let cfg_version = sm.cluster_config.version;
-            warn_once_on_dead_schedule_fields(&sm.volumes);
             let effective_quick_secs = scrub_cfg.quick_interval_secs.max(60);
             let effective_deep_secs = scrub_cfg.deep_interval_secs.max(60);
             let quick_h = (effective_quick_secs + 3599) / 3600;

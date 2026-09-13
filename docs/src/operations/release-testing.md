@@ -67,7 +67,6 @@ scenario depends on un-shipped functionality.
 | 04 | scrub-deep | manual deep scrub trigger | — |
 | 05 | migration | operator migrate path + sha holds | yes |
 | 06 | flush-cache | mandatory preserved + audit emitted | yes |
-| 07 | set-schedules | endpoint shape + deprecated-scrub-warn | — |
 | 08 | set-anchor | AnchorPolicy applies | — |
 | 09 | set-mandatory | RF change | — |
 | 10 | leader-rotation | new leader elected ≤30s | — |

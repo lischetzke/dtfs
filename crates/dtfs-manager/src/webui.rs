@@ -376,7 +376,6 @@ mod bug_bk_scrub_tests {
             "'/api/v1/nodes/' + nodeId + '/maintenance'",
             "'/api/v1/nodes/' + nid + '/unquarantine'",
             "'/api/v1/nodes/' + nid + '/decommission'",
-            "/set-schedules`",
             "/${suffix}`",
         ] {
             assert!(html.contains(needle), "expected mutate path fragment: {needle}");

@@ -377,7 +377,6 @@ mod tests {
                     datacenter: "dc3".into(),
                     required_tier: Some(DiskTier::Cold),
                 }),
-                schedules: dtfs_common::types::VolumeSchedules::default(),
                 spill: dtfs_common::types::SpillPolicy::default(),
                 anchor_datacenter: None,
                 write_safety: WriteSafety {

@@ -210,7 +210,6 @@ mod snapshot_persistence_tests {
             mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
             cache_replicas: CacheReplication::default(),
             anchor: None,
-            schedules: dtfs_common::types::VolumeSchedules::default(),
             spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety {
@@ -280,7 +279,6 @@ mod snapshot_persistence_tests {
             mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
             cache_replicas: CacheReplication::default(),
             anchor: None,
-            schedules: dtfs_common::types::VolumeSchedules::default(),
             spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety {

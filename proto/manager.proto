@@ -562,11 +562,11 @@ message PerChunkReadCounter {
 message ConfigUpdate {
   uint64 version = 1;
   string config_json = 2; // Full cluster config as JSON
-  // AZ-1 — manager-computed scrub override that accounts for per-volume
-  // schedules. When present, the data-node's scrub scheduler treats
-  // these values as the effective floor (overriding `config.scrub.*`
-  // for the lifetime of the heartbeat session). Hot-reloadable —
-  // the scheduler picks up changes within 60 s.
+  // AZ-1 — manager-computed scrub override. When present, the
+  // data-node's scrub scheduler treats these values as the effective
+  // floor (overriding `config.scrub.*` for the lifetime of the
+  // heartbeat session). Hot-reloadable — the scheduler picks up
+  // changes within 60 s.
   optional ScrubConfigOverride scrub_override = 3;
 }
 

@@ -170,8 +170,7 @@ async fn main() -> anyhow::Result<()> {
 
     // AZ-1 — scrub scheduler holds a hot-reloadable `Arc<RwLock<ScrubConfig>>`
     // so the manager's heartbeat-driven ConfigUpdate path can lower the
-    // effective interval at runtime (e.g. when an operator raises a
-    // per-volume scrub cadence via `POST /api/v1/volumes/{id}/set-schedules`).
+    // effective interval at runtime (cluster-wide `[scrub]` config change).
     let scrub_config = Arc::new(tokio::sync::RwLock::new(config.scrub.clone()));
 
     // Bug BF-2 — integrity-fault collector. verify_on_read records here;

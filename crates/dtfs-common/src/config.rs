@@ -26,7 +26,7 @@ pub struct ManagerConfig {
     pub audit: AuditConfig,
     /// Bug BC — cluster-wide scrub + integrity policy. Propagated to
     /// data nodes via the heartbeat `ScrubConfigOverride`. Replaces the
-    /// per-volume `scrub_interval_secs` and the hardcoded constants
+    /// removed per-volume schedule override and the hardcoded constants
     /// previously in `metadata.rs`.
     #[serde(default)]
     pub scrub: ClusterScrubConfig,

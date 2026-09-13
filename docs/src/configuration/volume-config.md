@@ -253,46 +253,6 @@ Edit a row's value, click **Apply (live only)** for an in-memory
 update or **Apply + write to disk** to persist; pending count is
 shown at the top of the page.
 
-### Per-volume schedules (AZ-1)
-
-Each volume carries a `[volume.schedules]` block that overrides
-cluster-wide background-job cadences for its chunks.
-
-```toml
-[volume.schedules]
-# Scrub more often than the cluster default (default 6h = 21600s)
-scrub_interval_secs = 3600    # 1 hour
-fsck_interval_secs  = 86400   # 24 hours (reserved for future fsck)
-[volume.schedules.custom]
-rebalance = 21600             # 6 hours
-```
-
-REST: `POST /api/v1/volumes/{id}/set-schedules`. Body:
-
-```json
-{
-  "scrub_interval_secs": 3600,
-  "fsck_interval_secs":  null,
-  "custom": {"rebalance": 21600},
-  "clear_unspecified": false
-}
-```
-
-Rules:
-- `null` (or omitted): preserve current value.
-- `0`: clear the override (back to cluster default).
-- Positive value: must be >= 60 seconds.
-- `clear_unspecified=true`: every `null` sub-field resets too.
-
-The manager pushes the effective scrub interval to data nodes via
-the heartbeat `ConfigUpdate.scrub_override` field (AZ-1). The
-data-node scrub scheduler reads its `Arc<RwLock<ScrubConfig>>`
-every `DECISION_TICK_SECS` (60s), so changes take effect inside
-1-2 minutes without restart.
-
-WebUI: the Volumes page exposes a **Schedules…** button next to
-**Edit policy…** that opens the same set-schedules form.
-
 ### Per-file chunk_size (AZ-3)
 
 `chunk_size_bytes` is editable on the volume, but the change does

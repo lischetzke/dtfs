@@ -325,7 +325,6 @@ async fn main() -> anyhow::Result<()> {
                 mandatory_replicas: dtfs_common::types::TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 },
                 cache_replicas: dtfs_common::types::CacheReplication::default(),
                 anchor: None,
-                schedules: dtfs_common::types::VolumeSchedules::default(),
                 spill: dtfs_common::types::SpillPolicy::default(),
             };
             match raft_for_volume

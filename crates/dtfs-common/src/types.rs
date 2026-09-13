@@ -564,12 +564,6 @@ pub struct VolumeConfig {
     #[serde(default)]
     pub anchor: Option<AnchorPolicy>,
 
-    /// Bug AZ-1 — per-volume background-job schedules. Currently
-    /// covers scrub cadence; future: fsck and operator-defined jobs.
-    /// `None` on any sub-field means "inherit cluster default".
-    #[serde(default)]
-    pub schedules: VolumeSchedules,
-
     /// Bug BZ — per-volume capacity-spill policy. Controls whether and
     /// WHERE the manager may spill this volume's chunks when the mandated
     /// tier is full (Bug BX-2). `#[serde(default)]` keeps old snapshots
@@ -620,37 +614,6 @@ impl SpillPolicy {
         }
         true
     }
-}
-
-/// Bug AZ-1 — per-volume background-job cadence overrides. Lets
-/// operators run scrub more often on hot volumes (e.g. Plex media
-/// libraries with frequent reads) than the cluster-wide default
-/// without dialling up scrub I/O on archival volumes.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct VolumeSchedules {
-    /// Bug BF-9 — REMOVED FROM THE ACTIVE PATH. Cluster-wide
-    /// `manager.scrub.quick_interval_secs` governs scrub cadence
-    /// (data nodes scrub by disk, not by volume). The field is
-    /// kept for snapshot back-compat + `#[serde(skip_serializing_if =
-    /// "Option::is_none")]` so fresh writes don't emit it. A
-    /// warn-once log fires on first observation per process.
-    #[deprecated(note = "Bug BF-9: removed from active path; set [scrub] block instead")]
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scrub_interval_secs: Option<u64>,
-    /// Bug BF-10 — RESERVED, NEVER CONSUMED. No fsck scheduler
-    /// exists. Scheduled for removal in next minor. Warn-once
-    /// log fires on first observation per process.
-    #[deprecated(note = "Bug BF-10: reserved-but-unused; scheduled for removal")]
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fsck_interval_secs: Option<u64>,
-    /// Bug BF-10 — RESERVED, NEVER CONSUMED. No scheduler honours
-    /// named-job entries. Scheduled for removal in next minor.
-    #[deprecated(note = "Bug BF-10: reserved-but-unused; scheduled for removal")]
-    #[serde(default)]
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub custom: std::collections::BTreeMap<String, u64>,
 }
 
 impl VolumeConfig {
@@ -730,7 +693,6 @@ impl Default for VolumeConfig {
             mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 },
             cache_replicas: CacheReplication::default(),
             anchor: None,
-            schedules: VolumeSchedules::default(),
             spill: SpillPolicy::default(),
         }
     }
@@ -863,6 +825,27 @@ mod tests {
         assert_eq!(tr.hot, 3);
         assert_eq!(tr.warm, 2);
         assert_eq!(tr.cold, 1);
+    }
+
+    /// Removal of the dead `VolumeSchedules` knob deleted the
+    /// `schedules` field from `VolumeConfig`. Serde ignores unknown
+    /// fields by default (no `deny_unknown_fields` on `VolumeConfig`),
+    /// so an old snapshot/config JSON that still carries a legacy
+    /// `"schedules"` key must keep deserializing cleanly.
+    #[test]
+    fn volume_config_deserializes_legacy_schedules_key() {
+        let json = serde_json::json!({
+            "id": "default",
+            "name": "default",
+            "chunk_size_bytes": 134217728u64,
+            "replication": { "hot": 3, "warm": 2, "cold": 1, "tape": 1 },
+            "write_safety": { "min_replicas_before_ack": 2, "write_timeout_secs": 30 },
+            "schedules": { "scrub_interval_secs": 3600 }
+        });
+        let cfg: VolumeConfig =
+            serde_json::from_value(json).expect("legacy schedules key must not fail deserialize");
+        assert_eq!(cfg.id, VolumeId::new("default".to_string()));
+        assert_eq!(cfg.replication.hot, 3);
     }
 }
 

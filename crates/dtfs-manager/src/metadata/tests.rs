@@ -369,7 +369,6 @@ mod bug_av_preferred_tier_tests {
                 cooldown_secs: 30,
             },
             anchor: None,
-            schedules: dtfs_common::types::VolumeSchedules::default(),
             spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: Some("dc-a".to_string()),
             write_safety: WriteSafety {
@@ -483,7 +482,6 @@ mod rev_4_10_hint_ack_floor_tests {
                 cooldown_secs: 30,
             },
             anchor: None,
-            schedules: VolumeSchedules::default(),
             spill: SpillPolicy::default(),
             anchor_datacenter: Some("dc-a".to_string()),
             write_safety: WriteSafety {
@@ -1382,7 +1380,6 @@ mod tests {
                 cooldown_secs: 30,
             },
             anchor: None,
-            schedules: VolumeSchedules::default(),
             spill: SpillPolicy::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety {

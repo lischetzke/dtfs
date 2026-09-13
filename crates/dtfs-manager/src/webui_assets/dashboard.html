@@ -770,39 +770,6 @@
     </div>
 </div>
 
-<!-- AZ-1 — Schedules edit dialog -->
-<div id="volume-schedules-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeVolumeSchedules()">
-    <div class="modal-card">
-        <h3>Edit volume schedules</h3>
-        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:1rem">
-            Per-volume background-job cadence overrides. Empty input
-            preserves the current value; <code>0</code> clears the
-            override (back to cluster default). Minimum: 60 s.
-        </div>
-        <div class="modal-row">
-            <label>Volume ID</label>
-            <input id="vs-volume-id" class="form-input" readonly>
-        </div>
-        <div class="modal-row">
-            <label>scrub_interval_secs <span style="color:var(--warning);font-size:.7rem">(deprecated)</span></label>
-            <input id="vs-scrub-secs" class="form-input" type="number" min="0" step="60" placeholder="(ignored — set cluster [scrub] block instead)">
-            <div style="font-size:.7rem;color:var(--text-muted);margin-top:.2rem">
-                Per-volume scrub cadence is no longer effective: data nodes scrub by disk,
-                not by volume. Set cluster-wide values in Config → scrub.* instead.
-            </div>
-        </div>
-        <div class="modal-row">
-            <label>fsck_interval_secs</label>
-            <input id="vs-fsck-secs" class="form-input" type="number" min="0" step="60" placeholder="(inherit; reserved for future fsck)">
-        </div>
-        <div class="modal-actions">
-            <button class="btn-secondary" onclick="closeVolumeSchedules()">Cancel</button>
-            <button class="btn-primary"  onclick="submitVolumeSchedules()" id="vs-submit">Apply</button>
-        </div>
-        <div id="vs-result" class="modal-result" style="display:none"></div>
-    </div>
-</div>
-
 <!-- Unquarantine confirmation dialog -->
 <div id="unquarantine-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeUnquarantineModal()">
     <div class="modal-card" style="max-width:32rem">
@@ -2229,16 +2196,6 @@
         const anchor = v.anchor
             ? `dc=${esc(v.anchor.datacenter||'—')}, required_tier=${esc(v.anchor.required_tier||'(any)')}`
             : '(none)';
-        // AZ-1 — per-volume background-job schedules.
-        const sch = v.schedules || {};
-        const scrubLine = (sch.scrub_interval_secs != null)
-            ? `${sch.scrub_interval_secs}s (override)`
-            : '(inherit cluster default)';
-        const fsckLine = (sch.fsck_interval_secs != null)
-            ? `${sch.fsck_interval_secs}s (override)`
-            : '(inherit cluster default)';
-        const customMap = sch.custom || {};
-        const customCount = Object.keys(customMap).length;
         return `<div class="placeholder" style="text-align:left;padding:1rem;background:rgba(0,0,0,.04);border-radius:.5rem">
             <div style="font-weight:bold;margin-bottom:.5rem">Policy for ${esc(v.volume_id)}</div>
             <div style="font-family:monospace;font-size:.78rem;line-height:1.6">
@@ -2250,10 +2207,6 @@
                 <div style="margin-left:1rem">${tier('tape')}</div>
                 <div>Anchor: ${anchor}</div>
                 <div>Chunk size: ${fmtBytes(v.chunk_size_bytes||0)}</div>
-                <div style="margin-top:.5rem;font-weight:bold">Schedules (AZ-1)</div>
-                <div style="margin-left:1rem">scrub_interval_secs: ${scrubLine}</div>
-                <div style="margin-left:1rem">fsck_interval_secs: ${fsckLine}</div>
-                <div style="margin-left:1rem">custom jobs: ${customCount}</div>
             </div>
         </div>`;
     }
@@ -2295,7 +2248,6 @@
                 '<th>Anchor</th>' +
                 '<th style="min-width:5.5rem">Details</th>' +
                 '<th style="min-width:7.5rem">Edit policy</th>' +
-                '<th style="min-width:7rem">Schedules</th>' +
                 '<th style="min-width:8rem">Flush cache</th>' +
             '</tr></thead><tbody>' +
             vols.flatMap(v => {
@@ -2318,12 +2270,10 @@
                     <td ${ACT_TD}><button class="${ACT_BTN}" style="${ACT_STYLE}"
                         onclick="openVolumeEdit('${safeVid}')">Edit policy…</button></td>
                     <td ${ACT_TD}><button class="${ACT_BTN}" style="${ACT_STYLE}"
-                        onclick="openVolumeSchedules('${safeVid}')">Schedules…</button></td>
-                    <td ${ACT_TD}><button class="${ACT_BTN}" style="${ACT_STYLE}"
                         onclick="openFlushCache('/')">Flush cache…</button></td>
                 </tr>`];
                 if (isOpen) {
-                    rows.push(`<tr><td colspan="10">${renderVolumeCard(v)}</td></tr>`);
+                    rows.push(`<tr><td colspan="9">${renderVolumeCard(v)}</td></tr>`);
                 }
                 return rows;
             }).join('') +
@@ -2610,61 +2560,6 @@
             result.textContent = 'Network error: ' + e;
         } finally {
             btn.disabled = false; btn.textContent = 'Migrate policy…';
-        }
-    }
-
-    // ── AZ-1 Schedules modal ──────────────────────────────────────
-    function openVolumeSchedules(volumeId) {
-        const v = (window._volumesData||[]).find(x => x.volume_id === volumeId);
-        document.getElementById('vs-volume-id').value = volumeId;
-        const sch = (v && v.schedules) || {};
-        document.getElementById('vs-scrub-secs').value = sch.scrub_interval_secs || '';
-        document.getElementById('vs-fsck-secs').value = sch.fsck_interval_secs || '';
-        document.getElementById('vs-result').style.display = 'none';
-        document.getElementById('volume-schedules-modal').classList.remove('hidden');
-    }
-
-    function closeVolumeSchedules() {
-        document.getElementById('volume-schedules-modal').classList.add('hidden');
-    }
-
-    async function submitVolumeSchedules() {
-        const vid = document.getElementById('vs-volume-id').value.trim();
-        if (!vid) { alert('volume id is required'); return; }
-
-        const intOrNull = (id) => {
-            const raw = document.getElementById(id).value.trim();
-            return raw === '' ? null : parseInt(raw, 10);
-        };
-        const body = {
-            scrub_interval_secs: intOrNull('vs-scrub-secs'),
-            fsck_interval_secs:  intOrNull('vs-fsck-secs'),
-        };
-
-        const btn = document.getElementById('vs-submit');
-        btn.disabled = true; btn.textContent = 'Applying…';
-        const result = document.getElementById('vs-result');
-        result.style.display = 'block';
-        result.textContent = 'Submitting…';
-
-        try {
-            const { resp, json, authError } = await mutateFetch(
-                `/api/v1/volumes/${encodeURIComponent(vid)}/set-schedules`,
-                { body: JSON.stringify(body) }
-            );
-            if (!resp.ok) {
-                result.textContent = authError
-                    || ('Error ' + resp.status + ': ' + ((json && json.error) || JSON.stringify(json)));
-            } else {
-                result.textContent = json && json.changed
-                    ? 'Updated. New schedules:\n' + JSON.stringify(json.config.schedules, null, 2)
-                    : 'No change (request was a no-op).';
-                await renderVolumes();
-            }
-        } catch (e) {
-            result.textContent = 'Network error: ' + e;
-        } finally {
-            btn.disabled = false; btn.textContent = 'Apply';
         }
     }
 

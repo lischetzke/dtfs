@@ -13,7 +13,7 @@ use crate::store::ChunkStore;
 /// every `DECISION_TICK_SECS` and consults the live `ScrubConfig` to
 /// decide whether the (now - last_run) gap has reached the configured
 /// interval. Replaces the legacy fixed-interval ticker so a config
-/// hot-reload (e.g. operator drops a volume's scrub_interval_secs)
+/// hot-reload (e.g. operator changes the cluster-wide scrub interval)
 /// takes effect within `DECISION_TICK_SECS`, not at next restart.
 const DECISION_TICK_SECS: u64 = 60;
 

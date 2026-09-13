@@ -327,42 +327,6 @@ Backed by `POST /api/v1/volumes/{id}/set-spill` with
 
 ---
 
-#### volumes set-schedules
-
-Set or update the volume's background-job schedule (scrub and fsck
-intervals). Intervals are seconds and must be `>= 60`; `0` clears the
-interval. Omitted flags keep the current value unless
-`--clear-unspecified` is set, which resets every omitted interval to
-unset.
-
-```bash
-dtfs-cli volumes set-schedules <volume_id> \
-    [--scrub-interval-secs N] [--fsck-interval-secs N] [--clear-unspecified]
-```
-
-**Example:**
-
-```
-$ dtfs-cli volumes set-schedules media --scrub-interval-secs 604800
-Volume 'media' set-schedules: applied
-  scrub_interval_secs:  Some(604800)
-  fsck_interval_secs:   None
-```
-
-Backed by `POST /api/v1/volumes/{id}/set-schedules` with
-`{"scrub_interval_secs": N, "fsck_interval_secs": N, "clear_unspecified": bool}`.
-The REST body also accepts a `custom` map of named intervals; the CLI
-does not expose it.
-
-**Errors:**
-
-| Status | Reason |
-|--------|--------|
-| HTTP 400 | An interval between 1 and 59 seconds. |
-| HTTP 404 | Volume not found. |
-
----
-
 #### files flush-cache
 
 Bug AV (AV-3-5) — drop cache replicas under a path prefix. Mandatory

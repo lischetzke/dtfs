@@ -188,8 +188,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/volumes/{id}/set-anchor", post(set_volume_anchor_endpoint))
         // Bug BZ — per-volume capacity-spill exclusions.
         .route("/api/v1/volumes/{id}/set-spill", post(set_volume_spill_endpoint))
-        // AZ-1 — per-volume background-job schedules (scrub, fsck).
-        .route("/api/v1/volumes/{id}/set-schedules", post(set_volume_schedules_endpoint))
         // AZ-5-A1 — effective cluster config (every key, name+current+default).
         .route("/api/v1/config/effective", get(get_config_effective))
         // Stats (aggregate cluster metrics for WebUI home page)
@@ -1840,7 +1838,6 @@ async fn create_volume(
         mandatory_replicas: dtfs_common::types::TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 },
         cache_replicas: dtfs_common::types::CacheReplication::default(),
         anchor: None,
-        schedules: dtfs_common::types::VolumeSchedules::default(),
         spill: dtfs_common::types::SpillPolicy::default(),
     };
 
@@ -1996,13 +1993,6 @@ pub(crate) fn volume_config_to_json(
         "write_safety": {
             "min_replicas_before_ack": cfg.write_safety.min_replicas_before_ack,
             "write_timeout_secs":      cfg.write_safety.write_timeout_secs,
-        },
-        // AZ-1 — per-volume background-job schedules. `null` means
-        // "inherit cluster default".
-        "schedules": {
-            "scrub_interval_secs": cfg.schedules.scrub_interval_secs,
-            "fsck_interval_secs":  cfg.schedules.fsck_interval_secs,
-            "custom":              cfg.schedules.custom,
         },
         // Bug BZ — per-volume capacity-spill exclusions.
         "spill": {
@@ -2379,122 +2369,6 @@ fn cluster_has_tape_disk(
             .iter()
             .any(|d| d.tier == dtfs_common::types::DiskTier::Tape)
     })
-}
-
-/// AZ-1 — request body for `POST /api/v1/volumes/{id}/set-schedules`.
-/// Each field is optional; `None` for a sub-field is a no-op
-/// (preserve current). To explicitly clear an override, send the
-/// value `0` for that field (clears) or set `clear_unspecified=true`
-/// to clear everything not explicitly set.
-#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SetSchedulesRequest {
-    pub scrub_interval_secs: Option<u64>,
-    pub fsck_interval_secs: Option<u64>,
-    pub custom: Option<std::collections::BTreeMap<String, u64>>,
-    #[serde(default)]
-    pub clear_unspecified: bool,
-}
-
-/// AZ-1 pure helper — merge a partial schedules update onto the
-/// current volume config + validate intervals.
-///
-/// Rules:
-/// * `Some(0)` clears the override (back to cluster default).
-/// * `Some(v)` with `v < 60` is rejected (scrub I/O floor).
-/// * `Some(v)` with `v >= 60` sets the override.
-/// * `None` is a no-op unless `clear_unspecified == true`, in
-///   which case it also clears.
-// Bug BF-9 / BF-10 — back-compat surface that accepts the deprecated
-// schedule fields. The merge writes them to state-machine for snapshot
-// continuity, but the heartbeat path (metadata.rs:warn_once_*) no
-// longer honors them.
-#[allow(deprecated)]
-pub(crate) fn apply_set_schedules(
-    current: &dtfs_common::types::VolumeConfig,
-    req: &SetSchedulesRequest,
-) -> Result<dtfs_common::types::VolumeConfig, String> {
-    let mut next = current.clone();
-    let clear = req.clear_unspecified;
-
-    fn merge(field: &mut Option<u64>, incoming: &Option<u64>, label: &str, clear: bool)
-        -> Result<(), String>
-    {
-        match incoming {
-            Some(0) => { *field = None; Ok(()) }
-            Some(v) if *v < 60 => Err(format!(
-                "{label}: {v} < 60 s minimum"
-            )),
-            Some(v) => { *field = Some(*v); Ok(()) }
-            None if clear => { *field = None; Ok(()) }
-            None => Ok(()),
-        }
-    }
-
-    merge(&mut next.schedules.scrub_interval_secs,
-          &req.scrub_interval_secs, "scrub_interval_secs", clear)?;
-    merge(&mut next.schedules.fsck_interval_secs,
-          &req.fsck_interval_secs, "fsck_interval_secs", clear)?;
-
-    if let Some(custom) = &req.custom {
-        for (name, value) in custom {
-            if *value == 0 {
-                next.schedules.custom.remove(name);
-                continue;
-            }
-            if *value < 60 {
-                return Err(format!("custom job {name}: {value} < 60 s minimum"));
-            }
-            next.schedules.custom.insert(name.clone(), *value);
-        }
-    } else if clear {
-        next.schedules.custom.clear();
-    }
-
-    Ok(next)
-}
-
-async fn set_volume_schedules_endpoint(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(volume_id): axum::extract::Path<String>,
-    Json(body): Json<SetSchedulesRequest>,
-) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
-    use axum::http::StatusCode;
-
-    let current = {
-        let sm = state.sm_data.read().await;
-        sm.volumes.get(&volume_id).cloned()
-    };
-    let Some(current) = current else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("volume not found: {volume_id}")})),
-        ));
-    };
-
-    let next = apply_set_schedules(&current, &body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
-
-    let changed = current != next;
-    if changed {
-        let req = ClientRequest::UpsertVolume { config: next.clone() };
-        if let Err(e) = state.raft.client_write(req).await {
-            warn!(volume = %volume_id, error = %e,
-                "set_volume_schedules Raft write failed");
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": format!("raft write failed: {e}")})),
-            ));
-        }
-        state.audit_log.log("api", "volume.set_schedules", &volume_id, "success");
-    } else {
-        state.audit_log.log("api", "volume.set_schedules", &volume_id, "noop");
-    }
-
-    Ok(Json(json!({
-        "volume_id": volume_id,
-        "changed": changed,
-        "config": volume_config_to_json(&next),
-    })))
 }
 
 /// AV-5-12 — request body for `POST /api/v1/volumes/{id}/set-anchor`.

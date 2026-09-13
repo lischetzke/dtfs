@@ -327,29 +327,6 @@ enum VolumesCmd {
         #[arg(long, value_delimiter = ',')]
         forbidden_datacenters: Option<Vec<String>>,
     },
-    /// UIP-3-3 — set or update the volume's scrub/fsck schedule
-    /// overrides (AZ-1). Every flag is optional; omitted flags keep
-    /// the current value. Sending `0` for an interval clears the
-    /// override back to the cluster default. Server-side validation
-    /// rejects a nonzero interval below 60s. `custom` is JSON-only
-    /// (webui/direct API) — no other CLI command exposes an
-    /// arbitrary BTreeMap flag.
-    SetSchedules {
-        /// Volume id to update.
-        volume_id: String,
-        /// Scrub interval in seconds (>= 60, or 0 to clear the
-        /// override). Default keep current.
-        #[arg(long)]
-        scrub_interval_secs: Option<u64>,
-        /// Fsck interval in seconds (>= 60, or 0 to clear the
-        /// override). Default keep current.
-        #[arg(long)]
-        fsck_interval_secs: Option<u64>,
-        /// Clear every schedule override not explicitly set on this
-        /// call.
-        #[arg(long)]
-        clear_unspecified: bool,
-    },
 }
 
 /// Bug AV (AV-3-5) — file-level commands. The legacy
@@ -677,15 +654,6 @@ async fn main() -> anyhow::Result<()> {
                 cmd_volumes_set_spill(
                     &api, &args.format, &volume_id,
                     allow, forbidden_tiers, forbidden_datacenters,
-                ).await?
-            }
-            VolumesCmd::SetSchedules {
-                volume_id,
-                scrub_interval_secs, fsck_interval_secs, clear_unspecified,
-            } => {
-                cmd_volumes_set_schedules(
-                    &api, &args.format, &volume_id,
-                    scrub_interval_secs, fsck_interval_secs, clear_unspecified,
                 ).await?
             }
         },
@@ -1269,46 +1237,6 @@ async fn cmd_volumes_set_spill(
             println!("  allow:                  {}", s["allow"].as_bool().unwrap_or(true));
             println!("  forbidden_tiers:        {:?}", s["forbidden_tiers"]);
             println!("  forbidden_datacenters:  {:?}", s["forbidden_datacenters"]);
-        }
-    }
-    Ok(())
-}
-
-/// UIP-3-3 — `dtfs-cli volumes set-schedules <id>
-/// [--scrub-interval-secs N] [--fsck-interval-secs N]
-/// [--clear-unspecified]`: patch the volume's scrub/fsck schedule
-/// overrides (AZ-1). `custom` is not exposed here (JSON-only via
-/// webui/direct API). Server-side validation rejects a nonzero
-/// interval below 60s; that 400's `error` message is surfaced by
-/// `api.post_checked`, not re-validated client-side.
-async fn cmd_volumes_set_schedules(
-    api: &ApiClient,
-    format: &OutputFormat,
-    volume_id: &str,
-    scrub_interval_secs: Option<u64>,
-    fsck_interval_secs: Option<u64>,
-    clear_unspecified: bool,
-) -> anyhow::Result<()> {
-    let mut body = serde_json::Map::new();
-    if let Some(v) = scrub_interval_secs { body.insert("scrub_interval_secs".into(), v.into()); }
-    if let Some(v) = fsck_interval_secs { body.insert("fsck_interval_secs".into(), v.into()); }
-    body.insert("clear_unspecified".into(), clear_unspecified.into());
-    let body = serde_json::Value::Object(body);
-
-    let url = format!("/api/v1/volumes/{}/set-schedules", volume_id);
-    let resp = api.post_checked(&url, &body).await?;
-    match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
-        OutputFormat::Table => {
-            let changed = resp["changed"].as_bool().unwrap_or(false);
-            let s = &resp["config"]["schedules"];
-            println!(
-                "Volume '{}' set-schedules: {}",
-                volume_id,
-                if changed { "applied" } else { "no-op" },
-            );
-            println!("  scrub_interval_secs:  {:?}", s["scrub_interval_secs"]);
-            println!("  fsck_interval_secs:   {:?}", s["fsck_interval_secs"]);
         }
     }
     Ok(())
@@ -2141,43 +2069,6 @@ mod audit_co_tests {
             }
             other => panic!("expected VolumesCmd::SetSpill, got {other:?}"),
         }
-    }
-
-    // UIP-3-3 — `volumes set-schedules <id> --scrub-interval-secs N
-    // --fsck-interval-secs N --clear-unspecified` parses into the
-    // expected variant/fields; a below-floor value still parses at the
-    // CLI layer (the >= 60-or-0 rule is enforced server-side, not
-    // re-validated here).
-    #[test]
-    fn uip_3_3_volumes_set_schedules_parses() {
-        let args = Args::try_parse_from([
-            "dtfs-cli", "volumes", "set-schedules", "default",
-            "--scrub-interval-secs", "3600", "--fsck-interval-secs", "7200",
-            "--clear-unspecified",
-        ])
-        .expect("set-schedules should parse");
-        match args.command {
-            Commands::Volumes(VolumesCmd::SetSchedules {
-                volume_id,
-                scrub_interval_secs,
-                fsck_interval_secs,
-                clear_unspecified,
-            }) => {
-                assert_eq!(volume_id, "default");
-                assert_eq!(scrub_interval_secs, Some(3600));
-                assert_eq!(fsck_interval_secs, Some(7200));
-                assert!(clear_unspecified);
-            }
-            other => panic!("expected VolumesCmd::SetSchedules, got {other:?}"),
-        }
-
-        // A below-floor value (rejected by the server, not the CLI
-        // parser) still parses fine at this layer.
-        let below_floor = Args::try_parse_from([
-            "dtfs-cli", "volumes", "set-schedules", "default",
-            "--scrub-interval-secs", "5",
-        ]);
-        assert!(below_floor.is_ok(), "CLI parse must not pre-validate the >=60-or-0 rule");
     }
 
     // UIP-4-1 — `unquarantine <node-id> --operator-id X

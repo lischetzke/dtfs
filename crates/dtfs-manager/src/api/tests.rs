@@ -107,7 +107,7 @@ mod audit_co_tests {
         use dtfs_raft::state_machine::StateMachineData;
         use dtfs_common::types::{
             CacheReplication, SpillPolicy, TierReplication, VolumeConfig, VolumeId,
-            VolumeSchedules, WriteSafety,
+            WriteSafety,
         };
 
         // Operator-supplied display name -> canonical id (lower, dashed).
@@ -130,7 +130,6 @@ mod audit_co_tests {
             mandatory_replicas: TierReplication { hot: 0, warm: 2, cold: 1, tape: 0 },
             cache_replicas: CacheReplication::default(),
             anchor: None,
-            schedules: VolumeSchedules::default(),
             spill: SpillPolicy::default(),
         };
 
@@ -539,7 +538,6 @@ mod bug_bp_tests {
             mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
             cache_replicas: CacheReplication::default(),
             anchor: None,
-            schedules: dtfs_common::types::VolumeSchedules::default(),
             spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety { min_replicas_before_ack: 1, write_timeout_secs: 30 },
@@ -926,7 +924,6 @@ mod bug_av_set_cache_tests {
             },
             cache_replicas: CacheReplication::default(),
             anchor: None,
-            schedules: dtfs_common::types::VolumeSchedules::default(),
             spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety {
@@ -1196,115 +1193,6 @@ mod bug_av_set_cache_tests {
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // VolumeSchedules fields are deprecated for the scheduler, still the set-schedules wire shape
-mod bug_az_set_schedules_tests {
-    //! AZ-1 — pure tests for `apply_set_schedules`. Axum handler
-    //! is live-only per the AV-3-5 convention.
-    use super::*;
-    use dtfs_common::types::{
-        CacheReplication, TierReplication, VolumeConfig, VolumeId,
-        VolumeSchedules, WriteSafety,
-    };
-
-    fn volume() -> VolumeConfig {
-        VolumeConfig {
-            id: VolumeId("default".to_string()),
-            name: "default".to_string(),
-            chunk_size_bytes: 4 * 1024 * 1024,
-            replication: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
-            mandatory_replicas: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
-            cache_replicas: CacheReplication::default(),
-            anchor: None,
-            anchor_datacenter: None,
-            write_safety: WriteSafety {
-                min_replicas_before_ack: 1,
-                write_timeout_secs: 30,
-            },
-            schedules: VolumeSchedules::default(),
-            spill: Default::default(),
-        }
-    }
-
-    #[test]
-    fn bug_az_set_schedules_sets_override() {
-        let v = volume();
-        let req = SetSchedulesRequest {
-            scrub_interval_secs: Some(3600),
-            ..Default::default()
-        };
-        let n = apply_set_schedules(&v, &req).expect("ok");
-        assert_eq!(n.schedules.scrub_interval_secs, Some(3600));
-        assert_eq!(n.schedules.fsck_interval_secs, None);
-    }
-
-    #[test]
-    fn bug_az_set_schedules_zero_clears() {
-        let mut v = volume();
-        v.schedules.scrub_interval_secs = Some(3600);
-        let req = SetSchedulesRequest {
-            scrub_interval_secs: Some(0),
-            ..Default::default()
-        };
-        let n = apply_set_schedules(&v, &req).expect("ok");
-        assert_eq!(n.schedules.scrub_interval_secs, None,
-            "Some(0) must clear the override");
-    }
-
-    #[test]
-    fn bug_az_set_schedules_rejects_below_floor() {
-        let v = volume();
-        let req = SetSchedulesRequest {
-            scrub_interval_secs: Some(30),
-            ..Default::default()
-        };
-        let err = apply_set_schedules(&v, &req).unwrap_err();
-        assert!(err.contains("scrub_interval_secs"));
-        assert!(err.contains("60 s minimum"));
-    }
-
-    #[test]
-    fn bug_az_set_schedules_clear_unspecified() {
-        let mut v = volume();
-        v.schedules.scrub_interval_secs = Some(3600);
-        v.schedules.fsck_interval_secs = Some(7200);
-        v.schedules.custom.insert("rebalance".into(), 86400);
-        let req = SetSchedulesRequest {
-            clear_unspecified: true,
-            ..Default::default()
-        };
-        let n = apply_set_schedules(&v, &req).expect("ok");
-        assert_eq!(n.schedules.scrub_interval_secs, None);
-        assert_eq!(n.schedules.fsck_interval_secs, None);
-        assert!(n.schedules.custom.is_empty(),
-            "clear_unspecified must clear the custom map too");
-    }
-
-    #[test]
-    fn bug_az_set_schedules_custom_job_merge() {
-        let v = volume();
-        let mut custom = std::collections::BTreeMap::new();
-        custom.insert("rebalance".to_string(), 86400u64);
-        custom.insert("snapshot".to_string(), 3600u64);
-        let req = SetSchedulesRequest {
-            custom: Some(custom),
-            ..Default::default()
-        };
-        let n = apply_set_schedules(&v, &req).expect("ok");
-        assert_eq!(n.schedules.custom.get("rebalance").copied(), Some(86400));
-        assert_eq!(n.schedules.custom.get("snapshot").copied(), Some(3600));
-    }
-
-    #[test]
-    fn bug_az_volume_config_json_includes_schedules() {
-        let mut v = volume();
-        v.schedules.scrub_interval_secs = Some(3600);
-        let json = volume_config_to_json(&v);
-        assert_eq!(json["schedules"]["scrub_interval_secs"], 3600);
-        assert!(json["schedules"]["fsck_interval_secs"].is_null());
-    }
-}
-
-#[cfg(test)]
 mod bug_av_set_mandatory_tests {
     //! AV-4-1a — pure tests for `apply_set_mandatory`. Mirrors
     //! the AV-3-5 `bug_av_set_cache_tests` convention (axum
@@ -1331,7 +1219,6 @@ mod bug_av_set_mandatory_tests {
             },
             cache_replicas: CacheReplication::default(),
             anchor: None,
-            schedules: dtfs_common::types::VolumeSchedules::default(),
             spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety {
@@ -1640,7 +1527,6 @@ mod bug_bv3_data_node_count_tests {
                     datacenter: "dc3".into(),
                     required_tier: Some(DiskTier::Cold),
                 }),
-                schedules: dtfs_common::types::VolumeSchedules::default(),
                 spill: dtfs_common::types::SpillPolicy::default(),
                 anchor_datacenter: None,
                 write_safety: WriteSafety {
@@ -1774,7 +1660,6 @@ mod cnf1_stable_disk_id_tests {
                 datacenter: "leli".into(),
                 required_tier: Some(DiskTier::Cold),
             }),
-            schedules: dtfs_common::types::VolumeSchedules::default(),
             spill: dtfs_common::types::SpillPolicy::default(),
             anchor_datacenter: None,
             write_safety: WriteSafety { min_replicas_before_ack: 1, write_timeout_secs: 30 },
