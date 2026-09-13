@@ -129,6 +129,11 @@ enum Commands {
         action: Option<String>,
     },
 
+    /// UIP-5-3 — integrity-fault views (scrub/read checksum faults,
+    /// quarantines) filtered out of the audit log by the manager.
+    #[command(subcommand)]
+    Integrity(IntegrityCmd),
+
     /// View or update cluster configuration
     Config {
         /// Show current config
@@ -406,6 +411,21 @@ enum ConfigAction {
     Effective,
 }
 
+/// UIP-5-3 — integrity subcommands.
+#[derive(clap::Subcommand, Debug)]
+enum IntegrityCmd {
+    /// List integrity faults (`GET /api/v1/integrity/faults`). Same
+    /// query shape as `audit`.
+    Faults {
+        /// Maximum entries to show
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Filter by action prefix
+        #[arg(long)]
+        action: Option<String>,
+    },
+}
+
 /// UIP-4-3 (D3) — manual data migration subcommands.
 #[derive(clap::Subcommand, Debug)]
 enum MigrationsCmd {
@@ -681,6 +701,11 @@ async fn main() -> anyhow::Result<()> {
             reason,
         } => cmd_decommission(&api, &node_id, &operator_id, &reason).await?,
         Commands::Audit { limit, action } => cmd_audit(&api, &args.format, limit, action).await?,
+        Commands::Integrity(sub) => match sub {
+            IntegrityCmd::Faults { limit, action } => {
+                cmd_integrity_faults(&api, &args.format, limit, action).await?
+            }
+        },
         Commands::Config { show: _, action } => match action {
             None => cmd_config(&api, &args.format).await?,
             Some(ConfigAction::Set {
@@ -1554,7 +1579,38 @@ async fn cmd_audit(
     limit: usize,
     action: Option<String>,
 ) -> anyhow::Result<()> {
-    let mut path = format!("/api/v1/audit?limit={}", limit);
+    render_audit_entries(api, format, "/api/v1/audit", limit, action, "No audit entries found.").await
+}
+
+/// UIP-5-3 — `dtfs-cli integrity faults`: the manager's integrity-fault
+/// view over the audit log (`GET /api/v1/integrity/faults`), same row
+/// shape as `audit`.
+async fn cmd_integrity_faults(
+    api: &ApiClient,
+    format: &OutputFormat,
+    limit: usize,
+    action: Option<String>,
+) -> anyhow::Result<()> {
+    render_audit_entries(
+        api,
+        format,
+        "/api/v1/integrity/faults",
+        limit,
+        action,
+        "No integrity faults recorded.",
+    )
+    .await
+}
+
+async fn render_audit_entries(
+    api: &ApiClient,
+    format: &OutputFormat,
+    base: &str,
+    limit: usize,
+    action: Option<String>,
+    empty_msg: &str,
+) -> anyhow::Result<()> {
+    let mut path = format!("{}?limit={}", base, limit);
     if let Some(ref a) = action {
         path.push_str(&format!("&action={}", a));
     }
@@ -1565,7 +1621,7 @@ async fn cmd_audit(
         OutputFormat::Table => {
             let entries = entries.as_array().cloned().unwrap_or_default();
             if entries.is_empty() {
-                println!("No audit entries found.");
+                println!("{}", empty_msg);
                 return Ok(());
             }
             println!(
@@ -2126,6 +2182,22 @@ mod audit_co_tests {
                 assert!(matches!(action, Some(ConfigAction::Effective)));
             }
             other => panic!("expected Commands::Config, got {other:?}"),
+        }
+    }
+
+    // UIP-5-3 — `integrity faults` parses with the audit-style flags.
+    #[test]
+    fn uip_5_3_integrity_faults_parses() {
+        let args = Args::try_parse_from([
+            "dtfs-cli", "integrity", "faults", "--limit", "5", "--action", "scrub.",
+        ])
+        .expect("integrity faults should parse");
+        match args.command {
+            Commands::Integrity(IntegrityCmd::Faults { limit, action }) => {
+                assert_eq!(limit, 5);
+                assert_eq!(action.as_deref(), Some("scrub."));
+            }
+            other => panic!("expected Commands::Integrity, got {other:?}"),
         }
     }
 }
