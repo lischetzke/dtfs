@@ -67,30 +67,15 @@ docker compose down -v
 
 ## Chaos Tests
 
-Chaos tests simulate failure conditions to verify that DTFS recovers correctly. These tests are typically longer-running and are gated behind a feature flag or test filter.
-
-> The lab-level chaos gate (whole-DC power-off, disk yank/replace, cross-DC
-> reads under shaping, per-DC balance convergence) runs against the Proxmox
-> 3dc topology via `tests/release/run.sh --chaos`. See
-> [Chaos / Cross-DC / Balance Testing](../operations/chaos-testing.md).
-
-### Running Chaos Tests
-
-```bash
-cargo test chaos -- --ignored
-```
-
-Chaos tests are marked with `#[ignore]` by default so they do not run in the standard `cargo test` cycle.
-
-### Chaos Test Scenarios
-
-| Test | Description |
-|------|-------------|
-| Node crash during write | Kill a data node mid-write and verify WAL recovery on restart |
-| Leader failover | Stop the Raft leader and verify a new leader is elected and operations resume |
-| Network partition | Simulate a partition between data nodes and verify that reads fall back to available replicas |
-| Disk failure | Mark a disk as failed and verify chunks are re-replicated to healthy disks |
-| Concurrent joins | Multiple nodes attempt to join simultaneously; all should succeed without deadlock |
+Failure-injection testing (whole-DC power-off, disk yank/replace,
+cross-DC reads under shaping, balance convergence) is a lab-level
+harness under `tests/release/run.sh --chaos` against the Proxmox
+topology. It is dormant while no cluster exists; see
+[Lab → Chaos Testing](../lab/chaos-testing.md). The recovery
+properties it exercised end to end are covered at unit level by the
+state-machine and scheduler tests (`*/tests.rs`): WAL replay after a
+crash mid-put, leader change mid-migration, replica fallback on a
+partitioned node, disk-failure re-replication.
 
 ## Benchmarks
 

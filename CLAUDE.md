@@ -61,7 +61,7 @@ Non-goals: multi-tenant isolation, POSIX completeness (Plex's FUSE read + occasi
 
 ## A.4 Build / test
 
-Linux toolchain only (Windows host can't build rocksdb + fuse3). Build and test in the local Docker image `dtfs-buildenv:latest` (rust toolchain at `/usr/local/cargo/bin`, protoc, clang, libfuse3-dev). The checkout is bind-mounted at `/build`; the cache lives in the named volumes `dtfs-target` (`/target`) and `dtfs-registry`. From Git Bash `MSYS_NO_PATHCONV=1` is required and `bash -lc` must not be used inside the image (it drops cargo from `PATH`):
+Linux toolchain only (Windows host can't build rocksdb + fuse3). Build and test in the Docker image `dtfs-buildenv:latest` (`docker/buildenv.Dockerfile`: rust 1.94.1 bookworm + protoc, clang, libfuse3-dev; rebuild with `docker build -t dtfs-buildenv:latest -f docker/buildenv.Dockerfile .`). The checkout is bind-mounted at `/build`; the cache lives in the named volumes `dtfs-target` (`/target`) and `dtfs-registry`. From Git Bash `MSYS_NO_PATHCONV=1` is required and `bash -lc` must not be used inside the image (it drops cargo from `PATH`):
 
 ```bash
 MSYS_NO_PATHCONV=1 docker run --rm -v "${DTFS_REPO_HOST_PATH:-C:/Users/<user>/git_github.com/dtfs2}:/build" \

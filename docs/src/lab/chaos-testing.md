@@ -1,5 +1,10 @@
 # Chaos / cross-DC / balance testing
 
+> **Dormant.** This page describes the Proxmox lab and its harnesses
+> (`tests/release/`, `tests/proxmox/`). Since 2026-09 there is no build VM
+> and no cluster; verification is unit/crate tests in Docker (see
+> `CLAUDE.md` § A.4). Kept for the day a lab exists again.
+
 The chaos suite is the part of the release gate that exercises behaviour you
 cannot reach with in-process failure injection: powering a whole datacenter
 off and on, yanking a disk out of a node and installing a fresh one, reading

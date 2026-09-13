@@ -27,7 +27,6 @@
 
 # Operations
 
-- [Production Deployment Runbook](./operations/production-deployment.md)
 - [Cluster Management](./operations/cluster-management.md)
 - [Disk Management](./operations/disk-management.md)
 - [Maintenance Mode](./operations/maintenance-mode.md)
@@ -38,8 +37,6 @@
 - [Time Synchronisation](./operations/time-sync.md)
 - [Failure Scenarios](./operations/failure-scenarios.md)
 - [Troubleshooting](./operations/troubleshooting.md)
-- [Release Testing](./operations/release-testing.md)
-- [Chaos / Cross-DC / Balance Testing](./operations/chaos-testing.md)
 
 # Storage
 
@@ -68,6 +65,12 @@
 - [REST API](./api-reference/rest-api.md)
 - [gRPC API](./api-reference/grpc-api.md)
 - [CLI Reference](./api-reference/cli-reference.md)
+
+# Lab (dormant — no cluster since 2026-09)
+
+- [Production Deployment Runbook](./lab/production-deployment.md)
+- [Release Testing](./lab/release-testing.md)
+- [Chaos / Cross-DC / Balance Testing](./lab/chaos-testing.md)
 
 # Development
 

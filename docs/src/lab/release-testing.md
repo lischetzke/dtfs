@@ -1,5 +1,10 @@
 # Release testing (Bug BE)
 
+> **Dormant.** This page describes the Proxmox lab and its harnesses
+> (`tests/release/`, `tests/proxmox/`). Since 2026-09 there is no build VM
+> and no cluster; verification is unit/crate tests in Docker (see
+> `CLAUDE.md` § A.4). Kept for the day a lab exists again.
+
 The release-gate suite at `tests/release/` is the single artefact
 the operator runs prior to a release tag. Anything not in it is
 not gated by release.

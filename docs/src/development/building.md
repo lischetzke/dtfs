@@ -96,39 +96,27 @@ cargo build -p dtfs-cli
 | `dtfs-proto` | Library | Protobuf definitions and generated gRPC code |
 | `dtfs-raft` | Library | Raft integration (OpenRaft state machine, log store, networking) |
 
-## Building on Windows (WSL)
+## Building on Windows (Docker)
 
-The FUSE client (`dtfs-fuse`) requires Linux kernel FUSE support. On Windows, use WSL 2 (Windows Subsystem for Linux) for development:
-
-1. **Install WSL 2** if not already available:
-
-```powershell
-wsl --install -d Ubuntu
-```
-
-2. **Install dependencies** inside WSL:
+rocksdb and fuse3 do not build on a Windows host, so the repository ships
+a Linux build image. Build it once:
 
 ```bash
-sudo apt update
-sudo apt install -y build-essential protobuf-compiler libclang-dev \
-  pkg-config libfuse3-dev curl
+docker build -t dtfs-buildenv:latest -f docker/buildenv.Dockerfile .
 ```
 
-3. **Install Rust** inside WSL:
+Then run cargo inside it with the checkout bind-mounted at `/build` and
+the cache in two named volumes (`MSYS_NO_PATHCONV=1` is required from Git
+Bash, and do not use `bash -lc` inside the image):
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
+MSYS_NO_PATHCONV=1 docker run --rm -v "C:/path/to/dtfs2:/build" \
+  -v dtfs-target:/target -v dtfs-registry:/usr/local/cargo/registry \
+  -w /build dtfs-buildenv:latest cargo test --workspace --release
 ```
 
-4. **Clone and build** inside WSL:
-
-```bash
-cd /path/to/dtfs2
-cargo build
-```
-
-The manager, data node, and CLI can be compiled natively on Windows, but the FUSE client is Linux-only. For Windows-native builds of non-FUSE components:
+The manager, data node and CLI also compile natively on Windows; the FUSE
+client is Linux-only:
 
 ```powershell
 cargo build -p dtfs-manager -p dtfs-data -p dtfs-cli -p dtfs-client -p dtfs-common -p dtfs-proto -p dtfs-raft
