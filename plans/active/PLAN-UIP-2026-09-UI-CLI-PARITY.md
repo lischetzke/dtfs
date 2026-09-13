@@ -185,8 +185,8 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
 
 | ID | Files | Sketch | Test | Done when | Status |
 |---|---|---|---|---|---|
-| UIP-6-1 | `AGENTS.md` | Update the `dtfs-manager/src/webui.rs` § A.8 row to note full REST-mutation coverage (create/migrate-policy/write-safety/scrub-all/raft/decommission all wired through `mutateFetch`); add a new row for `dtfs-cli/src/main.rs` summarising its REST-client command surface and pointing at `docs/src/api-reference/cli-reference.md` for the full list. | None (doc-only; no test framework covers AGENTS.md prose). | § A.8 has a row for `dtfs-cli/src/main.rs`; the `webui.rs` row reflects the post-plan feature set. | ⬜ |
-| UIP-6-2 | `docs/src/api-reference/cli-reference.md` | Add a `### <command>` section for every new leaf from Groups 3-5 (set-anchor, set-spill, set-schedules, unquarantine, decommission, migrations create, config set, config effective, integrity faults, files inspect, stats), following the existing section style (usage block, options table, example output, errors table, `See REST API → ...` link where `rest-api.md` already has the anchor — config/POST, config/GET, stats, raft/state, migrate-policy — and inline shape documentation otherwise, per the plan's Non-goals). | None (doc-only). | Every new CLI command in this plan has a matching `cli-reference.md` section. | ⬜ |
+| UIP-6-1 | `AGENTS.md` | Update the `dtfs-manager/src/webui.rs` § A.8 row to note full REST-mutation coverage (create/migrate-policy/write-safety/scrub-all/raft/decommission all wired through `mutateFetch`); add a new row for `dtfs-cli/src/main.rs` summarising its REST-client command surface and pointing at `docs/src/api-reference/cli-reference.md` for the full list. | None (doc-only; no test framework covers AGENTS.md prose). | § A.8 has a row for `dtfs-cli/src/main.rs`; the `webui.rs` row reflects the post-plan feature set. | ✅ |
+| UIP-6-2 | `docs/src/api-reference/cli-reference.md` | Add a `### <command>` section for every new leaf from Groups 3-5 (set-anchor, set-spill, set-schedules, unquarantine, decommission, migrations create, config set, config effective, integrity faults, files inspect, stats), following the existing section style (usage block, options table, example output, errors table, `See REST API → ...` link where `rest-api.md` already has the anchor — config/POST, config/GET, stats, raft/state, migrate-policy — and inline shape documentation otherwise, per the plan's Non-goals). | None (doc-only). | Every new CLI command in this plan has a matching `cli-reference.md` section. | ✅ |
 
 ## Cross-cutting invariants
 
@@ -268,6 +268,8 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
 - UIP-2-5: `cargo test -p dtfs-manager --release` (Docker buildenv, full
   crate) — before: 21 webui tests; after: 22 webui tests, 400 passed total
   (new `uip_2_webui_ops_tests::decommission_dialog_wired_through_mutate_fetch`).
+- UIP-6-1 / UIP-6-2: doc-only; `cargo test -p dtfs-manager --release webui`
+  re-run after the webui hint-text change: 22 passed.
 
 ## Deviations
 
@@ -289,3 +291,22 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
   `cmd_volumes_migrate_policy`). The webui button surfaces `changed` and
   `mandatory_replicas` instead, to stay consistent with the real wire
   shape and the CLI's own rendering.
+- UIP-6-1 also corrected a stale Settings-page hint in `webui.rs` that
+  named a non-existent `dtfs-cli volume create --chunk-size`; it now points
+  at the Create volume dialog's `chunk_size_mb` field (the `dtfs-cli config
+  set` hint at the same page was left as-is because UIP-5-1 made it true).
+- Rate limit: both group-2 and group-5 `dtfs-implementer` dispatches died
+  mid-task (`HTTP 429`, session limit on the subagent model) with UIP-2-1
+  and UIP-5-2 code-complete but uncommitted and untested. The orchestrator
+  finished UIP-2-1..2-5, UIP-5-2..5-5 and UIP-6-x inline, same
+  test-first + one-commit-per-task discipline, no roster stage for those.
+- AIWF-5-1 accounting (subagent_tokens from task notifications):
+  - intake: 57,472 (1 dispatch)
+  - planner: 127,305 (+153,974 in its three dtfs-explore dispatches)
+  - implementer group 1 (3 tasks): 57,457
+  - implementer group 3 (3 tasks): 90,279
+  - implementer group 4 (3 tasks): 112,690
+  - implementer groups 2 and 5: aborted by 429, tokens not reported
+  - implementer total for 9 landed tasks: 260,426 (~29k/task) vs the
+    ~450k / ~50k-per-task Group 3 baseline in PLAN-AIWF-2026-09.
+  - integrity auditor: see AIWF plan row (recorded after the audit ran).

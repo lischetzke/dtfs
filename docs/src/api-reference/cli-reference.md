@@ -255,6 +255,114 @@ Idempotent: re-running with the same value reports `no-op`.
 
 ---
 
+#### volumes set-anchor
+
+Set or update the volume's anchor policy: the datacenter that must always
+hold a mandatory replica of every chunk (and, optionally, the tier that
+replica must live on). Omitted flags keep the current value. The manager
+rejects an update that would leave `mandatory_replicas.<required_tier>`
+at zero.
+
+```bash
+dtfs-cli volumes set-anchor <volume_id> [--datacenter DC] [--required-tier TIER]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--datacenter <DC>` | Anchor datacenter name (compared case-insensitively against node `datacenter`). |
+| `--required-tier <TIER>` | `hot`, `warm`, `cold` or `tape`; the tier the anchor replica must live on. |
+
+**Example:**
+
+```
+$ dtfs-cli volumes set-anchor media --datacenter LELI --required-tier cold
+Volume 'media' set-anchor: applied
+  datacenter:     LELI
+  required_tier:  cold
+```
+
+Backed by `POST /api/v1/volumes/{id}/set-anchor` with
+`{"datacenter": "...", "required_tier": "..."}` (both optional).
+
+**Errors:**
+
+| Status | Reason |
+|--------|--------|
+| HTTP 400 | `mandatory_replicas` for the required tier is 0, or unknown tier. |
+| HTTP 404 | Volume not found. |
+
+---
+
+#### volumes set-spill
+
+Set or update the volume's spill policy: whether a write may land on a
+tier or datacenter outside its normal placement when the preferred
+targets are full, and which tiers/datacenters are never acceptable.
+Omitted flags keep the current value.
+
+```bash
+dtfs-cli volumes set-spill <volume_id> [--allow true|false] \
+    [--forbidden-tiers hot,tape] [--forbidden-datacenters NRB]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--allow <bool>` | Permit spill placement at all. |
+| `--forbidden-tiers <list>` | Comma-separated tiers spill may never use. |
+| `--forbidden-datacenters <list>` | Comma-separated datacenters spill may never use. |
+
+**Example:**
+
+```
+$ dtfs-cli volumes set-spill media --allow true --forbidden-tiers tape
+Volume 'media' set-spill: applied
+  allow:                  true
+  forbidden_tiers:        ["tape"]
+  forbidden_datacenters:  []
+```
+
+Backed by `POST /api/v1/volumes/{id}/set-spill` with
+`{"allow": bool, "forbidden_tiers": [...], "forbidden_datacenters": [...]}`
+(all optional).
+
+---
+
+#### volumes set-schedules
+
+Set or update the volume's background-job schedule (scrub and fsck
+intervals). Intervals are seconds and must be `>= 60`; `0` clears the
+interval. Omitted flags keep the current value unless
+`--clear-unspecified` is set, which resets every omitted interval to
+unset.
+
+```bash
+dtfs-cli volumes set-schedules <volume_id> \
+    [--scrub-interval-secs N] [--fsck-interval-secs N] [--clear-unspecified]
+```
+
+**Example:**
+
+```
+$ dtfs-cli volumes set-schedules media --scrub-interval-secs 604800
+Volume 'media' set-schedules: applied
+  scrub_interval_secs:  Some(604800)
+  fsck_interval_secs:   None
+```
+
+Backed by `POST /api/v1/volumes/{id}/set-schedules` with
+`{"scrub_interval_secs": N, "fsck_interval_secs": N, "clear_unspecified": bool}`.
+The REST body also accepts a `custom` map of named intervals; the CLI
+does not expose it.
+
+**Errors:**
+
+| Status | Reason |
+|--------|--------|
+| HTTP 400 | An interval between 1 and 59 seconds. |
+| HTTP 404 | Volume not found. |
+
+---
+
 #### files flush-cache
 
 Bug AV (AV-3-5) — drop cache replicas under a path prefix. Mandatory
@@ -306,10 +414,11 @@ for the underlying request body and audit semantics.
 
 ### files
 
-File-level operations. Two subcommands:
+File-level operations. Three subcommands:
 
 ```bash
 dtfs-cli files list [--limit N]      # List files (default 50)
+dtfs-cli files inspect <path>        # Chunk layout + replica placement
 dtfs-cli files flush-cache <path> …  # Bug AV — see above
 ```
 
@@ -334,6 +443,42 @@ PATH                                     VOLUME       CHUNKS   SIZE
 /data/reports/2024-q2.parquet            default      3        384.0 MB
 /data/logs/access-2024-03.csv            default      1        128.0 MB
 ```
+
+---
+
+#### files inspect
+
+Show one file's chunk layout and where every replica lives.
+
+```bash
+dtfs-cli files inspect <path>
+```
+
+**Example output:**
+
+```
+Path:        /movies/x.mkv
+Volume:      media
+Size:        4.3 GB
+Chunk size:  128.0 MB
+Chunks:      35
+
+INDEX  CHUNK_ID             SIZE       REPLICAS (node/disk tier)
+------------------------------------------------------------------------------------------
+0      9f2c1a7e0b4d3c5a...  128.0 MB   "1231…"/0 cold, "8841…"/1 warm
+1      3d8e0b1f6a2c9d4e...  128.0 MB   "1231…"/0 cold
+```
+
+Backed by `GET /api/v1/files/inspect?path=<url-encoded path>`; the
+response carries `path`, `volume_id`, `total_size`, `chunk_size`,
+`chunk_count` and a `chunks[]` list with `chunk_index`, `chunk_id`,
+`size` and `replicas[] = {node_id, disk_id, tier}`.
+
+**Errors:**
+
+| Status | Reason |
+|--------|--------|
+| HTTP 404 | Path not found. |
 
 ---
 
@@ -371,6 +516,117 @@ Status: accepted
 Enable or disable maintenance mode on a node. See [Maintenance Mode](../operations/maintenance-mode.md) for the full draining process.
 
 ```bash
+### unquarantine
+
+Re-admit a node that an integrity fault quarantined. Both fields are
+required and land in the audit log; `reason_acknowledged` must be at
+least 16 characters describing what you verified (disk swapped, rescan
+clean, ...). Requires the cluster `shared_secret`.
+
+```bash
+dtfs-cli unquarantine <node-id> --operator-id <who> --reason-acknowledged "<what you verified>"
+```
+
+**Example output:**
+
+```
+{
+  "node_id": "12709699821947187762",
+  "ok": true
+}
+```
+
+Backed by `POST /api/v1/nodes/{id}/unquarantine` with
+`{"operator_id": "...", "reason_acknowledged": "..."}`.
+
+**Errors:**
+
+| Status | Reason |
+|--------|--------|
+| HTTP 400 | Missing `operator_id`, or `reason_acknowledged` too short. |
+| HTTP 409 | Node is not quarantined. The server message is printed and the command exits non-zero. |
+
+---
+
+### decommission
+
+Permanently remove a node from the cluster registry. Refused while the
+node still holds any chunk replica: put it in maintenance, let
+re-replication drain it, then decommission. Requires the cluster
+`shared_secret`.
+
+```bash
+dtfs-cli decommission <node-id> --operator-id <who> --reason "<why>"
+```
+
+**Example output:**
+
+```
+{
+  "node_id": "12709699821947187762",
+  "ok": true
+}
+```
+
+Backed by `POST /api/v1/nodes/{id}/decommission` with
+`{"operator_id": "...", "reason": "..."}`.
+
+**Errors:**
+
+| Status | Reason |
+|--------|--------|
+| HTTP 400 | Missing `operator_id` or non-numeric node id. |
+| HTTP 404 | Node not registered. |
+| HTTP 409 | `node N still holds chunk replicas; drain/re-replicate before decommission`. Printed verbatim; exit non-zero. |
+
+---
+
+### migrations
+
+Operator-driven data migration: add a replica on the requested tier
+(and, optionally, datacenter) for every chunk of every file under a
+path prefix. Additive; existing replicas are left in place. Requires the
+cluster `shared_secret`.
+
+```bash
+dtfs-cli migrations create <path-prefix> --target-tier <hot|warm|cold|tape> \
+    [--target-dc DC] [--max-tasks N] [--allow-empty-prefix]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--target-tier <TIER>` | Required. Rejected client-side unless one of `hot`, `warm`, `cold`, `tape`. |
+| `--target-dc <DC>` | Restrict the new replica to one datacenter. |
+| `--max-tasks <N>` | Cap on migration tasks enqueued by this call. |
+| `--allow-empty-prefix` | Safety gate: required to migrate with an empty prefix (every file). |
+
+**Example:**
+
+```
+$ dtfs-cli migrations create "/movies/Season 1/" --target-tier warm --target-dc TORO
+migrations create prefix=/movies/Season 1/ target_tier=warm
+{
+  "status": "accepted",
+  "path_prefix": "/movies/Season 1/",
+  "target_tier": "warm",
+  "target_dc": "TORO",
+  "files_matched": 12,
+  "chunks_total": 412,
+  "already_satisfied": 0,
+  "tasks_scheduled": 412,
+  "no_source": 0,
+  "no_target": 0,
+  "truncated_chunks": 0,
+  "examples": []
+}
+```
+
+Backed by `POST /api/v1/migrations` with
+`{"path_prefix", "target_tier", "target_dc", "allow_empty_prefix", "max_tasks"}`.
+Progress is visible in the WebUI Migrations page or `GET /api/v1/migrations`.
+
+---
+
 # Enable maintenance mode
 dtfs-cli maintenance <node-id> --enable
 
@@ -434,10 +690,14 @@ TIME                   ACTOR          ACTION                   TARGET           
 
 ### config
 
-View the current cluster configuration.
+View the current cluster configuration. Bare `dtfs-cli config` GETs and
+renders it; the `set` and `effective` subcommands below change it or
+list every key with its default.
 
 ```bash
 dtfs-cli config
+dtfs-cli config set --config-json '<json>' [--write-to-disk] [--acknowledge-cluster-wide]
+dtfs-cli config effective
 ```
 
 | Option | Description |
@@ -466,6 +726,60 @@ Tiering:
 
 ---
 
+#### config set
+
+Apply a cluster-wide configuration override through Raft. The JSON is a
+partial `ManagerConfig` document; it is merged over the running config
+on every manager. Requires the cluster `shared_secret`.
+
+```bash
+dtfs-cli config set --config-json '<json>' [--write-to-disk] [--acknowledge-cluster-wide]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--config-json <JSON>` | Required. Partial config document, e.g. `'{"tiering":{"enabled":false}}'`. |
+| `--write-to-disk` | Also persist to `/etc/dtfs/manager.toml` (tmp + rename + fsync) on the serving manager. |
+| `--acknowledge-cluster-wide` | Confirm you understand the override applies to every manager. |
+
+**Example output:**
+
+```
+{
+  "version": 4,
+  "status": "applied",
+  "write_to_disk": false
+}
+```
+
+See [REST API → POST /api/v1/config](rest-api.md#post-apiv1config).
+
+---
+
+#### config effective
+
+List every effective config key with its current value, its upstream
+default and whether the two match. `--format json` prints the raw
+document.
+
+```bash
+dtfs-cli config effective
+```
+
+**Example output:**
+
+```
+NAME                                               CURRENT          DEFAULT          IS_DEFAULT
+----------------------------------------------------------------------------------------------------
+manager.tiering.enabled                            true             true             true
+manager.tiering.migration_bw_limit_mbps            200              100              false
+```
+
+Backed by `GET /api/v1/config/effective` (`{scope, node_hostname, entries[]}`,
+each entry `{name, current, default, is_default}`).
+
+---
+
 ### health
 
 Check whether the manager is healthy. Exits with code 0 on success, 1 on failure. Useful for scripting and monitoring.
@@ -485,6 +799,73 @@ Manager is healthy
 ```
 Manager status: unavailable
 ```
+
+---
+
+### stats
+
+Aggregate cluster statistics: the numbers the WebUI Home page renders.
+`--format json` prints the raw document.
+
+```bash
+dtfs-cli stats
+```
+
+**Example output:**
+
+```
+DTFS Cluster Stats
+==================
+Health:            healthy
+Nodes:             7 total, 7 healthy, 0 quarantined
+Roles:             5 manager, 2 data, 3 client
+Disks:             4
+Files:             1423
+Raw capacity:      12.4 TB used / 52.0 TB
+Net capacity:      6.1 TB used / 25.9 TB
+Logical bytes:     6.0 TB
+I/O:               38.2 MB/s read, 1.1 MB/s write
+Anchor pending:    0
+
+TIER   DISKS  USED         TOTAL
+----------------------------------------
+hot    0      0 B          0 B
+warm   2      1.2 TB       2.0 TB
+cold   2      11.2 TB      50.0 TB
+tape   0      0 B          0 B
+
+Last scrub:        2026-09-12 03:00:11 level=deep node=1231… disk=/srv/dtfs/disk0
+                   checked=48211 healthy=48211 corrupt=0 missing=0
+```
+
+Backed by `GET /api/v1/stats`.
+
+---
+
+### integrity
+
+Integrity-fault view over the audit log: scrub mismatches, read-time
+checksum failures, quarantine and unquarantine events. Same flags and
+output columns as `audit`.
+
+```bash
+dtfs-cli integrity faults [--limit N] [--action PREFIX]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--limit <N>` | 20 | Maximum entries to show. |
+| `--action <PREFIX>` | | Filter by action prefix (e.g. `scrub.`). |
+
+**Example output:**
+
+```
+TIME                   ACTOR          ACTION                   TARGET                         RESULT
+----------------------------------------------------------------------------------------------------
+2026-09-12 03:00:11    scrub          scrub.mismatch           chunk 9f2c1a7e0b4d3c5a…        quarantined
+```
+
+Backed by `GET /api/v1/integrity/faults?limit=N&action=PREFIX`.
 
 ---
 
