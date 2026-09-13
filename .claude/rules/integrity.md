@@ -2,6 +2,7 @@
 paths:
   - "crates/dtfs-data/**"
   - "crates/dtfs-manager/src/scheduler.rs"
+  - "crates/dtfs-manager/src/scheduler/**"
   - "crates/dtfs-raft/**"
 ---
 

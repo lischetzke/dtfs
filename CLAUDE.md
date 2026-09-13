@@ -107,7 +107,7 @@ One line per file. Bug/task history per row: `docs/src/internals/invariants.md` 
 | `dtfs-raft/src/lib.rs::ClientRequest` | Command enum; new mutation = new variant + arm (+ `#[serde(default)] now_ms`) |
 | `dtfs-raft/src/network.rs::full_snapshot` | Snapshot-stream RPC; unreachable-vs-storage error mapping, bounded in-flight sends |
 | `dtfs-raft/src/log_store.rs` | RocksDB Raft log/vote/last-purged; synced writes, range-delete truncate, purge + `last_purged` in one batch |
-| `dtfs-manager/src/scheduler.rs` | Migration/re-replication loop, SOLE owner of replica repair; leader-gated, bounded, Raft-remove-before-byte-delete; disk-keyed orphan reap; leader re-checked before every delete batch |
+| `dtfs-manager/src/scheduler.rs` + `scheduler/{repair,migration,flush,orphan}.rs` | TaskScheduler: struct, tick loop and lease GC in scheduler.rs; inherent-impl continuations per concern in the submodules. SOLE owner of replica repair; leader-gated, bounded, Raft-remove-before-byte-delete; disk-keyed orphan reap; leader re-checked before every delete batch |
 | `dtfs-manager/src/tiering.rs` | AV cache-tick planner + legacy temperature migration; never holds the SM read lock across an await |
 | `dtfs-manager/src/monitor.rs` | Heartbeat health detection only; MUST NOT schedule repair; leader-gated |
 | `dtfs-manager/src/metadata.rs` | ManagerService gRPC over `raft_write`; follower writes forward with HMAC + `forwardable()` allow-list; ack floor clamped to the tier's RF; placement resolved from the file's own volume |
