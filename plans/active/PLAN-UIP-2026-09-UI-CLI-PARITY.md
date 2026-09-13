@@ -161,7 +161,7 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
 |---|---|---|---|---|---|
 | UIP-3-1 | `crates/dtfs-cli/src/main.rs` | Add `VolumesCmd::SetAnchor { volume_id, #[arg(long)] datacenter: Option<String>, #[arg(long)] required_tier: Option<String> }`; handler builds a `serde_json::Map` (pattern at main.rs:795-810) and `api.post(format!("/api/v1/volumes/{}/set-anchor", volume_id), &body)`. | `#[cfg(test)]` `Args::try_parse_from(["dtfs-cli","volumes","set-anchor","default","--datacenter","leli"])` parses into the expected variant/fields (pattern at main.rs:1359-1368). | `dtfs-cli volumes set-anchor <id> [--datacenter D] [--required-tier T]` round-trips against the existing endpoint. | ✅ |
 | UIP-3-2 | `crates/dtfs-cli/src/main.rs` | Add `VolumesCmd::SetSpill { volume_id, #[arg(long)] allow: Option<bool>, #[arg(long, value_delimiter=',')] forbidden_tiers: Option<Vec<String>>, #[arg(long, value_delimiter=',')] forbidden_datacenters: Option<Vec<String>> }`; same POST-body pattern as UIP-3-1. | `try_parse_from` test covering `--allow true --forbidden-tiers hot,warm`. | `dtfs-cli volumes set-spill` exercises the endpoint. | ✅ |
-| UIP-3-3 | `crates/dtfs-cli/src/main.rs` | Add `VolumesCmd::SetSchedules { volume_id, #[arg(long)] scrub_interval_secs: Option<u64>, #[arg(long)] fsck_interval_secs: Option<u64>, #[arg(long)] clear_unspecified: bool }` (skip `custom` — no other CLI command exposes an arbitrary BTreeMap flag; document as JSON-only via webui/direct API for now). POST to `set-schedules`; surface the server's `>= 60 or 0` validation error verbatim on 400. | `try_parse_from` test covering the interval flags plus a rejected `--scrub-interval-secs 5` (parses fine at the CLI layer; server 400 is exercised only by the existing REST test, not re-tested here). | `dtfs-cli volumes set-schedules` matches the webui's AZ-1 modal capability. | ⬜ |
+| UIP-3-3 | `crates/dtfs-cli/src/main.rs` | Add `VolumesCmd::SetSchedules { volume_id, #[arg(long)] scrub_interval_secs: Option<u64>, #[arg(long)] fsck_interval_secs: Option<u64>, #[arg(long)] clear_unspecified: bool }` (skip `custom` — no other CLI command exposes an arbitrary BTreeMap flag; document as JSON-only via webui/direct API for now). POST to `set-schedules`; surface the server's `>= 60 or 0` validation error verbatim on 400. | `try_parse_from` test covering the interval flags plus a rejected `--scrub-interval-secs 5` (parses fine at the CLI layer; server 400 is exercised only by the existing REST test, not re-tested here). | `dtfs-cli volumes set-schedules` matches the webui's AZ-1 modal capability. | ✅ |
 
 ### Group 4 — dtfs-cli nodes lifecycle + migrations
 
@@ -222,6 +222,8 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
   12 passed; after: 13 passed (new `uip_3_1_volumes_set_anchor_parses`).
 - UIP-3-2: `cargo test -p dtfs-cli --release` (Docker buildenv) — before:
   13 passed; after: 14 passed (new `uip_3_2_volumes_set_spill_parses`).
+- UIP-3-3: `cargo test -p dtfs-cli --release` (Docker buildenv) — before:
+  14 passed; after: 15 passed (new `uip_3_3_volumes_set_schedules_parses`).
 - UIP-1-1: `cargo test -p dtfs-manager --release webui` (Docker buildenv) —
   before: 13 passed; after: 15 passed (new
   `create_volume_modal_tests::create_volume_modal_present_and_wired_through_mutate_fetch`,
