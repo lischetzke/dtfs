@@ -401,6 +401,9 @@ enum ConfigAction {
         #[arg(long)]
         acknowledge_cluster_wide: bool,
     },
+    /// UIP-5-2 — list every effective config key via
+    /// `GET /config/effective`.
+    Effective,
 }
 
 /// UIP-4-3 (D3) — manual data migration subcommands.
@@ -687,6 +690,7 @@ async fn main() -> anyhow::Result<()> {
             }) => {
                 cmd_config_set(&api, &config_json, write_to_disk, acknowledge_cluster_wide).await?
             }
+            Some(ConfigAction::Effective) => cmd_config_effective(&api, &args.format).await?,
         },
         Commands::Health => cmd_health(&api).await?,
         Commands::Raft(sub) => match sub {
@@ -1680,6 +1684,31 @@ async fn cmd_config_set(
     Ok(())
 }
 
+/// UIP-5-2 — `dtfs-cli config effective`: list every effective config
+/// key via `GET /config/effective`, rendering `{name, current, default,
+/// is_default}` rows as a table (or raw JSON with `--format json`).
+async fn cmd_config_effective(api: &ApiClient, format: &OutputFormat) -> anyhow::Result<()> {
+    let resp = api.get("/api/v1/config/effective").await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => {
+            let entries = resp["entries"].as_array().cloned().unwrap_or_default();
+            println!("{:<50} {:<16} {:<16} {}", "NAME", "CURRENT", "DEFAULT", "IS_DEFAULT");
+            println!("{}", "-".repeat(100));
+            for e in &entries {
+                println!(
+                    "{:<50} {:<16} {:<16} {}",
+                    truncate(e["name"].as_str().unwrap_or("—"), 48),
+                    truncate(&e["current"].to_string(), 14),
+                    truncate(&e["default"].to_string(), 14),
+                    e["is_default"].as_bool().unwrap_or(false),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_health(api: &ApiClient) -> anyhow::Result<()> {
     let health = api.get("/api/v1/health").await?;
     let status = health["status"].as_str().unwrap_or("unknown");
@@ -2083,6 +2112,19 @@ mod audit_co_tests {
                 }
                 other => panic!("expected Some(ConfigAction::Set), got {other:?}"),
             },
+            other => panic!("expected Commands::Config, got {other:?}"),
+        }
+    }
+
+    // UIP-5-2 — `config effective` parses into `Some(ConfigAction::Effective)`.
+    #[test]
+    fn uip_5_2_config_effective_parses() {
+        let args = Args::try_parse_from(["dtfs-cli", "config", "effective"])
+            .expect("config effective should parse");
+        match args.command {
+            Commands::Config { action, .. } => {
+                assert!(matches!(action, Some(ConfigAction::Effective)));
+            }
             other => panic!("expected Commands::Config, got {other:?}"),
         }
     }
