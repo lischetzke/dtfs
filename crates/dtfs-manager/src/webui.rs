@@ -961,6 +961,32 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     </div>
 </div>
 
+<!-- UIP-2-5 — Decommission dialog (permanent node removal) -->
+<div id="decommission-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeDecommissionModal()">
+    <div class="modal-card" style="max-width:32rem">
+        <h3 style="color:var(--danger)">Decommission <span id="dc-hostname"></span></h3>
+        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:.8rem">
+            Permanently removes the node from the cluster registry. The manager refuses while the node
+            still holds any chunk replica: drain it (maintenance + re-replication) first. Both fields
+            below land in the audit log.
+        </div>
+        <input type="hidden" id="dc-node-id">
+        <div class="modal-row">
+            <label>operator_id (your identity)</label>
+            <input id="dc-operator" class="form-input" oninput="onDecommissionInput()" placeholder="alice / ticket-123 / on-call">
+        </div>
+        <div class="modal-row">
+            <label>reason</label>
+            <input id="dc-reason" class="form-input" oninput="onDecommissionInput()" placeholder="e.g. host retired after disk swap-out">
+        </div>
+        <div class="modal-actions">
+            <button class="btn-secondary" onclick="closeDecommissionModal()">Cancel</button>
+            <button class="btn-primary" style="background:#b91c1c" onclick="submitDecommission()" id="dc-submit" disabled>Decommission</button>
+        </div>
+        <div id="dc-result" class="modal-result" style="display:none"></div>
+    </div>
+</div>
+
 <div class="footer">
     DTFS — Distributed Tiered Filesystem &nbsp;·&nbsp;
     <a href="/api/v1/cluster/status" style="color:var(--primary)">API</a> &nbsp;·&nbsp;
@@ -2171,6 +2197,8 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                         ${{isStorageRole ? `<button class="btn-maint" onclick="toggleMaintenance('${{escArg(n.node_id)}}', ${{!isMaintenance}})">
                             ${{isMaintenance ? 'Exit Maintenance' : 'Set Maintenance'}}
                         </button>` : ''}}
+                        ${{isStorageRole ? `<button class="btn-maint" style="color:var(--danger)" title="Remove this node from the cluster registry (refused while it holds replicas)"
+                            onclick="openDecommissionModal('${{escArg(n.node_id)}}','${{escArg(n.hostname||'')}}')">Decommission…</button>` : ''}}
                     </div>
                 </div>
                 <div class="node-card-body">
@@ -2256,6 +2284,57 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     window.closeUnquarantineModal = closeUnquarantineModal;
     window.onUnquarantineInput   = onUnquarantineInput;
     window.submitUnquarantine    = submitUnquarantine;
+
+    // UIP-2-5 — POST /api/v1/nodes/<id>/decommission. The manager's
+    // 409 ("still holds chunk replicas ...") is shown verbatim.
+    function openDecommissionModal(nodeId, hostname) {{
+        document.getElementById('dc-node-id').value = nodeId;
+        document.getElementById('dc-hostname').textContent = hostname;
+        document.getElementById('dc-operator').value = '';
+        document.getElementById('dc-reason').value = '';
+        document.getElementById('dc-result').style.display = 'none';
+        document.getElementById('dc-submit').disabled = true;
+        document.getElementById('decommission-modal').classList.remove('hidden');
+    }}
+    function closeDecommissionModal() {{
+        document.getElementById('decommission-modal').classList.add('hidden');
+    }}
+    function onDecommissionInput() {{
+        const op     = document.getElementById('dc-operator').value.trim();
+        const reason = document.getElementById('dc-reason').value.trim();
+        document.getElementById('dc-submit').disabled = !(op.length > 0 && reason.length > 0);
+    }}
+    async function submitDecommission() {{
+        const nid = document.getElementById('dc-node-id').value;
+        const body = {{
+            operator_id: document.getElementById('dc-operator').value.trim(),
+            reason:      document.getElementById('dc-reason').value.trim(),
+        }};
+        const result = document.getElementById('dc-result');
+        result.style.display = 'block';
+        result.style.color = 'var(--text-muted)';
+        result.textContent = 'Decommissioning…';
+        const {{ resp, text, json, authError }} = await mutateFetch(
+            '/api/v1/nodes/' + nid + '/decommission',
+            {{ body: JSON.stringify(body) }}
+        );
+        if (resp.ok) {{
+            result.style.color = 'var(--success)';
+            result.textContent = 'Decommissioned.';
+            setTimeout(async () => {{
+                closeDecommissionModal();
+                await refreshNodesList();
+            }}, 800);
+            return;
+        }}
+        result.style.color = 'var(--danger)';
+        result.textContent = authError
+            || ((json && json.error) ? json.error : ('Failed (' + resp.status + '): ' + (text || '')));
+    }}
+    window.openDecommissionModal  = openDecommissionModal;
+    window.closeDecommissionModal = closeDecommissionModal;
+    window.onDecommissionInput    = onDecommissionInput;
+    window.submitDecommission     = submitDecommission;
 
     // ── Volumes page ──────────────────────────────────────────────────────────
 
@@ -3914,6 +3993,7 @@ mod bug_bk_scrub_tests {
             "mutateFetch('/api/v1/config'",
             "'/api/v1/nodes/' + nodeId + '/maintenance'",
             "'/api/v1/nodes/' + nid + '/unquarantine'",
+            "'/api/v1/nodes/' + nid + '/decommission'",
             "/set-schedules`",
             "/${suffix}`",
         ] {
@@ -3995,6 +4075,39 @@ mod create_volume_modal_tests {
 #[cfg(test)]
 mod uip_2_webui_ops_tests {
     use super::*;
+
+    /// UIP-2-5 — node cards offer Decommission; the dialog POSTs through
+    /// mutateFetch and prints the server's 409 message verbatim.
+    #[test]
+    fn decommission_dialog_wired_through_mutate_fetch() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        for needle in [
+            "id=\"decommission-modal\"",
+            "id=\"dc-node-id\"",
+            "id=\"dc-operator\"",
+            "id=\"dc-reason\"",
+            "id=\"dc-submit\"",
+            "id=\"dc-result\"",
+            "openDecommissionModal('${escArg(n.node_id)}'",
+        ] {
+            assert!(html.contains(needle), "decommission dialog missing: {needle}");
+        }
+        let fn_body = html
+            .split("async function submitDecommission()")
+            .nth(1)
+            .expect("submitDecommission must be defined")
+            .split("window.openDecommissionModal")
+            .next()
+            .unwrap();
+        assert!(
+            fn_body.contains("mutateFetch(") && fn_body.contains("'/api/v1/nodes/' + nid + '/decommission'"),
+            "decommission must POST /api/v1/nodes/<id>/decommission through mutateFetch"
+        );
+        assert!(
+            fn_body.contains("json.error) ? json.error"),
+            "server error (409 replicas remain) must be shown verbatim"
+        );
+    }
 
     /// UIP-2-4 — membership forms POST the three raft endpoints through
     /// mutateFetch and surface the 409 leader hint.
