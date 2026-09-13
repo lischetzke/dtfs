@@ -309,4 +309,10 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
   - implementer groups 2 and 5: aborted by 429, tokens not reported
   - implementer total for 9 landed tasks: 260,426 (~29k/task) vs the
     ~450k / ~50k-per-task Group 3 baseline in PLAN-AIWF-2026-09.
-  - integrity auditor: see AIWF plan row (recorded after the audit ran).
+  - integrity auditor (whole range 3355070..HEAD): 89,181. All A.6 items
+    Verified or N-A; one must-fix (four new CLI mutations dropped the
+    server 400 body via `api.post`) landed as the `UIP-audit` commit with
+    `ApiClient::post_checked`.
+  - roster total: 57,472 + 127,305 + 153,974 + 260,426 + 89,181 = 688,358
+    subagent tokens for 21 tasks + audit (~33k/task); orchestrator inline
+    work for the 429-aborted 9 tasks is not counted.
