@@ -111,7 +111,7 @@ One line per file. Bug/task history per row: `docs/src/internals/invariants.md` 
 | `dtfs-manager/src/tiering.rs` | AV cache-tick planner + legacy temperature migration; never holds the SM read lock across an await |
 | `dtfs-manager/src/monitor.rs` | Heartbeat health detection only; MUST NOT schedule repair; leader-gated |
 | `dtfs-manager/src/metadata.rs` | ManagerService gRPC over `raft_write`; follower writes forward with HMAC + `forwardable()` allow-list; ack floor clamped to the tier's RF; placement resolved from the file's own volume |
-| `dtfs-manager/src/api.rs` | REST endpoints; LIS-18 auth; effective-config merge; decommission refuses while replicas remain |
+| `dtfs-manager/src/api.rs` + `api/{raft,cluster,nodes,files,volumes,audit,config}.rs` | REST router + AppState in api.rs; handlers by resource in the submodules (each `use super::*`, re-exported `pub(crate)`); LIS-18 auth; decommission refuses while replicas remain |
 | `dtfs-manager/src/rest_auth.rs` | LIS-18 mutation-auth check + axum middleware |
 | `dtfs-manager/src/membership.rs` | Online raft membership validation |
 | `dtfs-manager/src/join.rs` | Two-phase data-node join (HMAC handshake); node_id derived server-side |
