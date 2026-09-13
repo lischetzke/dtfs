@@ -85,6 +85,20 @@ enum Commands {
         disable: bool,
     },
 
+    /// UIP-4-1 (D1) — Bug BC-12 operator unquarantine. Flat top-level
+    /// command mirroring `Maintenance`'s shape.
+    Unquarantine {
+        /// Node ID
+        node_id: String,
+        /// Free-form actor label (initials/ticket) for the audit row.
+        #[arg(long)]
+        operator_id: String,
+        /// Written justification for clearing the integrity-fault
+        /// state (server requires >= 16 chars).
+        #[arg(long)]
+        reason_acknowledged: String,
+    },
+
     /// View audit log
     Audit {
         /// Maximum entries to show
@@ -558,6 +572,11 @@ async fn main() -> anyhow::Result<()> {
             enable,
             disable,
         } => cmd_maintenance(&api, &node_id, enable, disable).await?,
+        Commands::Unquarantine {
+            node_id,
+            operator_id,
+            reason_acknowledged,
+        } => cmd_unquarantine(&api, &node_id, &operator_id, &reason_acknowledged).await?,
         Commands::Audit { limit, action } => cmd_audit(&api, &args.format, limit, action).await?,
         Commands::Config { show: _ } => cmd_config(&api, &args.format).await?,
         Commands::Health => cmd_health(&api).await?,
@@ -1315,6 +1334,34 @@ async fn cmd_maintenance(
     Ok(())
 }
 
+/// UIP-4-1 — `dtfs-cli unquarantine <node-id> --operator-id X
+/// --reason-acknowledged "..."`: clear Bug BC-12's quarantine state.
+/// Surfaces the server's JSON verbatim (including the 409 "not
+/// Quarantined" body) and exits non-zero on failure.
+async fn cmd_unquarantine(
+    api: &ApiClient,
+    node_id: &str,
+    operator_id: &str,
+    reason_acknowledged: &str,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "operator_id": operator_id,
+        "reason_acknowledged": reason_acknowledged,
+    });
+    let (status, value) = api
+        .post_with_status(&format!("/api/v1/nodes/{}/unquarantine", node_id), &body)
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    if !status.is_success() {
+        anyhow::bail!(
+            "unquarantine node {} failed: HTTP {}",
+            node_id,
+            status
+        );
+    }
+    Ok(())
+}
+
 async fn cmd_audit(
     api: &ApiClient,
     format: &OutputFormat,
@@ -1654,5 +1701,47 @@ mod audit_co_tests {
             "--scrub-interval-secs", "5",
         ]);
         assert!(below_floor.is_ok(), "CLI parse must not pre-validate the >=60-or-0 rule");
+    }
+
+    // UIP-4-1 — `unquarantine <node-id> --operator-id X
+    // --reason-acknowledged "..."` requires both flags; either missing
+    // is a parse error.
+    #[test]
+    fn uip_4_1_unquarantine_parses() {
+        let args = Args::try_parse_from([
+            "dtfs-cli", "unquarantine", "n1",
+            "--operator-id", "alice",
+            "--reason-acknowledged", "investigated and re-hashed, chunk is trusted",
+        ])
+        .expect("unquarantine should parse");
+        match args.command {
+            Commands::Unquarantine {
+                node_id,
+                operator_id,
+                reason_acknowledged,
+            } => {
+                assert_eq!(node_id, "n1");
+                assert_eq!(operator_id, "alice");
+                assert_eq!(reason_acknowledged, "investigated and re-hashed, chunk is trusted");
+            }
+            other => panic!("expected Commands::Unquarantine, got {other:?}"),
+        }
+
+        assert!(
+            Args::try_parse_from([
+                "dtfs-cli", "unquarantine", "n1",
+                "--reason-acknowledged", "investigated and re-hashed, chunk is trusted",
+            ])
+            .is_err(),
+            "missing --operator-id must be rejected"
+        );
+        assert!(
+            Args::try_parse_from([
+                "dtfs-cli", "unquarantine", "n1",
+                "--operator-id", "alice",
+            ])
+            .is_err(),
+            "missing --reason-acknowledged must be rejected"
+        );
     }
 }
