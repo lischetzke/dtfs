@@ -48,3 +48,6 @@ dummy_files/
 !.claude/hooks/**
 .claude/skills/*-workspace/
 environments.yml
+
+# graphify knowledge graph: regenerated locally by a post-commit hook, never versioned
+graphify-out/
