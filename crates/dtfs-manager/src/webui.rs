@@ -3700,7 +3700,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
                     <label>Chunk size</label>
                     <span class="settings-val">${{d.chunk_size_mb ?? 128}} MB</span>
                 </div>
-                <p class="settings-note">Per-volume overrides available via <code>dtfs-cli volume create --chunk-size</code></p>
+                <p class="settings-note">Per-volume overrides: set <b>chunk_size_mb</b> in the Volumes page's Create volume dialog (POST /api/v1/volumes)</p>
             </div>
         </div>
 

@@ -146,7 +146,7 @@ Full narrative (bug/task-ID reasoning behind each row) moved to `docs/src/intern
 | `dtfs-manager/src/rest_auth.rs` | LIS-18 mutation-auth check + axum middleware |
 | `dtfs-manager/src/membership.rs` | CF-2 online raft membership validation |
 | `dtfs-manager/src/join.rs` | Two-phase data-node join (HMAC handshake); node_id derived server-side |
-| `dtfs-manager/src/webui.rs` | Embedded SPA; LIS-35 mutating POSTs carry the shared secret |
+| `dtfs-manager/src/webui.rs` | Embedded SPA; LIS-35 mutating POSTs carry the shared secret. UIP (2026-09): covers every `api.rs` mutation the CLI has — volume create/edit (mandatory, anchor, spill, cache, write-safety, migrate-policy), scrub-all, raft membership (`/ui/raft`), maintenance, unquarantine, decommission — all through `mutateFetch`; a webui test forbids any inline `method: 'POST'` |
 | `dtfs-data/src/server.rs::put_chunk` | Streaming put path; LIS-19/55/83 auth gates all data-plane RPCs |
 | `dtfs-data/src/replication.rs::replicate_to` | Push-replication engine; timeout sized from chunk bytes |
 | `dtfs-common/src/replication.rs` | Shared manager/data-node replication-deadline helpers |
@@ -158,6 +158,7 @@ Full narrative (bug/task-ID reasoning behind each row) moved to `docs/src/intern
 | `dtfs-fuse/src/readahead.rs` | `ReadAheadEngine`; prefetch bound + Shed-rung, `.claude/rules/fuse.md` |
 | `dtfs-fuse/src/fuse_adapter.rs` | fuse3 trait impl; every op error routes through `cluster_err_to_errno` |
 | `dtfs-common/build.rs` + `src/version.rs` | `VERSION`/`BUILD_DATE` stamps (§ A.3.5) |
+| `dtfs-cli/src/main.rs` | REST client over `api.rs` (clap). UIP (2026-09): feature-complete against the webui — `volumes {create,show,migrate-policy,set-cache,set-mandatory,set-write-safety,set-anchor,set-spill,set-schedules}`, `files {list,inspect,flush-cache}`, `migrations create`, `unquarantine`, `decommission`, `config {set,effective}`, `integrity faults`, `stats`, `scrub`, `raft {members,add-learner,promote,remove}`. Mutations via `post_with_status` print the server error body and exit non-zero. Full list: `docs/src/api-reference/cli-reference.md` |
 | `dtfs-cli/src/updater.rs` | `dtfs-cli update` — download, verify, atomic install, restart |
 | `scripts/dtfs-release.sh` | Release builder; stamps version, assembles tarball, prints `gh release create` |
 | `dtfs-common/src/tls.rs` | CF-6 `TlsContext`; all gRPC routes through it; enable only cluster-wide |
