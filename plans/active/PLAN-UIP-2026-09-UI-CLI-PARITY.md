@@ -151,7 +151,7 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
 |---|---|---|---|---|---|
 | UIP-2-1 | `crates/dtfs-manager/src/webui.rs` | Replace the scrub placeholder (webui.rs:1399-1400, card header at 1754) with a "Scrub all" button + a `quick`/`deep` `<select>` inside the existing `.scrub-card`; POSTs `{target:"*", target_type:"all", level}` via `mutateFetch` to `/api/v1/scrub`. | `html.contains` test: button + select markup present, placeholder string gone. | Integrity page can trigger a cluster-wide scrub without the CLI. | ✅ |
 | UIP-2-2 | `crates/dtfs-manager/src/webui.rs` | Add a plain (non-mutating) `fetch('/api/v1/health')` alongside the existing `fetch('/api/v1/stats')` (webui.rs:1102) and surface its `status` as a small manager-reachability indicator (e.g. next to the existing health banner at 611-618). | `html.contains` test mirroring webui.rs:3493-3497's pattern: asserts `fetch('/api/v1/health')` is present and is NOT wrapped in `mutateFetch(`. | A manager-reachability check independent of `/api/v1/stats` is visible on the dashboard. | ✅ |
-| UIP-2-3 | `crates/dtfs-manager/src/webui.rs` | New read-only Raft panel: fetch `GET /api/v1/raft/state`, render node_id/state/term/leader plus a voters/learners table (hostname, node_id, addr, role). Plain `fetch`, not `mutateFetch` (read-only). | `html.contains` test asserting the panel's static markup (table headers, element ids) exists. | Raft membership is visible from the webui without `dtfs-cli raft members`. | ⬜ |
+| UIP-2-3 | `crates/dtfs-manager/src/webui.rs` | New read-only Raft panel: fetch `GET /api/v1/raft/state`, render node_id/state/term/leader plus a voters/learners table (hostname, node_id, addr, role). Plain `fetch`, not `mutateFetch` (read-only). | `html.contains` test asserting the panel's static markup (table headers, element ids) exists. | Raft membership is visible from the webui without `dtfs-cli raft members`. | ✅ |
 | UIP-2-4 | `crates/dtfs-manager/src/webui.rs` | Add add-learner/promote/remove forms to the Raft panel from UIP-2-3, POSTing `MembershipChangeRequest` via `mutateFetch` to `/raft/{add-learner,promote,remove}`; on a 409 (not leader), surface the leader hint from the response body instead of a generic error. | `html.contains` test asserting the three form/button markups and their `mutateFetch('/api/v1/raft/...'` targets exist. | Raft membership can be grown/shrunk from the webui; a non-leader manager shows the leader hint instead of a bare 409. | ⬜ |
 | UIP-2-5 | `crates/dtfs-manager/src/webui.rs` | Add a "Decommission" button to the node detail/table (near the existing UNJOINED/LEADER badges, webui.rs:1484-1501/1984-1987) that opens a confirm dialog capturing `operator_id`+`reason`, POSTs `DecommissionRequest` via `mutateFetch` to `/nodes/{id}/decommission`, and surfaces the 409 "replicas remain" message verbatim on failure. | `html.contains` test asserting the button/dialog markup and its `mutateFetch('/api/v1/nodes/.../decommission'` target exist. | A node can be decommissioned from the webui; the replicas-remain 409 message is shown, not swallowed. | ⬜ |
 
@@ -259,6 +259,9 @@ None of the above are `#[serde]`-persisted structs or Raft `ClientRequest` varia
 - UIP-2-2: `cargo test -p dtfs-manager --release webui` (Docker buildenv) —
   before: 18 passed; after: 19 passed (new
   `uip_2_webui_ops_tests::manager_health_indicator_uses_plain_fetch`).
+- UIP-2-3: `cargo test -p dtfs-manager --release webui` (Docker buildenv) —
+  before: 19 passed; after: 20 passed (new
+  `uip_2_webui_ops_tests::raft_page_read_only_markup_present`).
 
 ## Deviations
 

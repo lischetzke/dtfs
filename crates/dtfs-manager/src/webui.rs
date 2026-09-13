@@ -595,6 +595,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         <div class="nav-menu">
             <a href="/ui/topology"   data-route="/ui/topology">Topology</a>
             <a href="/ui/nodes"      data-route="/ui/nodes">Nodes</a>
+            <a href="/ui/raft"       data-route="/ui/raft">Raft</a>
             <a href="/ui/integrity"  data-route="/ui/integrity">Integrity</a>
             <a href="/ui/audit"      data-route="/ui/audit">Audit Log</a>
             <a href="/ui/config"     data-route="/ui/config">Config</a>
@@ -1621,6 +1622,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
     const NAV_GROUP_OF = {{
         '/ui/topology':   'cluster',
         '/ui/nodes':      'cluster',
+        '/ui/raft':       'cluster',
         '/ui/integrity':  'cluster',
         '/ui/audit':      'cluster',
         '/ui/config':     'cluster',
@@ -1635,6 +1637,7 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
         '/ui/':           renderHome,
         '/ui/topology':   renderTopology,
         '/ui/nodes':      renderNodesList,
+        '/ui/raft':       renderRaft,
         '/ui/integrity':  renderIntegrityFeed,
         '/ui/volumes':    renderVolumes,
         '/ui/explorer':   renderExplorer,
@@ -3200,6 +3203,74 @@ fn render_dashboard(cluster_name: &str, hostname: &str) -> String {
             '</tbody></table></div>';
     }}
 
+    // ── Raft page (UIP-2-3) ───────────────────────────────────────────────────
+    // Read-only view of GET /api/v1/raft/state as seen by THIS manager:
+    // role/term/leader header plus the full membership (voters and
+    // learners with their replication addr). Plain fetch, no secret.
+    async function renderRaft() {{
+        document.getElementById('page-content').innerHTML =
+            `<div class="page-header">
+                <h2>Raft</h2>
+                <p class="page-desc">Membership and log state as seen by the manager serving this page</p>
+            </div>
+            <div style="display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap">
+                <button class="btn-primary" onclick="loadRaft()">Refresh</button>
+            </div>
+            <div id="raft-state"><div class="placeholder">Loading…</div></div>
+            <div id="raft-members"></div>`;
+        await loadRaft();
+        refreshTimer = setInterval(loadRaft, 10000);
+    }}
+
+    async function loadRaft() {{
+        const st = await fetch('/api/v1/raft/state').then(r => r.json()).catch(() => null);
+        const stateEl = document.getElementById('raft-state');
+        const membersEl = document.getElementById('raft-members');
+        if (!stateEl || !membersEl) return;
+        if (!st) {{
+            stateEl.innerHTML = '<div class="placeholder">Could not reach /api/v1/raft/state.</div>';
+            membersEl.innerHTML = '';
+            return;
+        }}
+        window._raftState = st;
+        const leaderRow = st.current_leader
+            ? esc(st.current_leader) + (st.is_leader ? ' (this manager)' : '')
+            : 'none elected';
+        const ack = (st.millis_since_quorum_ack === null || st.millis_since_quorum_ack === undefined)
+            ? '—' : st.millis_since_quorum_ack + ' ms ago';
+        stateEl.innerHTML = `<div class="table-card" style="padding:.8rem 1rem">
+            <div class="node-meta">
+                <div class="node-meta-item"><span>This manager</span>${{esc(st.hostname||'—')}} <span style="font-family:monospace;font-size:.75rem;color:var(--text-muted)">id:${{esc(st.node_id||'—')}}</span></div>
+                <div class="node-meta-item"><span>Role</span>${{esc(st.state||'—')}}${{st.is_leader ? ' <span class="badge badge-leader">LEADER</span>' : ''}}</div>
+                <div class="node-meta-item"><span>Term</span>${{esc(st.current_term ?? '—')}}</div>
+                <div class="node-meta-item"><span>Leader</span>${{leaderRow}}</div>
+                <div class="node-meta-item"><span>Last log / applied</span>${{esc(st.last_log_index ?? '—')}} / ${{esc(st.last_applied_index ?? '—')}} (lag ${{esc(st.applied_log_lag ?? 0)}})</div>
+                <div class="node-meta-item"><span>Snapshot index</span>${{esc(st.snapshot_index ?? '—')}}</div>
+                <div class="node-meta-item"><span>Quorum ack</span>${{ack}}</div>
+            </div>
+        </div>`;
+        const members = Array.isArray(st.membership) ? st.membership : [];
+        if (!members.length) {{
+            membersEl.innerHTML = '<div class="placeholder">No membership reported.</div>';
+            return;
+        }}
+        const learners = new Set(st.learners || []);
+        membersEl.innerHTML = '<div class="table-card"><table id="raft-members-table">' +
+            '<thead><tr><th>Hostname</th><th>Node id</th><th>Addr</th><th>Role</th></tr></thead><tbody>' +
+            members.map(m => {{
+                const role = m.is_voter ? 'voter' : (learners.has(String(m.node_id)) ? 'learner' : 'member');
+                const isLeader = st.current_leader && String(st.current_leader) === String(m.node_id);
+                return `<tr>
+                    <td>${{esc(m.hostname||'—')}}${{isLeader ? ' <span class="badge badge-leader">LEADER</span>' : ''}}</td>
+                    <td style="font-family:monospace;font-size:.78rem">${{esc(m.node_id||'—')}}</td>
+                    <td style="font-family:monospace;font-size:.78rem">${{esc(m.addr||'—')}}</td>
+                    <td>${{esc(role)}}</td>
+                </tr>`;
+            }}).join('') +
+            '</tbody></table></div>';
+    }}
+    window.loadRaft = loadRaft;
+
     // ── Config page (AZ-5) ────────────────────────────────────────────────────
     // Raw cluster-config viewer/editor. Every [section.key] from the
     // ManagerConfig is listed with name / current / default; operators
@@ -3855,6 +3926,29 @@ mod create_volume_modal_tests {
 #[cfg(test)]
 mod uip_2_webui_ops_tests {
     use super::*;
+
+    /// UIP-2-3 — read-only Raft page: nav entry, route, state/members
+    /// containers and table headers; GET raft/state is a plain fetch.
+    #[test]
+    fn raft_page_read_only_markup_present() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        for needle in [
+            "data-route=\"/ui/raft\"",
+            "'/ui/raft':       renderRaft",
+            "async function renderRaft()",
+            "id=\"raft-state\"",
+            "id=\"raft-members\"",
+            "id=\"raft-members-table\"",
+            "<th>Hostname</th><th>Node id</th><th>Addr</th><th>Role</th>",
+            "fetch('/api/v1/raft/state')",
+        ] {
+            assert!(html.contains(needle), "raft page missing: {needle}");
+        }
+        assert!(
+            !html.contains("mutateFetch('/api/v1/raft/state'"),
+            "GET raft/state must stay a plain fetch"
+        );
+    }
 
     /// UIP-2-2 — manager reachability comes from a plain GET
     /// /api/v1/health next to the stats poll, never via mutateFetch.
