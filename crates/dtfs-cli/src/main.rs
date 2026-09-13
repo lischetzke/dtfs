@@ -99,6 +99,21 @@ enum Commands {
         reason_acknowledged: String,
     },
 
+    /// UIP-4-2 (D1) — remove a drained/dead node from the cluster
+    /// registry. Flat top-level command mirroring `Maintenance`'s
+    /// shape. Rejected (409) while the node still holds chunk
+    /// replicas.
+    Decommission {
+        /// Node ID
+        node_id: String,
+        /// Free-form actor label (initials/ticket) for the audit row.
+        #[arg(long)]
+        operator_id: String,
+        /// Written justification for removing the node.
+        #[arg(long)]
+        reason: String,
+    },
+
     /// View audit log
     Audit {
         /// Maximum entries to show
@@ -577,6 +592,11 @@ async fn main() -> anyhow::Result<()> {
             operator_id,
             reason_acknowledged,
         } => cmd_unquarantine(&api, &node_id, &operator_id, &reason_acknowledged).await?,
+        Commands::Decommission {
+            node_id,
+            operator_id,
+            reason,
+        } => cmd_decommission(&api, &node_id, &operator_id, &reason).await?,
         Commands::Audit { limit, action } => cmd_audit(&api, &args.format, limit, action).await?,
         Commands::Config { show: _ } => cmd_config(&api, &args.format).await?,
         Commands::Health => cmd_health(&api).await?,
@@ -1362,6 +1382,34 @@ async fn cmd_unquarantine(
     Ok(())
 }
 
+/// UIP-4-2 — `dtfs-cli decommission <node-id> --operator-id X --reason
+/// "..."`: remove a drained/dead node from the cluster registry.
+/// Surfaces the server's JSON verbatim (including the 409 "replicas
+/// remain" body) and exits non-zero on failure.
+async fn cmd_decommission(
+    api: &ApiClient,
+    node_id: &str,
+    operator_id: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "operator_id": operator_id,
+        "reason": reason,
+    });
+    let (status, value) = api
+        .post_with_status(&format!("/api/v1/nodes/{}/decommission", node_id), &body)
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    if !status.is_success() {
+        anyhow::bail!(
+            "decommission node {} failed: HTTP {}",
+            node_id,
+            status
+        );
+    }
+    Ok(())
+}
+
 async fn cmd_audit(
     api: &ApiClient,
     format: &OutputFormat,
@@ -1742,6 +1790,47 @@ mod audit_co_tests {
             ])
             .is_err(),
             "missing --reason-acknowledged must be rejected"
+        );
+    }
+
+    // UIP-4-2 — `decommission <node-id> --operator-id X --reason "..."`
+    // requires both flags; either missing is a parse error.
+    #[test]
+    fn uip_4_2_decommission_parses() {
+        let args = Args::try_parse_from([
+            "dtfs-cli", "decommission", "n1",
+            "--operator-id", "alice",
+            "--reason", "drained and dead, removing from registry",
+        ])
+        .expect("decommission should parse");
+        match args.command {
+            Commands::Decommission {
+                node_id,
+                operator_id,
+                reason,
+            } => {
+                assert_eq!(node_id, "n1");
+                assert_eq!(operator_id, "alice");
+                assert_eq!(reason, "drained and dead, removing from registry");
+            }
+            other => panic!("expected Commands::Decommission, got {other:?}"),
+        }
+
+        assert!(
+            Args::try_parse_from([
+                "dtfs-cli", "decommission", "n1",
+                "--reason", "drained and dead, removing from registry",
+            ])
+            .is_err(),
+            "missing --operator-id must be rejected"
+        );
+        assert!(
+            Args::try_parse_from([
+                "dtfs-cli", "decommission", "n1",
+                "--operator-id", "alice",
+            ])
+            .is_err(),
+            "missing --reason must be rejected"
         );
     }
 }
