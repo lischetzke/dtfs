@@ -181,6 +181,9 @@ enum Commands {
         /// Read [updater] from this config file (default: /etc/dtfs/<role>.toml).
         #[arg(long)]
         config: Option<String>,
+        /// GitLab token for a private project (default: DTFS_REPO_TOKEN, then [updater].token).
+        #[arg(long)]
+        token: Option<String>,
         /// Install the new binary but do not restart the service.
         #[arg(long)]
         no_restart: bool,
@@ -756,9 +759,10 @@ async fn main() -> anyhow::Result<()> {
             repo_url,
             install_dir,
             config,
+            token,
             no_restart,
             yes,
-        } => updater::run(target, check, tag, repo_url, install_dir, config, no_restart, yes)?,
+        } => updater::run(target, check, tag, repo_url, install_dir, config, token, no_restart, yes)?,
     }
 
     Ok(())

@@ -37,20 +37,25 @@ for a in "$@"; do
         cat <<'AZ2HELP'
 
 AZ-2 source selection flags (in addition to the legacy positional arg):
-  --source local|github|auto   default `auto`. `local` searches
+  --source local|remote|auto   default `auto`. `local` searches
                                $DTFS_LOCAL_BIN_DIR, ./target/release,
                                /opt/dtfs/staging/*/release, ~/.cache/dtfs;
-                               `github` downloads from $DTFS_REPO_URL
-                               releases; `auto` tries local first, then
-                               github.
-  --version <tag>              GitHub release tag (default `latest`).
-                               Honoured for source=github and the auto
-                               fallback. Ignored for source=local.
+                               `remote` downloads the release tarball from
+                               $DTFS_REPO_URL (GitLab package registry, or
+                               GitHub releases for a github.com URL;
+                               `github` is accepted as an alias); `auto`
+                               tries local first, then remote.
+  --version <tag>              Release tag (default `latest` = newest full
+                               vX.Y.Z release). Honoured for source=remote
+                               and the auto fallback. Ignored for local.
 
 Env vars:
   DTFS_LOCAL_BIN_DIR  highest-priority local search dir (optional).
-  DTFS_REPO_URL       override the GitHub repo. Default:
+  DTFS_REPO_URL       override the release repo. Default:
                       https://github.com/lischetzke/dtfs
+  DTFS_REPO_TOKEN     GitLab deploy token (gldt-..., read_package_registry)
+                      or access token (glpat-..., read_api) for a private
+                      project; empty = anonymous.
 AZ2HELP
         exit 0
     fi
@@ -79,6 +84,7 @@ ROLE_ARG=""
 SOURCE="auto"
 VERSION=""        # tag / "latest". empty = "latest" when SOURCE != local
 REPO="${DTFS_REPO_URL:-https://github.com/lischetzke/dtfs}"
+REPO_TOKEN="${DTFS_REPO_TOKEN:-}"
 STAGING_ROOT="/opt/dtfs/staging"
 DOWNLOAD_CACHE="${HOME}/.cache/dtfs"
 
@@ -109,8 +115,9 @@ while [ $# -gt 0 ]; do
         --source)
             shift
             case "${1:-}" in
-                local|github|auto) SOURCE="$1" ;;
-                *) error "--source must be local|github|auto"; exit 1 ;;
+                local|auto) SOURCE="$1" ;;
+                remote|github) SOURCE="remote" ;;
+                *) error "--source must be local|remote|auto"; exit 1 ;;
             esac
             ;;
         --version)
@@ -121,23 +128,28 @@ while [ $# -gt 0 ]; do
             cat <<'AZ2HELP'
 
 AZ-2 source selection flags (in addition to the legacy positional arg):
-  --source local|github|auto   default `auto`. `local` searches
+  --source local|remote|auto   default `auto`. `local` searches
                                $DTFS_LOCAL_BIN_DIR, ./target/release,
                                /opt/dtfs/staging/*/release, ~/.cache/dtfs;
-                               `github` downloads from $DTFS_REPO_URL
-                               releases; `auto` tries local first, then
-                               github.
-  --version <tag>              GitHub release tag (default `latest`).
-                               Honoured for source=github and the auto
-                               fallback. Ignored for source=local.
+                               `remote` downloads the release tarball from
+                               $DTFS_REPO_URL (GitLab package registry, or
+                               GitHub releases for a github.com URL;
+                               `github` is accepted as an alias); `auto`
+                               tries local first, then remote.
+  --version <tag>              Release tag (default `latest` = newest full
+                               vX.Y.Z release). Honoured for source=remote
+                               and the auto fallback. Ignored for local.
 
 The legacy positional tarball arg still wins when supplied — the install
 script unpacks it directly, no source-selection logic runs.
 
 Env vars:
   DTFS_LOCAL_BIN_DIR  highest-priority local search dir (optional).
-  DTFS_REPO_URL       override the GitHub repo. Default:
+  DTFS_REPO_URL       override the release repo. Default:
                       https://github.com/lischetzke/dtfs
+  DTFS_REPO_TOKEN     GitLab deploy token (gldt-..., read_package_registry)
+                      or access token (glpat-..., read_api) for a private
+                      project; empty = anonymous.
 AZ2HELP
             exit 0
             ;;
@@ -174,18 +186,56 @@ if [ -z "$TARBALL" ]; then
         done
         return 1
     }
-    download_tarball_github() {
+    # Header for a GitLab token: deploy tokens (gldt-...) use DEPLOY-TOKEN,
+    # project/personal access tokens use PRIVATE-TOKEN (mirrors
+    # dtfs-cli/src/updater.rs::token_header).
+    repo_auth_args() {
+        [ -n "$REPO_TOKEN" ] || return 0
+        case "$REPO_TOKEN" in
+            gldt-*) printf -- '-H\nDEPLOY-TOKEN: %s\n' "$REPO_TOKEN" ;;
+            *)      printf -- '-H\nPRIVATE-TOKEN: %s\n' "$REPO_TOKEN" ;;
+        esac
+    }
+    # GitLab API base for a project URL: https://host/group/project ->
+    # https://host/api/v4/projects/group%2Fproject
+    gitlab_api_base() {
+        local u="${REPO%/}"; u="${u%.git}"
+        local scheme="${u%%://*}" rest="${u#*://}"
+        local host="${rest%%/*}" path="${rest#*/}"
+        [ -n "$host" ] && [ -n "$path" ] && [ "$path" != "$rest" ] || return 1
+        printf '%s://%s/api/v4/projects/%s' "$scheme" "$host" "${path//\//%2F}"
+    }
+    download_tarball_remote() {
         local tag="${VERSION:-latest}"
         local url
-        if [ "$tag" = "latest" ]; then
-            url="${REPO}/releases/latest/download/dtfs-linux-amd64.tar.gz"
-        else
-            url="${REPO}/releases/download/${tag}/dtfs-linux-amd64.tar.gz"
-        fi
+        local -a auth=()
+        mapfile -t auth < <(repo_auth_args)
+        case "$REPO" in
+            https://github.com/*|http://github.com/*)
+                if [ "$tag" = "latest" ]; then
+                    url="${REPO}/releases/latest/download/dtfs-linux-amd64.tar.gz"
+                else
+                    url="${REPO}/releases/download/${tag}/dtfs-linux-amd64.tar.gz"
+                fi
+                ;;
+            *)
+                local api
+                api="$(gitlab_api_base)" || { error "AZ-2: cannot derive a GitLab project from $REPO"; return 1; }
+                if [ "$tag" = "latest" ]; then
+                    # Newest full release (vX.Y.Z); alpha tags (vX.Y.Z_stamp) are skipped.
+                    command -v jq >/dev/null 2>&1 || { error "AZ-2: jq is required to resolve 'latest' from GitLab"; return 1; }
+                    tag="$(curl -fsSL "${auth[@]}" "${api}/releases?per_page=50" \
+                        | jq -r '[.[] | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | first // empty')"
+                    [ -n "$tag" ] || { error "AZ-2: no full release found at ${api}/releases"; return 1; }
+                    info "AZ-2: latest full release is $tag"
+                fi
+                url="${api}/packages/generic/dtfs/${tag}/dtfs-linux-amd64.tar.gz"
+                ;;
+        esac
         mkdir -p "$DOWNLOAD_CACHE"
         local out="${DOWNLOAD_CACHE}/dtfs-${tag}-linux-amd64.tar.gz"
         info "AZ-2: downloading $url -> $out"
-        if curl -fL --output "$out.partial" "$url"; then
+        if curl -fL "${auth[@]}" --output "$out.partial" "$url"; then
             mv "$out.partial" "$out"
             TARBALL="$out"
             return 0
@@ -201,16 +251,16 @@ if [ -z "$TARBALL" ]; then
                 exit 1
             }
             ;;
-        github)
-            download_tarball_github || {
-                error "AZ-2: GitHub download failed for tag '${VERSION:-latest}'"
+        remote)
+            download_tarball_remote || {
+                error "AZ-2: remote download failed for tag '${VERSION:-latest}'"
                 exit 1
             }
             ;;
         auto)
             if select_tarball_local; then
                 :
-            elif download_tarball_github; then
+            elif download_tarball_remote; then
                 :
             else
                 error "AZ-2: no local source found and GitHub fallback failed"

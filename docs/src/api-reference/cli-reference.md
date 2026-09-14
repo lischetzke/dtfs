@@ -835,9 +835,10 @@ Backed by `GET /api/v1/integrity/faults?limit=N&action=PREFIX`.
 
 ### update
 
-Update DTFS binaries from the configured GitHub release and restart the
-matching systemd service **on the local host** (cluster-wide rolling
-stays in `scripts/dtfs-update.sh`). Unlike the other commands this one
+Update DTFS binaries from the configured release source and restart the
+matching systemd service **on the local host** (the cluster-wide rolling
+update is the GitLab pipeline, see
+[CI Pipeline](../operations/ci-pipeline.md)). Unlike the other commands this one
 does not talk to the manager API; it downloads the release tarball,
 verifies each binary's sha256 against the in-tarball `MANIFEST`,
 atomically installs it (`install -m 0755`), and restarts the service.
@@ -846,16 +847,17 @@ Run as **root** (it writes the install directory and calls `systemctl`).
 
 ```bash
 dtfs-cli update <TARGET> [--check] [--tag <TAG>] [--repo-url <URL>] \
-                         [--install-dir <DIR>] [--config <PATH>] \
-                         [--no-restart] [-y|--yes]
+                         [--token <TOKEN>] [--install-dir <DIR>] \
+                         [--config <PATH>] [--no-restart] [-y|--yes]
 ```
 
 | Argument / Option | Description |
 |-------------------|-------------|
 | `<TARGET>` | `manager`, `data`, `fuse` (alias `client`), `cli`, or `all`. |
 | `--check` | Report installed vs latest available; make no changes. |
-| `--tag <TAG>` | Install a specific release tag (default: the latest release). |
-| `--repo-url <URL>` | Override the release repo (default: `[updater].repo_url`, then `DTFS_REPO_URL`, then the built-in repo). |
+| `--tag <TAG>` | Install a specific release tag (default: the newest full `vX.Y.Z` release; pipeline alpha tags `vX.Y.Z_YYYYMMDDHHmm` are only installed when named here). |
+| `--repo-url <URL>` | Override the release repo (default: `[updater].repo_url`, then `DTFS_REPO_URL`, then the built-in GitLab project). A GitLab project URL uses the Generic Package Registry; a github.com URL the legacy releases layout. |
+| `--token <TOKEN>` | GitLab token for a private project (default: `DTFS_REPO_TOKEN`, then `[updater].token`). `gldt-...` deploy tokens are sent as `DEPLOY-TOKEN`, anything else as `PRIVATE-TOKEN`. |
 | `--install-dir <DIR>` | Override the install directory (default: `[updater].install_dir` or `/usr/local/bin`). |
 | `--config <PATH>` | Read the `[updater]` block from this file (default: `/etc/dtfs/<role>.toml`). |
 | `--no-restart` | Install the new binary but do not restart the service. |
@@ -866,9 +868,10 @@ Target → service: `manager` → `dtfs-manager.service`, `data` →
 `cli` → none (the binary is replaced in place). `all` installs every
 binary and restarts each present service.
 
-The source repo URL lives in the `[updater]` block of any role config
-(see [Configuration](../configuration/manager.md)); it defaults to the
-canonical DTFS repository, so no config is required.
+The source repo URL and token live in the `[updater]` block of any role
+config (see [Configuration](../configuration/manager.md)); the URL
+defaults to the canonical DTFS project, so for a public project no
+config is required.
 
 **Integrity:** a single sha256 mismatch between a downloaded binary and
 its `MANIFEST` entry aborts the entire update — nothing is installed.

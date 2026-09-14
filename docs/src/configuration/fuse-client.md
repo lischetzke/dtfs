@@ -243,6 +243,7 @@ the full option table.
 ```toml
 [updater]
 repo_url    = "https://github.com/lischetzke/dtfs"
+token       = "gldt-..."          # deploy token for the private project
 install_dir = "/usr/local/bin"
 ```
 

@@ -124,9 +124,11 @@ timeout, 3 bad arguments. Read-only; needs no shared secret.
 
 ## Version stamps
 
-Alpha versions look like `v0.1.9_202609131530`. `dtfs-cli update`
-compares the numeric `X.Y.Z` prefix, so an alpha of the current release
-does not count as newer; use the pipeline to roll alphas out.
-`dtfs-cli update` still downloads from the configured
-`[updater].repo_url`; after the move to GitLab point it at the GitLab
-project (the Generic Package Registry URLs are stable per version).
+Alpha versions look like `v0.1.9_202609131530`. `dtfs-cli update` and
+`dtfs-install.sh --source remote` resolve `latest` to the newest full
+`vX.Y.Z` release and skip alphas; an alpha installs only when named with
+`--tag`/`--version`. Both read the tarball from the Generic Package
+Registry the `release` stage uploads to
+(`<repo_url>/api/v4/projects/<group>%2F<project>/packages/generic/dtfs/<tag>/`),
+authenticated with `[updater].token` / `DTFS_REPO_TOKEN` on a private
+project (deploy token, scope `read_package_registry`).

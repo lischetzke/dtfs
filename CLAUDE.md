@@ -129,7 +129,7 @@ One line per file. Bug/task history per row: `docs/src/internals/invariants.md` 
 | `dtfs-fuse/src/fuse_adapter.rs` | fuse3 trait impl; every op error routes through `cluster_err_to_errno` |
 | `dtfs-common/build.rs` + `src/version.rs` | `VERSION`/`BUILD_DATE` stamps (§ A.3.5) |
 | `dtfs-cli/src/main.rs` | REST client (clap), full parity with the webui; mutations print the server error body and exit non-zero. List: `docs/src/api-reference/cli-reference.md` |
-| `dtfs-cli/src/updater.rs` | `dtfs-cli update` — download, verify, atomic install, restart |
+| `dtfs-cli/src/updater.rs` | `dtfs-cli update` — GitLab package registry (default, deploy/access token) or GitHub releases; `latest` = newest full `vX.Y.Z`; verify, atomic install, restart |
 | `scripts/dtfs-release.sh` | Release builder; stamps version, assembles tarball + SHA256SUMS + git-cliff notes |
 | `.gitlab-ci.yml` + `scripts/ci/{version,gitlab-release}.sh` | Pipeline: keyword gate on the commit subject, version resolution, package upload + GitLab release |
 | `deploy/ansible/update-cluster.yml` + `tasks/update-node.yml` | Rolling cluster update used by the pipeline's deploy stage; order from live Raft state, per-node health wait + delay |

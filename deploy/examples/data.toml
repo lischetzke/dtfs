@@ -106,7 +106,11 @@ tier = "cold"
 
 #[updater]
 # AZ-5: read by `dtfs-cli update` only; the daemon ignores this block.
+# repo_url is a GitLab project URL (default) or a github.com repo. token is
+# needed for a private GitLab project: deploy token (gldt-..., scope
+# read_package_registry) or access token (glpat-..., scope read_api).
 #repo_url = "https://github.com/lischetzke/dtfs"
+#token = ""
 #install_dir = "/usr/local/bin"
 
 # LTFS-backed tape devices (frozen/archival tier). Omit if no tape drives.

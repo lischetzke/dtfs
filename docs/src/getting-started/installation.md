@@ -103,7 +103,7 @@ echo '/dev/sdX /mnt/dtfs-disk-01 xfs defaults 0 0' | sudo tee -a /etc/fstab
 
 ```bash
 git clone https://github.com/lischetzke/dtfs.git
-cd dtfs2
+cd dtfs
 ```
 
 ### Build All Binaries
@@ -226,9 +226,9 @@ workflow) OR resolves the tarball itself via `--source` + `--version`:
 | Flag | Default | Behaviour |
 |------|---------|-----------|
 | `--source local` | — | Search `$DTFS_LOCAL_BIN_DIR`, `./target/release`, `/opt/dtfs/staging/*/`, `~/.cache/dtfs`. Fail if none match. |
-| `--source github` | — | Download from `$DTFS_REPO_URL` (default `https://github.com/lischetzke/dtfs`) releases. Use `--version` to pin a tag. |
-| `--source auto` | yes | Try local first; fall back to GitHub. |
-| `--version <tag>` | `latest` | GitHub release tag. Ignored for `--source local`. |
+| `--source remote` | — | Download from `$DTFS_REPO_URL` (default `https://github.com/lischetzke/dtfs`, Generic Package Registry; a github.com URL uses GitHub releases). Set `DTFS_REPO_TOKEN` for a private project. `github` is accepted as an alias. Use `--version` to pin a tag. |
+| `--source auto` | yes | Try local first; fall back to remote. |
+| `--version <tag>` | `latest` | Release tag; `latest` is the newest full `vX.Y.Z` release. Ignored for `--source local`. |
 
 The installer stages the chosen tarball at `/opt/dtfs/staging/<version>/`
 before unpacking + installing. Failed runs leave the staging dir for

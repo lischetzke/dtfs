@@ -1,8 +1,13 @@
-//! AZ-5 — `dtfs-cli update`: pull the latest GitHub release, verify it
-//! against the in-tarball MANIFEST (sha256), atomically install the
-//! target binary, and restart the matching systemd service on the local
-//! host. Local-node only; cluster-wide rolling stays in
-//! `scripts/dtfs-update.sh`.
+//! AZ-5 — `dtfs-cli update`: pull a release tarball, verify it against
+//! the in-tarball MANIFEST (sha256), atomically install the target
+//! binary, and restart the matching systemd service on the local host.
+//! Local-node only; the cluster-wide rolling update is the GitLab
+//! pipeline (`deploy/ansible/update-cluster.yml`).
+//!
+//! Sources (`release_source`): a GitLab project URL (the default,
+//! `dtfs_common::REPO_URL`) reads the Generic Package Registry and the
+//! Releases API, optionally with a deploy/access token; a github.com URL
+//! keeps the legacy releases/download path.
 //!
 //! Network/IO is delegated to the same tools the deploy layer already
 //! uses (`curl`, `tar`, `install`, `systemctl`); the only Rust deps are
@@ -56,7 +61,93 @@ pub fn service_for_binary(bin: &str) -> Option<&'static str> {
     }
 }
 
-/// Release tarball URL. `tag = None` → the `latest` release.
+/// Where a `repo_url` points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseSource {
+    /// github.com `owner/repo` (legacy releases/download URLs).
+    GitHub { owner: String, repo: String },
+    /// A GitLab project; `api` is `https://<host>/api/v4/projects/<group>%2F<project>`.
+    GitLab { api: String },
+}
+
+/// Classify `repo_url`. GitLab is the default for any non-github.com
+/// host: the project path is URL-encoded into the `/projects/:id` form
+/// so no numeric project id is needed. `None` when no project path can
+/// be found.
+pub fn release_source(repo_url: &str) -> Option<ReleaseSource> {
+    if let Some((owner, repo)) = parse_owner_repo(repo_url) {
+        return Some(ReleaseSource::GitHub { owner, repo });
+    }
+    let s = repo_url.trim().trim_end_matches('/');
+    let (scheme, rest) = s.split_once("://")?;
+    let (host, path) = rest.split_once('/')?;
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    let encoded = path.replace('/', "%2F");
+    Some(ReleaseSource::GitLab {
+        api: format!("{scheme}://{host}/api/v4/projects/{encoded}"),
+    })
+}
+
+/// GitLab Generic Package Registry URL of the tarball for `tag`
+/// (package `dtfs`, the layout `scripts/ci/gitlab-release.sh` uploads).
+pub fn gitlab_tarball_url(api: &str, tag: &str) -> String {
+    format!("{api}/packages/generic/dtfs/{tag}/{ASSET}")
+}
+
+/// GitLab Releases API listing (newest first).
+pub fn gitlab_releases_url(api: &str) -> String {
+    format!("{api}/releases?per_page=50")
+}
+
+/// Header line for a GitLab token: deploy tokens (`gldt-...`) go in
+/// `DEPLOY-TOKEN`, project/personal access tokens (`glpat-...` or
+/// anything else) in `PRIVATE-TOKEN`.
+pub fn token_header(token: &str) -> String {
+    if token.starts_with("gldt-") {
+        format!("DEPLOY-TOKEN: {token}")
+    } else {
+        format!("PRIVATE-TOKEN: {token}")
+    }
+}
+
+/// Is `tag` a full release (`vX.Y.Z`) rather than an alpha
+/// (`vX.Y.Z_YYYYMMDDHHmm`, the pipeline's `deploy` builds)?
+pub fn is_full_release_tag(tag: &str) -> bool {
+    let Some(rest) = tag.strip_prefix('v') else { return false };
+    let parts: Vec<&str> = rest.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Pick the newest release tag from a GitLab `/releases` listing
+/// (already newest-first). Alphas are skipped unless `include_alpha`.
+/// Returns `(tag, released_at)`.
+pub fn pick_latest_release(json: &str, include_alpha: bool) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let arr = v.as_array()?;
+    for rel in arr {
+        let tag = rel.get("tag_name")?.as_str()?;
+        if !include_alpha && !is_full_release_tag(tag) {
+            continue;
+        }
+        let at = rel.get("released_at").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        return Some((tag.to_string(), at));
+    }
+    None
+}
+
+/// Token precedence: `--token` > `DTFS_REPO_TOKEN` env > `[updater].token`.
+pub fn resolve_token(flag: Option<&str>, env: Option<&str>, cfg: Option<&str>) -> Option<String> {
+    flag.filter(|s| !s.is_empty())
+        .or(env.filter(|s| !s.is_empty()))
+        .or(cfg.filter(|s| !s.is_empty()))
+        .map(|s| s.to_string())
+}
+
+/// GitHub release tarball URL. `tag = None` → the `latest` release.
 pub fn tarball_url(repo_url: &str, tag: Option<&str>) -> String {
     let base = repo_url.trim_end_matches('/');
     match tag {
@@ -134,6 +225,7 @@ pub fn run(
     repo_url_flag: Option<String>,
     install_dir_flag: Option<String>,
     config_path: Option<String>,
+    token_flag: Option<String>,
     no_restart: bool,
     yes: bool,
 ) -> Result<()> {
@@ -143,9 +235,9 @@ pub fn run(
     let cfg_path = config_path
         .map(PathBuf::from)
         .or_else(|| default_config_path(target));
-    let (cfg_repo, cfg_install) = match cfg_path {
+    let (cfg_repo, cfg_install, cfg_token) = match cfg_path {
         Some(ref p) if p.exists() => read_updater_section(p)?,
-        _ => (None, None),
+        _ => (None, None, None),
     };
 
     let env_repo = std::env::var("DTFS_REPO_URL").ok();
@@ -158,11 +250,37 @@ pub fn run(
     let install_dir = install_dir_flag
         .or(cfg_install)
         .unwrap_or(defaults.install_dir);
+    let env_token = std::env::var("DTFS_REPO_TOKEN").ok();
+    let token = resolve_token(token_flag.as_deref(), env_token.as_deref(), cfg_token.as_deref());
+    let headers: Vec<String> = token.iter().map(|t| token_header(t)).collect();
+    let source = release_source(&repo_url)
+        .with_context(|| format!("repo_url '{repo_url}' is neither a GitLab project URL nor a github.com repo"))?;
 
     if check {
-        return run_check(target, &repo_url, &install_dir);
+        return run_check(target, &source, &headers, &install_dir);
     }
-    run_update(target, &repo_url, tag.as_deref(), &install_dir, no_restart, yes)
+    run_update(target, &source, &headers, tag.as_deref(), &install_dir, no_restart, yes)
+}
+
+/// Resolve the tarball URL for `tag` (or the latest full release).
+fn resolve_tarball_url(source: &ReleaseSource, headers: &[String], tag: Option<&str>) -> Result<String> {
+    match source {
+        ReleaseSource::GitHub { owner, repo } => {
+            Ok(tarball_url(&format!("https://github.com/{owner}/{repo}"), tag))
+        }
+        ReleaseSource::GitLab { api } => {
+            let tag = match tag {
+                Some(t) => t.to_string(),
+                None => {
+                    let body = curl_get(&gitlab_releases_url(api), headers)?;
+                    pick_latest_release(&body, false)
+                        .map(|(t, _)| t)
+                        .context("no full release (vX.Y.Z) found in the GitLab release list")?
+                }
+            };
+            Ok(gitlab_tarball_url(api, &tag))
+        }
+    }
 }
 
 fn default_config_path(t: UpdateTarget) -> Option<PathBuf> {
@@ -177,11 +295,12 @@ fn default_config_path(t: UpdateTarget) -> Option<PathBuf> {
 
 /// Read just the `[updater]` block from any dtfs `.toml` (serde ignores
 /// the rest). `Option` fields so we can tell "set" from "defaulted".
-fn read_updater_section(path: &Path) -> Result<(Option<String>, Option<String>)> {
+fn read_updater_section(path: &Path) -> Result<(Option<String>, Option<String>, Option<String>)> {
     #[derive(serde::Deserialize, Default)]
     struct Section {
         repo_url: Option<String>,
         install_dir: Option<String>,
+        token: Option<String>,
     }
     #[derive(serde::Deserialize, Default)]
     struct File {
@@ -190,19 +309,20 @@ fn read_updater_section(path: &Path) -> Result<(Option<String>, Option<String>)>
     }
     let f: File = dtfs_common::config::load_config(path)
         .with_context(|| format!("reading [updater] from {}", path.display()))?;
-    Ok((f.updater.repo_url, f.updater.install_dir))
+    Ok((f.updater.repo_url, f.updater.install_dir, f.updater.token))
 }
 
 fn run_update(
     target: UpdateTarget,
-    repo_url: &str,
+    source: &ReleaseSource,
+    headers: &[String],
     tag: Option<&str>,
     install_dir: &str,
     no_restart: bool,
     yes: bool,
 ) -> Result<()> {
     let bins = target_binaries(target);
-    let url = tarball_url(repo_url, tag);
+    let url = resolve_tarball_url(source, headers, tag)?;
 
     // Stage into a fresh, unpredictable directory (CO-2-4): a fixed path
     // under temp_dir() is a symlink/race/clobber target. tempfile creates
@@ -212,7 +332,7 @@ fn run_update(
 
     let tarball = tmp.join(ASSET);
     eprintln!("Downloading {url}");
-    curl_download(&url, &tarball)?;
+    curl_download(&url, headers, &tarball)?;
 
     eprintln!("Extracting {ASSET}");
     extract(&tarball, tmp)?;
@@ -315,14 +435,29 @@ fn version_is_newer(installed: &str, latest: &str) -> bool {
     }
 }
 
-fn run_check(target: UpdateTarget, repo_url: &str, install_dir: &str) -> Result<()> {
-    let (owner, repo) = parse_owner_repo(repo_url)
-        .with_context(|| format!("--check needs a github.com repo_url, got {repo_url}"))?;
-    let body = curl_get(&api_latest_url(&owner, &repo))?;
-    let v: serde_json::Value =
-        serde_json::from_str(&body).context("parsing GitHub releases/latest JSON")?;
-    let tag = v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("<unknown>");
-    let published = v.get("published_at").and_then(|t| t.as_str()).unwrap_or("");
+fn run_check(
+    target: UpdateTarget,
+    source: &ReleaseSource,
+    headers: &[String],
+    install_dir: &str,
+) -> Result<()> {
+    let (tag, published) = match source {
+        ReleaseSource::GitHub { owner, repo } => {
+            let body = curl_get(&api_latest_url(owner, repo), headers)?;
+            let v: serde_json::Value =
+                serde_json::from_str(&body).context("parsing GitHub releases/latest JSON")?;
+            (
+                v.get("tag_name").and_then(|t| t.as_str()).unwrap_or("<unknown>").to_string(),
+                v.get("published_at").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+            )
+        }
+        ReleaseSource::GitLab { api } => {
+            let body = curl_get(&gitlab_releases_url(api), headers)?;
+            pick_latest_release(&body, false)
+                .context("no full release (vX.Y.Z) found in the GitLab release list")?
+        }
+    };
+    let tag = tag.as_str();
     if published.is_empty() {
         println!("latest release: {tag}");
     } else {
@@ -349,11 +484,16 @@ fn installed_version(install_dir: &str, bin: &str) -> String {
 
 // ---- external tools -----------------------------------------------------
 
-fn curl_download(url: &str, out: &Path) -> Result<()> {
+fn curl_download(url: &str, headers: &[String], out: &Path) -> Result<()> {
     // `=https,file`: https for real releases, file:// for a local/offline
     // --repo-url the operator explicitly points at; nothing else.
-    let status = Command::new("curl")
-        .args(["-fL", "--proto", "=https,file", "--tlsv1.2", "-o"])
+    let mut cmd = Command::new("curl");
+    cmd.args(["-fL", "--proto", "=https,file", "--tlsv1.2"]);
+    for h in headers {
+        cmd.arg("-H").arg(h);
+    }
+    let status = cmd
+        .arg("-o")
         .arg(out)
         .arg(url)
         .status()
@@ -364,9 +504,13 @@ fn curl_download(url: &str, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn curl_get(url: &str) -> Result<String> {
-    let out = Command::new("curl")
-        .args(["-fsSL", "--proto", "=https", "-H", "User-Agent: dtfs-cli"])
+fn curl_get(url: &str, headers: &[String]) -> Result<String> {
+    let mut cmd = Command::new("curl");
+    cmd.args(["-fsSL", "--proto", "=https", "-H", "User-Agent: dtfs-cli"]);
+    for h in headers {
+        cmd.arg("-H").arg(h);
+    }
+    let out = cmd
         .arg(url)
         .output()
         .context("running curl (is curl installed?)")?;
@@ -550,6 +694,74 @@ mod tests {
         assert_eq!(service_for_binary("dtfs-data"), Some("dtfs-data.service"));
         assert_eq!(service_for_binary("dtfs-fuse"), Some("dtfs-fuse@*"));
         assert_eq!(service_for_binary("dtfs-cli"), None);
+    }
+
+    #[test]
+    fn release_source_gitlab_encodes_the_project_path() {
+        assert_eq!(
+            release_source("https://github.com/lischetzke/dtfs"),
+            Some(ReleaseSource::GitLab {
+                api: "https://gitlab.example.invalid/api/v4/projects/example%2Fdtfs".into()
+            })
+        );
+        // Trailing slash / .git are tolerated; nested groups encode every slash.
+        assert_eq!(
+            release_source("https://gl.example/a/b/c.git/"),
+            Some(ReleaseSource::GitLab { api: "https://gl.example/api/v4/projects/a%2Fb%2Fc".into() })
+        );
+        assert_eq!(
+            release_source("https://github.com/lischetzke/dtfs"),
+            Some(ReleaseSource::GitHub { owner: "lischetzke".into(), repo: "dtfs".into() })
+        );
+        assert_eq!(release_source("https://gl.example"), None);
+        assert_eq!(release_source("not a url"), None);
+    }
+
+    #[test]
+    fn gitlab_urls_follow_the_pipeline_layout() {
+        let api = "https://gl.example/api/v4/projects/example%2Fdtfs";
+        assert_eq!(
+            gitlab_tarball_url(api, "v0.2.0"),
+            "https://gl.example/api/v4/projects/example%2Fdtfs/packages/generic/dtfs/v0.2.0/dtfs-linux-amd64.tar.gz"
+        );
+        assert_eq!(gitlab_releases_url(api), format!("{api}/releases?per_page=50"));
+    }
+
+    #[test]
+    fn token_header_picks_deploy_vs_private() {
+        assert_eq!(token_header("gldt-abc"), "DEPLOY-TOKEN: gldt-abc");
+        assert_eq!(token_header("glpat-abc"), "PRIVATE-TOKEN: glpat-abc");
+        assert_eq!(token_header("legacy"), "PRIVATE-TOKEN: legacy");
+    }
+
+    #[test]
+    fn latest_release_skips_alphas_unless_asked() {
+        let json = r#"[
+            {"tag_name": "v0.2.0_202609141200", "released_at": "2026-09-14T12:00:00Z"},
+            {"tag_name": "v0.2.0", "released_at": "2026-09-13T10:00:00Z"},
+            {"tag_name": "v0.1.9", "released_at": "2026-09-01T10:00:00Z"}
+        ]"#;
+        assert_eq!(
+            pick_latest_release(json, false),
+            Some(("v0.2.0".into(), "2026-09-13T10:00:00Z".into()))
+        );
+        assert_eq!(
+            pick_latest_release(json, true),
+            Some(("v0.2.0_202609141200".into(), "2026-09-14T12:00:00Z".into()))
+        );
+        assert_eq!(pick_latest_release("[]", false), None);
+        assert!(is_full_release_tag("v1.2.3"));
+        assert!(!is_full_release_tag("v1.2.3_202609141200"));
+        assert!(!is_full_release_tag("1.2.3"));
+    }
+
+    #[test]
+    fn token_precedence_flag_env_config() {
+        assert_eq!(resolve_token(Some("f"), Some("e"), Some("c")).as_deref(), Some("f"));
+        assert_eq!(resolve_token(None, Some("e"), Some("c")).as_deref(), Some("e"));
+        assert_eq!(resolve_token(None, None, Some("c")).as_deref(), Some("c"));
+        assert_eq!(resolve_token(Some(""), Some(""), Some("")), None);
+        assert_eq!(resolve_token(None, None, None), None);
     }
 
     #[test]

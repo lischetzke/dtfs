@@ -294,13 +294,25 @@ fn default_memory_sample_secs() -> u64 {
 /// intentionally NOT a field on the manager/data/fuse config structs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdaterConfig {
-    /// GitHub repo base URL releases are fetched from. The download URL
-    /// is `<repo_url>/releases/{latest/download,download/<tag>}/dtfs-linux-amd64.tar.gz`.
+    /// Repo base URL releases are fetched from. A GitLab project URL
+    /// (`https://<host>/<group>/<project>`, the default) resolves to the
+    /// Generic Package Registry
+    /// `<host>/api/v4/projects/<group>%2F<project>/packages/generic/dtfs/<tag>/dtfs-linux-amd64.tar.gz`;
+    /// a github.com URL keeps the legacy
+    /// `<repo_url>/releases/{latest/download,download/<tag>}/dtfs-linux-amd64.tar.gz`.
     #[serde(default = "default_updater_repo_url")]
     pub repo_url: String,
     /// Directory the binaries are installed into (atomic `install -m 0755`).
     #[serde(default = "default_updater_install_dir")]
     pub install_dir: String,
+    /// GitLab token for a private project: a deploy token (`gldt-...`,
+    /// scope `read_package_registry`, sent as `DEPLOY-TOKEN`) or a
+    /// project/personal access token (`glpat-...`, scope `read_api`, sent
+    /// as `PRIVATE-TOKEN`). Empty = anonymous (public project / GitHub).
+    /// Overridden by `--token` and the `DTFS_REPO_TOKEN` env var. Lives
+    /// in the same 0640 file as `cluster.shared_secret`.
+    #[serde(default)]
+    pub token: String,
 }
 
 impl Default for UpdaterConfig {
@@ -308,6 +320,7 @@ impl Default for UpdaterConfig {
         Self {
             repo_url: default_updater_repo_url(),
             install_dir: default_updater_install_dir(),
+            token: String::new(),
         }
     }
 }
@@ -1600,6 +1613,15 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.repo_url, "https://github.com/acme/fork");
         assert_eq!(cfg.install_dir, "/opt/dtfs/bin");
+        assert_eq!(cfg.token, "");
+    }
+
+    #[test]
+    fn updater_config_token() {
+        let cfg: UpdaterConfig =
+            toml::from_str("token = \"gldt-example\"\n").unwrap();
+        assert_eq!(cfg.token, "gldt-example");
+        assert_eq!(cfg.repo_url, crate::REPO_URL);
     }
 
     #[test]
