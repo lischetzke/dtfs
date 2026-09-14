@@ -93,8 +93,10 @@ On the builder host:
 - `ansible-core` (the playbook uses only `ansible.builtin` modules),
   `curl`, `jq`, `git-cliff` (optional; without it the release notes fall
   back to a one-line description).
-- SSH access to every cluster host as the inventory's `ansible_user`
-  with passwordless sudo.
+- SSH access as `root` to every cluster host with the key named in the
+  inventory (`ansible_ssh_private_key_file`). Ansible runs remote tasks
+  as root directly; there is no sudo/become. Only the preflight and the
+  final health check run locally on the runner.
 - The production inventory outside the repository, in the shape of
   `deploy/ansible/inventory.example.yml`. Host names must equal each
   node's `[node].hostname` (or set `dtfs_hostname`); clients carry

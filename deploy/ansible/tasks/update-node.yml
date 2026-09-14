@@ -2,7 +2,8 @@
 # One node: install the role's binaries, restart its service, wait until it
 # is healthy again, then pause. Included from update-cluster.yml with
 # `node` (inventory host) and `role` (manager | data | client); every task
-# is delegated so the caller's ordering is preserved exactly.
+# is delegated so the caller's ordering is preserved exactly. Remote tasks
+# run as root over SSH (ansible.cfg: remote_user = root, no become).
 
 - name: "[{{ node }}] Resolve role settings"
   ansible.builtin.set_fact:
@@ -21,7 +22,6 @@
   register: mount_escaped
   changed_when: false
   delegate_to: "{{ node }}"
-  become: true
   when: role == 'client'
 
 - name: "[{{ node }}] Service name"
@@ -41,7 +41,6 @@
     backup: true
   loop: "{{ node_bins }}"
   delegate_to: "{{ node }}"
-  become: true
 
 - name: "[{{ node }}] Restart {{ node_service }}"
   ansible.builtin.systemd:
@@ -49,7 +48,6 @@
     state: restarted
     daemon_reload: true
   delegate_to: "{{ node }}"
-  become: true
 
 # --- health wait -----------------------------------------------------------
 
@@ -103,7 +101,6 @@
   changed_when: false
   failed_when: false
   delegate_to: "{{ node }}"
-  become: true
   when: role == 'client'
 
 - name: "[{{ node }}] FUSE mount present"
@@ -118,7 +115,6 @@
   changed_when: false
   failed_when: installed_stamp.stdout is not match('^' ~ node_bins[0] ~ ' ' ~ (dtfs_version | regex_escape) ~ ' ')
   delegate_to: "{{ node }}"
-  become: true
 
 - name: "[{{ node }}] Settle for {{ dtfs_restart_delay_secs }}s before the next node"
   ansible.builtin.pause:

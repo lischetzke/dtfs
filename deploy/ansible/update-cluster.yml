@@ -19,6 +19,8 @@
 #   dtfs_restart_delay_secs    pause after each node (default 30)
 #   dtfs_health_timeout_secs   per-node wait budget (default 300)
 #   dtfs_api_port              manager REST port (default 9402)
+# Remote hosts are reached as root over SSH (deploy/ansible/ansible.cfg);
+# the preflight and final check run locally on the control host.
 
 - name: Preflight — unpack the build, verify the stamp, learn the Raft roles
   hosts: localhost

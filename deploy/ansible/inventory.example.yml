@@ -17,7 +17,8 @@
 # follower voters, the Raft leader last; then data nodes; then clients.
 all:
   vars:
-    ansible_user: debian
+    # Ansible connects to every host as root over SSH (no sudo/become).
+    ansible_user: root
     ansible_ssh_private_key_file: ~/.ssh/dtfs-deploy/id_ed25519
   children:
     managers:
