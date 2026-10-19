@@ -145,6 +145,8 @@ One line per file. Bug/task history per row: `docs/src/internals/invariants.md` 
 
 Reproduce/locate → failing test in the purest layer (pure helper > state-machine apply > manager aggregator > FUSE helper) → smallest fix → `cargo test -p <crate> --release` in Docker (§ A.4), full workspace suite for cross-crate changes → commit to `master`. Branch only for a wire/on-disk format change (`proto/*.proto`, `ClientRequest`, `apply_request`, `#[serde]`-persisted structs) or work that spans sessions. PR only when a release-note line is wanted (`bug:`/`feat:` subjects).
 
+Model split (hard requirement): analysis, planning and verification stay with the session's selected model; all implementation/coding goes to a subagent at `model: sonnet`, `effort: medium` (`dtfs-implementer`, or `cavecrew-builder` for a 1-2 file edit). The main session writes the task spec, then verifies the diff and the Docker test results; it does not edit source itself.
+
 ## B.2 Plans
 
 The session todo list is the only planning tool; there is no plans directory and no plan file format. Work that must outlive a session is carried by what already persists: the commit body (what changed, why, what is still open), `docs/src/internals/invariants.md` § A.8 for behaviour and bug history, and the final chat report for deferred findings (file:line, numbers, fix direction). If the user wants a written plan, they ask for one.
