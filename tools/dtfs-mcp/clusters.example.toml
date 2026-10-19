@@ -1,0 +1,17 @@
+# Copy to %USERPROFILE%\.dtfs\clusters.toml (or point DTFS_MCP_CONFIG at it).
+# Never commit the real file. Put the secret in an env var if you can.
+default_cluster = "prod"
+
+[clusters.prod]
+managers          = ["mgr01:9402", "mgr02:9402", "mgr03:9402"]
+shared_secret     = ""                  # [cluster].shared_secret, or:
+shared_secret_env = "DTFS_LM_SECRET"
+ssh_user          = "root"
+ssh_key           = "~/.ssh/dtfs-deploy/id_ed25519"
+ssh_port          = 22
+
+[[clusters.prod.hosts]]
+name        = "toro-plex"               # node hostname as shown by /api/v1/nodes
+address     = "100.64.0.4"              # what ssh connects to (Tailscale IP or DNS name)
+roles       = ["manager", "data", "client"]
+mount_point = "/mnt/dtfs"               # optional, default /mnt/dtfs

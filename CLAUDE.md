@@ -132,6 +132,8 @@ One line per file. Bug/task history per row: `docs/src/internals/invariants.md` 
 | `dtfs-cli/src/main.rs` | REST client (clap), full webui parity; mutations print server error body, exit non-zero. List: `docs/src/api-reference/cli-reference.md` |
 | `dtfs-cli/src/updater.rs` | `dtfs-cli update`: GitLab package registry (default, deploy/access token) or GitHub releases; `latest` = newest full `vX.Y.Z`; verify, atomic install, restart |
 | `scripts/dtfs-release.sh` | Release builder; stamps version, assembles tarball + SHA256SUMS + git-cliff notes |
+| `tools/dtfs-mcp/dtfs_mcp.py` | Live-cluster diagnostics MCP server (uv, stdio): REST read tools, allowlisted SSH read templates, gated `op_*` (dry-run unless `confirm=true`); config outside repo (`~/.dtfs/clusters.toml`); tests `uv run --with pytest --with "mcp<2" --with httpx pytest tools/dtfs-mcp`; setup `docs/src/operations/diagnostics-mcp.md` |
+| `.claude/skills/dtfs-diagnose/SKILL.md` | Incident runbook for the dtfs MCP tools: symptom to tool sequences, ops need user confirmation, never touch the LELI anchor |
 | `.gitlab-ci.yml` + `scripts/ci/{version,gitlab-release}.sh` | Pipeline: keyword gate on commit subject, version resolution, package upload + GitLab release |
 | `deploy/ansible/update-cluster.yml` + `tasks/update-node.yml` | Rolling cluster update used by pipeline deploy stage; order from live Raft state, per-node health wait + delay |
 | `scripts/dtfs-cluster-healthcheck.sh` | Read-only post-deploy gate: leader agreement, status ok, all data nodes healthy, version stamps |
@@ -171,7 +173,7 @@ Observe fail → implement → observe pass → crate suite. New durability/anch
 
 ## B.5 Where things live
 
-`docs/src/` (archaeology: `docs/src/internals/invariants.md`) · `crates/<crate>/src/` · `proto/` · `tests/release/` + `tests/proxmox/` (dormant) · `scripts/` · `deploy/examples/*.toml` · `.claude/{agents,rules,hooks}/`. No root status files, no loose `.md` under `crates/`/`tests/`, no in-repo changelog. Config-surface sync (`.claude/rules/config-surface.md`): `dtfs-common/src/config.rs` changes update examples + docs together.
+`docs/src/` (archaeology: `docs/src/internals/invariants.md`) · `crates/<crate>/src/` · `proto/` · `tests/release/` + `tests/proxmox/` (dormant) · `scripts/` · `tools/` (host-side Python tooling, e.g. `tools/dtfs-mcp`; not part of the Docker cargo loop) · `deploy/examples/*.toml` · `.claude/{agents,rules,hooks}/`. No root status files, no loose `.md` under `crates/`/`tests/`, no in-repo changelog. Config-surface sync (`.claude/rules/config-surface.md`): `dtfs-common/src/config.rs` changes update examples + docs together.
 
 ## B.6 Updating this file
 

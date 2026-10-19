@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "dtfs": {
+      "command": "uv",
+      "args": ["run", "--script", "tools/dtfs-mcp/dtfs_mcp.py"]
+    }
+  }
+}

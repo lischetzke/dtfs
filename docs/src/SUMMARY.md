@@ -38,6 +38,7 @@
 - [Time Synchronisation](./operations/time-sync.md)
 - [Failure Scenarios](./operations/failure-scenarios.md)
 - [Troubleshooting](./operations/troubleshooting.md)
+- [Live Diagnostics (MCP)](./operations/diagnostics-mcp.md)
 
 # Storage
 

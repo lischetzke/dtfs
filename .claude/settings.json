@@ -1,4 +1,19 @@
 {
+  "permissions": {
+    "allow": [
+      "mcp__dtfs__cluster_overview",
+      "mcp__dtfs__rest_get",
+      "mcp__dtfs__audit_merged",
+      "mcp__dtfs__metrics",
+      "mcp__dtfs__host_logs",
+      "mcp__dtfs__host_status",
+      "mcp__dtfs__host_disks",
+      "mcp__dtfs__host_smart",
+      "mcp__dtfs__host_config",
+      "mcp__dtfs__host_chunk",
+      "mcp__dtfs__host_net"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
