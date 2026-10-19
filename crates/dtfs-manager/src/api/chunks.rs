@@ -3,7 +3,7 @@
 #![allow(unused_imports)]
 
 use super::*;
-use crate::placement_state::{for_each_chunk_placement, ChunkPlacementView, PlacementState};
+use crate::placement_state::{for_each_chunk_placement, placement_for_file,ChunkPlacementView, PlacementState};
 
 const DEFAULT_LIMIT: usize = 200;
 const MAX_LIMIT: usize = 5000;
@@ -139,11 +139,21 @@ pub(super) fn chunk_lookup_json(
     // Placement state comes from the first referencing logical chunk;
     // all references share the volume goal in practice.
     let mut placement: Option<(&'static str, bool)> = None;
-    for_each_chunk_placement(sm, |v| {
-        if placement.is_none() && v.chunk_id.to_ascii_lowercase() == wanted {
-            placement = Some((state_name(v.state), v.dangling));
-        }
-    });
+    if let Some((path, f)) = files
+        .first()
+        .and_then(|f| f["path"].as_str())
+        .and_then(|p| sm.files.get_key_value(p))
+    {
+        let first_idx = files[0]["chunk_index"].as_u64();
+        placement_for_file(sm, path.as_str(), f, |v| {
+            if placement.is_none()
+                && Some(v.chunk_index) == first_idx
+                && v.chunk_id.to_ascii_lowercase() == wanted
+            {
+                placement = Some((state_name(v.state), v.dangling));
+            }
+        });
+    }
     let (state, dangling) = placement.unwrap_or(("missing", false));
     Ok(Some(json!({
         "chunk_id": wanted,

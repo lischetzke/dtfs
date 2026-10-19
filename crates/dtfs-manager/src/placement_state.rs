@@ -147,8 +147,21 @@ pub fn for_each_chunk_placement<'a>(
     mut visit: impl FnMut(ChunkPlacementView<'a>),
 ) {
     for (path, file_meta) in sm.files.iter() {
+        placement_for_file(sm, path.as_str(), file_meta, &mut visit);
+    }
+}
+
+/// Classify the logical chunks of a single file (skips directories and
+/// symlinks). Per-file body of `for_each_chunk_placement`.
+pub fn placement_for_file<'a>(
+    sm: &'a StateMachineData,
+    path: &'a str,
+    file_meta: &'a dtfs_raft::state_machine::FileMetadata,
+    mut visit: impl FnMut(ChunkPlacementView<'a>),
+) {
+    {
         if file_meta.is_directory || file_meta.symlink_target.is_some() {
-            continue;
+            return;
         }
         let volume = sm.volumes.get(&file_meta.volume_id);
         let mandatory = volume
@@ -181,7 +194,7 @@ pub fn for_each_chunk_placement<'a>(
             let state = classify_chunk(&resolved, &mandatory, anchor.as_ref(), allowance);
             let chunk_id = rows.first().map(|r| r.chunk_hash.as_str()).unwrap_or("");
             visit(ChunkPlacementView {
-                path: path.as_str(),
+                path,
                 volume_id: file_meta.volume_id.as_str(),
                 chunk_index: idx,
                 chunk_id,
