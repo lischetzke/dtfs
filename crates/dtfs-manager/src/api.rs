@@ -40,6 +40,7 @@ use crate::scheduler::TaskScheduler;
 use crate::webui;
 
 mod audit;
+mod chunks;
 mod cluster;
 mod config;
 mod files;
@@ -47,6 +48,7 @@ mod nodes;
 mod raft;
 mod volumes;
 pub(crate) use audit::*;
+pub(crate) use chunks::*;
 pub(crate) use cluster::*;
 pub(crate) use config::*;
 pub(crate) use files::*;
@@ -73,6 +75,8 @@ pub struct AppState {
     /// state-machine state) because rate is per-manager, not a cluster
     /// invariant.
     pub io_rate: Arc<parking_lot::RwLock<IoRateTracker>>,
+    /// Manager-local memory budget surfaced by `GET /api/v1/memory`.
+    pub memory: Option<Arc<dtfs_common::memory::MemoryBudget>>,
 }
 
 /// Bug AL — per-node cumulative-byte snapshots, used to derive a rolling
@@ -207,6 +211,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/config/effective", get(get_config_effective))
         // Stats (aggregate cluster metrics for WebUI home page)
         .route("/api/v1/stats", get(get_stats))
+        // Read-only diagnostics: chunk placement listing/lookup + the
+        // manager-local memory ladder state.
+        .route("/api/v1/chunks", get(list_chunks))
+        .route("/api/v1/chunks/{chunk_id}", get(get_chunk))
+        .route("/api/v1/memory", get(get_memory))
         // HMAC join (phase 1: challenge, phase 2: Raft register)
         .route("/api/v1/join/request", post(join_request_api))
         .route("/api/v1/join/complete", post(join_complete_api))
@@ -230,6 +239,7 @@ pub async fn run_api_server(
     audit_log: Arc<AuditLog>,
     join: Arc<JoinHandler>,
     scheduler: Arc<TaskScheduler>,
+    memory: Option<Arc<dtfs_common::memory::MemoryBudget>>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
@@ -243,6 +253,7 @@ pub async fn run_api_server(
         // first /api/v1/stats hit returns (0, 0) then subsequent calls
         // produce real bytes/sec deltas.
         io_rate: Arc::new(parking_lot::RwLock::new(IoRateTracker::default())),
+        memory,
     });
 
     let app = build_router(state);

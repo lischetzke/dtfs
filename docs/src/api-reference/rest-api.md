@@ -574,6 +574,35 @@ membership-change procedures these fields support.
 | `learners` | Array | Node ids that replicate state but do not vote |
 | `membership` | Array | One entry per member: `node_id`, `hostname`, `addr`, `is_voter` (the openraft `membership_config` projected to JSON) |
 | `millis_since_quorum_ack` | Integer / null | Milliseconds since the leader last confirmed quorum (leader only) |
+| `replication` | Array / null | Leader only (`null` elsewhere): one `{node_id, matched_index, lag}` per peer; `matched_index` is `null` until the peer acks anything, `lag = last_log_index - matched_index` |
+
+### GET /api/v1/chunks
+
+Read-only chunk placement listing (diagnostics). Query: `state=missing|undergoal|misplaced|overgoal|pending_deletion`
+(omit for all chunks; anything else is `400`) and `limit` (default 200, clamped to 1..5000).
+`pending_deletion` selects chunks that carry a dangling replica row.
+
+```json
+{ "total": 2, "limit": 200, "truncated": false,
+  "chunks": [ { "chunk_id": "ab12...", "path": "/media/a.mkv", "volume_id": "default",
+                "chunk_index": 0, "state": "undergoal",
+                "replicas": [ { "node_id": "1", "disk_id": 0, "tier": "warm",
+                                "datacenter": "toro", "node_health": "healthy",
+                                "disk_status": "healthy" } ] } ] }
+```
+
+`total` counts all matches before truncation. Replica fields are `null` when the node or disk is no longer registered.
+
+### GET /api/v1/chunks/{chunk_id}
+
+Looks up one chunk id (hex, case-insensitive; `400` otherwise, `404` if no file references it). Returns
+`{chunk_id, state, pending_deletion, files:[{path, chunk_index}], replicas:[...same shape as above]}`.
+
+### GET /api/v1/memory
+
+Manager-local memory budget: `{configured, hard_cap_bytes, last_rss_bytes, pressure_level ("Normal"|"Warn"|"Shed"),
+is_shedding, warn_threshold_bytes, shed_threshold_bytes, sample_interval_secs}`, or `{"configured": false}` when
+no budget is wired. `configured` is `false` as well when `hard_cap_mb = 0` (the other fields are still present).
 
 ### POST /api/v1/raft/add-learner
 

@@ -1692,3 +1692,121 @@ mod cnf1_stable_disk_id_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod chunks_diag_tests {
+    use super::chunks::{chunk_lookup_json, chunks_list_json, memory_json};
+    use super::raft::replication_json;
+    use crate::placement_state::test_fixture::mixed_fixture;
+    use serde_json::json;
+
+    #[test]
+    fn list_filters_by_state_with_total() {
+        let sm = mixed_fixture();
+        let v = chunks_list_json(&sm, Some("undergoal"), None).unwrap();
+        assert_eq!(v["total"], json!(2));
+        let ids: Vec<&str> = v["chunks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["chunk_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"aa02") && ids.contains(&"aa04"), "{ids:?}");
+        let m = chunks_list_json(&sm, Some("missing"), None).unwrap();
+        assert_eq!(m["total"], json!(1));
+        assert_eq!(m["chunks"][0]["path"], json!("/missing.bin"));
+        // Dangling row to unknown node -> nulls, not a panic.
+        assert_eq!(m["chunks"][0]["replicas"][0]["node_health"], json!(null));
+    }
+
+    #[test]
+    fn list_pending_deletion_and_replica_shape() {
+        let sm = mixed_fixture();
+        let v = chunks_list_json(&sm, Some("pending_deletion"), None).unwrap();
+        assert_eq!(v["total"], json!(2));
+        let under = v["chunks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["chunk_id"] == json!("aa02"))
+            .unwrap();
+        let reps = under["replicas"].as_array().unwrap();
+        assert_eq!(reps.len(), 2);
+        let down = reps.iter().find(|r| r["node_id"] == json!("2")).unwrap();
+        assert_eq!(down["node_health"], json!("down"));
+        assert_eq!(down["tier"], json!("cold"));
+        assert_eq!(down["datacenter"], json!("dc3"));
+        assert_eq!(down["disk_status"], json!("healthy"));
+    }
+
+    #[test]
+    fn list_limit_truncates_but_total_is_full() {
+        let sm = mixed_fixture();
+        let v = chunks_list_json(&sm, None, Some(2)).unwrap();
+        assert_eq!(v["total"], json!(5));
+        assert_eq!(v["chunks"].as_array().unwrap().len(), 2);
+        assert_eq!(v["truncated"], json!(true));
+        // limit above the cap is clamped, 0 is raised to 1.
+        assert_eq!(chunks_list_json(&sm, None, Some(1_000_000)).unwrap()["limit"], json!(5000));
+        assert_eq!(chunks_list_json(&sm, None, Some(0)).unwrap()["limit"], json!(1));
+    }
+
+    #[test]
+    fn list_bad_state_is_error() {
+        let sm = mixed_fixture();
+        assert!(chunks_list_json(&sm, Some("stable-ish"), None).is_err());
+    }
+
+    #[test]
+    fn lookup_hit_miss_and_bad_id() {
+        let sm = mixed_fixture();
+        // aa01 is shared by /stable.bin idx0 and /multi.bin idx0.
+        let hit = chunk_lookup_json(&sm, "AA01").unwrap().unwrap();
+        assert_eq!(hit["chunk_id"], json!("aa01"));
+        assert_eq!(hit["state"], json!("stable"));
+        let files = hit["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(hit["replicas"].as_array().unwrap().len(), 2, "deduped by (node,disk)");
+        let under = chunk_lookup_json(&sm, "aa02").unwrap().unwrap();
+        assert_eq!(under["state"], json!("undergoal"));
+        assert_eq!(under["pending_deletion"], json!(true));
+        assert!(chunk_lookup_json(&sm, "ffff").unwrap().is_none());
+        assert!(chunk_lookup_json(&sm, "zz").is_err());
+        assert!(chunk_lookup_json(&sm, "").is_err());
+        assert!(chunk_lookup_json(&sm, "../etc").is_err());
+    }
+
+    #[test]
+    fn memory_with_and_without_budget() {
+        assert_eq!(memory_json(None), json!({ "configured": false }));
+        let cfg = dtfs_common::config::MemoryConfig {
+            hard_cap_mb: 100,
+            warn_threshold_pct: 80,
+            shed_threshold_pct: 90,
+            sample_interval_secs: 5,
+        };
+        let b = dtfs_common::memory::MemoryBudget::from_config(&cfg);
+        b.record_sample(85 * 1024 * 1024);
+        let v = memory_json(Some(&b));
+        assert_eq!(v["configured"], json!(true));
+        assert_eq!(v["hard_cap_bytes"], json!(100u64 * 1024 * 1024));
+        assert_eq!(v["last_rss_bytes"], json!(85u64 * 1024 * 1024));
+        assert_eq!(v["pressure_level"], json!("Warn"));
+        assert_eq!(v["warn_threshold_bytes"], json!(80u64 * 1024 * 1024));
+        assert_eq!(v["shed_threshold_bytes"], json!(90u64 * 1024 * 1024));
+        assert_eq!(v["sample_interval_secs"], json!(5));
+    }
+
+    #[test]
+    fn replication_null_when_not_leader_and_lag_on_leader() {
+        // No non-leader raft fixture exists; the handler maps
+        // `metrics.replication == None` (follower) onto this helper.
+        assert_eq!(replication_json(None, 10), json!(null));
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(7u64, Some(8u64));
+        m.insert(9u64, None);
+        let v = replication_json(Some(m), 10);
+        assert_eq!(v[0], json!({"node_id": "7", "matched_index": 8, "lag": 2}));
+        assert_eq!(v[1], json!({"node_id": "9", "matched_index": null, "lag": 10}));
+    }
+}

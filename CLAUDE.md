@@ -113,6 +113,7 @@ One line per file. Bug/task history per row: `docs/src/internals/invariants.md` 
 | `dtfs-manager/src/metadata.rs` | ManagerService gRPC over `raft_write`; follower writes forward with HMAC + `forwardable()` allow-list; ack floor clamped to tier's RF; placement from file's own volume; heartbeat whose liveness write can't commit fails RPC (NOT_FOUND = re-register); `GetFileLocations` drops non-live replicas unless none live |
 | `dtfs-data/src/main.rs::manager_lifecycle` | Register + 5 s heartbeat loop; walks manager list after 3 failures, re-registers on NOT_FOUND; startup chunk rescan runs in background after WAL replay so server binds immediately |
 | `dtfs-manager/src/api.rs` + `api/{raft,cluster,nodes,files,volumes,audit,config}.rs` | REST router + AppState in api.rs; handlers by resource in submodules (each `use super::*`, re-exported `pub(crate)`); LIS-18 auth; decommission refuses while replicas remain |
+| `dtfs-manager/src/api/chunks.rs` | Read-only `GET /api/v1/chunks[?state=]`, `/chunks/{id}`, `/memory` over `placement_state::for_each_chunk_placement`; pure `*_json` cores are unit-tested |
 | `dtfs-manager/src/rest_auth.rs` | LIS-18 mutation-auth check + axum middleware |
 | `dtfs-manager/src/membership.rs` | Online raft membership validation |
 | `dtfs-manager/src/join.rs` | Two-phase data-node join (HMAC handshake); node_id derived server-side |

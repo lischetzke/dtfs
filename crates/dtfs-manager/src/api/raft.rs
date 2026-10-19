@@ -109,7 +109,39 @@ pub(super) async fn raft_state(State(state): State<Arc<AppState>>) -> Json<Value
         "millis_since_quorum_ack": metrics.last_quorum_acked
             .as_ref()
             .map(|t| t.elapsed().as_millis() as u64),
+        // Additive: per-peer replication progress, leader only (null else).
+        "replication": replication_json(
+            metrics.replication.as_ref().map(|r| {
+                r.iter()
+                    .map(|(id, lid)| (*id, lid.as_ref().map(|l| l.index)))
+                    .collect::<std::collections::BTreeMap<u64, Option<u64>>>()
+            }),
+            last_log_index,
+        ),
     }))
+}
+
+/// Leader replication progress as `[{node_id, matched_index, lag}]`, or
+/// `null` when this node is not the leader. `matched_index` is null when a
+/// peer has acknowledged nothing yet (lag then counts from 0).
+pub(super) fn replication_json(
+    matched: Option<std::collections::BTreeMap<u64, Option<u64>>>,
+    last_log_index: u64,
+) -> Value {
+    match matched {
+        None => Value::Null,
+        Some(m) => Value::Array(
+            m.into_iter()
+                .map(|(id, idx)| {
+                    json!({
+                        "node_id": id.to_string(),
+                        "matched_index": idx,
+                        "lag": last_log_index.saturating_sub(idx.unwrap_or(0)),
+                    })
+                })
+                .collect(),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------

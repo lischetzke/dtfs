@@ -551,6 +551,7 @@ async fn main() -> anyhow::Result<()> {
         audit_log.clone(),
         join_handler.clone(),
         task_scheduler.clone(),
+        Some(memory_budget.clone()),
         async move { api_shutdown.wait_for_shutdown().await },
     ));
 

@@ -249,6 +249,14 @@ impl MemoryBudget {
     pub fn hard_cap_bytes(&self) -> u64 {
         self.hard_cap_bytes
     }
+
+    pub fn warn_threshold_bytes(&self) -> u64 {
+        self.warn_threshold_bytes
+    }
+
+    pub fn shed_threshold_bytes(&self) -> u64 {
+        self.shed_threshold_bytes
+    }
 }
 
 // ---------------------------------------------------------------------------
