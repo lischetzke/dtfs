@@ -72,6 +72,31 @@ fn map_read_status(status: tonic::Status, node: &str, chunk_id: &str) -> anyhow:
     }
 }
 
+/// Client-side end-to-end check: the chunk id is the BLAKE3 of its bytes,
+/// so a stream whose digest differs is corrupt (bad node, bit-rot, MITM)
+/// and becomes an [`IntegrityFaultError`]. Ids that are not 64-hex cannot
+/// be verified and pass.
+fn verify_chunk_digest(chunk_id: &str, digest: [u8; 32], node: &str) -> Result<()> {
+    let Ok(expected) = dtfs_common::types::ChunkId::from_hex(chunk_id) else {
+        return Ok(());
+    };
+    if expected == dtfs_common::types::ChunkId::from_bytes(digest) {
+        return Ok(());
+    }
+    let actual = dtfs_common::types::ChunkId::from_bytes(digest).as_hex();
+    tracing::warn!(
+        chunk_id,
+        node,
+        actual = %actual,
+        "integrity fault: streamed chunk bytes do not hash to chunk id; failing over"
+    );
+    Err(anyhow::Error::new(IntegrityFaultError {
+        chunk_id: chunk_id.to_string(),
+        node: node.to_string(),
+        detail: format!("client-side blake3 mismatch (got {actual})"),
+    }))
+}
+
 /// Bug G — retry policy for `RESOURCE_EXHAUSTED` from put_chunk. The
 /// data node returns this status while its memory budget is in the
 /// "shedding" state. Client backs off exponentially and retries — this
@@ -145,6 +170,35 @@ pub(crate) fn is_retryable(code: tonic::Code, idempotent: bool) -> bool {
         tonic::Code::DeadlineExceeded | tonic::Code::Unknown => idempotent,
         _ => false,
     }
+}
+
+/// An `Unavailable` that carries a transport source (reset, broken pipe,
+/// h2 GOAWAY) may have fired after the request was sent and applied.
+/// Only a status the server itself returned (no source) or a failure in
+/// the connect phase is known to precede the apply.
+fn unavailable_before_send(status: &tonic::Status) -> bool {
+    use std::error::Error;
+    let mut cur = status.source();
+    if cur.is_none() {
+        return true;
+    }
+    while let Some(e) = cur {
+        let s = e.to_string();
+        if s.contains("connect error") || s.contains("dns error") {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
+}
+
+/// Full retry decision for a failed manager RPC: code class plus, for
+/// non-idempotent mutations, proof the request was not sent.
+pub(crate) fn should_retry_status(status: &tonic::Status, idempotent: bool) -> bool {
+    is_retryable(status.code(), idempotent)
+        && (idempotent
+            || status.code() != tonic::Code::Unavailable
+            || unavailable_before_send(status))
 }
 
 /// Inner shared state for the client, wrapped in Arc for cheap cloning.
@@ -616,6 +670,7 @@ impl DtfsClient {
         // avoid repeated Vec re-allocations for large chunks (fix for F-011).
         let mut data: Vec<u8> = Vec::new();
         let mut total_hint = 0u64;
+        let mut hasher = dtfs_common::checksum::IncrementalHasher::new();
 
         loop {
             match stream.message().await {
@@ -624,6 +679,7 @@ impl DtfsClient {
                         total_hint = piece.total_size;
                         data.reserve(piece.total_size as usize);
                     }
+                    hasher.update(&piece.data);
                     data.extend_from_slice(&piece.data);
                 }
                 Ok(None) => break,
@@ -634,6 +690,7 @@ impl DtfsClient {
             }
         }
 
+        verify_chunk_digest(chunk_id, hasher.finalize(), node_addr)?;
         debug!(
             chunk_id,
             size = data.len(),
@@ -911,7 +968,7 @@ impl DtfsClient {
                     Ok(v) => return Ok(v),
                     Err(status) => {
                         let code = status.code();
-                        if is_retryable(code, idempotent) {
+                        if should_retry_status(&status, idempotent) {
                             tracing::warn!(
                                 rpc = op_name,
                                 code = ?code,
@@ -1359,6 +1416,21 @@ mod bug_bc9_integrity_fault_tests {
         assert_eq!(fault.chunk_id, "chunk-abc");
     }
 
+    #[test]
+    fn verify_chunk_digest_accepts_match_rejects_mismatch() {
+        let data = b"hello chunk";
+        let digest = dtfs_common::checksum::compute(data);
+        let id = dtfs_common::types::ChunkId::from_bytes(digest).as_hex();
+        assert!(verify_chunk_digest(&id, digest, "n:1").is_ok());
+        let bad = dtfs_common::checksum::compute(b"tampered");
+        let e = verify_chunk_digest(&id, bad, "n:1").unwrap_err();
+        let f = e.downcast_ref::<IntegrityFaultError>().expect("typed fault");
+        assert_eq!(f.chunk_id, id);
+        assert_eq!(f.node, "n:1");
+        // non-hex ids cannot be verified and pass
+        assert!(verify_chunk_digest("chunk-abc", bad, "n:1").is_ok());
+    }
+
     /// A transport error must NOT be tagged as an integrity fault.
     #[test]
     fn transport_status_is_not_an_integrity_fault() {
@@ -1474,6 +1546,36 @@ mod bug_cf_manager_walk_retry_tests {
             manager_walk_retry_backoff(9, e),
             Some(Duration::from_millis(2000))
         );
+    }
+
+    #[derive(Debug)]
+    struct Src(&'static str);
+    impl std::fmt::Display for Src {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Src {}
+
+    fn unavailable_with(src: &'static str) -> tonic::Status {
+        let mut s = tonic::Status::unavailable("transport error");
+        s.set_source(Arc::new(Src(src)));
+        s
+    }
+
+    #[test]
+    fn non_idempotent_unavailable_retries_only_before_send() {
+        // Server-returned Unavailable (no transport source): safe.
+        let server = tonic::Status::unavailable("no leader");
+        assert!(should_retry_status(&server, false));
+        // Connect-phase failure: request never sent.
+        assert!(should_retry_status(&unavailable_with("tcp connect error"), false));
+        // Mid-flight reset: may have been applied, mutation must not retry.
+        assert!(!should_retry_status(&unavailable_with("connection reset by peer"), false));
+        // Idempotent reads retry either way.
+        assert!(should_retry_status(&unavailable_with("connection reset by peer"), true));
+        // Other codes keep is_retryable semantics.
+        assert!(!should_retry_status(&tonic::Status::not_found("x"), true));
     }
 
     /// CO-4-18 — `DeadlineExceeded`/`Unknown` are ambiguous (may fire
