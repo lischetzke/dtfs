@@ -295,6 +295,33 @@ pub fn blank_sm_startup_allowed(sm_is_blank: bool, last_purged: Option<LogId>) -
     }
 }
 
+/// Refuse to start when the state machine is STALE relative to the log:
+/// its `last_applied` index is below the log's `last_purged` index, so the
+/// entries in between exist nowhere on this node (e.g. an old `snapshot.bin`
+/// restored next to a newer log store). openraft's own guard is skipped
+/// because `read_committed` returns `None`, and a later election win would
+/// serve a state machine missing that range. A blank SM (`None`) is covered
+/// by `blank_sm_startup_allowed`; `last_applied == last_purged` is fine.
+pub fn stale_sm_startup_allowed(
+    sm_last_applied: Option<&LogId>,
+    last_purged: Option<&LogId>,
+) -> Result<(), String> {
+    match (sm_last_applied, last_purged) {
+        (Some(applied), Some(purged)) if applied.index < purged.index => Err(format!(
+            "Raft state machine is stale: it has applied up to index {} but this node's \
+             log was already purged up to index {}, so entries {}..={} exist nowhere on \
+             this node. Refusing to start. Restore raft-sm from a recent backup, or stop \
+             this node, wipe raft-log + raft-sm and re-join it as a learner from a \
+             healthy peer.",
+            applied.index,
+            purged.index,
+            applied.index + 1,
+            purged.index
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// RAFT-5 / CR2-7-5 — `WriteOptions` with `set_sync(true)`. Every durable
 /// Raft log/meta write (append, save_vote, truncate, purge) must fsync
 /// before returning; a per-write `flush_cf` only flushes RocksDB's
@@ -785,6 +812,30 @@ mod audit_co_tests {
 
         assert!(blank_sm_startup_allowed(false, Some(purge_id)).is_ok());
         assert!(blank_sm_startup_allowed(false, None).is_ok());
+    }
+
+    fn lid(i: u64) -> LogId {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        openraft::LogId::new(leader, i)
+    }
+
+    #[test]
+    fn stale_sm_applied_below_purged_refuses_startup() {
+        let (a, p) = (lid(41), lid(42));
+        let msg = stale_sm_startup_allowed(Some(&a), Some(&p)).unwrap_err();
+        assert!(msg.contains("applied up to index 41") && msg.contains("purged up to index 42"), "{msg}");
+        assert!(msg.contains("wipe raft-log + raft-sm"), "{msg}");
+    }
+
+    #[test]
+    fn stale_sm_boundary_and_other_cases_allowed() {
+        let (eq, hi) = (lid(42), lid(43));
+        assert!(stale_sm_startup_allowed(Some(&eq), Some(&eq)).is_ok(), "applied == purged");
+        assert!(stale_sm_startup_allowed(Some(&hi), Some(&eq)).is_ok(), "applied == purged + 1");
+        assert!(stale_sm_startup_allowed(Some(&eq), None).is_ok());
+        assert!(stale_sm_startup_allowed(None, None).is_ok());
+        assert!(stale_sm_startup_allowed(None, Some(&eq)).is_ok(), "blank SM is the other guard's job");
     }
 
     /// CO-4-12 — `get_log_state` on a populated log returns the real last

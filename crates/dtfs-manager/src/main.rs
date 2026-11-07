@@ -145,7 +145,16 @@ async fn main() -> anyhow::Result<()> {
     // purged) is unaffected.
     let sm_is_blank = { sm_data.read().await.last_applied_log.is_none() };
     let last_purged = log_store.peek_last_purged()?;
-    if let Err(msg) = dtfs_raft::log_store::blank_sm_startup_allowed(sm_is_blank, last_purged) {
+    if let Err(msg) = dtfs_raft::log_store::blank_sm_startup_allowed(sm_is_blank, last_purged.clone()) {
+        anyhow::bail!(msg);
+    }
+    // Stale (non-blank) SM behind the purge point: same hazard, see
+    // `stale_sm_startup_allowed`.
+    let sm_last_applied = { sm_data.read().await.last_applied_log.clone() };
+    if let Err(msg) = dtfs_raft::log_store::stale_sm_startup_allowed(
+        sm_last_applied.as_ref(),
+        last_purged.as_ref(),
+    ) {
         anyhow::bail!(msg);
     }
 
