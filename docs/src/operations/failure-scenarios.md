@@ -200,9 +200,7 @@ disaster-recovery procedure documented in
 
 **FUSE syscalls block (briefly), then retry.** The shared client
 treats `Unavailable` RPC errors as transient and rotates to the next
-manager in its `manager_addrs` list via `advance_active_manager`. The
-retry layer (`crates/dtfs-client/src/retry.rs`) applies exponential
-backoff with jitter capped at the configured retry budget. Under a
+manager in its `manager_addrs` list via `advance_active_manager`. Under a
 brief network blip the FUSE caller sees a slow syscall, not an error.
 
 **Write leases survive short partitions.** A write lease has a 120 s

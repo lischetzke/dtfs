@@ -17,4 +17,3 @@ futures = { workspace = true }
 tokio-stream = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
-rand = { workspace = true }

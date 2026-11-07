@@ -4,7 +4,6 @@ pub mod crypto;
 pub mod error;
 pub mod hash_ring;
 pub mod memory;
-pub mod reconfig;
 pub mod replication;
 pub mod tls;
 pub mod topology;

@@ -2,7 +2,7 @@
 
 Cluster-wide settings are managed through the Web UI or REST API and stored in the Raft-replicated state machine. Unlike per-node TOML files, these settings are centrally managed and automatically distributed to all nodes in the cluster.
 
-All cluster-wide settings support [live reload](./live-reload.md). When a setting is changed, the manager increments the `ConfigVersion`, replicates the new configuration through Raft, and pushes it to all affected nodes.
+All cluster-wide settings support [live reload](./live-reload.md). When a setting is changed, the manager replicates the new configuration through Raft.
 
 ## Default Volume Settings
 
@@ -47,19 +47,15 @@ Controls health monitoring thresholds for data nodes.
 
 1. An administrator changes a setting via the Web UI or REST API.
 2. The leader manager proposes the change as a Raft log entry.
-3. Once committed, the new `VersionedConfig` is stored in the replicated state machine.
-4. The manager pushes the updated configuration to each affected node via gRPC.
-5. Each node calls `apply_config()` on the relevant module (see [Live Reload](./live-reload.md)).
-6. Nodes report their applied `ConfigVersion` back to the manager.
-7. The `ConfigVersionTracker` records which version each node has applied, allowing the Web UI to show rollout progress.
+3. Once committed, the new configuration is stored in the replicated state machine and read from there by the manager tasks that use it.
 
 ## REST API
 
 Cluster configuration can be read and modified through the REST API:
 
-- `GET /api/v1/config` -- Returns the current cluster-wide configuration and its version number.
-- `PUT /api/v1/config` -- Submits a partial or full configuration update. Only the fields included in the request body are changed; omitted fields retain their current values.
-- `GET /api/v1/config/version` -- Returns the current `ConfigVersion` and a map of each node's applied version.
+- `GET /api/v1/config` -- Returns the current cluster-wide configuration.
+- `POST /api/v1/config` -- Submits a partial or full configuration update. Only the fields included in the request body are changed; omitted fields retain their current values.
+- `GET /api/v1/config/effective` -- Returns the effective configuration.
 
 ## Relationship to TOML Files
 

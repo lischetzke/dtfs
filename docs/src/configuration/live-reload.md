@@ -1,6 +1,6 @@
 # Live Reload
 
-DTFS supports live configuration reload for a subset of options. Changes to these options take effect without restarting any process. This page explains which options support live reload, how the mechanism works, and how to implement the `Reconfigurable` trait for new modules.
+DTFS supports live configuration reload for a subset of options. Changes to these options take effect without restarting any process. This page explains which options support live reload, and how the mechanism works.
 
 ## Options That Support Live Reload
 
@@ -70,71 +70,17 @@ DTFS uses two mechanisms for live configuration reload, depending on where the s
 
 ### Cluster-wide Settings (via Raft)
 
-Cluster-wide settings (defaults, tiering, monitoring, and per-volume configuration) are stored in the Raft-replicated state machine as a `VersionedConfig<T>`. Each update increments a monotonic `ConfigVersion`.
+Cluster-wide settings (defaults, tiering, monitoring, and per-volume configuration) are stored in the Raft-replicated state machine.
 
 The reload flow is:
 
 1. An administrator changes a setting via the REST API or Web UI.
 2. The leader manager proposes the change as a Raft log entry.
 3. Once committed, the new configuration is stored in the state machine.
-4. The manager pushes the new configuration to affected nodes over gRPC.
-5. Each node calls `apply_config()` on the relevant module.
-6. The node reports its applied `ConfigVersion` back to the manager.
-7. The `ConfigVersionTracker` records per-node versions so operators can monitor rollout progress.
 
 ### Local Settings (via File Watch)
 
-Some local TOML settings (such as cache policy on a data node or readahead mode on a FUSE client) are reloadable by sending `SIGHUP` to the process or by editing the TOML file while file-watching is active. On receiving the signal, the process re-reads the TOML file and calls `apply_config()` on each affected module.
-
-## The `Reconfigurable` Trait
-
-Every module that supports live reload implements the `Reconfigurable` trait, defined in `dtfs-common::reconfig`:
-
-```rust
-#[async_trait]
-pub trait Reconfigurable: Send + Sync {
-    /// The specific configuration type this module uses.
-    type Config: Send + Sync;
-
-    /// Apply new configuration without restart.
-    async fn apply_config(&self, config: &Self::Config) -> Result<()>;
-
-    /// Get the current configuration.
-    async fn current_config(&self) -> Self::Config;
-}
-```
-
-### Contract
-
-- **Non-blocking**: `apply_config()` must not block the calling task. If applying the configuration requires heavy work (such as resizing a cache), that work should be spawned as a background task.
-- **Safe under load**: `apply_config()` may be called while the module is actively serving requests. Implementations must handle concurrent access, typically by using interior mutability (`RwLock`, `watch` channel, or atomic swap).
-- **Idempotent**: Applying the same configuration twice must have no adverse effect.
-- **Atomic rollback**: If `apply_config()` fails, the module must remain in its previous configuration. The error is propagated to the caller so the operator is informed.
-
-### `VersionedConfig<T>`
-
-Cluster-wide configuration is wrapped in `VersionedConfig<T>`, which pairs a `ConfigVersion` (monotonic `u64`) with the configuration payload:
-
-```rust
-pub struct VersionedConfig<T> {
-    pub version: ConfigVersion,
-    pub config: T,
-}
-```
-
-Nodes compare the incoming version against their local version to detect stale or duplicate pushes. A node only calls `apply_config()` when the incoming version is strictly greater than its current version.
-
-### `ConfigVersionTracker`
-
-The manager maintains a `ConfigVersionTracker` that records which `ConfigVersion` each node has applied:
-
-```rust
-pub struct ConfigVersionTracker {
-    pub node_versions: BTreeMap<NodeId, ConfigVersion>,
-}
-```
-
-This allows operators to query the REST API (`GET /api/v1/config/version`) to see whether all nodes have converged on the latest configuration, and which nodes are still behind.
+Some local TOML settings (such as cache policy on a data node or readahead mode on a FUSE client) are reloadable by sending `SIGHUP` to the process or by editing the TOML file while file-watching is active. On receiving the signal, the process re-reads the TOML file and applies the changed reloadable options.
 
 ## Triggering a Reload
 
@@ -148,5 +94,5 @@ There are three ways to trigger a live reload:
 
 After triggering a reload, verify that the new configuration has been applied:
 
-- **Cluster-wide**: Query `GET /api/v1/config/version` and confirm all nodes report the latest version.
+- **Cluster-wide**: Query `GET /api/v1/config/effective` on each manager.
 - **Local**: Check the process logs for a confirmation message, or query the node's status endpoint.
