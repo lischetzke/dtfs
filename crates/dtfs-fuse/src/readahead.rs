@@ -179,6 +179,12 @@ pub struct ReadAheadEngine {
     prefetch_enabled: Arc<AtomicBool>,
 }
 
+/// Whether chunk `idx` is inside the window `on_chunk_read` prefetches after
+/// reading `chunk_index`: `chunk_index+1 ..= chunk_index+n`.
+pub(crate) fn in_prefetch_window(idx: u64, chunk_index: u32, n: u32) -> bool {
+    idx > chunk_index as u64 && idx <= chunk_index as u64 + n as u64
+}
+
 /// Monotonic insertion stamp for the prefetch cache (oldest-first eviction).
 static CACHE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -306,6 +312,11 @@ impl ReadAheadEngine {
                 break; // only the fresh entry remains
             }
         }
+    }
+
+    /// Number of chunks after the one just read that `on_chunk_read` may prefetch.
+    pub fn prefetch_window(&self) -> u32 {
+        self.mode.prefetch_chunks()
     }
 
     /// Bytes currently held in the prefetch cache (Bug CE accounting).
@@ -870,6 +881,16 @@ mod tests {
             "at most four 1 MB chunks fit in a 4 MB budget, got {} entries",
             engine.cache_len()
         );
+    }
+
+    #[test]
+    fn prefetch_window_bounds() {
+        assert!(!in_prefetch_window(5, 5, 4), "current chunk is not prefetched");
+        assert!(in_prefetch_window(6, 5, 4));
+        assert!(in_prefetch_window(9, 5, 4), "last chunk of the window");
+        assert!(!in_prefetch_window(10, 5, 4), "one past the window");
+        assert!(!in_prefetch_window(2, 5, 4), "earlier chunk");
+        assert!(!in_prefetch_window(6, 5, 0), "window 0 = nothing");
     }
 
     /// Eviction drops the oldest-inserted entries first (not DashMap

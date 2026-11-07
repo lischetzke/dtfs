@@ -200,6 +200,20 @@ pub(crate) fn is_viewer_read(bytes_on_fh: u64, readahead_active: bool) -> bool {
     bytes_on_fh >= crate::local_cache::ATIME_UPDATE_MIN_BYTES as u64 || readahead_active
 }
 
+/// A local disk-cache hit goes into the readahead memory cache too, so the
+/// ~1000 following 128 KB kernel reads of the same chunk hit memory instead
+/// of re-reading and re-hashing the whole chunk from disk each time.
+fn promote_disk_hit(
+    readahead: &crate::readahead::ReadAheadEngine,
+    candidates: &[String],
+    chunk_id: &str,
+    data: &bytes::Bytes,
+) {
+    if let Some(cand) = candidates.first() {
+        readahead.insert_cached(cand, chunk_id, data.clone());
+    }
+}
+
 /// CR-6-6 (FUSE-9) — outcome of trying to claim ownership of a
 /// foreground chunk fetch. `Owner` must perform the real fetch and
 /// resolve it via `complete_foreground_fetch`; `Waiter` should await the
@@ -971,6 +985,7 @@ impl DtfsFilesystem {
                         lc.get_with_hint(&chunk.chunk_id, is_viewer).await
                     {
                         debug!(chunk_id = %chunk.chunk_id, "local-disk cache hit");
+                        promote_disk_hit(&self.readahead, &candidates, &chunk.chunk_id, &cached);
                         chunk_data = Some(cached);
                         // AV-4-1c — pick any candidate (the disk cache
                         // is content-addressed; the bytes are
@@ -1176,17 +1191,21 @@ impl DtfsFilesystem {
                 // pre-order its replicas with `read_candidates`, so the
                 // prefetch hits the same replica the foreground read
                 // would pick and caches under the key that read looks up.
+                // Only the prefetch window is built: on_chunk_read looks at
+                // no chunk beyond chunk_idx + prefetch_chunks.
+                let window = self.readahead.prefetch_window();
                 let chunk_locs: Vec<(u64, String, Vec<String>)> = locations
                     .chunks
                     .iter()
                     .enumerate()
-                    .map(|(pos, c)| {
+                    .filter_map(|(pos, c)| {
                         let idx = if indices_trusted {
                             c.chunk_index.unwrap_or(pos as u64)
                         } else {
                             pos as u64
                         };
-                        (idx, c.chunk_id.clone(), self.read_candidates(c))
+                        crate::readahead::in_prefetch_window(idx, chunk_idx as u32, window)
+                            .then(|| (idx, c.chunk_id.clone(), self.read_candidates(c)))
                     })
                     .collect();
                 self.readahead.on_chunk_read(
@@ -2860,6 +2879,25 @@ mod cr_6_6_should_notify_tests {
 mod cr2_8_3_is_viewer_read_tests {
     use super::is_viewer_read;
     use crate::local_cache::ATIME_UPDATE_MIN_BYTES;
+
+    #[test]
+    fn disk_hit_is_promoted_into_readahead_memory_cache() {
+        use crate::readahead::{ReadAheadEngine, ReadAheadMode};
+        let engine = ReadAheadEngine::new(
+            ReadAheadMode::Disabled,
+            dtfs_client::client::DtfsClient::new(),
+            60,
+            1 << 20,
+            2,
+        );
+        let data = bytes::Bytes::from_static(b"chunk bytes");
+        super::promote_disk_hit(&engine, &["n:1".to_string(), "n:2".to_string()], "cid", &data);
+        // Looked up via any candidate key; the first candidate holds it.
+        assert_eq!(engine.get_cached("n:1", "cid"), Some(data.clone()));
+        // Negative: no candidates -> nothing stored, no panic.
+        super::promote_disk_hit(&engine, &[], "other", &data);
+        assert_eq!(engine.cache_len(), 1);
+    }
 
     #[test]
     fn below_threshold_and_no_readahead_is_scanner() {
