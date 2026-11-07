@@ -132,7 +132,7 @@ it isn't obvious from the diff.
 Co-Authored-By: <model> <noreply@<vendor>.com>
 ```
 
-`<type>` is `bug`/`feat`/`int`/`docs` (release notes via `git-cliff`, `.github/cliff.toml`; `Breaking:`/`Update-required:` trailers route sections). One commit per logical change. Never `--no-verify`, never `--amend` a pushed commit, never bypass signing.
+`<type>` is `bug`/`feat`/`int`/`docs` (release notes via `git-cliff`, `.github/cliff.toml`; `Breaking:`/`Update-required:` trailers route sections). One commit per logical change. **Hard rule: `git push origin master` immediately after every commit**; local master must never lag origin (stale origin = stale agent worktrees). Never `--no-verify`, never `--amend` a pushed commit, never bypass signing.
 
 ## B.4 Tests
 

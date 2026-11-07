@@ -53,7 +53,7 @@ dtfs-manager/dtfs-data, so reformulate the edit). Pipe output through
    refactor beyond the task; note anything nearby instead.
 3. Run the full crate suite (workspace only for cross-crate or wire
    changes) before declaring done.
-4. Commit to master per CLAUDE.md § B.3 (the `Co-Authored-By:` trailer
+4. Commit to master and push per CLAUDE.md § B.3 (the `Co-Authored-By:` trailer
    the caller gave you). Never `--no-verify`, never `--amend` a pushed
    commit, never bypass signing.
 
