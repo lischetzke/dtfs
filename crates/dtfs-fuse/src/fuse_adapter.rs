@@ -189,10 +189,30 @@ struct HeldLock {
 }
 
 impl HeldLock {
+    /// Kernel lock ranges are inclusive on both ends (`end` is the last
+    /// locked byte; whole file is `end == OFFSET_MAX`).
     fn overlaps(&self, start: u64, end: u64) -> bool {
-        // ranges are inclusive of start, half-open at end (FUSE convention).
-        start < self.end && self.start < end
+        start <= self.end && self.start <= end
     }
+}
+
+/// Remove `[start, end]` (inclusive) from every lock `owner` holds,
+/// keeping the parts outside it as separate locks of the same type.
+fn carve_owner_range(posix: &mut Vec<HeldLock>, owner: u64, start: u64, end: u64) {
+    let mut kept = Vec::with_capacity(posix.len() + 1);
+    for h in posix.drain(..) {
+        if h.owner != owner || !h.overlaps(start, end) {
+            kept.push(h);
+            continue;
+        }
+        if h.start < start {
+            kept.push(HeldLock { end: start - 1, ..h.clone() });
+        }
+        if h.end > end {
+            kept.push(HeldLock { start: end + 1, ..h });
+        }
+    }
+    *posix = kept;
 }
 
 impl DtfsFuse3Adapter {
@@ -629,19 +649,7 @@ impl Filesystem for DtfsFuse3Adapter {
         if lt == libc::F_UNLCK {
             let mut guard = self.locks.lock().await;
             if let Some(t) = guard.get_mut(&inode) {
-                t.posix.retain(|h| {
-                    !(h.owner == lock_owner && h.start >= start && h.end <= end)
-                });
-                for h in t.posix.iter_mut() {
-                    if h.owner != lock_owner {
-                        continue;
-                    }
-                    if h.start < start && h.end > start && h.end <= end {
-                        h.end = start;
-                    } else if h.start >= start && h.start < end && h.end > end {
-                        h.start = end;
-                    }
-                }
+                carve_owner_range(&mut t.posix, lock_owner, start, end);
             }
             drop(guard);
             self.notify_for(inode).notify_waiters();
@@ -667,9 +675,7 @@ impl Filesystem for DtfsFuse3Adapter {
                         && (h.write || want_write)
                 });
                 if !conflict {
-                    table.posix.retain(|h| {
-                        !(h.owner == lock_owner && h.overlaps(start, end))
-                    });
+                    carve_owner_range(&mut table.posix, lock_owner, start, end);
                     table.posix.push(HeldLock {
                         owner: lock_owner,
                         start,
@@ -1474,5 +1480,66 @@ mod inode_map_rename_tests {
         assert_eq!(m.path_for(src).unwrap(), "/y");
         assert_eq!(m.inode_for("/y"), src);
         assert!(m.path_for(victim).is_err(), "replaced inode must not resolve");
+    }
+}
+
+#[cfg(test)]
+mod posix_lock_range_tests {
+    use super::*;
+
+    fn lk(owner: u64, start: u64, end: u64) -> HeldLock {
+        HeldLock { owner, start, end, write: true }
+    }
+
+    #[test]
+    fn one_byte_locks_on_same_byte_overlap_adjacent_do_not() {
+        // fcntl lock of byte 5 arrives as start=5,end=5 (inclusive).
+        let h = lk(1, 5, 5);
+        assert!(h.overlaps(5, 5), "same byte must conflict");
+        assert!(!h.overlaps(6, 6));
+        assert!(!h.overlaps(4, 4));
+        assert!(h.overlaps(0, 5));
+        assert!(h.overlaps(5, u64::MAX));
+    }
+
+    #[test]
+    fn whole_file_lock_overlaps_everything() {
+        let h = lk(1, 0, u64::MAX);
+        assert!(h.overlaps(0, 0));
+        assert!(h.overlaps(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn unlock_in_the_middle_splits_the_lock() {
+        let mut v = vec![lk(1, 0, 99), lk(2, 0, 99)];
+        carve_owner_range(&mut v, 1, 40, 59);
+        let mine: Vec<_> = v.iter().filter(|h| h.owner == 1).map(|h| (h.start, h.end)).collect();
+        assert_eq!(mine, vec![(0, 39), (60, 99)]);
+        // other owner untouched
+        assert!(v.iter().any(|h| h.owner == 2 && h.start == 0 && h.end == 99));
+    }
+
+    #[test]
+    fn unlock_whole_file_range_removes_without_overflow() {
+        let mut v = vec![lk(1, 10, 20), lk(1, 0, u64::MAX)];
+        carve_owner_range(&mut v, 1, 0, u64::MAX);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn unlock_one_byte_at_edges_keeps_the_rest() {
+        let mut v = vec![lk(1, 0, 9)];
+        carve_owner_range(&mut v, 1, 0, 0);
+        assert_eq!((v[0].start, v[0].end), (1, 9));
+        carve_owner_range(&mut v, 1, 9, 9);
+        assert_eq!((v[0].start, v[0].end), (1, 8));
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn non_overlapping_range_is_untouched() {
+        let mut v = vec![lk(1, 0, 9)];
+        carve_owner_range(&mut v, 1, 10, 20);
+        assert_eq!((v[0].start, v[0].end), (0, 9));
     }
 }
