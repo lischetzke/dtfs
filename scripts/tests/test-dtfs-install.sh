@@ -31,6 +31,10 @@ check "--help mentions --source"        bash -c "'$SCRIPT' --help 2>&1 | grep -q
 check "--help mentions --version"       bash -c "'$SCRIPT' --help 2>&1 | grep -q -- '--version <tag>'"
 check "--help mentions DTFS_REPO_URL"   bash -c "'$SCRIPT' --help 2>&1 | grep -q DTFS_REPO_URL"
 
+check "--help mentions --noninteractive" bash -c "'$SCRIPT' --help 2>&1 | grep -q -- '--noninteractive'"
+check "--help mentions --reconfigure"    bash -c "'$SCRIPT' --help 2>&1 | grep -q -- '--reconfigure'"
+check "fuse config carries shared_secret" bash -c "sed -n '/^render_fuse/,/^}/p' '$SCRIPT' | grep -q shared_secret"
+
 # 2. --source must be one of {local,github,auto}.
 check "rejects bogus --source"          bash -c "! '$SCRIPT' --source bogus 2>&1"
 

@@ -238,6 +238,33 @@ Air-gapped workflow: pre-stage the tarball at
 `/opt/dtfs/staging/<version>/dtfs-<rev>-linux-amd64.tar.gz` on each
 host, then run `dtfs-install.sh --source local`.
 
+### Re-runs, non-interactive mode, uninstall
+
+Re-running the installer upgrades binaries and restarts the service but keeps
+an existing `/etc/dtfs/<role>.toml` (and its `shared_secret`) untouched; pass
+`--reconfigure` to re-render it. The secret defaults to `DTFS_SHARED_SECRET`,
+then the existing config, then a fresh `openssl rand` / `/dev/urandom` value;
+the installer refuses to continue if no secure RNG exists.
+
+| Flag | Behaviour |
+|------|-----------|
+| `--noninteractive` | No prompts. Requires `--role` and `--managers`. Other values come from flags or defaults. |
+| `--role manager\|data\|fuse-client` | Host role. |
+| `--managers h:9401,...` `--cluster-name N` `--hostname H` `--secret S` | Config values (`--secret` also via `DTFS_SHARED_SECRET`). |
+| `--bootstrap true\|false` | Manager only; default `false` non-interactively. |
+| `--disks /a,/b` | Data role; first disk is `hot`, the rest `cold`. |
+| `--mountpoint P` | FUSE role, default `/mnt/dtfs`. |
+| `--reconfigure` | Overwrite an existing role config. |
+| `--uninstall` | Remove units and binaries; config and data stay. |
+| `--uninstall --purge --yes` | Also delete `/etc/dtfs` and `/var/lib/dtfs` (all chunks). `--purge` without `--yes` is refused. |
+
+The units run with `ProtectSystem=strict`. The installer creates
+`/var/lib/dtfs/manager` or `/var/lib/dtfs/data` (matching `data_dir`) and, for
+the data role, writes `/etc/systemd/system/dtfs-data.service.d/disks.conf`
+with `ReadWritePaths=` for every `[[disks]]` path. Disk mount points must exist
+before the data node starts. `fuse.toml` carries the shared secret and is
+installed `0640 root:root`.
+
 Regression test: `bash scripts/tests/test-dtfs-install.sh`.
 
 ## Next Steps
