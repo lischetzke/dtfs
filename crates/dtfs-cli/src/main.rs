@@ -488,6 +488,46 @@ enum RaftCmd {
     },
 }
 
+/// A bare `host:port` gets `http://`; only a real scheme is kept (a host
+/// named `httpd01:9402` must not be mistaken for a URL).
+fn base_url_for(manager_addr: &str) -> String {
+    if manager_addr.starts_with("http://") || manager_addr.starts_with("https://") {
+        manager_addr.to_string()
+    } else {
+        format!("http://{}", manager_addr)
+    }
+}
+
+/// `/api/v1/files` page request.
+fn files_page_path(limit: usize, offset: usize) -> String {
+    format!("/api/v1/files?limit={}&offset={}", limit, offset)
+}
+
+/// "showing N of M" line, only when the list is cut short.
+fn files_truncation_note(shown: usize, total: Option<u64>, truncated: bool) -> Option<String> {
+    let total = total?;
+    (truncated || (shown as u64) < total)
+        .then(|| format!("showing {} of {} (raise --limit to see more)", shown, total))
+}
+
+/// Failure summary for a flush-cache response; `None` when clean.
+fn flush_failure_summary(resp: &Value) -> Option<String> {
+    let rpc = resp["rpc_failures"].as_u64().unwrap_or(0);
+    let raft = resp["raft_failures"].as_u64().unwrap_or(0);
+    (rpc + raft > 0).then(|| {
+        format!("flush-cache incomplete: rpc_failures={} raft_failures={}", rpc, raft)
+    })
+}
+
+/// Audit list path with the action filter percent-encoded.
+fn audit_path(base: &str, limit: usize, action: Option<&str>) -> String {
+    let mut path = format!("{}?limit={}", base, limit);
+    if let Some(a) = action {
+        path.push_str(&format!("&action={}", percent_encode_query(a)));
+    }
+    path
+}
+
 struct ApiClient {
     base_url: String,
     client: reqwest::Client,
@@ -497,11 +537,7 @@ struct ApiClient {
 
 impl ApiClient {
     fn new(manager_addr: &str, shared_secret: String) -> Self {
-        let base_url = if manager_addr.starts_with("http") {
-            manager_addr.to_string()
-        } else {
-            format!("http://{}", manager_addr)
-        };
+        let base_url = base_url_for(manager_addr);
 
         Self {
             base_url,
@@ -1274,7 +1310,7 @@ async fn cmd_files_flush_cache(
         "max_tasks": max_tasks,
         "allow_empty_prefix": allow_empty_prefix,
     });
-    let resp = api.post("/api/v1/files/flush_cache", &body).await?;
+    let resp = api.post_checked("/api/v1/files/flush_cache", &body).await?;
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
         OutputFormat::Table => {
@@ -1316,6 +1352,9 @@ async fn cmd_files_flush_cache(
                 println!("  truncated (re-run): {}", truncated);
             }
         }
+    }
+    if let Some(msg) = flush_failure_summary(&resp) {
+        anyhow::bail!(msg);
     }
     Ok(())
 }
@@ -1390,13 +1429,45 @@ async fn cmd_volumes(api: &ApiClient, format: &OutputFormat) -> anyhow::Result<(
     Ok(())
 }
 
-async fn cmd_files(api: &ApiClient, format: &OutputFormat, _limit: usize) -> anyhow::Result<()> {
-    let resp = api.get("/api/v1/files").await?;
+async fn cmd_files(api: &ApiClient, format: &OutputFormat, limit: usize) -> anyhow::Result<()> {
+    // Page until `limit` files are collected or the server says it is done.
+    // An older server ignores limit/offset and returns everything with no
+    // `truncated` field: one request, cut to `limit` client-side.
+    let mut files: Vec<Value> = Vec::new();
+    let mut total: Option<u64> = None;
+    let mut truncated = false;
+    while files.len() < limit {
+        let resp = api.get(&files_page_path(limit - files.len(), files.len())).await?;
+        let page = resp["files"].as_array().cloned().unwrap_or_default();
+        total = resp["total"].as_u64().or_else(|| resp["count"].as_u64());
+        let more = resp["truncated"].as_bool();
+        let empty = page.is_empty();
+        files.extend(page);
+        match more {
+            Some(true) if !empty => continue,
+            Some(m) => {
+                truncated = m;
+                break;
+            }
+            None => break,
+        }
+    }
+    if files.len() > limit {
+        files.truncate(limit);
+        truncated = true;
+    }
+    let note = files_truncation_note(files.len(), total, truncated);
+    let resp = json!({
+        "count": files.len(),
+        "total": total,
+        "truncated": note.is_some(),
+        "files": files,
+    });
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
         OutputFormat::Table => {
             let files = resp["files"].as_array().cloned().unwrap_or_default();
-            println!("Total files: {}", resp["count"].as_u64().unwrap_or(0));
+            println!("Total files: {}", total.unwrap_or(files.len() as u64));
             if files.is_empty() {
                 return Ok(());
             }
@@ -1414,6 +1485,9 @@ async fn cmd_files(api: &ApiClient, format: &OutputFormat, _limit: usize) -> any
                     f["chunk_count"].as_u64().unwrap_or(0),
                     format_bytes(f["total_size"].as_u64().unwrap_or(0)),
                 );
+            }
+            if let Some(n) = &note {
+                println!("{}", n);
             }
         }
     }
@@ -1625,10 +1699,7 @@ async fn render_audit_entries(
     action: Option<String>,
     empty_msg: &str,
 ) -> anyhow::Result<()> {
-    let mut path = format!("{}?limit={}", base, limit);
-    if let Some(ref a) = action {
-        path.push_str(&format!("&action={}", a));
-    }
+    let path = audit_path(base, limit, action.as_deref());
 
     let entries = api.get(&path).await?;
     match format {
@@ -2291,6 +2362,24 @@ mod audit_co_tests {
             Commands::Files(FilesCmd::Inspect { path }) => assert_eq!(path, "/movies/x.mkv"),
             other => panic!("expected Commands::Files(Inspect), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_helpers_scheme_paging_flush_audit() {
+        assert_eq!(base_url_for("httpd01:9402"), "http://httpd01:9402");
+        assert_eq!(base_url_for("https://m:9402"), "https://m:9402");
+        assert_eq!(base_url_for("http://m:9402"), "http://m:9402");
+        assert_eq!(files_page_path(50, 100), "/api/v1/files?limit=50&offset=100");
+        assert_eq!(files_truncation_note(50, Some(120), true).unwrap(), "showing 50 of 120 (raise --limit to see more)");
+        assert!(files_truncation_note(120, Some(120), false).is_none());
+        assert!(files_truncation_note(5, None, false).is_none());
+        assert!(flush_failure_summary(&json!({"rpc_failures": 0, "raft_failures": 0})).is_none());
+        assert_eq!(
+            flush_failure_summary(&json!({"rpc_failures": 2, "raft_failures": 1})).unwrap(),
+            "flush-cache incomplete: rpc_failures=2 raft_failures=1"
+        );
+        assert_eq!(audit_path("/api/v1/audit", 5, Some("a&b c")), "/api/v1/audit?limit=5&action=a%26b%20c");
+        assert_eq!(audit_path("/api/v1/audit", 5, None), "/api/v1/audit?limit=5");
     }
 
     #[test]
