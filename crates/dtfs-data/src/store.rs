@@ -1246,6 +1246,18 @@ impl ChunkStore {
         disk_path: &Path,
         level: ScrubLevel,
     ) -> DtfsResult<ScrubResult> {
+        self.scrub_disk_throttled(disk_path, level, 100).await
+    }
+
+    /// `scrub_disk` that sleeps `elapsed * (100 - p) / p` after each chunk
+    /// (`max_io_percent` = p), so scrub uses about p% of the disk's time.
+    pub async fn scrub_disk_throttled(
+        &self,
+        disk_path: &Path,
+        level: ScrubLevel,
+        max_io_percent: u8,
+    ) -> DtfsResult<ScrubResult> {
+        let mut chunk_started: Option<std::time::Instant> = None;
         let chunks_dir = disk_path.join("chunks");
         let wal = wal_dir(disk_path);
         let mut result = ScrubResult {
@@ -1304,6 +1316,15 @@ impl ChunkStore {
                     }
                 };
                 for path in files {
+                    // Throttle by the previous chunk's work time (the loop
+                    // body has many `continue`s, so sleep at the next top).
+                    if let Some(t) = chunk_started.take() {
+                        let d = crate::scrub::throttle_delay(t.elapsed(), max_io_percent);
+                        if !d.is_zero() {
+                            tokio::time::sleep(d).await;
+                        }
+                    }
+                    chunk_started = Some(std::time::Instant::now());
                     // Stem of the .dat file is the chunk_id hex.
                     let chunk_hex = path
                         .file_stem()

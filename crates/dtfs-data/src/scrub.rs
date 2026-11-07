@@ -17,6 +17,41 @@ use crate::store::ChunkStore;
 /// takes effect within `DECISION_TICK_SECS`, not at next restart.
 const DECISION_TICK_SECS: u64 = 60;
 
+/// Sleep owed after `elapsed` of scrub work so scrub uses about
+/// `max_io_percent` of the disk: `elapsed * (100 - p) / p`, p clamped to
+/// 1..=100 (100 and above -> no sleep).
+pub fn throttle_delay(elapsed: std::time::Duration, max_io_percent: u8) -> std::time::Duration {
+    let p = u32::from(max_io_percent).clamp(1, 100);
+    elapsed * (100 - p) / p
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::throttle_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn full_speed_never_sleeps() {
+        assert_eq!(throttle_delay(Duration::from_millis(50), 100), Duration::ZERO);
+        assert_eq!(throttle_delay(Duration::from_millis(50), 200), Duration::ZERO);
+    }
+
+    #[test]
+    fn ten_percent_sleeps_nine_times_work() {
+        assert_eq!(throttle_delay(Duration::from_millis(100), 10), Duration::from_millis(900));
+    }
+
+    #[test]
+    fn zero_clamps_to_one_percent() {
+        assert_eq!(throttle_delay(Duration::from_millis(10), 0), Duration::from_millis(990));
+    }
+
+    #[test]
+    fn fifty_percent_sleeps_equal_work() {
+        assert_eq!(throttle_delay(Duration::from_millis(40), 50), Duration::from_millis(40));
+    }
+}
+
 /// CF-8 — staleness window for manual scrub requests. The manager
 /// re-sends the latest `ScrubRequestNow` on every heartbeat forever
 /// (it is replaced, never cleared); per-process id dedupe handles the
@@ -159,16 +194,10 @@ impl ScrubScheduler {
         let disks = self.store.disk_paths();
 
         for disk_path in &disks {
-            // Throttle I/O between disks based on max_io_percent.
-            // A simple approach: if max_io_percent is 10%, sleep 90% of a
-            // small time slice between disk scrubs.
-            let io_percent = self.config.read().await.max_io_percent.max(1).min(100) as f64;
-            let sleep_fraction = (100.0 - io_percent) / io_percent;
-            let throttle_delay = tokio::time::Duration::from_millis(
-                (100.0 * sleep_fraction) as u64,
-            );
+            // max_io_percent throttling happens per chunk inside scrub_disk_throttled.
+            let io_percent = self.config.read().await.max_io_percent.min(100) as u8;
 
-            match self.store.scrub_disk(disk_path, level).await {
+            match self.store.scrub_disk_throttled(disk_path, level, io_percent).await {
                 Ok(result) => {
                     tracing::info!(
                         "{} scrub on {}: checked={}, healthy={}, corrupt={}, missing={}, size_mismatch={}, duration={:.2}s",
@@ -236,8 +265,6 @@ impl ScrubScheduler {
                 }
             }
 
-            // Throttle before next disk.
-            tokio::time::sleep(throttle_delay).await;
         }
 
         tracing::info!("Completed {} scrub on all disks", level_str);
