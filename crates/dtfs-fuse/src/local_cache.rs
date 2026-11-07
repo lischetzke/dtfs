@@ -396,10 +396,9 @@ impl LocalChunkCache {
             let atime = meta.accessed().unwrap_or_else(|_| now);
             let age = now.duration_since(atime).unwrap_or_default();
             if age > max_age {
-                let len = meta.len();
-                if tfs::remove_file(&path).await.is_ok() {
-                    self.sizes.remove(&id);
-                    self.total_bytes.fetch_sub(len, Ordering::Relaxed);
+                // evict_entry subtracts via the single `sizes.remove`, so a
+                // racing evict_to_size cannot double-subtract.
+                if self.evict_entry(&id).await {
                     removed += 1;
                 }
             }
@@ -789,6 +788,57 @@ mod tests {
         let removed = cache.prune_by_age().await.unwrap();
         assert_eq!(removed, 1);
         assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn prune_racing_eviction_keeps_byte_accounting_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            LocalChunkCache::new(
+                tmp.path().to_path_buf(),
+                10 * 1024 * 1024,
+                Some(Duration::from_millis(10)),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut ids = Vec::new();
+        for i in 0..64u8 {
+            let data = vec![i; 1000];
+            let id = cid(&data);
+            cache.put(&id, &data).await.unwrap();
+            ids.push(id);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let c1 = Arc::clone(&cache);
+        let c2 = Arc::clone(&cache);
+        let ev = tokio::spawn(async move {
+            for id in &ids {
+                c1.evict_entry(id).await;
+            }
+        });
+        let pr = tokio::spawn(async move { c2.prune_by_age().await.unwrap() });
+        ev.await.unwrap();
+        pr.await.unwrap();
+        assert_eq!(cache.entry_count(), 0);
+        assert_eq!(cache.current_bytes(), 0, "no underflow / double subtract");
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_fresh_entries_and_their_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = LocalChunkCache::new(
+            tmp.path().to_path_buf(),
+            1 << 20,
+            Some(Duration::from_secs(3600)),
+        )
+        .await
+        .unwrap();
+        cache.put(&cid(b"fresh"), b"fresh").await.unwrap();
+        let before = cache.current_bytes();
+        assert_eq!(cache.prune_by_age().await.unwrap(), 0);
+        assert_eq!(cache.current_bytes(), before);
+        assert_eq!(cache.entry_count(), 1);
     }
 
     #[tokio::test]
