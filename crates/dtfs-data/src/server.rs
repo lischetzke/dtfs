@@ -934,10 +934,10 @@ impl DataService for DataServiceImpl {
             .replicate_to(&chunk_id, &req.target_address, &req.target_tier)
             .await
         {
-            Ok(()) => Ok(Response::new(ReplicateChunkResponse {
+            Ok(target_disk_id) => Ok(Response::new(ReplicateChunkResponse {
                 success: true,
                 error: String::new(),
-                disk_id: None,
+                disk_id: Some(target_disk_id),
             })),
             Err(e) => Ok(Response::new(ReplicateChunkResponse {
                 success: false,
@@ -1557,6 +1557,64 @@ max_io_percent = 10
 
         let got = collect_stream(&svc, &chunk_hex).await.expect("authed get");
         assert_eq!(got, data);
+    }
+
+    /// replicate_to must report the disk the TARGET stored the copy on, not
+    /// a guess: the target has hot disk 0 and warm disk 1, tier "warm" lands on 1.
+    #[tokio::test]
+    async fn replicate_to_returns_target_disk_id() {
+        use tokio_stream::wrappers::TcpListenerStream;
+
+        let src_dir = tempfile::TempDir::new().unwrap();
+        let src = make_service(src_dir.path(), true).await;
+        let data = b"replicate-reports-target-disk";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        src.store
+            .put_chunk(&chunk_id, data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+
+        let d0 = tempfile::TempDir::new().unwrap();
+        let d1 = tempfile::TempDir::new().unwrap();
+        let dm = DiskManager::new(&[
+            dtfs_common::config::DiskConfig { path: d0.path().to_path_buf(), tier: DiskTier::Hot },
+            dtfs_common::config::DiskConfig { path: d1.path().to_path_buf(), tier: DiskTier::Warm },
+        ])
+        .unwrap();
+        let store = Arc::new(ChunkStore::new(dm));
+        let config = test_config(d0.path());
+        let target = DataServiceImpl {
+            config: config.clone(),
+            store: store.clone(),
+            replication: Arc::new(ReplicationManager::new(
+                store.clone(),
+                config,
+                dtfs_common::tls::TlsContext::plaintext(),
+            )),
+            metrics: Arc::new(DataMetrics::new()),
+            write_slots: Arc::new(Semaphore::new(8)),
+            memory: Arc::new(MemoryBudget::from_config(
+                &dtfs_common::config::MemoryConfig::default(),
+            )),
+            scrub_config: Arc::new(RwLock::new(scrub_cfg(true))),
+            integrity_faults: Arc::new(IntegrityFaultCollector::new(64)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(DataServiceServer::new(target))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+
+        let disk_id = src
+            .replication
+            .replicate_to(&chunk_id, &format!("http://{addr}"), "warm")
+            .await
+            .expect("replicate");
+        assert_eq!(disk_id, 1, "copy landed on the warm disk");
+        let (p, _) = store.chunk_file_path(&chunk_id).expect("stored on target");
+        assert!(p.starts_with(d1.path()));
     }
 
     #[tokio::test]

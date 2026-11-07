@@ -86,7 +86,7 @@ impl ReplicationManager {
         chunk_id: &ChunkId,
         target_addr: &str,
         target_tier: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u32> {
         tracing::info!("Replicating chunk {} to {}", chunk_id, target_addr);
 
         // Resolve the on-disk path; absent chunk keeps the exact
@@ -193,7 +193,8 @@ impl ReplicationManager {
                 resp.size,
                 target_addr,
             );
-            Ok(())
+            // The disk the TARGET stored the copy on (PutChunkResponse.disk_id).
+            Ok(resp.disk_id)
         };
 
         // WI-04 — the budget scales with this chunk's own byte count so a
