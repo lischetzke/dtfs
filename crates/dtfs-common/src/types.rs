@@ -46,11 +46,14 @@ impl ChunkId {
         if !s.is_ascii() {
             return Err("expected ASCII hex chars".to_string());
         }
+        // from_str_radix accepts '+' and uppercase; ids are canonical lowercase.
+        if let Some(i) = s.bytes().position(|b| !matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(format!("bad hex char at offset {}", i));
+        }
         let mut out = [0u8; 32];
         for i in 0..32 {
-            let byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
                 .map_err(|e| format!("bad hex at byte {}: {}", i, e))?;
-            out[i] = byte;
         }
         Ok(Self(out))
     }
@@ -1187,6 +1190,16 @@ mod bug_av_types_tests {
 #[cfg(test)]
 mod audit_co_tests {
     use super::*;
+
+    #[test]
+    fn from_hex_strict_lowercase() {
+        let ok = "ab".repeat(32);
+        assert!(ChunkId::from_hex(&ok).is_ok());
+        assert!(ChunkId::from_hex(&ok.to_uppercase()).is_err());
+        assert!(ChunkId::from_hex(&format!("+a{}", "ab".repeat(31))).is_err());
+        assert!(ChunkId::from_hex(&ok[..62]).is_err());
+        assert!(ChunkId::from_hex(&format!("{ok}ab")).is_err());
+    }
 
     // CO-5-12 — ChunkId::from_hex must Err (never panic) on a 64-byte
     // non-ASCII input; the byte-length check passes but `&s[i*2..i*2+2]`

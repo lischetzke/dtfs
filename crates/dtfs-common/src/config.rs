@@ -252,6 +252,15 @@ impl MemoryConfig {
     /// Either threshold above 100% is meaningless (RSS is a percentage of
     /// the cap). Called by the role config `validate()` on load.
     pub fn validate(&self) -> Result<(), String> {
+        if (1..128).contains(&self.hard_cap_mb) {
+            return Err(format!(
+                "[memory] hard_cap_mb = {} is below the 128 MB floor (0 = unbounded)",
+                self.hard_cap_mb
+            ));
+        }
+        if self.warn_threshold_pct == 0 {
+            return Err("[memory] warn_threshold_pct must be > 0".to_string());
+        }
         if self.warn_threshold_pct > 100 {
             return Err(format!(
                 "[memory] warn_threshold_pct = {} exceeds 100",
@@ -700,6 +709,64 @@ pub struct MonitoringConfig {
     pub suspect_after_missed: u32,
     #[serde(default = "default_down_after")]
     pub down_after_missed: u32,
+}
+
+impl TieringConfig {
+    /// `tokio::time::interval(ZERO)` panics inside the spawned tiering task.
+    pub fn validate(&self) -> Result<(), String> {
+        nonzero("[tiering] evaluation_interval_secs", self.evaluation_interval_secs)
+    }
+}
+
+impl MonitoringConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        nonzero("[monitoring] heartbeat_interval_secs", self.heartbeat_interval_secs)?;
+        nonzero("[monitoring] suspect_after_missed", self.suspect_after_missed as u64)?;
+        nonzero("[monitoring] down_after_missed", self.down_after_missed as u64)
+    }
+}
+
+impl RaftConfig {
+    pub fn validate_timings(&self) -> Result<(), String> {
+        nonzero("[raft] election_timeout_ms", self.election_timeout_ms)?;
+        nonzero("[raft] heartbeat_interval_ms", self.heartbeat_interval_ms)?;
+        if self.heartbeat_interval_ms >= self.election_timeout_ms {
+            return Err(format!(
+                "[raft] heartbeat_interval_ms ({}) must be below election_timeout_ms ({})",
+                self.heartbeat_interval_ms, self.election_timeout_ms
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ManagerConfig {
+    /// Interval/timeout checks for every block with a periodic task.
+    /// Call from manager `main.rs` next to `memory.validate()`.
+    pub fn validate_intervals(&self) -> Result<(), String> {
+        self.tiering.validate()?;
+        self.monitoring.validate()?;
+        self.raft.validate_timings()
+    }
+}
+
+impl FuseConfig {
+    /// Call from fuse `main.rs` next to `client.validate()`.
+    pub fn validate_intervals(&self) -> Result<(), String> {
+        nonzero("[cache] prune_interval_secs", self.cache.prune_interval_secs)?;
+        nonzero(
+            "[partition_safety] quorum_loss_timeout_secs",
+            self.partition_safety.quorum_loss_timeout_secs,
+        )
+    }
+}
+
+fn nonzero(name: &str, v: u64) -> Result<(), String> {
+    if v == 0 {
+        Err(format!("{name} must be > 0"))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1548,6 +1615,38 @@ mod tests {
             ..Default::default()
         };
         assert!(over.validate().is_err());
+    }
+
+    #[test]
+    fn memory_validate_floor_and_zero_warn() {
+        let low = MemoryConfig { hard_cap_mb: 127, ..Default::default() };
+        assert!(low.validate().unwrap_err().contains("128 MB floor"));
+        assert!(MemoryConfig { hard_cap_mb: 128, ..Default::default() }.validate().is_ok());
+        assert!(MemoryConfig { hard_cap_mb: 0, ..Default::default() }.validate().is_ok());
+        let zero = MemoryConfig { warn_threshold_pct: 0, ..Default::default() };
+        assert_eq!(zero.validate().unwrap_err(), "[memory] warn_threshold_pct must be > 0");
+    }
+
+    #[test]
+    fn interval_validators_reject_zero() {
+        let mut t: TieringConfig = toml::from_str("").unwrap();
+        assert!(t.validate().is_ok());
+        t.evaluation_interval_secs = 0;
+        assert_eq!(t.validate().unwrap_err(), "[tiering] evaluation_interval_secs must be > 0");
+        let mut m: MonitoringConfig = toml::from_str("").unwrap();
+        assert!(m.validate().is_ok());
+        m.heartbeat_interval_secs = 0;
+        assert!(m.validate().is_err());
+        let mut r: RaftConfig = toml::from_str("").unwrap();
+        assert!(r.validate_timings().is_ok());
+        r.heartbeat_interval_ms = r.election_timeout_ms;
+        assert!(r.validate_timings().is_err());
+        r.heartbeat_interval_ms = 0;
+        assert!(r.validate_timings().is_err());
+        let mut c: FuseCacheConfig = toml::from_str("").unwrap();
+        assert!(c.prune_interval_secs > 0);
+        c.prune_interval_secs = 0;
+        assert_eq!(nonzero("[cache] prune_interval_secs", c.prune_interval_secs).unwrap_err(), "[cache] prune_interval_secs must be > 0");
     }
 
     /// CR-6-1 (CMN-8) — `PlacementConfig::validate` rejects a `min_free_pct`

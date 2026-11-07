@@ -173,7 +173,7 @@ impl ConsistentHashRing {
             // Failure domain checks
             match rule.failure_domain {
                 FailureDomain::Datacenter => {
-                    if selected_dcs.contains(&vn.location.datacenter)
+                    if selected_dcs.iter().any(|d| d.eq_ignore_ascii_case(&vn.location.datacenter))
                         && selected.len() < rule.replica_count as usize
                     {
                         // Try to spread across DCs, but don't block if we can't
@@ -207,7 +207,7 @@ impl ConsistentHashRing {
                 // For the first replica, prefer a node in a client's DC
                 let in_client_dc = client_locations
                     .iter()
-                    .any(|cl| cl.datacenter == vn.location.datacenter);
+                    .any(|cl| cl.datacenter.eq_ignore_ascii_case(&vn.location.datacenter));
                 if !in_client_dc {
                     // Skip for now, but we'll fall through if we can't find any
                     continue;
@@ -342,11 +342,11 @@ impl ConsistentHashRing {
 
     /// Count unique datacenters that have nodes of a given tier.
     fn unique_dc_count_for_tier(&self, tier: DiskTier) -> usize {
-        let mut dcs: Vec<&str> = self
+        let mut dcs: Vec<String> = self
             .ring
             .values()
             .filter(|vn| vn.tier == tier)
-            .map(|vn| vn.location.datacenter.as_str())
+            .map(|vn| vn.location.datacenter.to_ascii_lowercase())
             .collect();
         dcs.sort();
         dcs.dedup();
@@ -359,7 +359,7 @@ impl ConsistentHashRing {
             .ring
             .values()
             .filter(|vn| vn.tier == tier)
-            .map(|vn| format!("{}:{}", vn.location.datacenter, vn.location.rack))
+            .map(|vn| rack_key(&vn.location))
             .collect();
         racks.sort();
         racks.dedup();
@@ -386,7 +386,7 @@ impl ConsistentHashRing {
 /// by datacenter, so `"{datacenter}:{rack}"` is the comparison/dedup key
 /// everywhere (matches `unique_rack_count_for_tier`).
 fn rack_key(loc: &Location) -> String {
-    format!("{}:{}", loc.datacenter, loc.rack)
+    format!("{}:{}", loc.datacenter, loc.rack).to_ascii_lowercase()
 }
 
 /// Hash a string to a u32 ring position.
@@ -524,6 +524,21 @@ mod tests {
         assert_eq!(unique.len(), placement.nodes.len(), "no duplicate NodeId");
         // The anchor DC is actually represented (the zip can see it now).
         assert!(placement.datacenters.iter().any(|d| d == "dc-a"));
+    }
+
+    /// DC counting and spreading ignore case: "DC-A" and "dc-a" are one DC.
+    #[test]
+    fn dc_counting_is_case_insensitive() {
+        let mut ring = ConsistentHashRing::new(64);
+        ring.add_node(&NodeId::from_string("n-a".to_string()), 0, DiskTier::Warm,
+            &make_location("DC-A", "rack-1", "host-a"), 1.0);
+        ring.add_node(&NodeId::from_string("n-b".to_string()), 0, DiskTier::Warm,
+            &make_location("dc-a", "Rack-1", "host-b"), 1.0);
+        assert_eq!(ring.unique_dc_count_for_tier(DiskTier::Warm), 1);
+        assert_eq!(ring.unique_rack_count_for_tier(DiskTier::Warm), 1);
+        ring.add_node(&NodeId::from_string("n-c".to_string()), 0, DiskTier::Warm,
+            &make_location("dc-b", "rack-1", "host-c"), 1.0);
+        assert_eq!(ring.unique_dc_count_for_tier(DiskTier::Warm), 2);
     }
 
     /// CR-3-7 / CMN-5 — the anchor-DC swap compares case-insensitively: a

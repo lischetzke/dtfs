@@ -26,20 +26,18 @@ impl Location {
     /// Compute distance between two locations.
     /// Lower values mean closer proximity.
     pub fn distance(&self, other: &Location) -> LocationDistance {
-        if self.host == other.host
-            && self.rack == other.rack
-            && self.datacenter == other.datacenter
-            && self.region == other.region
-        {
+        // Case-insensitive, consistent with anchor-DC matching (CLAUDE.md A.3.4).
+        let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+        let region = eq(&self.region, &other.region);
+        let dc = region && eq(&self.datacenter, &other.datacenter);
+        let rack = dc && eq(&self.rack, &other.rack);
+        if rack && eq(&self.host, &other.host) {
             LocationDistance::SameHost
-        } else if self.rack == other.rack
-            && self.datacenter == other.datacenter
-            && self.region == other.region
-        {
+        } else if rack {
             LocationDistance::SameRack
-        } else if self.datacenter == other.datacenter && self.region == other.region {
+        } else if dc {
             LocationDistance::SameDatacenter
-        } else if self.region == other.region {
+        } else if region {
             LocationDistance::SameRegion
         } else {
             LocationDistance::CrossRegion
@@ -186,5 +184,19 @@ mod tests {
     fn test_location_display() {
         let loc = Location::new("eu", "frankfurt", "rack-a1", "node-01");
         assert_eq!(loc.to_string(), "eu/frankfurt/rack-a1/node-01");
+    }
+}
+
+#[cfg(test)]
+mod case_tests {
+    use super::*;
+
+    #[test]
+    fn distance_ignores_case() {
+        let a = Location::new("EU", "LELI", "r1", "h1");
+        assert_eq!(a.distance(&Location::new("eu", "leli", "R1", "H1")), LocationDistance::SameHost);
+        assert_eq!(a.distance(&Location::new("eu", "Leli", "r1", "h2")), LocationDistance::SameRack);
+        assert_eq!(a.distance(&Location::new("eu", "toro", "r1", "h1")), LocationDistance::SameRegion);
+        assert_eq!(a.distance(&Location::new("us", "leli", "r1", "h1")), LocationDistance::CrossRegion);
     }
 }

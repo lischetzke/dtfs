@@ -18,8 +18,9 @@
 //!   land, § rollout step 2 in docs/src/security/tls.md — but note a node
 //!   that loses its cert file restarts into plaintext and partitions from a
 //!   TLS cluster; switch to `require` after the rollout to pin it).
-//!   Present-but-unreadable files are a hard error. Unknown modes warn and
-//!   behave like `auto`.
+//!   Present-but-unreadable files are a hard error.
+//! * anything else — hard startup error (a typo must not silently run
+//!   plaintext).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -86,12 +87,11 @@ impl TlsContext {
                 });
             }
             "auto" => {}
-            other => tracing::warn!(
-                mode = %other,
-                "unknown [tls] mode (expected auto|require|disabled); treating as \"auto\""
+            other => anyhow::bail!(
+                "unknown [tls] mode {other:?} (expected auto|require|disabled)"
             ),
         }
-        // auto (and unknown-mode fallthrough)
+        // auto
         match (&cfg.cert_file, &cfg.key_file, &cfg.ca_file) {
             (None, None, None) => Ok(Self::plaintext()),
             (Some(cert), Some(key), Some(ca)) => {
@@ -332,9 +332,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_mode_behaves_like_auto() {
-        let ctx = TlsContext::from_config(&cfg("frobnicate", None)).unwrap();
-        assert!(!ctx.is_enabled());
+    fn unknown_mode_is_an_error() {
+        let err = TlsContext::from_config(&cfg("frobnicate", None)).unwrap_err();
+        assert!(err.to_string().contains("unknown [tls] mode"), "{err}");
     }
 
     #[test]
