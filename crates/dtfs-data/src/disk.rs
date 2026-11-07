@@ -35,6 +35,8 @@ impl DiskManager {
             std::fs::create_dir_all(&tmp_dir)?;
             std::fs::create_dir_all(&wal_dir)?;
 
+            ensure_persisted_disk_id(&dc.path, i as u32)?;
+
             // Get disk capacity (best effort, default to 0 if can't determine)
             let (total, used) = get_disk_usage(&dc.path);
 
@@ -160,6 +162,82 @@ impl DiskManager {
             disk.status = DiskStatus::Draining;
             tracing::info!("Disk {} marked as DRAINING: {}", disk_id, disk.mount_path.display());
         }
+    }
+}
+
+/// Replica identity is `(node_id, disk_id)` and `disk_id` is the position in
+/// `[[disks]]`. Persist it in `<mount>/.dtfs-disk-id` on first start and
+/// refuse to start when the disk now sits at a different position, since
+/// the manager would attribute its chunks to the wrong disk (and the orphan
+/// reaper would then delete the wrong copies).
+fn ensure_persisted_disk_id(mount: &std::path::Path, disk_id: u32) -> anyhow::Result<()> {
+    let file = mount.join(".dtfs-disk-id");
+    match std::fs::read_to_string(&file) {
+        Ok(s) => {
+            let persisted: u32 = s.trim().parse().map_err(|_| {
+                anyhow::anyhow!("{} is not a valid disk id: {:?}", file.display(), s.trim())
+            })?;
+            if persisted != disk_id {
+                tracing::error!(
+                    path = %mount.display(), persisted, configured = disk_id,
+                    "disk position in [[disks]] changed; refusing to start"
+                );
+                anyhow::bail!(
+                    "disk {} was disk_id {} but is now at [[disks]] position {}. Keep \
+                     [[disks]] positions stable (do not remove or reorder entries); \
+                     replace a drained disk in place instead",
+                    mount.display(), persisted, disk_id
+                );
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let tmp = mount.join(".dtfs-disk-id.tmp");
+            std::fs::write(&tmp, format!("{disk_id}\n"))?;
+            std::fs::File::open(&tmp)?.sync_all()?;
+            std::fs::rename(&tmp, &file)?;
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(p: &std::path::Path) -> DiskConfig {
+        DiskConfig { path: p.to_path_buf(), tier: DiskTier::Hot }
+    }
+
+    #[test]
+    fn first_start_persists_position_and_same_position_restarts() {
+        let a = tempfile::TempDir::new().unwrap();
+        let b = tempfile::TempDir::new().unwrap();
+        let cfgs = [cfg(a.path()), cfg(b.path())];
+        let dm = DiskManager::new(&cfgs).unwrap();
+        assert_eq!(dm.all_disks()[1].disk_id, 1);
+        assert_eq!(std::fs::read_to_string(b.path().join(".dtfs-disk-id")).unwrap().trim(), "1");
+        // Same positions again: fine.
+        DiskManager::new(&cfgs).unwrap();
+    }
+
+    #[test]
+    fn moved_position_is_refused_with_clear_error() {
+        let a = tempfile::TempDir::new().unwrap();
+        let b = tempfile::TempDir::new().unwrap();
+        DiskManager::new(&[cfg(a.path()), cfg(b.path())]).unwrap();
+        // Remove the first entry: b moves from position 1 to 0.
+        let err = DiskManager::new(&[cfg(b.path())]).err().expect("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("was disk_id 1 but is now at [[disks]] position 0"), "{msg}");
+    }
+
+    #[test]
+    fn unparseable_id_file_is_refused() {
+        let a = tempfile::TempDir::new().unwrap();
+        std::fs::write(a.path().join(".dtfs-disk-id"), "garbage").unwrap();
+        assert!(DiskManager::new(&[cfg(a.path())]).is_err());
     }
 }
 

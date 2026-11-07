@@ -107,11 +107,17 @@ The new disk should appear in the disk list with `healthy` status.
 /dev/sdX /mnt/new-disk xfs noatime,inode64 0 0
 ```
 
+### Disk ids and `[[disks]]` order
+
+A disk's `disk_id` is its position (0-based) in the `[[disks]]` list, and replica identity is `(node_id, disk_id)`. On first start the data node writes the id to `<mount>/.dtfs-disk-id`. On later starts it **refuses to start** if the disk now sits at a different position (the error reads `disk <path> was disk_id N but is now at [[disks]] position M`), because renumbering would make the manager attribute chunks to the wrong disk and the orphan reaper delete the wrong copies.
+
+Rules: only append new `[[disks]]` entries at the end; never remove or reorder an entry in the middle. To retire a disk, drain it first, then replace it in place (same position) with the new disk. A replacement disk starts with no `.dtfs-disk-id` and takes the position it is configured at.
+
 ## Removing a Disk
 
 ### Graceful Removal
 
-1. Place the disk in draining mode. This is done by removing the disk entry from the configuration file, which the data node interprets as a drain request.
+1. Place the disk in draining mode. Do not delete its `[[disks]]` entry while it is in the middle of the list (see "Disk ids and `[[disks]]` order" above); the data node would refuse to start.
 
 2. Alternatively, use the API to set the node to maintenance mode if you need to remove the entire node:
 
