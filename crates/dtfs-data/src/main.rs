@@ -196,6 +196,7 @@ async fn main() -> anyhow::Result<()> {
     // Bug BF-2 — integrity-fault collector. verify_on_read records here;
     // heartbeat drains + ships to mgr (BF-5); mgr auto-quarantines (BF-6).
     let integrity_faults = Arc::new(integrity::IntegrityFaultCollector::new(1024));
+    integrity_faults.set_quarantine_on_fault(config.scrub.quarantine_on_fault);
     // CF-8 — manual scrub trigger path: the heartbeat task receives a
     // ScrubRequestNow from the manager and pushes the level here; the
     // scheduler loop selects on it and runs the scrub immediately.
@@ -892,6 +893,8 @@ async fn manager_lifecycle(
                                         );
                                         *sc = new_cfg.scrub.clone();
                                     }
+                                    integrity_faults
+                                        .set_quarantine_on_fault(new_cfg.scrub.quarantine_on_fault);
                                 }
                                 current_config_version = config_update.version;
                                 tracing::info!(

@@ -23,6 +23,9 @@ pub use dtfs_proto::dtfs::manager::IntegrityFault;
 pub struct IntegrityFaultCollector {
     faults: Mutex<Vec<IntegrityFault>>,
     self_quarantined: AtomicBool,
+    /// `[scrub].quarantine_on_fault`: when false, faults are still recorded
+    /// and reported but do not trip the sticky self-quarantine.
+    quarantine_on_fault: AtomicBool,
     cap: usize,
 }
 
@@ -31,16 +34,24 @@ impl IntegrityFaultCollector {
         Self {
             faults: Mutex::new(Vec::new()),
             self_quarantined: AtomicBool::new(false),
+            quarantine_on_fault: AtomicBool::new(true),
             cap: cap.max(1),
         }
     }
 
-    /// Record a fault. Trips `self_quarantined` on first record.
+    pub fn set_quarantine_on_fault(&self, enabled: bool) {
+        self.quarantine_on_fault.store(enabled, Ordering::Release);
+    }
+
+    /// Record a fault. Trips `self_quarantined` on first record
+    /// (unless `quarantine_on_fault` is off).
     /// At cap, drops the oldest entry to keep the buffer bounded
     /// (avoids unbounded growth if the mgr is unreachable for a
     /// long time — fresh faults are more informative than stale).
     pub fn record(&self, fault: IntegrityFault) {
-        self.self_quarantined.store(true, Ordering::Release);
+        if self.quarantine_on_fault.load(Ordering::Acquire) {
+            self.self_quarantined.store(true, Ordering::Release);
+        }
         let mut v = self.faults.lock();
         if v.len() >= self.cap {
             v.remove(0);
@@ -113,6 +124,19 @@ mod tests {
         c.record(mk("c1"));
         assert!(c.is_self_quarantined());
         assert_eq!(c.pending_len(), 1);
+    }
+
+    #[test]
+    fn quarantine_on_fault_off_records_but_does_not_self_quarantine() {
+        let c = IntegrityFaultCollector::new(8);
+        c.set_quarantine_on_fault(false);
+        c.record(mk("c1"));
+        assert!(!c.is_self_quarantined());
+        assert_eq!(c.pending_len(), 1, "fault still recorded for reporting");
+        // Flipping it back on makes the next fault sticky again.
+        c.set_quarantine_on_fault(true);
+        c.record(mk("c2"));
+        assert!(c.is_self_quarantined());
     }
 
     #[test]
