@@ -330,6 +330,43 @@ fn heartbeat_may_mark_healthy(current: HealthStatus) -> bool {
     }
 }
 
+/// Map the state machine's `RenameFile` rejection text to a typed gRPC status
+/// so FUSE can answer ENOENT / ENOTEMPTY / EINVAL instead of EIO. `None` =
+/// unrecognised message (kept as the legacy `success:false` response).
+fn rename_error_status(message: &str) -> Option<Status> {
+    if message.contains("not found") {
+        Some(Status::not_found(message))
+    } else if message.contains("non-empty directory") {
+        Some(Status::failed_precondition(message))
+    } else if message.contains("its own subtree") {
+        Some(Status::invalid_argument(message))
+    } else {
+        None
+    }
+}
+
+/// Chunk size for a new file: the volume's own `chunk_size_bytes` when set
+/// (> 0), else the `[defaults] chunk_size_mb` fallback.
+fn resolve_create_chunk_size(volume_chunk_size_bytes: Option<u64>, default_mb: u32) -> u64 {
+    match volume_chunk_size_bytes {
+        Some(b) if b > 0 => b,
+        _ => default_mb as u64 * 1024 * 1024,
+    }
+}
+
+/// Skip the heartbeat `UpdateNodeStatus(healthy)` Raft write (one every 5 s
+/// per node) when the node is already Healthy: the apply is a no-op.
+fn heartbeat_should_write_healthy(current: HealthStatus) -> bool {
+    current != HealthStatus::Healthy && heartbeat_may_mark_healthy(current)
+}
+
+/// `[scrub] quarantine_on_fault` gate for the heartbeat integrity-fault
+/// batch's `QuarantineNode` write. `RemoveCorruptChunkReplicas` is
+/// unconditional: the corrupt replica must be de-located either way.
+fn heartbeat_quarantine_write_enabled(quarantine_on_fault: bool) -> bool {
+    quarantine_on_fault
+}
+
 /// REV-3-8 — hard cap on how many integrity faults ONE heartbeat may
 /// carry into the manager's fault-processing path.
 ///
@@ -1002,7 +1039,9 @@ fn clamp_ack_floor_to_rf(
         .filter_map(|c| {
             let node_id: u64 = c.node_id.parse().ok()?;
             let tier = live_replica_tier(sm.nodes.get(&node_id), c.disk_id)?;
-            Some(mandatory.for_tier(tier))
+            // RF 0 = cache-only tier: not evidence of a durable placement,
+            // and clamping to 0 would ack a single evictable copy.
+            Some(mandatory.for_tier(tier)).filter(|rf| *rf > 0)
         })
         .max();
     let Some(rf) = max_rf else {
@@ -1061,7 +1100,13 @@ impl ManagerService for MetadataService {
             .clone()
             .unwrap_or_else(|| "default".to_string());
 
-        let chunk_size = self.config.defaults.chunk_size_mb as u64 * 1024 * 1024;
+        let chunk_size = {
+            let sm = self.sm_data.read().await;
+            resolve_create_chunk_size(
+                sm.volumes.get(&volume_id).map(|v| v.chunk_size_bytes),
+                self.config.defaults.chunk_size_mb,
+            )
+        };
 
         let resp = self
             .raft_write(ClientRequest::CreateFile {
@@ -1440,7 +1485,7 @@ impl ManagerService for MetadataService {
         // CO-3-8 — only re-stamp Healthy for the transient liveness states.
         // Maintenance/Draining (and Quarantined) are sticky: a heartbeat
         // must not clear an operator drain within one cycle.
-        if heartbeat_may_mark_healthy(current_health) {
+        if heartbeat_should_write_healthy(current_health) {
             // MGR-HB-1 — same contract as the UpdateNodeUsage write above:
             // a dropped `healthy` commit leaves a recovered node Down.
             liveness_write_status(
@@ -1551,14 +1596,22 @@ impl ManagerService for MetadataService {
             // advertised healthy until the next scrub; the data node
             // already re-enqueues drained faults when the ack is
             // `accepted == false` (Bug BF-5, CO-3-7 parity).
-            let quarantine_ok = match self
-                .raft_write_or_forward(ClientRequest::QuarantineNode { node_id, info })
-                .await
-            {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::warn!(error = %e, node_id, "CR-3-6: failed to commit QuarantineNode from heartbeat integrity fault");
-                    false
+            let quarantine_ok = if !heartbeat_quarantine_write_enabled(scrub_cfg.quarantine_on_fault) {
+                tracing::warn!(
+                    node_id,
+                    "[scrub] quarantine_on_fault=false: integrity fault reported, node NOT quarantined"
+                );
+                true
+            } else {
+                match self
+                    .raft_write_or_forward(ClientRequest::QuarantineNode { node_id, info })
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::warn!(error = %e, node_id, "CR-3-6: failed to commit QuarantineNode from heartbeat integrity fault");
+                        false
+                    }
                 }
             };
             // Drop the (node, chunk) replica entries so the
@@ -1927,193 +1980,22 @@ impl ManagerService for MetadataService {
         let req = request.into_inner();
         info!("DeleteFile: {}", req.path);
 
-        // Bug N — collect the chunk locations BEFORE the Raft delete
-        // commits so we know which data nodes need to reclaim disk
-        // space. After the commit `sm.files` will no longer have the
-        // entry. We dedup (chunk_hash, node_id) to avoid sending the
-        // same DeleteChunk twice for replicated chunks.
-        let chunk_targets: Vec<(String, String)> = {
-            let data = self.sm_data.read().await;
-            if let Some(meta) = data.files.get(&req.path) {
-                let mut seen: std::collections::HashSet<(String, String)> =
-                    Default::default();
-                let mut out = Vec::new();
-                for c in &meta.chunks {
-                    let key = (c.chunk_hash.clone(), c.node_id.clone());
-                    if seen.insert(key.clone()) {
-                        out.push(key);
-                    }
-                }
-                out
-            } else {
-                Vec::new()
-            }
-        };
-
-        // Resolve node_id → grpc_addr so we can talk to each data node
-        // without re-locking the state machine per chunk.
-        let node_addrs: std::collections::HashMap<String, String> = {
-            let data = self.sm_data.read().await;
-            data.nodes
-                .iter()
-                .map(|(id, info)| (id.to_string(), info.grpc_addr.clone()))
-                .collect()
-        };
-
-        // Commit the Raft-side delete first. The chunk fan-out is
-        // best-effort: a failure to reach a data node leaves an orphan
-        // that the scheduler's reconciler picks up later. We
-        // INTENTIONALLY commit the metadata removal first because
-        // a half-deleted file (metadata gone, chunks remain) is the
-        // correct failure mode — a dangling-pointer file (metadata
-        // remains, chunks gone) would be worse.
+        // Bug CI — metadata removal only. There is deliberately NO direct
+        // DeleteChunk fan-out: a content-identical re-upload can land its
+        // bytes before CommitChunkLocations, so any "no file references this
+        // chunk" re-check races it and deletes a just-committed file's
+        // bytes. The mtime-graced orphan reaper reclaims the space.
         let resp = self
             .raft_write(ClientRequest::DeleteFile {
                 path: req.path.clone(),
             })
             .await?;
 
-        // CR-2-4 (RAFT-7) — DeleteFile now refuses a non-empty directory
-        // (ClientResponse::Error). The chunk fan-out below must NOT run in
-        // that case: the file was never removed, so its chunks are still
-        // live and deleting them would corrupt a tree the apply just
-        // refused to touch. Bail out before computing/spawning the fan-out.
+        // CR-2-4 (RAFT-7) — DeleteFile refuses a non-empty directory.
         if let ClientResponse::Error { message } = &resp {
             return Err(Status::failed_precondition(message.clone()));
         }
 
-        // Now best-effort fan-out chunk deletes. Group by node so we
-        // open one connection per target. `plan_delete_fanout` returns
-        // tonic-ready endpoints (Bug N fix: the registry grpc_addr is
-        // already a full URL, re-prefixing doubled the scheme and made
-        // every fan-out fail with a transport error).
-        let by_node = plan_delete_fanout(chunk_targets, &node_addrs);
-
-        let path_for_log = req.path.clone();
-        // CF-1b — thread the audit log into the spawned fan-out task so a
-        // failure emits a `delete.fanout_failed` row (Option<Arc<_>> is
-        // cheap to clone). Pre-CF-1b these failures were journald-only,
-        // which masked the ~238 GB production orphan leak (Bug N).
-        let audit = self.audit.clone();
-        // Bug CI — the fan-out runs async, so a content-identical re-upload
-        // can recommit the SAME chunk ids before our DeleteChunk RPCs fire.
-        // Carry a state handle and re-check liveness per chunk at dispatch.
-        let sm_for_liveness = self.sm_data.clone();
-        // CF-6 — carry the TLS context into the spawned fan-out.
-        let tls = self.tls.clone();
-        // LIS-19 — capture secret before spawn (self is not 'static).
-        let delete_secret = self.config.cluster.shared_secret.clone();
-        tokio::spawn(async move {
-            let mut skipped_live: usize = 0;
-            for (addr, chunks) in by_node {
-                let mut client = match tls.connect(&addr).await
-                    .map(dtfs_proto::dtfs::data::data_service_client::DataServiceClient::new)
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %path_for_log,
-                            node_addr = %addr,
-                            error = %e,
-                            "Bug N delete fan-out: connect failed, leaving orphan chunks for reconciler"
-                        );
-                        if let Some(audit) = &audit {
-                            audit.log(
-                                "metadata",
-                                "delete.fanout_failed",
-                                &fanout_failed_summary(&addr, chunks.len()),
-                                "connect",
-                            );
-                        }
-                        continue;
-                    }
-                };
-                for chunk_id in chunks {
-                    // Bug CI — skip ids a live file references RIGHT NOW.
-                    // The .dat we would have deleted is that file's replica.
-                    let still_live = {
-                        let sm = sm_for_liveness.read().await;
-                        !fanout_delete_allowed(&chunk_id, &sm.files)
-                    };
-                    if still_live {
-                        skipped_live += 1;
-                        tracing::debug!(
-                            path = %path_for_log,
-                            chunk_id = %chunk_id,
-                            "Bug CI delete fan-out: id re-referenced by a live file; skipping delete"
-                        );
-                        continue;
-                    }
-                    // CO-1-1 — the unlink fan-out reclaims the chunk
-                    // entirely (the file is gone), so it stays node-wide:
-                    // disk_id absent -> legacy first-found.
-                    let mut req = tonic::Request::new(dtfs_proto::dtfs::data::DeleteChunkRequest {
-                        chunk_id: chunk_id.clone(),
-                        disk_id: None,
-                        tier: String::new(),
-                    });
-                    {
-                        use dtfs_common::crypto::{
-                            stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
-                        };
-                        if let Some((ts, mac)) =
-                            stamp_data_rpc_auth(&delete_secret, "DeleteChunk", &chunk_id)
-                        {
-                            if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
-                                req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
-                                req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
-                            }
-                        }
-                    }
-                    match client.delete_chunk(req).await {
-                        Ok(_) => {
-                            tracing::debug!(
-                                path = %path_for_log,
-                                node_addr = %addr,
-                                chunk_id = %chunk_id,
-                                "Bug N delete fan-out: chunk reclaimed"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                path = %path_for_log,
-                                node_addr = %addr,
-                                chunk_id = %chunk_id,
-                                error = %e,
-                                "Bug N delete fan-out: RPC failed, orphan remains for reconciler"
-                            );
-                            if let Some(audit) = &audit {
-                                audit.log(
-                                    "metadata",
-                                    "delete.fanout_failed",
-                                    &fanout_failed_summary(&addr, 1),
-                                    "rpc",
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            // Bug CI — surface how many ids were spared because a live
-            // file re-referenced them (one row per unlink, not per chunk).
-            if skipped_live > 0 {
-                tracing::info!(
-                    path = %path_for_log,
-                    skipped_live,
-                    "Bug CI delete fan-out: skipped ids re-referenced by live files"
-                );
-                if let Some(audit) = &audit {
-                    audit.log(
-                        "metadata",
-                        "delete.fanout_skipped_live",
-                        &format!("path={path_for_log} skipped={skipped_live}"),
-                        "ok",
-                    );
-                }
-            }
-        });
-
-        // Only Success reaches here — Error already returned above.
         Ok(Response::new(DeleteFileResponse { success: true }))
     }
 
@@ -2664,10 +2546,13 @@ impl ManagerService for MetadataService {
                 success: true,
                 error: String::new(),
             })),
-            ClientResponse::Error { message } => Ok(Response::new(RenameFileResponse {
-                success: false,
-                error: message,
-            })),
+            ClientResponse::Error { message } => match rename_error_status(&message) {
+                Some(status) => Err(status),
+                None => Ok(Response::new(RenameFileResponse {
+                    success: false,
+                    error: message,
+                })),
+            },
             _ => Ok(Response::new(RenameFileResponse {
                 success: false,
                 error: "unexpected response".into(),
@@ -3244,62 +3129,6 @@ pub(crate) fn resolve_preferred_tier(
 /// RegisterNode gRPC connection). Fall back to the reported hostname
 /// only when remote_addr isn't available (unit-test path, or a transport
 /// that doesn't surface a peer — UDS etc.).
-/// Bug N (endpoint fix) — group per-chunk delete targets by data node and
-/// return a map of tonic-ready endpoint URL → chunk hashes. The registry
-/// `grpc_addr` is a fully-formed URL (`http://ip:port`, Bug W), so it must
-/// go through `scheduler::normalize_endpoint` rather than getting another
-/// `http://` prefix — the old inline `format!("http://{}", addr)` produced
-/// `http://http://…`, every DeleteChunk fan-out failed with a transport
-/// error, and every deleted file leaked its chunks to the orphan reconciler
-/// (observed live on production 2026-06-06, 119/123 deletes failing).
-pub(crate) fn plan_delete_fanout(
-    chunk_targets: Vec<(String, String)>,
-    node_addrs: &std::collections::HashMap<String, String>,
-) -> std::collections::HashMap<String, Vec<String>> {
-    let mut by_endpoint: std::collections::HashMap<String, Vec<String>> =
-        Default::default();
-    for (chunk_hash, node_id) in chunk_targets {
-        if let Some(addr) = node_addrs.get(&node_id) {
-            by_endpoint
-                .entry(crate::scheduler::normalize_endpoint(addr))
-                .or_default()
-                .push(chunk_hash);
-        }
-    }
-    by_endpoint
-}
-
-/// Bug CI — may this chunk id actually be deleted from data nodes?
-///
-/// Chunks are content-addressed: an identical re-upload (WinSCP retry of
-/// the same movie) or a second file with identical content re-creates the
-/// SAME chunk ids the unlinked file used. The unlink fan-out captures its
-/// id list at unlink time and deletes asynchronously, so by the time a
-/// DeleteChunk RPC fires, the id may belong to a LIVE file again. Deleting
-/// it then is silent data loss: the new file's location entries stay, the
-/// bytes vanish (§ A.6(4) — 2026-06-06 production lost 2840/4135 chunks of
-/// a re-uploaded library this way). The fan-out re-checks each id against
-/// CURRENT state immediately before its RPC and skips live ones; the
-/// skipped .dat simply remains (it IS the live file's replica).
-pub(crate) fn fanout_delete_allowed(
-    chunk_hash: &str,
-    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
-) -> bool {
-    !crate::scheduler::chunk_in_any_file(chunk_hash, files)
-}
-
-/// Bug N / CF-1b — build the `delete.fanout_failed` audit summary. The
-/// summary identifies the data node endpoint plus how many chunks were
-/// left orphaned by the failure; the audit `result` carries the failure
-/// class (`connect` for a dial failure, `rpc` for a DeleteChunk RPC
-/// error). The orphan reconciler still reclaims the chunks later, but the
-/// audit row makes the failure observable in `/api/v1/audit` and the WebUI
-/// integrity feed instead of being journald-only (the gap that masked the
-/// ~238 GB production orphan leak).
-pub(crate) fn fanout_failed_summary(node_addr: &str, chunk_count: usize) -> String {
-    format!("node_addr={node_addr} orphan_chunks={chunk_count}")
-}
-
 pub(crate) fn build_data_grpc_addr(
     peer: Option<std::net::SocketAddr>,
     reported_hostname: &str,

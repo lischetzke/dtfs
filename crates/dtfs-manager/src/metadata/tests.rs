@@ -726,133 +726,9 @@ mod bug_cf_3b_ack_floor_tests {
 }
 
 #[cfg(test)]
-mod bug_ci_fanout_liveness_tests {
-    use super::fanout_delete_allowed;
-    use dtfs_raft::state_machine::FileMetadata;
-    use dtfs_raft::ChunkLocationEntry;
-
-    fn file_with_chunks(path: &str, chunk_hashes: &[&str]) -> FileMetadata {
-        FileMetadata {
-            path: path.to_string(),
-            volume_id: "default".to_string(),
-            chunk_size: 4 * 1024 * 1024,
-            chunks: chunk_hashes
-                .iter()
-                .enumerate()
-                .map(|(i, h)| ChunkLocationEntry {
-                    chunk_index: i as u64,
-                    chunk_hash: (*h).to_string(),
-                    node_id: "10".to_string(),
-                    disk_id: 0,
-                    size_bytes: 4 * 1024 * 1024,
-                })
-                .collect(),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            symlink_target: None,
-            logical_size: None,
-            is_directory: false,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
-        }
-    }
-
-    // Bug CI — chunks are content-addressed, so an identical re-upload (or a
-    // second file sharing identical content) re-creates the SAME chunk ids
-    // the unlinked file used. The async delete fan-out captured its id list
-    // at unlink time; on 2026-06-06 production it swept that list WHILE the
-    // re-upload recommitted the same ids, deleting 2840 of 4135 freshly
-    // written chunks from every node (state kept the entries — silent loss).
-    // The fan-out must re-check liveness against CURRENT state per chunk at
-    // dispatch time and skip any id a live file still references.
-    #[test]
-    fn live_referenced_chunk_must_not_be_deleted() {
-        let mut files = std::collections::BTreeMap::new();
-        files.insert(
-            "/media/movie-v2.mkv".to_string(),
-            file_with_chunks("/media/movie-v2.mkv", &["shared_x", "shared_y"]),
-        );
-        assert!(!fanout_delete_allowed("shared_x", &files));
-        assert!(!fanout_delete_allowed("shared_y", &files));
-    }
-
-    #[test]
-    fn unreferenced_chunk_is_deleted() {
-        let mut files = std::collections::BTreeMap::new();
-        files.insert(
-            "/media/movie-v2.mkv".to_string(),
-            file_with_chunks("/media/movie-v2.mkv", &["shared_x"]),
-        );
-        assert!(fanout_delete_allowed("gone_for_real", &files));
-        let empty = std::collections::BTreeMap::new();
-        assert!(fanout_delete_allowed("anything", &empty));
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-
-    /// Bug N regression — the registry stores a fully-formed URL
-    /// (`http://ip:port`, Bug W). The fan-out planner must NOT add a
-    /// second scheme; pre-fix it produced `http://http://ip:port` and
-    /// every delete fan-out failed with a tonic transport error.
-    #[test]
-    fn bug_n_fanout_registry_url_not_double_prefixed() {
-        let mut addrs = std::collections::HashMap::new();
-        addrs.insert("7".to_string(), "http://100.64.0.20:9500".to_string());
-        let plan = plan_delete_fanout(
-            vec![("chunk-a".to_string(), "7".to_string())],
-            &addrs,
-        );
-        assert_eq!(plan.len(), 1);
-        assert!(
-            plan.contains_key("http://100.64.0.20:9500"),
-            "endpoint must be the registry URL verbatim, got keys: {:?}",
-            plan.keys().collect::<Vec<_>>()
-        );
-    }
-
-    /// Bug N — pre-Bug-W registries stored bare `host:port`; those still
-    /// get exactly one scheme via normalize_endpoint.
-    #[test]
-    fn bug_n_fanout_bare_addr_gets_single_scheme() {
-        let mut addrs = std::collections::HashMap::new();
-        addrs.insert("7".to_string(), "10.0.0.4:9500".to_string());
-        let plan = plan_delete_fanout(
-            vec![("chunk-a".to_string(), "7".to_string())],
-            &addrs,
-        );
-        assert!(plan.contains_key("http://10.0.0.4:9500"));
-    }
-
-    /// Bug N — chunks group per endpoint; targets with no registry entry
-    /// are skipped (node gone — reconciler's job).
-    #[test]
-    fn bug_n_fanout_groups_and_skips_unknown_nodes() {
-        let mut addrs = std::collections::HashMap::new();
-        addrs.insert("7".to_string(), "http://10.0.0.4:9500".to_string());
-        let plan = plan_delete_fanout(
-            vec![
-                ("chunk-a".to_string(), "7".to_string()),
-                ("chunk-b".to_string(), "7".to_string()),
-                ("chunk-c".to_string(), "999".to_string()), // unknown node
-            ],
-            &addrs,
-        );
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan["http://10.0.0.4:9500"].len(), 2);
-    }
-
-    /// CF-1b — the fan-out failure audit summary identifies the data node
-    /// endpoint and the count of chunks left orphaned, so an operator
-    /// reading `/api/v1/audit` or the integrity feed can see which node and
-    /// how much disk is at stake without grepping journald.
-    #[test]
-    fn cf1b_fanout_failed_summary_carries_node_and_count() {
-        let summary = fanout_failed_summary("http://10.0.0.4:9500", 3);
-        assert_eq!(summary, "node_addr=http://10.0.0.4:9500 orphan_chunks=3");
-    }
 
     /// Bug W regression — peer IP wins over reported hostname.
     /// This is the actual prod bug from Plexmedia: data-warm01 resolves
@@ -1022,6 +898,62 @@ mod tests {
         assert!(!heartbeat_may_mark_healthy(HealthStatus::Maintenance));
         assert!(!heartbeat_may_mark_healthy(HealthStatus::Draining));
         assert!(!heartbeat_may_mark_healthy(HealthStatus::Quarantined));
+    }
+
+    /// An already-Healthy node needs no `healthy` write (no-op apply every
+    /// 5 s); every recoverable non-Healthy state still gets one; sticky
+    /// states never do.
+    #[test]
+    fn heartbeat_skips_healthy_write_when_already_healthy() {
+        assert!(!heartbeat_should_write_healthy(HealthStatus::Healthy));
+        for s in [
+            HealthStatus::Suspect,
+            HealthStatus::Down,
+            HealthStatus::Degraded,
+            HealthStatus::Failed,
+        ] {
+            assert!(heartbeat_should_write_healthy(s), "{s:?}");
+        }
+        for s in [HealthStatus::Maintenance, HealthStatus::Draining, HealthStatus::Quarantined] {
+            assert!(!heartbeat_should_write_healthy(s), "{s:?}");
+        }
+    }
+
+    /// RenameFile rejections carry typed gRPC codes (FUSE: ENOENT/ENOTEMPTY).
+    #[test]
+    fn rename_error_status_codes() {
+        use tonic::Code;
+        let code = |m: &str| rename_error_status(m).map(|s| s.code());
+        assert_eq!(code("RenameFile: source '/a' not found"), Some(Code::NotFound));
+        assert_eq!(
+            code("RenameFile: destination '/d' is a non-empty directory"),
+            Some(Code::FailedPrecondition)
+        );
+        assert_eq!(
+            code("RenameFile: cannot rename '/a' into its own subtree '/a/b'"),
+            Some(Code::InvalidArgument)
+        );
+        assert_eq!(code("something else"), None);
+        assert_eq!(
+            rename_error_status("RenameFile: source '/a' not found").unwrap().message(),
+            "RenameFile: source '/a' not found"
+        );
+    }
+
+    /// New files take the volume's chunk size; unset/zero/unknown volume
+    /// falls back to `[defaults] chunk_size_mb`.
+    #[test]
+    fn create_file_chunk_size_prefers_volume() {
+        assert_eq!(resolve_create_chunk_size(Some(16 << 20), 4), 16 << 20);
+        assert_eq!(resolve_create_chunk_size(Some(0), 4), 4 << 20);
+        assert_eq!(resolve_create_chunk_size(None, 4), 4 << 20);
+    }
+
+    /// `[scrub] quarantine_on_fault` gates the heartbeat QuarantineNode write.
+    #[test]
+    fn heartbeat_quarantine_write_follows_scrub_setting() {
+        assert!(heartbeat_quarantine_write_enabled(true));
+        assert!(!heartbeat_quarantine_write_enabled(false));
     }
 
     /// CR-3-6/MGR-7 — the heartbeat integrity-fault batch is accepted
@@ -1211,6 +1143,40 @@ mod tests {
             clamp_ack_floor_to_rf(3, &sm, &mixed_chunks, "mixed", "/movies/d.mkv", None),
             3,
             "warm's RF (3) must govern, not cold's RF (1) — the floor stays unchanged"
+        );
+    }
+
+    /// A tier with mandatory RF 0 is cache-only (evictable). Chunks landing
+    /// there must not drop the ack floor to 0 (would ack one evictable copy).
+    #[test]
+    fn ack_floor_clamp_ignores_rf_zero_cache_only_tier() {
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(1, mk_data_node(DiskTier::Hot));
+        sm.nodes.insert(2, mk_data_node(DiskTier::Cold));
+        let mut vol = vol_with_floor("cachey", 2);
+        vol.mandatory_replicas = dtfs_common::types::TierReplication {
+            hot: 0,
+            warm: 0,
+            cold: 1,
+            tape: 0,
+        };
+        sm.volumes.insert("cachey".to_string(), vol);
+        let entry = |node: &str| dtfs_raft::ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: "abc".to_string(),
+            node_id: node.to_string(),
+            disk_id: 0,
+            size_bytes: 1024,
+        };
+        // Only the RF-0 tier: floor untouched.
+        assert_eq!(
+            clamp_ack_floor_to_rf(2, &sm, &[entry("1")], "cachey", "/a", None),
+            2
+        );
+        // RF-0 tier + RF-1 tier: clamps to 1, never 0.
+        assert_eq!(
+            clamp_ack_floor_to_rf(2, &sm, &[entry("1"), entry("2")], "cachey", "/a", None),
+            1
         );
     }
 

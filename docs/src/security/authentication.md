@@ -113,8 +113,8 @@ authenticated gRPC metadata on mutating **and** read RPCs:
   `allow_insecure_empty_secret = true` (LIS-55 / LIS-20).
 
 Callers that stamp: FUSE/client put + get, data→data replication put,
-manager scheduler `ReplicateChunk` / `VerifyChunk` / `ListChunks`, manager
-unlink fan-out, scheduler flush/orphan delete. **Deploy data + manager +
+manager scheduler `ReplicateChunk` / `VerifyChunk` / `ListChunks`, scheduler
+flush/orphan delete. **Deploy data + manager +
 fuse together** when enabling a non-empty secret (update-required). mTLS
 (CF-6) is complementary transport auth, not a substitute for this MAC.
 
