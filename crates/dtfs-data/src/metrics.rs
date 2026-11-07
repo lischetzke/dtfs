@@ -41,11 +41,16 @@ pub struct DataMetrics {
     per_chunk_reads: DashMap<String, DashMap<String, AtomicU64>>,
     /// Last access timestamp per chunk_id (UTC ms).
     per_chunk_last_access: DashMap<String, AtomicU64>,
+    /// (chunk_id, dc) -> timestamp of the last hit that was COUNTED (dedup anchor).
+    per_chunk_dc_last_counted: DashMap<(String, String), u64>,
 }
 
 /// Cap on per-chunk read-tracking. Each entry is roughly
 /// 64 bytes (chunk_id) + 16 bytes per DC. 10k entries ≈ 1 MB worst case.
 const MAX_CHUNK_DC_ENTRIES: usize = 10_000;
+
+/// AV-5-7 read-count dedup window per (chunk, dc).
+const DEDUP_MS: u64 = 1_000;
 
 impl DataMetrics {
     /// Create a new zeroed metrics instance.
@@ -59,6 +64,7 @@ impl DataMetrics {
             cache_misses: AtomicU64::new(0),
             per_chunk_reads: DashMap::new(),
             per_chunk_last_access: DashMap::new(),
+            per_chunk_dc_last_counted: DashMap::new(),
         }
     }
 
@@ -77,6 +83,7 @@ impl DataMetrics {
     pub fn forget_chunk(&self, chunk_id: &str) {
         self.per_chunk_reads.remove(chunk_id);
         self.per_chunk_last_access.remove(chunk_id);
+        self.per_chunk_dc_last_counted.retain(|k, _| k.0 != chunk_id);
     }
 
     /// P0-9: record a per-chunk read attributed to a requester DC.
@@ -98,21 +105,28 @@ impl DataMetrics {
         // 60 s window, and the tiering engine's `promote_reads`
         // threshold (default 2) loses all meaning. Cap to "one
         // increment per (chunk, dc) per `DEDUP_MS`".
-        const DEDUP_MS: u64 = 1_000;
-        let last = self
-            .per_chunk_last_access
+        // The dedup window is anchored at the last COUNTED hit per
+        // (chunk, dc); suppressed hits do not slide it.
+        let dedup_key = (chunk_id.to_string(), dc.to_string());
+        let suppressed = matches!(
+            self.per_chunk_dc_last_counted.get(&dedup_key).map(|v| *v),
+            Some(prev) if now_ms.saturating_sub(prev) < DEDUP_MS
+        );
+        // Last-access is chunk-level and refreshed on every hit so the LRU
+        // eviction (below) keeps an actively read chunk warm.
+        self.per_chunk_last_access
             .entry(chunk_id.to_string())
-            .or_insert_with(|| AtomicU64::new(0));
-        let prev = last.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(prev) < DEDUP_MS && prev != 0 {
-            // Still update last-access timestamp so the LRU
-            // eviction (below) keeps the chunk warm.
-            last.store(now_ms, Ordering::Relaxed);
-            drop(last);
+            .or_insert_with(|| AtomicU64::new(0))
+            .store(now_ms, Ordering::Relaxed);
+        if suppressed {
             return;
         }
-        last.store(now_ms, Ordering::Relaxed);
-        drop(last);
+        self.per_chunk_dc_last_counted.insert(dedup_key, now_ms);
+        if self.per_chunk_dc_last_counted.len() > MAX_CHUNK_DC_ENTRIES {
+            // Entries past the window can never suppress anything.
+            self.per_chunk_dc_last_counted
+                .retain(|_, v| now_ms.saturating_sub(*v) < DEDUP_MS);
+        }
 
         // Eviction: if the table is at capacity AND this chunk isn't already
         // tracked, drop the entry with the oldest last_access to make room.
@@ -322,6 +336,44 @@ mod tests {
         let snap = m.snapshot();
         assert_eq!(snap.cache_hits, 2);
         assert_eq!(snap.cache_misses, 1);
+    }
+
+    fn counted(m: &DataMetrics, dc: &str) -> u32 {
+        // harvest drains; restore is not needed for these assertions.
+        m.harvest_per_chunk(10)
+            .iter()
+            .filter(|h| h.chunk_id == "c")
+            .map(|h| h.reads_by_dc.get(dc).copied().unwrap_or(0))
+            .sum()
+    }
+
+    #[test]
+    fn dedup_is_keyed_by_chunk_and_dc() {
+        let m = DataMetrics::new();
+        m.record_chunk_read("c", "A", 1_000);
+        m.record_chunk_read("c", "B", 1_100); // other dc inside A's window: counted
+        m.record_chunk_read("c", "A", 1_200); // same dc inside window: suppressed
+        let h = m.harvest_per_chunk(10);
+        assert_eq!(h[0].reads_by_dc.get("A"), Some(&1));
+        assert_eq!(h[0].reads_by_dc.get("B"), Some(&1));
+    }
+
+    #[test]
+    fn suppressed_hit_does_not_slide_the_window() {
+        let m = DataMetrics::new();
+        m.record_chunk_read("c", "A", 1_000); // counted
+        m.record_chunk_read("c", "A", 1_600); // suppressed, must not refresh
+        m.record_chunk_read("c", "A", 2_100); // 1100 after the counted hit: counted
+        assert_eq!(counted(&m, "A"), 2);
+    }
+
+    #[test]
+    fn forget_chunk_clears_dedup_anchor() {
+        let m = DataMetrics::new();
+        m.record_chunk_read("c", "A", 1_000);
+        m.forget_chunk("c");
+        m.record_chunk_read("c", "A", 1_100);
+        assert_eq!(counted(&m, "A"), 1);
     }
 
     #[test]
