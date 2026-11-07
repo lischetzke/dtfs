@@ -92,7 +92,7 @@ impl JoinHandler {
     ) -> JoinResult {
         // Verify HMAC(shared_secret, nonce).
         if !verify_join_hmac(&self.shared_secret, nonce, hmac_bytes) {
-            warn!("Join request rejected: invalid HMAC from {}", hostname);
+            warn!(hostname = %hostname, "Join request rejected: invalid HMAC");
             self.audit.log(
                 hostname,
                 "node.join.request",
@@ -119,7 +119,7 @@ impl JoinHandler {
                         });
                     }
                     Err(e) => {
-                        warn!("Failed to generate cluster CA: {}", e);
+                        warn!(error = %e, "Failed to generate cluster CA");
                     }
                 }
             }
@@ -241,7 +241,7 @@ impl JoinHandler {
                         })
                     }
                     ClientResponse::Error { message } => {
-                        warn!("Join completion failed for node {}: {}", node_id, message);
+                        warn!(node_id = %node_id, error = %message, "Join completion failed for node");
                         self.audit.log(
                             &info.hostname,
                             "node.join.complete",
@@ -269,7 +269,7 @@ impl JoinHandler {
                 }
             }
             Err(e) => {
-                warn!("Raft write failed during join: {}", e);
+                warn!(error = %e, "Raft write failed during join");
                 Err(anyhow::anyhow!("Raft write failed: {}", e))
             }
         }

@@ -262,7 +262,7 @@ pub(super) async fn raft_add_learner(
         }
         Err(e) => {
             state.audit_log.log("api", "raft.add_learner", &target, "error");
-            warn!("CF-2 add-learner {} failed: {}", target, e);
+            warn!(target = %target, error = %e, "CF-2 add-learner failed");
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("add_learner failed: {e}")})),
@@ -323,7 +323,7 @@ pub(super) async fn raft_promote(
         }
         Err(e) => {
             state.audit_log.log("api", "raft.promote", &target, "error");
-            warn!("CF-2 promote {} failed: {}", target, e);
+            warn!(target = %target, error = %e, "CF-2 promote failed");
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("change_membership failed: {e}")})),
@@ -388,7 +388,7 @@ pub(super) async fn raft_remove(
         }
         Err(e) => {
             state.audit_log.log("api", "raft.remove", &target, "error");
-            warn!("CF-2 remove {} failed: {}", target, e);
+            warn!(target = %target, error = %e, "CF-2 remove failed");
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("change_membership failed: {e}")})),

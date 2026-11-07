@@ -75,13 +75,13 @@ impl RaftTransportHandler {
                 match self.raft.append_entries(req).await {
                     Ok(resp) => serde_json::to_string(&resp).unwrap_or_default(),
                     Err(e) => {
-                        warn!("AppendEntries error: {}", e);
+                        warn!(error = %e, "AppendEntries error");
                         String::new()
                     }
                 }
             }
             Err(e) => {
-                warn!("Failed to parse AppendEntries: {}", e);
+                warn!(error = %e, "Failed to parse AppendEntries");
                 String::new()
             }
         }
@@ -94,13 +94,13 @@ impl RaftTransportHandler {
                 match self.raft.vote(req).await {
                     Ok(resp) => serde_json::to_string(&resp).unwrap_or_default(),
                     Err(e) => {
-                        warn!("Vote error: {}", e);
+                        warn!(error = %e, "Vote error");
                         String::new()
                     }
                 }
             }
             Err(e) => {
-                warn!("Failed to parse Vote: {}", e);
+                warn!(error = %e, "Failed to parse Vote");
                 String::new()
             }
         }
@@ -127,13 +127,13 @@ impl RaftTransportHandler {
                 match self.raft.install_full_snapshot(snap.vote, snapshot).await {
                     Ok(resp) => serde_json::to_string(&resp).unwrap_or_default(),
                     Err(e) => {
-                        warn!("InstallSnapshot error: {}", e);
+                        warn!(error = %e, "InstallSnapshot error");
                         String::new()
                     }
                 }
             }
             Err(e) => {
-                warn!("Failed to parse Snapshot: {}", e);
+                warn!(error = %e, "Failed to parse Snapshot");
                 String::new()
             }
         }

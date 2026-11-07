@@ -221,7 +221,7 @@ impl TaskScheduler {
         if resp.valid {
             Ok(true)
         } else {
-            warn!("VerifyChunk returned invalid: {}", resp.error);
+            warn!(error = %resp.error, "VerifyChunk returned invalid");
             Ok(false)
         }
     }
@@ -416,7 +416,7 @@ impl TaskScheduler {
         let json = match serde_json::to_string(state) {
             Ok(j) => j,
             Err(e) => {
-                error!("Failed to serialize migration state: {}", e);
+                error!(error = %e, "Failed to serialize migration state");
                 return;
             }
         };
@@ -434,7 +434,7 @@ impl TaskScheduler {
             // levels — operators should investigate when this is the
             // only manager logging "Migration: Copying -> Verifying"
             // for the same task_id every 30s.
-            warn!("Bug AB save_migration_state failed: {} (may not be leader)", e);
+            warn!(error = %e, "Bug AB save_migration_state failed (may not be leader)");
         }
     }
 

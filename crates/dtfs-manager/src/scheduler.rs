@@ -295,7 +295,7 @@ impl TaskScheduler {
             }
 
             if let Err(e) = self.tick().await {
-                warn!("Scheduler tick failed: {}", e);
+                warn!(error = %e, "Scheduler tick failed");
             }
         }
     }

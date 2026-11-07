@@ -225,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
         {
-            tracing::error!("Manager lifecycle task failed: {}", e);
+            tracing::error!(error = %e, "Manager lifecycle task failed");
         }
     });
 

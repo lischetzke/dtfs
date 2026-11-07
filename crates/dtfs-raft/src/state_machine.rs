@@ -680,7 +680,7 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
         // before the Raft log replay starts (F-024).
         if let Some(dir) = &self.snapshot_dir {
             if let Err(e) = StateMachineStore::persist_snapshot_to_disk(dir, &meta, &data_bytes) {
-                warn!("failed to persist snapshot to disk: {}", e);
+                warn!(error = %e, "failed to persist snapshot to disk");
             }
         }
 
@@ -798,7 +798,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         // Persist to disk so this follower can restart cleanly (F-024).
         if let Some(dir) = &self.snapshot_dir {
             if let Err(e) = Self::persist_snapshot_to_disk(dir, meta, &raw) {
-                warn!("failed to persist installed snapshot: {}", e);
+                warn!(error = %e, "failed to persist installed snapshot");
             }
         }
 
@@ -1189,7 +1189,7 @@ fn apply_request(
                 ), eff_now_ms));
                 ClientResponse::Success
             } else {
-                warn!("UpdateChunkLocations: file not found: {path}");
+                warn!(path = %path, "UpdateChunkLocations: file not found");
                 ClientResponse::Error {
                     message: format!("file not found: {path}"),
                 }
@@ -1353,7 +1353,7 @@ fn apply_request(
                     "maintenance" => node.health = HealthStatus::Maintenance,
                     "draining" => node.health = HealthStatus::Draining,
                     other => {
-                        warn!("unknown node status: {other}");
+                        warn!(status = %other, "unknown node status");
                     }
                 }
                 if node.health != old_health {

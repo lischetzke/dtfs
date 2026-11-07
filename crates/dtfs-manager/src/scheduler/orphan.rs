@@ -45,7 +45,7 @@ impl TaskScheduler {
                     "Bug BF-7: auto-unquarantine cleared nodes after cooldown"
                 ),
                 Ok(_) => debug!("Bug BF-7: auto-unquarantine tick clean"),
-                Err(e) => warn!("Bug BF-7: auto-unquarantine tick failed: {e}"),
+                Err(e) => warn!(error = %e, "Bug BF-7: auto-unquarantine tick failed"),
             }
         }
     }
@@ -160,7 +160,7 @@ impl TaskScheduler {
                         debug!("Bug BC-7: orphan_scrub tick clean");
                     }
                 }
-                Err(e) => warn!("Bug BC-7: orphan_scrub tick failed: {e}"),
+                Err(e) => warn!(error = %e, "Bug BC-7: orphan_scrub tick failed"),
             }
         }
     }

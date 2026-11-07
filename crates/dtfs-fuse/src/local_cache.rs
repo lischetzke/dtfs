@@ -442,7 +442,7 @@ pub fn spawn_pruner(
         loop {
             ticker.tick().await;
             if let Err(e) = cache.prune_by_age().await {
-                tracing::warn!("local cache prune failed: {e}");
+                tracing::warn!(error = %e, "local cache prune failed");
             }
         }
     })

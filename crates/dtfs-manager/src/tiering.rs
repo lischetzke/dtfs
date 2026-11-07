@@ -180,7 +180,7 @@ impl TieringEngine {
             }
 
             if let Err(e) = self.evaluate().await {
-                warn!("Tiering evaluation failed: {}", e);
+                warn!(error = %e, "Tiering evaluation failed");
             }
         }
     }
@@ -491,7 +491,7 @@ impl TieringEngine {
         // policy produce no plan (the planner skips them); volumes
         // WITH a policy drive the new opportunistic cache lifecycle.
         if let Err(e) = self.tick_av_cache().await {
-            warn!("Bug AV tick_av_cache failed: {}", e);
+            warn!(error = %e, "Bug AV tick_av_cache failed");
         }
 
         Ok(())

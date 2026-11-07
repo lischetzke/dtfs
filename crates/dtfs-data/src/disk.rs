@@ -150,7 +150,7 @@ impl DiskManager {
     pub fn mark_disk_failed(&mut self, disk_id: u32) {
         if let Some(disk) = self.disks.iter_mut().find(|d| d.disk_id == disk_id) {
             disk.status = DiskStatus::Failed;
-            tracing::warn!("Disk {} marked as FAILED: {}", disk_id, disk.mount_path.display());
+            tracing::warn!(disk_id, path = %disk.mount_path.display(), "disk marked as FAILED");
         }
     }
 

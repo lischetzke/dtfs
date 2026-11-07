@@ -390,7 +390,7 @@ impl Filesystem for DtfsFuse3Adapter {
         // dropping chunks past the new EOF on a shrink.
         if let Some(new_size) = set_attr.size {
             if let Err(e) = self.fs.truncate(&path, fh, new_size).await {
-                warn!("fuse3 setattr truncate {}: {}", path, e);
+                warn!(path = %path, error = %e, "fuse3 setattr truncate failed");
                 return Err(Errno::from(libc::EIO));
             }
         }
@@ -425,7 +425,7 @@ impl Filesystem for DtfsFuse3Adapter {
                 // P0-1: surface write-lease conflicts as EBUSY so apps see
                 // "Resource busy" instead of a generic ENOENT.
                 if e.downcast_ref::<crate::filesystem::LeaseBusy>().is_some() {
-                    warn!("fuse3 open {}: write lease busy", path);
+                    warn!(path = %path, "fuse3 open: write lease busy");
                     return Err(Errno::from(libc::EBUSY));
                 }
                 // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
@@ -445,7 +445,7 @@ impl Filesystem for DtfsFuse3Adapter {
     ) -> FuseResult<()> {
         debug!("fuse3:release fh={}", fh);
         self.fs.release(fh).await.map_err(|e| {
-            warn!("fuse3 release fh={}: {}", fh, e);
+            warn!(fh, error = %e, "fuse3 release failed");
             Errno::from(libc::EIO)
         })
     }
@@ -465,7 +465,7 @@ impl Filesystem for DtfsFuse3Adapter {
         match self.fs.read(fh, offset, size).await {
             Ok(data) => Ok(ReplyData { data }),
             Err(e) => {
-                warn!("fuse3 read fh={}: {}", fh, e);
+                warn!(fh, error = %e, "fuse3 read failed");
                 Err(Errno::from(libc::EIO))
             }
         }
@@ -491,7 +491,7 @@ impl Filesystem for DtfsFuse3Adapter {
         match self.fs.write(fh, offset, data).await {
             Ok(written) => Ok(ReplyWrite { written }),
             Err(e) => {
-                warn!("fuse3 write fh={}: {}", fh, e);
+                warn!(fh, error = %e, "fuse3 write failed");
                 Err(Errno::from(libc::EIO))
             }
         }
@@ -513,7 +513,7 @@ impl Filesystem for DtfsFuse3Adapter {
         // fault). Same shape as the F_UNLCK arm of `setlk`.
         self.release_posix_locks_for_owner(inode, lock_owner).await;
         self.fs.flush(fh).await.map_err(|e| {
-            warn!("fuse3 flush fh={}: {}", fh, e);
+            warn!(fh, error = %e, "fuse3 flush failed");
             Errno::from(libc::EIO)
         })
     }
@@ -533,7 +533,7 @@ impl Filesystem for DtfsFuse3Adapter {
     ) -> FuseResult<()> {
         debug!("fuse3:fsync fh={}", fh);
         self.fs.flush(fh).await.map_err(|e| {
-            warn!("fuse3 fsync fh={}: {}", fh, e);
+            warn!(fh, error = %e, "fuse3 fsync failed");
             Errno::from(libc::EIO)
         })
     }
@@ -699,7 +699,7 @@ impl Filesystem for DtfsFuse3Adapter {
             // never a bare EIO/ENOENT — a manager blip during a mkdir must
             // not be misreported.
             Err(e) => {
-                warn!("fuse3 mkdir {}: {}", path, e);
+                warn!(path = %path, error = %e, "fuse3 mkdir failed");
                 Err(cluster_err_to_errno(&e))
             }
         }
@@ -730,7 +730,7 @@ impl Filesystem for DtfsFuse3Adapter {
             // to EIO, not ENOENT — `cluster_err_to_errno` makes ENOENT
             // conditional on a genuine NotFound.
             Err(e) => {
-                warn!("fuse3 unlink {}: {}", path, e);
+                warn!(path = %path, error = %e, "fuse3 unlink failed");
                 Err(cluster_err_to_errno(&e))
             }
         }
@@ -751,7 +751,7 @@ impl Filesystem for DtfsFuse3Adapter {
             }
             // CR-1-6 (FUSE-4/CO-4-16): same rationale as unlink above.
             Err(e) => {
-                warn!("fuse3 rmdir {}: {}", path, e);
+                warn!(path = %path, error = %e, "fuse3 rmdir failed");
                 Err(cluster_err_to_errno(&e))
             }
         }
@@ -782,7 +782,7 @@ impl Filesystem for DtfsFuse3Adapter {
             Err(e) => {
                 // P0-1: write-lease conflict on create → EBUSY.
                 if e.downcast_ref::<crate::filesystem::LeaseBusy>().is_some() {
-                    warn!("fuse3 create {}: write lease busy", path);
+                    warn!(path = %path, "fuse3 create: write lease busy");
                     return Err(Errno::from(libc::EBUSY));
                 }
                 // Bug Y diagnostic — include the anyhow error chain so we
@@ -791,7 +791,7 @@ impl Filesystem for DtfsFuse3Adapter {
                 // "create_file failed".
                 // CR-1-6 (FUSE-4/CO-4-16): route the generic case through
                 // cluster_err_to_errno too.
-                warn!("fuse3 create {}: {:#}", path, e);
+                warn!(path = %path, error = %format!("{:#}", e), "fuse3 create failed");
                 Err(cluster_err_to_errno(&e))
             }
         }
@@ -1042,7 +1042,7 @@ impl Filesystem for DtfsFuse3Adapter {
         // turns the trailing bytes into a hole, matching what other
         // filesystems do for default-mode fallocate.
         if let Err(e) = self.fs.set_size(fh, new_size).await {
-            warn!("fuse3 fallocate set_size: {}", e);
+            warn!(error = %e, "fuse3 fallocate set_size failed");
             return Err(Errno::from(libc::EIO));
         }
         Ok(())
@@ -1082,7 +1082,7 @@ impl Filesystem for DtfsFuse3Adapter {
             }
             // CR-1-6 (FUSE-4/CO-4-16): route through cluster_err_to_errno.
             Err(e) => {
-                warn!("fuse3 rename {} -> {}: {}", from, to, e);
+                warn!(from = %from, to = %to, error = %e, "fuse3 rename failed");
                 Err(cluster_err_to_errno(&e))
             }
         }
@@ -1128,7 +1128,7 @@ impl Filesystem for DtfsFuse3Adapter {
             }
             // CR-1-6 (FUSE-4/CO-4-16): route through cluster_err_to_errno.
             Err(e) => {
-                warn!("fuse3 symlink {}: {}", path, e);
+                warn!(path = %path, error = %e, "fuse3 symlink failed");
                 Err(cluster_err_to_errno(&e))
             }
         }
@@ -1174,7 +1174,7 @@ impl Filesystem for DtfsFuse3Adapter {
             }
             // CR-1-6 (FUSE-4/CO-4-16): route through cluster_err_to_errno.
             Err(e) => {
-                warn!("fuse3 link {} -> {}: {}", src, dst, e);
+                warn!(src = %src, dst = %dst, error = %e, "fuse3 link failed");
                 Err(cluster_err_to_errno(&e))
             }
         }

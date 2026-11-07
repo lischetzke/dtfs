@@ -254,7 +254,7 @@ async fn main() -> anyhow::Result<()> {
             ),
             Err(e) => {
                 // Already initialised is fine (idempotent restart).
-                tracing::warn!("Raft init: {} (may already be initialised)", e);
+                tracing::warn!(error = %e, "Raft init failed (may already be initialised)");
             }
         }
 
@@ -268,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             if let Err(e) = raft_for_snap.trigger().snapshot().await {
-                tracing::warn!("post-bootstrap trigger_snapshot failed: {}", e);
+                tracing::warn!(error = %e, "post-bootstrap trigger_snapshot failed");
             } else {
                 tracing::info!("post-bootstrap snapshot triggered");
             }

@@ -315,7 +315,7 @@ impl HealthMonitor {
                         self.update_node_status_in_raft(*node_id, "suspect", &membership_nodes).await;
                     }
                     NodeStatus::Down => {
-                        warn!("Node {} is DOWN", node_id);
+                        warn!(node_id = %node_id, "Node is DOWN");
                         // Mark in Raft so placement and tiering stop using
                         // this node — and so the leader's scheduler tick
                         // stops counting its replicas (Bug CH:
