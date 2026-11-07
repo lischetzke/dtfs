@@ -3,6 +3,9 @@ pub mod network;
 pub mod snapshot;
 pub mod state_machine;
 
+#[cfg(test)]
+mod compat_tests;
+
 use std::fmt;
 use std::io::Cursor;
 

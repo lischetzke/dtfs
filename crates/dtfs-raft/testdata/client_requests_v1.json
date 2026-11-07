@@ -1,0 +1,357 @@
+[
+  {
+    "CreateFile": {
+      "path": "/a",
+      "volume_id": "default",
+      "chunk_size": 1024
+    }
+  },
+  {
+    "DeleteFile": {
+      "path": "/a"
+    }
+  },
+  {
+    "UpdateChunkLocations": {
+      "path": "/a",
+      "chunks": [
+        {
+          "chunk_index": 0,
+          "chunk_hash": "0000000000000000000000000000000000000000000000000000000000000001",
+          "node_id": "7",
+          "disk_id": 1,
+          "size_bytes": 4096
+        }
+      ],
+      "lease_id": "l1",
+      "now_ms": 5
+    }
+  },
+  {
+    "RemoveCorruptChunkReplicas": {
+      "node_id": "7",
+      "chunk_hashes": [
+        "ab"
+      ],
+      "disk_id": 1,
+      "now_ms": 5
+    }
+  },
+  {
+    "RegisterNode": {
+      "node_id": 7,
+      "info": {
+        "role": "data",
+        "hostname": "data-primary01",
+        "grpc_addr": "10.0.0.7:9200",
+        "location": {
+          "region": "eu",
+          "datacenter": "LELI",
+          "rack": "r1",
+          "host": "data-primary01"
+        },
+        "disks": [
+          {
+            "disk_id": 1,
+            "uuid": "uuid-1",
+            "mount_path": "/srv/d1",
+            "tier": "cold",
+            "total_bytes": 1000,
+            "used_bytes": 10,
+            "status": "healthy"
+          }
+        ],
+        "total_capacity": 1000,
+        "used_capacity": 10,
+        "health": "quarantined",
+        "last_seen_ms": 111,
+        "total_bytes_read": 5,
+        "total_bytes_written": 6,
+        "client_ip": "10.0.0.9",
+        "version": "v1.2.3",
+        "build_date": "20260101-000000",
+        "quarantine": {
+          "since_ms": 1,
+          "reason": "deep_scrub_hash_mismatch",
+          "triggering_chunk_id": "abc",
+          "fault_count_total": 2,
+          "last_fault_at_ms": 3,
+          "last_fault_summary": "bad hash"
+        }
+      }
+    }
+  },
+  {
+    "DeregisterNode": {
+      "node_id": 7
+    }
+  },
+  {
+    "UpdateNodeStatus": {
+      "node_id": 7,
+      "status": "down"
+    }
+  },
+  {
+    "QuarantineNode": {
+      "node_id": 7,
+      "info": {
+        "since_ms": 1,
+        "reason": "deep_scrub_hash_mismatch",
+        "triggering_chunk_id": "abc",
+        "fault_count_total": 2,
+        "last_fault_at_ms": 3,
+        "last_fault_summary": "bad hash"
+      }
+    }
+  },
+  {
+    "UnquarantineNode": {
+      "node_id": 7,
+      "operator_id": "op",
+      "reason_acknowledged": "fixed"
+    }
+  },
+  {
+    "UpdateNodeUsage": {
+      "node_id": 7,
+      "used_capacity": 1,
+      "chunk_count": 2,
+      "total_bytes_read": 3,
+      "total_bytes_written": 4,
+      "observed_at_ms": 5
+    }
+  },
+  {
+    "UpdateConfig": {
+      "config_json": "{}",
+      "version": 2,
+      "expected_version": 1
+    }
+  },
+  {
+    "UpsertVolume": {
+      "config": {
+        "id": "default",
+        "name": "default",
+        "chunk_size_bytes": 134217728,
+        "replication": {
+          "hot": 3,
+          "warm": 2,
+          "cold": 1,
+          "tape": 1
+        },
+        "write_safety": {
+          "min_replicas_before_ack": 2,
+          "write_timeout_secs": 30
+        },
+        "anchor_datacenter": null,
+        "mandatory_replicas": {
+          "hot": 0,
+          "warm": 0,
+          "cold": 0,
+          "tape": 0
+        },
+        "cache_replicas": {
+          "hot": {
+            "min": 0,
+            "max": 0
+          },
+          "warm": {
+            "min": 0,
+            "max": 0
+          },
+          "cold": {
+            "min": 0,
+            "max": 0
+          },
+          "tape": {
+            "min": 0,
+            "max": 0
+          },
+          "per_dc": false,
+          "promote_reads": 0,
+          "promote_window_secs": 0,
+          "cooldown_secs": 0
+        },
+        "anchor": null,
+        "schedules": {},
+        "spill": {
+          "allow": null,
+          "forbidden_tiers": [],
+          "forbidden_datacenters": []
+        }
+      }
+    }
+  },
+  {
+    "DeleteVolume": {
+      "volume_id": "default"
+    }
+  },
+  {
+    "ReportScrubResult": {
+      "node_id": 7,
+      "disk_path": "/d",
+      "level": "quick",
+      "completed_at_ms": 1,
+      "chunks_checked": 2,
+      "chunks_healthy": 3,
+      "chunks_corrupt": 4,
+      "chunks_missing": 5,
+      "duration_secs": 0.5
+    }
+  },
+  {
+    "UpdateMigrationState": {
+      "json": "{}"
+    }
+  },
+  {
+    "RenameFile": {
+      "from": "/a",
+      "to": "/b",
+      "now_ms": 5
+    }
+  },
+  {
+    "SetFileSize": {
+      "path": "/a",
+      "new_size": 10,
+      "now_ms": 5
+    }
+  },
+  {
+    "CreateSymlink": {
+      "path": "/l",
+      "target": "/a",
+      "now_ms": 5
+    }
+  },
+  {
+    "CreateLink": {
+      "source": "/a",
+      "dest": "/c",
+      "now_ms": 5
+    }
+  },
+  {
+    "AcquireLock": {
+      "path": "/a",
+      "owner_id": "o",
+      "start": 0,
+      "end": 9,
+      "write": true,
+      "lease_ms": 1000,
+      "now_ms": 5
+    }
+  },
+  {
+    "ReleaseLock": {
+      "path": "/a",
+      "owner_id": "o",
+      "start": 0,
+      "end": 9
+    }
+  },
+  {
+    "AcquireWriteLease": {
+      "path": "/a",
+      "owner_id": "o",
+      "lease_ms": 1000,
+      "now_ms": 5,
+      "proposed_lease_id": "l1"
+    }
+  },
+  {
+    "RenewWriteLease": {
+      "path": "/a",
+      "lease_id": "l1",
+      "extension_ms": 1000,
+      "now_ms": 5
+    }
+  },
+  {
+    "ReleaseWriteLease": {
+      "path": "/a",
+      "lease_id": "l1"
+    }
+  },
+  {
+    "ReleaseLeasesByHost": {
+      "hostname_prefix": "h",
+      "except_pid": 1,
+      "now_ms": 5
+    }
+  },
+  {
+    "SweepExpiredLeases": {
+      "now_ms": 5
+    }
+  },
+  {
+    "ReportChunkReads": {
+      "node_id": 7,
+      "entries": [
+        [
+          "c1",
+          {
+            "LELI": 3
+          }
+        ]
+      ]
+    }
+  },
+  {
+    "TriggerScrub": {
+      "id": "s1",
+      "level": "deep",
+      "requested_at_ms": 5
+    }
+  },
+  {
+    "UpdateNodeDiskUsage": {
+      "node_id": 7,
+      "per_disk": [
+        [
+          1,
+          100,
+          10
+        ]
+      ]
+    }
+  },
+  {
+    "AppendAudit": {
+      "actor": "a",
+      "action": "x.y",
+      "target": "t",
+      "result": "success",
+      "origin_manager": "mgr01",
+      "timestamp_ms": 5
+    }
+  },
+  {
+    "RemoveChunkLocation": {
+      "path": "/a",
+      "chunk_index": 0,
+      "node_id": "7",
+      "disk_id": 1,
+      "enforce_anchor": {
+        "datacenter": "LELI",
+        "required_tier": null
+      },
+      "now_ms": 5
+    }
+  },
+  {
+    "SetChunkCooldown": {
+      "path": "/a",
+      "chunk_indexes": [
+        0,
+        1
+      ],
+      "expires_at_ms": 9
+    }
+  }
+]

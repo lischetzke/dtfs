@@ -1,0 +1,221 @@
+{
+  "audit_log": [
+    {
+      "action": "volume.create",
+      "actor": "admin",
+      "log_index": 40,
+      "origin_manager": "mgr01",
+      "result": "success",
+      "summary": "volume.create: v1",
+      "target": "v1",
+      "timestamp_ms": 77
+    }
+  ],
+  "client_count": 2,
+  "cluster_config": {
+    "config_json": "{\"k\":1}",
+    "version": 4
+  },
+  "files": {
+    "/media/a.mkv": {
+      "cache_cooldown_until_ms": {
+        "0": 5000
+      },
+      "chunk_size": 134217728,
+      "chunks": [
+        {
+          "chunk_hash": "0000000000000000000000000000000000000000000000000000000000000001",
+          "chunk_index": 0,
+          "disk_id": 1,
+          "node_id": "7",
+          "size_bytes": 4096
+        },
+        {
+          "chunk_hash": "0000000000000000000000000000000000000000000000000000000000000002",
+          "chunk_index": 1,
+          "disk_id": 1,
+          "node_id": "7",
+          "size_bytes": 4096
+        }
+      ],
+      "created_at_ms": 10,
+      "is_directory": false,
+      "logical_size": 8192,
+      "path": "/media/a.mkv",
+      "symlink_target": "/media/b.mkv",
+      "updated_at_ms": 20,
+      "volume_id": "default"
+    }
+  },
+  "last_applied_log": [
+    3,
+    42
+  ],
+  "last_membership": {
+    "log_id": null,
+    "membership": {
+      "configs": [],
+      "nodes": {}
+    }
+  },
+  "migration_state_json": "{\"tasks\":[]}",
+  "nodes": {
+    "7": {
+      "build_date": "20260101-000000",
+      "client_ip": "10.0.0.9",
+      "disks": [
+        {
+          "disk_id": 1,
+          "mount_path": "/srv/d1",
+          "status": "healthy",
+          "tier": "cold",
+          "total_bytes": 1000,
+          "used_bytes": 10,
+          "uuid": "uuid-1"
+        }
+      ],
+      "grpc_addr": "10.0.0.7:9200",
+      "health": "quarantined",
+      "hostname": "data-primary01",
+      "last_seen_ms": 111,
+      "location": {
+        "datacenter": "LELI",
+        "host": "data-primary01",
+        "rack": "r1",
+        "region": "eu"
+      },
+      "quarantine": {
+        "fault_count_total": 2,
+        "last_fault_at_ms": 3,
+        "last_fault_summary": "bad hash",
+        "reason": "deep_scrub_hash_mismatch",
+        "since_ms": 1,
+        "triggering_chunk_id": "abc"
+      },
+      "role": "data",
+      "total_bytes_read": 5,
+      "total_bytes_written": 6,
+      "total_capacity": 1000,
+      "used_capacity": 10,
+      "version": "v1.2.3"
+    }
+  },
+  "pending_scrub": {
+    "id": "s1",
+    "level": "deep",
+    "requested_at_ms": 5
+  },
+  "posix_locks": {
+    "/media/a.mkv": [
+      {
+        "end": 10,
+        "expires_at_ms": 9,
+        "owner_id": "o1",
+        "start": 0,
+        "write": true
+      }
+    ]
+  },
+  "scrub_results": {
+    "7": {
+      "chunks_checked": 10,
+      "chunks_corrupt": 1,
+      "chunks_healthy": 8,
+      "chunks_missing": 1,
+      "completed_at_ms": 99,
+      "disk_path": "/srv/d1",
+      "duration_secs": 1.5,
+      "level": "quick",
+      "node_id": 7
+    }
+  },
+  "scrub_results_by_level": {
+    "7": {
+      "deep": {
+        "chunks_checked": 10,
+        "chunks_corrupt": 1,
+        "chunks_healthy": 8,
+        "chunks_missing": 1,
+        "completed_at_ms": 99,
+        "disk_path": "/srv/d1",
+        "duration_secs": 1.5,
+        "level": "deep",
+        "node_id": 7
+      },
+      "quick": {
+        "chunks_checked": 10,
+        "chunks_corrupt": 1,
+        "chunks_healthy": 8,
+        "chunks_missing": 1,
+        "completed_at_ms": 99,
+        "disk_path": "/srv/d1",
+        "duration_secs": 1.5,
+        "level": "quick",
+        "node_id": 7
+      }
+    }
+  },
+  "volumes": {
+    "default": {
+      "anchor": {
+        "datacenter": "LELI",
+        "required_tier": "cold"
+      },
+      "anchor_datacenter": null,
+      "cache_replicas": {
+        "cold": {
+          "max": 0,
+          "min": 0
+        },
+        "cooldown_secs": 0,
+        "hot": {
+          "max": 0,
+          "min": 0
+        },
+        "per_dc": false,
+        "promote_reads": 0,
+        "promote_window_secs": 0,
+        "tape": {
+          "max": 0,
+          "min": 0
+        },
+        "warm": {
+          "max": 0,
+          "min": 0
+        }
+      },
+      "chunk_size_bytes": 134217728,
+      "id": "default",
+      "mandatory_replicas": {
+        "cold": 0,
+        "hot": 0,
+        "tape": 0,
+        "warm": 0
+      },
+      "name": "default",
+      "replication": {
+        "cold": 1,
+        "hot": 3,
+        "tape": 1,
+        "warm": 2
+      },
+      "schedules": {},
+      "spill": {
+        "allow": null,
+        "forbidden_datacenters": [],
+        "forbidden_tiers": []
+      },
+      "write_safety": {
+        "min_replicas_before_ack": 2,
+        "write_timeout_secs": 30
+      }
+    }
+  },
+  "write_leases": {
+    "/media/a.mkv": {
+      "expires_at_ms": 8,
+      "lease_id": "l1",
+      "owner_id": "o1"
+    }
+  }
+}

@@ -8,3 +8,4 @@
 *.ico binary
 *.woff binary
 *.woff2 binary
+crates/dtfs-raft/testdata/*.json -text

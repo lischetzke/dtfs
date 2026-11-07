@@ -45,7 +45,7 @@ Crates: **dtfs-manager** (Raft peer, REST/gRPC, owns metadata), **dtfs-data** (p
 
 ## A.3 Conventions — Do Not Break
 
-**A.3.1 Snapshot compat.** Every new `StateMachineData` field carries `#[serde(default)]` + old-snapshot-loads regression test (`state_machine::posix_path_regression` or `snapshot_persistence_tests`). `ClientRequest` landing a timestamp in replicated state carries `#[serde(default)] now_ms: u64`, stamped by proposer; apply falls back to `log_id.index` when `0`.
+**A.3.1 Snapshot compat.** Every new `StateMachineData` field carries `#[serde(default)]` + old-snapshot-loads regression test (`state_machine::posix_path_regression` or `snapshot_persistence_tests`). `ClientRequest` landing a timestamp in replicated state carries `#[serde(default)] now_ms: u64`, stamped by proposer; apply falls back to `log_id.index` when `0`. Guard: `dtfs-raft/src/compat_tests.rs` loads committed `testdata/{snapshot,client_requests}_v1.json` (new `ClientRequest` variant breaks the build until added); fixtures are append-only: never regenerate a `_v1`, add `_v2` when the format grows.
 
 **A.3.2 Memory discipline.** No `Vec<u8>` of full chunks on hot path, read or write: stream to/off disk, hash incrementally. `[memory]` on all roles (core `dtfs-common/src/memory.rs`), validated at startup with `PlacementConfig::validate()`. FUSE caches bounded. FUSE detail: `.claude/rules/fuse.md`.
 
