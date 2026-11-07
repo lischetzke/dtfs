@@ -156,6 +156,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Re-report chunks quarantined by a previous run whose report may not
+    // have reached the manager (the pending queue is in-memory only).
+    let requeued = chunk_store.requeue_quarantined_for_report();
+    if requeued > 0 {
+        tracing::warn!(count = requeued, "re-reporting quarantined chunks at startup");
+    }
+
     // Bug BU-6 — reclaim any leftover streaming *.dat.tmp files. At startup
     // no put_chunk is in flight, so any streaming tmp is an orphan from a
     // crash or ENOSPC-aborted put whose RAII cleanup couldn't run across the
@@ -337,13 +344,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Drain any pending corruption reports one last time. We can't send to
-    // the manager from here (the heartbeat task owns the client), but we
-    // re-enqueue them so the next startup picks them up via WAL+rescan.
+    // the manager from here (the heartbeat task owns the client) and the
+    // queue is in-memory only; the next start re-enqueues quarantined
+    // chunks from `.dtfs/quarantine/*.dat.bad` (requeue_quarantined_for_report).
     let last_corrupt = chunk_store.drain_pending_corruption();
     if !last_corrupt.is_empty() {
         tracing::warn!(
             count = last_corrupt.len(),
-            "Bug U undelivered corruption reports at shutdown — next start will rediscover via scrub"
+            "Bug U undelivered corruption reports at shutdown; next start re-reports them from the quarantine dir"
         );
     }
 

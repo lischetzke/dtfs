@@ -858,6 +858,35 @@ impl ChunkStore {
         Err(DtfsError::ChunkNotFound(chunk_id.to_string()))
     }
 
+    /// Re-enqueue chunks sitting in `<disk>/.dtfs/quarantine/*.dat.bad` for
+    /// corruption reporting. `pending_corruption` is in-memory only and
+    /// quarantined chunks are no longer in `chunks/`, so scrub never finds
+    /// them again; without this an unreported quarantine is lost on restart.
+    /// Chunks that have a live `.dat` again (re-replicated here since) are
+    /// skipped: the manager's removal is a node-wide sweep and must not drop
+    /// a good new copy. Returns the number enqueued.
+    pub fn requeue_quarantined_for_report(&self) -> usize {
+        let mut ids = std::collections::BTreeSet::new();
+        for disk in self.disk_paths() {
+            let Ok(rd) = std::fs::read_dir(disk.join(".dtfs").join("quarantine")) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".dat.bad")) else {
+                    continue;
+                };
+                let Ok(id) = ChunkId::from_hex(stem) else { continue };
+                if self.chunk_file_path(&id).is_none() {
+                    ids.insert(stem.to_string());
+                }
+            }
+        }
+        let n = ids.len();
+        self.enqueue_pending_corruption(ids);
+        n
+    }
+
     /// Return all disk mount paths for enumeration (used by scrub scheduler).
     pub fn disk_paths(&self) -> Vec<std::path::PathBuf> {
         self.disk_manager
@@ -2251,6 +2280,36 @@ mod tests {
         let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
         assert_eq!(res.corrupt_chunk_ids, vec![ghost.as_hex()]);
         assert_eq!(res.chunks_meta_repaired, 0, "a hash mismatch must not be repaired");
+    }
+
+    #[tokio::test]
+    async fn requeue_quarantined_reports_only_chunks_without_live_dat() {
+        let (store, _tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+        let vol = VolumeId::new("default".to_string());
+        let q = disk.join(".dtfs").join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+
+        let gone = ChunkId::from_bytes(checksum::compute(b"quarantined-gone"));
+        std::fs::write(q.join(format!("{}.dat.bad", gone.as_hex())), b"x").unwrap();
+        // A .meta.bad breadcrumb and junk are ignored.
+        std::fs::write(q.join(format!("{}.meta.bad", gone.as_hex())), b"x").unwrap();
+        std::fs::write(q.join("junk.dat.bad"), b"x").unwrap();
+        // Re-replicated since: live .dat present, so not re-reported.
+        let back = b"quarantined-but-recreated";
+        let back_id = ChunkId::from_bytes(checksum::compute(back));
+        std::fs::write(q.join(format!("{}.dat.bad", back_id.as_hex())), b"x").unwrap();
+        store.put_chunk(&back_id, back, &vol, DiskTier::Hot).await.unwrap();
+
+        assert_eq!(store.requeue_quarantined_for_report(), 1);
+        assert_eq!(store.drain_pending_corruption(), vec![gone.as_hex()]);
+    }
+
+    #[tokio::test]
+    async fn requeue_quarantined_with_no_quarantine_dir_is_zero() {
+        let (store, _tmp) = make_test_store().await;
+        assert_eq!(store.requeue_quarantined_for_report(), 0);
+        assert!(store.drain_pending_corruption().is_empty());
     }
 
     #[tokio::test]
