@@ -24,9 +24,8 @@ thiserror = { workspace = true }
 clap = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
-# P0-11: disk-cache atime updates + xxhash for stable LRU jitter
+# P0-11: disk-cache atime updates
 filetime = "0.2"
-xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

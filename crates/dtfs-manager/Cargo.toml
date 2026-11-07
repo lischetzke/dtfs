@@ -32,13 +32,9 @@ dashmap = { workspace = true }
 parking_lot = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-jsonwebtoken = { workspace = true }
-bcrypt = { workspace = true }
-rust-embed = { workspace = true }
 prometheus-client = { workspace = true }
 openraft = { workspace = true }
 xxhash-rust = { workspace = true }
-http-body = { workspace = true }
 http-body-util = { workspace = true }
 hex = { workspace = true }
 # AZ-5 — write-to-disk on POST /config persists merged config back

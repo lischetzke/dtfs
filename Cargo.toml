@@ -25,7 +25,6 @@ tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.13", features = ["tls-ring"] }
 tonic-build = "0.13"
 prost = "0.13"
-prost-types = "0.13"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -43,7 +42,6 @@ rocksdb = "0.22"
 axum = { version = "0.8", features = ["tokio"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
-http-body = "1"
 http-body-util = "0.1"
 
 # TLS
@@ -80,9 +78,6 @@ async-trait = "0.1"
 futures = "0.3"
 hmac = "0.12"
 sha2 = "0.10"
-jsonwebtoken = "9"
-bcrypt = "0.16"
-rust-embed = "8"
 tokio-stream = "0.1"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

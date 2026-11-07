@@ -11,9 +11,6 @@
 #   ./scripts/build-docs.sh --open    # build and open in browser
 #   ./scripts/build-docs.sh --clean   # remove output directory first
 #
-# The built docs are also embedded into the dtfs-manager binary at compile
-# time (via rust-embed) and served at http://<manager>:9402/docs/.
-#
 
 set -euo pipefail
 
