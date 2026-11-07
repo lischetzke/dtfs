@@ -615,7 +615,7 @@ impl ChunkStore {
         let meta_json = match serde_json::to_string_pretty(&meta) {
             Ok(j) => j,
             Err(e) => {
-                cleanup_after_dat_committed(&final_dat_path, &final_meta_path, &wal_path).await;
+                cleanup_after_failed_commit(already_present, &final_dat_path, &final_meta_path, &wal_path).await;
                 return Err(DtfsError::Serialization(e.to_string()));
             }
         };
@@ -624,7 +624,8 @@ impl ChunkStore {
             // at this point; a failure writing its `.meta` companion must
             // not leave a `.dat` with no matching `.meta` (nor a stale WAL
             // entry) behind.
-            cleanup_after_dat_committed(&final_dat_path, &final_meta_path, &wal_path).await;
+            tracing::warn!(chunk_id = %chunk_id, already_present, error = %e, "meta write failed after dat rename");
+            cleanup_after_failed_commit(already_present, &final_dat_path, &final_meta_path, &wal_path).await;
             return Err(e);
         }
 
@@ -1740,6 +1741,22 @@ async fn cleanup_after_dat_committed(final_dat_path: &Path, final_meta_path: &Pa
     let _ = fs::remove_file(final_dat_path).await;
     let _ = fs::remove_file(final_meta_path).await;
     let _ = fs::remove_file(wal_path).await;
+}
+
+/// A duplicate upload of an already-complete chunk that fails after the
+/// rename must not destroy the good replica: bytes are content-addressed so
+/// the old `.dat`/`.meta` stay valid; only the WAL entry is removed.
+async fn cleanup_after_failed_commit(
+    already_present: bool,
+    final_dat_path: &Path,
+    final_meta_path: &Path,
+    wal_path: &Path,
+) {
+    if already_present {
+        let _ = fs::remove_file(wal_path).await;
+    } else {
+        cleanup_after_dat_committed(final_dat_path, final_meta_path, wal_path).await;
+    }
 }
 
 /// Bug O / CR-4-1 (DATA-1) — quarantine a chunk whose on-disk bytes have
@@ -3331,6 +3348,39 @@ mod tests {
         assert!(!final_dat_path.exists(), "no orphan .dat left behind");
         let wal_path = wal_dir(tmp.path()).join(format!("{}.wal.json", chunk_id.as_hex()));
         assert!(!wal_path.exists(), "no stale WAL entry left behind");
+    }
+
+    /// Duplicate upload of an already-present chunk whose meta write fails
+    /// must keep the existing `.dat` and `.meta` (only the WAL is removed).
+    #[tokio::test]
+    async fn duplicate_upload_meta_failure_keeps_existing_replica() {
+        let (store, tmp) = make_test_store().await;
+        let data = b"dup-upload-payload";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+
+        let chunk_dir = chunk_data_dir(tmp.path(), &chunk_id);
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let final_dat_path = chunk_dir.join(format!("{}.dat", chunk_id.as_hex()));
+        std::fs::write(&final_dat_path, data).unwrap();
+        // Existing "meta" as a non-empty dir: exists() is true and the
+        // rename in write_meta_atomic fails.
+        let final_meta_path = chunk_dir.join(format!("{}.meta", chunk_id.as_hex()));
+        std::fs::create_dir_all(&final_meta_path).unwrap();
+        std::fs::write(final_meta_path.join("blocker"), b"x").unwrap();
+
+        let tmp_path = tmp.path().join("tmp").join(format!("{}.dat.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp_path, data).unwrap();
+
+        let res = store
+            .commit_chunk_from_tmp(&chunk_id, &tmp_path, &volume_id, DiskTier::Hot, data.len() as u64, hash)
+            .await;
+        assert!(res.is_err());
+        assert_eq!(std::fs::read(&final_dat_path).unwrap(), data, "good .dat must survive");
+        assert!(final_meta_path.exists(), "existing .meta must survive");
+        let wal_path = wal_dir(tmp.path()).join(format!("{}.put.wal.json", chunk_id.as_hex()));
+        assert!(!wal_path.exists(), "WAL entry cleared");
     }
 
     // ── CR-4-4 (DATA-3) — per-chunk lock across commit/delete ──────
