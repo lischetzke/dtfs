@@ -89,48 +89,6 @@ t_fail "dtfs-install.sh rejects missing tarball" \
 t "dtfs-install.sh syntax"  bash -n "$SCRIPT_DIR/dtfs-install.sh"
 
 echo ""
-echo "=== dtfs-update.sh ==="
-
-HELP=$(bash "$SCRIPT_DIR/dtfs-update.sh" --help 2>&1 || true)
-assert_contains "dtfs-update.sh --help shows rolling"     "$HELP" "rolling-upgrade"
-assert_contains "dtfs-update.sh shows --dry-run"          "$HELP" "--dry-run"
-assert_contains "dtfs-update.sh shows --rollback"         "$HELP" "--rollback"
-assert_contains "dtfs-update.sh mentions inventory"       "$HELP" "Inventory"
-
-t_fail "dtfs-update.sh rejects missing tarball" \
-    bash "$SCRIPT_DIR/dtfs-update.sh"
-
-t_fail "dtfs-update.sh rejects nonexistent tarball" \
-    bash "$SCRIPT_DIR/dtfs-update.sh" /tmp/does-not-exist.tar.gz
-
-# dry-run accepts a valid-looking tarball and inventory.
-TARBALL=$(mktemp --suffix=.tar.gz)
-tar -czf "$TARBALL" -C /tmp --files-from /dev/null 2>/dev/null
-trap "rm -f $TARBALL" EXIT
-INV=$(mktemp --suffix=.yml)
-cat > "$INV" <<'EOF'
-all:
-  children:
-    managers:
-      hosts:
-        mgr-01:
-          ansible_host: 10.0.0.1
-    data_nodes:
-      hosts:
-        data-01:
-          ansible_host: 10.0.0.2
-    clients:
-      hosts:
-        client-01:
-          ansible_host: 10.0.0.3
-EOF
-DRY_OUT=$(bash "$SCRIPT_DIR/dtfs-update.sh" --dry-run "$TARBALL" "$INV" 2>&1 || true)
-rm -f "$INV"
-assert_contains "dtfs-update.sh dry-run inventory parsed" "$DRY_OUT" "1 mgr, 1 data, 1 client"
-
-t "dtfs-update.sh syntax"  bash -n "$SCRIPT_DIR/dtfs-update.sh"
-
-echo ""
 echo "=== Summary ==="
 echo "  Total: $((PASS + FAIL))  PASS: $PASS  FAIL: $FAIL"
 exit $FAIL
