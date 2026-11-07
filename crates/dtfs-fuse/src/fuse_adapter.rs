@@ -103,9 +103,32 @@ impl InodeMap {
     /// Migrate the inode of `from` to point at `to`. Used by rename so the
     /// open FDs keep working (F-034).
     fn rename(&self, from: &str, to: &str) {
+        // Descendants of a renamed directory move with it; collect first so
+        // no DashMap guard is held while mutating.
+        let prefix = format!("{}/", from.trim_end_matches('/'));
+        let children: Vec<(String, u64)> = self
+            .path_to_inode
+            .iter()
+            .filter(|e| e.key().starts_with(&prefix))
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect();
+        // A replaced destination loses its inode, else the old inode would
+        // keep resolving to the path now owned by the moved one.
+        if let Some((_, old)) = self.path_to_inode.remove(to) {
+            self.inode_to_path.remove(&old);
+        }
         if let Some((_, ino)) = self.path_to_inode.remove(from) {
             self.inode_to_path.insert(ino, to.to_string());
             self.path_to_inode.insert(to.to_string(), ino);
+        }
+        for (old_path, ino) in children {
+            let new_path = format!("{}/{}", to.trim_end_matches('/'), &old_path[prefix.len()..]);
+            self.path_to_inode.remove(&old_path);
+            if let Some((_, stale)) = self.path_to_inode.remove(&new_path) {
+                self.inode_to_path.remove(&stale);
+            }
+            self.inode_to_path.insert(ino, new_path.clone());
+            self.path_to_inode.insert(new_path, ino);
         }
     }
 
@@ -1417,5 +1440,39 @@ mod audit_co_tests {
     fn co_4_16_unknown_error_maps_to_eio() {
         let err = anyhow::anyhow!("some local error with no tonic status");
         assert_eq!(cluster_err_to_errno(&err), Errno::from(libc::EIO));
+    }
+}
+
+#[cfg(test)]
+mod inode_map_rename_tests {
+    use super::*;
+
+    #[test]
+    fn rename_rekeys_children_of_a_renamed_directory() {
+        let m = InodeMap::new();
+        let d = m.inode_for("/a");
+        let f = m.inode_for("/a/f.mkv");
+        let deep = m.inode_for("/a/sub/g");
+        let sibling = m.inode_for("/ab/f");
+        m.rename("/a", "/b");
+        assert_eq!(m.path_for(d).unwrap(), "/b");
+        assert_eq!(m.path_for(f).unwrap(), "/b/f.mkv");
+        assert_eq!(m.path_for(deep).unwrap(), "/b/sub/g");
+        assert_eq!(m.inode_for("/b/f.mkv"), f);
+        // old child path no longer maps to the moved inode
+        assert_ne!(m.inode_for("/a/f.mkv"), f);
+        // a path that merely shares the string prefix is untouched
+        assert_eq!(m.path_for(sibling).unwrap(), "/ab/f");
+    }
+
+    #[test]
+    fn rename_drops_the_replaced_destination_inode() {
+        let m = InodeMap::new();
+        let src = m.inode_for("/x");
+        let victim = m.inode_for("/y");
+        m.rename("/x", "/y");
+        assert_eq!(m.path_for(src).unwrap(), "/y");
+        assert_eq!(m.inode_for("/y"), src);
+        assert!(m.path_for(victim).is_err(), "replaced inode must not resolve");
     }
 }
