@@ -144,7 +144,7 @@ pub struct ReadAheadEngine {
     /// Currently pending prefetch tasks keyed by cache key.
     pending: Arc<DashMap<String, PendingPrefetch>>,
     /// Cached prefetched chunk data keyed by cache key.
-    cache: Arc<DashMap<String, Bytes>>,
+    cache: Arc<DashMap<String, (u64, Bytes)>>,
     /// Bug CE — running total of bytes held in `cache`, kept in sync with
     /// every insert/evict so the cache is bounded by SIZE, not entry count.
     /// A whole chunk can be up to 128 MB; the old 256-entry count bound x
@@ -177,6 +177,42 @@ pub struct ReadAheadEngine {
     /// re-add a byte gate here (A.3.2 — in-flight bytes are bounded by
     /// `prefetch_slots`).
     prefetch_enabled: Arc<AtomicBool>,
+}
+
+/// Monotonic insertion stamp for the prefetch cache (oldest-first eviction).
+static CACHE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Remove the oldest-inserted entry other than `keep`, subtracting its
+/// bytes. Returns false when there is nothing evictable.
+fn evict_oldest(
+    cache: &DashMap<String, (u64, Bytes)>,
+    cache_bytes: &AtomicUsize,
+    keep: Option<&str>,
+) -> bool {
+    let victim = cache
+        .iter()
+        .filter(|e| Some(e.key().as_str()) != keep)
+        .min_by_key(|e| e.value().0)
+        .map(|e| e.key().clone());
+    match victim {
+        Some(k) => {
+            if let Some((_, (_, v))) = cache.remove(&k) {
+                cache_bytes.fetch_sub(v.len(), Ordering::Relaxed);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Empty the cache entry by entry, subtracting each removed length, so a
+/// concurrent insert/evict keeps `cache_bytes` consistent (a bulk
+/// `store(0)` raced a `fetch_sub` and wrapped the counter).
+fn drain_cache(cache: &DashMap<String, (u64, Bytes)>, cache_bytes: &AtomicUsize) {
+    cache.retain(|_, (_, v)| {
+        cache_bytes.fetch_sub(v.len(), Ordering::Relaxed);
+        false
+    });
 }
 
 /// FUSE-2 — `0` keeps the documented "unbounded" meaning of
@@ -248,7 +284,7 @@ impl ReadAheadEngine {
     /// fn (not `&self`) so the prefetch task can call it with cloned `Arc`s.
     /// Keeps at least the just-stored entry; best-effort, never rejects.
     fn store_in_cache(
-        cache: &DashMap<String, Bytes>,
+        cache: &DashMap<String, (u64, Bytes)>,
         cache_bytes: &std::sync::atomic::AtomicUsize,
         max_cache_bytes: usize,
         key: String,
@@ -256,23 +292,18 @@ impl ReadAheadEngine {
     ) {
         use std::sync::atomic::Ordering;
         let incoming = data.len();
-        if let Some(old) = cache.insert(key.clone(), data) {
+        // Add before insert so a concurrent drain that removes the entry
+        // and subtracts its length never underflows the counter.
+        cache_bytes.fetch_add(incoming, Ordering::Relaxed);
+        let seq = CACHE_SEQ.fetch_add(1, Ordering::Relaxed);
+        if let Some((_, old)) = cache.insert(key.clone(), (seq, data)) {
             cache_bytes.fetch_sub(old.len(), Ordering::Relaxed);
         }
-        cache_bytes.fetch_add(incoming, Ordering::Relaxed);
-        // Evict until under budget, never dropping the entry just stored.
+        // Evict oldest-inserted first until under budget, never dropping
+        // the entry just stored.
         while cache_bytes.load(Ordering::Relaxed) > max_cache_bytes {
-            let victim = cache
-                .iter()
-                .find(|e| e.key() != &key)
-                .map(|e| e.key().clone());
-            match victim {
-                Some(k) => {
-                    if let Some((_, v)) = cache.remove(&k) {
-                        cache_bytes.fetch_sub(v.len(), Ordering::Relaxed);
-                    }
-                }
-                None => break, // only the fresh entry remains
+            if !evict_oldest(cache, cache_bytes, Some(&key)) {
+                break; // only the fresh entry remains
             }
         }
     }
@@ -376,7 +407,7 @@ impl ReadAheadEngine {
     /// or `None` if it has not been fetched yet.
     pub fn get_cached(&self, node_addr: &str, chunk_id: &str) -> Option<Bytes> {
         let key = cache_key(node_addr, chunk_id);
-        self.cache.get(&key).map(|entry| entry.value().clone())
+        self.cache.get(&key).map(|entry| entry.value().1.clone())
     }
 
     /// Insert a chunk that the foreground read path just fetched. Without
@@ -432,7 +463,7 @@ impl ReadAheadEngine {
     /// Remove a cached entry (e.g., after it has been consumed).
     pub fn evict(&self, node_addr: &str, chunk_id: &str) {
         let key = cache_key(node_addr, chunk_id);
-        if let Some((_, v)) = self.cache.remove(&key) {
+        if let Some((_, (_, v))) = self.cache.remove(&key) {
             self.cache_bytes
                 .fetch_sub(v.len(), std::sync::atomic::Ordering::Relaxed);
         }
@@ -448,9 +479,7 @@ impl ReadAheadEngine {
             entry.value().handle.abort();
         }
         self.pending.clear();
-        self.cache.clear();
-        self.cache_bytes
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        drain_cache(&self.cache, &self.cache_bytes);
     }
 
     /// Number of entries currently in the prefetch cache.
@@ -658,7 +687,7 @@ impl Drop for ReadAheadEngine {
 ///  * Normal → `shrink_to_bytes(configured)`: restore the operator budget.
 #[derive(Clone)]
 pub struct ReadAheadCacheController {
-    cache: Arc<DashMap<String, Bytes>>,
+    cache: Arc<DashMap<String, (u64, Bytes)>>,
     cache_bytes: Arc<AtomicUsize>,
     pending: Arc<DashMap<String, PendingPrefetch>>,
     max_cache_bytes: Arc<AtomicUsize>,
@@ -692,16 +721,10 @@ impl ReadAheadCacheController {
         self.max_cache_bytes.store(target, Ordering::Relaxed);
         let mut evicted = 0usize;
         while self.cache_bytes.load(Ordering::Relaxed) > target {
-            let victim = self.cache.iter().next().map(|e| e.key().clone());
-            match victim {
-                Some(k) => {
-                    if let Some((_, v)) = self.cache.remove(&k) {
-                        self.cache_bytes.fetch_sub(v.len(), Ordering::Relaxed);
-                        evicted += 1;
-                    }
-                }
-                None => break,
+            if !evict_oldest(&self.cache, &self.cache_bytes, None) {
+                break;
             }
+            evicted += 1;
         }
         evicted
     }
@@ -714,8 +737,7 @@ impl ReadAheadCacheController {
             entry.value().handle.abort();
         }
         self.pending.clear();
-        self.cache.clear();
-        self.cache_bytes.store(0, Ordering::Relaxed);
+        drain_cache(&self.cache, &self.cache_bytes);
     }
 
     /// CF-5 — Shed pins prefetch off; Normal/Warn turn it back on. Warn only
@@ -848,6 +870,62 @@ mod tests {
             "at most four 1 MB chunks fit in a 4 MB budget, got {} entries",
             engine.cache_len()
         );
+    }
+
+    /// Eviction drops the oldest-inserted entries first (not DashMap
+    /// iteration order): the newest chunks, i.e. the ones being read and
+    /// other streams' fresh prefetches, survive.
+    #[test]
+    fn eviction_is_oldest_inserted_first() {
+        let engine = ReadAheadEngine::new(
+            ReadAheadMode::Disabled,
+            DtfsClient::new(),
+            60,
+            3 * 1024 * 1024,
+            2,
+        );
+        let one_mb = Bytes::from(vec![0u8; 1024 * 1024]);
+        for i in 0..6 {
+            engine.insert_cached("node:9000", &format!("chunk{i}"), one_mb.clone());
+        }
+        for i in 0..3 {
+            assert!(engine.get_cached("node:9000", &format!("chunk{i}")).is_none(), "chunk{i} is oldest, must be evicted");
+        }
+        for i in 3..6 {
+            assert!(engine.get_cached("node:9000", &format!("chunk{i}")).is_some(), "chunk{i} is newest, must survive");
+        }
+        // shrink also goes oldest-first
+        engine.cache_controller().shrink_to_bytes(1024 * 1024);
+        assert!(engine.get_cached("node:9000", "chunk5").is_some());
+        assert!(engine.get_cached("node:9000", "chunk4").is_none());
+    }
+
+    /// Draining while inserts race must leave the byte counter equal to
+    /// the surviving entries (never wrapped by a bulk `store(0)`).
+    #[test]
+    fn drop_unconsumed_keeps_cache_bytes_consistent_under_race() {
+        let engine = Arc::new(ReadAheadEngine::new(
+            ReadAheadMode::Disabled,
+            DtfsClient::new(),
+            60,
+            usize::MAX / 2,
+            2,
+        ));
+        let ctrl = engine.cache_controller();
+        let e2 = Arc::clone(&engine);
+        let t = std::thread::spawn(move || {
+            for i in 0..2000 {
+                e2.insert_cached("n:1", &format!("c{}", i % 16), Bytes::from(vec![0u8; 1024]));
+            }
+        });
+        for _ in 0..200 {
+            ctrl.drop_unconsumed();
+        }
+        t.join().unwrap();
+        assert!(engine.cache_bytes() <= 16 * 1024, "counter wrapped: {}", engine.cache_bytes());
+        assert_eq!(engine.cache_bytes(), engine.cache_len() * 1024);
+        ctrl.drop_unconsumed();
+        assert_eq!(engine.cache_bytes(), 0);
     }
 
     /// CF-5 — the controller's `shrink_to_bytes` halves the live budget and
