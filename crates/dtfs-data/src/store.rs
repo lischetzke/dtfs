@@ -1337,12 +1337,25 @@ impl ChunkStore {
                             // sidecar was lost (e.g. CR-4-2's window before
                             // this fix), so repair `.meta` instead of
                             // quarantining a healthy chunk.
-                            if let Some(meta) = try_repair_meta_from_dat(
+                            match try_repair_meta_from_dat(
                                 disk_path, &path, &chunk_hex, file_meta.len(),
                             ).await {
-                                result.chunks_meta_repaired += 1;
-                                result.chunks_healthy += 1;
-                                let _ = meta;
+                                MetaRepair::Repaired => {
+                                    result.chunks_meta_repaired += 1;
+                                    result.chunks_healthy += 1;
+                                    continue;
+                                }
+                                MetaRepair::HashOkWriteFailed => {
+                                    result.chunks_healthy += 1;
+                                    continue;
+                                }
+                                MetaRepair::NotRepairable => {}
+                            }
+                            // Deleted mid-scan (GC removed the .dat, then
+                            // the .meta): not missing, not corrupt.
+                            if !path.exists() {
+                                result.chunks_checked = result.chunks_checked.saturating_sub(1);
+                                vanished += 1;
                                 continue;
                             }
                             result.chunks_missing += 1;
@@ -1352,6 +1365,23 @@ impl ChunkStore {
                             continue;
                         }
                         Err(e) => {
+                            // Unreadable `.meta` (EIO, EISDIR, ...): the
+                            // bytes may still be fine, so try the repair
+                            // before declaring the chunk corrupt.
+                            match try_repair_meta_from_dat(
+                                disk_path, &path, &chunk_hex, file_meta.len(),
+                            ).await {
+                                MetaRepair::Repaired => {
+                                    result.chunks_meta_repaired += 1;
+                                    result.chunks_healthy += 1;
+                                    continue;
+                                }
+                                MetaRepair::HashOkWriteFailed => {
+                                    result.chunks_healthy += 1;
+                                    continue;
+                                }
+                                MetaRepair::NotRepairable => {}
+                            }
                             io_errors += 1;
                             record_scrub_fault(&mut result, &chunk_hex, "meta_read", &e);
                             continue;
@@ -1364,13 +1394,19 @@ impl ChunkStore {
                             // logic for a `.meta` that exists but fails to
                             // parse (torn/0-byte, CR-4-2's window before
                             // this fix).
-                            if let Some(meta) = try_repair_meta_from_dat(
+                            match try_repair_meta_from_dat(
                                 disk_path, &path, &chunk_hex, file_meta.len(),
                             ).await {
-                                result.chunks_meta_repaired += 1;
-                                result.chunks_healthy += 1;
-                                let _ = meta;
-                                continue;
+                                MetaRepair::Repaired => {
+                                    result.chunks_meta_repaired += 1;
+                                    result.chunks_healthy += 1;
+                                    continue;
+                                }
+                                MetaRepair::HashOkWriteFailed => {
+                                    result.chunks_healthy += 1;
+                                    continue;
+                                }
+                                MetaRepair::NotRepairable => {}
                             }
                             io_errors += 1;
                             record_scrub_fault(&mut result, &chunk_hex, "meta_parse", &e);
@@ -1460,11 +1496,15 @@ async fn try_repair_meta_from_dat(
     dat_path: &Path,
     chunk_hex: &str,
     size: u64,
-) -> Option<ChunkMeta> {
-    let chunk_id = ChunkId::from_hex(chunk_hex).ok()?;
-    let digest = hash_chunk_file_incrementally(dat_path, size).await.ok()?;
+) -> MetaRepair {
+    let Ok(chunk_id) = ChunkId::from_hex(chunk_hex) else {
+        return MetaRepair::NotRepairable;
+    };
+    let Ok(digest) = hash_chunk_file_incrementally(dat_path, size).await else {
+        return MetaRepair::NotRepairable;
+    };
     if digest != chunk_id.0 {
-        return None;
+        return MetaRepair::NotRepairable;
     }
     let meta = ChunkMeta {
         id: chunk_id,
@@ -1477,14 +1517,34 @@ async fn try_repair_meta_from_dat(
         volume_id: VolumeId::new("default".to_string()),
         replication_factor: 1,
     };
-    let meta_json = serde_json::to_string_pretty(&meta).ok()?;
     let final_meta_path = dat_path.with_extension("meta");
-    write_meta_atomic(disk_root, &final_meta_path, &meta_json).await.ok()?;
+    let written = match serde_json::to_string_pretty(&meta) {
+        Ok(j) => write_meta_atomic(disk_root, &final_meta_path, &j).await,
+        Err(e) => Err(DtfsError::Serialization(e.to_string())),
+    };
+    if let Err(e) = written {
+        // The bytes verified against the id: the chunk is healthy even
+        // though the sidecar could not be rewritten. Never quarantine it.
+        tracing::warn!(
+            chunk = %chunk_hex, error = %e,
+            "scrub: .dat verified but .meta repair write failed; chunk treated healthy"
+        );
+        return MetaRepair::HashOkWriteFailed;
+    }
     tracing::info!(
         chunk = %chunk_hex,
         "CR-4-1 scrub repaired missing/torn .meta from a verified .dat"
     );
-    Some(meta)
+    MetaRepair::Repaired
+}
+
+/// Outcome of `try_repair_meta_from_dat`. Only `NotRepairable` (digest
+/// mismatch, malformed id, or unreadable `.dat`) may lead to quarantine.
+#[derive(Debug, PartialEq, Eq)]
+enum MetaRepair {
+    Repaired,
+    HashOkWriteFailed,
+    NotRepairable,
 }
 
 /// REV-4-4 — count one per-chunk scrub failure as corruption and report
@@ -2191,6 +2251,63 @@ mod tests {
         let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
         assert_eq!(res.corrupt_chunk_ids, vec![ghost.as_hex()]);
         assert_eq!(res.chunks_meta_repaired, 0, "a hash mismatch must not be repaired");
+    }
+
+    #[tokio::test]
+    async fn try_repair_meta_tri_state() {
+        let (store, _tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+        let data = b"tri-state-repair";
+        let id = ChunkId::from_bytes(checksum::compute(data));
+        std::fs::create_dir_all(chunk_data_dir(&disk, &id)).unwrap();
+        let dat = chunk_data_path(&disk, &id);
+
+        // Absent .dat: unreadable -> NotRepairable.
+        assert_eq!(
+            try_repair_meta_from_dat(&disk, &dat, &id.as_hex(), data.len() as u64).await,
+            MetaRepair::NotRepairable
+        );
+        // Wrong bytes: digest mismatch -> NotRepairable.
+        std::fs::write(&dat, b"wrong-bytes-here!").unwrap();
+        assert_eq!(
+            try_repair_meta_from_dat(&disk, &dat, &id.as_hex(), 17).await,
+            MetaRepair::NotRepairable
+        );
+        // Good bytes but meta path is a non-empty dir: write fails.
+        std::fs::write(&dat, data).unwrap();
+        let meta = chunk_meta_path(&disk, &id);
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(meta.join("blocker"), b"x").unwrap();
+        assert_eq!(
+            try_repair_meta_from_dat(&disk, &dat, &id.as_hex(), data.len() as u64).await,
+            MetaRepair::HashOkWriteFailed
+        );
+        std::fs::remove_dir_all(&meta).unwrap();
+        assert_eq!(
+            try_repair_meta_from_dat(&disk, &dat, &id.as_hex(), data.len() as u64).await,
+            MetaRepair::Repaired
+        );
+    }
+
+    /// Verified-good `.dat` + unreadable `.meta` whose repair write fails
+    /// must be counted healthy, never reported corrupt (so never quarantined).
+    #[tokio::test]
+    async fn scrub_good_dat_meta_repair_write_failure_is_healthy() {
+        let (store, _tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+        let data = b"scrub-good-dat-unwritable-meta";
+        let id = ChunkId::from_bytes(checksum::compute(data));
+        std::fs::create_dir_all(chunk_data_dir(&disk, &id)).unwrap();
+        std::fs::write(chunk_data_path(&disk, &id), data).unwrap();
+        let meta = chunk_meta_path(&disk, &id);
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(meta.join("blocker"), b"x").unwrap();
+
+        let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+        assert!(res.corrupt_chunk_ids.is_empty(), "good .dat must not be reported corrupt");
+        assert_eq!(res.chunks_healthy, 1);
+        assert_eq!(res.chunks_meta_repaired, 0);
+        assert_eq!(res.chunks_missing, 0);
     }
 
     // ── REV-3-2 — incremental (non-O(N)-per-page) chunk listing ────
