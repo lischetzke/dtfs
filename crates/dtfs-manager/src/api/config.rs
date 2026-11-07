@@ -93,7 +93,13 @@ pub(super) fn write_manager_toml_atomic(path: &std::path::Path, rendered: &str) 
     let tmp = path.with_extension("toml.az5.tmp");
     let write = || -> std::io::Result<()> {
         use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
+        // 0600: the file carries cluster.shared_secret.
+        let _ = std::fs::remove_file(&tmp); // a stale tmp would keep its old mode
+        let mut oo = std::fs::OpenOptions::new();
+        oo.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut oo, 0o600);
+        let mut f = oo.open(&tmp)?;
         f.write_all(rendered.as_bytes())?;
         f.sync_all()?;
         drop(f);
@@ -126,6 +132,20 @@ pub(super) async fn update_config(
         match serde_json::from_str::<serde_json::Value>(&body.config_json) {
             Ok(mut v) => {
                 strip_secret_sentinels(&mut v);
+                restore_array_sentinels(&mut v, &effective_config_value(&state).await);
+                // The override replicates to every manager; a per-host key
+                // (node.hostname, api.listen_addr, ...) must not.
+                let bad = non_cluster_keys(&v);
+                if !bad.is_empty() {
+                    warn!(keys = ?bad, "config update rejected: node-scoped keys");
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": format!("node-scoped keys cannot be set cluster-wide: {}", bad.join(", ")),
+                            "preserved_current": true,
+                        })),
+                    ));
+                }
                 serde_json::to_string(&v).unwrap_or_else(|_| body.config_json.clone())
             }
             Err(e) => {
@@ -449,12 +469,18 @@ pub(super) fn flatten_config(
             // Only a non-empty secret is masked, so an unset key still reads
             // as null and `is_default` stays meaningful.
             let secret = config_key_is_secret(prefix);
-            let masked = secret && matches!(current, V::String(s) if !s.is_empty());
-            let current_out: V = if masked {
-                V::String(CONFIG_SECRET_SENTINEL.to_string())
-            } else {
-                current.clone()
-            };
+            let mut current_out: V = current.clone();
+            if secret && matches!(current, V::String(s) if !s.is_empty()) {
+                current_out = V::String(CONFIG_SECRET_SENTINEL.to_string());
+            } else if current.is_array() {
+                // Arrays are one leaf; mask secrets/URLs inside their elements
+                // (alerts.webhooks[].secret / .url).
+                redact_secret_leaves(&mut current_out);
+                if prefix.ends_with("webhooks") {
+                    mask_webhook_urls(&mut current_out);
+                }
+            }
+            let masked = current_out != *current;
             // is_default compares the (possibly redacted) emitted value, so a
             // masked secret never round-trips its cleartext via this flag.
             let is_default = !masked && current == defaults;
@@ -485,7 +511,7 @@ pub(crate) const CONFIG_SECRET_SENTINEL: &str = "***";
 /// config field is ever added.
 pub(super) fn config_key_is_secret(prefix: &str) -> bool {
     let leaf = prefix.rsplit('.').next().unwrap_or(prefix);
-    matches!(leaf, "shared_secret")
+    matches!(leaf, "shared_secret" | "secret" | "token" | "password")
 }
 
 /// CO-2-1 — recursively drop any secret leaf (per `config_key_is_secret`)
@@ -517,16 +543,79 @@ pub(super) fn strip_secret_sentinels(v: &mut Value) {
 /// cluster-set `shared_secret` is never served in cleartext from this
 /// unauthenticated endpoint. An empty/non-string secret value is left as-is.
 pub(super) fn redact_secret_leaves(v: &mut Value) {
-    if let Value::Object(map) = v {
-        for (k, child) in map.iter_mut() {
-            let masked = config_key_is_secret(k)
-                && matches!(child, Value::String(s) if !s.is_empty());
-            if masked {
-                *child = Value::String(CONFIG_SECRET_SENTINEL.to_string());
-            } else {
-                redact_secret_leaves(child);
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map.iter_mut() {
+                let masked = config_key_is_secret(k)
+                    && matches!(child, Value::String(s) if !s.is_empty());
+                if masked {
+                    *child = Value::String(CONFIG_SECRET_SENTINEL.to_string());
+                } else {
+                    redact_secret_leaves(child);
+                    // Webhook URLs routinely embed tokens (Slack, Discord, ...).
+                    if k == "webhooks" {
+                        mask_webhook_urls(child);
+                    }
+                }
             }
         }
+        Value::Array(items) => items.iter_mut().for_each(redact_secret_leaves),
+        _ => {}
+    }
+}
+
+fn mask_webhook_urls(webhooks: &mut Value) {
+    for item in webhooks.as_array_mut().into_iter().flatten() {
+        if let Some(u) = item.get_mut("url") {
+            if matches!(u, Value::String(s) if !s.is_empty()) {
+                *u = Value::String(CONFIG_SECRET_SENTINEL.to_string());
+            }
+        }
+    }
+}
+
+/// Dotted paths of the override's leaves whose `config_key_scope` is not cluster.
+pub(super) fn non_cluster_keys(v: &Value) -> Vec<String> {
+    fn walk(v: &Value, prefix: &str, out: &mut Vec<String>) {
+        match v {
+            Value::Object(m) => {
+                for (k, c) in m {
+                    let p = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                    walk(c, &p, out);
+                }
+            }
+            _ if config_key_scope(&format!("manager.{prefix}")) != "cluster" => out.push(prefix.to_string()),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, "", &mut out);
+    out
+}
+
+/// A posted array (replaced wholesale by the deep-merge) may carry the "***"
+/// sentinel for a secret the operator did not change; put the stored value
+/// back, matched by array index.
+pub(super) fn restore_array_sentinels(new: &mut Value, old: &Value) {
+    match (new, old) {
+        (Value::Object(n), Value::Object(o)) => {
+            for (k, nv) in n.iter_mut() {
+                if let Some(ov) = o.get(k) {
+                    restore_array_sentinels(nv, ov);
+                }
+            }
+        }
+        (Value::Array(n), Value::Array(o)) => {
+            for (nv, ov) in n.iter_mut().zip(o) {
+                restore_array_sentinels(nv, ov);
+            }
+        }
+        (n @ Value::String(_), o @ Value::String(_))
+            if n.as_str() == Some(CONFIG_SECRET_SENTINEL) =>
+        {
+            *n = o.clone();
+        }
+        _ => {}
     }
 }
 

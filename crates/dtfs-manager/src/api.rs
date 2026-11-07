@@ -278,3 +278,7 @@ pub async fn run_api_server(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod handler_tests;
