@@ -181,6 +181,9 @@ message ReplicateChunkRequest {
 message ReplicateChunkResponse {
   bool success = 1;
   string error = 2;
+  // The disk the target actually stored the replica on. Unset from old
+  // data nodes; the manager must then not guess among several disks.
+  optional uint32 disk_id = 3;
 }
 
 // --- VerifyChunk ---

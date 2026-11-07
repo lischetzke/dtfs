@@ -928,10 +928,12 @@ impl DataService for DataServiceImpl {
             Ok(()) => Ok(Response::new(ReplicateChunkResponse {
                 success: true,
                 error: String::new(),
+                disk_id: None,
             })),
             Err(e) => Ok(Response::new(ReplicateChunkResponse {
                 success: false,
                 error: e.to_string(),
+                disk_id: None,
             })),
         }
     }
