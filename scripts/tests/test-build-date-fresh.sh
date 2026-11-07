@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Bug BS — guard the dev BUILD_DATE freshness invariant (CLAUDE.md §A.3.6).
+# Bug BS — guard the dev BUILD_DATE freshness invariant (CLAUDE.md §A.3.5).
 #
 # Proves two properties of the SOURCE_DATE_EPOCH-driven stamp:
 #   1. Distinct instants -> distinct BUILD_DATE (the property that broke when

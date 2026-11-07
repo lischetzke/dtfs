@@ -92,7 +92,7 @@ export RUSTFLAGS="${RUSTFLAGS:-} -A dead_code -A unused_imports -A unused_variab
 # Bug BS — stamp BUILD_DATE with this build's instant. dtfs-common/build.rs
 # formats SOURCE_DATE_EPOCH and declares rerun-if-env-changed for it, so
 # exporting a fresh value here re-stamps every wrapper build (two builds a
-# minute apart -> two distinct BUILD_DATE values; CLAUDE.md §A.3.6).
+# minute apart -> two distinct BUILD_DATE values; CLAUDE.md §A.3.5).
 # Honour a caller-pinned value for reproducible builds (the sanctioned
 # exception): only default to "now" when unset.
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date -u +%s)}"

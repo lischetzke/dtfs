@@ -17,7 +17,7 @@ Y", "list every location that creates/removes a replica", or "which
 files implement config option Z". Answer only that question.
 
 Method:
-0. Grep CLAUDE.md for `## A.8` and Read that table only (about 30
+0. Grep CLAUDE.md for `## A.8` and Read that table only (about 15
    lines). If it names the file that owns the thing you are asked
    about, grep inside that file first and stop when it answers — most
    "where does X live" questions end here.

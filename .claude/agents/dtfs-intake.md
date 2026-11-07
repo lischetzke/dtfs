@@ -59,4 +59,4 @@ data-plane reads only, etc.>
 The Size field routes the caller's next step (a 1-task fix goes straight
 to `dtfs-implementer`; multi-task is broken into a todo list by the
 caller first, one implementer run per item) — get it right: multi-task
-means >= 3 tasks, spans sessions, or crosses crates (CLAUDE.md § B.2).
+means >= 3 tasks, spans sessions, or crosses crates.

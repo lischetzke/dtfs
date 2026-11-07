@@ -30,6 +30,15 @@ manager, or an unknown replica node, leaves an entry empty/all-empty →
 not learned → that replica falls back to arbitrary/pure-distance order,
 exactly like `node_tiers`.
 
+`GetFileLocationsResponse` carries `volume_id`; the client never
+downgrades a known volume to `default`, and `allocate_chunks` always
+places by the file's own registered volume. `GetFileLocations` omits
+replicas on Down/Failed nodes or Failed/Removed disks unless the chunk
+has no live replica at all (then all rows are returned). A FUSE client
+listing only learner managers can read but never write: client
+mutations are not leader-forwarded, so `manager_addr`/`manager_addrs`
+must include at least one voter.
+
 ## A.3.4 — Mandatory vs cache replicas, full detail (Bug AV)
 
 See `.claude/rules/integrity.md` for the complete invariant — it is

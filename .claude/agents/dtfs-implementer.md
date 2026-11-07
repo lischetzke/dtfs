@@ -28,53 +28,34 @@ For "where is X" / "what already does Y" questions, dispatch
 `filesystem.rs`, `state_machine.rs` are each thousands of lines; grep
 for the symbol, then `Read` with `offset`/`limit` around the hit.
 
-Before touching anything: run `git status --short` (or check the
-caller told you the tree is clean). If it is dirty with unrelated
-changes, stop and tell the caller to re-dispatch you with worktree
-isolation rather than proceeding on a dirty tree.
+Before touching anything: run `git status --short`. If it is dirty
+with unrelated changes, list those files and stop.
 
-Source files are CRLF. Use `Edit`/`Write`, never `sed -i` or another
-line-oriented rewrite tool.
+Use `Edit`/`Write`, never `sed -i` or another line-oriented rewrite tool.
 
-## Build / verify environment
+## Build / verify
 
-Docker only (CLAUDE.md § A.4): no build VM, no cluster. The local
-`dtfs-buildenv:latest` image has the rust toolchain, protoc,
-clang/libclang, libfuse3-dev; the named volumes `dtfs-target`
-(`/target`) and `dtfs-registry` persist the cache. The checkout is
-bind-mounted at `/build`, so host edits build in place. Run from Git
-Bash; `MSYS_NO_PATHCONV=1` is REQUIRED. Refuse to run if
-`DTFS_REPO_HOST_PATH` is unset AND you are not in the main checkout
-(never guess a worktree path):
-
-```bash
-DTFS_REPO_HOST_PATH="${DTFS_REPO_HOST_PATH:-C:/Users/<user>/git_github.com/dtfs2}"
-MSYS_NO_PATHCONV=1 docker run --rm -v "$DTFS_REPO_HOST_PATH:/build" \
-  -v dtfs-target:/target -v dtfs-registry:/usr/local/cargo/registry \
-  -w /build dtfs-buildenv:latest cargo test -p <crate> --release 2>&1 | tail -30
-```
-
-Hard rules: no `bash -lc` inside the image; always pass `--release`;
-rustc 1.94 ICEs on some struct-literal edits in dtfs-manager/dtfs-data —
-reformulate the edit, never remove the crate's `#![allow(dead_code)]`.
-Run `cargo test -p dtfs-common --release` after any config/example
-change (`example_*_toml_parses`). Another agent may share the
-`dtfs-target` volume: cargo blocking on the build lock is normal.
+Docker only: use the command and hard rules in CLAUDE.md § A.4
+(`MSYS_NO_PATHCONV=1`, no `bash -lc`, always `--release`, keep
+`#![allow(dead_code)]`; rustc 1.94 ICEs on some struct-literal edits in
+dtfs-manager/dtfs-data, so reformulate the edit). Pipe output through
+`2>&1 | tail -30`.
 
 ## Loop
 
-1. Write the failing test in the purest layer that shows the bug/gap
-   (pure helper > state-machine apply > manager aggregator > FUSE
-   helper > shell case). Run it, confirm it fails for the expected
-   reason.
-2. Implement the smallest fix that turns it green. No bundled cleanup,
-   no refactor beyond the task, no touching a second task even if you
-   notice one nearby — note it instead.
-3. Run the crate test (full workspace suite only for cross-crate
+1. Write the tests in the purest layer that shows the bug/gap (pure
+   helper > state-machine apply > manager aggregator > FUSE helper),
+   positive AND negative per CLAUDE.md § B.4 (exact error asserted,
+   boundary covered). Run them by name, confirm the new ones fail for
+   the expected reason.
+2. Implement the smallest fix that turns them green. New rejection or
+   integrity paths log per CLAUDE.md § A.7. No bundled cleanup, no
+   refactor beyond the task; note anything nearby instead.
+3. Run the full crate suite (workspace only for cross-crate or wire
    changes) before declaring done.
-4. Commit per CLAUDE.md § B.3 (type-prefixed subject, short body, the
-   `Co-Authored-By:` trailer the caller gave you). Never `--no-verify`,
-   never `--amend` a pushed commit, never bypass signing.
+4. Commit to master per CLAUDE.md § B.3 (the `Co-Authored-By:` trailer
+   the caller gave you). Never `--no-verify`, never `--amend` a pushed
+   commit, never bypass signing.
 
 Must NOT: touch a second task in the same run; refactor beyond the
 fix; silently skip a required test layer; claim cluster-only behaviour
