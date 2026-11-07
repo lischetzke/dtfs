@@ -177,6 +177,50 @@ mod snapshot_persistence_tests {
         assert_eq!(data.cluster_config.version, 7);
     }
 
+    /// Audit: a failed snapshot persist must surface as Err and leave the
+    /// in-memory current snapshot untouched (openraft purges the log after Ok).
+    #[tokio::test]
+    async fn build_snapshot_persist_failure_is_err_and_not_published() {
+        let dir = tmp_dir();
+        let path = dir.path().join("sm");
+        let mut sm = StateMachineStore::open_at(&path).expect("open");
+        {
+            let mut data = sm.data.write().await;
+            populate_sample_state(&mut data);
+        }
+        std::fs::remove_dir_all(&path).expect("make snapshot dir unwritable");
+        let mut builder = sm.get_snapshot_builder().await;
+        assert!(builder.build_snapshot().await.is_err());
+        assert!(sm.get_current_snapshot().await.unwrap().is_none());
+
+        // Negative control: writable dir succeeds and publishes.
+        std::fs::create_dir_all(&path).unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        builder.build_snapshot().await.expect("build ok");
+        assert!(sm.get_current_snapshot().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_persist_failure_is_err_and_state_unchanged() {
+        let src_dir = tmp_dir();
+        let mut src = StateMachineStore::open_at(src_dir.path()).expect("open src");
+        {
+            let mut data = src.data.write().await;
+            populate_sample_state(&mut data);
+        }
+        let snap = src.get_snapshot_builder().await.build_snapshot().await.expect("build");
+        let meta = snap.meta.clone();
+        let bytes = snap.snapshot.into_inner();
+
+        let dir = tmp_dir();
+        let path = dir.path().join("sm");
+        let mut f = StateMachineStore::open_at(&path).expect("open follower");
+        std::fs::remove_dir_all(&path).unwrap();
+        assert!(f.install_snapshot(&meta, Cursor::new(bytes)).await.is_err());
+        assert!(f.data.read().await.files.is_empty());
+        assert!(f.get_current_snapshot().await.unwrap().is_none());
+    }
+
     /// Bug AZ-3 — `FileMetadata.chunk_size` is per-file and snapshotted at
     /// `CreateFile` time. An operator UpsertVolume call that changes
     /// `VolumeConfig.chunk_size_bytes` MUST NOT retro-modify any existing

@@ -13,7 +13,7 @@ use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::EntryPayload;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use dtfs_common::types::{AnchorPolicy, VolumeConfig};
 
@@ -666,6 +666,18 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
             snapshot_id,
         };
 
+        // Persist to disk FIRST so a manager restart can reload membership +
+        // state (F-024). A failure must surface: openraft purges the log
+        // after a successful build, and a snapshot that never hit disk would
+        // leave the restarted node with a purged log and no state.
+        if let Some(dir) = &self.snapshot_dir {
+            if let Err(e) = StateMachineStore::persist_snapshot_to_disk(dir, &meta, &data_bytes) {
+                error!(error = %e, snapshot_id = %meta.snapshot_id,
+                    "failed to persist built snapshot; not publishing it");
+                return Err(e);
+            }
+        }
+
         // Cache the freshly built snapshot in memory so `get_current_snapshot`
         // returns the up-to-date blob (leader needs this to send to followers).
         {
@@ -674,14 +686,6 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
                 meta: meta.clone(),
                 data: data_bytes.clone(),
             });
-        }
-
-        // Persist to disk so a manager restart can reload membership + state
-        // before the Raft log replay starts (F-024).
-        if let Some(dir) = &self.snapshot_dir {
-            if let Err(e) = StateMachineStore::persist_snapshot_to_disk(dir, &meta, &data_bytes) {
-                warn!(error = %e, "failed to persist snapshot to disk");
-            }
         }
 
         Ok(openraft::storage::Snapshot {
@@ -764,6 +768,16 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         let snap_data: StateMachineSnapshot = serde_json::from_slice(&raw)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        // Persist before touching any in-memory state (F-024): on failure the
+        // old state stays intact and openraft sees the error.
+        if let Some(dir) = &self.snapshot_dir {
+            if let Err(e) = Self::persist_snapshot_to_disk(dir, meta, &raw) {
+                error!(error = %e, snapshot_id = %meta.snapshot_id,
+                    "failed to persist installed snapshot; state unchanged");
+                return Err(e);
+            }
+        }
+
         // Rebuild the state machine from the snapshot.
         {
             let mut sm = self.data.write().await;
@@ -793,13 +807,6 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 meta: meta.clone(),
                 data: raw.clone(),
             });
-        }
-
-        // Persist to disk so this follower can restart cleanly (F-024).
-        if let Some(dir) = &self.snapshot_dir {
-            if let Err(e) = Self::persist_snapshot_to_disk(dir, meta, &raw) {
-                warn!(error = %e, "failed to persist installed snapshot");
-            }
         }
 
         info!(
