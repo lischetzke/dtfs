@@ -390,6 +390,13 @@ pub struct ClusterConfig {
     /// never fail-opens. Set `true` only for intentional insecure lab runs.
     #[serde(default)]
     pub allow_insecure_empty_secret: bool,
+    /// Raft transport auth: when `true`, a Raft RPC without a valid
+    /// `x-dtfs-rpc-*` stamp is rejected. When `false` (default, rolling-update
+    /// safe) unsigned RPCs are accepted with a rate-limited warning; stamped
+    /// but invalid RPCs are always rejected. Set `true` once every manager
+    /// runs a build that signs Raft RPCs.
+    #[serde(default)]
+    pub require_raft_auth: bool,
     #[serde(default)]
     pub bootstrap: bool,
     /// Optional list of manager peers to seed the Raft cluster with.
@@ -1357,6 +1364,7 @@ mod tests {
             name: "t".into(),
             shared_secret: String::new(),
             allow_insecure_empty_secret: false,
+            require_raft_auth: false,
             bootstrap: false,
             initial_voters: vec![],
         };
@@ -1383,6 +1391,7 @@ mod tests {
             name: "t".into(),
             shared_secret: String::new(),
             allow_insecure_empty_secret: true,
+            require_raft_auth: false,
             bootstrap: false,
             initial_voters: vec![],
         };
@@ -1399,6 +1408,7 @@ mod tests {
             name: "t".into(),
             shared_secret: "s3cret".into(),
             allow_insecure_empty_secret: false,
+            require_raft_auth: false,
             bootstrap: false,
             initial_voters: vec![],
         };

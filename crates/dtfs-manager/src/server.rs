@@ -144,6 +144,112 @@ impl RaftTransportHandler {
 // encoder so the pair is round-trip tested together — CNF-4).
 
 // ---------------------------------------------------------------------------
+// Raft transport auth + framing helpers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq)]
+enum RaftAuthDecision {
+    Accept,
+    /// No stamp, permissive mode (rolling update).
+    AcceptUnsigned,
+    Reject(&'static str),
+}
+
+/// Decide whether a Raft RPC is allowed. Empty secret skips auth. A stamp that
+/// is present but incomplete/invalid is ALWAYS rejected; a missing stamp is
+/// rejected only when `require` is set.
+fn raft_auth_decision(
+    secret: &str,
+    require: bool,
+    ts: Option<&str>,
+    mac: Option<&str>,
+    now_unix: u64,
+) -> RaftAuthDecision {
+    if secret.is_empty() {
+        return RaftAuthDecision::Accept;
+    }
+    match (ts, mac) {
+        (Some(ts), Some(mac)) => {
+            if dtfs_common::crypto::verify_mgr_rpc_auth(
+                secret,
+                dtfs_raft::network::RAFT_RPC_AUTH_METHOD,
+                ts,
+                mac,
+                "",
+                now_unix,
+            ) {
+                RaftAuthDecision::Accept
+            } else {
+                RaftAuthDecision::Reject("invalid stamp")
+            }
+        }
+        (None, None) if require => RaftAuthDecision::Reject("missing stamp"),
+        (None, None) => RaftAuthDecision::AcceptUnsigned,
+        _ => RaftAuthDecision::Reject("incomplete stamp"),
+    }
+}
+
+/// Warn about unsigned Raft RPCs at most once per 60 s (they arrive every heartbeat).
+fn warn_unsigned_raft_rpc(now_unix: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let last = LAST.load(Relaxed);
+    if now_unix.saturating_sub(last) >= 60
+        && LAST.compare_exchange(last, now_unix, Relaxed, Relaxed).is_ok()
+    {
+        warn!(
+            "RaftTransport: accepting UNSIGNED Raft RPC (cluster.require_raft_auth=false); \
+             set it true once every manager signs Raft RPCs"
+        );
+    }
+}
+
+fn grpc_error_response(code: i32, msg: &str) -> tonic::codegen::http::Response<tonic::body::Body> {
+    tonic::codegen::http::Response::builder()
+        .status(200)
+        .header("content-type", "application/grpc")
+        .header("grpc-status", code.to_string())
+        .header("grpc-message", msg)
+        .body(tonic::body::Body::empty())
+        .unwrap()
+}
+
+/// Peel the gRPC 5-byte frame and the prost `bytes` field (tag 0x0A + varint
+/// length) off a request body. Lenient on truncation (clamps to the body) but
+/// never panics: an unterminated/over-long varint is an error.
+fn decode_raft_payload(body_bytes: Bytes) -> Result<Bytes, &'static str> {
+    if body_bytes.len() < 5 {
+        return Ok(body_bytes);
+    }
+    let outer_len =
+        u32::from_be_bytes([body_bytes[1], body_bytes[2], body_bytes[3], body_bytes[4]]) as usize;
+    let outer_end = 5usize.saturating_add(outer_len).min(body_bytes.len());
+    let inner = body_bytes.slice(5..outer_end);
+    if inner.is_empty() || inner[0] != 0x0A {
+        return Ok(inner);
+    }
+    let mut value: u64 = 0;
+    let mut consumed = 0usize;
+    let mut done = false;
+    for (i, b) in inner[1..].iter().take(10).enumerate() {
+        consumed = i + 1;
+        value |= ((b & 0x7F) as u64) << (7 * i as u32);
+        if b & 0x80 == 0 {
+            done = true;
+            break;
+        }
+    }
+    if !done {
+        return Err("bad varint length");
+    }
+    let start = 1 + consumed;
+    let end = start
+        .saturating_add(usize::try_from(value).unwrap_or(usize::MAX))
+        .min(inner.len());
+    Ok(inner.slice(start..end))
+}
+
+// ---------------------------------------------------------------------------
 // RaftTransport as a tonic-compatible service
 // ---------------------------------------------------------------------------
 
@@ -151,6 +257,9 @@ impl RaftTransportHandler {
 #[derive(Clone)]
 struct RaftTransportSvc {
     handler: RaftTransportHandler,
+    secret: String,
+    require_auth: bool,
+    max_body_bytes: usize,
 }
 
 impl tonic::server::NamedService for RaftTransportSvc {
@@ -174,71 +283,52 @@ impl tower::Service<tonic::codegen::http::Request<tonic::body::Body>> for RaftTr
     fn call(&mut self, req: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
         let handler = self.handler.clone();
 
+        let secret = self.secret.clone();
+        let require_auth = self.require_auth;
+        let max_body = self.max_body_bytes;
+
         Box::pin(async move {
-            // Collect body into bytes using http_body_util::BodyExt.
-            let (_parts, body) = req.into_parts();
-            let collected = body.collect().await;
+            let (parts, body) = req.into_parts();
+
+            // Authenticate from the headers BEFORE reading any body bytes.
+            let hdr = |k: &str| parts.headers.get(k).and_then(|v| v.to_str().ok());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match raft_auth_decision(
+                &secret,
+                require_auth,
+                hdr(dtfs_common::crypto::DATA_RPC_AUTH_TS),
+                hdr(dtfs_common::crypto::DATA_RPC_AUTH_MAC),
+                now,
+            ) {
+                RaftAuthDecision::Accept => {}
+                RaftAuthDecision::AcceptUnsigned => warn_unsigned_raft_rpc(now),
+                RaftAuthDecision::Reject(why) => {
+                    warn!(reason = why, "RaftTransport: rejected unauthenticated Raft RPC");
+                    return Ok(grpc_error_response(7, "raft rpc authentication failed"));
+                }
+            }
+
+            // Bounded collect: tonic's decode cap does not apply to this
+            // hand-rolled service, so an unbounded body would buffer in RAM.
+            let collected = http_body_util::Limited::new(body, max_body).collect().await;
             let body_bytes = match collected {
                 Ok(c) => c.to_bytes(),
-                Err(_) => {
-                    let resp = tonic::codegen::http::Response::builder()
-                        .status(200)
-                        .header("content-type", "application/grpc")
-                        .header("grpc-status", "13")
-                        .body(tonic::body::Body::empty())
-                        .unwrap();
-                    return Ok(resp);
+                Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+                    warn!(limit = max_body, "RaftTransport: request body over limit");
+                    return Ok(grpc_error_response(8, "raft rpc body too large"));
                 }
+                Err(_) => return Ok(grpc_error_response(13, "body read error")),
             };
 
-            // The client uses tonic::client::Grpc::unary() with
-            // ProstCodec<Bytes, Bytes>; prost wraps each top-level `bytes`
-            // field as a length-prefixed entry (`tag<<3|wire=2`, then varint
-            // length, then payload). Then gRPC additionally wraps the whole
-            // protobuf message in its own length-prefix frame:
-            //   [1 byte compressed flag][4 byte big-endian length][prost message]
-            // So to recover the JSON payload we have to peel BOTH layers.
-            // (Without this the JSON parser sees framing bytes and fails with
-            // "bad raft msg: expected value at line 1 column 1" — breaking
-            // multi-voter Raft elections, F-009 v2.)
-            let payload_bytes = if body_bytes.len() >= 5 {
-                let outer_len = u32::from_be_bytes([
-                    body_bytes[1],
-                    body_bytes[2],
-                    body_bytes[3],
-                    body_bytes[4],
-                ]) as usize;
-                let outer_end = (5 + outer_len).min(body_bytes.len());
-                let inner = body_bytes.slice(5..outer_end);
-                // The first byte of the prost-encoded payload is the field
-                // tag (0x0A for field 1, wire type 2 = LEN). Skip it, then
-                // read a varint for the length, then take the rest.
-                if !inner.is_empty() && inner[0] == 0x0A {
-                    let (varlen, varbytes_consumed) = {
-                        let mut value: u64 = 0;
-                        let mut shift = 0;
-                        let mut consumed = 0;
-                        for (i, b) in inner[1..].iter().enumerate() {
-                            consumed = i + 1;
-                            value |= ((b & 0x7F) as u64) << shift;
-                            if b & 0x80 == 0 {
-                                break;
-                            }
-                            shift += 7;
-                            if shift > 63 {
-                                break;
-                            }
-                        }
-                        (value as usize, consumed)
-                    };
-                    let start = 1 + varbytes_consumed;
-                    let end = (start + varlen).min(inner.len());
-                    inner.slice(start..end)
-                } else {
-                    inner
+            let payload_bytes = match decode_raft_payload(body_bytes) {
+                Ok(p) => p,
+                Err(msg) => {
+                    warn!(error = msg, "RaftTransport: malformed request framing");
+                    return Ok(grpc_error_response(3, msg));
                 }
-            } else {
-                body_bytes
             };
 
             tracing::debug!(
@@ -316,6 +406,11 @@ pub async fn run_grpc_server(
 
     let raft_svc = RaftTransportSvc {
         handler: RaftTransportHandler::new(raft),
+        secret: config.cluster.shared_secret.clone(),
+        require_auth: config.cluster.require_raft_auth,
+        // A snapshot rides base64-in-JSON inside one body; the manager gRPC
+        // message cap is the existing operator-tuned bound for it.
+        max_body_bytes: dtfs_common::config::max_message_bytes(config.grpc.max_message_size_mb),
     };
 
     // Bug CK — bind the listener explicitly BEFORE logging "listening", so a
@@ -391,5 +486,139 @@ mod cr2_8_1_manager_listener_tests {
             dtfs_common::config::max_message_bytes(cfg.max_message_size_mb),
             256 * 1024 * 1024
         );
+    }
+}
+
+#[cfg(test)]
+mod raft_transport_hardening_tests {
+    use super::*;
+
+    const SECRET: &str = "s3cret";
+
+    fn stamp() -> (String, String) {
+        dtfs_common::crypto::stamp_mgr_rpc_auth(
+            SECRET,
+            dtfs_raft::network::RAFT_RPC_AUTH_METHOD,
+            "",
+        )
+        .unwrap()
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn valid_stamp_accepted_even_when_required() {
+        let (ts, mac) = stamp();
+        assert_eq!(
+            raft_auth_decision(SECRET, true, Some(&ts), Some(&mac), now()),
+            RaftAuthDecision::Accept
+        );
+    }
+
+    #[test]
+    fn missing_stamp_permissive_vs_required() {
+        assert_eq!(
+            raft_auth_decision(SECRET, false, None, None, now()),
+            RaftAuthDecision::AcceptUnsigned
+        );
+        assert_eq!(
+            raft_auth_decision(SECRET, true, None, None, now()),
+            RaftAuthDecision::Reject("missing stamp")
+        );
+    }
+
+    #[test]
+    fn bad_mac_rejected_even_when_permissive() {
+        let (ts, mac) = stamp();
+        let mut bad = mac.clone();
+        bad.replace_range(0..1, if mac.starts_with('0') { "1" } else { "0" });
+        assert_eq!(
+            raft_auth_decision(SECRET, false, Some(&ts), Some(&bad), now()),
+            RaftAuthDecision::Reject("invalid stamp")
+        );
+        // Wrong secret on the verifier side is the same failure.
+        assert_eq!(
+            raft_auth_decision("other", false, Some(&ts), Some(&mac), now()),
+            RaftAuthDecision::Reject("invalid stamp")
+        );
+    }
+
+    #[test]
+    fn half_stamp_rejected_even_when_permissive() {
+        let (ts, _) = stamp();
+        assert_eq!(
+            raft_auth_decision(SECRET, false, Some(&ts), None, now()),
+            RaftAuthDecision::Reject("incomplete stamp")
+        );
+    }
+
+    #[test]
+    fn skew_boundary() {
+        let (ts, mac) = stamp();
+        let t: u64 = ts.parse().unwrap();
+        let max = dtfs_common::crypto::DATA_RPC_MAX_SKEW_SECS;
+        assert_eq!(
+            raft_auth_decision(SECRET, false, Some(&ts), Some(&mac), t + max),
+            RaftAuthDecision::Accept
+        );
+        assert_eq!(
+            raft_auth_decision(SECRET, false, Some(&ts), Some(&mac), t + max + 1),
+            RaftAuthDecision::Reject("invalid stamp")
+        );
+    }
+
+    #[test]
+    fn empty_secret_skips_auth() {
+        assert_eq!(raft_auth_decision("", true, None, None, now()), RaftAuthDecision::Accept);
+    }
+
+    fn frame(prost: &[u8]) -> Bytes {
+        let mut v = vec![0u8];
+        v.extend_from_slice(&(prost.len() as u32).to_be_bytes());
+        v.extend_from_slice(prost);
+        Bytes::from(v)
+    }
+
+    #[test]
+    fn decode_roundtrip_and_clamp() {
+        let body = frame(&[0x0A, 3, b'a', b'b', b'c']);
+        assert_eq!(decode_raft_payload(body).unwrap(), Bytes::from_static(b"abc"));
+        // Declared length past the end clamps instead of panicking.
+        let body = frame(&[0x0A, 100, b'a']);
+        assert_eq!(decode_raft_payload(body).unwrap(), Bytes::from_static(b"a"));
+    }
+
+    #[test]
+    fn decode_malformed_varint_is_error_not_panic() {
+        // 11 continuation bytes: never terminates within 10 bytes.
+        let mut p = vec![0x0A];
+        p.extend_from_slice(&[0xFF; 11]);
+        assert_eq!(decode_raft_payload(frame(&p)), Err("bad varint length"));
+        // Varint cut off by end of body.
+        assert_eq!(decode_raft_payload(frame(&[0x0A, 0x80])), Err("bad varint length"));
+        // Huge declared length with a max-width varint: clamped, no overflow.
+        let mut p = vec![0x0A];
+        p.extend_from_slice(&[0xFF; 9]);
+        p.push(0x01);
+        p.extend_from_slice(b"xy");
+        assert_eq!(decode_raft_payload(frame(&p)).unwrap(), Bytes::from_static(b"xy"));
+        // Frame length of u32::MAX does not overflow.
+        let body = Bytes::from_static(&[0, 0xFF, 0xFF, 0xFF, 0xFF, 0x0A, 1, b'z']);
+        assert_eq!(decode_raft_payload(body).unwrap(), Bytes::from_static(b"z"));
+    }
+
+    #[tokio::test]
+    async fn oversize_body_rejected_with_resource_exhausted() {
+        let big = Bytes::from(vec![0u8; 64]);
+        let limited = http_body_util::Limited::new(http_body_util::Full::new(big), 16);
+        let err = limited.collect().await.unwrap_err();
+        assert!(err.downcast_ref::<http_body_util::LengthLimitError>().is_some());
+        let resp = grpc_error_response(8, "raft rpc body too large");
+        assert_eq!(resp.headers().get("grpc-status").unwrap(), "8");
     }
 }

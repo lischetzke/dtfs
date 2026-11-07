@@ -121,6 +121,8 @@ pub struct NetworkFactory {
     /// CF-6 — the manager's resolved `[tls]` context; peer channels speak
     /// mTLS when it is enabled, plaintext otherwise.
     pub tls: dtfs_common::tls::TlsContext,
+    /// `cluster.shared_secret`; when non-empty every Raft RPC is HMAC-stamped.
+    pub shared_secret: String,
 }
 
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
@@ -131,6 +133,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
             addr: node.addr.clone(),
             channel: None,
             tls: self.tls.clone(),
+            shared_secret: self.shared_secret.clone(),
         }
     }
 }
@@ -148,7 +151,11 @@ pub struct DtfsNetwork {
     channel: Option<Channel>,
     /// CF-6 — TLS context applied when (re)opening the channel.
     tls: dtfs_common::tls::TlsContext,
+    shared_secret: String,
 }
+
+/// gRPC method name bound into the Raft RPC HMAC stamp.
+pub const RAFT_RPC_AUTH_METHOD: &str = "RaftRpc";
 
 impl DtfsNetwork {
     /// Bug AC — connection and request timeouts. With the previous
@@ -222,6 +229,15 @@ impl DtfsNetwork {
         // CO-3-6: per-request timeout (the channel no longer sets one). Small
         // RPCs pass RPC_TIMEOUT; the snapshot send passes a size-scaled value.
         request.set_timeout(timeout);
+        if let Some((ts, mac)) =
+            dtfs_common::crypto::stamp_mgr_rpc_auth(&self.shared_secret, RAFT_RPC_AUTH_METHOD, "")
+        {
+            if let (Ok(ts), Ok(mac)) = (ts.parse(), mac.parse()) {
+                let md = request.metadata_mut();
+                md.insert(dtfs_common::crypto::DATA_RPC_AUTH_TS, ts);
+                md.insert(dtfs_common::crypto::DATA_RPC_AUTH_MAC, mac);
+            }
+        }
 
         // Use a raw gRPC call to `dtfs.manager.RaftTransport/RaftRpc`.
         let mut client = tonic::client::Grpc::new(channel);

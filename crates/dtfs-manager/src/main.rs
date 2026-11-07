@@ -168,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
     // 4. Create the Raft node.
     let network_factory = dtfs_raft::network::NetworkFactory {
         tls: tls_ctx.clone(),
+        shared_secret: config.cluster.shared_secret.clone(),
     };
     let raft = openraft::Raft::new(
         // Use a deterministic node id derived from the hostname hash.

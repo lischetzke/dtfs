@@ -33,6 +33,9 @@ shared_secret = "change-me"         # must be identical on all nodes (managers, 
                                     # unless allow_insecure_empty_secret = true.
 #allow_insecure_empty_secret = false # lab-only: permit empty shared_secret (fail-open
                                     # RegisterNode). Never set in production.
+#require_raft_auth = false          # true = reject Raft RPCs without a valid HMAC stamp.
+                                    # Leave false during a rolling update, set true once
+                                    # every manager runs a build that signs Raft RPCs.
 #bootstrap = false                  # true on EXACTLY ONE manager, only for the
                                     # very first cluster start. Never set true on
                                     # a node joining an existing cluster — it

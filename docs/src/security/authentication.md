@@ -118,6 +118,22 @@ unlink fan-out, scheduler flush/orphan delete. **Deploy data + manager +
 fuse together** when enabling a non-empty secret (update-required). mTLS
 (CF-6) is complementary transport auth, not a substitute for this MAC.
 
+## Raft transport
+
+When `cluster.shared_secret` is set, every Raft RPC (AppendEntries, Vote,
+InstallSnapshot) between managers carries the `x-dtfs-rpc-ts` /
+`x-dtfs-rpc-mac` pair (method `RaftRpc`, empty binding, `dtfs-mgr-rpc`
+plane, 300 s skew). The receiver verifies the stamp before reading the body.
+
+- A stamped-but-invalid request (bad MAC, skew, one header only) is always
+  rejected with `PermissionDenied`.
+- An unsigned request is accepted with a rate-limited warning unless
+  `cluster.require_raft_auth = true`, in which case it is rejected.
+- Rolling update: deploy the new build to all managers first (they sign but
+  still accept unsigned peers), then set `require_raft_auth = true` on every
+  manager and restart. Until then any host that can reach the gRPC port can
+  forge Raft RPCs (including InstallSnapshot).
+
 ## Node join / register
 
 Data nodes and FUSE clients prove the secret via gRPC `RegisterNode`
