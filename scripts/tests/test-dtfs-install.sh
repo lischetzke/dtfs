@@ -27,7 +27,7 @@ check() {
 }
 
 # 1. --help prints AZ-2 flags.
-check "--help mentions --source"        bash -c "'$SCRIPT' --help 2>&1 | grep -q -- '--source local|github|auto'"
+check "--help mentions --source"        bash -c "'$SCRIPT' --help 2>&1 | grep -q -- '--source local|remote|auto'"
 check "--help mentions --version"       bash -c "'$SCRIPT' --help 2>&1 | grep -q -- '--version <tag>'"
 check "--help mentions DTFS_REPO_URL"   bash -c "'$SCRIPT' --help 2>&1 | grep -q DTFS_REPO_URL"
 

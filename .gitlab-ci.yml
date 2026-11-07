@@ -86,7 +86,7 @@ prepare:
   stage: prepare
   script:
     - git fetch --tags --force --quiet
-    - BASE="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+    - BASE="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
     - STAMP="$(date -u +%Y%m%d%H%M)"
     - SUBJECT="$(printf '%s' "$CI_COMMIT_MESSAGE" | head -n1)"
     - |
@@ -130,6 +130,9 @@ test:scripts:
   script:
     - for f in scripts/*.sh scripts/ci/*.sh scripts/tests/*.sh; do bash -n "$f"; done
     - bash scripts/tests/test-ci-version.sh
+    - bash scripts/tests/test-dtfs-install.sh
+    - bash scripts/tests/test-build-date-fresh.sh
+    - bash scripts/tests/test-release-version-stamp.sh
     - bash scripts/dtfs-cluster-healthcheck.sh --help >/dev/null
     - ansible-playbook --version
     - ansible-playbook -i deploy/ansible/inventory.example.yml --syntax-check deploy/ansible/update-cluster.yml
@@ -146,7 +149,7 @@ build:
     - test "$MODE" != "none" || { echo "MODE=none: nothing to build"; exit 1; }
     - bash scripts/dtfs-release.sh "$VERSION"
     - rm -rf "$DIST_DIR" && mkdir -p "$DIST_DIR"
-    - cp "target/release-artifacts/$VERSION"/* "$DIST_DIR"/
+    - cp "$CARGO_TARGET_DIR/release-artifacts/$VERSION"/* "$DIST_DIR"/
     - ls -l "$DIST_DIR"
   artifacts:
     name: "dtfs-$VERSION"

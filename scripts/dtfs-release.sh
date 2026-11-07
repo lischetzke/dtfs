@@ -17,7 +17,7 @@
 #   ./scripts/dtfs-release.sh v0.3.0
 #   ./scripts/dtfs-release.sh v0.3.0 --publish
 #
-# Output: target/release-artifacts/<version>/
+# Output: $CARGO_TARGET_DIR (default target)/release-artifacts/<version>/
 #   dtfs-linux-amd64.tar.gz   asset the updater pulls (dtfs/bin + systemd + MANIFEST)
 #   SHA256SUMS                checksum of the asset
 #   notes.md                  git-cliff-generated release notes (if git-cliff ran)
@@ -69,10 +69,11 @@ export SOURCE_DATE_EPOCH="$(date -u +%s)"
 step "Building + staging $VERSION"
 "$SCRIPT_DIR/dtfs-build.sh"
 
-SRC_TARBALL="$(ls -t "$PROJECT_ROOT"/target/dist/dtfs-*-linux-amd64.tar.gz 2>/dev/null | head -1 || true)"
+TARGET_ROOT="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+SRC_TARBALL="$(ls -t "$TARGET_ROOT"/dist/dtfs-*-linux-amd64.tar.gz 2>/dev/null | head -1 || true)"
 [ -n "$SRC_TARBALL" ] && [ -f "$SRC_TARBALL" ] || { error "dtfs-build.sh produced no tarball"; exit 1; }
 
-OUT_DIR="$PROJECT_ROOT/target/release-artifacts/$VERSION"
+OUT_DIR="$TARGET_ROOT/release-artifacts/$VERSION"
 ASSET="dtfs-linux-amd64.tar.gz"
 step "Assembling release artifacts in $OUT_DIR"
 rm -rf "$OUT_DIR"

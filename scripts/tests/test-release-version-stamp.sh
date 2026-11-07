@@ -30,7 +30,7 @@ ver_for() {
     else
         cargo build --release -p dtfs-cli >/dev/null 2>&1 || { echo "BUILD_FAILED"; return 1; }
     fi
-    ./target/release/dtfs-cli --version 2>/dev/null
+    "${CARGO_TARGET_DIR:-./target}/release/dtfs-cli" --version 2>/dev/null
 }
 
 echo "[1/2] build with DTFS_VERSION unset"

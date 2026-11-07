@@ -31,7 +31,7 @@ stamp_for() {
     SOURCE_DATE_EPOCH="$epoch" cargo build --release -p dtfs-cli >/dev/null 2>&1 || {
         echo "BUILD_FAILED"; return 1
     }
-    ./target/release/dtfs-cli --version 2>/dev/null | grep -oE '[0-9]{8}-[0-9]{6}' | head -1
+    "${CARGO_TARGET_DIR:-./target}/release/dtfs-cli" --version 2>/dev/null | grep -oE '[0-9]{8}-[0-9]{6}' | head -1
 }
 
 echo "[1/3] build @ EPOCH_A=$EPOCH_A"

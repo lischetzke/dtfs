@@ -12,7 +12,7 @@
 #   ./scripts/dtfs-build.sh --help
 #
 # Exit codes:
-#   0  success — tarball at target/dist/dtfs-<git-rev>-linux-amd64.tar.gz
+#   0  success — tarball at $CARGO_TARGET_DIR (default target)/dist/dtfs-<git-rev>-linux-amd64.tar.gz
 #   1  build failed
 #   2  tests failed
 #   3  invalid argument
@@ -49,9 +49,10 @@ if ! command -v protoc >/dev/null 2>&1; then
 fi
 
 REV=$(git rev-parse --short HEAD 2>/dev/null || echo "nogit")
-OUT_DIR="$PROJECT_ROOT/target/dist"
+TARGET_ROOT="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+OUT_DIR="$TARGET_ROOT/dist"
 TARBALL="$OUT_DIR/dtfs-${REV}-linux-amd64.tar.gz"
-BIN_DIR="$PROJECT_ROOT/target/$PROFILE"
+BIN_DIR="$TARGET_ROOT/$PROFILE"
 mkdir -p "$OUT_DIR"
 
 # Bug BS — re-stamp BUILD_DATE per build via SOURCE_DATE_EPOCH (build.rs
