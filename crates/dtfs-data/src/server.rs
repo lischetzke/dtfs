@@ -364,6 +364,34 @@ fn stream_file(
     ReceiverStream::new(rx)
 }
 
+impl DataServiceImpl {
+    /// verify_on_read found no readable `.meta`. If the `.dat` is gone too
+    /// a delete raced the read (delete removes `.dat` first): plain
+    /// NOT_FOUND, no fault. Otherwise Bug BF-3: record an integrity fault
+    /// and return DATA_LOSS so the client fails over.
+    fn meta_absent_status(
+        &self,
+        chunk_id: &ChunkId,
+        chunk_hex: &str,
+        total_size: u64,
+        now_ms: u64,
+    ) -> Status {
+        if self.store.chunk_file_path(chunk_id).is_none() {
+            return Status::not_found(format!("chunk deleted during read: {chunk_hex}"));
+        }
+        self.integrity_faults.record(crate::integrity::IntegrityFault {
+            chunk_id: chunk_hex.to_string(),
+            observed_at_ms: now_ms,
+            detector: "verify_on_read_meta_absent".into(),
+            expected_len: 0,
+            actual_len: total_size,
+            expected_hash: String::new(),
+            actual_hash: String::new(),
+        });
+        Status::data_loss(format!("verify_on_read: meta absent for chunk {chunk_hex}"))
+    }
+}
+
 #[tonic::async_trait]
 impl DataService for DataServiceImpl {
     type GetChunkStream = ReceiverStream<Result<GetChunkResponse, Status>>;
@@ -683,26 +711,7 @@ impl DataService for DataServiceImpl {
             let expected = match self.store.get_chunk_meta(&chunk_id).await {
                 Ok(m) => m.checksum,
                 Err(_) => {
-                    // No meta on this node — can't verify. Bug BF-3:
-                    // record an integrity fault (detector =
-                    // "verify_on_read_meta_absent") so the heartbeat
-                    // surfaces this + the mgr quarantines us. Then
-                    // return DATA_LOSS so the FUSE client falls over
-                    // to a healthy replica.
-                    self.integrity_faults.record(
-                        crate::integrity::IntegrityFault {
-                            chunk_id:      req.chunk_id.clone(),
-                            observed_at_ms: now_ms,
-                            detector:      "verify_on_read_meta_absent".into(),
-                            expected_len:  0,
-                            actual_len:    total_size,
-                            expected_hash: String::new(),
-                            actual_hash:   String::new(),
-                        }
-                    );
-                    return Err(Status::data_loss(format!(
-                        "verify_on_read: meta absent for chunk {}", req.chunk_id
-                    )));
+                    return Err(self.meta_absent_status(&chunk_id, &req.chunk_id, total_size, now_ms));
                 }
             };
             let actual = hash_file_incrementally(&dat_path, total_size)
@@ -1548,6 +1557,32 @@ max_io_percent = 10
 
         let got = collect_stream(&svc, &chunk_hex).await.expect("authed get");
         assert_eq!(got, data);
+    }
+
+    #[tokio::test]
+    async fn meta_absent_with_dat_present_is_data_loss_and_fault() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"meta-absent-dat-present";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        svc.store
+            .put_chunk(&chunk_id, data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+        let st = svc.meta_absent_status(&chunk_id, &chunk_id.as_hex(), data.len() as u64, 1);
+        assert_eq!(st.code(), tonic::Code::DataLoss);
+        assert_eq!(svc.integrity_faults.pending_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn meta_absent_after_delete_race_is_not_found_without_fault() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let chunk_id = ChunkId::from_bytes(checksum::compute(b"gone"));
+        let st = svc.meta_absent_status(&chunk_id, &chunk_id.as_hex(), 4, 1);
+        assert_eq!(st.code(), tonic::Code::NotFound);
+        assert_eq!(svc.integrity_faults.pending_len(), 0);
+        assert!(!svc.integrity_faults.is_self_quarantined());
     }
 
     // ── CR-4-5 (DATA-5, server half) — declared chunk_id vs bytes ───
