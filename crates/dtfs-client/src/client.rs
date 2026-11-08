@@ -216,6 +216,9 @@ struct DtfsClientInner {
     /// data node can bucket per-chunk reads by DC for the tiering engine's
     /// auto-move-replica-toward-active-DC decision.
     requester_dc: parking_lot::RwLock<String>,
+    /// FUSE `[write] anchor_sync = false`: AllocateChunks sends
+    /// `defer_anchor = true` (see [`DtfsClient::set_defer_anchor`]).
+    defer_anchor: std::sync::atomic::AtomicBool,
     /// Optional host name for the same purpose (mostly diagnostic).
     requester_host: parking_lot::RwLock<String>,
     /// LIS-19 — cluster shared secret for data-plane PutChunk auth.
@@ -258,6 +261,7 @@ impl DtfsClient {
                 manager_addrs: parking_lot::RwLock::new(Vec::new()),
                 active_idx: parking_lot::RwLock::new(0),
                 requester_dc: parking_lot::RwLock::new(String::new()),
+                defer_anchor: std::sync::atomic::AtomicBool::new(false),
                 requester_host: parking_lot::RwLock::new(String::new()),
                 shared_secret: parking_lot::RwLock::new(String::new()),
                 tls: parking_lot::RwLock::new(
@@ -319,6 +323,14 @@ impl DtfsClient {
     pub fn set_requester_location(&self, dc: &str, host: &str) {
         *self.inner.requester_dc.write() = dc.to_string();
         *self.inner.requester_host.write() = host.to_string();
+    }
+
+    /// FUSE `[write] anchor_sync = false` — ask AllocateChunks to defer the
+    /// volume's anchor copy to the manager's anchor-lag repair.
+    pub fn set_defer_anchor(&self, defer: bool) {
+        self.inner
+            .defer_anchor
+            .store(defer, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Connect to a single manager node. Backward-compat shim for callers
@@ -523,6 +535,12 @@ impl DtfsClient {
             preferred_tier: preferred_tier.to_string(),
             exclude_addrs: exclude_addrs.to_vec(),
             requester_location,
+            // Absent unless deferring, so the default wire bytes are unchanged.
+            defer_anchor: self
+                .inner
+                .defer_anchor
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .then_some(true),
         };
         let response = self
             .call_manager("allocate_chunks", false, |mut c| {

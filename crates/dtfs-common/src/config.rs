@@ -1115,6 +1115,13 @@ pub struct FuseWriteConfig {
     /// per target, and every put shares the link under a fixed RPC timeout.
     #[serde(default = "default_upload_concurrency")]
     pub upload_concurrency: u32,
+    /// `true` (default): every write uploads synchronously to the volume's
+    /// anchor DC. `false`: AllocateChunks asks the manager to defer the
+    /// anchor (`defer_anchor`); the write acks on the ack floor from near
+    /// maintained nodes and the scheduler's anchor-lag repair copies the
+    /// anchor replica later. Ignored by managers that predate the field.
+    #[serde(default = "default_true")]
+    pub anchor_sync: bool,
 }
 
 impl Default for FuseWriteConfig {
@@ -1123,6 +1130,7 @@ impl Default for FuseWriteConfig {
             first_write_tier: default_first_write_tier(),
             flush_batch_chunks: default_flush_batch_chunks(),
             upload_concurrency: default_upload_concurrency(),
+            anchor_sync: true,
         }
     }
 }
@@ -2060,6 +2068,16 @@ warm = 2
                 toml::from_str(&format!("upload_concurrency = {raw}")).unwrap();
             assert_eq!(cfg.effective_upload_concurrency(), want, "raw {raw}");
         }
+    }
+
+    #[test]
+    fn anchor_sync_defaults_to_true() {
+        let cfg: FuseWriteConfig = toml::from_str("").unwrap();
+        assert!(cfg.anchor_sync);
+        assert!(FuseWriteConfig::default().anchor_sync);
+        let cfg: FuseWriteConfig = toml::from_str("anchor_sync = false").unwrap();
+        assert!(!cfg.anchor_sync);
+        assert!(toml::from_str::<FuseWriteConfig>("anchor_sync = \"no\"").is_err());
     }
 
     /// Bug BC-1 — an empty `[scrub]` block (or its complete absence)

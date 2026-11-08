@@ -38,7 +38,7 @@ Non-goals: multi-tenancy, POSIX completeness (xattrs/mmap/open-unlink best-effor
 
 Crates: **dtfs-manager** (Raft peer, REST/gRPC, owns metadata), **dtfs-data** (per-tier chunk store, streaming put/get, SMART), **dtfs-fuse** (`/mnt/dtfs`, read-ahead cache), **dtfs-client** (shared by fuse + cli), **dtfs-raft** (openraft SM; log = truth), **dtfs-common** (BLAKE3, hash ring, config, version), **dtfs-proto**.
 
-**Write:** write_lease → allocate_chunks (file's volume) → PutChunk to tmp → commit_chunk_from_tmp → commit_chunk_locations via Raft; rejected below `write_safety.min_replicas_before_ack` distinct `(node_id, disk_id)` replicas on maintained tiers (filled across).
+**Write:** write_lease → allocate_chunks (file's volume) → PutChunk to tmp → commit_chunk_from_tmp → commit_chunk_locations via Raft; rejected below `write_safety.min_replicas_before_ack` distinct `(node_id, disk_id)` replicas on maintained tiers (filled across). FUSE `write.anchor_sync=false`: no forced anchor slot, anchor-lag adds it.
 
 **Read:** metadata (ENTRY_TTL cache) → `select_read_replica` (priority > distance > tier) → GetChunk, verify → local cache → readahead; misses single-flighted. Detail: `docs/src/architecture/data-flow.md`.
 

@@ -129,6 +129,10 @@ async fn main() -> Result<()> {
         &fuse_config.location.datacenter,
         &fuse_config.location.host,
     );
+    client.set_defer_anchor(!fuse_config.write.anchor_sync);
+    if !fuse_config.write.anchor_sync {
+        info!("write.anchor_sync = false: anchor copies follow via anchor-lag repair");
+    }
 
     info!(count = endpoints.len(), "connected to manager pool");
 

@@ -403,6 +403,12 @@ message AllocateChunksRequest {
   // empty location keeps the legacy speed -> free-space ordering (nearness
   // neutral), so older FUSE clients that don't send it still work.
   dtfs.common.Location requester_location = 6;
+  // FUSE `[write] anchor_sync = false` — place the chunk without forcing a
+  // target into the volume's anchor DC; the scheduler's anchor-lag repair
+  // adds the anchor copy later. Absent / false = force the anchor (legacy).
+  // Older managers ignore the field and keep forcing it. The ack floor is
+  // never lowered: when near nodes cannot meet it, the anchor is included.
+  optional bool defer_anchor = 7;
 }
 
 message ChunkPlacement {

@@ -1260,6 +1260,100 @@ mod tests {
         assert!(both as u32 >= floor);
     }
 
+    // ---- [write] anchor_sync = false (defer_anchor) ----
+
+    /// Same composition as `allocate_chunks`: ring placement on the volume's
+    /// first maintained tier (warm rf 2) with `allocation_anchor_dc`, then the
+    /// ack-floor fill (floor 2) ranked from the requester. Per-chunk targets.
+    async fn alloc_targets(sm: &StateMachineData, defer: bool, requester_dc: &str) -> Vec<Vec<String>> {
+        let arc = Arc::new(tokio::sync::RwLock::new(sm.clone()));
+        let engine = PlacementEngine::default();
+        engine.rebuild_ring(&arc).await;
+        let vol = &sm.volumes["default"];
+        let anchor = allocation_anchor_dc(vol.anchor_datacenter.clone(), defer, requester_dc);
+        let placed = engine.place_chunks_with_anchor("default", "/a", 8, DiskTier::Warm, 2, anchor);
+        assert_eq!(placed.len(), 8);
+        placed
+            .into_iter()
+            .map(|p| {
+                let mut addrs: Vec<String> = p
+                    .node_ids
+                    .iter()
+                    .map(|n| sm.nodes[&n.0.parse::<u64>().unwrap()].grpc_addr.clone())
+                    .collect();
+                let extra = fill_floor_targets(
+                    &sm.nodes,
+                    &vol.effective_mandatory_replicas(),
+                    &vol.spill,
+                    &dtfs_common::config::PlacementConfig::default(),
+                    &Location::new("", requester_dc, "", ""),
+                    DiskTier::Warm,
+                    &addrs,
+                    2,
+                    &std::collections::HashSet::new(),
+                );
+                addrs.extend(extra);
+                addrs
+            })
+            .collect()
+    }
+
+    /// Deferral from NRB: both warm nodes meet the floor, no LELI target, and
+    /// the unchanged commit gate accepts the two warm copies.
+    #[tokio::test]
+    async fn defer_anchor_from_nrb_places_no_anchor_target() {
+        let sm = live_topology();
+        for t in alloc_targets(&sm, true, "nrb").await {
+            assert!(!t.contains(&"data01:9500".to_string()), "anchor target placed: {t:?}");
+            let mut s = t.clone();
+            s.sort();
+            assert_eq!(s, vec!["data02:9500".to_string(), "data03:9500".to_string()]);
+        }
+        let floor = clamp_ack_floor_to_capacity(2, &sm, "default", None, "/a", None);
+        assert!(min_maintained_replicas(&sm, "default", &[ent("2"), ent("3")]) as u32 >= floor);
+    }
+
+    /// Deferral never lowers the floor: with toro warm Down only one near
+    /// node is left, so the anchor node fills the second slot.
+    #[tokio::test]
+    async fn defer_anchor_includes_anchor_when_near_nodes_miss_floor() {
+        let mut sm = live_topology();
+        sm.nodes.get_mut(&2).unwrap().health = HealthStatus::Down;
+        for t in alloc_targets(&sm, true, "nrb").await {
+            let mut s = t.clone();
+            s.sort();
+            assert_eq!(s, vec!["data01:9500".to_string(), "data03:9500".to_string()]);
+        }
+    }
+
+    /// No deferral (field absent) = today's placement: anchor forced.
+    #[tokio::test]
+    async fn no_defer_anchor_forces_anchor_target() {
+        let sm = live_topology();
+        for t in alloc_targets(&sm, false, "nrb").await {
+            assert!(t.contains(&"data01:9500".to_string()), "anchor missing: {t:?}");
+            assert_eq!(t.len(), 2);
+        }
+    }
+
+    /// A requester inside the anchor DC is unaffected (case-insensitive).
+    #[tokio::test]
+    async fn defer_anchor_from_anchor_dc_still_forces_anchor() {
+        let sm = live_topology();
+        for t in alloc_targets(&sm, true, "LELI").await {
+            assert!(t.contains(&"data01:9500".to_string()), "anchor missing: {t:?}");
+        }
+    }
+
+    #[test]
+    fn allocation_anchor_dc_cases() {
+        let a = || Some("leli".to_string());
+        assert_eq!(allocation_anchor_dc(a(), false, "nrb"), a());
+        assert_eq!(allocation_anchor_dc(a(), true, "nrb"), None);
+        assert_eq!(allocation_anchor_dc(a(), true, "Leli"), a());
+        assert_eq!(allocation_anchor_dc(None, true, "nrb"), None);
+    }
+
     /// One data node / one maintained disk: floor clamps to 1 and commits
     /// (CR-6-2 reason the clamp exists).
     #[test]

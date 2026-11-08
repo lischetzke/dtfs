@@ -1161,6 +1161,22 @@ pub(crate) fn spill_for_fill(
     s
 }
 
+/// Anchor DC the hash-ring placement forces for one allocation. A writer
+/// with `[write] anchor_sync = false` (`defer_anchor`) outside the anchor DC
+/// gets none: the ack-floor fill still runs (and picks the anchor node when
+/// near nodes cannot meet the floor), and anchor-lag repair adds the anchor
+/// copy later. A writer inside the anchor DC keeps it forced (it is near).
+pub(crate) fn allocation_anchor_dc(
+    anchor_dc: Option<String>,
+    defer_anchor: bool,
+    requester_dc: &str,
+) -> Option<String> {
+    match anchor_dc {
+        Some(a) if defer_anchor && !a.eq_ignore_ascii_case(requester_dc) => None,
+        other => other,
+    }
+}
+
 /// The one per-node eligibility rule shared by the allocation fill and the
 /// commit-side capacity, so they cannot drift: a Healthy data node may hold
 /// a fill replica only if EVERY disk the data node might pick for
@@ -2479,6 +2495,22 @@ impl ManagerService for MetadataService {
         // (`find_nodes_for_pg` takes client_locations, not an exclude list),
         // so when the client is rerouting we skip it and fall straight to
         // the capacity + exclude-filtered round-robin below.
+        let requester_dc = req
+            .requester_location
+            .as_ref()
+            .map(|l| l.datacenter.as_str())
+            .unwrap_or("");
+        let ring_anchor =
+            allocation_anchor_dc(anchor_dc.clone(), req.defer_anchor.unwrap_or(false), requester_dc);
+        if anchor_dc.is_some() && ring_anchor.is_none() {
+            tracing::debug!(
+                path = %req.path,
+                num_chunks = req.num_chunks,
+                requester_dc,
+                anchor_dc = ?anchor_dc,
+                "anchor_sync=false: anchor copy deferred to anchor-lag repair"
+            );
+        }
         let placed = if exclude_set.is_empty() {
             self.placement.place_chunks_with_anchor(
                 &effective_volume_id,
@@ -2486,7 +2518,7 @@ impl ManagerService for MetadataService {
                 req.num_chunks,
                 effective_tier,
                 replication,
-                anchor_dc.clone(),
+                ring_anchor,
             )
         } else {
             Vec::new()

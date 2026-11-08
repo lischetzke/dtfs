@@ -1310,6 +1310,45 @@ mod bug_av_anchor_lag_tests {
         assert_eq!(a.source_node, 11, "the only existing replica");
     }
 
+    /// `[write] anchor_sync = false` — a deferred write commits warm toro +
+    /// warm nrb with no anchor copy. Anchor-lag schedules the LELI cold copy
+    /// from a live warm replica, and neither the window (2 warm) nor the final
+    /// state (cold 1 + warm 2 = goal) gives the excess-removal pass a victim.
+    #[test]
+    fn deferred_anchor_write_converges_to_goal_without_removal() {
+        use crate::scheduler::plan_excess_spill_removal;
+        use dtfs_common::types::TierReplication;
+        let anchor = AnchorPolicy {
+            datacenter: "leli".to_string(),
+            required_tier: Some(DiskTier::Cold),
+        };
+        let mandatory = TierReplication { hot: 0, warm: 2, cold: 1, tape: 0 };
+        let nodes = vec![
+            node(10, "leli", true, &[DiskTier::Cold]),
+            node(11, "toro", true, &[DiskTier::Warm]),
+            node(12, "nrb", true, &[DiskTier::Warm]),
+        ];
+        let placements = vec![
+            placement(12, "nrb", DiskTier::Warm),
+            placement(11, "toro", DiskTier::Warm),
+        ];
+        let a = plan_anchor_lag_repair(&anchor, &placements, &nodes, "h0", &HashSet::new())
+            .expect("committed chunk without anchor copy is anchor-pending");
+        assert_eq!((a.target_node, a.target_tier), (10, DiskTier::Cold));
+        assert!([11, 12].contains(&a.source_node), "source must be a live warm copy");
+
+        let window = vec![
+            (12, 0, "nrb".to_string(), DiskTier::Warm),
+            (11, 0, "toro".to_string(), DiskTier::Warm),
+        ];
+        assert_eq!(plan_excess_spill_removal(&window, &mandatory, Some(&anchor), 0), None);
+        let mut done = window.clone();
+        done.push((10, 0, "leli".to_string(), DiskTier::Cold));
+        assert_eq!(plan_excess_spill_removal(&done, &mandatory, Some(&anchor), 0), None);
+        let done_p: Vec<_> = done.iter().map(|(n, _, dc, t)| placement(*n, dc, *t)).collect();
+        assert!(plan_anchor_lag_repair(&anchor, &done_p, &nodes, "h0", &HashSet::new()).is_none());
+    }
+
     /// AV-3-3 test 2 — `required_tier = Cold` filters out a
     /// LELI warm node that *would* be in the anchor DC but on
     /// the wrong tier.

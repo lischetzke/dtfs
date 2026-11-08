@@ -35,7 +35,7 @@ Terms used across DTFS: its own names and the general distributed-systems words 
 ## Replication and placement
 
 - **Anchor copy**: The replica in the anchor datacenter. It is always one of the mandatory replicas, and no promote, demote, flush or repair may remove the last one.
-- **Anchor pending**: A file with at least one chunk that has no anchor copy yet. Normal for a while after a write that landed outside the anchor datacenter (for example a download at NRB, replicating over the slow LELI link). The dashboard shows this as "Catching up", not as a failure.
+- **Anchor pending**: A file with at least one chunk that has no anchor copy yet. Normal for a while after a write that landed outside the anchor datacenter (for example a download at NRB, replicating over the slow LELI link, or any write from a FUSE client with `[write] anchor_sync = false`, which acks on the ack floor of near copies before the anchor copy exists). The dashboard shows this as "Catching up", not as a failure.
 - **Cache replica**: An extra, evictable copy created by the tiering engine near readers when a chunk is read often (`cache_replicas.<tier>.{min,max}`). Never counted for durability. See [Replication](./storage/replication.md#two-replication-classes-mandatory-vs-cache).
 - **Demote / promote**: Removing a cache replica that is no longer needed, or creating one because of read demand. Both are done by the tiering engine and both check the anchor first.
 - **Flush cache**: An operator action that drops cache replicas under a path prefix ahead of time to reclaim space. Mandatory replicas are never touched.

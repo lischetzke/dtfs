@@ -48,8 +48,8 @@ events for the operator-visible lifecycle.
 
 Volumes carry an `anchor.datacenter` setting (optionally pinned to a specific `anchor.required_tier`). At least one **live** replica of every chunk must sit in the anchor datacenter. It is enforced at every place a replica can disappear:
 
-- Placement forces one replica into the anchor datacenter at allocation time (the tier constraint is relaxed for that slot).
-- The anchor-lag pass creates the anchor copy for chunks that landed without one.
+- Placement forces one replica into the anchor datacenter at allocation time (the tier constraint is relaxed for that slot), unless the writing FUSE client sets `[write] anchor_sync = false` and sits outside the anchor datacenter. Then the chunk is placed on near maintained nodes up to the ack floor (the anchor node is added only when they cannot reach it) and is anchor pending until the anchor-lag pass copies it: during that window it has at least `min_replicas_before_ack` copies and no anchor copy. The excess-removal pass leaves such a chunk alone (it is not over goal), so the near copies stay.
+- The anchor-lag pass creates the anchor copy for chunks that landed without one, copying from a live replica to a healthy anchor-datacenter node under the same per-tick task budget as under-replication repair.
 - Every promote, demote, flush and migration checks the anchor against its destination (`would_violate_anchor`, `demote_preserves_anchor`). An additive copy never subtracts its source; a move does.
 - The state machine re-checks on `RemoveChunkLocation` (`enforce_anchor`) and refuses to remove the last live replica regardless of policy.
 - A surviving replica that justifies dropping another must be live. A copy on a Down node does not count.
