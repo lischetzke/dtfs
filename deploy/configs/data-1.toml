@@ -35,10 +35,3 @@ policy = "arc"
 quick_interval_hours = 6
 deep_interval_hours = 168
 max_io_percent = 10
-
-# AZ-5 — source for `dtfs-cli update` (read by the CLI; the daemon
-# ignores the block). Both keys are optional; the defaults shown are
-# used when the block is absent.
-[updater]
-repo_url    = "https://github.com/lischetzke/dtfs"
-install_dir = "/usr/local/bin"
