@@ -41,11 +41,15 @@ else
 fi
 
 # First token of the subject, lower-cased.
+# The keyword ends at the first ':' or whitespace, exactly like the
+# .gitlab-ci.yml gate /^(release|deploy)(:|\s|$)/i, so "deploy:foo" agrees.
 FIRST="$(printf '%s' "$SUBJECT" | awk '{print tolower($1)}')"
+FIRST="${FIRST%%:*}"
+REST="$(printf '%s' "$SUBJECT" | sed -E 's/^[[:space:]]*[^:[:space:]]*[:[:space:]]*//')"
 
 case "$FIRST" in
-    release|release:)
-        SECOND="$(printf '%s' "$SUBJECT" | awk '{print $2}')"
+    release)
+        SECOND="$(printf '%s' "$REST" | awk '{print $1}')"
         # Trim a trailing ':' or ',' so "release v1.2.3: notes" parses.
         SECOND="${SECOND%%[:,]}"
         if [[ "$SECOND" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
@@ -56,7 +60,7 @@ case "$FIRST" in
         echo "error: 'release' must be followed by a semantic version (vX.Y.Z), got '${SECOND}'" >&2
         exit 3
         ;;
-    deploy|deploy:)
+    deploy)
         echo "MODE=deploy"
         echo "VERSION=${BASE}_${STAMP}"
         exit 0

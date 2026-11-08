@@ -36,6 +36,9 @@ check "deploy mid-sentence is not a keyword" "docs: describe deploy" v0.1.9 2026
 check "release mid-sentence is not a keyword" "docs: release notes"  v0.1.9 202609131530 "MODE=none VERSION=v0.1.9_202609131530"
 check "alpha base tag is normalised" "deploy"                       v0.1.9_202609010900 202609131530 "MODE=deploy VERSION=v0.1.9_202609131530"
 check "no base tag"               "deploy"                         "" 202609131530 "MODE=deploy VERSION=v0.0.0_202609131530"
+check "deploy:foo (no space) is a deploy" "deploy:foo"            v0.1.9 202609131530 "MODE=deploy VERSION=v0.1.9_202609131530"
+check "release:v0.2.0 (no space)"  "release:v0.2.0"               v0.1.9 202609131530 "MODE=release VERSION=v0.2.0"
+check "deployment is not a keyword" "deployment fix"              v0.1.9 202609131530 "MODE=none VERSION=v0.1.9_202609131530"
 check_fails "release without version"  "release"
 check_fails "release with short version" "release v1.2"
 
