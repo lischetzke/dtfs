@@ -925,9 +925,12 @@ fn replica_location_proto(
 /// Storing numeric IDs in `ChunkLocationEntry.node_id` keeps the field type
 /// consistent — the scheduler always parses it as `u64` (fix for issue #7).
 fn node_id_from_grpc_addr(sm: &StateMachineData, addr: &str) -> String {
+    // Scheme-insensitive: an unresolved address is rejected at commit.
+    let bare = |a: &str| a.trim_start_matches("http://").trim_start_matches("https://").to_string();
+    let want = bare(addr);
     sm.nodes
         .iter()
-        .find(|(_, n)| n.grpc_addr == addr)
+        .find(|(_, n)| bare(&n.grpc_addr) == want)
         .map(|(id, _)| id.to_string())
         .unwrap_or_else(|| addr.to_string())
 }
