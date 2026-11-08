@@ -57,6 +57,14 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   index" = zeros; "chunk with no live address" keeps refusing at commit.
 - A failed post-commit locations refresh sets the handles' `locations` to
   `None`; `write()`/`read()` must `refetch_locations` before using them.
+- `rename` over a path with open writers and `unlink`/`rmdir` of one
+  detach those handles (`detach_handles`: path becomes `<path>\0detached-N`,
+  unresolvable by the manager) so their commits fail instead of landing in
+  the replacement; `reacquire_write_lease` refuses detached handles.
+- The lease is renewed BEFORE each commit in `write()` (`renew_if_due`: top,
+  before every drain), never after. `set_size`/truncate-refresh failure set
+  handle `locations = None`. `create()` seeds from the manager's snapshot
+  when it kept a populated file (`committed_any = !chunks.is_empty()`).
 - `release()` drops the buffer when no other writer is open; a refused
   commit is logged at error with chunk indices and bytes lost. flush and
   fsync return the commit error.

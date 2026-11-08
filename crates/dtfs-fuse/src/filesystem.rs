@@ -1286,16 +1286,6 @@ impl DtfsFilesystem {
 
         let path = file.path.clone();
         let append = file.append;
-        // P0-1 follow-up: a streaming write of a multi-GB file can hold the
-        // file open for longer than WRITE_LEASE_MS without ever calling
-        // flush — and the original flush-only renewal then sees the lease
-        // already swept by manager GC and aborts the close with
-        // "write lease lost". Renew proactively from here too: cheap because
-        // the renewal only fires once per half-life window, and the manager
-        // dedups same-token renewals.
-        let lease_id_for_renew = file.lease_id.clone();
-        let lease_deadline_for_renew = file.lease_deadline;
-        let lease_owner_for_renew = file.lease_owner_id.clone();
         // For O_APPEND we ignore the kernel-supplied offset and target the
         // *current* end of file. Use the cached file size; the buffer may
         // already have unflushed data, in which case the buffer reports a
@@ -1303,6 +1293,10 @@ impl DtfsFilesystem {
         let chunk_size = file.chunk_size;
         let cached_snapshot = file.locations.clone();
         drop(file); // Release the lock before writing.
+        // P0-1 follow-up: renew BEFORE any commit (top of write, before each
+        // hole-fill drain and the final drain), not after: a long hole fill
+        // or slow commit must not outlive the lease it runs under.
+        self.renew_if_due(fh, &path).await?;
         // `None` = a post-commit refresh failed and marked the snapshot
         // stale; writing against it would zero-seed over committed chunks.
         let locations_snapshot = match cached_snapshot {
@@ -1414,6 +1408,7 @@ impl DtfsFilesystem {
                 // has already completed) to the cluster right now instead
                 // of accumulating further.
                 if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), n) {
+                    self.renew_if_due(fh, &path).await?;
                     let segs = self.write_buffer.flush_complete(&path);
                     if !segs.is_empty() {
                         if let Err(e) = self.flush_segments_to_cluster(&path, &segs).await {
@@ -1436,6 +1431,7 @@ impl DtfsFilesystem {
         // hole at all into an already-near-cap buffer, must not be allowed
         // to push it further over.
         if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), data.len()) {
+            self.renew_if_due(fh, &path).await?;
             let segs = self.write_buffer.flush_complete(&path);
             if !segs.is_empty() {
                 if let Err(e) = self.flush_segments_to_cluster(&path, &segs).await {
@@ -1451,6 +1447,10 @@ impl DtfsFilesystem {
         // Check if any complete chunks are ready to flush.
         let segments = self.write_buffer.flush(&path);
         if !segments.is_empty() {
+            if let Err(e) = self.renew_if_due(fh, &path).await {
+                self.write_buffer.restore_segments(&path, &segments);
+                return Err(e);
+            }
             if let Err(e) = self.flush_segments_to_cluster(&path, &segments).await {
                 // CO-1-8 (a): `flush` already drained these complete chunks out
                 // of the buffer. Restore them on a cluster-write error so the
@@ -1462,53 +1462,6 @@ impl DtfsFilesystem {
             self.mark_committed_and_refresh(&path).await;
         }
 
-        // Renew the write lease mid-stream so a long-running streaming
-        // write (multi-GB file, rsync over slow uplink) doesn't lose its
-        // lease before flush has a chance to renew it. Renews at most once
-        // per half-life window — manager dedups same-token renewals.
-        if let (Some(lease_id), Some(deadline)) =
-            (lease_id_for_renew, lease_deadline_for_renew)
-        {
-            let sent = Instant::now();
-            if lease_renew_due(deadline, sent) {
-                match self
-                    .client
-                    .renew_write_lease(&path, &lease_id, WRITE_LEASE_MS)
-                    .await
-                {
-                    Ok(resp) if resp.granted => {
-                        if let Some(mut entry) = self.open_files.get_mut(&fh) {
-                            entry.value_mut().lease_deadline = Some(lease_deadline_from(sent));
-                        }
-                    }
-                    Ok(_) => {
-                        // FUSE-1 — the lease was swept (handle idle past
-                        // WRITE_LEASE_MS, or a manager-side GC race). Try
-                        // once to take it back under our own owner id
-                        // before declaring it lost; only a lease genuinely
-                        // held by ANOTHER writer aborts. Pre-fix this arm
-                        // was terminal: every later write/flush on the fh
-                        // failed and release() ghost-unlinked a never-
-                        // committed file.
-                        self.reacquire_write_lease(fh, &path, lease_owner_for_renew.as_deref())
-                            .await
-                            .with_context(|| {
-                                format!("write lease lost for {path} during streaming write")
-                            })?;
-                    }
-                    Err(e) => {
-                        // Manager unreachable. Continue best-effort; the
-                        // existing lease may still be valid until GC.
-                        tracing::debug!(
-                            path = %path,
-                            error = %e,
-                            "lease renew during write failed (non-fatal until expiry)"
-                        );
-                    }
-                }
-            }
-        }
-
         debug!(
             path = %path,
             written,
@@ -1517,6 +1470,41 @@ impl DtfsFilesystem {
             "write buffered"
         );
         Ok(written as u32)
+    }
+
+    /// Renew the fh's write lease once less than half remains (at most once
+    /// per half-life window; the manager dedups same-token renewals). A swept
+    /// lease is re-acquired once under the fh's own owner id (FUSE-1); only a
+    /// lease held by another writer (or a detached handle) errors. A manager
+    /// that is unreachable is non-fatal until the lease actually expires.
+    async fn renew_if_due(&self, fh: u64, path: &str) -> Result<()> {
+        let (lease_id, deadline, owner) = match self.open_files.get(&fh) {
+            Some(f) => (f.lease_id.clone(), f.lease_deadline, f.lease_owner_id.clone()),
+            None => return Ok(()),
+        };
+        let (Some(lease_id), Some(deadline)) = (lease_id, deadline) else {
+            return Ok(());
+        };
+        let sent = Instant::now();
+        if !lease_renew_due(deadline, sent) {
+            return Ok(());
+        }
+        match self.client.renew_write_lease(path, &lease_id, WRITE_LEASE_MS).await {
+            Ok(resp) if resp.granted => {
+                if let Some(mut entry) = self.open_files.get_mut(&fh) {
+                    entry.value_mut().lease_deadline = Some(lease_deadline_from(sent));
+                }
+            }
+            Ok(_) => {
+                self.reacquire_write_lease(fh, path, owner.as_deref())
+                    .await
+                    .with_context(|| format!("write lease lost for {path}"))?;
+            }
+            Err(e) => {
+                tracing::debug!(path = %path, error = %e, "lease renew failed (non-fatal until expiry)");
+            }
+        }
+        Ok(())
     }
 
     /// Flush all buffered writes for an open file to the cluster.
@@ -1606,7 +1594,14 @@ impl DtfsFilesystem {
                 // the manager-walk deadline) — the ghost-unlink decision
                 // belongs to `release()`, not here, and must never run
                 // instead of this restore.
-                self.write_buffer.restore_segments(&path, &segments);
+                // Re-read the path: a concurrent rename may have re-keyed the
+                // handle (and its buffer) while the commit was in flight.
+                let cur = self
+                    .open_files
+                    .get(&fh)
+                    .map(|f| f.path.clone())
+                    .unwrap_or_else(|| path.clone());
+                self.write_buffer.restore_segments(&cur, &segments);
                 return Err(e);
             }
         }
@@ -1766,31 +1761,39 @@ impl DtfsFilesystem {
             }));
         }
 
+        // The manager keeps a populated file another client just created and
+        // filled: seed from its real snapshot so a partial write RMWs it.
+        let fetched = self.fetch_file_locations(path).await.ok().filter(|l| !l.chunks.is_empty());
+        let committed_any = fetched
+            .as_ref()
+            .map(|l| committed_any_from_created_snapshot(l.chunks.len()))
+            .unwrap_or_else(|| committed_any_on_open(true));
+        let snapshot = fetched.unwrap_or_else(|| FileLocations {
+            path: path.to_string(),
+            total_size: 0,
+            chunks: Vec::new(),
+            volume_id: response.volume_id,
+            chunk_size: response.chunk_size,
+            // Newly-created file: timestamps will be filled in on the
+            // next getattr/lookup once metadata round-trips back from
+            // the manager. 0 means "use UNIX_EPOCH for now".
+            created_at_ms: 0,
+            modified_at_ms: 0,
+            is_directory: false,
+            is_symlink: false,
+        });
         self.open_files.insert(
             fh,
             OpenFile {
                 path: path.to_string(),
                 flags: OpenFlags::ReadWrite,
                 append: false,
-                locations: Some(FileLocations {
-                    path: path.to_string(),
-                    total_size: 0,
-                    chunks: Vec::new(),
-                    volume_id: response.volume_id,
-                    chunk_size: response.chunk_size,
-                    // Newly-created file: timestamps will be filled in on the
-                    // next getattr/lookup once metadata round-trips back from
-                    // the manager. 0 means "use UNIX_EPOCH for now".
-                    created_at_ms: 0,
-                    modified_at_ms: 0,
-                    is_directory: false,
-                    is_symlink: false,
-                }),
+                locations: Some(snapshot),
                 chunk_size: response.chunk_size,
                 lease_id: Some(lease_resp.lease_id),
                 lease_deadline: Some(lease_deadline_from(sent)),
                 lease_owner_id: Some(owner_id),
-                committed_any: committed_any_on_open(true),
+                committed_any,
                 last_read_chunk: None,
                 bytes_read_on_fh: 0,
             },
@@ -1815,6 +1818,7 @@ impl DtfsFilesystem {
         // Invalidate caches.
         self.metadata_cache.remove(path);
         self.write_buffer.remove(path);
+        self.detach_handles(path);
 
         info!(path, "file deleted");
         Ok(())
@@ -1894,6 +1898,9 @@ impl DtfsFilesystem {
             .await
             .with_context(|| format!("set_size failed for {path}"))?;
         self.metadata_cache.remove(&path);
+        // Handle snapshots hold the old size (O_APPEND EOF, hole-fill base);
+        // None makes the next write()/read() refetch.
+        self.invalidate_handle_locations(&path);
         Ok(())
     }
 
@@ -1977,13 +1984,21 @@ impl DtfsFilesystem {
         // clamp to `locations.total_size`, so a stale size would resurrect
         // truncated bytes).
         self.metadata_cache.remove(path);
-        if let Ok(fresh) = self.fetch_file_locations(path).await {
-            for mut entry in self.open_files.iter_mut() {
-                if entry.value().path == path {
-                    entry.value_mut().locations = Some(fresh.clone());
+        match self.fetch_file_locations(path).await {
+            Ok(fresh) => {
+                for mut entry in self.open_files.iter_mut() {
+                    if entry.value().path == path {
+                        entry.value_mut().locations = Some(fresh.clone());
+                    }
                 }
+                self.cache_metadata(path, fresh);
             }
-            self.cache_metadata(path, fresh);
+            Err(e) => {
+                // A stale larger snapshot would resurrect truncated bytes;
+                // None makes write()/read() refetch first.
+                error!(path, error = %e, "post-truncate locations refresh failed; marking handle locations stale");
+                self.invalidate_handle_locations(path);
+            }
         }
         Ok(())
     }
@@ -1997,6 +2012,10 @@ impl DtfsFilesystem {
         // everything below either prefix.
         self.metadata_cache
             .retain(|k, _| rekey_path(k, from, "").is_none() && rekey_path(k, to, "").is_none());
+        // Writers open on the replaced destination must never commit into
+        // the replacement: detach them (their unflushed bytes are dropped).
+        self.write_buffer.remove(to);
+        self.detach_handles(to);
         // Move unflushed bytes with the file (a.part -> a keeps its data).
         self.write_buffer.rename(from, to);
         // Re-key open files at or below the old path.
@@ -2006,6 +2025,19 @@ impl DtfsFilesystem {
             }
         }
         Ok(())
+    }
+
+    /// Move every handle at or under `target` to a detached path (see
+    /// `detached_handle_path`); their commits then fail instead of landing
+    /// in whatever now lives at `target`.
+    fn detach_handles(&self, target: &str) {
+        let tag = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        for mut entry in self.open_files.iter_mut() {
+            if let Some(np) = detached_handle_path(&entry.value().path, target, tag) {
+                warn!(path = %entry.value().path, "open handle detached: its path was replaced or deleted");
+                entry.value_mut().path = np;
+            }
+        }
     }
 
     /// F-035 — create a symbolic link.
@@ -2198,6 +2230,9 @@ impl DtfsFilesystem {
         path: &str,
         owner_id: Option<&str>,
     ) -> Result<()> {
+        if is_detached_path(path) {
+            bail!("handle {fh} was detached (its path was replaced or deleted); not re-acquiring a lease");
+        }
         let owner_id = owner_id
             .ok_or_else(|| anyhow::anyhow!("no lease owner recorded for fh {fh}"))?;
         let sent = Instant::now();
@@ -2640,11 +2675,17 @@ impl DtfsFilesystem {
                 // Stale handle snapshots would zero-seed over the chunks just
                 // committed; drop them so write()/read() re-fetch first.
                 error!(path, error = %e, "post-commit locations refresh failed; marking handle locations stale");
-                for mut entry in self.open_files.iter_mut() {
-                    if entry.value().path == path {
-                        entry.value_mut().locations = None;
-                    }
-                }
+                self.invalidate_handle_locations(path);
+            }
+        }
+    }
+
+    /// Mark every handle of `path` stale (`locations = None`); the next
+    /// write()/read() refetches before using a snapshot.
+    fn invalidate_handle_locations(&self, path: &str) {
+        for mut entry in self.open_files.iter_mut() {
+            if entry.value().path == path {
+                entry.value_mut().locations = None;
             }
         }
     }
@@ -2904,6 +2945,23 @@ fn check_chunk_size_matches(file_chunk_size: u64, buffer_chunk_size: usize) -> R
 /// exists, so a failed flush must never ghost-unlink it.
 fn committed_any_on_open(created_here: bool) -> bool {
     !created_here
+}
+
+/// create() landed on a file another client already filled (the manager kept
+/// the populated entry): committed iff the fetched snapshot has chunks.
+fn committed_any_from_created_snapshot(chunk_count: usize) -> bool {
+    chunk_count > 0
+}
+
+/// Key a handle is moved to when a rename/unlink replaces its path. The NUL
+/// byte can never be a manager path, so later commits fail (ENOENT/EIO)
+/// instead of writing into the replacement. `tag` makes each detach unique.
+fn detached_handle_path(path: &str, target: &str, tag: u64) -> Option<String> {
+    rekey_path(path, target, &format!("{target}\0detached-{tag}"))
+}
+
+fn is_detached_path(path: &str) -> bool {
+    path.contains('\0')
 }
 
 /// Local deadline of a lease requested at `sent` for `WRITE_LEASE_MS`.
@@ -3916,5 +3974,40 @@ mod w3_write_hole_tests {
         wb.write("/f", 5 * 8 + 2, b"xy");
         let segs = wb.flush_all("/f");
         assert!(segments_committable(&segs, |_| false).is_err(), "offset_in_chunk > 0");
+    }
+
+    // Finding 1: a writer at a path that a rename/unlink replaces is detached
+    // to a key the manager can never resolve.
+    #[test]
+    fn detached_handle_path_exact_child_and_sibling() {
+        let d = detached_handle_path("/a", "/a", 7).unwrap();
+        assert!(is_detached_path(&d));
+        assert_ne!(d, "/a");
+        let c = detached_handle_path("/a/x", "/a", 7).unwrap();
+        assert!(is_detached_path(&c) && c.ends_with("/x"));
+        // Negative: sibling with a shared prefix and unrelated paths stay put.
+        assert_eq!(detached_handle_path("/ab", "/a", 7), None);
+        assert_eq!(detached_handle_path("/b", "/a", 7), None);
+        assert!(!is_detached_path("/a"));
+    }
+
+    // Detached writer bytes never merge into the replacement's buffer.
+    #[test]
+    fn detached_writer_bytes_do_not_reach_replacement() {
+        let wb = WriteBuffer::new(16);
+        wb.write("/a.part", 0, b"new");
+        let det = detached_handle_path("/a", "/a", 1).unwrap();
+        wb.write(&det, 0, b"old-writer");
+        wb.rename("/a.part", "/a");
+        let segs = wb.flush_all("/a");
+        assert_eq!(segs[0].data.as_ref(), b"new");
+        assert_eq!(wb.flush_all(&det)[0].data.as_ref(), b"old-writer");
+    }
+
+    // Finding 6: a create() that landed on a populated file is committed.
+    #[test]
+    fn created_file_committed_any_follows_chunks() {
+        assert!(!committed_any_from_created_snapshot(0));
+        assert!(committed_any_from_created_snapshot(1));
     }
 }

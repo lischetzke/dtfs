@@ -900,6 +900,11 @@ now call `reacquire_write_lease` under the stored `lease_owner_id`;
 only a lease genuinely held by another writer aborts. The former
 `MigrationTrigger` (one discarded `AllocateChunks` per cross-DC miss,
 manager ring rebuild per call, nothing ever migrated) is deleted.
+C5-fuse: rename/unlink detach open writers of the replaced path
+(`detach_handles`), `write()` renews its lease before committing
+(`renew_if_due`), `set_size` and a failed truncate refresh stale the handle
+snapshots, `flush` restores segments under the handle's current path, and
+`create()` seeds from a populated file the manager kept.
 
 ### `dtfs-fuse/src/readahead.rs`
 
