@@ -1431,6 +1431,9 @@
             return;
         }
 
+        // The user may have left Home while the fetches were in flight.
+        if (!document.getElementById('cnt-managers')) return;
+
         // ── Production signals (anchor / integrity / migrations)
         renderProductionSignals(stats, migrations, cluster, mR.e);
 
@@ -2919,6 +2922,7 @@
             document.getElementById('ve-anchor-dc').dataset.orig = an.datacenter || '';
             document.getElementById('ve-anchor-force').checked = false;
             document.getElementById('ve-anchor-tier').value = an.required_tier || '';
+            document.getElementById('ve-anchor-tier').dataset.orig = an.required_tier || '';
             // prefill spill policy.
             const sp = v.spill || {};
             document.getElementById('ve-spill-allow').value =
@@ -3013,11 +3017,11 @@
         const dc = document.getElementById('ve-anchor-dc').value.trim();
         const rt = document.getElementById('ve-anchor-tier').value.trim();
         const anchorBody = {};
-        if (dc !== '') anchorBody.datacenter = dc;
-        // Clearing a previously set anchor DC must send an explicit empty string (server clears on empty).
-        else if ((document.getElementById('ve-anchor-dc').dataset.orig || '') !== '') anchorBody.datacenter = '';
-        if (document.getElementById('ve-anchor-force').checked) anchorBody.force = true;
-        if (rt !== '') anchorBody.required_tier = rt;
+        // Send only changed fields (server treats absent as unchanged and
+        // "" as clear), so an unrelated edit never re-posts the anchor.
+        if (dc !== (document.getElementById('ve-anchor-dc').dataset.orig || '')) anchorBody.datacenter = dc;
+        if (rt !== (document.getElementById('ve-anchor-tier').dataset.orig || '')) anchorBody.required_tier = rt;
+        if (Object.keys(anchorBody).length && document.getElementById('ve-anchor-force').checked) anchorBody.force = true;
         // spill policy body.
         const spillAllow = document.getElementById('ve-spill-allow').value;
         const forbidTiers = ['hot','warm','cold','tape']
