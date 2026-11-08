@@ -106,7 +106,7 @@ Quarantined chunks are moved to `.dtfs/quarantine/<id>.dat.bad`, never deleted.
 
 ## `[[tape_devices]]`
 
-Parsed (`ltfs_path`, `device`, `library_device`, `label`, `capacity_gb`, `max_write_mbps`) but **not read** by the daemon. A tape tier is declared through a `[[disks]]` entry with `tier = "tape"` on a pre-mounted LTFS path. See [Tape](../storage/tape.md).
+Parsed (`ltfs_path`, `device`, `library_device`, `label`, `capacity_gb`, `max_write_mbps`) but **reserved, not yet read** by the daemon. A tape tier is declared through a `[[disks]]` entry with `tier = "tape"` on a pre-mounted LTFS path. See [Tape](../storage/tape.md).
 
 ## `[updater]` (optional, CLI only)
 

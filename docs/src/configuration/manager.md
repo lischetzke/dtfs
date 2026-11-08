@@ -68,7 +68,6 @@ addr = "10.0.0.3:9401"
 
 | Key | Type | Default | Constraint | Scope |
 |---|---|---|---|---|
-| `listen_addr` | string | `0.0.0.0:9400` | **Not read.** The Raft transport is served on `grpc.listen_addr`. | node |
 | `election_timeout_ms` | u64 | `400` | **Validated**: > 0. The election timeout is randomised in `[value, 2 x value]`. | cluster |
 | `heartbeat_interval_ms` | u64 | `150` | **Validated**: > 0 and strictly below `election_timeout_ms`. | cluster |
 | `snapshot_threshold` | u64 | `10000` | Applied entries between snapshots. | cluster |
@@ -94,7 +93,6 @@ addr = "10.0.0.3:9401"
 | Key | Type | Default | Constraint | Scope |
 |---|---|---|---|---|
 | `listen_addr` | string | `0.0.0.0:9402` | REST API and WebUI. A bind failure exits the process. | node |
-| `cors_origins` | list of string | `["*"]` | **Not read** (no CORS layer is installed). | node |
 
 ## `[tls]`
 

@@ -65,7 +65,6 @@ hostname = "dtfs-example-mgr03"
 addr = "10.0.0.3:9401"
 
 [raft]
-#listen_addr = "0.0.0.0:9400"       # raft peer-to-peer listener
 #election_timeout_ms = 400
 #heartbeat_interval_ms = 150        # must be well under election_timeout_ms
 #snapshot_threshold = 10000         # applied log entries per snapshot
@@ -84,7 +83,6 @@ listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
 
 [api]
 #listen_addr = "0.0.0.0:9402"       # REST API + WebUI
-#cors_origins = ["*"]
 
 [tls]
 # CF-6: mutual TLS for ALL manager gRPC (ManagerService + Raft transport),

@@ -537,8 +537,9 @@ impl DataClusterConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaftConfig {
-    #[serde(default = "default_raft_listen")]
-    pub listen_addr: String,
+    // `listen_addr` was removed: the Raft transport is served on
+    // `grpc.listen_addr`. Old configs that still set it keep parsing
+    // (unknown keys are ignored; see `removed_unread_keys_still_parse`).
     #[serde(default = "default_election_timeout")]
     pub election_timeout_ms: u64,
     #[serde(default = "default_heartbeat_interval")]
@@ -639,8 +640,8 @@ fn default_max_concurrent_chunk_writes() -> usize {
 pub struct ApiConfig {
     #[serde(default = "default_api_listen")]
     pub listen_addr: String,
-    #[serde(default = "default_cors_origins")]
-    pub cors_origins: Vec<String>,
+    // `cors_origins` was removed: no CORS layer exists. Old configs that
+    // still set it keep parsing.
 }
 
 /// CF-6 — gRPC transport security. Resolved by
@@ -1199,9 +1200,6 @@ fn default_auto() -> String {
 fn default_data_dir() -> PathBuf {
     PathBuf::from("/var/lib/dtfs")
 }
-fn default_raft_listen() -> String {
-    "0.0.0.0:9400".to_string()
-}
 fn default_election_timeout() -> u64 {
     400
 }
@@ -1247,9 +1245,6 @@ pub fn default_max_message_size() -> u32 {
 }
 fn default_api_listen() -> String {
     "0.0.0.0:9402".to_string()
-}
-fn default_cors_origins() -> Vec<String> {
-    vec!["*".to_string()]
 }
 fn default_tls_mode() -> String {
     "auto".to_string()
@@ -1651,6 +1646,16 @@ mod tests {
         assert!(MemoryConfig { hard_cap_mb: 0, ..Default::default() }.validate().is_ok());
         let zero = MemoryConfig { warn_threshold_pct: 0, ..Default::default() };
         assert_eq!(zero.validate().unwrap_err(), "[memory] warn_threshold_pct must be > 0");
+    }
+
+    #[test]
+    fn removed_unread_keys_still_parse() {
+        // raft.listen_addr and api.cors_origins were never read; configs
+        // written before their removal must keep loading.
+        let r: RaftConfig = toml::from_str("listen_addr = \"0.0.0.0:9400\"\nsnapshot_threshold = 7\n").unwrap();
+        assert_eq!(r.snapshot_threshold, 7);
+        let a: ApiConfig = toml::from_str("listen_addr = \"0.0.0.0:1\"\ncors_origins = [\"*\"]\n").unwrap();
+        assert_eq!(a.listen_addr, "0.0.0.0:1");
     }
 
     #[test]
