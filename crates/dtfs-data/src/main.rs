@@ -779,6 +779,14 @@ async fn manager_lifecycle(
                     if !drained_faults.is_empty() {
                         integrity_faults.re_enqueue(drained_faults.clone());
                     }
+                    // Same for the drained scrub summaries and per-chunk
+                    // read counters (as in the Err branch).
+                    if !drained_scrubs.is_empty() {
+                        chunk_store.restore_scrub_results(drained_scrubs);
+                    }
+                    if !per_chunk.is_empty() {
+                        data_metrics.restore_per_chunk(per_chunk);
+                    }
                 }
                 // Bug BF — mgr says we're not Quarantined any more
                 // (operator unquarantine OR clean from the start).
