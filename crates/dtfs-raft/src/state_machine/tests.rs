@@ -435,7 +435,7 @@ mod posix_path_regression {
         let meta = sm.files.get("/det.bin").expect("created");
         assert_eq!(meta.created_at_ms, 7);
         assert_eq!(meta.updated_at_ms, 7);
-        let entry = sm.audit_log.last().expect("audit pushed");
+        let entry = sm.audit_log.back().expect("audit pushed");
         assert_eq!(entry.timestamp_ms, 7);
         assert_eq!(entry.log_index, 7);
     }
@@ -1123,7 +1123,7 @@ mod posix_path_regression {
         assert!(matches!(resp, ClientResponse::Success));
         assert_eq!(sm.audit_log.len(), before + 1);
 
-        let entry = sm.audit_log.last().unwrap();
+        let entry = sm.audit_log.back().unwrap();
         assert_eq!(entry.actor, "scheduler");
         assert_eq!(entry.action, "replication.complete");
         assert_eq!(entry.target, "chunk=abc src=10 dst=11");
@@ -1156,7 +1156,7 @@ mod posix_path_regression {
                 timestamp_ms: 100,
             },
         );
-        let entry = sm.audit_log.last().unwrap();
+        let entry = sm.audit_log.back().unwrap();
         assert_eq!(entry.summary, "manager.start [mgr01]");
         assert!(entry.target.is_empty());
     }
@@ -1220,7 +1220,7 @@ mod posix_path_regression {
         assert_eq!(sm.audit_log.len(), MAX_AUDIT_LOG_ENTRIES);
         // The newest entries should be the fan-out ones (FIFO eviction
         // by `push_audit_capped`).
-        let last = sm.audit_log.last().unwrap();
+        let last = sm.audit_log.back().unwrap();
         assert_eq!(last.action, "flood");
         assert_eq!(last.origin_manager, "mgr03");
     }
@@ -2168,7 +2168,7 @@ mod posix_path_regression {
         assert_eq!(q.fault_count_total, 1, "first fault accumulates to 1");
 
         // Audit row should mention quarantine + reason.
-        let last = sm.audit_log.last().unwrap();
+        let last = sm.audit_log.back().unwrap();
         assert_eq!(last.summary, "node.quarantine: 42 reason=VerifyOnReadMismatch chunk=aabbccdd fault_count=1");
 
         // Bug BH-9 — the row must carry STRUCTURED fields so the
@@ -2244,7 +2244,7 @@ mod posix_path_regression {
         assert!(n.quarantine.is_none(),
             "quarantine record must be cleared");
 
-        let last = sm.audit_log.last().unwrap();
+        let last = sm.audit_log.back().unwrap();
         assert!(last.summary.contains("node.unquarantine: 9"),
             "audit must record the unquarantine event: {}", last.summary);
         assert!(last.summary.contains("by=alice"));
@@ -3399,5 +3399,20 @@ mod raft_audit_fix_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn push_audit_capped_drops_oldest_first() {
+        let mut log = std::collections::VecDeque::new();
+        for n in 0..(MAX_AUDIT_LOG_ENTRIES as u64 + 3) {
+            push_audit_capped(&mut log, AuditEntry {
+                log_index: n, timestamp_ms: 0, summary: String::new(),
+                actor: String::new(), action: String::new(), target: String::new(),
+                result: String::new(), origin_manager: String::new(),
+            });
+        }
+        assert_eq!(log.len(), MAX_AUDIT_LOG_ENTRIES);
+        assert_eq!(log.front().unwrap().log_index, 3);
+        assert_eq!(log.back().unwrap().log_index, MAX_AUDIT_LOG_ENTRIES as u64 + 2);
     }
 }

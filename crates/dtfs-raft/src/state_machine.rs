@@ -184,7 +184,7 @@ pub struct StateMachineData {
     pub files: BTreeMap<String, FileMetadata>,
     pub nodes: BTreeMap<u64, crate::NodeInfo>,
     pub cluster_config: ClusterConfig,
-    pub audit_log: Vec<AuditEntry>,
+    pub audit_log: std::collections::VecDeque<AuditEntry>,
 
     // ---- observability state ----
     /// Per-node scrub results, keyed by `node_id`.
@@ -251,7 +251,7 @@ impl Default for StateMachineData {
             files: BTreeMap::new(),
             nodes: BTreeMap::new(),
             cluster_config: ClusterConfig::default(),
-            audit_log: Vec::new(),
+            audit_log: std::collections::VecDeque::new(),
             scrub_results: BTreeMap::new(),
             scrub_results_by_level: BTreeMap::new(),
             pending_scrub: None,
@@ -531,7 +531,7 @@ impl StateMachineStore {
             sm.files = snap.files;
             sm.nodes = snap.nodes;
             sm.cluster_config = snap.cluster_config;
-            sm.audit_log = snap.audit_log;
+            sm.audit_log = snap.audit_log.into();
             sm.scrub_results = snap.scrub_results;
             sm.scrub_results_by_level = snap.scrub_results_by_level;
             migrate_scrub_results_by_level(&mut sm);
@@ -640,7 +640,7 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
             files: sm.files.clone(),
             nodes: sm.nodes.clone(),
             cluster_config: sm.cluster_config.clone(),
-            audit_log: sm.audit_log.clone(),
+            audit_log: sm.audit_log.iter().cloned().collect(),
             scrub_results: sm.scrub_results.clone(),
             scrub_results_by_level: sm.scrub_results_by_level.clone(),
             client_count: sm.client_count,
@@ -786,7 +786,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             sm.files = snap_data.files;
             sm.nodes = snap_data.nodes;
             sm.cluster_config = snap_data.cluster_config;
-            sm.audit_log = snap_data.audit_log;
+            sm.audit_log = snap_data.audit_log.into();
             sm.scrub_results = snap_data.scrub_results;
             sm.scrub_results_by_level = snap_data.scrub_results_by_level;
             migrate_scrub_results_by_level(&mut sm);
@@ -836,11 +836,10 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 ///
 /// Oldest entries are drained from the front when the cap is exceeded,
 /// preventing unbounded memory growth (fix for issue #5).
-fn push_audit_capped(log: &mut Vec<AuditEntry>, entry: AuditEntry) {
-    log.push(entry);
-    if log.len() > MAX_AUDIT_LOG_ENTRIES {
-        let excess = log.len() - MAX_AUDIT_LOG_ENTRIES;
-        log.drain(..excess);
+fn push_audit_capped(log: &mut std::collections::VecDeque<AuditEntry>, entry: AuditEntry) {
+    log.push_back(entry);
+    while log.len() > MAX_AUDIT_LOG_ENTRIES {
+        log.pop_front();
     }
 }
 
