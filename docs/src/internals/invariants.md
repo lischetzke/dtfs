@@ -173,6 +173,20 @@ current toolchain.
 
 ## A.8 — File map, full narrative
 
+### Raft RPC MAC, volume CAS, per-disk corrupt reports
+
+Raft RPC stamps bind `<from>
+<to>
+<blake3(payload)>` (`network::raft_rpc_binding`,
+sender in `x-dtfs-raft-from`, receiver uses its own id); auth runs after the
+bounded body read, so a captured stamp cannot authorize another body or peer.
+`UpsertVolume.expected_version` (serde default None) is checked against
+`VolumeConfig.version` (serde default 0, bumped by apply, wire value ignored);
+set-* handlers pass the version they read and map a committed Error to 409.
+`ChunkStatus.disk_id` (optional) makes `report_chunk_status` issue one
+disk-keyed `RemoveCorruptChunkReplicas` per disk; absent = node-wide legacy.
+Heartbeat `IntegrityFault` still carries no disk id.
+
 ### `dtfs-raft/src/network.rs::full_snapshot`
 
 Bug CL: network failures here (peer unreachable / timeout / empty
