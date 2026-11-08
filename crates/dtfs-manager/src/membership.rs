@@ -55,6 +55,41 @@ pub fn validate_membership_target(
     }
 }
 
+/// Refuse a voter-set change that would leave the cluster unable to commit.
+///
+/// Openraft commits the joint configuration with a majority of BOTH the old
+/// and the new voter set, so each set must have a majority of members that
+/// are reachable and caught up. `reachable_caught_up` must include the
+/// leader itself (build it from the raft metrics replication map: members
+/// whose matched log index is at or near the leader's last log index).
+/// Pure so the endpoints in `api/raft.rs` only gather the sets.
+pub fn ensure_voter_change_has_quorum(
+    current_voters: &std::collections::BTreeSet<u64>,
+    target_voters: &std::collections::BTreeSet<u64>,
+    reachable_caught_up: &std::collections::BTreeSet<u64>,
+) -> Result<(), String> {
+    if target_voters.is_empty() {
+        return Err("target voter set is empty".to_string());
+    }
+    for (label, set) in [("current", current_voters), ("new", target_voters)] {
+        let have = set.intersection(reachable_caught_up).count();
+        let need = set.len() / 2 + 1;
+        if have < need {
+            tracing::warn!(
+                set = label,
+                reachable_caught_up = have,
+                needed = need,
+                "membership change refused: no majority of reachable, caught-up voters"
+            );
+            return Err(format!(
+                "refusing membership change: only {have} of {} {label} voters are                  reachable and caught up (need {need})",
+                set.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +152,49 @@ mod tests {
             validate_membership_target("dtfs-dc1-mgr01", None, Some(NodeRole::Manager)),
             Ok(expect)
         );
+    }
+
+    fn set(ids: &[u64]) -> std::collections::BTreeSet<u64> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn quorum_ok_when_majority_of_both_sets_reachable() {
+        // 3 voters -> remove 3, leaving {1,2}; all reachable.
+        assert_eq!(
+            ensure_voter_change_has_quorum(&set(&[1, 2, 3]), &set(&[1, 2]), &set(&[1, 2, 3])),
+            Ok(())
+        );
+        // Boundary: exactly a majority (2 of 3) of each set.
+        assert_eq!(
+            ensure_voter_change_has_quorum(&set(&[1, 2, 3]), &set(&[1, 2, 3]), &set(&[1, 2])),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn quorum_refused_when_new_set_lacks_majority() {
+        // Promote learner 4 into {1,2,3,4}: 4 is not caught up, only 1,2,3
+        // reachable -> 3 of 4 is fine, but with only {1,2} it is not.
+        let err = ensure_voter_change_has_quorum(
+            &set(&[1, 2, 3]),
+            &set(&[1, 2, 3, 4]),
+            &set(&[1, 2]),
+        )
+        .unwrap_err();
+        assert!(err.contains("2 of 4 new voters") && err.contains("need 3"), "{err}");
+    }
+
+    #[test]
+    fn quorum_refused_when_old_set_lacks_majority() {
+        // New set {1} is fully reachable but the old set {1,2,3} is not.
+        let err = ensure_voter_change_has_quorum(&set(&[1, 2, 3]), &set(&[1]), &set(&[1]))
+            .unwrap_err();
+        assert!(err.contains("1 of 3 current voters"), "{err}");
+    }
+
+    #[test]
+    fn quorum_refused_for_empty_target() {
+        assert!(ensure_voter_change_has_quorum(&set(&[1]), &set(&[]), &set(&[1])).is_err());
     }
 }
