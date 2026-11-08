@@ -21,7 +21,7 @@ Shape returned by `GET /api/v1/volumes/{id}` ([REST API](../api-reference/rest-a
 | `cache_replicas.promote_reads` | u32 | `2` | `set-cache` |
 | `cache_replicas.promote_window_secs` | u64 | `14400` (4 h) | `set-cache` |
 | `cache_replicas.cooldown_secs` | u64 | `300` | `set-cache` |
-| `anchor.datacenter` | string | `[defaults].anchor_datacenter` or the request's `anchor_datacenter`; none if unset | create, `set-anchor` |
+| `anchor.datacenter` | string | request `anchor_datacenter`; none if omitted (`[defaults].anchor_datacenter` applies only to the auto-created `default` volume) | create, `set-anchor` |
 | `anchor.required_tier` | `hot`/`warm`/`cold`/`tape` or null | null (any tier in the anchor DC) | `set-anchor` |
 | `write_safety.min_replicas_before_ack` | u32 | `[defaults.write_safety]` (2) | `set-write-safety` |
 | `write_safety.write_timeout_secs` | u32 | `[defaults.write_safety]` (30) | `set-write-safety` |

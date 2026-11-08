@@ -1,693 +1,343 @@
 # REST API
 
-The DTFS manager exposes a REST API on the HTTP port (default 9402). This API is consumed by the WebUI dashboard, the `dtfs-cli` tool, and external integrations.
+The manager serves a JSON REST API and the WebUI on `[api].listen_addr` (default `0.0.0.0:9402`). It is used by `dtfs-cli`, the WebUI and external tooling. Source of truth: the router in `crates/dtfs-manager/src/api.rs` and the handlers in `crates/dtfs-manager/src/api/`.
 
-All endpoints return JSON. State-mutating endpoints require [JWT authentication](../security/authentication.md) when auth is enabled.
+Base URL: `http://<manager-host>:9402`. All versioned routes are under `/api/v1`.
 
-## Base URL
+## Conventions
 
-```
-http://<manager-host>:9402/api/v1
-```
+### Authentication
 
-## Endpoints
+| Request | Requirement |
+|---|---|
+| `GET`, `HEAD`, `OPTIONS`, `/healthz`, `/readyz`, `/metrics` | None. Do not expose the API port to untrusted networks. |
+| `POST /api/v1/join/request`, `POST /api/v1/join/complete` | None at the HTTP layer; protected by the HMAC join handshake ([Cluster Join](../security/cluster-join.md)). |
+| Every other `POST` (all mutations) | When `[cluster].shared_secret` is non-empty: header `X-Dtfs-Shared-Secret: <secret>` or `Authorization: Bearer <secret>`. With an empty secret (lab only) no header is needed. |
+
+Failures: `401` `{"error": "shared_secret required (X-Dtfs-Shared-Secret or Authorization: Bearer)"}` when missing, `403` `{"error": "shared_secret mismatch"}` when wrong. Denials are audited as `auth.denied`.
+
+The three Raft membership endpoints additionally require the secret in the request body (`shared_secret`).
+
+### Leader behaviour
+
+Reads are answered from the receiving manager's local state machine; a follower or learner can lag slightly behind the leader. Mutations commit through Raft:
+
+| Column value | Meaning |
+|---|---|
+| `leader (409)` | Checked up front. A non-leader answers `409` with `{"error": "not the leader ...", "leader": {"leader_id", "leader_hostname", "leader_addr"}}`. Resend to `leader_addr`'s API. |
+| `leader (503)` | Not pre-checked. On a non-leader the Raft write fails and the call answers `503` `{"error": "raft write failed: ..."}`. Send to the leader (`GET /api/v1/raft/state`, field `current_leader`). |
+| `any` | Served by whichever manager receives it. |
+
+### Errors
+
+Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserved_current`, `leader`). Codes used: `400` invalid input, `401`/`403` authentication, `404` unknown node/volume/file/chunk, `409` conflict or not leader, `503` Raft write failed (no quorum, or not the leader). Specific `409` cases:
+
+- Volume create when the id already exists.
+- Volume update (`set-*`) racing a concurrent update of the same volume: re-read the volume and retry the change.
+- `POST /config` version conflict: re-read and retry.
+- Node decommission while the node still holds replicas; unquarantine of a node that is not quarantined; promote of a node that is already a voter; maintenance toggle refused by the state machine.
+- Any leader-only call sent to a non-leader.
+
+### Common parameters
+
+- Node ids are decimal `u64` strings (`node_id = hash(hostname)`).
+- A `path_prefix` of `""` or `"/"` is treated as empty (matches every file) and requires `allow_empty_prefix: true`.
+- Tier names are lowercase `hot`, `warm`, `cold`, `tape`.
+
+## Endpoint index
+
+| Method | Path | Auth | Leader | Purpose |
+|---|---|---|---|---|
+| GET | `/healthz` | no | any | Liveness (`ok`) |
+| GET | `/readyz` | no | any | Readiness (200 or 503) |
+| GET | `/metrics` | no | any | Prometheus text |
+| GET | `/api/v1/health` | no | any | Simple health JSON |
+| GET | `/api/v1/cluster/status` | no | any | Cluster summary |
+| GET | `/api/v1/stats` | no | any | Aggregate metrics |
+| GET | `/api/v1/memory` | no | any | Manager memory ladder |
+| GET | `/api/v1/raft/state` | no | any | Raft view of this manager |
+| POST | `/api/v1/raft/add-learner` | yes + body secret | leader (409) | Add learner |
+| POST | `/api/v1/raft/promote` | yes + body secret | leader (409) | Learner to voter |
+| POST | `/api/v1/raft/remove` | yes + body secret | leader (409) | Remove member |
+| GET | `/api/v1/nodes` | no | any | List nodes |
+| GET | `/api/v1/nodes/{node_id}` | no | any | Node detail |
+| POST | `/api/v1/nodes/{node_id}/maintenance` | yes | leader (503) | Maintenance on/off |
+| POST | `/api/v1/nodes/{node_id}/unquarantine` | yes | leader (503) | Clear quarantine |
+| POST | `/api/v1/nodes/{node_id}/decommission` | yes | leader (503) | Deregister node |
+| GET | `/api/v1/files` | no | any | List files |
+| GET | `/api/v1/files/inspect` | no | any | Chunk layout of one file |
+| POST | `/api/v1/files/flush_cache` | yes | leader (409) | Drop cache replicas |
+| GET | `/api/v1/volumes` | no | any | List volumes |
+| POST | `/api/v1/volumes` | yes | leader (503) | Create volume |
+| GET | `/api/v1/volumes/{id}` | no | any | Volume detail |
+| POST | `/api/v1/volumes/{id}/migrate-policy` | yes | leader (503) | Copy legacy replication |
+| POST | `/api/v1/volumes/{id}/set-cache` | yes | leader (503) | Edit cache policy |
+| POST | `/api/v1/volumes/{id}/set-mandatory` | yes | leader (503) | Edit mandatory replicas |
+| POST | `/api/v1/volumes/{id}/set-write-safety` | yes | leader (503) | Edit write safety |
+| POST | `/api/v1/volumes/{id}/set-anchor` | yes | leader (503) | Edit anchor |
+| POST | `/api/v1/volumes/{id}/set-spill` | yes | leader (503) | Edit spill policy |
+| GET | `/api/v1/chunks` | no | any | Chunk placement listing |
+| GET | `/api/v1/chunks/{chunk_id}` | no | any | One chunk |
+| GET | `/api/v1/migrations` | no | leader | Migration tasks |
+| POST | `/api/v1/migrations` | yes | leader (409) | Start path migration |
+| POST | `/api/v1/scrub` | yes | leader (503) | Trigger cluster scrub |
+| GET | `/api/v1/audit` | no | any | Audit log |
+| GET | `/api/v1/integrity/faults` | no | any | Integrity-fault feed |
+| GET | `/api/v1/config` | no | any | Stored override |
+| POST | `/api/v1/config` | yes | leader (503) | Store override |
+| GET | `/api/v1/config/effective` | no | any | Flattened effective config |
+| POST | `/api/v1/join/request` | HMAC | any | Join step 1 |
+| POST | `/api/v1/join/complete` | HMAC | any | Join step 2 |
+
+`GET /api/v1/migrations` reads the scheduler's in-memory task table, which only the leader populates.
+
+## Probes and metrics
+
+- `GET /healthz`: `200 ok` while the process answers.
+- `GET /readyz`: `200 ready` when the state machine has applied at least one entry and one registered node is effectively healthy, else `503 not ready: fsm_initialised=<bool> any_healthy=<bool>`.
+- `GET /metrics`: Prometheus text format. Series: `dtfs_nodes_healthy`, `dtfs_nodes_suspect`, `dtfs_nodes_down`, `dtfs_nodes_quarantined`, `dtfs_cluster_capacity_bytes`, `dtfs_cluster_used_bytes`, `dtfs_files_total`, `dtfs_chunks_total`, `dtfs_volumes_total`, `dtfs_write_leases_active`, `dtfs_audit_log_in_memory`, `dtfs_tier_migrations_completed_total`, `dtfs_migration_failed_total`, `dtfs_anchor_protected_total`. See [Monitoring](../operations/monitoring.md).
+- `GET /api/v1/health`: `200 {"status": "healthy"}` whenever the manager runs.
+
+## Cluster
 
 ### GET /api/v1/cluster/status
-
-Returns overall cluster status including node counts, capacity, and configuration version.
-
-**Response:**
 
 ```json
 {
   "status": "ok",
   "cluster_name": "production",
-  "node": "manager-01",
+  "node": "mgr-01",
   "data_nodes": 6,
   "data_nodes_healthy": 6,
   "files": 1423,
+  "files_missing_chunks": 0,
+  "anchor_pending": 0,
   "total_capacity": 12884901888000,
   "used_capacity": 4294967296000,
   "config_version": 3
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `status` | String | `"ok"` when the cluster is operating normally |
-| `cluster_name` | String | Name from the manager configuration |
-| `node` | String | Hostname of the responding manager |
-| `data_nodes` | Integer | Total registered data nodes |
-| `data_nodes_healthy` | Integer | Data nodes with `Healthy` status |
-| `files` | Integer | Total files tracked in metadata |
-| `total_capacity` | Integer | Aggregate capacity in bytes across all nodes |
-| `used_capacity` | Integer | Aggregate used space in bytes |
-| `config_version` | Integer | Current cluster configuration version |
+`status` is `degraded` when any file has lost all chunk bindings (`files_missing_chunks > 0`) or fewer data nodes are effectively healthy than registered, else `ok`. Health is liveness-projected from `raft.node_liveness_secs`. `anchor_pending` counts files whose anchor copy has not landed yet (asynchronous convergence, does not degrade `status`).
 
----
+### GET /api/v1/stats
 
-### GET /api/v1/health
+Aggregate metrics for dashboards. Main fields: `health` (`healthy`, `degraded`, `critical`, `unknown`; `critical` also when any node is quarantined), `healthy_nodes`, `quarantined_nodes`, `total_nodes`, `anchor_pending`, `chunk_placement` (counts per state: missing, undergoal, misplaced, stable, overgoal, pending_deletion), `infra_healthy`, `infra_total`, `manager_count`, `data_node_count`, `disk_count`, `client_count`, `file_count`, `raw_total_bytes`, `raw_used_bytes`, `net_usable_bytes`, `net_used_bytes`, `logical_bytes`, `phantom_bytes_estimate`, `tier_breakdown` (array of `{tier, disks, total_bytes, used_bytes}`), `io_read_bytes_per_sec`, `io_write_bytes_per_sec` (0 on the first call after manager start), `last_scrub`, `scrub_results_by_node`, `config_version`.
 
-Simple health check endpoint. Returns HTTP 200 if the manager is running.
+### GET /api/v1/memory
 
-**Response:**
+`{"configured": false}` when no budget is wired; otherwise `configured` (false when `hard_cap_mb = 0`), `hard_cap_bytes`, `last_rss_bytes`, `pressure_level` (`Normal`, `Warn`, `Shed`), `is_shedding`, `warn_threshold_bytes`, `shed_threshold_bytes`, `sample_interval_secs`.
 
-```json
-{
-  "status": "healthy"
-}
-```
+### GET /api/v1/raft/state
 
-Useful for load balancer health probes and monitoring systems.
+This manager's view of Raft. Fields: `node_id`, `hostname`, `running_state` (`ok` or `fatal: ...`), `state` (`Leader`, `Follower`, `Candidate`, `Learner`), `is_leader`, `current_term`, `current_leader` (null = no quorum), `vote_term`, `vote_committed`, `last_log_index`, `last_applied_index`, `applied_log_lag`, `snapshot_index`, `voters`, `learners`, `membership` (array of `{node_id, hostname, addr, is_voter}`), `millis_since_quorum_ack` (leader only, else null), `replication` (leader only: array of `{node_id, matched_index, lag}`, else null).
 
----
+### Raft membership
+
+All three are leader-only (`409` with leader hint otherwise) and need the secret both as header and as `shared_secret` in the body (`403 {"error": "shared_secret mismatch"}`). See [Cluster Management](../operations/cluster-management.md).
+
+| Endpoint | Body | Success response | Errors |
+|---|---|---|---|
+| `POST /api/v1/raft/add-learner` | `{"hostname", "addr", "shared_secret"}` | `{"status":"ok","node_id","hostname","addr","log_index"}` | `400` missing/wildcard `addr` or a hostname that collides with a registered data or client node; `503` Raft change failed |
+| `POST /api/v1/raft/promote` | `{"hostname", "shared_secret"}` | `{"status":"ok","node_id","hostname","log_index"}` | `404` not a member (add-learner first); `409` already a voter; `503` |
+| `POST /api/v1/raft/remove` | `{"hostname", "shared_secret"}` | `{"status":"ok","node_id","hostname","was_voter","log_index"}` | `404` not a member; `400` last voter; `503` |
+
+## Nodes
 
 ### GET /api/v1/nodes
 
-Lists all registered data nodes with summary information.
+Array. Entry: `node_id`, `hostname`, `grpc_addr`, `location` (`region/datacenter/rack/host`), `disk_count`, `total_capacity`, `used_capacity`, `total_bytes_read`, `total_bytes_written`, `health` (liveness-projected), `role` (`Manager`, `Data`, `Client`), `last_seen_ms`, `is_leader`, `disks` (array of `{disk_id, uuid, mount_path, tier, total_bytes, used_bytes, status}`), and when present `client_ip`, `version`, `build_date`, `quarantine` (`since_ms`, `reason`, `triggering_chunk_id`, `fault_count_total`, `last_fault_at_ms`, `last_fault_summary`), `raft_member` (managers). Configured but unregistered voters and clients known only through write leases are synthesised into the list.
 
-**Response:**
+### GET /api/v1/nodes/{node_id}
 
-```json
-[
-  {
-    "node_id": "1",
-    "hostname": "data-01.example.com",
-    "grpc_addr": "data-01.example.com:9500",
-    "location": "us-east/dc1/rack-a/data-01",
-    "disk_count": 4,
-    "total_capacity": 4294967296000,
-    "used_capacity": 1073741824000,
-    "health": "Healthy",
-    "role": "Data"
-  }
-]
-```
+`node_id`, `hostname`, `grpc_addr`, `location` (object with `region`, `datacenter`, `rack`, `host`), `disks`, `total_capacity`, `used_capacity`, `health`, `role`. `400` if the id is not a `u64`, `404` if unknown.
 
----
+### POST /api/v1/nodes/{node_id}/maintenance
 
-### GET /api/v1/nodes/{id}
+Body `{"enable": true}`. Response `{"node_id", "maintenance": <bool>}`. `404` unknown node; `409` refused by the state machine. See [Maintenance Mode](../operations/maintenance-mode.md).
 
-Returns detailed information for a specific node, including its full disk inventory.
+### POST /api/v1/nodes/{node_id}/unquarantine
 
-**Path parameters:**
+Body `{"operator_id": "<label>", "reason_acknowledged": "<at least 16 characters>"}`. Response `{"node_id", "ok": true}`. `400` empty operator or short reason; `404` unknown node; `409` node is not quarantined.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `id` | String | Node ID |
+### POST /api/v1/nodes/{node_id}/decommission
 
-**Response:**
+Body `{"operator_id": "<label>", "reason": "<text, optional>"}`. Response `{"node_id", "ok": true}`. `409` while any file still has a replica on the node (drain or re-replicate first); `404` unknown node.
 
-```json
-{
-  "node_id": "1",
-  "hostname": "data-01.example.com",
-  "grpc_addr": "data-01.example.com:9500",
-  "location": {
-    "region": "us-east",
-    "datacenter": "dc1",
-    "rack": "rack-a",
-    "host": "data-01"
-  },
-  "disks": [
-    {
-      "disk_id": 0,
-      "uuid": "a1b2c3d4-...",
-      "mount_path": "/mnt/dtfs-disk-a1b2c3d4",
-      "tier": "Hot",
-      "total_bytes": 1073741824000,
-      "used_bytes": 268435456000,
-      "status": "Healthy"
-    }
-  ],
-  "total_capacity": 4294967296000,
-  "used_capacity": 1073741824000,
-  "health": "Healthy",
-  "role": "Data"
-}
-```
-
-**Error responses:**
-
-| Status | Condition |
-|--------|-----------|
-| 400 | Invalid node ID format |
-| 404 | Node not found |
-
----
-
-### POST /api/v1/nodes/{id}/maintenance
-
-Enable or disable maintenance mode on a node. See [Maintenance Mode](../operations/maintenance-mode.md) for the full draining process.
-
-**Path parameters:**
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `id` | String | Node ID |
-
-**Request body:**
-
-```json
-{
-  "enable": true
-}
-```
-
-**Response:**
-
-```json
-{
-  "node_id": "1",
-  "maintenance": true
-}
-```
-
-**Error responses:**
-
-| Status | Condition |
-|--------|-----------|
-| 400 | Invalid node ID format |
-| 503 | Raft leader unavailable |
-
----
+## Files
 
 ### GET /api/v1/files
 
-Lists files tracked in the cluster metadata, ordered by path. Query: `limit` (default 1000, clamped to 1..100000), `offset` (default 0), `prefix` (path prefix filter). `truncated` is true when more matching files exist past this page.
-
-**Response:**
+Query: `limit` (default 1000, clamped to 1..100000), `offset` (default 0), `prefix` (path prefix). Ordered by path.
 
 ```json
 {
   "count": 1423,
-  "total": 1423,
-  "returned": 1,
+  "total": 12,
+  "returned": 10,
   "truncated": true,
   "files": [
-    {
-      "path": "/data/reports/2024-q1.parquet",
-      "volume_id": "default",
-      "chunk_count": 3,
-      "total_size": 402653184,
-      "created_at": 1710842400000,
-      "updated_at": 1710928800000
-    }
+    { "path": "/movies/a.mkv", "volume_id": "default", "chunk_count": 3,
+      "total_size": 402653184, "created_at": 1710842400000, "updated_at": 1710928800000 }
   ]
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `count` | Integer | Total file count in the cluster (may exceed the returned list length) |
-| `total` | Integer | Files matching `prefix` |
-| `returned` | Integer | Entries in this page |
-| `truncated` | Boolean | More matching files exist past this page |
-| `files` | Array | The page of file entries |
+`count` is all files in the cluster, `total` is the number matching `prefix`, `returned` the page size, `truncated` is true when more matches exist beyond `offset + returned`. Page by increasing `offset` until `truncated` is false.
 
----
+### GET /api/v1/files/inspect
 
-### GET /api/v1/volumes
-
-Lists volumes aggregated from file metadata. Bug AV (AV-4-2):
-each row now embeds the full per-volume policy projection
-(`mandatory_replicas`, `cache_replicas`, `anchor`, legacy
-`replication`, `write_safety`, `chunk_size_bytes`, `name`)
-alongside the aggregation fields (`file_count`, `total_size`).
-Volumes that have no `VolumeConfig` (usage-only rows) render
-with just `volume_id` + the aggregation fields.
-
-**Response:**
-
-```json
-{
-  "count": 1,
-  "volumes": [
-    {
-      "volume_id": "default",
-      "name": "default",
-      "chunk_size_bytes": 4194304,
-      "replication": { "hot": 0, "warm": 2, "cold": 1, "tape": 1 },
-      "mandatory_replicas": { "hot": 0, "warm": 0, "cold": 1, "tape": 0 },
-      "cache_replicas": {
-        "hot":  { "min": 0, "max": 0 },
-        "warm": { "min": 1, "max": 1 },
-        "cold": { "min": 0, "max": 0 },
-        "tape": { "min": 0, "max": 0 },
-        "per_dc": true,
-        "promote_reads": 2,
-        "promote_window_secs": 60,
-        "cooldown_secs": 30
-      },
-      "anchor": { "datacenter": "dc-a", "required_tier": null },
-      "write_safety": { "min_replicas_before_ack": 2, "write_timeout_secs": 30 },
-      "file_count": 1200,
-      "total_size": 549755813888
-    }
-  ]
-}
-```
-
----
-
-### POST /api/v1/volumes/{id}/migrate-policy
-
-Bug AV — idempotently copy a volume's legacy `replication` block
-into the new `mandatory_replicas` field, leaving the legacy field
-intact for rollback safety. No-op if the migration has already
-been applied.
-
-**Path parameters:**
-
-| Name | Description |
-|------|-------------|
-| `id` | Volume ID. |
-
-**Response (changed):**
-
-```json
-{
-  "volume_id": "default",
-  "changed": true,
-  "mandatory_replicas": { "hot": 0, "warm": 2, "cold": 1, "tape": 1 }
-}
-```
-
-**Response (no-op):**
-
-```json
-{
-  "volume_id": "default",
-  "changed": false,
-  "mandatory_replicas": { "hot": 0, "warm": 2, "cold": 1, "tape": 1 }
-}
-```
-
-**Errors:**
-
-| Status | Reason |
-|--------|--------|
-| `404 Not Found` | Volume does not exist. |
-| `503 Service Unavailable` | Raft write failed (cluster lost quorum or follower without forwarding). |
-
-**Example:**
-
-```bash
-$ curl -X POST http://mgr-01:9402/api/v1/volumes/default/migrate-policy
-{"changed":true,"mandatory_replicas":{...},"volume_id":"default"}
-```
-
-CLI equivalent: `dtfs-cli volumes migrate-policy default` (see
-[CLI reference](./cli-reference.md#volumes-migrate-policy)).
-
----
+Query `path` (required). Response: `path`, `volume_id`, `total_size`, `chunk_size`, `chunk_count`, `chunks` (array of `{chunk_index, chunk_id, size, node_ids, replicas: [{node_id, disk_id, tier}]}`). `404 {"error": "file not found: ..."}`.
 
 ### POST /api/v1/files/flush_cache
 
-Bug AV — operator-driven button to drop **cache** replicas of every
-chunk under a path prefix on the listed tiers, refusing any drop
-that would strand the mandatory replica or anchor. Sets a
-per-chunk cooldown so the tiering engine doesn't immediately
-re-promote.
+Drops cache replicas under a path prefix; mandatory and anchor replicas are never dropped. Leader-only (`409`).
 
-**Request body:**
+| Body field | Type | Default | Meaning |
+|---|---|---|---|
+| `path_prefix` | string | required | `""`/`"/"` needs `allow_empty_prefix` |
+| `cache_tiers` | list of tier | `["warm","hot"]` | Tiers eligible to flush |
+| `cooldown_secs` | u64 | `300` | No re-promotion for this long |
+| `max_tasks` | usize | `10000` | Cap on replica deletions per call |
+| `allow_empty_prefix` | bool | `false` | Safety gate |
 
-```json
-{
-  "path_prefix": "/movies/Wicked.mkv",
-  "cache_tiers": ["warm"],
-  "cooldown_secs": 300,
-  "max_tasks": 10000,
-  "allow_empty_prefix": false
-}
-```
+Response: `status` (`accepted`), `path_prefix`, `cache_tiers`, `cooldown_secs`, `files_matched`, `chunks_examined`, `replicas_dropped`, `mandatory_refusals`, `truncated`, `unreachable_nodes`, `rpc_failures`, `raft_failures`. A `200` can still report partial failure: check `rpc_failures`, `raft_failures`, `mandatory_refusals` and `truncated` and re-run if non-zero. `400` for an invalid tier or a gated empty prefix.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `path_prefix` | string | *(required)* | Prefix to match. `/` matches every file in the cluster but is rejected unless `allow_empty_prefix=true`. |
-| `cache_tiers` | array of `"hot"`/`"warm"`/`"cold"`/`"tape"` | `["warm","hot"]` | Tiers eligible to be flushed. The planner additionally filters out any tier that's also `mandatory_replicas.<tier> > 0` for the file's volume — so e.g. flushing warm on a volume with `mandatory_replicas.warm = 1` is a safe no-op. |
-| `cooldown_secs` | integer | `300` | How long after the flush the tiering engine refuses to re-promote affected chunks. Set to `0` to disable the cooldown. |
-| `max_tasks` | integer | `10000` | Maximum replica deletions to enqueue in a single call. Operators re-run the call to pick up remaining work; the `truncated` counter in the response reports the unseen tail. |
-| `allow_empty_prefix` | bool | `false` | Safety gate against an empty/`"/"` prefix accidentally flushing the entire cluster. |
+## Volumes
 
-**Response:**
+Volume ids are lowercase names with spaces replaced by `-`. The field reference is in [Volume Configuration](../configuration/volume-config.md).
+
+### GET /api/v1/volumes
+
+`{"count": N, "volumes": [ ... ]}`. Each element is the volume projection below plus `file_count` and `total_size`. A volume referenced by files but without a stored config is listed with only `volume_id`, `file_count`, `total_size`.
+
+### GET /api/v1/volumes/{id}
 
 ```json
 {
-  "status": "accepted",
-  "path_prefix": "/movies/Wicked.mkv",
-  "cache_tiers": ["warm"],
-  "cooldown_secs": 300,
-  "files_matched": 1,
-  "chunks_examined": 128,
-  "replicas_dropped": 254,
-  "mandatory_refusals": 0,
-  "truncated": 0,
-  "unreachable_nodes": 0,
-  "rpc_failures": 0,
-  "raft_failures": 0
-}
-```
-
-| Field | Meaning |
-|-------|---------|
-| `files_matched` | Files whose path begins with `path_prefix`. |
-| `chunks_examined` | Distinct `chunk_index`es considered across all matched files. |
-| `replicas_dropped` | Successful per-replica deletes (counts replicas, not chunks). |
-| `mandatory_refusals` | Chunks where the planner refused to flush because doing so would have stranded the mandatory/anchor copy. Operator should investigate (each refusal emits a `cache.flush_refused` audit row + fires one deduped `AnchorViolated` alert per call). |
-| `truncated` | Replicas the planner skipped because `max_tasks` was hit. |
-| `unreachable_nodes` | Per-action failures: the node hosting the replica was unreachable at delete time. |
-| `rpc_failures` | Per-action failures: the data node's `DeleteChunkReplica` RPC errored. |
-| `raft_failures` | Per-action failures: the manager's `RemoveChunkLocation` Raft write errored. |
-
-**Audit and alerting:**
-
-* `cache.flush_replica` audit row per successful per-replica delete.
-* `cache.flush_refused` audit row per refused chunk (reason
-  `mandatory_strand`).
-* `cache.flush_complete` audit row at the end of the call (always
-  fires, even on early-return paths).
-* `AlertKind::AnchorViolated` fires once per call (deduped) when
-  any refusals occurred, with `subsystem: "cache_flush"` and a
-  sampled first-20 refusals in the details JSON.
-
-**Errors:**
-
-| Status | Reason |
-|--------|--------|
-| `400 Bad Request` | Empty `path_prefix` without `allow_empty_prefix=true`; invalid `cache_tiers` entry. |
-| `503 Service Unavailable` | Raft writes during the dispatch failed; partial progress is committed and reflected in counters. |
-
-**Example:**
-
-```bash
-$ curl -X POST http://mgr-01:9402/api/v1/files/flush_cache \
-       -H 'content-type: application/json' \
-       -d '{"path_prefix":"/movies/Wicked.mkv","cache_tiers":["warm"],"cooldown_secs":300}'
-{"status":"accepted","replicas_dropped":254,"mandatory_refusals":0,...}
-```
-
-CLI equivalent: planned `dtfs-cli files flush-cache` under AV-3-5
-(see [CLI reference](./cli-reference.md#files-flush-cache-planned)).
-
----
-
-### GET /api/v1/audit
-
-Query the audit log. See [Audit Log](../security/audit-log.md) for details on entry format and retention.
-
-**Query parameters:**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `limit` | Integer | 50 | Maximum entries to return |
-| `action` | String | (none) | Filter by action prefix |
-
-**Example request:**
-
-```
-GET /api/v1/audit?limit=10&action=node.join
-```
-
-**Response:**
-
-```json
-[
-  {
-    "timestamp": 1710842400,
-    "actor": "data-node-03.example.com",
-    "action": "node.join.request",
-    "target": "data-node-03.example.com",
-    "result": "accepted"
+  "volume_id": "default",
+  "name": "default",
+  "chunk_size_bytes": 4194304,
+  "replication": { "hot": 3, "warm": 2, "cold": 1, "tape": 1 },
+  "mandatory_replicas": { "hot": 0, "warm": 0, "cold": 1, "tape": 0 },
+  "cache_replicas": {
+    "hot":  { "min": 0, "max": 0 }, "warm": { "min": 1, "max": 1 },
+    "cold": { "min": 0, "max": 0 }, "tape": { "min": 0, "max": 0 },
+    "per_dc": true, "promote_reads": 2, "promote_window_secs": 14400, "cooldown_secs": 300
   },
-  {
-    "timestamp": 1710842401,
-    "actor": "data-node-03.example.com",
-    "action": "node.join.complete",
-    "target": "3",
-    "result": "success"
-  }
-]
-```
-
----
-
-### GET /api/v1/config
-
-Returns the current cluster configuration, including defaults, replication settings, and tiering parameters.
-
-**Response:**
-
-```json
-{
-  "version": 3,
-  "config": { },
-  "defaults": {
-    "chunk_size_mb": 128,
-    "write_safety": {
-      "min_replicas_before_ack": 2,
-      "write_timeout_secs": 30
-    },
-    "replication": {
-      "hot": 3,
-      "warm": 2,
-      "cold": 1
-    }
-  },
-  "tiering": {
-    "enabled": true,
-    "hot_threshold_reads_per_hour": 5,
-    "cold_threshold_days": 14,
-    "migration_bandwidth_limit_mbps": 200
-  }
+  "anchor": { "datacenter": "leli", "required_tier": "cold" },
+  "write_safety": { "min_replicas_before_ack": 2, "write_timeout_secs": 30 },
+  "spill": { "allow": null, "forbidden_tiers": [], "forbidden_datacenters": [] }
 }
 ```
 
----
+`mandatory_replicas` shows the effective floor (the legacy `replication` while the stored field is all zero). `anchor` is null when unset. `404` for an unknown id.
 
-### POST /api/v1/config
+### POST /api/v1/volumes
 
-Update the cluster-wide configuration. The new configuration is written to the Raft state machine and propagated to data nodes via heartbeat responses.
+| Body field | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | required | Becomes the id (lowercased, spaces to `-`) |
+| `chunk_size_mb` | u32 | `[defaults].chunk_size_mb` | Honoured per volume |
+| `replication_hot`, `replication_warm`, `replication_cold` | u32 | `[defaults.replication]` | Legacy per-tier counts |
+| `anchor_datacenter` | string | none (`[defaults].anchor_datacenter` is not applied here) | Anchor datacenter |
+| `force` | bool | `false` | Allow an anchor datacenter that no registered node reports |
 
-**Request body:**
+Response `{"volume_id", "name", "status": "created"}`. `409` if the id exists. `400` if `anchor_datacenter` is unknown to the cluster (case-insensitive) and `force` is not `true`. Unknown body fields are ignored. Write safety comes from `[defaults.write_safety]`; mandatory and cache policy start empty (set them with the endpoints below).
 
-```json
-{
-  "config_json": "{\"replication\":{\"hot\":3,\"warm\":2,\"cold\":2}}"
-}
-```
+### Volume edit endpoints
 
-**Response:**
+All take a JSON body in which omitted fields keep their value, and answer `{"volume_id", "changed": <bool>, "config": <volume projection>}` (`changed:false` is a no-op). Common errors: `404` unknown volume, `400` validation message, `409` when a concurrent update of the same volume wins (re-read with `GET /api/v1/volumes/{id}`, reapply, retry), `503` Raft failure.
 
-```json
-{
-  "version": 4,
-  "status": "applied"
-}
-```
+| Endpoint | Body fields | `400` cases |
+|---|---|---|
+| `set-cache` | `warm_min`, `warm_max`, `hot_min`, `hot_max`, `cold_min`, `cold_max`, `tape_min`, `tape_max` (u32); `per_dc` (bool); `promote_reads` (u32); `promote_window_secs`, `cooldown_secs` (u64) | `max < min` for any tier |
+| `set-mandatory` | `hot_replicas`, `warm_replicas`, `cold_replicas`, `tape_replicas` (u32); unknown fields rejected | result all zero; zero on the anchor's `required_tier`; non-zero `tape` without a tape disk |
+| `set-write-safety` | `min_replicas_before_ack`, `write_timeout_secs` (u32) | value below 1 |
+| `set-anchor` | `datacenter` (string; `""` clears the anchor), `required_tier` (`hot`/`warm`/`cold`/`tape`/`""`), `force` (bool) | unknown tier; `mandatory_replicas.<tier> = 0`; datacenter unknown to the cluster without `force: true` |
+| `set-spill` | `allow` (bool), `forbidden_tiers` (list), `forbidden_datacenters` (list) | unknown tier name |
 
-**Error responses:**
+`POST /api/v1/volumes/{id}/migrate-policy` (no body) copies the legacy `replication` into `mandatory_replicas` once. Response `{"volume_id", "changed", "mandatory_replicas"}`; idempotent.
 
-| Status | Condition |
-|--------|-----------|
-| 503 | Raft leader unavailable |
-
----
-
-### POST /api/v1/scrub
-
-Trigger an immediate cluster-wide scrub (CF-8). The request is
-raft-replicated and relayed to every data node on its next heartbeat;
-each node runs the scrub once (dedupe by `id`) and ships the result
-back, visible in `GET /api/v1/stats` (`scrub_results_by_node`,
-`last_scrub`). Send to the leader (a follower answers `503` with a
-forward hint). See [Scrubbing](../storage/scrubbing.md) for scrub
-levels and scheduling.
-
-**Request body:**
-
-```json
-{
-  "level": "quick"
-}
-```
-
-| Field | Type | Values | Description |
-|-------|------|--------|-------------|
-| `level` | String | `"quick"`, `"deep"` | Scrub depth. Default `"deep"`. |
-| `target_type` / `target` | String | only `"all"` / `"*"` | Per-target scrub is **not implemented**; any other value is rejected with `400` (pre-CF-8 the API accepted and silently ignored targets). |
-
-**Response:**
-
-```json
-{
-  "status": "accepted",
-  "target_type": "all",
-  "target": "*",
-  "level": "quick",
-  "id": "0d9c2f6a-..."
-}
-```
-
-`id` is the trigger's unique identifier; the audit row
-(`scrub.trigger.quick`) carries it.
-
-### GET /api/v1/raft/state
-
-Returns the queried manager's view of the Raft consensus state: who the
-leader is, whether this node is caught up, and the full membership
-(voters and learners). Read-only; safe to call on any manager. Used by
-operators and the `dtfs-cli raft members` command. See
-[Cluster Management](../operations/cluster-management.md) for the
-membership-change procedures these fields support.
-
-**Response (healthy follower):**
-
-```json
-{
-  "node_id": "12709699821947187762",
-  "hostname": "mgr01",
-  "running_state": "ok",
-  "state": "Follower",
-  "is_leader": false,
-  "current_term": 18,
-  "current_leader": "15786580940693171021",
-  "last_log_index": 4521,
-  "last_applied_index": 4521,
-  "applied_log_lag": 0,
-  "snapshot_index": 4000,
-  "voters": ["12709...", "15786...", "5766..."],
-  "learners": ["8841..."],
-  "membership": [
-    { "node_id": "12709...", "hostname": "mgr01", "addr": "10.0.0.1:9401", "is_voter": true },
-    { "node_id": "8841...",  "hostname": "mgr04", "addr": "10.1.0.1:9401", "is_voter": false }
-  ],
-  "millis_since_quorum_ack": null
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `node_id` / `hostname` | String | The responding manager's identity (`node_id = hash(hostname)`) |
-| `state` | String | `Leader`, `Follower`, `Candidate`, or `Learner` |
-| `is_leader` | Bool | True when this node is the current leader |
-| `current_leader` | String / null | Leader node id; `null` means quorum is currently lost |
-| `current_term` | Integer | Current Raft term |
-| `last_log_index` / `last_applied_index` | Integer | Log head vs applied position |
-| `applied_log_lag` | Integer | `last_log_index - last_applied_index`; `> 0` on a follower means it is behind |
-| `snapshot_index` | Integer | Log index of the latest on-disk snapshot |
-| `voters` | Array | Node ids in the voter set (count toward quorum) |
-| `learners` | Array | Node ids that replicate state but do not vote |
-| `membership` | Array | One entry per member: `node_id`, `hostname`, `addr`, `is_voter` (the openraft `membership_config` projected to JSON) |
-| `millis_since_quorum_ack` | Integer / null | Milliseconds since the leader last confirmed quorum (leader only) |
-| `replication` | Array / null | Leader only (`null` elsewhere): one `{node_id, matched_index, lag}` per peer; `matched_index` is `null` until the peer acks anything, `lag = last_log_index - matched_index` |
+## Chunks
 
 ### GET /api/v1/chunks
 
-Read-only chunk placement listing (diagnostics). Query: `state=missing|undergoal|misplaced|overgoal|pending_deletion`
-(omit for all chunks; anything else is `400`) and `limit` (default 200, clamped to 1..5000).
-`pending_deletion` selects chunks that carry a dangling replica row.
+Query: `state` = `missing`, `undergoal`, `misplaced`, `overgoal`, `pending_deletion` (omit for all; other values `400`), `limit` (default 200, clamped to 1..5000).
 
 ```json
 { "total": 2, "limit": 200, "truncated": false,
   "chunks": [ { "chunk_id": "ab12...", "path": "/media/a.mkv", "volume_id": "default",
                 "chunk_index": 0, "state": "undergoal",
-                "replicas": [ { "node_id": "1", "disk_id": 0, "tier": "warm",
-                                "datacenter": "toro", "node_health": "healthy",
-                                "disk_status": "healthy" } ] } ] }
+                "replicas": [ { "node_id": "1", "disk_id": 0, "tier": "warm", "datacenter": "toro",
+                                "node_health": "healthy", "disk_status": "healthy" } ] } ] }
 ```
 
-`total` counts all matches before truncation. Replica fields are `null` when the node or disk is no longer registered.
+`total` counts all matches before truncation. Replica fields are null when the node or disk is no longer registered. `node_health` and `disk_status` are lowercase strings.
 
 ### GET /api/v1/chunks/{chunk_id}
 
-Looks up one chunk id (hex, case-insensitive; `400` otherwise, `404` if no file references it). Returns
-`{chunk_id, state, pending_deletion, files:[{path, chunk_index}], replicas:[...same shape as above]}`.
+Hex id, case-insensitive (`400` otherwise, `404` when no file references it). Response `{chunk_id, state, pending_deletion, files: [{path, chunk_index}], replicas: [...]}`.
 
-### GET /api/v1/memory
+## Migrations
 
-Manager-local memory budget: `{configured, hard_cap_bytes, last_rss_bytes, pressure_level ("Normal"|"Warn"|"Shed"),
-is_shedding, warn_threshold_bytes, shed_threshold_bytes, sample_interval_secs}`, or `{"configured": false}` when
-no budget is wired. `configured` is `false` as well when `hard_cap_mb = 0` (the other fields are still present).
+### POST /api/v1/migrations
 
-### POST /api/v1/raft/add-learner
+Enqueue tier or datacenter moves for every chunk under a path prefix. Leader-only (`409`).
 
-Add a manager to the Raft group as a non-voting **learner**: the leader
-begins replicating the full state (snapshot + log) to it immediately, but
-it does not count toward quorum until promoted. Leader-only; a follower
-answers `409` with a `leader` hint. Requires the cluster `shared_secret`.
-Idempotent (re-adding an existing learner re-registers its addr).
+| Body field | Type | Default | Meaning |
+|---|---|---|---|
+| `path_prefix` | string | required | `""`/`"/"` needs `allow_empty_prefix` |
+| `target_tier` | string | required | `hot`, `warm`, `cold`, `tape` (`400` otherwise) |
+| `target_dc` | string | none | Constrain the target node's datacenter |
+| `allow_empty_prefix` | bool | `false` | Safety gate |
+| `max_tasks` | usize | `10000` | Soft cap |
 
-**Request body:**
+Response: `status` (`accepted`), `path_prefix`, `target_tier`, `target_dc`, `files_matched`, `chunks_total`, `already_satisfied`, `tasks_scheduled`, `no_source`, `no_target`, `truncated_chunks`, `examples`. The anchor replica is never moved off the anchor. See [Migration](../storage/migration.md).
 
-```json
-{
-  "hostname": "mgr04",
-  "addr": "10.1.0.1:9401",
-  "shared_secret": "your-shared-secret"
-}
-```
+### GET /api/v1/migrations
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `hostname` | String | New manager's `[node].hostname` (raft node id is `hash(hostname)`) |
-| `addr` | String | Peer-routable Raft/gRPC `host:port`; never a wildcard (`0.0.0.0` is rejected) |
-| `shared_secret` | String | Must match `[cluster].shared_secret` |
+`{"count": N, "tasks": [ ... ]}`: pending and recent tasks held by the scheduler (leader).
 
-**Response:**
+## Scrub
 
-```json
-{ "status": "ok", "node_id": "8841...", "hostname": "mgr04", "addr": "10.1.0.1:9401", "log_index": 4522 }
-```
+### POST /api/v1/scrub
 
-### POST /api/v1/raft/promote
+Body `{"level": "quick" | "deep"}` (default `deep`). Every data node runs the scrub once on its next heartbeat. Per-target scrubs are not implemented: any `target_type` other than `all` or `target` other than `*` returns `400`. Response `{"status": "accepted", "target_type": "all", "target": "*", "level", "id"}`. Results appear in `GET /api/v1/stats` (`scrub_results_by_node`, `last_scrub`). See [Scrubbing](../storage/scrubbing.md).
 
-Promote an up-to-date learner to a voting member. Leader-only,
-shared-secret gated. Returns `404` if the target is not in the membership
-(add-learner first) and `409` if it is already a voter.
+## Audit and integrity
 
-**Request body:**
+### GET /api/v1/audit
 
-```json
-{ "hostname": "mgr04", "shared_secret": "your-shared-secret" }
-```
+Query: `limit` (default 50), `action` (prefix filter). Newest first. Entry: `timestamp` (Unix seconds), `actor`, `action`, `target`, `result`, `summary`, `origin_manager` (the last two are populated when `[audit] replicate_via_raft` is on). See [Audit Log](../security/audit-log.md).
 
-### POST /api/v1/raft/remove
+### GET /api/v1/integrity/faults
 
-Remove a learner or voter from the membership entirely (a removed voter is
-not retained as a learner). Leader-only, shared-secret gated. Refuses to
-remove the last voter (`400`).
+Same query (`limit` default 200) and entry shape, filtered to integrity actions (`node.quarantine`, `node.unquarantine`, `scrub.quick.fault`, `scrub.deep.corrupt`, `read.integrity_fault`, `orphan.in_state_missing`).
 
-**Request body:**
+## Config
 
-```json
-{ "hostname": "mgr04", "shared_secret": "your-shared-secret" }
-```
+See [Cluster-wide Configuration Override](../configuration/cluster-config.md) for semantics. No daemon applies the stored override at runtime.
 
-**Response:**
+### GET /api/v1/config
 
-```json
-{ "status": "ok", "node_id": "8841...", "hostname": "mgr04", "was_voter": true, "log_index": 4530 }
-```
+`{"version": <u64>, "config": <stored override, secrets as "***">, "defaults": <[defaults] with override applied>, "tiering": <[tiering] with override applied>}`.
 
-**Membership-change error codes:**
+### POST /api/v1/config
 
-| Status | Meaning |
-|--------|---------|
-| 403 | `shared_secret` mismatch |
-| 409 | Not the leader (body carries a `leader` hint: `leader_id`, `leader_hostname`, `leader_addr`) or already a voter (promote) |
-| 400 | Bad target (empty/wildcard addr, hostname collides with a data/client node) or refusing to remove the last voter |
-| 404 | Target not in the membership (promote/remove) |
-| 503 | The underlying openraft `add_learner` / `change_membership` call failed |
+Body `{"config_json": "<JSON string>", "write_to_disk": false, "acknowledge_cluster_wide": false}`. Response `{"version", "status": "applied", "write_to_disk": <bool actually written>}`.
 
-## Error Format
+- `400`: invalid JSON, node-scoped key in the override, merged config does not type-check, or `write_to_disk` without `acknowledge_cluster_wide`. Body carries `"preserved_current": true`.
+- `409`: another update advanced the version first (re-read, retry).
+- `write_to_disk` rewrites `/etc/dtfs/manager.toml` on this manager only (atomic, mode 0600). A failed disk write is logged and reported as `"write_to_disk": false`; the Raft write has already happened.
 
-When an error occurs, the API returns an appropriate HTTP status code. Common error codes:
+### GET /api/v1/config/effective
 
-| Status | Meaning |
-|--------|---------|
-| 400 | Bad request (invalid parameters) |
-| 401 | Unauthorized (missing or invalid JWT token) |
-| 403 | Forbidden (insufficient role) |
-| 404 | Resource not found |
-| 503 | Service unavailable (Raft leader not available) |
+`{"scope": "manager", "node_hostname", "entries": [ {name, scope, scope_kind, current, default, is_default} ]}`. Secrets (`shared_secret`, `secret`, `token`, `password`) and alert webhook URLs are returned as `"***"` when non-empty. `default` is an indicative baseline and may differ from the compiled-in defaults; use the configuration pages.
+
+## Join
+
+Used by `dtfs-data` during the HMAC handshake; see [Cluster Join](../security/cluster-join.md).
+
+- `POST /api/v1/join/request` body `{"nonce", "hmac_hex", "hostname"}`, response `{"accepted", "challenge", "ca_cert_pem", "rejection_reason"}`. `400` on malformed hex.
+- `POST /api/v1/join/complete` body `{"challenge", "completion_hmac_hex", "hostname", "grpc_addr", "region", "datacenter", "rack", "host", "disks": [{"disk_id", "uuid", "mount_path", "tier", "total_bytes", "used_bytes", "status"}]}`, response `{"success", "config_version", "config_json"}`. `400` on malformed hex, `500` on handshake failure.
