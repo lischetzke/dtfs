@@ -461,9 +461,12 @@ impl WriteBuffer {
         InflightGuard { wb: self, id }
     }
 
-    /// Remove the buffer for a given path entirely.
+    /// Remove the buffer for a given path entirely, and the in-flight overlay
+    /// of the path and everything below it (unlink / rename-over: the old
+    /// file's drained bytes must not show under the path).
     pub fn remove(&self, path: &str) {
         self.buffers.remove(path);
+        self.inflight.retain(|_, (p, _)| rekey_path(p, path, path).is_none());
     }
 
     /// True iff `chunk_index` of `path` has any buffered bytes.
@@ -564,6 +567,16 @@ impl WriteBuffer {
     /// CO-1-8 (b) — drop buffered bytes at or above `new_size`, keeping the
     /// buffered prefix `[0..new_size)` intact.
     pub fn truncate(&self, path: &str, new_size: u64) {
+        // In-flight parts too: drop those at/above new_size, shorten a straddler.
+        for mut e in self.inflight.iter_mut() {
+            let (p, parts) = e.value_mut();
+            if p == path {
+                parts.retain_mut(|(start, data)| {
+                    data.truncate(new_size.saturating_sub(*start) as usize);
+                    !data.is_empty()
+                });
+            }
+        }
         let mut entry = match self.buffers.get_mut(path) {
             Some(e) => e,
             None => return,
@@ -1608,6 +1621,72 @@ mod async_commit_tests {
         let mut v = vec![0u8; 4];
         wb.overlay("/g", 0, &mut v);
         assert_eq!(v, [0, 9, 9, 0]);
+    }
+
+    fn drain_inflight<'a>(wb: &'a WriteBuffer, path: &str, data: &[u8]) -> InflightGuard<'a> {
+        wb.write(path, 0, data);
+        let segs = wb.flush_all(path);
+        wb.begin_inflight(path, &segs)
+    }
+
+    /// unlink: the old file's in-flight bytes must not show under the path
+    /// (or below it), a sibling sharing the prefix keeps its own; the
+    /// guard of a removed entry drops as a no-op.
+    #[test]
+    fn remove_ends_the_inflight_overlay_of_path_and_subtree() {
+        let wb = WriteBuffer::new(CS);
+        let gf = drain_inflight(&wb, "/f", &[1; 3]);
+        let gx = drain_inflight(&wb, "/d/x", &[1; 3]);
+        let gdd = drain_inflight(&wb, "/dd", &[1; 3]);
+        wb.remove("/f");
+        wb.remove("/d");
+        assert_eq!(wb.visible_size("/f"), None, "unlinked file still visible");
+        assert_eq!(wb.visible_size("/d/x"), None);
+        let mut v = [0u8; 3];
+        assert_eq!(wb.overlay("/f", 0, &mut v), 0);
+        assert_eq!(wb.visible_size("/dd"), Some(3), "sibling prefix kept");
+        drop((gf, gx));
+        assert_eq!(wb.visible_size("/dd"), Some(3));
+        drop(gdd);
+        assert_eq!(wb.visible_size("/dd"), None);
+    }
+
+    /// rename-over (rename_inner: remove(to) then rename(from, to)): only
+    /// the moved file's in-flight bytes show under `to`.
+    #[test]
+    fn rename_over_drops_the_replaced_files_inflight_overlay() {
+        let wb = WriteBuffer::new(CS);
+        let _ga = drain_inflight(&wb, "/a", &[1; 3]);
+        let _gb = drain_inflight(&wb, "/b", &[2; 5]);
+        wb.remove("/b");
+        wb.rename("/a", "/b");
+        assert_eq!(wb.visible_size("/b"), Some(3), "replaced file's size leaks");
+        let mut v = [0u8; 5];
+        assert_eq!(wb.overlay("/b", 0, &mut v), 3);
+        assert_eq!(v, [1, 1, 1, 0, 0]);
+    }
+
+    /// truncate clips in-flight parts: dropped at/above new_size, the
+    /// straddling one shortened; growing is a no-op.
+    #[test]
+    fn truncate_clips_the_inflight_overlay() {
+        let wb = WriteBuffer::new(CS);
+        wb.write("/t", 0, &[1; CS]);
+        wb.write("/t", CS as u64, &[2; 3]);
+        let segs = wb.flush_all("/t");
+        let _g = wb.begin_inflight("/t", &segs);
+        wb.truncate("/t", CS as u64 + 10);
+        assert_eq!(wb.visible_size("/t"), Some(CS as u64 + 3), "grow keeps it");
+        wb.truncate("/t", CS as u64 + 1);
+        assert_eq!(wb.visible_size("/t"), Some(CS as u64 + 1), "straddling part shortened");
+        wb.truncate("/t", CS as u64);
+        assert_eq!(wb.visible_size("/t"), Some(CS as u64), "part starting at new_size dropped");
+        wb.truncate("/t", 3);
+        let mut v = vec![0u8; CS + 4];
+        assert_eq!(wb.overlay("/t", 0, &mut v), 3);
+        assert!(v[..3].iter().all(|b| *b == 1) && v[3..].iter().all(|b| *b == 0));
+        wb.truncate("/t", 0);
+        assert_eq!(wb.visible_size("/t"), None);
     }
 
     #[test]
