@@ -241,6 +241,12 @@ impl TaskScheduler {
         }
     }
 
+    /// Placement thresholds (headroom) the scheduler places against; the
+    /// tiering engine uses the same view when picking promotion targets.
+    pub(crate) fn placement_cfg(&self) -> &dtfs_common::config::PlacementConfig {
+        &self.placement_cfg
+    }
+
     /// Inject the alert dispatcher (called after main.rs has wired one).
     pub fn set_alerts(&self, alerts: Arc<crate::alerts::AlertDispatcher>) {
         *self.alerts.write() = Some(alerts);

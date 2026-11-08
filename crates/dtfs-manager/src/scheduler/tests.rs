@@ -8,7 +8,7 @@ use super::*;
 #[cfg(test)]
 mod rev_leader_gate_tests {
     use super::{
-        first_sweep_abort_index, force_tick_after_skips, leader_gate_open, orphan_sweep_allowed,
+        force_tick_after_skips, leader_gate_open, orphan_sweep_allowed,
         should_quarantine_for_missing, task_budget_available,
         IN_STATE_MISSING_QUARANTINE_THRESHOLD, MAX_CONSECUTIVE_PRESSURE_SKIPS, MAX_LIVE_TASKS,
         MAX_NEW_TASKS_PER_TICK,
@@ -37,39 +37,6 @@ mod rev_leader_gate_tests {
     fn orphan_sweep_refuses_an_empty_namespace_view() {
         // "Every chunk on every disk is an orphan" is never a real answer.
         assert!(!orphan_sweep_allowed(true, 100, 100, 0));
-    }
-
-    /// CR2-7-3 / MGR-13 — a leadership loss mid-sweep (third checkpoint)
-    /// must stop the sweep at that checkpoint; nothing after it runs.
-    #[test]
-    fn mgr_13_leadership_loss_mid_sweep_aborts_at_that_checkpoint() {
-        let checks = vec![
-            (true, 100, 100, 5),  // node 1: ok
-            (true, 100, 100, 5),  // node 1's delete batch: ok
-            (false, 100, 100, 5), // node 2: leadership lost -> abort here
-            (true, 100, 100, 5),  // never reached
-        ];
-        assert_eq!(first_sweep_abort_index(&checks), Some(2));
-    }
-
-    /// CR2-7-3 / MGR-13 — a sweep that never loses the gate never aborts.
-    #[test]
-    fn mgr_13_sweep_with_no_gate_failure_never_aborts() {
-        let checks = vec![(true, 100, 100, 5); 6];
-        assert_eq!(first_sweep_abort_index(&checks), None);
-    }
-
-    /// CR2-7-3 / MGR-13 — a freshness regression (state machine falls
-    /// behind mid-sweep, e.g. after a snapshot install) aborts exactly like
-    /// a leadership loss.
-    #[test]
-    fn mgr_13_freshness_regression_mid_sweep_aborts_at_that_checkpoint() {
-        let checks = vec![
-            (true, 100, 100, 5),
-            (true, 50, 5_000, 5), // fell behind -> abort here
-            (true, 5_000, 5_000, 5),
-        ];
-        assert_eq!(first_sweep_abort_index(&checks), Some(1));
     }
 
     #[test]
@@ -313,44 +280,6 @@ mod bug_ch_live_replica_tests {
         assert_eq!(live_replica_tier(Some(&n), 0), None, "no disk with id 0 exists");
     }
 
-    // CNF-1 — the WRITE side must agree: the disk_id recorded for a new
-    // replica (AV-5-9 read-back) is the matching disk's `disk_id` field,
-    // not its Vec position — otherwise on a sparse-id node the fresh
-    // replica is invisible to live_replica_tier and the repair
-    // re-schedules every tick.
-    #[test]
-    fn new_replica_records_disk_id_field_not_position() {
-        let mut d = disk(DiskTier::Cold, DiskStatus::Healthy);
-        d.disk_id = 1;
-        let n = node(HealthStatus::Healthy, vec![d]);
-        assert_eq!(super::resolve_disk_id_for_tier(Some(&n), DiskTier::Cold), Some(1));
-        // No disk of the tier → None.
-        assert_eq!(super::resolve_disk_id_for_tier(Some(&n), DiskTier::Warm), None);
-    }
-
-    /// CR-3-4/MGR-8 — a Failed/Removed disk of the right tier must not be
-    /// resolved as a registration target; only a LIVE disk of the tier
-    /// counts.
-    #[test]
-    fn dead_disk_of_the_tier_is_not_resolved() {
-        let mut failed = disk(DiskTier::Cold, DiskStatus::Failed);
-        failed.disk_id = 0;
-        let mut live = disk(DiskTier::Cold, DiskStatus::Healthy);
-        live.disk_id = 1;
-        let n = node(HealthStatus::Healthy, vec![failed, live]);
-        assert_eq!(
-            super::resolve_disk_id_for_tier(Some(&n), DiskTier::Cold),
-            Some(1),
-            "must skip the Failed disk and resolve the live one"
-        );
-
-        // Only a Failed disk of the tier exists → None.
-        let mut only_failed = disk(DiskTier::Cold, DiskStatus::Failed);
-        only_failed.disk_id = 0;
-        let n2 = node(HealthStatus::Healthy, vec![only_failed]);
-        assert_eq!(super::resolve_disk_id_for_tier(Some(&n2), DiskTier::Cold), None);
-    }
-
     fn entry(hash: &str, node: &str, disk_id: u32) -> super::ChunkLocationEntry {
         super::ChunkLocationEntry {
             chunk_index: 0,
@@ -551,69 +480,6 @@ mod endpoint_tests {
     fn bug_w_endpoint_https_passthrough() {
         let stored = "https://data-warm01:9500";
         assert_eq!(normalize_endpoint(stored), "https://data-warm01:9500");
-    }
-}
-
-#[cfg(test)]
-mod bug_bh_dedup_tests {
-    use super::*;
-
-    fn ent(node: &str, disk: u32) -> ChunkLocationEntry {
-        ChunkLocationEntry {
-            chunk_index: 0,
-            chunk_hash: "h".to_string(),
-            node_id: node.to_string(),
-            disk_id: disk,
-            size_bytes: 0,
-        }
-    }
-
-    /// BH-1 — the dedup guard must key on (node_id, disk_id). A node that
-    /// holds the chunk on disk 0 (warm) is NOT "already present" for a
-    /// cold copy on disk 1. (Fails with the old node-only guard.)
-    #[test]
-    fn replica_present_dedupes_by_node_and_disk() {
-        let entries = vec![ent("A", 0)];
-        assert!(
-            !replica_already_present(&entries, "A", 1),
-            "same node, different disk/tier must NOT count as present"
-        );
-        assert!(
-            replica_already_present(&entries, "A", 0),
-            "exact (node, disk) match must count as present (idempotency)"
-        );
-        assert!(
-            !replica_already_present(&entries, "B", 0),
-            "different node must NOT count as present"
-        );
-    }
-
-    /// BH-2 — the completion path must RECORD a same-node cold replica
-    /// when the anchor target already holds the chunk on its warm disk.
-    /// Mirrors the dispatcher push logic; pre-BH (node-only guard) this
-    /// leaves 2 entries (cold never recorded) → infinite anchor-lag loop.
-    #[test]
-    fn completion_records_same_node_cold_replica() {
-        // Existing warm replicas on both data nodes (warm disk = 0).
-        let mut entries = vec![ent("A", 0), ent("B", 0)];
-        // Anchor-cold repair targets B; its cold disk resolved to id 1.
-        let target = "B";
-        let resolved_cold_disk = 1u32;
-        if !replica_already_present(&entries, target, resolved_cold_disk) {
-            entries.push(ent(target, resolved_cold_disk));
-        }
-        assert_eq!(
-            entries.len(),
-            3,
-            "cold anchor on B must be recorded alongside its warm copy"
-        );
-        assert!(
-            entries.iter().any(|e| e.node_id == "B" && e.disk_id == 1),
-            "the new B-cold entry must be present"
-        );
-        // Integrity invariant (A.3.3): existing warm entries untouched.
-        assert!(entries.iter().any(|e| e.node_id == "A" && e.disk_id == 0));
-        assert!(entries.iter().any(|e| e.node_id == "B" && e.disk_id == 0));
     }
 }
 
@@ -1790,58 +1656,6 @@ mod bug_ae_orphan_tests {
         assert!(files_referencing_chunk(&files, "nope").is_empty());
     }
 
-    /// chunk_in_any_file returns true when a chunk hash matches any file.
-    #[test]
-    fn chunk_in_any_file_finds_existing_chunk() {
-        let mut files: BTreeMap<String, FileMetadata> = BTreeMap::new();
-        files.insert(
-            "/movies/a.mkv".to_string(),
-            file_with_chunks("/movies/a.mkv", &["hash_a0", "hash_a1"]),
-        );
-        files.insert(
-            "/movies/b.mkv".to_string(),
-            file_with_chunks("/movies/b.mkv", &["hash_b0"]),
-        );
-
-        assert!(chunk_in_any_file("hash_a0", &files));
-        assert!(chunk_in_any_file("hash_a1", &files));
-        assert!(chunk_in_any_file("hash_b0", &files));
-    }
-
-    /// Returns false when no file references the chunk — this is the
-    /// orphan condition that fast-paths the task to Failed.
-    #[test]
-    fn chunk_in_any_file_returns_false_for_orphan() {
-        let mut files: BTreeMap<String, FileMetadata> = BTreeMap::new();
-        files.insert(
-            "/movies/a.mkv".to_string(),
-            file_with_chunks("/movies/a.mkv", &["hash_a0"]),
-        );
-
-        assert!(!chunk_in_any_file("hash_orphan", &files));
-        assert!(!chunk_in_any_file("", &files));
-    }
-
-    /// Empty file map — every chunk lookup is orphan. Common at
-    /// fresh-cluster boot before any file is created.
-    #[test]
-    fn chunk_in_any_file_handles_empty_map() {
-        let files: BTreeMap<String, FileMetadata> = BTreeMap::new();
-        assert!(!chunk_in_any_file("any_hash", &files));
-    }
-
-    /// File present but with no chunks (e.g. truncated to zero, or symlink
-    /// placeholder). Chunk lookup must return false, not panic.
-    #[test]
-    fn chunk_in_any_file_skips_chunkless_files() {
-        let mut files: BTreeMap<String, FileMetadata> = BTreeMap::new();
-        files.insert(
-            "/empty.bin".to_string(),
-            file_with_chunks("/empty.bin", &[]),
-        );
-        assert!(!chunk_in_any_file("anything", &files));
-    }
-
     /// Bug AF — the exact error string produced when a source data node
     /// reports "Chunk not found" must be classified as fast-fail. This is
     /// the live shape observed on Plexmedia 4h soak v2 at 07:30 UTC.
@@ -2585,7 +2399,8 @@ mod advance_round_tests {
         assert_eq!(task.status, MigrationStatus::Completing, "must NOT advance to Done on Err");
         assert_eq!(task.attempts, 1);
 
-        // Round 2: register_replica succeeds -> task reaches Done.
+        // Next tick (fresh once-per-call guards): register_replica succeeds -> Done.
+        let (mut copied, mut verified) = (Default::default(), Default::default());
         let progressed = advance_round(&ops, &mut state, 2_000, &mut copied, &mut verified).await;
         assert!(progressed);
         let task = state.tasks.get(&task_id).unwrap();
@@ -2610,14 +2425,34 @@ mod advance_round_tests {
         let task_id = t.task_id.clone();
         state.tasks.insert(task_id.clone(), t);
 
-        let mut copied = std::collections::HashSet::new();
-        let mut verified = std::collections::HashSet::new();
         for _ in 0..MAX_MIGRATION_ATTEMPTS {
-            advance_round(&ops, &mut state, 1_000, &mut copied, &mut verified).await;
+            // One call per tick: the once-per-call guards are fresh each time.
+            advance_migration_tasks(&ops, &mut state, 1_000).await;
         }
         let task = state.tasks.get(&task_id).unwrap();
         assert_eq!(task.status, MigrationStatus::Failed);
         assert_eq!(ops.failed_alerts.load(Ordering::SeqCst), 1);
+    }
+
+    /// A failing registration burns exactly ONE attempt per advance call
+    /// (tick), not every round of the loop.
+    #[tokio::test]
+    async fn register_failure_burns_one_attempt_per_call() {
+        let ops = MockOps {
+            register_fail_times: AtomicUsize::new(usize::MAX),
+            ..Default::default()
+        };
+        let mut state = MigrationState::default();
+        let mut t = pending_task(0);
+        t.status = MigrationStatus::Completing;
+        let task_id = t.task_id.clone();
+        state.tasks.insert(task_id.clone(), t);
+
+        advance_migration_tasks(&ops, &mut state, 1_000).await;
+        let task = state.tasks.get(&task_id).unwrap();
+        assert_eq!(task.attempts, 1);
+        assert_eq!(task.status, MigrationStatus::Completing);
+        assert_eq!(ops.register_calls.load(Ordering::SeqCst), 1);
     }
 
     // WI-04 — at most MIGRATION_COPIES_PER_TARGET ReplicateChunk RPCs are
@@ -3084,7 +2919,7 @@ mod batch_schedule_tests {
         let ids = ids(5);
         let reqs: Vec<_> = ids.iter().map(|c| (c.as_str(), 1u64, 2u64, DiskTier::Warm)).collect();
         let mut st = MigrationState::default();
-        let out = plan_replication_batch(&mut st, &reqs, usize::MAX, 10);
+        let out = plan_replication_batch(&mut st, &reqs, usize::MAX, MAX_LIVE_TASKS, 10);
         assert!(out.iter().all(|o| *o == ScheduleOutcome::New));
         assert_eq!(st.tasks.len(), 5);
         assert_eq!(st.next_task_id, 5);
@@ -3097,9 +2932,9 @@ mod batch_schedule_tests {
         let ids = ids(6);
         let mut st = MigrationState::default();
         let first: Vec<_> = ids[..3].iter().map(|c| (c.as_str(), 1u64, 2u64, DiskTier::Warm)).collect();
-        plan_replication_batch(&mut st, &first, usize::MAX, 10);
+        plan_replication_batch(&mut st, &first, usize::MAX, MAX_LIVE_TASKS, 10);
         let all: Vec<_> = ids.iter().map(|c| (c.as_str(), 1u64, 2u64, DiskTier::Warm)).collect();
-        let out = plan_replication_batch(&mut st, &all, 2, 11);
+        let out = plan_replication_batch(&mut st, &all, 2, MAX_LIVE_TASKS, 11);
         use ScheduleOutcome::*;
         assert_eq!(out, vec![AlreadyScheduled, AlreadyScheduled, AlreadyScheduled, New, New, Deferred]);
         assert_eq!(st.tasks.len(), 5);
@@ -3111,8 +2946,148 @@ mod batch_schedule_tests {
         let mut st = MigrationState::default();
         let big = ids(MAX_LIVE_TASKS);
         let reqs: Vec<_> = big.iter().map(|c| (c.as_str(), 1u64, 2u64, DiskTier::Warm)).collect();
-        plan_replication_batch(&mut st, &reqs, usize::MAX, 1);
-        let out = plan_replication_batch(&mut st, &[("extra", 1, 2, DiskTier::Warm)], usize::MAX, 2);
+        plan_replication_batch(&mut st, &reqs, usize::MAX, MAX_LIVE_TASKS, 1);
+        let out = plan_replication_batch(&mut st, &[("extra", 1, 2, DiskTier::Warm)], usize::MAX, MAX_LIVE_TASKS, 2);
         assert_eq!(out, vec![ScheduleOutcome::Refused]);
+    }
+    fn task(id: &str, status: MigrationStatus) -> ReplicationTask {
+        ReplicationTask {
+            task_id: id.to_string(),
+            chunk_id: format!("c-{id}"),
+            source_node: 1,
+            target_node: 2,
+            tier: DiskTier::Warm,
+            status,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            attempts: 0,
+            last_error: None,
+        }
+    }
+
+    /// Failed (dedup-only) and Done tasks must not eat the live budget:
+    /// a backlog of permanent failures used to starve mandatory repair.
+    #[test]
+    fn failed_tasks_do_not_count_toward_live_budget() {
+        let mut st = MigrationState::default();
+        for i in 0..MAX_LIVE_TASKS {
+            let t = task(&format!("f{i}"), MigrationStatus::Failed);
+            st.tasks.insert(t.task_id.clone(), t);
+        }
+        let t = task("p", MigrationStatus::Pending);
+        st.tasks.insert(t.task_id.clone(), t);
+        assert_eq!(live_task_count(&st), 1);
+        let out = plan_replication_batch(&mut st, &[("new", 1, 2, DiskTier::Warm)], usize::MAX, MAX_LIVE_TASKS, 5);
+        assert_eq!(out, vec![ScheduleOutcome::New]);
+        // A Failed task still dedups the same (chunk, target).
+        let out = plan_replication_batch(&mut st, &[("c-f0", 1, 2, DiskTier::Warm)], usize::MAX, MAX_LIVE_TASKS, 6);
+        assert_eq!(out, vec![ScheduleOutcome::AlreadyScheduled]);
+    }
+
+    /// Tiering's lower ceiling refuses while the global ceiling still has
+    /// room, exactly at the boundary.
+    #[test]
+    fn tiering_live_ceiling_is_lower_than_global() {
+        assert!(TIERING_MAX_LIVE_TASKS < MAX_LIVE_TASKS);
+        let mut st = MigrationState::default();
+        for i in 0..TIERING_MAX_LIVE_TASKS {
+            let t = task(&format!("p{i}"), MigrationStatus::Pending);
+            st.tasks.insert(t.task_id.clone(), t);
+        }
+        let req = [("new", 1u64, 2u64, DiskTier::Warm)];
+        let out = plan_replication_batch(&mut st, &req, usize::MAX, TIERING_MAX_LIVE_TASKS, 1);
+        assert_eq!(out, vec![ScheduleOutcome::Refused], "promotions refused at their ceiling");
+        let out = plan_replication_batch(&mut st, &req, usize::MAX, MAX_LIVE_TASKS, 2);
+        assert_eq!(out, vec![ScheduleOutcome::New], "repair still has headroom");
+    }
+
+    #[test]
+    fn rotated_from_visits_every_entry_once_from_the_seed() {
+        let m: std::collections::BTreeMap<u32, ()> = (0..5).map(|i| (i, ())).collect();
+        let keys = |seed| rotated_from(&m, seed).map(|(k, _)| *k).collect::<Vec<_>>();
+        assert_eq!(keys(0), vec![0, 1, 2, 3, 4]);
+        assert_eq!(keys(2), vec![2, 3, 4, 0, 1]);
+        assert_eq!(keys(7), vec![2, 3, 4, 0, 1], "seed wraps modulo len");
+        let empty: std::collections::BTreeMap<u32, ()> = Default::default();
+        assert_eq!(rotated_from(&empty, 9).count(), 0);
+    }
+
+    #[test]
+    fn active_pairs_exclude_terminal_tasks() {
+        let mut st = MigrationState::default();
+        for (id, s) in [
+            ("a", MigrationStatus::Pending),
+            ("b", MigrationStatus::Verifying),
+            ("c", MigrationStatus::Done),
+            ("d", MigrationStatus::Failed),
+        ] {
+            let t = task(id, s);
+            st.tasks.insert(t.task_id.clone(), t);
+        }
+        let pairs = active_pairs_of(&st);
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.contains(&("c-a".to_string(), 2)));
+        assert!(pairs.contains(&("c-b".to_string(), 2)));
+        assert!(!pairs.contains(&("c-c".to_string(), 2)));
+    }
+
+    /// Only NEW tasks are reported as scheduled (dedup/refusal are not).
+    #[test]
+    fn new_task_count_counts_only_new() {
+        use ScheduleOutcome::*;
+        assert_eq!(new_task_count(&[New, AlreadyScheduled, Refused, Deferred, New]), 2);
+        assert_eq!(new_task_count(&[]), 0);
+    }
+}
+
+#[cfg(test)]
+mod anchor_tier_fallback_tests {
+    use super::*;
+    use dtfs_common::types::AnchorPolicy;
+    use std::collections::HashSet;
+
+    fn anchor(tier: Option<DiskTier>) -> AnchorPolicy {
+        AnchorPolicy { datacenter: "leli".to_string(), required_tier: tier }
+    }
+    fn node(id: u64, tiers: &[DiskTier]) -> AnchorRepairNode {
+        AnchorRepairNode { node_id: id, datacenter: "leli".into(), healthy: true, tiers: tiers.to_vec() }
+    }
+    fn elsewhere() -> Vec<AnchorRepairPlacement> {
+        vec![AnchorRepairPlacement { node_id: 9, dc: "toro".into(), tier: DiskTier::Warm }]
+    }
+
+    /// No required tier and no cold disk with room in the anchor DC: fall
+    /// back to a tier that has room instead of stranding the anchor.
+    #[test]
+    fn none_required_tier_falls_back_when_cold_unavailable() {
+        let nodes = vec![node(1, &[DiskTier::Warm])];
+        let act = plan_anchor_lag_repair(&anchor(None), &elsewhere(), &nodes, "h", &HashSet::new())
+            .expect("warm fallback");
+        assert_eq!((act.target_node, act.target_tier), (1, DiskTier::Warm));
+    }
+
+    #[test]
+    fn none_required_tier_still_prefers_cold() {
+        let nodes = vec![node(1, &[DiskTier::Warm]), node(2, &[DiskTier::Cold])];
+        let act = plan_anchor_lag_repair(&anchor(None), &elsewhere(), &nodes, "h", &HashSet::new()).unwrap();
+        assert_eq!((act.target_node, act.target_tier), (2, DiskTier::Cold));
+    }
+
+    /// A required tier is exact: no fallback to another tier.
+    #[test]
+    fn required_tier_has_no_fallback() {
+        let nodes = vec![node(1, &[DiskTier::Warm])];
+        let a = anchor(Some(DiskTier::Cold));
+        assert_eq!(plan_anchor_lag_repair(&a, &elsewhere(), &nodes, "h", &HashSet::new()), None);
+    }
+
+    /// No node with room in the anchor DC at all: no action.
+    #[test]
+    fn no_target_in_anchor_dc_yields_none() {
+        let nodes = vec![node(1, &[])];
+        assert_eq!(
+            plan_anchor_lag_repair(&anchor(None), &elsewhere(), &nodes, "h", &HashSet::new()),
+            None
+        );
     }
 }

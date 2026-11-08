@@ -18,7 +18,11 @@ impl TaskScheduler {
         tier: DiskTier,
     ) -> bool {
         let out = self
-            .schedule_replications(&[(chunk_id, source_node, target_node, tier)], usize::MAX)
+            .schedule_replications(
+                &[(chunk_id, source_node, target_node, tier)],
+                usize::MAX,
+                MAX_LIVE_TASKS,
+            )
             .await;
         out[0] != ScheduleOutcome::Refused
     }
@@ -26,17 +30,29 @@ impl TaskScheduler {
     /// Schedule many replication tasks with ONE migration-state load/save.
     /// Only newly created tasks count toward `max_new`; already-scheduled
     /// pairs are skipped for free. Returns one outcome per request.
+    /// `max_live` is the non-terminal-task ceiling for THIS caller (tiering
+    /// uses a lower one so promotions cannot starve mandatory repair).
+    /// When the tick holds the migration-state lock (it can for minutes
+    /// during an advance) every request comes back `Deferred` instead of
+    /// blocking the caller; the caller re-plans next tick / returns 503.
     pub(crate) async fn schedule_replications(
         &self,
         reqs: &[(&str, u64, u64, DiskTier)],
         max_new: usize,
+        max_live: usize,
     ) -> Vec<ScheduleOutcome> {
         // CO-3-5 — serialise with the tick's load-modify-save (and any
         // other concurrent schedule) so neither writer clobbers the
         // other's tasks or regresses `next_task_id`.
-        let _ms_guard = self.migration_state_lock.lock().await;
+        let Ok(_ms_guard) = self.migration_state_lock.try_lock() else {
+            warn!(
+                requests = reqs.len(),
+                "replication scheduling deferred: migration state busy (scheduler tick in progress)"
+            );
+            return vec![ScheduleOutcome::Deferred; reqs.len()];
+        };
         let mut state = self.load_migration_state().await;
-        let outcomes = plan_replication_batch(&mut state, reqs, max_new, now_millis());
+        let outcomes = plan_replication_batch(&mut state, reqs, max_new, max_live, now_millis());
         let mut created = 0usize;
         for (r, o) in reqs.iter().zip(&outcomes) {
             match o {
@@ -52,7 +68,7 @@ impl TaskScheduler {
                 }
                 ScheduleOutcome::Refused => warn!(
                     chunk_id = %r.0,
-                    max_live = MAX_LIVE_TASKS,
+                    max_live,
                     "replication task refused: live task budget exhausted"
                 ),
                 _ => {}
@@ -64,24 +80,16 @@ impl TaskScheduler {
         outcomes
     }
 
-    /// AV-5-5 — return true when a replication task targeting `chunk_id`
-    /// on `target_node` is still in flight (any status except Done /
-    /// Failed). The AV-2-5 demote dispatcher consults this to avoid
-    /// racing a just-completed PutChunk against a stale planner-emitted
-    /// demote (the planner's snapshot can predate the
-    /// UpdateChunkLocations Raft write that records the new replica).
-    pub(crate) async fn has_active_replication_to(
+    /// AV-5-5 — `(chunk_id, target_node)` pairs with a replication task
+    /// still in flight (any status except Done / Failed). The AV-2-5 demote
+    /// dispatcher consults this (loaded once per tick) to avoid racing a
+    /// just-completed PutChunk against a stale planner-emitted demote (the
+    /// planner's snapshot can predate the UpdateChunkLocations Raft write
+    /// that records the new replica).
+    pub(crate) async fn active_replication_pairs(
         &self,
-        chunk_id: &str,
-        target_node: u64,
-    ) -> bool {
-        let state = self.load_migration_state().await;
-        state.tasks.values().any(|t| {
-            t.chunk_id == chunk_id
-                && t.target_node == target_node
-                && t.status != MigrationStatus::Done
-                && t.status != MigrationStatus::Failed
-        })
+    ) -> std::collections::HashSet<(String, u64)> {
+        active_pairs_of(&self.load_migration_state().await)
     }
 
     /// Check the cluster state for under-replicated chunks and schedule
@@ -106,7 +114,7 @@ impl TaskScheduler {
             .filter(|t| task_blocks_requeue(t.status))
             .map(|t| (t.chunk_id.clone(), t.target_node, t.tier))
             .collect();
-        let mut live_tasks = live_index.len();
+        let mut live_tasks = live_task_count(migration_state);
 
         // Collect healthy DATA nodes and their live tiers. Bug CH — the
         // role filter is explicit (managers/clients register with no
@@ -146,7 +154,9 @@ impl TaskScheduler {
         //
         // Bug AV (AV-1-8) — under-replication enforces ONLY mandatory tiers;
         // cache tiers are the tiering engine's job.
-        for (_path, file_meta) in &sm.files {
+        // Rotated start: a budget `return` mid-scan must not always cut off
+        // the same tail of the namespace.
+        for (_path, file_meta) in rotated_from(&sm.files, now_millis()) {
             if file_meta.is_directory || file_meta.symlink_target.is_some() {
                 continue;
             }
@@ -540,14 +550,10 @@ impl TaskScheduler {
         // budget as `check_under_replicated`; pre-fix it created one task
         // per un-anchored chunk with NO bound at all.
         let mut created: usize = 0;
-        let mut live_tasks: usize = migration_state
-            .tasks
-            .values()
-            .filter(|t| task_blocks_requeue(t.status))
-            .count();
+        let mut live_tasks: usize = live_task_count(migration_state);
 
-        // Walk every file and run the per-chunk planner.
-        for (file_path, file_meta) in &sm.files {
+        // Walk every file (rotated start, see check_under_replicated).
+        for (file_path, file_meta) in rotated_from(&sm.files, now_millis()) {
             let Some(volume) = sm.volumes.get(&file_meta.volume_id) else {
                 continue;
             };
@@ -669,6 +675,48 @@ impl TaskScheduler {
     }
 }
 
+/// Ceiling on live tasks for tiering promotions: half the global budget, so
+/// cache promotions can never fill the queue mandatory/anchor repair needs.
+pub(crate) const TIERING_MAX_LIVE_TASKS: usize = MAX_LIVE_TASKS / 2;
+
+/// Tasks that count toward the live budget: non-terminal only. Failed
+/// tasks linger for dedup (`task_blocks_requeue`) but are not work.
+pub(crate) fn live_task_count(state: &MigrationState) -> usize {
+    state
+        .tasks
+        .values()
+        .filter(|t| !matches!(t.status, MigrationStatus::Done | MigrationStatus::Failed))
+        .count()
+}
+
+/// `(chunk_id, target_node)` of every in-flight (non-terminal) task.
+pub(crate) fn active_pairs_of(
+    state: &MigrationState,
+) -> std::collections::HashSet<(String, u64)> {
+    state
+        .tasks
+        .values()
+        .filter(|t| !matches!(t.status, MigrationStatus::Done | MigrationStatus::Failed))
+        .map(|t| (t.chunk_id.clone(), t.target_node))
+        .collect()
+}
+
+/// Iterate `m` starting at index `seed % len` and wrapping, visiting every
+/// entry once. Scans that can stop early on a budget use this so a
+/// permanent early failure cannot starve the entries after it.
+pub(crate) fn rotated_from<K: Ord, V>(
+    m: &std::collections::BTreeMap<K, V>,
+    seed: u64,
+) -> impl Iterator<Item = (&K, &V)> {
+    let start = if m.is_empty() { 0 } else { (seed % m.len() as u64) as usize };
+    m.iter().skip(start).chain(m.iter().take(start))
+}
+
+/// Number of NEW tasks in a batch (what the operator actually got).
+pub(crate) fn new_task_count(outcomes: &[ScheduleOutcome]) -> usize {
+    outcomes.iter().filter(|o| **o == ScheduleOutcome::New).count()
+}
+
 /// Result of one request in a `schedule_replications` batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScheduleOutcome {
@@ -689,9 +737,10 @@ pub(crate) fn plan_replication_batch(
     state: &mut MigrationState,
     reqs: &[(&str, u64, u64, DiskTier)],
     max_new: usize,
+    max_live: usize,
     now_ms: u64,
 ) -> Vec<ScheduleOutcome> {
-    let mut live = state.tasks.values().filter(|t| task_blocks_requeue(t.status)).count();
+    let mut live = live_task_count(state);
     let mut out = Vec::with_capacity(reqs.len());
     let mut new = 0usize;
     for &(chunk_id, source_node, target_node, tier) in reqs {
@@ -706,7 +755,7 @@ pub(crate) fn plan_replication_batch(
             out.push(ScheduleOutcome::Deferred);
             continue;
         }
-        if !task_budget_available(0, live) {
+        if live >= max_live {
             out.push(ScheduleOutcome::Refused);
             continue;
         }
@@ -881,10 +930,21 @@ pub(crate) fn plan_anchor_lag_repair(
         return None;
     }
 
-    // Gate 2 — pick a target tier. Prefer the required_tier if set,
-    // else cold (the durable anchor floor), else any tier available
-    // in the anchor DC.
-    let candidate_tier = anchor.required_tier.unwrap_or(DiskTier::Cold);
+    // Gate 2 — pick a target tier. A required_tier is exact; otherwise
+    // prefer cold (the durable anchor floor), then fall back to any tier
+    // with room in the anchor DC (`nodes[].tiers` is room-filtered).
+    let tier_prefs: &[DiskTier] = match &anchor.required_tier {
+        Some(t) => std::slice::from_ref(t),
+        None => &[DiskTier::Cold, DiskTier::Warm, DiskTier::Hot, DiskTier::Tape],
+    };
+    let in_anchor_dc = |n: &&AnchorRepairNode| {
+        n.healthy && n.datacenter.eq_ignore_ascii_case(&anchor.datacenter)
+    };
+    let candidate_tier = tier_prefs
+        .iter()
+        .copied()
+        .find(|t| nodes.iter().filter(in_anchor_dc).any(|n| n.tiers.contains(t)))
+        .unwrap_or(tier_prefs[0]);
 
     // Gate 3 — find a healthy node in the anchor DC with the
     // candidate tier. Bug fix (BF-followup): exclude only nodes that
@@ -899,13 +959,21 @@ pub(crate) fn plan_anchor_lag_repair(
         .filter(|p| p.tier == candidate_tier)
         .map(|p| p.node_id)
         .collect();
-    let target = nodes
+    let Some(target) = nodes
         .iter()
-        .filter(|n| n.healthy)
-        .filter(|n| n.datacenter.eq_ignore_ascii_case(&anchor.datacenter))
+        .filter(in_anchor_dc)
         .filter(|n| n.tiers.contains(&candidate_tier))
         .filter(|n| !tier_holders.contains(&n.node_id))
-        .min_by_key(|n| n.node_id)?; // deterministic by node_id
+        .min_by_key(|n| n.node_id) // deterministic by node_id
+    else {
+        warn!(
+            chunk = %chunk_id,
+            dc = %anchor.datacenter,
+            tier = ?candidate_tier,
+            "anchor-lag repair: no healthy anchor-DC node with room can take the anchor copy"
+        );
+        return None;
+    };
 
     // Gate 4 — already scheduled?
     if existing_tasks.contains(&(chunk_id.to_string(), target.node_id)) {
@@ -999,42 +1067,6 @@ pub(crate) fn rpc_error_indicates_chunk_missing(error_message: &str) -> bool {
     error_message.contains("Chunk not found")
 }
 
-/// Returns true iff `chunk_hash` appears in any `FileMetadata.chunks` entry
-/// across the supplied `files` map. The async caller pulls the
-/// state-machine read lock; this function stays sync so it's trivially
-/// unit-testable without a tokio runtime. Retained for its test coverage
-/// and as the orphan predicate `chunk_size_in_any_file` mirrors (WI-04's
-/// `chunk_bytes_anywhere` now uses that instead, since it also needs the
-/// chunk's size).
-#[inline]
-pub(crate) fn chunk_in_any_file(
-    chunk_hash: &str,
-    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
-) -> bool {
-    files
-        .values()
-        .any(|f| f.chunks.iter().any(|c| c.chunk_hash == chunk_hash))
-}
-
-/// WI-04 — pure helper for `chunk_bytes_anywhere`. Returns the largest
-/// `size_bytes` recorded for `chunk_hash` across every `ChunkLocationEntry`
-/// row that references it in `files`, or `None` if no file references the
-/// chunk at all (the same orphan predicate as `chunk_in_any_file`). `max`
-/// is a defensive, never-under-estimate choice — chunks are
-/// content-addressed, so distinct rows for the same hash should agree.
-#[inline]
-pub(crate) fn chunk_size_in_any_file(
-    chunk_hash: &str,
-    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
-) -> Option<u64> {
-    files
-        .values()
-        .flat_map(|f| f.chunks.iter())
-        .filter(|c| c.chunk_hash == chunk_hash)
-        .map(|c| c.size_bytes)
-        .max()
-}
-
 // ---------------------------------------------------------------------------
 // Bug CH — node/disk-loss-aware replica accounting + dispatch target guard
 // (pure logic, unit-tested below). See PLAN-BUG-CH /
@@ -1099,31 +1131,6 @@ pub(crate) fn pick_backfill_target(
             !exclude.contains(id) && tiers.iter().any(|(t, has_room)| *t == tier && *has_room)
         })
         .map(|(id, _)| *id)
-}
-
-/// CNF-1 — the disk_id recorded into a new `ChunkLocationEntry` (AV-5-9
-/// read-back registration) must be the matching disk's `disk_id` FIELD —
-/// the key every reader resolves via `NodeInfo::disk` — never its Vec
-/// position. CR-3-4/MGR-8 — also filters out Failed/Removed disks: a
-/// dead disk of the right tier is not a valid registration target
-/// (the fresh replica would record a location `live_replica_tier` can
-/// never see, and the repair loop would re-copy it forever). Returns
-/// `None` when the target has no LIVE disk of the tier (pre-fix this
-/// silently fell back to disk_id 0, mis-registering a copy that may
-/// have actually landed on a different, live disk).
-#[inline]
-pub(crate) fn resolve_disk_id_for_tier(
-    node: Option<&dtfs_raft::NodeInfo>,
-    tier: DiskTier,
-) -> Option<u32> {
-    node.and_then(|n| {
-        n.disks
-            .iter()
-            .find(|d| {
-                d.tier == tier && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed)
-            })
-            .map(|d| d.disk_id)
-    })
 }
 
 /// Bug CH — dispatch-time guard: can this task's target possibly receive

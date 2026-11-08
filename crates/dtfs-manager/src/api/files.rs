@@ -329,6 +329,13 @@ pub(super) async fn start_path_migration(
         )
         .await;
 
+    if report.busy {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "scheduler busy advancing migrations, retry shortly" })),
+        ));
+    }
+
     state.audit_log.log(
         "api",
         "migration.path",

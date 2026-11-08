@@ -261,25 +261,6 @@ impl TieringEngine {
         apply_heartbeat_reads(chunk_id, &reads_by_dc, now_ms, &mut windows);
     }
 
-    /// Bug AV (AV-2-4) — return a snapshot of the read window for a
-    /// `(chunk_id, dc)` pair after pruning to `window_secs`. Used by
-    /// the tick path; safe to call concurrently.
-    async fn read_window_count(
-        &self,
-        chunk_id: &str,
-        dc: &str,
-        now_ms: u64,
-        window_secs: u64,
-    ) -> u32 {
-        let mut windows = self.read_windows.write().await;
-        let key = (chunk_id.to_string(), dc.to_string());
-        if let Some(ring) = windows.get_mut(&key) {
-            prune_read_window(ring, now_ms, window_secs);
-            return count_reads_in_window(ring, now_ms, window_secs);
-        }
-        0
-    }
-
     /// Evaluate all tracked chunks and classify their temperature.
     /// Schedules tier migration tasks for chunks whose temperature doesn't
     /// match their current tier.
@@ -579,7 +560,7 @@ impl TieringEngine {
             .collect();
         let outcomes = self
             .scheduler
-            .schedule_replications(&reqs, MAX_PROMOTIONS_PER_TICK)
+            .schedule_replications(&reqs, MAX_PROMOTIONS_PER_TICK, crate::scheduler::TIERING_MAX_LIVE_TASKS)
             .await;
         let deferred = outcomes.iter().filter(|o| **o == crate::scheduler::ScheduleOutcome::Deferred).count();
         if deferred > 0 || outcomes.contains(&crate::scheduler::ScheduleOutcome::Refused) {
@@ -640,6 +621,8 @@ impl TieringEngine {
         let grace_ms = promote_window_max
             .saturating_add(180)
             .saturating_mul(1_000);
+        // Load the migration state ONCE per tick, not once per demotion.
+        let active_pairs = self.scheduler.active_replication_pairs().await;
         for d in &plan.demotions {
             // AV-5-5 dispatcher re-check #1: between the planner's
             // snapshot and now, a replication.complete may have
@@ -663,11 +646,7 @@ impl TieringEngine {
             // span 90s+ and a stale demote plan would otherwise
             // race the PutChunk write, deleting the file off disk
             // mid-replication.
-            if self
-                .scheduler
-                .has_active_replication_to(&d.chunk_id, d.node_id)
-                .await
-            {
+            if active_pairs.contains(&(d.chunk_id.clone(), d.node_id)) {
                 continue;
             }
             // 1. Resolve the data-node's gRPC address.
@@ -805,7 +784,7 @@ impl TieringEngine {
                 if !seen_tiers.insert(disk.tier) {
                     continue;
                 }
-                let view = node_selection_view(*id, info, disk.tier);
+                let view = node_selection_view(*id, info, disk.tier, self.scheduler.placement_cfg());
                 if view.has_target_tier_disk {
                     node_views.push(view);
                 }
@@ -1273,12 +1252,16 @@ pub(crate) fn apply_heartbeat_reads(
         // flood of distinct chunk reads inside one tick grew it without
         // bound.
         if !windows.contains_key(&key) && windows.len() >= MAX_READ_WINDOW_KEYS {
-            if let Some(stalest) = windows
+            // Evict the stalest ~10% in ONE pass: a per-key full scan at the
+            // cap made every new key O(n).
+            let mut by_age: Vec<(u64, (String, String))> = windows
                 .iter()
-                .min_by_key(|(_, ring)| ring.iter().map(|s| s.ts_ms).max().unwrap_or(0))
-                .map(|(k, _)| k.clone())
-            {
-                windows.remove(&stalest);
+                .map(|(k, ring)| (ring.iter().map(|s| s.ts_ms).max().unwrap_or(0), k.clone()))
+                .collect();
+            let n = (MAX_READ_WINDOW_KEYS / 10).max(1).min(by_age.len());
+            by_age.select_nth_unstable_by_key(n - 1, |(ts, _)| *ts);
+            for (_, k) in by_age.into_iter().take(n) {
+                windows.remove(&k);
             }
         }
         let ring = windows.entry(key).or_default();
@@ -1513,11 +1496,13 @@ pub(crate) fn node_selection_view(
     node_id: u64,
     info: &dtfs_raft::NodeInfo,
     target_tier: DiskTier,
+    cfg: &dtfs_common::config::PlacementConfig,
 ) -> NodeSelectionView {
     use dtfs_common::types::{DiskStatus, HealthStatus};
     let has_target_tier_disk = info.disks.iter().any(|d| {
         d.tier == target_tier
             && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed)
+            && cfg.has_room(d.total_bytes, d.used_bytes)
     });
     // Any health state that means "don't place a new replica here".
     // `draining` is the selector's catch-all exclusion flag.
@@ -3068,6 +3053,12 @@ mod audit_co_tests {
     use dtfs_common::topology::Location;
     use dtfs_common::types::{DiskInfo, DiskStatus, DiskTier, HealthStatus, NodeRole};
     use dtfs_raft::NodeInfo;
+    use dtfs_common::config::PlacementConfig;
+
+    /// Zero headroom, so the 1 KB test disks count as having room until full.
+    fn no_headroom() -> PlacementConfig {
+        PlacementConfig { min_free_bytes: 0, min_free_pct: 0.0, ..Default::default() }
+    }
 
     fn disk(disk_id: u32, tier: DiskTier, status: DiskStatus) -> DiskInfo {
         DiskInfo {
@@ -3122,8 +3113,8 @@ mod audit_co_tests {
             HealthStatus::Healthy,
             vec![disk(0, DiskTier::Warm, DiskStatus::Healthy)],
         );
-        let va = node_selection_view(10, &a, DiskTier::Warm);
-        let vb = node_selection_view(11, &b, DiskTier::Warm);
+        let va = node_selection_view(10, &a, DiskTier::Warm, &no_headroom());
+        let vb = node_selection_view(11, &b, DiskTier::Warm, &no_headroom());
         assert!(
             !va.has_target_tier_disk,
             "cold-only node must not advertise a warm target disk"
@@ -3132,6 +3123,17 @@ mod audit_co_tests {
         // So the pure selector picks B, never the cold-only A.
         let pick = select_promotion_target(&[va, vb], "leli");
         assert_eq!(pick, Some(11));
+    }
+
+    /// A full disk of the target tier is not a promotion target.
+    #[test]
+    fn full_warm_disk_has_no_room_for_promotion() {
+        let mut d = disk(0, DiskTier::Warm, DiskStatus::Healthy);
+        d.used_bytes = d.total_bytes;
+        let full = node(10, "toro", HealthStatus::Healthy, vec![d]);
+        assert!(!node_selection_view(10, &full, DiskTier::Warm, &no_headroom()).has_target_tier_disk);
+        let roomy = node(11, "toro", HealthStatus::Healthy, vec![disk(0, DiskTier::Warm, DiskStatus::Healthy)]);
+        assert!(node_selection_view(11, &roomy, DiskTier::Warm, &no_headroom()).has_target_tier_disk);
     }
 
     /// CO-4-5 — a Failed/Removed disk of the target tier doesn't count.
@@ -3143,14 +3145,14 @@ mod audit_co_tests {
             HealthStatus::Healthy,
             vec![disk(0, DiskTier::Warm, DiskStatus::Failed)],
         );
-        assert!(!node_selection_view(10, &n, DiskTier::Warm).has_target_tier_disk);
+        assert!(!node_selection_view(10, &n, DiskTier::Warm, &no_headroom()).has_target_tier_disk);
         let n2 = node(
             10,
             "toro",
             HealthStatus::Healthy,
             vec![disk(0, DiskTier::Warm, DiskStatus::Removed)],
         );
-        assert!(!node_selection_view(10, &n2, DiskTier::Warm).has_target_tier_disk);
+        assert!(!node_selection_view(10, &n2, DiskTier::Warm, &no_headroom()).has_target_tier_disk);
     }
 
     /// CO-4-5 — Down/Failed/Quarantined nodes are excluded
@@ -3170,7 +3172,7 @@ mod audit_co_tests {
                 bad,
                 vec![disk(0, DiskTier::Warm, DiskStatus::Healthy)],
             );
-            let v = node_selection_view(10, &n, DiskTier::Warm);
+            let v = node_selection_view(10, &n, DiskTier::Warm, &no_headroom());
             assert!(v.draining, "{bad:?} node must be flagged excluded");
             assert_eq!(
                 select_promotion_target(&[v], "toro"),
@@ -3637,6 +3639,27 @@ mod audit_co_tests {
             "read_windows key set must stay <= MAX (got {})",
             windows.len()
         );
+    }
+
+    /// At the cap, a new key evicts the stalest ~10% in one pass (so the
+    /// next ~1000 new keys do not each rescan the map), keeping the newest.
+    #[test]
+    fn read_window_eviction_is_batched_and_drops_the_stalest() {
+        let mut windows: HashMap<(String, String), Vec<ReadSample>> = HashMap::new();
+        let mut reads = HashMap::new();
+        reads.insert("dc-a".to_string(), 1u32);
+        for i in 0..MAX_READ_WINDOW_KEYS as u64 {
+            apply_heartbeat_reads(&format!("c{i}"), &reads, 1_000 + i, &mut windows);
+        }
+        assert_eq!(windows.len(), MAX_READ_WINDOW_KEYS);
+        apply_heartbeat_reads("new", &reads, 9_999_999, &mut windows);
+        let evicted = MAX_READ_WINDOW_KEYS / 10;
+        assert_eq!(windows.len(), MAX_READ_WINDOW_KEYS - evicted + 1);
+        let k = |c: &str| (c.to_string(), "dc-a".to_string());
+        assert!(!windows.contains_key(&k("c0")));
+        assert!(!windows.contains_key(&k(&format!("c{}", evicted - 1))));
+        assert!(windows.contains_key(&k(&format!("c{evicted}"))));
+        assert!(windows.contains_key(&k("new")));
     }
 
     #[test]

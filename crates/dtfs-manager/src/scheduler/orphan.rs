@@ -924,19 +924,6 @@ pub(crate) fn orphan_sweep_allowed(
     in_state_chunks > 0
 }
 
-/// CR2-7-3 / MGR-13 — pure model of the abort decision `orphan_scrub_tick`
-/// makes at every per-node and per-delete-batch checkpoint: given the
-/// sequence of `(is_leader, last_applied, last_log_index, in_state_chunks)`
-/// samples observed at each checkpoint (in order), return the index of the
-/// FIRST one that fails `orphan_sweep_allowed`, or `None` if every
-/// checkpoint stayed clear. The real loop `break`s at exactly that point,
-/// so no delete batch after it is ever attempted.
-pub(crate) fn first_sweep_abort_index(checks: &[(bool, u64, u64, usize)]) -> Option<usize> {
-    checks
-        .iter()
-        .position(|&(leader, applied, last_log, n)| !orphan_sweep_allowed(leader, applied, last_log, n))
-}
-
 /// REV-3-5 — how many consecutive memory-pressure skips the scheduler
 /// tolerates before it runs a tick anyway.
 ///

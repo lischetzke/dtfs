@@ -476,18 +476,19 @@ impl TaskScheduler {
             max_tasks,
         );
 
-        // Dispatch the planned tasks. `schedule_replication` already
-        // deduplicates so a retry of this call is safe.
-        for action in &plan {
-            self.schedule_replication(
-                &action.chunk_hash,
-                action.source_node,
-                action.target_node,
-                action.tier,
-            )
+        // Dispatch the planned tasks in ONE batch. Scheduling deduplicates
+        // so a retry of this call is safe; only NEW tasks are reported.
+        let reqs: Vec<(&str, u64, u64, DiskTier)> = plan
+            .iter()
+            .map(|a| (a.chunk_hash.as_str(), a.source_node, a.target_node, a.tier))
+            .collect();
+        let outcomes = self
+            .schedule_replications(&reqs, usize::MAX, MAX_LIVE_TASKS)
             .await;
-        }
-        report.tasks_scheduled = plan.len();
+        // `max_new` is unbounded here, so Deferred means the tick holds the
+        // migration state: report busy so the REST layer answers 503.
+        report.busy = outcomes.contains(&ScheduleOutcome::Deferred);
+        report.tasks_scheduled = new_task_count(&outcomes);
 
         info!(
             prefix = %path_prefix,
@@ -1185,6 +1186,12 @@ pub(super) async fn advance_round<O: MigrationOps>(
             (task.chunk_id.clone(), task.target_node, task.tier, task.source_node)
         };
 
+        // Once-per-call registration guard (shares the `verified` set under a
+        // "reg:" key): a failing register must burn one attempt per tick,
+        // not one per round.
+        if !verified.insert(format!("reg:{task_id}")) {
+            continue;
+        }
         let landed = state.landed_disks.get(task_id).copied();
         match ops.register_replica_on(&chunk_id, target_node, tier, landed).await {
             Ok(()) => {
@@ -1593,6 +1600,10 @@ pub struct PathMigrationReport {
     /// Chunks past `max_tasks` we walked but did not schedule. The next call
     /// with the same prefix will pick them up.
     pub truncated_chunks: usize,
+    /// The scheduler tick held the migration state, nothing was scheduled;
+    /// the caller should retry (REST: 503).
+    #[serde(default)]
+    pub busy: bool,
     /// Up to 5 illustrative entries so the operator can see *which* paths
     /// hit `no_source` / `no_target` without dumping the full list.
     pub examples: Vec<PathMigrationExample>,

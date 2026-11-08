@@ -112,7 +112,7 @@ impl TaskScheduler {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let cooldown_until_ms = now_ms.saturating_add(cooldown_secs * 1000);
+        let cooldown_until_ms = now_ms.saturating_add(cooldown_secs.saturating_mul(1000));
 
         // Group affected chunk_indexes per file_path for one
         // SetChunkCooldown write per file at the end.
@@ -361,23 +361,6 @@ pub struct FlushCacheReport {
     /// list internally to emit audit log entries and an alert; tests
     /// inspect it to verify the planner's refusal classification.
     #[serde(skip)] pub(crate) refusals: Vec<FlushRefusal>,
-}
-
-/// Bug BH — true if `entries` already records a replica of this chunk on
-/// the exact `(node_id, disk_id)` slot. The anchor-lag-repair completion
-/// path used to dedup on `node_id` alone, which on a no-spare-node
-/// multi-tier topology (target already holds the chunk on its warm disk)
-/// silently dropped the new *cold* anchor entry — `disk_id` is already
-/// tier-resolved (AV-5-9 `resolved_disk_id`), so `(node_id, disk_id)` is
-/// the exact `(node, tier)` slot and the correct dedup key.
-pub(crate) fn replica_already_present(
-    entries: &[ChunkLocationEntry],
-    node_id: &str,
-    disk_id: u32,
-) -> bool {
-    entries
-        .iter()
-        .any(|c| c.node_id == node_id && c.disk_id == disk_id)
 }
 
 /// Bug AV — pure planner kernel. Walks the snapshot, identifies cache-
