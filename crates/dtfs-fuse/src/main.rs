@@ -69,6 +69,9 @@ async fn main() -> Result<()> {
         .client
         .validate()
         .map_err(|e| anyhow::anyhow!(e))?;
+    fuse_config
+        .validate_intervals()
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let mountpoint = args
         .mountpoint

@@ -67,6 +67,8 @@ async fn main() -> anyhow::Result<()> {
     config.placement.validate().map_err(|e| anyhow::anyhow!(e))?;
     // CR2-8-1 (CMN-3) — reject an unusable message-size cap at startup.
     config.grpc.validate().map_err(|e| anyhow::anyhow!(e))?;
+    // A zero interval would panic the spawned tiering/monitor task.
+    config.validate_intervals().map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!(
         "Manager {} at {} ({})",
