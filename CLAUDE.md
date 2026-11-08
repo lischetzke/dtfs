@@ -128,7 +128,7 @@ Every logic change ships a **positive** test (intended outcome) and a **negative
 
 ## B.5 Where things live
 
-`crates/<crate>/src/` · `proto/` · `docs/src/` (history: `docs/src/internals/invariants.md`) · `scripts/` · `tools/` (host Python, outside Docker loop) · `deploy/examples/*.toml` · `.claude/{agents,rules,hooks}/`. No root status files, no loose `.md` under `crates/`/`tests/`, no in-repo changelog. `dtfs-common/src/config.rs` changes update examples + docs together (`.claude/rules/config-surface.md`).
+`crates/<crate>/src/` · `proto/` · `docs/src/` · `scripts/` · `tools/` (host Python, outside Docker loop) · `deploy/examples/*.toml` · `.claude/{agents,rules,hooks}/`. No root status files, no loose `.md` under `crates/`/`tests/`, no in-repo changelog. `dtfs-common/src/config.rs` changes update examples + docs together (`.claude/rules/config-surface.md`).
 
 ## B.6 Updating this file
 
