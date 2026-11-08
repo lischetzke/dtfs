@@ -158,7 +158,7 @@ listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
 #quick_interval_secs = 21600        # 6 h: stat + size + meta presence
 #deep_interval_secs = 604800        # 7 d: full BLAKE3 verify
 #orphan_interval_secs = 86400       # 1 d: ListChunks vs chunk_locations cross-check
-#orphan_grace_secs = 86400          # 1 d: grace before reaping an orphan (vs .dat mtime, Bug CB)
+#orphan_grace_secs = 86400          # 1 d: grace before reaping an orphan (vs .dat mtime, Bug CB); minimum 21600 (6 h)
 #max_io_percent = 10
 #verify_on_read = true              # hash-verify every read. Disabling needs an
                                     # explicit API ack and is the only mode where

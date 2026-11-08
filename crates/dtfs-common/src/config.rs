@@ -727,6 +727,22 @@ impl TieringConfig {
     }
 }
 
+/// Floor for `[scrub] orphan_grace_secs`: the orphan reaper must not race
+/// the commit-to-raft-apply window of an in-flight write.
+pub const MIN_ORPHAN_GRACE_SECS: u64 = 6 * 3600;
+
+impl ClusterScrubConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.orphan_grace_secs < MIN_ORPHAN_GRACE_SECS {
+            return Err(format!(
+                "[scrub] orphan_grace_secs ({}) must be >= {} (6 h)",
+                self.orphan_grace_secs, MIN_ORPHAN_GRACE_SECS
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl MonitoringConfig {
     pub fn validate(&self) -> Result<(), String> {
         nonzero("[monitoring] heartbeat_interval_secs", self.heartbeat_interval_secs)?;
@@ -755,6 +771,7 @@ impl ManagerConfig {
     pub fn validate_intervals(&self) -> Result<(), String> {
         self.tiering.validate()?;
         self.monitoring.validate()?;
+        self.scrub.validate()?;
         self.raft.validate_timings()
     }
 }
@@ -2026,12 +2043,23 @@ max_io_percent = 10
     /// knobs are honoured even when an operator sets them to the
     /// risky values.
     #[test]
+    fn orphan_grace_below_floor_is_rejected() {
+        let mut c = ClusterScrubConfig::default();
+        assert!(c.validate().is_ok());
+        c.orphan_grace_secs = MIN_ORPHAN_GRACE_SECS;
+        assert!(c.validate().is_ok(), "boundary is inclusive");
+        c.orphan_grace_secs = MIN_ORPHAN_GRACE_SECS - 1;
+        let e = c.validate().unwrap_err();
+        assert!(e.contains("orphan_grace_secs"), "{e}");
+    }
+
+    #[test]
     fn bug_bc_1_cluster_scrub_config_overrides_apply() {
         let cfg: ClusterScrubConfig = toml::from_str(r#"
 quick_interval_secs    = 600
 deep_interval_secs     = 3600
 orphan_interval_secs   = 7200
-orphan_grace_secs      = 60
+orphan_grace_secs      = 21600
 max_io_percent         = 25
 verify_on_read         = false
 quarantine_on_fault    = false
@@ -2040,7 +2068,7 @@ auto_unquarantine_secs = 3600
         assert_eq!(cfg.quick_interval_secs, 600);
         assert_eq!(cfg.deep_interval_secs, 3600);
         assert_eq!(cfg.orphan_interval_secs, 7200);
-        assert_eq!(cfg.orphan_grace_secs, 60);
+        assert_eq!(cfg.orphan_grace_secs, 21600);
         assert_eq!(cfg.max_io_percent, 25);
         assert!(!cfg.verify_on_read,
             "operator may disable verify_on_read; the API-level ack guard \

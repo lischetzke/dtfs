@@ -165,7 +165,7 @@ Cluster scrub and integrity policy. The manager sends it to every data node in e
 | `quick_interval_secs` | u64 | `21600` (6 h) | Stat, size and `.meta` presence. Values below 60 are raised to 60. |
 | `deep_interval_secs` | u64 | `604800` (7 d) | Full BLAKE3 verify. Values below 60 are raised to 60. |
 | `orphan_interval_secs` | u64 | `86400` | Data-node `ListChunks` versus metadata cross-check. |
-| `orphan_grace_secs` | u64 | `86400` | Grace before an orphan is reaped, measured against the `.dat` mtime. |
+| `orphan_grace_secs` | u64 | `86400` | Grace before an orphan is reaped, measured against the `.dat` mtime. Minimum `21600` (6 h); lower values fail startup. |
 | `max_io_percent` | u32 | `10` | Scrub I/O throttle. |
 | `verify_on_read` | bool | `true` | Hash every read before bytes leave the data node. Disabling is the only mode in which reads can return corrupt bytes. |
 | `quarantine_on_fault` | bool | `true` | `true`: a single integrity fault quarantines the faulting node, both on the data node (self-quarantine) and on the manager (fault reported in a heartbeat). `false`: faults are recorded and reported, nothing is quarantined. |

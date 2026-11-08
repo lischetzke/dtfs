@@ -43,7 +43,7 @@ pane, observe the reap audit lines, then restore defaults.
    ```
    The two fields to lower:
    - `scrub.orphan_interval_secs = 300` (5 min tick)
-   - `scrub.orphan_grace_secs    = 60`  (1 min before reap)
+   - `scrub.orphan_grace_secs    = 21600`  (6 h, the enforced minimum)
    
    `write_to_disk:false` keeps the change live-only — a manager
    restart returns defaults. Operationally safer for a one-shot
@@ -84,7 +84,7 @@ pane, observe the reap audit lines, then restore defaults.
   makes the manager DEFER reaping — `orphan.reaped` will not advance
   until the data nodes are upgraded. If a drain stalls with zero reaps,
   confirm the data-node build carries Bug CB (`dtfs-data --version`).
-- Lowering `orphan_grace_secs` below 60 s risks reaping
+- Lowering `orphan_grace_secs` below 21600 s (6 h) is rejected at startup because it risks reaping
   in-flight writes (commit-to-raft-apply window). Don't go lower.
 - This is a CLUSTER-WIDE knob. Every data node will run the
   same accelerated cadence while the override is live.
