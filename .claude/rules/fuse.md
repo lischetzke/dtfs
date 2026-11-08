@@ -57,17 +57,20 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   index" = zeros; "chunk with no live address" keeps refusing at commit.
 - After a commit, `mark_committed_and_refresh` merges the committed chunks
   into each handle's snapshot and the metadata cache entry
-  (`merge_into_snapshot`: replace the index, grow size). It re-fetches the
-  whole file (and drops the cache entry) when a handle has no snapshot, the
-  commit was lease-less, the snapshot is positional/sizeless, another commit
-  on the path overlapped it (`CommitTracker`; commits are not serialized per
-  path, so merge order may differ from apply order), or the committing fh is
-  closed/detached (`merge_allowed`); never re-fetch per batch
-  (quadratic on big files). Snapshots are `Arc<FileLocations>` (handles and
-  metadata cache): read()/write() clone the Arc, never the chunk list; the
-  merge is copy-on-write (`merge_shared`).
-- A failed post-commit locations refresh sets the handles' `locations` to
-  `None`; `write()`/`read()` must `refetch_locations` before using them.
+  (`merge_into_snapshot`: replace the index, grow size). Instead it sets the
+  handles' `locations = None` (and drops the cache entry) when a handle has
+  no snapshot, the commit was lease-less, the snapshot is positional/
+  sizeless, another commit on the path overlapped it (`CommitTracker`;
+  commits are not serialized per path, so merge order may differ from apply
+  order), or the committing fh is closed/detached (`merge_allowed`). Never
+  eager-fetch after a commit (fetch results can land out of order) and never
+  per batch (quadratic on big files). `refetch_locations` installs a fetch
+  only if no commit on the path overlapped it (`FetchToken::may_install`;
+  one retry, else the caller uses it uninstalled). Snapshots are
+  `Arc<FileLocations>` (handles and metadata cache): read()/write() clone
+  the Arc, never the chunk list; the merge is copy-on-write (`merge_shared`).
+- Handle `locations = None` means stale; `write()`/`read()` must
+  `refetch_locations` before using them.
 - `rename` over a path with open writers and `unlink`/`rmdir` of one
   detach those handles (`detach_handles`: path becomes `<path>\0detached-N`,
   unresolvable by the manager) so their commits fail instead of landing in

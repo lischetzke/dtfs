@@ -394,11 +394,45 @@ impl std::error::Error for LeaseBusy {}
 pub(crate) const WRITE_LEASE_MS: u64 = 120_000;
 pub(crate) const WRITE_LEASE_RENEW_AFTER_MS: u64 = 60_000;
 
-/// Per-path `(in_flight, generation)` of commit RPCs. There is no per-path
-/// commit serialization, so a post-commit merge is only order-safe when no
-/// other commit on the path overlapped this one (`CommitToken::exclusive`).
+/// Per-path `(commits_in_flight, generation, fetches_in_flight)`. There is no
+/// per-path commit serialization, so a post-commit merge is only order-safe
+/// when no other commit on the path overlapped this one
+/// (`CommitToken::exclusive`), and a full fetch may only be installed when
+/// no commit overlapped the fetch (`FetchToken::may_install`). The entry
+/// lives while any commit or fetch is in flight, so generations compare.
 #[derive(Default)]
-struct CommitTracker(DashMap<String, (u32, u64)>);
+struct CommitTracker(DashMap<String, (u32, u64, u32)>);
+
+/// One full locations fetch's tracker slot (dropped = fetch over).
+struct FetchToken<'a> {
+    tracker: &'a CommitTracker,
+    path: String,
+    generation: u64,
+    quiet_at_start: bool,
+}
+
+impl FetchToken<'_> {
+    /// True iff no commit on the path was in flight at the fetch's start or
+    /// end and none started in between: the result is not older than any
+    /// commit applied meanwhile, so it may be installed on the handles.
+    fn may_install(&self) -> bool {
+        self.quiet_at_start
+            && self
+                .tracker
+                .0
+                .get(&self.path)
+                .is_some_and(|e| (e.0, e.1) == (0, self.generation))
+    }
+}
+
+impl Drop for FetchToken<'_> {
+    fn drop(&mut self) {
+        self.tracker.0.remove_if_mut(&self.path, |_, e| {
+            e.2 -= 1;
+            e.0 == 0 && e.2 == 0
+        });
+    }
+}
 
 /// One commit's tracker slot; dropping it (success or any error path) ends
 /// the commit and removes the path's entry at zero.
@@ -411,13 +445,22 @@ struct CommitToken<'a> {
 
 impl CommitTracker {
     fn begin(&self, path: &str) -> CommitToken<'_> {
-        let (in_flight, generation) = {
-            let mut e = self.0.entry(path.to_string()).or_insert((0, 0));
+        let (in_flight, generation, _) = {
+            let mut e = self.0.entry(path.to_string()).or_insert((0, 0, 0));
             e.0 += 1;
             e.1 += 1;
             *e
         };
         CommitToken { tracker: self, path: path.to_string(), generation, overlapped: in_flight > 1 }
+    }
+
+    fn begin_fetch(&self, path: &str) -> FetchToken<'_> {
+        let (in_flight, generation, _) = {
+            let mut e = self.0.entry(path.to_string()).or_insert((0, 0, 0));
+            e.2 += 1;
+            *e
+        };
+        FetchToken { tracker: self, path: path.to_string(), generation, quiet_at_start: in_flight == 0 }
     }
 }
 
@@ -425,7 +468,11 @@ impl CommitToken<'_> {
     /// True iff this was the only commit on the path for its whole window.
     fn exclusive(&self) -> bool {
         !self.overlapped
-            && self.tracker.0.get(&self.path).is_some_and(|e| *e == (1, self.generation))
+            && self
+                .tracker
+                .0
+                .get(&self.path)
+                .is_some_and(|e| (e.0, e.1) == (1, self.generation))
     }
 }
 
@@ -434,7 +481,7 @@ impl Drop for CommitToken<'_> {
         // Generations only compare overlapping windows, so resetting at zero is safe.
         self.tracker.0.remove_if_mut(&self.path, |_, e| {
             e.0 -= 1;
-            e.0 == 0
+            e.0 == 0 && e.2 == 0
         });
     }
 }
@@ -2818,24 +2865,13 @@ impl DtfsFilesystem {
             }
             return;
         }
-        match self.fetch_file_locations(path).await {
-            Ok(fresh) => {
-                let fresh = Arc::new(fresh);
-                for mut entry in self.open_files.iter_mut() {
-                    if entry.value().path == path {
-                        entry.value_mut().locations = Some(fresh.clone());
-                    }
-                }
-                // The cache entry stays dropped: a concurrent commit may
-                // land after this fetch; getattr re-fetches it.
-            }
-            Err(e) => {
-                // Stale handle snapshots would zero-seed over the chunks just
-                // committed; drop them so write()/read() re-fetch first.
-                error!(path, error = %e, "post-commit locations refresh failed; marking handle locations stale");
-                self.invalidate_handle_locations(path);
-            }
-        }
+        // No eager re-fetch: with overlapping commits a fetch result can land
+        // after a newer one and hide a committed chunk. Mark the handles
+        // stale (cache entry already dropped); read()/write() re-fetch
+        // lazily through `refetch_locations`, which installs only a result
+        // no commit overlapped.
+        debug!(path, "post-commit merge not applicable; marking handle locations stale");
+        self.invalidate_handle_locations(path);
     }
 
     /// Mark every handle of `path` stale (`locations = None`); the next
@@ -2848,20 +2884,35 @@ impl DtfsFilesystem {
         }
     }
 
-    /// Re-fetch `path`'s locations and install them on every handle of it.
+    /// Re-fetch `path`'s locations and install them on every handle of it,
+    /// but only when no commit on the path overlapped the fetch (else a
+    /// result older than a concurrent commit could replace a newer snapshot).
+    /// One retry; after that the caller gets the result for its own use and
+    /// the handles are left as they are.
     async fn refetch_locations(&self, path: &str) -> Result<Arc<FileLocations>> {
         self.metadata_cache.remove(path);
-        let fresh = Arc::new(
-            self.fetch_file_locations(path)
-                .await
-                .with_context(|| format!("stale locations for {path} and re-fetch failed"))?,
-        );
-        for mut entry in self.open_files.iter_mut() {
-            if entry.value().path == path {
-                entry.value_mut().locations = Some(fresh.clone());
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let fetch = self.commit_tracker.begin_fetch(path);
+            let fresh = Arc::new(
+                self.fetch_file_locations(path)
+                    .await
+                    .with_context(|| format!("stale locations for {path} and re-fetch failed"))?,
+            );
+            if fetch.may_install() {
+                for mut entry in self.open_files.iter_mut() {
+                    if entry.value().path == path {
+                        entry.value_mut().locations = Some(fresh.clone());
+                    }
+                }
+                return Ok(fresh);
+            }
+            if attempts == 2 {
+                debug!(path, "locations re-fetch overlapped a commit twice; not installing");
+                return Ok(fresh);
             }
         }
-        Ok(fresh)
     }
 
     /// Read chunk `chunk_idx` of `locations` for an RMW seed, walking the
@@ -4419,6 +4470,30 @@ mod commit_tracker_tests {
         assert_eq!(t.0.get("/f").map(|e| e.0), Some(1));
         drop(b);
         assert!(t.0.is_empty());
+    }
+
+    /// Simulated reorder: a fetch taken before a concurrent commit (started
+    /// and even finished during the fetch) must not be installed; neither may
+    /// one started while a commit was in flight. A quiet fetch may.
+    #[test]
+    fn fetch_overlapping_a_commit_is_not_installed() {
+        let t = CommitTracker::default();
+        let f = t.begin_fetch("/f");
+        drop(t.begin("/f"));
+        assert!(!f.may_install(), "a commit applied during the fetch makes it stale");
+        drop(f);
+        let c = t.begin("/f");
+        let f = t.begin_fetch("/f");
+        drop(c);
+        assert!(!f.may_install(), "fetch started while a commit was in flight");
+        drop(f);
+        assert!(t.0.is_empty(), "entry removed once no commit or fetch is in flight");
+        let f = t.begin_fetch("/f");
+        let _other_path = t.begin("/g");
+        assert!(f.may_install(), "quiet fetch (other paths do not count) is installed");
+        let c = t.begin("/f");
+        assert!(!f.may_install(), "a commit in flight at the fetch's end blocks install");
+        assert!(c.exclusive(), "a fetch does not make a commit non-exclusive");
     }
 
     /// A detached fh (unlink/rename moved it) or a closed fh must not merge
