@@ -394,6 +394,65 @@ impl std::error::Error for LeaseBusy {}
 pub(crate) const WRITE_LEASE_MS: u64 = 120_000;
 pub(crate) const WRITE_LEASE_RENEW_AFTER_MS: u64 = 60_000;
 
+/// Per-path `(in_flight, generation)` of commit RPCs. There is no per-path
+/// commit serialization, so a post-commit merge is only order-safe when no
+/// other commit on the path overlapped this one (`CommitToken::exclusive`).
+#[derive(Default)]
+struct CommitTracker(DashMap<String, (u32, u64)>);
+
+/// One commit's tracker slot; dropping it (success or any error path) ends
+/// the commit and removes the path's entry at zero.
+struct CommitToken<'a> {
+    tracker: &'a CommitTracker,
+    path: String,
+    generation: u64,
+    overlapped: bool,
+}
+
+impl CommitTracker {
+    fn begin(&self, path: &str) -> CommitToken<'_> {
+        let (in_flight, generation) = {
+            let mut e = self.0.entry(path.to_string()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += 1;
+            *e
+        };
+        CommitToken { tracker: self, path: path.to_string(), generation, overlapped: in_flight > 1 }
+    }
+}
+
+impl CommitToken<'_> {
+    /// True iff this was the only commit on the path for its whole window.
+    fn exclusive(&self) -> bool {
+        !self.overlapped
+            && self.tracker.0.get(&self.path).is_some_and(|e| *e == (1, self.generation))
+    }
+}
+
+impl Drop for CommitToken<'_> {
+    fn drop(&mut self) {
+        // Generations only compare overlapping windows, so resetting at zero is safe.
+        self.tracker.0.remove_if_mut(&self.path, |_, e| {
+            e.0 -= 1;
+            e.0 == 0
+        });
+    }
+}
+
+/// The chunks a commit registered plus its tracker slot (`None` chunks = a
+/// lease-less commit, which the manager unions: re-fetch instead).
+struct Committed<'a> {
+    chunks: Option<Vec<ChunkInfo>>,
+    token: Option<CommitToken<'a>>,
+}
+
+/// Post-commit: may the committed chunks be merged locally? Only for an
+/// exclusive commit whose fh is still open on the same path (a detached
+/// handle or a file re-created under the path must re-fetch).
+fn merge_allowed(exclusive: bool, fh_path: Option<&str>, path: &str) -> bool {
+    exclusive && fh_path == Some(path)
+}
+
 /// An open file handle with its associated state.
 struct OpenFile {
     path: String,
@@ -505,6 +564,8 @@ pub struct DtfsFilesystem {
     /// Known node locations for nearest-node selection.
     /// Populated as we discover node addresses from metadata responses.
     known_locations: DashMap<String, Location>,
+    /// In-flight commits per path; gates the post-commit incremental merge.
+    commit_tracker: CommitTracker,
     /// P0-1: prefix used for write-lease `owner_id` values. Format:
     /// `<hostname>:<pid>:`. The per-open `:<fh>` suffix is appended at
     /// open-time to make each owner_id unique within the process.
@@ -581,6 +642,7 @@ impl DtfsFilesystem {
             )),
             foreground_inflight: DashMap::new(),
             known_locations: DashMap::new(),
+            commit_tracker: CommitTracker::default(),
             lease_owner_prefix,
             local_cache: None,
         }
@@ -1421,7 +1483,7 @@ impl DtfsFilesystem {
                                 return Err(e);
                             }
                         };
-                        self.mark_committed_and_refresh(&path, committed.as_deref()).await;
+                        self.mark_committed_and_refresh(&path, fh, committed).await;
                     }
                 }
                 let zeros = vec![0u8; n];
@@ -1447,7 +1509,7 @@ impl DtfsFilesystem {
                         return Err(e);
                     }
                 };
-                self.mark_committed_and_refresh(&path, committed.as_deref()).await;
+                self.mark_committed_and_refresh(&path, fh, committed).await;
             }
         }
 
@@ -1471,7 +1533,7 @@ impl DtfsFilesystem {
                     return Err(e);
                 }
             };
-            self.mark_committed_and_refresh(&path, committed.as_deref()).await;
+            self.mark_committed_and_refresh(&path, fh, committed).await;
         }
 
         debug!(
@@ -1597,7 +1659,7 @@ impl DtfsFilesystem {
         let mut committed = None;
         if had_segments {
             match self.flush_segments_to_cluster(&path, &segments).await {
-                Ok(c) => committed = c,
+                Ok(c) => committed = Some(c),
                 Err(e) => {
                 // CR-1-4 (FUSE-3): ALWAYS restore the drained segments on a
                 // cluster-write failure, regardless of whether this file
@@ -1627,8 +1689,8 @@ impl DtfsFilesystem {
 
         // CR-1-4 + F-029: mark every handle of the path committed and refresh
         // their locations so reads on the same fd see the new chunks.
-        if had_segments {
-            self.mark_committed_and_refresh(&path, committed.as_deref()).await;
+        if let Some(committed) = committed {
+            self.mark_committed_and_refresh(&path, fh, committed).await;
         }
 
         debug!(path = %path, "flush complete");
@@ -2411,15 +2473,15 @@ impl DtfsFilesystem {
     ///
     /// Allocates placements from the manager and writes each segment to
     /// the assigned data node. On success returns the committed chunks as
-    /// `ChunkInfo`s for `mark_committed_and_refresh`, or `None` when the
-    /// commit was lease-less (the caller must re-fetch instead of merging).
+    /// `ChunkInfo`s for `mark_committed_and_refresh` (`None` when the commit
+    /// was lease-less) plus the commit's tracker slot, held until the merge.
     async fn flush_segments_to_cluster(
         &self,
         path: &str,
         segments: &[crate::writebuf::ChunkSegment],
-    ) -> Result<Option<Vec<ChunkInfo>>> {
+    ) -> Result<Committed<'_>> {
         if segments.is_empty() {
-            return Ok(Some(Vec::new()));
+            return Ok(Committed { chunks: Some(Vec::new()), token: None });
         }
 
         // R2 (FUSE-7(c)) — refuse up front to commit a segment that starts
@@ -2670,6 +2732,8 @@ impl DtfsFilesystem {
             .find_lease_id_for_path(path)
             .unwrap_or_default();
 
+        // Dropped on the `?` below, so a failed commit ends its slot too.
+        let token = self.commit_tracker.begin(path);
         self.client
             .commit_chunk_locations(path, &volume_id, commits, &lease_id)
             .await
@@ -2677,7 +2741,7 @@ impl DtfsFilesystem {
 
         // A lease-less commit is union-merged by the manager, so the local
         // replace-merge would not match it: make the caller re-fetch.
-        Ok((!lease_id.is_empty()).then_some(committed))
+        Ok(Committed { chunks: (!lease_id.is_empty()).then_some(committed), token: Some(token) })
     }
 
     /// True iff some open handle on `path` is writable.
@@ -2707,7 +2771,15 @@ impl DtfsFilesystem {
     /// file is re-fetched only when some handle cannot take the merge
     /// (`merge_into_snapshot`), since a per-batch full re-fetch is quadratic
     /// in file size.
-    async fn mark_committed_and_refresh(&self, path: &str, committed: Option<&[ChunkInfo]>) {
+    async fn mark_committed_and_refresh(&self, path: &str, fh: u64, committed: Committed<'_>) {
+        // `_token` stays alive through any re-fetch below, so a commit that
+        // starts meanwhile sees the overlap and re-fetches after this one.
+        let Committed { chunks, token: _token } = committed;
+        let exclusive = _token.as_ref().is_some_and(|t| t.exclusive());
+        let fh_path = self.open_files.get(&fh).map(|f| f.path.clone());
+        let committed = chunks
+            .as_deref()
+            .filter(|_| merge_allowed(exclusive, fh_path.as_deref(), path));
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -2754,7 +2826,8 @@ impl DtfsFilesystem {
                         entry.value_mut().locations = Some(fresh.clone());
                     }
                 }
-                self.cache_metadata(path, fresh);
+                // The cache entry stays dropped: a concurrent commit may
+                // land after this fetch; getattr re-fetches it.
             }
             Err(e) => {
                 // Stale handle snapshots would zero-seed over the chunks just
@@ -4292,5 +4365,69 @@ mod w3_write_hole_tests {
     fn created_file_committed_any_follows_chunks() {
         assert!(!committed_any_from_created_snapshot(0));
         assert!(committed_any_from_created_snapshot(1));
+    }
+}
+
+#[cfg(test)]
+mod commit_tracker_tests {
+    use super::{merge_allowed, CommitTracker};
+
+    /// Back-to-back commits on one path are each exclusive (merge allowed).
+    #[test]
+    fn sequential_commits_are_exclusive() {
+        let t = CommitTracker::default();
+        let a = t.begin("/f");
+        assert!(a.exclusive());
+        drop(a);
+        let b = t.begin("/f");
+        assert!(b.exclusive());
+        // Another path never interferes.
+        let other = t.begin("/g");
+        assert!(b.exclusive() && other.exclusive());
+    }
+
+    /// Overlapping commits X, Y on one path: neither may merge (manager
+    /// apply order is unknown), even after the other one finished.
+    #[test]
+    fn overlapping_commits_force_full_refetch() {
+        let t = CommitTracker::default();
+        let x = t.begin("/f");
+        let y = t.begin("/f");
+        assert!(!x.exclusive(), "a later commit started inside X's window");
+        assert!(!y.exclusive(), "Y started while X was in flight");
+        drop(x);
+        assert!(!y.exclusive(), "Y overlapped X even though X has finished");
+        drop(y);
+        assert!(t.begin("/f").exclusive(), "a fresh commit after both is exclusive");
+    }
+
+    /// The slot is released on an error return (drop guard) and the path's
+    /// entry is removed at zero.
+    #[test]
+    fn tracker_entry_cleaned_up_on_error_path() {
+        let t = CommitTracker::default();
+        let failing = || -> Result<(), &'static str> {
+            let _token = t.begin("/f");
+            Err("commit_chunk_locations failed")?;
+            Ok(())
+        };
+        assert_eq!(failing(), Err("commit_chunk_locations failed"));
+        assert!(t.0.is_empty(), "entry must be removed when no commit is in flight");
+        let a = t.begin("/f");
+        let b = t.begin("/f");
+        drop(a);
+        assert_eq!(t.0.get("/f").map(|e| e.0), Some(1));
+        drop(b);
+        assert!(t.0.is_empty());
+    }
+
+    /// A detached fh (unlink/rename moved it) or a closed fh must not merge
+    /// into whatever now lives under the path; same path + exclusive may.
+    #[test]
+    fn detached_or_closed_fh_never_merges() {
+        assert!(merge_allowed(true, Some("/f"), "/f"));
+        assert!(!merge_allowed(true, Some("/f\0detached-3"), "/f"));
+        assert!(!merge_allowed(true, None, "/f"));
+        assert!(!merge_allowed(false, Some("/f"), "/f"));
     }
 }

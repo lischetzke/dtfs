@@ -58,8 +58,11 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 - After a commit, `mark_committed_and_refresh` merges the committed chunks
   into each handle's snapshot and the metadata cache entry
   (`merge_into_snapshot`: replace the index, grow size). It re-fetches the
-  whole file only when a handle has no snapshot, the commit was lease-less,
-  or the snapshot is positional/sizeless; never re-fetch per batch
+  whole file (and drops the cache entry) when a handle has no snapshot, the
+  commit was lease-less, the snapshot is positional/sizeless, another commit
+  on the path overlapped it (`CommitTracker`; commits are not serialized per
+  path, so merge order may differ from apply order), or the committing fh is
+  closed/detached (`merge_allowed`); never re-fetch per batch
   (quadratic on big files). Snapshots are `Arc<FileLocations>` (handles and
   metadata cache): read()/write() clone the Arc, never the chunk list; the
   merge is copy-on-write (`merge_shared`).
