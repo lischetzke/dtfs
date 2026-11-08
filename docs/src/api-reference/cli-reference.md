@@ -1,950 +1,142 @@
 # CLI Reference
 
-`dtfs-cli` is the command-line administration tool for DTFS. It communicates with the manager's REST API to perform cluster operations.
+`dtfs-cli` administers a cluster through the manager [REST API](./rest-api.md) and updates local binaries. Source of truth: the clap definitions in `crates/dtfs-cli/src/main.rs`; `dtfs-cli --help` and `dtfs-cli <command> --help` are authoritative for the installed build.
 
-## Global Options
-
-```
-dtfs-cli [OPTIONS] <COMMAND>
-```
-
-| Option | Short | Default | Description |
-|--------|-------|---------|-------------|
-| `--manager <HOST:PORT>` | `-m` | `localhost:9402` | Manager REST API address |
-| `--format <FORMAT>` | | `table` | Output format: `table` or `json` |
-
-The manager address can also be set via the `DTFS_MANAGER` environment variable:
-
-```bash
-export DTFS_MANAGER="manager-01:9402"
-```
-
----
-
-## Commands
-
-### status
-
-Show cluster status overview.
-
-```bash
-dtfs-cli status
-```
-
-**Example output:**
-
-```
-DTFS Cluster Status
-===================
-Cluster:        production
-Status:         ok
-Manager:        manager-01
-Data Nodes:     6 (6 healthy)
-Files:          1423
-Total Capacity: 12.0 TB
-Used Capacity:  4.0 TB
-Config Version: 3
-```
-
-**JSON output:**
-
-```bash
-dtfs-cli status --format json
-```
-
----
-
-### nodes
-
-List all data nodes or show details for a specific node.
-
-```bash
-# List all nodes
-dtfs-cli nodes
-
-# Show details for a specific node
-dtfs-cli nodes --id <node-id>
-```
-
-| Option | Description |
-|--------|-------------|
-| `--id <ID>` | Show detailed info for a specific node, including disk inventory |
-
-**Example (list):**
-
-```bash
-$ dtfs-cli nodes
-NODE ID              HOSTNAME             LOCATION                       DISKS  CAPACITY     USED         HEALTH
---------------------------------------------------------------------------------------------------------------
-1                    data-01.example.com  us-east/dc1/rack-a/data-01     4      4.0 TB       1.0 TB       Healthy
-2                    data-02.example.com  us-east/dc1/rack-b/data-02     4      4.0 TB       1.5 TB       Healthy
-3                    data-03.example.com  us-east/dc1/rack-c/data-03     4      4.0 TB       1.5 TB       Healthy
-
-Total: 3 nodes
-```
-
-**Example (detail):**
-
-```bash
-$ dtfs-cli nodes --id 1
-Node Details
-============
-ID:       1
-Hostname: data-01.example.com
-Address:  data-01.example.com:9500
-Health:   Healthy
-Role:     Data
-Location: us-east/dc1/rack-a/data-01
-
-Disks (4):
-  ID       Tier       Path                     Total        Used         Status
-  0        Hot        /mnt/dtfs-disk-a1b2      1.0 TB       250.0 GB     Healthy
-  1        Hot        /mnt/dtfs-disk-c3d4      1.0 TB       250.0 GB     Healthy
-  2        Warm       /mnt/dtfs-disk-e5f6      1.0 TB       300.0 GB     Healthy
-  3        Cold       /mnt/dtfs-disk-g7h8      1.0 TB       200.0 GB     Healthy
-```
-
----
-
-### volumes
-
-List all volumes with file counts and total sizes.
-
-```bash
-dtfs-cli volumes
-```
-
-**Example output:**
-
-```
-VOLUME ID                FILES      TOTAL SIZE
---------------------------------------------------
-default                  1200       512.0 GB
-archive                  223        100.0 GB
-```
-
-#### volumes migrate-policy
-
-Bug AV — copy a volume's legacy `replication` block into the new
-`mandatory_replicas` field. Idempotent: re-running it once the
-migration has been applied is a no-op.
-
-```bash
-dtfs-cli volumes migrate-policy <volume_id>
-```
-
-**Example:**
-
-```
-$ dtfs-cli volumes migrate-policy default
-Volume 'default' migrate-policy: applied (mandatory hot=0 warm=2 cold=1 tape=1)
-
-$ dtfs-cli volumes migrate-policy default
-Volume 'default' migrate-policy: no-op (already migrated) (mandatory hot=0 warm=2 cold=1 tape=1)
-```
-
-Exits non-zero with an HTTP 404 message if the volume is unknown.
-See [REST API → POST /api/v1/volumes/{id}/migrate-policy](./rest-api.md#post-apiv1volumesidmigrate-policy)
-for the underlying request.
-
----
-
-#### volumes show
-
-Bug AV (AV-3-5) — render a volume's full configuration including
-the AV `mandatory_replicas` / `cache_replicas` / `anchor` fields.
-
-```bash
-dtfs-cli volumes show <volume_id>
-```
-
-**Example:**
-
-```
-$ dtfs-cli volumes show default
-Volume: default
-Name:   default
-Chunk size:  4194304 bytes
-Legacy replication:  hot=0 warm=2 cold=1 tape=1
-Mandatory replicas:  hot=0 warm=2 cold=1 tape=1
-Cache replicas:
-  warm: min=1 max=1
-  hot:  min=0 max=0
-  per_dc:               true
-  promote_reads:        2
-  promote_window_secs:  14400
-  cooldown_secs:        300
-Anchor:  dc=leli required_tier=cold
-```
-
-Use `--format json` for scripted consumption (returns the same JSON
-shape as `GET /api/v1/volumes/{id}`).
-
----
-
-#### volumes set-cache
-
-Bug AV (AV-3-5) — set or update a volume's `cache_replicas` policy.
-Every flag is optional; omitted flags keep the current value.
-Validates `max >= min` per tier at the REST layer.
-
-```bash
-dtfs-cli volumes set-cache <volume_id> \
-    [--warm-min N] [--warm-max N] [--hot-min N] [--hot-max N] \
-    [--per-dc true|false] \
-    [--promote-reads N] [--promote-window-secs N] [--cooldown-secs N]
-```
-
-**Example — Plexmedia-style warm cache:**
-
-```
-$ dtfs-cli volumes set-cache default \
-    --warm-min 1 --warm-max 1 --per-dc true \
-    --promote-reads 2 --promote-window-secs 14400 \
-    --cooldown-secs 300
-Volume 'default' set-cache: applied
-  warm: min=1 max=1
-  hot:  min=0 max=0
-  per_dc:               true
-  promote_reads:        2
-  promote_window_secs:  14400
-  cooldown_secs:        300
-```
-
-Idempotent: re-running with the same flags reports `no-op`.
-
-**Errors:**
-
-| Status | Reason |
-|--------|--------|
-| HTTP 400 | `max < min` for a tier (e.g. `--warm-min 2 --warm-max 1`). |
-| HTTP 404 | Volume not found. |
-
----
-
-#### volumes set-write-safety
-
-CF-3a — set or update a volume's `write_safety` policy (the
-durability-ack threshold + per-write timeout). Every flag is optional;
-omitted flags keep the current value. The runtime reconciliation tool
-for the ack threshold — without it the only way to change a stored
-`min_replicas_before_ack` is a full volume upsert.
-
-```bash
-dtfs-cli volumes set-write-safety <volume_id> \
-    [--min-replicas-before-ack N] [--write-timeout-secs N]
-```
-
-**Example — lower the production default volume's ack floor to 1:**
-
-```
-$ dtfs-cli volumes set-write-safety default --min-replicas-before-ack 1
-Volume 'default' set-write-safety: applied
-  min_replicas_before_ack: 1
-  write_timeout_secs:      30
-```
-
-Idempotent: re-running with the same value reports `no-op`.
-
-**Errors:**
-
-| Status | Reason |
-|--------|--------|
-| HTTP 400 | `--min-replicas-before-ack 0` or `--write-timeout-secs 0` (both must be >= 1). |
-| HTTP 404 | Volume not found. |
-
----
-
-#### volumes set-anchor
-
-Set or update the volume's anchor policy: the datacenter that must always
-hold a mandatory replica of every chunk (and, optionally, the tier that
-replica must live on). Omitted flags keep the current value. The manager
-rejects an update that would leave `mandatory_replicas.<required_tier>`
-at zero.
-
-```bash
-dtfs-cli volumes set-anchor <volume_id> [--datacenter DC] [--required-tier TIER]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--datacenter <DC>` | Anchor datacenter name (compared case-insensitively against node `datacenter`). |
-| `--required-tier <TIER>` | `hot`, `warm`, `cold` or `tape`; the tier the anchor replica must live on. |
-
-**Example:**
-
-```
-$ dtfs-cli volumes set-anchor media --datacenter LELI --required-tier cold
-Volume 'media' set-anchor: applied
-  datacenter:     LELI
-  required_tier:  cold
-```
-
-Backed by `POST /api/v1/volumes/{id}/set-anchor` with
-`{"datacenter": "...", "required_tier": "..."}` (both optional).
-
-**Errors:**
-
-| Status | Reason |
-|--------|--------|
-| HTTP 400 | `mandatory_replicas` for the required tier is 0, or unknown tier. |
-| HTTP 404 | Volume not found. |
-
----
-
-#### volumes set-spill
-
-Set or update the volume's spill policy: whether a write may land on a
-tier or datacenter outside its normal placement when the preferred
-targets are full, and which tiers/datacenters are never acceptable.
-Omitted flags keep the current value.
-
-```bash
-dtfs-cli volumes set-spill <volume_id> [--allow true|false] \
-    [--forbidden-tiers hot,tape] [--forbidden-datacenters NRB]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--allow <bool>` | Permit spill placement at all. |
-| `--forbidden-tiers <list>` | Comma-separated tiers spill may never use. |
-| `--forbidden-datacenters <list>` | Comma-separated datacenters spill may never use. |
-
-**Example:**
-
-```
-$ dtfs-cli volumes set-spill media --allow true --forbidden-tiers tape
-Volume 'media' set-spill: applied
-  allow:                  true
-  forbidden_tiers:        ["tape"]
-  forbidden_datacenters:  []
-```
-
-Backed by `POST /api/v1/volumes/{id}/set-spill` with
-`{"allow": bool, "forbidden_tiers": [...], "forbidden_datacenters": [...]}`
-(all optional).
-
----
-
-#### files flush-cache
-
-Bug AV (AV-3-5) — drop cache replicas under a path prefix. Mandatory
-(anchor) replicas are always preserved; a chunk whose flush would
-strand the anchor is refused and audited (`cache.flush_refused`).
-
-```bash
-dtfs-cli files flush-cache <path> \
-    [--cache-tiers warm[,hot]] \
-    [--cooldown-secs N] \
-    [--max-tasks N] \
-    [--allow-empty-prefix]
-```
-
-**Defaults:** `--cache-tiers warm`, `--cooldown-secs 300`,
-`--max-tasks 10000`.
-
-**Example:**
-
-```
-$ dtfs-cli files flush-cache /movies/Season-1/ --cooldown-secs 60
-flush-cache prefix=/movies/Season-1/ tiers=["warm"] cooldown=60s
-  files_matched     = 12
-  chunks_examined   = 482
-  replicas_dropped  = 482
-  mandatory_refusals = 0
-  unreachable_nodes = 0
-  rpc_failures      = 0
-  raft_failures     = 0
-```
-
-A non-zero `mandatory_refusals` indicates the planner protected
-against data loss for those chunks AND fired an `AnchorViolated`
-alert; investigate via the audit log:
-
-```bash
-dtfs-cli audit --action cache.flush_refused
-```
-
-See [REST API → POST /api/v1/files/flush_cache](./rest-api.md#post-apiv1filesflush_cache)
-for the underlying request body and audit semantics.
-
-> **Breaking change:** the legacy `dtfs-cli files --limit N`
-> moved to `dtfs-cli files list --limit N` to make room for the
-> `files flush-cache` subcommand. Both share the noun-verb
-> hierarchy used by `volumes`, `nodes`, etc.
-
----
-
-### files
-
-File-level operations. Three subcommands:
-
-```bash
-dtfs-cli files list [--limit N]      # List files (default 50)
-dtfs-cli files inspect <path>        # Chunk layout + replica placement
-dtfs-cli files flush-cache <path> …  # Bug AV — see above
-```
-
-#### files list
-
-```bash
-dtfs-cli files list [--limit N]
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--limit <N>` | 50 | Maximum number of files to display |
-
-**Example output:**
-
-```
-Total files: 1423
-
-PATH                                     VOLUME       CHUNKS   SIZE
----------------------------------------------------------------------------
-/data/reports/2024-q1.parquet            default      3        384.0 MB
-/data/reports/2024-q2.parquet            default      3        384.0 MB
-/data/logs/access-2024-03.csv            default      1        128.0 MB
-```
-
----
-
-#### files inspect
-
-Show one file's chunk layout and where every replica lives.
-
-```bash
-dtfs-cli files inspect <path>
-```
-
-**Example output:**
-
-```
-Path:        /movies/x.mkv
-Volume:      media
-Size:        4.3 GB
-Chunk size:  128.0 MB
-Chunks:      35
-
-INDEX  CHUNK_ID             SIZE       REPLICAS (node/disk tier)
-------------------------------------------------------------------------------------------
-0      9f2c1a7e0b4d3c5a...  128.0 MB   "1231…"/0 cold, "8841…"/1 warm
-1      3d8e0b1f6a2c9d4e...  128.0 MB   "1231…"/0 cold
 ```
-
-Backed by `GET /api/v1/files/inspect?path=<url-encoded path>`; the
-response carries `path`, `volume_id`, `total_size`, `chunk_size`,
-`chunk_count` and a `chunks[]` list with `chunk_index`, `chunk_id`,
-`size` and `replicas[] = {node_id, disk_id, tier}`.
-
-**Errors:**
-
-| Status | Reason |
-|--------|--------|
-| HTTP 404 | Path not found. |
-
----
-
-### scrub
-
-Trigger an immediate cluster-wide scrub on every data node (CF-8: the
-manager replicates the request and relays it via heartbeat; each data
-node runs it once and reports the result, visible in
-`/api/v1/stats.scrub_results_by_node` and the WebUI Last Scrub card).
-
-```bash
-# Cluster-wide deep scrub
-dtfs-cli scrub
-
-# Quick scrub (metadata only)
-dtfs-cli scrub --level quick
-```
-
-| Option | Description |
-|--------|-------------|
-| `--level <LEVEL>` | Scrub level: `quick` (metadata) or `deep` (full checksum). Default: `deep` |
-| `--disk <PATH>` / `--file <PATH>` / `--chunk <ID>` | **Not implemented** — the API rejects targeted scrubs with `400`; only full cluster-wide scrubs are supported. |
-
-**Example output:**
-
-```
-Scrub triggered: all * (level: deep)
-Status: accepted
-```
-
----
-
-### maintenance
-
-Enable or disable maintenance mode on a node. See [Maintenance Mode](../operations/maintenance-mode.md) for the full draining process.
-
-```bash
-### unquarantine
-
-Re-admit a node that an integrity fault quarantined. Both fields are
-required and land in the audit log; `reason_acknowledged` must be at
-least 16 characters describing what you verified (disk swapped, rescan
-clean, ...). Requires the cluster `shared_secret`.
-
-```bash
-dtfs-cli unquarantine <node-id> --operator-id <who> --reason-acknowledged "<what you verified>"
-```
-
-**Example output:**
-
-```
-{
-  "node_id": "12709699821947187762",
-  "ok": true
-}
-```
-
-Backed by `POST /api/v1/nodes/{id}/unquarantine` with
-`{"operator_id": "...", "reason_acknowledged": "..."}`.
-
-**Errors:**
-
-| Status | Reason |
-|--------|--------|
-| HTTP 400 | Missing `operator_id`, or `reason_acknowledged` too short. |
-| HTTP 409 | Node is not quarantined. The server message is printed and the command exits non-zero. |
-
----
-
-### decommission
-
-Permanently remove a node from the cluster registry. Refused while the
-node still holds any chunk replica: put it in maintenance, let
-re-replication drain it, then decommission. Requires the cluster
-`shared_secret`.
-
-```bash
-dtfs-cli decommission <node-id> --operator-id <who> --reason "<why>"
-```
-
-**Example output:**
-
-```
-{
-  "node_id": "12709699821947187762",
-  "ok": true
-}
-```
-
-Backed by `POST /api/v1/nodes/{id}/decommission` with
-`{"operator_id": "...", "reason": "..."}`.
-
-**Errors:**
-
-| Status | Reason |
-|--------|--------|
-| HTTP 400 | Missing `operator_id` or non-numeric node id. |
-| HTTP 404 | Node not registered. |
-| HTTP 409 | `node N still holds chunk replicas; drain/re-replicate before decommission`. Printed verbatim; exit non-zero. |
-
----
-
-### migrations
-
-Operator-driven data migration: add a replica on the requested tier
-(and, optionally, datacenter) for every chunk of every file under a
-path prefix. Additive; existing replicas are left in place. Requires the
-cluster `shared_secret`.
-
-```bash
-dtfs-cli migrations create <path-prefix> --target-tier <hot|warm|cold|tape> \
-    [--target-dc DC] [--max-tasks N] [--allow-empty-prefix]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--target-tier <TIER>` | Required. Rejected client-side unless one of `hot`, `warm`, `cold`, `tape`. |
-| `--target-dc <DC>` | Restrict the new replica to one datacenter. |
-| `--max-tasks <N>` | Cap on migration tasks enqueued by this call. |
-| `--allow-empty-prefix` | Safety gate: required to migrate with an empty prefix (every file). |
-
-**Example:**
-
-```
-$ dtfs-cli migrations create "/movies/Season 1/" --target-tier warm --target-dc TORO
-migrations create prefix=/movies/Season 1/ target_tier=warm
-{
-  "status": "accepted",
-  "path_prefix": "/movies/Season 1/",
-  "target_tier": "warm",
-  "target_dc": "TORO",
-  "files_matched": 12,
-  "chunks_total": 412,
-  "already_satisfied": 0,
-  "tasks_scheduled": 412,
-  "no_source": 0,
-  "no_target": 0,
-  "truncated_chunks": 0,
-  "examples": []
-}
-```
-
-Backed by `POST /api/v1/migrations` with
-`{"path_prefix", "target_tier", "target_dc", "allow_empty_prefix", "max_tasks"}`.
-Progress is visible in the WebUI Migrations page or `GET /api/v1/migrations`.
-
----
-
-# Enable maintenance mode
-dtfs-cli maintenance <node-id> --enable
-
-# Disable maintenance mode
-dtfs-cli maintenance <node-id> --disable
-```
-
-| Argument | Description |
-|----------|-------------|
-| `<node-id>` | Target node ID (required) |
-
-| Option | Description |
-|--------|-------------|
-| `--enable` | Enter maintenance mode (stops new placements, begins draining) |
-| `--disable` | Exit maintenance mode (resumes normal operation) |
-
-**Example output:**
-
-```
-Maintenance mode ENABLED for node 2
-Current state: maintenance
-```
-
----
-
-### audit
-
-View audit log entries. See [Audit Log](../security/audit-log.md) for details on the log format.
-
-```bash
-# Show 20 most recent entries
-dtfs-cli audit
-
-# Show more entries
-dtfs-cli audit --limit 100
-
-# Filter by action type
-dtfs-cli audit --action node.join
-
-# Filter by action prefix
-dtfs-cli audit --action config --limit 50
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--limit <N>` | 20 | Maximum entries to display |
-| `--action <PREFIX>` | (none) | Filter entries by action prefix |
-
-**Example output:**
-
-```
-TIME                   ACTOR          ACTION                   TARGET                         RESULT
-----------------------------------------------------------------------------------------------------
-2024-03-19 14:00:00    api            config.update            version=4                      success
-2024-03-19 13:45:12    data-03        node.join.complete       3                              success
-2024-03-19 13:45:11    data-03        node.join.request        data-03.example.com            accepted
-2024-03-19 12:30:00    api            maintenance.toggle       node=2                         enabled
-```
-
----
-
-### config
-
-View the current cluster configuration. Bare `dtfs-cli config` GETs and
-renders it; the `set` and `effective` subcommands below change it or
-list every key with its default.
-
-```bash
-dtfs-cli config
-dtfs-cli config set --config-json '<json>' [--write-to-disk] [--acknowledge-cluster-wide]
-dtfs-cli config effective
-```
-
-| Option | Description |
-|--------|-------------|
-| `--show` | Show current config (default behavior) |
-
-**Example output:**
-
-```
-Cluster Configuration
-=====================
-Config Version: 3
-
-Defaults:
-  Chunk Size:       128 MB
-  Min Replicas ACK: 2
-  Write Timeout:    30s
-  Replication:      hot=3, warm=2, cold=1
-
-Tiering:
-  Enabled:              true
-  Hot Threshold:        5 reads/hour
-  Cold Threshold:       14 days
-  Migration BW Limit:   200 Mbps
-```
-
----
-
-#### config set
-
-Apply a cluster-wide configuration override through Raft. The JSON is a
-partial `ManagerConfig` document; it is merged over the running config
-on every manager. Requires the cluster `shared_secret`.
-
-```bash
-dtfs-cli config set --config-json '<json>' [--write-to-disk] [--acknowledge-cluster-wide]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--config-json <JSON>` | Required. Partial config document, e.g. `'{"tiering":{"enabled":false}}'`. |
-| `--write-to-disk` | Also persist to `/etc/dtfs/manager.toml` (tmp + rename + fsync) on the serving manager. |
-| `--acknowledge-cluster-wide` | Confirm you understand the override applies to every manager. |
-
-**Example output:**
-
-```
-{
-  "version": 4,
-  "status": "applied",
-  "write_to_disk": false
-}
-```
-
-See [REST API → POST /api/v1/config](rest-api.md#post-apiv1config).
-
----
-
-#### config effective
-
-List every effective config key with its current value, its upstream
-default and whether the two match. `--format json` prints the raw
-document.
-
-```bash
-dtfs-cli config effective
-```
-
-**Example output:**
-
-```
-NAME                                               CURRENT          DEFAULT          IS_DEFAULT
-----------------------------------------------------------------------------------------------------
-manager.tiering.enabled                            true             true             true
-manager.tiering.migration_bw_limit_mbps            200              100              false
-```
-
-Backed by `GET /api/v1/config/effective` (`{scope, node_hostname, entries[]}`,
-each entry `{name, current, default, is_default}`).
-
----
-
-### health
-
-Check whether the manager is healthy. Exits with code 0 on success, 1 on failure. Useful for scripting and monitoring.
-
-```bash
-dtfs-cli health
-```
-
-**Example output (healthy):**
-
-```
-Manager is healthy
-```
-
-**Example output (unhealthy):**
-
-```
-Manager status: unavailable
-```
-
----
-
-### stats
-
-Aggregate cluster statistics: the numbers the WebUI Home page renders.
-`--format json` prints the raw document.
-
-```bash
-dtfs-cli stats
-```
-
-**Example output:**
-
-```
-DTFS Cluster Stats
-==================
-Health:            healthy
-Nodes:             7 total, 7 healthy, 0 quarantined
-Roles:             5 manager, 2 data, 3 client
-Disks:             4
-Files:             1423
-Raw capacity:      12.4 TB used / 52.0 TB
-Net capacity:      6.1 TB used / 25.9 TB
-Logical bytes:     6.0 TB
-I/O:               38.2 MB/s read, 1.1 MB/s write
-Anchor pending:    0
-
-TIER   DISKS  USED         TOTAL
-----------------------------------------
-hot    0      0 B          0 B
-warm   2      1.2 TB       2.0 TB
-cold   2      11.2 TB      50.0 TB
-tape   0      0 B          0 B
-
-Last scrub:        2026-09-12 03:00:11 level=deep node=1231… disk=/srv/dtfs/disk0
-                   checked=48211 healthy=48211 corrupt=0 missing=0
-```
-
-Backed by `GET /api/v1/stats`.
-
----
-
-### integrity
-
-Integrity-fault view over the audit log: scrub mismatches, read-time
-checksum failures, quarantine and unquarantine events. Same flags and
-output columns as `audit`.
-
-```bash
-dtfs-cli integrity faults [--limit N] [--action PREFIX]
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--limit <N>` | 20 | Maximum entries to show. |
-| `--action <PREFIX>` | | Filter by action prefix (e.g. `scrub.`). |
-
-**Example output:**
-
-```
-TIME                   ACTOR          ACTION                   TARGET                         RESULT
-----------------------------------------------------------------------------------------------------
-2026-09-12 03:00:11    scrub          scrub.mismatch           chunk 9f2c1a7e0b4d3c5a…        quarantined
+dtfs-cli [--manager <host:port>] [--secret <secret>] [--format table|json] <command> ...
 ```
 
-Backed by `GET /api/v1/integrity/faults?limit=N&action=PREFIX`.
+## Global options
 
----
+| Option | Env | Default | Meaning |
+|---|---|---|---|
+| `-m`, `--manager <host:port>` | `DTFS_MANAGER` | `localhost:9402` | Manager REST address. A bare `host:port` becomes `http://host:port`; an explicit `http://` or `https://` scheme is kept. Must appear **before** the subcommand. |
+| `--secret <secret>` | `DTFS_SHARED_SECRET` | empty | Cluster `shared_secret`, sent as `X-Dtfs-Shared-Secret` on every mutating request. Required when the cluster has a secret. Global (may appear anywhere). Prefer the env var; a command-line secret is visible in the process list. |
+| `--format table|json` | none | `table` | Output format. Global. `json` prints the server response and is the form to script against. |
+| `--version` | none | none | Version and build date. |
 
-### update
+Mutations must go to the leader (or the call returns `409`/`503`; see [REST API](./rest-api.md#leader-behaviour)). Find it with `dtfs-cli raft members`.
 
-Update DTFS binaries from the configured release source and restart the
-matching systemd service **on the local host** (the cluster-wide rolling
-update is the GitLab pipeline, see
-[CI Pipeline](../operations/ci-pipeline.md)). Unlike the other commands this one
-does not talk to the manager API; it downloads the release tarball,
-verifies each binary's sha256 against the in-tarball `MANIFEST`,
-atomically installs it (`install -m 0755`), and restarts the service.
+## Exit codes
 
-Run as **root** (it writes the install directory and calls `systemctl`).
+| Code | Meaning |
+|---|---|
+| `0` | Success. Also: `update` answered `n` at the prompt (nothing installed). |
+| `1` | Any failure: connection error, non-success HTTP status, validation failure, a partially failed operation (see `files flush-cache`), `health` with a non-healthy status, update verification failure. |
+| `2` | Usage error (unknown flag, missing argument). |
 
-```bash
-dtfs-cli update <TARGET> [--check] [--tag <TAG>] [--repo-url <URL>] \
-                         [--token <TOKEN>] [--install-dir <DIR>] \
-                         [--config <PATH>] [--no-restart] [-y|--yes]
-```
-
-| Argument / Option | Description |
-|-------------------|-------------|
-| `<TARGET>` | `manager`, `data`, `fuse` (alias `client`), `cli`, or `all`. |
-| `--check` | Report installed vs latest available; make no changes. |
-| `--tag <TAG>` | Install a specific release tag (default: the newest full `vX.Y.Z` release; pipeline alpha tags `vX.Y.Z_YYYYMMDDHHmm` are only installed when named here). |
-| `--repo-url <URL>` | Override the release repo (default: `[updater].repo_url`, then `DTFS_REPO_URL`, then the built-in GitLab project). A GitLab project URL uses the Generic Package Registry; a github.com URL the legacy releases layout. |
-| `--token <TOKEN>` | GitLab token for a private project (default: `DTFS_REPO_TOKEN`, then `[updater].token`). `gldt-...` deploy tokens are sent as `DEPLOY-TOKEN`, anything else as `PRIVATE-TOKEN`. |
-| `--install-dir <DIR>` | Override the install directory (default: `[updater].install_dir` or `/usr/local/bin`). |
-| `--config <PATH>` | Read the `[updater]` block from this file (default: `/etc/dtfs/<role>.toml`). |
-| `--no-restart` | Install the new binary but do not restart the service. |
-| `-y`, `--yes` | Skip the confirmation prompt. |
-
-Target → service: `manager` → `dtfs-manager.service`, `data` →
-`dtfs-data.service`, `fuse` → every running `dtfs-fuse@*` instance,
-`cli` → none (the binary is replaced in place). `all` installs every
-binary and restarts each present service.
-
-The source repo URL and token live in the `[updater]` block of any role
-config (see [Configuration](../configuration/manager.md)); the URL
-defaults to the canonical DTFS project, so for a public project no
-config is required.
-
-**Integrity:** a single sha256 mismatch between a downloaded binary and
-its `MANIFEST` entry aborts the entire update — nothing is installed.
+Error reporting differs by command. Read commands (`status`, `stats`, `nodes`, `files list`, `files inspect`, `audit`, `integrity faults`, `volumes list`, `volumes show`, `config`, `config effective`, `raft members`, `health`) and the mutations `volumes create`, `volumes migrate-policy`, `volumes set-cache`, `volumes set-mandatory`, `volumes set-write-safety`, `scrub` and `maintenance` report only the HTTP status line on failure. `volumes set-anchor`, `volumes set-spill`, `files flush-cache` and `migrations create` print `HTTP <status>: <server error>` (for example `anchor.required_tier = Cold but mandatory_replicas.cold = 0`). `unquarantine`, `decommission`, `config set` and `raft add-learner|promote|remove` print the full JSON error body. To see the body of the first group, repeat the call with `curl`.
 
-**Examples:**
-
-```bash
-# What's the latest release, and what's installed here?
-dtfs-cli update manager --check
-
-# Update + restart this data node (prompts before restarting).
-sudo dtfs-cli update data
-
-# Update the manager to a specific tag without prompting.
-sudo dtfs-cli update manager --tag v0.3.0 --yes
-
-# Refresh just the CLI (no service to restart).
-sudo dtfs-cli update cli
-```
+## Cluster
 
----
+| Command | Description |
+|---|---|
+| `status` | `GET /api/v1/cluster/status`: status, node counts, files, capacity, config version. |
+| `health` | `GET /api/v1/health`. Prints `Manager is healthy`; exits `1` otherwise. |
+| `stats` | `GET /api/v1/stats`: counts, capacity, tier breakdown, placement states, last scrub. |
+| `nodes [--id <node-id>]` | List nodes, or show one node with its disks. |
+| `maintenance <node-id> (--enable \| --disable)` | Toggle maintenance mode. Exactly one flag is required. See [Maintenance Mode](../operations/maintenance-mode.md). |
+| `unquarantine <node-id> --operator-id <label> --reason-acknowledged <text>` | Clear an integrity quarantine. The reason must be at least 16 characters. Prints the server JSON; exits `1` on failure (for example `409` node not quarantined). |
+| `decommission <node-id> --operator-id <label> --reason <text>` | Remove a drained or dead node from the registry. `409` while it still holds replicas. |
+| `scrub [--level quick\|deep]` | Trigger a cluster-wide scrub (default `deep`). The `--disk`, `--file` and `--chunk` options exist but the server rejects per-target scrubs with `400`; omit them. |
+| `audit [--limit N] [--action <prefix>]` | Audit log, default limit 20. |
+| `integrity faults [--limit N] [--action <prefix>]` | Integrity-fault feed, default limit 20. |
 
 ### raft
 
-Inspect and change Raft membership (the manager voter/learner set). The
-mutating subcommands (`add-learner`, `promote`, `remove`) are
-**leader-only** — point `--manager` at the current leader; a follower
-answers `409` with a leader hint — and require the cluster
-`shared_secret` (pass `--secret` or set `DTFS_SHARED_SECRET`). See
-[Cluster Management → Adding a Manager Node](../operations/cluster-management.md#adding-a-manager-node)
-for the full add/promote/remove workflow and the learner-vs-voter
-distinction.
+Membership changes go to the leader's address (`--manager <leader>:9402`). A non-leader answers `409` with a leader hint, printed as JSON. The mutating subcommands require the cluster secret in `--secret` (env `DTFS_SHARED_SECRET`); it is sent both as the header and in the request body. They print the server JSON and exit `1` on a non-success status. See [Cluster Management](../operations/cluster-management.md).
+
+| Command | Description |
+|---|---|
+| `raft members` | Voters, learners and leader as seen by the queried manager. |
+| `raft add-learner <hostname> <addr> --secret <s>` | Add a manager as a non-voting learner. `addr` is its peer-routable gRPC `host:port` (never a wildcard); `hostname` is its `[node].hostname`. |
+| `raft promote <hostname> --secret <s>` | Promote a caught-up learner to voter. |
+| `raft remove <hostname> --secret <s>` | Remove a learner or voter. Refuses to remove the last voter. |
+
+## Volumes
+
+Volume ids are lowercase names with spaces turned into `-`. Field meanings: [Volume Configuration](../configuration/volume-config.md). For all `set-*` commands only the flags you pass change; the response tells whether anything changed (`applied` or `no-op`). `409` means a concurrent update to the same volume won: run `volumes show <id>`, reapply, retry.
+
+| Command | Description |
+|---|---|
+| `volumes list` | All volumes with file count and size. |
+| `volumes show <id>` | Full policy: replication, mandatory, cache, anchor, write safety, spill. |
+| `volumes create <name> [--replication-factor N] [--tier-policy T]` | Create a volume. Both options are accepted by the CLI but **ignored by the current server**; the volume takes `[defaults]`. Use `POST /api/v1/volumes` for `chunk_size_mb`, `replication_*` and `anchor_datacenter`. Builds that add `--force` (anchor datacenter unknown to the cluster) list it in `volumes create --help`. |
+| `volumes migrate-policy <id>` | Copy legacy `replication` into `mandatory_replicas` once. Idempotent. |
+| `volumes set-cache <id> [--warm-min N] [--warm-max N] [--hot-min N] [--hot-max N] [--per-dc true\|false] [--promote-reads N] [--promote-window-secs N] [--cooldown-secs N]` | Cache replica policy. `max` must be at least `min`; `0`/`0` disables a tier. Cold and tape cache tiers are REST only. |
+| `volumes set-mandatory <id> [--hot-replicas N] [--warm-replicas N] [--cold-replicas N] [--tape-replicas N]` | Mandatory replica counts. Rejects an all-zero result, a zero on the anchor's required tier, and tape without a tape disk. |
+| `volumes set-write-safety <id> [--min-replicas-before-ack N] [--write-timeout-secs N]` | Write acknowledgement threshold and timeout (each at least 1). |
+| `volumes set-anchor <id> [--datacenter <dc>] [--required-tier hot\|warm\|cold\|tape] [--force]` | Anchor datacenter and tier. An empty `--datacenter ""` clears the anchor. A datacenter no registered node reports is refused unless `--force`. `--force` needs a CLI build that includes it (see `volumes set-anchor --help`); the server field is `force`. |
+| `volumes set-spill <id> [--allow true\|false] [--forbidden-tiers a,b] [--forbidden-datacenters x,y]` | Per-volume capacity-spill rules. Comma-separated lists; an empty list clears the exclusion. |
+
+## Files
+
+| Command | Description |
+|---|---|
+| `files list [--limit N]` | List files, default 50. The CLI pages through `GET /api/v1/files` (`limit`/`offset`) until `N` files are collected or the list ends, and prints `showing N of M (raise --limit to see more)` when the list is cut short. With `--format json` the output is `{count, total, truncated, files}`. Replaces the old `files --limit`. |
+| `files inspect <path>` | Chunk layout and per-replica placement (node, disk, tier) of one file. |
+| `files flush-cache <path-prefix> [--cache-tiers warm,hot] [--cooldown-secs N] [--max-tasks N] [--allow-empty-prefix]` | Drop cache replicas under a prefix; mandatory and anchor replicas are never dropped. Defaults: tiers `warm`, cooldown 300, max tasks 10000. A prefix of `""` or `/` needs `--allow-empty-prefix`. **Exits `1` when `rpc_failures` or `raft_failures` is non-zero** (output is still printed) and prints `truncated` when more remains; re-run to continue. `mandatory_refusals > 0` is reported but is not an error exit; check the audit log (`cache.flush_refused`). |
+
+## Migrations
+
+`migrations create <path-prefix> --target-tier <tier> [--target-dc <dc>] [--allow-empty-prefix] [--max-tasks N]` enqueues moves of every chunk under the prefix. `--target-tier` is one of `hot`, `warm`, `cold`, `tape` and is checked locally before any request. Prints the server's counters (`files_matched`, `tasks_scheduled`, `already_satisfied`, `no_source`, `no_target`). Leader-only. See [Migration](../storage/migration.md).
+
+## Config
+
+| Command | Description |
+|---|---|
+| `config` (or `config --show`) | Stored override plus effective `[defaults]` and `[tiering]`. |
+| `config effective` | Every key with `current`, `default`, `is_default`, scope. Secrets show `***`. The default column is indicative only. |
+| `config set --config-json '<json>' [--write-to-disk --acknowledge-cluster-wide]` | Store a sparse override. `--write-to-disk` rewrites `/etc/dtfs/manager.toml` on the manager you contacted and requires `--acknowledge-cluster-wide`. Prints the server JSON; exits `1` on failure. No daemon applies the stored override at runtime; see [Cluster-wide Configuration](../configuration/cluster-config.md). |
+
+## update
+
+```
+dtfs-cli update <target> [--check] [--tag <tag>] [--repo-url <url>] [--install-dir <dir>]
+                [--config <file>] [--token <token>] [--no-restart] [-y|--yes]
+```
+
+Updates binaries on **this host** (run as root). The rolling cluster-wide update is the pipeline playbook, see [CI Pipeline](../operations/ci-pipeline.md).
+
+| Argument | Meaning |
+|---|---|
+| `<target>` | `manager`, `data`, `fuse` (alias `client`), `cli` or `all`. Binaries and services: `dtfs-manager` / `dtfs-manager.service`, `dtfs-data` / `dtfs-data.service`, `dtfs-fuse` / `dtfs-fuse@*` (all running instances), `dtfs-cli` (no service). |
+| `--check` | Print the latest release and installed versions; change nothing. |
+| `--tag <tag>` | Install this release. Default: the newest full `vX.Y.Z` release; alpha tags (`vX.Y.Z_YYYYMMDDHHmm`) are skipped unless named. |
+| `--repo-url <url>` | Release source. Precedence: flag, `[updater].repo_url`, `DTFS_REPO_URL`, built-in GitLab project. |
+| `--install-dir <dir>` | Default `[updater].install_dir`, else `/usr/local/bin`. |
+| `--config <file>` | File to read `[updater]` from. Default `/etc/dtfs/<role>.toml` (`manager`, `data`, `fuse`); none for `cli` and `all`. |
+| `--token <token>` | GitLab token. Precedence: flag, `DTFS_REPO_TOKEN`, `[updater].token`. `gldt-` tokens are sent as `DEPLOY-TOKEN`, everything else as `PRIVATE-TOKEN`. |
+| `--no-restart` | Install but leave services on the old binary until their next restart. |
+| `-y`, `--yes` | Skip the `Proceed? [y/N]` prompt (otherwise the command prompts; with no terminal input it prints `aborted; nothing installed` and still exits `0`, so always pass `-y` in automation). |
+
+Sequence:
+
+1. Resolve the tarball (`dtfs-linux-amd64.tar.gz`) from the GitLab Generic Package Registry (`.../packages/generic/dtfs/<tag>/`) or a github.com release.
+2. Download to a private temporary directory.
+3. **Minisign verification** when a public key is configured (`[updater].minisign_public_key` or `DTFS_MINISIGN_PUBKEY`; env wins): also download `SHA256SUMS` and `SHA256SUMS.minisig` from the same location, verify the signature, and require the tarball's SHA-256 to match the signed `SHA256SUMS`. Any failure aborts before extraction. Without a key a warning is printed and only the in-tarball `MANIFEST` is checked.
+4. Extract and verify every target binary against the tarball `MANIFEST` SHA-256; one mismatch aborts with nothing installed.
+5. Print the plan and ask for confirmation.
+6. Install each binary atomically (temporary file in the target directory, then rename), then `systemctl restart` the matching units unless `--no-restart`.
+
+Token handling: the token header is attached only to the first request of each download. HTTP redirects are followed by the CLI itself (at most 5 hops, `https` only after the first hop, TLS 1.2 or newer), and redirect targets never receive the token, so a registry that redirects to object storage does not leak it. Exit `1` on any failure.
+
+Examples:
 
 ```bash
-dtfs-cli raft members
-dtfs-cli --manager <leader>:9402 raft add-learner <HOSTNAME> <ADDR> --secret <SECRET>
-dtfs-cli --manager <leader>:9402 raft promote <HOSTNAME> --secret <SECRET>
-dtfs-cli --manager <leader>:9402 raft remove <HOSTNAME> --secret <SECRET>
+dtfs-cli update all --check
+sudo dtfs-cli update data --tag v1.4.2 -y
+sudo DTFS_MINISIGN_PUBKEY="RWQ..." dtfs-cli update manager -y
 ```
 
-| Subcommand | Description |
-|------------|-------------|
-| `members` | Show the membership (voters, learners, leader, addrs) as seen by the queried manager. Read-only; works on any manager. Backed by `GET /api/v1/raft/state`. |
-| `add-learner <HOSTNAME> <ADDR>` | Add a manager as a non-voting learner. `<ADDR>` is the peer-routable Raft/gRPC `host:port` (never a wildcard). |
-| `promote <HOSTNAME>` | Promote an up-to-date learner to a voting member. |
-| `remove <HOSTNAME>` | Remove a learner or voter from the membership entirely. |
+## Common tasks
 
-`<HOSTNAME>` is the target manager's `[node].hostname` (the raft node id
-is `hash(hostname)`). The `--secret` value can also come from the
-`DTFS_SHARED_SECRET` environment variable.
-
-**Example output (`raft members`, table format):**
-
+```bash
+export DTFS_MANAGER=mgr-01:9402 DTFS_SHARED_SECRET=...
+dtfs-cli status
+dtfs-cli files list --limit 200 --format json
+dtfs-cli files flush-cache /movies/ --cache-tiers warm --cooldown-secs 600
+dtfs-cli volumes set-mandatory media --cold-replicas 1
+dtfs-cli maintenance 1234567890 --enable
+dtfs-cli --manager mgr-02:9402 raft add-learner mgr04 10.1.0.1:9401 --secret "$DTFS_SHARED_SECRET"
 ```
-Queried: mgr01 (state=Leader, term=18)
-HOSTNAME               NODE_ID                ADDR                     ROLE     
-mgr01                  12709699821947187762   10.0.0.1:9401            voter    (leader)
-mgr04                  8841...                10.1.0.1:9401            learner  
-```
-
-## Exit Codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | Command completed successfully |
-| 1 | Command failed (unhealthy manager, API error, etc.) |
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `DTFS_MANAGER` | Default manager address (overridden by `--manager` flag) |
-| `DTFS_TOKEN` | JWT authentication token |
-| `DTFS_MINISIGN_PUBKEY` | Minisign public key for `update` release verification (overrides `[updater].minisign_public_key`) |
-| `DTFS_REPO_URL` | Default release repo for `update` (overridden by `--repo-url` and by `[updater].repo_url`) |
-| `DTFS_SHARED_SECRET` | Cluster shared secret for `raft add-learner`/`promote`/`remove` (overridden by `--secret`) |
