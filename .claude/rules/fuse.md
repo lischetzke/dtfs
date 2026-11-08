@@ -75,7 +75,10 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   (`gated_snapshot`; open/create check after inserting the handle, else
   `locations = None`). read() re-fetches once per snapshot before serving
   zeros for a missing entry below EOF (`gap_needs_refetch`,
-  `holes_confirmed`). Snapshots are
+  `holes_confirmed`). Writers seed only from a snapshot fetched after the
+  lease grant via `quiet_fetch` (`seed_snapshot_usable`): writable open
+  re-fetches after the grant; truncate's size/tail fetches use
+  `quiet_fetch`. Snapshots are
   `Arc<FileLocations>` (handles and metadata cache): read()/write() clone
   the Arc, never the chunk list; the merge is copy-on-write (`merge_shared`).
 - `FileLocations.chunks` is sorted by chunk index (`sort_chunks_by_index` at

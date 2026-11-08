@@ -557,6 +557,13 @@ fn gated_snapshot(snapshot: Arc<FileLocations>, may_install: bool) -> Option<Arc
     may_install.then_some(snapshot)
 }
 
+/// May a writer seed (RMW / O_APPEND tail) from this snapshot? Only one
+/// fetched after the write lease was granted (the previous writer, on any
+/// host, has finished committing) that no local commit overlapped.
+fn seed_snapshot_usable(fetched_after_lease: bool, may_install: bool) -> bool {
+    fetched_after_lease && may_install
+}
+
 /// read(): a missing chunk entry below the snapshot's size may be a chunk
 /// the snapshot missed (not a hole). Re-fetch once before serving zeros,
 /// unless this snapshot already came from such a re-fetch (`confirmed`).
@@ -929,8 +936,8 @@ impl DtfsFilesystem {
         append: bool,
     ) -> Result<u64> {
         // Fetch (or refresh) file locations from the manager.
-        let fetch = self.commit_tracker.begin_fetch(path);
-        let locations = self.fetch_file_locations(path).await?;
+        let mut fetch = self.commit_tracker.begin_fetch(path);
+        let mut locations = Arc::new(self.fetch_file_locations(path).await?);
         let chunk_size = self.resolve_chunk_size(&locations);
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
@@ -983,6 +990,25 @@ impl DtfsFilesystem {
             (None, None, None)
         };
 
+        // A writer seeds from this snapshot (O_APPEND tail below, write()'s
+        // RMW): the pre-lease fetch can predate the previous writer's last
+        // commit, so re-fetch after the grant through the guarded path. On
+        // failure skip the open-time seed; the handle then stays stale (or
+        // the fetch below is still current) and write() re-fetches guarded.
+        let mut seed_ok = true;
+        if flags.is_writable() && !seed_snapshot_usable(false, fetch.may_install()) {
+            match self.quiet_fetch(path).await {
+                Ok((l, f)) => {
+                    locations = l;
+                    fetch = f;
+                }
+                Err(e) => {
+                    warn!(path, error = %e, "post-lease locations fetch failed; open-time seed skipped");
+                    seed_ok = false;
+                }
+            }
+        }
+
         // F-021 / CR-1-2 (FUSE-7): when opened with O_APPEND, pre-seed the
         // write buffer with the file's existing tail chunk so the
         // subsequent write(s) extend it instead of replacing the chunk
@@ -994,7 +1020,7 @@ impl DtfsFilesystem {
         // index (`chunk_at(max index)`), never by array position, since the
         // manager's array is dense while the file's index space may be
         // sparse (REV-2-1).
-        if append && flags.is_writable() {
+        if append && flags.is_writable() && seed_ok {
             let max_idx = locations.chunk_count().checked_sub(1);
             if let Some(last_idx) = max_idx {
                 match self
@@ -1022,7 +1048,6 @@ impl DtfsFilesystem {
             }
         }
 
-        let locations = Arc::new(locations);
         self.open_files.insert(
             fh,
             OpenFile {
@@ -2196,8 +2221,9 @@ impl DtfsFilesystem {
         let writer = self.has_writable_handle(path);
         let mut temp_fh = None;
         if !writer {
-            let before = self
-                .fetch_file_locations(path)
+            // Decides the tail rewrite from the size: guarded like the seed.
+            let (before, _fetch) = self
+                .quiet_fetch(path)
                 .await
                 .with_context(|| format!("truncate: locations for {path}"))?;
             let cs = self.resolve_chunk_size(&before);
@@ -2229,8 +2255,10 @@ impl DtfsFilesystem {
         // writer for the bare-path case).
         let mut tail_seed: Option<(u64, Bytes)> = None;
         if writer {
-            let before = self
-                .fetch_file_locations(path)
+            // Seeds the tail chunk: guarded fetch (waits out in-flight
+            // commits), never a snapshot older than one of them.
+            let (before, _fetch) = self
+                .quiet_fetch(path)
                 .await
                 .with_context(|| format!("truncate: locations for {path}"))?;
             let chunk_size = self.resolve_chunk_size(&before);
@@ -3032,6 +3060,21 @@ impl DtfsFilesystem {
     /// fetch again, failing (EIO) after `QUIET_WAIT`.
     async fn refetch_locations(&self, path: &str) -> Result<Arc<FileLocations>> {
         self.metadata_cache.remove(path);
+        let (fresh, _fetch) = self.quiet_fetch(path).await?;
+        // No await since `may_install` held: install right away.
+        for mut entry in self.open_files.iter_mut() {
+            if entry.value().path == path {
+                entry.value_mut().locations = Some(fresh.clone());
+            }
+        }
+        Ok(fresh)
+    }
+
+    /// Fetch `path`'s locations until a fetch no commit on the path overlapped
+    /// succeeds (waiting for quiet in between), failing (EIO) after
+    /// `QUIET_WAIT`. Returns the snapshot and its still-open fetch slot, so a
+    /// caller that stores it later can re-check `may_install` at that point.
+    async fn quiet_fetch(&self, path: &str) -> Result<(Arc<FileLocations>, FetchToken<'_>)> {
         let deadline = Instant::now() + QUIET_WAIT;
         loop {
             let fetch = self.commit_tracker.begin_fetch(path);
@@ -3041,14 +3084,7 @@ impl DtfsFilesystem {
                     .with_context(|| format!("stale locations for {path} and re-fetch failed"))?,
             );
             match next_fetch_step(fetch.may_install(), Instant::now(), deadline) {
-                FetchStep::Install => {
-                    for mut entry in self.open_files.iter_mut() {
-                        if entry.value().path == path {
-                            entry.value_mut().locations = Some(fresh.clone());
-                        }
-                    }
-                    return Ok(fresh);
-                }
+                FetchStep::Install => return Ok((fresh, fetch)),
                 FetchStep::WaitQuiet => {
                     drop(fetch);
                     debug!(path, "locations fetch overlapped a commit; waiting for it");
@@ -4779,6 +4815,19 @@ mod commit_tracker_tests {
         drop(fetch);
         let fetch = t.begin_fetch("/f");
         assert!(gated_snapshot(snap("/f"), fetch.may_install()).is_some(), "quiet open installs");
+    }
+
+    /// A writer seeds (O_APPEND tail, RMW, truncate tail) only from a
+    /// snapshot fetched after its lease was granted and not overlapped by a
+    /// local commit. A pre-lease fetch is never enough, even when quiet: the
+    /// previous writer may be on another host (not tracked locally).
+    #[test]
+    fn seed_needs_post_lease_quiet_snapshot() {
+        use super::seed_snapshot_usable;
+        assert!(!seed_snapshot_usable(false, true), "pre-lease fetch, even if quiet");
+        assert!(!seed_snapshot_usable(true, false), "post-lease but overlapped a commit");
+        assert!(!seed_snapshot_usable(false, false));
+        assert!(seed_snapshot_usable(true, true));
     }
 
     /// read(): a missing entry below EOF triggers one re-fetch; a missing
