@@ -8,6 +8,36 @@ this is the full narrative. Read it when you need to understand *why* a
 rule exists, are touching the exact code path it describes, or are
 reviewing a diff against it — not by default.
 
+## Index
+
+| Section | Topic |
+|---------|-------|
+| [A.2](#a2--read-path-replica-selection-u4-co-3-10) | Read replica selection and what `GetFileLocations` returns |
+| [A.3.4](#a34--mandatory-vs-cache-replicas-full-detail-bug-av) | Mandatory vs cache replicas, anchor, cooldowns |
+| [A.6](#a6--data-node-durability-hardening-cr-4) | Data-node durability checklist, item by item |
+| [A.3.5](#a35--build-date--version-stamp-mechanism-bug-bs-az-5) | `BUILD_DATE` and `DTFS_VERSION` stamping |
+| [A.4](#a4--stale-artifact-trap-bug-cf) | Stale-artifact trap on remote builders |
+| [A.8](#a8--file-map-full-narrative) | Per-file narrative: raft, scheduler, monitor, metadata, api, join, data node, common, fuse (subsections in that order) |
+| [Archive](#archive) | Removed contract text |
+
+For the page-level explanation of the data model and invariants see the [Architecture Overview](../architecture/overview.md).
+
+## Recent fixes at a glance (2026-11)
+
+One line each; the narrative is in the A.8 subsection named in brackets.
+
+- **Determinism** (raft): apply never reads the wall clock; audit and lease times come from `now_ms` or the log index. Lease-less `UpdateChunkLocations` is union-only. `RenameFile` refuses dir/file type conflicts; `CreateSymlink`/`CreateLink` refuse an occupied destination.
+- **Snapshots** (raft): a persist failure in build or install is returned as an error and nothing is published or purged; a stale or blank state machine next to a purged log refuses to start as a voter; `truncate_after` is a synced batch and purge writes `last_purged` in the same batch.
+- **One Raft-response checker** (scheduler): `raft_write_checked` / `client_response_ok` treat a state-machine refusal as failure; a refused or failed Raft removal means no byte delete.
+- **Repair registration** (scheduler): a finished copy registers only its new row, on the disk id the data node reported (`ReplicateChunkResponse.disk_id`); data disk ids persist in `.dtfs-disk-id`.
+- **Orphan reaper** (scheduler): disk-keyed, re-reads the node view after `ListChunks`, never reaps a chunk recorded under another disk of the same node, grace measured on `.dat` mtime; unlink no longer fans out byte deletes.
+- **Tiering** (scheduler/tiering): promotions are batched and capped at 50 new tasks per tick (`MAX_PROMOTIONS_PER_TICK`); the excess-replica pass allows one cache allowance per datacenter (`cache_allowance`); demotion needs a LIVE surviving anchor replica; the anchor datacenter compares case-insensitively everywhere.
+- **Monitor**: never overwrites `Maintenance`, `Draining` or `Quarantined` with `Down`.
+- **Scrub** (data): tri-state meta repair (`Repaired` / `HashOkWriteFailed` / `NotRepairable`), quarantined ids are re-queued for reporting at startup, scrub I/O is throttled per chunk, `quarantine_on_fault` is honoured.
+- **FUSE write path**: RMW seed read once, locations refreshed after commit, ghost unlink only for never-committed creates, rename moves buffers/inodes/mode overrides, truncate rewrites the tail (also bare path truncate via a temporary writer), chunk size taken from the manager and a mismatch refused, local lease deadline tracked on the handle.
+- **FUSE read/inode path**: client-side BLAKE3 verification of fetched bytes, disk-cache hits promoted into the memory cache, oldest-first read-ahead eviction, `opendir` snapshots, inode lookup/forget counts, symlink kind from the manager, inclusive POSIX lock ranges (process-local; manager lock RPCs unused).
+- **Security**: Raft transport requests carry the HMAC stamp with a `require_raft_auth` rollout flag and a body-size cap; config reads mask secrets as `***`; `manager.toml` is written `0600`; `auth.denied` audit rows are coalesced per (source, path); the manager requires the stamp on `Heartbeat` and `ReportChunkStatus`; join phases must hit the same manager and no CA is issued at join; `dtfs-cli update` verifies a minisign signature over `SHA256SUMS` and never forwards tokens across redirects.
+
 ## A.2 — Read path replica selection (U4, CO-3-10)
 
 `location.rs::select_read_replica` orders candidates: (1) configured
