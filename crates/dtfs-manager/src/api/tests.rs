@@ -131,6 +131,7 @@ mod audit_co_tests {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             spill: SpillPolicy::default(),
+            version: 0,
         };
 
         let mut sm = StateMachineData::default();
@@ -539,6 +540,7 @@ mod bug_bp_tests {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             spill: dtfs_common::types::SpillPolicy::default(),
+            version: 0,
             anchor_datacenter: None,
             write_safety: WriteSafety { min_replicas_before_ack: 1, write_timeout_secs: 30 },
         };
@@ -925,6 +927,7 @@ mod bug_av_set_cache_tests {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             spill: dtfs_common::types::SpillPolicy::default(),
+            version: 0,
             anchor_datacenter: None,
             write_safety: WriteSafety {
                 min_replicas_before_ack: 2,
@@ -1220,6 +1223,7 @@ mod bug_av_set_mandatory_tests {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             spill: dtfs_common::types::SpillPolicy::default(),
+            version: 0,
             anchor_datacenter: None,
             write_safety: WriteSafety {
                 min_replicas_before_ack: 2,
@@ -1528,6 +1532,7 @@ mod bug_bv3_data_node_count_tests {
                     required_tier: Some(DiskTier::Cold),
                 }),
                 spill: dtfs_common::types::SpillPolicy::default(),
+                version: 0,
                 anchor_datacenter: None,
                 write_safety: WriteSafety {
                     min_replicas_before_ack: 1,
@@ -1657,6 +1662,7 @@ mod cnf1_stable_disk_id_tests {
                 required_tier: Some(DiskTier::Cold),
             }),
             spill: dtfs_common::types::SpillPolicy::default(),
+            version: 0,
             anchor_datacenter: None,
             write_safety: WriteSafety { min_replicas_before_ack: 1, write_timeout_secs: 30 },
         });

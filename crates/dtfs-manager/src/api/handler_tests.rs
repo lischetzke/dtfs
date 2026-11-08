@@ -310,6 +310,7 @@ fn vol(id: &str) -> dtfs_common::types::VolumeConfig {
         cache_replicas: CacheReplication::default(),
         anchor: None,
         spill: SpillPolicy::default(),
+        version: 0,
     }
 }
 

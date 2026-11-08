@@ -255,6 +255,7 @@ mod snapshot_persistence_tests {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             spill: dtfs_common::types::SpillPolicy::default(),
+            version: 0,
             anchor_datacenter: None,
             write_safety: WriteSafety {
                 min_replicas_before_ack: 1,
@@ -264,7 +265,7 @@ mod snapshot_persistence_tests {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::UpsertVolume { config: volume.clone() },
+            &ClientRequest::UpsertVolume { config: volume.clone(), expected_version: None },
         );
         apply_request(
             &mut sm,
@@ -281,7 +282,7 @@ mod snapshot_persistence_tests {
         apply_request(
             &mut sm,
             &mk_log_id(3),
-            &ClientRequest::UpsertVolume { config: shrunk },
+            &ClientRequest::UpsertVolume { config: shrunk, expected_version: None },
         );
 
         let file = sm.files.get("/foo.bin").expect("file persisted");
@@ -324,6 +325,7 @@ mod snapshot_persistence_tests {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             spill: dtfs_common::types::SpillPolicy::default(),
+            version: 0,
             anchor_datacenter: None,
             write_safety: WriteSafety {
                 min_replicas_before_ack: 1,
@@ -333,14 +335,14 @@ mod snapshot_persistence_tests {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::UpsertVolume { config: volume.clone() },
+            &ClientRequest::UpsertVolume { config: volume.clone(), expected_version: None },
         );
 
         volume.chunk_size_bytes = 4 * 1024 * 1024;
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::UpsertVolume { config: volume.clone() },
+            &ClientRequest::UpsertVolume { config: volume.clone(), expected_version: None },
         );
 
         apply_request(
@@ -965,6 +967,57 @@ mod posix_path_regression {
         );
         let got: Vec<&str> = sm.files["/d.bin"].chunks.iter().map(|c| c.node_id.as_str()).collect();
         assert_eq!(got, vec!["11"]);
+    }
+
+    fn upsert(sm: &mut StateMachineData, idx: u64, v: VolumeConfig, exp: Option<u64>) -> ClientResponse {
+        apply_request(
+            sm,
+            &mk_log_id(idx),
+            &ClientRequest::UpsertVolume { config: v, expected_version: exp },
+        )
+    }
+
+    /// Volume CAS: apply owns `version` (bumped per upsert, wire value ignored);
+    /// a stale `expected_version` is refused and leaves the stored volume alone.
+    #[test]
+    fn upsert_volume_cas_bumps_and_rejects_stale() {
+        let mut sm = StateMachineData::default();
+        let mut v = VolumeConfig::default();
+        v.version = 99; // ignored
+        assert!(matches!(upsert(&mut sm, 1, v.clone(), None), ClientResponse::Success));
+        assert_eq!(sm.volumes["default"].version, 1);
+
+        // Fresh read at version 1 wins, bumping to 2.
+        v.name = "a".into();
+        assert!(matches!(upsert(&mut sm, 2, v.clone(), Some(1)), ClientResponse::Success));
+        assert_eq!(sm.volumes["default"].version, 2);
+
+        // A concurrent writer that also read version 1 is refused.
+        v.name = "b".into();
+        match upsert(&mut sm, 3, v.clone(), Some(1)) {
+            ClientResponse::Error { message } => assert_eq!(
+                message,
+                "volume version conflict on default: expected 1, current 2"
+            ),
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        assert_eq!(sm.volumes["default"].name, "a");
+        assert_eq!(sm.volumes["default"].version, 2);
+
+        // Unconditional upsert still works and bumps.
+        assert!(matches!(upsert(&mut sm, 4, v, None), ClientResponse::Success));
+        assert_eq!(sm.volumes["default"].version, 3);
+    }
+
+    /// A missing volume counts as version 0: Some(0) creates, Some(1) is refused.
+    #[test]
+    fn upsert_volume_cas_missing_volume_is_version_zero() {
+        let mut sm = StateMachineData::default();
+        let v = VolumeConfig::default();
+        assert!(matches!(upsert(&mut sm, 1, v.clone(), Some(1)), ClientResponse::Error { .. }));
+        assert!(sm.volumes.is_empty());
+        assert!(matches!(upsert(&mut sm, 2, v, Some(0)), ClientResponse::Success));
+        assert_eq!(sm.volumes["default"].version, 1);
     }
 
     /// Bug P — `UpdateChunkLocations` MUST reject a commit whose

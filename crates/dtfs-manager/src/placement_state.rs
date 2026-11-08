@@ -336,6 +336,7 @@ pub(crate) mod test_fixture {
                     required_tier: Some(DiskTier::Cold),
                 }),
                 spill: SpillPolicy::default(),
+                version: 0,
                 anchor_datacenter: None,
                 write_safety: WriteSafety {
                     min_replicas_before_ack: 1,
@@ -637,6 +638,7 @@ mod tests {
                     required_tier: Some(DiskTier::Cold),
                 }),
                 spill: dtfs_common::types::SpillPolicy::default(),
+                version: 0,
                 anchor_datacenter: None,
                 write_safety: WriteSafety {
                     min_replicas_before_ack: 1,

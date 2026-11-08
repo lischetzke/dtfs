@@ -164,7 +164,7 @@ fn all_requests() -> Vec<ClientRequest> {
             observed_at_ms: 5,
         },
         UpdateConfig { config_json: s("{}"), version: 2, expected_version: 1 },
-        UpsertVolume { config: VolumeConfig::default() },
+        UpsertVolume { config: VolumeConfig::default(), expected_version: None },
         DeleteVolume { volume_id: s("default") },
         ReportScrubResult {
             node_id: 7, disk_path: s("/d"), level: s("quick"), completed_at_ms: 1, chunks_checked: 2,
@@ -311,6 +311,25 @@ fn client_requests_v1_fixture_covers_every_variant() {
     let live: BTreeSet<&str> = all_requests().iter().map(variant_name).collect();
     assert_eq!(fixture.len(), reqs.len(), "duplicate variant in fixture");
     assert_eq!(fixture, live, "ClientRequest variant set drifted from client_requests_v1.json; add client_requests_v2.json");
+}
+
+/// The v1 fixture predates `VolumeConfig.version` and
+/// `UpsertVolume.expected_version`: both must default (0 / unconditional).
+#[test]
+fn upsert_volume_v1_entry_defaults_cas_fields() {
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V1).unwrap();
+    let up = reqs.iter().find_map(|r| match r {
+        ClientRequest::UpsertVolume { config, expected_version } => Some((config, expected_version)),
+        _ => None,
+    });
+    let (config, expected) = up.expect("fixture has UpsertVolume");
+    assert_eq!((config.version, *expected), (0, None));
+    assert_eq!(snap_volume_version(), 0);
+}
+
+fn snap_volume_version() -> u64 {
+    let snap = deserialize_snapshot(io::Cursor::new(SNAPSHOT_V1.as_bytes().to_vec())).unwrap();
+    snap.volumes["default"].version
 }
 
 #[test]

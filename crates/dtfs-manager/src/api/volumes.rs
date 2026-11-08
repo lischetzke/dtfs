@@ -161,9 +161,10 @@ pub(super) async fn create_volume(
         cache_replicas: dtfs_common::types::CacheReplication::default(),
         anchor: None,
         spill: dtfs_common::types::SpillPolicy::default(),
+        version: 0,
     };
 
-    let req = ClientRequest::UpsertVolume { config };
+    let req = ClientRequest::UpsertVolume { config, expected_version: None };
     state.raft.client_write(req).await
         .map_err(|e| err_body(StatusCode::SERVICE_UNAVAILABLE, format!("raft write failed: {e}")))?;
 
@@ -171,6 +172,20 @@ pub(super) async fn create_volume(
     info!("Volume created: {}", vol_id);
 
     Ok(Json(json!({ "volume_id": vol_id, "name": body.name, "status": "created" })))
+}
+
+/// Map a committed `UpsertVolume` response to 409 when apply rejected it for a
+/// stale `expected_version` (a concurrent set-* won; the caller must re-read).
+fn volume_cas_check(
+    resp: &dtfs_raft::ClientResponse,
+) -> Result<(), (axum::http::StatusCode, Json<Value>)> {
+    if let dtfs_raft::ClientResponse::Error { message } = resp {
+        return Err((
+            axum::http::StatusCode::CONFLICT,
+            Json(json!({"error": message, "preserved_current": true})),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -207,15 +222,19 @@ pub(super) async fn migrate_volume_policy_endpoint(
     let changed = current != migrated;
 
     if changed {
-        let req = ClientRequest::UpsertVolume { config: migrated.clone() };
-        if let Err(e) = state.raft.client_write(req).await {
+        let req = ClientRequest::UpsertVolume { config: migrated.clone(), expected_version: Some(current.version) };
+        let resp = match state.raft.client_write(req).await {
+            Ok(r) => r,
+            Err(e) => {
             warn!(volume = %volume_id, error = %e,
                 "migrate_volume_policy Raft write failed");
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("raft write failed: {e}")})),
             ));
-        }
+        },
+        };
+        volume_cas_check(&resp.data)?;
         state.audit_log.log(
             "api",
             "volume.migrate_policy",
@@ -417,15 +436,19 @@ pub(super) async fn set_volume_cache_endpoint(
 
     let changed = current != next;
     if changed {
-        let req = ClientRequest::UpsertVolume { config: next.clone() };
-        if let Err(e) = state.raft.client_write(req).await {
+        let req = ClientRequest::UpsertVolume { config: next.clone(), expected_version: Some(current.version) };
+        let resp = match state.raft.client_write(req).await {
+            Ok(r) => r,
+            Err(e) => {
             warn!(volume = %volume_id, error = %e,
                 "set_volume_cache Raft write failed");
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("raft write failed: {e}")})),
             ));
-        }
+        },
+        };
+        volume_cas_check(&resp.data)?;
         state.audit_log.log(
             "api", "volume.set_cache", &volume_id, "success",
         );
@@ -520,15 +543,19 @@ pub(super) async fn set_volume_write_safety_endpoint(
 
     let changed = current != next;
     if changed {
-        let req = ClientRequest::UpsertVolume { config: next.clone() };
-        if let Err(e) = state.raft.client_write(req).await {
+        let req = ClientRequest::UpsertVolume { config: next.clone(), expected_version: Some(current.version) };
+        let resp = match state.raft.client_write(req).await {
+            Ok(r) => r,
+            Err(e) => {
             warn!(volume = %volume_id, error = %e,
                 "set_volume_write_safety Raft write failed");
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("raft write failed: {e}")})),
             ));
-        }
+        },
+        };
+        volume_cas_check(&resp.data)?;
         state.audit_log.log(
             "api", "volume.set_write_safety", &volume_id, "success",
         );
@@ -809,15 +836,19 @@ pub(super) async fn set_volume_anchor_endpoint(
 
     let changed = current != next;
     if changed {
-        let req = ClientRequest::UpsertVolume { config: next.clone() };
-        if let Err(e) = state.raft.client_write(req).await {
+        let req = ClientRequest::UpsertVolume { config: next.clone(), expected_version: Some(current.version) };
+        let resp = match state.raft.client_write(req).await {
+            Ok(r) => r,
+            Err(e) => {
             warn!(volume = %volume_id, error = %e,
                 "set_volume_anchor Raft write failed");
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("raft write failed: {e}")})),
             ));
-        }
+        },
+        };
+        volume_cas_check(&resp.data)?;
         state.audit_log.log("api", "volume.set_anchor", &volume_id, "success");
     } else {
         state.audit_log.log("api", "volume.set_anchor", &volume_id, "noop");
@@ -911,14 +942,18 @@ pub(super) async fn set_volume_spill_endpoint(
 
     let changed = current != next;
     if changed {
-        let req = ClientRequest::UpsertVolume { config: next.clone() };
-        if let Err(e) = state.raft.client_write(req).await {
+        let req = ClientRequest::UpsertVolume { config: next.clone(), expected_version: Some(current.version) };
+        let resp = match state.raft.client_write(req).await {
+            Ok(r) => r,
+            Err(e) => {
             warn!(volume = %volume_id, error = %e, "set_volume_spill Raft write failed");
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("raft write failed: {e}")})),
             ));
-        }
+        },
+        };
+        volume_cas_check(&resp.data)?;
         state.audit_log.log("api", "volume.set_spill", &volume_id, "success");
     } else {
         state.audit_log.log("api", "volume.set_spill", &volume_id, "noop");
@@ -971,15 +1006,19 @@ pub(super) async fn set_volume_mandatory_endpoint(
 
     let changed = current != next;
     if changed {
-        let req = ClientRequest::UpsertVolume { config: next.clone() };
-        if let Err(e) = state.raft.client_write(req).await {
+        let req = ClientRequest::UpsertVolume { config: next.clone(), expected_version: Some(current.version) };
+        let resp = match state.raft.client_write(req).await {
+            Ok(r) => r,
+            Err(e) => {
             warn!(volume = %volume_id, error = %e,
                 "set_volume_mandatory Raft write failed");
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("raft write failed: {e}")})),
             ));
-        }
+        },
+        };
+        volume_cas_check(&resp.data)?;
         state.audit_log.log(
             "api", "volume.set_mandatory", &volume_id, "success",
         );
@@ -999,3 +1038,19 @@ pub(super) async fn set_volume_mandatory_endpoint(
 // ---------------------------------------------------------------------------
 // Audit log endpoint
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod volume_cas_tests {
+    use super::*;
+
+    #[test]
+    fn conflict_maps_to_409_and_success_passes() {
+        assert!(volume_cas_check(&dtfs_raft::ClientResponse::Success).is_ok());
+        let (code, Json(body)) = volume_cas_check(&dtfs_raft::ClientResponse::Error {
+            message: "volume version conflict on v: expected 1, current 2".into(),
+        })
+        .unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::CONFLICT);
+        assert_eq!(body["error"], "volume version conflict on v: expected 1, current 2");
+    }
+}

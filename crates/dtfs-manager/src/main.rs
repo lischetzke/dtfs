@@ -339,9 +339,10 @@ async fn main() -> anyhow::Result<()> {
                 cache_replicas: dtfs_common::types::CacheReplication::default(),
                 anchor: None,
                 spill: dtfs_common::types::SpillPolicy::default(),
+                version: 0,
             };
             match raft_for_volume
-                .client_write(dtfs_raft::ClientRequest::UpsertVolume { config: vol_cfg })
+                .client_write(dtfs_raft::ClientRequest::UpsertVolume { config: vol_cfg, expected_version: None })
                 .await
             {
                 Ok(_) => tracing::info!(

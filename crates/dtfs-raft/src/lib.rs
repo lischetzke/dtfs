@@ -426,6 +426,11 @@ pub enum ClientRequest {
     /// Create or update a volume configuration.
     UpsertVolume {
         config: VolumeConfig,
+        /// Optimistic concurrency: when `Some(v)`, apply refuses unless the
+        /// stored volume's `version` is `v` (a missing volume counts as 0).
+        /// `None` (old log entries, create, bootstrap) is an unconditional upsert.
+        #[serde(default)]
+        expected_version: Option<u64>,
     },
     /// Remove a volume configuration.
     DeleteVolume {
@@ -745,7 +750,7 @@ impl fmt::Display for ClientRequest {
                 )
             }
             Self::UpdateConfig { version, .. } => write!(f, "UpdateConfig(v{version})"),
-            Self::UpsertVolume { config } => write!(f, "UpsertVolume({})", config.id),
+            Self::UpsertVolume { config, .. } => write!(f, "UpsertVolume({})", config.id),
             Self::DeleteVolume { volume_id } => write!(f, "DeleteVolume({volume_id})"),
             Self::ReportScrubResult { node_id, level, chunks_checked, chunks_corrupt, .. } => {
                 write!(f, "ReportScrubResult(node={node_id}, {level}, checked={chunks_checked}, corrupt={chunks_corrupt})")

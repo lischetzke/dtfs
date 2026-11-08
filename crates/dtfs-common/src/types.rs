@@ -574,6 +574,11 @@ pub struct VolumeConfig {
     /// tier/DC exclusions).
     #[serde(default)]
     pub spill: SpillPolicy,
+
+    /// Optimistic-concurrency counter, bumped by every `UpsertVolume` apply.
+    /// `#[serde(default)]` keeps old snapshots loadable (0 = never bumped).
+    #[serde(default)]
+    pub version: u64,
 }
 
 /// Bug BZ — per-volume capacity-spill exclusions. When the mandated tier
@@ -697,6 +702,7 @@ impl Default for VolumeConfig {
             cache_replicas: CacheReplication::default(),
             anchor: None,
             spill: SpillPolicy::default(),
+            version: 0,
         }
     }
 }

@@ -396,6 +396,7 @@ mod bug_av_preferred_tier_tests {
             },
             anchor: None,
             spill: dtfs_common::types::SpillPolicy::default(),
+            version: 0,
             anchor_datacenter: Some("dc-a".to_string()),
             write_safety: WriteSafety {
                 min_replicas_before_ack: 1,
@@ -509,6 +510,7 @@ mod rev_4_10_hint_ack_floor_tests {
             },
             anchor: None,
             spill: SpillPolicy::default(),
+            version: 0,
             anchor_datacenter: Some("dc-a".to_string()),
             write_safety: WriteSafety {
                 min_replicas_before_ack: floor,
@@ -1387,6 +1389,7 @@ mod tests {
             },
             anchor: None,
             spill: SpillPolicy::default(),
+            version: 0,
             anchor_datacenter: None,
             write_safety: WriteSafety {
                 min_replicas_before_ack: floor,

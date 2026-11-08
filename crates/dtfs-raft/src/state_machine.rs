@@ -1584,10 +1584,23 @@ fn apply_request(
             ClientResponse::Success
         }
 
-        ClientRequest::UpsertVolume { config } => {
+        ClientRequest::UpsertVolume { config, expected_version } => {
             let vol_id = config.id.0.clone();
+            let current = sm.volumes.get(&vol_id).map_or(0, |v| v.version);
+            if let Some(exp) = expected_version {
+                if *exp != current {
+                    return ClientResponse::Error {
+                        message: format!(
+                            "volume version conflict on {vol_id}: expected {exp}, current {current}"
+                        ),
+                    };
+                }
+            }
             push_audit_capped(&mut sm.audit_log, audit(format!("UpsertVolume: {vol_id}")));
-            sm.volumes.insert(vol_id, config.clone());
+            // Apply is the sole authority on `version`; the wire value is ignored.
+            let mut stored = config.clone();
+            stored.version = current + 1;
+            sm.volumes.insert(vol_id, stored);
             ClientResponse::Success
         }
 
