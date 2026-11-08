@@ -55,7 +55,7 @@ A fetch that fails (timeout `client.chunk_read_timeout_secs`, `data_loss`, check
 
 ## Writes
 
-Writes are buffered per chunk, flushed in batches (`write.flush_batch_chunks`, default 4; the chunks of a batch upload concurrently) and committed under a write lease, one commit per batch after all its chunks are stored. Details and failure handling in [Data Flow](../architecture/data-flow.md#write). Points that affect behaviour:
+Writes are buffered per chunk, flushed in batches (`write.flush_batch_chunks`, default 4; up to `write.upload_concurrency`, default 2, chunks of a batch upload at once) and committed under a write lease, one commit per batch after all its chunks are stored. Details and failure handling in [Data Flow](../architecture/data-flow.md#write). Points that affect behaviour:
 
 - **Chunk size.** `client.chunk_size_mb` (default 4) must equal the volume's chunk size. The client reads the file's real chunk size from the manager and refuses a write whose configured size does not match.
 - **Read-modify-write.** Writing into the middle of an existing chunk reads that chunk once to seed the buffer; a seed failure is an error, not a silent partial overwrite.

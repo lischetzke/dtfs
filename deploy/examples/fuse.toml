@@ -110,6 +110,10 @@ mountpoint = "/mnt/dtfs"
 # volume falls back to per-chunk flushing). 1 restores the pre-WI-01
 # per-chunk-flush behaviour exactly.
 #flush_batch_chunks = 4
+# Chunks of one flush batch uploaded concurrently (clamped 1..=8; 1 = one
+# chunk at a time). Each in-flight chunk buffers about 3 MiB per target;
+# on a slow WAN link keep it low so puts stay within the 60 s RPC timeout.
+#upload_concurrency = 2
 
 #[memory]
 # CF-5: per-process RAM budget + pressure ladder. 0 = unbounded (legacy).

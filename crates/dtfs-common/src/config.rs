@@ -1109,6 +1109,12 @@ pub struct FuseWriteConfig {
     /// chunks of 64 MB or more flushes per chunk — see CLAUDE.md A.3.2.
     #[serde(default = "default_flush_batch_chunks")]
     pub flush_batch_chunks: u32,
+    /// Chunks of one flush batch put concurrently (each to all its targets).
+    /// Clamped into `1..=8` by `effective_upload_concurrency`; `1` uploads
+    /// one chunk at a time. Each in-flight chunk put holds buffered pieces
+    /// per target, and every put shares the link under a fixed RPC timeout.
+    #[serde(default = "default_upload_concurrency")]
+    pub upload_concurrency: u32,
 }
 
 impl Default for FuseWriteConfig {
@@ -1116,6 +1122,7 @@ impl Default for FuseWriteConfig {
         Self {
             first_write_tier: default_first_write_tier(),
             flush_batch_chunks: default_flush_batch_chunks(),
+            upload_concurrency: default_upload_concurrency(),
         }
     }
 }
@@ -1146,6 +1153,11 @@ impl FuseWriteConfig {
             _ => FirstWriteTier::Cold,
         }
     }
+
+    /// `upload_concurrency` clamped into `1..=8`.
+    pub fn effective_upload_concurrency(&self) -> usize {
+        self.upload_concurrency.clamp(1, 8) as usize
+    }
 }
 
 fn default_first_write_tier() -> String {
@@ -1154,6 +1166,10 @@ fn default_first_write_tier() -> String {
 
 fn default_flush_batch_chunks() -> u32 {
     4
+}
+
+fn default_upload_concurrency() -> u32 {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2031,6 +2047,19 @@ warm = 2
         let cfg: FuseWriteConfig =
             toml::from_str("flush_batch_chunks = 1").unwrap();
         assert_eq!(cfg.flush_batch_chunks, 1, "1 is the documented rollback value");
+    }
+
+    #[test]
+    fn upload_concurrency_defaults_to_two_and_clamps_to_1_8() {
+        let cfg: FuseWriteConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.upload_concurrency, 2);
+        assert_eq!(cfg.effective_upload_concurrency(), 2);
+        assert_eq!(FuseWriteConfig::default().upload_concurrency, 2);
+        for (raw, want) in [(0u32, 1usize), (1, 1), (8, 8), (9, 8)] {
+            let cfg: FuseWriteConfig =
+                toml::from_str(&format!("upload_concurrency = {raw}")).unwrap();
+            assert_eq!(cfg.effective_upload_concurrency(), want, "raw {raw}");
+        }
     }
 
     /// Bug BC-1 — an empty `[scrub]` block (or its complete absence)

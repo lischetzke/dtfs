@@ -800,7 +800,8 @@ impl DtfsClient {
         let volume_id_owned = volume_id.to_string();
         let tier_owned = tier.to_string();
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<PutChunkRequest>(8);
+        // 2 x 1 MiB pieces queued per put (each piece is a copy of the chunk).
+        let (tx, rx) = tokio::sync::mpsc::channel::<PutChunkRequest>(2);
         let id_for_task = chunk_id_owned.clone();
         let vol_for_task = volume_id_owned.clone();
         let tier_for_task = tier_owned.clone();

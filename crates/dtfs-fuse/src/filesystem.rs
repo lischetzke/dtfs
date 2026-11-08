@@ -2774,7 +2774,8 @@ impl DtfsFilesystem {
         // replication-factor=N real (fix for F-010). The segments of the
         // batch upload concurrently; any failed segment fails the batch
         // before the single commit below.
-        let uploaded = upload_segments(segments.len(), |i| async move {
+        let concurrency = self.config.write.effective_upload_concurrency();
+        let uploaded = upload_segments(segments.len(), concurrency, |i| async move {
             let segment = &segments[i];
             let mut placement = placements[i].clone();
 
@@ -3536,14 +3537,19 @@ fn is_resource_exhausted(e: &anyhow::Error) -> bool {
 }
 
 /// Runs `upload(i)` for every segment index of a flush batch and returns the
-/// results in index order, or the lowest-index error. All uploads run
-/// concurrently and each is awaited to its end (none is cancelled mid-put).
-async fn upload_segments<T, F, Fut>(n: usize, upload: F) -> Result<Vec<T>>
+/// results in index order, or the lowest-index error. At most `concurrency`
+/// uploads run at once (`1` = sequential); after the first error in index
+/// order no further segment starts and the other in-flight puts are dropped.
+async fn upload_segments<T, F, Fut>(n: usize, concurrency: usize, upload: F) -> Result<Vec<T>>
 where
     F: FnMut(usize) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    futures_util::future::join_all((0..n).map(upload)).await.into_iter().collect()
+    use futures_util::{StreamExt, TryStreamExt};
+    futures_util::stream::iter((0..n).map(upload))
+        .buffered(concurrency.max(1))
+        .try_collect()
+        .await
 }
 
 /// Spawns `fut` only if `permits` has a free permit (held until `fut` ends);
@@ -3570,40 +3576,64 @@ mod perf_io_concurrency_tests {
     use std::sync::atomic::AtomicUsize;
 
     #[tokio::test]
-    async fn upload_segments_runs_all_segments_concurrently_in_order() {
-        let inflight = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let res = upload_segments(4, |i| {
-            let (inflight, peak) = (inflight.clone(), peak.clone());
-            async move {
-                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                inflight.fetch_sub(1, Ordering::SeqCst);
-                Ok(i * 10)
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(peak.load(Ordering::SeqCst), 4, "segments must overlap");
-        assert_eq!(res, vec![0, 10, 20, 30]);
+    async fn upload_segments_keeps_at_most_n_in_flight_in_order() {
+        for n in [1usize, 2, 4] {
+            let inflight = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let res = upload_segments(6, n, |i| {
+                let (inflight, peak) = (inflight.clone(), peak.clone());
+                async move {
+                    let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    // Later segments finish first: order must still hold.
+                    tokio::time::sleep(Duration::from_millis(30 - 4 * i as u64)).await;
+                    inflight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(i * 10)
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(peak.load(Ordering::SeqCst), n, "concurrency {n}");
+            assert_eq!(res, vec![0, 10, 20, 30, 40, 50]);
+        }
     }
 
     #[tokio::test]
-    async fn upload_segments_fails_on_any_segment_error_after_all_finish() {
-        let done = Arc::new(AtomicUsize::new(0));
-        let res: Result<Vec<usize>> = upload_segments(3, |i| {
-            let done = done.clone();
+    async fn upload_segments_n1_is_sequential_and_stops_at_first_error() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let res: Result<Vec<usize>> = upload_segments(4, 1, |i| {
+            let started = started.clone();
             async move {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                done.fetch_add(1, Ordering::SeqCst);
+                started.fetch_add(1, Ordering::SeqCst);
                 if i == 1 { bail!("segment {i} failed") } else { Ok(i) }
             }
         })
         .await;
         assert_eq!(res.unwrap_err().to_string(), "segment 1 failed");
-        // No put is abandoned mid-stream: every segment ran to completion.
-        assert_eq!(done.load(Ordering::SeqCst), 3);
+        assert_eq!(started.load(Ordering::SeqCst), 2, "no segment starts after the failure");
+    }
+
+    #[tokio::test]
+    async fn upload_segments_returns_lowest_index_error() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let res: Result<Vec<usize>> = upload_segments(6, 2, |i| {
+            let started = started.clone();
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                match i {
+                    // Segment 1 fails after segment 2 already failed.
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        bail!("segment 1 failed")
+                    }
+                    2 => bail!("segment 2 failed"),
+                    _ => Ok(i),
+                }
+            }
+        })
+        .await;
+        assert_eq!(res.unwrap_err().to_string(), "segment 1 failed");
+        assert_eq!(started.load(Ordering::SeqCst), 3, "only segments 0..=2 started");
     }
 
     #[tokio::test]

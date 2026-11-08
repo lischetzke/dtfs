@@ -100,9 +100,12 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   fsync return the commit error.
 - `writebuf.rs` batches `write.flush_batch_chunks` (default 4, clamp
   1..=32) complete chunks per `flush()`; `flush_all` drains everything.
-  `flush_segments_to_cluster` puts a batch's segments concurrently
-  (`upload_segments`, every put awaited, lowest-index error wins) and sends
-  ONE `commit_chunk_locations` only after all segments reached quorum.
+  `flush_segments_to_cluster` puts a batch's segments at most
+  `write.upload_concurrency` (default 2, clamp 1..=8) at a time
+  (`upload_segments`, ordered `buffered`, lowest-index error wins, nothing
+  starts after it) and sends ONE `commit_chunk_locations` only after all
+  segments reached quorum. Do not unbound it: puts share a fixed 60 s
+  deadline and each buffers ~3 MiB per target (put channel depth 2).
 - Batch is byte-clamped at `FLUSH_BATCH_MAX_BYTES` (64 MB); total dirty
   bytes per open file are capped at `DIRTY_BYTES_CAP` (2x) and
   force-drained via `flush_complete()` before a hole fill or write would
