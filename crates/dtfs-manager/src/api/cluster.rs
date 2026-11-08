@@ -35,6 +35,20 @@ pub(crate) fn effective_health(
     }
 }
 
+/// Closure projecting a node's stored health through `effective_health` using
+/// the wall clock now and `[raft].node_liveness_secs`. Every read endpoint
+/// must use it so a frozen-heartbeat node is not reported Healthy anywhere.
+pub(crate) fn liveness_projector(
+    state: &AppState,
+) -> impl Fn(&RaftNodeInfo) -> dtfs_common::types::HealthStatus {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let window = state.config.raft.node_liveness_secs;
+    move |n| effective_health(n.health, n.last_seen_ms, now_ms, window)
+}
+
 /// CF-4c — true iff `node_id` participates in raft membership as a voter or
 /// a learner. A Manager-role node that is in neither set is registered/
 /// configured but has not actually joined the cluster (the production dc1
@@ -121,7 +135,7 @@ pub(super) fn anchor_satisfied_by(
     anchor: &dtfs_common::types::AnchorPolicy,
 ) -> bool {
     placements.iter().any(|(dc, tier)| {
-        dc == &anchor.datacenter
+        dc.eq_ignore_ascii_case(&anchor.datacenter)
             && match anchor.required_tier {
                 Some(t) => *tier == t,
                 None => true,
@@ -485,27 +499,28 @@ pub(super) async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value>
     // dashboard banner. Managers come from config voters; data-node
     // health from sm.nodes. Clients excluded so a FUSE mount can't drag
     // the ratio. Same two inputs feed numerator and denominator.
-    let (infra_healthy, infra_total) = infra_health_counts(
-        manager_count,
-        sm.nodes
-            .values()
-            .filter(|n| n.role == NodeRole::Data)
-            .map(|n| &n.health),
-    );
+    let eff = liveness_projector(&state);
+    let data_health: Vec<HealthStatus> = sm
+        .nodes
+        .values()
+        .filter(|n| n.role == NodeRole::Data)
+        .map(|n| eff(n))
+        .collect();
+    let (infra_healthy, infra_total) = infra_health_counts(manager_count, data_health.iter());
 
     // Overall cluster health.
     let total_nodes = sm.nodes.len();
     let healthy_nodes = sm
         .nodes
         .values()
-        .filter(|n| n.health == HealthStatus::Healthy)
+        .filter(|n| eff(n) == HealthStatus::Healthy)
         .count();
     let degraded_nodes = sm
         .nodes
         .values()
         .filter(|n| {
             matches!(
-                n.health,
+                eff(n),
                 HealthStatus::Suspect | HealthStatus::Degraded
             )
         })
@@ -516,7 +531,7 @@ pub(super) async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value>
     let quarantined_nodes = sm
         .nodes
         .values()
-        .filter(|n| matches!(n.health, HealthStatus::Quarantined))
+        .filter(|n| matches!(eff(n), HealthStatus::Quarantined))
         .count();
     let health = if total_nodes == 0 {
         "unknown"
@@ -539,23 +554,24 @@ pub(super) async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value>
     // Per (node, level) scrub results (BK — previously keyed per-node only,
     // so a deep scrub overwrote the quick result). Flatten the nested map to
     // one JSON object per (node, level); the WebUI lists every entry.
+    let scrub_json = |s: &dtfs_raft::state_machine::ScrubRecord| {
+        json!({
+            "node_id":         s.node_id,
+            "disk_path":       s.disk_path,
+            "level":           s.level,
+            "completed_at_ms": s.completed_at_ms,
+            "chunks_checked":  s.chunks_checked,
+            "chunks_healthy":  s.chunks_healthy,
+            "chunks_corrupt":  s.chunks_corrupt,
+            "chunks_missing":  s.chunks_missing,
+            "duration_secs":   s.duration_secs,
+        })
+    };
     let scrub_results_by_node: Vec<Value> = sm
         .scrub_results_by_level
         .values()
         .flat_map(|by_level| by_level.values())
-        .map(|s| {
-            json!({
-                "node_id":         s.node_id,
-                "disk_path":       s.disk_path,
-                "level":           s.level,
-                "completed_at_ms": s.completed_at_ms,
-                "chunks_checked":  s.chunks_checked,
-                "chunks_healthy":  s.chunks_healthy,
-                "chunks_corrupt":  s.chunks_corrupt,
-                "chunks_missing":  s.chunks_missing,
-                "duration_secs":   s.duration_secs,
-            })
-        })
+        .map(scrub_json)
         .collect();
 
     // Backward-compatible `last_scrub` field: the most recent result across
@@ -565,19 +581,7 @@ pub(super) async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value>
         .values()
         .flat_map(|by_level| by_level.values())
         .max_by_key(|s| s.completed_at_ms)
-        .map(|s| {
-            json!({
-                "node_id":         s.node_id,
-                "disk_path":       s.disk_path,
-                "level":           s.level,
-                "completed_at_ms": s.completed_at_ms,
-                "chunks_checked":  s.chunks_checked,
-                "chunks_healthy":  s.chunks_healthy,
-                "chunks_corrupt":  s.chunks_corrupt,
-                "chunks_missing":  s.chunks_missing,
-                "duration_secs":   s.duration_secs,
-            })
-        });
+        .map(scrub_json);
 
     // Bug AK — logical user-visible bytes across all files. Sum per-file
     // sizes deduped by chunk_index (replicas don't multiply user data).
@@ -662,8 +666,9 @@ pub(super) async fn prometheus_metrics(
     let mut quarantined = 0u64;
     let mut total_capacity: u64 = 0;
     let mut used_capacity: u64 = 0;
+    let eff = liveness_projector(&state);
     for info in sm.nodes.values() {
-        match info.health {
+        match eff(info) {
             dtfs_common::types::HealthStatus::Healthy => healthy += 1,
             dtfs_common::types::HealthStatus::Suspect => suspect += 1,
             dtfs_common::types::HealthStatus::Down => down += 1,
@@ -758,11 +763,12 @@ pub(super) async fn healthz_probe() -> (axum::http::StatusCode, &'static str) {
 /// manager has finished its Raft warmup); 503 otherwise so K8s/systemd can
 /// route around an in-recovery manager.
 pub(super) async fn readyz_probe(State(state): State<Arc<AppState>>) -> (axum::http::StatusCode, String) {
+    let eff = liveness_projector(&state);
     let sm = state.sm_data.read().await;
     let any_healthy = sm
         .nodes
         .values()
-        .any(|n| n.health == dtfs_common::types::HealthStatus::Healthy);
+        .any(|n| eff(n) == dtfs_common::types::HealthStatus::Healthy);
     let fsm_initialised = sm.last_applied_log.is_some();
     drop(sm);
 

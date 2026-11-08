@@ -487,11 +487,14 @@ pub(super) async fn list_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<N
 pub(super) async fn get_node(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(node_id): axum::extract::Path<String>,
-) -> Result<Json<Value>, StatusCode> {
-    let nid: u64 = node_id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let nid: u64 = node_id.parse().map_err(|_| err_body(StatusCode::BAD_REQUEST, "node_id must be u64"))?;
     let sm = state.sm_data.read().await;
 
-    let info = sm.nodes.get(&nid).ok_or(StatusCode::NOT_FOUND)?;
+    let info = sm
+        .nodes
+        .get(&nid)
+        .ok_or_else(|| err_body(StatusCode::NOT_FOUND, format!("node {nid} not found")))?;
 
     let disks: Vec<Value> = info
         .disks
@@ -522,9 +525,13 @@ pub(super) async fn get_node(
         "disks": disks,
         "total_capacity": info.total_capacity,
         "used_capacity": info.used_capacity,
-        "health": format!("{:?}", info.health),
+        "health": format!("{:?}", liveness_projector(&state)(info)),
         "role": format!("{:?}", info.role),
     })))
+}
+
+pub(super) fn err_body(code: StatusCode, msg: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (code, Json(json!({"error": msg.to_string()})))
 }
 
 #[derive(Deserialize)]
@@ -536,8 +543,12 @@ pub(super) async fn set_maintenance(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(node_id): axum::extract::Path<String>,
     Json(body): Json<MaintenanceRequest>,
-) -> Result<Json<Value>, StatusCode> {
-    let nid: u64 = node_id.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let nid: u64 = node_id.parse().map_err(|_| err_body(StatusCode::BAD_REQUEST, "node_id must be u64"))?;
+    // The apply silently ignores an unknown node; refuse it here.
+    if !state.sm_data.read().await.nodes.contains_key(&nid) {
+        return Err(err_body(StatusCode::NOT_FOUND, format!("node {nid} not found")));
+    }
 
     let status_str = if body.enable {
         "maintenance"
@@ -550,11 +561,15 @@ pub(super) async fn set_maintenance(
         status: status_str.to_string(),
     };
 
-    state
+    let resp = state
         .raft
         .client_write(req)
         .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|e| err_body(StatusCode::SERVICE_UNAVAILABLE, format!("raft write failed: {e}")))?;
+    if let dtfs_raft::ClientResponse::Error { message } = resp.data {
+        warn!(node = nid, error = %message, "maintenance toggle refused by apply");
+        return Err(err_body(StatusCode::CONFLICT, message));
+    }
 
     state.audit_log.log(
         "api",
@@ -640,12 +655,16 @@ pub(super) async fn unquarantine_node_endpoint(
         reason_acknowledged: body.reason_acknowledged.clone(),
     };
 
-    state
+    let resp = state
         .raft
         .client_write(req)
         .await
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": format!("raft write failed: {e}")}))))?;
+    if let dtfs_raft::ClientResponse::Error { message } = resp.data {
+        warn!(node = nid, error = %message, "unquarantine refused by apply");
+        return Err(err_body(StatusCode::CONFLICT, message));
+    }
 
     state.audit_log.log(
         "api",

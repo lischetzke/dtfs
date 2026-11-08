@@ -207,3 +207,187 @@ async fn list_files_paging_prefix_and_truncation() {
     assert_eq!(r["files"].as_array().unwrap().len(), 0);
     assert_eq!(r["truncated"], false);
 }
+
+// ---- Tasks 5, 8, 10: node endpoints ------------------------------------------
+
+fn data_node(last_seen_ms: u64) -> dtfs_raft::NodeInfo {
+    dtfs_raft::NodeInfo {
+        hostname: "d1".into(),
+        grpc_addr: String::new(),
+        role: dtfs_common::types::NodeRole::Data,
+        disks: Vec::new(),
+        location: dtfs_common::topology::Location::new("", "", "", ""),
+        health: dtfs_common::types::HealthStatus::Healthy,
+        total_capacity: 0,
+        used_capacity: 0,
+        last_seen_ms,
+        total_bytes_read: 0,
+        total_bytes_written: 0,
+        client_ip: None,
+        version: String::new(),
+        build_date: String::new(),
+        quarantine: None,
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+async fn seed_node(h: &super::test_support::Harness, last_seen_ms: u64) {
+    h.state.sm_data.write().await.nodes.insert(7, data_node(last_seen_ms));
+}
+
+fn path7() -> axum::extract::Path<String> {
+    axum::extract::Path("7".to_string())
+}
+
+#[tokio::test]
+async fn get_node_projects_stale_liveness() {
+    let h = harness().await;
+    seed_node(&h, now_ms() - 3_600_000).await;
+    let v = get_node(State(h.state.clone()), path7()).await.unwrap().0;
+    assert_eq!(v["health"], "Down");
+    seed_node(&h, now_ms()).await;
+    let v = get_node(State(h.state.clone()), path7()).await.unwrap().0;
+    assert_eq!(v["health"], "Healthy");
+}
+
+#[tokio::test]
+async fn stats_and_readyz_use_effective_health() {
+    let h = harness().await;
+    seed_node(&h, now_ms() - 3_600_000).await;
+    let s = get_stats(State(h.state.clone())).await.0;
+    assert_eq!(s["healthy_nodes"], 0, "{s}");
+    assert_ne!(s["health"], "healthy");
+    let (_, msg) = readyz_probe(State(h.state.clone())).await;
+    assert!(msg.contains("any_healthy=false"), "{msg}");
+    let (_, _, metrics) = prometheus_metrics(State(h.state.clone())).await;
+    assert!(metrics.contains("dtfs_nodes_down 1\n") && metrics.contains("dtfs_nodes_healthy 0\n"), "{metrics}");
+
+    seed_node(&h, now_ms()).await;
+    let s = get_stats(State(h.state.clone())).await.0;
+    assert_eq!(s["healthy_nodes"], 1, "{s}");
+    let (_, msg) = readyz_probe(State(h.state.clone())).await;
+    assert!(msg.contains("any_healthy=true"), "{msg}");
+}
+
+#[tokio::test]
+async fn node_errors_carry_json_bodies_and_unknown_node_is_404() {
+    let h = harness().await;
+    let e = get_node(State(h.state.clone()), path7()).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::NOT_FOUND);
+    assert!(e.1.0["error"].as_str().unwrap().contains("not found"));
+    let e = get_node(State(h.state.clone()), axum::extract::Path("x".into())).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::BAD_REQUEST);
+    assert!(e.1.0["error"].is_string());
+    let e = set_maintenance(State(h.state.clone()), path7(), Json(MaintenanceRequest { enable: true }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.0, StatusCode::NOT_FOUND);
+    assert!(e.1.0["error"].is_string());
+    // Known node but no leader: the failed write is a 503 with a body, never 200.
+    seed_node(&h, now_ms()).await;
+    let e = set_maintenance(State(h.state.clone()), path7(), Json(MaintenanceRequest { enable: true }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(e.1.0["error"].is_string());
+}
+
+// ---- Task 6: anchor datacenter handling --------------------------------------
+
+fn vol(id: &str) -> dtfs_common::types::VolumeConfig {
+    use dtfs_common::types::*;
+    VolumeConfig {
+        id: VolumeId::new(id.to_string()),
+        name: id.into(),
+        chunk_size_bytes: 1 << 20,
+        replication: TierReplication { hot: 1, warm: 1, cold: 1, tape: 1 },
+        write_safety: WriteSafety { min_replicas_before_ack: 1, write_timeout_secs: 30 },
+        anchor_datacenter: None,
+        mandatory_replicas: TierReplication { hot: 0, warm: 1, cold: 1, tape: 0 },
+        cache_replicas: CacheReplication::default(),
+        anchor: None,
+        spill: SpillPolicy::default(),
+    }
+}
+
+fn create(name: &str, dc: Option<&str>, force: bool) -> CreateVolumeRequest {
+    CreateVolumeRequest {
+        name: name.into(),
+        chunk_size_mb: None,
+        replication_hot: None,
+        replication_warm: None,
+        replication_cold: None,
+        anchor_datacenter: dc.map(String::from),
+        force,
+    }
+}
+
+async fn seed_dc(h: &super::test_support::Harness, dc: &str) {
+    let mut n = data_node(now_ms());
+    n.location = dtfs_common::topology::Location::new("r", dc, "k", "h");
+    h.state.sm_data.write().await.nodes.insert(9, n);
+}
+
+#[test]
+fn anchor_dc_compares_case_insensitively_and_trims() {
+    use dtfs_common::types::{AnchorPolicy, DiskTier};
+    let a = AnchorPolicy { datacenter: "LELI".into(), required_tier: None };
+    assert!(anchor_satisfied_by(&[("leli".into(), DiskTier::Warm)], &a));
+    assert!(!anchor_satisfied_by(&[("toro".into(), DiskTier::Warm)], &a));
+    assert_eq!(normalize_dc(Some("  leli ")).as_deref(), Some("leli"));
+    assert_eq!(normalize_dc(Some("  ")), None);
+    assert_eq!(normalize_dc(Some("")), None);
+    assert_eq!(normalize_dc(None), None);
+}
+
+#[tokio::test]
+async fn create_volume_unknown_anchor_dc_is_400_unless_forced() {
+    let h = harness().await;
+    seed_dc(&h, "LELI").await;
+    let e = create_volume(State(h.state.clone()), Json(create("v1", Some("nowhere"), false))).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::BAD_REQUEST);
+    assert!(e.1.0["error"].as_str().unwrap().contains("nowhere"));
+    // Past the DC gate the (leaderless) Raft write is what fails: 503, not 400.
+    for (dc, force) in [(Some(" leli "), false), (Some("nowhere"), true), (Some(""), false), (None, false)] {
+        let e = create_volume(State(h.state.clone()), Json(create("v2", dc, force))).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE, "{dc:?} force={force}");
+        assert!(e.1.0["error"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn create_volume_duplicate_is_409_with_body() {
+    let h = harness().await;
+    h.state.sm_data.write().await.volumes.insert("dup".into(), vol("dup"));
+    let e = create_volume(State(h.state.clone()), Json(create("dup", None, false))).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert!(e.1.0["error"].is_string());
+}
+
+#[tokio::test]
+async fn set_anchor_unknown_dc_is_400_unless_forced() {
+    let h = harness().await;
+    seed_dc(&h, "LELI").await;
+    h.state.sm_data.write().await.volumes.insert("v".into(), vol("v"));
+    let body = |dc: &str, force| SetAnchorRequest { datacenter: Some(dc.into()), required_tier: None, force };
+    let p = || axum::extract::Path("v".to_string());
+    let e = set_volume_anchor_endpoint(State(h.state.clone()), p(), Json(body("nowhere", false))).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::BAD_REQUEST);
+    for (dc, force) in [(" leli ", false), ("nowhere", true)] {
+        let e = set_volume_anchor_endpoint(State(h.state.clone()), p(), Json(body(dc, force))).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE, "{dc:?} force={force}");
+    }
+    // Clearing the anchor never needs a known DC (no-op here, so no write).
+    let r = set_volume_anchor_endpoint(State(h.state.clone()), p(), Json(body("", false))).await.unwrap();
+    assert_eq!(r.0["changed"], false);
+}
+
+#[test]
+fn apply_set_anchor_trims_datacenter() {
+    let next = apply_set_anchor(&vol("v"), &SetAnchorRequest { datacenter: Some(" leli ".into()), required_tier: None, force: false }).unwrap();
+    assert_eq!(next.anchor.unwrap().datacenter, "leli");
+    assert_eq!(next.anchor_datacenter.as_deref(), Some("leli"));
+}

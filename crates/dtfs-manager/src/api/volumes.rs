@@ -80,6 +80,23 @@ pub(super) struct CreateVolumeRequest {
     /// last anchor copy).
     #[serde(default)]
     pub(super) anchor_datacenter: Option<String>,
+    /// Accept an anchor DC that no registered node reports (e.g. before the
+    /// anchor site's data node has joined).
+    #[serde(default)]
+    pub(super) force: bool,
+}
+
+/// Trim an operator-supplied anchor DC; empty means "no anchor".
+pub(super) fn normalize_dc(dc: Option<&str>) -> Option<String> {
+    dc.map(str::trim).filter(|d| !d.is_empty()).map(str::to_string)
+}
+
+/// Does any registered node report `dc` (case-insensitive)?
+pub(super) fn dc_is_known(
+    nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+    dc: &str,
+) -> bool {
+    nodes.values().any(|n| n.location.datacenter.eq_ignore_ascii_case(dc))
 }
 
 /// CO-4-14 — canonical volume id derived from the operator-supplied name.
@@ -92,7 +109,7 @@ pub(super) fn volume_id_from_name(name: &str) -> String {
 pub(super) async fn create_volume(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateVolumeRequest>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     use dtfs_common::types::{TierReplication, VolumeConfig, VolumeId, WriteSafety};
 
     let vol_id = volume_id_from_name(&body.name);
@@ -102,8 +119,21 @@ pub(super) async fn create_volume(
     // cache / anchor / write-safety tuning applied since the first create
     // (apply is a blind BTreeMap insert). Reject with 409 instead; operators
     // change an existing volume through the dedicated tuning endpoints.
-    if state.sm_data.read().await.volumes.contains_key(&vol_id) {
-        return Err(StatusCode::CONFLICT);
+    let anchor_dc = normalize_dc(body.anchor_datacenter.as_deref());
+    {
+        let sm = state.sm_data.read().await;
+        if sm.volumes.contains_key(&vol_id) {
+            return Err(err_body(StatusCode::CONFLICT, format!("volume {vol_id} already exists")));
+        }
+        if let Some(dc) = &anchor_dc {
+            if !body.force && !dc_is_known(&sm.nodes, dc) {
+                warn!(volume = %vol_id, dc = %dc, "create_volume rejected: unknown anchor datacenter");
+                return Err(err_body(
+                    StatusCode::BAD_REQUEST,
+                    format!("no registered node reports datacenter '{dc}'; pass force:true to anchor anyway"),
+                ));
+            }
+        }
     }
 
     let config = VolumeConfig {
@@ -122,7 +152,7 @@ pub(super) async fn create_volume(
             min_replicas_before_ack: state.config.defaults.write_safety.min_replicas_before_ack,
             write_timeout_secs:      state.config.defaults.write_safety.write_timeout_secs,
         },
-        anchor_datacenter: body.anchor_datacenter.clone(),
+        anchor_datacenter: anchor_dc,
         // Bug AV — new fields default to empty so the legacy
         // construction path lands a back-compat volume. Operators on the
         // new policy upgrade via `dtfs-cli volume migrate-policy`
@@ -135,7 +165,7 @@ pub(super) async fn create_volume(
 
     let req = ClientRequest::UpsertVolume { config };
     state.raft.client_write(req).await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|e| err_body(StatusCode::SERVICE_UNAVAILABLE, format!("raft write failed: {e}")))?;
 
     state.audit_log.log("api", "volume.create", &vol_id, "success");
     info!("Volume created: {}", vol_id);
@@ -673,6 +703,9 @@ pub(super) fn cluster_has_tape_disk(
 pub(crate) struct SetAnchorRequest {
     pub datacenter: Option<String>,
     pub required_tier: Option<String>,
+    /// Accept a datacenter no registered node reports.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// AV-5-12 pure helper — merge a partial anchor update onto the
@@ -697,7 +730,8 @@ pub(crate) fn apply_set_anchor(
 
     let new_dc = req
         .datacenter
-        .clone()
+        .as_deref()
+        .map(|d| d.trim().to_string())
         .unwrap_or_else(|| current_anchor.datacenter.clone());
     let new_tier: Option<DiskTier> = match req.required_tier.as_deref() {
         None => current_anchor.required_tier,
@@ -760,6 +794,18 @@ pub(super) async fn set_volume_anchor_endpoint(
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e})),
         ))?;
+    if let Some(dc) = next.anchor.as_ref().map(|a| a.datacenter.as_str()) {
+        let named = normalize_dc(body.datacenter.as_deref()).is_some();
+        if named && !body.force && !dc_is_known(&state.sm_data.read().await.nodes, dc) {
+            warn!(volume = %volume_id, dc = %dc, "set-anchor rejected: unknown datacenter");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!(
+                    "no registered node reports datacenter '{dc}'; pass force:true to anchor anyway"
+                )})),
+            ));
+        }
+    }
 
     let changed = current != next;
     if changed {
