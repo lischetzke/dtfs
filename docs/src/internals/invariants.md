@@ -742,6 +742,19 @@ removes a drained/dead node from the registry; the apply REFUSES
 re-replicate first. The endpoint pre-checks the same and the apply
 re-checks authoritatively (TOCTOU-safe).
 
+Remove-dead (`POST /api/v1/nodes/{id}/remove-dead`, `api/remove_dead.rs`)
+is the only way to clear the rows of a node that never returns. Pure
+`plan_remove_dead` (node Down/Failed and silent >= the monitor Down
+threshold) sorts each row: another LIVE replica and
+`remove_chunk_location_check` (the shared guard half of
+`apply_remove_chunk_location`, anchor included) passes -> guarded
+`RemoveChunkLocation`; live replica but anchor would strand ->
+`anchor_pending` (left for anchor-lag repair, re-run later); no other
+live replica -> `data_loss`, removed only with `accept_data_loss` via
+`ClientRequest::RemoveDeadNodeReplica` (apply refuses a live node or a
+chunk that still has a live copy; one `chunk.dead_node_replica_removed`
+audit row per chunk). `DeregisterNode` runs once zero rows remain.
+
 ### `dtfs-manager/src/join.rs`
 
 Two-phase data-node join (HMAC handshake; `/api/v1/join/{request,

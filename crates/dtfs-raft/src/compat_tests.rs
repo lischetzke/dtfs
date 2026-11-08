@@ -234,6 +234,23 @@ fn variant_name(r: &ClientRequest) -> &'static str {
         AppendAudit { .. } => "AppendAudit",
         RemoveChunkLocation { .. } => "RemoveChunkLocation",
         SetChunkCooldown { .. } => "SetChunkCooldown",
+        RemoveDeadNodeReplica { .. } => "RemoveDeadNodeReplica",
+    }
+}
+
+/// Added after the v1 fixtures were cut: not in `all_requests`/v1, so its
+/// own wire shape is pinned here (an entry without `now_ms` defaults to 0).
+#[test]
+fn remove_dead_node_replica_wire_shape() {
+    let r: ClientRequest = serde_json::from_str(
+        r#"{"RemoveDeadNodeReplica":{"path":"/a","chunk_index":2,"node_id":"7","disk_id":1}}"#,
+    )
+    .unwrap();
+    match r {
+        ClientRequest::RemoveDeadNodeReplica { path, chunk_index, node_id, disk_id, now_ms } => {
+            assert_eq!((path.as_str(), chunk_index, node_id.as_str(), disk_id, now_ms), ("/a", 2, "7", 1, 0));
+        }
+        other => panic!("wrong variant: {}", variant_name(&other)),
     }
 }
 

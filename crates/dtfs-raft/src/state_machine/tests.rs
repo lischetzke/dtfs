@@ -1547,6 +1547,100 @@ mod posix_path_regression {
         assert_eq!(sm_try_dead.files.get("/x").unwrap().chunks.len(), 1, "dead row removed");
     }
 
+    fn dead_req(node: &str) -> ClientRequest {
+        ClientRequest::RemoveDeadNodeReplica {
+            path: "/x".into(), chunk_index: 0, node_id: node.into(), disk_id: 0, now_ms: 77,
+        }
+    }
+
+    /// Remove-dead-node data-loss arm: refuses a live node and a chunk that
+    /// still has a live copy; removes the only (dead) copy with an audit row;
+    /// idempotent on a second apply.
+    #[test]
+    fn remove_dead_node_replica_requires_dead_node_and_no_live_copy() {
+        use dtfs_common::types::{DiskTier, HealthStatus};
+        let mut sm = sm_with_chunk("/x", 0, "h", &[
+            (10, "leli", DiskTier::Cold),
+            (11, "toro", DiskTier::Warm),
+        ]);
+        // Node 10 still Healthy: refused.
+        match apply_request(&mut sm, &mk_log_id(1), &dead_req("10")) {
+            ClientResponse::Error { message } => assert!(message.contains("not Down/Failed"), "{message}"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        // Node 10 Down but node 11 still serves the chunk: refused.
+        sm.nodes.get_mut(&10).unwrap().health = HealthStatus::Down;
+        match apply_request(&mut sm, &mk_log_id(2), &dead_req("10")) {
+            ClientResponse::Error { message } => assert!(message.contains("has a live replica"), "{message}"),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert_eq!(sm.files["/x"].chunks.len(), 2, "nothing removed");
+        // Both dead: the row goes, one audit row names the chunk.
+        sm.nodes.get_mut(&11).unwrap().health = HealthStatus::Down;
+        let audits_before = sm.audit_log.len();
+        assert!(matches!(apply_request(&mut sm, &mk_log_id(3), &dead_req("10")), ClientResponse::Success));
+        assert_eq!(sm.files["/x"].chunks.len(), 1);
+        assert_eq!(sm.files["/x"].chunks[0].node_id, "11");
+        assert_eq!(sm.files["/x"].updated_at_ms, 77);
+        assert_eq!(sm.audit_log.len(), audits_before + 1);
+        let a = sm.audit_log.back().unwrap();
+        assert_eq!((a.action.as_str(), a.target.as_str()), ("chunk.dead_node_replica_removed", "/x#0"));
+        // Idempotent.
+        assert!(matches!(apply_request(&mut sm, &mk_log_id(4), &dead_req("10")), ClientResponse::Success));
+        assert_eq!(sm.audit_log.len(), audits_before + 1, "no second audit row");
+    }
+
+    /// Exhaustive over every Down/Healthy mix of three replicas and every
+    /// target row: the arm never reduces the number of live replicas and
+    /// never removes a row of a Healthy node.
+    #[test]
+    fn remove_dead_node_replica_never_drops_live_copies_exhaustive() {
+        use dtfs_common::types::{DiskTier, HealthStatus};
+        for mask in 0u8..8 {
+            for target in [10u64, 11, 12] {
+                let mut sm = sm_with_chunk("/x", 0, "h", &[
+                    (10, "leli", DiskTier::Cold),
+                    (11, "toro", DiskTier::Warm),
+                    (12, "nrb", DiskTier::Warm),
+                ]);
+                for (i, nid) in [10u64, 11, 12].iter().enumerate() {
+                    if mask & (1 << i) != 0 {
+                        sm.nodes.get_mut(nid).unwrap().health = HealthStatus::Down;
+                    }
+                }
+                let live = |sm: &StateMachineData| {
+                    sm.files["/x"].chunks.iter().filter(|c| replica_row_is_live(sm, c)).count()
+                };
+                let (rows_before, live_before) = (sm.files["/x"].chunks.len(), live(&sm));
+                let resp = apply_request(&mut sm, &mk_log_id(1), &dead_req(&target.to_string()));
+                assert_eq!(live(&sm), live_before, "mask={mask} target={target}");
+                if matches!(resp, ClientResponse::Success) && sm.files["/x"].chunks.len() < rows_before {
+                    let idx = [10u64, 11, 12].iter().position(|n| *n == target).unwrap();
+                    assert!(mask & (1 << idx) != 0, "removed a Healthy node's row");
+                    assert_eq!(live_before, 0, "removed a row while a live copy existed");
+                }
+            }
+        }
+    }
+
+    /// The shared guard reports the anchor strand for a dead anchor row whose
+    /// only live survivor is a non-anchor copy (planner: "anchor pending").
+    #[test]
+    fn remove_check_dead_anchor_row_is_refused_until_another_anchor_copy_exists() {
+        use dtfs_common::types::{AnchorPolicy, DiskTier, HealthStatus};
+        let mut sm = sm_with_chunk("/x", 0, "h", &[
+            (10, "leli", DiskTier::Cold),
+            (11, "toro", DiskTier::Warm),
+        ]);
+        sm.nodes.get_mut(&10).unwrap().health = HealthStatus::Down;
+        let policy = AnchorPolicy { datacenter: "leli".into(), required_tier: None };
+        let err = remove_chunk_location_check(&sm, "/x", 0, "10", 0, Some(&policy)).unwrap_err();
+        assert!(err.contains("would strand anchor"), "{err}");
+        // Without a policy the dead row may go; absent rows are a no-op.
+        assert_eq!(remove_chunk_location_check(&sm, "/x", 0, "10", 0, None), Ok(true));
+        assert_eq!(remove_chunk_location_check(&sm, "/x", 5, "10", 0, None), Ok(false));
+    }
+
     /// AV-1-3 test 1 — happy path: drop one entry, others survive.
     #[test]
     fn bug_av_remove_chunk_location_drops_entry() {

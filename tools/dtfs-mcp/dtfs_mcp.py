@@ -10,7 +10,7 @@
 Read tools talk to the manager REST API (:9402) and, over the system `ssh`
 binary, run a fixed set of allowlisted read-only command templates on cluster
 hosts. Gated ops (scrub, maintenance, unquarantine, flush_cache, migrate,
-decommission) mutate the cluster and only act when called with confirm=true.
+decommission, remove_dead) mutate the cluster and only act when called with confirm=true.
 
 Config: %USERPROFILE%\\.dtfs\\clusters.toml (or env DTFS_MCP_CONFIG). See
 clusters.example.toml. Documentation: docs/src/operations/diagnostics-mcp.md.
@@ -1130,6 +1130,25 @@ def op_decommission_impl(cl: Cluster, node_id: Any, operator_id: str, reason: st
     return res
 
 
+def op_remove_dead_impl(cl: Cluster, node_id: Any, operator_id: str, reason: str,
+                        accept_data_loss: bool, confirm: bool) -> dict:
+    nid = validate_node_id(node_id)
+    _need(_OPERATOR, operator_id, "operator_id")
+    if not isinstance(reason, str) or len(reason) > 500 or not (reason == "" or reason.isprintable()):
+        raise ValidationError("reason must be <= 500 printable characters")
+    if not isinstance(accept_data_loss, bool):
+        raise ValidationError("accept_data_loss must be a boolean")
+    path = f"/api/v1/nodes/{nid}/remove-dead"
+    body = {"operator_id": operator_id, "reason": reason, "accept_data_loss": accept_data_loss}
+    if confirm is not True:
+        # The server's own dry_run returns the full plan and changes nothing.
+        res = _post_with_leader(cl, path, {**body, "dry_run": True}, f"plan remove-dead of node {nid}")
+        return {"dry_run": True, "action": f"remove dead node {nid}", "plan": res.get("response"),
+                "note": "nothing was changed; re-call with confirm=true after the user approves. "
+                        "accept_data_loss=true also drops chunks with no other live replica (lost)."}
+    return _post_with_leader(cl, path, {**body, "dry_run": False}, f"remove dead node {nid}")
+
+
 # --------------------------------------------------------------------------
 # MCP wiring
 # --------------------------------------------------------------------------
@@ -1441,6 +1460,17 @@ def build_server():
         """GATED. Remove a drained/dead node from the registry; server refuses while it holds
         any chunk replica. Dry-run shows the node's current state."""
         return op_decommission_impl(get_cluster(cluster), node_id, operator_id, reason, confirm)
+
+    @tool
+    def op_remove_dead(node_id: str, operator_id: str, reason: str = "",
+                       accept_data_loss: bool = False, confirm: bool = False,
+                       cluster: str | None = None) -> dict:
+        """GATED. Remove a permanently dead (Down/Failed) node: drops its chunk rows that have
+        another live replica (anchor-guarded), reports anchor-pending and data-loss rows, and
+        deregisters the node once no rows remain. accept_data_loss=true also drops rows with no
+        other live replica. Without confirm=true returns the server's plan and changes nothing."""
+        return op_remove_dead_impl(get_cluster(cluster), node_id, operator_id, reason,
+                                   accept_data_loss, confirm)
 
     return mcp
 

@@ -745,6 +745,24 @@ pub enum ClientRequest {
         chunk_indexes: Vec<u64>,
         expires_at_ms: u64,
     },
+
+    /// Operator "remove dead node" with `accept_data_loss`: drop the
+    /// `(node_id, disk_id)` row of a chunk whose ONLY remaining copies sit
+    /// on a Down/Failed node. Unlike `RemoveChunkLocation` this deliberately
+    /// removes a row with no other live replica, so apply refuses unless the
+    /// node is Down/Failed and no other live replica exists (a live copy
+    /// means the guarded `RemoveChunkLocation` is the right command). Writes
+    /// one audit row per chunk. Idempotent on an absent row. Added after the
+    /// v1 compat fixtures.
+    RemoveDeadNodeReplica {
+        path: String,
+        chunk_index: u64,
+        node_id: String,
+        disk_id: u32,
+        /// Proposer wall-clock (A.3.1 / CR-2-5); `0` falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
+    },
 }
 
 impl fmt::Display for ClientRequest {
@@ -863,6 +881,9 @@ impl fmt::Display for ClientRequest {
             Self::SetChunkCooldown { path, chunk_indexes, expires_at_ms } => {
                 write!(f, "SetChunkCooldown({path}, {} chunks, until={expires_at_ms}ms)",
                     chunk_indexes.len())
+            }
+            Self::RemoveDeadNodeReplica { path, chunk_index, node_id, disk_id, .. } => {
+                write!(f, "RemoveDeadNodeReplica({path}, idx={chunk_index}, node={node_id}, disk={disk_id})")
             }
         }
     }

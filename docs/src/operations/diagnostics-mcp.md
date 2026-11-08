@@ -56,6 +56,7 @@ Without a config the server still starts; every tool returns a `setup_required` 
 | `op_flush_cache(path_prefix, cache_tiers?, cooldown_secs?, confirm?)` | gated: `POST /api/v1/files/flush_cache`; tiers limited to `warm`/`hot`, prefix must name a subtree; dry run previews matching files |
 | `op_migrate(path_prefix, target_tier, target_dc?, max_tasks?, confirm?)` | gated: `POST /api/v1/migrations`; prefix must name a subtree, `max_tasks` 1..10000; dry run previews matching files |
 | `op_decommission(node_id, operator_id, reason?, confirm?)` | gated: `POST /api/v1/nodes/{id}/decommission`; dry run shows the node, server refuses while it holds replicas |
+| `op_remove_dead(node_id, operator_id, reason?, accept_data_loss?, confirm?)` | gated: `POST /api/v1/nodes/{id}/remove-dead`; without `confirm` it asks the server for its plan (`dry_run`) and changes nothing |
 
 `/api/v1/chunks`, `/api/v1/chunks/{id}`, `/api/v1/memory` and the raft-state `replication`
 field exist only on manager builds that include them; older builds answer 404 and the tools

@@ -208,6 +208,13 @@ other live replicas, stop the node, then deregister it.
 4. Deregister: `dtfs-cli decommission <node-id> --operator-id <who> --reason "<why>"`.
    The server answers 409 while any file still lists a replica on the node.
 
+For a node that is permanently dead and cannot be drained, use
+`dtfs-cli nodes remove-dead <node-id> [--dry-run] [--accept-data-loss]`
+instead (node must be Down/Failed past the Down threshold). It drops rows that
+have another live replica, leaves anchor-pending rows for repair, and removes
+rows with no live replica only with `--accept-data-loss`; see
+[Decommission and Replace](../deployment/decommission-replace.md#a-node-that-is-permanently-dead).
+
 Details and the disk and manager variants: [Decommission and Replace](../deployment/decommission-replace.md).
 See [Maintenance Mode](./maintenance-mode.md) for exactly what the flag does.
 

@@ -18,6 +18,7 @@ anchor holder as a side effect of an automation run.
 |---|---|
 | Maintenance mode (`POST /api/v1/nodes/{id}/maintenance`) | Exists. Excludes the node from new placement and from automatic `Down` marking; sticky until disabled. It does **not** move or re-replicate any chunk. |
 | Node decommission (`POST /api/v1/nodes/{id}/decommission`, `dtfs-cli decommission`) | Exists. Removes the node from the registry. Refused with HTTP 409 while any file's chunk list still has a replica on that node. |
+| Remove dead node (`POST /api/v1/nodes/{id}/remove-dead`, `dtfs-cli nodes remove-dead`) | Exists. For a permanently dead node: clears its rows (guarded by live replicas and the anchor; lost chunks only with `--accept-data-loss`), then deregisters. See below. |
 | Disk "drain" operation | Does not exist. No API sets a disk to draining. Content leaves a disk only through the mechanisms below. |
 | Additive migration (`dtfs-cli migrations create <prefix> --target-tier T [--target-dc DC]`) | Exists. Adds replicas; never removes the source. |
 | Automatic repair | The manager scheduler is the sole owner of replica repair: it re-creates missing mandatory replicas on healthy targets, and removes only replicas in excess of the goal. |
@@ -150,12 +151,33 @@ Choose by what is retained:
 6. Remove the host from the inventory, keep its `/etc/dtfs` and disks until the
    cluster has been healthy for a while, then purge.
 
-Known gap: for a node that is permanently dead, the manager's rows that point at
-it are not removed by the reconciliation described above (that runs against live
-nodes). Whether `decommission` can then succeed without first bringing the node
-back is not established by the code and was not exercised; the 409 is the
-authoritative answer. Plan on keeping a dead node's identity reachable until
-decommission succeeds.
+### A node that is permanently dead
+
+`decommission` refuses while any chunk row still points at the node, and the
+reconciliation above only runs against live nodes. For a node that will never
+come back use remove-dead (leader only, node must be `Down`/`Failed` and silent
+for at least the Down threshold, `down_after_missed * heartbeat_interval_secs`):
+
+```bash
+dtfs-cli nodes remove-dead <node-id> --dry-run          # plan only
+dtfs-cli nodes remove-dead <node-id> --operator-id <who> --reason "<why>"
+dtfs-cli nodes remove-dead <node-id> --operator-id <who> --accept-data-loss
+```
+
+REST: `POST /api/v1/nodes/{id}/remove-dead`. For every row on the node:
+
+- another live replica of the same chunk exists: the row is removed through the
+  normal guarded `RemoveChunkLocation` (the volume anchor applies). If the dead
+  node held the only anchor-datacenter copy, the row is left and counted as
+  `anchor_pending`; anchor-lag repair copies from a live non-anchor replica,
+  then re-run the command.
+- no other live replica: the chunk is lost. It is listed as a
+  `data_loss_candidate` and removed only with `--accept-data-loss`
+  (`RemoveDeadNodeReplica`, one audit row per chunk).
+
+When no rows remain the node is deregistered. The command is idempotent; re-run
+until `anchor_pending` is 0. Without `--accept-data-loss` a node that holds
+data-loss candidates stays registered.
 
 ## Replace or remove a manager
 

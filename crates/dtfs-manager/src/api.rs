@@ -46,6 +46,7 @@ mod config;
 mod files;
 mod nodes;
 mod raft;
+mod remove_dead;
 mod volumes;
 pub(crate) use audit::*;
 pub(crate) use chunks::*;
@@ -54,6 +55,7 @@ pub(crate) use config::*;
 pub(crate) use files::*;
 pub(crate) use nodes::*;
 pub(crate) use raft::*;
+pub(crate) use remove_dead::*;
 pub(crate) use volumes::*;
 
 /// Shared application state for API handlers.
@@ -146,6 +148,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/nodes/{node_id}/decommission",
             post(decommission_node_endpoint),
+        )
+        // Operator "remove dead node": clear rows of a Down/Failed node, then deregister.
+        .route(
+            "/api/v1/nodes/{node_id}/remove-dead",
+            post(remove_dead_node_endpoint),
         )
         // Files
         .route("/api/v1/files", get(list_files))

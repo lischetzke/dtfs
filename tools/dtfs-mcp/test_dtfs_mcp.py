@@ -444,7 +444,7 @@ def test_tool_registry():
                      "files_list", "file_lookup", "chunk_detail", "volume_detail", "node_detail",
                      "migrations_status", "integrity_faults", "memory_status", "raft_replication",
                      "config_diff", "host_disk_ids", "host_quarantine", "op_flush_cache",
-                     "op_migrate", "op_decommission"}
+                     "op_migrate", "op_decommission", "op_remove_dead"}
 
 
 # ---- extended read tools ---------------------------------------------------
@@ -583,6 +583,26 @@ def test_ops_new_dry_run_preview_and_validation(monkeypatch):
                lambda: m.op_migrate_impl(cl, "/tv/", "cold", None, 0, True),
                lambda: m.op_decommission_impl(cl, "1;x", "ops1", "", True),
                lambda: m.op_decommission_impl(cl, "1", "ops1", "x" * 501, True)):
+        with pytest.raises(m.ValidationError):
+            fn()
+
+
+def test_op_remove_dead_dry_run_plans_via_server_and_confirm_executes(monkeypatch):
+    calls = []
+    monkeypatch.setattr(m, "rest_call", fake_rest({"/api/v1/nodes/9/remove-dead": {"removable": 2}}, calls))
+    monkeypatch.setattr(m, "find_leader", lambda cl: None)
+    cl = cluster()
+    r = m.op_remove_dead_impl(cl, "9", "ops1", "", False, False)
+    assert r["dry_run"] and r["plan"] == {"removable": 2}
+    posts = [c for c in calls if c[3] == "POST"]
+    assert len(posts) == 1 and posts[0][4]["dry_run"] is True and posts[0][4]["accept_data_loss"] is False
+    r = m.op_remove_dead_impl(cl, "9", "ops1", "gone", True, True)
+    assert r["executed"]
+    last = [c for c in calls if c[3] == "POST"][-1]
+    assert last[4]["dry_run"] is False and last[4]["accept_data_loss"] is True
+    for fn in (lambda: m.op_remove_dead_impl(cl, "1;x", "ops1", "", False, True),
+               lambda: m.op_remove_dead_impl(cl, "1", "ops1", "x" * 501, False, True),
+               lambda: m.op_remove_dead_impl(cl, "1", "ops1", "", "yes", True)):
         with pytest.raises(m.ValidationError):
             fn()
 

@@ -43,11 +43,14 @@ enum Commands {
     /// Show cluster status
     Status,
 
-    /// List all data nodes
+    /// List all data nodes (`nodes remove-dead <id>` clears a dead node)
+    #[command(args_conflicts_with_subcommands = true)]
     Nodes {
         /// Show detailed info for a specific node
         #[arg(long)]
         id: Option<String>,
+        #[command(subcommand)]
+        cmd: Option<NodesCmd>,
     },
 
     /// Manage volumes
@@ -416,6 +419,28 @@ enum IntegrityCmd {
     },
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum NodesCmd {
+    /// Remove a permanently dead node: drop its chunk location rows (guarded
+    /// by live replicas and the anchor), then deregister it. Leader only.
+    RemoveDead {
+        /// Node ID
+        node_id: String,
+        /// Free-form actor label (initials/ticket) for the audit row.
+        #[arg(long, default_value = "dtfs-cli")]
+        operator_id: String,
+        /// Written justification, recorded in the audit row.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Also drop rows with no other live replica (those chunks are lost).
+        #[arg(long)]
+        accept_data_loss: bool,
+        /// Print the plan without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 /// UIP-4-3 (D3) — manual data migration subcommands.
 #[derive(clap::Subcommand, Debug)]
 enum MigrationsCmd {
@@ -634,7 +659,20 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Commands::Status => cmd_status(&api, &args.format).await?,
-        Commands::Nodes { id } => cmd_nodes(&api, &args.format, id).await?,
+        Commands::Nodes { id, cmd: None } => cmd_nodes(&api, &args.format, id).await?,
+        Commands::Nodes {
+            cmd: Some(NodesCmd::RemoveDead { node_id, operator_id, reason, accept_data_loss, dry_run }),
+            ..
+        } => {
+            let body = remove_dead_body(&operator_id, &reason, accept_data_loss, dry_run);
+            let (status, value) = api
+                .post_with_status(&format!("/api/v1/nodes/{}/remove-dead", node_id), &body)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            if !status.is_success() {
+                anyhow::bail!("remove-dead node {} failed: HTTP {}", node_id, status);
+            }
+        }
         Commands::Volumes(sub) => match sub {
             VolumesCmd::List => cmd_volumes(&api, &args.format).await?,
             VolumesCmd::Create {
@@ -1570,6 +1608,15 @@ async fn cmd_unquarantine(
     Ok(())
 }
 
+fn remove_dead_body(operator_id: &str, reason: &str, accept_data_loss: bool, dry_run: bool) -> serde_json::Value {
+    serde_json::json!({
+        "operator_id": operator_id,
+        "reason": reason,
+        "accept_data_loss": accept_data_loss,
+        "dry_run": dry_run,
+    })
+}
+
 /// UIP-4-2 — `dtfs-cli decommission <node-id> --operator-id X --reason
 /// "..."`: remove a drained/dead node from the cluster registry.
 /// Surfaces the server's JSON verbatim (including the 409 "replicas
@@ -2196,6 +2243,27 @@ mod audit_co_tests {
             .is_err(),
             "missing --reason-acknowledged must be rejected"
         );
+    }
+
+    #[test]
+    fn nodes_remove_dead_parses_and_plain_nodes_still_works() {
+        let a = Args::try_parse_from(["dtfs-cli", "nodes", "remove-dead", "7", "--dry-run", "--accept-data-loss"])
+            .expect("remove-dead parses");
+        match a.command {
+            Commands::Nodes { cmd: Some(NodesCmd::RemoveDead { node_id, accept_data_loss, dry_run, operator_id, .. }), .. } => {
+                assert_eq!((node_id.as_str(), accept_data_loss, dry_run, operator_id.as_str()), ("7", true, true, "dtfs-cli"));
+            }
+            other => panic!("wrong parse: {other:?}"),
+        }
+        let a = Args::try_parse_from(["dtfs-cli", "nodes", "--id", "7"]).expect("nodes --id parses");
+        assert!(matches!(a.command, Commands::Nodes { id: Some(_), cmd: None }));
+        assert!(matches!(
+            Args::try_parse_from(["dtfs-cli", "nodes"]).unwrap().command,
+            Commands::Nodes { id: None, cmd: None }
+        ));
+        assert!(Args::try_parse_from(["dtfs-cli", "nodes", "remove-dead"]).is_err(), "node id required");
+        let b = remove_dead_body("op", "why", true, false);
+        assert_eq!((b["accept_data_loss"].as_bool(), b["dry_run"].as_bool()), (Some(true), Some(false)));
     }
 
     // UIP-4-2 — `decommission <node-id> --operator-id X --reason "..."`

@@ -38,6 +38,7 @@ Error reporting differs by command. Read commands (`status`, `stats`, `nodes`, `
 | `maintenance <node-id> (--enable \| --disable)` | Toggle maintenance mode. Exactly one flag is required. See [Maintenance Mode](../operations/maintenance-mode.md). |
 | `unquarantine <node-id> --operator-id <label> --reason-acknowledged <text>` | Clear an integrity quarantine. The reason must be at least 16 characters. Prints the server JSON; exits `1` on failure (for example `409` node not quarantined). |
 | `decommission <node-id> --operator-id <label> --reason <text>` | Remove a drained or dead node from the registry. `409` while it still holds replicas. |
+| `nodes remove-dead <node-id> [--operator-id <label>] [--reason <text>] [--accept-data-loss] [--dry-run]` | Remove a permanently dead (Down/Failed) node: drop its rows that have another live replica, report `anchor_pending` and data-loss candidates, deregister when no rows remain. `--accept-data-loss` also drops rows with no live replica. Prints the server JSON; exits `1` on failure. |
 | `scrub [--level quick\|deep]` | Trigger a cluster-wide scrub (default `deep`). The `--disk`, `--file` and `--chunk` options exist but the server rejects per-target scrubs with `400`; omit them. |
 | `audit [--limit N] [--action <prefix>]` | Audit log, default limit 20. |
 | `integrity faults [--limit N] [--action <prefix>]` | Integrity-fault feed, default limit 20. |

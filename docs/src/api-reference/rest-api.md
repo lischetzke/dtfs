@@ -64,6 +64,7 @@ Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserve
 | POST | `/api/v1/nodes/{node_id}/maintenance` | yes | leader (503) | Maintenance on/off |
 | POST | `/api/v1/nodes/{node_id}/unquarantine` | yes | leader (503) | Clear quarantine |
 | POST | `/api/v1/nodes/{node_id}/decommission` | yes | leader (503) | Deregister node |
+| POST | `/api/v1/nodes/{node_id}/remove-dead` | yes | leader (409) | Clear a dead node's rows, then deregister |
 | GET | `/api/v1/files` | no | any | List files |
 | GET | `/api/v1/files/inspect` | no | any | Chunk layout of one file |
 | POST | `/api/v1/files/flush_cache` | yes | leader (409) | Drop cache replicas |
@@ -163,6 +164,12 @@ Body `{"operator_id": "<label>", "reason_acknowledged": "<at least 16 characters
 ### POST /api/v1/nodes/{node_id}/decommission
 
 Body `{"operator_id": "<label>", "reason": "<text, optional>"}`. Response `{"node_id", "ok": true}`. `409` while any file still has a replica on the node (drain or re-replicate first); `404` unknown node.
+
+### POST /api/v1/nodes/{node_id}/remove-dead
+
+Leader only (`409` not leader). Body `{"operator_id": "<label, required>", "reason": "<text>", "accept_data_loss": false, "dry_run": false}`. The node must be `Down` or `Failed` and silent for at least `down_after_missed * heartbeat_interval_secs` (`409` otherwise; `404` unknown node). Rows with another live replica are removed through the guarded `RemoveChunkLocation`; rows that would strand the volume anchor stay (`anchor_pending`); rows with no live replica are `data_loss_candidates`, removed only when `accept_data_loss` is true. The node is deregistered once no rows remain.
+
+Response: `{"node_id", "dry_run", "accept_data_loss", "removable", "anchor_pending", "data_loss_candidates", "sample": {"removable": [...], "anchor_pending": [...], "data_loss": [...]}}` (samples are up to 5 `path#chunk_index` strings), plus, when not a dry run, `removed`, `data_loss_removed`, `failed`, `remaining_rows`, `deregistered` and `deregister_error` on a failed deregister. Safe to repeat.
 
 ## Files
 

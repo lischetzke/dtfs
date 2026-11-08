@@ -999,6 +999,7 @@ fn apply_request(
         | ClientRequest::DeleteVolume { now_ms, .. }
         | ClientRequest::ReportScrubResult { now_ms, .. }
         | ClientRequest::ReleaseWriteLease { now_ms, .. }
+        | ClientRequest::RemoveDeadNodeReplica { now_ms, .. }
             if *now_ms != 0 =>
         {
             *now_ms
@@ -2283,6 +2284,60 @@ fn apply_request(
             // (max of existing and new); 0 clears.
             apply_set_chunk_cooldown(sm, path, chunk_indexes, *expires_at_ms)
         }
+
+        ClientRequest::RemoveDeadNodeReplica { path, chunk_index, node_id, disk_id, .. } => {
+            let nid: Option<u64> = node_id.parse().ok();
+            let dead = nid
+                .and_then(|n| sm.nodes.get(&n))
+                .map(|n| {
+                    matches!(
+                        n.health,
+                        dtfs_common::types::HealthStatus::Down | dtfs_common::types::HealthStatus::Failed
+                    )
+                })
+                .unwrap_or(false);
+            if !dead {
+                tracing::warn!(%path, chunk_index, %node_id, "RemoveDeadNodeReplica refused: node is not Down/Failed");
+                return ClientResponse::Error {
+                    message: format!("RemoveDeadNodeReplica refused: node {node_id} is not Down/Failed"),
+                };
+            }
+            let Some(file) = sm.files.get(path) else {
+                return ClientResponse::Success;
+            };
+            let is_row = |c: &ChunkLocationEntry| {
+                c.chunk_index == *chunk_index && c.node_id == *node_id && c.disk_id == *disk_id
+            };
+            if !file.chunks.iter().any(is_row) {
+                return ClientResponse::Success; // idempotent
+            }
+            if file
+                .chunks
+                .iter()
+                .any(|c| c.chunk_index == *chunk_index && !is_row(c) && replica_row_is_live(sm, c))
+            {
+                tracing::warn!(%path, chunk_index, %node_id, "RemoveDeadNodeReplica refused: a live replica exists");
+                return ClientResponse::Error {
+                    message: format!(
+                        "RemoveDeadNodeReplica refused: {path}#{chunk_index} has a live replica; use RemoveChunkLocation"
+                    ),
+                };
+            }
+            let file_mut = sm.files.get_mut(path).expect("checked above");
+            file_mut.chunks.retain(|c| !is_row(c));
+            file_mut.updated_at_ms = now_ms; // proposer stamp, else log index (see top of apply_request)
+            tracing::warn!(%path, chunk_index, %node_id, disk_id, "dead-node replica row removed with data loss accepted");
+            push_audit_capped(
+                &mut sm.audit_log,
+                audit_structured(
+                    "chunk.dead_node_replica_removed",
+                    format!("{path}#{chunk_index}"),
+                    "data_loss_accepted".to_string(),
+                    format!("RemoveDeadNodeReplica: {path}#{chunk_index} node={node_id} disk={disk_id}"),
+                ),
+            );
+            ClientResponse::Success
+        }
     }
 }
 
@@ -2325,11 +2380,78 @@ fn apply_remove_chunk_location(
     enforce_anchor: Option<&AnchorPolicy>,
     now_ms: u64,
 ) -> ClientResponse {
+    match remove_chunk_location_check(sm, path, chunk_index, node_id, disk_id, enforce_anchor) {
+        Ok(false) => return ClientResponse::Success,
+        Err(message) => return ClientResponse::Error { message },
+        Ok(true) => {}
+    }
+    let legacy_node_wide = disk_id == crate::legacy_disk_id();
+    let matches = |c: &ChunkLocationEntry| -> bool {
+        c.chunk_index == chunk_index
+            && c.node_id == node_id
+            && (legacy_node_wide || c.disk_id == disk_id)
+    };
+    // Safe to drop. Mutate.
+    let file_mut = sm.files.get_mut(path).expect("checked above");
+    let before = file_mut.chunks.len();
+    file_mut.chunks.retain(|c| !matches(c));
+    let after = file_mut.chunks.len();
+    // CO-1-1 — a disk-targeted removal drops EXACTLY the one (node,disk)
+    // entry; only the legacy node-wide sentinel may drop several
+    // co-located entries at once.
+    debug_assert!(
+        before.saturating_sub(after) == 1 || legacy_node_wide,
+        "disk-targeted RemoveChunkLocation must drop exactly one entry"
+    );
+    // RAFT-4 — was a fresh `SystemTime::now()` per replica; now the
+    // proposer-stamped (or `log_id.index`-fallback) deterministic value.
+    file_mut.updated_at_ms = now_ms;
+    ClientResponse::Success
+}
+
+/// Is this replica row servable: node not Down/Failed and disk not
+/// Failed/Removed (same test as the scheduler's `live_replica_tier`).
+pub fn replica_row_is_live(sm: &StateMachineData, c: &ChunkLocationEntry) -> bool {
+    let Ok(nid) = c.node_id.parse::<u64>() else {
+        return false;
+    };
+    let Some(ninfo) = sm.nodes.get(&nid) else {
+        return false;
+    };
+    if matches!(
+        ninfo.health,
+        dtfs_common::types::HealthStatus::Down | dtfs_common::types::HealthStatus::Failed
+    ) {
+        return false;
+    }
+    ninfo
+        .disk(c.disk_id)
+        .map(|d| {
+            !matches!(
+                d.status,
+                dtfs_common::types::DiskStatus::Failed | dtfs_common::types::DiskStatus::Removed
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Guard half of `RemoveChunkLocation`, shared with the manager's
+/// remove-dead-node planner so plan and apply cannot disagree.
+/// `Ok(false)` = nothing to remove (idempotent no-op), `Ok(true)` = the
+/// removal is allowed, `Err(msg)` = refused (anchor strand / last live replica).
+pub fn remove_chunk_location_check(
+    sm: &StateMachineData,
+    path: &str,
+    chunk_index: u64,
+    node_id: &str,
+    disk_id: u32,
+    enforce_anchor: Option<&AnchorPolicy>,
+) -> Result<bool, String> {
     let file = match sm.files.get(path) {
         Some(f) => f,
         // Idempotent: unknown file → success no-op so a retry after
         // a CrashRestart doesn't spam errors.
-        None => return ClientResponse::Success,
+        None => return Ok(false),
     };
 
     // CO-1-1 — replica identity is `(node_id, disk_id)` (A.3.4 / Bug BH).
@@ -2348,7 +2470,7 @@ fn apply_remove_chunk_location(
     // Check the entry is even present. Idempotent on absent.
     let entry_present = file.chunks.iter().any(matches);
     if !entry_present {
-        return ClientResponse::Success;
+        return Ok(false);
     }
 
     // Anchor safety: compute the post-removal state for this
@@ -2398,17 +2520,15 @@ fn apply_remove_chunk_location(
             policy.is_satisfied_by(dc, tier)
         });
         if !survives_anchor {
-            return ClientResponse::Error {
-                message: format!(
-                    "RemoveChunkLocation refused: would strand anchor for {path}#{chunk_index} \
-                     (policy: dc={}{})",
-                    policy.datacenter,
-                    match policy.required_tier {
-                        Some(t) => format!(", required_tier={t}"),
-                        None => String::new(),
-                    },
-                ),
-            };
+            return Err(format!(
+                "RemoveChunkLocation refused: would strand anchor for {path}#{chunk_index} \
+                 (policy: dc={}{})",
+                policy.datacenter,
+                match policy.required_tier {
+                    Some(t) => format!(", required_tier={t}"),
+                    None => String::new(),
+                },
+            ));
         }
     }
 
@@ -2452,30 +2572,13 @@ fn apply_remove_chunk_location(
             .iter()
             .any(|c| !matches(c) && c.chunk_index == chunk_index && is_live(c));
         if !other_live_survives {
-            return ClientResponse::Error {
-                message: format!(
-                    "RemoveChunkLocation refused: would remove the last live replica of {path}#{chunk_index}"
-                ),
-            };
+            return Err(format!(
+                "RemoveChunkLocation refused: would remove the last live replica of {path}#{chunk_index}"
+            ));
         }
     }
 
-    // Safe to drop. Mutate.
-    let file_mut = sm.files.get_mut(path).expect("checked above");
-    let before = file_mut.chunks.len();
-    file_mut.chunks.retain(|c| !matches(c));
-    let after = file_mut.chunks.len();
-    // CO-1-1 — a disk-targeted removal drops EXACTLY the one (node,disk)
-    // entry; only the legacy node-wide sentinel may drop several
-    // co-located entries at once.
-    debug_assert!(
-        before.saturating_sub(after) == 1 || legacy_node_wide,
-        "disk-targeted RemoveChunkLocation must drop exactly one entry"
-    );
-    // RAFT-4 — was a fresh `SystemTime::now()` per replica; now the
-    // proposer-stamped (or `log_id.index`-fallback) deterministic value.
-    file_mut.updated_at_ms = now_ms;
-    ClientResponse::Success
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
