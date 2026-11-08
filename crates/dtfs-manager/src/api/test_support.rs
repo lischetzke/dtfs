@@ -15,6 +15,7 @@ pub(super) async fn harness() -> Harness {
     let mut config: ManagerConfig = toml::from_str(include_str!("../../../../deploy/examples/manager.toml"))
         .expect("example manager.toml parses");
     config.cluster.shared_secret = String::new();
+    config.audit.replicate_via_raft = false; // read the local ring
     config.node.data_dir = dir.path().to_path_buf();
 
     let log_store = dtfs_raft::log_store::LogStore::new_with_opts(

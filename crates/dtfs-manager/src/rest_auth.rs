@@ -26,6 +26,51 @@ use std::sync::Arc;
 
 use crate::api::AppState;
 
+/// One `auth.denied` audit row per (source, path) per window; the rest are
+/// counted and reported on the next row. Without this an unauthenticated
+/// flood costs a blocking disk append + a Raft AppendAudit per request and
+/// evicts real audit history from the capped ring.
+pub struct DenyCoalescer {
+    window_ms: u64,
+    max_keys: usize,
+    /// (source, path) -> (window start ms, suppressed since)
+    seen: parking_lot::Mutex<std::collections::HashMap<(String, String), (u64, u64)>>,
+}
+
+impl DenyCoalescer {
+    pub fn new(window_ms: u64, max_keys: usize) -> Self {
+        Self { window_ms, max_keys, seen: Default::default() }
+    }
+
+    /// `Some(n)`: write a row now, `n` earlier denials were suppressed.
+    /// `None`: coalesced into the open window (or table full of live keys).
+    pub fn admit(&self, src: &str, path: &str, now_ms: u64) -> Option<u64> {
+        let mut seen = self.seen.lock();
+        let key = (src.to_string(), path.to_string());
+        if let Some((start, suppressed)) = seen.get_mut(&key) {
+            if now_ms.saturating_sub(*start) < self.window_ms {
+                *suppressed += 1;
+                return None;
+            }
+            let n = *suppressed;
+            *start = now_ms;
+            *suppressed = 0;
+            return Some(n);
+        }
+        if seen.len() >= self.max_keys {
+            let w = self.window_ms;
+            seen.retain(|_, (start, _)| now_ms.saturating_sub(*start) < w);
+            if seen.len() >= self.max_keys {
+                return None; // flood of distinct keys: drop rather than grow
+            }
+        }
+        seen.insert(key, (now_ms, 0));
+        Some(0)
+    }
+}
+
+static DENY_COALESCER: std::sync::OnceLock<DenyCoalescer> = std::sync::OnceLock::new();
+
 /// Header operators / CLI / release suite send on mutating calls.
 pub const SHARED_SECRET_HEADER: &str = "x-dtfs-shared-secret";
 
@@ -123,6 +168,10 @@ pub async fn require_mutation_auth(
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0);
 
     if mutation_auth_exempt(&method, &path) {
         return next.run(req).await;
@@ -135,12 +184,22 @@ pub async fn require_mutation_auth(
     match check_mutation_auth(&state.config.cluster.shared_secret, req.headers()) {
         Ok(()) => next.run(req).await,
         Err(err) => {
-            state.audit_log.log(
-                "api",
-                "auth.denied",
-                &format!("method={method} path={path}"),
-                err.message(),
-            );
+            let src = peer
+                .map(|a| a.ip().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let co = DENY_COALESCER.get_or_init(|| DenyCoalescer::new(60_000, 1024));
+            if let Some(suppressed) = co.admit(&src, &path, now_ms) {
+                state.audit_log.log(
+                    "api",
+                    "auth.denied",
+                    &format!("method={method} path={path} src={src} suppressed={suppressed}"),
+                    err.message(),
+                );
+            }
             (
                 err.status(),
                 Json(json!({
@@ -166,6 +225,31 @@ mod tests {
             );
         }
         h
+    }
+
+    #[test]
+    fn deny_coalescer_one_row_per_source_path_per_window() {
+        let c = DenyCoalescer::new(60_000, 4);
+        assert_eq!(c.admit("1.1.1.1", "/api/v1/scrub", 0), Some(0));
+        assert_eq!(c.admit("1.1.1.1", "/api/v1/scrub", 10), None);
+        assert_eq!(c.admit("1.1.1.1", "/api/v1/scrub", 59_999), None);
+        // Different source or path is its own key.
+        assert_eq!(c.admit("2.2.2.2", "/api/v1/scrub", 20), Some(0));
+        assert_eq!(c.admit("1.1.1.1", "/api/v1/config", 20), Some(0));
+        // Window elapsed: row again, carrying the suppressed count.
+        assert_eq!(c.admit("1.1.1.1", "/api/v1/scrub", 60_000), Some(2));
+        assert_eq!(c.admit("1.1.1.1", "/api/v1/scrub", 60_001), None);
+    }
+
+    #[test]
+    fn deny_coalescer_table_is_bounded() {
+        let c = DenyCoalescer::new(60_000, 2);
+        assert_eq!(c.admit("a", "/x", 0), Some(0));
+        assert_eq!(c.admit("b", "/x", 0), Some(0));
+        // Full of live keys: a third distinct key is dropped, not stored.
+        assert_eq!(c.admit("c", "/x", 1), None);
+        // Once the old keys expire there is room again.
+        assert_eq!(c.admit("c", "/x", 70_000), Some(0));
     }
 
     #[test]

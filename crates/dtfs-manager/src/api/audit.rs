@@ -74,12 +74,13 @@ pub(super) async fn get_integrity_faults(
         // Local-ring AuditEntry has no `summary` field (that lives on
         // the replicated state_machine variant). Match against action
         // only. Over-fetch so the filter has enough material before
-        // truncation.
+        // truncation (the whole ring, not a newest-N window).
         let filter = crate::audit::AuditFilter {
             since: None,
             until: None,
             action: None,
-            limit: Some(limit.saturating_mul(4).max(limit)),
+            // Whole ring: faults are rare, so a newest-N window would miss them.
+            limit: None,
         };
         let entries: Vec<Value> = state
             .audit_log

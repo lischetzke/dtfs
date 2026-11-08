@@ -169,3 +169,7 @@ The audit entry fields map naturally to common SIEM schemas:
 ## Audit Log and Raft
 
 Audit entries are written locally on the manager leader. They are not replicated through Raft to avoid adding high-frequency writes to the consensus log. If the leader changes, the new leader starts with an empty audit buffer. For durable audit history, use the JSON export mechanism to persist entries to external storage.
+
+## Rejected REST mutations (`auth.denied`)
+
+A REST mutation refused by the shared-secret gate writes one `auth.denied` row per (source IP, path) per 60 seconds. Further denials inside the window are counted and reported as `suppressed=N` on the next row, so an unauthenticated flood cannot evict real audit history.

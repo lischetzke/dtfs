@@ -266,7 +266,10 @@ pub async fn run_api_server(
     tracing::info!("Manager REST API listening on {}", config.api.listen_addr);
 
     // Bug U — graceful shutdown: existing connections finish, no new ones accepted.
-    axum::serve(listener, app)
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
         .with_graceful_shutdown(shutdown)
         .await?;
     Ok(())

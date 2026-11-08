@@ -391,3 +391,18 @@ fn apply_set_anchor_trims_datacenter() {
     assert_eq!(next.anchor.unwrap().datacenter, "leli");
     assert_eq!(next.anchor_datacenter.as_deref(), Some("leli"));
 }
+
+// ---- Task 9: integrity feed scans the whole ring -----------------------------
+
+#[tokio::test]
+async fn integrity_faults_found_beyond_the_newest_window() {
+    let h = harness().await;
+    h.state.audit_log.log("api", "scrub.deep.corrupt", "chunk-1", "fail");
+    for i in 0..100 {
+        h.state.audit_log.log("api", "config.update", &format!("v{i}"), "success");
+    }
+    let q = Query(AuditQuery { limit: Some(5), ..Default::default() });
+    let rows = get_integrity_faults(State(h.state.clone()), q).await.0;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["action"], "scrub.deep.corrupt");
+}
