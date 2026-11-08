@@ -90,7 +90,7 @@ Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserve
 | POST | `/api/v1/join/request` | HMAC | any | Join step 1 |
 | POST | `/api/v1/join/complete` | HMAC | any | Join step 2 |
 
-`GET /api/v1/migrations` reads the scheduler's in-memory task table, which only the leader populates.
+`GET /api/v1/migrations` reads the scheduler's in-memory task table, which only the leader populates. Each task's `source_node` and `target_node` are decimal strings (u64 ids exceed JS's safe integer range).
 
 ## Probes and metrics
 
@@ -123,7 +123,7 @@ Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserve
 
 ### GET /api/v1/stats
 
-Aggregate metrics for dashboards. Main fields: `health` (`healthy`, `degraded`, `critical`, `unknown`; `critical` also when any node is quarantined), `healthy_nodes`, `quarantined_nodes`, `total_nodes`, `anchor_pending`, `chunk_placement` (counts per state: missing, undergoal, misplaced, stable, overgoal, pending_deletion), `infra_healthy`, `infra_total`, `manager_count`, `data_node_count`, `disk_count`, `client_count`, `file_count`, `raw_total_bytes`, `raw_used_bytes`, `net_usable_bytes`, `net_used_bytes`, `logical_bytes`, `phantom_bytes_estimate`, `tier_breakdown` (array of `{tier, disks, total_bytes, used_bytes}`), `io_read_bytes_per_sec`, `io_write_bytes_per_sec` (0 on the first call after manager start), `last_scrub`, `scrub_results_by_node`, `config_version`.
+Aggregate metrics for dashboards. Main fields: `health` (`healthy`, `degraded`, `critical`, `unknown`; `critical` also when any node is quarantined), `healthy_nodes`, `quarantined_nodes`, `total_nodes`, `anchor_pending`, `chunk_placement` (counts per state: missing, undergoal, misplaced, stable, overgoal, pending_deletion), `infra_healthy`, `infra_total`, `manager_count`, `data_node_count`, `disk_count`, `client_count`, `file_count`, `raw_total_bytes`, `raw_used_bytes`, `net_usable_bytes`, `net_used_bytes`, `logical_bytes`, `phantom_bytes_estimate`, `tier_breakdown` (array of `{tier, disks, total_bytes, used_bytes}`), `io_read_bytes_per_sec`, `io_write_bytes_per_sec` (0 on the first call after manager start), `last_scrub`, `scrub_results_by_node` (and `last_scrub`; each entry's `node_id` is a decimal string, like `/nodes`), `config_version`.
 
 ### GET /api/v1/memory
 

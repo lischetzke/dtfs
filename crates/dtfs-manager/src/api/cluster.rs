@@ -4,6 +4,22 @@
 
 use super::*;
 
+/// One scrub record as served by `/stats`. `node_id` is a decimal STRING like
+/// `/nodes` emits: u64 ids exceed 2^53 and JS would round a JSON number.
+pub(crate) fn scrub_record_json(s: &dtfs_raft::state_machine::ScrubRecord) -> Value {
+    json!({
+        "node_id":         s.node_id.to_string(),
+        "disk_path":       s.disk_path,
+        "level":           s.level,
+        "completed_at_ms": s.completed_at_ms,
+        "chunks_checked":  s.chunks_checked,
+        "chunks_healthy":  s.chunks_healthy,
+        "chunks_corrupt":  s.chunks_corrupt,
+        "chunks_missing":  s.chunks_missing,
+        "duration_secs":   s.duration_secs,
+    })
+}
+
 /// Bug BP-3 — effective (projected) health for a node, downgrading a stored
 /// `Healthy` to `Suspect`/`Down` when its `last_seen_ms` is stale. Read-path
 /// only: it never mutates state, so it surfaces the truth even when raft
@@ -554,19 +570,7 @@ pub(super) async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value>
     // Per (node, level) scrub results (BK — previously keyed per-node only,
     // so a deep scrub overwrote the quick result). Flatten the nested map to
     // one JSON object per (node, level); the WebUI lists every entry.
-    let scrub_json = |s: &dtfs_raft::state_machine::ScrubRecord| {
-        json!({
-            "node_id":         s.node_id,
-            "disk_path":       s.disk_path,
-            "level":           s.level,
-            "completed_at_ms": s.completed_at_ms,
-            "chunks_checked":  s.chunks_checked,
-            "chunks_healthy":  s.chunks_healthy,
-            "chunks_corrupt":  s.chunks_corrupt,
-            "chunks_missing":  s.chunks_missing,
-            "duration_secs":   s.duration_secs,
-        })
-    };
+    let scrub_json = scrub_record_json;
     let scrub_results_by_node: Vec<Value> = sm
         .scrub_results_by_level
         .values()
@@ -826,4 +830,28 @@ pub(crate) fn backfill_audit_fields(
         target_part,
         "success".to_string(),
     )
+}
+
+#[cfg(test)]
+mod scrub_json_tests {
+    use super::*;
+
+    #[test]
+    fn scrub_record_node_id_serialises_as_string() {
+        let big = 15786580940693171021u64; // > 2^53
+        let v = scrub_record_json(&dtfs_raft::state_machine::ScrubRecord {
+            node_id: big,
+            disk_path: "/d".into(),
+            level: "quick".into(),
+            completed_at_ms: 1,
+            chunks_checked: 2,
+            chunks_healthy: 2,
+            chunks_corrupt: 0,
+            chunks_missing: 0,
+            duration_secs: 0.5,
+        });
+        assert_eq!(v["node_id"], serde_json::json!("15786580940693171021"));
+        assert!(v["node_id"].as_u64().is_none(), "must not be a JSON number");
+        assert_eq!(v["chunks_checked"], serde_json::json!(2));
+    }
 }

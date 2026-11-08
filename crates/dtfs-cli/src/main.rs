@@ -1960,7 +1960,7 @@ async fn cmd_stats(api: &ApiClient, format: &OutputFormat) -> anyhow::Result<()>
                     "Last scrub:        {} level={} node={} disk={}",
                     when,
                     ls["level"].as_str().unwrap_or("—"),
-                    ls["node_id"],
+                    ls["node_id"].as_str().unwrap_or("—"),
                     ls["disk_path"].as_str().unwrap_or("—")
                 );
                 println!(

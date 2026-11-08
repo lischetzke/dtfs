@@ -530,20 +530,7 @@ impl TaskScheduler {
         let mut out: Vec<_> = state
             .tasks
             .values()
-            .map(|t| {
-                serde_json::json!({
-                    "task_id":    t.task_id,
-                    "chunk_id":   t.chunk_id,
-                    "source_node": t.source_node,
-                    "target_node": t.target_node,
-                    "tier":        format!("{:?}", t.tier).to_ascii_lowercase(),
-                    "status":      format!("{:?}", t.status).to_ascii_lowercase(),
-                    "attempts":    t.attempts,
-                    "last_error":  t.last_error,
-                    "created_at_ms": t.created_at_ms,
-                    "updated_at_ms": t.updated_at_ms,
-                })
-            })
+            .map(migration_task_json)
             .collect();
         // Bug AW — sort by created_at_ms (set-once) DESC, tiebreak by
         // natural-numeric task_id ASC. Bug AM's earlier fix sorted on
@@ -764,6 +751,23 @@ impl MigrationOps for TaskScheduler {
             );
         }
     }
+}
+
+/// One migration task as served by `/api/v1/migrations`. Node ids are decimal
+/// STRINGS (u64 exceeds JS's 2^53 safe integer range), matching `/nodes`.
+pub(super) fn migration_task_json(t: &ReplicationTask) -> serde_json::Value {
+    serde_json::json!({
+        "task_id":    t.task_id,
+        "chunk_id":   t.chunk_id,
+        "source_node": t.source_node.to_string(),
+        "target_node": t.target_node.to_string(),
+        "tier":        format!("{:?}", t.tier).to_ascii_lowercase(),
+        "status":      format!("{:?}", t.status).to_ascii_lowercase(),
+        "attempts":    t.attempts,
+        "last_error":  t.last_error,
+        "created_at_ms": t.created_at_ms,
+        "updated_at_ms": t.updated_at_ms,
+    })
 }
 
 /// U3 — a copy job planned for one Copying task in the current round. The
@@ -2066,5 +2070,30 @@ mod sched_audit_tests {
         let mut state = state_of(1);
         advance_migration_tasks(&ops, &mut state, 1).await;
         assert_eq!(*ops.registered_with.lock().unwrap(), vec![None]);
+    }
+}
+
+#[cfg(test)]
+mod migration_json_tests {
+    use super::*;
+
+    #[test]
+    fn migration_task_nodes_serialise_as_strings() {
+        let t = ReplicationTask {
+            task_id: "repl-1".into(),
+            chunk_id: "abc".into(),
+            source_node: 15786580940693171021,
+            target_node: 12709699821947187762,
+            tier: DiskTier::Cold,
+            status: MigrationStatus::Pending,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            attempts: 0,
+            last_error: None,
+        };
+        let v = migration_task_json(&t);
+        assert_eq!(v["source_node"], serde_json::json!("15786580940693171021"));
+        assert_eq!(v["target_node"], serde_json::json!("12709699821947187762"));
+        assert_eq!(v["status"], serde_json::json!("pending"));
     }
 }
