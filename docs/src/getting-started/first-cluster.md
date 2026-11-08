@@ -1,93 +1,68 @@
 # First Cluster
 
-This guide walks through deploying a production-style DTFS cluster with 3 manager nodes, 4 data nodes across 2 racks, and FUSE clients. It assumes you have already completed the [Installation](./installation.md) steps on all machines.
+This guide walks through a small multi-node cluster by hand: 3 managers, 4 data
+nodes in 2 racks, 2 FUSE clients. It is the worked example behind the
+step-by-step spec in [Deployment automation](../deployment/overview.md); when
+you automate, follow that section, which also gives the exact checks after each
+step. Binaries are installed as described in [Installation](./installation.md)
+(release tarball, systemd units in place).
 
-## Cluster Topology
-
-We will deploy the following topology:
+## Topology
 
 ```text
-Region: us-east
-Datacenter: dc-1
-+-----------------------------------------------------------+
-|                                                           |
-|  Rack A                       Rack B                      |
-|  +-------------------------+  +-------------------------+ |
-|  | mgr-01  (manager)       |  | mgr-02  (manager)       | |
-|  | data-01 (SSD hot+warm)  |  | data-03 (SSD hot+warm)  | |
-|  | data-02 (HDD cold)      |  | data-04 (HDD cold)      | |
-|  +-------------------------+  +-------------------------+ |
-|                                                           |
-|  mgr-03 (manager, Rack A or B -- odd count for quorum)   |
-|                                                           |
-+-----------------------------------------------------------+
+Region us-east, datacenter dc-1
 
-Clients:
-  client-01 (Rack A, mounts /mnt/dtfs)
-  client-02 (Rack B, mounts /mnt/dtfs)
+  Rack A                          Rack B
+  mgr-01 (manager, bootstrap)     mgr-02 (manager)
+  mgr-03 (manager)
+  data-01 (SSD hot+warm)          data-03 (SSD hot+warm)
+  data-02 (HDD cold)              data-04 (HDD cold)
+  client-01                       client-02
 ```
 
-### Node Roles Summary
+| Hostname | Role | Rack | Disks (position: path, tier) |
+|----------|------|------|------------------------------|
+| mgr-01, mgr-03 | Manager | rack-a | none |
+| mgr-02 | Manager | rack-b | none |
+| data-01 | Data | rack-a | 0: /mnt/ssd-a hot, 1: /mnt/ssd-b warm |
+| data-02 | Data | rack-a | 0: /mnt/hdd-a cold |
+| data-03 | Data | rack-b | 0: /mnt/ssd-c hot, 1: /mnt/ssd-d warm |
+| data-04 | Data | rack-b | 0: /mnt/hdd-b cold |
+| client-01, client-02 | FUSE | rack-a, rack-b | none |
 
-| Hostname | Role | Rack | Disks |
-|----------|------|------|-------|
-| mgr-01 | Manager | rack-a | -- |
-| mgr-02 | Manager | rack-b | -- |
-| mgr-03 | Manager | rack-a | -- |
-| data-01 | Data | rack-a | /mnt/ssd-a (hot), /mnt/ssd-b (warm) |
-| data-02 | Data | rack-a | /mnt/hdd-a (cold) |
-| data-03 | Data | rack-b | /mnt/ssd-c (hot), /mnt/ssd-d (warm) |
-| data-04 | Data | rack-b | /mnt/hdd-b (cold) |
-| client-01 | FUSE | rack-a | -- |
-| client-02 | FUSE | rack-b | -- |
+Every daemon needs a unique hostname (`node.hostname`; for a client
+`location.host`): the node id is derived from it.
 
-## Step 1: Prepare Storage Disks
+## Step 1: Disks and secret
 
-On each data node, format and mount the storage disks. Use XFS for production:
+On each data node format, mount (by UUID in `/etc/fstab`) and give the disks to
+the service user. The daemon creates its own directories and identity files on
+the first start; do not pre-create anything inside a disk.
 
 ```bash
-# On data-01:
-sudo mkfs.xfs /dev/sdb
-sudo mkfs.xfs /dev/sdc
-sudo mkdir -p /mnt/ssd-a /mnt/ssd-b
-sudo mount /dev/sdb /mnt/ssd-a
-sudo mount /dev/sdc /mnt/ssd-b
-
-# On data-02:
-sudo mkfs.xfs /dev/sdb
-sudo mkdir -p /mnt/hdd-a
-sudo mount /dev/sdb /mnt/hdd-a
+sudo mkfs.xfs /dev/sdb && sudo mkdir -p /mnt/ssd-a
+echo 'UUID=<uuid> /mnt/ssd-a xfs noatime,inode64 0 0' | sudo tee -a /etc/fstab
+sudo mount /mnt/ssd-a && sudo chown dtfs:dtfs /mnt/ssd-a
 ```
 
-Repeat for `data-03` and `data-04` with their respective disks.
+Each disk's position in `[[disks]]` becomes its permanent id; keep the order
+(append only, see [Decommission and Replace](../deployment/decommission-replace.md)).
 
-Create the DTFS metadata directories on each disk:
-
-```bash
-sudo mkdir -p /mnt/ssd-a/.dtfs /mnt/ssd-a/chunks /mnt/ssd-a/tmp
-```
-
-## Step 2: Generate a Shared Secret
-
-All nodes in the cluster authenticate using a shared secret. Generate one and distribute it to all machines:
+Generate one cluster secret and use it in every config file of every role:
 
 ```bash
 openssl rand -hex 32
-# Example output: a3f8c1d9e2b7...
 ```
 
-Use this value in the `shared_secret` field of every configuration file.
+## Step 2: Configure managers
 
-## Step 3: Configure Manager Nodes
+`/etc/dtfs/manager.toml` on `mgr-01` (the bootstrap manager). Start from
+`deploy/examples/manager.toml`; the keys that matter here:
 
-### mgr-01 (Bootstrap Node)
-
-```bash
-cat <<'EOF' | sudo tee /etc/dtfs/manager.toml
+```toml
 [node]
-id = "auto"
 hostname = "mgr-01"
-data_dir = "/var/lib/dtfs/manager"
+data_dir = "/var/lib/dtfs/manager"   # must match the unit's writable path
 
 [location]
 region = "us-east"
@@ -98,27 +73,27 @@ host = "mgr-01"
 [cluster]
 name = "production"
 shared_secret = "YOUR_SHARED_SECRET_HERE"
-bootstrap = true
+bootstrap = true                     # exactly one manager, first start only
+
+[[cluster.initial_voters]]           # the voters seeded at bootstrap
+hostname = "mgr-01"
+addr = "10.0.0.1:9401"               # routable, never 0.0.0.0
+[[cluster.initial_voters]]
+hostname = "mgr-02"
+addr = "10.0.0.2:9401"
+[[cluster.initial_voters]]
+hostname = "mgr-03"
+addr = "10.0.0.3:9401"
 
 [raft]
-listen_addr = "0.0.0.0:9400"
-election_timeout_ms = 400
-heartbeat_interval_ms = 150
-snapshot_threshold = 10000
-
 [grpc]
 listen_addr = "0.0.0.0:9401"
-max_message_size_mb = 256
-
 [api]
-listen_addr = "0.0.0.0:9402"
-cors_origins = ["*"]
-
 [tls]
-mode = "auto"
+mode = "disabled"                    # see Security > TLS before enabling
 
 [defaults]
-chunk_size_mb = 128
+anchor_datacenter = "dc-1"
 
 [defaults.write_safety]
 min_replicas_before_ack = 2
@@ -130,46 +105,21 @@ warm = 2
 cold = 1
 
 [tiering]
-enabled = true
-hot_threshold_reads_per_hour = 5
-cold_threshold_days = 14
-frozen_threshold_days = 60
-migration_bandwidth_limit_mbps = 200
-evaluation_interval_secs = 3600
-
 [monitoring]
-heartbeat_interval_secs = 5
-suspect_after_missed = 3
-down_after_missed = 6
-EOF
 ```
 
-> **Important:** Only the first manager node should have `bootstrap = true`. This initializes the Raft cluster.
+`mgr-02` and `mgr-03` use the same file with their own `hostname`, `rack` and
+`host` and `bootstrap = false`. Unlisted keys take their defaults (the chunk size
+defaults to 4 MB; if you change `defaults.chunk_size_mb`, set the same
+`chunk_size_mb` on every client).
 
-### mgr-02 and mgr-03
+## Step 3: Configure data nodes and clients
 
-Use the same configuration as `mgr-01` with the following changes:
+`data-01` (`/etc/dtfs/data.toml`), the other data nodes differ in hostname, rack,
+`listen_addr` and `[[disks]]`:
 
 ```toml
 [node]
-hostname = "mgr-02"  # or "mgr-03"
-
-[location]
-rack = "rack-b"      # mgr-02 is in rack-b; mgr-03 in rack-a
-host = "mgr-02"      # or "mgr-03"
-
-[cluster]
-bootstrap = false     # These nodes join an existing cluster
-```
-
-## Step 4: Configure Data Nodes
-
-### data-01 (Hot + Warm SSD)
-
-```bash
-cat <<'EOF' | sudo tee /etc/dtfs/data.toml
-[node]
-id = "auto"
 hostname = "data-01"
 data_dir = "/var/lib/dtfs/data"
 
@@ -180,15 +130,15 @@ rack = "rack-a"
 host = "data-01"
 
 [cluster]
-manager_addr = "mgr-01:9401"
+manager_addr = "10.0.0.1:9401"
+manager_addrs = ["10.0.0.2:9401", "10.0.0.3:9401"]
 shared_secret = "YOUR_SHARED_SECRET_HERE"
 
 [grpc]
-listen_addr = "0.0.0.0:9500"
-max_message_size_mb = 256
+listen_addr = "10.0.1.1:9500"        # the routable address others dial
 
 [tls]
-mode = "auto"
+mode = "disabled"
 
 [[disks]]
 path = "/mnt/ssd-a"
@@ -199,44 +149,16 @@ path = "/mnt/ssd-b"
 tier = "warm"
 
 [cache]
-max_memory_mb = 8192
-policy = "arc"
-
 [scrub]
-quick_interval_hours = 6
-deep_interval_hours = 168
-max_io_percent = 10
-EOF
 ```
 
-### data-02 (Cold HDD)
+`client-01` (`/etc/dtfs/fuse.toml`, mode 0640 root:root):
 
 ```toml
-[node]
-hostname = "data-02"
-
-[location]
-rack = "rack-a"
-host = "data-02"
-
-[[disks]]
-path = "/mnt/hdd-a"
-tier = "cold"
-
-[cache]
-max_memory_mb = 2048
-```
-
-Repeat the pattern for `data-03` (rack-b, hot+warm) and `data-04` (rack-b, cold).
-
-## Step 5: Configure FUSE Clients
-
-### client-01
-
-```bash
-cat <<'EOF' | sudo tee /etc/dtfs/fuse.toml
 [client]
-manager_addr = "mgr-01:9401"
+manager_addr = "10.0.0.1:9401"
+manager_addrs = ["10.0.0.2:9401", "10.0.0.3:9401"]   # must include a voter
+shared_secret = "YOUR_SHARED_SECRET_HERE"
 
 [location]
 region = "us-east"
@@ -246,160 +168,52 @@ host = "client-01"
 
 [mount]
 mountpoint = "/mnt/dtfs"
+allow_other = true
 
 [readahead]
-mode = "folder-sequential"
-prefetch_chunks = 8
-prefetch_next_files = 3
-
 [cache]
-local_cache_dir = "/var/cache/dtfs"
-local_cache_max_gb = 50
-
 [partition_safety]
-mode = "strict"
-quorum_loss_timeout_secs = 10
-show_warning = true
-EOF
 ```
 
-The `location` field is critical for the FUSE client. It determines which data nodes are considered "nearest" for read operations. A client in `rack-a` will prefer reading from `data-01` and `data-02` over nodes in `rack-b`. See [Data Distribution](../architecture/data-distribution.md) for details on location-aware placement.
+The `location` block drives nearest-replica routing (a client in `rack-a` prefers
+`data-01` and `data-02`); see [Data Distribution](../architecture/data-distribution.md).
 
-## Step 6: Start the Cluster
+## Step 4: Start in order
 
-Start components in this order:
+Use the systemd units from the tarball (`systemctl enable --now`); after each
+step wait for the gate in [Fresh Install Order](../deployment/fresh-install.md).
 
-### 1. Bootstrap Manager
+1. Managers: start `mgr-01`, then `mgr-02` and `mgr-03`. Gate: each manager's
+   `curl http://<mgr>:9402/api/v1/raft/state` shows `running_state: ok`, the same
+   `current_leader`, and three `voters`.
+2. Data nodes: `systemctl enable --now dtfs-data` on each. Gate:
+   `curl http://mgr-01:9402/api/v1/nodes` lists every node `Healthy` with the
+   expected disk count.
+3. Clients: `systemctl enable --now "dtfs-fuse@$(systemd-escape --path /mnt/dtfs).service"`.
+   Gate: `mountpoint -q /mnt/dtfs`.
+
+A manager added later (not in `initial_voters` at bootstrap) joins as a learner
+through `dtfs-cli raft add-learner` and `raft promote`, see
+[Cluster Management](../operations/cluster-management.md#adding-a-manager-node).
+
+## Step 5: Verify
 
 ```bash
-# On mgr-01:
-sudo RUST_LOG=dtfs=info dtfs-manager --config /etc/dtfs/manager.toml
+dtfs-cli --manager mgr-01:9402 status
+dd if=/dev/urandom of=/mnt/dtfs/test-replication.bin bs=1M count=256   # on client-01
+curl -s "http://mgr-01:9402/api/v1/files/inspect?path=/test-replication.bin" | jq .
 ```
 
-Wait for the bootstrap message:
+The 256 MB file is stored as 64 chunks of 4 MB; the inspect output lists each
+chunk's replicas as `(node_id, disk_id, tier)`. A write is acknowledged only
+after `min_replicas_before_ack` distinct replicas are durable. The WebUI at
+`http://mgr-01:9402` shows nodes, disks and volumes. Delete the test file when
+done; its chunks are reclaimed by the orphan reaper after the grace period, not
+immediately.
 
-```text
-INFO  Raft cluster bootstrapped with node <id>
-```
+## Next steps
 
-### 2. Join Additional Managers
-
-```bash
-# On mgr-02:
-sudo RUST_LOG=dtfs=info dtfs-manager --config /etc/dtfs/manager.toml
-
-# On mgr-03:
-sudo RUST_LOG=dtfs=info dtfs-manager --config /etc/dtfs/manager.toml
-```
-
-The Raft cluster will elect a leader and form a 3-node quorum. You should see leader election messages in the logs:
-
-```text
-INFO  Raft: node <id> elected as leader for term 1
-```
-
-### 3. Start Data Nodes
-
-```bash
-# On each data node:
-sudo RUST_LOG=dtfs=info dtfs-data --config /etc/dtfs/data.toml
-```
-
-Each data node registers with the manager and begins sending heartbeats. The manager logs will show:
-
-```text
-INFO  RegisterNode: <node_id>
-```
-
-### 4. Mount FUSE Clients
-
-```bash
-# On each client:
-sudo RUST_LOG=dtfs=info dtfs-fuse --config /etc/dtfs/fuse.toml
-```
-
-## Step 7: Verify the Cluster
-
-### Check Cluster Health via WebUI
-
-Navigate to `http://mgr-01:9402` in a browser. The dashboard should show:
-
-- 3 manager nodes (one leader, two followers)
-- 4 data nodes, all healthy
-- Disk utilization across all tiers
-
-### Verify Replication
-
-Write a file and confirm it is replicated:
-
-```bash
-# On client-01:
-dd if=/dev/urandom of=/mnt/dtfs/test-replication.bin bs=1M count=256
-```
-
-This creates a 256 MB file, which is split into two 128 MB chunks. With `hot = 3` replication, each chunk is stored on 3 different data nodes.
-
-### Check Failure Domain Spread
-
-The [placement engine](../architecture/data-distribution.md) ensures that the 3 replicas of each hot chunk are placed on nodes in different racks. For our topology:
-
-```text
-Chunk 0: data-01 (rack-a) + data-03 (rack-b) + data-01 or data-03 (best effort)
-Chunk 1: data-03 (rack-b) + data-01 (rack-a) + ...
-```
-
-## Running as systemd Services
-
-For production, run each component as a systemd service:
-
-```bash
-cat <<'EOF' | sudo tee /etc/systemd/system/dtfs-manager.service
-[Unit]
-Description=DTFS Manager Node
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/dtfs-manager --config /etc/dtfs/manager.toml
-Restart=on-failure
-RestartSec=5
-Environment=RUST_LOG=dtfs=info
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now dtfs-manager
-```
-
-Create similar unit files for `dtfs-data` and `dtfs-fuse`.
-
-## Scaling the Cluster
-
-### Adding a Data Node
-
-1. Install DTFS on the new machine
-2. Create a `data.toml` pointing to any manager address
-3. Format and mount disks
-4. Start `dtfs-data`
-
-The data node registers automatically. The placement engine incorporates the new node into the hash ring, and subsequent writes will begin using it. Existing data is not automatically rebalanced -- see [Cluster Management](../operations/cluster-management.md) for rebalancing operations.
-
-### Adding a Manager Node
-
-Manager nodes participate in Raft consensus. Adding a manager requires a Raft membership change:
-
-1. Start the new manager with `bootstrap = false`
-2. The existing leader adds the new node to the Raft membership
-3. The new node receives a snapshot and begins replicating the log
-
-> **Warning:** Always maintain an odd number of manager nodes (3 or 5) to ensure a clear quorum. See [Consensus](../architecture/consensus.md) for quorum requirements.
-
-## Next Steps
-
-- [Architecture Overview](../architecture/overview.md) -- understand the system design
-- [Tiering](../storage/tiering.md) -- configure automatic hot/cold migration
-- [Monitoring](../operations/monitoring.md) -- set up health monitoring and alerting
-- [Security](../security/tls.md) -- configure TLS encryption
+- [Architecture Overview](../architecture/overview.md)
+- [Tiering](../storage/tiering.md)
+- [Monitoring](../operations/monitoring.md)
+- [TLS](../security/tls.md)

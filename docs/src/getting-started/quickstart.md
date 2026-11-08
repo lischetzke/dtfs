@@ -1,11 +1,11 @@
 # Quick Start
 
-This guide gets a single-node DTFS instance running in under 5 minutes. It is intended for development and experimentation -- see [First Cluster](./first-cluster.md) for production deployments.
+This guide gets a single-node DTFS instance running by hand in a few minutes. It is intended for development and experimentation: no systemd, no TLS, replication 1. For a real cluster see [First Cluster](./first-cluster.md) and [Deployment automation](../deployment/overview.md).
 
 ## Prerequisites
 
-- DTFS binaries built (see [Installation](./installation.md))
-- Linux with FUSE3 support (or WSL 2)
+- DTFS binaries built or unpacked from a release (see [Installation](./installation.md)) and on `PATH`
+- Linux with the `fuse3` package (or WSL 2), run as root for this walkthrough
 
 ## Step 1: Create Configuration Files
 
@@ -25,24 +25,26 @@ sudo mkdir -p /mnt/dtfs             # FUSE mount point
 cat <<'EOF' | sudo tee /etc/dtfs/manager.toml
 [node]
 id = "auto"
-hostname = "localhost"
+hostname = "qs-mgr"
 data_dir = "/var/lib/dtfs/manager"
 
 [location]
 region = "local"
 datacenter = "local"
 rack = "rack-1"
-host = "localhost"
+host = "qs-mgr"
 
 [cluster]
 name = "dtfs-quickstart"
 shared_secret = "change-me-in-production"
 bootstrap = true
 
+# A single-voter cluster still needs its own routable address here.
+[[cluster.initial_voters]]
+hostname = "qs-mgr"
+addr = "127.0.0.1:9401"
+
 [raft]
-listen_addr = "0.0.0.0:9400"
-election_timeout_ms = 400
-heartbeat_interval_ms = 150
 
 [grpc]
 listen_addr = "0.0.0.0:9401"
@@ -54,7 +56,6 @@ listen_addr = "0.0.0.0:9402"
 mode = "disabled"
 
 [defaults]
-chunk_size_mb = 128
 
 [defaults.write_safety]
 min_replicas_before_ack = 1
@@ -75,7 +76,7 @@ down_after_missed = 6
 EOF
 ```
 
-> **Note:** For a single-node setup, replication is set to 1 for all tiers and `min_replicas_before_ack` is 1. The `bootstrap = true` flag tells this manager to initialize a new Raft cluster.
+> **Note:** For a single-node setup, replication is set to 1 for all tiers and `min_replicas_before_ack` is 1. The `bootstrap = true` flag tells this manager to initialize a new Raft cluster; `initial_voters` must contain the manager itself. The chunk size is left at its default (4 MB); the FUSE client uses the same default, and the two must match. The shared secret is required on all three components; an empty one is refused at startup. The three `hostname`/`host` values must differ: they are the daemons' registry identities.
 
 ### Data Node Configuration
 
@@ -83,14 +84,14 @@ EOF
 cat <<'EOF' | sudo tee /etc/dtfs/data.toml
 [node]
 id = "auto"
-hostname = "localhost"
+hostname = "qs-data"
 data_dir = "/var/lib/dtfs/data"
 
 [location]
 region = "local"
 datacenter = "local"
 rack = "rack-1"
-host = "localhost"
+host = "qs-data"
 
 [cluster]
 manager_addr = "localhost:9401"
@@ -107,8 +108,6 @@ path = "/mnt/dtfs-data"
 tier = "hot"
 
 [cache]
-max_memory_mb = 1024
-policy = "arc"
 
 [scrub]
 quick_interval_hours = 6
@@ -123,12 +122,13 @@ EOF
 cat <<'EOF' | sudo tee /etc/dtfs/fuse.toml
 [client]
 manager_addr = "localhost:9401"
+shared_secret = "change-me-in-production"
 
 [location]
 region = "local"
 datacenter = "local"
 rack = "rack-1"
-host = "localhost"
+host = "qs-client"
 
 [mount]
 mountpoint = "/mnt/dtfs"
@@ -139,7 +139,6 @@ prefetch_chunks = 8
 prefetch_next_files = 3
 
 [cache]
-local_cache_max_gb = 10
 
 [partition_safety]
 mode = "strict"
@@ -159,16 +158,15 @@ You should see output similar to:
 
 ```text
 INFO  dtfs_manager > Starting DTFS Manager with config: /etc/dtfs/manager.toml
-INFO  dtfs_manager > Manager localhost at 0.0.0.0:9401 (local/local/rack-1/localhost)
+INFO  dtfs_manager > Manager qs-mgr at 0.0.0.0:9401 (local/local/rack-1/qs-mgr)
 INFO  dtfs_manager > Raft log store opened at "/var/lib/dtfs/manager/raft-log"
 INFO  dtfs_manager > Raft cluster bootstrapped with node <id>
 INFO  dtfs_manager > Tiering engine started (evaluation interval: 3600s)
 ```
 
 The manager is now running with:
-- gRPC service on port **9401**
+- gRPC service (metadata, registration and the Raft transport) on port **9401**
 - REST API and WebUI on port **9402**
-- Raft internal communication on port **9400**
 
 ## Step 3: Start the Data Node
 
@@ -182,9 +180,8 @@ Expected output:
 
 ```text
 INFO  dtfs_data > Starting DTFS Data Node with config: /etc/dtfs/data.toml
-INFO  dtfs_data > Data node localhost at 0.0.0.0:9500 (local/local/rack-1/localhost)
+INFO  dtfs_data > Data node qs-data at 0.0.0.0:9500 (local/local/rack-1/qs-data)
 INFO  dtfs_data > Initialized 1 disks
-INFO  dtfs_data > Initialized ARC cache: max_memory=1024MB, max_entries=8192
 INFO  dtfs_data > Started scrub scheduler background task
 ```
 
@@ -267,14 +264,13 @@ DEBUG dtfs_manager > Heartbeat from node <node_id>
          |  gRPC
    +-----v--------+
    | dtfs-manager  |   Raft (single-node), metadata
-   | :9400 (raft)  |   REST API + WebUI on :9402
-   | :9401 (grpc)  |
+   | :9401 (grpc)  |   REST API + WebUI on :9402
    | :9402 (api)   |
    +-----+---------+
          |  gRPC
    +-----v------+
    | dtfs-data   |   Chunk storage on /mnt/dtfs-data
-   | :9500       |   ARC cache: 1 GB
+   | :9500       |
    +-------------+
 ```
 
@@ -291,6 +287,8 @@ Press `Ctrl+C` in each terminal to stop the components. Stop in reverse order:
 **"failed to connect to DTFS manager"** -- Make sure the manager is running and the `manager_addr` in your config matches the manager's gRPC listen address.
 
 **"No disk for tier Hot"** -- The data node cannot find a disk configured for the requested tier. Verify the `[[disks]]` section in `data.toml` and ensure the path exists.
+
+**"shared_secret is empty" at startup** -- every component refuses an empty `shared_secret`; set the same non-empty value in all three files.
 
 **Permission denied on /mnt/dtfs** -- FUSE mounts may require the user to be in the `fuse` group:
 

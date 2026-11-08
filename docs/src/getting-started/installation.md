@@ -1,274 +1,72 @@
 # Installation
 
-This guide covers building DTFS from source. DTFS is written in Rust and uses Cargo as its build system.
+Two ways to get DTFS onto a host: a release tarball (normal) or a build from
+source (development). Installing a whole cluster by automation is specified in
+[Deployment automation](../deployment/overview.md); this page covers one host.
 
-## Prerequisites
+## From a release (recommended)
 
-### Rust Toolchain
+Releases are published to the project's GitLab package registry as
+`dtfs-linux-amd64.tar.gz` (see [Release Artifacts](../deployment/artifacts.md)
+for layout, checksums and signatures). Linux x86_64 with glibc 2.36 or newer
+(Debian 12, Ubuntu 24.04) is required; other prerequisites per role are in
+[Host Prerequisites](../deployment/host-prerequisites.md).
 
-DTFS requires Rust **edition 2024** (Rust 1.85+). Install or update via [rustup](https://rustup.rs/):
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup update stable
-```
-
-Verify your Rust version:
-
-```bash
-rustc --version
-# rustc 1.85.0 (... ) or newer
-```
-
-### System Dependencies
-
-DTFS depends on a few system libraries that must be installed before building.
-
-#### Debian / Ubuntu
+The installer unpacks a tarball, installs the binaries and systemd units,
+renders a minimal config and starts the service:
 
 ```bash
-sudo apt update
-sudo apt install -y \
-    build-essential \
-    pkg-config \
-    libfuse3-dev \
-    librocksdb-dev \
-    clang \
-    protobuf-compiler
+sudo ./scripts/dtfs-install.sh --source remote --version v0.2.0       # download + install
+sudo ./scripts/dtfs-install.sh /path/to/dtfs-linux-amd64.tar.gz       # a tarball you verified yourself
+sudo ./scripts/dtfs-install.sh --role data --noninteractive --managers m1:9401,m2:9401 --disks /mnt/disk-a,/mnt/disk-b
 ```
 
-#### Fedora / RHEL
-
-```bash
-sudo dnf install -y \
-    gcc gcc-c++ \
-    pkg-config \
-    fuse3-devel \
-    rocksdb-devel \
-    clang \
-    protobuf-compiler
-```
-
-#### Arch Linux
-
-```bash
-sudo pacman -S --needed \
-    base-devel \
-    pkg-config \
-    fuse3 \
-    rocksdb \
-    clang \
-    protobuf
-```
-
-#### macOS (Development Only)
-
-FUSE mounting is Linux-only, but you can build the manager and data node crates on macOS for development:
-
-```bash
-brew install protobuf rocksdb llvm
-```
-
-> **Note:** The `dtfs-fuse` binary compiles on macOS but cannot mount a filesystem. Use Linux or WSL for end-to-end testing.
-
-#### Windows (WSL)
-
-DTFS is designed for Linux. On Windows, use WSL 2 with an Ubuntu distribution:
-
-```powershell
-wsl --install -d Ubuntu
-```
-
-Then follow the Debian/Ubuntu instructions above inside your WSL environment.
-
-### XFS Filesystem (Production)
-
-Data nodes store chunks on XFS-formatted disks. While any filesystem works for development, XFS is recommended for production due to its efficient handling of large files and `O_DIRECT` support:
-
-```bash
-# Format a disk as XFS (DESTRUCTIVE -- wipes the disk)
-sudo mkfs.xfs /dev/sdX
-
-# Create a mount point and mount
-sudo mkdir -p /mnt/dtfs-disk-01
-sudo mount /dev/sdX /mnt/dtfs-disk-01
-
-# Add to /etc/fstab for persistence
-echo '/dev/sdX /mnt/dtfs-disk-01 xfs defaults 0 0' | sudo tee -a /etc/fstab
-```
-
-## Building from Source
-
-### Clone the Repository
-
-```bash
-git clone https://github.com/lischetzke/dtfs.git
-cd dtfs
-```
-
-### Build All Binaries
-
-Build the entire workspace in release mode:
-
-```bash
-cargo build --release
-```
-
-This produces three binaries in `target/release/`:
-
-| Binary | Description |
-|--------|-------------|
-| `dtfs-manager` | Manager node (Raft consensus, metadata, placement, WebUI) |
-| `dtfs-data` | Data node (chunk storage, replication, scrubbing) |
-| `dtfs-fuse` | FUSE client (POSIX mount point) |
-| `dtfs-cli` | Command-line administration tool |
-
-### Build Individual Crates
-
-If you only need a specific binary:
-
-```bash
-# Manager only
-cargo build --release -p dtfs-manager
-
-# Data node only
-cargo build --release -p dtfs-data
-
-# FUSE client only (Linux)
-cargo build --release -p dtfs-fuse
-
-# CLI tool
-cargo build --release -p dtfs-cli
-```
-
-### Verify the Build
-
-```bash
-./target/release/dtfs-manager --help
-./target/release/dtfs-data --help
-./target/release/dtfs-fuse --help
-```
-
-Expected output for `dtfs-manager`:
-
-```text
-DTFS Manager Node
-
-Usage: dtfs-manager [OPTIONS]
-
-Options:
-  -c, --config <CONFIG>  Path to configuration file [default: /etc/dtfs/manager.toml]
-  -h, --help             Print help
-```
-
-## Running Tests
-
-Run the full test suite:
-
-```bash
-cargo test --workspace
-```
-
-Run tests for a specific crate:
-
-```bash
-cargo test -p dtfs-common
-cargo test -p dtfs-data
-cargo test -p dtfs-raft
-```
-
-## Installation Paths
-
-For a production deployment, install the binaries and create the default configuration directory:
-
-```bash
-# Install binaries
-sudo install -m 0755 target/release/dtfs-manager /usr/local/bin/
-sudo install -m 0755 target/release/dtfs-data /usr/local/bin/
-sudo install -m 0755 target/release/dtfs-fuse /usr/local/bin/
-sudo install -m 0755 target/release/dtfs-cli /usr/local/bin/
-
-# Create configuration directory
-sudo mkdir -p /etc/dtfs
-
-# Create default data directory
-sudo mkdir -p /var/lib/dtfs
-```
-
-## Workspace Structure
-
-The repository is organized as a Cargo workspace:
-
-```text
-dtfs2/
-+-- Cargo.toml              # Workspace root
-+-- crates/
-|   +-- dtfs-common/        # Shared types, config, topology, hash ring
-|   +-- dtfs-proto/         # Protobuf definitions and generated code
-|   +-- dtfs-raft/          # OpenRaft integration (state machine, log store)
-|   +-- dtfs-manager/       # Manager node binary
-|   +-- dtfs-data/          # Data node binary
-|   +-- dtfs-client/        # Shared gRPC client library
-|   +-- dtfs-fuse/          # FUSE client binary
-|   +-- dtfs-cli/           # CLI administration tool
-+-- proto/                   # .proto source files
-+-- deploy/                  # Deployment configurations
-+-- tests/                   # Integration tests
-+-- webui/                   # WebUI frontend assets
-+-- docs/                    # This documentation (mdBook)
-```
-
-## Installer flags (AZ-2)
-
-`scripts/dtfs-install.sh` accepts a positional build tarball (the legacy
-workflow) OR resolves the tarball itself via `--source` + `--version`:
+It does not verify checksums or signatures; for anything beyond a lab, verify
+the download first. The config it renders is minimal, so a real cluster should
+template its own ([Configuration Templating](../deployment/config-templating.md)).
 
 | Flag | Default | Behaviour |
 |------|---------|-----------|
-| `--source local` | — | Search `$DTFS_LOCAL_BIN_DIR`, `./target/release`, `/opt/dtfs/staging/*/`, `~/.cache/dtfs`. Fail if none match. |
-| `--source remote` | — | Download from `$DTFS_REPO_URL` (default `https://github.com/lischetzke/dtfs`, Generic Package Registry; a github.com URL uses GitHub releases). Set `DTFS_REPO_TOKEN` for a private project. `github` is accepted as an alias. Use `--version` to pin a tag. |
-| `--source auto` | yes | Try local first; fall back to remote. |
-| `--version <tag>` | `latest` | Release tag; `latest` is the newest full `vX.Y.Z` release. Ignored for `--source local`. |
+| `--source local\|remote\|auto` | `auto` | `local` searches `$DTFS_LOCAL_BIN_DIR`, `./target/release`, `/opt/dtfs/staging/*/` and `~/.cache/dtfs` for `dtfs-<version>-linux-amd64.tar.gz` (a differently named file must be passed as the positional argument). `remote` downloads from `$DTFS_REPO_URL` (default `https://github.com/lischetzke/dtfs`, package registry; a github.com URL uses GitHub releases; `jq` is needed to resolve `latest` on GitLab). `auto` tries local, then remote. |
+| `--version <tag>` | `latest` | Release tag; `latest` is the newest full `vX.Y.Z`, alphas are skipped. |
+| `--role manager\|data\|fuse-client` | prompt | Host role. |
+| `--noninteractive` | off | No prompts; needs `--role` and `--managers`. |
+| `--managers h:9401,...` `--cluster-name N` `--hostname H` `--secret S` | prompts | Config values. The secret also comes from `DTFS_SHARED_SECRET`; prefer that, `--secret` is visible in `ps`. |
+| `--bootstrap true\|false` | `false` non-interactively | Manager only; true on exactly one manager, first start of a new cluster. |
+| `--disks /a,/b` | prompt | Data role; the first disk is `hot`, the rest `cold`. The order becomes the permanent disk ids. |
+| `--mountpoint P` | `/mnt/dtfs` | FUSE role. |
+| `--reconfigure` | off | Re-render an existing `/etc/dtfs/<role>.toml`; otherwise it and its secret are kept. |
+| `--uninstall` | | Remove units and binaries; config and data stay. `--purge --yes` also deletes `/etc/dtfs` and `/var/lib/dtfs` (never data disks). |
 
-The installer stages the chosen tarball at `/opt/dtfs/staging/<version>/`
-before unpacking + installing. Failed runs leave the staging dir for
-forensic inspection.
-
-Air-gapped workflow: pre-stage the tarball at
-`/opt/dtfs/staging/<version>/dtfs-<rev>-linux-amd64.tar.gz` on each
-host, then run `dtfs-install.sh --source local`.
-
-### Re-runs, non-interactive mode, uninstall
-
-Re-running the installer upgrades binaries and restarts the service but keeps
-an existing `/etc/dtfs/<role>.toml` (and its `shared_secret`) untouched; pass
-`--reconfigure` to re-render it. The secret defaults to `DTFS_SHARED_SECRET`,
-then the existing config, then a fresh `openssl rand` / `/dev/urandom` value;
-the installer refuses to continue if no secure RNG exists.
-
-| Flag | Behaviour |
-|------|-----------|
-| `--noninteractive` | No prompts. Requires `--role` and `--managers`. Other values come from flags or defaults. |
-| `--role manager\|data\|fuse-client` | Host role. |
-| `--managers h:9401,...` `--cluster-name N` `--hostname H` `--secret S` | Config values (`--secret` also via `DTFS_SHARED_SECRET`). |
-| `--bootstrap true\|false` | Manager only; default `false` non-interactively. |
-| `--disks /a,/b` | Data role; first disk is `hot`, the rest `cold`. |
-| `--mountpoint P` | FUSE role, default `/mnt/dtfs`. |
-| `--reconfigure` | Overwrite an existing role config. |
-| `--uninstall` | Remove units and binaries; config and data stay. |
-| `--uninstall --purge --yes` | Also delete `/etc/dtfs` and `/var/lib/dtfs` (all chunks). `--purge` without `--yes` is refused. |
-
-The units run with `ProtectSystem=strict`. The installer creates
-`/var/lib/dtfs/manager` or `/var/lib/dtfs/data` (matching `data_dir`) and, for
-the data role, writes `/etc/systemd/system/dtfs-data.service.d/disks.conf`
-with `ReadWritePaths=` for every `[[disks]]` path. Disk mount points must exist
-before the data node starts. `fuse.toml` carries the shared secret and is
-installed `0640 root:root`.
-
+Environment: `DTFS_REPO_URL`, `DTFS_REPO_TOKEN` (GitLab deploy token `gldt-...`
+or access token for a private project), `DTFS_LOCAL_BIN_DIR`,
+`DTFS_SHARED_SECRET`. Downloads are cached in `~/.cache/dtfs` and staged in
+`/opt/dtfs/staging/<version>/` (kept after a failed run). Air-gapped: place the
+tarball there and use `--source local`. The units run with
+`ProtectSystem=strict`; the installer creates `/var/lib/dtfs/<role>` and writes
+the data node's `disks.conf` drop-in (disk mount points must exist before the
+data node starts). Layout and modes: [Filesystem Layout](../deployment/filesystem-layout.md).
 Regression test: `bash scripts/tests/test-dtfs-install.sh`.
 
-## Next Steps
+## From source
 
-- [Quick Start](./quickstart.md) -- run a single-node DTFS instance in 5 minutes
-- [First Cluster](./first-cluster.md) -- deploy a multi-node cluster
-- [Manager Configuration](../configuration/manager.md) -- full configuration reference
+Build in the Docker image `dtfs-buildenv:latest` (Debian 12, Rust 1.94.1, protoc,
+clang, libfuse3-dev; `docker/buildenv.Dockerfile`) or on a Linux host with the
+same packages. Steps, crate layout and test commands are in
+[Building from Source](../development/building.md) and
+[Testing](../development/testing.md). Deploy builds must go through the wrapper
+scripts so the version and build date are stamped (`scripts/dtfs-build.sh`,
+`scripts/dtfs-release.sh <tag>`); a bare `cargo build --release` stamps stale
+metadata. The manager and data crates need RocksDB and fuse3 and do not build on
+Windows or macOS; use Docker or WSL 2.
+
+The result is four binaries (`dtfs-manager`, `dtfs-data`, `dtfs-fuse`,
+`dtfs-cli`) in `target/release/`, or the release tarball layout under
+`target/dist/`.
+
+## Next steps
+
+- [Quick Start](./quickstart.md): one node by hand in a few minutes
+- [First Cluster](./first-cluster.md): a multi-node cluster walkthrough
+- [Deployment automation](../deployment/overview.md): the spec for Ansible-style automation
+- [Manager Configuration](../configuration/manager.md): every key

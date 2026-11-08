@@ -9,6 +9,18 @@
 - [Quick Start](./getting-started/quickstart.md)
 - [First Cluster](./getting-started/first-cluster.md)
 
+# Deployment automation
+
+- [Overview](./deployment/overview.md)
+- [Release Artifacts](./deployment/artifacts.md)
+- [Host Prerequisites](./deployment/host-prerequisites.md)
+- [Filesystem Layout and Units](./deployment/filesystem-layout.md)
+- [Configuration Templating](./deployment/config-templating.md)
+- [Fresh Install Order](./deployment/fresh-install.md)
+- [Rolling Update and Rollback](./deployment/rolling-update.md)
+- [Decommission and Replace](./deployment/decommission-replace.md)
+- [Role Variables and Idempotency](./deployment/role-variables.md)
+
 # Architecture
 
 - [Overview](./architecture/overview.md)
@@ -22,6 +34,7 @@
 - [Data Node Configuration](./configuration/data-node.md)
 - [FUSE Client Configuration](./configuration/fuse-client.md)
 - [Cluster-wide Configuration](./configuration/cluster-config.md)
+- [Cluster vs Node-scoped Keys](./configuration/scope.md)
 - [Volume Configuration](./configuration/volume-config.md)
 - [Live Reload](./configuration/live-reload.md)
 
@@ -30,6 +43,7 @@
 - [Cluster Management](./operations/cluster-management.md)
 - [CI Pipeline: Test, Release, Deploy](./operations/ci-pipeline.md)
 - [Disk Management](./operations/disk-management.md)
+- [Orphan Chunk Cleanup](./operations/orphan-cleanup-runbook.md)
 - [Maintenance Mode](./operations/maintenance-mode.md)
 - [Monitoring](./operations/monitoring.md)
 - [Log Shipping (Filebeat → Elastic)](./operations/log-shipping.md)
