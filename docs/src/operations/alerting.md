@@ -114,7 +114,7 @@ a blackbox or JSON exporter or a cron job):
 |-----------|-------|
 | No Raft leader | `GET /api/v1/raft/state`: `current_leader == null` on any manager |
 | Raft lag | `applied_log_lag` above a few hundred, or a peer's `replication[].lag` |
-| Data loss signal | `GET /api/v1/cluster/status`: `files_missing_chunks > 0`, or `status != "ok"` |
+| Data loss signal | `GET /api/v1/cluster/status`: `files_missing_chunks > 0` (files whose committed data is gone; empty files do not count), or `status != "ok"` |
 | Not ready | `GET /readyz` returns 503 |
 | Anchor copy missing | `anchor_pending` stays above zero for long |
 | Auth probing | audit rows `auth.denied` (see below) |

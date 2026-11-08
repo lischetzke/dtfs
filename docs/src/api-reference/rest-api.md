@@ -119,7 +119,7 @@ Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserve
 }
 ```
 
-`status` is `degraded` when any file has lost all chunk bindings (`files_missing_chunks > 0`) or fewer data nodes are effectively healthy than registered, else `ok`. Health is liveness-projected from `raft.node_liveness_secs`. `anchor_pending` counts files whose anchor copy has not landed yet (asynchronous convergence, does not degrade `status`).
+`status` is `degraded` when any file has lost its committed data (`files_missing_chunks > 0`; empty and never-written sparse files do not count, see [Glossary](../glossary.md)) or fewer data nodes are effectively healthy than registered, else `ok`. Health is liveness-projected from `raft.node_liveness_secs`. `anchor_pending` counts files whose anchor copy has not landed yet (asynchronous convergence, does not degrade `status`).
 
 ### GET /api/v1/stats
 

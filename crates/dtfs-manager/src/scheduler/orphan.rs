@@ -1025,6 +1025,7 @@ mod sched_audit_orphan_tests {
             logical_size: None,
             is_directory: false,
             cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            ever_committed: None,
         };
         [("/f".to_string(), fm)].into()
     }

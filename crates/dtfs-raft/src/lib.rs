@@ -386,6 +386,10 @@ pub enum ClientRequest {
         path: String,
         volume_id: String,
         chunk_size: u64,
+        /// Proposer wall-clock for created/updated_at (A.3.1); `0` = legacy
+        /// entry, apply falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
     },
     DeleteFile {
         path: String,

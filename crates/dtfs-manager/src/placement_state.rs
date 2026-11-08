@@ -313,6 +313,7 @@ pub(crate) mod test_fixture {
             logical_size: None,
             is_directory: false,
             cache_cooldown_until_ms: BTreeMap::new(),
+            ever_committed: None,
         }
     }
 
@@ -674,6 +675,7 @@ mod tests {
                 logical_size: None,
                 is_directory: false,
                 cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+                ever_committed: None,
             },
         );
 

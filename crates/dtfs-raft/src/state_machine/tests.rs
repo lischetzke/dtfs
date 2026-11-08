@@ -46,7 +46,7 @@ mod snapshot_persistence_tests {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
-                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
             },
         );
         data.cluster_config.version = 7;
@@ -282,7 +282,7 @@ mod snapshot_persistence_tests {
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/foo.bin".to_string(),
                 volume_id: "default".to_string(),
                 chunk_size: 16 * 1024 * 1024,
@@ -360,7 +360,7 @@ mod snapshot_persistence_tests {
         apply_request(
             &mut sm,
             &mk_log_id(3),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/post-resize.bin".to_string(),
                 volume_id: "default".to_string(),
                 chunk_size: 4 * 1024 * 1024,
@@ -440,7 +440,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(7),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/det.bin".into(),
                 volume_id: "default".into(),
                 chunk_size: 1024,
@@ -516,7 +516,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/corpus/".into(),
                 volume_id: "default".into(),
                 chunk_size: 128 * 1024 * 1024,
@@ -548,7 +548,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/foo/bar.txt".into(),
                 volume_id: "default".into(),
                 chunk_size: 1024,
@@ -579,7 +579,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(3),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/series/episode-01.mkv".into(),
                 volume_id: "default".into(),
                 chunk_size: 128 * 1024 * 1024,
@@ -612,7 +612,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(4),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/movies/.foo.GQhlto".into(),
                 volume_id: "default".into(),
                 chunk_size: 128 * 1024 * 1024,
@@ -697,7 +697,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/f.bin".into(),
                 volume_id: "default".into(),
                 chunk_size: 4 * 1024 * 1024,
@@ -759,7 +759,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(10),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/series/".into(),
                 volume_id: "default".into(),
                 chunk_size: 128 * 1024 * 1024,
@@ -769,7 +769,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(11),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/series/episode-01.mkv".into(),
                 volume_id: "default".into(),
                 chunk_size: 128 * 1024 * 1024,
@@ -837,7 +837,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(20),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/movies/foo.mkv".into(),
                 volume_id: "default".into(),
                 chunk_size: 1024,
@@ -888,7 +888,7 @@ mod posix_path_regression {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
-                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
             },
         );
 
@@ -930,7 +930,7 @@ mod posix_path_regression {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
-                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
             },
         );
         sm
@@ -1040,7 +1040,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/x.bin".into(),
                 volume_id: "default".into(),
                 chunk_size: 1024,
@@ -1152,7 +1152,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::CreateFile {
+            &ClientRequest::CreateFile { now_ms: 0,
                 path: "/y.bin".into(),
                 volume_id: "default".into(),
                 chunk_size: 1024,
@@ -1220,7 +1220,7 @@ mod posix_path_regression {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
-                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
             },
         );
         apply_request(
@@ -1335,7 +1335,7 @@ mod posix_path_regression {
             apply_request(
                 &mut sm,
                 &mk_log_id(i + 1),
-                &ClientRequest::CreateFile {
+                &ClientRequest::CreateFile { now_ms: 0,
                     path: format!("/seed/{i}"),
                     volume_id: "default".into(),
                     chunk_size: 1024,
@@ -1428,7 +1428,7 @@ mod posix_path_regression {
             symlink_target: None,
             logical_size: None,
             is_directory: false,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
         });
         sm
     }
@@ -2008,7 +2008,7 @@ mod posix_path_regression {
             symlink_target: None,
             logical_size: None,
             is_directory: false,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
         };
         original.cache_cooldown_until_ms.insert(0, 1_000_000);
         original.cache_cooldown_until_ms.insert(2, 2_000_000);
@@ -2714,13 +2714,13 @@ mod posix_path_regression {
     #[test]
     fn raft_2_rename_directory_moves_children() {
         let mut sm = StateMachineData::default();
-        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
             path: "/a/".into(), volume_id: "default".into(), chunk_size: 4096,
         });
-        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile { now_ms: 0,
             path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
         });
-        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::CreateFile { now_ms: 0,
             path: "/a/b/y".into(), volume_id: "default".into(), chunk_size: 4096,
         });
         apply_request(&mut sm, &mk_log_id(4),
@@ -2741,7 +2741,7 @@ mod posix_path_regression {
         let mut sm = StateMachineData::default();
         // No mkdir marker for "/a" — only a file underneath it, so "/a" is
         // a synthetic directory (Bug B).
-        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
             path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
         });
         let resp = apply_request(&mut sm, &mk_log_id(2),
@@ -2755,10 +2755,10 @@ mod posix_path_regression {
     #[test]
     fn raft_2_rename_onto_nonempty_directory_is_refused() {
         let mut sm = StateMachineData::default();
-        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
             path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
         });
-        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile { now_ms: 0,
             path: "/b/y".into(), volume_id: "default".into(), chunk_size: 4096,
         });
         let resp = apply_request(&mut sm, &mk_log_id(3),
@@ -2772,7 +2772,7 @@ mod posix_path_regression {
     #[test]
     fn raft_2_rename_lease_follows_child() {
         let mut sm = StateMachineData::default();
-        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
             path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
         });
         apply_request(&mut sm, &mk_log_id(2), &ClientRequest::AcquireWriteLease {
@@ -2793,7 +2793,7 @@ mod posix_path_regression {
     #[test]
     fn raft_3_truncate_zero_then_commit_grows_logical_size() {
         let mut sm = StateMachineData::default();
-        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
             path: "/f".into(), volume_id: "default".into(), chunk_size: 4 * 1024 * 1024,
         });
         apply_request(&mut sm, &mk_log_id(2),
@@ -2818,7 +2818,7 @@ mod posix_path_regression {
     #[test]
     fn raft_3_sparse_grow_size_is_preserved_over_a_smaller_chunk_extent() {
         let mut sm = StateMachineData::default();
-        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
             path: "/f".into(), volume_id: "default".into(), chunk_size: 4 * 1024 * 1024,
         });
         let six_mb = 6 * 1024 * 1024u64;
@@ -2845,7 +2845,7 @@ mod posix_path_regression {
     #[test]
     fn raft_7_delete_file_removes_lease_and_locks() {
         let mut sm = StateMachineData::default();
-        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
             path: "/f".into(), volume_id: "default".into(), chunk_size: 4096,
         });
         apply_request(&mut sm, &mk_log_id(2), &ClientRequest::AcquireWriteLease {
@@ -2864,10 +2864,10 @@ mod posix_path_regression {
     #[test]
     fn raft_7_delete_nonempty_directory_is_refused() {
         let mut sm = StateMachineData::default();
-        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
             path: "/a/".into(), volume_id: "default".into(), chunk_size: 4096,
         });
-        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile { now_ms: 0,
             path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
         });
         let resp = apply_request(&mut sm, &mk_log_id(3),
@@ -2903,7 +2903,7 @@ mod posix_path_regression {
             from: "/a".into(), to: "/b".into(), now_ms: 1_234,
         };
         let mut sm1 = StateMachineData::default();
-        apply_request(&mut sm1, &mk_log_id(1), &ClientRequest::CreateFile {
+        apply_request(&mut sm1, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
             path: "/a".into(), volume_id: "default".into(), chunk_size: 4096,
         });
         let mut sm2 = sm1.clone();
@@ -2927,7 +2927,7 @@ mod posix_path_regression {
             other => panic!("expected RenameFile, got {other:?}"),
         }
         let mut sm = StateMachineData::default();
-        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
             path: "/a".into(), volume_id: "default".into(), chunk_size: 4096,
         });
         apply_request(&mut sm, &mk_log_id(7), &req);
@@ -2949,7 +2949,7 @@ mod posix_path_regression {
             now_ms: 5_000,
         };
         let mut sm1 = StateMachineData::default();
-        apply_request(&mut sm1, &mk_log_id(1), &ClientRequest::CreateFile {
+        apply_request(&mut sm1, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
             path: "/f".into(), volume_id: "default".into(), chunk_size: 4096,
         });
         let mut sm2 = sm1.clone();
@@ -3034,7 +3034,7 @@ mod audit_co_tests {
             symlink_target: None,
             logical_size: None,
             is_directory: false,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
         });
         sm
     }
@@ -3117,7 +3117,7 @@ mod audit_co_tests {
     // SAME CreateFile therefore diverge byte-for-byte. Correct: identical.
     #[test]
     fn co_3_1_create_file_apply_is_deterministic_across_replicas() {
-        let req = ClientRequest::CreateFile {
+        let req = ClientRequest::CreateFile { now_ms: 0,
             path: "/det.bin".into(),
             volume_id: "default".into(),
             chunk_size: 1024,
@@ -3147,7 +3147,7 @@ mod audit_co_tests {
     #[test]
     fn co_4_9_create_file_existing_path_preserves_chunks() {
         let mut sm = StateMachineData::default();
-        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
             path: "/keep.bin".into(),
             volume_id: "default".into(),
             chunk_size: 1024,
@@ -3167,7 +3167,7 @@ mod audit_co_tests {
         assert_eq!(sm.files.get("/keep.bin").unwrap().chunks.len(), 1);
 
         // Re-create the same path.
-        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::CreateFile { now_ms: 0,
             path: "/keep.bin".into(),
             volume_id: "default".into(),
             chunk_size: 1024,
@@ -3200,7 +3200,7 @@ mod audit_co_tests {
             other => panic!("expected WriteLeaseGranted, got {other:?}"),
         };
         // Create the file so UpdateChunkLocations has a target after rename.
-        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile { now_ms: 0,
             path: "/a".into(),
             volume_id: "default".into(),
             chunk_size: 1024,
@@ -3298,7 +3298,7 @@ mod audit_co_tests {
             now_ms: 1_000,
             proposed_lease_id: "lease-A".into(),
         });
-        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile {
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::CreateFile { now_ms: 0,
             path: "/f".into(),
             volume_id: "default".into(),
             chunk_size: 1024,
@@ -3476,7 +3476,7 @@ mod raft_audit_fix_tests {
     }
 
     fn create(sm: &mut StateMachineData, idx: u64, path: &str) {
-        let r = apply_request(sm, &lid(idx), &ClientRequest::CreateFile {
+        let r = apply_request(sm, &lid(idx), &ClientRequest::CreateFile { now_ms: 0,
             path: path.into(), volume_id: "default".into(), chunk_size: 4096,
         });
         assert!(matches!(r, ClientResponse::FileCreated { .. }), "{r:?}");
@@ -3857,5 +3857,223 @@ mod raft_audit_fix_tests {
             };
             assert!(first.iter().all(|(_, t)| *t == expect), "{first:?} want {expect}");
         }
+    }
+}
+
+/// `FileMetadata.ever_committed`: only a file whose committed data is gone
+/// counts as missing chunks, not an empty or never-written sparse file.
+#[cfg(test)]
+mod ever_committed_tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn lid(idx: u64) -> LogId {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        openraft::LogId::new(leader, idx)
+    }
+
+    fn create(sm: &mut StateMachineData, idx: u64, path: &str) {
+        let r = apply_request(sm, &lid(idx), &ClientRequest::CreateFile {
+            now_ms: 0, path: path.into(), volume_id: "default".into(), chunk_size: MIB,
+        });
+        assert!(matches!(r, ClientResponse::FileCreated { .. }), "{r:?}");
+    }
+
+    fn row(i: u64) -> ChunkLocationEntry {
+        ChunkLocationEntry {
+            chunk_index: i, chunk_hash: format!("h{i}"), node_id: "7".into(),
+            disk_id: 1, size_bytes: MIB,
+        }
+    }
+
+    fn commit(sm: &mut StateMachineData, idx: u64, path: &str, i: u64) {
+        let r = apply_request(sm, &lid(idx), &ClientRequest::UpdateChunkLocations {
+            path: path.into(), chunks: vec![row(i)], lease_id: "seed".into(), now_ms: 0,
+        });
+        assert_eq!(r, ClientResponse::Success);
+    }
+
+    fn set_size(sm: &mut StateMachineData, idx: u64, path: &str, new_size: u64) {
+        let r = apply_request(sm, &lid(idx), &ClientRequest::SetFileSize {
+            path: path.into(), new_size, now_ms: 0,
+        });
+        assert_eq!(r, ClientResponse::Success);
+    }
+
+    #[test]
+    fn empty_file_is_not_missing() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/e");
+        let f = &sm.files["/e"];
+        assert_eq!(f.ever_committed, Some(false));
+        assert!(!f.committed_data_missing());
+        set_size(&mut sm, 2, "/e", 0); // `: > e` / O_TRUNC
+        assert!(!sm.files["/e"].committed_data_missing());
+    }
+
+    #[test]
+    fn sparse_never_written_file_is_not_missing() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/s");
+        set_size(&mut sm, 2, "/s", 10 * MIB); // truncate -s 10M
+        let f = &sm.files["/s"];
+        assert_eq!((f.ever_committed, f.logical_size), (Some(false), Some(10 * MIB)));
+        assert!(!f.committed_data_missing());
+    }
+
+    #[test]
+    fn written_file_that_lost_its_chunks_is_missing() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/w");
+        seed_lease(&mut sm, "/w");
+        commit(&mut sm, 2, "/w", 0);
+        assert_eq!(sm.files["/w"].ever_committed, Some(true));
+        assert!(!sm.files["/w"].committed_data_missing(), "chunks present");
+        // BP-4: rows gone (e.g. GC) => realized data loss, with or without a
+        // logical size set.
+        sm.files.get_mut("/w").unwrap().chunks.clear();
+        assert!(sm.files["/w"].committed_data_missing());
+    }
+
+    #[test]
+    fn lease_less_union_onto_existing_rows_marks_committed() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/u");
+        seed_lease(&mut sm, "/u");
+        commit(&mut sm, 2, "/u", 0);
+        // A legacy entry (marker unknown) re-registered by the scheduler.
+        sm.files.get_mut("/u").unwrap().ever_committed = None;
+        let mut copy = row(0);
+        copy.node_id = "8".into();
+        let r = apply_request(&mut sm, &lid(3), &ClientRequest::UpdateChunkLocations {
+            path: "/u".into(), chunks: vec![copy], lease_id: String::new(), now_ms: 0,
+        });
+        assert_eq!(r, ClientResponse::Success);
+        assert_eq!(sm.files["/u"].ever_committed, Some(true));
+    }
+
+    #[test]
+    fn rename_and_link_keep_the_marker() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/a");
+        seed_lease(&mut sm, "/a");
+        commit(&mut sm, 2, "/a", 0);
+        apply_request(&mut sm, &lid(3), &ClientRequest::RenameFile {
+            from: "/a".into(), to: "/b".into(), now_ms: 0,
+        });
+        apply_request(&mut sm, &lid(4), &ClientRequest::CreateLink {
+            source: "/b".into(), dest: "/c".into(), now_ms: 0,
+        });
+        assert_eq!(sm.files["/b"].ever_committed, Some(true));
+        assert_eq!(sm.files["/c"].ever_committed, Some(true));
+    }
+
+    #[test]
+    fn truncate_to_zero_resets_marker_and_regrow_is_not_missing() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/t");
+        seed_lease(&mut sm, "/t");
+        commit(&mut sm, 2, "/t", 0);
+        set_size(&mut sm, 3, "/t", 0);
+        assert_eq!(sm.files["/t"].ever_committed, Some(false));
+        set_size(&mut sm, 4, "/t", 10 * MIB); // truncate 0 then sparse grow
+        assert!(!sm.files["/t"].committed_data_missing());
+        // Boundary: shrinking to 1 byte keeps chunk 0 and the marker.
+        commit(&mut sm, 5, "/t", 0);
+        set_size(&mut sm, 6, "/t", 1);
+        assert_eq!(sm.files["/t"].ever_committed, Some(true));
+    }
+
+    #[test]
+    fn legacy_entry_counts_only_with_logical_size() {
+        let mut f = FileMetadata {
+            path: "/l".into(), volume_id: "default".into(), chunk_size: MIB, chunks: vec![],
+            created_at_ms: 0, updated_at_ms: 0, symlink_target: None, logical_size: None,
+            is_directory: false, cache_cooldown_until_ms: Default::default(),
+            ever_committed: None,
+        };
+        assert!(!f.committed_data_missing(), "legacy, size unknown -> 0");
+        f.logical_size = Some(0);
+        assert!(!f.committed_data_missing(), "legacy, size 0");
+        f.logical_size = Some(1);
+        assert!(f.committed_data_missing(), "legacy, size 1 without chunks");
+        f.is_directory = true;
+        assert!(!f.committed_data_missing(), "directory never counts");
+        f.is_directory = false;
+        f.symlink_target = Some("/x".into());
+        assert!(!f.committed_data_missing(), "symlink never counts");
+    }
+
+    #[test]
+    fn create_stamps_proposer_time_and_falls_back_to_log_index() {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &lid(5), &ClientRequest::CreateFile {
+            now_ms: 1_700_000_000_000, path: "/n".into(), volume_id: "default".into(), chunk_size: MIB,
+        });
+        let f = &sm.files["/n"];
+        assert_eq!((f.created_at_ms, f.updated_at_ms), (1_700_000_000_000, 1_700_000_000_000));
+        create(&mut sm, 6, "/legacy");
+        assert_eq!(sm.files["/legacy"].created_at_ms, 6, "now_ms 0 -> log index");
+    }
+
+    /// Random op sequences: replay is deterministic and the marker is
+    /// `Some(true)` on every regular file that holds chunks.
+    #[test]
+    fn random_ops_are_deterministic_and_keep_marker_invariant() {
+        let paths = ["/p0", "/p1", "/p2"];
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let mut ops = Vec::new();
+        for _ in 0..400 {
+            let p = paths[(next() % 3) as usize].to_string();
+            ops.push(match next() % 5 {
+                0 => ClientRequest::CreateFile {
+                    now_ms: 0, path: p, volume_id: "default".into(), chunk_size: MIB,
+                },
+                1 | 2 => ClientRequest::UpdateChunkLocations {
+                    path: p, chunks: vec![row(next() % 4)], lease_id: String::new(), now_ms: 0,
+                },
+                3 => ClientRequest::SetFileSize { path: p, new_size: (next() % 5) * MIB, now_ms: 0 },
+                _ => ClientRequest::DeleteFile { path: p, now_ms: 0 },
+            });
+        }
+        let run = |check: bool| {
+            let mut sm = StateMachineData::default();
+            for (i, op) in ops.iter().enumerate() {
+                // Lease-less writes cannot add rows; seed them with a lease.
+                if let ClientRequest::UpdateChunkLocations { path, chunks, .. } = op {
+                    if sm.files.contains_key(path) && next_bool(i) {
+                        seed_lease(&mut sm, path);
+                        apply_request(&mut sm, &lid(i as u64 + 1), &ClientRequest::UpdateChunkLocations {
+                            path: path.clone(), chunks: chunks.clone(), lease_id: "seed".into(), now_ms: 0,
+                        });
+                        sm.write_leases.remove(path);
+                        continue;
+                    }
+                }
+                apply_request(&mut sm, &lid(i as u64 + 1), op);
+                if check {
+                    for f in sm.files.values() {
+                        if !f.chunks.is_empty() {
+                            assert_eq!(f.ever_committed, Some(true), "step {i}: {f:?}");
+                        }
+                        if f.ever_committed == Some(false) {
+                            assert!(!f.committed_data_missing(), "step {i}");
+                        }
+                    }
+                }
+            }
+            sm.files
+        };
+        assert_eq!(run(true), run(false), "replay must be deterministic");
+    }
+
+    fn next_bool(i: usize) -> bool {
+        i % 3 != 0
     }
 }

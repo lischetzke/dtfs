@@ -1082,7 +1082,7 @@ mod tests {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
-                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
             },
         );
 
@@ -1805,7 +1805,7 @@ mod tests {
             symlink_target: None,
             logical_size: None,
             is_directory: false,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
         }
     }
 

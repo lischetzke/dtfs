@@ -158,6 +158,7 @@ fn file(path: &str) -> dtfs_raft::state_machine::FileMetadata {
         logical_size: None,
         is_directory: false,
         cache_cooldown_until_ms: Default::default(),
+        ever_committed: None,
     }
 }
 
@@ -307,6 +308,31 @@ async fn stats_and_readyz_use_effective_health() {
     assert!(s["goal_unreachable"].as_array().unwrap().is_empty(), "{s}");
     let (_, msg) = readyz_probe(State(h.state.clone())).await;
     assert!(msg.contains("any_healthy=true"), "{msg}");
+}
+
+#[tokio::test]
+async fn cluster_status_ok_with_empty_file_degraded_on_lost_data() {
+    let h = harness().await;
+    seed_node(&h, now_ms()).await;
+    {
+        let mut sm = h.state.sm_data.write().await;
+        let mut empty = file("/empty");
+        empty.chunks.clear();
+        empty.ever_committed = Some(false);
+        sm.files.insert("/empty".into(), empty);
+    }
+    let v = cluster_status(State(h.state.clone())).await.0;
+    assert_eq!((v["status"].as_str(), v["files_missing_chunks"].as_u64()), (Some("ok"), Some(0)), "{v}");
+
+    {
+        let mut sm = h.state.sm_data.write().await;
+        let mut lost = file("/lost");
+        lost.chunks.clear();
+        lost.ever_committed = Some(true);
+        sm.files.insert("/lost".into(), lost);
+    }
+    let v = cluster_status(State(h.state.clone())).await.0;
+    assert_eq!((v["status"].as_str(), v["files_missing_chunks"].as_u64()), (Some("degraded"), Some(1)), "{v}");
 }
 
 #[tokio::test]

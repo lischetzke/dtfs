@@ -33,8 +33,10 @@ All on the manager REST port (default 9402), no authentication for reads.
 }
 ```
 
-`status` is `degraded` when any file has lost all chunk bindings
+`status` is `degraded` when any file has lost its committed data
 (`files_missing_chunks > 0`) or fewer data nodes are healthy than registered.
+Empty files and sparse files that were never written have no chunks and do
+not count ([Glossary](../glossary.md)).
 `anchor_pending` counts files whose anchor copy has not landed yet (asynchronous
 convergence, not data loss, does not degrade `status`). The post-deploy gate
 `scripts/dtfs-cluster-healthcheck.sh` asserts exactly these fields.

@@ -518,13 +518,24 @@ mod bug_bp_tests {
             }).collect(),
             created_at_ms: 0, updated_at_ms: 0,
             symlink_target: link, logical_size: None, is_directory: dir,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: Some(true),
+        };
+        let with = |mut f: FileMetadata, size: Option<u64>, ever: Option<bool>| {
+            f.logical_size = size;
+            f.ever_committed = ever;
+            f
         };
         sm.files.insert("/ok.bin".into(), mk("/ok.bin", 2, false, None));
         sm.files.insert("/lost.bin".into(), mk("/lost.bin", 0, false, None)); // data loss
         sm.files.insert("/dir".into(), mk("/dir", 0, true, None));            // dir, excluded
         sm.files.insert("/lnk".into(), mk("/lnk", 0, false, Some("/ok.bin".into()))); // symlink, excluded
-        assert_eq!(count_files_missing_chunks(&sm), 1, "only the chunkless regular file counts");
+        // Empty and never-written sparse files legitimately have no chunks.
+        sm.files.insert("/empty".into(), with(mk("/empty", 0, false, None), Some(0), Some(false)));
+        sm.files.insert("/sparse".into(), with(mk("/sparse", 0, false, None), Some(10 << 20), Some(false)));
+        // Legacy entries (marker unknown): only a size > 0 counts.
+        sm.files.insert("/old0".into(), with(mk("/old0", 0, false, None), None, None));
+        sm.files.insert("/old1".into(), with(mk("/old1", 0, false, None), Some(1), None));
+        assert_eq!(count_files_missing_chunks(&sm), 2, "only /lost.bin and /old1 count");
     }
 
     // ── BP-5 — tape replication normalization ───────────────────────
@@ -1567,7 +1578,7 @@ mod bug_bv3_data_node_count_tests {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
-                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
             },
         );
 
@@ -1683,7 +1694,7 @@ mod cnf1_stable_disk_id_tests {
             symlink_target: None,
             logical_size: None,
             is_directory: false,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
         });
 
         assert_eq!(

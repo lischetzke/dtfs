@@ -336,6 +336,7 @@ mod tests {
                 logical_size: None,
                 is_directory: false,
                 cache_cooldown_until_ms: Default::default(),
+                ever_committed: None,
             },
         );
         sm

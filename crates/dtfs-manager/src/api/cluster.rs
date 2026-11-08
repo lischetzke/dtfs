@@ -81,13 +81,10 @@ pub(crate) fn is_raft_member(
 
 /// Bug BP-4 — count regular files that have no chunk bindings (realized data
 /// loss: FileMetadata stranded with zero chunks, e.g. after GC deleted
-/// orphaned chunks). Directories + symlinks legitimately have no chunks and
-/// are excluded.
+/// orphaned chunks). Directories, symlinks, empty and never-written sparse
+/// files legitimately have no chunks: see `FileMetadata::committed_data_missing`.
 pub(crate) fn count_files_missing_chunks(sm: &dtfs_raft::state_machine::StateMachineData) -> usize {
-    sm.files
-        .values()
-        .filter(|f| !f.is_directory && f.symlink_target.is_none() && f.chunks.is_empty())
-        .count()
+    sm.files.values().filter(|f| f.committed_data_missing()).count()
 }
 
 /// Bug BB-1 — per-tier `used_bytes` contribution of one node's disks.

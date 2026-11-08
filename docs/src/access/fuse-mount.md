@@ -74,6 +74,7 @@ Writes are buffered per chunk, flushed in batches (`write.flush_batch_chunks`, d
 
 - `opendir` takes one snapshot of the listing and serves `readdir` and `readdirplus` pages from it until `releasedir`.
 - The client counts kernel lookups per inode and drops an inode only when the count reaches zero. fuse3 batch-forget carries no counts, so an inode that was not looked up for 5 s is dropped instead.
+- Times: a new file reports its creation time; mtime then follows writes, truncates and renames. Explicit times from `utimensat` (`touch -d`, `touch -r`, `cp -p`, `rsync -t`) are ignored: there is no replicated command for them.
 - File attributes: symlinks are reported as symlinks (`is_symlink` from the manager); file mode overrides are kept client-side and re-keyed on rename. The metadata cache is bounded (4096 entries) and swept on its TTL.
 
 ## Locks
@@ -96,3 +97,23 @@ A DTFS mount can be re-exported with the Linux kernel NFS server (`exportfs`, us
 - An NFSv3 EXCLUSIVE create that is retransmitted returns `EEXIST` (create verifiers are not stored).
 - Ownership is the daemon's uid/gid; `chown` is ignored.
 - The kernel NFS server may open, flush and release a file repeatedly during a long write; this has not been tested end to end.
+- **Unexport before stopping the client.** While a path under the mount is exported, knfsd holds the mount: `fusermount3 -u` fails with `EBUSY`, `dtfs-fuse` exits anyway, and the dead mount (`Transport endpoint is not connected`) makes every later start fail. Unexport every export under the mount first (`exportfs -u <client>:<path>` per export, then `exportfs -f`), and re-export after the mount is up.
+
+A drop-in for the `dtfs-fuse@` instance does this on every start and stop. The empty `ExecStartPre=` and `ExecStop=` lines clear the template's own `fusermount3 -u` so the unexport runs first. Adjust the client spec (as in `/etc/exports`) and the path, one `-u` line per export:
+
+```ini
+# /etc/systemd/system/dtfs-fuse@mnt-dtfs.service.d/nfs-export.conf
+[Service]
+ExecStartPre=
+ExecStartPre=-/usr/sbin/exportfs -u *:/mnt/dtfs/media
+ExecStartPre=-/usr/sbin/exportfs -f
+ExecStartPre=-/usr/bin/fusermount3 -u /mnt/dtfs
+# Type=simple: wait for the mount before re-exporting.
+ExecStartPost=/bin/sh -c 'for i in $(seq 30); do mountpoint -q /mnt/dtfs && exec /usr/sbin/exportfs -r; sleep 1; done; exit 1'
+ExecStop=
+ExecStop=-/usr/sbin/exportfs -u *:/mnt/dtfs/media
+ExecStop=-/usr/sbin/exportfs -f
+ExecStop=/usr/bin/fusermount3 -u /mnt/dtfs
+```
+
+Run `systemctl daemon-reload` after adding it. This drop-in is not shipped or tested by the installer.

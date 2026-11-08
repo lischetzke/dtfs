@@ -100,6 +100,7 @@ fn full_snapshot() -> StateMachineSnapshot {
         logical_size: Some(8192),
         is_directory: false,
         cache_cooldown_until_ms: cooldown,
+        ever_committed: None,
     };
     let mut snap = StateMachineSnapshot {
         last_applied_log: Some((3, 42)),
@@ -150,7 +151,7 @@ fn all_requests() -> Vec<ClientRequest> {
     use ClientRequest::*;
     let s = |x: &str| x.to_string();
     vec![
-        CreateFile { path: s("/a"), volume_id: s("default"), chunk_size: 1024 },
+        CreateFile { path: s("/a"), volume_id: s("default"), chunk_size: 1024, now_ms: 0 },
         DeleteFile { path: s("/a"), now_ms: 5 },
         UpdateChunkLocations { path: s("/a"), chunks: vec![chunk(0)], lease_id: s("l1"), now_ms: 5 },
         RemoveCorruptChunkReplicas { node_id: s("7"), chunk_hashes: vec![s("ab")], disk_id: 1, now_ms: 5 },
@@ -287,6 +288,20 @@ fn snapshot_v1_fixture_loads() {
     assert_eq!(snap.pending_scrub.unwrap().id, "s1");
     assert_eq!(snap.migration_state_json, "{\"tasks\":[]}");
     assert_eq!(snap.client_count, 2);
+}
+
+/// The v1 fixtures predate `FileMetadata.ever_committed` and
+/// `CreateFile.now_ms`: they load as "unknown" (None) and legacy `0`.
+#[test]
+fn v1_fixtures_default_ever_committed_and_create_now_ms() {
+    let snap = deserialize_snapshot(io::Cursor::new(SNAPSHOT_V1.as_bytes().to_vec())).unwrap();
+    assert!(snap.files.values().all(|f| f.ever_committed.is_none()));
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V1).unwrap();
+    let create = reqs.iter().find_map(|r| match r {
+        ClientRequest::CreateFile { now_ms, .. } => Some(*now_ms),
+        _ => None,
+    });
+    assert_eq!(create, Some(0));
 }
 
 /// Every top-level snapshot field except the original required six must be

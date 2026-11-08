@@ -99,6 +99,30 @@ pub struct FileMetadata {
     /// for pre-AV files.
     #[serde(default)]
     pub cache_cooldown_until_ms: std::collections::BTreeMap<u64, u64>,
+
+    /// Whether committed chunk data ever existed for this entry (only then is
+    /// a chunkless file data loss; an empty or never-written sparse file
+    /// legitimately has no chunks). `Some(false)` at create and after a
+    /// truncate to 0, `Some(true)` once an `UpdateChunkLocations` leaves the
+    /// file with chunks. `None` = entry from an older snapshot, unknown.
+    #[serde(default)]
+    pub ever_committed: Option<bool>,
+}
+
+impl FileMetadata {
+    /// A regular file whose committed data is gone: no chunk rows left
+    /// although data was committed. Legacy entries (`ever_committed` None)
+    /// count only when their logical size is > 0. Single source for every
+    /// `files_missing_chunks` count.
+    pub fn committed_data_missing(&self) -> bool {
+        !self.is_directory
+            && self.symlink_target.is_none()
+            && self.chunks.is_empty()
+            && match self.ever_committed {
+                Some(ever) => ever,
+                None => self.logical_size.unwrap_or(0) > 0,
+            }
+    }
 }
 
 /// F-039 — One distributed POSIX byte-range lock held in the cluster FSM.
@@ -505,6 +529,7 @@ impl StateMachineData {
                 logical_size: None,
                 is_directory: true,
                 cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+                ever_committed: Some(false),
             });
         }
         None
@@ -1066,6 +1091,7 @@ fn apply_request(
             path,
             volume_id,
             chunk_size,
+            now_ms: req_now_ms,
         } => {
             // Bug A — normalize the storage key. FUSE's `mkdir` historically
             // signals "create a directory entry" by appending a trailing
@@ -1086,17 +1112,11 @@ fn apply_request(
             // CO-3-1 — CreateFile must apply deterministically: two replicas
             // (or a replay) applying the same log entry have to reach
             // byte-identical state, so the timestamps it stamps cannot come
-            // from each machine's own `SystemTime::now()`. The CreateFile
-            // command carries no proposer wall-clock (the eventual real fix is
-            // to thread one in, like AcquireWriteLease.now_ms), so the
-            // committed `log_id.index` -- identical on every replica -- is used
-            // as a deterministic logical timestamp for the new entry + its
-            // audit row. NOTE: an empty file therefore reports a small
-            // (near-epoch) created/updated_at until the first
-            // UpdateChunkLocations stamps a real wall-clock; this is the
-            // accepted cost of making apply deterministic without a wire
-            // change.
-            let det_now = log_id.index;
+            // from each machine's own `SystemTime::now()`. The proposer's
+            // `now_ms` is used; a legacy entry without one (0) falls back to
+            // the committed `log_id.index`, identical on every replica (such
+            // an empty file reports a near-epoch mtime).
+            let det_now = if *req_now_ms == 0 { log_id.index } else { *req_now_ms };
             // CO-4-9 — CreateFile on an existing non-empty regular file must
             // NOT silently truncate it (a re-open / O_CREAT on an already-
             // populated path). Keep the existing entry intact -- chunks,
@@ -1132,6 +1152,7 @@ fn apply_request(
                         logical_size: None,
                         is_directory: is_dir,
                         cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+                        ever_committed: Some(false),
                     },
                 );
             }
@@ -1260,6 +1281,9 @@ fn apply_request(
                     }
                 } else {
                     merge_chunk_location_entries_in_place(&mut file.chunks, chunks);
+                }
+                if !file.chunks.is_empty() {
+                    file.ever_committed = Some(true);
                 }
                 file.updated_at_ms = eff_now_ms;
                 // RAFT-3 — `logical_size` is set once by SetFileSize (e.g.
@@ -1865,6 +1889,11 @@ fn apply_request(
                 let chunk_size = meta.chunk_size.max(1);
                 let keep_idx = (*new_size).div_ceil(chunk_size);
                 meta.chunks.retain(|c| c.chunk_index < keep_idx);
+                // Truncate to 0 discards all committed data legitimately, so a
+                // later sparse grow is not data loss.
+                if *new_size == 0 {
+                    meta.ever_committed = Some(false);
+                }
                 push_audit_capped(
                     &mut sm.audit_log,
                     audit_at(format!("SetFileSize: {path} -> {new_size}"), eff_now_ms),
@@ -1897,6 +1926,7 @@ fn apply_request(
                     logical_size: Some(target.len() as u64),
                     is_directory: false,
                     cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+                    ever_committed: Some(false),
                 },
             );
             push_audit_capped(

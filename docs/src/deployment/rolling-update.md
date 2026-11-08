@@ -111,7 +111,8 @@ bash scripts/dtfs-cluster-healthcheck.sh --managers <host:9402,...all managers> 
 
 Exit 0 means: all listed managers `running_state == ok` and agree on one leader;
 the leader's `/api/v1/cluster/status` has `status == "ok"`,
-`data_nodes_healthy == data_nodes`, `files_missing_chunks == 0`; at least
+`data_nodes_healthy == data_nodes`, `files_missing_chunks == 0` (empty files do
+not count, see [Glossary](../glossary.md)); at least
 `--min-data-nodes` data nodes; every node that reports a version reports
 `--expect-version`. Exit 1 unhealthy after the timeout, 3 bad arguments. The CI
 `verify` stage repeats the same command from the runner.

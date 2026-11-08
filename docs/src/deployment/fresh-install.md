@@ -152,7 +152,8 @@ curl -fsS http://$LEADER/readyz          # now 200 "ready"
 
 The healthcheck passes when every listed manager has `running_state == ok` and
 the same leader, `cluster/status.status == "ok"`, `data_nodes_healthy ==
-data_nodes`, `files_missing_chunks == 0`, at least `--min-data-nodes` data nodes
+data_nodes`, `files_missing_chunks == 0` (empty files do not count, see
+[Glossary](../glossary.md)), at least `--min-data-nodes` data nodes
 and every reporting node on `--expect-version`. List every voter in
 `--managers`; learners are optional.
 

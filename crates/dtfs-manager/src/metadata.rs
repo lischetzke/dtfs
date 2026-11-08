@@ -1478,6 +1478,7 @@ impl ManagerService for MetadataService {
 
         let resp = self
             .raft_write(ClientRequest::CreateFile {
+                now_ms: stamp_now_ms(),
                 path: req.path.clone(),
                 volume_id: volume_id.clone(),
                 chunk_size,
