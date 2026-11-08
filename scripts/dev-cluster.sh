@@ -35,6 +35,8 @@ Usage: scripts/dev-cluster.sh <command>
   fuse [cmd...]     start (or reuse) the FUSE client container; with args, run
                     them inside it: fuse sh -c 'echo hi > /mnt/dtfs/x'
   nfs-check         NFS re-export of a FUSE mount: PASS/FAIL per step
+  empty-files       empty/sparse files (FUSE + NFS create paths) must not make
+                    cluster/status degraded on any manager; mtime not 1970
   big-file <GiB>    large-file check through FUSE (write, read back, in-DTFS
                     copy; MB/s per phase, peak RSS). Needs free disk of about
                     size x replicas x 2
@@ -273,6 +275,72 @@ cmd_nfs_check() {
   docker exec dtfs-dev-nfs sh -c "$NFS_STEPS"
 }
 
+EMPTY_MAKE='
+set -u; D=/mnt/dtfs/$1; rc=0
+ck() { if [ "$1" = 0 ]; then echo "PASS: $2"; else echo "FAIL: $2"; rc=1; fi; }
+mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null; rpcbind; sleep 1
+echo "/mnt/dtfs *(rw,sync,no_subtree_check,no_root_squash,fsid=4242)" > /etc/exports
+exportfs -ra && rpc.mountd && rpc.nfsd 4; ck $? "nfs server up"
+mkdir -p /mnt/nfs
+mount -t nfs -o vers=3,nolock,actimeo=0 127.0.0.1:/mnt/dtfs /mnt/nfs; ck $? "nfs mount"
+mkdir "$D"; ck $? "mkdir $D"
+cd "$D" || exit 1
+touch a; ck $? "FUSE touch a"
+: > b; ck $? "FUSE : > b (O_TRUNC create)"
+echo x > c; : > c; ck $? "FUSE write then truncate c"
+truncate -s 10M d; ck $? "FUSE truncate -s 10M d (sparse)"
+python3 -c "import os,stat; os.mknod(\"e\", 0o644|stat.S_IFREG)"; ck $? "FUSE mknod e"
+N=/mnt/nfs/$1
+touch $N/f; ck $? "NFS touch f"
+: > $N/g; ck $? "NFS : > g"
+touch $N/h; : > $N/h; ck $? "NFS touch + truncate h"
+exit $rc
+'
+
+EMPTY_FINISH='
+set -u; D=/mnt/dtfs/$1; rc=0
+ck() { if [ "$1" = 0 ]; then echo "PASS: $2"; else echo "FAIL: $2"; rc=1; fi; }
+for f in a e; do
+  m=$(stat -c %Y "$D/$f" 2>/dev/null || echo 0)
+  [ "$m" -gt 1600000000 ]; ck $? "mtime of $f is not 1970 ($m)"
+done
+cd /
+rm -rf "$D"; ck $? "cleanup files"
+exportfs -u "*:/mnt/dtfs"; exportfs -f
+umount /mnt/nfs; ck $? "umount nfs"
+fusermount3 -u /mnt/dtfs; ck $? "fusermount3 -u /mnt/dtfs"
+exit $rc
+'
+
+# status "ok" and files_missing_chunks 0 on every manager; sets rc=1 on FAIL
+empty_status_check() { # empty_status_check <label>
+  local m s
+  for m in mgr01 mgr02 mgr03; do
+    s="$(curl -s --max-time 5 "http://127.0.0.1:$(mgr_port $m)/api/v1/cluster/status" | tr -d ' \n')"
+    case "$s" in
+      *'"status":"ok"'*'"files_missing_chunks":0'*|*'"files_missing_chunks":0'*'"status":"ok"'*) pass "$1: $m status ok, files_missing_chunks 0";;
+      *) fail "$1: $m status not ok or files_missing_chunks != 0 (${s:-no REST reply})"; rc=1;;
+    esac
+  done
+}
+
+cmd_empty_files() {
+  local rc=0 dir; dir="empty-check-$(date +%s)"
+  empty_status_check "baseline (pre-existing cluster state, not caused by this check)"
+  [ $rc = 0 ] || exit 1
+  exists dtfs-dev-nfs && docker rm -f dtfs-dev-nfs >/dev/null
+  start_client nfs nfs.toml 1
+  log "installing nfs and python3 packages in dtfs-dev-nfs"
+  docker exec dtfs-dev-nfs sh -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-kernel-server nfs-common python3-minimal >/dev/null' \
+    || { fail "apt install packages"; exit 1; }
+  docker exec dtfs-dev-nfs bash -c "$EMPTY_MAKE" _ "$dir" || rc=1
+  sleep 5
+  empty_status_check "after empty files"
+  docker exec dtfs-dev-nfs bash -c "$EMPTY_FINISH" _ "$dir" || rc=1
+  [ $rc = 0 ] && log "empty-files: all PASS" || log "empty-files: FAILED"
+  exit $rc
+}
+
 BIG_STEPS='
 set -u; N=$1; B=/mnt/dtfs/big-$$
 t() { date +%s.%N; }
@@ -314,6 +382,7 @@ case "${1:-}" in
   status) cmd_status;;
   fuse) shift; cmd_fuse "$@";;
   nfs-check) cmd_nfs_check;;
+  empty-files) cmd_empty_files;;
   big-file) shift; cmd_big_file "$@";;
   down) cmd_down;;
   -h|--help|help|"") usage;;

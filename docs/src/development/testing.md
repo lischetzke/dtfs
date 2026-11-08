@@ -44,6 +44,7 @@ The host-side Python tooling under `tools/dtfs-mcp` is tested separately (`uv ru
 | `status` | Container states plus the `/api/v1/cluster/status` summary |
 | `fuse [cmd...]` | Start or reuse the FUSE client container; run `cmd` inside it (mount at `/mnt/dtfs`) |
 | `nfs-check` | Re-export the FUSE mount over NFSv3 in a privileged container: small file, 10 MB `cmp` via NFS and FUSE, rename, remove, `cmp` again after dropping caches; PASS/FAIL per step, non-zero exit on failure |
+| `empty-files` | Regression check for v0.1.8 (empty and sparse files must not make `GET /api/v1/cluster/status` report "degraded"). Asserts a clean baseline on mgr01/02/03 (status `ok`, `files_missing_chunks` 0), then in a unique `/mnt/dtfs/empty-check-<ts>` creates empty files via `touch`, `: >`, write-then-truncate, `truncate -s 10M` (sparse) and `mknod` (the knfsd create path), plus `touch`/`: >` over an NFS re-export. Re-asserts status on every manager, checks the mtime of `a` and `e` is not 1970, then cleans up (`exportfs -u`, `umount`, `fusermount3 -u`). PASS/FAIL per step, non-zero exit on failure |
 | `big-file <GiB>` | Opt-in: stream random data through FUSE while hashing, read back, copy inside DTFS, compare; prints MB/s per phase and peak RSS of `dtfs-fuse`. Needs free disk of about size x replicas x 2 |
 | `down` | Remove all containers, the network and volumes (state is lost) |
 
