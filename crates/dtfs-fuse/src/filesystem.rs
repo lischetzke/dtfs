@@ -1863,8 +1863,21 @@ impl DtfsFilesystem {
             .get(&fh)
             .map(|f| f.path.clone())
             .context("invalid fh")?;
+        // Fresh manager fetch (never the metadata cache); a failure is an
+        // error, not a guess, since a too-small size would shrink the file.
+        self.metadata_cache.remove(&path);
         let loc = self.fetch_file_locations(&path).await?;
-        Ok(loc.total_size.max(self.write_buffer.logical_size(&path).unwrap_or(0)))
+        let handle_sizes: Vec<u64> = self
+            .open_files
+            .iter()
+            .filter(|e| e.value().path == path)
+            .filter_map(|e| e.value().locations.as_ref().map(|l| l.total_size))
+            .collect();
+        Ok(authoritative_size(
+            loc.total_size,
+            self.write_buffer.logical_size(&path),
+            &handle_sizes,
+        ))
     }
 
     /// Update the manager-side logical size (F-033 fallocate / F-037
@@ -2829,6 +2842,16 @@ fn segments_committable(
         }
     }
     Ok(())
+}
+
+/// Largest size any source knows; fallocate grows from this so a stale
+/// manager/cache view can never make it shrink the file.
+fn authoritative_size(manager: u64, buffered_end: Option<u64>, handle_sizes: &[u64]) -> u64 {
+    handle_sizes
+        .iter()
+        .copied()
+        .chain(buffered_end)
+        .fold(manager, u64::max)
 }
 
 /// Chunk index holding the existing partial tail when a write at
@@ -3845,6 +3868,18 @@ mod audit_write_path_tests {
 #[cfg(test)]
 mod w3_write_hole_tests {
     use super::*;
+
+    /// Stale view (manager/cache says 0) must not win over the buffered end
+    /// or a handle's known size, else fallocate(0, 1M) would shrink to 1M.
+    #[test]
+    fn authoritative_size_takes_max_of_all_sources() {
+        let g = 1u64 << 30;
+        assert_eq!(authoritative_size(0, Some(g), &[]), g);
+        assert_eq!(authoritative_size(0, None, &[g, 5]), g);
+        assert_eq!(authoritative_size(10, None, &[]), 10);
+        assert_eq!(authoritative_size(0, None, &[]), 0);
+        assert_eq!(crate::fuse_adapter::fallocate_target_size(0, 1 << 20, 0, g).unwrap(), None);
+    }
 
     #[test]
     fn hole_tail_chunk_only_for_unaligned_eof_and_write_past_it() {

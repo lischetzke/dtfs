@@ -1267,7 +1267,7 @@ impl Filesystem for DtfsFuse3Adapter {
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, "fuse3 fallocate size lookup failed");
-                return Err(open_err_to_errno(&e));
+                return Err(Errno::from(libc::EIO)); // never guess a size
             }
         };
         let new_size = match fallocate_target_size(offset, length, mode, current)? {
