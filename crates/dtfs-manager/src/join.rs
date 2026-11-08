@@ -8,9 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dtfs_common::crypto::{
-    compute_join_hmac, generate_cluster_ca, generate_node_cert, generate_nonce, verify_join_hmac,
-};
+use dtfs_common::crypto::{compute_join_hmac, generate_nonce, verify_join_hmac};
 use dtfs_raft::{ClientRequest, ClientResponse, DtfsRaft, NodeInfo};
 use parking_lot::RwLock;
 use tracing::{info, warn};
@@ -22,20 +20,12 @@ use crate::audit::AuditLog;
 /// stale challenge MUST NOT remain forgeable indefinitely.
 const CHALLENGE_TTL_MS: u64 = 60_000;
 
-/// Cached cluster CA material (lazily generated on first join if auto-TLS).
-struct CaState {
-    ca_cert_pem: Vec<u8>,
-    ca_key_pem: Vec<u8>,
-}
-
 /// Handles the two-phase cluster join handshake.
 pub struct JoinHandler {
     shared_secret: String,
     cluster_name: String,
     raft: Arc<DtfsRaft>,
     audit: Arc<AuditLog>,
-    /// Lazily generated CA certificate for auto-TLS.
-    ca: RwLock<Option<CaState>>,
     /// CO-2-3 — outstanding phase-1 challenges keyed by the server-issued
     /// challenge string, valued by their expiry instant (ms since epoch).
     /// Single-use: phase-2 removes the entry before verifying, so a replayed
@@ -77,7 +67,6 @@ impl JoinHandler {
             cluster_name,
             raft,
             audit,
-            ca: RwLock::new(None),
             challenges: RwLock::new(HashMap::new()),
         }
     }
@@ -107,25 +96,6 @@ impl JoinHandler {
             };
         }
 
-        // Ensure a cluster CA exists (lazy init for auto-TLS).
-        let ca_cert_pem = {
-            let mut ca = self.ca.write();
-            if ca.is_none() {
-                match generate_cluster_ca(&self.cluster_name) {
-                    Ok((cert, key)) => {
-                        *ca = Some(CaState {
-                            ca_cert_pem: cert,
-                            ca_key_pem: key,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to generate cluster CA");
-                    }
-                }
-            }
-            ca.as_ref().map(|c| c.ca_cert_pem.clone()).unwrap_or_default()
-        };
-
         // Generate a challenge nonce for the completion step and persist it
         // with a TTL so phase-2 can verify the caller actually holds the
         // shared secret (CO-2-3). Prune expired challenges opportunistically
@@ -145,21 +115,10 @@ impl JoinHandler {
         JoinResult {
             accepted: true,
             challenge,
-            ca_cert_pem,
+            // No join-time CA: TLS material comes from the [tls] config.
+            ca_cert_pem: Vec::new(),
             rejection_reason: String::new(),
         }
-    }
-
-    /// Generate a node certificate signed by the cluster CA.
-    pub fn generate_node_certificate(
-        &self,
-        hostname: &str,
-    ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-        let ca = self.ca.read();
-        let ca = ca
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Cluster CA not initialized"))?;
-        generate_node_cert(&ca.ca_cert_pem, &ca.ca_key_pem, hostname)
     }
 
     /// CO-2-3 — pure proof-of-possession check for phase-2 (no Raft, no

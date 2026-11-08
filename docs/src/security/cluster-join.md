@@ -40,13 +40,10 @@ The join handshake consists of two gRPC calls defined in `cluster.proto` via the
        |  1. RequestJoin(hmac, nonce, node_info)   |
        |----------------------------------------->|
        |                                          |  Verify HMAC(secret, nonce)
-       |                                          |  Generate cluster CA (if needed)
        |                                          |  Generate challenge nonce
        |  2. JoinResponse(accepted, challenge,     |
        |     ca_cert, managers)                    |
        |<-----------------------------------------|
-       |                                          |
-       |  (Node configures TLS with CA cert)       |
        |                                          |
        |  3. CompleteJoin(challenge,               |
        |       HMAC(secret, challenge), node_info) |
@@ -91,20 +88,19 @@ If HMAC verification fails, the manager returns a `JoinResponse` with `accepted 
 
 If validation passes, the manager:
 
-1. Lazily generates a cluster CA certificate if one does not already exist (see [TLS](./tls.md)).
-2. Generates a challenge nonce for Phase 2.
-3. Returns a `JoinResponse` containing:
+1. Generates a challenge nonce for Phase 2. Challenges are held in memory **per manager** (single-use, 60 s TTL): both phases (`RequestJoin` and `CompleteJoin`) must reach the same manager, or `CompleteJoin` fails with an unknown-challenge rejection and the node must restart the join.
+2. Returns a `JoinResponse` containing:
 
 | Field | Description |
 |-------|-------------|
 | `accepted` | `true` |
 | `challenge` | A new random nonce for the completion step |
-| `cluster_ca_cert` | PEM-encoded CA certificate for TLS setup |
+| `cluster_ca_cert` | Empty. The manager no longer generates a join-time CA; TLS material comes from the `[tls]` config (see [TLS](./tls.md)) |
 | `managers` | List of all manager node addresses |
 
 ## Phase 2: CompleteJoin
 
-After receiving the CA certificate, the joining node configures its TLS stack to trust the cluster CA. It then computes a completion HMAC over the manager-issued `challenge` and sends a `JoinCompletionRequest` containing:
+The joining node computes a completion HMAC over the manager-issued `challenge` and sends a `JoinCompletionRequest` containing:
 
 ```text
 completion_hmac = HMAC-SHA256(key=shared_secret, message=challenge)
