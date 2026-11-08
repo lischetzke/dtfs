@@ -555,12 +555,16 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         // prefix). `delete_range_cf` is one RocksDB write; the on-disk
         // result is always either "not yet applied" or "fully applied",
         // never torn.
+        // Written with `synced_write_opts()` (like purge): an unsynced range
+        // delete could be lost in a crash, resurrecting truncated entries.
+        let mut batch = WriteBatch::default();
+        batch.delete_range_cf(
+            &cf,
+            index_to_key(start_index).as_slice(),
+            key_upper_bound().as_slice(),
+        );
         self.db
-            .delete_range_cf(
-                &cf,
-                index_to_key(start_index).as_slice(),
-                key_upper_bound().as_slice(),
-            )
+            .write_opt(batch, &synced_write_opts())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         Ok(())
