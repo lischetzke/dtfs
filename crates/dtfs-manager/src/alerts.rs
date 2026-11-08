@@ -149,17 +149,17 @@ impl AlertDispatcher {
                     .await;
                 match res {
                     Ok(r) if r.status().is_success() => {
-                        tracing::debug!(url = %url, "alert delivered");
+                        tracing::debug!(host = %url_host(&url), "alert delivered");
                     }
                     Ok(r) => {
                         tracing::warn!(
-                            url = %url,
+                            host = %url_host(&url),
                             status = %r.status(),
                             "alert sink returned non-success"
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(url = %url, error = %e, "alert delivery failed");
+                        tracing::warn!(host = %url_host(&url), error = %e.without_url(), "alert delivery failed");
                     }
                 }
             });
@@ -186,8 +186,23 @@ fn hmac_sha256_hex(secret: &str, body: &[u8]) -> String {
     hex::encode(result)
 }
 
+/// Host (no scheme/path/query/credentials) of a webhook URL for logging:
+/// the path and query commonly carry the sink's secret token.
+fn url_host(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "<unparsable>".to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn url_host_drops_secret_path_and_query() {
+        assert_eq!(super::url_host("https://user:pw@hooks.example.com/services/T0/B1/SECRET?k=v"), "hooks.example.com");
+        assert_eq!(super::url_host("not a url"), "<unparsable>");
+    }
+
     use super::*;
 
     #[tokio::test]

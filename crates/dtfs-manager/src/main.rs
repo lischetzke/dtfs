@@ -742,7 +742,8 @@ fn self_register_endpoints(
             }
         };
 
-        if let Some(self_v) = voters.iter().find(|v| v.hostname == hostname) {
+        let self_voter = voters.iter().find(|v| v.hostname == hostname);
+        if let Some(self_v) = self_voter {
             push(&self_v.addr);
         }
         for v in voters {
@@ -756,7 +757,12 @@ fn self_register_endpoints(
         } else {
             format!("{listen_host}:{grpc_port}")
         };
-        push(&local_bare);
+        // A loopback dial registers this manager under 127.0.0.1 (the server
+        // records the peer address), so skip it when our own voter addr is known.
+        let loopback_ok = self_voter.is_none() || !is_wildcard_listen_host(&listen_host);
+        if loopback_ok {
+            push(&local_bare);
+        }
         // local_bare always lands at least one entry; no empty fallback needed.
     }
     endpoints
@@ -1113,13 +1119,20 @@ mod lis77_br1_self_register_endpoints_tests {
     #[test]
     fn wildcard_listen_falls_back_to_loopback() {
         let voters = vec![voter("mgr01", "10.0.0.1:9401")];
-        let eps = self_register_endpoints("mgr01", "0.0.0.0:9401", &voters, |a| {
+        let eps = self_register_endpoints("other", "0.0.0.0:9401", &voters, |a| {
             format!("http://{a}")
         });
         assert!(
             eps.iter().any(|e| e == "http://127.0.0.1:9401"),
             "wildcard listen needs loopback fallback: {eps:?}"
         );
+    }
+
+    #[test]
+    fn wildcard_listen_with_known_self_voter_never_dials_loopback() {
+        let voters = vec![voter("mgr01", "10.0.0.1:9401")];
+        let eps = self_register_endpoints("mgr01", "0.0.0.0:9401", &voters, |a| format!("http://{a}"));
+        assert_eq!(eps, vec!["http://10.0.0.1:9401".to_string()]);
     }
 
     #[test]

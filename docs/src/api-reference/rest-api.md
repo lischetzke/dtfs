@@ -243,7 +243,7 @@ Volume ids are lowercase names with spaces replaced by `-`. The field reference 
 | `anchor_datacenter` | string | none (`[defaults].anchor_datacenter` is not applied here) | Anchor datacenter |
 | `force` | bool | `false` | Allow an anchor datacenter that no registered node reports |
 
-Response `{"volume_id", "name", "status": "created"}`. `409` if the id exists. `400` if `anchor_datacenter` is unknown to the cluster (case-insensitive) and `force` is not `true`. Unknown body fields are ignored. Write safety comes from `[defaults.write_safety]`; mandatory and cache policy start empty (set them with the endpoints below).
+Response `{"volume_id", "name", "status": "created"}`. `409` if the id exists, including when a concurrent create wins. The tape count starts at 0. `400` if `anchor_datacenter` is unknown to the cluster (case-insensitive) and `force` is not `true`. Unknown body fields are ignored. Write safety comes from `[defaults.write_safety]`; mandatory and cache policy start empty (set them with the endpoints below).
 
 ### Volume edit endpoints
 
@@ -325,7 +325,7 @@ See [Cluster-wide Configuration Override](../configuration/cluster-config.md) fo
 
 ### POST /api/v1/config
 
-Body `{"config_json": "<JSON string>", "write_to_disk": false, "acknowledge_cluster_wide": false}`. Response `{"version", "status": "applied", "write_to_disk": <bool actually written>}`.
+Body `{"config_json": "<JSON string>", "write_to_disk": false, "acknowledge_cluster_wide": false}`. The incoming JSON is deep-merged onto the stored override (omitted keys keep their stored value; an empty `config_json` resets it). Response `{"version", "status": "stored", "note", "write_to_disk": <bool actually written>}`: the override is stored cluster-wide in Raft and takes effect after each daemon restarts.
 
 - `400`: invalid JSON, node-scoped key in the override, merged config does not type-check, or `write_to_disk` without `acknowledge_cluster_wide`. Body carries `"preserved_current": true`.
 - `409`: another update advanced the version first (re-read, retry).
@@ -339,5 +339,5 @@ Body `{"config_json": "<JSON string>", "write_to_disk": false, "acknowledge_clus
 
 Used by `dtfs-data` during the HMAC handshake; see [Cluster Join](../security/cluster-join.md).
 
-- `POST /api/v1/join/request` body `{"nonce", "hmac_hex", "hostname"}`, response `{"accepted", "challenge", "ca_cert_pem", "rejection_reason"}`. `400` on malformed hex.
+- `POST /api/v1/join/request` body `{"nonce", "hmac_hex", "hostname"}`, response `{"accepted", "challenge", "ca_cert_pem", "rejection_reason"}`. `400` on malformed hex. Rejected (bad HMAC) requests are audited at most once per hostname per 60 s.
 - `POST /api/v1/join/complete` body `{"challenge", "completion_hmac_hex", "hostname", "grpc_addr", "region", "datacenter", "rack", "host", "disks": [{"disk_id", "uuid", "mount_path", "tier", "total_bytes", "used_bytes", "status"}]}`, response `{"success", "config_version", "config_json"}`. `400` on malformed hex, `500` on handshake failure.

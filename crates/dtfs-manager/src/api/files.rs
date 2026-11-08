@@ -210,6 +210,10 @@ pub(super) async fn trigger_scrub(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": format!("raft write failed: {e}")})),
             )
+        })
+        .and_then(|r| {
+            crate::scheduler::client_response_ok(&r.data)
+                .map_err(|m| err_body(StatusCode::CONFLICT, format!("scrub trigger refused: {m}")))
         })?;
 
     state.audit_log.log(

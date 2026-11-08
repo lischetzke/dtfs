@@ -405,8 +405,8 @@ fn run_update(
         }
     }
     if !yes && !confirm("Proceed? [y/N] ")? {
-        eprintln!("aborted; nothing installed");
-        return Ok(());
+        // Non-zero so scripts running without -y do not read "aborted" as success.
+        bail!("aborted; nothing installed (pass -y to proceed non-interactively)");
     }
 
     for (bin, src) in bins.iter().zip(&staged) {

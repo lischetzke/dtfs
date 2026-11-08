@@ -63,15 +63,8 @@ enum Commands {
     #[command(subcommand)]
     Migrations(MigrationsCmd),
 
-    /// Trigger or view scrub operations
+    /// Trigger a full scrub of all disks (the server has no per-target scrub)
     Scrub {
-        /// Target: --disk /path, --file /path, or --chunk <id>
-        #[arg(long)]
-        disk: Option<String>,
-        #[arg(long)]
-        file: Option<String>,
-        #[arg(long)]
-        chunk: Option<String>,
         /// Scrub level: quick or deep
         #[arg(long, default_value = "deep")]
         level: String,
@@ -201,12 +194,9 @@ enum VolumesCmd {
     Create {
         /// Volume name (used as both name and id)
         name: String,
-        /// Per-tier replication factor (hot)
+        /// Replication factor for the hot tier (sent as replication_hot)
         #[arg(long)]
         replication_factor: Option<u32>,
-        /// Tier policy hint (currently informational)
-        #[arg(long)]
-        tier_policy: Option<String>,
         /// Skip the server's check that some node reports the datacenter.
         #[arg(long)]
         force: bool,
@@ -646,9 +636,8 @@ async fn main() -> anyhow::Result<()> {
             VolumesCmd::Create {
                 name,
                 replication_factor,
-                tier_policy,
                 force,
-            } => cmd_volumes_create(&api, &args.format, &name, replication_factor, tier_policy.as_deref(), force).await?,
+            } => cmd_volumes_create(&api, &args.format, &name, replication_factor, force).await?,
             VolumesCmd::MigratePolicy { volume_id } => {
                 cmd_volumes_migrate_policy(&api, &args.format, &volume_id).await?
             }
@@ -721,12 +710,7 @@ async fn main() -> anyhow::Result<()> {
                 allow_empty_prefix, max_tasks,
             ).await?,
         },
-        Commands::Scrub {
-            disk,
-            file,
-            chunk,
-            level,
-        } => cmd_scrub(&api, disk, file, chunk, &level).await?,
+        Commands::Scrub { level } => cmd_scrub(&api, &level).await?,
         Commands::Maintenance {
             node_id,
             enable,
@@ -944,15 +928,11 @@ async fn cmd_nodes(
 fn volumes_create_body(
     name: &str,
     replication_factor: Option<u32>,
-    tier_policy: Option<&str>,
     force: bool,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({ "name": name });
     if let Some(rf) = replication_factor {
-        body["replication_factor"] = serde_json::json!(rf);
-    }
-    if let Some(t) = tier_policy {
-        body["tier_policy"] = serde_json::json!(t);
+        body["replication_hot"] = serde_json::json!(rf);
     }
     if force {
         body["force"] = serde_json::json!(true);
@@ -977,11 +957,10 @@ async fn cmd_volumes_create(
     format: &OutputFormat,
     name: &str,
     replication_factor: Option<u32>,
-    tier_policy: Option<&str>,
     force: bool,
 ) -> anyhow::Result<()> {
-    let body = volumes_create_body(name, replication_factor, tier_policy, force);
-    let resp = api.post("/api/v1/volumes", &body).await?;
+    let body = volumes_create_body(name, replication_factor, force);
+    let resp = api.post_checked("/api/v1/volumes", &body).await?;
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
         OutputFormat::Table => {
@@ -1525,36 +1504,11 @@ async fn cmd_files(api: &ApiClient, format: &OutputFormat, limit: usize) -> anyh
     Ok(())
 }
 
-async fn cmd_scrub(
-    api: &ApiClient,
-    disk: Option<String>,
-    file: Option<String>,
-    chunk: Option<String>,
-    level: &str,
-) -> anyhow::Result<()> {
-    let (target_type, target) = if let Some(d) = disk {
-        ("disk", d)
-    } else if let Some(f) = file {
-        ("file", f)
-    } else if let Some(c) = chunk {
-        ("chunk", c)
-    } else {
-        ("all", "*".to_string())
-    };
+async fn cmd_scrub(api: &ApiClient, level: &str) -> anyhow::Result<()> {
+    let body = serde_json::json!({ "level": level });
 
-    let body = serde_json::json!({
-        "target_type": target_type,
-        "target": target,
-        "level": level,
-    });
-
-    let resp = api.post("/api/v1/scrub", &body).await?;
-    println!(
-        "Scrub triggered: {} {} (level: {})",
-        target_type,
-        target,
-        level
-    );
+    let resp = api.post_checked("/api/v1/scrub", &body).await?;
+    println!("Scrub triggered: all disks (level: {})", level);
     println!("Status: {}", resp["status"].as_str().unwrap_or("—"));
     Ok(())
 }
@@ -2161,8 +2115,11 @@ mod audit_co_tests {
         let a = Args::try_parse_from(["dtfs-cli", "volumes", "create", "v"]).unwrap();
         assert!(matches!(a.command, Commands::Volumes(VolumesCmd::Create { force: false, .. })));
 
-        assert_eq!(volumes_create_body("v", Some(2), None, true)["force"], true);
-        assert!(volumes_create_body("v", None, None, false).get("force").is_none());
+        assert_eq!(volumes_create_body("v", Some(2), true)["force"], true);
+        assert_eq!(volumes_create_body("v", Some(2), false)["replication_hot"], 2);
+        assert!(volumes_create_body("v", None, false).get("force").is_none());
+        assert!(Args::try_parse_from(["dtfs-cli", "scrub", "--disk", "/x"]).is_err());
+        assert!(Args::try_parse_from(["dtfs-cli", "volumes", "create", "v", "--tier-policy", "x"]).is_err());
         let b = set_anchor_body(Some("leli".into()), None, true);
         assert_eq!((b["force"].clone(), b["datacenter"].clone()), (true.into(), "leli".into()));
         assert!(set_anchor_body(None, None, false).get("force").is_none());

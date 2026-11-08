@@ -615,6 +615,10 @@
             <label>anchor_datacenter</label>
             <input id="cv-anchor-datacenter" class="form-input" type="text" placeholder="e.g. dc-a">
         </div>
+        <div class="modal-row">
+            <label>force</label>
+            <label><input id="cv-force" type="checkbox"> accept an anchor DC no registered node reports</label>
+        </div>
         <div class="modal-actions">
             <button class="btn-secondary" onclick="closeCreateVolume()">Cancel</button>
             <button class="btn-primary"  onclick="submitCreateVolume()" id="cv-submit">Create volume</button>
@@ -660,6 +664,10 @@
         <div class="modal-row">
             <label>datacenter</label>
             <input id="ve-anchor-dc" class="form-input" type="text" placeholder="e.g. dc-a">
+        </div>
+        <div class="modal-row">
+            <label>force</label>
+            <label><input id="ve-anchor-force" type="checkbox"> accept a DC no registered node reports</label>
         </div>
         <div class="modal-row">
             <label>required_tier</label>
@@ -2248,7 +2256,6 @@
                 '<th>Anchor</th>' +
                 '<th style="min-width:5.5rem">Details</th>' +
                 '<th style="min-width:7.5rem">Edit policy</th>' +
-                '<th style="min-width:8rem">Flush cache</th>' +
             '</tr></thead><tbody>' +
             vols.flatMap(v => {
                 const vid = v.volume_id||'—';
@@ -2269,11 +2276,9 @@
                         onclick="toggleVolumeRow('${safeVid}')">${isOpen?'Hide':'Details'}</button></td>
                     <td ${ACT_TD}><button class="${ACT_BTN}" style="${ACT_STYLE}"
                         onclick="openVolumeEdit('${safeVid}')">Edit policy…</button></td>
-                    <td ${ACT_TD}><button class="${ACT_BTN}" style="${ACT_STYLE}"
-                        onclick="openFlushCache('/')">Flush cache…</button></td>
                 </tr>`];
                 if (isOpen) {
-                    rows.push(`<tr><td colspan="9">${renderVolumeCard(v)}</td></tr>`);
+                    rows.push(`<tr><td colspan="8">${renderVolumeCard(v)}</td></tr>`);
                 }
                 return rows;
             }).join('') +
@@ -2300,6 +2305,7 @@
         document.getElementById('cv-replication-warm').value = '';
         document.getElementById('cv-replication-cold').value = '';
         document.getElementById('cv-anchor-datacenter').value = '';
+        document.getElementById('cv-force').checked = false;
         document.getElementById('cv-result').style.display = 'none';
         document.getElementById('create-volume-modal').classList.remove('hidden');
     }
@@ -2324,6 +2330,7 @@
             replication_warm: intOrNull('cv-replication-warm'),
             replication_cold: intOrNull('cv-replication-cold'),
             anchor_datacenter: dc === '' ? null : dc,
+            force: document.getElementById('cv-force').checked,
         };
 
         const btn = document.getElementById('cv-submit');
@@ -2380,9 +2387,14 @@
             document.getElementById('ve-mand-warm').value = mr.warm || 0;
             document.getElementById('ve-mand-cold').value = mr.cold || 0;
             document.getElementById('ve-mand-tape').value = mr.tape || 0;
+            for (const t of ['hot','warm','cold','tape']) {
+                const el = document.getElementById('ve-mand-' + t);
+                el.dataset.orig = el.value;
+            }
             // prefill anchor.
             const an = v.anchor || {};
             document.getElementById('ve-anchor-dc').value = an.datacenter || '';
+            document.getElementById('ve-anchor-force').checked = false;
             document.getElementById('ve-anchor-tier').value = an.required_tier || '';
             // prefill spill policy.
             const sp = v.spill || {};
@@ -2443,17 +2455,20 @@
             return;
         }
         // mandatory replicas (per tier).
-        const mandBody = {
-            hot_replicas:  intOrNull('ve-mand-hot'),
-            warm_replicas: intOrNull('ve-mand-warm'),
-            cold_replicas: intOrNull('ve-mand-cold'),
-            tape_replicas: intOrNull('ve-mand-tape'),
-        };
+        // Only fields the operator changed from the prefill: reposting
+        // untouched values would migrate legacy volumes and trip the
+        // tape-satisfiable check on clusters without tape.
+        const mandBody = {};
+        for (const t of ['hot','warm','cold','tape']) {
+            const el = document.getElementById('ve-mand-' + t);
+            if (el.value.trim() !== (el.dataset.orig || '')) mandBody[t + '_replicas'] = intOrNull('ve-mand-' + t);
+        }
         // anchor policy.
         const dc = document.getElementById('ve-anchor-dc').value.trim();
         const rt = document.getElementById('ve-anchor-tier').value.trim();
         const anchorBody = {};
         if (dc !== '') anchorBody.datacenter = dc;
+        if (document.getElementById('ve-anchor-force').checked) anchorBody.force = true;
         if (rt !== '') anchorBody.required_tier = rt;
         // spill policy body.
         const spillAllow = document.getElementById('ve-spill-allow').value;
@@ -2507,7 +2522,7 @@
         const lines = [];
         // Only post mandatory when at least one field is set (avoid an
         // all-null no-op being rejected as all-zero by the validator).
-        if (Object.values(mandBody).some(x => x != null)) {
+        if (Object.keys(mandBody).length > 0) {
             lines.push(await post('set-mandatory', mandBody));
         }
         if (Object.keys(anchorBody).length > 0) {
@@ -3199,7 +3214,7 @@
     // ── Config page (AZ-5) ────────────────────────────────────────────────────
     // Raw cluster-config viewer/editor. Every [section.key] from the
     // ManagerConfig is listed with name / current / default; operators
-    // can edit and Apply (live-reload + write-to-disk). Validation
+    // can edit and Apply (stored cluster-wide; takes effect after restart). Validation
     // failures surface inline and the input reverts to the
     // pre-attempt value (AZ-5-A3 boundary fallback).
     window._configRows = [];
@@ -3212,7 +3227,7 @@
             <div class="page-header"><h2>Config</h2>
                 <p class="page-desc">Cluster-wide keys must match across every manager. Node-specific
                 keys (hostname, listen addrs, TLS material) live in the per-host tab. Edit a field
-                and click <b>Apply</b> to live-reload + persist.</p>
+                and click <b>Apply</b> to store it cluster-wide. Changes take effect after each daemon restarts; <i>write to disk</i> also updates this manager's TOML.</p>
             </div>
             <div style="display:flex;gap:.5rem;margin-bottom:.5rem;flex-wrap:wrap;align-items:center">
                 <button id="cfg-tab-cluster" class="btn-secondary"
@@ -3222,7 +3237,7 @@
                 <input id="cfg-filter" type="text" class="form-input" placeholder="Filter by name…" style="max-width:260px"
                        oninput="onConfigFilter(this.value)">
                 <button class="btn-secondary" onclick="renderConfig()">Refresh</button>
-                <button class="btn-primary"   onclick="submitConfigDiff(false)">Apply (live only)</button>
+                <button class="btn-primary"   onclick="submitConfigDiff(false)">Apply (store cluster-wide)</button>
                 <button class="btn-primary"   onclick="submitConfigDiff(true)">Apply + write to disk</button>
                 <span id="cfg-pending-count" style="font-size:.85rem;color:var(--text-muted)"></span>
             </div>
@@ -3337,6 +3352,10 @@
             }
             cursor[parts[parts.length - 1]] = pending[dotted];
         }
+        if (writeToDisk && !confirm('Write this manager's /etc/dtfs/manager.toml and store the change cluster-wide?
+Cluster-scoped values must match across every manager.')) {
+            return;
+        }
         const result = document.getElementById('cfg-result');
         result.style.display = 'block';
         result.textContent = 'Submitting…';
@@ -3345,6 +3364,7 @@
                 body: JSON.stringify({
                     config_json: JSON.stringify(merged),
                     write_to_disk: writeToDisk,
+                    acknowledge_cluster_wide: writeToDisk,
                 }),
             });
             const j = json || {error: 'invalid JSON response'};
@@ -3357,7 +3377,7 @@
                 await renderConfig();
                 return;
             }
-            result.textContent = `Applied. version=${j.version}, write_to_disk=${j.write_to_disk}`;
+            result.textContent = `Stored cluster-wide (takes effect after restart). version=${j.version}, write_to_disk=${j.write_to_disk}`;
             // Re-fetch to reflect post-apply state.
             await renderConfig();
         } catch (e) {
@@ -3369,7 +3389,7 @@
 
     async function renderSettings() {
         document.getElementById('page-content').innerHTML =
-            '<div class="page-header"><h2>Settings</h2><p class="page-desc">Cluster-wide configuration (live reload)</p></div>' +
+            '<div class="page-header"><h2>Settings</h2><p class="page-desc">Cluster-wide configuration (stored in Raft; takes effect after restart)</p></div>' +
             '<div id="settings-body"><div class="placeholder">Loading…</div></div>';
         await loadSettings();
     }

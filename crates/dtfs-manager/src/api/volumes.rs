@@ -146,7 +146,7 @@ pub(super) async fn create_volume(
             hot:  body.replication_hot.unwrap_or(state.config.defaults.replication.hot),
             warm: body.replication_warm.unwrap_or(state.config.defaults.replication.warm),
             cold: body.replication_cold.unwrap_or(state.config.defaults.replication.cold),
-            tape: 1,
+            tape: 0, // no tape tier unless an operator opts in (a hard-coded 1 was unsatisfiable)
         },
         write_safety: WriteSafety {
             min_replicas_before_ack: state.config.defaults.write_safety.min_replicas_before_ack,
@@ -164,9 +164,11 @@ pub(super) async fn create_volume(
         version: 0,
     };
 
-    let req = ClientRequest::UpsertVolume { config, expected_version: None };
-    state.raft.client_write(req).await
+    // Some(0) = "must not exist": a concurrent create loses with 409.
+    let req = ClientRequest::UpsertVolume { config, expected_version: Some(0) };
+    let resp = state.raft.client_write(req).await
         .map_err(|e| err_body(StatusCode::SERVICE_UNAVAILABLE, format!("raft write failed: {e}")))?;
+    volume_cas_check(&resp.data)?;
 
     state.audit_log.log("api", "volume.create", &vol_id, "success");
     info!("Volume created: {}", vol_id);

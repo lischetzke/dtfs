@@ -454,6 +454,36 @@ mod create_volume_modal_tests {
 }
 
 #[cfg(test)]
+mod w3api_dashboard_tests {
+    use super::*;
+
+    #[test]
+    fn config_write_to_disk_sends_cluster_wide_ack_and_is_honest_about_reload() {
+        let html = render_dashboard("c", "h");
+        assert!(html.contains("acknowledge_cluster_wide: writeToDisk"));
+        assert!(!html.contains("live-reload"));
+        assert!(!html.contains("live reload"));
+        assert!(!html.contains("Apply (live only)"));
+    }
+
+    #[test]
+    fn volume_editor_posts_only_changed_mandatory_fields() {
+        let html = render_dashboard("c", "h");
+        assert!(html.contains("const mandBody = {};"));
+        assert!(html.contains("el.dataset.orig = el.value;"));
+        assert!(!html.contains("tape_replicas: intOrNull('ve-mand-tape')"));
+    }
+
+    #[test]
+    fn force_checkboxes_present_and_no_per_volume_cluster_wide_flush() {
+        let html = render_dashboard("c", "h");
+        assert!(html.contains("id=\"cv-force\"") && html.contains("force: document.getElementById('cv-force').checked"));
+        assert!(html.contains("id=\"ve-anchor-force\"") && html.contains("anchorBody.force = true"));
+        assert!(!html.contains("openFlushCache('/')"));
+    }
+}
+
+#[cfg(test)]
 mod uip_2_webui_ops_tests {
     use super::*;
 

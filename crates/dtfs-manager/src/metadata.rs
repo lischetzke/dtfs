@@ -211,7 +211,12 @@ impl MetadataService {
         // initial_voters), falling back to the configured voter set.
         let leader_addr = {
             let sm = self.sm_data.read().await;
-            resolve_leader_addr(&self.config.cluster.initial_voters, &sm.nodes, leader_id)
+            resolve_leader_addr_with(
+                raft_membership_addr(&self.raft, leader_id).as_deref(),
+                &self.config.cluster.initial_voters,
+                &sm.nodes,
+                leader_id,
+            )
         }
         .ok_or_else(|| {
             Status::unavailable(format!(
@@ -494,10 +499,34 @@ pub(crate) fn validate_num_chunks(num_chunks: u32, max: u32) -> Result<(), Strin
     Ok(())
 }
 
+/// Leader address from the openraft membership itself (the address the
+/// manager was added to Raft with). Unlike the node registry it is never a
+/// loopback address captured from a self-register dial.
+fn raft_membership_addr(raft: &DtfsRaft, leader_id: u64) -> Option<String> {
+    use openraft::async_runtime::watch::WatchReceiver;
+    let m = raft.metrics().borrow_watched().clone();
+    m.membership_config.membership().get_node(&leader_id).map(|n| n.addr.clone())
+}
+
+/// Raft-membership address first, then [`resolve_leader_addr`].
+fn resolve_leader_addr_with(
+    raft_addr: Option<&str>,
+    voters: &[dtfs_common::config::InitialVoter],
+    membership_nodes: &std::collections::BTreeMap<u64, RaftNodeInfo>,
+    leader_id: u64,
+) -> Option<String> {
+    raft_addr
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+        .or_else(|| resolve_leader_addr(voters, membership_nodes, leader_id))
+}
+
 /// Bug BL / CO-3-9 — resolve the gRPC address of the current Raft leader.
 ///
-/// Prefers the live Raft membership (`StateMachineData::nodes`, keyed by
-/// the openraft node id): a CF-2-promoted leader was added online and is
+/// Falls back to the node registry (`StateMachineData::nodes`, keyed by
+/// the openraft node id), which can hold a loopback address for a leader that
+/// self-registered over 127.0.0.1, so callers try the Raft membership first
+/// ([`resolve_leader_addr_with`]): a CF-2-promoted leader was added online and is
 /// NOT in the bootstrap-only `cluster.initial_voters`, so resolving from
 /// voters alone returns `None` and heartbeat-originated writes on that
 /// follower silently drop. The configured voter set is the fallback (an
@@ -667,7 +696,7 @@ pub(crate) async fn write_via_leader(
 ) -> Result<(), String> {
     use openraft::async_runtime::watch::WatchReceiver;
     match raft.client_write(req.clone()).await {
-        Ok(_) => Ok(()),
+        Ok(resp) => crate::scheduler::client_response_ok(&resp.data),
         Err(e) => {
             let msg = format!("{e}");
             if !is_forward_to_leader_err(&msg) {
@@ -680,7 +709,12 @@ pub(crate) async fn write_via_leader(
                 .ok_or_else(|| "no leader to forward to".to_string())?;
             // CO-3-9 / MGR-MON-3 — membership first (covers a leader
             // promoted after bootstrap), `initial_voters` as the fallback.
-            let leader_addr = resolve_leader_addr(voters, membership_nodes, leader_id)
+            let leader_addr = resolve_leader_addr_with(
+                raft_membership_addr(raft, leader_id).as_deref(),
+                voters,
+                membership_nodes,
+                leader_id,
+            )
                 .ok_or_else(|| {
                     format!("leader {leader_id} not in raft membership or cluster.initial_voters")
                 })?;
@@ -708,6 +742,20 @@ pub(crate) async fn write_via_leader(
     }
 }
 
+/// A write that reached Raft and committed, but whose apply REFUSED it
+/// (`ClientResponse::Error` / conflict), is a failure for the caller.
+pub(crate) trait CommittedOk {
+    fn pipe_committed_ok(self) -> Result<(), String>;
+}
+impl CommittedOk for Result<ClientResponse, Status> {
+    fn pipe_committed_ok(self) -> Result<(), String> {
+        match self {
+            Ok(r) => crate::scheduler::client_response_ok(&r),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 /// MGR-12 — a `ForwardClientWrite` that transports fine but is REJECTED by
 /// the leader (bad shared secret, MGR-11 variant not allow-listed, or the
 /// underlying Raft apply itself failed) comes back as `Ok(Response)` at the
@@ -718,7 +766,11 @@ pub(crate) async fn write_via_leader(
 /// it is unit-testable against the response struct directly.
 fn forward_result(resp: &ForwardWriteResponse) -> Result<(), String> {
     if resp.success {
-        Ok(())
+        // The leader applied it, but the state machine may have refused it.
+        match serde_json::from_slice::<ClientResponse>(&resp.response_json) {
+            Ok(r) => crate::scheduler::client_response_ok(&r),
+            Err(_) => Ok(()), // empty / unparsable body: nothing to judge
+        }
     } else {
         Err(resp.error.clone())
     }
@@ -814,7 +866,7 @@ fn new_chunk_location(chunk_hash: &str, size: u64, chunk_index: u64) -> ChunkLoc
 /// disk sentinel is judged on the node alone.
 pub(crate) fn replica_is_live(sm: &StateMachineData, c: &ChunkLocationEntry) -> bool {
     let Ok(id) = c.node_id.parse::<u64>() else {
-        return true; // pre-numeric row: nothing to judge against
+        return false; // unresolved address string: no registered node to judge
     };
     let Some(n) = sm.nodes.get(&id) else {
         return false;
@@ -1146,7 +1198,17 @@ impl ManagerService for MetadataService {
             .await?;
 
         match resp {
-            ClientResponse::FileCreated { volume_id, .. } => {
+            ClientResponse::FileCreated { volume_id: created_vol, path: canonical } => {
+                // The apply keeps an existing non-empty file's layout; report
+                // what is stored, not what this request asked for.
+                let stored = self
+                    .sm_data
+                    .read()
+                    .await
+                    .files
+                    .get(&canonical)
+                    .map(|f| (f.volume_id.clone(), f.chunk_size));
+                let (volume_id, chunk_size) = created_layout(stored, created_vol, chunk_size);
                 Ok(Response::new(CreateFileResponse {
                     success: true,
                     chunk_size,
@@ -1636,8 +1698,9 @@ impl ManagerService for MetadataService {
                 match self
                     .raft_write_or_forward(ClientRequest::QuarantineNode { node_id, info })
                     .await
+                    .pipe_committed_ok()
                 {
-                    Ok(_) => true,
+                    Ok(()) => true,
                     Err(e) => {
                         tracing::warn!(error = %e, node_id, "CR-3-6: failed to commit QuarantineNode from heartbeat integrity fault");
                         false
@@ -1663,8 +1726,9 @@ impl ManagerService for MetadataService {
                         disk_id: dtfs_raft::legacy_disk_id(),
                     })
                     .await
+                    .pipe_committed_ok()
                 {
-                    Ok(_) => true,
+                    Ok(()) => true,
                     Err(e) => {
                         tracing::warn!(error = %e, node_id, "CR-3-6: failed to commit RemoveCorruptChunkReplicas from heartbeat integrity fault");
                         false
@@ -1811,6 +1875,7 @@ impl ManagerService for MetadataService {
                 status: status.to_string(),
             })
             .await
+            .pipe_committed_ok()
         {
             tracing::warn!(error = %e, "CO-3-7 failed to commit node-status from chunk report");
             accepted = false;
@@ -1836,6 +1901,7 @@ impl ManagerService for MetadataService {
                         disk_id,
                     })
                     .await
+                    .pipe_committed_ok()
                 {
                     tracing::warn!(error = %e, disk_id, "CO-3-7 failed to commit corrupt-replica removal");
                     accepted = false;
@@ -2480,6 +2546,23 @@ impl ManagerService for MetadataService {
             (chunks, ack_floor)
         }; // sm_data lock released here
 
+        let unresolved = unresolved_commit_nodes(&chunks);
+        if !unresolved.is_empty() {
+            tracing::warn!(
+                path = %req.path,
+                addresses = ?unresolved,
+                "rejecting commit: replica address does not match any registered node"
+            );
+            return Ok(Response::new(CommitChunkLocationsResponse {
+                success: false,
+                lease_conflict: false,
+                error: format!(
+                    "write rejected: replica address(es) not registered with the cluster: {}",
+                    unresolved.join(", ")
+                ),
+            }));
+        }
+
         // CF-3b — write-safety ack floor. The FUSE writer only commits
         // replicas that already landed (no more are coming), so we reject
         // here rather than wait: if any chunk in this batch has fewer than
@@ -3086,6 +3169,30 @@ pub(crate) fn resolve_volume_placement(
 /// regression test catches it.
 pub(crate) fn chunk_placement_tier_string(tier: dtfs_common::types::DiskTier) -> String {
     tier.to_string()
+}
+
+/// `(volume_id, chunk_size)` to report from CreateFile: the stored entry when
+/// there is one (an existing non-empty file survives re-create unchanged).
+pub(crate) fn created_layout(
+    stored: Option<(String, u64)>,
+    req_volume: String,
+    req_chunk_size: u64,
+) -> (String, u64) {
+    stored.unwrap_or((req_volume, req_chunk_size))
+}
+
+/// Distinct non-numeric `node_id`s in a commit batch: addresses
+/// `node_id_from_grpc_addr` could not map to a registered node. Counting
+/// them toward the ack floor would acknowledge a replica nobody can reach.
+pub(crate) fn unresolved_commit_nodes(commits: &[ChunkLocationEntry]) -> Vec<String> {
+    let mut v: Vec<String> = commits
+        .iter()
+        .filter(|c| c.node_id.parse::<u64>().is_err())
+        .map(|c| c.node_id.clone())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Bug CF-3b — write-safety ack floor. Returns `true` only when EVERY

@@ -82,6 +82,31 @@ mod mgr_12_forward_result_tests {
     }
 
     #[test]
+    fn applied_but_refused_response_is_err() {
+        let json = serde_json::to_vec(&dtfs_raft::ClientResponse::Error {
+            message: "would strand anchor".into(),
+        })
+        .unwrap();
+        let resp = ForwardWriteResponse { success: true, response_json: json, error: String::new() };
+        assert_eq!(forward_result(&resp), Err("would strand anchor".to_string()));
+        let ok = serde_json::to_vec(&dtfs_raft::ClientResponse::Success).unwrap();
+        let resp = ForwardWriteResponse { success: true, response_json: ok, error: String::new() };
+        assert!(forward_result(&resp).is_ok());
+    }
+
+    #[test]
+    fn committed_refusal_is_err_via_pipe() {
+        use super::super::CommittedOk;
+        let refused: Result<dtfs_raft::ClientResponse, tonic::Status> =
+            Ok(dtfs_raft::ClientResponse::Error { message: "nope".into() });
+        assert_eq!(refused.pipe_committed_ok(), Err("nope".to_string()));
+        let fine: Result<dtfs_raft::ClientResponse, tonic::Status> = Ok(dtfs_raft::ClientResponse::Success);
+        assert!(fine.pipe_committed_ok().is_ok());
+        let st: Result<dtfs_raft::ClientResponse, tonic::Status> = Err(tonic::Status::unavailable("x"));
+        assert!(st.pipe_committed_ok().is_err());
+    }
+
+    #[test]
     fn rejected_response_is_err() {
         let resp = ForwardWriteResponse {
             success: false,
@@ -830,6 +855,24 @@ mod tests {
         assert!(!compute_self_quarantine_cleared(true, 2));
     }
 
+    /// The Raft membership address wins over a (possibly loopback) registry
+    /// entry; empty membership falls back to registry/voters.
+    #[test]
+    fn leader_addr_prefers_raft_membership_over_registry() {
+        let voters = vec![mk_voter("mgr01", "10.0.0.1:9401")];
+        let leader_id = dtfs_common::node_id_from_hostname("mgr01");
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(
+            resolve_leader_addr_with(Some("100.64.0.9:9401"), &voters, &empty, leader_id),
+            Some("100.64.0.9:9401".to_string())
+        );
+        assert_eq!(
+            resolve_leader_addr_with(Some(""), &voters, &empty, leader_id),
+            Some("10.0.0.1:9401".to_string())
+        );
+        assert_eq!(resolve_leader_addr_with(None, &voters, &empty, 0), None);
+    }
+
     /// BL-1 — the leader's gRPC addr resolves from the voter set by
     /// matching node_id_from_hostname against the openraft leader id when
     /// no membership entry exists.
@@ -1506,6 +1549,35 @@ mod mgr_loc_replica_is_live {
     fn unknown_node_is_dead() {
         let sm = StateMachineData::default();
         assert!(!replica_is_live(&sm, &row(0)));
+    }
+
+    #[test]
+    fn non_numeric_node_id_is_not_live() {
+        let sm = sm_with(HealthStatus::Healthy, DiskStatus::Healthy);
+        let mut r = row(0);
+        r.node_id = "http://gone:9500".into();
+        assert!(!replica_is_live(&sm, &r));
+    }
+
+    #[test]
+    fn created_layout_prefers_stored_entry() {
+        use super::super::created_layout;
+        assert_eq!(
+            created_layout(Some(("old".into(), 8)), "new".into(), 4),
+            ("old".to_string(), 8)
+        );
+        assert_eq!(created_layout(None, "new".into(), 4), ("new".to_string(), 4));
+    }
+
+    #[test]
+    fn unresolved_commit_nodes_lists_only_addresses() {
+        let mut a = row(0);
+        a.node_id = "7".into();
+        let mut b = row(0);
+        b.node_id = "10.0.0.9:9500".into();
+        let got = super::super::unresolved_commit_nodes(&[a.clone(), b.clone(), b]);
+        assert_eq!(got, vec!["10.0.0.9:9500".to_string()]);
+        assert!(super::super::unresolved_commit_nodes(&[a]).is_empty());
     }
 
     #[test]

@@ -82,12 +82,20 @@ impl JoinHandler {
         // Verify HMAC(shared_secret, nonce).
         if !verify_join_hmac(&self.shared_secret, nonce, hmac_bytes) {
             warn!(hostname = %hostname, "Join request rejected: invalid HMAC");
-            self.audit.log(
-                hostname,
-                "node.join.request",
-                hostname,
-                "rejected: invalid HMAC",
-            );
+            // Unauthenticated route: coalesce per hostname (key length capped,
+            // table bounded) so a flood cannot churn the audit ring.
+            static CO: std::sync::OnceLock<crate::rest_auth::DenyCoalescer> =
+                std::sync::OnceLock::new();
+            let co = CO.get_or_init(|| crate::rest_auth::DenyCoalescer::new(60_000, 1024));
+            let key: String = hostname.chars().take(64).collect();
+            if let Some(suppressed) = co.admit(&key, "join.request", now_ms()) {
+                self.audit.log(
+                    hostname,
+                    "node.join.request",
+                    hostname,
+                    &format!("rejected: invalid HMAC (suppressed={suppressed})"),
+                );
+            }
             return JoinResult {
                 accepted: false,
                 challenge: String::new(),

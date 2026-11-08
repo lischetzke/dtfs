@@ -49,9 +49,8 @@ pub(super) async fn get_config(State(state): State<Arc<AppState>>) -> Json<Value
 pub(super) struct ConfigUpdateRequest {
     pub(super) config_json: String,
     /// AZ-5 — when true, also persist the merged config back to
-    /// `/etc/dtfs/manager.toml` so the change survives a process
-    /// restart. Default false preserves the existing live-reload-
-    /// only behaviour for backwards compatibility.
+    /// `/etc/dtfs/manager.toml` (this manager only). No daemon reloads the
+    /// stored cluster config live; it takes effect after restart.
     #[serde(default)]
     pub(super) write_to_disk: bool,
     /// Bug BD-3 — operator must explicitly acknowledge any write
@@ -111,6 +110,23 @@ pub(super) fn write_manager_toml_atomic(path: &std::path::Path, rendered: &str) 
     })
 }
 
+/// Deep-merge `incoming` onto the stored cluster override. Empty `incoming`
+/// (explicit reset) stays empty; unparsable stored JSON is treated as empty.
+pub(super) fn merge_onto_stored_override(stored: &str, incoming: &str) -> String {
+    if incoming.is_empty() {
+        return String::new();
+    }
+    let mut base: Value = serde_json::from_str(stored).unwrap_or(Value::Null);
+    let Ok(over) = serde_json::from_str::<Value>(incoming) else {
+        return incoming.to_string();
+    };
+    if !base.is_object() {
+        return incoming.to_string();
+    }
+    json_deep_merge(&mut base, &over);
+    serde_json::to_string(&base).unwrap_or_else(|_| incoming.to_string())
+}
+
 pub(super) async fn update_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ConfigUpdateRequest>,
@@ -160,6 +176,14 @@ pub(super) async fn update_config(
         }
     };
 
+    // The editor sends only the keys it edited, but UpdateConfig replaces the
+    // stored override wholesale: merge onto the stored override first so
+    // earlier settings survive.
+    let config_json = {
+        let stored = state.sm_data.read().await.cluster_config.config_json.clone();
+        merge_onto_stored_override(&stored, &config_json)
+    };
+
     // CO-4-3 — strict-validate the override by deep-merging it onto the node's
     // startup config and requiring the MERGED result to deserialize as a full
     // `ManagerConfig`. `UpdateConfig` REPLACES the cluster override wholesale
@@ -192,9 +216,8 @@ pub(super) async fn update_config(
     // payload that the WebUI would touch under the Cluster tab as
     // cluster-wide; the ack flag confirms the operator understands
     // this propagates to every manager. Node-only writes are accepted
-    // without ack but only when `write_to_disk` is false (live-reload
-    // doesn't drift across peers — manager.toml is the durability
-    // boundary).
+    // without ack but only when `write_to_disk` is false (the Raft-stored
+    // override is not applied live; manager.toml is the durability boundary).
     if body.write_to_disk && !body.acknowledge_cluster_wide {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -290,7 +313,8 @@ pub(super) async fn update_config(
 
     Ok(Json(json!({
         "version": version,
-        "status": "applied",
+        "status": "stored",
+        "note": "stored cluster-wide in Raft; takes effect on each daemon after restart (write_to_disk updates this manager's TOML only)",
         "write_to_disk": wrote_to_disk,
     })))
 }
