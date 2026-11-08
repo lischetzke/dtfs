@@ -742,8 +742,31 @@ _SECRET_LINE = re.compile(
 )
 
 
+_TABLE_HDR = re.compile(r'^\s*\[+\s*([^\]]+?)\s*\]+\s*(?:#.*)?$')
+_KV_LINE = re.compile(r'^(\s*"?([A-Za-z0-9_.\-]*)"?\s*=\s*)(.*)$')
+# [[alerts.webhooks]] keys that carry no secret; every other key is redacted
+# (the webhook URL itself is the credential for Slack/Discord-style sinks).
+_WEBHOOK_SAFE_KEYS = {"kinds", "dedup_secs"}
+
+
 def redact_config(text: str) -> str:
-    return _SECRET_LINE.sub(lambda m: m.group(1) + '"***"', text)
+    out: list[str] = []
+    in_webhook = False
+    for line in _SECRET_LINE.sub(lambda m: m.group(1) + '"***"', text).splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        h = _TABLE_HDR.match(body)
+        if h:
+            in_webhook = h.group(1) == "alerts.webhooks"
+        else:
+            kv = _KV_LINE.match(body)
+            if kv:
+                key, val = kv.group(2).lower(), kv.group(3)
+                # URL userinfo / query strings carry credentials anywhere.
+                url_cred = "url" in key and ("@" in val or "?" in val)
+                if url_cred or (in_webhook and key not in _WEBHOOK_SAFE_KEYS):
+                    line = kv.group(1) + '"***"' + line[len(body):]
+        out.append(line)
+    return "".join(out)
 
 
 def disk_paths_from_config(text: str) -> list[str]:
