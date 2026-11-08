@@ -118,17 +118,19 @@ Seeds the auto-created `default` volume and the defaults for volumes created thr
 
 | Key | Type | Default | Constraint |
 |---|---|---|---|
-| `min_replicas_before_ack` | u32 | `2` | A write is acknowledged only after this many distinct `(node_id, disk_id)` replicas are durable; a commit with fewer is rejected. The manager clamps it down (never up) to the highest mandatory replica count of the tiers the chunks landed on. The topology must be able to hold this many replicas. |
+| `min_replicas_before_ack` | u32 | `2` | A write is acknowledged only after this many distinct `(node_id, disk_id)` replicas are durable; a commit with fewer is rejected. Allocation fills the floor across the volume's maintained tiers; the floor is clamped only to the healthy maintained node capacity, never to 0. The topology must be able to hold this many replicas. See [Write Safety](../storage/replication.md#write-safety). |
 | `write_timeout_secs` | u32 | `30` | Seconds to wait for acknowledgements. |
 
-`[defaults.replication]` (if the table is present, `hot`, `warm`, `cold` are required; `tape` defaults to `1`):
+`[defaults.replication]`. When the table is absent the built-in goal is cold 1, warm 2, hot 0, tape 0 (hot and tape are opt-in, so a cold+warm cluster can reach its goal). If the table is present, `hot`, `warm`, `cold` are required and `tape` defaults to `1`:
 
-| Key | Type | Default |
-|---|---|---|
-| `hot` | u32 | `3` |
-| `warm` | u32 | `2` |
-| `cold` | u32 | `1` |
-| `tape` | u32 | `1` |
+| Key | Type | Default (table absent) | Default (table present) |
+|---|---|---|---|
+| `hot` | u32 | `0` | required |
+| `warm` | u32 | `2` | required |
+| `cold` | u32 | `1` | required |
+| `tape` | u32 | `0` | `1` |
+
+A volume that requires copies on a tier with no registered disks (or more copies than nodes carrying that tier) can never leave `undergoal`. The manager logs one warning and audits `volume.goal_unreachable` per volume and tier at startup (after 120 s), on volume create and on `set-mandatory`; `GET /api/v1/stats` returns `goal_unreachable_volumes` and a `goal_unreachable` list (`volume`, `tier`, `required`, `nodes_with_tier`), shown as a dashboard signal chip. Placement classification is unchanged.
 
 A replication count creates replicas only if something maintains them: the volume's `mandatory_replicas` (under-replication scheduler) or cache promotion (`promote_reads`). See [Replication](../storage/replication.md) and [Volume Configuration](./volume-config.md).
 

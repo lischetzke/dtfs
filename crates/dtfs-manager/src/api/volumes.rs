@@ -171,6 +171,12 @@ pub(super) async fn create_volume(
     volume_cas_check(&resp.data)?;
 
     state.audit_log.log("api", "volume.create", &vol_id, "success");
+    {
+        let sm = state.sm_data.read().await;
+        if let Some(v) = sm.volumes.get(&vol_id) {
+            crate::goal_check::report_unreachable_goals(&state.audit_log, v, &sm.nodes);
+        }
+    }
     info!("Volume created: {}", vol_id);
 
     Ok(Json(json!({ "volume_id": vol_id, "name": body.name, "status": "created" })))
@@ -1024,6 +1030,10 @@ pub(super) async fn set_volume_mandatory_endpoint(
         state.audit_log.log(
             "api", "volume.set_mandatory", &volume_id, "success",
         );
+        {
+            let sm = state.sm_data.read().await;
+            crate::goal_check::report_unreachable_goals(&state.audit_log, &next, &sm.nodes);
+        }
     } else {
         state.audit_log.log(
             "api", "volume.set_mandatory", &volume_id, "noop",

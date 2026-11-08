@@ -302,6 +302,9 @@ async fn stats_and_readyz_use_effective_health() {
     seed_node(&h, now_ms()).await;
     let s = get_stats(State(h.state.clone())).await.0;
     assert_eq!(s["healthy_nodes"], 1, "{s}");
+    // Stats expose the unreachable-goal signal (no volumes in this harness).
+    assert_eq!(s["goal_unreachable_volumes"], 0, "{s}");
+    assert!(s["goal_unreachable"].as_array().unwrap().is_empty(), "{s}");
     let (_, msg) = readyz_probe(State(h.state.clone())).await;
     assert!(msg.contains("any_healthy=true"), "{msg}");
 }

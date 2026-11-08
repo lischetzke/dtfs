@@ -813,6 +813,14 @@ mod tests {
         assert_eq!(id.to_string(), "test-node-1");
     }
 
+    /// Compat (A.3.1): a stored volume's `replication` without `tape`
+    /// still deserializes with tape = 1, whatever the new config default.
+    #[test]
+    fn stored_replication_without_tape_deserializes_tape_1() {
+        let r: TierReplication = serde_json::from_str(r#"{"hot":0,"warm":2,"cold":1}"#).unwrap();
+        assert_eq!(r, TierReplication { hot: 0, warm: 2, cold: 1, tape: 1 });
+    }
+
     #[test]
     fn test_tier_replication_default() {
         let tr = TierReplication::default();

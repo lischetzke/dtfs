@@ -111,6 +111,9 @@ listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
 #write_timeout_secs = 30
 
 #[defaults.replication]
+# Absent table = cold 1, warm 2, hot 0, tape 0 (hot and tape opt-in). A tier
+# with no disks in the cluster makes every chunk undergoal forever; the
+# manager warns (volume.goal_unreachable) and /api/v1/stats reports it.
 # A tier replication count only creates replicas if something maintains them:
 # mandatory_replicas (under-replication scheduler) or cache promotion
 # (tiering engine with promote_reads > 0). See docs/storage/replication.md.

@@ -604,6 +604,27 @@ pub(super) async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value>
         .sum();
     let phantom_bytes_estimate = logical_bytes.saturating_sub(net_used);
 
+    // Volumes whose mandatory goal can never be met by the registered topology.
+    let goal_unreachable: Vec<Value> = sm
+        .volumes
+        .values()
+        .flat_map(|v| {
+            crate::goal_check::unreachable_goals(v, &sm.nodes).into_iter().map(move |g| {
+                json!({
+                    "volume": v.id.to_string(),
+                    "tier": crate::goal_check::tier_label(g.tier),
+                    "required": g.required,
+                    "nodes_with_tier": g.nodes_with_tier,
+                })
+            })
+        })
+        .collect();
+    let goal_unreachable_volumes = sm
+        .volumes
+        .values()
+        .filter(|v| !crate::goal_check::unreachable_goals(v, &sm.nodes).is_empty())
+        .count();
+
     Json(json!({
         "health":                health,
         "healthy_nodes":         healthy_nodes,
@@ -611,6 +632,8 @@ pub(super) async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value>
         // quarantined after an integrity fault. Routing already
         // excludes them; the counter is what the WebUI badge reads.
         "quarantined_nodes":     quarantined_nodes,
+        "goal_unreachable_volumes": goal_unreachable_volumes,
+        "goal_unreachable":      goal_unreachable,
         "total_nodes":           total_nodes,
         // Bug BV-1 — files whose mandatory anchor copy hasn't landed yet
         // (durability-pending, async convergence; not data loss).

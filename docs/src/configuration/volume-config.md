@@ -13,7 +13,7 @@ Shape returned by `GET /api/v1/volumes/{id}` ([REST API](../api-reference/rest-a
 | `volume_id` | string | lowercase `name` with spaces replaced by `-` | create only |
 | `name` | string | required at create | create only |
 | `chunk_size_bytes` | u64 | `[defaults].chunk_size_mb` (4 MiB) x 1048576, or the request's `chunk_size_mb` | create only |
-| `replication.{hot,warm,cold}` | u32 | request `replication_hot/warm/cold`, else `[defaults.replication]` (3, 2, 1) | create only |
+| `replication.{hot,warm,cold}` | u32 | request `replication_hot/warm/cold`, else `[defaults.replication]` (built-in 0, 2, 1 when the table is absent) | create only |
 | `replication.tape` | u32 | `1` | not editable |
 | `mandatory_replicas.{hot,warm,cold,tape}` | u32 | `0` each (legacy fallback, see below) | `set-mandatory`, `migrate-policy` |
 | `cache_replicas.{hot,warm,cold,tape}.{min,max}` | u32 | `0`/`0` (disabled) | `set-cache` |

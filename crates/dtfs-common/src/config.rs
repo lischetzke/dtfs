@@ -664,13 +664,20 @@ impl Default for TlsConfig {
     }
 }
 
+/// Built-in goal when `[defaults.replication]` is absent: cold 1, warm 2,
+/// hot and tape opt-in. Not `TierReplication::default()` (3,2,1,1), which
+/// is unreachable on a cold+warm cluster; that one stays for stored volumes.
+fn default_defaults_replication() -> TierReplication {
+    TierReplication { hot: 0, warm: 2, cold: 1, tape: 0 }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultsConfig {
     #[serde(default = "default_chunk_size")]
     pub chunk_size_mb: u32,
     #[serde(default)]
     pub write_safety: WriteSafety,
-    #[serde(default)]
+    #[serde(default = "default_defaults_replication")]
     pub replication: TierReplication,
     /// Bug Z — anchor datacenter for the auto-created "default" volume.
     /// When set, every chunk placement guarantees at least one replica
@@ -1917,6 +1924,30 @@ max_io_percent = 10
             "DefaultsConfig.chunk_size_mb must default to 4; got {}",
             cfg.chunk_size_mb
         );
+    }
+
+    /// Built-in `[defaults.replication]` when the table is absent: hot and
+    /// tape are opt-in, so a cold+warm cluster can reach its goal. An
+    /// explicit table keeps its meaning (tape still defaults to 1 there).
+    #[test]
+    fn defaults_replication_absent_is_cold1_warm2_hot0_tape0() {
+        let cfg: DefaultsConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.replication, TierReplication { hot: 0, warm: 2, cold: 1, tape: 0 });
+    }
+
+    #[test]
+    fn defaults_replication_explicit_table_unchanged() {
+        let cfg: DefaultsConfig =
+            toml::from_str("[replication]
+hot = 3
+warm = 2
+cold = 1
+").unwrap();
+        assert_eq!(cfg.replication, TierReplication { hot: 3, warm: 2, cold: 1, tape: 1 });
+        // A partial table is still rejected (hot, warm, cold are required).
+        assert!(toml::from_str::<DefaultsConfig>("[replication]
+warm = 2
+").is_err());
     }
 
     // ---------------------------------------------------------------

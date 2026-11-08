@@ -1573,6 +1573,14 @@
                 href: '/ui/migrations',
             },
             {
+                id: 'sig-goal-unreachable',
+                val: stats.goal_unreachable_volumes ?? 0,
+                lbl: 'Unreachable replica goals',
+                hint: (stats.goal_unreachable || []).map(g => g.volume + ': ' + g.tier + ' needs ' + g.required + ' node(s), cluster has ' + g.nodes_with_tier).join('; ') || 'Every volume goal fits the registered disks',
+                sev: (stats.goal_unreachable_volumes || 0) > 0 ? 'warn' : 'ok',
+                href: null,
+            },
+            {
                 id: 'sig-undergoal',
                 val: cp.undergoal ?? 0,
                 lbl: 'Under-replicated chunks',

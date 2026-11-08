@@ -15,6 +15,7 @@ mod api;
 mod audit;
 #[allow(dead_code)]
 mod cluster;
+mod goal_check;
 mod join;
 mod membership;
 mod metadata;
@@ -575,6 +576,20 @@ async fn main() -> anyhow::Result<()> {
         &config.node.hostname,
         "success",
     );
+
+    // Goal-reachability check once data nodes have had time to register
+    // their disks (a check at t=0 would see an empty topology).
+    {
+        let sm = sm_data.clone();
+        let audit = audit_log.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            let sm = sm.read().await;
+            for v in sm.volumes.values() {
+                goal_check::report_unreachable_goals(&audit, v, &sm.nodes);
+            }
+        });
+    }
 
     // Bug BR-1 — self-register this manager's version + build_date + a live
     // last_seen_ms into shared Raft state. Managers are Raft peers, not
