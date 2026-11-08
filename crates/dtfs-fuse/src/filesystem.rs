@@ -889,7 +889,7 @@ impl DtfsFilesystem {
             // F-029: if writes are still buffered locally, the cluster-side
             // size is stale — fold in the buffered logical size so `stat`
             // reports what the user can actually `read()`.
-            if let Some(buffered_eof) = self.write_buffer.logical_size(path) {
+            if let Some(buffered_eof) = self.write_buffer.visible_size(path) {
                 if buffered_eof > attr.size {
                     attr.size = buffered_eof;
                 }
@@ -901,7 +901,7 @@ impl DtfsFilesystem {
         let fetch = self.commit_tracker.begin_fetch(path);
         let locations = self.fetch_file_locations(path).await?;
         let mut attr = file_attr_from_locations(&locations);
-        if let Some(buffered_eof) = self.write_buffer.logical_size(path) {
+        if let Some(buffered_eof) = self.write_buffer.visible_size(path) {
             if buffered_eof > attr.size {
                 attr.size = buffered_eof;
             }
@@ -1129,7 +1129,8 @@ impl DtfsFilesystem {
         // size). Without this, every read of bytes that have only been
         // *buffered* (not yet flushed to a chunk) returns Bytes::new() and
         // SQLite / any DB engine sees an empty database after `CREATE TABLE`.
-        let buffered_eof = self.write_buffer.logical_size(&file_path).unwrap_or(0);
+        // Includes drained segments whose commit is still in flight.
+        let buffered_eof = self.write_buffer.visible_size(&file_path).unwrap_or(0);
         let file_size = locations.total_size.max(buffered_eof);
         if offset >= file_size {
             return Ok(Bytes::new());
@@ -1723,6 +1724,7 @@ impl DtfsFilesystem {
                     self.renew_if_due(fh, &path).await?;
                     let segs = self.cap_drain(&path, at, n);
                     if !segs.is_empty() {
+                        let _inflight = self.write_buffer.begin_inflight(&path, &segs);
                         let committed = match self.flush_segments_to_cluster(&path, &segs).await {
                             Ok(c) => c,
                             Err(e) => {
@@ -1750,6 +1752,7 @@ impl DtfsFilesystem {
             self.renew_if_due(fh, &path).await?;
             let segs = self.cap_drain(&path, effective_offset, data.len());
             if !segs.is_empty() {
+                let _inflight = self.write_buffer.begin_inflight(&path, &segs);
                 let committed = match self.flush_segments_to_cluster(&path, &segs).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -1767,6 +1770,7 @@ impl DtfsFilesystem {
         // Check if any complete chunks are ready to flush.
         let segments = self.write_buffer.flush(&path);
         if !segments.is_empty() {
+            let _inflight = self.write_buffer.begin_inflight(&path, &segments);
             if let Err(e) = self.renew_if_due(fh, &path).await {
                 self.write_buffer.restore_segments(&path, &segments);
                 return Err(e);
@@ -1980,6 +1984,8 @@ impl DtfsFilesystem {
         }
 
         let segments = self.write_buffer.flush_all(&path);
+        // Visible to readers until restored or merged (dropped at return).
+        let _inflight = self.write_buffer.begin_inflight(&path, &segments);
         let had_segments = !segments.is_empty();
         let mut committed = None;
         if had_segments {
@@ -5527,5 +5533,48 @@ mod async_commit_fs_tests {
         let err = fs.release(fh).await.unwrap_err();
         assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
         assert!(!fs.open_files.contains_key(&fh));
+    }
+
+    /// Dev-cluster repro: knfsd's close drained the buffer (flush_all) and a
+    /// reader that opened the file before the upload finished saw size 0 /
+    /// EOF. A manager that accepts but never answers keeps the commit in
+    /// flight; the drained bytes must stay visible to lookup() and read().
+    #[tokio::test]
+    async fn drained_bytes_stay_visible_while_the_commit_is_in_flight() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let hole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                held.push(s);
+            }
+        });
+        let client = DtfsClient::new();
+        client.connect(&addr).await.expect("black-hole manager accepts");
+        for async_on in [false, true] {
+            let mut cfg: FuseConfig =
+                toml::from_str(include_str!("../../../deploy/examples/fuse.toml")).unwrap();
+            cfg.write.async_commit = async_on;
+            let fs = Arc::new(DtfsFilesystem::new(client.clone(), cfg.location.clone(), cfg));
+            let cs = fs.write_buffer.chunk_size() as u64;
+            let w = open(&fs, "/v", OpenFlags::ReadWrite);
+            let r = open(&fs, "/v", OpenFlags::ReadOnly);
+            for fh in [w, r] {
+                fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/v", 0, cs)));
+            }
+            fs.cache_metadata("/v", Arc::new(holes("/v", 0, cs)));
+            fs.write_buffer.write("/v", 0, b"visible");
+            let f2 = fs.clone();
+            let commit = tokio::spawn(async move { f2.flush(w).await });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!commit.is_finished(), "the commit must still be in flight");
+            assert_eq!(fs.write_buffer.dirty_bytes("/v"), 0, "drained by flush_all");
+            assert_eq!(fs.lookup("/v").await.unwrap().size, 7, "async={async_on}");
+            assert_eq!(&fs.read(r, 0, 100).await.unwrap()[..], b"visible", "async={async_on}");
+            commit.abort();
+            let _ = commit.await;
+            assert_eq!(fs.lookup("/v").await.unwrap().size, 0, "overlay ends with the commit");
+        }
+        hole.abort();
     }
 }

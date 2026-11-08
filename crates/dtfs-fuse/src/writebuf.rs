@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::{Range, RangeInclusive};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -96,6 +97,25 @@ pub struct WriteBuffer {
     flush_batch_chunks: usize,
     /// Per-file write buffers, keyed by file path.
     buffers: DashMap<String, FileWriteBuffer>,
+    /// Drained segments whose commit is in flight, by `begin_inflight` id:
+    /// (path, [(absolute offset, bytes)]). Read-only overlay so a reader
+    /// between the drain and the commit's return still sees the bytes
+    /// (`Bytes` clones of the segments being uploaded: no extra copy).
+    inflight: DashMap<u64, (String, Vec<(u64, Bytes)>)>,
+    next_inflight: AtomicU64,
+}
+
+/// Ends an in-flight overlay on drop: after the commit's caller restored the
+/// segments (failure) or merged the committed chunks (success).
+pub struct InflightGuard<'a> {
+    wb: &'a WriteBuffer,
+    id: u64,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.wb.inflight.remove(&self.id);
+    }
 }
 
 /// Internal per-file write buffer: a sparse map from chunk index to the
@@ -245,6 +265,8 @@ impl WriteBuffer {
             chunk_size,
             flush_batch_chunks: 1,
             buffers: DashMap::new(),
+            inflight: DashMap::new(),
+            next_inflight: AtomicU64::new(0),
         }
     }
 
@@ -264,6 +286,8 @@ impl WriteBuffer {
             chunk_size,
             flush_batch_chunks: effective_batch_chunks(flush_batch_chunks, chunk_size),
             buffers: DashMap::new(),
+            inflight: DashMap::new(),
+            next_inflight: AtomicU64::new(0),
         }
     }
 
@@ -423,6 +447,20 @@ impl WriteBuffer {
         segs
     }
 
+    /// Keep `segs` (just drained from `path`) visible to `overlay` and
+    /// `visible_size` until the returned guard drops. Hold it across the
+    /// upload and the restore or post-commit merge.
+    pub fn begin_inflight(&self, path: &str, segs: &[ChunkSegment]) -> InflightGuard<'_> {
+        let id = self.next_inflight.fetch_add(1, Ordering::Relaxed);
+        let cs = self.chunk_size as u64;
+        let parts = segs
+            .iter()
+            .map(|s| (s.chunk_index as u64 * cs + s.offset_in_chunk as u64, s.data.clone()))
+            .collect();
+        self.inflight.insert(id, (path.to_string(), parts));
+        InflightGuard { wb: self, id }
+    }
+
     /// Remove the buffer for a given path entirely.
     pub fn remove(&self, path: &str) {
         self.buffers.remove(path);
@@ -464,6 +502,11 @@ impl WriteBuffer {
             };
             buf.path = new_key.clone();
             self.buffers.insert(new_key, buf);
+        }
+        for mut e in self.inflight.iter_mut() {
+            if let Some(np) = rekey_path(&e.value().0, from, to) {
+                e.value_mut().0 = np;
+            }
         }
     }
 
@@ -659,6 +702,18 @@ impl WriteBuffer {
             .max()
     }
 
+    /// What a reader sees as the end of `path` beyond the committed size:
+    /// `logical_size` or the end of an in-flight drained segment.
+    pub fn visible_size(&self, path: &str) -> Option<u64> {
+        let inflight = self
+            .inflight
+            .iter()
+            .filter(|e| e.value().0 == path)
+            .flat_map(|e| e.value().1.iter().map(|(o, d)| o + d.len() as u64).collect::<Vec<_>>())
+            .max();
+        self.logical_size(path).max(inflight)
+    }
+
     /// Overlay any buffered data for `path` that overlaps the byte range
     /// `[abs_offset, abs_offset + dst.len())` onto `dst`.
     ///
@@ -674,6 +729,35 @@ impl WriteBuffer {
         if dst.is_empty() {
             return 0;
         }
+        // In-flight drained segments first (oldest first), the buffer on top:
+        // its bytes are newer.
+        let mut ids: Vec<u64> = self
+            .inflight
+            .iter()
+            .filter(|e| e.value().0 == path)
+            .map(|e| *e.key())
+            .collect();
+        ids.sort_unstable();
+        let req_end = abs_offset + dst.len() as u64;
+        let mut total = 0usize;
+        for id in ids {
+            let Some(e) = self.inflight.get(&id) else { continue };
+            for (start, data) in &e.value().1 {
+                let lo = abs_offset.max(*start);
+                let hi = req_end.min(start + data.len() as u64);
+                if hi > lo {
+                    let n = (hi - lo) as usize;
+                    let d = (lo - abs_offset) as usize;
+                    let s = (lo - start) as usize;
+                    dst[d..d + n].copy_from_slice(&data[s..s + n]);
+                    total += n;
+                }
+            }
+        }
+        total + self.overlay_buffer(path, abs_offset, dst)
+    }
+
+    fn overlay_buffer(&self, path: &str, abs_offset: u64, dst: &mut [u8]) -> usize {
         let Some(entry) = self.buffers.get(path) else { return 0 };
         let buf = entry.value();
         if buf.chunks.is_empty() {
@@ -1500,6 +1584,30 @@ mod async_commit_tests {
         assert_eq!(segs.iter().map(|s| s.chunk_index).collect::<Vec<_>>(), vec![0]);
         assert!(!wb.chunk_needs_seed("/f", 2), "still seeded for the pending write");
         assert_eq!(wb.dirty_bytes("/f"), CS + 2);
+    }
+
+    #[test]
+    fn inflight_overlay_until_the_guard_drops_buffer_wins_rename_follows() {
+        let wb = WriteBuffer::new(CS);
+        wb.write("/f", 0, &[1; CS]);
+        wb.write("/f", CS as u64, &[2; 3]);
+        let segs = wb.flush_all("/f");
+        let g = wb.begin_inflight("/f", &segs);
+        assert_eq!(wb.logical_size("/f"), None, "drained");
+        assert_eq!(wb.visible_size("/f"), Some(CS as u64 + 3));
+        wb.write("/f", 1, &[9; 2]); // newer write over the in-flight chunk
+        let mut v = vec![0u8; CS + 4];
+        wb.overlay("/f", 0, &mut v);
+        assert_eq!(&v[..4], &[1, 9, 9, 1]);
+        assert_eq!(&v[CS..], &[2, 2, 2, 0]);
+        wb.rename("/f", "/g");
+        assert_eq!(wb.visible_size("/f"), None);
+        assert_eq!(wb.visible_size("/g"), Some(CS as u64 + 3));
+        drop(g);
+        assert_eq!(wb.visible_size("/g"), Some(3), "only the newer write is left");
+        let mut v = vec![0u8; 4];
+        wb.overlay("/g", 0, &mut v);
+        assert_eq!(v, [0, 9, 9, 0]);
     }
 
     #[test]

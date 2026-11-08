@@ -106,6 +106,14 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   starts after it) and sends ONE `commit_chunk_locations` only after all
   segments reached quorum. Do not unbound it: puts share a fixed 60 s
   deadline and each buffers ~3 MiB per target (put channel depth 2).
+- Every drain that goes to `flush_segments_to_cluster` (write flush, cap
+  drains, `commit_all`) holds `WriteBuffer::begin_inflight` (`Bytes`
+  clones, no copy) until the restore (failure) or
+  `mark_committed_and_refresh` (success) is done, so read() (`overlay`,
+  in-flight under the buffer) and lookup/read size (`visible_size`) still
+  see drained bytes while the upload runs. Without it a reader between
+  knfsd's close (flush drains) and the commit saw size 0 / EOF. Write-side
+  EOF decisions keep using `logical_size`.
 - Batch is byte-clamped at `FLUSH_BATCH_MAX_BYTES` (64 MB); total dirty
   bytes per open file are capped at `DIRTY_BYTES_CAP` (2x) and
   force-drained via `WriteBuffer::cap_drain` (complete chunks, never the

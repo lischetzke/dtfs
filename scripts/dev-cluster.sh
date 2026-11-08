@@ -48,6 +48,7 @@ ports 29402 (mgr01), 29412 (mgr02), 29422 (mgr03). No TLS; fixed dev secret.
 Env: DTFS_DEV_TARGET_VOLUME (cargo target volume, default dtfs-target).
 DTFS_DEV_ASYNC_COMMIT=<secs> writes [write] async_commit = true with that
 async_commit_secs into the client configs (written by up; up --no-build to switch).
+DTFS_DEV_RUST_LOG (default info) sets RUST_LOG for the FUSE/NFS client containers.
 No systemd, journald or sshd in the containers: MCP host_* tools and Ansible
 do not apply.
 EOF
@@ -233,7 +234,7 @@ start_client() {
   if [ "$priv" = 1 ]; then args="--privileged"
   else args="--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined"; fi
   # shellcheck disable=SC2086
-  docker run -d --name $name --hostname $1 --network $NET $args -e RUST_LOG=info \
+  docker run -d --name $name --hostname $1 --network $NET $args -e RUST_LOG="${DTFS_DEV_RUST_LOG:-info}" \
     -v $BINVOL:/opt/dtfs:ro -v $ETCVOL:/etc/dtfs:ro "$IMG" sh -c \
     "mkdir -p /mnt/dtfs && exec /opt/dtfs/dtfs-fuse --config /etc/dtfs/$cfg" >/dev/null
   local i
@@ -263,11 +264,16 @@ echo hello > /mnt/nfs/small; [ "$(cat /mnt/dtfs/small)" = hello ]; ck $? "small 
 head -c 10485760 /dev/urandom > /tmp/r10; cp /tmp/r10 /mnt/nfs/r10
 cmp /tmp/r10 /mnt/nfs/r10; ck $? "10MB cmp via NFS"
 cmp /tmp/r10 /mnt/dtfs/r10; ck $? "10MB cmp via FUSE"
+cp /tmp/r10 /mnt/nfs/n1; cmp /tmp/r10 /mnt/dtfs/n1; ck $? "cmp via FUSE right after NFS cp"
+echo 3 > /proc/sys/vm/drop_caches; cmp /tmp/r10 /mnt/dtfs/n1; ck $? "cmp via FUSE after cache drop, before the commit timer"
+rm /mnt/nfs/n1; [ ! -e /mnt/dtfs/n1 ]; ck $? "rm n1"
 mv /mnt/nfs/r10 /mnt/nfs/r10b; [ -e /mnt/dtfs/r10b ] && [ ! -e /mnt/dtfs/r10 ]; ck $? "rename"
 echo 3 > /proc/sys/vm/drop_caches
 cmp /tmp/r10 /mnt/nfs/r10b; ck $? "cmp via NFS after cache drop"
 cmp /tmp/r10 /mnt/dtfs/r10b; ck $? "cmp via FUSE after cache drop"
 rm /mnt/nfs/r10b /mnt/nfs/small; [ ! -e /mnt/dtfs/r10b ] && [ ! -e /mnt/dtfs/small ]; ck $? "rm"
+# knfsd holds the FUSE mount while exported: a later docker rm -f leaves a zombie.
+umount /mnt/nfs; exportfs -ua; exportfs -f; ck $? "unexport"
 exit $rc
 '
 
