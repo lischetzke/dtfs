@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -270,7 +271,7 @@ fn complete_foreground_fetch(
 /// grows well past the bound, so a long-lived process re-caching the same
 /// hot paths forever doesn't leak the queue itself.
 fn evict_metadata_cache(
-    cache: &DashMap<String, (FileLocations, Instant)>,
+    cache: &DashMap<String, (Arc<FileLocations>, Instant)>,
     order: &mut std::collections::VecDeque<String>,
     max_entries: usize,
 ) {
@@ -297,7 +298,7 @@ fn evict_metadata_cache(
 /// the cache handle so it's directly testable without a full
 /// `DtfsFilesystem`.
 fn sweep_expired_metadata_cache_entries(
-    cache: &DashMap<String, (FileLocations, Instant)>,
+    cache: &DashMap<String, (Arc<FileLocations>, Instant)>,
     ttl: Duration,
 ) {
     cache.retain(|_, (_, cached_at)| cached_at.elapsed() < ttl);
@@ -400,8 +401,9 @@ struct OpenFile {
     /// `O_APPEND` semantics — every write goes to the *current* end of file,
     /// regardless of the offset the kernel hands us. (F-021)
     append: bool,
-    /// Cached locations (refreshed on open).
-    locations: Option<FileLocations>,
+    /// Cached locations (refreshed on open). `Arc` so read()/write() share
+    /// the snapshot instead of cloning the chunk list per kernel call.
+    locations: Option<Arc<FileLocations>>,
     /// Chunk size in bytes for this file's volume.
     chunk_size: u64,
     /// P0-1: write lease token for this file handle. None for read-only opens.
@@ -466,7 +468,7 @@ pub struct DtfsFilesystem {
     /// FUSE configuration.
     config: FuseConfig,
     /// Metadata cache: path -> (FileLocations, cached_at).
-    metadata_cache: DashMap<String, (FileLocations, Instant)>,
+    metadata_cache: DashMap<String, (Arc<FileLocations>, Instant)>,
     /// CR-6-5 (FUSE-5) — insertion-order queue backing bounded eviction of
     /// `metadata_cache`. A path can appear more than once (re-cached); a
     /// popped entry whose key is no longer the live one is a harmless
@@ -658,7 +660,7 @@ impl DtfsFilesystem {
                 attr.size = buffered_eof;
             }
         }
-        self.cache_metadata(path, locations);
+        self.cache_metadata(path, Arc::new(locations));
         Ok(attr)
     }
 
@@ -805,6 +807,7 @@ impl DtfsFilesystem {
             }
         }
 
+        let locations = Arc::new(locations);
         self.open_files.insert(
             fh,
             OpenFile {
@@ -1820,7 +1823,7 @@ impl DtfsFilesystem {
                 path: path.to_string(),
                 flags: OpenFlags::ReadWrite,
                 append: false,
-                locations: Some(snapshot),
+                locations: Some(Arc::new(snapshot)),
                 chunk_size: response.chunk_size,
                 lease_id: Some(lease_resp.lease_id),
                 lease_deadline: Some(lease_deadline_from(sent)),
@@ -2018,6 +2021,7 @@ impl DtfsFilesystem {
         self.metadata_cache.remove(path);
         match self.fetch_file_locations(path).await {
             Ok(fresh) => {
+                let fresh = Arc::new(fresh);
                 for mut entry in self.open_files.iter_mut() {
                     if entry.value().path == path {
                         entry.value_mut().locations = Some(fresh.clone());
@@ -2091,7 +2095,7 @@ impl DtfsFilesystem {
             .with_context(|| format!("link {src} -> {dst}"))?;
         let locs = self.fetch_file_locations(dst).await?;
         let attr = file_attr_from_locations(&locs);
-        self.cache_metadata(dst, locs);
+        self.cache_metadata(dst, Arc::new(locs));
         Ok(attr)
     }
 
@@ -2167,7 +2171,7 @@ impl DtfsFilesystem {
                     None
                 }
             })
-            .or_else(|| self.get_cached_metadata(path).map(|loc| loc.volume_id));
+            .or_else(|| self.get_cached_metadata(path).map(|loc| loc.volume_id.clone()));
         let volume_id =
             resolve_refreshed_volume_id(&response.volume_id, existing_volume_id.as_deref());
 
@@ -2185,7 +2189,7 @@ impl DtfsFilesystem {
     }
 
     /// Get cached metadata if it exists and hasn't expired.
-    fn get_cached_metadata(&self, path: &str) -> Option<FileLocations> {
+    fn get_cached_metadata(&self, path: &str) -> Option<Arc<FileLocations>> {
         let entry = self.metadata_cache.get(path)?;
         let (locations, cached_at) = entry.value();
         if cached_at.elapsed() < self.metadata_ttl {
@@ -2204,7 +2208,7 @@ impl DtfsFilesystem {
     /// getattr-heavy scan workload, per CLAUDE.md § B.1's "smallest fix").
     /// Before this, a Plex library scan pinned one full chunk-location list
     /// per path ever stat'ed, unboundedly.
-    fn cache_metadata(&self, path: &str, locations: FileLocations) {
+    fn cache_metadata(&self, path: &str, locations: Arc<FileLocations>) {
         self.metadata_cache
             .insert(path.to_string(), (locations, Instant::now()));
         let mut order = self.metadata_cache_order.lock().unwrap();
@@ -2708,27 +2712,43 @@ impl DtfsFilesystem {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
+        // Take the cache's copy out first, held only weakly when a handle
+        // shares it, so a sole-writer handle merges in place without a copy.
+        let cached = self.metadata_cache.remove(path).map(|(_, (arc, at))| {
+            if Arc::strong_count(&arc) > 1 {
+                (Err(Arc::downgrade(&arc)), at)
+            } else {
+                (Ok(arc), at)
+            }
+        });
+        let mut done = Vec::new();
         let mut refetch = false;
         for mut entry in self.open_files.iter_mut() {
             if entry.value().path == path {
                 let f = entry.value_mut();
                 f.committed_any = true;
-                refetch |= !merge_into_snapshot(f.locations.as_mut(), committed, now_ms);
+                refetch |= !merge_shared(&mut f.locations, committed, now_ms, &mut done);
             }
         }
         if !refetch {
-            let merged = match self.metadata_cache.get_mut(path) {
-                Some(mut e) => merge_into_snapshot(Some(&mut e.value_mut().0), committed, now_ms),
-                None => true,
+            let restored = match cached {
+                Some((Ok(arc), at)) => {
+                    let mut slot = Some(arc);
+                    merge_shared(&mut slot, committed, now_ms, &mut done).then(|| (slot, at))
+                }
+                Some((Err(weak), at)) => {
+                    merged_of(&done, &weak).map(|arc| (Some(arc), at))
+                }
+                None => None,
             };
-            if !merged {
-                self.metadata_cache.remove(path);
+            if let Some((Some(arc), at)) = restored {
+                self.metadata_cache.insert(path.to_string(), (arc, at));
             }
             return;
         }
-        self.metadata_cache.remove(path);
         match self.fetch_file_locations(path).await {
             Ok(fresh) => {
+                let fresh = Arc::new(fresh);
                 for mut entry in self.open_files.iter_mut() {
                     if entry.value().path == path {
                         entry.value_mut().locations = Some(fresh.clone());
@@ -2756,12 +2776,13 @@ impl DtfsFilesystem {
     }
 
     /// Re-fetch `path`'s locations and install them on every handle of it.
-    async fn refetch_locations(&self, path: &str) -> Result<FileLocations> {
+    async fn refetch_locations(&self, path: &str) -> Result<Arc<FileLocations>> {
         self.metadata_cache.remove(path);
-        let fresh = self
-            .fetch_file_locations(path)
-            .await
-            .with_context(|| format!("stale locations for {path} and re-fetch failed"))?;
+        let fresh = Arc::new(
+            self.fetch_file_locations(path)
+                .await
+                .with_context(|| format!("stale locations for {path} and re-fetch failed"))?,
+        );
         for mut entry in self.open_files.iter_mut() {
             if entry.value().path == path {
                 entry.value_mut().locations = Some(fresh.clone());
@@ -2985,10 +3006,7 @@ fn merge_into_snapshot(
     let (Some(loc), Some(committed)) = (snapshot, committed) else {
         return false;
     };
-    if loc.chunk_size == 0
-        || !loc.indices_are_authoritative()
-        || committed.iter().any(|c| c.chunk_index.is_none())
-    {
+    if !can_merge(loc, Some(committed)) {
         return false;
     }
     for c in committed {
@@ -3004,6 +3022,51 @@ fn merge_into_snapshot(
     }
     loc.modified_at_ms = loc.modified_at_ms.max(now_ms);
     true
+}
+
+/// Whether `merge_into_snapshot` would apply `committed` to `loc`.
+fn can_merge(loc: &FileLocations, committed: Option<&[ChunkInfo]>) -> bool {
+    committed.is_some_and(|c| c.iter().all(|c| c.chunk_index.is_some()))
+        && loc.chunk_size != 0
+        && loc.indices_are_authoritative()
+}
+
+/// Copy-on-write `merge_into_snapshot` for one shared holder. A holder whose
+/// snapshot was already merged this round (`done`) takes that result, so
+/// holders that shared one `Arc` still share one; a sole owner is merged in
+/// place without copying the chunk list. Other holders (an in-flight read)
+/// keep the old snapshot. False (slot untouched) = needs the full re-fetch.
+fn merge_shared(
+    slot: &mut Option<Arc<FileLocations>>,
+    committed: Option<&[ChunkInfo]>,
+    now_ms: i64,
+    done: &mut Vec<(Weak<FileLocations>, Arc<FileLocations>)>,
+) -> bool {
+    let Some(cur) = slot.as_mut() else {
+        return false;
+    };
+    if let Some(new) = merged_of(done, &Arc::downgrade(cur)) {
+        *cur = new;
+        return true;
+    }
+    // Check before make_mut so a refused merge never copies.
+    if !can_merge(cur, committed) {
+        return false;
+    }
+    // The Weak keeps the old allocation's address from being reused while
+    // `done` still compares against it.
+    let old = Arc::downgrade(cur);
+    merge_into_snapshot(Some(Arc::make_mut(cur)), committed, now_ms);
+    done.push((old, cur.clone()));
+    true
+}
+
+/// The merged snapshot recorded in `done` for the pre-merge `old`.
+fn merged_of(
+    done: &[(Weak<FileLocations>, Arc<FileLocations>)],
+    old: &Weak<FileLocations>,
+) -> Option<Arc<FileLocations>> {
+    done.iter().find(|(o, _)| o.ptr_eq(old)).map(|(_, new)| new.clone())
 }
 
 /// Largest size any source knows; fallocate grows from this so a stale
@@ -3300,6 +3363,7 @@ mod cr_6_5_metadata_cache_bound_tests {
     use super::{evict_metadata_cache, sweep_expired_metadata_cache_entries, FileLocations};
     use dashmap::DashMap;
     use std::collections::VecDeque;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     /// Built through a free function on purpose (same rustc 1.94 struct-
@@ -3328,11 +3392,11 @@ mod cr_6_5_metadata_cache_bound_tests {
 
     #[test]
     fn insert_5000_stays_bounded() {
-        let cache: DashMap<String, (FileLocations, Instant)> = DashMap::new();
+        let cache: DashMap<String, (Arc<FileLocations>, Instant)> = DashMap::new();
         let mut order: VecDeque<String> = VecDeque::new();
         for i in 0..5000 {
             let path = format!("/movies/{i}.mkv");
-            cache.insert(path.clone(), (empty_locations(&path), Instant::now()));
+            cache.insert(path.clone(), (Arc::new(empty_locations(&path)), Instant::now()));
             order.push_back(path);
             evict_metadata_cache(&cache, &mut order, 4096);
         }
@@ -3346,14 +3410,14 @@ mod cr_6_5_metadata_cache_bound_tests {
 
     #[test]
     fn expired_entry_gone_after_sweep() {
-        let cache: DashMap<String, (FileLocations, Instant)> = DashMap::new();
+        let cache: DashMap<String, (Arc<FileLocations>, Instant)> = DashMap::new();
         cache.insert(
             "/stale.mkv".to_string(),
-            (empty_locations("/stale.mkv"), Instant::now() - Duration::from_secs(120)),
+            (Arc::new(empty_locations("/stale.mkv")), Instant::now() - Duration::from_secs(120)),
         );
         cache.insert(
             "/fresh.mkv".to_string(),
-            (empty_locations("/fresh.mkv"), Instant::now()),
+            (Arc::new(empty_locations("/fresh.mkv")), Instant::now()),
         );
         sweep_expired_metadata_cache_entries(&cache, Duration::from_secs(60));
         assert!(!cache.contains_key("/stale.mkv"), "expired entry must be swept");
@@ -3755,6 +3819,37 @@ mod rev_2_1_chunk_index_tests {
         assert_eq!(super::chunks_needing_seed(&wb, "/f", CS, 0, 3), [0]);
         let segs = wb.flush_all("/f");
         assert!(super::segments_committable(&segs, |i| l.chunk_at(i as u64).is_some()).is_err());
+    }
+
+    /// Copy-on-write: merging one holder of a shared snapshot never changes
+    /// what another holder (an in-flight read) sees; a second holder of the
+    /// same snapshot takes the same merged Arc; a sole owner merges in place.
+    #[test]
+    fn shared_snapshot_merge_is_copy_on_write() {
+        use std::sync::Arc;
+        let original = Arc::new(locs(&[(0, "h0")]));
+        let reader = original.clone();
+        let mut h1 = Some(original.clone());
+        let mut h2 = Some(original);
+        let mut done = Vec::new();
+        let c = [committed(1, "n1", CS)];
+        assert!(super::merge_shared(&mut h1, Some(&c), 1, &mut done));
+        assert!(super::merge_shared(&mut h2, Some(&c), 1, &mut done));
+        assert_eq!(reader.chunks.len(), 1, "another holder's snapshot must not change");
+        assert!(reader.chunk_at(1).is_none());
+        let (h1, h2) = (h1.unwrap(), h2.unwrap());
+        assert_eq!(h1.chunk_at(1).unwrap().chunk_id, "n1");
+        assert!(Arc::ptr_eq(&h1, &h2), "holders that shared one snapshot share the merge");
+        // Refused merge (lease-less commit) leaves the slot untouched.
+        let mut h3 = Some(reader.clone());
+        assert!(!super::merge_shared(&mut h3, None, 1, &mut Vec::new()));
+        assert!(Arc::ptr_eq(h3.as_ref().unwrap(), &reader));
+        // Sole owner: no chunk-list copy (same Vec buffer after the merge).
+        drop((h1, h2, h3));
+        let mut sole = Some(Arc::new(locs(&[(0, "h0"), (1, "h1")])));
+        let buf = sole.as_ref().unwrap().chunks.as_ptr();
+        assert!(super::merge_shared(&mut sole, Some(&[committed(1, "n1", CS)]), 1, &mut Vec::new()));
+        assert_eq!(sole.as_ref().unwrap().chunks.as_ptr(), buf, "sole owner merges in place");
     }
 }
 

@@ -60,7 +60,9 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   (`merge_into_snapshot`: replace the index, grow size). It re-fetches the
   whole file only when a handle has no snapshot, the commit was lease-less,
   or the snapshot is positional/sizeless; never re-fetch per batch
-  (quadratic on big files).
+  (quadratic on big files). Snapshots are `Arc<FileLocations>` (handles and
+  metadata cache): read()/write() clone the Arc, never the chunk list; the
+  merge is copy-on-write (`merge_shared`).
 - A failed post-commit locations refresh sets the handles' `locations` to
   `None`; `write()`/`read()` must `refetch_locations` before using them.
 - `rename` over a path with open writers and `unlink`/`rmdir` of one
