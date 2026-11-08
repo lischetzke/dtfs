@@ -1,0 +1,85 @@
+name: Bug report
+description: Something does not work as documented, or data is at risk.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Never paste `shared_secret` values, tokens or HMACs; replace them with `***`.
+        For security problems use the private advisory link instead of this form.
+  - type: dropdown
+    id: data_risk
+    attributes:
+      label: Is data at risk?
+      description: Pick the worst that applies.
+      options:
+        - "No"
+        - Reads fail or return errors
+        - Writes are rejected or lost
+        - Chunks missing, quarantined or corrupt
+        - Anchor copy missing
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      multiple: true
+      options:
+        - Manager (Raft, metadata, scheduler)
+        - Data node
+        - FUSE client
+        - CLI / updater
+        - Web dashboard
+        - REST or gRPC API
+        - Installer / Ansible / systemd
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `dtfs-manager --version` (or the dashboard footer / `GET /api/v1/nodes` version field) on the affected nodes.
+      placeholder: dtfs-manager v0.1.6 (built 20261108-120000)
+    validations:
+      required: true
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: What you saw, including exact error messages.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+  - type: textarea
+    id: topology
+    attributes:
+      label: Cluster layout
+      description: Number of managers and data nodes, datacenters, disk tiers, anchor datacenter.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant `journalctl -u dtfs-*` lines from the affected nodes, around the time of the problem.
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: Config (secrets removed)
+      description: The relevant TOML sections or `GET /api/v1/config/effective` rows.
+      render: toml
