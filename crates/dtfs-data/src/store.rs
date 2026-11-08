@@ -597,7 +597,20 @@ impl ChunkStore {
     /// pulled the whole chunk into a heap `Bytes`, which under the
     /// 2026-06-06 task storm pinned the data node at its memory cap).
     pub fn chunk_file_path(&self, chunk_id: &ChunkId) -> Option<(std::path::PathBuf, u64)> {
+        self.chunk_file_path_on_disk(chunk_id, None)
+    }
+
+    /// `chunk_file_path` restricted to `disk_id` when `Some` (an unknown id
+    /// finds nothing); `None` = first-found across disks.
+    pub fn chunk_file_path_on_disk(
+        &self,
+        chunk_id: &ChunkId,
+        disk_id: Option<u32>,
+    ) -> Option<(std::path::PathBuf, u64)> {
         for disk in self.disk_manager.all_disks() {
+            if disk_id.is_some_and(|want| disk.disk_id != want) {
+                continue;
+            }
             let dat_path = chunk_data_path(&disk.mount_path, chunk_id);
             if let Ok(md) = std::fs::metadata(&dat_path) {
                 return Some((dat_path, md.len()));
@@ -770,7 +783,19 @@ impl ChunkStore {
 
     /// Get chunk metadata.
     pub async fn get_chunk_meta(&self, chunk_id: &ChunkId) -> DtfsResult<ChunkMeta> {
+        self.get_chunk_meta_on_disk(chunk_id, None).await
+    }
+
+    /// `get_chunk_meta` restricted to `disk_id` when `Some`.
+    pub async fn get_chunk_meta_on_disk(
+        &self,
+        chunk_id: &ChunkId,
+        disk_id: Option<u32>,
+    ) -> DtfsResult<ChunkMeta> {
         for disk in self.disk_manager.all_disks() {
+            if disk_id.is_some_and(|want| disk.disk_id != want) {
+                continue;
+            }
             let meta_path = chunk_meta_path(&disk.mount_path, chunk_id);
             if meta_path.exists() {
                 let meta_json = fs::read_to_string(&meta_path)
@@ -2264,6 +2289,29 @@ mod tests {
             store.drain_pending_corruption(),
             vec![(gone.as_hex(), store.disk_id_for_path(&disk))]
         );
+    }
+
+    /// Disk-targeted lookups see only that disk's copy (VerifyChunk).
+    #[tokio::test]
+    async fn disk_targeted_lookup_sees_only_that_disks_copy() {
+        let (store, cold, warm) = make_two_disk_store().await;
+        let data = b"verify-disk-targeted";
+        let id = ChunkId::from_bytes(checksum::compute(data));
+        let vol = VolumeId::new("default".to_string());
+        store.put_chunk(&id, data, &vol, DiskTier::Cold).await.unwrap();
+        store.put_chunk(&id, data, &vol, DiskTier::Warm).await.unwrap();
+        let (p0, _) = store.chunk_file_path_on_disk(&id, Some(0)).unwrap();
+        let (p1, _) = store.chunk_file_path_on_disk(&id, Some(1)).unwrap();
+        assert_eq!(p0, chunk_data_path(cold.path(), &id));
+        assert_eq!(p1, chunk_data_path(warm.path(), &id));
+        assert!(store.chunk_file_path_on_disk(&id, Some(99)).is_none());
+        // Remove the warm copy: disk 1 no longer has it, disk 0 still does.
+        std::fs::remove_file(&p1).unwrap();
+        std::fs::remove_file(p1.with_extension("meta")).unwrap();
+        assert!(store.chunk_file_path_on_disk(&id, Some(1)).is_none());
+        assert!(store.get_chunk_meta_on_disk(&id, Some(1)).await.is_err());
+        assert!(store.get_chunk_meta_on_disk(&id, Some(0)).await.is_ok());
+        assert!(store.chunk_file_path_on_disk(&id, None).is_some());
     }
 
     /// Good .dat + parseable-but-wrong .meta (bad checksum, or bad size):

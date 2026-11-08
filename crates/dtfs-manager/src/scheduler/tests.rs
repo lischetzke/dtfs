@@ -2236,7 +2236,7 @@ mod advance_round_tests {
                 None => Ok(()),
             }
         }
-        async fn verify(&self, _tgt: &str, _chunk: &str) -> Result<bool, String> {
+        async fn verify(&self, _tgt: &str, _chunk: &str, _disk: Option<u32>) -> Result<bool, String> {
             self.verify_calls.fetch_add(1, Ordering::SeqCst);
             match self.verify_result {
                 VerifyMode::Ok => Ok(true),

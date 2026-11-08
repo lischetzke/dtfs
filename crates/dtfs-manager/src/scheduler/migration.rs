@@ -160,7 +160,7 @@ impl TaskScheduler {
 
     /// Ask the target node to verify the integrity of `chunk_id`.
     /// Returns `true` if the chunk is valid, `false` if the checksum failed.
-    pub(super) async fn verify_chunk(&self, target_addr: &str, chunk_id: &str) -> anyhow::Result<bool> {
+    pub(super) async fn verify_chunk(&self, target_addr: &str, chunk_id: &str, disk_id: Option<u32>) -> anyhow::Result<bool> {
         // Bug W (part 2) — same fix as `replicate_chunk`: NodeInfo.grpc_addr
         // already carries the scheme. Don't double-prefix.
         let endpoint = normalize_endpoint(target_addr);
@@ -173,6 +173,7 @@ impl TaskScheduler {
                 .map_err(|e| anyhow::anyhow!("connect to target {}: {}", target_addr, e))?;
             let mut req = tonic::Request::new(VerifyChunkRequest {
                 chunk_id: chunk_id.to_string(),
+                disk_id,
             });
             {
                 use dtfs_common::crypto::{
@@ -593,7 +594,7 @@ pub(super) trait MigrationOps {
         chunk_bytes: u64,
     ) -> Result<(), String>;
     /// VerifyChunk on the target. `Ok(false)` = checksum mismatch.
-    async fn verify(&self, tgt_addr: &str, chunk_id: &str) -> Result<bool, String>;
+    async fn verify(&self, tgt_addr: &str, chunk_id: &str, disk_id: Option<u32>) -> Result<bool, String>;
     /// Completing: register the new replica location through Raft.
     /// CR-3-4/MGR-4 — `Err` keeps the task Completing (retry next tick)
     /// instead of unconditionally advancing to Done.
@@ -702,8 +703,8 @@ impl MigrationOps for TaskScheduler {
             .map_err(|e| format!("ReplicateChunk error: {e}"))
     }
 
-    async fn verify(&self, tgt_addr: &str, chunk_id: &str) -> Result<bool, String> {
-        self.verify_chunk(tgt_addr, chunk_id)
+    async fn verify(&self, tgt_addr: &str, chunk_id: &str, disk_id: Option<u32>) -> Result<bool, String> {
+        self.verify_chunk(tgt_addr, chunk_id, disk_id)
             .await
             .map_err(|e| e.to_string())
     }
@@ -1103,7 +1104,7 @@ pub(super) async fn advance_round<O: MigrationOps>(
         }
 
         match ops.target_addr(target_node).await {
-            Some(tgt_addr) => match ops.verify(&tgt_addr, &chunk_id).await {
+            Some(tgt_addr) => match ops.verify(&tgt_addr, &chunk_id, state.landed_disks.get(task_id).copied()).await {
                 Ok(true) => {
                     if let Some(task) = state.tasks.get_mut(task_id) {
                         info!(
@@ -1973,7 +1974,7 @@ mod sched_audit_tests {
             self.replicate_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.landed)
         }
-        async fn verify(&self, _t: &str, _c: &str) -> Result<bool, String> {
+        async fn verify(&self, _t: &str, _c: &str, _d: Option<u32>) -> Result<bool, String> {
             Ok(true)
         }
         async fn register_replica(&self, _c: &str, _t: u64, _tier: DiskTier) -> Result<(), String> {

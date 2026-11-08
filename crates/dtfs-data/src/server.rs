@@ -810,7 +810,7 @@ impl DataService for DataServiceImpl {
         // .dat is readable. Migration marks a copy Done on this, so a
         // false `valid:true` lets bit-rot propagate and tier-demote drop
         // the only good source. Missing meta = unverifiable = invalid.
-        let meta = match self.store.get_chunk_meta(&chunk_id).await {
+        let meta = match self.store.get_chunk_meta_on_disk(&chunk_id, req.disk_id).await {
             Ok(meta) => meta,
             Err(e) => {
                 return Ok(Response::new(VerifyChunkResponse {
@@ -819,7 +819,7 @@ impl DataService for DataServiceImpl {
                 }));
             }
         };
-        let dat_path = match self.store.chunk_file_path(&chunk_id) {
+        let dat_path = match self.store.chunk_file_path_on_disk(&chunk_id, req.disk_id) {
             Some((path, stat_size)) => {
                 // CR-4-6 (DATA-9) — a size mismatch is corruption/truncation
                 // that a checksum over the WRONG number of bytes can't
@@ -1519,6 +1519,7 @@ max_io_percent = 10
         let err = svc
             .verify_chunk(Request::new(VerifyChunkRequest {
                 chunk_id: "00".repeat(32),
+                disk_id: None,
             }))
             .await
             .expect_err("unauthenticated VerifyChunk must fail");
@@ -1881,6 +1882,7 @@ max_io_percent = 10
 
         let mut req = Request::new(VerifyChunkRequest {
             chunk_id: chunk_hex.clone(),
+            disk_id: None,
         });
         attach_data_rpc_auth(
             &mut req,
@@ -1924,6 +1926,7 @@ max_io_percent = 10
 
         let mut req = Request::new(VerifyChunkRequest {
             chunk_id: chunk_hex.clone(),
+            disk_id: None,
         });
         attach_data_rpc_auth(
             &mut req,
@@ -1967,6 +1970,7 @@ max_io_percent = 10
 
         let mut req = Request::new(VerifyChunkRequest {
             chunk_id: chunk_hex.clone(),
+            disk_id: None,
         });
         attach_data_rpc_auth(
             &mut req,
@@ -1995,7 +1999,7 @@ max_io_percent = 10
         let svc = make_service(tmp.path()).await;
 
         let bad_id = "a\u{e9}a".to_string();
-        let mut req = Request::new(VerifyChunkRequest { chunk_id: bad_id.clone() });
+        let mut req = Request::new(VerifyChunkRequest { chunk_id: bad_id.clone(), disk_id: None });
         attach_data_rpc_auth(&mut req, &svc.config.cluster.shared_secret, "VerifyChunk", &bad_id);
 
         let result = svc.verify_chunk(req).await;
