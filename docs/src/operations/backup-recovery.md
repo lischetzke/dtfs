@@ -13,7 +13,7 @@ The Raft state machine contains all cluster metadata:
 - Volume configurations
 - Cluster-wide configuration
 
-This state lives under the manager's `data_dir` (default: `/var/lib/dtfs`) in two directories:
+This state lives under the manager's `data_dir` (`/var/lib/dtfs/manager` with the installed layout, which the unit's `ReadWritePaths=` requires; the compiled-in default is `/var/lib/dtfs`) in two directories:
 
 - `raft-log/` -- the RocksDB Raft log (the source of truth for all metadata mutations).
 - `raft-sm/` -- the state-machine snapshot. The latest snapshot is the single file `raft-sm/snapshot.bin`; it carries the full FSM state plus the Raft membership, so a restart restores membership before any log replay.
@@ -53,13 +53,13 @@ dtfs-cli status
 2. Snapshots are automatic. To verify the latest one on disk:
 
 ```bash
-ls -la /var/lib/dtfs/raft-sm/
+ls -la /var/lib/dtfs/manager/raft-sm/
 ```
 
 3. Copy the state-machine snapshot to a backup location:
 
 ```bash
-rsync -av /var/lib/dtfs/raft-sm/ \
+rsync -av /var/lib/dtfs/manager/raft-sm/ \
   /backup/dtfs/manager-sm/$(date +%Y%m%d)/
 ```
 
@@ -67,7 +67,7 @@ rsync -av /var/lib/dtfs/raft-sm/ \
 
 ```bash
 # Stop writes briefly or use a filesystem snapshot
-rsync -av /var/lib/dtfs/ \
+rsync -av /var/lib/dtfs/manager/ \
   /backup/dtfs/manager-full/$(date +%Y%m%d)/
 ```
 
@@ -77,10 +77,10 @@ Set up a cron job on each manager node:
 
 ```cron
 # Daily Raft snapshot backup at 02:00
-0 2 * * * rsync -av /var/lib/dtfs/raft-sm/ /backup/dtfs/sm/$(hostname)/$(date +\%Y\%m\%d)/
+0 2 * * * rsync -av /var/lib/dtfs/manager/raft-sm/ /backup/dtfs/sm/$(hostname)/$(date +\%Y\%m\%d)/
 
 # Weekly full data_dir backup at 03:00 Sunday (raft-log/ + raft-sm/)
-0 3 * * 0 rsync -av /var/lib/dtfs/ /backup/dtfs/full/$(hostname)/$(date +\%Y\%m\%d)/
+0 3 * * 0 rsync -av /var/lib/dtfs/manager/ /backup/dtfs/full/$(hostname)/$(date +\%Y\%m\%d)/
 ```
 
 ### Configuration Backup
@@ -173,7 +173,7 @@ restore-and-restart, not a re-bootstrap.
 
 ```bash
 systemctl stop dtfs-manager
-rsync -av --delete /backup/dtfs/manager-full/latest/ /var/lib/dtfs/
+rsync -av --delete /backup/dtfs/manager-full/latest/ /var/lib/dtfs/manager/
 ```
 
 4. Configure the recovery node with `bootstrap = false` and the matching

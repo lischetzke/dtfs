@@ -236,15 +236,19 @@ openssl s_client -connect <manager>:9401
 **Diagnosis:**
 
 ```bash
-# Run a targeted deep scrub
-dtfs-cli scrub --disk /mnt/affected-disk --level deep
+# Recent integrity faults and which node/chunk they hit
+curl -s "http://<manager>:9402/api/v1/integrity/faults?limit=50" | jq .
+
+# Cluster-wide deep scrub (targeted --disk/--file/--chunk scrubs are rejected by the API)
+dtfs-cli scrub --level deep
 
 # Check disk health with smartctl
 ssh <node-host> smartctl -a /dev/sdX
 ```
 
 **Resolution:**
-1. If replicas exist on other nodes, the corrupt chunk will be automatically re-replicated from a healthy copy.
+1. The bad chunk is renamed into `<disk>/.dtfs/quarantine/<id>.dat.bad` (never deleted). If replicas exist on other nodes, the repair scheduler re-creates the replica from a healthy copy. Repeated fault rows after a data-node restart are the same quarantined chunks being re-reported, not new corruption.
+   With `[scrub] quarantine_on_fault = true` (default) the node also self-quarantines (health `Quarantined`, excluded from placement) until you run `dtfs-cli unquarantine <node-id> --operator-id <who> --reason-acknowledged "<what you verified, 16+ chars>"`. Unquarantine only after the cause (disk, memory) is understood.
 2. If the disk shows hardware errors (`smartctl` reports), plan a disk replacement. See [Disk Management](./disk-management.md).
 3. If corruption is isolated, the scrub marks the chunk for re-replication. No manual intervention is needed if the replication factor is greater than 1.
 
@@ -281,7 +285,7 @@ dtfs-cli config
 **Symptoms:** File reads through FUSE are slow.
 
 **Causes:**
-- Cache miss -- the requested chunk is not in the ARC cache or read-ahead cache.
+- Cache miss -- the requested chunk is not in the FUSE read-ahead or local disk cache. (Data nodes have no in-memory chunk cache; every read streams from disk.)
 - Remote reads -- the chunk is being served from a distant datacenter.
 - Network congestion.
 - Data node under heavy I/O from scrubbing or replication.
@@ -289,15 +293,12 @@ dtfs-cli config
 **Diagnosis:**
 
 ```bash
-# Check cache metrics
-curl -s http://<data-node>:9500/metrics | grep cache
-
 # Check if reads are crossing datacenter boundaries (in FUSE client logs)
 journalctl -u dtfs-fuse | grep "remote"
 ```
 
 **Resolution:**
-- Increase the data node ARC cache size (`cache.max_memory_mb` in `data.toml`).
+- Raise the FUSE client's `[readahead] cache_mb` or enable the local disk cache (`[cache] local_cache_dir`, `local_cache_max_gb`).
 - Enable or tune read-ahead mode on the FUSE client. See [Read-Ahead Modes](../access/read-ahead.md).
 - If reads are consistently remote, the tiering engine should eventually migrate replicas closer. Check that tiering is enabled.
 - Reduce scrub I/O intensity by lowering `scrub.max_io_percent`.
@@ -326,6 +327,23 @@ dtfs-cli nodes --id <node-id>
 - Verify the data node is heartbeating successfully.
 - Check that the manager's heartbeat response includes `config_update` when the data node's version is outdated.
 
+### A Daemon Refuses To Start
+
+The process exits with a message naming the cause; under systemd it restarts every
+5 s, so read `journalctl -u <unit> -n 30`. Do not retry-loop; fix the cause.
+
+| Message contains | Cause | Fix |
+|---|---|---|
+| `was disk_id N but is now at [[disks]] position M` (data) | A disk moved to a different `[[disks]]` position | Restore the original order; never remove or reorder entries. See [Disk Management](./disk-management.md#disk-ids-and-disks-order). |
+| `is not a valid disk id` (data) | `.dtfs-disk-id` damaged | Restore it from the disk's expected position; do not guess. |
+| `Raft state machine snapshot was corrupt/unreadable ... Refusing to start as a voter` (manager) | Corrupt snapshot discarded while the log is already purged | Stop, move `raft-log/` and `raft-sm/` aside, restart as a learner from a healthy peer ([Backup and Recovery](./backup-recovery.md)). |
+| `Raft state machine is stale: it has applied up to index N but this node's log was already purged up to index M` (manager) | An old `snapshot.bin` next to a newer log | Restore `raft-sm` from a recent backup, or wipe both directories and re-join as a learner; never restore a lone old snapshot over a newer log. |
+| `cluster.shared_secret is empty` (manager, data) | Empty secret | Set it (same on all nodes). |
+| `[memory] ...`, `[placement] min_free_pct ...`, `max_message_size_mb must be > 0` | Invalid ladder, percentage or size | Fix the named key. |
+| `... must be > 0`, `heartbeat_interval_ms ... must be below election_timeout_ms` | Zero or inverted intervals (`[tiering]`, `[monitoring]`, `[raft]`, FUSE `[cache] prune_interval_secs`, `[partition_safety] quorum_loss_timeout_secs`) | Fix the named key. |
+| unit status 226/NAMESPACE | A `ReadWritePaths=` directory does not exist | Create `/var/lib/dtfs/<role>` and mount the disks ([Filesystem Layout](../deployment/filesystem-layout.md)). |
+| read-only file system on the Raft log (manager) | `data_dir` is not the unit's writable path | Set `data_dir = "/var/lib/dtfs/manager"`. |
+
 ### Disk Shows "Failed" Status
 
 **Symptoms:** A disk appears as `failed` in the node details.
@@ -350,7 +368,7 @@ ssh <node-host> smartctl -a /dev/sdX
 
 **Resolution:**
 - If the disk is unmountable, replace it. See [Disk Management](./disk-management.md).
-- If the mount was lost due to a transient issue, remount and restart the data node. The disk will return to `healthy` status after the next successful heartbeat.
+- If the mount was lost due to a transient issue, remount and restart the data node. The disk will return to `healthy` status after the next successful heartbeat. Use `RequiresMountsFor=` in the unit drop-in so a missing mount fails the start instead of initialising an empty directory as a new disk.
 - For hardware failures, replace the disk and add the new one to the configuration.
 
 ## Performance Diagnostics
@@ -359,21 +377,15 @@ ssh <node-host> smartctl -a /dev/sdX
 
 ```bash
 # Write a test file through FUSE
-dd if=/dev/urandom of=/mnt/dtfs/test-file bs=128M count=10
+dd if=/dev/urandom of=/mnt/dtfs/test-file bs=4M count=250
 
 # Read a test file
-dd if=/mnt/dtfs/test-file of=/dev/null bs=128M
+dd if=/mnt/dtfs/test-file of=/dev/null bs=4M
 ```
 
 ### Cache Effectiveness
 
-Monitor the cache hit ratio metric:
-
-```bash
-curl -s http://<data-node>:9500/metrics | grep dtfs_data_cache
-```
-
-A hit ratio below 50% indicates the working set exceeds the cache size. Consider increasing `cache.max_memory_mb`.
+Caching is on the client: the read-ahead cache (`[readahead] cache_mb`) and the optional local disk cache (`[cache] local_cache_dir`). The data node's `[cache]` block is parsed but inert. There is no cache hit-ratio metric in this revision; judge by `journalctl -u dtfs-fuse` and by read latency while replaying the same file.
 
 ### Network Diagnostics
 

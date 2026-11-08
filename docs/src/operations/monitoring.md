@@ -4,120 +4,81 @@ DTFS exposes metrics and health endpoints for integration with monitoring system
 
 ## Health Endpoints
 
-### Manager Health
+All on the manager REST port (default 9402), no authentication for reads.
 
-```
-GET /api/v1/health
-```
+| Endpoint | Meaning |
+|----------|---------|
+| `GET /healthz` | Liveness: `200 ok` whenever the process answers. |
+| `GET /readyz` | Readiness: `200` only when the state machine has applied at least one log entry **and** at least one node is healthy; otherwise `503` with the reason. A fresh cluster with no data node yet is not ready. |
+| `GET /api/v1/health` | `{"status":"healthy"}`, same liveness meaning. `dtfs-cli health` wraps it. |
+| `GET /api/v1/raft/state` | Raft view of this manager: `running_state` (`ok` or `fatal: ...`), `state`, `is_leader`, `current_leader` (null = no quorum), `voters`, `learners`, `membership`, `applied_log_lag`, `millis_since_quorum_ack`, and on the leader per-peer `replication` lag. |
+| `GET /api/v1/cluster/status` | Cluster summary, see below. |
+| `GET /api/v1/nodes` | Array of nodes with `health`, `role`, `version`, `build_date`, `disk_count`, capacity and `last_seen_ms`. |
 
-Returns a simple health check response:
-
-```json
-{"status": "healthy"}
-```
-
-Returns HTTP 200 when the manager is operational. Use this endpoint for load balancer health checks and uptime monitors.
-
-### Cluster Status
-
-```
-GET /api/v1/cluster/status
-```
-
-Returns a comprehensive cluster overview:
+`/api/v1/cluster/status`:
 
 ```json
 {
   "status": "ok",
   "cluster_name": "production",
-  "node": "mgr-01.example.com",
+  "node": "mgr-01",
   "data_nodes": 12,
   "data_nodes_healthy": 12,
   "files": 48293,
+  "files_missing_chunks": 0,
+  "anchor_pending": 0,
   "total_capacity": 107374182400,
   "used_capacity": 53687091200,
   "config_version": 42
 }
 ```
 
-### CLI Health Check
-
-```bash
-dtfs-cli health
-```
-
-Exits with code 0 if the manager is healthy, code 1 otherwise. Suitable for use in monitoring scripts.
+`status` is `degraded` when any file has lost all chunk bindings
+(`files_missing_chunks > 0`) or fewer data nodes are healthy than registered.
+`anchor_pending` counts files whose anchor copy has not landed yet (asynchronous
+convergence, not data loss, does not degrade `status`). The post-deploy gate
+`scripts/dtfs-cluster-healthcheck.sh` asserts exactly these fields.
 
 ## Prometheus Metrics
 
-DTFS uses the `prometheus-client` library to expose metrics in the OpenMetrics/Prometheus exposition format.
-
-### Metrics Endpoint
-
-Each node type exposes metrics on its HTTP port:
-
-- **Manager:** `http://<manager>:9402/metrics`
-- **Data node:** `http://<data-node>:9500/metrics` (if the data node HTTP endpoint is enabled)
-
-### Prometheus Scrape Configuration
+Only the manager exposes `GET /metrics` (port 9402, text exposition format). Data
+nodes and FUSE clients have no metrics endpoint in this revision; monitor them
+through the manager's node table, `journalctl`, and host-level exporters
+(node_exporter, SMART).
 
 ```yaml
 scrape_configs:
   - job_name: 'dtfs-managers'
     static_configs:
-      - targets:
-        - 'mgr-01:9402'
-        - 'mgr-02:9402'
-        - 'mgr-03:9402'
-
-  - job_name: 'dtfs-data-nodes'
-    static_configs:
-      - targets:
-        - 'data-01:9500'
-        - 'data-02:9500'
-        - 'data-03:9500'
+      - targets: ['mgr-01:9402', 'mgr-02:9402', 'mgr-03:9402']
 ```
 
-For dynamic environments, use service discovery instead of static targets.
-
-### Manager Metrics
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `dtfs_cluster_data_nodes_total` | Gauge | Total registered data nodes |
-| `dtfs_cluster_data_nodes_healthy` | Gauge | Data nodes in healthy state |
-| `dtfs_cluster_files_total` | Gauge | Total files tracked |
-| `dtfs_cluster_capacity_total_bytes` | Gauge | Aggregate cluster capacity |
-| `dtfs_cluster_capacity_used_bytes` | Gauge | Aggregate cluster usage |
-| `dtfs_raft_term` | Gauge | Current Raft term |
-| `dtfs_raft_committed_index` | Gauge | Last committed log index |
-| `dtfs_raft_applied_index` | Gauge | Last applied log index |
-| `dtfs_raft_leader` | Gauge | 1 if this node is leader, 0 otherwise |
-| `dtfs_api_requests_total` | Counter | REST API requests by endpoint and status |
-| `dtfs_api_request_duration_seconds` | Histogram | REST API request latency |
-| `dtfs_tiering_promotions_total` | Counter | Chunks promoted to a hotter tier |
-| `dtfs_tiering_demotions_total` | Counter | Chunks demoted to a colder tier |
-| `dtfs_config_version` | Gauge | Current cluster configuration version |
-
-### Data Node Metrics
+Metrics are computed from the local state machine, so every manager serves the same
+cluster-wide values; scrape all of them to also detect a manager that is down or
+lagging.
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `dtfs_data_reads_total` | Counter | Total read operations |
-| `dtfs_data_writes_total` | Counter | Total write operations |
-| `dtfs_data_bytes_read_total` | Counter | Total bytes read |
-| `dtfs_data_bytes_written_total` | Counter | Total bytes written |
-| `dtfs_data_cache_hits_total` | Counter | ARC cache hits |
-| `dtfs_data_cache_misses_total` | Counter | ARC cache misses |
-| `dtfs_data_cache_hit_ratio` | Gauge | Cache hit ratio (hits / (hits + misses)) |
-| `dtfs_data_chunks_total` | Gauge | Total chunks stored |
-| `dtfs_data_disk_total_bytes` | Gauge | Per-disk total capacity (labels: `disk_id`, `tier`, `mount_path`) |
-| `dtfs_data_disk_used_bytes` | Gauge | Per-disk used capacity |
-| `dtfs_data_disk_status` | Gauge | Per-disk status (1=healthy, 0=other) |
-| `dtfs_scrub_last_duration_seconds` | Gauge | Duration of last scrub |
-| `dtfs_scrub_chunks_checked_total` | Counter | Chunks checked across all scrubs |
-| `dtfs_scrub_chunks_corrupt_total` | Counter | Corrupt chunks found |
-| `dtfs_scrub_running` | Gauge | 1 if a scrub is currently running |
+| `dtfs_files_total` | gauge | Files tracked |
+| `dtfs_chunks_total` | gauge | Chunk-location entries (replicas), not unique chunks |
+| `dtfs_volumes_total` | gauge | Configured volumes |
+| `dtfs_nodes_healthy` | gauge | Nodes in `Healthy` state (data nodes, managers registered in the node table, clients) |
+| `dtfs_nodes_suspect` | gauge | Nodes `Suspect` |
+| `dtfs_nodes_down` | gauge | Nodes `Down` |
+| `dtfs_nodes_quarantined` | gauge | Nodes `Quarantined` after an integrity fault |
+| `dtfs_cluster_capacity_bytes` | gauge | Total capacity reported by nodes |
+| `dtfs_cluster_used_bytes` | gauge | Used capacity |
+| `dtfs_write_leases_active` | gauge | Held single-writer leases |
+| `dtfs_anchor_protected_total` | counter | Tiering decisions refused to protect the anchor |
+| `dtfs_tier_migrations_completed_total` | counter | Promote and demote events in the in-memory audit ring |
+| `dtfs_migration_failed_total` | counter | Migration tasks that exhausted retries (audit ring) |
+| `dtfs_audit_log_in_memory` | gauge | Entries in the capped audit ring |
+
+The last three counters are derived from a bounded audit ring, so they can drop
+when old entries are evicted; alert on `increase()` over short windows, not on
+absolute values. A node in `Maintenance` is counted in none of the node gauges.
+Anything else (Raft lag, per-disk usage, scrub results) comes from the REST
+endpoints above or `GET /api/v1/stats`.
 
 ## Node Health Monitoring
 
@@ -126,7 +87,7 @@ The manager tracks data node health through periodic heartbeats:
 | Configuration | Default | Description |
 |---------------|---------|-------------|
 | `monitoring.heartbeat_interval_secs` | 5 | Heartbeat interval |
-| `monitoring.suspect_after_missed` | 3 | Missed heartbeats before node becomes suspect (15s default) |
+| `monitoring.suspect_after_missed` | 3 | Missed heartbeats before a node becomes suspect (15 s with defaults) |
 | `monitoring.down_after_missed` | 6 | Missed heartbeats before node is marked down (30s default) |
 
 ### Health State Transitions
@@ -138,35 +99,23 @@ Suspect -> Down    (after 6 total missed heartbeats)
 Down    -> Healthy (node restarts and heartbeats resume)
 ```
 
+Operator-set `Maintenance` and `Quarantined` (and `Draining`) are sticky: the monitor never marks such a node `Down`, and a heartbeat does not clear them. Only data nodes are tracked by the monitor.
+
 When a node transitions to `Down`, the manager begins re-replicating its chunks to maintain the configured replication factor.
 
 ## Key Dashboards
 
-### Cluster Overview Dashboard
+Grafana panels worth building on the manager metrics and a small JSON poller of the
+REST endpoints:
 
-Recommended panels for a Grafana cluster overview:
-
-- **Cluster capacity** -- Stacked gauge of total vs. used capacity.
-- **Node health** -- Table of all nodes with color-coded health status.
-- **File count** -- Time series of total files.
-- **Throughput** -- Aggregate read/write bytes per second across all data nodes.
-- **Cache hit ratio** -- Per-node cache effectiveness.
-
-### Per-Node Dashboard
-
-- **Disk utilization** -- Per-disk capacity bars.
-- **I/O rates** -- Reads/writes per second.
-- **Cache performance** -- Hit ratio, T1/T2 sizes.
-- **Scrub status** -- One card per node and scrub level (quick / deep):
-  completion time, duration, and chunks checked / healthy / corrupt /
-  missing. Quick and deep results are listed separately so the latest of
-  each level is always visible.
-
-### Raft Dashboard
-
-- **Leader status** -- Which node is the current leader.
-- **Log lag** -- Difference between committed and applied index.
-- **Term changes** -- Rate of elections (should be rare in a healthy cluster).
+- **Cluster:** capacity used vs total, node health gauges, files and replicas,
+  `anchor_pending`, `files_missing_chunks`.
+- **Per node** (from `/api/v1/nodes` or `/api/v1/stats`): disk usage per disk,
+  bytes read and written, last scrub result per level.
+- **Raft:** which manager is leader (`/api/v1/raft/state`), `applied_log_lag`,
+  term changes (rare in a healthy cluster), per-peer replication lag.
+- **Host level (not DTFS):** disk SMART, free space, memory vs the systemd
+  `MemoryMax` of each role, clock offset.
 
 ## Alerting Integration
 
@@ -174,8 +123,7 @@ See [Alerting](./alerting.md) for configuring alerts based on these metrics. Com
 
 - Node health transitions (Healthy -> Suspect -> Down).
 - Disk capacity exceeding 80% or 90%.
-- Scrub discovering corrupt chunks.
-- Cache hit ratio dropping below a threshold.
+- Scrub discovering corrupt chunks (a quarantined node: `dtfs_nodes_quarantined > 0`).
 - Raft leader changes (flapping).
 
 ## WebUI
@@ -191,11 +139,8 @@ Access the WebUI at `http://<manager>:9402/` in a web browser.
 
 ## Log Monitoring
 
-DTFS uses structured logging via the `tracing` framework. Logs are output in JSON format when configured:
-
-```toml
-# In manager.toml or data.toml (environment variable)
-RUST_LOG=dtfs_manager=info,dtfs_raft=info
-```
-
-JSON log output can be ingested by log aggregation systems such as Elasticsearch, Loki, or Splunk for centralized monitoring.
+The daemons log through `tracing` in the default text format to stdout, so under
+systemd the logs are in the journal (`journalctl -u dtfs-manager -u dtfs-data`).
+Verbosity is set with `RUST_LOG` (units default to `dtfs=info`; override in a
+drop-in). JSON output is not implemented in this revision, see
+[Log Shipping](./log-shipping.md).

@@ -10,9 +10,15 @@ on it directly:
 | Audit log | Timestamps on every mutation event |
 | Tiering engine | Hot/cold classification uses "days since last access" |
 | Scrub scheduler | Interval calculations for quick/deep scrub cycles |
-| JWT authentication | Token expiry checked against current time |
+| HMAC request stamps | Stamped RPCs and mutating REST calls carry a timestamp; more than 300 s of skew is rejected |
 | Heartbeat monitoring | Suspect/down thresholds measured in wall-clock seconds |
 
+> **Hard limit:** every HMAC-stamped RPC (mutating data-plane calls, mutating
+> manager calls, and Raft RPCs when `cluster.require_raft_auth = true`) is
+> rejected when the sender's clock differs from the receiver's by more than
+> 300 seconds. Beyond that skew nodes cannot register, heartbeat or replicate,
+> and they show up as `Down`.
+>
 > **Rule of thumb:** Keep all nodes within **100 ms** of each other.
 > Raft tolerates moderate clock skew (it uses logical clocks internally),
 > but audit timestamps, tiering decisions, and token expiry all use wall time.
@@ -137,7 +143,7 @@ Add this alert to your alerting rules to catch clock drift early:
     summary: "Critical clock skew on {{ $labels.instance }}"
     description: >
       Clock offset of {{ $value | humanizeDuration }} detected.
-      Raft election timeouts and JWT token validation may malfunction.
+      Raft election timeouts and HMAC request validation may malfunction.
 ```
 
 This requires the `node_exporter` with `--collector.ntp` enabled (or the
@@ -181,9 +187,9 @@ precautions:
 |---|---|
 | < 100 ms | No practical impact |
 | 100 ms – 1 s | Audit timestamps inaccurate; tiering intervals slightly off |
-| 1 s – 30 s | JWT tokens may expire prematurely or be accepted too long; heartbeat false-positives possible |
+| 1 s – 30 s | Heartbeat false-positives possible; audit ordering across managers is off |
 | > 30 s | Raft election stability may degrade; scrub scheduler drift; cold-tier migration triggered at wrong times |
-| > 300 s | `min_replicas_before_ack` write-safety timeouts may fire spuriously |
+| > 300 s | Stamped RPCs are rejected outright: nodes cannot register, heartbeat or replicate (and Raft RPCs once `require_raft_auth = true`); they appear `Down` |
 
 ---
 

@@ -228,7 +228,7 @@ regardless.
 ## See also
 
 - [Release testing](./release-testing.md) — the full release gate and its env.
-- [Failure Scenarios](./failure-scenarios.md) — the behaviours these cases
+- [Failure Scenarios](../operations/failure-scenarios.md) — the behaviours these cases
   exercise.
 
 ## Design notes (from the 2026-06 chaos-suite work)

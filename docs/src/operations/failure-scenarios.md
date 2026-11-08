@@ -44,8 +44,10 @@ warm/cold backfill.
 **Recovery (node comes back).** The data node re-registers via the
 join protocol on startup. The manager flips its status back to
 `Healthy` on the next heartbeat. Chunks that were already
-re-replicated elsewhere are not deleted from the returning node — the
-scrub + GC pass reconciles ownership later.
+re-replicated elsewhere are not deleted from the returning node at once: its
+replicas count as live again, replicas above the goal are removed by the
+scheduler's excess-removal pass, and chunks no file references any more by the
+orphan reaper after its grace period.
 
 See also: [Cluster Management](./cluster-management.md),
 [Replication](../storage/replication.md).
@@ -56,8 +58,9 @@ See also: [Cluster Management](./cluster-management.md),
 
 **SMART monitoring.** Each data node polls disk health and includes
 `DiskStatus` (`Healthy`, `Degraded`, `Failed`) in its heartbeats. A
-disk transitioning to `Degraded` or `Failed` raises a manager alert
-(`crates/dtfs-manager/src/monitor.rs::check_disk_health`).
+disk transitioning to `Degraded` or `Failed` is logged by the manager as a
+"SMART warning/alert" (`crates/dtfs-manager/src/monitor.rs::check_disk_health`);
+there is no webhook for it yet ([Alerting](./alerting.md)).
 
 **Read returns I/O error from the kernel.** The data server reports
 the failed read back to the client, which falls back to the next
@@ -67,18 +70,21 @@ on that disk.
 **Scrub catches silent corruption.** The scrub scheduler computes
 BLAKE3 over the on-disk `.dat` file and compares to
 `ChunkMeta.checksum`. A mismatch quarantines the bad chunk on the
-local disk, enqueues a manager-side `ReplicationTask` to repair from a
-healthy replica, and fires the `ScrubCorruption` alert.
+local disk (the file is renamed into `.dtfs/quarantine/`, never deleted),
+reports the fault to the manager, and the repair scheduler re-creates the
+replica from a healthy copy. With `[scrub] quarantine_on_fault = true` (the
+default) the node also self-quarantines until an operator runs
+`dtfs-cli unquarantine`; with `false` the fault is recorded and reported but the
+node keeps serving.
 
 **Auto-repair.** The scheduler uses `replicate_chunk` to copy a clean
 replica onto a different disk (or different node, if the failed disk
-is the only one on the host). The original quarantined file is kept
-until the new replica is verified, then GC'd.
+is the only one on the host). The quarantined `.dat.bad` file stays in
+`.dtfs/quarantine/` for the operator; DTFS does not delete it.
 
-**Marking a disk failed manually.** Operators can mark a disk failed
-via the data node admin RPC; the node stops accepting writes to that
-disk and reports it as `Failed` in its next heartbeat. The manager
-then schedules re-replication for every chunk that lived on it.
+**Disk marked failed.** A disk the node reports as `Failed` stops
+counting as a live replica location and is excluded from placement; the
+manager then re-creates the affected mandatory replicas from other copies.
 
 See also: [Disk Management](./disk-management.md),
 [Scrubbing](../storage/scrubbing.md).
@@ -123,7 +129,7 @@ cannot be created and metadata cannot be read.
 - Every chunk is committed via `tmp + atomic rename` (no torn writes).
 - Every metadata mutation was Raft-replicated and fsynced before
   acknowledgement, and is stored in each manager's local Raft log and
-  the latest snapshot under `/var/lib/dtfs-manager/`.
+  the latest snapshot under `/var/lib/dtfs/manager/`.
 - The anchor invariant means every chunk has at least one copy on the
   LELI `data-primary01` archive, so even if every other DC is wiped
   the data exists.

@@ -61,76 +61,52 @@ The build honours `CARGO_TARGET_DIR` (exported from `DTFS_CI_TARGET_DIR`);
 `dtfs-build.sh` and `dtfs-release.sh` write their output under it, default
 `target/`.
 
-## Rolling update order
+## Rolling update
 
-`deploy/ansible/update-cluster.yml` reads `/api/v1/raft/state` from every
-manager first and refuses to start if a manager is unreachable or the
-cluster has no single leader. It then updates one node at a time, each
-followed by a health wait and a settle delay:
-
-1. managers: learners, then follower voters, then the leader last. Wait:
-   REST port up, `running_state == ok`, a leader known.
-2. data nodes. Wait: the leader's `/api/v1/nodes` lists the node as
-   `Healthy` with the new version.
-3. FUSE clients (`dtfs-fuse@<mount>.service`). Wait: the mount point is
-   back.
-
-After each node the installed binary must report the new version stamp.
-Binaries are installed to `/usr/local/bin`; the previous file is kept as
-`<bin>.prev` (one copy, overwritten by the next update, never piling up).
-A node already running `dtfs_version` with an active service is skipped, so
-a failed run can simply be re-run. A failed wait stops the run at that node;
-the nodes before it stay on the new version, the ones after it on the old
-one. The final task runs the same health check the `verify` stage repeats.
+`deploy` runs `deploy/ansible/update-cluster.yml`: preflight on the control host,
+then one node at a time (managers learners-first and leader last, then data nodes,
+then clients), each with a health gate and a settle delay, then
+`scripts/dtfs-cluster-healthcheck.sh`. A node already on the target version with an
+active service is skipped, so a failed run can be re-run. The previous binary is
+kept as `<bin>.prev`. The exact steps, health conditions, rollback, the extra
+checks an Ansible role should add, and the config flips that must follow an update
+(`require_raft_auth` and others) are in
+[Rolling Update and Rollback](../deployment/rolling-update.md); the playbook's
+variables are in [Role Variables and Idempotency](../deployment/role-variables.md).
 
 Run it by hand:
 
 ```bash
-ansible-playbook -i /etc/dtfs-ci/inventory.yml deploy/ansible/update-cluster.yml \
-    -e dtfs_tarball=target/release-artifacts/v0.2.0/dtfs-linux-amd64.tar.gz \
-    -e dtfs_version=v0.2.0 -e dtfs_restart_delay_secs=30
+ansible-playbook -i /etc/dtfs-ci/inventory.yml deploy/ansible/update-cluster.yml     -e dtfs_tarball=target/release-artifacts/v0.2.0/dtfs-linux-amd64.tar.gz     -e dtfs_version=v0.2.0 -e dtfs_restart_delay_secs=30
 ```
-
-### Playbook inputs
-
-The playbook has no DTFS-host assumptions beyond the three roles, so it can
-be included from a larger Ansible repository. Override with `-e`:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `dtfs_version` | required | Expected `dtfs-* --version` stamp, e.g. `v0.2.0`. |
-| `dtfs_tarball` | | Path on the control host to `dtfs-linux-amd64.tar.gz`. |
-| `dtfs_tarball_url` / `dtfs_repo_token` | | Alternative to `dtfs_tarball`: download URL (Generic Package Registry) and optional GitLab token (`gldt-` deploy token or access token). |
-| `dtfs_group_managers` / `dtfs_group_data_nodes` / `dtfs_group_clients` | `managers` / `data_nodes` / `clients` | Inventory group per role; data and client groups may be absent. |
-| `dtfs_api_port` | `9402` | Manager REST port (per-host `dtfs_api_port` wins). |
-| `dtfs_bin_dir` | `/usr/local/bin` | Binary install dir (per-host `dtfs_bin_dir` wins). |
-| `dtfs_restart_delay_secs` | `30` | Settle pause after each updated node. |
-| `dtfs_health_timeout_secs` | `300` | Per-node and final health-wait budget. |
-| `dtfs_force_update` | `false` | Reinstall and restart even if already on `dtfs_version`. |
-| `dtfs_run_healthcheck` | `true` | Run `scripts/dtfs-cluster-healthcheck.sh` at the end (needs the repo's `scripts/` next to the playbook). |
-
-Per-host inventory variables: `ansible_host` (required), `dtfs_hostname`
-(identity registered with the managers, default the inventory name),
-`dtfs_mount_point` (clients). The per-node tasks live in
-`deploy/ansible/tasks/update-node.yml` and are included with `node` and
-`role` (`manager`, `data`, `client`).
 
 ### Recovering from a failed rollout
 
-1. Stuck or unhealthy node: fix or inspect it, then re-run the same
-   command; completed nodes are skipped.
-2. Roll a node back: on the node, `cp -p /usr/local/bin/<bin>.prev
-   /usr/local/bin/<bin>` for each binary of its role (`dtfs-manager`,
-   `dtfs-data` or `dtfs-fuse`, and `dtfs-cli`) and `systemctl restart` the
-   unit. Roll back in the reverse order (clients, data nodes, followers,
-   leader).
-3. Withdraw the release: the `release` job runs before the rollout, so a
-   failed deploy leaves it as `latest`. Run the manual job `yank:release`
-   in the pipeline (or `scripts/ci/gitlab-yank.sh <version>` in a job).
-   It deletes the GitLab release object only; the tag and packages stay and
-   the version number is burnt, so ship the fix as the next version.
-   Needs `DTFS_RELEASE_API_TOKEN` (project access token, scope `api`,
-   Maintainer) unless the instance lets job tokens delete releases.
+1. Stuck or unhealthy node: fix or inspect it, then re-run the same command;
+   completed nodes are skipped.
+2. Roll a node back from its `<bin>.prev` copies, in reverse update order
+   ([Rollback](../deployment/rolling-update.md#rollback)).
+3. Withdraw the release: the `release` job runs before the rollout, so a failed
+   deploy leaves it as `latest`. Run the manual job `yank:release` in the pipeline
+   (or `scripts/ci/gitlab-yank.sh <version>` in a job). It deletes the GitLab
+   release object only; the tag and packages stay and the version number is
+   burnt, so ship the fix as the next version. Needs `DTFS_RELEASE_API_TOKEN`
+   (project access token, scope `api`, Maintainer) unless the instance lets job
+   tokens delete releases.
+
+## Documentation job
+
+Job `pages` (stage `build`, independent of the test and release chain) builds this
+book with `scripts/build-docs.sh --clean` on every push to the default branch
+that touches `docs/**`, `scripts/build-docs.sh` or `scripts/check-docs-links.py`,
+and on a manually started pipeline. The script runs a Markdown link check (broken
+relative links, pages missing from `SUMMARY.md` fail the job), downloads the pinned
+mdBook release binary once into `~/.cache/dtfs/mdbook` (sha256-verified), builds
+`docs/book/` and the job copies it to `public/`, which GitLab publishes as Pages
+and keeps as the `dtfs-docs` artifact for four weeks. `site-url` is derived from
+`CI_PAGES_URL` so the 404 page resolves under the project sub-path. Build locally
+with `./scripts/build-docs.sh` (see the script header for the Docker fallback on
+non-Linux hosts). GitLab Pages must be enabled for the project.
 
 ## Runner prerequisites
 
@@ -141,7 +117,8 @@ On the builder host:
   (the same set as `docker/buildenv.Dockerfile`).
 - `ansible-core` (the playbook uses only `ansible.builtin` modules),
   `curl`, `jq`, `git-cliff` (optional; without it the release notes fall
-  back to a one-line description).
+  back to a one-line description), and for the `pages` job `python3`, `tar`
+  and `sha256sum`, plus outbound HTTPS to github.com once to fetch mdBook.
 - SSH access as `root` to every cluster host with the key named in the
   inventory (`ansible_ssh_private_key_file`). Ansible runs remote tasks
   as root directly; there is no sudo/become. Only the preflight and the
@@ -188,20 +165,16 @@ public key (the second line of `dtfs-release.pub`) into the consumers'
 ## Health check
 
 `scripts/dtfs-cluster-healthcheck.sh --managers <list> [--expect-version V]
-[--min-data-nodes N] [--timeout S]` polls until every listed manager
-reports `running_state == ok` and the same leader, the leader's
-`/api/v1/cluster/status` is `ok` with every data node healthy and no
-file missing chunks, and (with `--expect-version`) every node that
-reports a version reports `V`. Exit 0 healthy, 1 unhealthy after the
-timeout, 3 bad arguments. Read-only; needs no shared secret.
+[--min-data-nodes N] [--timeout S]` is the post-deploy gate used by the playbook's
+last task and the `verify` stage; what it asserts is listed in
+[Rolling Update](../deployment/rolling-update.md#per-node-procedure). Exit 0
+healthy, 1 unhealthy after the timeout, 3 bad arguments. Read-only; needs no
+shared secret, only `curl` and `jq`.
 
 ## Version stamps
 
 Alpha versions look like `v0.1.9_202609131530`. `dtfs-cli update` and
-`dtfs-install.sh --source remote` resolve `latest` to the newest full
-`vX.Y.Z` release and skip alphas; an alpha installs only when named with
-`--tag`/`--version`. Both read the tarball from the Generic Package
-Registry the `release` stage uploads to
-(`<repo_url>/api/v4/projects/<group>%2F<project>/packages/generic/dtfs/<tag>/`),
-authenticated with `[updater].token` / `DTFS_REPO_TOKEN` on a private
-project (deploy token, scope `read_package_registry`).
+`dtfs-install.sh --source remote` resolve `latest` to the newest full `vX.Y.Z`
+release and skip alphas; an alpha installs only when named with `--tag` or
+`--version`. Naming, package URLs, tokens and verification are specified in
+[Release Artifacts](../deployment/artifacts.md).

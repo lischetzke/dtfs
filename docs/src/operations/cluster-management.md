@@ -7,9 +7,10 @@ This chapter covers adding, removing, and managing Manager and Data nodes in a D
 A DTFS cluster consists of two node types:
 
 - **Manager nodes** -- Maintain cluster metadata, run Raft consensus, handle file namespace operations, and coordinate placement decisions.
-- **Data nodes** -- Store chunks on XFS-formatted disks, serve read/write requests, and report status via heartbeats.
+- **Data nodes** -- Store chunks on local disks (XFS recommended), serve read/write requests, and report status via heartbeats.
+- **FUSE clients** -- Mount the filesystem; they register under their `[location].host` and appear in the node table with role `Client`.
 
-Manager nodes form a Raft group. An odd number (3, 5, or 7) is recommended for fault tolerance. Data nodes are stateless from a consensus perspective; they register with the manager and maintain their state locally on disk.
+Manager nodes form a Raft group. An odd number (3, 5, or 7) is recommended for fault tolerance. Data nodes are not part of consensus; they register with a manager (shared secret in the request) and keep their chunks and identity files locally on disk. An automation-oriented version of the procedures below, with the checks after each step, is in [Deployment automation](../deployment/overview.md).
 
 ## Adding a Manager Node
 
@@ -130,7 +131,7 @@ add a replacement via add-learner/promote.
 ### Prerequisites
 
 1. `dtfs-data` is installed with a valid configuration at `/etc/dtfs/data.toml`.
-2. One or more XFS-formatted disks are mounted and listed in the `[[disks]]` configuration sections.
+2. One or more disks are mounted (by UUID), owned by `dtfs`, and listed in the `[[disks]]` configuration sections. The list is append-only, see [Disk Management](./disk-management.md#disk-ids-and-disks-order).
 3. The `shared_secret` matches the cluster.
 
 ### Procedure
@@ -158,9 +159,9 @@ systemctl start dtfs-data
 ```
 
 3. The data node:
-   - Performs the cluster join protocol against the manager.
-   - Sends a `RegisterNode` RPC with its hostname, location, and disk inventory.
-   - Begins periodic heartbeats (default every 5 seconds).
+   - Replays its write-ahead log, binds its gRPC port, and sends a `RegisterNode` RPC (hostname, location, disk inventory, authenticated with the shared secret) to the first reachable manager in `manager_addr` / `manager_addrs`.
+   - Begins periodic heartbeats (every 5 seconds). After 3 failed heartbeats it walks the manager list, and it re-registers when a manager answers NOT_FOUND.
+   - Rescans its chunks in the background after startup, so the port is open before the inventory walk finishes.
 
 4. The manager records the new node in the Raft state machine, making it available for chunk placement.
 
@@ -170,7 +171,7 @@ systemctl start dtfs-data
 dtfs-cli nodes
 ```
 
-The new node should appear with `Healthy` status within a few heartbeat intervals.
+The new node should appear with `Healthy` status within a few heartbeat intervals and its `disk_count` should equal the number of `[[disks]]` entries.
 
 ### Location Configuration
 
@@ -190,34 +191,32 @@ The placement engine uses this information for location-aware replica distributi
 
 ### Graceful Decommission
 
-1. Place the node in maintenance mode to stop new chunk placements and begin draining:
+There is no one-shot drain. Removal is: make sure every chunk on the node has
+other live replicas, stop the node, then deregister it.
 
-```bash
-dtfs-cli maintenance <node-id> --enable
-```
+1. Put the node in maintenance mode so it is not marked `Down` and receives no new
+   placements (this does not move data):
 
-2. The manager initiates replication of all chunks on the node to other data nodes with matching tier capacity. Monitor progress:
+   ```bash
+   dtfs-cli --secret "$DTFS_SHARED_SECRET" maintenance <node-id> --enable
+   ```
 
-```bash
-dtfs-cli nodes --id <node-id>
-```
+2. Ensure its data is replicated elsewhere (volume replication policy plus
+   `dtfs-cli migrations create`, see [Migration](../storage/migration.md)), and never
+   remove the only node holding a chunk's anchor replica.
+3. Stop and disable the service: `systemctl disable --now dtfs-data`.
+4. Deregister: `dtfs-cli decommission <node-id> --operator-id <who> --reason "<why>"`.
+   The server answers 409 while any file still lists a replica on the node.
 
-3. Once draining is complete (all chunks have been replicated elsewhere), stop the process:
-
-```bash
-systemctl stop dtfs-data
-```
-
-4. The manager marks the node as removed after it stops heartbeating.
-
-See [Maintenance Mode](./maintenance-mode.md) for more details on the draining process.
+Details and the disk and manager variants: [Decommission and Replace](../deployment/decommission-replace.md).
+See [Maintenance Mode](./maintenance-mode.md) for exactly what the flag does.
 
 ### Forced Removal
 
 If a data node has failed unrecoverably:
 
-1. The manager detects the failure after `down_after_missed` missed heartbeats.
-2. The scheduler automatically re-replicates under-replicated chunks from remaining replicas to healthy nodes.
+1. The manager marks the node `Suspect` and then `Down` after `suspect_after_missed` and `down_after_missed` missed heartbeats (15 s and 30 s by default).
+2. The scheduler re-creates the missing mandatory replicas from remaining live replicas on healthy nodes. Replicas on a `Down` node do not count as live.
 3. Data availability depends on the replication factor. With the default hot replication factor of 3, the cluster can tolerate one data node failure with no data loss.
 
 ## Monitoring Cluster Membership
@@ -251,9 +250,10 @@ dtfs-cli health          # Quick manager health check
 | `Healthy` | Node is heartbeating normally. |
 | `Suspect` | Node has missed `suspect_after_missed` heartbeats (default: 3). |
 | `Down` | Node has missed `down_after_missed` heartbeats (default: 6). Re-replication begins. |
-| `Maintenance` | Operator placed the node in maintenance mode. No new placements; draining in progress. |
-| `Draining` | Active chunk evacuation underway. |
-| `Failed` | Permanent failure recorded. Node will not recover. |
+| `Maintenance` | Operator flag (sticky). No new placements, never auto-marked `Down`; no data is moved. |
+| `Quarantined` | An integrity fault quarantined the node (sticky; `dtfs-cli unquarantine` after the cause is understood). |
+| `Degraded` / `Failed` | Derived from disk health reported by the node. |
+| `Draining` | Defined but not set by any operator API or scheduler path in this revision. |
 
 ## Reclaiming warm cache space (Bug AV flush)
 
@@ -387,17 +387,16 @@ For details on the planner's refusal logic, see
 ## Rolling Upgrades
 
 The GitLab pipeline does this for every `release`/`deploy` commit via
-`deploy/ansible/update-cluster.yml` (see [CI Pipeline](./ci-pipeline.md)).
-The order it implements, and the order to follow by hand:
-
-1. Manager nodes one at a time: learners first, then follower voters, the Raft leader last. After each restart wait until the node's `/api/v1/raft/state` reports `running_state: ok` and a known leader.
-2. Data nodes one at a time. Wait until the leader's `/api/v1/nodes` shows the node `Healthy` on the new version. Maintenance mode is not required for a plain binary restart; use it for work that keeps the node down longer than the liveness window.
-3. FUSE clients last. They reconnect to managers automatically; wait until the mount point is back.
+`deploy/ansible/update-cluster.yml` ([CI Pipeline](./ci-pipeline.md)). The order
+(managers: learners, follower voters, leader last; then data nodes; then clients),
+the per-node steps, health gates, rollback and the config flips that must wait
+until every manager is updated are specified in
+[Rolling Update and Rollback](../deployment/rolling-update.md).
 
 ## Best Practices
 
 - Run 3 or 5 manager nodes. Three is sufficient for most deployments; five is recommended for large clusters or multi-datacenter setups.
 - Spread manager nodes across failure domains (racks or datacenters) to survive localized outages.
-- Do not co-locate manager and data node roles on the same host in production. Managers should have low, predictable latency for Raft consensus.
+- Co-locating roles on one host is supported (the reference deployment does it) but each daemon needs its own hostname and its own memory budget; see [Filesystem Layout and Units](../deployment/filesystem-layout.md#memory-limits-on-co-hosted-boxes). Keep the Raft voters on hosts with low, predictable latency to each other.
 - Always verify quorum health before removing any manager node.
 - When adding data nodes, allow time for the placement engine to begin distributing new writes before decommissioning old nodes.

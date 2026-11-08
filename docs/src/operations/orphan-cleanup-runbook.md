@@ -1,5 +1,13 @@
 # Orphan-chunk cleanup runbook (Bug BC / BF-13)
 
+Deleting a file (`unlink`/`rm` through FUSE, or the delete RPC) removes only its
+metadata. DTFS deliberately has no immediate chunk delete: a content-identical
+re-upload can land its bytes before its metadata commit, so an eager "nobody
+references this chunk" check would race it. The orphan reaper below is therefore
+the only thing that frees the space of deleted files, once each chunk's on-disk
+`.dat` is older than `orphan_grace_secs`. Expect space to come back one to two
+days after a bulk delete with the default cadence (Option B shortens that).
+
 `orphan_scrub` (Bug BC-7) reaps chunks present on disk but not in
 `state_machine.chunk_locations`. Default cadence is conservative
 (`orphan_interval_secs = 86400` = 1 d, `orphan_grace_secs = 86400` =
@@ -58,7 +66,7 @@ pane, observe the reap audit lines, then restore defaults.
 
 4. **Verify disk usage matches expectations**:
    ```
-   ssh debian@<data-node> "du -sh /mnt/*-*/chunks"
+   ssh root@<data-node> "du -sh <mount>/chunks"   # one per [[disks]] path
    ```
    Compare against `logical_bytes × replication_factor` from
    `/api/v1/stats`. After full drain, on-disk should be within

@@ -1,8 +1,10 @@
 # Log Shipping (Filebeat → Elastic)
 
-This guide is a **worked example** for shipping DTFS logs from every cluster node to an Elastic Stack (Elasticsearch + Kibana) using Filebeat as the on-node agent. It is tuned for the multi-DC Plexmedia topology described in [CLAUDE.md § A.1.1](../../../CLAUDE.md) — bandwidth-asymmetric DCs where naive log shipping can saturate the 40 Mbps LELI uplink during an incident.
+This guide is a **worked example** for shipping DTFS logs from every cluster node to an Elastic Stack (Elasticsearch + Kibana) using Filebeat as the on-node agent. It is tuned for the multi-DC Plexmedia topology (LELI at 40 Mbps, TORO at 400 Mbps, NRB at 1 Gbps) — bandwidth-asymmetric DCs where naive log shipping can saturate the 40 Mbps LELI uplink during an incident.
 
-Adapt the version numbers, hostnames, and credentials to your environment. Tested with Elastic Stack 8.13 and Filebeat 8.13.
+Adapt the version numbers, hostnames, and credentials to your environment. Written against Elastic Stack 8.13 and Filebeat 8.13; not exercised against this DTFS revision (there is no lab).
+
+> **JSON logging is not implemented in this revision.** The daemons initialise `tracing_subscriber::fmt()` with the default text formatter and nothing reads `DTFS_LOG_FORMAT`; the `json` cargo feature is compiled in but never selected. Every step below that parses JSON (`decode_json_fields`, the `dtfs.*` field mappings) needs either a code change that selects the JSON formatter or a Filebeat `dissect`/`grok` processor over the text lines. Treat the pipeline as a template and verify the first events before relying on it.
 
 ## Architecture
 
@@ -37,7 +39,7 @@ Each DTFS node runs its own Filebeat. The agent reads only the DTFS systemd unit
 
 - **Elastic Stack 8.x** (Elasticsearch + Kibana). 8.13+ recommended for ECS 8 mappings.
 - **Filebeat 8.x**, matching your Elasticsearch major version.
-- **Network**: outbound TCP 9200 (ES direct) or 5044 (via Logstash) from each DTFS node to the Elastic cluster. Add this to your shaping exemption list alongside SSH/22, manager gRPC/9401, manager API/9402, data gRPC/9500, NTP/123 (CLAUDE.md § A.7) — otherwise Filebeat backoff will mask real incidents.
+- **Network**: outbound TCP 9200 (ES direct) or 5044 (via Logstash) from each DTFS node to the Elastic cluster. Add this to your shaping exemption list alongside SSH/22, manager gRPC/9401, manager API/9402, data gRPC/9500, NTP/123 — otherwise Filebeat backoff will mask real incidents.
 - **Disk**: ~1 GB per node for Filebeat's local queue (see § Bandwidth and noise control).
 - **Credentials**: a dedicated `filebeat_writer` Elasticsearch role with `create_doc` on `filebeat-dtfs-*` and `monitor` on the cluster. Do not reuse the superuser.
 
@@ -45,7 +47,7 @@ For multi-DC deployments with the Plexmedia profile, prefer a per-DC ingest path
 
 ## Step 1 — Configure DTFS to emit JSON logs
 
-DTFS components use `tracing-subscriber` with the `json` feature enabled (see workspace `Cargo.toml`). Switch your binaries to JSON output via a systemd drop-in so the change survives package upgrades.
+DTFS components use `tracing-subscriber` with the `json` feature enabled (see workspace `Cargo.toml`). Set the log level through a systemd drop-in so the change survives package upgrades. The `DTFS_LOG_FORMAT=json` lines below are accepted by systemd but ignored by the daemons in this revision (see the note at the top).
 
 Create the drop-in for each role:
 
@@ -64,7 +66,7 @@ Environment="DTFS_LOG_FORMAT=json"
 ```
 
 ```ini
-# /etc/systemd/system/dtfs-fuse.service.d/logging.conf
+# /etc/systemd/system/dtfs-fuse@.service.d/logging.conf
 [Service]
 Environment="RUST_LOG=info,dtfs_fuse=info"
 Environment="DTFS_LOG_FORMAT=json"
@@ -123,7 +125,7 @@ filebeat.inputs:
     include_matches.match:
       - _SYSTEMD_UNIT=dtfs-manager.service
       - _SYSTEMD_UNIT=dtfs-data.service
-      - _SYSTEMD_UNIT=dtfs-fuse.service
+      - _SYSTEMD_UNIT=dtfs-fuse@mnt-dtfs.service   # instance name = systemd-escape --path <mountpoint>
     fields:
       log_source: dtfs
     fields_under_root: true
@@ -367,4 +369,3 @@ These knobs all matter most for LELI. Apply selectively:
 - [Monitoring](monitoring.md) — Prometheus metrics scrape (complement to log shipping).
 - [Alerting](alerting.md) — alert rules; consider adding log-derived alerts for the saved searches above.
 - [Troubleshooting](troubleshooting.md) — on-cluster diagnostic commands that complement centralised logs.
-- [CLAUDE.md § A.7](../../../CLAUDE.md) — DTFS bandwidth-shaping and port exemption rules.

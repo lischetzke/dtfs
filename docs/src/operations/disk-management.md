@@ -1,26 +1,28 @@
 # Disk Management
 
-This chapter covers adding, removing, and replacing disks on DTFS Data nodes, as well as tier assignment.
+This chapter covers disks on DTFS data nodes: the disk model, tiers, adding,
+replacing and retiring disks, and monitoring. The step-by-step procedures with
+their checks are in [Decommission and Replace](../deployment/decommission-replace.md).
 
 ## Disk Model
 
-Each Data node manages one or more locally-mounted disks. Disks are XFS-formatted filesystems where chunks are stored in a two-level directory structure based on the BLAKE3 content hash prefix (e.g., `/mnt/ssd-a/ab/cd/<chunk_hex>`).
-
-Every disk has the following properties tracked by the cluster:
+Each data node manages one or more locally mounted filesystems. Chunks are stored
+under `<mount>/chunks/<2 hex>/<2 hex>/<chunk_hex>.dat` (with a `.meta` file next
+to it), in-flight writes under `<mount>/tmp/`, write-ahead markers under
+`<mount>/.dtfs/wal/`, and quarantined chunks under `<mount>/.dtfs/quarantine/`.
 
 | Property | Description |
 |----------|-------------|
-| `disk_id` | Numeric identifier, unique per node. |
-| `uuid` | Persistent UUID for the disk (survives re-ordering). |
-| `mount_path` | Filesystem mount point (e.g., `/mnt/ssd-a`). |
-| `tier` | Storage tier: `hot`, `warm`, or `cold`. |
-| `total_bytes` | Total capacity. |
-| `used_bytes` | Current usage. |
-| `status` | One of: `healthy`, `degraded`, `draining`, `failed`, `removed`. |
+| `disk_id` | The disk's 0-based position in `[[disks]]`, persisted in `<mount>/.dtfs-disk-id`. Replica identity is `(node_id, disk_id)`. |
+| `uuid` | Stable UUID in `<mount>/.dtfs-disk-uuid`, created on first start. |
+| `mount_path` | The configured `path`. |
+| `tier` | `hot`, `warm`, `cold` or `tape`. |
+| `total_bytes` / `used_bytes` | Capacity as reported by the node. |
+| `status` | `healthy`, `degraded`, `draining`, `failed` or `removed`. Operators do not set it: `degraded` and `failed` come from the node's health checks; nothing sets `draining` today. |
 
 ## Tier Assignment
 
-Each disk is assigned to exactly one storage tier in the data node configuration:
+Each disk belongs to exactly one tier:
 
 ```toml
 [[disks]]
@@ -28,175 +30,146 @@ path = "/mnt/nvme-0"
 tier = "hot"
 
 [[disks]]
-path = "/mnt/ssd-a"
-tier = "warm"
-
-[[disks]]
 path = "/mnt/hdd-a"
 tier = "cold"
 ```
 
-### Tier Guidelines
+Typical use: `hot` for NVMe, `warm` for SATA SSD, `cold` for the large HDD archive
+(the anchor copy lives on the cold tier of the anchor datacenter in the reference
+deployment). Tier drives the per-tier replication policy ([Replication](../storage/replication.md))
+and the tiering engine's moves ([Tiering](../storage/tiering.md)).
 
-| Tier | Typical Media | Replication Default | Use Case |
-|------|---------------|--------------------:|----------|
-| `hot` | NVMe SSD | 3 | Frequently accessed data, recent writes |
-| `warm` | SATA SSD | 2 | Moderate access, recent data aging out of hot |
-| `cold` | HDD / high-capacity SSD | 1 | Archival data, infrequently accessed |
+Changing the `tier` of an existing entry keeps its position, so it is safe. The
+`[[disks]]` section is **not** live-reloadable ([Live Reload](../configuration/live-reload.md)):
+edit `/etc/dtfs/data.toml` and restart `dtfs-data`. Existing chunks stay where
+they are; the tiering engine adjusts over time, and `dtfs-cli migrations create
+<prefix> --target-tier T` adds replicas on a tier explicitly.
 
-Tier assignment drives two behaviors:
+## Disk ids and `[[disks]]` order
 
-1. **Replication factor** -- The volume's per-tier replication settings determine how many copies are maintained on each tier. See [Replication](../storage/replication.md).
-2. **Tiering migration** -- The tiering engine moves chunks between tiers based on access temperature. See [Tiering](../storage/tiering.md).
+A disk's `disk_id` is its position (0-based) in the `[[disks]]` list. On first
+start the data node writes it to `<mount>/.dtfs-disk-id`. On later starts it
+**refuses to start** if the disk now sits at a different position (the error
+reads `disk <path> was disk_id N but is now at [[disks]] position M`), because
+renumbering would make the manager attribute chunks to the wrong disk and the
+orphan reaper delete the wrong copies.
 
-### Changing a Disk's Tier
-
-To change the tier of an existing disk:
-
-1. Update the `tier` field in `/etc/dtfs/data.toml`.
-2. The data node detects the configuration change via live reload (see [Live Reload](../configuration/live-reload.md)) and reports the updated disk info to the manager on the next heartbeat.
-3. Existing chunks on the disk are not moved immediately. The tiering engine will gradually migrate them if the chunk temperature does not match the new tier assignment.
-4. To force immediate migration, trigger a manual scrub and tier evaluation:
-
-```bash
-dtfs-cli scrub --disk /mnt/ssd-a --level quick
-```
+Rules: only append new `[[disks]]` entries at the end; never remove or reorder an
+entry in the middle; mount by `UUID=` or `LABEL=` so a device rename cannot swap
+two disks. To retire a disk, make sure its content has other live replicas, then
+replace it in place (same position) with the new disk. A replacement disk starts
+with no `.dtfs-disk-id` and takes the position it is configured at.
 
 ## Adding a Disk
 
-### Procedure
+1. Format and mount it (XFS with `noatime,inode64` is the documented choice; any
+   POSIX filesystem with atomic rename and fsync works), and `chown dtfs:dtfs` the
+   mount point:
 
-1. Physically install the disk and format it with XFS:
+   ```bash
+   mkfs.xfs /dev/sdX
+   mkdir -p /mnt/new-disk
+   echo 'UUID=<uuid> /mnt/new-disk xfs noatime,inode64 0 0' >> /etc/fstab
+   mount /mnt/new-disk && chown dtfs:dtfs /mnt/new-disk
+   ```
 
-```bash
-mkfs.xfs /dev/sdX
-mkdir -p /mnt/new-disk
-mount /dev/sdX /mnt/new-disk
-```
+2. Append it to `/etc/dtfs/data.toml` (at the end):
 
-2. Add the disk to `/etc/dtfs/data.toml`:
+   ```toml
+   [[disks]]
+   path = "/mnt/new-disk"
+   tier = "warm"
+   ```
 
-```toml
-[[disks]]
-path = "/mnt/new-disk"
-tier = "warm"
-```
+3. Add the path to `ReadWritePaths=` (and `RequiresMountsFor=`) in
+   `/etc/systemd/system/dtfs-data.service.d/disks.conf`, `systemctl daemon-reload`,
+   then `systemctl restart dtfs-data`. Without the drop-in the unit's
+   `ProtectSystem=strict` makes the disk read-only to the daemon
+   ([Filesystem Layout](../deployment/filesystem-layout.md#drop-ins)).
+4. Verify with `dtfs-cli nodes --id <node-id>`: the disk appears with `healthy`
+   status and `.dtfs-disk-id` on the new mount equals its position.
 
-3. If the data node is running and live reload is enabled, the new disk is picked up automatically. Otherwise, restart the data node:
+Existing data is not rebalanced. New writes prefer disks with more free space.
 
-```bash
-systemctl restart dtfs-data
-```
+## Removing or retiring a Disk
 
-4. The data node reports the new disk to the manager via the next heartbeat. The manager begins including the disk in placement decisions.
-
-5. Verify:
-
-```bash
-dtfs-cli nodes --id <node-id>
-```
-
-The new disk should appear in the disk list with `healthy` status.
-
-### Filesystem Requirements
-
-- **XFS is required.** DTFS relies on XFS features for efficient file allocation and `O_DIRECT` support.
-- Ensure the mount includes `noatime` for performance:
-
-```
-/dev/sdX /mnt/new-disk xfs noatime,inode64 0 0
-```
-
-### Disk ids and `[[disks]]` order
-
-A disk's `disk_id` is its position (0-based) in the `[[disks]]` list, and replica identity is `(node_id, disk_id)`. On first start the data node writes the id to `<mount>/.dtfs-disk-id`. On later starts it **refuses to start** if the disk now sits at a different position (the error reads `disk <path> was disk_id N but is now at [[disks]] position M`), because renumbering would make the manager attribute chunks to the wrong disk and the orphan reaper delete the wrong copies.
-
-Rules: only append new `[[disks]]` entries at the end; never remove or reorder an entry in the middle. To retire a disk, drain it first, then replace it in place (same position) with the new disk. A replacement disk starts with no `.dtfs-disk-id` and takes the position it is configured at.
-
-## Removing a Disk
-
-### Graceful Removal
-
-1. Place the disk in draining mode. Do not delete its `[[disks]]` entry while it is in the middle of the list (see "Disk ids and `[[disks]]` order" above); the data node would refuse to start.
-
-2. Alternatively, use the API to set the node to maintenance mode if you need to remove the entire node:
-
-```bash
-dtfs-cli maintenance <node-id> --enable
-```
-
-3. The data node stops accepting new writes to the disk and begins migrating existing chunks to other disks (on the same node if available, or to other nodes).
-
-4. Monitor draining progress by checking the disk status:
-
-```bash
-dtfs-cli nodes --id <node-id>
-```
-
-The disk transitions through states: `healthy` -> `draining` -> `removed`.
-
-5. Once the disk shows `removed` status and zero chunks remain, physically remove it.
+There is no drain operation for a disk. Do not delete its `[[disks]]` entry if it
+is in the middle of the list: the data node would refuse to start. Replace it in
+place instead (below), or, for the last entry only, remove the entry after its
+chunks are covered by other replicas. Evacuation relies on replication policy,
+`dtfs-cli migrations create` and the scheduler; see
+[Decommission and Replace](../deployment/decommission-replace.md).
 
 ### Emergency Disk Failure
 
-If a disk fails unexpectedly:
+1. The data node detects I/O errors and reports the disk as `failed` in its next
+   heartbeat; the manager logs a "SMART alert" for it.
+2. A failed disk's replicas stop counting as live; the repair scheduler re-creates
+   the mandatory replicas from copies on other disks or nodes. The disk is excluded
+   from placement.
+3. Wait for `files_missing_chunks == 0` and no undergoal chunks
+   (`GET /api/v1/chunks?state=undergoal`), then replace the disk in place.
 
-1. The data node detects I/O errors and marks the disk as `failed`.
-2. The node reports the failure to the manager via the next heartbeat.
-3. The manager begins re-replicating chunks that were stored on the failed disk, using replicas on other nodes.
-4. The failed disk is excluded from all future placement decisions.
-5. Replace the disk and add it as a new disk following the procedure above.
+If a chunk had its only copy on the failed disk, that is data loss; do not wipe
+anything and escalate.
 
 ## Replacing a Disk
 
-Disk replacement is a combination of removing the old disk and adding a new one:
+Replace at the **same `[[disks]]` position and mount path**.
 
-1. Place the old disk in draining mode (or let failure detection handle it).
-2. Wait for chunk evacuation to complete.
-3. Physically swap the disk.
-4. Format, mount, and configure the new disk with the same or different tier.
-5. The data node picks up the new disk and reports it to the manager.
+- Healthy disk, planned swap: stop `dtfs-data`, copy the whole filesystem to the new
+  disk with attributes and hidden files (`rsync -aHAXx`), keeping
+  `.dtfs-disk-id` and `.dtfs-disk-uuid`, mount it at the old path, start.
+- Failed disk: let repair finish first (above), then mount the empty replacement
+  at the same path and start; it takes the configured position, and the scheduler
+  drops the now-stale location rows (when another live copy exists) and refills
+  the disk. A node that reports chunks missing whose last copy was on that disk is
+  quarantined.
 
-If the replacement disk has the same mount path as the old one, update the configuration to reflect any tier changes.
+## Reclaiming Space After Deletes
+
+Deleting a file (`unlink`) only removes its metadata; there is no immediate chunk
+delete. The orphan reaper deletes chunks that no file references once their
+on-disk `.dat` is older than `orphan_grace_secs` (default 86 400 s), checked every
+`orphan_interval_secs` (default 86 400 s), so free space returns about one to two
+days after the delete. See [Orphan Chunk Cleanup](./orphan-cleanup-runbook.md) to
+speed that up.
 
 ## Disk Status Monitoring
 
-### Per-Node Disk View
-
 ```bash
-dtfs-cli nodes --id <node-id>
+dtfs-cli nodes --id <node-id>                       # disks of one node
+curl http://<manager>:9402/api/v1/nodes/<node-id>    # JSON, includes a disks array
 ```
 
-This shows all disks on a node with their tier, capacity, usage, and status.
+The `DataService.GetDiskStatus` RPC returns disk information directly from a data
+node, bypassing the manager, which helps when the manager is unreachable.
 
-### REST API
+## Integrity and Scrubbing
 
-```bash
-curl http://<manager>:9402/api/v1/nodes/<node-id>
-```
-
-The response includes a `disks` array with full disk details.
-
-### gRPC
-
-The `DataService.GetDiskStatus` RPC returns disk information directly from a data node, bypassing the manager. This is useful for troubleshooting when the manager is unreachable.
-
-## Disk Health Checks
-
-The scrub engine performs periodic integrity checks on all disks. See [Scrubbing](../storage/scrubbing.md) for details.
-
-Quick scrubs verify chunk metadata (sizes, counts), while deep scrubs recompute BLAKE3 checksums to detect bit rot.
+The scrub engine runs on every data node; quick scrubs check chunk presence and
+sizes, deep scrubs recompute BLAKE3 checksums. A fault renames the chunk into
+`.dtfs/quarantine/<id>.dat.bad` (never deletes it) and the replica is repaired from
+another copy. With `[scrub] quarantine_on_fault = true` (default) a single fault
+also quarantines the whole node until an operator runs `dtfs-cli unquarantine`;
+with `false` faults are still recorded and chunks quarantined individually but the
+node keeps serving. `dtfs-cli scrub --level quick|deep` triggers a cluster-wide
+scrub (targeted `--disk`/`--file`/`--chunk` scrubs are rejected by the API). See
+[Scrubbing](../storage/scrubbing.md).
 
 ## Capacity Planning
 
-- The placement engine avoids disks that are above 90% utilization.
-- When a disk approaches capacity, chunks are preferentially placed on other disks in the same tier.
-- If all disks in a tier are full, writes to that tier will fail. Ensure adequate capacity headroom, especially on the hot tier where new writes land.
+- Placement keeps `[placement] min_free_bytes` (default 1 GiB) and `min_free_pct`
+  (default 5 %) free on every disk; writes that would dip below that are refused
+  on that disk (typed `RESOURCE_EXHAUSTED`) or spilled to another tier when
+  `allow_capacity_spill = true`.
+- If every disk of a tier is full, writes needing that tier fail. Keep headroom,
+  especially on the tier where new writes land.
+- Plan expansion before 80 % usage on a tier.
 
 ## Best Practices
 
-- Use consistent mount paths across nodes for operational simplicity (e.g., `/mnt/ssd-{a,b,c}` for hot, `/mnt/hdd-{a,b}` for cold).
-- Always use XFS with `noatime,inode64` mount options.
-- Label disks by tier to avoid accidental mis-assignment after hardware maintenance.
-- Monitor disk utilization and plan capacity expansions before reaching 80% usage on any tier.
-- After adding new disks, the cluster does not automatically rebalance existing data. New writes will preferentially fill the emptier disks. To force rebalancing, use a manual scrub + tier evaluation cycle.
+- Consistent mount paths across nodes (`/mnt/ssd-a`, `/mnt/hdd-a`).
+- Mount by UUID with `noatime`.
+- Keep the intended `[[disks]]` order in your config management data, not derived.
+- After adding disks the cluster does not rebalance existing data on its own.
