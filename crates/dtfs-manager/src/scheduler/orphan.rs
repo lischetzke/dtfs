@@ -444,7 +444,9 @@ impl TaskScheduler {
                 // first-found delete, unchanged.
                 let cause = if is_orphan { "orphan" } else { "delocated" };
                 match self
-                    .delete_chunk_replica_on_node(grpc_addr, cid, *disk_id_opt, "")
+                    .delete_chunk_replica_on_node_if_older(
+                        grpc_addr, cid, *disk_id_opt, "", Some(*mtime_ms),
+                    )
                     .await
                 {
                     Ok((was_present, freed)) => {

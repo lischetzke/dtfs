@@ -656,6 +656,20 @@ impl ChunkStore {
         chunk_id: &ChunkId,
         disk_id: Option<u32>,
     ) -> DtfsResult<(bool, u64)> {
+        self.delete_chunk_idempotent_guarded(chunk_id, disk_id, None).await
+    }
+
+    /// `delete_chunk_idempotent_on_disk` plus the orphan-reaper mtime
+    /// guard: with `if_mtime_le_ms = Some(t)` a copy whose `.dat` mtime is
+    /// newer than `t` (re-uploaded since the reaper listed it) is NOT
+    /// deleted and the call returns `(false, 0)`. Checked under the chunk
+    /// lock. `None` = legacy unconditional delete.
+    pub async fn delete_chunk_idempotent_guarded(
+        &self,
+        chunk_id: &ChunkId,
+        disk_id: Option<u32>,
+        if_mtime_le_ms: Option<u64>,
+    ) -> DtfsResult<(bool, u64)> {
         // CR-4-4 (DATA-3) — hold this chunk id's stripe for the whole
         // delete so a concurrent commit of the same id can't interleave.
         let _chunk_guard = self.chunk_locks[Self::chunk_lock_index(chunk_id)]
@@ -674,6 +688,17 @@ impl ChunkStore {
             let meta_path = chunk_meta_path(&disk.mount_path, chunk_id);
 
             if dat_path.exists() {
+                if let Some(limit) = if_mtime_le_ms {
+                    // Unknown mtime is treated as fresh (never delete on doubt).
+                    let fresh = dat_mtime_ms(&dat_path).await.map_or(true, |m| m > limit);
+                    if fresh {
+                        tracing::info!(
+                            "delete of {} skipped: .dat newer than reaper listing (re-upload race)",
+                            chunk_id
+                        );
+                        return Ok((false, 0));
+                    }
+                }
                 // Read the on-disk file size *before* deleting so we can
                 // accurately decrement bytes_stored. Previously this counter
                 // was never decremented on delete, causing it to grow
@@ -3195,6 +3220,44 @@ mod tests {
         assert_eq!(freed, 0);
         assert!(chunk_data_path(cold.path(), &chunk_id).exists(), "cold copy untouched");
         assert!(chunk_data_path(warm.path(), &chunk_id).exists(), "warm copy untouched");
+    }
+
+    /// Reaper guard: a .dat newer than the listed mtime is NOT deleted; an
+    /// older one is; an absent bound is the legacy unconditional delete.
+    #[tokio::test]
+    async fn reaper_mtime_guard_skips_fresh_deletes_old() {
+        let (store, cold, _warm) = make_two_disk_store().await;
+        let data = b"reaper-mtime-guard";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        let volume_id = VolumeId::new("default".to_string());
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Cold).await.unwrap();
+        let dat = chunk_data_path(cold.path(), &chunk_id);
+        let mtime = dat_mtime_ms(&dat).await.unwrap();
+
+        // Listed view older than the file (re-upload after ListChunks).
+        let r = store
+            .delete_chunk_idempotent_guarded(&chunk_id, Some(0), Some(mtime - 1000))
+            .await
+            .unwrap();
+        assert_eq!(r, (false, 0));
+        assert!(dat.exists(), "fresh re-uploaded copy must survive");
+
+        // Listed mtime == current mtime: old enough, deleted.
+        let r = store
+            .delete_chunk_idempotent_guarded(&chunk_id, Some(0), Some(mtime))
+            .await
+            .unwrap();
+        assert!(r.0);
+        assert!(!dat.exists());
+
+        // Absent bound = legacy unconditional.
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Cold).await.unwrap();
+        let r = store
+            .delete_chunk_idempotent_guarded(&chunk_id, Some(0), None)
+            .await
+            .unwrap();
+        assert!(r.0);
+        assert!(!dat.exists());
     }
 
     /// AV-4-7 — WAL-recoverable delete. Resolves the AV-1-5

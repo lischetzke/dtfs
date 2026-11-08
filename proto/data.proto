@@ -148,6 +148,11 @@ message DeleteChunkRequest {
   // parity with the manager-side action; the store resolves the disk by
   // disk_id, not by tier.
   string tier = 3;
+  // Orphan-reaper guard: delete only when the copy's .dat mtime (Unix ms)
+  // is <= this value, checked under the chunk lock. A re-upload of the same
+  // content after ListChunks bumps the mtime, so the fresh copy is skipped
+  // (was_present=false). ABSENT = legacy unconditional delete.
+  optional uint64 if_mtime_le_ms = 4;
 }
 
 message DeleteChunkResponse {

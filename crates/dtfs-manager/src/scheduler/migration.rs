@@ -230,6 +230,20 @@ impl TaskScheduler {
         disk_id: Option<u32>,
         tier: &str,
     ) -> anyhow::Result<(bool, u64)> {
+        self.delete_chunk_replica_on_node_if_older(node_addr, chunk_id, disk_id, tier, None)
+            .await
+    }
+
+    /// As above, but the data node skips the delete when the `.dat` mtime
+    /// is newer than `if_mtime_le_ms` (orphan reaper re-upload guard).
+    pub(crate) async fn delete_chunk_replica_on_node_if_older(
+        &self,
+        node_addr: &str,
+        chunk_id: &str,
+        disk_id: Option<u32>,
+        tier: &str,
+        if_mtime_le_ms: Option<u64>,
+    ) -> anyhow::Result<(bool, u64)> {
         let endpoint = normalize_endpoint(node_addr);
         let mut client = self.tls.connect(&endpoint).await
             .map(DataServiceClient::new)
@@ -239,6 +253,7 @@ impl TaskScheduler {
             chunk_id: chunk_id.to_string(),
             disk_id,
             tier: tier.to_string(),
+            if_mtime_le_ms,
         });
         {
             use dtfs_common::crypto::{

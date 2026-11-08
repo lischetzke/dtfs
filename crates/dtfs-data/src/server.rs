@@ -766,7 +766,7 @@ impl DataService for DataServiceImpl {
         // context) falls back to the legacy first-found-across-all-disks.
         let (was_present, freed_bytes) = self
             .store
-            .delete_chunk_idempotent_on_disk(&chunk_id, req.disk_id)
+            .delete_chunk_idempotent_guarded(&chunk_id, req.disk_id, req.if_mtime_le_ms)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -1303,6 +1303,7 @@ max_io_percent = 10
                 chunk_id: chunk_hex.clone(),
                 disk_id: None,
                 tier: String::new(),
+                if_mtime_le_ms: None,
             }))
             .await
             .expect_err("unauthenticated DeleteChunk must fail");
@@ -1353,6 +1354,7 @@ max_io_percent = 10
             chunk_id: chunk_hex.clone(),
             disk_id: None,
             tier: String::new(),
+            if_mtime_le_ms: None,
         });
         attach_data_rpc_auth(
             &mut req,
