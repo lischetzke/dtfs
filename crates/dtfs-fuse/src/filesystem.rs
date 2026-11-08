@@ -1411,11 +1411,14 @@ impl DtfsFilesystem {
                     self.renew_if_due(fh, &path).await?;
                     let segs = self.write_buffer.flush_complete(&path);
                     if !segs.is_empty() {
-                        if let Err(e) = self.flush_segments_to_cluster(&path, &segs).await {
-                            self.write_buffer.restore_segments(&path, &segs);
-                            return Err(e);
-                        }
-                        self.mark_committed_and_refresh(&path).await;
+                        let committed = match self.flush_segments_to_cluster(&path, &segs).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                self.write_buffer.restore_segments(&path, &segs);
+                                return Err(e);
+                            }
+                        };
+                        self.mark_committed_and_refresh(&path, committed.as_deref()).await;
                     }
                 }
                 let zeros = vec![0u8; n];
@@ -1434,11 +1437,14 @@ impl DtfsFilesystem {
             self.renew_if_due(fh, &path).await?;
             let segs = self.write_buffer.flush_complete(&path);
             if !segs.is_empty() {
-                if let Err(e) = self.flush_segments_to_cluster(&path, &segs).await {
-                    self.write_buffer.restore_segments(&path, &segs);
-                    return Err(e);
-                }
-                self.mark_committed_and_refresh(&path).await;
+                let committed = match self.flush_segments_to_cluster(&path, &segs).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.write_buffer.restore_segments(&path, &segs);
+                        return Err(e);
+                    }
+                };
+                self.mark_committed_and_refresh(&path, committed.as_deref()).await;
             }
         }
 
@@ -1451,15 +1457,18 @@ impl DtfsFilesystem {
                 self.write_buffer.restore_segments(&path, &segments);
                 return Err(e);
             }
-            if let Err(e) = self.flush_segments_to_cluster(&path, &segments).await {
-                // CO-1-8 (a): `flush` already drained these complete chunks out
-                // of the buffer. Restore them on a cluster-write error so the
-                // bytes survive for the next flush instead of being dropped
-                // while the write call reports failure upstream.
-                self.write_buffer.restore_segments(&path, &segments);
-                return Err(e);
-            }
-            self.mark_committed_and_refresh(&path).await;
+            let committed = match self.flush_segments_to_cluster(&path, &segments).await {
+                Ok(c) => c,
+                Err(e) => {
+                    // CO-1-8 (a): `flush` already drained these complete chunks out
+                    // of the buffer. Restore them on a cluster-write error so the
+                    // bytes survive for the next flush instead of being dropped
+                    // while the write call reports failure upstream.
+                    self.write_buffer.restore_segments(&path, &segments);
+                    return Err(e);
+                }
+            };
+            self.mark_committed_and_refresh(&path, committed.as_deref()).await;
         }
 
         debug!(
@@ -1582,8 +1591,11 @@ impl DtfsFilesystem {
 
         let segments = self.write_buffer.flush_all(&path);
         let had_segments = !segments.is_empty();
+        let mut committed = None;
         if had_segments {
-            if let Err(e) = self.flush_segments_to_cluster(&path, &segments).await {
+            match self.flush_segments_to_cluster(&path, &segments).await {
+                Ok(c) => committed = c,
+                Err(e) => {
                 // CR-1-4 (FUSE-3): ALWAYS restore the drained segments on a
                 // cluster-write failure, regardless of whether this file
                 // has ever committed anything before. `flush_all` already
@@ -1603,6 +1615,7 @@ impl DtfsFilesystem {
                     .unwrap_or_else(|| path.clone());
                 self.write_buffer.restore_segments(&cur, &segments);
                 return Err(e);
+                }
             }
         }
 
@@ -1612,7 +1625,7 @@ impl DtfsFilesystem {
         // CR-1-4 + F-029: mark every handle of the path committed and refresh
         // their locations so reads on the same fd see the new chunks.
         if had_segments {
-            self.mark_committed_and_refresh(&path).await;
+            self.mark_committed_and_refresh(&path, committed.as_deref()).await;
         }
 
         debug!(path = %path, "flush complete");
@@ -2393,14 +2406,16 @@ impl DtfsFilesystem {
     /// Flush chunk segments to the cluster.
     ///
     /// Allocates placements from the manager and writes each segment to
-    /// the assigned data node.
+    /// the assigned data node. On success returns the committed chunks as
+    /// `ChunkInfo`s for `mark_committed_and_refresh`, or `None` when the
+    /// commit was lease-less (the caller must re-fetch instead of merging).
     async fn flush_segments_to_cluster(
         &self,
         path: &str,
         segments: &[crate::writebuf::ChunkSegment],
-    ) -> Result<()> {
+    ) -> Result<Option<Vec<ChunkInfo>>> {
         if segments.is_empty() {
-            return Ok(());
+            return Ok(Some(Vec::new()));
         }
 
         // R2 (FUSE-7(c)) — refuse up front to commit a segment that starts
@@ -2449,6 +2464,7 @@ impl DtfsFilesystem {
             .with_context(|| format!("allocate_chunks failed for {path}"))?;
 
         let mut commits: Vec<ChunkLocationCommit> = Vec::with_capacity(segments.len());
+        let mut committed: Vec<ChunkInfo> = Vec::with_capacity(segments.len());
 
         // For each segment: write the chunk to the primary AND every replica
         // target the manager assigned. Wait for all writes in parallel; require
@@ -2489,7 +2505,7 @@ impl DtfsFilesystem {
             // segment — identical across every reroute attempt below.
             let expected_chunk_id = blake3_hex(segment.data.as_ref());
 
-            let successes = loop {
+            let (successes, tier) = loop {
                 let mut targets: Vec<String> =
                     Vec::with_capacity(1 + placement.replica_addresses.len());
                 targets.push(placement.primary_address.clone());
@@ -2569,7 +2585,7 @@ impl DtfsFilesystem {
                 }
 
                 if successes.len() >= min_ok {
-                    break successes;
+                    break (successes, tier);
                 }
 
                 // Shortfall — reroute only if a target was full AND we have
@@ -2616,6 +2632,13 @@ impl DtfsFilesystem {
                 })?;
             };
 
+            committed.push(committed_chunk_info(
+                segment.chunk_index,
+                &expected_chunk_id,
+                successes[0].1.size,
+                successes.iter().map(|(a, _)| a.clone()).collect(),
+                &tier,
+            ));
             for (addr, put_resp) in successes {
                 commits.push(ChunkLocationCommit {
                     chunk_index: segment.chunk_index,
@@ -2648,7 +2671,9 @@ impl DtfsFilesystem {
             .await
             .with_context(|| format!("commit_chunk_locations failed for {path}"))?;
 
-        Ok(())
+        // A lease-less commit is union-merged by the manager, so the local
+        // replace-merge would not match it: make the caller re-fetch.
+        Ok((!lease_id.is_empty()).then_some(committed))
     }
 
     /// True iff some open handle on `path` is writable.
@@ -2671,14 +2696,35 @@ impl DtfsFilesystem {
 
     /// After a successful commit of `path`'s segments (from flush() or a
     /// write()-driven batch/cap flush): mark every handle of the path
-    /// committed (so release() never ghost-unlinks it) and refresh their
-    /// locations (so a later header rewrite seeds from the committed
-    /// chunks instead of committing a partial segment as the whole chunk).
-    async fn mark_committed_and_refresh(&self, path: &str) {
+    /// committed (so release() never ghost-unlinks it) and bring their
+    /// locations up to date (so a later header rewrite seeds from the
+    /// committed chunks instead of committing a partial segment as the whole
+    /// chunk). `committed` is merged into each snapshot in place; the whole
+    /// file is re-fetched only when some handle cannot take the merge
+    /// (`merge_into_snapshot`), since a per-batch full re-fetch is quadratic
+    /// in file size.
+    async fn mark_committed_and_refresh(&self, path: &str, committed: Option<&[ChunkInfo]>) {
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut refetch = false;
         for mut entry in self.open_files.iter_mut() {
             if entry.value().path == path {
-                entry.value_mut().committed_any = true;
+                let f = entry.value_mut();
+                f.committed_any = true;
+                refetch |= !merge_into_snapshot(f.locations.as_mut(), committed, now_ms);
             }
+        }
+        if !refetch {
+            let merged = match self.metadata_cache.get_mut(path) {
+                Some(mut e) => merge_into_snapshot(Some(&mut e.value_mut().0), committed, now_ms),
+                None => true,
+            };
+            if !merged {
+                self.metadata_cache.remove(path);
+            }
+            return;
         }
         self.metadata_cache.remove(path);
         match self.fetch_file_locations(path).await {
@@ -2902,6 +2948,62 @@ fn segments_committable(
         }
     }
     Ok(())
+}
+
+/// The `ChunkInfo` a successful commit registered for one segment: the
+/// replicas that acked the put, all at the placement's tier. Locations stay
+/// empty (as from an old manager); `known_locations` already ranks them.
+fn committed_chunk_info(
+    chunk_index: u32,
+    chunk_id: &str,
+    size: u64,
+    node_addresses: Vec<String>,
+    tier: &str,
+) -> ChunkInfo {
+    let node_tiers = vec![tier.to_string(); node_addresses.len()];
+    ChunkInfo {
+        chunk_id: chunk_id.to_string(),
+        size,
+        node_addresses,
+        node_tiers,
+        node_locations: Vec::new(),
+        chunk_index: Some(chunk_index as u64),
+    }
+}
+
+/// Post-commit: merge `committed` into a handle's `snapshot` the way the
+/// manager's leased merge applies it (each committed index's entry replaced,
+/// size grown to the committed extent). Returns false (snapshot untouched)
+/// when the handle needs the whole-file re-fetch instead: no snapshot, a
+/// lease-less commit (`None`), positional old-manager indices, or an unknown
+/// chunk size.
+fn merge_into_snapshot(
+    snapshot: Option<&mut FileLocations>,
+    committed: Option<&[ChunkInfo]>,
+    now_ms: i64,
+) -> bool {
+    let (Some(loc), Some(committed)) = (snapshot, committed) else {
+        return false;
+    };
+    if loc.chunk_size == 0
+        || !loc.indices_are_authoritative()
+        || committed.iter().any(|c| c.chunk_index.is_none())
+    {
+        return false;
+    }
+    for c in committed {
+        let idx = c.chunk_index.unwrap_or(0);
+        // Manager snapshots are sorted by index; merges keep them sorted.
+        let pos = loc.chunks.partition_point(|e| e.chunk_index.unwrap_or(0) < idx);
+        if loc.chunks.get(pos).is_some_and(|e| e.chunk_index.unwrap_or(0) == idx) {
+            loc.chunks[pos] = c.clone();
+        } else {
+            loc.chunks.insert(pos, c.clone());
+        }
+        loc.total_size = loc.total_size.max(idx * loc.chunk_size + c.size);
+    }
+    loc.modified_at_ms = loc.modified_at_ms.max(now_ms);
+    true
 }
 
 /// Largest size any source knows; fallocate grows from this so a stale
@@ -3586,6 +3688,73 @@ mod rev_2_1_chunk_index_tests {
         assert_eq!(l.chunk_at(1).unwrap().chunk_id, "h1");
         assert_eq!(l.chunk_at(2).unwrap().chunk_id, "h2");
         assert!(l.chunk_at(3).is_none(), "past the end is still absent");
+    }
+
+    const CS: u64 = 4 * 1024 * 1024;
+
+    fn committed(idx: u32, id: &str, size: u64) -> ChunkInfo {
+        super::committed_chunk_info(idx, id, size, vec!["http://w1:9500".to_string()], "warm")
+    }
+
+    /// Post-commit merge replaces the committed index, inserts new ones in
+    /// index order, grows size to the committed end and leaves others alone.
+    #[test]
+    fn merge_replaces_and_inserts_committed_chunks_and_grows_size() {
+        let mut l = locs(&[(0, "h0"), (1, "h1"), (3, "h3")]);
+        l.total_size = 4 * CS;
+        let c = [committed(1, "n1", CS), committed(2, "n2", CS), committed(4, "n4", 100)];
+        assert!(super::merge_into_snapshot(Some(&mut l), Some(&c), 7), "merge must apply");
+        let ids: Vec<&str> = l.chunks.iter().map(|c| c.chunk_id.as_str()).collect();
+        assert_eq!(ids, ["h0", "n1", "n2", "h3", "n4"]);
+        assert_eq!(l.chunk_at(1).unwrap().node_addresses, ["http://w1:9500"]);
+        assert_eq!(l.chunk_at(1).unwrap().node_tiers, ["warm"]);
+        assert_eq!(l.chunk_at(0).unwrap().node_addresses, ["http://n1:9500"], "untouched");
+        assert_eq!(l.total_size, 4 * CS + 100);
+        assert_eq!(l.modified_at_ms, 7);
+        // A rewrite below EOF never shrinks the size.
+        assert!(super::merge_into_snapshot(Some(&mut l), Some(&[committed(0, "x", 1)]), 8));
+        assert_eq!(l.total_size, 4 * CS + 100);
+    }
+
+    /// A handle with no snapshot, or a lease-less commit (`None`), takes the
+    /// whole-file re-fetch; a snapshot plus committed chunks does not.
+    #[test]
+    fn full_refetch_only_without_snapshot_or_for_leaseless_commit() {
+        let mut l = locs(&[(0, "h0")]);
+        assert!(super::merge_into_snapshot(Some(&mut l), Some(&[committed(1, "n1", CS)]), 1));
+        assert!(!super::merge_into_snapshot(None, Some(&[committed(1, "n1", CS)]), 1));
+        let before = format!("{l:?}");
+        assert!(!super::merge_into_snapshot(Some(&mut l), None, 1));
+        assert_eq!(format!("{l:?}"), before, "refused merge leaves the snapshot untouched");
+    }
+
+    /// Old-manager positional labels (all 0) or an unknown chunk size cannot
+    /// be merged by index: refuse without touching the snapshot.
+    #[test]
+    fn merge_refuses_positional_or_sizeless_snapshots_untouched() {
+        let mut old = locs(&[(0, "h0"), (0, "h1")]);
+        let before = format!("{old:?}");
+        assert!(!super::merge_into_snapshot(Some(&mut old), Some(&[committed(2, "n2", CS)]), 1));
+        assert_eq!(format!("{old:?}"), before);
+        let mut sizeless = locs(&[]);
+        sizeless.chunk_size = 0;
+        assert!(!super::merge_into_snapshot(Some(&mut sizeless), Some(&[committed(0, "n0", 1)]), 1));
+        assert!(sizeless.chunks.is_empty());
+    }
+
+    /// After a batch commit of chunk 0 into a freshly created file, a header
+    /// rewrite of chunk 0 must seed from the cluster: the chunk is found with
+    /// a replica, and an unseeded partial segment for it is refused.
+    #[test]
+    fn header_rewrite_after_merge_seeds_from_committed_chunk() {
+        let mut l = locs(&[]);
+        assert!(super::merge_into_snapshot(Some(&mut l), Some(&[committed(0, "n0", CS)]), 1));
+        assert!(!l.chunk_at(0).unwrap().node_addresses.is_empty(), "seed source exists");
+        let wb = crate::writebuf::WriteBuffer::new(CS as usize);
+        wb.write("/f", 0, b"hdr");
+        assert_eq!(super::chunks_needing_seed(&wb, "/f", CS, 0, 3), [0]);
+        let segs = wb.flush_all("/f");
+        assert!(super::segments_committable(&segs, |i| l.chunk_at(i as u64).is_some()).is_err());
     }
 }
 

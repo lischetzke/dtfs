@@ -55,6 +55,12 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   the partial tail chunk when writing past EOF (`hole_tail_chunk`), and a
   hole chunk below EOF gets a zero seed (`read_seed_bytes`). "No chunk at
   index" = zeros; "chunk with no live address" keeps refusing at commit.
+- After a commit, `mark_committed_and_refresh` merges the committed chunks
+  into each handle's snapshot and the metadata cache entry
+  (`merge_into_snapshot`: replace the index, grow size). It re-fetches the
+  whole file only when a handle has no snapshot, the commit was lease-less,
+  or the snapshot is positional/sizeless; never re-fetch per batch
+  (quadratic on big files).
 - A failed post-commit locations refresh sets the handles' `locations` to
   `None`; `write()`/`read()` must `refetch_locations` before using them.
 - `rename` over a path with open writers and `unlink`/`rmdir` of one
