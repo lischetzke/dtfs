@@ -247,7 +247,7 @@ sha256_via_fuse() {
 # ─── Chaos / lifecycle env (consumed by lib/pve.sh + lib/lifecycle.sh) ──
 # ALLOW_PVE_CHAOS=1   opt-in for hypervisor-destructive cases (else they SKIP)
 # PVE_TOKEN=...       Proxmox API token (root@pam!dtfs-test=...); never commit
-# INVENTORY_JSON=...  topology map (default tests/proxmox/inventory-3dc.json)
+# INVENTORY_JSON=...  topology map (required by dc.sh)
 # KEEP_CLUSTER=1      after a --provision run, leave the VMs up for debugging
 
 # ─── BE-1 — pull in fixture + health + DC/PVE helpers ────────────

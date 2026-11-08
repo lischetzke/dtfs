@@ -29,7 +29,7 @@ Unit tests sit beside the code in `#[cfg(test)]` modules or `tests.rs` files (`d
 
 ## Dormant harnesses
 
-`tests/release/`, `tests/proxmox/`, `tests/chaos/` and `tests/integration/` are shell harnesses for a live cluster or Docker Compose lab. They are not part of the verification loop and need no change to ship a fix. See [Lab: Chaos Testing](../lab/chaos-testing.md) and [Release Testing](../lab/release-testing.md).
+`tests/release/`, `tests/chaos/` and `tests/integration/` are shell harnesses for a live cluster or Docker Compose lab. They are not part of the verification loop and need no change to ship a fix. See [Lab: Chaos Testing](../lab/chaos-testing.md) and [Release Testing](../lab/release-testing.md).
 
 The host-side Python tooling under `tools/dtfs-mcp` is tested separately (`uv run --with pytest --with "mcp<2" --with httpx pytest tools/dtfs-mcp`), outside the cargo loop.
 

@@ -1,12 +1,12 @@
 # tests/release/lib/pve.sh — hypervisor chaos wrappers for the release suite.
-# Thin shims over tests/proxmox/pve-chaos.ps1 (PVE REST verbs) invoked through
+# Thin shims over $PVE_CHAOS_PS1 (PVE REST verbs; lab tooling, not in the repo) invoked through
 # pwsh; the heavy/tested PVE logic stays in pve.ps1. Sourced by chaos cases.
 # Depends on common.sh (fail, skip) + health.sh (wait_cluster_ready,
 # wait_all_healthy). All verbs no-op-SKIP a case unless ALLOW_PVE_CHAOS=1.
 
 _PVE_LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PVE_CHAOS_PS1=${PVE_CHAOS_PS1:-$_PVE_LIBDIR/../../proxmox/pve-chaos.ps1}
-ANSIBLE_DIR=${ANSIBLE_DIR:-$_PVE_LIBDIR/../../proxmox/ansible}
+PVE_CHAOS_PS1=${PVE_CHAOS_PS1:-}
+ANSIBLE_DIR=${ANSIBLE_DIR:-}
 INV3DC=${INV3DC:-$ANSIBLE_DIR/inventories/3dc/hosts.yml}
 
 # Gate: destructive hypervisor ops require an explicit opt-in + a token.

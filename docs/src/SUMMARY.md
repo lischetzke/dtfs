@@ -84,7 +84,6 @@
 
 # Lab (dormant — no cluster since 2026-09)
 
-- [Production Deployment Runbook](./lab/production-deployment.md)
 - [Release Testing](./lab/release-testing.md)
 - [Chaos / Cross-DC / Balance Testing](./lab/chaos-testing.md)
 

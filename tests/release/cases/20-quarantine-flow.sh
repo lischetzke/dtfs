@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # BE-20 (Bug BC) — corrupt → detect → fallback → manual quarantine →
 # unquarantine. Uses the same byte-flip mechanic as
-# tests/proxmox/abuse/18-bug-bc-bitrot.sh.
+# a former lab bit-rot abuse script.
 source "$(dirname "$0")/../lib/common.sh"
 
 F="$MOUNT/release/20-quar-$$.bin"

@@ -4,7 +4,8 @@
 # (wait_cluster_ready, wait_all_healthy). Only invoked when --provision is set.
 
 _LC_LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROXMOX_DIR=${PROXMOX_DIR:-$_LC_LIBDIR/../../proxmox}
+# Lab provisioning tooling (provision-3dc.ps1, pve-chaos.ps1) is not in the repo.
+PROXMOX_DIR=${PROXMOX_DIR:-}
 ANSIBLE_DIR=${ANSIBLE_DIR:-$PROXMOX_DIR/ansible}
 INV3DC=${INV3DC:-$ANSIBLE_DIR/inventories/3dc/hosts.yml}
 

@@ -1,7 +1,7 @@
 # Chaos / cross-DC / balance testing
 
 > **Dormant.** This page describes the Proxmox lab and its harnesses
-> (`tests/release/`, `tests/proxmox/`). Since 2026-09 there is no build VM
+> (`tests/release/`; the Proxmox lab tooling it used is not in the repo, so `INVENTORY_JSON`, `PVE_CHAOS_PS1` and `PROXMOX_DIR` must point at your own copies). Since 2026-09 there is no build VM
 > and no cluster; verification is unit/crate tests in Docker (see
 > `CLAUDE.md` § A.4). Kept for the day a lab exists again.
 
@@ -39,7 +39,7 @@ The chaos cases standardize on the **3dc** topology. Its defining property is
 **one Raft voter per datacenter**, so losing any single DC leaves a 2/3
 majority — quorum holds and recovery is observable. The single source of truth
 for the topology (hostnames, Proxmox vmids, datacenters, per-node tier disks)
-is `tests/proxmox/inventory-3dc.json`; both the bash helpers and the PVE chaos
+is `$INVENTORY_JSON`; both the bash helpers and the PVE chaos
 script read it.
 
 | Role | dc-a (anchor) | dc-b | dc-c | Why |
@@ -82,7 +82,7 @@ On the machine that runs the suite (the operator's WSL/Linux host or the
 builder VM):
 
 - **`pwsh`** (PowerShell 7) — drives the PVE REST API via
-  `tests/proxmox/pve.ps1` and `tests/proxmox/pve-chaos.ps1`. On Debian/WSL:
+  `pve.ps1` (lab tooling) and `$PVE_CHAOS_PS1`. On Debian/WSL:
   `apt install powershell`.
 - **`ansible`** — only for `--provision` (deploy playbooks) and case 48
   (netshape). Power/disk chaos itself needs no ansible.
@@ -122,7 +122,7 @@ deploys the VMs. VM boot/shutdown dominates the power cases.
 |---|---|---|
 | `ALLOW_PVE_CHAOS` | `0` | `1` enables the hypervisor-destructive cases (43, 44, 45, 48). Without it they **SKIP**, so `--chaos` still runs the non-PVE cases (42, 46, 47) against a live cluster. |
 | `PVE_TOKEN` | _(unset)_ | Proxmox API token. Required for any PVE op (and for `--provision`). |
-| `INVENTORY_JSON` | `tests/proxmox/inventory-3dc.json` | Topology map (hostname → vmid → dc → disks). |
+| `INVENTORY_JSON` | `$INVENTORY_JSON` | Topology map (hostname → vmid → dc → disks). |
 | `KEEP_CLUSTER` | `0` | After a `--provision` run, `1` leaves the VMs up for debugging instead of destroying them. |
 
 The standard `MGRS` / `DATA` / `CLIENT` / `MOUNT` / `VOL` / `MGR_PORT` /
@@ -131,12 +131,12 @@ The standard `MGRS` / `DATA` / `CLIENT` / `MOUNT` / `VOL` / `MGR_PORT` /
 ## Control layer
 
 ```
-case (bash) ── lib/pve.sh ──▶ pwsh tests/proxmox/pve-chaos.ps1 ──▶ PVE REST API
+case (bash) ── lib/pve.sh ──▶ pwsh $PVE_CHAOS_PS1 ──▶ PVE REST API
               lib/dc.sh   ──▶ manager REST API + SSH + inventory-3dc.json
               lib/lifecycle.sh ▶ provision-3dc.ps1 + ansible deploy playbooks
 ```
 
-- **`tests/proxmox/pve-chaos.ps1`** — DC-aware verbs over the tested
+- **`$PVE_CHAOS_PS1`** — DC-aware verbs over the tested
   `pve.ps1` helpers, resolving names/DCs from `inventory-3dc.json`. REST-only.
 
   ```
@@ -233,7 +233,7 @@ regardless.
 
 ## Design notes (from the 2026-06 chaos-suite work)
 
-- Topology is `3dc` (`tests/proxmox/inventory-3dc.json`: one Raft voter
+- Topology is `3dc` (`$INVENTORY_JSON`: one Raft voter
   per DC, two data nodes per DC, one client per DC, dc-a is the anchor DC
   and holds `cold`). One DC can fail with quorum intact, so recovery is
   observable; a LELI-style total outage (all voters plus the anchor in
@@ -241,7 +241,7 @@ regardless.
 - The suite provisions a clean cluster per run and tears it down
   (`--provision`, kept alive with `KEEP_CLUSTER=1`). Hypervisor chaos
   (power a DC off/on, detach/attach a disk) goes through
-  `tests/proxmox/pve-chaos.ps1`, gated by `ALLOW_PVE_CHAOS`.
+  `$PVE_CHAOS_PS1`, gated by `ALLOW_PVE_CHAOS`.
 - Cases assert true end state through read-only manager APIs added for
   this purpose: `NodeResponse.total_bytes_read/_written` and the
   per-replica `{node_id, disk_id, tier}` list in the file inspect

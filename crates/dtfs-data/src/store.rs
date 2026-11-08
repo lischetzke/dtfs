@@ -3296,7 +3296,7 @@ mod tests {
     /// tmp into RAM, this test still passes — but the live profiler on
     /// data-a1 (configured to a 2 GB hard cap) will OOM the moment
     /// concurrent writes start, and the regression is caught in
-    /// `tests/proxmox/abuse/13-data-node-mem-cap.sh`.
+    /// a lab memory-cap abuse test (no longer in the repo).
     #[tokio::test]
     async fn bug_i_commit_handles_multi_mb_streamed_chunk() {
         use dtfs_common::checksum::IncrementalHasher;

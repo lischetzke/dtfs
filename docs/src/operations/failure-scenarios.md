@@ -269,7 +269,7 @@ manager list on process startup.
 Run the restart in parallel across hosts:
 
 ```bash
-ansible -i tests/proxmox/ansible/inventory.yml clients \
+ansible -i /path/to/inventory.yml clients \
     -m systemd -a "name=dtfs-fuse@plex.service state=restarted"
 ```
 

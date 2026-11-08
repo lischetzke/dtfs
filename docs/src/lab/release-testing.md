@@ -1,7 +1,7 @@
 # Release testing (Bug BE)
 
 > **Dormant.** This page describes the Proxmox lab and its harnesses
-> (`tests/release/`, `tests/proxmox/`). Since 2026-09 there is no build VM
+> (`tests/release/`; the Proxmox lab tooling it used is not in the repo, so `INVENTORY_JSON`, `PVE_CHAOS_PS1` and `PROXMOX_DIR` must point at your own copies). Since 2026-09 there is no build VM
 > and no cluster; verification is unit/crate tests in Docker (see
 > `CLAUDE.md` § A.4). Kept for the day a lab exists again.
 
@@ -30,7 +30,7 @@ Required env (defaults match the lab minicluster):
 | `SSH_KEY` | `~/.ssh/dtfs-lab/id_ed25519` | private key |
 | `ALLOW_PVE_CHAOS` | `0` | `1` enables hypervisor-destructive cases (else they SKIP) |
 | `PVE_TOKEN` | _(unset)_ | Proxmox API token `root@pam!dtfs-test=…`; never commit |
-| `INVENTORY_JSON` | `tests/proxmox/inventory-3dc.json` | topology map (hostname→vmid→dc→disks) |
+| `INVENTORY_JSON` | `$INVENTORY_JSON` | topology map (hostname→vmid→dc→disks) |
 | `KEEP_CLUSTER` | `0` | after `--provision`, `1` leaves the VMs up for debugging |
 
 ## Output
@@ -99,7 +99,7 @@ scenario depends on un-shipped functionality.
 
 `--chaos` runs the hypervisor-level + cross-DC + auto-balance cases against
 the **3dc** lab (one Raft voter per DC, two data nodes per DC, one client per
-DC — `tests/proxmox/inventory-3dc.json`). It is a separate ~45–60 min gate
+DC — `$INVENTORY_JSON`). It is a separate ~45–60 min gate
 from the SSH-only full run.
 
 ```
@@ -112,10 +112,10 @@ ALLOW_PVE_CHAOS=1 PVE_TOKEN='root@pam!dtfs-test=…' \
 ```
 
 Prerequisites on the runner: `pwsh` (PowerShell 7 — drives the PVE REST API
-via `tests/proxmox/pve.ps1`/`pve-chaos.ps1`) and `ansible` (deploy + netshape
+via `pve.ps1` (lab tooling)/`pve-chaos.ps1`) and `ansible` (deploy + netshape
 playbooks). Without `ALLOW_PVE_CHAOS=1` + `PVE_TOKEN` the PVE-destructive
 cases SKIP, so the suite still runs on a pre-provisioned cluster. Power/disk
-chaos and teardown go through `tests/proxmox/pve-chaos.ps1` (REST-only, no
+chaos and teardown go through `$PVE_CHAOS_PS1` (REST-only, no
 ssh, so it works under Linux `pwsh`).
 
 ### What's testable on 3dc vs total-outage-by-design

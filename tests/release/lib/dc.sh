@@ -4,11 +4,12 @@
 # ALLOW_PVE_CHAOS. Depends on common.sh (mgr_get_any, mgrs_list, MGR_PORT,
 # CURL_OPTS) and health.sh (mgr_leader).
 #
-# Topology source of truth: tests/proxmox/inventory-3dc.json
+# Topology source of truth: $INVENTORY_JSON (required; the Proxmox lab
+# tooling that provided tests/proxmox/inventory-3dc.json is not in the repo)
 # (vms[].{name,vmid,ip,dc,role,extra_disks}). Override with INVENTORY_JSON.
 
 _DC_LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INVENTORY_JSON=${INVENTORY_JSON:-$_DC_LIBDIR/../../proxmox/inventory-3dc.json}
+INVENTORY_JSON=${INVENTORY_JSON:?set INVENTORY_JSON to your topology map}
 
 # ─── Inventory lookups (offline; read the JSON) ──────────────────
 _inv_vm_field() {  # <host> <field> -> field value (empty if not found)

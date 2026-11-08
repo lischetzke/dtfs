@@ -61,7 +61,7 @@ Crates: **dtfs-manager** (Raft peer, REST/gRPC, owns metadata), **dtfs-data** (p
 Linux toolchain only. Docker image `dtfs-buildenv:latest` (`docker/buildenv.Dockerfile`; rebuild `docker build -t dtfs-buildenv:latest -f docker/buildenv.Dockerfile .`). From Git Bash, `MSYS_NO_PATHCONV=1` required; no `bash -lc` inside image:
 
 ```bash
-MSYS_NO_PATHCONV=1 docker run --rm -v "${DTFS_REPO_HOST_PATH:-C:/Users/<user>/git_github.com/dtfs2}:/build" \
+MSYS_NO_PATHCONV=1 docker run --rm -v "${DTFS_REPO_HOST_PATH:-$(pwd -W 2>/dev/null || pwd)}:/build" \
   -v dtfs-target:/target -v dtfs-registry:/usr/local/cargo/registry \
   -w /build dtfs-buildenv:latest cargo test -p <crate> --release [<test_name>]
 ```

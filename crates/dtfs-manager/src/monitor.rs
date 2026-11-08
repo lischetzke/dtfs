@@ -89,7 +89,7 @@ pub(crate) fn clock_skew_suspects(
 /// commit (instead of silently dropping ForwardToLeader): afterwards a
 /// follower's bogus Down fought the receiver's `healthy` write every few
 /// seconds and the node FLAPPED (live on production 2026-06-07,
-/// dtfs-prod-data01).
+/// prod-cluster-data01).
 ///
 /// Only `role == Data` nodes heartbeat (managers use raft; the FUSE client
 /// never calls the heartbeat RPC), so judging any other role by
