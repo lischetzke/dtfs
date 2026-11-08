@@ -98,9 +98,9 @@ min_replicas_before_ack = 2
 
 The write flow (see [Data Flow](../architecture/data-flow.md#write)):
 
-1. The FUSE client asks the manager for placement and streams the chunk to **every** target in parallel; there is no primary-to-replica forwarding on the write path.
-2. The client continues once at least `ceil(N/2)` targets acknowledged the same chunk id.
-3. `CommitChunkLocations` is rejected unless every chunk has at least `min_replicas_before_ack` distinct `(node_id, disk_id)` replicas among the acknowledged targets. The ack floor is clamped to the tier's replication factor.
+1. The FUSE client asks the manager for placement and streams the chunk to **every** target in parallel; there is no primary-to-replica forwarding on the write path. The manager fills the floor **across maintained tiers**: when the volume's write tier cannot supply `min_replicas_before_ack` distinct nodes (for example one cold node plus two warm nodes), it adds targets on other tiers whose mandatory replica count is above 0, on distinct healthy nodes, honouring the spill-forbid lists. Cache-only tiers (mandatory 0) never fill the floor.
+2. The client waits for every target to answer and continues when at least `ceil(N/2)` acknowledged the same chunk id.
+3. `CommitChunkLocations` is rejected unless every chunk has at least `min_replicas_before_ack` distinct `(node_id, disk_id)` replicas on maintained tiers among the acknowledged targets. The floor is clamped only to what the cluster can physically hold: the number of healthy data nodes with a usable disk on a maintained tier (a single-node cluster commits at 1, and a cluster whose other nodes are quarantined or in maintenance clamps to what remains; the clamp is logged once and audited as `write_safety.floor_clamped`).
 4. Targets that did not acknowledge are filled in later by the repair scheduler.
 
 Setting `min_replicas_before_ack` equal to the replication factor gives the strongest guarantee but needs every target up; 1 gives the lowest latency but a single node failure right after the ack can lose the chunk.

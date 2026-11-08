@@ -1081,26 +1081,16 @@ static WARNED_FLOOR_CLAMPED: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::OnceLock::new();
 
-/// CR-6-2 (CMN-2) — the volume's `write_safety.min_replicas_before_ack`
-/// floor (e.g. the compiled-in default of 2) can exceed the effective
-/// mandatory RF of the tier the chunks actually landed on (e.g. cold
-/// RF 1), which made `commit_chunk_locations` reject every write to
-/// that tier forever (CF-3b never re-checks, so the write buffer just
-/// keeps retrying and failing). Clamp the floor to the MAXIMUM
-/// `effective_mandatory_replicas().for_tier()` across the distinct
-/// tiers the committed chunks resolved to — R1 review fix: taking the
-/// minimum let a multi-tier placement (e.g. warm RF 3 + cold RF 1) with
-/// one warm + one cold replica clamp the floor down to 1 and ack at 2
-/// replicas, silently downgrading warm's own RF 3 requirement (exactly
-/// the RF downgrade A.3.3 #5 forbids). The floor may only be lowered to
-/// the HIGHEST RF any placed tier actually demands, never below it. A
-/// chunk whose node/disk can't be resolved to a live tier (unknown
-/// node, e.g. an old/rejoining data node) is skipped — it doesn't
-/// weaken the clamp, since it isn't evidence of a real placement tier.
-fn clamp_ack_floor_to_rf(
+/// CR-6-2 (CMN-2) — a floor larger than the cluster can ever hold
+/// (e.g. 2 on a single-node cluster) would reject every commit forever
+/// (CF-3b never re-checks, the write buffer just keeps retrying). The
+/// floor is lowered to the number of distinct healthy maintained nodes
+/// (`maintained_node_capacity`), never to a placed tier's own RF: the
+/// allocator fills the floor across maintained tiers, so a single cold
+/// copy no longer passes just because cold RF is 1.
+fn clamp_ack_floor_to_capacity(
     floor: u32,
     sm: &StateMachineData,
-    chunks: &[ChunkLocationEntry],
     volume_id: &str,
     path: &str,
     audit: Option<&crate::audit::AuditLog>,
@@ -1110,27 +1100,11 @@ fn clamp_ack_floor_to_rf(
         None => return floor,
     };
     let mandatory = volume.effective_mandatory_replicas();
-    // R1 review fix — MAX, not min, across the distinct tiers the chunks
-    // actually landed on. A multi-tier volume (e.g. warm RF 3 + cold RF 1)
-    // with a chunk placed 1 warm + 1 cold must still enforce warm's RF 3;
-    // taking the min silently downgraded the floor to 1 and acked the
-    // write at 2 replicas, exactly the RF downgrade the floor exists to
-    // prevent (A.3.3 #5). The floor may only be lowered to the HIGHEST RF
-    // any placed tier actually requires — never below what any placed
-    // tier itself demands.
-    let max_rf = chunks
-        .iter()
-        .filter_map(|c| {
-            let node_id: u64 = c.node_id.parse().ok()?;
-            let tier = live_replica_tier(sm.nodes.get(&node_id), c.disk_id)?;
-            // RF 0 = cache-only tier: not evidence of a durable placement,
-            // and clamping to 0 would ack a single evictable copy.
-            Some(mandatory.for_tier(tier)).filter(|rf| *rf > 0)
-        })
-        .max();
-    let Some(rf) = max_rf else {
-        return floor;
-    };
+    // The floor is filled ACROSS maintained tiers (allocation adds targets
+    // on other RF>0 tiers), so it is clamped only to what the cluster can
+    // physically hold: distinct healthy data nodes with a usable disk on a
+    // maintained tier (one node holds one replica per chunk on the wire).
+    let rf = maintained_node_capacity(sm, &mandatory);
     if rf >= floor {
         return floor;
     }
@@ -1161,6 +1135,132 @@ fn clamp_ack_floor_to_rf(
         );
     }
     rf
+}
+
+/// Distinct Healthy data nodes (with a gRPC address) holding at least one
+/// usable disk on a tier whose mandatory RF is > 0.
+pub(crate) fn maintained_node_capacity(
+    sm: &StateMachineData,
+    mandatory: &dtfs_common::types::TierReplication,
+) -> u32 {
+    sm.nodes
+        .values()
+        .filter(|n| n.role == NodeRole::Data && n.health == HealthStatus::Healthy)
+        .filter(|n| {
+            n.disks.iter().any(|d| {
+                d.status == DiskStatus::Healthy && mandatory.for_tier(d.tier) > 0
+            })
+        })
+        .count() as u32
+}
+
+/// Smallest per-chunk count of distinct `(node_id, disk_id)` replicas that
+/// sit on a maintained tier (mandatory RF > 0) of `volume_id`. A replica on
+/// a tier that resolves to RF 0 (cache-only, evictable) never counts; one
+/// that cannot be resolved (unknown node/disk) is given the benefit of the
+/// doubt. `usize::MAX` for an empty batch. Unknown volume: every replica
+/// counts (old behaviour).
+pub(crate) fn min_maintained_replicas(
+    sm: &StateMachineData,
+    volume_id: &str,
+    chunks: &[ChunkLocationEntry],
+) -> usize {
+    let mandatory = sm
+        .volumes
+        .get(volume_id)
+        .map(|v| v.effective_mandatory_replicas());
+    let mut per_chunk: std::collections::HashMap<u64, std::collections::HashSet<(&str, u32)>> =
+        std::collections::HashMap::new();
+    for c in chunks {
+        let set = per_chunk.entry(c.chunk_index).or_default();
+        let cache_only = mandatory.as_ref().is_some_and(|m| {
+            c.node_id
+                .parse::<u64>()
+                .ok()
+                .and_then(|id| sm.nodes.get(&id))
+                .and_then(|n| n.disk(c.disk_id))
+                .is_some_and(|d| m.for_tier(d.tier) == 0)
+        });
+        if !cache_only {
+            set.insert((c.node_id.as_str(), c.disk_id));
+        }
+    }
+    per_chunk.values().map(|s| s.len()).min().unwrap_or(usize::MAX)
+}
+
+fn norm_grpc_addr(a: &str) -> String {
+    a.trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string()
+}
+
+/// Extra write targets that fill a chunk's ack floor across maintained
+/// tiers. `existing` are the addresses the placement engine already chose
+/// for `placed_tier`; they count toward the floor only when that tier is
+/// maintained (RF > 0). Returns addresses of Healthy data nodes (distinct
+/// from `existing` and from each other, honouring `exclude`, headroom and
+/// the volume's spill-forbid lists) with a usable disk on a maintained
+/// tier, ranked fastest+nearest. Fewer than needed when the cluster
+/// has fewer eligible nodes. One node holds one replica per chunk on the
+/// wire (the data node picks the disk), so no same-node fallback.
+pub(crate) fn fill_floor_targets(
+    nodes: &BTreeMap<u64, dtfs_raft::NodeInfo>,
+    mandatory: &dtfs_common::types::TierReplication,
+    spill: &dtfs_common::types::SpillPolicy,
+    pcfg: &dtfs_common::config::PlacementConfig,
+    requester: &Location,
+    placed_tier: DiskTier,
+    existing: &[String],
+    floor: u32,
+    exclude: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let have = if mandatory.for_tier(placed_tier) > 0 {
+        existing.len() as u32
+    } else {
+        0
+    };
+    if have >= floor {
+        return Vec::new();
+    }
+    let need = (floor - have) as usize;
+    let existing_norm: std::collections::HashSet<String> =
+        existing.iter().map(|a| norm_grpc_addr(a)).collect();
+    let mut cands: Vec<crate::placement::CandidateDisk> = Vec::new();
+    for (id, n) in nodes {
+        if n.role != NodeRole::Data
+            || n.health != HealthStatus::Healthy
+            || n.grpc_addr.is_empty()
+        {
+            continue;
+        }
+        let addr = norm_grpc_addr(&n.grpc_addr);
+        if exclude.contains(&addr) || existing_norm.contains(&addr) {
+            continue;
+        }
+        for d in &n.disks {
+            if d.status != DiskStatus::Healthy
+                || mandatory.for_tier(d.tier) == 0
+                || !pcfg.has_room(d.total_bytes, d.used_bytes)
+                || !spill.allows_target(&n.location.datacenter, d.tier)
+            {
+                continue;
+            }
+            cands.push(crate::placement::CandidateDisk {
+                node_id: *id,
+                disk_id: d.disk_id,
+                tier: d.tier,
+                location: n.location.clone(),
+                free_bytes: d.total_bytes.saturating_sub(d.used_bytes),
+            });
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    crate::placement::rank_candidates(&cands, requester)
+        .into_iter()
+        .filter(|c| seen.insert(c.node_id))
+        .take(need)
+        .filter_map(|c| nodes.get(&c.node_id).map(|n| n.grpc_addr.clone()))
+        .collect()
 }
 
 #[tonic::async_trait]
@@ -2482,6 +2582,53 @@ impl ManagerService for MetadataService {
             }
         }
 
+        // Fill the ack floor across maintained tiers: the effective tier may
+        // hold fewer distinct nodes than the floor (e.g. one cold node, floor
+        // 2), so add targets on other RF>0 tiers rather than let the commit
+        // be acked (or rejected) on a single copy.
+        let (mandatory, floor, spill) = match &volume_cfg {
+            Some(v) => (
+                v.effective_mandatory_replicas().clone(),
+                v.write_safety.min_replicas_before_ack,
+                v.spill.clone(),
+            ),
+            None => (
+                self.config.defaults.replication.clone(),
+                self.config.defaults.write_safety.min_replicas_before_ack,
+                Default::default(),
+            ),
+        };
+        let requester = req
+            .requester_location
+            .as_ref()
+            .map(|l| dtfs_common::topology::Location::new(&l.region, &l.datacenter, &l.rack, &l.host))
+            .unwrap_or_else(|| dtfs_common::topology::Location::new("", "", "", ""));
+        for p in placements.iter_mut() {
+            let mut existing = vec![p.primary_address.clone()];
+            existing.extend(p.replica_addresses.iter().cloned());
+            let extra = fill_floor_targets(
+                &data.nodes,
+                &mandatory,
+                &spill,
+                &self.config.placement,
+                &requester,
+                effective_tier,
+                &existing,
+                floor,
+                &exclude_set,
+            );
+            if !extra.is_empty() {
+                tracing::debug!(
+                    path = %req.path,
+                    chunk_index = p.chunk_index,
+                    extra = ?extra,
+                    floor,
+                    "filling ack floor across maintained tiers"
+                );
+                p.replica_addresses.extend(extra);
+            }
+        }
+
         Ok(Response::new(AllocateChunksResponse { placements }))
     }
 
@@ -2510,7 +2657,7 @@ impl ManagerService for MetadataService {
         // and the volume the file is actually registered under, so a
         // wrong/unknown `req.volume_id` can't fall back to the default and
         // bypass a stricter per-file floor (a silent RF downgrade).
-        let (chunks, ack_floor): (Vec<ChunkLocationEntry>, u32) = {
+        let (chunks, ack_floor, min_committed): (Vec<ChunkLocationEntry>, u32, usize) = {
             let data = self.sm_data.read().await;
             let ack_floor = resolve_ack_floor(
                 &data,
@@ -2538,15 +2685,15 @@ impl ManagerService for MetadataService {
                 .get(&req.path)
                 .map(|f| f.volume_id.clone())
                 .unwrap_or_else(|| req.volume_id.clone());
-            let ack_floor = clamp_ack_floor_to_rf(
+            let ack_floor = clamp_ack_floor_to_capacity(
                 ack_floor,
                 &data,
-                &chunks,
                 &effective_volume_id,
                 &req.path,
                 self.audit.as_deref(),
             );
-            (chunks, ack_floor)
+            let min_committed = min_maintained_replicas(&data, &effective_volume_id, &chunks);
+            (chunks, ack_floor, min_committed)
         }; // sm_data lock released here
 
         let unresolved = unresolved_commit_nodes(&chunks);
@@ -2574,22 +2721,7 @@ impl ManagerService for MetadataService {
         // (Bug CB) reclaims the abandoned chunks on the data nodes. The
         // gate lives at the manager boundary (defence-in-depth), NOT inside
         // the raft state machine, so there is no snapshot-compat impact.
-        if !ack_floor_satisfied(&chunks, ack_floor) {
-            let min_committed = chunks
-                .iter()
-                .fold(
-                    std::collections::HashMap::<u64, std::collections::HashSet<(String, u32)>>::new(),
-                    |mut acc, c| {
-                        acc.entry(c.chunk_index)
-                            .or_default()
-                            .insert((c.node_id.clone(), c.disk_id));
-                        acc
-                    },
-                )
-                .values()
-                .map(|s| s.len())
-                .min()
-                .unwrap_or(0);
+        if (min_committed as u64) < ack_floor as u64 {
             tracing::warn!(
                 path = %req.path,
                 volume = %req.volume_id,

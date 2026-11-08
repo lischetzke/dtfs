@@ -50,7 +50,7 @@ Terms used across DTFS: its own names and the general distributed-systems words 
 - **Repair scheduler**: The leader-only background loop that keeps mandatory replicas at goal: it copies under-replicated chunks, retires extras, and is the only component allowed to remove a replica after the Raft removal has committed.
 - **Spill**: Placing a replica on another tier or datacenter when the preferred one has no room, as allowed by the volume's spill rules. The anchor copy never spills out of the anchor datacenter.
 - **Tiering engine**: The leader-only loop that promotes and demotes cache replicas from read statistics. It never creates or removes mandatory replicas. See [Tiering](./storage/tiering.md).
-- **Write safety**: `min_replicas_before_ack`: how many distinct `(node, disk)` replicas a write needs before it is acknowledged. Below that the write fails rather than pretending to be durable. See [Write Safety](./storage/replication.md#write-safety).
+- **Write safety**: `min_replicas_before_ack`: how many distinct `(node, disk)` replicas on maintained tiers a write needs before it is acknowledged (filled across tiers, clamped only to what the cluster can hold). Below that the write fails rather than pretending to be durable. See [Write Safety](./storage/replication.md#write-safety).
 
 ## Health and operations
 

@@ -98,6 +98,9 @@ mountpoint = "/mnt/dtfs"
                                     # tier holds the chunk (safe, slower).
                                     # "nearest-warm": ACK on a warm replica,
                                     # anchor copy follows asynchronously.
+                                    # Either way the manager adds targets on
+                                    # other maintained tiers until
+                                    # min_replicas_before_ack nodes hold it.
 # WI-01: number of complete chunks the write buffer holds back before
 # flushing, amortizing the AllocateChunks + CommitChunkLocations round trip
 # over a batch instead of firing once per chunk. Effective range 1..=32

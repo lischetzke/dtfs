@@ -1123,146 +1123,221 @@ mod tests {
         );
     }
 
-    /// CR-6-2 (CMN-2) — a volume floor (2) that exceeds the effective
-    /// mandatory RF of the tier the chunks landed on (cold, RF 1 via
-    /// `vol_with_floor`) is clamped down to that RF, not left to reject
-    /// every commit forever.
-    #[test]
-    fn cr_6_2_ack_floor_clamped_to_placed_tier_rf() {
-        let mut sm = StateMachineData::default();
-        sm.volumes.insert("strict".to_string(), vol_with_floor("strict", 2));
-        sm.nodes.insert(1, mk_data_node(DiskTier::Cold));
-        let chunks = vec![dtfs_raft::ChunkLocationEntry {
-            chunk_index: 0,
-            chunk_hash: "abc".to_string(),
-            node_id: "1".to_string(),
-            disk_id: 0,
-            size_bytes: 1024,
-        }];
-        assert_eq!(
-            clamp_ack_floor_to_rf(2, &sm, &chunks, "strict", "/movies/a.mkv", None),
-            1,
-            "cold RF is 1, so the floor of 2 must clamp down to 1"
-        );
+    // ---- Ack floor filled across maintained tiers ----
 
-        // A floor already at or below the RF is left untouched.
-        assert_eq!(
-            clamp_ack_floor_to_rf(1, &sm, &chunks, "strict", "/movies/a.mkv", None),
-            1
-        );
-
-        // A tier that resolves to a higher RF than the floor doesn't
-        // raise the floor.
-        sm.nodes.insert(2, mk_data_node(DiskTier::Warm));
-        let mut vol_warm = vol_with_floor("warm-strict", 2);
-        vol_warm.mandatory_replicas = dtfs_common::types::TierReplication {
-            hot: 0,
-            warm: 3,
-            cold: 1,
-            tape: 0,
-        };
-        sm.volumes.insert("warm-strict".to_string(), vol_warm);
-        let warm_chunks = vec![dtfs_raft::ChunkLocationEntry {
-            chunk_index: 0,
-            chunk_hash: "abc".to_string(),
-            node_id: "2".to_string(),
-            disk_id: 0,
-            size_bytes: 1024,
-        }];
-        assert_eq!(
-            clamp_ack_floor_to_rf(2, &sm, &warm_chunks, "warm-strict", "/movies/b.mkv", None),
-            2,
-            "warm RF (3) exceeds the floor (2); the floor is never raised"
-        );
-
-        // Unknown node → tier unresolved → clamp is a no-op.
-        let unknown_chunks = vec![dtfs_raft::ChunkLocationEntry {
-            chunk_index: 0,
-            chunk_hash: "abc".to_string(),
-            node_id: "999".to_string(),
-            disk_id: 0,
-            size_bytes: 1024,
-        }];
-        assert_eq!(
-            clamp_ack_floor_to_rf(2, &sm, &unknown_chunks, "strict", "/movies/c.mkv", None),
-            2
-        );
+    fn lab_node(host: &str, dc: &str, tier: DiskTier, health: HealthStatus) -> RaftNodeInfo {
+        let mut n = mk_data_node(tier);
+        n.hostname = host.to_string();
+        n.grpc_addr = format!("{host}:9500");
+        n.location = Location::new("lab", dc, "rack-1", host);
+        n.health = health;
+        n
     }
 
-    /// R1 review fix — a chunk placed on MULTIPLE tiers (warm RF 3 + cold
-    /// RF 1) must clamp to the HIGHEST placed tier's RF (3), never the
-    /// lowest (1). Taking the min silently downgraded the floor to 1 and
-    /// let a write ack at 2 replicas even though warm's own policy
-    /// demands 3 — exactly the RF downgrade the ack floor exists to
-    /// prevent (A.3.3 #5).
-    #[test]
-    fn cr_6_2_ack_floor_clamp_uses_highest_placed_tier_rf_not_lowest() {
+    /// data01 = only cold (anchor DC), data02/03 = warm; cold 1 / warm 2, floor 2.
+    fn live_topology() -> StateMachineData {
         let mut sm = StateMachineData::default();
-        sm.nodes.insert(1, mk_data_node(DiskTier::Warm));
-        sm.nodes.insert(2, mk_data_node(DiskTier::Cold));
-        let mut vol = vol_with_floor("mixed", 3);
-        vol.mandatory_replicas = dtfs_common::types::TierReplication {
-            hot: 0,
-            warm: 3,
-            cold: 1,
-            tape: 0,
-        };
-        sm.volumes.insert("mixed".to_string(), vol);
-        let mixed_chunks = vec![
-            dtfs_raft::ChunkLocationEntry {
-                chunk_index: 0,
-                chunk_hash: "abc".to_string(),
-                node_id: "1".to_string(),
-                disk_id: 0,
-                size_bytes: 1024,
-            },
-            dtfs_raft::ChunkLocationEntry {
-                chunk_index: 0,
-                chunk_hash: "abc".to_string(),
-                node_id: "2".to_string(),
-                disk_id: 0,
-                size_bytes: 1024,
-            },
-        ];
-        assert_eq!(
-            clamp_ack_floor_to_rf(3, &sm, &mixed_chunks, "mixed", "/movies/d.mkv", None),
-            3,
-            "warm's RF (3) must govern, not cold's RF (1) — the floor stays unchanged"
-        );
+        let mut vol = vol_with_floor("default", 2);
+        vol.mandatory_replicas =
+            dtfs_common::types::TierReplication { hot: 0, warm: 2, cold: 1, tape: 0 };
+        vol.anchor_datacenter = Some("leli".to_string());
+        sm.volumes.insert("default".to_string(), vol);
+        sm.nodes.insert(1, lab_node("data01", "leli", DiskTier::Cold, HealthStatus::Healthy));
+        sm.nodes.insert(2, lab_node("data02", "toro", DiskTier::Warm, HealthStatus::Healthy));
+        sm.nodes.insert(3, lab_node("data03", "nrb", DiskTier::Warm, HealthStatus::Healthy));
+        sm
     }
 
-    /// A tier with mandatory RF 0 is cache-only (evictable). Chunks landing
-    /// there must not drop the ack floor to 0 (would ack one evictable copy).
-    #[test]
-    fn ack_floor_clamp_ignores_rf_zero_cache_only_tier() {
-        let mut sm = StateMachineData::default();
-        sm.nodes.insert(1, mk_data_node(DiskTier::Hot));
-        sm.nodes.insert(2, mk_data_node(DiskTier::Cold));
-        let mut vol = vol_with_floor("cachey", 2);
-        vol.mandatory_replicas = dtfs_common::types::TierReplication {
-            hot: 0,
-            warm: 0,
-            cold: 1,
-            tape: 0,
-        };
-        sm.volumes.insert("cachey".to_string(), vol);
-        let entry = |node: &str| dtfs_raft::ChunkLocationEntry {
+    fn fill(sm: &StateMachineData, existing: &[&str], floor: u32) -> Vec<String> {
+        let vol = &sm.volumes["default"];
+        fill_floor_targets(
+            &sm.nodes,
+            &vol.effective_mandatory_replicas(),
+            &vol.spill,
+            &dtfs_common::config::PlacementConfig::default(),
+            &Location::new("", "", "", ""),
+            DiskTier::Cold,
+            &existing.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            floor,
+            &std::collections::HashSet::new(),
+        )
+    }
+
+    fn ent(node: &str) -> dtfs_raft::ChunkLocationEntry {
+        dtfs_raft::ChunkLocationEntry {
             chunk_index: 0,
             chunk_hash: "abc".to_string(),
             node_id: node.to_string(),
             disk_id: 0,
             size_bytes: 1024,
+        }
+    }
+
+    /// The ring places the single cold node only; the fill adds a warm node
+    /// so each chunk has 2 targets on 2 distinct nodes, anchor cold first.
+    #[tokio::test]
+    async fn floor_fill_adds_warm_target_next_to_anchor_cold() {
+        let sm = live_topology();
+        let arc = Arc::new(tokio::sync::RwLock::new(sm.clone()));
+        let engine = PlacementEngine::default();
+        engine.rebuild_ring(&arc).await;
+        let placed = engine.place_chunks_with_anchor(
+            "default", "/a", 4, DiskTier::Cold, 2, Some("leli".to_string()),
+        );
+        assert_eq!(placed.len(), 4);
+        for p in placed {
+            assert_eq!(p.node_ids.len(), 1, "ring alone finds one cold node (the bug)");
+            assert_eq!(p.node_ids[0].0, "1");
+            let extra = fill(&sm, &["data01:9500"], 2);
+            assert_eq!(extra.len(), 1);
+            assert!(extra[0] == "data02:9500" || extra[0] == "data03:9500");
+        }
+    }
+
+    /// Floor 3 on that topology: both warm nodes, distinct.
+    #[test]
+    fn floor_fill_distinct_nodes_up_to_floor() {
+        let sm = live_topology();
+        let mut got = fill(&sm, &["data01:9500"], 3);
+        got.sort();
+        assert_eq!(got, vec!["data02:9500".to_string(), "data03:9500".to_string()]);
+        // Already satisfied: nothing added.
+        assert!(fill(&sm, &["data01:9500", "data02:9500"], 2).is_empty());
+    }
+
+    /// Quarantined / maintenance / excluded warm nodes are not fill targets.
+    #[test]
+    fn floor_fill_skips_unhealthy_and_excluded_nodes() {
+        let mut sm = live_topology();
+        sm.nodes.get_mut(&2).unwrap().health = HealthStatus::Quarantined;
+        sm.nodes.get_mut(&3).unwrap().health = HealthStatus::Maintenance;
+        assert!(fill(&sm, &["data01:9500"], 2).is_empty());
+        // Only node 3 healthy but client-excluded: still none.
+        sm.nodes.get_mut(&3).unwrap().health = HealthStatus::Healthy;
+        let vol = &sm.volumes["default"];
+        let ex: std::collections::HashSet<String> = ["data03:9500".to_string()].into();
+        let got = fill_floor_targets(
+            &sm.nodes, &vol.effective_mandatory_replicas(), &vol.spill,
+            &dtfs_common::config::PlacementConfig::default(),
+            &Location::new("", "", "", ""), DiskTier::Cold,
+            &["data01:9500".to_string()], 2, &ex,
+        );
+        assert!(got.is_empty());
+    }
+
+    /// Cache-only (RF 0) disks and BZ-forbidden tiers are never fill targets.
+    #[test]
+    fn floor_fill_skips_cache_only_and_forbidden_tiers() {
+        let mut sm = live_topology();
+        sm.nodes.insert(4, lab_node("data04", "toro", DiskTier::Hot, HealthStatus::Healthy));
+        // hot RF 0 => data04 ignored; data02/03 still picked.
+        let got = fill(&sm, &["data01:9500"], 2);
+        assert_eq!(got.len(), 1);
+        assert_ne!(got[0], "data04:9500");
+        // Forbid warm spill: nothing left.
+        sm.volumes.get_mut("default").unwrap().spill.forbidden_tiers = vec!["warm".into()];
+        assert!(fill(&sm, &["data01:9500"], 2).is_empty());
+    }
+
+    /// Cold-only commit on the live topology is rejected (min 1 < floor 2);
+    /// cold + warm passes.
+    #[test]
+    fn commit_gate_cold_only_rejected_cold_plus_warm_accepted() {
+        let sm = live_topology();
+        let floor = clamp_ack_floor_to_capacity(2, &sm, "default", "/a", None);
+        assert_eq!(floor, 2, "3 maintained nodes can hold 2 copies");
+        let cold_only = min_maintained_replicas(&sm, "default", &[ent("1")]);
+        assert_eq!(cold_only, 1);
+        assert!((cold_only as u32) < floor, "single cold copy must be rejected");
+        let both = min_maintained_replicas(&sm, "default", &[ent("1"), ent("2")]);
+        assert_eq!(both, 2);
+        assert!(both as u32 >= floor);
+    }
+
+    /// One data node / one maintained disk: floor clamps to 1 and commits
+    /// (CR-6-2 reason the clamp exists).
+    #[test]
+    fn commit_gate_single_node_clamps_floor_to_one() {
+        let mut sm = StateMachineData::default();
+        sm.volumes.insert("default".to_string(), vol_with_floor("default", 2));
+        sm.nodes.insert(1, lab_node("data01", "leli", DiskTier::Cold, HealthStatus::Healthy));
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, "default", "/a", None), 1);
+        assert_eq!(min_maintained_replicas(&sm, "default", &[ent("1")]), 1);
+        // A floor already within capacity is untouched.
+        assert_eq!(clamp_ack_floor_to_capacity(1, &sm, "default", "/a", None), 1);
+    }
+
+    /// A replica on a cache-only tier (RF 0) does not count toward the floor.
+    #[test]
+    fn cache_only_replica_does_not_count_toward_floor() {
+        let mut sm = live_topology();
+        sm.nodes.insert(4, lab_node("data04", "toro", DiskTier::Hot, HealthStatus::Healthy));
+        // cold + hot(cache): only the cold one counts.
+        assert_eq!(min_maintained_replicas(&sm, "default", &[ent("1"), ent("4")]), 1);
+        // hot only: zero maintained replicas.
+        assert_eq!(min_maintained_replicas(&sm, "default", &[ent("4")]), 0);
+        // Hot nodes add no capacity.
+        assert_eq!(
+            maintained_node_capacity(&sm, &sm.volumes["default"].effective_mandatory_replicas()),
+            3
+        );
+    }
+
+    /// Other nodes quarantined / in maintenance: capacity (and so the
+    /// clamp) drops to what is available, here 1 (only data01), so the
+    /// cold-only commit is accepted rather than failing forever; with one
+    /// warm node back it needs 2 again.
+    #[test]
+    fn floor_clamps_to_available_when_peers_unavailable() {
+        let mut sm = live_topology();
+        sm.nodes.get_mut(&2).unwrap().health = HealthStatus::Quarantined;
+        sm.nodes.get_mut(&3).unwrap().health = HealthStatus::Maintenance;
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, "default", "/a", None), 1);
+        sm.nodes.get_mut(&3).unwrap().health = HealthStatus::Healthy;
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, "default", "/a", None), 2);
+    }
+
+    /// Property-style: over many topologies, the allocator fill plus one
+    /// anchor target reaches min(floor, capacity) distinct nodes, never
+    /// duplicates, and keeps the anchor target.
+    #[test]
+    fn floor_fill_reaches_min_of_floor_and_capacity() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut rnd = move |m: u64| {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            seed % m
         };
-        // Only the RF-0 tier: floor untouched.
-        assert_eq!(
-            clamp_ack_floor_to_rf(2, &sm, &[entry("1")], "cachey", "/a", None),
-            2
-        );
-        // RF-0 tier + RF-1 tier: clamps to 1, never 0.
-        assert_eq!(
-            clamp_ack_floor_to_rf(2, &sm, &[entry("1"), entry("2")], "cachey", "/a", None),
-            1
-        );
+        for _ in 0..300 {
+            let mut sm = StateMachineData::default();
+            let floor = 1 + rnd(4) as u32;
+            let mut vol = vol_with_floor("default", floor);
+            vol.mandatory_replicas = dtfs_common::types::TierReplication {
+                hot: rnd(2) as u32, warm: rnd(3) as u32, cold: 1, tape: 0,
+            };
+            sm.volumes.insert("default".to_string(), vol);
+            sm.nodes.insert(1, lab_node("data01", "leli", DiskTier::Cold, HealthStatus::Healthy));
+            for id in 2..(2 + rnd(5)) {
+                let tier = [DiskTier::Hot, DiskTier::Warm, DiskTier::Cold][rnd(3) as usize];
+                let health = [HealthStatus::Healthy, HealthStatus::Healthy, HealthStatus::Quarantined, HealthStatus::Maintenance][rnd(4) as usize];
+                sm.nodes.insert(id, lab_node(&format!("data{id:02}"), "toro", tier, health));
+            }
+            let mand = sm.volumes["default"].effective_mandatory_replicas();
+            let cap = maintained_node_capacity(&sm, &mand);
+            let existing = vec!["data01:9500".to_string()];
+            let vol = &sm.volumes["default"];
+            let extra = fill_floor_targets(
+                &sm.nodes, &mand, &vol.spill,
+                &dtfs_common::config::PlacementConfig::default(),
+                &Location::new("", "", "", ""), DiskTier::Cold, &existing, floor,
+                &std::collections::HashSet::new(),
+            );
+            let mut all = existing.clone();
+            all.extend(extra);
+            let uniq: std::collections::HashSet<_> = all.iter().collect();
+            assert_eq!(uniq.len(), all.len(), "no duplicate targets");
+            assert_eq!(all[0], "data01:9500", "anchor target kept first");
+            assert_eq!(all.len() as u32, floor.min(cap), "floor {floor} cap {cap}");
+        }
     }
 
     /// CR-3-3/MGR-1 helper — a Data node with one disk of the given tier.
