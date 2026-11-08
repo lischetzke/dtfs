@@ -5,7 +5,7 @@ default_cluster = "prod"
 [clusters.prod]
 managers          = ["mgr01:9402", "mgr02:9402", "mgr03:9402"]
 shared_secret     = ""                  # [cluster].shared_secret, or:
-shared_secret_env = "DTFS_LM_SECRET"
+shared_secret_env = "DTFS_SHARED_SECRET"
 ssh_user          = "root"
 ssh_key           = "~/.ssh/dtfs-deploy/id_ed25519"
 ssh_port          = 22
