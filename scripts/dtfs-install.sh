@@ -48,13 +48,21 @@ AZ-2 source selection flags (in addition to the legacy positional arg):
                                `github` is accepted as an alias); `auto`
                                tries local first, then remote.
   --version <tag>              Release tag (default `latest` = newest full
-                               vX.Y.Z release). Honoured for source=remote
-                               and the auto fallback. Ignored for local.
+                               vX.Y.Z release). With auto, a given tag skips
+                               local candidates (no stale cache); with local,
+                               only dtfs-<tag>-linux-amd64.tar.gz matches.
 
 Config flags (also usable interactively as prompt defaults):
   --noninteractive             no prompts; --role and --managers required
   --reconfigure                re-render an existing /etc/dtfs/<role>.toml
   --hostname H  --cluster-name N  --managers h:9401,...  --secret S
+  --managers for role manager: hostname=addr:port,... (hostname = that
+                               manager's [node].hostname; bare addresses are
+                               refused, except a single self entry with
+                               --bootstrap true). data/fuse also accept
+                               the hostname=addr form and ignore the name.
+  --chown-disks                data role: chown the disk paths to dtfs:dtfs
+                               (default: only print the chown command)
   --bootstrap true|false (manager)  --disks /a,/b (data)
   --mountpoint P (fuse-client)
   --uninstall [--purge --yes]  remove units/binaries; --purge --yes also
@@ -88,6 +96,7 @@ MGR_LIST=""
 SHARED_SECRET="${DTFS_SHARED_SECRET:-}"
 BOOTSTRAP=""
 DISKS=""
+CHOWN_DISKS=0
 MOUNTPOINT=""
 TARBALL=""
 ROLE_ARG=""
@@ -115,6 +124,7 @@ while [ $# -gt 0 ]; do
         --secret)       shift; SHARED_SECRET="${1:-}" ;;
         --bootstrap)    shift; BOOTSTRAP="${1:-}" ;;
         --disks)        shift; DISKS="${1:-}" ;;
+        --chown-disks)  CHOWN_DISKS=1 ;;
         --mountpoint)   shift; MOUNTPOINT="${1:-}" ;;
         --role)
             shift; ROLE_ARG="${1:-}"
@@ -149,7 +159,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
     step "Uninstall mode"
     systemctl disable --now dtfs-manager.service 2>/dev/null || true
     systemctl disable --now dtfs-data.service 2>/dev/null || true
-    for u in $(systemctl list-units --type=service --no-legend 'dtfs-fuse@*' 2>/dev/null | awk '{print $1}'); do
+    for u in $(systemctl list-units --plain --no-legend --all 'dtfs-fuse@*' 2>/dev/null | awk '{print $1}'); do
         systemctl disable --now "$u" || true
     done
     rm -f /usr/local/bin/dtfs-{manager,data,fuse,cli}
@@ -177,11 +187,13 @@ fi
 # explicit tarball (legacy workflow stays unchanged).
 if [ -z "$TARBALL" ]; then
     select_tarball_local() {
+        local tag="*"
+        [ -z "$VERSION" ] || [ "$VERSION" = "latest" ] || tag="$VERSION"
         local candidates=(
-            "${DTFS_LOCAL_BIN_DIR:-}/dtfs-*-linux-amd64.tar.gz"
-            "./target/release/dtfs-*-linux-amd64.tar.gz"
-            "/opt/dtfs/staging/"*"/dtfs-*-linux-amd64.tar.gz"
-            "${DOWNLOAD_CACHE}/dtfs-*-linux-amd64.tar.gz"
+            "${DTFS_LOCAL_BIN_DIR:-}/dtfs-${tag}-linux-amd64.tar.gz"
+            "./target/release/dtfs-${tag}-linux-amd64.tar.gz"
+            "/opt/dtfs/staging/"*"/dtfs-${tag}-linux-amd64.tar.gz"
+            "${DOWNLOAD_CACHE}/dtfs-${tag}-linux-amd64.tar.gz"
         )
         for pattern in "${candidates[@]}"; do
             [ -z "$pattern" ] && continue
@@ -267,7 +279,11 @@ if [ -z "$TARBALL" ]; then
             }
             ;;
         auto)
-            if select_tarball_local; then
+            # An explicit tag must not be satisfied by whatever is cached locally.
+            if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
+                select_tarball_local || true
+            fi
+            if [ -n "$TARBALL" ]; then
                 :
             elif download_tarball_remote; then
                 :
@@ -322,6 +338,37 @@ gen_secret() {
     fi
 }
 
+# Split "host=addr" --managers entries into MGR_HOSTS/MGR_ADDRS. Node ids
+# derive from [node].hostname, so a voter name guessed from its address would
+# not match the hostname that manager actually runs with.
+parse_managers() {
+    MGR_HOSTS=(); MGR_ADDRS=()
+    local -a ents; local e h self=0
+    IFS=',' read -ra ents <<<"$MGR_LIST"
+    for e in "${ents[@]}"; do
+        case "$e" in
+            *=*) MGR_HOSTS+=("${e%%=*}"); MGR_ADDRS+=("${e#*=}") ;;
+            *)
+                if [ "$ROLE" = "manager" ]; then
+                    if [ "$BOOTSTRAP" = "true" ] && [ "${#ents[@]}" -eq 1 ]; then
+                        MGR_HOSTS+=("$HOSTNAME_FQ")
+                    else
+                        error "--managers entry '$e' has no hostname; use hostname=addr:port (hostname must equal that manager's [node].hostname)"
+                        return 1
+                    fi
+                else
+                    MGR_HOSTS+=("")
+                fi
+                MGR_ADDRS+=("$e")
+                ;;
+        esac
+    done
+    if [ "$ROLE" = "manager" ] && [ "$BOOTSTRAP" = "true" ]; then
+        for h in "${MGR_HOSTS[@]}"; do [ "$h" = "$HOSTNAME_FQ" ] && self=1; done
+        [ "$self" -eq 1 ] || { error "bootstrap manager '$HOSTNAME_FQ' is not named in --managers; its entry must be $HOSTNAME_FQ=<routable addr:port>"; return 1; }
+    fi
+}
+
 if [ -n "$ROLE_ARG" ]; then
     ROLE="$ROLE_ARG"
 elif [ "$NONINT" -eq 1 ]; then
@@ -355,7 +402,7 @@ if [ "$KEEP_CFG" -eq 0 ]; then
     ask SHARED_SECRET "Auth" "Cluster shared secret (32+ hex chars):" "$SHARED_SECRET"
     [ -n "$SHARED_SECRET" ] || { error "shared secret required"; exit 1; }
 
-    ask MGR_LIST "Cluster managers" "Comma-separated manager addresses (host:9401):" ""
+    ask MGR_LIST "Cluster managers" "Comma-separated managers (hostname=addr:9401; hostname = that manager's [node].hostname):" ""
     [ -z "$MGR_LIST" ] && { error "manager list required"; exit 1; }
 
     ask CLUSTER_NAME "Cluster identity" "Cluster name:" "dtfs-cluster"
@@ -378,6 +425,7 @@ if [ "$KEEP_CFG" -eq 0 ]; then
             ask MOUNTPOINT "Mount" "Mount point:" "/mnt/dtfs"
             ;;
     esac
+    parse_managers || exit 1
 fi
 if [ "$ROLE" = "fuse-client" ] && [ -z "$MOUNTPOINT" ]; then
     MOUNTPOINT="$(grep -hE '^[[:space:]]*mountpoint[[:space:]]*=' "$CFG" | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/')"
@@ -415,11 +463,9 @@ install -m 0644 "$TMP/dtfs/systemd/"*.service /etc/systemd/system/ 2>/dev/null |
 
 # ─── render config + start service ───────────────────────────────────────────
 render_manager() {
-    local -a MGRS; IFS=',' read -ra MGRS <<<"$MGR_LIST"
-    local VOTERS="" m host
-    for m in "${MGRS[@]}"; do
-        host="${m%:*}"
-        VOTERS+="  { hostname = \"$host\", addr = \"$m\" },
+    local VOTERS="" i
+    for i in "${!MGR_ADDRS[@]}"; do
+        VOTERS+="  { hostname = \"${MGR_HOSTS[$i]}\", addr = \"${MGR_ADDRS[$i]}\" },
 "
     done
     cat > "$CFG" <<EOF
@@ -455,12 +501,19 @@ listen_addr = "0.0.0.0:9402"
 
 [tls]
 mode = "off"
+
+# Required tables (no serde default on ManagerConfig); empty = built-in defaults.
+[defaults]
+
+[tiering]
+
+[monitoring]
 EOF
     chown dtfs:dtfs "$CFG"; chmod 0640 "$CFG"
 }
 
 render_data() {
-    local -a MGRS DKS; IFS=',' read -ra MGRS <<<"$MGR_LIST"; IFS=',' read -ra DKS <<<"$DISKS"
+    local -a MGRS DKS; MGRS=("${MGR_ADDRS[@]}"); IFS=',' read -ra DKS <<<"$DISKS"
     cat > "$CFG" <<EOF
 [node]
 id = "auto"
@@ -510,7 +563,7 @@ EOF
 }
 
 render_fuse() {
-    local -a MGRS; IFS=',' read -ra MGRS <<<"$MGR_LIST"
+    local -a MGRS; MGRS=("${MGR_ADDRS[@]}")
     cat > "$CFG" <<EOF
 [client]
 manager_addr = "${MGRS[0]}"
@@ -560,10 +613,15 @@ case "$ROLE" in
         # read-only unless listed. Derive from the config actually in use.
         DISK_PATHS="$(grep -E '^[[:space:]]*path[[:space:]]*=' "$CFG" | sed -E 's/^[^"]*"([^"]*)".*/\1/' | tr '\n' ' ')"
         install -d -m 0755 /etc/systemd/system/dtfs-data.service.d
-        printf '[Service]\nReadWritePaths=%s\n' "$DISK_PATHS" \
+        # "-" prefix: a not-yet-mounted disk must not fail the unit namespace.
+        printf '[Service]\nReadWritePaths=%s\n' "$(for d in $DISK_PATHS; do printf -- '-%s ' "$d"; done)" \
             > /etc/systemd/system/dtfs-data.service.d/disks.conf
         for d in $DISK_PATHS; do
-            [ -d "$d" ] || warn "disk path $d does not exist; mount it and restart dtfs-data"
+            [ -d "$d" ] || { warn "disk path $d does not exist; mount it and restart dtfs-data"; continue; }
+            if [ "$CHOWN_DISKS" -eq 1 ]; then chown dtfs:dtfs "$d"; fi
+            if ! runuser -u dtfs -- test -w "$d" 2>/dev/null; then
+                warn "user dtfs cannot write $d; run: chown dtfs:dtfs $d  (or re-run with --chown-disks)"
+            fi
         done
         systemctl daemon-reload
         systemctl enable dtfs-data.service

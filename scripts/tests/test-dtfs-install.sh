@@ -46,7 +46,10 @@ tmpdir=$(mktemp -d)
 trap "rm -rf $tmpdir" EXIT
 check "local search defines DOWNLOAD_CACHE" bash -c "grep -q 'DOWNLOAD_CACHE' '$SCRIPT'"
 check "local search defines STAGING_ROOT"   bash -c "grep -q 'STAGING_ROOT' '$SCRIPT'"
-check "auto first tries local then github"  bash -c "grep -q 'select_tarball_local || download_tarball_github\\|select_tarball_local; then' '$SCRIPT'"
+check "auto first tries local then remote"  bash -c "grep -q 'select_tarball_local || true' '$SCRIPT'"
+check "explicit --version skips local in auto" bash -c "grep -q 'An explicit tag must not be satisfied' '$SCRIPT'"
+check "manager config renders required tables" bash -c "sed -n '/^render_manager/,/^}/p' '$SCRIPT' | grep -q '^.monitoring.\$'"
+check "data disks drop-in uses optional -paths" bash -c "grep -q \"printf -- '-%s '\" '$SCRIPT'"
 check "github URL is from DTFS_REPO_URL"    bash -c "grep -q 'DTFS_REPO_URL' '$SCRIPT'"
 
 echo
