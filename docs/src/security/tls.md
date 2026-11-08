@@ -14,45 +14,18 @@
 > a live cluster.
 
 DTFS can secure all inter-node gRPC with mutual TLS. **The operator
-provisions the certificates** (`[tls]` `cert_file`/`key_file`/`ca_file` on
-every node — own PKI or certs generated with the cluster-CA machinery
-below); with no files configured the cluster stays plaintext.
+provisions the certificates**: set `[tls]` `cert_file`/`key_file`/`ca_file`
+on every node. The manager does not generate or distribute a CA during
+node join; with no files configured the cluster stays plaintext.
 
-> **Join-issued certificates are NOT yet consumed by the TLS layer.** The
-> join handshake's CA + node-cert machinery (below) runs, but the issued
-> certificates are held in memory only — nothing persists them to the
-> `cert_file`/`key_file`/`ca_file` paths that `TlsContext` loads, and the
-> lazily generated CA dies with the manager process. Wiring join-issued
-> certs into `[tls]` automatically is a follow-up; until then, distribute
-> certificates out-of-band per the [Rollout](#rollout-enabling-tls-on-an-existing-cluster).
+## Provisioning Certificates
 
-## Auto-Generated Cluster CA
+Use your own PKI, or generate a CA and node certificates with any external
+tool (openssl, step, cfssl). `dtfs_common::crypto::generate_cluster_ca` and
+`generate_node_cert` exist only as test helpers; they are not wired into
+the join protocol or the `[tls]` loader.
 
-When the first data node joins the cluster and no custom certificates are configured, the manager lazily generates a self-signed CA certificate using the `rcgen` crate. This CA is used to sign individual node certificates throughout the lifetime of the cluster.
-
-The auto-generated CA has the following properties:
-
-| Field | Value |
-|-------|-------|
-| Common Name | `DTFS CA - <cluster_name>` |
-| Organization | `DTFS` |
-| Key Type | ECDSA (P-256, via `rcgen::KeyPair::generate`) |
-| CA Constraint | `BasicConstraints::Unconstrained` |
-
-The CA certificate and private key are held in memory on the manager leader and are distributed to joining nodes during the [Cluster Join Protocol](./cluster-join.md).
-
-### Node Certificate Generation
-
-When a node completes the join handshake, the manager generates a node-specific certificate signed by the cluster CA:
-
-1. A new ECDSA key pair is generated for the node.
-2. The certificate's Common Name is set to the node's hostname.
-3. A Subject Alternative Name (SAN) DNS entry is added for the hostname.
-4. The certificate is signed by the cluster CA key.
-
-Both the node certificate and private key are returned to the joining node in PEM format.
-
-## Custom Certificates
+## Configuration
 
 For environments with existing certificate infrastructure, operators can provide their own CA and node certificates by configuring the TLS section of each component's TOML file:
 
@@ -64,7 +37,7 @@ key_file = "/etc/dtfs/certs/node-key.pem"
 ca_file = "/etc/dtfs/certs/ca.pem"
 ```
 
-When custom certificates are provided, the auto-generation logic is skipped entirely. The CA certificate is still distributed to joining nodes so they can validate peer connections.
+Every node needs the CA certificate in `ca_file`; nothing distributes it at join time.
 
 ### Mode semantics
 
@@ -81,7 +54,7 @@ restart.
 
 ### Certificate Requirements
 
-Custom certificates must satisfy these requirements:
+Certificates must satisfy these requirements:
 
 - The CA certificate must have the `CA:TRUE` basic constraint.
 - Node certificates must include a SAN entry for **every address peers dial
@@ -100,9 +73,6 @@ Custom certificates must satisfy these requirements:
   bracketed (`http://[2001:db8::1]:9500`); the TLS server-name check does
   not currently strip the brackets, so TLS-enabled clusters must dial
   nodes via IPv4 or DNS names.
-- `generate_node_cert` issues a single SAN (IP or DNS, from the
-  hostname argument); certs covering several addresses must be produced
-  with external tooling.
 
 ## Mutual TLS (mTLS)
 
@@ -142,7 +112,6 @@ DTFS uses `rustls` with the `ring` cryptographic backend for all TLS operations.
 | `rustls` | TLS protocol | Connection establishment, handshake, record layer |
 | `ring` | Cryptography | ECDSA signatures, AES-GCM encryption, key agreement |
 | `tokio-rustls` | Async integration | TLS streams over Tokio async I/O |
-| `rcgen` | Certificate generation | Auto-generated CA and node certificates |
 | `rustls-pemfile` | PEM parsing | Loading custom certificates from disk |
 
 ### Supported Cipher Suites

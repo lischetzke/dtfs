@@ -78,7 +78,7 @@ legacy skip.
 `dtfs-client` (FUSE / CLI) stamps these from `[client].shared_secret`.
 Read-only RPCs (`GetFileLocations`, `ListDirectory`, …) stay open.
 `RegisterNode` keeps its body `shared_secret` field; `ForwardClientWrite`
-keeps CO-2-2 body auth; heartbeats stay on the data-node trust path.
+keeps CO-2-2 body auth. `Heartbeat` and `ReportChunkStatus` are mutating and carry the same stamp.
 
 **REST and gRPC are independent gates** — securing only `:9402` leaves
 `:9401` open to anyone who can dial the leader.
@@ -125,6 +125,8 @@ InstallSnapshot) between managers carries the `x-dtfs-rpc-ts` /
 `x-dtfs-rpc-mac` pair (method `RaftRpc`, empty binding, `dtfs-mgr-rpc`
 plane, 300 s skew). The receiver verifies the stamp before reading the body.
 
+- The Raft request body is capped at the manager gRPC message limit
+  (`[grpc].max_message_size_mb`); larger bodies are rejected before parsing.
 - A stamped-but-invalid request (bad MAC, skew, one header only) is always
   rejected with `PermissionDenied`.
 - An unsigned request is accepted with a rate-limited warning unless
@@ -139,3 +141,14 @@ plane, 300 s skew). The receiver verifies the stamp before reading the body.
 Data nodes and FUSE clients prove the secret via gRPC `RegisterNode`
 (`shared_secret` field) or the HMAC join handshake — see
 [cluster-join.md](./cluster-join.md).
+
+## Secret handling
+
+- `GET /api/v1/config` and the WebUI editor show every secret leaf (and
+  webhook URL) as `***`. Writing `***` back means "unchanged"; the real value
+  is never round-tripped.
+- When a config update is persisted, `manager.toml` is replaced via a
+  `0600` temp file, `fsync`, then atomic rename, because it carries
+  `cluster.shared_secret`.
+- Rejected REST mutations are audited as `auth.denied`, coalesced per
+  (source, path) per 60 s window; see [Audit Log](./audit-log.md).

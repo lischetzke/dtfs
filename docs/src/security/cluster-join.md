@@ -2,7 +2,7 @@
 
 When a new node starts and contacts the manager to register itself, it must prove that it holds the cluster's shared secret. DTFS uses a two-phase handshake based on HMAC-SHA256 to authenticate joining nodes without transmitting the secret over the network.
 
-> **Scope.** This protocol covers **data-node and client registration**: the HMAC handshake, cluster CA issuance, and the `RegisterNode` write that records the node in the node registry. It does **not** change Raft membership. Adding, promoting, or removing a *manager* in the Raft voter/learner set is a separate operation through the membership API (`/api/v1/raft/{add-learner,promote,remove}` and `dtfs-cli raft …`); see [Cluster Management → Adding a Manager Node](../operations/cluster-management.md#adding-a-manager-node).
+> **Scope.** This protocol covers **data-node and client registration**: the HMAC handshake and the `RegisterNode` write that records the node in the node registry. It does **not** change Raft membership. Adding, promoting, or removing a *manager* in the Raft voter/learner set is a separate operation through the membership API (`/api/v1/raft/{add-learner,promote,remove}` and `dtfs-cli raft …`); see [Cluster Management → Adding a Manager Node](../operations/cluster-management.md#adding-a-manager-node).
 
 ## Prerequisites
 
@@ -42,7 +42,7 @@ The join handshake consists of two gRPC calls defined in `cluster.proto` via the
        |                                          |  Verify HMAC(secret, nonce)
        |                                          |  Generate challenge nonce
        |  2. JoinResponse(accepted, challenge,     |
-       |     ca_cert, managers)                    |
+       |     managers)                             |
        |<-----------------------------------------|
        |                                          |
        |  3. CompleteJoin(challenge,               |
@@ -80,7 +80,6 @@ The node sends a `JoinRequest` containing:
 The manager receives the request and performs the following checks:
 
 1. **HMAC verification** -- Recomputes `HMAC-SHA256(shared_secret, nonce)` using its own copy of the shared secret and compares the result against the provided `secret_hmac` using constant-time comparison to prevent timing attacks.
-2. **Duplicate check** -- Verifies the node is not already registered.
 
 If HMAC verification fails, the manager returns a `JoinResponse` with `accepted = false` and a rejection reason. The attempt is recorded in the audit log.
 
@@ -150,7 +149,7 @@ Nonces are generated using 32 bytes from the system's cryptographically secure r
 | No client-trusted identity | `node_id` is derived server-side from the hostname; the client cannot choose it |
 | Replay prevention | Fresh random nonce per request; each nonce/challenge is single-use |
 | Timing attack resistance | Constant-time HMAC comparison |
-| Man-in-the-middle prevention | CA certificate distributed during join; subsequent connections use mTLS |
+| Transport protection | Not provided by the join itself; enable operator-provisioned mTLS ([TLS](./tls.md)) |
 | Audit trail | All join attempts (accepted and rejected) are recorded in the audit log |
 
 ## Rejection Scenarios
@@ -159,7 +158,7 @@ A join request is rejected if:
 
 - The HMAC does not match (wrong shared secret) — Phase 1 over the nonce, or Phase 2 over the challenge.
 - The Phase 2 challenge is unknown or expired (no matching Phase 1, TTL elapsed, or already consumed).
-- The manager cluster has no elected leader (request cannot be processed).
+- The manager cluster has no elected leader (the registration write cannot be committed).
 
 Rejected join attempts are logged as `node.join.request` with result `rejected` in the audit log.
 

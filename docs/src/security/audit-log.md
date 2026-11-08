@@ -4,7 +4,7 @@ DTFS maintains an append-only audit log that records security-relevant and admin
 
 ## Architecture
 
-The audit log is implemented as an in-memory ring buffer on the manager node. When the buffer reaches its maximum capacity (default: 10,000 entries), the oldest entries are evicted to make room for new ones.
+The audit log is an in-memory ring buffer on each manager, optionally mirrored to a daily-rotated JSONL file (`archive_dir`) and, with `replicate_via_raft`, to the Raft state machine. When the buffer reaches its maximum capacity (default: 10,000 entries), the oldest entries are evicted to make room for new ones.
 
 All state-mutating operations that pass through the manager -- node joins, configuration changes, maintenance mode toggles, scrub triggers -- are automatically recorded.
 
@@ -168,7 +168,9 @@ The audit entry fields map naturally to common SIEM schemas:
 
 ## Audit Log and Raft
 
-Audit entries are written locally on the manager leader. They are not replicated through Raft to avoid adding high-frequency writes to the consensus log. If the leader changes, the new leader starts with an empty audit buffer. For durable audit history, use the JSON export mechanism to persist entries to external storage.
+With `replicate_via_raft = false` (default) events live only in the observing manager's local ring and JSONL archive. With `true`, each event is also proposed as an `AppendAudit` Raft write (spawn-and-forget, 5 s timeout; a failed proposal never blocks the request) and every manager's state machine holds the same capped log.
+
+Rows the state machine itself writes while applying a command (node registration, chunk-location changes, and so on) carry no wall-clock time. Their timestamp is the proposer's `now_ms` where the command has one, otherwise the committed Raft log index, so every replica and every replay produces the identical entry. `AppendAudit` rows carry the originating manager's timestamp. Treat a state-machine-written timestamp that looks tiny as a log index, not a date.
 
 ## Rejected REST mutations (`auth.denied`)
 
