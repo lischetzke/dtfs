@@ -129,4 +129,7 @@ mountpoint = "/mnt/dtfs"
 # read_package_registry) or access token (glpat-..., scope read_api).
 #repo_url = "https://github.com/lischetzke/dtfs"
 #token = ""
+# Minisign public key the release SHA256SUMS must be signed with (empty =
+# unverified, warning printed). Env DTFS_MINISIGN_PUBKEY overrides.
+#minisign_public_key = ""
 #install_dir = "/usr/local/bin"

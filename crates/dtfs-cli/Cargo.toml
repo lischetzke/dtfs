@@ -22,4 +22,5 @@ clap = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
+minisign-verify = "0.3"
 tempfile = { workspace = true }

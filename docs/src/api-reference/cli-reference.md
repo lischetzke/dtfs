@@ -945,5 +945,6 @@ mgr04                  8841...                10.1.0.1:9401            learner
 |----------|-------------|
 | `DTFS_MANAGER` | Default manager address (overridden by `--manager` flag) |
 | `DTFS_TOKEN` | JWT authentication token |
+| `DTFS_MINISIGN_PUBKEY` | Minisign public key for `update` release verification (overrides `[updater].minisign_public_key`) |
 | `DTFS_REPO_URL` | Default release repo for `update` (overridden by `--repo-url` and by `[updater].repo_url`) |
 | `DTFS_SHARED_SECRET` | Cluster shared secret for `raft add-learner`/`promote`/`remove` (overridden by `--secret`) |

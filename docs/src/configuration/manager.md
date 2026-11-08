@@ -347,6 +347,7 @@ absent. The same block is honoured in `data.toml` and `fuse.toml`;
 |--------|-----------|------|---------|-------------|-------------|
 | `repo_url` | `updater.repo_url` | `String` | `https://github.com/lischetzke/dtfs` | No | Project the release tarball is pulled from. A GitLab project URL resolves to the Generic Package Registry (`<host>/api/v4/projects/<group>%2F<project>/packages/generic/dtfs/<tag>/dtfs-linux-amd64.tar.gz`, `latest` = newest full `vX.Y.Z` release, alphas skipped); a github.com URL keeps the legacy `releases/download` layout. Overridden by `--repo-url` and `DTFS_REPO_URL`. |
 | `token` | `updater.token` | `String` | `""` | No | GitLab token for a private project: a deploy token (`gldt-...`, scope `read_package_registry`, sent as `DEPLOY-TOKEN`) or a project/personal access token (`glpat-...`, scope `read_api`, sent as `PRIVATE-TOKEN`). Same 0640 file as `cluster.shared_secret`. Overridden by `--token` and `DTFS_REPO_TOKEN`. |
+| `minisign_public_key` | `updater.minisign_public_key` | `String` | `""` | No | Minisign public key (base64 line or full `.pub` text). When set, `dtfs-cli update` downloads `SHA256SUMS` + `SHA256SUMS.minisig`, verifies the signature, checks the tarball against `SHA256SUMS` and refuses the install on any failure. Empty = unverified (warning printed). Overridden by `DTFS_MINISIGN_PUBKEY`. |
 | `install_dir` | `updater.install_dir` | `String` | `/usr/local/bin` | No | Directory binaries are installed into. Overridden by `--install-dir`. |
 
 ### Example

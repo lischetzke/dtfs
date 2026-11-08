@@ -322,6 +322,14 @@ pub struct UpdaterConfig {
     /// in the same 0640 file as `cluster.shared_secret`.
     #[serde(default)]
     pub token: String,
+    /// Minisign public key (base64 line, or the full `.pub` file text) the
+    /// release `SHA256SUMS` must be signed with. When set, `dtfs-cli update`
+    /// also downloads `SHA256SUMS.minisig`, verifies it and checks the
+    /// tarball against `SHA256SUMS`; any failure refuses the install.
+    /// Overridden by the `DTFS_MINISIGN_PUBKEY` env var. Empty = unverified
+    /// (the in-tarball MANIFEST is then the only check; a warning is printed).
+    #[serde(default)]
+    pub minisign_public_key: String,
 }
 
 impl Default for UpdaterConfig {
@@ -330,6 +338,7 @@ impl Default for UpdaterConfig {
             repo_url: default_updater_repo_url(),
             install_dir: default_updater_install_dir(),
             token: String::new(),
+            minisign_public_key: String::new(),
         }
     }
 }

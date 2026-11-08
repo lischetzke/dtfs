@@ -235,10 +235,14 @@ pub fn run(
     let cfg_path = config_path
         .map(PathBuf::from)
         .or_else(|| default_config_path(target));
-    let (cfg_repo, cfg_install, cfg_token) = match cfg_path {
+    let (cfg_repo, cfg_install, cfg_token, cfg_key) = match cfg_path {
         Some(ref p) if p.exists() => read_updater_section(p)?,
-        _ => (None, None, None),
+        _ => (None, None, None, None),
     };
+    let minisign_key = std::env::var("DTFS_MINISIGN_PUBKEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or(cfg_key.filter(|s| !s.trim().is_empty()));
 
     let env_repo = std::env::var("DTFS_REPO_URL").ok();
     let repo_url = resolve_repo_url(
@@ -259,7 +263,16 @@ pub fn run(
     if check {
         return run_check(target, &source, &headers, &install_dir);
     }
-    run_update(target, &source, &headers, tag.as_deref(), &install_dir, no_restart, yes)
+    run_update(
+        target,
+        &source,
+        &headers,
+        tag.as_deref(),
+        &install_dir,
+        minisign_key.as_deref(),
+        no_restart,
+        yes,
+    )
 }
 
 /// Resolve the tarball URL for `tag` (or the latest full release).
@@ -295,12 +308,15 @@ fn default_config_path(t: UpdateTarget) -> Option<PathBuf> {
 
 /// Read just the `[updater]` block from any dtfs `.toml` (serde ignores
 /// the rest). `Option` fields so we can tell "set" from "defaulted".
-fn read_updater_section(path: &Path) -> Result<(Option<String>, Option<String>, Option<String>)> {
+fn read_updater_section(
+    path: &Path,
+) -> Result<(Option<String>, Option<String>, Option<String>, Option<String>)> {
     #[derive(serde::Deserialize, Default)]
     struct Section {
         repo_url: Option<String>,
         install_dir: Option<String>,
         token: Option<String>,
+        minisign_public_key: Option<String>,
     }
     #[derive(serde::Deserialize, Default)]
     struct File {
@@ -309,15 +325,18 @@ fn read_updater_section(path: &Path) -> Result<(Option<String>, Option<String>, 
     }
     let f: File = dtfs_common::config::load_config(path)
         .with_context(|| format!("reading [updater] from {}", path.display()))?;
-    Ok((f.updater.repo_url, f.updater.install_dir, f.updater.token))
+    let u = f.updater;
+    Ok((u.repo_url, u.install_dir, u.token, u.minisign_public_key))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_update(
     target: UpdateTarget,
     source: &ReleaseSource,
     headers: &[String],
     tag: Option<&str>,
     install_dir: &str,
+    minisign_key: Option<&str>,
     no_restart: bool,
     yes: bool,
 ) -> Result<()> {
@@ -333,6 +352,25 @@ fn run_update(
     let tarball = tmp.join(ASSET);
     eprintln!("Downloading {url}");
     curl_download(&url, headers, &tarball)?;
+
+    match minisign_key {
+        Some(key) => {
+            let sums_url = sibling_url(&url, SUMS_ASSET);
+            let sums_path = tmp.join(SUMS_ASSET);
+            let sig_path = tmp.join(format!("{SUMS_ASSET}.minisig"));
+            eprintln!("Downloading {sums_url} (+ .minisig)");
+            curl_download(&sums_url, headers, &sums_path)?;
+            curl_download(&format!("{sums_url}.minisig"), headers, &sig_path)?;
+            let sums = std::fs::read(&sums_path).context("reading SHA256SUMS")?;
+            let sig = std::fs::read_to_string(&sig_path).context("reading SHA256SUMS.minisig")?;
+            verify_signed_sums(key, &sums, &sig, &sha256_file(&tarball)?)?;
+            eprintln!("verified {SUMS_ASSET} signature and {ASSET} checksum");
+        }
+        None => eprintln!(
+            "warning: no minisign public key configured ([updater].minisign_public_key / \
+             DTFS_MINISIGN_PUBKEY); release authenticity is NOT verified"
+        ),
+    }
 
     eprintln!("Extracting {ASSET}");
     extract(&tarball, tmp)?;
@@ -484,22 +522,89 @@ fn installed_version(install_dir: &str, bin: &str) -> String {
 
 // ---- external tools -----------------------------------------------------
 
-fn curl_download(url: &str, headers: &[String], out: &Path) -> Result<()> {
-    // `=https,file`: https for real releases, file:// for a local/offline
-    // --repo-url the operator explicitly points at; nothing else.
-    let mut cmd = Command::new("curl");
-    cmd.args(["-fL", "--proto", "=https,file", "--tlsv1.2"]);
-    for h in headers {
-        cmd.arg("-H").arg(h);
+const MAX_REDIRECTS: usize = 5;
+const SUMS_ASSET: &str = "SHA256SUMS";
+
+/// Same directory as `url`, different file name.
+fn sibling_url(url: &str, name: &str) -> String {
+    match url.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{name}"),
+        None => name.to_string(),
     }
-    let status = cmd
-        .arg("-o")
-        .arg(out)
-        .arg(url)
-        .status()
-        .context("running curl (is curl installed?)")?;
-    if !status.success() {
-        bail!("curl failed downloading {url}");
+}
+
+/// curl argv for ONE hop. No `-L`: curl re-sends custom headers (the
+/// PRIVATE-TOKEN) to redirect targets on other hosts, so redirects are
+/// followed by hand and only the first hop carries `headers`. `=https,file`
+/// on the first hop (file:// for an explicit offline --repo-url); later hops
+/// are https only so a hostile redirect cannot point at a local file.
+fn curl_hop_args(url: &str, headers: &[String], out: &Path, first_hop: bool) -> Vec<String> {
+    let proto = if first_hop { "=https,file" } else { "=https" };
+    let mut a: Vec<String> = ["-fsS", "--proto", proto, "--tlsv1.2", "-w", "%{redirect_url}"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if first_hop {
+        for h in headers {
+            a.push("-H".into());
+            a.push(h.clone());
+        }
+    }
+    a.push("-o".into());
+    a.push(out.display().to_string());
+    a.push(url.to_string());
+    a
+}
+
+/// Redirect target from curl's `-w %{redirect_url}` output, if any.
+fn redirect_target(stdout: &str) -> Option<String> {
+    let t = stdout.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+fn curl_download(url: &str, headers: &[String], out: &Path) -> Result<()> {
+    let mut cur = url.to_string();
+    for hop in 0..=MAX_REDIRECTS {
+        let o = Command::new("curl")
+            .args(curl_hop_args(&cur, headers, out, hop == 0))
+            .output()
+            .context("running curl (is curl installed?)")?;
+        if !o.status.success() {
+            bail!(
+                "curl failed downloading {cur}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+        match redirect_target(&String::from_utf8_lossy(&o.stdout)) {
+            None => return Ok(()),
+            Some(next) => cur = next,
+        }
+    }
+    bail!("too many redirects downloading {url}")
+}
+
+/// Verify `sums` (the release SHA256SUMS) against its minisign signature
+/// under `key` (base64 line or full .pub text), then require the line for
+/// the tarball to equal `tarball_sha`. Pure so it is testable.
+fn verify_signed_sums(key: &str, sums: &[u8], sig: &str, tarball_sha: &str) -> Result<()> {
+    let pk = if key.trim().contains('\n') {
+        minisign_verify::PublicKey::decode(key.trim())
+    } else {
+        minisign_verify::PublicKey::from_base64(key.trim())
+    }
+    .map_err(|e| anyhow::anyhow!("invalid minisign public key: {e}"))?;
+    let sig = minisign_verify::Signature::decode(sig)
+        .map_err(|e| anyhow::anyhow!("invalid SHA256SUMS.minisig: {e}"))?;
+    pk.verify(sums, &sig, false)
+        .map_err(|e| anyhow::anyhow!("SHA256SUMS signature verification failed: {e}"))?;
+    check_sums_entry(std::str::from_utf8(sums).context("SHA256SUMS is not UTF-8")?, tarball_sha)
+}
+
+fn check_sums_entry(sums: &str, tarball_sha: &str) -> Result<()> {
+    let want = manifest_sha(sums, ASSET)
+        .with_context(|| format!("signed SHA256SUMS has no entry for {ASSET}"))?;
+    if want != tarball_sha {
+        bail!("{ASSET} sha256 {tarball_sha} does not match signed SHA256SUMS {want}");
     }
     Ok(())
 }
@@ -801,6 +906,49 @@ mod tests {
             api_latest_url("lischetzke", "dtfs"),
             "https://api.github.com/repos/lischetzke/dtfs/releases/latest"
         );
+    }
+
+    const MS_KEY: &str = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+    const MS_SIG: &str = "untrusted comment: signature from minisign secret key\nRUQf6LRCGA9i559r3g7V1qNyJDApGip8MfqcadIgT9CuhV3EMhHoN1mGTkUidF/z7SrlQgXdy8ofjb7bNJJylDOocrCo8KLzZwo=\ntrusted comment: timestamp:1633700835\tfile:test\tprehashed\nwLMDjy9FLAuxZ3q4NlEvkgtyhrr0gtTu6KC4KBJdITbbOeAi1zBIYo0v4iTgt8jJpIidRJnp94ABQkJAgAooBQ==\n";
+
+    #[test]
+    fn minisign_verification_gate() {
+        // Valid signature over "test" passes the signature step and then
+        // fails on the missing tarball entry (proves the sig was accepted).
+        let e = verify_signed_sums(MS_KEY, b"test", MS_SIG, "x").unwrap_err().to_string();
+        assert!(e.contains("no entry"), "{e}");
+        // Tampered content is refused at the signature step.
+        let e = verify_signed_sums(MS_KEY, b"Test", MS_SIG, "x").unwrap_err().to_string();
+        assert!(e.contains("signature verification failed"), "{e}");
+        // Garbage key / signature.
+        assert!(verify_signed_sums("nope", b"test", MS_SIG, "x").unwrap_err().to_string().contains("invalid minisign public key"));
+        assert!(verify_signed_sums(MS_KEY, b"test", "junk", "x").unwrap_err().to_string().contains("invalid SHA256SUMS.minisig"));
+    }
+
+    #[test]
+    fn signed_sums_entry_must_match_tarball() {
+        let sha = "a".repeat(64);
+        let sums = format!("{sha}  {ASSET}\n");
+        assert!(check_sums_entry(&sums, &sha).is_ok());
+        assert!(check_sums_entry(&sums, &"b".repeat(64)).unwrap_err().to_string().contains("does not match"));
+        assert!(check_sums_entry(&format!("{sha}  other.tar.gz\n"), &sha).is_err());
+    }
+
+    #[test]
+    fn curl_hops_never_follow_redirects_with_token() {
+        let h = vec!["PRIVATE-TOKEN: t".to_string()];
+        let out = Path::new("/tmp/o");
+        let first = curl_hop_args("https://gl/x", &h, out, true);
+        assert!(!first.contains(&"-L".to_string()) && !first.contains(&"-fL".to_string()));
+        assert!(first.contains(&"PRIVATE-TOKEN: t".to_string()));
+        assert!(first.contains(&"=https,file".to_string()));
+        assert_eq!(first.last().unwrap(), "https://gl/x");
+        let next = curl_hop_args("https://s3/y", &h, out, false);
+        assert!(!next.contains(&"PRIVATE-TOKEN: t".to_string()) && !next.contains(&"-H".to_string()));
+        assert!(next.contains(&"=https".to_string()));
+        assert_eq!(redirect_target("https://s3/y\n").as_deref(), Some("https://s3/y"));
+        assert_eq!(redirect_target(""), None);
+        assert_eq!(sibling_url("https://h/p/dtfs/v1/dtfs-linux-amd64.tar.gz", "SHA256SUMS"), "https://h/p/dtfs/v1/SHA256SUMS");
     }
 
     #[test]
