@@ -226,6 +226,21 @@ if [ -z "$TARBALL" ]; then
         [ -n "$host" ] && [ -n "$path" ] && [ "$path" != "$rest" ] || return 1
         printf '%s://%s/api/v4/projects/%s' "$scheme" "$host" "${path//\//%2F}"
     }
+    # fetch_hops URL OUT: https only; redirects followed by hand so the token
+    # header goes to the first hop only (mirrors updater.rs::curl_download).
+    fetch_hops() {
+        local url="$1" out="$2" hop next
+        local -a auth=()
+        mapfile -t auth < <(repo_auth_args)
+        for hop in 0 1 2 3 4 5; do
+            [ "$hop" -eq 0 ] || auth=()
+            next="$(curl -fsS --proto '=https' --tlsv1.2 "${auth[@]}" -w '%{redirect_url}' -o "$out" "$url")" \
+                || { error "AZ-2: download failed: $url"; return 1; }
+            [ -n "$next" ] || return 0
+            url="$next"
+        done
+        error "AZ-2: too many redirects"; return 1
+    }
     download_tarball_remote() {
         local tag="${VERSION:-latest}"
         local url
@@ -245,8 +260,10 @@ if [ -z "$TARBALL" ]; then
                 if [ "$tag" = "latest" ]; then
                     # Newest full release (vX.Y.Z); alpha tags (vX.Y.Z_stamp) are skipped.
                     command -v jq >/dev/null 2>&1 || { error "AZ-2: jq is required to resolve 'latest' from GitLab"; return 1; }
-                    tag="$(curl -fsSL "${auth[@]}" "${api}/releases?per_page=50" \
-                        | jq -r '[.[] | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | first // empty')"
+                    local rel; rel="$(mktemp)"
+                    fetch_hops "${api}/releases?per_page=50" "$rel" || { rm -f "$rel"; return 1; }
+                    tag="$(jq -r '[.[] | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | first // empty' "$rel")"
+                    rm -f "$rel"
                     [ -n "$tag" ] || { error "AZ-2: no full release found at ${api}/releases"; return 1; }
                     info "AZ-2: latest full release is $tag"
                 fi
@@ -256,7 +273,7 @@ if [ -z "$TARBALL" ]; then
         mkdir -p "$DOWNLOAD_CACHE"
         local out="${DOWNLOAD_CACHE}/dtfs-${tag}-linux-amd64.tar.gz"
         info "AZ-2: downloading $url -> $out"
-        if curl -fL "${auth[@]}" --output "$out.partial" "$url"; then
+        if fetch_hops "$url" "$out.partial"; then
             mv "$out.partial" "$out"
             TARBALL="$out"
             return 0
@@ -437,6 +454,14 @@ step "Unpacking tarball"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 tar -C "$TMP" -xzf "$TARBALL"
 [ -d "$TMP/dtfs" ] || { error "tarball missing dtfs/ root"; exit 1; }
+# Integrity gate (same as dtfs-cli update): every binary must match MANIFEST.
+# Not a signature check; use `dtfs-cli update` with a minisign key for that.
+[ -f "$TMP/dtfs/MANIFEST" ] || { error "tarball has no dtfs/MANIFEST; refusing to install unverified binaries"; exit 1; }
+for b in dtfs-manager dtfs-data dtfs-fuse dtfs-cli; do
+    want="$(awk -v b="$b" '$2==b {print $1}' "$TMP/dtfs/MANIFEST")"
+    got="$(sha256sum "$TMP/dtfs/bin/$b" | awk '{print $1}')"
+    [ -n "$want" ] && [ "$want" = "$got" ] || { error "integrity check failed for $b (manifest '${want:-none}', actual $got)"; exit 1; }
+done
 
 step "Installing binaries to /usr/local/bin"
 install -m 0755 "$TMP/dtfs/bin/dtfs-manager" /usr/local/bin/dtfs-manager

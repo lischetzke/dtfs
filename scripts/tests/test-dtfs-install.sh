@@ -50,6 +50,8 @@ check "auto first tries local then remote"  bash -c "grep -q 'select_tarball_loc
 check "explicit --version skips local in auto" bash -c "grep -q 'An explicit tag must not be satisfied' '$SCRIPT'"
 check "manager config renders required tables" bash -c "sed -n '/^render_manager/,/^}/p' '$SCRIPT' | grep -q '^.monitoring.\$'"
 check "data disks drop-in uses optional -paths" bash -c "grep -q \"printf -- '-%s '\" '$SCRIPT'"
+check "installer verifies binaries against MANIFEST" bash -c "grep -q 'integrity check failed for' '$SCRIPT'"
+check "installer never uses curl -L with the token" bash -c "! grep -qE 'curl -f?s?S?L' '$SCRIPT'"
 check "github URL is from DTFS_REPO_URL"    bash -c "grep -q 'DTFS_REPO_URL' '$SCRIPT'"
 
 echo
