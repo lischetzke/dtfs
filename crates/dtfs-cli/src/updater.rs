@@ -232,13 +232,18 @@ pub fn run(
     let defaults = dtfs_common::config::UpdaterConfig::default();
 
     // Pull [updater] from --config, else the default role config path.
-    let cfg_path = config_path
-        .map(PathBuf::from)
-        .or_else(|| default_config_path(target));
-    let (cfg_repo, cfg_install, cfg_token, cfg_key) = match cfg_path {
-        Some(ref p) if p.exists() => read_updater_section(p)?,
-        _ => (None, None, None, None),
+    let cfg_paths = match config_path {
+        Some(p) => vec![PathBuf::from(p)],
+        None => default_config_paths(target),
     };
+    let (mut cfg_repo, mut cfg_install, mut cfg_token, mut cfg_key) = (None, None, None, None);
+    for p in cfg_paths.iter().filter(|p| p.exists()) {
+        let (r, i, t, k) = read_updater_section(p)?;
+        cfg_repo = cfg_repo.or(r);
+        cfg_install = cfg_install.or(i);
+        cfg_token = cfg_token.or(t);
+        cfg_key = cfg_key.or(k);
+    }
     let minisign_key = std::env::var("DTFS_MINISIGN_PUBKEY")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -296,14 +301,16 @@ fn resolve_tarball_url(source: &ReleaseSource, headers: &[String], tag: Option<&
     }
 }
 
-fn default_config_path(t: UpdateTarget) -> Option<PathBuf> {
-    let role = match t {
-        UpdateTarget::Manager => "manager",
-        UpdateTarget::Data => "data",
-        UpdateTarget::Fuse => "fuse",
-        UpdateTarget::Cli | UpdateTarget::All => return None,
+/// Role configs that may carry `[updater]` for `t`. `cli`/`all` have no role
+/// of their own, so any present role config on the host may supply it.
+fn default_config_paths(t: UpdateTarget) -> Vec<PathBuf> {
+    let roles: &[&str] = match t {
+        UpdateTarget::Manager => &["manager"],
+        UpdateTarget::Data => &["data"],
+        UpdateTarget::Fuse => &["fuse"],
+        UpdateTarget::Cli | UpdateTarget::All => &["manager", "data", "fuse"],
     };
-    Some(PathBuf::from(format!("/etc/dtfs/{role}.toml")))
+    roles.iter().map(|r| PathBuf::from(format!("/etc/dtfs/{r}.toml"))).collect()
 }
 
 /// Read just the `[updater]` block from any dtfs `.toml` (serde ignores
@@ -418,11 +425,13 @@ fn run_update(
     if no_restart {
         eprintln!("--no-restart: services keep the old binary until the next restart");
     } else {
+        let mut failures = Vec::new();
         for bin in bins {
             if let Some(svc) = service_for_binary(bin) {
-                restart_service(svc)?;
+                restart_service(svc, &mut failures)?;
             }
         }
+        finish_restarts(failures)?;
     }
     eprintln!("update complete");
     Ok(())
@@ -535,12 +544,10 @@ fn sibling_url(url: &str, name: &str) -> String {
 
 /// curl argv for ONE hop. No `-L`: curl re-sends custom headers (the
 /// PRIVATE-TOKEN) to redirect targets on other hosts, so redirects are
-/// followed by hand and only the first hop carries `headers`. `=https,file`
-/// on the first hop (file:// for an explicit offline --repo-url); later hops
-/// are https only so a hostile redirect cannot point at a local file.
+/// followed by hand and only the first hop carries `headers`. https only on
+/// every hop so a hostile redirect cannot point at a local file.
 fn curl_hop_args(url: &str, headers: &[String], out: &Path, first_hop: bool) -> Vec<String> {
-    let proto = if first_hop { "=https,file" } else { "=https" };
-    let mut a: Vec<String> = ["-fsS", "--proto", proto, "--tlsv1.2", "-w", "%{redirect_url}"]
+    let mut a: Vec<String> = ["-fsS", "--proto", "=https", "--tlsv1.2", "-w", "%{redirect_url}"]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -610,19 +617,11 @@ fn check_sums_entry(sums: &str, tarball_sha: &str) -> Result<()> {
 }
 
 fn curl_get(url: &str, headers: &[String]) -> Result<String> {
-    let mut cmd = Command::new("curl");
-    cmd.args(["-fsSL", "--proto", "=https", "-H", "User-Agent: dtfs-cli"]);
-    for h in headers {
-        cmd.arg("-H").arg(h);
-    }
-    let out = cmd
-        .arg(url)
-        .output()
-        .context("running curl (is curl installed?)")?;
-    if !out.status.success() {
-        bail!("curl failed GET {url}: {}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    // Same hop-by-hop path as downloads so the token never follows a redirect.
+    let dir = tempfile::tempdir().context("creating temp dir")?;
+    let out = dir.path().join("body");
+    curl_download(url, headers, &out)?;
+    std::fs::read_to_string(&out).with_context(|| format!("reading response of GET {url}"))
 }
 
 fn extract(tarball: &Path, dir: &Path) -> Result<()> {
@@ -663,39 +662,71 @@ fn install_binary(src: &Path, dst: &str) -> Result<()> {
     Ok(())
 }
 
-fn restart_service(svc: &str) -> Result<()> {
-    if svc.contains('*') {
-        let units = list_units(svc)?;
-        if units.is_empty() {
-            eprintln!("no running {svc} instances to restart");
-        }
-        for u in units {
-            systemctl(&["restart", &u])?;
-            assert_active(&u)?;
-            eprintln!("restarted {u}");
-        }
+/// Restart `svc` if it exists on this host (a host without e.g. the data
+/// role must not abort the rest of an `update all`). Per-unit failures are
+/// pushed to `failures` so remaining units still restart.
+fn restart_service(svc: &str, failures: &mut Vec<String>) -> Result<()> {
+    let units = if svc.contains('*') {
+        list_units(svc)?
+    } else if unit_exists(svc)? {
+        vec![svc.to_string()]
     } else {
-        systemctl(&["restart", svc])?;
-        assert_active(svc)?;
-        eprintln!("restarted {svc}");
+        Vec::new()
+    };
+    if units.is_empty() {
+        eprintln!("no {svc} unit on this host; nothing to restart");
+    }
+    for u in units {
+        match systemctl(&["restart", &u]).and_then(|_| assert_active(&u)) {
+            Ok(()) => eprintln!("restarted {u}"),
+            Err(e) => {
+                eprintln!("FAILED {u}: {e:#}");
+                failures.push(u);
+            }
+        }
     }
     Ok(())
 }
 
+/// Report every unit that failed to restart, as one non-zero exit.
+fn finish_restarts(failures: Vec<String>) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "binaries installed but {} service(s) failed to restart: {}",
+        failures.len(),
+        failures.join(", ")
+    )
+}
+
+fn unit_exists(unit: &str) -> Result<bool> {
+    let out = Command::new("systemctl")
+        .args(["list-unit-files", "--no-legend", "--plain", unit])
+        .output()
+        .context("running systemctl list-unit-files")?;
+    Ok(out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty())
+}
+
 fn list_units(pattern: &str) -> Result<Vec<String>> {
     let out = Command::new("systemctl")
-        .args(["list-units", "--type=service", "--no-legend", pattern])
+        .args(["list-units", "--plain", "--no-legend", "--type=service", pattern])
         .output()
         .context("running systemctl list-units")?;
     if !out.status.success() {
         bail!("systemctl list-units {pattern} failed");
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    Ok(parse_unit_names(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// First column of `systemctl list-units --plain --no-legend`; failed
+/// instances are listed too (no marker with --plain, tolerated anyway).
+fn parse_unit_names(stdout: &str) -> Vec<String> {
+    stdout
         .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .map(|s| s.trim_start_matches('●').to_string())
-        .filter(|s| !s.is_empty())
-        .collect())
+        .filter_map(|l| l.split_whitespace().find(|t| *t != "●"))
+        .map(str::to_string)
+        .collect()
 }
 
 fn systemctl(args: &[&str]) -> Result<()> {
@@ -941,7 +972,7 @@ mod tests {
         let first = curl_hop_args("https://gl/x", &h, out, true);
         assert!(!first.contains(&"-L".to_string()) && !first.contains(&"-fL".to_string()));
         assert!(first.contains(&"PRIVATE-TOKEN: t".to_string()));
-        assert!(first.contains(&"=https,file".to_string()));
+        assert!(first.contains(&"=https".to_string()) && !first.iter().any(|a| a.contains("file")));
         assert_eq!(first.last().unwrap(), "https://gl/x");
         let next = curl_hop_args("https://s3/y", &h, out, false);
         assert!(!next.contains(&"PRIVATE-TOKEN: t".to_string()) && !next.contains(&"-H".to_string()));
@@ -998,6 +1029,33 @@ mod tests {
         assert!(err.is_err(), "install of a missing source must error");
         assert_eq!(std::fs::read(&dst).unwrap(), b"OLD-CONTENT", "dst must be untouched");
         assert!(!dir.path().join("dtfs-cli.new").exists(), "<dst>.new must not linger");
+    }
+
+    #[test]
+    fn unit_names_include_failed_instances() {
+        let out = "dtfs-fuse@mnt-a.service loaded active running DTFS\n\
+                   dtfs-fuse@mnt-b.service loaded failed failed DTFS\n\
+                   ● dtfs-fuse@mnt-c.service loaded failed failed DTFS\n";
+        assert_eq!(
+            parse_unit_names(out),
+            ["dtfs-fuse@mnt-a.service", "dtfs-fuse@mnt-b.service", "dtfs-fuse@mnt-c.service"]
+        );
+        assert!(parse_unit_names("").is_empty());
+    }
+
+    #[test]
+    fn restart_failures_are_all_reported() {
+        assert!(finish_restarts(vec![]).is_ok());
+        let e = finish_restarts(vec!["a.service".into(), "b.service".into()]).unwrap_err().to_string();
+        assert!(e.contains("2 service(s)") && e.contains("a.service, b.service"), "{e}");
+    }
+
+    #[test]
+    fn config_paths_cover_all_roles_for_cli_and_all() {
+        assert_eq!(default_config_paths(UpdateTarget::Manager), [PathBuf::from("/etc/dtfs/manager.toml")]);
+        for t in [UpdateTarget::Cli, UpdateTarget::All] {
+            assert_eq!(default_config_paths(t).len(), 3);
+        }
     }
 
     #[test]
