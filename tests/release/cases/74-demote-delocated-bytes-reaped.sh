@@ -42,7 +42,7 @@ source "$(dirname "$0")/../lib/dc.sh"
 
 MGR_TOML=/etc/dtfs/manager.toml
 BAK=$MGR_TOML.case67.bak
-GRACE=30          # orphan grace (s) — short so the reap is observable
+GRACE=21600       # orphan grace (s) — config floor is 6 h (MIN_ORPHAN_GRACE_SECS); reap waits that long
 SCRUB_INT=60      # orphan scrub interval (s); run_orphan_scrub floors at 60
 
 PREFIX=/release/67-co13-$$/
@@ -205,8 +205,8 @@ echo "  warm location entry de-located from the SM (RemoveChunkLocation committe
 # ── 5. De-located bytes reaped; anchor + file survive ────────────
 echo "[5/5] de-located on-disk bytes on $WARM_HOST must be reaped after grace+scrub"
 warm_bytes_reaped() { ! host_has_chunk "$WARM_HOST" "$FIRST_CID"; }
-# grace=30s + one 60s scrub interval + 30s scrub warmup + slack.
-if ! wait_for 240 "de-located bytes reaped from $WARM_HOST" warm_bytes_reaped; then
+# grace (6 h floor) + one 60s scrub interval + 30s scrub warmup + slack.
+if ! wait_for $((GRACE + 300))"de-located bytes reaped from $WARM_HOST" warm_bytes_reaped; then
     fail "phantom on-disk replica on $WARM_HOST was NOT reaped after demote de-location"
 fi
 echo "  $WARM_HOST no longer holds $FIRST_CID on disk"
