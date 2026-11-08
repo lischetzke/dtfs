@@ -1540,18 +1540,25 @@ async fn try_repair_meta_from_dat(
     if digest != chunk_id.0 {
         return MetaRepair::NotRepairable;
     }
+    let final_meta_path = dat_path.with_extension("meta");
+    // A parseable old sidecar (e.g. wrong size/checksum) still knows the
+    // real volume and RF; only an unparseable one falls back to defaults.
+    let old = tokio::fs::read(&final_meta_path)
+        .await
+        .ok()
+        .and_then(|b| serde_json::from_slice::<ChunkMeta>(&b).ok());
+    let (volume_id, replication_factor, created_at) = match old {
+        Some(o) => (o.volume_id, o.replication_factor, o.created_at),
+        None => (VolumeId::new("default".to_string()), 1, chrono::Utc::now().timestamp()),
+    };
     let meta = ChunkMeta {
         id: chunk_id,
         size,
         checksum: digest,
-        created_at: chrono::Utc::now().timestamp(),
-        // The real volume can't be recovered from the `.dat` alone; the
-        // "default" volume is a best-effort placeholder purely so the
-        // sidecar is complete and parseable again.
-        volume_id: VolumeId::new("default".to_string()),
-        replication_factor: 1,
+        created_at,
+        volume_id,
+        replication_factor,
     };
-    let final_meta_path = dat_path.with_extension("meta");
     let written = match serde_json::to_string_pretty(&meta) {
         Ok(j) => write_meta_atomic(disk_root, &final_meta_path, &j).await,
         Err(e) => Err(DtfsError::Serialization(e.to_string())),
@@ -2339,6 +2346,41 @@ mod tests {
             assert_eq!(fixed.checksum, id.0);
             assert_eq!(fixed.size, data.len() as u64);
         }
+    }
+
+    /// Repairing a parseable-but-wrong .meta keeps its volume and RF; an
+    /// unparseable one falls back to the defaults.
+    #[tokio::test]
+    async fn meta_repair_keeps_volume_and_rf_when_old_meta_parses() {
+        let (store, _tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+        let data = b"repair-keeps-volume";
+        let id = ChunkId::from_bytes(checksum::compute(data));
+        let vol = VolumeId::new("media".to_string());
+        store.put_chunk(&id, data, &vol, DiskTier::Hot).await.unwrap();
+        let mp = chunk_meta_path(&disk, &id);
+        let mut m: ChunkMeta = serde_json::from_str(&std::fs::read_to_string(&mp).unwrap()).unwrap();
+        m.replication_factor = 3;
+        m.size += 5;
+        std::fs::write(&mp, serde_json::to_string(&m).unwrap()).unwrap();
+        let dat = chunk_data_path(&disk, &id);
+        assert_eq!(
+            try_repair_meta_from_dat(&disk, &dat, &id.as_hex(), data.len() as u64).await,
+            MetaRepair::Repaired
+        );
+        let fixed: ChunkMeta = serde_json::from_str(&std::fs::read_to_string(&mp).unwrap()).unwrap();
+        assert_eq!(fixed.volume_id, vol);
+        assert_eq!(fixed.replication_factor, 3);
+        assert_eq!(fixed.size, data.len() as u64);
+        // Unparseable: defaults.
+        std::fs::write(&mp, b"{torn").unwrap();
+        assert_eq!(
+            try_repair_meta_from_dat(&disk, &dat, &id.as_hex(), data.len() as u64).await,
+            MetaRepair::Repaired
+        );
+        let fixed: ChunkMeta = serde_json::from_str(&std::fs::read_to_string(&mp).unwrap()).unwrap();
+        assert_eq!(fixed.volume_id, VolumeId::new("default".to_string()));
+        assert_eq!(fixed.replication_factor, 1);
     }
 
     /// Bytes that do not hash to the chunk id are corrupt even when the
