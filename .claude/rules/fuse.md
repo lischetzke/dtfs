@@ -64,9 +64,12 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   commits are not serialized per path, so merge order may differ from apply
   order), or the committing fh is closed/detached (`merge_allowed`). Never
   eager-fetch after a commit (fetch results can land out of order) and never
-  per batch (quadratic on big files). `refetch_locations` installs a fetch
-  only if no commit on the path overlapped it (`FetchToken::may_install`;
-  one retry, else the caller uses it uninstalled). Snapshots are
+  per batch (quadratic on big files). `refetch_locations` (read, write and
+  the post-truncate refresh) uses a fetch only if no commit on the path
+  overlapped it (`FetchToken::may_install`); otherwise it waits for the path
+  to go quiet (`wait_quiet`, Notify, no polling) and fetches again, failing
+  with EIO after `QUIET_WAIT` (the write-lease length). Never use or install
+  an overlapped fetch. truncate's SetFileSize holds a commit slot. Snapshots are
   `Arc<FileLocations>` (handles and metadata cache): read()/write() clone
   the Arc, never the chunk list; the merge is copy-on-write (`merge_shared`).
 - Handle `locations = None` means stale; `write()`/`read()` must

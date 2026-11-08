@@ -1478,7 +1478,7 @@ impl Filesystem for DtfsFuse3Adapter {
 /// (`call_manager` wraps it via `anyhow::Error::new(status).context(...)`),
 /// possibly under one or more `.context(...)` layers, so we walk the whole
 /// chain rather than only inspecting the top error.
-fn cluster_err_to_errno(err: &anyhow::Error) -> Errno {
+pub(crate) fn cluster_err_to_errno(err: &anyhow::Error) -> Errno {
     for cause in err.chain() {
         if let Some(status) = cause.downcast_ref::<tonic::Status>() {
             if status.code() == tonic::Code::NotFound {

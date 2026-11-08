@@ -400,8 +400,34 @@ pub(crate) const WRITE_LEASE_RENEW_AFTER_MS: u64 = 60_000;
 /// (`CommitToken::exclusive`), and a full fetch may only be installed when
 /// no commit overlapped the fetch (`FetchToken::may_install`). The entry
 /// lives while any commit or fetch is in flight, so generations compare.
+/// The `Notify` wakes `wait_quiet` callers when a path's commits reach 0.
 #[derive(Default)]
-struct CommitTracker(DashMap<String, (u32, u64, u32)>);
+struct CommitTracker(DashMap<String, (u32, u64, u32)>, tokio::sync::Notify);
+
+/// Upper bound for waiting out in-flight commits before a locations fetch:
+/// a commit cannot legitimately outlive the write lease it runs under.
+const QUIET_WAIT: Duration = Duration::from_millis(WRITE_LEASE_MS);
+
+/// What `refetch_locations` does with a fetch result.
+#[derive(Debug, PartialEq)]
+enum FetchStep {
+    /// No commit overlapped the fetch: install it and use it.
+    Install,
+    /// Overlapped: wait for the path to go quiet, then fetch again.
+    WaitQuiet,
+    /// Overlapped and out of time: fail (EIO), never use a maybe-stale list.
+    TimedOut,
+}
+
+fn next_fetch_step(may_install: bool, now: Instant, deadline: Instant) -> FetchStep {
+    if may_install {
+        FetchStep::Install
+    } else if now >= deadline {
+        FetchStep::TimedOut
+    } else {
+        FetchStep::WaitQuiet
+    }
+}
 
 /// One full locations fetch's tracker slot (dropped = fetch over).
 struct FetchToken<'a> {
@@ -462,6 +488,27 @@ impl CommitTracker {
         };
         FetchToken { tracker: self, path: path.to_string(), generation, quiet_at_start: in_flight == 0 }
     }
+
+    /// Wait (woken by the last commit's drop, no polling) until no commit on
+    /// `path` is in flight. Err after `timeout`; it maps to EIO.
+    async fn wait_quiet(&self, path: &str, timeout: Duration) -> Result<()> {
+        let wait = async {
+            loop {
+                // Register before checking so a drop in between is not missed.
+                let notified = self.1.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.0.get(path).map_or(true, |e| e.0 == 0) {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.map_err(|_| {
+            warn!(path, ?timeout, "a commit stayed in flight; locations not refreshed");
+            anyhow::anyhow!("{path}: a commit stayed in flight for {timeout:?}; locations not refreshed")
+        })
+    }
 }
 
 impl CommitToken<'_> {
@@ -479,10 +526,15 @@ impl CommitToken<'_> {
 impl Drop for CommitToken<'_> {
     fn drop(&mut self) {
         // Generations only compare overlapping windows, so resetting at zero is safe.
+        let mut quiet = false;
         self.tracker.0.remove_if_mut(&self.path, |_, e| {
             e.0 -= 1;
+            quiet = e.0 == 0;
             e.0 == 0 && e.2 == 0
         });
+        if quiet {
+            self.tracker.1.notify_waiters();
+        }
     }
 }
 
@@ -2113,10 +2165,15 @@ impl DtfsFilesystem {
                 }
             }
         }
-        self.client
-            .set_file_size(path, new_size)
-            .await
-            .with_context(|| format!("truncate failed for {path}"))?;
+        {
+            // Counts as a commit, so a fetch overlapping the size change is
+            // never installed (it would resurrect truncated bytes).
+            let _commit = self.commit_tracker.begin(path);
+            self.client
+                .set_file_size(path, new_size)
+                .await
+                .with_context(|| format!("truncate failed for {path}"))?;
+        }
         // CO-1-8 (b): clear buffered writes AT OR ABOVE the new EOF but keep
         // buffered bytes below it. Removing the whole buffer (the old
         // behaviour) lost un-flushed writes that the truncation never deleted.
@@ -2126,18 +2183,9 @@ impl DtfsFilesystem {
         }
         // Refresh cached locations on every handle of the path (seed reads
         // clamp to `locations.total_size`, so a stale size would resurrect
-        // truncated bytes).
-        self.metadata_cache.remove(path);
-        match self.fetch_file_locations(path).await {
-            Ok(fresh) => {
-                let fresh = Arc::new(fresh);
-                for mut entry in self.open_files.iter_mut() {
-                    if entry.value().path == path {
-                        entry.value_mut().locations = Some(fresh.clone());
-                    }
-                }
-                self.cache_metadata(path, fresh);
-            }
+        // truncated bytes). Same overlap guard as any re-fetch.
+        match self.refetch_locations(path).await {
+            Ok(_) => {}
             Err(e) => {
                 // A stale larger snapshot would resurrect truncated bytes;
                 // None makes write()/read() refetch first.
@@ -2884,33 +2932,41 @@ impl DtfsFilesystem {
         }
     }
 
-    /// Re-fetch `path`'s locations and install them on every handle of it,
-    /// but only when no commit on the path overlapped the fetch (else a
-    /// result older than a concurrent commit could replace a newer snapshot).
-    /// One retry; after that the caller gets the result for its own use and
-    /// the handles are left as they are.
+    /// Re-fetch `path`'s locations and install them on every handle of it.
+    /// Only a fetch no commit on the path overlapped is used (an older result
+    /// could hide a committed chunk: a write would seed zeros over it, a read
+    /// would return a hole); otherwise wait for the path to go quiet and
+    /// fetch again, failing (EIO) after `QUIET_WAIT`.
     async fn refetch_locations(&self, path: &str) -> Result<Arc<FileLocations>> {
         self.metadata_cache.remove(path);
-        let mut attempts = 0;
+        let deadline = Instant::now() + QUIET_WAIT;
         loop {
-            attempts += 1;
             let fetch = self.commit_tracker.begin_fetch(path);
             let fresh = Arc::new(
                 self.fetch_file_locations(path)
                     .await
                     .with_context(|| format!("stale locations for {path} and re-fetch failed"))?,
             );
-            if fetch.may_install() {
-                for mut entry in self.open_files.iter_mut() {
-                    if entry.value().path == path {
-                        entry.value_mut().locations = Some(fresh.clone());
+            match next_fetch_step(fetch.may_install(), Instant::now(), deadline) {
+                FetchStep::Install => {
+                    for mut entry in self.open_files.iter_mut() {
+                        if entry.value().path == path {
+                            entry.value_mut().locations = Some(fresh.clone());
+                        }
                     }
+                    return Ok(fresh);
                 }
-                return Ok(fresh);
-            }
-            if attempts == 2 {
-                debug!(path, "locations re-fetch overlapped a commit twice; not installing");
-                return Ok(fresh);
+                FetchStep::WaitQuiet => {
+                    drop(fetch);
+                    debug!(path, "locations fetch overlapped a commit; waiting for it");
+                    self.commit_tracker
+                        .wait_quiet(path, deadline.saturating_duration_since(Instant::now()))
+                        .await?;
+                }
+                FetchStep::TimedOut => {
+                    warn!(path, "locations fetch kept overlapping commits; failing the call");
+                    bail!("{path}: locations kept changing under in-flight commits");
+                }
             }
         }
     }
@@ -4494,6 +4550,66 @@ mod commit_tracker_tests {
         let c = t.begin("/f");
         assert!(!f.may_install(), "a commit in flight at the fetch's end blocks install");
         assert!(c.exclusive(), "a fetch does not make a commit non-exclusive");
+    }
+
+    /// An overlapped fetch waits for the path to go quiet (it is never used),
+    /// a quiet one installs, and only an overlapped one past the deadline
+    /// fails. Fake clock: plain `Instant`s.
+    #[test]
+    fn overlapped_fetch_waits_instead_of_being_used() {
+        use super::{next_fetch_step, FetchStep};
+        let t0 = std::time::Instant::now();
+        let later = t0 + std::time::Duration::from_secs(1);
+        assert_eq!(next_fetch_step(false, t0, later), FetchStep::WaitQuiet);
+        assert_eq!(next_fetch_step(true, t0, later), FetchStep::Install);
+        assert_eq!(next_fetch_step(true, later, later), FetchStep::Install);
+        assert_eq!(next_fetch_step(false, later, later), FetchStep::TimedOut, "deadline reached");
+    }
+
+    /// A writer's re-fetch waits for the in-flight commit to end (woken, not
+    /// polled), and the fetch it then takes is installable.
+    #[tokio::test]
+    async fn writer_refetch_waits_for_in_flight_commit_then_installs() {
+        use std::time::Duration;
+        let t = CommitTracker::default();
+        let commit = t.begin("/f");
+        let start = std::time::Instant::now();
+        let (_, (waited, took)) = tokio::join!(
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                drop(commit);
+            },
+            async { (t.wait_quiet("/f", Duration::from_secs(10)).await, start.elapsed()) },
+        );
+        assert!(waited.is_ok());
+        assert!(took >= Duration::from_millis(50), "must wait for the commit to end");
+        assert!(t.begin_fetch("/f").may_install(), "fetch after the commit is installable");
+    }
+
+    /// A commit that never ends: the wait times out with an error that the
+    /// adapter maps to EIO (never a guessed snapshot).
+    #[tokio::test]
+    async fn quiet_wait_timeout_is_eio() {
+        use std::time::Duration;
+        let t = CommitTracker::default();
+        let _commit = t.begin("/f");
+        let err = t.wait_quiet("/f", Duration::from_millis(30)).await.unwrap_err();
+        assert_eq!(
+            crate::fuse_adapter::cluster_err_to_errno(&err),
+            fuse3::Errno::from(libc::EIO)
+        );
+        // No commit in flight: returns at once.
+        assert!(t.wait_quiet("/g", Duration::from_millis(1)).await.is_ok());
+    }
+
+    /// truncate holds a commit slot around SetFileSize: a refresh fetch that
+    /// overlapped it is not installed.
+    #[test]
+    fn truncate_size_change_blocks_overlapping_fetch_install() {
+        let t = CommitTracker::default();
+        let fetch = t.begin_fetch("/f");
+        drop(t.begin("/f")); // truncate_inner's slot around set_file_size
+        assert!(!fetch.may_install());
     }
 
     /// A detached fh (unlink/rename moved it) or a closed fh must not merge
