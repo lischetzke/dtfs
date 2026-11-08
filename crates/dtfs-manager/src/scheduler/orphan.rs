@@ -176,7 +176,7 @@ impl TaskScheduler {
         // also snapshots per-node expected sets so the in-state-missing
         // inverse check can fire alongside the on-disk-not-in-state
         // reap loop without taking the state-machine lock twice.
-        let (data_nodes, in_state_chunks, expected_by_node, expected_by_node_disk, already_quarantined) = {
+        let (data_nodes, in_state_chunks, expected_by_node, already_quarantined) = {
             let sm = self.state_data.read().await;
             let nodes: Vec<(u64, String)> = sm
                 .nodes
@@ -188,26 +188,11 @@ impl TaskScheduler {
                 std::collections::HashSet::new();
             let mut expected: std::collections::BTreeMap<u64, std::collections::HashSet<String>> =
                 std::collections::BTreeMap::new();
-            // CR2-7-2 / MGR-10 — same as `expected` but keyed by
-            // (node_id, disk_id), so the reap can key the de-located check
-            // by the exact disk a chunk was found on, not node-wide. Two
-            // replicas of the same chunk can legitimately co-locate on one
-            // node on different disks/tiers (Bug BH); a node-wide check
-            // alone can't tell a genuinely de-located warm-disk leftover
-            // from a still-live cold-disk anchor of the SAME chunk.
-            let mut expected_disk: std::collections::BTreeMap<
-                (u64, u32),
-                std::collections::HashSet<String>,
-            > = std::collections::BTreeMap::new();
             for f in sm.files.values() {
                 for c in &f.chunks {
                     chunks.insert(c.chunk_hash.clone());
                     if let Ok(nid) = c.node_id.parse::<u64>() {
                         expected.entry(nid).or_default().insert(c.chunk_hash.clone());
-                        expected_disk
-                            .entry((nid, c.disk_id))
-                            .or_default()
-                            .insert(c.chunk_hash.clone());
                     }
                 }
             }
@@ -220,7 +205,7 @@ impl TaskScheduler {
                 ))
                 .map(|(id, _)| *id)
                 .collect();
-            (nodes, chunks, expected, expected_disk, quarantined)
+            (nodes, chunks, expected, quarantined)
         };
 
         // REV-1-2 — freshness gate. The reap deletes anything on disk that
@@ -243,14 +228,14 @@ impl TaskScheduler {
         let mut reaped: usize = 0;
 
         'nodes: for (node_id, grpc_addr) in &data_nodes {
-            // CR2-7-3 / MGR-13 — re-check leadership + freshness at the top
-            // of EVERY node iteration, not just once before the loop. A
-            // sweep over a 50 TB anchor node can span an election; without
-            // this a follower that just lost (or a leader that just lost)
-            // leadership kept issuing direct data-node delete RPCs for the
-            // rest of the sweep, which no Raft rejection can undo.
-            let (applied_now, last_log_now) = self.applied_and_log_index();
-            if !orphan_sweep_allowed(self.is_leader(), applied_now, last_log_now, in_state_chunks.len()) {
+            // CR2-7-3 / MGR-13 — re-check leadership at the top of EVERY node
+            // iteration. A sweep over a 50 TB anchor node can span an
+            // election; without this a leader that just lost leadership kept
+            // issuing direct data-node delete RPCs for the rest of the sweep,
+            // which no Raft rejection can undo. Only leadership is re-checked
+            // here: the log-caught-up gate ran once at sweep start (the
+            // leader's own in-flight writes keep last_applied < last_log).
+            if !orphan_delete_allowed(self.is_leader(), in_state_chunks.len()) {
                 self.audit.log(
                     "scheduler",
                     "orphan.sweep_aborted_not_leader",
@@ -266,6 +251,15 @@ impl TaskScheduler {
                     warn!(node = %node_id, error = %e, "Bug BC-7: ListChunks failed");
                     continue;
                 }
+            };
+            // The sets snapshotted at sweep start predate this node's
+            // ListChunks (which can take minutes on a big node). Rebuild
+            // this node's view from the CURRENT state machine before any
+            // reap decision, so a replica registered or removed meanwhile is
+            // judged on fresh state.
+            let view = {
+                let sm = self.state_data.read().await;
+                NodeReapView::from_files(&sm.files, *node_id)
             };
             // Bug BF-8 — in-state-missing inverse. Before processing
             // the on-disk-not-in-state loop, check what the state
@@ -365,7 +359,6 @@ impl TaskScheduler {
                 }
             }
 
-            let node_expected = expected_by_node.get(node_id);
             for (cid, (mtime_ms, disk_id_opt)) in &on_disk {
                 // Bug BP-4 — a chunk is an orphan candidate when NO
                 // FileMetadata references its hash (`in_state_chunks` is the
@@ -374,7 +367,7 @@ impl TaskScheduler {
                 // stale — that was the data-loss vector (BN-1 UUID rotation
                 // dropped location bindings; the hash-referenced guard here
                 // is the defence-in-depth backstop). CLAUDE.md §A.6 #8.
-                let is_orphan = chunk_is_orphan(&in_state_chunks, cid);
+                let is_orphan = chunk_is_orphan(&view.in_state, cid);
 
                 // CO-3-2 / CR2-7-2 (MGR-10) — a chunk on this node's disk
                 // for which the SM records NO location entry naming this
@@ -396,13 +389,10 @@ impl TaskScheduler {
                 // node (documented co-located layout: cold anchor + warm
                 // cache, Bug BH). A pre-CR2-7-2 data node reports no
                 // disk_id — fall back to today's node-wide check exactly.
-                let de_located = match disk_id_opt {
-                    Some(disk_id) => {
-                        let node_disk_expected = expected_by_node_disk.get(&(*node_id, *disk_id));
-                        chunk_delocated_on_node(node_disk_expected, cid)
-                    }
-                    None => chunk_delocated_on_node(node_expected, cid),
-                };
+                // A copy recorded under ANOTHER disk id of the same node must
+                // never be deleted, so the per-disk verdict is also gated on
+                // the node-wide set (co-located leftovers may leak instead).
+                let de_located = view.delocated(*disk_id_opt, cid);
                 let reap_candidate = is_orphan || de_located;
 
                 // Bug CB — measure the reap grace against the chunk's
@@ -429,18 +419,10 @@ impl TaskScheduler {
                 }
                 let age_secs = now_ms.saturating_sub(*mtime_ms) / 1000;
 
-                // CR2-7-3 / MGR-13 — re-check leadership + freshness again
-                // immediately before EACH delete batch (not just once per
-                // node): a per-node on_disk listing can itself carry many
-                // reap candidates, and an election can land between two of
-                // them just as easily as between two nodes.
-                let (applied_batch, last_log_batch) = self.applied_and_log_index();
-                if !orphan_sweep_allowed(
-                    self.is_leader(),
-                    applied_batch,
-                    last_log_batch,
-                    in_state_chunks.len(),
-                ) {
+                // CR2-7-3 / MGR-13 — re-check leadership immediately before
+                // EACH delete (an election can land between two candidates
+                // of one node's listing). Leadership only; see node top.
+                if !orphan_delete_allowed(self.is_leader(), view.in_state.len()) {
                     self.audit.log(
                         "scheduler",
                         "orphan.sweep_aborted_not_leader",
@@ -708,11 +690,12 @@ pub(crate) struct SchedulerDelocate<'a> {
 
 impl DelocateOps for SchedulerDelocate<'_> {
     async fn remove_location(&self) -> anyhow::Result<()> {
+        // Checked: the apply refuses a removal that would strand the anchor
+        // or the last live replica with Ok(ClientResponse::Error), which must
+        // keep the byte delete from running.
         self.sched
-            .raft()
-            .client_write(self.remove_req.clone())
+            .raft_write_checked(self.remove_req.clone())
             .await
-            .map(|_| ())
             .map_err(|e| anyhow::anyhow!("RemoveChunkLocation Raft write: {}", e))
     }
 
@@ -774,6 +757,60 @@ pub(crate) fn chunk_delocated_on_node(
         // expected -> every on-disk chunk is de-located.
         None => true,
     }
+}
+
+/// Reap decision view of ONE node, built from the current file table right
+/// after that node's ListChunks completes.
+pub(crate) struct NodeReapView {
+    /// Every chunk hash any file references.
+    pub in_state: std::collections::HashSet<String>,
+    /// Hashes the SM records on this node, any disk.
+    pub node_expected: std::collections::HashSet<String>,
+    /// Same, keyed by the disk id recorded in the row.
+    pub by_disk: std::collections::HashMap<u32, std::collections::HashSet<String>>,
+}
+
+impl NodeReapView {
+    pub(crate) fn from_files(
+        files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
+        node_id: u64,
+    ) -> Self {
+        let mut v = Self {
+            in_state: Default::default(),
+            node_expected: Default::default(),
+            by_disk: Default::default(),
+        };
+        for f in files.values() {
+            for c in &f.chunks {
+                v.in_state.insert(c.chunk_hash.clone());
+                if c.node_id.parse::<u64>().ok() == Some(node_id) {
+                    v.node_expected.insert(c.chunk_hash.clone());
+                    v.by_disk.entry(c.disk_id).or_default().insert(c.chunk_hash.clone());
+                }
+            }
+        }
+        v
+    }
+
+    /// Is the on-disk copy `cid` (found on `disk_id`, when the data node
+    /// reports it) de-located? With a disk id the per-disk set must lack it
+    /// AND the node-wide set must lack it: a row naming another disk of the
+    /// same node still protects the chunk. Without a disk id: node-wide.
+    pub(crate) fn delocated(&self, disk_id: Option<u32>, cid: &str) -> bool {
+        let node_wide = chunk_delocated_on_node(Some(&self.node_expected), cid);
+        match disk_id {
+            Some(d) => chunk_delocated_on_node(self.by_disk.get(&d), cid) && node_wide,
+            None => node_wide,
+        }
+    }
+}
+
+/// Per-delete gate of the orphan sweep: leadership plus a non-empty file
+/// view. The "log caught up" check is NOT here: it runs once at sweep start
+/// (`orphan_sweep_allowed`), since the leader's own in-flight writes keep
+/// `last_applied < last_log_index` and would abort every long sweep.
+pub(crate) fn orphan_delete_allowed(is_leader: bool, in_state_chunks: usize) -> bool {
+    is_leader && in_state_chunks > 0
 }
 
 /// CO-3-3 — given a set of chunks the tick's OPENING snapshot expected on a
@@ -970,4 +1007,121 @@ pub(crate) fn files_referencing_chunk(
         .filter(|(_, fm)| fm.chunks.iter().any(|c| c.chunk_hash == chunk_hash))
         .map(|(path, _)| path.clone())
         .collect()
+}
+
+#[cfg(test)]
+mod sched_audit_orphan_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn row(idx: u64, hash: &str, node: &str, disk: u32) -> ChunkLocationEntry {
+        ChunkLocationEntry {
+            chunk_index: idx,
+            chunk_hash: hash.to_string(),
+            node_id: node.to_string(),
+            disk_id: disk,
+            size_bytes: 1,
+        }
+    }
+
+    fn files(rows: Vec<ChunkLocationEntry>) -> std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata> {
+        let fm = dtfs_raft::state_machine::FileMetadata {
+            path: "/f".to_string(),
+            volume_id: "default".to_string(),
+            chunk_size: 4 * 1024 * 1024,
+            chunks: rows,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+        };
+        [("/f".to_string(), fm)].into()
+    }
+
+    // ---- task 1 ----
+    struct Ops {
+        remove: Result<(), String>,
+        deleted: AtomicBool,
+    }
+    impl DelocateOps for Ops {
+        async fn remove_location(&self) -> anyhow::Result<()> {
+            self.remove.clone().map_err(|e| anyhow::anyhow!(e))
+        }
+        async fn delete_bytes(&self) -> anyhow::Result<()> {
+            self.deleted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn refused_apply_is_an_error_not_success() {
+        use dtfs_raft::ClientResponse as R;
+        assert_eq!(client_response_ok(&R::Success), Ok(()));
+        assert_eq!(client_response_ok(&R::LockGranted), Ok(()));
+        assert_eq!(
+            client_response_ok(&R::Error { message: "last live replica".into() }),
+            Err("last live replica".to_string())
+        );
+        assert!(client_response_ok(&R::WriteLeaseConflict { owner_id: "o".into(), expires_at_ms: 1 }).is_err());
+        assert!(client_response_ok(&R::LockConflict { owner_id: "o".into(), start: 0, end: 1, write: true }).is_err());
+    }
+
+    #[tokio::test]
+    async fn refused_remove_never_deletes_bytes() {
+        let refused = client_response_ok(&dtfs_raft::ClientResponse::Error { message: "would strand anchor".into() });
+        let ops = Ops { remove: refused, deleted: AtomicBool::new(false) };
+        assert_eq!(delocate_replica(&ops).await, DelocateOutcome::RemoveFailed);
+        assert!(!ops.deleted.load(Ordering::SeqCst));
+
+        let ok = Ops { remove: client_response_ok(&dtfs_raft::ClientResponse::Success), deleted: AtomicBool::new(false) };
+        assert_eq!(delocate_replica(&ok).await, DelocateOutcome::Done);
+        assert!(ok.deleted.load(Ordering::SeqCst));
+    }
+
+    // ---- task 3a ----
+    #[test]
+    fn copy_under_another_disk_of_the_same_node_is_never_delocated() {
+        // SM records the chunk on node 1 disk 2; bytes found on disk 1.
+        let v = NodeReapView::from_files(&files(vec![row(0, "h", "1", 2)]), 1);
+        assert!(!v.delocated(Some(1), "h"));
+        assert!(!v.delocated(Some(2), "h"));
+        // Unrecorded chunk is still reapable, per disk and node-wide.
+        assert!(v.delocated(Some(1), "x"));
+        assert!(v.delocated(None, "x"));
+    }
+
+    #[test]
+    fn row_naming_another_node_does_not_protect() {
+        let v = NodeReapView::from_files(&files(vec![row(0, "h", "2", 1)]), 1);
+        assert!(v.delocated(Some(1), "h"));
+        assert!(v.delocated(None, "h"));
+        // Still referenced by a file, so not a hash-orphan.
+        assert!(v.in_state.contains("h"));
+    }
+
+    // ---- task 3b ----
+    #[test]
+    fn rebuilt_view_reflects_the_current_state() {
+        let before = NodeReapView::from_files(&files(vec![row(0, "h", "1", 0)]), 1);
+        assert!(!before.delocated(Some(0), "h"));
+        // The replica was removed after the sweep-start snapshot.
+        let after = NodeReapView::from_files(&files(vec![row(0, "h", "2", 0)]), 1);
+        assert!(after.delocated(Some(0), "h"));
+        // A replica registered meanwhile protects the bytes.
+        let reg = NodeReapView::from_files(&files(vec![row(0, "new", "1", 3)]), 1);
+        assert!(!reg.delocated(Some(3), "new"));
+    }
+
+    // ---- task 3c ----
+    #[test]
+    fn per_delete_gate_is_leadership_only_not_log_lag() {
+        // Start-of-sweep gate rejects a lagging log ...
+        assert!(!orphan_sweep_allowed(true, 5, 10, 3));
+        // ... the per-delete gate does not (the leader's own writes lag).
+        assert!(orphan_delete_allowed(true, 3));
+        assert!(!orphan_delete_allowed(false, 3));
+        assert!(!orphan_delete_allowed(true, 0));
+    }
 }

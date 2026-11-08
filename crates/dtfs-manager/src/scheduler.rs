@@ -73,6 +73,19 @@ const MIGRATION_COPIES_PER_TARGET: usize = 2;
 /// the worst case.
 const MAX_ADVANCE_ROUNDS: usize = 8;
 
+/// Cap on copy jobs dispatched in ONE advance round. The tick holds
+/// `migration_state_lock` for the whole advance, so an unbounded round (a
+/// backlog of thousands of tasks after a LELI outage) pinned it for hours.
+/// Tasks past the cap keep their Copying status and are picked up by the
+/// next round / tick.
+const MIGRATION_MAX_JOBS_PER_ROUND: usize = 2 * MIGRATION_COPY_CONCURRENCY;
+
+/// Wall-clock budget for the round loop of one tick: no new round starts
+/// once it is spent (a started round still finishes; each RPC inside is
+/// bounded). Migration state is saved after every round, so the progress
+/// survives a leader change.
+const MIGRATION_TICK_BUDGET: Duration = Duration::from_secs(600);
+
 /// Bug CN — hard wall-clock cap on a VerifyChunk RPC from the scheduler to a
 /// data node. WITHOUT this the orchestrating RPC could block forever when a
 /// target data node stalls (cross-DC flaky link, swap-thrashing node):
@@ -115,12 +128,30 @@ pub struct ReplicationTask {
     pub last_error: Option<String>,
 }
 
+/// Map a Raft apply response to a scheduler-level success/failure. The state
+/// machine reports refusals (anchor/last-live-replica guards, lease or lock
+/// conflicts) as `Ok(ClientResponse::...)`, not as a Raft error, so callers
+/// that only look at `client_write(..).is_err()` treat a refused write as done.
+pub(crate) fn client_response_ok(resp: &dtfs_raft::ClientResponse) -> Result<(), String> {
+    use dtfs_raft::ClientResponse as R;
+    match resp {
+        R::Error { message } => Err(message.clone()),
+        R::LockConflict { .. } | R::WriteLeaseConflict { .. } => Err(resp.to_string()),
+        _ => Ok(()),
+    }
+}
+
 /// Serializable collection of active migration tasks, stored in Raft state
 /// via `ClientRequest::UpdateConfig`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct MigrationState {
     tasks: HashMap<String, ReplicationTask>,
     next_task_id: u64,
+    /// task_id -> disk the target data node reported storing the copy on
+    /// (`ReplicateChunkResponse.disk_id`), consumed at registration. Absent
+    /// for old data nodes. Pruned when the task goes terminal.
+    #[serde(default)]
+    landed_disks: HashMap<String, u32>,
 }
 
 /// Background task scheduler that drives re-replication and migration.
@@ -159,9 +190,28 @@ pub struct TaskScheduler {
     /// `PlacementConfig::default()`; `set_placement_cfg` (main.rs) wires
     /// the operator's `[placement]` config after construction.
     placement_cfg: dtfs_common::config::PlacementConfig,
+    /// Per-round index of the chunks the in-flight migration tasks refer to
+    /// (one namespace pass per round instead of one per task). Only set
+    /// between `begin_round` and `end_round`, under `migration_state_lock`.
+    round_index: parking_lot::Mutex<Option<ChunkIndex>>,
 }
 
 impl TaskScheduler {
+
+    /// Propose `req` and treat a state-machine refusal as an error (see
+    /// `client_response_ok`). Use for writes whose success gates a byte
+    /// delete or a "registered" claim.
+    pub(crate) async fn raft_write_checked(&self, req: ClientRequest) -> anyhow::Result<()> {
+        let resp = self
+            .raft
+            .client_write(req)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        client_response_ok(&resp.data).map_err(|message| {
+            warn!(%message, "scheduler Raft write refused by the state machine");
+            anyhow::anyhow!("refused by state machine: {message}")
+        })
+    }
 
     /// Create a new task scheduler.
     pub fn new(
@@ -187,6 +237,7 @@ impl TaskScheduler {
             migration_state_lock: tokio::sync::Mutex::new(()),
             shared_secret: parking_lot::RwLock::new(String::new()),
             placement_cfg,
+            round_index: parking_lot::Mutex::new(None),
         }
     }
 
@@ -452,3 +503,15 @@ mod mgr_gc_lease_sweep_due_tests {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod migration_state_compat_tests {
+    use super::*;
+
+    #[test]
+    fn old_migration_state_json_loads_without_landed_disks() {
+        let s: MigrationState = serde_json::from_str(r#"{"tasks":{},"next_task_id":3}"#).unwrap();
+        assert_eq!(s.next_task_id, 3);
+        assert!(s.landed_disks.is_empty());
+    }
+}

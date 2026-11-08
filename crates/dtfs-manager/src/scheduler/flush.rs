@@ -276,7 +276,7 @@ impl FlushSnapshot {
             .collect();
         let mut files = Vec::new();
         for (path, meta) in sm.files.iter() {
-            if !path.starts_with(path_prefix) {
+            if !path_matches_prefix(path, path_prefix) {
                 continue;
             }
             // CO-5-7 — resolve mandatory replicas AND the anchor from the

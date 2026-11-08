@@ -60,43 +60,24 @@ impl TaskScheduler {
         &self.raft
     }
 
-    /// Pick any healthy node that currently has a copy of `chunk_id`,
-    /// excluding `exclude` (the migration target). Returns `(node_id,
-    /// grpc_addr)` for the chosen source, or `None` if no healthy replica
-    /// exists. (Helper for F-015.)
-    /// Resolve a healthy node that holds `chunk_id`, optionally excluding
-    /// one node id. Bug BO-1: `exclude` is `None` for a same-node
-    /// cross-tier anchor copy (`source_node == target_node`) — the planner
-    /// (`plan_anchor_lag_repair`, BH) legitimately targets a node that
-    /// already holds the chunk on another tier, so excluding the target
-    /// would strand the copy with "no healthy source replica". All other
-    /// call sites pass `Some(target_node)` (unchanged behaviour).
+    /// Resolve a healthy node holding a LIVE copy of `chunk_id` (node
+    /// Healthy and the row's disk not Failed/Removed), optionally excluding
+    /// one node id. `preferred` (the task's recorded source) is tried first
+    /// so a retry does not hop sources for no reason. Bug BO-1: `exclude` is
+    /// `None` for a same-node cross-tier anchor copy (`source_node ==
+    /// target_node`): the planner legitimately targets a node that already
+    /// holds the chunk on another tier.
     pub(super) async fn resolve_healthy_source(
         &self,
         chunk_id: &str,
         exclude: Option<u64>,
+        preferred: Option<u64>,
     ) -> Option<(u64, String)> {
+        let refs = self.chunk_refs(chunk_id).await;
         let sm = self.state_data.read().await;
-        let mut candidates: Vec<u64> = Vec::new();
-        for file in sm.files.values() {
-            for c in &file.chunks {
-                if c.chunk_hash == chunk_id {
-                    if let Ok(nid) = c.node_id.parse::<u64>() {
-                        if Some(nid) != exclude && !candidates.contains(&nid) {
-                            candidates.push(nid);
-                        }
-                    }
-                }
-            }
-        }
-        for nid in candidates {
-            if let Some(info) = sm.nodes.get(&nid) {
-                if info.health == HealthStatus::Healthy {
-                    return Some((nid, info.grpc_addr.clone()));
-                }
-            }
-        }
-        None
+        let locs = refs.iter().flat_map(|r| r.locs.iter().copied());
+        let nid = pick_healthy_source(locs, preferred, exclude, &sm.nodes)?;
+        Some((nid, sm.nodes.get(&nid)?.grpc_addr.clone()))
     }
 
     /// Ask the source node to replicate `chunk_id` to `target_addr`,
@@ -111,7 +92,7 @@ impl TaskScheduler {
         target_addr: &str,
         target_tier: &str,
         chunk_bytes: u64,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<u32>> {
         // Bug W (part 2) — `source_addr` is `NodeInfo.grpc_addr`, which the
         // RegisterNode path stores already as a full URL ("http://ip:port").
         // The old code prepended "http://" unconditionally and produced
@@ -169,7 +150,9 @@ impl TaskScheduler {
         })??;
 
         if resp.success {
-            Ok(())
+            // The disk the target really stored the copy on; None from an
+            // old data node.
+            Ok(resp.disk_id)
         } else {
             Err(anyhow::anyhow!("ReplicateChunk returned error: {}", resp.error))
         }
@@ -289,80 +272,59 @@ impl TaskScheduler {
         Ok((resp.was_present, resp.freed_bytes))
     }
 
-    /// Find the file path that contains a given chunk hash.
-    pub(super) async fn find_file_for_chunk(&self, chunk_hash: &str) -> Option<String> {
-        self.find_files_for_chunk(chunk_hash).await.into_iter().next()
-    }
-
-    /// REV-4-6 — EVERY file that references this chunk hash.
-    ///
-    /// Chunks are content-addressed, so identical content in two files (a
-    /// re-download, a copy, two episodes sharing a segment) is ONE chunk id
-    /// referenced from several `FileMetadata.chunks` lists. Registering a
-    /// completed replica against only the first match left every other
-    /// referencing file still short of its mandatory count, so
-    /// `check_under_replicated` scheduled the same copy again on the next
-    /// tick, forever — the copy succeeded every time and the deficit never
-    /// closed.
-    pub(super) async fn find_files_for_chunk(&self, chunk_hash: &str) -> Vec<String> {
+    /// Rows of every file referencing `chunk_hash`: from the per-round
+    /// index when one is active, else one namespace pass for this hash.
+    pub(super) async fn chunk_refs(&self, chunk_hash: &str) -> Vec<ChunkRef> {
+        if let Some(refs) = self
+            .round_index
+            .lock()
+            .as_ref()
+            .and_then(|i| i.get(chunk_hash))
+            .map(|r| r.to_vec())
+        {
+            return refs;
+        }
+        let wanted: std::collections::HashSet<String> = [chunk_hash.to_string()].into();
         let sm = self.state_data.read().await;
-        files_referencing_chunk(&sm.files, chunk_hash)
+        ChunkIndex::build(&sm.files, &wanted)
+            .get(chunk_hash)
+            .map(|r| r.to_vec())
+            .unwrap_or_default()
     }
 
-    /// Completing-stage replica registration (U3 — extracted verbatim from
-    /// the pre-U3 Completing branch so the orchestrator's `MigrationOps`
-    /// impl can call it). Finds the file owning `chunk_id`, ADDs the new
-    /// `target_node`/`tier` replica to the chunk's existing location set
-    /// (Bug AB: read existing entries, dedup by (node_id, disk_id) — Bug BH
-    /// — pick the disk matching `tier` — AV-5-9), and writes the full set
-    /// through Raft. No-op when the file is gone (next round's Bug AE guard
-    /// catches the orphan).
-    /// CR-3-4/MGR-4/MGR-8/MGR-9 — returns `Err` (instead of silently
-    /// warning) when the target has no LIVE disk of `tier`, or when
-    /// `chunk_id` no longer resolves to any row in any file (both
-    /// resolved under ONE SM read lock via `plan_replica_registration`,
-    /// so a lease-holder rewrite or corrupt-replica sweep landing between
-    /// two separate lock acquisitions can no longer make a vanished hash
-    /// default to chunk_index 0 — MGR-9), or when any `UpdateChunkLocations`
-    /// Raft write fails. The Completing dispatcher (below) keeps the task
-    /// Completing and retries on `Err` instead of marking it Done.
+    /// Completing-stage replica registration. Registers the copy on
+    /// `target_node` at the disk it ACTUALLY landed on (`landed`, from
+    /// `ReplicateChunkResponse.disk_id`); for an old data node that reports
+    /// none, the disk is only inferred when the target has exactly one live
+    /// disk of `tier` (`pick_registration_disk`). Only the NEW row(s) go to
+    /// Raft (never the read set of existing rows), once per referencing file
+    /// and chunk_index. `Err` keeps the task Completing (retry next tick):
+    /// no usable disk, hash no longer resolves to any row, or a refused or
+    /// failed `UpdateChunkLocations`.
     pub(super) async fn register_replica_location(
         &self,
         chunk_id: &str,
         target_node: u64,
         tier: DiskTier,
+        landed: Option<u32>,
     ) -> Result<(), String> {
-        let writes = {
-            let sm = self.state_data.read().await;
-            // AV-5-9 / CR-3-4/MGR-8 — pick a LIVE disk_id matching the
-            // task's tier on the target; a Failed/Removed disk of the
-            // right tier must not be resolved (the fresh replica would
-            // record a location `live_replica_tier` can never see).
-            let Some(resolved_disk_id) = resolve_disk_id_for_tier(sm.nodes.get(&target_node), tier)
-            else {
-                warn!(
-                    chunk = %chunk_id,
-                    target_node,
-                    ?tier,
-                    "CR-3-4/MGR-8: target has no live disk of this tier; not registering"
-                );
-                return Err(format!(
-                    "no live disk of tier {tier:?} on target node {target_node}"
-                ));
-            };
-            // REV-4-6 / CR-3-4/MGR-9 — register against every referencing
-            // file AND every chunk_index within it whose rows carry the
-            // hash, under this ONE lock (no second acquisition, no
-            // unwrap_or(0) fallback for a hash that isn't there).
-            plan_replica_registration(&sm.files, chunk_id, target_node, resolved_disk_id)
-        };
-        if writes.is_empty() {
+        let refs = self.chunk_refs(chunk_id).await;
+        if refs.is_empty() {
             warn!(
                 chunk = %chunk_id,
                 "CR-3-4/MGR-9: chunk hash not found in any file; not registering"
             );
             return Err(format!("chunk {chunk_id} hash not found in any file"));
         }
+        let disk = {
+            let sm = self.state_data.read().await;
+            pick_registration_disk(sm.nodes.get(&target_node), tier, landed)
+        };
+        let disk = disk.map_err(|e| {
+            warn!(chunk = %chunk_id, target_node, ?tier, reason = %e, "not registering replica");
+            e
+        })?;
+        let writes = plan_new_replica_rows(&refs, chunk_id, target_node, disk);
         if writes.len() > 1 {
             debug!(
                 chunk = %chunk_id,
@@ -372,14 +334,16 @@ impl TaskScheduler {
         }
         let mut first_err: Option<String> = None;
         for (path, chunks) in writes {
-            let req = ClientRequest::UpdateChunkLocations { now_ms: now_millis(),
+            let req = ClientRequest::UpdateChunkLocations {
+                now_ms: now_millis(),
                 path,
                 chunks,
                 // Bug P — system-driven, so no client lease applies.
                 lease_id: String::new(),
             };
-            // Bug AB diagnostic — WARN so a stuck-in-loop scheduler is visible.
-            if let Err(e) = self.raft.client_write(req).await {
+            // Checked: a lease/lock conflict or Error response is NOT a
+            // registration.
+            if let Err(e) = self.raft_write_checked(req).await {
                 warn!(
                     chunk = %chunk_id,
                     error = %e,
@@ -406,8 +370,8 @@ impl TaskScheduler {
     /// Delegates to the pure helper `chunk_size_in_any_file` so the
     /// predicate logic is unit-testable.
     pub(super) async fn chunk_bytes_anywhere(&self, chunk_hash: &str) -> Option<u64> {
-        let sm = self.state_data.read().await;
-        chunk_size_in_any_file(chunk_hash, &sm.files)
+        let refs = self.chunk_refs(chunk_hash).await;
+        chunk_bytes_from_refs(&refs)
     }
 
     /// Persist the migration state via the dedicated `UpdateMigrationState`
@@ -483,7 +447,7 @@ impl TaskScheduler {
             let files: Vec<(String, Vec<ChunkLocationEntry>)> = sm
                 .files
                 .iter()
-                .filter(|(path, _)| path.starts_with(path_prefix))
+                .filter(|(path, _)| path_matches_prefix(path, path_prefix))
                 .map(|(path, meta)| (path.clone(), meta.chunks.clone()))
                 .collect();
             let nodes: HashMap<u64, NodeSummary> = sm
@@ -627,6 +591,46 @@ pub(super) trait MigrationOps {
     fn audit(&self, action: &str, detail: &str, outcome: &str);
     /// Fire the MigrationFailed alert for an exhausted task.
     fn fire_migration_failed(&self, task: &ReplicationTask, reason: &str);
+
+    /// Like `resolve_source`, trying the task's recorded source first.
+    async fn resolve_source_preferring(
+        &self,
+        chunk_id: &str,
+        exclude: Option<u64>,
+        _preferred: u64,
+    ) -> Option<(u64, String)> {
+        self.resolve_source(chunk_id, exclude).await
+    }
+    /// Like `replicate`, also returning the disk the target stored the copy
+    /// on (None = not reported).
+    async fn replicate_landed(
+        &self,
+        src_addr: &str,
+        chunk_id: &str,
+        tgt_addr: &str,
+        tier_str: &str,
+        chunk_bytes: u64,
+    ) -> Result<Option<u32>, String> {
+        self.replicate(src_addr, chunk_id, tgt_addr, tier_str, chunk_bytes)
+            .await
+            .map(|_| None)
+    }
+    /// Like `register_replica`, with the disk the copy landed on.
+    async fn register_replica_on(
+        &self,
+        chunk_id: &str,
+        target_node: u64,
+        tier: DiskTier,
+        _landed: Option<u32>,
+    ) -> Result<(), String> {
+        self.register_replica(chunk_id, target_node, tier).await
+    }
+    /// Build the per-round chunk index for `wanted` (live impl only).
+    async fn begin_round(&self, _wanted: &std::collections::HashSet<String>) {}
+    /// Drop the per-round chunk index.
+    fn end_round(&self) {}
+    /// Persist migration state mid-tick (after each round).
+    async fn save_state(&self, _state: &MigrationState) {}
 }
 
 impl MigrationOps for TaskScheduler {
@@ -640,7 +644,16 @@ impl MigrationOps for TaskScheduler {
     }
 
     async fn resolve_source(&self, chunk_id: &str, exclude: Option<u64>) -> Option<(u64, String)> {
-        self.resolve_healthy_source(chunk_id, exclude).await
+        self.resolve_healthy_source(chunk_id, exclude, None).await
+    }
+
+    async fn resolve_source_preferring(
+        &self,
+        chunk_id: &str,
+        exclude: Option<u64>,
+        preferred: u64,
+    ) -> Option<(u64, String)> {
+        self.resolve_healthy_source(chunk_id, exclude, Some(preferred)).await
     }
 
     async fn target_addr(&self, node_id: u64) -> Option<String> {
@@ -655,6 +668,19 @@ impl MigrationOps for TaskScheduler {
         tier_str: &str,
         chunk_bytes: u64,
     ) -> Result<(), String> {
+        self.replicate_landed(src_addr, chunk_id, tgt_addr, tier_str, chunk_bytes)
+            .await
+            .map(|_| ())
+    }
+
+    async fn replicate_landed(
+        &self,
+        src_addr: &str,
+        chunk_id: &str,
+        tgt_addr: &str,
+        tier_str: &str,
+        chunk_bytes: u64,
+    ) -> Result<Option<u32>, String> {
         self.replicate_chunk(src_addr, chunk_id, tgt_addr, tier_str, chunk_bytes)
             .await
             .map_err(|e| format!("ReplicateChunk error: {e}"))
@@ -672,7 +698,33 @@ impl MigrationOps for TaskScheduler {
         target_node: u64,
         tier: DiskTier,
     ) -> Result<(), String> {
-        self.register_replica_location(chunk_id, target_node, tier).await
+        self.register_replica_location(chunk_id, target_node, tier, None).await
+    }
+
+    async fn register_replica_on(
+        &self,
+        chunk_id: &str,
+        target_node: u64,
+        tier: DiskTier,
+        landed: Option<u32>,
+    ) -> Result<(), String> {
+        self.register_replica_location(chunk_id, target_node, tier, landed).await
+    }
+
+    async fn begin_round(&self, wanted: &std::collections::HashSet<String>) {
+        let idx = {
+            let sm = self.state_data.read().await;
+            ChunkIndex::build(&sm.files, wanted)
+        };
+        *self.round_index.lock() = Some(idx);
+    }
+
+    fn end_round(&self) {
+        *self.round_index.lock() = None;
+    }
+
+    async fn save_state(&self, state: &MigrationState) {
+        self.save_migration_state(state).await;
     }
 
     fn audit(&self, action: &str, detail: &str, outcome: &str) {
@@ -725,6 +777,19 @@ pub(super) async fn advance_migration_tasks<O: MigrationOps>(
     state: &mut MigrationState,
     now_ms: u64,
 ) {
+    advance_migration_tasks_budgeted(ops, state, now_ms, MIGRATION_TICK_BUDGET).await
+}
+
+/// `advance_migration_tasks` with an explicit wall-clock `budget`: no round
+/// after the first starts once it is spent, and state is saved after every
+/// round that progressed (so a leader change loses at most one round).
+pub(super) async fn advance_migration_tasks_budgeted<O: MigrationOps>(
+    ops: &O,
+    state: &mut MigrationState,
+    now_ms: u64,
+    budget: Duration,
+) {
+    let started = std::time::Instant::now();
     // A task gets at most ONE Copying RPC and ONE Verifying RPC per call
     // (i.e. per tick). This preserves the pre-U3 retry cadence — a no-source
     // / transient-error task still burns one attempt per tick over
@@ -734,11 +799,16 @@ pub(super) async fn advance_migration_tasks<O: MigrationOps>(
     // one tick; it never re-dispatches a network RPC to the same task.
     let mut copied: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut verified: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for _round in 0..MAX_ADVANCE_ROUNDS {
+    for round in 0..MAX_ADVANCE_ROUNDS {
+        if round > 0 && started.elapsed() >= budget {
+            info!(round, ?budget, "Migration: tick budget spent; remaining work deferred to next tick");
+            break;
+        }
         let progressed = advance_round(ops, state, now_ms, &mut copied, &mut verified).await;
         if !progressed {
             break;
         }
+        ops.save_state(state).await;
     }
 }
 
@@ -758,6 +828,14 @@ pub(super) async fn advance_round<O: MigrationOps>(
 
     let mut progressed = false;
     let task_ids: Vec<String> = state.tasks.keys().cloned().collect();
+    // One namespace pass for the whole round (not one per task).
+    let wanted: std::collections::HashSet<String> = state
+        .tasks
+        .values()
+        .filter(|t| !matches!(t.status, MigrationStatus::Done | MigrationStatus::Failed))
+        .map(|t| t.chunk_id.clone())
+        .collect();
+    ops.begin_round(&wanted).await;
 
     // ---- Phase 1: Pending -> Copying (pure, serial). ----
     for task_id in &task_ids {
@@ -780,6 +858,10 @@ pub(super) async fn advance_round<O: MigrationOps>(
     // the surviving copies bounded-parallel. ----
     let mut jobs: Vec<CopyJob> = Vec::new();
     for task_id in &task_ids {
+        // Bounded round: leave the rest Copying for the next round / tick.
+        if jobs.len() >= MIGRATION_MAX_JOBS_PER_ROUND {
+            break;
+        }
         // Snapshot the fields we need; drop the &mut borrow before awaiting.
         let (chunk_id, target_node, source_node, tier) = {
             let Some(task) = state.tasks.get(task_id) else { continue };
@@ -854,7 +936,9 @@ pub(super) async fn advance_round<O: MigrationOps>(
         // Bug BO-1: for a same-node cross-tier anchor copy, don't exclude
         // the target — it IS the only holder (on its other tier).
         let exclude = anchor_copy_source_exclude(source_node, target_node);
-        let resolved_source = ops.resolve_source(&chunk_id, exclude).await;
+        let resolved_source = ops
+            .resolve_source_preferring(&chunk_id, exclude, source_node)
+            .await;
 
         match (resolved_source, target_addr) {
             (Some((src_node, src_addr)), Some(tgt_addr)) => {
@@ -907,7 +991,7 @@ pub(super) async fn advance_round<O: MigrationOps>(
                 .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MIGRATION_COPIES_PER_TARGET)));
         }
 
-        let results: Vec<(String, u64, Result<(), String>)> = stream::iter(jobs)
+        let results: Vec<(String, u64, Result<Option<u32>, String>)> = stream::iter(jobs)
             .map(|job| {
                 // Safe to unwrap: every job's tgt_addr was inserted above.
                 let gate = gates.get(&job.tgt_addr).expect("gate for tgt_addr").clone();
@@ -921,7 +1005,7 @@ pub(super) async fn advance_round<O: MigrationOps>(
                         .await
                         .expect("gate semaphore is never closed");
                     let r = ops
-                        .replicate(
+                        .replicate_landed(
                             &job.src_addr,
                             &job.chunk_id,
                             &job.tgt_addr,
@@ -939,7 +1023,15 @@ pub(super) async fn advance_round<O: MigrationOps>(
         for (task_id, resolved_source, result) in results {
             progressed = true;
             match result {
-                Ok(()) => {
+                Ok(landed) => {
+                    match landed {
+                        Some(d) => {
+                            state.landed_disks.insert(task_id.clone(), d);
+                        }
+                        None => {
+                            state.landed_disks.remove(&task_id);
+                        }
+                    }
                     if let Some(task) = state.tasks.get_mut(&task_id) {
                         if task.source_node != resolved_source {
                             info!(
@@ -1073,6 +1165,17 @@ pub(super) async fn advance_round<O: MigrationOps>(
     }
 
     // ---- Phase 4: Completing -> Done (serial; writes Raft). ----
+    // Phase 2 may have run for a long time; re-index just the chunks being
+    // registered so the planned rows come from a fresh view.
+    let completing: std::collections::HashSet<String> = state
+        .tasks
+        .values()
+        .filter(|t| t.status == MigrationStatus::Completing)
+        .map(|t| t.chunk_id.clone())
+        .collect();
+    if !completing.is_empty() {
+        ops.begin_round(&completing).await;
+    }
     for task_id in &task_ids {
         let (chunk_id, target_node, tier, source_node) = {
             let Some(task) = state.tasks.get(task_id) else { continue };
@@ -1082,7 +1185,8 @@ pub(super) async fn advance_round<O: MigrationOps>(
             (task.chunk_id.clone(), task.target_node, task.tier, task.source_node)
         };
 
-        match ops.register_replica(&chunk_id, target_node, tier).await {
+        let landed = state.landed_disks.get(task_id).copied();
+        match ops.register_replica_on(&chunk_id, target_node, tier, landed).await {
             Ok(()) => {
                 if let Some(task) = state.tasks.get_mut(task_id) {
                     info!(
@@ -1121,6 +1225,13 @@ pub(super) async fn advance_round<O: MigrationOps>(
         progressed = true;
     }
 
+    ops.end_round();
+    state.landed_disks.retain(|id, _| {
+        state
+            .tasks
+            .get(id)
+            .is_some_and(|t| !matches!(t.status, MigrationStatus::Done | MigrationStatus::Failed))
+    });
     progressed
 }
 
@@ -1174,6 +1285,160 @@ pub(super) fn record_copy_failure<O: MigrationOps>(
             "Copying retry queued",
         );
     }
+}
+
+/// One (file, chunk_index) that references a chunk hash, with every replica
+/// row recorded for it.
+#[derive(Debug, Clone)]
+pub(crate) struct ChunkRef {
+    pub path: String,
+    pub chunk_index: u64,
+    pub size_bytes: u64,
+    /// `(node_id, disk_id)` of each replica row.
+    pub locs: Vec<(u64, u32)>,
+}
+
+/// `chunk_hash -> refs` for a bounded set of hashes, built in ONE pass over
+/// the file table (instead of one pass per migration task).
+#[derive(Debug, Default)]
+pub(crate) struct ChunkIndex {
+    map: HashMap<String, Vec<ChunkRef>>,
+}
+
+impl ChunkIndex {
+    pub(crate) fn build(
+        files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
+        wanted: &std::collections::HashSet<String>,
+    ) -> Self {
+        let mut map: HashMap<String, Vec<ChunkRef>> =
+            wanted.iter().map(|h| (h.clone(), Vec::new())).collect();
+        for (path, fm) in files {
+            for c in &fm.chunks {
+                let Some(refs) = map.get_mut(&c.chunk_hash) else { continue };
+                let loc = c.node_id.parse::<u64>().ok().map(|n| (n, c.disk_id));
+                match refs
+                    .iter_mut()
+                    .find(|r| r.chunk_index == c.chunk_index && r.path == *path)
+                {
+                    Some(r) => {
+                        r.size_bytes = r.size_bytes.max(c.size_bytes);
+                        r.locs.extend(loc);
+                    }
+                    None => refs.push(ChunkRef {
+                        path: path.clone(),
+                        chunk_index: c.chunk_index,
+                        size_bytes: c.size_bytes,
+                        locs: loc.into_iter().collect(),
+                    }),
+                }
+            }
+        }
+        Self { map }
+    }
+
+    /// `None` = hash was not indexed; `Some(empty)` = indexed, unreferenced.
+    pub(crate) fn get(&self, hash: &str) -> Option<&Vec<ChunkRef>> {
+        self.map.get(hash)
+    }
+}
+
+/// Chunk size for the RPC deadline: largest recorded row size, `None` iff no
+/// file references the chunk (orphan).
+pub(crate) fn chunk_bytes_from_refs(refs: &[ChunkRef]) -> Option<u64> {
+    refs.iter().map(|r| r.size_bytes).max()
+}
+
+/// Pick the source replica: the node must be Healthy and the row's disk live
+/// (`live_replica_tier`); `preferred` first, else first eligible in row
+/// order; `exclude` never.
+pub(crate) fn pick_healthy_source(
+    locs: impl Iterator<Item = (u64, u32)>,
+    preferred: Option<u64>,
+    exclude: Option<u64>,
+    nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+) -> Option<u64> {
+    let eligible: Vec<u64> = locs
+        .filter(|(n, d)| {
+            Some(*n) != exclude
+                && nodes.get(n).is_some_and(|i| {
+                    i.health == HealthStatus::Healthy && live_replica_tier(Some(i), *d).is_some()
+                })
+        })
+        .map(|(n, _)| n)
+        .collect();
+    preferred
+        .filter(|p| eligible.contains(p))
+        .or_else(|| eligible.first().copied())
+}
+
+/// Disk to record for a freshly copied replica. `landed` (reported by the
+/// data node) wins. Without it the disk is only inferred when the target has
+/// exactly ONE live disk of `tier`: the data node picks by free space, so
+/// guessing among several would register the wrong disk and the orphan
+/// reaper would later delete the real bytes.
+pub(crate) fn pick_registration_disk(
+    node: Option<&dtfs_raft::NodeInfo>,
+    tier: DiskTier,
+    landed: Option<u32>,
+) -> Result<u32, String> {
+    let Some(node) = node else {
+        return Err("target node not registered".to_string());
+    };
+    if let Some(d) = landed {
+        return Ok(d);
+    }
+    let live: Vec<u32> = node
+        .disks
+        .iter()
+        .filter(|d| d.tier == tier && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed))
+        .map(|d| d.disk_id)
+        .collect();
+    match live.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(format!("no live disk of tier {tier:?} on target node")),
+        many => Err(format!(
+            "data node did not report the landing disk and {} live {tier:?} disks exist; refusing to guess",
+            many.len()
+        )),
+    }
+}
+
+/// Rows to ADD for a new replica `(target_node, disk)`: one per
+/// (file, chunk_index) that does not already carry it, grouped per file.
+/// Existing rows are never re-sent.
+pub(crate) fn plan_new_replica_rows(
+    refs: &[ChunkRef],
+    chunk_hash: &str,
+    target_node: u64,
+    disk: u32,
+) -> Vec<(String, Vec<ChunkLocationEntry>)> {
+    let mut out: Vec<(String, Vec<ChunkLocationEntry>)> = Vec::new();
+    for r in refs.iter().filter(|r| !r.locs.contains(&(target_node, disk))) {
+        let row = ChunkLocationEntry {
+            chunk_index: r.chunk_index,
+            chunk_hash: chunk_hash.to_string(),
+            node_id: target_node.to_string(),
+            disk_id: disk,
+            size_bytes: r.size_bytes,
+        };
+        match out.iter_mut().find(|(p, _)| *p == r.path) {
+            Some((_, rows)) => rows.push(row),
+            None => out.push((r.path.clone(), vec![row])),
+        }
+    }
+    out
+}
+
+/// Does `path` fall under the directory prefix `prefix`? Component-wise:
+/// "/media/tv" matches "/media/tv" and "/media/tv/x" but not "/media/tv-old".
+/// A trailing "/" is ignored and "/" (or "") is the whole tree.
+pub(crate) fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    let p = prefix.trim_end_matches('/');
+    if p.is_empty() {
+        return true;
+    }
+    path.strip_prefix(p)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -1438,3 +1703,341 @@ pub(super) fn trailing_u64(s: &str) -> Option<u64> {
 // lost-update race — a concurrent schedule during a tick would otherwise
 // clobber a task and regress `next_task_id`.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod sched_audit_tests {
+    use super::*;
+    use dtfs_common::types::{DiskInfo, NodeRole};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    fn disk(id: u32, tier: DiskTier, status: DiskStatus) -> DiskInfo {
+        DiskInfo {
+            disk_id: id,
+            uuid: String::new(),
+            mount_path: String::new(),
+            tier,
+            total_bytes: 0,
+            used_bytes: 0,
+            status,
+        }
+    }
+
+    fn node(health: HealthStatus, disks: Vec<DiskInfo>) -> dtfs_raft::NodeInfo {
+        dtfs_raft::NodeInfo {
+            hostname: String::new(),
+            grpc_addr: "http://n:9500".to_string(),
+            role: NodeRole::Data,
+            disks,
+            location: dtfs_common::topology::Location::new("", "", "", ""),
+            health,
+            total_capacity: 0,
+            used_capacity: 0,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    fn row(idx: u64, hash: &str, node: &str, disk: u32) -> ChunkLocationEntry {
+        ChunkLocationEntry {
+            chunk_index: idx,
+            chunk_hash: hash.to_string(),
+            node_id: node.to_string(),
+            disk_id: disk,
+            size_bytes: 1024,
+        }
+    }
+
+    fn file(chunks: Vec<ChunkLocationEntry>) -> dtfs_raft::state_machine::FileMetadata {
+        dtfs_raft::state_machine::FileMetadata {
+            path: "/f".to_string(),
+            volume_id: "default".to_string(),
+            chunk_size: 4 * 1024 * 1024,
+            chunks,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+        }
+    }
+
+    // ---- task 7: prefix matching ----
+    #[test]
+    fn prefix_is_component_wise() {
+        assert!(path_matches_prefix("/media/tv", "/media/tv"));
+        assert!(path_matches_prefix("/media/tv/s1/e1.mkv", "/media/tv"));
+        assert!(path_matches_prefix("/media/tv/s1/e1.mkv", "/media/tv/"));
+        assert!(!path_matches_prefix("/media/tv-old/x", "/media/tv"));
+        assert!(!path_matches_prefix("/media/tv-old/x", "/media/tv/"));
+        assert!(!path_matches_prefix("/media", "/media/tv"));
+    }
+
+    #[test]
+    fn root_prefix_is_whole_tree() {
+        assert!(path_matches_prefix("/a/b", "/"));
+        assert!(path_matches_prefix("/a", ""));
+    }
+
+    // ---- task 2a: registration disk ----
+    #[test]
+    fn reported_landing_disk_wins_over_guess() {
+        let n = node(
+            HealthStatus::Healthy,
+            vec![disk(1, DiskTier::Warm, DiskStatus::Healthy), disk(2, DiskTier::Warm, DiskStatus::Healthy)],
+        );
+        assert_eq!(pick_registration_disk(Some(&n), DiskTier::Warm, Some(2)), Ok(2));
+    }
+
+    #[test]
+    fn unreported_disk_inferred_only_when_unique() {
+        let one = node(
+            HealthStatus::Healthy,
+            vec![
+                disk(1, DiskTier::Warm, DiskStatus::Failed),
+                disk(2, DiskTier::Warm, DiskStatus::Healthy),
+                disk(3, DiskTier::Cold, DiskStatus::Healthy),
+            ],
+        );
+        assert_eq!(pick_registration_disk(Some(&one), DiskTier::Warm, None), Ok(2));
+
+        let two = node(
+            HealthStatus::Healthy,
+            vec![disk(1, DiskTier::Warm, DiskStatus::Healthy), disk(2, DiskTier::Warm, DiskStatus::Healthy)],
+        );
+        let err = pick_registration_disk(Some(&two), DiskTier::Warm, None).unwrap_err();
+        assert!(err.contains("refusing to guess"), "{err}");
+
+        let zero = node(HealthStatus::Healthy, vec![disk(3, DiskTier::Cold, DiskStatus::Healthy)]);
+        let err = pick_registration_disk(Some(&zero), DiskTier::Warm, None).unwrap_err();
+        assert!(err.contains("no live disk"), "{err}");
+        assert!(pick_registration_disk(None, DiskTier::Warm, Some(1)).is_err());
+    }
+
+    // ---- task 2b: only NEW rows are proposed ----
+    #[test]
+    fn registration_sends_only_the_new_row() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("/f".to_string(), file(vec![row(0, "h", "1", 0), row(0, "h", "2", 5)]));
+        let wanted = ["h".to_string()].into();
+        let idx = ChunkIndex::build(&files, &wanted);
+        let refs = idx.get("h").unwrap();
+        let writes = plan_new_replica_rows(refs, "h", 9, 3);
+        assert_eq!(writes.len(), 1);
+        let (path, rows) = &writes[0];
+        assert_eq!(path, "/f");
+        assert_eq!(rows.len(), 1, "existing rows must not be re-proposed");
+        assert_eq!((rows[0].node_id.as_str(), rows[0].disk_id, rows[0].chunk_index), ("9", 3, 0));
+        assert_eq!(rows[0].size_bytes, 1024);
+    }
+
+    #[test]
+    fn registration_skips_already_present_and_same_node_other_disk_is_new() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("/f".to_string(), file(vec![row(0, "h", "9", 3)]));
+        let wanted = ["h".to_string()].into();
+        let idx = ChunkIndex::build(&files, &wanted);
+        let refs = idx.get("h").unwrap();
+        assert!(plan_new_replica_rows(refs, "h", 9, 3).is_empty());
+        assert_eq!(plan_new_replica_rows(refs, "h", 9, 4).len(), 1);
+    }
+
+    // ---- task 6: one-pass index ----
+    #[test]
+    fn index_groups_rows_and_distinguishes_unreferenced_from_unindexed() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("/a".to_string(), file(vec![row(0, "h", "1", 0), row(0, "h", "2", 0), row(1, "other", "1", 0)]));
+        files.insert("/b".to_string(), file(vec![row(4, "h", "1", 0)]));
+        let wanted: std::collections::HashSet<String> = ["h".to_string(), "gone".to_string()].into();
+        let idx = ChunkIndex::build(&files, &wanted);
+        let refs = idx.get("h").unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs.iter().find(|r| r.path == "/a").unwrap().locs, vec![(1, 0), (2, 0)]);
+        assert_eq!(chunk_bytes_from_refs(refs), Some(1024));
+        assert_eq!(chunk_bytes_from_refs(idx.get("gone").unwrap()), None);
+        assert!(idx.get("other").is_none());
+    }
+
+    // ---- task 5: source choice ----
+    fn nodes_for_source() -> std::collections::BTreeMap<u64, dtfs_raft::NodeInfo> {
+        let mut m = std::collections::BTreeMap::new();
+        // node 1 Healthy but its disk is Failed.
+        m.insert(1, node(HealthStatus::Healthy, vec![disk(0, DiskTier::Cold, DiskStatus::Failed)]));
+        m.insert(2, node(HealthStatus::Healthy, vec![disk(0, DiskTier::Cold, DiskStatus::Healthy)]));
+        m.insert(3, node(HealthStatus::Healthy, vec![disk(0, DiskTier::Cold, DiskStatus::Healthy)]));
+        m.insert(4, node(HealthStatus::Down, vec![disk(0, DiskTier::Cold, DiskStatus::Healthy)]));
+        m
+    }
+
+    #[test]
+    fn source_skips_failed_disk_and_down_node() {
+        let nodes = nodes_for_source();
+        let locs = [(1u64, 0u32), (4, 0), (2, 0)];
+        assert_eq!(pick_healthy_source(locs.into_iter(), None, None, &nodes), Some(2));
+    }
+
+    #[test]
+    fn source_prefers_recorded_source_only_when_live() {
+        let nodes = nodes_for_source();
+        let locs = [(2u64, 0u32), (3, 0)];
+        assert_eq!(pick_healthy_source(locs.into_iter(), Some(3), None, &nodes), Some(3));
+        // Preferred node's only disk is Failed -> falls back to first eligible.
+        let locs = [(2u64, 0u32), (1, 0)];
+        assert_eq!(pick_healthy_source(locs.into_iter(), Some(1), None, &nodes), Some(2));
+    }
+
+    #[test]
+    fn source_honours_exclude_and_can_be_none() {
+        let nodes = nodes_for_source();
+        let locs = [(2u64, 0u32)];
+        assert_eq!(pick_healthy_source(locs.into_iter(), None, Some(2), &nodes), None);
+        let locs = [(1u64, 0u32), (4, 0)];
+        assert_eq!(pick_healthy_source(locs.into_iter(), None, None, &nodes), None);
+    }
+
+    // ---- tasks 2a/4: round cap, tick budget, landed disk plumbing ----
+    #[derive(Default)]
+    struct Ops {
+        replicate_calls: AtomicUsize,
+        saves: AtomicUsize,
+        landed: Option<u32>,
+        registered_with: Mutex<Vec<Option<u32>>>,
+        preferred_seen: Mutex<Vec<u64>>,
+    }
+
+    impl MigrationOps for Ops {
+        async fn validate_target(&self, _t: u64, _tier: DiskTier) -> Result<(), String> {
+            Ok(())
+        }
+        async fn chunk_bytes(&self, _c: &str) -> Option<u64> {
+            Some(4 << 20)
+        }
+        async fn resolve_source(&self, _c: &str, _ex: Option<u64>) -> Option<(u64, String)> {
+            Some((1, "http://src:9500".to_string()))
+        }
+        async fn resolve_source_preferring(
+            &self,
+            c: &str,
+            ex: Option<u64>,
+            preferred: u64,
+        ) -> Option<(u64, String)> {
+            self.preferred_seen.lock().unwrap().push(preferred);
+            self.resolve_source(c, ex).await
+        }
+        async fn target_addr(&self, n: u64) -> Option<String> {
+            Some(format!("http://tgt{n}:9500"))
+        }
+        async fn replicate(&self, _s: &str, _c: &str, _t: &str, _tier: &str, _b: u64) -> Result<(), String> {
+            Ok(())
+        }
+        async fn replicate_landed(
+            &self,
+            _s: &str,
+            _c: &str,
+            _t: &str,
+            _tier: &str,
+            _b: u64,
+        ) -> Result<Option<u32>, String> {
+            self.replicate_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.landed)
+        }
+        async fn verify(&self, _t: &str, _c: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+        async fn register_replica(&self, _c: &str, _t: u64, _tier: DiskTier) -> Result<(), String> {
+            Ok(())
+        }
+        async fn register_replica_on(
+            &self,
+            _c: &str,
+            _t: u64,
+            _tier: DiskTier,
+            landed: Option<u32>,
+        ) -> Result<(), String> {
+            self.registered_with.lock().unwrap().push(landed);
+            Ok(())
+        }
+        async fn save_state(&self, _s: &MigrationState) {
+            self.saves.fetch_add(1, Ordering::SeqCst);
+        }
+        fn audit(&self, _a: &str, _d: &str, _o: &str) {}
+        fn fire_migration_failed(&self, _t: &ReplicationTask, _r: &str) {}
+    }
+
+    fn state_of(n: usize) -> MigrationState {
+        let mut s = MigrationState::default();
+        for i in 0..n {
+            s.tasks.insert(
+                format!("repl-{i}"),
+                ReplicationTask {
+                    task_id: format!("repl-{i}"),
+                    chunk_id: format!("chunk-{i}"),
+                    source_node: 1,
+                    target_node: 2,
+                    tier: DiskTier::Warm,
+                    status: MigrationStatus::Pending,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    attempts: 0,
+                    last_error: None,
+                },
+            );
+        }
+        s
+    }
+
+    #[tokio::test]
+    async fn one_round_dispatches_at_most_the_cap() {
+        let ops = Ops::default();
+        let mut state = state_of(MIGRATION_MAX_JOBS_PER_ROUND + 6);
+        let (mut copied, mut verified) = (Default::default(), Default::default());
+        advance_round(&ops, &mut state, 1, &mut copied, &mut verified).await;
+        assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), MIGRATION_MAX_JOBS_PER_ROUND);
+        let still_copying =
+            state.tasks.values().filter(|t| t.status == MigrationStatus::Copying).count();
+        assert_eq!(still_copying, 6, "tasks past the cap wait for the next round");
+        // The next round picks them up.
+        advance_round(&ops, &mut state, 2, &mut copied, &mut verified).await;
+        assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), MIGRATION_MAX_JOBS_PER_ROUND + 6);
+    }
+
+    #[tokio::test]
+    async fn spent_budget_stops_after_first_round_and_saves_per_round() {
+        let ops = Ops::default();
+        let mut state = state_of(MIGRATION_MAX_JOBS_PER_ROUND * 2 + 1);
+        advance_migration_tasks_budgeted(&ops, &mut state, 1, Duration::ZERO).await;
+        assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), MIGRATION_MAX_JOBS_PER_ROUND);
+        assert_eq!(ops.saves.load(Ordering::SeqCst), 1);
+
+        let ops = Ops::default();
+        let mut state = state_of(MIGRATION_MAX_JOBS_PER_ROUND * 2 + 1);
+        advance_migration_tasks_budgeted(&ops, &mut state, 1, Duration::from_secs(3600)).await;
+        assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), MIGRATION_MAX_JOBS_PER_ROUND * 2 + 1);
+        assert_eq!(ops.saves.load(Ordering::SeqCst), 3);
+        assert!(state.tasks.values().all(|t| t.status == MigrationStatus::Done));
+    }
+
+    #[tokio::test]
+    async fn landed_disk_reaches_registration_and_is_pruned() {
+        let ops = Ops { landed: Some(7), ..Default::default() };
+        let mut state = state_of(1);
+        advance_migration_tasks(&ops, &mut state, 1).await;
+        assert_eq!(*ops.registered_with.lock().unwrap(), vec![Some(7)]);
+        assert!(state.landed_disks.is_empty(), "terminal task must not keep a landed disk");
+        assert_eq!(*ops.preferred_seen.lock().unwrap(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn old_data_node_registers_with_no_landed_disk() {
+        let ops = Ops::default();
+        let mut state = state_of(1);
+        advance_migration_tasks(&ops, &mut state, 1).await;
+        assert_eq!(*ops.registered_with.lock().unwrap(), vec![None]);
+    }
+}
