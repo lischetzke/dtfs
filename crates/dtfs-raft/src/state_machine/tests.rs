@@ -3182,3 +3182,58 @@ mod audit_co_tests {
         assert_eq!(sm.cluster_config.config_json, r#"{"a":1}"#);
     }
 }
+
+/// Raft audit fixes (symlink/link overwrite, rename type conflicts, ...).
+#[cfg(test)]
+mod raft_audit_fix_tests {
+    use super::*;
+
+    fn lid(idx: u64) -> LogId {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        openraft::LogId::new(leader, idx)
+    }
+
+    fn create(sm: &mut StateMachineData, idx: u64, path: &str) {
+        let r = apply_request(sm, &lid(idx), &ClientRequest::CreateFile {
+            path: path.into(), volume_id: "default".into(), chunk_size: 4096,
+        });
+        assert!(matches!(r, ClientResponse::FileCreated { .. }), "{r:?}");
+    }
+
+    fn err_msg(r: ClientResponse) -> String {
+        match r {
+            ClientResponse::Error { message } => message,
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn symlink_refuses_existing_file_and_directory() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/f");
+        create(&mut sm, 2, "/d/x");
+        let sym = |sm: &mut StateMachineData, i, p: &str| apply_request(sm, &lid(i),
+            &ClientRequest::CreateSymlink { path: p.into(), target: "/t".into(), now_ms: 0 });
+        assert_eq!(err_msg(sym(&mut sm, 3, "/f")), "Symlink: '/f' already exists");
+        assert_eq!(err_msg(sym(&mut sm, 4, "/d")), "Symlink: '/d' already exists");
+        assert!(sm.files["/f"].symlink_target.is_none(), "existing file untouched");
+        // Sibling with a shared name prefix is not a child of /f.
+        assert!(matches!(sym(&mut sm, 5, "/f2"), ClientResponse::Success));
+        assert_eq!(sm.files["/f2"].symlink_target.as_deref(), Some("/t"));
+    }
+
+    #[test]
+    fn link_refuses_existing_dest_and_allows_fresh() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/src");
+        create(&mut sm, 2, "/dst");
+        create(&mut sm, 3, "/d/x");
+        let link = |sm: &mut StateMachineData, i, d: &str| apply_request(sm, &lid(i),
+            &ClientRequest::CreateLink { source: "/src".into(), dest: d.into(), now_ms: 0 });
+        assert_eq!(err_msg(link(&mut sm, 4, "/dst")), "Link: destination '/dst' already exists");
+        assert_eq!(err_msg(link(&mut sm, 5, "/d")), "Link: destination '/d' already exists");
+        assert!(matches!(link(&mut sm, 6, "/new"), ClientResponse::Success));
+        assert!(sm.files.contains_key("/new"));
+    }
+}

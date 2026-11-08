@@ -844,6 +844,17 @@ fn push_audit_capped(log: &mut Vec<AuditEntry>, entry: AuditEntry) {
     }
 }
 
+/// True when `p` is an existing entry or a (synthetic) directory with children.
+fn path_occupied(sm: &StateMachineData, p: &str) -> bool {
+    let prefix = format!("{p}/");
+    sm.files.contains_key(p)
+        || sm
+            .files
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|(k, _)| k.starts_with(&prefix))
+}
+
 /// Bug BK — one-shot migration on snapshot restore: when the nested
 /// `scrub_results_by_level` map is empty but the legacy single-per-node
 /// `scrub_results` map has entries (a snapshot written by a pre-BK
@@ -1705,6 +1716,11 @@ fn apply_request(
         }
 
         ClientRequest::CreateSymlink { path, target, now_ms: req_now_ms } => {
+            if path_occupied(sm, path) {
+                return ClientResponse::Error {
+                    message: format!("Symlink: '{path}' already exists"),
+                };
+            }
             let eff_now_ms = if *req_now_ms == 0 { log_id.index } else { *req_now_ms };
             sm.files.insert(
                 path.clone(),
@@ -1729,6 +1745,11 @@ fn apply_request(
         }
 
         ClientRequest::CreateLink { source, dest, now_ms: req_now_ms } => {
+            if path_occupied(sm, dest) {
+                return ClientResponse::Error {
+                    message: format!("Link: destination '{dest}' already exists"),
+                };
+            }
             let eff_now_ms = if *req_now_ms == 0 { log_id.index } else { *req_now_ms };
             // Hard link: clone the source metadata under the dest path.
             // The chunk list is shared by value (chunk_ids are content-addressed
