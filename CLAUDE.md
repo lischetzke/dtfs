@@ -2,7 +2,7 @@
 
 DTFS = Raft-managed tiered distributed filesystem in Rust. This file is canonical contract: keep accurate, update in same commit as any behaviour/convention change.
 
-Environment: crate tests in the Docker image (§ A.4), runtime checks on `scripts/dev-cluster.sh` (local Docker cluster). A real cluster (`prod` in the `dtfs` MCP config) is read-only for verification; it auto-updates within ~1 h of a release, after which an rsync job reruns: monitor it after every release and follow up with fixes/releases. Anything else is reasoned, not executed.
+Environment: no lab or prod cluster. Verification: crate tests in the Docker image (§ A.4), runtime checks on `scripts/dev-cluster.sh` (local Docker cluster); anything else is reasoned, not executed.
 
 Agents: `.claude/agents/`. Path-scoped invariants: `.claude/rules/`. Live incidents: `dtfs-diagnose` skill + `dtfs` MCP (`tools/dtfs-mcp/`, `docs/src/operations/diagnostics-mcp.md`); `op_*` dry-run unless confirmed.
 
