@@ -1,0 +1,137 @@
+# Release: a push to master whose head commit subject starts with
+# `release vX.Y.Z` (CLAUDE.md A.3.5; parsed by scripts/ci/version.sh), or a
+# manual run with a `version` input. Tests, builds the version-stamped
+# tarball in rust:1.94.1-bookworm (glibc must match the Debian bookworm
+# hosts), signs SHA256SUMS when MINISIGN_SECRET_KEY is set, and creates the
+# tag + GitHub release. Nothing is deployed: the operator runs
+# deploy/ansible/update-cluster.yml (docs/src/operations/ci-pipeline.md).
+name: release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, vX.Y.Z (builds the selected master commit)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.v.outputs.mode }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Resolve the version
+        id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            [ "$REF" = "refs/heads/master" ] || { echo "::error::releases are cut from master, not $REF"; exit 1; }
+            subject="release $INPUT_VERSION"
+          else
+            subject="$(printf '%s' "$COMMIT_MESSAGE" | head -n1)"
+          fi
+          out="$(bash scripts/ci/version.sh "$subject")"
+          echo "$out"
+          # version.sh prints MODE=/VERSION=; step outputs want lower-case keys.
+          printf '%s\n' "$out" | sed -E 's/^MODE=/mode=/; s/^VERSION=/version=/' >> "$GITHUB_OUTPUT"
+          if printf '%s\n' "$out" | grep -qx 'MODE=release'; then
+            version="$(printf '%s\n' "$out" | sed -n 's/^VERSION=//p')"
+            if git rev-parse -q --verify "refs/tags/$version" >/dev/null; then
+              echo "::error::tag $version already exists; bump the version"; exit 1
+            fi
+          else
+            echo "head commit is not a release commit; nothing to do"
+          fi
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.mode == 'release'
+    runs-on: ubuntu-latest
+    container: rust:1.94.1-bookworm
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Native build dependencies (as docker/buildenv.Dockerfile)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            clang libclang-dev cmake protobuf-compiler pkg-config \
+            libfuse3-dev fuse3 libssl-dev nodejs
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --workspace --release
+      - name: Build, stamp and package the release
+        run: bash scripts/dtfs-release.sh "$VERSION"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist
+          path: target/release-artifacts/${{ needs.prepare.outputs.version }}/
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist
+      - name: Refuse an existing release or tag
+        run: |
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null || gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "::error::$VERSION already exists"; exit 1
+          fi
+      - name: Sign SHA256SUMS (no-op without MINISIGN_SECRET_KEY)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          if [ -n "$MINISIGN_SECRET_KEY" ]; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends minisign
+          fi
+          bash scripts/ci/sign-release.sh dist
+      - name: Release notes (git-cliff, .github/cliff.toml)
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: .github/cliff.toml
+          args: --tag ${{ needs.prepare.outputs.version }} --unreleased --strip header
+        env:
+          OUTPUT: notes.md
+      - name: Create the tag and GitHub release
+        run: |
+          assets=(dist/dtfs-linux-amd64.tar.gz dist/SHA256SUMS)
+          [ ! -f dist/SHA256SUMS.minisig ] || assets+=(dist/SHA256SUMS.minisig)
+          # Same shape as `scripts/dtfs-release.sh <version> --publish`.
+          gh release create "$VERSION" "${assets[@]}" \
+            --title "$VERSION" --target "$GITHUB_SHA" --notes-file notes.md

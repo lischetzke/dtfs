@@ -52,7 +52,7 @@ Crates: **dtfs-manager** (Raft peer, REST/gRPC, owns metadata), **dtfs-data** (p
 
 **A.3.4 Mandatory vs cache replicas.** Never conflated: `mandatory_replicas.<tier>` (only under-replication scheduler maintains) vs `cache_replicas.<tier>.{min,max}` (only tiering engine creates, evictable). Every promote/demote checks anchor first. Replicas keyed by `(node_id, disk_id)`, never `node_id` alone; data disk ids persist in `<disk>/.dtfs-disk-id` (moved `[[disks]]` entry refuses startup) and copies register the disk the target reports. A Raft `ClientResponse::Error` is a failure (`scheduler::client_response_ok`), never followed by a byte delete. A replica justifying removal of another must be LIVE (`live_replica_tier`); `apply_remove_chunk_location` refuses to remove the last live replica. Anchor DC strings compare case-insensitively.
 
-**A.3.5 Build stamp.** Deploy builds only via `scripts/{build-linux-amd64,dtfs-build,dtfs-release}.sh` (fresh `BUILD_DATE`, release stamps `DTFS_VERSION`). Commit subject `release vX.Y.Z` / `deploy` ships via `.gitlab-ci.yml` + `deploy/ansible/update-cluster.yml` (`docs/src/operations/ci-pipeline.md`).
+**A.3.5 Build stamp.** Deploy builds only via `scripts/{build-linux-amd64,dtfs-build,dtfs-release}.sh` (fresh `BUILD_DATE`, release stamps `DTFS_VERSION`). Commit subject `release vX.Y.Z` on master releases via `release.yml`; CI never deploys, operator runs `deploy/ansible/update-cluster.yml` (`ci-pipeline.md`).
 
 **A.3.6 Raft is the only mutation point.** Replicated state changes only via a `ClientRequest` applied in `apply_request`. Apply is deterministic: no wall clock (use `now_ms`), no RNG, no I/O, no hash-map iteration order leaking into state. Byte deletion only after the Raft removal commits. Lease-less `UpdateChunkLocations` (scheduler) is union-only: never removes rows, never touches an index without rows, never grows size, errors when it skipped anything. Every apply arm that can refuse returns an error and has a negative test.
 
@@ -102,7 +102,7 @@ Load-bearing ownership only; history per row in `docs/src/internals/invariants.m
 | `dtfs-fuse/src/fuse_adapter.rs` | Every op error routes through `cluster_err_to_errno` |
 | `dtfs-cli/src/main.rs` + `updater.rs` | REST client, full webui parity, non-zero exit on failure; updater verifies sha256 (+ minisign), token on first hop only |
 | `scripts/dtfs-install.sh` | Role installer; rendered configs proven by `dtfs-common/tests/installer_render.rs` |
-| `docs/` + `scripts/build-docs.sh` | mdBook (pinned, Docker fallback), `scripts/check-docs-links.py`; CI `pages` job publishes HTML; Ansible spec in `docs/src/deployment/` |
+| `docs/` + `scripts/build-docs.sh` | mdBook, `scripts/check-docs-links.py`; `docs.yml` publishes Pages + Wiki (`scripts/sync-wiki.py`); Ansible spec in `docs/src/deployment/` |
 
 ---
 

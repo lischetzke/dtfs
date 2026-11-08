@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DTFS cluster health check — read-only, runs from any host that can reach
-# the manager REST API. Used by the CI verify stage and as
-# the final play of deploy/ansible/update-cluster.yml.
+# the manager REST API. Used as the final play of
+# deploy/ansible/update-cluster.yml and by hand.
 #
 # Passes when, within --timeout seconds, ALL of the following hold:
 #   * every listed manager answers /api/v1/raft/state with

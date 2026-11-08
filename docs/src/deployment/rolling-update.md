@@ -1,7 +1,7 @@
 # Rolling Update and Rollback
 
 Sources: `deploy/ansible/update-cluster.yml`, `deploy/ansible/tasks/update-node.yml`,
-`scripts/dtfs-cluster-healthcheck.sh`, `.gitlab-ci.yml`, `scripts/ci/gitlab-yank.sh`,
+`scripts/dtfs-cluster-healthcheck.sh`, `.github/workflows/release.yml`,
 `crates/dtfs-cli/src/updater.rs`, `crates/dtfs-manager/src/{monitor,metadata}.rs`.
 
 This page specifies what a role must do to update a running cluster to a new
@@ -18,7 +18,7 @@ playbook leaves out.
   data nodes, then clients.
 - Every node must pass its health gate, then a settle delay, before the next
   node starts. A failed gate stops the whole run.
-- The target is an exact tag (`vX.Y.Z`, or an alpha `vX.Y.Z_YYYYMMDDHHmm`). Do
+- The target is an exact tag (`vX.Y.Z`). Do
   not resolve `latest` inside an unattended run.
 
 ## Inputs
@@ -201,7 +201,7 @@ trailer; read them before pinning a version.
 | gate times out on a node | the run stops at that node; earlier nodes stay on the new version, later ones on the old | inspect (`journalctl -u <unit>`), then either fix forward and re-run (finished nodes are skipped) or roll back (below) |
 | preflight cannot reach a manager or sees no leader | nothing changed | fix or wait; re-run |
 | stamp mismatch after install | binary on disk is not the requested tag | stop; check the tarball/tag and the task that copied it |
-| release itself is bad | the GitLab release is still `latest` because `release` runs before `deploy` | run the manual CI job `yank:release` (or `scripts/ci/gitlab-yank.sh <tag>`); this deletes only the release object, the tag and package files stay, the version number is burnt, and the fix ships as the next version |
+| release itself is bad | the GitHub release is still `latest` | `gh release delete <tag>` (see [CI Pipeline](../operations/ci-pipeline.md#recovering-from-a-failed-rollout)); the tag stays, the version number is burnt, and the fix ships as the next version |
 
 ## Rollback
 
@@ -231,8 +231,8 @@ The manager role must preserve the data directory: rollback never touches
 ## Alternative: self-update on the node
 
 `dtfs-cli update <manager|data|client|cli|all> [--tag vX.Y.Z] [--check] [--yes]`
-downloads from the configured repo (default GitLab package registry; token from
-`--token`, `DTFS_REPO_TOKEN` or `[updater] token`), verifies the minisign
+downloads from the configured repo (default: the GitHub releases of
+`lischetzke/dtfs`; flags in the [CLI Reference](../api-reference/cli-reference.md)), verifies the minisign
 signature when `--minisign-key`, `DTFS_MINISIGN_PUBKEY` or `[updater] minisign_public_key` is set
 (a warning otherwise), verifies each binary against `MANIFEST`, installs
 atomically and restarts the units that exist on the host (a role with no unit

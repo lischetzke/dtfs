@@ -18,8 +18,8 @@ the daemon identity (`node.hostname`, or `location.host` for clients), or set
 | Variable | Default | Required | Meaning |
 |---|---|---|---|
 | `dtfs_version` | none | yes | Exact tag to install, for example `v0.2.0` |
-| `dtfs_tarball` / `dtfs_tarball_url` | none | one of | Local path on the control host, or registry URL |
-| `dtfs_repo_token` | empty | for a private project | GitLab deploy (`gldt-`) or access token; use `no_log` |
+| `dtfs_repo` | `lischetzke/dtfs` | no | GitHub `owner/repo` the release is downloaded from |
+| `dtfs_tarball` / `dtfs_tarball_url` | the GitHub release asset of `dtfs_version` | no | Local path on the control host, or an explicit URL, instead of the default download |
 | `dtfs_minisign_pubkey` | empty | recommended | Public key (base64, or an absolute `.pub` path); when set, signature verification of `SHA256SUMS` is mandatory and `minisign` must exist on the control host |
 | `dtfs_verify_checksum` | true | no | Require the tarball sha256 in `SHA256SUMS` (also checks `dtfs/MANIFEST`); `update-cluster.yml` fails the play on mismatch |
 | `dtfs_sums` / `dtfs_sums_url` / `dtfs_minisig` | beside the tarball | no | Override where `SHA256SUMS` and `SHA256SUMS.minisig` come from |

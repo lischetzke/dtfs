@@ -1,0 +1,79 @@
+# Documentation: mdBook site on GitHub Pages and the GitHub Wiki, both
+# generated from docs/src on master. One-time repository setup: Settings >
+# Pages > Source "GitHub Actions"; Wiki enabled with its first page created
+# once by hand (GitHub only creates the wiki repository then).
+name: docs
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/**"
+      - "scripts/build-docs.sh"
+      - "scripts/check-docs-links.py"
+      - "scripts/sync-wiki.py"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs
+  cancel-in-progress: false
+
+jobs:
+  pages-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build the book (link check first)
+        env:
+          # Project Pages site lives under /dtfs/ (docs/book.toml default is /).
+          MDBOOK_OUTPUT__HTML__SITE_URL: /dtfs/
+        run: bash scripts/build-docs.sh --clean
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs/book
+
+  pages-deploy:
+    needs: pages-build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  wiki:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Convert docs/src to wiki pages
+        run: python3 -I scripts/sync-wiki.py docs/src "$RUNNER_TEMP/wiki-out"
+      - name: Push to the wiki repository
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/wiki-out"; work="$RUNNER_TEMP/wiki"
+          git clone --quiet "https://x-access-token:${TOKEN}@github.com/${REPO}.wiki.git" "$work" || {
+            echo "::error::cannot clone ${REPO}.wiki; enable the wiki and create its first page once"; exit 1; }
+          cd "$work"
+          # The wiki is fully generated: drop pages that left SUMMARY.md.
+          git rm -rq --ignore-unmatch -- '*.md'
+          cp -r "$out"/. .
+          git add -A
+          if git diff --cached --quiet; then
+            echo "wiki already up to date"; exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Sync from docs/src at ${GITHUB_SHA}"
+          git push --quiet origin HEAD

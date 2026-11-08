@@ -1,8 +1,8 @@
 ---
 # Production inventory shape for deploy/ansible/update-cluster.yml.
 #
-# The real file lives OUTSIDE the repository on the GitLab runner host and
-# is referenced by the CI variable DTFS_ANSIBLE_INVENTORY. Groups are
+# The real file lives OUTSIDE the repository on the operator's control host
+# (it holds real addresses; pass it with -i). Groups are
 # fixed (managers / data_nodes / clients); host names must equal the
 # node's `[node].hostname` in its dtfs config (or set dtfs_hostname).
 #

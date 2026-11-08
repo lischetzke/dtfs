@@ -1,21 +1,21 @@
 # Release Artifacts
 
 Sources: `scripts/dtfs-release.sh`, `scripts/dtfs-build.sh`,
-`scripts/ci/{version,gitlab-release,sign-release,gitlab-yank}.sh`,
+`scripts/ci/{version,sign-release}.sh`, `.github/workflows/release.yml`,
 `crates/dtfs-cli/src/updater.rs`.
 
 ## What a release consists of
 
-Files published per version, all under one package version:
+Files attached to the GitHub release of each version:
 
 | File | Always | Content |
 |---|---|---|
 | `dtfs-linux-amd64.tar.gz` | yes | The only tarball name consumers use. Linux x86_64 only. |
 | `SHA256SUMS` | yes | One line: `<sha256>  dtfs-linux-amd64.tar.gz` (output of `sha256sum`, so `sha256sum -c SHA256SUMS` works in the download directory). |
-| `SHA256SUMS.minisig` | only if the CI variable `MINISIGN_SECRET_KEY` was set | minisign signature over `SHA256SUMS`. |
+| `SHA256SUMS.minisig` | only if the repository secret `MINISIGN_SECRET_KEY` was set | minisign signature over `SHA256SUMS`. |
 
 `notes.md` (git-cliff release notes) is built but not uploaded as a file; it is
-the description of the GitLab release.
+the body of the GitHub release.
 
 Inside the tarball (single top-level directory `dtfs/`):
 
@@ -37,48 +37,30 @@ before it installs anything. The `systemd/` units are the same files as
 
 ## Where they are published
 
-Primary: the GitLab Generic Package Registry of the project, package name
-`dtfs`, package version = release tag:
+GitHub releases of `https://github.com/lischetzke/dtfs`, created by
+`.github/workflows/release.yml` (or by hand with
+`scripts/dtfs-release.sh <tag> --publish`, which runs the same
+`gh release create`). The tag is created with the release:
 
 ```text
-<repo_url>/api/v4/projects/<group>%2F<project>/packages/generic/dtfs/<tag>/<file>
-# default repo_url: https://github.com/lischetzke/dtfs
-# example: https://gitlab.example.invalid/api/v4/projects/example%2Fdtfs/packages/generic/dtfs/v0.2.0/dtfs-linux-amd64.tar.gz
+https://github.com/lischetzke/dtfs/releases/download/<tag>/<file>
+https://github.com/lischetzke/dtfs/releases/latest/download/<file>
 ```
 
-Authentication for a private project, sent as an HTTP header (the installer and
-`dtfs-cli update` choose by prefix):
-
-| Token | Header |
-|---|---|
-| Deploy token `gldt-...`, scope `read_package_registry` | `DEPLOY-TOKEN: <token>` |
-| Project or personal access token `glpat-...`, scope `read_api` | `PRIVATE-TOKEN: <token>` |
-
-Redirects: the registry may redirect to object storage. Do not forward the token
-header to the redirect target (`dtfs-cli` follows redirects hop by hop and drops
-it after the first hop). With `curl`, do the first request with the header and
-`--max-redirs 0`, then fetch the `Location` URL without it; Ansible
-`get_url` with `headers:` as `update-cluster.yml` does works when the instance
-serves the file directly.
-
-Secondary: `scripts/dtfs-release.sh <tag> --publish` creates a GitHub release
-(`https://github.com/lischetzke/dtfs`) with `dtfs-linux-amd64.tar.gz` and
-`SHA256SUMS`. A `github.com` repo URL makes the installer and updater use
-`releases/latest/download/` and `releases/download/<tag>/`. CI does not create
-GitHub releases and no `.minisig` is attached there; treat GitLab as the source
-of record.
+The repository is public: no token is needed to download. GitHub redirects
+asset downloads to object storage; `curl -L`, `dtfs-cli`, the installer and
+Ansible `get_url` all follow it.
 
 ## Version naming
 
 | Kind | Tag / version string | Created by | Resolves as `latest` |
 |---|---|---|---|
-| Release | `vX.Y.Z` (three numbers) | commit subject starting `release vX.Y.Z` (the `v` is optional in the subject; the tag always has it) | yes |
-| Alpha | `v<base>_<YYYYMMDDHHmm>` (UTC), `<base>` = newest `vX.Y.Z` tag, for example `v0.1.9_202609131530` | commit subject starting `deploy`, or a manual pipeline with `DTFS_DEPLOY_MODE=deploy` | no, only when named explicitly; the GitLab release is marked as an alpha build |
+| Release | `vX.Y.Z` (three numbers) | commit subject starting `release vX.Y.Z` on master (the `v` is optional in the subject; the tag always has it), or the `release` workflow started by hand with a `version` | yes |
 | Dev build | `v0.0.0-dev` | any build without `DTFS_VERSION` | never published |
 
-`latest` is resolved by listing `GET <api>/releases?per_page=50` and taking the
-first `tag_name` that matches `^v[0-9]+\.[0-9]+\.[0-9]+$` (needs `jq`). Pin an
-explicit tag in automation; resolve `latest` only for interactive use.
+There are no alpha or per-commit builds and CI never deploys. `latest` is the
+release GitHub marks as latest (`releases/latest`). Pin an explicit tag in
+automation; resolve `latest` only for interactive use.
 
 The version is stamped into every binary. The check an automation should use:
 
@@ -140,10 +122,11 @@ protecting the signing key: [CI Pipeline](../operations/ci-pipeline.md#release-s
 
 ## Yanked releases
 
-A failed rollout is handled by deleting the GitLab release object
-(`yank:release` job, `scripts/ci/gitlab-yank.sh <tag>`); the tag and the package
-files stay downloadable by exact URL but `latest` no longer resolves to them.
+A failed rollout is handled by deleting the GitHub release object
+(`gh release delete <tag>`, see [CI Pipeline](../operations/ci-pipeline.md#recovering-from-a-failed-rollout));
+the tag stays (`gh release delete` without `--cleanup-tag`) but `latest` no longer
+resolves to the release and its assets are gone.
 A role that pins an explicit tag must therefore not assume a published tag is
-still the current one: check `GET <api>/releases/<tag>` returns 200 before a
+still the current one: check `gh release view <tag>` succeeds before a
 fleet-wide run, and never reuse a yanked version number (the fix ships as the
 next version).

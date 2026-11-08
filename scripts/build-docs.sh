@@ -19,7 +19,7 @@
 #   ./scripts/build-docs.sh --no-linkcheck
 #
 # Env: MDBOOK_OUTPUT__HTML__SITE_URL overrides [output.html] site-url (the
-#      GitLab Pages job sets it to the project sub-path).
+#      GitHub Pages job sets it to the project sub-path /dtfs/).
 
 set -euo pipefail
 

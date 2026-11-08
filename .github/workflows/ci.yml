@@ -1,0 +1,70 @@
+# CI: crate tests + script/docs/playbook checks on every push to master and
+# on pull requests. Nothing here builds a release or deploys; see
+# release.yml and docs/src/operations/ci-pipeline.md.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: cargo test (workspace, release)
+    runs-on: ubuntu-latest
+    # Same toolchain image as docker/buildenv.Dockerfile: rustc 1.94.1 on
+    # Debian bookworm (the crate-level #![allow(dead_code)] ICE workaround
+    # is pinned to this version).
+    container: rust:1.94.1-bookworm
+    steps:
+      - name: Native build dependencies (as docker/buildenv.Dockerfile)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            clang libclang-dev cmake protobuf-compiler pkg-config \
+            libfuse3-dev fuse3 libssl-dev nodejs
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --release
+      # Build-stamp guards (CLAUDE.md A.3.5): rebuild dtfs-cli with and
+      # without DTFS_VERSION / SOURCE_DATE_EPOCH.
+      - run: bash scripts/tests/test-release-version-stamp.sh
+      - run: bash scripts/tests/test-build-date-fresh.sh
+
+  scripts:
+    name: scripts, docs links, playbook syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Syntax-check every shell script
+        run: |
+          for f in scripts/*.sh scripts/ci/*.sh scripts/tests/*.sh; do
+            bash -n "$f"
+          done
+      - name: Script guards
+        run: |
+          bash scripts/tests/test-ci-version.sh
+          bash scripts/tests/test-dtfs-install.sh
+          bash scripts/tests/check-webui-js.sh
+          bash scripts/dtfs-cluster-healthcheck.sh --help >/dev/null
+      - name: Wiki sync unit tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_sync_wiki.py'
+      - name: Docs link check
+        run: python3 -I scripts/check-docs-links.py docs/src
+      - name: Docs convert to wiki pages with every link resolved
+        run: python3 -I scripts/sync-wiki.py docs/src "$RUNNER_TEMP/wiki"
+      - name: Ansible syntax check
+        run: |
+          pipx install ansible-core
+          ansible-playbook --version
+          ansible-playbook -i deploy/ansible/inventory.example.yml --syntax-check deploy/ansible/update-cluster.yml

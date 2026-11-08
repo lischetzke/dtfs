@@ -1,18 +1,16 @@
 # git-cliff config for DTFS release notes (AIWF-4-1).
 #
-# Reproduces the section grouping .github/release.yml applies to PR
-# labels, but driven off commit SUBJECTS/trailers instead of PR labels
+# Groups release notes by commit SUBJECTS/trailers, not PR labels
 # (CLAUDE.md B.1 defaults to committing straight to master, so most
 # user-visible work never gets a PR to label). Convention:
-#   - subject prefix `bug:` / `feat:` / `int:` (`int:` is excluded from
-#     the notes entirely, same as the `int` PR label today).
+#   - subject prefix `bug:` / `feat:` / `int:` (`int:` and `docs:` are
+#     excluded from the notes entirely).
 #   - a `Breaking:` or `Update-required:` trailer anywhere in the
 #     commit body routes it into that section regardless of prefix.
 #   - a `Known-issue:` trailer routes it into Known Issues.
-# scripts/dtfs-release.sh runs `git-cliff` (when installed) to produce
-# `notes.md` for `gh release create --notes-file`; without git-cliff it
-# falls back to `--generate-notes` (GitHub's PR-label grouping) with a
-# warning.
+# .github/workflows/release.yml (orhun/git-cliff-action) and, when
+# git-cliff is installed, scripts/dtfs-release.sh produce `notes.md` for
+# `gh release create --notes-file`.
 
 [changelog]
 header = ""
@@ -31,8 +29,8 @@ trim = true
 conventional_commits = false
 filter_unconventional = false
 filter_commits = false
-# Full releases only: alpha tags (vX.Y.Z_YYYYMMDDHHmm from GitLab "deploy"
-# commits) must not cut the "since the last release" range of the notes.
+# Full releases only (vX.Y.Z): anything else must not cut the "since the
+# last release" range of the notes.
 tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
 commit_preprocessors = []
 commit_parsers = [

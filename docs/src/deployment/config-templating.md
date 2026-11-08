@@ -102,9 +102,8 @@ time.
   production.
 - Rotation is not a rolling operation: every node must change together. Treat a
   rotation as an outage window.
-- The optional `[updater] token` (a GitLab deploy or access token) is a second
-  secret in the same files; it is read only by `dtfs-cli update` and is not
-  needed when the role pushes binaries itself, so leave it out.
+- The `[updater]` section is read only by `dtfs-cli update` and is not needed
+  when the role pushes binaries itself, so leave it out.
 
 ## Validation performed at startup
 

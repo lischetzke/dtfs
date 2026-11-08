@@ -13,13 +13,13 @@ create-missing = false
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
-# The canonical remote is GitHub (origin); CI and releases run on GitLab.
-# Repository and "suggest an edit" links point at the GitHub mirror of master.
+# GitHub is the only source; CI, releases, Pages and the Wiki run there.
+# Repository and "suggest an edit" links point at master.
 git-repository-url = "https://github.com/lischetzke/dtfs"
 edit-url-template = "https://github.com/lischetzke/dtfs/edit/master/docs/{path}"
 # Used for the generated 404 page. "/" fits a site served from a domain root;
-# the GitLab Pages job overrides it with the project sub-path
-# (MDBOOK_OUTPUT__HTML__SITE_URL, see .gitlab-ci.yml job `pages`).
+# the GitHub Pages job overrides it with the project sub-path /dtfs/
+# (MDBOOK_OUTPUT__HTML__SITE_URL, see .github/workflows/docs.yml).
 site-url = "/"
 
 [output.html.search]

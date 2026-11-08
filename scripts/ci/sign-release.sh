@@ -3,8 +3,8 @@
 # to it. No-op (exit 0) when MINISIGN_SECRET_KEY is unset, so unsigned
 # pipelines keep working.
 #
-# MINISIGN_SECRET_KEY       protected CI variable: the secret key file
-#                           contents, or (File-type variable) a path to it.
+# MINISIGN_SECRET_KEY       repository secret: the secret key file contents,
+#                           or a path to the key file.
 # MINISIGN_PASSWORD         password of the key; empty for a key made with -W.
 #
 # Usage: scripts/ci/sign-release.sh <dist-dir>
@@ -19,7 +19,7 @@ if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
     exit 0
 fi
 [ -f "$DIST/SHA256SUMS" ] || { echo "error: $DIST/SHA256SUMS missing" >&2; exit 1; }
-command -v minisign >/dev/null 2>&1 || { echo "error: minisign not installed on the runner" >&2; exit 1; }
+command -v minisign >/dev/null 2>&1 || { echo "error: minisign not installed" >&2; exit 1; }
 
 KEY="$MINISIGN_SECRET_KEY"
 if [ ! -f "$KEY" ]; then

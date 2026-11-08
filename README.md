@@ -78,7 +78,8 @@ The docs are an mdBook in `docs/src/` (table of contents:
 [`SUMMARY.md`](docs/src/SUMMARY.md)). Build the HTML site with
 `scripts/build-docs.sh` (output in `docs/book/`). It checks internal links
 first and uses a local mdBook, or downloads the pinned release. CI publishes
-the same build through the `pages` job.
+the same build to GitHub Pages and the pages to the GitHub Wiki
+(`.github/workflows/docs.yml`).
 
 ## Repository layout
 
