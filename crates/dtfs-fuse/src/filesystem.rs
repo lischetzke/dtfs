@@ -24,7 +24,7 @@ use dtfs_common::config::FuseConfig;
 use dtfs_common::topology::Location;
 
 use crate::readahead::{ReadAheadEngine, ReadAheadMode};
-use crate::writebuf::WriteBuffer;
+use crate::writebuf::{rekey_path, WriteBuffer};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -388,8 +388,11 @@ struct OpenFile {
     chunk_size: u64,
     /// P0-1: write lease token for this file handle. None for read-only opens.
     lease_id: Option<String>,
-    /// P0-1: absolute Unix-ms expiry of the lease (renew at half-life).
-    lease_expires_at_ms: Option<u64>,
+    /// P0-1: LOCAL monotonic deadline of the lease (grant/renew instant +
+    /// lease duration). The leader's absolute `expires_at_ms` is never
+    /// compared with this host's wall clock: a client clock skewed by more
+    /// than the lease duration would never (or always) renew.
+    lease_deadline: Option<Instant>,
     /// P0-1: owner_id used to acquire the lease (for renew/release).
     lease_owner_id: Option<String>,
     /// CR-1-4 (FUSE-3): true once `flush_segments_to_cluster` has
@@ -401,7 +404,10 @@ struct OpenFile {
     /// `locations` snapshot) to decide whether a flush failure may
     /// ghost-unlink the file — a file with any committed chunk must never
     /// be unlinked, and its drained-but-unsent segments must always be
-    /// restored instead.
+    /// restored instead. Starts `true` for a file opened (it already
+    /// exists); only a file this process `create()`d starts `false`.
+    /// Set on every handle of the path after ANY successful commit,
+    /// including write()-driven batch/cap flushes.
     committed_any: bool,
     /// CR-6-6 (FUSE-8/FUSE-10) — the last chunk index `read()` touched on
     /// THIS fh. Gates both: (a) `record_cache_hit` fires only on the
@@ -582,23 +588,6 @@ impl DtfsFilesystem {
         self.readahead.cache_controller()
     }
 
-    /// P0-1: hostname (without PID/fh) used for the orphan-lease cleanup
-    /// call at FUSE startup. Returns just the hostname segment.
-    pub fn lease_hostname(&self) -> String {
-        // Strip the trailing ":pid:" — release_leases_by_host takes the
-        // hostname only (it appends ":" itself when matching prefixes).
-        self.lease_owner_prefix
-            .split(':')
-            .next()
-            .unwrap_or("unknown-host")
-            .to_string()
-    }
-
-    /// Override the metadata cache TTL.
-    pub fn set_metadata_ttl(&mut self, ttl: Duration) {
-        self.metadata_ttl = ttl;
-    }
-
     // -----------------------------------------------------------------------
     // Filesystem operations
     // -----------------------------------------------------------------------
@@ -688,15 +677,10 @@ impl DtfsFilesystem {
         Ok(entries)
     }
 
-    /// Open a file and return a file handle.
-    #[instrument(skip(self), fields(path = %path, ?flags))]
-    pub async fn open(&self, path: &str, flags: OpenFlags) -> Result<u64> {
-        self.open_with_append(path, flags, false).await
-    }
-
-    /// Same as [`open`] but lets the caller signal `O_APPEND`. Used by the
+    /// Open a file and return a file handle; the caller signals `O_APPEND`. Used by the
     /// fuse3 adapter when the kernel passes the open-flag bitmask, so every
     /// subsequent write lands at the current end-of-file (F-021).
+    #[instrument(skip(self), fields(path = %path, ?flags))]
     pub async fn open_with_append(
         &self,
         path: &str,
@@ -713,7 +697,15 @@ impl DtfsFilesystem {
         // inserting the OpenFile entry, so a busy condition leaves no
         // dangling fh. A returned LeaseBusy error surfaces as EBUSY to the
         // caller via the fuse adapter's downcast.
-        let (lease_id, lease_expires_at_ms, lease_owner_id) = if flags.is_writable() {
+        if flags.is_writable() {
+            if let Err(msg) =
+                check_chunk_size_matches(locations.chunk_size, self.write_buffer.chunk_size())
+            {
+                tracing::error!(path, error = %msg, "refusing writable open");
+                bail!(msg);
+            }
+        }
+        let (lease_id, lease_deadline, lease_owner_id) = if flags.is_writable() {
             // Bug X — append the client's DC as a 4th field. Existing
             // parsers (starts_with("host:"), split(':').next()) ignore
             // trailing fields, so this is backward-compatible. The
@@ -727,6 +719,7 @@ impl DtfsFilesystem {
                     self.lease_owner_prefix, fh, self.client_location.datacenter
                 )
             };
+            let sent = Instant::now();
             let resp = self
                 .client
                 .acquire_write_lease(path, &owner_id, WRITE_LEASE_MS)
@@ -741,7 +734,7 @@ impl DtfsFilesystem {
             }
             (
                 Some(resp.lease_id),
-                Some(resp.expires_at_ms),
+                Some(lease_deadline_from(sent)),
                 Some(owner_id),
             )
         } else {
@@ -768,28 +761,26 @@ impl DtfsFilesystem {
                 Some(locations.chunks.len() as u64 - 1)
             };
             if let Some(last_idx) = max_idx {
-                if let Some(last_chunk) = locations.chunk_at(last_idx) {
-                    if !last_chunk.node_addresses.is_empty() {
-                        let node = self.select_nearest_node(&last_chunk.node_addresses);
-                        match self.client.read_chunk(&node, &last_chunk.chunk_id).await {
-                            Ok(existing) => {
-                                let offset_in_file = last_idx * chunk_size;
-                                self.write_buffer.write(path, offset_in_file, &existing);
-                                debug!(
-                                    path,
-                                    offset_in_file,
-                                    len = existing.len(),
-                                    "O_APPEND: pre-seeded tail chunk into write buffer"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    path,
-                                    error = %e,
-                                    "O_APPEND: failed to pre-seed tail chunk; append may truncate"
-                                );
-                            }
-                        }
+                match self
+                    .read_seed_bytes(path, &locations, last_idx, chunk_size, locations.total_size)
+                    .await
+                {
+                    Ok(Some(existing)) => {
+                        self.write_buffer.seed_chunk(path, last_idx as u32, &existing);
+                        debug!(
+                            path,
+                            last_idx,
+                            len = existing.len(),
+                            "O_APPEND: pre-seeded tail chunk into write buffer"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            path,
+                            error = %e,
+                            "O_APPEND: failed to pre-seed tail chunk; append may truncate"
+                        );
                     }
                 }
             }
@@ -804,9 +795,9 @@ impl DtfsFilesystem {
                 locations: Some(locations.clone()),
                 chunk_size,
                 lease_id,
-                lease_expires_at_ms,
+                lease_deadline,
                 lease_owner_id,
-                committed_any: false,
+                committed_any: committed_any_on_open(false),
                 last_read_chunk: None,
                 bytes_read_on_fh: 0,
             },
@@ -1280,7 +1271,7 @@ impl DtfsFilesystem {
         // the renewal only fires once per half-life window, and the manager
         // dedups same-token renewals.
         let lease_id_for_renew = file.lease_id.clone();
-        let lease_expires_for_renew = file.lease_expires_at_ms;
+        let lease_deadline_for_renew = file.lease_deadline;
         let lease_owner_for_renew = file.lease_owner_id.clone();
         // For O_APPEND we ignore the kernel-supplied offset and target the
         // *current* end of file. Use the cached file size; the buffer may
@@ -1294,6 +1285,15 @@ impl DtfsFilesystem {
         let chunk_size = file.chunk_size;
         let locations_snapshot = file.locations.clone();
         drop(file); // Release the lock before writing.
+
+        // A write buffer split at a different chunk size than the file's own
+        // would silently corrupt it (reads use the file's chunk size).
+        let file_chunk_size = locations_snapshot.as_ref().map(|l| l.chunk_size).unwrap_or(0);
+        if let Err(msg) = check_chunk_size_matches(file_chunk_size, self.write_buffer.chunk_size())
+        {
+            tracing::error!(path = %path, error = %msg, "refusing write");
+            bail!(msg);
+        }
 
         let effective_offset = if append {
             let buffered = self.write_buffer.logical_size(&path).unwrap_or(0);
@@ -1327,18 +1327,10 @@ impl DtfsFilesystem {
             for chunk_idx in
                 chunks_needing_seed(&self.write_buffer, &path, chunk_size, effective_offset, data.len())
             {
-                // R2 (FUSE-7(c)) — each of these three `continue`s skips
-                // the seed because there is nothing (cheap) to seed FROM:
-                // no cached locations snapshot, no chunk_at() entry for
-                // this index, or no live replica address. That is only
-                // safe when the chunk genuinely doesn't exist on the
-                // cluster yet; if it DOES (this OpenFile's `locations`
-                // snapshot is merely stale/missing), the resulting
-                // still-partial ChunkBuf must never be committed as the
-                // chunk's whole content — `flush_segments_to_cluster`'s
-                // `segments_committable()` guard is the backstop that
-                // catches that case at commit time and returns EIO instead
-                // of silently shifting bytes.
+                // R2 (FUSE-7(c)) — skipping the seed is only safe when the
+                // chunk genuinely isn't on the cluster yet; otherwise the
+                // still-partial ChunkBuf is caught at commit time by
+                // `segments_committable` (EIO, bytes kept for retry).
                 let Some(loc) = &locations_snapshot else {
                     warn!(
                         path = %path,
@@ -1347,36 +1339,13 @@ impl DtfsFilesystem {
                     );
                     continue;
                 };
-                // REV-2-1 — resolve by index, not by array position:
-                // seeding the RMW buffer from a NEIGHBOURING chunk would
-                // write that chunk's bytes back under this chunk's index.
-                let Some(chunk) = loc.chunk_at(chunk_idx) else {
-                    warn!(
-                        path = %path,
-                        chunk_idx,
-                        "RMW: no chunk_at() entry for this index; seed skipped, relying on the commit-time partial-segment guard"
-                    );
-                    continue;
-                };
-                if chunk.node_addresses.is_empty() {
-                    warn!(
-                        path = %path,
-                        chunk_idx,
-                        "RMW: chunk has no live replica address; seed skipped, relying on the commit-time partial-segment guard"
-                    );
-                    continue;
-                }
-                let chunk_start = chunk_idx * chunk_size;
-                let node = self.select_nearest_node(&chunk.node_addresses);
-                let existing = self
-                    .client
-                    .read_chunk(&node, &chunk.chunk_id)
-                    .await
-                    .with_context(|| {
-                        format!("RMW seed read failed for {path} chunk {chunk_idx}")
-                    })?;
-                if !existing.is_empty() {
-                    self.write_buffer.write(&path, chunk_start, &existing);
+                // Seed bytes are clamped to the file's logical EOF, so stale
+                // bytes left in a chunk by a shrinking truncate never come back.
+                if let Some(existing) = self
+                    .read_seed_bytes(&path, loc, chunk_idx, chunk_size, loc.total_size)
+                    .await?
+                {
+                    self.write_buffer.seed_chunk(&path, chunk_idx as u32, &existing);
                     debug!(
                         path = %path,
                         chunk_idx,
@@ -1417,6 +1386,7 @@ impl DtfsFilesystem {
                             self.write_buffer.restore_segments(&path, &segs);
                             return Err(e);
                         }
+                        self.mark_committed_and_refresh(&path).await;
                     }
                 }
                 let zeros = vec![0u8; n];
@@ -1438,6 +1408,7 @@ impl DtfsFilesystem {
                     self.write_buffer.restore_segments(&path, &segs);
                     return Err(e);
                 }
+                self.mark_committed_and_refresh(&path).await;
             }
         }
 
@@ -1454,21 +1425,18 @@ impl DtfsFilesystem {
                 self.write_buffer.restore_segments(&path, &segments);
                 return Err(e);
             }
+            self.mark_committed_and_refresh(&path).await;
         }
 
         // Renew the write lease mid-stream so a long-running streaming
         // write (multi-GB file, rsync over slow uplink) doesn't lose its
         // lease before flush has a chance to renew it. Renews at most once
         // per half-life window — manager dedups same-token renewals.
-        if let (Some(lease_id), Some(expires_at_ms)) =
-            (lease_id_for_renew, lease_expires_for_renew)
+        if let (Some(lease_id), Some(deadline)) =
+            (lease_id_for_renew, lease_deadline_for_renew)
         {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let remaining = expires_at_ms.saturating_sub(now_ms);
-            if remaining < (WRITE_LEASE_MS - WRITE_LEASE_RENEW_AFTER_MS) {
+            let sent = Instant::now();
+            if lease_renew_due(deadline, sent) {
                 match self
                     .client
                     .renew_write_lease(&path, &lease_id, WRITE_LEASE_MS)
@@ -1476,8 +1444,7 @@ impl DtfsFilesystem {
                 {
                     Ok(resp) if resp.granted => {
                         if let Some(mut entry) = self.open_files.get_mut(&fh) {
-                            entry.value_mut().lease_expires_at_ms =
-                                Some(resp.new_expires_at_ms);
+                            entry.value_mut().lease_deadline = Some(lease_deadline_from(sent));
                         }
                     }
                     Ok(_) => {
@@ -1547,7 +1514,7 @@ impl DtfsFilesystem {
         let path = file.path.clone();
         // P0-1: capture lease state for renewal-before-flush.
         let lease_id = file.lease_id.clone();
-        let lease_expires_at_ms = file.lease_expires_at_ms;
+        let lease_deadline = file.lease_deadline;
         let lease_owner_id = file.lease_owner_id.clone();
         drop(file);
 
@@ -1555,14 +1522,10 @@ impl DtfsFilesystem {
         // renew BEFORE issuing the cluster writes. Otherwise a large flush
         // could exceed the lease lifetime and another writer would acquire
         // the path mid-flush.
-        if let (Some(lease_id), Some(expires_at_ms)) = (lease_id.as_ref(), lease_expires_at_ms) {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let elapsed = expires_at_ms.saturating_sub(now_ms);
+        if let (Some(lease_id), Some(deadline)) = (lease_id.as_ref(), lease_deadline) {
+            let sent = Instant::now();
             // If less than half the lease remains, refresh proactively.
-            if elapsed < (WRITE_LEASE_MS - WRITE_LEASE_RENEW_AFTER_MS) {
+            if lease_renew_due(deadline, sent) {
                 match self
                     .client
                     .renew_write_lease(&path, lease_id, WRITE_LEASE_MS)
@@ -1570,7 +1533,7 @@ impl DtfsFilesystem {
                 {
                     Ok(resp) if resp.granted => {
                         if let Some(mut entry) = self.open_files.get_mut(&fh) {
-                            entry.value_mut().lease_expires_at_ms = Some(resp.new_expires_at_ms);
+                            entry.value_mut().lease_deadline = Some(lease_deadline_from(sent));
                         }
                     }
                     Ok(_) => {
@@ -1612,40 +1575,15 @@ impl DtfsFilesystem {
                 self.write_buffer.restore_segments(&path, &segments);
                 return Err(e);
             }
-            // CR-1-4: mark every OpenFile sharing this path as having
-            // committed at least once, ever — this is what makes
-            // `release()`'s ghost-unlink decision safe. A per-fh snapshot
-            // of `locations` was stale between write-driven batch flushes
-            // (only refreshed by `flush()` itself), so a file that HAD
-            // committed several chunks via mid-stream batch flushes could
-            // still read as "fresh" (was_fresh) at a later `flush()` if a
-            // fresh OpenFile's `locations` snapshot predated those
-            // commits.
-            for mut entry in self.open_files.iter_mut() {
-                if entry.value().path == path {
-                    entry.value_mut().committed_any = true;
-                }
-            }
         }
 
         // Invalidate metadata cache since the file may have changed.
         self.metadata_cache.remove(&path);
 
-        // F-029: after a successful flush, refresh the OpenFile's locations
-        // so subsequent reads on the same fd see the freshly committed
-        // chunks. Without this, the in-memory `OpenFile.locations` keeps the
-        // pre-flush state (often total_size=0 + empty chunks for a new file)
-        // and read() returns Bytes::new() because it thinks the file is
-        // empty — which is what makes SQLite see no rows after an fsync.
+        // CR-1-4 + F-029: mark every handle of the path committed and refresh
+        // their locations so reads on the same fd see the new chunks.
         if had_segments {
-            if let Ok(fresh) = self.fetch_file_locations(&path).await {
-                for mut entry in self.open_files.iter_mut() {
-                    if entry.value().path == path {
-                        entry.value_mut().locations = Some(fresh.clone());
-                    }
-                }
-                self.cache_metadata(&path, fresh);
-            }
+            self.mark_committed_and_refresh(&path).await;
         }
 
         debug!(path = %path, "flush complete");
@@ -1709,14 +1647,12 @@ impl DtfsFilesystem {
                 }
             }
 
-            // CR-1-4 (FUSE-3): the ghost-unlink now lives here, not in
-            // flush(), and fires ONLY when this path has NEVER committed a
-            // single chunk (`!committed_any` — tracked across every
-            // OpenFile of the path, so it can't go stale between
-            // write()-driven batch flushes). A file with any committed
-            // chunk is never unlinked on a flush failure; `flush()` always
-            // restores the drained segments instead so the next flush can
-            // retry them.
+            // CR-1-4 (FUSE-3): the ghost-unlink lives here, not in flush(),
+            // and fires ONLY for a file this process create()d that has not
+            // committed a single chunk (`!committed_any`): opened files start
+            // `true`, and every successful commit (flush() or write()-driven
+            // batch/cap flush) sets it on all handles of the path. `flush()`
+            // always restores drained segments on failure so a retry works.
             if should_ghost_unlink(flush_result.is_err(), file.committed_any) {
                 warn!(
                     path = %file.path,
@@ -1771,6 +1707,7 @@ impl DtfsFilesystem {
                 self.lease_owner_prefix, fh, self.client_location.datacenter
             )
         };
+        let sent = Instant::now();
         let lease_resp = self
             .client
             .acquire_write_lease(path, &owner_id, WRITE_LEASE_MS)
@@ -1805,9 +1742,9 @@ impl DtfsFilesystem {
                 }),
                 chunk_size: response.chunk_size,
                 lease_id: Some(lease_resp.lease_id),
-                lease_expires_at_ms: Some(lease_resp.expires_at_ms),
+                lease_deadline: Some(lease_deadline_from(sent)),
                 lease_owner_id: Some(owner_id),
-                committed_any: false,
+                committed_any: committed_any_on_open(true),
                 last_read_chunk: None,
                 bytes_read_on_fh: 0,
             },
@@ -1895,9 +1832,37 @@ impl DtfsFilesystem {
     pub async fn truncate(
         &self,
         path: &str,
-        fh: Option<u64>,
+        _fh: Option<u64>,
         new_size: u64,
     ) -> Result<()> {
+        // A shrink to a non-chunk-aligned size leaves the old tail bytes in
+        // the cluster's tail chunk. Read that chunk (clamped to the new EOF)
+        // BEFORE mutating the manager, so a read failure leaves the file
+        // untouched, and re-buffer it below so the normal commit path
+        // rewrites it zero-trimmed. Only with a writable handle: the buffer
+        // is flushed by a writable fh's flush/release, and without one the
+        // seeded bytes would be stranded (shortcut: a bare path truncate
+        // with no writable handle keeps the stale tail until the next
+        // writer's EOF-clamped seed).
+        let mut tail_seed: Option<(u64, Bytes)> = None;
+        if self.has_writable_handle(path) {
+            let before = self
+                .fetch_file_locations(path)
+                .await
+                .with_context(|| format!("truncate: locations for {path}"))?;
+            let chunk_size = self.resolve_chunk_size(&before);
+            if let Some((idx, _keep)) = tail_rewrite_target(before.total_size, new_size, chunk_size)
+            {
+                if self.write_buffer.chunk_needs_seed(path, idx as u32) {
+                    if let Some(b) = self
+                        .read_seed_bytes(path, &before, idx, chunk_size, new_size)
+                        .await?
+                    {
+                        tail_seed = Some((idx, b));
+                    }
+                }
+            }
+        }
         self.client
             .set_file_size(path, new_size)
             .await
@@ -1906,15 +1871,20 @@ impl DtfsFilesystem {
         // buffered bytes below it. Removing the whole buffer (the old
         // behaviour) lost un-flushed writes that the truncation never deleted.
         self.write_buffer.truncate(path, new_size);
-        // Refresh cached locations.
+        if let Some((idx, bytes)) = tail_seed {
+            self.write_buffer.seed_chunk(path, idx as u32, &bytes);
+        }
+        // Refresh cached locations on every handle of the path (seed reads
+        // clamp to `locations.total_size`, so a stale size would resurrect
+        // truncated bytes).
         self.metadata_cache.remove(path);
-        if let Some(fh) = fh {
-            if let Ok(fresh) = self.fetch_file_locations(path).await {
-                if let Some(mut entry) = self.open_files.get_mut(&fh) {
+        if let Ok(fresh) = self.fetch_file_locations(path).await {
+            for mut entry in self.open_files.iter_mut() {
+                if entry.value().path == path {
                     entry.value_mut().locations = Some(fresh.clone());
                 }
-                self.cache_metadata(path, fresh);
             }
+            self.cache_metadata(path, fresh);
         }
         Ok(())
     }
@@ -1924,13 +1894,16 @@ impl DtfsFilesystem {
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.client.rename_file(from, to).await
             .with_context(|| format!("rename {from} -> {to}"))?;
-        self.metadata_cache.remove(from);
-        self.metadata_cache.remove(to);
-        self.write_buffer.remove(from);
-        // Update any open files pointing at the old path.
+        // Invalidate the cache for the exact paths and (directory rename)
+        // everything below either prefix.
+        self.metadata_cache
+            .retain(|k, _| rekey_path(k, from, "").is_none() && rekey_path(k, to, "").is_none());
+        // Move unflushed bytes with the file (a.part -> a keeps its data).
+        self.write_buffer.rename(from, to);
+        // Re-key open files at or below the old path.
         for mut entry in self.open_files.iter_mut() {
-            if entry.value().path == from {
-                entry.value_mut().path = to.to_string();
+            if let Some(np) = rekey_path(&entry.value().path, from, to) {
+                entry.value_mut().path = np;
             }
         }
         Ok(())
@@ -1957,34 +1930,6 @@ impl DtfsFilesystem {
         let attr = file_attr_from_locations(&locs);
         self.cache_metadata(dst, locs);
         Ok(attr)
-    }
-
-    /// F-039 — try to acquire a byte-range lock through the cluster manager.
-    /// Returns `Ok(true)` on grant, `Ok(false)` on conflict, `Err(_)` on RPC failure.
-    pub async fn try_acquire_lock(
-        &self,
-        path: &str,
-        owner_id: &str,
-        start: u64,
-        end: u64,
-        write: bool,
-        lease_ms: u64,
-    ) -> Result<bool> {
-        let resp = self.client
-            .acquire_lock(path, owner_id, start, end, write, false, lease_ms)
-            .await?;
-        Ok(resp.granted)
-    }
-
-    /// F-039 — release a previously-granted byte-range lock.
-    pub async fn release_cluster_lock(
-        &self,
-        path: &str,
-        owner_id: &str,
-        start: u64,
-        end: u64,
-    ) -> Result<()> {
-        self.client.release_lock(path, owner_id, start, end).await
     }
 
     // -----------------------------------------------------------------------
@@ -2158,29 +2103,6 @@ impl DtfsFilesystem {
         .unwrap_or_else(|| addresses[0].clone())
     }
 
-    /// Sort candidate addresses by distance, nearest first.
-    /// Used for replica fallback on read failure (P0-2).
-    fn sort_candidates(&self, addresses: &[String]) -> Vec<String> {
-        if addresses.len() <= 1 {
-            return addresses.to_vec();
-        }
-
-        let known: HashMap<String, Location> = addresses
-            .iter()
-            .filter_map(|addr| {
-                self.known_locations
-                    .get(addr)
-                    .map(|loc| (addr.clone(), loc.clone()))
-            })
-            .collect();
-
-        dtfs_client::location::sort_nodes_by_distance(
-            Some(&self.client_location),
-            addresses,
-            &known,
-        )
-    }
-
     /// CR-6-6 (FUSE-9) — extracted foreground fetch loop: try each
     /// candidate node in order, bounded per-replica by
     /// `client.chunk_read_timeout_secs` (0 = unbounded, FUSE-HOL),
@@ -2202,6 +2124,7 @@ impl DtfsFilesystem {
     ) -> Result<()> {
         let owner_id = owner_id
             .ok_or_else(|| anyhow::anyhow!("no lease owner recorded for fh {fh}"))?;
+        let sent = Instant::now();
         let resp = self
             .client
             .acquire_write_lease(path, owner_id, WRITE_LEASE_MS)
@@ -2217,7 +2140,7 @@ impl DtfsFilesystem {
         if let Some(mut entry) = self.open_files.get_mut(&fh) {
             let f = entry.value_mut();
             f.lease_id = Some(resp.lease_id);
-            f.lease_expires_at_ms = Some(resp.expires_at_ms);
+            f.lease_deadline = Some(lease_deadline_from(sent));
         }
         tracing::warn!(
             path = %path,
@@ -2361,7 +2284,7 @@ impl DtfsFilesystem {
         // caller of this method already `restore_segments`s on `Err`, so
         // refusing here trades silent corruption for EIO with the bytes
         // intact for a retry.
-        if let Err(msg) = segments_committable(segments) {
+        if let Err(msg) = segments_committable(segments, |i| self.chunk_exists_on_cluster(path, i)) {
             warn!(path, error = %msg, "refusing to commit a partial (needs_seed) segment");
             return Err(anyhow::anyhow!(msg));
         }
@@ -2598,6 +2521,78 @@ impl DtfsFilesystem {
         Ok(())
     }
 
+    /// True iff some open handle on `path` is writable.
+    fn has_writable_handle(&self, path: &str) -> bool {
+        self.open_files
+            .iter()
+            .any(|e| e.value().path == path && e.value().flags.is_writable())
+    }
+
+    /// True iff any open handle's locations snapshot has chunk `idx` of `path`.
+    fn chunk_exists_on_cluster(&self, path: &str, idx: u32) -> bool {
+        self.open_files.iter().any(|e| {
+            e.value().path == path
+                && e.value()
+                    .locations
+                    .as_ref()
+                    .is_some_and(|l| l.chunk_at(idx as u64).is_some())
+        })
+    }
+
+    /// After a successful commit of `path`'s segments (from flush() or a
+    /// write()-driven batch/cap flush): mark every handle of the path
+    /// committed (so release() never ghost-unlinks it) and refresh their
+    /// locations (so a later header rewrite seeds from the committed
+    /// chunks instead of committing a partial segment as the whole chunk).
+    async fn mark_committed_and_refresh(&self, path: &str) {
+        for mut entry in self.open_files.iter_mut() {
+            if entry.value().path == path {
+                entry.value_mut().committed_any = true;
+            }
+        }
+        self.metadata_cache.remove(path);
+        match self.fetch_file_locations(path).await {
+            Ok(fresh) => {
+                for mut entry in self.open_files.iter_mut() {
+                    if entry.value().path == path {
+                        entry.value_mut().locations = Some(fresh.clone());
+                    }
+                }
+                self.cache_metadata(path, fresh);
+            }
+            Err(e) => warn!(path, error = %e, "post-commit locations refresh failed"),
+        }
+    }
+
+    /// Read chunk `chunk_idx` of `locations` for an RMW seed, walking the
+    /// same ordered, timeout-bounded candidate list as foreground reads, and
+    /// clamp it to `eof` (bytes at or beyond the logical EOF are stale).
+    /// `Ok(None)`: nothing to seed from (not on the cluster / no replica).
+    async fn read_seed_bytes(
+        &self,
+        path: &str,
+        locations: &FileLocations,
+        chunk_idx: u64,
+        chunk_size: u64,
+        eof: u64,
+    ) -> Result<Option<Bytes>> {
+        let Some(chunk) = locations.chunk_at(chunk_idx) else {
+            warn!(path, chunk_idx, "RMW: no chunk_at() entry for this index; seed skipped, relying on the commit-time partial-segment guard");
+            return Ok(None);
+        };
+        if chunk.node_addresses.is_empty() {
+            warn!(path, chunk_idx, "RMW: chunk has no live replica address; seed skipped, relying on the commit-time partial-segment guard");
+            return Ok(None);
+        }
+        let candidates = self.read_candidates(chunk);
+        let (_, existing) = self
+            .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id)
+            .await
+            .with_context(|| format!("RMW seed read failed for {path} chunk {chunk_idx}"))?;
+        let keep = seed_len_within_eof(existing.len(), chunk_idx * chunk_size, eof);
+        Ok(Some(existing.slice(0..keep)))
+    }
+
     /// Look up the volume_id for a path from any open file handle.
     fn find_volume_id_for_path(&self, path: &str) -> Option<String> {
         for entry in self.open_files.iter() {
@@ -2712,17 +2707,21 @@ fn chunks_needing_seed(
     let start_chunk = offset / chunk_size;
     let end_chunk = (offset + len as u64 - 1) / chunk_size;
     (start_chunk..=end_chunk)
-        .filter(|&idx| !write_buffer.chunk_is_fully_buffered(path, idx as u32))
+        .filter(|&idx| write_buffer.chunk_needs_seed(path, idx as u32))
         .collect()
 }
 
 /// R2 (FUSE-7(c)) — refuse to commit any segment that starts mid-chunk.
 /// The data node stores `PutChunkRequest` bytes as the chunk's WHOLE
 /// content starting at offset 0, so a segment whose `offset_in_chunk > 0`
-/// (equivalently `needs_seed`) would be stored shifted, silently
-/// corrupting (truncating/offsetting) whatever the cluster already had
-/// for that chunk. Returns the first offending chunk's error message.
-fn segments_committable(segments: &[crate::writebuf::ChunkSegment]) -> Result<(), String> {
+/// would be stored shifted. Likewise a `needs_seed` segment (partial and
+/// never seeded) for a chunk that already exists on the cluster
+/// (`exists_on_cluster`) would replace it wholesale with the partial bytes.
+/// Returns the first offending chunk's error message.
+fn segments_committable(
+    segments: &[crate::writebuf::ChunkSegment],
+    exists_on_cluster: impl Fn(u32) -> bool,
+) -> Result<(), String> {
     for seg in segments {
         if seg.offset_in_chunk > 0 {
             return Err(format!(
@@ -2730,8 +2729,60 @@ fn segments_committable(segments: &[crate::writebuf::ChunkSegment]) -> Result<()
                 seg.chunk_index, seg.offset_in_chunk
             ));
         }
+        if seg.needs_seed && exists_on_cluster(seg.chunk_index) {
+            return Err(format!(
+                "segment for chunk {} is partial and unseeded but the chunk exists on the cluster — cannot commit without seeding",
+                seg.chunk_index
+            ));
+        }
     }
     Ok(())
+}
+
+/// Bytes of a cluster chunk (`existing_len` long, starting at file offset
+/// `chunk_start`) that lie below the file's logical `eof`; the rest is stale.
+fn seed_len_within_eof(existing_len: usize, chunk_start: u64, eof: u64) -> usize {
+    eof.saturating_sub(chunk_start).min(existing_len as u64) as usize
+}
+
+/// Shrinking `old_size` -> `new_size` to a non-chunk-aligned size leaves the
+/// old tail bytes in chunk `new_size / chunk_size`; returns that chunk index
+/// and how many leading bytes survive, or `None` when no rewrite is needed.
+fn tail_rewrite_target(old_size: u64, new_size: u64, chunk_size: u64) -> Option<(u64, u64)> {
+    if chunk_size == 0 || new_size >= old_size || new_size % chunk_size == 0 {
+        None
+    } else {
+        Some((new_size / chunk_size, new_size % chunk_size))
+    }
+}
+
+/// A write buffer sized for a different chunk size than the file's own
+/// would corrupt it. `file_chunk_size == 0` means the manager did not say.
+fn check_chunk_size_matches(file_chunk_size: u64, buffer_chunk_size: usize) -> Result<(), String> {
+    if file_chunk_size == 0 || file_chunk_size == buffer_chunk_size as u64 {
+        Ok(())
+    } else {
+        Err(format!(
+            "file chunk size {file_chunk_size} differs from the write buffer's {buffer_chunk_size}; set [client].chunk_size_mb to the volume's chunk size"
+        ))
+    }
+}
+
+/// Initial `OpenFile.committed_any`: a file opened (not created here) already
+/// exists, so a failed flush must never ghost-unlink it.
+fn committed_any_on_open(created_here: bool) -> bool {
+    !created_here
+}
+
+/// Local deadline of a lease requested at `sent` for `WRITE_LEASE_MS`.
+fn lease_deadline_from(sent: Instant) -> Instant {
+    sent + Duration::from_millis(WRITE_LEASE_MS)
+}
+
+/// True when less than half the lease remains before the local `deadline`.
+fn lease_renew_due(deadline: Instant, now: Instant) -> bool {
+    deadline.saturating_duration_since(now)
+        < Duration::from_millis(WRITE_LEASE_MS - WRITE_LEASE_RENEW_AFTER_MS)
 }
 
 /// CR-1-5 (DATA-5 FUSE half) — hex BLAKE3 digest of `data`, in the same
@@ -3079,20 +3130,20 @@ mod r2_segments_committable_tests {
     #[test]
     fn all_aligned_segments_are_committable() {
         let segs = vec![seg(0, 0, false), seg(1, 0, false), seg(2, 0, false)];
-        assert!(segments_committable(&segs).is_ok());
+        assert!(segments_committable(&segs, |_| false).is_ok());
     }
 
     #[test]
     fn a_single_mid_chunk_segment_is_refused() {
         let segs = vec![seg(0, 0, false), seg(1, 4096, true), seg(2, 0, false)];
-        let err = segments_committable(&segs).unwrap_err();
+        let err = segments_committable(&segs, |_| false).unwrap_err();
         assert!(err.contains("chunk 1"), "error must name the offending chunk: {err}");
         assert!(err.contains("4096"));
     }
 
     #[test]
     fn empty_segments_are_committable() {
-        assert!(segments_committable(&[]).is_ok());
+        assert!(segments_committable(&[], |_| true).is_ok());
     }
 }
 
@@ -3541,5 +3592,102 @@ mod tests {
             Some("node-a:9500"),
             "empty known_locations must fall back to the first replica"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_write_path_tests {
+    use super::*;
+    use crate::writebuf::ChunkSegment;
+
+    fn seg(chunk_index: u32, needs_seed: bool) -> ChunkSegment {
+        ChunkSegment {
+            chunk_index,
+            data: Bytes::from_static(b"x"),
+            offset_in_chunk: 0,
+            needs_seed,
+        }
+    }
+
+    // Ghost-unlink: an opened (pre-existing) file starts committed, so a
+    // failed final flush never deletes it.
+    #[test]
+    fn opened_existing_file_is_never_ghost_unlinked() {
+        assert!(!should_ghost_unlink(true, committed_any_on_open(false)));
+    }
+
+    // A batch-committed file (mark_committed_and_refresh set committed_any)
+    // survives a failed final flush; a fresh create with a failed first
+    // flush is the one case that is unlinked.
+    #[test]
+    fn fresh_create_failed_first_flush_unlinks_but_committed_does_not() {
+        assert!(should_ghost_unlink(true, committed_any_on_open(true)));
+        let after_batch_commit = true;
+        assert!(!should_ghost_unlink(true, after_batch_commit));
+    }
+
+    #[test]
+    fn unseeded_partial_segment_for_existing_chunk_is_refused() {
+        let err = segments_committable(&[seg(0, true)], |i| i == 0).unwrap_err();
+        assert!(err.contains("chunk 0") && err.contains("exists on the cluster"), "{err}");
+    }
+
+    #[test]
+    fn unseeded_partial_segment_for_new_chunk_is_committable() {
+        assert!(segments_committable(&[seg(3, true)], |i| i == 0).is_ok());
+    }
+
+    #[test]
+    fn seeded_or_complete_segment_for_existing_chunk_is_committable() {
+        assert!(segments_committable(&[seg(0, false)], |_| true).is_ok());
+    }
+
+    #[test]
+    fn seed_is_clamped_to_logical_eof() {
+        // chunk 1 of 100-byte chunks, cluster holds 100 bytes, EOF at 130.
+        assert_eq!(seed_len_within_eof(100, 100, 130), 30);
+        assert_eq!(seed_len_within_eof(100, 100, 100), 0, "EOF at chunk start: nothing live");
+        assert_eq!(seed_len_within_eof(100, 100, 50), 0, "EOF before chunk: nothing live");
+        assert_eq!(seed_len_within_eof(40, 100, 500), 40, "never longer than the chunk");
+    }
+
+    #[test]
+    fn tail_rewrite_only_for_unaligned_shrink() {
+        assert_eq!(tail_rewrite_target(1000, 250, 100), Some((2, 50)));
+        assert_eq!(tail_rewrite_target(1000, 300, 100), None, "aligned");
+        assert_eq!(tail_rewrite_target(1000, 0, 100), None, "to zero");
+        assert_eq!(tail_rewrite_target(100, 250, 100), None, "grow");
+        assert_eq!(tail_rewrite_target(250, 250, 100), None, "same size");
+        assert_eq!(tail_rewrite_target(1000, 250, 0), None, "unknown chunk size");
+    }
+
+    #[test]
+    fn chunk_size_mismatch_is_refused() {
+        assert!(check_chunk_size_matches(4 << 20, 4 << 20).is_ok());
+        assert!(check_chunk_size_matches(0, 4 << 20).is_ok(), "unknown size accepted");
+        let err = check_chunk_size_matches(128 << 20, 4 << 20).unwrap_err();
+        assert!(err.contains("134217728") && err.contains("4194304"), "{err}");
+    }
+
+    // The deadline is a local Instant: renewal depends only on elapsed
+    // local time, never on the leader's wall clock.
+    #[test]
+    fn lease_renews_in_the_last_half_only() {
+        let t0 = Instant::now();
+        let deadline = lease_deadline_from(t0);
+        assert!(!lease_renew_due(deadline, t0));
+        assert!(!lease_renew_due(deadline, t0 + Duration::from_millis(WRITE_LEASE_RENEW_AFTER_MS)));
+        assert!(lease_renew_due(
+            deadline,
+            t0 + Duration::from_millis(WRITE_LEASE_RENEW_AFTER_MS + 1)
+        ));
+        assert!(lease_renew_due(deadline, t0 + Duration::from_millis(WRITE_LEASE_MS * 2)));
+    }
+
+    #[test]
+    fn a_seeded_partial_chunk_is_not_flagged_again() {
+        let wb = WriteBuffer::new(4096);
+        wb.seed_chunk("/f", 0, &[1u8; 100]);
+        assert!(chunks_needing_seed(&wb, "/f", 4096, 0, 10).is_empty());
     }
 }

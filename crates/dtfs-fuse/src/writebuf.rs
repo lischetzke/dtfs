@@ -60,25 +60,22 @@ pub const DIRTY_BYTES_CAP: usize = FLUSH_BATCH_MAX_BYTES * 2;
 pub(crate) fn effective_batch_chunks(configured: usize, chunk_size: usize) -> usize {
     let by_count = configured.clamp(1, MAX_FLUSH_BATCH_CHUNKS);
     if chunk_size == 0 {
-        // Degenerate; complete_chunks_available already returns 0. Also
-        // avoids a divide by zero.
+        // Degenerate; avoids a divide by zero.
         return by_count;
     }
     by_count.min(FLUSH_BATCH_MAX_BYTES / chunk_size).max(1)
 }
 
-/// Pre-CR-1-1 pure helper retained for its direct unit test and any external
-/// caller: number of whole, chunk-aligned chunks extractable from a
-/// contiguous run that starts at `dirty_offset` and holds `len` bytes. The
-/// sparse per-chunk buffer below no longer uses this internally (batching
-/// now counts complete `ChunkBuf` entries directly — see
-/// `FileWriteBuffer::complete_chunk_count`), but the single-buffer semantics
-/// this encodes are still a useful, independently-testable invariant.
-pub(crate) fn complete_chunks_available(dirty_offset: u64, len: usize, chunk_size: usize) -> usize {
-    if chunk_size == 0 || dirty_offset % chunk_size as u64 != 0 {
-        return 0;
+/// If `path` is `from` or lies below `from/`, the same path re-rooted under
+/// `to`; `None` otherwise. Shared by the write buffer and the open-handle
+/// table so a rename re-keys both identically.
+pub(crate) fn rekey_path(path: &str, from: &str, to: &str) -> Option<String> {
+    if path == from {
+        return Some(to.to_string());
     }
-    len / chunk_size
+    let from_dir = from.trim_end_matches('/');
+    let rest = path.strip_prefix(from_dir)?.strip_prefix('/')?;
+    Some(format!("{}/{}", to.trim_end_matches('/'), rest))
 }
 
 /// Write buffer that accumulates data and flushes chunk-aligned segments.
@@ -117,6 +114,11 @@ struct ChunkBuf {
     data: Vec<u8>,
     /// Byte range within the chunk (`0..chunk_size`) that `data` covers.
     dirty: Range<usize>,
+    /// True once `seed_chunk` merged the cluster's existing bytes in: the
+    /// chunk is then safe to commit as a whole even though it is partial,
+    /// and must not be seeded again (a re-seed used to overwrite newer
+    /// buffered bytes with stale cluster bytes).
+    seeded: bool,
 }
 
 impl ChunkBuf {
@@ -214,7 +216,7 @@ pub struct ChunkSegment {
     /// drained by `flush_all` without full coverage.
     pub offset_in_chunk: usize,
     /// CR-1-1 (FUSE-1/FUSE-7) — true when `data` does NOT fully cover
-    /// `0..chunk_size`. The caller must never commit a segment with
+    /// `0..chunk_size` and was not seeded via `seed_chunk`. The caller must never commit a segment with
     /// `needs_seed == true` as the chunk's whole content without first
     /// RMW-seeding it against the cluster's existing bytes (CR-1-2) — doing
     /// so would silently truncate or shift already-committed data.
@@ -254,11 +256,6 @@ impl WriteBuffer {
         }
     }
 
-    /// Create a new write buffer with the default 128 MB chunk size.
-    pub fn with_default_chunk_size() -> Self {
-        Self::new(128 * 1024 * 1024)
-    }
-
     /// Write data into the buffer for the given file path at the specified
     /// offset. Splits the write at chunk boundaries and merges each piece
     /// into its own chunk's buffer — never touching, let alone zero-filling,
@@ -293,6 +290,7 @@ impl WriteBuffer {
                 .or_insert_with(|| ChunkBuf {
                     data: Vec::new(),
                     dirty: 0..0,
+                    seeded: false,
                 })
                 .merge(offset_in_chunk, piece);
             remaining = rest;
@@ -384,6 +382,83 @@ impl WriteBuffer {
         self.buffers.remove(path);
     }
 
+    /// Move the buffer of `from` (and, for a directory rename, of every
+    /// path below `from/`) to the matching key under `to`, so a rename of an
+    /// open file (`a.part` -> `a`) keeps its unflushed bytes. An existing
+    /// buffer under a destination key is replaced (rename overwrites).
+    pub fn rename(&self, from: &str, to: &str) {
+        let keys: Vec<String> = self
+            .buffers
+            .iter()
+            .map(|e| e.key().clone())
+            .filter(|k| rekey_path(k, from, to).is_some())
+            .collect();
+        for k in keys {
+            let (Some(new_key), Some((_, mut buf))) =
+                (rekey_path(&k, from, to), self.buffers.remove(&k))
+            else {
+                continue;
+            };
+            buf.path = new_key.clone();
+            self.buffers.insert(new_key, buf);
+        }
+    }
+
+    /// True iff `chunk_index` still needs an RMW seed before a partial
+    /// write: it is neither fully covered nor already seeded.
+    pub fn chunk_needs_seed(&self, path: &str, chunk_index: u32) -> bool {
+        !self
+            .buffers
+            .get(path)
+            .and_then(|e| {
+                e.value()
+                    .chunks
+                    .get(&chunk_index)
+                    .map(|cb| cb.seeded || cb.is_complete(self.chunk_size))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Merge the cluster's existing bytes of `chunk_index` UNDER whatever is
+    /// already buffered for it (buffered bytes win), then mark it seeded.
+    /// Idempotent: a second call is a no-op, so a seed can never overwrite
+    /// a newer write. Bytes between the end of `existing` and the buffered
+    /// range read as zeros (the file ended inside this chunk).
+    pub fn seed_chunk(&self, path: &str, chunk_index: u32, existing: &[u8]) {
+        if existing.is_empty() || self.chunk_size == 0 {
+            return;
+        }
+        let existing = &existing[..existing.len().min(self.chunk_size)];
+        let mut entry = self.buffers.entry(path.to_string()).or_insert_with(|| {
+            FileWriteBuffer {
+                path: path.to_string(),
+                chunks: BTreeMap::new(),
+            }
+        });
+        let cb = entry
+            .value_mut()
+            .chunks
+            .entry(chunk_index)
+            .or_insert_with(|| ChunkBuf {
+                data: Vec::new(),
+                dirty: 0..0,
+                seeded: false,
+            });
+        if cb.seeded {
+            return;
+        }
+        let mut merged = existing.to_vec();
+        if !cb.data.is_empty() {
+            if merged.len() < cb.dirty.end {
+                merged.resize(cb.dirty.end, 0);
+            }
+            merged[cb.dirty.clone()].copy_from_slice(&cb.data);
+        }
+        cb.dirty = 0..merged.len();
+        cb.data = merged;
+        cb.seeded = true;
+    }
+
     /// CO-1-8 (b) — drop buffered bytes at or above `new_size`, keeping the
     /// buffered prefix `[0..new_size)` intact.
     pub fn truncate(&self, path: &str, new_size: u64) {
@@ -442,6 +517,14 @@ impl WriteBuffer {
         for seg in segments {
             let abs_offset = seg.chunk_index as u64 * chunk_size + seg.offset_in_chunk as u64;
             self.write(path, abs_offset, seg.data.as_ref());
+            if !seg.needs_seed && seg.offset_in_chunk == 0 {
+                // A seeded partial chunk stays seeded across the restore.
+                if let Some(mut e) = self.buffers.get_mut(path) {
+                    if let Some(cb) = e.value_mut().chunks.get_mut(&seg.chunk_index) {
+                        cb.seeded = true;
+                    }
+                }
+            }
         }
     }
 
@@ -584,7 +667,7 @@ impl FileWriteBuffer {
                 segments.push(ChunkSegment {
                     chunk_index: k,
                     offset_in_chunk: cb.dirty.start,
-                    needs_seed: !complete,
+                    needs_seed: !complete && !cb.seeded,
                     data: Bytes::from(cb.data),
                 });
             }
@@ -762,26 +845,6 @@ mod tests {
         );
     }
 
-    // WI-01 — direct unit on the pure batch-threshold helper: a buffer that
-    // starts mid-chunk must report 0 available chunks regardless of how much
-    // data it holds (mirrors the CO-1-7 rule in extract_complete_chunks).
-    // Retained unchanged post-CR-1-1: this exercises the pure
-    // single-contiguous-buffer helper directly, not the sparse per-chunk
-    // buffer's own (now internal) batching count.
-    #[test]
-    fn wi01_complete_chunks_available_is_zero_when_midchunk() {
-        let chunk = 10;
-        // Aligned start: 25 bytes -> 2 complete chunks.
-        assert_eq!(complete_chunks_available(0, 25, chunk), 2);
-        assert_eq!(complete_chunks_available(20, 25, chunk), 2);
-        // Mid-chunk start (dirty_offset % chunk_size != 0) -> always 0.
-        assert_eq!(complete_chunks_available(5, 25, chunk), 0);
-        assert_eq!(complete_chunks_available(5, 1000, chunk), 0);
-    }
-
-    // WI-01 — flush() must hold back complete chunks until the batch
-    // threshold is reached, then emit exactly the batch, ascending, and
-    // leave nothing dirty.
     #[test]
     fn wi01_flush_holds_chunks_until_batch_is_full() {
         let chunk = 4 * 1024 * 1024; // 4 MiB
@@ -1118,5 +1181,99 @@ mod audit_co_tests {
             emitted.extend_from_slice(seg.data.as_ref());
         }
         assert_eq!(emitted, data, "restored buffer re-sends every original byte");
+    }
+
+    /// Mimics `DtfsFilesystem::write`'s RMW step for a 7-byte cluster chunk.
+    fn rmw_write(wb: &WriteBuffer, path: &str, offset: u64, data: &[u8], seed_calls: &mut u32) {
+        if wb.chunk_needs_seed(path, 0) {
+            *seed_calls += 1;
+            wb.seed_chunk(path, 0, &[7u8; 7]);
+        }
+        wb.write(path, offset, data);
+    }
+
+    #[test]
+    fn seed_once_two_writes_into_partial_chunk_keep_both_payloads() {
+        let wb = WriteBuffer::new(16);
+        let mut seeds = 0;
+        rmw_write(&wb, "/f", 0, b"AA", &mut seeds);
+        rmw_write(&wb, "/f", 5, b"BB", &mut seeds);
+        assert_eq!(seeds, 1, "a partial chunk is seeded at most once");
+        let segs = wb.flush_all("/f");
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].offset_in_chunk, 0);
+        assert!(!segs[0].needs_seed, "seeded chunk is committable whole");
+        assert_eq!(segs[0].data.as_ref(), b"AABB");
+    }
+
+    #[test]
+    fn seed_never_overwrites_buffered_bytes_and_is_idempotent() {
+        let wb = WriteBuffer::new(16);
+        wb.write("/f", 2, b"AA");
+        assert!(wb.chunk_needs_seed("/f", 0), "unseeded partial needs a seed");
+        wb.seed_chunk("/f", 0, &[1u8; 10]);
+        wb.seed_chunk("/f", 0, &[9u8; 10]);
+        assert!(!wb.chunk_needs_seed("/f", 0));
+        let mut dst = [0u8; 10];
+        assert_eq!(wb.overlay("/f", 0, &mut dst), 10);
+        assert_eq!(&dst, &[1, 1, b'A', b'A', 1, 1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn unseeded_partial_segment_still_needs_seed() {
+        let wb = WriteBuffer::new(16);
+        wb.write("/f", 0, b"AA");
+        let segs = wb.flush_all("/f");
+        assert!(segs[0].needs_seed);
+    }
+
+    #[test]
+    fn seeded_flag_survives_restore_segments() {
+        let wb = WriteBuffer::new(16);
+        wb.seed_chunk("/f", 0, &[7u8; 7]);
+        wb.write("/f", 1, b"A");
+        let segs = wb.flush_all("/f");
+        wb.restore_segments("/f", &segs);
+        assert!(!wb.chunk_needs_seed("/f", 0));
+        assert!(!wb.flush_all("/f")[0].needs_seed);
+    }
+
+    #[test]
+    fn rename_moves_buffer_and_children_not_siblings() {
+        let wb = WriteBuffer::new(16);
+        wb.write("/d/a.part", 0, b"one");
+        wb.write("/d/sub/x", 0, b"two");
+        wb.write("/dd/y", 0, b"sib");
+        wb.write("/e", 0, b"old");
+        wb.rename("/d", "/e");
+        assert!(!wb.has_dirty_data("/d/a.part"));
+        let mut b = [0u8; 3];
+        assert_eq!(wb.overlay("/e/a.part", 0, &mut b), 3);
+        assert_eq!(&b, b"one");
+        assert_eq!(wb.overlay("/e/sub/x", 0, &mut b), 3);
+        assert_eq!(&b, b"two");
+        assert_eq!(wb.overlay("/dd/y", 0, &mut b), 3, "sibling prefix untouched");
+        assert_eq!(wb.overlay("/e", 0, &mut b), 3, "unrelated /e kept (not a rename target key)");
+        assert_eq!(&b, b"old");
+    }
+
+    #[test]
+    fn rename_file_keeps_unflushed_data_and_overwrites_target() {
+        let wb = WriteBuffer::new(16);
+        wb.write("/a.part", 0, b"payload");
+        wb.write("/a", 0, b"stale!!");
+        wb.rename("/a.part", "/a");
+        assert!(!wb.has_dirty_data("/a.part"));
+        let segs = wb.flush_all("/a");
+        assert_eq!(segs[0].data.as_ref(), b"payload");
+    }
+
+    #[test]
+    fn rekey_path_boundaries() {
+        assert_eq!(rekey_path("/a", "/a", "/b").as_deref(), Some("/b"));
+        assert_eq!(rekey_path("/a/c", "/a", "/b").as_deref(), Some("/b/c"));
+        assert_eq!(rekey_path("/a/c", "/a/", "/b/").as_deref(), Some("/b/c"));
+        assert_eq!(rekey_path("/ab", "/a", "/b"), None);
+        assert_eq!(rekey_path("/x", "/a", "/b"), None);
     }
 }
