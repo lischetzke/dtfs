@@ -1,212 +1,69 @@
 # Building from Source
 
-DTFS is a Rust project organized as a Cargo workspace. This page covers how to set up the build environment and compile all components.
+DTFS is a Cargo workspace (Rust edition 2024). The supported toolchain is Linux: rocksdb and fuse3 do not build on a Windows host. The canonical, reproducible way to build and test is the Docker build image; building directly on Linux works too.
 
-## Prerequisites
+## Docker build image (canonical)
 
-### Rust Toolchain
-
-DTFS requires the Rust 2024 edition (Rust 1.85 or later). Install Rust using `rustup`:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Verify the installation:
-
-```bash
-rustc --version
-cargo --version
-```
-
-### System Dependencies
-
-The following system libraries are required at build time:
-
-| Dependency | Purpose | Package (Debian/Ubuntu) | Package (Fedora/RHEL) |
-|------------|---------|------------------------|----------------------|
-| `protoc` | Protocol Buffers compiler (for gRPC codegen) | `protobuf-compiler` | `protobuf-compiler` |
-| `libclang` | Required by RocksDB build | `libclang-dev` | `clang-devel` |
-| `pkg-config` | Build system helper | `pkg-config` | `pkgconf` |
-| FUSE headers | Required for `dtfs-fuse` | `libfuse3-dev` | `fuse3-devel` |
-
-**Debian/Ubuntu:**
-
-```bash
-sudo apt update
-sudo apt install -y build-essential protobuf-compiler libclang-dev \
-  pkg-config libfuse3-dev
-```
-
-**Fedora/RHEL:**
-
-```bash
-sudo dnf install -y gcc protobuf-compiler clang-devel pkgconf fuse3-devel
-```
-
-**macOS (for development only -- FUSE client requires Linux):**
-
-```bash
-brew install protobuf llvm pkg-config
-```
-
-## Building
-
-### Full Workspace Build
-
-From the repository root:
-
-```bash
-cargo build
-```
-
-This compiles all crates in the workspace in debug mode. Binaries are placed in `target/debug/`.
-
-### Release Build
-
-For production use, build with optimizations:
-
-```bash
-cargo build --release
-```
-
-Release binaries are placed in `target/release/`.
-
-### Building Individual Crates
-
-To build a specific component:
-
-```bash
-cargo build -p dtfs-manager
-cargo build -p dtfs-data
-cargo build -p dtfs-fuse
-cargo build -p dtfs-cli
-```
-
-### Workspace Crate Structure
-
-| Crate | Type | Description |
-|-------|------|-------------|
-| `dtfs-manager` | Binary | Manager node (Raft, metadata, placement, tiering, WebUI) |
-| `dtfs-data` | Binary | Data node (chunk storage, replication, scrubbing) |
-| `dtfs-fuse` | Binary | FUSE client (POSIX mount, read-ahead, write buffering) |
-| `dtfs-cli` | Binary | Command-line administration tool |
-| `dtfs-client` | Library | Shared gRPC client used by `dtfs-fuse` and `dtfs-cli` |
-| `dtfs-common` | Library | Shared types, configuration, topology, hash ring, checksums |
-| `dtfs-proto` | Library | Protobuf definitions and generated gRPC code |
-| `dtfs-raft` | Library | Raft integration (OpenRaft state machine, log store, networking) |
-
-## Building on Windows (Docker)
-
-rocksdb and fuse3 do not build on a Windows host, so the repository ships
-a Linux build image. Build it once:
+The image `dtfs-buildenv:latest` (`docker/buildenv.Dockerfile`) carries the pinned Rust toolchain plus `protoc`, `clang` and `libfuse3-dev`. Build it once:
 
 ```bash
 docker build -t dtfs-buildenv:latest -f docker/buildenv.Dockerfile .
 ```
 
-Then run cargo inside it with the checkout bind-mounted at `/build` and
-the cache in two named volumes (`MSYS_NO_PATHCONV=1` is required from Git
-Bash, and do not use `bash -lc` inside the image):
+Run cargo inside it with the checkout bind-mounted at `/build` and the build cache in two named volumes. From Git Bash on Windows `MSYS_NO_PATHCONV=1` is required, and do not use `bash -lc` inside the image (it drops cargo from `PATH`):
 
 ```bash
-MSYS_NO_PATHCONV=1 docker run --rm -v "C:/path/to/dtfs2:/build" \
+MSYS_NO_PATHCONV=1 docker run --rm -v "<path-to-checkout>:/build" \
   -v dtfs-target:/target -v dtfs-registry:/usr/local/cargo/registry \
-  -w /build dtfs-buildenv:latest cargo test --workspace --release
+  -w /build dtfs-buildenv:latest cargo test -p dtfs-common --release
 ```
 
-The manager, data node and CLI also compile natively on Windows; the FUSE
-client is Linux-only:
+Always pass `--release`; the cache volumes hold release artifacts. Parallel containers share the `dtfs-target` volume, so cargo may wait on the build lock. The exact command and conventions are the contract in `CLAUDE.md` section A.4; this page only explains them.
 
-```powershell
-cargo build -p dtfs-manager -p dtfs-data -p dtfs-cli -p dtfs-client -p dtfs-common -p dtfs-proto -p dtfs-raft
-```
+## Building natively on Linux
 
-## Proto Code Generation
+Install the dependencies, then use cargo directly.
 
-The `dtfs-proto` crate uses `tonic-build` to generate Rust code from the `.proto` files in the `proto/` directory. Code generation runs automatically as part of `cargo build` via a `build.rs` script. No manual `protoc` invocation is needed beyond having the `protoc` binary on your PATH.
-
-If you modify `.proto` files, a clean rebuild of `dtfs-proto` ensures regeneration:
+| Dependency | Purpose | Debian/Ubuntu | Fedora/RHEL |
+|------------|---------|---------------|-------------|
+| `protoc` | gRPC code generation | `protobuf-compiler` | `protobuf-compiler` |
+| `libclang` | RocksDB build | `libclang-dev` | `clang-devel` |
+| `pkg-config` | build helper | `pkg-config` | `pkgconf` |
+| FUSE 3 headers | `dtfs-fuse` | `libfuse3-dev` | `fuse3-devel` |
 
 ```bash
-cargo clean -p dtfs-proto
-cargo build -p dtfs-proto
+sudo apt install -y build-essential protobuf-compiler libclang-dev pkg-config libfuse3-dev
+cargo build --release
 ```
 
-## Installed Binaries
+Individual crates: `cargo build --release -p dtfs-manager` (likewise `dtfs-data`, `dtfs-fuse`, `dtfs-cli`). Binaries land in `target/release/`.
 
-After a release build, the following binaries are available:
+## Workspace crates
 
-| Binary | Path |
-|--------|------|
-| `dtfs-manager` | `target/release/dtfs-manager` |
-| `dtfs-data` | `target/release/dtfs-data` |
-| `dtfs-fuse` | `target/release/dtfs-fuse` |
-| `dtfs-cli` | `target/release/dtfs-cli` |
+See the table in the [Introduction](../introduction.md#components). `dtfs-proto` regenerates its Rust code from `proto/*.proto` automatically through `build.rs`; after editing a `.proto`, rebuild with `cargo clean -p dtfs-proto && cargo build -p dtfs-proto`.
 
-These are statically linked against `rustls` (no OpenSSL dependency at runtime). The only runtime dependency is FUSE 3 for `dtfs-fuse`.
+## Deploy and release builds: use the wrappers
 
-## Cutting a Release
+Every build carries a `BUILD_DATE` stamp, the only field that tells two dev builds apart. A bare `cargo build --release` can reuse a stale stamp, so builds that go to a cluster must use a wrapper:
 
-`scripts/dtfs-release.sh <version>` turns a version string into a
-publishable GitHub release. It stamps the version into the binaries
-(`DTFS_VERSION`, see below), builds + stages the canonical tarball via
-`scripts/dtfs-build.sh`, and assembles everything `gh release create`
-needs:
+| Script | Use |
+|--------|-----|
+| `scripts/build-linux-amd64.sh`, `scripts/dtfs-build.sh` | Dev/deploy build with a fresh `BUILD_DATE` |
+| `scripts/dtfs-release.sh <tag>` | Release build: also stamps `DTFS_VERSION`, builds, writes `target/release-artifacts/<tag>/` |
 
-```bash
-scripts/dtfs-release.sh v0.3.0                 # stage only, print the gh command
-scripts/dtfs-release.sh v0.3.0 --publish       # also run `gh release create`
-```
+Confirm what is running with `dtfs-<binary> --version`. Guards: `scripts/tests/test-build-date-fresh.sh` and `scripts/tests/test-release-version-stamp.sh`. Mechanism: [Invariants](../internals/invariants.md#a35--build-date--version-stamp-mechanism-bug-bs-az-5).
 
-Output lands in `target/release-artifacts/<version>/`:
+### Release artifacts
 
-| File | Purpose |
-|------|---------|
-| `dtfs-linux-amd64.tar.gz` | The release asset `dtfs-cli update` downloads (`dtfs/bin/*` + `dtfs/systemd/*` + `dtfs/MANIFEST`). The **fixed** name is what the updater expects at `<repo>/releases/latest/download/`. |
-| `SHA256SUMS` | Checksum of the asset. |
+`dtfs-release.sh` produces `dtfs-linux-amd64.tar.gz` (`dtfs/bin/*`, `dtfs/systemd/*`, `dtfs/MANIFEST` with per-binary sha256), `SHA256SUMS` and release notes. Releases are cut by the GitLab pipeline (`.gitlab-ci.yml`): a commit whose subject starts with `release vX.Y.Z` publishes that version, one starting with `deploy` publishes an alpha `v<base>_<YYYYMMDDHHmm>`; both then run the rolling update. See [CI Pipeline](../operations/ci-pipeline.md).
 
-Release notes are auto-generated by GitHub from the pull requests merged
-since the previous release (`gh release create --generate-notes`), so PR
-titles should carry the user-visible summary. Without `--publish` the
-script prints the exact `gh release create …` command to run by hand. The updater verifies each binary against the
-per-binary sha256 lines inside `dtfs/MANIFEST`, so the asset is
-self-describing; the top-level `SHA256SUMS` covers the asset itself.
+### `dtfs-cli update`
 
-### Version stamping (`DTFS_VERSION`)
-
-`VERSION` defaults to `v0.0.0-dev`. `dtfs-common/build.rs` reads the
-`DTFS_VERSION` environment variable and emits it as a compile-time
-constant; `dtfs-release.sh` exports `DTFS_VERSION=<version>` before
-building so `dtfs-* --version` (and the WebUI node table) report the real
-tag. Plain `cargo build` and the dev wrappers leave it at `v0.0.0-dev`.
-`scripts/tests/test-release-version-stamp.sh` guards both behaviours.
-
-Operators upgrade a node with [`dtfs-cli update`](../api-reference/cli-reference.md#update),
-which pulls and installs the matching binary from the published release.
+The updater downloads the tarball from the GitLab package registry (default) or GitHub releases. It checks every binary against the tarball's `MANIFEST` and refuses to install anything if one hash differs. When a minisign public key is configured (`[updater].minisign_public_key` or `DTFS_MINISIGN_PUBKEY`) it also downloads `SHA256SUMS` and `SHA256SUMS.minisig`, verifies the signature, and checks the tarball's sha256 against the signed list; without a key it prints a warning that authenticity is not verified. Redirects are followed by hand: the access token header is sent only on the first request (never to a redirect target on another host), later hops are HTTPS-only. Token precedence: `--token`, then `DTFS_REPO_TOKEN`, then `[updater].token`. The installed binary is swapped atomically and the matching service is restarted.
 
 ## Troubleshooting
 
-### `protoc` not found
-
-```
-error: failed to run custom build command for `dtfs-proto`
-```
-
-Install the Protocol Buffers compiler (`protobuf-compiler` on Debian/Ubuntu, `protobuf` on macOS via Homebrew).
-
-### RocksDB build failure
-
-```
-error: failed to run custom build command for `rocksdb-sys`
-```
-
-Ensure `libclang` is installed. On Debian/Ubuntu: `sudo apt install libclang-dev`.
-
-### FUSE headers not found
-
-```
-error[E0432]: unresolved import `fuse3`
-```
-
-Install FUSE 3 development headers: `sudo apt install libfuse3-dev` (Debian/Ubuntu) or `sudo dnf install fuse3-devel` (Fedora).
+- `failed to run custom build command for dtfs-proto`: install `protoc`.
+- `rocksdb-sys` build failure: install `libclang-dev`.
+- `unresolved import fuse3`: install `libfuse3-dev`.
+- An ICE in rustc dead-code analysis: the crate-level `#![allow(dead_code)]` on `dtfs-manager` and `dtfs-data` is a deliberate workaround for the pinned toolchain; do not remove it without re-verifying.

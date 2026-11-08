@@ -1,125 +1,38 @@
 # Testing
 
-DTFS uses a multi-layered testing strategy: unit tests, integration tests, chaos tests, and benchmarks. All tests are run through the standard Cargo test infrastructure.
+All verification runs as unit and crate tests inside the Docker build image ([Building from Source](./building.md)). There is no build VM and no lab cluster; behavior that only exists on a real cluster is reasoned about and noted in the commit body, not executed.
 
-## Unit Tests
-
-Unit tests live alongside the source code in each crate using Rust's built-in `#[cfg(test)]` modules.
-
-### Running All Unit Tests
+## Running tests
 
 ```bash
-cargo test
+MSYS_NO_PATHCONV=1 docker run --rm -v "<path-to-checkout>:/build" \
+  -v dtfs-target:/target -v dtfs-registry:/usr/local/cargo/registry \
+  -w /build dtfs-buildenv:latest cargo test -p <crate> --release
 ```
 
-### Running Tests for a Specific Crate
+- Always `--release`. Run the crate you changed; run the whole workspace (`cargo test --workspace --release`) for cross-crate changes.
+- After any config struct or example change, run `cargo test -p dtfs-common --release`: the `example_*_toml_parses` tests check every shipped example. If one flakes while another container holds the shared build lock, rerun it once.
+- A single test: append the test name after `--` (`cargo test -p dtfs-raft --release posix_path_regression`).
 
-```bash
-cargo test -p dtfs-common
-cargo test -p dtfs-manager
-cargo test -p dtfs-data
-cargo test -p dtfs-raft
-cargo test -p dtfs-client
-```
+## Where tests live
 
-### Running a Specific Test
+Unit tests sit beside the code in `#[cfg(test)]` modules or `tests.rs` files (`dtfs-raft/src/state_machine/tests.rs`, `dtfs-manager/src/scheduler/tests.rs`, `dtfs-manager/src/api/tests.rs`). `crates/dtfs-data/tests/` holds loopback integration tests such as mutual TLS.
 
-```bash
-cargo test -p dtfs-common test_hmac_roundtrip
-```
+## Conventions
 
-### Key Unit Test Areas
+1. **Test the purest layer.** Prefer, in order: a pure helper, then a state-machine `apply` test, then a manager aggregator, then a FUSE helper. Planners (`plan_cache_tick`, `plan_cache_promotion`) and decision functions (`demote_preserves_anchor`) are pure on purpose.
+2. **Red, green, suite.** Write the failing test, watch it fail for the right reason, make the smallest fix, watch it pass, then run the crate suite.
+3. **Snapshot compatibility.** Every new field on `StateMachineData` carries `#[serde(default)]` and gets a regression test (`state_machine::posix_path_regression` or `snapshot_persistence_tests`). A new replicated timestamp carries `#[serde(default)] now_ms` and falls back to the log index when `0`.
+4. **Durability and anchor invariants** get a property-style test over random operation sequences, not just examples.
+5. **Cluster-only behavior** (failover timing, WAN behavior) cannot run here. Say so in the commit body instead of adding a test that cannot execute.
+6. **No wall clock in `apply`.** A test that would need `SystemTime` inside apply is a sign the field should come from the proposer.
 
-| Crate | Test Area | What Is Tested |
-|-------|-----------|----------------|
-| `dtfs-common` | `crypto` | HMAC-SHA256 roundtrip, CA generation, node certificate signing, nonce uniqueness |
-| `dtfs-common` | `hash_ring` | Consistent hashing ring distribution, node addition/removal |
-| `dtfs-common` | `checksum` | BLAKE3 checksum computation and verification |
-| `dtfs-common` | `config` | TOML parsing, default values, validation |
-| `dtfs-manager` | `placement` | Rack-aware placement, failure domain spreading |
-| `dtfs-manager` | `audit` | Ring buffer behavior, filtering, capacity limits |
-| `dtfs-manager` | `tiering` | Temperature classification, migration decisions |
-| `dtfs-data` | `store` | WAL writes, atomic renames, crash recovery |
-| `dtfs-data` | `cache` | ARC cache eviction, hit/miss tracking |
-| `dtfs-data` | `scrub` | Quick and deep scrub correctness |
-| `dtfs-raft` | `state_machine` | Raft state machine apply, snapshot, restore |
-| `dtfs-raft` | `lib` (`merge_tests`) | Chunk location merge semantics for `UpdateChunkLocations` |
+## Dormant harnesses
 
-## Integration Tests
+`tests/release/`, `tests/proxmox/`, `tests/chaos/` and `tests/integration/` are shell harnesses for a live cluster or Docker Compose lab. They are not part of the verification loop and need no change to ship a fix. See [Lab: Chaos Testing](../lab/chaos-testing.md) and [Release Testing](../lab/release-testing.md).
 
-End-to-end checks use **Docker Compose** (see `deploy/`) plus **shell scripts** under `tests/integration/` (and related `tests/performance/`, `tests/chaos/`). There is **no** workspace-root `tests/*.rs` harness yet.
+The host-side Python tooling under `tools/dtfs-mcp` is tested separately (`uv run --with pytest --with "mcp<2" --with httpx pytest tools/dtfs-mcp`), outside the cargo loop.
 
-### Running Shell / Docker Integration Flow
+## Environment
 
-```bash
-cd deploy && docker compose build && docker compose up -d
-# Then run scripts from tests/integration/ (e.g. ./run_all.sh when available)
-docker compose down -v
-```
-
-### Key scenarios (targets for scripts / manual QA)
-
-- **Node join flow** — gRPC `RegisterNode` with `shared_secret`, or REST `POST /api/v1/join/*` HMAC flow.
-- **File write/read roundtrip** — create file, allocate chunks, write to data nodes, `CommitChunkLocations`, read back.
-- **Replication** — multiple placements / scheduler-driven copies.
-- **Scrub detection** — corrupt chunk, deep scrub, re-replication.
-- **Configuration propagation** — REST config updates and heartbeat-driven data-node config.
-
-## Chaos Tests
-
-Failure-injection testing (whole-DC power-off, disk yank/replace,
-cross-DC reads under shaping, balance convergence) is a lab-level
-harness under `tests/release/run.sh --chaos` against the Proxmox
-topology. It is dormant while no cluster exists; see
-[Lab → Chaos Testing](../lab/chaos-testing.md). The recovery
-properties it exercised end to end are covered at unit level by the
-state-machine and scheduler tests (`*/tests.rs`): WAL replay after a
-crash mid-put, leader change mid-migration, replica fallback on a
-partitioned node, disk-failure re-replication.
-
-## Benchmarks
-
-Performance benchmarks use Rust's built-in benchmark framework or `criterion` for more detailed statistical analysis.
-
-### Running Benchmarks
-
-```bash
-cargo bench
-```
-
-### Running Benchmarks for a Specific Crate
-
-```bash
-cargo bench -p dtfs-data
-cargo bench -p dtfs-common
-```
-
-### Key Benchmark Areas
-
-| Crate | Benchmark | What Is Measured |
-|-------|-----------|------------------|
-| `dtfs-common` | `checksum` | BLAKE3 hashing throughput at various chunk sizes |
-| `dtfs-common` | `hash_ring` | Consistent hash ring lookup latency |
-| `dtfs-data` | `store` | Sequential and random chunk write/read throughput |
-| `dtfs-data` | `cache` | ARC cache lookup latency under contention |
-| `dtfs-raft` | `state_machine` | State machine apply throughput |
-
-## Test Configuration
-
-Some tests require specific environment variables or configuration:
-
-| Variable | Purpose |
-|----------|---------|
-| `DTFS_TEST_DATA_DIR` | Directory for temporary test data (defaults to a `tempfile`-managed directory) |
-| `RUST_LOG` | Log level for test output (e.g., `RUST_LOG=dtfs_manager=debug cargo test`) |
-
-## Continuous Integration
-
-The recommended CI pipeline runs the following stages in order:
-
-1. **Format check** -- `cargo fmt --check`
-2. **Lint** -- `cargo clippy -- -D warnings`
-3. **Unit tests** -- `cargo test`
-4. **Integration tests** -- `cargo test --test '*'`
-5. **Chaos tests** (nightly/weekly) -- `cargo test chaos -- --ignored`
-6. **Benchmarks** (optional, for regression tracking) -- `cargo bench`
+`RUST_LOG=dtfs_manager=debug` raises log output for a failing test. `DTFS_TEST_DATA_DIR` overrides the temp directory some data-node tests use.
