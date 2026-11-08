@@ -69,9 +69,36 @@ impl FileLocations {
     /// every entry, which is indistinguishable from a real index 0. Treat the
     /// labels as authoritative only when at least one is non-zero, or when
     /// there is at most one chunk (where labelled and positional lookup agree
-    /// anyway).
+    /// anyway). O(1): `chunks` is sorted by label (`sort_chunks_by_index`), so
+    /// "some label non-zero" is "the last label non-zero".
     fn indices_are_authoritative(&self) -> bool {
-        self.chunks.len() <= 1 || self.chunks.iter().any(|c| c.chunk_index.unwrap_or(0) != 0)
+        self.chunks.len() <= 1 || self.chunks.last().is_some_and(|c| chunk_label(c) != 0)
+    }
+
+    /// Number of chunk slots: highest index + 1 (labelled), else the entry
+    /// count (positional). O(1).
+    fn chunk_count(&self) -> u64 {
+        if self.indices_are_authoritative() {
+            self.chunks.last().map_or(0, |c| chunk_label(c) + 1)
+        } else {
+            self.chunks.len() as u64
+        }
+    }
+
+    /// Entries with index in `from..=to`, ascending, with their index.
+    /// O(log n + entries returned).
+    fn chunks_in(&self, from: u64, to: u64) -> impl Iterator<Item = (u64, &ChunkInfo)> {
+        let labelled = self.indices_are_authoritative();
+        let start = if labelled {
+            self.chunks.partition_point(|c| chunk_label(c) < from)
+        } else {
+            (from as usize).min(self.chunks.len())
+        };
+        self.chunks[start..]
+            .iter()
+            .enumerate()
+            .map(move |(i, c)| (if labelled { chunk_label(c) } else { (start + i) as u64 }, c))
+            .take_while(move |(idx, _)| *idx <= to)
     }
 
     /// REV-2-1 — the chunk covering file offset `index * chunk_size`.
@@ -83,16 +110,28 @@ impl FileLocations {
     /// that array by position therefore returned a DIFFERENT chunk's bytes at
     /// a valid offset — silently, with a valid checksum. Resolve by index
     /// instead, and report a genuine hole as absent rather than serving a
-    /// neighbour.
+    /// neighbour. Binary search over the index-sorted `chunks`: O(log n).
     pub fn chunk_at(&self, index: u64) -> Option<&ChunkInfo> {
         if self.indices_are_authoritative() {
-            self.chunks
-                .iter()
-                .find(|c| c.chunk_index.unwrap_or(0) == index)
+            let pos = self.chunks.partition_point(|c| chunk_label(c) < index);
+            self.chunks.get(pos).filter(|c| chunk_label(c) == index)
         } else {
             self.chunks.get(index as usize)
         }
     }
+}
+
+/// A chunk entry's index label (`None`, synthesised locally, counts as 0).
+fn chunk_label(c: &ChunkInfo) -> u64 {
+    c.chunk_index.unwrap_or(0)
+}
+
+/// Invariant behind the O(log n) lookups: `FileLocations.chunks` is sorted
+/// ascending by label. Stable, so an older manager's all-zero labels keep
+/// their positional order; already-sorted input (the manager's BTreeMap
+/// order) costs one linear pass. The post-commit merge keeps it sorted.
+fn sort_chunks_by_index(chunks: &mut [ChunkInfo]) {
+    chunks.sort_by_key(chunk_label);
 }
 
 /// Information about a single chunk within a file.
@@ -935,13 +974,7 @@ impl DtfsFilesystem {
         // manager's array is dense while the file's index space may be
         // sparse (REV-2-1).
         if append && flags.is_writable() {
-            let max_idx = if locations.indices_are_authoritative() {
-                locations.chunks.iter().filter_map(|c| c.chunk_index).max()
-            } else if locations.chunks.is_empty() {
-                None
-            } else {
-                Some(locations.chunks.len() as u64 - 1)
-            };
+            let max_idx = locations.chunk_count().checked_sub(1);
             if let Some(last_idx) = max_idx {
                 match self
                     .read_seed_bytes(path, &locations, last_idx, chunk_size, locations.total_size)
@@ -1065,18 +1098,7 @@ impl DtfsFilesystem {
         // consumed there, and `read_candidates` sorts per chunk, so building
         // it for every chunk of the file on every 128 KB read would be pure
         // waste on the (common) cache-hit path.
-        let indices_trusted = locations.indices_are_authoritative();
-        let total_chunks = if indices_trusted {
-            locations
-                .chunks
-                .iter()
-                .filter_map(|c| c.chunk_index)
-                .max()
-                .map(|m| m + 1)
-                .unwrap_or(0) as u32
-        } else {
-            locations.chunks.len() as u32
-        };
+        let total_chunks = locations.chunk_count() as u32;
 
         for chunk_idx in start_chunk..end_chunk {
             // REV-2-1 — resolve by chunk index, never by array position. The
@@ -1362,19 +1384,11 @@ impl DtfsFilesystem {
                 // Only the prefetch window is built: on_chunk_read looks at
                 // no chunk beyond chunk_idx + prefetch_chunks.
                 let window = self.readahead.prefetch_window();
+                // Exactly `in_prefetch_window`: chunk_idx+1 ..= chunk_idx+window.
+                let first = chunk_idx as u64 + 1;
                 let chunk_locs: Vec<(u64, String, Vec<String>)> = locations
-                    .chunks
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(pos, c)| {
-                        let idx = if indices_trusted {
-                            c.chunk_index.unwrap_or(pos as u64)
-                        } else {
-                            pos as u64
-                        };
-                        crate::readahead::in_prefetch_window(idx, chunk_idx as u32, window)
-                            .then(|| (idx, c.chunk_id.clone(), self.read_candidates(c)))
-                    })
+                    .chunks_in(first, chunk_idx as u64 + window as u64)
+                    .map(|(idx, c)| (idx, c.chunk_id.clone(), self.read_candidates(c)))
                     .collect();
                 self.readahead.on_chunk_read(
                     &file_path,
@@ -2303,6 +2317,8 @@ impl DtfsFilesystem {
                 }
             })
             .collect();
+        let mut chunks = chunks;
+        sort_chunks_by_index(&mut chunks);
 
         // Use the chunk_size the manager returned; fall back to 128 MiB only
         // when the field is absent (e.g. talking to an older manager build).
@@ -3937,6 +3953,55 @@ mod rev_2_1_chunk_index_tests {
         assert_eq!(l.chunk_at(1).unwrap().chunk_id, "h1");
         assert_eq!(l.chunk_at(2).unwrap().chunk_id, "h2");
         assert!(l.chunk_at(3).is_none(), "past the end is still absent");
+    }
+
+    /// Unsorted labelled input (an older manager, or any non-BTreeMap order)
+    /// is sorted at construction so the binary-search lookups are correct.
+    #[test]
+    fn unsorted_manager_input_is_sorted_for_lookup() {
+        let mut l = locs(&[(3, "h3"), (0, "h0"), (7, "h7"), (1, "h1")]);
+        super::sort_chunks_by_index(&mut l.chunks);
+        for (i, id) in [(0u64, "h0"), (1, "h1"), (3, "h3"), (7, "h7")] {
+            assert_eq!(l.chunk_at(i).map(|c| c.chunk_id.as_str()), Some(id), "index {i}");
+        }
+        assert!(l.chunk_at(2).is_none() && l.chunk_at(8).is_none(), "holes stay holes");
+        assert_eq!(l.chunk_count(), 8);
+    }
+
+    /// All-zero labels (positional, older manager) keep their order.
+    #[test]
+    fn positional_labels_keep_order_after_sort() {
+        let mut l = locs(&[(0, "a"), (0, "b"), (0, "c")]);
+        super::sort_chunks_by_index(&mut l.chunks);
+        assert_eq!(l.chunk_at(1).unwrap().chunk_id, "b");
+        assert_eq!(l.chunk_count(), 3);
+        let w: Vec<(u64, &str)> = l.chunks_in(1, 5).map(|(i, c)| (i, c.chunk_id.as_str())).collect();
+        assert_eq!(w, [(1, "b"), (2, "c")]);
+    }
+
+    /// `chunks_in` returns exactly the labelled entries in range, skipping
+    /// holes; `chunk_count` is max index + 1 even with holes.
+    #[test]
+    fn chunks_in_respects_holes_and_bounds() {
+        let l = locs(&[(0, "h0"), (2, "h2"), (3, "h3"), (9, "h9")]);
+        let w: Vec<u64> = l.chunks_in(1, 3).map(|(i, _)| i).collect();
+        assert_eq!(w, [2, 3]);
+        assert_eq!(l.chunks_in(4, 8).count(), 0);
+        assert_eq!(l.chunks_in(10, 20).count(), 0);
+        assert_eq!(l.chunk_count(), 10);
+        assert_eq!(locs(&[]).chunk_count(), 0);
+    }
+
+    /// The post-commit merge keeps `chunks` sorted (lookup invariant).
+    #[test]
+    fn merge_keeps_chunks_sorted() {
+        let mut l = locs(&[(0, "h0"), (5, "h5")]);
+        let c = [committed(9, "n9", 1), committed(2, "n2", 1), committed(5, "n5", 1)];
+        assert!(super::merge_into_snapshot(Some(&mut l), Some(&c), 1));
+        let idx: Vec<u64> = l.chunks.iter().map(super::chunk_label).collect();
+        assert_eq!(idx, [0, 2, 5, 9]);
+        assert_eq!(l.chunk_at(2).unwrap().chunk_id, "n2");
+        assert_eq!(l.chunk_at(5).unwrap().chunk_id, "n5");
     }
 
     const CS: u64 = 4 * 1024 * 1024;

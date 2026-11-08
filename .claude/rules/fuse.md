@@ -72,6 +72,10 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   an overlapped fetch. SetFileSize (truncate, set_size) holds a commit slot. Snapshots are
   `Arc<FileLocations>` (handles and metadata cache): read()/write() clone
   the Arc, never the chunk list; the merge is copy-on-write (`merge_shared`).
+- `FileLocations.chunks` is sorted by chunk index (`sort_chunks_by_index` at
+  fetch, the merge inserts in order). Per-call lookups use it: `chunk_at`
+  binary search, `chunk_count` from the last entry, `chunks_in` for the
+  prefetch window. No per-call or per-chunk walk over the whole list.
 - Handle `locations = None` means stale; `write()`/`read()` must
   `refetch_locations` before using them.
 - `rename` over a path with open writers and `unlink`/`rmdir` of one
