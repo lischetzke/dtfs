@@ -207,6 +207,9 @@ enum VolumesCmd {
         /// Tier policy hint (currently informational)
         #[arg(long)]
         tier_policy: Option<String>,
+        /// Skip the server's check that some node reports the datacenter.
+        #[arg(long)]
+        force: bool,
     },
     /// Bug AV — migrate a legacy volume to the mandatory/cache split
     /// schema. Clones the volume's `replication` field into
@@ -310,6 +313,9 @@ enum VolumesCmd {
         /// current.
         #[arg(long)]
         required_tier: Option<String>,
+        /// Skip the server's check that some node reports the datacenter.
+        #[arg(long)]
+        force: bool,
     },
     /// UIP-3-2 — set or update the volume's spill policy (Bug BZ:
     /// which tiers/datacenters a chunk may spill onto beyond its
@@ -641,7 +647,8 @@ async fn main() -> anyhow::Result<()> {
                 name,
                 replication_factor,
                 tier_policy,
-            } => cmd_volumes_create(&api, &args.format, &name, replication_factor, tier_policy.as_deref()).await?,
+                force,
+            } => cmd_volumes_create(&api, &args.format, &name, replication_factor, tier_policy.as_deref(), force).await?,
             VolumesCmd::MigratePolicy { volume_id } => {
                 cmd_volumes_migrate_policy(&api, &args.format, &volume_id).await?
             }
@@ -679,11 +686,11 @@ async fn main() -> anyhow::Result<()> {
             }
             VolumesCmd::SetAnchor {
                 volume_id,
-                datacenter, required_tier,
+                datacenter, required_tier, force,
             } => {
                 cmd_volumes_set_anchor(
                     &api, &args.format, &volume_id,
-                    datacenter, required_tier,
+                    datacenter, required_tier, force,
                 ).await?
             }
             VolumesCmd::SetSpill {
@@ -934,13 +941,12 @@ async fn cmd_nodes(
     Ok(())
 }
 
-async fn cmd_volumes_create(
-    api: &ApiClient,
-    format: &OutputFormat,
+fn volumes_create_body(
     name: &str,
     replication_factor: Option<u32>,
     tier_policy: Option<&str>,
-) -> anyhow::Result<()> {
+    force: bool,
+) -> serde_json::Value {
     let mut body = serde_json::json!({ "name": name });
     if let Some(rf) = replication_factor {
         body["replication_factor"] = serde_json::json!(rf);
@@ -948,6 +954,33 @@ async fn cmd_volumes_create(
     if let Some(t) = tier_policy {
         body["tier_policy"] = serde_json::json!(t);
     }
+    if force {
+        body["force"] = serde_json::json!(true);
+    }
+    body
+}
+
+fn set_anchor_body(
+    datacenter: Option<String>,
+    required_tier: Option<String>,
+    force: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = datacenter { body.insert("datacenter".into(), v.into()); }
+    if let Some(v) = required_tier { body.insert("required_tier".into(), v.into()); }
+    if force { body.insert("force".into(), true.into()); }
+    serde_json::Value::Object(body)
+}
+
+async fn cmd_volumes_create(
+    api: &ApiClient,
+    format: &OutputFormat,
+    name: &str,
+    replication_factor: Option<u32>,
+    tier_policy: Option<&str>,
+    force: bool,
+) -> anyhow::Result<()> {
+    let body = volumes_create_body(name, replication_factor, tier_policy, force);
     let resp = api.post("/api/v1/volumes", &body).await?;
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
@@ -1213,11 +1246,9 @@ async fn cmd_volumes_set_anchor(
     volume_id: &str,
     datacenter: Option<String>,
     required_tier: Option<String>,
+    force: bool,
 ) -> anyhow::Result<()> {
-    let mut body = serde_json::Map::new();
-    if let Some(v) = datacenter { body.insert("datacenter".into(), v.into()); }
-    if let Some(v) = required_tier { body.insert("required_tier".into(), v.into()); }
-    let body = serde_json::Value::Object(body);
+    let body = set_anchor_body(datacenter, required_tier, force);
 
     let url = format!("/api/v1/volumes/{}/set-anchor", volume_id);
     let resp = api.post_checked(&url, &body).await?;
@@ -2111,6 +2142,7 @@ mod audit_co_tests {
                 volume_id,
                 datacenter,
                 required_tier,
+                ..
             }) => {
                 assert_eq!(volume_id, "default");
                 assert_eq!(datacenter.as_deref(), Some("leli"));
@@ -2118,6 +2150,22 @@ mod audit_co_tests {
             }
             other => panic!("expected VolumesCmd::SetAnchor, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn force_flag_parses_and_reaches_request_body() {
+        let a = Args::try_parse_from(["dtfs-cli", "volumes", "create", "v", "--force"]).unwrap();
+        assert!(matches!(a.command, Commands::Volumes(VolumesCmd::Create { force: true, .. })));
+        let a = Args::try_parse_from(["dtfs-cli", "volumes", "set-anchor", "v", "--force"]).unwrap();
+        assert!(matches!(a.command, Commands::Volumes(VolumesCmd::SetAnchor { force: true, .. })));
+        let a = Args::try_parse_from(["dtfs-cli", "volumes", "create", "v"]).unwrap();
+        assert!(matches!(a.command, Commands::Volumes(VolumesCmd::Create { force: false, .. })));
+
+        assert_eq!(volumes_create_body("v", Some(2), None, true)["force"], true);
+        assert!(volumes_create_body("v", None, None, false).get("force").is_none());
+        let b = set_anchor_body(Some("leli".into()), None, true);
+        assert_eq!((b["force"].clone(), b["datacenter"].clone()), (true.into(), "leli".into()));
+        assert!(set_anchor_body(None, None, false).get("force").is_none());
     }
 
     // UIP-3-2 — `volumes set-spill <id> --allow true --forbidden-tiers
