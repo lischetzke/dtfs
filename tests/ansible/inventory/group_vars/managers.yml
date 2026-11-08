@@ -1,5 +1,5 @@
 ---
-# Ports must match deploy/configs/mgr-*.toml (real schema).
+# Ports must match deploy/examples/manager.toml (real schema).
 # Earlier defaults of 7000/7001/8080 do NOT match the binary (fix for F-003).
 dtfs_raft_listen_addr: "0.0.0.0"
 dtfs_raft_port: 9400

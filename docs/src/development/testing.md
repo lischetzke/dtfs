@@ -29,9 +29,27 @@ Unit tests sit beside the code in `#[cfg(test)]` modules or `tests.rs` files (`d
 
 ## Dormant harnesses
 
-`tests/release/`, `tests/chaos/` and `tests/integration/` are shell harnesses for a live cluster or Docker Compose lab. They are not part of the verification loop and need no change to ship a fix. See [Lab: Chaos Testing](../lab/chaos-testing.md) and [Release Testing](../lab/release-testing.md).
+`tests/release/`, `tests/chaos/` and `tests/integration/` are shell harnesses for a live cluster (the integration one can target the local dev cluster below). They are not part of the verification loop and need no change to ship a fix. See [Lab: Chaos Testing](../lab/chaos-testing.md) and [Release Testing](../lab/release-testing.md).
 
 The host-side Python tooling under `tools/dtfs-mcp` is tested separately (`uv run --with pytest --with "mcp<2" --with httpx pytest tools/dtfs-mcp`), outside the cargo loop.
+
+## Local dev cluster
+
+`scripts/dev-cluster.sh` (needs only docker and bash; works from Git Bash and Linux) runs a real 3-manager, 3-data-node cluster in Docker for runtime checks that crate tests cannot give. Binaries are built in the build image and copied into the `dtfs-dev-bin` volume, so later builds never swap binaries under running daemons. Everything is named `dtfs-dev-*`; the network is `dtfs-dev-net` (172.31.250.0/24).
+
+| Command | What it does |
+|---|---|
+| `up [--no-build]` | Build, write configs, start `mgr01-03` (leli/toro/nrb) and `data01` (leli cold), `data02` (toro warm), `data03` (nrb warm); wait for 3 healthy data nodes |
+| `deploy` | Rebuild, copy binaries, restart all daemons (state kept), wait healthy |
+| `status` | Container states plus the `/api/v1/cluster/status` summary |
+| `fuse [cmd...]` | Start or reuse the FUSE client container; run `cmd` inside it (mount at `/mnt/dtfs`) |
+| `nfs-check` | Re-export the FUSE mount over NFSv3 in a privileged container: small file, 10 MB `cmp` via NFS and FUSE, rename, remove, `cmp` again after dropping caches; PASS/FAIL per step, non-zero exit on failure |
+| `big-file <GiB>` | Opt-in: stream random data through FUSE while hashing, read back, copy inside DTFS, compare; prints MB/s per phase and peak RSS of `dtfs-fuse`. Needs free disk of about size x replicas x 2 |
+| `down` | Remove all containers, the network and volumes (state is lost) |
+
+Manager REST is published on host ports 29402 (mgr01), 29412 (mgr02), 29422 (mgr03). TLS is disabled and the shared secret is a fixed dev value. `DTFS_DEV_TARGET_VOLUME` selects the cargo target volume (default `dtfs-target`).
+
+What it proves: the release binaries start, form a Raft quorum, register data nodes, and serve real writes, reads and replication through FUSE and an NFS re-export. What it cannot: there is no systemd, journald or sshd, so the MCP `host_*` tools and Ansible do not apply; all nodes share one host, so WAN behaviour and failover timing are not exercised.
 
 ## Environment
 

@@ -27,7 +27,6 @@ dtfs/bin/dtfs-cli
 dtfs/systemd/dtfs-manager.service
 dtfs/systemd/dtfs-data.service
 dtfs/systemd/dtfs-fuse@.service
-dtfs/configs/*.toml            # sample configs from deploy/configs/
 dtfs/MANIFEST                  # build info, then "<sha256>  <binary>" per file in bin/
 ```
 

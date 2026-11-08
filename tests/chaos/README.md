@@ -15,7 +15,7 @@ Chaos tests verify DTFS resilience under adverse conditions.
 ## Running
 
 ```bash
-# Requires a running docker-compose cluster
+# Dormant harness; a local cluster comes from scripts/dev-cluster.sh up
 cargo test --test chaos -- --nocapture
 ```
 

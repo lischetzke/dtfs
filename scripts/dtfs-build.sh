@@ -83,7 +83,7 @@ fi
 echo ">>> Staging tarball"
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
-mkdir -p "$STAGE/dtfs/bin" "$STAGE/dtfs/configs" "$STAGE/dtfs/systemd"
+mkdir -p "$STAGE/dtfs/bin" "$STAGE/dtfs/systemd"
 for b in dtfs-manager dtfs-data dtfs-fuse dtfs-cli; do
     if [ ! -x "$BIN_DIR/$b" ]; then
         echo "error: $BIN_DIR/$b missing" >&2; exit 1
@@ -91,8 +91,7 @@ for b in dtfs-manager dtfs-data dtfs-fuse dtfs-cli; do
     cp "$BIN_DIR/$b" "$STAGE/dtfs/bin/$b"
 done
 
-# Sample configs + systemd units
-cp deploy/configs/*.toml "$STAGE/dtfs/configs/" 2>/dev/null || true
+# systemd units
 cp deploy/systemd/*.service "$STAGE/dtfs/systemd/" 2>/dev/null || true
 
 # Manifest
