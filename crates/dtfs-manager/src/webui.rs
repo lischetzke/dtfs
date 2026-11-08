@@ -1035,7 +1035,10 @@ assert.strictEqual(pctOf(1000, 1000), 100);
 assert.strictEqual(pctOf(0, 0), 0);
 assert.strictEqual(pctOf(5, 100), 5);
 assert.strictEqual(anchorRisk({anchor_pending: 0, chunk_placement: {missing: 0}}, {files_missing_chunks: 0}).atRisk, false);
-assert.strictEqual(anchorRisk({anchor_pending: 2}, null).atRisk, true);
+// pending = normal replication lag toward the anchor DC, not data loss
+assert.strictEqual(anchorRisk({anchor_pending: 2}, null).atRisk, false);
+assert.strictEqual(anchorRisk({anchor_pending: 2}, null).catchingUp, true);
+assert.strictEqual(anchorRisk({anchor_pending: 2, chunk_placement: {missing: 1}}, null).catchingUp, false);
 assert.strictEqual(anchorRisk({anchor_pending: 0, chunk_placement: {missing: 1}}, null).atRisk, true);
 assert.strictEqual(anchorRisk({anchor_pending: 0}, {files_missing_chunks: 3}).atRisk, true);
 "#);

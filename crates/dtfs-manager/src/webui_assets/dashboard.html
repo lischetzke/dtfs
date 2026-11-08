@@ -1329,8 +1329,11 @@
         const missingFiles = (cluster && typeof cluster.files_missing_chunks === 'number')
             ? cluster.files_missing_chunks : 0;
         const missingChunks = (stats && stats.chunk_placement && stats.chunk_placement.missing) || 0;
-        return { pending, missingFiles, missingChunks,
-                 atRisk: pending > 0 || missingFiles > 0 || missingChunks > 0 };
+        // Pending alone is normal lag (e.g. after an NRB write burst over the
+        // slow anchor link); only missing chunks put the anchor at risk.
+        const atRisk = missingFiles > 0 || missingChunks > 0;
+        return { pending, missingFiles, missingChunks, atRisk,
+                 catchingUp: !atRisk && pending > 0 };
     }
 
     // Red count badges on the Data menu entries that own a problem.
@@ -1367,7 +1370,8 @@
             const total   = stats.infra_total   ?? stats.total_nodes;
             const nodesTxt = (healthy === undefined || total === undefined) ? ''
                 : healthy + '/' + total + ' nodes healthy';
-            const detail = (nodesTxt ? nodesTxt + ' · ' : '') + (risk.atRisk ? 'anchor AT RISK' : 'anchor OK');
+            const detail = (nodesTxt ? nodesTxt + ' · ' : '') + (risk.atRisk ? 'anchor AT RISK'
+                : risk.catchingUp ? 'anchor catching up (' + risk.pending + ' files)' : 'anchor OK');
             const right = 'Config v' + (stats.config_version || 0) +
                           ' · ' + (stats.file_count || 0) + ' files';
             const promoted = risk.atRisk && healthCssClass(stats.health) === 'healthy';
@@ -1496,6 +1500,7 @@
         renderChunkPlacement(stats.chunk_placement);
 
         // ── Scrub results (one card per node + level)
+        window._nodeNames = Object.fromEntries((nR.v || []).map(n => [String(n.node_id), n.hostname]));
         renderScrub(stats.scrub_results_by_node || []);
 
         // ── Nodes table
@@ -1523,7 +1528,8 @@
         const filesKnown = !!(cluster && typeof cluster.files_missing_chunks === 'number');
         const anchorDcs = window._anchorDcs;
         const anchorLbl = 'Anchor' + ((anchorDcs && anchorDcs.length) ? ' (' + anchorDcs.join(', ') + ')' : '');
-        const anchorHint = !risk.atRisk ? 'Every file has its anchor copy'
+        const anchorHint = risk.catchingUp ? risk.pending + ' files waiting for their anchor copy'
+            : !risk.atRisk ? 'Every file has its anchor copy'
             : [risk.pending > 0 ? risk.pending + ' files missing their anchor copy' : '',
                risk.missingFiles > 0 ? risk.missingFiles + ' files missing chunks' : '',
                risk.missingChunks > 0 ? risk.missingChunks + ' chunks missing' : ''].filter(Boolean).join('; ');
@@ -1531,10 +1537,10 @@
         const chips = [
             {
                 id: 'sig-anchor', hero: true,
-                val: risk.atRisk ? 'AT RISK' : 'Safe',
+                val: risk.atRisk ? 'AT RISK' : risk.catchingUp ? 'Catching up' : 'Safe',
                 lbl: anchorLbl,
                 hint: anchorHint,
-                sev: risk.atRisk ? 'danger' : 'ok',
+                sev: risk.atRisk ? 'danger' : risk.catchingUp ? 'warn' : 'ok',
                 href: risk.atRisk && (risk.missingFiles > 0 || risk.missingChunks > 0) ? '/ui/integrity' : null,
             },
             {
@@ -1667,7 +1673,7 @@
             <div class="scrub-result">
             <div class="scrub-meta">
                 <div class="scrub-meta-item">${lvlBadge}</div>
-                <div class="scrub-meta-item"><span>Node:</span> ${esc(s.node_id)}</div>
+                <div class="scrub-meta-item"><span>Node:</span> <span title="${esc(s.node_id)}">${esc((window._nodeNames || {})[String(s.node_id)] || s.node_id)}</span></div>
                 <div class="scrub-meta-item"><span>Disk:</span> ${esc(s.disk_path)}</div>
                 <div class="scrub-meta-item"><span>Completed:</span> ${when}</div>
                 <div class="scrub-meta-item"><span>Duration:</span> ${dur}</div>
