@@ -132,4 +132,4 @@ Every logic change ships a **positive** test (intended outcome) and a **negative
 
 ## B.6 Updating this file
 
-Behaviour change visible to operator, agent, or data plane updates CLAUDE.md in same commit. Keep it ≤13 KB; history goes to `invariants.md`, not here.
+Behaviour change visible to operator, agent, or data plane updates CLAUDE.md in same commit. History goes to `invariants.md`, not here.
