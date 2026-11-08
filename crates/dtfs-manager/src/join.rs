@@ -187,7 +187,7 @@ impl JoinHandler {
             });
         }
 
-        let req = ClientRequest::RegisterNode { node_id, info: info.clone() };
+        let req = ClientRequest::RegisterNode { now_ms: crate::metadata::stamp_now_ms(), node_id, info: info.clone() };
 
         match self.raft.client_write(req).await {
             Ok(resp) => {

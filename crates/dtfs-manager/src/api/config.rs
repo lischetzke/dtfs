@@ -260,7 +260,7 @@ pub(super) async fn update_config(
     };
     let version = base_version + 1;
 
-    let req = ClientRequest::UpdateConfig {
+    let req = ClientRequest::UpdateConfig { now_ms: crate::metadata::stamp_now_ms(),
         config_json: config_json.clone(),
         version,
         expected_version: base_version,

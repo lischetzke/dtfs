@@ -151,24 +151,24 @@ fn all_requests() -> Vec<ClientRequest> {
     let s = |x: &str| x.to_string();
     vec![
         CreateFile { path: s("/a"), volume_id: s("default"), chunk_size: 1024 },
-        DeleteFile { path: s("/a") },
+        DeleteFile { path: s("/a"), now_ms: 5 },
         UpdateChunkLocations { path: s("/a"), chunks: vec![chunk(0)], lease_id: s("l1"), now_ms: 5 },
         RemoveCorruptChunkReplicas { node_id: s("7"), chunk_hashes: vec![s("ab")], disk_id: 1, now_ms: 5 },
-        RegisterNode { node_id: 7, info: node_info() },
-        DeregisterNode { node_id: 7 },
-        UpdateNodeStatus { node_id: 7, status: s("down") },
-        QuarantineNode { node_id: 7, info: quarantine() },
-        UnquarantineNode { node_id: 7, operator_id: s("op"), reason_acknowledged: s("fixed") },
+        RegisterNode { node_id: 7, info: node_info(), now_ms: 5 },
+        DeregisterNode { node_id: 7, now_ms: 5 },
+        UpdateNodeStatus { node_id: 7, status: s("down"), now_ms: 5 },
+        QuarantineNode { node_id: 7, info: quarantine(), now_ms: 5 },
+        UnquarantineNode { node_id: 7, operator_id: s("op"), reason_acknowledged: s("fixed"), now_ms: 5 },
         UpdateNodeUsage {
             node_id: 7, used_capacity: 1, chunk_count: 2, total_bytes_read: 3, total_bytes_written: 4,
             observed_at_ms: 5,
         },
-        UpdateConfig { config_json: s("{}"), version: 2, expected_version: 1 },
-        UpsertVolume { config: VolumeConfig::default(), expected_version: None },
-        DeleteVolume { volume_id: s("default") },
+        UpdateConfig { config_json: s("{}"), version: 2, expected_version: 1, now_ms: 5 },
+        UpsertVolume { config: VolumeConfig::default(), expected_version: None, now_ms: 5 },
+        DeleteVolume { volume_id: s("default"), now_ms: 5 },
         ReportScrubResult {
             node_id: 7, disk_path: s("/d"), level: s("quick"), completed_at_ms: 1, chunks_checked: 2,
-            chunks_healthy: 3, chunks_corrupt: 4, chunks_missing: 5, duration_secs: 0.5,
+            chunks_healthy: 3, chunks_corrupt: 4, chunks_missing: 5, duration_secs: 0.5, now_ms: 5,
         },
         UpdateMigrationState { json: s("{}") },
         RenameFile { from: s("/a"), to: s("/b"), now_ms: 5 },
@@ -179,7 +179,7 @@ fn all_requests() -> Vec<ClientRequest> {
         ReleaseLock { path: s("/a"), owner_id: s("o"), start: 0, end: 9 },
         AcquireWriteLease { path: s("/a"), owner_id: s("o"), lease_ms: 1000, now_ms: 5, proposed_lease_id: s("l1") },
         RenewWriteLease { path: s("/a"), lease_id: s("l1"), extension_ms: 1000, now_ms: 5 },
-        ReleaseWriteLease { path: s("/a"), lease_id: s("l1") },
+        ReleaseWriteLease { path: s("/a"), lease_id: s("l1"), now_ms: 5 },
         ReleaseLeasesByHost { hostname_prefix: s("h"), except_pid: 1, now_ms: 5 },
         SweepExpiredLeases { now_ms: 5 },
         ReportChunkReads { node_id: 7, entries: vec![(s("c1"), [(s("LELI"), 3u32)].into_iter().collect())] },
@@ -319,12 +319,35 @@ fn client_requests_v1_fixture_covers_every_variant() {
 fn upsert_volume_v1_entry_defaults_cas_fields() {
     let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V1).unwrap();
     let up = reqs.iter().find_map(|r| match r {
-        ClientRequest::UpsertVolume { config, expected_version } => Some((config, expected_version)),
+        ClientRequest::UpsertVolume { config, expected_version, .. } => Some((config, expected_version)),
         _ => None,
     });
     let (config, expected) = up.expect("fixture has UpsertVolume");
     assert_eq!((config.version, *expected), (0, None));
     assert_eq!(snap_volume_version(), 0);
+}
+
+/// The v1 fixture predates the audit `now_ms` on these variants: it must
+/// default to 0 (apply then falls back to `log_id.index`).
+#[test]
+fn audited_variants_v1_entries_default_now_ms_to_zero() {
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V1).unwrap();
+    let mut seen = 0;
+    for r in &reqs {
+        use ClientRequest::*;
+        match r {
+            DeleteFile { now_ms, .. } | RegisterNode { now_ms, .. } | DeregisterNode { now_ms, .. }
+            | UpdateNodeStatus { now_ms, .. } | QuarantineNode { now_ms, .. }
+            | UnquarantineNode { now_ms, .. } | UpdateConfig { now_ms, .. } | UpsertVolume { now_ms, .. }
+            | DeleteVolume { now_ms, .. } | ReportScrubResult { now_ms, .. }
+            | ReleaseWriteLease { now_ms, .. } => {
+                assert_eq!(*now_ms, 0, "{}", variant_name(r));
+                seen += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(seen, 11);
 }
 
 fn snap_volume_version() -> u64 {

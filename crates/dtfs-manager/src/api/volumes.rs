@@ -165,7 +165,7 @@ pub(super) async fn create_volume(
     };
 
     // Some(0) = "must not exist": a concurrent create loses with 409.
-    let req = ClientRequest::UpsertVolume { config, expected_version: Some(0) };
+    let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config, expected_version: Some(0) };
     let resp = state.raft.client_write(req).await
         .map_err(|e| err_body(StatusCode::SERVICE_UNAVAILABLE, format!("raft write failed: {e}")))?;
     volume_cas_check(&resp.data)?;
@@ -224,7 +224,7 @@ pub(super) async fn migrate_volume_policy_endpoint(
     let changed = current != migrated;
 
     if changed {
-        let req = ClientRequest::UpsertVolume { config: migrated.clone(), expected_version: Some(current.version) };
+        let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: migrated.clone(), expected_version: Some(current.version) };
         let resp = match state.raft.client_write(req).await {
             Ok(r) => r,
             Err(e) => {
@@ -438,7 +438,7 @@ pub(super) async fn set_volume_cache_endpoint(
 
     let changed = current != next;
     if changed {
-        let req = ClientRequest::UpsertVolume { config: next.clone(), expected_version: Some(current.version) };
+        let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: next.clone(), expected_version: Some(current.version) };
         let resp = match state.raft.client_write(req).await {
             Ok(r) => r,
             Err(e) => {
@@ -545,7 +545,7 @@ pub(super) async fn set_volume_write_safety_endpoint(
 
     let changed = current != next;
     if changed {
-        let req = ClientRequest::UpsertVolume { config: next.clone(), expected_version: Some(current.version) };
+        let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: next.clone(), expected_version: Some(current.version) };
         let resp = match state.raft.client_write(req).await {
             Ok(r) => r,
             Err(e) => {
@@ -838,7 +838,7 @@ pub(super) async fn set_volume_anchor_endpoint(
 
     let changed = current != next;
     if changed {
-        let req = ClientRequest::UpsertVolume { config: next.clone(), expected_version: Some(current.version) };
+        let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: next.clone(), expected_version: Some(current.version) };
         let resp = match state.raft.client_write(req).await {
             Ok(r) => r,
             Err(e) => {
@@ -944,7 +944,7 @@ pub(super) async fn set_volume_spill_endpoint(
 
     let changed = current != next;
     if changed {
-        let req = ClientRequest::UpsertVolume { config: next.clone(), expected_version: Some(current.version) };
+        let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: next.clone(), expected_version: Some(current.version) };
         let resp = match state.raft.client_write(req).await {
             Ok(r) => r,
             Err(e) => {
@@ -1008,7 +1008,7 @@ pub(super) async fn set_volume_mandatory_endpoint(
 
     let changed = current != next;
     if changed {
-        let req = ClientRequest::UpsertVolume { config: next.clone(), expected_version: Some(current.version) };
+        let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: next.clone(), expected_version: Some(current.version) };
         let resp = match state.raft.client_write(req).await {
             Ok(r) => r,
             Err(e) => {

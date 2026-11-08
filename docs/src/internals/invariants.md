@@ -217,6 +217,28 @@ set-* handlers pass the version they read and map a committed Error to 409.
 disk-keyed `RemoveCorruptChunkReplicas` per disk; absent = node-wide legacy.
 Heartbeat `IntegrityFault` still carries no disk id.
 
+### Data-node / apply hardening (w3data)
+
+Orphan reaper: `DeleteChunkRequest.if_mtime_le_ms` (optional) = the `.dat`
+mtime from `ListChunks`; under the chunk lock the data node skips the delete
+(`was_present=false`) when the file is newer (re-upload race). `VerifyChunkRequest.disk_id`
+(optional) verifies only that disk's copy; migration passes the landed disk.
+Scrub and `verify_on_read` judge `.dat` against the chunk id (content address);
+a `.meta` that disagrees but whose `.dat` hashes to the id is repaired, not
+quarantined. Scrub quarantines each detection per bucket via
+`confirm_and_quarantine` (chunk lock, re-hash, rename). Startup quarantine
+re-report skips only when the SAME disk has a live `.dat`.
+Apply: `RemoveCorruptChunkReplicas` never removes the last row of a
+(file, chunk_index) (audit row instead). Lease-less `UpdateChunkLocations`
+(union) skips indexes with no rows, never grows `logical_size`, and returns
+`ClientResponse::Error` when any index was skipped (valid rows still merge), so
+a lease-less initial add is refused. Audited variants without a timestamp
+(`DeleteFile`, `RegisterNode`, `DeregisterNode`, `UpdateNodeStatus`,
+`QuarantineNode`, `UnquarantineNode`, `UpdateConfig`, `UpsertVolume`,
+`DeleteVolume`, `ReportScrubResult`, `ReleaseWriteLease`) now carry
+`#[serde(default)] now_ms` stamped by the proposer; `0` falls back to
+`log_id.index`.
+
 ### `dtfs-raft/src/network.rs::full_snapshot`
 
 Bug CL: network failures here (peer unreachable / timeout / empty

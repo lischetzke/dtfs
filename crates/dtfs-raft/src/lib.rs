@@ -303,6 +303,10 @@ pub enum ClientRequest {
     },
     DeleteFile {
         path: String,
+        /// Proposer wall-clock for the audit row (A.3.1 / CR-2-5); `0` =
+        /// legacy entry, apply falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
     },
     UpdateChunkLocations {
         path: String,
@@ -354,13 +358,25 @@ pub enum ClientRequest {
     RegisterNode {
         node_id: u64,
         info: NodeInfo,
+        /// Proposer wall-clock for the audit row (A.3.1 / CR-2-5); `0` =
+        /// legacy entry, apply falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
     },
     DeregisterNode {
         node_id: u64,
+        /// Proposer wall-clock for the audit row (A.3.1 / CR-2-5); `0` =
+        /// legacy entry, apply falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
     },
     UpdateNodeStatus {
         node_id: u64,
         status: String,
+        /// Proposer wall-clock for the audit row (A.3.1 / CR-2-5); `0` =
+        /// legacy entry, apply falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
     },
 
     /// Bug BC-10 — quarantine a node after an integrity fault.
@@ -372,6 +388,10 @@ pub enum ClientRequest {
     QuarantineNode {
         node_id: u64,
         info: dtfs_common::types::QuarantineInfo,
+        /// Proposer wall-clock for the audit row (A.3.1 / CR-2-5); `0` =
+        /// legacy entry, apply falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
     },
 
     /// Bug BC-12 — operator-driven unquarantine. Apply path clears
@@ -382,6 +402,10 @@ pub enum ClientRequest {
         node_id: u64,
         operator_id: String,
         reason_acknowledged: String,
+        /// Proposer wall-clock for the audit row (A.3.1 / CR-2-5); `0` =
+        /// legacy entry, apply falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
     },
 
     /// Heartbeat-derived usage counters for a data node (best-effort).
@@ -419,6 +443,10 @@ pub enum ClientRequest {
         /// `version 0`), and that write MUST still be CAS-checked.
         #[serde(default = "update_config_no_cas")]
         expected_version: u64,
+        /// Proposer wall-clock for the audit row (A.3.1 / CR-2-5); `0` =
+        /// legacy entry, apply falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
     },
 
     /// Create or update a volume configuration.
@@ -429,10 +457,18 @@ pub enum ClientRequest {
         /// `None` (old log entries, create, bootstrap) is an unconditional upsert.
         #[serde(default)]
         expected_version: Option<u64>,
+        /// Proposer wall-clock for the audit row (A.3.1 / CR-2-5); `0` =
+        /// legacy entry, apply falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
     },
     /// Remove a volume configuration.
     DeleteVolume {
         volume_id: String,
+        /// Proposer wall-clock for the audit row (A.3.1 / CR-2-5); `0` =
+        /// legacy entry, apply falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
     },
 
     // ---- Observability operations ----
@@ -454,6 +490,10 @@ pub enum ClientRequest {
         chunks_corrupt: u64,
         chunks_missing: u64,
         duration_secs: f64,
+        /// Proposer wall-clock for the audit row (A.3.1 / CR-2-5); `0` =
+        /// legacy entry, apply falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
     },
 
     /// Persist migration-scheduler state as a dedicated Raft entry.
@@ -547,6 +587,10 @@ pub enum ClientRequest {
     ReleaseWriteLease {
         path: String,
         lease_id: String,
+        /// Proposer wall-clock for the audit row (A.3.1 / CR-2-5); `0` =
+        /// legacy entry, apply falls back to `log_id.index`.
+        #[serde(default)]
+        now_ms: u64,
     },
     /// Garbage-collect orphan leases from a crashed FUSE process. Releases
     /// every lease whose `owner_id` starts with `hostname_prefix`, whose
@@ -709,7 +753,7 @@ impl fmt::Display for ClientRequest {
             Self::CreateFile { path, volume_id, .. } => {
                 write!(f, "CreateFile({path}, vol={volume_id})")
             }
-            Self::DeleteFile { path } => write!(f, "DeleteFile({path})"),
+            Self::DeleteFile { path, .. } => write!(f, "DeleteFile({path})"),
             Self::UpdateChunkLocations { path, chunks, lease_id, .. } => {
                 let lease_marker = if lease_id.is_empty() {
                     "no-lease".to_string()
@@ -724,11 +768,11 @@ impl fmt::Display for ClientRequest {
                 chunk_hashes.len()
             ),
             Self::RegisterNode { node_id, .. } => write!(f, "RegisterNode({node_id})"),
-            Self::DeregisterNode { node_id } => write!(f, "DeregisterNode({node_id})"),
-            Self::UpdateNodeStatus { node_id, status } => {
+            Self::DeregisterNode { node_id, .. } => write!(f, "DeregisterNode({node_id})"),
+            Self::UpdateNodeStatus { node_id, status, .. } => {
                 write!(f, "UpdateNodeStatus({node_id}, {status})")
             }
-            Self::QuarantineNode { node_id, info } => {
+            Self::QuarantineNode { node_id, info, .. } => {
                 write!(f, "QuarantineNode({node_id}, {:?})", info.reason)
             }
             Self::UnquarantineNode { node_id, operator_id, .. } => {
@@ -749,7 +793,7 @@ impl fmt::Display for ClientRequest {
             }
             Self::UpdateConfig { version, .. } => write!(f, "UpdateConfig(v{version})"),
             Self::UpsertVolume { config, .. } => write!(f, "UpsertVolume({})", config.id),
-            Self::DeleteVolume { volume_id } => write!(f, "DeleteVolume({volume_id})"),
+            Self::DeleteVolume { volume_id, .. } => write!(f, "DeleteVolume({volume_id})"),
             Self::ReportScrubResult { node_id, level, chunks_checked, chunks_corrupt, .. } => {
                 write!(f, "ReportScrubResult(node={node_id}, {level}, checked={chunks_checked}, corrupt={chunks_corrupt})")
             }
@@ -779,7 +823,7 @@ impl fmt::Display for ClientRequest {
                 f,
                 "RenewWriteLease({path}, lease_id={lease_id}, ext_ms={extension_ms})"
             ),
-            Self::ReleaseWriteLease { path, lease_id } => {
+            Self::ReleaseWriteLease { path, lease_id, .. } => {
                 write!(f, "ReleaseWriteLease({path}, lease_id={lease_id})")
             }
             Self::ReleaseLeasesByHost { hostname_prefix, except_pid, now_ms } => write!(

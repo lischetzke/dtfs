@@ -29,7 +29,9 @@ text there.
 
 ## Replica lifecycle
 
-6. Migration marks Done only after `VerifyChunk` on the target. Every
+6. Migration marks Done only after `VerifyChunk` on the target (disk-targeted
+   via the landed disk id). `RemoveCorruptChunkReplicas` never removes the last
+   row of a (file, chunk_index). Every
    de-location goes through `scheduler::delocate_replica`: Raft
    `RemoveChunkLocation` FIRST, byte delete AFTER; a failed OR
    state-machine-refused Raft remove (`raft_write_checked` /
@@ -39,12 +41,16 @@ text there.
    target reported (`ReplicateChunkResponse.disk_id`) and sends only the
    new row (apply is a union for lease-less writes). Data disk ids persist
    in `.dtfs-disk-id`.
-7. Scrub hashes `.dat` vs `checksum`. Missing/unparseable `.meta` is first
+7. Scrub hashes `.dat` vs `checksum`; on a `.meta` mismatch it re-hashes vs the
+   chunk id and repairs `.meta` (only an id mismatch is corruption;
+   `verify_on_read` also compares to the id). Quarantine runs per bucket under
+   the chunk lock after a fresh re-hash (`confirm_and_quarantine`). Missing/unparseable `.meta` is first
    repaired from the `.dat` when the re-hash matches the id; only a
    digest mismatch or unreadable `.dat` quarantines, by RENAMING to
    `.dtfs/quarantine/<id>.dat.bad`, never `remove_file`.
 8. Unlink removes `FileMetadata` first and does NOT fan out deletes; the
-   orphan reaper reclaims bytes. The reaper re-reads the node view after
+   orphan reaper reclaims bytes, passing the listed `.dat` mtime as
+   `DeleteChunkRequest.if_mtime_le_ms` (data node skips a newer, re-uploaded copy). The reaper re-reads the node view after
    `ListChunks` and never de-locates a chunk recorded under another disk
    of the same node. Orphan/de-located reap grace is measured on the on-disk `.dat` mtime, keyed by
    `(node_id, disk_id)` when the data node reports disk ids (node-wide

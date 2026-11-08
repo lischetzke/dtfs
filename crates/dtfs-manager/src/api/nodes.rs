@@ -556,7 +556,7 @@ pub(super) async fn set_maintenance(
         "healthy"
     };
 
-    let req = ClientRequest::UpdateNodeStatus {
+    let req = ClientRequest::UpdateNodeStatus { now_ms: crate::metadata::stamp_now_ms(),
         node_id: nid,
         status: status_str.to_string(),
     };
@@ -649,7 +649,7 @@ pub(super) async fn unquarantine_node_endpoint(
         }
     }
 
-    let req = ClientRequest::UnquarantineNode {
+    let req = ClientRequest::UnquarantineNode { now_ms: crate::metadata::stamp_now_ms(),
         node_id: nid,
         operator_id: op.to_string(),
         reason_acknowledged: body.reason_acknowledged.clone(),
@@ -732,7 +732,7 @@ pub(super) async fn decommission_node_endpoint(
 
     let resp = state
         .raft
-        .client_write(ClientRequest::DeregisterNode { node_id: nid })
+        .client_write(ClientRequest::DeregisterNode { now_ms: crate::metadata::stamp_now_ms(), node_id: nid })
         .await
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": format!("raft write failed: {e}")}))))?;

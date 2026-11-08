@@ -38,7 +38,7 @@ mod mgr_11_forward_allow_list_tests {
 
     #[test]
     fn update_config_is_not_forwardable() {
-        assert!(!forwardable(&ClientRequest::UpdateConfig {
+        assert!(!forwardable(&ClientRequest::UpdateConfig { now_ms: 0,
             config_json: "{}".into(),
             version: 0,
             expected_version: u64::MAX,
@@ -59,7 +59,7 @@ mod mgr_11_forward_allow_list_tests {
 
     #[test]
     fn update_node_status_is_forwardable() {
-        assert!(forwardable(&ClientRequest::UpdateNodeStatus {
+        assert!(forwardable(&ClientRequest::UpdateNodeStatus { now_ms: 0,
             node_id: 1,
             status: "Healthy".into(),
         }));

@@ -342,7 +342,7 @@ async fn main() -> anyhow::Result<()> {
                 version: 0,
             };
             match raft_for_volume
-                .client_write(dtfs_raft::ClientRequest::UpsertVolume { config: vol_cfg, expected_version: None })
+                .client_write(dtfs_raft::ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: vol_cfg, expected_version: None })
                 .await
             {
                 Ok(_) => tracing::info!(

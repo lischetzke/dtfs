@@ -277,7 +277,7 @@ mod snapshot_persistence_tests {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::UpsertVolume { config: volume.clone(), expected_version: None },
+            &ClientRequest::UpsertVolume { now_ms: 0, config: volume.clone(), expected_version: None },
         );
         apply_request(
             &mut sm,
@@ -294,7 +294,7 @@ mod snapshot_persistence_tests {
         apply_request(
             &mut sm,
             &mk_log_id(3),
-            &ClientRequest::UpsertVolume { config: shrunk, expected_version: None },
+            &ClientRequest::UpsertVolume { now_ms: 0, config: shrunk, expected_version: None },
         );
 
         let file = sm.files.get("/foo.bin").expect("file persisted");
@@ -347,14 +347,14 @@ mod snapshot_persistence_tests {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::UpsertVolume { config: volume.clone(), expected_version: None },
+            &ClientRequest::UpsertVolume { now_ms: 0, config: volume.clone(), expected_version: None },
         );
 
         volume.chunk_size_bytes = 4 * 1024 * 1024;
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::UpsertVolume { config: volume.clone(), expected_version: None },
+            &ClientRequest::UpsertVolume { now_ms: 0, config: volume.clone(), expected_version: None },
         );
 
         apply_request(
@@ -692,7 +692,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 10, info: mk_data_node_with_disk(0) },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 10, info: mk_data_node_with_disk(0) },
         );
         apply_request(
             &mut sm,
@@ -722,7 +722,7 @@ mod posix_path_regression {
 
         // Refused while node 10 still holds the replica.
         let refused =
-            apply_request(&mut sm, &mk_log_id(4), &ClientRequest::DeregisterNode { node_id: 10 });
+            apply_request(&mut sm, &mk_log_id(4), &ClientRequest::DeregisterNode { now_ms: 0, node_id: 10 });
         match refused {
             ClientResponse::Error { message } => {
                 assert!(message.contains("still holds chunk replicas"), "got: {message}")
@@ -735,13 +735,13 @@ mod posix_path_regression {
         // directly), then deregister succeeds and removes the node.
         sm.files.values_mut().for_each(|f| f.chunks.clear());
         let ok =
-            apply_request(&mut sm, &mk_log_id(6), &ClientRequest::DeregisterNode { node_id: 10 });
+            apply_request(&mut sm, &mk_log_id(6), &ClientRequest::DeregisterNode { now_ms: 0, node_id: 10 });
         assert!(matches!(ok, ClientResponse::Success), "drained node must deregister");
         assert!(!sm.nodes.contains_key(&10), "node removed after deregister");
 
         // Unknown node -> Error (idempotent safety, no panic).
         let unknown =
-            apply_request(&mut sm, &mk_log_id(7), &ClientRequest::DeregisterNode { node_id: 99 });
+            apply_request(&mut sm, &mk_log_id(7), &ClientRequest::DeregisterNode { now_ms: 0, node_id: 99 });
         assert!(matches!(unknown, ClientResponse::Error { .. }), "unknown node deregister is Error");
     }
 
@@ -981,7 +981,7 @@ mod posix_path_regression {
         apply_request(
             sm,
             &mk_log_id(idx),
-            &ClientRequest::UpsertVolume { config: v, expected_version: exp },
+            &ClientRequest::UpsertVolume { now_ms: 0, config: v, expected_version: exp },
         )
     }
 
@@ -1932,7 +1932,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_quarantinable_node() },
         );
         assert_eq!(count_register_audits(&sm), 1, "first register emits one row");
     }
@@ -1944,7 +1944,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 7, info: info.clone() },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: info.clone() },
         );
         // Re-register: only volatile fields differ (heartbeat-driven).
         let mut info2 = info;
@@ -1955,7 +1955,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::RegisterNode { node_id: 7, info: info2 },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: info2 },
         );
         assert_eq!(
             count_register_audits(&sm),
@@ -1971,14 +1971,14 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 7, info: info.clone() },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: info.clone() },
         );
         let mut info2 = info;
         info2.version = "v0.0.1-new".into(); // material identity field
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::RegisterNode { node_id: 7, info: info2 },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: info2 },
         );
         assert_eq!(
             count_register_audits(&sm),
@@ -1997,12 +1997,12 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_quarantinable_node() },
         );
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::QuarantineNode {
+            &ClientRequest::QuarantineNode { now_ms: 0,
                 node_id: 7,
                 info: mk_quarantine_info(QuarantineReason::DeepScrubHashMismatch),
             },
@@ -2014,7 +2014,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(3),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_quarantinable_node() },
         );
         let node = sm.nodes.get(&7).expect("node still registered");
         assert_eq!(node.health, HealthStatus::Quarantined,
@@ -2030,18 +2030,18 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_quarantinable_node() },
         );
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::UpdateNodeStatus { node_id: 7, status: "maintenance".into() },
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "maintenance".into() },
         );
         assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Maintenance);
         apply_request(
             &mut sm,
             &mk_log_id(3),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_quarantinable_node() },
         );
         assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Maintenance,
             "re-register must not clear Maintenance");
@@ -2054,12 +2054,12 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_quarantinable_node() },
         );
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_quarantinable_node() },
         );
         assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Healthy);
     }
@@ -2083,7 +2083,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 42, info: info.clone() },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 42, info: info.clone() },
         );
         assert_eq!(
             sm.nodes.get(&42).map(|n| n.version.as_str()),
@@ -2098,7 +2098,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::RegisterNode { node_id: 42, info: beat },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 42, info: beat },
         );
         assert_eq!(
             count_register_audits(&sm),
@@ -2112,7 +2112,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(3),
-            &ClientRequest::RegisterNode { node_id: 42, info: upgraded },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 42, info: upgraded },
         );
         assert_eq!(
             count_register_audits(&sm),
@@ -2131,7 +2131,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::ReportScrubResult {
+            &ClientRequest::ReportScrubResult { now_ms: 0,
                 node_id: 5,
                 disk_path: "/mnt/data01-warm".into(),
                 level: "quick".into(),
@@ -2155,7 +2155,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::ReportScrubResult {
+            &ClientRequest::ReportScrubResult { now_ms: 0,
                 node_id: 5,
                 disk_path: "/mnt/data01-warm".into(),
                 level: "deep".into(),
@@ -2196,12 +2196,12 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_data_node_with_disk(100) },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_data_node_with_disk(100) },
         );
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_data_node_with_disk(999_999) },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_data_node_with_disk(999_999) },
         );
         assert_eq!(
             count_register_audits(&sm),
@@ -2217,14 +2217,14 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_data_node_with_disk(100) },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_data_node_with_disk(100) },
         );
         let mut changed = mk_data_node_with_disk(100);
         changed.disks[0].status = dtfs_common::types::DiskStatus::Failed;
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::RegisterNode { node_id: 7, info: changed },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: changed },
         );
         assert_eq!(
             count_register_audits(&sm),
@@ -2274,12 +2274,12 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 7, info: n1 },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: n1 },
         );
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::RegisterNode { node_id: 7, info: n2 },
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: n2 },
         );
         assert_eq!(
             count_register_audits(&sm),
@@ -2298,7 +2298,7 @@ mod posix_path_regression {
         let resp = apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::QuarantineNode { node_id: 42, info: info.clone() },
+            &ClientRequest::QuarantineNode { now_ms: 0, node_id: 42, info: info.clone() },
         );
         assert!(matches!(resp, ClientResponse::Success));
 
@@ -2343,7 +2343,7 @@ mod posix_path_regression {
             apply_request(
                 &mut sm,
                 &mk_log_id(i),
-                &ClientRequest::QuarantineNode {
+                &ClientRequest::QuarantineNode { now_ms: 0,
                     node_id: 7,
                     info: mk_quarantine_info(QuarantineReason::DeepScrubHashMismatch),
                 },
@@ -2362,7 +2362,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::QuarantineNode {
+            &ClientRequest::QuarantineNode { now_ms: 0,
                 node_id: 9,
                 info: mk_quarantine_info(QuarantineReason::QuickScrubMissingDat),
             },
@@ -2372,7 +2372,7 @@ mod posix_path_regression {
         let resp = apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::UnquarantineNode {
+            &ClientRequest::UnquarantineNode { now_ms: 0,
                 node_id: 9,
                 operator_id: "alice".into(),
                 reason_acknowledged: "disk swapped + bitrot test passed".into(),
@@ -2412,7 +2412,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::QuarantineNode {
+            &ClientRequest::QuarantineNode { now_ms: 0,
                 node_id: 2,
                 info: mk_quarantine_info(QuarantineReason::VerifyOnReadMismatch),
             },
@@ -2440,7 +2440,7 @@ mod posix_path_regression {
         let resp = apply_request(
             &mut sm,
             &mk_log_id(1),
-            &ClientRequest::QuarantineNode {
+            &ClientRequest::QuarantineNode { now_ms: 0,
                 node_id: 999,
                 info: mk_quarantine_info(QuarantineReason::OrphanScrubInStateMissing),
             },
@@ -2451,7 +2451,7 @@ mod posix_path_regression {
     // ── Bug BK — scrub results per (node, level) ────────────────────
 
     fn mk_scrub_req(node_id: u64, level: &str, completed_at_ms: u64) -> ClientRequest {
-        ClientRequest::ReportScrubResult {
+        ClientRequest::ReportScrubResult { now_ms: 0,
             node_id,
             disk_path: "/mnt/d0".into(),
             level: level.into(),
@@ -2533,7 +2533,7 @@ mod posix_path_regression {
     fn bug_bn2_update_node_usage_emits_no_audit() {
         let mut sm = StateMachineData::default();
         apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() });
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_quarantinable_node() });
         let before = sm.audit_log.len();
         apply_request(&mut sm, &mk_log_id(2), &ClientRequest::UpdateNodeUsage {
             node_id: 7, used_capacity: 123, chunk_count: 4,
@@ -2547,13 +2547,13 @@ mod posix_path_regression {
     fn bug_bn2_update_node_status_no_audit_without_transition() {
         let mut sm = StateMachineData::default();
         apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() });
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_quarantinable_node() });
         // mk_quarantinable_node() is Healthy; applying "healthy" twice is a
         // no-op transition each time.
         apply_request(&mut sm, &mk_log_id(2),
-            &ClientRequest::UpdateNodeStatus { node_id: 7, status: "healthy".into() });
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "healthy".into() });
         apply_request(&mut sm, &mk_log_id(3),
-            &ClientRequest::UpdateNodeStatus { node_id: 7, status: "healthy".into() });
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "healthy".into() });
         assert_eq!(count_audit_prefix(&sm, "UpdateNodeStatus:"), 0,
             "Healthy -> Healthy must not audit");
     }
@@ -2562,11 +2562,11 @@ mod posix_path_regression {
     fn bug_bn2_update_node_status_audits_real_transition() {
         let mut sm = StateMachineData::default();
         apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RegisterNode { node_id: 7, info: mk_quarantinable_node() });
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_quarantinable_node() });
         apply_request(&mut sm, &mk_log_id(2),
-            &ClientRequest::UpdateNodeStatus { node_id: 7, status: "suspect".into() });
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "suspect".into() });
         apply_request(&mut sm, &mk_log_id(3),
-            &ClientRequest::UpdateNodeStatus { node_id: 7, status: "healthy".into() });
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "healthy".into() });
         assert_eq!(count_audit_prefix(&sm, "UpdateNodeStatus:"), 2,
             "Healthy->Suspect then Suspect->Healthy = two transitions = two rows");
     }
@@ -2717,7 +2717,7 @@ mod posix_path_regression {
         });
         assert!(sm.write_leases.contains_key("/f"));
         let resp = apply_request(&mut sm, &mk_log_id(3),
-            &ClientRequest::DeleteFile { path: "/f".into() });
+            &ClientRequest::DeleteFile { now_ms: 0, path: "/f".into() });
         assert!(matches!(resp, ClientResponse::Success));
         assert!(!sm.files.contains_key("/f"));
         assert!(!sm.write_leases.contains_key("/f"),
@@ -2734,7 +2734,7 @@ mod posix_path_regression {
             path: "/a/x".into(), volume_id: "default".into(), chunk_size: 4096,
         });
         let resp = apply_request(&mut sm, &mk_log_id(3),
-            &ClientRequest::DeleteFile { path: "/a".into() });
+            &ClientRequest::DeleteFile { now_ms: 0, path: "/a".into() });
         assert!(matches!(resp, ClientResponse::Error { .. }),
             "rmdir of a non-empty directory must be refused, got {resp:?}");
         assert!(sm.files.contains_key("/a"), "dir survives refusal");
@@ -2748,7 +2748,7 @@ mod posix_path_regression {
     fn raft_8_update_config_version_always_current_plus_one() {
         let mut sm = StateMachineData::default();
         sm.cluster_config = ClusterConfig { config_json: "{}".into(), version: 5 };
-        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::UpdateConfig {
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::UpdateConfig { now_ms: 0,
             config_json: "{\"a\":1}".into(),
             version: 1, // stale/regressive wire value
             expected_version: 5,
@@ -2828,7 +2828,7 @@ mod posix_path_regression {
     #[test]
     fn raft_9_non_finite_duration_is_clamped_to_zero() {
         let mut sm = StateMachineData::default();
-        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::ReportScrubResult {
+        apply_request(&mut sm, &mk_log_id(1), &ClientRequest::ReportScrubResult { now_ms: 0,
             node_id: 7,
             disk_path: "/data".into(),
             level: "quick".into(),
@@ -3224,12 +3224,12 @@ mod audit_co_tests {
         assert_eq!(sm.cluster_config.version, 0);
 
         // Both writers read base version 0 and build version 1.
-        let first = ClientRequest::UpdateConfig {
+        let first = ClientRequest::UpdateConfig { now_ms: 0,
             config_json: r#"{"a":1}"#.into(),
             version: 1,
             expected_version: 0,
         };
-        let second = ClientRequest::UpdateConfig {
+        let second = ClientRequest::UpdateConfig { now_ms: 0,
             config_json: r#"{"b":2}"#.into(),
             version: 1,
             expected_version: 0,
@@ -3265,7 +3265,7 @@ mod audit_co_tests {
         let req: ClientRequest =
             serde_json::from_str(legacy).expect("legacy UpdateConfig must deserialise");
         match &req {
-            ClientRequest::UpdateConfig { expected_version, version, .. } => {
+            ClientRequest::UpdateConfig { now_ms: 0, expected_version, version, .. } => {
                 assert_eq!(
                     *expected_version,
                     crate::UPDATE_CONFIG_NO_CAS,
@@ -3303,12 +3303,12 @@ mod audit_co_tests {
         let mut sm = StateMachineData::default();
         assert_eq!(sm.cluster_config.version, 0);
 
-        let first = ClientRequest::UpdateConfig {
+        let first = ClientRequest::UpdateConfig { now_ms: 0,
             config_json: r#"{"a":1}"#.into(),
             version: 1,
             expected_version: 0,
         };
-        let second = ClientRequest::UpdateConfig {
+        let second = ClientRequest::UpdateConfig { now_ms: 0,
             config_json: r#"{"b":2}"#.into(),
             version: 1,
             expected_version: 0,
@@ -3614,7 +3614,7 @@ mod raft_audit_fix_tests {
                                 assert!(sm.files["/f"].chunks.contains(e), "seed {seed}");
                             }
                         }
-                        apply_request(&mut sm, &lid(idx), &ClientRequest::ReleaseWriteLease {
+                        apply_request(&mut sm, &lid(idx), &ClientRequest::ReleaseWriteLease { now_ms: 0,
                             path: "/f".into(), lease_id: "L".into(),
                         });
                     }
@@ -3641,7 +3641,11 @@ mod raft_audit_fix_tests {
     #[test]
     fn audit_timestamp_is_independent_of_wall_clock() {
         let reqs = vec![
-            ClientRequest::DeleteVolume { volume_id: "v".into() },
+            // Legacy entry (now_ms 0) falls back to the log index; a
+            // proposer-stamped one is used as the audit timestamp.
+            ClientRequest::DeleteVolume { now_ms: 0, volume_id: "v".into() },
+            ClientRequest::DeleteVolume { now_ms: 888, volume_id: "v".into() },
+            ClientRequest::DeleteFile { now_ms: 999, path: "/f".into() },
             ClientRequest::SweepExpiredLeases { now_ms: 777 },
             ClientRequest::AcquireWriteLease {
                 path: "/f".into(), owner_id: "o".into(), lease_ms: 10, now_ms: 555,
@@ -3670,6 +3674,8 @@ mod raft_audit_fix_tests {
             let expect = match req {
                 ClientRequest::SweepExpiredLeases { .. } => 777,
                 ClientRequest::AcquireWriteLease { .. } => 555,
+                ClientRequest::DeleteVolume { now_ms: 888, .. } => 888,
+                ClientRequest::DeleteFile { .. } => 999,
                 _ => 40 + n as u64,
             };
             assert!(first.iter().all(|(_, t)| *t == expect), "{first:?} want {expect}");

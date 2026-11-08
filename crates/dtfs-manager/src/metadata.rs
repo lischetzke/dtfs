@@ -28,7 +28,7 @@ static WARNED_SUBHOUR_SCRUB_CADENCE: std::sync::atomic::AtomicBool =
 /// RAFT-4 — proposer wall-clock stamped into the `now_ms` field of the
 /// seven ClientRequest variants apply now applies deterministically
 /// (see `dtfs-raft/src/state_machine.rs`'s `audit_at`/`eff_now_ms`).
-fn stamp_now_ms() -> u64 {
+pub(crate) fn stamp_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1413,7 +1413,7 @@ impl ManagerService for MetadataService {
         };
 
         let resp = self
-            .raft_write(ClientRequest::RegisterNode { node_id, info })
+            .raft_write(ClientRequest::RegisterNode { now_ms: stamp_now_ms(), node_id, info })
             .await?;
 
         if let ClientResponse::Error { message } = resp {
@@ -1584,7 +1584,7 @@ impl ManagerService for MetadataService {
             // MGR-HB-1 — same contract as the UpdateNodeUsage write above:
             // a dropped `healthy` commit leaves a recovered node Down.
             liveness_write_status(
-                self.raft_write_or_forward(ClientRequest::UpdateNodeStatus {
+                self.raft_write_or_forward(ClientRequest::UpdateNodeStatus { now_ms: stamp_now_ms(),
                     node_id,
                     status: "healthy".to_string(),
                 })
@@ -1699,7 +1699,7 @@ impl ManagerService for MetadataService {
                 true
             } else {
                 match self
-                    .raft_write_or_forward(ClientRequest::QuarantineNode { node_id, info })
+                    .raft_write_or_forward(ClientRequest::QuarantineNode { now_ms: stamp_now_ms(), node_id, info })
                     .await
                     .pipe_committed_ok()
                 {
@@ -1757,7 +1757,7 @@ impl ManagerService for MetadataService {
         if !req.scrub_results.is_empty() {
             for s in &req.scrub_results {
                 let _ = self
-                    .raft_write_or_forward(ClientRequest::ReportScrubResult {
+                    .raft_write_or_forward(ClientRequest::ReportScrubResult { now_ms: stamp_now_ms(),
                         node_id,
                         disk_path: s.disk_path.clone(),
                         level: s.level.clone(),
@@ -1873,7 +1873,7 @@ impl ManagerService for MetadataService {
         // surface failure as `accepted: false` so the data node retries.
         let mut accepted = true;
         if let Err(e) = self
-            .raft_write_or_forward(ClientRequest::UpdateNodeStatus {
+            .raft_write_or_forward(ClientRequest::UpdateNodeStatus { now_ms: stamp_now_ms(),
                 node_id: node_id_u64,
                 status: status.to_string(),
             })
@@ -2080,7 +2080,7 @@ impl ManagerService for MetadataService {
         // chunk" re-check races it and deletes a just-committed file's
         // bytes. The mtime-graced orphan reaper reclaims the space.
         let resp = self
-            .raft_write(ClientRequest::DeleteFile {
+            .raft_write(ClientRequest::DeleteFile { now_ms: stamp_now_ms(),
                 path: req.path.clone(),
             })
             .await?;
@@ -3047,7 +3047,7 @@ impl ManagerService for MetadataService {
         )?;
         let req = request.into_inner();
         let _ = self
-            .raft_write(ClientRequest::ReleaseWriteLease {
+            .raft_write(ClientRequest::ReleaseWriteLease { now_ms: stamp_now_ms(),
                 path: req.path,
                 lease_id: req.lease_id,
             })

@@ -988,6 +988,17 @@ fn apply_request(
         ClientRequest::AcquireWriteLease { now_ms, .. }
         | ClientRequest::ReleaseLeasesByHost { now_ms, .. }
         | ClientRequest::SweepExpiredLeases { now_ms }
+        | ClientRequest::DeleteFile { now_ms, .. }
+        | ClientRequest::RegisterNode { now_ms, .. }
+        | ClientRequest::DeregisterNode { now_ms, .. }
+        | ClientRequest::UpdateNodeStatus { now_ms, .. }
+        | ClientRequest::QuarantineNode { now_ms, .. }
+        | ClientRequest::UnquarantineNode { now_ms, .. }
+        | ClientRequest::UpdateConfig { now_ms, .. }
+        | ClientRequest::UpsertVolume { now_ms, .. }
+        | ClientRequest::DeleteVolume { now_ms, .. }
+        | ClientRequest::ReportScrubResult { now_ms, .. }
+        | ClientRequest::ReleaseWriteLease { now_ms, .. }
             if *now_ms != 0 =>
         {
             *now_ms
@@ -1142,7 +1153,7 @@ fn apply_request(
             }
         }
 
-        ClientRequest::DeleteFile { path } => {
+        ClientRequest::DeleteFile { path, .. } => {
             // RAFT-7 — a bare `sm.files.remove(path)` leaked the file's
             // write lease + posix locks forever (re-creating the same path
             // within `lease_ms` hit a stale WriteLeaseConflict), and never
@@ -1365,7 +1376,7 @@ fn apply_request(
             ClientResponse::Success
         }
 
-        ClientRequest::RegisterNode { node_id, info } => {
+        ClientRequest::RegisterNode { node_id, info, .. } => {
             use dtfs_common::types::HealthStatus;
             // Bug BJ — audit only on a NEW node or a materially-changed
             // re-registration. node_id is deterministic
@@ -1417,7 +1428,7 @@ fn apply_request(
             ClientResponse::Success
         }
 
-        ClientRequest::DeregisterNode { node_id } => {
+        ClientRequest::DeregisterNode { node_id, .. } => {
             // Integrity (A.6 #5): never drop a node that still holds chunk
             // replicas. Removing it from sm.nodes would dangle its location
             // entries and silently lower the replication factor with no
@@ -1447,7 +1458,7 @@ fn apply_request(
             }
         }
 
-        ClientRequest::UpdateNodeStatus { node_id, status } => {
+        ClientRequest::UpdateNodeStatus { node_id, status, .. } => {
             use dtfs_common::types::HealthStatus;
             if let Some(node) = sm.nodes.get_mut(node_id) {
                 // Bug BF-6 — refuse to overwrite Quarantined via the
@@ -1498,7 +1509,7 @@ fn apply_request(
             }
         }
 
-        ClientRequest::QuarantineNode { node_id, info } => {
+        ClientRequest::QuarantineNode { node_id, info, .. } => {
             use dtfs_common::types::HealthStatus;
             if let Some(node) = sm.nodes.get_mut(node_id) {
                 node.health = HealthStatus::Quarantined;
@@ -1544,7 +1555,7 @@ fn apply_request(
             }
         }
 
-        ClientRequest::UnquarantineNode { node_id, operator_id, reason_acknowledged } => {
+        ClientRequest::UnquarantineNode { node_id, operator_id, reason_acknowledged, .. } => {
             use dtfs_common::types::HealthStatus;
             if let Some(node) = sm.nodes.get_mut(node_id) {
                 node.quarantine = None;
@@ -1592,6 +1603,7 @@ fn apply_request(
             config_json,
             version: _, // RAFT-8 — apply always derives its own version.
             expected_version,
+            ..
         } => {
             // CO-5-10 — compare-and-set on the cluster-config version. The
             // proposer reads the current version, builds `version =
@@ -1628,7 +1640,7 @@ fn apply_request(
             ClientResponse::Success
         }
 
-        ClientRequest::UpsertVolume { config, expected_version } => {
+        ClientRequest::UpsertVolume { config, expected_version, .. } => {
             let vol_id = config.id.0.clone();
             let current = sm.volumes.get(&vol_id).map_or(0, |v| v.version);
             if let Some(exp) = expected_version {
@@ -1648,7 +1660,7 @@ fn apply_request(
             ClientResponse::Success
         }
 
-        ClientRequest::DeleteVolume { volume_id } => {
+        ClientRequest::DeleteVolume { volume_id, .. } => {
             sm.volumes.remove(volume_id);
             push_audit_capped(&mut sm.audit_log, audit(format!("DeleteVolume: {volume_id}")));
             ClientResponse::Success
@@ -1664,6 +1676,7 @@ fn apply_request(
             chunks_corrupt,
             chunks_missing,
             duration_secs,
+            ..
         } => {
             // RAFT-9 — serde_json serialises NaN/inf as `null`, which then
             // fails to deserialise as f64 on the very next snapshot load
@@ -2085,7 +2098,7 @@ fn apply_request(
             }
         }
 
-        ClientRequest::ReleaseWriteLease { path, lease_id } => {
+        ClientRequest::ReleaseWriteLease { path, lease_id, .. } => {
             if let Some(existing) = sm.write_leases.get(path) {
                 if existing.lease_id == *lease_id {
                     sm.write_leases.remove(path);

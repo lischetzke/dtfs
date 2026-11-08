@@ -82,7 +82,7 @@ impl TaskScheduler {
 
         let mut cleared = 0usize;
         for node_id in eligible {
-            let req = ClientRequest::UnquarantineNode {
+            let req = ClientRequest::UnquarantineNode { now_ms: crate::metadata::stamp_now_ms(),
                 node_id,
                 operator_id: "auto-cooldown".to_string(),
                 reason_acknowledged: format!(
@@ -497,7 +497,7 @@ impl TaskScheduler {
             last_fault_at_ms: now_ms,
             last_fault_summary: summary,
         };
-        let req = ClientRequest::QuarantineNode { node_id, info };
+        let req = ClientRequest::QuarantineNode { now_ms: crate::metadata::stamp_now_ms(), node_id, info };
         if let Err(e) = self.raft.client_write(req).await {
             warn!(
                 node = %node_id, error = %e,
