@@ -780,21 +780,6 @@ pub enum MigrationStatus {
     Failed,
 }
 
-/// Partition safety mode for FUSE clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PartitionMode {
-    Strict,
-    LocalReadOnly,
-    FullLock,
-}
-
-impl Default for PartitionMode {
-    fn default() -> Self {
-        Self::Strict
-    }
-}
-
 /// Failure domain level for replica placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

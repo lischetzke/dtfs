@@ -89,9 +89,9 @@ Parsed but **not read** by the client in this build; partition behaviour is not 
 
 | Key | Type | Default | Constraint |
 |---|---|---|---|
-| `mode` | string | `"strict"` | `strict`, `localreadonly`, `fulllock` (lowercase, no hyphens). Not read. |
-| `quorum_loss_timeout_secs` | u64 | `10` | **Validated**: > 0. Not otherwise read. |
-| `show_warning` | bool | `true` | Not read. |
+| `quorum_loss_timeout_secs` | u64 | `10` | **Validated**: > 0. Not otherwise read at runtime. |
+
+The former `mode` and `show_warning` keys were removed (never read); configs that still set them keep loading.
 
 ## `[tls]` (optional)
 

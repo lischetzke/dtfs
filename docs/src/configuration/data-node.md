@@ -7,7 +7,7 @@ File: `/etc/dtfs/data.toml`. Source of truth: `crates/dtfs-common/src/config.rs`
 - **Scope**: every data-node key is `node` (per host). The cluster-wide scrub policy comes from the manager and overrides `[scrub]` at runtime (see below).
 - **Reload**: no option is re-read while the process runs; change then restart ([Live Reload](./live-reload.md)).
 - **Validated**: the process refuses to start when the check fails.
-- Required tables: `[node]`, `[location]`, `[cluster]`, `[grpc]`, `[tls]`, `[cache]`, `[scrub]` and at least one `[[disks]]`. `[tls]`, `[cache]` and `[scrub]` may be empty. Optional: `[memory]`, `[placement]`, `[[tape_devices]]`, `[updater]` (CLI only).
+- Required tables: `[node]`, `[location]`, `[cluster]`, `[grpc]`, `[tls]`, `[scrub]` and at least one `[[disks]]`. `[tls]` and `[scrub]` may be empty. Optional: `[memory]`, `[placement]`, `[[tape_devices]]`, `[updater]` (CLI only).
 - Unknown keys are ignored silently; check spelling against this page.
 - Startup checks: `cluster.shared_secret` non-empty, `[memory]`, `[grpc]`, `[tls]` resolution, persistent disk ids.
 
@@ -64,14 +64,9 @@ path = "/mnt/ssd0"
 tier = "warm"
 ```
 
-## `[cache]`
+## `[cache]` (removed)
 
-Parsed for backward compatibility and **ignored**: the data node has no server-side chunk cache (reads stream from disk). Client-side caching is the FUSE `[cache]` disk cache.
-
-| Key | Type | Default |
-|---|---|---|
-| `max_memory_mb` | u64 | `8192` |
-| `policy` | string | `"arc"` |
+The data node has no server-side chunk cache (reads stream from disk). An old `[cache]` table (`max_memory_mb`, `policy`) is still accepted and ignored. Client-side caching is the FUSE `[cache]` disk cache.
 
 ## `[scrub]`
 
@@ -84,7 +79,6 @@ Local fallback used until the first heartbeat response arrives. From then on the
 | `max_io_percent` | u32 | `10` | Clamped to 1..=100 when applied. |
 | `verify_on_read` | bool | `true` | Hash every read before bytes leave the node. |
 | `quarantine_on_fault` | bool | `true` | `true`: a single integrity fault self-quarantines the node. `false`: faults are recorded and reported, the node does not self-quarantine. The manager applies the same switch on its side. |
-| `quick_cron`, `deep_cron` | string | unset | **Not read.** |
 | `quick_interval_secs`, `deep_interval_secs` | u64 | `0` | Internal: filled from the manager's heartbeat for sub-hour cadences. Do not set by hand. |
 
 Quarantined chunks are moved to `.dtfs/quarantine/<id>.dat.bad`, never deleted.

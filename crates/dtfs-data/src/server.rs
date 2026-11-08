@@ -1050,8 +1050,6 @@ max_io_percent = 10
             deep_interval_hours: 168,
             quick_interval_secs: 0,
             deep_interval_secs: 0,
-            quick_cron: None,
-            deep_cron: None,
             max_io_percent: 10,
             verify_on_read,
             quarantine_on_fault: true,
@@ -1105,25 +1103,14 @@ max_io_percent = 10
     /// 1 GB-capped node that phantom reservation collapsed the write
     /// path to a single in-flight chunk.
     ///
-    /// Invariant: **put_chunk slot sizing does not depend on
-    /// `cache.max_memory_mb`.**
+    /// Invariant: **put_chunk slot sizing has no cache reservation**
+    /// (`[cache]` is no longer parsed at all).
     #[test]
     fn rev_4_5_write_slots_ignore_phantom_arc_cache_budget() {
         let mut small = test_config(std::path::Path::new("/tmp/rev-4-5"));
         small.memory.hard_cap_mb = 1024;
-        small.cache.max_memory_mb = 16;
-        let mut large = small.clone();
-        large.cache.max_memory_mb = 768;
-
         let budget = MemoryBudget::from_config(&small.memory);
-        let with_small = plan_write_slots(&small, &budget);
-        let with_large = plan_write_slots(&large, &budget);
-
-        assert_eq!(
-            with_small, with_large,
-            "put_chunk concurrency must not change with the (unused) ARC \
-             cache budget: {with_small} vs {with_large}"
-        );
+        let with_large = plan_write_slots(&small, &budget);
         assert!(
             with_large > 1,
             "a 1 GB cap must still allow parallel streaming writes; got \
@@ -1837,8 +1824,6 @@ max_io_percent = 10
             deep_interval_hours: 168,
             quick_interval_secs: 0,
             deep_interval_secs: 0,
-            quick_cron: None,
-            deep_cron: None,
             max_io_percent: 10,
             verify_on_read: true,
             quarantine_on_fault: true,

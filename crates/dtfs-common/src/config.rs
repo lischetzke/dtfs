@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::topology::Location;
-use crate::types::{DiskTier, PartitionMode, TierReplication, WriteSafety};
+use crate::types::{DiskTier, TierReplication, WriteSafety};
 
 /// Manager node configuration (loaded from /etc/dtfs/manager.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,7 +188,6 @@ pub struct DataNodeConfig {
     pub grpc: GrpcConfig,
     pub tls: TlsConfig,
     pub disks: Vec<DiskConfig>,
-    pub cache: CacheConfig,
     pub scrub: ScrubConfig,
     /// Optional LTFS-backed tape devices for frozen/archival storage.
     /// Leave empty (or omit) if this node has no tape drives.
@@ -846,14 +845,6 @@ pub struct TapeDeviceConfig {
     pub max_write_mbps: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheConfig {
-    #[serde(default = "default_cache_memory")]
-    pub max_memory_mb: u64,
-    #[serde(default = "default_cache_policy")]
-    pub policy: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScrubConfig {
     #[serde(default = "default_quick_interval")]
@@ -873,8 +864,6 @@ pub struct ScrubConfig {
     /// See `quick_interval_secs`.
     #[serde(default)]
     pub deep_interval_secs: u64,
-    pub quick_cron: Option<String>,
-    pub deep_cron: Option<String>,
     #[serde(default = "default_scrub_io")]
     pub max_io_percent: u32,
     /// Bug BC — data-side mirror of `ClusterScrubConfig.verify_on_read`.
@@ -1184,12 +1173,9 @@ pub struct FuseCacheConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitionSafetyConfig {
-    #[serde(default)]
-    pub mode: PartitionMode,
+    /// Validated non-zero at startup but not acted on at runtime.
     #[serde(default = "default_quorum_timeout")]
     pub quorum_loss_timeout_secs: u64,
-    #[serde(default = "default_true")]
-    pub show_warning: bool,
 }
 
 // --- Default value functions ---
@@ -1322,12 +1308,6 @@ fn default_suspect_after() -> u32 {
 }
 fn default_down_after() -> u32 {
     6
-}
-fn default_cache_memory() -> u64 {
-    8192
-}
-fn default_cache_policy() -> String {
-    "arc".to_string()
 }
 fn default_quick_interval() -> u64 {
     6
@@ -1656,6 +1636,13 @@ mod tests {
         assert_eq!(r.snapshot_threshold, 7);
         let a: ApiConfig = toml::from_str("listen_addr = \"0.0.0.0:1\"\ncors_origins = [\"*\"]\n").unwrap();
         assert_eq!(a.listen_addr, "0.0.0.0:1");
+        // Scrub quick_cron/deep_cron and partition_safety mode/show_warning
+        // were never read either; the data [cache] table is ignored whole.
+        let s: ScrubConfig = toml::from_str("quick_cron = \"0 3 * * *\"\ndeep_cron = \"0 4 * * 0\"\n").unwrap();
+        assert_eq!(s.quick_interval_hours, 6);
+        let p: PartitionSafetyConfig =
+            toml::from_str("mode = \"strict\"\nshow_warning = true\nquorum_loss_timeout_secs = 7\n").unwrap();
+        assert_eq!(p.quorum_loss_timeout_secs, 7);
     }
 
     #[test]

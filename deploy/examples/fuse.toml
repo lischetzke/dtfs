@@ -78,9 +78,7 @@ mountpoint = "/mnt/dtfs"
 #prune_interval_secs = 3600
 
 [partition_safety]
-#mode = "strict"                    # "strict" | "localreadonly" | "fulllock"
-#quorum_loss_timeout_secs = 10
-#show_warning = true
+#quorum_loss_timeout_secs = 10      # validated only; not acted on at runtime
 
 #[tls]
 # CF-6: gRPC transport security toward managers and data nodes (mutual TLS
