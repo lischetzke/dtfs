@@ -1349,6 +1349,28 @@ mod bug_av_anchor_lag_tests {
         assert!(plan_anchor_lag_repair(&anchor, &done_p, &nodes, "h0", &HashSet::new()).is_none());
     }
 
+    /// An anchor-pending chunk that is OVER goal by count (extra warm copies
+    /// outside LELI) still yields no removal: the goal/anchor guard refuses,
+    /// not the total-count early return.
+    #[test]
+    fn over_goal_anchor_pending_chunk_has_no_removal() {
+        use crate::scheduler::plan_excess_spill_removal;
+        use dtfs_common::types::TierReplication;
+        let w = |n: u64, dc: &str| (n, 0u32, dc.to_string(), DiskTier::Warm);
+        // warm 2 / cold 1, four warm copies (4 > 3), none in LELI.
+        let cold_anchor = AnchorPolicy { datacenter: "leli".into(), required_tier: Some(DiskTier::Cold) };
+        let m = TierReplication { hot: 0, warm: 2, cold: 1, tape: 0 };
+        let reps = vec![w(11, "toro"), w(12, "nrb"), w(13, "nrb"), w(14, "toro")];
+        assert_eq!(plan_excess_spill_removal(&reps, &m, Some(&cold_anchor), 0), None);
+        // Anchor alone: warm 2 / cold 0, three warm (3 > 2), anchor any tier.
+        // Every tier count survives a removal, only the anchor refuses it.
+        let any_anchor = AnchorPolicy { datacenter: "leli".into(), required_tier: None };
+        let m = TierReplication { hot: 0, warm: 2, cold: 0, tape: 0 };
+        let reps = vec![w(11, "toro"), w(12, "nrb"), w(13, "nrb")];
+        assert_eq!(plan_excess_spill_removal(&reps, &m, Some(&any_anchor), 0), None);
+        assert!(plan_excess_spill_removal(&reps, &m, None, 0).is_some(), "control: no anchor -> removable");
+    }
+
     /// AV-3-3 test 2 — `required_tier = Cold` filters out a
     /// LELI warm node that *would* be in the anchor DC but on
     /// the wrong tier.

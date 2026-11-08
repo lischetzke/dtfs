@@ -1262,15 +1262,34 @@ mod tests {
 
     // ---- [write] anchor_sync = false (defer_anchor) ----
 
-    /// Same composition as `allocate_chunks`: ring placement on the volume's
-    /// first maintained tier (warm rf 2) with `allocation_anchor_dc`, then the
-    /// ack-floor fill (floor 2) ranked from the requester. Per-chunk targets.
+    /// Same composition as `allocate_chunks`: a deferred anchor uses
+    /// `deferred_anchor_targets` (when it finds any); otherwise ring placement
+    /// on the volume's first maintained tier (warm rf 2) with
+    /// `allocation_anchor_dc`, then the ack-floor fill (floor 2) ranked from
+    /// the requester. Per-chunk targets.
     async fn alloc_targets(sm: &StateMachineData, defer: bool, requester_dc: &str) -> Vec<Vec<String>> {
+        let vol = &sm.volumes["default"];
+        let anchor_dc = volume_anchor_dc(vol);
+        let anchor = allocation_anchor_dc(anchor_dc.clone(), defer, requester_dc);
+        if anchor_dc.is_some() && anchor.is_none() {
+            let t = deferred_anchor_targets(
+                &sm.nodes,
+                &vol.effective_mandatory_replicas(),
+                &spill_for_fill(&vol.spill, anchor_dc.as_deref()),
+                &dtfs_common::config::PlacementConfig::default(),
+                &Location::new("", requester_dc, "", ""),
+                DiskTier::Warm,
+                anchor_dc.as_deref().unwrap(),
+                2,
+                &std::collections::HashSet::new(),
+            );
+            if !t.is_empty() {
+                return vec![t; 8];
+            }
+        }
         let arc = Arc::new(tokio::sync::RwLock::new(sm.clone()));
         let engine = PlacementEngine::default();
         engine.rebuild_ring(&arc).await;
-        let vol = &sm.volumes["default"];
-        let anchor = allocation_anchor_dc(vol.anchor_datacenter.clone(), defer, requester_dc);
         let placed = engine.place_chunks_with_anchor("default", "/a", 8, DiskTier::Warm, 2, anchor);
         assert_eq!(placed.len(), 8);
         placed
@@ -1352,6 +1371,71 @@ mod tests {
         assert_eq!(allocation_anchor_dc(a(), true, "nrb"), None);
         assert_eq!(allocation_anchor_dc(a(), true, "Leli"), a());
         assert_eq!(allocation_anchor_dc(None, true, "nrb"), None);
+    }
+
+    fn deferred(sm: &StateMachineData, placed_tier: DiskTier, requester_dc: &str, floor: u32) -> Vec<String> {
+        let vol = &sm.volumes["default"];
+        deferred_anchor_targets(
+            &sm.nodes,
+            &vol.effective_mandatory_replicas(),
+            &spill_for_fill(&vol.spill, Some("leli")),
+            &dtfs_common::config::PlacementConfig::default(),
+            &Location::new("", requester_dc, "", ""),
+            placed_tier,
+            "leli",
+            floor,
+            &std::collections::HashSet::new(),
+        )
+    }
+
+    /// LELI holds a cold-only and a warm node, TORO/NRB one warm each. A
+    /// deferred write from NRB lands on nrb + toro whatever the placed tier
+    /// (the ring would hash onto the LELI warm node or the cold one).
+    #[test]
+    fn deferred_targets_skip_anchor_dc_for_any_placed_tier() {
+        let mut sm = live_topology();
+        sm.nodes.insert(4, lab_node("data04", "leli", DiskTier::Warm, HealthStatus::Healthy));
+        for tier in [DiskTier::Warm, DiskTier::Cold] {
+            let mut got = deferred(&sm, tier, "nrb", 2);
+            got.sort();
+            assert_eq!(
+                got,
+                vec!["data02:9500".to_string(), "data03:9500".to_string()],
+                "placed tier {tier:?}"
+            );
+        }
+    }
+
+    /// Only one healthy node outside LELI: the floor is met by adding an
+    /// anchor-DC node, never lowered. No maintained node at all: empty
+    /// (caller falls back to the normal path).
+    #[test]
+    fn deferred_targets_fall_back_to_anchor_dc_for_floor() {
+        let mut sm = live_topology();
+        sm.nodes.get_mut(&2).unwrap().health = HealthStatus::Down;
+        let got = deferred(&sm, DiskTier::Warm, "nrb", 2);
+        assert_eq!(got, vec!["data03:9500".to_string(), "data01:9500".to_string()]);
+        for n in sm.nodes.values_mut() {
+            n.health = HealthStatus::Down;
+        }
+        assert!(deferred(&sm, DiskTier::Warm, "nrb", 2).is_empty());
+    }
+
+    /// A volume configured only via the newer `anchor = {..}` policy (no
+    /// legacy `anchor_datacenter`) still has an anchor at allocation.
+    #[test]
+    fn volume_anchor_dc_reads_anchor_policy() {
+        let mut v = vol_with_floor("default", 2);
+        v.anchor_datacenter = None;
+        v.anchor = Some(dtfs_common::types::AnchorPolicy {
+            datacenter: "leli".into(),
+            required_tier: Some(DiskTier::Cold),
+        });
+        assert_eq!(volume_anchor_dc(&v), Some("leli".to_string()));
+        v.anchor = None;
+        assert_eq!(volume_anchor_dc(&v), None);
+        v.anchor_datacenter = Some("toro".into());
+        assert_eq!(volume_anchor_dc(&v), Some("toro".to_string()));
     }
 
     /// One data node / one maintained disk: floor clamps to 1 and commits

@@ -115,9 +115,10 @@ mountpoint = "/mnt/dtfs"
 # on a slow WAN link keep it low so puts stay within the 60 s RPC timeout.
 #upload_concurrency = 2
 # true: every write uploads synchronously to the volume's anchor datacenter.
-# false: the write acks once min_replicas_before_ack near maintained nodes
-# hold it (the anchor node is still used when near nodes cannot reach the
-# floor); the manager's anchor-lag repair copies the anchor replica later.
+# false: each chunk goes to min_replicas_before_ack maintained nodes outside
+# the anchor DC (any maintained tier, whatever first_write_tier says; anchor-DC
+# nodes only when the others cannot reach the floor); the manager's repair
+# copies the anchor replica later.
 # Until then the chunk has >= floor copies but none in the anchor DC
 # ("Catching up" on the dashboard). No effect for a client in the anchor DC.
 #anchor_sync = true

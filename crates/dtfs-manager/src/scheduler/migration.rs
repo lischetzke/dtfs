@@ -1080,6 +1080,35 @@ pub(super) async fn advance_round<O: MigrationOps>(
                     }
                 }
                 Err(reason) => {
+                    // A source row whose bytes are gone ("Chunk not found")
+                    // moves the task to the next live replica instead of the
+                    // Bug AF instant-Failed, which re-plans the same source.
+                    let chunk_id = state.tasks.get(&task_id).map(|t| t.chunk_id.clone());
+                    let alt = match chunk_id {
+                        Some(c) if rpc_error_indicates_chunk_missing(&reason) => ops
+                            .resolve_source(&c, Some(resolved_source))
+                            .await
+                            .map(|(n, _)| n)
+                            .filter(|n| *n != resolved_source),
+                        _ => None,
+                    };
+                    if let (Some(alt), Some(task)) = (alt, state.tasks.get_mut(&task_id)) {
+                        if task.attempts + 1 < MAX_MIGRATION_ATTEMPTS {
+                            task.attempts += 1;
+                            task.last_error = Some(reason.clone());
+                            task.updated_at_ms = now_ms;
+                            task.source_node = alt;
+                            warn!(
+                                task_id = %task.task_id,
+                                chunk = %task.chunk_id,
+                                bad_source = resolved_source,
+                                new_source = alt,
+                                attempt = task.attempts,
+                                "Copying: source has no bytes for this chunk; retrying from the next live replica"
+                            );
+                            continue;
+                        }
+                    }
                     // Record the source we actually tried (F-015) before
                     // accounting the failure.
                     if let Some(task) = state.tasks.get_mut(&task_id) {
@@ -2070,6 +2099,97 @@ mod sched_audit_tests {
         let mut state = state_of(1);
         advance_migration_tasks(&ops, &mut state, 1).await;
         assert_eq!(*ops.registered_with.lock().unwrap(), vec![None]);
+    }
+
+    /// Live sources 1 and 2; node 1's row is a phantom (its bytes are gone,
+    /// "Chunk not found"). `only_source` limits the live set to one node.
+    #[derive(Default)]
+    struct PhantomOps {
+        only_source: Option<u64>,
+        tried: Mutex<Vec<String>>,
+    }
+
+    impl MigrationOps for PhantomOps {
+        async fn validate_target(&self, _t: u64, _tier: DiskTier) -> Result<(), String> {
+            Ok(())
+        }
+        async fn chunk_bytes(&self, _c: &str) -> Option<u64> {
+            Some(4 << 20)
+        }
+        async fn resolve_source(&self, _c: &str, ex: Option<u64>) -> Option<(u64, String)> {
+            [1u64, 2]
+                .into_iter()
+                .filter(|n| self.only_source.map_or(true, |o| o == *n))
+                .find(|n| Some(*n) != ex)
+                .map(|n| (n, format!("http://src{n}:9500")))
+        }
+        async fn resolve_source_preferring(
+            &self,
+            c: &str,
+            ex: Option<u64>,
+            preferred: u64,
+        ) -> Option<(u64, String)> {
+            match self.resolve_source(c, ex).await {
+                Some(_) if [1, 2].contains(&preferred) && Some(preferred) != ex
+                    && self.only_source.map_or(true, |o| o == preferred) =>
+                {
+                    Some((preferred, format!("http://src{preferred}:9500")))
+                }
+                other => other,
+            }
+        }
+        async fn target_addr(&self, n: u64) -> Option<String> {
+            Some(format!("http://tgt{n}:9500"))
+        }
+        async fn replicate(&self, s: &str, _c: &str, _t: &str, _tier: &str, _b: u64) -> Result<(), String> {
+            self.tried.lock().unwrap().push(s.to_string());
+            if s.contains("src1") {
+                Err("status: NotFound, message: \"Chunk not found\"".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        async fn verify(&self, _t: &str, _c: &str, _d: Option<u32>) -> Result<bool, String> {
+            Ok(true)
+        }
+        async fn register_replica(&self, _c: &str, _t: u64, _tier: DiskTier) -> Result<(), String> {
+            Ok(())
+        }
+        fn audit(&self, _a: &str, _d: &str, _o: &str) {}
+        fn fire_migration_failed(&self, _t: &ReplicationTask, _r: &str) {}
+    }
+
+    fn phantom_state() -> MigrationState {
+        let mut s = state_of(1);
+        s.tasks.get_mut("repl-0").unwrap().target_node = 3;
+        s
+    }
+
+    /// A "Chunk not found" from the recorded source moves the task to the
+    /// next live source instead of failing it (and re-planning the same
+    /// phantom source after the Failed-task GC).
+    #[tokio::test]
+    async fn chunk_missing_on_source_retries_next_live_source() {
+        let ops = PhantomOps::default();
+        let mut state = phantom_state();
+        for t in 1..=4u64 {
+            advance_migration_tasks(&ops, &mut state, t * 600_000).await;
+        }
+        let task = &state.tasks["repl-0"];
+        assert_eq!(task.status, MigrationStatus::Done, "last_error {:?}", task.last_error);
+        assert_eq!(task.source_node, 2);
+        assert_eq!(*ops.tried.lock().unwrap(), vec!["http://src1:9500", "http://src2:9500"]);
+    }
+
+    /// No other live source: the Bug AF instant-Failed behaviour stays.
+    #[tokio::test]
+    async fn chunk_missing_without_alternate_source_fails_at_once() {
+        let ops = PhantomOps { only_source: Some(1), ..Default::default() };
+        let mut state = phantom_state();
+        advance_migration_tasks(&ops, &mut state, 600_000).await;
+        let task = &state.tasks["repl-0"];
+        assert_eq!(task.status, MigrationStatus::Failed);
+        assert_eq!(task.attempts, MAX_MIGRATION_ATTEMPTS);
     }
 }
 

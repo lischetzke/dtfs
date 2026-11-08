@@ -71,8 +71,13 @@ text there.
 - A survivor that authorises dropping another replica must be live;
   `apply_remove_chunk_location` refuses to remove the last live replica.
 - Every promote/demote/flush checks the anchor against the destination
-  (`would_violate_anchor`, `demote_preserves_anchor`, `enforce_anchor` on
+  (`would_violate_anchor_for`, `demote_preserves_anchor`, `enforce_anchor` on
   apply). Anchor DC compares case-insensitively.
+- Anchor-pending (FUSE write.anchor_sync=false, writer outside the anchor
+  DC): acked on the unchanged ack floor without an anchor copy;
+  check_anchor_lag repairs it. Until the anchor copy is live, every removal
+  path refuses (goal_met / demote_preserves_anchor / enforce_anchor),
+  including dead or stale rows.
 - Presence and removal keyed by `(node_id, disk_id)`; removals carry the
   disk id. The orphan reaper is disk-keyed: it never removes a row
   recorded under a different disk of the same node.

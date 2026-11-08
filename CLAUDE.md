@@ -30,7 +30,7 @@ DTFS serves **one household Plex media library across three DCs with asymmetric 
 | TORO | ~400 Mbps | Working set + read-ahead cache | mgr04, data-warm01 (~1 TB SSD), client02 |
 | NRB | ~1 Gbps | Download landing, replicates to LELI | mgr05, data-warm02 (~1 TB HDD), client03 |
 
-Reads dominate (~5 streams ≤60 Mbps); writes bursty (30 GB in minutes). Hosts are shared with Plex: per-role memory budgets, never starve the co-resident app. **Anchor invariant: every chunk has ≥1 replica on LELI data-primary01.** Other replicas move freely; LELI copy sacred.
+Reads dominate (~5 streams ≤60 Mbps); writes bursty (30 GB in minutes). Hosts are shared with Plex: per-role memory budgets, never starve the co-resident app. **Anchor invariant: every chunk has >=1 replica on LELI data-primary01**, except while anchor-pending after a FUSE `write.anchor_sync=false` write from outside LELI (acked on the ack floor; anchor-lag adds the copy; no replica of an anchor-pending chunk is removed). Other replicas move freely; LELI copy sacred.
 
 Non-goals: multi-tenancy, POSIX completeness (xattrs/mmap/open-unlink best-effort), online rebalance across reconfigs (drain-then-replace).
 
@@ -38,7 +38,7 @@ Non-goals: multi-tenancy, POSIX completeness (xattrs/mmap/open-unlink best-effor
 
 Crates: **dtfs-manager** (Raft peer, REST/gRPC, owns metadata), **dtfs-data** (per-tier chunk store, streaming put/get, SMART), **dtfs-fuse** (`/mnt/dtfs`, read-ahead cache), **dtfs-client** (shared by fuse + cli), **dtfs-raft** (openraft SM; log = truth), **dtfs-common** (BLAKE3, hash ring, config, version), **dtfs-proto**.
 
-**Write:** write_lease → allocate_chunks (file's volume) → PutChunk to tmp → commit_chunk_from_tmp → commit_chunk_locations via Raft; rejected below `write_safety.min_replicas_before_ack` distinct `(node_id, disk_id)` replicas on maintained tiers (filled across). FUSE `write.anchor_sync=false`: no forced anchor slot, anchor-lag adds it.
+**Write:** write_lease → allocate_chunks (file's volume) → PutChunk to tmp → commit_chunk_from_tmp → commit_chunk_locations via Raft; rejected below `write_safety.min_replicas_before_ack` distinct `(node_id, disk_id)` replicas on maintained tiers (filled across). With FUSE `write.anchor_sync=false` from outside the anchor DC, allocation picks floor-many maintained nodes outside the anchor DC, nearest first (`deferred_anchor_targets`), and uses anchor-DC nodes only when the floor needs them.
 
 **Read:** metadata (ENTRY_TTL cache) → `select_read_replica` (priority > distance > tier) → GetChunk, verify → local cache → readahead; misses single-flighted. Detail: `docs/src/architecture/data-flow.md`.
 

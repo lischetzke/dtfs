@@ -1105,7 +1105,7 @@ fn clamp_ack_floor_to_capacity(
     // on other RF>0 tiers), so it is clamped only to what the cluster can
     // physically hold: distinct healthy data nodes with a usable disk on a
     // maintained tier (one node holds one replica per chunk on the wire).
-    let spill = spill_for_fill(&volume.spill, volume.anchor_datacenter.as_deref());
+    let spill = spill_for_fill(&volume.spill, volume_anchor_dc(volume).as_deref());
     let rf = maintained_node_capacity(sm, &mandatory, &spill, placed_tier);
     let latch =
         WARNED_FLOOR_CLAMPED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -1159,6 +1159,58 @@ pub(crate) fn spill_for_fill(
         s.forbidden_datacenters.retain(|d| !d.eq_ignore_ascii_case(a));
     }
     s
+}
+
+/// The volume's anchor DC as repair sees it (`effective_anchor`: the
+/// `anchor` policy, else the legacy `anchor_datacenter`).
+pub(crate) fn volume_anchor_dc(v: &dtfs_common::types::VolumeConfig) -> Option<String> {
+    v.effective_anchor().map(|a| a.datacenter)
+}
+
+/// Targets for a deferred-anchor write (`[write] anchor_sync = false`):
+/// `floor` (min 1) distinct healthy nodes eligible as fill replicas
+/// (`eligible_fill_picks`, any maintained tier, with room), ranked from the
+/// requester (`rank_candidates`), nodes outside `anchor_dc` first; anchor-DC
+/// nodes only fill what the others cannot. Empty = no eligible node.
+// shortcut: every chunk of a batch gets the same ranked nodes; fine while
+// the near maintained nodes number about the floor, rotate if that grows.
+pub(crate) fn deferred_anchor_targets(
+    nodes: &BTreeMap<u64, dtfs_raft::NodeInfo>,
+    mandatory: &dtfs_common::types::TierReplication,
+    spill: &dtfs_common::types::SpillPolicy,
+    pcfg: &dtfs_common::config::PlacementConfig,
+    requester: &Location,
+    placed_tier: DiskTier,
+    anchor_dc: &str,
+    floor: u32,
+    exclude: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut cands = Vec::new();
+    for (id, n) in nodes {
+        if n.grpc_addr.is_empty() || exclude.contains(&norm_grpc_addr(&n.grpc_addr)) {
+            continue;
+        }
+        for d in eligible_fill_picks(n, placed_tier, mandatory, spill, Some(pcfg)) {
+            cands.push(crate::placement::CandidateDisk {
+                node_id: *id,
+                disk_id: d.disk_id,
+                tier: d.tier,
+                location: n.location.clone(),
+                free_bytes: d.total_bytes.saturating_sub(d.used_bytes),
+            });
+        }
+    }
+    let ranked = crate::placement::rank_candidates(&cands, requester);
+    let (near, anchor): (Vec<_>, Vec<_>) = ranked
+        .into_iter()
+        .partition(|c| !c.location.datacenter.eq_ignore_ascii_case(anchor_dc));
+    let mut seen = std::collections::HashSet::new();
+    near.into_iter()
+        .chain(anchor)
+        .filter(|c| seen.insert(c.node_id))
+        .take(floor.max(1) as usize)
+        .filter_map(|c| nodes.get(&c.node_id).map(|n| n.grpc_addr.clone()))
+        .collect()
 }
 
 /// Anchor DC the hash-ring placement forces for one allocation. A writer
@@ -2457,7 +2509,7 @@ impl ManagerService for MetadataService {
                     &req.preferred_tier,
                     &available_tiers,
                 );
-                (tier, rf, v.anchor_datacenter.clone())
+                (tier, rf, volume_anchor_dc(v))
             }
             None => {
                 let (tier, rf) = resolve_preferred_tier(
@@ -2500,25 +2552,19 @@ impl ManagerService for MetadataService {
             .as_ref()
             .map(|l| l.datacenter.as_str())
             .unwrap_or("");
-        let ring_anchor =
-            allocation_anchor_dc(anchor_dc.clone(), req.defer_anchor.unwrap_or(false), requester_dc);
-        if anchor_dc.is_some() && ring_anchor.is_none() {
-            tracing::debug!(
-                path = %req.path,
-                num_chunks = req.num_chunks,
-                requester_dc,
-                anchor_dc = ?anchor_dc,
-                "anchor_sync=false: anchor copy deferred to anchor-lag repair"
-            );
-        }
-        let placed = if exclude_set.is_empty() {
+        // `[write] anchor_sync = false` from outside the anchor DC: placed by
+        // `deferred_anchor_targets` below instead of the ring.
+        let defer = anchor_dc.is_some()
+            && allocation_anchor_dc(anchor_dc.clone(), req.defer_anchor.unwrap_or(false), requester_dc)
+                .is_none();
+        let placed = if exclude_set.is_empty() && !defer {
             self.placement.place_chunks_with_anchor(
                 &effective_volume_id,
                 &req.path, // Bug BO-3 — per-file seed so chunk-0 doesn't collide cross-file
                 req.num_chunks,
                 effective_tier,
                 replication,
-                ring_anchor,
+                anchor_dc.clone(),
             )
         } else {
             Vec::new()
@@ -2532,7 +2578,7 @@ impl ManagerService for MetadataService {
         let (mandatory, spill_cfg, default_floor) = match &volume_cfg {
             Some(v) => (
                 v.effective_mandatory_replicas().clone(),
-                spill_for_fill(&v.spill, v.anchor_datacenter.as_deref()),
+                spill_for_fill(&v.spill, volume_anchor_dc(v).as_deref()),
                 self.config.defaults.write_safety.min_replicas_before_ack,
             ),
             None => (
@@ -2574,6 +2620,43 @@ impl ManagerService for MetadataService {
                 }
             }
         };
+
+        if let (true, Some(adc)) = (defer, anchor_dc.as_deref()) {
+            let targets = deferred_anchor_targets(
+                &data.nodes,
+                &mandatory,
+                &spill_cfg,
+                &self.config.placement,
+                &fill_requester,
+                effective_tier,
+                adc,
+                floor,
+                &exclude_set,
+            );
+            if let Some((primary, replicas)) = targets.split_first() {
+                let anchor_included = targets.iter().any(|a| {
+                    data.nodes.values().any(|n| {
+                        n.grpc_addr == *a && n.location.datacenter.eq_ignore_ascii_case(adc)
+                    })
+                });
+                if anchor_included {
+                    tracing::debug!(path = %req.path, num_chunks = req.num_chunks, targets = ?targets,
+                        "anchor_sync=false: anchor-DC node included to meet the ack floor");
+                } else {
+                    tracing::debug!(path = %req.path, num_chunks = req.num_chunks, targets = ?targets,
+                        anchor_dc = adc, "anchor_sync=false: anchor copy deferred to anchor-lag repair");
+                }
+                let placements = (0..req.num_chunks)
+                    .map(|i| ChunkPlacement {
+                        chunk_index: i,
+                        primary_address: primary.clone(),
+                        replica_addresses: replicas.to_vec(),
+                        tier: chunk_placement_tier_string(effective_tier),
+                    })
+                    .collect();
+                return Ok(Response::new(AllocateChunksResponse { placements }));
+            }
+        }
 
         let mut placements = Vec::new();
 
