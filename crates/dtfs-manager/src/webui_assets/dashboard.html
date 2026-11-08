@@ -3352,8 +3352,7 @@
             }
             cursor[parts[parts.length - 1]] = pending[dotted];
         }
-        if (writeToDisk && !confirm('Write this manager's /etc/dtfs/manager.toml and store the change cluster-wide?
-Cluster-scoped values must match across every manager.')) {
+        if (writeToDisk && !confirm("Write this manager's /etc/dtfs/manager.toml and store the change cluster-wide?\nCluster-scoped values must match across every manager.")) {
             return;
         }
         const result = document.getElementById('cfg-result');
