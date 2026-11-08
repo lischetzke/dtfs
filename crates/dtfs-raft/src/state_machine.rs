@@ -1234,12 +1234,14 @@ fn apply_request(
                 }
             }
 
+            let mut stale_skipped: Option<Vec<u64>> = None;
             if let Some(file) = sm.files.get_mut(path) {
                 if lease_id.is_empty() {
                     let (merged, skipped) = union_chunk_location_entries(&file.chunks, chunks);
                     if !skipped.is_empty() {
                         warn!(path = %path, indices = ?skipped,
-                            "UpdateChunkLocations: lease-less write skipped stale chunk indices (hash not current)");
+                            "UpdateChunkLocations: lease-less write skipped stale chunk indices (no rows or hash not current)");
+                        stale_skipped = Some(skipped);
                     }
                     file.chunks = merged;
                 } else {
@@ -1261,7 +1263,8 @@ fn apply_request(
                     .iter()
                     .map(|c| c.chunk_index * file.chunk_size + c.size_bytes)
                     .max();
-                if let Some(extent) = extent {
+                // Lease-less (system / stale) writes never grow the extent.
+                if let (Some(extent), false) = (extent, lease_id.is_empty()) {
                     file.logical_size = file.logical_size.map(|l| l.max(extent));
                 }
                 push_audit_capped(&mut sm.audit_log, audit_at(format!(
@@ -1269,7 +1272,16 @@ fn apply_request(
                     chunks.len(),
                     file.chunks.len()
                 ), eff_now_ms));
-                ClientResponse::Success
+                match stale_skipped {
+                    // Surface the skip so a lease-less client commit is not
+                    // silently lost (the scheduler treats Err as retry).
+                    Some(idx) => ClientResponse::Error {
+                        message: format!(
+                            "UpdateChunkLocations: stale lease-less commit for {path}, chunk indices {idx:?} skipped"
+                        ),
+                    },
+                    None => ClientResponse::Success,
+                }
             } else {
                 warn!(path = %path, "UpdateChunkLocations: file not found");
                 ClientResponse::Error {
@@ -1295,13 +1307,37 @@ fn apply_request(
                 chunk_hashes.iter().map(|s| s.as_str()).collect();
             let mut dropped: u64 = 0;
             let mut affected_files: u64 = 0;
-            for (_path, file) in sm.files.iter_mut() {
+            let mut protected: u64 = 0;
+            for (path, file) in sm.files.iter_mut() {
                 let before = file.chunks.len();
-                file.chunks.retain(|c| {
-                    !(c.node_id == *node_id
+                let is_corrupt = |c: &ChunkLocationEntry| {
+                    c.node_id == *node_id
                         && needle.contains(c.chunk_hash.as_str())
-                        && (legacy_node_wide || c.disk_id == *disk_id))
-                });
+                        && (legacy_node_wide || c.disk_id == *disk_id)
+                };
+                // Never remove the last row at a (file, chunk_index): the
+                // bytes are quarantined so reads fail EIO, but dropping the
+                // row would make FUSE serve zeros for that range.
+                let mut per_index: std::collections::HashMap<u64, (usize, usize)> =
+                    std::collections::HashMap::new();
+                for c in &file.chunks {
+                    let e = per_index.entry(c.chunk_index).or_default();
+                    e.0 += 1;
+                    if is_corrupt(c) {
+                        e.1 += 1;
+                    }
+                }
+                let last_row_indices: std::collections::HashSet<u64> = per_index
+                    .iter()
+                    .filter(|(_, (total, bad))| *bad > 0 && bad == total)
+                    .map(|(i, _)| *i)
+                    .collect();
+                if !last_row_indices.is_empty() {
+                    protected += last_row_indices.len() as u64;
+                    warn!(path = %path, indices = ?last_row_indices, node = %node_id,
+                        "RemoveCorruptChunkReplicas: refused to drop the last replica row of a chunk index");
+                }
+                file.chunks.retain(|c| !is_corrupt(c) || last_row_indices.contains(&c.chunk_index));
                 let after = file.chunks.len();
                 if after < before {
                     dropped += (before - after) as u64;
@@ -1318,6 +1354,14 @@ fn apply_request(
                     affected_files,
                 ), eff_now_ms),
             );
+            if protected > 0 {
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit_at(format!(
+                        "RemoveCorruptChunkReplicas: node={node_id} disk={disk_id} kept {protected} chunk index(es) whose only replica row is corrupt (bytes quarantined; reads fail until restored)"
+                    ), eff_now_ms),
+                );
+            }
             ClientResponse::Success
         }
 

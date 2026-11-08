@@ -5,6 +5,18 @@
 
 use super::*;
 
+/// Hold a lease with id "seed" so a test can seed chunk rows through a
+/// leased UpdateChunkLocations (lease-less writes cannot add indexes).
+fn seed_lease(sm: &mut StateMachineData, path: &str) {
+    use openraft::vote::RaftLeaderId;
+    let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+    let log_id: LogId = openraft::LogId::new(leader, 9_000);
+    apply_request(sm, &log_id, &ClientRequest::AcquireWriteLease {
+        path: path.into(), owner_id: "seed".into(), lease_ms: 60_000, now_ms: 1,
+        proposed_lease_id: "seed".into(),
+    });
+}
+
 #[cfg(test)]
 mod snapshot_persistence_tests {
     use super::*;
@@ -607,6 +619,7 @@ mod posix_path_regression {
             },
         );
         // Step 2: rsync writes data; chunk locations land via UpdateChunkLocations.
+        seed_lease(&mut sm, "/movies/.foo.GQhlto");
         apply_request(
             &mut sm,
             &mk_log_id(5),
@@ -619,7 +632,7 @@ mod posix_path_regression {
                     disk_id: 0,
                     size_bytes: 4096,
                 }],
-                lease_id: String::new(),
+                lease_id: "seed".into(),
             },
         );
         // Sanity: the temp file is fully formed.
@@ -690,6 +703,7 @@ mod posix_path_regression {
                 chunk_size: 4 * 1024 * 1024,
             },
         );
+        seed_lease(&mut sm, "/f.bin");
         apply_request(
             &mut sm,
             &mk_log_id(3),
@@ -702,7 +716,7 @@ mod posix_path_regression {
                     disk_id: 0,
                     size_bytes: 4096,
                 }],
-                lease_id: String::new(),
+                lease_id: "seed".into(),
             },
         );
 
@@ -717,16 +731,9 @@ mod posix_path_regression {
         }
         assert!(sm.nodes.contains_key(&10), "node must remain while it holds replicas");
 
-        // Drain the replica, then deregister succeeds and removes the node.
-        apply_request(
-            &mut sm,
-            &mk_log_id(5),
-            &ClientRequest::RemoveCorruptChunkReplicas { now_ms: 0,
-                node_id: "10".into(),
-                chunk_hashes: vec!["h0".into()],
-                disk_id: crate::legacy_disk_id(),
-            },
-        );
+        // Drain the replica (RemoveCorrupt keeps a sole row, so clear it
+        // directly), then deregister succeeds and removes the node.
+        sm.files.values_mut().for_each(|f| f.chunks.clear());
         let ok =
             apply_request(&mut sm, &mk_log_id(6), &ClientRequest::DeregisterNode { node_id: 10 });
         assert!(matches!(ok, ClientResponse::Success), "drained node must deregister");
@@ -768,6 +775,7 @@ mod posix_path_regression {
                 chunk_size: 128 * 1024 * 1024,
             },
         );
+        seed_lease(&mut sm, "/series/episode-01.mkv");
         apply_request(
             &mut sm,
             &mk_log_id(12),
@@ -781,7 +789,7 @@ mod posix_path_regression {
                     // 10 GB single chunk for the test
                     size_bytes: 10 * 1024 * 1024 * 1024,
                 }],
-                lease_id: String::new(),
+                lease_id: "seed".into(),
             },
         );
 
@@ -1165,10 +1173,13 @@ mod posix_path_regression {
                 lease_id: String::new(),
             },
         );
+        // Lease-less writes can no longer introduce an index (stale-writer
+        // protection); the client sees an error rather than silent loss.
         assert!(
-            matches!(resp, ClientResponse::Success),
-            "empty lease_id must skip verification (legacy compat)"
+            matches!(resp, ClientResponse::Error { .. }),
+            "lease-less initial add must be refused, got {resp:?}"
         );
+        assert!(sm.files.get("/y.bin").unwrap().chunks.is_empty());
     }
 
     /// Bug O — unrelated chunks on the same node MUST be preserved.
@@ -1186,6 +1197,13 @@ mod posix_path_regression {
                         chunk_index: 0,
                         chunk_hash: "h-bad".into(),
                         node_id: "20".into(),
+                        disk_id: 0,
+                        size_bytes: 1024,
+                    },
+                    ChunkLocationEntry {
+                        chunk_index: 0,
+                        chunk_hash: "h-bad".into(),
+                        node_id: "21".into(),
                         disk_id: 0,
                         size_bytes: 1024,
                     },
@@ -1215,8 +1233,11 @@ mod posix_path_regression {
             },
         );
         let c = sm.files.get("/c.bin").unwrap();
-        assert_eq!(c.chunks.len(), 1);
-        assert_eq!(c.chunks[0].chunk_hash, "h-good");
+        // Node 20's bad row is gone; node 21's row for the same index and
+        // node 20's unrelated good chunk survive.
+        assert_eq!(c.chunks.len(), 2);
+        assert!(c.chunks.iter().all(|e| !(e.node_id == "20" && e.chunk_hash == "h-bad")));
+        assert!(c.chunks.iter().any(|e| e.chunk_hash == "h-good"));
     }
 
     // ---- Bug AH — replicated audit log fan-out ----
@@ -2641,13 +2662,14 @@ mod posix_path_regression {
         apply_request(&mut sm, &mk_log_id(2),
             &ClientRequest::SetFileSize { now_ms: 0, path: "/f".into(), new_size: 0 });
         assert_eq!(sm.files.get("/f").unwrap().logical_size, Some(0));
+        seed_lease(&mut sm, "/f");
         apply_request(&mut sm, &mk_log_id(3), &ClientRequest::UpdateChunkLocations { now_ms: 0,
             path: "/f".into(),
             chunks: vec![ChunkLocationEntry {
                 chunk_index: 0, chunk_hash: "h".into(), node_id: "10".into(),
                 disk_id: 0, size_bytes: 4 * 1024 * 1024,
             }],
-            lease_id: String::new(),
+            lease_id: "seed".into(),
         });
         assert_eq!(
             sm.files.get("/f").unwrap().logical_size,
@@ -2993,6 +3015,7 @@ mod audit_co_tests {
             volume_id: "default".into(),
             chunk_size: 1024,
         });
+        seed_lease(&mut sm, "/keep.bin");
         apply_request(&mut sm, &mk_log_id(2), &ClientRequest::UpdateChunkLocations { now_ms: 0,
             path: "/keep.bin".into(),
             chunks: vec![ChunkLocationEntry {
@@ -3002,7 +3025,7 @@ mod audit_co_tests {
                 disk_id: 0,
                 size_bytes: 1024,
             }],
-            lease_id: String::new(),
+            lease_id: "seed".into(),
         });
         assert_eq!(sm.files.get("/keep.bin").unwrap().chunks.len(), 1);
 
@@ -3418,19 +3441,97 @@ mod raft_audit_fix_tests {
     }
 
     #[test]
-    fn union_skips_stale_hash_but_allows_initial_add() {
+    fn union_skips_stale_hash_and_rowless_index() {
         let existing = vec![row(0, "new", "1", 0)];
         let (out, skipped) = union_chunk_location_entries(
             &existing, &[row(0, "old", "2", 0), row(1, "x", "2", 0)]);
-        assert_eq!(skipped, vec![0], "old-hash write to index 0 is stale");
-        assert_eq!(out, vec![row(0, "new", "1", 0), row(1, "x", "2", 0)]);
+        assert_eq!(skipped, vec![0, 1], "old-hash write to index 0 and a row-less index 1 are stale");
+        assert_eq!(out, vec![row(0, "new", "1", 0)]);
+    }
+
+    /// Lease-less commit that is (partly) stale is reported as an error, adds
+    /// the valid rows, and never grows logical_size.
+    #[test]
+    fn lease_less_stale_commit_errors_and_never_grows_extent() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/f");
+        sm.files.get_mut("/f").unwrap().chunks = vec![row(0, "h", "1", 0)];
+        // Rowless index 5 (e.g. truncated since the writer read) is skipped.
+        let r = upd(&mut sm, 3, "", vec![row(0, "h", "2", 0), row(5, "z", "1", 0)]);
+        assert!(err_msg(r).contains("stale lease-less commit"));
+        assert_eq!(sm.files["/f"].chunks, vec![row(0, "h", "1", 0), row(0, "h", "2", 0)]);
+        // Fully valid lease-less write still succeeds.
+        assert!(matches!(upd(&mut sm, 4, "", vec![row(0, "h", "3", 0)]), ClientResponse::Success));
+        // Extent: lease-less never grows, leased does.
+        sm.files.get_mut("/f").unwrap().logical_size = Some(1);
+        upd(&mut sm, 5, "", vec![row(0, "h", "4", 0)]);
+        assert_eq!(sm.files["/f"].logical_size, Some(1), "lease-less write must not grow the extent");
+        apply_request(&mut sm, &lid(6), &ClientRequest::AcquireWriteLease {
+            path: "/f".into(), owner_id: "w".into(), lease_ms: 60_000, now_ms: 1,
+            proposed_lease_id: "L".into(),
+        });
+        upd(&mut sm, 7, "L", vec![row(0, "h", "4", 0)]);
+        assert_eq!(sm.files["/f"].logical_size, Some(10), "leased write grows to row extent");
+    }
+
+    /// RemoveCorruptChunkReplicas keeps the last row of an index (with an
+    /// audit row) and still drops one of several.
+    #[test]
+    fn remove_corrupt_keeps_last_row_and_audits() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/f");
+        sm.files.get_mut("/f").unwrap().chunks = vec![row(0, "h", "1", 0), row(0, "h", "2", 0), row(1, "g", "1", 0)];
+        let rm = |sm: &mut StateMachineData, i, n: &str, h: &str| apply_request(sm, &lid(i),
+            &ClientRequest::RemoveCorruptChunkReplicas {
+                now_ms: 0, node_id: n.into(), chunk_hashes: vec![h.into()], disk_id: 0 });
+        rm(&mut sm, 10, "1", "g");
+        assert_eq!(sm.files["/f"].chunks.len(), 3, "sole row of index 1 kept");
+        assert!(sm.audit_log.iter().any(|a| a.summary.contains("kept 1 chunk index")));
+        rm(&mut sm, 11, "1", "h");
+        assert_eq!(sm.files["/f"].chunks.len(), 2, "one of two rows at index 0 dropped");
+        rm(&mut sm, 12, "2", "h");
+        assert_eq!(sm.files["/f"].chunks.len(), 2, "last row of index 0 kept");
+    }
+
+    /// Property: over random op sequences, RemoveCorruptChunkReplicas never
+    /// empties a chunk index.
+    #[test]
+    fn remove_corrupt_never_empties_an_index_property() {
+        for seed in 1..=40u64 {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut rnd = move |n: u64| {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                x % n
+            };
+            let mut sm = StateMachineData::default();
+            create(&mut sm, 1, "/f");
+            let mut rows = Vec::new();
+            for i in 0..3u64 {
+                for _ in 0..(rnd(3) + 1) {
+                    let r = row(i, &format!("h{i}"), &rnd(3).to_string(), rnd(2) as u32);
+                    if !rows.contains(&r) { rows.push(r); }
+                }
+            }
+            sm.files.get_mut("/f").unwrap().chunks = rows.clone();
+            for k in 0..30u64 {
+                let disk = if rnd(3) == 0 { legacy_disk_id() } else { rnd(2) as u32 };
+                apply_request(&mut sm, &lid(10 + k), &ClientRequest::RemoveCorruptChunkReplicas {
+                    now_ms: 0, node_id: rnd(3).to_string(),
+                    chunk_hashes: vec![format!("h{}", rnd(3))], disk_id: disk });
+                for i in 0..3u64 {
+                    let had = rows.iter().any(|r| r.chunk_index == i);
+                    let has = sm.files["/f"].chunks.iter().any(|r| r.chunk_index == i);
+                    assert!(!had || has, "seed {seed}: index {i} emptied");
+                }
+            }
+        }
     }
 
     #[test]
     fn lease_less_write_keeps_removed_row_removed_and_lease_write_replaces() {
         let mut sm = StateMachineData::default();
         create(&mut sm, 1, "/f");
-        upd(&mut sm, 2, "", vec![row(0, "h", "1", 0), row(0, "h", "2", 0)]);
+        sm.files.get_mut("/f").unwrap().chunks = vec![row(0, "h", "1", 0), row(0, "h", "2", 0)];
         apply_request(&mut sm, &lid(3), &ClientRequest::RemoveChunkLocation {
             path: "/f".into(), chunk_index: 0, node_id: "2".into(), disk_id: 0,
             enforce_anchor: None, now_ms: 0,
