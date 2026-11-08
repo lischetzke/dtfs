@@ -239,7 +239,7 @@ openssl s_client -connect <manager>:9401
 # Recent integrity faults and which node/chunk they hit
 curl -s "http://<manager>:9402/api/v1/integrity/faults?limit=50" | jq .
 
-# Cluster-wide deep scrub (targeted --disk/--file/--chunk scrubs are rejected by the API)
+# Cluster-wide deep scrub (targeted scrubs are not supported)
 dtfs-cli scrub --level deep
 
 # Check disk health with smartctl

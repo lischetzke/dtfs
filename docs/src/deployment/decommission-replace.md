@@ -80,7 +80,7 @@ Use a copy so that nothing has to be evacuated:
    `[[disks]]` entry.
 5. Start `dtfs-data`; pass the node health gate; disable maintenance.
 6. Verification: trigger a deep scrub (`dtfs-cli scrub --level deep`; scrubs are
-   cluster-wide, targeted `--disk` scrubs are rejected by the API) and require
+   cluster-wide, targeted scrubs are not supported) and require
    `files_missing_chunks == 0` in `GET /api/v1/cluster/status`. Chunks are checksummed on every read and by
    scrub, so a bad copy is detected, quarantined (renamed, never deleted) and
    repaired from another replica.

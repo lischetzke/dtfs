@@ -80,7 +80,7 @@ On-disk chunk cache on the client.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `first_write_tier` | string | `"cold"` | `cold`: no tier hint, the manager uses the volume's own policy. `nearest-warm`: asks for the warm tier; honoured when a healthy warm disk exists, replica count clamped up to `write_safety.min_replicas_before_ack`. No datacenter affinity, and the volume anchor still forces one replica into the anchor datacenter. Unknown values act as `cold`. See [FUSE mount](../access/fuse-mount.md#first-write-tier-preference-bug-av). |
+| `first_write_tier` | string | `"cold"` | `cold`: no tier hint, the manager uses the volume's own policy. `nearest-warm`: asks for the warm tier; honoured when a healthy warm disk exists, replica count clamped up to `write_safety.min_replicas_before_ack`. No datacenter affinity, and the volume anchor still forces one replica into the anchor datacenter. Unknown values act as `cold`. See [FUSE mount](../access/fuse-mount.md#writes). |
 | `flush_batch_chunks` | u32 | `4` | Complete chunks held back before one `AllocateChunks` plus `CommitChunkLocations` round trip. Clamped to 1..=32 and further so that `batch x chunk_size_mb <= 64`. `1` flushes per chunk. `flush`/close always drains held chunks. |
 
 ## `[partition_safety]`

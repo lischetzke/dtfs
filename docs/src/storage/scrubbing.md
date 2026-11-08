@@ -57,7 +57,7 @@ quarantine_on_fault    = true
 auto_unquarantine_secs = 0
 ```
 
-The data node's own fallback block uses `quick_interval_hours` (6) and `deep_interval_hours` (168). See [Manager Configuration](../configuration/manager.md#scrub----cluster-wide-scrub--integrity-policy) and [Data Node](../configuration/data-node.md) for the full reference. There is no scheduling window and no bandwidth setting.
+The data node's own fallback block uses `quick_interval_hours` (6) and `deep_interval_hours` (168). See [Manager Configuration](../configuration/manager.md#scrub-optional) and [Data Node](../configuration/data-node.md) for the full reference. There is no scheduling window and no bandwidth setting.
 
 ### I/O throttling
 

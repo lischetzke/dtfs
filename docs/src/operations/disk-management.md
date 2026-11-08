@@ -130,7 +130,7 @@ Replace at the **same `[[disks]]` position and mount path**.
 
 Deleting a file (`unlink`) only removes its metadata; there is no immediate chunk
 delete. The orphan reaper deletes chunks that no file references once their
-on-disk `.dat` is older than `orphan_grace_secs` (default 86 400 s), checked every
+on-disk `.dat` is older than `orphan_grace_secs` (default 86 400 s, minimum 21 600 s), checked every
 `orphan_interval_secs` (default 86 400 s), so free space returns about one to two
 days after the delete. See [Orphan Chunk Cleanup](./orphan-cleanup-runbook.md) to
 speed that up.
@@ -154,7 +154,7 @@ another copy. With `[scrub] quarantine_on_fault = true` (default) a single fault
 also quarantines the whole node until an operator runs `dtfs-cli unquarantine`;
 with `false` faults are still recorded and chunks quarantined individually but the
 node keeps serving. `dtfs-cli scrub --level quick|deep` triggers a cluster-wide
-scrub (targeted `--disk`/`--file`/`--chunk` scrubs are rejected by the API). See
+scrub (targeted scrubs are not supported). See
 [Scrubbing](../storage/scrubbing.md).
 
 ## Capacity Planning
