@@ -48,3 +48,5 @@ dummy_files/
 !.claude/hooks/**
 .claude/skills/*-workspace/
 environments.yml
+
+__pycache__/
