@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use dtfs_common::hash_ring::{ConsistentHashRing, PlacementRule};
 use dtfs_common::topology::Location;
-use dtfs_common::types::{DiskTier, FailureDomain, HealthStatus, NodeId};
+use dtfs_common::types::{DiskInfo, DiskTier, FailureDomain, HealthStatus, NodeId};
 use dtfs_raft::state_machine::StateMachineData;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::RwLock as TokioRwLock;
 
 /// A single chunk placement decision.
@@ -28,13 +28,19 @@ pub struct PlacementEngine {
     /// Bug BU — free-space headroom used to exclude near-full disks from
     /// the ring so new chunks route to a disk that can hold them.
     placement_cfg: dtfs_common::config::PlacementConfig,
+    /// Every ring input as of the last build; equal key = identical ring.
+    ring_key: Mutex<Option<Vec<RingKeyEntry>>>,
 }
+
+/// Per-node ring inputs: (node id, health, location, disks).
+type RingKeyEntry = (u64, HealthStatus, Location, Vec<DiskInfo>);
 
 impl PlacementEngine {
     pub fn new(placement_cfg: dtfs_common::config::PlacementConfig) -> Self {
         Self {
             ring: RwLock::new(ConsistentHashRing::new(256)),
             placement_cfg,
+            ring_key: Mutex::new(None),
         }
     }
 
@@ -43,8 +49,23 @@ impl PlacementEngine {
     /// Skips nodes that aren't `Healthy`: assigning chunks to a `Down` or
     /// `Suspect` node guarantees the write will fail at the data plane while
     /// the metadata plane has already created the file entry. (Fix for F-012.)
-    pub async fn rebuild_ring(&self, sm: &Arc<TokioRwLock<StateMachineData>>) {
+    ///
+    /// Returns `false` (ring reused) when every ring input is unchanged since
+    /// the last build; `allocate_chunks` calls this per batch.
+    pub async fn rebuild_ring(&self, sm: &Arc<TokioRwLock<StateMachineData>>) -> bool {
         let data = sm.read().await;
+        let key: Vec<RingKeyEntry> = data
+            .nodes
+            .iter()
+            .map(|(id, n)| (*id, n.health, n.location.clone(), n.disks.clone()))
+            .collect();
+        // Held across the build so a concurrent caller never sees the new key
+        // with the old ring.
+        let mut last_key = self.ring_key.lock();
+        if last_key.as_ref() == Some(&key) {
+            return false;
+        }
+        *last_key = Some(key);
         let mut new_ring = ConsistentHashRing::new(256);
 
         for (node_id, info) in &data.nodes {
@@ -92,6 +113,7 @@ impl PlacementEngine {
         }
 
         *self.ring.write() = new_ring;
+        true
     }
 
     /// P0-10: place chunks for a volume that may have a `required_datacenter`
@@ -344,6 +366,41 @@ mod bu1_capacity_ring_tests {
             }
         }
         assert!(seen.contains("1") && seen.contains("2"), "both eligible nodes used, got {seen:?}");
+    }
+
+    // The ring is rebuilt only when a ring input (node set, health incl.
+    // quarantine/maintenance, location, disks incl. free space) changed.
+    #[tokio::test]
+    async fn ring_rebuilt_only_on_topology_change() {
+        let gib = 1024 * 1024 * 1024u64;
+        let mut sm = StateMachineData::default();
+        sm.nodes.insert(1, mk_node("data01", "rack-1", 20 * gib, 0));
+        let sm_arc = Arc::new(TokioRwLock::new(sm));
+        let engine = PlacementEngine::new(dtfs_common::config::PlacementConfig::default());
+
+        assert!(engine.rebuild_ring(&sm_arc).await, "first call builds");
+        assert!(!engine.rebuild_ring(&sm_arc).await, "unchanged topology reuses the ring");
+
+        sm_arc.write().await.nodes.get_mut(&1).unwrap().health = HealthStatus::Quarantined;
+        assert!(engine.rebuild_ring(&sm_arc).await, "health flip rebuilds");
+        assert!(engine.place_chunks_with_anchor("default", "/a", 1, DiskTier::Warm, 1, None).is_empty(),
+            "quarantined node left the ring");
+        sm_arc.write().await.nodes.get_mut(&1).unwrap().health = HealthStatus::Healthy;
+        assert!(engine.rebuild_ring(&sm_arc).await, "health flip back rebuilds");
+        assert!(!engine.rebuild_ring(&sm_arc).await);
+
+        let mut disk = sm_arc.read().await.nodes[&1].disks[0].clone();
+        disk.disk_id = 1;
+        sm_arc.write().await.nodes.get_mut(&1).unwrap().disks.push(disk);
+        assert!(engine.rebuild_ring(&sm_arc).await, "disk added rebuilds");
+        assert!(!engine.rebuild_ring(&sm_arc).await);
+
+        sm_arc.write().await.nodes.get_mut(&1).unwrap().disks[0].used_bytes = gib;
+        assert!(engine.rebuild_ring(&sm_arc).await, "free-space change (ring weight) rebuilds");
+
+        sm_arc.write().await.nodes.insert(2, mk_node("data02", "rack-2", 20 * gib, 0));
+        assert!(engine.rebuild_ring(&sm_arc).await, "node added rebuilds");
+        assert!(!engine.rebuild_ring(&sm_arc).await);
     }
 }
 

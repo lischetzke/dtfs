@@ -2362,10 +2362,7 @@ impl ManagerService for MetadataService {
             request.metadata(),
         )?;
         let req = request.into_inner();
-        info!(
-            "AllocateChunks for file: {}, count: {}",
-            req.path, req.num_chunks
-        );
+        tracing::debug!(path = %req.path, num_chunks = req.num_chunks, "AllocateChunks");
 
         // REV-4-2 — `num_chunks` is peer-controlled. Bound it BEFORE the
         // ring rebuild, before the placement allocation and before the
