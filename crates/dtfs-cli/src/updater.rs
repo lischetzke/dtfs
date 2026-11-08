@@ -147,6 +147,16 @@ pub fn resolve_token(flag: Option<&str>, env: Option<&str>, cfg: Option<&str>) -
         .map(|s| s.to_string())
 }
 
+/// Minisign key precedence: `--minisign-key` > `DTFS_MINISIGN_PUBKEY` env >
+/// `[updater].minisign_public_key`. Blank values are skipped.
+pub fn resolve_minisign_key(flag: Option<&str>, env: Option<&str>, cfg: Option<&str>) -> Option<String> {
+    [flag, env, cfg]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
 /// GitHub release tarball URL. `tag = None` → the `latest` release.
 pub fn tarball_url(repo_url: &str, tag: Option<&str>) -> String {
     let base = repo_url.trim_end_matches('/');
@@ -226,6 +236,7 @@ pub fn run(
     install_dir_flag: Option<String>,
     config_path: Option<String>,
     token_flag: Option<String>,
+    minisign_key_flag: Option<String>,
     no_restart: bool,
     yes: bool,
 ) -> Result<()> {
@@ -244,10 +255,8 @@ pub fn run(
         cfg_token = cfg_token.or(t);
         cfg_key = cfg_key.or(k);
     }
-    let minisign_key = std::env::var("DTFS_MINISIGN_PUBKEY")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or(cfg_key.filter(|s| !s.trim().is_empty()));
+    let env_key = std::env::var("DTFS_MINISIGN_PUBKEY").ok();
+    let minisign_key = resolve_minisign_key(minisign_key_flag.as_deref(), env_key.as_deref(), cfg_key.as_deref());
 
     let env_repo = std::env::var("DTFS_REPO_URL").ok();
     let repo_url = resolve_repo_url(
@@ -910,6 +919,15 @@ mod tests {
             tarball_url("https://github.com/lischetzke/dtfs/", Some("v1.2.3")),
             "https://github.com/lischetzke/dtfs/releases/download/v1.2.3/dtfs-linux-amd64.tar.gz"
         );
+    }
+
+    #[test]
+    fn minisign_key_precedence_flag_env_config() {
+        assert_eq!(resolve_minisign_key(Some("f"), Some("e"), Some("c")).as_deref(), Some("f"));
+        assert_eq!(resolve_minisign_key(None, Some("e"), Some("c")).as_deref(), Some("e"));
+        assert_eq!(resolve_minisign_key(Some(" "), None, Some("c")).as_deref(), Some("c"));
+        assert_eq!(resolve_minisign_key(Some(""), Some("\n"), Some(" ")), None);
+        assert_eq!(resolve_minisign_key(None, None, None), None);
     }
 
     #[test]

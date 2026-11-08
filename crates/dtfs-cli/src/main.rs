@@ -177,6 +177,10 @@ enum Commands {
         /// GitLab token for a private project (default: DTFS_REPO_TOKEN, then [updater].token).
         #[arg(long)]
         token: Option<String>,
+        /// Minisign public key (base64 line or .pub text) used to verify SHA256SUMS
+        /// (default: DTFS_MINISIGN_PUBKEY, then [updater].minisign_public_key).
+        #[arg(long)]
+        minisign_key: Option<String>,
         /// Install the new binary but do not restart the service.
         #[arg(long)]
         no_restart: bool,
@@ -787,9 +791,10 @@ async fn main() -> anyhow::Result<()> {
             install_dir,
             config,
             token,
+            minisign_key,
             no_restart,
             yes,
-        } => updater::run(target, check, tag, repo_url, install_dir, config, token, no_restart, yes)?,
+        } => updater::run(target, check, tag, repo_url, install_dir, config, token, minisign_key, no_restart, yes)?,
     }
 
     Ok(())

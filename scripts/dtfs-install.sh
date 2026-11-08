@@ -65,6 +65,12 @@ Config flags (also usable interactively as prompt defaults):
                                (default: only print the chown command)
   --bootstrap true|false (manager)  --disks /a,/b (data)
   --mountpoint P (fuse-client)
+  --minisign-key K             verify the release: K is a minisign public key
+                               (base64 line, or a .pub file path); needs the
+                               minisign binary and SHA256SUMS + .minisig next
+                               to the tarball (or at the release URL). Install
+                               is refused on any failure. Without a key a
+                               warning says authenticity is NOT verified.
   --uninstall [--purge --yes]  remove units/binaries; --purge --yes also
                                deletes /etc/dtfs and /var/lib/dtfs.
 
@@ -73,6 +79,7 @@ Env vars:
   DTFS_LOCAL_BIN_DIR  highest-priority local search dir (optional).
   DTFS_REPO_URL       override the release repo. Default:
                       https://github.com/lischetzke/dtfs
+  DTFS_MINISIGN_PUBKEY  default for --minisign-key.
   DTFS_REPO_TOKEN     GitLab deploy token (gldt-..., read_package_registry)
                       or access token (glpat-..., read_api) for a private
                       project; empty = anonymous.
@@ -97,6 +104,8 @@ SHARED_SECRET="${DTFS_SHARED_SECRET:-}"
 BOOTSTRAP=""
 DISKS=""
 CHOWN_DISKS=0
+MINISIGN_KEY="${DTFS_MINISIGN_PUBKEY:-}"
+SUMS_URL_BASE=""   # set by the remote download; where SHA256SUMS(.minisig) live
 MOUNTPOINT=""
 TARBALL=""
 ROLE_ARG=""
@@ -125,6 +134,7 @@ while [ $# -gt 0 ]; do
         --bootstrap)    shift; BOOTSTRAP="${1:-}" ;;
         --disks)        shift; DISKS="${1:-}" ;;
         --chown-disks)  CHOWN_DISKS=1 ;;
+        --minisign-key) shift; MINISIGN_KEY="${1:-}" ;;
         --mountpoint)   shift; MOUNTPOINT="${1:-}" ;;
         --role)
             shift; ROLE_ARG="${1:-}"
@@ -276,6 +286,7 @@ if [ -z "$TARBALL" ]; then
         if fetch_hops "$url" "$out.partial"; then
             mv "$out.partial" "$out"
             TARBALL="$out"
+            SUMS_URL_BASE="${url%/*}"
             return 0
         else
             rm -f "$out.partial"
@@ -326,6 +337,37 @@ STAGING_DIR="${STAGING_ROOT}/${VERSION_TAG}"
 mkdir -p "$STAGING_DIR"
 cp -f "$TARBALL" "${STAGING_DIR}/${TARBALL_BASENAME}"
 info "AZ-2: staged at ${STAGING_DIR}/${TARBALL_BASENAME}"
+
+# Release authenticity: minisign over SHA256SUMS (what scripts/ci/sign-release.sh
+# signs), then the tarball sha256 must be listed in it. Refuses the install on
+# any failure; with no key only warns (MANIFEST below still checks integrity).
+verify_minisign() {
+    if [ -z "$MINISIGN_KEY" ]; then
+        warn "no minisign key (--minisign-key / DTFS_MINISIGN_PUBKEY); release authenticity is NOT verified"
+        return 0
+    fi
+    command -v minisign >/dev/null 2>&1 || { error "--minisign-key given but the minisign binary is not installed"; return 1; }
+    local d sums sig keyarg got want
+    d="$(mktemp -d)"; sums="$d/SHA256SUMS"; sig="$d/SHA256SUMS.minisig"
+    if [ -f "$(dirname "$TARBALL")/SHA256SUMS" ] && [ -f "$(dirname "$TARBALL")/SHA256SUMS.minisig" ]; then
+        cp "$(dirname "$TARBALL")/SHA256SUMS" "$sums"; cp "$(dirname "$TARBALL")/SHA256SUMS.minisig" "$sig"
+    elif [ -n "$SUMS_URL_BASE" ]; then
+        fetch_hops "$SUMS_URL_BASE/SHA256SUMS" "$sums" && fetch_hops "$SUMS_URL_BASE/SHA256SUMS.minisig" "$sig" \
+            || { rm -rf "$d"; error "cannot fetch SHA256SUMS(.minisig) for signature check"; return 1; }
+    else
+        rm -rf "$d"; error "SHA256SUMS and SHA256SUMS.minisig not found next to $TARBALL"; return 1
+    fi
+    if [ -f "$MINISIGN_KEY" ]; then keyarg=(-p "$MINISIGN_KEY"); else keyarg=(-P "$MINISIGN_KEY"); fi
+    minisign -V "${keyarg[@]}" -m "$sums" -x "$sig" >/dev/null 2>&1 \
+        || { rm -rf "$d"; error "minisign signature verification of SHA256SUMS failed; refusing to install"; return 1; }
+    got="$(sha256sum "$TARBALL" | awk '{print $1}')"
+    want="$(awk '$2 ~ /(^|\/)dtfs-linux-amd64\.tar\.gz$/ || $2 == "*dtfs-linux-amd64.tar.gz" {print $1}' "$sums" | head -1)"
+    rm -rf "$d"
+    [ -n "$want" ] && [ "$want" = "$got" ] \
+        || { error "tarball sha256 $got does not match signed SHA256SUMS (${want:-no entry}); refusing to install"; return 1; }
+    info "minisign: SHA256SUMS signature and tarball checksum verified"
+}
+verify_minisign || exit 1
 
 # ─── gather role + cluster info (TUI, or flags/env with --noninteractive) ────
 # ask VAR TITLE PROMPT DEFAULT: keeps a flag/env preset, else prompts.
@@ -455,7 +497,7 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 tar -C "$TMP" -xzf "$TARBALL"
 [ -d "$TMP/dtfs" ] || { error "tarball missing dtfs/ root"; exit 1; }
 # Integrity gate (same as dtfs-cli update): every binary must match MANIFEST.
-# Not a signature check; use `dtfs-cli update` with a minisign key for that.
+# Not a signature check; see verify_minisign (--minisign-key) above for that.
 [ -f "$TMP/dtfs/MANIFEST" ] || { error "tarball has no dtfs/MANIFEST; refusing to install unverified binaries"; exit 1; }
 for b in dtfs-manager dtfs-data dtfs-fuse dtfs-cli; do
     want="$(awk -v b="$b" '$2==b {print $1}' "$TMP/dtfs/MANIFEST")"
