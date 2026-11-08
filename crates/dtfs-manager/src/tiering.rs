@@ -434,12 +434,12 @@ impl TieringEngine {
                     continue;
                 }
 
+                // Tiering ceiling, not the global one: promotions must not starve repair.
                 self.scheduler
-                    .schedule_replication(
-                        &d.chunk_id,
-                        d.current_node,
-                        target,
-                        d.target_tier,
+                    .schedule_replications(
+                        &[(d.chunk_id.as_str(), d.current_node, target, d.target_tier)],
+                        usize::MAX,
+                        crate::scheduler::TIERING_MAX_LIVE_TASKS,
                     )
                     .await;
 
