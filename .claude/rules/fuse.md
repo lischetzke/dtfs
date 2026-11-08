@@ -108,8 +108,9 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   deadline and each buffers ~3 MiB per target (put channel depth 2).
 - Batch is byte-clamped at `FLUSH_BATCH_MAX_BYTES` (64 MB); total dirty
   bytes per open file are capped at `DIRTY_BYTES_CAP` (2x) and
-  force-drained via `flush_complete()` before a hole fill or write would
-  exceed it.
+  force-drained via `WriteBuffer::cap_drain` (complete chunks, never the
+  chunks of the pending write: `keep`, they were just seeded) before a hole
+  fill or write would exceed it.
 - `write.async_commit` (default off = all of the above unchanged): FUSE
   flush/fsync commit nothing and only report a pending background error
   (`OpenFile.write_error`, once per fh, EIO); `release()` still runs
@@ -117,8 +118,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   `AGED_COMMITS_PER_TICK` paths) commits a path whose oldest buffered byte
   (`ChunkBuf.since`, kept across `restore_segments`) is `async_commit_secs`
   old, through `commit_all` with a writable non-detached fh. The cap drain
-  (`WriteBuffer::cap_drain`) then also drains partial chunks, never the
-  chunks of the pending write (`keep`, they were just seeded). The timer is
+  then also drains partial chunks outside `keep`. The timer is
   not serialised by the kernel like write/fsync/setattr, so write(), a
   writer's truncate, release and the timer hold `path_guard` (per-path
   tokio mutex, async mode only, never across another guard).

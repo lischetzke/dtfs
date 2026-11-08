@@ -340,31 +340,6 @@ impl WriteBuffer {
         segments
     }
 
-    /// R1 (FUSE-1 memory half) — drain EVERY complete chunk right now,
-    /// ignoring `flush_batch_chunks`. Unlike `flush()`, which deliberately
-    /// holds back below the batch threshold to amortize the
-    /// allocate+commit round trip, this exists purely as a memory-pressure
-    /// release valve: a caller nearing `DIRTY_BYTES_CAP` (e.g. the F-022
-    /// sparse-hole fill loop in `filesystem.rs::write()`) needs to commit
-    /// and drop whatever is already flushable RIGHT NOW, not wait for a
-    /// batch to fill. Partial (incomplete) chunks are left resident.
-    #[instrument(skip(self), fields(path = %path))]
-    pub fn flush_complete(&self, path: &str) -> Vec<ChunkSegment> {
-        let mut entry = match self.buffers.get_mut(path) {
-            Some(e) => e,
-            None => return Vec::new(),
-        };
-        let buf = entry.value_mut();
-        let segments = buf.extract_complete_chunks(self.chunk_size);
-        debug!(
-            path,
-            num_segments = segments.len(),
-            remaining = buf.chunks.len(),
-            "flush_complete: force-drained complete chunks (memory pressure)"
-        );
-        segments
-    }
-
     /// Extract every buffered chunk, including partial (not fully covered)
     /// ones. This should be called when the file is being closed or when
     /// all buffered data must be persisted regardless of alignment.
@@ -400,10 +375,9 @@ impl WriteBuffer {
     }
 
     /// `DIRTY_BYTES_CAP` release valve: if `dirty + incoming >= cap`, drain
-    /// every complete chunk (`flush_complete`, unchanged default). With
-    /// `partial` (async_commit): drain complete chunks outside `keep` (the
-    /// chunks the pending write touches and has just seeded), then, if still
-    /// at the cap, partial ones outside `keep`. Ascending by chunk index.
+    /// every complete chunk outside `keep` (the chunks the pending write
+    /// touches and has just seeded). With `partial` (async_commit), if still
+    /// at the cap, also partial ones outside `keep`. Ascending by chunk index.
     pub fn cap_drain(
         &self,
         path: &str,
@@ -415,9 +389,6 @@ impl WriteBuffer {
         if self.dirty_bytes(path).saturating_add(incoming) < cap {
             return Vec::new();
         }
-        if !partial {
-            return self.flush_complete(path);
-        }
         let Some(mut entry) = self.buffers.get_mut(path) else { return Vec::new() };
         let buf = entry.value_mut();
         let mut dirty: usize = buf.chunks.values().map(|cb| cb.data.len()).sum();
@@ -426,7 +397,7 @@ impl WriteBuffer {
         // Never a `keep` chunk: draining a chunk the pending write just
         // seeded would leave its bytes in a fresh unseeded chunk.
         for complete in [true, false] {
-            if !complete && dirty.saturating_add(incoming) < cap {
+            if !complete && (!partial || dirty.saturating_add(incoming) < cap) {
                 break;
             }
             let drain: Vec<u32> = buf
@@ -1087,7 +1058,7 @@ mod tests {
         assert_eq!(WriteBuffer::new_with_batch(4 * 1024 * 1024, 4).flush_batch_chunks, 4);
     }
 
-    // R1 (FUSE-1 memory half) — flush_complete() must drain EVERY complete
+    // R1 (FUSE-1 memory half) — the cap drain must take EVERY complete
     // chunk immediately, ignoring flush_batch_chunks entirely. A caller
     // reacting to memory pressure (DIRTY_BYTES_CAP) can't wait for a batch
     // to fill.
@@ -1101,9 +1072,10 @@ mod tests {
         assert_eq!(wb.dirty_bytes("/f"), 40 * chunk);
 
         // A normal flush() would emit exactly one batch of 4 (holding back
-        // the rest); flush_complete() must take everything at once.
-        let segs = wb.flush_complete("/f");
-        assert_eq!(segs.len(), 40, "flush_complete must drain every complete chunk");
+        // the rest); the cap drain must take everything at once.
+        #[allow(clippy::reversed_empty_ranges)]
+        let segs = wb.cap_drain("/f", 0, 0, false, 1..=0);
+        assert_eq!(segs.len(), 40, "the cap drain must take every complete chunk");
         for (idx, seg) in segs.iter().enumerate() {
             assert_eq!(seg.chunk_index, idx as u32);
             assert!(!seg.needs_seed);
@@ -1498,6 +1470,21 @@ mod async_commit_tests {
         assert!(!wb.chunk_needs_seed("/f", 2), "still seeded for the pending write");
     }
 
+    /// Default mode: the cap drain takes complete chunks only, and never the
+    /// one the pending write just seeded to full (its bytes would land in a
+    /// fresh unseeded chunk and be refused at close).
+    #[test]
+    fn cap_drain_default_keeps_the_seeded_chunk_of_the_pending_write() {
+        let wb = WriteBuffer::new_with_batch(CS, 4);
+        wb.write("/f", 0, &[1; CS]); // complete chunk 0
+        wb.seed_chunk("/f", 2, &[9; CS]); // complete after the seed
+        wb.write("/f", 3 * CS as u64, &[3; 2]); // partial: never in default mode
+        let segs = wb.cap_drain("/f", 1, 1, false, 2..=2);
+        assert_eq!(segs.iter().map(|s| s.chunk_index).collect::<Vec<_>>(), vec![0]);
+        assert!(!wb.chunk_needs_seed("/f", 2), "still seeded for the pending write");
+        assert_eq!(wb.dirty_bytes("/f"), CS + 2);
+    }
+
     #[test]
     fn cap_drain_async_stops_once_complete_chunks_suffice() {
         let wb = WriteBuffer::new_with_batch(CS, 4);
@@ -1730,12 +1717,6 @@ mod async_commit_tests {
                     rng % m
                 };
                 let mut sim = Sim::new(async_on);
-                if !async_on {
-                    // Default mode keeps `flush_complete`, which can drain a
-                    // chunk the pending write just seeded (pre-existing,
-                    // reported); model the default with the cap out of reach.
-                    sim.cap = usize::MAX / 2;
-                }
                 for _ in 0..80 {
                     let logical = sim.model.len() as u64;
                     sim.trace.push(format!("size={} buf={:?}", sim.size, sim.wb.logical_size(P)));
