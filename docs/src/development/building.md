@@ -55,11 +55,11 @@ Confirm what is running with `dtfs-<binary> --version`. Guards: `scripts/tests/t
 
 ### Release artifacts
 
-`dtfs-release.sh` produces `dtfs-linux-amd64.tar.gz` (`dtfs/bin/*`, `dtfs/systemd/*`, `dtfs/MANIFEST` with per-binary sha256), `SHA256SUMS` and release notes. Releases are cut by the GitLab pipeline (`.gitlab-ci.yml`): a commit whose subject starts with `release vX.Y.Z` publishes that version, one starting with `deploy` publishes an alpha `v<base>_<YYYYMMDDHHmm>`; both then run the rolling update. See [CI Pipeline](../operations/ci-pipeline.md).
+`dtfs-release.sh` produces `dtfs-linux-amd64.tar.gz` (`dtfs/bin/*`, `dtfs/systemd/*`, `dtfs/MANIFEST` with per-binary sha256), `SHA256SUMS` and release notes. Releases are cut by CI: a commit whose subject starts with `release vX.Y.Z` publishes that version, one starting with `deploy` publishes an alpha `v<base>_<YYYYMMDDHHmm>`; both then run the rolling update. See [CI Pipeline](../operations/ci-pipeline.md).
 
 ### `dtfs-cli update`
 
-The updater downloads the tarball from the GitLab package registry (default) or GitHub releases. It checks every binary against the tarball's `MANIFEST` and refuses to install anything if one hash differs. When a minisign public key is configured (`[updater].minisign_public_key` or `DTFS_MINISIGN_PUBKEY`) it also downloads `SHA256SUMS` and `SHA256SUMS.minisig`, verifies the signature, and checks the tarball's sha256 against the signed list; without a key it prints a warning that authenticity is not verified. Redirects are followed by hand: the access token header is sent only on the first request (never to a redirect target on another host), later hops are HTTPS-only. Token precedence: `--token`, then `DTFS_REPO_TOKEN`, then `[updater].token`. The installed binary is swapped atomically and the matching service is restarted.
+The updater downloads the tarball from GitHub releases. It checks every binary against the tarball's `MANIFEST` and refuses to install anything if one hash differs. When a minisign public key is configured (`[updater].minisign_public_key` or `DTFS_MINISIGN_PUBKEY`) it also downloads `SHA256SUMS` and `SHA256SUMS.minisig`, verifies the signature, and checks the tarball's sha256 against the signed list; without a key it prints a warning that authenticity is not verified. Redirects are followed by hand: the access token header is sent only on the first request (never to a redirect target on another host), later hops are HTTPS-only. Token precedence: `--token`, then `DTFS_REPO_TOKEN`, then `[updater].token`. The installed binary is swapped atomically and the matching service is restarted.
 
 ## Troubleshooting
 

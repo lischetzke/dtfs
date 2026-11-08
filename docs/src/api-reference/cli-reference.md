@@ -103,17 +103,17 @@ Updates binaries on **this host** (run as root). The rolling cluster-wide update
 |---|---|
 | `<target>` | `manager`, `data`, `fuse` (alias `client`), `cli` or `all`. Binaries and services: `dtfs-manager` / `dtfs-manager.service`, `dtfs-data` / `dtfs-data.service`, `dtfs-fuse` / `dtfs-fuse@*` (all running instances), `dtfs-cli` (no service). |
 | `--check` | Print the latest release and installed versions; change nothing. |
-| `--tag <tag>` | Install this release. Default: the newest full `vX.Y.Z` release; alpha tags (`vX.Y.Z_YYYYMMDDHHmm`) are skipped unless named. |
-| `--repo-url <url>` | Release source. Precedence: flag, `[updater].repo_url`, `DTFS_REPO_URL`, built-in GitLab project. |
+| `--tag <tag>` | Install this release. Default: GitHub's latest release (prereleases are skipped unless named). |
+| `--repo-url <url>` | Release source. Precedence: flag, `[updater].repo_url`, `DTFS_REPO_URL`, built-in `https://github.com/lischetzke/dtfs`. Must be a github.com repo; anything else is an error. |
 | `--install-dir <dir>` | Default `[updater].install_dir`, else `/usr/local/bin`. |
 | `--config <file>` | File to read `[updater]` from. Default `/etc/dtfs/<role>.toml` (`manager`, `data`, `fuse`); none for `cli` and `all`. |
-| `--token <token>` | GitLab token. Precedence: flag, `DTFS_REPO_TOKEN`, `[updater].token`. `gldt-` tokens are sent as `DEPLOY-TOKEN`, everything else as `PRIVATE-TOKEN`. |
+| `--token <token>` | Optional GitHub token (rate limits or a private fork). Precedence: flag, `DTFS_REPO_TOKEN`, `[updater].token`. Sent as `Authorization: Bearer` on the first request only. |
 | `--no-restart` | Install but leave services on the old binary until their next restart. |
 | `-y`, `--yes` | Skip the `Proceed? [y/N]` prompt (otherwise the command prompts; with no terminal input it prints `aborted; nothing installed` and still exits `0`, so always pass `-y` in automation). |
 
 Sequence:
 
-1. Resolve the tarball (`dtfs-linux-amd64.tar.gz`) from the GitLab Generic Package Registry (`.../packages/generic/dtfs/<tag>/`) or a github.com release.
+1. Resolve the tarball (`dtfs-linux-amd64.tar.gz`) from the GitHub release (`.../releases/download/<tag>/` or `releases/latest/download/`).
 2. Download to a private temporary directory.
 3. **Minisign verification** when a public key is configured (`[updater].minisign_public_key` or `DTFS_MINISIGN_PUBKEY`; env wins): also download `SHA256SUMS` and `SHA256SUMS.minisig` from the same location, verify the signature, and require the tarball's SHA-256 to match the signed `SHA256SUMS`. Any failure aborts before extraction. Without a key a warning is printed and only the in-tarball `MANIFEST` is checked.
 4. Extract and verify every target binary against the tarball `MANIFEST` SHA-256; one mismatch aborts with nothing installed.

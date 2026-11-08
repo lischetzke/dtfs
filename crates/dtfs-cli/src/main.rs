@@ -177,7 +177,7 @@ enum Commands {
         /// Read [updater] from this config file (default: /etc/dtfs/<role>.toml).
         #[arg(long)]
         config: Option<String>,
-        /// GitLab token for a private project (default: DTFS_REPO_TOKEN, then [updater].token).
+        /// GitHub token for rate limits or a private fork (default: DTFS_REPO_TOKEN, then [updater].token).
         #[arg(long)]
         token: Option<String>,
         /// Minisign public key (base64 line or .pub text) used to verify SHA256SUMS

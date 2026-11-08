@@ -211,8 +211,8 @@ Read by [`dtfs-cli update`](../api-reference/cli-reference.md#update); the daemo
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `repo_url` | string | `https://github.com/lischetzke/dtfs` | GitLab project URL (Generic Package Registry) or a github.com repo. Precedence: `--repo-url`, this key, `DTFS_REPO_URL`, built-in default. |
-| `token` | string | `""` | GitLab deploy token (`gldt-...`, scope `read_package_registry`) or access token (`glpat-...`, scope `read_api`). Precedence: `--token`, `DTFS_REPO_TOKEN`, this key. |
+| `repo_url` | string | `https://github.com/lischetzke/dtfs` | GitHub repo URL (github.com only). Precedence: `--repo-url`, this key, `DTFS_REPO_URL`, built-in default. |
+| `token` | string | `""` | Optional GitHub token (rate limits or a private fork), sent as `Authorization: Bearer`. Precedence: `--token`, `DTFS_REPO_TOKEN`, this key. |
 | `minisign_public_key` | string | `""` | Minisign public key (base64 line or full `.pub` text). `DTFS_MINISIGN_PUBKEY` overrides it. When set, `SHA256SUMS` must carry a valid signature and list the tarball's hash, else the install is refused. Empty: unverified, a warning is printed. |
 | `install_dir` | string | `/usr/local/bin` | Overridden by `--install-dir`. |
 

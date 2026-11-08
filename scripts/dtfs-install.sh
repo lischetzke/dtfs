@@ -43,8 +43,7 @@ AZ-2 source selection flags (in addition to the legacy positional arg):
                                $DTFS_LOCAL_BIN_DIR, ./target/release,
                                /opt/dtfs/staging/*/release, ~/.cache/dtfs;
                                `remote` downloads the release tarball from
-                               $DTFS_REPO_URL (GitLab package registry, or
-                               GitHub releases for a github.com URL;
+                               $DTFS_REPO_URL (GitHub releases, github.com only;
                                `github` is accepted as an alias); `auto`
                                tries local first, then remote.
   --version <tag>              Release tag (default `latest` = newest full
@@ -80,9 +79,8 @@ Env vars:
   DTFS_REPO_URL       override the release repo. Default:
                       https://github.com/lischetzke/dtfs
   DTFS_MINISIGN_PUBKEY  default for --minisign-key.
-  DTFS_REPO_TOKEN     GitLab deploy token (gldt-..., read_package_registry)
-                      or access token (glpat-..., read_api) for a private
-                      project; empty = anonymous.
+  DTFS_REPO_TOKEN     optional GitHub token (rate limits or a private fork),
+                      sent as a Bearer header; empty = anonymous.
 AZ2HELP
         exit 0
     fi
@@ -217,24 +215,12 @@ if [ -z "$TARBALL" ]; then
         done
         return 1
     }
-    # Header for a GitLab token: deploy tokens (gldt-...) use DEPLOY-TOKEN,
-    # project/personal access tokens use PRIVATE-TOKEN (mirrors
-    # dtfs-cli/src/updater.rs::token_header).
+    # Header for the optional GitHub token (mirrors updater.rs::token_header).
     repo_auth_args() {
         [ -n "$REPO_TOKEN" ] || return 0
-        case "$REPO_TOKEN" in
-            gldt-*) printf -- '-H\nDEPLOY-TOKEN: %s\n' "$REPO_TOKEN" ;;
-            *)      printf -- '-H\nPRIVATE-TOKEN: %s\n' "$REPO_TOKEN" ;;
-        esac
-    }
-    # GitLab API base for a project URL: https://host/group/project ->
-    # https://host/api/v4/projects/group%2Fproject
-    gitlab_api_base() {
-        local u="${REPO%/}"; u="${u%.git}"
-        local scheme="${u%%://*}" rest="${u#*://}"
-        local host="${rest%%/*}" path="${rest#*/}"
-        [ -n "$host" ] && [ -n "$path" ] && [ "$path" != "$rest" ] || return 1
-        printf '%s://%s/api/v4/projects/%s' "$scheme" "$host" "${path//\//%2F}"
+        printf -- '-H
+Authorization: Bearer %s
+' "$REPO_TOKEN"
     }
     # fetch_hops URL OUT: https only; redirects followed by hand so the token
     # header goes to the first hop only (mirrors updater.rs::curl_download).
@@ -256,30 +242,21 @@ if [ -z "$TARBALL" ]; then
         local url
         local -a auth=()
         mapfile -t auth < <(repo_auth_args)
-        case "$REPO" in
-            https://github.com/*|http://github.com/*)
-                if [ "$tag" = "latest" ]; then
-                    url="${REPO}/releases/latest/download/dtfs-linux-amd64.tar.gz"
-                else
-                    url="${REPO}/releases/download/${tag}/dtfs-linux-amd64.tar.gz"
-                fi
-                ;;
-            *)
-                local api
-                api="$(gitlab_api_base)" || { error "AZ-2: cannot derive a GitLab project from $REPO"; return 1; }
-                if [ "$tag" = "latest" ]; then
-                    # Newest full release (vX.Y.Z); alpha tags (vX.Y.Z_stamp) are skipped.
-                    command -v jq >/dev/null 2>&1 || { error "AZ-2: jq is required to resolve 'latest' from GitLab"; return 1; }
-                    local rel; rel="$(mktemp)"
-                    fetch_hops "${api}/releases?per_page=50" "$rel" || { rm -f "$rel"; return 1; }
-                    tag="$(jq -r '[.[] | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | first // empty' "$rel")"
-                    rm -f "$rel"
-                    [ -n "$tag" ] || { error "AZ-2: no full release found at ${api}/releases"; return 1; }
-                    info "AZ-2: latest full release is $tag"
-                fi
-                url="${api}/packages/generic/dtfs/${tag}/dtfs-linux-amd64.tar.gz"
-                ;;
+        case "${REPO%/}" in
+            https://github.com/*/*) ;;
+            *) error "AZ-2: DTFS_REPO_URL must be https://github.com/<owner>/<repo> (got $REPO)"; return 1 ;;
         esac
+        local base="${REPO%/}"; base="${base%.git}"
+        if [ "$tag" = "latest" ]; then
+            # /releases/latest redirects to /releases/tag/<tag>; resolve it so the
+            # cache name and SHA256SUMS location are pinned to one release.
+            local loc
+            loc="$(curl -fsS --proto '=https' --tlsv1.2 "${auth[@]}" -o /dev/null -w '%{redirect_url}' "${base}/releases/latest")"                 || { error "AZ-2: cannot resolve the latest release of $base"; return 1; }
+            tag="${loc##*/releases/tag/}"
+            case "$tag" in ""|*/*|"$loc") error "AZ-2: no release found at ${base}/releases/latest"; return 1 ;; esac
+            info "AZ-2: latest release is $tag"
+        fi
+        url="${base}/releases/download/${tag}/dtfs-linux-amd64.tar.gz"
         mkdir -p "$DOWNLOAD_CACHE"
         local out="${DOWNLOAD_CACHE}/dtfs-${tag}-linux-amd64.tar.gz"
         info "AZ-2: downloading $url -> $out"

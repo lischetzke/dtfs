@@ -1,13 +1,11 @@
 //! AZ-5 — `dtfs-cli update`: pull a release tarball, verify it against
 //! the in-tarball MANIFEST (sha256), atomically install the target
 //! binary, and restart the matching systemd service on the local host.
-//! Local-node only; the cluster-wide rolling update is the GitLab
-//! pipeline (`deploy/ansible/update-cluster.yml`).
+//! Local-node only; the cluster-wide rolling update is
+//! `deploy/ansible/update-cluster.yml`.
 //!
-//! Sources (`release_source`): a GitLab project URL (the default,
-//! `dtfs_common::REPO_URL`) reads the Generic Package Registry and the
-//! Releases API, optionally with a deploy/access token; a github.com URL
-//! keeps the legacy releases/download path.
+//! Source (`release_source`): GitHub releases of a github.com repo (the
+//! default, `dtfs_common::REPO_URL`), optionally with a GitHub token.
 //!
 //! Network/IO is delegated to the same tools the deploy layer already
 //! uses (`curl`, `tar`, `install`, `systemctl`); the only Rust deps are
@@ -61,82 +59,20 @@ pub fn service_for_binary(bin: &str) -> Option<&'static str> {
     }
 }
 
-/// Where a `repo_url` points.
+/// Where a `repo_url` points: a github.com `owner/repo` (the only source).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseSource {
-    /// github.com `owner/repo` (legacy releases/download URLs).
     GitHub { owner: String, repo: String },
-    /// A GitLab project; `api` is `https://<host>/api/v4/projects/<group>%2F<project>`.
-    GitLab { api: String },
 }
 
-/// Classify `repo_url`. GitLab is the default for any non-github.com
-/// host: the project path is URL-encoded into the `/projects/:id` form
-/// so no numeric project id is needed. `None` when no project path can
-/// be found.
+/// Classify `repo_url`; `None` unless it is a github.com `owner/repo`.
 pub fn release_source(repo_url: &str) -> Option<ReleaseSource> {
-    if let Some((owner, repo)) = parse_owner_repo(repo_url) {
-        return Some(ReleaseSource::GitHub { owner, repo });
-    }
-    let s = repo_url.trim().trim_end_matches('/');
-    let (scheme, rest) = s.split_once("://")?;
-    let (host, path) = rest.split_once('/')?;
-    let path = path.trim_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    if host.is_empty() || path.is_empty() {
-        return None;
-    }
-    let encoded = path.replace('/', "%2F");
-    Some(ReleaseSource::GitLab {
-        api: format!("{scheme}://{host}/api/v4/projects/{encoded}"),
-    })
+    parse_owner_repo(repo_url).map(|(owner, repo)| ReleaseSource::GitHub { owner, repo })
 }
 
-/// GitLab Generic Package Registry URL of the tarball for `tag`
-/// (package `dtfs`, the layout `scripts/ci/gitlab-release.sh` uploads).
-pub fn gitlab_tarball_url(api: &str, tag: &str) -> String {
-    format!("{api}/packages/generic/dtfs/{tag}/{ASSET}")
-}
-
-/// GitLab Releases API listing (newest first).
-pub fn gitlab_releases_url(api: &str) -> String {
-    format!("{api}/releases?per_page=50")
-}
-
-/// Header line for a GitLab token: deploy tokens (`gldt-...`) go in
-/// `DEPLOY-TOKEN`, project/personal access tokens (`glpat-...` or
-/// anything else) in `PRIVATE-TOKEN`.
+/// Header line for the optional GitHub token (rate limits / private fork).
 pub fn token_header(token: &str) -> String {
-    if token.starts_with("gldt-") {
-        format!("DEPLOY-TOKEN: {token}")
-    } else {
-        format!("PRIVATE-TOKEN: {token}")
-    }
-}
-
-/// Is `tag` a full release (`vX.Y.Z`) rather than an alpha
-/// (`vX.Y.Z_YYYYMMDDHHmm`, the pipeline's `deploy` builds)?
-pub fn is_full_release_tag(tag: &str) -> bool {
-    let Some(rest) = tag.strip_prefix('v') else { return false };
-    let parts: Vec<&str> = rest.split('.').collect();
-    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// Pick the newest release tag from a GitLab `/releases` listing
-/// (already newest-first). Alphas are skipped unless `include_alpha`.
-/// Returns `(tag, released_at)`.
-pub fn pick_latest_release(json: &str, include_alpha: bool) -> Option<(String, String)> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let arr = v.as_array()?;
-    for rel in arr {
-        let tag = rel.get("tag_name")?.as_str()?;
-        if !include_alpha && !is_full_release_tag(tag) {
-            continue;
-        }
-        let at = rel.get("released_at").and_then(|t| t.as_str()).unwrap_or("").to_string();
-        return Some((tag.to_string(), at));
-    }
-    None
+    format!("Authorization: Bearer {token}")
 }
 
 /// Token precedence: `--token` > `DTFS_REPO_TOKEN` env > `[updater].token`.
@@ -272,7 +208,7 @@ pub fn run(
     let token = resolve_token(token_flag.as_deref(), env_token.as_deref(), cfg_token.as_deref());
     let headers: Vec<String> = token.iter().map(|t| token_header(t)).collect();
     let source = release_source(&repo_url)
-        .with_context(|| format!("repo_url '{repo_url}' is neither a GitLab project URL nor a github.com repo"))?;
+        .with_context(|| format!("repo_url '{repo_url}' is not a github.com repo (https://github.com/<owner>/<repo>); GitHub is the only supported release source"))?;
 
     if check {
         return run_check(target, &source, &headers, &install_dir);
@@ -290,22 +226,10 @@ pub fn run(
 }
 
 /// Resolve the tarball URL for `tag` (or the latest full release).
-fn resolve_tarball_url(source: &ReleaseSource, headers: &[String], tag: Option<&str>) -> Result<String> {
+fn resolve_tarball_url(source: &ReleaseSource, tag: Option<&str>) -> Result<String> {
     match source {
         ReleaseSource::GitHub { owner, repo } => {
             Ok(tarball_url(&format!("https://github.com/{owner}/{repo}"), tag))
-        }
-        ReleaseSource::GitLab { api } => {
-            let tag = match tag {
-                Some(t) => t.to_string(),
-                None => {
-                    let body = curl_get(&gitlab_releases_url(api), headers)?;
-                    pick_latest_release(&body, false)
-                        .map(|(t, _)| t)
-                        .context("no full release (vX.Y.Z) found in the GitLab release list")?
-                }
-            };
-            Ok(gitlab_tarball_url(api, &tag))
         }
     }
 }
@@ -357,7 +281,7 @@ fn run_update(
     yes: bool,
 ) -> Result<()> {
     let bins = target_binaries(target);
-    let url = resolve_tarball_url(source, headers, tag)?;
+    let url = resolve_tarball_url(source, tag)?;
 
     // Stage into a fresh, unpredictable directory (CO-2-4): a fixed path
     // under temp_dir() is a symlink/race/clobber target. tempfile creates
@@ -507,11 +431,6 @@ fn run_check(
                 v.get("published_at").and_then(|t| t.as_str()).unwrap_or("").to_string(),
             )
         }
-        ReleaseSource::GitLab { api } => {
-            let body = curl_get(&gitlab_releases_url(api), headers)?;
-            pick_latest_release(&body, false)
-                .context("no full release (vX.Y.Z) found in the GitLab release list")?
-        }
     };
     let tag = tag.as_str();
     if published.is_empty() {
@@ -552,7 +471,7 @@ fn sibling_url(url: &str, name: &str) -> String {
 }
 
 /// curl argv for ONE hop. No `-L`: curl re-sends custom headers (the
-/// PRIVATE-TOKEN) to redirect targets on other hosts, so redirects are
+/// token) to redirect targets on other hosts, so redirects are
 /// followed by hand and only the first hop carries `headers`. https only on
 /// every hop so a hostile redirect cannot point at a local file.
 fn curl_hop_args(url: &str, headers: &[String], out: &Path, first_hop: bool) -> Vec<String> {
@@ -842,62 +761,19 @@ mod tests {
     }
 
     #[test]
-    fn release_source_gitlab_encodes_the_project_path() {
-        assert_eq!(
-            release_source("https://github.com/lischetzke/dtfs"),
-            Some(ReleaseSource::GitLab {
-                api: "https://gitlab.example.invalid/api/v4/projects/example%2Fdtfs".into()
-            })
-        );
-        // Trailing slash / .git are tolerated; nested groups encode every slash.
-        assert_eq!(
-            release_source("https://gl.example/a/b/c.git/"),
-            Some(ReleaseSource::GitLab { api: "https://gl.example/api/v4/projects/a%2Fb%2Fc".into() })
-        );
+    fn release_source_is_github_only() {
         assert_eq!(
             release_source("https://github.com/lischetzke/dtfs"),
             Some(ReleaseSource::GitHub { owner: "lischetzke".into(), repo: "dtfs".into() })
         );
-        assert_eq!(release_source("https://gl.example"), None);
-        assert_eq!(release_source("not a url"), None);
+        for bad in ["https://git.example/a/b", "https://gl.example", "not a url"] {
+            assert_eq!(release_source(bad), None, "{bad}");
+        }
     }
 
     #[test]
-    fn gitlab_urls_follow_the_pipeline_layout() {
-        let api = "https://gl.example/api/v4/projects/example%2Fdtfs";
-        assert_eq!(
-            gitlab_tarball_url(api, "v0.2.0"),
-            "https://gl.example/api/v4/projects/example%2Fdtfs/packages/generic/dtfs/v0.2.0/dtfs-linux-amd64.tar.gz"
-        );
-        assert_eq!(gitlab_releases_url(api), format!("{api}/releases?per_page=50"));
-    }
-
-    #[test]
-    fn token_header_picks_deploy_vs_private() {
-        assert_eq!(token_header("gldt-abc"), "DEPLOY-TOKEN: gldt-abc");
-        assert_eq!(token_header("glpat-abc"), "PRIVATE-TOKEN: glpat-abc");
-        assert_eq!(token_header("legacy"), "PRIVATE-TOKEN: legacy");
-    }
-
-    #[test]
-    fn latest_release_skips_alphas_unless_asked() {
-        let json = r#"[
-            {"tag_name": "v0.2.0_202609141200", "released_at": "2026-09-14T12:00:00Z"},
-            {"tag_name": "v0.2.0", "released_at": "2026-09-13T10:00:00Z"},
-            {"tag_name": "v0.1.9", "released_at": "2026-09-01T10:00:00Z"}
-        ]"#;
-        assert_eq!(
-            pick_latest_release(json, false),
-            Some(("v0.2.0".into(), "2026-09-13T10:00:00Z".into()))
-        );
-        assert_eq!(
-            pick_latest_release(json, true),
-            Some(("v0.2.0_202609141200".into(), "2026-09-14T12:00:00Z".into()))
-        );
-        assert_eq!(pick_latest_release("[]", false), None);
-        assert!(is_full_release_tag("v1.2.3"));
-        assert!(!is_full_release_tag("v1.2.3_202609141200"));
-        assert!(!is_full_release_tag("1.2.3"));
+    fn token_header_is_bearer() {
+        assert_eq!(token_header("ghp_abc"), "Authorization: Bearer ghp_abc");
     }
 
     #[test]
@@ -944,7 +820,7 @@ mod tests {
             parse_owner_repo("github.com/acme/widget"),
             Some(("acme".into(), "widget".into()))
         );
-        assert_eq!(parse_owner_repo("https://gitlab.com/a/b"), None);
+        assert_eq!(parse_owner_repo("https://example.com/a/b"), None);
         assert_eq!(parse_owner_repo("https://github.com/onlyowner"), None);
         assert_eq!(parse_owner_repo("file:///tmp/repo"), None);
     }
@@ -985,15 +861,15 @@ mod tests {
 
     #[test]
     fn curl_hops_never_follow_redirects_with_token() {
-        let h = vec!["PRIVATE-TOKEN: t".to_string()];
+        let h = vec!["Authorization: Bearer t".to_string()];
         let out = Path::new("/tmp/o");
         let first = curl_hop_args("https://gl/x", &h, out, true);
         assert!(!first.contains(&"-L".to_string()) && !first.contains(&"-fL".to_string()));
-        assert!(first.contains(&"PRIVATE-TOKEN: t".to_string()));
+        assert!(first.contains(&"Authorization: Bearer t".to_string()));
         assert!(first.contains(&"=https".to_string()) && !first.iter().any(|a| a.contains("file")));
         assert_eq!(first.last().unwrap(), "https://gl/x");
         let next = curl_hop_args("https://s3/y", &h, out, false);
-        assert!(!next.contains(&"PRIVATE-TOKEN: t".to_string()) && !next.contains(&"-H".to_string()));
+        assert!(!next.contains(&"Authorization: Bearer t".to_string()) && !next.contains(&"-H".to_string()));
         assert!(next.contains(&"=https".to_string()));
         assert_eq!(redirect_target("https://s3/y\n").as_deref(), Some("https://s3/y"));
         assert_eq!(redirect_target(""), None);

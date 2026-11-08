@@ -302,21 +302,17 @@ fn default_memory_sample_secs() -> u64 {
 /// intentionally NOT a field on the manager/data/fuse config structs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdaterConfig {
-    /// Repo base URL releases are fetched from. A GitLab project URL
-    /// (`https://<host>/<group>/<project>`, the default) resolves to the
-    /// Generic Package Registry
-    /// `<host>/api/v4/projects/<group>%2F<project>/packages/generic/dtfs/<tag>/dtfs-linux-amd64.tar.gz`;
-    /// a github.com URL keeps the legacy
+    /// GitHub repo URL releases are fetched from (`https://github.com/<owner>/<repo>`,
+    /// the default). Assets resolve to
     /// `<repo_url>/releases/{latest/download,download/<tag>}/dtfs-linux-amd64.tar.gz`.
+    /// A non-github.com URL is rejected by `dtfs-cli update`.
     #[serde(default = "default_updater_repo_url")]
     pub repo_url: String,
     /// Directory the binaries are installed into (atomic `install -m 0755`).
     #[serde(default = "default_updater_install_dir")]
     pub install_dir: String,
-    /// GitLab token for a private project: a deploy token (`gldt-...`,
-    /// scope `read_package_registry`, sent as `DEPLOY-TOKEN`) or a
-    /// project/personal access token (`glpat-...`, scope `read_api`, sent
-    /// as `PRIVATE-TOKEN`). Empty = anonymous (public project / GitHub).
+    /// Optional GitHub token (rate limits or a private fork), sent as
+    /// `Authorization: Bearer` on the first request only. Empty = anonymous.
     /// Overridden by `--token` and the `DTFS_REPO_TOKEN` env var. Lives
     /// in the same 0640 file as `cluster.shared_secret`.
     #[serde(default)]
@@ -1725,7 +1721,7 @@ mod tests {
     #[test]
     fn updater_config_defaults() {
         let empty: UpdaterConfig = toml::from_str("").unwrap();
-        assert_eq!(empty.repo_url, crate::REPO_URL);
+        assert_eq!(empty.repo_url, "https://github.com/lischetzke/dtfs");
         assert_eq!(empty.install_dir, "/usr/local/bin");
         // Default impl agrees with the empty-parse path.
         assert_eq!(UpdaterConfig::default().repo_url, crate::REPO_URL);

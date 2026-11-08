@@ -387,7 +387,7 @@ For details on the planner's refusal logic, see
 
 ## Rolling Upgrades
 
-The GitLab pipeline does this for every `release`/`deploy` commit via
+The release pipeline does this for every `release`/`deploy` commit via
 `deploy/ansible/update-cluster.yml` ([CI Pipeline](./ci-pipeline.md)). The order
 (managers: learners, follower voters, leader last; then data nodes; then clients),
 the per-node steps, health gates, rollback and the config flips that must wait

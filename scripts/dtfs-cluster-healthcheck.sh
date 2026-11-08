@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DTFS cluster health check — read-only, runs from any host that can reach
-# the manager REST API. Used by the GitLab pipeline's verify stage and as
+# the manager REST API. Used by the CI verify stage and as
 # the final play of deploy/ansible/update-cluster.yml.
 #
 # Passes when, within --timeout seconds, ALL of the following hold:

@@ -53,6 +53,7 @@ check "data disks drop-in uses optional -paths" bash -c "grep -q \"printf -- '-%
 check "installer verifies binaries against MANIFEST" bash -c "grep -q 'integrity check failed for' '$SCRIPT'"
 check "installer never uses curl -L with the token" bash -c "! grep -qE 'curl -f?s?S?L' '$SCRIPT'"
 check "github URL is from DTFS_REPO_URL"    bash -c "grep -q 'DTFS_REPO_URL' '$SCRIPT'"
+check "non-github repo URL is refused"       bash -c "grep -q 'must be https://github.com/' '$SCRIPT'"
 
 echo
 if [ $fail -eq 0 ]; then

@@ -97,9 +97,8 @@ tier = "cold"
 
 #[updater]
 # AZ-5: read by `dtfs-cli update` only; the daemon ignores this block.
-# repo_url is a GitLab project URL (default) or a github.com repo. token is
-# needed for a private GitLab project: deploy token (gldt-..., scope
-# read_package_registry) or access token (glpat-..., scope read_api).
+# repo_url must be a github.com repo (default below). token is an optional
+# GitHub token (rate limits or a private fork), sent as a Bearer header.
 #repo_url = "https://github.com/lischetzke/dtfs"
 #token = ""
 # Minisign public key the release SHA256SUMS must be signed with (empty =

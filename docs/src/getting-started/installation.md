@@ -6,7 +6,7 @@ source (development). Installing a whole cluster by automation is specified in
 
 ## From a release (recommended)
 
-Releases are published to the project's GitLab package registry as
+Releases are published as GitHub releases of `lischetzke/dtfs` with the asset
 `dtfs-linux-amd64.tar.gz` (see [Release Artifacts](../deployment/artifacts.md)
 for layout, checksums and signatures). Linux x86_64 with glibc 2.36 or newer
 (Debian 12, Ubuntu 24.04) is required; other prerequisites per role are in
@@ -30,7 +30,7 @@ template its own ([Configuration Templating](../deployment/config-templating.md)
 
 | Flag | Default | Behaviour |
 |------|---------|-----------|
-| `--source local\|remote\|auto` | `auto` | `local` searches `$DTFS_LOCAL_BIN_DIR`, `./target/release`, `/opt/dtfs/staging/*/` and `~/.cache/dtfs` for `dtfs-<version>-linux-amd64.tar.gz` (a differently named file must be passed as the positional argument). `remote` downloads from `$DTFS_REPO_URL` (default `https://github.com/lischetzke/dtfs`, package registry; a github.com URL uses GitHub releases; `jq` is needed to resolve `latest` on GitLab). `auto` tries local, then remote. |
+| `--source local\|remote\|auto` | `auto` | `local` searches `$DTFS_LOCAL_BIN_DIR`, `./target/release`, `/opt/dtfs/staging/*/` and `~/.cache/dtfs` for `dtfs-<version>-linux-amd64.tar.gz` (a differently named file must be passed as the positional argument). `remote` downloads from `$DTFS_REPO_URL` (default `https://github.com/lischetzke/dtfs`, GitHub releases; other hosts are refused). `auto` tries local, then remote. |
 | `--version <tag>` | `latest` | Release tag; `latest` is the newest full `vX.Y.Z`, alphas are skipped. |
 | `--role manager\|data\|fuse-client` | prompt | Host role. |
 | `--noninteractive` | off | No prompts; needs `--role` and `--managers`. |
@@ -43,8 +43,8 @@ template its own ([Configuration Templating](../deployment/config-templating.md)
 | `--reconfigure` | off | Re-render an existing `/etc/dtfs/<role>.toml`; otherwise it and its secret are kept. |
 | `--uninstall` | | Remove units and binaries; config and data stay. `--purge --yes` also deletes `/etc/dtfs` and `/var/lib/dtfs` (never data disks). |
 
-Environment: `DTFS_REPO_URL`, `DTFS_REPO_TOKEN` (GitLab deploy token `gldt-...`
-or access token for a private project), `DTFS_LOCAL_BIN_DIR`,
+Environment: `DTFS_REPO_URL`, `DTFS_REPO_TOKEN` (optional GitHub token for rate
+limits or a private fork), `DTFS_LOCAL_BIN_DIR`,
 `DTFS_SHARED_SECRET`. Downloads are cached in `~/.cache/dtfs` and staged in
 `/opt/dtfs/staging/<version>/` (kept after a failed run). Air-gapped: place the
 tarball there and use `--source local`. The units run with

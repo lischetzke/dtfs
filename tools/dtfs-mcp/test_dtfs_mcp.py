@@ -191,7 +191,7 @@ def test_redact_config():
 
 
 def test_redact_config_urls_and_webhooks():
-    txt = ('[updater]\nrepo_url = "https://gitlab.example/example/dtfs"\n'
+    txt = ('[updater]\nrepo_url = "https://github.example/example/dtfs"\n'
            'proxy_url = "http://user:pw@proxy:3128"\n'
            '[[alerts.webhooks]]\nurl = "https://hooks.slack.com/services/T0/B0/XYZ"\n'
            'secret = "s"\nkinds = ["node_down"]\ndedup_secs = 300\n'
@@ -201,7 +201,7 @@ def test_redact_config_urls_and_webhooks():
     for leak in ("XYZ", "user:pw", "x.example/h", '"s"'):
         assert leak not in out
     # non-sensitive values survive, including after the webhook tables end
-    for keep in ('repo_url = "https://gitlab.example/example/dtfs"', 'kinds = ["node_down"]',
+    for keep in ('repo_url = "https://github.example/example/dtfs"', 'kinds = ["node_down"]',
                  "dedup_secs = 300", 'listen_addr = "0.0.0.0:9401"'):
         assert keep in out
     assert out.count('url = "***"') == 3  # proxy_url + two webhook urls
