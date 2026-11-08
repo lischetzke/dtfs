@@ -80,7 +80,7 @@ jobs:
             clang libclang-dev cmake protobuf-compiler pkg-config \
             libfuse3-dev fuse3 libssl-dev nodejs
       - uses: actions/checkout@v6
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Tests
         run: cargo test --workspace --release
       - name: Build, stamp and package the release
@@ -98,7 +98,6 @@ jobs:
       contents: write
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -108,6 +107,8 @@ jobs:
           name: dist
           path: dist
       - name: Refuse an existing release or tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null || gh release view "$VERSION" >/dev/null 2>&1; then
             echo "::error::$VERSION already exists"; exit 1
@@ -122,13 +123,15 @@ jobs:
           fi
           bash scripts/ci/sign-release.sh dist
       - name: Release notes (git-cliff, .github/cliff.toml)
-        uses: orhun/git-cliff-action@v4
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
         with:
           config: .github/cliff.toml
           args: --tag ${{ needs.prepare.outputs.version }} --unreleased --strip header
         env:
           OUTPUT: notes.md
       - name: Create the tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           assets=(dist/dtfs-linux-amd64.tar.gz dist/SHA256SUMS)
           [ ! -f dist/SHA256SUMS.minisig ] || assets+=(dist/SHA256SUMS.minisig)

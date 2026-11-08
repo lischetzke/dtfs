@@ -34,7 +34,7 @@ jobs:
             clang libclang-dev cmake protobuf-compiler pkg-config \
             libfuse3-dev fuse3 libssl-dev nodejs
       - uses: actions/checkout@v6
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --workspace --release
       # Build-stamp guards (CLAUDE.md A.3.5): rebuild dtfs-cli with and
       # without DTFS_VERSION / SOURCE_DATE_EPOCH.
