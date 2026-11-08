@@ -170,6 +170,15 @@ fn raft_auth_decision(
         return RaftAuthDecision::Accept;
     }
     match (ts, mac) {
+        // Empty binding = no x-dtfs-raft-from header: the MAC would cover no
+        // sender/target/body, so a captured legacy stamp could authorize any body.
+        (Some(_), Some(_)) if binding.is_empty() => {
+            if require {
+                RaftAuthDecision::Reject("missing sender header")
+            } else {
+                RaftAuthDecision::AcceptUnsigned
+            }
+        }
         (Some(ts), Some(mac)) => {
             if dtfs_common::crypto::verify_mgr_rpc_auth(
                 secret,
@@ -604,6 +613,25 @@ mod raft_transport_hardening_tests {
         assert_eq!(
             raft_auth_decision(SECRET, false, Some(&ts), Some(&mac), &binding(), t + max + 1),
             RaftAuthDecision::Reject("invalid stamp")
+        );
+    }
+
+    #[test]
+    fn stamp_without_from_header_rejected_when_required_else_unsigned() {
+        // A legacy stamp (empty binding) must not authorize an arbitrary body.
+        let (ts, mac) = dtfs_common::crypto::stamp_mgr_rpc_auth(
+            SECRET,
+            dtfs_raft::network::RAFT_RPC_AUTH_METHOD,
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            raft_auth_decision(SECRET, true, Some(&ts), Some(&mac), "", now()),
+            RaftAuthDecision::Reject("missing sender header")
+        );
+        assert_eq!(
+            raft_auth_decision(SECRET, false, Some(&ts), Some(&mac), "", now()),
+            RaftAuthDecision::AcceptUnsigned
         );
     }
 

@@ -128,8 +128,9 @@ in the `x-dtfs-raft-from` header), the receiver's own node id, and the BLAKE3
 hash of the request payload, so a captured stamp cannot authorize another body
 or another peer. Because the MAC covers the body, the receiver verifies the
 stamp after a size-bounded read of the body (a missing or non-numeric
-`x-dtfs-raft-from` yields an empty binding, which fails verification of a
-stamped request).
+`x-dtfs-raft-from` is treated as a legacy request with no sender binding: it
+is rejected when `require_raft_auth = true`, otherwise accepted as unsigned
+with the rate-limited warning, even if it carries a stamp).
 
 - The Raft request body is capped at the manager gRPC message limit
   (`[grpc].max_message_size_mb`); larger bodies are rejected before parsing.
