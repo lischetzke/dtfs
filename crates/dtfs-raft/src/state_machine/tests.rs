@@ -3415,4 +3415,42 @@ mod raft_audit_fix_tests {
         assert_eq!(log.front().unwrap().log_index, 3);
         assert_eq!(log.back().unwrap().log_index, MAX_AUDIT_LOG_ENTRIES as u64 + 2);
     }
+
+    #[test]
+    fn audit_timestamp_is_independent_of_wall_clock() {
+        let reqs = vec![
+            ClientRequest::DeleteVolume { volume_id: "v".into() },
+            ClientRequest::SweepExpiredLeases { now_ms: 777 },
+            ClientRequest::AcquireWriteLease {
+                path: "/f".into(), owner_id: "o".into(), lease_ms: 10, now_ms: 555,
+                proposed_lease_id: "L".into(),
+            },
+        ];
+        for (n, req) in reqs.iter().enumerate() {
+            let apply_once = || {
+                let mut sm = StateMachineData::default();
+                create(&mut sm, 1, "/f");
+                if matches!(req, ClientRequest::SweepExpiredLeases { .. }) {
+                    apply_request(&mut sm, &lid(2), &ClientRequest::AcquireWriteLease {
+                        path: "/f".into(), owner_id: "o".into(), lease_ms: 1, now_ms: 1,
+                        proposed_lease_id: "old".into(),
+                    });
+                }
+                apply_request(&mut sm, &lid(40 + n as u64), req);
+                sm.audit_log.iter().filter(|e| e.log_index == 40 + n as u64)
+                    .map(|e| (e.summary.clone(), e.timestamp_ms)).collect::<Vec<_>>()
+            };
+            let first = apply_once();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let second = apply_once();
+            assert!(!first.is_empty(), "{req:?} must audit");
+            assert_eq!(first, second, "{req:?}");
+            let expect = match req {
+                ClientRequest::SweepExpiredLeases { .. } => 777,
+                ClientRequest::AcquireWriteLease { .. } => 555,
+                _ => 40 + n as u64,
+            };
+            assert!(first.iter().all(|(_, t)| *t == expect), "{first:?} want {expect}");
+        }
+    }
 }

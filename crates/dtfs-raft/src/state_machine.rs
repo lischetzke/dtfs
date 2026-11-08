@@ -980,10 +980,20 @@ fn apply_request(
     log_id: &LogId,
     req: &ClientRequest,
 ) -> ClientResponse {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    // Audit timestamp must be a pure function of (req, log entry): the
+    // proposer's `now_ms` where the variant carries one, else the committed
+    // `log_id.index` (same fallback as CreateFile, CLAUDE.md A.3.6). A
+    // replica-local wall clock made replicas and replays disagree.
+    let now_ms = match req {
+        ClientRequest::AcquireWriteLease { now_ms, .. }
+        | ClientRequest::ReleaseLeasesByHost { now_ms, .. }
+        | ClientRequest::SweepExpiredLeases { now_ms }
+            if *now_ms != 0 =>
+        {
+            *now_ms
+        }
+        _ => log_id.index,
+    };
 
     let audit = |summary: String| AuditEntry {
         log_index: log_id.index,
