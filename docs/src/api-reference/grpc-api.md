@@ -1,473 +1,155 @@
 # gRPC API
 
-All inter-component communication in DTFS uses gRPC with Protocol Buffers. The `.proto` definitions are in the `proto/` directory, and generated Rust code lives in the `dtfs-proto` crate.
+All inter-component traffic uses gRPC with Protocol Buffers. Definitions: `proto/*.proto`; generated Rust code: the `dtfs-proto` crate. This page follows the current `.proto` files.
 
-## Services Overview
+## Services
 
-| Service | Proto File | Port (Default) | Purpose |
-|---------|-----------|----------------|---------|
-| `ManagerService` | `manager.proto` | 9401 | Client and data node operations against the manager |
-| `DataService` | `data.proto` | 9500 | Chunk storage operations on data nodes |
-| `ClusterJoin` | `cluster.proto` | 9401 | Node join handshake |
-| `AdminService` | `admin.proto` | 9401 | Administrative operations (scrub, maintenance, audit) |
+| Service | Proto | Served by | Port (default) | Status |
+|---|---|---|---|---|
+| `dtfs.manager.ManagerService` | `manager.proto` | manager | `[grpc].listen_addr` (9401) | in use |
+| `dtfs.manager.RaftTransport` | not a proto service | manager | same port as ManagerService | in use, see [Raft transport](#raft-transport) |
+| `dtfs.data.DataService` | `data.proto` | data node | `[grpc].listen_addr` (9500) | in use |
+| `dtfs.cluster.ClusterJoin` | `cluster.proto` | none | n/a | defined and compiled, **no server implements it**. The join handshake runs over REST (`/api/v1/join/*`). |
+| `dtfs.admin.AdminService` | `admin.proto` | none | n/a | defined and compiled, **no server implements it**. Admin operations use the [REST API](./rest-api.md). |
 
-All connections use mTLS when TLS is enabled (see [TLS](../security/tls.md)).
+`common.proto` holds shared messages (`Location`, `DiskInfo`, `NodeInfo`). With `[tls]` enabled all connections use mutual TLS ([TLS](../security/tls.md)). Message size caps come from `[grpc].max_message_size_mb` (servers) and `[client].max_message_size_mb` (FUSE).
 
----
+## Authentication
 
-## ManagerService
+When `cluster.shared_secret` is non-empty, mutating RPCs must carry two gRPC metadata entries:
 
-Defined in `manager.proto` under the `dtfs.manager` package. This service handles metadata operations from FUSE clients and registration/heartbeat traffic from data nodes.
+| Metadata key | Value |
+|---|---|
+| `x-dtfs-rpc-ts` | Unix seconds when the stamp was made. Rejected when more than 300 s from the receiver's clock (keep clocks synced, see [Time Sync](../operations/time-sync.md)). |
+| `x-dtfs-rpc-mac` | Lowercase hex HMAC-SHA256 (key = shared secret) of the canonical message below. |
 
-### CreateFile
+Canonical message (newline-terminated fields):
 
-Creates a new file in the namespace.
-
-```protobuf
-rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
+```
+<plane>\nv1\n<Method>\n<ts>\n<binding>\n
 ```
 
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `path` | string | Absolute file path |
-| `volume_id` | string (optional) | Volume to create the file in; defaults to the cluster default volume |
+There are two planes so a stamp for one cannot be replayed on the other: `dtfs-data-rpc` for DataService and `dtfs-mgr-rpc` for ManagerService and the Raft transport. The `binding` ties the stamp to the object. A missing or invalid stamp returns `PERMISSION_DENIED`. With an empty secret (lab mode) stamping and verification are skipped.
+
+| Service | RPC | Binding |
+|---|---|---|
+| DataService | `PutChunk`, `ListChunks` | empty |
+| DataService | `GetChunk`, `DeleteChunk`, `VerifyChunk`, `RecordCacheHit` | `chunk_id` |
+| DataService | `ReplicateChunk` | `chunk_id`, a literal `\|`, then `target_address` |
+| DataService | `GetDiskStatus`, `ReportStats` | not authenticated |
+| ManagerService | `CreateFile`, `DeleteFile`, `AllocateChunks`, `CommitChunkLocations`, `SetFileSize`, `CreateSymlink`, `AcquireLock`, `ReleaseLock`, `AcquireWriteLease`, `RenewWriteLease`, `ReleaseWriteLease` | `path` |
+| ManagerService | `RenameFile` | `from\nto` |
+| ManagerService | `CreateLink` | `source\ndest` |
+| ManagerService | `Heartbeat`, `ReportChunkStatus` | `node_id` |
+| ManagerService | `ReleaseLeasesByHost` | `hostname` |
+| ManagerService | `RegisterNode`, `ForwardClientWrite` | no stamp; the request carries `shared_secret` instead |
+| ManagerService | `GetFileLocations`, `ListDirectory`, `ReadSymlink`, `ClusterCapacity`, `ProbeLock` | not authenticated (read-only) |
 
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `success` | bool | Whether the file was created |
-| `chunk_size` | uint64 | Chunk size in bytes for this file |
-| `volume_id` | string | Assigned volume ID |
+### Raft transport
 
-### GetFileLocations
+Managers exchange Raft traffic (AppendEntries, Vote, InstallSnapshot) over the service `dtfs.manager.RaftTransport` on the manager gRPC port, with JSON payloads. Each call is stamped on the `dtfs-mgr-rpc` plane with method `RaftRpc` and an empty binding. Receiver behaviour is set by `cluster.require_raft_auth`:
 
-Resolves a file path to its chunk locations across data nodes.
+| `require_raft_auth` | Valid stamp | No stamp | Invalid or incomplete stamp |
+|---|---|---|---|
+| `false` (default, rolling-update safe) | accepted | accepted, rate-limited warning | rejected |
+| `true` | accepted | rejected | rejected |
 
-```protobuf
-rpc GetFileLocations(GetFileLocationsRequest) returns (GetFileLocationsResponse);
-```
+Enable `true` once every manager runs a build that signs Raft RPCs. An empty shared secret skips Raft authentication entirely.
 
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `path` | string | Absolute file path |
+## ManagerService (`manager.proto`)
 
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `path` | string | Echoed file path |
-| `total_size` | uint64 | Total file size in bytes |
-| `chunks` | repeated ChunkLocationInfo | List of chunks with replica addresses |
+Used by FUSE clients (metadata, leases, locks), data nodes (registration, heartbeat) and peer managers (`ForwardClientWrite`). Any manager serves these; writes are applied through Raft, and a follower forwards them to the leader.
 
-Each `ChunkLocationInfo` contains:
+### Namespace
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `chunk_id` | string | Hex-encoded chunk ID |
-| `size` | uint64 | Chunk size in bytes |
-| `node_addresses` | repeated string | Addresses of all nodes holding replicas |
-| `node_tiers` | repeated string | Per-replica storage tier (lowercase), positional with `node_addresses`; empty from an older manager |
-| `node_locations` | repeated Location | Per-replica topology Location, positional with `node_addresses`; the FUSE client learns these for distance/priority read routing. Empty/all-empty from an older manager or unknown node |
+| RPC | Request | Response |
+|---|---|---|
+| `CreateFile` | `path`, optional `volume_id` | `success`, `chunk_size`, `volume_id` |
+| `GetFileLocations` | `path` | `path`, `total_size`, `chunks` (`ChunkLocationInfo`), `chunk_size`, `created_at_ms`, `modified_at_ms`, `is_directory`, `volume_id`, `is_symlink` |
+| `DeleteFile` | `path` | `success` |
+| `ListDirectory` | `path` | `entries` (`DirectoryEntry`) |
+| `RenameFile` | `from`, `to` | `success`, `error` |
+| `SetFileSize` | `path`, `new_size` | `success`, `error` |
+| `CreateSymlink` | `path`, `target` | `success`, `error` |
+| `ReadSymlink` | `path` | `target`, `found` |
+| `CreateLink` | `source`, `dest` | `success`, `error` |
+| `ClusterCapacity` | none | `total_bytes`, `used_bytes`, `file_count` |
 
-### DeleteFile
+`ChunkLocationInfo`: `chunk_id` (hex BLAKE3), `size`, `node_addresses` (all live replicas), `node_tiers` and `node_locations` (positional with `node_addresses`; empty from an older manager), `chunk_index`. Replicas on Down or Failed nodes or Failed/Removed disks are omitted unless the chunk has no live replica at all, in which case every row is returned. `volume_id` is the file's own volume; clients must not substitute `default`.
 
-Removes a file from the namespace and schedules chunk cleanup.
-
-```protobuf
-rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
-```
+`DirectoryEntry`: `name`, `size`, `is_directory`, `created_at`, `modified_at`, `is_symlink`. `is_symlink` (and `GetFileLocationsResponse.is_symlink`) is `false` from an older manager.
 
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `path` | string | Absolute file path |
+### Write path
 
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `success` | bool | Whether the file was deleted |
+Order used by the FUSE client: `AcquireWriteLease`, `AllocateChunks`, stream `PutChunk` to the data nodes, `CommitChunkLocations`, `ReleaseWriteLease`.
 
-### ListDirectory
+| RPC | Request | Response |
+|---|---|---|
+| `AllocateChunks` | `path`, `num_chunks`, `volume_id`, `preferred_tier`, `exclude_addrs`, `requester_location` | `placements`: per chunk `chunk_index`, `primary_address`, `replica_addresses`, `tier`. Placement follows the file's own volume. |
+| `CommitChunkLocations` | `path`, `volume_id`, `lease_id`, `chunks` (`ChunkLocationCommit`: `chunk_index`, `chunk_id`, `primary_address`, `size_bytes`, `disk_id`) | `success`, `lease_conflict`, `error`. Rejected when a chunk landed on fewer distinct `(node_id, disk_id)` replicas than the volume's `write_safety.min_replicas_before_ack` (after clamping). |
 
-Lists entries in a directory.
+`ChunkLocationCommit.disk_id` must be the `disk_id` returned by `PutChunkResponse`; the manager resolves the replica's tier from it.
 
-```protobuf
-rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
-```
+### Leases and locks
 
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `path` | string | Directory path |
+| RPC | Request | Response |
+|---|---|---|
+| `AcquireWriteLease` | `path`, `owner_id`, `lease_ms` | `granted`, `lease_id`, `expires_at_ms`, `conflict_owner`, `conflict_expires_at_ms` |
+| `RenewWriteLease` | `path`, `lease_id`, `extension_ms` | `granted`, `new_expires_at_ms` |
+| `ReleaseWriteLease` | `path`, `lease_id` | `ok` |
+| `ReleaseLeasesByHost` | `hostname`, `except_pid` | `released_count` (clears leases left by a crashed FUSE process; keeps those of `except_pid`) |
+| `AcquireLock` | `path`, `owner_id`, `start`, `end`, `write`, `blocking`, `lease_ms` | `granted`, `conflict_owner`, `conflict_start`, `conflict_end`, `conflict_write` |
+| `ReleaseLock` | `path`, `owner_id`, `start`, `end` | `ok` |
+| `ProbeLock` | `path`, `owner_id`, `start`, `end`, `write` | `would_grant`, conflict fields as above |
 
-Each `DirectoryEntry` in the response contains:
+### Node lifecycle
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | string | Entry name |
-| `size` | uint64 | Size in bytes (0 for directories) |
-| `is_directory` | bool | True if this entry is a directory |
-| `created_at` | int64 | Creation timestamp (Unix epoch) |
-| `modified_at` | int64 | Last modification timestamp |
+| RPC | Request | Response |
+|---|---|---|
+| `RegisterNode` | `hostname`, `role` (`data`, `client`), `grpc_port`, `location`, `disks`, `shared_secret` (optional), `version`, `build_date` | `accepted`, `node_id`, `config_version` |
+| `Heartbeat` | `node_id`, `uptime_secs`, `total_chunks`, `total_bytes_used`, `config_version`, `chunk_reads` (per-chunk read counters by datacenter), `total_bytes_read`, `total_bytes_written`, `disk_usage` (`disk_id`, `total_bytes`, `used_bytes`), `integrity_faults`, `scrub_results` | `accepted`, `config_version`, `config_update`, `self_quarantine_cleared`, `scrub_request` |
+| `ReportChunkStatus` | `node_id`, `chunks` (`chunk_id`, `size`, `status`: `healthy`, `corrupt`, `missing`) | `accepted` |
+| `ForwardClientWrite` | `client_request_json`, `shared_secret` | `success`, `response_json`, `error`. Peer-manager use only: a follower forwards a Raft command to the leader. Only an allow-listed set of commands is accepted. |
 
-### AllocateChunks
+A heartbeat whose liveness write cannot commit fails the RPC; `NOT_FOUND` tells the data node to re-register. `HeartbeatResponse.config_update.scrub_override` (`ScrubConfigOverride`) carries the cluster scrub policy from the manager's `[scrub]` block on every heartbeat: `quick_interval_hours`, `deep_interval_hours`, `quick_interval_secs`, `deep_interval_secs` (exact seconds, `0` from an older manager), `orphan_interval_secs`, `orphan_grace_secs`, `max_io_percent`, `verify_on_read`, `quarantine_on_fault`, `auto_unquarantine_secs`. `scrub_request` relays a manual scrub trigger (`id`, `level`, `requested_at_ms`); data nodes deduplicate by `id`. `config_update.config_json` is empty in current builds.
 
-Requests the placement engine to decide where new chunks should be stored.
+## DataService (`data.proto`)
 
-```protobuf
-rpc AllocateChunks(AllocateChunksRequest) returns (AllocateChunksResponse);
-```
+Chunk I/O on data nodes. Chunks are streamed, never buffered whole; the BLAKE3 checksum is computed incrementally and verified on every read.
 
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `path` | string | File path being written |
-| `num_chunks` | uint32 | Number of chunks to allocate |
-| `volume_id` | string | Volume ID for placement decisions |
+| RPC | Request | Response |
+|---|---|---|
+| `PutChunk` (client stream) | first message sets `chunk_id`, `volume_id`, `tier`; every message carries `data` | `chunk_id`, `size`, `checksum` (hex BLAKE3), `success`, `disk_id` |
+| `GetChunk` (server stream) | `chunk_id`, `requester_dc`, `requester_host` | stream of `data`, `offset`, `total_size` |
+| `DeleteChunk` | `chunk_id`, optional `disk_id`, `tier` | `success`, `was_present`, `freed_bytes` |
+| `ReplicateChunk` | `chunk_id`, `target_address`, `target_tier` | `success`, `error`, optional `disk_id` |
+| `VerifyChunk` | `chunk_id` | `valid`, `error` |
+| `ListChunks` | `page_token`, `limit` | `chunk_ids`, `next_page_token`, `chunk_mtimes_ms`, `chunk_disk_ids` |
+| `GetDiskStatus` | none | `hostname`, `disks` (`DiskInfo`) |
+| `ReportStats` | none | `total_chunks`, `total_bytes`, `cache_hits`, `cache_misses` |
+| `RecordCacheHit` | `chunk_id`, `requester_dc`, `requester_host` | empty |
 
-Each `ChunkPlacement` in the response contains:
+Notes:
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `chunk_index` | uint32 | Index of this chunk in the file |
-| `primary_address` | string | Address of the primary data node |
-| `replica_addresses` | repeated string | Addresses of replica data nodes |
+- `PutChunkResponse.disk_id` and `ReplicateChunkResponse.disk_id` report the disk the data actually landed on. Callers must pass the `PutChunk` value into `CommitChunkLocations`; for replication, an unset `disk_id` (older data node) means the manager must not guess among several disks.
+- `DeleteChunkRequest.disk_id` limits the delete to that disk's copy. Replica identity is `(node_id, disk_id)`; unset means first-found (legacy).
+- `ListChunks` arrays `chunk_mtimes_ms` and `chunk_disk_ids` are index-aligned with `chunk_ids`; empty from an older node. The manager uses them to reap orphans per disk after a grace period.
+- A `PutChunk` onto a disk below its free-space reserve, or while the node sheds load, fails with `RESOURCE_EXHAUSTED`; clients reroute or retry with backoff.
+- A checksum mismatch on read returns `DATA_LOSS`; the FUSE client fails over to another replica.
+- `ReplicateChunk` pushes the chunk to `target_address`, which receives it as a `PutChunk`; the call timeout scales with the chunk size.
 
-### RegisterNode
+## ClusterJoin (`cluster.proto`)
 
-Registers a new data node with the cluster. Called during the join process after the handshake completes.
+Defined, not served. `JoinRequest` (`secret_hmac`, `nonce`, `node_info`), `JoinResponse` (`accepted`, `challenge`, `cluster_ca_cert`, `managers`, `rejection_reason`), `JoinCompletionRequest` (`node_id`, `challenge_response`), `JoinCompletionResponse` (`success`, `config_version`, `config_json`). The live handshake is [`POST /api/v1/join/request` and `/complete`](./rest-api.md#join).
 
-```protobuf
-rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
-```
+## AdminService (`admin.proto`)
 
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `hostname` | string | Node hostname |
-| `role` | string | Node role (`"data"`) |
-| `grpc_port` | uint32 | gRPC listen port |
-| `location` | Location | Topology location (region/datacenter/rack/host) |
-| `disks` | repeated DiskInfo | Disk inventory |
+Defined, not served: `TriggerScrub`, `GetScrubResults`, `SetMaintenanceMode`, `GetAuditLog`. Use [`POST /api/v1/scrub`](./rest-api.md#scrub), the maintenance endpoint and `GET /api/v1/audit`.
 
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `accepted` | bool | Whether registration was accepted |
-| `node_id` | string | Assigned node ID |
-| `config_version` | uint64 | Current cluster configuration version |
+## Common types (`common.proto`)
 
-### Heartbeat
-
-Periodic liveness signal from data nodes. Carries capacity statistics and the node's current config version.
-
-```protobuf
-rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `node_id` | string | Sending node's ID |
-| `uptime_secs` | uint64 | Node uptime in seconds |
-| `total_chunks` | uint64 | Number of chunks stored |
-| `total_bytes_used` | uint64 | Bytes used across all disks |
-| `config_version` | uint64 | Node's current config version |
-
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `accepted` | bool | Whether the heartbeat was processed |
-| `config_version` | uint64 | Manager's current config version |
-| `config_update` | ConfigUpdate (optional) | Full config if the node's version is stale |
-
-### ReportChunkStatus
-
-Data nodes report chunk health after scrubbing.
-
-```protobuf
-rpc ReportChunkStatus(ChunkStatusReport) returns (ChunkStatusAck);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `node_id` | string | Reporting node's ID |
-| `chunks` | repeated ChunkStatus | List of chunk health reports |
-
-Each `ChunkStatus` contains:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `chunk_id` | string | Chunk identifier |
-| `size` | uint64 | Chunk size in bytes |
-| `status` | string | `"healthy"`, `"corrupt"`, or `"missing"` |
-
----
-
-## DataService
-
-Defined in `data.proto` under the `dtfs.data` package. This service runs on every data node and handles chunk-level I/O.
-
-### PutChunk
-
-Stores a chunk using client-side streaming. The first message carries metadata (chunk ID, volume, target tier), and subsequent messages carry data payloads.
-
-```protobuf
-rpc PutChunk(stream PutChunkRequest) returns (PutChunkResponse);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `chunk_id` | string | Hex-encoded chunk ID (first message) |
-| `volume_id` | string | Volume ID (first message) |
-| `tier` | string | Target tier: `"hot"`, `"warm"`, `"cold"` (first message) |
-| `data` | bytes | Chunk data payload (all messages) |
-
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `chunk_id` | string | Echoed chunk ID |
-| `size` | uint64 | Total bytes written |
-| `checksum` | string | Hex-encoded BLAKE3 checksum |
-| `success` | bool | Whether the write succeeded |
-
-### GetChunk
-
-Retrieves a chunk using server-side streaming. Data is returned in multiple response messages.
-
-```protobuf
-rpc GetChunk(GetChunkRequest) returns (stream GetChunkResponse);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `chunk_id` | string | Hex-encoded chunk ID |
-
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `data` | bytes | Chunk data payload |
-| `offset` | uint64 | Byte offset within the chunk |
-| `total_size` | uint64 | Total chunk size |
-
-### DeleteChunk
-
-Removes a chunk from the data node.
-
-```protobuf
-rpc DeleteChunk(DeleteChunkRequest) returns (DeleteChunkResponse);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `chunk_id` | string | Chunk to delete |
-
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `success` | bool | Whether the chunk was deleted |
-
-### ReplicateChunk
-
-Instructs the data node to copy a chunk it holds to another data node.
-
-```protobuf
-rpc ReplicateChunk(ReplicateChunkRequest) returns (ReplicateChunkResponse);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `chunk_id` | string | Chunk to replicate |
-| `target_address` | string | Address of the destination data node |
-
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `success` | bool | Whether replication completed |
-| `error` | string | Error message if failed |
-
-### VerifyChunk
-
-Checks the integrity of a chunk on the data node.
-
-```protobuf
-rpc VerifyChunk(VerifyChunkRequest) returns (VerifyChunkResponse);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `chunk_id` | string | Chunk to verify |
-
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `valid` | bool | Whether the chunk passes integrity check |
-| `error` | string | Error description if invalid |
-
----
-
-## ClusterJoin
-
-Defined in `cluster.proto` under the `dtfs.cluster` package. Implements the two-phase node join handshake (see [Cluster Join Protocol](../security/cluster-join.md)).
-
-### RequestJoin
-
-Phase 1: The joining node proves possession of the shared secret via HMAC.
-
-```protobuf
-rpc RequestJoin(JoinRequest) returns (JoinResponse);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `secret_hmac` | bytes | HMAC-SHA256(shared_secret, nonce) |
-| `nonce` | string | Random nonce generated by the joining node |
-| `node_info` | NodeInfo | Node metadata (ID, role, hostname, disks, location) |
-
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `accepted` | bool | Whether the HMAC was valid |
-| `challenge` | string | Challenge nonce for Phase 2 |
-| `cluster_ca_cert` | bytes | PEM-encoded cluster CA certificate |
-| `managers` | repeated NodeInfo | List of manager nodes |
-| `rejection_reason` | string | Reason if rejected |
-
-### CompleteJoin
-
-Phase 2: The joining node completes the handshake and is registered in Raft.
-
-```protobuf
-rpc CompleteJoin(JoinCompletionRequest) returns (JoinCompletionResponse);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `node_id` | string | Node's ID |
-| `challenge_response` | bytes | Response to the manager's challenge |
-
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `success` | bool | Whether registration succeeded |
-| `config_version` | uint64 | Current cluster configuration version |
-| `config_json` | string | Full cluster configuration as JSON |
-
----
-
-## AdminService
-
-Defined in `admin.proto` under the `dtfs.admin` package. Provides administrative operations used by `dtfs-cli` and automation tooling.
-
-### TriggerScrub
-
-Initiates a scrub operation targeting a disk, file, chunk, or the entire cluster.
-
-```protobuf
-rpc TriggerScrub(TriggerScrubRequest) returns (TriggerScrubResponse);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `target_type` | string | `"disk"`, `"file"`, `"chunk"`, or `"all"` |
-| `target_id` | string | Disk path, file path, chunk ID, or empty for `"all"` |
-| `level` | string | `"quick"` or `"deep"` |
-
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `accepted` | bool | Whether the scrub was scheduled |
-| `task_id` | string | Task identifier for status queries |
-
-### GetScrubResults
-
-Retrieves the results of a previously triggered scrub.
-
-```protobuf
-rpc GetScrubResults(GetScrubResultsRequest) returns (GetScrubResultsResponse);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `task_id` | string | Task ID from TriggerScrub |
-
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `status` | string | `"running"`, `"completed"`, or `"failed"` |
-| `chunks_checked` | uint64 | Total chunks examined |
-| `chunks_healthy` | uint64 | Chunks that passed verification |
-| `chunks_corrupt` | uint64 | Chunks with checksum mismatches |
-| `chunks_missing` | uint64 | Chunks that could not be found |
-| `chunks_size_mismatch` | uint64 | Chunks with incorrect sizes |
-| `duration_secs` | double | Elapsed time in seconds |
-
-### SetMaintenanceMode
-
-Enables or disables maintenance mode on a data node.
-
-```protobuf
-rpc SetMaintenanceMode(MaintenanceModeRequest) returns (MaintenanceModeResponse);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `node_id` | string | Target node ID |
-| `enable` | bool | `true` to enter maintenance, `false` to exit |
-
-| Response Field | Type | Description |
-|----------------|------|-------------|
-| `success` | bool | Whether the mode change was applied |
-| `status` | string | Current node status: `"draining"`, `"maintenance"`, or `"active"` |
-
-### GetAuditLog
-
-Queries the audit log with optional filters.
-
-```protobuf
-rpc GetAuditLog(AuditLogRequest) returns (AuditLogResponse);
-```
-
-| Request Field | Type | Description |
-|---------------|------|-------------|
-| `since_timestamp` | int64 | Return entries at or after this Unix timestamp |
-| `limit` | uint32 | Maximum entries to return |
-| `action_filter` | string | Filter by action prefix |
-
-Each `AuditLogEntry` in the response contains:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `timestamp` | int64 | Unix epoch timestamp |
-| `actor` | string | Who performed the action |
-| `action` | string | Action type |
-| `target` | string | What was acted upon |
-| `result` | string | Outcome |
-| `source_location` | string | Source location information |
-
----
-
-## Common Types
-
-Defined in `common.proto` under the `dtfs.common` package. These types are shared across all services.
-
-### Location
-
-```protobuf
-message Location {
-  string region = 1;
-  string datacenter = 2;
-  string rack = 3;
-  string host = 4;
-}
-```
-
-### DiskInfo
-
-```protobuf
-message DiskInfo {
-  uint32 disk_id = 1;
-  string uuid = 2;
-  string mount_path = 3;
-  string tier = 4;        // "hot", "warm", "cold"
-  uint64 total_bytes = 5;
-  uint64 used_bytes = 6;
-  string status = 7;      // "healthy", "degraded", "draining", "failed", "removed"
-}
-```
-
-### NodeInfo
-
-```protobuf
-message NodeInfo {
-  string id = 1;
-  string role = 2;          // "manager" or "data"
-  string hostname = 3;
-  uint32 grpc_port = 4;
-  Location location = 5;
-  repeated DiskInfo disks = 6;
-  uint64 total_capacity = 7;
-  uint64 used_capacity = 8;
-  string health_status = 9;
-}
-```
+| Message | Fields |
+|---|---|
+| `Location` | `region`, `datacenter`, `rack`, `host` |
+| `DiskInfo` | `disk_id`, `uuid`, `mount_path`, `tier` (`hot`, `warm`, `cold`, `tape`), `total_bytes`, `used_bytes`, `status` (`healthy`, `degraded`, `draining`, `failed`, `removed`) |
+| `NodeInfo` | `id`, `role` (`manager`, `data`, `client`), `hostname`, `grpc_port`, `location`, `disks`, `total_capacity`, `used_capacity`, `health_status` |
