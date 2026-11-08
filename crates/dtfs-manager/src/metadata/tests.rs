@@ -5,6 +5,12 @@
 
 use super::*;
 
+/// CF-3b gate as the service applies it (default state: every replica
+/// counts), for the pure batch tests below.
+fn ack_floor_satisfied(commits: &[ChunkLocationEntry], floor: u32) -> bool {
+    min_maintained_replicas(&StateMachineData::default(), "v", commits) as u64 >= floor as u64
+}
+
 #[cfg(test)]
 mod chunk_status_disk_grouping_tests {
     use super::group_corrupt_by_disk;
@@ -1338,6 +1344,127 @@ mod tests {
             assert_eq!(all[0], "data01:9500", "anchor target kept first");
             assert_eq!(all.len() as u32, floor.min(cap), "floor {floor} cap {cap}");
         }
+    }
+
+    fn add_disk(sm: &mut StateMachineData, node: u64, id: u32, tier: DiskTier, total: u64, used: u64) {
+        sm.nodes.get_mut(&node).unwrap().disks.push(dtfs_common::types::DiskInfo {
+            disk_id: id,
+            uuid: String::new(),
+            mount_path: String::new(),
+            tier,
+            total_bytes: total,
+            used_bytes: used,
+            status: DiskStatus::Healthy,
+        });
+    }
+
+    /// MGR-1: with no Healthy maintained node the clamp must not reach 0
+    /// (that acked a write on cache-only disks with zero durable copies).
+    #[test]
+    fn clamp_never_drops_to_zero_and_cache_only_commit_is_rejected() {
+        let mut sm = live_topology();
+        for id in [1, 2, 3] {
+            sm.nodes.get_mut(&id).unwrap().health = HealthStatus::Suspect;
+        }
+        sm.nodes.insert(4, lab_node("data04", "toro", DiskTier::Hot, HealthStatus::Healthy));
+        let floor = clamp_ack_floor_to_capacity(2, &sm, "default", "/a", None);
+        assert_eq!(floor, 2, "no capacity: keep the configured floor, never 0");
+        let have = min_maintained_replicas(&sm, "default", &[ent("4")]);
+        assert_eq!(have, 0);
+        assert!((have as u32) < floor, "cache-only commit must be rejected");
+    }
+
+    /// MGR-4: the warn-once latch re-arms after the volume stops clamping.
+    #[test]
+    fn clamp_warning_latch_rearms_after_recovery() {
+        let latched = |v: &str| {
+            WARNED_FLOOR_CLAMPED
+                .get()
+                .map(|s| s.lock().unwrap().contains(v))
+                .unwrap_or(false)
+        };
+        let v = "mgr4-vol";
+        let mut sm = StateMachineData::default();
+        sm.volumes.insert(v.to_string(), vol_with_floor(v, 2));
+        sm.nodes.insert(1, lab_node("data01", "leli", DiskTier::Cold, HealthStatus::Healthy));
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, v, "/a", None), 1);
+        assert!(latched(v));
+        sm.nodes.insert(2, lab_node("data02", "leli", DiskTier::Cold, HealthStatus::Healthy));
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, v, "/a", None), 2);
+        assert!(!latched(v), "recovered volume clears the latch");
+        sm.nodes.remove(&2);
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, v, "/a", None), 1);
+        assert!(latched(v), "a later clamp episode warns again");
+    }
+
+    /// MGR-3: a fill node is accepted only if the disk the data node will
+    /// pick is maintained with room. data05 has a big hot (RF 0) disk plus
+    /// a small warm one and no cold disk, so `select_disk_for_tier(cold)`
+    /// may pick the hot disk: not a target.
+    #[test]
+    fn floor_fill_rejects_node_whose_chosen_disk_may_be_cache_only() {
+        let mut sm = live_topology();
+        sm.nodes.get_mut(&2).unwrap().health = HealthStatus::Maintenance;
+        sm.nodes.get_mut(&3).unwrap().health = HealthStatus::Maintenance;
+        sm.nodes.insert(5, lab_node("data05", "toro", DiskTier::Warm, HealthStatus::Healthy));
+        add_disk(&mut sm, 5, 1, DiskTier::Hot, 1 << 40, 0);
+        assert!(fill(&sm, &["data01:9500"], 2).is_empty());
+    }
+
+    /// MGR-3: an exact placed-tier disk wins the data node's pick, so a
+    /// hot disk beside it is irrelevant; but a full disk among the
+    /// possible picks disqualifies the node.
+    #[test]
+    fn floor_fill_follows_the_data_node_disk_choice_rule() {
+        let mut sm = live_topology();
+        sm.nodes.get_mut(&2).unwrap().health = HealthStatus::Maintenance;
+        sm.nodes.get_mut(&3).unwrap().health = HealthStatus::Maintenance;
+        // Cold exact match + hot cache disk: pick is the cold disk.
+        sm.nodes.insert(6, lab_node("data06", "toro", DiskTier::Cold, HealthStatus::Healthy));
+        add_disk(&mut sm, 6, 1, DiskTier::Hot, 1 << 40, 0);
+        assert_eq!(fill(&sm, &["data01:9500"], 2), vec!["data06:9500".to_string()]);
+        // Two warm disks (no cold), one full: either may be picked.
+        sm.nodes.get_mut(&6).unwrap().health = HealthStatus::Maintenance;
+        sm.nodes.insert(7, lab_node("data07", "toro", DiskTier::Warm, HealthStatus::Healthy));
+        add_disk(&mut sm, 7, 1, DiskTier::Warm, 1 << 30, 1 << 30);
+        assert!(fill(&sm, &["data01:9500"], 2).is_empty());
+    }
+
+    /// MGR-2: capacity-spill candidates never include cache-only (RF 0)
+    /// tiers, so a non-durable spill fails at allocate time.
+    #[test]
+    fn spill_candidates_exclude_cache_only_tiers() {
+        let mut sm = live_topology();
+        sm.nodes.insert(4, lab_node("data04", "toro", DiskTier::Hot, HealthStatus::Healthy));
+        let vol = &sm.volumes["default"];
+        let got = spill_candidates(
+            &sm.nodes,
+            DiskTier::Cold,
+            &std::collections::HashSet::new(),
+            &dtfs_common::config::PlacementConfig::default(),
+            &vol.spill,
+            &vol.effective_mandatory_replicas(),
+        );
+        let mut nodes: Vec<u64> = got.iter().map(|c| c.node_id).collect();
+        nodes.sort();
+        assert_eq!(nodes, vec![2, 3], "only the warm (RF 2) nodes; hot RF 0 dropped");
+        assert!(got.iter().all(|c| c.tier == DiskTier::Warm));
+    }
+
+    /// MGR-2: after a spill to a maintained tier with a single node, the
+    /// fill (placed tier = spill tier) adds the second warm node for floor 2.
+    #[test]
+    fn spill_to_warm_gets_fill_target_for_floor_two() {
+        let sm = live_topology();
+        let vol = &sm.volumes["default"];
+        let got = fill_floor_targets(
+            &sm.nodes, &vol.effective_mandatory_replicas(), &vol.spill,
+            &dtfs_common::config::PlacementConfig::default(),
+            &Location::new("", "", "", ""), DiskTier::Warm,
+            &["data02:9500".to_string()], 2, &std::collections::HashSet::new(),
+        );
+        assert_eq!(got.len(), 1);
+        assert_ne!(got[0], "data02:9500");
     }
 
     /// CR-3-3/MGR-1 helper — a Data node with one disk of the given tier.

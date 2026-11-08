@@ -1105,13 +1105,21 @@ fn clamp_ack_floor_to_capacity(
     // physically hold: distinct healthy data nodes with a usable disk on a
     // maintained tier (one node holds one replica per chunk on the wire).
     let rf = maintained_node_capacity(sm, &mandatory);
+    let latch =
+        WARNED_FLOOR_CLAMPED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     if rf >= floor {
+        // Capacity recovered: re-arm the warn-once latch for a later episode.
+        latch.lock().unwrap().remove(volume_id);
+        return floor;
+    }
+    // No Healthy maintained node at all: never clamp to 0 (that would ack a
+    // write with zero durable copies); keep the floor so the commit is
+    // rejected until a maintained node returns.
+    if rf == 0 {
         return floor;
     }
     let first_time = {
-        let set =
-            WARNED_FLOOR_CLAMPED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-        set.lock().unwrap().insert(volume_id.to_string())
+        latch.lock().unwrap().insert(volume_id.to_string())
     };
     if first_time {
         tracing::warn!(
@@ -1119,8 +1127,8 @@ fn clamp_ack_floor_to_capacity(
             configured_floor = floor,
             effective_rf = rf,
             "CR-6-2 (CMN-2): write_safety.min_replicas_before_ack exceeds the \
-             effective mandatory RF of a placed tier; clamping the ack floor \
-             to the RF so writes to that tier can commit"
+             healthy maintained node capacity; clamping the ack floor to that \
+             capacity so writes can commit"
         );
     }
     if let Some(audit) = audit {
@@ -1194,6 +1202,59 @@ fn norm_grpc_addr(a: &str) -> String {
         .to_string()
 }
 
+/// Disks the data node may store a chunk on when asked for `tier`; mirrors
+/// `dtfs-data` `select_disk_for_tier`: healthy disks of that tier (most
+/// free wins, unknowable here so all are possible), else any healthy disk.
+pub(crate) fn data_node_possible_picks(
+    n: &dtfs_raft::NodeInfo,
+    tier: DiskTier,
+) -> Vec<&dtfs_common::types::DiskInfo> {
+    let healthy = |d: &&dtfs_common::types::DiskInfo| d.status == DiskStatus::Healthy;
+    let exact: Vec<_> = n.disks.iter().filter(healthy).filter(|d| d.tier == tier).collect();
+    if exact.is_empty() {
+        n.disks.iter().filter(healthy).collect()
+    } else {
+        exact
+    }
+}
+
+/// Bug BX-2 spill candidates: disks on Healthy nodes outside the full
+/// `effective_tier` with room, not excluded, allowed by the volume's BZ
+/// spill policy.
+pub(crate) fn spill_candidates(
+    nodes: &BTreeMap<u64, dtfs_raft::NodeInfo>,
+    effective_tier: DiskTier,
+    exclude: &std::collections::HashSet<String>,
+    pcfg: &dtfs_common::config::PlacementConfig,
+    spill: &dtfs_common::types::SpillPolicy,
+    mandatory: &dtfs_common::types::TierReplication,
+) -> Vec<crate::placement::CandidateDisk> {
+    let mut out = Vec::new();
+    for (id, info) in nodes {
+        if info.health != HealthStatus::Healthy || exclude.contains(&norm_grpc_addr(&info.grpc_addr)) {
+            continue;
+        }
+        for d in &info.disks {
+            // RF 0 = cache-only: a spill there could never be durable.
+            if d.tier == effective_tier
+                || mandatory.for_tier(d.tier) == 0
+                || !pcfg.has_room(d.total_bytes, d.used_bytes)
+                || !spill.allows_target(&info.location.datacenter, d.tier)
+            {
+                continue;
+            }
+            out.push(crate::placement::CandidateDisk {
+                node_id: *id,
+                disk_id: d.disk_id,
+                tier: d.tier,
+                location: info.location.clone(),
+                free_bytes: d.total_bytes.saturating_sub(d.used_bytes),
+            });
+        }
+    }
+    out
+}
+
 /// Extra write targets that fill a chunk's ack floor across maintained
 /// tiers. `existing` are the addresses the placement engine already chose
 /// for `placed_tier`; they count toward the floor only when that tier is
@@ -1237,14 +1298,17 @@ pub(crate) fn fill_floor_targets(
         if exclude.contains(&addr) || existing_norm.contains(&addr) {
             continue;
         }
-        for d in &n.disks {
-            if d.status != DiskStatus::Healthy
-                || mandatory.for_tier(d.tier) == 0
-                || !pcfg.has_room(d.total_bytes, d.used_bytes)
-                || !spill.allows_target(&n.location.datacenter, d.tier)
-            {
-                continue;
-            }
+        let picks = data_node_possible_picks(n, placed_tier);
+        let all_ok = !picks.is_empty()
+            && picks.iter().all(|d| {
+                mandatory.for_tier(d.tier) > 0
+                    && pcfg.has_room(d.total_bytes, d.used_bytes)
+                    && spill.allows_target(&n.location.datacenter, d.tier)
+            });
+        if !all_ok {
+            continue;
+        }
+        for d in picks {
             cands.push(crate::placement::CandidateDisk {
                 node_id: *id,
                 disk_id: d.disk_id,
@@ -2379,6 +2443,57 @@ impl ManagerService for MetadataService {
             Vec::new()
         };
 
+        // Fill the ack floor across maintained tiers: the placed tier may
+        // hold fewer distinct nodes than the floor (e.g. one cold node, floor
+        // 2), so add targets on other RF>0 tiers rather than let the commit
+        // be acked (or rejected) on a single copy. The floor is the one the
+        // commit gate resolves (stricter of request and file volume).
+        let (mandatory, spill_cfg, default_floor) = match &volume_cfg {
+            Some(v) => (
+                v.effective_mandatory_replicas().clone(),
+                v.spill.clone(),
+                self.config.defaults.write_safety.min_replicas_before_ack,
+            ),
+            None => (
+                self.config.defaults.replication.clone(),
+                Default::default(),
+                self.config.defaults.write_safety.min_replicas_before_ack,
+            ),
+        };
+        let floor = resolve_ack_floor(&data, &req.path, &req.volume_id, default_floor);
+        let fill_requester = req
+            .requester_location
+            .as_ref()
+            .map(|l| dtfs_common::topology::Location::new(&l.region, &l.datacenter, &l.rack, &l.host))
+            .unwrap_or_else(|| dtfs_common::topology::Location::new("", "", "", ""));
+        let fill_ack_floor = |placements: &mut Vec<ChunkPlacement>, placed_tier: DiskTier| {
+            for p in placements.iter_mut() {
+                let mut existing = vec![p.primary_address.clone()];
+                existing.extend(p.replica_addresses.iter().cloned());
+                let extra = fill_floor_targets(
+                    &data.nodes,
+                    &mandatory,
+                    &spill_cfg,
+                    &self.config.placement,
+                    &fill_requester,
+                    placed_tier,
+                    &existing,
+                    floor,
+                    &exclude_set,
+                );
+                if !extra.is_empty() {
+                    tracing::debug!(
+                        path = %req.path,
+                        chunk_index = p.chunk_index,
+                        extra = ?extra,
+                        floor,
+                        "filling ack floor across maintained tiers"
+                    );
+                    p.replica_addresses.extend(extra);
+                }
+            }
+        };
+
         let mut placements = Vec::new();
 
         if placed.len() == req.num_chunks as usize && !placed.is_empty() {
@@ -2458,34 +2573,14 @@ impl ManagerService for MetadataService {
                         "No healthy data node has free space on tier {effective_tier:?} (all candidate disks below placement headroom or excluded); capacity spill disabled for this volume"
                     )));
                 }
-                let mut candidates: Vec<crate::placement::CandidateDisk> = Vec::new();
-                for (id, info) in &data.nodes {
-                    if info.health != dtfs_common::types::HealthStatus::Healthy {
-                        continue;
-                    }
-                    if exclude_set.contains(&norm_addr(&info.grpc_addr)) {
-                        continue;
-                    }
-                    for d in &info.disks {
-                        if d.tier == effective_tier {
-                            continue; // the mandated tier is the full one
-                        }
-                        if !pcfg.has_room(d.total_bytes, d.used_bytes) {
-                            continue;
-                        }
-                        // Bug BZ — drop spill targets this volume forbids.
-                        if !spill_policy.allows_target(&info.location.datacenter, d.tier) {
-                            continue;
-                        }
-                        candidates.push(crate::placement::CandidateDisk {
-                            node_id: *id,
-                            disk_id: d.disk_id,
-                            tier: d.tier,
-                            location: info.location.clone(),
-                            free_bytes: d.total_bytes.saturating_sub(d.used_bytes),
-                        });
-                    }
-                }
+                let candidates = spill_candidates(
+                    &data.nodes,
+                    effective_tier,
+                    &exclude_set,
+                    pcfg,
+                    &spill_policy,
+                    &mandatory,
+                );
                 // Bug BX-9 — the writer's location (sent by the FUSE client)
                 // makes nearness effective: same-DC candidates rank ahead of
                 // far ones at equal speed. Absent location => neutral distance
@@ -2505,7 +2600,7 @@ impl ManagerService for MetadataService {
                 let ranked = crate::placement::rank_candidates(&candidates, &requester);
                 let Some(best) = ranked.first() else {
                     return Err(Status::unavailable(
-                        "No data node has free space on ANY tier (cluster full); cannot spill",
+                        "No data node has free space on any maintained tier (cluster full, or only cache-only tiers left); cannot spill",
                     ));
                 };
                 let spill_tier = best.tier;
@@ -2556,6 +2651,7 @@ impl ManagerService for MetadataService {
                         tier: chunk_placement_tier_string(spill_tier),
                     });
                 }
+                fill_ack_floor(&mut placements, spill_tier);
                 return Ok(Response::new(AllocateChunksResponse { placements }));
             }
             let rf = (replication as usize).min(node_list.len());
@@ -2582,52 +2678,7 @@ impl ManagerService for MetadataService {
             }
         }
 
-        // Fill the ack floor across maintained tiers: the effective tier may
-        // hold fewer distinct nodes than the floor (e.g. one cold node, floor
-        // 2), so add targets on other RF>0 tiers rather than let the commit
-        // be acked (or rejected) on a single copy.
-        let (mandatory, floor, spill) = match &volume_cfg {
-            Some(v) => (
-                v.effective_mandatory_replicas().clone(),
-                v.write_safety.min_replicas_before_ack,
-                v.spill.clone(),
-            ),
-            None => (
-                self.config.defaults.replication.clone(),
-                self.config.defaults.write_safety.min_replicas_before_ack,
-                Default::default(),
-            ),
-        };
-        let requester = req
-            .requester_location
-            .as_ref()
-            .map(|l| dtfs_common::topology::Location::new(&l.region, &l.datacenter, &l.rack, &l.host))
-            .unwrap_or_else(|| dtfs_common::topology::Location::new("", "", "", ""));
-        for p in placements.iter_mut() {
-            let mut existing = vec![p.primary_address.clone()];
-            existing.extend(p.replica_addresses.iter().cloned());
-            let extra = fill_floor_targets(
-                &data.nodes,
-                &mandatory,
-                &spill,
-                &self.config.placement,
-                &requester,
-                effective_tier,
-                &existing,
-                floor,
-                &exclude_set,
-            );
-            if !extra.is_empty() {
-                tracing::debug!(
-                    path = %req.path,
-                    chunk_index = p.chunk_index,
-                    extra = ?extra,
-                    floor,
-                    "filling ack floor across maintained tiers"
-                );
-                p.replica_addresses.extend(extra);
-            }
-        }
+        fill_ack_floor(&mut placements, effective_tier);
 
         Ok(Response::new(AllocateChunksResponse { placements }))
     }
@@ -3328,35 +3379,6 @@ pub(crate) fn unresolved_commit_nodes(commits: &[ChunkLocationEntry]) -> Vec<Str
     v.sort();
     v.dedup();
     v
-}
-
-/// Bug CF-3b — write-safety ack floor. Returns `true` only when EVERY
-/// chunk in the commit batch carries at least `floor` distinct
-/// `(node_id, disk_id)` replicas. The FUSE writer commits one
-/// `ChunkLocationEntry` per replica that actually landed, so the per-
-/// chunk distinct-target count is the durable replica count for that
-/// chunk at commit time. Replica identity is `(node_id, disk_id)`,
-/// never `node_id` alone (CLAUDE.md A.3.4, Bug BH): two copies on one
-/// node but different disks/tiers count as two.
-///
-/// `floor <= 1` is always satisfied (a single durable copy is enough,
-/// or the gate is disabled). An empty batch is vacuously satisfied.
-/// Pure, so it is unit-tested directly.
-pub(crate) fn ack_floor_satisfied(commits: &[ChunkLocationEntry], floor: u32) -> bool {
-    if floor <= 1 {
-        return true;
-    }
-    let mut per_chunk: std::collections::HashMap<u64, std::collections::HashSet<(String, u32)>> =
-        std::collections::HashMap::new();
-    for c in commits {
-        per_chunk
-            .entry(c.chunk_index)
-            .or_default()
-            .insert((c.node_id.clone(), c.disk_id));
-    }
-    per_chunk
-        .values()
-        .all(|targets| targets.len() as u32 >= floor)
 }
 
 /// Bug AV (AV-3-2) — pure-function resolution of the
