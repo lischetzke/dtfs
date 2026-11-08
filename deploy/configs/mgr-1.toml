@@ -13,6 +13,11 @@ host = "mgr-1"
 name = "dtfs-dev"
 shared_secret = "dev-cluster-secret-change-me"
 bootstrap = true
+initial_voters = [
+  { hostname = "mgr-1", addr = "mgr-1:9401" },
+  { hostname = "mgr-2", addr = "mgr-2:9401" },
+  { hostname = "mgr-3", addr = "mgr-3:9401" },
+]
 
 [raft]
 listen_addr = "0.0.0.0:9400"
