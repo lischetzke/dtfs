@@ -21,7 +21,10 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 TARGET="x86_64-unknown-linux-gnu"
-DIST_DIR="$PROJECT_ROOT/target/release/dist/linux-amd64"
+# Honour CARGO_TARGET_DIR (cargo writes there; relative = from the project root).
+TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+case "$TARGET_DIR" in /*) ;; *) TARGET_DIR="$PROJECT_ROOT/$TARGET_DIR" ;; esac
+DIST_DIR="$TARGET_DIR/release/dist/linux-amd64"
 QUICK="${1:-}"
 
 # Colours (disabled if not a terminal)
@@ -120,7 +123,7 @@ rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
 for bin in "${BINARIES[@]}"; do
-    SRC="$PROJECT_ROOT/target/release/$bin"
+    SRC="$TARGET_DIR/release/$bin"
     if [ ! -f "$SRC" ]; then
         error "Binary not found: $SRC"
         exit 1
