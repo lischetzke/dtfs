@@ -69,7 +69,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   overlapped it (`FetchToken::may_install`); otherwise it waits for the path
   to go quiet (`wait_quiet`, Notify, no polling) and fetches again, failing
   with EIO after `QUIET_WAIT` (the write-lease length). Never use or install
-  an overlapped fetch. truncate's SetFileSize holds a commit slot. Snapshots are
+  an overlapped fetch. SetFileSize (truncate, set_size) holds a commit slot. Snapshots are
   `Arc<FileLocations>` (handles and metadata cache): read()/write() clone
   the Arc, never the chunk list; the merge is copy-on-write (`merge_shared`).
 - Handle `locations = None` means stale; `write()`/`read()` must

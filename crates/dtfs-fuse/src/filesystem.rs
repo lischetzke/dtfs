@@ -2089,10 +2089,15 @@ impl DtfsFilesystem {
             .get(&fh)
             .map(|f| f.path.clone())
             .context("invalid fh")?;
-        self.client
-            .set_file_size(&path, new_size)
-            .await
-            .with_context(|| format!("set_size failed for {path}"))?;
+        {
+            // Counts as a commit (as in truncate), so a fetch overlapping the
+            // size change is never installed with the old size.
+            let _commit = self.commit_tracker.begin(&path);
+            self.client
+                .set_file_size(&path, new_size)
+                .await
+                .with_context(|| format!("set_size failed for {path}"))?;
+        }
         self.metadata_cache.remove(&path);
         // Handle snapshots hold the old size (O_APPEND EOF, hole-fill base);
         // None makes the next write()/read() refetch.
