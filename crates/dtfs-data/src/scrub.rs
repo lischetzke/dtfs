@@ -234,21 +234,8 @@ impl ScrubScheduler {
                             count = result.corrupt_chunk_ids.len(),
                             "Bug O scrub quarantining locally-corrupt chunks + enqueuing for manager report"
                         );
-                        for cid in &result.corrupt_chunk_ids {
-                            if let Err(e) =
-                                crate::store::quarantine_chunk_on_disk(disk_path, cid).await
-                            {
-                                tracing::warn!(
-                                    chunk_id = %cid,
-                                    error = %e,
-                                    "Bug O quarantine failed (non-fatal; entry still reported)"
-                                );
-                            }
-                        }
-                        let disk_id = self.store.disk_id_for_path(disk_path);
-                        self.store.enqueue_pending_corruption(
-                            result.corrupt_chunk_ids.iter().map(|c| (c.clone(), disk_id)),
-                        );
+                        // Quarantine + enqueue already happened inline in
+                        // scrub_disk, under each chunk's lock.
                     }
                 }
                 Err(e) => {

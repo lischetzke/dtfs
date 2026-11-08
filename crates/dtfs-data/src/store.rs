@@ -815,6 +815,45 @@ impl ChunkStore {
         n
     }
 
+    /// Quarantine + enqueue for the manager every id in `ids[*done..]` that is
+    /// still bad when re-checked under its chunk lock; drop ids that turned out
+    /// healthy (re-uploaded or repaired since detection). Advances `*done`.
+    async fn quarantine_confirmed(&self, disk_path: &Path, ids: &mut Vec<String>, done: &mut usize) {
+        let mut i = *done;
+        while i < ids.len() {
+            if self.confirm_and_quarantine(disk_path, &ids[i]).await {
+                i += 1;
+            } else {
+                ids.remove(i);
+            }
+        }
+        *done = i;
+    }
+
+    /// Under the chunk lock, re-hash the `.dat` against the chunk id; if it is
+    /// still bad (mismatch or unreadable), quarantine by RENAME and queue the
+    /// corruption report. Returns false when the chunk is gone or healthy.
+    async fn confirm_and_quarantine(&self, disk_path: &Path, chunk_hex: &str) -> bool {
+        let Ok(id) = ChunkId::from_hex(chunk_hex) else { return true };
+        let _guard = self.chunk_locks[Self::chunk_lock_index(&id)].lock().await;
+        let dat = chunk_data_path(disk_path, &id);
+        let Ok(md) = fs::metadata(&dat).await else { return false };
+        match hash_chunk_file_incrementally(&dat, md.len()).await {
+            Ok(d) if d == id.0 => {
+                tracing::info!(chunk = %chunk_hex, "scrub: chunk healthy on re-check; not quarantined");
+                return false;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            _ => {}
+        }
+        tracing::warn!(chunk = %chunk_hex, disk = %disk_path.display(), "scrub quarantining corrupt chunk (inline, under chunk lock)");
+        if let Err(e) = quarantine_chunk_on_disk(disk_path, chunk_hex).await {
+            tracing::warn!(chunk = %chunk_hex, error = %e, "quarantine failed (non-fatal; entry still reported)");
+        }
+        self.enqueue_pending_corruption([(chunk_hex.to_string(), self.disk_id_for_path(disk_path))]);
+        true
+    }
+
     /// Disk id of the managed disk mounted at `path`, if any.
     pub fn disk_id_for_path(&self, path: &std::path::Path) -> Option<u32> {
         self.disk_manager
@@ -1172,6 +1211,7 @@ impl ChunkStore {
 
         let mut io_errors: u64 = 0;
         let mut vanished: u64 = 0;
+        let mut quarantined_upto: usize = 0;
 
         for l1 in &level1 {
             let l1_dir = chunks_dir.join(l1);
@@ -1418,6 +1458,10 @@ impl ChunkStore {
 
                     result.chunks_healthy += 1;
                 }
+                // Quarantine this bucket's detections now (under the chunk
+                // lock, re-hashed against the id), not at the end of the
+                // whole disk pass.
+                self.quarantine_confirmed(disk_path, &mut result.corrupt_chunk_ids, &mut quarantined_upto).await;
             }
         }
 
@@ -2251,6 +2295,27 @@ mod tests {
 
     /// Bytes that do not hash to the chunk id are corrupt even when the
     /// .meta agrees with them.
+    #[tokio::test]
+    async fn scrub_quarantines_inline_and_rechecks_before_rename() {
+        let (store, _tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+        let vol = VolumeId::new("default".to_string());
+        let data = b"scrub-inline-quarantine";
+        let id = ChunkId::from_bytes(checksum::compute(data));
+        store.put_chunk(&id, data, &vol, DiskTier::Hot).await.unwrap();
+        // Healthy chunk: the re-check under the lock declines to quarantine.
+        assert!(!store.confirm_and_quarantine(&disk, &id.as_hex()).await);
+        assert!(chunk_data_path(&disk, &id).exists());
+        assert!(store.drain_pending_corruption().is_empty());
+        // Corrupt it: the scrub pass itself quarantines (rename) and enqueues.
+        std::fs::write(chunk_data_path(&disk, &id), b"scrub-inline-quarantiXe").unwrap();
+        let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+        assert_eq!(res.corrupt_chunk_ids, vec![id.as_hex()]);
+        assert!(!chunk_data_path(&disk, &id).exists());
+        assert!(disk.join(".dtfs/quarantine").join(format!("{}.dat.bad", id.as_hex())).exists());
+        assert_eq!(store.drain_pending_corruption(), vec![(id.as_hex(), store.disk_id_for_path(&disk))]);
+    }
+
     #[tokio::test]
     async fn scrub_reports_dat_not_matching_chunk_id_even_if_meta_agrees() {
         let (store, _tmp) = make_test_store().await;
