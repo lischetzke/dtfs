@@ -1564,11 +1564,7 @@ impl DtfsFilesystem {
     /// to data nodes automatically. Returns the number of bytes written.
     #[instrument(skip(self, data), fields(fh, offset, len = data.len()))]
     pub async fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32> {
-        let path = self.open_files.get(&fh).map(|f| f.path.clone());
-        let guard = match &path {
-            Some(p) => self.path_guard(p).await,
-            None => None,
-        };
+        let (path, guard) = self.fh_path_guard(fh).await;
         let res = self.write_inner(fh, offset, data).await;
         if let Some(p) = path {
             self.drop_path_guard(&p, guard);
@@ -1839,11 +1835,7 @@ impl DtfsFilesystem {
     /// this result; RELEASE is async and its reply is ignored, so committing
     /// only there would let close() return with the bytes in memory.
     pub async fn flush(&self, fh: u64) -> Result<()> {
-        let path = self.open_files.get(&fh).map(|f| f.path.clone());
-        let guard = match &path {
-            Some(p) => self.path_guard(p).await,
-            None => None,
-        };
+        let (path, guard) = self.fh_path_guard(fh).await;
         let res = self.commit_all(fh).await.and_then(|()| {
             match self.open_files.get_mut(&fh).and_then(|mut f| f.write_error.take()) {
                 Some(msg) => Err(anyhow::anyhow!(msg)),
@@ -1899,6 +1891,26 @@ impl DtfsFilesystem {
         }
         let lock = self.path_locks.entry(path.to_string()).or_default().clone();
         Some(lock.lock_owned().await)
+    }
+
+    /// `path_guard` of `fh`'s current path, plus that path (for
+    /// `drop_path_guard`); `(None, None)` for an unknown fh. A rename can
+    /// re-key the handle while we wait: re-check and retry on the new path.
+    async fn fh_path_guard(
+        &self,
+        fh: u64,
+    ) -> (Option<String>, Option<tokio::sync::OwnedMutexGuard<()>>) {
+        loop {
+            let Some(p) = self.open_files.get(&fh).map(|f| f.path.clone()) else {
+                return (None, None);
+            };
+            let g = self.path_guard(&p).await;
+            let moved = self.open_files.get(&fh).is_some_and(|f| f.path != p);
+            if !moved || g.is_none() {
+                return (Some(p), g);
+            }
+            self.drop_path_guard(&p, g);
+        }
     }
 
     /// Unlock and forget `path`'s lock once nobody holds or awaits it, so
@@ -2097,11 +2109,7 @@ impl DtfsFilesystem {
         // down the handle, its write lease, and its write buffer; otherwise the
         // fh leaks and the stale buffer overlays (incorrectly) future reads of
         // the same path. Capture the error and surface it AFTER cleanup.
-        let guard_path = self.open_files.get(&fh).map(|f| f.path.clone());
-        let guard = match &guard_path {
-            Some(p) => self.path_guard(p).await,
-            None => None,
-        };
+        let (guard_path, guard) = self.fh_path_guard(fh).await;
         let commit_result = if self.open_files.contains_key(&fh) {
             self.commit_all(fh).await
         } else {
@@ -5426,6 +5434,28 @@ mod async_commit_fs_tests {
             let err = fs.rename(from, to).await.unwrap_err();
             assert!(format!("{err:#}").contains(&format!("rename {from} -> {to}")), "{err:#}");
         }
+    }
+
+    /// write/flush/release read the fh's path, then wait for its guard; a
+    /// directory rename can re-key the handle meanwhile. They must end up
+    /// holding the guard of the path the handle has now (the one
+    /// `commit_aged` locks), not the old one.
+    #[tokio::test]
+    async fn fh_path_guard_follows_a_rename_while_waiting() {
+        let fs = Arc::new(fs(true));
+        let fh = open(&fs, "/d/f", OpenFlags::ReadWrite);
+        let held = fs.path_guard("/d/f").await; // rename holds it while re-keying
+        let f2 = fs.clone();
+        let waiter = tokio::spawn(async move { f2.fh_path_guard(fh).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        fs.open_files.get_mut(&fh).unwrap().path = "/e/f".to_string();
+        fs.drop_path_guard("/d/f", held);
+        let (p, g) = waiter.await.unwrap();
+        assert_eq!(p.as_deref(), Some("/e/f"), "guard taken on the pre-rename path");
+        let timer = tokio::time::timeout(Duration::from_millis(100), fs.path_guard("/e/f")).await;
+        assert!(timer.is_err(), "commit_aged on /e/f must wait for the writer");
+        fs.drop_path_guard("/e/f", g);
+        assert_eq!(fs.fh_path_guard(999).await.0, None, "unknown fh");
     }
 
     /// The config bound must stay at half the write lease (renewed only by

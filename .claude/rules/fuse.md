@@ -140,7 +140,9 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   then also drains partial chunks outside `keep`. The timer is
   not serialised by the kernel like write/fsync/setattr, so write(), a
   writer's truncate, flush, release and the timer hold `path_guard` (per-path
-  tokio mutex, async mode only, one guard at a time). Only `rename` holds
+  tokio mutex, async mode only, one guard at a time; write/flush/release
+  take it via `fh_path_guard`, which re-reads the fh's path after acquiring
+  and retries if a rename re-keyed it). Only `rename` holds
   several: `from` plus every writable handle at or below `from` or `to`
   (`rename_lock_paths`, taken in sorted order) across `rename_file` and the
   buffer/handle re-key. A writer opened under `from` while rename waits for
