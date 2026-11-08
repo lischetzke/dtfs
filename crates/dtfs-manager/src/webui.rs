@@ -1002,4 +1002,132 @@ assert.strictEqual(errMsg({resp: {status: 401}, text: '', json: null, authError:
         assert!(first_send < prompt, "prompt must come after the first attempt");
         assert!(body.contains("status === 401"), "prompt gated on 401");
     }
+
+    /// Byte/time/percent formatting and the anchor-risk rule, run in node.
+    #[test]
+    fn formatting_and_anchor_helpers_behave() {
+        if std::process::Command::new("node").arg("--version").output().is_err() {
+            eprintln!("WARNING: node not on PATH, dashboard formatting helpers NOT exercised");
+            return;
+        }
+        let html = render_dashboard("c", "h");
+        let mut src: String = ["esc", "fmtBytes", "fmtBytesUnit", "timeAgo", "timeTag", "pctOf", "anchorRisk"]
+            .iter().map(|n| js_fn(&html, n)).collect::<Vec<_>>().join("\n");
+        src.push_str(r#"
+const assert = require('assert');
+assert.strictEqual(fmtBytes(0), '0 B');
+assert.strictEqual(fmtBytes(1023), '1023 B');
+assert.strictEqual(fmtBytes(1024), '1.0 KiB');
+assert.strictEqual(fmtBytes(1.5 * 1024 ** 3), '1.5 GiB');
+assert.strictEqual(fmtBytes(-1), '—');
+assert.strictEqual(fmtBytes(undefined), '—');
+assert.strictEqual(fmtBytes(NaN), '—');
+assert.strictEqual(fmtBytesUnit(2048).unit, 'KiB/s');
+assert.strictEqual(fmtBytesUnit(undefined).val, '—');
+assert.strictEqual(timeAgo(Date.now() + 60000), 'just now', 'future clamps');
+assert.strictEqual(timeAgo(0), '—');
+assert.ok(/^\d+m ago$/.test(timeAgo(Date.now() - 125000)));
+const t = timeTag(Date.now() - 3600 * 1000);
+assert.ok(t.startsWith('<time datetime="') && t.includes(' UTC / ') && t.includes('1h ago'), t);
+assert.strictEqual(timeTag(undefined), '—');
+assert.strictEqual(pctOf(999, 1000), 99, 'never 100 before full');
+assert.strictEqual(pctOf(1000, 1000), 100);
+assert.strictEqual(pctOf(0, 0), 0);
+assert.strictEqual(pctOf(5, 100), 5);
+assert.strictEqual(anchorRisk({anchor_pending: 0, chunk_placement: {missing: 0}}, {files_missing_chunks: 0}).atRisk, false);
+assert.strictEqual(anchorRisk({anchor_pending: 2}, null).atRisk, true);
+assert.strictEqual(anchorRisk({anchor_pending: 0, chunk_placement: {missing: 1}}, null).atRisk, true);
+assert.strictEqual(anchorRisk({anchor_pending: 0}, {files_missing_chunks: 3}).atRisk, true);
+"#);
+        let f = std::env::temp_dir().join(format!("dtfs-webui-fmt-{}.js", std::process::id()));
+        std::fs::write(&f, src).unwrap();
+        let out = std::process::Command::new("node").arg(&f).output().unwrap();
+        let _ = std::fs::remove_file(&f);
+        assert!(out.status.success(), "formatting checks failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+/// Design, theme and accessibility guarantees of the served dashboard.
+#[cfg(test)]
+mod design_a11y_tests {
+    use super::*;
+
+    fn style_block(html: &str) -> &str {
+        let a = html.find("<style>").expect("style open") + 7;
+        let b = html.find("</style>").expect("style close");
+        &html[a..b]
+    }
+
+    #[test]
+    fn stylesheet_has_light_theme_and_no_stray_hex_colours() {
+        let html = render_dashboard("c", "h");
+        let css = style_block(&html);
+        assert!(css.contains("color-scheme"), "color-scheme declared");
+        assert!(css.contains("@media (prefers-color-scheme: light)"), "light override present");
+        assert!(!html.contains("var(--border-color)"), "undefined variable must not be used");
+        // Hex colours are allowed only as variable definitions (`--name: #...`).
+        for line in css.lines() {
+            let t = line.trim_start();
+            if t.starts_with("--") { continue; }
+            let b = t.as_bytes();
+            for (i, c) in b.iter().enumerate() {
+                if *c != b'#' { continue; }
+                let n = b[i + 1..].iter().take_while(|x| x.is_ascii_hexdigit()).count();
+                let next = b.get(i + 1 + n).copied().unwrap_or(b' ');
+                assert!(
+                    !((3..=8).contains(&n) && !next.is_ascii_alphanumeric()),
+                    "hard-coded hex colour outside a CSS variable: {line}"
+                );
+            }
+        }
+        for needle in [":focus-visible", ".form-input:focus", ".btn-danger", "button:disabled", ".placeholder.error", "tabular-nums", "overflow-x: auto"] {
+            assert!(css.contains(needle), "stylesheet missing {needle}");
+        }
+    }
+
+    #[test]
+    fn modals_are_dialogs_with_labels_and_live_results() {
+        let html = render_dashboard("c", "h");
+        let modals = html.matches("class=\"modal-backdrop hidden\"").count();
+        assert_eq!(modals, 7, "seven dialogs expected");
+        assert_eq!(html.matches("role=\"dialog\" aria-modal=\"true\" aria-labelledby=").count(), modals);
+        for line in html.lines().filter(|l| l.contains("class=\"modal-result\"")) {
+            assert!(line.contains("role=\"status\" aria-live=\"polite\""), "result area must be a live region: {line}");
+        }
+        assert!(html.contains("e.key === 'Escape'") && html.contains("function showModal(") && html.contains("function hideModal("));
+        assert!(!html.contains("classList.remove('hidden')") || html.matches("classList.remove('hidden')").count() == 1,
+            "only showModal may unhide a dialog");
+        assert!(html.contains("id=\"health-banner\" role=\"status\" aria-live=\"polite\""));
+        assert!(html.contains("aria-expanded=\"false\" onclick=\"toggleNavGroup("));
+        assert!(html.contains("role=\"img\" aria-label=\"DTFS logo\""));
+    }
+
+    #[test]
+    fn copy_and_chrome_rules() {
+        let html = render_dashboard("c", "h");
+        assert!(!html.contains("<title>DTFS \u{2014}"), "no em-dash in the title");
+        for emoji in ["\u{2705}", "\u{274C}", "\u{26A0}", "\u{1F4C1}", "\u{1F4C4}", "\u{1F310}", "\u{1F3E2}", "\u{1F5C4}"] {
+            assert!(!html.contains(emoji), "emoji {emoji:?} must not be served");
+        }
+        for old in ["Set Maintenance", "Exit Maintenance", "Undergoal chunks", "Utilisation", "Data Explorer</h2>", "(MB/s)", "alert('name is required')"] {
+            assert!(!html.contains(old), "stale copy still served: {old}");
+        }
+        for new in ["Enter maintenance", "Exit maintenance", "Under-replicated", "Over-replicated", "Mbit/s", "Phantom (metadata without data on disk)", "Config editor", "Cluster settings (raw JSON)"] {
+            assert!(html.contains(new), "expected copy missing: {new}");
+        }
+        // Nav groups and problem badges.
+        for g in ["data-group=\"cluster\"", "data-group=\"data\"", "data-group=\"system\"", "id=\"nc-integrity\"", "id=\"nc-migrations\""] {
+            assert!(html.contains(g), "nav missing {g}");
+        }
+        // Anchor hero chip and tier-vs-health styling.
+        assert!(html.contains("anchor AT RISK") && html.contains("anchor OK") && html.contains("signal-chip ${c.sev}${c.hero"));
+        assert!(html.contains(".badge-hot  { background: transparent"), "tier badges are outlines");
+        // Destructive actions use btn-danger.
+        for id in ["id=\"dc-submit\"", "id=\"rd-submit\"", "id=\"uq-submit\"", "id=\"fc-submit\"", "id=\"raft-remove-btn\""] {
+            let at = html.find(id).unwrap();
+            let tag_start = html[..at].rfind('<').unwrap();
+            assert!(html[tag_start..at].contains("btn-danger"), "{id} must be a btn-danger button");
+        }
+        assert!(!html.contains("style=\"background:#b91c1c\""), "no inline red buttons");
+    }
 }

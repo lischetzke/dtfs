@@ -3,22 +3,72 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DTFS — __DTFS_CLUSTER_NAME__</title>
+    <title>DTFS - __DTFS_CLUSTER_NAME__</title>
     <style>
         :root {
+            color-scheme: dark;
             --bg:          #0f172a;
             --surface:     #1e293b;
             --surface2:    #273449;
             --border:      #334155;
             --text:        #e2e8f0;
             --text-muted:  #94a3b8;
-            --primary:     #3b82f6;
+            --primary:     #60a5fa;
+            --primary-solid: #2563eb;
             --success:     #22c55e;
             --warning:     #f59e0b;
-            --danger:      #ef4444;
-            --tape:        #a855f7;
+            --danger:      #f87171;
+            --tape:        #c084fc;
+            --danger-solid: #b91c1c;
+            --warn-solid:   #d97706;
+            --on-solid:     #ffffff;
+            --orange:       #e67e22;
+            --accent:       #a5b4fc;
+            --cyan:         #22d3ee;
+            --tier-hot:     #fb923c;
+            --tier-warm:    #facc15;
+            --tier-cold:    #22d3ee;
+            --tier-tape:    #c084fc;
+            --shadow:       rgba(0,0,0,.4);
+            --scrim:        rgba(0,0,0,.55);
+        }
+        @media (prefers-color-scheme: light) {
+            :root {
+                color-scheme: light;
+                --bg:          #f1f5f9;
+                --surface:     #ffffff;
+                --surface2:    #f1f5f9;
+                --border:      #cbd5e1;
+                --text:        #0f172a;
+                --text-muted:  #475569;
+                --primary:     #1d4ed8;
+                --primary-solid: #1d4ed8;
+                --success:     #15803d;
+                --warning:     #b45309;
+                --danger:      #b91c1c;
+                --tape:        #7e22ce;
+                --danger-solid: #b91c1c;
+                --warn-solid:   #b45309;
+                --orange:       #c2410c;
+                --accent:       #4338ca;
+                --cyan:         #0e7490;
+                --tier-hot:     #c2410c;
+                --tier-warm:    #a16207;
+                --tier-cold:    #0e7490;
+                --tier-tape:    #7e22ce;
+                --shadow:       rgba(15,23,42,.2);
+                --scrim:        rgba(15,23,42,.45);
+            }
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
+        :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+        .form-input:focus, .form-textarea:focus {
+            outline: none; border-color: var(--primary);
+            box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 35%, transparent);
+        }
+        button:disabled { opacity: .5; cursor: not-allowed; }
+        .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+        .num { text-align: right; font-variant-numeric: tabular-nums; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: var(--bg); color: var(--text); min-height: 100vh;
@@ -30,6 +80,7 @@
             border-bottom: 1px solid var(--border);
             padding: .5rem 1.25rem;
             display: flex; align-items: center; justify-content: space-between;
+            flex-wrap: wrap; gap: .4rem 1rem;
         }
         .header-brand { display: flex; align-items: center; gap: .75rem; }
         .header-brand svg { flex-shrink: 0; }
@@ -46,10 +97,13 @@
             color: var(--text-muted); font-family: inherit;
         }
         .auth-badge.auth-set {
-            border-color: #166534; color: var(--success); background: #14532d33;
+            border-color: var(--success); color: var(--success);
+            background: color-mix(in srgb, var(--success) 15%, transparent);
         }
-        .auth-badge.auth-missing {
-            border-color: #92400e; color: var(--warning); background: #78350f33;
+        /* neutral until a mutation was refused with 401 */
+        .auth-badge.auth-needed {
+            border-color: var(--warning); color: var(--warning);
+            background: color-mix(in srgb, var(--warning) 15%, transparent);
         }
         .auth-badge:hover { border-color: var(--primary); color: var(--text); }
 
@@ -58,7 +112,7 @@
             background: var(--surface);
             border-bottom: 1px solid var(--border);
             padding: 0 1.25rem;
-            display: flex; gap: 0;
+            display: flex; flex-wrap: wrap; gap: 0;
             /* overflow MUST be visible so the absolute-positioned
                .nav-menu dropdowns aren't clipped at the nav bottom.
                Horizontal scroll on tiny viewports is handled by the
@@ -89,8 +143,14 @@
             display: none; position: absolute; top: 100%; left: 0;
             background: var(--surface); border: 1px solid var(--border);
             border-top: none; min-width: 11rem; z-index: 50;
-            box-shadow: 0 4px 12px rgba(0,0,0,.25);
+            box-shadow: 0 4px 12px var(--shadow);
         }
+        .nav-count {
+            display: inline-block; min-width: 1.2rem; margin-left: .35rem; padding: 0 .35rem;
+            border-radius: 999px; background: var(--danger-solid); color: var(--on-solid);
+            font-size: .68rem; font-weight: 700; text-align: center; line-height: 1.2rem;
+        }
+        .nav-count:empty { display: none; }
         .nav .nav-group:hover .nav-menu,
         .nav .nav-group.open .nav-menu { display: block; }
         .nav .nav-menu a {
@@ -112,9 +172,10 @@
             font-size: .9rem; font-weight: 600;
             border-bottom: 1px solid var(--border);
         }
-        .health-banner.healthy  { background: #14532d44; }
-        .health-banner.degraded { background: #78350f44; }
-        .health-banner.critical { background: #7f1d1d44; }
+        .health-banner.healthy  { background: color-mix(in srgb, var(--success) 18%, var(--surface)); }
+        .health-banner.degraded { background: color-mix(in srgb, var(--warning) 20%, var(--surface)); }
+        .health-banner.critical { background: color-mix(in srgb, var(--danger) 24%, var(--surface)); }
+        .health-banner { flex-wrap: wrap; gap: .25rem 1rem; }
         .health-banner.unknown  { background: var(--surface); }
         .health-left { display: flex; align-items: center; gap: .75rem; }
         .health-dot {
@@ -155,11 +216,18 @@
             font-size: .7rem; color: var(--text-muted); margin-top: .2rem;
             text-transform: uppercase; letter-spacing: .04em;
         }
-        .signal-chip.ok .signal-val { color: var(--text-muted); }
-        .signal-chip.warn { border-color: #92400e88; background: #78350f22; }
+        .signal-chip.ok { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+        .signal-chip.ok .signal-val { color: var(--success); }
+        .signal-chip.warn { border-color: var(--warning); background: color-mix(in srgb, var(--warning) 12%, var(--surface)); }
         .signal-chip.warn .signal-val { color: var(--warning); }
-        .signal-chip.danger { border-color: #7f1d1d88; background: #7f1d1d22; }
+        .signal-chip.danger { border-color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, var(--surface)); }
         .signal-chip.danger .signal-val { color: var(--danger); }
+        .signal-chip.info .signal-val { color: var(--text); }
+        .signal-chip.hero { grid-column: span 2; }
+        .signal-chip .signal-val .glyph {
+            display: inline-block; min-width: 1.4rem; margin-right: .3rem;
+            font-size: .72rem; font-weight: 800; letter-spacing: .02em;
+        }
         .signal-chip .signal-hint {
             font-size: .65rem; color: var(--text-muted); margin-top: .15rem;
         }
@@ -174,25 +242,17 @@
         /* ── Count cards (auto-fit so wide displays show more per row) ── */
         .counts-row {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: .75rem; margin-bottom: 1rem;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: .5rem; margin-bottom: 1rem;
         }
         .count-card {
             background: var(--surface); border: 1px solid var(--border);
-            border-radius: .5rem; padding: .65rem .9rem;
-            display: flex; align-items: center; gap: .75rem;
+            border-radius: .5rem; padding: .4rem .8rem;
+            display: flex; align-items: baseline; gap: .6rem;
         }
-        .count-icon {
-            width: 40px; height: 40px; border-radius: .5rem;
-            display: flex; align-items: center; justify-content: center;
-            font-size: 1.25rem; flex-shrink: 0;
-        }
-        .count-icon.managers   { background: #1d4ed822; color: var(--primary); }
-        .count-icon.datanodes  { background: #15803d22; color: var(--success); }
-        .count-icon.disks      { background: #92400e22; color: var(--warning); }
-        .count-icon.clients    { background: #6b21a822; color: var(--tape); }
-        .count-body h4 { font-size: 1.6rem; font-weight: 700; line-height: 1; }
-        .count-body p  { font-size: .75rem; color: var(--text-muted); margin-top: .2rem; }
+        .count-body { display: flex; align-items: baseline; gap: .5rem; }
+        .count-body h4 { font-size: 1.15rem; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+        .count-body p  { font-size: .75rem; color: var(--text-muted); }
 
         /* ── Metric cards (capacity + I/O) ── */
         .metrics-row {
@@ -256,8 +316,9 @@
         /* ── Nodes table ── */
         .table-card {
             background: var(--surface); border: 1px solid var(--border);
-            border-radius: .5rem; overflow: hidden; margin-bottom: 1rem;
+            border-radius: .5rem; overflow-x: auto; margin-bottom: 1rem;
         }
+        th.num { text-align: right; }
         .table-card-header {
             padding: .55rem 1rem;
             display: flex; align-items: center; justify-content: space-between;
@@ -287,47 +348,50 @@
             display: inline-block; padding: .15rem .55rem;
             border-radius: 9999px; font-size: .7rem; font-weight: 600;
         }
-        .badge-healthy    { background: #22c55e22; color: var(--success); }
-        .badge-suspect    { background: #f59e0b22; color: var(--warning); }
-        .badge-degraded   { background: #f59e0b22; color: var(--warning); }
-        .badge-down       { background: #ef444422; color: var(--danger); }
-        .badge-failed     { background: #ef444422; color: var(--danger); }
-        /* Quarantined nodes hard-flag in deep red so an
-           operator scanning the page can't miss a data-integrity event. */
-        .badge-quarantined { background: #b91c1c; color: white; font-weight: 700; letter-spacing: .04em; }
-        /* CF-4c — a Manager-role node that is configured/registered but
-           NOT in raft membership (voter or learner). Amber so it reads as
-           a warning distinct from the red integrity quarantine. */
-        .badge-unjoined { background: #d97706; color: white; font-weight: 700; letter-spacing: .04em; }
-        .badge-maintenance { background: #3b82f622; color: var(--primary); }
-        .badge-draining   { background: #3b82f622; color: var(--primary); }
-        .badge-hot  { background: #ef444422; color: var(--danger); }
-        .badge-warm { background: #f59e0b22; color: var(--warning); }
-        .badge-cold { background: #3b82f622; color: var(--primary); }
-        .badge-tape { background: #a855f722; color: var(--tape); }
-        .badge-manager { background: #6366f122; color: #818cf8; }
-        /* Raft-leader marker on the Nodes page. Bright accent so
-           it stands out next to the normal role/health badges. */
-        .badge-leader { background: var(--primary); color: white; letter-spacing: .04em; }
-        .badge-data    { background: #22c55e22; color: var(--success); }
-        /* clients previously had no badge style, so the role
-           column on Nodes rendered an unstyled "client" text without
-           the pill that data/manager rows have. */
-        .badge-client  { background: #06b6d422; color: #22d3ee; }
-        .badge-unknown { background: #6b728022; color: var(--text-muted); }
+        /* Green/amber/red are reserved for health. Tiers use outline badges,
+           roles use neutral outline badges. */
+        .badge-healthy    { background: color-mix(in srgb, var(--success) 16%, transparent); color: var(--success); }
+        .badge-suspect    { background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--warning); }
+        .badge-degraded   { background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--warning); }
+        /* Down/Failed: the loudest health style (solid red). */
+        .badge-down, .badge-failed { background: var(--danger-solid); color: var(--on-solid); font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+        /* Quarantined: solid red plus an inset ring so it differs from Down. */
+        .badge-quarantined { background: var(--danger-solid); color: var(--on-solid); font-weight: 700; letter-spacing: .04em; box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--danger-solid); }
+        /* A Manager-role node that is registered but not in raft membership. */
+        .badge-unjoined { background: var(--warn-solid); color: var(--on-solid); font-weight: 700; letter-spacing: .04em; }
+        /* Planned states: dashed neutral outline, not a tier or leader colour. */
+        .badge-maintenance, .badge-draining { background: transparent; color: var(--text); border: 1px dashed var(--text-muted); }
+        .badge-hot  { background: transparent; color: var(--tier-hot);  border: 1px solid var(--tier-hot); }
+        .badge-warm { background: transparent; color: var(--tier-warm); border: 1px solid var(--tier-warm); }
+        .badge-cold { background: transparent; color: var(--tier-cold); border: 1px solid var(--tier-cold); }
+        .badge-tape { background: transparent; color: var(--tier-tape); border: 1px solid var(--tier-tape); }
+        .badge-manager, .badge-data, .badge-client { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+        .badge-manager { color: var(--accent); }
+        .badge-client  { color: var(--cyan); }
+        /* Raft-leader marker. */
+        .badge.badge-leader { background: var(--primary-solid); color: var(--on-solid); letter-spacing: .04em; }
+        .badge-anchor { background: transparent; color: var(--primary); border: 1px solid var(--primary); font-weight: 700; letter-spacing: .04em; }
+        .badge-unknown { background: color-mix(in srgb, var(--text-muted) 16%, transparent); color: var(--text-muted); }
+        .badge-ok   { background: color-mix(in srgb, var(--success) 16%, transparent); color: var(--success); }
+        .badge-warn { background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--warning); }
+        .badge-bad  { background: var(--danger-solid); color: var(--on-solid); }
+        .badge-pending { background: color-mix(in srgb, var(--text-muted) 16%, transparent); color: var(--text-muted); }
         /* right-click context menu for the Data Explorer. */
         .ctxmenu { position: absolute; z-index: 1000; min-width: 180px;
                     background: var(--surface); border: 1px solid var(--border);
-                    border-radius: .375rem; box-shadow: 0 4px 12px #0008;
+                    border-radius: .375rem; box-shadow: 0 4px 12px var(--shadow);
                     padding: .25rem 0; font-size: .82rem; }
-        .ctxmenu-item { padding: .35rem .75rem; cursor: pointer; color: var(--text); }
-        .ctxmenu-item:hover { background: var(--surface2); }
+        .ctxmenu-item { display: block; width: 100%; text-align: left; background: transparent; border: none;
+                        font: inherit; padding: .35rem .75rem; cursor: pointer; color: var(--text); }
+        .ctxmenu-item:hover, .ctxmenu-item:focus-visible { background: var(--surface2); }
         .explorer-row:hover { background: var(--surface2); }
+        .explorer-row:focus-visible { outline-offset: -2px; }
 
         .placeholder {
             text-align: center; color: var(--text-muted);
             padding: 2.5rem; font-style: italic; font-size: .85rem;
         }
+        .placeholder.error { color: var(--danger); font-style: normal; font-weight: 600; }
 
         /* ── Page header ── */
         .page-header { margin-bottom: 1rem; }
@@ -365,6 +429,7 @@
             transition: all .15s;
         }
         .btn-maint:hover { border-color: var(--primary); color: var(--primary); }
+        .btn-maint.btn-danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); padding: .25rem .75rem; font-size: .75rem; }
 
         /* ── Settings ── */
         .settings-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .75rem; }
@@ -392,11 +457,18 @@
             width: 100%; font-family: monospace; resize: vertical;
         }
         .btn-primary {
-            background: var(--primary); border: none; color: white;
+            background: var(--primary-solid); border: none; color: white;
             padding: .4rem 1rem; border-radius: .375rem; font-size: .85rem; cursor: pointer;
             transition: opacity .15s; white-space: nowrap;
         }
         .btn-primary:hover { opacity: .85; }
+        .btn-primary { color: var(--on-solid); }
+        .btn-danger { background: var(--danger-solid); border: none; color: var(--on-solid);
+            padding: .4rem 1rem; border-radius: .375rem; font-size: .85rem; cursor: pointer;
+            transition: background .15s; white-space: nowrap; }
+        .btn-danger:hover { background: color-mix(in srgb, var(--danger-solid) 80%, black); }
+        .btn-danger.btn-sm { padding: .35rem .75rem; font-size: .78rem; }
+        .btn-maint.btn-danger:hover { background: var(--danger-solid); color: var(--on-solid); border-color: var(--danger-solid); }
         .btn-secondary {
             background: var(--surface2); border: 1px solid var(--border); color: var(--text);
             padding: .35rem .75rem; border-radius: .375rem; font-size: .78rem; cursor: pointer;
@@ -406,16 +478,26 @@
 
         /* ── Modal (Migrate dialog) ── */
         .modal-backdrop {
-            position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 99;
+            position: fixed; inset: 0; background: var(--scrim); z-index: 99;
             display: flex; align-items: center; justify-content: center;
         }
         .modal-backdrop.hidden { display: none; }
         .modal-card {
             background: var(--surface); border: 1px solid var(--border);
-            border-radius: .5rem; padding: 1.25rem 1.5rem; min-width: 460px;
-            max-width: 640px; box-shadow: 0 10px 40px rgba(0,0,0,.4);
-            max-height: 80vh; overflow-y: auto;
+            border-radius: .5rem; padding: 1.25rem 1.5rem; min-width: min(460px, 92vw);
+            max-width: min(640px, 96vw); box-shadow: 0 10px 40px var(--shadow);
+            max-height: 90vh; overflow-y: auto;
         }
+        .modal-card fieldset { border: 1px solid var(--border); border-radius: .4rem; padding: .6rem .8rem .2rem; margin-bottom: .85rem; min-width: 0; }
+        .modal-card legend { font-size: .8rem; font-weight: 600; padding: 0 .35rem; }
+        .modal-card details { margin-bottom: .85rem; }
+        .modal-card summary { cursor: pointer; font-size: .8rem; font-weight: 600; margin-bottom: .5rem; }
+        .field-error { color: var(--danger); font-size: .78rem; margin-top: .2rem; }
+        .modal-note { font-size: .78rem; color: var(--text-muted); margin-bottom: 1rem; }
+        .modal-warn { color: var(--warning); }
+        .modal-danger-box { background: color-mix(in srgb, var(--danger-solid) 10%, transparent); border: 1px solid var(--danger-solid); border-radius: .4rem; padding: .5rem; margin-bottom: .8rem; font-size: .8rem; }
+        .modal-card h3.danger { color: var(--danger); }
+        .modal-result.warn { border-color: var(--warning); color: var(--warning); }
         .modal-card h3 { margin: 0 0 1rem; font-size: 1.05rem; }
         .modal-row { display: flex; flex-direction: column; gap: .25rem; margin-bottom: .85rem; }
         .modal-row label { font-size: .78rem; color: var(--text-muted); }
@@ -440,18 +522,23 @@
             .scrub-stats { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
             .container { padding: .75rem .75rem; }
             .header, .nav, .health-banner { padding-left: .75rem; padding-right: .75rem; }
+            .header-meta { text-align: left; }
+            .node-card-header { flex-wrap: wrap; gap: .5rem; }
+            .node-card-header > div { flex-wrap: wrap; }
         }
+        .page-actions { display: flex; gap: .75rem; margin-bottom: 1rem; flex-wrap: wrap; }
+        @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
     </style>
 </head>
 <body>
 
 <div class="header">
     <div class="header-brand">
-        <svg width="28" height="28" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+        <svg width="28" height="28" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="DTFS logo">
             <rect width="64" height="64" rx="10" fill="#2563eb"/>
             <text x="32" y="44" font-size="34" fill="white" text-anchor="middle" font-family="monospace" font-weight="bold">D</text>
         </svg>
-        <span class="header-title"><span>DTFS</span> — __DTFS_CLUSTER_NAME__</span>
+        <span class="header-title"><span>DTFS</span> - __DTFS_CLUSTER_NAME__</span>
     </div>
     <div class="header-meta">
         Manager: <b>__DTFS_HOSTNAME__</b><br>
@@ -462,39 +549,44 @@
     </div>
 </div>
 
-<nav class="nav" id="topnav">
+<nav class="nav" id="topnav" aria-label="Main">
     <a href="/ui" class="active" data-route="/ui">Home</a>
     <div class="nav-group" data-group="cluster">
-        <button type="button" onclick="toggleNavGroup(event,'cluster')">Cluster</button>
+        <button type="button" aria-haspopup="true" aria-expanded="false" onclick="toggleNavGroup(event,'cluster')">Cluster</button>
         <div class="nav-menu">
-            <a href="/ui/topology"   data-route="/ui/topology">Topology</a>
             <a href="/ui/nodes"      data-route="/ui/nodes">Nodes</a>
+            <a href="/ui/topology"   data-route="/ui/topology">Topology</a>
             <a href="/ui/raft"       data-route="/ui/raft">Raft</a>
-            <a href="/ui/integrity"  data-route="/ui/integrity">Integrity</a>
-            <a href="/ui/audit"      data-route="/ui/audit">Audit Log</a>
-            <a href="/ui/config"     data-route="/ui/config">Config</a>
-            <a href="/ui/settings"   data-route="/ui/settings">Settings</a>
         </div>
     </div>
     <div class="nav-group" data-group="data">
-        <button type="button" onclick="toggleNavGroup(event,'data')">Data</button>
+        <button type="button" aria-haspopup="true" aria-expanded="false" onclick="toggleNavGroup(event,'data')">Data<span class="nav-count" id="nc-data" aria-live="polite"></span></button>
         <div class="nav-menu">
             <a href="/ui/volumes"    data-route="/ui/volumes">Volumes</a>
-            <a href="/ui/explorer"   data-route="/ui/explorer">Data Explorer</a>
-            <a href="/ui/migrations" data-route="/ui/migrations">Migrations</a>
+            <a href="/ui/explorer"   data-route="/ui/explorer">Explorer</a>
+            <a href="/ui/migrations" data-route="/ui/migrations">Migrations<span class="nav-count" id="nc-migrations"></span></a>
+            <a href="/ui/integrity"  data-route="/ui/integrity">Integrity<span class="nav-count" id="nc-integrity"></span></a>
         </div>
     </div>
-    <a href="__DTFS_REPO_URL__/tree/master/docs" target="_blank">Docs ↗</a>
+    <div class="nav-group" data-group="system">
+        <button type="button" aria-haspopup="true" aria-expanded="false" onclick="toggleNavGroup(event,'system')">System</button>
+        <div class="nav-menu">
+            <a href="/ui/audit"      data-route="/ui/audit">Audit log</a>
+            <a href="/ui/config"     data-route="/ui/config">Config editor</a>
+            <a href="/ui/settings"   data-route="/ui/settings">Cluster settings (raw JSON)</a>
+        </div>
+    </div>
+    <a href="__DTFS_REPO_URL__/tree/master/docs" target="_blank" rel="noopener">Docs (new tab)</a>
 </nav>
 
-<div class="health-banner unknown" id="health-banner">
+<div class="health-banner unknown" id="health-banner" role="status" aria-live="polite">
     <div class="health-left">
-        <div class="health-dot unknown" id="health-dot"></div>
+        <div class="health-dot unknown" id="health-dot" aria-hidden="true"></div>
         <span class="health-label" id="health-label">Loading…</span>
         <span id="health-detail" style="font-weight:400;color:var(--text-muted);font-size:.85rem"></span>
         <span id="manager-health" class="manager-health unknown" title="GET /api/v1/health on this manager, independent of /api/v1/stats">manager: …</span>
     </div>
-    <div class="health-right" id="health-right">Fetching cluster status…</div>
+    <div class="health-right" id="health-right">Loading…</div>
 </div>
 
 <div class="container" id="page-content">
@@ -503,19 +595,19 @@
 
 <!-- ── Migrate dialog (operator-driven tier/DC moves) ── -->
 <div id="migrate-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeMigrate()">
-    <div class="modal-card">
-        <h3>Migrate data to another tier / datacenter</h3>
-        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:1rem">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="migrate-title" tabindex="-1">
+        <h3 id="migrate-title">Migrate data to another tier / datacenter</h3>
+        <div class="modal-note">
             Adds a replica satisfying the chosen tier (and, when set, datacenter) for every chunk
-            whose file path begins with the prefix. Existing replicas are left in place — this
+            whose file path begins with the prefix. Existing replicas are left in place; this
             is additive and never deletes data.
         </div>
         <div class="modal-row">
-            <label>Path prefix</label>
+            <label for="m-path">Path prefix</label>
             <input id="m-path" class="form-input" placeholder="/movies/Season 1/">
         </div>
         <div class="modal-row">
-            <label>Target tier</label>
+            <label for="m-tier">Target tier</label>
             <select id="m-tier" class="form-input">
                 <option value="hot">hot</option>
                 <option value="warm" selected>warm</option>
@@ -524,40 +616,40 @@
             </select>
         </div>
         <div class="modal-row">
-            <label>Target datacenter (optional)</label>
+            <label for="m-dc">Target datacenter (optional)</label>
             <select id="m-dc" class="form-input">
                 <option value="">Any datacenter</option>
             </select>
         </div>
         <div class="modal-row" id="m-empty-row" style="display:none">
-            <label style="color:var(--warning)">
-                <input id="m-allow-empty" type="checkbox"> Allow empty prefix (matches every file — destructive on big clusters!)
+            <label class="modal-warn" for="m-allow-empty">
+                <input id="m-allow-empty" type="checkbox"> Allow empty prefix (matches every file; destructive on big clusters)
             </label>
         </div>
         <div class="modal-actions">
             <button class="btn-secondary" onclick="closeMigrate()">Cancel</button>
             <button class="btn-primary"  onclick="submitMigrate()" id="m-submit">Schedule migration</button>
         </div>
-        <div id="m-result" class="modal-result" style="display:none"></div>
+        <div id="m-result" class="modal-result" style="display:none" role="status" aria-live="polite"></div>
     </div>
 </div>
 
 <!-- ── Flush cache dialog (operator-driven cache eviction) ── -->
 <div id="flush-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeFlushCache()">
-    <div class="modal-card">
-        <h3>Flush cache replicas</h3>
-        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:1rem">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="flush-title" tabindex="-1">
+        <h3 id="flush-title">Flush cache replicas</h3>
+        <div class="modal-note">
             Drops every <em>cache</em>-class replica (warm/hot, depending on the volume policy)
             for files under the path prefix and sets a per-chunk cooldown to prevent immediate
-            re-promotion. Mandatory replicas (the durable anchor) are preserved — any chunk
+            re-promotion. Mandatory replicas (the durable anchor) are preserved; any chunk
             whose flush would strand the anchor is refused and audited.
         </div>
         <div class="modal-row">
-            <label>Path prefix</label>
+            <label for="fc-path">Path prefix</label>
             <input id="fc-path" class="form-input" placeholder="/movies/Season 1/">
         </div>
         <div class="modal-row">
-            <label>Cache tiers to flush</label>
+            <label for="fc-tiers">Cache tiers to flush</label>
             <select id="fc-tiers" class="form-input">
                 <option value="warm" selected>warm</option>
                 <option value="hot">hot</option>
@@ -565,112 +657,114 @@
             </select>
         </div>
         <div class="modal-row">
-            <label>Cooldown (seconds)</label>
+            <label for="fc-cooldown">Cooldown (seconds)</label>
             <input id="fc-cooldown" class="form-input" type="number" min="0" step="60" value="300">
         </div>
         <div class="modal-row" id="fc-empty-row" style="display:none">
-            <label style="color:var(--warning)">
-                <input id="fc-allow-empty" type="checkbox"> Allow empty prefix (matches every file — destructive!)
+            <label class="modal-warn" for="fc-allow-empty">
+                <input id="fc-allow-empty" type="checkbox"> Allow empty prefix (matches every file; destructive)
             </label>
         </div>
         <div class="modal-actions">
             <button class="btn-secondary" onclick="closeFlushCache()">Cancel</button>
-            <button class="btn-primary"  onclick="submitFlushCache()" id="fc-submit">Flush cache</button>
+            <button class="btn-danger"  onclick="submitFlushCache()" id="fc-submit">Flush cache</button>
         </div>
-        <div id="fc-result" class="modal-result" style="display:none"></div>
+        <div id="fc-result" class="modal-result" style="display:none" role="status" aria-live="polite"></div>
     </div>
 </div>
 
 <!-- ── Create volume dialog (UIP-1-1) ── -->
 <div id="create-volume-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeCreateVolume()">
-    <div class="modal-card">
-        <h3>Create volume</h3>
-        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:1rem">
-            Posts <code>CreateVolumeRequest</code> to <code>/api/v1/volumes</code>.
-            Only <code>name</code> is required; every other field falls back
-            to the cluster default when left empty.
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="cv-title" tabindex="-1">
+        <h3 id="cv-title">Create volume</h3>
+        <div class="modal-note">
+            Only the name is required; every other field falls back to the cluster default when left empty.
         </div>
         <div class="modal-row">
-            <label>name</label>
-            <input id="cv-name" class="form-input" type="text" placeholder="e.g. media">
+            <label for="cv-name">Volume name (required)</label>
+            <input id="cv-name" class="form-input" type="text" required pattern="[A-Za-z0-9._\-]+" maxlength="64"
+                   title="Letters, digits, dot, underscore and dash only" placeholder="e.g. media" aria-describedby="cv-name-err">
+            <div id="cv-name-err" class="field-error" role="alert"></div>
         </div>
         <div class="modal-row">
-            <label>chunk_size_mb</label>
+            <label for="cv-chunk-size-mb">Chunk size (MiB)</label>
             <input id="cv-chunk-size-mb" class="form-input" type="number" min="1" step="1" placeholder="(cluster default)">
         </div>
-        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Replication</div>
-        <div class="modal-row">
-            <label>replication_hot</label>
-            <input id="cv-replication-hot" class="form-input" type="number" min="0" max="9" step="1" placeholder="(default)">
-        </div>
-        <div class="modal-row">
-            <label>replication_warm</label>
-            <input id="cv-replication-warm" class="form-input" type="number" min="0" max="9" step="1" placeholder="(default)">
-        </div>
-        <div class="modal-row">
-            <label>replication_cold</label>
-            <input id="cv-replication-cold" class="form-input" type="number" min="0" max="9" step="1" placeholder="(default)">
-        </div>
-        <div class="modal-row">
-            <label>anchor_datacenter</label>
-            <input id="cv-anchor-datacenter" class="form-input" type="text" placeholder="e.g. dc-a">
-        </div>
-        <div class="modal-row">
-            <label>force</label>
-            <label><input id="cv-force" type="checkbox"> accept an anchor DC no registered node reports</label>
-        </div>
+        <fieldset>
+            <legend>Mandatory replicas per tier</legend>
+            <div class="modal-row">
+                <label for="cv-replication-hot">Hot replicas</label>
+                <input id="cv-replication-hot" class="form-input" type="number" min="0" max="9" step="1" placeholder="(default)">
+            </div>
+            <div class="modal-row">
+                <label for="cv-replication-warm">Warm replicas</label>
+                <input id="cv-replication-warm" class="form-input" type="number" min="0" max="9" step="1" placeholder="(default)">
+            </div>
+            <div class="modal-row">
+                <label for="cv-replication-cold">Cold replicas</label>
+                <input id="cv-replication-cold" class="form-input" type="number" min="0" max="9" step="1" placeholder="(default)">
+            </div>
+        </fieldset>
+        <fieldset>
+            <legend>Anchor</legend>
+            <div class="modal-row">
+                <label for="cv-anchor-datacenter">Anchor datacenter (every chunk keeps a copy here)</label>
+                <input id="cv-anchor-datacenter" class="form-input" type="text" placeholder="e.g. leli">
+            </div>
+            <div class="modal-row">
+                <label for="cv-force"><input id="cv-force" type="checkbox"> Accept an anchor datacenter no registered node reports</label>
+            </div>
+        </fieldset>
         <div class="modal-actions">
             <button class="btn-secondary" onclick="closeCreateVolume()">Cancel</button>
             <button class="btn-primary"  onclick="submitCreateVolume()" id="cv-submit">Create volume</button>
         </div>
-        <div id="cv-result" class="modal-result" style="display:none"></div>
+        <div id="cv-result" class="modal-result" style="display:none" role="status" aria-live="polite"></div>
     </div>
 </div>
 
 <!-- ── Volume edit dialog (inline policy editor) ── -->
 <div id="volume-edit-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeVolumeEdit()">
-    <div class="modal-card">
-        <h3>Edit volume policy</h3>
-        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:1rem">
-            Edits mandatory replicas (<code>set-mandatory</code>), the anchor
-            policy (<code>set-anchor</code>), cache replicas
-            (<code>set-cache</code>) and write safety
-            (<code>set-write-safety</code>). Empty fields are left unchanged; each
-            section posts only when you change it. Server-side validation
-            (e.g. unsatisfiable tape / anchor) is shown below.
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="ve-title" tabindex="-1" oninput="onVolumeEditInput()" onchange="onVolumeEditInput()">
+        <h3 id="ve-title">Edit volume policy</h3>
+        <div class="modal-note">
+            Each section is sent only when you change it. Server-side validation
+            (for example an unsatisfiable tape or anchor) is shown below.
         </div>
         <div class="modal-row">
-            <label>Volume ID</label>
+            <label for="ve-volume-id">Volume ID</label>
             <input id="ve-volume-id" class="form-input" readonly>
         </div>
-        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Mandatory replicas</div>
+        <fieldset>
+            <legend>Mandatory replicas per tier</legend>
         <div class="modal-row">
-            <label>hot</label>
+            <label for="ve-mand-hot">Hot replicas</label>
             <input id="ve-mand-hot" class="form-input" type="number" min="0" max="9" step="1">
         </div>
         <div class="modal-row">
-            <label>warm</label>
+            <label for="ve-mand-warm">Warm replicas</label>
             <input id="ve-mand-warm" class="form-input" type="number" min="0" max="9" step="1">
         </div>
         <div class="modal-row">
-            <label>cold</label>
+            <label for="ve-mand-cold">Cold replicas</label>
             <input id="ve-mand-cold" class="form-input" type="number" min="0" max="9" step="1">
         </div>
         <div class="modal-row">
-            <label>tape</label>
+            <label for="ve-mand-tape">Tape replicas</label>
             <input id="ve-mand-tape" class="form-input" type="number" min="0" max="9" step="1">
         </div>
-        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Anchor</div>
+        </fieldset>
+        <fieldset>
+            <legend>Anchor</legend>
         <div class="modal-row">
-            <label>datacenter</label>
-            <input id="ve-anchor-dc" class="form-input" type="text" placeholder="e.g. dc-a">
+            <label for="ve-anchor-dc">Anchor datacenter</label>
+            <input id="ve-anchor-dc" class="form-input" type="text" placeholder="e.g. leli">
         </div>
         <div class="modal-row">
-            <label>force</label>
-            <label><input id="ve-anchor-force" type="checkbox"> accept a DC no registered node reports</label>
+            <label for="ve-anchor-force"><input id="ve-anchor-force" type="checkbox"> Accept a datacenter no registered node reports</label>
         </div>
         <div class="modal-row">
-            <label>required_tier</label>
+            <label for="ve-anchor-tier">Required tier</label>
             <select id="ve-anchor-tier" class="form-input">
                 <option value="">(unchanged)</option>
                 <option value="hot">hot</option>
@@ -679,197 +773,206 @@
                 <option value="tape">tape</option>
             </select>
         </div>
-        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Spill policy</div>
+        </fieldset>
+        <fieldset>
+            <legend>Spill policy</legend>
         <div class="modal-row">
-            <label>allow spill</label>
+            <label for="ve-spill-allow">Allow spill</label>
             <select id="ve-spill-allow" class="form-input">
                 <option value="">(not set / unchanged)</option>
-                <option value="true">yes — spill allowed</option>
-                <option value="false">no — fail the write instead</option>
+                <option value="true">Yes: spill allowed</option>
+                <option value="false">No: fail the write instead</option>
             </select>
         </div>
         <div class="modal-row">
-            <label>forbid tiers</label>
-            <label style="font-weight:normal;display:flex;gap:.6rem;flex-wrap:wrap">
-                <span><input id="ve-spill-forbid-hot"  type="checkbox"> hot</span>
-                <span><input id="ve-spill-forbid-warm" type="checkbox"> warm</span>
-                <span><input id="ve-spill-forbid-cold" type="checkbox"> cold</span>
-                <span><input id="ve-spill-forbid-tape" type="checkbox"> tape</span>
-            </label>
+            <span id="ve-forbid-tiers-lbl" style="font-size:.78rem;color:var(--text-muted)">Forbid tiers</span>
+            <div role="group" aria-labelledby="ve-forbid-tiers-lbl" style="display:flex;gap:.6rem;flex-wrap:wrap">
+                <label for="ve-spill-forbid-hot"><input id="ve-spill-forbid-hot"  type="checkbox"> hot</label>
+                <label for="ve-spill-forbid-warm"><input id="ve-spill-forbid-warm" type="checkbox"> warm</label>
+                <label for="ve-spill-forbid-cold"><input id="ve-spill-forbid-cold" type="checkbox"> cold</label>
+                <label for="ve-spill-forbid-tape"><input id="ve-spill-forbid-tape" type="checkbox"> tape</label>
+            </div>
         </div>
         <div class="modal-row">
-            <label>forbid datacenters</label>
-            <input id="ve-spill-forbid-dcs" class="form-input" type="text" placeholder="comma-separated, e.g. dc-b, dc-c">
+            <label for="ve-spill-forbid-dcs">Forbid datacenters</label>
+            <input id="ve-spill-forbid-dcs" class="form-input" type="text" placeholder="comma-separated, e.g. toro, nrb">
         </div>
-        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Cache replicas</div>
+        </fieldset>
+        <fieldset>
+            <legend>Cache replicas (warm)</legend>
         <div class="modal-row">
-            <label>warm.min</label>
+            <label for="ve-warm-min">Warm cache minimum</label>
             <input id="ve-warm-min" class="form-input" type="number" min="0" max="9" step="1">
         </div>
         <div class="modal-row">
-            <label>warm.max</label>
+            <label for="ve-warm-max">Warm cache maximum</label>
             <input id="ve-warm-max" class="form-input" type="number" min="0" max="9" step="1">
         </div>
         <div class="modal-row">
-            <label>hot.min (advanced)</label>
-            <input id="ve-hot-min" class="form-input" type="number" min="0" max="9" step="1">
+            <label for="ve-per-dc"><input id="ve-per-dc" type="checkbox"> Apply caps per datacenter</label>
         </div>
         <div class="modal-row">
-            <label>hot.max (advanced)</label>
-            <input id="ve-hot-max" class="form-input" type="number" min="0" max="9" step="1">
-        </div>
-        <div class="modal-row">
-            <label>cold.min (advanced)</label>
-            <input id="ve-cold-min" class="form-input" type="number" min="0" max="9" step="1">
-        </div>
-        <div class="modal-row">
-            <label>cold.max (advanced)</label>
-            <input id="ve-cold-max" class="form-input" type="number" min="0" max="9" step="1">
-        </div>
-        <div class="modal-row">
-            <label>tape.min (advanced)</label>
-            <input id="ve-tape-min" class="form-input" type="number" min="0" max="9" step="1">
-        </div>
-        <div class="modal-row">
-            <label>tape.max (advanced)</label>
-            <input id="ve-tape-max" class="form-input" type="number" min="0" max="9" step="1">
-        </div>
-        <div class="modal-row">
-            <label>per_dc</label>
-            <label style="font-weight:normal">
-                <input id="ve-per-dc" type="checkbox"> apply caps per datacenter
-            </label>
-        </div>
-        <div class="modal-row">
-            <label>promote_reads</label>
+            <label for="ve-promote-reads">Promote after N reads</label>
             <input id="ve-promote-reads" class="form-input" type="number" min="1" step="1">
         </div>
         <div class="modal-row">
-            <label>promote_window_secs</label>
+            <label for="ve-promote-window">Promote read window (seconds)</label>
             <input id="ve-promote-window" class="form-input" type="number" min="1" step="1">
         </div>
         <div class="modal-row">
-            <label>cooldown_secs</label>
+            <label for="ve-cooldown">Cooldown (seconds)</label>
             <input id="ve-cooldown" class="form-input" type="number" min="0" step="1">
         </div>
-        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Write safety</div>
+        <details>
+            <summary>Other cache tiers (hot, cold, tape; rarely changed)</summary>
         <div class="modal-row">
-            <label>min_replicas_before_ack</label>
+            <label for="ve-hot-min">Hot cache minimum</label>
+            <input id="ve-hot-min" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label for="ve-hot-max">Hot cache maximum</label>
+            <input id="ve-hot-max" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label for="ve-cold-min">Cold cache minimum</label>
+            <input id="ve-cold-min" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label for="ve-cold-max">Cold cache maximum</label>
+            <input id="ve-cold-max" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label for="ve-tape-min">Tape cache minimum</label>
+            <input id="ve-tape-min" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        <div class="modal-row">
+            <label for="ve-tape-max">Tape cache maximum</label>
+            <input id="ve-tape-max" class="form-input" type="number" min="0" max="9" step="1">
+        </div>
+        </details>
+        </fieldset>
+        <fieldset>
+            <legend>Write safety</legend>
+        <div class="modal-row">
+            <label for="ve-write-safety-min-replicas">Replicas required before a write is acknowledged</label>
             <input id="ve-write-safety-min-replicas" class="form-input" type="number" min="1" step="1">
         </div>
         <div class="modal-row">
-            <label>write_timeout_secs</label>
+            <label for="ve-write-safety-timeout">Write timeout (seconds)</label>
             <input id="ve-write-safety-timeout" class="form-input" type="number" min="1" step="1">
         </div>
-        <div style="font-weight:600;font-size:.8rem;margin:.6rem 0 .2rem">Legacy policy migration</div>
-        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:.4rem">
+        </fieldset>
+        <details>
+            <summary>Legacy policy migration</summary>
+        <div class="modal-note">
             One-shot: clones the legacy <code>replication</code> field into
-            <code>mandatory_replicas</code>. Idempotent — safe to run again.
+            <code>mandatory_replicas</code>. Idempotent; safe to run again.
         </div>
         <div class="modal-row">
             <button class="btn-secondary" onclick="migrateVolumePolicy()" id="ve-migrate-btn">Migrate policy…</button>
         </div>
-        <div id="ve-migrate-result" class="modal-result" style="display:none"></div>
+        <div id="ve-migrate-result" class="modal-result" style="display:none" role="status" aria-live="polite"></div>
+        </details>
         <div class="modal-actions">
             <button class="btn-secondary" onclick="closeVolumeEdit()">Cancel</button>
-            <button class="btn-primary"  onclick="submitVolumeEdit()" id="ve-submit">Apply</button>
+            <button class="btn-primary"  onclick="submitVolumeEdit()" id="ve-submit" disabled>Apply</button>
         </div>
-        <div id="ve-result" class="modal-result" style="display:none"></div>
+        <div id="ve-result" class="modal-result" style="display:none" role="status" aria-live="polite"></div>
     </div>
 </div>
 
 <!-- Unquarantine confirmation dialog -->
 <div id="unquarantine-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeUnquarantineModal()">
-    <div class="modal-card" style="max-width:32rem">
-        <h3 style="color:var(--danger)">Unquarantine <span id="uq-hostname"></span></h3>
-        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:.8rem">
+    <div class="modal-card" style="max-width:32rem" role="dialog" aria-modal="true" aria-labelledby="uq-title" tabindex="-1">
+        <h3 id="uq-title" class="danger">Unquarantine <span id="uq-hostname"></span></h3>
+        <div class="modal-note">
             This re-admits the node to all serving paths (reads, replication source, allocate target).
             Do this only AFTER you have personally verified the chunk integrity or replaced the failing
             disk. Both fields below land in the audit log and are required.
         </div>
         <input type="hidden" id="uq-node-id">
-        <div style="background:#b91c1c14;border:1px solid #b91c1c;border-radius:.4rem;padding:.5rem;margin-bottom:.8rem;font-size:.8rem">
+        <div class="modal-danger-box">
             <div><b>Reason:</b> <span id="uq-reason"></span></div>
             <div><b>Triggering chunk:</b> <span id="uq-chunk" style="font-family:monospace;font-size:.7rem"></span></div>
             <div><b>Total faults:</b> <span id="uq-fault-count"></span></div>
             <div><b>Last summary:</b> <span id="uq-summary"></span></div>
         </div>
         <div class="modal-row">
-            <label>operator_id (your identity)</label>
+            <label for="uq-operator">Your name or ticket (operator_id)</label>
             <input id="uq-operator" class="form-input" oninput="onUnquarantineInput()" placeholder="alice / ticket-123 / on-call">
         </div>
         <div class="modal-row">
-            <label>reason_acknowledged (≥ 16 chars; what you verified)</label>
+            <label for="uq-ack">What you verified (at least 16 characters)</label>
             <input id="uq-ack" class="form-input" oninput="onUnquarantineInput()" placeholder="e.g. disk swapped + bitrot rescan clean">
         </div>
         <div class="modal-actions">
             <button class="btn-secondary" onclick="closeUnquarantineModal()">Cancel</button>
-            <button class="btn-primary" style="background:#b91c1c" onclick="submitUnquarantine()" id="uq-submit" disabled>Unquarantine</button>
+            <button class="btn-danger" onclick="submitUnquarantine()" id="uq-submit" disabled>Unquarantine</button>
         </div>
-        <div id="uq-result" class="modal-result" style="display:none"></div>
+        <div id="uq-result" class="modal-result" style="display:none" role="status" aria-live="polite"></div>
     </div>
 </div>
 
 <!-- UIP-2-5 — Decommission dialog (permanent node removal) -->
 <div id="decommission-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeDecommissionModal()">
-    <div class="modal-card" style="max-width:32rem">
-        <h3 style="color:var(--danger)">Decommission <span id="dc-hostname"></span></h3>
-        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:.8rem">
+    <div class="modal-card" style="max-width:32rem" role="dialog" aria-modal="true" aria-labelledby="dc-title" tabindex="-1">
+        <h3 id="dc-title" class="danger">Decommission <span id="dc-hostname"></span></h3>
+        <div class="modal-note">
             Permanently removes the node from the cluster registry. The manager refuses while the node
             still holds any chunk replica: drain it (maintenance + re-replication) first. Both fields
             below land in the audit log.
         </div>
         <input type="hidden" id="dc-node-id">
         <div class="modal-row">
-            <label>operator_id (your identity)</label>
+            <label for="dc-operator">Your name or ticket (operator_id)</label>
             <input id="dc-operator" class="form-input" oninput="onDecommissionInput()" placeholder="alice / ticket-123 / on-call">
         </div>
         <div class="modal-row">
-            <label>reason</label>
+            <label for="dc-reason">Reason</label>
             <input id="dc-reason" class="form-input" oninput="onDecommissionInput()" placeholder="e.g. host retired after disk swap-out">
         </div>
         <div class="modal-actions">
             <button class="btn-secondary" onclick="closeDecommissionModal()">Cancel</button>
-            <button class="btn-primary" style="background:#b91c1c" onclick="submitDecommission()" id="dc-submit" disabled>Decommission</button>
+            <button class="btn-danger" onclick="submitDecommission()" id="dc-submit" disabled>Decommission</button>
         </div>
-        <div id="dc-result" class="modal-result" style="display:none"></div>
+        <div id="dc-result" class="modal-result" style="display:none" role="status" aria-live="polite"></div>
     </div>
 </div>
 
 <!-- Remove dead node: dry-run plan first, then confirm -->
 <div id="removedead-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeRemoveDead()">
-    <div class="modal-card" style="max-width:36rem">
-        <h3 style="color:var(--danger)">Remove dead node <span id="rd-hostname"></span></h3>
-        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:.8rem">
+    <div class="modal-card" style="max-width:36rem" role="dialog" aria-modal="true" aria-labelledby="rd-title" tabindex="-1">
+        <h3 id="rd-title" class="danger">Remove dead node <span id="rd-hostname"></span></h3>
+        <div class="modal-note">
             For a node that is Down/Failed and will not come back. Preview first: the manager computes which
             replica rows can be dropped safely and which chunks have no other live copy (data loss).
             Leader only. operator_id and reason land in the audit log.
         </div>
         <input type="hidden" id="rd-node-id">
         <div class="modal-row">
-            <label>operator_id (your identity)</label>
+            <label for="rd-operator">Your name or ticket (operator_id)</label>
             <input id="rd-operator" class="form-input" oninput="onRemoveDeadInput()" placeholder="alice / ticket-123 / on-call">
         </div>
         <div class="modal-row">
-            <label>reason</label>
+            <label for="rd-reason">Reason</label>
             <input id="rd-reason" class="form-input" oninput="onRemoveDeadInput()" placeholder="e.g. host destroyed, disks lost">
         </div>
-        <div id="rd-plan" style="display:none;margin:.6rem 0;font-size:.82rem"></div>
+        <div id="rd-plan" style="display:none;margin:.6rem 0;font-size:.82rem" aria-live="polite"></div>
         <div id="rd-loss-row" class="modal-row" style="display:none">
-            <label><input type="checkbox" id="rd-accept-loss" onchange="onRemoveDeadInput()">
+            <label for="rd-accept-loss"><input type="checkbox" id="rd-accept-loss" onchange="onRemoveDeadInput()">
                 I accept permanent data loss for the chunks listed above (affected files move to /.dtfs-lost)</label>
         </div>
         <div class="modal-actions">
             <button class="btn-secondary" onclick="closeRemoveDead()">Cancel</button>
             <button class="btn-secondary" onclick="previewRemoveDead()" id="rd-preview" disabled>Preview plan</button>
-            <button class="btn-primary" style="background:#b91c1c" onclick="submitRemoveDead()" id="rd-submit" disabled>Remove node</button>
+            <button class="btn-danger" onclick="submitRemoveDead()" id="rd-submit" disabled>Remove node</button>
         </div>
-        <div id="rd-result" class="modal-result" style="display:none"></div>
+        <div id="rd-result" class="modal-result" style="display:none" role="status" aria-live="polite"></div>
     </div>
 </div>
 
 <div class="footer">
-    DTFS — Distributed Tiered Filesystem &nbsp;·&nbsp;
+    DTFS: Distributed Tiered Filesystem &nbsp;·&nbsp;
     <a href="/api/v1/cluster/status" style="color:var(--primary)">API</a> &nbsp;·&nbsp;
     <a href="__DTFS_REPO_URL__/tree/master/docs" style="color:var(--primary)" target="_blank">Docs</a>
 </div>
@@ -902,19 +1005,29 @@
             .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029'));
     }
 
+    // 1024 divisors, binary unit labels; undefined/negative/NaN show a dash.
     function fmtBytes(b) {
-        if (b === 0) return '0 B';
-        const u = ['B','KB','MB','GB','TB','PB'];
+        if (typeof b !== 'number' || !isFinite(b) || b < 0) return '—';
+        if (b < 1024) return Math.round(b) + ' B';
+        const u = ['B','KiB','MiB','GiB','TiB','PiB'];
         const i = Math.min(Math.floor(Math.log(b) / Math.log(1024)), u.length - 1);
-        return (b / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
+        return (b / Math.pow(1024, i)).toFixed(1) + ' ' + u[i];
     }
 
     function fmtBytesUnit(b) {
         // Returns { val, unit } for separate display
-        if (b === 0) return { val: '0', unit: 'B/s' };
-        const u = ['B/s','KB/s','MB/s','GB/s','TB/s'];
+        if (typeof b !== 'number' || !isFinite(b) || b < 0) return { val: '—', unit: '' };
+        if (b < 1024) return { val: String(Math.round(b)), unit: 'B/s' };
+        const u = ['B/s','KiB/s','MiB/s','GiB/s','TiB/s'];
         const i = Math.min(Math.floor(Math.log(b) / Math.log(1024)), u.length - 1);
         return { val: (b / Math.pow(1024, i)).toFixed(1), unit: u[i] };
+    }
+
+    // Whole percent that never reads 100 until used >= total.
+    function pctOf(used, total) {
+        if (!total || !(used > 0)) return 0;
+        const p = Math.round(used / total * 100);
+        return (used < total && p >= 100) ? 99 : Math.min(p, 100);
     }
 
     function barColor(pct) {
@@ -977,6 +1090,7 @@
         el.textContent = set ? 'Secret: session' : 'Secret: not set';
         el.classList.toggle('auth-set', set);
         el.classList.toggle('auth-missing', !set);
+        if (set) el.classList.remove('auth-needed');
         el.title = set
             ? 'X-Dtfs-Shared-Secret will be sent on mutating POSTs (sessionStorage). Click to change.'
             : 'Mutating POSTs get 401 if shared_secret is set. Click to store secret in sessionStorage.';
@@ -1044,6 +1158,8 @@
         // Prompt only after a 401: a cluster without shared_secret accepts
         // unauthenticated mutations. Retry once with the entered secret.
         if (r.resp.status === 401) {
+            const badge = document.getElementById('auth-badge');
+            if (badge && !getSharedSecret()) badge.classList.add('auth-needed');
             const before = getSharedSecret();
             const after = promptSharedSecret('The cluster requires its shared_secret for this change.');
             if (after && after !== before) r = await send();
@@ -1061,14 +1177,63 @@
         return (secs / 3600).toFixed(1) + 'h';
     }
 
+    // Relative text; a future timestamp (clock skew) clamps to "just now".
     function timeAgo(ms) {
-        const diff = Date.now() - ms;
-        const s = Math.floor(diff / 1000);
+        if (typeof ms !== 'number' || !isFinite(ms) || ms <= 0) return '—';
+        const s = Math.floor((Date.now() - ms) / 1000);
+        if (s < 5)    return 'just now';
         if (s < 60)   return s + 's ago';
         if (s < 3600) return Math.floor(s / 60) + 'm ago';
         if (s < 86400) return Math.floor(s / 3600) + 'h ago';
         return Math.floor(s / 86400) + 'd ago';
     }
+
+    // The one timestamp style: relative text, absolute UTC + local in the title.
+    function timeTag(ms) {
+        if (typeof ms !== 'number' || !isFinite(ms) || ms <= 0) return '—';
+        const d = new Date(ms);
+        const iso = d.toISOString();
+        const abs = iso.replace('T', ' ').replace(/\..*/, '') + ' UTC / ' + d.toLocaleString() + ' local';
+        return '<time datetime="' + iso + '" title="' + esc(abs) + '">' + esc(timeAgo(ms)) + '</time>';
+    }
+
+    // Brief success text auto-closes a dialog no faster than this.
+    const SUCCESS_CLOSE_MS = 2500;
+
+    // ── Modal focus management ───────────────────────────────────────────────
+    const modalReturnFocus = {};
+    function showModal(id) {
+        const m = document.getElementById(id);
+        if (!m) return;
+        modalReturnFocus[id] = document.activeElement;
+        m.classList.remove('hidden');
+        const card = m.querySelector('.modal-card');
+        const first = card && card.querySelector('input:not([type=hidden]):not([readonly]), select, textarea, button');
+        const target = first || card;
+        if (target) target.focus();
+    }
+    function hideModal(id) {
+        const m = document.getElementById(id);
+        if (!m || m.classList.contains('hidden')) return;
+        m.classList.add('hidden');
+        const back = modalReturnFocus[id];
+        delete modalReturnFocus[id];
+        if (back && back.isConnected && back.focus) back.focus();
+    }
+    // Escape closes the topmost open modal; Tab stays inside it.
+    document.addEventListener('keydown', e => {
+        const open = [...document.querySelectorAll('.modal-backdrop:not(.hidden)')].pop();
+        if (!open) return;
+        if (e.key === 'Escape') { e.preventDefault(); hideModal(open.id); return; }
+        if (e.key === 'Tab') {
+            const f = [...open.querySelectorAll('button:not(:disabled), input:not([type=hidden]):not(:disabled), select:not(:disabled), textarea:not(:disabled), summary')]
+                .filter(x => x.offsetParent !== null);
+            if (!f.length) return;
+            const a = document.activeElement;
+            if (e.shiftKey && (a === f[0] || !open.contains(a))) { e.preventDefault(); f[f.length - 1].focus(); }
+            else if (!e.shiftKey && (a === f[f.length - 1] || !open.contains(a))) { e.preventDefault(); f[0].focus(); }
+        }
+    });
 
     // Map any server health string to the banner/dot CSS classes
     // (.healthy/.degraded/.critical/.unknown). /stats emits exactly
@@ -1104,11 +1269,11 @@
         return 'Could not load ' + what + ' (' + ((e && e.message) || e) + '). Retrying.';
     }
     function loadErrRow(cols, what, e) {
-        return '<tr><td colspan="' + cols + '" class="placeholder load-error" style="color:var(--danger)">'
+        return '<tr><td colspan="' + cols + '" class="placeholder error load-error">'
             + esc(loadErrText(what, e)) + '</td></tr>';
     }
     function loadErrBlock(what, e) {
-        return '<div class="placeholder load-error" style="color:var(--danger)">' + esc(loadErrText(what, e)) + '</div>';
+        return '<div class="placeholder error load-error">' + esc(loadErrText(what, e)) + '</div>';
     }
 
     /** One message for any failed mutateFetch result; never raw JSON or "null". */
@@ -1155,7 +1320,39 @@
     // Global header/banner state. Updated by ONE poll (refreshGlobal) that
     // runs on every page, plus Home's own fetchStats.
     let lastStatsAt = 0;
-    function updateBanner(stats, err) {
+
+    // Is the anchor copy of every file safe? Reads only fields the API already
+    // serves: stats.anchor_pending, cluster/status.files_missing_chunks and the
+    // missing bucket of stats.chunk_placement.
+    function anchorRisk(stats, cluster) {
+        const pending = (stats && stats.anchor_pending) || 0;
+        const missingFiles = (cluster && typeof cluster.files_missing_chunks === 'number')
+            ? cluster.files_missing_chunks : 0;
+        const missingChunks = (stats && stats.chunk_placement && stats.chunk_placement.missing) || 0;
+        return { pending, missingFiles, missingChunks,
+                 atRisk: pending > 0 || missingFiles > 0 || missingChunks > 0 };
+    }
+
+    // Red count badges on the Data menu entries that own a problem.
+    function updateNav(stats, cluster, migrations) {
+        const set = (id, n) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.textContent = n > 0 ? String(n) : '';
+            el.title = n > 0 ? n + ' need attention' : '';
+        };
+        let integ = 0, mig = 0;
+        if (stats) integ = (stats.quarantined_nodes || 0)
+            + ((cluster && typeof cluster.files_missing_chunks === 'number') ? cluster.files_missing_chunks : 0);
+        if (migrations && migrations.tasks) mig = migrations.tasks.filter(t => (t.status || '').toLowerCase() === 'failed').length;
+        if (stats) set('nc-integrity', integ);
+        if (migrations) set('nc-migrations', mig);
+        const data = (stats ? integ : 0) + mig;
+        const g = document.getElementById('nc-data');
+        if (g && (stats || migrations)) { g.textContent = data > 0 ? String(data) : ''; g.title = data > 0 ? data + ' need attention in Data' : ''; }
+    }
+
+    function updateBanner(stats, err, cluster) {
         const rt = document.getElementById('refresh-time');
         if (stats) {
             lastStatsAt = Date.now();
@@ -1163,14 +1360,18 @@
             // count managers + data only (infra_*); clients are
             // consumers and must not drag the ratio. Fall back to the legacy
             // all-node fields if an older manager hasn't shipped infra_*.
-            const h = healthCssClass(stats.health);
+            const risk = anchorRisk(stats, cluster);
+            let h = healthCssClass(stats.health);
+            if (risk.atRisk && h === 'healthy') h = 'degraded';
             const healthy = stats.infra_healthy ?? stats.healthy_nodes;
             const total   = stats.infra_total   ?? stats.total_nodes;
-            const detail = (healthy === undefined || total === undefined) ? ''
+            const nodesTxt = (healthy === undefined || total === undefined) ? ''
                 : healthy + '/' + total + ' nodes healthy';
+            const detail = (nodesTxt ? nodesTxt + ' · ' : '') + (risk.atRisk ? 'anchor AT RISK' : 'anchor OK');
             const right = 'Config v' + (stats.config_version || 0) +
                           ' · ' + (stats.file_count || 0) + ' files';
-            setHealthBanner(h, String(stats.health || 'unknown').toUpperCase(), detail, right);
+            const promoted = risk.atRisk && healthCssClass(stats.health) === 'healthy';
+            setHealthBanner(h, promoted ? 'DEGRADED' : String(stats.health || 'unknown').toUpperCase(), detail, right);
         } else {
             if (rt) rt.textContent = lastStatsAt
                 ? 'Last good update ' + new Date(lastStatsAt).toLocaleTimeString()
@@ -1183,27 +1384,39 @@
     // One poll for banner + header + manager indicator, independent of the
     // page timer, so every page shows live health (not only Home).
     async function refreshGlobal() {
-        const [sr, hr] = await Promise.allSettled([
+        const [sr, hr, cr, mr] = await Promise.allSettled([
             getJSON('/api/v1/stats'),
             fetch('/api/v1/health', { signal: AbortSignal.timeout(10000) }).then(r => r.ok ? r.json() : null),
+            getJSON('/api/v1/cluster/status'),
+            getJSON('/api/v1/migrations'),
         ]);
         setManagerHealth(hr.status === 'fulfilled' ? hr.value : null);
-        if (sr.status === 'fulfilled') updateBanner(sr.value, null);
-        else updateBanner(null, sr.reason);
+        const cluster = cr.status === 'fulfilled' ? cr.value : null;
+        const migrations = mr.status === 'fulfilled' ? mr.value : null;
+        if (sr.status === 'fulfilled') {
+            updateBanner(sr.value, null, cluster);
+            updateNav(sr.value, cluster, migrations);
+        } else updateBanner(null, sr.reason);
     }
 
     async function fetchStats() {
         const settle = p => p.then(v => ({ v }), e => ({ e }));
-        const [sR, nR, mR, cR, hR] = await Promise.all([
+        const [sR, nR, mR, cR, hR, vR] = await Promise.all([
             settle(getJSON('/api/v1/stats')),
             settle(getJSON('/api/v1/nodes')),
             settle(getJSON('/api/v1/migrations')),
             settle(getJSON('/api/v1/cluster/status')),
             fetch('/api/v1/health', { signal: AbortSignal.timeout(10000) }).then(r => r.ok ? r.json() : null).catch(() => null),
+            settle(getJSON('/api/v1/volumes')),
         ]);
         const stats = sR.v, migrations = mR.v || null, cluster = cR.v || null;
+        // Anchor datacenters come from the volume policies (distinct, case-insensitive).
+        window._anchorDcs = vR.v ? [...new Set((vR.v.volumes || [])
+            .map(v => v.anchor && v.anchor.datacenter).filter(Boolean)
+            .map(s => String(s).trim()))] : null;
         setManagerHealth(hR);
-        updateBanner(stats || null, sR.e);
+        updateBanner(stats || null, sR.e, cluster);
+        if (stats) updateNav(stats, cluster, migrations);
 
         if (!stats) {
             // Keep the last rendered numbers on screen; they are marked stale
@@ -1227,26 +1440,28 @@
         const rawTotal = stats.raw_total_bytes || 0;
         const rawUsed  = stats.raw_used_bytes  || 0;
         const rawFree  = rawTotal - rawUsed;
-        const rawPct   = rawTotal ? Math.round(rawUsed / rawTotal * 100) : 0;
+        const rawPct   = pctOf(rawUsed, rawTotal);
         document.getElementById('raw-total').textContent = fmtBytes(rawTotal);
         document.getElementById('raw-used').textContent  = fmtBytes(rawUsed);
         document.getElementById('raw-free').textContent  = fmtBytes(rawFree);
         document.getElementById('raw-pct').textContent   = rawPct + '%';
         const rawBar = document.getElementById('raw-bar');
         rawBar.style.width = rawPct + '%';
+        rawBar.parentElement.setAttribute('aria-valuenow', rawPct);
         if (barColor(rawPct)) rawBar.style.background = barColor(rawPct);
 
         // ── Net capacity
         const netUsable = stats.net_usable_bytes || 0;
         const netUsed   = stats.net_used_bytes   || 0;
         const netFree   = netUsable - netUsed;
-        const netPct    = netUsable ? Math.round(netUsed / netUsable * 100) : 0;
+        const netPct    = pctOf(netUsed, netUsable);
         document.getElementById('net-usable').textContent = fmtBytes(netUsable);
         document.getElementById('net-used').textContent   = fmtBytes(netUsed);
         document.getElementById('net-free').textContent   = fmtBytes(netFree);
         document.getElementById('net-pct').textContent    = netPct + '%';
         const netBar = document.getElementById('net-bar');
         netBar.style.width = netPct + '%';
+        netBar.parentElement.setAttribute('aria-valuenow', netPct);
         if (barColor(netPct)) netBar.style.background = barColor(netPct);
 
         // ── logical claimed bytes vs phantom (metadata without on-disk data).
@@ -1304,25 +1519,32 @@
             return s && s !== 'done' && s !== 'failed';
         }).length;
         const cp = stats.chunk_placement || {};
-        const missingChunks = (cluster && typeof cluster.files_missing_chunks === 'number')
-            ? cluster.files_missing_chunks : null;
+        const risk = anchorRisk(stats, cluster);
+        const filesKnown = !!(cluster && typeof cluster.files_missing_chunks === 'number');
+        const anchorDcs = window._anchorDcs;
+        const anchorLbl = 'Anchor' + ((anchorDcs && anchorDcs.length) ? ' (' + anchorDcs.join(', ') + ')' : '');
+        const anchorHint = !risk.atRisk ? 'Every file has its anchor copy'
+            : [risk.pending > 0 ? risk.pending + ' files missing their anchor copy' : '',
+               risk.missingFiles > 0 ? risk.missingFiles + ' files missing chunks' : '',
+               risk.missingChunks > 0 ? risk.missingChunks + ' chunks missing' : ''].filter(Boolean).join('; ');
+        // Order: real data loss first, then soft signals.
         const chips = [
             {
-                id: 'sig-anchor',
-                val: stats.anchor_pending ?? 0,
-                lbl: 'Anchor pending',
-                hint: 'Files missing mandatory anchor copy',
-                sev: (stats.anchor_pending || 0) > 0 ? 'warn' : 'ok',
-                href: null, // no drill-down page exists for anchor-pending files
+                id: 'sig-anchor', hero: true,
+                val: risk.atRisk ? 'AT RISK' : 'Safe',
+                lbl: anchorLbl,
+                hint: anchorHint,
+                sev: risk.atRisk ? 'danger' : 'ok',
+                href: risk.atRisk && (risk.missingFiles > 0 || risk.missingChunks > 0) ? '/ui/integrity' : null,
             },
             {
+                // one data-loss chip: files with empty chunk bindings plus the missing placement bucket
                 id: 'sig-missing-files',
-                val: missingChunks === null ? '—' : missingChunks,
-                lbl: 'Files missing chunks',
-                hint: missingChunks === null
-                    ? 'cluster/status unavailable'
-                    : 'Realized data loss (chunk bindings empty)',
-                sev: (missingChunks || 0) > 0 ? 'danger' : (missingChunks === null ? 'ok' : 'ok'),
+                val: filesKnown ? cluster.files_missing_chunks : (cp.missing ?? 0),
+                lbl: 'Data loss: missing chunks',
+                hint: (filesKnown ? cluster.files_missing_chunks + ' files with missing chunks' : 'file count unavailable')
+                    + '; ' + (cp.missing ?? 0) + ' chunks in missing placement state',
+                sev: (risk.missingFiles + risk.missingChunks) > 0 ? 'danger' : 'ok',
                 href: '/ui/integrity',
             },
             {
@@ -1338,32 +1560,25 @@
                 val: err ? '—' : failedMig,
                 lbl: 'Migrations failed',
                 hint: err ? 'migrations unavailable' : (activeMig ? (activeMig + ' in flight') : 'Exhausted retries'),
-                sev: !err && failedMig > 0 ? 'danger' : 'ok',
+                sev: !err && failedMig > 0 ? 'danger' : (err ? 'warn' : 'ok'),
                 href: '/ui/migrations',
             },
             {
                 id: 'sig-undergoal',
                 val: cp.undergoal ?? 0,
-                lbl: 'Undergoal chunks',
-                hint: 'Below volume replica goal',
+                lbl: 'Under-replicated chunks',
+                hint: 'Below volume replica goal; repair is automatic',
                 sev: (cp.undergoal || 0) > 0 ? 'warn' : 'ok',
                 href: null, // repair is automatic; no page lists these chunks
             },
-            {
-                id: 'sig-missing-chunks',
-                val: cp.missing ?? 0,
-                lbl: 'Missing chunks',
-                hint: 'Placement state: missing',
-                sev: (cp.missing || 0) > 0 ? 'danger' : 'ok',
-                href: '/ui/integrity',
-            },
         ];
+        const GLYPH = { ok: ['OK', 'OK: '], warn: ['!', 'Warning: '], danger: ['X', 'Problem: '] };
         el.innerHTML = chips.map(c => `
-            <${c.href ? 'button type="button"' : 'div style="cursor:default"'} class="signal-chip ${c.sev}" id="${c.id}"
-                    title="${c.hint}"${c.href ? ` onclick="navigate('${c.href}')"` : ''}>
-                <div class="signal-val">${c.val}</div>
-                <div class="signal-lbl">${c.lbl}</div>
-                <div class="signal-hint">${c.hint}</div>
+            <${c.href ? 'button type="button"' : 'div style="cursor:default"'} class="signal-chip ${c.sev}${c.hero ? ' hero' : ''}" id="${c.id}"
+                    title="${esc(c.hint)}"${c.href ? ` onclick="navigate('${c.href}')"` : ''}>
+                <div class="signal-val"><span class="glyph" aria-hidden="true">${GLYPH[c.sev][0]}</span><span class="sr-only">${GLYPH[c.sev][1]}</span>${esc(c.val)}</div>
+                <div class="signal-lbl">${esc(c.lbl)}</div>
+                <div class="signal-hint">${esc(c.hint)}</div>
             </${c.href ? 'button' : 'div'}>`).join('');
     }
 
@@ -1376,13 +1591,13 @@
         const buckets = [
             ['stable','Stable','var(--success)'],
             ['misplaced','Misplaced','var(--warning)'],
-            ['undergoal','Undergoal','#e67e22'],
-            ['overgoal','Overgoal','var(--primary)'],
+            ['undergoal','Under-replicated','var(--orange)'],
+            ['overgoal','Over-replicated','var(--primary)'],
             ['missing','Missing','var(--danger)'],
             ['pending_deletion','Pending deletion','var(--text-muted)'],
         ];
         const total = buckets.reduce((a, [k]) => a + (cp[k] || 0), 0) || 1;
-        let bar = '<div style="display:flex;height:14px;border-radius:6px;overflow:hidden;margin-bottom:.6rem;background:var(--border)">';
+        let bar = '<div role="img" aria-label="Chunk placement distribution, see legend below" style="display:flex;height:14px;border-radius:6px;overflow:hidden;margin-bottom:.6rem;background:var(--border)">';
         let legend = '<div style="display:flex;flex-wrap:wrap;gap:.75rem;font-size:.78rem">';
         for (const [k, label, color] of buckets) {
             const n = cp[k] || 0;
@@ -1411,17 +1626,17 @@
         for (const t of sorted) {
             const total = t.total_bytes || 0;
             const used  = t.used_bytes  || 0;
-            const pct   = total ? Math.round(used / total * 100) : 0;
+            const pct   = pctOf(used, total);
             const color = barColor(pct) || 'var(--primary)';
             const badge = `<span class="badge badge-${esc(t.tier)}" style="text-transform:capitalize">${esc(t.tier)}</span>`;
             html += `<tr>
                 <td style="padding:.4rem">${badge}</td>
-                <td style="padding:.4rem">${t.disks||0}</td>
-                <td style="padding:.4rem">${fmtBytes(total)}</td>
-                <td style="padding:.4rem">${fmtBytes(used)}</td>
+                <td class="num" style="padding:.4rem">${t.disks||0}</td>
+                <td class="num" style="padding:.4rem">${fmtBytes(total)}</td>
+                <td class="num" style="padding:.4rem">${fmtBytes(used)}</td>
                 <td style="padding:.4rem">
                     <div style="display:flex;align-items:center;gap:.5rem">
-                        <div class="progress-bar" style="flex:1">
+                        <div class="progress-bar" style="flex:1" role="progressbar" aria-label="${esc(t.tier)} tier utilization" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}">
                             <div class="progress-fill" style="width:${pct}%;background:${color}"></div>
                         </div>
                         <span style="font-size:.75rem;color:var(--text-muted);min-width:3em;text-align:right">${pct}%</span>
@@ -1442,12 +1657,11 @@
     }
 
     function renderScrubCard(s) {
-        const when = new Date(s.completed_at_ms).toLocaleString();
-        const ago  = timeAgo(s.completed_at_ms);
+        const when = timeTag(s.completed_at_ms);
         const dur  = fmtDuration(s.duration_secs);
         const lvlBadge = s.level === 'deep'
-            ? '<span class="badge badge-healthy">Deep</span>'
-            : '<span class="badge badge-warm">Quick</span>';
+            ? '<span class="badge badge-data">Deep</span>'
+            : '<span class="badge badge-data">Quick</span>';
 
         return `
             <div class="scrub-result">
@@ -1455,7 +1669,7 @@
                 <div class="scrub-meta-item">${lvlBadge}</div>
                 <div class="scrub-meta-item"><span>Node:</span> ${esc(s.node_id)}</div>
                 <div class="scrub-meta-item"><span>Disk:</span> ${esc(s.disk_path)}</div>
-                <div class="scrub-meta-item"><span>Completed:</span> ${when} (${ago})</div>
+                <div class="scrub-meta-item"><span>Completed:</span> ${when}</div>
                 <div class="scrub-meta-item"><span>Duration:</span> ${dur}</div>
             </div>
             <div class="scrub-stats">
@@ -1467,11 +1681,11 @@
                     <div class="stat-val" style="color:var(--success)">${s.chunks_healthy.toLocaleString()}</div>
                     <div class="stat-lbl">Healthy</div>
                 </div>
-                <div class="scrub-stat corrupt">
+                <div class="scrub-stat${s.chunks_corrupt > 0 ? ' corrupt' : ''}">
                     <div class="stat-val">${s.chunks_corrupt.toLocaleString()}</div>
                     <div class="stat-lbl">Corrupt</div>
                 </div>
-                <div class="scrub-stat missing">
+                <div class="scrub-stat${s.chunks_missing > 0 ? ' missing' : ''}">
                     <div class="stat-val">${s.chunks_missing.toLocaleString()}</div>
                     <div class="stat-lbl">Missing</div>
                 </div>
@@ -1555,7 +1769,7 @@
             return;
         }
         if (!nodes || nodes.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="10" class="placeholder">No nodes registered yet.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="10" class="placeholder">No nodes registered.</td></tr>';
             document.getElementById('nodes-summary').textContent = '';
             return;
         }
@@ -1576,8 +1790,7 @@
             const rc = 'badge badge-' + role;
             const isManager = role === 'manager';
             const isClient  = role === 'client';
-            const usedPct = n.total_capacity
-                ? Math.round(n.used_capacity / n.total_capacity * 100) : 0;
+            const usedPct = pctOf(n.used_capacity, n.total_capacity);
             const barFill = usedPct > 90 ? 'var(--danger)'
                           : usedPct > 75 ? 'var(--warning)' : 'var(--primary)';
             // manager nodes have no disks of their own; the
@@ -1587,19 +1800,19 @@
             const usedBarCell = (isManager || isClient)
                 ? `<td style="text-align:center;color:var(--text-muted)">—</td>`
                 : `<td style="width:120px">
-                       <div style="height:6px;background:var(--border);border-radius:3px;width:100%">
+                       <div role="progressbar" aria-label="Utilization" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${usedPct}" style="height:6px;background:var(--border);border-radius:3px;width:100%">
                            <div style="height:100%;border-radius:3px;background:${barFill};width:${usedPct}%"></div>
                        </div>
                    </td>`;
             const usedValCell = (isManager || isClient)
-                ? `<td style="font-size:.78rem;white-space:nowrap;color:var(--text-muted)">—</td>`
-                : `<td style="font-size:.78rem;white-space:nowrap">${fmtBytes(n.used_capacity||0)} <span style="color:var(--text-muted)">(${usedPct}%)</span></td>`;
+                ? `<td class="num" style="font-size:.78rem;white-space:nowrap;color:var(--text-muted)">—</td>`
+                : `<td class="num" style="font-size:.78rem;white-space:nowrap">${fmtBytes(n.used_capacity||0)} <span style="color:var(--text-muted)">(${usedPct}%)</span></td>`;
             const capCell = (isManager || isClient)
-                ? `<td style="color:var(--text-muted)">—</td>`
-                : `<td>${fmtBytes(n.total_capacity||0)}</td>`;
+                ? `<td class="num" style="color:var(--text-muted)">—</td>`
+                : `<td class="num">${fmtBytes(n.total_capacity||0)}</td>`;
             const diskCell = (isManager || isClient)
-                ? `<td style="color:var(--text-muted)">—</td>`
-                : `<td>${n.disk_count||0}</td>`;
+                ? `<td class="num" style="color:var(--text-muted)">—</td>`
+                : `<td class="num">${n.disk_count||0}</td>`;
             // Show full node_id (no slice). Location + Version columns
             // get explicit min-widths (×4 + ×2 of the previous implicit
             // width) so the full location string and the version+build
@@ -1614,7 +1827,7 @@
                 ? '<span class="badge badge-unjoined" style="margin-right:.4rem" title="Manager is not a raft member (voter or learner)">UNJOINED</span>'
                 : '';
             return `<tr>
-                <td style="font-size:.75rem;color:var(--text-muted);font-family:monospace;white-space:nowrap">
+                <td style="font-size:.75rem;color:var(--text-muted);font-family:monospace;white-space:nowrap" title="${esc(n.node_id||'')}">
                     ${esc(n.node_id||'—')}</td>
                 <td><b>${esc(n.hostname||'—')}</b></td>
                 <td><span class="${esc(rc)}">${esc(role)}</span></td>
@@ -1638,10 +1851,10 @@
         '/ui/topology':   'cluster',
         '/ui/nodes':      'cluster',
         '/ui/raft':       'cluster',
-        '/ui/integrity':  'cluster',
-        '/ui/audit':      'cluster',
-        '/ui/config':     'cluster',
-        '/ui/settings':   'cluster',
+        '/ui/integrity':  'data',
+        '/ui/audit':      'system',
+        '/ui/config':     'system',
+        '/ui/settings':   'system',
         '/ui/volumes':    'data',
         '/ui/explorer':   'data',
         '/ui/migrations': 'data',
@@ -1671,21 +1884,20 @@
             <div class="page-header">
                 <h2>Integrity</h2>
                 <p class="page-desc">
-                    Data-integrity events across the cluster. Quarantined nodes,
-                    scrub faults, read-hash mismatches, orphan reaps. Click a row to jump
-                    to the node detail panel.
+                    Data-integrity events across the cluster: quarantined nodes,
+                    scrub faults, read-hash mismatches, orphan reaps.
                 </p>
             </div>
             <div id="integrity-summary" style="margin-bottom:.6rem;font-size:.85rem;color:var(--text-muted)">Loading…</div>
             <div class="table-card"><table>
                 <thead><tr>
-                    <th style="min-width:11rem">Time (UTC)</th>
+                    <th style="min-width:8rem">Time</th>
                     <th style="min-width:9rem">Action</th>
                     <th style="min-width:9rem">Actor</th>
                     <th style="min-width:9rem">Target</th>
                     <th>Result / Summary</th>
                 </tr></thead>
-                <tbody id="integrity-body"><tr><td colspan="5" class="placeholder">Fetching…</td></tr></tbody>
+                <tbody id="integrity-body"><tr><td colspan="5" class="placeholder">Loading…</td></tr></tbody>
             </table></div>`;
         const tick = async () => {
             let rows;
@@ -1707,13 +1919,14 @@
             }
             sum.textContent = rows.length + ' event(s); newest first';
             body.innerHTML = rows.map(r => {
-                const ts = new Date((r.timestamp||0)*1000).toISOString().replace('T',' ').replace(/\..*/, '');
+                const ts = timeTag((r.timestamp||0)*1000);
                 const action = r.action||'';
                 const isQuar = action.startsWith('node.quarantine');
                 const isUnq  = action.startsWith('node.unquarantine');
-                const rowStyle = isQuar ? 'background:#b91c1c14' : (isUnq ? 'background:#22c55e10' : '');
+                const rowStyle = isQuar ? 'background:color-mix(in srgb, var(--danger) 9%, transparent)'
+                    : (isUnq ? 'background:color-mix(in srgb, var(--success) 9%, transparent)' : '');
                 return `<tr style="${rowStyle}">
-                    <td style="font-family:monospace;font-size:.78rem">${ts}</td>
+                    <td style="font-size:.78rem;white-space:nowrap">${ts}</td>
                     <td><b>${esc(action)}</b></td>
                     <td style="font-size:.78rem;color:var(--text-muted)">${esc(r.actor||'—')}</td>
                     <td style="font-size:.78rem;font-family:monospace">${esc(r.target||'—')}</td>
@@ -1725,6 +1938,12 @@
         setPageTimer(tick, 5000, gen);
     }
 
+    function syncNavExpanded() {
+        document.querySelectorAll('.nav .nav-group').forEach(g => {
+            const b = g.querySelector(':scope > button');
+            if (b) b.setAttribute('aria-expanded', g.classList.contains('open') ? 'true' : 'false');
+        });
+    }
     function toggleNavGroup(ev, name) {
         ev.stopPropagation();
         document.querySelectorAll('.nav .nav-group').forEach(g => {
@@ -1734,10 +1953,22 @@
                 g.classList.remove('open');
             }
         });
+        syncNavExpanded();
     }
-    document.addEventListener('click', () => {
+    function closeNavGroups() {
         document.querySelectorAll('.nav .nav-group.open').forEach(g =>
             g.classList.remove('open'));
+        syncNavExpanded();
+    }
+    document.addEventListener('click', closeNavGroups);
+    // Escape closes an open menu and returns focus to its button.
+    document.addEventListener('keydown', e => {
+        if (e.key !== 'Escape') return;
+        const g = document.querySelector('.nav .nav-group.open');
+        if (!g) return;
+        closeNavGroups();
+        const b = g.querySelector(':scope > button');
+        if (b) b.focus();
     });
     window.toggleNavGroup = toggleNavGroup;
 
@@ -1765,6 +1996,7 @@
         document.querySelectorAll('.nav a').forEach(a => {
             const href = (a.getAttribute('href')||'').replace(/\/$/, '');
             a.classList.toggle('active', href === normPath);
+            if (href === normPath) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
         });
 
         // Cascade active highlight onto the parent nav-group button.
@@ -1774,6 +2006,7 @@
             // Close any open dropdowns when route changes.
             g.classList.remove('open');
         });
+        syncNavExpanded();
 
         routeGen++;
         // Clear existing auto-refresh
@@ -1798,41 +2031,23 @@
     function renderHome() {
         const gen = routeGen;
         document.getElementById('page-content').innerHTML = `
-        <div class="section-title">Production signals</div>
+        <h2 class="section-title">Production signals</h2>
         <div class="signal-strip" id="signal-strip">
-            <div class="placeholder">Loading signals…</div>
-        </div>
-        <div class="counts-row">
-            <div class="count-card">
-                <div class="count-icon managers">⬡</div>
-                <div class="count-body"><h4 id="cnt-managers">—</h4><p>Manager nodes</p></div>
-            </div>
-            <div class="count-card">
-                <div class="count-icon datanodes">◈</div>
-                <div class="count-body"><h4 id="cnt-datanodes">—</h4><p>Data nodes</p></div>
-            </div>
-            <div class="count-card">
-                <div class="count-icon disks">▨</div>
-                <div class="count-body"><h4 id="cnt-disks">—</h4><p>Disks registered</p></div>
-            </div>
-            <div class="count-card">
-                <div class="count-icon clients">⌗</div>
-                <div class="count-body"><h4 id="cnt-clients">—</h4><p>FUSE clients</p></div>
-            </div>
+            <div class="placeholder">Loading…</div>
         </div>
         <div class="metrics-row">
             <div class="metric-card">
-                <h3>Raw Capacity</h3>
+                <h3>Raw capacity</h3>
                 <div class="metric-row"><span class="metric-label">Total</span><span class="metric-value" id="raw-total">—</span></div>
                 <div class="metric-row"><span class="metric-label">Used</span><span class="metric-value" id="raw-used">—</span></div>
                 <div class="progress-wrap">
                     <div style="display:flex;justify-content:space-between;margin-bottom:.3rem">
-                        <span style="font-size:.75rem;color:var(--text-muted)">Utilisation</span>
+                        <span style="font-size:.75rem;color:var(--text-muted)">Utilization</span>
                         <span style="font-size:.75rem;color:var(--text-muted)" id="raw-pct">—</span>
                     </div>
-                    <div class="progress-bar"><div class="progress-fill primary" id="raw-bar" style="width:0%"></div></div>
+                    <div class="progress-bar" role="progressbar" aria-label="Raw capacity utilization" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-fill primary" id="raw-bar" style="width:0%"></div></div>
                 </div>
-                <div class="metric-row" style="margin-top:.25rem"><span class="metric-label">Free</span><span class="metric-value" id="raw-free" style="color:var(--success)">—</span></div>
+                <div class="metric-row" style="margin-top:.25rem"><span class="metric-label">Free</span><span class="metric-value" id="raw-free">—</span></div>
             </div>
             <!-- drop the "After replication factor (÷ hot RF)"
                  subheader (the math is per-tier now anyway, and the title
@@ -1840,23 +2055,23 @@
                  Raw Capacity so the rows line up at the same vertical
                  baseline across both cards. -->
             <div class="metric-card">
-                <h3>Net Usable Capacity</h3>
+                <h3>Net usable capacity</h3>
                 <div class="metric-row"><span class="metric-label">Total</span><span class="metric-value" id="net-usable">—</span></div>
                 <div class="metric-row"><span class="metric-label">Used</span><span class="metric-value" id="net-used">—</span></div>
                 <div class="progress-wrap">
                     <div style="display:flex;justify-content:space-between;margin-bottom:.3rem">
-                        <span style="font-size:.75rem;color:var(--text-muted)">Utilisation</span>
+                        <span style="font-size:.75rem;color:var(--text-muted)">Utilization</span>
                         <span style="font-size:.75rem;color:var(--text-muted)" id="net-pct">—</span>
                     </div>
-                    <div class="progress-bar"><div class="progress-fill success" id="net-bar" style="width:0%"></div></div>
+                    <div class="progress-bar" role="progressbar" aria-label="Net usable capacity utilization" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-fill primary" id="net-bar" style="width:0%"></div></div>
                 </div>
-                <div class="metric-row" style="margin-top:.25rem"><span class="metric-label">Free</span><span class="metric-value" id="net-free" style="color:var(--success)">—</span></div>
+                <div class="metric-row" style="margin-top:.25rem"><span class="metric-label">Free</span><span class="metric-value" id="net-free">—</span></div>
                 <!-- show logical bytes claimed by file metadata vs net actually on disk. -->
-                <div class="metric-row" style="margin-top:.6rem;border-top:1px solid var(--border-color);padding-top:.4rem"><span class="metric-label" title="Sum of file sizes in metadata (replicas deduped). Should match Net Used in a healthy cluster.">Logical</span><span class="metric-value" id="logical-bytes">—</span></div>
-                <div class="metric-row"><span class="metric-label" title="Logical − Net Used. Non-zero indicates file metadata referencing chunks that aren't on any disk (data-node wipe, ENOSPC unlink cascade, etc.). A scrub-driven GC would reclaim these.">Phantom</span><span class="metric-value" id="phantom-bytes" style="color:var(--text-muted)">—</span></div>
+                <div class="metric-row" style="margin-top:.6rem;border-top:1px solid var(--border);padding-top:.4rem"><span class="metric-label" title="Sum of file sizes in metadata (replicas deduped). Should match Net Used in a healthy cluster.">Logical</span><span class="metric-value" id="logical-bytes">—</span></div>
+                <div class="metric-row"><span class="metric-label" title="Logical minus Net Used. Non-zero means file metadata references chunks that are not on any disk (data-node wipe, ENOSPC unlink cascade, etc.).">Phantom (metadata without data on disk)</span><span class="metric-value" id="phantom-bytes" style="color:var(--text-muted)">—</span></div>
             </div>
             <div class="metric-card">
-                <h3>I/O Throughput</h3>
+                <h3>I/O throughput</h3>
                 <div class="io-row">
                     <div class="io-item">
                         <div class="io-dir">↓ Read</div>
@@ -1873,25 +2088,25 @@
             </div>
         </div>
         <div class="metric-card" style="margin-top:1rem">
-            <h3>Tier Distribution</h3>
+            <h3>Tier distribution</h3>
             <div style="font-size:.72rem;color:var(--text-muted);margin-bottom:.75rem">
                 Capacity and usage per storage tier across all data nodes
             </div>
-            <table style="width:100%;font-size:.85rem">
+            <div style="overflow-x:auto"><table style="width:100%;font-size:.85rem">
                 <thead>
                     <tr style="text-align:left;border-bottom:1px solid var(--border)">
                         <th style="padding:.4rem">Tier</th>
-                        <th style="padding:.4rem">Disks</th>
-                        <th style="padding:.4rem">Total</th>
-                        <th style="padding:.4rem">Used</th>
-                        <th style="padding:.4rem;width:40%">Utilisation</th>
+                        <th class="num" style="padding:.4rem">Disks</th>
+                        <th class="num" style="padding:.4rem">Total</th>
+                        <th class="num" style="padding:.4rem">Used</th>
+                        <th style="padding:.4rem;width:40%">Utilization</th>
                     </tr>
                 </thead>
                 <tbody id="tier-table"><tr><td colspan="5" class="placeholder">Loading…</td></tr></tbody>
-            </table>
+            </table></div>
         </div>
         <div class="metric-card" style="margin-top:1rem">
-            <h3>Chunk Placement</h3>
+            <h3>Chunk placement</h3>
             <div style="font-size:.72rem;color:var(--text-muted);margin-bottom:.75rem">
                 Every logical chunk classified by its replica placement vs the volume goal
             </div>
@@ -1899,8 +2114,9 @@
         </div>
         <div class="scrub-card">
             <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem">
-                <h3 style="margin:0">Last Scrub</h3>
+                <h3 style="margin:0">Last scrub</h3>
                 <div style="display:flex;align-items:center;gap:.4rem">
+                    <label for="scrub-all-level" class="sr-only">Scrub level</label>
                     <select id="scrub-all-level" class="form-input" style="width:auto">
                         <option value="quick">Quick</option>
                         <option value="deep">Deep</option>
@@ -1908,27 +2124,33 @@
                     <button class="btn-primary" onclick="runScrubAll()" id="scrub-all-btn">Scrub all</button>
                 </div>
             </div>
-            <div id="scrub-all-result" style="display:none;margin:.5rem 0;font-size:.8rem"></div>
+            <div id="scrub-all-result" style="display:none;margin:.5rem 0;font-size:.8rem" role="status" aria-live="polite"></div>
             <div id="scrub-content"><div class="scrub-placeholder">No scrub result recorded yet.</div></div>
         </div>
         <div class="table-card">
             <div class="table-card-header">
-                <h3>Data &amp; Manager Nodes</h3>
+                <h3>Data &amp; manager nodes</h3>
                 <span style="font-size:.75rem;color:var(--text-muted)" id="nodes-summary"></span>
             </div>
             <table><thead><tr>
                 <th style="min-width:14rem">ID</th>
                 <th>Hostname</th>
                 <th>Role</th>
-                <th style="min-width:16rem">Location</th>
+                <th style="min-width:12rem">Location</th>
                 <th style="min-width:10rem">Version</th>
-                <th>Disks</th>
-                <th>Capacity</th>
+                <th class="num">Disks</th>
+                <th class="num">Capacity</th>
                 <th style="width:120px">Utilization</th>
-                <th>Used</th>
+                <th class="num">Used</th>
                 <th>Health</th>
             </tr></thead>
-            <tbody id="nodes-table"><tr><td colspan="10" class="placeholder">Fetching node list…</td></tr></tbody></table>
+            <tbody id="nodes-table"><tr><td colspan="10" class="placeholder">Loading…</td></tr></tbody></table>
+        </div>
+        <div class="counts-row" aria-label="Cluster inventory">
+            <div class="count-card"><div class="count-body"><h4 id="cnt-managers">—</h4><p>Manager nodes</p></div></div>
+            <div class="count-card"><div class="count-body"><h4 id="cnt-datanodes">—</h4><p>Data nodes</p></div></div>
+            <div class="count-card"><div class="count-body"><h4 id="cnt-disks">—</h4><p>Disks registered</p></div></div>
+            <div class="count-card"><div class="count-body"><h4 id="cnt-clients">—</h4><p>FUSE clients</p></div></div>
         </div>`;
         fetchStats();
         setPageTimer(fetchStats, 8000, gen);
@@ -1961,6 +2183,13 @@
             if (t) t.innerHTML = loadErrBlock('topology', e);
             return;
         }
+        // Anchor DCs (volume policy); a failed lookup just omits the badge.
+        let anchorSet = new Set();
+        try {
+            const vols = await getJSON('/api/v1/volumes');
+            anchorSet = new Set((vols.volumes || []).map(v => v.anchor && v.anchor.datacenter)
+                .filter(Boolean).map(s => String(s).trim().toLowerCase()));
+        } catch (_) {}
         if (!document.getElementById('topo-tree')) return; // checked again after await
 
         // Group nodes: region → dc → rack → [nodes]
@@ -1975,7 +2204,7 @@
         }
 
         if (nodes.length === 0) {
-            topo.innerHTML = '<div class="placeholder">No nodes registered yet.</div>';
+            topo.innerHTML = '<div class="placeholder">No nodes registered.</div>';
             return;
         }
 
@@ -1988,7 +2217,7 @@
 
         let html = '';
         for (const [region, dcs] of sortedEntries(tree)) {
-            html += `<div class="topo-region"><div class="topo-region-label">🌐 Region: <b>${esc(region)}</b></div>`;
+            html += `<div class="topo-region"><div class="topo-region-label">Region: <b>${esc(region)}</b></div>`;
             for (const [dc, racks] of sortedEntries(dcs)) {
                 // wrap all racks of this DC in a horizontal flex
                 // container (.topo-racks); each .topo-rack inside is a
@@ -2000,9 +2229,10 @@
                 //
                 // Matches operator mental model: racks are physical
                 // siblings; hosts within a rack are stacked.
-                html += `<div class="topo-dc"><div class="topo-dc-label">🏢 Datacenter: <b>${esc(dc)}</b></div><div class="topo-racks">`;
+                const isAnchorDc = anchorSet.has(String(dc).trim().toLowerCase());
+                html += `<div class="topo-dc"><div class="topo-dc-label">Datacenter: <b>${esc(dc)}</b>${isAnchorDc ? ' <span class="badge badge-anchor" title="Every chunk keeps a copy in this datacenter">ANCHOR</span>' : ''}</div><div class="topo-racks">`;
                 for (const [rack, rnodes] of sortedEntries(racks)) {
-                    html += `<div class="topo-rack"><div class="topo-rack-label">🗄 Rack: <b>${esc(rack)}</b></div><div class="topo-nodes">`;
+                    html += `<div class="topo-rack"><div class="topo-rack-label">Rack: <b>${esc(rack)}</b></div><div class="topo-nodes">`;
                     // Sort hosts (nodes) inside the rack by hostname ASC.
                     const sortedNodes = [...rnodes].sort((a, b) =>
                         (a.hostname || '').localeCompare(b.hostname || '', undefined,
@@ -2017,6 +2247,7 @@
                             </div>
                             <div style="font-size:.75rem;color:var(--text-muted);margin-bottom:.3rem">
                                 <span class="badge badge-${esc(role)}">${esc(role)}</span>
+                                ${isAnchorDc && role === 'data' ? '<span class="badge badge-anchor" title="Data node in the anchor datacenter">ANCHOR</span>' : ''}
                                 &nbsp; ${n.disk_count||0} disk${n.disk_count!==1?'s':''}
                             </div>
                             <div style="font-size:.75rem;color:var(--text-muted)">
@@ -2078,12 +2309,12 @@
             const isManager = role === 'manager';
             const isClient  = role === 'client';
             const isStorageRole = !isManager && !isClient;
-            const pct = n.total_capacity ? Math.round(n.used_capacity/n.total_capacity*100) : 0;
+            const pct = pctOf(n.used_capacity, n.total_capacity);
             const barCol = pct>90?'var(--danger)':pct>75?'var(--warning)':'var(--primary)';
             const isMaintenance = h === 'maintenance';
 
             // manager + client nodes have no disks of their own;
-            // showing a "Used / Utilisation" row that always reads 0
+            // showing a "Used / Utilization" row that always reads 0
             // (or — / —) is misleading clutter. For those roles, drop the
             // size/util rows entirely. For data nodes keep the full
             // breakdown.
@@ -2106,7 +2337,7 @@
             // at 2% — the symptom that drove the earlier fix).
             const disks = Array.isArray(n.disks) ? n.disks : [];
             const diskTable = isStorageRole && disks.length > 0
-                ? `<div style="margin-top:.5rem">
+                ? `<div style="margin-top:.5rem;overflow-x:auto">
                        <div style="font-size:.75rem;color:var(--text-muted);margin-bottom:.3rem;text-transform:uppercase;letter-spacing:.04em">Disks (${disks.length})</div>
                        <table style="width:100%;font-size:.78rem;border-collapse:collapse">
                            <thead>
@@ -2114,26 +2345,26 @@
                                    <th style="padding:.25rem .4rem">ID</th>
                                    <th style="padding:.25rem .4rem">Tier</th>
                                    <th style="padding:.25rem .4rem">Mount</th>
-                                   <th style="padding:.25rem .4rem">Total</th>
-                                   <th style="padding:.25rem .4rem">Used</th>
-                                   <th style="padding:.25rem .4rem;width:140px">Utilisation</th>
+                                   <th class="num" style="padding:.25rem .4rem">Total</th>
+                                   <th class="num" style="padding:.25rem .4rem">Used</th>
+                                   <th style="padding:.25rem .4rem;width:140px">Utilization</th>
                                    <th style="padding:.25rem .4rem">Status</th>
                                </tr>
                            </thead>
                            <tbody>
                                ${disks.map(d => {
-                                   const dpct = d.total_bytes ? Math.round(d.used_bytes/d.total_bytes*100) : 0;
+                                   const dpct = pctOf(d.used_bytes, d.total_bytes);
                                    const dcol = dpct>90?'var(--danger)':dpct>75?'var(--warning)':'var(--primary)';
                                    const dstatus = (d.status||'healthy').toLowerCase();
                                    return `<tr>
                                        <td style="padding:.25rem .4rem;font-family:monospace">${esc(d.disk_id)}</td>
                                        <td style="padding:.25rem .4rem"><span class="badge badge-${esc((d.tier||'').toLowerCase())}">${esc(d.tier||'—')}</span></td>
                                        <td style="padding:.25rem .4rem;font-family:monospace;color:var(--text-muted);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(d.mount_path||'')}">${esc(d.mount_path||'—')}</td>
-                                       <td style="padding:.25rem .4rem">${fmtBytes(d.total_bytes||0)}</td>
-                                       <td style="padding:.25rem .4rem">${fmtBytes(d.used_bytes||0)}</td>
+                                       <td class="num" style="padding:.25rem .4rem">${fmtBytes(d.total_bytes)}</td>
+                                       <td class="num" style="padding:.25rem .4rem">${fmtBytes(d.used_bytes)}</td>
                                        <td style="padding:.25rem .4rem">
                                            <div style="display:flex;align-items:center;gap:.5rem">
-                                               <div style="flex:1;height:5px;background:var(--border);border-radius:3px;min-width:60px">
+                                               <div role="progressbar" aria-label="Disk utilization" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${dpct}" style="flex:1;height:5px;background:var(--border);border-radius:3px;min-width:60px">
                                                    <div style="height:100%;border-radius:3px;background:${dcol};width:${dpct}%"></div>
                                                </div>
                                                <span style="font-size:.72rem;color:var(--text-muted);min-width:2.5em;text-align:right">${dpct}%</span>
@@ -2163,9 +2394,7 @@
             const addrRow = isClient
                 ? `<div class="node-meta-item"><span>Client IP</span>${esc(n.client_ip || '—')}</div>`
                 : `<div class="node-meta-item"><span>gRPC</span>${esc(n.grpc_addr||'—')}</div>`;
-            const lastSeenRow = n.last_seen_ms
-                ? `<div class="node-meta-item"><span>Last seen</span>${timeAgo(n.last_seen_ms)}</div>`
-                : `<div class="node-meta-item"><span>Last seen</span>—</div>`;
+            const lastSeenRow = `<div class="node-meta-item"><span>Last seen</span>${timeTag(n.last_seen_ms)}</div>`;
             // show binary version + build date. Empty values
             // mean the node pre-dates that field or wasn't queried directly
             // (older clients, peer managers).
@@ -2181,18 +2410,18 @@
                 ? `<span class="badge badge-quarantined" title="Click to inspect">QUARANTINED</span>`
                 : '';
             const quarPanel = isQuarantined ? `
-                <div style="margin-top:.6rem;padding:.6rem;border:1px solid #b91c1c;border-radius:.4rem;background:#b91c1c14">
+                <div style="margin-top:.6rem;padding:.6rem;border:1px solid var(--danger-solid);border-radius:.4rem;background:color-mix(in srgb, var(--danger-solid) 8%, transparent)">
                     <div style="font-weight:700;color:var(--danger);margin-bottom:.3rem">
-                        Integrity fault — node excluded from all serving paths.
+                        Integrity fault: node excluded from all serving paths.
                     </div>
                     <div class="node-meta-item"><span>Reason</span><b>${esc(n.quarantine.reason)}</b></div>
                     ${n.quarantine.triggering_chunk_id ? `<div class="node-meta-item"><span>Triggering chunk</span><span style="font-family:monospace;font-size:.75rem">${esc(n.quarantine.triggering_chunk_id)}</span></div>` : ''}
-                    <div class="node-meta-item"><span>Since</span>${new Date(n.quarantine.since_ms).toISOString()}</div>
-                    <div class="node-meta-item"><span>Last fault</span>${new Date(n.quarantine.last_fault_at_ms).toISOString()}</div>
+                    <div class="node-meta-item"><span>Since</span>${timeTag(n.quarantine.since_ms)}</div>
+                    <div class="node-meta-item"><span>Last fault</span>${timeTag(n.quarantine.last_fault_at_ms)}</div>
                     <div class="node-meta-item"><span>Total faults</span>${n.quarantine.fault_count_total||0}</div>
                     <div class="node-meta-item"><span>Summary</span>${esc(n.quarantine.last_fault_summary||'—')}</div>
                     <div style="margin-top:.6rem;display:flex;gap:.4rem">
-                        <button class="btn-primary" style="background:#b91c1c"
+                        <button class="btn-danger"
                             onclick="openUnquarantineModal('${escArg(n.node_id)}','${escArg(n.hostname||'')}','${escArg(n.quarantine.reason)}','${escArg(n.quarantine.triggering_chunk_id||'')}','${escArg(n.quarantine.fault_count_total||0)}','${escArg(n.quarantine.last_fault_summary||'')}')">
                             Unquarantine…
                         </button>
@@ -2205,19 +2434,19 @@
                         ${leaderBadge}
                         ${unjoinedBadge}
                         <b style="font-size:1rem">${esc(n.hostname||'—')}</b>
-                        <span style="font-size:.78rem;color:var(--text-muted);margin-left:.5rem;font-family:monospace">
+                        <span style="font-size:.78rem;color:var(--text-muted);margin-left:.5rem;font-family:monospace" title="${esc(n.node_id||'')}">
                             id:${esc((n.node_id||'').slice(0,12))}…
                         </span>
                     </div>
-                    <div style="display:flex;gap:.5rem;align-items:center">
+                    <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
                         ${quarBadge}
                         ${isQuarantined ? '' : `<span class="badge badge-${esc(h)}">${esc(n.health||'unknown')}</span>`}
-                        ${isStorageRole && (h === 'down' || h === 'failed') ? `<button class="btn-maint" style="color:var(--danger)" title="Dead node: drop its replica rows (preview first)"
-                            onclick="openRemoveDead('${escArg(n.node_id)}','${escArg(n.hostname||'')}')">Remove dead…</button>` : ''}
-                        ${isStorageRole ? `<button class="btn-maint" onclick="toggleMaintenance('${escArg(n.node_id)}', ${!isMaintenance}, '${escArg(n.hostname||'')}')">
-                            ${isMaintenance ? 'Exit Maintenance' : 'Set Maintenance'}
+                        ${isStorageRole && (h === 'down' || h === 'failed') ? `<button class="btn-maint btn-danger" title="Dead node: drop its replica rows (preview first)"
+                            onclick="openRemoveDead('${escArg(n.node_id)}','${escArg(n.hostname||'')}')">Remove dead node…</button>` : ''}
+                        ${isStorageRole ? `<button class="btn-maint" title="${isMaintenance ? 'Return this node to service' : 'Stop serving and receiving chunks until you exit maintenance'}" onclick="toggleMaintenance('${escArg(n.node_id)}', ${!isMaintenance}, '${escArg(n.hostname||'')}')">
+                            ${isMaintenance ? 'Exit maintenance' : 'Enter maintenance'}
                         </button>` : ''}
-                        ${isStorageRole ? `<button class="btn-maint" style="color:var(--danger)" title="Remove this node from the cluster registry (refused while it holds replicas)"
+                        ${isStorageRole ? `<button class="btn-maint btn-danger" title="Remove this node from the cluster registry (refused while it holds replicas)"
                             onclick="openDecommissionModal('${escArg(n.node_id)}','${escArg(n.hostname||'')}')">Decommission…</button>` : ''}
                     </div>
                 </div>
@@ -2270,10 +2499,10 @@
         document.getElementById('uq-ack').value = '';
         document.getElementById('uq-result').style.display = 'none';
         document.getElementById('uq-submit').disabled = true;
-        document.getElementById('unquarantine-modal').classList.remove('hidden');
+        showModal('unquarantine-modal');
     }
     function closeUnquarantineModal() {
-        document.getElementById('unquarantine-modal').classList.add('hidden');
+        hideModal('unquarantine-modal');
     }
     function onUnquarantineInput() {
         const op  = document.getElementById('uq-operator').value.trim();
@@ -2298,7 +2527,7 @@
             setTimeout(async () => {
                 closeUnquarantineModal();
                 await refreshNodesList();
-            }, 800);
+            }, SUCCESS_CLOSE_MS);
         } else {
             result.style.color = 'var(--danger)';
             result.textContent = errMsg({ resp, text, json, authError });
@@ -2318,10 +2547,10 @@
         document.getElementById('dc-reason').value = '';
         document.getElementById('dc-result').style.display = 'none';
         document.getElementById('dc-submit').disabled = true;
-        document.getElementById('decommission-modal').classList.remove('hidden');
+        showModal('decommission-modal');
     }
     function closeDecommissionModal() {
-        document.getElementById('decommission-modal').classList.add('hidden');
+        hideModal('decommission-modal');
     }
     function onDecommissionInput() {
         const op     = document.getElementById('dc-operator').value.trim();
@@ -2348,7 +2577,7 @@
             setTimeout(async () => {
                 closeDecommissionModal();
                 await refreshNodesList();
-            }, 800);
+            }, SUCCESS_CLOSE_MS);
             return;
         }
         result.style.color = 'var(--danger)';
@@ -2372,10 +2601,10 @@
         document.getElementById('rd-plan').style.display = 'none';
         document.getElementById('rd-result').style.display = 'none';
         onRemoveDeadInput();
-        document.getElementById('removedead-modal').classList.remove('hidden');
+        showModal('removedead-modal');
     }
     function closeRemoveDead() {
-        document.getElementById('removedead-modal').classList.add('hidden');
+        hideModal('removedead-modal');
     }
     function onRemoveDeadInput() {
         const op = document.getElementById('rd-operator').value.trim();
@@ -2476,7 +2705,7 @@
         const anchor = v.anchor
             ? `dc=${esc(v.anchor.datacenter||'—')}, required_tier=${esc(v.anchor.required_tier||'(any)')}`
             : '(none)';
-        return `<div class="placeholder" style="text-align:left;padding:1rem;background:rgba(0,0,0,.04);border-radius:.5rem">
+        return `<div class="placeholder" style="text-align:left;padding:1rem;background:var(--surface2);border-radius:.5rem;font-style:normal">
             <div style="font-weight:bold;margin-bottom:.5rem">Policy for ${esc(v.volume_id)}</div>
             <div style="font-family:monospace;font-size:.78rem;line-height:1.6">
                 <div>Mandatory replicas: hot=${(v.mandatory_replicas||{}).hot||0}, warm=${(v.mandatory_replicas||{}).warm||0}, cold=${(v.mandatory_replicas||{}).cold||0}, tape=${(v.mandatory_replicas||{}).tape||0}</div>
@@ -2505,7 +2734,7 @@
         if (!el) return;
         const vols = window._volumesData;
         if (!vols.length) {
-            el.innerHTML = '<div class="placeholder">No volumes yet. Use "+ New volume" above to create one.</div>';
+            el.innerHTML = '<div class="placeholder">No volumes yet. Use "New volume" above to create one.</div>';
             return;
         }
         // Actions layout — each action gets its own column so the
@@ -2521,13 +2750,13 @@
         el.innerHTML = '<div class="table-card"><table>' +
             '<thead><tr>' +
                 '<th>Volume ID</th>' +
-                '<th>Files</th>' +
-                '<th>Total Size</th>' +
-                '<th>Avg File Size</th>' +
+                '<th class="num">Files</th>' +
+                '<th class="num">Total size</th>' +
+                '<th class="num">Average file size</th>' +
                 '<th>Cache</th>' +
-                '<th>Anchor</th>' +
+                '<th>Anchor datacenter</th>' +
                 '<th style="min-width:5.5rem">Details</th>' +
-                '<th style="min-width:7.5rem">Edit policy</th>' +
+                '<th style="min-width:7.5rem">Policy</th>' +
             '</tr></thead><tbody>' +
             vols.flatMap(v => {
                 const vid = v.volume_id||'—';
@@ -2539,13 +2768,13 @@
                 const isOpen = window._volumesExpanded.has(vid);
                 const rows = [`<tr>
                     <td><b style="font-family:monospace">${esc(vid)}</b></td>
-                    <td>${(v.file_count||0).toLocaleString()}</td>
-                    <td>${fmtBytes(v.total_size||0)}</td>
-                    <td>${v.file_count ? fmtBytes(Math.round((v.total_size||0)/v.file_count)) : '—'}</td>
+                    <td class="num">${(v.file_count||0).toLocaleString()}</td>
+                    <td class="num">${fmtBytes(v.total_size||0)}</td>
+                    <td class="num">${v.file_count ? fmtBytes(Math.round((v.total_size||0)/v.file_count)) : '—'}</td>
                     <td>${cacheLabel}</td>
                     <td>${anchorLabel}</td>
                     <td ${ACT_TD}><button class="${ACT_BTN}" style="${ACT_STYLE}"
-                        onclick="toggleVolumeRow('${safeVid}')">${isOpen?'Hide':'Details'}</button></td>
+                        aria-expanded="${isOpen}" onclick="toggleVolumeRow('${safeVid}')">${isOpen?'Hide':'Details'}</button></td>
                     <td ${ACT_TD}><button class="${ACT_BTN}" style="${ACT_STYLE}"
                         onclick="openVolumeEdit('${safeVid}')">Edit policy…</button></td>
                 </tr>`];
@@ -2561,7 +2790,7 @@
         document.getElementById('page-content').innerHTML =
             '<div class="page-header"><h2>Volumes</h2><p class="page-desc">Storage volumes, file distribution, and cache policy</p></div>' +
             '<div style="display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap">' +
-                '<button class="btn-secondary" onclick="openCreateVolume()">+ New volume</button>' +
+                '<button class="btn-secondary" onclick="openCreateVolume()">New volume…</button>' +
             '</div>' +
             '<div id="volumes-list"><div class="placeholder">Loading…</div></div>';
         let data;
@@ -2585,16 +2814,25 @@
         document.getElementById('cv-anchor-datacenter').value = '';
         document.getElementById('cv-force').checked = false;
         document.getElementById('cv-result').style.display = 'none';
-        document.getElementById('create-volume-modal').classList.remove('hidden');
+        document.getElementById('cv-name-err').textContent = '';
+        showModal('create-volume-modal');
     }
 
     function closeCreateVolume() {
-        document.getElementById('create-volume-modal').classList.add('hidden');
+        hideModal('create-volume-modal');
     }
 
     async function submitCreateVolume() {
-        const name = document.getElementById('cv-name').value.trim();
-        if (!name) { alert('name is required'); return; }
+        const nameEl = document.getElementById('cv-name');
+        const name = nameEl.value.trim();
+        const nameErr = document.getElementById('cv-name-err');
+        nameErr.textContent = '';
+        if (!name) { nameErr.textContent = 'A volume name is required.'; nameEl.focus(); return; }
+        if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+            nameErr.textContent = 'Use letters, digits, dot, underscore and dash only.';
+            nameEl.focus();
+            return;
+        }
 
         const intOrNull = (id) => {
             const raw = document.getElementById(id).value.trim();
@@ -2628,7 +2866,7 @@
                 setTimeout(async () => {
                     closeCreateVolume();
                     await renderVolumes();
-                }, 800);
+                }, SUCCESS_CLOSE_MS);
             } else {
                 result.style.color = 'var(--danger)';
                 result.textContent = errMsg({ resp, text, json, authError });
@@ -2703,16 +2941,34 @@
             wsTimeoutEl.dataset.orig = wsTimeoutEl.value;
         }
         document.getElementById('ve-result').style.display = 'none';
-        document.getElementById('volume-edit-modal').classList.remove('hidden');
+        const btn = document.getElementById('ve-submit');
+        btn.textContent = 'Apply';
+        showModal('volume-edit-modal');
+        window._veSnap = veSnapshot();
+        btn.disabled = true;
     }
 
+    // Whole-form signature; Apply stays disabled until it differs from the open state.
+    function veSnapshot() {
+        return JSON.stringify([...document.querySelectorAll('#volume-edit-modal input, #volume-edit-modal select')]
+            .map(e => [e.id, e.type === 'checkbox' ? e.checked : e.value]));
+    }
+    function onVolumeEditInput() {
+        document.getElementById('ve-submit').disabled = veSnapshot() === window._veSnap;
+    }
+    window.onVolumeEditInput = onVolumeEditInput;
+
     function closeVolumeEdit() {
-        document.getElementById('volume-edit-modal').classList.add('hidden');
+        hideModal('volume-edit-modal');
     }
 
     async function submitVolumeEdit() {
         const vid = document.getElementById('ve-volume-id').value.trim();
-        if (!vid) { alert('volume id is required'); return; }
+        const veFail = (msg) => {
+            const r = document.getElementById('ve-result');
+            r.style.display = 'block'; r.className = 'modal-result error'; r.textContent = msg;
+        };
+        if (!vid) { veFail('A volume id is required.'); return; }
 
         const intOrNull = (id) => {
             const raw = document.getElementById(id).value.trim();
@@ -2735,7 +2991,7 @@
         // Client-side guard: warm.max >= warm.min when both provided.
         if (cacheBody.warm_min != null && cacheBody.warm_max != null
             && cacheBody.warm_max < cacheBody.warm_min) {
-            alert('warm.max must be >= warm.min');
+            veFail('Warm cache maximum must be at least the minimum.');
             return;
         }
         // mandatory replicas (per tier).
@@ -2781,10 +3037,22 @@
             writeSafetyBody.write_timeout_secs = intOrNull('ve-write-safety-timeout');
         }
 
+        // Changing the anchor or the ack floor affects durability: show a diff and ask.
+        const diff = [];
+        if (anchorBody.datacenter !== undefined) {
+            const was = document.getElementById('ve-anchor-dc').dataset.orig || '(none)';
+            diff.push('Anchor datacenter: ' + was + ' -> ' + (anchorBody.datacenter || '(cleared)'));
+        }
+        if (writeSafetyBody.min_replicas_before_ack !== undefined) {
+            diff.push('Replicas before write ack: ' + (wsMinEl.dataset.orig || '(unset)') + ' -> ' + writeSafetyBody.min_replicas_before_ack);
+        }
+        if (diff.length && !window.confirm('Apply these durability changes to volume ' + vid + '?\n\n' + diff.join('\n'))) return;
+
         const btn = document.getElementById('ve-submit');
         btn.disabled = true; btn.textContent = 'Applying…';
         const result = document.getElementById('ve-result');
         result.style.display = 'block';
+        result.className = 'modal-result';
         result.textContent = 'Submitting…';
 
         // POST one section; return a human-readable line. Each endpoint
@@ -2823,15 +3091,18 @@
         }
         lines.push(await post('set-cache', cacheBody));
 
+        result.className = 'modal-result';
         result.textContent = lines.join('\n');
         await renderVolumes();
-        btn.disabled = false; btn.textContent = 'Apply';
+        btn.textContent = 'Apply';
+        window._veSnap = veSnapshot();   // clean until the next edit
+        onVolumeEditInput();
     }
 
     // UIP-1-3 — legacy→mandatory policy migration, one-shot (no request body).
     async function migrateVolumePolicy() {
         const vid = document.getElementById('ve-volume-id').value.trim();
-        if (!vid) { alert('volume id is required'); return; }
+        if (!vid) return;
 
         const btn = document.getElementById('ve-migrate-btn');
         const result = document.getElementById('ve-migrate-result');
@@ -2892,11 +3163,12 @@
     async function renderExplorer() {
         document.getElementById('page-content').innerHTML =
             `<div class="page-header">
-                <h2>Data Explorer</h2>
-                <p class="page-desc">Browse files and folders cluster-wide. Right-click a row for actions.</p>
+                <h2>Explorer</h2>
+                <p class="page-desc">Browse files and folders cluster-wide. Right-click a row, or focus it and press Enter or Shift+F10, for actions.</p>
             </div>
             <div style="display:flex;gap:.75rem;margin-bottom:.5rem;flex-wrap:wrap;align-items:center">
-                <div id="explorer-breadcrumb" style="flex:1;min-width:200px;font-family:monospace;font-size:.85rem;color:var(--text-muted)">/</div>
+                <nav aria-label="Folder path" id="explorer-breadcrumb" style="flex:1;min-width:200px;font-family:monospace;font-size:.85rem;color:var(--text-muted)">/</nav>
+                <label for="explorer-filter" class="sr-only">Filter by name</label>
                 <input id="explorer-filter" type="text" class="form-input" placeholder="Filter by name…" style="max-width:240px">
                 <button class="btn-primary"   onclick="loadExplorer()">Refresh</button>
                 <button class="btn-secondary" onclick="openMigrate(window.explorerCwd || '/')" title="Migrate the current folder">Migrate folder…</button>
@@ -2999,38 +3271,42 @@
             return;
         }
 
-        const folderRows = folderList.map(d => `<tr class="explorer-row" oncontextmenu="event.preventDefault();showCtxMenu(event,'${escArg(d.path)}',true)">
-            <td style="font-size:1rem;width:1.5rem">📁</td>
+        const folderRows = folderList.map(d => `<tr class="explorer-row" tabindex="0" aria-label="Folder ${esc(d.name)}, press Enter to open, Shift+F10 for actions"
+                oncontextmenu="event.preventDefault();showCtxMenu(event,'${escArg(d.path)}',true)"
+                onkeydown="explorerRowKey(event,'${escArg(d.path)}',true)">
+            <td style="width:3rem;font-size:.7rem;color:var(--text-muted)">Folder</td>
             <td>
-                <a href="#" onclick="event.preventDefault();explorerNavigate('${escArg(d.path)}')" style="color:var(--primary);text-decoration:none;font-family:monospace">${esc(d.name)}/</a>
+                <a href="#" tabindex="-1" onclick="event.preventDefault();explorerNavigate('${escArg(d.path)}')" style="color:var(--primary);text-decoration:none;font-family:monospace">${esc(d.name)}/</a>
             </td>
             <td style="font-size:.78rem;color:var(--text-muted)">${d.fileCount.toLocaleString()} file${d.fileCount!==1?'s':''}</td>
-            <td>${fmtBytes(d.totalSize)}</td>
+            <td class="num">${fmtBytes(d.totalSize)}</td>
             <td></td>
             <td style="white-space:nowrap">
-                <button class="btn-secondary" style="font-size:.72rem;padding:.2rem .5rem"
-                        onclick="openMigrate('${escArg(d.path)}')" title="Migrate this folder">⋯</button>
+                <button class="btn-secondary" style="font-size:.72rem;padding:.2rem .5rem" aria-label="Migrate folder ${esc(d.name)}"
+                        onclick="openMigrate('${escArg(d.path)}')" title="Migrate this folder">...</button>
             </td>
         </tr>`).join('');
 
         const fileRows = files.map(f => {
             const safePath = escArg(f.path || '');
-            return `<tr class="explorer-row" oncontextmenu="event.preventDefault();showCtxMenu(event,'${safePath}',false)">
-                <td style="font-size:1rem;width:1.5rem">📄</td>
+            return `<tr class="explorer-row" tabindex="0" aria-label="File ${esc(f.name)}, press Enter or Shift+F10 for actions"
+                    oncontextmenu="event.preventDefault();showCtxMenu(event,'${safePath}',false)"
+                    onkeydown="explorerRowKey(event,'${safePath}',false)">
+                <td style="width:3rem;font-size:.7rem;color:var(--text-muted)">File</td>
                 <td style="font-family:monospace;font-size:.85rem;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.path||'')}">${esc(f.name)}</td>
                 <td style="font-size:.78rem;color:var(--text-muted)">${f.chunk_count||0} chunk${(f.chunk_count||0)!==1?'s':''}</td>
-                <td>${fmtBytes(f.total_size||0)}</td>
-                <td style="font-size:.78rem;color:var(--text-muted)">${f.created_at ? timeAgo(f.created_at) : '—'}</td>
+                <td class="num">${fmtBytes(f.total_size||0)}</td>
+                <td style="font-size:.78rem;color:var(--text-muted)">${timeTag(f.created_at)}</td>
                 <td style="white-space:nowrap">
-                    <button class="btn-secondary" style="font-size:.72rem;padding:.2rem .5rem"
-                            onclick="openMigrate('${safePath}')" title="Migrate just this file">⋯</button>
+                    <button class="btn-secondary" style="font-size:.72rem;padding:.2rem .5rem" aria-label="Migrate file ${esc(f.name)}"
+                            onclick="openMigrate('${safePath}')" title="Migrate just this file">...</button>
                 </td>
             </tr>`;
         }).join('');
 
         const savedScroll = window.scrollY;
         el.innerHTML = '<div class="table-card"><table>' +
-            '<thead><tr><th></th><th>Name</th><th>Contents</th><th>Size</th><th>Created</th><th></th></tr></thead><tbody>' +
+            '<thead><tr><th><span class="sr-only">Type</span></th><th>Name</th><th>Contents</th><th class="num">Size</th><th>Created</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>' +
             folderRows + fileRows +
             `</tbody></table>` +
             `<div style="padding:.75rem 1.25rem;font-size:.78rem;color:var(--text-muted);border-top:1px solid var(--border)">
@@ -3064,18 +3340,50 @@
                 { label: 'Flush cache (parent)…', onClick: `openFlushCache('${safeParent}')` },
                 { label: 'Copy path',             onClick: `navigator.clipboard&&navigator.clipboard.writeText('${safe}')` },
               ];
+        menu.setAttribute('role', 'menu');
         menu.innerHTML = items.map(it =>
-            `<div class="ctxmenu-item" onclick="${it.onClick};hideCtxMenu()">${it.label}</div>`
+            `<button type="button" role="menuitem" class="ctxmenu-item" onclick="${it.onClick};hideCtxMenu()">${it.label}</button>`
         ).join('');
         menu.style.display = 'block';
-        menu.style.left = evt.pageX + 'px';
-        menu.style.top  = evt.pageY + 'px';
+        // Keep the menu inside the viewport.
+        const mw = menu.offsetWidth, mh = menu.offsetHeight;
+        let x = evt.pageX, y = evt.pageY;
+        if (!x && !y) { const r = evt.target.getBoundingClientRect(); x = r.left + window.scrollX; y = r.bottom + window.scrollY; }
+        x = Math.max(window.scrollX + 4, Math.min(x, window.scrollX + document.documentElement.clientWidth - mw - 4));
+        y = Math.max(window.scrollY + 4, Math.min(y, window.scrollY + window.innerHeight - mh - 4));
+        menu.style.left = x + 'px';
+        menu.style.top  = y + 'px';
+        window._ctxReturnFocus = document.activeElement;
+        const first = menu.querySelector('button');
+        if (first) first.focus();
     }
 
     function hideCtxMenu() {
         const m = document.getElementById('explorer-ctxmenu');
-        if (m) m.style.display = 'none';
+        if (m && m.style.display !== 'none') {
+            m.style.display = 'none';
+            const back = window._ctxReturnFocus;
+            window._ctxReturnFocus = null;
+            if (back && back.isConnected && m.contains(document.activeElement)) back.focus();
+        }
     }
+
+    // Enter opens a folder or the actions menu; arrows move inside the menu.
+    function explorerRowKey(e, path, isFolder) {
+        if (e.target !== e.currentTarget) return;
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            if (isFolder) explorerNavigate(path); else showCtxMenu(e, path, false);
+        }
+    }
+    document.addEventListener('keydown', e => {
+        const m = document.getElementById('explorer-ctxmenu');
+        if (!m || m.style.display === 'none' || !m.contains(document.activeElement)) return;
+        const items = [...m.querySelectorAll('button')];
+        const i = items.indexOf(document.activeElement);
+        if (e.key === 'ArrowDown') { e.preventDefault(); items[(i + 1) % items.length].focus(); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
+    });
 
     // ── Migrate dialog (operator-driven path migration) ──────────────────────
 
@@ -3099,12 +3407,12 @@
         document.getElementById('m-empty-row').style.display = (prefix === '' || prefix === '/') ? 'block' : 'none';
         document.getElementById('m-allow-empty').checked = false;
         document.getElementById('m-submit').disabled = false;
-        document.getElementById('migrate-modal').classList.remove('hidden');
+        showModal('migrate-modal');
         document.getElementById('m-path').focus();
     }
 
     function closeMigrate() {
-        document.getElementById('migrate-modal').classList.add('hidden');
+        hideModal('migrate-modal');
     }
 
     async function submitMigrate() {
@@ -3172,12 +3480,12 @@
             (prefix === '' || prefix === '/') ? 'block' : 'none';
         document.getElementById('fc-allow-empty').checked = false;
         document.getElementById('fc-submit').disabled = false;
-        document.getElementById('flush-modal').classList.remove('hidden');
+        showModal('flush-modal');
         document.getElementById('fc-path').focus();
     }
 
     function closeFlushCache() {
-        document.getElementById('flush-modal').classList.add('hidden');
+        hideModal('flush-modal');
     }
 
     async function submitFlushCache() {
@@ -3218,7 +3526,7 @@
                 'Replicas dropped: '    + (data.replicas_dropped   ?? 0) + '\n' +
                 'Mandatory refusals: '  + (data.mandatory_refusals ?? 0) +
                 ((data.mandatory_refusals > 0)
-                    ? '  ⚠ check audit log: action=cache.flush_refused'
+                    ? '  WARNING: check audit log: action=cache.flush_refused'
                     : '') + '\n' +
                 'Unreachable nodes: '   + (data.unreachable_nodes  ?? 0) + '\n' +
                 'RPC failures: '        + (data.rpc_failures       ?? 0) + '\n' +
@@ -3241,11 +3549,11 @@
                 <p class="page-desc">Manual + automatic chunk migration tasks (refreshed every 5s)</p>
             </div>
             <div id="mig-summary" class="signal-strip" style="margin-bottom:.75rem">
-                <div class="placeholder">Counting…</div>
+                <div class="placeholder">Loading…</div>
             </div>
             <div style="display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap">
                 <button class="btn-primary"   onclick="loadMigrations()">Refresh</button>
-                <button class="btn-secondary" onclick="openMigrate('')">+ New migration</button>
+                <button class="btn-secondary" onclick="openMigrate('')">New migration…</button>
             </div>
             <div id="migrations-list"><div class="placeholder">Loading…</div></div>`;
         await loadMigrations();
@@ -3276,25 +3584,25 @@
             }
             const chip = (val, lbl, sev) =>
                 `<div class="signal-chip ${sev}" style="cursor:default">
-                    <div class="signal-val">${val}</div>
+                    <div class="signal-val">${sev === 'ok' ? '' : `<span class="glyph" aria-hidden="true">${sev === 'danger' ? 'X' : '!'}</span>`}${val}</div>
                     <div class="signal-lbl">${lbl}</div>
                 </div>`;
             sumEl.innerHTML =
                 chip(failed, 'Failed', failed > 0 ? 'danger' : 'ok') +
                 chip(active, 'In flight', active > 0 ? 'warn' : 'ok') +
-                chip(pending, 'Pending', 'ok') +
+                chip(pending, 'Pending', 'info') +
                 chip(done, 'Done', 'ok') +
-                chip(tasks.length, 'Total tracked', 'ok');
+                chip(tasks.length, 'Total tracked', 'info');
         }
         if (tasks.length === 0) {
-            setHtmlPreserveScroll(el, '<div class="placeholder">No migration tasks. Schedule one from Data Explorer or the “+ New migration” button.</div>');
+            setHtmlPreserveScroll(el, '<div class="placeholder">No migration tasks. Schedule one from Explorer or the "New migration" button.</div>');
             return;
         }
-        const statusColor = (s) => {
-            if (s === 'done')      return 'var(--success)';
-            if (s === 'failed')    return 'var(--danger)';
-            if (s === 'pending')   return 'var(--text-muted)';
-            return 'var(--warning)'; // copying/verifying/completing
+        const statusBadge = (s) => {
+            const label = s || '—';
+            const cls = s === 'done' ? 'badge-ok' : s === 'failed' ? 'badge-bad'
+                : s === 'pending' ? 'badge-pending' : 'badge-warn'; // copying/verifying/completing
+            return '<span class="badge ' + cls + '">' + esc(label) + '</span>';
         };
         // wrap the innerHTML write in setHtmlPreserveScroll so
         // the 5s auto-refresh doesn't yank the user back to the top of
@@ -3303,15 +3611,15 @@
         // during sustained migration storms.
         setHtmlPreserveScroll(el,
             '<div class="table-card"><table>' +
-            '<thead><tr><th>Task</th><th>Chunk</th><th>Src → Tgt</th><th>Tier</th><th>Status</th><th>Attempts</th><th>Updated</th><th>Last error</th></tr></thead><tbody>' +
+            '<thead><tr><th>Task</th><th>Chunk</th><th>Source to target</th><th>Tier</th><th>Status</th><th class="num">Attempts</th><th>Updated</th><th>Last error</th></tr></thead><tbody>' +
             tasks.map(t => `<tr>
                 <td style="font-family:monospace;font-size:.75rem">${esc(t.task_id||'—')}</td>
                 <td style="font-family:monospace;font-size:.75rem;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(t.chunk_id||'')}">${esc((t.chunk_id||'').slice(0,16))}…</td>
                 <td style="font-family:monospace;font-size:.78rem">${esc(t.source_node||'?')} → ${esc(t.target_node||'?')}</td>
                 <td><span class="badge badge-${esc((t.tier||'').toLowerCase())}">${esc(t.tier||'—')}</span></td>
-                <td style="color:${statusColor((t.status||'').toLowerCase())};font-weight:600">${esc(t.status||'—')}</td>
-                <td>${t.attempts ?? 0}</td>
-                <td style="font-size:.75rem;color:var(--text-muted)">${t.updated_at_ms ? timeAgo(t.updated_at_ms) : '—'}</td>
+                <td>${statusBadge((t.status||'').toLowerCase())}</td>
+                <td class="num">${t.attempts ?? 0}</td>
+                <td style="font-size:.75rem;color:var(--text-muted)">${timeTag(t.updated_at_ms)}</td>
                 <td style="font-size:.75rem;color:var(--text-muted);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(t.last_error||'')}">${esc(t.last_error||'—')}</td>
             </tr>`).join('') +
             `</tbody></table>` +
@@ -3328,11 +3636,13 @@
         const gen = routeGen;
         document.getElementById('page-content').innerHTML =
             `<div class="page-header">
-                <h2>Audit Log</h2>
+                <h2>Audit log</h2>
                 <p class="page-desc">All mutating operations recorded cluster-wide</p>
             </div>
-            <div style="display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap">
+            <div class="page-actions">
+                <label for="audit-action-filter" class="sr-only">Filter by action</label>
                 <input id="audit-action-filter" type="text" class="form-input" placeholder="Filter by action (e.g. tier, scrub)…" style="max-width:260px">
+                <label for="audit-limit" class="sr-only">Rows to show</label>
                 <select id="audit-limit" class="form-input" style="max-width:120px">
                     <option value="50">Last 50</option>
                     <option value="100">Last 100</option>
@@ -3371,18 +3681,20 @@
         el.innerHTML = '<div class="table-card"><table>' +
             '<thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Result</th></tr></thead><tbody>' +
             entries.map(e => {
-                const ok = (e.result||'').toLowerCase() === 'success' || (e.result||'').toLowerCase() === 'ok';
-                const resultColor = ok ? 'var(--success)' : e.result === 'pending' ? 'var(--warning)' : 'var(--text-muted)';
-                return `<tr>
+                const res = (e.result||'').toLowerCase();
+                const bad = /fail|denied|error|refused|reject/.test(res);
+                const ok = res === 'success' || res === 'ok';
+                const resultColor = bad ? 'var(--danger)' : ok ? 'var(--success)' : res === 'pending' ? 'var(--warning)' : 'var(--text-muted)';
+                return `<tr${bad ? ' style="background:color-mix(in srgb, var(--danger) 9%, transparent)"' : ''}>
                     <td style="font-size:.78rem;color:var(--text-muted);white-space:nowrap">
-                        ${/* AuditEntry.timestamp is SECONDS-since-epoch (chrono::Utc::now().timestamp() in audit.rs). JS new Date() expects MS. Without *1000 every entry rendered as 1970-01-2x. */ e.timestamp ? new Date(e.timestamp * 1000).toLocaleString() : '—'}
+                        ${/* AuditEntry.timestamp is SECONDS-since-epoch; timeTag wants ms. */ timeTag(e.timestamp * 1000)}
                     </td>
                     <td style="font-size:.8rem">${esc(e.actor||'—')}</td>
                     <td style="font-family:monospace;font-size:.78rem">${esc(e.action||'—')}</td>
                     <td style="font-size:.78rem;color:var(--text-muted);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(e.target||'')}">
                         ${esc(e.target||'—')}
                     </td>
-                    <td style="font-size:.78rem;color:${resultColor}">${esc(e.result||'—')}</td>
+                    <td style="font-size:.78rem;color:${resultColor};${bad ? 'font-weight:700' : ''}">${esc(e.result||'—')}</td>
                 </tr>`;
             }).join('') +
             '</tbody></table></div>';
@@ -3405,7 +3717,7 @@
             <div id="raft-state"><div class="placeholder">Loading…</div></div>
             <div id="raft-members"></div>
             <div class="table-card" style="padding:.8rem 1rem;margin-top:1rem" id="raft-membership-ops">
-                <h3 style="margin:0 0 .4rem 0">Membership changes</h3>
+                <h3 style="margin:0 0 .4rem 0;font-size:1rem">Membership changes</h3>
                 <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:.8rem">
                     Grow or shrink the manager quorum. Accepted only by the current leader; a follower
                     answers with the leader's address. Add a manager as a learner first, promote it once
@@ -3414,18 +3726,18 @@
                 </div>
                 <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end">
                     <div class="modal-row" style="margin:0;min-width:14rem">
-                        <label>Manager hostname ([node].hostname)</label>
+                        <label for="raft-op-hostname">Manager hostname ([node].hostname)</label>
                         <input id="raft-op-hostname" class="form-input" placeholder="mgr04">
                     </div>
                     <div class="modal-row" style="margin:0;min-width:14rem">
-                        <label>Raft addr host:port (add-learner only)</label>
+                        <label for="raft-op-addr">Raft address host:port (add learner only)</label>
                         <input id="raft-op-addr" class="form-input" placeholder="10.0.0.4:9401">
                     </div>
                     <button class="btn-primary"   id="raft-add-learner-btn" onclick="raftMembershipOp('add-learner')">Add learner</button>
                     <button class="btn-primary"   id="raft-promote-btn"     onclick="raftMembershipOp('promote')">Promote</button>
-                    <button class="btn-secondary" id="raft-remove-btn"      style="color:var(--danger)" onclick="raftMembershipOp('remove')">Remove</button>
+                    <button class="btn-danger"    id="raft-remove-btn"      onclick="raftMembershipOp('remove')">Remove</button>
                 </div>
-                <div id="raft-op-result" class="modal-result" style="display:none;margin-top:.6rem"></div>
+                <div id="raft-op-result" class="modal-result" style="display:none;margin-top:.6rem" role="status" aria-live="polite"></div>
             </div>`;
         await loadRaft();
         setPageTimer(loadRaft, 10000, gen);
@@ -3547,25 +3859,26 @@
     window._configTab = 'cluster';
     async function renderConfig() {
         document.getElementById('page-content').innerHTML = `
-            <div class="page-header"><h2>Config</h2>
-                <p class="page-desc">Cluster-wide keys must match across every manager. Node-specific
+            <div class="page-header"><h2>Config editor</h2>
+                <p class="page-desc">Edit individual keys of the manager configuration. Cluster-wide keys must match across every manager. Node-specific
                 keys (hostname, listen addrs, TLS material) live in the per-host tab. Edit a field
                 and click <b>Apply</b> to record it cluster-wide in Raft. Daemons do not read that record: only <i>write to disk</i>
-                rewrites this manager's TOML, effective after this manager restarts.</p>
+                rewrites this manager's TOML, effective after this manager restarts. To edit the stored record as one JSON document, use Cluster settings (System menu).</p>
             </div>
-            <div style="display:flex;gap:.5rem;margin-bottom:.5rem;flex-wrap:wrap;align-items:center">
-                <button id="cfg-tab-cluster" class="btn-secondary"
+            <div class="page-actions" style="margin-bottom:.5rem;align-items:center">
+                <button id="cfg-tab-cluster" class="btn-secondary" aria-pressed="false"
                         onclick="onConfigTab('cluster')">Cluster (—)</button>
-                <button id="cfg-tab-node" class="btn-secondary"
+                <button id="cfg-tab-node" class="btn-secondary" aria-pressed="false"
                         onclick="onConfigTab('node')">Node: <span id="cfg-tab-node-host">—</span> (—)</button>
+                <label for="cfg-filter" class="sr-only">Filter by name</label>
                 <input id="cfg-filter" type="text" class="form-input" placeholder="Filter by name…" style="max-width:260px"
                        oninput="onConfigFilter(this.value)">
                 <button class="btn-secondary" onclick="renderConfig()">Refresh</button>
                 <button class="btn-primary"   onclick="submitConfigDiff(false)">Apply (record only)</button>
-                <button class="btn-primary"   onclick="submitConfigDiff(true)">Apply + write this manager's TOML</button>
-                <span id="cfg-pending-count" style="font-size:.85rem;color:var(--text-muted)"></span>
+                <button class="btn-danger"    onclick="submitConfigDiff(true)">Apply and write this manager's TOML</button>
+                <span id="cfg-pending-count" style="font-size:.85rem;color:var(--text-muted)" aria-live="polite"></span>
             </div>
-            <div id="cfg-result" class="modal-result" style="display:none"></div>
+            <div id="cfg-result" class="modal-result" style="display:none" role="status" aria-live="polite"></div>
             <div id="cfg-list"><div class="placeholder">Loading…</div></div>`;
         let data;
         try { data = await getJSON('/api/v1/config/effective'); }
@@ -3584,15 +3897,15 @@
         document.getElementById('cfg-tab-cluster').textContent = 'Cluster (' + cn + ')';
         document.getElementById('cfg-tab-node').textContent =
             'Node: ' + window._configHost + ' (' + nn + ')';
-        rerenderConfigTable();
+        onConfigTab(window._configTab || 'cluster');
     }
 
     function onConfigTab(name) {
         window._configTab = name;
         const ct = document.getElementById('cfg-tab-cluster');
         const nt = document.getElementById('cfg-tab-node');
-        if (ct) ct.classList.toggle('btn-primary', name === 'cluster');
-        if (nt) nt.classList.toggle('btn-primary', name === 'node');
+        if (ct) { ct.classList.toggle('btn-primary', name === 'cluster'); ct.setAttribute('aria-pressed', name === 'cluster'); }
+        if (nt) { nt.classList.toggle('btn-primary', name === 'node'); nt.setAttribute('aria-pressed', name === 'node'); }
         rerenderConfigTable();
     }
     window.onConfigTab = onConfigTab;
@@ -3637,7 +3950,7 @@
                     <td>${esc(r.scope)}</td>
                     <td style="font-family:monospace;font-size:.78rem">${esc(cur||'(null)')}</td>
                     <td style="font-family:monospace;font-size:.78rem;color:var(--text-muted)">${esc(def)}</td>
-                    <td><input class="form-input" style="font-family:monospace;font-size:.78rem;width:14rem"
+                    <td><input class="form-input" aria-label="${esc('Edit ' + r.name)}" style="font-family:monospace;font-size:.78rem;width:14rem"
                                value="${esc(pending !== undefined ? String(pending) : cur)}"
                                oninput="onConfigEdit('${safeName}', this.value)"></td>
                 </tr>`;
@@ -3732,7 +4045,7 @@
 
     async function renderSettings() {
         document.getElementById('page-content').innerHTML =
-            '<div class="page-header"><h2>Settings</h2><p class="page-desc">Cluster-wide configuration record (stored in Raft; daemons do not read it, see Config page)</p></div>' +
+            '<div class="page-header"><h2>Cluster settings (raw JSON)</h2><p class="page-desc">Session secret and the cluster-wide configuration record as one JSON document (stored in Raft; daemons do not read it). For key-by-key editing use the Config editor.</p></div>' +
             '<div id="settings-body"><div class="placeholder">Loading…</div></div>';
         await loadSettings();
     }
@@ -3803,7 +4116,7 @@
                 <p class="settings-desc">Automatic hot/cold data classification and migration settings.</p>
                 <div class="settings-row">
                     <label>Enabled</label>
-                    <span class="settings-val">${tier.enabled ? '✅ Yes' : '❌ No'}</span>
+                    <span class="settings-val">${tier.enabled ? 'Yes' : 'No'}</span>
                 </div>
                 <div class="settings-row">
                     <label>Hot threshold (reads/hr)</label>
@@ -3822,12 +4135,12 @@
                     <span class="settings-val">${tier.evaluation_interval_secs ?? '—'}</span>
                 </div>
                 <div class="settings-row">
-                    <label>Migration bandwidth (MB/s)</label>
-                    <span class="settings-val">${tier.migration_bandwidth_limit_mbps ?? '—'}</span>
+                    <label>Migration bandwidth limit (Mbit/s, 0 = unlimited)</label>
+                    <span class="settings-val num">${tier.migration_bandwidth_limit_mbps ?? '—'}</span>
                 </div>
                 <div class="settings-row">
                     <label>Cache redundancy escalation</label>
-                    <span class="settings-val">${tier.enable_cache_redundancy_escalation ? '✅ Yes' : '❌ No'}</span>
+                    <span class="settings-val">${tier.enable_cache_redundancy_escalation ? 'Yes' : 'No'}</span>
                 </div>
             </div>
 
@@ -3843,14 +4156,14 @@
         </div>
 
         <div class="settings-section" style="margin-top:1.25rem">
-            <h3>Raw Config JSON</h3>
-            <p class="settings-desc">Current cluster config blob stored in Raft state. Edit carefully.</p>
+            <h3>Raw config JSON</h3>
+            <p class="settings-desc"><label for="cfg-json">Current cluster config blob stored in Raft state. Edit carefully.</label></p>
             <textarea id="cfg-json" class="form-textarea" rows="6">${
                 esc(cfg.config ? JSON.stringify(cfg.config, null, 2) : '(empty)')
             }</textarea>
-            <div style="margin-top:.75rem;display:flex;gap:.75rem;align-items:center">
-                <button class="btn-primary" onclick="saveConfigJson()">Apply Config JSON</button>
-                <span id="cfg-save-status" style="font-size:.8rem;color:var(--text-muted)"></span>
+            <div style="margin-top:.75rem;display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
+                <button class="btn-danger" onclick="saveConfigJson()">Replace config JSON</button>
+                <span id="cfg-save-status" style="font-size:.8rem;color:var(--text-muted)" role="status" aria-live="polite"></span>
             </div>
         </div>`;
         // Refresh session-secret status after Settings DOM is built.
