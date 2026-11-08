@@ -1,35 +1,23 @@
 # Tiering
 
-DTFS automatically classifies data into temperature tiers based on access patterns and migrates chunks to the appropriate storage media. The tiering engine runs on the manager leader node and periodically evaluates every chunk in the cluster.
+The tiering engine runs on the manager leader. It watches per-datacenter read counts reported by data nodes and decides when to add or drop **cache replicas** (opportunistic, evictable copies on faster disks near the readers). It never touches mandatory replicas and never violates the anchor; those belong to the repair scheduler (see [Replication](./replication.md)).
 
-## Cache tier semantics (Bug AV)
+## Cache tier semantics
 
-> **Status (2026-05):** Phase 1 (schema, flush, audit, alert,
-> migration helpers) and Phase 2 (demand-driven promotion +
-> idle-window demotion + cooldown clearance) are complete. The
-> legacy temperature path below still runs alongside the new
-> engine for backward compatibility with volumes that don't have
-> `cache_replicas` configured. New AV-style volumes use the
-> rules described here.
+Cache replicas are created by the tiering engine in response to read demand. Unlike mandatory replicas they are:
 
-Cache replicas are **opportunistic** copies created by the tiering
-engine in response to read demand. Unlike mandatory replicas they
-are:
+* Freely evictable (operator flush, tiering demotion).
+* Not counted toward write-safety thresholds or the replication goal.
+* Counted per datacenter (`cache_replicas.per_dc = true`, the default). Set `false` to pool all reads into one global cache.
 
-* Freely evictable (operator flush; tiering-engine demotion).
-* Not counted toward write-safety thresholds (mandatory replicas
-  only).
-* Allowed to differ in count per DC (`cache_replicas.per_dc = true`
-  is the default; set `false` to scope the cache pool globally).
+See [Volume Configuration](../configuration/volume-config.md#replication-classes) for the schema.
 
-See [Volume Configuration → Replication classes](../configuration/volume-config.md#replication-classes)
-for the full schema reference.
+The engine ticks every `tiering.evaluation_interval_secs` (default **3600**, one hour; set a shorter value if you want faster promotion). Only the leader acts; a follower skips the tick.
 
 ### Promotion math
 
 For each `(chunk, DC, cache-tier)` triple, the engine evaluates on
-every tick (default 5 min, configurable via
-`tiering.evaluation_interval_secs`):
+every tick:
 
 1. **Window count** — sum of reads from this DC in the last
    `cache_replicas.promote_window_secs` (default 4 h).
@@ -43,8 +31,7 @@ every tick (default 5 min, configurable via
    `min` is reached. The redundancy-escalation pass that ramps
    toward `max` is opt-in via the
    `tiering.enable_cache_redundancy_escalation` runtime config
-   flag (default `false`; AV-4-5 promoted it from a compile-time
-   constant so operators can flip without rebuilding). When
+   flag (default `false`, changeable at runtime). When
    enabled, the planner schedules up to `max - current_in_dc`
    replicas once `current_in_dc >= min` AND read count is at
    least `2 * promote_reads` — the audit reason code switches
@@ -68,16 +55,19 @@ For each existing cache-tier placement:
    `mandatory_replicas.<tier> == 0`).
 2. **Window check** — `reads_in_window_by_dc[placement.dc]` must
    be 0 (no reads from this DC inside `promote_window_secs`).
-3. **Anchor safety** — at least one mandatory-tier replica must
-   survive the drop (the planner refuses any demotion that would
-   strand the mandatory copy; defence-in-depth: the apply path
-   also re-checks via `enforce_anchor` on `RemoveChunkLocation`).
+3. **Anchor safety** — at least one other **live** replica must
+   satisfy the anchor (datacenter, and tier if `required_tier` is
+   set). A replica on a Down node or Failed disk, or one already
+   slated for demotion in the same plan, does not count. The apply
+   path re-checks via `enforce_anchor` on `RemoveChunkLocation`.
 
 A surviving demotion triggers the full sequence:
 
-* `DeleteChunkReplica` RPC on the data node (idempotent
-  `was_present`/`freed_bytes` shape).
-* `RemoveChunkLocation` Raft write removes the SM entry.
+* `RemoveChunkLocation` Raft write removes the SM entry FIRST. If the
+  write fails or the state machine refuses it, nothing is deleted.
+* Only then the `DeleteChunkReplica` RPC deletes the bytes
+  (idempotent `was_present`/`freed_bytes` shape). A failed byte delete is
+  left for the orphan reaper.
 * Conditional `SetChunkCooldown(expires_at_ms = 0)` — clears
   the chunk's cooldown entry **only if** the snapshot cooldown
   was 0 or in the past. A future operator-flush cooldown is
@@ -116,8 +106,8 @@ wait).
 
 ### Anchor-aware demotion
 
-The planner never emits a demotion that would leave 0
-mandatory-tier replicas. This invariant lives in two places:
+The planner never emits a demotion that would leave the anchor
+unsatisfied by a live replica. This invariant lives in two places:
 
 * `plan_chunk_demotions` filters before emitting the action.
 * `RemoveChunkLocation`'s state-machine apply path re-checks
@@ -127,6 +117,10 @@ mandatory-tier replicas. This invariant lives in two places:
 If a tier-aware anchor is configured
 (`anchor.required_tier = "cold"`), the engine treats it as the
 mandatory floor for demotion decisions.
+
+### Dispatch limits
+
+Promotions are planned for every chunk and then dispatched as one batch. At most 50 NEW tasks are scheduled per tick (tasks already in flight do not count) so anchor and mandatory repair, which share the scheduler's task budget, are never starved. The rest are re-planned on the next tick. Target selection is a pure function: a healthy, non-draining node in the reading datacenter with a serviceable disk of the cache tier that does not already hold the chunk, highest free capacity first, lowest node id as the tie-break. A promotion is an additive copy, so the source replica is not subtracted in the anchor check.
 
 ### Worked example — `/movies/Wicked.mkv` lifecycle
 
@@ -178,136 +172,40 @@ t=14_600:   Plex opens the file again. 1 read.
             cooldown blocks anything.)
 ```
 
-The legacy temperature path runs in parallel for volumes
-without a `cache_replicas` policy (back-compat); volumes WITH
-one drive the engine described here.
+The temperature path below runs only for volumes WITHOUT an active `cache_replicas` policy; a volume with one is driven solely by the engine above, so a legacy promote can never undo an operator flush.
 
-## Temperature Classification
+## Temperature classification (volumes without a cache policy)
 
-Each chunk maintains an access counter that the data nodes report to the manager via periodic heartbeats. The manager uses these counters to assign one of four temperature levels:
+Data nodes report per-chunk read counts in heartbeats. The engine classifies each chunk:
 
-| Temperature | Threshold | Default Storage Target |
-|-------------|-----------|------------------------|
-| Hot | >= 5 reads per hour | NVMe / fast SSD |
-| Warm | >= 2 reads per day (but below hot threshold) | SATA SSD |
-| Cold | No access for 14+ days | HDD |
-| Frozen | No access for 60+ days | HDD (reduced replicas) |
-
-These thresholds are configurable per volume:
+| Temperature | Rule (first match) | Target tier |
+|-------------|--------------------|-------------|
+| Hot | at least `hot_threshold_reads_per_hour` (5) reads in the last hour | hot |
+| Warm | at least 2 reads in the last 24 hours | warm |
+| Frozen | no access for more than `frozen_threshold_days` (60) | tape |
+| Cold | no access for more than `cold_threshold_days` (14) | cold |
+| Warm | otherwise | warm |
 
 ```toml
-[volume.mydata.tiering]
-hot_reads_per_hour   = 5
-warm_reads_per_day   = 2
-cold_after_days      = 14
-frozen_after_days    = 60
+[tiering]                       # manager.toml
+enabled = true
+hot_threshold_reads_per_hour = 5
+cold_threshold_days = 14
+frozen_threshold_days = 60
+evaluation_interval_secs = 3600
+enable_cache_redundancy_escalation = false
 ```
 
-The thresholds are evaluated from hottest to coldest. A chunk that meets the hot threshold is classified as hot regardless of how recently it was last accessed. A chunk that does not meet the warm threshold and has not been accessed for 14 days is cold.
+When the target tier differs from the chunk's current tier, a replication to a node with a disk of the target tier is scheduled, subject to the anchor check. This path is deliberately slow: at most 8 migrations are planned per tick and the rest are re-derived on the next tick. There is no hysteresis margin and no per-path pinning.
 
-### Access Counting
+Disks declare their tier in `data.toml` (`[[disks]]`, `tier = "hot|warm|cold|tape"`); see [Data Node Configuration](../configuration/data-node.md) and [Tape Storage](./tape.md).
 
-Data nodes track per-chunk read counters using a sliding-window approach:
+## Operator controls
 
-- **Hourly window**: the number of reads in the current clock hour, used for the hot threshold.
-- **Daily window**: the number of reads in the current calendar day (UTC), used for the warm threshold.
-- **Last-access timestamp**: the wall-clock time of the most recent read, used for the cold and frozen thresholds.
-
-Write operations also count as access events and reset the last-access timestamp, but they do not increment the read counters.
-
-## Disk Assignment
-
-When a data node starts, it registers each of its disks with the manager, including the disk type (NVMe, SSD, HDD) and the physical location in the topology hierarchy. The manager uses this information to build a mapping from temperature tiers to candidate disks.
-
-```toml
-# data-node.toml
-[[disk]]
-path = "/mnt/nvme0"
-tier = "hot"
-capacity_reserved_percent = 5
-
-[[disk]]
-path = "/mnt/ssd0"
-tier = "warm"
-capacity_reserved_percent = 5
-
-[[disk]]
-path = "/mnt/hdd0"
-tier = "cold"
-capacity_reserved_percent = 10
-```
-
-A single disk can serve only one tier. If no disk is assigned to a particular tier on a node, that node is not eligible for placement of chunks at that temperature.
-
-### Capacity Reservation
-
-The `capacity_reserved_percent` field reserves a percentage of each disk for temporary overhead during migrations and rebalancing. Once a disk crosses the `100 - capacity_reserved_percent` usage threshold, the manager stops placing new chunks on it and begins draining existing chunks to other disks in the same tier.
-
-## Tiering Evaluation Cycle
-
-The manager evaluates chunk temperatures on a configurable interval (default: 5 minutes):
-
-1. **Collect**: the manager aggregates the latest access statistics from data-node heartbeats.
-2. **Classify**: each chunk is assigned a temperature based on the thresholds.
-3. **Compare**: the chunk's current tier (determined by the disk it resides on) is compared to the target tier for its temperature.
-4. **Schedule**: if the tiers do not match, a migration task is created. See [Migration](./migration.md) for details on the task lifecycle.
-
-```toml
-[tiering]
-evaluation_interval_secs = 300    # 5 minutes
-max_concurrent_migrations = 10
-```
-
-### Hysteresis
-
-To avoid thrashing -- where a chunk oscillates between tiers because its access rate sits near a threshold boundary -- the tiering engine applies a hysteresis margin. A chunk must exceed the promotion threshold by 20% to be promoted, and must fall below the demotion threshold by 20% to be demoted. For example, a warm chunk is only promoted to hot if it reaches 6 reads per hour (5 * 1.2), and a hot chunk is only demoted to warm if it drops below 4 reads per hour (5 * 0.8).
-
-```toml
-[tiering]
-hysteresis_percent = 20
-```
-
-## Location-Aware Migration
-
-When the tiering engine decides to migrate a chunk to a different tier, the placement engine selects a target disk that satisfies two constraints:
-
-1. **Tier match**: the target disk must be assigned to the correct tier.
-2. **Failure domain spread**: the new placement must maintain the required separation across failure domains (see [Replication](./replication.md)).
-
-If no suitable disk exists in the same datacenter, the migration is deferred and an alert is raised. DTFS never migrates a chunk to a location that would violate the failure-domain policy.
-
-### Cross-Datacenter Migration
-
-For geo-distributed clusters, cross-datacenter migration is disabled by default because of bandwidth costs. It can be enabled per volume:
-
-```toml
-[volume.mydata.tiering]
-allow_cross_dc_migration = false
-```
-
-When enabled, the placement engine prefers intra-datacenter targets but will fall back to cross-datacenter targets if no local disk has capacity in the required tier.
-
-## Manual Tier Override
-
-Administrators can pin a file or directory to a specific tier, bypassing the automatic temperature classification:
-
-```bash
-dtfs-cli tier pin /data/important-dataset --tier hot
-dtfs-cli tier unpin /data/important-dataset
-```
-
-Pinned chunks are never demoted by the tiering engine. They can still be promoted if their access rate exceeds a higher tier's threshold, unless the `--strict` flag is used:
-
-```bash
-dtfs-cli tier pin /data/archive --tier cold --strict
-```
+- `dtfs-cli` volume commands set `mandatory_replicas`, `cache_replicas` and the anchor ([Volume Configuration](../configuration/volume-config.md)).
+- A cache flush (`POST /api/v1/files/flush_cache`) drops cache replicas for a path and sets a cooldown.
+- An explicit migrate request moves a chunk to a target tier (and optionally datacenter) through the same verified-copy path ([Migration](./migration.md)).
 
 ## Monitoring
 
-The manager exposes tiering metrics via the REST API and the WebUI dashboard:
-
-- `dtfs_tiering_chunks_by_temperature{temperature="hot|warm|cold|frozen"}` -- current chunk count per temperature.
-- `dtfs_tiering_migrations_scheduled_total` -- total migrations scheduled since startup.
-- `dtfs_tiering_migrations_completed_total` -- total migrations completed.
-- `dtfs_tiering_migrations_failed_total` -- total migrations that failed and were retried.
-- `dtfs_tiering_evaluation_duration_seconds` -- histogram of evaluation cycle duration.
+The manager `/metrics` endpoint exposes `dtfs_tier_migrations_completed_total`, `dtfs_migration_failed_total` and `dtfs_anchor_protected_total`; the audit log records `tier.promote`, `tier.demote`, `cache.flush_replica` and `cache.flush_refused`. See [Monitoring](../operations/monitoring.md).

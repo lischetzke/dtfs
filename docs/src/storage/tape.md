@@ -154,21 +154,16 @@ second copy on each (e.g. off-site disaster recovery).
 
 ## How tiering to tape works
 
-1. The tiering engine classifies chunks as `Frozen` after
-   `frozen_threshold_days` (default: 60) of no access.
-2. A migration task is created: `cold disk → tape LTFS mount`.
-3. The data node writes the chunk sequentially to the LTFS path.
-   LTFS buffers data and writes in large sequential blocks (optimal for tape).
-4. After the write is confirmed, the source chunk on the cold disk is removed.
-5. Chunk metadata in the manager's Raft state is updated to reflect the new
-   tape location.
+> **Status.** Tape is an LTFS-mounted directory used as a `tape`-tier disk. DTFS does not drive the changer, load cartridges or read TapeAlert; mount the cartridge before `dtfs-data` starts. Only the temperature path described in [Tiering](./tiering.md) sends data to tape, so it applies to volumes without a `cache_replicas` policy.
+
+1. The tiering engine classifies chunks as `Frozen` after `frozen_threshold_days` (default 60) of no access.
+2. A migration task copies the chunk to a node with a `tape`-tier disk, subject to the anchor check. The LELI anchor copy is not removed by tiering.
+3. The data node writes the chunk to the LTFS path through the normal atomic put.
+4. The target is verified with `VerifyChunk`, the new location is registered through Raft, and only then may a surplus source replica be removed (Raft first, bytes second).
 
 ### Migration is crash-safe
 
-Migration follows the same `Pending → Copying → Verifying → Completing → Done`
-state machine as all other migrations.  The source chunk is **never** removed
-until the tape write is verified.  If the data node crashes during the copy,
-the migration task is retried from the beginning on restart.
+Tape migration uses the same `Pending, Copying, Verifying, Completing, Done` state machine as every other migration ([Migration](./migration.md)). The source chunk is never removed until the tape copy is verified.
 
 ---
 
@@ -184,7 +179,7 @@ on-disk storage:
 └── chunks/
     ├── ab/
     │   └── cd/
-    │       ├── abcd...hash.dat   # Raw chunk data (128 MB)
+    │       ├── abcd...hash.dat   # Raw chunk data
     │       └── abcd...hash.meta  # Chunk metadata (checksum, size)
 ```
 
@@ -192,46 +187,7 @@ on-disk storage:
 
 ## Scrubbing on tape
 
-**Quick scrub is not performed on tape.**  The LTFS layer maintains its own
-internal checksums (ECC blocks written with every data block) and reports
-media errors independently.
-
-**Deep scrub on tape** reads the full chunk data and recomputes the BLAKE3
-checksum, but is **strongly discouraged** as a routine operation:
-
-- Reading a full tape cartridge takes hours and causes wear.
-- It is only recommended after a media alert from LTFS or if data integrity
-  is in question.
-
-To trigger a deep scrub on a specific tape device:
-
-```bash
-dtfs-cli scrub --disk /mnt/tape-a --level deep
-```
-
-The manager rate-limits tape scrub I/O via `max_io_percent` to avoid
-impacting concurrent migration writes.
-
----
-
-## Tape library management
-
-For automated tape libraries, DTFS uses the LTFS library interface.  The
-changer device (e.g. `/dev/sg2`) is used to:
-
-- Load/unload cartridges
-- Query cartridge inventory
-- Select the appropriate cartridge for a read or write operation
-
-You can query the library state via the CLI:
-
-```bash
-# List tape devices and their status
-dtfs-cli nodes --id <node_id> | jq '.tape_devices'
-
-# Check LTFS mount status (on the data node directly)
-ltfsck /dev/nst0       # Non-destructive consistency check
-```
+Scrub applies to the tape disk like any other disk: quick scrub stats the files, deep scrub re-hashes them. Reading a full cartridge takes hours and wears the media, so consider running deep scrub on tape only after a media alert. Scrub targets cannot be narrowed to one disk (`dtfs-cli scrub` is cluster-wide); the throttle is the cluster `scrub.max_io_percent`.
 
 ---
 

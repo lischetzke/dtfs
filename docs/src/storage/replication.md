@@ -4,8 +4,7 @@ DTFS replicates chunks across multiple data nodes to tolerate hardware failures 
 
 ## Two replication classes: mandatory vs cache
 
-Bug AV (2026-05) introduced two independent replication classes per
-volume. Conceptually:
+Each volume has two independent replication classes:
 
 | Class | Source of truth | Who creates them | Who removes them |
 |-------|-----------------|------------------|-------------------|
@@ -19,7 +18,7 @@ distinction is virtual, derived from the volume's policy plus each
 replica's storage tier.
 
 See [Volume Configuration → Replication classes](../configuration/volume-config.md#replication-classes)
-for the configuration surface, [`Tiering`](./tiering.md#cache-tier-semantics-bug-av)
+for the configuration surface, [`Tiering`](./tiering.md#cache-tier-semantics)
 for the promotion + cooldown rules that drive cache replica
 creation, and `cache.flush_replica` / `cache.flush_refused` audit
 events for the operator-visible lifecycle.
@@ -35,7 +34,7 @@ events for the operator-visible lifecycle.
 >   reads reach `promote_reads` within `promote_window_secs`. With
 >   `promote_reads = 0` the trigger never fires and a `min > 0` floor is
 >   inert: the scheduler is *forbidden* from backfilling cache replicas
->   (that is the Bug AV class separation).
+>   (that is the class separation).
 >
 > The legacy `replication.<tier>` count on its own creates nothing. Example
 > footgun: `replication = {cold = 1, warm = 1}` +
@@ -47,12 +46,16 @@ events for the operator-visible lifecycle.
 
 ### Anchor invariant
 
-Volumes additionally carry an `anchor.datacenter` setting (optionally
-pinned to a specific `anchor.required_tier`). The scheduler refuses
-any migration that would leave the volume with no mandatory replica
-in the anchor DC, and the cache-flush planner refuses any flush that
-would strand the anchor (an `AnchorViolated` alert fires when a
-flush attempt produces refusals — see the AV-1-11 hooks for details).
+Volumes carry an `anchor.datacenter` setting (optionally pinned to a specific `anchor.required_tier`). At least one **live** replica of every chunk must sit in the anchor datacenter. It is enforced at every place a replica can disappear:
+
+- Placement forces one replica into the anchor datacenter at allocation time (the tier constraint is relaxed for that slot).
+- The anchor-lag pass creates the anchor copy for chunks that landed without one.
+- Every promote, demote, flush and migration checks the anchor against its destination (`would_violate_anchor`, `demote_preserves_anchor`). An additive copy never subtracts its source; a move does.
+- The state machine re-checks on `RemoveChunkLocation` (`enforce_anchor`) and refuses to remove the last live replica regardless of policy.
+- A surviving replica that justifies dropping another must be live. A copy on a Down node does not count.
+- Datacenter names compare case-insensitively everywhere.
+
+A refused flush raises an `AnchorViolated` alert; see `dtfs_anchor_protected_total` in [Monitoring](../operations/monitoring.md).
 
 ## Per-Tier Replication Factors
 
@@ -78,7 +81,7 @@ cold = 1
 tape = 1
 ```
 
-When a chunk's temperature changes and its tier shifts (see [Tiering](./tiering.md)), the target replication factor changes as well. For example, a chunk moving from hot (3 replicas) to warm (2 replicas) will have one replica decommissioned after the migration completes. A chunk moving from cold (1 replica) to warm (2 replicas) will have a new replica created.
+The scheduler is the only component that creates or repairs mandatory replicas. It counts only live replicas, and removing a surplus replica goes through the same Raft-first path as every other removal (see [Re-Replication](#re-replication)).
 
 ## Write Safety
 
@@ -93,23 +96,22 @@ The `min_replicas_before_ack` parameter controls how many replicas must confirm 
 min_replicas_before_ack = 2
 ```
 
-The write flow proceeds as follows:
+The write flow (see [Data Flow](../architecture/data-flow.md#write)):
 
-1. The FUSE client sends a write request to the primary data node for the chunk.
-2. The primary writes the data to its local disk and forwards the write to the secondary replicas in parallel.
-3. Once `min_replicas_before_ack` nodes (including the primary) have confirmed the write to durable storage, the primary responds to the client with success.
-4. Remaining replicas continue to receive the write asynchronously.
+1. The FUSE client asks the manager for placement and streams the chunk to **every** target in parallel; there is no primary-to-replica forwarding on the write path.
+2. The client continues once at least `ceil(N/2)` targets acknowledged the same chunk id.
+3. `CommitChunkLocations` is rejected unless every chunk has at least `min_replicas_before_ack` distinct `(node_id, disk_id)` replicas among the acknowledged targets. The ack floor is clamped to the tier's replication factor.
+4. Targets that did not acknowledge are filled in later by the repair scheduler.
 
-Setting `min_replicas_before_ack` equal to the replication factor provides the strongest durability guarantee but increases write latency. Setting it to 1 gives the lowest latency but risks data loss if the single acknowledging node fails before replication completes.
+Setting `min_replicas_before_ack` equal to the replication factor gives the strongest guarantee but needs every target up; 1 gives the lowest latency but a single node failure right after the ack can lose the chunk.
 
 > **The ack floor is only as durable as its maintainers.** `N` acknowledged
 > replicas at write time stay `N` replicas only if the volume's policy keeps
 > them (see "Every tier needs a maintainer" above). If the extra ack comes
 > from a tier with no `mandatory_replicas` entry and no firing cache
-> promotion, that copy is later dropped and the file settles below `N` —
-> the configured guarantee silently degrades. Before raising
-> `min_replicas_before_ack`, confirm the topology has enough disks on
-> maintained tiers to durably hold `N` copies.
+> promotion, that copy is later dropped and the file settles below `N`.
+> Before raising `min_replicas_before_ack`, confirm the topology has enough
+> disks on maintained tiers to durably hold `N` copies.
 
 ### fsync Behavior
 
@@ -118,83 +120,26 @@ it, and sync the metadata before clearing the write-ahead log entry — an
 acknowledged write has reached stable storage. There is no configuration
 option to disable this.
 
-### write_timeout
+### write_timeout_secs
 
-The `write_timeout_secs` parameter sets the maximum time the primary will wait for replica acknowledgments before returning an error to the client:
-
-```toml
-[defaults.write_safety]
-write_timeout_secs = 30
-```
-
-If the timeout expires before `min_replicas_before_ack` replicas confirm, the write fails and the client receives an I/O error. The client may retry the write. Chunks that end up under-replicated due to timeouts are flagged for re-replication by the manager.
+`write_timeout_secs` is part of the volume's `write_safety` record and is stored and editable, but the current write path does not read it. Per-chunk timeouts come from the client (`client.chunk_read_timeout_secs` for reads) and from gRPC deadlines.
 
 ## Failure Domain Spreading
 
-DTFS uses the topology hierarchy to spread replicas across independent failure domains, minimizing the chance that a single hardware failure (a disk, a host, a rack, or a datacenter) destroys all copies of a chunk.
-
-### Topology Hierarchy
-
-Every data node registers its location in a four-level hierarchy:
-
-```text
-Region > Datacenter > Rack > Host
-```
-
-This is configured in the data node's configuration file:
-
-```toml
-[location]
-region     = "us-east"
-datacenter = "dc1"
-rack       = "rack-12"
-```
-
-### Placement Rules
-
-The placement engine applies the following rules when selecting nodes for a chunk's replicas, evaluated in order of priority:
-
-1. **No two replicas on the same host.** This is always enforced and cannot be relaxed.
-2. **Spread across racks.** If the replication factor is <= the number of available racks, each replica is placed on a different rack.
-3. **Spread across datacenters.** For geo-distributed clusters with `spread_across_dcs = true`, replicas are distributed across datacenters when possible.
-
-```toml
-[placement]
-failure_domain = "rack"         # "host", "rack", or "datacenter"
-spread_across_dcs = false
-```
-
-The `failure_domain` setting controls the minimum separation. With `failure_domain = "rack"` (the default), the placement engine guarantees that no two replicas of the same chunk share a rack. If there are not enough distinct racks to satisfy the replication factor, placement falls back to host-level separation and the manager raises a warning.
-
-### Geo-Distributed Clusters
-
-In clusters that span multiple datacenters, operators can require that at least one replica exists in each datacenter:
-
-```toml
-[placement]
-spread_across_dcs = true
-min_dcs = 2
-```
-
-With `min_dcs = 2`, the placement engine ensures that no single datacenter failure can cause data loss. This increases write latency due to cross-datacenter replication but provides the strongest durability guarantee for critical data.
+Placement spreads replicas with a `Rack`-level failure domain: one replica per host, preferring distinct racks, with a relaxed second pass when the topology is too small. The anchor datacenter is then forced in. The details, including the capacity filters, are in [Data Distribution](../architecture/data-distribution.md#node-selection). The `[placement]` block of `manager.toml` only holds the free-space headroom (`min_free_bytes`, `min_free_pct`) and `allow_capacity_spill`.
 
 ## Re-Replication
 
-When a data node fails or a disk is removed, the manager detects under-replicated chunks through heartbeat timeouts and schedules re-replication:
+When a node goes Down or a disk fails, the leader's scheduler repairs chunks whose **live** mandatory replica count is below policy:
 
-1. The manager identifies all chunks that had a replica on the failed node.
-2. For each under-replicated chunk, the placement engine selects a new target node that satisfies the failure-domain constraints.
-3. A healthy replica streams the chunk data to the new target.
-4. Once the new replica is verified (BLAKE3 checksum match), the chunk is marked as fully replicated.
+1. Find chunks with a replica on the failed node or disk. Replicas on Down nodes and Failed disks do not count as live.
+2. Pick a live source and a healthy target on a disk that has room, honouring the failure-domain and anchor rules.
+3. Copy with `ReplicateChunk`. The target hashes as it writes and the scheduler marks the task done only after `VerifyChunk` on the target.
+4. Register only the **new** replica row, using the disk id the target reported. A lease-less location update is a union, so it cannot erase other replicas.
+5. Removing a surplus or misplaced replica later goes through `delocate_replica`: Raft `RemoveChunkLocation` first, byte delete after. If the Raft write fails or the state machine refuses it, no byte is deleted.
 
-Re-replication respects bandwidth limits to avoid saturating the network. See [Migration](./migration.md) for bandwidth configuration.
+Repair is bounded per tick (new tasks and live tasks are capped) and never competes with itself: the health monitor only reports state, and the scheduler is the sole owner of repair. Bandwidth and concurrency limits are in [Migration](./migration.md).
 
 ## Monitoring
 
-The manager exposes replication metrics:
-
-- `dtfs_replication_factor{tier="hot|warm|cold|frozen"}` -- configured replication factor per tier.
-- `dtfs_chunks_under_replicated` -- number of chunks below their target replication factor.
-- `dtfs_chunks_over_replicated` -- number of chunks above their target (pending decommission).
-- `dtfs_replication_write_ack_duration_seconds` -- histogram of time from write initiation to `min_replicas_before_ack` confirmations.
-- `dtfs_replication_rereplicate_total` -- total re-replication operations triggered.
+Under-replication, anchor and migration counters are exposed on the manager's `/metrics` endpoint and in `GET /api/v1/stats`; see [Monitoring](../operations/monitoring.md) for the current metric names.

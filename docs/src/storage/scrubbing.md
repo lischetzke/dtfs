@@ -1,123 +1,72 @@
 # Scrubbing
 
-DTFS data nodes run periodic scrub jobs to detect data corruption, bit rot, and metadata inconsistencies. Corrupt chunks are automatically flagged for re-replication from a healthy replica, ensuring that silent data corruption does not go unnoticed.
+Data nodes run periodic scrubs to find corruption, bit rot and metadata damage. A faulty chunk is quarantined (renamed, never deleted), reported to the manager, and repaired from a healthy replica.
 
-## Scrub Types
+## Scrub types
 
-DTFS supports two levels of integrity verification, each with different performance characteristics.
+### Quick scrub
 
-### Quick Scrub
+Reads no chunk data. For each chunk it stats the `.dat`, parses the `.meta`, and compares the file size with the size recorded in the meta. It catches deletion, truncation and a damaged `.meta`. Default interval: 6 hours.
 
-A quick scrub performs lightweight checks without reading full chunk data:
+### Deep scrub
 
-- **Existence**: verifies that the chunk file exists on disk at the expected path.
-- **Size**: confirms that the file size matches the size recorded in the metadata.
-- **Modification time (mtime)**: checks that the file's mtime has not changed unexpectedly since the last known write.
+Re-hashes every `.dat` incrementally with BLAKE3 and compares the digest with `ChunkMeta.checksum`. It detects bit rot that leaves size unchanged. Default interval: 7 days.
 
-Quick scrubs are fast because they only require `stat()` system calls, not full reads. They catch common failure modes such as accidental deletion, truncation, and filesystem corruption that alters file metadata.
+Chunks with a WAL entry (a put or delete in flight) are skipped, and a chunk deleted while the scan runs is not an error. One unreadable bucket directory or one bad file counts against that chunk only; the disk pass continues.
 
-**Default interval**: every 6 hours.
+## What happens to a faulty chunk
 
-### Deep Scrub
+```text
+  .meta missing, unreadable, or unparseable
+        |
+        v
+  re-hash .dat: digest == chunk id ?
+     yes -> rewrite .meta (tmp, fsync, rename)      counted "repaired", healthy
+            (if the rewrite itself fails: still healthy, retried next scrub)
+     no  -> not repairable
+  size mismatch / digest mismatch / unreadable .dat / not repairable
+     -> rename .dat to .dtfs/quarantine/<id>.dat.bad   (never remove_file)
+     -> queue the id for the next heartbeat
+```
 
-A deep scrub reads the full content of every chunk and recomputes its BLAKE3 checksum:
+The three outcomes of a meta repair (repaired, hash ok but write failed, not repairable) are kept distinct on purpose: only a real digest mismatch or unreadable data justifies quarantine. A healthy chunk is never quarantined because its `.meta` was torn.
 
-- **Full read**: the entire chunk (default 128 MB) is read sequentially from disk.
-- **Checksum verification**: a BLAKE3 hash is computed over the read data and compared to the checksum stored in the metadata.
-- **Header validation**: chunk headers (version, flags, compression type) are validated against the expected format.
+After quarantine:
 
-Deep scrubs detect bit rot, silent disk corruption, and any form of data modification that leaves file size and mtime intact. They are I/O-intensive and are therefore run less frequently than quick scrubs.
+1. The id is reported in the next heartbeat. If the data node restarts before reporting, it re-queues every id found in `.dtfs/quarantine/` that has no live `.dat` again, so the report is not lost.
+2. The manager removes that `(node, chunk)` location through Raft and the repair scheduler copies the chunk from a healthy replica. Clients are not affected while another healthy replica exists.
+3. If no healthy replica exists, the chunk cannot be repaired and an alert is raised.
 
-**Default interval**: every 7 days (weekly).
+### quarantine_on_fault
+
+With `quarantine_on_fault = true` (default) a single integrity fault (quick or deep mismatch, a verify-on-read mismatch, or a chunk missing from disk that the state machine lists) puts the whole node into the `Quarantined` health state until an operator clears it with `POST /api/v1/nodes/{id}/unquarantine` (or `auto_unquarantine_secs` elapses, if set; default 0 means manual only). With `false`, faults are recorded and repaired but the node keeps serving. Disabling `verify_on_read` needs an explicit acknowledgement and is the only mode in which a read can return corrupt bytes.
 
 ## Configuration
 
-Scrub intervals and behavior are configured in the data node's configuration file:
+Scrub policy is cluster-wide. It lives in the manager's `[scrub]` block, is stored in Raft, and reaches every data node in heartbeat responses where it replaces the data node's own `[scrub]` block (kept only as a startup fallback):
 
 ```toml
-[scrubbing]
-quick_interval_secs = 21600     # 6 hours
-deep_interval_secs  = 604800    # 7 days
-
-# Throttle scrub I/O to limit impact on production reads
-max_scrub_bandwidth_mbps = 100
-
-# Maximum number of chunks to scrub concurrently
-max_concurrent_scrubs = 2
-
-# Time window during which deep scrubs are allowed to run
-# (24-hour format, local time). Outside this window, deep scrubs
-# are paused and resume when the window reopens.
-deep_scrub_window_start = "02:00"
-deep_scrub_window_end   = "06:00"
+[scrub]                       # manager.toml
+quick_interval_secs    = 21600     # 6 hours
+deep_interval_secs     = 604800    # 7 days
+orphan_interval_secs   = 86400     # orphan cross-check, see Data Flow
+orphan_grace_secs      = 86400
+max_io_percent         = 10        # scrub may use about this share of disk time
+verify_on_read         = true
+quarantine_on_fault    = true
+auto_unquarantine_secs = 0
 ```
 
-### Bandwidth Throttling
+The data node's own fallback block uses `quick_interval_hours` (6) and `deep_interval_hours` (168). See [Manager Configuration](../configuration/manager.md#scrub----cluster-wide-scrub--integrity-policy) and [Data Node](../configuration/data-node.md) for the full reference. There is no scheduling window and no bandwidth setting.
 
-The `max_scrub_bandwidth_mbps` setting limits the disk read rate for scrub operations. This prevents scrubbing from competing with production workloads for disk I/O bandwidth. The limit applies to the aggregate scrub throughput across all concurrent scrub threads on the node.
+### I/O throttling
 
-### Scheduling Window
+Throttling is per chunk: after scrubbing a chunk that took `t` seconds, the scrubber sleeps `t * (100 - p) / p` where `p = max_io_percent`, so scrub uses about `p` percent of the disk's time. The cap is re-read for each disk, so a policy change applies to the next disk.
 
-For deep scrubs, operators can define a time window during which scrubbing is permitted. This is useful for clusters with predictable load patterns where off-peak hours provide spare I/O capacity. Outside the window, any in-progress deep scrub is paused (not cancelled) and resumes when the window reopens.
+## Manual triggers
 
-If the deep scrub cannot complete within its window over multiple cycles, the data node logs a warning and the manager raises an alert. In this case, consider widening the window or increasing `max_scrub_bandwidth_mbps`.
-
-## Scrub Lifecycle
-
-Each scrub run proceeds through the following stages:
-
-1. **Enumerate**: the data node lists all chunks on the target disk.
-2. **Check**: each chunk is verified according to the scrub type (quick or deep).
-3. **Report**: results are sent to the manager in the next heartbeat. Healthy chunks update their last-scrub timestamp. Failed chunks are flagged.
-4. **Repair**: the manager schedules re-replication for any chunk that failed verification, using a healthy replica as the source.
-
-If no healthy replica exists (all copies are corrupt), the manager raises a critical alert. DTFS cannot repair chunks that have no healthy copy.
-
-## Manual Triggers
-
-Operators can trigger an immediate **cluster-wide** scrub (CF-8). The
-manager raft-replicates the request and relays it to every data node on
-its next heartbeat; each node runs the scrub once (per-trigger id
-dedupe) and ships the result back on a subsequent heartbeat.
-
-```bash
-# Quick scrub, all disks on all data nodes
-dtfs-cli scrub --level quick
-
-# Deep scrub (default level)
-dtfs-cli scrub
-```
-
-REST equivalent: `POST /api/v1/scrub {"level": "quick"}` (see the
-[REST API reference](../api-reference/rest-api.md)). Per-node /
-per-disk / per-chunk targeting is **not implemented** — the API rejects
-targeted requests with `400` rather than silently ignoring the target.
-
-Manual scrubs bypass the scheduling window, start within one heartbeat
-interval (~5 s), reset that level's interval timer, and respect the
-same `max_io_percent` throttle as scheduled scrubs. Results land in
-`GET /api/v1/stats` (`scrub_results_by_node` / `last_scrub`) and the
-WebUI Last Scrub card; there is no separate scrub-status endpoint.
-
-## Corrupt Chunk Handling
-
-When a scrub detects a corrupt chunk, the following sequence occurs:
-
-1. The data node marks the local replica as `CORRUPT` and stops serving reads from it.
-2. The data node reports the corruption to the manager on the next heartbeat.
-3. The manager redirects any reads for the affected chunk to a healthy replica.
-4. The manager schedules re-replication to restore the target replication factor.
-5. Once the new replica is verified, the corrupt copy is deleted.
-
-Clients experience no errors as long as at least one healthy replica exists. Read requests are transparently rerouted.
+`dtfs-cli scrub --level quick|deep` (REST: `POST /api/v1/scrub {"level": "quick"}`) triggers a **cluster-wide** scrub. The manager raft-replicates the request and each data node runs it once (per-trigger id dedupe) on its next heartbeat, about 5 s. Manual scrubs reset that level's interval timer and obey the same `max_io_percent`. Per-node, per-disk or per-chunk targets are not implemented; the API rejects them with `400`. Results appear in `GET /api/v1/stats` (`scrub_results_by_node`, `last_scrub`) and the WebUI Last Scrub card.
 
 ## Monitoring
 
-Scrub-related metrics are exported by each data node:
-
-- `dtfs_scrub_quick_last_completed_timestamp` -- Unix timestamp of the last completed quick scrub.
-- `dtfs_scrub_deep_last_completed_timestamp` -- Unix timestamp of the last completed deep scrub.
-- `dtfs_scrub_chunks_checked_total{type="quick|deep"}` -- total chunks checked.
-- `dtfs_scrub_chunks_corrupt_total{type="quick|deep"}` -- total corrupt chunks detected.
-- `dtfs_scrub_duration_seconds{type="quick|deep"}` -- histogram of scrub duration.
-- `dtfs_scrub_bandwidth_bytes_per_second` -- current scrub I/O rate.
+Per-disk scrub results (checked, healthy, corrupt, missing, size mismatch, repaired meta, duration) are logged by the data node and shipped to the manager with the heartbeat. Cluster counters, including quarantined nodes (`dtfs_nodes_quarantined`), are on the manager `/metrics` endpoint; see [Monitoring](../operations/monitoring.md).
