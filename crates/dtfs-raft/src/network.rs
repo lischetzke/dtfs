@@ -123,17 +123,21 @@ pub struct NetworkFactory {
     pub tls: dtfs_common::tls::TlsContext,
     /// `cluster.shared_secret`; when non-empty every Raft RPC is HMAC-stamped.
     pub shared_secret: String,
+    /// This manager's own node id; bound into every Raft RPC MAC as the sender.
+    pub self_id: u64,
 }
 
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     type Network = DtfsNetwork;
 
-    async fn new_client(&mut self, _target: u64, node: &DtfsNode) -> Self::Network {
+    async fn new_client(&mut self, target: u64, node: &DtfsNode) -> Self::Network {
         DtfsNetwork {
             addr: node.addr.clone(),
             channel: None,
             tls: self.tls.clone(),
             shared_secret: self.shared_secret.clone(),
+            self_id: self.self_id,
+            target_id: target,
         }
     }
 }
@@ -152,10 +156,23 @@ pub struct DtfsNetwork {
     /// CF-6 — TLS context applied when (re)opening the channel.
     tls: dtfs_common::tls::TlsContext,
     shared_secret: String,
+    self_id: u64,
+    target_id: u64,
 }
 
 /// gRPC method name bound into the Raft RPC HMAC stamp.
 pub const RAFT_RPC_AUTH_METHOD: &str = "RaftRpc";
+
+/// Header carrying the sender's node id (the receiver binds its own id as target).
+pub const RAFT_RPC_FROM_HEADER: &str = "x-dtfs-raft-from";
+
+/// MAC binding tying a stamp to sender, target and the exact request payload,
+/// so a captured stamp cannot authorize another body or another peer.
+pub fn raft_rpc_binding(from: u64, to: u64, payload: &[u8]) -> String {
+    format!("{from}
+{to}
+{}", blake3::hash(payload).to_hex())
+}
 
 impl DtfsNetwork {
     /// Bug AC — connection and request timeouts. With the previous
@@ -225,15 +242,17 @@ impl DtfsNetwork {
         // before the (potentially slow) network call so only `body` is held.
         drop(msg);
 
+        let binding = raft_rpc_binding(self.self_id, self.target_id, &body);
         let mut request = tonic::Request::new(bytes::Bytes::from(body));
         // CO-3-6: per-request timeout (the channel no longer sets one). Small
         // RPCs pass RPC_TIMEOUT; the snapshot send passes a size-scaled value.
         request.set_timeout(timeout);
         if let Some((ts, mac)) =
-            dtfs_common::crypto::stamp_mgr_rpc_auth(&self.shared_secret, RAFT_RPC_AUTH_METHOD, "")
+            dtfs_common::crypto::stamp_mgr_rpc_auth(&self.shared_secret, RAFT_RPC_AUTH_METHOD, &binding)
         {
             if let (Ok(ts), Ok(mac)) = (ts.parse(), mac.parse()) {
                 let md = request.metadata_mut();
+                md.insert(RAFT_RPC_FROM_HEADER, self.self_id.to_string().parse().expect("ascii digits"));
                 md.insert(dtfs_common::crypto::DATA_RPC_AUTH_TS, ts);
                 md.insert(dtfs_common::crypto::DATA_RPC_AUTH_MAC, mac);
             }

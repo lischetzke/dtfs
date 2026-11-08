@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 dtfs-common = { workspace = true }
+blake3 = { workspace = true }
 dtfs-proto = { workspace = true }
 openraft = { workspace = true }
 rocksdb = { workspace = true }

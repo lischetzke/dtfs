@@ -163,6 +163,7 @@ fn raft_auth_decision(
     require: bool,
     ts: Option<&str>,
     mac: Option<&str>,
+    binding: &str,
     now_unix: u64,
 ) -> RaftAuthDecision {
     if secret.is_empty() {
@@ -175,7 +176,7 @@ fn raft_auth_decision(
                 dtfs_raft::network::RAFT_RPC_AUTH_METHOD,
                 ts,
                 mac,
-                "",
+                binding,
                 now_unix,
             ) {
                 RaftAuthDecision::Accept
@@ -260,6 +261,8 @@ struct RaftTransportSvc {
     secret: String,
     require_auth: bool,
     max_body_bytes: usize,
+    /// This manager's node id: the MAC "target" binding.
+    self_id: u64,
 }
 
 impl tonic::server::NamedService for RaftTransportSvc {
@@ -286,30 +289,16 @@ impl tower::Service<tonic::codegen::http::Request<tonic::body::Body>> for RaftTr
         let secret = self.secret.clone();
         let require_auth = self.require_auth;
         let max_body = self.max_body_bytes;
+        let self_id = self.self_id;
 
         Box::pin(async move {
             let (parts, body) = req.into_parts();
 
-            // Authenticate from the headers BEFORE reading any body bytes.
             let hdr = |k: &str| parts.headers.get(k).and_then(|v| v.to_str().ok());
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            match raft_auth_decision(
-                &secret,
-                require_auth,
-                hdr(dtfs_common::crypto::DATA_RPC_AUTH_TS),
-                hdr(dtfs_common::crypto::DATA_RPC_AUTH_MAC),
-                now,
-            ) {
-                RaftAuthDecision::Accept => {}
-                RaftAuthDecision::AcceptUnsigned => warn_unsigned_raft_rpc(now),
-                RaftAuthDecision::Reject(why) => {
-                    warn!(reason = why, "RaftTransport: rejected unauthenticated Raft RPC");
-                    return Ok(grpc_error_response(7, "raft rpc authentication failed"));
-                }
-            }
 
             // Bounded collect: tonic's decode cap does not apply to this
             // hand-rolled service, so an unbounded body would buffer in RAM.
@@ -330,6 +319,31 @@ impl tower::Service<tonic::codegen::http::Request<tonic::body::Body>> for RaftTr
                     return Ok(grpc_error_response(3, msg));
                 }
             };
+
+            // The MAC covers the payload, so auth runs after the (bounded) read.
+            let binding = match hdr(dtfs_raft::network::RAFT_RPC_FROM_HEADER)
+                .and_then(|f| f.parse::<u64>().ok())
+            {
+                Some(from) => {
+                    dtfs_raft::network::raft_rpc_binding(from, self_id, &payload_bytes)
+                }
+                None => String::new(),
+            };
+            match raft_auth_decision(
+                &secret,
+                require_auth,
+                hdr(dtfs_common::crypto::DATA_RPC_AUTH_TS),
+                hdr(dtfs_common::crypto::DATA_RPC_AUTH_MAC),
+                &binding,
+                now,
+            ) {
+                RaftAuthDecision::Accept => {}
+                RaftAuthDecision::AcceptUnsigned => warn_unsigned_raft_rpc(now),
+                RaftAuthDecision::Reject(why) => {
+                    warn!(reason = why, "RaftTransport: rejected unauthenticated Raft RPC");
+                    return Ok(grpc_error_response(7, "raft rpc authentication failed"));
+                }
+            }
 
             tracing::debug!(
                 len = payload_bytes.len(),
@@ -408,6 +422,7 @@ pub async fn run_grpc_server(
         handler: RaftTransportHandler::new(raft),
         secret: config.cluster.shared_secret.clone(),
         require_auth: config.cluster.require_raft_auth,
+        self_id: dtfs_common::node_id_from_hostname(&config.node.hostname),
         // A snapshot rides base64-in-JSON inside one body; the manager gRPC
         // message cap is the existing operator-tuned bound for it.
         max_body_bytes: dtfs_common::config::max_message_bytes(config.grpc.max_message_size_mb),
@@ -495,13 +510,33 @@ mod raft_transport_hardening_tests {
 
     const SECRET: &str = "s3cret";
 
+    fn binding() -> String {
+        dtfs_raft::network::raft_rpc_binding(1, 2, b"body")
+    }
+
     fn stamp() -> (String, String) {
         dtfs_common::crypto::stamp_mgr_rpc_auth(
             SECRET,
             dtfs_raft::network::RAFT_RPC_AUTH_METHOD,
-            "",
+            &binding(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn mac_bound_to_body_and_target() {
+        let (ts, mac) = stamp();
+        let d = |b: &str| raft_auth_decision(SECRET, true, Some(&ts), Some(&mac), b, now());
+        assert_eq!(d(&binding()), RaftAuthDecision::Accept);
+        // tampered body
+        let tampered = dtfs_raft::network::raft_rpc_binding(1, 2, b"bodY");
+        assert_eq!(d(&tampered), RaftAuthDecision::Reject("invalid stamp"));
+        // replayed against a different target
+        let wrong_to = dtfs_raft::network::raft_rpc_binding(1, 3, b"body");
+        assert_eq!(d(&wrong_to), RaftAuthDecision::Reject("invalid stamp"));
+        // spoofed sender
+        let wrong_from = dtfs_raft::network::raft_rpc_binding(9, 2, b"body");
+        assert_eq!(d(&wrong_from), RaftAuthDecision::Reject("invalid stamp"));
     }
 
     fn now() -> u64 {
@@ -515,7 +550,7 @@ mod raft_transport_hardening_tests {
     fn valid_stamp_accepted_even_when_required() {
         let (ts, mac) = stamp();
         assert_eq!(
-            raft_auth_decision(SECRET, true, Some(&ts), Some(&mac), now()),
+            raft_auth_decision(SECRET, true, Some(&ts), Some(&mac), &binding(), now()),
             RaftAuthDecision::Accept
         );
     }
@@ -523,11 +558,11 @@ mod raft_transport_hardening_tests {
     #[test]
     fn missing_stamp_permissive_vs_required() {
         assert_eq!(
-            raft_auth_decision(SECRET, false, None, None, now()),
+            raft_auth_decision(SECRET, false, None, None, &binding(), now()),
             RaftAuthDecision::AcceptUnsigned
         );
         assert_eq!(
-            raft_auth_decision(SECRET, true, None, None, now()),
+            raft_auth_decision(SECRET, true, None, None, &binding(), now()),
             RaftAuthDecision::Reject("missing stamp")
         );
     }
@@ -538,12 +573,12 @@ mod raft_transport_hardening_tests {
         let mut bad = mac.clone();
         bad.replace_range(0..1, if mac.starts_with('0') { "1" } else { "0" });
         assert_eq!(
-            raft_auth_decision(SECRET, false, Some(&ts), Some(&bad), now()),
+            raft_auth_decision(SECRET, false, Some(&ts), Some(&bad), &binding(), now()),
             RaftAuthDecision::Reject("invalid stamp")
         );
         // Wrong secret on the verifier side is the same failure.
         assert_eq!(
-            raft_auth_decision("other", false, Some(&ts), Some(&mac), now()),
+            raft_auth_decision("other", false, Some(&ts), Some(&mac), &binding(), now()),
             RaftAuthDecision::Reject("invalid stamp")
         );
     }
@@ -552,7 +587,7 @@ mod raft_transport_hardening_tests {
     fn half_stamp_rejected_even_when_permissive() {
         let (ts, _) = stamp();
         assert_eq!(
-            raft_auth_decision(SECRET, false, Some(&ts), None, now()),
+            raft_auth_decision(SECRET, false, Some(&ts), None, &binding(), now()),
             RaftAuthDecision::Reject("incomplete stamp")
         );
     }
@@ -563,18 +598,18 @@ mod raft_transport_hardening_tests {
         let t: u64 = ts.parse().unwrap();
         let max = dtfs_common::crypto::DATA_RPC_MAX_SKEW_SECS;
         assert_eq!(
-            raft_auth_decision(SECRET, false, Some(&ts), Some(&mac), t + max),
+            raft_auth_decision(SECRET, false, Some(&ts), Some(&mac), &binding(), t + max),
             RaftAuthDecision::Accept
         );
         assert_eq!(
-            raft_auth_decision(SECRET, false, Some(&ts), Some(&mac), t + max + 1),
+            raft_auth_decision(SECRET, false, Some(&ts), Some(&mac), &binding(), t + max + 1),
             RaftAuthDecision::Reject("invalid stamp")
         );
     }
 
     #[test]
     fn empty_secret_skips_auth() {
-        assert_eq!(raft_auth_decision("", true, None, None, now()), RaftAuthDecision::Accept);
+        assert_eq!(raft_auth_decision("", true, None, None, &binding(), now()), RaftAuthDecision::Accept);
     }
 
     fn frame(prost: &[u8]) -> Bytes {

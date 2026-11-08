@@ -31,7 +31,7 @@ pub(super) async fn harness() -> Harness {
         openraft::Raft::new(
             1,
             raft_cfg,
-            dtfs_raft::network::NetworkFactory { tls: tls.clone(), shared_secret: String::new() },
+            dtfs_raft::network::NetworkFactory { tls: tls.clone(), shared_secret: String::new(), self_id: 1 },
             log_store,
             sm,
         )
