@@ -38,9 +38,24 @@ Without a config the server still starts; every tool returns a `setup_required` 
 | `host_config(host, role)` | `/etc/dtfs/<role>.toml` with secret/token/password/key_file values redacted |
 | `host_chunk(host, chunk_id)` | `.dat`/`.meta` stat, `.meta` content, quarantine and WAL entries for one chunk |
 | `host_net(host, targets?)` | `ss -tlnp` plus optional `host:port` reachability probes from that host |
+| `files_list(prefix?, limit?, offset?)` | page `/api/v1/files` (limit 1..1000); returns `total` and `truncated`, page with `offset` |
+| `file_lookup(path)` | one file: per-chunk replicas joined with node health, DC, disk status, tier and the volume anchor policy; `problem_chunks` lists chunks with no live replica or no live anchor replica (first 50 chunks shown) |
+| `chunk_detail(chunk_id)` | `/api/v1/chunks/{id}`: placement state, owning files, replicas, pending deletion |
+| `volume_detail(volume_id?)` | all volumes, or one volume's full policy (mandatory/cache replicas, anchor, write safety, spill) |
+| `node_detail(node_id)` | `/api/v1/nodes/{id}`: location, per-disk uuid/tier/capacity/status, health |
+| `migrations_status()` | migration/repair queue summarised by status, failed tasks with `last_error` first |
+| `integrity_faults(limit?)` | integrity-fault audit rows (checksum, quarantine, scrub), newest first |
+| `memory_status()` | `/api/v1/memory` from every manager (pressure, RSS vs hard cap); data/FUSE memory via `host_status` and `metrics` |
+| `raft_replication()` | per-manager term, leader, applied lag, voters/learners, per-follower replication lag, `millis_since_quorum_ack` |
+| `config_diff()` | manager config keys that differ from defaults (`/config/effective`), secret-like keys masked |
+| `host_disk_ids(host)` | persisted `<disk>/.dtfs-disk-id` vs the 0-based `[[disks]]` position; `ok=false` means dtfs-data will refuse to start |
+| `host_quarantine(host)` | per data disk: count and listing (capped at 300 lines) of `.dtfs/quarantine` |
 | `op_scrub(level?, confirm?)` | gated: `POST /api/v1/scrub` (full scrub of all disks) |
 | `op_maintenance(node_id, enabled, confirm?)` | gated: `POST /api/v1/nodes/{id}/maintenance` |
 | `op_unquarantine(node_id, operator_id, reason_acknowledged, confirm?)` | gated: `POST /api/v1/nodes/{id}/unquarantine` |
+| `op_flush_cache(path_prefix, cache_tiers?, cooldown_secs?, confirm?)` | gated: `POST /api/v1/files/flush_cache`; tiers limited to `warm`/`hot`, prefix must name a subtree; dry run previews matching files |
+| `op_migrate(path_prefix, target_tier, target_dc?, max_tasks?, confirm?)` | gated: `POST /api/v1/migrations`; prefix must name a subtree, `max_tasks` 1..10000; dry run previews matching files |
+| `op_decommission(node_id, operator_id, reason?, confirm?)` | gated: `POST /api/v1/nodes/{id}/decommission`; dry run shows the node, server refuses while it holds replicas |
 
 `/api/v1/chunks`, `/api/v1/chunks/{id}`, `/api/v1/memory` and the raft-state `replication`
 field exist only on manager builds that include them; older builds answer 404 and the tools
@@ -50,7 +65,7 @@ report that instead of failing.
 
 `<disk>/chunks/<aa>/<bb>/<chunk_id>.{dat,meta}` where `aa`/`bb` are the first two bytes of the
 chunk id in hex; `<disk>/.dtfs/wal/`, `<disk>/.dtfs/quarantine/<id>.dat.bad`, `<disk>/tmp/`,
-`<disk>/.dtfs-disk-uuid`. Units: `dtfs-manager`, `dtfs-data`, `dtfs-fuse@<mount>`.
+`<disk>/.dtfs-disk-id` (the disk's 0-based position in `[[disks]]`, written on first start). Units: `dtfs-manager`, `dtfs-data`, `dtfs-fuse@<mount>`.
 
 ## Security notes
 
@@ -62,6 +77,15 @@ chunk id in hex; `<disk>/.dtfs/wal/`, `<disk>/.dtfs/quarantine/<id>.dat.bad`, `<
   any returned text. `host_config` redacts secret-like keys before returning.
 - Gated ops are dry runs unless `confirm=true`; `.claude/settings.json` allowlists only the
   read tools, so `op_*` always prompts. A follower's 409 leader hint is followed once.
+- No op can target an empty or `/` prefix (the server's `allow_empty_prefix` escape hatch is
+  never sent) and flush cannot touch cold. Last-replica and anchor protection stay with the
+  server (`apply_remove_chunk_location`, the decommission replica check); the MCP adds no way
+  around them. There are no orphan-sweep or anchor-repair endpoints, so there are no tools for
+  them (the scheduler owns repair).
+- `config_diff` masks secret/token/password/webhook keys on top of the server's own masking;
+  `host_config` redacts webhook URLs and credentials.
+- `.claude/settings.json` allowlists read tools by name (`mcp__dtfs__<tool>`); the new read tools
+  need adding there to avoid prompts. `op_*` must stay off the allowlist.
 - Output is capped near 60 KB per call; timeouts are 10 s (REST), 30 s (SSH), 60 s (logs).
   Unreachable managers or hosts become findings, not errors.
 - Real SSH and live-cluster behaviour is untested in CI: the tests cover validation, argv and

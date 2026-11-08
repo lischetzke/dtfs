@@ -440,4 +440,157 @@ def test_tool_registry():
     names = {t.name for t in asyncio.run(mcp.list_tools())}
     assert names == {"cluster_overview", "rest_get", "audit_merged", "metrics", "host_logs",
                      "host_status", "host_disks", "host_smart", "host_config", "host_chunk",
-                     "host_net", "op_scrub", "op_maintenance", "op_unquarantine"}
+                     "host_net", "op_scrub", "op_maintenance", "op_unquarantine",
+                     "files_list", "file_lookup", "chunk_detail", "volume_detail", "node_detail",
+                     "migrations_status", "integrity_faults", "memory_status", "raft_replication",
+                     "config_diff", "host_disk_ids", "host_quarantine", "op_flush_cache",
+                     "op_migrate", "op_decommission"}
+
+
+# ---- extended read tools ---------------------------------------------------
+
+def fake_rest(routes, calls=None):
+    def fake(cl, addr, path, params=None, method="GET", body=None, auth=False):
+        if calls is not None:
+            calls.append((addr, path, params, method, body))
+        if path == "/api/v1/raft/state":
+            return {"status": 200, "data": {"is_leader": addr == "mgr01:9402"}, "addr": addr}
+        r = routes.get(path)
+        if r is None:
+            return {"__error__": f"{addr}: HTTP 404", "status": 404, "data": {"error": "nf"}}
+        return {"status": 200, "data": r, "addr": addr}
+    return fake
+
+
+NODES = [
+    {"node_id": "1", "hostname": "leli-d", "health": "Healthy", "location": "eu/LELI/r/leli-d",
+     "disks": [{"disk_id": 0, "status": "active"}]},
+    {"node_id": "2", "hostname": "toro-d", "health": "Down", "location": "na/TORO/r/toro-d",
+     "disks": [{"disk_id": 0, "status": "active"}]},
+]
+INSPECT = {"path": "/a/b.mkv", "volume_id": "default", "total_size": 9, "chunk_count": 2, "chunks": [
+    {"chunk_index": 0, "chunk_id": "aa", "size": 4, "replicas": [
+        {"node_id": "1", "disk_id": 0, "tier": "cold"}, {"node_id": "2", "disk_id": 0, "tier": "warm"}]},
+    {"chunk_index": 1, "chunk_id": "bb", "size": 5, "replicas": [
+        {"node_id": "2", "disk_id": 0, "tier": "warm"}]},
+]}
+
+
+def test_file_lookup_anchor_and_liveness(monkeypatch):
+    monkeypatch.setattr(m, "rest_call", fake_rest({
+        "/api/v1/files/inspect": INSPECT, "/api/v1/nodes": NODES,
+        "/api/v1/volumes/default": {"anchor": {"datacenter": "leli", "required_tier": "cold"}}}))
+    out = m.file_lookup_impl(cluster(), "/a/b.mkv")
+    assert out["problem_chunk_count"] == 1
+    bad = out["problem_chunks"][0]
+    assert bad["chunk_id"] == "bb" and bad["problem"] == "no live replica"
+    c0 = out["chunks"][0]
+    assert c0["live_replicas"] == 1 and c0["replicas"][0]["anchor"] and not c0["replicas"][1]["live"]
+
+
+def test_file_lookup_not_found_and_validation(monkeypatch):
+    monkeypatch.setattr(m, "rest_call", fake_rest({}))
+    out = m.file_lookup_impl(cluster(), "/missing")
+    assert out["error"].endswith("404") and "note" in out and out["server_error"] == "nf"
+    for bad in ("rel/path", "/a\nb", "/" + "x" * 2000):
+        with pytest.raises(m.ValidationError):
+            m.file_lookup_impl(cluster(), bad)
+
+
+def test_prefix_validation():
+    for bad in ("", "/", "//", "x"):
+        with pytest.raises(m.ValidationError):
+            m.validate_prefix(bad)
+    assert m.validate_prefix("", allow_empty=True) == ""
+    assert m.validate_prefix("/tv/") == "/tv/"
+
+
+def test_summaries():
+    mg = m.summarize_migrations({"tasks": [{"status": "failed", "last_error": "e"},
+                                           {"status": "pending"}, {"status": "pending"}]})
+    assert mg["by_status"] == {"failed": 1, "pending": 2} and mg["failed"][0]["last_error"] == "e"
+    r = m.summarize_raft({"a": {"data": {"is_leader": True, "current_term": 3, "voters": [1],
+                                         "replication": [{"node_id": "2", "lag": 4}], "junk": 1}},
+                          "b": {"__error__": "down"}})
+    assert "junk" not in r["a"] and r["a"]["replication"][0]["lag"] == 4 and r["b"]["error"] == "down"
+
+
+def test_config_diff_redacts_and_filters():
+    eff = {"node_hostname": "mgr01", "entries": [
+        {"name": "manager.cluster.shared_secret", "current": "hunter2", "default": "", "is_default": False},
+        {"name": "manager.alerts.webhooks", "current": [{"url": "https://hook/x"}], "default": [],
+         "is_default": False},
+        {"name": "manager.scrub.interval", "current": 5, "default": 3, "is_default": False},
+        {"name": "manager.x", "current": 1, "default": 1, "is_default": True}]}
+    out = m.config_diff_impl(eff)
+    assert out["total_non_default"] == 3
+    dumped = json.dumps(out)
+    assert "hunter2" not in dumped and "hook/x" not in dumped and '"current": 5' in dumped
+
+
+def test_disk_ids_command_and_check():
+    cmd = m.cmd_disk_ids(["/mnt/hdd0", "/mnt/ssd0"])
+    assert "cat /mnt/hdd0/.dtfs-disk-id" in cmd and "/mnt/ssd0/.dtfs-disk-id" in cmd
+    with pytest.raises(m.ValidationError):
+        m.cmd_disk_ids(["/mnt/x; id"])
+    secs = {"disk /mnt/hdd0": "0", "disk /mnt/ssd0": "0", "disk /mnt/n": "cat: x: No such file or directory"}
+    rows = m.check_disk_ids(["/mnt/hdd0", "/mnt/ssd0", "/mnt/n"], secs)
+    assert [r["ok"] for r in rows] == [True, False, True] and rows[1]["persisted_id"] == 0
+
+
+def test_quarantine_command():
+    cmd = m.cmd_quarantine(["/mnt/hdd0"])
+    assert "ls -la --time-style=long-iso /mnt/hdd0/.dtfs/quarantine" in cmd and "head -n 300" in cmd
+    with pytest.raises(m.ValidationError):
+        m.cmd_quarantine(["/mnt/../etc"])
+
+
+def test_host_disk_ids_tool_end_to_end(monkeypatch):
+    def fake(cl, host, cmd, timeout=30):
+        if cmd.startswith("cat /etc/dtfs"):
+            return {"ok": True, "stdout": '[[disks]]\npath = "/mnt/hdd0"\n[[disks]]\npath = "/mnt/b"\n'}
+        return {"ok": True, "stdout": "### disk /mnt/hdd0\n0\n### disk /mnt/b\n0\n"}
+    monkeypatch.setattr(m, "run_ssh", fake)
+    monkeypatch.setattr(m, "get_cluster", lambda c=None, cfg=None: cluster())
+    mcp = m.build_server()
+    res = asyncio.run(mcp.call_tool("host_disk_ids", {"host": "toro-plex"}))
+    text = json.dumps(res, default=str)
+    assert '\\"ok\\": false' in text or '"ok": false' in text
+
+
+def test_ops_new_dry_run_preview_and_validation(monkeypatch):
+    calls = []
+    monkeypatch.setattr(m, "rest_call", fake_rest({
+        "/api/v1/files": {"total": 7, "files": [{"path": "/tv/a"}]},
+        "/api/v1/nodes/9": {"node_id": "9", "used_capacity": 5}}, calls))
+    cl = cluster()
+    r = m.op_flush_cache_impl(cl, "/tv/", None, 60, False)
+    assert r["dry_run"] and r["preview"]["matching_files"] == 7
+    assert r["would_send"]["path"] == "/api/v1/files/flush_cache"
+    assert r["would_send"]["body"] == {"path_prefix": "/tv/", "cache_tiers": ["warm", "hot"],
+                                       "cooldown_secs": 60}
+    r = m.op_migrate_impl(cl, "/tv/", "cold", "LELI", 100, False)
+    assert r["dry_run"] and r["would_send"]["body"]["target_dc"] == "LELI"
+    r = m.op_decommission_impl(cl, "9", "ops1", "", False)
+    assert r["dry_run"] and r["preview"]["node"]["used_capacity"] == 5
+    assert not [c for c in calls if c[3] == "POST"]
+    for fn in (lambda: m.op_flush_cache_impl(cl, "/", None, None, True),
+               lambda: m.op_flush_cache_impl(cl, "/tv/", ["cold"], None, True),
+               lambda: m.op_flush_cache_impl(cl, "/tv/", [], None, True),
+               lambda: m.op_migrate_impl(cl, "", "cold", None, 10, True),
+               lambda: m.op_migrate_impl(cl, "/tv/", "ice", None, 10, True),
+               lambda: m.op_migrate_impl(cl, "/tv/", "cold", "a b", 10, True),
+               lambda: m.op_migrate_impl(cl, "/tv/", "cold", None, 0, True),
+               lambda: m.op_decommission_impl(cl, "1;x", "ops1", "", True),
+               lambda: m.op_decommission_impl(cl, "1", "ops1", "x" * 501, True)):
+        with pytest.raises(m.ValidationError):
+            fn()
+
+
+def test_new_ops_confirm_posts(monkeypatch):
+    calls = []
+    monkeypatch.setattr(m, "rest_call", fake_rest({"/api/v1/migrations": {"queued": 1}}, calls))
+    r = m.op_migrate_impl(cluster(), "/tv/", "warm", None, 5, True)
+    assert r["executed"]
+    post = [c for c in calls if c[3] == "POST"][0]
+    assert post[1] == "/api/v1/migrations" and post[4]["target_tier"] == "warm"

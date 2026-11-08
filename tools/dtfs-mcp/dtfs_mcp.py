@@ -9,8 +9,8 @@
 
 Read tools talk to the manager REST API (:9402) and, over the system `ssh`
 binary, run a fixed set of allowlisted read-only command templates on cluster
-hosts. Three gated ops (scrub, maintenance, unquarantine) mutate the cluster
-and only act when called with confirm=true.
+hosts. Gated ops (scrub, maintenance, unquarantine, flush_cache, migrate,
+decommission) mutate the cluster and only act when called with confirm=true.
 
 Config: %USERPROFILE%\\.dtfs\\clusters.toml (or env DTFS_MCP_CONFIG). See
 clusters.example.toml. Documentation: docs/src/operations/diagnostics-mcp.md.
@@ -687,7 +687,7 @@ def cmd_disks_for(paths: list[str], count_chunks: bool) -> str:
             f"echo '### disk {p}'",
             f"df -B1 {d}",
             f"findmnt -n -o SOURCE,FSTYPE,OPTIONS --target {d}",
-            f"cat {d}/.dtfs-disk-uuid",
+            f"cat {d}/.dtfs-disk-id",
             f"echo '-- wal'; ls -la {d}/.dtfs/wal | head -n 200",
             f"echo '-- quarantine'; ls -la --time-style=long-iso {d}/.dtfs/quarantine | head -n 200",
             f"echo '-- tmp'; find {d}/tmp -type f | wc -l; "
@@ -833,6 +833,178 @@ def host_logs_impl(cl: Cluster, host: str, unit: str, since: str, until: str | N
 
 
 # --------------------------------------------------------------------------
+# Extra read helpers (pure where possible)
+# --------------------------------------------------------------------------
+
+_VOLUME_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
+_DC = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_SECRETISH = re.compile(r"secret|token|password|key_file|webhook|credential", re.I)
+
+
+def validate_fs_path(v: Any) -> str:
+    if (not isinstance(v, str) or not v.startswith("/") or len(v) > 1024
+            or any(ord(c) < 32 for c in v)):
+        raise ValidationError(f"invalid file path: {v!r}")
+    return v
+
+
+def validate_prefix(v: Any, allow_empty: bool = False) -> str:
+    if allow_empty and v in ("", None):
+        return ""
+    validate_fs_path(v)
+    if v.strip("/") == "":
+        raise ValidationError("path prefix must not be empty or '/': pick a subtree")
+    return v
+
+
+def _get(cl: Cluster, path: str, params: dict | None = None, addr: str | None = None) -> Any:
+    """Payload of a leader GET, or {"error", "note"} (404 = older build / not found)."""
+    r = rest_call(cl, addr or pick_manager(cl, None), path, params)
+    if is_err(r):
+        out = {"error": r["__error__"]}
+        if r.get("status") == 404:
+            out["note"] = "404: route missing or object not found (older manager build?)"
+        if isinstance(r.get("data"), dict) and r["data"].get("error"):
+            out["server_error"] = r["data"]["error"]
+        return out
+    return r["data"]
+
+
+def analyze_file(inspect_: dict, nodes: Any, volume: Any, max_chunks: int = 50) -> dict:
+    """Join /files/inspect with node health/DC and the volume anchor policy."""
+    by_id: dict[str, dict] = {}
+    for n in nodes if isinstance(nodes, list) else []:
+        if isinstance(n, dict):
+            loc = str(n.get("location", "")).split("/")  # region/dc/rack/host
+            by_id[str(n.get("node_id"))] = {
+                "hostname": n.get("hostname"), "health": n.get("health"),
+                "dc": loc[1] if len(loc) > 1 else "",
+                "disks": {d.get("disk_id"): d.get("status") for d in n.get("disks") or []},
+            }
+    anchor = volume.get("anchor") if isinstance(volume, dict) else None
+    a_dc = str((anchor or {}).get("datacenter") or "").lower()
+    a_tier = (anchor or {}).get("required_tier")
+    chunks, problems = [], []
+    for c in inspect_.get("chunks") or []:
+        reps, live, anchored = [], 0, False
+        for r in c.get("replicas") or []:
+            nd = by_id.get(str(r.get("node_id")), {})
+            health = str(nd.get("health", "unknown"))
+            dstat = str(nd.get("disks", {}).get(r.get("disk_id"), "unknown"))
+            is_live = (health.lower() in ("healthy", "maintenance", "draining")
+                       and not any(b in dstat.lower() for b in ("failed", "removed")))
+            live += is_live
+            at_anchor = bool(a_dc) and nd.get("dc", "").lower() == a_dc and (
+                not a_tier or str(r.get("tier", "")).lower() == str(a_tier).lower())
+            anchored |= at_anchor and is_live
+            reps.append({**r, "hostname": nd.get("hostname"), "dc": nd.get("dc"),
+                         "node_health": health, "disk_status": dstat, "live": is_live,
+                         "anchor": at_anchor})
+        row = {"chunk_index": c.get("chunk_index"), "chunk_id": c.get("chunk_id"),
+               "size": c.get("size"), "replicas": reps, "live_replicas": live}
+        chunks.append(row)
+        if live == 0 or (a_dc and not anchored):
+            problems.append({**row, "problem": "no live replica" if live == 0
+                             else "no live anchor replica"})
+    return {
+        "path": inspect_.get("path"), "volume_id": inspect_.get("volume_id"),
+        "total_size": inspect_.get("total_size"), "chunk_count": inspect_.get("chunk_count"),
+        "anchor_policy": anchor,
+        "problem_chunk_count": len(problems), "problem_chunks": problems[:max_chunks],
+        "chunks": chunks[:max_chunks], "chunks_shown": min(len(chunks), max_chunks),
+    }
+
+
+def file_lookup_impl(cl: Cluster, path: str) -> dict:
+    validate_fs_path(path)
+    addr = pick_manager(cl, None)
+    ins = _get(cl, "/api/v1/files/inspect", {"path": path}, addr)
+    if "error" in ins:
+        return ins
+    vid = str(ins.get("volume_id") or "")
+    vol = _get(cl, f"/api/v1/volumes/{vid}", None, addr) if _VOLUME_ID.fullmatch(vid) else None
+    return analyze_file(ins, _get(cl, "/api/v1/nodes", None, addr), vol)
+
+
+def summarize_migrations(data: Any, cap: int = 30) -> dict:
+    tasks = data.get("tasks") if isinstance(data, dict) else None
+    if not isinstance(tasks, list):
+        return {"raw": data}
+    counts: dict[str, int] = {}
+    for t in tasks:
+        k = str((t or {}).get("status", "unknown"))
+        counts[k] = counts.get(k, 0) + 1
+    failed = [t for t in tasks if "fail" in str((t or {}).get("status", "")).lower()]
+    rest = [t for t in tasks if t not in failed]
+    return {"count": len(tasks), "by_status": counts, "failed": failed[:cap],
+            "other_sample": rest[:cap],
+            "omitted": max(0, len(failed) - cap) + max(0, len(rest) - cap)}
+
+
+def summarize_raft(per: dict[str, Any]) -> dict:
+    rows = {}
+    for addr, r in per.items():
+        d = payload(r)
+        if not isinstance(d, dict):
+            rows[addr] = {"error": r.get("__error__", "no data") if isinstance(r, dict) else "no data"}
+            continue
+        rows[addr] = {k: d[k] for k in (
+            "hostname", "state", "is_leader", "current_term", "current_leader", "last_log_index",
+            "last_applied_index", "applied_log_lag", "snapshot_index", "voters", "learners",
+            "replication", "millis_since_quorum_ack", "running_state") if k in d}
+    return rows
+
+
+def config_diff_impl(effective: Any, cap: int = 500) -> dict:
+    entries = effective.get("entries") if isinstance(effective, dict) else None
+    if not isinstance(entries, list):
+        return {"raw": effective}
+    out = []
+    for e in entries:
+        if not isinstance(e, dict) or e.get("is_default", True):
+            continue
+        name = str(e.get("name", ""))
+        sec = bool(_SECRETISH.search(name))
+        out.append({"name": name, "current": "***" if sec else e.get("current"),
+                    "default": "***" if sec else e.get("default")})
+    return {"node_hostname": effective.get("node_hostname"), "non_default": out[:cap],
+            "total_non_default": len(out)}
+
+
+def cmd_disk_ids(paths: list[str]) -> str:
+    parts = []
+    for p in paths:
+        validate_disk_path(p)
+        parts += [f"echo '### disk {p}'", f"cat {_q(p + '/.dtfs-disk-id')} 2>&1"]
+    return " ; ".join(parts)
+
+
+def check_disk_ids(paths: list[str], sections: dict[str, str]) -> list[dict]:
+    """disk_id is the 0-based position in [[disks]]; a mismatch makes dtfs-data refuse to start."""
+    rows = []
+    for i, p in enumerate(paths):
+        raw = sections.get(f"disk {p}", "").strip()
+        if raw.isdigit():
+            rows.append({"path": p, "config_position": i, "persisted_id": int(raw),
+                         "ok": int(raw) == i})
+        else:
+            rows.append({"path": p, "config_position": i, "persisted_id": None,
+                         "ok": "No such file" in raw, "detail": raw[:200]})
+    return rows
+
+
+def cmd_quarantine(paths: list[str]) -> str:
+    parts = []
+    for p in paths:
+        validate_disk_path(p)
+        d = _q(p + "/.dtfs/quarantine")
+        parts += [f"echo '### disk {p}'",
+                  f"find {d} -maxdepth 1 -type f | wc -l",
+                  f"ls -la --time-style=long-iso {d} 2>&1 | head -n 300"]
+    return " ; ".join(parts)
+
+
+# --------------------------------------------------------------------------
 # Gated ops
 # --------------------------------------------------------------------------
 
@@ -895,6 +1067,67 @@ def op_unquarantine_impl(cl: Cluster, node_id: Any, operator_id: str, reason: st
     body = {"operator_id": operator_id, "reason_acknowledged": reason}
     return gated_post(cl, f"/api/v1/nodes/{nid}/unquarantine", body, confirm,
                       f"clear integrity quarantine on node {nid}")
+
+
+def _prefix_preview(cl: Cluster, prefix: str) -> dict:
+    r = _get(cl, "/api/v1/files", {"prefix": prefix, "limit": 5})
+    if "error" in r:
+        return r
+    return {"matching_files": r.get("total"), "sample": [f.get("path") for f in r.get("files", [])]}
+
+
+def op_flush_cache_impl(cl: Cluster, path_prefix: str, cache_tiers: list[str] | None,
+                        cooldown_secs: int | None, confirm: bool) -> dict:
+    validate_prefix(path_prefix)
+    tiers = ["warm", "hot"] if cache_tiers is None else cache_tiers
+    if not isinstance(tiers, list) or not tiers or any(t not in ("warm", "hot") for t in tiers):
+        raise ValidationError("cache_tiers must be a non-empty subset of ['warm','hot']")
+    body: dict = {"path_prefix": path_prefix, "cache_tiers": tiers}
+    if cooldown_secs is not None:
+        if isinstance(cooldown_secs, bool) or not isinstance(cooldown_secs, int) \
+                or not 0 <= cooldown_secs <= 86400:
+            raise ValidationError("cooldown_secs must be 0..86400")
+        body["cooldown_secs"] = cooldown_secs
+    res = gated_post(cl, "/api/v1/files/flush_cache", body, confirm,
+                     f"flush {'/'.join(tiers)} cache replicas under {path_prefix}")
+    if res.get("dry_run"):
+        res["preview"] = _prefix_preview(cl, path_prefix)
+    return res
+
+
+def op_migrate_impl(cl: Cluster, path_prefix: str, target_tier: str, target_dc: str | None,
+                    max_tasks: int, confirm: bool) -> dict:
+    validate_prefix(path_prefix)
+    if target_tier not in ("hot", "warm", "cold", "tape"):
+        raise ValidationError("target_tier must be hot|warm|cold|tape")
+    if isinstance(max_tasks, bool) or not isinstance(max_tasks, int) or not 1 <= max_tasks <= 10000:
+        raise ValidationError("max_tasks must be 1..10000")
+    body: dict = {"path_prefix": path_prefix, "target_tier": target_tier, "max_tasks": max_tasks}
+    if target_dc:
+        body["target_dc"] = _need(_DC, target_dc, "target_dc")
+    res = gated_post(cl, "/api/v1/migrations", body, confirm,
+                     f"migrate {path_prefix} to tier {target_tier}"
+                     + (f" in {target_dc}" if target_dc else ""))
+    if res.get("dry_run"):
+        res["preview"] = _prefix_preview(cl, path_prefix)
+    return res
+
+
+def op_decommission_impl(cl: Cluster, node_id: Any, operator_id: str, reason: str,
+                         confirm: bool) -> dict:
+    nid = validate_node_id(node_id)
+    _need(_OPERATOR, operator_id, "operator_id")
+    if not isinstance(reason, str) or len(reason) > 500 or not (reason == "" or reason.isprintable()):
+        raise ValidationError("reason must be <= 500 printable characters")
+    res = gated_post(cl, f"/api/v1/nodes/{nid}/decommission",
+                     {"operator_id": operator_id, "reason": reason}, confirm,
+                     f"remove node {nid} from the registry")
+    if res.get("dry_run"):
+        res["preview"] = {
+            "node": _get(cl, f"/api/v1/nodes/{nid}"),
+            "note": "server refuses (409) while the node still holds any chunk replica; "
+                    "drain first. used_capacity > 0 usually means it does."}
+    return res
 
 
 # --------------------------------------------------------------------------
@@ -999,7 +1232,7 @@ def build_server():
 
     @tool
     def host_disks(host: str, count_chunks: bool = False, cluster: str | None = None) -> dict:
-        """Per data disk (from /etc/dtfs/data.toml): df, WAL, quarantine, tmp, uuid, backing device."""
+        """Per data disk (from /etc/dtfs/data.toml): df, WAL, quarantine, tmp, .dtfs-disk-id, backing device."""
         cl = get_cluster(cluster)
         paths, err = _remote_disks(cl, host)
         if err:
@@ -1090,6 +1323,124 @@ def build_server():
         """GATED. Clear a node's integrity quarantine (reason >= 16 chars, audited). Dry-run unless confirm=true."""
         return op_unquarantine_impl(get_cluster(cluster), node_id, operator_id,
                                     reason_acknowledged, confirm)
+
+    @tool
+    def files_list(prefix: str = "", limit: int = 100, offset: int = 0,
+                   cluster: str | None = None) -> dict:
+        """Page /api/v1/files (path order). Check `truncated`/`total`; page with offset."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValidationError("limit must be 1..1000")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValidationError("offset must be >= 0")
+        p = validate_prefix(prefix, allow_empty=True)
+        return _get(get_cluster(cluster), "/api/v1/files",
+                    {"prefix": p, "limit": limit, "offset": offset})
+
+    @tool
+    def file_lookup(path: str, cluster: str | None = None) -> dict:
+        """One file: per-chunk replicas with node health, DC, disk status, tier and anchor
+        status against the volume anchor policy; problem_chunks = no live / no live anchor replica."""
+        return file_lookup_impl(get_cluster(cluster), path)
+
+    @tool
+    def chunk_detail(chunk_id: str, cluster: str | None = None) -> dict:
+        """/api/v1/chunks/{id}: placement state, owning files, replicas, pending deletion."""
+        return _get(get_cluster(cluster), f"/api/v1/chunks/{validate_chunk_id(chunk_id)}")
+
+    @tool
+    def volume_detail(volume_id: str | None = None, cluster: str | None = None) -> dict:
+        """All volumes, or one volume's full policy (mandatory/cache replicas, anchor, write
+        safety, spill)."""
+        cl = get_cluster(cluster)
+        if volume_id is None:
+            return _get(cl, "/api/v1/volumes")
+        return _get(cl, f"/api/v1/volumes/{_need(_VOLUME_ID, volume_id, 'volume id')}")
+
+    @tool
+    def node_detail(node_id: str, cluster: str | None = None) -> dict:
+        """/api/v1/nodes/{id}: location, per-disk uuid/tier/capacity/status, health."""
+        return _get(get_cluster(cluster), f"/api/v1/nodes/{validate_node_id(node_id)}")
+
+    @tool
+    def migrations_status(cluster: str | None = None) -> dict:
+        """Migration/repair task queue summarised by status; failed tasks (last_error) first."""
+        return summarize_migrations(_get(get_cluster(cluster), "/api/v1/migrations"))
+
+    @tool
+    def integrity_faults(limit: int = 50, cluster: str | None = None) -> dict:
+        """Recent integrity-fault audit rows (checksum, quarantine, scrub), newest first."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise ValidationError("limit must be 1..500")
+        return _get(get_cluster(cluster), "/api/v1/integrity/faults", {"limit": limit})
+
+    @tool
+    def memory_status(cluster: str | None = None) -> dict:
+        """/api/v1/memory from EVERY manager (pressure level, RSS vs hard cap). Data/FUSE
+        memory: use host_status and metrics."""
+        cl = get_cluster(cluster)
+        return {a: (payload(r) if not is_err(r) else r["__error__"])
+                for a, r in fetch_all(cl, "/api/v1/memory").items()}
+
+    @tool
+    def raft_replication(cluster: str | None = None) -> dict:
+        """Per-manager raft view: term, leader, applied lag, voters/learners, per-follower
+        replication lag, millis_since_quorum_ack."""
+        return summarize_raft(fetch_all(get_cluster(cluster), "/api/v1/raft/state"))
+
+    @tool
+    def config_diff(cluster: str | None = None) -> dict:
+        """Manager config keys that differ from defaults (/config/effective), secrets redacted."""
+        return config_diff_impl(_get(get_cluster(cluster), "/api/v1/config/effective"))
+
+    @tool
+    def host_disk_ids(host: str, cluster: str | None = None) -> dict:
+        """Persisted <disk>/.dtfs-disk-id vs the disk's position in [[disks]] (data.toml).
+        A mismatch makes dtfs-data refuse to start (disk moved or reordered)."""
+        cl = get_cluster(cluster)
+        paths, err = _remote_disks(cl, host)
+        if err:
+            return err
+        h, res = _ssh_tool(cl, host, cmd_disk_ids(paths or []))
+        if not res.get("stdout") and not res.get("ok"):
+            return _unreachable(host, res)
+        return {"host": host, "disks": check_disk_ids(paths or [], split_sections(res["stdout"]))}
+
+    @tool
+    def host_quarantine(host: str, cluster: str | None = None) -> dict:
+        """Per data disk: files in .dtfs/quarantine (count + listing, capped). Read-only."""
+        cl = get_cluster(cluster)
+        paths, err = _remote_disks(cl, host)
+        if err:
+            return err
+        h, res = _ssh_tool(cl, host, cmd_quarantine(paths or []))
+        if not res.get("stdout") and not res.get("ok"):
+            return _unreachable(host, res)
+        return {"host": host, **split_sections(res["stdout"])}
+
+    @tool
+    def op_flush_cache(path_prefix: str, cache_tiers: list[str] | None = None,
+                       cooldown_secs: int | None = None, confirm: bool = False,
+                       cluster: str | None = None) -> dict:
+        """GATED. Drop warm/hot cache replicas under a path prefix (never empty, never cold);
+        server keeps mandatory/anchor replicas. Dry-run previews matching files."""
+        return op_flush_cache_impl(get_cluster(cluster), path_prefix, cache_tiers,
+                                   cooldown_secs, confirm)
+
+    @tool
+    def op_migrate(path_prefix: str, target_tier: str, target_dc: str | None = None,
+                   max_tasks: int = 1000, confirm: bool = False,
+                   cluster: str | None = None) -> dict:
+        """GATED. Start a path-prefix tier/DC migration (never empty prefix); server enforces
+        anchor guards. Dry-run previews matching files."""
+        return op_migrate_impl(get_cluster(cluster), path_prefix, target_tier, target_dc,
+                               max_tasks, confirm)
+
+    @tool
+    def op_decommission(node_id: str, operator_id: str, reason: str = "",
+                        confirm: bool = False, cluster: str | None = None) -> dict:
+        """GATED. Remove a drained/dead node from the registry; server refuses while it holds
+        any chunk replica. Dry-run shows the node's current state."""
+        return op_decommission_impl(get_cluster(cluster), node_id, operator_id, reason, confirm)
 
     return mcp
 
