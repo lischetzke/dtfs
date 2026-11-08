@@ -9,16 +9,23 @@
 #      (the order is read from /api/v1/raft/state at run time);
 #   2. data nodes;
 #   3. FUSE clients.
-# A node whose health wait fails stops the run; the previous binary is kept
-# as /usr/local/bin/<bin>.<timestamp> by the copy backup for a manual
-# rollback. The final play runs scripts/dtfs-cluster-healthcheck.sh.
+# A node already running dtfs_version with an active service is skipped
+# (idempotent re-run). A node whose health wait fails stops the run; the
+# previous binary is kept as <bin>.prev (one copy) for a manual rollback.
+# The final step runs scripts/dtfs-cluster-healthcheck.sh.
 #
-# Variables (override with -e):
-#   dtfs_tarball               tarball from scripts/dtfs-release.sh (required)
+# Variables (override with -e); full table in docs/src/operations/ci-pipeline.md:
+#   dtfs_tarball               tarball from scripts/dtfs-release.sh, OR
+#   dtfs_tarball_url           URL of dtfs-linux-amd64.tar.gz (+ dtfs_repo_token)
 #   dtfs_version               expected `dtfs-* --version` stamp (required)
 #   dtfs_restart_delay_secs    pause after each node (default 30)
 #   dtfs_health_timeout_secs   per-node wait budget (default 300)
 #   dtfs_api_port              manager REST port (default 9402)
+#   dtfs_group_managers / dtfs_group_data_nodes / dtfs_group_clients
+#                              inventory group names (managers / data_nodes / clients)
+#   dtfs_bin_dir               install dir on the nodes (default /usr/local/bin)
+#   dtfs_force_update          reinstall even if already at dtfs_version (false)
+#   dtfs_run_healthcheck       run the final cluster healthcheck (true)
 # Remote hosts are reached as root over SSH (deploy/ansible/ansible.cfg);
 # the preflight and final check run locally on the control host.
 
@@ -31,19 +38,27 @@
     dtfs_restart_delay_secs: 30
     dtfs_health_timeout_secs: 300
     dtfs_api_port: 9402
+    dtfs_group_managers: managers
+    dtfs_group_data_nodes: data_nodes
+    dtfs_group_clients: clients
+    dtfs_bin_dir: /usr/local/bin
+    dtfs_force_update: false
+    dtfs_run_healthcheck: true
+    dtfs_repo_token: ""
   tasks:
-    - name: Require dtfs_tarball and dtfs_version
+    - name: Require a version and a tarball (path or URL)
       ansible.builtin.assert:
         that:
-          - dtfs_tarball is defined
           - dtfs_version is defined
-        fail_msg: "pass -e dtfs_tarball=<tarball> -e dtfs_version=<version>"
+          - dtfs_tarball is defined or dtfs_tarball_url is defined
+        fail_msg: "pass -e dtfs_version=<version> and -e dtfs_tarball=<path> or -e dtfs_tarball_url=<url>"
 
     - name: Tarball exists
       ansible.builtin.stat:
         path: "{{ dtfs_tarball }}"
       register: tarball_stat
       failed_when: not tarball_stat.stat.exists
+      when: dtfs_tarball is defined
 
     - name: Staging directory on the control host
       ansible.builtin.tempfile:
@@ -51,9 +66,21 @@
         prefix: "dtfs-update-"
       register: stage
 
+    - name: Download the tarball (GitLab deploy/access token header when set)
+      ansible.builtin.get_url:
+        url: "{{ dtfs_tarball_url }}"
+        dest: "{{ stage.path }}/dtfs-linux-amd64.tar.gz"
+        mode: "0600"
+        headers: >-
+          {{ {} if dtfs_repo_token == ''
+             else ({'DEPLOY-TOKEN': dtfs_repo_token} if dtfs_repo_token.startswith('gldt-')
+                   else {'PRIVATE-TOKEN': dtfs_repo_token}) }}
+      no_log: true
+      when: dtfs_tarball is not defined
+
     - name: Unpack the tarball
       ansible.builtin.unarchive:
-        src: "{{ dtfs_tarball }}"
+        src: "{{ dtfs_tarball | default(stage.path ~ '/dtfs-linux-amd64.tar.gz') }}"
         dest: "{{ stage.path }}"
         remote_src: true
 
@@ -72,7 +99,7 @@
         url: "http://{{ hostvars[item].ansible_host }}:{{ hostvars[item].dtfs_api_port | default(dtfs_api_port) }}/api/v1/raft/state"
         return_content: true
         timeout: 10
-      loop: "{{ groups['managers'] }}"
+      loop: "{{ groups[dtfs_group_managers] }}"
       register: raft_states
       ignore_errors: true
 
@@ -100,13 +127,13 @@
       ansible.builtin.set_fact:
         dtfs_manager_order: >-
           {{ dtfs_learners
-             + (groups['managers'] | difference(dtfs_learners) | difference(dtfs_leaders))
+             + (groups[dtfs_group_managers] | difference(dtfs_learners) | difference(dtfs_leaders))
              + dtfs_leaders }}
         dtfs_leader_api: >-
           http://{{ hostvars[dtfs_leaders[0]].ansible_host }}:{{ hostvars[dtfs_leaders[0]].dtfs_api_port | default(dtfs_api_port) }}
         dtfs_stage_dir: "{{ stage.path }}"
         dtfs_manager_endpoints: >-
-          {% for m in groups['managers'] -%}
+          {% for m in groups[dtfs_group_managers] -%}
           {{ hostvars[m].ansible_host }}:{{ hostvars[m].dtfs_api_port | default(dtfs_api_port) }}{{ ',' if not loop.last else '' }}
           {%- endfor %}
 
@@ -115,8 +142,8 @@
         msg:
           - "version: {{ dtfs_version }}"
           - "managers (in order): {{ dtfs_manager_order | join(' -> ') }}"
-          - "data nodes: {{ groups['data_nodes'] | default([]) | join(', ') }}"
-          - "clients: {{ groups['clients'] | default([]) | join(', ') }}"
+          - "data nodes: {{ groups[dtfs_group_data_nodes] | default([]) | join(', ') }}"
+          - "clients: {{ groups[dtfs_group_clients] | default([]) | join(', ') }}"
           - "delay between nodes: {{ dtfs_restart_delay_secs }}s, health wait: {{ dtfs_health_timeout_secs }}s"
 
     - name: Update managers one at a time
@@ -129,7 +156,7 @@
 
     - name: Update data nodes one at a time
       ansible.builtin.include_tasks: tasks/update-node.yml
-      loop: "{{ groups['data_nodes'] | default([]) }}"
+      loop: "{{ groups[dtfs_group_data_nodes] | default([]) }}"
       loop_control:
         loop_var: node
       vars:
@@ -137,13 +164,14 @@
 
     - name: Update FUSE clients one at a time
       ansible.builtin.include_tasks: tasks/update-node.yml
-      loop: "{{ groups['clients'] | default([]) }}"
+      loop: "{{ groups[dtfs_group_clients] | default([]) }}"
       loop_control:
         loop_var: node
       vars:
         role: client
 
     - name: Final cluster health check
+      when: dtfs_run_healthcheck | bool
       ansible.builtin.command:
         argv:
           - bash
@@ -153,7 +181,7 @@
           - --expect-version
           - "{{ dtfs_version }}"
           - --min-data-nodes
-          - "{{ groups['data_nodes'] | default([]) | length }}"
+          - "{{ groups[dtfs_group_data_nodes] | default([]) | length }}"
           - --timeout
           - "{{ dtfs_health_timeout_secs }}"
       changed_when: false
