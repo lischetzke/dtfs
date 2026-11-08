@@ -294,7 +294,7 @@ mod bug_bk_scrub_tests {
             "Home must render the production-signals container"
         );
         assert!(
-            html.contains("renderProductionSignals(stats, migrations, cluster)"),
+            html.contains("renderProductionSignals(stats, migrations, cluster,"),
             "fetchStats must pass stats + migrations + cluster/status into the strip"
         );
         assert!(
@@ -376,6 +376,7 @@ mod bug_bk_scrub_tests {
             "'/api/v1/nodes/' + nodeId + '/maintenance'",
             "'/api/v1/nodes/' + nid + '/unquarantine'",
             "'/api/v1/nodes/' + nid + '/decommission'",
+            "'/remove-dead'",
             "/${suffix}`",
         ] {
             assert!(html.contains(needle), "expected mutate path fragment: {needle}");
@@ -391,8 +392,8 @@ mod bug_bk_scrub_tests {
         );
         // GETs must remain unauthenticated plain fetch.
         assert!(
-            html.contains("fetch('/api/v1/stats')"),
-            "GET /api/v1/stats must stay a plain fetch"
+            html.contains("getJSON('/api/v1/stats')"),
+            "GET /api/v1/stats must stay a plain (non-mutating) fetch via getJSON"
         );
         assert!(
             !html.contains("mutateFetch('/api/v1/stats'"),
@@ -515,8 +516,8 @@ mod uip_2_webui_ops_tests {
             "decommission must POST /api/v1/nodes/<id>/decommission through mutateFetch"
         );
         assert!(
-            fn_body.contains("json.error) ? json.error"),
-            "server error (409 replicas remain) must be shown verbatim"
+            fn_body.contains("errMsg({ resp, text, json, authError })"),
+            "server error (409 replicas remain) must be shown via the shared errMsg"
         );
     }
 
@@ -551,8 +552,9 @@ mod uip_2_webui_ops_tests {
             "body must carry the session secret for the API's second check"
         );
         assert!(
-            fn_body.contains("resp.status === 409") && fn_body.contains("leader_hostname"),
-            "409 must surface the leader hint, not a generic error"
+            fn_body.contains("errMsg({ resp, text, json, authError })")
+                && html.contains("json.leader.leader_hostname"),
+            "409 must surface the leader hint (mutateFetch -> leaderErrorMsg), not a generic error"
         );
     }
 
@@ -569,7 +571,7 @@ mod uip_2_webui_ops_tests {
             "id=\"raft-members\"",
             "id=\"raft-members-table\"",
             "<th>Hostname</th><th>Node id</th><th>Addr</th><th>Role</th>",
-            "fetch('/api/v1/raft/state')",
+            "getJSON('/api/v1/raft/state')",
         ] {
             assert!(html.contains(needle), "raft page missing: {needle}");
         }
@@ -586,7 +588,7 @@ mod uip_2_webui_ops_tests {
         let html = render_dashboard("test-cluster", "mgr-test");
         assert!(html.contains("id=\"manager-health\""), "indicator span missing");
         assert!(
-            html.contains("fetch('/api/v1/health')"),
+            html.contains("fetch('/api/v1/health'"),
             "GET /api/v1/health must be a plain fetch"
         );
         assert!(
@@ -928,5 +930,76 @@ mod js_syntax_tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(n > 0, "no inline script found");
+    }
+}
+
+/// Run the pure JS helpers in node: escaping, health class mapping, leader
+/// hints and error text. Skipped (loudly) when node is not installed.
+#[cfg(test)]
+mod js_helper_behaviour_tests {
+    use super::*;
+
+    fn js_fn(html: &str, name: &str) -> String {
+        let i = html.find(&format!("function {name}(")).unwrap_or_else(|| panic!("no {name}"));
+        let mut depth = 0i32;
+        let mut started = false;
+        for (off, c) in html[i..].char_indices() {
+            match c {
+                '{' => { depth += 1; started = true; }
+                '}' => { depth -= 1; if started && depth == 0 { return html[i..i + off + 1].to_string(); } }
+                _ => {}
+            }
+        }
+        panic!("unbalanced {name}");
+    }
+
+    #[test]
+    fn pure_helpers_behave() {
+        if std::process::Command::new("node").arg("--version").output().is_err() {
+            eprintln!("WARNING: node not on PATH, dashboard JS helpers NOT exercised");
+            return;
+        }
+        let html = render_dashboard("c", "h");
+        let mut src: String = ["esc", "escArg", "healthCssClass", "formatAuthError", "errMsg", "leaderErrorMsg"]
+            .iter().map(|n| js_fn(&html, n)).collect::<Vec<_>>().join("\n");
+        src.push_str(r#"
+const assert = require('assert');
+const unesc = x => x.replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+const raw = "a\nb'c\d e f\r";
+assert.strictEqual(eval("'" + unesc(escArg(raw)) + "'"), raw, 'escArg must survive newlines and separators');
+assert.strictEqual(healthCssClass('critical'), 'critical');
+assert.strictEqual(healthCssClass('Down'), 'critical');
+assert.strictEqual(healthCssClass('degraded'), 'degraded');
+assert.strictEqual(healthCssClass('healthy'), 'healthy');
+assert.strictEqual(healthCssClass(undefined), 'unknown');
+assert.strictEqual(leaderErrorMsg(409, {leader: {leader_hostname: 'mgr01', leader_addr: 'mgr01:9401'}}),
+    'Not the leader. Open the dashboard on mgr01 (mgr01:9401).');
+assert.ok(leaderErrorMsg(503, {error: 'raft write failed: has to forward request to: Some(1), Some(DtfsNode { addr: "mgr01:9401", hostname: "mgr01" })'}).includes('mgr01 (mgr01:9401)'));
+assert.ok(leaderErrorMsg(409, {error: 'x', leader: null}).startsWith('Not the leader and no leader'));
+assert.strictEqual(leaderErrorMsg(503, {error: 'disk full'}), null);
+assert.strictEqual(leaderErrorMsg(400, {error: 'bad'}), null);
+assert.strictEqual(errMsg({resp: {status: 422}, text: '', json: null, authError: null}), 'Error 422');
+assert.strictEqual(errMsg({resp: {status: 400}, text: '', json: {error: 'bad'}, authError: null}), 'Error 400: bad');
+assert.strictEqual(errMsg({resp: {status: 401}, text: '', json: null, authError: 'AUTH'}), 'AUTH');
+"#);
+        let f = std::env::temp_dir().join(format!("dtfs-webui-helpers-{}.js", std::process::id()));
+        std::fs::write(&f, src).unwrap();
+        let out = std::process::Command::new("node").arg(&f).output().unwrap();
+        let _ = std::fs::remove_file(&f);
+        assert!(out.status.success(), "helper checks failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn global_poll_and_no_preemptive_secret_prompt() {
+        let html = render_dashboard("c", "h");
+        assert!(html.contains("setInterval(refreshGlobal, 8000)"), "banner must refresh on every page");
+        assert!(html.contains("async function getJSON("), "failure-aware loader missing");
+        assert!(!html.contains("No integrity events. Cluster is clean.</td></tr>'; // on error"));
+        // mutateFetch must prompt only after a 401.
+        let body = js_fn(&html, "mutateFetch");
+        let first_send = body.find("let r = await send()").expect("send first");
+        let prompt = body.find("promptSharedSecret").expect("prompt on 401");
+        assert!(first_send < prompt, "prompt must come after the first attempt");
+        assert!(body.contains("status === 401"), "prompt gated on 401");
     }
 }

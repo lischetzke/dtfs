@@ -683,7 +683,7 @@
         <div class="modal-row">
             <label>allow spill</label>
             <select id="ve-spill-allow" class="form-input">
-                <option value="">(inherit cluster default)</option>
+                <option value="">(not set / unchanged)</option>
                 <option value="true">yes — spill allowed</option>
                 <option value="false">no — fail the write instead</option>
             </select>
@@ -836,6 +836,38 @@
     </div>
 </div>
 
+<!-- Remove dead node: dry-run plan first, then confirm -->
+<div id="removedead-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeRemoveDead()">
+    <div class="modal-card" style="max-width:36rem">
+        <h3 style="color:var(--danger)">Remove dead node <span id="rd-hostname"></span></h3>
+        <div style="font-size:.78rem;color:var(--text-muted);margin-bottom:.8rem">
+            For a node that is Down/Failed and will not come back. Preview first: the manager computes which
+            replica rows can be dropped safely and which chunks have no other live copy (data loss).
+            Leader only. operator_id and reason land in the audit log.
+        </div>
+        <input type="hidden" id="rd-node-id">
+        <div class="modal-row">
+            <label>operator_id (your identity)</label>
+            <input id="rd-operator" class="form-input" oninput="onRemoveDeadInput()" placeholder="alice / ticket-123 / on-call">
+        </div>
+        <div class="modal-row">
+            <label>reason</label>
+            <input id="rd-reason" class="form-input" oninput="onRemoveDeadInput()" placeholder="e.g. host destroyed, disks lost">
+        </div>
+        <div id="rd-plan" style="display:none;margin:.6rem 0;font-size:.82rem"></div>
+        <div id="rd-loss-row" class="modal-row" style="display:none">
+            <label><input type="checkbox" id="rd-accept-loss" onchange="onRemoveDeadInput()">
+                I accept permanent data loss for the chunks listed above (affected files move to /.dtfs-lost)</label>
+        </div>
+        <div class="modal-actions">
+            <button class="btn-secondary" onclick="closeRemoveDead()">Cancel</button>
+            <button class="btn-secondary" onclick="previewRemoveDead()" id="rd-preview" disabled>Preview plan</button>
+            <button class="btn-primary" style="background:#b91c1c" onclick="submitRemoveDead()" id="rd-submit" disabled>Remove node</button>
+        </div>
+        <div id="rd-result" class="modal-result" style="display:none"></div>
+    </div>
+</div>
+
 <div class="footer">
     DTFS — Distributed Tiered Filesystem &nbsp;·&nbsp;
     <a href="/api/v1/cluster/status" style="color:var(--primary)">API</a> &nbsp;·&nbsp;
@@ -864,7 +896,10 @@
     // quote of the JS literal and let the argument run into code.
     function escArg(v) {
         return esc(String(v === null || v === undefined ? '' : v)
-            .replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
+            .replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+            // a raw line break inside a JS string literal is a syntax error
+            .replace(/\n/g, '\\n').replace(/\r/g, '\\r')
+            .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029'));
     }
 
     function fmtBytes(b) {
@@ -880,11 +915,6 @@
         const u = ['B/s','KB/s','MB/s','GB/s','TB/s'];
         const i = Math.min(Math.floor(Math.log(b) / Math.log(1024)), u.length - 1);
         return { val: (b / Math.pow(1024, i)).toFixed(1), unit: u[i] };
-    }
-
-    function fmtPct(used, total) {
-        if (!total) return '—';
-        return Math.round(used / total * 100) + '%';
     }
 
     function barColor(pct) {
@@ -1000,18 +1030,29 @@
      * { resp, text, json, authError }. Body is consumed once.
      */
     async function mutateFetch(url, options) {
-        if (!getSharedSecret()) {
-            promptSharedSecret('Mutating API call needs the cluster shared_secret.');
+        const send = async () => {
+            const opts = Object.assign({}, options || {});
+            opts.method = opts.method || 'POST';
+            opts.headers = authHeaders(opts.headers);
+            const resp = await fetch(url, opts);
+            const text = await resp.text();
+            let json = null;
+            try { json = text ? JSON.parse(text) : null; } catch (_) {}
+            return { resp, text, json };
+        };
+        let r = await send();
+        // Prompt only after a 401: a cluster without shared_secret accepts
+        // unauthenticated mutations. Retry once with the entered secret.
+        if (r.resp.status === 401) {
+            const before = getSharedSecret();
+            const after = promptSharedSecret('The cluster requires its shared_secret for this change.');
+            if (after && after !== before) r = await send();
         }
-        const opts = Object.assign({}, options || {});
-        opts.method = opts.method || 'POST';
-        opts.headers = authHeaders(opts.headers);
-        const resp = await fetch(url, opts);
-        const text = await resp.text();
-        let json = null;
-        try { json = text ? JSON.parse(text) : null; } catch (_) {}
-        const authError = formatAuthError(resp.status, text, json);
-        return { resp, text, json, authError };
+        // authError also carries the leader hint, so every caller that
+        // prefers authError shows it.
+        const authError = formatAuthError(r.resp.status, r.text, r.json)
+            || leaderErrorMsg(r.resp.status, r.json);
+        return { resp: r.resp, text: r.text, json: r.json, authError };
     }
 
     function fmtDuration(secs) {
@@ -1029,12 +1070,72 @@
         return Math.floor(s / 86400) + 'd ago';
     }
 
-    function healthClass(h) {
-        const m = (h || '').toLowerCase();
-        if (m === 'healthy') return 'healthy';
-        if (['suspect','degraded'].includes(m)) return 'degraded';
-        if (['down','failed'].includes(m)) return 'danger';
-        return '';
+    // Map any server health string to the banner/dot CSS classes
+    // (.healthy/.degraded/.critical/.unknown). /stats emits exactly
+    // healthy|degraded|critical|unknown; node states map by severity.
+    function healthCssClass(h) {
+        const m = String(h || '').toLowerCase();
+        if (m === 'healthy' || m === 'ok') return 'healthy';
+        if (m === 'degraded' || m === 'suspect') return 'degraded';
+        if (m === 'critical' || m === 'down' || m === 'failed' || m === 'quarantined') return 'critical';
+        return 'unknown';
+    }
+
+    /** GET JSON; rejects on !ok with `HTTP <status>: <server error>` (never resolves to empty on failure). */
+    async function getJSON(url) {
+        // timeout: a hung manager must read as a failure, not freeze the poll
+        const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+        const text = await r.text();
+        let j = null;
+        try { j = text ? JSON.parse(text) : null; } catch (_) {}
+        if (!r.ok) {
+            const d = (j && j.error) ? j.error
+                : (text && text.length < 200 && text.indexOf('<') === -1 ? text : '');
+            const e = new Error('HTTP ' + r.status + (d ? ': ' + d : ''));
+            e.status = r.status;
+            throw e;
+        }
+        if (j === null) throw new Error('HTTP ' + r.status + ': empty or non-JSON response');
+        return j;
+    }
+
+    /** Visible load-failure copy, distinct from every empty-state text. */
+    function loadErrText(what, e) {
+        return 'Could not load ' + what + ' (' + ((e && e.message) || e) + '). Retrying.';
+    }
+    function loadErrRow(cols, what, e) {
+        return '<tr><td colspan="' + cols + '" class="placeholder load-error" style="color:var(--danger)">'
+            + esc(loadErrText(what, e)) + '</td></tr>';
+    }
+    function loadErrBlock(what, e) {
+        return '<div class="placeholder load-error" style="color:var(--danger)">' + esc(loadErrText(what, e)) + '</div>';
+    }
+
+    /** One message for any failed mutateFetch result; never raw JSON or "null". */
+    function errMsg(r, fallback) {
+        if (r.authError) return r.authError;
+        const j = r.json;
+        let d = j && (j.error || j.message);
+        if (d && typeof d !== 'string') d = JSON.stringify(d);
+        if (!d && r.text && r.text.length < 300 && r.text.indexOf('<') === -1) d = r.text;
+        return (fallback ? fallback + ' ' : '') + 'Error ' + r.resp.status + (d ? ': ' + d : '');
+    }
+
+    /** Leader hint for 409 {leader} and 503 "has to forward request to ... hostname" replies. */
+    function leaderErrorMsg(status, json) {
+        let host = null, addr = null;
+        if (status === 409 && json && json.leader) {
+            host = json.leader.leader_hostname; addr = json.leader.leader_addr;
+        } else if (status === 503 && json && typeof json.error === 'string'
+                   && json.error.indexOf('forward request to') !== -1) {
+            const m = /addr: "([^"]+)", hostname: "([^"]+)"/.exec(json.error);
+            if (m) { addr = m[1]; host = m[2]; }
+        } else if (status === 409 && json && 'leader' in json) {
+            return 'Not the leader and no leader is known (quorum may be lost). Retry in a few seconds.';
+        } else { return null; }
+        if (!host) return 'Not the leader. Open the dashboard on the leader manager.';
+        // addr is the manager's Raft/gRPC address; the REST address is not published.
+        return 'Not the leader. Open the dashboard on ' + host + ' (' + addr + ').';
     }
 
     // ── Stats fetch ──────────────────────────────────────────────────────────
@@ -1051,39 +1152,70 @@
         el.textContent = 'manager: ' + status;
     }
 
-    async function fetchStats() {
-        const [stats, nodes, migrations, cluster, health] = await Promise.all([
-            fetch('/api/v1/stats').then(r => r.json()).catch(() => null),
-            fetch('/api/v1/nodes').then(r => r.json()).catch(() => []),
-            fetch('/api/v1/migrations').then(r => r.json()).catch(() => ({count:0,tasks:[]})),
-            fetch('/api/v1/cluster/status').then(r => r.json()).catch(() => null),
-            fetch('/api/v1/health').then(r => r.json()).catch(() => null),
-        ]);
+    // Global header/banner state. Updated by ONE poll (refreshGlobal) that
+    // runs on every page, plus Home's own fetchStats.
+    let lastStatsAt = 0;
+    function updateBanner(stats, err) {
+        const rt = document.getElementById('refresh-time');
+        if (stats) {
+            lastStatsAt = Date.now();
+            if (rt) rt.textContent = 'Updated ' + new Date(lastStatsAt).toLocaleTimeString();
+            // count managers + data only (infra_*); clients are
+            // consumers and must not drag the ratio. Fall back to the legacy
+            // all-node fields if an older manager hasn't shipped infra_*.
+            const h = healthCssClass(stats.health);
+            const healthy = stats.infra_healthy ?? stats.healthy_nodes;
+            const total   = stats.infra_total   ?? stats.total_nodes;
+            const detail = (healthy === undefined || total === undefined) ? ''
+                : healthy + '/' + total + ' nodes healthy';
+            const right = 'Config v' + (stats.config_version || 0) +
+                          ' · ' + (stats.file_count || 0) + ' files';
+            setHealthBanner(h, String(stats.health || 'unknown').toUpperCase(), detail, right);
+        } else {
+            if (rt) rt.textContent = lastStatsAt
+                ? 'Last good update ' + new Date(lastStatsAt).toLocaleTimeString()
+                : 'No successful update yet';
+            setHealthBanner('unknown', 'UNREACHABLE', loadErrText('cluster status', err),
+                lastStatsAt ? 'Numbers shown may be stale' : '');
+        }
+    }
 
-        document.getElementById('refresh-time').textContent =
-            'Updated ' + new Date().toLocaleTimeString();
-        setManagerHealth(health);
+    // One poll for banner + header + manager indicator, independent of the
+    // page timer, so every page shows live health (not only Home).
+    async function refreshGlobal() {
+        const [sr, hr] = await Promise.allSettled([
+            getJSON('/api/v1/stats'),
+            fetch('/api/v1/health', { signal: AbortSignal.timeout(10000) }).then(r => r.ok ? r.json() : null),
+        ]);
+        setManagerHealth(hr.status === 'fulfilled' ? hr.value : null);
+        if (sr.status === 'fulfilled') updateBanner(sr.value, null);
+        else updateBanner(null, sr.reason);
+    }
+
+    async function fetchStats() {
+        const settle = p => p.then(v => ({ v }), e => ({ e }));
+        const [sR, nR, mR, cR, hR] = await Promise.all([
+            settle(getJSON('/api/v1/stats')),
+            settle(getJSON('/api/v1/nodes')),
+            settle(getJSON('/api/v1/migrations')),
+            settle(getJSON('/api/v1/cluster/status')),
+            fetch('/api/v1/health', { signal: AbortSignal.timeout(10000) }).then(r => r.ok ? r.json() : null).catch(() => null),
+        ]);
+        const stats = sR.v, migrations = mR.v || null, cluster = cR.v || null;
+        setManagerHealth(hR);
+        updateBanner(stats || null, sR.e);
 
         if (!stats) {
-            setHealthBanner('unknown', 'Unknown', 'Could not reach API', '');
-            renderProductionSignals(null, null, null);
+            // Keep the last rendered numbers on screen; they are marked stale
+            // by the UNREACHABLE banner and header.
+            if (!document.querySelector('#signal-strip .signal-chip'))
+                renderProductionSignals(null, null, null, sR.e);
+            renderNodes(nR.v, nR.e);
             return;
         }
 
-        // ── Health banner
-        const h = stats.health || 'unknown';
-        // count managers + data only (infra_*); clients are
-        // consumers and must not drag the ratio. Fall back to the legacy
-        // all-node fields if an older manager hasn't shipped infra_*.
-        const infraHealthy = stats.infra_healthy ?? stats.healthy_nodes;
-        const infraTotal   = stats.infra_total   ?? stats.total_nodes;
-        const detail = infraHealthy + '/' + infraTotal + ' nodes healthy';
-        const right = 'Config v' + (stats.config_version || 0) +
-                      ' · ' + (stats.file_count || 0) + ' files';
-        setHealthBanner(h, h.toUpperCase(), detail, right);
-
         // ── Production signals (anchor / integrity / migrations)
-        renderProductionSignals(stats, migrations, cluster);
+        renderProductionSignals(stats, migrations, cluster, mR.e);
 
         // ── Count cards
         document.getElementById('cnt-managers').textContent  = stats.manager_count   ?? '0';
@@ -1152,16 +1284,17 @@
         renderScrub(stats.scrub_results_by_node || []);
 
         // ── Nodes table
-        renderNodes(nodes);
+        renderNodes(nR.v, nR.e);
     }
 
     // Home strip: surface production lies from real API fields only.
     // Clicking a chip navigates to the page that owns the drill-down.
-    function renderProductionSignals(stats, migrations, cluster) {
+    // err: the stats error when stats is null, else the migrations error.
+    function renderProductionSignals(stats, migrations, cluster, err) {
         const el = document.getElementById('signal-strip');
         if (!el) return;
         if (!stats) {
-            el.innerHTML = '<div class="placeholder">Signals unavailable (stats fetch failed).</div>';
+            el.innerHTML = loadErrBlock('signals', err);
             return;
         }
         const tasks = (migrations && migrations.tasks) || [];
@@ -1180,7 +1313,7 @@
                 lbl: 'Anchor pending',
                 hint: 'Files missing mandatory anchor copy',
                 sev: (stats.anchor_pending || 0) > 0 ? 'warn' : 'ok',
-                href: '/ui/volumes',
+                href: null, // no drill-down page exists for anchor-pending files
             },
             {
                 id: 'sig-missing-files',
@@ -1202,10 +1335,10 @@
             },
             {
                 id: 'sig-mig-failed',
-                val: failedMig,
+                val: err ? '—' : failedMig,
                 lbl: 'Migrations failed',
-                hint: activeMig ? (activeMig + ' in flight') : 'Exhausted retries',
-                sev: failedMig > 0 ? 'danger' : 'ok',
+                hint: err ? 'migrations unavailable' : (activeMig ? (activeMig + ' in flight') : 'Exhausted retries'),
+                sev: !err && failedMig > 0 ? 'danger' : 'ok',
                 href: '/ui/migrations',
             },
             {
@@ -1214,7 +1347,7 @@
                 lbl: 'Undergoal chunks',
                 hint: 'Below volume replica goal',
                 sev: (cp.undergoal || 0) > 0 ? 'warn' : 'ok',
-                href: '/ui/',
+                href: null, // repair is automatic; no page lists these chunks
             },
             {
                 id: 'sig-missing-chunks',
@@ -1222,16 +1355,16 @@
                 lbl: 'Missing chunks',
                 hint: 'Placement state: missing',
                 sev: (cp.missing || 0) > 0 ? 'danger' : 'ok',
-                href: '/ui/',
+                href: '/ui/integrity',
             },
         ];
         el.innerHTML = chips.map(c => `
-            <button type="button" class="signal-chip ${c.sev}" id="${c.id}"
-                    title="${c.hint}" onclick="navigate('${c.href}')">
+            <${c.href ? 'button type="button"' : 'div style="cursor:default"'} class="signal-chip ${c.sev}" id="${c.id}"
+                    title="${c.hint}"${c.href ? ` onclick="navigate('${c.href}')"` : ''}>
                 <div class="signal-val">${c.val}</div>
                 <div class="signal-lbl">${c.lbl}</div>
                 <div class="signal-hint">${c.hint}</div>
-            </button>`).join('');
+            </${c.href ? 'button' : 'div'}>`).join('');
     }
 
     // render the chunk placement-state distribution
@@ -1356,8 +1489,10 @@
                 'Use "Scrub all" above to trigger one.</div>';
             return;
         }
+        // node_id is a decimal string (u64 > 2^53): compare by length, then lexically.
+        const idCmp = (x, y) => (String(x).length - String(y).length) || String(x).localeCompare(String(y));
         const sorted = [...list].sort((a, b) =>
-            (a.node_id - b.node_id) || String(a.level).localeCompare(String(b.level)));
+            idCmp(a.node_id, b.node_id) || String(a.level).localeCompare(String(b.level)));
         el.innerHTML = sorted.map(renderScrubCard).join('');
     }
 
@@ -1373,13 +1508,12 @@
         result.className = '';
         result.textContent = 'Starting scrub…';
         try {
-            const { resp, json, authError } = await mutateFetch(
+            const { resp, text, json, authError } = await mutateFetch(
                 '/api/v1/scrub',
                 { body: JSON.stringify({ target: '*', target_type: 'all', level }) }
             );
             if (!resp.ok) {
-                result.textContent = authError
-                    || ('Error ' + resp.status + ': ' + ((json && json.error) || JSON.stringify(json)));
+                result.textContent = errMsg({ resp, text, json, authError });
             } else {
                 result.textContent = 'Scrub ' + (json && json.status || 'started')
                     + ' (level: ' + (json && json.level || level) + ')';
@@ -1412,8 +1546,14 @@
         });
     }
 
-    function renderNodes(nodes) {
+    function renderNodes(nodes, err) {
         const tbody = document.getElementById('nodes-table');
+        if (!tbody) return;
+        if (err) {
+            tbody.innerHTML = loadErrRow(10, 'nodes', err);
+            document.getElementById('nodes-summary').textContent = '';
+            return;
+        }
         if (!nodes || nodes.length === 0) {
             tbody.innerHTML = '<tr><td colspan="10" class="placeholder">No nodes registered yet.</td></tr>';
             document.getElementById('nodes-summary').textContent = '';
@@ -1525,8 +1665,8 @@
     // Integrity feed page. Lists every integrity-related
     // audit row (quarantine, unquarantine, scrub faults, read mismatch,
     // orphan in-state-missing). Polls every 5s while the page is open.
-    let _integrityTimer = null;
     async function renderIntegrityFeed() {
+        const gen = routeGen;
         document.getElementById('page-content').innerHTML = `
             <div class="page-header">
                 <h2>Integrity</h2>
@@ -1548,10 +1688,18 @@
                 <tbody id="integrity-body"><tr><td colspan="5" class="placeholder">Fetching…</td></tr></tbody>
             </table></div>`;
         const tick = async () => {
-            const rows = await fetch('/api/v1/integrity/faults?limit=200')
-                .then(r => r.json()).catch(() => []);
+            let rows;
+            try { rows = await getJSON('/api/v1/integrity/faults?limit=200'); }
+            catch (e) {
+                const b = document.getElementById('integrity-body');
+                const sm = document.getElementById('integrity-summary');
+                if (b) b.innerHTML = loadErrRow(5, 'integrity events', e);
+                if (sm) sm.textContent = 'Integrity status unknown';
+                return;
+            }
             const body = document.getElementById('integrity-body');
             const sum  = document.getElementById('integrity-summary');
+            if (!body || !sum) return; // navigated away mid-fetch
             if (!rows.length) {
                 body.innerHTML = '<tr><td colspan="5" class="placeholder">No integrity events. Cluster is clean.</td></tr>';
                 sum.textContent = '0 events';
@@ -1574,8 +1722,7 @@
             }).join('');
         };
         await tick();
-        if (refreshTimer) { clearInterval(refreshTimer); }
-        refreshTimer = setInterval(tick, 5000);
+        setPageTimer(tick, 5000, gen);
     }
 
     function toggleNavGroup(ev, name) {
@@ -1595,6 +1742,15 @@
     window.toggleNavGroup = toggleNavGroup;
 
     let refreshTimer = null;
+    // Bumped on every route change. A renderer captures it before its first
+    // await and starts its page timer through setPageTimer, so a navigation
+    // during the await cannot leak an interval.
+    let routeGen = 0;
+    function setPageTimer(fn, ms, gen) {
+        if (gen !== routeGen) return;
+        if (refreshTimer) clearInterval(refreshTimer);
+        refreshTimer = setInterval(fn, ms);
+    }
 
     function navigate(path) {
         history.pushState({}, '', path);
@@ -1619,6 +1775,7 @@
             g.classList.remove('open');
         });
 
+        routeGen++;
         // Clear existing auto-refresh
         if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
 
@@ -1639,6 +1796,7 @@
     // ── Home page ─────────────────────────────────────────────────────────────
 
     function renderHome() {
+        const gen = routeGen;
         document.getElementById('page-content').innerHTML = `
         <div class="section-title">Production signals</div>
         <div class="signal-strip" id="signal-strip">
@@ -1773,12 +1931,13 @@
             <tbody id="nodes-table"><tr><td colspan="10" class="placeholder">Fetching node list…</td></tr></tbody></table>
         </div>`;
         fetchStats();
-        refreshTimer = setInterval(fetchStats, 8000);
+        setPageTimer(fetchStats, 8000, gen);
     }
 
     // ── Topology page ─────────────────────────────────────────────────────────
 
     async function renderTopology() {
+        const gen = routeGen;
         document.getElementById('page-content').innerHTML =
             '<div class="page-header"><h2>Topology</h2><p class="page-desc">Region → DC → Rack → Host hierarchy</p></div>' +
             '<div id="topo-tree" class="topo-root"><div class="placeholder">Loading topology…</div></div>';
@@ -1789,13 +1948,19 @@
         // 15s, blowing away scroll position and any user interaction
         // state. Also: that previous self-call set a NEW setInterval
         // without clearing the old one, so timers stacked up over time.
-        refreshTimer = setInterval(refreshTopology, 15000);
+        setPageTimer(refreshTopology, 15000, gen);
     }
 
     async function refreshTopology() {
         const topo = document.getElementById('topo-tree');
         if (!topo) return; // user navigated away mid-fetch
-        const nodes = await fetch('/api/v1/nodes').then(r => r.json()).catch(() => []);
+        let nodes;
+        try { nodes = await getJSON('/api/v1/nodes'); }
+        catch (e) {
+            const t = document.getElementById('topo-tree');
+            if (t) t.innerHTML = loadErrBlock('topology', e);
+            return;
+        }
         if (!document.getElementById('topo-tree')) return; // checked again after await
 
         // Group nodes: region → dc → rack → [nodes]
@@ -1877,17 +2042,21 @@
     // ── Nodes list page ────────────────────────────────────────────────────────
 
     async function renderNodesList() {
+        const gen = routeGen;
         document.getElementById('page-content').innerHTML =
             '<div class="page-header"><h2>Nodes</h2><p class="page-desc">All cluster nodes with disk detail</p></div>' +
             '<div id="nodes-detail-list"><div class="placeholder">Loading…</div></div>';
         await refreshNodesList();
-        refreshTimer = setInterval(refreshNodesList, 10000);
+        setPageTimer(refreshNodesList, 10000, gen);
     }
 
     async function refreshNodesList() {
-        const nodes = await fetch('/api/v1/nodes').then(r => r.json()).catch(() => []);
+        let nodes;
+        let loadErr = null;
+        try { nodes = await getJSON('/api/v1/nodes'); } catch (e) { loadErr = e; }
         const el = document.getElementById('nodes-detail-list');
         if (!el) return;
+        if (loadErr) { el.innerHTML = loadErrBlock('nodes', loadErr); return; }
         if (!nodes || nodes.length === 0) {
             el.innerHTML = '<div class="placeholder">No nodes registered.</div>';
             return;
@@ -2043,7 +2212,9 @@
                     <div style="display:flex;gap:.5rem;align-items:center">
                         ${quarBadge}
                         ${isQuarantined ? '' : `<span class="badge badge-${esc(h)}">${esc(n.health||'unknown')}</span>`}
-                        ${isStorageRole ? `<button class="btn-maint" onclick="toggleMaintenance('${escArg(n.node_id)}', ${!isMaintenance})">
+                        ${isStorageRole && (h === 'down' || h === 'failed') ? `<button class="btn-maint" style="color:var(--danger)" title="Dead node: drop its replica rows (preview first)"
+                            onclick="openRemoveDead('${escArg(n.node_id)}','${escArg(n.hostname||'')}')">Remove dead…</button>` : ''}
+                        ${isStorageRole ? `<button class="btn-maint" onclick="toggleMaintenance('${escArg(n.node_id)}', ${!isMaintenance}, '${escArg(n.hostname||'')}')">
                             ${isMaintenance ? 'Exit Maintenance' : 'Set Maintenance'}
                         </button>` : ''}
                         ${isStorageRole ? `<button class="btn-maint" style="color:var(--danger)" title="Remove this node from the cluster registry (refused while it holds replicas)"
@@ -2068,14 +2239,18 @@
         window.scrollTo(0, savedScroll);
     }
 
-    async function toggleMaintenance(nodeId, enable) {
+    async function toggleMaintenance(nodeId, enable, hostname) {
+        const who = hostname || nodeId;
+        if (!window.confirm(enable
+            ? 'Put ' + who + ' into maintenance? It stops serving and receiving chunks until you exit maintenance.'
+            : 'Take ' + who + ' out of maintenance and return it to service?')) return;
         try {
             const { resp, text, json, authError } = await mutateFetch(
                 '/api/v1/nodes/' + nodeId + '/maintenance',
                 { body: JSON.stringify({ enable }) }
             );
             if (!resp.ok) {
-                alert(authError || ((json && json.error) ? json.error : (text || ('HTTP ' + resp.status))));
+                alert(errMsg({ resp, text, json, authError }));
             }
         } catch (e) {
             alert('Maintenance toggle failed: ' + e);
@@ -2126,7 +2301,7 @@
             }, 800);
         } else {
             result.style.color = 'var(--danger)';
-            result.textContent = authError || ('Failed: ' + (text || JSON.stringify(json)));
+            result.textContent = errMsg({ resp, text, json, authError });
         }
     }
     window.openUnquarantineModal = openUnquarantineModal;
@@ -2177,13 +2352,110 @@
             return;
         }
         result.style.color = 'var(--danger)';
-        result.textContent = authError
-            || ((json && json.error) ? json.error : ('Failed (' + resp.status + '): ' + (text || '')));
+        result.textContent = errMsg({ resp, text, json, authError });
     }
     window.openDecommissionModal  = openDecommissionModal;
     window.closeDecommissionModal = closeDecommissionModal;
     window.onDecommissionInput    = onDecommissionInput;
     window.submitDecommission     = submitDecommission;
+
+    // ── Remove dead node (POST /nodes/{id}/remove-dead) ─────────────────────
+    let rdPlan = null; // last dry-run plan; null until previewed
+    function openRemoveDead(nodeId, hostname) {
+        rdPlan = null;
+        document.getElementById('rd-node-id').value = nodeId;
+        document.getElementById('rd-hostname').textContent = hostname;
+        document.getElementById('rd-operator').value = '';
+        document.getElementById('rd-reason').value = '';
+        document.getElementById('rd-accept-loss').checked = false;
+        document.getElementById('rd-loss-row').style.display = 'none';
+        document.getElementById('rd-plan').style.display = 'none';
+        document.getElementById('rd-result').style.display = 'none';
+        onRemoveDeadInput();
+        document.getElementById('removedead-modal').classList.remove('hidden');
+    }
+    function closeRemoveDead() {
+        document.getElementById('removedead-modal').classList.add('hidden');
+    }
+    function onRemoveDeadInput() {
+        const op = document.getElementById('rd-operator').value.trim();
+        const reason = document.getElementById('rd-reason').value.trim();
+        const loss = rdPlan && rdPlan.data_loss_candidates > 0;
+        document.getElementById('rd-preview').disabled = !op;
+        document.getElementById('rd-submit').disabled = !(rdPlan && op && reason
+            && (!loss || document.getElementById('rd-accept-loss').checked));
+    }
+    async function callRemoveDead(dryRun) {
+        return mutateFetch('/api/v1/nodes/' + document.getElementById('rd-node-id').value + '/remove-dead', {
+            body: JSON.stringify({
+                operator_id: document.getElementById('rd-operator').value.trim(),
+                reason: document.getElementById('rd-reason').value.trim(),
+                accept_data_loss: !dryRun && document.getElementById('rd-accept-loss').checked,
+                dry_run: dryRun,
+            }),
+        });
+    }
+    async function previewRemoveDead() {
+        const result = document.getElementById('rd-result');
+        result.style.display = 'block';
+        result.style.color = 'var(--text-muted)';
+        result.textContent = 'Computing plan…';
+        const r = await callRemoveDead(true);
+        if (!r.resp.ok) {
+            rdPlan = null;
+            result.style.color = 'var(--danger)';
+            result.textContent = errMsg(r);
+            onRemoveDeadInput();
+            return;
+        }
+        rdPlan = r.json;
+        result.style.display = 'none';
+        const list = (a) => (a && a.length)
+            ? '<ul style="margin:.2rem 0 0 1.2rem;font-family:monospace;font-size:.75rem">'
+              + a.map(x => '<li>' + esc(x) + '</li>').join('') + '</ul>' : '';
+        const sm = rdPlan.sample || {};
+        const loss = rdPlan.data_loss_candidates > 0;
+        const el = document.getElementById('rd-plan');
+        el.style.display = 'block';
+        el.innerHTML =
+            '<div><b>' + esc(rdPlan.removable) + '</b> replica row(s) can be dropped safely (another live copy exists).'
+            + list(sm.removable) + '</div>'
+            + '<div style="margin-top:.4rem"><b>' + esc(rdPlan.anchor_pending) + '</b> row(s) kept until the anchor copy is restored.'
+            + list(sm.anchor_pending) + '</div>'
+            + '<div style="margin-top:.4rem;color:' + (loss ? 'var(--danger)' : 'inherit') + '"><b>' + esc(rdPlan.data_loss_candidates)
+            + '</b> chunk(s) have NO other live replica: removing the node loses their data.'
+            + list(sm.data_loss) + (rdPlan.data_loss_candidates > 5 ? '<div>… and more</div>' : '') + '</div>';
+        document.getElementById('rd-loss-row').style.display = loss ? 'block' : 'none';
+        document.getElementById('rd-accept-loss').checked = false;
+        onRemoveDeadInput();
+    }
+    async function submitRemoveDead() {
+        const result = document.getElementById('rd-result');
+        result.style.display = 'block';
+        result.style.color = 'var(--text-muted)';
+        result.textContent = 'Removing…';
+        document.getElementById('rd-submit').disabled = true;
+        const r = await callRemoveDead(false);
+        if (!r.resp.ok) {
+            result.style.color = 'var(--danger)';
+            result.textContent = errMsg(r);
+            onRemoveDeadInput();
+            return;
+        }
+        const j = r.json || {};
+        const bad = (j.failed || 0) > 0 || (j.remaining_rows || 0) > 0;
+        result.style.color = bad ? 'var(--warning)' : 'var(--success)';
+        result.textContent = 'Removed ' + (j.removed ?? 0) + ' row(s), ' + (j.data_loss_removed ?? 0)
+            + ' with data loss; failed ' + (j.failed ?? 0) + ', rows remaining ' + (j.remaining_rows ?? 0)
+            + (j.deregistered ? '; node deregistered.' : '; node NOT deregistered yet.')
+            + (j.deregister_error ? ' (' + j.deregister_error + ')' : '');
+        await refreshNodesList();
+    }
+    window.openRemoveDead = openRemoveDead;
+    window.closeRemoveDead = closeRemoveDead;
+    window.onRemoveDeadInput = onRemoveDeadInput;
+    window.previewRemoveDead = previewRemoveDead;
+    window.submitRemoveDead = submitRemoveDead;
 
     // ── Volumes page ──────────────────────────────────────────────────────────
 
@@ -2292,7 +2564,13 @@
                 '<button class="btn-secondary" onclick="openCreateVolume()">+ New volume</button>' +
             '</div>' +
             '<div id="volumes-list"><div class="placeholder">Loading…</div></div>';
-        const data = await fetch('/api/v1/volumes').then(r => r.json()).catch(() => ({count:0, volumes:[]}));
+        let data;
+        try { data = await getJSON('/api/v1/volumes'); }
+        catch (e) {
+            const vl = document.getElementById('volumes-list');
+            if (vl) vl.innerHTML = loadErrBlock('volumes', e);
+            return;
+        }
         window._volumesData = data.volumes || [];
         rerenderVolumesTable();
     }
@@ -2353,7 +2631,7 @@
                 }, 800);
             } else {
                 result.style.color = 'var(--danger)';
-                result.textContent = authError || ('Failed: ' + (text || JSON.stringify(json)));
+                result.textContent = errMsg({ resp, text, json, authError });
             }
         } catch (e) {
             result.style.color = 'var(--danger)';
@@ -2394,6 +2672,7 @@
             // prefill anchor.
             const an = v.anchor || {};
             document.getElementById('ve-anchor-dc').value = an.datacenter || '';
+            document.getElementById('ve-anchor-dc').dataset.orig = an.datacenter || '';
             document.getElementById('ve-anchor-force').checked = false;
             document.getElementById('ve-anchor-tier').value = an.required_tier || '';
             // prefill spill policy.
@@ -2407,6 +2686,11 @@
             document.getElementById('ve-spill-forbid-tape').checked = ft.includes('tape');
             document.getElementById('ve-spill-forbid-dcs').value =
                 (sp.forbidden_datacenters || []).join(', ');
+            // prefill signature: set-spill is posted whenever the form differs from it
+            // (including clearing every forbid, which sends empty lists).
+            document.getElementById('ve-spill-allow').dataset.orig = JSON.stringify([
+                document.getElementById('ve-spill-allow').value, [...ft].sort().join(','),
+                (sp.forbidden_datacenters || []).join(',')]);
             // prefill write safety; remember the prefilled strings so
             // submit only posts a field the operator actually edited
             // (never silently reasserts/resets an untouched value).
@@ -2468,6 +2752,8 @@
         const rt = document.getElementById('ve-anchor-tier').value.trim();
         const anchorBody = {};
         if (dc !== '') anchorBody.datacenter = dc;
+        // Clearing a previously set anchor DC must send an explicit empty string (server clears on empty).
+        else if ((document.getElementById('ve-anchor-dc').dataset.orig || '') !== '') anchorBody.datacenter = '';
         if (document.getElementById('ve-anchor-force').checked) anchorBody.force = true;
         if (rt !== '') anchorBody.required_tier = rt;
         // spill policy body.
@@ -2505,13 +2791,12 @@
         // surfaces its own server-side validation error (BM-3 tape, anchor).
         const post = async (suffix, body) => {
             try {
-                const { resp, json, authError } = await mutateFetch(
+                const { resp, text, json, authError } = await mutateFetch(
                     `/api/v1/volumes/${encodeURIComponent(vid)}/${suffix}`,
                     { body: JSON.stringify(body) }
                 );
                 if (!resp.ok) {
-                    return `${suffix}: ` + (authError
-                        || (`Error ${resp.status}: ${(json && json.error) || JSON.stringify(json)}`));
+                    return `${suffix}: ` + errMsg({ resp, text, json, authError });
                 }
                 return `${suffix}: ${json && json.changed ? 'updated' : 'no change'}`;
             } catch (e) {
@@ -2528,8 +2813,9 @@
         if (Object.keys(anchorBody).length > 0) {
             lines.push(await post('set-anchor', anchorBody));
         }
-        // post spill policy when the operator set anything.
-        if (spillBody.allow !== null || forbidTiers.length > 0 || forbidDcs.length > 0) {
+        // post spill policy when the form differs from the prefill.
+        const spillSig = JSON.stringify([spillAllow, [...forbidTiers].sort().join(','), forbidDcs.join(',')]);
+        if (spillSig !== document.getElementById('ve-spill-allow').dataset.orig) {
             lines.push(await post('set-spill', spillBody));
         }
         if (Object.keys(writeSafetyBody).length > 0) {
@@ -2555,14 +2841,13 @@
         result.textContent = 'Migrating…';
 
         try {
-            const { resp, json, authError } = await mutateFetch(
+            const { resp, text, json, authError } = await mutateFetch(
                 `/api/v1/volumes/${encodeURIComponent(vid)}/migrate-policy`,
                 {}
             );
             if (!resp.ok) {
                 result.className = 'modal-result error';
-                result.textContent = authError
-                    || ('Error ' + resp.status + ': ' + ((json && json.error) || JSON.stringify(json)));
+                result.textContent = errMsg({ resp, text, json, authError });
             } else {
                 result.className = 'modal-result success';
                 result.textContent = json && json.changed
@@ -2620,8 +2905,12 @@
             <div id="explorer-ctxmenu" class="ctxmenu" style="display:none"></div>`;
         document.getElementById('explorer-filter').addEventListener('input', () => renderExplorerCwd());
         // Hide the context menu on any outside click / Escape.
-        document.addEventListener('click', hideCtxMenu);
-        document.addEventListener('keydown', e => { if (e.key === 'Escape') hideCtxMenu(); });
+        // Registered once for the page lifetime (hideCtxMenu tolerates a missing menu).
+        if (!window._explorerDocListeners) {
+            window._explorerDocListeners = true;
+            document.addEventListener('click', hideCtxMenu);
+            document.addEventListener('keydown', e => { if (e.key === 'Escape') hideCtxMenu(); });
+        }
         explorerCwd = '/';
         window.explorerCwd = '/';
         await loadExplorer();
@@ -2632,7 +2921,14 @@
         // Page through the listing; the server caps each response.
         let all = [];
         for (let offset = 0; ; ) {
-            const data = await fetch('/api/v1/files?limit=10000&offset=' + offset).then(r => r.json()).catch(() => null);
+            let data;
+            try { data = await getJSON('/api/v1/files?limit=10000&offset=' + offset); }
+            catch (e) {
+                // A partial listing would look like missing files; show the error instead.
+                const el = document.getElementById('explorer-list');
+                if (el) el.innerHTML = loadErrBlock('files', e);
+                return;
+            }
             if (!data || !data.files || !data.files.length) break;
             all = all.concat(data.files);
             offset += data.files.length;
@@ -2786,7 +3082,9 @@
     async function openMigrate(prefix) {
         // Populate the DC picker from the live node list so the user only sees
         // datacenters that actually exist.
-        const nodes = await fetch('/api/v1/nodes').then(r => r.json()).catch(() => []);
+        let nodes = [];
+        try { nodes = await getJSON('/api/v1/nodes'); }
+        catch (e) { console.warn('openMigrate: node list unavailable', e); }
         const dcs = Array.from(new Set(nodes
             .map(n => (n.location || '').split('/')[1])
             .filter(Boolean)
@@ -2798,7 +3096,7 @@
         document.getElementById('m-path').value = prefix || '';
         document.getElementById('m-result').style.display = 'none';
         document.getElementById('m-result').textContent = '';
-        document.getElementById('m-empty-row').style.display = (prefix === '') ? 'block' : 'none';
+        document.getElementById('m-empty-row').style.display = (prefix === '' || prefix === '/') ? 'block' : 'none';
         document.getElementById('m-allow-empty').checked = false;
         document.getElementById('m-submit').disabled = false;
         document.getElementById('migrate-modal').classList.remove('hidden');
@@ -2830,14 +3128,13 @@
         if (dcRaw) body.target_dc = dcRaw;
 
         try {
-            const { resp, json, authError } = await mutateFetch('/api/v1/migrations', {
+            const { resp, text, json, authError } = await mutateFetch('/api/v1/migrations', {
                 body: JSON.stringify(body),
             });
             const data = json || {};
             if (!resp.ok) {
                 result.className = 'modal-result error';
-                result.textContent = authError
-                    || ((data && data.error) ? data.error : ('HTTP ' + resp.status));
+                result.textContent = errMsg({ resp, text, json, authError });
                 submitBtn.disabled = false;
                 return;
             }
@@ -2904,14 +3201,13 @@
         };
 
         try {
-            const { resp, json, authError } = await mutateFetch('/api/v1/files/flush_cache', {
+            const { resp, text, json, authError } = await mutateFetch('/api/v1/files/flush_cache', {
                 body: JSON.stringify(body),
             });
             const data = json || {};
             if (!resp.ok) {
                 result.className = 'modal-result error';
-                result.textContent = authError
-                    || ((data && data.error) ? data.error : ('HTTP ' + resp.status));
+                result.textContent = errMsg({ resp, text, json, authError });
                 submitBtn.disabled = false;
                 return;
             }
@@ -2938,6 +3234,7 @@
     // ── Migrations page ──────────────────────────────────────────────────────
 
     async function renderMigrations() {
+        const gen = routeGen;
         document.getElementById('page-content').innerHTML =
             `<div class="page-header">
                 <h2>Migrations</h2>
@@ -2952,13 +3249,20 @@
             </div>
             <div id="migrations-list"><div class="placeholder">Loading…</div></div>`;
         await loadMigrations();
-        refreshTimer = setInterval(loadMigrations, 5000);
+        setPageTimer(loadMigrations, 5000, gen);
     }
 
     async function loadMigrations() {
-        const data = await fetch('/api/v1/migrations').then(r => r.json()).catch(() => ({count:0,tasks:[]}));
+        let data, loadErr = null;
+        try { data = await getJSON('/api/v1/migrations'); } catch (e) { loadErr = e; }
         const el = document.getElementById('migrations-list');
         if (!el) return;
+        if (loadErr) {
+            setHtmlPreserveScroll(el, loadErrBlock('migrations', loadErr));
+            const sm = document.getElementById('mig-summary');
+            if (sm) sm.innerHTML = '';
+            return;
+        }
         const tasks = data.tasks || [];
         const sumEl = document.getElementById('mig-summary');
         if (sumEl) {
@@ -3019,7 +3323,9 @@
 
     // ── Audit Log page ────────────────────────────────────────────────────────
 
+    let auditSeq = 0, auditDebounce = null;
     async function renderAudit() {
+        const gen = routeGen;
         document.getElementById('page-content').innerHTML =
             `<div class="page-header">
                 <h2>Audit Log</h2>
@@ -3036,10 +3342,14 @@
                 <button class="btn-primary" onclick="loadAudit()">Refresh</button>
             </div>
             <div id="audit-list"><div class="placeholder">Loading…</div></div>`;
-        document.getElementById('audit-action-filter').addEventListener('input', () => loadAudit());
+        // debounce keystrokes; loadAudit also drops out-of-order responses
+        document.getElementById('audit-action-filter').addEventListener('input', () => {
+            clearTimeout(auditDebounce);
+            auditDebounce = setTimeout(() => loadAudit(), 300);
+        });
         document.getElementById('audit-limit').addEventListener('change', () => loadAudit());
         await loadAudit();
-        refreshTimer = setInterval(loadAudit, 15000);
+        setPageTimer(loadAudit, 15000, gen);
     }
 
     async function loadAudit() {
@@ -3047,9 +3357,13 @@
         const limit  = document.getElementById('audit-limit')?.value || '50';
         let url = '/api/v1/audit?limit=' + limit;
         if (action) url += '&action=' + encodeURIComponent(action);
-        const entries = await fetch(url).then(r => r.json()).catch(() => []);
+        const seq = ++auditSeq;
+        let entries, loadErr = null;
+        try { entries = await getJSON(url); } catch (e) { loadErr = e; }
+        if (seq !== auditSeq) return; // a newer request superseded this one
         const el = document.getElementById('audit-list');
         if (!el) return;
+        if (loadErr) { el.innerHTML = loadErrBlock('audit log', loadErr); return; }
         if (!entries || entries.length === 0) {
             el.innerHTML = '<div class="placeholder">No audit entries found.</div>';
             return;
@@ -3079,6 +3393,7 @@
     // role/term/leader header plus the full membership (voters and
     // learners with their replication addr). Plain fetch, no secret.
     async function renderRaft() {
+        const gen = routeGen;
         document.getElementById('page-content').innerHTML =
             `<div class="page-header">
                 <h2>Raft</h2>
@@ -3113,7 +3428,7 @@
                 <div id="raft-op-result" class="modal-result" style="display:none;margin-top:.6rem"></div>
             </div>`;
         await loadRaft();
-        refreshTimer = setInterval(loadRaft, 10000);
+        setPageTimer(loadRaft, 10000, gen);
     }
 
     // UIP-2-4 — POST /api/v1/raft/add-learner, /promote, /remove. The
@@ -3128,10 +3443,28 @@
         result.style.color = 'var(--danger)';
         if (!hostname) { result.textContent = 'hostname is required'; return; }
         if (op === 'add-learner' && !addr) { result.textContent = 'addr is required for add-learner'; return; }
-        if (op === 'remove' && !window.confirm('Remove ' + hostname + ' from the raft membership?')) {
-            result.style.display = 'none';
-            return;
+        if (op === 'remove') {
+            // Compute the post-removal voter count and quorum from the last loaded /raft/state.
+            const st = window._raftState || {};
+            const voters = (st.membership || []).filter(m => m.is_voter);
+            const target = (st.membership || []).find(m => m.hostname === hostname);
+            let effect;
+            if (!target) effect = hostname + ' is not in the membership last loaded; voters stay ' + voters.length + '.';
+            else if (!target.is_voter) effect = hostname + ' is a learner; voters stay ' + voters.length
+                + ' (quorum ' + (Math.floor(voters.length / 2) + 1) + ').';
+            else {
+                const n = voters.length - 1;
+                effect = 'Voters after removal: ' + n + ', quorum ' + (Math.floor(n / 2) + 1)
+                    + ' (tolerates ' + (n - (Math.floor(n / 2) + 1)) + ' failure(s)).'
+                    + (n < 3 ? ' WARNING: fewer than 3 voters cannot survive a single manager failure.' : '');
+            }
+            if (!window.confirm('Remove ' + hostname + ' from the raft membership?\n\n' + effect)) {
+                result.style.display = 'none';
+                return;
+            }
         }
+        // The membership endpoints require the secret in the BODY (fail-closed), so ask up front.
+        if (!getSharedSecret()) promptSharedSecret('Raft membership changes need the cluster shared_secret.');
         const body = { hostname: hostname, shared_secret: getSharedSecret() };
         if (op === 'add-learner') body.addr = addr;
         result.style.color = 'var(--text-muted)';
@@ -3147,28 +3480,18 @@
             return;
         }
         result.style.color = 'var(--danger)';
-        if (resp.status === 409 && json && json.leader) {
-            const l = json.leader;
-            result.textContent = 'This manager is not the leader. Leader: '
-                + (l.leader_hostname || '?') + ' (' + (l.leader_addr || '?') + ', id ' + (l.leader_id || '?')
-                + '). Open its web UI and retry there.';
-            return;
-        }
-        if (resp.status === 409) {
-            result.textContent = 'Not the leader and no leader known: ' + ((json && json.error) || text);
-            return;
-        }
-        result.textContent = authError || ('Failed (' + resp.status + '): ' + ((json && json.error) || text || ''));
+        result.textContent = errMsg({ resp, text, json, authError });
     }
     window.raftMembershipOp = raftMembershipOp;
 
     async function loadRaft() {
-        const st = await fetch('/api/v1/raft/state').then(r => r.json()).catch(() => null);
+        let st, stErr = null;
+        try { st = await getJSON('/api/v1/raft/state'); } catch (e) { stErr = e; }
         const stateEl = document.getElementById('raft-state');
         const membersEl = document.getElementById('raft-members');
         if (!stateEl || !membersEl) return;
-        if (!st) {
-            stateEl.innerHTML = '<div class="placeholder">Could not reach /api/v1/raft/state.</div>';
+        if (stErr) {
+            stateEl.innerHTML = loadErrBlock('Raft state', stErr);
             membersEl.innerHTML = '';
             return;
         }
@@ -3214,7 +3537,7 @@
     // ── Config page (AZ-5) ────────────────────────────────────────────────────
     // Raw cluster-config viewer/editor. Every [section.key] from the
     // ManagerConfig is listed with name / current / default; operators
-    // can edit and Apply (stored cluster-wide; takes effect after restart). Validation
+    // can edit and Apply (recorded in Raft only; write_to_disk rewrites this manager's TOML). Validation
     // failures surface inline and the input reverts to the
     // pre-attempt value (AZ-5-A3 boundary fallback).
     window._configRows = [];
@@ -3227,7 +3550,8 @@
             <div class="page-header"><h2>Config</h2>
                 <p class="page-desc">Cluster-wide keys must match across every manager. Node-specific
                 keys (hostname, listen addrs, TLS material) live in the per-host tab. Edit a field
-                and click <b>Apply</b> to store it cluster-wide. Changes take effect after each daemon restarts; <i>write to disk</i> also updates this manager's TOML.</p>
+                and click <b>Apply</b> to record it cluster-wide in Raft. Daemons do not read that record: only <i>write to disk</i>
+                rewrites this manager's TOML, effective after this manager restarts.</p>
             </div>
             <div style="display:flex;gap:.5rem;margin-bottom:.5rem;flex-wrap:wrap;align-items:center">
                 <button id="cfg-tab-cluster" class="btn-secondary"
@@ -3237,14 +3561,19 @@
                 <input id="cfg-filter" type="text" class="form-input" placeholder="Filter by name…" style="max-width:260px"
                        oninput="onConfigFilter(this.value)">
                 <button class="btn-secondary" onclick="renderConfig()">Refresh</button>
-                <button class="btn-primary"   onclick="submitConfigDiff(false)">Apply (store cluster-wide)</button>
-                <button class="btn-primary"   onclick="submitConfigDiff(true)">Apply + write to disk</button>
+                <button class="btn-primary"   onclick="submitConfigDiff(false)">Apply (record only)</button>
+                <button class="btn-primary"   onclick="submitConfigDiff(true)">Apply + write this manager's TOML</button>
                 <span id="cfg-pending-count" style="font-size:.85rem;color:var(--text-muted)"></span>
             </div>
             <div id="cfg-result" class="modal-result" style="display:none"></div>
             <div id="cfg-list"><div class="placeholder">Loading…</div></div>`;
-        const data = await fetch('/api/v1/config/effective').then(r => r.json())
-            .catch(() => ({entries: [], scope: 'unknown', node_hostname: 'unknown'}));
+        let data;
+        try { data = await getJSON('/api/v1/config/effective'); }
+        catch (e) {
+            const cl = document.getElementById('cfg-list');
+            if (cl) cl.innerHTML = loadErrBlock('config', e);
+            return;
+        }
         window._configRows = data.entries || [];
         window._configHost = data.node_hostname || '—';
         window._configPending = {};
@@ -3333,6 +3662,16 @@
             pendingCount ? `${pendingCount} pending change${pendingCount===1?'':'s'}` : '';
     }
 
+    // The server renders unchanged secrets as this sentinel and drops it on write;
+    // the UI additionally refuses to post it so it can never become a real value.
+    const CONFIG_MASK = '***';
+    function hasMaskedValue(v) {
+        if (v === CONFIG_MASK) return true;
+        if (Array.isArray(v)) return v.some(hasMaskedValue);
+        if (v && typeof v === 'object') return Object.values(v).some(hasMaskedValue);
+        return false;
+    }
+
     async function submitConfigDiff(writeToDisk) {
         const pending = window._configPending;
         const keys = Object.keys(pending);
@@ -3352,14 +3691,18 @@
             }
             cursor[parts[parts.length - 1]] = pending[dotted];
         }
-        if (writeToDisk && !confirm("Write this manager's /etc/dtfs/manager.toml and store the change cluster-wide?\nCluster-scoped values must match across every manager.")) {
+        if (hasMaskedValue(merged)) {
+            alert('Refusing to apply: a value equals the redaction mask "' + CONFIG_MASK + '". Clear that field or type the real value.');
+            return;
+        }
+        if (writeToDisk && !confirm("Rewrite this manager's TOML (effective after this manager restarts) and record the change in Raft?\nOther managers are NOT changed; cluster-scoped values must match across every manager.")) {
             return;
         }
         const result = document.getElementById('cfg-result');
         result.style.display = 'block';
         result.textContent = 'Submitting…';
         try {
-            const { resp, json, authError } = await mutateFetch('/api/v1/config', {
+            const { resp, text, json, authError } = await mutateFetch('/api/v1/config', {
                 body: JSON.stringify({
                     config_json: JSON.stringify(merged),
                     write_to_disk: writeToDisk,
@@ -3368,17 +3711,18 @@
             });
             const j = json || {error: 'invalid JSON response'};
             if (!resp.ok) {
-                result.textContent = (authError
-                    || ('Error ' + resp.status + ': ' + (j.error || JSON.stringify(j))))
+                result.textContent = errMsg({ resp, text, json, authError })
                     + (j.preserved_current ? ' (current values preserved)' : '');
                 // AZ-5-A3 — reload to revert pending UI state to
                 // server's current values.
                 await renderConfig();
                 return;
             }
-            result.textContent = `Stored cluster-wide (takes effect after restart). version=${j.version}, write_to_disk=${j.write_to_disk}`;
-            // Re-fetch to reflect post-apply state.
+            const msg = `Recorded in Raft (version ${j.version}), write_to_disk=${j.write_to_disk}. ` + (j.note || '');
+            // Re-fetch to reflect post-apply state, then show the server note.
             await renderConfig();
+            const r2 = document.getElementById('cfg-result');
+            if (r2) { r2.style.display = 'block'; r2.textContent = msg; }
         } catch (e) {
             result.textContent = 'Network error: ' + e;
         }
@@ -3388,19 +3732,17 @@
 
     async function renderSettings() {
         document.getElementById('page-content').innerHTML =
-            '<div class="page-header"><h2>Settings</h2><p class="page-desc">Cluster-wide configuration (stored in Raft; takes effect after restart)</p></div>' +
+            '<div class="page-header"><h2>Settings</h2><p class="page-desc">Cluster-wide configuration record (stored in Raft; daemons do not read it, see Config page)</p></div>' +
             '<div id="settings-body"><div class="placeholder">Loading…</div></div>';
         await loadSettings();
     }
 
     async function loadSettings() {
-        const cfg = await fetch('/api/v1/config').then(r => r.json()).catch(() => null);
+        let cfg, cfgErr = null;
+        try { cfg = await getJSON('/api/v1/config'); } catch (e) { cfgErr = e; }
         const el = document.getElementById('settings-body');
         if (!el) return;
-        if (!cfg) {
-            el.innerHTML = '<div class="placeholder">Could not load configuration.</div>';
-            return;
-        }
+        if (cfgErr) { el.innerHTML = loadErrBlock('configuration', cfgErr); return; }
         const d = cfg.defaults || {};
         const ws = d.write_safety || {};
         const rep = d.replication || {};
@@ -3521,13 +3863,23 @@
         if (status) status.textContent = 'Saving…';
         try {
             // Validate JSON first
-            JSON.parse(json === '(empty)' ? '{}' : json);
-            const { resp, json: result, authError } = await mutateFetch('/api/v1/config', {
+            const parsed = JSON.parse(json === '(empty)' ? '{}' : json);
+            if (hasMaskedValue(parsed)) {
+                if (status) status.textContent = 'Refused: a value equals the redaction mask "' + CONFIG_MASK
+                    + '". Replace it with the real value or delete the key.';
+                return;
+            }
+            if (!window.confirm('Replace the stored cluster config record with this JSON? '
+                + 'Daemons do not read it; it only changes what the Config page and API report.')) {
+                if (status) status.textContent = '';
+                return;
+            }
+            const { resp, text, json: result, authError } = await mutateFetch('/api/v1/config', {
                 body: JSON.stringify({ config_json: json === '(empty)' ? '' : json }),
             });
             if (status) status.textContent = resp.ok
-                ? 'Applied (v' + (result && result.version) + ')'
-                : (authError || ('Error: ' + JSON.stringify(result)));
+                ? 'Applied (v' + (result && result.version) + '). ' + ((result && result.note) || '')
+                : errMsg({ resp, text, json: result, authError });
         } catch(e) {
             if (status) status.textContent = String(e.message || e);
         }
@@ -3536,6 +3888,8 @@
     // ── Bootstrap ────────────────────────────────────────────────────────────
     updateAuthBadge();
     route();
+    refreshGlobal();
+    setInterval(refreshGlobal, 8000);
 </script>
 </body>
 </html>
