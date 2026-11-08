@@ -35,6 +35,12 @@
 #                            used by the manual yank:release job.
 #   DTFS_CI_TARGET_DIR       optional: persistent cargo target dir on the
 #                            builder so builds are incremental across pipelines.
+# Docs: job `pages` builds docs/ with mdBook (scripts/build-docs.sh, pinned
+# release binary downloaded once into ~/.cache/dtfs/mdbook on the runner) on
+# every default-branch push that touches docs/** and publishes the result as
+# GitLab Pages (public/) and as a job artifact. Needs curl, sha256sum, tar and
+# python3 on the builder host; independent of the test/release/deploy chain.
+#
 # The runner user needs SSH access as root to every cluster host (key in
 # the inventory's ansible_ssh_private_key_file); nothing runs via sudo.
 
@@ -244,3 +250,35 @@ yank:release:
     - when: never
   script:
     - bash scripts/ci/gitlab-yank.sh "$VERSION"
+
+# ---------------------------------------------------------------------------
+# pages: HTML documentation (mdBook) from docs/src. The Markdown link check
+# runs first (scripts/check-docs-links.py) and fails the job on a broken
+# link or a page missing from SUMMARY.md. Output docs/book is copied to
+# public/ (GitLab Pages) and kept as an artifact for 4 weeks. site-url is
+# set from CI_PAGES_URL so the 404 page resolves under the project sub-path.
+# The job name `pages` is what makes GitLab publish public/ (no `pages:`
+# keyword, so this also lints on instances older than 17.9).
+# ---------------------------------------------------------------------------
+pages:
+  stage: build
+  needs: []
+  before_script: []
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      changes:
+        - docs/**/*
+        - scripts/build-docs.sh
+        - scripts/check-docs-links.py
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "web"
+    - when: never
+  script:
+    - export MDBOOK_OUTPUT__HTML__SITE_URL="$(printf '%s' "${CI_PAGES_URL:-}" | sed -E 's#^https?://[^/]+##; s#/*$#/#')"
+    - echo "site-url=$MDBOOK_OUTPUT__HTML__SITE_URL"
+    - bash scripts/build-docs.sh --clean
+    - rm -rf public && cp -r docs/book public
+  artifacts:
+    name: "dtfs-docs"
+    paths:
+      - public
+    expire_in: 4 weeks

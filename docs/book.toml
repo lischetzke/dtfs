@@ -1,18 +1,31 @@
 [book]
 authors = ["DTFS Team"]
 language = "en"
-multilingual = false
 src = "src"
 title = "DTFS Documentation"
-description = "Comprehensive documentation for the DTFS Distributed Tiered Filesystem"
+description = "Documentation for DTFS, the Raft-managed tiered distributed filesystem"
 
 [build]
 build-dir = "book"
-create-missing = true
+# A page listed in SUMMARY.md that does not exist is a build error, not a stub.
+create-missing = false
 
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
+# The canonical remote is GitHub (origin); CI and releases run on GitLab.
+# Repository and "suggest an edit" links point at the GitHub mirror of master.
 git-repository-url = "https://github.com/lischetzke/dtfs"
-edit-url-template = "https://github.com/lischetzke/dtfs/edit/main/docs/{path}"
-site-url = "/docs/"
+edit-url-template = "https://github.com/lischetzke/dtfs/edit/master/docs/{path}"
+# Used for the generated 404 page. "/" fits a site served from a domain root;
+# the GitLab Pages job overrides it with the project sub-path
+# (MDBOOK_OUTPUT__HTML__SITE_URL, see .gitlab-ci.yml job `pages`).
+site-url = "/"
+
+[output.html.search]
+enable = true
+limit-results = 30
+
+# Single-page version of the whole book at print.html (browser "save as PDF").
+[output.html.print]
+enable = true
