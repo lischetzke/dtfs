@@ -100,6 +100,9 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   fsync return the commit error.
 - `writebuf.rs` batches `write.flush_batch_chunks` (default 4, clamp
   1..=32) complete chunks per `flush()`; `flush_all` drains everything.
+  `flush_segments_to_cluster` puts a batch's segments concurrently
+  (`upload_segments`, every put awaited, lowest-index error wins) and sends
+  ONE `commit_chunk_locations` only after all segments reached quorum.
 - Batch is byte-clamped at `FLUSH_BATCH_MAX_BYTES` (64 MB); total dirty
   bytes per open file are capped at `DIRTY_BYTES_CAP` (2x) and
   force-drained via `flush_complete()` before a hole fill or write would
@@ -126,6 +129,9 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   drains per entry (never `clear()` + `store(0)`). The prefetch candidate
   list is limited to `chunk_idx+1..=chunk_idx+prefetch_chunks`.
 - `LocalChunkCache` removals (evict and age prune) go through `evict_entry`.
+- A foreground miss writes the disk cache in the background via
+  `spawn_bounded` (`LOCAL_CACHE_PUT_MAX_INFLIGHT`, 2); a put without a
+  permit is dropped, never queued or awaited on the read path.
 - Client `read_chunk` verifies the streamed bytes against the 64-hex
   chunk id (IntegrityFaultError on mismatch).
 - Disk cache: viewer-read atime hint comes from `OpenFile.bytes_read_on_fh`

@@ -211,6 +211,10 @@ pub const METADATA_CACHE_MAX_ENTRIES: usize = 4096;
 /// CR-6-6 (FUSE-8) — bound on in-flight `record_cache_hit` notify tasks.
 pub const CACHE_HIT_NOTIFY_MAX_INFLIGHT: usize = 8;
 
+/// Bound on background disk-cache puts after foreground misses; each holds
+/// one chunk's `Bytes` (refcounted, usually shared with the readahead cache).
+pub const LOCAL_CACHE_PUT_MAX_INFLIGHT: usize = 2;
+
 /// CR-6-6 (FUSE-8 / FUSE-10) — true iff `current` is a genuinely new
 /// chunk index for this fh (never seen, or different from the last one),
 /// i.e. a transition. Pure decision boundary shared by the cache-hit
@@ -715,6 +719,9 @@ pub struct DtfsFilesystem {
     /// tasks; a permit-less notify is simply skipped (a missed metrics
     /// ping is acceptable, per the existing comment on this call site).
     cache_hit_notify_permits: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Bounds background disk-cache puts after a foreground miss
+    /// (`LOCAL_CACHE_PUT_MAX_INFLIGHT`); a put without a permit is dropped.
+    cache_put_permits: std::sync::Arc<tokio::sync::Semaphore>,
     /// CR-6-6 (FUSE-9) — single-flights foreground chunk-miss fetches by
     /// chunk_id (content-addressed, so any candidate node's fetch is
     /// interchangeable). The first reader to miss becomes the Owner and
@@ -801,6 +808,9 @@ impl DtfsFilesystem {
             write_buffer,
             cache_hit_notify_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 CACHE_HIT_NOTIFY_MAX_INFLIGHT,
+            )),
+            cache_put_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                LOCAL_CACHE_PUT_MAX_INFLIGHT,
             )),
             foreground_inflight: DashMap::new(),
             known_locations: DashMap::new(),
@@ -1425,13 +1435,21 @@ impl DtfsFilesystem {
 
                         // P0-11: also write to the disk cache so the chunk
                         // survives readahead-cache eviction + FUSE restarts.
-                        if let Some(lc) = &self.local_cache {
-                            if let Err(e) = lc.put(&chunk.chunk_id, &data).await {
-                                tracing::warn!(
-                                    chunk_id = %chunk.chunk_id,
-                                    error = %e,
-                                    "local disk cache put failed"
-                                );
+                        // Off the foreground path, bounded; a dropped or torn
+                        // put is just a later miss (entries verify on read).
+                        if let Some(lc) = self.local_cache.clone() {
+                            let (id, bytes) = (chunk.chunk_id.clone(), data.clone());
+                            let spawned = spawn_bounded(&self.cache_put_permits, async move {
+                                if let Err(e) = lc.put(&id, &bytes).await {
+                                    tracing::warn!(
+                                        chunk_id = %id,
+                                        error = %e,
+                                        "local disk cache put failed"
+                                    );
+                                }
+                            });
+                            if !spawned {
+                                debug!(chunk_id = %chunk.chunk_id, "local disk cache put skipped, bound full");
                             }
                         }
 
@@ -2738,27 +2756,27 @@ impl DtfsFilesystem {
             .await
             .with_context(|| format!("allocate_chunks failed for {path}"))?;
 
-        let mut commits: Vec<ChunkLocationCommit> = Vec::with_capacity(segments.len());
-        let mut committed: Vec<ChunkInfo> = Vec::with_capacity(segments.len());
+        if alloc_response.placements.len() < segments.len() {
+            bail!(
+                "manager returned fewer placements than requested ({} < {})",
+                alloc_response.placements.len(),
+                segments.len()
+            );
+        }
+        let placements = &alloc_response.placements;
+        let volume_id = volume_id.as_str();
 
         // For each segment: write the chunk to the primary AND every replica
         // target the manager assigned. Wait for all writes in parallel; require
         // at least quorum (ceil(N/2)) to succeed before acking.  Each
         // successful target produces a `ChunkLocationCommit` so the manager
         // ends up with N location entries — that's what actually makes
-        // replication-factor=N real (fix for F-010).
-        for (i, segment) in segments.iter().enumerate() {
-            let mut placement = alloc_response
-                .placements
-                .get(i)
-                .with_context(|| {
-                    format!(
-                        "manager returned fewer placements than requested ({} < {})",
-                        alloc_response.placements.len(),
-                        segments.len()
-                    )
-                })?
-                .clone();
+        // replication-factor=N real (fix for F-010). The segments of the
+        // batch upload concurrently; any failed segment fails the batch
+        // before the single commit below.
+        let uploaded = upload_segments(segments.len(), |i| async move {
+            let segment = &segments[i];
+            let mut placement = placements[i].clone();
 
             // Bug BU-2 — bounded reroute. If the assigned placement can't
             // accept the write because its target-tier disk is full
@@ -2907,15 +2925,16 @@ impl DtfsFilesystem {
                 })?;
             };
 
-            committed.push(committed_chunk_info(
+            let info = committed_chunk_info(
                 segment.chunk_index,
                 &expected_chunk_id,
                 successes[0].1.size,
                 successes.iter().map(|(a, _)| a.clone()).collect(),
                 &tier,
-            ));
+            );
+            let mut seg_commits = Vec::with_capacity(successes.len());
             for (addr, put_resp) in successes {
-                commits.push(ChunkLocationCommit {
+                seg_commits.push(ChunkLocationCommit {
                     chunk_index: segment.chunk_index,
                     chunk_id: put_resp.chunk_id.clone(),
                     primary_address: addr,
@@ -2931,6 +2950,15 @@ impl DtfsFilesystem {
                 chunk_index = segment.chunk_index,
                 "chunk written to cluster",
             );
+            Ok((info, seg_commits))
+        })
+        .await?;
+
+        let mut commits: Vec<ChunkLocationCommit> = Vec::with_capacity(segments.len());
+        let mut committed: Vec<ChunkInfo> = Vec::with_capacity(segments.len());
+        for (info, seg_commits) in uploaded {
+            committed.push(info);
+            commits.extend(seg_commits);
         }
 
         // Bug P — find the lease_id for this path so the manager can
@@ -3505,6 +3533,104 @@ fn other_writer_open(remaining: &[(String, OpenFlags)], path: &str) -> bool {
 /// independent of the error's concrete type.
 fn is_resource_exhausted(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("ResourceExhausted")
+}
+
+/// Runs `upload(i)` for every segment index of a flush batch and returns the
+/// results in index order, or the lowest-index error. All uploads run
+/// concurrently and each is awaited to its end (none is cancelled mid-put).
+async fn upload_segments<T, F, Fut>(n: usize, upload: F) -> Result<Vec<T>>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    futures_util::future::join_all((0..n).map(upload)).await.into_iter().collect()
+}
+
+/// Spawns `fut` only if `permits` has a free permit (held until `fut` ends);
+/// returns false and drops `fut` when the bound is full, never waiting.
+fn spawn_bounded<F>(permits: &Arc<tokio::sync::Semaphore>, fut: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match permits.clone().try_acquire_owned() {
+        Ok(permit) => {
+            tokio::spawn(async move {
+                let _permit = permit;
+                fut.await;
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod perf_io_concurrency_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn upload_segments_runs_all_segments_concurrently_in_order() {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let res = upload_segments(4, |i| {
+            let (inflight, peak) = (inflight.clone(), peak.clone());
+            async move {
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                Ok(i * 10)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), 4, "segments must overlap");
+        assert_eq!(res, vec![0, 10, 20, 30]);
+    }
+
+    #[tokio::test]
+    async fn upload_segments_fails_on_any_segment_error_after_all_finish() {
+        let done = Arc::new(AtomicUsize::new(0));
+        let res: Result<Vec<usize>> = upload_segments(3, |i| {
+            let done = done.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                done.fetch_add(1, Ordering::SeqCst);
+                if i == 1 { bail!("segment {i} failed") } else { Ok(i) }
+            }
+        })
+        .await;
+        assert_eq!(res.unwrap_err().to_string(), "segment 1 failed");
+        // No put is abandoned mid-stream: every segment ran to completion.
+        assert_eq!(done.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn spawn_bounded_drops_when_full_and_never_blocks() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        assert!(spawn_bounded(&permits, async move {
+            let _ = rx.await;
+        }));
+        // Bound full: dropped immediately, not queued.
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r = ran.clone();
+        assert!(!spawn_bounded(&permits, async move {
+            r.fetch_add(1, Ordering::SeqCst);
+        }));
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while permits.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("permit released when the task ends");
+        assert!(spawn_bounded(&permits, async {}));
+        tokio::task::yield_now().await;
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "dropped put never ran");
+    }
 }
 
 #[cfg(test)]

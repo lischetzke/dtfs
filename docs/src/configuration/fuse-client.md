@@ -83,6 +83,13 @@ On-disk chunk cache on the client.
 | `first_write_tier` | string | `"cold"` | `cold`: no tier hint, the manager uses the volume's own policy. `nearest-warm`: asks for the warm tier; honoured when a healthy warm disk exists, replica count clamped up to `write_safety.min_replicas_before_ack`. No datacenter affinity, and the volume anchor still forces one replica into the anchor datacenter. Unknown values act as `cold`. See [FUSE mount](../access/fuse-mount.md#writes). |
 | `flush_batch_chunks` | u32 | `4` | Complete chunks held back before one `AllocateChunks` plus `CommitChunkLocations` round trip. Clamped to 1..=32 and further so that `batch x chunk_size_mb <= 64`. `1` flushes per chunk. `flush`/close always drains held chunks. |
 
+## Tuning recommendations
+
+Defaults suit a LAN client with one or two readers. Two cases worth changing (chunk size 4 MiB assumed):
+
+- **WAN writers** (client far from its data nodes, e.g. a high-RTT link to LELI): `write.flush_batch_chunks = 16`. Each batch costs one `AllocateChunks` plus one `CommitChunkLocations` round trip to the manager, so 16 cuts those round trips four-fold versus the default; 16 x 4 MiB is exactly the 64 MB batch byte cap. Cost: up to 64 MB of complete chunks held per open writer before a flush (default: 16 MB; the fixed 128 MB per-file dirty cap is unchanged), and up to 16 concurrent chunk puts per file per target.
+- **Clients serving about 5 parallel streams** (a Plex host): `readahead.cache_mb = 192` and `readahead.prefetch_max_inflight = 4`. With the default `prefetch_chunks = 8`, five streams want 5 x 8 x 4 MiB = 160 MiB of prefetched chunks, which the 64 MB default evicts before they are read. Cost: about 128 MB more client RAM than the default (the cache budget), plus two more 4 MiB in-flight prefetch buffers; with a `[memory]` cap the warn level still halves it. Size `hard_cap_mb` to include it.
+
 ## `[partition_safety]`
 
 Parsed but **not read** by the client in this build; partition behaviour is not configurable here. See [Partition Behavior](../access/partition-behavior.md). `quorum_loss_timeout_secs` is still range-checked.

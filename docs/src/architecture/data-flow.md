@@ -29,7 +29,7 @@ This page traces what happens, step by step, for the common operations and for t
 6. **Quorum on the client.** The write proceeds when at least `ceil(N/2)` targets acknowledged with a matching chunk id. A node that returns a different id is treated as failed.
 7. **Commit.** `CommitChunkLocations` is one Raft command. The manager rejects it when any chunk has fewer distinct `(node_id, disk_id)` replicas than the volume's `write_safety.min_replicas_before_ack` (counting only replicas on maintained tiers; allocation fills the floor across such tiers, and the floor is clamped only to what the cluster can hold). Replicas that missed the quorum are created later by the repair scheduler.
 
-Large writes flush in batches of complete chunks (`write.flush_batch_chunks`, default 4) so memory stays bounded. If a flush fails, the drained bytes are restored to the buffer. On `release`, a file that never committed a chunk (a create that failed) is unlinked (the "ghost" case); a file that has ever committed is never ghost-unlinked.
+Large writes flush in batches of complete chunks (`write.flush_batch_chunks`, default 4) so memory stays bounded. The chunks of one batch are put concurrently (each to all its targets); the batch's single `CommitChunkLocations` is sent only after every chunk reached its quorum, so one failed chunk commits nothing of the batch. If a flush fails, the drained bytes are restored to the buffer. On `release`, a file that never committed a chunk (a create that failed) is unlinked (the "ghost" case); a file that has ever committed is never ghost-unlinked.
 
 Other write-side operations:
 
@@ -53,7 +53,7 @@ Other write-side operations:
 
 1. **Metadata.** Locations are cached per path for 5 s (bounded to 4096 entries). The response lists only live replicas unless none are live. It carries each replica's tier and location so the client can rank them.
 2. **Replica order.** `select_read_replica` ranks candidates: configured `read_location_priority` first, then physical distance (same host, rack, datacenter, region), then tier only on equal distance (prefer warm over the cold anchor HDD). A strictly nearer replica always wins.
-3. **Caches.** The read-ahead memory cache is checked first, then the optional local disk cache. A disk cache hit is also inserted into the memory cache. Concurrent misses for the same chunk are single-flighted: one fetch, the others wait.
+3. **Caches.** The read-ahead memory cache is checked first, then the optional local disk cache. A disk cache hit is also inserted into the memory cache. Concurrent misses for the same chunk are single-flighted: one fetch, the others wait. A fetched chunk is written to the disk cache in the background (at most 2 such writes in flight; beyond that the write is skipped), so the reader does not wait for the disk.
 4. **Fetch and fail over.** The client tries candidates in order, each bounded by `client.chunk_read_timeout_secs` (default 60 s). The data node streams the file in pieces. With `verify_on_read` (default on) it hashes the file first and answers `data_loss` on a mismatch, so the client moves to the next replica. The read fails only after every candidate failed.
 5. **Client verify.** The client hashes the streamed bytes and compares them with the chunk id. A mismatch is an integrity fault and also fails over.
 6. **After the read.** The client stores the chunk in its caches, prefetches the following chunks, and tells a data node about the read (`RecordCacheHit`, at most once per file handle and chunk transition). Those read counts feed tiering.
