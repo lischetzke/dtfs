@@ -1238,6 +1238,7 @@ impl ManagerService for MetadataService {
             // CR-6-4 (FUSE-6) — the file's ACTUAL volume, so the client
             // stops hardcoding "default" on every refresh.
             volume_id: file.volume_id.clone(),
+            is_symlink: file.symlink_target.is_some(),
         }))
     }
 
@@ -2026,14 +2027,26 @@ impl ManagerService for MetadataService {
         // Iteration order of `data.files` no longer affects the type bit.
         let listed = data.list_directory_entries(&req.path);
 
+        let dir_prefix = if req.path.ends_with('/') {
+            req.path.clone()
+        } else {
+            format!("{}/", req.path)
+        };
         let entries: Vec<DirectoryEntry> = listed
             .into_iter()
-            .map(|e| DirectoryEntry {
-                name: e.name,
-                size: e.size_bytes,
-                is_directory: e.is_directory,
-                created_at: e.created_at_ms as i64,
-                modified_at: e.updated_at_ms as i64,
+            .map(|e| {
+                let is_symlink = data
+                    .files
+                    .get(&format!("{}{}", dir_prefix, e.name))
+                    .is_some_and(|f| f.symlink_target.is_some());
+                DirectoryEntry {
+                    name: e.name,
+                    size: e.size_bytes,
+                    is_directory: e.is_directory,
+                    created_at: e.created_at_ms as i64,
+                    modified_at: e.updated_at_ms as i64,
+                    is_symlink,
+                }
             })
             .collect();
 

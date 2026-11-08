@@ -56,6 +56,8 @@ pub struct FileLocations {
     /// the SOAK-RECOVERY-2026-05-18 bugs A & B where `getattr` on a
     /// freshly-mkdir'd folder returned ENOENT.
     pub is_directory: bool,
+    /// Path is a symlink (manager `is_symlink`; false from old managers).
+    pub is_symlink: bool,
 }
 
 impl FileLocations {
@@ -323,6 +325,7 @@ fn resolve_refreshed_volume_id(response_volume_id: &str, cached_volume_id: Optio
 pub struct FileAttr {
     pub size: u64,
     pub is_directory: bool,
+    pub is_symlink: bool,
     pub created_at: SystemTime,
     pub modified_at: SystemTime,
 }
@@ -333,6 +336,7 @@ pub struct DirEntry {
     pub name: String,
     pub size: u64,
     pub is_directory: bool,
+    pub is_symlink: bool,
     pub created_at: SystemTime,
     pub modified_at: SystemTime,
 }
@@ -627,6 +631,7 @@ impl DtfsFilesystem {
             return Ok(FileAttr {
                 size: 4096,
                 is_directory: true,
+                is_symlink: false,
                 created_at: now,
                 modified_at: now,
             });
@@ -681,6 +686,7 @@ impl DtfsFilesystem {
                     name: e.name,
                     size: e.size,
                     is_directory: e.is_directory,
+                    is_symlink: e.is_symlink,
                     created_at: system_time_from_epoch_ms(e.created_at),
                     modified_at: system_time_from_epoch_ms(e.modified_at),
                 }
@@ -991,7 +997,7 @@ impl DtfsFilesystem {
                         // is content-addressed; the bytes are
                         // identical regardless of which node we
                         // notify). First candidate is the nearest
-                        // healthy replica per `sort_candidates`.
+                        // healthy replica per `read_candidates`.
                         if cache_hit_notify_addr.is_none() {
                             cache_hit_notify_addr =
                                 candidates.first().cloned();
@@ -1758,6 +1764,7 @@ impl DtfsFilesystem {
                     created_at_ms: 0,
                     modified_at_ms: 0,
                     is_directory: false,
+                    is_symlink: false,
                 }),
                 chunk_size: response.chunk_size,
                 lease_id: Some(lease_resp.lease_id),
@@ -1854,17 +1861,45 @@ impl DtfsFilesystem {
         _fh: Option<u64>,
         new_size: u64,
     ) -> Result<()> {
+        // A bare path truncate (no writable handle) of an unaligned shrink
+        // opens a temporary internal writer so the tail chunk is rewritten
+        // through the normal lease + commit path, then released.
+        let writer = self.has_writable_handle(path);
+        let mut temp_fh = None;
+        if !writer {
+            let before = self
+                .fetch_file_locations(path)
+                .await
+                .with_context(|| format!("truncate: locations for {path}"))?;
+            let cs = self.resolve_chunk_size(&before);
+            if truncate_needs_temp_writer(false, before.total_size, new_size, cs) {
+                temp_fh = Some(
+                    self.open_with_append(path, OpenFlags::ReadWrite, false)
+                        .await
+                        .with_context(|| format!("truncate: temp writer for {path}"))?,
+                );
+            }
+        }
+        let res = self.truncate_inner(path, new_size, writer || temp_fh.is_some()).await;
+        if let Some(fh) = temp_fh {
+            let rel = self.release(fh).await;
+            res?;
+            return rel;
+        }
+        res
+    }
+
+    async fn truncate_inner(&self, path: &str, new_size: u64, writer: bool) -> Result<()> {
         // A shrink to a non-chunk-aligned size leaves the old tail bytes in
         // the cluster's tail chunk. Read that chunk (clamped to the new EOF)
         // BEFORE mutating the manager, so a read failure leaves the file
         // untouched, and re-buffer it below so the normal commit path
         // rewrites it zero-trimmed. Only with a writable handle: the buffer
         // is flushed by a writable fh's flush/release, and without one the
-        // seeded bytes would be stranded (shortcut: a bare path truncate
-        // with no writable handle keeps the stale tail until the next
-        // writer's EOF-clamped seed).
+        // seeded bytes would be stranded (`truncate` supplies a temporary
+        // writer for the bare-path case).
         let mut tail_seed: Option<(u64, Bytes)> = None;
-        if self.has_writable_handle(path) {
+        if writer {
             let before = self
                 .fetch_file_locations(path)
                 .await
@@ -2036,6 +2071,7 @@ impl DtfsFilesystem {
             created_at_ms: response.created_at_ms,
             modified_at_ms: response.modified_at_ms,
             is_directory: response.is_directory,
+            is_symlink: response.is_symlink,
         })
     }
 
@@ -2096,30 +2132,6 @@ impl DtfsFilesystem {
         } else {
             128 * 1024 * 1024
         }
-    }
-
-    /// Select the nearest data node from a list of addresses.
-    fn select_nearest_node(&self, addresses: &[String]) -> String {
-        if addresses.len() == 1 {
-            return addresses[0].clone();
-        }
-
-        // Build a HashMap of known locations for the candidate nodes.
-        let known: HashMap<String, Location> = addresses
-            .iter()
-            .filter_map(|addr| {
-                self.known_locations
-                    .get(addr)
-                    .map(|loc| (addr.clone(), loc.clone()))
-            })
-            .collect();
-
-        dtfs_client::location::select_nearest_node(
-            Some(&self.client_location),
-            addresses,
-            &known,
-        )
-        .unwrap_or_else(|| addresses[0].clone())
     }
 
     /// CR-6-6 (FUSE-9) — extracted foreground fetch loop: try each
@@ -2663,6 +2675,7 @@ fn file_attr_from_locations(locations: &FileLocations) -> FileAttr {
     FileAttr {
         size: if locations.is_directory { 4096 } else { locations.total_size },
         is_directory: locations.is_directory,
+        is_symlink: locations.is_symlink,
         created_at: system_time_from_epoch_ms(locations.created_at_ms),
         modified_at: system_time_from_epoch_ms(locations.modified_at_ms),
     }
@@ -2773,6 +2786,12 @@ fn tail_rewrite_target(old_size: u64, new_size: u64, chunk_size: u64) -> Option<
     } else {
         Some((new_size / chunk_size, new_size % chunk_size))
     }
+}
+
+/// A path truncate with no writable handle needs a temporary internal writer
+/// exactly when it is an unaligned shrink (stale tail bytes must be rewritten).
+fn truncate_needs_temp_writer(has_writer: bool, old_size: u64, new_size: u64, chunk_size: u64) -> bool {
+    !has_writer && tail_rewrite_target(old_size, new_size, chunk_size).is_some()
 }
 
 /// A write buffer sized for a different chunk size than the file's own
@@ -3022,7 +3041,16 @@ mod cr_6_5_metadata_cache_bound_tests {
             created_at_ms: 0,
             modified_at_ms: 0,
             is_directory: false,
+            is_symlink: false,
         }
+    }
+
+    #[test]
+    fn symlink_bit_propagates_into_attrs() {
+        let mut loc = empty_locations("/l");
+        assert!(!super::file_attr_from_locations(&loc).is_symlink);
+        loc.is_symlink = true;
+        assert!(super::file_attr_from_locations(&loc).is_symlink);
     }
 
     #[test]
@@ -3336,6 +3364,7 @@ mod rev_2_1_chunk_index_tests {
             created_at_ms: 0,
             modified_at_ms: 0,
             is_directory: false,
+            is_symlink: false,
         }
     }
 
@@ -3457,6 +3486,7 @@ mod tests {
             created_at_ms: 0,
             modified_at_ms: 0,
             is_directory: false,
+            is_symlink: false,
         };
         let attr = file_attr_from_locations(&loc);
         assert_eq!(attr.size, 42);
@@ -3481,6 +3511,7 @@ mod tests {
             created_at_ms: 1,
             modified_at_ms: 1,
             is_directory: true,
+            is_symlink: false,
         };
         let attr = file_attr_from_locations(&loc);
         assert!(attr.is_directory, "directory bit must round-trip into FileAttr");
@@ -3687,6 +3718,16 @@ mod audit_write_path_tests {
         assert_eq!(seed_len_within_eof(100, 100, 100), 0, "EOF at chunk start: nothing live");
         assert_eq!(seed_len_within_eof(100, 100, 50), 0, "EOF before chunk: nothing live");
         assert_eq!(seed_len_within_eof(40, 100, 500), 40, "never longer than the chunk");
+    }
+
+    #[test]
+    fn temp_writer_only_for_bare_unaligned_shrink() {
+        let cs = 100;
+        assert!(truncate_needs_temp_writer(false, 250, 150, cs));
+        assert!(!truncate_needs_temp_writer(true, 250, 150, cs), "writer already open");
+        assert!(!truncate_needs_temp_writer(false, 250, 200, cs), "aligned shrink");
+        assert!(!truncate_needs_temp_writer(false, 250, 300, cs), "grow");
+        assert!(!truncate_needs_temp_writer(false, 250, 250, cs), "no-op");
     }
 
     #[test]

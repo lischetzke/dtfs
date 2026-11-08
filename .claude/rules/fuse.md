@@ -32,12 +32,20 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   a ref (never forgotten; bounded by distinct paths listed).
 - `rename` re-keys every descendant path and drops the replaced
   destination's inode.
+  `mode_overrides` are re-keyed the same way (`rekey_mode_overrides`).
+- Symlink kind comes from the manager's `is_symlink` (ListDirectory +
+  GetFileLocations; old managers send false) via `file_kind`.
+- `cluster_err_to_errno`: NotFound ENOENT, FailedPrecondition ENOTEMPTY,
+  InvalidArgument EINVAL, else EIO.
 - `opendir` snapshots the listing (fh -> `Arc<Vec<DirEntry>>`, dropped at
   `releasedir`); readdir/readdirplus serve pages from it, cookie = position
   (`dir_entry_cookie`). Do not re-list per page.
 
 ## Writes
 
+- A bare path `truncate` (no writable fh) to an unaligned shrink opens a
+  temporary internal writer (`truncate_needs_temp_writer`) so the tail chunk
+  is rewritten via the normal lease + commit path, then released.
 - `writebuf.rs` batches `write.flush_batch_chunks` (default 4, clamp
   1..=32) complete chunks per `flush()`; `flush_all` drains everything.
 - Batch is byte-clamped at `FLUSH_BATCH_MAX_BYTES` (64 MB); total dirty

@@ -296,6 +296,32 @@ fn snapshot_page(
         .filter(move |(cookie, _)| *cookie > offset)
 }
 
+/// Move chmod overrides of `from` and of every path under `from/` to `to`.
+fn rekey_mode_overrides(map: &DashMap<String, u16>, from: &str, to: &str) {
+    let under = format!("{}/", from);
+    let moved: Vec<String> = map
+        .iter()
+        .map(|e| e.key().clone())
+        .filter(|k| k == from || k.starts_with(&under))
+        .collect();
+    for k in moved {
+        if let Some((_, v)) = map.remove(&k) {
+            map.insert(format!("{}{}", to, &k[from.len()..]), v);
+        }
+    }
+}
+
+/// Node kind from the manager's directory / symlink bits.
+fn file_kind(is_directory: bool, is_symlink: bool) -> FileType {
+    if is_directory {
+        FileType::Directory
+    } else if is_symlink {
+        FileType::Symlink
+    } else {
+        FileType::RegularFile
+    }
+}
+
 /// fuse3 `FileAttr` for a manager attribute with the given permission bits.
 /// Single source for getattr/lookup and readdirplus so both agree on nlink.
 fn build_attr(ino: u64, a: &DtfsAttr, perm: u16) -> FileAttr {
@@ -306,11 +332,7 @@ fn build_attr(ino: u64, a: &DtfsAttr, perm: u16) -> FileAttr {
         atime: to_timestamp(a.modified_at),
         mtime: to_timestamp(a.modified_at),
         ctime: to_timestamp(a.created_at),
-        kind: if a.is_directory {
-            FileType::Directory
-        } else {
-            FileType::RegularFile
-        },
+        kind: file_kind(a.is_directory, a.is_symlink),
         perm,
         nlink: if a.is_directory { 2 } else { 1 },
         uid: unsafe { libc::getuid() },
@@ -1077,11 +1099,7 @@ impl Filesystem for DtfsFuse3Adapter {
             items.push(Ok(DirectoryEntry {
                 inode: child_ino,
                 offset: entry_offset,
-                kind: if entry.is_directory {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                },
+                kind: file_kind(entry.is_directory, entry.is_symlink),
                 name: entry.name.clone().into(),
             }));
         }
@@ -1118,16 +1136,13 @@ impl Filesystem for DtfsFuse3Adapter {
                 format!("{}/{}", path, entry.name)
             };
             let child_ino = self.inodes.inode_for(&child_path);
-            let kind = if entry.is_directory {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            };
+            let kind = file_kind(entry.is_directory, entry.is_symlink);
             let attr = build_attr(
                 child_ino,
                 &DtfsAttr {
                     size: entry.size,
                     is_directory: entry.is_directory,
+                    is_symlink: entry.is_symlink,
                     created_at: entry.created_at,
                     modified_at: entry.modified_at,
                 },
@@ -1260,9 +1275,7 @@ impl Filesystem for DtfsFuse3Adapter {
             Ok(()) => {
                 // Migrate adapter-local state.
                 self.inodes.rename(&from, &to);
-                if let Some((_, v)) = self.mode_overrides.remove(&from) {
-                    self.mode_overrides.insert(to.clone(), v);
-                }
+                rekey_mode_overrides(&self.mode_overrides, &from, &to);
                 Ok(())
             }
             // CR-1-6 (FUSE-4/CO-4-16): route through cluster_err_to_errno.
@@ -1397,6 +1410,10 @@ fn cluster_err_to_errno(err: &anyhow::Error) -> Errno {
             // reports the tree gone while it is still there.
             if status.code() == tonic::Code::FailedPrecondition {
                 return Errno::from(libc::ENOTEMPTY);
+            }
+            // Manager rejects e.g. rename into its own subtree.
+            if status.code() == tonic::Code::InvalidArgument {
+                return Errno::from(libc::EINVAL);
             }
             // Any other status (Unavailable, DeadlineExceeded, Internal, ...)
             // is transient or non-NotFound/non-FailedPrecondition — never
@@ -1610,6 +1627,33 @@ mod inode_map_rename_tests {
     use super::*;
 
     #[test]
+    fn mode_overrides_follow_a_renamed_directory() {
+        let m: DashMap<String, u16> = DashMap::new();
+        m.insert("/a".into(), 0o700);
+        m.insert("/a/f".into(), 0o600);
+        m.insert("/a/sub/g".into(), 0o640);
+        m.insert("/ab/f".into(), 0o444);
+        rekey_mode_overrides(&m, "/a", "/b");
+        assert_eq!(*m.get("/b").unwrap(), 0o700);
+        assert_eq!(*m.get("/b/f").unwrap(), 0o600);
+        assert_eq!(*m.get("/b/sub/g").unwrap(), 0o640);
+        assert_eq!(*m.get("/ab/f").unwrap(), 0o444, "string-prefix sibling untouched");
+        assert!(m.get("/a/f").is_none() && m.get("/a").is_none());
+    }
+
+    /// Manager rename-into-own-subtree (InvalidArgument) must be EINVAL.
+    #[test]
+    fn invalid_argument_maps_to_einval_and_others_unchanged() {
+        let e = anyhow::Error::new(tonic::Status::invalid_argument("subtree"))
+            .context("rename failed");
+        assert_eq!(cluster_err_to_errno(&e), Errno::from(libc::EINVAL));
+        let fp = anyhow::Error::new(tonic::Status::failed_precondition("x"));
+        assert_eq!(cluster_err_to_errno(&fp), Errno::from(libc::ENOTEMPTY));
+        let int = anyhow::Error::new(tonic::Status::internal("x"));
+        assert_eq!(cluster_err_to_errno(&int), Errno::from(libc::EIO));
+    }
+
+    #[test]
     fn rename_rekeys_children_of_a_renamed_directory() {
         let m = InodeMap::new();
         let d = m.inode_for("/a");
@@ -1710,6 +1754,7 @@ mod forget_and_snapshot_tests {
             name: name.to_string(),
             size: 10,
             is_directory: dir,
+            is_symlink: false,
             created_at: SystemTime::UNIX_EPOCH,
             modified_at: SystemTime::UNIX_EPOCH,
         }
@@ -1799,6 +1844,7 @@ mod forget_and_snapshot_tests {
         let a = DtfsAttr {
             size: 0,
             is_directory: true,
+            is_symlink: false,
             created_at: SystemTime::UNIX_EPOCH,
             modified_at: SystemTime::UNIX_EPOCH,
         };
@@ -1807,5 +1853,10 @@ mod forget_and_snapshot_tests {
         assert_eq!(d.perm, 0o700, "chmod override is honoured");
         let f = build_attr(6, &DtfsAttr { is_directory: false, ..a }, 0o600);
         assert_eq!((f.nlink, f.perm), (1, 0o600));
+        assert_eq!(f.kind, FileType::RegularFile);
+        let l = build_attr(7, &DtfsAttr { is_directory: false, is_symlink: true, ..a }, 0o777);
+        let l = (l.kind, l.nlink);
+        assert_eq!(l, (FileType::Symlink, 1));
+        assert_eq!(file_kind(true, true), FileType::Directory);
     }
 }

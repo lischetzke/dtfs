@@ -13,13 +13,12 @@ use dtfs_proto::dtfs::data::data_service_client::DataServiceClient;
 use dtfs_proto::dtfs::data::{GetChunkRequest, PutChunkRequest};
 use dtfs_proto::dtfs::manager::manager_service_client::ManagerServiceClient;
 use dtfs_proto::dtfs::manager::{
-    AcquireLockRequest, AcquireLockResponse, AcquireWriteLeaseRequest, AcquireWriteLeaseResponse,
+    AcquireWriteLeaseRequest, AcquireWriteLeaseResponse,
     AllocateChunksRequest, AllocateChunksResponse, ChunkLocationCommit, ClusterCapacityRequest,
     CommitChunkLocationsRequest, CreateFileRequest, CreateFileResponse, CreateLinkRequest,
     CreateSymlinkRequest, DeleteFileRequest, DeleteFileResponse, GetFileLocationsRequest,
-    GetFileLocationsResponse, ListDirectoryRequest, ListDirectoryResponse, ProbeLockRequest,
-    ProbeLockResponse, ReadSymlinkRequest, ReleaseLeasesByHostRequest,
-    ReleaseLeasesByHostResponse, ReleaseLockRequest, ReleaseWriteLeaseRequest, RenameFileRequest,
+    GetFileLocationsResponse, ListDirectoryRequest, ListDirectoryResponse, ReadSymlinkRequest, ReleaseLeasesByHostRequest,
+    ReleaseLeasesByHostResponse, ReleaseWriteLeaseRequest, RenameFileRequest,
     RenewWriteLeaseRequest, RenewWriteLeaseResponse, SetFileSizeRequest,
 };
 
@@ -1173,84 +1172,6 @@ impl DtfsClient {
             .await?
             .into_inner();
         Ok((resp.total_bytes, resp.used_bytes, resp.file_count))
-    }
-
-    // ---- Distributed POSIX byte-range locks (F-039) ----
-
-    pub async fn acquire_lock(
-        &self,
-        path: &str,
-        owner_id: &str,
-        start: u64,
-        end: u64,
-        write: bool,
-        blocking: bool,
-        lease_ms: u64,
-    ) -> Result<AcquireLockResponse> {
-        let request = AcquireLockRequest {
-            path: path.to_string(),
-            owner_id: owner_id.to_string(),
-            start,
-            end,
-            write,
-            blocking,
-            lease_ms,
-        };
-        let resp = self
-            .call_manager("acquire_lock", false, |mut c| {
-                let r = self.stamp_mgr_mutation("AcquireLock", &request.path, request.clone());
-                async move { c.acquire_lock(r).await }
-            })
-            .await?
-            .into_inner();
-        Ok(resp)
-    }
-
-    pub async fn release_lock(
-        &self,
-        path: &str,
-        owner_id: &str,
-        start: u64,
-        end: u64,
-    ) -> Result<()> {
-        let request = ReleaseLockRequest {
-            path: path.to_string(),
-            owner_id: owner_id.to_string(),
-            start,
-            end,
-        };
-        let _ = self
-            .call_manager("release_lock", false, |mut c| {
-                let r = self.stamp_mgr_mutation("ReleaseLock", &request.path, request.clone());
-                async move { c.release_lock(r).await }
-            })
-            .await?;
-        Ok(())
-    }
-
-    pub async fn probe_lock(
-        &self,
-        path: &str,
-        owner_id: &str,
-        start: u64,
-        end: u64,
-        write: bool,
-    ) -> Result<ProbeLockResponse> {
-        let request = ProbeLockRequest {
-            path: path.to_string(),
-            owner_id: owner_id.to_string(),
-            start,
-            end,
-            write,
-        };
-        let resp = self
-            .call_manager("probe_lock", true, |mut c| {
-                let r = request.clone();
-                async move { c.probe_lock(r).await }
-            })
-            .await?
-            .into_inner();
-        Ok(resp)
     }
 
     // ---- P0-1: single-writer leases ----

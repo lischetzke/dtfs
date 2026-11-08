@@ -345,6 +345,8 @@ message GetFileLocationsResponse {
   // (which silently applies default-volume RF/tier/anchor to a
   // non-default-volume file on every refresh after the first).
   string volume_id = 8;
+  // Path is a symlink (FileMetadata.symlink_target is set). Old managers send false.
+  bool is_symlink = 9;
 }
 
 // --- DeleteFile ---
@@ -367,6 +369,8 @@ message DirectoryEntry {
   bool is_directory = 3;
   int64 created_at = 4;
   int64 modified_at = 5;
+  // Entry is a symlink. Old managers send false.
+  bool is_symlink = 6;
 }
 
 message ListDirectoryResponse {
