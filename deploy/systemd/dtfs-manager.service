@@ -34,7 +34,7 @@ SendSIGKILL=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/dtfs/manager
+ReadWritePaths=/var/lib/dtfs/manager /etc/dtfs
 PrivateTmp=yes
 
 # Environment — P1-11: keep openraft/tonic quiet so 48h soaks don't fill
