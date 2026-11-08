@@ -306,9 +306,17 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Pick up the server context (write_slots + max_writes) so we can drain.
-    let server_ctx = ctx_rx
-        .await
-        .map_err(|e| anyhow::anyhow!("server never published its context: {e}"))?;
+    // A server that fails before publishing (bad listen_addr, bind error)
+    // drops the sender; surface its real error instead of the channel's.
+    let server_ctx = match ctx_rx.await {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            return match server_handle.await {
+                Ok(Err(e)) => Err(e.context("data gRPC server failed to start")),
+                _ => Err(anyhow::anyhow!("data gRPC server exited before publishing its context")),
+            };
+        }
+    };
 
     // Wait for the server to stop accepting connections.
     match server_handle.await {

@@ -141,7 +141,9 @@ pub async fn run_grpc_server(
     shutdown: impl std::future::Future<Output = ()>,
     ctx_tx: Option<tokio::sync::oneshot::Sender<ServerContext>>,
 ) -> anyhow::Result<()> {
-    let addr = config.grpc.listen_addr.parse()?;
+    let addr = anyhow::Context::with_context(config.grpc.listen_addr.parse(), || {
+        format!("grpc.listen_addr {:?} must be ip:port", config.grpc.listen_addr)
+    })?;
     let replication = Arc::new(ReplicationManager::new(
         store.clone(),
         config.clone(),
