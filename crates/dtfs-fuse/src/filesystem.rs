@@ -2024,24 +2024,39 @@ impl DtfsFilesystem {
             let guard = self.path_guard(&path).await;
             // Re-check under the lock: release or rename may have won.
             let still_open = self.open_files.get(&fh).map(|f| f.path == path) == Some(true);
-            let result = if still_open { self.commit_all(fh).await } else { Ok(()) };
-            if let Err(e) = result {
-                let (idx, bytes) = self.write_buffer.pending_summary(&path);
-                error!(
-                    path = %path,
-                    chunk_indices = ?idx,
-                    bytes,
-                    error = %format!("{e:#}"),
-                    "async commit failed; bytes kept for retry, next fsync/close returns EIO"
-                );
-                let msg = format!("async commit of {path} failed: {e:#}");
-                for mut f in self.open_files.iter_mut() {
-                    if f.path == path && f.flags.is_writable() {
-                        f.write_error = Some(msg.clone());
-                    }
-                }
+            if still_open {
+                let result = self.commit_all(fh).await;
+                self.record_aged_commit(&path, result);
             }
             self.drop_path_guard(&path, guard);
+        }
+    }
+
+    /// Timer commit result for `path`: a failure is logged and arms every
+    /// writer's sticky error (bytes restored, retried next tick); a success
+    /// clears it (the bytes it reported are committed now).
+    fn record_aged_commit(&self, path: &str, result: Result<()>) {
+        let Err(e) = result else {
+            for mut f in self.open_files.iter_mut() {
+                if f.path == path {
+                    f.write_error = None;
+                }
+            }
+            return;
+        };
+        let (idx, bytes) = self.write_buffer.pending_summary(path);
+        error!(
+            path = %path,
+            chunk_indices = ?idx,
+            bytes,
+            error = %format!("{e:#}"),
+            "async commit failed; bytes kept for retry, next fsync/close returns EIO"
+        );
+        let msg = format!("async commit of {path} failed: {e:#}");
+        for mut f in self.open_files.iter_mut() {
+            if f.path == path && f.flags.is_writable() {
+                f.write_error = Some(msg.clone());
+            }
         }
     }
 
@@ -2068,18 +2083,21 @@ impl DtfsFilesystem {
             Some(p) => self.path_guard(p).await,
             None => None,
         };
-        let flush_result = if self.open_files.contains_key(&fh) {
-            // Release always commits everything; a pending async_commit
-            // error (never set when off) is reported if the commit succeeds.
-            self.commit_all(fh).await.and_then(|()| {
-                match self.open_files.get_mut(&fh).and_then(|mut f| f.write_error.take()) {
-                    Some(msg) => Err(anyhow::anyhow!(msg)),
-                    None => Ok(()),
-                }
-            })
+        let commit_result = if self.open_files.contains_key(&fh) {
+            self.commit_all(fh).await
         } else {
             Ok(())
         };
+        // Release always commits everything; a pending async_commit error
+        // (never set when off) is reported if the commit succeeds, but only
+        // the commit itself decides the buffer drop and the ghost unlink.
+        let commit_failed = commit_result.is_err();
+        let flush_result = commit_result.and_then(|()| {
+            match self.open_files.get_mut(&fh).and_then(|mut f| f.write_error.take()) {
+                Some(msg) => Err(anyhow::anyhow!(msg)),
+                None => Ok(()),
+            }
+        });
 
         if let Some((_, file)) = self.open_files.remove(&fh) {
             // P0-1: release the write lease (if held). Best-effort: a
@@ -2118,7 +2136,7 @@ impl DtfsFilesystem {
                     // here (the data is lost on the cluster too) but the
                     // error is propagated below so the caller sees the
                     // failure rather than a silent success.
-                    if flush_result.is_err() {
+                    if commit_failed {
                         let (idx, bytes) = self.write_buffer.pending_summary(&file.path);
                         if bytes > 0 {
                             error!(
@@ -2139,7 +2157,7 @@ impl DtfsFilesystem {
             // `true`, and every successful commit (flush() or write()-driven
             // batch/cap flush) sets it on all handles of the path. `flush()`
             // always restores drained segments on failure so a retry works.
-            if should_ghost_unlink(flush_result.is_err(), file.committed_any) {
+            if should_ghost_unlink(commit_failed, file.committed_any) {
                 warn!(
                     path = %file.path,
                     "flush of never-committed file failed at release; unlinking ghost entry",
@@ -5382,6 +5400,59 @@ mod async_commit_fs_tests {
         fs.drop_path_guard("/c", gc);
         fs.drop_path_guard("/b", gb);
         fs.drop_path_guard("/ab", gab);
+    }
+
+    /// A later timer retry that succeeds clears the sticky error: the bytes
+    /// it reported are committed now.
+    #[tokio::test]
+    async fn successful_timer_retry_clears_the_sticky_error() {
+        let fs = fs(true);
+        let a = open(&fs, "/f", OpenFlags::ReadWrite);
+        let b = open(&fs, "/f", OpenFlags::WriteOnly);
+        fs.record_aged_commit("/f", Err(anyhow::anyhow!("put failed")));
+        assert!(fs.open_files.get(&a).unwrap().write_error.is_some());
+        fs.record_aged_commit("/f", Ok(()));
+        assert!(fs.open_files.get(&a).unwrap().write_error.is_none(), "retry succeeded");
+        assert!(fs.open_files.get(&b).unwrap().write_error.is_none());
+        fs.fsync(a).await.expect("nothing pending after a successful retry");
+    }
+
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Logs {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Ghost unlink of a never-committed file follows release's own commit
+    /// result only, not a stale background error the commit already fixed.
+    #[tokio::test]
+    async fn release_ghost_unlink_ignores_a_pending_background_error() {
+        let logs = Logs::default();
+        let w = logs.clone();
+        let sub = tracing_subscriber::fmt().with_writer(move || w.clone()).with_ansi(false).finish();
+        let _g = tracing::subscriber::set_default(sub);
+        let ghost = "unlinking ghost entry";
+        for (buffered, pending, expect_unlink) in [(false, true, false), (true, false, true)] {
+            logs.0.lock().unwrap().clear();
+            let fs = fs(true);
+            let fh = open(&fs, "/g", OpenFlags::ReadWrite);
+            fs.open_files.get_mut(&fh).unwrap().committed_any = false;
+            if pending {
+                fs.open_files.get_mut(&fh).unwrap().write_error = Some("old timer failure".into());
+            }
+            if buffered {
+                fs.write_buffer.write("/g", 0, b"new");
+            }
+            assert!(fs.release(fh).await.is_err(), "pending error or failed commit is reported");
+            let out = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(out.contains(ghost), expect_unlink, "buffered={buffered}: {out}");
+        }
     }
 
     #[tokio::test]
