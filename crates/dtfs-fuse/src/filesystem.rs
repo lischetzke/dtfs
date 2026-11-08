@@ -5458,6 +5458,107 @@ mod async_commit_fs_tests {
         assert_eq!(fs.fh_path_guard(999).await.0, None, "unknown fh");
     }
 
+    /// Client connected to a manager that accepts and never answers: a
+    /// commit through it stays in flight until aborted.
+    async fn black_hole_client() -> (DtfsClient, tokio::task::JoinHandle<()>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let hole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                held.push(s);
+            }
+        });
+        let client = DtfsClient::new();
+        client.connect(&addr).await.expect("black-hole manager accepts");
+        (client, hole)
+    }
+
+    /// Writer fs over `client` with a chunkless snapshot of `eof` bytes on
+    /// `/f` (zero seeds, no I/O); `fill` complete chunks of 1s buffered.
+    fn writer_fs(client: &DtfsClient, async_on: bool, eof_chunks: u64, eof_extra: u64, fill: u32) -> (Arc<DtfsFilesystem>, u64, u64) {
+        let mut cfg: FuseConfig =
+            toml::from_str(include_str!("../../../deploy/examples/fuse.toml")).unwrap();
+        cfg.write.async_commit = async_on;
+        let fs = Arc::new(DtfsFilesystem::new(client.clone(), cfg.location.clone(), cfg));
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let eof = eof_chunks * cs + eof_extra;
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/f", eof, cs)));
+        for i in 0..fill {
+            fs.write_buffer.write("/f", i as u64 * cs, &vec![1; cs as usize]);
+        }
+        (fs, fh, cs)
+    }
+
+    /// Start `fs.write(fh, offset, data)` and wait until its commit is
+    /// stuck on the black-hole manager.
+    async fn stuck_write(fs: &Arc<DtfsFilesystem>, fh: u64, offset: u64, data: Vec<u8>) -> tokio::task::JoinHandle<Result<u32>> {
+        let f2 = fs.clone();
+        let w = tokio::spawn(async move { f2.write(fh, offset, &data).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!w.is_finished(), "the commit must still be in flight");
+        w
+    }
+
+    fn overlay_len(fs: &DtfsFilesystem, at: u64, len: usize) -> usize {
+        fs.write_buffer.overlay("/f", at, &mut vec![0u8; len])
+    }
+
+    /// The final cap drain of a write into a zero-seeded chunk below EOF
+    /// drains the other complete chunks but not the write's own (`keep`):
+    /// drained, it would take the seed and leave the write's bytes in a
+    /// fresh unseeded chunk. The drained chunks stay visible in flight.
+    #[tokio::test]
+    async fn cap_drain_keeps_the_pending_writes_seeded_chunk_and_stays_visible() {
+        let (client, hole) = black_hole_client().await;
+        let full = (crate::writebuf::DIRTY_BYTES_CAP / (4 << 20)) as u32;
+        for async_on in [false, true] {
+            let (fs, fh, cs) = writer_fs(&client, async_on, 64, 0, full);
+            assert_eq!(full as u64 * cs, crate::writebuf::DIRTY_BYTES_CAP as u64);
+            let w = stuck_write(&fs, fh, 40 * cs + 10, vec![2; 10]).await;
+            assert!(fs.write_buffer.has_chunk("/f", 40), "async={async_on}: the write's seeded chunk was drained");
+            assert_eq!(fs.write_buffer.dirty_bytes("/f"), cs as usize, "only chunk 40 left");
+            assert_eq!(overlay_len(&fs, 0, cs as usize), cs as usize, "async={async_on}: drained chunk 0 invisible");
+            w.abort();
+            let _ = w.await;
+            assert_eq!(overlay_len(&fs, 0, cs as usize), 0, "overlay ends with the commit");
+        }
+        hole.abort();
+    }
+
+    /// The hole-fill cap drain keeps the drained chunks visible in flight.
+    #[tokio::test]
+    async fn hole_fill_cap_drain_stays_visible_in_flight() {
+        let (client, hole) = black_hole_client().await;
+        let full = (crate::writebuf::DIRTY_BYTES_CAP / (4 << 20)) as u32;
+        for async_on in [false, true] {
+            let (fs, fh, cs) = writer_fs(&client, async_on, full as u64, 100, full);
+            let w = stuck_write(&fs, fh, (full as u64 + 2) * cs, vec![2; 10]).await;
+            assert!(!fs.write_buffer.has_chunk("/f", 0), "chunk 0 drained by the hole-fill cap drain");
+            assert_eq!(overlay_len(&fs, 0, cs as usize), cs as usize, "async={async_on}: drained chunk 0 invisible");
+            w.abort();
+            let _ = w.await;
+        }
+        hole.abort();
+    }
+
+    /// write()'s batch flush keeps the drained batch visible in flight.
+    #[tokio::test]
+    async fn write_batch_flush_stays_visible_in_flight() {
+        let (client, hole) = black_hole_client().await;
+        for async_on in [false, true] {
+            let (fs, fh, cs) = writer_fs(&client, async_on, 0, 0, 0);
+            let w = stuck_write(&fs, fh, 0, vec![3; 4 * cs as usize]).await;
+            assert_eq!(fs.write_buffer.dirty_bytes("/f"), 0, "batch drained");
+            assert_eq!(fs.write_buffer.visible_size("/f"), Some(4 * cs), "async={async_on}: drained batch invisible");
+            assert_eq!(overlay_len(&fs, 0, 4 * cs as usize), 4 * cs as usize);
+            w.abort();
+            let _ = w.await;
+        }
+        hole.abort();
+    }
+
     /// The config bound must stay at half the write lease (renewed only by
     /// write() and commits, not by the timer's wait).
     #[test]
