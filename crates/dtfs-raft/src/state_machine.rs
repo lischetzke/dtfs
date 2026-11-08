@@ -19,7 +19,7 @@ use dtfs_common::types::{AnchorPolicy, VolumeConfig};
 
 use crate::snapshot::{self, StateMachineSnapshot};
 use crate::{
-    merge_chunk_location_entries, ChunkLocationEntry, ClientRequest, ClientResponse, TypeConfig,
+    merge_chunk_location_entries, union_chunk_location_entries, ChunkLocationEntry, ClientRequest, ClientResponse, TypeConfig,
 };
 #[cfg(test)]
 use crate::legacy_disk_id;
@@ -1180,7 +1180,16 @@ fn apply_request(
             }
 
             if let Some(file) = sm.files.get_mut(path) {
-                file.chunks = merge_chunk_location_entries(&file.chunks, chunks);
+                if lease_id.is_empty() {
+                    let (merged, skipped) = union_chunk_location_entries(&file.chunks, chunks);
+                    if !skipped.is_empty() {
+                        warn!(path = %path, indices = ?skipped,
+                            "UpdateChunkLocations: lease-less write skipped stale chunk indices (hash not current)");
+                    }
+                    file.chunks = merged;
+                } else {
+                    file.chunks = merge_chunk_location_entries(&file.chunks, chunks);
+                }
                 file.updated_at_ms = eff_now_ms;
                 // RAFT-3 — `logical_size` is set once by SetFileSize (e.g.
                 // O_TRUNC → SetFileSize(0)) and never revisited, so a

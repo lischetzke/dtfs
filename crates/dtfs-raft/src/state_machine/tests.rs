@@ -3271,4 +3271,133 @@ mod raft_audit_fix_tests {
         assert!(matches!(rename(&mut sm, 4, "/f", "/g"), ClientResponse::Success));
         assert!(!sm.files.contains_key("/f") && sm.files.contains_key("/g"));
     }
+
+    fn row(idx: u64, hash: &str, node: &str, disk: u32) -> ChunkLocationEntry {
+        ChunkLocationEntry {
+            chunk_index: idx, chunk_hash: hash.into(), node_id: node.into(),
+            disk_id: disk, size_bytes: 10,
+        }
+    }
+
+    fn upd(sm: &mut StateMachineData, i: u64, lease: &str, rows: Vec<ChunkLocationEntry>) -> ClientResponse {
+        apply_request(sm, &lid(i), &ClientRequest::UpdateChunkLocations {
+            path: "/f".into(), chunks: rows, lease_id: lease.into(), now_ms: 0,
+        })
+    }
+
+    #[test]
+    fn union_adds_missing_replica_and_never_removes() {
+        let existing = vec![row(0, "h", "1", 0), row(0, "h", "2", 0)];
+        // Stale incoming only knows node 1 and a new node 3.
+        let (out, skipped) = union_chunk_location_entries(
+            &existing, &[row(0, "h", "1", 0), row(0, "h", "3", 0)]);
+        assert!(skipped.is_empty());
+        let nodes: Vec<&str> = out.iter().map(|e| e.node_id.as_str()).collect();
+        assert_eq!(nodes, ["1", "2", "3"], "node 2 kept, node 3 added");
+    }
+
+    #[test]
+    fn union_skips_stale_hash_but_allows_initial_add() {
+        let existing = vec![row(0, "new", "1", 0)];
+        let (out, skipped) = union_chunk_location_entries(
+            &existing, &[row(0, "old", "2", 0), row(1, "x", "2", 0)]);
+        assert_eq!(skipped, vec![0], "old-hash write to index 0 is stale");
+        assert_eq!(out, vec![row(0, "new", "1", 0), row(1, "x", "2", 0)]);
+    }
+
+    #[test]
+    fn lease_less_write_keeps_removed_row_removed_and_lease_write_replaces() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/f");
+        upd(&mut sm, 2, "", vec![row(0, "h", "1", 0), row(0, "h", "2", 0)]);
+        apply_request(&mut sm, &lid(3), &ClientRequest::RemoveChunkLocation {
+            path: "/f".into(), chunk_index: 0, node_id: "2".into(), disk_id: 0,
+            enforce_anchor: None, now_ms: 0,
+        });
+        assert_eq!(sm.files["/f"].chunks.len(), 1);
+        // Stale scheduler write built from the pre-removal read of node 1 only.
+        upd(&mut sm, 4, "", vec![row(0, "h", "1", 0)]);
+        assert_eq!(sm.files["/f"].chunks, vec![row(0, "h", "1", 0)]);
+        // Lease holder keeps replace semantics (new content).
+        apply_request(&mut sm, &lid(5), &ClientRequest::AcquireWriteLease {
+            path: "/f".into(), owner_id: "w".into(), lease_ms: 60_000, now_ms: 1,
+            proposed_lease_id: "L".into(),
+        });
+        upd(&mut sm, 6, "L", vec![row(0, "h2", "3", 0)]);
+        assert_eq!(sm.files["/f"].chunks, vec![row(0, "h2", "3", 0)]);
+    }
+
+    /// Property: over random op sequences a lease-less write never removes a
+    /// row, never changes the hash set of an index that already had rows, and
+    /// only adds rows it carried.
+    #[test]
+    fn lease_less_update_property_over_random_ops() {
+        for seed in 1..=40u64 {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut rnd = move |n: u64| {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                x % n
+            };
+            let mut sm = StateMachineData::default();
+            create(&mut sm, 1, "/f");
+            let mut idx = 10u64;
+            for _ in 0..60 {
+                idx += 1;
+                let pre = sm.files["/f"].chunks.clone();
+                match rnd(4) {
+                    0 | 1 => {
+                        let n = rnd(3) + 1;
+                        let rows: Vec<_> = (0..n).map(|_| row(
+                            rnd(2), &format!("h{}", rnd(2)), &rnd(3).to_string(), rnd(2) as u32)).collect();
+                        upd(&mut sm, idx, "", rows.clone());
+                        let post = &sm.files["/f"].chunks;
+                        for r in &pre {
+                            assert!(post.contains(r), "seed {seed}: lease-less write removed {r:?}");
+                        }
+                        for r in post.iter().filter(|r| !pre.contains(r)) {
+                            assert!(rows.contains(r), "seed {seed}: row {r:?} not carried by the write");
+                        }
+                        for i in 0..2u64 {
+                            let hs = |v: &[ChunkLocationEntry]| {
+                                let mut h: Vec<_> = v.iter().filter(|e| e.chunk_index == i)
+                                    .map(|e| e.chunk_hash.clone()).collect();
+                                h.sort(); h.dedup(); h
+                            };
+                            if !hs(&pre).is_empty() {
+                                assert_eq!(hs(&pre), hs(post), "seed {seed}: hash changed at {i}");
+                            }
+                        }
+                    }
+                    2 => {
+                        if let Some(r) = pre.first() {
+                            apply_request(&mut sm, &lid(idx), &ClientRequest::RemoveChunkLocation {
+                                path: "/f".into(), chunk_index: r.chunk_index,
+                                node_id: r.node_id.clone(), disk_id: r.disk_id,
+                                enforce_anchor: None, now_ms: 0,
+                            });
+                            let post = &sm.files["/f"].chunks;
+                            assert!(post.len() <= pre.len(), "seed {seed}");
+                        }
+                    }
+                    _ => {
+                        // Lease rewrite: replace semantics with fresh content.
+                        apply_request(&mut sm, &lid(idx), &ClientRequest::AcquireWriteLease {
+                            path: "/f".into(), owner_id: "w".into(), lease_ms: 60_000, now_ms: 1,
+                            proposed_lease_id: "L".into(),
+                        });
+                        let rows = vec![row(rnd(2), &format!("h{}", rnd(2)), &rnd(3).to_string(), 0)];
+                        let r = upd(&mut sm, idx, "L", rows.clone());
+                        if matches!(r, ClientResponse::Success) {
+                            for e in &rows {
+                                assert!(sm.files["/f"].chunks.contains(e), "seed {seed}");
+                            }
+                        }
+                        apply_request(&mut sm, &lid(idx), &ClientRequest::ReleaseWriteLease {
+                            path: "/f".into(), lease_id: "L".into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
 }

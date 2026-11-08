@@ -152,6 +152,54 @@ pub fn merge_chunk_location_entries(
     out
 }
 
+/// Lease-less (system-driven) variant of [`merge_chunk_location_entries`]:
+/// UNION semantics. A lease-less writer (scheduler replica registration)
+/// built `incoming` from a possibly stale read, so replacing an index's rows
+/// wholesale would resurrect removed rows, drop concurrent adds, or revert
+/// content. Instead, an incoming row is applied only when `existing` has no
+/// rows at that index yet (initial add) or already carries the same
+/// `(chunk_index, chunk_hash)`; rows are added when absent
+/// by `(chunk_index, chunk_hash, node_id, disk_id)`; nothing is ever removed
+/// and no hash is ever introduced. Returns the merged rows and the incoming
+/// chunk indices skipped as stale.
+pub fn union_chunk_location_entries(
+    existing: &[ChunkLocationEntry],
+    incoming: &[ChunkLocationEntry],
+) -> (Vec<ChunkLocationEntry>, Vec<u64>) {
+    let mut out: Vec<ChunkLocationEntry> = existing.to_vec();
+    let mut skipped: Vec<u64> = Vec::new();
+    for inc in incoming {
+        // An index with no rows yet is an initial add; one with rows must
+        // already carry this hash.
+        let has_rows = existing.iter().any(|e| e.chunk_index == inc.chunk_index);
+        let same_hash = existing
+            .iter()
+            .any(|e| e.chunk_index == inc.chunk_index && e.chunk_hash == inc.chunk_hash);
+        if has_rows && !same_hash {
+            if !skipped.contains(&inc.chunk_index) {
+                skipped.push(inc.chunk_index);
+            }
+            continue;
+        }
+        let present = out.iter().any(|e| {
+            e.chunk_index == inc.chunk_index
+                && e.chunk_hash == inc.chunk_hash
+                && e.node_id == inc.node_id
+                && e.disk_id == inc.disk_id
+        });
+        if !present {
+            out.push(inc.clone());
+        }
+    }
+    out.sort_by(|a, b| {
+        a.chunk_index
+            .cmp(&b.chunk_index)
+            .then_with(|| a.chunk_hash.cmp(&b.chunk_hash))
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    (out, skipped)
+}
+
 /// Node information stored in the Raft state machine (richer than `DtfsNode`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeInfo {
