@@ -92,11 +92,6 @@ pub fn deserialize_snapshot(mut cursor: Cursor<Vec<u8>>) -> io::Result<StateMach
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Write raw bytes into a fresh `Cursor`.
-pub fn cursor_from_bytes(data: Vec<u8>) -> Cursor<Vec<u8>> {
-    Cursor::new(data)
-}
-
 /// Extract the bytes from a cursor (rewinds first).
 pub fn bytes_from_cursor(mut cursor: Cursor<Vec<u8>>) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();

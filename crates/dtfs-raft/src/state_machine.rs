@@ -243,6 +243,93 @@ pub struct StateMachineData {
     pub write_leases: BTreeMap<String, WriteLease>,
 }
 
+impl StateMachineData {
+    /// Single restore path for `open_at` and `install_snapshot`. The
+    /// exhaustive destructure makes a new `StateMachineSnapshot` field a
+    /// compile error here until it is restored (or explicitly ignored).
+    /// `last_applied_log` / `last_membership` come from the snapshot META
+    /// (openraft's view), not the payload copies.
+    fn restore_from_snapshot(
+        &mut self,
+        last_log_id: Option<LogId>,
+        last_membership: StoredMembership,
+        snap: StateMachineSnapshot,
+    ) {
+        let StateMachineSnapshot {
+            last_applied_log: _,
+            last_membership: _,
+            files,
+            nodes,
+            cluster_config,
+            audit_log,
+            scrub_results,
+            scrub_results_by_level,
+            client_count,
+            volumes,
+            migration_state_json,
+            posix_locks,
+            write_leases,
+            pending_scrub,
+        } = snap;
+        self.last_applied_log = last_log_id;
+        self.last_membership = last_membership;
+        self.files = files;
+        self.nodes = nodes;
+        self.cluster_config = cluster_config;
+        self.audit_log = audit_log.into();
+        self.scrub_results = scrub_results;
+        self.scrub_results_by_level = scrub_results_by_level;
+        migrate_scrub_results_by_level(self);
+        self.client_count = client_count;
+        self.volumes = volumes;
+        self.migration_state_json = migration_state_json;
+        self.posix_locks = posix_locks;
+        self.write_leases = write_leases;
+        // CO-4-11 — assign even when None so a snapshot is the source of
+        // truth for pending_scrub.
+        self.pending_scrub = pending_scrub;
+    }
+
+    /// Build side of the snapshot; exhaustive over `StateMachineData` so a
+    /// new field cannot be silently left out of snapshots.
+    fn to_snapshot(&self) -> StateMachineSnapshot {
+        let StateMachineData {
+            last_applied_log,
+            last_membership,
+            files,
+            nodes,
+            cluster_config,
+            audit_log,
+            scrub_results,
+            scrub_results_by_level,
+            pending_scrub,
+            client_count,
+            volumes,
+            migration_state_json,
+            posix_locks,
+            write_leases,
+        } = self;
+        StateMachineSnapshot {
+            last_applied_log: last_applied_log
+                .as_ref()
+                .map(|lid| (lid.leader_id.term, lid.index)),
+            last_membership: serde_json::to_value(last_membership).ok(),
+            files: files.clone(),
+            nodes: nodes.clone(),
+            cluster_config: cluster_config.clone(),
+            audit_log: audit_log.iter().cloned().collect(),
+            scrub_results: scrub_results.clone(),
+            scrub_results_by_level: scrub_results_by_level.clone(),
+            client_count: *client_count,
+            volumes: volumes.clone(),
+            migration_state_json: migration_state_json.clone(),
+            posix_locks: posix_locks.clone(),
+            write_leases: write_leases.clone(),
+            pending_scrub: pending_scrub.clone(),
+        }
+    }
+}
+
 impl Default for StateMachineData {
     fn default() -> Self {
         Self {
@@ -526,23 +613,11 @@ impl StateMachineStore {
                 .data
                 .try_write()
                 .expect("fresh store, no contention");
-            sm.last_applied_log = persisted.meta.last_log_id.clone();
-            sm.last_membership = persisted.meta.last_membership.clone();
-            sm.files = snap.files;
-            sm.nodes = snap.nodes;
-            sm.cluster_config = snap.cluster_config;
-            sm.audit_log = snap.audit_log.into();
-            sm.scrub_results = snap.scrub_results;
-            sm.scrub_results_by_level = snap.scrub_results_by_level;
-            migrate_scrub_results_by_level(&mut sm);
-            sm.client_count = snap.client_count;
-            sm.volumes = snap.volumes;
-            sm.migration_state_json = snap.migration_state_json;
-            sm.posix_locks = snap.posix_locks;
-            sm.write_leases = snap.write_leases;
-            // CO-4-11 — assign even when None so a reloaded snapshot is the
-            // source of truth for pending_scrub on restart.
-            sm.pending_scrub = snap.pending_scrub;
+            sm.restore_from_snapshot(
+                persisted.meta.last_log_id.clone(),
+                persisted.meta.last_membership.clone(),
+                snap,
+            );
             drop(sm);
             let mut slot = store
                 .snapshot
@@ -632,24 +707,7 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
         let sm = &self.data;
 
         // Serialise the snapshot.
-        let snap = StateMachineSnapshot {
-            last_applied_log: sm.last_applied_log.as_ref().map(|lid| {
-                (lid.leader_id.term, lid.index)
-            }),
-            last_membership: serde_json::to_value(&sm.last_membership).ok(),
-            files: sm.files.clone(),
-            nodes: sm.nodes.clone(),
-            cluster_config: sm.cluster_config.clone(),
-            audit_log: sm.audit_log.iter().cloned().collect(),
-            scrub_results: sm.scrub_results.clone(),
-            scrub_results_by_level: sm.scrub_results_by_level.clone(),
-            client_count: sm.client_count,
-            volumes: sm.volumes.clone(),
-            migration_state_json: sm.migration_state_json.clone(),
-            posix_locks: sm.posix_locks.clone(),
-            write_leases: sm.write_leases.clone(),
-            pending_scrub: sm.pending_scrub.clone(),
-        };
+        let snap = sm.to_snapshot();
 
         let cursor = snapshot::serialize_snapshot(&snap)?;
         let data_bytes = cursor.into_inner();
@@ -781,23 +839,11 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         // Rebuild the state machine from the snapshot.
         {
             let mut sm = self.data.write().await;
-            sm.last_applied_log = meta.last_log_id.clone();
-            sm.last_membership = meta.last_membership.clone();
-            sm.files = snap_data.files;
-            sm.nodes = snap_data.nodes;
-            sm.cluster_config = snap_data.cluster_config;
-            sm.audit_log = snap_data.audit_log.into();
-            sm.scrub_results = snap_data.scrub_results;
-            sm.scrub_results_by_level = snap_data.scrub_results_by_level;
-            migrate_scrub_results_by_level(&mut sm);
-            sm.client_count = snap_data.client_count;
-            sm.volumes = snap_data.volumes;
-            sm.migration_state_json = snap_data.migration_state_json;
-            sm.posix_locks = snap_data.posix_locks;
-            sm.write_leases = snap_data.write_leases;
-            // CO-4-11 — assign even when None so an installed snapshot replaces
-            // a follower's stale pending_scrub with the source's value.
-            sm.pending_scrub = snap_data.pending_scrub;
+            sm.restore_from_snapshot(
+                meta.last_log_id.clone(),
+                meta.last_membership.clone(),
+                snap_data,
+            );
         }
 
         // Store the snapshot blob for later retrieval.
