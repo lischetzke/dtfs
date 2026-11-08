@@ -1347,6 +1347,23 @@ impl ChunkStore {
                     };
 
                     if file_meta.len() != chunk_meta.size {
+                        // The .meta may be the damaged side: the chunk id is
+                        // the content address, so re-hash the .dat against it
+                        // and repair the sidecar when it matches.
+                        match try_repair_meta_from_dat(
+                            disk_path, &path, &chunk_hex, file_meta.len(),
+                        ).await {
+                            MetaRepair::Repaired => {
+                                result.chunks_meta_repaired += 1;
+                                result.chunks_healthy += 1;
+                                continue;
+                            }
+                            MetaRepair::HashOkWriteFailed => {
+                                result.chunks_healthy += 1;
+                                continue;
+                            }
+                            MetaRepair::NotRepairable => {}
+                        }
                         result.chunks_size_mismatch += 1;
                         if !chunk_hex.is_empty() {
                             result.corrupt_chunk_ids.push(chunk_hex.clone());
@@ -1361,6 +1378,22 @@ impl ChunkStore {
                         match hash_chunk_file_incrementally(&path, file_meta.len()).await {
                             Ok(digest) => {
                                 if digest != chunk_meta.checksum {
+                                    // Same as the size case: only a mismatch
+                                    // against the chunk id is corruption.
+                                    match try_repair_meta_from_dat(
+                                        disk_path, &path, &chunk_hex, file_meta.len(),
+                                    ).await {
+                                        MetaRepair::Repaired => {
+                                            result.chunks_meta_repaired += 1;
+                                            result.chunks_healthy += 1;
+                                            continue;
+                                        }
+                                        MetaRepair::HashOkWriteFailed => {
+                                            result.chunks_healthy += 1;
+                                            continue;
+                                        }
+                                        MetaRepair::NotRepairable => {}
+                                    }
                                     result.chunks_corrupt += 1;
                                     if !chunk_hex.is_empty() {
                                         result.corrupt_chunk_ids.push(chunk_hex.clone());
@@ -2187,6 +2220,49 @@ mod tests {
             store.drain_pending_corruption(),
             vec![(gone.as_hex(), store.disk_id_for_path(&disk))]
         );
+    }
+
+    /// Good .dat + parseable-but-wrong .meta (bad checksum, or bad size):
+    /// scrub repairs the sidecar against the chunk id, no corruption report.
+    #[tokio::test]
+    async fn scrub_repairs_damaged_parseable_meta_against_chunk_id() {
+        let (store, _tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+        let vol = VolumeId::new("default".to_string());
+        let data = b"scrub-damaged-meta";
+        let id = ChunkId::from_bytes(checksum::compute(data));
+        store.put_chunk(&id, data, &vol, DiskTier::Hot).await.unwrap();
+        let mp = chunk_meta_path(&disk, &id);
+        for bad in [
+            |m: &mut ChunkMeta| m.checksum = [0xAB; 32],
+            |m: &mut ChunkMeta| m.size += 5,
+        ] {
+            let mut m: ChunkMeta = serde_json::from_str(&std::fs::read_to_string(&mp).unwrap()).unwrap();
+            bad(&mut m);
+            std::fs::write(&mp, serde_json::to_string(&m).unwrap()).unwrap();
+            let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+            assert!(res.corrupt_chunk_ids.is_empty(), "good bytes must not be reported");
+            assert_eq!(res.chunks_meta_repaired, 1);
+            let fixed: ChunkMeta = serde_json::from_str(&std::fs::read_to_string(&mp).unwrap()).unwrap();
+            assert_eq!(fixed.checksum, id.0);
+            assert_eq!(fixed.size, data.len() as u64);
+        }
+    }
+
+    /// Bytes that do not hash to the chunk id are corrupt even when the
+    /// .meta agrees with them.
+    #[tokio::test]
+    async fn scrub_reports_dat_not_matching_chunk_id_even_if_meta_agrees() {
+        let (store, _tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+        let vol = VolumeId::new("default".to_string());
+        let data = b"scrub-id-mismatch";
+        let id = ChunkId::from_bytes(checksum::compute(data));
+        store.put_chunk(&id, data, &vol, DiskTier::Hot).await.unwrap();
+        std::fs::write(chunk_data_path(&disk, &id), b"scrub-id-mismatcX").unwrap();
+        let res = store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+        assert_eq!(res.corrupt_chunk_ids, vec![id.as_hex()]);
+        assert_eq!(res.chunks_meta_repaired, 0);
     }
 
     /// A live copy on ANOTHER disk must not suppress the report for the

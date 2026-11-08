@@ -689,7 +689,10 @@ impl DataService for DataServiceImpl {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             let expected = match self.store.get_chunk_meta(&chunk_id).await {
-                Ok(m) => m.checksum,
+                // Compare against the content address (chunk id), not the
+                // sidecar: a damaged-but-parseable .meta must not make good
+                // bytes look corrupt and self-quarantine the node.
+                Ok(_) => chunk_id.0,
                 Err(_) => {
                     return Err(self.meta_absent_status(&chunk_id, &req.chunk_id, total_size, now_ms));
                 }
@@ -1221,6 +1224,28 @@ max_io_percent = 10
         let got = collect_stream(&svc, &chunk_hex).await.unwrap();
         assert_eq!(got.len(), data.len());
         assert_eq!(got, data, "streamed bytes must match the stored chunk");
+    }
+
+    // A damaged-but-parseable .meta (wrong checksum) must not make good
+    // bytes look corrupt: verify_on_read compares against the chunk id.
+    #[tokio::test]
+    async fn getchunk_verify_on_read_ignores_damaged_meta_checksum() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = vec![9u8; 4096];
+        let chunk_id = ChunkId::from_bytes(checksum::compute(&data));
+        svc.store
+            .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+        let (dat_path, _) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let meta_path = dat_path.with_extension("meta");
+        let mut m: dtfs_common::types::ChunkMeta =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        m.checksum = [0xCD; 32];
+        std::fs::write(&meta_path, serde_json::to_string(&m).unwrap()).unwrap();
+        let got = collect_stream(&svc, &chunk_id.as_hex()).await.expect("good bytes must stream");
+        assert_eq!(got, data);
     }
 
     // Bug BC-8 / U2 — verify_on_read mismatch on the streaming MISS path
