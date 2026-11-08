@@ -9,14 +9,14 @@ impl TaskScheduler {
     /// Schedule a replication task for a specific chunk.
     ///
     /// Creates a new task in `Pending` state that will be picked up on the
-    /// next scheduler tick.
+    /// next scheduler tick. Returns false when refused for the live-task budget.
     pub async fn schedule_replication(
         &self,
         chunk_id: &str,
         source_node: u64,
         target_node: u64,
         tier: DiskTier,
-    ) {
+    ) -> bool {
         // CO-3-5 — serialise with the tick's load-modify-save (and any
         // other concurrent schedule) so neither writer clobbers the
         // other's tasks or regresses `next_task_id`.
@@ -38,7 +38,21 @@ impl TaskScheduler {
                 chunk_id,
                 target_node, "Replication task already scheduled, skipping"
             );
-            return;
+            return true;
+        }
+
+        // Same live-task ceiling as the repair passes, so a promotion burst
+        // cannot starve anchor/mandatory repair. Callers drop the rest for
+        // this tick (planners are idempotent and retry next tick).
+        let live_tasks = state.tasks.values().filter(|t| task_blocks_requeue(t.status)).count();
+        if !task_budget_available(0, live_tasks) {
+            warn!(
+                chunk_id,
+                live_tasks,
+                max_live = MAX_LIVE_TASKS,
+                "replication task refused: live task budget exhausted"
+            );
+            return false;
         }
 
         let now_ms = now_millis();
@@ -75,6 +89,7 @@ impl TaskScheduler {
 
         state.tasks.insert(task_id, task);
         self.save_migration_state(&state).await;
+        true
     }
 
     /// AV-5-5 — return true when a replication task targeting `chunk_id`
@@ -302,6 +317,15 @@ impl TaskScheduler {
     pub(super) async fn check_misplaced_rebalance(&self) {
         const MAX_REMOVALS_PER_TICK: usize = 50;
 
+        let in_flight: std::collections::HashSet<String> = self
+            .load_migration_state()
+            .await
+            .tasks
+            .values()
+            .filter(|t| t.status != MigrationStatus::Done && t.status != MigrationStatus::Failed)
+            .map(|t| t.chunk_id.clone())
+            .collect();
+
         // Phase 1 — under a read lock, decide the safe removals.
         let removals: Vec<(String, u64, u64, u32, Option<dtfs_common::types::AnchorPolicy>, String)> = {
             let sm = self.state_data.read().await;
@@ -315,10 +339,6 @@ impl TaskScheduler {
                 };
                 let mandatory = vol.effective_mandatory_replicas().clone();
                 let anchor = vol.effective_anchor();
-                let cache_allow = vol.cache_replicas.hot.max
-                    + vol.cache_replicas.warm.max
-                    + vol.cache_replicas.cold.max
-                    + vol.cache_replicas.tape.max;
 
                 let mut by_idx: std::collections::BTreeMap<u64, Vec<&ChunkLocationEntry>> =
                     std::collections::BTreeMap::new();
@@ -326,6 +346,11 @@ impl TaskScheduler {
                     by_idx.entry(c.chunk_index).or_default().push(c);
                 }
                 for (idx, entries) in by_idx {
+                    // A chunk with a promotion/replication in flight is mid-way
+                    // to its goal; removing now causes remove / re-promote loops.
+                    if entries.first().map_or(false, |e| in_flight.contains(e.chunk_hash.as_str())) {
+                        continue;
+                    }
                     // CO-1-1 — carry disk_id alongside (node, dc, tier) so
                     // the removal targets the exact (node, disk) replica,
                     // never a co-located anchor copy on another disk.
@@ -344,6 +369,10 @@ impl TaskScheduler {
                             Some((nid, e.disk_id, info.location.datacenter.clone(), tier))
                         })
                         .collect();
+                    let cache_allow = crate::placement_state::cache_allowance(
+                        &vol.cache_replicas,
+                        crate::placement_state::distinct_dcs(reps.iter().map(|r| r.2.as_str())),
+                    );
                     if let Some((node, disk_id)) =
                         plan_excess_spill_removal(&reps, &mandatory, anchor.as_ref(), cache_allow)
                     {
@@ -370,6 +399,16 @@ impl TaskScheduler {
                 enforce_anchor: enforce,
             };
             match self.raft.client_write(req).await {
+                // A committed entry can still apply to ClientResponse::Error
+                // (refused removal): not removed, so no success log/audit.
+                Ok(r) if apply_error(&r.data).is_some() => warn!(
+                    path = %path,
+                    idx,
+                    node,
+                    disk_id,
+                    error = apply_error(&r.data).unwrap_or_default(),
+                    "Bug BX-11 excess-replica removal refused by apply"
+                ),
                 Ok(_) => {
                     info!(
                         path = %path,
@@ -459,6 +498,18 @@ impl TaskScheduler {
                 enforce_anchor: anchor,
             };
             match self.raft.client_write(req).await {
+                // Apply refused (e.g. would strand the anchor): the stale row
+                // is still there, so count it unreconcilable.
+                Ok(r) if apply_error(&r.data).is_some() => {
+                    warn!(
+                        node = node_id,
+                        path = %path,
+                        chunk_index,
+                        error = apply_error(&r.data).unwrap_or_default(),
+                        "REV-3-10: apply refused dropping a missing replica row"
+                    );
+                    unreconcilable += 1;
+                }
                 Ok(_) => debug!(
                     node = node_id,
                     path = %path,
@@ -493,7 +544,7 @@ impl TaskScheduler {
                 node_id: *id,
                 datacenter: info.location.datacenter.clone(),
                 healthy: info.health == HealthStatus::Healthy,
-                tiers: info.disks.iter().map(|d| d.tier).collect(),
+                tiers: anchor_target_tiers(info, &self.placement_cfg),
             })
             .collect();
 
@@ -646,6 +697,29 @@ impl TaskScheduler {
     }
 }
 
+/// A Raft `client_write` returning `Ok` only means the entry committed; the
+/// apply may still have produced `ClientResponse::Error`. Returns that message.
+pub(crate) fn apply_error(resp: &dtfs_raft::ClientResponse) -> Option<&str> {
+    match resp {
+        dtfs_raft::ClientResponse::Error { message } => Some(message.as_str()),
+        _ => None,
+    }
+}
+
+/// Tiers a node can take a NEW anchor copy on: live disks (not
+/// Failed/Removed) that still have room.
+pub(crate) fn anchor_target_tiers(
+    info: &dtfs_raft::NodeInfo,
+    cfg: &dtfs_common::config::PlacementConfig,
+) -> Vec<DiskTier> {
+    info.disks
+        .iter()
+        .filter(|d| !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed))
+        .filter(|d| cfg.has_room(d.total_bytes, d.used_bytes))
+        .map(|d| d.tier)
+        .collect()
+}
+
 /// AV-3-3 — projection of a node's state used by the anchor-lag
 /// planner.
 #[derive(Debug, Clone)]
@@ -748,22 +822,11 @@ pub(crate) fn plan_excess_spill_removal(
             .filter(|(i, _)| *i != idx)
             .map(|(_, r)| r)
             .collect();
-        let on_tier = |t: DiskTier| remaining.iter().filter(|(_, _, _, tt)| *tt == t).count() as u32;
-        let tiers_ok = on_tier(DiskTier::Hot) >= mandatory.hot
-            && on_tier(DiskTier::Warm) >= mandatory.warm
-            && on_tier(DiskTier::Cold) >= mandatory.cold
-            && on_tier(DiskTier::Tape) >= mandatory.tape;
-        let anchor_ok = match anchor {
-            None => true,
-            Some(a) => remaining.iter().any(|(_, _, dc, tt)| {
-                dc == &a.datacenter
-                    && match a.required_tier {
-                        Some(rt) => *tt == rt,
-                        None => true,
-                    }
-            }),
-        };
-        if tiers_ok && anchor_ok {
+        if crate::placement_state::goal_met(
+            remaining.iter().map(|(_, _, dc, tt)| (dc.as_str(), *tt)),
+            mandatory,
+            anchor,
+        ) {
             return Some((*node, *disk_id));
         }
     }
@@ -782,13 +845,10 @@ pub(crate) fn plan_anchor_lag_repair(
     existing_tasks: &std::collections::HashSet<(String, u64)>,
 ) -> Option<AnchorRepairAction> {
     // Gate 1 — is the anchor already satisfied?
-    let satisfied = placements.iter().any(|p| {
-        p.dc == anchor.datacenter
-            && match anchor.required_tier {
-                Some(t) => p.tier == t,
-                None => true,
-            }
-    });
+    let satisfied = crate::placement_state::anchor_met(
+        anchor,
+        placements.iter().map(|p| (p.dc.as_str(), p.tier)),
+    );
     if satisfied {
         return None;
     }
@@ -814,7 +874,7 @@ pub(crate) fn plan_anchor_lag_repair(
     let target = nodes
         .iter()
         .filter(|n| n.healthy)
-        .filter(|n| n.datacenter == anchor.datacenter)
+        .filter(|n| n.datacenter.eq_ignore_ascii_case(&anchor.datacenter))
         .filter(|n| n.tiers.contains(&candidate_tier))
         .filter(|n| !tier_holders.contains(&n.node_id))
         .min_by_key(|n| n.node_id)?; // deterministic by node_id

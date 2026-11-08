@@ -3012,3 +3012,155 @@ mod co_3_5_migration_state_race_tests {
         assert!(chunks.contains("chunk-a") && chunks.contains("chunk-b"));
     }
 }
+
+#[cfg(test)]
+mod mgrsched_audit_repair_tests {
+    use super::*;
+    use crate::placement_state::{anchor_met, cache_allowance, distinct_dcs, goal_met};
+    use dtfs_common::types::{
+        AnchorPolicy, CacheReplication, CacheTierConfig, DiskInfo, DiskStatus, DiskTier,
+        HealthStatus, NodeRole, TierReplication,
+    };
+    use std::collections::HashSet;
+
+    // ---- Task 1: apply-level Error is a failure ----
+    #[test]
+    fn apply_error_detects_refusal_only() {
+        let err = dtfs_raft::ClientResponse::Error { message: "would strand anchor".into() };
+        assert_eq!(apply_error(&err), Some("would strand anchor"));
+        assert_eq!(apply_error(&dtfs_raft::ClientResponse::Success), None);
+    }
+
+    // ---- Task 2: anchor DC case-insensitive ----
+    fn anchor(dc: &str) -> AnchorPolicy {
+        AnchorPolicy { datacenter: dc.into(), required_tier: Some(DiskTier::Cold) }
+    }
+
+    #[test]
+    fn anchor_met_ignores_case_and_checks_tier() {
+        let a = anchor("leli");
+        assert!(anchor_met(&a, [("LELI", DiskTier::Cold)].into_iter()));
+        assert!(!anchor_met(&a, [("LELI", DiskTier::Warm)].into_iter()));
+        assert!(!anchor_met(&a, [("toro", DiskTier::Cold)].into_iter()));
+    }
+
+    #[test]
+    fn goal_met_requires_tiers_and_anchor() {
+        let m = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+        let reps = [("LELI", DiskTier::Cold)];
+        assert!(goal_met(reps.iter().copied(), &m, Some(&anchor("leli"))));
+        assert!(!goal_met(reps.iter().copied(), &m, Some(&anchor("toro"))));
+        assert!(!goal_met([("LELI", DiskTier::Warm)].iter().copied(), &m, None));
+    }
+
+    #[test]
+    fn spill_removal_and_lag_repair_ignore_anchor_case() {
+        let m = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+        let a = anchor("leli");
+        let reps = vec![
+            (1, 0, "LELI".to_string(), DiskTier::Cold),
+            (2, 0, "toro".to_string(), DiskTier::Warm),
+        ];
+        // stored "LELI" satisfies anchor "leli", so the spill (node 2) goes, never node 1
+        assert_eq!(plan_excess_spill_removal(&reps, &m, Some(&a), 0), Some((2, 0)));
+        let placements = vec![AnchorRepairPlacement { node_id: 1, dc: "LELI".into(), tier: DiskTier::Cold }];
+        let nodes = vec![AnchorRepairNode { node_id: 2, datacenter: "LELI".into(), healthy: true, tiers: vec![DiskTier::Cold] }];
+        assert_eq!(plan_anchor_lag_repair(&a, &placements, &nodes, "h", &HashSet::new()), None);
+        // target node in "LELI" is eligible for anchor "leli"
+        let placements = vec![AnchorRepairPlacement { node_id: 9, dc: "toro".into(), tier: DiskTier::Warm }];
+        let act = plan_anchor_lag_repair(&a, &placements, &nodes, "h", &HashSet::new()).unwrap();
+        assert_eq!(act.target_node, 2);
+    }
+
+    // ---- Task 4: per-DC cache allowance, Plexmedia policy ----
+    fn plex_cache() -> CacheReplication {
+        let mut c = CacheReplication::default();
+        c.warm = CacheTierConfig { min: 1, max: 1 };
+        c.per_dc = true;
+        c
+    }
+
+    #[test]
+    fn cache_allowance_scales_with_dcs_when_per_dc() {
+        let mut c = plex_cache();
+        assert_eq!(cache_allowance(&c, 1), 1);
+        assert_eq!(cache_allowance(&c, 3), 3);
+        assert_eq!(cache_allowance(&c, 0), 1);
+        c.per_dc = false;
+        assert_eq!(cache_allowance(&c, 3), 1);
+        assert_eq!(distinct_dcs(["LELI", "leli", "toro"].into_iter()), 2);
+    }
+
+    #[test]
+    fn plexmedia_two_watching_dcs_not_removed() {
+        let m = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+        let a = anchor("LELI");
+        let reps = vec![
+            (1, 0, "leli".to_string(), DiskTier::Cold),
+            (2, 0, "toro".to_string(), DiskTier::Warm),
+            (3, 0, "nrb".to_string(), DiskTier::Warm),
+        ];
+        let c = plex_cache();
+        let allow = cache_allowance(&c, distinct_dcs(reps.iter().map(|r| r.2.as_str())));
+        assert_eq!(plan_excess_spill_removal(&reps, &m, Some(&a), allow), None);
+        // pre-fix flat allowance of 1 would remove a warm copy -> loop
+        assert!(plan_excess_spill_removal(&reps, &m, Some(&a), 1).is_some());
+        // genuinely over: a 4th warm copy in toro exceeds the per-DC allowance
+        let mut over = reps.clone();
+        over.push((4, 0, "toro".to_string(), DiskTier::Warm));
+        over.push((5, 0, "toro".to_string(), DiskTier::Warm));
+        assert!(plan_excess_spill_removal(&over, &m, Some(&a), allow).is_some());
+    }
+
+    // ---- Task 7: anchor target tiers from live disks with room ----
+    fn disk(id: u32, tier: DiskTier, status: DiskStatus, total: u64, used: u64) -> DiskInfo {
+        DiskInfo { disk_id: id, uuid: String::new(), mount_path: String::new(), tier, total_bytes: total, used_bytes: used, status }
+    }
+
+    fn node_with(disks: Vec<DiskInfo>) -> dtfs_raft::NodeInfo {
+        dtfs_raft::NodeInfo {
+            hostname: String::new(),
+            grpc_addr: String::new(),
+            role: NodeRole::Data,
+            disks,
+            location: dtfs_common::topology::Location::new("", "", "", ""),
+            health: HealthStatus::Healthy,
+            total_capacity: 0,
+            used_capacity: 0,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    #[test]
+    fn anchor_target_tiers_skip_failed_and_full_disks() {
+        let cfg = dtfs_common::config::PlacementConfig::default();
+        let n = node_with(vec![
+            disk(0, DiskTier::Cold, DiskStatus::Failed, 0, 0),
+            disk(1, DiskTier::Cold, DiskStatus::Healthy, 10_000_000_000_000, 10_000_000_000_000), // full
+            disk(2, DiskTier::Warm, DiskStatus::Healthy, 10_000_000_000_000, 0),
+        ]);
+        assert_eq!(anchor_target_tiers(&n, &cfg), vec![DiskTier::Warm]);
+        let ok = node_with(vec![disk(3, DiskTier::Cold, DiskStatus::Healthy, 10_000_000_000_000, 0)]);
+        assert_eq!(anchor_target_tiers(&ok, &cfg), vec![DiskTier::Cold]);
+    }
+
+    #[test]
+    fn lag_repair_falls_back_to_other_anchor_dc_node() {
+        let cfg = dtfs_common::config::PlacementConfig::default();
+        let bad = node_with(vec![disk(0, DiskTier::Cold, DiskStatus::Failed, 0, 0)]);
+        let good = node_with(vec![disk(0, DiskTier::Cold, DiskStatus::Healthy, 10_000_000_000_000, 0)]);
+        let nodes = vec![
+            AnchorRepairNode { node_id: 1, datacenter: "leli".into(), healthy: true, tiers: anchor_target_tiers(&bad, &cfg) },
+            AnchorRepairNode { node_id: 2, datacenter: "leli".into(), healthy: true, tiers: anchor_target_tiers(&good, &cfg) },
+        ];
+        let placements = vec![AnchorRepairPlacement { node_id: 9, dc: "toro".into(), tier: DiskTier::Warm }];
+        let act = plan_anchor_lag_repair(&anchor("leli"), &placements, &nodes, "h", &HashSet::new()).unwrap();
+        assert_eq!(act.target_node, 2, "node 1's only cold disk failed");
+    }
+}

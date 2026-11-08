@@ -564,14 +564,16 @@ impl TieringEngine {
         }
 
         info!(
-            "Bug AV tick: {} promotions, {} demotions",
+            "Bug AV tick: {} promotions ({} deferred to later ticks), {} demotions",
             plan.promotions.len(),
+            plan.deferred_promotions,
             plan.demotions.len()
         );
 
         // -- Dispatch promotions via the scheduler.
         for p in &plan.promotions {
-            self.scheduler
+            let accepted = self
+                .scheduler
                 .schedule_replication(
                     &p.chunk_id,
                     p.source_node_id,
@@ -579,6 +581,10 @@ impl TieringEngine {
                     p.target_tier,
                 )
                 .await;
+            if !accepted {
+                warn!("promotion dispatch stopped: scheduler task budget exhausted; remaining promotions re-planned next tick");
+                break;
+            }
             self.audit.log(
                 "tiering",
                 "cache.promote",
@@ -1315,7 +1321,6 @@ pub(crate) fn window_counts_for_chunk(
 /// Intended for in-place pruning of the ring-buffer that the engine
 /// keeps in its `read_windows` map. Not a hot-path operation; called
 /// once per heartbeat per affected (chunk, dc) pair.
-#[allow(dead_code)] // used by AV-2-4 wiring; kept here so the helpers stay co-located.
 pub(crate) fn prune_read_window(
     samples: &mut Vec<ReadSample>,
     now_ms: u64,
@@ -1479,13 +1484,13 @@ pub(crate) fn anchor_violated_after_copy(
     }
     let mut anchor_count: i64 = replica_dcs
         .iter()
-        .filter(|dc| dc.as_str() == anchor_dc)
+        .filter(|dc| dc.eq_ignore_ascii_case(anchor_dc))
         .count() as i64;
     // Only a move removes the source replica from its DC.
-    if !is_additive && source_dc == Some(anchor_dc) {
+    if !is_additive && source_dc.map_or(false, |d| d.eq_ignore_ascii_case(anchor_dc)) {
         anchor_count -= 1;
     }
-    if target_dc == Some(anchor_dc) {
+    if target_dc.map_or(false, |d| d.eq_ignore_ascii_case(anchor_dc)) {
         anchor_count += 1;
     }
     anchor_count <= 0
@@ -1549,7 +1554,7 @@ pub(crate) fn select_promotion_target(
 ) -> Option<u64> {
     candidates
         .iter()
-        .filter(|n| n.datacenter == dc)
+        .filter(|n| n.datacenter.eq_ignore_ascii_case(dc))
         .filter(|n| !n.draining)
         .filter(|n| !n.already_holds_chunk)
         .filter(|n| n.has_target_tier_disk)
@@ -1575,15 +1580,6 @@ pub(crate) fn select_promotion_target(
 // decision logic ("threshold met → schedule promotion", "idle for
 // `promote_window_secs` → schedule demotion", "draining nodes never
 // receive promotions", etc.) without spinning up Raft / SM mocks.
-
-/// AV-4-5 — deprecated marker. The redundancy-escalation gate is now
-/// the runtime `TieringConfig::enable_cache_redundancy_escalation`
-/// flag (per-cluster, hot-reloadable). The const is kept for
-/// documentation; new code paths MUST take the bool as a parameter
-/// instead of reading this constant.
-#[deprecated(note = "AV-4-5: use TieringConfig::enable_cache_redundancy_escalation runtime flag instead")]
-#[allow(dead_code)]
-pub(crate) const ENABLE_CACHE_REDUNDANCY_ESCALATION: bool = false;
 
 /// AV-2-4 — projection of a volume's caching policy used by the
 /// planner. Built from `VolumeConfig` by the engine.
@@ -1717,7 +1713,14 @@ pub(crate) struct TickPlan {
     pub demotions: Vec<TickDemotion>,
     /// CO-1-2 — demotes refused to protect the anchor DC.
     pub anchor_protected: Vec<AnchorProtectedDemote>,
+    /// Promotions beyond `MAX_PROMOTIONS_PER_TICK`; re-planned next tick.
+    pub deferred_promotions: usize,
 }
+
+/// A library scan can plan ~10k promotions at once; cap per tick so the
+/// Raft entries and migration-state saves stay small and anchor/mandatory
+/// repair (MAX_LIVE_TASKS) is not starved.
+pub(crate) const MAX_PROMOTIONS_PER_TICK: usize = 50;
 
 /// AV-2-4 — pure planner. Walks every chunk in the snapshot and
 /// emits:
@@ -1763,6 +1766,10 @@ pub(crate) fn plan_cache_tick(
             &mut plan.demotions,
             &mut plan.anchor_protected,
         );
+    }
+    if plan.promotions.len() > MAX_PROMOTIONS_PER_TICK {
+        plan.deferred_promotions = plan.promotions.len() - MAX_PROMOTIONS_PER_TICK;
+        plan.promotions.truncate(MAX_PROMOTIONS_PER_TICK);
     }
     plan
 }
@@ -1954,6 +1961,7 @@ pub(crate) fn demote_preserves_anchor(
     chunk: &TickChunk,
     victim: &TickPlacement,
     anchor: Option<&dtfs_common::types::AnchorPolicy>,
+    already_demoted: &[(u64, u32)],
 ) -> bool {
     let Some(anchor) = anchor else {
         return true; // no anchor policy → no constraint
@@ -1966,7 +1974,12 @@ pub(crate) fn demote_preserves_anchor(
     // keeps the invariant.
     chunk.placements.iter().any(|p| {
         let is_victim = p.node_id == victim.node_id && p.disk_id == victim.disk_id;
-        !is_victim && anchor.is_satisfied_by(&p.dc, Some(p.tier))
+        // Only a LIVE placement not itself slated for demotion in this plan
+        // can be the surviving anchor copy.
+        !is_victim
+            && p.live
+            && !already_demoted.contains(&(p.node_id, p.disk_id))
+            && anchor.is_satisfied_by(&p.dc, Some(p.tier))
     })
 }
 
@@ -2026,6 +2039,7 @@ fn plan_chunk_demotions(
     // A demotion candidate is a placement on a cache tier with 0
     // reads in its DC and at least one mandatory replica surviving
     // after the drop.
+    let mut chosen: Vec<(u64, u32)> = Vec::new();
     for placement in &chunk.placements {
         if !is_cache_tier(placement.tier) {
             continue;
@@ -2059,7 +2073,7 @@ fn plan_chunk_demotions(
         // volume's `effective_anchor`. The dispatcher additionally passes
         // the anchor as `enforce_anchor` on the RemoveChunkLocation apply
         // (defence-in-depth, matching the AV-2-4 pattern).
-        if !demote_preserves_anchor(chunk, placement, policy.anchor.as_ref()) {
+        if !demote_preserves_anchor(chunk, placement, policy.anchor.as_ref(), &chosen) {
             anchor_protected.push(AnchorProtectedDemote {
                 chunk_id: chunk.chunk_id.clone(),
                 chunk_index: chunk.chunk_index,
@@ -2070,6 +2084,7 @@ fn plan_chunk_demotions(
             });
             continue;
         }
+        chosen.push((placement.node_id, placement.disk_id));
         out.push(TickDemotion {
             chunk_id: chunk.chunk_id.clone(),
             chunk_index: chunk.chunk_index,
@@ -3271,9 +3286,94 @@ mod audit_co_tests {
         let chunk = chunk_with(vec![leli_cache.clone(), toro_mand]);
         let anchor = AnchorPolicy { datacenter: "leli".into(), required_tier: None };
         assert!(
-            !demote_preserves_anchor(&chunk, &leli_cache, Some(&anchor)),
+            !demote_preserves_anchor(&chunk, &leli_cache, Some(&anchor), &[]),
             "demoting the only LELI replica must be refused"
         );
+    }
+
+    /// Dead survivor: the only other anchor-DC placement is on a dead node.
+    #[test]
+    fn demote_refused_when_only_survivor_is_dead() {
+        let victim = placement(10, 1, "leli", DiskTier::Warm);
+        let dead = dead_placement(11, 0, "leli", DiskTier::Cold);
+        let chunk = chunk_with(vec![victim.clone(), dead]);
+        let anchor = AnchorPolicy { datacenter: "leli".into(), required_tier: None };
+        assert!(!demote_preserves_anchor(&chunk, &victim, Some(&anchor), &[]));
+    }
+
+    /// Two idle anchor-DC cache placements must not justify each other.
+    #[test]
+    fn two_idle_anchor_cache_placements_not_both_demoted() {
+        let a = placement(10, 1, "LELI", DiskTier::Warm);
+        let b = placement(11, 1, "leli", DiskTier::Warm);
+        let chunk = chunk_with(vec![a.clone(), b.clone(), placement(20, 0, "toro", DiskTier::Cold)]);
+        let anchor = AnchorPolicy { datacenter: "leli".into(), required_tier: None };
+        // first victim fine (case-insensitive: b survives), second refused once a is chosen
+        assert!(demote_preserves_anchor(&chunk, &a, Some(&anchor), &[]));
+        assert!(!demote_preserves_anchor(&chunk, &b, Some(&anchor), &[(10, 1)]));
+    }
+
+    #[test]
+    fn plan_demotes_at_most_one_of_two_idle_anchor_cache_copies() {
+        let mut policy_cache = dtfs_common::types::CacheReplication::default();
+        policy_cache.warm = dtfs_common::types::CacheTierConfig { min: 0, max: 2 };
+        policy_cache.promote_window_secs = 60;
+        let policy = TickVolumePolicy {
+            mandatory: dtfs_common::types::TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            cache: policy_cache,
+            anchor: Some(AnchorPolicy { datacenter: "leli".into(), required_tier: None }),
+        };
+        let chunk = chunk_with(vec![
+            placement(10, 1, "leli", DiskTier::Warm),
+            placement(11, 1, "leli", DiskTier::Warm),
+            placement(20, 0, "toro", DiskTier::Cold),
+        ]);
+        let mut out = Vec::new();
+        let mut prot = Vec::new();
+        plan_chunk_demotions(&chunk, &policy, 10_000_000, &mut out, &mut prot);
+        assert_eq!(out.len(), 1, "only one anchor-DC cache copy may go");
+        assert_eq!(prot.len(), 1);
+    }
+
+    #[test]
+    fn anchor_violated_after_copy_ignores_case() {
+        assert!(!anchor_violated_after_copy(&["LELI".to_string()], "leli", Some("toro"), Some("nrb"), false));
+        assert!(anchor_violated_after_copy(&["LELI".to_string()], "leli", Some("LELI"), Some("toro"), false));
+    }
+
+    #[test]
+    fn promotions_capped_per_tick() {
+        let mut cache = dtfs_common::types::CacheReplication::default();
+        cache.warm = dtfs_common::types::CacheTierConfig { min: 1, max: 1 };
+        cache.promote_reads = 1;
+        cache.per_dc = true;
+        let mut volumes = HashMap::new();
+        volumes.insert("v1".to_string(), TickVolumePolicy {
+            mandatory: dtfs_common::types::TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
+            cache,
+            anchor: None,
+        });
+        let nodes = vec![NodeSelectionView {
+            node_id: 5, datacenter: "toro".into(), tier: DiskTier::Warm,
+            has_target_tier_disk: true, free_capacity: 100, draining: false, already_holds_chunk: false,
+        }];
+        let mk = |i: usize, cap: usize| {
+            let mut c = chunk_with(vec![placement(1, 0, "leli", DiskTier::Cold)]);
+            c.chunk_id = format!("c{i}");
+            c.reads_in_window_by_dc.insert("toro".into(), 5);
+            let _ = cap;
+            c
+        };
+        let n = MAX_PROMOTIONS_PER_TICK + 7;
+        let snap = TickSnapshot { chunks: (0..n).map(|i| mk(i, n)).collect(), nodes: nodes.clone(), volumes: volumes.clone() };
+        let plan = plan_cache_tick(&snap, 1_000, false);
+        assert_eq!(plan.promotions.len(), MAX_PROMOTIONS_PER_TICK);
+        assert_eq!(plan.deferred_promotions, 7);
+        // negative: at the boundary nothing is deferred
+        let snap = TickSnapshot { chunks: (0..MAX_PROMOTIONS_PER_TICK).map(|i| mk(i, 0)).collect(), nodes, volumes };
+        let plan = plan_cache_tick(&snap, 1_000, false);
+        assert_eq!(plan.promotions.len(), MAX_PROMOTIONS_PER_TICK);
+        assert_eq!(plan.deferred_promotions, 0);
     }
 
     /// CO-1-2 — a second LELI replica keeps the anchor satisfied, so the
@@ -3285,7 +3385,7 @@ mod audit_co_tests {
         let chunk = chunk_with(vec![leli_cache.clone(), leli_anchor]);
         let anchor = AnchorPolicy { datacenter: "leli".into(), required_tier: None };
         assert!(
-            demote_preserves_anchor(&chunk, &leli_cache, Some(&anchor)),
+            demote_preserves_anchor(&chunk, &leli_cache, Some(&anchor), &[]),
             "another LELI replica keeps the anchor satisfied"
         );
     }
@@ -3303,7 +3403,7 @@ mod audit_co_tests {
             required_tier: Some(DiskTier::Cold),
         };
         assert!(
-            !demote_preserves_anchor(&chunk, &leli_cold, Some(&anchor)),
+            !demote_preserves_anchor(&chunk, &leli_cold, Some(&anchor), &[]),
             "the surviving LELI warm copy does not satisfy a cold-pinned anchor"
         );
     }
@@ -3313,9 +3413,9 @@ mod audit_co_tests {
     fn co_1_2_no_anchor_policy_never_blocks() {
         let leli = placement(10, 1, "leli", DiskTier::Warm);
         let chunk = chunk_with(vec![leli.clone()]);
-        assert!(demote_preserves_anchor(&chunk, &leli, None));
+        assert!(demote_preserves_anchor(&chunk, &leli, None, &[]));
         let empty = AnchorPolicy { datacenter: String::new(), required_tier: None };
-        assert!(demote_preserves_anchor(&chunk, &leli, Some(&empty)));
+        assert!(demote_preserves_anchor(&chunk, &leli, Some(&empty), &[]));
     }
 
     /// CR-3-1/MGR-2 — a mandatory (cold) replica on a Down/Failed node or

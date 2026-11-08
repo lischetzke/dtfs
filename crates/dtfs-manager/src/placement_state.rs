@@ -68,24 +68,8 @@ pub fn classify_chunk(
         return PlacementState::Undergoal;
     }
 
-    let on_tier = |t: DiskTier| replicas.iter().filter(|(_, tt)| *tt == t).count() as u32;
-    let tiers_ok = on_tier(DiskTier::Hot) >= mandatory.hot
-        && on_tier(DiskTier::Warm) >= mandatory.warm
-        && on_tier(DiskTier::Cold) >= mandatory.cold
-        && on_tier(DiskTier::Tape) >= mandatory.tape;
-
-    let anchor_ok = match anchor {
-        None => true,
-        Some(a) => replicas.iter().any(|(dc, t)| {
-            dc == &a.datacenter
-                && match a.required_tier {
-                    Some(rt) => *t == rt,
-                    None => true,
-                }
-        }),
-    };
-
-    if !(tiers_ok && anchor_ok) {
+    let goal_met_now = goal_met(replicas.iter().map(|(d, t)| (d.as_str(), *t)), mandatory, anchor);
+    if !goal_met_now {
         return PlacementState::Misplaced;
     }
     if total > mandatory_total + cache_allowance {
@@ -94,9 +78,46 @@ pub fn classify_chunk(
     PlacementState::Stable
 }
 
-/// Bug BX — sum of a volume's per-tier cache `max` (legit extra copies).
-fn cache_allowance(cache: &dtfs_common::types::CacheReplication) -> u32 {
-    cache.hot.max + cache.warm.max + cache.cold.max + cache.tape.max
+/// True when some replica satisfies the anchor policy. Datacenter compares
+/// case-insensitively (`AnchorPolicy::is_satisfied_by`), the single anchor
+/// predicate for the planner, the rebalance pass and the classifier.
+pub(crate) fn anchor_met<'a>(
+    anchor: &AnchorPolicy,
+    mut replicas: impl Iterator<Item = (&'a str, DiskTier)>,
+) -> bool {
+    replicas.any(|(dc, t)| anchor.is_satisfied_by(dc, Some(t)))
+}
+
+/// True when every mandated tier has enough replicas AND the anchor (if any)
+/// is satisfied. One helper for classify / spill removal.
+pub(crate) fn goal_met<'a>(
+    replicas: impl Iterator<Item = (&'a str, DiskTier)> + Clone,
+    mandatory: &TierReplication,
+    anchor: Option<&AnchorPolicy>,
+) -> bool {
+    let on_tier = |t: DiskTier| replicas.clone().filter(|(_, tt)| *tt == t).count() as u32;
+    on_tier(DiskTier::Hot) >= mandatory.hot
+        && on_tier(DiskTier::Warm) >= mandatory.warm
+        && on_tier(DiskTier::Cold) >= mandatory.cold
+        && on_tier(DiskTier::Tape) >= mandatory.tape
+        && anchor.map_or(true, |a| anchor_met(a, replicas.clone()))
+}
+
+/// Bug BX — a volume's legitimate extra (cache) copies. With `per_dc` (the
+/// default) each tier's `max` applies per datacenter, so the allowance scales
+/// with the number of DCs holding replicas (`dcs_holding`, at least 1).
+pub(crate) fn cache_allowance(
+    cache: &dtfs_common::types::CacheReplication,
+    dcs_holding: u32,
+) -> u32 {
+    let sum = cache.hot.max + cache.warm.max + cache.cold.max + cache.tape.max;
+    if cache.per_dc { sum * dcs_holding.max(1) } else { sum }
+}
+
+/// Distinct datacenters (case-insensitive) among `dcs`.
+pub(crate) fn distinct_dcs<'a>(dcs: impl Iterator<Item = &'a str>) -> u32 {
+    let set: std::collections::HashSet<String> = dcs.map(|d| d.to_ascii_lowercase()).collect();
+    set.len() as u32
 }
 
 /// Bug BX — classify every logical chunk in the state machine and tally the
@@ -168,7 +189,6 @@ pub fn placement_for_file<'a>(
             .map(|v| v.effective_mandatory_replicas().clone())
             .unwrap_or(TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 });
         let anchor = volume.and_then(|v| v.effective_anchor());
-        let allowance = volume.map(|v| cache_allowance(&v.cache_replicas)).unwrap_or(0);
 
         // (rows, resolved live replicas, dangling) per chunk_index.
         type Group<'g> = (
@@ -191,6 +211,9 @@ pub fn placement_for_file<'a>(
         }
 
         for (idx, (rows, resolved, dangling)) in by_idx {
+            let allowance = volume
+                .map(|v| cache_allowance(&v.cache_replicas, distinct_dcs(resolved.iter().map(|(d, _)| d.as_str()))))
+                .unwrap_or(0);
             let state = classify_chunk(&resolved, &mandatory, anchor.as_ref(), allowance);
             let chunk_id = rows.first().map(|r| r.chunk_hash.as_str()).unwrap_or("");
             visit(ChunkPlacementView {
@@ -356,7 +379,6 @@ mod tests {
                 .map(|v| v.effective_mandatory_replicas().clone())
                 .unwrap_or(TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 });
             let anchor = volume.and_then(|v| v.effective_anchor());
-            let allowance = volume.map(|v| cache_allowance(&v.cache_replicas)).unwrap_or(0);
             let mut by_idx: BTreeMap<u64, Vec<(String, DiskTier)>> = BTreeMap::new();
             let mut dangling: std::collections::BTreeSet<u64> = Default::default();
             for c in &file_meta.chunks {
@@ -368,6 +390,9 @@ mod tests {
                 }
             }
             for (_idx, replicas) in by_idx {
+                let allowance = volume
+                    .map(|v| cache_allowance(&v.cache_replicas, distinct_dcs(replicas.iter().map(|(d, _)| d.as_str()))))
+                    .unwrap_or(0);
                 match classify_chunk(&replicas, &mandatory, anchor.as_ref(), allowance) {
                     PlacementState::Missing => counts.missing += 1,
                     PlacementState::Undergoal => counts.undergoal += 1,
