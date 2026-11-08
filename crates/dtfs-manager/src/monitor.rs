@@ -108,6 +108,19 @@ pub(crate) fn liveness_changes(
         if info.role != NodeRole::Data || info.last_seen_ms == 0 {
             continue;
         }
+        // Operator-set states are sticky: marking them Down would lose
+        // Maintenance (WAN backfill storm) and wedge a rebooted quarantined
+        // node Down forever.
+        if info.quarantine.is_some()
+            || matches!(
+                info.health,
+                dtfs_common::types::HealthStatus::Maintenance
+                    | dtfs_common::types::HealthStatus::Draining
+                    | dtfs_common::types::HealthStatus::Quarantined
+            )
+        {
+            continue;
+        }
         let elapsed = now_ms.saturating_sub(info.last_seen_ms);
         let target = if elapsed > down_ms {
             Some(NodeStatus::Down)
@@ -555,6 +568,28 @@ mod bug_cj_liveness_tests {
             (2, node(NodeRole::Client, NOW - 10_000_000)),
         ]);
         assert!(liveness_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS).is_empty());
+    }
+
+    // Operator-set states are never overwritten by liveness, even when stale.
+    #[test]
+    fn stale_maintenance_draining_quarantined_not_marked() {
+        use dtfs_common::types::HealthStatus;
+        for h in [HealthStatus::Maintenance, HealthStatus::Draining, HealthStatus::Quarantined] {
+            let mut n = node(NodeRole::Data, NOW - 40_000);
+            n.health = h;
+            assert!(liveness_changes(&map(&[(1, n)]), NOW, SUSPECT_MS, DOWN_MS).is_empty(), "{h:?}");
+        }
+        // quarantine info set while health was reset (reboot) is also skipped
+        let mut n = node(NodeRole::Data, NOW - 40_000);
+        n.quarantine = Some(dtfs_common::types::QuarantineInfo {
+            since_ms: 1,
+            reason: dtfs_common::types::QuarantineReason::OperatorRequested,
+            triggering_chunk_id: None,
+            fault_count_total: 0,
+            last_fault_at_ms: 0,
+            last_fault_summary: String::new(),
+        });
+        assert!(liveness_changes(&map(&[(1, n)]), NOW, SUSPECT_MS, DOWN_MS).is_empty());
     }
 
     // A freshly-registered data node that has not heartbeated yet
