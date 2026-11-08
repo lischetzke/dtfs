@@ -80,6 +80,13 @@ jobs:
             clang libclang-dev cmake protobuf-compiler pkg-config \
             libfuse3-dev fuse3 libssl-dev nodejs
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      # The container runs as root but the workspace is owned by the runner
+      # user; without this git refuses the repo ("dubious ownership") and the
+      # release scripts lose the commit id.
+      - name: Trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Tests
         run: cargo test --workspace --release
