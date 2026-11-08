@@ -2489,6 +2489,30 @@ impl DtfsFilesystem {
     /// F-034 — rename a file (atomic) in the manager namespace.
     #[instrument(skip(self), fields(from = %from, to = %to))]
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
+        // async_commit: the timer's commit is not serialised with rename by
+        // the kernel. Hold the guard of `from` and of every open writer at or
+        // below `from` or `to` (sorted: one global order, no deadlock) so no
+        // commit runs across the rename and the buffer/handle re-key.
+        let mut guards = Vec::new();
+        if self.config.write.async_commit {
+            let open: Vec<(String, OpenFlags)> = self
+                .open_files
+                .iter()
+                .map(|e| (e.value().path.clone(), e.value().flags))
+                .collect();
+            for p in rename_lock_paths(&open, from, to) {
+                let g = self.path_guard(&p).await;
+                guards.push((p, g));
+            }
+        }
+        let res = self.rename_inner(from, to).await;
+        for (p, g) in guards {
+            self.drop_path_guard(&p, g);
+        }
+        res
+    }
+
+    async fn rename_inner(&self, from: &str, to: &str) -> Result<()> {
         self.client.rename_file(from, to).await
             .with_context(|| format!("rename {from} -> {to}"))?;
         // Invalidate the cache for the exact paths and (directory rename)
@@ -3687,6 +3711,21 @@ fn other_writer_open(remaining: &[(String, OpenFlags)], path: &str) -> bool {
     remaining
         .iter()
         .any(|(p, flags)| p == path && flags.is_writable())
+}
+
+/// `write.async_commit` rename: the paths whose `path_guard` rename holds,
+/// sorted and unique: `from`, plus every writable handle at or below `from`
+/// (re-keyed) or `to` (detached). Only those can have a timer commit.
+fn rename_lock_paths(open: &[(String, OpenFlags)], from: &str, to: &str) -> Vec<String> {
+    let mut paths: std::collections::BTreeSet<String> = open
+        .iter()
+        .filter(|(p, f)| {
+            f.is_writable() && (rekey_path(p, from, to).is_some() || rekey_path(p, to, to).is_some())
+        })
+        .map(|(p, _)| p.clone())
+        .collect();
+    paths.insert(from.to_string());
+    paths.into_iter().collect()
 }
 
 /// Bug BU-2 — did this write error originate from a data-node out-of-space
@@ -5278,6 +5317,59 @@ mod async_commit_fs_tests {
         assert!(fs.open_files.get(&rfh).unwrap().write_error.is_none());
         assert_eq!(fs.write_buffer.dirty_bytes(&det), 10);
         assert_eq!(fs.write_buffer.dirty_bytes("/r"), 6);
+    }
+
+    /// A held `path_guard` stands for the timer's in-flight commit: rename
+    /// must wait for it on the source, a destination with an open writer, and
+    /// an open writer below a renamed directory.
+    #[tokio::test]
+    async fn async_rename_waits_for_commits_on_source_destination_and_children() {
+        for (writer, held, from, to) in [
+            ("/a", "/a", "/a", "/b"),
+            ("/b", "/b", "/a", "/b"),
+            ("/d/x", "/d/x", "/d", "/e"),
+        ] {
+            let fs = fs(true);
+            open(&fs, writer, OpenFlags::ReadWrite);
+            let g = fs.path_guard(held).await;
+            let r = tokio::time::timeout(Duration::from_millis(200), fs.rename(from, to)).await;
+            assert!(r.is_err(), "rename {from} -> {to} must wait for the commit on {held}");
+            fs.drop_path_guard(held, g);
+            let err = fs.rename(from, to).await.unwrap_err();
+            assert!(format!("{err:#}").contains(&format!("rename {from} -> {to}")), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn rename_lock_paths_sorted_unique_writers_only() {
+        let w = OpenFlags::ReadWrite;
+        let open = vec![
+            ("/e/z".to_string(), w),
+            ("/d/y".to_string(), w),
+            ("/d/x".to_string(), w),
+            ("/d/x".to_string(), w),
+            ("/d/r".to_string(), OpenFlags::ReadOnly),
+            ("/dd".to_string(), w),
+            ("/e".to_string(), OpenFlags::ReadOnly),
+        ];
+        assert_eq!(rename_lock_paths(&open, "/d", "/e"), ["/d", "/d/x", "/d/y", "/e/z"]);
+        assert_eq!(rename_lock_paths(&[], "/a", "/b"), ["/a"]);
+    }
+
+    #[tokio::test]
+    async fn async_rename_does_not_wait_on_unrelated_or_reader_only_paths() {
+        let fs = fs(true);
+        open(&fs, "/c", OpenFlags::ReadWrite);
+        open(&fs, "/b", OpenFlags::ReadOnly);
+        open(&fs, "/ab", OpenFlags::ReadWrite);
+        let gc = fs.path_guard("/c").await;
+        let gb = fs.path_guard("/b").await;
+        let gab = fs.path_guard("/ab").await;
+        let r = tokio::time::timeout(Duration::from_secs(5), fs.rename("/a", "/b")).await;
+        assert!(r.expect("must not wait").is_err(), "no managers: the rename RPC fails");
+        fs.drop_path_guard("/c", gc);
+        fs.drop_path_guard("/b", gb);
+        fs.drop_path_guard("/ab", gab);
     }
 
     #[tokio::test]

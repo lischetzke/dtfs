@@ -122,8 +122,12 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   old, through `commit_all` with a writable non-detached fh. The cap drain
   then also drains partial chunks outside `keep`. The timer is
   not serialised by the kernel like write/fsync/setattr, so write(), a
-  writer's truncate, release and the timer hold `path_guard` (per-path
-  tokio mutex, async mode only, never across another guard).
+  writer's truncate, flush, release and the timer hold `path_guard` (per-path
+  tokio mutex, async mode only, one guard at a time). Only `rename` holds
+  several: `from` plus every writable handle at or below `from` or `to`
+  (`rename_lock_paths`, taken in sorted order) across `rename_file` and the
+  buffer/handle re-key. A writer opened under `from` while rename waits for
+  those guards is not covered (the kernel's rename locks make that rare).
 
 ## Reads and prefetch
 
