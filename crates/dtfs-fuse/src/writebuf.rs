@@ -483,6 +483,10 @@ impl WriteBuffer {
             if k == cutoff_chunk && cutoff_in_chunk > 0 {
                 let mut drop_entirely = false;
                 if let Some(cb) = buf.chunks.get_mut(&k) {
+                    // A fully buffered chunk is committable without a seed;
+                    // cutting it makes it partial, so remember the
+                    // completeness or the commit guard refuses it later.
+                    cb.seeded |= cb.is_complete(chunk_size);
                     if cb.dirty.start >= cutoff_in_chunk {
                         drop_entirely = true;
                     } else {
@@ -528,7 +532,20 @@ impl WriteBuffer {
         }
     }
 
+    /// Resident chunk indices and total buffered bytes for `path`; used to
+    /// report exactly what a refused commit loses when the buffer is dropped.
+    pub fn pending_summary(&self, path: &str) -> (Vec<u32>, usize) {
+        self.buffers
+            .get(path)
+            .map(|e| {
+                let c = &e.value().chunks;
+                (c.keys().copied().collect(), c.values().map(|cb| cb.data.len()).sum())
+            })
+            .unwrap_or_default()
+    }
+
     /// Check whether a file has any buffered dirty data.
+    #[cfg(test)]
     pub fn has_dirty_data(&self, path: &str) -> bool {
         self.buffers
             .get(path)
@@ -548,6 +565,7 @@ impl WriteBuffer {
     /// CR-1-1/CR-1-2 — true iff `chunk_index` is currently buffered AND its
     /// buffered range fully covers `0..chunk_size`, i.e. it is already safe
     /// to commit without an RMW seed.
+    #[cfg(test)]
     pub fn chunk_is_fully_buffered(&self, path: &str, chunk_index: u32) -> bool {
         self.buffers
             .get(path)
@@ -1275,5 +1293,56 @@ mod audit_co_tests {
         assert_eq!(rekey_path("/a/c", "/a/", "/b/").as_deref(), Some("/b/c"));
         assert_eq!(rekey_path("/ab", "/a", "/b"), None);
         assert_eq!(rekey_path("/x", "/a", "/b"), None);
+    }
+
+    // Truncating a fully buffered chunk used to leave it partial AND
+    // unseeded; the commit guard then refused it (data loss at close).
+    #[test]
+    fn truncate_of_complete_chunk_stays_committable() {
+        let wb = WriteBuffer::new(8);
+        wb.write("/f", 0, &[7u8; 8]);
+        wb.truncate("/f", 3);
+        let segs = wb.flush_all("/f");
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].data.as_ref(), &[7u8; 3]);
+        assert_eq!(segs[0].offset_in_chunk, 0);
+        assert!(!segs[0].needs_seed, "complete-then-cut chunk must be committable");
+    }
+
+    // Negative: a genuinely partial chunk stays unseeded after a cut.
+    #[test]
+    fn truncate_of_partial_chunk_stays_unseeded() {
+        let wb = WriteBuffer::new(8);
+        wb.write("/f", 0, &[7u8; 5]);
+        wb.truncate("/f", 3);
+        assert!(wb.flush_all("/f")[0].needs_seed);
+    }
+
+    // Hole below EOF: a zero base of min(chunk, eof - start) bytes makes a
+    // partial write into the hole chunk commit as one zero-padded chunk.
+    #[test]
+    fn zero_seed_makes_hole_chunk_committable() {
+        let wb = WriteBuffer::new(8);
+        // eof 20: chunk 1 covers 8..16, fully below EOF.
+        let base = vec![0u8; seed_len_within_eof_for_test(8, 1, 20)];
+        wb.write("/f", 10, b"ab");
+        assert!(wb.chunk_needs_seed("/f", 1));
+        wb.seed_chunk("/f", 1, &base);
+        let segs = wb.flush_all("/f");
+        assert!(!segs[0].needs_seed);
+        assert_eq!(segs[0].offset_in_chunk, 0);
+        assert_eq!(segs[0].data.as_ref(), &[0, 0, b'a', b'b', 0, 0, 0, 0]);
+    }
+
+    fn seed_len_within_eof_for_test(cs: u64, idx: u64, eof: u64) -> usize {
+        eof.saturating_sub(idx * cs).min(cs) as usize
+    }
+
+    #[test]
+    fn pending_summary_reports_indices_and_bytes() {
+        let wb = WriteBuffer::new(8);
+        assert_eq!(wb.pending_summary("/f"), (vec![], 0));
+        wb.write("/f", 0, &[1u8; 10]);
+        assert_eq!(wb.pending_summary("/f"), (vec![0, 1], 10));
     }
 }

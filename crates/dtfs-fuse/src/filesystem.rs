@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use dtfs_client::client::DtfsClient;
 use dtfs_proto::dtfs::manager::ChunkLocationCommit;
@@ -522,7 +522,6 @@ impl DtfsFilesystem {
         let readahead_mode = ReadAheadMode::from_config(
             &config.readahead.mode,
             config.readahead.prefetch_chunks,
-            config.readahead.prefetch_next_files,
         );
 
         // Bug BW — the write buffer MUST split files at the same chunk size
@@ -772,7 +771,7 @@ impl DtfsFilesystem {
         // index (`chunk_at(max index)`), never by array position, since the
         // manager's array is dense while the file's index space may be
         // sparse (REV-2-1).
-        if append {
+        if append && flags.is_writable() {
             let max_idx = if locations.indices_are_authoritative() {
                 locations.chunks.iter().filter_map(|c| c.chunk_index).max()
             } else if locations.chunks.is_empty() {
@@ -842,19 +841,18 @@ impl DtfsFilesystem {
         // stalled chunk fetch must not hold the open_files entry guard, or it
         // serializes / deadlocks concurrent opens of the same file. Mirrors
         // the write()/flush() idiom.
-        let (locations, chunk_size, file_path) = {
+        let (cached, chunk_size, file_path) = {
             let file = self
                 .open_files
                 .get(&fh)
                 .context("invalid file handle")?;
-            let locations = file
-                .locations
-                .clone()
-                .context("file has no location data")?;
-            let chunk_size = file.chunk_size;
-            let file_path = file.path.clone();
-            (locations, chunk_size, file_path)
+            (file.locations.clone(), file.chunk_size, file.path.clone())
         }; // guard dropped here, before the await loop below
+        // `None` = a post-commit refresh failed and marked the snapshot stale.
+        let locations = match cached {
+            Some(l) => l,
+            None => self.refetch_locations(&file_path).await?,
+        };
 
         // F-029: effective file size = max(persisted size, buffered logical
         // size). Without this, every read of bytes that have only been
@@ -1302,14 +1300,16 @@ impl DtfsFilesystem {
         // *current* end of file. Use the cached file size; the buffer may
         // already have unflushed data, in which case the buffer reports a
         // larger logical end than `locations.total_size`. (F-021)
-        let cached_eof = file
-            .locations
-            .as_ref()
-            .map(|l| l.total_size)
-            .unwrap_or(0);
         let chunk_size = file.chunk_size;
-        let locations_snapshot = file.locations.clone();
+        let cached_snapshot = file.locations.clone();
         drop(file); // Release the lock before writing.
+        // `None` = a post-commit refresh failed and marked the snapshot
+        // stale; writing against it would zero-seed over committed chunks.
+        let locations_snapshot = match cached_snapshot {
+            Some(l) => Some(l),
+            None => Some(self.refetch_locations(&path).await?),
+        };
+        let cached_eof = locations_snapshot.as_ref().map(|l| l.total_size).unwrap_or(0);
 
         // A write buffer split at a different chunk size than the file's own
         // would silently corrupt it (reads use the file's chunk size).
@@ -1349,9 +1349,18 @@ impl DtfsFilesystem {
         // next flush would then commit as the chunk's complete (truncated)
         // content — silent data loss, not just a truncated append.
         if chunk_size > 0 && !data.is_empty() {
-            for chunk_idx in
-                chunks_needing_seed(&self.write_buffer, &path, chunk_size, effective_offset, data.len())
-            {
+            let mut seed_list =
+                chunks_needing_seed(&self.write_buffer, &path, chunk_size, effective_offset, data.len());
+            // A write past EOF hole-fills the existing partial tail chunk
+            // with zeros; it must be seeded first or the zero-padded tail
+            // replaces its real bytes at commit.
+            let eof_now = cached_eof.max(self.write_buffer.logical_size(&path).unwrap_or(0));
+            if let Some(t) = hole_tail_chunk(eof_now, effective_offset, chunk_size) {
+                if !seed_list.contains(&t) && self.write_buffer.chunk_needs_seed(&path, t as u32) {
+                    seed_list.insert(0, t);
+                }
+            }
+            for chunk_idx in seed_list {
                 // R2 (FUSE-7(c)) — skipping the seed is only safe when the
                 // chunk genuinely isn't on the cluster yet; otherwise the
                 // still-partial ChunkBuf is caught at commit time by
@@ -1668,6 +1677,17 @@ impl DtfsFilesystem {
                     // here (the data is lost on the cluster too) but the
                     // error is propagated below so the caller sees the
                     // failure rather than a silent success.
+                    if flush_result.is_err() {
+                        let (idx, bytes) = self.write_buffer.pending_summary(&file.path);
+                        if bytes > 0 {
+                            error!(
+                                path = %file.path,
+                                chunk_indices = ?idx,
+                                bytes_lost = bytes,
+                                "release: commit refused, dropping unflushed write buffer (data loss)"
+                            );
+                        }
+                    }
                     self.write_buffer.remove(&file.path);
                 }
             }
@@ -1833,6 +1853,18 @@ impl DtfsFilesystem {
     /// `statvfs` (F-038). Falls back to an error if the manager is down.
     pub async fn cluster_capacity(&self) -> Result<(u64, u64, u64)> {
         self.client.cluster_capacity().await
+    }
+
+    /// Logical size of the file behind `fh`: manager size or buffered end,
+    /// whichever is larger (fallocate must only ever grow from this).
+    pub async fn logical_size(&self, fh: u64) -> Result<u64> {
+        let path = self
+            .open_files
+            .get(&fh)
+            .map(|f| f.path.clone())
+            .context("invalid fh")?;
+        let loc = self.fetch_file_locations(&path).await?;
+        Ok(loc.total_size.max(self.write_buffer.logical_size(&path).unwrap_or(0)))
     }
 
     /// Update the manager-side logical size (F-033 fallocate / F-037
@@ -2591,8 +2623,32 @@ impl DtfsFilesystem {
                 }
                 self.cache_metadata(path, fresh);
             }
-            Err(e) => warn!(path, error = %e, "post-commit locations refresh failed"),
+            Err(e) => {
+                // Stale handle snapshots would zero-seed over the chunks just
+                // committed; drop them so write()/read() re-fetch first.
+                error!(path, error = %e, "post-commit locations refresh failed; marking handle locations stale");
+                for mut entry in self.open_files.iter_mut() {
+                    if entry.value().path == path {
+                        entry.value_mut().locations = None;
+                    }
+                }
+            }
         }
+    }
+
+    /// Re-fetch `path`'s locations and install them on every handle of it.
+    async fn refetch_locations(&self, path: &str) -> Result<FileLocations> {
+        self.metadata_cache.remove(path);
+        let fresh = self
+            .fetch_file_locations(path)
+            .await
+            .with_context(|| format!("stale locations for {path} and re-fetch failed"))?;
+        for mut entry in self.open_files.iter_mut() {
+            if entry.value().path == path {
+                entry.value_mut().locations = Some(fresh.clone());
+            }
+        }
+        Ok(fresh)
     }
 
     /// Read chunk `chunk_idx` of `locations` for an RMW seed, walking the
@@ -2608,8 +2664,11 @@ impl DtfsFilesystem {
         eof: u64,
     ) -> Result<Option<Bytes>> {
         let Some(chunk) = locations.chunk_at(chunk_idx) else {
-            warn!(path, chunk_idx, "RMW: no chunk_at() entry for this index; seed skipped, relying on the commit-time partial-segment guard");
-            return Ok(None);
+            // A hole below EOF reads as zeros: seed zeros so a partial write
+            // into it commits as one zero-padded chunk (guard would refuse).
+            let n = seed_len_within_eof(chunk_size as usize, chunk_idx * chunk_size, eof);
+            debug!(path, chunk_idx, n, "RMW: no cluster chunk at index; zero-seeding hole");
+            return Ok(Some(Bytes::from(vec![0u8; n])));
         };
         if chunk.node_addresses.is_empty() {
             warn!(path, chunk_idx, "RMW: chunk has no live replica address; seed skipped, relying on the commit-time partial-segment guard");
@@ -2658,6 +2717,7 @@ impl DtfsFilesystem {
 // ---------------------------------------------------------------------------
 
 /// Convert epoch seconds (i64) to `SystemTime`.
+#[cfg(test)]
 fn system_time_from_epoch_secs(secs: i64) -> SystemTime {
     if secs >= 0 {
         SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64)
@@ -2769,6 +2829,17 @@ fn segments_committable(
         }
     }
     Ok(())
+}
+
+/// Chunk index holding the existing partial tail when a write at
+/// `write_offset` lands past `eof` (the hole fill rewrites that chunk with
+/// zeros after `eof`, so it needs a seed first); `None` otherwise.
+fn hole_tail_chunk(eof: u64, write_offset: u64, chunk_size: u64) -> Option<u64> {
+    if chunk_size == 0 || write_offset <= eof || eof % chunk_size == 0 {
+        None
+    } else {
+        Some(eof / chunk_size)
+    }
 }
 
 /// Bytes of a cluster chunk (`existing_len` long, starting at file offset
@@ -3768,5 +3839,47 @@ mod audit_write_path_tests {
         let wb = WriteBuffer::new(4096);
         wb.seed_chunk("/f", 0, &[1u8; 100]);
         assert!(chunks_needing_seed(&wb, "/f", 4096, 0, 10).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod w3_write_hole_tests {
+    use super::*;
+
+    #[test]
+    fn hole_tail_chunk_only_for_unaligned_eof_and_write_past_it() {
+        assert_eq!(hole_tail_chunk(10, 100, 8), Some(1));
+        assert_eq!(hole_tail_chunk(10, 10, 8), None, "write at EOF is not past it");
+        assert_eq!(hole_tail_chunk(16, 100, 8), None, "aligned EOF has no partial tail");
+        assert_eq!(hole_tail_chunk(0, 100, 8), None);
+        assert_eq!(hole_tail_chunk(10, 100, 0), None);
+    }
+
+    /// Byte outcome of a partial write into a hole chunk below EOF
+    /// (`truncate -s 1G; dd seek=5 conv=notrunc`): zero base from
+    /// `seed_len_within_eof`, then the write -> one committable zero-padded chunk.
+    #[test]
+    fn write_into_hole_below_eof_commits_zero_padded_chunk() {
+        let cs = 8u64;
+        let eof = 100u64;
+        let wb = WriteBuffer::new(cs as usize);
+        wb.write("/f", 5 * cs + 2, b"xy");
+        let n = seed_len_within_eof(cs as usize, 5 * cs, eof);
+        assert_eq!(n, 8, "hole chunk below EOF seeds a full chunk");
+        wb.seed_chunk("/f", 5, &vec![0u8; n]);
+        let segs = wb.flush_all("/f");
+        assert!(segments_committable(&segs, |_| false).is_ok());
+        assert_eq!(segs[0].data.as_ref(), &[0, 0, b'x', b'y', 0, 0, 0, 0]);
+        // Last chunk is bounded by EOF.
+        assert_eq!(seed_len_within_eof(cs as usize, 12 * cs, eof), 4);
+    }
+
+    /// Without a zero seed the same write is refused by the commit guard.
+    #[test]
+    fn unseeded_hole_write_is_refused_by_guard() {
+        let wb = WriteBuffer::new(8);
+        wb.write("/f", 5 * 8 + 2, b"xy");
+        let segs = wb.flush_all("/f");
+        assert!(segments_committable(&segs, |_| false).is_err(), "offset_in_chunk > 0");
     }
 }

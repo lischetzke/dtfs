@@ -104,6 +104,17 @@ impl InodeMap {
         e.1 = Instant::now();
     }
 
+    /// `add_ref` for an entry already handed to the kernel under `ino`; a
+    /// concurrent forget may have dropped the mapping since `inode_for`, so
+    /// restore it (the kernel now holds `ino`).
+    fn add_ref_at(&self, ino: u64, path: &str) {
+        self.add_ref(ino);
+        if ino != FUSE_ROOT_ID && !self.inode_to_path.contains_key(&ino) {
+            self.inode_to_path.insert(ino, path.to_string());
+            self.path_to_inode.entry(path.to_string()).or_insert(ino);
+        }
+    }
+
     /// `inode_for` + `add_ref`, re-minting if a concurrent forget dropped
     /// the mapping between the two.
     fn lookup_ref(&self, path: &str) -> u64 {
@@ -347,10 +358,6 @@ fn build_attr(ino: u64, a: &DtfsAttr, perm: u16) -> FileAttr {
 struct InodeLocks {
     /// POSIX byte-range locks granted via `fcntl(F_SETLK/F_SETLKW)`.
     posix: Vec<HeldLock>,
-    /// BSD-style whole-file lock held via `flock(2)`. There is at most one
-    /// exclusive flock; multiple shared flocks can coexist. The bool is
-    /// `true` for exclusive (LOCK_EX), `false` for shared (LOCK_SH).
-    flock_owners: Vec<(u64, bool)>,
 }
 
 /// One granted byte-range lock entry in the per-inode lock table (F-031).
@@ -621,8 +628,8 @@ impl Filesystem for DtfsFuse3Adapter {
         // dropping chunks past the new EOF on a shrink.
         if let Some(new_size) = set_attr.size {
             if let Err(e) = self.fs.truncate(&path, fh, new_size).await {
-                warn!(path = %path, error = %e, "fuse3 setattr truncate failed");
-                return Err(Errno::from(libc::EIO));
+                warn!(path = %path, error = %format!("{:#}", e), "fuse3 setattr truncate failed");
+                return Err(open_err_to_errno(&e));
             }
         }
 
@@ -651,16 +658,26 @@ impl Filesystem for DtfsFuse3Adapter {
             .open_with_append(&path, open_flags, append)
             .await
         {
-            Ok(fh) => Ok(ReplyOpen { fh, flags: 0 }),
+            Ok(fh) => {
+                // FUSE_ATOMIC_O_TRUNC: the kernel passes O_TRUNC here and
+                // skips its own truncate, so honour it or the stale tail
+                // of the old file survives (`echo hi > existing`).
+                if open_wants_trunc(flags) {
+                    if let Err(e) = self.fs.truncate(&path, Some(fh), 0).await {
+                        warn!(path = %path, error = %format!("{:#}", e), "fuse3 open: O_TRUNC truncate failed");
+                        let _ = self.fs.release(fh).await;
+                        return Err(open_err_to_errno(&e));
+                    }
+                }
+                Ok(ReplyOpen { fh, flags: 0 })
+            }
             Err(e) => {
-                // P0-1: surface write-lease conflicts as EBUSY so apps see
-                // "Resource busy" instead of a generic ENOENT.
+                // P0-1: write-lease conflicts surface as EBUSY; CO-4-16:
+                // ENOENT only on genuine NotFound, transient -> EIO.
                 if e.downcast_ref::<crate::filesystem::LeaseBusy>().is_some() {
                     warn!(path = %path, "fuse3 open: write lease busy");
-                    return Err(Errno::from(libc::EBUSY));
                 }
-                // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
-                Err(cluster_err_to_errno(&e))
+                Err(open_err_to_errno(&e))
             }
         }
     }
@@ -890,8 +907,7 @@ impl Filesystem for DtfsFuse3Adapter {
     // Note: fuse3 0.7.3 does not expose a separate `flock` trait method;
     // Linux passes `flock(2)` calls through the same FUSE_LK opcode that
     // our `setlk` already implements (with the whole-file range and
-    // F_WRLCK / F_RDLCK type). The `flock_owners` field on `InodeLocks`
-    // is reserved for a future explicit handler.
+    // F_WRLCK / F_RDLCK type), stored in `InodeLocks::posix`.
 
     async fn mkdir(
         &self,
@@ -980,12 +996,20 @@ impl Filesystem for DtfsFuse3Adapter {
         parent: u64,
         name: &OsStr,
         mode: u32,
-        _flags: u32,
+        flags: u32,
     ) -> FuseResult<ReplyCreated> {
         let path = self.child_path(parent, name)?;
         debug!("fuse3:create {} (mode={:#o})", path, mode);
         match self.fs.create(&path, mode).await {
             Ok(fh) => {
+                // create(O_TRUNC) over a file that appeared meanwhile.
+                if open_wants_trunc(flags) {
+                    if let Err(e) = self.fs.truncate(&path, Some(fh), 0).await {
+                        warn!(path = %path, error = %format!("{:#}", e), "fuse3 create: O_TRUNC truncate failed");
+                        let _ = self.fs.release(fh).await;
+                        return Err(open_err_to_errno(&e));
+                    }
+                }
                 let ino = self.inodes.lookup_ref(&path);
                 let attr = self.synthetic_attr(ino, false, (mode & 0o777) as u16);
                 Ok(ReplyCreated {
@@ -1127,7 +1151,7 @@ impl Filesystem for DtfsFuse3Adapter {
         // CR-1-6 (FUSE-4/CO-4-16): same rationale as readdir above.
         let entries = self.listing(fh, &path).await?;
 
-        let mut items: Vec<FuseResult<DirectoryEntryPlus>> = Vec::new();
+        let mut items: Vec<(FuseResult<DirectoryEntryPlus>, String)> = Vec::new();
 
         for (entry_offset, entry) in snapshot_page(&entries, offset) {
             let child_path = if path == "/" {
@@ -1148,7 +1172,7 @@ impl Filesystem for DtfsFuse3Adapter {
                 },
                 self.override_perm(&child_path, entry.is_directory),
             );
-            items.push(Ok(DirectoryEntryPlus {
+            items.push((Ok(DirectoryEntryPlus {
                 inode: child_ino,
                 generation: 0,
                 kind,
@@ -1157,7 +1181,7 @@ impl Filesystem for DtfsFuse3Adapter {
                 attr,
                 entry_ttl: ENTRY_TTL,
                 attr_ttl: ATTR_TTL,
-            }));
+            }), child_path));
         }
 
         // Each entry the kernel actually receives is a lookup reference;
@@ -1166,9 +1190,9 @@ impl Filesystem for DtfsFuse3Adapter {
         let inodes = &self.inodes;
         Ok(ReplyDirectoryPlus {
             entries: futures_util::stream::iter(items)
-                .map(move |r| {
+                .map(move |(r, p)| {
                     if let Ok(e) = &r {
-                        inodes.add_ref(e.inode);
+                        inodes.add_ref_at(e.inode, &p);
                     }
                     r
                 })
@@ -1214,8 +1238,9 @@ impl Filesystem for DtfsFuse3Adapter {
     }
 
     /// `fallocate(2)` — pre-allocate space. DTFS stores files as sparse
-    /// chunk lists so pre-allocation is conceptually free. We treat both
-    /// FALLOC_FL_KEEP_SIZE and the default mode as a no-op success. (F-033)
+    /// chunk lists so pre-allocation is conceptually free. KEEP_SIZE is a
+    /// no-op success; mode 0 only ever grows the file; any other mode bit is
+    /// EOPNOTSUPP. (F-033)
     async fn fallocate(
         &self,
         _req: Request,
@@ -1234,9 +1259,20 @@ impl Filesystem for DtfsFuse3Adapter {
         }
         // CO-5-18 — honour the mode: FALLOC_FL_KEEP_SIZE must NOT grow the
         // file, and `offset + length` must not silently overflow u64.
-        let new_size = match fallocate_target_size(offset, length, mode)? {
+        // Reject unsupported modes / handle KEEP_SIZE before any network call.
+        if fallocate_target_size(offset, length, mode, 0)?.is_none() {
+            return Ok(());
+        }
+        let current = match self.fs.logical_size(fh).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "fuse3 fallocate size lookup failed");
+                return Err(open_err_to_errno(&e));
+            }
+        };
+        let new_size = match fallocate_target_size(offset, length, mode, current)? {
             Some(size) => size,
-            None => return Ok(()), // KEEP_SIZE: reserve space, don't grow.
+            None => return Ok(()), // already large enough: never shrink.
         };
         // Grow the file via setattr-style size update. The sparse-fill path
         // turns the trailing bytes into a hole, matching what other
@@ -1469,13 +1505,37 @@ pub(crate) fn fallocate_target_size(
     offset: u64,
     length: u64,
     mode: u32,
+    current: u64,
 ) -> Result<Option<u64>, Errno> {
+    // Only mode 0 and KEEP_SIZE are supported; PUNCH_HOLE, ZERO_RANGE etc.
+    // must not be silently treated as a size change.
+    if mode & !(libc::FALLOC_FL_KEEP_SIZE as u32) != 0 {
+        return Err(Errno::from(libc::EOPNOTSUPP));
+    }
     if mode & (libc::FALLOC_FL_KEEP_SIZE as u32) != 0 {
         return Ok(None);
     }
     match offset.checked_add(length) {
-        Some(size) => Ok(Some(size)),
+        // Grow only: a smaller target would drop existing chunks.
+        Some(size) if size > current => Ok(Some(size)),
+        Some(_) => Ok(None),
         None => Err(Errno::from(libc::EINVAL)),
+    }
+}
+
+/// True when an open/create flag word asks for truncation on a writable fd.
+pub(crate) fn open_wants_trunc(flags: u32) -> bool {
+    let acc = flags as libc::c_int & libc::O_ACCMODE;
+    (flags as libc::c_int & libc::O_TRUNC) != 0 && (acc == libc::O_WRONLY || acc == libc::O_RDWR)
+}
+
+/// Errno for open/create/truncate/fallocate failures: a lease conflict is
+/// EBUSY (P0-1), everything else goes through `cluster_err_to_errno`.
+pub(crate) fn open_err_to_errno(e: &anyhow::Error) -> Errno {
+    if e.downcast_ref::<crate::filesystem::LeaseBusy>().is_some() {
+        Errno::from(libc::EBUSY)
+    } else {
+        cluster_err_to_errno(e)
     }
 }
 
@@ -1550,10 +1610,50 @@ mod audit_co_tests {
     #[test]
     fn co_5_18_keep_size_does_not_grow() {
         let mode = libc::FALLOC_FL_KEEP_SIZE as u32;
-        assert_eq!(fallocate_target_size(100, 50, mode).unwrap(), None);
-        // KEEP_SIZE combined with other bits still suppresses the grow.
-        let combined = (libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE) as u32;
-        assert_eq!(fallocate_target_size(100, 50, combined).unwrap(), None);
+        assert_eq!(fallocate_target_size(100, 50, mode, 0).unwrap(), None);
+    }
+
+    /// Any mode bit besides 0 / KEEP_SIZE (punch hole, zero range, ...) is
+    /// EOPNOTSUPP, never a silent size change.
+    #[test]
+    fn fallocate_unsupported_modes_are_eopnotsupp() {
+        let punch = (libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE) as u32;
+        for m in [punch, libc::FALLOC_FL_ZERO_RANGE as u32, libc::FALLOC_FL_COLLAPSE_RANGE as u32] {
+            assert_eq!(
+                fallocate_target_size(0, 10, m, 100).unwrap_err(),
+                Errno::from(libc::EOPNOTSUPP)
+            );
+        }
+    }
+
+    /// Mode 0 below the current size must be a no-op (SetFileSize would
+    /// drop chunks); equal size is a no-op; one byte past grows.
+    #[test]
+    fn fallocate_only_grows() {
+        assert_eq!(fallocate_target_size(0, 10, 0, 100).unwrap(), None);
+        assert_eq!(fallocate_target_size(90, 10, 0, 100).unwrap(), None);
+        assert_eq!(fallocate_target_size(90, 11, 0, 100).unwrap(), Some(101));
+    }
+
+    #[test]
+    fn open_trunc_only_on_writable_opens() {
+        let t = libc::O_TRUNC as u32;
+        assert!(open_wants_trunc(libc::O_WRONLY as u32 | t));
+        assert!(open_wants_trunc(libc::O_RDWR as u32 | t));
+        assert!(!open_wants_trunc(libc::O_RDONLY as u32 | t));
+        assert!(!open_wants_trunc(libc::O_WRONLY as u32));
+    }
+
+    #[test]
+    fn lease_busy_maps_to_ebusy() {
+        let e = anyhow::Error::new(crate::filesystem::LeaseBusy {
+            path: "/f".into(),
+            conflict_owner: "x".into(),
+            expires_at_ms: 0,
+        });
+        assert_eq!(open_err_to_errno(&e), Errno::from(libc::EBUSY));
+        let other = anyhow::anyhow!("boom");
+        assert_eq!(open_err_to_errno(&other), Errno::from(libc::EIO));
     }
 
     /// CO-5-18 — `offset + length` overflowing u64 must surface as EINVAL,
@@ -1561,7 +1661,7 @@ mod audit_co_tests {
     /// panicked in debug or wrapped in release.
     #[test]
     fn co_5_18_overflow_is_einval() {
-        let err = fallocate_target_size(u64::MAX, 1, 0).unwrap_err();
+        let err = fallocate_target_size(u64::MAX, 1, 0, 0).unwrap_err();
         assert_eq!(err, Errno::from(libc::EINVAL));
     }
 
@@ -1569,7 +1669,7 @@ mod audit_co_tests {
     /// `offset + length`.
     #[test]
     fn co_5_18_default_mode_grows() {
-        assert_eq!(fallocate_target_size(100, 50, 0).unwrap(), Some(150));
+        assert_eq!(fallocate_target_size(100, 50, 0, 0).unwrap(), Some(150));
     }
 
     /// CO-4-16 — a genuine `NotFound` status maps to ENOENT (the file
@@ -1858,5 +1958,23 @@ mod forget_and_snapshot_tests {
         let l = (l.kind, l.nlink);
         assert_eq!(l, (FileType::Symlink, 1));
         assert_eq!(file_kind(true, true), FileType::Directory);
+    }
+}
+
+#[cfg(test)]
+mod w3_readdirplus_ref_tests {
+    use super::*;
+
+    /// A forget racing between `inode_for` and the lazy `add_ref` must not
+    /// leave the kernel holding an inode with no path.
+    #[test]
+    fn add_ref_at_restores_mapping_dropped_by_concurrent_forget() {
+        let m = InodeMap::new();
+        let ino = m.lookup_ref("/a");
+        assert!(m.forget(ino, 1).is_some());
+        assert!(m.path_for(ino).is_err());
+        m.add_ref_at(ino, "/a");
+        assert_eq!(m.path_for(ino).unwrap(), "/a");
+        assert_eq!(m.forget(ino, 1), Some("/a".to_string()));
     }
 }

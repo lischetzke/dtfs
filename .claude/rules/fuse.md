@@ -46,6 +46,20 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 - A bare path `truncate` (no writable fh) to an unaligned shrink opens a
   temporary internal writer (`truncate_needs_temp_writer`) so the tail chunk
   is rewritten via the normal lease + commit path, then released.
+- `open`/`create` with `O_TRUNC` on a writable fd truncate to 0 after the
+  open succeeds (release the fh and return the errno if that fails);
+  `open_err_to_errno` maps `LeaseBusy` to EBUSY for open/create/setattr.
+- `fallocate`: mode 0 only grows (`max(current, offset+len)`, else no-op);
+  KEEP_SIZE no-op; any other mode bit EOPNOTSUPP (`fallocate_target_size`).
+- `write()` seeds every chunk it must preserve: chunks in the write range,
+  the partial tail chunk when writing past EOF (`hole_tail_chunk`), and a
+  hole chunk below EOF gets a zero seed (`read_seed_bytes`). "No chunk at
+  index" = zeros; "chunk with no live address" keeps refusing at commit.
+- A failed post-commit locations refresh sets the handles' `locations` to
+  `None`; `write()`/`read()` must `refetch_locations` before using them.
+- `release()` drops the buffer when no other writer is open; a refused
+  commit is logged at error with chunk indices and bytes lost. flush and
+  fsync return the commit error.
 - `writebuf.rs` batches `write.flush_batch_chunks` (default 4, clamp
   1..=32) complete chunks per `flush()`; `flush_all` drains everything.
 - Batch is byte-clamped at `FLUSH_BATCH_MAX_BYTES` (64 MB); total dirty

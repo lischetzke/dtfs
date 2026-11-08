@@ -24,11 +24,11 @@ pub enum ReadAheadMode {
     FileSequential {
         prefetch_chunks: u32,
     },
-    /// Prefetch the next N chunks in this file AND the first chunks of the
-    /// next M files in the same directory (sorted lexicographically).
+    /// Config name `folder-sequential`. Cross-file prefetch is NOT
+    /// implemented (`readahead.prefetch_next_files` is parsed and ignored):
+    /// behaves like `FileSequential`.
     FolderSequential {
         prefetch_chunks: u32,
-        prefetch_next_files: u32,
     },
     /// Prefetch only within the current file, no cross-file prefetching.
     FileOnly {
@@ -40,21 +40,15 @@ pub enum ReadAheadMode {
 
 impl ReadAheadMode {
     /// Parse a mode string from configuration into a `ReadAheadMode`.
-    pub fn from_config(mode: &str, prefetch_chunks: u32, prefetch_next_files: u32) -> Self {
+    pub fn from_config(mode: &str, prefetch_chunks: u32) -> Self {
         match mode {
             "file-sequential" => ReadAheadMode::FileSequential { prefetch_chunks },
-            "folder-sequential" => ReadAheadMode::FolderSequential {
-                prefetch_chunks,
-                prefetch_next_files,
-            },
+            "folder-sequential" => ReadAheadMode::FolderSequential { prefetch_chunks },
             "file-only" => ReadAheadMode::FileOnly { prefetch_chunks },
             "disabled" => ReadAheadMode::Disabled,
             other => {
                 warn!(mode = other, "unknown readahead mode, defaulting to folder-sequential");
-                ReadAheadMode::FolderSequential {
-                    prefetch_chunks,
-                    prefetch_next_files,
-                }
+                ReadAheadMode::FolderSequential { prefetch_chunks }
             }
         }
     }
@@ -472,6 +466,7 @@ impl ReadAheadEngine {
     }
 
     /// Remove a cached entry (e.g., after it has been consumed).
+    #[cfg(test)]
     pub fn evict(&self, node_addr: &str, chunk_id: &str) {
         let key = cache_key(node_addr, chunk_id);
         if let Some((_, (_, v))) = self.cache.remove(&key) {
@@ -485,6 +480,7 @@ impl ReadAheadEngine {
     }
 
     /// Cancel all pending prefetch tasks and clear the cache.
+    #[cfg(test)]
     pub fn clear(&self) {
         for entry in self.pending.iter() {
             entry.value().handle.abort();
@@ -816,33 +812,30 @@ mod tests {
 
     #[test]
     fn test_readahead_mode_from_config() {
-        let mode = ReadAheadMode::from_config("disabled", 8, 3);
+        let mode = ReadAheadMode::from_config("disabled", 8);
         assert!(matches!(mode, ReadAheadMode::Disabled));
         assert_eq!(mode.prefetch_chunks(), 0);
 
-        let mode = ReadAheadMode::from_config("file-sequential", 4, 0);
+        let mode = ReadAheadMode::from_config("file-sequential", 4);
         assert!(matches!(
             mode,
             ReadAheadMode::FileSequential { prefetch_chunks: 4 }
         ));
 
-        let mode = ReadAheadMode::from_config("folder-sequential", 8, 3);
+        let mode = ReadAheadMode::from_config("folder-sequential", 8);
         assert!(matches!(
             mode,
-            ReadAheadMode::FolderSequential {
-                prefetch_chunks: 8,
-                prefetch_next_files: 3,
-            }
+            ReadAheadMode::FolderSequential { prefetch_chunks: 8 }
         ));
 
-        let mode = ReadAheadMode::from_config("file-only", 2, 0);
+        let mode = ReadAheadMode::from_config("file-only", 2);
         assert!(matches!(
             mode,
             ReadAheadMode::FileOnly { prefetch_chunks: 2 }
         ));
 
         // Unknown defaults to folder-sequential.
-        let mode = ReadAheadMode::from_config("unknown", 8, 3);
+        let mode = ReadAheadMode::from_config("unknown", 8);
         assert!(matches!(mode, ReadAheadMode::FolderSequential { .. }));
     }
 

@@ -909,6 +909,17 @@ next `F_SETLKW` blocked forever (a mount hang with no cluster fault);
 inode_for` was get-then-insert, letting two concurrent lookups mint two
 inodes for one path; it mints under the DashMap entry lock.
 
+**FUSE write-path data loss (w3fuse):**
+- `open`/`create` honour `O_TRUNC` (FUSE_ATOMIC_O_TRUNC makes the kernel skip its own truncate).
+- `fallocate` mode 0 only grows; any mode bit besides 0/KEEP_SIZE is EOPNOTSUPP.
+- A write into a chunk index that is a hole below EOF zero-seeds it (`read_seed_bytes`), so it commits as one zero-padded chunk.
+- A write past EOF seeds the existing partial tail chunk first (`hole_tail_chunk`).
+- `WriteBuffer::truncate` marks a complete chunk seeded before cutting it.
+- A failed post-commit locations refresh drops the handles' snapshots; `write`/`read` re-fetch (`refetch_locations`).
+- `release` logs at error the chunk indices and bytes dropped after a refused commit.
+- `O_APPEND` tail seed only on writable opens; `readdirplus` add_ref restores a forgotten mapping; `setattr` truncate errors use `open_err_to_errno`.
+- Dead code: `prefetch_next_files` is parsed but ignored (`folder-sequential` == file-sequential); `InodeLocks.flock_owners` removed.
+
 ## Archive
 
 Paragraphs removed from the agent contract and `.claude/rules/` on

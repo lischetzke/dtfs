@@ -232,6 +232,7 @@ impl LocalChunkCache {
     /// Note: `tokio::fs::read()` triggers an OS-level atime update on
     /// most filesystems. We capture the pre-read atime + restore it
     /// after, so scanner reads truly leave the LRU position alone.
+    #[cfg(test)]
     pub async fn peek(&self, chunk_id: &str) -> Option<Bytes> {
         let path = self.path_for(chunk_id);
         if !path.exists() {
@@ -258,6 +259,7 @@ impl LocalChunkCache {
     /// compatibility; new callers should use [`get_with_hint`](Self::get_with_hint)
     /// with a viewer/scanner decision that accounts for per-fh cumulative
     /// consumption, not one kernel call's length.
+    #[cfg(test)]
     pub async fn get(&self, chunk_id: &str, bytes_hint: usize) -> Option<Bytes> {
         self.get_with_hint(chunk_id, bytes_hint >= ATIME_UPDATE_MIN_BYTES).await
     }
