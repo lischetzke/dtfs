@@ -862,14 +862,20 @@ impl ChunkStore {
         let Ok(id) = ChunkId::from_hex(chunk_hex) else { return true };
         let _guard = self.chunk_locks[Self::chunk_lock_index(&id)].lock().await;
         let dat = chunk_data_path(disk_path, &id);
-        let Ok(md) = fs::metadata(&dat).await else { return false };
-        match hash_chunk_file_incrementally(&dat, md.len()).await {
-            Ok(d) if d == id.0 => {
-                tracing::info!(chunk = %chunk_hex, "scrub: chunk healthy on re-check; not quarantined");
-                return false;
+        // Only NotFound means "gone"; any other stat error (EIO) is a fault to report.
+        match fs::metadata(&dat).await {
+            Err(e) if stat_error_means_gone(e.kind()) => return false,
+            Err(e) => {
+                tracing::warn!(chunk = %chunk_hex, error = %e, "scrub: stat failed on re-check; treating as corrupt");
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
-            _ => {}
+            Ok(md) => match hash_chunk_file_incrementally(&dat, md.len()).await {
+                Ok(d) if d == id.0 => {
+                    tracing::info!(chunk = %chunk_hex, "scrub: chunk healthy on re-check; not quarantined");
+                    return false;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+                _ => {}
+            },
         }
         tracing::warn!(chunk = %chunk_hex, disk = %disk_path.display(), "scrub quarantining corrupt chunk (inline, under chunk lock)");
         if let Err(e) = quarantine_chunk_on_disk(disk_path, chunk_hex).await {
@@ -1708,6 +1714,12 @@ fn chunk_data_dir(disk_path: &Path, chunk_id: &ChunkId) -> PathBuf {
         .join(chunk_id.dir_prefix_2())
 }
 
+/// A failed stat means the chunk is gone only for NotFound; other errors
+/// (EIO) are disk faults and must still be quarantined and reported.
+fn stat_error_means_gone(kind: std::io::ErrorKind) -> bool {
+    kind == std::io::ErrorKind::NotFound
+}
+
 /// Build the full path to a chunk's .dat file.
 fn chunk_data_path(disk_path: &Path, chunk_id: &ChunkId) -> PathBuf {
     chunk_data_dir(disk_path, chunk_id).join(format!("{}.dat", chunk_id.as_hex()))
@@ -1977,6 +1989,15 @@ mod tests {
     use super::*;
     use dtfs_common::types::DiskTier;
     use tempfile::TempDir;
+
+    #[test]
+    fn stat_error_gone_only_for_not_found() {
+        use std::io::ErrorKind::*;
+        assert!(stat_error_means_gone(NotFound));
+        for k in [PermissionDenied, Other, TimedOut, InvalidData] {
+            assert!(!stat_error_means_gone(k), "{k:?} must be reported, not dropped");
+        }
+    }
 
     // ── Bug BN-1 — persistent disk UUID ────────────────────────────
 
