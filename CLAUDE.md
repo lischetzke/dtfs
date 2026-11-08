@@ -4,7 +4,7 @@ DTFS = Raft-managed tiered distributed filesystem in Rust. This file is canonica
 
 Environment (2026-09): no build VM, no lab or prod cluster. All verification via crate tests in local Docker image (§ A.4). Cluster-only behaviour reasoned about, not executed.
 
-Agents: `.claude/agents/` (dtfs-explore, dtfs-intake, dtfs-implementer, dtfs-reviewer, dtfs-integrity-auditor). Path-scoped invariants: `.claude/rules/`. Live-cluster incidents: `dtfs-diagnose` skill + `dtfs` MCP server (`tools/dtfs-mcp/`, setup `docs/src/operations/diagnostics-mcp.md`); `op_*` always prompts.
+Agents: `.claude/agents/` (dtfs-explore, dtfs-intake, dtfs-implementer, dtfs-reviewer, dtfs-integrity-auditor). Path-scoped invariants: `.claude/rules/`. Live incidents: `dtfs-diagnose` skill + `dtfs` MCP (`tools/dtfs-mcp/`, `docs/src/operations/diagnostics-mcp.md`); `op_*` dry-run unless confirmed.
 
 ---
 
@@ -89,7 +89,7 @@ Load-bearing ownership only; history per row in `docs/src/internals/invariants.m
 
 | File | Responsibility |
 |---|---|
-| `dtfs-raft/src/state_machine.rs` | `apply_request`, sole state-mutation point; sticky node states survive `RegisterNode`; dir rename re-keys children; blank SM with purged log refuses to start as voter |
+| `dtfs-raft/src/state_machine.rs` | `apply_request`, sole state-mutation point; sticky node states survive `RegisterNode`; dir rename re-keys children |
 | `dtfs-raft/src/lib.rs::ClientRequest` | Command enum; new mutation = new variant + arm (+ `now_ms`) |
 | `dtfs-manager/src/scheduler.rs` + `scheduler/*.rs` | SOLE owner of replica repair; leader-gated, bounded, Raft-remove-before-byte-delete; disk-keyed orphan reap; leader re-checked before every delete batch |
 | `dtfs-manager/src/tiering.rs` | Cache-tick planner; never holds SM read lock across await |

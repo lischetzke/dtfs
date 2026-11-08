@@ -24,7 +24,7 @@ Reads can be briefly stale: a manager that is behind may return an older locatio
 
 ## `[partition_safety]` is not enforced
 
-`fuse.toml` accepts a `[partition_safety]` block (`mode` = `strict`, `localreadonly`, `fulllock`; `quorum_loss_timeout_secs`; `show_warning`), and `quorum_loss_timeout_secs` is validated as non-zero at startup. The client does not act on any of these values: there is no quorum-loss state, no marker file and no read blocking. The behavior is the one in the table above regardless of the setting. Do not rely on `strict` or `fulllock` to freeze a mount.
+`fuse.toml` accepts a `[partition_safety]` block with only `quorum_loss_timeout_secs`, validated as non-zero at startup but not acted on at runtime: there is no quorum-loss state, no marker file and no read blocking. The behavior is the one in the table above. Older configs with `mode` or `show_warning` still parse; those keys are ignored.
 
 ## Manager side
 

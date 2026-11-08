@@ -657,9 +657,7 @@ max_size_mb = 512
 ttl_secs = 60
 
 [partition_safety]
-mode = "localreadonly"
 quorum_loss_timeout_secs = 30
-show_warning = true
 EOF
     # Holds the secret; dtfs-fuse@.service runs as root.
     chown root:root "$CFG"; chmod 0640 "$CFG"
