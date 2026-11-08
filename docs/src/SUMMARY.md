@@ -41,7 +41,7 @@
 # Operations
 
 - [Cluster Management](./operations/cluster-management.md)
-- [CI Pipeline: Test, Release, Deploy](./operations/ci-pipeline.md)
+- [CI and Releases](./operations/ci-pipeline.md)
 - [Disk Management](./operations/disk-management.md)
 - [Orphan Chunk Cleanup](./operations/orphan-cleanup-runbook.md)
 - [Maintenance Mode](./operations/maintenance-mode.md)
