@@ -15,7 +15,7 @@ days after a bulk delete with the default cadence (Option B shortens that).
 weeks of accumulated orphans (in the lab: 24+ GB of 128 MB chunks
 from prior test campaigns). Two paths to drain them.
 
-## Option A — wait
+## Option A: wait
 
 Do nothing. `orphan_scrub` ticks every `orphan_interval_secs`.
 After two intervals (≈ 48 h on defaults) the orphans have been
@@ -26,10 +26,11 @@ curl -s http://mgr01:9402/api/v1/audit?action=orphan.reaped&limit=200 \
   | python3 -m json.tool
 ```
 
-## Option B — accelerate
+## Option B: accelerate
 
-Temporarily lower the cadence + grace via the live-reload Config
-pane, observe the reap audit lines, then restore defaults.
+Temporarily lower the cadence + grace through the cluster config
+override, restart the managers so it takes effect, observe the reap
+audit lines, then restore defaults.
 
 1. **Snapshot current `[scrub]` values** before changing anything:
    ```
@@ -39,23 +40,31 @@ pane, observe the reap audit lines, then restore defaults.
        if e['name'].startswith('manager.scrub.')})"
    ```
 
-2. **POST a temporary lower cadence + ack flag**. Use the same
-   `config_json` shape `update_config` accepts (full ManagerConfig
-   JSON; reuse the snapshot from step 1, mutate just the two
-   fields):
+2. **POST a temporary lower cadence**. `config_json` is a JSON
+   string holding only the keys to change (a sparse override). The
+   manager validates it merged onto its startup config, then deep-merges
+   it onto the cluster override already stored in Raft, so earlier
+   overrides survive; an empty `config_json` resets the stored override.
    ```
    curl -s -X POST http://mgr01:9402/api/v1/config \
      -H 'content-type: application/json' \
-     -d '{"config_json":"<full-config>","write_to_disk":false,
-          "acknowledge_cluster_wide":true}'
+     -d '{"config_json":"{\"scrub\":{\"orphan_interval_secs\":300,\"orphan_grace_secs\":21600}}",
+          "write_to_disk":true,"acknowledge_cluster_wide":true}'
    ```
    The two fields to lower:
    - `scrub.orphan_interval_secs = 300` (5 min tick)
    - `scrub.orphan_grace_secs    = 21600`  (6 h, the enforced minimum)
-   
-   `write_to_disk:false` keeps the change live-only — a manager
-   restart returns defaults. Operationally safer for a one-shot
-   drain.
+
+   The POST stores the override cluster-wide in Raft and the response
+   says `"status":"stored"`; nothing reloads it live, and a running
+   daemon only changes behaviour after a restart. The daemon reads its
+   own `/etc/dtfs/manager.toml` at startup, and `write_to_disk:true`
+   (which requires `acknowledge_cluster_wide:true`) rewrites that file
+   on the manager that served the POST only. Repeat the POST against
+   each manager (the stored override is merged, so repeating is safe),
+   then restart the managers one at a time, leader last. The scrub
+   policy reaches the data nodes in heartbeat responses from the
+   managers' `[scrub]` block, so no data node restart is needed.
 
 3. **Watch the reaps stream**:
    ```
@@ -72,8 +81,11 @@ pane, observe the reap audit lines, then restore defaults.
    `/api/v1/stats`. After full drain, on-disk should be within
    ~5 % of expected.
 
-5. **Restore defaults**. Either restart the manager (live-only
-   wipe revert) or POST again with original values.
+5. **Restore defaults**. POST again with the original values from
+   step 1 (same `write_to_disk` and ack flags, on every manager) and
+   restart the managers again. Restarting alone does not revert
+   anything: the file and the stored override both keep the lowered
+   values.
 
 ## Safety notes
 

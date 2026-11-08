@@ -235,7 +235,11 @@ downloads from the configured repo (default GitLab package registry; token from
 `--token`, `DTFS_REPO_TOKEN` or `[updater] token`), verifies the minisign
 signature when `--minisign-key`, `DTFS_MINISIGN_PUBKEY` or `[updater] minisign_public_key` is set
 (a warning otherwise), verifies each binary against `MANIFEST`, installs
-atomically and restarts the unit. It does not keep `.prev`, does not install
+atomically and restarts the units that exist on the host (a role with no unit
+here, for example a manager binary on a data-only host, is skipped with a
+message; FUSE restarts every `dtfs-fuse@*` instance found). It attempts every
+restart, then reports all units that failed to restart or did not come back
+active and exits non-zero. It does not keep `.prev`, does not install
 `dtfs-cli` unless asked (`manager`/`data`/`client` replace only their own
 daemon binary), does not update unit files, and has no health gate, so it is for
 manual use on a single node, not for fleet automation.

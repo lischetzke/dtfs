@@ -21,8 +21,11 @@ sudo ./scripts/dtfs-install.sh /path/to/dtfs-linux-amd64.tar.gz       # a tarbal
 sudo ./scripts/dtfs-install.sh --role data --noninteractive --managers m1:9401,m2:9401 --disks /mnt/disk-a,/mnt/disk-b
 ```
 
-It does not verify checksums or signatures; for anything beyond a lab, verify
-the download first. The config it renders is minimal, so a real cluster should
+Before installing, the installer checks every binary against the tarball's
+`dtfs/MANIFEST` sha256 list and refuses to install on a mismatch or a missing
+`MANIFEST`. That detects corruption, not forgery: for authenticity pass
+`--minisign-key` (below), otherwise it prints a warning that the release is not
+verified. The config it renders is minimal, so a real cluster should
 template its own ([Configuration Templating](../deployment/config-templating.md)).
 
 | Flag | Default | Behaviour |
@@ -31,7 +34,9 @@ template its own ([Configuration Templating](../deployment/config-templating.md)
 | `--version <tag>` | `latest` | Release tag; `latest` is the newest full `vX.Y.Z`, alphas are skipped. |
 | `--role manager\|data\|fuse-client` | prompt | Host role. |
 | `--noninteractive` | off | No prompts; needs `--role` and `--managers`. |
-| `--managers h:9401,...` `--cluster-name N` `--hostname H` `--secret S` | prompts | Config values. The secret also comes from `DTFS_SHARED_SECRET`; prefer that, `--secret` is visible in `ps`. |
+| `--managers hostname=addr:9401,...` `--cluster-name N` `--hostname H` `--secret S` | prompts | Config values. The secret also comes from `DTFS_SHARED_SECRET`; prefer that, `--secret` is visible in `ps`. For the manager role each entry must be `hostname=addr:port`, where `hostname` equals that manager's `[node].hostname`; a bare address is refused, except one self entry with `--bootstrap true`. Data and FUSE roles accept the same form and ignore the name. |
+| `--minisign-key K` | `$DTFS_MINISIGN_PUBKEY` | minisign public key (base64 line or a `.pub` file path). Needs the `minisign` binary and `SHA256SUMS` + `SHA256SUMS.minisig` beside the tarball (or at the release URL for `--source remote`); verifies the signature, then that the tarball sha256 is listed. Any failure refuses the install. |
+| `--chown-disks` | off | Data role: `chown dtfs:dtfs` each disk path. Without it the installer only prints the `chown` command when the `dtfs` user cannot write a disk. |
 | `--bootstrap true\|false` | `false` non-interactively | Manager only; true on exactly one manager, first start of a new cluster. |
 | `--disks /a,/b` | prompt | Data role; the first disk is `hot`, the rest `cold`. The order becomes the permanent disk ids. |
 | `--mountpoint P` | `/mnt/dtfs` | FUSE role. |

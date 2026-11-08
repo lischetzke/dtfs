@@ -135,7 +135,7 @@ When a node goes Down or a disk fails, the leader's scheduler repairs chunks who
 1. Find chunks with a replica on the failed node or disk. Replicas on Down nodes and Failed disks do not count as live.
 2. Pick a live source and a healthy target on a disk that has room, honouring the failure-domain and anchor rules.
 3. Copy with `ReplicateChunk`. The target hashes as it writes and the scheduler marks the task done only after `VerifyChunk` on the target.
-4. Register only the **new** replica row, using the disk id the target reported. A lease-less location update is a union, so it cannot erase other replicas.
+4. Register only the **new** replica row, using the disk id the target reported. A lease-less location update is a union, so it cannot erase other replicas, add a new chunk index or grow the file size; if any index was skipped it returns `Error` (the valid rows are still merged) and the scheduler retries. `VerifyChunk` in step 3 names the disk the target reported, so it checks that disk's copy only.
 5. Removing a surplus or misplaced replica later goes through `delocate_replica`: Raft `RemoveChunkLocation` first, byte delete after. If the Raft write fails or the state machine refuses it, no byte is deleted.
 
 Repair is bounded per tick (new tasks and live tasks are capped) and never competes with itself: the health monitor only reports state, and the scheduler is the sole owner of repair. Bandwidth and concurrency limits are in [Migration](./migration.md).

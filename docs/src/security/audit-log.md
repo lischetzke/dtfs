@@ -8,6 +8,8 @@ The audit log is an in-memory ring buffer on each manager, optionally mirrored t
 
 All state-mutating operations that pass through the manager -- node joins, configuration changes, maintenance mode toggles, scrub triggers -- are automatically recorded.
 
+Audit rows written by the state machine take their time from the `now_ms` the proposing manager stamped into the Raft entry (`DeleteFile`, `RegisterNode`, `DeregisterNode`, `UpdateNodeStatus`, `QuarantineNode`, `UnquarantineNode`, `UpdateConfig`, `UpsertVolume`, `DeleteVolume`, `ReportScrubResult`, `ReleaseWriteLease`, and the chunk-location variants), so every manager shows the same timestamp. An entry from an older build without `now_ms` uses its Raft log index as a stand-in; such a legacy row is ordered correctly but its timestamp is not a wall-clock time (it shows as a date near 1970).
+
 ## Entry Format
 
 Each audit log entry contains five fields:

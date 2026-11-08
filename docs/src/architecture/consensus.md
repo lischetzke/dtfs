@@ -192,7 +192,8 @@ Notable apply rules:
 
 | Rule | Effect |
 |------|--------|
-| Lease-less `UpdateChunkLocations` | Union only: it adds the rows it names and never erases other replicas. Writes that hold a lease replace the chunk's rows |
+| Lease-less `UpdateChunkLocations` | Union only: it adds the rows it names and never erases other replicas. It skips any chunk index that has no existing row carrying the same hash (it cannot introduce a new index), never grows `logical_size`, and returns `Error` when anything was skipped (the valid rows are still merged; callers treat it as a retry). Writes that hold a lease replace the chunk's rows |
+| `RemoveCorruptChunkReplicas` | Drops the `(node, disk)` rows of the reported hashes, but never the last row of a `(file, chunk_index)`: the bytes are quarantined so reads fail with EIO instead of FUSE serving zeros, and an audit row records the kept index |
 | `RemoveChunkLocation` | Refused if it would strand the anchor or remove the last live replica |
 | `RegisterNode` | Sticky states (`Maintenance`, `Draining`, `Quarantined`) survive re-registration |
 | `DeregisterNode` | Refused while the node still holds replicas |
@@ -436,7 +437,7 @@ The `RaftRpcKind` enum identifies the message type:
 
 The `DtfsNetwork` struct lazily creates a tonic `Channel` on first use and caches it. If a connection fails, the channel is cleared so the next attempt reconnects.
 
-When `cluster.shared_secret` is set, every Raft RPC carries the `x-dtfs-rpc-ts` and `x-dtfs-rpc-mac` stamp, checked before the body is read; unsigned RPCs are accepted only while `cluster.require_raft_auth` is false (rolling-update window). The request body is capped at the manager gRPC message limit. See [Authentication](../security/authentication.md#raft-transport).
+When `cluster.shared_secret` is set, every Raft RPC carries the `x-dtfs-rpc-ts` and `x-dtfs-rpc-mac` stamp. The MAC is bound to `"<from>\n<to>\n<blake3(body)>"` (sender id in the `x-dtfs-raft-from` header, receiver's own id, hash of the payload), so it is checked after the size-bounded body read; unsigned RPCs are accepted only while `cluster.require_raft_auth` is false (rolling-update window). The request body is capped at the manager gRPC message limit. See [Authentication](../security/authentication.md#raft-transport).
 
 Snapshot data is base64-encoded within the JSON payload. While not the most efficient encoding, it simplifies the transport layer by keeping all Raft messages in a uniform format. For production clusters with large state machines, a streaming snapshot transfer would be more appropriate.
 

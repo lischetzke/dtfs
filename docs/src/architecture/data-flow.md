@@ -74,7 +74,7 @@ Other write-side operations:
 ```
 
 - The monitor never marks `Maintenance`, `Draining` or `Quarantined` nodes `Down`, so a planned reboot or a quarantine is not turned into a repair storm.
-- The scheduler registers the new copy under the disk id the target actually reported. A lease-less location update is a union, so it can add a row but never erase other replicas.
+- The scheduler registers the new copy under the disk id the target actually reported. A lease-less location update is a union, so it can add a row to a chunk index that already has one but never erase other replicas, add a new index or grow the file size; if any index was skipped the update returns `Error` and the scheduler retries.
 - Cache replicas that were on D are not repaired; the tiering engine recreates them if reads continue.
 - If D comes back, its replicas count again. Surplus copies are trimmed by the excess-replica pass, which never goes below the mandatory count plus the cache allowance and never removes the anchor.
 
@@ -115,8 +115,8 @@ Chunks no file references accumulate after an unlink, an overwrite or an aborted
 
 1. List chunks on a data node (`ListChunks`).
 2. Re-read the node's view of the state machine after listing, so a chunk registered while the listing ran is not mistaken for an orphan.
-3. For chunks still unreferenced, wait out the grace period (`orphan_grace_secs`, default 24 h) measured on the `.dat` mtime of that disk. An unknown mtime defers the reap.
-4. De-locate through Raft first, then delete bytes. A chunk recorded under a different disk of the same node is never reaped by a listing of this disk.
+3. For chunks still unreferenced, wait out the grace period (`orphan_grace_secs`, default 24 h, minimum 6 h: a lower value fails manager startup) measured on the `.dat` mtime of that disk. An unknown mtime defers the reap.
+4. De-locate through Raft first, then delete bytes. The `DeleteChunk` carries `if_mtime_le_ms` set to the mtime from the listing, and the data node refuses the delete (`was_present = false`) if the `.dat` is newer by then, so a re-upload of the same content between listing and delete survives. A chunk recorded under a different disk of the same node is never reaped by a listing of this disk.
 
 See the [Orphan Cleanup Runbook](../operations/orphan-cleanup-runbook.md).
 

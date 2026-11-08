@@ -122,8 +122,14 @@ fuse together** when enabling a non-empty secret (update-required). mTLS
 
 When `cluster.shared_secret` is set, every Raft RPC (AppendEntries, Vote,
 InstallSnapshot) between managers carries the `x-dtfs-rpc-ts` /
-`x-dtfs-rpc-mac` pair (method `RaftRpc`, empty binding, `dtfs-mgr-rpc`
-plane, 300 s skew). The receiver verifies the stamp before reading the body.
+`x-dtfs-rpc-mac` pair (method `RaftRpc`, `dtfs-mgr-rpc` plane, 300 s skew).
+The MAC binding is `<from>\n<to>\n<blake3(body)>`: the sender's node id (sent
+in the `x-dtfs-raft-from` header), the receiver's own node id, and the BLAKE3
+hash of the request payload, so a captured stamp cannot authorize another body
+or another peer. Because the MAC covers the body, the receiver verifies the
+stamp after a size-bounded read of the body (a missing or non-numeric
+`x-dtfs-raft-from` yields an empty binding, which fails verification of a
+stamped request).
 
 - The Raft request body is capped at the manager gRPC message limit
   (`[grpc].max_message_size_mb`); larger bodies are rejected before parsing.
@@ -139,7 +145,7 @@ plane, 300 s skew). The receiver verifies the stamp before reading the body.
 ## Node join / register
 
 Data nodes and FUSE clients prove the secret via gRPC `RegisterNode`
-(`shared_secret` field) or the HMAC join handshake — see
+(`shared_secret` field) or the HMAC join handshake; see
 [cluster-join.md](./cluster-join.md).
 
 ## Secret handling

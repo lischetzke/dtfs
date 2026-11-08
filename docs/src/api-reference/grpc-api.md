@@ -47,7 +47,7 @@ There are two planes so a stamp for one cannot be replayed on the other: `dtfs-d
 
 ### Raft transport
 
-Managers exchange Raft traffic (AppendEntries, Vote, InstallSnapshot) over the service `dtfs.manager.RaftTransport` on the manager gRPC port, with JSON payloads. Each call is stamped on the `dtfs-mgr-rpc` plane with method `RaftRpc` and an empty binding. Receiver behaviour is set by `cluster.require_raft_auth`:
+Managers exchange Raft traffic (AppendEntries, Vote, InstallSnapshot) over the service `dtfs.manager.RaftTransport` on the manager gRPC port, with JSON payloads. Each call is stamped on the `dtfs-mgr-rpc` plane with method `RaftRpc` and the binding `<from>\n<to>\n<blake3(body)>` (sender id in the `x-dtfs-raft-from` header, receiver's own id). Receiver behaviour is set by `cluster.require_raft_auth`:
 
 | `require_raft_auth` | Valid stamp | No stamp | Invalid or incomplete stamp |
 |---|---|---|---|
@@ -121,9 +121,9 @@ Chunk I/O on data nodes. Chunks are streamed, never buffered whole; the BLAKE3 c
 |---|---|---|
 | `PutChunk` (client stream) | first message sets `chunk_id`, `volume_id`, `tier`; every message carries `data` | `chunk_id`, `size`, `checksum` (hex BLAKE3), `success`, `disk_id` |
 | `GetChunk` (server stream) | `chunk_id`, `requester_dc`, `requester_host` | stream of `data`, `offset`, `total_size` |
-| `DeleteChunk` | `chunk_id`, optional `disk_id`, `tier` | `success`, `was_present`, `freed_bytes` |
+| `DeleteChunk` | `chunk_id`, optional `disk_id`, `tier`, optional `if_mtime_le_ms` | `success`, `was_present`, `freed_bytes` |
 | `ReplicateChunk` | `chunk_id`, `target_address`, `target_tier` | `success`, `error`, optional `disk_id` |
-| `VerifyChunk` | `chunk_id` | `valid`, `error` |
+| `VerifyChunk` | `chunk_id`, optional `disk_id` | `valid`, `error` |
 | `ListChunks` | `page_token`, `limit` | `chunk_ids`, `next_page_token`, `chunk_mtimes_ms`, `chunk_disk_ids` |
 | `GetDiskStatus` | none | `hostname`, `disks` (`DiskInfo`) |
 | `ReportStats` | none | `total_chunks`, `total_bytes`, `cache_hits`, `cache_misses` |
@@ -133,6 +133,8 @@ Notes:
 
 - `PutChunkResponse.disk_id` and `ReplicateChunkResponse.disk_id` report the disk the data actually landed on. Callers must pass the `PutChunk` value into `CommitChunkLocations`; for replication, an unset `disk_id` (older data node) means the manager must not guess among several disks.
 - `DeleteChunkRequest.disk_id` limits the delete to that disk's copy. Replica identity is `(node_id, disk_id)`; unset means first-found (legacy).
+- `DeleteChunkRequest.if_mtime_le_ms` is the orphan reaper's guard: the copy is deleted only if its `.dat` mtime (Unix ms) is at or below this value, checked under the chunk lock. A copy re-uploaded since the reaper listed it is skipped and the call returns `was_present = false`. Unset means an unconditional delete.
+- `VerifyChunkRequest.disk_id` checks only that disk's `.dat` and `.meta` (an unknown disk is reported invalid); unset means first-found (legacy). The scheduler passes the disk the target reported at `ReplicateChunk`.
 - `ListChunks` arrays `chunk_mtimes_ms` and `chunk_disk_ids` are index-aligned with `chunk_ids`; empty from an older node. The manager uses them to reap orphans per disk after a grace period.
 - A `PutChunk` onto a disk below its free-space reserve, or while the node sheds load, fails with `RESOURCE_EXHAUSTED`; clients reroute or retry with backoff.
 - A checksum mismatch on read returns `DATA_LOSS`; the FUSE client fails over to another replica.

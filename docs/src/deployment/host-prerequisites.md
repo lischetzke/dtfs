@@ -69,8 +69,9 @@ inbound access on a client host.
 
 Notes that prevent wrong firewall rules:
 
-- `[raft] listen_addr` (default `0.0.0.0:9400`) is accepted by the config parser
-  but the manager does not bind it. Do not open or monitor 9400.
+- `[raft] listen_addr` no longer exists: the Raft transport is served on
+  `[grpc] listen_addr` (9401). An old config that still sets it parses, and the
+  key is ignored; nothing binds 9400, so do not open or monitor it.
 - Manager-to-manager traffic on 9401 must work in both directions, including
   across datacenters; so must data-node-to-data-node on 9500 (push replication)
   and client-to-data on 9500.
