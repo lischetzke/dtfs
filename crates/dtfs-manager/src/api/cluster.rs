@@ -592,15 +592,7 @@ pub(super) async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value>
     let logical_bytes: u64 = sm
         .files
         .values()
-        .map(|f| {
-            let mut by_index: std::collections::BTreeMap<u64, u64> =
-                std::collections::BTreeMap::new();
-            for c in &f.chunks {
-                let e = by_index.entry(c.chunk_index).or_insert(0);
-                *e = (*e).max(c.size_bytes);
-            }
-            by_index.values().sum::<u64>()
-        })
+        .map(|f| unique_chunk_bytes(&f.chunks))
         .sum();
     let phantom_bytes_estimate = logical_bytes.saturating_sub(net_used);
 

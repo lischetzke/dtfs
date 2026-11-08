@@ -174,13 +174,16 @@ Enable or disable maintenance mode on a node. See [Maintenance Mode](../operatio
 
 ### GET /api/v1/files
 
-Lists files tracked in the cluster metadata. Results are capped at 1,000 entries.
+Lists files tracked in the cluster metadata, ordered by path. Query: `limit` (default 1000, clamped to 1..100000), `offset` (default 0), `prefix` (path prefix filter). `truncated` is true when more matching files exist past this page.
 
 **Response:**
 
 ```json
 {
   "count": 1423,
+  "total": 1423,
+  "returned": 1,
+  "truncated": true,
   "files": [
     {
       "path": "/data/reports/2024-q1.parquet",
@@ -196,8 +199,11 @@ Lists files tracked in the cluster metadata. Results are capped at 1,000 entries
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `count` | Integer | Total file count (may exceed the returned list length) |
-| `files` | Array | Up to 1,000 file entries |
+| `count` | Integer | Total file count in the cluster (may exceed the returned list length) |
+| `total` | Integer | Files matching `prefix` |
+| `returned` | Integer | Entries in this page |
+| `truncated` | Boolean | More matching files exist past this page |
+| `files` | Array | The page of file entries |
 
 ---
 

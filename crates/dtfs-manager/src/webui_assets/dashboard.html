@@ -2614,8 +2614,16 @@
 
     async function loadExplorer() {
         // Fetch a large slice once; folder rendering is purely client-side.
-        const data = await fetch('/api/v1/files?limit=100000').then(r => r.json()).catch(() => ({count:0,files:[]}));
-        explorerLastFiles = data.files || [];
+        // Page through the listing; the server caps each response.
+        let all = [];
+        for (let offset = 0; ; ) {
+            const data = await fetch('/api/v1/files?limit=10000&offset=' + offset).then(r => r.json()).catch(() => null);
+            if (!data || !data.files || !data.files.length) break;
+            all = all.concat(data.files);
+            offset += data.files.length;
+            if (!data.truncated) break;
+        }
+        explorerLastFiles = all;
         renderExplorerCwd();
     }
 

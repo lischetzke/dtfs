@@ -13,14 +13,7 @@ pub(super) async fn list_volumes(State(state): State<Arc<AppState>>) -> Json<Val
     for meta in sm.files.values() {
         let entry = usage.entry(meta.volume_id.clone()).or_insert((0, 0));
         entry.0 += 1;
-        // Group by chunk_index so replicas don't multiply the reported size.
-        let mut by_index: std::collections::BTreeMap<u64, u64> =
-            std::collections::BTreeMap::new();
-        for c in &meta.chunks {
-            let e = by_index.entry(c.chunk_index).or_insert(0);
-            *e = (*e).max(c.size_bytes);
-        }
-        entry.1 += by_index.values().sum::<u64>();
+        entry.1 += unique_chunk_bytes(&meta.chunks);
     }
 
     // Merge with the volume configs stored in Raft state, falling back to

@@ -90,24 +90,49 @@ pub(super) async fn inspect_file_endpoint(
 // File endpoints
 // ---------------------------------------------------------------------------
 
-pub(super) async fn list_files(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let sm = state.sm_data.read().await;
+/// Logical bytes of a file's chunk rows: replicas share a `chunk_index`, so
+/// take the largest size per unique index rather than summing every row.
+pub(super) fn unique_chunk_bytes(chunks: &[dtfs_raft::ChunkLocationEntry]) -> u64 {
+    unique_chunk_stats(chunks).1
+}
 
-    let files: Vec<Value> = sm
-        .files
-        .iter()
-        .take(1000) // Limit response size
+/// (unique chunk count, logical bytes); see `unique_chunk_bytes`.
+pub(super) fn unique_chunk_stats(chunks: &[dtfs_raft::ChunkLocationEntry]) -> (usize, u64) {
+    let mut by_index: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    for c in chunks {
+        let e = by_index.entry(c.chunk_index).or_insert(0);
+        *e = (*e).max(c.size_bytes);
+    }
+    (by_index.len(), by_index.values().sum())
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct ListFilesQuery {
+    pub(super) limit: Option<usize>,
+    pub(super) offset: Option<usize>,
+    pub(super) prefix: Option<String>,
+}
+
+pub(super) const LIST_FILES_DEFAULT_LIMIT: usize = 1000;
+pub(super) const LIST_FILES_MAX_LIMIT: usize = 100_000;
+
+pub(super) async fn list_files(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ListFilesQuery>,
+) -> Json<Value> {
+    let sm = state.sm_data.read().await;
+    let limit = q.limit.unwrap_or(LIST_FILES_DEFAULT_LIMIT).clamp(1, LIST_FILES_MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0);
+    let prefix = q.prefix.as_deref().unwrap_or("");
+
+    // `files` is ordered by path, so offset paging is stable between calls.
+    let matching = || sm.files.iter().filter(|(p, _)| p.starts_with(prefix));
+    let total = matching().count();
+    let files: Vec<Value> = matching()
+        .skip(offset)
+        .take(limit)
         .map(|(path, meta)| {
-            // Replica entries (one per node holding a copy) all share a
-            // chunk_index. Sum size per unique chunk_index, not per row.
-            let mut sizes_by_index: std::collections::BTreeMap<u64, u64> =
-                std::collections::BTreeMap::new();
-            for c in &meta.chunks {
-                let e = sizes_by_index.entry(c.chunk_index).or_insert(0);
-                *e = (*e).max(c.size_bytes);
-            }
-            let total_size: u64 = sizes_by_index.values().sum();
-            let chunk_count = sizes_by_index.len();
+            let (chunk_count, total_size) = unique_chunk_stats(&meta.chunks);
             json!({
                 "path": path,
                 "volume_id": meta.volume_id,
@@ -120,7 +145,11 @@ pub(super) async fn list_files(State(state): State<Arc<AppState>>) -> Json<Value
         .collect();
 
     Json(json!({
+        // `count` keeps its old meaning (all files); `total` is the filtered count.
         "count": sm.files.len(),
+        "total": total,
+        "returned": files.len(),
+        "truncated": offset + files.len() < total,
         "files": files,
     }))
 }
@@ -239,6 +268,12 @@ pub(super) struct StartMigrationRequest {
     pub(super) max_tasks: Option<usize>,
 }
 
+/// "", whitespace and "/" all match every file; the allow_empty_prefix gate
+/// must treat them alike.
+pub(super) fn prefix_is_empty(p: &str) -> bool {
+    matches!(p.trim(), "" | "/")
+}
+
 pub(super) fn parse_tier(s: &str) -> Option<DiskTier> {
     match s.to_ascii_lowercase().as_str() {
         "hot" => Some(DiskTier::Hot),
@@ -265,7 +300,7 @@ pub(super) async fn start_path_migration(
         )
     })?;
 
-    if body.path_prefix.is_empty() && !body.allow_empty_prefix {
+    if prefix_is_empty(&body.path_prefix) && !body.allow_empty_prefix {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -273,6 +308,10 @@ pub(super) async fn start_path_migration(
             })),
         ));
     }
+
+    // Scheduling reads leader-local state and writes through Raft; a follower
+    // would report tasks_scheduled while the saves fail.
+    check_is_leader(&state)?;
 
     let max_tasks = body.max_tasks.unwrap_or(10_000);
 
@@ -376,7 +415,7 @@ pub(super) async fn flush_cache_endpoint(
     check_is_leader(&state)?;
 
     // Safety gate: empty prefix matches every file.
-    if body.path_prefix.is_empty() && !body.allow_empty_prefix {
+    if prefix_is_empty(&body.path_prefix) && !body.allow_empty_prefix {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({
