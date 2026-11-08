@@ -271,6 +271,47 @@ pub(super) async fn raft_add_learner(
     }
 }
 
+/// A peer counts as caught up when its matched index is within this many
+/// entries of the leader's last log index.
+const MEMBERSHIP_CATCHUP_LAG: u64 = 1000;
+
+/// Leader plus every replication-map peer whose matched index is within
+/// `MEMBERSHIP_CATCHUP_LAG` of `last_log_index`.
+fn caught_up_set(
+    leader_id: u64,
+    matched: &std::collections::BTreeMap<u64, Option<u64>>,
+    last_log_index: u64,
+) -> BTreeSet<u64> {
+    let mut set: BTreeSet<u64> = matched
+        .iter()
+        .filter(|(_, m)| m.is_some_and(|m| last_log_index.saturating_sub(m) <= MEMBERSHIP_CATCHUP_LAG))
+        .map(|(id, _)| *id)
+        .collect();
+    set.insert(leader_id);
+    set
+}
+
+/// Refuse a voter-set change that would leave the old or new voter set
+/// without a reachable, caught-up majority. `target_of` maps the current
+/// voters to the post-change voters.
+fn guard_voter_change(
+    state: &AppState,
+    target_of: impl FnOnce(&BTreeSet<u64>) -> BTreeSet<u64>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    use openraft::async_runtime::watch::WatchReceiver;
+    let metrics = state.raft.metrics().borrow_watched().clone();
+    let current: BTreeSet<u64> = metrics.membership_config.membership().voter_ids().collect();
+    let target = target_of(&current);
+    let matched: std::collections::BTreeMap<u64, Option<u64>> = metrics
+        .replication
+        .as_ref()
+        .map(|r| r.iter().map(|(id, l)| (*id, l.as_ref().map(|l| l.index))).collect())
+        .unwrap_or_default();
+    let caught = caught_up_set(metrics.id, &matched, metrics.last_log_index.unwrap_or(0));
+    crate::membership::ensure_voter_change_has_quorum(&current, &target, &caught)
+        .map_err(|e| (StatusCode::CONFLICT, Json(json!({"error": e}))))
+}
+
 /// POST /api/v1/raft/promote — upgrade an up-to-date learner to voter.
 pub(super) async fn raft_promote(
     State(state): State<Arc<AppState>>,
@@ -309,6 +350,11 @@ pub(super) async fn raft_promote(
     }
 
     let target = format!("{hostname}({nid})");
+    guard_voter_change(&state, |cur| {
+        let mut t = cur.clone();
+        t.insert(nid);
+        t
+    })?;
     let change = openraft::ChangeMembers::AddVoterIds(BTreeSet::from([nid]));
     match state.raft.change_membership(change, false).await {
         Ok(resp) => {
@@ -365,6 +411,13 @@ pub(super) async fn raft_remove(
         voters.contains(&nid)
     };
 
+    if is_voter {
+        guard_voter_change(&state, |cur| {
+            let mut t = cur.clone();
+            t.remove(&nid);
+            t
+        })?;
+    }
     let change = if is_voter {
         openraft::ChangeMembers::RemoveVoters(BTreeSet::from([nid]))
     } else {
@@ -394,5 +447,37 @@ pub(super) async fn raft_remove(
                 Json(json!({"error": format!("change_membership failed: {e}")})),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod membership_guard_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn caught_up_set_includes_leader_and_lag_boundary() {
+        let m = BTreeMap::from([
+            (2, Some(9000)),  // lag 1000: in
+            (3, Some(8999)),  // lag 1001: out
+            (4, None),        // never matched: out
+            (5, Some(10000)), // lag 0: in
+        ]);
+        assert_eq!(caught_up_set(1, &m, 10000), BTreeSet::from([1, 2, 5]));
+        // Matched ahead of last_log_index (stale read) does not underflow.
+        assert!(caught_up_set(1, &BTreeMap::from([(2, Some(50))]), 10).contains(&2));
+    }
+
+    #[test]
+    fn removing_voter_with_lagging_peer_is_refused() {
+        let cur = BTreeSet::from([1, 2, 3]);
+        let caught = caught_up_set(1, &BTreeMap::from([(2, None), (3, None)]), 100);
+        let err = crate::membership::ensure_voter_change_has_quorum(
+            &cur,
+            &BTreeSet::from([1, 2]),
+            &caught,
+        )
+        .unwrap_err();
+        assert!(err.contains("1 of 3 current voters"), "{err}");
     }
 }
