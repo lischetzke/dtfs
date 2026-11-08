@@ -28,6 +28,11 @@
 #   DTFS_RESTART_DELAY_SECS  optional, default 30: pause between node restarts.
 #   DTFS_HEALTH_TIMEOUT_SECS optional, default 300: per-node and final
 #                            health-wait budget.
+#   MINISIGN_SECRET_KEY      optional, protected: minisign secret key
+#                            (contents or File variable); with it the release
+#                            job signs SHA256SUMS (+ MINISIGN_PASSWORD).
+#   DTFS_RELEASE_API_TOKEN   optional, protected: project access token (api)
+#                            used by the manual yank:release job.
 #   DTFS_CI_TARGET_DIR       optional: persistent cargo target dir on the
 #                            builder so builds are incremental across pipelines.
 # The runner user needs SSH access as root to every cluster host (key in
@@ -158,14 +163,21 @@ build:
     expire_in: 4 weeks
 
 # ---------------------------------------------------------------------------
-# release: Generic Package Registry upload + GitLab release (creates the
-# tag). Alpha builds are marked as pre-release in the description.
+# release: optional minisign signature of SHA256SUMS, Generic Package
+# Registry upload + GitLab release (creates the tag). Alpha builds are marked
+# as pre-release in the description.
+#
+# The release precedes the rollout (deploy installs from the build artifact,
+# but the release is what `latest` resolves to). If deploy/verify fails, run
+# the manual job `yank:release` (docs/src/operations/ci-pipeline.md).
 # ---------------------------------------------------------------------------
 release:
   stage: release
   needs: [prepare, build]
   rules: *keyword_commit_default_branch
   script:
+    # No-op unless the protected variable MINISIGN_SECRET_KEY is set.
+    - bash scripts/ci/sign-release.sh "$DIST_DIR"
     - |
       if [ "$MODE" = "deploy" ]; then
         bash scripts/ci/gitlab-release.sh "$VERSION" "$DIST_DIR" --prerelease
@@ -211,3 +223,24 @@ verify:
       --managers "$DTFS_MANAGER_API_URLS"
       --expect-version "$VERSION"
       --timeout "${DTFS_HEALTH_TIMEOUT_SECS:-300}"
+
+# ---------------------------------------------------------------------------
+# yank:release: manual recovery after a failed rollout. Withdraws the GitLab
+# release so `latest` (installer, dtfs-cli update) no longer resolves to it.
+# Tag and packages stay; ship the fix as the next version.
+# ---------------------------------------------------------------------------
+yank:release:
+  stage: verify
+  needs: [prepare, release]
+  rules:
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $DTFS_DEPLOY_MODE == "release" || $DTFS_DEPLOY_MODE == "deploy"
+      when: manual
+      allow_failure: true
+    - if: $CI_COMMIT_MESSAGE =~ /^(release|deploy)(:|\s|$)/i
+      when: manual
+      allow_failure: true
+    - when: never
+  script:
+    - bash scripts/ci/gitlab-yank.sh "$VERSION"
