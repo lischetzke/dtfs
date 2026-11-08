@@ -18,6 +18,8 @@
       {{ {'manager': ['dtfs-manager', 'dtfs-cli'],
           'data':    ['dtfs-data', 'dtfs-cli'],
           'client':  ['dtfs-fuse', 'dtfs-cli']}[role] }}
+    node_unit_template: >-
+      {{ {'manager': 'dtfs-manager.service', 'data': 'dtfs-data.service', 'client': 'dtfs-fuse@.service'}[role] }}
     node_mount: "{{ hostvars[node].dtfs_mount_point | default('/mnt/dtfs') }}"
     node_bin_dir: "{{ hostvars[node].dtfs_bin_dir | default(dtfs_bin_dir) }}"
 
@@ -87,6 +89,26 @@
         mode: "0755"
       loop: "{{ node_bins }}"
       delegate_to: "{{ node }}"
+
+    # The restart below runs daemon-reload, so a changed unit file is picked up
+    # together with the new binary. Drop-ins are operator-owned and untouched.
+    - name: "[{{ node }}] Unit file shipped in the tarball"
+      ansible.builtin.stat:
+        path: "{{ dtfs_stage_dir }}/dtfs/systemd/{{ node_unit_template }}"
+      register: unit_src
+      delegate_to: localhost
+      when: dtfs_refresh_units | bool
+
+    - name: "[{{ node }}] Refresh /etc/systemd/system/{{ node_unit_template }}"
+      ansible.builtin.copy:
+        src: "{{ dtfs_stage_dir }}/dtfs/systemd/{{ node_unit_template }}"
+        dest: "/etc/systemd/system/{{ node_unit_template }}"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      delegate_to: "{{ node }}"
+      when: dtfs_refresh_units | bool and unit_src.stat.exists
 
     - name: "[{{ node }}] Restart {{ node_service }}"
       ansible.builtin.systemd:

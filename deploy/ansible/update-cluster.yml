@@ -9,15 +9,32 @@
 #      (the order is read from /api/v1/raft/state at run time);
 #   2. data nodes;
 #   3. FUSE clients.
+# Before anything is installed the tarball sha256 must appear in SHA256SUMS
+# (next to the tarball, or dtfs_sums / dtfs_sums_url), and when
+# dtfs_minisign_pubkey is set SHA256SUMS must carry a valid minisign signature;
+# a mismatch fails the play with nothing changed. Each node also gets the
+# systemd unit file from the tarball (daemon-reload happens with the restart).
 # A node already running dtfs_version with an active service is skipped
 # (idempotent re-run). A node whose health wait fails stops the run; the
 # previous binary is kept as <bin>.prev (one copy) for a manual rollback.
-# The final step runs scripts/dtfs-cluster-healthcheck.sh.
+# The final step runs scripts/dtfs-cluster-healthcheck.sh. An optional last
+# play (dtfs_enable_raft_auth=true) then sets [cluster] require_raft_auth=true
+# on every manager, one at a time with health gates.
 #
-# Variables (override with -e); full table in docs/src/operations/ci-pipeline.md:
+# Variables (override with -e); full table in docs/src/operations/ci-pipeline.md
+# and docs/src/deployment/role-variables.md:
 #   dtfs_tarball               tarball from scripts/dtfs-release.sh, OR
 #   dtfs_tarball_url           URL of dtfs-linux-amd64.tar.gz (+ dtfs_repo_token)
 #   dtfs_version               expected `dtfs-* --version` stamp (required)
+#   dtfs_verify_checksum       require the tarball sha256 in SHA256SUMS (true)
+#   dtfs_sums / dtfs_sums_url  SHA256SUMS path / URL (default: beside the tarball)
+#   dtfs_minisign_pubkey       minisign public key (base64, or absolute .pub path);
+#                              set = SHA256SUMS.minisig must verify (needs the
+#                              minisign binary on the control host)
+#   dtfs_minisig               SHA256SUMS.minisig path (default: <sums>.minisig)
+#   dtfs_refresh_units         install the tarball's unit files on each node (true)
+#   dtfs_enable_raft_auth      final play: require_raft_auth=true on all managers (false)
+#   dtfs_manager_config        manager config path on the nodes (/etc/dtfs/manager.toml)
 #   dtfs_restart_delay_secs    pause after each node (default 30)
 #   dtfs_health_timeout_secs   per-node wait budget (default 300)
 #   dtfs_api_port              manager REST port (default 9402)
@@ -29,7 +46,7 @@
 # Remote hosts are reached as root over SSH (deploy/ansible/ansible.cfg);
 # the preflight and final check run locally on the control host.
 
-- name: Preflight — unpack the build, verify the stamp, learn the Raft roles
+- name: Preflight - unpack the build, verify it, learn the Raft roles
   hosts: localhost
   connection: local
   gather_facts: false
@@ -45,6 +62,15 @@
     dtfs_force_update: false
     dtfs_run_healthcheck: true
     dtfs_repo_token: ""
+    dtfs_verify_checksum: true
+    dtfs_minisign_pubkey: ""
+    dtfs_refresh_units: true
+    dtfs_enable_raft_auth: false
+    dtfs_manager_config: /etc/dtfs/manager.toml
+    dtfs_repo_headers: >-
+      {{ {} if dtfs_repo_token == ''
+         else ({'DEPLOY-TOKEN': dtfs_repo_token} if dtfs_repo_token.startswith('gldt-')
+               else {'PRIVATE-TOKEN': dtfs_repo_token}) }}
   tasks:
     - name: Require a version and a tarball (path or URL)
       ansible.builtin.assert:
@@ -71,18 +97,120 @@
         url: "{{ dtfs_tarball_url }}"
         dest: "{{ stage.path }}/dtfs-linux-amd64.tar.gz"
         mode: "0600"
-        headers: >-
-          {{ {} if dtfs_repo_token == ''
-             else ({'DEPLOY-TOKEN': dtfs_repo_token} if dtfs_repo_token.startswith('gldt-')
-                   else {'PRIVATE-TOKEN': dtfs_repo_token}) }}
+        headers: "{{ dtfs_repo_headers }}"
       no_log: true
       when: dtfs_tarball is not defined
+
+    # --- release verification (before anything is unpacked or installed) ----
+    - name: A minisign key needs the checksum step too
+      ansible.builtin.assert:
+        that: dtfs_verify_checksum | bool or dtfs_minisign_pubkey == ''
+        fail_msg: "dtfs_minisign_pubkey is set but dtfs_verify_checksum is false; the signature covers SHA256SUMS"
+
+    - name: Where SHA256SUMS comes from
+      ansible.builtin.set_fact:
+        sums_from_path: "{{ dtfs_sums is defined or (dtfs_tarball is defined and dtfs_sums_url is not defined) }}"
+        sums_src: >-
+          {{ dtfs_sums | default((dtfs_tarball | default('')) | dirname ~ '/SHA256SUMS') }}
+        sums_url: >-
+          {{ dtfs_sums_url | default((dtfs_tarball_url | default('')) | regex_replace('[^/]+$', 'SHA256SUMS')) }}
+
+    - name: Copy SHA256SUMS (+ .minisig) from the control host
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ stage.path }}/{{ item.name }}"
+        remote_src: true
+        mode: "0600"
+      loop:
+        - { name: SHA256SUMS, src: "{{ sums_src }}", need: true }
+        - { name: SHA256SUMS.minisig, src: "{{ dtfs_minisig | default(sums_src ~ '.minisig') }}", need: "{{ dtfs_minisign_pubkey != '' }}" }
+      loop_control:
+        label: "{{ item.name }}"
+      when: dtfs_verify_checksum | bool and sums_from_path | bool and item.need | bool
+
+    - name: Download SHA256SUMS (+ .minisig)
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "{{ stage.path }}/{{ item.name }}"
+        mode: "0600"
+        headers: "{{ dtfs_repo_headers }}"
+      loop:
+        - { name: SHA256SUMS, url: "{{ sums_url }}", need: true }
+        - { name: SHA256SUMS.minisig, url: "{{ sums_url }}.minisig", need: "{{ dtfs_minisign_pubkey != '' }}" }
+      loop_control:
+        label: "{{ item.name }}"
+      no_log: true
+      when: dtfs_verify_checksum | bool and not (sums_from_path | bool) and item.need | bool
+
+    - name: Hash the tarball
+      ansible.builtin.stat:
+        path: "{{ dtfs_tarball | default(stage.path ~ '/dtfs-linux-amd64.tar.gz') }}"
+        checksum_algorithm: sha256
+      register: tarball_hash
+      when: dtfs_verify_checksum | bool
+
+    - name: Read SHA256SUMS
+      ansible.builtin.slurp:
+        src: "{{ stage.path }}/SHA256SUMS"
+      register: sums_file
+      when: dtfs_verify_checksum | bool
+
+    - name: Tarball sha256 is listed in SHA256SUMS
+      ansible.builtin.assert:
+        that: >-
+          tarball_hash.stat.checksum in (sums_file.content | b64decode
+          | regex_findall('(?m)^([0-9a-f]{64}) [ *](?:.*/)?dtfs-linux-amd64\.tar\.gz\s*$'))
+        fail_msg: >-
+          sha256 of the tarball ({{ tarball_hash.stat.checksum }}) is not in SHA256SUMS; refusing to update
+          (dtfs_verify_checksum=false only for a hand-built tarball)
+      when: dtfs_verify_checksum | bool
+
+    - name: minisign is installed on the control host
+      ansible.builtin.command: minisign -v
+      changed_when: false
+      when: dtfs_minisign_pubkey != ''
+
+    - name: Verify the SHA256SUMS signature
+      ansible.builtin.command:
+        argv:
+          - minisign
+          - -V
+          - "{{ '-p' if dtfs_minisign_pubkey.startswith('/') else '-P' }}"
+          - "{{ dtfs_minisign_pubkey }}"
+          - -m
+          - "{{ stage.path }}/SHA256SUMS"
+          - -x
+          - "{{ stage.path }}/SHA256SUMS.minisig"
+      changed_when: false
+      when: dtfs_minisign_pubkey != ''
 
     - name: Unpack the tarball
       ansible.builtin.unarchive:
         src: "{{ dtfs_tarball | default(stage.path ~ '/dtfs-linux-amd64.tar.gz') }}"
         dest: "{{ stage.path }}"
         remote_src: true
+
+    - name: Read the packaged MANIFEST
+      ansible.builtin.slurp:
+        src: "{{ stage.path }}/dtfs/MANIFEST"
+      register: manifest_file
+
+    - name: Hash the packaged binaries
+      ansible.builtin.stat:
+        path: "{{ stage.path }}/dtfs/bin/{{ item }}"
+        checksum_algorithm: sha256
+      loop: [dtfs-manager, dtfs-data, dtfs-fuse, dtfs-cli]
+      register: bin_hashes
+
+    - name: Every binary matches MANIFEST
+      ansible.builtin.assert:
+        that: >-
+          item.stat.checksum in (manifest_file.content | b64decode
+          | regex_findall('(?m)^([0-9a-f]{64})\s+' ~ item.item ~ '\s*$'))
+        fail_msg: "{{ item.item }} does not match dtfs/MANIFEST; refusing to update"
+      loop: "{{ bin_hashes.results }}"
+      loop_control:
+        label: "{{ item.item }}"
 
     - name: Read the version stamp from the packaged dtfs-cli
       ansible.builtin.command: "{{ stage.path }}/dtfs/bin/dtfs-cli --version"
@@ -108,7 +236,7 @@
         that: raft_states.results | selectattr('failed', 'defined') | selectattr('failed') | list | length == 0
         fail_msg: >-
           unreachable managers: {{ raft_states.results | selectattr('failed', 'defined') | selectattr('failed')
-          | map(attribute='item') | list | join(', ') }} — fix them before updating
+          | map(attribute='item') | list | join(', ') }}; fix them before updating
 
     - name: Classify managers (learner / follower voter / leader)
       ansible.builtin.set_fact:
@@ -121,9 +249,9 @@
     - name: Exactly one leader
       ansible.builtin.assert:
         that: dtfs_leaders | length == 1
-        fail_msg: "expected one Raft leader, found {{ dtfs_leaders }} — cluster is electing; retry later"
+        fail_msg: "expected one Raft leader, found {{ dtfs_leaders }}; cluster is electing; retry later"
 
-    - name: Manager restart order — learners, follower voters, leader last
+    - name: Manager restart order, learners, follower voters, leader last
       ansible.builtin.set_fact:
         dtfs_manager_order: >-
           {{ dtfs_learners
@@ -190,3 +318,37 @@
       ansible.builtin.file:
         path: "{{ stage.path }}"
         state: absent
+
+# Optional second pass: flip [cluster] require_raft_auth=true. Runs only with
+# -e dtfs_enable_raft_auth=true, after every node above is on dtfs_version, so
+# no manager is left signing-unaware. Followers first, leader last, one at a
+# time with the same health gates as the update.
+- name: Enable require_raft_auth on all managers (opt-in)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    dtfs_restart_delay_secs: 30
+    dtfs_health_timeout_secs: 300
+    dtfs_api_port: 9402
+    dtfs_bin_dir: /usr/local/bin
+    dtfs_enable_raft_auth: false
+    dtfs_manager_config: /etc/dtfs/manager.toml
+  tasks:
+    - name: Flip require_raft_auth
+      when: dtfs_enable_raft_auth | bool
+      block:
+        - name: Every manager runs the target version
+          ansible.builtin.command: "{{ hostvars[item].dtfs_bin_dir | default(dtfs_bin_dir) }}/dtfs-manager --version"
+          register: mgr_versions
+          delegate_to: "{{ item }}"
+          loop: "{{ dtfs_manager_order }}"
+          changed_when: false
+          failed_when: mgr_versions.stdout is not match('^dtfs-manager ' ~ (dtfs_version | regex_escape) ~ ' ')
+
+        - name: Flip one manager at a time
+          ansible.builtin.include_tasks: tasks/raft-auth-node.yml
+          loop: "{{ dtfs_manager_order }}"
+          loop_control:
+            loop_var: node

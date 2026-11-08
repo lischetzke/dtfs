@@ -128,8 +128,14 @@ Do all of this on the control host, before anything is copied to a node.
    `dtfs/bin/<binary>` to each node; no download happens on the nodes).
 
 Where the public key lives for consumers: `[updater] minisign_public_key` in
-any role config (read only by `dtfs-cli update`, ignored by the daemons) or the
-environment variable `DTFS_MINISIGN_PUBKEY`, which wins. Generating and
+any role config (read only by `dtfs-cli update`, ignored by the daemons), the
+environment variable `DTFS_MINISIGN_PUBKEY`, or `dtfs-cli update --minisign-key`;
+precedence is flag, then environment, then config. `scripts/dtfs-install.sh
+--minisign-key <base64-or-.pub-path>` (or the same environment variable) does
+the same check at install time: it needs the `minisign` binary and
+`SHA256SUMS` + `SHA256SUMS.minisig` beside the tarball (or at the release URL
+for a remote download), requires the tarball sha256 to be listed, and refuses
+to install on any failure. Without a key the installer only warns. Generating and
 protecting the signing key: [CI Pipeline](../operations/ci-pipeline.md#release-signing-optional).
 
 ## Yanked releases

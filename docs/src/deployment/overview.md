@@ -64,7 +64,7 @@ cap. Every chunk keeps a replica on `data-primary01`.
 | Step | Repository artifact | Gap a role must close |
 |---|---|---|
 | First install on one host | `scripts/dtfs-install.sh` (interactive or `--noninteractive`) | Single host at a time; renders a minimal config; no checksum/signature check of the download; no cluster-level ordering. Use it as a reference for paths and modes, not as the role. |
-| Rolling binary update | `deploy/ansible/update-cluster.yml` + `tasks/update-node.yml` | Replaces binaries only: no config rendering, no unit-file refresh, no sha256/minisign verification, no maintenance-mode wrapping, no `.prev` restore task, no `require_raft_auth` flip. All of these are specified in the pages above. |
+| Rolling binary update | `deploy/ansible/update-cluster.yml` + `tasks/update-node.yml` | Verifies the tarball (sha256 against `SHA256SUMS`, optional minisign), replaces binaries, refreshes the shipped unit file, and can flip `require_raft_auth` in an opt-in last play. No config rendering, no maintenance-mode wrapping, no `.prev` restore task. These are specified in the pages above. |
 | Release production | `.gitlab-ci.yml`, `scripts/dtfs-release.sh`, `scripts/ci/*` | None for consumers; the role only downloads. |
 | Post-deploy gate | `scripts/dtfs-cluster-healthcheck.sh` | Needs `curl` and `jq` on the machine that runs it. |
 

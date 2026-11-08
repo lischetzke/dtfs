@@ -1,0 +1,51 @@
+---
+# One manager: set [cluster] require_raft_auth = true, restart only if the
+# file changed, then wait for Raft to be healthy before the next manager.
+# Included from the opt-in last play of update-cluster.yml with `node`.
+
+- name: "[{{ node }}] Cluster shared_secret is set (require_raft_auth needs it)"
+  ansible.builtin.command:
+    argv: [grep, -Eq, '^[[:space:]]*shared_secret[[:space:]]*=[[:space:]]*"[^"]+"', "{{ dtfs_manager_config }}"]
+  changed_when: false
+  delegate_to: "{{ node }}"
+
+- name: "[{{ node }}] Set require_raft_auth = true under [cluster]"
+  ansible.builtin.lineinfile:
+    path: "{{ dtfs_manager_config }}"
+    regexp: '^\s*require_raft_auth\s*='
+    line: "require_raft_auth = true"
+    insertafter: '^\[cluster\]'
+    backup: true
+  register: raft_auth_cfg
+  delegate_to: "{{ node }}"
+
+- name: "[{{ node }}] Restart dtfs-manager.service"
+  ansible.builtin.systemd:
+    name: dtfs-manager.service
+    state: restarted
+  delegate_to: "{{ node }}"
+  when: raft_auth_cfg.changed
+
+- name: "[{{ node }}] Wait for the manager API port"
+  ansible.builtin.wait_for:
+    host: "{{ hostvars[node].ansible_host }}"
+    port: "{{ hostvars[node].dtfs_api_port | default(dtfs_api_port) }}"
+    timeout: "{{ dtfs_health_timeout_secs }}"
+
+- name: "[{{ node }}] Wait until Raft is running and a leader is known"
+  ansible.builtin.uri:
+    url: "http://{{ hostvars[node].ansible_host }}:{{ hostvars[node].dtfs_api_port | default(dtfs_api_port) }}/api/v1/raft/state"
+    return_content: true
+    timeout: 10
+  register: raft_after
+  until: >-
+    raft_after.status == 200
+    and raft_after.json.running_state == 'ok'
+    and (raft_after.json.current_leader | default('') | string) not in ['', 'None', 'null']
+  retries: "{{ (dtfs_health_timeout_secs | int / 5) | int }}"
+  delay: 5
+
+- name: "[{{ node }}] Settle for {{ dtfs_restart_delay_secs }}s before the next manager"
+  ansible.builtin.pause:
+    seconds: "{{ dtfs_restart_delay_secs }}"
+  when: raft_auth_cfg.changed

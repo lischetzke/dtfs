@@ -20,7 +20,12 @@ the daemon identity (`node.hostname`, or `location.host` for clients), or set
 | `dtfs_version` | none | yes | Exact tag to install, for example `v0.2.0` |
 | `dtfs_tarball` / `dtfs_tarball_url` | none | one of | Local path on the control host, or registry URL |
 | `dtfs_repo_token` | empty | for a private project | GitLab deploy (`gldt-`) or access token; use `no_log` |
-| `dtfs_minisign_pubkey` | empty | recommended | Public key; when set, signature verification is mandatory |
+| `dtfs_minisign_pubkey` | empty | recommended | Public key (base64, or an absolute `.pub` path); when set, signature verification of `SHA256SUMS` is mandatory and `minisign` must exist on the control host |
+| `dtfs_verify_checksum` | true | no | Require the tarball sha256 in `SHA256SUMS` (also checks `dtfs/MANIFEST`); `update-cluster.yml` fails the play on mismatch |
+| `dtfs_sums` / `dtfs_sums_url` / `dtfs_minisig` | beside the tarball | no | Override where `SHA256SUMS` and `SHA256SUMS.minisig` come from |
+| `dtfs_refresh_units` | true | no | `update-cluster.yml`: install the tarball's unit file on each updated node (daemon-reload with the restart) |
+| `dtfs_enable_raft_auth` | false | no | `update-cluster.yml`: last play sets `[cluster] require_raft_auth = true` on every manager, rolling, after all are on `dtfs_version` |
+| `dtfs_manager_config` | `/etc/dtfs/manager.toml` | no | Manager config edited by that play |
 | `dtfs_bin_dir` | `/usr/local/bin` | no | Binary directory (per-host override allowed) |
 | `dtfs_restart_delay_secs` | 30 | no | Settle pause after each updated node |
 | `dtfs_health_timeout_secs` | 300 | no | Per-node and final health budget |

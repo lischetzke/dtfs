@@ -30,16 +30,29 @@ playbook leaves out.
 | `dtfs_restart_delay_secs` | settle pause after each updated node, default 30 |
 | `dtfs_health_timeout_secs` | per-node and final wait budget, default 300 (poll every 5 s) |
 | `dtfs_force_update` | reinstall even when already on `dtfs_version`, default false |
+| `dtfs_verify_checksum` | require the tarball sha256 in `SHA256SUMS`, default true |
+| `dtfs_sums`, `dtfs_sums_url` | `SHA256SUMS` path or URL; default beside the tarball (or the tarball URL) |
+| `dtfs_minisign_pubkey` | minisign public key (base64, or an absolute `.pub` path); when set the signature must verify |
+| `dtfs_minisig` | `SHA256SUMS.minisig` path; default `<sums>.minisig` |
+| `dtfs_refresh_units` | install the tarball's unit file on each updated node, default true |
+| `dtfs_enable_raft_auth` | run the final `require_raft_auth` play, default false |
+| `dtfs_manager_config` | manager config path on the nodes, default `/etc/dtfs/manager.toml` |
 
 ## Preflight (control host, nothing on the nodes changes)
 
-1. Unpack the tarball into a fresh temp directory; run `dtfs/bin/dtfs-cli
+1. Verify the download before unpacking: the sha256 of the tarball must be a
+   line for `dtfs-linux-amd64.tar.gz` in `SHA256SUMS`; when `dtfs_minisign_pubkey`
+   is set, `minisign -V` must accept `SHA256SUMS` against `SHA256SUMS.minisig`
+   (the `minisign` binary is needed on the control host). Any mismatch fails the
+   play before a node is touched. After unpacking, every `dtfs/bin/*` file must
+   match `dtfs/MANIFEST`.
+2. Unpack the tarball into a fresh temp directory; run `dtfs/bin/dtfs-cli
    --version` and require it to start with `dtfs-cli <dtfs_version> `.
-2. `GET http://<mgr>:9402/api/v1/raft/state` on every manager. Every manager must
+3. `GET http://<mgr>:9402/api/v1/raft/state` on every manager. Every manager must
    answer (otherwise abort: fix it before updating). Exactly one must report
    `is_leader == true` (otherwise a leader election is in progress: abort and
    retry later).
-3. Classify: **learners** = managers whose `state` contains `Learner` and that
+4. Classify: **learners** = managers whose `state` contains `Learner` and that
    are not leader; **leader** = the one with `is_leader`; **followers** = the
    rest. Order = learners, followers, leader.
 
@@ -68,7 +81,10 @@ For each node:
    `<bin_dir>/<binary>`, owner `root`, group `root`, mode `0755`. Use a method
    that replaces the file atomically (Ansible `copy`, or `install` to `<bin>.new`
    then `mv`); never write into the running executable.
-4. **Restart.** `systemctl daemon-reload` then `systemctl restart <unit>`. Allow
+   Then copy the role's unit file from `dtfs/systemd/` to
+   `/etc/systemd/system/` (`dtfs_refresh_units`, default on; the previous file
+   is kept as a timestamped backup). Drop-ins are operator-owned and not touched.
+4. **Restart.** `systemctl daemon-reload` (picks up a changed unit file) then `systemctl restart <unit>`. Allow
    the stop timeout (manager 30 s, data and client 45 s).
 5. **Health gate** (poll every 5 s up to `dtfs_health_timeout_secs`; fail the run
    on timeout):
@@ -103,18 +119,19 @@ the leader's `/api/v1/cluster/status` has `status == "ok"`,
 ## Additions a role should make
 
 These are not in `update-cluster.yml` and are needed for a role that owns the
-whole host.
+whole host. (Checksum, optional minisign verification and the unit-file refresh
+are now done by the playbook itself; see the Inputs table.)
 
 1. **Verify before distributing.** minisign and sha256 as in
-   [Artifacts](./artifacts.md#how-to-verify-a-download). The playbook only checks
-   the version stamp of the packaged `dtfs-cli`.
+   [Artifacts](./artifacts.md#how-to-verify-a-download); the playbook does this
+   against `SHA256SUMS` as described under Preflight.
 2. **Gate on a healthy start.** Before touching the first node run the cluster
    gate without `--expect-version`. Do not update a cluster that is already
    degraded (a node Down, `files_missing_chunks > 0`, no single leader).
-3. **Units and config.** Install changed unit files from the tarball
-   (`dtfs/systemd/`) and re-render configs before the restart, with
-   `daemon-reload`, so one restart applies binary, unit and config together.
-   Keep a copy of the previous unit and config for rollback.
+3. **Units and config.** The playbook installs the unit file from the tarball
+   (`dtfs/systemd/`) before the restart. Re-rendering configs is still the
+   role's job, before the restart, so one restart applies binary, unit and
+   config together. Keep a copy of the previous config for rollback.
 4. **Maintenance mode for long restarts (data nodes).** A plain binary restart
    takes seconds and needs no maintenance. If the node can stay down longer than
    the liveness window (`monitoring.heartbeat_interval_secs` x
@@ -164,6 +181,16 @@ order), never in the same pass as the binary update.
 | `audit.replicate_via_raft` (manager.toml) | `false` | to `true` only after every manager understands `AppendAudit` | an old follower cannot deserialize the new Raft entries and gets stuck |
 | `[tls] mode` | `auto` | enable TLS (`require` or certificates present) only cluster-wide after every node runs a TLS-capable build | mixed TLS and plaintext nodes cannot talk |
 
+`update-cluster.yml` automates the first row: run it with
+`-e dtfs_enable_raft_auth=true` (normally on a second invocation after the
+binary update, which is then a no-op skip for already-current nodes). The last
+play first requires every manager to report `dtfs_version`, then, followers
+first and the leader last, one manager at a time: checks `shared_secret` is set
+in `dtfs_manager_config`, sets `require_raft_auth = true` under `[cluster]`
+(a timestamped backup of the file is kept), restarts the unit only if the file
+changed, and waits for Raft `running_state == ok` and a known leader before
+the next manager. Default off.
+
 The release notes of a version list such requirements under an `Update-required:`
 trailer; read them before pinning a version.
 
@@ -206,7 +233,7 @@ The manager role must preserve the data directory: rollback never touches
 `dtfs-cli update <manager|data|client|cli|all> [--tag vX.Y.Z] [--check] [--yes]`
 downloads from the configured repo (default GitLab package registry; token from
 `--token`, `DTFS_REPO_TOKEN` or `[updater] token`), verifies the minisign
-signature when `DTFS_MINISIGN_PUBKEY` or `[updater] minisign_public_key` is set
+signature when `--minisign-key`, `DTFS_MINISIGN_PUBKEY` or `[updater] minisign_public_key` is set
 (a warning otherwise), verifies each binary against `MANIFEST`, installs
 atomically and restarts the unit. It does not keep `.prev`, does not install
 `dtfs-cli` unless asked (`manager`/`data`/`client` replace only their own
