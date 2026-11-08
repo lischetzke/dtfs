@@ -919,6 +919,20 @@ mod tests {
         }
     }
 
+    /// Lock leases are clamped to [1 s, 5 min]; a lock is live strictly
+    /// before its expiry.
+    #[test]
+    fn posix_lock_lease_clamp_and_liveness() {
+        assert_eq!(clamp_posix_lock_lease_ms(0), 1_000);
+        assert_eq!(clamp_posix_lock_lease_ms(1_000), 1_000);
+        assert_eq!(clamp_posix_lock_lease_ms(300_000), 300_000);
+        assert_eq!(clamp_posix_lock_lease_ms(300_001), 300_000);
+        assert_eq!(clamp_posix_lock_lease_ms(u64::MAX), 300_000);
+        assert!(posix_lock_is_live(101, 100));
+        assert!(!posix_lock_is_live(100, 100));
+        assert!(!posix_lock_is_live(0, 100));
+    }
+
     /// RenameFile rejections carry typed gRPC codes (FUSE: ENOENT/ENOTEMPTY).
     #[test]
     fn rename_error_status_codes() {

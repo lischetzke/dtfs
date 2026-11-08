@@ -330,6 +330,18 @@ fn heartbeat_may_mark_healthy(current: HealthStatus) -> bool {
     }
 }
 
+/// Lease bounds for a distributed POSIX lock: at least 1 s, at most 5 min,
+/// so a client cannot pin a byte range for an unbounded time.
+fn clamp_posix_lock_lease_ms(lease_ms: u64) -> u64 {
+    lease_ms.clamp(1_000, 300_000)
+}
+
+/// A lock counts for conflicts only until `expires_at_ms` (same predicate as
+/// the state machine's expiry sweep: live iff `expires_at_ms > now`).
+fn posix_lock_is_live(expires_at_ms: u64, now_ms: u64) -> bool {
+    expires_at_ms > now_ms
+}
+
 /// Map the state machine's `RenameFile` rejection text to a typed gRPC status
 /// so FUSE can answer ENOENT / ENOTEMPTY / EINVAL instead of EIO. `None` =
 /// unrecognised message (kept as the legacy `success:false` response).
@@ -2729,7 +2741,7 @@ impl ManagerService for MetadataService {
                 start: req.start,
                 end: req.end,
                 write: req.write,
-                lease_ms: req.lease_ms.max(1000),
+                lease_ms: clamp_posix_lock_lease_ms(req.lease_ms),
                 now_ms,
             })
             .await?;
@@ -2783,10 +2795,14 @@ impl ManagerService for MetadataService {
         request: Request<ProbeLockRequest>,
     ) -> Result<Response<ProbeLockResponse>, Status> {
         let req = request.into_inner();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let data = self.sm_data.read().await;
         if let Some(locks) = data.posix_locks.get(&req.path) {
             for l in locks {
-                if l.owner_id == req.owner_id {
+                if l.owner_id == req.owner_id || !posix_lock_is_live(l.expires_at_ms, now_ms) {
                     continue;
                 }
                 if req.start >= l.end || req.end <= l.start {
