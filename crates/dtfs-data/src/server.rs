@@ -295,27 +295,7 @@ const GET_PIECE_SIZE: usize = 8 * 1024 * 1024;
 /// it tiny (2 pieces in flight) so peak buffering stays ~16 MB.
 const GET_CHANNEL_DEPTH: usize = 2;
 
-/// U2 — BLAKE3-hash an on-disk chunk file incrementally, holding at most
-/// one ~8 MB piece in RAM at a time (never the whole chunk). Used by the
-/// verify_on_read cache-MISS path so a corrupt on-disk chunk is detected
-/// before any bytes leave the process, with Bug-I memory parity.
-async fn hash_file_incrementally(
-    path: &std::path::Path,
-    total: u64,
-) -> std::io::Result<[u8; 32]> {
-    use tokio::io::AsyncReadExt;
-    let mut f = tokio::fs::File::open(path).await?;
-    let mut hasher = dtfs_common::checksum::IncrementalHasher::new();
-    let mut read: u64 = 0;
-    let mut buf = vec![0u8; GET_PIECE_SIZE];
-    while read < total {
-        let want = (total - read).min(GET_PIECE_SIZE as u64) as usize;
-        f.read_exact(&mut buf[..want]).await?;
-        hasher.update(&buf[..want]);
-        read += want as u64;
-    }
-    Ok(hasher.finalize())
-}
+use crate::store::hash_chunk_file_incrementally as hash_file_incrementally;
 
 /// U2 — stream an on-disk chunk file to the gRPC response channel in
 /// `GET_PIECE_SIZE` pieces, reading one piece at a time via `read_exact`.

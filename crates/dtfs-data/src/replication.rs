@@ -213,11 +213,6 @@ impl ReplicationManager {
             ),
         }
     }
-
-    /// Get a reference to the underlying config.
-    pub fn config(&self) -> &DataNodeConfig {
-        &self.config
-    }
 }
 
 #[cfg(test)]

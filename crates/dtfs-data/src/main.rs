@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-mod cache;
 mod disk;
 mod integrity;
 mod memory;

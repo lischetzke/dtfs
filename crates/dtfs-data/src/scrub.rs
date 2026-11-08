@@ -107,13 +107,6 @@ impl ScrubScheduler {
         Self { store, config }
     }
 
-    /// Construct a scheduler from an owned config (test / legacy callers).
-    /// Wraps the value in `Arc<RwLock<...>>` so the loop's hot-reload
-    /// semantics still hold.
-    pub fn new_owned(store: Arc<ChunkStore>, config: ScrubConfig) -> Self {
-        Self { store, config: Arc::new(RwLock::new(config)) }
-    }
-
     /// Run the background scrub loop. Wakes every `DECISION_TICK_SECS`,
     /// reads the live `ScrubConfig`, and runs a quick / deep scrub
     /// when the configured interval has elapsed since the last run.

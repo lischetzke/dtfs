@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[cfg(test)]
 use bytes::Bytes;
+#[cfg(test)]
 use dtfs_common::checksum;
 use dtfs_common::error::{DtfsError, DtfsResult};
 use dtfs_common::types::{ChunkId, ChunkMeta, DiskTier, ScrubLevel, ScrubResult, VolumeId};
@@ -298,11 +300,9 @@ impl ChunkStore {
         &self.disk_manager
     }
 
-    /// Write a chunk to disk with fsync guarantee.
-    /// Returns the ChunkMeta on success.
-    ///
-    /// The write is preceded by a WAL entry. The WAL entry is removed only
-    /// after the chunk data and metadata have been fully committed to disk.
+    /// Test helper: store a whole in-memory chunk through the production
+    /// streaming path (`allocate_streaming_tmp` + `commit_chunk_from_tmp`).
+    #[cfg(test)]
     pub async fn put_chunk(
         &self,
         chunk_id: &ChunkId,
@@ -310,110 +310,34 @@ impl ChunkStore {
         volume_id: &VolumeId,
         tier: DiskTier,
     ) -> DtfsResult<ChunkMeta> {
-        let disk = self
-            .disk_manager
-            .select_disk_for_tier(tier)
-            .ok_or_else(|| DtfsError::DiskNotFound(format!("No disk for tier {:?}", tier)))?;
-
-        let chunk_dir = chunk_data_dir(&disk.mount_path, chunk_id);
-        let tmp_dir = tmp_dir(&disk.mount_path);
-        let wal_dir = wal_dir(&disk.mount_path);
-
-        // Ensure directories exist
-        fs::create_dir_all(&chunk_dir)
-            .await
-            .map_err(DtfsError::Io)?;
-        fs::create_dir_all(&tmp_dir).await.map_err(DtfsError::Io)?;
-        fs::create_dir_all(&wal_dir).await.map_err(DtfsError::Io)?;
-
-        // 1. Write WAL entry before doing anything.
-        let wal_entry = WalEntry {
-            operation: WalOperation::PutChunk,
-            chunk_id: chunk_id.as_hex(),
-            disk_path: disk.mount_path.to_string_lossy().to_string(),
-            timestamp_ms: now_millis(),
-        };
-        let wal_path = wal_dir.join(format!("{}.wal.json", chunk_id.as_hex()));
-        write_wal_entry(&wal_path, &wal_entry).await?;
-
-        // 2. Compute checksum
-        let hash = checksum::compute(data);
-
-        // 3. Write to tmp first, then atomic rename
-        let tmp_path = tmp_dir.join(format!("{}.dat.tmp", chunk_id.as_hex()));
-        let final_dat_path = chunk_dir.join(format!("{}.dat", chunk_id.as_hex()));
-        let final_meta_path = chunk_dir.join(format!("{}.meta", chunk_id.as_hex()));
-
-        // Write data to tmp with fsync
-        {
-            let mut file = fs::File::create(&tmp_path).await.map_err(DtfsError::Io)?;
-            file.write_all(data).await.map_err(DtfsError::Io)?;
-            file.sync_all().await.map_err(DtfsError::Io)?;
-        }
-
-        // CO-5-5 — chunks are content-addressed, so a re-upload of the same
-        // bytes lands on an already-present chunk. Note whether a COMPLETE
-        // chunk (.dat + .meta) already exists *before* the rename so we only
-        // bump the chunk_count / bytes_stored counters for a genuinely new
-        // chunk. Requiring the .meta too means a meta-less .dat left by an
-        // interrupted prior put (CO-1-4b residue) doesn't suppress the first
-        // real count for this id.
-        let already_present =
-            final_dat_path.exists() && final_meta_path.exists();
-
-        // Atomic rename to final location
-        fs::rename(&tmp_path, &final_dat_path)
-            .await
-            .map_err(DtfsError::Io)?;
-        // Bug L — fsync parent directory after rename so the directory
-        // entry survives a crash.
-        fsync_dir(&chunk_dir).await?;
-
-        // 4. Write metadata
-        let meta = ChunkMeta {
-            id: chunk_id.clone(),
-            size: data.len() as u64,
-            checksum: hash,
-            created_at: chrono::Utc::now().timestamp(),
-            volume_id: volume_id.clone(),
-            replication_factor: 1, // Will be set by manager
-        };
-
-        let meta_json = serde_json::to_string_pretty(&meta)
-            .map_err(|e| DtfsError::Serialization(e.to_string()))?;
-
-        {
-            let mut file = fs::File::create(&final_meta_path)
-                .await
-                .map_err(DtfsError::Io)?;
-            file.write_all(meta_json.as_bytes())
-                .await
-                .map_err(DtfsError::Io)?;
-            file.sync_all().await.map_err(DtfsError::Io)?;
-        }
-        // Bug L — fsync parent dir after .meta create.
-        fsync_dir(&chunk_dir).await?;
-
-        // 5. Remove the WAL entry now that the write is fully committed.
-        let _ = fs::remove_file(&wal_path).await;
-        let _ = fsync_dir(&wal_dir).await;
-
-        // Update running counters — only for a newly-stored chunk. A
-        // duplicate put (CO-5-5) overwrote an existing .dat, so counting it
-        // again would inflate chunk_count / bytes_stored.
-        if !already_present {
-            self.chunk_count.fetch_add(1, Ordering::Relaxed);
-            self.bytes_stored.fetch_add(data.len() as u64, Ordering::Relaxed);
-        }
-
-        tracing::debug!(
-            "Stored chunk {} ({} bytes) on disk {}",
-            chunk_id,
-            data.len(),
-            disk.mount_path.display()
-        );
-
+        let (tmp_path, _mount) = self.allocate_streaming_tmp(tier)?;
+        fs::write(&tmp_path, data).await.map_err(DtfsError::Io)?;
+        let (meta, _disk_id) = self
+            .commit_chunk_from_tmp(
+                chunk_id,
+                &tmp_path,
+                volume_id,
+                tier,
+                data.len() as u64,
+                checksum::compute(data),
+            )
+            .await?;
         Ok(meta)
+    }
+
+    /// Test helper: read a whole chunk into memory.
+    #[cfg(test)]
+    pub async fn get_chunk(&self, chunk_id: &ChunkId) -> DtfsResult<Bytes> {
+        let (path, _) = self
+            .chunk_file_path(chunk_id)
+            .ok_or_else(|| DtfsError::ChunkNotFound(chunk_id.to_string()))?;
+        Ok(Bytes::from(fs::read(path).await.map_err(DtfsError::Io)?))
+    }
+
+    /// Test helper: does the chunk exist on any disk?
+    #[cfg(test)]
+    pub async fn has_chunk(&self, chunk_id: &ChunkId) -> bool {
+        self.chunk_file_path(chunk_id).is_some()
     }
 
     // -----------------------------------------------------------------------
@@ -679,22 +603,6 @@ impl ChunkStore {
         None
     }
 
-    pub async fn get_chunk(&self, chunk_id: &ChunkId) -> DtfsResult<Bytes> {
-        for disk in self.disk_manager.all_disks() {
-            let dat_path = chunk_data_path(&disk.mount_path, chunk_id);
-            if !dat_path.exists() {
-                continue;
-            }
-            let path = dat_path.clone();
-            let data = tokio::task::spawn_blocking(move || std::fs::read(&path))
-                .await
-                .map_err(|e| DtfsError::Io(std::io::Error::other(e.to_string())))?
-                .map_err(DtfsError::Io)?;
-            return Ok(Bytes::from(data));
-        }
-        Err(DtfsError::ChunkNotFound(chunk_id.to_string()))
-    }
-
     /// Delete a chunk from disk. **Errors** with `ChunkNotFound` when
     /// the chunk is absent — call `delete_chunk_idempotent` instead
     /// if you want a silent no-op on absent.
@@ -832,16 +740,6 @@ impl ChunkStore {
         Ok((false, 0))
     }
 
-    /// Check if a chunk exists on any disk.
-    pub async fn has_chunk(&self, chunk_id: &ChunkId) -> bool {
-        for disk in self.disk_manager.all_disks() {
-            if chunk_data_path(&disk.mount_path, chunk_id).exists() {
-                return true;
-            }
-        }
-        false
-    }
-
     /// Get chunk metadata.
     pub async fn get_chunk_meta(&self, chunk_id: &ChunkId) -> DtfsResult<ChunkMeta> {
         for disk in self.disk_manager.all_disks() {
@@ -894,61 +792,6 @@ impl ChunkStore {
             .iter()
             .map(|d| d.mount_path.clone())
             .collect()
-    }
-
-    /// Bug BC-6 / Bug CB — enumerate every chunk this node holds on disk
-    /// together with its `.dat` mtime (Unix ms). Walks each configured
-    /// disk's `chunks/aa/bb/<id>.dat` tree and returns the stems whose
-    /// `.meta` companion also exists. Used by the manager-side
-    /// orphan_scrub planner (BC-7); the mtime is the durable grace clock
-    /// the reaper measures against (Bug CB, scheduler::orphan_reap_due).
-    /// Linear in chunk count; OK at the ~24h cadence we tick orphan_scrub
-    /// on. A stat failure on an individual file yields mtime 0 ("age
-    /// unknown"), which the manager treats as not-yet-due rather than
-    /// reaping with no grace.
-    pub async fn list_all_chunks_with_mtime(&self) -> DtfsResult<Vec<(String, u64)>> {
-        let mut out: Vec<(String, u64)> = Vec::new();
-        for disk in self.disk_manager.all_disks() {
-            let chunks_dir = disk.mount_path.join("chunks");
-            if !chunks_dir.exists() {
-                continue;
-            }
-            let mut d1 = fs::read_dir(&chunks_dir).await.map_err(DtfsError::Io)?;
-            while let Some(e1) = d1.next_entry().await.map_err(DtfsError::Io)? {
-                if !e1.file_type().await.map_err(DtfsError::Io)?.is_dir() { continue; }
-                let mut d2 = fs::read_dir(e1.path()).await.map_err(DtfsError::Io)?;
-                while let Some(e2) = d2.next_entry().await.map_err(DtfsError::Io)? {
-                    if !e2.file_type().await.map_err(DtfsError::Io)?.is_dir() { continue; }
-                    let mut files = fs::read_dir(e2.path()).await.map_err(DtfsError::Io)?;
-                    while let Some(f) = files.next_entry().await.map_err(DtfsError::Io)? {
-                        let p = f.path();
-                        if p.extension().map_or(false, |x| x == "dat") {
-                            let stem = match p.file_stem().and_then(|s| s.to_str()) {
-                                Some(s) if !s.is_empty() => s.to_string(),
-                                _ => continue,
-                            };
-                            // Require the .meta companion so we never
-                            // surface a half-written chunk to the orphan
-                            // reaper.
-                            if p.with_extension("meta").exists() {
-                                let mtime_ms = f
-                                    .metadata()
-                                    .await
-                                    .ok()
-                                    .and_then(|m| m.modified().ok())
-                                    .and_then(|t| {
-                                        t.duration_since(std::time::UNIX_EPOCH).ok()
-                                    })
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0);
-                                out.push((stem, mtime_ms));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(out)
     }
 
     /// REV-3-2 — return ONE page of this node's chunk listing without
@@ -1090,7 +933,7 @@ impl ChunkStore {
                                             // a PutChunk WAL with a meta-less
                                             // .dat means the put was interrupted.
                                             if let Some(cid) =
-                                                parse_chunk_id_hex(&wal_entry.chunk_id)
+                                                ChunkId::from_hex(&wal_entry.chunk_id).ok()
                                             {
                                                 let dat = chunk_data_path(
                                                     &disk.mount_path,
@@ -1132,7 +975,7 @@ impl ChunkStore {
                                             // Attempt to complete the deletion.
                                             // Parse chunk_id hex back into bytes.
                                             if let Some(cid) =
-                                                parse_chunk_id_hex(&wal_entry.chunk_id)
+                                                ChunkId::from_hex(&wal_entry.chunk_id).ok()
                                             {
                                                 let dat = chunk_data_path(
                                                     &disk.mount_path,
@@ -1941,24 +1784,6 @@ async fn fsync_dir(dir: &Path) -> DtfsResult<()> {
     }
 }
 
-/// Parse a hex-encoded chunk ID string back into a ChunkId.
-fn parse_chunk_id_hex(hex_str: &str) -> Option<ChunkId> {
-    let bytes: Vec<u8> = (0..hex_str.len())
-        .step_by(2)
-        .filter_map(|i| {
-            hex_str.get(i..i + 2).and_then(|s| u8::from_str_radix(s, 16).ok())
-        })
-        .collect();
-
-    if bytes.len() == 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Some(ChunkId::from_bytes(arr))
-    } else {
-        None
-    }
-}
-
 /// CO-1-4(a) — read a `.dat` file's mtime as epoch millis, or None if the
 /// file is absent or its mtime can't be resolved. Used by the DeleteChunk
 /// WAL replay to tell a fresh re-upload (mtime > WAL timestamp) from the
@@ -1975,7 +1800,7 @@ async fn dat_mtime_ms(path: &Path) -> Option<u64> {
 /// CO-4-2 — BLAKE3-hash an on-disk chunk file incrementally, holding at most
 /// one ~8 MB piece in RAM at a time (never the whole chunk, A.3.2). Used by
 /// the deep scrub so a large chunk isn't loaded whole to verify its checksum.
-async fn hash_chunk_file_incrementally(path: &Path, total: u64) -> std::io::Result<[u8; 32]> {
+pub(crate) async fn hash_chunk_file_incrementally(path: &Path, total: u64) -> std::io::Result<[u8; 32]> {
     use tokio::io::AsyncReadExt;
     const PIECE: usize = 8 * 1024 * 1024;
     let mut f = fs::File::open(path).await?;
@@ -1997,10 +1822,6 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -2432,13 +2253,7 @@ mod tests {
             dat_paths.insert(chunk_id.as_hex(), chunk_data_path(&disk, &chunk_id));
         }
 
-        let mut expected: Vec<String> = store
-            .list_all_chunks_with_mtime()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
+        let mut expected: Vec<String> = dat_paths.keys().cloned().collect();
         expected.sort();
         assert_eq!(expected.len(), 25);
 

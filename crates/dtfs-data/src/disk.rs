@@ -143,26 +143,6 @@ impl DiskManager {
             .collect()
     }
 
-    /// Get disks of a specific tier.
-    pub fn disks_for_tier(&self, tier: DiskTier) -> Vec<&ManagedDisk> {
-        self.disks.iter().filter(|d| d.tier == tier).collect()
-    }
-
-    /// Mark a disk as failed.
-    pub fn mark_disk_failed(&mut self, disk_id: u32) {
-        if let Some(disk) = self.disks.iter_mut().find(|d| d.disk_id == disk_id) {
-            disk.status = DiskStatus::Failed;
-            tracing::warn!(disk_id, path = %disk.mount_path.display(), "disk marked as FAILED");
-        }
-    }
-
-    /// Mark a disk as draining (for removal or maintenance).
-    pub fn mark_disk_draining(&mut self, disk_id: u32) {
-        if let Some(disk) = self.disks.iter_mut().find(|d| d.disk_id == disk_id) {
-            disk.status = DiskStatus::Draining;
-            tracing::info!("Disk {} marked as DRAINING: {}", disk_id, disk.mount_path.display());
-        }
-    }
 }
 
 /// Replica identity is `(node_id, disk_id)` and `disk_id` is the position in
