@@ -1,6 +1,7 @@
 # Summary
 
 [Introduction](./introduction.md)
+[Glossary](./glossary.md)
 
 # Getting Started
 
