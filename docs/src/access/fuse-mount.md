@@ -1,218 +1,83 @@
 # FUSE Mount
 
-DTFS exposes the distributed filesystem as a local mount point using FUSE (Filesystem in Userspace). Applications read and write files through standard POSIX system calls without any awareness of the underlying distributed storage.
-
-## Overview
-
-The `dtfs-fuse` binary is the FUSE client. It connects to the manager cluster for metadata operations and directly to data nodes for chunk reads and writes. From the application's perspective, the mount point behaves like a local filesystem.
+`dtfs-fuse` mounts the filesystem as a local directory. Applications use ordinary POSIX calls; the client talks to managers for metadata and directly to data nodes for chunk bytes.
 
 ```text
-Application
-    |
-    v  (POSIX: open, read, write, stat, readdir, ...)
-+-----------+
-| dtfs-fuse |
-+-----------+
-    |               |
-    v               v
-dtfs-manager    dtfs-data
-(metadata)      (chunk I/O)
+Application --POSIX--> dtfs-fuse --metadata--> dtfs-manager
+                          |
+                          +--chunk bytes---> dtfs-data
 ```
 
 ## Mounting
 
-### Basic Mount
-
 ```bash
-dtfs-fuse mount \
-  --manager-addrs 10.0.1.1:9100,10.0.1.2:9100,10.0.1.3:9100 \
-  --volume default \
-  --mountpoint /mnt/dtfs
+dtfs-fuse --config /etc/dtfs/fuse.toml --mountpoint /mnt/dtfs
 ```
 
-The `--manager-addrs` flag accepts a comma-separated list of manager addresses. The client discovers the current Raft leader automatically and reconnects on failover.
+`--config` defaults to `/etc/dtfs/fuse.toml`; `--mountpoint` overrides `[mount].mountpoint`. There are no subcommands. Unmount with `fusermount3 -u /mnt/dtfs`, or stop the service. A bad config makes the process exit at startup (a restart loop under systemd), so check `journalctl -u 'dtfs-fuse@*'` after editing.
 
-### Configuration File
-
-For production deployments, use a configuration file instead of command-line flags:
+Minimal `fuse.toml`:
 
 ```toml
-# /etc/dtfs/fuse-client.toml
+[client]
+manager_addr  = "mgr01:9401"
+manager_addrs = ["mgr02:9401", "mgr03:9401"]   # list every manager
+shared_secret = "..."
 
-[manager]
-addrs = ["10.0.1.1:9100", "10.0.1.2:9100", "10.0.1.3:9100"]
+[location]
+region = "eu"
+datacenter = "toro"
+rack = "r1"
+host = "toro-plex_cln"
 
 [mount]
-volume = "default"
 mountpoint = "/mnt/dtfs"
-
-# Allow non-root users to access the mount
 allow_other = true
-
-# Set the filesystem name shown in mount and df output
-fsname = "dtfs"
 ```
 
-```bash
-dtfs-fuse mount --config /etc/dtfs/fuse-client.toml
-```
+`manager_addr` plus `manager_addrs` must include at least one Raft **voter**. Reads work against any manager, including learners, but client mutations are not forwarded by learners, so every write would fail. Full reference: [FUSE Client Configuration](../configuration/fuse-client.md).
 
-### Unmounting
+The systemd template is `deploy/systemd/dtfs-fuse@.service` (instance name = mount path, for example `dtfs-fuse@mnt-dtfs`).
 
-```bash
-dtfs-fuse unmount /mnt/dtfs
-```
+## Reads
 
-Or use the standard `fusermount` command:
+See [Data Flow](../architecture/data-flow.md#read) for the full path. In short: location lookup (5 s cache), replica ranking, single-flighted chunk fetch with failover, server-side verification, client-side BLAKE3 check of the fetched bytes, then caching and read-ahead.
 
-```bash
-fusermount -u /mnt/dtfs
-```
+### Replica selection
 
-A graceful unmount flushes all pending writes and closes all open file handles before detaching the mount. If applications hold open handles, the unmount blocks until they are closed (or use `--force` to detach immediately, which may lose unflushed writes).
+Ranked in this order:
 
-## Transparent Remote Access
+1. `read_location_priority` (top-level `fuse.toml` key, ordered list of datacenter or host names, case-insensitive): the first replica matching the earliest entry wins, even over a nearer one.
+2. Physical distance from `[location]`: same host, same rack, same datacenter, same region, other region.
+3. On equal distance only, prefer a faster tier (warm over the cold anchor HDD).
 
-When a FUSE client reads a file, the following sequence occurs transparently:
+A fetch that fails (timeout `client.chunk_read_timeout_secs`, `data_loss`, checksum mismatch, transport error) moves to the next candidate. The read fails only when every candidate failed. Errors map to errno through one function: only a genuine gRPC `NotFound` becomes `ENOENT`; a transient failure is `EIO`.
 
-1. The client resolves the file path to a file ID and chunk list via the manager's metadata service.
-2. For each chunk needed, the client selects the best replica based on network proximity (see location-aware selection below).
-3. The client opens a gRPC stream to the selected data node and reads the chunk data.
-4. The data is returned to the application through the FUSE interface.
+## Writes
 
-### Location-Aware Node Selection
+Writes are buffered per chunk, flushed in batches (`write.flush_batch_chunks`, default 4) and committed under a write lease. Details and failure handling in [Data Flow](../architecture/data-flow.md#write). Points that affect behaviour:
 
-The FUSE client is configured with its own location in the topology hierarchy:
+- **Chunk size.** `client.chunk_size_mb` (default 4) must equal the volume's chunk size. The client reads the file's real chunk size from the manager and refuses a write whose configured size does not match.
+- **Read-modify-write.** Writing into the middle of an existing chunk reads that chunk once to seed the buffer; a seed failure is an error, not a silent partial overwrite.
+- **First-write tier.** `[write] first_write_tier = "cold"` (default) sends no tier hint, so the manager uses the volume's own tier. `"nearest-warm"` asks for the warm tier when a healthy warm disk exists; it selects a tier, not a datacenter. The volume's anchor still applies to the same allocation.
+- **Dirty-data cap.** Dirty bytes per open file are capped (about twice the flush batch); a write that would exceed it drains first.
+- **Rename** moves buffers, inode mappings and mode overrides with the path. Unaligned **truncate** rewrites the tail chunk; a bare path truncate uses a temporary internal writer.
+- **Ghost unlink.** A file whose create never committed any chunk is removed on release; a file that has ever committed is never ghost-unlinked.
 
-```toml
-[client.location]
-region     = "us-east"
-datacenter = "dc1"
-rack       = "rack-05"
-```
+## Directories, inodes and metadata
 
-When multiple replicas of a chunk are available, the client selects the one with the smallest topological distance:
+- `opendir` takes one snapshot of the listing and serves `readdir` and `readdirplus` pages from it until `releasedir`.
+- The client counts kernel lookups per inode and drops an inode only when the count reaches zero. fuse3 batch-forget carries no counts, so an inode that was not looked up for 5 s is dropped instead.
+- File attributes: symlinks are reported as symlinks (`is_symlink` from the manager); file mode overrides are kept client-side and re-keyed on rename. The metadata cache is bounded (4096 entries) and swept on its TTL.
 
-1. Same rack (lowest latency).
-2. Same datacenter, different rack.
-3. Same region, different datacenter.
-4. Different region (highest latency).
+## Locks
 
-If two replicas are equidistant, the client picks one at random to distribute load.
+`fcntl` byte-range locks are tracked inside the client process only. Ranges from the kernel are inclusive; unlock carves the owner's ranges instead of dropping a whole overlapping lock, and `flush` drops the closing owner's locks. The manager lock RPCs exist but are not used, so locks do **not** coordinate between two mounts.
 
-## Performance Tuning
+## Memory
 
-### Metadata Caching
-
-The FUSE client caches directory entries and file attributes to reduce round trips to the manager:
-
-```toml
-[cache.metadata]
-# Time-to-live for cached directory entries
-entry_ttl_secs = 5
-
-# Time-to-live for cached file attributes (size, mtime, permissions)
-attr_ttl_secs = 5
-
-# Maximum number of cached metadata entries
-max_entries = 100000
-```
-
-Lower TTL values provide stronger consistency but increase metadata traffic. For workloads where files are rarely modified, increasing the TTL reduces latency.
-
-### First-write tier preference (Bug AV)
-
-The FUSE client can request a specific tier for the first chunk of a write via the `[write] first_write_tier` config option. The hint selects a **tier** and nothing else. Two modes:
-
-* **`"cold"` (default)** — the client sends no tier hint at all, so the manager places the chunk on the volume’s own effective tier (`pick_effective_tier` over `mandatory_replicas`: the first non-zero of hot, warm, cold) at the volume’s replica count. No anchor-lag window, but slower when the client’s DC has a slow uplink to the DC that ends up holding the copy.
-* **`"nearest-warm"`** — the client asks for the warm tier. The manager honours the hint whenever *any* healthy node advertises a warm disk, and falls back to the volume’s effective tier when none does. The replica count is then clamped up to `write_safety.min_replicas_before_ack` (REV-4-10) so the write is not streamed in full only to be rejected at commit.
-
-Configure in `fuse.toml`:
-
-```toml
-[write]
-first_write_tier = "nearest-warm"
-```
-
-See [FUSE Client Configuration → `[write]`](../configuration/fuse-client.md#write----write-path-preferences-bug-av) for the full reference and trade-off discussion.
-
-> **The hint carries no datacenter affinity.** The allocation path walks the hash ring with `prefer_client_locations = false` and never learns where the writing client is, so `"nearest-warm"` selects *a* warm node, not necessarily one in the client’s own DC. Read the name as "the warm tier", not as "nearby".
-
-> **The volume’s anchor still applies to the same allocation.** `anchor_datacenter` is handed to the ring as a required DC, so if none of the chosen replicas lives there one slot is swapped for an anchor-DC node — with the tier constraint relaxed for that slot, which is how a warm-tier write still lands a copy on a cold-only anchor node. On a volume that has an anchor and an ack floor of 2 or more, the anchor copy is therefore placed in the *same* allocation rather than deferred; the asynchronous anchor-lag-repair path (AV-3-3) only comes into play when the ring cannot find an anchor-DC candidate at all.
-
-> **There is no `cache_replicas` safety valve.** `resolve_preferred_tier` consults only which tiers are available on healthy nodes; it never looks at the volume’s cache policy. A volume with `cache_replicas.warm.max = 0` still honours a `"nearest-warm"` hint. Durability is protected by the anchor requirement and the ack floor above, not by the cache policy.
-
-### Write Buffering
-
-Writes are buffered on the client and flushed to data nodes in chunk-sized batches (default 128 MB). This converts many small writes into fewer large sequential writes:
-
-```toml
-[write_buffer]
-# Maximum memory for write buffers across all open files
-max_total_size = "1 GiB"
-
-# Flush a chunk when the buffer for that chunk reaches this size
-flush_threshold = "128 MiB"
-
-# Maximum time a buffer can remain unflushed
-flush_timeout_secs = 30
-```
-
-The `flush_timeout_secs` ensures that data is not held in memory indefinitely. Even if a chunk buffer has not reached the flush threshold, it is written to the data nodes after this timeout.
-
-### Read-Ahead
-
-The FUSE client supports configurable read-ahead to prefetch data before the application requests it. See [Read-Ahead Modes](./read-ahead.md) for details.
-
-### Concurrency
-
-```toml
-[io]
-# Maximum concurrent chunk reads
-max_read_concurrency = 16
-
-# Maximum concurrent chunk writes
-max_write_concurrency = 8
-
-# Number of FUSE worker threads
-fuse_threads = 4
-```
-
-Increasing `max_read_concurrency` improves throughput for workloads with many parallel readers. The `fuse_threads` setting controls how many FUSE requests are processed in parallel by the kernel-to-userspace bridge.
-
-## systemd Integration
-
-For systems using systemd, install the provided unit file:
-
-```ini
-# /etc/systemd/system/dtfs-fuse.service
-[Unit]
-Description=DTFS FUSE Client
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=notify
-ExecStart=/usr/local/bin/dtfs-fuse mount --config /etc/dtfs/fuse-client.toml
-ExecStop=/usr/local/bin/dtfs-fuse unmount /mnt/dtfs
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-systemctl enable --now dtfs-fuse
-```
+An optional `[memory]` block caps the client. At Warn the read-ahead cache budget halves; at Shed unconsumed prefetch is dropped and prefetching stops. See [Architecture Overview](../architecture/overview.md#memory-model).
 
 ## Monitoring
 
-The FUSE client exports metrics on a local Prometheus endpoint:
-
-- `dtfs_fuse_ops_total{op="read|write|open|stat|readdir|..."}` -- total FUSE operations by type.
-- `dtfs_fuse_op_duration_seconds{op="..."}` -- histogram of operation latency.
-- `dtfs_fuse_read_bytes_total` -- total bytes read through the mount.
-- `dtfs_fuse_write_bytes_total` -- total bytes written through the mount.
-- `dtfs_fuse_open_handles` -- currently open file handles.
-- `dtfs_fuse_write_buffer_bytes` -- current write buffer usage.
+The client has no Prometheus endpoint. It registers itself with the managers (appears in the node table when `client.shared_secret` is set) and logs operations at `RUST_LOG` level. Cluster-side views are in [Monitoring](../operations/monitoring.md).

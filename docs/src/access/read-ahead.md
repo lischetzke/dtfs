@@ -1,138 +1,49 @@
-# Read-Ahead Modes
+# Read-Ahead
 
-The DTFS FUSE client supports configurable read-ahead to prefetch chunk data before the application requests it, reducing perceived latency for sequential access patterns.
-
-## Modes
-
-The read-ahead engine operates in one of four modes, selected per mount or per directory:
-
-### file-sequential
-
-**Default mode.** The client detects sequential read patterns within a single file and prefetches subsequent chunks.
-
-When the client observes two consecutive chunk reads from the same file in ascending order, it begins prefetching the next N chunks in the background. The prefetch depth starts at 1 and doubles with each confirmed sequential access, up to `max_prefetch_chunks`.
-
-This mode is well suited for large file reads such as media playback, log processing, and data analytics where a single file is read from beginning to end.
-
-```toml
-[read_ahead]
-mode = "file-sequential"
-max_prefetch_chunks = 8
-```
-
-### folder-sequential
-
-The client prefetches not only subsequent chunks of the current file but also the first chunks of the next files in the same directory, sorted by filename.
-
-When a file read reaches the final chunk, the client begins prefetching the first chunk of the next file in directory order. This continues up to `max_prefetch_files` files ahead.
-
-This mode is designed for workloads that process every file in a directory in order, such as batch image processing, sequential log ingestion, or training data pipelines.
-
-```toml
-[read_ahead]
-mode = "folder-sequential"
-max_prefetch_chunks = 8
-max_prefetch_files = 4
-```
-
-### file-only
-
-The client prefetches chunks within the current file only when the application issues an explicit `posix_fadvise(FADV_SEQUENTIAL)` or `readahead()` system call. No automatic detection is performed.
-
-This mode gives the application full control over prefetching behavior. It is useful when the application knows its own access pattern and can issue advisory calls, or when automatic detection would waste bandwidth on random-access workloads.
-
-```toml
-[read_ahead]
-mode = "file-only"
-max_prefetch_chunks = 4
-```
-
-### disabled
-
-Read-ahead is completely turned off. Every chunk is fetched on demand when the application reads it.
-
-Use this mode for workloads with purely random access patterns where prefetching would waste network bandwidth and cache space.
-
-```toml
-[read_ahead]
-mode = "disabled"
-```
+The FUSE client prefetches the chunks that follow the one being read, so sequential playback finds its next chunk already in memory.
 
 ## Configuration
 
-### Global Settings
-
-Read-ahead is configured in the FUSE client configuration file:
-
 ```toml
-[read_ahead]
-# Mode selection: "file-sequential", "folder-sequential", "file-only", "disabled"
-mode = "file-sequential"
-
-# Maximum number of chunks to prefetch ahead of the read position
-max_prefetch_chunks = 8
-
-# Maximum number of files to prefetch ahead in folder-sequential mode
-max_prefetch_files = 4
-
-# Maximum memory for prefetch buffers
-max_prefetch_buffer = "512 MiB"
-
-# Prefetch priority relative to foreground reads (0.0-1.0)
-# Lower values give more bandwidth to foreground reads
-prefetch_priority = 0.5
+[readahead]                      # fuse.toml
+mode                   = "folder-sequential"   # default
+prefetch_chunks        = 8
+prefetch_next_files    = 3
+cache_mb               = 64
+prefetch_max_inflight  = 2
 ```
 
-### Per-Directory Overrides
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `mode` | `folder-sequential` | `file-sequential`, `folder-sequential`, `file-only` or `disabled`. An unknown value falls back to `folder-sequential` with a warning |
+| `prefetch_chunks` | 8 | Chunks fetched ahead of the read position (`disabled` makes it 0) |
+| `prefetch_next_files` | 3 | Parsed for `folder-sequential`; see the note below |
+| `cache_mb` | 64 | Byte budget of the prefetch memory cache |
+| `prefetch_max_inflight` | 2 | Prefetch `GetChunk` streams on the wire at once |
 
-Different directories can use different read-ahead modes via extended attributes:
+> **All three non-disabled modes currently behave the same.** After each chunk read the engine prefetches the next `prefetch_chunks` chunks of the same file. Cross-file prefetch for `folder-sequential` (`prefetch_next_files`) and any `fadvise`-driven behaviour for `file-only` are not implemented. There are no per-directory overrides and no read-ahead CLI.
 
-```bash
-# Set a directory to use folder-sequential mode
-dtfs-cli read-ahead set /mnt/dtfs/training-data --mode folder-sequential
+## How it works
 
-# Disable read-ahead for a random-access directory
-dtfs-cli read-ahead set /mnt/dtfs/database --mode disabled
+1. After every chunk transition (hit or miss) the engine computes the window `chunk_idx+1 ..= chunk_idx+prefetch_chunks`, capped at the end of the file, and skips chunks already cached or in flight.
+2. Each missing chunk becomes a background fetch. Fetches are admitted in ascending chunk order through a semaphore of `prefetch_max_inflight` permits, so the nearest chunk is always on the wire first. The replica is chosen with the same ranking as foreground reads, and each fetch is bounded by `client.chunk_read_timeout_secs`.
+3. A foreground read that misses first waits briefly (up to 2 s) for an in-flight prefetch of the same first candidate chunk, but never for one that has not yet obtained a slot; otherwise it fetches itself. Concurrent foreground misses for one chunk are single-flighted.
+4. Fetched bytes are verified against the chunk id before they are cached, like any other read.
+5. Cached chunks are consumed by reads. The cache evicts oldest-inserted first to stay under `cache_mb` and drains entry by entry. Keep `cache_mb` at least `(prefetch_chunks + prefetch_max_inflight) * chunk_size_mb` or the window evicts itself.
 
-# View current read-ahead mode for a path
-dtfs-cli read-ahead get /mnt/dtfs/training-data
-```
+There is deliberately no "cache is full, stop prefetching" gate: in-flight bytes are bounded by the semaphore and stored bytes by the eviction budget.
 
-Per-directory settings override the global mode. They are stored as metadata in the manager and persist across client restarts.
+## Memory pressure
 
-## How Prefetching Works
+With `[memory]` configured: at Warn, `cache_mb` is halved; at Shed, unconsumed prefetch is dropped and prefetching is switched off until pressure subsides. Foreground reads are never blocked by prefetch.
 
-The read-ahead engine maintains a prefetch queue per open file. When a prefetch decision is made:
+## Choosing a mode
 
-1. The engine enqueues chunk IDs into the prefetch queue.
-2. Background workers dequeue chunks and fetch them from data nodes using the same location-aware selection as foreground reads.
-3. Fetched chunks are placed in the local disk cache (if enabled) or held in the prefetch memory buffer.
-4. When the application reads a prefetched chunk, it is served from memory or local cache with no network round trip.
-
-If the application's access pattern changes (for example, it seeks to a distant position), the prefetch queue is flushed and detection restarts. This avoids wasting bandwidth on speculative fetches that are no longer relevant.
-
-### Prefetch Buffer Pressure
-
-If the prefetch buffer reaches `max_prefetch_buffer`, new prefetch requests are dropped until buffer space is freed by application reads consuming buffered data. Foreground reads are never blocked by prefetch operations.
-
-## Use Cases
-
-| Workload | Recommended Mode | Rationale |
-|----------|-----------------|-----------|
-| Video/audio streaming | file-sequential | Single large files read start to end |
-| Log processing | file-sequential | Sequential reads within individual log files |
-| Batch image processing | folder-sequential | Directory of images processed in order |
-| ML training data loading | folder-sequential | Iterating over datasets stored as files in a directory |
-| Database storage engine | disabled or file-only | Random access patterns, prefetching wastes I/O |
-| Interactive file browsing | disabled | Unpredictable access patterns |
-| Scientific simulation checkpoints | file-only | Application knows when it will read sequentially |
+| Workload | Mode |
+|----------|------|
+| Plex playback, large sequential files | any of the three (identical today); default is fine |
+| Random access (databases, indexers) | `disabled` |
 
 ## Monitoring
 
-Read-ahead metrics are exported by the FUSE client:
-
-- `dtfs_readahead_prefetch_total` -- total chunks prefetched.
-- `dtfs_readahead_prefetch_hit_total` -- prefetched chunks that were actually read by the application.
-- `dtfs_readahead_prefetch_waste_total` -- prefetched chunks evicted before being read.
-- `dtfs_readahead_hit_ratio` -- ratio of hits to total prefetches (higher is better).
-- `dtfs_readahead_buffer_bytes` -- current prefetch buffer usage.
+There are no read-ahead metrics. Prefetch activity is visible at `RUST_LOG=dtfs_fuse=debug` ("readahead triggered").

@@ -1,141 +1,35 @@
 # Partition Behavior
 
-When a network partition splits a DTFS cluster, some nodes lose contact with the Raft leader and cannot commit metadata operations. DTFS provides configurable behavior modes that control what operations clients can perform during quorum loss, allowing operators to choose the right trade-off between availability and consistency.
+What a FUSE client can do when it cannot reach a manager quorum, and what the data plane does while the control plane is down.
 
-## Background: Quorum and Partitions
+## What happens
 
-The manager cluster uses Raft consensus, which requires a majority quorum (more than half the nodes) to commit operations. In a 3-node manager cluster, 2 nodes form a quorum. In a 5-node cluster, 3 nodes form a quorum.
+Metadata always goes through managers; chunk bytes go straight to data nodes. A partition therefore affects reads and writes very differently.
 
-When a network partition occurs:
+| Operation | Client on the minority side or leader unreachable |
+|-----------|----------------------------------------------------|
+| Read, location cached (within 5 s) | Works if a replica's data node is reachable |
+| Read, location not cached | Needs a manager answer. Managers other than the leader can answer reads from their local state, so this works as long as any manager is reachable; with none reachable it fails after the manager walk |
+| Chunk fetch | Works against any reachable data node; fails over replica by replica |
+| Create, write, rename, unlink, truncate | Fail. Allocation, write leases and commit go through the leader, so nothing can be committed without a quorum. The client retries its manager list for up to 15 s, then returns `EIO` |
+| Bytes already streamed to data nodes by an uncommitted write | Not referenced by any file; reclaimed by the orphan reaper after its grace period |
 
-- The **majority side** retains quorum and continues normal operation.
-- The **minority side** loses quorum and cannot commit metadata changes (file creation, deletion, rename, chunk placement updates).
+Reads can be briefly stale: a manager that is behind may return an older location or file size, and a client keeps a location for up to 5 s. A stale location only costs a failover, because chunk ids are content hashes and a replica that no longer exists simply errors.
 
-DTFS clients connected to the minority side are affected. The partition behavior mode determines what these clients can still do.
+## Client behavior
 
-## Modes
+- **Manager walk.** The client keeps the whole `manager_addr` + `manager_addrs` list. When no usable manager answers (election in progress, rolling restart), it re-walks the list with backoff for up to 15 seconds before giving up.
+- **Write lease.** A lapsed lease is re-acquired once under the same owner id. If the lease cannot be renewed because managers are unreachable, a flush continues best effort with the existing lease until it expires; if another writer holds the path, the write aborts.
+- **Voters.** The manager list must include at least one voter. A list of learners only supports reads.
 
-The partition behavior mode is configured on the FUSE client:
+## `[partition_safety]` is not enforced
 
-```toml
-[partition]
-mode = "strict"
-```
+`fuse.toml` accepts a `[partition_safety]` block (`mode` = `strict`, `localreadonly`, `fulllock`; `quorum_loss_timeout_secs`; `show_warning`), and `quorum_loss_timeout_secs` is validated as non-zero at startup. The client does not act on any of these values: there is no quorum-loss state, no marker file and no read blocking. The behavior is the one in the table above regardless of the setting. Do not rely on `strict` or `fulllock` to freeze a mount.
 
-### strict (default)
+## Manager side
 
-The strictest consistency mode. During quorum loss:
-
-- **Local reads**: permitted. Clients can read chunks that are cached locally or stored on data nodes reachable from the client. Metadata is served from the client's local metadata cache (subject to TTL).
-- **Cross-datacenter reads**: blocked. Reads that would require contacting a data node in another datacenter are rejected, because the client cannot verify that the chunk's placement metadata is current without quorum.
-- **All writes**: blocked. No file creation, modification, deletion, or rename is permitted. Write operations return `EIO` (I/O error) to the application.
-
-This mode guarantees that clients never read stale data from a remote datacenter that may have been updated by the majority side. It is the recommended mode for workloads that require strong consistency.
-
-```text
-Partition occurs (client on minority side):
-  read local chunk  --> OK (served from local data node / cache)
-  read remote chunk --> EIO (cross-DC read blocked)
-  write any file    --> EIO (no quorum for metadata commit)
-  mkdir / rename    --> EIO (no quorum for metadata commit)
-```
-
-### local-readonly
-
-A relaxed mode that allows reads from any reachable data node, even across datacenter boundaries:
-
-- **All reads**: permitted, from any reachable data node. Metadata is served from the local cache. Reads may return stale data if the majority side has processed writes that the minority side has not seen.
-- **All writes**: blocked.
-
-This mode trades consistency for read availability. It is appropriate for workloads that can tolerate stale reads during a partition, such as serving static assets or read-heavy analytics.
-
-```text
-Partition occurs (client on minority side):
-  read local chunk  --> OK
-  read remote chunk --> OK (may be stale)
-  write any file    --> EIO
-  mkdir / rename    --> EIO
-```
-
-**Stale read risk**: in local-readonly mode, a file that was deleted or modified on the majority side may still be readable from the minority side until the partition heals and the metadata cache refreshes. Applications must tolerate this possibility.
-
-### full-lock
-
-The most conservative mode. During quorum loss, all operations are blocked:
-
-- **All reads**: blocked, including local and cached reads.
-- **All writes**: blocked.
-
-This mode is intended for workloads where reading stale data is worse than being unavailable. Financial transaction logs, audit records, and other compliance-critical data may warrant this setting.
-
-```text
-Partition occurs (client on minority side):
-  read local chunk  --> EIO
-  read remote chunk --> EIO
-  write any file    --> EIO
-  mkdir / rename    --> EIO
-```
-
-## Configuration
-
-### FUSE Client
-
-```toml
-[partition]
-# Mode: "strict", "local-readonly", "full-lock"
-mode = "strict"
-
-# How quickly the client detects quorum loss.
-# The client considers quorum lost if it cannot reach
-# the manager leader for this duration.
-detection_timeout_secs = 10
-
-# Grace period after quorum is regained before resuming
-# full operations. Allows metadata caches to refresh.
-recovery_grace_secs = 5
-```
-
-### Per-Volume Override
-
-Different volumes can use different partition modes:
-
-```toml
-[volume.financial-records.partition]
-mode = "full-lock"
-
-[volume.static-assets.partition]
-mode = "local-readonly"
-```
-
-This allows a single cluster to serve workloads with different consistency requirements.
-
-## Quorum Loss Detection
-
-The FUSE client maintains a heartbeat connection to the manager leader. When the leader becomes unreachable, the client attempts to discover a new leader by contacting the other manager nodes. If no leader is found within `detection_timeout_secs`, the client enters the partitioned state and applies the configured behavior mode.
-
-When the partition heals and a leader becomes reachable again, the client waits `recovery_grace_secs` before resuming normal operations. During this grace period:
-
-1. The metadata cache is invalidated and refreshed from the leader.
-2. Any writes that were queued (in modes that support write queuing, which is not the default) are flushed.
-3. The client verifies that its local view of the filesystem is consistent with the leader's state.
-
-## Behavior Summary
-
-| Operation | strict | local-readonly | full-lock |
-|-----------|--------|----------------|-----------|
-| Read (local/cached data) | Allowed | Allowed | Blocked |
-| Read (remote data node) | Blocked | Allowed (may be stale) | Blocked |
-| Write (any) | Blocked | Blocked | Blocked |
-| Metadata mutation (mkdir, rename, delete) | Blocked | Blocked | Blocked |
-| Stat / readdir (cached) | Allowed | Allowed | Blocked |
+Raft behavior during partitions (leader isolation, minority loss, three-way split) is described in [Consensus](../architecture/consensus.md#network-partition-behavior). A data node that cannot reach any manager keeps serving existing chunks and keeps trying its manager list (re-registering when told it is unknown); the managers mark it Suspect and then Down after 3 and 6 missed heartbeats, which stops new placements on it and starts repair of its mandatory replicas.
 
 ## Monitoring
 
-Partition-related metrics and events:
-
-- `dtfs_partition_state{mode="normal|partitioned"}` -- current partition state (gauge, 1 = active).
-- `dtfs_partition_events_total{type="detected|recovered"}` -- total partition events.
-- `dtfs_partition_duration_seconds` -- histogram of partition duration.
-- `dtfs_partition_blocked_ops_total{op="read|write|metadata"}` -- operations blocked due to partition mode.
-
-The manager also logs partition events at `WARN` level when it detects that a client has entered the partitioned state.
+Watch `dtfs_nodes_suspect` and `dtfs_nodes_down` on the manager `/metrics` endpoint and the Raft state under `GET /api/v1/raft/state`. See [Monitoring](../operations/monitoring.md).
