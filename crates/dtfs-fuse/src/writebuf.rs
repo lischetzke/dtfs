@@ -428,6 +428,23 @@ impl WriteBuffer {
         self.buffers.remove(path);
     }
 
+    /// True iff `chunk_index` of `path` has any buffered bytes.
+    pub fn has_chunk(&self, path: &str, chunk_index: u32) -> bool {
+        self.buffers.get(path).is_some_and(|e| e.value().chunks.contains_key(&chunk_index))
+    }
+
+    /// Drop the given chunks of `path` (a failed write's own seeds).
+    pub fn remove_chunks(&self, path: &str, chunk_indices: &[u32]) {
+        let Some(mut e) = self.buffers.get_mut(path) else { return };
+        for k in chunk_indices {
+            e.value_mut().chunks.remove(k);
+        }
+        if e.value().chunks.is_empty() {
+            drop(e);
+            self.buffers.remove_if(path, |_, b| b.chunks.is_empty());
+        }
+    }
+
     /// Move the buffer of `from` (and, for a directory rename, of every
     /// path below `from/`) to the matching key under `to`, so a rename of an
     /// open file (`a.part` -> `a`) keeps its unflushed bytes. An existing
@@ -1510,11 +1527,11 @@ mod async_commit_tests {
         sticky: bool,
         clock: Duration,
         trace: Vec<String>,
-        /// Buffered bytes before the current write; a write whose cap drain
-        /// fails returns EIO with its seeds still buffered (at most the
-        /// chunks it touches), so the bound is then `max(cap, before) + 4*CS`.
-        seeds_before: usize,
+        /// A write's cap drain failed: it returned EIO after dropping its own
+        /// fresh seeds, so the bound is the cap plus one drain's overshoot.
         drain_failed: bool,
+        /// Chunks the current write seeded that held no bytes before.
+        fresh: Vec<u32>,
     }
 
     impl Sim {
@@ -1530,8 +1547,8 @@ mod async_commit_tests {
                 sticky: false,
                 clock: Duration::ZERO,
                 trace: Vec::new(),
-                seeds_before: 0,
                 drain_failed: false,
+                fresh: Vec::new(),
             }
         }
 
@@ -1589,6 +1606,9 @@ mod async_commit_tests {
             if !self.wb.chunk_needs_seed(P, idx) || base >= eof {
                 return;
             }
+            if !self.wb.has_chunk(P, idx) {
+                self.fresh.push(idx);
+            }
             let clamp = (eof - base).min(CS as u64) as usize;
             let bytes = match self.chunks.get(&idx) {
                 Some(d) => d[..d.len().min(clamp)].to_vec(),
@@ -1604,18 +1624,24 @@ mod async_commit_tests {
         fn cap_drain(&mut self, incoming: usize, keep: RangeInclusive<u32>) -> bool {
             let segs = self.wb.cap_drain(P, incoming, self.cap, self.async_on, keep);
             let ok = self.commit(segs);
+            if !ok {
+                self.wb.remove_chunks(P, &self.fresh);
+            }
             self.drain_failed |= !ok;
             ok
         }
 
         fn write(&mut self, off: u64, data: &[u8]) {
-            self.seeds_before = self.wb.dirty_bytes(P);
+            self.fresh.clear();
             let eof = self.size.max(self.wb.logical_size(P).unwrap_or(0));
             for idx in Self::span(off, data.len()) {
                 self.seed(idx, self.size);
             }
             if off > eof && eof % CS as u64 != 0 {
+                // The hole tail seed is kept on a failed drain (filesystem.rs).
+                let in_range = std::mem::take(&mut self.fresh);
                 self.seed((eof / CS as u64) as u32, self.size);
+                self.fresh = in_range;
             }
             let mut at = eof;
             while at < off {
@@ -1689,11 +1715,11 @@ mod async_commit_tests {
         }
 
         fn check(&mut self) {
-            assert_eq!(self.view(), self.model);
+            assert_eq!(self.view(), self.model, "async={} {:?}", self.async_on, self.trace);
             if self.async_on {
                 let d = self.wb.dirty_bytes(P);
                 let bound = if self.drain_failed {
-                    self.cap.max(self.seeds_before) + 4 * CS
+                    self.cap + 4 * CS
                 } else {
                     self.cap
                 };

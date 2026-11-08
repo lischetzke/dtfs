@@ -1643,6 +1643,13 @@ impl DtfsFilesystem {
         // chunk buffer that still doesn't cover the whole chunk, which the
         // next flush would then commit as the chunk's complete (truncated)
         // content — silent data loss, not just a truncated append.
+        // Chunks this write seeded that held no bytes before: on a failed cap
+        // drain they hold nothing the caller was promised, so they are
+        // dropped (else retried failing writes grow the buffer unbounded).
+        // The hole tail seed is kept: hole zeros above it must keep masking
+        // the stale bytes a shrink left in that chunk, and it is seeded once.
+        let mut fresh_seeds: Vec<u32> = Vec::new();
+        let mut tail_seed = None;
         if chunk_size > 0 && !data.is_empty() {
             let mut seed_list =
                 chunks_needing_seed(&self.write_buffer, &path, chunk_size, effective_offset, data.len());
@@ -1653,6 +1660,7 @@ impl DtfsFilesystem {
             if let Some(t) = hole_tail_chunk(eof_now, effective_offset, chunk_size) {
                 if !seed_list.contains(&t) && self.write_buffer.chunk_needs_seed(&path, t as u32) {
                     seed_list.insert(0, t);
+                    tail_seed = Some(t);
                 }
             }
             for chunk_idx in seed_list {
@@ -1674,6 +1682,9 @@ impl DtfsFilesystem {
                     .read_seed_bytes(&path, loc, chunk_idx, chunk_size, loc.total_size)
                     .await?
                 {
+                    if tail_seed != Some(chunk_idx) && !self.write_buffer.has_chunk(&path, chunk_idx as u32) {
+                        fresh_seeds.push(chunk_idx as u32);
+                    }
                     self.write_buffer.seed_chunk(&path, chunk_idx as u32, &existing);
                     debug!(
                         path = %path,
@@ -1716,6 +1727,7 @@ impl DtfsFilesystem {
                             Ok(c) => c,
                             Err(e) => {
                                 self.write_buffer.restore_segments(&path, &segs);
+                                self.write_buffer.remove_chunks(&path, &fresh_seeds);
                                 return Err(e);
                             }
                         };
@@ -1742,6 +1754,7 @@ impl DtfsFilesystem {
                     Ok(c) => c,
                     Err(e) => {
                         self.write_buffer.restore_segments(&path, &segs);
+                        self.write_buffer.remove_chunks(&path, &fresh_seeds);
                         return Err(e);
                     }
                 };
@@ -5269,6 +5282,57 @@ mod async_commit_fs_tests {
             },
         );
         fh
+    }
+
+    /// Chunkless snapshot of `size` bytes: every seed is a zero seed, no I/O
+    /// (free function: rustc 1.94 struct-literal ICE workaround).
+    fn holes(path: &str, size: u64, chunk_size: u64) -> FileLocations {
+        FileLocations {
+            path: path.to_string(),
+            total_size: size,
+            chunks: Vec::new(),
+            volume_id: "default".to_string(),
+            chunk_size,
+            created_at_ms: 0,
+            modified_at_ms: 0,
+            is_directory: false,
+            is_symlink: false,
+        }
+    }
+
+    /// A write whose cap drain fails returns EIO and must not leave the seeds
+    /// it just added: retried writes would otherwise grow the buffer past
+    /// `DIRTY_BYTES_CAP` without bound while uploads fail. Final drain: the
+    /// in-range seed is dropped. Hole-fill drain: the tail seed (100 bytes)
+    /// stays, once, so the buffer does not grow across retries.
+    #[tokio::test]
+    async fn failed_cap_drain_drops_the_writes_own_seeds() {
+        let cap = crate::writebuf::DIRTY_BYTES_CAP;
+        for async_on in [false, true] {
+            let fs = fs(async_on);
+            let cs = fs.write_buffer.chunk_size() as u64;
+            let full = (cap as u64 / cs) as u32;
+            for (eof, offset) in [(64 * cs, 40 * cs + 10), (full as u64 * cs + 100, (full as u64 + 2) * cs)] {
+                let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+                fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/f", eof, cs)));
+                for i in 0..full {
+                    fs.write_buffer.write("/f", i as u64 * cs, &vec![1; cs as usize]);
+                }
+                assert_eq!(fs.write_buffer.dirty_bytes("/f"), cap);
+                let tail = (eof % cs) as usize * usize::from(offset > eof);
+                for k in 0..3u64 {
+                    let err = fs.write(fh, offset + k * cs, &[2; 10]).await.unwrap_err();
+                    assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
+                    assert_eq!(
+                        fs.write_buffer.dirty_bytes("/f"),
+                        cap + tail,
+                        "async={async_on} eof={eof} try {k}: seeds left behind"
+                    );
+                }
+                fs.write_buffer.remove("/f");
+                fs.open_files.remove(&fh);
+            }
+        }
     }
 
     #[tokio::test]

@@ -110,7 +110,10 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   bytes per open file are capped at `DIRTY_BYTES_CAP` (2x) and
   force-drained via `WriteBuffer::cap_drain` (complete chunks, never the
   chunks of the pending write: `keep`, they were just seeded) before a hole
-  fill or write would exceed it.
+  fill or write would exceed it. A failed cap drain restores the drained
+  segments and drops the write's own fresh in-range seeds
+  (`remove_chunks`, chunks that held no bytes before); the hole tail seed
+  stays (it masks a shrink's stale bytes under the hole zeros).
 - `write.async_commit` (default off = all of the above unchanged): FUSE
   fsync (`DtfsFilesystem::fsync`) commits nothing and only reports a pending
   background error (`OpenFile.write_error`, once per fh, EIO; a successful
