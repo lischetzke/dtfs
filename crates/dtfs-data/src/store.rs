@@ -118,7 +118,7 @@ pub struct ChunkStore {
     /// waiting to be reported to the manager on the next heartbeat so
     /// the Raft state machine can drop the matching replica entries
     /// and trigger re-replication from a healthy peer.
-    pending_corruption: Arc<parking_lot::Mutex<Vec<String>>>,
+    pending_corruption: Arc<parking_lot::Mutex<Vec<(String, Option<u32>)>>>,
     /// Bug BY — completed scrub-result summaries waiting to be shipped to
     /// the manager on the next heartbeat (one per disk per quick/deep
     /// cycle). The manager issues a `ReportScrubResult` Raft write per
@@ -195,7 +195,10 @@ impl ChunkStore {
     /// Bug O — append chunk_ids that have been quarantined locally
     /// (failed checksum or missing meta) so the next heartbeat can
     /// report them to the manager. Called by the scrub scheduler.
-    pub fn enqueue_pending_corruption(&self, chunk_ids: impl IntoIterator<Item = String>) {
+    pub fn enqueue_pending_corruption(
+        &self,
+        chunk_ids: impl IntoIterator<Item = (String, Option<u32>)>,
+    ) {
         let mut q = self.pending_corruption.lock();
         for id in chunk_ids {
             q.push(id);
@@ -205,7 +208,7 @@ impl ChunkStore {
     /// Bug O — drain the pending-corruption queue. Called by the
     /// heartbeat loop so each report is sent to the manager exactly
     /// once.
-    pub fn drain_pending_corruption(&self) -> Vec<String> {
+    pub fn drain_pending_corruption(&self) -> Vec<(String, Option<u32>)> {
         let mut q = self.pending_corruption.lock();
         std::mem::take(&mut *q)
     }
@@ -765,7 +768,8 @@ impl ChunkStore {
     /// a good new copy. Returns the number enqueued.
     pub fn requeue_quarantined_for_report(&self) -> usize {
         let mut ids = std::collections::BTreeSet::new();
-        for disk in self.disk_paths() {
+        for d in self.disk_manager.all_disks() {
+            let disk = &d.mount_path;
             let Ok(rd) = std::fs::read_dir(disk.join(".dtfs").join("quarantine")) else {
                 continue;
             };
@@ -776,13 +780,22 @@ impl ChunkStore {
                 };
                 let Ok(id) = ChunkId::from_hex(stem) else { continue };
                 if self.chunk_file_path(&id).is_none() {
-                    ids.insert(stem.to_string());
+                    ids.insert((stem.to_string(), Some(d.disk_id)));
                 }
             }
         }
         let n = ids.len();
         self.enqueue_pending_corruption(ids);
         n
+    }
+
+    /// Disk id of the managed disk mounted at `path`, if any.
+    pub fn disk_id_for_path(&self, path: &std::path::Path) -> Option<u32> {
+        self.disk_manager
+            .all_disks()
+            .iter()
+            .find(|d| d.mount_path == path)
+            .map(|d| d.disk_id)
     }
 
     /// Return all disk mount paths for enumeration (used by scrub scheduler).
@@ -2144,7 +2157,10 @@ mod tests {
         store.put_chunk(&back_id, back, &vol, DiskTier::Hot).await.unwrap();
 
         assert_eq!(store.requeue_quarantined_for_report(), 1);
-        assert_eq!(store.drain_pending_corruption(), vec![gone.as_hex()]);
+        assert_eq!(
+            store.drain_pending_corruption(),
+            vec![(gone.as_hex(), store.disk_id_for_path(&disk))]
+        );
     }
 
     #[tokio::test]

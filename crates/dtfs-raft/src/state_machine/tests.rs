@@ -899,6 +899,74 @@ mod posix_path_regression {
         assert_eq!(a.chunks[0].chunk_hash, "corrupt-hash");
     }
 
+    fn corrupt_disk_fixture() -> StateMachineData {
+        let mut sm = StateMachineData::default();
+        let mk = |node: &str, disk: u32| ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: "h".into(),
+            node_id: node.into(),
+            disk_id: disk,
+            size_bytes: 1024,
+        };
+        sm.files.insert(
+            "/d.bin".into(),
+            FileMetadata {
+                path: "/d.bin".into(),
+                volume_id: "default".into(),
+                chunk_size: 1024,
+                chunks: vec![mk("10", 0), mk("10", 2), mk("11", 2)],
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                symlink_target: None,
+                logical_size: None,
+                is_directory: false,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            },
+        );
+        sm
+    }
+
+    /// A corrupt copy on (node 10, disk 2) must not drop the good copy on
+    /// (node 10, disk 0) nor node 11's copy on disk 2.
+    #[test]
+    fn remove_corrupt_with_disk_id_drops_only_that_disk() {
+        let mut sm = corrupt_disk_fixture();
+        apply_request(
+            &mut sm,
+            &mk_log_id(100),
+            &ClientRequest::RemoveCorruptChunkReplicas {
+                now_ms: 0,
+                node_id: "10".into(),
+                chunk_hashes: vec!["h".into()],
+                disk_id: 2,
+            },
+        );
+        let got: Vec<(String, u32)> = sm.files["/d.bin"]
+            .chunks
+            .iter()
+            .map(|c| (c.node_id.clone(), c.disk_id))
+            .collect();
+        assert_eq!(got, vec![("10".to_string(), 0), ("11".to_string(), 2)]);
+    }
+
+    /// Legacy sentinel keeps the node-wide sweep (both of node 10's copies).
+    #[test]
+    fn remove_corrupt_without_disk_id_sweeps_whole_node() {
+        let mut sm = corrupt_disk_fixture();
+        apply_request(
+            &mut sm,
+            &mk_log_id(100),
+            &ClientRequest::RemoveCorruptChunkReplicas {
+                now_ms: 0,
+                node_id: "10".into(),
+                chunk_hashes: vec!["h".into()],
+                disk_id: legacy_disk_id(),
+            },
+        );
+        let got: Vec<&str> = sm.files["/d.bin"].chunks.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(got, vec!["11"]);
+    }
+
     /// Bug P — `UpdateChunkLocations` MUST reject a commit whose
     /// `lease_id` doesn't match the currently-held lease for the
     /// path. Pre-fix a stale writer (whose lease the manager had

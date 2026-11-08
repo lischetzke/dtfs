@@ -38,7 +38,7 @@ const CHUNK_STATUS_REPORT_BATCH_SIZE: usize = 1000;
 
 /// Split `ids` into chunks of at most `n` each, preserving order. `n == 0`
 /// degenerates to one batch (never divides by zero / infinite-loops).
-fn batches(ids: Vec<String>, n: usize) -> Vec<Vec<String>> {
+fn batches<T: Clone>(ids: Vec<T>, n: usize) -> Vec<Vec<T>> {
     if n == 0 {
         return vec![ids];
     }
@@ -697,10 +697,11 @@ async fn manager_lifecycle(
                     node_id: node_id.clone(),
                     chunks: batch
                         .iter()
-                        .map(|id| dtfs_proto::dtfs::manager::ChunkStatus {
+                        .map(|(id, disk_id)| dtfs_proto::dtfs::manager::ChunkStatus {
                             chunk_id: id.clone(),
                             status: "corrupt".into(),
                             size: 0,
+                            disk_id: *disk_id,
                         })
                         .collect(),
                 };
@@ -1039,7 +1040,7 @@ mod data_8_batches_tests {
 
     #[test]
     fn empty_input_yields_no_batches() {
-        assert!(batches(Vec::new(), 1000).is_empty());
+        assert!(batches(Vec::<String>::new(), 1000).is_empty());
     }
 
     #[test]

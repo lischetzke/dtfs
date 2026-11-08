@@ -648,6 +648,8 @@ message ChunkStatus {
   string chunk_id = 1;
   uint64 size = 2;
   string status = 3; // "healthy", "corrupt", "missing"
+  // Disk the replica lives on. Absent (older data node) = node-wide removal.
+  optional uint32 disk_id = 4;
 }
 
 message ChunkStatusReport {

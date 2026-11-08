@@ -245,8 +245,10 @@ impl ScrubScheduler {
                                 );
                             }
                         }
-                        self.store
-                            .enqueue_pending_corruption(result.corrupt_chunk_ids.iter().cloned());
+                        let disk_id = self.store.disk_id_for_path(disk_path);
+                        self.store.enqueue_pending_corruption(
+                            result.corrupt_chunk_ids.iter().map(|c| (c.clone(), disk_id)),
+                        );
                     }
                 }
                 Err(e) => {

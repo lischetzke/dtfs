@@ -280,6 +280,23 @@ impl MetadataService {
     }
 }
 
+/// Partition corrupt/missing entries of a `ChunkStatusReport` by disk. Reports
+/// without a disk id (older data nodes) land under `legacy_disk_id()`, which
+/// the apply arm treats as a node-wide sweep.
+fn group_corrupt_by_disk(
+    chunks: &[dtfs_proto::dtfs::manager::ChunkStatus],
+) -> std::collections::BTreeMap<u32, Vec<String>> {
+    let mut out: std::collections::BTreeMap<u32, Vec<String>> = Default::default();
+    for ch in chunks {
+        if ch.status.eq_ignore_ascii_case("corrupt") || ch.status.eq_ignore_ascii_case("missing") {
+            out.entry(ch.disk_id.unwrap_or_else(dtfs_raft::legacy_disk_id))
+                .or_default()
+                .push(ch.chunk_id.clone());
+        }
+    }
+    out
+}
+
 /// Bug BL-3 — a data node may be told it is clear (so it re-enables
 /// `put_chunk`) only when it is not currently quarantined in Raft state
 /// AND it did not report any integrity fault in this heartbeat. The
@@ -1770,14 +1787,8 @@ impl ManagerService for MetadataService {
         // Bug O — partition the reported chunks into corrupt/missing
         // (which need replica entries dropped + re-replication queued)
         // vs healthy (which keep their entries).
-        let mut corrupt_ids: Vec<String> = Vec::new();
-        for ch in &req.chunks {
-            if ch.status.eq_ignore_ascii_case("corrupt")
-                || ch.status.eq_ignore_ascii_case("missing")
-            {
-                corrupt_ids.push(ch.chunk_id.clone());
-            }
-        }
+        let corrupt_by_disk = group_corrupt_by_disk(&req.chunks);
+        let corrupt_ids: Vec<&String> = corrupt_by_disk.values().flatten().collect();
 
         let status = if !corrupt_ids.is_empty() {
             "degraded"
@@ -1815,19 +1826,20 @@ impl ManagerService for MetadataService {
                 count = corrupt_ids.len(),
                 "Bug O dropping corrupt-replica entries + queueing re-replication"
             );
-            if let Err(e) = self
-                .raft_write_or_forward(ClientRequest::RemoveCorruptChunkReplicas { now_ms: stamp_now_ms(),
-                    node_id: req.node_id.clone(),
-                    chunk_hashes: corrupt_ids,
-                    // CO-1-1 — the scrub ChunkStatusReport carries no
-                    // disk_id, so keep the node-wide legacy sweep (Bug O
-                    // behaviour). Per-disk would need a proto change.
-                    disk_id: dtfs_raft::legacy_disk_id(),
-                })
-                .await
-            {
-                tracing::warn!(error = %e, "CO-3-7 failed to commit corrupt-replica removal");
-                accepted = false;
+            // One write per disk: a report with a disk id drops only that
+            // (node, disk) copy; legacy reports (no disk id) stay node-wide.
+            for (disk_id, chunk_hashes) in corrupt_by_disk {
+                if let Err(e) = self
+                    .raft_write_or_forward(ClientRequest::RemoveCorruptChunkReplicas { now_ms: stamp_now_ms(),
+                        node_id: req.node_id.clone(),
+                        chunk_hashes,
+                        disk_id,
+                    })
+                    .await
+                {
+                    tracing::warn!(error = %e, disk_id, "CO-3-7 failed to commit corrupt-replica removal");
+                    accepted = false;
+                }
             }
         }
 

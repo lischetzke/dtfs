@@ -6,6 +6,32 @@
 use super::*;
 
 #[cfg(test)]
+mod chunk_status_disk_grouping_tests {
+    use super::group_corrupt_by_disk;
+    use dtfs_proto::dtfs::manager::ChunkStatus;
+
+    fn cs(id: &str, status: &str, disk_id: Option<u32>) -> ChunkStatus {
+        ChunkStatus { chunk_id: id.into(), size: 0, status: status.into(), disk_id }
+    }
+
+    #[test]
+    fn groups_by_disk_and_legacy_for_absent() {
+        let g = group_corrupt_by_disk(&[
+            cs("a", "corrupt", Some(2)),
+            cs("b", "MISSING", Some(2)),
+            cs("c", "corrupt", Some(0)),
+            cs("d", "corrupt", None),
+            cs("e", "healthy", Some(2)),
+        ]);
+        assert_eq!(g[&2], vec!["a", "b"]);
+        assert_eq!(g[&0], vec!["c"]);
+        assert_eq!(g[&dtfs_raft::legacy_disk_id()], vec!["d"]);
+        assert_eq!(g.len(), 3);
+        assert!(group_corrupt_by_disk(&[cs("e", "healthy", None)]).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod mgr_11_forward_allow_list_tests {
     use super::forwardable;
     use dtfs_raft::ClientRequest;

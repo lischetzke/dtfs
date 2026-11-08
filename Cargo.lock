@@ -843,6 +843,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
+ "blake3",
  "bytes",
  "dtfs-common",
  "dtfs-proto",
