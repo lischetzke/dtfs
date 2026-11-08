@@ -38,7 +38,7 @@ Non-goals: multi-tenancy, POSIX completeness (xattrs/mmap/open-unlink best-effor
 
 Crates: **dtfs-manager** (Raft peer, REST/gRPC, owns metadata), **dtfs-data** (per-tier chunk store, streaming put/get, SMART), **dtfs-fuse** (`/mnt/dtfs`, read-ahead cache), **dtfs-client** (shared by fuse + cli), **dtfs-raft** (openraft SM; log = truth), **dtfs-common** (BLAKE3, hash ring, config, version), **dtfs-proto**.
 
-**Write:** write_lease → allocate_chunks (file's volume) → PutChunk to tmp → commit_chunk_from_tmp → commit_chunk_locations via Raft; rejected below `write_safety.min_replicas_before_ack` distinct `(node_id, disk_id)` replicas.
+**Write:** write_lease → allocate_chunks (file's volume) → PutChunk to tmp → commit_chunk_from_tmp → commit_chunk_locations via Raft; rejected below `write_safety.min_replicas_before_ack` distinct `(node_id, disk_id)` replicas on maintained tiers (filled across).
 
 **Read:** metadata (ENTRY_TTL cache) → `select_read_replica` (priority > distance > tier) → GetChunk, verify → local cache → readahead; misses single-flighted. Detail: `docs/src/architecture/data-flow.md`.
 
@@ -94,7 +94,7 @@ Load-bearing ownership only; history per row in `docs/src/internals/invariants.m
 | `dtfs-manager/src/scheduler.rs` + `scheduler/*.rs` | SOLE owner of replica repair; leader-gated, bounded, Raft-remove-before-byte-delete; disk-keyed orphan reap; leader re-checked before every delete batch |
 | `dtfs-manager/src/tiering.rs` | Cache-tick planner; never holds SM read lock across await |
 | `dtfs-manager/src/monitor.rs` | Heartbeat health detection only; MUST NOT schedule repair |
-| `dtfs-manager/src/metadata.rs` | ManagerService gRPC over `raft_write`; follower writes forward via `forwardable()` allow-list; ack floor filled across RF>0 tiers |
+| `dtfs-manager/src/metadata.rs` | ManagerService gRPC over `raft_write`; follower writes forward via `forwardable()` allow-list |
 | `dtfs-manager/src/api.rs` + `api/*.rs` | REST router; handlers per resource; decommission refuses while replicas remain |
 | `dtfs-data/src/server.rs::put_chunk` | Streaming put; HMAC gates all data-plane RPCs |
 | `dtfs-data/src/store.rs::commit_chunk_from_tmp` | Atomic commit (§ A.6) |

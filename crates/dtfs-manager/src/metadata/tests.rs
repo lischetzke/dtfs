@@ -1422,6 +1422,26 @@ mod tests {
         assert_eq!(placed_tier_of(&sm, &[]), None);
     }
 
+    /// F1: spill rules govern extra placement, not the anchor copy. A volume
+    /// forbidding its own anchor DC for spill must still count the anchor
+    /// node as capacity, else one warm node down clamps the floor to 1 and
+    /// a warm-only commit (no anchor copy) could be acked.
+    #[test]
+    fn forbidden_anchor_dc_still_counts_anchor_node_as_capacity() {
+        let mut sm = live_topology();
+        sm.volumes.get_mut("default").unwrap().spill.forbidden_datacenters = vec!["LELI".into()];
+        sm.nodes.get_mut(&3).unwrap().health = HealthStatus::Down;
+        let floor = clamp_ack_floor_to_capacity(2, &sm, "default", Some(DiskTier::Cold), "/a", None);
+        assert_eq!(floor, 2, "anchor (data01) + remaining warm (data02) = 2");
+        // A forbidden NON-anchor DC is still excluded from capacity.
+        sm.volumes.get_mut("default").unwrap().spill.forbidden_datacenters = vec!["toro".into()];
+        assert_eq!(
+            clamp_ack_floor_to_capacity(2, &sm, "default", Some(DiskTier::Cold), "/a", None),
+            1,
+            "data02 (toro) forbidden, data03 down: only the anchor remains"
+        );
+    }
+
     /// MGR-4: the warn-once latch re-arms after the volume stops clamping.
     #[test]
     fn clamp_warning_latch_rearms_after_recovery() {

@@ -64,6 +64,10 @@ text there.
   them, counting only LIVE replicas (`live_replica_tier`).
 - `cache_replicas.<tier>.{min,max}`: only the tiering engine creates them;
   the under-replication scheduler never backfills them.
+- Write ack floor counts only distinct (node_id, disk_id) replicas on RF>0
+  tiers; allocation fills it across maintained tiers; the only lowering is
+  the capacity clamp (healthy maintained nodes, same eligibility rule as the
+  fill, never 0, warn + audit `write_safety.floor_clamped`).
 - A survivor that authorises dropping another replica must be live;
   `apply_remove_chunk_location` refuses to remove the last live replica.
 - Every promote/demote/flush checks the anchor against the destination

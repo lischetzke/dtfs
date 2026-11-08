@@ -1105,7 +1105,8 @@ fn clamp_ack_floor_to_capacity(
     // on other RF>0 tiers), so it is clamped only to what the cluster can
     // physically hold: distinct healthy data nodes with a usable disk on a
     // maintained tier (one node holds one replica per chunk on the wire).
-    let rf = maintained_node_capacity(sm, &mandatory, &volume.spill, placed_tier);
+    let spill = spill_for_fill(&volume.spill, volume.anchor_datacenter.as_deref());
+    let rf = maintained_node_capacity(sm, &mandatory, &spill, placed_tier);
     let latch =
         WARNED_FLOOR_CLAMPED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     if rf >= floor {
@@ -1144,6 +1145,20 @@ fn clamp_ack_floor_to_capacity(
         );
     }
     rf
+}
+
+/// Spill rules govern EXTRA placement, never the anchor copy: drop the
+/// anchor DC (case-insensitive) from `forbidden_datacenters` before the
+/// fill/capacity rule applies the policy.
+pub(crate) fn spill_for_fill(
+    spill: &dtfs_common::types::SpillPolicy,
+    anchor_dc: Option<&str>,
+) -> dtfs_common::types::SpillPolicy {
+    let mut s = spill.clone();
+    if let Some(a) = anchor_dc {
+        s.forbidden_datacenters.retain(|d| !d.eq_ignore_ascii_case(a));
+    }
+    s
 }
 
 /// The one per-node eligibility rule shared by the allocation fill and the
@@ -1201,7 +1216,10 @@ pub(crate) fn maintained_node_capacity(
 }
 
 /// Placement tier of a commit batch: the tier of the disk the first
-/// resolvable replica landed on (the primary target is committed first).
+/// resolvable replica landed on. The FUSE writer commits successes in target
+/// order (primary first; `join_all` preserves it). If the primary failed, the
+/// first success is a fill replica and its tier may differ from the placement
+/// tier, making the capacity estimate approximate for that write.
 pub(crate) fn placed_tier_of(sm: &StateMachineData, chunks: &[ChunkLocationEntry]) -> Option<DiskTier> {
     chunks.iter().find_map(|c| {
         let id: u64 = c.node_id.parse().ok()?;
@@ -2485,7 +2503,7 @@ impl ManagerService for MetadataService {
         let (mandatory, spill_cfg, default_floor) = match &volume_cfg {
             Some(v) => (
                 v.effective_mandatory_replicas().clone(),
-                v.spill.clone(),
+                spill_for_fill(&v.spill, v.anchor_datacenter.as_deref()),
                 self.config.defaults.write_safety.min_replicas_before_ack,
             ),
             None => (
