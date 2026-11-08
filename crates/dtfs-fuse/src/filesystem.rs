@@ -667,6 +667,9 @@ struct OpenFile {
     /// The snapshot read() last re-fetched to check a gap below EOF: its
     /// missing entries are confirmed holes (until the snapshot changes).
     holes_confirmed: Option<Weak<FileLocations>>,
+    /// `write.async_commit`: a failed background commit of this path,
+    /// reported once by the next fsync/flush/release on this fh (EIO).
+    write_error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +678,9 @@ struct OpenFile {
 
 /// Default metadata cache TTL: 5 seconds.
 const DEFAULT_METADATA_TTL: Duration = Duration::from_secs(5);
+
+/// `write.async_commit`: max paths the age timer commits per tick.
+const AGED_COMMITS_PER_TICK: usize = 8;
 
 // ---------------------------------------------------------------------------
 // DtfsFilesystem
@@ -735,6 +741,10 @@ pub struct DtfsFilesystem {
     known_locations: DashMap<String, Location>,
     /// In-flight commits per path; gates the post-commit incremental merge.
     commit_tracker: CommitTracker,
+    /// `write.async_commit` only: serialises the background age commit with
+    /// write(), a writer's truncate and release on the same path
+    /// (`path_guard`); unused (empty) when async_commit is off.
+    path_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// P0-1: prefix used for write-lease `owner_id` values. Format:
     /// `<hostname>:<pid>:`. The per-open `:<fh>` suffix is appended at
     /// open-time to make each owner_id unique within the process.
@@ -815,6 +825,7 @@ impl DtfsFilesystem {
             foreground_inflight: DashMap::new(),
             known_locations: DashMap::new(),
             commit_tracker: CommitTracker::default(),
+            path_locks: DashMap::new(),
             lease_owner_prefix,
             local_cache: None,
         }
@@ -1073,6 +1084,7 @@ impl DtfsFilesystem {
                 last_read_chunk: None,
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
+                write_error: None,
             },
         );
 
@@ -1551,6 +1563,19 @@ impl DtfsFilesystem {
     /// to data nodes automatically. Returns the number of bytes written.
     #[instrument(skip(self, data), fields(fh, offset, len = data.len()))]
     pub async fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32> {
+        let path = self.open_files.get(&fh).map(|f| f.path.clone());
+        let guard = match &path {
+            Some(p) => self.path_guard(p).await,
+            None => None,
+        };
+        let res = self.write_inner(fh, offset, data).await;
+        if let Some(p) = path {
+            self.drop_path_guard(&p, guard);
+        }
+        res
+    }
+
+    async fn write_inner(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32> {
         let file = self
             .open_files
             .get(&fh)
@@ -1685,7 +1710,7 @@ impl DtfsFilesystem {
                 // of accumulating further.
                 if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), n) {
                     self.renew_if_due(fh, &path).await?;
-                    let segs = self.write_buffer.flush_complete(&path);
+                    let segs = self.cap_drain(&path, at, n);
                     if !segs.is_empty() {
                         let committed = match self.flush_segments_to_cluster(&path, &segs).await {
                             Ok(c) => c,
@@ -1711,7 +1736,7 @@ impl DtfsFilesystem {
         // to push it further over.
         if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), data.len()) {
             self.renew_if_due(fh, &path).await?;
-            let segs = self.write_buffer.flush_complete(&path);
+            let segs = self.cap_drain(&path, effective_offset, data.len());
             if !segs.is_empty() {
                 let committed = match self.flush_segments_to_cluster(&path, &segs).await {
                     Ok(c) => c,
@@ -1792,6 +1817,60 @@ impl DtfsFilesystem {
         Ok(())
     }
 
+    /// FUSE flush/fsync. Default: commit everything (`commit_all`). With
+    /// `write.async_commit`: commit nothing extra (partial chunks wait for the
+    /// age timer, the dirty cap or release) and report a pending background
+    /// commit error once.
+    pub async fn flush(&self, fh: u64) -> Result<()> {
+        if !self.config.write.async_commit {
+            return self.commit_all(fh).await;
+        }
+        let err = self
+            .open_files
+            .get_mut(&fh)
+            .context("invalid file handle")?
+            .write_error
+            .take();
+        match err {
+            Some(msg) => Err(anyhow::anyhow!(msg)),
+            None => Ok(()),
+        }
+    }
+
+    /// `DIRTY_BYTES_CAP` drain before buffering `len` bytes at `at`: complete
+    /// chunks; with async_commit also partial chunks outside `at..at+len`
+    /// (those were just seeded for this write and must stay seeded).
+    fn cap_drain(&self, path: &str, at: u64, len: usize) -> Vec<crate::writebuf::ChunkSegment> {
+        let cs = self.write_buffer.chunk_size().max(1) as u64;
+        let keep = (at / cs) as u32..=((at + len.max(1) as u64 - 1) / cs) as u32;
+        self.write_buffer.cap_drain(
+            path,
+            len,
+            crate::writebuf::DIRTY_BYTES_CAP,
+            self.config.write.async_commit,
+            keep,
+        )
+    }
+
+    /// `write.async_commit` serialisation of the timer commit with write(),
+    /// a writer's truncate and release on `path`; `None` when off.
+    async fn path_guard(&self, path: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if !self.config.write.async_commit {
+            return None;
+        }
+        let lock = self.path_locks.entry(path.to_string()).or_default().clone();
+        Some(lock.lock_owned().await)
+    }
+
+    /// Unlock and forget `path`'s lock once nobody holds or awaits it, so
+    /// `path_locks` only holds paths in use.
+    fn drop_path_guard(&self, path: &str, guard: Option<tokio::sync::OwnedMutexGuard<()>>) {
+        if guard.is_some() {
+            drop(guard);
+            self.path_locks.remove_if(path, |_, m| Arc::strong_count(m) == 1);
+        }
+    }
+
     /// Flush all buffered writes for an open file to the cluster.
     ///
     /// On failure (e.g. a chunk write fails because a target node is down),
@@ -1802,7 +1881,7 @@ impl DtfsFilesystem {
     /// metadata entry creates the appearance of silent data loss. (Fix for
     /// F-013.)
     #[instrument(skip(self), fields(fh))]
-    pub async fn flush(&self, fh: u64) -> Result<()> {
+    async fn commit_all(&self, fh: u64) -> Result<()> {
         let file = self
             .open_files
             .get(&fh)
@@ -1908,6 +1987,50 @@ impl DtfsFilesystem {
         Ok(())
     }
 
+    /// `write.async_commit` timer tick: commit (flush_all, through
+    /// `commit_all`) up to `AGED_COMMITS_PER_TICK` paths whose oldest buffered
+    /// byte is `async_commit_secs` old at `now`. Skips detached paths and
+    /// paths without a writable handle. A failure keeps the bytes (restored,
+    /// age kept, retried next tick) and arms each writer's sticky error.
+    pub async fn commit_aged(&self, now: Instant) {
+        let max_age = Duration::from_secs(self.config.write.async_commit_secs);
+        for path in self.write_buffer.aged_paths(now, max_age, AGED_COMMITS_PER_TICK) {
+            if is_detached_path(&path) {
+                continue;
+            }
+            let Some(fh) = self.writable_fh(&path) else { continue };
+            let guard = self.path_guard(&path).await;
+            // Re-check under the lock: release or rename may have won.
+            let still_open = self.open_files.get(&fh).map(|f| f.path == path) == Some(true);
+            let result = if still_open { self.commit_all(fh).await } else { Ok(()) };
+            if let Err(e) = result {
+                let (idx, bytes) = self.write_buffer.pending_summary(&path);
+                error!(
+                    path = %path,
+                    chunk_indices = ?idx,
+                    bytes,
+                    error = %format!("{e:#}"),
+                    "async commit failed; bytes kept for retry, next fsync/close returns EIO"
+                );
+                let msg = format!("async commit of {path} failed: {e:#}");
+                for mut f in self.open_files.iter_mut() {
+                    if f.path == path && f.flags.is_writable() {
+                        f.write_error = Some(msg.clone());
+                    }
+                }
+            }
+            self.drop_path_guard(&path, guard);
+        }
+    }
+
+    /// Any writable, open handle of `path` (lease info for a commit).
+    fn writable_fh(&self, path: &str) -> Option<u64> {
+        self.open_files
+            .iter()
+            .find(|e| e.value().path == path && e.value().flags.is_writable())
+            .map(|e| *e.key())
+    }
+
     /// Release (close) an open file handle.
     ///
     /// Flushes any remaining buffered writes, then removes the handle.
@@ -1918,8 +2041,20 @@ impl DtfsFilesystem {
         // down the handle, its write lease, and its write buffer; otherwise the
         // fh leaks and the stale buffer overlays (incorrectly) future reads of
         // the same path. Capture the error and surface it AFTER cleanup.
+        let guard_path = self.open_files.get(&fh).map(|f| f.path.clone());
+        let guard = match &guard_path {
+            Some(p) => self.path_guard(p).await,
+            None => None,
+        };
         let flush_result = if self.open_files.contains_key(&fh) {
-            self.flush(fh).await
+            // Release always commits everything; a pending async_commit
+            // error (never set when off) is reported if the commit succeeds.
+            self.commit_all(fh).await.and_then(|()| {
+                match self.open_files.get_mut(&fh).and_then(|mut f| f.write_error.take()) {
+                    Some(msg) => Err(anyhow::anyhow!(msg)),
+                    None => Ok(()),
+                }
+            })
         } else {
             Ok(())
         };
@@ -1998,6 +2133,9 @@ impl DtfsFilesystem {
             }
 
             debug!(path = %file.path, fh, "file released");
+        }
+        if let Some(p) = guard_path {
+            self.drop_path_guard(&p, guard);
         }
 
         flush_result
@@ -2106,6 +2244,7 @@ impl DtfsFilesystem {
                 last_read_chunk: None,
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
+                write_error: None,
             },
         );
         // Checked after the insert: a later commit sees this handle in its
@@ -2253,7 +2392,9 @@ impl DtfsFilesystem {
                 );
             }
         }
+        let guard = self.path_guard(path).await;
         let res = self.truncate_inner(path, new_size, writer || temp_fh.is_some()).await;
+        self.drop_path_guard(path, guard);
         if let Some(fh) = temp_fh {
             let rel = self.release(fh).await;
             res?;
@@ -3992,6 +4133,7 @@ mod r2_segments_committable_tests {
             data: bytes::Bytes::from_static(b"x"),
             offset_in_chunk,
             needs_seed,
+            since: None,
         }
     }
 
@@ -4624,6 +4766,7 @@ mod audit_write_path_tests {
             data: Bytes::from_static(b"x"),
             offset_in_chunk: 0,
             needs_seed,
+            since: None,
         }
     }
 
@@ -5007,5 +5150,109 @@ mod commit_tracker_tests {
         assert!(!merge_allowed(true, Some("/f\0detached-3"), "/f"));
         assert!(!merge_allowed(true, None, "/f"));
         assert!(!merge_allowed(false, Some("/f"), "/f"));
+    }
+}
+
+/// `write.async_commit` on a filesystem whose client has no manager: every
+/// upload attempt fails fast ("no managers configured"), so an `Err` proves
+/// an upload was attempted and `Ok` with the bytes still buffered proves none was.
+#[cfg(test)]
+mod async_commit_fs_tests {
+    use super::*;
+
+    const AGE: Duration = Duration::from_secs(30);
+
+    fn fs(async_on: bool) -> DtfsFilesystem {
+        let mut cfg: FuseConfig =
+            toml::from_str(include_str!("../../../deploy/examples/fuse.toml")).unwrap();
+        cfg.write.async_commit = async_on;
+        DtfsFilesystem::new(DtfsClient::new(), cfg.location.clone(), cfg)
+    }
+
+    fn open(fs: &DtfsFilesystem, path: &str, flags: OpenFlags) -> u64 {
+        let fh = fs.next_fh.fetch_add(1, Ordering::Relaxed);
+        fs.open_files.insert(
+            fh,
+            OpenFile {
+                path: path.to_string(),
+                flags,
+                append: false,
+                locations: None,
+                chunk_size: fs.write_buffer.chunk_size() as u64,
+                lease_id: None,
+                lease_deadline: None,
+                lease_owner_id: None,
+                committed_any: true,
+                last_read_chunk: None,
+                bytes_read_on_fh: 0,
+                holes_confirmed: None,
+                write_error: None,
+            },
+        );
+        fh
+    }
+
+    #[tokio::test]
+    async fn async_fsync_on_partial_tail_uploads_nothing() {
+        let fs = fs(true);
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/f", 0, &[7; 100]);
+        fs.flush(fh).await.expect("async fsync must not upload the partial tail");
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100);
+    }
+
+    #[tokio::test]
+    async fn sync_fsync_still_uploads_partial_tail() {
+        let fs = fs(false);
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/f", 0, &[7; 100]);
+        let err = fs.flush(fh).await.unwrap_err();
+        assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100, "restored after the failed upload");
+    }
+
+    #[tokio::test]
+    async fn timer_commits_after_the_age_and_failure_is_reported_once() {
+        let fs = fs(true);
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/f", 0, &[7; 100]);
+        fs.commit_aged(Instant::now() + AGE - Duration::from_secs(1)).await;
+        fs.flush(fh).await.expect("younger than the age: no commit attempted");
+        fs.commit_aged(Instant::now() + AGE).await;
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100, "failed commit keeps the bytes");
+        let err = fs.flush(fh).await.unwrap_err();
+        assert!(format!("{err:#}").contains("async commit of /f failed"), "{err:#}");
+        fs.flush(fh).await.expect("the sticky error is reported once");
+        // Retried on the next tick (age kept), reported again once.
+        fs.commit_aged(Instant::now() + AGE).await;
+        assert!(fs.flush(fh).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn timer_never_commits_detached_or_reader_only_paths() {
+        let fs = fs(true);
+        let det = detached_handle_path("/d", "/d", 1).unwrap();
+        let dfh = open(&fs, &det, OpenFlags::ReadWrite);
+        fs.write_buffer.write(&det, 0, b"old-writer");
+        let rfh = open(&fs, "/r", OpenFlags::ReadOnly);
+        fs.write_buffer.write("/r", 0, b"orphan");
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/f", 0, b"live");
+        fs.commit_aged(Instant::now() + AGE).await;
+        assert!(fs.flush(fh).await.is_err(), "the live path was attempted");
+        assert!(fs.open_files.get(&dfh).unwrap().write_error.is_none(), "detached: not attempted");
+        assert!(fs.open_files.get(&rfh).unwrap().write_error.is_none());
+        assert_eq!(fs.write_buffer.dirty_bytes(&det), 10);
+        assert_eq!(fs.write_buffer.dirty_bytes("/r"), 6);
+    }
+
+    #[tokio::test]
+    async fn async_release_still_commits_the_partial_tail() {
+        let fs = fs(true);
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/f", 0, &[7; 100]);
+        let err = fs.release(fh).await.unwrap_err();
+        assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
+        assert!(!fs.open_files.contains_key(&fh));
     }
 }

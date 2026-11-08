@@ -247,6 +247,7 @@ async fn main() -> Result<()> {
     let local_cache_cfg = fuse_config.cache.clone();
     // CF-5 — snapshot the memory config before fuse_config is moved.
     let memory_cfg = fuse_config.memory.clone();
+    let write_cfg = fuse_config.write.clone();
     let client_location = fuse_config.location.clone();
     // Bug U — keep a handle to the client (cheap Arc clone) so we can
     // release this PID's leases on the way out, after DtfsFilesystem has
@@ -303,6 +304,25 @@ async fn main() -> Result<()> {
             loop {
                 ticker.tick().await;
                 sweep_fs.sweep_expired_metadata_cache();
+            }
+        });
+    }
+
+    // write.async_commit: fsync/flush no longer commit partial chunks; this
+    // 1 s tick commits any file whose oldest buffered byte is too old.
+    if write_cfg.async_commit {
+        tracing::warn!(
+            "write.async_commit = true: acknowledged writes may stay in client memory up to {} s / {} bytes per open file; a dtfs-fuse or host crash loses them",
+            write_cfg.async_commit_secs,
+            writebuf::DIRTY_BYTES_CAP,
+        );
+        let commit_fs = fs.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                commit_fs.commit_aged(std::time::Instant::now()).await;
             }
         });
     }

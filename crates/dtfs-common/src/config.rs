@@ -786,7 +786,21 @@ impl FuseConfig {
         nonzero(
             "[partition_safety] quorum_loss_timeout_secs",
             self.partition_safety.quorum_loss_timeout_secs,
-        )
+        )?;
+        self.write.validate()
+    }
+}
+
+impl FuseWriteConfig {
+    /// `async_commit_secs` must be in `1..=600` when `async_commit` is on.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.async_commit && !(1..=600).contains(&self.async_commit_secs) {
+            return Err(format!(
+                "[write] async_commit_secs ({}) must be in 1..=600 when async_commit = true",
+                self.async_commit_secs
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1122,6 +1136,18 @@ pub struct FuseWriteConfig {
     /// anchor replica later. Ignored by managers that predate the field.
     #[serde(default = "default_true")]
     pub anchor_sync: bool,
+    /// `false` (default): fsync and close(2) commit every buffered byte,
+    /// including a partial tail chunk. `true`: fsync/flush commit nothing
+    /// extra; a partial chunk is committed once complete, once its oldest
+    /// byte is `async_commit_secs` old, under `DIRTY_BYTES_CAP` pressure, or
+    /// at the last writer's release. Acknowledged writes can be lost on a
+    /// dtfs-fuse or host crash inside that window (media / NFS re-export).
+    #[serde(default)]
+    pub async_commit: bool,
+    /// Max age (seconds) of an uncommitted buffered byte with
+    /// `async_commit = true`; validated `1..=600` only when it is on.
+    #[serde(default = "default_async_commit_secs")]
+    pub async_commit_secs: u64,
 }
 
 impl Default for FuseWriteConfig {
@@ -1131,6 +1157,8 @@ impl Default for FuseWriteConfig {
             flush_batch_chunks: default_flush_batch_chunks(),
             upload_concurrency: default_upload_concurrency(),
             anchor_sync: true,
+            async_commit: false,
+            async_commit_secs: default_async_commit_secs(),
         }
     }
 }
@@ -1178,6 +1206,10 @@ fn default_flush_batch_chunks() -> u32 {
 
 fn default_upload_concurrency() -> u32 {
     2
+}
+
+fn default_async_commit_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1554,6 +1586,17 @@ mod tests {
         };
         cfg.validate_shared_secret()
             .expect("escape hatch must allow empty");
+    }
+
+    #[test]
+    fn fuse_startup_validation_refuses_bad_async_commit_secs() {
+        let mut cfg: FuseConfig = load_config(&example_path("fuse.toml")).unwrap();
+        assert!(!cfg.write.async_commit, "example ships async_commit off");
+        cfg.validate_intervals().unwrap();
+        cfg.write.async_commit = true;
+        cfg.write.async_commit_secs = 0;
+        let err = cfg.validate_intervals().unwrap_err();
+        assert!(err.contains("[write] async_commit_secs"), "{err}");
     }
 
     #[test]
@@ -2067,6 +2110,36 @@ warm = 2
             let cfg: FuseWriteConfig =
                 toml::from_str(&format!("upload_concurrency = {raw}")).unwrap();
             assert_eq!(cfg.effective_upload_concurrency(), want, "raw {raw}");
+        }
+    }
+
+    #[test]
+    fn async_commit_defaults_off_30s_and_validates_only_when_on() {
+        let cfg: FuseWriteConfig = toml::from_str("").unwrap();
+        assert!(!cfg.async_commit);
+        assert_eq!(cfg.async_commit_secs, 30);
+        assert_eq!(FuseWriteConfig::default(), cfg);
+        assert!(cfg.validate().is_ok());
+        // Off: the age is not used, so it is not validated.
+        let off: FuseWriteConfig = toml::from_str("async_commit_secs = 0").unwrap();
+        assert!(off.validate().is_ok());
+        for ok in [1u64, 30, 600] {
+            let c: FuseWriteConfig =
+                toml::from_str(&format!("async_commit = true\nasync_commit_secs = {ok}")).unwrap();
+            assert!(c.validate().is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn async_commit_secs_out_of_range_refused_naming_the_key() {
+        for bad in [0u64, 601] {
+            let c: FuseWriteConfig =
+                toml::from_str(&format!("async_commit = true\nasync_commit_secs = {bad}")).unwrap();
+            let err = c.validate().unwrap_err();
+            assert_eq!(
+                err,
+                format!("[write] async_commit_secs ({bad}) must be in 1..=600 when async_commit = true")
+            );
         }
     }
 

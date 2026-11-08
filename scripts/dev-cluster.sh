@@ -46,6 +46,8 @@ Topology: mgr01/02/03 (leli/toro/nrb), data01 leli cold, data02 toro warm,
 data03 nrb warm. Network dtfs-dev-net 172.31.250.0/24. REST published on host
 ports 29402 (mgr01), 29412 (mgr02), 29422 (mgr03). No TLS; fixed dev secret.
 Env: DTFS_DEV_TARGET_VOLUME (cargo target volume, default dtfs-target).
+DTFS_DEV_ASYNC_COMMIT=<secs> writes [write] async_commit = true with that
+async_commit_secs into the client configs (written by up; up --no-build to switch).
 No systemd, journald or sshd in the containers: MCP host_* tools and Ansible
 do not apply.
 EOF
@@ -148,6 +150,9 @@ allow_other = $2
 [cache]
 [partition_safety]
 EOF
+  if [ -n "${DTFS_DEV_ASYNC_COMMIT:-}" ]; then
+    printf '[write]\nasync_commit = true\nasync_commit_secs = %s\n' "$DTFS_DEV_ASYNC_COMMIT"
+  fi
 }
 
 write_configs() {

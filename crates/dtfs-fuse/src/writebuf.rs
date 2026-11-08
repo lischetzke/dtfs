@@ -17,7 +17,8 @@
 // safe to commit as the chunk's whole content.
 
 use std::collections::BTreeMap;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -119,9 +120,16 @@ struct ChunkBuf {
     /// and must not be seeded again (a re-seed used to overwrite newer
     /// buffered bytes with stale cluster bytes).
     seeded: bool,
+    /// When this chunk's oldest uncommitted byte was buffered
+    /// (`write.async_commit` age trigger, `aged_paths`).
+    since: Instant,
 }
 
 impl ChunkBuf {
+    fn empty() -> Self {
+        Self { data: Vec::new(), dirty: 0..0, seeded: false, since: Instant::now() }
+    }
+
     /// True iff this chunk's buffered data fully covers `0..chunk_size` —
     /// i.e. it is safe to commit as the chunk's whole content without an
     /// RMW seed first.
@@ -221,6 +229,9 @@ pub struct ChunkSegment {
     /// RMW-seeding it against the cluster's existing bytes (CR-1-2) — doing
     /// so would silently truncate or shift already-committed data.
     pub needs_seed: bool,
+    /// Age of the chunk's oldest byte; `restore_segments` keeps it so a
+    /// failed age-triggered commit retries on the next tick.
+    pub since: Option<Instant>,
 }
 
 impl WriteBuffer {
@@ -287,11 +298,7 @@ impl WriteBuffer {
             let (piece, rest) = remaining.split_at(take);
             buf.chunks
                 .entry(chunk_index)
-                .or_insert_with(|| ChunkBuf {
-                    data: Vec::new(),
-                    dirty: 0..0,
-                    seeded: false,
-                })
+                .or_insert_with(ChunkBuf::empty)
                 .merge(offset_in_chunk, piece);
             remaining = rest;
             cur_offset += take as u64;
@@ -377,6 +384,74 @@ impl WriteBuffer {
         segments
     }
 
+    /// `write.async_commit` age trigger: up to `limit` paths whose oldest
+    /// buffered byte is at least `max_age` old at `now`, oldest first.
+    pub fn aged_paths(&self, now: Instant, max_age: Duration, limit: usize) -> Vec<String> {
+        let mut aged: Vec<(Instant, String)> = self
+            .buffers
+            .iter()
+            .filter_map(|e| {
+                let oldest = e.value().chunks.values().map(|cb| cb.since).min()?;
+                (now.saturating_duration_since(oldest) >= max_age).then(|| (oldest, e.key().clone()))
+            })
+            .collect();
+        aged.sort();
+        aged.into_iter().take(limit).map(|(_, p)| p).collect()
+    }
+
+    /// `DIRTY_BYTES_CAP` release valve: if `dirty + incoming >= cap`, drain
+    /// every complete chunk (`flush_complete`, unchanged default). With
+    /// `partial` (async_commit): drain complete chunks outside `keep` (the
+    /// chunks the pending write touches and has just seeded), then, if still
+    /// at the cap, partial ones outside `keep`. Ascending by chunk index.
+    pub fn cap_drain(
+        &self,
+        path: &str,
+        incoming: usize,
+        cap: usize,
+        partial: bool,
+        keep: RangeInclusive<u32>,
+    ) -> Vec<ChunkSegment> {
+        if self.dirty_bytes(path).saturating_add(incoming) < cap {
+            return Vec::new();
+        }
+        if !partial {
+            return self.flush_complete(path);
+        }
+        let Some(mut entry) = self.buffers.get_mut(path) else { return Vec::new() };
+        let buf = entry.value_mut();
+        let mut dirty: usize = buf.chunks.values().map(|cb| cb.data.len()).sum();
+        let mut segs = Vec::new();
+        // Complete chunks first, then partial ones while still at the cap.
+        // Never a `keep` chunk: draining a chunk the pending write just
+        // seeded would leave its bytes in a fresh unseeded chunk.
+        for complete in [true, false] {
+            if !complete && dirty.saturating_add(incoming) < cap {
+                break;
+            }
+            let drain: Vec<u32> = buf
+                .chunks
+                .iter()
+                .filter(|(k, cb)| !keep.contains(k) && cb.is_complete(self.chunk_size) == complete)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in drain {
+                if let Some(cb) = buf.chunks.remove(&k) {
+                    dirty -= cb.data.len();
+                    segs.push(ChunkSegment {
+                        chunk_index: k,
+                        offset_in_chunk: cb.dirty.start,
+                        needs_seed: !complete && !cb.seeded,
+                        since: Some(cb.since),
+                        data: Bytes::from(cb.data),
+                    });
+                }
+            }
+        }
+        segs.sort_by_key(|s| s.chunk_index);
+        segs
+    }
+
     /// Remove the buffer for a given path entirely.
     pub fn remove(&self, path: &str) {
         self.buffers.remove(path);
@@ -439,11 +514,7 @@ impl WriteBuffer {
             .value_mut()
             .chunks
             .entry(chunk_index)
-            .or_insert_with(|| ChunkBuf {
-                data: Vec::new(),
-                dirty: 0..0,
-                seeded: false,
-            });
+            .or_insert_with(ChunkBuf::empty);
         if cb.seeded {
             return;
         }
@@ -521,11 +592,14 @@ impl WriteBuffer {
         for seg in segments {
             let abs_offset = seg.chunk_index as u64 * chunk_size + seg.offset_in_chunk as u64;
             self.write(path, abs_offset, seg.data.as_ref());
-            if !seg.needs_seed && seg.offset_in_chunk == 0 {
-                // A seeded partial chunk stays seeded across the restore.
-                if let Some(mut e) = self.buffers.get_mut(path) {
-                    if let Some(cb) = e.value_mut().chunks.get_mut(&seg.chunk_index) {
+            if let Some(mut e) = self.buffers.get_mut(path) {
+                if let Some(cb) = e.value_mut().chunks.get_mut(&seg.chunk_index) {
+                    if !seg.needs_seed && seg.offset_in_chunk == 0 {
+                        // A seeded partial chunk stays seeded across the restore.
                         cb.seeded = true;
+                    }
+                    if let Some(since) = seg.since {
+                        cb.since = cb.since.min(since);
                     }
                 }
             }
@@ -668,6 +742,7 @@ impl FileWriteBuffer {
                     data: Bytes::from(cb.data),
                     offset_in_chunk: 0,
                     needs_seed: false,
+                    since: Some(cb.since),
                 });
             }
         }
@@ -686,6 +761,7 @@ impl FileWriteBuffer {
                     chunk_index: k,
                     offset_in_chunk: cb.dirty.start,
                     needs_seed: !complete && !cb.seeded,
+                    since: Some(cb.since),
                     data: Bytes::from(cb.data),
                 });
             }
@@ -1344,5 +1420,362 @@ mod audit_co_tests {
         assert_eq!(wb.pending_summary("/f"), (vec![], 0));
         wb.write("/f", 0, &[1u8; 10]);
         assert_eq!(wb.pending_summary("/f"), (vec![0, 1], 10));
+    }
+}
+
+/// `write.async_commit`: age trigger, cap drain of partial chunks, and a
+/// model check of the buffer under the async policy.
+#[cfg(test)]
+mod async_commit_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const CS: usize = 8;
+    const AGE: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn aged_paths_waits_for_the_oldest_byte_and_drops_drained_paths() {
+        let wb = WriteBuffer::new(CS);
+        let t0 = Instant::now();
+        wb.write("/a", 0, b"abc");
+        wb.write("/b", 0, &[1u8; CS]);
+        assert!(wb.aged_paths(t0 + AGE - Duration::from_secs(1), AGE, 8).is_empty());
+        let mut aged = wb.aged_paths(Instant::now() + AGE, AGE, 8);
+        aged.sort();
+        assert_eq!(aged, vec!["/a".to_string(), "/b".to_string()]);
+        assert_eq!(wb.aged_paths(Instant::now() + AGE, AGE, 1).len(), 1, "limit per tick");
+        let _ = wb.flush_all("/b");
+        assert_eq!(wb.aged_paths(Instant::now() + AGE, AGE, 8), vec!["/a".to_string()]);
+    }
+
+    #[test]
+    fn restore_keeps_the_original_age_so_a_failed_commit_retries_next_tick() {
+        let wb = WriteBuffer::new(CS);
+        wb.write("/a", 0, b"abc");
+        let mut segs = wb.flush_all("/a");
+        let t0 = Instant::now();
+        segs[0].since = Some(t0);
+        while Instant::now() <= t0 {}
+        wb.restore_segments("/a", &segs);
+        assert_eq!(wb.aged_paths(t0 + AGE, AGE, 8), vec!["/a".to_string()]);
+        // A fresh write after t0 is not aged at t0 + AGE.
+        wb.write("/c", 0, b"x");
+        assert!(!wb.aged_paths(t0 + AGE, AGE, 8).contains(&"/c".to_string()));
+    }
+
+    #[test]
+    fn cap_drain_async_also_drains_partials_outside_keep() {
+        for partial in [false, true] {
+            let wb = WriteBuffer::new_with_batch(CS, 4);
+            wb.write("/f", 0, &[1; CS]); // complete chunk 0
+            wb.write("/f", CS as u64 + 1, &[2; 5]); // partial chunk 1
+            wb.write("/f", 3 * CS as u64, &[3; 4]); // partial chunk 3 (pending write)
+            assert_eq!(wb.dirty_bytes("/f"), 17);
+            assert!(wb.cap_drain("/f", 0, 18, partial, 3..=3).is_empty(), "17 < 18: nothing");
+            // 17 + 4 >= 13: drain complete; 9 + 4 still meets 13 exactly.
+            let segs = wb.cap_drain("/f", 4, 13, partial, 3..=3);
+            let idx: Vec<u32> = segs.iter().map(|s| s.chunk_index).collect();
+            if partial {
+                assert_eq!(idx, vec![0, 1]);
+                assert_eq!(wb.dirty_bytes("/f"), 4, "only the kept chunk stays");
+            } else {
+                assert_eq!(idx, vec![0], "sync mode: complete chunks only");
+                assert_eq!(wb.dirty_bytes("/f"), 9);
+            }
+        }
+    }
+
+    /// Found by the model below: a chunk the pending write just seeded to
+    /// full is complete; draining it would leave the write's bytes in a fresh
+    /// unseeded chunk that the commit guard then refuses.
+    #[test]
+    fn cap_drain_async_keeps_the_seeded_chunk_of_the_pending_write() {
+        let wb = WriteBuffer::new_with_batch(CS, 4);
+        wb.seed_chunk("/f", 2, &[9; CS]);
+        wb.write("/f", 0, &[1; 3]);
+        let segs = wb.cap_drain("/f", 1, 1, true, 2..=2);
+        assert_eq!(segs.iter().map(|s| s.chunk_index).collect::<Vec<_>>(), vec![0]);
+        assert!(!wb.chunk_needs_seed("/f", 2), "still seeded for the pending write");
+    }
+
+    #[test]
+    fn cap_drain_async_stops_once_complete_chunks_suffice() {
+        let wb = WriteBuffer::new_with_batch(CS, 4);
+        wb.write("/f", 0, &[1; CS]);
+        wb.write("/f", CS as u64, &[2; 3]);
+        let segs = wb.cap_drain("/f", 1, 11, true, 5..=5);
+        assert_eq!(segs.len(), 1, "3 + 1 < 11 after the complete drain");
+        assert_eq!(wb.dirty_bytes("/f"), 3);
+    }
+
+    const P: &str = "/f";
+
+    /// Model of the cluster plus filesystem.rs write/fsync/timer/truncate/
+    /// release steps on top of the real `WriteBuffer` (cap scaled down).
+    struct Sim {
+        wb: WriteBuffer,
+        async_on: bool,
+        cap: usize,
+        chunks: BTreeMap<u32, Vec<u8>>,
+        size: u64,
+        model: Vec<u8>,
+        fail_next: bool,
+        sticky: bool,
+        clock: Duration,
+        trace: Vec<String>,
+        /// Buffered bytes before the current write; a write whose cap drain
+        /// fails returns EIO with its seeds still buffered (at most the
+        /// chunks it touches), so the bound is then `max(cap, before) + 4*CS`.
+        seeds_before: usize,
+        drain_failed: bool,
+    }
+
+    impl Sim {
+        fn new(async_on: bool) -> Self {
+            Self {
+                wb: WriteBuffer::new_with_batch(CS, 2),
+                async_on,
+                cap: 40,
+                chunks: BTreeMap::new(),
+                size: 0,
+                model: Vec::new(),
+                fail_next: false,
+                sticky: false,
+                clock: Duration::ZERO,
+                trace: Vec::new(),
+                seeds_before: 0,
+                drain_failed: false,
+            }
+        }
+
+        /// flush_segments_to_cluster + segments_committable; the caller's
+        /// restore on error.
+        fn commit(&mut self, segs: Vec<ChunkSegment>) -> bool {
+            if segs.is_empty() {
+                return true;
+            }
+            let refused = segs.iter().any(|s| {
+                s.offset_in_chunk > 0 || (s.needs_seed && self.chunks.contains_key(&s.chunk_index))
+            });
+            assert!(
+                !refused,
+                "policy produced an uncommittable segment: async={} {:?} trace={:?}",
+                self.async_on,
+                segs.iter()
+                    .map(|s| (s.chunk_index, s.offset_in_chunk, s.needs_seed, s.data.len()))
+                    .collect::<Vec<_>>(),
+                self.trace
+            );
+            if std::mem::take(&mut self.fail_next) {
+                self.wb.restore_segments(P, &segs);
+                return false;
+            }
+            for s in segs {
+                let end = s.chunk_index as u64 * CS as u64 + s.data.len() as u64;
+                self.chunks.insert(s.chunk_index, s.data.to_vec());
+                self.size = self.size.max(end);
+            }
+            true
+        }
+
+        fn committed_view(&self) -> Vec<u8> {
+            (0..self.size)
+                .map(|i| {
+                    let (c, o) = ((i / CS as u64) as u32, (i % CS as u64) as usize);
+                    self.chunks.get(&c).and_then(|d| d.get(o).copied()).unwrap_or(0)
+                })
+                .collect()
+        }
+
+        /// read(): committed bytes overlaid with the buffer.
+        fn view(&self) -> Vec<u8> {
+            let len = self.size.max(self.wb.logical_size(P).unwrap_or(0));
+            let mut v = self.committed_view();
+            v.resize(len as usize, 0);
+            self.wb.overlay(P, 0, &mut v);
+            v
+        }
+
+        /// read_seed_bytes clamped to `eof`; a hole below EOF seeds zeros.
+        fn seed(&mut self, idx: u32, eof: u64) {
+            let base = idx as u64 * CS as u64;
+            if !self.wb.chunk_needs_seed(P, idx) || base >= eof {
+                return;
+            }
+            let clamp = (eof - base).min(CS as u64) as usize;
+            let bytes = match self.chunks.get(&idx) {
+                Some(d) => d[..d.len().min(clamp)].to_vec(),
+                None => vec![0; clamp],
+            };
+            self.wb.seed_chunk(P, idx, &bytes);
+        }
+
+        fn span(off: u64, len: usize) -> RangeInclusive<u32> {
+            (off / CS as u64) as u32..=((off + len as u64 - 1) / CS as u64) as u32
+        }
+
+        fn cap_drain(&mut self, incoming: usize, keep: RangeInclusive<u32>) -> bool {
+            let segs = self.wb.cap_drain(P, incoming, self.cap, self.async_on, keep);
+            let ok = self.commit(segs);
+            self.drain_failed |= !ok;
+            ok
+        }
+
+        fn write(&mut self, off: u64, data: &[u8]) {
+            self.seeds_before = self.wb.dirty_bytes(P);
+            let eof = self.size.max(self.wb.logical_size(P).unwrap_or(0));
+            for idx in Self::span(off, data.len()) {
+                self.seed(idx, self.size);
+            }
+            if off > eof && eof % CS as u64 != 0 {
+                self.seed((eof / CS as u64) as u32, self.size);
+            }
+            let mut at = eof;
+            while at < off {
+                let n = ((off - at) as usize).min(2 * CS);
+                if !self.cap_drain(n, Self::span(at, n)) {
+                    self.model.resize(self.model.len().max(at as usize), 0);
+                    return;
+                }
+                self.wb.write(P, at, &vec![0; n]);
+                at += n as u64;
+            }
+            self.model.resize(self.model.len().max(at as usize), 0);
+            if !self.cap_drain(data.len(), Self::span(off, data.len())) {
+                return;
+            }
+            self.wb.write(P, off, data);
+            let end = off as usize + data.len();
+            if self.model.len() < end {
+                self.model.resize(end, 0);
+            }
+            self.model[off as usize..end].copy_from_slice(data);
+            let segs = self.wb.flush(P);
+            self.commit(segs);
+        }
+
+        /// fsync / flush: async only reports the sticky error.
+        fn fsync(&mut self) {
+            if self.async_on {
+                self.sticky = false;
+            } else {
+                let segs = self.wb.flush_all(P);
+                self.commit(segs);
+            }
+        }
+
+        fn tick(&mut self, adv: Duration) {
+            self.clock += adv;
+            if !self.async_on {
+                return;
+            }
+            for p in self.wb.aged_paths(Instant::now() + self.clock, AGE, 8) {
+                assert_eq!(p, P);
+                let segs = self.wb.flush_all(P);
+                if !self.commit(segs) {
+                    self.sticky = true;
+                }
+            }
+        }
+
+        /// truncate_inner with a writer. Shrink only: a shrink-then-grow
+        /// before the tail commit is a pre-existing gap, not async_commit's.
+        fn truncate(&mut self, new: u64) {
+            if new < self.size && new % CS as u64 != 0 {
+                self.seed((new / CS as u64) as u32, new);
+            }
+            self.size = new;
+            self.chunks.retain(|&c, _| (c as u64) * (CS as u64) < new);
+            self.wb.truncate(P, new);
+            self.model.truncate(new as usize);
+        }
+
+        fn release(&mut self) {
+            let segs = self.wb.flush_all(P);
+            if self.commit(segs) {
+                assert_eq!(self.committed_view(), self.model, "release commits the model");
+            } else {
+                self.wb.remove(P);
+                self.model = self.committed_view();
+            }
+            self.sticky = false;
+        }
+
+        fn check(&mut self) {
+            assert_eq!(self.view(), self.model);
+            if self.async_on {
+                let d = self.wb.dirty_bytes(P);
+                let bound = if self.drain_failed {
+                    self.cap.max(self.seeds_before) + 4 * CS
+                } else {
+                    self.cap
+                };
+                let tail = &self.trace[self.trace.len().saturating_sub(6)..];
+                assert!(d <= bound, "{d} buffered > {bound} {tail:?}");
+                // The overshoot lasts until a write's drain succeeds.
+                self.drain_failed &= d > self.cap;
+            }
+        }
+    }
+
+    #[test]
+    fn async_commit_random_ops_keep_reads_equal_to_model() {
+        for async_on in [true, false] {
+            for seed in 1..=400u64 {
+                let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                let mut next = |m: u64| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng % m
+                };
+                let mut sim = Sim::new(async_on);
+                if !async_on {
+                    // Default mode keeps `flush_complete`, which can drain a
+                    // chunk the pending write just seeded (pre-existing,
+                    // reported); model the default with the cap out of reach.
+                    sim.cap = usize::MAX / 2;
+                }
+                for _ in 0..80 {
+                    let logical = sim.model.len() as u64;
+                    sim.trace.push(format!("size={} buf={:?}", sim.size, sim.wb.logical_size(P)));
+                    match next(10) {
+                        0..=3 => {
+                            let off = next(logical + 3 * CS as u64 + 1);
+                            let len = 1 + next(12) as usize;
+                            let b = (next(255) + 1) as u8;
+                            sim.trace.push(format!("write {off} {len}"));
+                            sim.write(off, &vec![b; len]);
+                        }
+                        4 | 9 => {
+                            sim.trace.push("fsync".into());
+                            sim.fsync();
+                        }
+                        5 => {
+                            let a = next(21);
+                            sim.trace.push(format!("tick {a}"));
+                            sim.tick(Duration::from_secs(a));
+                        }
+                        6 => {
+                            let n = next(logical + 1);
+                            sim.trace.push(format!("truncate {n}"));
+                            sim.truncate(n);
+                        }
+                        7 => {
+                            sim.trace.push("fail next upload".into());
+                            sim.fail_next = true;
+                        }
+                        _ => {
+                            sim.trace.push("release".into());
+                            sim.release();
+                        }
+                    }
+                    sim.check();
+                }
+                sim.fail_next = false;
+                sim.release();
+                assert_eq!(sim.wb.dirty_bytes(P), 0);
+            }
+        }
     }
 }
