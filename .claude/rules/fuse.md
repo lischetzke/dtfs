@@ -18,6 +18,23 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 - Background prefetch is bounded by `client.chunk_read_timeout_secs`
   like the foreground fetch (`0` = unbounded).
 - `flush()` drops the `lock_owner`'s POSIX locks (kernel close contract).
+- POSIX lock ranges from the kernel are INCLUSIVE (`end` = last byte,
+  `OFFSET_MAX` = whole file); unlock and re-acquire carve the owner's
+  ranges (`carve_owner_range`), never drop a whole overlapping lock.
+
+## Inodes and directories
+
+- `InodeMap` counts kernel lookups (`lookup_ref`: lookup/create/mkdir/
+  symlink/link; `add_ref` per readdirplus entry actually pulled by fuse3).
+  `forget` drops the mapping (and the path's `mode_overrides` entry) at 0.
+  fuse3 0.7 `batch_forget` has no counts: it only drops inodes not looked
+  up for `BATCH_FORGET_QUIET` (5 s). Plain `readdir` mints inodes without
+  a ref (never forgotten; bounded by distinct paths listed).
+- `rename` re-keys every descendant path and drops the replaced
+  destination's inode.
+- `opendir` snapshots the listing (fh -> `Arc<Vec<DirEntry>>`, dropped at
+  `releasedir`); readdir/readdirplus serve pages from it, cookie = position
+  (`dir_entry_cookie`). Do not re-list per page.
 
 ## Writes
 
@@ -44,6 +61,13 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 - Per (fh, chunk) transition (`should_notify`): `record_cache_hit` at most
   once, bounded by `CACHE_HIT_NOTIFY_MAX_INFLIGHT` (8, skip when full);
   `readahead.on_chunk_read` on every transition, hit or miss.
+- A disk-cache hit is also inserted into the readahead memory cache
+  (`promote_disk_hit`); the readahead cache evicts oldest-inserted first and
+  drains per entry (never `clear()` + `store(0)`). The prefetch candidate
+  list is limited to `chunk_idx+1..=chunk_idx+prefetch_chunks`.
+- `LocalChunkCache` removals (evict and age prune) go through `evict_entry`.
+- Client `read_chunk` verifies the streamed bytes against the 64-hex
+  chunk id (IntegrityFaultError on mismatch).
 - Disk cache: viewer-read atime hint comes from `OpenFile.bytes_read_on_fh`
   + `ReadAheadEngine::is_active()` (`is_viewer_read`), not one kernel
   read's length; `evict_to_size` targets `EVICT_TARGET_PCT` (90%).

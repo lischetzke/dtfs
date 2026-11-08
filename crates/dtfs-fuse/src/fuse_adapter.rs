@@ -17,11 +17,12 @@
 use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use fuse3::raw::prelude::*;
 use fuse3::{Errno, Result as FuseResult, Timestamp};
+use futures_util::StreamExt;
 use tracing::{debug, warn};
 
 use crate::filesystem::{DtfsFilesystem, FileAttr as DtfsAttr, OpenFlags};
@@ -51,7 +52,16 @@ struct InodeMap {
     inode_to_path: DashMap<u64, String>,
     path_to_inode: DashMap<String, u64>,
     next: AtomicU64,
+    /// Kernel lookup count per inode (+ time of the last bump). Entries are
+    /// dropped when `forget` brings the count to 0.
+    refs: DashMap<u64, (u64, Instant)>,
 }
+
+/// fuse3 0.7 hands `batch_forget` bare inode numbers (the per-inode
+/// `nlookup` is discarded), so a batched forget only drops an inode that
+/// has not been looked up for this long: a lookup racing the forget keeps
+/// its mapping and is forgotten by its own later FORGET.
+const BATCH_FORGET_QUIET: Duration = Duration::from_secs(5);
 
 impl InodeMap {
     fn new() -> Self {
@@ -59,6 +69,7 @@ impl InodeMap {
             inode_to_path: DashMap::new(),
             path_to_inode: DashMap::new(),
             next: AtomicU64::new(2),
+            refs: DashMap::new(),
         };
         m.inode_to_path.insert(FUSE_ROOT_ID, "/".to_string());
         m.path_to_inode.insert("/".to_string(), FUSE_ROOT_ID);
@@ -79,6 +90,74 @@ impl InodeMap {
                 v.insert(ino);
                 ino
             }
+        }
+    }
+
+    /// Count one kernel lookup reference on `ino` (every reply that hands
+    /// the kernel an entry: lookup, create, mkdir, symlink, link, readdirplus).
+    fn add_ref(&self, ino: u64) {
+        if ino == FUSE_ROOT_ID {
+            return;
+        }
+        let mut e = self.refs.entry(ino).or_insert((0, Instant::now()));
+        e.0 += 1;
+        e.1 = Instant::now();
+    }
+
+    /// `inode_for` + `add_ref`, re-minting if a concurrent forget dropped
+    /// the mapping between the two.
+    fn lookup_ref(&self, path: &str) -> u64 {
+        loop {
+            let ino = self.inode_for(path);
+            self.add_ref(ino);
+            if self.inode_to_path.contains_key(&ino) {
+                return ino;
+            }
+        }
+    }
+
+    /// Drop both directions of `ino`'s mapping; returns the path it had.
+    fn drop_mapping(&self, ino: u64) -> Option<String> {
+        let (_, path) = self.inode_to_path.remove(&ino)?;
+        // Only if the path still points at this inode (unlink + recreate
+        // may have re-minted the path for a different inode).
+        self.path_to_inode.remove_if(&path, |_, v| *v == ino);
+        Some(path)
+    }
+
+    /// FUSE_FORGET: subtract `n` lookups; at 0 drop the mapping. Returns the
+    /// dropped path so the caller can clear path-keyed state.
+    fn forget(&self, ino: u64, n: u64) -> Option<String> {
+        if ino == FUSE_ROOT_ID {
+            return None;
+        }
+        match self.refs.entry(ino) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                let left = e.get().0.saturating_sub(n);
+                if left > 0 {
+                    e.get_mut().0 = left;
+                    return None;
+                }
+                let dropped = self.drop_mapping(ino);
+                e.remove();
+                dropped
+            }
+            dashmap::mapref::entry::Entry::Vacant(_) => None,
+        }
+    }
+
+    /// FUSE_BATCH_FORGET (count unknown, see `BATCH_FORGET_QUIET`).
+    fn forget_quiet(&self, ino: u64, quiet: Duration) -> Option<String> {
+        if ino == FUSE_ROOT_ID {
+            return None;
+        }
+        match self.refs.entry(ino) {
+            dashmap::mapref::entry::Entry::Occupied(e) if e.get().1.elapsed() >= quiet => {
+                let dropped = self.drop_mapping(ino);
+                e.remove();
+                dropped
+            }
+            _ => None,
         }
     }
 
@@ -155,6 +234,8 @@ pub struct DtfsFuse3Adapter {
     /// keeps the usual `chmod 600 f && stat -c %a f → 600` workflow honest
     /// without changing cluster-wide metadata. The map is lost on unmount.
     mode_overrides: DashMap<String, u16>,
+    /// Directory listings snapshotted at opendir, dropped at releasedir.
+    dirs: DirSnapshots,
     /// F-031: per-inode POSIX advisory + flock lock table, with one
     /// `tokio::sync::Notify` per inode so blocking-acquire (`F_SETLKW`,
     /// `flock(LOCK_EX|0)`) waits until the holder releases instead of
@@ -166,6 +247,77 @@ pub struct DtfsFuse3Adapter {
     /// for that inode is released. `DashMap` so we don't need to lock the
     /// lock table merely to find the Notify.
     lock_notify: Arc<DashMap<u64, Arc<tokio::sync::Notify>>>,
+}
+
+/// Directory listings frozen at `opendir` (fh -> entries). Cookies are
+/// positions in the frozen list, so pages stay consistent while the live
+/// directory changes.
+struct DirSnapshots {
+    next: AtomicU64,
+    map: DashMap<u64, Arc<Vec<crate::filesystem::DirEntry>>>,
+}
+
+impl DirSnapshots {
+    fn new() -> Self {
+        // fh 0 means "no snapshot" (fallback to a live listing).
+        Self { next: AtomicU64::new(1), map: DashMap::new() }
+    }
+
+    fn open(&self, entries: Vec<crate::filesystem::DirEntry>) -> u64 {
+        let fh = self.next.fetch_add(1, Ordering::Relaxed);
+        self.map.insert(fh, Arc::new(dedup_entries(entries)));
+        fh
+    }
+
+    fn get(&self, fh: u64) -> Option<Arc<Vec<crate::filesystem::DirEntry>>> {
+        self.map.get(&fh).map(|e| Arc::clone(e.value()))
+    }
+
+    fn close(&self, fh: u64) {
+        self.map.remove(&fh);
+    }
+}
+
+/// Keep the first entry per name (defensive; see F-027).
+fn dedup_entries(entries: Vec<crate::filesystem::DirEntry>) -> Vec<crate::filesystem::DirEntry> {
+    let mut seen = std::collections::HashSet::new();
+    entries.into_iter().filter(|e| seen.insert(e.name.clone())).collect()
+}
+
+/// Entries of a snapshot after cookie `offset`, with their cookies.
+fn snapshot_page(
+    entries: &[crate::filesystem::DirEntry],
+    offset: u64,
+) -> impl Iterator<Item = (u64, &crate::filesystem::DirEntry)> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(idx, e)| (dir_entry_cookie(idx), e))
+        .filter(move |(cookie, _)| *cookie > offset)
+}
+
+/// fuse3 `FileAttr` for a manager attribute with the given permission bits.
+/// Single source for getattr/lookup and readdirplus so both agree on nlink.
+fn build_attr(ino: u64, a: &DtfsAttr, perm: u16) -> FileAttr {
+    FileAttr {
+        ino,
+        size: a.size,
+        blocks: (a.size + 511) / 512,
+        atime: to_timestamp(a.modified_at),
+        mtime: to_timestamp(a.modified_at),
+        ctime: to_timestamp(a.created_at),
+        kind: if a.is_directory {
+            FileType::Directory
+        } else {
+            FileType::RegularFile
+        },
+        perm,
+        nlink: if a.is_directory { 2 } else { 1 },
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        rdev: 0,
+        blksize: 4096,
+    }
 }
 
 /// All lock state for one inode (F-031).
@@ -228,6 +380,7 @@ impl DtfsFuse3Adapter {
             fs,
             inodes: InodeMap::new(),
             mode_overrides: DashMap::new(),
+            dirs: DirSnapshots::new(),
             locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             lock_notify: Arc::new(DashMap::new()),
         }
@@ -250,6 +403,24 @@ impl DtfsFuse3Adapter {
         if released {
             self.notify_for(inode).notify_waiters();
         }
+    }
+
+    /// The snapshot opendir took for `fh`, or a fresh listing when the
+    /// kernel passes an fh we never issued.
+    async fn listing(
+        &self,
+        fh: u64,
+        path: &str,
+    ) -> FuseResult<Arc<Vec<crate::filesystem::DirEntry>>> {
+        if let Some(s) = self.dirs.get(fh) {
+            return Ok(s);
+        }
+        let entries = self
+            .fs
+            .readdir(path)
+            .await
+            .map_err(|e| cluster_err_to_errno(&e))?;
+        Ok(Arc::new(dedup_entries(entries)))
     }
 
     fn notify_for(&self, inode: u64) -> Arc<tokio::sync::Notify> {
@@ -291,26 +462,7 @@ impl DtfsFuse3Adapter {
             .inodes
             .path_for(ino)
             .unwrap_or_else(|_| "/".to_string());
-        let perm = self.override_perm(&path, a.is_directory);
-        FileAttr {
-            ino,
-            size: a.size,
-            blocks: (a.size + 511) / 512,
-            atime: to_timestamp(a.modified_at),
-            mtime: to_timestamp(a.modified_at),
-            ctime: to_timestamp(a.created_at),
-            kind: if a.is_directory {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            },
-            perm,
-            nlink: if a.is_directory { 2 } else { 1 },
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: 4096,
-        }
+        build_attr(ino, a, self.override_perm(&path, a.is_directory))
     }
 
     /// Synthesise a fuse3 `FileAttr` for a newly-created file or directory.
@@ -376,7 +528,7 @@ impl Filesystem for DtfsFuse3Adapter {
         debug!("fuse3:lookup {}", path);
         match self.fs.lookup(&path).await {
             Ok(attrs) => {
-                let ino = self.inodes.inode_for(&path);
+                let ino = self.inodes.lookup_ref(&path);
                 Ok(ReplyEntry {
                     ttl: ENTRY_TTL,
                     attr: self.to_fuse_attr(ino, &attrs),
@@ -385,6 +537,20 @@ impl Filesystem for DtfsFuse3Adapter {
             }
             // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
             Err(e) => Err(cluster_err_to_errno(&e)),
+        }
+    }
+
+    async fn forget(&self, _req: Request, inode: u64, nlookup: u64) {
+        if let Some(path) = self.inodes.forget(inode, nlookup) {
+            self.mode_overrides.remove(&path);
+        }
+    }
+
+    async fn batch_forget(&self, _req: Request, inodes: &[u64]) {
+        for &ino in inodes {
+            if let Some(path) = self.inodes.forget_quiet(ino, BATCH_FORGET_QUIET) {
+                self.mode_overrides.remove(&path);
+            }
         }
     }
 
@@ -717,7 +883,7 @@ impl Filesystem for DtfsFuse3Adapter {
         debug!("fuse3:mkdir {} (mode={:#o})", path, mode);
         match self.fs.mkdir(&path).await {
             Ok(()) => {
-                let ino = self.inodes.inode_for(&path);
+                let ino = self.inodes.lookup_ref(&path);
                 Ok(ReplyEntry {
                     ttl: ENTRY_TTL,
                     attr: self.synthetic_attr(ino, true, (mode & 0o777) as u16),
@@ -798,7 +964,7 @@ impl Filesystem for DtfsFuse3Adapter {
         debug!("fuse3:create {} (mode={:#o})", path, mode);
         match self.fs.create(&path, mode).await {
             Ok(fh) => {
-                let ino = self.inodes.inode_for(&path);
+                let ino = self.inodes.lookup_ref(&path);
                 let attr = self.synthetic_attr(ino, false, (mode & 0o777) as u16);
                 Ok(ReplyCreated {
                     ttl: ENTRY_TTL,
@@ -835,7 +1001,17 @@ impl Filesystem for DtfsFuse3Adapter {
         let path = self.inodes.path_for(inode)?;
         debug!("fuse3:opendir {} (ino={})", path, inode);
         match self.fs.lookup(&path).await {
-            Ok(a) if a.is_directory => Ok(ReplyOpen { fh: 0, flags }),
+            Ok(a) if a.is_directory => {
+                // Snapshot the listing once per opendir; pages are served
+                // from it so a concurrent delete cannot shift cookies and
+                // skip an unrelated entry.
+                let entries = self
+                    .fs
+                    .readdir(&path)
+                    .await
+                    .map_err(|e| cluster_err_to_errno(&e))?;
+                Ok(ReplyOpen { fh: self.dirs.open(entries), flags })
+            }
             Ok(_) => Err(Errno::from(libc::ENOTDIR)),
             // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
             Err(e) => Err(cluster_err_to_errno(&e)),
@@ -846,9 +1022,10 @@ impl Filesystem for DtfsFuse3Adapter {
         &self,
         _req: Request,
         _inode: u64,
-        _fh: u64,
+        fh: u64,
         _flags: u32,
     ) -> FuseResult<()> {
+        self.dirs.close(fh);
         Ok(())
     }
 
@@ -861,7 +1038,7 @@ impl Filesystem for DtfsFuse3Adapter {
         &'a self,
         _req: Request,
         inode: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
     ) -> FuseResult<ReplyDirectory<Self::DirEntryStream<'a>>> {
         let path = self.inodes.path_for(inode)?;
@@ -870,11 +1047,7 @@ impl Filesystem for DtfsFuse3Adapter {
         // CR-1-6 (FUSE-4/CO-4-16): a manager blip during a Plex library
         // scan must not read as "directory does not exist" — only a
         // genuine NotFound may map to ENOENT.
-        let entries = self
-            .fs
-            .readdir(&path)
-            .await
-            .map_err(|e| cluster_err_to_errno(&e))?;
+        let entries = self.listing(fh, &path).await?;
 
         // Cookie scheme — Bug F fix:
         //
@@ -892,18 +1065,9 @@ impl Filesystem for DtfsFuse3Adapter {
         // side — we MUST NOT emit them here, and the cookie for the
         // first real entry must be 1, matching readdirplus.
         let mut items: Vec<FuseResult<DirectoryEntry>> = Vec::new();
-        let mut seen_names: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
 
-        for (idx, entry) in entries.iter().enumerate() {
-            let entry_offset = dir_entry_cookie(idx) as i64;
-            if entry_offset <= offset {
-                continue;
-            }
-            // Defensive dedup within the same call.
-            if !seen_names.insert(entry.name.clone()) {
-                continue;
-            }
+        for (cookie, entry) in snapshot_page(&entries, offset.max(0) as u64) {
+            let entry_offset = cookie as i64;
             let child_path = if path == "/" {
                 format!("/{}", entry.name)
             } else {
@@ -928,7 +1092,7 @@ impl Filesystem for DtfsFuse3Adapter {
     }
 
     type DirEntryPlusStream<'a>
-        = futures_util::stream::Iter<std::vec::IntoIter<FuseResult<DirectoryEntryPlus>>>
+        = futures_util::stream::BoxStream<'a, FuseResult<DirectoryEntryPlus>>
     where
         Self: 'a;
 
@@ -936,32 +1100,18 @@ impl Filesystem for DtfsFuse3Adapter {
         &'a self,
         _req: Request,
         inode: u64,
-        _fh: u64,
+        fh: u64,
         offset: u64,
         _lock_owner: u64,
     ) -> FuseResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>> {
         let path = self.inodes.path_for(inode)?;
         debug!("fuse3:readdirplus {} (ino={}, offset={})", path, inode, offset);
         // CR-1-6 (FUSE-4/CO-4-16): same rationale as readdir above.
-        let entries = self
-            .fs
-            .readdir(&path)
-            .await
-            .map_err(|e| cluster_err_to_errno(&e))?;
+        let entries = self.listing(fh, &path).await?;
 
         let mut items: Vec<FuseResult<DirectoryEntryPlus>> = Vec::new();
-        // Defensive dedup by name (see F-027 comment in readdir above).
-        let mut seen_names: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
 
-        for (idx, entry) in entries.iter().enumerate() {
-            let entry_offset = dir_entry_cookie(idx);
-            if entry_offset <= offset {
-                continue;
-            }
-            if !seen_names.insert(entry.name.clone()) {
-                continue;
-            }
+        for (entry_offset, entry) in snapshot_page(&entries, offset) {
             let child_path = if path == "/" {
                 format!("/{}", entry.name)
             } else {
@@ -973,21 +1123,16 @@ impl Filesystem for DtfsFuse3Adapter {
             } else {
                 FileType::RegularFile
             };
-            let attr = FileAttr {
-                ino: child_ino,
-                size: entry.size,
-                blocks: (entry.size + 511) / 512,
-                atime: to_timestamp(entry.modified_at),
-                mtime: to_timestamp(entry.modified_at),
-                ctime: to_timestamp(entry.created_at),
-                kind,
-                perm: if entry.is_directory { 0o755 } else { 0o644 },
-                nlink: 1,
-                uid: unsafe { libc::getuid() },
-                gid: unsafe { libc::getgid() },
-                rdev: 0,
-                blksize: 4096,
-            };
+            let attr = build_attr(
+                child_ino,
+                &DtfsAttr {
+                    size: entry.size,
+                    is_directory: entry.is_directory,
+                    created_at: entry.created_at,
+                    modified_at: entry.modified_at,
+                },
+                self.override_perm(&child_path, entry.is_directory),
+            );
             items.push(Ok(DirectoryEntryPlus {
                 inode: child_ino,
                 generation: 0,
@@ -1000,8 +1145,19 @@ impl Filesystem for DtfsFuse3Adapter {
             }));
         }
 
+        // Each entry the kernel actually receives is a lookup reference;
+        // count lazily as fuse3 pulls items so entries it never reads (page
+        // full) are not counted (at most the one item pulled and dropped).
+        let inodes = &self.inodes;
         Ok(ReplyDirectoryPlus {
-            entries: futures_util::stream::iter(items),
+            entries: futures_util::stream::iter(items)
+                .map(move |r| {
+                    if let Ok(e) = &r {
+                        inodes.add_ref(e.inode);
+                    }
+                    r
+                })
+                .boxed(),
         })
     }
 
@@ -1134,7 +1290,7 @@ impl Filesystem for DtfsFuse3Adapter {
         debug!("fuse3:symlink {} -> {}", path, tgt);
         match self.fs.symlink(&path, &tgt).await {
             Ok(()) => {
-                let ino = self.inodes.inode_for(&path);
+                let ino = self.inodes.lookup_ref(&path);
                 Ok(ReplyEntry {
                     ttl: ENTRY_TTL,
                     attr: FileAttr {
@@ -1194,7 +1350,7 @@ impl Filesystem for DtfsFuse3Adapter {
         debug!("fuse3:link {} -> {}", src, dst);
         match self.fs.link(&src, &dst).await {
             Ok(attr) => {
-                let ino = self.inodes.inode_for(&dst);
+                let ino = self.inodes.lookup_ref(&dst);
                 Ok(ReplyEntry {
                     ttl: ENTRY_TTL,
                     attr: self.to_fuse_attr(ino, &attr),
@@ -1541,5 +1697,115 @@ mod posix_lock_range_tests {
         let mut v = vec![lk(1, 0, 9)];
         carve_owner_range(&mut v, 1, 10, 20);
         assert_eq!((v[0].start, v[0].end), (0, 9));
+    }
+}
+
+#[cfg(test)]
+mod forget_and_snapshot_tests {
+    use super::*;
+    use crate::filesystem::DirEntry;
+
+    fn de(name: &str, dir: bool) -> DirEntry {
+        DirEntry {
+            name: name.to_string(),
+            size: 10,
+            is_directory: dir,
+            created_at: SystemTime::UNIX_EPOCH,
+            modified_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn forget_drops_mapping_only_when_count_reaches_zero() {
+        let m = InodeMap::new();
+        let a = m.lookup_ref("/a");
+        assert_eq!(m.lookup_ref("/a"), a);
+        assert_eq!(m.forget(a, 1), None, "one lookup still outstanding");
+        assert_eq!(m.path_for(a).unwrap(), "/a");
+        assert_eq!(m.forget(a, 1), Some("/a".to_string()));
+        assert!(m.path_for(a).is_err());
+        assert!(!m.path_to_inode.contains_key("/a"));
+        assert!(m.refs.is_empty());
+    }
+
+    #[test]
+    fn forget_more_than_count_saturates_and_unknown_inode_is_noop() {
+        let m = InodeMap::new();
+        let a = m.lookup_ref("/a");
+        assert_eq!(m.forget(a, 99), Some("/a".to_string()));
+        assert_eq!(m.forget(a, 1), None, "second forget is a no-op");
+        assert_eq!(m.forget(12345, 1), None);
+    }
+
+    #[test]
+    fn root_is_never_forgotten() {
+        let m = InodeMap::new();
+        assert_eq!(m.forget(FUSE_ROOT_ID, 1), None);
+        assert_eq!(m.forget_quiet(FUSE_ROOT_ID, Duration::ZERO), None);
+        assert_eq!(m.path_for(FUSE_ROOT_ID).unwrap(), "/");
+    }
+
+    #[test]
+    fn forgetting_an_unlinked_inode_keeps_the_recreated_path() {
+        let m = InodeMap::new();
+        let old = m.lookup_ref("/f");
+        m.remove("/f"); // unlink
+        let new = m.lookup_ref("/f"); // recreate: new inode
+        assert_ne!(old, new);
+        m.forget(old, 1);
+        assert_eq!(m.inode_for("/f"), new, "new file keeps its mapping");
+        assert_eq!(m.path_for(new).unwrap(), "/f");
+    }
+
+    #[test]
+    fn batch_forget_spares_recently_looked_up_inodes() {
+        let m = InodeMap::new();
+        let a = m.lookup_ref("/a");
+        assert_eq!(m.forget_quiet(a, Duration::from_secs(3600)), None);
+        assert_eq!(m.path_for(a).unwrap(), "/a");
+        assert_eq!(m.forget_quiet(a, Duration::ZERO), Some("/a".to_string()));
+        assert!(m.path_for(a).is_err());
+    }
+
+    #[test]
+    fn snapshot_pages_survive_a_concurrent_delete() {
+        let snaps = DirSnapshots::new();
+        let fh = snaps.open(vec![de("a", false), de("b", false), de("c", false)]);
+        let snap = snaps.get(fh).unwrap();
+        // First page ended after "a" (cookie 1); "a" is deleted meanwhile.
+        let names: Vec<_> = snapshot_page(&snap, 1).map(|(_, e)| e.name.clone()).collect();
+        assert_eq!(names, vec!["b", "c"], "b must not be skipped");
+        // A live re-list ([b, c]) paged from cookie 1 would have lost "b":
+        let live = vec![de("b", false), de("c", false)];
+        let live_names: Vec<_> = snapshot_page(&live, 1).map(|(_, e)| e.name.clone()).collect();
+        assert_eq!(live_names, vec!["c"]);
+        snaps.close(fh);
+        assert!(snaps.get(fh).is_none());
+        assert!(snaps.get(0).is_none(), "fh 0 means no snapshot");
+    }
+
+    #[test]
+    fn snapshot_dedups_names_and_numbers_cookies_from_one() {
+        let snaps = DirSnapshots::new();
+        let fh = snaps.open(vec![de("a", false), de("a", true), de("b", false)]);
+        let snap = snaps.get(fh).unwrap();
+        let page: Vec<_> = snapshot_page(&snap, 0).map(|(c, e)| (c, e.name.clone())).collect();
+        assert_eq!(page, vec![(1, "a".to_string()), (2, "b".to_string())]);
+        assert_eq!(snapshot_page(&snap, 2).count(), 0);
+    }
+
+    #[test]
+    fn readdirplus_attr_matches_getattr_rules() {
+        let a = DtfsAttr {
+            size: 0,
+            is_directory: true,
+            created_at: SystemTime::UNIX_EPOCH,
+            modified_at: SystemTime::UNIX_EPOCH,
+        };
+        let d = build_attr(5, &a, 0o700);
+        assert_eq!(d.nlink, 2, "directories report nlink 2");
+        assert_eq!(d.perm, 0o700, "chmod override is honoured");
+        let f = build_attr(6, &DtfsAttr { is_directory: false, ..a }, 0o600);
+        assert_eq!((f.nlink, f.perm), (1, 0o600));
     }
 }
