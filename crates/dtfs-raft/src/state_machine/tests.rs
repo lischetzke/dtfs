@@ -1623,7 +1623,50 @@ mod posix_path_regression {
         }
     }
 
-    /// The shared guard reports the anchor strand for a dead anchor row whose
+    /// Losing the last row of a chunk index moves the whole file to
+    /// `/.dtfs-lost/<path>` (surviving rows kept), audits the lost indices,
+    /// and leaves other files alone; a taken target gets a numeric suffix.
+    #[test]
+    fn remove_dead_node_replica_last_row_moves_file_to_lost() {
+        use dtfs_common::types::{DiskTier, HealthStatus};
+        let mut sm = sm_with_chunk("/a/x", 0, "h", &[(10, "leli", DiskTier::Cold)]);
+        let mut c1 = sm.files["/a/x"].chunks[0].clone();
+        c1.chunk_index = 1;
+        c1.node_id = "11".into();
+        sm.files.get_mut("/a/x").unwrap().chunks.push(c1);
+        let other = sm.files["/a/x"].clone();
+        sm.files.insert("/other".into(), FileMetadata { path: "/other".into(), ..other });
+        sm.nodes.insert(11, sm.nodes[&10].clone());
+        sm.nodes.get_mut(&10).unwrap().health = HealthStatus::Down;
+        let req = |p: &str| ClientRequest::RemoveDeadNodeReplica {
+            path: p.into(), chunk_index: 0, node_id: "10".into(), disk_id: 0, now_ms: 5,
+        };
+        // Occupy the first target so the suffix path is exercised.
+        sm.files.insert("/.dtfs-lost/a/x".into(), FileMetadata { path: "/.dtfs-lost/a/x".into(), ..sm.files["/other"].clone() });
+        assert!(matches!(apply_request(&mut sm, &mk_log_id(1), &req("/a/x")), ClientResponse::Success));
+        assert!(!sm.files.contains_key("/a/x"));
+        let moved = &sm.files["/.dtfs-lost/a/x.1"];
+        assert_eq!(moved.path, "/.dtfs-lost/a/x.1");
+        assert_eq!(moved.chunks.len(), 1, "surviving chunk row kept");
+        assert_eq!(moved.chunks[0].chunk_index, 1);
+        assert_eq!(moved.updated_at_ms, 5);
+        assert_eq!(sm.files["/other"].chunks.len(), 2, "other file untouched");
+        let a = sm.audit_log.back().unwrap();
+        assert_eq!(a.action, "file.moved_to_lost");
+        assert!(a.target.contains("/a/x") && a.target.contains("/.dtfs-lost/a/x.1"), "{}", a.target);
+        assert!(format!("{a:?}").contains("[0]"), "lost indices audited");
+
+        // A file already under /.dtfs-lost/ is not moved again.
+        sm.nodes.get_mut(&11).unwrap().health = HealthStatus::Down;
+        let again = ClientRequest::RemoveDeadNodeReplica {
+            path: "/.dtfs-lost/a/x.1".into(), chunk_index: 1, node_id: "11".into(), disk_id: 0, now_ms: 6,
+        };
+        assert!(matches!(apply_request(&mut sm, &mk_log_id(2), &again), ClientResponse::Success));
+        assert!(sm.files.contains_key("/.dtfs-lost/a/x.1"), "stays in place");
+        assert!(sm.files["/.dtfs-lost/a/x.1"].chunks.is_empty());
+    }
+
+    /// The guard reports the anchor strand for a dead anchor row whose
     /// only live survivor is a non-anchor copy (planner: "anchor pending").
     #[test]
     fn remove_check_dead_anchor_row_is_refused_until_another_anchor_copy_exists() {

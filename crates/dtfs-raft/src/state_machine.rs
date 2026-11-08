@@ -2336,9 +2336,47 @@ fn apply_request(
                     format!("RemoveDeadNodeReplica: {path}#{chunk_index} node={node_id} disk={disk_id}"),
                 ),
             );
+            // A missing chunk index reads as a hole (zeros) in FUSE, so a
+            // file that lost the last row of an index is quarantined under
+            // /.dtfs-lost/ (surviving rows kept) instead of serving zeros.
+            // Already-lost files stay put (no nested /.dtfs-lost/.dtfs-lost/...).
+            if !path.starts_with("/.dtfs-lost/")
+                && !sm.files[path].chunks.iter().any(|c| c.chunk_index == *chunk_index)
+            {
+                let mut target = format!("/.dtfs-lost{path}");
+                let mut n = 0u32;
+                while sm.files.contains_key(&target) {
+                    n += 1;
+                    target = format!("/.dtfs-lost{path}.{n}");
+                }
+                let mut f = sm.files.remove(path).expect("checked above");
+                let mut lost = lost_chunk_indices(&f);
+                if !lost.contains(chunk_index) {
+                    lost.push(*chunk_index);
+                    lost.sort_unstable();
+                }
+                f.path = target.clone();
+                sm.files.insert(target.clone(), f);
+                tracing::warn!(%path, %target, ?lost, "file with lost chunk(s) moved to /.dtfs-lost");
+                push_audit_capped(
+                    &mut sm.audit_log,
+                    audit_structured(
+                        "file.moved_to_lost",
+                        format!("{path} -> {target}"),
+                        "data_loss_accepted".to_string(),
+                        format!("RemoveDeadNodeReplica: lost chunk indices {lost:?}"),
+                    ),
+                );
+            }
             ClientResponse::Success
         }
     }
+}
+
+/// Chunk indices in `0..=max` that have no row (the holes after a loss).
+fn lost_chunk_indices(f: &FileMetadata) -> Vec<u64> {
+    let max = f.chunks.iter().map(|c| c.chunk_index).max().unwrap_or(0);
+    (0..=max).filter(|i| !f.chunks.iter().any(|c| c.chunk_index == *i)).collect()
 }
 
 /// Bug AV — apply path for `SetChunkCooldown`. Factored out for testing.

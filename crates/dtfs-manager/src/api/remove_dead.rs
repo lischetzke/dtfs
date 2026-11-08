@@ -212,6 +212,28 @@ pub(super) async fn remove_dead_node_endpoint(
                 }
             }
         }
+        // A file that lost a chunk index was moved to /.dtfs-lost/, so its other
+        // dead rows (planned under the old path) are still there: sweep them.
+        let rest = {
+            let sm = state.sm_data.read().await;
+            plan_remove_dead(&sm, nid, crate::metadata::stamp_now_ms(), down_ms).map(|p| p.data_loss)
+        };
+        for r in rest.unwrap_or_default().iter().filter(|r| r.path.starts_with("/.dtfs-lost/")) {
+            let req = ClientRequest::RemoveDeadNodeReplica {
+                path: r.path.clone(),
+                chunk_index: r.chunk_index,
+                node_id: nid_str.clone(),
+                disk_id: r.disk_id,
+                now_ms: crate::metadata::stamp_now_ms(),
+            };
+            match propose(&state, req).await {
+                Ok(()) => loss_removed += 1,
+                Err(e) => {
+                    warn!(row = %r.label(), error = %e, "remove-dead: data-loss removal refused");
+                    failed += 1;
+                }
+            }
+        }
     }
 
     let remaining = {

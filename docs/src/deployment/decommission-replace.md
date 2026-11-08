@@ -173,7 +173,12 @@ REST: `POST /api/v1/nodes/{id}/remove-dead`. For every row on the node:
   then re-run the command.
 - no other live replica: the chunk is lost. It is listed as a
   `data_loss_candidate` and removed only with `--accept-data-loss`
-  (`RemoveDeadNodeReplica`, one audit row per chunk).
+  (`RemoveDeadNodeReplica`, one audit row per chunk). A file that loses the
+  last row of a chunk index this way is moved whole to
+  `/.dtfs-lost/<original path>` (a numeric suffix is added if that path is
+  taken) with its surviving chunks kept, and a `file.moved_to_lost` audit row
+  names both paths and the lost chunk indices. Exclude `/.dtfs-lost/` from the
+  Plex library scan; restore the file from backup or delete it.
 
 When no rows remain the node is deregistered. The command is idempotent; re-run
 until `anchor_pending` is 0. Without `--accept-data-loss` a node that holds

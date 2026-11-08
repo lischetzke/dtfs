@@ -212,7 +212,8 @@ For a node that is permanently dead and cannot be drained, use
 `dtfs-cli nodes remove-dead <node-id> [--dry-run] [--accept-data-loss]`
 instead (node must be Down/Failed past the Down threshold). It drops rows that
 have another live replica, leaves anchor-pending rows for repair, and removes
-rows with no live replica only with `--accept-data-loss`; see
+rows with no live replica only with `--accept-data-loss` (damaged files move to
+`/.dtfs-lost/`, which Plex should not scan; restore from backup or delete); see
 [Decommission and Replace](../deployment/decommission-replace.md#a-node-that-is-permanently-dead).
 
 Details and the disk and manager variants: [Decommission and Replace](../deployment/decommission-replace.md).
