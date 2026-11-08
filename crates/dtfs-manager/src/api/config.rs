@@ -49,8 +49,8 @@ pub(super) async fn get_config(State(state): State<Arc<AppState>>) -> Json<Value
 pub(super) struct ConfigUpdateRequest {
     pub(super) config_json: String,
     /// AZ-5 — when true, also persist the merged config back to
-    /// `/etc/dtfs/manager.toml` (this manager only). No daemon reloads the
-    /// stored cluster config live; it takes effect after restart.
+    /// `/etc/dtfs/manager.toml` (this manager only). No daemon reads the
+    /// stored Raft override; only the TOML, at the next restart.
     #[serde(default)]
     pub(super) write_to_disk: bool,
     /// Bug BD-3 — operator must explicitly acknowledge any write
@@ -314,7 +314,7 @@ pub(super) async fn update_config(
     Ok(Json(json!({
         "version": version,
         "status": "stored",
-        "note": "stored cluster-wide in Raft; takes effect on each daemon after restart (write_to_disk updates this manager's TOML only)",
+        "note": "stored cluster-wide in Raft as a record; daemons do not read it. Only write_to_disk changes behaviour: it rewrites this manager's TOML, effective after its restart",
         "write_to_disk": wrote_to_disk,
     })))
 }
