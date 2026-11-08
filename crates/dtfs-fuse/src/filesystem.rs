@@ -550,6 +550,20 @@ impl CommitTracker {
     }
 }
 
+/// Snapshot to store on a new handle / in the cache from an unguarded-path
+/// fetch: only when no commit overlapped it (`FetchToken::may_install`),
+/// else `None` (stale; the handle re-fetches through the guarded path).
+fn gated_snapshot(snapshot: Arc<FileLocations>, may_install: bool) -> Option<Arc<FileLocations>> {
+    may_install.then_some(snapshot)
+}
+
+/// read(): a missing chunk entry below the snapshot's size may be a chunk
+/// the snapshot missed (not a hole). Re-fetch once before serving zeros,
+/// unless this snapshot already came from such a re-fetch (`confirmed`).
+fn gap_needs_refetch(missing: bool, idx: u64, total_size: u64, chunk_size: u64, confirmed: bool) -> bool {
+    missing && !confirmed && chunk_size > 0 && idx.saturating_mul(chunk_size) < total_size
+}
+
 impl CommitToken<'_> {
     /// True iff this was the only commit on the path for its whole window.
     fn exclusive(&self) -> bool {
@@ -639,6 +653,9 @@ struct OpenFile {
     /// consumption on this handle rather than one kernel call's (~128 KB)
     /// length.
     bytes_read_on_fh: u64,
+    /// The snapshot read() last re-fetched to check a gap below EOF: its
+    /// missing entries are confirmed holes (until the snapshot changes).
+    holes_confirmed: Option<Weak<FileLocations>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -853,6 +870,7 @@ impl DtfsFilesystem {
         }
 
         // Fetch from the manager.
+        let fetch = self.commit_tracker.begin_fetch(path);
         let locations = self.fetch_file_locations(path).await?;
         let mut attr = file_attr_from_locations(&locations);
         if let Some(buffered_eof) = self.write_buffer.logical_size(path) {
@@ -860,7 +878,9 @@ impl DtfsFilesystem {
                 attr.size = buffered_eof;
             }
         }
-        self.cache_metadata(path, Arc::new(locations));
+        if let Some(l) = gated_snapshot(Arc::new(locations), fetch.may_install()) {
+            self.cache_metadata(path, l);
+        }
         Ok(attr)
     }
 
@@ -909,6 +929,7 @@ impl DtfsFilesystem {
         append: bool,
     ) -> Result<u64> {
         // Fetch (or refresh) file locations from the manager.
+        let fetch = self.commit_tracker.begin_fetch(path);
         let locations = self.fetch_file_locations(path).await?;
         let chunk_size = self.resolve_chunk_size(&locations);
 
@@ -1016,11 +1037,17 @@ impl DtfsFilesystem {
                 committed_any: committed_any_on_open(false),
                 last_read_chunk: None,
                 bytes_read_on_fh: 0,
+                holes_confirmed: None,
             },
         );
 
-        // Cache metadata.
-        self.cache_metadata(path, locations);
+        // Checked after the insert: a commit starting later sees this handle
+        // in its merge loop; one that overlapped the fetch changed the
+        // generation, so the snapshot may miss its chunk (lazy refetch).
+        match gated_snapshot(locations, fetch.may_install()) {
+            Some(l) => self.cache_metadata(path, l),
+            None => self.invalidate_fh_locations(fh),
+        }
 
         debug!(path, fh, append, "file opened");
         Ok(fh)
@@ -1098,6 +1125,34 @@ impl DtfsFilesystem {
         // consumed there, and `read_candidates` sorts per chunk, so building
         // it for every chunk of the file on every 128 KB read would be pure
         // waste on the (common) cache-hit path.
+        // Safety net: an entry missing below the snapshot's size may be a
+        // chunk the snapshot missed rather than a hole. One guarded re-fetch
+        // per snapshot before serving zeros; its own gaps are confirmed holes.
+        let confirmed = self.open_files.get(&fh).is_some_and(|f| {
+            f.holes_confirmed
+                .as_ref()
+                .is_some_and(|w| w.ptr_eq(&Arc::downgrade(&locations)))
+        });
+        let gap = (start_chunk..end_chunk).any(|i| {
+            gap_needs_refetch(
+                locations.chunk_at(i as u64).is_none(),
+                i as u64,
+                locations.total_size,
+                chunk_size,
+                confirmed,
+            )
+        });
+        let locations = if gap {
+            debug!(path = %file_path, "chunk entry missing below EOF; re-fetching before serving zeros");
+            let fresh = self.refetch_locations(&file_path).await?;
+            if let Some(mut f) = self.open_files.get_mut(&fh) {
+                f.holes_confirmed = Some(Arc::downgrade(&fresh));
+            }
+            fresh
+        } else {
+            locations
+        };
+
         let total_chunks = locations.chunk_count() as u32;
 
         for chunk_idx in start_chunk..end_chunk {
@@ -1973,6 +2028,7 @@ impl DtfsFilesystem {
 
         // The manager keeps a populated file another client just created and
         // filled: seed from its real snapshot so a partial write RMWs it.
+        let fetch = self.commit_tracker.begin_fetch(path);
         let fetched = self.fetch_file_locations(path).await.ok().filter(|l| !l.chunks.is_empty());
         let committed_any = fetched
             .as_ref()
@@ -2006,8 +2062,14 @@ impl DtfsFilesystem {
                 committed_any,
                 last_read_chunk: None,
                 bytes_read_on_fh: 0,
+                holes_confirmed: None,
             },
         );
+        // Checked after the insert: a later commit sees this handle in its
+        // merge loop; an earlier one changed the generation.
+        if !fetch.may_install() {
+            self.invalidate_fh_locations(fh);
+        }
 
         Ok(fh)
     }
@@ -2269,9 +2331,12 @@ impl DtfsFilesystem {
     pub async fn link(&self, src: &str, dst: &str) -> Result<FileAttr> {
         self.client.link_file(src, dst).await
             .with_context(|| format!("link {src} -> {dst}"))?;
+        let fetch = self.commit_tracker.begin_fetch(dst);
         let locs = self.fetch_file_locations(dst).await?;
         let attr = file_attr_from_locations(&locs);
-        self.cache_metadata(dst, Arc::new(locs));
+        if let Some(l) = gated_snapshot(Arc::new(locs), fetch.may_install()) {
+            self.cache_metadata(dst, l);
+        }
         Ok(attr)
     }
 
@@ -2941,6 +3006,13 @@ impl DtfsFilesystem {
         // no commit overlapped.
         debug!(path, "post-commit merge not applicable; marking handle locations stale");
         self.invalidate_handle_locations(path);
+    }
+
+    /// Mark one handle stale (`locations = None`).
+    fn invalidate_fh_locations(&self, fh: u64) {
+        if let Some(mut f) = self.open_files.get_mut(&fh) {
+            f.locations = None;
+        }
     }
 
     /// Mark every handle of `path` stale (`locations = None`); the next
@@ -4680,6 +4752,46 @@ mod commit_tracker_tests {
         let fetch = t.begin_fetch("/f");
         drop(t.begin("/f")); // truncate_inner's slot around set_file_size
         assert!(!fetch.may_install());
+    }
+
+    /// open() vs a local commit: open's fetch ran before a commit applied
+    /// (commit started and ended during the fetch, before the handle was
+    /// inserted). The snapshot must not be stored on the handle or cached.
+    #[test]
+    fn open_snapshot_fetched_before_commit_is_not_installed() {
+        use super::{gated_snapshot, FileLocations};
+        use std::sync::Arc;
+        let t = CommitTracker::default();
+        let snap = |p: &str| Arc::new(FileLocations {
+            path: p.to_string(),
+            total_size: 0,
+            chunks: Vec::new(),
+            volume_id: "default".to_string(),
+            chunk_size: 4,
+            created_at_ms: 0,
+            modified_at_ms: 0,
+            is_directory: false,
+            is_symlink: false,
+        });
+        let fetch = t.begin_fetch("/f");
+        drop(t.begin("/f")); // writer's commit lands, merge loop runs
+        assert!(gated_snapshot(snap("/f"), fetch.may_install()).is_none());
+        drop(fetch);
+        let fetch = t.begin_fetch("/f");
+        assert!(gated_snapshot(snap("/f"), fetch.may_install()).is_some(), "quiet open installs");
+    }
+
+    /// read(): a missing entry below EOF triggers one re-fetch; a missing
+    /// entry at/after EOF, a present entry, or a snapshot that already came
+    /// from such a re-fetch serve zeros directly.
+    #[test]
+    fn read_gap_below_size_refetches_before_zeros() {
+        use super::gap_needs_refetch;
+        assert!(gap_needs_refetch(true, 2, 12, 4, false), "chunk 2 starts below EOF 12");
+        assert!(!gap_needs_refetch(true, 3, 12, 4, false), "chunk 3 starts at EOF");
+        assert!(!gap_needs_refetch(false, 2, 12, 4, false), "entry present");
+        assert!(!gap_needs_refetch(true, 2, 12, 4, true), "hole already confirmed");
+        assert!(!gap_needs_refetch(true, 0, 12, 0, false), "unknown chunk size");
     }
 
     /// A detached fh (unlink/rename moved it) or a closed fh must not merge

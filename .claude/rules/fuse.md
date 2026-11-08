@@ -69,7 +69,13 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   overlapped it (`FetchToken::may_install`); otherwise it waits for the path
   to go quiet (`wait_quiet`, Notify, no polling) and fetches again, failing
   with EIO after `QUIET_WAIT` (the write-lease length). Never use or install
-  an overlapped fetch. SetFileSize (truncate, set_size) holds a commit slot. Snapshots are
+  an overlapped fetch. SetFileSize (truncate, set_size) holds a commit slot.
+  Every other fetch that stores a snapshot (open, create, getattr and link
+  cache) takes `begin_fetch` first and stores only if `may_install()`
+  (`gated_snapshot`; open/create check after inserting the handle, else
+  `locations = None`). read() re-fetches once per snapshot before serving
+  zeros for a missing entry below EOF (`gap_needs_refetch`,
+  `holes_confirmed`). Snapshots are
   `Arc<FileLocations>` (handles and metadata cache): read()/write() clone
   the Arc, never the chunk list; the merge is copy-on-write (`merge_shared`).
 - `FileLocations.chunks` is sorted by chunk index (`sort_chunks_by_index` at
