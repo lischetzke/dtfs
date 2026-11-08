@@ -3236,4 +3236,39 @@ mod raft_audit_fix_tests {
         assert!(matches!(link(&mut sm, 6, "/new"), ClientResponse::Success));
         assert!(sm.files.contains_key("/new"));
     }
+
+    fn rename(sm: &mut StateMachineData, i: u64, from: &str, to: &str) -> ClientResponse {
+        apply_request(sm, &lid(i),
+            &ClientRequest::RenameFile { from: from.into(), to: to.into(), now_ms: 0 })
+    }
+
+    #[test]
+    fn rename_directory_onto_regular_file_is_refused() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/a/x");
+        create(&mut sm, 2, "/f");
+        assert_eq!(err_msg(rename(&mut sm, 3, "/a", "/f")),
+            "RenameFile: destination '/f' is not a directory");
+        assert!(sm.files.contains_key("/a/x") && sm.files.contains_key("/f"));
+    }
+
+    #[test]
+    fn rename_file_onto_directory_is_refused() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/f");
+        create(&mut sm, 2, "/d/x");
+        assert_eq!(err_msg(rename(&mut sm, 3, "/f", "/d")),
+            "RenameFile: destination '/d' is a directory");
+        assert!(sm.files.contains_key("/f") && sm.files.contains_key("/d/x"));
+    }
+
+    #[test]
+    fn rename_file_over_file_and_self_still_work() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/f");
+        create(&mut sm, 2, "/g");
+        assert!(matches!(rename(&mut sm, 3, "/f", "/f"), ClientResponse::Success));
+        assert!(matches!(rename(&mut sm, 4, "/f", "/g"), ClientResponse::Success));
+        assert!(!sm.files.contains_key("/f") && sm.files.contains_key("/g"));
+    }
 }

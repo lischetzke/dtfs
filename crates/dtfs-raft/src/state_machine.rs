@@ -1614,6 +1614,31 @@ fn apply_request(
                 .take_while(|(k, _)| k.starts_with(&to_prefix))
                 .next()
                 .is_some();
+            // POSIX type conflicts: a directory (marker or children) may not
+            // replace a regular file, and a non-directory may not replace a
+            // directory; otherwise one name ends up as both file and dir.
+            let src_is_dir = sm.files.get(from).is_some_and(|m| m.is_directory)
+                || sm
+                    .files
+                    .range(from_prefix.clone()..)
+                    .next()
+                    .is_some_and(|(k, _)| k.starts_with(&from_prefix));
+            let dst_meta = sm.files.get(to);
+            if src_is_dir && dst_meta.is_some_and(|m| !m.is_directory) {
+                warn!(from = %from, to = %to, "RenameFile refused: directory onto regular file");
+                return ClientResponse::Error {
+                    message: format!("RenameFile: destination '{to}' is not a directory"),
+                };
+            }
+            if !src_is_dir
+                && sm.files.contains_key(from)
+                && (to_has_children || dst_meta.is_some_and(|m| m.is_directory))
+            {
+                warn!(from = %from, to = %to, "RenameFile refused: file onto directory");
+                return ClientResponse::Error {
+                    message: format!("RenameFile: destination '{to}' is a directory"),
+                };
+            }
             if to_has_children {
                 return ClientResponse::Error {
                     message: format!(
