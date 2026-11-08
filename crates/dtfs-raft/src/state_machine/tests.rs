@@ -3566,6 +3566,46 @@ mod raft_audit_fix_tests {
         })
     }
 
+    /// Rows produced by the in-place apply merges survive a snapshot
+    /// round-trip and equal the old (reference) merge output.
+    #[tokio::test]
+    async fn in_place_merge_snapshot_loads_and_equals_reference() {
+        use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut want: Vec<ChunkLocationEntry> = Vec::new();
+        {
+            let mut store = StateMachineStore::open_at(dir.path()).expect("open");
+            {
+                let mut sm = store.data.write().await;
+                create(&mut sm, 1, "/f");
+                apply_request(&mut sm, &lid(2), &ClientRequest::AcquireWriteLease {
+                    path: "/f".into(), owner_id: "w".into(), lease_ms: 60_000, now_ms: 1,
+                    proposed_lease_id: "L".into(),
+                });
+                let steps: Vec<(&str, Vec<ChunkLocationEntry>)> = vec![
+                    ("L", vec![row(3, "c", "2", 0), row(0, "a", "1", 0), row(3, "c", "1", 1)]),
+                    ("L", vec![row(1, "b", "1", 0), row(2, "z", "1", 0)]),
+                    ("", vec![row(0, "a", "3", 0), row(3, "c", "1", 0), row(2, "z", "0", 1)]),
+                    ("L", vec![row(2, "y", "2", 0), row(2, "y", "1", 0)]),
+                    ("", vec![row(1, "b", "1", 0), row(1, "b", "3", 1)]),
+                ];
+                for (i, (lease, rows)) in steps.into_iter().enumerate() {
+                    want = if lease.is_empty() {
+                        union_chunk_location_entries(&want, &rows).0
+                    } else {
+                        merge_chunk_location_entries(&want, &rows)
+                    };
+                    upd(&mut sm, 10 + i as u64, lease, rows);
+                    assert_eq!(sm.files["/f"].chunks, want, "step {i}");
+                }
+            }
+            let mut builder = store.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build");
+        }
+        let restored = StateMachineStore::open_at(dir.path()).expect("reopen");
+        assert_eq!(restored.data.read().await.files["/f"].chunks, want);
+    }
+
     #[test]
     fn union_adds_missing_replica_and_never_removes() {
         let existing = vec![row(0, "h", "1", 0), row(0, "h", "2", 0)];

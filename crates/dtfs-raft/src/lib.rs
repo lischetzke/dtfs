@@ -131,6 +131,10 @@ pub fn legacy_disk_id() -> u32 {
 /// Adding a single replica for a chunk that already has replicas is still
 /// handled correctly because the caller always builds the *full* new set of
 /// replicas at flush time (`flush_segments_to_cluster`).
+///
+/// Test-only reference: apply uses [`merge_chunk_location_entries_in_place`],
+/// which must produce exactly this output for every input.
+#[cfg(test)]
 pub fn merge_chunk_location_entries(
     existing: &[ChunkLocationEntry],
     incoming: &[ChunkLocationEntry],
@@ -162,6 +166,9 @@ pub fn merge_chunk_location_entries(
 /// and no index or hash is ever introduced (an index with no rows may have
 /// been truncated or deleted-and-recreated since the writer read it).
 /// Returns the merged rows and the incoming chunk indices skipped as stale.
+///
+/// Test-only reference for [`union_chunk_location_entries_in_place`].
+#[cfg(test)]
 pub fn union_chunk_location_entries(
     existing: &[ChunkLocationEntry],
     incoming: &[ChunkLocationEntry],
@@ -196,6 +203,85 @@ pub fn union_chunk_location_entries(
             .then_with(|| a.node_id.cmp(&b.node_id))
     });
     (out, skipped)
+}
+
+/// Canonical row order of `FileMetadata.chunks`: (chunk_index, chunk_hash,
+/// node_id); ties keep insertion order (stable).
+fn chunk_row_cmp(a: &ChunkLocationEntry, b: &ChunkLocationEntry) -> std::cmp::Ordering {
+    a.chunk_index
+        .cmp(&b.chunk_index)
+        .then_with(|| a.chunk_hash.cmp(&b.chunk_hash))
+        .then_with(|| a.node_id.cmp(&b.node_id))
+}
+
+/// Stable-sort `rows` into canonical order unless already there. Apply keeps
+/// rows sorted, so this is normally one compare pass with no allocation; the
+/// sort only matters for rows set outside apply (old snapshots, tests) and
+/// makes the result identical to the old filter + extend + sort merge.
+fn ensure_chunk_rows_sorted(rows: &mut [ChunkLocationEntry]) {
+    if !rows.is_sorted_by(|a, b| chunk_row_cmp(a, b) != std::cmp::Ordering::Greater) {
+        rows.sort_by(chunk_row_cmp);
+    }
+}
+
+/// Row range of `chunk_index` in canonically sorted `rows`.
+fn chunk_index_range(rows: &[ChunkLocationEntry], chunk_index: u64) -> std::ops::Range<usize> {
+    let lo = rows.partition_point(|e| e.chunk_index < chunk_index);
+    lo..lo + rows[lo..].partition_point(|e| e.chunk_index == chunk_index)
+}
+
+/// Leased-commit merge (replace semantics, see [`merge_chunk_location_entries`])
+/// done in place: every touched index's rows are spliced out and replaced by
+/// the incoming rows for it; untouched rows are neither cloned nor moved
+/// except by the splice shift. Output is identical to the reference.
+pub fn merge_chunk_location_entries_in_place(
+    rows: &mut Vec<ChunkLocationEntry>,
+    incoming: &[ChunkLocationEntry],
+) {
+    ensure_chunk_rows_sorted(rows);
+    let mut inc: Vec<&ChunkLocationEntry> = incoming.iter().collect();
+    inc.sort_by(|a, b| chunk_row_cmp(a, b));
+    let mut i = 0;
+    while i < inc.len() {
+        let idx = inc[i].chunk_index;
+        let j = i + inc[i..].partition_point(|e| e.chunk_index == idx);
+        let range = chunk_index_range(rows, idx);
+        rows.splice(range, inc[i..j].iter().map(|e| (*e).clone()));
+        i = j;
+    }
+}
+
+/// Lease-less union merge (see [`union_chunk_location_entries`]) done in
+/// place. Returns the incoming chunk indices skipped as stale. Output is
+/// identical to the reference: a union never introduces an (index, hash)
+/// pair, so checking the hash against the growing `rows` equals checking it
+/// against the original rows, and inserting at the upper bound of the equal
+/// key reproduces the stable sort's existing-then-pushed order.
+pub fn union_chunk_location_entries_in_place(
+    rows: &mut Vec<ChunkLocationEntry>,
+    incoming: &[ChunkLocationEntry],
+) -> Vec<u64> {
+    ensure_chunk_rows_sorted(rows);
+    let mut skipped: Vec<u64> = Vec::new();
+    for inc in incoming {
+        let range = chunk_index_range(rows, inc.chunk_index);
+        let group = &rows[range.clone()];
+        if !group.iter().any(|e| e.chunk_hash == inc.chunk_hash) {
+            if !skipped.contains(&inc.chunk_index) {
+                skipped.push(inc.chunk_index);
+            }
+            continue;
+        }
+        let present = group.iter().any(|e| {
+            e.chunk_hash == inc.chunk_hash && e.node_id == inc.node_id && e.disk_id == inc.disk_id
+        });
+        if !present {
+            let pos = range.start
+                + group.partition_point(|e| chunk_row_cmp(e, inc) != std::cmp::Ordering::Greater);
+            rows.insert(pos, inc.clone());
+        }
+    }
+    skipped
 }
 
 /// Node information stored in the Raft state machine (richer than `DtfsNode`).
@@ -1018,5 +1104,70 @@ mod merge_tests {
         let merged = merge_chunk_location_entries(&[a.clone(), b], &[entry(1, "bb2", "http://n1:1", 21)]);
         assert!(merged.contains(&a), "chunk 0 unaffected");
         assert_eq!(merged.iter().filter(|e| e.chunk_index == 1).count(), 1);
+    }
+
+    /// Property: over random sequences of leased and lease-less updates the
+    /// in-place merges produce exactly the reference output (rows, order,
+    /// dedup, tie-breaks, skipped indices) after every step. Some seeds start
+    /// from unsorted rows (set outside apply) to cover the re-sort fallback.
+    #[test]
+    fn in_place_merges_match_reference_over_random_ops() {
+        use super::{
+            merge_chunk_location_entries_in_place, union_chunk_location_entries,
+            union_chunk_location_entries_in_place,
+        };
+        for seed in 1..=200u64 {
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut rnd = move |n: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % n
+            };
+            let mk = |rnd: &mut dyn FnMut(u64) -> u64| ChunkLocationEntry {
+                chunk_index: rnd(6),
+                chunk_hash: format!("h{}", rnd(3)),
+                node_id: format!("n{}", rnd(3)),
+                disk_id: rnd(2) as u32,
+                size_bytes: rnd(3),
+            };
+            let mut rows: Vec<ChunkLocationEntry> = Vec::new();
+            if seed % 4 == 0 {
+                for _ in 0..rnd(8) {
+                    rows.push(mk(&mut rnd));
+                }
+            }
+            for step in 0..60 {
+                let n = rnd(5);
+                let incoming: Vec<ChunkLocationEntry> = if rnd(2) == 0 || rows.is_empty() {
+                    (0..n).map(|_| mk(&mut rnd)).collect()
+                } else {
+                    // Lease-less style: mostly re-register existing (index, hash).
+                    (0..n)
+                        .map(|_| {
+                            let mut e = rows[rnd(rows.len() as u64) as usize].clone();
+                            e.node_id = format!("n{}", rnd(4));
+                            e.disk_id = rnd(2) as u32;
+                            if rnd(5) == 0 {
+                                e.chunk_hash = format!("h{}", rnd(3));
+                            }
+                            e
+                        })
+                        .collect()
+                };
+                let mut got = rows.clone();
+                if rnd(2) == 0 {
+                    let want = merge_chunk_location_entries(&rows, &incoming);
+                    merge_chunk_location_entries_in_place(&mut got, &incoming);
+                    assert_eq!(got, want, "seed {seed} step {step}: leased merge diverged");
+                } else {
+                    let (want, want_skipped) = union_chunk_location_entries(&rows, &incoming);
+                    let skipped = union_chunk_location_entries_in_place(&mut got, &incoming);
+                    assert_eq!(got, want, "seed {seed} step {step}: union merge diverged");
+                    assert_eq!(skipped, want_skipped, "seed {seed} step {step}: skipped diverged");
+                }
+                rows = got;
+            }
+        }
     }
 }
