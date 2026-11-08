@@ -113,3 +113,18 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 - Every fuse op error goes through `cluster_err_to_errno`: ENOENT only
   for a genuine gRPC `NotFound`, EIO for anything transient. Never a bare
   `Err(_) => ENOENT`.
+
+## NFS re-export (knfsd)
+
+- knfsd creates files via FUSE_MKNOD, never FUSE_CREATE: `mknod` is
+  regular-file only (else EPERM, never ENOSYS), EEXIST on an existing name
+  (lookup first), namespace entry only via `create_entry` (no lease, no fh;
+  the follow-up OPEN takes the lease, so the ghost-unlink cannot hit it).
+- `lookup(dir, ".")` / `".."` resolve to the dir / its parent (root's ".."
+  is root) for NFS handle decoding (`dot_lookup_target`).
+- Every entry reply carries `entry_generation(ino)`: one random non-zero
+  u32 per process, 0 for root. Known limit: nodeids restart at 2 per
+  process, so NFS clients get ESTALE after a dtfs-fuse restart and must
+  remount. Other limits: NFSv3 EXCLUSIVE create retransmit gives EEXIST,
+  chown is ignored (daemon uid/gid), repeated open/flush/release during
+  long NFS writes is untested end to end.

@@ -553,7 +553,11 @@ impl Filesystem for DtfsFuse3Adapter {
         parent: u64,
         name: &OsStr,
     ) -> FuseResult<ReplyEntry> {
-        let path = self.child_path(parent, name)?;
+        let path = match dot_lookup_target(&self.inodes.path_for(parent)?, &name.to_string_lossy())
+        {
+            Some(p) => p,
+            None => self.child_path(parent, name)?,
+        };
         debug!("fuse3:lookup {}", path);
         match self.fs.lookup(&path).await {
             Ok(attrs) => {
@@ -561,7 +565,7 @@ impl Filesystem for DtfsFuse3Adapter {
                 Ok(ReplyEntry {
                     ttl: ENTRY_TTL,
                     attr: self.to_fuse_attr(ino, &attrs),
-                    generation: 0,
+                    generation: entry_generation(ino),
                 })
             }
             // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
@@ -925,7 +929,7 @@ impl Filesystem for DtfsFuse3Adapter {
                 Ok(ReplyEntry {
                     ttl: ENTRY_TTL,
                     attr: self.synthetic_attr(ino, true, (mode & 0o777) as u16),
-                    generation: 0,
+                    generation: entry_generation(ino),
                 })
             }
             // CR-1-6 (FUSE-4/CO-4-16): route through cluster_err_to_errno,
@@ -990,6 +994,46 @@ impl Filesystem for DtfsFuse3Adapter {
         }
     }
 
+    /// FUSE_MKNOD: what knfsd's vfs_create sends for an NFS CREATE. Namespace
+    /// entry only; the kernel's follow-up OPEN takes the write lease.
+    async fn mknod(
+        &self,
+        _req: Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _rdev: u32,
+    ) -> FuseResult<ReplyEntry> {
+        let path = self.child_path(parent, name)?;
+        debug!("fuse3:mknod {} (mode={:#o})", path, mode);
+        if let Err(e) = mknod_mode_check(mode) {
+            warn!(path = %path, mode = format!("{:#o}", mode), "fuse3 mknod: only regular files supported");
+            return Err(e);
+        }
+        if let Err(e) = mknod_exists_check(&self.fs.lookup(&path).await) {
+            if e == Errno::from(libc::EEXIST) {
+                debug!(path = %path, "fuse3 mknod: exists");
+            } else {
+                warn!(path = %path, "fuse3 mknod: existence check failed");
+            }
+            return Err(e);
+        }
+        match self.fs.create_entry(&path).await {
+            Ok(_) => {
+                let ino = self.inodes.lookup_ref(&path);
+                Ok(ReplyEntry {
+                    ttl: ENTRY_TTL,
+                    attr: self.synthetic_attr(ino, false, (mode & 0o777) as u16),
+                    generation: entry_generation(ino),
+                })
+            }
+            Err(e) => {
+                warn!(path = %path, error = %format!("{:#}", e), "fuse3 mknod failed");
+                Err(cluster_err_to_errno(&e))
+            }
+        }
+    }
+
     async fn create(
         &self,
         _req: Request,
@@ -1015,7 +1059,7 @@ impl Filesystem for DtfsFuse3Adapter {
                 Ok(ReplyCreated {
                     ttl: ENTRY_TTL,
                     attr,
-                    generation: 0,
+                    generation: entry_generation(ino),
                     fh,
                     flags: 0,
                 })
@@ -1174,7 +1218,7 @@ impl Filesystem for DtfsFuse3Adapter {
             );
             items.push((Ok(DirectoryEntryPlus {
                 inode: child_ino,
-                generation: 0,
+                generation: entry_generation(child_ino),
                 kind,
                 name: entry.name.clone().into(),
                 offset: entry_offset as i64,
@@ -1357,7 +1401,7 @@ impl Filesystem for DtfsFuse3Adapter {
                         rdev: 0,
                         blksize: 4096,
                     },
-                    generation: 0,
+                    generation: entry_generation(ino),
                 })
             }
             // CR-1-6 (FUSE-4/CO-4-16): route through cluster_err_to_errno.
@@ -1403,7 +1447,7 @@ impl Filesystem for DtfsFuse3Adapter {
                 Ok(ReplyEntry {
                     ttl: ENTRY_TTL,
                     attr: self.to_fuse_attr(ino, &attr),
-                    generation: 0,
+                    generation: entry_generation(ino),
                 })
             }
             // CR-1-6 (FUSE-4/CO-4-16): route through cluster_err_to_errno.
@@ -1476,6 +1520,61 @@ fn parent_of(path: &str) -> String {
     match path.rfind('/') {
         Some(0) | None => "/".to_string(),
         Some(idx) => path[..idx].to_string(),
+    }
+}
+
+/// One random non-zero generation per process. Nodeids restart at 2 on every
+/// dtfs-fuse start, so an NFS handle (nodeid, generation) minted by a previous
+/// process must not match a different file in this one.
+fn process_generation() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static GEN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *GEN.get_or_init(|| {
+        let g = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish() as u32;
+        u64::from(g.max(1))
+    })
+}
+
+/// Generation for a `ReplyEntry`: 0 for root (the kernel forces it), else
+/// the per-process value.
+fn entry_generation(ino: u64) -> u64 {
+    if ino == FUSE_ROOT_ID {
+        0
+    } else {
+        process_generation()
+    }
+}
+
+/// FUSE_MKNOD supports regular files only (what knfsd's vfs_create sends).
+fn mknod_mode_check(mode: u32) -> Result<(), Errno> {
+    if mode & libc::S_IFMT as u32 == libc::S_IFREG as u32 {
+        Ok(())
+    } else {
+        Err(Errno::from(libc::EPERM))
+    }
+}
+
+/// mknod(excl): an existing entry is EEXIST, a genuine NotFound proceeds,
+/// anything else maps through `cluster_err_to_errno`.
+fn mknod_exists_check(existing: &anyhow::Result<DtfsAttr>) -> Result<(), Errno> {
+    match existing {
+        Ok(_) => Err(Errno::from(libc::EEXIST)),
+        Err(e) => match cluster_err_to_errno(e) {
+            n if n == Errno::from(libc::ENOENT) => Ok(()),
+            n => Err(n),
+        },
+    }
+}
+
+/// Target path of LOOKUP(parent, "." | "..") (NFS handle decoding via
+/// FUSE_EXPORT_SUPPORT); `None` for an ordinary name. Root's ".." is root.
+fn dot_lookup_target(parent_path: &str, name: &str) -> Option<String> {
+    match name {
+        "." => Some(parent_path.to_string()),
+        ".." => Some(parent_of(parent_path)),
+        _ => None,
     }
 }
 
@@ -1976,5 +2075,66 @@ mod w3_readdirplus_ref_tests {
         m.add_ref_at(ino, "/a");
         assert_eq!(m.path_for(ino).unwrap(), "/a");
         assert_eq!(m.forget(ino, 1), Some("/a".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod nfs_export_tests {
+    use super::*;
+
+    fn attr() -> DtfsAttr {
+        DtfsAttr {
+            size: 0,
+            is_directory: false,
+            is_symlink: false,
+            created_at: SystemTime::now(),
+            modified_at: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn mknod_accepts_regular_file_only() {
+        assert!(mknod_mode_check(libc::S_IFREG as u32 | 0o644).is_ok());
+        for t in [libc::S_IFIFO, libc::S_IFCHR, libc::S_IFBLK, libc::S_IFSOCK] {
+            assert_eq!(
+                mknod_mode_check(t as u32 | 0o644),
+                Err(Errno::from(libc::EPERM))
+            );
+        }
+    }
+
+    #[test]
+    fn mknod_existing_is_eexist_notfound_proceeds_else_mapped() {
+        assert_eq!(
+            mknod_exists_check(&Ok(attr())),
+            Err(Errno::from(libc::EEXIST))
+        );
+        let nf = anyhow::Error::new(tonic::Status::not_found("x"));
+        assert_eq!(mknod_exists_check(&Err(nf)), Ok(()));
+        let down = anyhow::Error::new(tonic::Status::unavailable("x"));
+        assert_eq!(
+            mknod_exists_check(&Err(down)),
+            Err(Errno::from(libc::EIO))
+        );
+    }
+
+    #[test]
+    fn dot_lookup_resolves_self_and_parent() {
+        assert_eq!(dot_lookup_target("/a/b", ".").as_deref(), Some("/a/b"));
+        assert_eq!(dot_lookup_target("/a/b", "..").as_deref(), Some("/a"));
+        assert_eq!(dot_lookup_target("/a", "..").as_deref(), Some("/"));
+        assert_eq!(dot_lookup_target("/", "..").as_deref(), Some("/"));
+        assert_eq!(dot_lookup_target("/", ".").as_deref(), Some("/"));
+        assert_eq!(dot_lookup_target("/a", "x"), None);
+        assert_eq!(dot_lookup_target("/a", "..x"), None);
+    }
+
+    #[test]
+    fn generation_is_stable_nonzero_and_zero_for_root() {
+        let g = process_generation();
+        assert!(g != 0 && g <= u64::from(u32::MAX));
+        assert_eq!(entry_generation(2), g);
+        assert_eq!(entry_generation(99), g);
+        assert_eq!(entry_generation(FUSE_ROOT_ID), 0);
     }
 }

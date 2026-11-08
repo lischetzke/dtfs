@@ -1717,6 +1717,21 @@ impl DtfsFilesystem {
     /// Create a new file in the DTFS namespace and return a file handle.
     #[instrument(skip(self), fields(path = %path))]
     pub async fn create(&self, path: &str, _mode: u32) -> Result<u64> {
+        let response = self.create_entry(path).await?;
+
+        // Open the newly created file for read-write. P0-1: acquire the
+        // single-writer lease so a second create() against the same path
+        // (race between two clients) returns EBUSY.
+        self.open_created(path, response).await
+    }
+
+    /// Namespace half of `create`: the manager entry only, no lease and no
+    /// fh. Shared with FUSE_MKNOD (NFS re-export), whose follow-up OPEN takes
+    /// the lease like any writable open.
+    pub async fn create_entry(
+        &self,
+        path: &str,
+    ) -> Result<dtfs_proto::dtfs::manager::CreateFileResponse> {
         let response = self
             .client
             .create_file(path, None)
@@ -1733,10 +1748,14 @@ impl DtfsFilesystem {
             volume_id = %response.volume_id,
             "file created"
         );
+        Ok(response)
+    }
 
-        // Open the newly created file for read-write. P0-1: acquire the
-        // single-writer lease so a second create() against the same path
-        // (race between two clients) returns EBUSY.
+    async fn open_created(
+        &self,
+        path: &str,
+        response: dtfs_proto::dtfs::manager::CreateFileResponse,
+    ) -> Result<u64> {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         // Bug X — owner_id carries DC as a 4th field for the topology view.
         let owner_id = if self.client_location.datacenter.is_empty() {

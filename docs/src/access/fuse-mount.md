@@ -85,3 +85,12 @@ An optional `[memory]` block caps the client. At Warn the read-ahead cache budge
 ## Monitoring
 
 The client has no Prometheus endpoint. It registers itself with the managers (appears in the node table when `client.shared_secret` is set) and logs operations at `RUST_LOG` level. Cluster-side views are in [Monitoring](../operations/monitoring.md).
+
+## NFS re-export
+
+A DTFS mount can be re-exported with the Linux kernel NFS server (`exportfs`, use an explicit `fsid=`). Create, read, write, rename and delete work. Known limits:
+
+- After a `dtfs-fuse` restart, NFS clients get `ESTALE` and must remount (inode numbers are not stable across restarts).
+- An NFSv3 EXCLUSIVE create that is retransmitted returns `EEXIST` (create verifiers are not stored).
+- Ownership is the daemon's uid/gid; `chown` is ignored.
+- The kernel NFS server may open, flush and release a file repeatedly during a long write; this has not been tested end to end.
