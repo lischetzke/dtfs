@@ -112,15 +112,15 @@ pub struct FileMetadata {
 impl FileMetadata {
     /// A regular file whose committed data is gone: no chunk rows left
     /// although data was committed. Legacy entries (`ever_committed` None)
-    /// count only when their logical size is > 0. Single source for every
-    /// `files_missing_chunks` count.
+    /// count unless their logical size is explicitly 0, so real loss is
+    /// never hidden. Single source for every `files_missing_chunks` count.
     pub fn committed_data_missing(&self) -> bool {
         !self.is_directory
             && self.symlink_target.is_none()
             && self.chunks.is_empty()
             && match self.ever_committed {
                 Some(ever) => ever,
-                None => self.logical_size.unwrap_or(0) > 0,
+                None => self.logical_size != Some(0),
             }
     }
 }

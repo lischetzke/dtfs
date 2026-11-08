@@ -532,10 +532,11 @@ mod bug_bp_tests {
         // Empty and never-written sparse files legitimately have no chunks.
         sm.files.insert("/empty".into(), with(mk("/empty", 0, false, None), Some(0), Some(false)));
         sm.files.insert("/sparse".into(), with(mk("/sparse", 0, false, None), Some(10 << 20), Some(false)));
-        // Legacy entries (marker unknown): only a size > 0 counts.
-        sm.files.insert("/old0".into(), with(mk("/old0", 0, false, None), None, None));
+        // Legacy entries (marker unknown): only an explicit size 0 is excluded.
+        sm.files.insert("/old0".into(), with(mk("/old0", 0, false, None), Some(0), None));
+        sm.files.insert("/oldn".into(), with(mk("/oldn", 0, false, None), None, None));
         sm.files.insert("/old1".into(), with(mk("/old1", 0, false, None), Some(1), None));
-        assert_eq!(count_files_missing_chunks(&sm), 2, "only /lost.bin and /old1 count");
+        assert_eq!(count_files_missing_chunks(&sm), 3, "/lost.bin, /oldn and /old1 count");
     }
 
     // ── BP-5 — tape replication normalization ───────────────────────

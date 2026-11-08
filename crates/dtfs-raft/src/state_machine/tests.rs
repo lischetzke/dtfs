@@ -3987,14 +3987,14 @@ mod ever_committed_tests {
     }
 
     #[test]
-    fn legacy_entry_counts_only_with_logical_size() {
+    fn legacy_entry_excluded_only_with_explicit_zero_size() {
         let mut f = FileMetadata {
             path: "/l".into(), volume_id: "default".into(), chunk_size: MIB, chunks: vec![],
             created_at_ms: 0, updated_at_ms: 0, symlink_target: None, logical_size: None,
             is_directory: false, cache_cooldown_until_ms: Default::default(),
             ever_committed: None,
         };
-        assert!(!f.committed_data_missing(), "legacy, size unknown -> 0");
+        assert!(f.committed_data_missing(), "legacy, size unset: may be real loss");
         f.logical_size = Some(0);
         assert!(!f.committed_data_missing(), "legacy, size 0");
         f.logical_size = Some(1);
