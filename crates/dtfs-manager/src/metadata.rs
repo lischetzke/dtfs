@@ -1092,6 +1092,7 @@ fn clamp_ack_floor_to_capacity(
     floor: u32,
     sm: &StateMachineData,
     volume_id: &str,
+    placed_tier: Option<DiskTier>,
     path: &str,
     audit: Option<&crate::audit::AuditLog>,
 ) -> u32 {
@@ -1104,7 +1105,7 @@ fn clamp_ack_floor_to_capacity(
     // on other RF>0 tiers), so it is clamped only to what the cluster can
     // physically hold: distinct healthy data nodes with a usable disk on a
     // maintained tier (one node holds one replica per chunk on the wire).
-    let rf = maintained_node_capacity(sm, &mandatory);
+    let rf = maintained_node_capacity(sm, &mandatory, &volume.spill, placed_tier);
     let latch =
         WARNED_FLOOR_CLAMPED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     if rf >= floor {
@@ -1145,21 +1146,67 @@ fn clamp_ack_floor_to_capacity(
     rf
 }
 
-/// Distinct Healthy data nodes (with a gRPC address) holding at least one
-/// usable disk on a tier whose mandatory RF is > 0.
+/// The one per-node eligibility rule shared by the allocation fill and the
+/// commit-side capacity, so they cannot drift: a Healthy data node may hold
+/// a fill replica only if EVERY disk the data node might pick for
+/// `placed_tier` is on a maintained tier (RF > 0) and not spill-forbidden,
+/// and, when `pcfg` is given (allocation only), has room. Empty = ineligible.
+fn eligible_fill_picks<'a>(
+    n: &'a dtfs_raft::NodeInfo,
+    placed_tier: DiskTier,
+    mandatory: &dtfs_common::types::TierReplication,
+    spill: &dtfs_common::types::SpillPolicy,
+    pcfg: Option<&dtfs_common::config::PlacementConfig>,
+) -> Vec<&'a dtfs_common::types::DiskInfo> {
+    if n.role != NodeRole::Data || n.health != HealthStatus::Healthy {
+        return Vec::new();
+    }
+    let picks = data_node_possible_picks(n, placed_tier);
+    let ok = !picks.is_empty()
+        && picks.iter().all(|d| {
+            mandatory.for_tier(d.tier) > 0
+                && pcfg.map_or(true, |p| p.has_room(d.total_bytes, d.used_bytes))
+                && spill.allows_target(&n.location.datacenter, d.tier)
+        });
+    if ok {
+        picks
+    } else {
+        Vec::new()
+    }
+}
+
+/// Healthy data nodes that can hold a durable replica for a write placed on
+/// `placed_tier` (`eligible_fill_picks` without the room check, so a full
+/// cluster is rejected rather than clamped). With an unknown placement tier
+/// (`None`) falls back to "any healthy disk on a maintained tier".
 pub(crate) fn maintained_node_capacity(
     sm: &StateMachineData,
     mandatory: &dtfs_common::types::TierReplication,
+    spill: &dtfs_common::types::SpillPolicy,
+    placed_tier: Option<DiskTier>,
 ) -> u32 {
     sm.nodes
         .values()
-        .filter(|n| n.role == NodeRole::Data && n.health == HealthStatus::Healthy)
-        .filter(|n| {
-            n.disks.iter().any(|d| {
-                d.status == DiskStatus::Healthy && mandatory.for_tier(d.tier) > 0
-            })
+        .filter(|n| match placed_tier {
+            Some(t) => !eligible_fill_picks(n, t, mandatory, spill, None).is_empty(),
+            None => {
+                n.role == NodeRole::Data
+                    && n.health == HealthStatus::Healthy
+                    && n.disks.iter().any(|d| {
+                        d.status == DiskStatus::Healthy && mandatory.for_tier(d.tier) > 0
+                    })
+            }
         })
         .count() as u32
+}
+
+/// Placement tier of a commit batch: the tier of the disk the first
+/// resolvable replica landed on (the primary target is committed first).
+pub(crate) fn placed_tier_of(sm: &StateMachineData, chunks: &[ChunkLocationEntry]) -> Option<DiskTier> {
+    chunks.iter().find_map(|c| {
+        let id: u64 = c.node_id.parse().ok()?;
+        sm.nodes.get(&id)?.disk(c.disk_id).map(|d| d.tier)
+    })
 }
 
 /// Smallest per-chunk count of distinct `(node_id, disk_id)` replicas that
@@ -1288,27 +1335,14 @@ pub(crate) fn fill_floor_targets(
         existing.iter().map(|a| norm_grpc_addr(a)).collect();
     let mut cands: Vec<crate::placement::CandidateDisk> = Vec::new();
     for (id, n) in nodes {
-        if n.role != NodeRole::Data
-            || n.health != HealthStatus::Healthy
-            || n.grpc_addr.is_empty()
-        {
+        if n.grpc_addr.is_empty() {
             continue;
         }
         let addr = norm_grpc_addr(&n.grpc_addr);
         if exclude.contains(&addr) || existing_norm.contains(&addr) {
             continue;
         }
-        let picks = data_node_possible_picks(n, placed_tier);
-        let all_ok = !picks.is_empty()
-            && picks.iter().all(|d| {
-                mandatory.for_tier(d.tier) > 0
-                    && pcfg.has_room(d.total_bytes, d.used_bytes)
-                    && spill.allows_target(&n.location.datacenter, d.tier)
-            });
-        if !all_ok {
-            continue;
-        }
-        for d in picks {
+        for d in eligible_fill_picks(n, placed_tier, mandatory, spill, Some(pcfg)) {
             cands.push(crate::placement::CandidateDisk {
                 node_id: *id,
                 disk_id: d.disk_id,
@@ -2740,6 +2774,7 @@ impl ManagerService for MetadataService {
                 ack_floor,
                 &data,
                 &effective_volume_id,
+                placed_tier_of(&data, &chunks),
                 &req.path,
                 self.audit.as_deref(),
             );

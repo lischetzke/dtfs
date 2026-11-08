@@ -1250,7 +1250,7 @@ mod tests {
     #[test]
     fn commit_gate_cold_only_rejected_cold_plus_warm_accepted() {
         let sm = live_topology();
-        let floor = clamp_ack_floor_to_capacity(2, &sm, "default", "/a", None);
+        let floor = clamp_ack_floor_to_capacity(2, &sm, "default", None, "/a", None);
         assert_eq!(floor, 2, "3 maintained nodes can hold 2 copies");
         let cold_only = min_maintained_replicas(&sm, "default", &[ent("1")]);
         assert_eq!(cold_only, 1);
@@ -1267,10 +1267,10 @@ mod tests {
         let mut sm = StateMachineData::default();
         sm.volumes.insert("default".to_string(), vol_with_floor("default", 2));
         sm.nodes.insert(1, lab_node("data01", "leli", DiskTier::Cold, HealthStatus::Healthy));
-        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, "default", "/a", None), 1);
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, "default", None, "/a", None), 1);
         assert_eq!(min_maintained_replicas(&sm, "default", &[ent("1")]), 1);
         // A floor already within capacity is untouched.
-        assert_eq!(clamp_ack_floor_to_capacity(1, &sm, "default", "/a", None), 1);
+        assert_eq!(clamp_ack_floor_to_capacity(1, &sm, "default", None, "/a", None), 1);
     }
 
     /// A replica on a cache-only tier (RF 0) does not count toward the floor.
@@ -1284,7 +1284,7 @@ mod tests {
         assert_eq!(min_maintained_replicas(&sm, "default", &[ent("4")]), 0);
         // Hot nodes add no capacity.
         assert_eq!(
-            maintained_node_capacity(&sm, &sm.volumes["default"].effective_mandatory_replicas()),
+            maintained_node_capacity(&sm, &sm.volumes["default"].effective_mandatory_replicas(), &Default::default(), Some(DiskTier::Cold)),
             3
         );
     }
@@ -1298,9 +1298,9 @@ mod tests {
         let mut sm = live_topology();
         sm.nodes.get_mut(&2).unwrap().health = HealthStatus::Quarantined;
         sm.nodes.get_mut(&3).unwrap().health = HealthStatus::Maintenance;
-        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, "default", "/a", None), 1);
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, "default", None, "/a", None), 1);
         sm.nodes.get_mut(&3).unwrap().health = HealthStatus::Healthy;
-        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, "default", "/a", None), 2);
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, "default", None, "/a", None), 2);
     }
 
     /// Property-style: over many topologies, the allocator fill plus one
@@ -1328,7 +1328,7 @@ mod tests {
                 sm.nodes.insert(id, lab_node(&format!("data{id:02}"), "toro", tier, health));
             }
             let mand = sm.volumes["default"].effective_mandatory_replicas();
-            let cap = maintained_node_capacity(&sm, &mand);
+            let cap = maintained_node_capacity(&sm, &mand, &Default::default(), Some(DiskTier::Cold));
             let existing = vec!["data01:9500".to_string()];
             let vol = &sm.volumes["default"];
             let extra = fill_floor_targets(
@@ -1367,11 +1367,59 @@ mod tests {
             sm.nodes.get_mut(&id).unwrap().health = HealthStatus::Suspect;
         }
         sm.nodes.insert(4, lab_node("data04", "toro", DiskTier::Hot, HealthStatus::Healthy));
-        let floor = clamp_ack_floor_to_capacity(2, &sm, "default", "/a", None);
+        let floor = clamp_ack_floor_to_capacity(2, &sm, "default", None, "/a", None);
         assert_eq!(floor, 2, "no capacity: keep the configured floor, never 0");
         let have = min_maintained_replicas(&sm, "default", &[ent("4")]);
         assert_eq!(have, 0);
         assert!((have as u32) < floor, "cache-only commit must be rejected");
+    }
+
+    /// Capacity must use the fill's per-node rule: a warm node with a hot
+    /// RF-0 cache disk beside its warm disk is never a fill target for a
+    /// cold placement, so it must not count as capacity either (else the
+    /// floor stays 2 and every commit is rejected forever).
+    #[test]
+    fn capacity_matches_fill_on_mixed_cache_node() {
+        let mut sm = StateMachineData::default();
+        let mut vol = vol_with_floor("mixed-vol", 2);
+        vol.mandatory_replicas =
+            dtfs_common::types::TierReplication { hot: 0, warm: 2, cold: 1, tape: 0 };
+        sm.volumes.insert("mixed-vol".to_string(), vol);
+        sm.nodes.insert(1, lab_node("data01", "leli", DiskTier::Cold, HealthStatus::Healthy));
+        sm.nodes.insert(2, lab_node("data02", "toro", DiskTier::Warm, HealthStatus::Healthy));
+        add_disk(&mut sm, 2, 1, DiskTier::Hot, 1 << 40, 0);
+        let v = &sm.volumes["mixed-vol"];
+        let mand = v.effective_mandatory_replicas();
+        let fill_targets = fill_floor_targets(
+            &sm.nodes, &mand, &v.spill,
+            &dtfs_common::config::PlacementConfig::default(),
+            &Location::new("", "", "", ""), DiskTier::Cold,
+            &["data01:9500".to_string()], 2, &std::collections::HashSet::new(),
+        );
+        assert!(fill_targets.is_empty(), "fill cannot target the mixed node");
+        assert_eq!(maintained_node_capacity(&sm, &mand, &v.spill, Some(DiskTier::Cold)), 1);
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, "mixed-vol", Some(DiskTier::Cold), "/a", None), 1);
+        assert!(WARNED_FLOOR_CLAMPED.get().unwrap().lock().unwrap().contains("mixed-vol"));
+        assert!(min_maintained_replicas(&sm, "mixed-vol", &[ent("1")]) >= 1);
+        // Normal single-tier topology still needs 2.
+        let sm2 = live_topology();
+        let v2 = &sm2.volumes["default"];
+        assert_eq!(
+            maintained_node_capacity(&sm2, &v2.effective_mandatory_replicas(), &v2.spill, Some(DiskTier::Cold)),
+            3
+        );
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm2, "default", Some(DiskTier::Cold), "/a", None), 2);
+    }
+
+    /// The commit side derives the placement tier from the first resolvable
+    /// replica's disk.
+    #[test]
+    fn placed_tier_is_the_first_replicas_disk_tier() {
+        let sm = live_topology();
+        assert_eq!(placed_tier_of(&sm, &[ent("1"), ent("2")]), Some(DiskTier::Cold));
+        assert_eq!(placed_tier_of(&sm, &[ent("2")]), Some(DiskTier::Warm));
+        assert_eq!(placed_tier_of(&sm, &[ent("99")]), None);
+        assert_eq!(placed_tier_of(&sm, &[]), None);
     }
 
     /// MGR-4: the warn-once latch re-arms after the volume stops clamping.
@@ -1387,13 +1435,13 @@ mod tests {
         let mut sm = StateMachineData::default();
         sm.volumes.insert(v.to_string(), vol_with_floor(v, 2));
         sm.nodes.insert(1, lab_node("data01", "leli", DiskTier::Cold, HealthStatus::Healthy));
-        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, v, "/a", None), 1);
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, v, None, "/a", None), 1);
         assert!(latched(v));
         sm.nodes.insert(2, lab_node("data02", "leli", DiskTier::Cold, HealthStatus::Healthy));
-        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, v, "/a", None), 2);
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, v, None, "/a", None), 2);
         assert!(!latched(v), "recovered volume clears the latch");
         sm.nodes.remove(&2);
-        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, v, "/a", None), 1);
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, v, None, "/a", None), 1);
         assert!(latched(v), "a later clamp episode warns again");
     }
 
