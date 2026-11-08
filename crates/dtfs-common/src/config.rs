@@ -1137,10 +1137,10 @@ pub struct FuseWriteConfig {
     #[serde(default = "default_true")]
     pub anchor_sync: bool,
     /// `false` (default): fsync and close(2) commit every buffered byte,
-    /// including a partial tail chunk. `true`: fsync/flush commit nothing
-    /// extra; a partial chunk is committed once complete, once its oldest
-    /// byte is `async_commit_secs` old, under `DIRTY_BYTES_CAP` pressure, or
-    /// at the last writer's release. Acknowledged writes can be lost on a
+    /// including a partial tail chunk. `true`: fsync commits nothing extra;
+    /// a partial chunk is committed once complete, once its oldest byte is
+    /// `async_commit_secs` old, under `DIRTY_BYTES_CAP` pressure, or at
+    /// close(2) (FUSE flush, every close). Acknowledged writes can be lost on a
     /// dtfs-fuse or host crash inside that window (media / NFS re-export).
     #[serde(default)]
     pub async_commit: bool,

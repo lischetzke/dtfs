@@ -775,7 +775,8 @@ impl Filesystem for DtfsFuse3Adapter {
     /// Without this method the kernel returns OK locally and the writes may
     /// still be sitting in our process-local `write_buffer` — i.e. a power
     /// loss before the next release() would lose committed transactions.
-    /// We route fsync to the same chunk-flush path used by close().
+    /// Default: the same commit as close(); `write.async_commit`: no commit,
+    /// only a pending background error (`DtfsFilesystem::fsync`).
     async fn fsync(
         &self,
         _req: Request,
@@ -784,7 +785,7 @@ impl Filesystem for DtfsFuse3Adapter {
         _datasync: bool,
     ) -> FuseResult<()> {
         debug!("fuse3:fsync fh={}", fh);
-        self.fs.flush(fh).await.map_err(|e| {
+        self.fs.fsync(fh).await.map_err(|e| {
             warn!(fh, error = %e, "fuse3 fsync failed");
             Errno::from(libc::EIO)
         })

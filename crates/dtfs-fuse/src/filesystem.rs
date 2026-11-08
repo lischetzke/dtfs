@@ -1817,11 +1817,33 @@ impl DtfsFilesystem {
         Ok(())
     }
 
-    /// FUSE flush/fsync. Default: commit everything (`commit_all`). With
-    /// `write.async_commit`: commit nothing extra (partial chunks wait for the
-    /// age timer, the dirty cap or release) and report a pending background
-    /// commit error once.
+    /// FUSE flush (every close(2)): always commit everything (`commit_all`),
+    /// then report a pending background commit error once. close(2) returns
+    /// this result; RELEASE is async and its reply is ignored, so committing
+    /// only there would let close() return with the bytes in memory.
     pub async fn flush(&self, fh: u64) -> Result<()> {
+        let path = self.open_files.get(&fh).map(|f| f.path.clone());
+        let guard = match &path {
+            Some(p) => self.path_guard(p).await,
+            None => None,
+        };
+        let res = self.commit_all(fh).await.and_then(|()| {
+            match self.open_files.get_mut(&fh).and_then(|mut f| f.write_error.take()) {
+                Some(msg) => Err(anyhow::anyhow!(msg)),
+                None => Ok(()),
+            }
+        });
+        if let Some(p) = path {
+            self.drop_path_guard(&p, guard);
+        }
+        res
+    }
+
+    /// FUSE fsync. Default: commit everything (`commit_all`). With
+    /// `write.async_commit`: commit nothing extra (partial chunks wait for the
+    /// age timer, the dirty cap or close) and report a pending background
+    /// commit error once.
+    pub async fn fsync(&self, fh: u64) -> Result<()> {
         if !self.config.write.async_commit {
             return self.commit_all(fh).await;
         }
@@ -5197,8 +5219,20 @@ mod async_commit_fs_tests {
         let fs = fs(true);
         let fh = open(&fs, "/f", OpenFlags::ReadWrite);
         fs.write_buffer.write("/f", 0, &[7; 100]);
-        fs.flush(fh).await.expect("async fsync must not upload the partial tail");
+        fs.fsync(fh).await.expect("async fsync must not upload the partial tail");
         assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100);
+    }
+
+    /// close(2) sends FUSE_FLUSH and returns its result; RELEASE is async and
+    /// its reply ignored, so flush must commit even in async mode.
+    #[tokio::test]
+    async fn async_flush_on_close_commits_the_partial_tail() {
+        let fs = fs(true);
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/f", 0, &[7; 100]);
+        let err = fs.flush(fh).await.unwrap_err();
+        assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100, "restored after the failed upload");
     }
 
     #[tokio::test]
@@ -5206,7 +5240,7 @@ mod async_commit_fs_tests {
         let fs = fs(false);
         let fh = open(&fs, "/f", OpenFlags::ReadWrite);
         fs.write_buffer.write("/f", 0, &[7; 100]);
-        let err = fs.flush(fh).await.unwrap_err();
+        let err = fs.fsync(fh).await.unwrap_err();
         assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
         assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100, "restored after the failed upload");
     }
@@ -5217,15 +5251,15 @@ mod async_commit_fs_tests {
         let fh = open(&fs, "/f", OpenFlags::ReadWrite);
         fs.write_buffer.write("/f", 0, &[7; 100]);
         fs.commit_aged(Instant::now() + AGE - Duration::from_secs(1)).await;
-        fs.flush(fh).await.expect("younger than the age: no commit attempted");
+        fs.fsync(fh).await.expect("younger than the age: no commit attempted");
         fs.commit_aged(Instant::now() + AGE).await;
         assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100, "failed commit keeps the bytes");
-        let err = fs.flush(fh).await.unwrap_err();
+        let err = fs.fsync(fh).await.unwrap_err();
         assert!(format!("{err:#}").contains("async commit of /f failed"), "{err:#}");
-        fs.flush(fh).await.expect("the sticky error is reported once");
+        fs.fsync(fh).await.expect("the sticky error is reported once");
         // Retried on the next tick (age kept), reported again once.
         fs.commit_aged(Instant::now() + AGE).await;
-        assert!(fs.flush(fh).await.is_err());
+        assert!(fs.fsync(fh).await.is_err());
     }
 
     #[tokio::test]
@@ -5239,7 +5273,7 @@ mod async_commit_fs_tests {
         let fh = open(&fs, "/f", OpenFlags::ReadWrite);
         fs.write_buffer.write("/f", 0, b"live");
         fs.commit_aged(Instant::now() + AGE).await;
-        assert!(fs.flush(fh).await.is_err(), "the live path was attempted");
+        assert!(fs.fsync(fh).await.is_err(), "the live path was attempted");
         assert!(fs.open_files.get(&dfh).unwrap().write_error.is_none(), "detached: not attempted");
         assert!(fs.open_files.get(&rfh).unwrap().write_error.is_none());
         assert_eq!(fs.write_buffer.dirty_bytes(&det), 10);

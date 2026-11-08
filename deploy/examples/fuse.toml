@@ -123,9 +123,9 @@ mountpoint = "/mnt/dtfs"
 # ("Catching up" on the dashboard). No effect for a client in the anchor DC.
 #anchor_sync = true
 # false: fsync and close(2) commit every buffered byte (default).
-# true: fsync/flush commit nothing extra; a partial chunk is committed when it
+# true: fsync commits nothing extra; a partial chunk is committed when it
 # fills, when its oldest byte is async_commit_secs old, under the 128 MB
-# per-file dirty cap, or at the last close. RISK: acknowledged writes can stay
+# per-file dirty cap, or at close(2) (every close still commits). RISK: acknowledged writes can stay
 # only in client memory for that window and are LOST if dtfs-fuse or the host
 # crashes. Media / NFS re-export only.
 #async_commit = false

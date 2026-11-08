@@ -112,9 +112,11 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   chunks of the pending write: `keep`, they were just seeded) before a hole
   fill or write would exceed it.
 - `write.async_commit` (default off = all of the above unchanged): FUSE
-  flush/fsync commit nothing and only report a pending background error
-  (`OpenFile.write_error`, once per fh, EIO); `release()` still runs
-  `commit_all` (flush_all). A 1 s timer (`commit_aged`, at most
+  fsync (`DtfsFilesystem::fsync`) commits nothing and only reports a pending
+  background error (`OpenFile.write_error`, once per fh, EIO). FUSE flush
+  (every close(2), whose result close returns; RELEASE is async and its
+  reply ignored) and `release()` still run `commit_all` (flush_all) under
+  `path_guard`. A 1 s timer (`commit_aged`, at most
   `AGED_COMMITS_PER_TICK` paths) commits a path whose oldest buffered byte
   (`ChunkBuf.since`, kept across `restore_segments`) is `async_commit_secs`
   old, through `commit_all` with a writable non-detached fh. The cap drain

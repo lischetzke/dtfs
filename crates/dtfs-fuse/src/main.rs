@@ -308,7 +308,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // write.async_commit: fsync/flush no longer commit partial chunks; this
+    // write.async_commit: fsync no longer commits partial chunks; this
     // 1 s tick commits any file whose oldest buffered byte is too old.
     if write_cfg.async_commit {
         tracing::warn!(
