@@ -1,8 +1,10 @@
 ---
 # One node: install the role's binaries, restart its service, wait until it
 # is healthy again, then pause. A node already running dtfs_version with an
-# active service is skipped (idempotent re-run; dtfs_force_update=true
-# overrides). The previous binary is kept as <bin>.prev (one rollback copy). Included from update-cluster.yml with
+# active service skips the install (idempotent re-run; dtfs_force_update=true
+# overrides) but ALWAYS runs the health waits, so a re-run after a failed
+# rollout still fails loudly. The previous binary is kept as <bin>.prev (one
+# rollback copy, only taken from a running binary). Included from update-cluster.yml with
 # `node` (inventory host) and `role` (manager | data | client); every task
 # is delegated so the caller's ordering is preserved exactly. Remote tasks
 # run as root over SSH (ansible.cfg: remote_user = root, no become).
@@ -59,7 +61,7 @@
          and current_stamp.stdout is match('^' ~ node_bins[0] ~ ' ' ~ (dtfs_version | regex_escape) ~ ' ')
          and current_service.stdout | trim == 'active' }}
 
-- name: "[{{ node }}] Already on {{ dtfs_version }} and active, skipping"
+- name: "[{{ node }}] Already on {{ dtfs_version }} and active, skipping install"
   ansible.builtin.debug:
     msg: "{{ node }} already runs {{ dtfs_version }}; set dtfs_force_update=true to reinstall"
   when: node_uptodate | bool
@@ -72,7 +74,9 @@
         argv: [sh, -c, 'test ! -f "$1" || cp -p "$1" "$1.prev"', _, "{{ node_bin_dir }}/{{ item }}"]
       loop: "{{ node_bins }}"
       delegate_to: "{{ node }}"
-      when: not (node_at_version | bool)
+      # Only a healthy, different binary is worth keeping: never overwrite the
+      # last good .prev with a build that is not running.
+      when: not (node_at_version | bool) and current_service.stdout | trim == 'active'
 
     - name: "[{{ node }}] Install {{ node_bins | join(', ') }} ({{ dtfs_version }})"
       ansible.builtin.copy:
@@ -91,65 +95,65 @@
         daemon_reload: true
       delegate_to: "{{ node }}"
 
-    # --- health wait -----------------------------------------------------------
+# --- health wait -----------------------------------------------------------
 
-    - name: "[{{ node }}] Wait for the manager API port"
-      ansible.builtin.wait_for:
-        host: "{{ node_host }}"
-        port: "{{ hostvars[node].dtfs_api_port | default(dtfs_api_port) }}"
-        timeout: "{{ dtfs_health_timeout_secs }}"
-      when: role == 'manager'
+- name: "[{{ node }}] Wait for the manager API port"
+  ansible.builtin.wait_for:
+    host: "{{ node_host }}"
+    port: "{{ hostvars[node].dtfs_api_port | default(dtfs_api_port) }}"
+    timeout: "{{ dtfs_health_timeout_secs }}"
+  when: role == 'manager'
 
-    - name: "[{{ node }}] Wait until Raft is running and a leader is known"
-      ansible.builtin.uri:
-        url: "{{ node_api }}/api/v1/raft/state"
-        return_content: true
-        timeout: 10
-      register: raft_after
-      until: >-
-        raft_after.status == 200
-        and raft_after.json.running_state == 'ok'
-        and (raft_after.json.current_leader | default('') | string) not in ['', 'None', 'null']
-      retries: "{{ (dtfs_health_timeout_secs | int / 5) | int }}"
-      delay: 5
-      when: role == 'manager'
+- name: "[{{ node }}] Wait until Raft is running and a leader is known"
+  ansible.builtin.uri:
+    url: "{{ node_api }}/api/v1/raft/state"
+    return_content: true
+    timeout: 10
+  register: raft_after
+  until: >-
+    raft_after.status == 200
+    and raft_after.json.running_state == 'ok'
+    and (raft_after.json.current_leader | default('') | string) not in ['', 'None', 'null']
+  retries: "{{ (dtfs_health_timeout_secs | int / 5) | int }}"
+  delay: 5
+  when: role == 'manager'
 
-    - name: "[{{ node }}] Wait until the managers report it Healthy on {{ dtfs_version }}"
-      ansible.builtin.uri:
-        url: "{{ dtfs_leader_api }}/api/v1/nodes"
-        return_content: true
-        timeout: 10
-      register: nodes_after
-      vars:
-        node_rows: >-
-          {{ ((nodes_after.json.nodes | default([])) if nodes_after.json is mapping else nodes_after.json)
-             | selectattr('hostname', 'equalto', node_identity) | list }}
-      until: >-
-        nodes_after.status == 200
-        and node_rows | length > 0
-        and node_rows[0].health == 'Healthy'
-        and (node_rows[0].version | default('')) == dtfs_version
-      retries: "{{ (dtfs_health_timeout_secs | int / 5) | int }}"
-      delay: 5
-      when: role == 'data'
+- name: "[{{ node }}] Wait until the managers report it Healthy on {{ dtfs_version }}"
+  ansible.builtin.uri:
+    url: "{{ dtfs_leader_api }}/api/v1/nodes"
+    return_content: true
+    timeout: 10
+  register: nodes_after
+  vars:
+    node_rows: >-
+      {{ ((nodes_after.json.nodes | default([])) if nodes_after.json is mapping else nodes_after.json)
+         | selectattr('hostname', 'equalto', node_identity) | list }}
+  until: >-
+    nodes_after.status == 200
+    and node_rows | length > 0
+    and node_rows[0].health == 'Healthy'
+    and (node_rows[0].version | default('')) == dtfs_version
+  retries: "{{ (dtfs_health_timeout_secs | int / 5) | int }}"
+  delay: 5
+  when: role == 'data'
 
-    - name: "[{{ node }}] Wait until the FUSE mount is back"
-      ansible.builtin.command:
-        argv: [mountpoint, -q, "{{ node_mount }}"]
-      register: mounted
-      until: mounted.rc == 0
-      retries: "{{ (dtfs_health_timeout_secs | int / 5) | int }}"
-      delay: 5
-      changed_when: false
-      failed_when: false
-      delegate_to: "{{ node }}"
-      when: role == 'client'
+- name: "[{{ node }}] Wait until the FUSE mount is back"
+  ansible.builtin.command:
+    argv: [mountpoint, -q, "{{ node_mount }}"]
+  register: mounted
+  until: mounted.rc == 0
+  retries: "{{ (dtfs_health_timeout_secs | int / 5) | int }}"
+  delay: 5
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ node }}"
+  when: role == 'client'
 
-    - name: "[{{ node }}] FUSE mount present"
-      ansible.builtin.assert:
-        that: mounted.rc == 0
-        fail_msg: "{{ node_mount }} did not come back within {{ dtfs_health_timeout_secs }}s"
-      when: role == 'client'
+- name: "[{{ node }}] FUSE mount present"
+  ansible.builtin.assert:
+    that: mounted.rc == 0
+    fail_msg: "{{ node_mount }} did not come back within {{ dtfs_health_timeout_secs }}s"
+  when: role == 'client'
 
 - name: "[{{ node }}] Installed binary reports {{ dtfs_version }}"
   ansible.builtin.command: "{{ node_bin_dir }}/{{ node_bins[0] }} --version"
