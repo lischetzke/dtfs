@@ -14,7 +14,7 @@ FROM rust:1.94.1-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         clang libclang-dev cmake protobuf-compiler pkg-config \
-        libfuse3-dev fuse3 libssl-dev \
+        libfuse3-dev fuse3 libssl-dev nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CARGO_TARGET_DIR=/target

@@ -890,3 +890,43 @@ mod xss_escaping_tests {
         );
     }
 }
+
+/// A JS parse error blanks the whole dashboard; `node --check` every inline
+/// script. Skipped (loudly) when node is not installed.
+#[cfg(test)]
+mod js_syntax_tests {
+    use super::*;
+
+    #[test]
+    fn inline_scripts_parse_with_node() {
+        if std::process::Command::new("node").arg("--version").output().is_err() {
+            eprintln!("WARNING: node not on PATH, dashboard JS syntax NOT checked");
+            return;
+        }
+        let html = render_dashboard("test-cluster", "mgr-test");
+        let dir = std::env::temp_dir().join(format!("dtfs-webui-js-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut n = 0;
+        let mut rest = html.as_str();
+        while let Some(i) = rest.find("<script") {
+            let after = &rest[i..];
+            let open_end = after.find('>').unwrap() + 1;
+            let tag = &after[..open_end];
+            let close = after.find("</script>").expect("unterminated <script>");
+            if !tag.contains("src=") {
+                let f = dir.join(format!("s{n}.js"));
+                std::fs::write(&f, &after[open_end..close]).unwrap();
+                let out = std::process::Command::new("node").arg("--check").arg(&f).output().unwrap();
+                assert!(
+                    out.status.success(),
+                    "dashboard script {n} has a JS syntax error:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                n += 1;
+            }
+            rest = &after[close + "</script>".len()..];
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(n > 0, "no inline script found");
+    }
+}

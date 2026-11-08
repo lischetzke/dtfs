@@ -144,6 +144,7 @@ test:scripts:
     - bash scripts/tests/test-dtfs-install.sh
     - bash scripts/tests/test-build-date-fresh.sh
     - bash scripts/tests/test-release-version-stamp.sh
+    - bash scripts/tests/check-webui-js.sh
     - bash scripts/dtfs-cluster-healthcheck.sh --help >/dev/null
     - ansible-playbook --version
     - ansible-playbook -i deploy/ansible/inventory.example.yml --syntax-check deploy/ansible/update-cluster.yml
