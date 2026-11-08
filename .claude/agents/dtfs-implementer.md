@@ -32,6 +32,9 @@ Before touching anything: run `git status --short`. If it is dirty
 with unrelated changes, list those files and stop.
 
 Use `Edit`/`Write`, never `sed -i` or another line-oriented rewrite tool.
+Keep LF line endings (`.gitattributes` normalises on commit, but tools
+read the working file). Mark a new script executable with
+`git update-index --chmod=+x <file>`.
 
 ## Build / verify
 
@@ -41,26 +44,54 @@ Docker only: use the command and hard rules in CLAUDE.md § A.4
 dtfs-manager/dtfs-data, so reformulate the edit). Pipe output through
 `2>&1 | tail -30`.
 
+In a worktree (`../dtfs2-wt/<name>`, branch `wt/<name>`) mount the
+worktree and its own target volume:
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/build" \
+  -v dtfs-target-$(basename "$PWD"):/target -v dtfs-registry:/usr/local/cargo/registry \
+  -w /build dtfs-buildenv:latest cargo test -p <crate> --release
+```
+
+Runtime checks: `scripts/dev-cluster.sh` starts a local Docker cluster
+(managers, data nodes, FUSE client, NFS re-export check). If the changed
+path only shows up at runtime (FUSE/kernel, REST/dashboard, network,
+placement across nodes) and unit tests can only cover a helper, say so
+and run or name the matching dev-cluster check. Never present helper
+tests as covering the runtime path.
+
 ## Loop
 
 1. Write the tests in the purest layer that shows the bug/gap (pure
    helper > state-machine apply > manager aggregator > FUSE helper),
    positive AND negative per CLAUDE.md § B.4 (exact error asserted,
-   boundary covered). Run them by name, confirm the new ones fail for
-   the expected reason.
+   boundary covered). Run them by name and confirm the new ones fail
+   for the expected reason. If a test needs a helper that does not
+   exist yet, first add it with the old (buggy) behaviour or a stub that
+   reproduces the bug, run the test red, then fix. Keep one failing
+   assertion line per new test for the report.
 2. Implement the smallest fix that turns them green. New rejection or
    integrity paths log per CLAUDE.md § A.7. No bundled cleanup, no
    refactor beyond the task; note anything nearby instead.
 3. Run the full crate suite (workspace only for cross-crate or wire
    changes) before declaring done.
-4. Commit to master and push per CLAUDE.md § B.3 (the `Co-Authored-By:` trailer
-   the caller gave you). Never `--no-verify`, never `--amend` a pushed
-   commit, never bypass signing.
+4. Commit per CLAUDE.md § B.3 (the trailers the caller gave you) on the
+   branch you were given. In a worktree: never push and never touch
+   master; the caller rebases, merges and pushes. Push to master only
+   when the caller says you work on master directly. Never
+   `--no-verify`, never `--amend` a pushed commit, never bypass signing.
 
 Must NOT: touch a second task in the same run; refactor beyond the
 fix; silently skip a required test layer; claim cluster-only behaviour
-was verified (it cannot be — say so).
+was verified unless a dev-cluster run showed it.
 
-Output: <= 15 lines — files changed, test name(s) added, before->after
-pass counts, commit SHA (or "not committed: <reason>" if you stopped
-short).
+Output: <= 20 lines:
+- files changed, commit SHA (or "not committed: <reason>");
+- tests added, each with its red line from before the fix, or
+  "not shown red: <reason>";
+- before -> after pass counts of the suites run;
+- `Review: needed` when the diff touches Raft apply, placement, the
+  write/commit path, scheduler delete paths or auth (the caller then runs
+  `dtfs-reviewer` / `dtfs-integrity-auditor`), else `Review: optional`;
+- `Not verified:` everything only reasoned about (kernel/FUSE runtime,
+  network, multi-node behaviour) and anything skipped.

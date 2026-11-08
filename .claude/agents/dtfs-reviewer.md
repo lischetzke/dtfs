@@ -17,7 +17,8 @@ checklist), plus `.claude/rules/integrity.md` if the diff touches
 (`.claude/rules/fuse.md` for `dtfs-fuse/**`).
 
 Get the diff via `git diff`/`git show` against whatever the caller
-specified (a branch, a commit range, or the working tree). Do not read
+specified (a branch, a commit range, or the working tree; for a
+worktree branch use `git diff master...wt/<name>`). Do not read
 whole files end to end — pull the diff, then `Read` with `offset`/
 `limit` around each changed region when you need surrounding context
 (e.g. to check a caller of a changed function).
@@ -30,7 +31,7 @@ finding" rather than manufacture one; a fabricated finding costs more
 than a missed one (CLAUDE.md's over-engineering rule applies to reviews
 too — don't pad the list).
 
-Severity ladder (exactly as CORE-REVIEW-2026-09-12.md defines it):
+Severity ladder:
 - **HIGH** — data loss, silent corruption, invariant violation, outage,
   OOM, non-terminating repair, or auth bypass.
 - **MEDIUM** — slow-healing wrong state, wasted bandwidth on the

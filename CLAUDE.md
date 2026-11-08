@@ -2,9 +2,9 @@
 
 DTFS = Raft-managed tiered distributed filesystem in Rust. This file is canonical contract: keep accurate, update in same commit as any behaviour/convention change.
 
-Environment (2026-09): no build VM, no lab or prod cluster. All verification via crate tests in local Docker image (§ A.4). Cluster-only behaviour reasoned about, not executed.
+Environment: no lab or prod cluster. Verification: crate tests in the Docker image (§ A.4), runtime checks on `scripts/dev-cluster.sh` (local Docker cluster); anything else is reasoned, not executed.
 
-Agents: `.claude/agents/` (dtfs-explore, dtfs-intake, dtfs-implementer, dtfs-reviewer, dtfs-integrity-auditor). Path-scoped invariants: `.claude/rules/`. Live incidents: `dtfs-diagnose` skill + `dtfs` MCP (`tools/dtfs-mcp/`, `docs/src/operations/diagnostics-mcp.md`); `op_*` dry-run unless confirmed.
+Agents: `.claude/agents/`. Path-scoped invariants: `.claude/rules/`. Live incidents: `dtfs-diagnose` skill + `dtfs` MCP (`tools/dtfs-mcp/`, `docs/src/operations/diagnostics-mcp.md`); `op_*` dry-run unless confirmed.
 
 ---
 
@@ -66,7 +66,7 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "${DTFS_REPO_HOST_PATH:-$(pwd -W 2>/dev/nu
   -w /build dtfs-buildenv:latest cargo test -p <crate> --release [<test_name>]
 ```
 
-Always `--release`. Iterate with `<test_name>`, finish with full crate. After config/example change run `cargo test -p dtfs-common --release` (`example_*_toml_parses`; rerun once if flaked). Parallel agents: one worktree each (`../dtfs2-wt/<name>`, branch `wt/<name>`), own target volume `dtfs-target-<name>` (copy of `dtfs-target`), mounted at `/build`. Keep crate-level `#![allow(dead_code)]` on dtfs-manager/dtfs-data (rustc 1.94 ICE workaround). Source files: use Edit/Write, never `sed -i`.
+Always `--release`. Iterate with `<test_name>`, finish with full crate. After config/example change run `cargo test -p dtfs-common --release`. Parallel agents: one worktree each (`../dtfs2-wt/<name>`, branch `wt/<name>`), own target volume `dtfs-target-<name>` (copied from `dtfs-target`). Keep crate-level `#![allow(dead_code)]` on dtfs-manager/dtfs-data (rustc 1.94 ICE workaround). Source files: use Edit/Write, never `sed -i`.
 
 ## A.5 Memory model
 
@@ -112,7 +112,7 @@ Load-bearing ownership only; history per row in `docs/src/internals/invariants.m
 
 Locate → failing tests (positive + negative, § B.4) → smallest fix → targeted run → crate suite → commit to `master`. Workspace suite only for cross-crate or wire changes. No PRs, no plan files; only temporary `wt/*` branches (§ A.4): rebase, workspace suite, fast-forward, push, remove worktree/branch/volume. Wire/on-disk changes also land on master, gated by § A.3.1 tests.
 
-Model split: main session analyses, specs, verifies diff + test output. Code goes to `dtfs-implementer` (sonnet, medium). Exception: main session edits directly for docs, comments, config examples, and code changes of ≤10 lines in one file.
+Model split: main session analyses, specs, verifies diff + test output. Code goes to `dtfs-implementer` (sonnet, medium; opus for Raft apply, placement or write-path semantics). Exception: main session edits directly for docs, comments, config examples, and code changes of ≤10 lines in one file.
 
 ## B.2 Plans
 
@@ -124,7 +124,7 @@ Session todo list only. Deferred work goes in the commit body or final chat repo
 
 ## B.4 Tests
 
-Every logic change ships a **positive** test (intended outcome) and a **negative** one per new guard, asserting the exact error (`Status::code()`, `DtfsError` variant, errno) and the boundary (min_replicas-1, last live replica, cap hit). Bug fix: test fails before the fix, for the stated reason; network paths untestable here get a pure decision helper + test. Durability/anchor/Raft-apply invariants: property test over random op sequences, invariant asserted after every step. Snapshot fields: old-snapshot-loads test (§ A.3.1). Cluster-only behaviour: "not executed, reasoned" in commit body; `tests/release/` and `tests/proxmox/` are dormant.
+Every logic change ships a **positive** test (intended outcome) and a **negative** one per new guard, asserting the exact error (`Status::code()`, `DtfsError` variant, errno) and the boundary (min_replicas-1, last live replica, cap hit). Bug fix: test fails before the fix, for the stated reason; network paths untestable here get a pure decision helper + test. Durability/anchor/Raft-apply invariants: property test over random op sequences, invariant asserted after every step. Snapshot fields: old-snapshot-loads test (§ A.3.1). Runtime-only behaviour: run the dev-cluster check or write "not executed, reasoned" in the commit body; `tests/release/` is dormant.
 
 ## B.5 Where things live
 
