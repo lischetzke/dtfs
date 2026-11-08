@@ -60,7 +60,11 @@ fetch_pinned() {
         local tmp; tmp="$(mktemp -d)"
         info "downloading $MDBOOK_URL" >&2
         # GitHub release downloads return transient 5xx now and then.
-        curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -o "$tmp/$MDBOOK_ASSET" "$MDBOOK_URL" \
+        # The browser download URL can 504 while the API asset path works, so
+        # fall back to `gh release download` (sha256 is checked either way).
+        curl -fsSL --retry 3 --retry-all-errors --retry-delay 3 -o "$tmp/$MDBOOK_ASSET" "$MDBOOK_URL" \
+            || { command -v gh >/dev/null 2>&1 && gh release download "v$MDBOOK_VERSION" \
+                    -R rust-lang/mdBook -p "$MDBOOK_ASSET" -D "$tmp" --clobber >&2; } \
             || { error "download failed: $MDBOOK_URL"; rm -rf "$tmp"; return 1; }
         echo "$MDBOOK_SHA256  $tmp/$MDBOOK_ASSET" | sha256sum -c - >&2 \
             || { error "sha256 mismatch for $MDBOOK_ASSET"; rm -rf "$tmp"; return 1; }

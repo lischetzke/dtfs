@@ -31,6 +31,8 @@ jobs:
         env:
           # Project Pages site lives under /dtfs/ (docs/book.toml default is /).
           MDBOOK_OUTPUT__HTML__SITE_URL: /dtfs/
+          # gh fallback for the mdBook download (scripts/build-docs.sh)
+          GH_TOKEN: ${{ github.token }}
         run: bash scripts/build-docs.sh --clean
       - uses: actions/upload-pages-artifact@v4
         with:
