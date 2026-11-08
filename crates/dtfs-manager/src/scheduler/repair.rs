@@ -17,79 +17,51 @@ impl TaskScheduler {
         target_node: u64,
         tier: DiskTier,
     ) -> bool {
+        let out = self
+            .schedule_replications(&[(chunk_id, source_node, target_node, tier)], usize::MAX)
+            .await;
+        out[0] != ScheduleOutcome::Refused
+    }
+
+    /// Schedule many replication tasks with ONE migration-state load/save.
+    /// Only newly created tasks count toward `max_new`; already-scheduled
+    /// pairs are skipped for free. Returns one outcome per request.
+    pub(crate) async fn schedule_replications(
+        &self,
+        reqs: &[(&str, u64, u64, DiskTier)],
+        max_new: usize,
+    ) -> Vec<ScheduleOutcome> {
         // CO-3-5 — serialise with the tick's load-modify-save (and any
         // other concurrent schedule) so neither writer clobbers the
         // other's tasks or regresses `next_task_id`.
         let _ms_guard = self.migration_state_lock.lock().await;
         let mut state = self.load_migration_state().await;
-
-        // Avoid duplicate tasks for the same chunk + target. CR-3-5/MGR-5
-        // — `task_blocks_requeue` so a lingering Failed task (within its
-        // retention window) also blocks an immediate re-schedule here,
-        // matching `check_under_replicated`'s dedup.
-        let already_scheduled = state.tasks.values().any(|t| {
-            t.chunk_id == chunk_id
-                && t.target_node == target_node
-                && task_blocks_requeue(t.status)
-        });
-
-        if already_scheduled {
-            debug!(
-                chunk_id,
-                target_node, "Replication task already scheduled, skipping"
-            );
-            return true;
+        let outcomes = plan_replication_batch(&mut state, reqs, max_new, now_millis());
+        let mut created = 0usize;
+        for (r, o) in reqs.iter().zip(&outcomes) {
+            match o {
+                ScheduleOutcome::New => {
+                    created += 1;
+                    info!(chunk_id = %r.0, source = r.1, target = r.2, "Scheduled replication task");
+                    self.audit.log(
+                        "scheduler",
+                        "replication.schedule",
+                        &format!("chunk={} src={} dst={}", r.0, r.1, r.2),
+                        "pending",
+                    );
+                }
+                ScheduleOutcome::Refused => warn!(
+                    chunk_id = %r.0,
+                    max_live = MAX_LIVE_TASKS,
+                    "replication task refused: live task budget exhausted"
+                ),
+                _ => {}
+            }
         }
-
-        // Same live-task ceiling as the repair passes, so a promotion burst
-        // cannot starve anchor/mandatory repair. Callers drop the rest for
-        // this tick (planners are idempotent and retry next tick).
-        let live_tasks = state.tasks.values().filter(|t| task_blocks_requeue(t.status)).count();
-        if !task_budget_available(0, live_tasks) {
-            warn!(
-                chunk_id,
-                live_tasks,
-                max_live = MAX_LIVE_TASKS,
-                "replication task refused: live task budget exhausted"
-            );
-            return false;
+        if created > 0 {
+            self.save_migration_state(&state).await;
         }
-
-        let now_ms = now_millis();
-        let task_id = format!("repl-{}", state.next_task_id);
-        state.next_task_id += 1;
-
-        let task = ReplicationTask {
-            task_id: task_id.clone(),
-            chunk_id: chunk_id.to_string(),
-            source_node,
-            target_node,
-            tier,
-            status: MigrationStatus::Pending,
-            created_at_ms: now_ms,
-            updated_at_ms: now_ms,
-            attempts: 0,
-            last_error: None,
-        };
-
-        info!(
-            task_id = %task_id,
-            chunk_id = %chunk_id,
-            source = source_node,
-            target = target_node,
-            "Scheduled replication task"
-        );
-
-        self.audit.log(
-            "scheduler",
-            "replication.schedule",
-            &format!("chunk={chunk_id} src={source_node} dst={target_node}"),
-            "pending",
-        );
-
-        state.tasks.insert(task_id, task);
-        self.save_migration_state(&state).await;
-        true
+        outcomes
     }
 
     /// AV-5-5 — return true when a replication task targeting `chunk_id`
@@ -401,12 +373,12 @@ impl TaskScheduler {
             match self.raft.client_write(req).await {
                 // A committed entry can still apply to ClientResponse::Error
                 // (refused removal): not removed, so no success log/audit.
-                Ok(r) if apply_error(&r.data).is_some() => warn!(
+                Ok(r) if client_response_ok(&r.data).is_err() => warn!(
                     path = %path,
                     idx,
                     node,
                     disk_id,
-                    error = apply_error(&r.data).unwrap_or_default(),
+                    error = client_response_ok(&r.data).err().unwrap_or_default(),
                     "Bug BX-11 excess-replica removal refused by apply"
                 ),
                 Ok(_) => {
@@ -500,12 +472,12 @@ impl TaskScheduler {
             match self.raft.client_write(req).await {
                 // Apply refused (e.g. would strand the anchor): the stale row
                 // is still there, so count it unreconcilable.
-                Ok(r) if apply_error(&r.data).is_some() => {
+                Ok(r) if client_response_ok(&r.data).is_err() => {
                     warn!(
                         node = node_id,
                         path = %path,
                         chunk_index,
-                        error = apply_error(&r.data).unwrap_or_default(),
+                        error = client_response_ok(&r.data).err().unwrap_or_default(),
                         "REV-3-10: apply refused dropping a missing replica row"
                     );
                     unreconcilable += 1;
@@ -697,13 +669,69 @@ impl TaskScheduler {
     }
 }
 
-/// A Raft `client_write` returning `Ok` only means the entry committed; the
-/// apply may still have produced `ClientResponse::Error`. Returns that message.
-pub(crate) fn apply_error(resp: &dtfs_raft::ClientResponse) -> Option<&str> {
-    match resp {
-        dtfs_raft::ClientResponse::Error { message } => Some(message.as_str()),
-        _ => None,
+/// Result of one request in a `schedule_replications` batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScheduleOutcome {
+    /// A new task was created.
+    New,
+    /// A live/lingering task for (chunk, target) already exists; free.
+    AlreadyScheduled,
+    /// Refused: live-task budget exhausted.
+    Refused,
+    /// Not processed: `max_new` new tasks already created this batch.
+    Deferred,
+}
+
+/// Pure batch planner behind `schedule_replications`: dedups per
+/// (chunk, target) via `task_blocks_requeue`, enforces the live-task budget,
+/// and counts only NEW tasks toward `max_new`.
+pub(crate) fn plan_replication_batch(
+    state: &mut MigrationState,
+    reqs: &[(&str, u64, u64, DiskTier)],
+    max_new: usize,
+    now_ms: u64,
+) -> Vec<ScheduleOutcome> {
+    let mut live = state.tasks.values().filter(|t| task_blocks_requeue(t.status)).count();
+    let mut out = Vec::with_capacity(reqs.len());
+    let mut new = 0usize;
+    for &(chunk_id, source_node, target_node, tier) in reqs {
+        let dup = state.tasks.values().any(|t| {
+            t.chunk_id == chunk_id && t.target_node == target_node && task_blocks_requeue(t.status)
+        });
+        if dup {
+            out.push(ScheduleOutcome::AlreadyScheduled);
+            continue;
+        }
+        if new >= max_new {
+            out.push(ScheduleOutcome::Deferred);
+            continue;
+        }
+        if !task_budget_available(0, live) {
+            out.push(ScheduleOutcome::Refused);
+            continue;
+        }
+        let task_id = format!("repl-{}", state.next_task_id);
+        state.next_task_id += 1;
+        state.tasks.insert(
+            task_id.clone(),
+            ReplicationTask {
+                task_id,
+                chunk_id: chunk_id.to_string(),
+                source_node,
+                target_node,
+                tier,
+                status: MigrationStatus::Pending,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                attempts: 0,
+                last_error: None,
+            },
+        );
+        live += 1;
+        new += 1;
+        out.push(ScheduleOutcome::New);
     }
+    out
 }
 
 /// Tiers a node can take a NEW anchor copy on: live disks (not

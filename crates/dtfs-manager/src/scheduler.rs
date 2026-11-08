@@ -144,7 +144,7 @@ pub(crate) fn client_response_ok(resp: &dtfs_raft::ClientResponse) -> Result<(),
 /// Serializable collection of active migration tasks, stored in Raft state
 /// via `ClientRequest::UpdateConfig`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct MigrationState {
+pub(crate) struct MigrationState {
     tasks: HashMap<String, ReplicationTask>,
     next_task_id: u64,
     /// task_id -> disk the target data node reported storing the copy on

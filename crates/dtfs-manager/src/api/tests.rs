@@ -1578,14 +1578,10 @@ mod bug_bv3_data_node_count_tests {
 mod cf1b_integrity_feed_tests {
     use super::action_is_integrity_fault;
 
-    /// CF-1b — `delete.fanout_failed` (Bug N) must surface in the integrity
-    /// feed. The handler matches structured `action` entries (replicated
-    /// branch) via the same prefix helper, so the audit row emitted by the
-    /// metadata fan-out lands in `/api/v1/integrity/faults` and the WebUI
-    /// feed. This was red before the prefix was added to INTEGRITY_ACTIONS.
+    /// Integrity actions surface in the integrity feed via the prefix helper.
     #[test]
-    fn delete_fanout_failed_is_integrity_fault() {
-        assert!(action_is_integrity_fault("delete.fanout_failed", ""));
+    fn quarantine_is_integrity_fault() {
+        assert!(action_is_integrity_fault("node.quarantine", ""));
     }
 
     /// A non-integrity action (e.g. a routine volume mutation) must NOT be
@@ -1599,7 +1595,7 @@ mod cf1b_integrity_feed_tests {
     /// column; the prefix match must still catch them there.
     #[test]
     fn matches_on_summary_when_action_empty() {
-        assert!(action_is_integrity_fault("", "delete.fanout_failed: node_addr=..."));
+        assert!(action_is_integrity_fault("", "node.quarantine: node=1"));
     }
 }
 

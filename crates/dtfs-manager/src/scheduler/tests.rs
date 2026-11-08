@@ -618,102 +618,6 @@ mod bug_bh_dedup_tests {
 }
 
 #[cfg(test)]
-mod cr_3_4_plan_replica_registration_tests {
-    //! CR-3-4/MGR-9 — pure-planner tests for `plan_replica_registration`,
-    //! the single-lock replacement for the old two-lock
-    //! `register_replica_location`/`register_replica_location_for_path`
-    //! split (which could observe two different snapshots of the file
-    //! tree and default a vanished hash to chunk_index 0).
-    use super::*;
-
-    fn file_with(chunks: Vec<ChunkLocationEntry>) -> dtfs_raft::state_machine::FileMetadata {
-        dtfs_raft::state_machine::FileMetadata {
-            path: "/f".to_string(),
-            volume_id: "default".to_string(),
-            chunk_size: 4 * 1024 * 1024,
-            chunks,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            symlink_target: None,
-            logical_size: None,
-            is_directory: false,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
-        }
-    }
-
-    fn entry(idx: u64, hash: &str, node: &str, disk: u32) -> ChunkLocationEntry {
-        ChunkLocationEntry {
-            chunk_index: idx,
-            chunk_hash: hash.to_string(),
-            node_id: node.to_string(),
-            disk_id: disk,
-            size_bytes: 1024,
-        }
-    }
-
-    /// CR-3-4/MGR-9 — a hash that resolves to no row anywhere yields NO
-    /// writes at all (never a fabricated chunk_index-0 registration).
-    #[test]
-    fn unresolvable_hash_yields_no_writes() {
-        let mut files = std::collections::BTreeMap::new();
-        files.insert("/f".to_string(), file_with(vec![entry(0, "other-hash", "1", 0)]));
-        let writes = plan_replica_registration(&files, "missing-hash", 5, 0);
-        assert!(writes.is_empty(), "no proposal for an unresolvable hash");
-    }
-
-    /// CR-3-4/MGR-8 — an intra-file duplicate hash (e.g. two indexes with
-    /// identical zero-filled padding content) registers the new replica
-    /// at EVERY carrying index, not just the first.
-    #[test]
-    fn duplicate_hash_within_one_file_registers_every_index() {
-        let mut files = std::collections::BTreeMap::new();
-        files.insert(
-            "/f".to_string(),
-            file_with(vec![entry(0, "h", "1", 0), entry(2, "h", "1", 0)]),
-        );
-        let writes = plan_replica_registration(&files, "h", 9, 0);
-        assert_eq!(writes.len(), 1, "one referencing file");
-        let (path, entries) = &writes[0];
-        assert_eq!(path, "/f");
-        assert!(
-            entries.iter().any(|c| c.chunk_index == 0 && c.node_id == "9"),
-            "index 0 must get the new replica"
-        );
-        assert!(
-            entries.iter().any(|c| c.chunk_index == 2 && c.node_id == "9"),
-            "index 2 must ALSO get the new replica"
-        );
-        // Existing rows at both indexes survive.
-        assert!(entries.iter().any(|c| c.chunk_index == 0 && c.node_id == "1"));
-        assert!(entries.iter().any(|c| c.chunk_index == 2 && c.node_id == "1"));
-    }
-
-    /// Bug BH — dedup by (node_id, disk_id): registering a replica the
-    /// file already carries at that exact slot is a no-op, not a
-    /// duplicate row.
-    #[test]
-    fn already_present_replica_is_not_duplicated() {
-        let mut files = std::collections::BTreeMap::new();
-        files.insert("/f".to_string(), file_with(vec![entry(0, "h", "9", 2)]));
-        let writes = plan_replica_registration(&files, "h", 9, 2);
-        assert_eq!(writes.len(), 1);
-        let (_, entries) = &writes[0];
-        assert_eq!(entries.len(), 1, "no duplicate row for an already-present (node,disk)");
-    }
-
-    /// REV-4-6 — a hash shared by two files registers the new replica
-    /// against BOTH.
-    #[test]
-    fn shared_hash_registers_against_every_file() {
-        let mut files = std::collections::BTreeMap::new();
-        files.insert("/a".to_string(), file_with(vec![entry(0, "h", "1", 0)]));
-        files.insert("/b".to_string(), file_with(vec![entry(0, "h", "2", 0)]));
-        let writes = plan_replica_registration(&files, "h", 9, 0);
-        assert_eq!(writes.len(), 2);
-    }
-}
-
-#[cfg(test)]
 mod path_migration_tests {
     use super::*;
 
@@ -3025,10 +2929,10 @@ mod mgrsched_audit_repair_tests {
 
     // ---- Task 1: apply-level Error is a failure ----
     #[test]
-    fn apply_error_detects_refusal_only() {
+    fn client_response_ok_detects_refusal_only() {
         let err = dtfs_raft::ClientResponse::Error { message: "would strand anchor".into() };
-        assert_eq!(apply_error(&err), Some("would strand anchor"));
-        assert_eq!(apply_error(&dtfs_raft::ClientResponse::Success), None);
+        assert_eq!(client_response_ok(&err), Err("would strand anchor".to_string()));
+        assert_eq!(client_response_ok(&dtfs_raft::ClientResponse::Success), Ok(()));
     }
 
     // ---- Task 2: anchor DC case-insensitive ----
@@ -3162,5 +3066,53 @@ mod mgrsched_audit_repair_tests {
         let placements = vec![AnchorRepairPlacement { node_id: 9, dc: "toro".into(), tier: DiskTier::Warm }];
         let act = plan_anchor_lag_repair(&anchor("leli"), &placements, &nodes, "h", &HashSet::new()).unwrap();
         assert_eq!(act.target_node, 2, "node 1's only cold disk failed");
+    }
+}
+
+#[cfg(test)]
+mod batch_schedule_tests {
+    use super::*;
+
+    fn ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("c{i}")).collect()
+    }
+
+    /// N promotions mutate ONE state value (caller saves it once) and bump
+    /// next_task_id N times.
+    #[test]
+    fn batch_creates_all_in_one_state() {
+        let ids = ids(5);
+        let reqs: Vec<_> = ids.iter().map(|c| (c.as_str(), 1u64, 2u64, DiskTier::Warm)).collect();
+        let mut st = MigrationState::default();
+        let out = plan_replication_batch(&mut st, &reqs, usize::MAX, 10);
+        assert!(out.iter().all(|o| *o == ScheduleOutcome::New));
+        assert_eq!(st.tasks.len(), 5);
+        assert_eq!(st.next_task_id, 5);
+    }
+
+    /// Already-scheduled pairs do not count toward the cap, so later chunks
+    /// are not starved; the cap bounds NEW tasks only.
+    #[test]
+    fn dedup_does_not_consume_cap() {
+        let ids = ids(6);
+        let mut st = MigrationState::default();
+        let first: Vec<_> = ids[..3].iter().map(|c| (c.as_str(), 1u64, 2u64, DiskTier::Warm)).collect();
+        plan_replication_batch(&mut st, &first, usize::MAX, 10);
+        let all: Vec<_> = ids.iter().map(|c| (c.as_str(), 1u64, 2u64, DiskTier::Warm)).collect();
+        let out = plan_replication_batch(&mut st, &all, 2, 11);
+        use ScheduleOutcome::*;
+        assert_eq!(out, vec![AlreadyScheduled, AlreadyScheduled, AlreadyScheduled, New, New, Deferred]);
+        assert_eq!(st.tasks.len(), 5);
+    }
+
+    /// Live-task budget refusal is kept.
+    #[test]
+    fn budget_refuses() {
+        let mut st = MigrationState::default();
+        let big = ids(MAX_LIVE_TASKS);
+        let reqs: Vec<_> = big.iter().map(|c| (c.as_str(), 1u64, 2u64, DiskTier::Warm)).collect();
+        plan_replication_batch(&mut st, &reqs, usize::MAX, 1);
+        let out = plan_replication_batch(&mut st, &[("extra", 1, 2, DiskTier::Warm)], usize::MAX, 2);
+        assert_eq!(out, vec![ScheduleOutcome::Refused]);
     }
 }

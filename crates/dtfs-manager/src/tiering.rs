@@ -564,26 +564,30 @@ impl TieringEngine {
         }
 
         info!(
-            "Bug AV tick: {} promotions ({} deferred to later ticks), {} demotions",
+            "Bug AV tick: {} promotions planned, {} demotions",
             plan.promotions.len(),
-            plan.deferred_promotions,
             plan.demotions.len()
         );
 
         // -- Dispatch promotions via the scheduler.
-        for p in &plan.promotions {
-            let accepted = self
-                .scheduler
-                .schedule_replication(
-                    &p.chunk_id,
-                    p.source_node_id,
-                    p.target_node_id,
-                    p.target_tier,
-                )
-                .await;
-            if !accepted {
-                warn!("promotion dispatch stopped: scheduler task budget exhausted; remaining promotions re-planned next tick");
-                break;
+        // One migration-state load/save for the whole batch; only NEWLY
+        // scheduled tasks count toward the per-tick cap.
+        let reqs: Vec<(&str, u64, u64, DiskTier)> = plan
+            .promotions
+            .iter()
+            .map(|p| (p.chunk_id.as_str(), p.source_node_id, p.target_node_id, p.target_tier))
+            .collect();
+        let outcomes = self
+            .scheduler
+            .schedule_replications(&reqs, MAX_PROMOTIONS_PER_TICK)
+            .await;
+        let deferred = outcomes.iter().filter(|o| **o == crate::scheduler::ScheduleOutcome::Deferred).count();
+        if deferred > 0 || outcomes.contains(&crate::scheduler::ScheduleOutcome::Refused) {
+            warn!(deferred, "promotion dispatch capped or scheduler task budget exhausted; remainder re-planned next tick");
+        }
+        for (p, o) in plan.promotions.iter().zip(&outcomes) {
+            if *o != crate::scheduler::ScheduleOutcome::New {
+                continue;
             }
             self.audit.log(
                 "tiering",
@@ -1713,13 +1717,11 @@ pub(crate) struct TickPlan {
     pub demotions: Vec<TickDemotion>,
     /// CO-1-2 — demotes refused to protect the anchor DC.
     pub anchor_protected: Vec<AnchorProtectedDemote>,
-    /// Promotions beyond `MAX_PROMOTIONS_PER_TICK`; re-planned next tick.
-    pub deferred_promotions: usize,
 }
 
-/// A library scan can plan ~10k promotions at once; cap per tick so the
-/// Raft entries and migration-state saves stay small and anchor/mandatory
-/// repair (MAX_LIVE_TASKS) is not starved.
+/// A library scan can plan ~10k promotions at once; the dispatcher creates at
+/// most this many NEW tasks per tick (already-scheduled ones do not count) so
+/// anchor/mandatory repair (MAX_LIVE_TASKS) is not starved.
 pub(crate) const MAX_PROMOTIONS_PER_TICK: usize = 50;
 
 /// AV-2-4 — pure planner. Walks every chunk in the snapshot and
@@ -1766,10 +1768,6 @@ pub(crate) fn plan_cache_tick(
             &mut plan.demotions,
             &mut plan.anchor_protected,
         );
-    }
-    if plan.promotions.len() > MAX_PROMOTIONS_PER_TICK {
-        plan.deferred_promotions = plan.promotions.len() - MAX_PROMOTIONS_PER_TICK;
-        plan.promotions.truncate(MAX_PROMOTIONS_PER_TICK);
     }
     plan
 }
@@ -3367,13 +3365,8 @@ mod audit_co_tests {
         let n = MAX_PROMOTIONS_PER_TICK + 7;
         let snap = TickSnapshot { chunks: (0..n).map(|i| mk(i, n)).collect(), nodes: nodes.clone(), volumes: volumes.clone() };
         let plan = plan_cache_tick(&snap, 1_000, false);
-        assert_eq!(plan.promotions.len(), MAX_PROMOTIONS_PER_TICK);
-        assert_eq!(plan.deferred_promotions, 7);
-        // negative: at the boundary nothing is deferred
-        let snap = TickSnapshot { chunks: (0..MAX_PROMOTIONS_PER_TICK).map(|i| mk(i, 0)).collect(), nodes, volumes };
-        let plan = plan_cache_tick(&snap, 1_000, false);
-        assert_eq!(plan.promotions.len(), MAX_PROMOTIONS_PER_TICK);
-        assert_eq!(plan.deferred_promotions, 0);
+        // The planner no longer truncates: the dispatcher caps NEW tasks.
+        assert_eq!(plan.promotions.len(), n);
     }
 
     /// CO-1-2 — a second LELI replica keeps the anchor satisfied, so the

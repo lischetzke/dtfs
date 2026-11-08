@@ -31,15 +31,22 @@ text there.
 
 6. Migration marks Done only after `VerifyChunk` on the target. Every
    de-location goes through `scheduler::delocate_replica`: Raft
-   `RemoveChunkLocation` FIRST, byte delete AFTER; a failed Raft remove
-   issues no byte delete; a failed byte delete is never rolled back (the
-   orphan reaper reclaims it).
+   `RemoveChunkLocation` FIRST, byte delete AFTER; a failed OR
+   state-machine-refused Raft remove (`raft_write_checked` /
+   `client_response_ok`, the one Raft-response checker) issues no byte
+   delete; a failed byte delete is never rolled back (the orphan reaper
+   reclaims it). Registration of a finished copy uses the disk id the
+   target reported (`ReplicateChunkResponse.disk_id`) and sends only the
+   new row (apply is a union for lease-less writes). Data disk ids persist
+   in `.dtfs-disk-id`.
 7. Scrub hashes `.dat` vs `checksum`. Missing/unparseable `.meta` is first
    repaired from the `.dat` when the re-hash matches the id; only a
    digest mismatch or unreadable `.dat` quarantines, by RENAMING to
    `.dtfs/quarantine/<id>.dat.bad`, never `remove_file`.
-8. Unlink removes `FileMetadata` first, bytes async. Orphan/de-located
-   reap grace is measured on the on-disk `.dat` mtime, keyed by
+8. Unlink removes `FileMetadata` first and does NOT fan out deletes; the
+   orphan reaper reclaims bytes. The reaper re-reads the node view after
+   `ListChunks` and never de-locates a chunk recorded under another disk
+   of the same node. Orphan/de-located reap grace is measured on the on-disk `.dat` mtime, keyed by
    `(node_id, disk_id)` when the data node reports disk ids (node-wide
    fallback otherwise); unknown mtime defers the reap.
 9. Rename is one Raft command; chunk_id bindings unchanged.
@@ -57,8 +64,8 @@ text there.
   (`would_violate_anchor`, `demote_preserves_anchor`, `enforce_anchor` on
   apply). Anchor DC compares case-insensitively.
 - Presence and removal keyed by `(node_id, disk_id)`; removals carry the
-  disk id. Whole-chunk reclaimers (unlink fan-out, orphan reaper) stay
-  node-wide on purpose.
+  disk id. The orphan reaper is disk-keyed: it never removes a row
+  recorded under a different disk of the same node.
 
 ## RPC auth
 

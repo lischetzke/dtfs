@@ -380,66 +380,6 @@ pub(crate) fn replica_already_present(
         .any(|c| c.node_id == node_id && c.disk_id == disk_id)
 }
 
-/// CR-3-4/MGR-9 — pure planner for `register_replica_location`. For
-/// EVERY (file, chunk_index) pair whose existing rows carry
-/// `chunk_hash` (not just the first match — MGR-8's intra-file
-/// duplicate-hash case, e.g. zero-filled padding sharing a chunk),
-/// builds the FULL post-registration entry set for that index: existing
-/// rows plus the new target replica, deduped by `(node_id, disk_id)`
-/// (Bug BH). Returns one `(path, entries)` per referencing file; empty
-/// when the hash resolves to no row anywhere (caller treats that as an
-/// error rather than defaulting to chunk_index 0 — MGR-9).
-pub(crate) fn plan_replica_registration(
-    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
-    chunk_hash: &str,
-    target_node: u64,
-    resolved_disk_id: u32,
-) -> Vec<(String, Vec<ChunkLocationEntry>)> {
-    let target_str = target_node.to_string();
-    let mut writes = Vec::new();
-    for (path, fm) in files.iter() {
-        let mut indices: Vec<u64> = fm
-            .chunks
-            .iter()
-            .filter(|c| c.chunk_hash == chunk_hash)
-            .map(|c| c.chunk_index)
-            .collect();
-        indices.sort_unstable();
-        indices.dedup();
-        if indices.is_empty() {
-            continue;
-        }
-        // Bug AB — carry every EXISTING row of each touched index, then
-        // add the new one; merge_chunk_location_entries REPLACES a
-        // chunk_index's rows wholesale, so passing only the new entry
-        // would wipe prior replicas and loop under-replication forever.
-        let mut entries: Vec<ChunkLocationEntry> = fm
-            .chunks
-            .iter()
-            .filter(|c| indices.contains(&c.chunk_index))
-            .cloned()
-            .collect();
-        for idx in &indices {
-            // Bug BH — dedup by (node_id, disk_id), NOT node_id alone, so
-            // a second-tier mandatory copy on the same node is recorded.
-            let already = entries
-                .iter()
-                .any(|c| c.chunk_index == *idx && c.node_id == target_str && c.disk_id == resolved_disk_id);
-            if !already {
-                entries.push(ChunkLocationEntry {
-                    chunk_index: *idx,
-                    chunk_hash: chunk_hash.to_string(),
-                    node_id: target_str.clone(),
-                    disk_id: resolved_disk_id,
-                    size_bytes: 0,
-                });
-            }
-        }
-        writes.push((path.clone(), entries));
-    }
-    writes
-}
-
 /// Bug AV — pure planner kernel. Walks the snapshot, identifies cache-
 /// tier replicas eligible for deletion, refuses anything that would
 /// strand a mandatory-tier replica.

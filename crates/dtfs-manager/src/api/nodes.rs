@@ -566,7 +566,7 @@ pub(super) async fn set_maintenance(
         .client_write(req)
         .await
         .map_err(|e| err_body(StatusCode::SERVICE_UNAVAILABLE, format!("raft write failed: {e}")))?;
-    if let dtfs_raft::ClientResponse::Error { message } = resp.data {
+    if let Err(message) = crate::scheduler::client_response_ok(&resp.data) {
         warn!(node = nid, error = %message, "maintenance toggle refused by apply");
         return Err(err_body(StatusCode::CONFLICT, message));
     }
@@ -661,7 +661,7 @@ pub(super) async fn unquarantine_node_endpoint(
         .await
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": format!("raft write failed: {e}")}))))?;
-    if let dtfs_raft::ClientResponse::Error { message } = resp.data {
+    if let Err(message) = crate::scheduler::client_response_ok(&resp.data) {
         warn!(node = nid, error = %message, "unquarantine refused by apply");
         return Err(err_body(StatusCode::CONFLICT, message));
     }
@@ -738,7 +738,7 @@ pub(super) async fn decommission_node_endpoint(
             Json(json!({"error": format!("raft write failed: {e}")}))))?;
 
     // The apply is the authoritative writer; surface a committed refusal.
-    if let dtfs_raft::ClientResponse::Error { message } = resp.data {
+    if let Err(message) = crate::scheduler::client_response_ok(&resp.data) {
         return Err((StatusCode::CONFLICT, Json(json!({"error": message}))));
     }
 

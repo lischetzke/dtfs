@@ -19,11 +19,6 @@ pub(super) const INTEGRITY_ACTIONS: &[&str] = &[
     "scrub.deep.corrupt",
     "read.integrity_fault",
     "orphan.in_state_missing",
-    // CF-1b — delete fan-out failures (Bug N): a data node was
-    // unreachable or rejected DeleteChunk, so the deleted file's chunks
-    // are orphaned until the reconciler reclaims them. Surfacing it here
-    // makes the leak visible in the WebUI integrity feed.
-    "delete.fanout_failed",
 ];
 
 /// Bug BC-12b / CF-1b — does an audit entry belong in the integrity feed?
