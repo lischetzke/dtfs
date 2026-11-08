@@ -788,9 +788,10 @@ impl ChunkStore {
     /// corruption reporting. `pending_corruption` is in-memory only and
     /// quarantined chunks are no longer in `chunks/`, so scrub never finds
     /// them again; without this an unreported quarantine is lost on restart.
-    /// Chunks that have a live `.dat` again (re-replicated here since) are
-    /// skipped: the manager's removal is a node-wide sweep and must not drop
-    /// a good new copy. Returns the number enqueued.
+    /// Chunks that have a live `.dat` again ON THE SAME DISK (re-replicated
+    /// there since) are skipped: the manager's removal is per (node, disk)
+    /// and must not drop a good new copy. A live copy on another disk does
+    /// not suppress the report for this disk. Returns the number enqueued.
     pub fn requeue_quarantined_for_report(&self) -> usize {
         let mut ids = std::collections::BTreeSet::new();
         for d in self.disk_manager.all_disks() {
@@ -804,7 +805,7 @@ impl ChunkStore {
                     continue;
                 };
                 let Ok(id) = ChunkId::from_hex(stem) else { continue };
-                if self.chunk_file_path(&id).is_none() {
+                if !chunk_data_path(&d.mount_path, &id).exists() {
                     ids.insert((stem.to_string(), Some(d.disk_id)));
                 }
             }
@@ -2186,6 +2187,30 @@ mod tests {
             store.drain_pending_corruption(),
             vec![(gone.as_hex(), store.disk_id_for_path(&disk))]
         );
+    }
+
+    /// A live copy on ANOTHER disk must not suppress the report for the
+    /// disk that holds the quarantined bytes; one on the SAME disk must.
+    #[tokio::test]
+    async fn requeue_quarantined_skip_is_per_disk() {
+        let (store, cold, warm) = make_two_disk_store().await;
+        let vol = VolumeId::new("default".to_string());
+        let data = b"requeue-per-disk";
+        let id = ChunkId::from_bytes(checksum::compute(data));
+        let q = cold.path().join(".dtfs").join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(q.join(format!("{}.dat.bad", id.as_hex())), b"x").unwrap();
+        // Good copy on the warm disk only.
+        store.put_chunk(&id, data, &vol, DiskTier::Warm).await.unwrap();
+        assert!(chunk_data_path(warm.path(), &id).exists());
+        assert_eq!(store.requeue_quarantined_for_report(), 1);
+        assert_eq!(
+            store.drain_pending_corruption(),
+            vec![(id.as_hex(), store.disk_id_for_path(cold.path()))]
+        );
+        // Now a good copy on the quarantining disk too: skipped.
+        store.put_chunk(&id, data, &vol, DiskTier::Cold).await.unwrap();
+        assert_eq!(store.requeue_quarantined_for_report(), 0);
     }
 
     #[tokio::test]
