@@ -129,7 +129,8 @@ mountpoint = "/mnt/dtfs"
 # only in client memory for that window and are LOST if dtfs-fuse or the host
 # crashes. Media / NFS re-export only.
 #async_commit = false
-# Max age of an uncommitted buffered byte with async_commit = true (1..=600).
+# Max age of an uncommitted buffered byte with async_commit = true (1..=60,
+# half the 120 s write lease).
 #async_commit_secs = 30
 
 #[memory]

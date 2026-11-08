@@ -5340,6 +5340,18 @@ mod async_commit_fs_tests {
         }
     }
 
+    /// The config bound must stay at half the write lease (renewed only by
+    /// write() and commits, not by the timer's wait).
+    #[test]
+    fn async_commit_secs_bound_is_half_the_write_lease() {
+        let mut w = dtfs_common::config::FuseWriteConfig::default();
+        w.async_commit = true;
+        w.async_commit_secs = WRITE_LEASE_MS / 2000;
+        assert!(w.validate().is_ok());
+        w.async_commit_secs += 1;
+        assert!(w.validate().is_err());
+    }
+
     #[test]
     fn rename_lock_paths_sorted_unique_writers_only() {
         let w = OpenFlags::ReadWrite;

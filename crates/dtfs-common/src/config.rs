@@ -792,11 +792,14 @@ impl FuseConfig {
 }
 
 impl FuseWriteConfig {
-    /// `async_commit_secs` must be in `1..=600` when `async_commit` is on.
+    /// `async_commit_secs` must be in `1..=60` when `async_commit` is on: at
+    /// most half the FUSE write lease (`WRITE_LEASE_MS` 120 s), which renews
+    /// only on write() or a commit, so an idle writer's buffered bytes are
+    /// committed before the lease can lapse.
     pub fn validate(&self) -> Result<(), String> {
-        if self.async_commit && !(1..=600).contains(&self.async_commit_secs) {
+        if self.async_commit && !(1..=60).contains(&self.async_commit_secs) {
             return Err(format!(
-                "[write] async_commit_secs ({}) must be in 1..=600 when async_commit = true",
+                "[write] async_commit_secs ({}) must be in 1..=60 when async_commit = true (the write lease is 120 s and renews only on write or commit)",
                 self.async_commit_secs
             ));
         }
@@ -1145,7 +1148,7 @@ pub struct FuseWriteConfig {
     #[serde(default)]
     pub async_commit: bool,
     /// Max age (seconds) of an uncommitted buffered byte with
-    /// `async_commit = true`; validated `1..=600` only when it is on.
+    /// `async_commit = true`; validated `1..=60` only when it is on.
     #[serde(default = "default_async_commit_secs")]
     pub async_commit_secs: u64,
 }
@@ -2123,7 +2126,7 @@ warm = 2
         // Off: the age is not used, so it is not validated.
         let off: FuseWriteConfig = toml::from_str("async_commit_secs = 0").unwrap();
         assert!(off.validate().is_ok());
-        for ok in [1u64, 30, 600] {
+        for ok in [1u64, 30, 60] {
             let c: FuseWriteConfig =
                 toml::from_str(&format!("async_commit = true\nasync_commit_secs = {ok}")).unwrap();
             assert!(c.validate().is_ok(), "{ok}");
@@ -2132,13 +2135,13 @@ warm = 2
 
     #[test]
     fn async_commit_secs_out_of_range_refused_naming_the_key() {
-        for bad in [0u64, 601] {
+        for bad in [0u64, 61, 600] {
             let c: FuseWriteConfig =
                 toml::from_str(&format!("async_commit = true\nasync_commit_secs = {bad}")).unwrap();
             let err = c.validate().unwrap_err();
             assert_eq!(
                 err,
-                format!("[write] async_commit_secs ({bad}) must be in 1..=600 when async_commit = true")
+                format!("[write] async_commit_secs ({bad}) must be in 1..=60 when async_commit = true (the write lease is 120 s and renews only on write or commit)")
             );
         }
     }
