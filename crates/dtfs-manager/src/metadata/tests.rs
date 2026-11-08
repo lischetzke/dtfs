@@ -1421,6 +1421,47 @@ mod tests {
         assert!(deferred(&sm, DiskTier::Warm, "nrb", 2).is_empty());
     }
 
+    /// With the requester's full location (region included, as the FUSE
+    /// client now sends it) the floor fill and deferred placement pick the
+    /// same-DC node; a region-less requester is CrossRegion to every node and
+    /// falls back to the node-id tie-break (toro).
+    #[test]
+    fn requester_region_makes_ranking_prefer_same_dc() {
+        let sm = live_topology();
+        let vol = &sm.volumes["default"];
+        let pick = |req: Location| {
+            fill_floor_targets(
+                &sm.nodes,
+                &vol.effective_mandatory_replicas(),
+                &vol.spill,
+                &dtfs_common::config::PlacementConfig::default(),
+                &req,
+                DiskTier::Cold,
+                &["data01:9500".to_string()],
+                2,
+                &std::collections::HashSet::new(),
+            )
+        };
+        assert_eq!(pick(Location::new("lab", "nrb", "rack-1", "c")), vec!["data03:9500".to_string()]);
+        assert_eq!(pick(Location::new("", "nrb", "", "")), vec!["data02:9500".to_string()]);
+        let first = |req: Location| {
+            deferred_anchor_targets(
+                &sm.nodes,
+                &vol.effective_mandatory_replicas(),
+                &spill_for_fill(&vol.spill, Some("leli")),
+                &dtfs_common::config::PlacementConfig::default(),
+                &req,
+                DiskTier::Warm,
+                "leli",
+                2,
+                &std::collections::HashSet::new(),
+            )[0]
+            .clone()
+        };
+        assert_eq!(first(Location::new("lab", "nrb", "rack-1", "c")), "data03:9500");
+        assert_eq!(first(Location::new("lab", "toro", "rack-1", "c")), "data02:9500");
+    }
+
     /// A volume configured only via the newer `anchor = {..}` policy (no
     /// legacy `anchor_datacenter`) still has an anchor at allocation.
     #[test]

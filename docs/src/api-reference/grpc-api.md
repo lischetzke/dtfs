@@ -85,7 +85,7 @@ Order used by the FUSE client: `AcquireWriteLease`, `AllocateChunks`, stream `Pu
 
 | RPC | Request | Response |
 |---|---|---|
-| `AllocateChunks` | `path`, `num_chunks`, `volume_id`, `preferred_tier`, `exclude_addrs`, `requester_location` | `placements`: per chunk `chunk_index`, `primary_address`, `replica_addresses`, `tier`. Placement follows the file's own volume. |
+| `AllocateChunks` | `path`, `num_chunks`, `volume_id`, `preferred_tier`, `exclude_addrs`, `requester_location` (the FUSE client's full `[location]`), optional `defer_anchor` | `placements`: per chunk `chunk_index`, `primary_address`, `replica_addresses`, `tier`. Placement follows the file's own volume. `defer_anchor = true` from outside the anchor datacenter skips the forced anchor slot (FUSE `write.anchor_sync = false`). |
 | `CommitChunkLocations` | `path`, `volume_id`, `lease_id`, `chunks` (`ChunkLocationCommit`: `chunk_index`, `chunk_id`, `primary_address`, `size_bytes`, `disk_id`) | `success`, `lease_conflict`, `error`. Rejected when a chunk landed on fewer distinct `(node_id, disk_id)` replicas than the volume's `write_safety.min_replicas_before_ack` (after clamping). |
 
 `ChunkLocationCommit.disk_id` must be the `disk_id` returned by `PutChunkResponse`; the manager resolves the replica's tier from it.

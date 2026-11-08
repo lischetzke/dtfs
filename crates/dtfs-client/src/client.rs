@@ -221,6 +221,10 @@ struct DtfsClientInner {
     defer_anchor: std::sync::atomic::AtomicBool,
     /// Optional host name for the same purpose (mostly diagnostic).
     requester_host: parking_lot::RwLock<String>,
+    /// `[location].region` / `.rack`, completing `requester_dc`/`requester_host`
+    /// into the AllocateChunks `requester_location`.
+    requester_region: parking_lot::RwLock<String>,
+    requester_rack: parking_lot::RwLock<String>,
     /// LIS-19 — cluster shared secret for data-plane PutChunk auth.
     /// Empty = legacy plaintext (server skips verification).
     shared_secret: parking_lot::RwLock<String>,
@@ -263,6 +267,8 @@ impl DtfsClient {
                 requester_dc: parking_lot::RwLock::new(String::new()),
                 defer_anchor: std::sync::atomic::AtomicBool::new(false),
                 requester_host: parking_lot::RwLock::new(String::new()),
+                requester_region: parking_lot::RwLock::new(String::new()),
+                requester_rack: parking_lot::RwLock::new(String::new()),
                 shared_secret: parking_lot::RwLock::new(String::new()),
                 tls: parking_lot::RwLock::new(
                     dtfs_common::tls::TlsContext::plaintext(),
@@ -317,10 +323,26 @@ impl DtfsClient {
         *self.inner.max_message_size_mb.write() = max_message_size_mb;
     }
 
-    /// P0-9: set the client's DC/host labels for `read_chunk` telemetry.
-    /// Should be called once after construction (typically from the FUSE
-    /// startup path using the topology location from fuse.toml).
-    pub fn set_requester_location(&self, dc: &str, host: &str) {
+    /// Location sent as AllocateChunks `requester_location`; None without a DC.
+    pub(crate) fn requester_location_proto(&self) -> Option<dtfs_proto::dtfs::common::Location> {
+        let dc = self.inner.requester_dc.read().clone();
+        if dc.is_empty() {
+            return None;
+        }
+        Some(dtfs_proto::dtfs::common::Location {
+            region: self.inner.requester_region.read().clone(),
+            datacenter: dc,
+            rack: self.inner.requester_rack.read().clone(),
+            host: self.inner.requester_host.read().clone(),
+        })
+    }
+
+    /// P0-9: set the client's `[location]` (DC/host also label `read_chunk`
+    /// telemetry). Should be called once after construction (typically from
+    /// the FUSE startup path using the topology location from fuse.toml).
+    pub fn set_requester_location(&self, region: &str, dc: &str, rack: &str, host: &str) {
+        *self.inner.requester_region.write() = region.to_string();
+        *self.inner.requester_rack.write() = rack.to_string();
         *self.inner.requester_dc.write() = dc.to_string();
         *self.inner.requester_host.write() = host.to_string();
     }
@@ -512,22 +534,7 @@ impl DtfsClient {
         preferred_tier: &str,
         exclude_addrs: &[String],
     ) -> Result<AllocateChunksResponse> {
-        // Bug BX-9 — send the writer's datacenter so the manager's capacity
-        // spill can prefer the NEAREST tier with room (BX-1 distance key).
-        // We only have the DC (set via `set_requester_location`); region/rack/
-        // host stay empty, which is enough for same-DC-first ranking. Absent
-        // DC => no location => legacy speed->free ordering.
-        let dc = self.inner.requester_dc.read().clone();
-        let requester_location = if dc.is_empty() {
-            None
-        } else {
-            Some(dtfs_proto::dtfs::common::Location {
-                region: String::new(),
-                datacenter: dc,
-                rack: String::new(),
-                host: String::new(),
-            })
-        };
+        let requester_location = self.requester_location_proto();
         let request = AllocateChunksRequest {
             path: path.to_string(),
             num_chunks,
@@ -1649,5 +1656,27 @@ mod bug_cf_manager_walk_retry_tests {
             started.elapsed() < Duration::from_secs(5),
             "application errors must surface without backoff"
         );
+    }
+}
+
+#[cfg(test)]
+mod requester_location_tests {
+    use super::*;
+
+    /// The AllocateChunks `requester_location` carries the whole `[location]`:
+    /// with an empty region every node compares CrossRegion and the
+    /// manager's nearness ranking is neutral.
+    #[test]
+    fn requester_location_sends_full_location() {
+        let c = DtfsClient::new();
+        assert_eq!(c.requester_location_proto(), None, "no DC configured -> absent");
+        c.set_requester_location("home", "nrb", "r1", "client03_cln");
+        let l = c.requester_location_proto().unwrap();
+        assert_eq!(
+            (l.region.as_str(), l.datacenter.as_str(), l.rack.as_str(), l.host.as_str()),
+            ("home", "nrb", "r1", "client03_cln")
+        );
+        c.set_requester_location("home", "", "r1", "h");
+        assert_eq!(c.requester_location_proto(), None);
     }
 }

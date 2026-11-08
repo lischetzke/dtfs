@@ -126,7 +126,9 @@ async fn main() -> Result<()> {
     // P0-9: attach our DC label to every GetChunk request so the data node
     // can bucket per-chunk reads by DC for tiering's auto-move-replica logic.
     client.set_requester_location(
+        &fuse_config.location.region,
         &fuse_config.location.datacenter,
+        &fuse_config.location.rack,
         &fuse_config.location.host,
     );
     client.set_defer_anchor(!fuse_config.write.anchor_sync);
