@@ -1,257 +1,113 @@
 # FUSE Client Configuration
 
-The FUSE client is configured via `/etc/dtfs/fuse.toml`. This page documents every available option.
+File: `/etc/dtfs/fuse.toml`. Source of truth: `crates/dtfs-common/src/config.rs` (`FuseConfig`). A complete, parse-tested example is `deploy/examples/fuse.toml`.
 
-> **Malformed config = restart loop.** A `fuse.toml` that fails to parse
-> (syntax error, missing required field such as `manager_addr`) makes the
-> service exit at startup; under systemd it restart-loops every few seconds.
-> After editing, check `journalctl -u dtfs-fuse@<mount> -n 20`.
+## Conventions
 
-## Top-level options
+- **Scope**: every client key is `node` (per host).
+- **Reload**: no option is re-read while the process runs; change then restart the unit ([Live Reload](./live-reload.md)).
+- **Validated**: the process refuses to start when the check fails. Under systemd a failing start becomes a restart loop; after editing, check `journalctl -u dtfs-fuse@<mount> -n 20`.
+- Required tables: `[client]`, `[location]`, `[mount]`, `[readahead]`, `[cache]`, `[partition_safety]`. They may be empty when every key has a default, except `[client]` (`manager_addr`), `[location]` and `[mount]` (`mountpoint`). Optional: `[write]`, `[memory]`, `[tls]`, `[updater]` (CLI only).
+- Unknown keys are ignored silently; check spelling against this page.
+- Startup checks: `[memory]`, `client.max_message_size_mb`, `cache.prune_interval_secs`, `partition_safety.quorum_loss_timeout_secs`, `[tls]` resolution.
 
-These keys sit at the root of `fuse.toml` (before any `[table]` header).
+## Top-level key
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `read_location_priority` | `read_location_priority` | `Vec<String>` | `[]` | Datacenter or host names | No | Ordered read-location preference (U4). When set, a read picks the first replica whose `datacenter` **or** `host` matches the earliest-listed entry (case-insensitive), taking precedence over raw physical distance — the operator's explicit cross-DC routing intent. When no entry matches, selection falls through to physical distance and then a warm-over-cold tier tie-break. Empty (the default) = distance-only behaviour, unchanged. |
+Must precede the first `[table]` header.
 
-Read replica selection order (U4): **(1)** `read_location_priority` (if any entry matches a replica's DC/host); **(2)** physical distance (`SameHost` < `SameRack` < `SameDatacenter` < `SameRegion` < `CrossRegion`); **(3)** when distance is *equal*, prefer the faster tier (warm over the cold anchor HDD). The tier is only a tie-break — a strictly-nearer replica always wins, so a local cold copy still beats a remote warm one.
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `read_location_priority` | list of string | `[]` | Ordered datacenter or host names (case-insensitive). A read picks the first replica whose datacenter or host matches the earliest entry, ahead of physical distance. No match falls through to distance, then to a faster-tier tie-break at equal distance. Empty: distance only. |
 
-### Example
+Replica selection order: (1) `read_location_priority`; (2) physical distance (`SameHost` < `SameRack` < `SameDatacenter` < `SameRegion` < `CrossRegion`); (3) tier (warm before cold) only at equal distance.
 
 ```toml
-# A TORO client that should read from DC1 first, then DC3,
-# before considering any other replica by distance.
 read_location_priority = ["dc1", "dc3"]
 ```
 
----
+## `[client]`
 
-## `[client]` -- Manager Connection
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `manager_addr` | string | required | Primary manager gRPC `host:port`. |
+| `manager_addrs` | list of string | `[]` | Fallback managers, walked in order. `manager_addr` plus `manager_addrs` must include at least one Raft **voter**: reads work against a learner, but client mutations are not leader-forwarded, so writes fail with EIO otherwise. |
+| `shared_secret` | string | `""` | Cluster secret. Needed to self-register (the client then appears in the node table) and to sign mutating manager RPCs. Empty is accepted by the client, but a manager with a secret rejects the client's mutations. |
+| `heartbeat_interval_secs` | u64 | `10` | Keepalive re-registration cadence. Keep well below the manager's `raft.node_liveness_secs` (30) or the client flaps `Down`. `0` registers once only. |
+| `chunk_size_mb` | u32 | `4` | Chunk size of the write buffer. Must equal the chunk size of the volume being written. A write to a file whose chunk size differs is refused with an error that names this key. |
+| `chunk_read_timeout_secs` | u64 | `60` | Per-replica chunk-fetch timeout; on expiry the read fails over to the next replica. `0` disables the timeout (a hung node then stalls the read). Raise for very large chunks on very slow links. |
+| `max_message_size_mb` | u32 | `256` | **Validated**: > 0. Must be at least the managers' and data nodes' `grpc.max_message_size_mb`. |
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `manager_addr` | `client.manager_addr` | `String` | *(required)* | `host:port` | No | Primary manager gRPC endpoint for metadata operations. Reads are served by any manager (a nearby learner is ideal), but client mutations are not leader-forwarded: `manager_addr` + `manager_addrs` together MUST include at least one Raft voter, or every write fails with EIO after the 15 s manager walk. |
-| `manager_addrs` | `client.manager_addrs` | `Vec<String>` | `[]` | List of `host:port` | No | Additional manager endpoints, walked in order on failover (F-024). List every manager. |
-| `shared_secret` | `client.shared_secret` | `String` | `""` | Cluster secret | No | Required for the client to self-register and appear in the node table (Bug AA). Empty = the client stays invisible except while holding a write lease. |
-| `heartbeat_interval_secs` | `client.heartbeat_interval_secs` | `u64` | `10` | 0--liveness window | No | Keepalive re-register cadence (Bug BQ-1). Keep well under the manager's `raft.node_liveness_secs` (default 30) or the client flaps `Down`. `0` = register once. |
-| `chunk_size_mb` | `client.chunk_size_mb` | `u32` | `4` | Must match volume | No | Chunk size the write buffer splits files into (Bug BW). **Must equal the volume's chunk size** (manager `defaults.chunk_size_mb`); a mismatch corrupts multi-chunk reads. |
-| `chunk_read_timeout_secs` | `client.chunk_read_timeout_secs` | `u64` | `60` | `0` = disabled | No | Per-replica chunk-fetch timeout (FUSE-HOL). A hung/dead data node that never returns a transport error would otherwise stall the read — and the app's FUSE op — indefinitely; on timeout the read fails over to the next replica. Generous vs a 4 MB chunk at 40 Mbps (~0.8 s); raise for very large chunks on very slow links. `0` keeps the legacy unbounded await. Also bounds each background readahead prefetch. |
-| `max_message_size_mb` | `client.max_message_size_mb` | `u32` | `256` | 1--1024 | No | Maximum gRPC message size (MB) for the client's manager and data-node channels (CMN-3). Must be at least as large as the manager/data-node `[grpc].max_message_size_mb`, or a large response from a raised server-side cap gets rejected client-side. Must be > 0. |
+## `[location]`
 
-### Example
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `region`, `datacenter`, `rack` | string | required | Real topology of the client; drives nearest-replica routing. |
+| `host` | string | required | Also the client's **registry identity** (the FUSE client has no `[node].hostname`). Unique cluster-wide: never reuse a data node's or manager's hostname. Convention for a client on a data-node box: `<data-hostname>_cln`. |
 
-```toml
-[client]
-manager_addr = "mgr-01.example.com:9401"
-manager_addrs = ["mgr-02.example.com:9401", "mgr-03.example.com:9401"]
-shared_secret = "a-strong-random-secret"
-```
+The `_cln` suffix loses the `SameHost` tie-break; give each physical box its own `rack` so `SameRack` keeps reads local.
 
----
+## `[mount]`
 
-## `[location]` -- Client Topology Location
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `mountpoint` | path | required | Must exist. Can be overridden on the command line. |
+| `allow_other` | bool | `false` | Mount with FUSE `allow_other` so other UIDs (for example Plex) can use the mount. May require `user_allow_other` in `/etc/fuse.conf`. |
 
-The location block places this client in the four-level topology hierarchy. The cluster uses this to route reads to the nearest data node that holds the requested chunk.
+## `[readahead]`
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `region` | `location.region` | `String` | *(required)* | Any non-empty string | No | Geographic region where this client runs. |
-| `datacenter` | `location.datacenter` | `String` | *(required)* | Any non-empty string | No | Datacenter within the region. |
-| `rack` | `location.rack` | `String` | *(required)* | Any non-empty string | No | Rack or failure zone. |
-| `host` | `location.host` | `String` | *(required)* | Any non-empty string | No | Host-level identifier — **and this client's registry identity**. The FUSE client has no `[node].hostname`; it registers (and holds write leases) under this string. It must be unique cluster-wide: never reuse a data node's or manager's hostname, or the two daemons overwrite each other's registry entry. Convention for a client co-located with a data node: `<data-hostname>_cln`. |
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `mode` | string | `"folder-sequential"` | `disabled`, `file-only`, `file-sequential`, `folder-sequential` (also prefetches the next files in the directory). An unknown value falls back to `folder-sequential` with a warning. |
+| `prefetch_chunks` | u32 | `8` | Chunks prefetched ahead on sequential access. `0` disables chunk prefetch. |
+| `prefetch_next_files` | u32 | `3` | Files prefetched ahead (`folder-sequential` only). |
+| `cache_mb` | u64 | `64` | Byte budget of the in-memory prefetch cache; evicts to stay under it regardless of chunk size. |
+| `prefetch_max_inflight` | u32 | `2` | Concurrent prefetch `GetChunk` streams (`0` acts as 1). Keep `cache_mb >= (prefetch_chunks + prefetch_max_inflight) x chunk_size_mb`. |
 
-> The `_cln` suffix costs the `SameHost` distance tie-break for read routing
-> (the strings no longer match). Give each physical box its own `rack` value
-> so `SameRack` keeps reads local.
+See [Read-Ahead](../access/read-ahead.md).
 
-### Example
+## `[cache]`
 
-```toml
-[location]
-region = "eu"
-datacenter = "frankfurt"
-rack = "rack-b2"
-host = "app-server-01_cln"
-```
+On-disk chunk cache on the client.
 
----
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `local_cache_dir` | path | unset | Unset disables the disk cache. |
+| `local_cache_max_gb` | u64 | `50` | Eviction starts above the limit and stops at 90% of it. `0` = zero budget. |
+| `max_age_days` | u32 | unset | Evicts chunks not accessed for this long. Unset: size-based eviction only. |
+| `prune_interval_secs` | u64 | `3600` | **Validated**: > 0. |
 
-## `[mount]` -- FUSE Mount Point
+## `[write]` (optional)
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `mountpoint` | `mount.mountpoint` | `PathBuf` | *(required)* | Absolute filesystem path | No | Directory where the DTFS filesystem is mounted. This directory must exist and be empty before the FUSE client starts. Applications access DTFS files through this path. |
-| `allow_other` | `mount.allow_other` | `bool` | `false` | `true` or `false` | No | Mount with FUSE `allow_other` so non-root users (e.g. a media-server service under its own UID) can read and write through the mount (F-028). |
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `first_write_tier` | string | `"cold"` | `cold`: no tier hint, the manager uses the volume's own policy. `nearest-warm`: asks for the warm tier; honoured when a healthy warm disk exists, replica count clamped up to `write_safety.min_replicas_before_ack`. No datacenter affinity, and the volume anchor still forces one replica into the anchor datacenter. Unknown values act as `cold`. See [FUSE mount](../access/fuse-mount.md#first-write-tier-preference-bug-av). |
+| `flush_batch_chunks` | u32 | `4` | Complete chunks held back before one `AllocateChunks` plus `CommitChunkLocations` round trip. Clamped to 1..=32 and further so that `batch x chunk_size_mb <= 64`. `1` flushes per chunk. `flush`/close always drains held chunks. |
 
-### Example
+## `[partition_safety]`
 
-```toml
-[mount]
-mountpoint = "/mnt/dtfs"
-```
+Parsed but **not read** by the client in this build; partition behaviour is not configurable here. See [Partition Behavior](../access/partition-behavior.md). `quorum_loss_timeout_secs` is still range-checked.
 
----
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `mode` | string | `"strict"` | `strict`, `localreadonly`, `fulllock` (lowercase, no hyphens). Not read. |
+| `quorum_loss_timeout_secs` | u64 | `10` | **Validated**: > 0. Not otherwise read. |
+| `show_warning` | bool | `true` | Not read. |
 
-## `[readahead]` -- Read-Ahead Prefetching
+## `[tls]` (optional)
 
-Controls speculative prefetching of chunks and files to reduce read latency for sequential and predictable workloads.
+Same keys and semantics as the manager (`mode`, `cert_file`, `key_file`, `ca_file`; default `auto`), for connections to managers and data nodes. `cert_file`/`key_file` are the client certificate and key. **Validated** as on the manager. See [Manager `[tls]`](./manager.md#tls) and [TLS](../security/tls.md).
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `mode` | `readahead.mode` | `String` | `"folder-sequential"` | `"disabled"`, `"file-only"`, `"file-sequential"`, `"folder-sequential"` | Yes | Read-ahead strategy. `"disabled"` turns off all prefetching. `"file-only"` / `"file-sequential"` prefetch subsequent chunks of the current file. `"folder-sequential"` additionally prefetches the next files in the same directory (sorted by name) — useful for media streaming. Unknown values fall back to `"folder-sequential"` with a warning. |
-| `prefetch_chunks` | `readahead.prefetch_chunks` | `u32` | `8` | 0--64 | Yes | Number of subsequent chunks to prefetch when sequential access is detected. Set to `0` to disable chunk-level prefetching while keeping file-level prefetching active. |
-| `prefetch_next_files` | `readahead.prefetch_next_files` | `u32` | `3` | 0--20 | Yes | Number of subsequent files in the same directory to prefetch. Only applies when `mode` is `"folder-sequential"`. |
-| `cache_mb` | `readahead.cache_mb` | `u64` | `64` | >=1 | Yes | Byte budget (MB) for the in-memory prefetch cache (Bug CE). The cache evicts to stay under this regardless of chunk size, so whole-file reads cannot OOM the FUSE process. |
-| `prefetch_max_inflight` | `readahead.prefetch_max_inflight` | `u32` | `2` | >=1 (`0` degrades to `1`) | Yes | WI-05: maximum number of prefetch `GetChunk` streams allowed on the wire at once. The prefetch window stays `prefetch_chunks` deep; this only bounds concurrency, nearest chunk first. Keep `cache_mb >= (prefetch_chunks + prefetch_max_inflight) * client.chunk_size_mb` so the prefetch window cannot evict itself mid-flight. |
+## `[memory]` (optional)
 
-### Example
+`hard_cap_mb = 0` (default, or block absent) disables the ladder. With a cap: at the warn level the `[readahead] cache_mb` budget is halved; at the shed level all unconsumed prefetch is dropped (the disk cache survives). On a composite host the sum of all roles' caps must stay below host RAM.
 
-```toml
-[readahead]
-mode = "folder-sequential"
-prefetch_chunks = 8
-prefetch_next_files = 3
-prefetch_max_inflight = 2
-```
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `hard_cap_mb` | u64 | `0` | **Validated**: `0` or at least 128. |
+| `warn_threshold_pct` | u8 | `80` | **Validated**: 1..=100 and below `shed_threshold_pct`. |
+| `shed_threshold_pct` | u8 | `92` | **Validated**: at most 100. |
+| `sample_interval_secs` | u64 | `5` | `0` is treated as 1. |
 
----
+## `[updater]` (optional, CLI only)
 
-## `[cache]` -- Local Disk Cache
-
-Controls an optional on-disk cache on the client machine that stores recently accessed chunks. This reduces network round trips for repeated reads.
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `local_cache_dir` | `cache.local_cache_dir` | `Option<PathBuf>` | `None` | Absolute filesystem path | No | Directory for the local chunk cache. When set to `None` (omitted), the local disk cache is disabled and all reads go to the network. |
-| `local_cache_max_gb` | `cache.local_cache_max_gb` | `u64` | `50` | 0--10000 | Yes | Maximum size of the local disk cache in gigabytes. When the cache exceeds this limit, the least recently used entries are evicted. `0` = zero byte budget (cache effectively disabled even when `local_cache_dir` is set). |
-| `max_age_days` | `cache.max_age_days` | `Option<u32>` | `None` | >=1 | Yes | Maximum age of a cached chunk before the pruner evicts it (atime-based, P0-11). Unset = size-based eviction only. |
-| `prune_interval_secs` | `cache.prune_interval_secs` | `u64` | `3600` | >=60 | Yes | Interval between background pruner sweeps. |
-
-### Example
-
-```toml
-[cache]
-local_cache_dir = "/var/cache/dtfs"
-local_cache_max_gb = 100
-```
-
----
-
-## `[write]` -- Write-Path Preferences (Bug AV)
-
-Controls how the FUSE client requests chunk placement at write time. Combined with the manager's anchor-lag-repair pass (AV-3-3), this lets operators trade durability latency for throughput on slow uplinks.
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `first_write_tier` | `write.first_write_tier` | `string` | `"cold"` | `"cold"`, `"nearest-warm"` | No (restart FUSE) | Tier preference for first-chunk placement, and a tier preference only. `"cold"` (default) sends no hint, so the manager uses the volume’s own effective tier at the volume’s replica count. `"nearest-warm"` asks for the warm tier; the manager honours it whenever any healthy node advertises a warm disk, and the replica count is clamped up to `write_safety.min_replicas_before_ack` (REV-4-10). The hint has NO datacenter affinity — placement runs with `prefer_client_locations = false` and never sees the writing client’s location — and the volume’s `anchor_datacenter` still forces one replica slot into the anchor DC in the same allocation. Any unrecognised value falls back to `"cold"` for forward-compat safety. |
-| `flush_batch_chunks` | `write.flush_batch_chunks` | `integer` | `4` | `1`-`32` (clamped, and further clamped so `flush_batch_chunks * chunk_size_mb <= 64`) | No (restart FUSE) | WI-01 — number of complete, chunk-aligned chunks the write buffer holds back before issuing one `AllocateChunks` + `CommitChunkLocations` round trip, instead of one round trip per chunk. Divides both RPC counts by roughly this factor on a sequential streaming write. WI-01 / H1 — the effective batch is additionally capped so `batch * chunk_size <= 64 MB`, so the client's un-committed buffer ceiling per open write never exceeds 64 MB regardless of `chunk_size_mb` (default `4 * 4 MB = 16 MB`; a 128 MB-chunk volume falls back to per-chunk flushing) — size it against the client's `[memory] hard_cap_mb`. `flush(fh)`/close always drains any held-back chunks regardless of this setting, so nothing is stranded past fsync. `1` reproduces the pre-WI-01 per-chunk-flush behaviour exactly (the rollback value). |
-
-### Example
-
-```toml
-[write]
-first_write_tier = "nearest-warm"
-```
-
-### When to use `"nearest-warm"`
-
-* **Fresh-download landing zones** — the NRB Plexmedia DC wants torrent finishes to ACK against fast warm SSD rather than the volume’s default tier. Note the anchor requirement is unchanged: with an `anchor_datacenter` set, one replica of the allocation still goes to the anchor DC, so the slow link is only avoided for the *other* replicas.
-* **Volumes whose default tier is the archive HDD** — steering first writes at the warm tier keeps the fast disks in the write path.
-
-> The mode does **not** steer placement toward the writing client’s own datacenter; see the note in [FUSE mount → First-write tier preference](../access/fuse-mount.md#first-write-tier-preference-bug-av). If you need DC-local writes, that is a placement change, not a client setting.
-
-### When to keep the default `"cold"`
-
-* **Compliance / DR workloads** — you want placement decided entirely by the volume policy, with no client-side input at all.
-* **Tiny clusters without a fast warm tier** — picking the wrong tier just adds a hop.
-
-> An anchor-lag window opens only when the allocation cannot place an anchor-DC replica (no healthy candidate in `anchor_datacenter`). In that case the manager’s anchor-lag-repair pass (AV-3-3) schedules the missing copy from the normal tiering tick. See [Tiering → Promotion math](../storage/tiering.md#promotion-math) for what happens *after* the first chunk lands.
-
----
-
-## `[partition_safety]` -- Network Partition Behavior
-
-Controls how the FUSE client behaves when it loses contact with the manager cluster (network partition or quorum loss).
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `mode` | `partition_safety.mode` | `PartitionMode` | `"strict"` | `"strict"`, `"localreadonly"`, `"fulllock"` | Yes | Behavior when the client cannot reach the manager quorum. `"strict"` returns I/O errors for all operations after `quorum_loss_timeout_secs`. `"localreadonly"` allows reads from the local cache but blocks all writes. `"fulllock"` freezes the mount entirely, causing all I/O to block until connectivity is restored. (TOML values are the lowercase variant names, no hyphens.) |
-| `quorum_loss_timeout_secs` | `partition_safety.quorum_loss_timeout_secs` | `u64` | `10` | 1--3600 | Yes | Number of seconds to wait after losing manager contact before the partition safety `mode` takes effect. During this grace period, cached metadata is used for reads and writes are buffered. |
-| `show_warning` | `partition_safety.show_warning` | `bool` | `true` | `true` or `false` | Yes | When `true`, the FUSE client logs a warning and writes a marker file at the mount root (`.dtfs-partition-warning`) when a partition is detected. Applications can watch for this file to implement their own partition-aware logic. |
-
-### Example
-
-```toml
-[partition_safety]
-mode = "strict"
-quorum_loss_timeout_secs = 10
-show_warning = true
-```
-
----
-
-## `[tls]` -- TLS Settings
-
-Optional block (CF-6). gRPC transport security toward managers and data
-nodes: mutual TLS verified against the cluster CA. The block may be omitted
-entirely (mode `"auto"` with no certificate paths resolves to plaintext, so
-legacy configs keep working). Enable only after every manager and data node
-runs a TLS-capable build -- see [TLS](../security/tls.md).
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `mode` | `tls.mode` | `String` | `"auto"` | `"auto"`, `"require"`, `"disabled"` | No | `"auto"` enables mTLS only when all three files are configured AND exist on disk, else plaintext. `"require"` fails startup unless all three load. `"disabled"` forces plaintext. |
-| `cert_file` | `tls.cert_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Client certificate presented to servers (mutual TLS). |
-| `key_file` | `tls.key_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Private key for `cert_file`. |
-| `ca_file` | `tls.ca_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Cluster CA used to verify manager and data-node certificates. |
-
----
-
-## `[memory]` -- Process Memory Budget
-
-Optional block (CF-5). `hard_cap_mb = 0` (the default, and the behaviour when
-the block is absent) means unbounded -- no pressure ladder. When non-zero, a
-background sampler watches RSS and, at the warn level, halves the
-[`[readahead]`](#readahead--read-ahead-prefetching) `cache_mb` prefetch budget;
-at the shed level it drops all unconsumed prefetch (the on-disk `[cache]`
-survives). systemd `MemoryHigh`/`MemoryMax` remain the hard backstop; on a
-composite host the sum of all roles' caps must stay under host RAM.
-
-| Option | TOML Path | Type | Default | Description |
-|--------|-----------|------|---------|-------------|
-| `hard_cap_mb` | `memory.hard_cap_mb` | `u64` | `0` | Total RAM budget for the FUSE client process in MB. `0` disables the ladder. |
-| `warn_threshold_pct` | `memory.warn_threshold_pct` | `u8` | `80` | At/above this fraction of the cap the readahead `cache_mb` budget is halved. |
-| `shed_threshold_pct` | `memory.shed_threshold_pct` | `u8` | `92` | At/above this all unconsumed prefetch is dropped from the in-memory cache. |
-| `sample_interval_secs` | `memory.sample_interval_secs` | `u64` | `5` | RSS sampling cadence. |
-
-CR-6-1: `dtfs-fuse` calls `MemoryConfig::validate()` right after config
-load and exits non-zero if `warn_threshold_pct >= shed_threshold_pct` or
-either is `> 100`.
-
----
-
-## `[updater]` -- Self-Updater Source
-
-Read by [`dtfs-cli update`](../api-reference/cli-reference.md#update) when
-run on this node (e.g. `dtfs-cli update fuse`, alias `client`); the FUSE
-client daemon itself ignores the block. Both keys are optional and
-default to the canonical DTFS repo and `/usr/local/bin`. See the
-`[updater]` section of the [Manager Configuration](./manager.md) page for
-the full option table.
-
-```toml
-[updater]
-repo_url    = "https://github.com/lischetzke/dtfs"
-token       = "gldt-..."          # deploy token for the private project
-install_dir = "/usr/local/bin"
-```
-
----
-
-## Complete Example
-
-The canonical, exhaustive example (every option, optional ones commented out
-with their defaults) is checked in at `deploy/examples/fuse.toml`. It is
-parse-tested against the config structs (`dtfs-common`
-`example_fuse_toml_parses`), so it cannot silently drift from the code.
+Read by `dtfs-cli update fuse` (alias `client`); the daemon ignores it. Keys and precedence: [Manager `[updater]`](./manager.md#updater-optional-cli-only).

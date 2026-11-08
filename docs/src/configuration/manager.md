@@ -1,404 +1,221 @@
 # Manager Configuration
 
-The manager node is configured via `/etc/dtfs/manager.toml`. This page documents every available option.
+File: `/etc/dtfs/manager.toml`. Source of truth: `crates/dtfs-common/src/config.rs` (`ManagerConfig`). A complete, parse-tested example is `deploy/examples/manager.toml`.
 
-## `[node]` -- Node Identity
+## Conventions
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `id` | `node.id` | `String` | `"auto"` | Any non-empty string or `"auto"` | No | Unique identifier for this manager node. When set to `"auto"`, a UUID v4 is generated on first startup and persisted to `data_dir`. |
-| `hostname` | `node.hostname` | `String` | *(required)* | Any non-empty string | No | This manager's **identity**: the Raft/registry `node_id` is a hash of this string. It must be unique across every daemon in the cluster and must exactly equal this node's `[[cluster.initial_voters]]` entry (see below). It does not have to be DNS-resolvable. |
-| `data_dir` | `node.data_dir` | `PathBuf` | `"/var/lib/dtfs"` | Absolute filesystem path | No | Directory where the manager stores Raft logs, snapshots, and metadata. Must exist and be writable by the DTFS process. |
+- **Scope** is `node` (legitimately different per host) or `cluster` (must be identical on every manager). See [Scope](./scope.md).
+- **Reload**: no manager option is re-read while the process runs. Every change needs a restart (see [Live Reload](./live-reload.md)).
+- **Validated**: the process refuses to start when the check fails (exit non-zero, reason in the log).
+- Required tables: `[node]`, `[location]`, `[cluster]`, `[raft]`, `[grpc]`, `[api]`, `[tls]`, `[defaults]`, `[tiering]`, `[monitoring]`. A required table may be empty when every key in it has a default. Optional tables: `[alerts]`, `[audit]`, `[scrub]`, `[placement]`, `[memory]`, `[updater]` (CLI only).
+- Unknown keys are ignored silently, so a misspelt key falls back to its default. Check spelling against this page.
+- Startup checks, in order: `cluster.shared_secret` non-empty, `[memory]`, `[placement]`, `[grpc]`, intervals (`[tiering]`, `[monitoring]`, `[raft]` timings), `[tls]` resolution.
 
-> **Identity uniqueness.** `node_id = hash(hostname)`. Two daemons that register
-> with the same hostname share one registry slot and overwrite each other on
-> every heartbeat (role flapping, vanishing `grpc_addr`). On a composite host,
-> give every role its own name: manager `dtfs-dc1-mgr01`, data node
-> `dtfs-dc1-data01`, FUSE client `dtfs-dc1-data01_cln` (the FUSE client
-> registers under its `[location].host` — see the FUSE client page).
+## `[node]`
 
-### Example
+| Key | Type | Default | Constraint | Scope |
+|---|---|---|---|---|
+| `hostname` | string | required | Unique across every daemon (managers, data nodes, clients). Must equal this node's `[[cluster.initial_voters]]` `hostname`. | node |
+| `id` | string | `"auto"` | Leave `auto`. | node |
+| `data_dir` | path | `/var/lib/dtfs` | Writable. Holds the Raft log (RocksDB), snapshots and metadata. | node |
 
-```toml
-[node]
-id = "auto"
-hostname = "mgr-01.example.com"
-data_dir = "/var/lib/dtfs/manager"
-```
+`node_id = hash(hostname)`. Two daemons with the same hostname overwrite each other's registry entry. On a composite host give every role its own name (manager `dtfs-dc1-mgr01`, data node `dtfs-dc1-data01`, FUSE client `dtfs-dc1-data01_cln`).
 
----
+## `[location]`
 
-## `[location]` -- Topology Location
+All four keys are required strings: `region`, `datacenter`, `rack`, `host`. Scope: node. Datacenter strings are compared case-insensitively where the anchor invariant is evaluated.
 
-The location block places this node in the four-level topology hierarchy used for replica placement and proximity-aware routing.
+## `[cluster]`
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `region` | `location.region` | `String` | *(required)* | Any non-empty string | No | Geographic region (e.g., `"eu"`, `"us-east"`). |
-| `datacenter` | `location.datacenter` | `String` | *(required)* | Any non-empty string | No | Datacenter within the region (e.g., `"frankfurt"`, `"us-east-1a"`). |
-| `rack` | `location.rack` | `String` | *(required)* | Any non-empty string | No | Rack or failure zone within the datacenter. |
-| `host` | `location.host` | `String` | *(required)* | Any non-empty string | No | Host-level identifier, typically matching the hostname. |
+| Key | Type | Default | Constraint | Scope |
+|---|---|---|---|---|
+| `name` | string | required | Identical on all managers. | cluster |
+| `shared_secret` | string | required | **Validated**: empty is refused unless `allow_insecure_empty_secret = true`. Identical on every manager, data node and client. Keep the file mode 0640. | cluster |
+| `allow_insecure_empty_secret` | bool | `false` | Lab only. With an empty secret, REST, join and RPC authentication are skipped. | cluster |
+| `require_raft_auth` | bool | `false` | `true`: Raft RPCs without a valid `x-dtfs-rpc-ts`/`x-dtfs-rpc-mac` stamp are rejected. `false`: unsigned RPCs are accepted with a rate-limited warning (rolling-update safe); a stamped-but-invalid RPC is always rejected. No effect with an empty secret. | cluster |
+| `bootstrap` | bool | `false` | `true` on exactly one manager, first start only. Never on a node joining an existing cluster (creates a second, divergent group). | node |
+| `initial_voters` | array of tables | `[]` | See below. | cluster |
 
-### Example
+`[[cluster.initial_voters]]`:
 
-```toml
-[location]
-region = "eu"
-datacenter = "frankfurt"
-rack = "rack-a1"
-host = "mgr-01"
-```
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `hostname` | string | required | Exactly the peer's `[node].hostname`. A manager that finds no entry for itself cannot join. |
+| `addr` | string | required | Peer-routable manager gRPC `host:port` (its `grpc.listen_addr` as seen by other nodes). Never `0.0.0.0`. |
+| `region`, `datacenter`, `rack` | string | `""` | Display hints for the node table only. |
 
----
-
-## `[cluster]` -- Cluster Membership
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `name` | `cluster.name` | `String` | *(required)* | Any non-empty string | No | Human-readable cluster name. All managers in a cluster must share the same name. |
-| `shared_secret` | `cluster.shared_secret` | `String` | *(required)* | Any non-empty string | No | Pre-shared key used to authenticate nodes joining the cluster. Must be identical on all nodes. Empty is refused at manager startup unless `allow_insecure_empty_secret` is set (LIS-20 / Sec R3). |
-| `allow_insecure_empty_secret` | `cluster.allow_insecure_empty_secret` | `bool` | `false` | `true` or `false` | No | Lab-only escape hatch. When `true`, an empty `shared_secret` is permitted and RegisterNode fail-opens. Never enable in production. |
-| `require_raft_auth` | `cluster.require_raft_auth` | `bool` | `false` | `true` or `false` | No | When `true`, Raft transport RPCs without a valid HMAC stamp are rejected. When `false`, unsigned RPCs are accepted with a rate-limited warning (rolling-update safe); stamped-but-invalid RPCs are always rejected. Set `true` once every manager signs Raft RPCs. Has no effect with an empty `shared_secret`. |
-| `bootstrap` | `cluster.bootstrap` | `bool` | `false` | `true` or `false` | No | Set to `true` on exactly one manager during initial cluster creation, and only for the very first start. **Never** set it on a node meant to join an existing cluster: it initializes a second, divergent Raft group that never federates (metadata split-brain). |
-| `initial_voters` | `[[cluster.initial_voters]]` | array of tables | `[]` | — | No | The full expected voter set. See below. |
-
-### `[[cluster.initial_voters]]` -- Voter Set
-
-One entry per manager. The identity contract:
-
-- `hostname` must **exactly equal** that manager's `[node].hostname` — the
-  Raft `node_id` is derived from this string. A manager that finds no entry
-  matching its own hostname cannot bootstrap-join and logs
-  `Bug AC bootstrap: no matching initial_voters entry for self`.
-- The **same list** must appear in every manager's `manager.toml`.
-- `addr` is the peer-routable Raft gRPC `host:port` (the peer's
-  `grpc.listen_addr` as other nodes reach it). Never `0.0.0.0` — peers dial
-  this exact string.
-- `region` / `datacenter` / `rack` are optional WebUI display hints.
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `hostname` | `String` | *(required)* | Must equal the peer's `[node].hostname`. |
-| `addr` | `String` | *(required)* | Routable `host:port` of the peer's manager gRPC. |
-| `region`, `datacenter`, `rack` | `String` | `""` | Optional topology hints for the node table. |
-
-The list is consulted at **bootstrap only** — editing `initial_voters`
-alone does not join an already-initialized cluster. Late joins go through
-the online membership API (`dtfs-cli raft add-learner` / `promote` /
-`remove`) — see [Cluster Management](../operations/cluster-management.md).
-Running managers still read the list as their peer-address pool (BR-1
-self-registration, follower→leader forwarding), so keep it in sync with
-the real membership.
-
-### Example
+The list is consulted at bootstrap and as the peer-address pool afterwards. Editing it does not join a running cluster: use `dtfs-cli raft add-learner` / `promote` / `remove` ([Cluster Management](../operations/cluster-management.md)). Keep it equal to the real membership.
 
 ```toml
 [cluster]
 name = "production"
 shared_secret = "a-strong-random-secret"
+require_raft_auth = true
 bootstrap = true            # first manager, first start only
 
 [[cluster.initial_voters]]
-hostname = "mgr-01"          # == that node's [node].hostname
+hostname = "mgr-01"
 addr = "10.0.0.1:9401"
-
 [[cluster.initial_voters]]
 hostname = "mgr-02"
 addr = "10.0.0.2:9401"
-
 [[cluster.initial_voters]]
 hostname = "mgr-03"
 addr = "10.0.0.3:9401"
 ```
 
----
+## `[raft]`
+
+| Key | Type | Default | Constraint | Scope |
+|---|---|---|---|---|
+| `listen_addr` | string | `0.0.0.0:9400` | **Not read.** The Raft transport is served on `grpc.listen_addr`. | node |
+| `election_timeout_ms` | u64 | `400` | **Validated**: > 0. The election timeout is randomised in `[value, 2 x value]`. | cluster |
+| `heartbeat_interval_ms` | u64 | `150` | **Validated**: > 0 and strictly below `election_timeout_ms`. | cluster |
+| `snapshot_threshold` | u64 | `10000` | Applied entries between snapshots. | cluster |
+| `max_in_snapshot_log_to_keep` | u64 | `1000` | Committed entries kept behind a snapshot. | node |
+| `rocksdb_keep_log_file_num` | u64 | `4` | RocksDB info-LOG files retained. | node |
+| `rocksdb_max_manifest_bytes` | u64 | `67108864` | MANIFEST rotation size (bytes). | node |
+| `rocksdb_write_buffer_mb` | u64 | `64` | Memtable size per column family (MiB). | node |
+| `rocksdb_block_cache_mb` | u64 | `64` | Shared block cache (MiB). | node |
+| `node_liveness_secs` | u64 | `30` | A node not seen for this long reads as `Suspect` (and `Down` past 4x) in the read API. FUSE `client.heartbeat_interval_secs` must stay well below it. | node |
+| `failed_task_retention_secs` | u64 | `1800` | How long a `Failed` migration task is kept before pruning. | node |
+| `done_task_retention_secs` | u64 | `300` | Same for `Done` tasks. | node |
+
+## `[grpc]`
+
+| Key | Type | Default | Constraint | Scope |
+|---|---|---|---|---|
+| `listen_addr` | string | required | `host:port`. Serves ManagerService and the Raft transport. | node |
+| `max_message_size_mb` | u32 | `256` | **Validated**: > 0. Data nodes and clients should use at least the same value. | node |
+| `max_concurrent_chunk_writes` | usize | `8` | Data-node setting; ignored on managers. | node |
+
+## `[api]`
+
+| Key | Type | Default | Constraint | Scope |
+|---|---|---|---|---|
+| `listen_addr` | string | `0.0.0.0:9402` | REST API and WebUI. A bind failure exits the process. | node |
+| `cors_origins` | list of string | `["*"]` | **Not read** (no CORS layer is installed). | node |
+
+## `[tls]`
+
+Mutual TLS for all manager gRPC (ManagerService, Raft transport, outbound connections). See [TLS](../security/tls.md).
 
-## `[raft]` -- Raft Consensus
+| Key | Type | Default | Constraint | Scope |
+|---|---|---|---|---|
+| `mode` | string | `"auto"` | **Validated**: `auto`, `require`, `disabled` (case-insensitive; aliases `disable`, `off`, `required`). Any other value refuses startup. `auto`: mTLS when all three files are set and exist; plaintext when none is set; startup error when only some are set; files set but absent on disk log a warning and stay plaintext. `require`: all three must be set and load, else startup fails. | node |
+| `cert_file`, `key_file`, `ca_file` | path | unset | PEM files. | node |
+
+Roll TLS out only after every node runs a TLS-capable build, and enable it on all roles together.
+
+## `[defaults]`
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `listen_addr` | `raft.listen_addr` | `String` | `"0.0.0.0:9400"` | `host:port` | No | Address and port for Raft peer-to-peer communication. |
-| `election_timeout_ms` | `raft.election_timeout_ms` | `u64` | `400` | 100--10000 | No | Maximum time in milliseconds a follower waits before starting an election. Higher values reduce spurious elections on slow networks but increase failover latency. |
-| `heartbeat_interval_ms` | `raft.heartbeat_interval_ms` | `u64` | `150` | 50--5000 | No | Interval in milliseconds at which the leader sends heartbeats to followers. Must be significantly less than `election_timeout_ms`. |
-| `snapshot_threshold` | `raft.snapshot_threshold` | `u64` | `10000` | 100--1000000 | No | Number of applied Raft log entries before a snapshot is triggered. Lower values use more disk I/O; higher values increase recovery time after restart. |
-| `rocksdb_keep_log_file_num` | `raft.rocksdb_keep_log_file_num` | `u64` | `4` | >=1 | No | RocksDB info-LOG files kept for the Raft log store (Bug BP-1; unbounded logs once filled a manager partition). |
-| `rocksdb_max_manifest_bytes` | `raft.rocksdb_max_manifest_bytes` | `u64` | `67108864` | >=1 MiB | No | RocksDB MANIFEST size before rotation (Bug BP-1). |
-| `rocksdb_write_buffer_mb` | `raft.rocksdb_write_buffer_mb` | `u64` | `64` | >=1 | No | RocksDB memtable (write buffer) size per column family for the Raft log store, in MiB (CNF-3). |
-| `rocksdb_block_cache_mb` | `raft.rocksdb_block_cache_mb` | `u64` | `64` | >=1 | No | RocksDB block-cache size for the Raft log store, in MiB; one LRU cache shared across both column families (CNF-3). |
-| `max_in_snapshot_log_to_keep` | `raft.max_in_snapshot_log_to_keep` | `u64` | `1000` | >=0 | No | Committed Raft log entries kept after a snapshot (Bug BP-1; keeps the on-disk log small). |
-| `node_liveness_secs` | `raft.node_liveness_secs` | `u64` | `30` | >=5 | No | A node whose `last_seen` is older than this is projected `Suspect` (and `Down` past 4x) in the read API, regardless of stored health (Bug BP-3). |
-| `failed_task_retention_secs` | `raft.failed_task_retention_secs` | `u64` | `1800` | >=1 | No | How long a `Failed` migration task lingers before the scheduler's terminal-task prune drops it (CNF-2; long enough to inspect after a `migration.failed` alert, short enough that a mass-failure event does not bloat the Raft snapshot). |
-| `done_task_retention_secs` | `raft.done_task_retention_secs` | `u64` | `300` | >=1 | No | How long a `Done` migration task lingers before the scheduler's terminal-task prune drops it (CNF-2). |
-
-### Example
-
-```toml
-[raft]
-listen_addr = "0.0.0.0:9400"
-election_timeout_ms = 400
-heartbeat_interval_ms = 150
-snapshot_threshold = 10000
-```
-
----
-
-## `[grpc]` -- gRPC Server
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `listen_addr` | `grpc.listen_addr` | `String` | *(required)* | `host:port` | No | Address and port for the gRPC server that data nodes and clients connect to. |
-| `max_message_size_mb` | `grpc.max_message_size_mb` | `u32` | `256` | 1--1024 | No | Maximum gRPC message size in megabytes. Increase if large metadata responses are expected. |
-
-### Example
-
-```toml
-[grpc]
-listen_addr = "0.0.0.0:9401"
-max_message_size_mb = 256
-```
-
----
-
-## `[api]` -- REST API / Web UI
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `listen_addr` | `api.listen_addr` | `String` | `"0.0.0.0:9402"` | `host:port` | No | Address and port for the HTTP REST API and Web UI. |
-| `cors_origins` | `api.cors_origins` | `Vec<String>` | `["*"]` | List of origin URLs or `"*"` | Yes | Allowed CORS origins for the REST API. Use `["*"]` to allow all origins, or specify exact origins for production environments. |
-
-### Example
-
-```toml
-[api]
-listen_addr = "0.0.0.0:9402"
-cors_origins = ["https://dashboard.example.com"]
-```
-
----
-
-## `[tls]` -- TLS Settings
-
-Mutual TLS (CF-6) for ALL manager gRPC -- the `ManagerService` listener, the
-Raft transport, and every outbound manager connection. Roll out only after
-every node runs a TLS-capable build -- see [TLS](../security/tls.md).
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `mode` | `tls.mode` | `String` | `"auto"` | `"auto"`, `"require"`, `"disabled"` | No | `"auto"` enables mTLS only when all three files are configured AND exist on disk, else plaintext (back-compat). `"require"` fails startup unless all three load. `"disabled"` forces plaintext. |
-| `cert_file` | `tls.cert_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Path to the TLS certificate file in PEM format. |
-| `key_file` | `tls.key_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Path to the TLS private key file in PEM format. |
-| `ca_file` | `tls.ca_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Path to the CA certificate bundle for verifying client certificates (mutual TLS). |
-
-### Example
-
-```toml
-[tls]
-mode = "require"
-cert_file = "/etc/dtfs/tls/server.crt"
-key_file = "/etc/dtfs/tls/server.key"
-ca_file = "/etc/dtfs/tls/ca.crt"
-```
-
----
-
-## `[defaults]` -- Default Volume Settings
-
-These defaults apply to newly created volumes unless overridden at volume creation time.
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `chunk_size_mb` | `defaults.chunk_size_mb` | `u32` | `4` | 1--1024 | Yes | Default chunk size in megabytes for new volumes. 4 MB is the workspace default (streaming put + memory budget make small chunks win: faster migrations, granular retries, finer cache). FUSE clients must use the same value (`client.chunk_size_mb`). |
-| `anchor_datacenter` | `defaults.anchor_datacenter` | `Option<String>` | unset | DC name | Yes | When set, every chunk placement guarantees at least one replica in this datacenter (the anchor invariant). Unset = no anchor enforcement. |
-
-### `[defaults.write_safety]`
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `min_replicas_before_ack` | `defaults.write_safety.min_replicas_before_ack` | `u32` | `2` | 1--replication factor | Yes | Minimum number of replicas that must acknowledge a write before the client receives success. Setting this to 1 gives lower latency but risks data loss on node failure. CR-6-2: clamped down (never raised) to the HIGHEST effective mandatory RF of any tier the chunks actually landed on -- a configured floor above every placed tier's own RF (e.g. the default 2 above cold's default RF 1) would otherwise reject every commit to that tier forever; a multi-tier placement (e.g. warm RF 3 + cold RF 1) still enforces the stricter warm RF, never downgrading to the weakest placed tier. The clamp is logged once per volume and audited as `write_safety.floor_clamped`. |
-| `write_timeout_secs` | `defaults.write_safety.write_timeout_secs` | `u32` | `30` | 1--3600 | Yes | Maximum time in seconds to wait for write acknowledgements before returning an error to the client. |
-
-> **Topology prerequisite.** `min_replicas_before_ack = N` is only a durable
-> guarantee if the cluster can *keep* N replicas: each counted replica needs a
-> tier with disks AND a maintainer (`mandatory_replicas` or a firing cache
-> promotion — see [Replication](../storage/replication.md)). If the Nth
-> replica lands on a tier nothing maintains, the ack is satisfied by a copy
-> that is later dropped and the file settles below N.
-
-### `[defaults.replication]`
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `hot` | `defaults.replication.hot` | `u32` | `3` | 0--9 | Yes | Default replication factor for hot-tier data. |
-| `warm` | `defaults.replication.warm` | `u32` | `2` | 0--9 | Yes | Default replication factor for warm-tier data. |
-| `cold` | `defaults.replication.cold` | `u32` | `1` | 0--9 | Yes | Default replication factor for cold-tier data. |
-| `tape` | `defaults.replication.tape` | `u32` | `1` | 0--9 | Yes | Default replication factor for tape-tier data. |
-
-> **A replication count alone creates nothing.** A tier's copies exist only if
-> something maintains them: the under-replication scheduler (driven by the
-> volume's `mandatory_replicas.<tier>`) or the tiering engine (cache replicas,
-> only when `promote_reads > 0` fires). `replication.warm = 1` with
-> `mandatory_replicas.warm = 0` and `promote_reads = 0` yields **zero** warm
-> copies. Details: [Replication](../storage/replication.md).
-
-### Example
-
-```toml
-[defaults]
-chunk_size_mb = 128
-
-[defaults.write_safety]
-min_replicas_before_ack = 2
-write_timeout_secs = 30
-
-[defaults.replication]
-hot = 3
-warm = 2
-cold = 1
-```
-
----
-
-## `[tiering]` -- Automatic Data Tiering
-
-Controls the automatic data tiering engine that moves chunks between hot, warm, cold, and frozen storage based on access patterns.
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `enabled` | `tiering.enabled` | `bool` | `true` | `true` or `false` | Yes | Enable or disable the automatic tiering engine. |
-| `hot_threshold_reads_per_hour` | `tiering.hot_threshold_reads_per_hour` | `u32` | `5` | 1--10000 | Yes | Minimum reads per hour for data to be classified as hot. Data below this threshold is considered warm. |
-| `cold_threshold_days` | `tiering.cold_threshold_days` | `u32` | `14` | 1--3650 | Yes | Days without access before data is classified as cold. |
-| `frozen_threshold_days` | `tiering.frozen_threshold_days` | `u32` | `60` | 1--3650 | Yes | Days without access before data is classified as frozen. Must be greater than `cold_threshold_days`. |
-| `migration_bandwidth_limit_mbps` | `tiering.migration_bandwidth_limit_mbps` | `u32` | `200` | 0--10000 | Yes | Maximum bandwidth in megabits per second allocated to tier migration. Set to `0` for unlimited. |
-| `evaluation_interval_secs` | `tiering.evaluation_interval_secs` | `u64` | `3600` | 60--86400 | Yes | How often, in seconds, the tiering engine evaluates data access patterns and triggers migrations. |
-| `enable_cache_redundancy_escalation` | `tiering.enable_cache_redundancy_escalation` | `bool` | `false` | `true` or `false` | Yes | Opt-in (Bug AV-4-5): let the cache planner ramp a chunk's cache replicas from `min` toward `max` once reads reach `2 x promote_reads`. |
-
-### Example
-
-```toml
-[tiering]
-enabled = true
-hot_threshold_reads_per_hour = 5
-cold_threshold_days = 14
-frozen_threshold_days = 60
-migration_bandwidth_limit_mbps = 200
-evaluation_interval_secs = 3600
-```
-
----
-
-## `[monitoring]` -- Node Health Monitoring
-
-Controls how the manager monitors the health of data nodes through heartbeats. The leader's health monitor derives its thresholds from this block at startup: `suspect = heartbeat_interval_secs * suspect_after_missed`, `down = heartbeat_interval_secs * down_after_missed` (clamped to at least one interval above suspect). Data nodes heartbeat every 5 s (fixed); keep `heartbeat_interval_secs` at 5 unless that changes.
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `heartbeat_interval_secs` | `monitoring.heartbeat_interval_secs` | `u64` | `5` | 1--300 | No (restart) | Expected interval in seconds between data node heartbeats. |
-| `suspect_after_missed` | `monitoring.suspect_after_missed` | `u32` | `3` | 1--100 | No (restart) | Number of consecutive missed heartbeats before a node is marked as suspect. A suspect node is still considered available but may be experiencing issues. |
-| `down_after_missed` | `monitoring.down_after_missed` | `u32` | `6` | 1--100 | No (restart) | Number of consecutive missed heartbeats before a node is marked as down. A down node triggers re-replication of its chunks. Must be greater than `suspect_after_missed`. |
-
-### Example
-
-```toml
-[monitoring]
-heartbeat_interval_secs = 5
-suspect_after_missed = 3
-down_after_missed = 6
-```
-
----
-
-## `[memory]` -- Process Memory Budget
-
-Optional block (CF-5). `hard_cap_mb = 0` (the default, and the behaviour when
-the block is absent) means unbounded -- no pressure ladder. When non-zero, a
-background sampler watches RSS. Warn takes no manager action (only the data
-and FUSE roles react at Warn); once RSS reaches the Shed level, the scheduler
-skips its background ticks (re-replication / migration / rebalance) so the
-manager gives RAM back instead of being OOM/cgroup-killed -- self-limiting via
-`MAX_CONSECUTIVE_PRESSURE_SKIPS` (REV-3-5), which forces a tick periodically so
-mandatory-replica repair can't wedge indefinitely. systemd `MemoryHigh`/
-`MemoryMax` remain the hard backstop; on a composite host the sum of all
-roles' caps must stay under host RAM.
-
-| Option | TOML Path | Type | Default | Description |
-|--------|-----------|------|---------|-------------|
-| `hard_cap_mb` | `memory.hard_cap_mb` | `u64` | `0` | Total RAM budget for the manager process in MB. `0` disables the ladder. |
-| `warn_threshold_pct` | `memory.warn_threshold_pct` | `u8` | `80` | At/above this fraction of the cap the manager logs Warn but takes no scheduler action. |
-| `shed_threshold_pct` | `memory.shed_threshold_pct` | `u8` | `92` | At/above this fraction of the cap the scheduler pauses background ticks (self-limiting, see above) until RSS recovers. |
-| `sample_interval_secs` | `memory.sample_interval_secs` | `u64` | `5` | RSS sampling cadence. |
-
-CR-6-1: `dtfs-manager` calls `MemoryConfig::validate()` right after config
-load and exits non-zero if `warn_threshold_pct >= shed_threshold_pct` or
-either is `> 100` -- an inverted/degenerate ladder used to flap Warn/Shed on
-every sample instead of being rejected at startup.
-
----
-
-## `[updater]` -- Self-Updater Source
-
-Read by [`dtfs-cli update`](../api-reference/cli-reference.md#update), not
-by the manager daemon (the daemon ignores the block). Both keys are
-optional; the defaults apply when the block -- or the whole file -- is
-absent. The same block is honoured in `data.toml` and `fuse.toml`;
-`dtfs-cli update <target>` reads `/etc/dtfs/<role>.toml` by default
-(override with `--config`).
-
-| Option | TOML Path | Type | Default | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|
-| `repo_url` | `updater.repo_url` | `String` | `https://github.com/lischetzke/dtfs` | No | Project the release tarball is pulled from. A GitLab project URL resolves to the Generic Package Registry (`<host>/api/v4/projects/<group>%2F<project>/packages/generic/dtfs/<tag>/dtfs-linux-amd64.tar.gz`, `latest` = newest full `vX.Y.Z` release, alphas skipped); a github.com URL keeps the legacy `releases/download` layout. Overridden by `--repo-url` and `DTFS_REPO_URL`. |
-| `token` | `updater.token` | `String` | `""` | No | GitLab token for a private project: a deploy token (`gldt-...`, scope `read_package_registry`, sent as `DEPLOY-TOKEN`) or a project/personal access token (`glpat-...`, scope `read_api`, sent as `PRIVATE-TOKEN`). Same 0640 file as `cluster.shared_secret`. Overridden by `--token` and `DTFS_REPO_TOKEN`. |
-| `minisign_public_key` | `updater.minisign_public_key` | `String` | `""` | No | Minisign public key (base64 line or full `.pub` text). When set, `dtfs-cli update` downloads `SHA256SUMS` + `SHA256SUMS.minisig`, verifies the signature, checks the tarball against `SHA256SUMS` and refuses the install on any failure. Empty = unverified (warning printed). Overridden by `DTFS_MINISIGN_PUBKEY`. |
-| `install_dir` | `updater.install_dir` | `String` | `/usr/local/bin` | No | Directory binaries are installed into. Overridden by `--install-dir`. |
-
-### Example
-
-```toml
-[updater]
-repo_url    = "https://github.com/lischetzke/dtfs"
-token       = "gldt-..."          # deploy token, read_package_registry
-install_dir = "/usr/local/bin"
-```
-
----
-
-## `[scrub]` -- Cluster-Wide Scrub & Integrity Policy
-
-Optional block (Bug BC). Propagated to every data node via heartbeat,
-overriding their local `[scrub]` fallback.
-
-| Option | TOML Path | Type | Default | Description |
-|--------|-----------|------|---------|-------------|
-| `quick_interval_secs` | `scrub.quick_interval_secs` | `u64` | `21600` (6 h) | Quick scrub cadence (stat + size + meta presence). |
-| `deep_interval_secs` | `scrub.deep_interval_secs` | `u64` | `604800` (7 d) | Deep scrub cadence (full BLAKE3 verify). |
-| `orphan_interval_secs` | `scrub.orphan_interval_secs` | `u64` | `86400` (1 d) | Orphan cross-check (data-node `ListChunks` vs metadata). |
-| `orphan_grace_secs` | `scrub.orphan_grace_secs` | `u64` | `86400` (1 d) | Grace before reaping an orphan, measured against the chunk's on-disk mtime (Bug CB). |
-| `max_io_percent` | `scrub.max_io_percent` | `u32` | `10` | Deep-scrub I/O throttle. |
-| `verify_on_read` | `scrub.verify_on_read` | `bool` | `true` | Hash-verify every read before bytes leave the data node. Disabling requires an explicit API acknowledgement and is the only mode where reads can return corrupt bytes. |
-| `quarantine_on_fault` | `scrub.quarantine_on_fault` | `bool` | `true` | A single integrity fault quarantines the faulting node immediately. |
-| `auto_unquarantine_secs` | `scrub.auto_unquarantine_secs` | `u64` | `0` | Cooldown for automatic unquarantine. `0` = manual only. |
-
----
-
-## `[alerts]`, `[audit]`, `[placement]` -- Optional Blocks
-
-| Block | Option | Default | Description |
-|-------|--------|---------|-------------|
-| `[[alerts.webhooks]]` | `url`, `secret`, `kinds`, `dedup_secs` | — / `""` / `[]` (all) / `300` | HTTP alert sinks (P1-8). |
-| `[audit]` | `replicate_via_raft` | `false` | Replicate audit entries via Raft so every manager serves the same `/api/v1/audit` view (Bug AH). Enable only after **all** managers run a binary that understands it — see the rollout recipe in `crates/dtfs-common/src/config.rs`. |
-| `[placement]` | `min_free_bytes` | `1073741824` (1 GiB) | Per-disk free-space reserve (Bug BU). |
-| | `min_free_pct` | `5.0` | Reserve = `max(min_free_bytes, total * pct%)`. |
-| | `allow_capacity_spill` | `true` | Spill a write to the fastest tier with room when the mandated tier is full, instead of failing it (Bug BX; the anchor copy is never spilled). `false` = fail-loud. |
-
-CR-6-1 (CMN-8): `dtfs-manager` calls `PlacementConfig::validate()` at
-startup and exits non-zero when `min_free_pct` is outside `0.0..=100.0`
-(or NaN) -- a value `>100` excludes every disk from the placement ring,
-and a negative/NaN value silently disables the reserve.
-
----
-
-## Complete Example
-
-The canonical, exhaustive example (every option, optional ones commented out
-with their defaults) is checked in at `deploy/examples/manager.toml`. It is
-parse-tested against the config structs (`dtfs-common`
-`example_manager_toml_parses`), so it cannot silently drift from the code.
+Seeds the auto-created `default` volume and the defaults for volumes created through the API. Read at startup. Changing it later does not modify existing volumes.
+
+| Key | Type | Default | Constraint | Scope |
+|---|---|---|---|---|
+| `chunk_size_mb` | u32 | `4` | Chunk size for new volumes. FUSE `client.chunk_size_mb` must equal the chunk size of the volumes it writes. | cluster |
+| `anchor_datacenter` | string | unset | When set, every chunk keeps at least one replica in this datacenter. Unset: no anchor. | cluster |
+
+`[defaults.write_safety]` (if the table is present, both keys are required):
+
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `min_replicas_before_ack` | u32 | `2` | A write is acknowledged only after this many distinct `(node_id, disk_id)` replicas are durable; a commit with fewer is rejected. The manager clamps it down (never up) to the highest mandatory replica count of the tiers the chunks landed on. The topology must be able to hold this many replicas. |
+| `write_timeout_secs` | u32 | `30` | Seconds to wait for acknowledgements. |
+
+`[defaults.replication]` (if the table is present, `hot`, `warm`, `cold` are required; `tape` defaults to `1`):
+
+| Key | Type | Default |
+|---|---|---|
+| `hot` | u32 | `3` |
+| `warm` | u32 | `2` |
+| `cold` | u32 | `1` |
+| `tape` | u32 | `1` |
+
+A replication count creates replicas only if something maintains them: the volume's `mandatory_replicas` (under-replication scheduler) or cache promotion (`promote_reads`). See [Replication](../storage/replication.md) and [Volume Configuration](./volume-config.md).
+
+## `[tiering]`
+
+| Key | Type | Default | Constraint | Scope |
+|---|---|---|---|---|
+| `enabled` | bool | `true` | | cluster |
+| `hot_threshold_reads_per_hour` | u32 | `5` | | cluster |
+| `cold_threshold_days` | u32 | `14` | | cluster |
+| `frozen_threshold_days` | u32 | `60` | Keep above `cold_threshold_days`. | cluster |
+| `migration_bandwidth_limit_mbps` | u32 | `200` | `0` = unlimited. | cluster |
+| `evaluation_interval_secs` | u64 | `3600` | **Validated**: > 0. | cluster |
+| `enable_cache_redundancy_escalation` | bool | `false` | `true`: the cache planner may raise a chunk's cache replicas from `min` toward `max` once reads reach 2 x `promote_reads`. | cluster |
+
+## `[monitoring]`
+
+The leader's health monitor reads these at startup: suspect after `heartbeat_interval_secs x suspect_after_missed`, down after `heartbeat_interval_secs x down_after_missed` (forced at least one interval above suspect). Data nodes heartbeat every 5 s (fixed); keep `heartbeat_interval_secs = 5`.
+
+| Key | Type | Default | Constraint | Scope |
+|---|---|---|---|---|
+| `heartbeat_interval_secs` | u64 | `5` | **Validated**: > 0. | cluster |
+| `suspect_after_missed` | u32 | `3` | **Validated**: > 0. | cluster |
+| `down_after_missed` | u32 | `6` | **Validated**: > 0. Keep above `suspect_after_missed`. | cluster |
+
+## `[scrub]` (optional)
+
+Cluster scrub and integrity policy. The manager sends it to every data node in each heartbeat response; it overrides the data node's local `[scrub]` fallback. It is read from this file at startup, so change it on every manager and restart.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `quick_interval_secs` | u64 | `21600` (6 h) | Stat, size and `.meta` presence. Values below 60 are raised to 60. |
+| `deep_interval_secs` | u64 | `604800` (7 d) | Full BLAKE3 verify. Values below 60 are raised to 60. |
+| `orphan_interval_secs` | u64 | `86400` | Data-node `ListChunks` versus metadata cross-check. |
+| `orphan_grace_secs` | u64 | `86400` | Grace before an orphan is reaped, measured against the `.dat` mtime. |
+| `max_io_percent` | u32 | `10` | Scrub I/O throttle. |
+| `verify_on_read` | bool | `true` | Hash every read before bytes leave the data node. Disabling is the only mode in which reads can return corrupt bytes. |
+| `quarantine_on_fault` | bool | `true` | `true`: a single integrity fault quarantines the faulting node, both on the data node (self-quarantine) and on the manager (fault reported in a heartbeat). `false`: faults are recorded and reported, nothing is quarantined. |
+| `auto_unquarantine_secs` | u64 | `0` | Cooldown for automatic unquarantine; `0` = manual only. |
+
+## `[placement]` (optional)
+
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `min_free_bytes` | u64 | `1073741824` | Per-disk free-space reserve. |
+| `min_free_pct` | f64 | `5.0` | **Validated**: `0.0..=100.0`. Reserve is `max(min_free_bytes, total x pct%)`. A disk under its reserve leaves the placement ring. |
+| `allow_capacity_spill` | bool | `true` | When the mandated tier is full, spill to the fastest tier with room (audited, rebalanced later). The anchor copy is never spilled. `false`: fail the write. Per-volume override: `volumes set-spill`. |
+
+## `[memory]` (optional)
+
+Per-process RAM budget and pressure ladder. `hard_cap_mb = 0` (default, or block absent) disables it. On the manager, once RSS reaches the shed level the scheduler skips background ticks (repair, migration, rebalance), self-limited so repair cannot stall indefinitely. Warn takes no manager action. systemd `MemoryMax` stays the hard backstop; on a composite host the sum of all roles' caps must stay below host RAM.
+
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `hard_cap_mb` | u64 | `0` | **Validated**: `0` or at least 128. |
+| `warn_threshold_pct` | u8 | `80` | **Validated**: 1..=100 and below `shed_threshold_pct`. |
+| `shed_threshold_pct` | u8 | `92` | **Validated**: at most 100. |
+| `sample_interval_secs` | u64 | `5` | `0` is treated as 1. |
+
+## `[audit]` (optional)
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `replicate_via_raft` | bool | `false` | `true`: audit entries are replicated through Raft so every manager serves the same `/api/v1/audit`. Enable only after every manager runs a binary that understands the entry type, then restart the managers. |
+
+## `[[alerts.webhooks]]` (optional)
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `url` | string | required | Masked in `/api/v1/config*` output. |
+| `secret` | string | `""` | Per-sink shared secret. Masked in `/api/v1/config*` output. |
+| `kinds` | list of string | `[]` | Empty = all alert kinds. |
+| `dedup_secs` | u64 | `300` | Duplicate suppression window. |
+
+See [Alerting](../operations/alerting.md).
+
+## `[updater]` (optional, CLI only)
+
+Read by [`dtfs-cli update`](../api-reference/cli-reference.md#update); the daemon ignores it. The same block works in `data.toml` and `fuse.toml`.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `repo_url` | string | `https://github.com/lischetzke/dtfs` | GitLab project URL (Generic Package Registry) or a github.com repo. Precedence: `--repo-url`, this key, `DTFS_REPO_URL`, built-in default. |
+| `token` | string | `""` | GitLab deploy token (`gldt-...`, scope `read_package_registry`) or access token (`glpat-...`, scope `read_api`). Precedence: `--token`, `DTFS_REPO_TOKEN`, this key. |
+| `minisign_public_key` | string | `""` | Minisign public key (base64 line or full `.pub` text). `DTFS_MINISIGN_PUBKEY` overrides it. When set, `SHA256SUMS` must carry a valid signature and list the tarball's hash, else the install is refused. Empty: unverified, a warning is printed. |
+| `install_dir` | string | `/usr/local/bin` | Overridden by `--install-dir`. |
+
+Keep the file mode 0640: `token` and `cluster.shared_secret` share it.

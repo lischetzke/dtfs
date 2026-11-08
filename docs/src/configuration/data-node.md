@@ -1,280 +1,113 @@
 # Data Node Configuration
 
-The data node is configured via `/etc/dtfs/data.toml`. This page documents every available option.
+File: `/etc/dtfs/data.toml`. Source of truth: `crates/dtfs-common/src/config.rs` (`DataNodeConfig`). A complete, parse-tested example is `deploy/examples/data.toml`.
 
-## `[node]` -- Node Identity
+## Conventions
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `id` | `node.id` | `String` | `"auto"` | Any non-empty string or `"auto"` | No | Unique identifier for this data node. When set to `"auto"`, a UUID v4 is generated on first startup and persisted to the data directory. |
-| `hostname` | `node.hostname` | `String` | *(required)* | Any non-empty string | No | This data node's **identity**: the registry `node_id` is a hash of this string. Must be unique across every daemon in the cluster — in particular it must differ from a co-located manager's `[node].hostname` and from a co-located FUSE client's `[location].host`. A collision makes the two daemons overwrite each other's registry entry on every heartbeat. |
-| `data_dir` | `node.data_dir` | `PathBuf` | `"/var/lib/dtfs"` | Absolute filesystem path | No | Directory where the data node stores local metadata and state. Must exist and be writable. Chunk data itself is stored on the configured disks (see `[[disks]]`). |
+- **Scope**: every data-node key is `node` (per host). The cluster-wide scrub policy comes from the manager and overrides `[scrub]` at runtime (see below).
+- **Reload**: no option is re-read while the process runs; change then restart ([Live Reload](./live-reload.md)).
+- **Validated**: the process refuses to start when the check fails.
+- Required tables: `[node]`, `[location]`, `[cluster]`, `[grpc]`, `[tls]`, `[cache]`, `[scrub]` and at least one `[[disks]]`. `[tls]`, `[cache]` and `[scrub]` may be empty. Optional: `[memory]`, `[placement]`, `[[tape_devices]]`, `[updater]` (CLI only).
+- Unknown keys are ignored silently; check spelling against this page.
+- Startup checks: `cluster.shared_secret` non-empty, `[memory]`, `[grpc]`, `[tls]` resolution, persistent disk ids.
 
-### Example
+## `[node]`
 
-```toml
-[node]
-id = "auto"
-hostname = "data-01.example.com"
-data_dir = "/var/lib/dtfs/data"
-```
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `hostname` | string | required | Identity: `node_id = hash(hostname)`. Unique across every daemon. Must differ from a co-located manager's `[node].hostname` and from a co-located FUSE client's `[location].host`. |
+| `id` | string | `"auto"` | Leave `auto`. |
+| `data_dir` | path | `/var/lib/dtfs` | Node-local state. Chunk bytes live on the `[[disks]]` paths. |
 
----
+## `[location]`
 
-## `[location]` -- Topology Location
+Required strings `region`, `datacenter`, `rack`, `host`. Use the same values as other daemons on the same box so reads prefer the local replica.
 
-Places this node in the four-level topology hierarchy used for replica placement and proximity-aware read routing.
+## `[cluster]`
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `region` | `location.region` | `String` | *(required)* | Any non-empty string | No | Geographic region (e.g., `"eu"`, `"us-east"`). |
-| `datacenter` | `location.datacenter` | `String` | *(required)* | Any non-empty string | No | Datacenter within the region. |
-| `rack` | `location.rack` | `String` | *(required)* | Any non-empty string | No | Rack or failure zone within the datacenter. |
-| `host` | `location.host` | `String` | *(required)* | Any non-empty string | No | Host-level identifier, typically matching the hostname. |
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `manager_addr` | string | required | Primary manager gRPC `host:port` (registration and heartbeat). |
+| `manager_addrs` | list of string | `[]` | Fallback managers, walked in order after repeated heartbeat failures. List every manager so a rolling manager restart never strands the node. |
+| `shared_secret` | string | required | **Validated**: empty is refused unless `allow_insecure_empty_secret = true`. Same value as the managers. Used to register, to sign heartbeats and to verify the `x-dtfs-rpc-*` stamp on data-plane RPCs. |
+| `allow_insecure_empty_secret` | bool | `false` | Lab only. With an empty secret, data-plane RPC authentication is skipped. |
 
-### Example
+## `[grpc]`
 
-```toml
-[location]
-region = "eu"
-datacenter = "frankfurt"
-rack = "rack-a1"
-host = "data-01"
-```
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `listen_addr` | string | required | Chunk-streaming gRPC. Use the routable address other nodes dial, not `0.0.0.0`, on a multi-interface host. |
+| `max_message_size_mb` | u32 | `256` | **Validated**: > 0. |
+| `max_concurrent_chunk_writes` | usize | `8` | In-flight `PutChunk` operations (floor 1). Bounds peak write memory (N x chunk size). |
 
----
+## `[tls]`
 
-## `[cluster]` -- Cluster Connection
+Same keys and semantics as the manager (`mode`, `cert_file`, `key_file`, `ca_file`; default `auto`). **Validated**: unknown `mode`, `require` without all three files, or a partial `auto` configuration refuses startup. See [Manager `[tls]`](./manager.md#tls) and [TLS](../security/tls.md).
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `manager_addr` | `cluster.manager_addr` | `String` | *(required)* | `host:port` | No | Primary manager gRPC endpoint to register with on startup. |
-| `manager_addrs` | `cluster.manager_addrs` | `Vec<String>` | `[]` | List of `host:port` | No | Additional manager endpoints, walked in order when the primary is unreachable (F-024). List every manager so a rolling manager restart never strands the node. |
-| `shared_secret` | `cluster.shared_secret` | `String` | *(required)* | Any non-empty string | No | Pre-shared key used to authenticate with the manager cluster and to MAC data-plane mutating RPCs (Put/Delete/ReplicateChunk). Must match the managers. Empty is refused at data-node startup unless `allow_insecure_empty_secret` is set (LIS-55 / LIS-20). |
-| `allow_insecure_empty_secret` | `cluster.allow_insecure_empty_secret` | `bool` | `false` | `true` or `false` | No | Lab-only escape hatch. When `true`, an empty `shared_secret` is permitted and data-RPC auth skips. Never enable in production. |
+## `[[disks]]`
 
-### Example
+One table per local disk or mount point. At least one is required.
 
-```toml
-[cluster]
-manager_addr = "mgr-01.example.com:9401"
-manager_addrs = ["mgr-02.example.com:9401", "mgr-03.example.com:9401"]
-shared_secret = "a-strong-random-secret"
-```
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `path` | path | required | Dedicated directory or mount point, writable by the daemon. |
+| `tier` | string | required | `hot`, `warm`, `cold` or `tape` (lowercase). |
 
----
-
-## `[grpc]` -- gRPC Server
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `listen_addr` | `grpc.listen_addr` | `String` | *(required)* | `host:port` | No | Address and port for the gRPC server that handles chunk read/write requests from clients and replication traffic from peers. On a multi-interface host, prefer the routable address other nodes dial over `0.0.0.0`. |
-| `max_message_size_mb` | `grpc.max_message_size_mb` | `u32` | `256` | 1--1024 | No | Maximum gRPC message size in megabytes. Must be at least as large as the maximum chunk size used in the cluster. |
-| `max_concurrent_chunk_writes` | `grpc.max_concurrent_chunk_writes` | `usize` | `8` | 1--32 | No | Maximum in-flight `PutChunk` operations (Bug D). Bounds peak write memory: N in-flight writes x chunk size. |
-
-### Example
+Disk ids are positions: the first `[[disks]]` entry is disk 0, the next disk 1, and so on. Replica identity is `(node_id, disk_id)`. The id is persisted in `<path>/.dtfs-disk-id` on first start, and **the daemon refuses to start** when a disk now sits at a different position. Therefore never remove or reorder entries in the middle of the list. Append new disks at the end; replace a failed or drained disk in place (same position, same path).
 
 ```toml
-[grpc]
-listen_addr = "0.0.0.0:9500"
-max_message_size_mb = 256
-```
-
----
-
-## `[tls]` -- TLS Settings
-
-Mutual TLS (CF-6) for the data gRPC listener plus outbound replication and
-manager connections. Roll out only after every node runs a TLS-capable
-build -- see [TLS](../security/tls.md).
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `mode` | `tls.mode` | `String` | `"auto"` | `"auto"`, `"require"`, `"disabled"` | No | `"auto"` enables mTLS only when all three files are configured AND exist on disk, else plaintext (back-compat). `"require"` fails startup unless all three load. `"disabled"` forces plaintext. |
-| `cert_file` | `tls.cert_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Path to the TLS certificate file in PEM format. |
-| `key_file` | `tls.key_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Path to the TLS private key file in PEM format. |
-| `ca_file` | `tls.ca_file` | `Option<PathBuf>` | `None` | Absolute path to PEM file | No | Path to the CA certificate bundle for verifying peer certificates. |
-
-### Example
-
-```toml
-[tls]
-mode = "require"
-cert_file = "/etc/dtfs/tls/data-node.crt"
-key_file = "/etc/dtfs/tls/data-node.key"
-ca_file = "/etc/dtfs/tls/ca.crt"
-```
-
----
-
-## `[[disks]]` -- Storage Disks
-
-The `[[disks]]` section is an array of tables. Each entry declares a disk (or mount point) that the data node uses to store chunk data. You must configure at least one disk.
-
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `path` | `disks[].path` | `PathBuf` | *(required)* | Absolute filesystem path | No | Mount point or directory path where chunk data is stored. Must be a dedicated mount point or directory that the DTFS process has full read/write access to. |
-| `tier` | `disks[].tier` | `DiskTier` | *(required)* | `"hot"`, `"warm"`, `"cold"`, `"tape"` | No | Storage tier classification for this disk. The tiering engine uses this to decide where to place chunks based on their access temperature. Typically, `"hot"` is NVMe/SSD, `"warm"` is SSD/fast HDD, `"cold"` is high-capacity HDD; `"tape"` is for LTFS mounts declared via `[[tape_devices]]`. |
-
-### Example
-
-```toml
-[[disks]]
-path = "/mnt/nvme-a"
-tier = "hot"
-
-[[disks]]
-path = "/mnt/ssd-a"
+[[disks]]          # disk 0
+path = "/mnt/hdd0"
+tier = "cold"
+[[disks]]          # disk 1
+path = "/mnt/ssd0"
 tier = "warm"
-
-[[disks]]
-path = "/mnt/hdd-a"
-tier = "cold"
-
-[[disks]]
-path = "/mnt/hdd-b"
-tier = "cold"
 ```
 
----
+## `[cache]`
 
-## `[cache]` -- Read Cache
+Parsed for backward compatibility and **ignored**: the data node has no server-side chunk cache (reads stream from disk). Client-side caching is the FUSE `[cache]` disk cache.
 
-**Inert since REV-4-5.** The in-memory ARC read cache is not wired into the read path: every `GetChunk` streams the chunk off disk in pieces so a read never holds a whole chunk in heap (CLAUDE.md § A.3.2). These keys are still parsed for back-compatibility but have no effect, and they no longer consume the data node's memory budget - previously the 8 GB default was subtracted when sizing `put_chunk` slots and collapsed write concurrency to a single slot on a memory-capped node. Client-side read caching is provided by the FUSE local disk cache (`local_cache_dir`) instead.
+| Key | Type | Default |
+|---|---|---|
+| `max_memory_mb` | u64 | `8192` |
+| `policy` | string | `"arc"` |
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `max_memory_mb` | `cache.max_memory_mb` | `u64` | `8192` | 256--1048576 | Yes | **Inert** (REV-4-5). Parsed, ignored. |
-| `policy` | `cache.policy` | `String` | `"arc"` | `"arc"`, `"lru"`, `"lfu"` | Yes | **Inert** (REV-4-5). Parsed, ignored. |
+## `[scrub]`
 
-### Example
+Local fallback used until the first heartbeat response arrives. From then on the manager's cluster `[scrub]` policy ([Manager `[scrub]`](./manager.md#scrub-optional)) overrides the intervals, I/O throttle, `verify_on_read` and `quarantine_on_fault` at runtime.
 
-```toml
-[cache]
-max_memory_mb = 16384
-policy = "arc"
-```
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `quick_interval_hours` | u64 | `6` | Stat, size and `.meta` presence. |
+| `deep_interval_hours` | u64 | `168` | Full BLAKE3 verify. |
+| `max_io_percent` | u32 | `10` | Clamped to 1..=100 when applied. |
+| `verify_on_read` | bool | `true` | Hash every read before bytes leave the node. |
+| `quarantine_on_fault` | bool | `true` | `true`: a single integrity fault self-quarantines the node. `false`: faults are recorded and reported, the node does not self-quarantine. The manager applies the same switch on its side. |
+| `quick_cron`, `deep_cron` | string | unset | **Not read.** |
+| `quick_interval_secs`, `deep_interval_secs` | u64 | `0` | Internal: filled from the manager's heartbeat for sub-hour cadences. Do not set by hand. |
 
----
+Quarantined chunks are moved to `.dtfs/quarantine/<id>.dat.bad`, never deleted.
 
-## `[scrub]` -- Data Integrity Scrubbing
+## `[memory]` (optional)
 
-Controls the background scrubbing process that verifies chunk integrity by recalculating and comparing checksums.
+`hard_cap_mb = 0` (default, or block absent) disables the ladder. Set a non-zero cap on every production deploy. With a cap, the node sizes `PutChunk` concurrency to it and, at the shed level, rejects new `PutChunk` with `RESOURCE_EXHAUSTED` (clients back off and retry) instead of risking an OOM kill. On a composite host the sum of all roles' caps must stay below host RAM.
 
-| Option | TOML Path | Type | Default | Valid Range | Live Reload | Description |
-|--------|-----------|------|---------|-------------|-------------|-------------|
-| `quick_interval_hours` | `scrub.quick_interval_hours` | `u64` | `6` | 1--720 | Yes | Interval in hours between quick scrub cycles. Quick scrubs verify chunk metadata and sizes without reading full chunk contents. |
-| `deep_interval_hours` | `scrub.deep_interval_hours` | `u64` | `168` | 1--8760 | Yes | Interval in hours between deep scrub cycles. Deep scrubs read entire chunk contents and recompute checksums. The default of 168 hours equals one week. |
-| `quick_cron` | `scrub.quick_cron` | `Option<String>` | `None` | Valid cron expression | Yes | Optional cron expression that overrides `quick_interval_hours` for scheduling quick scrubs. When set, `quick_interval_hours` is ignored. |
-| `deep_cron` | `scrub.deep_cron` | `Option<String>` | `None` | Valid cron expression | Yes | Optional cron expression that overrides `deep_interval_hours` for scheduling deep scrubs. When set, `deep_interval_hours` is ignored. |
-| `max_io_percent` | `scrub.max_io_percent` | `u32` | `10` | 1--100 | Yes | Maximum percentage of disk I/O bandwidth that scrubbing is allowed to consume. Keeps scrubbing from impacting normal read/write performance. |
-| `verify_on_read` | `scrub.verify_on_read` | `bool` | `true` | `true` or `false` | Yes | Startup fallback for hash-on-read before the first manager heartbeat arrives. |
-| `quarantine_on_fault` | `scrub.quarantine_on_fault` | `bool` | `true` | `true` or `false` | Yes | Startup fallback for fault-quarantine policy. |
+| Key | Type | Default | Constraint |
+|---|---|---|---|
+| `hard_cap_mb` | u64 | `0` | **Validated**: `0` or at least 128. |
+| `warn_threshold_pct` | u8 | `80` | **Validated**: 1..=100 and below `shed_threshold_pct`. |
+| `shed_threshold_pct` | u8 | `92` | **Validated**: at most 100. |
+| `sample_interval_secs` | u64 | `5` | `0` is treated as 1. |
 
-> This local block is only a **startup fallback** — once connected, the
-> manager's cluster-wide `[scrub]` policy (see the manager page) overrides it
-> via heartbeat.
+## `[placement]` (optional)
 
-CR-6-3 (PROTO-2): `quick_interval_secs`/`deep_interval_secs` are internal,
-not meant to be hand-set in `data.toml` (default `0` = unused). The manager's
-heartbeat `ScrubConfigOverride` populates them with the exact configured
-cadence so a sub-hour quick/deep interval takes effect precisely instead of
-silently rounding up to the nearest hour via `*_interval_hours`; an older
-manager leaves them `0` and this data node falls back to the hours field
-exactly as before.
+`PutChunk` rejects a write to a disk whose free space is below `max(min_free_bytes, total x min_free_pct%)` with a typed `RESOURCE_EXHAUSTED`, so the client reroutes instead of streaming into ENOSPC. Same keys as the manager's [`[placement]`](./manager.md#placement-optional) (`min_free_bytes` default `1073741824`, `min_free_pct` default `5.0`, `allow_capacity_spill` default `true`). The range check on `min_free_pct` runs on the manager only; use identical values on both.
 
-### Example
+## `[[tape_devices]]`
 
-```toml
-[scrub]
-quick_interval_hours = 6
-deep_interval_hours = 168
-max_io_percent = 10
-```
+Parsed (`ltfs_path`, `device`, `library_device`, `label`, `capacity_gb`, `max_write_mbps`) but **not read** by the daemon. A tape tier is declared through a `[[disks]]` entry with `tier = "tape"` on a pre-mounted LTFS path. See [Tape](../storage/tape.md).
 
-With cron overrides:
+## `[updater]` (optional, CLI only)
 
-```toml
-[scrub]
-quick_cron = "0 */6 * * *"
-deep_cron = "0 2 * * 0"
-max_io_percent = 15
-```
-
----
-
-## `[updater]` -- Self-Updater Source
-
-Read by [`dtfs-cli update`](../api-reference/cli-reference.md#update) when
-run on this node (e.g. `dtfs-cli update data`); the data-node daemon
-itself ignores the block. Both keys are optional and default to the
-canonical DTFS repo and `/usr/local/bin`. See the `[updater]` section of
-the [Manager Configuration](./manager.md) page for the full option table.
-
-```toml
-[updater]
-repo_url    = "https://github.com/lischetzke/dtfs"
-token       = "gldt-..."          # deploy token for the private project
-install_dir = "/usr/local/bin"
-```
-
----
-
-## `[memory]` -- Process Memory Budget
-
-Optional block (Bug G). `hard_cap_mb = 0` (the default, and the behaviour when
-the block is absent) means unbounded — no backpressure ladder. **Set a
-non-zero cap on every production deploy**; on a composite host the sum of all
-roles' caps must stay under host RAM.
-
-| Option | TOML Path | Type | Default | Description |
-|--------|-----------|------|---------|-------------|
-| `hard_cap_mb` | `memory.hard_cap_mb` | `u64` | `0` | Total RAM budget for the data-node process in MB. `0` disables the ladder. |
-| `warn_threshold_pct` | `memory.warn_threshold_pct` | `u8` | `80` | Log a warning when RSS crosses this fraction of the cap. |
-| `shed_threshold_pct` | `memory.shed_threshold_pct` | `u8` | `92` | Above this, new `put_chunk` requests get `RESOURCE_EXHAUSTED` (clients retry with backoff) instead of risking an OOM kill. |
-| `sample_interval_secs` | `memory.sample_interval_secs` | `u64` | `5` | RSS sampling cadence. |
-
-CR-6-1: `dtfs-data` calls `MemoryConfig::validate()` right after config
-load and exits non-zero if `warn_threshold_pct >= shed_threshold_pct` or
-either is `> 100`.
-
----
-
-## `[placement]` -- Free-Space Headroom
-
-Optional block (Bug BU). `put_chunk` rejects writes to a disk whose free space
-is below `max(min_free_bytes, total * min_free_pct%)` with a typed
-`RESOURCE_EXHAUSTED`, so the client reroutes instead of streaming into ENOSPC.
-
-| Option | TOML Path | Type | Default |
-|--------|-----------|------|---------|
-| `min_free_bytes` | `placement.min_free_bytes` | `u64` | `1073741824` (1 GiB) |
-| `min_free_pct` | `placement.min_free_pct` | `f64` | `5.0` |
-| `allow_capacity_spill` | `placement.allow_capacity_spill` | `bool` | `true` |
-
----
-
-## `[[tape_devices]]` -- LTFS Tape Devices
-
-Optional array; omit if the node has no tape drives. Each entry exposes an
-LTFS mount as `"tape"`-tier storage (write-once; only the tiering engine
-writes to tape). The LTFS filesystem must be mounted before `dtfs-data`
-starts.
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `ltfs_path` | `PathBuf` | *(required)* | LTFS mount point. |
-| `device` | `Option<String>` | `None` | Raw drive node (e.g. `/dev/nst0`) for status/rewind. |
-| `library_device` | `Option<String>` | `None` | Robotic changer (e.g. `/dev/sg2`); omit for standalone drives. |
-| `label` | `String` | *(required)* | Human-readable label for WebUI/CLI. |
-| `capacity_gb` | `Option<u64>` | `None` | Informational capacity hint per cartridge. |
-| `max_write_mbps` | `u32` | `0` | Tiering write bandwidth cap; `0` = unlimited. |
-
----
-
-## Complete Example
-
-The canonical, exhaustive example (every option, optional ones commented out
-with their defaults) is checked in at `deploy/examples/data.toml`. It is
-parse-tested against the config structs (`dtfs-common`
-`example_data_toml_parses`), so it cannot silently drift from the code.
+Read by `dtfs-cli update data`; the daemon ignores it. Keys and precedence: [Manager `[updater]`](./manager.md#updater-optional-cli-only).

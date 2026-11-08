@@ -1,39 +1,27 @@
-# Cluster vs node-scoped config (Bug BD)
+# Config Scope: Cluster vs Node
 
-Every key under `ManagerConfig` belongs to one of two scopes:
+Every `manager.toml` key is classified as **cluster** (must be identical on every manager) or **node** (legitimately different per host). The WebUI `/ui/config` page and `GET /api/v1/config/effective` expose the classification as `scope_kind`.
 
-| Scope | Where it must match | Examples |
+| Scope | Keys (manager) |
+|---|---|
+| cluster | `cluster.*`, `defaults.*`, `tiering.*`, `monitoring.*`, `alerts.*`, `audit.*`, `scrub.*`, `raft.election_timeout_ms`, `raft.heartbeat_interval_ms`, `raft.snapshot_threshold` |
+| node | everything else: `node.*`, `location.*`, `grpc.*`, `api.*`, `tls.*`, `placement.*`, `memory.*`, remaining `raft.*` keys |
+
+Data-node and FUSE-client files are node-scoped in full. The cluster scrub policy reaches data nodes through the manager's `[scrub]` block, not through their own file.
+
+`cluster.bootstrap` is classified as cluster but is `true` on exactly one manager by design; treat it as per-host.
+
+The classifier is `config_key_scope` in `crates/dtfs-manager/src/api/config.rs`. A key that is not in its prefix table is `node`, the safe default. A new `ManagerConfig` sub-table that should be cluster-wide needs a row there.
+
+## Why it matters
+
+Managers read their own file at startup. A cluster key that differs between managers produces different behaviour depending on which manager is leader (scheduler, tiering, monitor) or which one answers a request. After editing a cluster key, change it on every manager and restart them one at a time (learners, followers, then the leader).
+
+## Editing through the API
+
+| Action | Request | Required |
 |---|---|---|
-| **Cluster** | Identical on every manager | `cluster.*`, `defaults.*`, `tiering.*`, `monitoring.*`, `alerts.*`, `audit.*`, `scrub.*`, `raft.election_timeout_ms`, `raft.heartbeat_interval_ms`, `raft.snapshot_threshold` |
-| **Node** | Intentionally per-host | `node.hostname`, `node.id`, `node.data_dir`, `location.*`, `grpc.*`, `api.*`, `tls.*` |
+| Store an override in Raft | `POST /api/v1/config` with `write_to_disk:false` | nothing extra |
+| Also rewrite `/etc/dtfs/manager.toml` on the manager that handled the request | `POST /api/v1/config` with `write_to_disk:true` | `acknowledge_cluster_wide:true` |
 
-The WebUI **/ui/config** page surfaces this split with two tabs.
-Cluster opens by default. Search filters within the active tab.
-
-## Editing
-
-| Action | Endpoint | Required |
-|---|---|---|
-| Live-reload only (in-memory) | `POST /api/v1/config` `write_to_disk:false` | no ack |
-| Persist to `/etc/dtfs/manager.toml` | `POST /api/v1/config` `write_to_disk:true` | `acknowledge_cluster_wide:true` |
-
-The boundary check at `api.rs::update_config` enforces the ack
-flag. The WebUI Cluster tab sets it automatically. Editing a
-node-scoped key from a single manager and persisting it locally
-WILL drift relative to peers — manage with care.
-
-## Classification source of truth
-
-The classifier `config_key_scope(dotted) -> &'static str` in
-`crates/dtfs-manager/src/api.rs`. Test
-`bug_bd_1_classification_table` pins the 14 prefix table. New
-sub-configs added to `ManagerConfig` MUST add a row to that table
-or they fall back to `node` (safer default).
-
-## Deferred (v2)
-
-- Cross-manager federation: `/api/v1/nodes/{id}/config` proxy so
-  the Node tab can show peer managers' configs.
-- Raft-driven cluster propagation:
-  `ClientRequest::SetClusterConfig` variant so cluster-key changes
-  land on every manager without operator SSH.
+A body that contains a node-scoped key is rejected with `400` (`node-scoped keys cannot be set cluster-wide`). Details and limits: [Cluster-wide Configuration](./cluster-config.md) and [REST API](../api-reference/rest-api.md#config).

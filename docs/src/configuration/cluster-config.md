@@ -1,66 +1,49 @@
-# Cluster-wide Configuration
+# Cluster-wide Configuration Override
 
-Cluster-wide settings are managed through the Web UI or REST API and stored in the Raft-replicated state machine. Unlike per-node TOML files, these settings are centrally managed and automatically distributed to all nodes in the cluster.
+The manager REST API can store a **cluster configuration override**: a sparse JSON document kept in the Raft state machine with a version counter. It is a staging and inspection tool, not a runtime control plane.
 
-All cluster-wide settings support [live reload](./live-reload.md). When a setting is changed, the manager replicates the new configuration through Raft.
+## What it does and does not do
 
-## Default Volume Settings
+- `POST /api/v1/config` validates the override, stores it in Raft (version +1) and optionally rewrites `manager.toml` on the manager that handled the request.
+- `GET /api/v1/config` and `GET /api/v1/config/effective` return the startup config with the stored override merged on top.
+- **No daemon reads the override at runtime.** The scheduler, tiering engine, health monitor and volume defaults use the values loaded from `manager.toml` at startup. A stored override changes behaviour only if it was written to disk (`write_to_disk:true`) on each manager and the manager was restarted.
+- Settings for existing volumes are not part of this document; use the volume endpoints ([Volume Configuration](./volume-config.md)).
 
-These settings control the defaults applied when new volumes are created. They mirror the `[defaults]` section of the manager TOML file but take precedence over it once the cluster is running.
+For the keys themselves see [Manager Configuration](./manager.md); for which keys may be set here see [Scope](./scope.md).
 
-| Setting | Type | Default | Valid Range | Description |
-|---------|------|---------|-------------|-------------|
-| `chunk_size_mb` | `u32` | `128` | 1--1024 | Default chunk size in megabytes for newly created volumes. |
-| `write_safety.min_replicas_before_ack` | `u32` | `2` | 1--replication factor | Minimum replicas that must acknowledge a write before the client receives success. |
-| `write_safety.write_timeout_secs` | `u32` | `30` | 1--3600 | Maximum seconds to wait for write acknowledgements. |
-| `replication.hot` | `u32` | `3` | 1--9 | Default replication factor for hot-tier data. |
-| `replication.warm` | `u32` | `2` | 1--9 | Default replication factor for warm-tier data. |
-| `replication.cold` | `u32` | `1` | 1--9 | Default replication factor for cold-tier data. |
+## Writing an override
 
-Changing these defaults does not retroactively modify existing volumes. Use the per-volume configuration to update individual volumes.
+`POST /api/v1/config`:
 
-## Tiering Settings
+```json
+{
+  "config_json": "{\"tiering\":{\"evaluation_interval_secs\":1800}}",
+  "write_to_disk": false,
+  "acknowledge_cluster_wide": false
+}
+```
 
-Controls the cluster-wide automatic data tiering engine.
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `config_json` | string | required | JSON object, sparse. It replaces the previous stored override wholesale. |
+| `write_to_disk` | bool | `false` | Also write the merged, validated config to `/etc/dtfs/manager.toml` (temp file, fsync, atomic rename, mode 0600) on this manager only. |
+| `acknowledge_cluster_wide` | bool | `false` | Required when `write_to_disk` is `true` (otherwise `400`). |
 
-| Setting | Type | Default | Valid Range | Description |
-|---------|------|---------|-------------|-------------|
-| `tiering.enabled` | `bool` | `true` | `true` or `false` | Enable or disable the automatic tiering engine across the cluster. |
-| `tiering.hot_threshold_reads_per_hour` | `u32` | `5` | 1--10000 | Minimum reads per hour for data to remain classified as hot. |
-| `tiering.cold_threshold_days` | `u32` | `14` | 1--3650 | Days without access before data is reclassified as cold. |
-| `tiering.frozen_threshold_days` | `u32` | `60` | 1--3650 | Days without access before data is reclassified as frozen. |
-| `tiering.migration_bandwidth_limit_mbps` | `u32` | `200` | 0--10000 | Maximum bandwidth in Mbps for tier migration traffic. `0` means unlimited. |
-| `tiering.evaluation_interval_secs` | `u64` | `3600` | 60--86400 | Seconds between tiering evaluation cycles. |
-| `tiering.enable_cache_redundancy_escalation` | `bool` | `false` | `true` or `false` | Bug AV (AV-4-5): opt-in for the cache-tier redundancy-escalation pass. When `true` the planner may ramp cache replicas past `cache_replicas.<tier>.min` toward `.max` for chunks with sustained read pressure (>= `2 * promote_reads`). Leave `false` unless per-DC HA on warm needs the extra copy. |
+Checks, all before anything is stored or written (failures return `400` with `{"error": ..., "preserved_current": true}`):
 
-## Monitoring Settings
+1. Valid JSON.
+2. No node-scoped key (see [Scope](./scope.md)).
+3. The override deep-merged onto this manager's startup config must deserialize as a complete `ManagerConfig`. Out-of-type values fail here.
+4. For `write_to_disk`, the rendered TOML must parse back through the daemon's own loader.
 
-Controls health monitoring thresholds for data nodes.
+The write is a compare-and-set on the version counter. A concurrent update returns `409`: re-read `GET /api/v1/config` and retry. Secrets (`shared_secret`, `secret`, `token`, `password`, and webhook URLs) read back as `"***"`; posting `"***"` back keeps the stored value.
 
-| Setting | Type | Default | Valid Range | Description |
-|---------|------|---------|-------------|-------------|
-| `monitoring.heartbeat_interval_secs` | `u64` | `5` | 1--300 | Expected heartbeat interval in seconds. |
-| `monitoring.suspect_after_missed` | `u32` | `3` | 1--100 | Missed heartbeats before a node is marked suspect. |
-| `monitoring.down_after_missed` | `u32` | `6` | 1--100 | Missed heartbeats before a node is marked down and re-replication begins. |
+The merge does not run the startup range checks (`[memory]`, `[placement]`, intervals, `[tls]` mode). A value that parses but would fail those checks is accepted here and then stops the manager from starting after `write_to_disk`. Review the value against [Manager Configuration](./manager.md) first.
 
-## How Cluster Config Is Applied
+## Reading
 
-1. An administrator changes a setting via the Web UI or REST API.
-2. The leader manager proposes the change as a Raft log entry.
-3. Once committed, the new configuration is stored in the replicated state machine and read from there by the manager tasks that use it.
+`GET /api/v1/config/effective` lists one row per leaf key: `name`, `scope`, `scope_kind`, `current`, `default`, `is_default`. The `default` column is a hand-written baseline in the API handler and does not always equal the compiled-in default documented on the configuration pages (for example it reports `defaults.chunk_size_mb` as 128, the real default is 4). Trust the configuration pages for defaults.
 
-## REST API
+## Relationship to the TOML files
 
-Cluster configuration can be read and modified through the REST API:
-
-- `GET /api/v1/config` -- Returns the current cluster-wide configuration.
-- `POST /api/v1/config` -- Submits a partial or full configuration update. Only the fields included in the request body are changed; omitted fields retain their current values.
-- `GET /api/v1/config/effective` -- Returns the effective configuration.
-
-## Relationship to TOML Files
-
-The manager TOML file (`manager.toml`) provides initial seed values for cluster-wide settings. Once the cluster is bootstrapped and running:
-
-- Cluster-wide settings stored in Raft take precedence over the TOML file values.
-- The TOML file is only re-read on process startup and is used to populate the initial Raft state if no existing state is found.
-- Per-node settings (such as `[node]`, `[location]`, `[raft]`, `[grpc]`, and `[tls]`) always come from the local TOML file and are never overridden by cluster config.
+`manager.toml` is the source of truth on each manager. The override never reaches data nodes or clients except through the manager `[scrub]` policy heartbeat described in [Live Reload](./live-reload.md).
