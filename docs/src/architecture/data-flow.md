@@ -1,506 +1,146 @@
 # Data Flow
 
-This page traces the complete read and write data paths through the DTFS cluster, covering the interactions between FUSE clients, manager nodes, and data nodes. It also covers replication, write safety, transparent remote-DC fetch, and background migration.
+This page traces what happens, step by step, for the common operations and for the common failures. Terminology is in the [Architecture Overview](./overview.md).
 
-## High-Level Architecture Recap
+## Write
 
-Bulk data never flows through the manager. The manager provides metadata and placement decisions only; all chunk data travels directly between FUSE clients and data nodes (or between data nodes during replication).
-
-```
-+-------------+       metadata (gRPC)       +----------------+
-|  dtfs-fuse  | <-------------------------> |  dtfs-manager   |
-|  /mnt/dtfs  |                             |  (Raft leader)  |
-+------+------+                             +-------+--------+
-       |                                            |
-       |  chunk data (gRPC streaming)               |  placement,
-       |                                            |  replication
-       v                                            |  commands
-+-------------+       replication (gRPC)    +-------v--------+
-|  dtfs-data  | <------------------------> |   dtfs-data     |
-|  (node-a)   |                             |   (node-b)     |
-+-------------+                             +----------------+
-```
-
-## Read Path
-
-A FUSE `read()` call traverses the following stages:
-
-```
-  Application
-      |
-      | read(fd, buf, 4096)
-      v
-  +-----------+
-  | dtfs-fuse |  1. Translate offset to chunk index
-  |           |  2. Check metadata cache (TTL 5s)
-  |           |  3. If miss: GetFileLocations(path) -> manager
-  |           |  4. Select nearest node from replica list
-  |           |  5. Check read-ahead cache
-  |           |  6. If miss: GetChunk(chunk_id) -> data node
-  |           |  7. Trigger read-ahead for next chunks
-  |           |  8. Trigger migration check if remote read
-  |           |  9. Extract byte range, return to caller
-  +-----------+
+```text
+  app write()                dtfs-fuse                 manager (leader)        data nodes
+      |                         |                            |                     |
+      |-- bytes --------------->| 1. buffer by chunk         |                     |
+      |                         | 2. AcquireWriteLease ----->| (Raft)              |
+      |                         |    (120 s, renewed at 60 s)|                     |
+      |                         | 3. AllocateChunks -------->| placement           |
+      |                         |<-- targets per chunk ------|                     |
+      |                         | 4. hash chunk (BLAKE3)     |                     |
+      |                         | 5. PutChunk (stream) ------------------------->  all targets
+      |                         |    in parallel             |        tmp, fsync, rename, .meta
+      |                         | 6. need ceil(N/2) acks     |                     |
+      |                         | 7. CommitChunkLocations -->| (Raft) checks       |
+      |                         |    one row per acked replica   min_replicas_before_ack
+      |<-- ok ------------------|                            |                     |
 ```
 
-### Step-by-Step Read Sequence
+1. **Buffer.** The write buffer groups bytes by chunk (default chunk size 4 MB; the size must match the volume). A partial overwrite of an existing chunk first reads the old chunk once to seed the buffer (read-modify-write), then merges the new bytes. A write whose chunk size does not match the file's is refused with an error rather than committed misaligned.
+2. **Lease.** The client holds a write lease on the path (120 s, renewed after 60 s). A lapsed lease is re-acquired once under the same owner id; a lease held by another writer aborts the write. The local deadline is tracked on the handle so a renew is sent before a long flush, not after.
+3. **Allocate.** The manager places each chunk by the file's own registered volume, using the hash ring over healthy nodes with room, forcing one replica into the anchor datacenter (see [Data Distribution](./data-distribution.md)).
+4. **Hash.** The client hashes the chunk once. The hash is the chunk id and is sent as the declared id, so the data node can reject a bit flip between the client buffer and its own incremental hash.
+5. **Put.** The client streams the chunk to every target in parallel. Each data node writes `tmp/<uuid>.dat.tmp` incrementally while hashing, fsyncs, renames to `chunks/<aa>/<bb>/<id>.dat`, then writes `.meta` the same way, then clears the WAL entry. If a disk is full (`RESOURCE_EXHAUSTED`), the client re-allocates that chunk excluding the full node (bounded retries).
+6. **Quorum on the client.** The write proceeds when at least `ceil(N/2)` targets acknowledged with a matching chunk id. A node that returns a different id is treated as failed.
+7. **Commit.** `CommitChunkLocations` is one Raft command. The manager rejects it when any chunk has fewer distinct `(node_id, disk_id)` replicas than the volume's `write_safety.min_replicas_before_ack`. Replicas that missed the quorum are created later by the repair scheduler.
 
-```
-  dtfs-fuse                dtfs-manager              dtfs-data (node-a)
-      |                         |                          |
-      |  1. GetFileLocations    |                          |
-      |  ---------------------->|                          |
-      |                         |                          |
-      |  2. Response:           |                          |
-      |  path, total_size,      |                          |
-      |  chunks: [              |                          |
-      |    { chunk_id: "abc",   |                          |
-      |      size: 128MB,       |                          |
-      |      nodes: [           |                          |
-      |        "node-a:9500",   |                          |
-      |        "node-b:9500",   |                          |
-      |        "node-c:9500"    |                          |
-      |      ]                  |                          |
-      |    }, ...               |                          |
-      |  ]                      |                          |
-      |  <----------------------|                          |
-      |                         |                          |
-      |  3. GetChunk("abc")     |                          |
-      |  ------------------------------------------------>|
-      |                         |                          |
-      |  4. Streamed chunk data |                          |
-      |  <-------------------------------------------------|
-      |                         |                          |
-```
+Large writes flush in batches of complete chunks (`write.flush_batch_chunks`, default 4) so memory stays bounded. If a flush fails, the drained bytes are restored to the buffer. On `release`, a file that never committed a chunk (a create that failed) is unlinked (the "ghost" case); a file that has ever committed is never ghost-unlinked.
 
-### Metadata Caching
+Other write-side operations:
 
-The FUSE client caches `FileLocations` in a `DashMap` with a configurable TTL (default 5 seconds). On each `lookup()` or `open()`:
+- **rename** is one Raft command; chunk ids do not change. The client moves its buffers, inode mappings and mode overrides with the path, and descendants of a renamed directory are re-keyed.
+- **truncate** to a smaller unaligned size rewrites the tail chunk through the normal lease and commit path. A bare path `truncate` (no open writer) opens a temporary internal writer for that.
+- **unlink** removes the file's metadata only. Bytes are reclaimed later by the orphan reaper (see below).
 
-1. Check the cache by path. If the entry exists and `cached_at.elapsed() < metadata_ttl`, return the cached result.
-2. Otherwise, call `GetFileLocations` on the manager, store the result, and return it.
+## Read
 
-Cache invalidation happens automatically on TTL expiry and explicitly after a `flush()` or `unlink()`.
-
-### Read Replica Selection
-
-When a chunk has multiple replicas across different nodes, the FUSE client picks the read replica using a three-level precedence (U4):
-
-```
-  1. read_location_priority (operator config, if any entry matches)
-        first replica whose datacenter OR host matches the
-        earliest-listed entry wins -- takes precedence over distance
-        (the operator's explicit cross-DC routing intent)
-
-  2. Physical distance (closest first):
-        a. SameHost       -- co-located on the same machine
-        b. SameRack       -- same rack, different host
-        c. SameDatacenter -- same DC, different rack
-        d. SameRegion     -- same region, different DC
-        e. CrossRegion    -- different region entirely
-
-  3. Tier tie-break (only when distance is EQUAL):
-        prefer warm over the cold anchor HDD, to offload the slow
-        archive disk. NEVER overrides a strictly-nearer replica --
-        a local cold copy still beats a remote warm one.
+```text
+  app read()        dtfs-fuse                                 manager     data node
+     |                 |  1. metadata cache (5 s)                |            |
+     |                 |  2. miss: GetFileLocations ------------>|            |
+     |                 |<-- chunk list, replicas (live only) ----|            |
+     |                 |  3. readahead memory cache? disk cache? |            |
+     |                 |  4. order replicas, GetChunk (stream) ------------->|
+     |                 |<-- bytes, verified server side ---------------------|
+     |                 |  5. BLAKE3 of bytes == chunk id ?       |            |
+     |<-- bytes -------|  6. cache, prefetch ahead, RecordCacheHit ---------->|
 ```
 
-The selection function is `dtfs_client::location::select_read_replica`. Each replica's tier comes from the manager in `GetFileLocations` (`ChunkLocationInfo.node_tiers`, positionally aligned with `node_addresses`); an older manager leaves it empty, in which case the tier tie-break is inert and selection is pure distance. `read_location_priority` is configured per client in `fuse.toml` (empty by default = distance-only). If location data is unavailable for a node, it is treated as `CrossRegion`; with no client location the first address is used as a fallback.
+1. **Metadata.** Locations are cached per path for 5 s (bounded to 4096 entries). The response lists only live replicas unless none are live. It carries each replica's tier and location so the client can rank them.
+2. **Replica order.** `select_read_replica` ranks candidates: configured `read_location_priority` first, then physical distance (same host, rack, datacenter, region), then tier only on equal distance (prefer warm over the cold anchor HDD). A strictly nearer replica always wins.
+3. **Caches.** The read-ahead memory cache is checked first, then the optional local disk cache. A disk cache hit is also inserted into the memory cache. Concurrent misses for the same chunk are single-flighted: one fetch, the others wait.
+4. **Fetch and fail over.** The client tries candidates in order, each bounded by `client.chunk_read_timeout_secs` (default 60 s). The data node streams the file in pieces. With `verify_on_read` (default on) it hashes the file first and answers `data_loss` on a mismatch, so the client moves to the next replica. The read fails only after every candidate failed.
+5. **Client verify.** The client hashes the streamed bytes and compares them with the chunk id. A mismatch is an integrity fault and also fails over.
+6. **After the read.** The client stores the chunk in its caches, prefetches the following chunks, and tells a data node about the read (`RecordCacheHit`, at most once per file handle and chunk transition). Those read counts feed tiering.
 
-### Read-Ahead Prefetching
+`readdir` takes one snapshot of the directory per `opendir` and serves pages from it. The kernel's lookup and forget counts are tracked so an inode is dropped only when the kernel has forgotten it.
 
-After every successful chunk read, the `ReadAheadEngine` speculatively prefetches upcoming chunks in background tokio tasks. This improves throughput for sequential reads because by the time the application requests the next chunk, it is already in the prefetch cache.
+## A data node goes down
 
-The read-ahead engine supports multiple modes configured via `fuse.toml`:
-
-| Mode | Behavior |
-|------|----------|
-| `disabled` | No prefetching |
-| `sequential` | Prefetch the next N chunks after each read |
-| `aggressive` | Prefetch N chunks ahead plus adjacent files |
-
-Prefetched data is stored in a bounded in-memory cache (default 256 entries). Cache hits are logged at DEBUG level.
-
-### Serving GetChunk on the Data Node
-
-When a data node serves `GetChunk`, it never buffers the whole chunk in heap (Bug-I parity for the read side):
-
-- **Cache hit**: the chunk is already resident in the ARC cache, so it is sliced and streamed from that in-memory buffer in 8 MB pieces.
-- **Cache miss**: the node resolves the chunk's on-disk `.dat` path and size without reading the file, then streams it in 8 MB pieces via `read_exact` (one piece in RAM at a time). A cold miss does NOT repopulate the ARC cache, so a large-file read does not re-buffer the full chunk; a hot set re-promoted by tiering still lands in cache on later reads.
-
-When `verify_on_read` is enabled (the default), the miss path BLAKE3-hashes the on-disk file incrementally (one piece at a time, never the whole chunk) and compares against the stored `ChunkMeta.checksum` BEFORE any bytes leave the process. A mismatch returns `Status::data_loss` and serves nothing, so the FUSE client falls over to a healthy replica (P0-2); it then streams the file a second pass to send. Disabling `verify_on_read` (gated by an explicit API-boundary ack) skips the hash and streams the raw bytes — the only mode where a read can deliver corrupt bytes.
-
-## Write Path
-
-A FUSE `write()` call follows this sequence:
-
-```
-  Application
-      |
-      | write(fd, buf, len)
-      v
-  +-----------+
-  | dtfs-fuse |  1. Buffer data in WriteBuffer (chunk-aligned)
-  |           |  2. When a full chunk is ready:
-  |           |     a. AllocateChunks(path, count, volume_id) -> manager
-  |           |     b. PutChunk(chunk_id, data) -> primary data node
-  |           |  3. On flush/close: flush_all (including partial chunks)
-  +-----------+
+```text
+  t=0     last heartbeat from node D
+  t=15 s  3 missed: D is Suspect       (monitor)
+  t=30 s  6 missed: D is Down          (monitor, writes the state through Raft)
+  next    GetFileLocations stops returning D's replicas (unless a chunk has no
+  tick    live replica); reads fail over to other replicas
+  next    scheduler (leader): chunks whose LIVE replica count is below
+  tick    mandatory_replicas  -->  copy from a live source to a new disk,
+          verify the copy, then register ONLY the new row via Raft
 ```
 
-### Write Buffering
+- The monitor never marks `Maintenance`, `Draining` or `Quarantined` nodes `Down`, so a planned reboot or a quarantine is not turned into a repair storm.
+- The scheduler registers the new copy under the disk id the target actually reported. A lease-less location update is a union, so it can add a row but never erase other replicas.
+- Cache replicas that were on D are not repaired; the tiering engine recreates them if reads continue.
+- If D comes back, its replicas count again. Surplus copies are trimmed by the excess-replica pass, which never goes below the mandatory count plus the cache allowance and never removes the anchor.
 
-The `WriteBuffer` accumulates writes in memory and produces chunk-aligned segments. Small writes (e.g., 4KB application writes into a 128MB chunk) are coalesced until a full chunk boundary is reached. This avoids sending many small RPCs to data nodes.
+## A disk fails
 
-```
-  Application writes:   [4KB] [4KB] [4KB] ... [4KB]
-                         |     |     |          |
-                         v     v     v          v
-  WriteBuffer:          [========= 128MB chunk =========]
-                                     |
-                                     v  (chunk complete)
-                         flush_segments_to_cluster()
-```
+1. The disk is marked `failed` (reported status or operator action, see [Disk Management](../operations/disk-management.md)). Reads that hit the bad disk meanwhile fail over on the client.
+2. Replicas on that disk stop counting as live. The repair path is the same as for a down node, but only for that disk's chunks.
+3. When the repair copy is verified, the old row is removed through the one de-location path: Raft `RemoveChunkLocation` first, byte delete after. If Raft refuses (for example it would remove the last live replica), no byte is deleted.
+4. Disk ids persist in `.dtfs-disk-id`, so a restarted node does not look like a new disk, and a replaced disk gets a new id.
 
-Key behaviors:
+## A scrub finds a fault
 
-- **Aligned flush**: `flush()` only extracts segments where `chunk_size` bytes are complete. Partial trailing data remains in the buffer.
-- **Full flush**: `flush_all()` extracts all data, including partial final chunks. This is called on `close()` and explicit `fsync()`.
-- **Overlapping writes**: If the application overwrites a region already in the buffer, the new data replaces the old data in place.
-- **Gap filling**: Disjoint writes to the same file are joined with zero-filled gaps (optimized for sequential patterns).
-
-### Write Sequence Diagram
-
-```
-  dtfs-fuse               dtfs-manager              dtfs-data (primary)    dtfs-data (replica)
-      |                        |                          |                       |
-      |  1. AllocateChunks     |                          |                       |
-      |  --------------------->|                          |                       |
-      |                        |                          |                       |
-      |  2. Response:          |                          |                       |
-      |  placements: [         |                          |                       |
-      |    { primary: node-a,  |                          |                       |
-      |      replicas: [       |                          |                       |
-      |        node-b, node-c  |                          |                       |
-      |      ]                 |                          |                       |
-      |    }                   |                          |                       |
-      |  ]                     |                          |                       |
-      |  <---------------------|                          |                       |
-      |                        |                          |                       |
-      |  3. PutChunk(data)     |                          |                       |
-      |  ------------------------------------------------>|                       |
-      |                        |                          |                       |
-      |                        |                          |  4. replicate_to()    |
-      |                        |                          |  --------------------->|
-      |                        |                          |                       |
-      |  5. PutChunk ACK       |                          |  6. Replication ACK   |
-      |  <-------------------------------------------------|  <-------------------|
-      |                        |                          |                       |
-      |                        |  7. UpdateChunkLocations |                       |
-      |                        |  <-----------------------|                       |
-      |                        |  (via Raft commit)       |                       |
-      |                        |                          |                       |
+```text
+  quick scrub: stat .dat, compare size with .meta           (every 6 h)
+  deep scrub : re-hash .dat with BLAKE3, compare checksum   (every 7 d)
+        |
+        v
+  .meta missing or torn?  re-hash .dat; digest matches the chunk id?
+        |-- yes: rewrite .meta atomically, count as repaired, healthy
+        |-- no / .dat unreadable / digest mismatch:
+        v
+  rename .dat to .dtfs/quarantine/<id>.dat.bad   (never remove_file)
+  queue the id; the next heartbeat reports it to the manager
+        |
+        v
+  manager drops that (node, chunk) row through Raft; the repair scheduler
+  copies the chunk from a healthy replica
 ```
 
-### Chunk Storage on Data Nodes
+- A failed attempt to write the repaired `.meta` still counts the chunk as healthy; only a real digest mismatch or unreadable data quarantines.
+- Quarantined ids that were not yet reported are queued again on data node startup, so a restart cannot lose the report. An id that has a live `.dat` again is skipped.
+- Scrub I/O is throttled per chunk to `max_io_percent` of disk time.
+- With `quarantine_on_fault` (default on), one fault also puts the node into `Quarantined`, which an operator clears (or `auto_unquarantine_secs` if set). With it off, faults are recorded and repaired but the node keeps serving.
 
-When a data node receives a `PutChunk` request, it follows a crash-safe write sequence:
+## Orphan reaping (after unlink or a failed write)
 
-```
-  PutChunk RPC arrives
-      |
-      v
-  1. Write WAL entry       -->  .dtfs/wal/{chunk_id}.wal.json
-      |
-      v
-  2. Compute BLAKE3 checksum of data
-      |
-      v
-  3. Write data to tmp     -->  tmp/{chunk_id}.dat.tmp
-      |
-      v
-  4. fsync the tmp file
-      |
-      v
-  5. Atomic rename          -->  chunks/{ab}/{cd}/{hash}.dat
-      |
-      v
-  6. Write chunk metadata   -->  chunks/{ab}/{cd}/{hash}.meta
-      |
-      v
-  7. fsync metadata file
-      |
-      v
-  8. Remove WAL entry       -->  .dtfs/wal/{chunk_id}.wal.json
-      |
-      v
-  9. ACK to caller
+Chunks no file references accumulate after an unlink, an overwrite or an aborted write. The orphan reaper runs on the manager leader every `orphan_interval_secs` (default 24 h):
+
+1. List chunks on a data node (`ListChunks`).
+2. Re-read the node's view of the state machine after listing, so a chunk registered while the listing ran is not mistaken for an orphan.
+3. For chunks still unreferenced, wait out the grace period (`orphan_grace_secs`, default 24 h) measured on the `.dat` mtime of that disk. An unknown mtime defers the reap.
+4. De-locate through Raft first, then delete bytes. A chunk recorded under a different disk of the same node is never reaped by a listing of this disk.
+
+See the [Orphan Cleanup Runbook](../operations/orphan-cleanup-runbook.md).
+
+## Cache promotion and demotion
+
+```text
+  read on TORO --> data node counts it --> heartbeat --> manager read window
+                                                         (per chunk, per DC)
+  every tiering tick (leader only):
+    window reads in DC >= promote_reads, no cooldown, DC has < min cache copies
+        --> schedule ONE copy to a healthy node with a disk of that tier in that DC
+            (anchor check: an additive copy never removes the source)
+    window idle for promote_window_secs, cache tier, a LIVE survivor satisfies
+    the anchor
+        --> remove location via Raft, then delete bytes
 ```
 
-The two-level directory structure (`{first_byte}/{second_byte}/`) under `chunks/` prevents any single directory from accumulating too many files, which is important for XFS performance.
+- Promotions are planned for all chunks, then dispatched as one batch capped at 50 new tasks per tick so anchor and mandatory repair are not starved; the rest are re-planned next tick.
+- `cache_replicas.per_dc` (default true) counts reads and copies per datacenter; the excess-replica pass allows one cache allowance per datacenter.
+- An operator flush sets a cooldown so the next read does not instantly re-promote. An engine-driven demotion clears an expired cooldown but never a future one.
+- Demotion requires a live replica that still satisfies the anchor. The anchor datacenter compares case-insensitively.
 
-On crash recovery, the data node replays all WAL entries:
+Details and a worked example are in [Tiering](../storage/tiering.md).
 
-- **Incomplete PutChunk**: Remove orphaned tmp files.
-- **Incomplete DeleteChunk**: Complete the deletion by removing data and metadata files.
+## Replication and migration
 
-### Write Safety
-
-Write safety is configured per-volume via `WriteSafety`:
-
-```toml
-[volume.write_safety]
-min_replicas_before_ack = 2   # ACK after 2 replicas confirmed
-write_timeout_secs = 30       # Timeout for the entire write
-```
-
-The primary data node receives the chunk from the FUSE client, writes it locally, then pushes replicas to the other nodes in the placement list. The write is acknowledged back to the FUSE client after `min_replicas_before_ack` replicas (including the primary) have confirmed successful storage. Remaining replicas complete asynchronously.
-
-```
-  Timeline for min_replicas_before_ack = 2, replication_factor = 3:
-
-  t0: FUSE client sends PutChunk to primary (node-a)
-  t1: node-a stores chunk locally (WAL + fsync)       --> replica 1 done
-  t2: node-a starts replication to node-b and node-c
-  t3: node-b confirms storage                          --> replica 2 done
-  t4: node-a ACKs PutChunk to FUSE client              --> WRITE COMPLETE
-  t5: node-c confirms storage (async, not blocking)    --> replica 3 done
-```
-
-## Replication
-
-Replication is handled by the `ReplicationManager` on each data node. It supports two modes:
-
-### Push Replication (Primary to Replicas)
-
-After the primary stores a chunk, it pushes copies to all designated replica nodes. The data is streamed in 1MB pieces over gRPC:
-
-```
-  node-a (primary)                     node-b (replica)
-      |                                      |
-      |  PutChunk (streaming, 1MB pieces)    |
-      |  ----------------------------------->|
-      |                                      |
-      |     piece 1: chunk_id + volume_id    |
-      |     piece 2: data[0..1MB]            |
-      |     piece 3: data[1MB..2MB]          |
-      |     ...                              |
-      |     piece N: data[(N-1)MB..end]      |
-      |                                      |
-      |  PutChunkResponse (success, size)    |
-      |  <-----------------------------------|
-      |                                      |
-```
-
-The first piece in the stream carries metadata (chunk ID, volume ID, tier). Subsequent pieces carry raw data. This avoids loading the entire chunk (up to 128MB) into memory at once.
-
-### Pull Replication (Replica from Source)
-
-Used when a data node needs to fetch a chunk it does not have, for example during re-replication after a node failure:
-
-```
-  node-c (new replica)                 node-a (source)
-      |                                      |
-      |  GetChunk(chunk_id)                  |
-      |  ----------------------------------->|
-      |                                      |
-      |  Streamed response                   |
-      |  <-----------------------------------|
-      |                                      |
-      |  Store locally via ChunkStore        |
-      |                                      |
-```
-
-### Per-Tier Replication Factors
-
-Each volume defines independent replication factors per storage tier:
-
-```toml
-[volume.replication]
-hot  = 3    # 3 replicas on NVMe/SSD
-warm = 2    # 2 replicas on SSD
-cold = 1    # 1 replica on HDD (erasure coding planned)
-```
-
-The placement engine uses the appropriate replication factor when computing placements for each tier. When data is migrated between tiers (e.g., hot -> warm), the replication factor changes accordingly, and excess replicas are garbage-collected.
-
-## Transparent Remote-DC Fetch
-
-When a FUSE client in one datacenter reads a chunk whose replicas are all in another datacenter, the read still succeeds transparently. The process:
-
-```
-  DC-EAST (client)                     DC-WEST (data nodes)
-  +-------------+                      +-------------+
-  | dtfs-fuse   |                      | dtfs-data   |
-  | location:   |   GetChunk(chunk_id) | (node-w1)   |
-  |  dc=east    |  ------------------->|             |
-  |             |  <-------------------|  (streamed) |
-  +------+------+                      +-------------+
-         |
-         |  Remote read detected!
-         |  distance >= SameDatacenter
-         v
-  +------+------+
-  | Migration   |  allocate_chunks(path, 1, volume_id)
-  | Trigger     |  ----------------------------------> dtfs-manager
-  +-------------+
-         |
-         |  Manager schedules background migration
-         |  to place a replica in DC-EAST
-         v
-  (Future reads served from local DC)
-```
-
-### Migration Trigger Details
-
-The `MigrationTrigger` in `dtfs-fuse` fires after every chunk read. It computes the topology distance between the FUSE client's location and the data node's location:
-
-1. If distance < `SameDatacenter` (i.e., SameHost or SameRack), the read is local -- no action.
-2. If distance >= `SameDatacenter`, the read is considered remote.
-3. A migration request is sent to the manager, rate-limited to once per chunk per 5 minutes (`MIGRATION_COOLDOWN`).
-
-The manager receives the allocation request and uses the placement engine's `place_with_affinity()` method, which respects `prefer_client_locations` to favor placing a new replica in the requesting client's datacenter.
-
-### Multi-DC Read Path Example
-
-Consider a three-DC deployment:
-
-```
-  +--DC-EAST--+     +--DC-CENTRAL--+     +--DC-WEST--+
-  |           |     |              |     |           |
-  | dtfs-fuse |     | dtfs-manager |     | dtfs-data |
-  | (client)  |     | (leader)     |     | (node-w1) |
-  |           |     |              |     | (node-w2) |
-  | dtfs-data |     | dtfs-data    |     | (node-w3) |
-  | (node-e1) |     | (node-c1)   |     |           |
-  +-----------+     +--------------+     +-----------+
-
-  1. Client opens file, gets chunk locations from manager.
-     Chunk "abc" replicas: [node-w1, node-w2]
-
-  2. Client selects nearest: both are in DC-WEST.
-     Picks node-w1 (first in list).
-
-  3. Client reads chunk "abc" from node-w1 (cross-DC).
-     Read succeeds, data returned to application.
-
-  4. MigrationTrigger detects: client=DC-EAST, node=DC-WEST
-     distance = SameRegion (or CrossRegion)
-     Sends migration request to manager.
-
-  5. Manager runs placement with client affinity for DC-EAST.
-     Selects node-e1 (in client's DC) for new replica.
-     Schedules replication: node-w1 -> node-e1.
-
-  6. Background: node-e1 pulls chunk "abc" from node-w1.
-     Manager updates chunk locations via Raft.
-
-  7. Next read: client's metadata cache expires (5s TTL).
-     Fresh GetFileLocations returns: [node-w1, node-w2, node-e1]
-     Client selects node-e1 (SameDatacenter). Local read!
-```
-
-## Background Migration (Tiering)
-
-The tiering engine on the manager leader periodically evaluates data temperature and moves chunks between storage tiers:
-
-```
-  dtfs-manager (leader)
-      |
-      |  Tiering engine evaluates access stats
-      |  from data node heartbeats
-      |
-      |  Chunk "xyz" classified as "cold"
-      |  Currently on hot tier (SSD)
-      |  Policy says cold data -> cold tier (HDD)
-      |
-      v
-  +------------------+
-  | Task Scheduler   |  Creates migration task:
-  |                  |    source: node-a (hot/SSD)
-  |                  |    target: node-d (cold/HDD)
-  |                  |    chunk: "xyz"
-  +--------+---------+
-           |
-           v
-  Migration task lifecycle:
-
-  1. Pending    -- queued in scheduler
-  2. Copying    -- target node pulls chunk from source
-  3. Verifying  -- target node validates checksum
-  4. Completing -- manager updates metadata via Raft
-  5. Done       -- source copy scheduled for GC
-```
-
-The migration status transitions:
-
-```
-  Pending --> Copying --> Verifying --> Completing --> Done
-      |          |            |             |
-      +----------+------------+-------------+---> Failed
-                     (on any error)
-```
-
-Key points:
-
-- Migrations are non-blocking: reads continue to be served from the current location while the copy is in progress.
-- The Raft state machine is only updated after the new copy is verified, ensuring no metadata points to incomplete data.
-- Replication factor changes when crossing tiers: hot (3 replicas) -> cold (1 replica) means two excess replicas are eventually garbage-collected.
-- Tiering decisions are based on configurable thresholds for access frequency and recency.
-
-## End-to-End Write Flow Summary
-
-The complete lifecycle of a write, from application to durable storage:
-
-```
-  1. Application calls write(fd, buf, 4096)
-         |
-  2. FUSE layer calls DtfsFilesystem::write(fh, offset, data)
-         |
-  3. WriteBuffer accumulates data
-         |
-  4. When chunk boundary reached: flush_segments_to_cluster()
-         |
-  5. AllocateChunks RPC to manager
-         |  Returns: primary node + replica list
-         |
-  6. PutChunk RPC to primary data node
-         |  Primary writes: WAL -> tmp -> fsync -> rename -> meta -> fsync -> WAL remove
-         |
-  7. Primary replicates to replica nodes
-         |  Each replica: WAL -> tmp -> fsync -> rename -> meta -> fsync -> WAL remove
-         |
-  8. After min_replicas_before_ack confirmed: ACK to FUSE client
-         |
-  9. Primary reports chunk locations to manager
-         |  Manager commits UpdateChunkLocations via Raft
-         |
-  10. FUSE client receives success, write() returns
-```
-
-## End-to-End Read Flow Summary
-
-```
-  1. Application calls read(fd, buf, 4096)
-         |
-  2. FUSE layer calls DtfsFilesystem::read(fh, offset, size)
-         |
-  3. Check metadata cache for chunk locations
-         |  Hit: use cached locations
-         |  Miss: GetFileLocations RPC to manager
-         |
-  4. Compute which chunks span [offset, offset+size)
-         |
-  5. For each chunk:
-         |  a. Select nearest data node from replica list
-         |  b. Check read-ahead cache
-         |     Hit: use cached chunk data
-         |     Miss: GetChunk RPC to data node
-         |  c. Data node reads chunk from XFS disk, verifies BLAKE3 checksum
-         |  d. Trigger read-ahead for upcoming chunks
-         |  e. Trigger migration check if read was remote
-         |
-  6. Extract byte range from chunk data
-         |
-  7. Return bytes to application
-```
+Repair, promotion, flush and operator migrations share the scheduler's task state machine (`Pending, Copying, Verifying, Completing, Done, Failed`). A task is marked `Done` only after `VerifyChunk` on the target, and the source is removed only after the new row is committed. See [Migration](../storage/migration.md).

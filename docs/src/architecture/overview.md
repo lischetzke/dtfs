@@ -1,229 +1,140 @@
 # Architecture Overview
 
-DTFS is composed of three binary components that collaborate to provide a distributed, tiered filesystem. This page describes each component's role, their interactions, and the key subsystems that make them work together.
+DTFS has three runtime binaries (manager, data node, FUSE client). This page describes their roles, the data model they share, and the safety invariants every change must preserve.
 
-## The Three Binaries
+## The three binaries
 
 ```text
-+------------------------------------------------------------------+
-|                        DTFS Cluster                              |
-|                                                                  |
-|  +-------------------+    +-------------------+                  |
-|  |   dtfs-manager    |    |   dtfs-manager    |  (Raft cluster)  |
-|  |   (leader)        |<-->|   (follower)      |                  |
-|  +--------+----------+    +-------------------+                  |
-|           |                                                      |
-|           |  gRPC: metadata, placement, heartbeats               |
-|           |                                                      |
-|  +--------v----------+    +-------------------+                  |
-|  |   dtfs-data       |    |   dtfs-data       |  (chunk storage) |
-|  |   (SSD / hot)     |    |   (HDD / cold)    |                  |
-|  +--------+----------+    +--------+----------+                  |
-|           |                        |                             |
-|           +--- gRPC: replication --+                             |
-|                                                                  |
-+------------------------------------------------------------------+
-        |                        |
-  +-----v------+          +-----v------+
-  | dtfs-fuse  |          | dtfs-fuse  |   (FUSE clients)
-  | /mnt/dtfs  |          | /mnt/dtfs  |
-  +------------+          +------------+
+  dtfs-fuse (/mnt/dtfs)            dtfs-fuse
+        |  metadata (gRPC)             |
+        v                              v
+  +-----------------------------------------+
+  | dtfs-manager x3 or x5  (Raft cluster)   |
+  | leader + followers (+ optional learners)|
+  +-------------------+---------------------+
+                      | heartbeats, repair / verify / list RPCs
+                      v
+  +----------+   +----------+   +----------+
+  | dtfs-data|   | dtfs-data|   | dtfs-data|   chunk bytes
+  +----------+   +----------+   +----------+
+        ^ chunk data (gRPC streams) straight from/to dtfs-fuse
 ```
+
+Bulk data never flows through a manager. Clients talk to managers for metadata and to data nodes for bytes.
 
 ### dtfs-manager
 
-The **manager node** is the brain of the cluster. A group of 3 or 5 manager nodes forms a Raft consensus cluster, electing a leader that handles all write operations. Manager responsibilities include:
+A Raft peer and the REST/gRPC front end. It owns all metadata: files, chunk locations, node and disk registry, volumes, write leases, scrub and migration state.
 
 | Subsystem | Module | Purpose |
 |-----------|--------|---------|
-| Raft Consensus | `dtfs-raft` | Replicated state machine for all metadata |
-| Metadata Service | `metadata.rs` | File and chunk location tracking |
-| Placement Engine | `placement.rs` | Decides where to store chunk replicas |
-| Cluster Manager | `cluster.rs` | Node registration, join protocol |
-| Health Monitor | `monitor.rs` | Heartbeat processing, failure detection |
-| Tiering Engine | `tiering.rs` | Access pattern analysis, tier migration |
-| Task Scheduler | `scheduler.rs` | Background task queue (replication, migration) |
-| Audit Log | `audit.rs` | Immutable record of cluster operations |
-| REST API | `api.rs` | HTTP API for WebUI and external integrations |
-| WebUI | `webui.rs` | Embedded web interface (served via Axum) |
+| Raft state machine | `dtfs-raft` | The only place state changes; the log is the source of truth |
+| Metadata service | `metadata.rs` | ManagerService gRPC; every mutation is a Raft write; followers forward writes to the leader |
+| Placement | `placement.rs`, `placement_state.rs` | Hash-ring placement; anchor, goal and misplacement views |
+| Health monitor | `monitor.rs` | Heartbeat-based Healthy/Suspect/Down detection only; never schedules repair |
+| Task scheduler | `scheduler.rs` and `scheduler/*` | Sole owner of replica repair, migration, flush and the orphan reaper; leader-gated and bounded |
+| Tiering engine | `tiering.rs` | Demand-driven cache promotion and demotion |
+| Audit log | `audit.rs` | Local ring plus JSONL archive; optional Raft replication |
+| REST API and WebUI | `api.rs`, `api/*`, `webui.rs` | Operator surface |
 
-**Ports (defaults):**
-
-| Port | Protocol | Purpose |
-|------|----------|---------|
-| 9400 | gRPC | Raft internal communication |
-| 9401 | gRPC | Client and data node RPCs |
-| 9402 | HTTP | REST API and WebUI |
-
-**State model:** All metadata is stored in the Raft state machine (`StateMachineData`), which holds:
-
-- **File metadata**: path, volume ID, chunk size, chunk location list
-- **Node registry**: hostname, location, disk inventory, health status
-- **Cluster configuration**: versioned JSON blob, updated via Raft
-- **Audit log**: append-only operation history
-
-See [Consensus](./consensus.md) for details on the Raft implementation.
+Default ports: 9400 Raft transport, 9401 client and data-node gRPC, 9402 REST and WebUI. See [Consensus](./consensus.md).
 
 ### dtfs-data
 
-The **data node** stores and serves chunk data on local disks. Each data node manages one or more XFS-formatted disks, each assigned to a storage tier (hot, warm, or cold).
+Stores and serves chunks on local disks, each assigned a tier (hot, warm, cold, tape).
 
 | Subsystem | Module | Purpose |
 |-----------|--------|---------|
-| Chunk Store | `store.rs` | WAL-protected chunk I/O with BLAKE3 checksums |
-| Disk Manager | `disk.rs` | Multi-disk management, tier-based disk selection |
-| ARC Cache | `cache.rs` | In-memory Adaptive Replacement Cache |
-| Replication | `replication.rs` | Push/pull chunk replication between data nodes |
-| Scrub Scheduler | `scrub.rs` | Periodic integrity checking (quick and deep) |
-| Metrics | `metrics.rs` | I/O statistics exposed via Prometheus |
-| gRPC Server | `server.rs` | PutChunk / GetChunk / DeleteChunk RPCs |
+| Chunk store | `store.rs` | WAL-protected, checksummed chunk I/O; streaming put and get |
+| Disk manager | `disk.rs` | Multi-disk layout; persistent disk ids |
+| Replication | `replication.rs` | Push replication used by repair and promotion |
+| Scrub | `scrub.rs`, `integrity.rs` | Quick and deep scrub, quarantine, fault reporting |
+| Memory ladder | `memory.rs` | Per-role pressure response (`[memory]`) |
+| gRPC server | `server.rs` | PutChunk, GetChunk, DeleteChunk, ReplicateChunk, VerifyChunk, ListChunks, RecordCacheHit |
 
-**Port (default):** 9500 (gRPC)
+There is no in-process chunk cache on the data node; the operating system page cache serves hot chunks. Default port 9500.
 
-**Disk layout on each managed disk:**
+On-disk layout of one data disk:
 
 ```text
-/mnt/dtfs-disk-{uuid}/
-+-- .dtfs/
-|   +-- disk.meta             # Disk identity and tier
-|   +-- wal/                  # Write-ahead log entries
-|       +-- {chunk_id}.wal.json
-+-- chunks/
-|   +-- {00-ff}/              # First byte of chunk hash
-|       +-- {00-ff}/          # Second byte of chunk hash
-|           +-- {hash}.dat    # Chunk data
-|           +-- {hash}.meta   # Chunk metadata (size, checksum, timestamps)
-+-- tmp/                       # Staging area for atomic writes
+<mount>/
+  .dtfs-disk-id          persistent numeric disk id, written once
+  .dtfs/wal/             write-ahead entries (<id>.put.wal.json, <id>.delete.wal.json)
+  .dtfs/quarantine/      <id>.dat.bad  (renamed, never deleted by scrub)
+  chunks/<aa>/<bb>/      <id>.dat  and  <id>.meta
+  tmp/                   staging for atomic writes
 ```
-
-Chunk writes follow a crash-safe sequence: WAL entry, write to `tmp/`, atomic rename to `chunks/`, remove WAL entry. On startup, the data node runs WAL recovery to clean up any incomplete writes from a previous crash.
 
 ### dtfs-fuse
 
-The **FUSE client** mounts the distributed filesystem as a local directory and translates POSIX operations into gRPC calls against the manager and data nodes.
+Mounts the filesystem and translates POSIX calls into gRPC. It holds a metadata cache (5 s TTL, bounded), a write buffer, a read-ahead engine with a bounded memory cache, and an optional local disk cache. Details in [FUSE Mount](../access/fuse-mount.md) and [Read-Ahead](../access/read-ahead.md).
 
-| Subsystem | Module | Purpose |
-|-----------|--------|---------|
-| Filesystem | `filesystem.rs` | POSIX operation handlers (lookup, open, read, write, readdir) |
-| Read-Ahead Engine | `readahead.rs` | Background chunk prefetching |
-| Write Buffer | `writebuf.rs` | Coalesces small writes into chunk-sized flushes |
-| Migration Trigger | `migration.rs` | Requests closer replicas for remote reads |
-| Client Library | `dtfs-client` | Shared gRPC client for manager and data node communication |
-
-**Key behaviors:**
-
-- **Metadata caching**: File locations are cached with a configurable TTL (default 5 seconds) to reduce manager round-trips.
-- **Nearest-node selection**: When a chunk has multiple replicas, the client reads from the replica in the closest failure domain based on its own `[location]` config.
-- **Read-ahead**: After each chunk read, the engine speculatively prefetches upcoming chunks in background tasks. See [Read-Ahead Modes](../access/read-ahead.md).
-- **Write buffering**: Small writes are accumulated until a full chunk is ready, then flushed to the cluster in a single operation.
-
-## Communication Patterns
-
-All inter-component communication uses gRPC with Protocol Buffers. The `.proto` definitions live in the `proto/` directory.
-
-### Client-to-Manager RPCs
-
-Defined in `manager.proto` via the `ManagerService`:
-
-| RPC | Direction | Purpose |
-|-----|-----------|---------|
-| `CreateFile` | Client -> Manager | Create a new file in the namespace |
-| `GetFileLocations` | Client -> Manager | Resolve file path to chunk locations |
-| `DeleteFile` | Client -> Manager | Remove a file |
-| `ListDirectory` | Client -> Manager | List directory contents |
-| `AllocateChunks` | Client -> Manager | Request placement decisions for new chunks |
-
-### Data-Node-to-Manager RPCs
-
-| RPC | Direction | Purpose |
-|-----|-----------|---------|
-| `RegisterNode` | Data -> Manager | Register a new data node |
-| `Heartbeat` | Data -> Manager | Periodic liveness signal with capacity stats |
-| `ReportChunkStatus` | Data -> Manager | Report chunk health after scrubbing |
-
-### Data-Node-to-Data-Node RPCs
-
-Defined in `data.proto` via the `DataService`:
-
-| RPC | Direction | Purpose |
-|-----|-----------|---------|
-| `PutChunk` | Node -> Node | Stream a chunk for replication |
-| `GetChunk` | Node -> Node | Stream a chunk for reading or pull replication |
-| `DeleteChunk` | Node -> Node | Remove a chunk replica |
-
-### Client-to-Data-Node RPCs
-
-FUSE clients also call `GetChunk` and `PutChunk` directly on data nodes for actual data transfer. The manager only provides metadata and placement decisions -- bulk data never flows through the manager.
+## Data model
 
 ```text
-                    1. GetFileLocations(path)
-  dtfs-fuse  -------------------------------->  dtfs-manager
-                    2. Response: [chunk_id -> [node-a, node-b, node-c]]
-  dtfs-fuse  <--------------------------------  dtfs-manager
-
-                    3. GetChunk(chunk_id)
-  dtfs-fuse  -------------------------------->  dtfs-data (node-a)
-                    4. Streamed chunk data
-  dtfs-fuse  <--------------------------------  dtfs-data (node-a)
+  Volume ------ policy: chunk size, mandatory_replicas per tier,
+     |                  cache_replicas per tier, anchor datacenter,
+     |                  write_safety (min_replicas_before_ack)
+     v
+  File (path) -- ordered chunk list: [chunk_0, chunk_1, ...]
+     |
+     v
+  Chunk ------- id = BLAKE3(content), size, checksum
+     |
+     v
+  Replica ----- (node_id, disk_id) -> tier, datacenter, live or not
 ```
 
-## Subsystem Interactions
+Key points:
 
-### Health Monitoring Flow
+- A chunk id is the hash of its bytes, so a chunk is immutable. Overwriting part of a file writes a new chunk and rebinds the file's chunk list; the old chunk becomes an orphan and is reclaimed later.
+- A replica is identified by the pair `(node_id, disk_id)`, never by node alone. Disk ids are persistent across restarts.
+- Replicas fall into two independent classes that are never conflated:
 
-```text
-  dtfs-data                dtfs-manager
-     |                         |
-     |--- Heartbeat ---------->|
-     |    (uptime, chunks,     |
-     |     bytes_used,         |  HealthMonitor processes heartbeats
-     |     config_version)     |  and updates node health status.
-     |                         |
-     |<-- HeartbeatResponse ---|  Includes config_version; if stale,
-     |    (config_update?)     |  the response includes a full
-     |                         |  ConfigUpdate for live reload.
-     |                         |
-     |  (no heartbeat for      |
-     |   15+ seconds)          |  HealthMonitor marks node "suspect"
-     |                         |  after 3 missed heartbeats (15s),
-     |                         |  then "down" after 6 (30s).
-     |                         |
-     |                         |  TaskScheduler triggers re-replication
-     |                         |  of chunks from the failed node.
-```
+| Class | Configured by | Created by | Removed by |
+|-------|---------------|------------|------------|
+| Mandatory | `mandatory_replicas.<tier>` | Under-replication scheduler only | Operator reconfiguration or file deletion |
+| Cache | `cache_replicas.<tier>.{min,max}` | Tiering engine only, on read demand | Tiering demotion or operator flush |
 
-### Tiering Flow
+- The **anchor** is a volume setting (`anchor.datacenter`, optionally a required tier). At least one live replica of every chunk must sit in that datacenter. Datacenter names compare case-insensitively everywhere.
+- All metadata above is in the Raft state machine. Chunk bytes and `.meta` files are on data disks. If the two disagree, the orphan reaper and scrub reconcile them (see the invariants below).
 
-The tiering engine runs on the manager leader and periodically evaluates chunk access statistics reported by data nodes:
+## Safety invariants
 
-1. Data nodes report per-chunk read counts in heartbeats
-2. The tiering engine classifies each chunk's temperature (hot/warm/cold/frozen)
-3. If a chunk's temperature no longer matches its storage tier, a migration task is scheduled
-4. The task scheduler coordinates the migration: copy chunk to a node with the target tier, update metadata via Raft, remove the old copy
+Every change to a byte-touching path must preserve these. The detailed checklist lives in `.claude/rules/integrity.md`; history is in [Invariants and Bug Archaeology](../internals/invariants.md).
 
-See [Data Flow](./data-flow.md) for complete read and write paths, and [Data Distribution](./data-distribution.md) for placement algorithm details.
+1. **One mutation point.** Metadata changes only through a Raft command. Apply is a pure function of the state and the log entry: timestamps come from the proposer's `now_ms` or the log index, never a replica-local clock.
+2. **Checksum end to end.** BLAKE3 is computed incrementally, stored in the chunk meta, and verified on every read and scrub. A mismatch is `data_loss`; the client fails over to another replica.
+3. **Durable before acknowledged.** `.dat` and `.meta` are written to a temp file, `sync_all`, then atomically renamed. A WAL entry precedes the operation and is cleared only after fsync.
+4. **Remove from metadata first, bytes second.** Every replica removal goes through Raft first. If the Raft write fails or the state machine refuses it, no byte is deleted. A failed byte delete is never rolled back; the orphan reaper finishes it.
+5. **Never delete the last live replica or the anchor.** The state machine refuses a `RemoveChunkLocation` that would strand the anchor or remove the last live replica. A replica that justifies dropping another must itself be live.
+6. **Quarantine, do not delete.** A faulty chunk is renamed into `.dtfs/quarantine/`. A missing or torn `.meta` is repaired from a verified `.dat` before anything is quarantined.
+7. **Unlink does not delete bytes.** Removing a file drops its metadata. The orphan reaper reclaims unreferenced chunks after a grace period measured on the `.dat` mtime. The reaper is keyed by `(node_id, disk_id)`, re-reads the node view after listing, and never removes a chunk recorded under another disk of the same node.
+8. **Snapshots never lose state.** A snapshot that cannot be persisted is a fatal Raft error (no silent log purge). A node whose snapshot is older than its purged log refuses to start as a voter.
+9. **Replication is never silently lowered.** A write must reach `min_replicas_before_ack` distinct `(node, disk)` replicas or the commit is rejected.
+10. **Mutations are authenticated.** With `cluster.shared_secret` set, every mutating RPC on every plane carries an HMAC stamp. See [Authentication](../security/authentication.md).
 
-## Security Model
+## Failure and health model
 
-- **Shared secret**: Data nodes authenticate with the manager using a shared secret during registration
-- **TLS**: All gRPC connections support TLS with auto-generated or user-provided certificates
-- **JWT**: The REST API uses JWT tokens for authentication (see [Authentication](../security/authentication.md))
-- **Audit log**: All state-mutating operations are recorded in the Raft-replicated audit log
+- A data node heartbeats every 5 s. After 3 missed beats it is `Suspect`, after 6 it is `Down` (configurable under `[monitoring]`). The monitor only sets health; it never starts repair.
+- `Maintenance`, `Draining` and `Quarantined` are operator or integrity states. The monitor never overwrites them with `Down`.
+- The scheduler (leader only) counts only live replicas when deciding whether a chunk is under-replicated, then copies from a live source to a new disk. See the walkthroughs in [Data Flow](./data-flow.md).
+- Metadata reads omit replicas on `Down` or `Failed` nodes and disks unless a chunk has no live replica at all, in which case every row is returned as a last resort.
 
-## Configuration Model
+## Memory model
 
-Each component loads its configuration from a TOML file at startup:
+Streaming I/O everywhere: no hot path accumulates a full chunk in a `Vec`. An optional `[memory]` block on each role sets `hard_cap_mb` and warn and shed thresholds. The ladder goes: stream to disk, shrink caches, drop unconsumed read-ahead, pause background tasks, TCP backpressure, and only as an opt-in last resort reject writes with `RESOURCE_EXHAUSTED`. Composite hosts (several roles on one box) set a cap per role so the total stays below host RAM minus the co-resident application.
 
-| Component | Default Config Path | Config Struct |
-|-----------|-------------------|---------------|
-| dtfs-manager | `/etc/dtfs/manager.toml` | `ManagerConfig` |
-| dtfs-data | `/etc/dtfs/data.toml` | `DataNodeConfig` |
-| dtfs-fuse | `/etc/dtfs/fuse.toml` | `FuseConfig` |
+## Communication
 
-Cluster-wide configuration (replication policies, tiering thresholds) is stored in the Raft state machine and propagated to data nodes via heartbeat responses. This enables [Live Reload](../configuration/live-reload.md) without restarting nodes.
+All traffic is gRPC. Manager API (`ManagerService`): file operations, `AllocateChunks`, `CommitChunkLocations`, write leases, `RegisterNode`, `Heartbeat`, `ReportChunkStatus`, `ForwardClientWrite`. Data API (`DataService`): `PutChunk`, `GetChunk`, `DeleteChunk`, `ReplicateChunk`, `VerifyChunk`, `ListChunks`, `GetDiskStatus`, `ReportStats`, `RecordCacheHit`. The POSIX lock RPCs exist on the manager but the FUSE client does not use them; POSIX locks are process-local. Full list: [gRPC API](../api-reference/grpc-api.md).
 
-## Next Steps
+## Configuration model
 
-- [Data Flow](./data-flow.md) -- trace read and write operations end to end
-- [Consensus](./consensus.md) -- understand the Raft implementation
-- [Data Distribution](./data-distribution.md) -- learn how chunks are placed across nodes
+Each binary reads a TOML file (`/etc/dtfs/manager.toml`, `data.toml`, `fuse.toml`). Cluster policy (replication, tiering, scrub) lives in Raft and reaches data nodes in heartbeat responses; see [Live Reload](../configuration/live-reload.md).
+
+## Next steps
+
+- [Data Flow](./data-flow.md): write, read, failure and tiering walkthroughs
+- [Consensus](./consensus.md): the Raft implementation
+- [Data Distribution](./data-distribution.md): how chunks are placed

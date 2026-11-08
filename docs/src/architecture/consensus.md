@@ -28,8 +28,8 @@ openraft::declare_raft_types!(
 );
 ```
 
-- **ClientRequest**: An enum of all state-mutating commands (CreateFile, DeleteFile, UpdateChunkLocations, RegisterNode, DeregisterNode, UpdateNodeStatus, UpdateConfig).
-- **ClientResponse**: The result returned after applying a command (Success, FileCreated, Error).
+- **ClientRequest**: An enum of every state-mutating command: namespace (create, delete, rename, symlink, link, size), chunk locations (commit, update, remove), nodes and disks, volumes and policy, write leases, cache cooldowns, scrub and migration state, config and audit. A new mutation is a new variant plus an arm in `apply_request`. Fields that land in replicated state and need a time carry `#[serde(default)] now_ms`, stamped by the proposer.
+- **ClientResponse**: The result returned after applying a command (Success, FileCreated, Error). A command the state machine refuses (for example removing the last live replica) comes back as an error response, not a Raft failure; callers use the shared response checker so a refusal is never treated as success.
 - **DtfsNode**: Carries the gRPC address and human-readable hostname for each Raft peer, stored inside the Raft membership.
 
 ## Cluster Topology
@@ -87,18 +87,7 @@ All write operations (file creation, node registration, metadata updates) must g
 
 2. **Candidate transition**: The follower increments its term, votes for itself, and sends `VoteRequest` RPCs to all other nodes.
 
-3. **Vote persistence**: Before granting a vote, each node persists the vote to RocksDB (`save_vote` in `LogStore`). This ensures that a node never votes twice in the same term, even after a crash.
-
-   ```rust
-   // From log_store.rs -- vote persistence with fsync
-   async fn save_vote(&mut self, vote: &Vote) -> Result<(), io::Error> {
-       let cf = self.db.cf_handle(CF_META).expect("meta CF");
-       let bytes = bincode::serialize(vote)?;
-       self.db.put_cf(&cf, META_KEY_VOTE, bytes)?;
-       self.db.flush_cf(&cf)?;  // Flush to guarantee durability
-       Ok(())
-   }
-   ```
+3. **Vote persistence**: Before granting a vote, each node persists it to RocksDB (`save_vote` in `LogStore`) with a synced write, so a node never votes twice in the same term, even after a crash.
 
 4. **Majority wins**: A candidate becomes leader once it receives votes from a majority of nodes (quorum). For a 3-node cluster, quorum is 2; for 5 nodes, quorum is 3.
 
@@ -172,14 +161,14 @@ The `LogStore` in `dtfs-raft/src/log_store.rs` uses RocksDB with two column fami
 | Column Family | Key | Value | Purpose |
 |---------------|-----|-------|---------|
 | `logs` | Big-endian `u64` (log index) | bincode-encoded `Entry` | Raft log entries |
-| `meta` | `b"vote"` | bincode-encoded `Vote` | Current vote (persisted with fsync) |
+| `meta` | `b"vote"` | bincode-encoded `Vote` | Current vote (synced write) |
 | `meta` | `b"last_purged"` | bincode-encoded `Option<LogId>` | Last purged log index |
 
 Key operations:
 
-- **Append**: Write entries to the `logs` CF, then `flush_cf` to ensure durability. The `IOFlushed` callback notifies OpenRaft when the write is stable on disk.
-- **Truncate after**: Delete all entries with index > the given log ID. Used when a follower needs to discard conflicting entries from a deposed leader.
-- **Purge**: Delete entries up to and including the given index (after a snapshot). Uses RocksDB's `delete_range_cf` for efficiency.
+- **Append**: Write entries to the `logs` CF with a synced write. The `IOFlushed` callback notifies OpenRaft when the write is stable on disk.
+- **Truncate after**: Delete all entries with index > the given log ID with a range delete in a synced `WriteBatch`. Used when a follower discards conflicting entries from a deposed leader.
+- **Purge**: Delete entries up to and including the given index (after a snapshot) with `delete_range_cf`, and persist `last_purged` in the same batch so a crash cannot leave one without the other.
 
 ### Entry Application
 
@@ -197,19 +186,20 @@ match &entry.payload {
 }
 ```
 
-The `apply_request` function handles each `ClientRequest` variant:
+The `apply_request` function handles each `ClientRequest` variant. It is deterministic: its result depends only on the current state and the entry. It never reads the wall clock or a random source. Timestamps written during apply (audit rows, lease expiry, creation times) come from the proposer's `now_ms`, or from the committed `log_id.index` for legacy entries where `now_ms` is `0`. Replicas and replays therefore always agree.
 
-| Command | State Machine Effect |
-|---------|---------------------|
-| `CreateFile` | Insert into `files` BTreeMap, append audit log entry |
-| `DeleteFile` | Remove from `files` BTreeMap, append audit log entry |
-| `UpdateChunkLocations` | Update chunk list on existing file entry |
-| `RegisterNode` | Insert into `nodes` BTreeMap |
-| `DeregisterNode` | Remove from `nodes` BTreeMap |
-| `UpdateNodeStatus` | Update health field on existing node entry |
-| `UpdateConfig` | Replace `cluster_config` with new versioned JSON |
+Notable apply rules:
 
-If the applying node is the leader and a client is waiting for the response, the response is sent back via the `responder` channel.
+| Rule | Effect |
+|------|--------|
+| Lease-less `UpdateChunkLocations` | Union only: it adds the rows it names and never erases other replicas. Writes that hold a lease replace the chunk's rows |
+| `RemoveChunkLocation` | Refused if it would strand the anchor or remove the last live replica |
+| `RegisterNode` | Sticky states (`Maintenance`, `Draining`, `Quarantined`) survive re-registration |
+| `DeregisterNode` | Refused while the node still holds replicas |
+| `RenameFile` | Directory renames re-key all children; directory-onto-file and file-onto-directory are refused |
+| `CreateSymlink` / `CreateLink` | Refuse an occupied destination |
+
+If the applying node is the leader and a client is waiting, the response is sent back through the `responder` channel.
 
 ## Snapshots
 
@@ -217,20 +207,7 @@ Over time, the Raft log grows unboundedly. Snapshots compact the state machine i
 
 ### Snapshot Format
 
-Snapshots are serialized as JSON via the `StateMachineSnapshot` struct:
-
-```rust
-pub struct StateMachineSnapshot {
-    pub last_applied_log: Option<(u64, u64)>,  // (term, index)
-    pub last_membership: Option<serde_json::Value>,
-    pub files: BTreeMap<String, FileMetadata>,
-    pub nodes: BTreeMap<u64, NodeInfo>,
-    pub cluster_config: ClusterConfig,
-    pub audit_log: Vec<AuditEntry>,
-}
-```
-
-The snapshot is wrapped in a `Cursor<Vec<u8>>` for transport. The `last_applied_log` is stored as a simple `(term, index)` tuple to decouple the snapshot format from OpenRaft internal types.
+A snapshot is the serialized `StateMachineData` (JSON) wrapped in a `Cursor<Vec<u8>>`, plus the last applied log id and membership. Every field added to `StateMachineData` must carry `#[serde(default)]` so older snapshots still load, and each new field gets a regression test.
 
 ### Snapshot Lifecycle
 
@@ -246,15 +223,19 @@ The snapshot is wrapped in a `Cursor<Vec<u8>>` for transport. The `last_applied_
     |  - Generate snapshot_id from last applied log
     |
     v
-  2. Store snapshot in memory (StoredSnapshot)
+  2. Persist the snapshot to disk (temp file, rename). A failure here is
+    |  returned to Raft as a fatal storage error: the snapshot is NOT
+    |  published and the log is NOT purged
+    v
+  3. Cache it in memory (StoredSnapshot)
     |
     v
-  3. Purge log entries up to snapshot's last_applied_log
+  4. Purge log entries up to snapshot's last_applied_log
     |  - delete_range_cf on the "logs" column family
-    |  - Update last_purged in "meta" CF
+    |  - last_purged written in the SAME batch as the range delete
     |
     v
-  4. If a follower is too far behind (missing purged entries):
+  5. If a follower is too far behind (missing purged entries):
     |  - Send full snapshot via InstallSnapshot RPC
     |
     v
@@ -276,9 +257,11 @@ When a follower is too far behind to catch up via log entries (because those ent
     |                                              |
     |                                              |  2. install_snapshot()
     |                                              |     - Deserialize JSON blob
-    |                                              |     - Replace state machine:
-    |                                              |       files, nodes, config,
-    |                                              |       audit_log
+    |                                              |     - Persist it to disk FIRST;
+    |                                              |       on failure state is unchanged
+    |                                              |     - Replace the whole state
+    |                                              |       machine (one restore path
+    |                                              |       shared with snapshot build)
     |                                              |     - Update last_applied_log
     |                                              |       and last_membership
     |                                              |
@@ -326,9 +309,7 @@ A write is committed when the leader plus enough followers have persisted the lo
 
 ### Read Consistency
 
-All reads in DTFS go to the Raft leader (or are forwarded to the leader by followers). This provides linearizable read consistency -- every read sees the result of the most recently committed write.
-
-However, for metadata reads that can tolerate slightly stale data (such as file location lookups that the FUSE client will cache for 5 seconds anyway), a follower read optimization is possible. The FUSE client's metadata cache TTL already provides a natural staleness window.
+Writes are linearized through the leader (followers forward client mutations to it, authenticated with the shared secret). Metadata reads are served from the local state machine of whichever manager the client asked, including learners, so a read can lag the leader by a replication delay. Clients tolerate this: file locations are cached for 5 s anyway, and a stale location only costs a failover to another replica. Client mutations are not forwarded by learners, so a FUSE client's manager list must include at least one voter.
 
 ## Membership Changes
 
@@ -414,7 +395,7 @@ During the joint configuration phase, entries must be committed by a majority of
 | File reads (cached) | Succeeds if FUSE client has cached metadata and data node is reachable. |
 | File reads (uncached) | Fails if metadata lookup cannot reach a functioning leader. |
 | Chunk reads | Succeeds as long as at least one replica data node is reachable (data path does not go through Raft). |
-| Chunk writes | Placement allocation fails without a leader. Writes that are already placed succeed if data nodes are reachable. |
+| Chunk writes | Allocation, write leases and the final location commit all go through the leader, so a write cannot complete without one. Bytes already streamed to data nodes are not lost; they become orphans if the commit never happens and are reaped after the grace period. |
 | Node registration | Fails without a functioning leader. |
 | Health monitoring | Heartbeats continue to the accessible manager nodes. Unreachable data nodes are marked suspect/down. |
 
@@ -423,15 +404,15 @@ During the joint configuration phase, entries must be committed by a majority of
 Data nodes operate independently of the manager for serving existing chunks. If a data node cannot reach any manager:
 
 - **GetChunk** requests from FUSE clients continue to work for chunks already stored locally.
-- **PutChunk** requests succeed for local storage, but the manager cannot update chunk locations in the Raft state machine until the partition heals.
+- **PutChunk** requests can still land bytes, but a client cannot commit their locations until it reaches a leader.
 - **Heartbeats** fail, so the data node appears unhealthy to any manager that can still reach it.
 
 ### FUSE Client Behavior During Partition
 
 The FUSE client handles manager unavailability through:
 
-1. **Metadata cache**: Reads for recently-accessed files continue to work using cached chunk locations (default 5-second TTL, but the data remains valid beyond the TTL as long as data nodes have not changed).
-2. **Retry with backoff**: The `DtfsClient` retries failed RPCs with exponential backoff.
+1. **Metadata cache**: Reads of recently-accessed files keep working from cached chunk locations for the 5-second TTL. After that the client must reach a manager again; an expired entry is dropped, not served stale.
+2. **Manager walk**: `DtfsClient` walks its manager list and, when no usable manager answers (election, rolling restart), re-walks with backoff for up to 15 s before surfacing an error (EIO on a write). See [Partition Behavior](../access/partition-behavior.md).
 3. **Direct data node access**: Once the client knows which data nodes hold a chunk, it communicates directly with them. The data path is independent of the manager.
 
 ## Raft Transport
@@ -455,36 +436,17 @@ The `RaftRpcKind` enum identifies the message type:
 
 The `DtfsNetwork` struct lazily creates a tonic `Channel` on first use and caches it. If a connection fails, the channel is cleared so the next attempt reconnects.
 
+When `cluster.shared_secret` is set, every Raft RPC carries the `x-dtfs-rpc-ts` and `x-dtfs-rpc-mac` stamp, checked before the body is read; unsigned RPCs are accepted only while `cluster.require_raft_auth` is false (rolling-update window). The request body is capped at the manager gRPC message limit. See [Authentication](../security/authentication.md#raft-transport).
+
 Snapshot data is base64-encoded within the JSON payload. While not the most efficient encoding, it simplifies the transport layer by keeping all Raft messages in a uniform format. For production clusters with large state machines, a streaming snapshot transfer would be more appropriate.
 
 ## State Machine Recovery
 
 On startup, each manager node:
 
-1. Opens the RocksDB log store and reads the persisted vote and last purged log ID.
-2. Initializes an empty `StateMachineData`.
-3. OpenRaft replays all log entries from the log store (from `last_purged + 1` to the latest entry), applying them to the state machine.
-4. If a snapshot exists, it is loaded first, and only entries after the snapshot's `last_applied_log` are replayed.
+1. Opens the RocksDB log store and reads the persisted vote and last purged log id.
+2. Loads the newest persisted snapshot, if any, and restores the state machine from it.
+3. Applies the safety check: a node whose state machine is blank (or whose last applied index is below `last_purged`) while the log has been purged **refuses to start as a voter**. Starting would silently serve an empty or stale state; the operator must restore the snapshot or rejoin the node as a learner.
+4. Lets OpenRaft replay log entries after the snapshot's `last_applied_log`.
 
-This ensures that the state machine is always consistent with the committed log, even after a crash.
-
-```
-  Startup sequence:
-
-  1. Open RocksDB at configured path
-         |
-  2. Read meta CF: vote, last_purged
-         |
-  3. Read logs CF: iterate all entries
-         |
-  4. If snapshot exists: install_snapshot()
-         |  - Deserialize state machine from JSON
-         |  - Set last_applied_log, last_membership
-         |
-  5. Replay log entries after snapshot
-         |  - For each entry: apply to state machine
-         |
-  6. State machine is now up to date
-         |
-  7. Join Raft cluster (or start election if single-node)
-```
+Two refusals protect against silent data loss: a **blank** state machine (for example an unreadable, discarded snapshot) next to a purged log, and a **stale** state machine whose last applied index is below the purged index (for example an old snapshot restored beside a newer log). In both cases the recovery is to restore `raft-sm` from a recent backup, or wipe `raft-log` and `raft-sm` and re-join the node as a learner from a healthy peer.
