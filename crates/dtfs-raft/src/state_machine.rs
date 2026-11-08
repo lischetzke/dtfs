@@ -1888,10 +1888,12 @@ fn apply_request(
                 // Truncate-shrink: drop chunks fully past the new EOF.
                 let chunk_size = meta.chunk_size.max(1);
                 let keep_idx = (*new_size).div_ceil(chunk_size);
+                let had_chunks = !meta.chunks.is_empty();
                 meta.chunks.retain(|c| c.chunk_index < keep_idx);
-                // Truncate to 0 discards all committed data legitimately, so a
-                // later sparse grow is not data loss.
-                if *new_size == 0 {
+                // A truncate that discards every chunk (or to 0) leaves no
+                // committed data legitimately; an already-chunkless lost file
+                // keeps its marker so the loss is not hidden.
+                if meta.chunks.is_empty() && (had_chunks || *new_size == 0) {
                     meta.ever_committed = Some(false);
                 }
                 push_audit_capped(

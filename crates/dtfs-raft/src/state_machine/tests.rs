@@ -3987,6 +3987,27 @@ mod ever_committed_tests {
     }
 
     #[test]
+    fn truncate_dropping_every_chunk_is_not_missing() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/c3");
+        seed_lease(&mut sm, "/c3");
+        commit(&mut sm, 2, "/c3", 3); // only chunk 3 written (sparse head)
+        set_size(&mut sm, 3, "/c3", 1);
+        assert!(!sm.files["/c3"].committed_data_missing());
+    }
+
+    #[test]
+    fn truncate_of_an_already_lost_file_stays_missing() {
+        let mut sm = StateMachineData::default();
+        create(&mut sm, 1, "/lost");
+        seed_lease(&mut sm, "/lost");
+        commit(&mut sm, 2, "/lost", 0);
+        sm.files.get_mut("/lost").unwrap().chunks.clear(); // rows already gone
+        set_size(&mut sm, 3, "/lost", 1);
+        assert!(sm.files["/lost"].committed_data_missing(), "truncate must not hide loss");
+    }
+
+    #[test]
     fn legacy_entry_excluded_only_with_explicit_zero_size() {
         let mut f = FileMetadata {
             path: "/l".into(), volume_id: "default".into(), chunk_size: MIB, chunks: vec![],
