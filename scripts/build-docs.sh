@@ -59,7 +59,9 @@ fetch_pinned() {
         mkdir -p "$CACHE_DIR"
         local tmp; tmp="$(mktemp -d)"
         info "downloading $MDBOOK_URL" >&2
-        curl -fsSL -o "$tmp/$MDBOOK_ASSET" "$MDBOOK_URL"
+        # GitHub release downloads return transient 5xx now and then.
+        curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -o "$tmp/$MDBOOK_ASSET" "$MDBOOK_URL" \
+            || { error "download failed: $MDBOOK_URL"; rm -rf "$tmp"; return 1; }
         echo "$MDBOOK_SHA256  $tmp/$MDBOOK_ASSET" | sha256sum -c - >&2 \
             || { error "sha256 mismatch for $MDBOOK_ASSET"; rm -rf "$tmp"; return 1; }
         tar -C "$tmp" -xzf "$tmp/$MDBOOK_ASSET" mdbook
