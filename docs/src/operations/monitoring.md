@@ -103,6 +103,8 @@ Down    -> Healthy (node restarts and heartbeats resume)
 
 Operator-set `Maintenance` and `Quarantined` (and `Draining`) are sticky: the monitor never marks such a node `Down`, and a heartbeat does not clear them. Only data nodes are tracked by the monitor.
 
+Only the Raft leader judges liveness, and it counts missed heartbeats from the later of the node's last committed heartbeat and the moment it became leader. After a leader change (for example a rolling manager restart, during which no heartbeat can commit) a data node is therefore not marked `Suspect`/`Down` until the new leader has itself waited the full interval; a node that really died during the election is detected up to one interval later than otherwise.
+
 When a node transitions to `Down`, the manager begins re-replicating its chunks to maintain the configured replication factor.
 
 ## Key Dashboards

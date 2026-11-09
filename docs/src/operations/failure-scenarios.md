@@ -15,7 +15,10 @@ are configurable per cluster.
 manager Raft cluster. The cluster manager marks a node `Suspect` after
 15 seconds of silence and `Down` after 30 seconds
 (`crates/dtfs-manager/src/cluster.rs` thresholds, written to the Raft
-state machine via `UpdateNodeStatus`).
+state machine via `UpdateNodeStatus`). Only the Raft leader judges, and a
+newly elected leader counts the silence from its own election, so a manager
+failover or rolling restart does not mark healthy data nodes `Down`; a
+node that dies around a leader change is detected up to 30 s later.
 
 **Reads continue immediately.** Clients pick the next healthy replica
 via the `location.rs` distance heuristic. If a read RPC fails mid-flight

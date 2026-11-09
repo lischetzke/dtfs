@@ -103,6 +103,18 @@ pub(crate) fn liveness_changes(
     suspect_ms: u64,
     down_ms: u64,
 ) -> Vec<(u64, NodeStatus)> {
+    liveness_changes_since(nodes, now_ms, suspect_ms, down_ms, 0)
+}
+
+/// MGR-MON-4 - as `liveness_changes`, but staleness is measured from
+/// `max(last_seen_ms, seen_floor_ms)`: nothing older than the floor counts.
+fn liveness_changes_since(
+    nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+    now_ms: u64,
+    suspect_ms: u64,
+    down_ms: u64,
+    seen_floor_ms: u64,
+) -> Vec<(u64, NodeStatus)> {
     let mut out = Vec::new();
     for (id, info) in nodes {
         if info.role != NodeRole::Data || info.last_seen_ms == 0 {
@@ -121,7 +133,7 @@ pub(crate) fn liveness_changes(
         {
             continue;
         }
-        let elapsed = now_ms.saturating_sub(info.last_seen_ms);
+        let elapsed = now_ms.saturating_sub(info.last_seen_ms.max(seen_floor_ms));
         let target = if elapsed > down_ms {
             Some(NodeStatus::Down)
         } else if elapsed > suspect_ms {
@@ -178,17 +190,24 @@ fn health_matches_status(
 /// voter (learners never lead), judges data-node liveness. Recovery stays the
 /// heartbeat handler's `UpdateNodeStatus(healthy)` (any manager, forwarded),
 /// so a node still un-marks promptly after a real Down.
+///
+/// MGR-MON-4 - `leader_since_ms` is `None` on a non-leader, else when this
+/// manager became leader. Staleness is measured from
+/// `max(last_seen_ms, leader_since_ms)`: during a manager rolling restart no
+/// heartbeat can commit, so a fresh leader would otherwise mark every data
+/// node Down on its first tick (prod dtfs-lm, empty placement ring). Each
+/// node gets a full suspect/down interval to heartbeat to the new leader.
 pub(crate) fn monitor_status_changes(
     nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
     now_ms: u64,
     suspect_ms: u64,
     down_ms: u64,
-    is_leader: bool,
+    leader_since_ms: Option<u64>,
 ) -> Vec<(u64, NodeStatus)> {
-    if !is_leader {
+    let Some(since) = leader_since_ms else {
         return Vec::new();
-    }
-    liveness_changes(nodes, now_ms, suspect_ms, down_ms)
+    };
+    liveness_changes_since(nodes, now_ms, suspect_ms, down_ms, since)
 }
 
 fn now_millis() -> u64 {
@@ -272,6 +291,9 @@ impl HealthMonitor {
         );
 
         let mut interval = tokio::time::interval(self.check_interval);
+        // MGR-MON-4 - (term, first tick this manager saw itself leader in
+        // that term). Seen at tick granularity, so the grace only lengthens.
+        let mut leader_since: Option<(u64, u64)> = None;
         loop {
             interval.tick().await;
 
@@ -280,10 +302,15 @@ impl HealthMonitor {
             // reading its own bursty-stale replicated view would otherwise
             // flap the node (CJ's residual case). openraft's metrics watch is a
             // Receiver — borrow_watched gives a borrow without consuming it.
-            let is_leader = {
+            let (is_leader, term) = {
                 use openraft::async_runtime::watch::WatchReceiver;
                 let m = self.raft.metrics().borrow_watched().clone();
-                m.current_leader.map(|leader| leader == m.id).unwrap_or(false)
+                (m.current_leader.map(|leader| leader == m.id).unwrap_or(false), m.current_term)
+            };
+            leader_since = match leader_since {
+                Some((t, since)) if is_leader && t == term => Some((t, since)),
+                _ if is_leader => Some((term, now_millis())),
+                _ => None,
             };
 
             // Bug CJ — judge liveness from the replicated `last_seen_ms` (not a
@@ -307,7 +334,7 @@ impl HealthMonitor {
                     now_ms,
                     self.suspect_ms,
                     self.down_ms,
-                    is_leader,
+                    leader_since.map(|(_, since)| since),
                 );
                 // MGR-MON-3 — snapshot the raft membership only when there is
                 // something to commit, so the leader-forward below can resolve
@@ -614,22 +641,58 @@ mod bug_cj_liveness_tests {
         let nodes = map(&[(1, node(NodeRole::Data, NOW - 60_000))]);
         // Leader: detects Down.
         assert_eq!(
-            monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, true),
+            monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, Some(0)),
             vec![(1, NodeStatus::Down)]
         );
         // Follower/learner: silent (no flap).
-        assert!(monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, false).is_empty());
+        assert!(monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, None).is_empty());
     }
 
     // A non-leader stays silent for a SUSPECT-range node too.
     #[test]
     fn follower_silent_for_suspect_range() {
         let nodes = map(&[(1, node(NodeRole::Data, NOW - 20_000))]);
-        assert!(monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, false).is_empty());
+        assert!(monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, None).is_empty());
         assert_eq!(
-            monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, true),
+            monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, Some(0)),
             vec![(1, NodeStatus::Suspect)]
         );
+    }
+
+    // MGR-MON-4 (prod dtfs-lm, 5 rolling restarts) - during a manager
+    // rolling restart no heartbeat can commit, so the replicated last_seen
+    // of a healthy data node is already older than down_ms when the NEW
+    // leader's monitor first ticks. A leader whose tenure is shorter than
+    // the threshold must not judge that staleness.
+    #[test]
+    fn new_leader_does_not_mark_down_within_tenure_grace() {
+        let nodes = map(&[(1, node(NodeRole::Data, NOW - 60_000))]);
+        // Leader for 1 s: no Down, no Suspect.
+        assert!(monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, Some(NOW - 1_000)).is_empty());
+        // Leader for exactly down_ms (boundary, not strictly above): at most Suspect.
+        assert_eq!(
+            monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, Some(NOW - DOWN_MS)),
+            vec![(1, NodeStatus::Suspect)]
+        );
+    }
+
+    // Grace expires: tenure > down_ms and still no heartbeat -> Down.
+    #[test]
+    fn leader_marks_down_once_tenure_exceeds_down_ms() {
+        let nodes = map(&[(1, node(NodeRole::Data, NOW - 60_000))]);
+        assert_eq!(
+            monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, Some(NOW - DOWN_MS - 1)),
+            vec![(1, NodeStatus::Down)]
+        );
+    }
+
+    // A heartbeat committed under the new leader keeps the node fresh
+    // regardless of tenure.
+    #[test]
+    fn fresh_heartbeat_under_new_leader_is_not_marked() {
+        let nodes = map(&[(1, node(NodeRole::Data, NOW - 2_000))]);
+        assert!(monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, Some(NOW - 500)).is_empty());
+        assert!(monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, Some(NOW - 600_000)).is_empty());
     }
 }
 
