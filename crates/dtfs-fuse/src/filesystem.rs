@@ -1789,10 +1789,23 @@ impl DtfsFilesystem {
             // makes too small; once set, commits grow it to their extent.
             // At least every committed, in-flight and buffered end: a
             // SetFileSize drops the chunks above it.
-            let (end, _) = self.eof_after(fh, &path, self.write_buffer.visible_size(&path)).await?;
-            let pin = logical_size.max(end);
-            self.set_size(fh, pin).await?;
-            debug!(path = %path, size = pin, "pinned size before a sparse write");
+            let pinned = match self.eof_after(fh, &path, self.write_buffer.visible_size(&path)).await {
+                Ok((end, _)) => {
+                    let pin = logical_size.max(end);
+                    self.set_size(fh, pin).await.map(|()| pin)
+                }
+                Err(e) => Err(e),
+            };
+            match pinned {
+                Ok(pin) => debug!(path = %path, size = pin, "pinned size before a sparse write"),
+                Err(e) => {
+                    // As a failed cap drain: drop the write's own fresh seeds,
+                    // else retried failing writes grow the buffer unbounded
+                    // (the hole tail seed stays).
+                    self.write_buffer.remove_chunks(&path, &fresh_seeds);
+                    return Err(e);
+                }
+            }
         }
         for r in fill.iter() {
             // Cap the zero-fill at 64 MiB per step to keep memory bounded.
@@ -6073,6 +6086,7 @@ mod async_commit_fs_tests {
         assert!(format!("{err:#}").contains("set_size"), "{err:#}");
         assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100, "tail padded although the pin failed");
         assert_eq!(fs.write_buffer.logical_size("/f"), Some(100));
+        assert_eq!(fs.write_buffer.pending_summary("/f").0, vec![0], "a fresh seed left behind");
     }
 
     /// R2-4: a grow under an exclusive commit slot drops no chunks: the
