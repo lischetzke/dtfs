@@ -493,12 +493,16 @@ impl WriteBuffer {
     /// chunks are available.
     #[instrument(skip(self), fields(path = %path))]
     pub fn flush(&self, path: &str) -> Vec<ChunkSegment> {
-        let mut entry = match self.buffers.get_mut(path) {
-            Some(e) => e,
-            None => return Vec::new(),
-        };
-        let buf = entry.value_mut();
+        self.drain(path, false, |buf| self.flush_locked(buf)).0
+    }
 
+    /// `flush` + `begin_inflight` in one step (write()'s batch flush and
+    /// `spawn_bg_upload`); no overlay when nothing was drained.
+    pub fn flush_inflight(&self, path: &str) -> (Vec<ChunkSegment>, Option<InflightGuard<'_>>) {
+        self.drain(path, true, |buf| self.flush_locked(buf))
+    }
+
+    fn flush_locked(&self, buf: &mut FileWriteBuffer) -> Vec<ChunkSegment> {
         let ready = buf
             .chunks
             .values()
@@ -507,17 +511,33 @@ impl WriteBuffer {
         if ready < self.flush_batch_chunks {
             return Vec::new();
         }
-
         let segments = buf.extract_complete_chunks(self.chunk_size);
         debug!(
-            path,
+            path = %buf.path,
             num_segments = segments.len(),
             remaining = buf.chunks.len(),
             "flushed complete chunks"
         );
+        segments
+    }
+
+    /// Drain `path` with `f` under its buffer entry's write lock. With
+    /// `inflight`, the drained segments are registered as in-flight BEFORE
+    /// that lock drops: `visible_size`/`overlay` read the overlay under the
+    /// entry lock, so they never see the bytes in neither place.
+    fn drain(
+        &self,
+        path: &str,
+        inflight: bool,
+        f: impl FnOnce(&mut FileWriteBuffer) -> Vec<ChunkSegment>,
+    ) -> (Vec<ChunkSegment>, Option<InflightGuard<'_>>) {
+        let Some(mut entry) = self.buffers.get_mut(path) else { return (Vec::new(), None) };
+        let segments = f(entry.value_mut());
+        // Lock order buffers -> inflight (as in visible_size/overlay).
+        let guard = (inflight && !segments.is_empty()).then(|| self.begin_inflight(path, &segments));
         drop(entry);
         self.note_drained(path, &segments);
-        segments
+        (segments, guard)
     }
 
     /// Extract every buffered chunk, including partial (not fully covered)
@@ -525,35 +545,22 @@ impl WriteBuffer {
     /// all buffered data must be persisted regardless of alignment.
     #[instrument(skip(self), fields(path = %path))]
     pub fn flush_all(&self, path: &str) -> Vec<ChunkSegment> {
-        let mut entry = match self.buffers.get_mut(path) {
-            Some(e) => e,
-            None => return Vec::new(),
-        };
-        let buf = entry.value_mut();
+        self.drain(path, false, |buf| self.flush_all_locked(buf)).0
+    }
+
+    /// `flush_all` + `begin_inflight` in one step (commit_all).
+    pub fn flush_all_inflight(&self, path: &str) -> (Vec<ChunkSegment>, Option<InflightGuard<'_>>) {
+        self.drain(path, true, |buf| self.flush_all_locked(buf))
+    }
+
+    fn flush_all_locked(&self, buf: &mut FileWriteBuffer) -> Vec<ChunkSegment> {
         let segments = buf.extract_all_chunks(self.chunk_size);
         debug!(
-            path,
+            path = %buf.path,
             num_segments = segments.len(),
             "flushed all chunks (including partial)"
         );
-        drop(entry);
-        self.note_drained(path, &segments);
         segments
-    }
-
-    /// `flush_all` + `begin_inflight` in one step: a `visible_size` reader
-    /// never sees the drained bytes in neither place (commit_all).
-    pub fn flush_all_inflight(&self, path: &str) -> (Vec<ChunkSegment>, InflightGuard<'_>) {
-        let Some(mut entry) = self.buffers.get_mut(path) else {
-            return (Vec::new(), self.begin_inflight(path, &[]));
-        };
-        let segments = entry.value_mut().extract_all_chunks(self.chunk_size);
-        // Registered while the buffer entry is locked: a reader blocked on it
-        // finds the overlay once it sees the drained buffer.
-        let guard = self.begin_inflight(path, &segments);
-        drop(entry);
-        self.note_drained(path, &segments);
-        (segments, guard)
     }
 
     /// `write.async_commit` age trigger: up to `limit` paths whose oldest
@@ -584,12 +591,33 @@ impl WriteBuffer {
         partial: bool,
         keep: RangeInclusive<u32>,
     ) -> Vec<ChunkSegment> {
-        if self.dirty_bytes(path).saturating_add(incoming) < cap {
+        self.drain(path, false, |buf| self.cap_drain_locked(buf, incoming, cap, partial, keep)).0
+    }
+
+    /// `cap_drain` + `begin_inflight` in one step (write()'s cap drains).
+    pub fn cap_drain_inflight(
+        &self,
+        path: &str,
+        incoming: usize,
+        cap: usize,
+        partial: bool,
+        keep: RangeInclusive<u32>,
+    ) -> (Vec<ChunkSegment>, Option<InflightGuard<'_>>) {
+        self.drain(path, true, |buf| self.cap_drain_locked(buf, incoming, cap, partial, keep))
+    }
+
+    fn cap_drain_locked(
+        &self,
+        buf: &mut FileWriteBuffer,
+        incoming: usize,
+        cap: usize,
+        partial: bool,
+        keep: RangeInclusive<u32>,
+    ) -> Vec<ChunkSegment> {
+        let mut dirty: usize = buf.chunks.values().map(|cb| cb.data.len()).sum();
+        if dirty.saturating_add(incoming) < cap {
             return Vec::new();
         }
-        let Some(mut entry) = self.buffers.get_mut(path) else { return Vec::new() };
-        let buf = entry.value_mut();
-        let mut dirty: usize = buf.chunks.values().map(|cb| cb.data.len()).sum();
         let mut segs = Vec::new();
         // Pass 0: complete gap-free chunks (all). Pass 1, still at the cap:
         // complete chunks with an unwritten gap, only until under the cap
@@ -630,8 +658,6 @@ impl WriteBuffer {
             }
         }
         segs.sort_by_key(|s| s.chunk_index);
-        drop(entry);
-        self.note_drained(path, &segs);
         segs
     }
 
@@ -1008,7 +1034,25 @@ impl WriteBuffer {
             return 0;
         }
         // In-flight drained segments first (oldest first), the buffer on top:
-        // its bytes are newer.
+        // its bytes are newer. Both under the buffer entry's read lock (order
+        // buffers -> inflight, as `visible_size`): a drain registers its
+        // overlay and a restore refills the buffer under the write lock, both
+        // while the overlay exists, so a read never sees the bytes in neither.
+        loop {
+            let Some(entry) = self.buffers.get(path) else {
+                // No entry: no drain can run; a restore creating one drops its
+                // overlay only after, so re-check the entry.
+                let n = self.overlay_inflight(path, abs_offset, dst);
+                if !self.buffers.contains_key(path) {
+                    return n;
+                }
+                continue;
+            };
+            return self.overlay_inflight(path, abs_offset, dst) + self.overlay_buffer(entry.value(), abs_offset, dst);
+        }
+    }
+
+    fn overlay_inflight(&self, path: &str, abs_offset: u64, dst: &mut [u8]) -> usize {
         let mut ids: Vec<u64> = self
             .inflight
             .iter()
@@ -1032,12 +1076,10 @@ impl WriteBuffer {
                 }
             }
         }
-        total + self.overlay_buffer(path, abs_offset, dst)
+        total
     }
 
-    fn overlay_buffer(&self, path: &str, abs_offset: u64, dst: &mut [u8]) -> usize {
-        let Some(entry) = self.buffers.get(path) else { return 0 };
-        let buf = entry.value();
+    fn overlay_buffer(&self, buf: &FileWriteBuffer, abs_offset: u64, dst: &mut [u8]) -> usize {
         if buf.chunks.is_empty() {
             return 0;
         }
@@ -2527,25 +2569,48 @@ mod async_commit_tests {
     #[test]
     fn drain_to_inflight_and_restore_never_hide_the_bytes() {
         let wb = WriteBuffer::new(CS);
-        let end = 3 * CS as u64 + 5;
-        wb.write(P, 0, &vec![1; end as usize]);
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        std::thread::scope(|s| {
-            let reader = s.spawn(|| {
-                let mut misses = 0u32;
-                while !stop.load(Ordering::Relaxed) {
-                    misses += u32::from(wb.visible_size(P) != Some(end));
-                }
-                misses
-            });
-            for _ in 0..200_000 {
-                let (segs, g) = wb.flush_all_inflight(P);
-                wb.restore_segments(P, &segs);
-                drop(g);
+        // Every drain into an overlay: commit_all, write()'s batch flush (and
+        // spawn_bg_upload), the cap drains; read via size and via content.
+        let mut misses = Vec::new();
+        for drain in ["flush_all", "flush", "cap_drain"] {
+            // flush leaves a partial tail buffered, which would mask the size.
+            let end = if drain == "flush" { 4 * CS as u64 } else { 3 * CS as u64 + 5 };
+            wb.remove(P);
+            wb.write(P, 0, &vec![1; end as usize]);
+            for read in ["visible_size", "overlay"] {
+                let stop = std::sync::atomic::AtomicBool::new(false);
+                std::thread::scope(|s| {
+                    let reader = s.spawn(|| {
+                        let mut n = 0u32;
+                        let mut dst = vec![0u8; end as usize];
+                        while !stop.load(Ordering::Relaxed) {
+                            let ok = if read == "overlay" {
+                                dst.fill(0);
+                                wb.overlay(P, 0, &mut dst);
+                                dst.iter().all(|&b| b == 1)
+                            } else {
+                                wb.visible_size(P) == Some(end)
+                            };
+                            n += u32::from(!ok);
+                        }
+                        n
+                    });
+                    for _ in 0..30_000 {
+                        let (segs, g) = match drain {
+                            "flush_all" => wb.flush_all_inflight(P),
+                            "flush" => wb.flush_inflight(P),
+                            _ => wb.cap_drain_inflight(P, 0, 0, true, u32::MAX..=u32::MAX),
+                        };
+                        assert!(!segs.is_empty() && g.is_some(), "{drain}: nothing drained");
+                        wb.restore_segments(P, &segs);
+                        drop(g);
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                    misses.push((drain, read, reader.join().unwrap()));
+                });
             }
-            stop.store(true, Ordering::Relaxed);
-            assert_eq!(reader.join().unwrap(), 0, "visible_size dropped below the end");
-        });
+        }
+        assert!(misses.iter().all(|m| m.2 == 0), "bytes hidden by a drain/restore: {misses:?}");
     }
 
     /// Write at 0, then far past the end, close: only the two written chunks

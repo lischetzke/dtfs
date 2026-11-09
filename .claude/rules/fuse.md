@@ -224,9 +224,14 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   only this order always counts it (else the pin went below the committed
   end and SetFileSize dropped committed chunks). fallocate's floor
   (`size_floor`) reads `visible_size` before the fetch and the handles.
-  `commit_all` drains via `flush_all_inflight` (overlay registered under the
-  buffer entry lock) and `visible_size` reads the overlay under that lock,
-  so a drain or restore never hides the bytes from an EOF reader.
+  Every drain into an overlay goes through `WriteBuffer::drain` (overlay
+  registered under the buffer entry write lock): `flush_all_inflight`
+  (commit_all), `flush_inflight` (write()'s batch flush; async hands the
+  overlay id to `spawn_bg_upload`, adopted by the task), `cap_drain_inflight`
+  (both cap drains). `visible_size` and `overlay()` read the overlay under
+  the entry's read lock (order buffers -> inflight; no entry: overlay read,
+  then re-check), so a drain or restore never hides the bytes from an EOF
+  reader or a read(). Never `flush`/`cap_drain` then `begin_inflight`.
 
 ## Reads and prefetch
 

@@ -1790,9 +1790,8 @@ impl DtfsFilesystem {
                 self.bg_backpressure(&path, n).await;
                 if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), n) {
                     self.renew_if_due(fh, &path).await?;
-                    let segs = self.cap_drain(&path, at, n);
+                    let (segs, _inflight) = self.cap_drain(&path, at, n);
                     if !segs.is_empty() {
-                        let _inflight = self.write_buffer.begin_inflight(&path, &segs);
                         let committed = match self.flush_segments_to_cluster(&path, &segs).await {
                             Ok(c) => c,
                             Err(e) => {
@@ -1817,9 +1816,8 @@ impl DtfsFilesystem {
         self.bg_backpressure(&path, data.len()).await;
         if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), data.len()) {
             self.renew_if_due(fh, &path).await?;
-            let segs = self.cap_drain(&path, effective_offset, data.len());
+            let (segs, _inflight) = self.cap_drain(&path, effective_offset, data.len());
             if !segs.is_empty() {
-                let _inflight = self.write_buffer.begin_inflight(&path, &segs);
                 let committed = match self.flush_segments_to_cluster(&path, &segs).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -1839,18 +1837,18 @@ impl DtfsFilesystem {
         // flight, complete chunks stay buffered (bounded by the cap above).
         if self.config.write.async_commit {
             if !self.bg_uploads.contains_key(&path) {
-                let segments = self.write_buffer.flush(&path);
-                if !segments.is_empty() {
-                    self.spawn_bg_upload(fh, path.clone(), segments);
+                // Overlay registered with the drain: the batch is visible
+                // (reads, the next write's EOF) the moment write() returns.
+                if let (segments, Some(g)) = self.write_buffer.flush_inflight(&path) {
+                    self.spawn_bg_upload(fh, path.clone(), segments, g.into_id());
                 }
             }
             return Ok(written as u32);
         }
 
         // Check if any complete chunks are ready to flush.
-        let segments = self.write_buffer.flush(&path);
+        let (segments, _inflight) = self.write_buffer.flush_inflight(&path);
         if !segments.is_empty() {
-            let _inflight = self.write_buffer.begin_inflight(&path, &segments);
             if let Err(e) = self.renew_if_due(fh, &path).await {
                 self.write_buffer.restore_segments(&path, &segments);
                 return Err(e);
@@ -1964,10 +1962,16 @@ impl DtfsFilesystem {
     /// `DIRTY_BYTES_CAP` drain before buffering `len` bytes at `at`: complete
     /// chunks; with async_commit also partial chunks outside `at..at+len`
     /// (those were just seeded for this write and must stay seeded).
-    fn cap_drain(&self, path: &str, at: u64, len: usize) -> Vec<crate::writebuf::ChunkSegment> {
+    /// Returns the drained segments with their in-flight overlay.
+    fn cap_drain(
+        &self,
+        path: &str,
+        at: u64,
+        len: usize,
+    ) -> (Vec<crate::writebuf::ChunkSegment>, Option<crate::writebuf::InflightGuard<'_>>) {
         let cs = self.write_buffer.chunk_size().max(1) as u64;
         let keep = (at / cs) as u32..=((at + len.max(1) as u64 - 1) / cs) as u32;
-        self.write_buffer.cap_drain(
+        self.write_buffer.cap_drain_inflight(
             path,
             len,
             crate::writebuf::DIRTY_BYTES_CAP,
@@ -2007,14 +2011,12 @@ impl DtfsFilesystem {
     /// `bg_uploads`). One batch, not more: two overlapping commits of a path
     /// make the post-commit merge fall back to a full re-fetch (O(file) per
     /// batch); the batch itself keeps `upload_concurrency` puts busy.
-    fn spawn_bg_upload(self: &Arc<Self>, fh: u64, path: String, segs: Vec<crate::writebuf::ChunkSegment>) {
+    /// `inflight`: the batch's overlay id (`flush_inflight`), adopted by the task.
+    fn spawn_bg_upload(self: &Arc<Self>, fh: u64, path: String, segs: Vec<crate::writebuf::ChunkSegment>, inflight: u64) {
         let mut chunks: Vec<u32> = segs.iter().map(|s| s.chunk_index).collect();
         chunks.sort_unstable();
         let bytes = segs.iter().map(|s| s.data.len()).sum();
         self.bg_uploads.insert(path.clone(), (chunks, bytes));
-        // Overlay registered before the spawn: the batch is visible (reads,
-        // the next write's EOF) the moment write() returns.
-        let inflight = self.write_buffer.begin_inflight(&path, &segs).into_id();
         let this = Arc::clone(self);
         tokio::spawn(async move { this.bg_upload(fh, path, segs, inflight).await });
     }
