@@ -766,6 +766,10 @@ pub struct DtfsFilesystem {
     bg_uploads: DashMap<String, (Vec<u32>, usize)>,
     /// Woken whenever a background upload ends (`wait_bg_uploads`).
     bg_done: tokio::sync::Notify,
+    /// Test hook run by write_inner right after it read the handle: models a
+    /// commit retiring during the awaits that follow.
+    #[cfg(test)]
+    write_race_hook: std::sync::Mutex<Option<Box<dyn FnOnce(&DtfsFilesystem) + Send>>>,
     /// P0-1: prefix used for write-lease `owner_id` values. Format:
     /// `<hostname>:<pid>:`. The per-open `:<fh>` suffix is appended at
     /// open-time to make each owner_id unique within the process.
@@ -849,6 +853,8 @@ impl DtfsFilesystem {
             path_locks: DashMap::new(),
             bg_uploads: DashMap::new(),
             bg_done: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            write_race_hook: std::sync::Mutex::new(None),
             lease_owner_prefix,
             local_cache: None,
         }
@@ -1638,19 +1644,19 @@ impl DtfsFilesystem {
         // already have unflushed data, in which case the buffer reports a
         // larger logical end than `locations.total_size`. (F-021)
         let chunk_size = file.chunk_size;
-        let cached_snapshot = file.locations.clone();
         drop(file); // Release the lock before writing.
+        #[cfg(test)]
+        if let Some(hook) = self.write_race_hook.lock().unwrap().take() {
+            hook(self);
+        }
         // P0-1 follow-up: renew BEFORE any commit (top of write, before each
         // hole-fill drain and the final drain), not after: a long hole fill
         // or slow commit must not outlive the lease it runs under.
         self.renew_if_due(fh, &path).await?;
-        // `None` = a post-commit refresh failed and marked the snapshot
-        // stale; writing against it would zero-seed over committed chunks.
-        let locations_snapshot = match cached_snapshot {
-            Some(l) => Some(l),
-            None => Some(self.refetch_locations(&path).await?),
-        };
-        let cached_eof = locations_snapshot.as_ref().map(|l| l.total_size).unwrap_or(0);
+        // EOF (append offset, tail seed) and the seed snapshot, read only now
+        // (a commit may have retired during the awaits above).
+        let (eof_now, snapshot) = self.eof_after(fh, &path, self.write_eof(&path)).await?;
+        let locations_snapshot = Some(snapshot);
 
         // A write buffer split at a different chunk size than the file's own
         // would silently corrupt it (reads use the file's chunk size).
@@ -1661,12 +1667,7 @@ impl DtfsFilesystem {
             bail!(msg);
         }
 
-        let effective_offset = if append {
-            let buffered = self.write_eof(&path).unwrap_or(0);
-            cached_eof.max(buffered)
-        } else {
-            offset
-        };
+        let effective_offset = if append { eof_now } else { offset };
 
         // Read-modify-write for partial-chunk writes (F-021).
         //
@@ -1702,7 +1703,6 @@ impl DtfsFilesystem {
             // A write past EOF hole-fills the existing partial tail chunk
             // with zeros; it must be seeded first or the zero-padded tail
             // replaces its real bytes at commit.
-            let eof_now = cached_eof.max(self.write_eof(&path).unwrap_or(0));
             if let Some(t) = hole_tail_chunk(eof_now, effective_offset, chunk_size) {
                 if !seed_list.contains(&t) && self.write_buffer.chunk_needs_seed(&path, t as u32) {
                     seed_list.insert(0, t);
@@ -1756,8 +1756,8 @@ impl DtfsFilesystem {
         // Chunk indices entirely inside the hole stay unbuffered and are
         // never uploaded: a missing index below EOF reads as zeros.
         // `write_eof` also counts a batch uploading in the background.
-        let buffered_size = self.write_eof(&path).unwrap_or(0);
-        let logical_size = cached_eof.max(buffered_size);
+        // Re-read after the seed awaits (same order as above).
+        let (logical_size, _) = self.eof_after(fh, &path, self.write_eof(&path)).await?;
         let fill = crate::writebuf::hole_fill_ranges(logical_size, effective_offset, chunk_size);
         for (i, r) in fill.iter().enumerate() {
             if i == 1 && r.start > fill[0].end {
@@ -1767,7 +1767,8 @@ impl DtfsFilesystem {
                 // makes too small; once set, commits grow it to their extent.
                 // At least every committed, in-flight and buffered end: a
                 // SetFileSize drops the chunks above it.
-                let pin = logical_size.max(self.write_buffer.visible_size(&path).unwrap_or(0));
+                let (end, _) = self.eof_after(fh, &path, self.write_buffer.visible_size(&path)).await?;
+                let pin = logical_size.max(end);
                 self.set_size(fh, pin).await?;
                 debug!(path = %path, size = pin, "pinned size before a sparse write");
             }
@@ -2089,6 +2090,22 @@ impl DtfsFilesystem {
         }
     }
 
+    /// Write-side EOF of `fh`'s file: `buffered` (buffer [+ in-flight],
+    /// evaluated by the caller FIRST), then the handle's CURRENT snapshot
+    /// (refetched when stale), max. A commit merges into the handles before
+    /// it drops its overlay, so this order always counts its bytes (FUSE-1).
+    /// Returns that snapshot too: seeds must use it.
+    async fn eof_after(&self, fh: u64, path: &str, buffered: Option<u64>) -> Result<(u64, Arc<FileLocations>)> {
+        let cur = self.open_files.get(&fh).and_then(|f| f.locations.clone());
+        // `None` = stale (a post-commit refresh failed): seeding from it would
+        // zero-seed over committed chunks.
+        let loc = match cur {
+            Some(l) => l,
+            None => self.refetch_locations(path).await?,
+        };
+        Ok((buffered.unwrap_or(0).max(loc.total_size), loc))
+    }
+
     /// `write.async_commit` serialisation of the timer commit with write(),
     /// a writer's truncate and release on `path`; `None` when off.
     async fn path_guard(&self, path: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
@@ -2205,9 +2222,8 @@ impl DtfsFilesystem {
             }
         }
 
-        let segments = self.write_buffer.flush_all(&path);
         // Visible to readers until restored or merged (dropped at return).
-        let _inflight = self.write_buffer.begin_inflight(&path, &segments);
+        let (segments, _inflight) = self.write_buffer.flush_all_inflight(&path);
         let had_segments = !segments.is_empty();
         let mut committed = None;
         if had_segments {
@@ -2622,18 +2638,24 @@ impl DtfsFilesystem {
         // Fresh manager fetch (never the metadata cache); a failure is an
         // error, not a guess, since a too-small size would shrink the file.
         self.metadata_cache.remove(&path);
-        let loc = self.fetch_file_locations(&path).await?;
+        self.size_floor(&path, async { Ok::<_, anyhow::Error>(self.fetch_file_locations(&path).await?.total_size) })
+            .await
+    }
+
+    /// max(manager size from `manager`, buffered end, handle sizes) of `path`.
+    /// Buffer + in-flight are read BEFORE the fetch and the handles: a batch
+    /// that retires meanwhile is in the fetch (committed) or the handles
+    /// (merged before the overlay drops).
+    async fn size_floor(&self, path: &str, manager: impl std::future::Future<Output = Result<u64>>) -> Result<u64> {
+        let buffered = self.write_buffer.visible_size(path);
+        let manager = manager.await?;
         let handle_sizes: Vec<u64> = self
             .open_files
             .iter()
             .filter(|e| e.value().path == path)
             .filter_map(|e| e.value().locations.as_ref().map(|l| l.total_size))
             .collect();
-        Ok(authoritative_size(
-            loc.total_size,
-            self.write_buffer.logical_size(&path),
-            &handle_sizes,
-        ))
+        Ok(authoritative_size(manager, buffered, &handle_sizes))
     }
 
     /// Update the manager-side logical size (F-033 fallocate / F-037
@@ -2652,7 +2674,7 @@ impl DtfsFilesystem {
             self.client
                 .set_file_size(&path, new_size)
                 .await
-                .with_context(|| format!("set_size failed for {path}"))?;
+                .with_context(|| format!("set_size {new_size} failed for {path}"))?;
         }
         self.metadata_cache.remove(&path);
         // Handle snapshots hold the old size (O_APPEND EOF, hole-fill base);
@@ -6236,6 +6258,72 @@ mod async_commit_fs_tests {
         assert_eq!(w.expect("chunk 10 is not in the batch {2, 19}: must not wait").unwrap(), 10);
         assert!(pending(fs.write(fh, 19 * cs + 1, &[5; 10])).await, "chunk 19 is in the batch");
         assert!(pending(fs.write(fh, 19 * cs - 1, &[5; 2])).await, "straddles 18/19");
+    }
+
+    /// `/f` with a 4-chunk batch in flight (overlay only). The returned hook
+    /// retires it like `bg_upload`/`commit_all` do: merge into every handle
+    /// (size 4 chunks), then drop the overlay.
+    fn retiring_batch(fs: &DtfsFilesystem, cs: u64) -> Box<dyn FnOnce(&DtfsFilesystem) + Send> {
+        fs.write_buffer.write("/f", 0, &vec![3; 4 * cs as usize]);
+        let segs = fs.write_buffer.flush_all("/f");
+        let id = fs.write_buffer.begin_inflight("/f", &segs).into_id();
+        Box::new(move |fs: &DtfsFilesystem| {
+            for mut f in fs.open_files.iter_mut() {
+                if f.path == "/f" {
+                    f.locations = Some(Arc::new(holes("/f", 4 * cs, cs)));
+                }
+            }
+            drop(fs.write_buffer.adopt_inflight(id));
+        })
+    }
+
+    /// FUSE-1: a batch commits and retires between write()'s snapshot read
+    /// and its EOF uses (renew/refetch/seed awaits). Its bytes are then in
+    /// none of buffer, overlay or the stale clone: O_APPEND must still land
+    /// at its end and the sparse-write size pin must not drop it.
+    #[tokio::test]
+    async fn write_eof_counts_a_batch_that_retired_after_the_snapshot_read() {
+        for async_on in [true, false] {
+            let fs = Arc::new(fs(async_on));
+            let cs = fs.write_buffer.chunk_size() as u64;
+            for append in [false, true] {
+                let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+                {
+                    let mut f = fs.open_files.get_mut(&fh).unwrap();
+                    f.append = append;
+                    f.locations = Some(Arc::new(holes("/f", 0, cs)));
+                }
+                *fs.write_race_hook.lock().unwrap() = Some(retiring_batch(&fs, cs));
+                if append {
+                    assert_eq!(fs.write(fh, 0, &[5; 10]).await.unwrap(), 10);
+                    assert!(!fs.write_buffer.has_chunk("/f", 0), "async={async_on}: O_APPEND landed over the batch");
+                    assert!(fs.write_buffer.has_chunk("/f", 4), "async={async_on}: append not at the batch end");
+                } else {
+                    let err = fs.write(fh, 10 * cs + 5, &[5; 10]).await.unwrap_err();
+                    let want = format!("set_size {} failed", 4 * cs);
+                    assert!(format!("{err:#}").contains(&want), "async={async_on}: pin below the batch: {err:#}");
+                }
+                fs.write_buffer.remove("/f");
+                fs.open_files.remove(&fh);
+            }
+        }
+    }
+
+    /// FUSE-2: fallocate's size floor counts in-flight bytes, also when the
+    /// batch retires during the manager fetch; else the manager size wins.
+    #[tokio::test]
+    async fn fallocate_size_floor_counts_in_flight_bytes() {
+        let fs = fs(true);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let _fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let hook = retiring_batch(&fs, cs);
+        let floor = fs.size_floor("/f", async { Ok::<u64, anyhow::Error>(0) }).await.unwrap();
+        assert_eq!(floor, 4 * cs, "in-flight batch not counted");
+        let fsr = &fs;
+        let floor = fs.size_floor("/f", async move { hook(fsr); Ok::<u64, anyhow::Error>(0) }).await.unwrap();
+        assert_eq!(floor, 4 * cs, "batch retired during the fetch");
+        let _g = open(&fs, "/g", OpenFlags::ReadWrite);
+        assert_eq!(fs.size_floor("/g", async { Ok::<u64, anyhow::Error>(100) }).await.unwrap(), 100);
     }
 
     /// The config bound must stay at half the write lease (renewed only by

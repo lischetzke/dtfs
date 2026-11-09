@@ -541,6 +541,21 @@ impl WriteBuffer {
         segments
     }
 
+    /// `flush_all` + `begin_inflight` in one step: a `visible_size` reader
+    /// never sees the drained bytes in neither place (commit_all).
+    pub fn flush_all_inflight(&self, path: &str) -> (Vec<ChunkSegment>, InflightGuard<'_>) {
+        let Some(mut entry) = self.buffers.get_mut(path) else {
+            return (Vec::new(), self.begin_inflight(path, &[]));
+        };
+        let segments = entry.value_mut().extract_all_chunks(self.chunk_size);
+        // Registered while the buffer entry is locked: a reader blocked on it
+        // finds the overlay once it sees the drained buffer.
+        let guard = self.begin_inflight(path, &segments);
+        drop(entry);
+        self.note_drained(path, &segments);
+        (segments, guard)
+    }
+
     /// `write.async_commit` age trigger: up to `limit` paths whose oldest
     /// buffered byte is at least `max_age` old at `now`, oldest first.
     pub fn aged_paths(&self, now: Instant, max_age: Duration, limit: usize) -> Vec<String> {
@@ -941,7 +956,10 @@ impl WriteBuffer {
     /// to size sparse-hole zero fills.
     pub fn logical_size(&self, path: &str) -> Option<u64> {
         let entry = self.buffers.get(path)?;
-        let buf = entry.value();
+        self.buffered_end(entry.value())
+    }
+
+    fn buffered_end(&self, buf: &FileWriteBuffer) -> Option<u64> {
         if buf.chunks.is_empty() {
             return None;
         }
@@ -956,14 +974,22 @@ impl WriteBuffer {
 
     /// What a reader sees as the end of `path` beyond the committed size:
     /// `logical_size` or the end of an in-flight drained segment.
+    /// The overlay is read under the buffer entry's lock: a drain
+    /// (`flush_all_inflight`) registers its overlay and a restore refills
+    /// the buffer under the write lock, both before the overlay drops, so
+    /// the bytes are always in one of the two. No entry: no drain can run,
+    /// and the overlay read first covers a restore that creates one.
     pub fn visible_size(&self, path: &str) -> Option<u64> {
-        let inflight = self
-            .inflight
-            .iter()
-            .filter(|e| e.value().0 == path)
-            .flat_map(|e| e.value().1.iter().map(|(o, d)| o + d.len() as u64).collect::<Vec<_>>())
-            .max();
-        self.logical_size(path).max(inflight)
+        let inflight = || {
+            self.inflight
+                .iter()
+                .filter(|e| e.value().0 == path)
+                .flat_map(|e| e.value().1.iter().map(|(o, d)| o + d.len() as u64).collect::<Vec<_>>())
+                .max()
+        };
+        let before = inflight();
+        let Some(entry) = self.buffers.get(path) else { return before };
+        self.buffered_end(entry.value()).max(inflight())
     }
 
     /// Overlay any buffered data for `path` that overlaps the byte range
@@ -2492,6 +2518,34 @@ mod async_commit_tests {
         assert_eq!(wb.visible_size(P), Some(10 * CS as u64 + 4), "truncate-extend");
         wb.truncate(P, 2);
         assert_eq!(wb.visible_size(P), Some(2), "truncate-shrink");
+    }
+
+    /// commit_all's drain into the in-flight overlay (and a failed upload's
+    /// restore back) is atomic for `visible_size`: a concurrent EOF reader
+    /// never sees the file shorter (FUSE-1: a SetFileSize pin below it drops
+    /// committed chunks).
+    #[test]
+    fn drain_to_inflight_and_restore_never_hide_the_bytes() {
+        let wb = WriteBuffer::new(CS);
+        let end = 3 * CS as u64 + 5;
+        wb.write(P, 0, &vec![1; end as usize]);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let mut misses = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    misses += u32::from(wb.visible_size(P) != Some(end));
+                }
+                misses
+            });
+            for _ in 0..200_000 {
+                let (segs, g) = wb.flush_all_inflight(P);
+                wb.restore_segments(P, &segs);
+                drop(g);
+            }
+            stop.store(true, Ordering::Relaxed);
+            assert_eq!(reader.join().unwrap(), 0, "visible_size dropped below the end");
+        });
     }
 
     /// Write at 0, then far past the end, close: only the two written chunks

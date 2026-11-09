@@ -214,7 +214,19 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   may hold `path_guard` (the task never takes it: no deadlock), and holding
   it means no new batch starts. Write-side EOF (append offset, hole fill,
   tail seed) uses `write_eof` = `visible_size` in async mode (the in-flight
-  batch counts, else the next append zero-filled over it).
+  batch counts, else the next append zero-filled over it). Every EOF use in
+  write() (append offset + tail seed, hole fill, size pin) is computed right
+  before it by `eof_after`: FIRST the buffer (+ in-flight), THEN the
+  handle's CURRENT snapshot (refetched if `None`), max; seeds use that
+  snapshot. Never a snapshot cloned before an await: a batch (bg or another
+  fd's `commit_all`, neither holds `path_guard` against it) may retire in
+  between, and it merges into the handles before dropping its overlay, so
+  only this order always counts it (else the pin went below the committed
+  end and SetFileSize dropped committed chunks). fallocate's floor
+  (`size_floor`) reads `visible_size` before the fetch and the handles.
+  `commit_all` drains via `flush_all_inflight` (overlay registered under the
+  buffer entry lock) and `visible_size` reads the overlay under that lock,
+  so a drain or restore never hides the bytes from an EOF reader.
 
 ## Reads and prefetch
 
