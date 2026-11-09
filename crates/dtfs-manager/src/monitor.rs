@@ -122,11 +122,16 @@ fn liveness_changes_since(
         }
         // Operator-set states are sticky: marking them Down would lose
         // Maintenance (WAN backfill storm) and wedge a rebooted quarantined
-        // node Down forever.
+        // node Down forever. Down/Failed are never moved by the monitor
+        // (MGR-1): the tenure floor would restart a dead node's elapsed at
+        // each election and re-mark it Suspect, which counts as live.
+        // Recovery is the heartbeat handler's job.
         if info.quarantine.is_some()
             || matches!(
                 info.health,
-                dtfs_common::types::HealthStatus::Maintenance
+                dtfs_common::types::HealthStatus::Down
+                    | dtfs_common::types::HealthStatus::Failed
+                    | dtfs_common::types::HealthStatus::Maintenance
                     | dtfs_common::types::HealthStatus::Draining
                     | dtfs_common::types::HealthStatus::Quarantined
             )
@@ -698,7 +703,7 @@ mod bug_cj_liveness_tests {
 
 #[cfg(test)]
 mod audit_co_tests {
-    use super::{liveness_changes, SUSPECT_MS, DOWN_MS};
+    use super::{liveness_changes, monitor_status_changes, SUSPECT_MS, DOWN_MS};
     use crate::cluster::NodeStatus;
     use dtfs_common::types::{HealthStatus, NodeRole};
 
@@ -754,6 +759,41 @@ mod audit_co_tests {
             liveness_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS),
             vec![(1, NodeStatus::Down)],
             "a Healthy node gone stale must transition to Down"
+        );
+    }
+
+    // MGR-1 - the leader-tenure floor restarts elapsed at the election, so a
+    // node Down/Failed for hours used to be re-marked Suspect (counted live
+    // by live_replica_tier) once tenure passed suspect_ms. The monitor must
+    // never move a Down or Failed node; recovery is the heartbeat's job.
+    #[test]
+    fn mgr_1_new_leader_never_moves_down_or_failed_node() {
+        for health in [HealthStatus::Down, HealthStatus::Failed] {
+            let nodes = map(&[(1, node(NodeRole::Data, NOW - 600_000, health))]);
+            for tenure in [SUSPECT_MS + 1, 40_000, DOWN_MS + 1] {
+                assert_eq!(
+                    monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, Some(NOW - tenure)),
+                    vec![],
+                    "{health:?} node moved by new leader after {tenure} ms tenure"
+                );
+            }
+            assert!(liveness_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS).is_empty());
+        }
+    }
+
+    // MGR-1 negative - a Healthy stale node still goes Suspect, then Down,
+    // by leader tenure.
+    #[test]
+    fn mgr_1_healthy_stale_node_still_suspect_then_down_by_tenure() {
+        let nodes = map(&[(1, node(NodeRole::Data, NOW - 600_000, HealthStatus::Healthy))]);
+        assert_eq!(
+            monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, Some(NOW - SUSPECT_MS - 1)),
+            vec![(1, NodeStatus::Suspect)]
+        );
+        let nodes = map(&[(1, node(NodeRole::Data, NOW - 600_000, HealthStatus::Suspect))]);
+        assert_eq!(
+            monitor_status_changes(&nodes, NOW, SUSPECT_MS, DOWN_MS, Some(NOW - DOWN_MS - 1)),
+            vec![(1, NodeStatus::Down)]
         );
     }
 }
