@@ -228,11 +228,10 @@ impl MetadataService {
         let body = serde_json::to_vec(&req)
             .map_err(|e| Status::internal(format!("serialize ClientRequest: {e}")))?;
         let resp = client
-            .forward_client_write(ForwardWriteRequest {
-                client_request_json: body,
-                // CO-2-2 — authenticate this forward to the leader.
-                shared_secret: self.config.cluster.shared_secret.clone(),
-            })
+            .forward_client_write(forward_write_request(
+                &self.config.cluster.shared_secret,
+                body,
+            ))
             .await
             .map_err(|e| {
                 // Drop the cached client on transport error so the next
@@ -629,6 +628,71 @@ fn forward_secret_ok(configured: &str, presented: &str) -> bool {
     dtfs_common::crypto::constant_time_eq(configured.as_bytes(), presented.as_bytes())
 }
 
+/// MAC binding of a forward: the BLAKE3 hash of the exact serialized
+/// `ClientRequest` bytes, so a captured stamp cannot authorize another body.
+fn forward_binding(client_request_json: &[u8]) -> String {
+    hex::encode(dtfs_common::checksum::compute(client_request_json))
+}
+
+/// Build the follower's `ForwardClientWrite` request: `dtfs-mgr-rpc` HMAC
+/// stamp over the body, legacy `shared_secret` field left empty so the raw
+/// secret never crosses the (possibly plaintext) WAN link.
+fn forward_write_request(secret: &str, body: Vec<u8>) -> Request<ForwardWriteRequest> {
+    use dtfs_common::crypto::{stamp_mgr_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS};
+    let stamp = stamp_mgr_rpc_auth(secret, "ForwardClientWrite", &forward_binding(&body));
+    let mut req = Request::new(ForwardWriteRequest {
+        client_request_json: body,
+        shared_secret: String::new(),
+    });
+    if let Some((ts, mac)) = stamp {
+        if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+            req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+            req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+        }
+    }
+    req
+}
+
+/// Leader-side authentication of a `ForwardClientWrite`. A stamped forward
+/// is always HMAC-verified against the body. An unstamped (pre-upgrade)
+/// forward is accepted on its legacy raw `shared_secret` only while
+/// `cluster.accept_legacy_forward_secret` is true.
+fn check_forward_auth(
+    secret: &str,
+    accept_legacy: bool,
+    body: &ForwardWriteRequest,
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<(), Status> {
+    use dtfs_common::crypto::{DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS};
+    if secret.is_empty() {
+        return Ok(());
+    }
+    if metadata.get(DATA_RPC_AUTH_TS).is_some() || metadata.get(DATA_RPC_AUTH_MAC).is_some() {
+        return require_mgr_rpc_auth(
+            secret,
+            "ForwardClientWrite",
+            &forward_binding(&body.client_request_json),
+            metadata,
+        );
+    }
+    if !accept_legacy {
+        tracing::warn!(
+            "ForwardClientWrite rejected: unsigned legacy forward \
+             (cluster.accept_legacy_forward_secret=false)"
+        );
+        return Err(Status::permission_denied(
+            "unsigned forwarded write refused (cluster.accept_legacy_forward_secret=false)",
+        ));
+    }
+    if !forward_secret_ok(secret, &body.shared_secret) {
+        tracing::warn!("ForwardClientWrite rejected: shared-secret mismatch");
+        return Err(Status::permission_denied(
+            "forwarded write shared-secret mismatch",
+        ));
+    }
+    Ok(())
+}
+
 /// LIS-56 — fail-closed auth for mutating ManagerService client RPCs when
 /// `cluster.shared_secret` is configured. Empty secret = legacy plaintext
 /// skip (same contract as LIS-19 / ForwardClientWrite). Uses the
@@ -731,10 +795,7 @@ pub(crate) async fn write_via_leader(
             let body =
                 serde_json::to_vec(&req).map_err(|e| format!("serialize ClientRequest: {e}"))?;
             let resp = client
-                .forward_client_write(ForwardWriteRequest {
-                    client_request_json: body,
-                    shared_secret: shared_secret.to_string(),
-                })
+                .forward_client_write(forward_write_request(shared_secret, body))
                 .await
                 .map_err(|e| format!("forward to leader {leader_addr}: {e}"))?;
             forward_result(&resp.into_inner())
@@ -2211,19 +2272,18 @@ impl ManagerService for MetadataService {
         &self,
         request: Request<ForwardWriteRequest>,
     ) -> Result<Response<ForwardWriteResponse>, Status> {
-        let body = request.into_inner();
         // CO-2-2 — authenticate the forwarding manager BEFORE applying any
         // write. Without this a follower (which accepts forwards from any
         // peer, including unauthenticated client writes like DeleteFile)
-        // could be driven by anyone who can reach its gRPC port. The check
-        // is skipped only when this leader has no configured shared secret
-        // (back-compat for plaintext clusters); the compare is constant-time.
-        if !forward_secret_ok(&self.config.cluster.shared_secret, &body.shared_secret) {
-            tracing::warn!("ForwardClientWrite rejected: shared-secret mismatch");
-            return Err(Status::permission_denied(
-                "forwarded write shared-secret mismatch",
-            ));
-        }
+        // could be driven by anyone who can reach its gRPC port. Skipped only
+        // when this leader has no configured shared secret.
+        check_forward_auth(
+            &self.config.cluster.shared_secret,
+            self.config.cluster.accept_legacy_forward_secret,
+            request.get_ref(),
+            request.metadata(),
+        )?;
+        let body = request.into_inner();
         let req: ClientRequest = serde_json::from_slice(&body.client_request_json)
             .map_err(|e| Status::invalid_argument(format!("bad ClientRequest json: {e}")))?;
         // MGR-11 — CO-2-2 only authenticates WHO is forwarding, not WHAT is

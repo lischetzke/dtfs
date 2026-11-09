@@ -145,6 +145,82 @@ mod co_2_2_forward_auth_tests {
     }
 }
 
+/// The forward is authenticated by the `dtfs-mgr-rpc` HMAC bound to the
+/// body, never by the raw secret crossing the (possibly plaintext) WAN.
+#[cfg(test)]
+mod forward_hmac_auth_tests {
+    use super::{check_forward_auth, forward_write_request};
+    use dtfs_common::crypto::{DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS};
+    use dtfs_proto::dtfs::manager::ForwardWriteRequest;
+    use tonic::metadata::MetadataMap;
+
+    const SECRET: &str = "s3cr3t-cluster";
+    const BODY: &[u8] = br#"{"UpdateNodeUsage":{"node_id":7}}"#;
+
+    #[test]
+    fn follower_request_carries_hmac_not_secret() {
+        let req = forward_write_request(SECRET, BODY.to_vec());
+        assert_eq!(req.get_ref().shared_secret, "");
+        assert!(req.metadata().get(DATA_RPC_AUTH_TS).is_some());
+        assert!(req.metadata().get(DATA_RPC_AUTH_MAC).is_some());
+    }
+
+    #[test]
+    fn hmac_forward_accepted_with_legacy_disabled() {
+        let req = forward_write_request(SECRET, BODY.to_vec());
+        check_forward_auth(SECRET, false, req.get_ref(), req.metadata()).unwrap();
+    }
+
+    #[test]
+    fn hmac_forward_with_tampered_body_refused() {
+        let req = forward_write_request(SECRET, BODY.to_vec());
+        let tampered = ForwardWriteRequest {
+            client_request_json: br#"{"UpdateNodeUsage":{"node_id":8}}"#.to_vec(),
+            shared_secret: String::new(),
+        };
+        let err = check_forward_auth(SECRET, true, &tampered, req.metadata()).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn hmac_forward_signed_with_wrong_secret_refused() {
+        let req = forward_write_request("other-secret", BODY.to_vec());
+        let err = check_forward_auth(SECRET, true, req.get_ref(), req.metadata()).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    fn legacy(secret: &str) -> ForwardWriteRequest {
+        ForwardWriteRequest { client_request_json: BODY.to_vec(), shared_secret: secret.into() }
+    }
+
+    #[test]
+    fn legacy_secret_accepted_while_flag_on() {
+        check_forward_auth(SECRET, true, &legacy(SECRET), &MetadataMap::new()).unwrap();
+    }
+
+    #[test]
+    fn legacy_wrong_secret_refused_even_with_flag_on() {
+        let err =
+            check_forward_auth(SECRET, true, &legacy("wrong"), &MetadataMap::new()).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn legacy_secret_refused_with_flag_off() {
+        let err =
+            check_forward_auth(SECRET, false, &legacy(SECRET), &MetadataMap::new()).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("accept_legacy_forward_secret"), "{}", err.message());
+    }
+
+    #[test]
+    fn empty_configured_secret_skips_auth() {
+        let req = forward_write_request("", BODY.to_vec());
+        assert!(req.metadata().get(DATA_RPC_AUTH_MAC).is_none());
+        check_forward_auth("", false, req.get_ref(), req.metadata()).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod lis56_mgr_rpc_auth_tests {
     use super::require_mgr_rpc_auth;

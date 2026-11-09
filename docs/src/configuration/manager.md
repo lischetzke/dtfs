@@ -33,6 +33,7 @@ All four keys are required strings: `region`, `datacenter`, `rack`, `host`. Scop
 | `shared_secret` | string | required | **Validated**: empty is refused unless `allow_insecure_empty_secret = true`. Identical on every manager, data node and client. Keep the file mode 0640. | cluster |
 | `allow_insecure_empty_secret` | bool | `false` | Lab only. With an empty secret, REST, join and RPC authentication are skipped. | cluster |
 | `require_raft_auth` | bool | `false` | `true`: Raft RPCs without a valid `x-dtfs-rpc-ts`/`x-dtfs-rpc-mac` stamp are rejected. `false`: unsigned RPCs are accepted with a rate-limited warning (rolling-update safe); a stamped-but-invalid RPC is always rejected. No effect with an empty secret. | cluster |
+| `accept_legacy_forward_secret` | bool | `true` | Leader side of `ForwardClientWrite`. `true`: a forward without the `x-dtfs-rpc-*` stamp is accepted when its legacy raw `shared_secret` field matches (pre-HMAC managers, rolling-update safe). `false`: such forwards are refused with `PERMISSION_DENIED`. Stamped forwards are always verified. No effect with an empty secret. Set `false` once every manager runs a build that signs forwards. | cluster |
 | `bootstrap` | bool | `false` | `true` on exactly one manager, first start only. Never on a node joining an existing cluster (creates a second, divergent group). | node |
 | `initial_voters` | array of tables | `[]` | See below. | cluster |
 

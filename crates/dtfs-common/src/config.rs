@@ -437,6 +437,13 @@ pub struct ClusterConfig {
     /// runs a build that signs Raft RPCs.
     #[serde(default)]
     pub require_raft_auth: bool,
+    /// Leader side of `ForwardClientWrite`: when `true` (default, rolling-update
+    /// safe) a forward without the `x-dtfs-rpc-*` HMAC stamp is still accepted
+    /// if its legacy body `shared_secret` matches. Set `false` once every
+    /// manager runs a build that signs forwards; legacy forwards are then
+    /// refused with `PermissionDenied`. Stamped forwards are always verified.
+    #[serde(default = "default_true")]
+    pub accept_legacy_forward_secret: bool,
     #[serde(default)]
     pub bootstrap: bool,
     /// Optional list of manager peers to seed the Raft cluster with.
@@ -1556,6 +1563,7 @@ mod tests {
             shared_secret: String::new(),
             allow_insecure_empty_secret: false,
             require_raft_auth: false,
+            accept_legacy_forward_secret: true,
             bootstrap: false,
             initial_voters: vec![],
         };
@@ -1583,6 +1591,7 @@ mod tests {
             shared_secret: String::new(),
             allow_insecure_empty_secret: true,
             require_raft_auth: false,
+            accept_legacy_forward_secret: true,
             bootstrap: false,
             initial_voters: vec![],
         };
@@ -1600,6 +1609,7 @@ mod tests {
             shared_secret: "s3cret".into(),
             allow_insecure_empty_secret: false,
             require_raft_auth: false,
+            accept_legacy_forward_secret: true,
             bootstrap: false,
             initial_voters: vec![],
         };

@@ -42,7 +42,8 @@ There are two planes so a stamp for one cannot be replayed on the other: `dtfs-d
 | ManagerService | `CreateLink` | `source\ndest` |
 | ManagerService | `Heartbeat`, `ReportChunkStatus` | `node_id` |
 | ManagerService | `ReleaseLeasesByHost` | `hostname` |
-| ManagerService | `RegisterNode`, `ForwardClientWrite` | no stamp; the request carries `shared_secret` instead |
+| ManagerService | `ForwardClientWrite` | hex `blake3(client_request_json)`; the legacy `shared_secret` field is sent empty and accepted unstamped only while `cluster.accept_legacy_forward_secret = true` |
+| ManagerService | `RegisterNode` | no stamp; the request carries `shared_secret` instead |
 | ManagerService | `GetFileLocations`, `ListDirectory`, `ReadSymlink`, `ClusterCapacity`, `ProbeLock` | not authenticated (read-only) |
 
 ### Raft transport

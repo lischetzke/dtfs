@@ -179,6 +179,7 @@ order), never in the same pass as the binary update.
 | Key | Default | Flip when | Why |
 |---|---|---|---|
 | `cluster.require_raft_auth` (manager.toml) | `false` | `false` to `true` once every manager runs a build that signs Raft RPCs (no "accepting UNSIGNED Raft RPC" warning in `journalctl -u dtfs-manager`, or check each manager's version) | `true` rejects unsigned Raft RPCs; with a mixed fleet it splits the cluster. Stamped-but-invalid RPCs are always rejected. Requires a non-empty secret and clocks within 300 s. |
+| `cluster.accept_legacy_forward_secret` (manager.toml) | `true` | `true` to `false` once every manager runs a build that HMAC-signs `ForwardClientWrite` | `false` refuses forwards authenticated by the raw secret (pre-HMAC followers); with a mixed fleet their heartbeat forwards stop committing. |
 | `audit.replicate_via_raft` (manager.toml) | `false` | to `true` only after every manager understands `AppendAudit` | an old follower cannot deserialize the new Raft entries and gets stuck |
 | `[tls] mode` | `auto` | enable TLS (`require` or certificates present) only cluster-wide after every node runs a TLS-capable build | mixed TLS and plaintext nodes cannot talk |
 

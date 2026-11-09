@@ -101,11 +101,12 @@ service ManagerService {
 message ForwardWriteRequest {
   // JSON-serialized dtfs_raft::ClientRequest.
   bytes client_request_json = 1;
-  // CO-2-2 — cluster shared secret of the forwarding manager
-  // (config.cluster.shared_secret). The leader rejects a forward whose
-  // secret does not match (constant-time compare) with PERMISSION_DENIED.
-  // Empty when the cluster runs without a shared secret (back-compat);
-  // an empty configured secret on the leader skips the check entirely.
+  // DEPRECATED legacy auth (CO-2-2): raw cluster shared secret. Current
+  // managers send it EMPTY and authenticate the forward with the
+  // x-dtfs-rpc-ts / x-dtfs-rpc-mac metadata (dtfs-mgr-rpc plane, method
+  // ForwardClientWrite, binding = hex blake3(client_request_json)). The
+  // leader accepts an unstamped forward carrying this field only while
+  // cluster.accept_legacy_forward_secret = true (PERMISSION_DENIED otherwise).
   string shared_secret = 2;
 }
 
