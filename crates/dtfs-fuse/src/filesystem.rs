@@ -803,9 +803,12 @@ pub struct DtfsFilesystem {
     /// (`spawn_bg_upload`, up to `write.max_inflight_batches`, pairwise
     /// disjoint chunk sets); an entry stays until its restore/merge is done.
     bg_uploads: DashMap<String, Vec<(u64, Vec<u32>, usize)>>,
-    /// Background batch ids that must not commit because an earlier batch of
-    /// their path failed (`fail_bg_batch`); cleared by `BgSlot`.
-    bg_doomed: dashmap::DashSet<u64>,
+    /// path -> `(failed id, boundary)` per failed background batch: ids
+    /// strictly between them were drained before its restore and must not
+    /// commit (`fail_bg_batch`, `bg_is_doomed`). Ids never repeat, so a stale
+    /// range dooms nothing new; write() drops the entry once the path has no
+    /// batch in flight (`bg_may_start`).
+    bg_doom: DashMap<String, Vec<(u64, u64)>>,
     /// Woken whenever a background upload ends (`wait_bg_uploads`).
     bg_done: tokio::sync::Notify,
     /// Test hook run by write_inner right after it read the handle: models a
@@ -901,7 +904,7 @@ impl DtfsFilesystem {
             commit_tracker: CommitTracker::default(),
             path_locks: DashMap::new(),
             bg_uploads: DashMap::new(),
-            bg_doomed: dashmap::DashSet::new(),
+            bg_doom: DashMap::new(),
             bg_done: tokio::sync::Notify::new(),
             #[cfg(test)]
             write_race_hook: std::sync::Mutex::new(None),
@@ -1934,7 +1937,7 @@ impl DtfsFilesystem {
         // chunk of an in-flight one: those left the buffer, and writes into
         // them waited above.
         if self.config.write.async_commit {
-            if self.bg_batches(&path) < self.config.write.effective_max_inflight_batches() {
+            if self.bg_may_start(&path) {
                 // Overlay registered with the drain: the batch is visible
                 // (reads, the next write's EOF) the moment write() returns.
                 if let (segments, Some(g)) = self.write_buffer.flush_inflight(&path) {
@@ -2158,7 +2161,9 @@ impl DtfsFilesystem {
     /// flight must then not commit either (`wait_commit_turn` -> false), else
     /// committed data sits above the uncommitted hole and an old manager's
     /// summed size + a sparse-write pin drops it. They restore too; the next
-    /// flush/commit_all retries all of them in order.
+    /// flush/commit_all retries all of them in order. Doom goes by drain
+    /// order, not by `bg_uploads` membership: write() may have drained a
+    /// batch before the restore and not pushed it yet.
     fn fail_bg_batch(
         &self,
         fh: u64,
@@ -2168,17 +2173,36 @@ impl DtfsFilesystem {
         chunks: &[u32],
         e: anyhow::Error,
     ) {
-        // Before BgSlot wakes the next batch: it must see the mark.
-        if let Some(v) = self.bg_uploads.get(key) {
-            for b in v.iter().skip_while(|b| b.0 != id).skip(1) {
-                self.bg_doomed.insert(b.0);
-            }
-        }
         // unlink may have detached the fh meanwhile: restore under
         // its current path, never into a replacement at `path`.
         let cur = self.open_files.get(&fh).map(|f| f.path.clone()).unwrap_or_else(|| key.to_string());
         self.write_buffer.restore_segments(&cur, segs);
+        // After the restore (`next_inflight_id`), before BgSlot wakes the
+        // next batch: it must see the range.
+        let end = self.write_buffer.next_inflight_id();
+        self.bg_doom.entry(key.to_string()).or_default().push((id, end));
         self.record_bg_batch(&cur, chunks, Err(e));
+    }
+
+    /// Batch `id` of `path` was drained after a failed batch of the path and
+    /// before its restore (`fail_bg_batch`): it must not commit.
+    fn bg_is_doomed(&self, path: &str, id: u64) -> bool {
+        self.bg_doom.get(path).is_some_and(|v| v.iter().any(|&(f, end)| f < id && id < end))
+    }
+
+    /// write() (under `path_guard`) may start a background batch of `path`:
+    /// fewer than `max_inflight_batches` in flight and none doomed. A new
+    /// batch next to a doomed one would take the restored chunks and be
+    /// doomed in turn (re-uploading them each time); doomed batches bail
+    /// before allocate/put, so the wait is short. With none in flight no
+    /// doomed id can still be pending a push (only write() pushes, under
+    /// the guard): drop the path's ranges.
+    fn bg_may_start(&self, path: &str) -> bool {
+        let Some(v) = self.bg_uploads.get(path) else {
+            self.bg_doom.remove(path);
+            return true;
+        };
+        v.len() < self.config.write.effective_max_inflight_batches() && !v.iter().any(|b| self.bg_is_doomed(path, b.0))
     }
 
     /// Background batch result: a failure arms every writer's error
@@ -2262,7 +2286,7 @@ impl DtfsFilesystem {
     async fn wait_commit_turn(&self, path: &str, id: u64) -> bool {
         self.wait_bg(|| self.bg_uploads.get(path).is_none_or(|v| v.first().is_none_or(|b| b.0 == id)))
             .await;
-        !self.bg_doomed.contains(&id)
+        !self.bg_is_doomed(path, id)
     }
 
     /// Background batches of `path` in flight.
@@ -3557,6 +3581,12 @@ impl DtfsFilesystem {
             warn!(path, error = %msg, "refusing to commit a partial (needs_seed) segment");
             return Err(anyhow::anyhow!(msg));
         }
+        // FUSE-1: a doomed batch must not commit; do not upload it either
+        // (up to a whole batch of orphans, over the anchor link).
+        let doomed = || turn.is_some_and(|(key, id)| self.bg_is_doomed(key, id));
+        if doomed() {
+            return Err(doomed_batch_err(path, turn, true));
+        }
 
         // Determine the volume_id. Check if we have it cached from an
         // open file handle, otherwise default.
@@ -3607,6 +3637,10 @@ impl DtfsFilesystem {
         // before the single commit below.
         let concurrency = self.config.write.effective_upload_concurrency();
         let uploaded = upload_segments(segments.len(), concurrency, |i| async move {
+            // Doomed mid-upload: skip the remaining puts (one warn at the turn).
+            if doomed() {
+                return Err(doomed_batch_err(path, turn, false));
+            }
             let segment = &segments[i];
             let mut placement = placements[i].clone();
 
@@ -3794,8 +3828,7 @@ impl DtfsFilesystem {
 
         if let Some((key, id)) = turn {
             if !self.wait_commit_turn(key, id).await {
-                warn!(path, batch = id, "earlier batch of the path failed: not committing this one above the hole");
-                bail!("an earlier batch of {path} failed: batch not committed (retried by the next flush)");
+                return Err(doomed_batch_err(path, turn, true));
             }
         }
 
@@ -4164,6 +4197,16 @@ fn range_hits_upload(batch: &[u32], offset: u64, len: usize, chunk_size: u64) ->
     batch.get(i).is_some_and(|&c| c as u64 <= last)
 }
 
+/// The error of a background batch that must not commit above an earlier
+/// failed batch's hole (`bg_is_doomed`); `log` once per batch.
+fn doomed_batch_err(path: &str, turn: Option<(&str, u64)>, log: bool) -> anyhow::Error {
+    let batch = turn.map_or(0, |t| t.1);
+    if log {
+        warn!(path, batch, "earlier batch of the path failed: not uploading/committing this one above the hole");
+    }
+    anyhow::anyhow!("an earlier batch of {path} failed: batch not committed (retried by the next flush)")
+}
+
 /// Clears its batch from the path's `bg_uploads` entry (the entry with the
 /// last batch) and wakes waiters when the background upload ends, also if
 /// its task panics or is dropped at runtime shutdown.
@@ -4179,7 +4222,6 @@ impl Drop for BgSlot<'_> {
             v.retain(|b| b.0 != self.id);
             v.is_empty()
         });
-        self.fs.bg_doomed.remove(&self.id);
         self.fs.bg_done.notify_waiters();
     }
 }
@@ -7098,27 +7140,25 @@ mod async_commit_fs_tests {
         let fs = Arc::new(fs(true));
         let cs = fs.write_buffer.chunk_size();
         let fh = open(&fs, "/f", OpenFlags::ReadWrite);
-        let mut segs = Vec::new();
-        for i in 0..3u8 {
-            fs.write_buffer.write("/f", i as u64 * cs as u64, &vec![i + 1; cs]);
-            segs.push(fs.write_buffer.flush_all("/f"));
-        }
+        let (segs, ids): (Vec<_>, Vec<_>) = (0..3u8).map(|i| drain_batch(&fs, i as u32, i + 1)).unzip();
+        let [b1, b2, b3] = ids[..] else { unreachable!() };
         assert_eq!(fs.write_buffer.dirty_bytes("/f"), 0);
-        fs.bg_uploads.insert("/f".to_string(), vec![(1, vec![0], cs), (2, vec![1], cs), (3, vec![2], cs)]);
+        fs.bg_uploads.insert("/f".to_string(), vec![(b1, vec![0], cs), (b2, vec![1], cs), (b3, vec![2], cs)]);
         let f2 = fs.clone();
-        let b2 = tokio::spawn(async move { f2.wait_commit_turn("/f", 2).await });
-        fs.fail_bg_batch(fh, "/f", 1, &segs[0], &[0], anyhow::anyhow!("put failed"));
-        drop(BgSlot { fs: &fs, path: "/f".into(), id: 1 });
-        let may_commit = tokio::time::timeout(Duration::from_secs(2), b2).await.expect("batch 1 ended").unwrap();
+        let w2 = tokio::spawn(async move { f2.wait_commit_turn("/f", b2).await });
+        fs.fail_bg_batch(fh, "/f", b1, &segs[0], &[0], anyhow::anyhow!("put failed"));
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: b1 });
+        let may_commit = tokio::time::timeout(Duration::from_secs(2), w2).await.expect("batch 1 ended").unwrap();
         assert!(!may_commit, "batch 2 committed above batch 1's uncommitted hole");
         // Batch 2's task bails before the commit and restores.
-        fs.fail_bg_batch(fh, "/f", 2, &segs[1], &[1], anyhow::anyhow!("earlier batch failed"));
-        drop(BgSlot { fs: &fs, path: "/f".into(), id: 2 });
-        let may_commit = tokio::time::timeout(Duration::from_secs(2), fs.wait_commit_turn("/f", 3)).await.unwrap();
+        fs.fail_bg_batch(fh, "/f", b2, &segs[1], &[1], anyhow::anyhow!("earlier batch failed"));
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: b2 });
+        let may_commit = tokio::time::timeout(Duration::from_secs(2), fs.wait_commit_turn("/f", b3)).await.unwrap();
         assert!(!may_commit, "batch 3 committed above the hole");
-        fs.fail_bg_batch(fh, "/f", 3, &segs[2], &[2], anyhow::anyhow!("earlier batch failed"));
-        drop(BgSlot { fs: &fs, path: "/f".into(), id: 3 });
-        assert!(fs.bg_doomed.is_empty() && fs.bg_uploads.is_empty());
+        fs.fail_bg_batch(fh, "/f", b3, &segs[2], &[2], anyhow::anyhow!("earlier batch failed"));
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: b3 });
+        assert!(fs.bg_uploads.is_empty());
+        assert!(fs.bg_may_start("/f") && fs.bg_doom.is_empty(), "no batch in flight: ranges dropped");
         // Every byte is back in the buffer (readable, retried in order).
         assert_eq!(fs.write_buffer.dirty_bytes("/f"), 3 * cs);
         let mut buf = vec![0u8; cs];
@@ -7154,6 +7194,99 @@ mod async_commit_fs_tests {
         });
         assert!(b1.await.is_err());
         tokio::time::timeout(Duration::from_secs(2), b2).await.expect("panicked batch 1 released batch 2").unwrap();
+    }
+
+    /// Buffer one full chunk `chunk` of `/f` and drain it as a batch with a
+    /// real overlay id (as write()'s `flush_inflight`); the overlay itself is
+    /// dropped (these tests drive the task's restore by hand).
+    fn drain_batch(fs: &DtfsFilesystem, chunk: u32, fill: u8) -> (Vec<crate::writebuf::ChunkSegment>, u64) {
+        let cs = fs.write_buffer.chunk_size();
+        fs.write_buffer.write("/f", chunk as u64 * cs as u64, &vec![fill; cs]);
+        let (segs, g) = fs.write_buffer.flush_all_inflight("/f");
+        let id = g.unwrap().into_id();
+        drop(fs.write_buffer.adopt_inflight(id));
+        (segs, id)
+    }
+
+    /// FUSE-1 race: write() drains batch D before failed batch A's restore
+    /// but pushes it into `bg_uploads` only after A's marking. D must still
+    /// not commit above A's hole; a batch drained after the restores does.
+    #[tokio::test]
+    async fn multibatch_batch_drained_before_restore_registered_after_marking_is_doomed() {
+        let fs = Arc::new(fs(true));
+        let cs = fs.write_buffer.chunk_size();
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let (a_segs, a) = drain_batch(&fs, 0, 1);
+        fs.bg_uploads.insert("/f".to_string(), vec![(a, vec![0], cs)]);
+        let (d_segs, d) = drain_batch(&fs, 1, 2);
+        fs.fail_bg_batch(fh, "/f", a, &a_segs, &[0], anyhow::anyhow!("put failed"));
+        fs.bg_uploads.get_mut("/f").unwrap().push((d, vec![1], cs));
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: a });
+        let may_commit = tokio::time::timeout(Duration::from_secs(2), fs.wait_commit_turn("/f", d)).await.unwrap();
+        assert!(!may_commit, "batch D, drained before batch A's restore, committed above A's hole");
+        fs.fail_bg_batch(fh, "/f", d, &d_segs, &[1], anyhow::anyhow!("earlier batch failed"));
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: d });
+        // The retry batch, drained after both restores, commits.
+        let (segs, g) = fs.write_buffer.flush_all_inflight("/f");
+        assert_eq!(segs.len(), 2);
+        let e = g.unwrap().into_id();
+        fs.bg_uploads.insert("/f".to_string(), vec![(e, vec![0, 1], 2 * cs)]);
+        assert!(tokio::time::timeout(Duration::from_secs(2), fs.wait_commit_turn("/f", e)).await.unwrap());
+    }
+
+    /// FUSE-1 waste: a doomed batch bails before allocate_chunks (no
+    /// allocation, no put); a batch that is not doomed does allocate.
+    #[tokio::test]
+    async fn multibatch_doomed_batch_does_not_allocate_or_put() {
+        let fs = Arc::new(fs(true));
+        let cs = fs.write_buffer.chunk_size();
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let (a_segs, a) = drain_batch(&fs, 0, 1);
+        let (b_segs, b) = drain_batch(&fs, 1, 2);
+        fs.bg_uploads.insert("/f".to_string(), vec![(a, vec![0], cs), (b, vec![1], cs)]);
+        fs.fail_bg_batch(fh, "/f", a, &a_segs, &[0], anyhow::anyhow!("put failed"));
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: a });
+        let flush = fs.flush_segments_to_cluster(fh, "/f", &b_segs, Some(("/f", b)));
+        let Err(err) = tokio::time::timeout(Duration::from_secs(2), flush).await.unwrap() else { panic!("doomed batch committed") };
+        assert!(format!("{err:#}").contains("an earlier batch of /f failed"), "doomed batch reached the cluster: {err:#}");
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: b });
+        // Not doomed: goes to the manager (unreachable here).
+        let (c_segs, c) = drain_batch(&fs, 2, 3);
+        fs.bg_uploads.insert("/f".to_string(), vec![(c, vec![2], cs)]);
+        let flush = fs.flush_segments_to_cluster(fh, "/f", &c_segs, Some(("/f", c)));
+        let Err(err) = tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap() else { panic!("no manager") };
+        assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
+    }
+
+    /// FUSE-1 doom chain: while a batch of the path is doomed, write() starts
+    /// no new batch (it would pick up the restored chunks and be doomed in
+    /// turn); once the doomed batches ended, one batch takes everything and
+    /// may commit.
+    #[tokio::test]
+    async fn multibatch_write_starts_no_batch_while_one_is_doomed() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, fh, cs) = multi_batch_fs(&client, 2);
+        let (a_segs, a) = drain_batch(&fs, 20, 1);
+        let (b_segs, b) = drain_batch(&fs, 21, 2);
+        let c = cs as usize;
+        fs.bg_uploads.insert("/f".to_string(), vec![(a, vec![20], c), (b, vec![21], c)]);
+        fs.fail_bg_batch(fh, "/f", a, &a_segs, &[20], anyhow::anyhow!("put failed"));
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: a });
+        let batch = 4 * c;
+        let w = tokio::time::timeout(Duration::from_secs(2), fs.write(fh, 0, &vec![3; batch])).await;
+        assert_eq!(w.expect("must not wait").unwrap(), batch as u32);
+        assert_eq!(fs.bg_batches("/f"), 1, "write() started a batch while batch {b} is doomed");
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 5 * c, "chunks 0..4 + restored 20 stay buffered");
+        // The doomed batch bails and restores; the next write starts one batch.
+        fs.fail_bg_batch(fh, "/f", b, &b_segs, &[21], anyhow::anyhow!("earlier batch failed"));
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: b });
+        let w = tokio::time::timeout(Duration::from_secs(2), fs.write(fh, 4 * cs, &vec![3; batch])).await;
+        assert_eq!(w.expect("must not wait").unwrap(), batch as u32);
+        let (id, chunks) = fs.bg_uploads.get("/f").map(|v| (v[0].0, v[0].1.clone())).unwrap();
+        assert_eq!(fs.bg_batches("/f"), 1);
+        assert_eq!(chunks, vec![0, 1, 2, 3, 4, 5, 6, 7, 20, 21]);
+        assert!(tokio::time::timeout(Duration::from_secs(2), fs.wait_commit_turn("/f", id)).await.unwrap());
+        hole.abort();
     }
 
     /// multibatch: batch 1 fails, disjoint batch 2 succeeds: the error stays

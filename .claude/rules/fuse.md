@@ -266,10 +266,18 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   manager reported as the summed size and the next sparse-write pin
   dropped the later chunks (FUSE-1); the manager now also reports the
   chunk extent for a file without explicit size. A failed batch
-  (`fail_bg_batch`) marks every later in-flight batch of the path
-  (`bg_doomed`, cleared by `BgSlot`): `wait_commit_turn` returns false, so
-  they restore and record failed chunks instead of committing above the
-  hole; the next flush/`commit_all` retries them in order. The
+  (`fail_bg_batch`) restores, then records `(its id, next_inflight_id)` in
+  `bg_doom`: every batch of the path drained after it and before its
+  restore is doomed by drain order (ids are taken under the buffer entry
+  lock the restore also takes), also one write() drained before the
+  restore but pushed into `bg_uploads` after it. A doomed batch bails
+  before allocate_chunks and before each put (`bg_is_doomed`), and
+  `wait_commit_turn` returns false, so it restores and records failed
+  chunks instead of uploading/committing above the hole. write() starts no
+  new batch while one of the path is doomed (`bg_may_start`; else each new
+  batch takes the restored chunks and is doomed in turn); once they ended,
+  one batch retries everything in order, and write() drops the ranges when
+  the path has none in flight. The
   per-file dirty cap is `max(128 MB, (n + 1) x batch limit)` (`dirty_cap_for`;
   n = 1 when async_commit is off). The task
   (`bg_upload`) renews the lease (`renew_if_due`), keeps `begin_inflight`

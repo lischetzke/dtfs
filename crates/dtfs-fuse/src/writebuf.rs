@@ -704,6 +704,14 @@ impl WriteBuffer {
         InflightGuard { wb: self, id }
     }
 
+    /// The id the next `begin_inflight` takes. Ids of one path are taken
+    /// under its buffer entry lock (`drain`), which `restore_segments` also
+    /// takes, so read after a restore every batch of the path drained before
+    /// it has a lower id and every one drained after it a higher or equal one.
+    pub fn next_inflight_id(&self) -> u64 {
+        self.next_inflight.load(Ordering::Relaxed)
+    }
+
     /// Guard for an overlay registered earlier (`InflightGuard::into_id`).
     pub fn adopt_inflight(&self, id: u64) -> InflightGuard<'_> {
         InflightGuard { wb: self, id }
