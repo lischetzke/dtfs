@@ -1682,8 +1682,11 @@ impl DtfsFilesystem {
                 };
                 // Seed bytes are clamped to the file's logical EOF, so stale
                 // bytes left in a chunk by a shrinking truncate never come back.
+                // A missing index (zeros) also counts the buffered end: the
+                // skipped chunks of a sparse write lie above the cluster EOF.
+                let seed_eof = if loc.chunk_at(chunk_idx).is_none() { eof_now } else { loc.total_size };
                 if let Some(existing) = self
-                    .read_seed_bytes(&path, loc, chunk_idx, chunk_size, loc.total_size)
+                    .read_seed_bytes(&path, loc, chunk_idx, chunk_size, seed_eof)
                     .await?
                 {
                     if tail_seed != Some(chunk_idx) && !self.write_buffer.has_chunk(&path, chunk_idx as u32) {
@@ -1705,18 +1708,30 @@ impl DtfsFilesystem {
             }
         }
 
-        // Sparse-file semantics (F-022): if the write lands past the current
-        // logical end, zero-fill the gap so `stat` reports the right size and
-        // subsequent reads of the hole return zeros rather than ENOENT.
+        // Sparse-file semantics (F-022): a write past the logical end
+        // zero-fills only the edge chunks of the hole (`hole_fill_ranges`):
+        // the old partial tail and the write's own chunk below the offset.
+        // Chunk indices entirely inside the hole stay unbuffered and are
+        // never uploaded: a missing index below EOF reads as zeros.
         let buffered_size = self.write_buffer.logical_size(&path).unwrap_or(0);
         let logical_size = cached_eof.max(buffered_size);
-        if effective_offset > logical_size {
-            let hole = (effective_offset - logical_size) as usize;
-            // Cap the zero-fill at 64 MiB per call to keep memory bounded;
-            // larger holes are handled by chunking the fill internally.
+        let fill = crate::writebuf::hole_fill_ranges(logical_size, effective_offset, chunk_size);
+        for (i, r) in fill.iter().enumerate() {
+            if i == 1 && r.start > fill[0].end {
+                // Whole chunks skipped: pin the manager's size before any
+                // chunk above the hole commits. A file without one (never
+                // truncated) reports the sum of its chunk sizes, which a hole
+                // makes too small; once set, commits grow it to their extent.
+                // At least every committed, in-flight and buffered end: a
+                // SetFileSize drops the chunks above it.
+                let pin = logical_size.max(self.write_buffer.visible_size(&path).unwrap_or(0));
+                self.set_size(fh, pin).await?;
+                debug!(path = %path, size = pin, "pinned size before a sparse write");
+            }
+            // Cap the zero-fill at 64 MiB per step to keep memory bounded.
             const FILL_CHUNK: usize = 64 * 1024 * 1024;
-            let mut remaining = hole;
-            let mut at = logical_size;
+            let mut remaining = (r.end - r.start) as usize;
+            let mut at = r.start;
             while remaining > 0 {
                 let n = remaining.min(FILL_CHUNK);
                 // R1 (FUSE-1 memory half) — a torrent client writing its
@@ -1748,7 +1763,6 @@ impl DtfsFilesystem {
                 at += n as u64;
                 remaining -= n;
             }
-            debug!(path = %path, hole, "zero-filled sparse gap");
         }
 
         // R1 — one more check before merging the caller's own bytes: a hole
@@ -5754,6 +5768,25 @@ mod async_commit_fs_tests {
             let w = stuck_write(&fs, fh, (full as u64 + 2) * cs, vec![2; 10]).await;
             assert!(!fs.write_buffer.has_chunk("/f", 0), "chunk 0 drained by the hole-fill cap drain");
             assert_eq!(overlay_len(&fs, 0, cs as usize), cs as usize, "async={async_on}: drained chunk 0 invisible");
+            w.abort();
+            let _ = w.await;
+        }
+        hole.abort();
+    }
+
+    /// A write 200 MiB past the end buffers only the old tail chunk's zero
+    /// padding, then pins the manager size (stuck on the black hole) before
+    /// any upload: the chunks inside the hole are never materialised (prod:
+    /// 213 MB hole fills drained gappy zero chunks on every write, x1.6).
+    #[tokio::test]
+    async fn sparse_write_pads_only_the_tail_chunk_and_pins_the_size() {
+        let (client, hole) = black_hole_client().await;
+        for async_on in [false, true] {
+            let (fs, fh, cs) = writer_fs(&client, async_on, 0, 0, 0);
+            fs.write_buffer.write("/f", 0, &[1; 100]);
+            let w = stuck_write(&fs, fh, 200 << 20, vec![2; 10]).await;
+            assert_eq!(fs.write_buffer.dirty_bytes("/f"), cs as usize, "async={async_on}: hole materialised");
+            assert_eq!(overlay_len(&fs, 0, 8 * cs as usize), cs as usize, "nothing drained or in flight");
             w.abort();
             let _ = w.await;
         }

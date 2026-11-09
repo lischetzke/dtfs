@@ -106,6 +106,18 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   fsync return the commit error.
 - `writebuf.rs` batches `write.flush_batch_chunks` (default 4, clamp
   1..=32) complete chunks per `flush()`; `flush_all` drains everything.
+  A write past the logical end zero-fills only the hole's edge chunks
+  (`hole_fill_ranges`: old partial tail to its chunk end, the write's chunk
+  start to the offset); whole chunks inside the hole get no buffer and no
+  upload (missing index = zeros). When it skips a whole chunk, write() first
+  `set_size`s the manager to max(logical end, `visible_size`) (never below a
+  committed/in-flight end: SetFileSize drops chunks above it), since a file
+  with no SetFileSize reports the sum of its chunk sizes; commits then grow
+  it. `FileWriteBuffer.extent` is the buffered end (`logical_size` =
+  max(extent, chunk ends), kept across partial drains, `None` once fully
+  drained, reset by the next write/seed into an empty entry, set by
+  `truncate`). A missing-index seed in write() clamps to that end, not the
+  snapshot's `total_size` (skipped chunks lie above the cluster EOF).
   Zeros a write filled only because it landed beyond them (hole fill via
   `write_hole`, `ChunkBuf::merge` gap, seed shorter than the buffered start)
   are `ChunkBuf.gaps` until a write covers them; a gappy chunk is complete

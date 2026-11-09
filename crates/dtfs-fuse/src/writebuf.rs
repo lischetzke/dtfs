@@ -68,6 +68,21 @@ pub(crate) fn effective_batch_chunks(configured: usize, chunk_size: usize) -> us
     by_count.min(FLUSH_BATCH_MAX_BYTES / chunk_size).max(1)
 }
 
+/// Zero fill for a write at `offset` past the logical `end`: only the edge
+/// chunks get bytes, `[end, end of its chunk)` (old partial tail) and
+/// `[start of the write's chunk, offset)`. Chunk indices entirely inside the
+/// hole get nothing: a missing index below EOF reads as zeros. The two ranges
+/// are contiguous when the write lands in or right after the tail chunk;
+/// `r[1].start > r[0].end` means whole chunks were skipped.
+pub(crate) fn hole_fill_ranges(end: u64, offset: u64, chunk_size: u64) -> [Range<u64>; 2] {
+    if offset <= end || chunk_size == 0 {
+        return [end..end, end..end];
+    }
+    let tail_end = end.next_multiple_of(chunk_size).min(offset);
+    let head = (offset / chunk_size * chunk_size).max(tail_end);
+    [end..tail_end, head..offset]
+}
+
 /// If `path` is `from` or lies below `from/`, the same path re-rooted under
 /// `to`; `None` otherwise. Shared by the write buffer and the open-handle
 /// table so a rename re-keys both identically.
@@ -143,6 +158,16 @@ struct FileWriteBuffer {
     #[allow(dead_code)] // kept for parity/debuggability; not read internally
     path: String,
     chunks: BTreeMap<u32, ChunkBuf>,
+    /// Logical end of the buffered writes: highest `offset + len` written,
+    /// kept across drains (whole-hole chunks have no `ChunkBuf`, the top
+    /// chunk may already be committed); set by `truncate`.
+    extent: u64,
+}
+
+impl FileWriteBuffer {
+    fn new(path: &str) -> Self {
+        Self { path: path.to_string(), chunks: BTreeMap::new(), extent: 0 }
+    }
 }
 
 /// CR-1-1 — buffered bytes for one chunk index. `data.len() == dirty.end -
@@ -355,13 +380,11 @@ impl WriteBuffer {
             return 0;
         }
 
-        let mut entry = self.buffers.entry(path.to_string()).or_insert_with(|| {
-            FileWriteBuffer {
-                path: path.to_string(),
-                chunks: BTreeMap::new(),
-            }
-        });
+        let mut entry = self.buffers.entry(path.to_string()).or_insert_with(|| FileWriteBuffer::new(path));
         let buf = entry.value_mut();
+        // A fully drained buffer's end is the snapshot's (or in-flight) now.
+        let prev = if buf.chunks.is_empty() { 0 } else { buf.extent };
+        buf.extent = prev.max(offset + len as u64);
 
         let chunk_size = self.chunk_size as u64;
         let mut remaining = data;
@@ -699,12 +722,10 @@ impl WriteBuffer {
         }
         let existing = &existing[..existing.len().min(self.chunk_size)];
         let hint = self.gap_hints.get(path).and_then(|h| h.get(&chunk_index).cloned()).unwrap_or_default();
-        let mut entry = self.buffers.entry(path.to_string()).or_insert_with(|| {
-            FileWriteBuffer {
-                path: path.to_string(),
-                chunks: BTreeMap::new(),
-            }
-        });
+        let mut entry = self.buffers.entry(path.to_string()).or_insert_with(|| FileWriteBuffer::new(path));
+        if entry.chunks.is_empty() {
+            entry.extent = 0;
+        }
         let cb = entry
             .value_mut()
             .chunks
@@ -770,6 +791,7 @@ impl WriteBuffer {
             None => return,
         };
         let buf = entry.value_mut();
+        buf.extent = new_size;
         let chunk_size = self.chunk_size;
         if chunk_size == 0 {
             return;
@@ -894,9 +916,11 @@ impl WriteBuffer {
             .unwrap_or(false)
     }
 
-    /// Logical end of the file as seen by the buffer (i.e. the highest
-    /// `chunk_index * chunk_size + dirty.end` of any resident chunk).
-    /// Returns `None` if the buffer has never seen a write for this path.
+    /// Logical end of the file as seen by the buffer: the buffered end
+    /// (`FileWriteBuffer.extent`, kept across partial drains: the top chunk
+    /// may be committed, whole-hole chunks are never buffered) or the end of
+    /// a resident chunk (a seed), whichever is larger. `None` when nothing
+    /// is buffered (fully drained: in-flight overlay, then the snapshot).
     ///
     /// Used by the F-021/F-022 fix to decide where O_APPEND writes land and
     /// to size sparse-hole zero fills.
@@ -907,10 +931,12 @@ impl WriteBuffer {
             return None;
         }
         let chunk_size = self.chunk_size as u64;
-        buf.chunks
+        let end = buf
+            .chunks
             .iter()
             .map(|(idx, cb)| *idx as u64 * chunk_size + cb.dirty.end as u64)
-            .max()
+            .max();
+        (buf.extent > 0).then_some(buf.extent).max(end)
     }
 
     /// What a reader sees as the end of `path` beyond the committed size:
@@ -1531,7 +1557,8 @@ mod audit_co_tests {
         // Re-populate, then cut above the end: untouched.
         wb.write("/f", 10, &[2u8; 20]);
         wb.truncate("/f", 1000);
-        assert_eq!(wb.logical_size("/f"), Some(30), "cut above end is a no-op");
+        assert_eq!(wb.dirty_bytes("/f"), 20, "cut above end keeps the bytes");
+        assert_eq!(wb.logical_size("/f"), Some(1000), "and extends the end");
     }
 
     // CO-1-8 (a): on a cluster-flush error the FUSE layer must restore the
@@ -2220,9 +2247,11 @@ mod async_commit_tests {
             v
         }
 
-        /// read_seed_bytes clamped to `eof`; a hole below EOF seeds zeros.
-        fn seed(&mut self, idx: u32, eof: u64) {
+        /// read_seed_bytes clamped to `eof`; a hole below EOF seeds zeros
+        /// (write(): up to the buffered end, `hole_eof`).
+        fn seed(&mut self, idx: u32, eof: u64, hole_eof: u64) {
             let base = idx as u64 * CS as u64;
+            let eof = if self.chunks.contains_key(&idx) { eof } else { hole_eof };
             if !self.wb.chunk_needs_seed(P, idx) || base >= eof {
                 return;
             }
@@ -2254,25 +2283,34 @@ mod async_commit_tests {
             self.fresh.clear();
             let eof = self.size.max(self.wb.logical_size(P).unwrap_or(0));
             for idx in Self::span(off, data.len()) {
-                self.seed(idx, self.size);
+                self.seed(idx, self.size, eof);
             }
             if off > eof && eof % CS as u64 != 0 {
                 // The hole tail seed is kept on a failed drain (filesystem.rs).
                 let in_range = std::mem::take(&mut self.fresh);
-                self.seed((eof / CS as u64) as u32, self.size);
+                self.seed((eof / CS as u64) as u32, self.size, eof);
                 self.fresh = in_range;
             }
-            let mut at = eof;
-            while at < off {
-                let n = ((off - at) as usize).min(2 * CS);
-                if !self.cap_drain(n, Self::span(at, n)) {
-                    self.model.resize(self.model.len().max(at as usize), 0);
-                    return;
+            let fill = hole_fill_ranges(eof, off, CS as u64);
+            for (i, r) in fill.iter().enumerate() {
+                if i == 1 && r.start > fill[0].end {
+                    // set_size pin (SetFileSize keeps every chunk below it).
+                    self.size = self.size.max(eof);
                 }
-                self.wb.write_hole(P, at, n);
-                at += n as u64;
+                let mut at = r.start;
+                while at < r.end {
+                    let n = ((r.end - at) as usize).min(2 * CS);
+                    if !self.cap_drain(n, Self::span(at, n)) {
+                        self.model.resize(self.model.len().max(at as usize), 0);
+                        return;
+                    }
+                    self.wb.write_hole(P, at, n);
+                    at += n as u64;
+                }
+                if r.start < r.end {
+                    self.model.resize(self.model.len().max(r.end as usize), 0);
+                }
             }
-            self.model.resize(self.model.len().max(at as usize), 0);
             if !self.cap_drain(data.len(), Self::span(off, data.len())) {
                 return;
             }
@@ -2310,16 +2348,15 @@ mod async_commit_tests {
             }
         }
 
-        /// truncate_inner with a writer. Shrink only: a shrink-then-grow
-        /// before the tail commit is a pre-existing gap, not async_commit's.
+        /// truncate_inner with a writer (SetFileSize to `new`).
         fn truncate(&mut self, new: u64) {
             if new < self.size && new % CS as u64 != 0 {
-                self.seed((new / CS as u64) as u32, new);
+                self.seed((new / CS as u64) as u32, new, new);
             }
             self.size = new;
             self.chunks.retain(|&c, _| (c as u64) * (CS as u64) < new);
             self.wb.truncate(P, new);
-            self.model.truncate(new as usize);
+            self.model.resize(new as usize, 0);
         }
 
         fn release(&mut self) {
@@ -2401,6 +2438,113 @@ mod async_commit_tests {
                 }
                 assert_eq!(sim.uploads.len(), 12);
             }
+        }
+    }
+
+    /// Only the edge chunks of a hole get zero padding; whole chunks inside
+    /// it are skipped (`r[1].start > r[0].end`).
+    #[test]
+    fn hole_fill_ranges_pads_only_the_edge_chunks() {
+        assert_eq!(hole_fill_ranges(10, 100, 8), [10..16, 96..100]);
+        assert_eq!(hole_fill_ranges(10, 14, 8), [10..14, 14..14], "write inside the tail chunk");
+        assert_eq!(hole_fill_ranges(10, 20, 8), [10..16, 16..20], "next chunk: contiguous, no skip");
+        assert_eq!(hole_fill_ranges(16, 96, 8), [16..16, 96..96], "aligned both ends: nothing padded");
+        assert_eq!(hole_fill_ranges(16, 100, 8), [16..16, 96..100]);
+        assert_eq!(hole_fill_ranges(16, 16, 8), [16..16, 16..16], "write at the end: no hole");
+        assert_eq!(hole_fill_ranges(20, 16, 8), [20..20, 20..20], "write below the end: no hole");
+    }
+
+    /// The buffered end is the logical end: no zero buffers for a sparse
+    /// write, it survives draining the top chunk while a lower one stays
+    /// buffered, and truncate clips or extends it. Fully drained: `None`
+    /// (in-flight overlay, then the snapshot).
+    #[test]
+    fn buffered_end_survives_drains_and_follows_truncate() {
+        let wb = WriteBuffer::new(CS);
+        wb.write(P, 0, &[1; 3]);
+        wb.write(P, 20 * CS as u64, &[2; CS]);
+        assert_eq!(wb.dirty_bytes(P), CS + 3, "no zeros buffered for the hole");
+        assert_eq!(wb.visible_size(P), Some(21 * CS as u64));
+        assert_eq!(idx(&wb.flush(P)), vec![20]);
+        assert_eq!(wb.logical_size(P), Some(21 * CS as u64), "end lost by the drain");
+        let _segs = wb.flush_all(P);
+        assert_eq!(wb.logical_size(P), None, "fully drained");
+        wb.write(P, 1, &[3; 1]);
+        assert_eq!(wb.logical_size(P), Some(2), "a drained end does not come back");
+
+        wb.write(P, 0, &[1; 3]);
+        wb.truncate(P, 10 * CS as u64 + 4);
+        assert_eq!(wb.visible_size(P), Some(10 * CS as u64 + 4), "truncate-extend");
+        wb.truncate(P, 2);
+        assert_eq!(wb.visible_size(P), Some(2), "truncate-shrink");
+    }
+
+    /// Write at 0, then far past the end, close: only the two written chunks
+    /// upload (edge-padded), the hole reads zeros, the size is the end.
+    #[test]
+    fn sparse_write_uploads_only_written_chunks() {
+        for async_on in [true, false] {
+            let mut sim = Sim::new(async_on);
+            sim.cap = 1 << 20;
+            sim.write(0, &[1; 3]);
+            sim.write(10 * CS as u64 + 3, &[2; 5]);
+            sim.check();
+            assert_eq!(sim.wb.dirty_bytes(P), 2 * CS, "async={async_on}: only edge padding");
+            assert_eq!(sim.wb.visible_size(P), Some(10 * CS as u64 + 8));
+            sim.release();
+            assert_eq!(sim.uploads.keys().copied().collect::<Vec<_>>(), vec![0, 10]);
+            assert_eq!(sim.size, 10 * CS as u64 + 8);
+        }
+    }
+
+    /// Truncate-extend then close: the end is a hole, size is the truncate
+    /// size, the hole reads zeros. (A write past EOF always ends with data.)
+    #[test]
+    fn truncate_extend_then_close_keeps_the_size() {
+        for async_on in [true, false] {
+            let mut sim = Sim::new(async_on);
+            sim.write(0, &[1; 5]);
+            sim.truncate(10 * CS as u64 + 4);
+            sim.check();
+            sim.release();
+            assert_eq!(sim.size, 10 * CS as u64 + 4);
+            assert_eq!(sim.uploads.keys().copied().collect::<Vec<_>>(), vec![0]);
+        }
+    }
+
+    /// Prod knfsd pattern (NFSv4.1 rsync, async_commit): ~6 sequential
+    /// writeback streams over adjacent, chunk-unaligned regions, round-robin
+    /// in small writes, each starting past the current end. Every chunk
+    /// uploads exactly once and the file equals the model; the dirty cap
+    /// (16 chunks) is never hit. Before: each stream start zero-filled the
+    /// whole gap, the cap drain uploaded gappy chunks, x1.6.
+    #[test]
+    fn interleaved_streams_upload_each_chunk_once() {
+        const REG: u64 = 16 * CS as u64 + 3;
+        const ARRIVAL: [u64; 6] = [1, 5, 2, 0, 3, 4];
+        for async_on in [true, false] {
+            let mut sim = Sim::new(async_on);
+            sim.cap = 16 * CS;
+            let mut pos: Vec<u64> = (0..6).map(|s| s * REG).collect();
+            let mut k = 0u64;
+            while pos.iter().enumerate().any(|(s, &p)| p < (s as u64 + 1) * REG) {
+                for &s in &ARRIVAL {
+                    let end = (s + 1) * REG;
+                    let p = pos[s as usize];
+                    if p < end {
+                        let n = (end - p).min(2) as usize;
+                        k += 1;
+                        sim.trace.push(format!("write {p} {n}"));
+                        sim.write(p, &vec![(k % 251 + 1) as u8; n]);
+                        sim.check();
+                        pos[s as usize] += n as u64;
+                    }
+                }
+            }
+            sim.release();
+            let chunks = (6 * REG).div_ceil(CS as u64) as usize;
+            assert_eq!(sim.uploads.len(), chunks, "async={async_on}");
+            assert!(sim.uploads.values().all(|&n| n == 1), "async={async_on}: {:?}", sim.uploads);
         }
     }
 
