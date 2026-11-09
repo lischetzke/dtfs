@@ -622,3 +622,19 @@ async fn orphan_reap_without_the_shared_secret_is_401() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert!(h.state.scheduler.last_orphan_run().is_none());
 }
+
+/// Audit #10 — a requested write_to_disk that failed must not report a
+/// plain 200/"success": 500, `raft_stored: true`, audit "partial".
+#[test]
+fn config_update_outcome_reports_failed_disk_write() {
+    use super::config::config_update_outcome;
+    let (s, b, a) = config_update_outcome(4, Some(Err("EACCES".into())));
+    assert_eq!((s, a), (StatusCode::INTERNAL_SERVER_ERROR, "partial"), "{b}");
+    assert_eq!((b["raft_stored"].as_bool(), b["write_to_disk"].as_bool()), (Some(true), Some(false)), "{b}");
+    assert!(b["error"].as_str().unwrap().contains("EACCES"), "{b}");
+    for (disk, wrote) in [(None, false), (Some(Ok(())), true)] {
+        let (s, b, a) = config_update_outcome(4, disk);
+        assert_eq!((s, a), (StatusCode::OK, "success"), "{b}");
+        assert_eq!(b["write_to_disk"].as_bool(), Some(wrote), "{b}");
+    }
+}

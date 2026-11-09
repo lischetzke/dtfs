@@ -295,28 +295,59 @@ pub(super) async fn update_config(
     // a valid manager.toml — and it has already been proven to re-parse
     // through the startup deserialiser, so the manager can always restart
     // from what we write.
-    let mut wrote_to_disk = false;
-    if let Some(ref rendered) = pending_toml {
-        let path = std::path::Path::new(MANAGER_CONFIG_PATH);
-        match write_manager_toml_atomic(path, rendered) {
-            Ok(()) => wrote_to_disk = true,
-            Err(e) => warn!(error = %e, "AZ-5-A2 write_to_disk failed"),
+    let disk = pending_toml.as_ref().map(|rendered| {
+        let res = write_manager_toml_atomic(std::path::Path::new(MANAGER_CONFIG_PATH), rendered);
+        if let Err(e) = &res {
+            warn!(error = %e, "AZ-5-A2 write_to_disk failed");
         }
-    }
+        res
+    });
+    let wrote_to_disk = matches!(disk, Some(Ok(())));
+    let (status, body, audit_result) = config_update_outcome(version, disk);
 
     state.audit_log.log(
         "api",
         "config.update",
         &format!("version={version} write_to_disk={wrote_to_disk}"),
-        "success",
+        audit_result,
     );
 
-    Ok(Json(json!({
-        "version": version,
-        "status": "stored",
-        "note": "stored cluster-wide in Raft as a record; daemons do not read it. Only write_to_disk changes behaviour: it rewrites this manager's TOML, effective after its restart",
-        "write_to_disk": wrote_to_disk,
-    })))
+    if status.is_success() {
+        Ok(Json(body))
+    } else {
+        Err((status, Json(body)))
+    }
+}
+
+/// Audit #10 — response + audit result after the Raft store committed.
+/// `disk` is `None` when `write_to_disk` was not requested.
+pub(super) fn config_update_outcome(
+    version: u64,
+    disk: Option<Result<(), String>>,
+) -> (StatusCode, Value, &'static str) {
+    if let Some(Err(e)) = disk {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({
+                "error": format!("stored in Raft but write_to_disk failed: {e}"),
+                "version": version,
+                "raft_stored": true,
+                "write_to_disk": false,
+            }),
+            "partial",
+        );
+    }
+    let wrote_to_disk = disk.is_some();
+    (
+        StatusCode::OK,
+        json!({
+            "version": version,
+            "status": "stored",
+            "note": "stored cluster-wide in Raft as a record; daemons do not read it. Only write_to_disk changes behaviour: it rewrites this manager's TOML, effective after its restart",
+            "write_to_disk": wrote_to_disk,
+        }),
+        "success",
+    )
 }
 
 /// AZ-5-A1 — effective cluster config endpoint. Returns one entry per
