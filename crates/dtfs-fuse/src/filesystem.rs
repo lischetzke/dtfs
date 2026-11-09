@@ -1782,19 +1782,20 @@ impl DtfsFilesystem {
         // Re-read after the seed awaits (same order as above).
         let (logical_size, _) = self.eof_after(fh, &path, self.write_eof(&path)).await?;
         let fill = crate::writebuf::hole_fill_ranges(logical_size, effective_offset, chunk_size);
-        for (i, r) in fill.iter().enumerate() {
-            if i == 1 && r.start > fill[0].end {
-                // Whole chunks skipped: pin the manager's size before any
-                // chunk above the hole commits. A file without one (never
-                // truncated) reports the sum of its chunk sizes, which a hole
-                // makes too small; once set, commits grow it to their extent.
-                // At least every committed, in-flight and buffered end: a
-                // SetFileSize drops the chunks above it.
-                let (end, _) = self.eof_after(fh, &path, self.write_buffer.visible_size(&path)).await?;
-                let pin = logical_size.max(end);
-                self.set_size(fh, pin).await?;
-                debug!(path = %path, size = pin, "pinned size before a sparse write");
-            }
+        if fill[1].start > fill[0].end {
+            // Whole chunks skipped: pin the manager's size before any chunk
+            // above the hole commits, and before any padding (a failed pin
+            // leaves the buffer as it was). A file without one (never
+            // truncated) reports the sum of its chunk sizes, which a hole
+            // makes too small; once set, commits grow it to their extent.
+            // At least every committed, in-flight and buffered end: a
+            // SetFileSize drops the chunks above it.
+            let (end, _) = self.eof_after(fh, &path, self.write_buffer.visible_size(&path)).await?;
+            let pin = logical_size.max(end);
+            self.set_size(fh, pin).await?;
+            debug!(path = %path, size = pin, "pinned size before a sparse write");
+        }
+        for r in fill.iter() {
             // Cap the zero-fill at 64 MiB per step to keep memory bounded.
             const FILL_CHUNK: usize = 64 * 1024 * 1024;
             let mut remaining = (r.end - r.start) as usize;
@@ -5797,7 +5798,10 @@ mod async_commit_fs_tests {
             let fs = Arc::new(fs(async_on));
             let cs = fs.write_buffer.chunk_size() as u64;
             let full = (cap as u64 / cs) as u32;
-            for (eof, offset) in [(64 * cs, 40 * cs + 10), (full as u64 * cs + 100, (full as u64 + 2) * cs)] {
+            // Hole-fill case: the write lands in the chunk right after the
+            // tail (no whole chunk skipped, so no size pin runs first);
+            // retries move by one byte to stay there.
+            for (eof, offset, step) in [(64 * cs, 40 * cs + 10, cs), (full as u64 * cs + 100, (full as u64 + 1) * cs + 10, 1)] {
                 let fh = open(&fs, "/f", OpenFlags::ReadWrite);
                 fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/f", eof, cs)));
                 for i in 0..full {
@@ -5806,7 +5810,7 @@ mod async_commit_fs_tests {
                 assert_eq!(fs.write_buffer.dirty_bytes("/f"), cap);
                 let tail = (eof % cs) as usize * usize::from(offset > eof);
                 for k in 0..3u64 {
-                    let err = fs.write(fh, offset + k * cs, &[2; 10]).await.unwrap_err();
+                    let err = fs.write(fh, offset + k * step, &[2; 10]).await.unwrap_err();
                     assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
                     assert_eq!(
                         fs.write_buffer.dirty_bytes("/f"),
@@ -5989,6 +5993,21 @@ mod async_commit_fs_tests {
         close.abort();
         w.abort();
         hole.abort();
+    }
+
+    /// R3-3: the sparse-write size pin runs before any hole padding, so a
+    /// failed pin (EIO) leaves the buffer as it was.
+    #[tokio::test]
+    async fn failed_size_pin_leaves_the_buffer_unchanged() {
+        let fs = Arc::new(fs(true));
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/f", 0, cs)));
+        fs.write_buffer.write("/f", 0, &[1; 100]);
+        let err = fs.write(fh, 10 * cs + 5, &[2; 10]).await.unwrap_err();
+        assert!(format!("{err:#}").contains("set_size"), "{err:#}");
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100, "tail padded although the pin failed");
+        assert_eq!(fs.write_buffer.logical_size("/f"), Some(100));
     }
 
     /// R2-4: a grow under an exclusive commit slot drops no chunks: the
@@ -6176,7 +6195,8 @@ mod async_commit_fs_tests {
         let full = (crate::writebuf::DIRTY_BYTES_CAP / (4 << 20)) as u32;
         for async_on in [false, true] {
             let (fs, fh, cs) = writer_fs(&client, async_on, full as u64, 100, full);
-            let w = stuck_write(&fs, fh, (full as u64 + 2) * cs, vec![2; 10]).await;
+            // In the chunk after the tail: no whole chunk skipped, no pin first.
+            let w = stuck_write(&fs, fh, (full as u64 + 1) * cs + 10, vec![2; 10]).await;
             assert!(!fs.write_buffer.has_chunk("/f", 0), "chunk 0 drained by the hole-fill cap drain");
             assert_eq!(overlay_len(&fs, 0, cs as usize), cs as usize, "async={async_on}: drained chunk 0 invisible");
             w.abort();
@@ -6185,10 +6205,10 @@ mod async_commit_fs_tests {
         hole.abort();
     }
 
-    /// A write 200 MiB past the end buffers only the old tail chunk's zero
-    /// padding, then pins the manager size (stuck on the black hole) before
-    /// any upload: the chunks inside the hole are never materialised (prod:
-    /// 213 MB hole fills drained gappy zero chunks on every write, x1.6).
+    /// A write 200 MiB past the end pins the manager size (stuck on the
+    /// black hole) before any padding or upload: the chunks inside the hole
+    /// are never materialised (prod: 213 MB hole fills drained gappy zero
+    /// chunks on every write, x1.6); the tail chunk is padded only after.
     #[tokio::test]
     async fn sparse_write_pads_only_the_tail_chunk_and_pins_the_size() {
         let (client, hole) = black_hole_client().await;
@@ -6196,8 +6216,9 @@ mod async_commit_fs_tests {
             let (fs, fh, cs) = writer_fs(&client, async_on, 0, 0, 0);
             fs.write_buffer.write("/f", 0, &[1; 100]);
             let w = stuck_write(&fs, fh, 200 << 20, vec![2; 10]).await;
-            assert_eq!(fs.write_buffer.dirty_bytes("/f"), cs as usize, "async={async_on}: hole materialised");
-            assert_eq!(overlay_len(&fs, 0, 8 * cs as usize), cs as usize, "nothing drained or in flight");
+            assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100, "async={async_on}: padded before the pin");
+            assert_eq!(overlay_len(&fs, 0, 8 * cs as usize), 100, "nothing drained or in flight");
+            let _ = cs;
             w.abort();
             let _ = w.await;
         }
