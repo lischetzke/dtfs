@@ -116,9 +116,9 @@ Setting `min_replicas_before_ack` equal to the replication factor gives the stro
 ### fsync Behavior
 
 Data nodes always `sync_all()` a chunk before the atomic rename that commits
-it, and sync the metadata before clearing the write-ahead log entry — an
-acknowledged write has reached stable storage. There is no configuration
-option to disable this.
+it, sync the metadata, and fsync the chunk directory once after both renames
+before clearing the write-ahead log entry: an acknowledged write has reached
+stable storage. There is no configuration option to disable this.
 
 ### write_timeout_secs
 

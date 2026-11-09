@@ -166,6 +166,19 @@ tests would otherwise exercise against half-fixed code.
   file; `recover_from_wal` matches on the `.json` extension and reads the
   operation out of the JSON body, so it keeps replaying the legacy
   `<id>.wal.json` name unchanged.
+- **Commit fsync budget (2026-11).** An IOPS-bound NAS-backed data disk
+  spent ~70% of its write ops on small log/directory writes forced by 7
+  syncs per chunk. The streaming commit now does 5: tmp `.dat`
+  `sync_all`, WAL file `sync_all` + WAL dir fsync (WAL-first unchanged),
+  `.meta` tmp `sync_all`, and ONE chunk-dir fsync after both the `.dat`
+  and `.meta` renames (`write_meta_atomic_no_dir_sync`; other callers keep
+  `write_meta_atomic`'s own dir fsync), then the WAL delete without a WAL
+  dir fsync. Crash cases, all handled by the put-WAL replay: neither
+  rename durable -> tmp swept; `.dat` without `.meta` -> `.meta` rebuilt
+  when the `.dat` hashes to its id, else rolled back; `.meta` without
+  `.dat` -> the `.meta` is removed; a WAL that reappears after the delete
+  finds a complete chunk and is a no-op. Pinned by
+  `commit_new_chunk_does_five_syncs` and the `put_wal_replay_*` tests.
 
 ## A.3.5 — Build-date / version stamp mechanism (Bug BS, AZ-5)
 

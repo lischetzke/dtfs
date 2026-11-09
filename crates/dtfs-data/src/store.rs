@@ -486,6 +486,7 @@ impl ChunkStore {
         // O_RDONLY here just to sync the data pages without re-buffering.
         {
             let f = fs::File::open(tmp_path).await.map_err(DtfsError::Io)?;
+            note_sync();
             f.sync_all().await.map_err(DtfsError::Io)?;
         }
 
@@ -532,13 +533,6 @@ impl ChunkStore {
             tracing::warn!(chunk_id = %chunk_id, error = %e, "dat mtime stamp failed after rename; delete guard sees the tmp mtime");
         }
 
-        // Bug L — fsync the parent directory after the rename so the
-        // directory-entry pointing at the renamed inode survives a crash.
-        // On XFS / ext4 a rename's directory update can be lost even
-        // though the inode itself is durable, leaving an orphan inode and
-        // a missing chunk from the manager's perspective.
-        fsync_dir(&chunk_dir).await?;
-
         // 3. Write the meta sidecar. CR-4-2 (DATA-2) — atomic tmp+rename
         // instead of a direct `File::create` at the final path: a crash
         // mid-write of the direct create left a torn (partial/0-byte)
@@ -561,7 +555,17 @@ impl ChunkStore {
                 return Err(DtfsError::Serialization(e.to_string()));
             }
         };
-        if let Err(e) = write_meta_atomic(&disk.mount_path, &final_meta_path, &meta_json).await {
+        // Bug L — ONE chunk-dir fsync after both renames (.dat and .meta)
+        // makes both directory entries durable before the put is acked; a
+        // rename's dir update can otherwise be lost on XFS/ext4. A crash
+        // before it leaves any subset of the two renames: put-WAL replay
+        // repairs/rolls back a .dat without .meta and drops a .meta
+        // without .dat.
+        let meta_written = match write_meta_atomic_no_dir_sync(&disk.mount_path, &final_meta_path, &meta_json).await {
+            Ok(()) => fsync_dir(&chunk_dir).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = meta_written {
             // CR-4-3 (DATA-4) — the `.dat` is already committed (renamed)
             // at this point; a failure writing its `.meta` companion must
             // not leave a `.dat` with no matching `.meta` (nor a stale WAL
@@ -571,12 +575,10 @@ impl ChunkStore {
             return Err(e);
         }
 
-        // 4. Clear WAL.
+        // 4. Clear WAL. Not fsynced: a put WAL that reappears after a
+        // crash finds a complete .dat + parseable .meta and replays as a
+        // no-op (recover_from_wal, PutChunk arm).
         let _ = fs::remove_file(&wal_path).await;
-        // Best-effort fsync of WAL dir so the removal is durable; if
-        // we crash after this point the (now-absent) WAL is a "no-op"
-        // for recover_from_wal.
-        let _ = fsync_dir(&wal_dir_path).await;
 
         // 5. Counters — skip for a re-upload of an already-complete chunk
         // (CR-4-6 / CO-5-5 parity).
@@ -1109,6 +1111,15 @@ impl ChunkStore {
                                                     tracing::info!(
                                                         "Rolled back meta-less/torn-meta committed chunk {} (interrupted put)",
                                                         wal_entry.chunk_id
+                                                    );
+                                                } else if !dat.exists() && meta.exists() {
+                                                    // The commit fsyncs the chunk dir once
+                                                    // after both renames: a crash can keep
+                                                    // the .meta rename and lose the .dat's.
+                                                    let _ = fs::remove_file(&meta).await;
+                                                    tracing::warn!(
+                                                        chunk_id = %wal_entry.chunk_id,
+                                                        "WAL replay removed a .meta without its .dat (interrupted put)"
                                                     );
                                                 }
                                             }
@@ -1838,6 +1849,7 @@ async fn write_wal_entry(path: &Path, entry: &WalEntry) -> DtfsResult<()> {
     file.write_all(json.as_bytes())
         .await
         .map_err(DtfsError::Io)?;
+    note_sync();
     file.sync_all().await.map_err(DtfsError::Io)?;
     if let Some(parent) = path.parent() {
         let _ = fsync_dir(parent).await;
@@ -1856,6 +1868,20 @@ async fn write_meta_atomic(
     final_meta_path: &Path,
     meta_json: &str,
 ) -> DtfsResult<()> {
+    write_meta_atomic_no_dir_sync(disk_root, final_meta_path, meta_json).await?;
+    if let Some(parent) = final_meta_path.parent() {
+        fsync_dir(parent).await?;
+    }
+    Ok(())
+}
+
+/// `write_meta_atomic` without the trailing destination-dir fsync. Only for
+/// the put commit, which fsyncs the chunk dir once after both renames.
+async fn write_meta_atomic_no_dir_sync(
+    disk_root: &Path,
+    final_meta_path: &Path,
+    meta_json: &str,
+) -> DtfsResult<()> {
     let tmp = tmp_dir(disk_root);
     fs::create_dir_all(&tmp).await.map_err(DtfsError::Io)?;
     let tmp_path = tmp.join(format!("{}.meta.tmp", uuid::Uuid::new_v4()));
@@ -1865,15 +1891,13 @@ async fn write_meta_atomic(
         file.write_all(meta_json.as_bytes())
             .await
             .map_err(DtfsError::Io)?;
+        note_sync();
         file.sync_all().await.map_err(DtfsError::Io)?;
     }
 
     if let Err(e) = fs::rename(&tmp_path, final_meta_path).await {
         let _ = fs::remove_file(&tmp_path).await;
         return Err(DtfsError::Io(e));
-    }
-    if let Some(parent) = final_meta_path.parent() {
-        fsync_dir(parent).await?;
     }
     Ok(())
 }
@@ -1948,11 +1972,25 @@ pub async fn quarantine_chunk_on_disk(
     Ok(())
 }
 
+// Test hook: counts fsync/sync_all calls on the commit path, per thread
+// (current_thread tokio tests run the async code on the test thread).
+#[cfg(test)]
+thread_local! {
+    static SYNC_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn note_sync() {
+    #[cfg(test)]
+    SYNC_CALLS.with(|c| c.set(c.get() + 1));
+}
+
 /// Bug L — fsync a directory so any rename/create inside it is durable
 /// across a power loss. POSIX requires the parent-dir to be fsynced
 /// separately from the inode itself; tokio's `File::open` + `sync_all`
 /// works for directories on Linux when opened with read-only access.
 async fn fsync_dir(dir: &Path) -> DtfsResult<()> {
+    note_sync();
     // `fs::File::open` on a directory yields a handle whose `sync_all`
     // syncs the directory metadata. On Linux this is the canonical
     // dir-fsync. On non-Linux it's a no-op cost.
@@ -3281,6 +3319,158 @@ mod tests {
         assert_eq!(meta.size, payload.len() as u64);
         let got = store.get_chunk(&chunk_id).await.unwrap();
         assert_eq!(got.as_ref(), payload);
+    }
+
+    // ---- commit-path fsync budget + put-WAL crash cases ----
+
+    /// Stream `payload` into a tmp on the store's disk, unsynced.
+    async fn write_streaming_tmp(store: &ChunkStore, payload: &[u8]) -> (std::path::PathBuf, ChunkId) {
+        let (tmp_path, _) = store.allocate_streaming_tmp(DiskTier::Hot).unwrap();
+        tokio::fs::write(&tmp_path, payload).await.unwrap();
+        (tmp_path, ChunkId::from_bytes(dtfs_common::checksum::compute(payload)))
+    }
+
+    async fn commit_payload(store: &ChunkStore, payload: &[u8]) -> ChunkId {
+        let (tmp_path, id) = write_streaming_tmp(store, payload).await;
+        store
+            .commit_chunk_from_tmp(&id, &tmp_path, &VolumeId::new("default".to_string()), DiskTier::Hot, payload.len() as u64, id.0)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn write_put_wal(disk: &Path, id: &ChunkId) -> std::path::PathBuf {
+        let wal_path = wal_dir(disk).join(format!("{}.put.wal.json", id.as_hex()));
+        let entry = WalEntry {
+            operation: WalOperation::PutChunk,
+            chunk_id: id.as_hex(),
+            disk_path: disk.to_string_lossy().to_string(),
+            timestamp_ms: now_millis(),
+        };
+        write_wal_entry(&wal_path, &entry).await.unwrap();
+        wal_path
+    }
+
+    /// Commit of a new chunk costs exactly 5 syncs: tmp .dat, WAL file,
+    /// WAL dir, .meta tmp, one chunk-dir fsync covering both renames.
+    #[tokio::test]
+    async fn commit_new_chunk_does_five_syncs() {
+        let (store, _tmp) = make_test_store().await;
+        let payload = b"five-syncs-per-chunk";
+        let (tmp_path, id) = write_streaming_tmp(&store, payload).await;
+        let before = SYNC_CALLS.with(|c| c.get());
+        let (meta, _) = store
+            .commit_chunk_from_tmp(&id, &tmp_path, &VolumeId::new("default".to_string()), DiskTier::Hot, payload.len() as u64, id.0)
+            .await
+            .unwrap();
+        let syncs = SYNC_CALLS.with(|c| c.get()) - before;
+        assert_eq!(syncs, 5, "fsync budget per new chunk");
+        assert_eq!(meta.size, payload.len() as u64);
+        assert_eq!(store.get_chunk_meta(&id).await.unwrap().checksum, id.0);
+        assert_eq!(store.get_chunk(&id).await.unwrap().as_ref(), payload);
+        assert_eq!(store.chunk_count.load(Ordering::Relaxed), 1);
+        assert!(!wal_dir(_tmp.path()).join(format!("{}.put.wal.json", id.as_hex())).exists());
+    }
+
+    /// Crash after the WAL delete was issued but before it was durable:
+    /// the leftover put WAL for a complete chunk replays as a no-op.
+    #[tokio::test]
+    async fn put_wal_replay_of_complete_chunk_changes_nothing() {
+        let (store, tmp) = make_test_store().await;
+        let id = commit_payload(&store, b"complete-before-crash").await;
+        let dat = chunk_data_path(tmp.path(), &id);
+        let meta = chunk_meta_path(tmp.path(), &id);
+        let dat_bytes = tokio::fs::read(&dat).await.unwrap();
+        let meta_bytes = tokio::fs::read(&meta).await.unwrap();
+        let mtime = dat_mtime_ms(&dat).await;
+        let wal = write_put_wal(tmp.path(), &id).await;
+
+        store.recover_from_wal().await.unwrap();
+
+        assert_eq!(tokio::fs::read(&dat).await.unwrap(), dat_bytes);
+        assert_eq!(tokio::fs::read(&meta).await.unwrap(), meta_bytes, ".meta must not be rewritten");
+        assert_eq!(dat_mtime_ms(&dat).await, mtime);
+        assert!(!wal.exists());
+        assert_eq!(store.get_chunk(&id).await.unwrap().as_ref(), b"complete-before-crash");
+    }
+
+    /// Crash before either rename was durable: replay removes the tmp,
+    /// leaves no chunk files.
+    #[tokio::test]
+    async fn put_wal_replay_neither_rename_durable_cleans_tmp() {
+        let (store, tmp) = make_test_store().await;
+        let (tmp_path, id) = write_streaming_tmp(&store, b"never-renamed").await;
+        let wal = write_put_wal(tmp.path(), &id).await;
+
+        store.recover_from_wal().await.unwrap();
+
+        assert!(!tmp_path.exists());
+        assert!(!chunk_data_path(tmp.path(), &id).exists());
+        assert!(!chunk_meta_path(tmp.path(), &id).exists());
+        assert!(!wal.exists());
+    }
+
+    /// Crash with the .dat rename durable but not the .meta: a .dat that
+    /// hashes to its id gets its .meta rebuilt; a mismatching one is
+    /// rolled back.
+    #[tokio::test]
+    async fn put_wal_replay_dat_without_meta_repairs_or_rolls_back() {
+        let (store, tmp) = make_test_store().await;
+        let good = ChunkId::from_bytes(dtfs_common::checksum::compute(b"good-bytes"));
+        let bad = ChunkId::from_bytes(dtfs_common::checksum::compute(b"expected"));
+        for (id, bytes) in [(&good, &b"good-bytes"[..]), (&bad, &b"torn-bytes"[..])] {
+            let dat = chunk_data_path(tmp.path(), id);
+            tokio::fs::create_dir_all(dat.parent().unwrap()).await.unwrap();
+            tokio::fs::write(&dat, bytes).await.unwrap();
+            write_put_wal(tmp.path(), id).await;
+        }
+
+        store.recover_from_wal().await.unwrap();
+
+        assert_eq!(store.get_chunk_meta(&good).await.unwrap().checksum, good.0);
+        assert_eq!(store.get_chunk(&good).await.unwrap().as_ref(), b"good-bytes");
+        assert!(!chunk_data_path(tmp.path(), &bad).exists(), "mismatching .dat rolled back");
+        assert!(!chunk_meta_path(tmp.path(), &bad).exists());
+    }
+
+    /// Crash with the .meta rename durable but not the .dat: replay must
+    /// not leave a stale sidecar behind.
+    #[tokio::test]
+    async fn put_wal_replay_meta_without_dat_removes_meta() {
+        let (store, tmp) = make_test_store().await;
+        let id = ChunkId::from_bytes(dtfs_common::checksum::compute(b"dat-lost"));
+        let meta_path = chunk_meta_path(tmp.path(), &id);
+        tokio::fs::create_dir_all(meta_path.parent().unwrap()).await.unwrap();
+        let meta = ChunkMeta {
+            id: id.clone(),
+            size: 8,
+            checksum: id.0,
+            created_at: 0,
+            volume_id: VolumeId::new("default".to_string()),
+            replication_factor: 1,
+        };
+        tokio::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).await.unwrap();
+        let wal = write_put_wal(tmp.path(), &id).await;
+
+        store.recover_from_wal().await.unwrap();
+
+        assert!(!meta_path.exists(), "stale .meta without .dat must be removed");
+        assert!(!wal.exists());
+    }
+
+    /// Negative: without a put WAL, a .meta-only state is not touched by
+    /// replay (only an interrupted put authorises the removal).
+    #[tokio::test]
+    async fn meta_without_dat_and_no_wal_is_left_alone() {
+        let (store, tmp) = make_test_store().await;
+        let id = ChunkId::from_bytes(dtfs_common::checksum::compute(b"no-wal"));
+        let meta_path = chunk_meta_path(tmp.path(), &id);
+        tokio::fs::create_dir_all(meta_path.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&meta_path, b"{}").await.unwrap();
+
+        store.recover_from_wal().await.unwrap();
+
+        assert!(meta_path.exists());
     }
 
     /// Bug M — `recover_from_wal` must be safe to call on a clean

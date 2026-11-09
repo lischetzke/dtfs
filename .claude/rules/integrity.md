@@ -19,14 +19,18 @@ text there.
    `chunks/<aa>/<bb>/<id>.dat`.
 3. `.meta`: only via `write_meta_atomic` (tmp, `sync_all`, rename, dir
    fsync). Never `File::create` at the final path. An unparseable `.meta`
-   is treated as missing.
+   is treated as missing. The put commit alone uses
+   `write_meta_atomic_no_dir_sync` and fsyncs the chunk dir ONCE after
+   both the `.dat` and `.meta` renames, before the WAL delete (5 syncs per
+   new chunk; the WAL delete itself is not fsynced).
 4. Counters (`bytes_stored`, `chunk_count`) update only after `.meta` is
    durable, and only for a genuinely new chunk.
 5. Any put error removes the tmp; an error AFTER the `.dat` rename removes
    `.dat`, `.meta` and the WAL entry (`cleanup_after_dat_committed`),
    except a `.dat` that existed before the rename (only the WAL goes).
    Put-WAL replay rebuilds a missing/torn `.meta` from a `.dat` that hashes
-   to its id and rolls back only a mismatch. Commit stamps the `.dat` mtime
+   to its id and rolls back only a mismatch, removes a `.meta` whose
+   `.dat` is missing, and is a no-op for a complete chunk. Commit stamps the `.dat` mtime
    to commit time (the `if_mtime_le_ms` delete guard reads it).
    Put and delete of the same id serialize on the 256-way striped chunk
    lock; WAL names are op-keyed (`.put.wal.json` / `.delete.wal.json`).
