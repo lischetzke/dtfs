@@ -97,10 +97,16 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   handle `locations = None`. `create()` seeds from the manager's snapshot
   when it kept a populated file (`committed_any = !chunks.is_empty()`).
 - A writable open of a path this process already holds a lease on (knfsd
-  reopen) reuses that handle's `lease_owner_id` (`shared_lease_owner`;
-  same owner = manager re-acquire, no EBUSY); `release()` skips
-  `release_write_lease` while another handle shares the owner
-  (`lease_owner_still_open`).
+  reopen, one per NFS COMMIT) takes a writable handle's owner, lease_id,
+  deadline and snapshot `Arc` (`shared_writer`): no fetch, no
+  acquire_write_lease, no post-lease `quiet_fetch`, not cached into the
+  metadata cache; `FetchToken::unchanged` (no commit started/ended since
+  the copy) gates the tail seed and the handle's snapshot (else `None`).
+  That handle's snapshot `None` = fetch path with the same owner
+  (`shared_lease_owner`; same owner = manager re-acquire, no EBUSY). Prod:
+  two O(file) fetches + a Raft write per COMMIT, 29 -> 20 MiB/s.
+  `release()` skips `release_write_lease` while another handle shares the
+  owner (`lease_owner_still_open`).
 - `release()` drops the buffer when no other writer is open; a refused
   commit is logged at error with chunk indices and bytes lost. flush and
   fsync return the commit error.
@@ -200,7 +206,8 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   from the pre-commit snapshot and the restore clobbers it), a write whose
   dirty + in-flight bytes would meet `DIRTY_BYTES_CAP` (`bg_backpressure`,
   then the cap drain as before), `commit_all` (last writer's flush/release,
-  timer), async fsync, truncate, rename (every lock path) and unlink. Waiters
+  timer), truncate, rename (every lock path) and unlink; NOT async fsync
+  (knfsd fsyncs per NFS COMMIT; waiting stalled its one thread). Waiters
   may hold `path_guard` (the task never takes it: no deadlock), and holding
   it means no new batch starts. Write-side EOF (append offset, hole fill,
   tail seed) uses `write_eof` = `visible_size` in async mode (the in-flight
@@ -262,7 +269,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   remount. Other limits: NFSv3 EXCLUSIVE create retransmit gives EEXIST,
   chown is ignored (daemon uid/gid), repeated open/flush/release during
   long NFS writes is untested end to end (a second writable open shares
-  the first handle's lease owner).
+  the first handle's lease and snapshot, `shared_writer`).
 - knfsd opens, fsyncs and closes a separate file for every NFS COMMIT
   while the NFSv4 open-state file stays open (no NFS OPEN/CLOSE). With
   `write.async_commit` that close commits nothing (`defer_close_commit`);

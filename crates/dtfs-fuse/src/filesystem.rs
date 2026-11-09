@@ -478,9 +478,20 @@ struct FetchToken<'a> {
     path: String,
     generation: u64,
     quiet_at_start: bool,
+    in_flight_at_start: u32,
 }
 
 impl FetchToken<'_> {
+    /// No commit on the path started or finished since the token was taken
+    /// (in-flight ones allowed: their merge still reaches a handle inserted
+    /// now). Gates a snapshot copied from another open handle.
+    fn unchanged(&self) -> bool {
+        self.tracker
+            .0
+            .get(&self.path)
+            .is_some_and(|e| (e.0, e.1) == (self.in_flight_at_start, self.generation))
+    }
+
     /// True iff no commit on the path was in flight at the fetch's start or
     /// end and none started in between: the result is not older than any
     /// commit applied meanwhile, so it may be installed on the handles.
@@ -529,7 +540,7 @@ impl CommitTracker {
             e.2 += 1;
             *e
         };
-        FetchToken { tracker: self, path: path.to_string(), generation, quiet_at_start: in_flight == 0 }
+        FetchToken { tracker: self, path: path.to_string(), generation, quiet_at_start: in_flight == 0, in_flight_at_start: in_flight }
     }
 
     /// Wait (woken by the last commit's drop, no polling) until no commit on
@@ -970,7 +981,13 @@ impl DtfsFilesystem {
     ) -> Result<u64> {
         // Fetch (or refresh) file locations from the manager.
         let mut fetch = self.commit_tracker.begin_fetch(path);
-        let mut locations = Arc::new(self.fetch_file_locations(path).await?);
+        // knfsd opens a file per NFS COMMIT: a writable reopen of a path with
+        // an open leased writer takes its lease and snapshot, no manager RPC.
+        let reused = if flags.is_writable() { self.shared_writer(path) } else { None };
+        let mut locations = match &reused {
+            Some((_, _, _, l)) => l.clone(),
+            None => Arc::new(self.fetch_file_locations(path).await?),
+        };
         let chunk_size = self.resolve_chunk_size(&locations);
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
@@ -987,7 +1004,10 @@ impl DtfsFilesystem {
                 bail!(msg);
             }
         }
-        let (lease_id, lease_deadline, lease_owner_id) = if flags.is_writable() {
+        let (lease_id, lease_deadline, lease_owner_id) = if let Some((o, id, dl, _)) = &reused {
+            debug!(path, owner = %o, "writable reopen shares the open writer's lease and snapshot");
+            (Some(id.clone()), *dl, Some(o.clone()))
+        } else if flags.is_writable() {
             // Bug X — append the client's DC as a 4th field. Existing
             // parsers (starts_with("host:"), split(':').next()) ignore
             // trailing fields, so this is backward-compatible. The
@@ -1030,8 +1050,9 @@ impl DtfsFilesystem {
         // commit, so re-fetch after the grant through the guarded path. On
         // failure skip the open-time seed; the handle then stays stale (or
         // the fetch below is still current) and write() re-fetches guarded.
-        let mut seed_ok = true;
-        if flags.is_writable() && !seed_snapshot_usable(false, fetch.may_install()) {
+        // A reused snapshot is the lease holder's own, kept current by merges.
+        let mut seed_ok = reused.is_none() || fetch.unchanged();
+        if flags.is_writable() && reused.is_none() && !seed_snapshot_usable(false, fetch.may_install()) {
             match self.quiet_fetch(path).await {
                 Ok((l, f)) => {
                     locations = l;
@@ -1106,9 +1127,17 @@ impl DtfsFilesystem {
         // Checked after the insert: a commit starting later sees this handle
         // in its merge loop; one that overlapped the fetch changed the
         // generation, so the snapshot may miss its chunk (lazy refetch).
-        match gated_snapshot(locations, fetch.may_install()) {
-            Some(l) => self.cache_metadata(path, l),
-            None => self.invalidate_fh_locations(fh),
+        // A reused snapshot was not fetched: never cached, stale if a commit
+        // started or merged since it was copied.
+        if reused.is_some() {
+            if !fetch.unchanged() {
+                self.invalidate_fh_locations(fh);
+            }
+        } else {
+            match gated_snapshot(locations, fetch.may_install()) {
+                Some(l) => self.cache_metadata(path, l),
+                None => self.invalidate_fh_locations(fh),
+            }
         }
 
         debug!(path, fh, append, "file opened");
@@ -1917,8 +1946,8 @@ impl DtfsFilesystem {
         if !self.config.write.async_commit {
             return self.commit_all(fh).await;
         }
-        let path = self.open_files.get(&fh).context("invalid file handle")?.path.clone();
-        self.wait_bg_uploads(&path).await;
+        // No `wait_bg_uploads`: knfsd fsyncs per NFS COMMIT and waiting
+        // serialised its one thread on every batch; close/timer still wait.
         let err = self
             .open_files
             .get_mut(&fh)
@@ -4013,6 +4042,19 @@ impl DtfsFilesystem {
         }
     }
 
+    /// `(owner, lease_id, deadline, snapshot)` of an open writable handle of
+    /// `path` holding a lease and a current snapshot (detached handles have
+    /// another path). `None` = no such handle, or its snapshot is stale.
+    fn shared_writer(&self, path: &str) -> Option<(String, String, Option<Instant>, Arc<FileLocations>)> {
+        self.open_files.iter().find_map(|e| {
+            let f = e.value();
+            if f.path != path || !f.flags.is_writable() {
+                return None;
+            }
+            Some((f.lease_owner_id.clone()?, f.lease_id.clone()?, f.lease_deadline, f.locations.clone()?))
+        })
+    }
+
     fn open_lease_owners(&self) -> Vec<(String, Option<String>)> {
         self.open_files
             .iter()
@@ -6016,17 +6058,19 @@ mod async_commit_fs_tests {
         hole.abort();
     }
 
-    /// The last writer's close (flush/release), fsync and a write into an
-    /// in-flight chunk wait for the background upload. (truncate, rename,
-    /// unlink and the timer issue RPCs the black hole also stalls, so this
-    /// harness cannot tell their wait apart; same `wait_bg_uploads` call.)
+    /// The last writer's close (flush/release) and a write into an in-flight
+    /// chunk wait for the background upload; fsync does not (prod: knfsd's
+    /// per-COMMIT fsync waited on every batch, 29 -> 20 MiB/s). (truncate,
+    /// rename, unlink and the timer issue RPCs the black hole also stalls,
+    /// so this harness cannot tell their wait apart; same `wait_bg_uploads`.)
     #[tokio::test]
-    async fn async_close_fsync_and_overlapping_write_wait_for_the_upload() {
+    async fn async_close_and_overlapping_write_wait_for_the_upload_fsync_does_not() {
         let (client, hole) = black_hole_client().await;
         let (fs, fh, cs) = bg_batch_in_flight(&client).await;
+        assert!(!pending(fs.fsync(fh)).await, "async fsync must not wait for the upload");
+        assert!(fs.bg_uploads.contains_key("/f"), "upload still in flight");
         assert!(pending(fs.flush(fh)).await, "last writer's flush must wait");
         assert!(pending(fs.release(fh)).await, "last writer's release must wait");
-        assert!(pending(fs.fsync(fh)).await, "fsync must wait");
         assert!(pending(fs.write(fh, 10, &[1; 10])).await, "write into in-flight chunk 0 must wait");
         assert!(pending(fs.write(fh, 3 * cs + 1, &[1; 10])).await, "chunk 3 (last in flight) too");
         assert_eq!(fs.write_buffer.dirty_bytes("/f"), 0, "nothing buffered over in-flight chunks");
@@ -6035,6 +6079,51 @@ mod async_commit_fs_tests {
         let fh2 = open(&fs, "/f", OpenFlags::ReadWrite);
         let _fh3 = open(&fs, "/f", OpenFlags::ReadWrite);
         assert!(!pending(fs.flush(fh2)).await, "deferred close must not wait");
+        hole.abort();
+    }
+
+    /// Writer `fh` on `/f` holding lease "L1" of owner "h:1" (black hole: any
+    /// manager RPC hangs).
+    async fn leased_writer(client: &DtfsClient) -> (Arc<DtfsFilesystem>, u64) {
+        let (fs, fh, _) = writer_fs(client, true, 3, 5, 0);
+        set_lease(&fs, fh, "h:1", "L1");
+        fs.open_files.get_mut(&fh).unwrap().lease_deadline = Some(Instant::now() + AGE);
+        (fs, fh)
+    }
+
+    /// knfsd opens a struct file per NFS COMMIT (prod: 13/20 knfsd stack
+    /// samples in fuse_send_open, 29 -> 20 MiB/s as the file grew): a second
+    /// writable open of a leased path sends no RPC (no O(file) fetch, no
+    /// Raft lease write) and shares the lease and the snapshot Arc.
+    #[tokio::test]
+    async fn writable_reopen_of_a_leased_path_reuses_lease_and_snapshot() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, fh) = leased_writer(&client).await;
+        let open2 = tokio::time::timeout(Duration::from_secs(2), fs.open_with_append("/f", OpenFlags::WriteOnly, false)).await;
+        let fh2 = open2.expect("reopen must not issue a manager RPC").unwrap();
+        let (a, b) = (fs.open_files.get(&fh).unwrap(), fs.open_files.get(&fh2).unwrap());
+        assert_eq!(b.lease_id.as_deref(), Some("L1"));
+        assert_eq!(b.lease_owner_id.as_deref(), Some("h:1"));
+        assert_eq!(b.lease_deadline, a.lease_deadline);
+        assert!(Arc::ptr_eq(a.locations.as_ref().unwrap(), b.locations.as_ref().unwrap()), "snapshot not shared");
+        drop((a, b));
+        assert!(fs.metadata_cache.get("/f").is_none(), "a reused snapshot is not a fetch: not cached");
+        // Not the last handle of the owner: no commit, no lease release RPC.
+        let r = tokio::time::timeout(Duration::from_secs(2), fs.release(fh2)).await;
+        r.expect("release of a shared-owner handle must not call the manager").unwrap();
+        assert_eq!(lease_id(&fs, fh).as_deref(), Some("L1"));
+        hole.abort();
+    }
+
+    /// The first handle's snapshot is stale (None): the reopen falls back to
+    /// the fetch (hangs on the black hole). Readers always fetch.
+    #[tokio::test]
+    async fn reopen_falls_back_to_fetch_when_stale_and_readers_still_fetch() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, fh) = leased_writer(&client).await;
+        assert!(pending(fs.open_with_append("/f", OpenFlags::ReadOnly, false)).await, "reader must fetch");
+        fs.invalidate_fh_locations(fh);
+        assert!(pending(fs.open_with_append("/f", OpenFlags::WriteOnly, false)).await, "stale snapshot must fetch");
         hole.abort();
     }
 
