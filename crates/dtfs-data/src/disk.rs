@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dtfs_common::config::DiskConfig;
 use dtfs_common::types::{DiskStatus, DiskTier};
@@ -17,6 +18,9 @@ pub struct ManagedDisk {
 /// Manages all disks on this data node.
 pub struct DiskManager {
     disks: Vec<ManagedDisk>,
+    /// Per-disk (by position = disk_id) failed flag, set on EIO/EROFS from a
+    /// put or commit. Never cleared at runtime; a restart clears it.
+    failed: Vec<AtomicBool>,
 }
 
 impl DiskManager {
@@ -59,7 +63,40 @@ impl DiskManager {
             );
         }
 
-        Ok(Self { disks })
+        let failed = disks.iter().map(|_| AtomicBool::new(false)).collect();
+        Ok(Self { disks, failed })
+    }
+
+    fn is_failed(&self, d: &ManagedDisk) -> bool {
+        self.failed.get(d.disk_id as usize).is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
+    /// Status as seen now: `Failed` once a write hit EIO/EROFS on the disk.
+    pub fn disk_status(&self, d: &ManagedDisk) -> DiskStatus {
+        if self.is_failed(d) { DiskStatus::Failed } else { d.status }
+    }
+
+    /// A put/commit on the disk mounted at `mount` failed with `e`. EIO and
+    /// EROFS mark the disk Failed so `select_disk_for_tier` stops choosing
+    /// it; other errors (ENOSPC, ...) do not. Returns true when this call
+    /// flagged the disk.
+    pub fn note_write_error(&self, mount: &Path, e: &std::io::Error) -> bool {
+        // 5 = EIO, 30 = EROFS on Linux.
+        if !matches!(e.raw_os_error(), Some(5) | Some(30)) {
+            return false;
+        }
+        let Some(d) = self.disks.iter().find(|d| d.mount_path == mount) else {
+            return false;
+        };
+        let Some(flag) = self.failed.get(d.disk_id as usize) else { return false };
+        if flag.swap(true, Ordering::Relaxed) {
+            return false;
+        }
+        tracing::error!(
+            disk_id = d.disk_id, path = %d.mount_path.display(), error = %e,
+            "data disk marked Failed after write I/O error; no new chunks placed on it until restart"
+        );
+        true
     }
 
     /// Number of managed disks.
@@ -97,7 +134,7 @@ impl DiskManager {
         let exact = self
             .disks
             .iter()
-            .filter(|d| d.tier == tier && d.status == DiskStatus::Healthy)
+            .filter(|d| d.tier == tier && d.status == DiskStatus::Healthy && !self.is_failed(d))
             .max_by_key(|d| live_free(d));
         if exact.is_some() {
             return exact;
@@ -107,7 +144,7 @@ impl DiskManager {
         // rather than failing the whole replica set.
         self.disks
             .iter()
-            .filter(|d| d.status == DiskStatus::Healthy)
+            .filter(|d| d.status == DiskStatus::Healthy && !self.is_failed(d))
             .max_by_key(|d| live_free(d))
     }
 
@@ -211,6 +248,39 @@ mod tests {
         let err = DiskManager::new(&[cfg(b.path())]).err().expect("must refuse");
         let msg = err.to_string();
         assert!(msg.contains("was disk_id 1 but is now at [[disks]] position 0"), "{msg}");
+    }
+
+    #[test]
+    fn eio_or_erofs_marks_disk_failed_and_selection_skips_it() {
+        let a = tempfile::TempDir::new().unwrap();
+        let b = tempfile::TempDir::new().unwrap();
+        let dm = DiskManager::new(&[cfg(a.path()), cfg(b.path())]).unwrap();
+        let eio = std::io::Error::from_raw_os_error(5);
+        // Same filesystem, equal free space: max_by_key picks the LAST disk,
+        // so fail that one to prove the skip.
+        assert!(dm.note_write_error(b.path(), &eio));
+        assert!(!dm.note_write_error(b.path(), &eio), "flag (and error log) only once");
+        assert_eq!(dm.disk_status(&dm.all_disks()[1]), DiskStatus::Failed);
+        assert_eq!(dm.select_disk_for_tier(DiskTier::Hot).unwrap().disk_id, 0);
+        assert!(dm.note_write_error(a.path(), &std::io::Error::from_raw_os_error(30)));
+        assert!(dm.select_disk_for_tier(DiskTier::Hot).is_none(), "every disk failed");
+        assert!(dm.select_disk_for_tier(DiskTier::Cold).is_none(), "fallback skips failed too");
+    }
+
+    #[test]
+    fn enospc_and_other_errors_do_not_mark_disk_failed() {
+        let a = tempfile::TempDir::new().unwrap();
+        let dm = DiskManager::new(&[cfg(a.path())]).unwrap();
+        for e in [
+            std::io::Error::from_raw_os_error(28),
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        ] {
+            assert!(!dm.note_write_error(a.path(), &e));
+        }
+        let other = tempfile::TempDir::new().unwrap();
+        assert!(!dm.note_write_error(other.path(), &std::io::Error::from_raw_os_error(5)));
+        assert_eq!(dm.disk_status(&dm.all_disks()[0]), DiskStatus::Healthy);
+        assert_eq!(dm.select_disk_for_tier(DiskTier::Hot).unwrap().disk_id, 0);
     }
 
     #[test]

@@ -18,7 +18,7 @@ to it), in-flight writes under `<mount>/tmp/`, write-ahead markers under
 | `mount_path` | The configured `path`. |
 | `tier` | `hot`, `warm`, `cold` or `tape`. |
 | `total_bytes` / `used_bytes` | Capacity as reported by the node. |
-| `status` | `healthy`, `degraded`, `draining`, `failed` or `removed`. Operators do not set it: `degraded` and `failed` come from the node's health checks; nothing sets `draining` today. |
+| `status` | `healthy`, `degraded`, `draining`, `failed` or `removed`. Operators do not set it. The manager keeps the value the node registered with (`healthy`); the data node's own `GetDiskStatus` answers `failed` once a chunk write hit EIO/EROFS on the disk (until restart). Nothing sets `degraded` or `draining` today. |
 
 ## Tier Assignment
 
@@ -102,11 +102,13 @@ chunks are covered by other replicas. Evacuation relies on replication policy,
 
 ### Emergency Disk Failure
 
-1. The data node detects I/O errors and reports the disk as `failed` in its next
-   heartbeat; the manager logs a "SMART alert" for it.
-2. A failed disk's replicas stop counting as live; the repair scheduler re-creates
-   the mandatory replicas from copies on other disks or nodes. The disk is excluded
-   from placement.
+1. On the first EIO or EROFS from a chunk write the data node marks the disk
+   `failed` locally (one `error` log line naming `disk_id` and path) and stops
+   placing new chunks on it; a restart clears the flag. The manager is not told:
+   heartbeats carry usage only, so the disk stays `healthy` in the API.
+2. Its replicas therefore still count as live. Reads that hit the disk fail over
+   on the client; scrub reports unreadable chunks as corrupt and the manager
+   repairs them from other copies.
 3. Wait for `files_missing_chunks == 0` and no undergoal chunks
    (`GET /api/v1/chunks?state=undergoal`), then replace the disk in place.
 

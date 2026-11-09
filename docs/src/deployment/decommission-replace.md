@@ -91,9 +91,14 @@ exercised in a lab (none exists), so treat the first run as supervised.
 
 ## Replace a failed or unreadable disk
 
-1. Do not stop the cluster. The data node reports I/O errors and marks the disk
-   `Failed`; the manager excludes it from placement and the repair scheduler
-   re-creates its mandatory replicas from other nodes.
+1. Do not stop the cluster. On the first EIO or EROFS from a chunk write (put
+   or commit) the data node marks the disk `Failed` locally (one error log line)
+   and places new chunks on its other disks; a node whose only disk failed
+   refuses puts, so writers move to other nodes. A restart clears the flag.
+   The manager is not told (heartbeats carry usage only), so its rows for the
+   disk stay live: reads of those chunks fail over on the client, and scrub
+   reports unreadable chunks as corrupt, which drives their repair. Check the
+   data node log and `GetDiskStatus` for the disk.
 2. Wait until nothing is waiting for repair:
    `GET /api/v1/chunks?state=undergoal` and `?state=missing` return no rows and
    `files_missing_chunks == 0`. If a chunk has no replica left on any other

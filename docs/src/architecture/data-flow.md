@@ -80,8 +80,8 @@ Other write-side operations:
 
 ## A disk fails
 
-1. The disk is marked `failed` (reported status or operator action, see [Disk Management](../operations/disk-management.md)). Reads that hit the bad disk meanwhile fail over on the client.
-2. Replicas on that disk stop counting as live. The repair path is the same as for a down node, but only for that disk's chunks.
+1. A chunk write that hits EIO/EROFS marks the disk `failed` on the data node, which then places new chunks on its other disks (until restart). The manager is not told; scrub's corruption reports drive repair (see [Disk Management](../operations/disk-management.md)). Reads that hit the bad disk meanwhile fail over on the client.
+2. If the manager records a disk as `failed` (only at registration today), replicas on that disk stop counting as live. The repair path is the same as for a down node, but only for that disk's chunks.
 3. When the repair copy is verified, the old row is removed through the one de-location path: Raft `RemoveChunkLocation` first, byte delete after. If Raft refuses (for example it would remove the last live replica), no byte is deleted.
 4. Disk ids persist in `.dtfs-disk-id`, so a restarted node does not look like a new disk, and a replaced disk gets a new id.
 

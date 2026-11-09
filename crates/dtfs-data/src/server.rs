@@ -486,7 +486,7 @@ impl DataService for DataServiceImpl {
         };
 
         // Allocate the tmp file on the disk that will host the chunk.
-        let (tmp_path, _disk_mount) = self
+        let (tmp_path, disk_mount) = self
             .store
             .allocate_streaming_tmp(tier)
             .map_err(|e| Status::internal(format!("allocate tmp: {e}")))?;
@@ -498,20 +498,25 @@ impl DataService for DataServiceImpl {
         // on a disk holding only 1.25 GB of committed chunks). Disarmed
         // after a successful commit (which renames the tmp away).
         let mut tmp_guard = TmpCleanup::new(tmp_path.clone());
+        // EIO/EROFS on this disk marks it Failed so the next put picks another.
+        let io_status = |ctx: &str, e: std::io::Error| {
+            self.store.disk_manager().note_write_error(&disk_mount, &e);
+            put_io_status(ctx, e)
+        };
 
         let mut hasher = dtfs_common::checksum::IncrementalHasher::new();
         let mut total_size: u64 = 0;
         {
             let mut f = tokio::fs::File::create(&tmp_path)
                 .await
-                .map_err(|e| put_io_status(&format!("create tmp {}", tmp_path.display()), e))?;
+                .map_err(|e| io_status(&format!("create tmp {}", tmp_path.display()), e))?;
             // First piece (already consumed from the stream).
             if !first.data.is_empty() {
                 hasher.update(&first.data);
                 total_size += first.data.len() as u64;
                 tokio::io::AsyncWriteExt::write_all(&mut f, &first.data)
                     .await
-                    .map_err(|e| put_io_status("write tmp", e))?;
+                    .map_err(|e| io_status("write tmp", e))?;
             }
             // Remaining pieces.
             while let Some(msg) = stream
@@ -526,11 +531,11 @@ impl DataService for DataServiceImpl {
                 total_size += msg.data.len() as u64;
                 tokio::io::AsyncWriteExt::write_all(&mut f, &msg.data)
                     .await
-                    .map_err(|e| put_io_status("write tmp", e))?;
+                    .map_err(|e| io_status("write tmp", e))?;
             }
             tokio::io::AsyncWriteExt::flush(&mut f)
                 .await
-                .map_err(|e| put_io_status("flush tmp", e))?;
+                .map_err(|e| io_status("flush tmp", e))?;
             // fsync is done implicitly by commit_chunk_from_tmp before
             // the rename to the final path; we can save the duplicate
             // sync_all on the tmp.
@@ -564,7 +569,7 @@ impl DataService for DataServiceImpl {
             // reclaims the tmp on this error path (disarm runs only on the
             // success branch below).
             .map_err(|e| match e {
-                DtfsError::Io(io) => put_io_status("commit chunk", io),
+                DtfsError::Io(io) => io_status("commit chunk", io),
                 other => Status::internal(other.to_string()),
             })?;
         // Commit renamed the tmp to its final path; nothing to clean up.
@@ -915,7 +920,7 @@ impl DataService for DataServiceImpl {
                 tier: d.tier.to_string(),
                 total_bytes: d.total_bytes,
                 used_bytes: d.used_bytes,
-                status: disk_status_proto(d.status),
+                status: disk_status_proto(self.store.disk_manager().disk_status(d)),
             })
             .collect();
 
