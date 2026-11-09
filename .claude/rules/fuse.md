@@ -100,8 +100,10 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   reopen, one per NFS COMMIT) takes a writable handle's owner, lease_id,
   deadline and snapshot `Arc` (`shared_writer`): no fetch, no
   acquire_write_lease, no post-lease `quiet_fetch`, not cached into the
-  metadata cache; `FetchToken::unchanged` (no commit started/ended since
-  the copy) gates the handle's snapshot (else `None`). The open-time
+  metadata cache; `FetchToken::may_install` (no commit in flight at the
+  copy, none started/ended since; a commit in flight may merge into the
+  lender before the insert) gates the handle's snapshot (else `None`,
+  guarded refetch on first use). The open-time
   O_APPEND tail seed runs only for a sole writer (no reuse, no other
   writable handle of the path) and only if `chunk_needs_seed`: it holds no
   `path_guard`/bg wait, and a stale partial seed of a chunk in an in-flight

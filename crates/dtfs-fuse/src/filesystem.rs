@@ -478,20 +478,9 @@ struct FetchToken<'a> {
     path: String,
     generation: u64,
     quiet_at_start: bool,
-    in_flight_at_start: u32,
 }
 
 impl FetchToken<'_> {
-    /// No commit on the path started or finished since the token was taken
-    /// (in-flight ones allowed: their merge still reaches a handle inserted
-    /// now). Gates a snapshot copied from another open handle.
-    fn unchanged(&self) -> bool {
-        self.tracker
-            .0
-            .get(&self.path)
-            .is_some_and(|e| (e.0, e.1) == (self.in_flight_at_start, self.generation))
-    }
-
     /// True iff no commit on the path was in flight at the fetch's start or
     /// end and none started in between: the result is not older than any
     /// commit applied meanwhile, so it may be installed on the handles.
@@ -540,7 +529,7 @@ impl CommitTracker {
             e.2 += 1;
             *e
         };
-        FetchToken { tracker: self, path: path.to_string(), generation, quiet_at_start: in_flight == 0, in_flight_at_start: in_flight }
+        FetchToken { tracker: self, path: path.to_string(), generation, quiet_at_start: in_flight == 0 }
     }
 
     /// Wait (woken by the last commit's drop, no polling) until no commit on
@@ -1057,7 +1046,7 @@ impl DtfsFilesystem {
         // failure skip the open-time seed; the handle then stays stale (or
         // the fetch below is still current) and write() re-fetches guarded.
         // A reused snapshot is the lease holder's own, kept current by merges.
-        let mut seed_ok = reused.is_none() || fetch.unchanged();
+        let mut seed_ok = reused.is_none() || fetch.may_install();
         if flags.is_writable() && reused.is_none() && !seed_snapshot_usable(false, fetch.may_install()) {
             match self.quiet_fetch(path).await {
                 Ok((l, f)) => {
@@ -1142,9 +1131,10 @@ impl DtfsFilesystem {
         // in its merge loop; one that overlapped the fetch changed the
         // generation, so the snapshot may miss its chunk (lazy refetch).
         // A reused snapshot was not fetched: never cached, stale if a commit
-        // started or merged since it was copied.
+        // was in flight at the copy (it may merge into the lender before
+        // this insert) or started/ended since.
         if reused.is_some() {
-            if !fetch.unchanged() {
+            if !fetch.may_install() {
                 self.invalidate_fh_locations(fh);
             }
         } else {
@@ -6188,6 +6178,21 @@ mod async_commit_fs_tests {
         open2.expect("append reopen must not read the tail chunk").unwrap();
         assert!(!fs.write_buffer.has_chunk("/f", 3), "tail seeded at open");
         drop(data);
+        hole.abort();
+    }
+
+    /// R2-2: a commit in flight while the reopen copies the lender's snapshot
+    /// may merge into the lender before the new fh is inserted (its token
+    /// still alive, so the old `unchanged()` held): the copy must not be kept.
+    #[tokio::test]
+    async fn reopen_during_an_in_flight_commit_keeps_no_snapshot() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, _fh) = leased_writer(&client).await;
+        let commit = fs.commit_tracker.begin("/f");
+        let open2 = tokio::time::timeout(Duration::from_secs(2), fs.open_with_append("/f", OpenFlags::WriteOnly, false)).await;
+        let fh2 = open2.expect("reopen must not issue a manager RPC").unwrap();
+        assert!(fs.open_files.get(&fh2).unwrap().locations.is_none(), "kept a snapshot copied under an in-flight commit");
+        drop(commit);
         hole.abort();
     }
 
