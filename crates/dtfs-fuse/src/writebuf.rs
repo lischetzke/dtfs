@@ -152,6 +152,16 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
+impl InflightGuard<'_> {
+    /// Keep the overlay registered past this guard (a background upload
+    /// registers it before spawning, then `adopt_inflight`s it in the task).
+    pub fn into_id(self) -> u64 {
+        let id = self.id;
+        std::mem::forget(self);
+        id
+    }
+}
+
 /// Internal per-file write buffer: a sparse map from chunk index to the
 /// dirty bytes buffered for that chunk (CR-1-1).
 struct FileWriteBuffer {
@@ -621,6 +631,11 @@ impl WriteBuffer {
             .map(|s| (s.chunk_index as u64 * cs + s.offset_in_chunk as u64, s.data.clone()))
             .collect();
         self.inflight.insert(id, (path.to_string(), parts));
+        InflightGuard { wb: self, id }
+    }
+
+    /// Guard for an overlay registered earlier (`InflightGuard::into_id`).
+    pub fn adopt_inflight(&self, id: u64) -> InflightGuard<'_> {
         InflightGuard { wb: self, id }
     }
 

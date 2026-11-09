@@ -1982,8 +1982,11 @@ impl DtfsFilesystem {
         let hi = segs.iter().map(|s| s.chunk_index).max().unwrap_or(0);
         let bytes = segs.iter().map(|s| s.data.len()).sum();
         self.bg_uploads.insert(path.clone(), (lo, hi, bytes));
+        // Overlay registered before the spawn: the batch is visible (reads,
+        // the next write's EOF) the moment write() returns.
+        let inflight = self.write_buffer.begin_inflight(&path, &segs).into_id();
         let this = Arc::clone(self);
-        tokio::spawn(async move { this.bg_upload(fh, path, segs).await });
+        tokio::spawn(async move { this.bg_upload(fh, path, segs, inflight).await });
     }
 
     /// The background half of write()'s batch flush. Holds no `path_guard`
@@ -1992,9 +1995,9 @@ impl DtfsFilesystem {
     /// truncate, rename and unlink wait in `wait_bg_uploads`), so the
     /// restore cannot clobber newer bytes. The overlay stays until the
     /// restore/merge is done; `bg_uploads` is cleared after that.
-    async fn bg_upload(&self, fh: u64, path: String, segs: Vec<crate::writebuf::ChunkSegment>) {
+    async fn bg_upload(&self, fh: u64, path: String, segs: Vec<crate::writebuf::ChunkSegment>, inflight: u64) {
         let _slot = BgSlot { fs: self, path: path.clone() };
-        let _inflight = self.write_buffer.begin_inflight(&path, &segs);
+        let _inflight = self.write_buffer.adopt_inflight(inflight);
         let res = match self.renew_if_due(fh, &path).await {
             Ok(()) => self.flush_segments_to_cluster(&path, &segs).await,
             Err(e) => Err(e),
@@ -5972,6 +5975,23 @@ mod async_commit_fs_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(fs.bg_uploads.contains_key("/f"), "batch uploads in the background");
         (fs, fh, cs)
+    }
+
+    /// The handed-off batch is visible the moment write() returns, before the
+    /// upload task ever runs: else the next write's EOF (`write_eof` =
+    /// visible size) is too low and its hole fill pads zeros into chunks
+    /// that are still uploading (and a reader sees the file short).
+    #[tokio::test]
+    async fn async_batch_is_visible_before_the_upload_task_runs() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, fh, cs) = writer_fs(&client, true, 0, 0, 0);
+        assert_eq!(fs.write(fh, 0, &vec![3; 4 * cs as usize]).await.unwrap(), 4 * cs as u32);
+        // No await since write() returned: the spawned task has not run.
+        assert!(fs.bg_uploads.contains_key("/f"), "batch handed off");
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 0, "batch drained");
+        assert_eq!(fs.write_buffer.visible_size("/f"), Some(4 * cs), "drained batch invisible");
+        assert_eq!(overlay_len(&fs, 0, 4 * cs as usize), 4 * cs as usize);
+        hole.abort();
     }
 
     /// `op` must still be pending after 300 ms (it waits for the upload).
