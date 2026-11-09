@@ -1815,7 +1815,7 @@ impl DtfsFilesystem {
                     self.renew_if_due(fh, &path).await?;
                     let (segs, _inflight) = self.cap_drain(&path, at, n);
                     if !segs.is_empty() {
-                        let committed = match self.flush_segments_to_cluster(&path, &segs).await {
+                        let committed = match self.flush_segments_to_cluster(fh, &path, &segs).await {
                             Ok(c) => c,
                             Err(e) => {
                                 self.write_buffer.restore_segments(&path, &segs);
@@ -1841,7 +1841,7 @@ impl DtfsFilesystem {
             self.renew_if_due(fh, &path).await?;
             let (segs, _inflight) = self.cap_drain(&path, effective_offset, data.len());
             if !segs.is_empty() {
-                let committed = match self.flush_segments_to_cluster(&path, &segs).await {
+                let committed = match self.flush_segments_to_cluster(fh, &path, &segs).await {
                     Ok(c) => c,
                     Err(e) => {
                         self.write_buffer.restore_segments(&path, &segs);
@@ -1876,7 +1876,7 @@ impl DtfsFilesystem {
                 self.write_buffer.restore_segments(&path, &segments);
                 return Err(e);
             }
-            let committed = match self.flush_segments_to_cluster(&path, &segments).await {
+            let committed = match self.flush_segments_to_cluster(fh, &path, &segments).await {
                 Ok(c) => c,
                 Err(e) => {
                     // CO-1-8 (a): `flush` already drained these complete chunks out
@@ -2054,7 +2054,12 @@ impl DtfsFilesystem {
         let _slot = BgSlot { fs: self, path: path.clone() };
         let _inflight = self.write_buffer.adopt_inflight(inflight);
         let res = match self.renew_if_due(fh, &path).await {
-            Ok(()) => self.flush_segments_to_cluster(&path, &segs).await,
+            // The fh's current path: a detached fh's commit must fail, never
+            // land in a file re-created at `path`.
+            Ok(()) => {
+                let cur = self.open_files.get(&fh).map(|f| f.path.clone()).unwrap_or_else(|| path.clone());
+                self.flush_segments_to_cluster(fh, &cur, &segs).await
+            }
             Err(e) => Err(e),
         };
         match res {
@@ -2252,7 +2257,7 @@ impl DtfsFilesystem {
         let had_segments = !segments.is_empty();
         let mut committed = None;
         if had_segments {
-            match self.flush_segments_to_cluster(&path, &segments).await {
+            match self.flush_segments_to_cluster(fh, &path, &segments).await {
                 Ok(c) => committed = Some(c),
                 Err(e) => {
                 // CR-1-4 (FUSE-3): ALWAYS restore the drained segments on a
@@ -2595,6 +2600,15 @@ impl DtfsFilesystem {
     /// Delete a file from the DTFS namespace.
     #[instrument(skip(self), fields(path = %path))]
     pub async fn unlink(&self, path: &str) -> Result<()> {
+        // Held across the bg wait, delete and detach: no write on a still
+        // attached fh can start a new batch meanwhile (as in truncate).
+        let guard = self.path_guard(path).await;
+        let res = self.unlink_inner(path).await;
+        self.drop_path_guard(path, guard);
+        res
+    }
+
+    async fn unlink_inner(&self, path: &str) -> Result<()> {
         // A background batch commits by path: let it land in the old file
         // before the name can be deleted and re-created.
         self.wait_bg_uploads(path).await;
@@ -3217,6 +3231,7 @@ impl DtfsFilesystem {
     /// was lease-less) plus the commit's tracker slot, held until the merge.
     async fn flush_segments_to_cluster(
         &self,
+        fh: u64,
         path: &str,
         segments: &[crate::writebuf::ChunkSegment],
     ) -> Result<Committed<'_>> {
@@ -3478,9 +3493,7 @@ impl DtfsFilesystem {
         // verify it before applying the commit. If no open file handle
         // has a lease (system flow, e.g. read-only path), an empty
         // string preserves the legacy no-verification behaviour.
-        let lease_id = self
-            .find_lease_id_for_path(path)
-            .unwrap_or_default();
+        let lease_id = self.commit_lease_id(fh, path);
 
         // Dropped on the `?` below, so a failed commit ends its slot too.
         let token = self.commit_tracker.begin(path);
@@ -3684,6 +3697,16 @@ impl DtfsFilesystem {
             }
         }
         None
+    }
+
+    /// Lease a commit by `fh` of `path` sends.
+    /// The committing fh's own lease (a path lookup could pick a writer of a
+    /// file re-created at the path); a closed fh falls back to the path.
+    fn commit_lease_id(&self, fh: u64, path: &str) -> String {
+        match self.open_files.get(&fh) {
+            Some(f) => f.lease_id.clone().unwrap_or_default(),
+            None => self.find_lease_id_for_path(path).unwrap_or_default(),
+        }
     }
 
     /// Bug P — find the current write-lease id for an open file handle
@@ -5912,6 +5935,36 @@ mod async_commit_fs_tests {
         assert!(fs.open_files.get(&rfh).unwrap().write_error.is_none());
         assert_eq!(fs.write_buffer.dirty_bytes(&det), 10);
         assert_eq!(fs.write_buffer.dirty_bytes("/r"), 6);
+    }
+
+    /// R2-3: unlink holds `path_guard` across the bg wait, delete and
+    /// detach, so a write cannot start a new batch meanwhile: with the guard
+    /// held elsewhere it must wait (then fails: no managers).
+    #[tokio::test]
+    async fn async_unlink_waits_for_the_path_guard() {
+        let fs = fs(true);
+        open(&fs, "/f", OpenFlags::ReadWrite);
+        let g = fs.path_guard("/f").await;
+        assert!(pending(fs.unlink("/f")).await, "unlink ran without the path guard");
+        fs.drop_path_guard("/f", g);
+        assert!(fs.unlink("/f").await.is_err(), "no managers");
+    }
+
+    /// R2-3: a commit sends the committing fh's own lease, not the first
+    /// lease found at the path (a writer of a file re-created there).
+    #[test]
+    fn commit_uses_the_committing_handles_lease() {
+        let fs = fs(true);
+        let det = detached_handle_path("/f", "/f", 1).unwrap();
+        let old = open(&fs, &det, OpenFlags::ReadWrite);
+        let new = open(&fs, "/f", OpenFlags::ReadWrite);
+        set_lease(&fs, old, "h:1", "LA");
+        set_lease(&fs, new, "h:2", "LB");
+        assert_eq!(fs.commit_lease_id(old, "/f"), "LA", "took the re-created file's lease");
+        assert_eq!(fs.commit_lease_id(new, "/f"), "LB");
+        let reader = open(&fs, "/f", OpenFlags::ReadOnly);
+        assert_eq!(fs.commit_lease_id(reader, "/f"), "", "a handle without a lease sends none");
+        assert_eq!(fs.commit_lease_id(999, "/f"), "LB", "closed fh: path lookup (legacy)");
     }
 
     /// A held `path_guard` stands for the timer's in-flight commit: rename

@@ -151,7 +151,10 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   `write.upload_concurrency` (default 2, clamp 1..=16) at a time
   (`upload_segments`, ordered `buffered`, lowest-index error wins, nothing
   starts after it) and sends ONE `commit_chunk_locations` only after all
-  segments reached quorum. Do not unbound it: puts share a fixed 60 s
+  segments reached quorum; that commit carries the committing fh's own
+  lease (`commit_lease_id`; path lookup only for a closed fh), and
+  `bg_upload` commits under the fh's current path (a detached fh fails,
+  never lands in a file re-created at the old path). Do not unbound it: puts share a fixed 60 s
   deadline and each buffers ~3 MiB per target (put channel depth 2).
 - Every drain that goes to `flush_segments_to_cluster` (write flush, cap
   drains, `commit_all`) holds `WriteBuffer::begin_inflight` (`Bytes`
@@ -192,7 +195,8 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   old, through `commit_all` with a writable non-detached fh. The cap drain
   then also drains partial chunks outside `keep`. The timer is
   not serialised by the kernel like write/fsync/setattr, so write(), a
-  writer's truncate, flush, release and the timer hold `path_guard` (per-path
+  writer's truncate, unlink (across the bg wait, delete and detach: no new
+  batch can start meanwhile), flush, release and the timer hold `path_guard` (per-path
   tokio mutex, async mode only, one guard at a time; write/flush/release
   take it via `fh_path_guard`, which re-reads the fh's path after acquiring
   and retries if a rename re-keyed it). Only `rename` holds
