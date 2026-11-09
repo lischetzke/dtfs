@@ -39,12 +39,6 @@ pub(super) async fn harness() -> Harness {
         .unwrap(),
     );
     let audit_log = Arc::new(AuditLog::new(1000));
-    let join = Arc::new(JoinHandler::new(
-        String::new(),
-        config.cluster.name.clone(),
-        raft.clone(),
-        audit_log.clone(),
-    ));
     let scheduler = Arc::new(TaskScheduler::new(
         raft.clone(),
         sm_data.clone(),
@@ -59,7 +53,6 @@ pub(super) async fn harness() -> Harness {
         raft,
         sm_data,
         audit_log,
-        join,
         scheduler,
         io_rate: Arc::new(parking_lot::RwLock::new(IoRateTracker::default())),
         memory: None,

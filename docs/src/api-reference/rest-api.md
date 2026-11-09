@@ -11,7 +11,6 @@ Base URL: `http://<manager-host>:9402`. All versioned routes are under `/api/v1`
 | Request | Requirement |
 |---|---|
 | `GET`, `HEAD`, `OPTIONS`, `/healthz`, `/readyz`, `/metrics` | None. Do not expose the API port to untrusted networks. |
-| `POST /api/v1/join/request`, `POST /api/v1/join/complete` | None at the HTTP layer; protected by the HMAC join handshake ([Cluster Join](../security/cluster-join.md)). |
 | Every other `POST` (all mutations) | When `[cluster].shared_secret` is non-empty: header `X-Dtfs-Shared-Secret: <secret>` or `Authorization: Bearer <secret>`. With an empty secret (lab only) no header is needed. |
 
 Failures: `401` `{"error": "shared_secret required (X-Dtfs-Shared-Secret or Authorization: Bearer)"}` when missing, `403` `{"error": "shared_secret mismatch"}` when wrong. Denials are audited as `auth.denied`.
@@ -89,8 +88,6 @@ Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserve
 | GET | `/api/v1/config` | no | any | Stored override |
 | POST | `/api/v1/config` | yes | leader (503) | Store override |
 | GET | `/api/v1/config/effective` | no | any | Flattened effective config |
-| POST | `/api/v1/join/request` | HMAC | any | Join step 1 |
-| POST | `/api/v1/join/complete` | HMAC | any | Join step 2 |
 
 `GET /api/v1/migrations` reads the scheduler's in-memory task table, which only the leader populates. Each task's `source_node` and `target_node` are decimal strings (u64 ids exceed JS's safe integer range).
 
@@ -365,7 +362,4 @@ Body `{"config_json": "<JSON string>", "write_to_disk": false, "acknowledge_clus
 
 ## Join
 
-Used by `dtfs-data` during the HMAC handshake; see [Cluster Join](../security/cluster-join.md).
-
-- `POST /api/v1/join/request` body `{"nonce", "hmac_hex", "hostname"}`, response `{"accepted", "challenge", "ca_cert_pem", "rejection_reason"}`. `400` on malformed hex. Rejected (bad HMAC) requests are audited at most once per hostname per 60 s.
-- `POST /api/v1/join/complete` body `{"challenge", "completion_hmac_hex", "hostname", "grpc_addr", "region", "datacenter", "rack", "host", "disks": [{"disk_id", "uuid", "mount_path", "tier", "total_bytes", "used_bytes", "status"}]}`, response `{"success", "config_version", "config_json"}`. `400` on malformed hex, `500` on handshake failure.
+There is no REST join. Data nodes and clients register over gRPC `RegisterNode`; see [Cluster Join](../security/cluster-join.md).

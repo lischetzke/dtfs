@@ -755,7 +755,10 @@ live replica -> `data_loss`, removed only with `accept_data_loss` via
 chunk that still has a live copy; one `chunk.dead_node_replica_removed`
 audit row per chunk). `DeregisterNode` runs once zero rows remain.
 
-### `dtfs-manager/src/join.rs`
+### `dtfs-manager/src/join.rs` (removed 2026-11, audit #12)
+
+Deleted with its unauthenticated `/api/v1/join/*` routes: nothing called
+them; nodes join via gRPC `RegisterNode`. History below.
 
 Two-phase data-node join (HMAC handshake; `/api/v1/join/{request,
 complete}` in api.rs). Phase-1 `handle_join_request` verifies HMAC(secret,

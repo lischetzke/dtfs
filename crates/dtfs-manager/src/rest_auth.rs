@@ -11,7 +11,6 @@
 //!
 //! Exempt (own auth or non-mutating):
 //! - GET / HEAD / OPTIONS
-//! - `/api/v1/join/*` (HMAC challenge already proves the secret)
 //! - `/healthz`, `/readyz`, `/metrics` (probes / scrapers)
 
 use axum::{
@@ -154,9 +153,6 @@ pub fn mutation_auth_exempt(method: &Method, path: &str) -> bool {
     if path == "/healthz" || path == "/readyz" || path == "/metrics" {
         return true;
     }
-    if path.starts_with("/api/v1/join/") {
-        return true;
-    }
     false
 }
 
@@ -294,9 +290,10 @@ mod tests {
     }
 
     #[test]
-    fn exempt_gets_and_join() {
+    fn exempt_gets_and_probes_not_join() {
         assert!(mutation_auth_exempt(&Method::GET, "/api/v1/scrub"));
-        assert!(mutation_auth_exempt(&Method::POST, "/api/v1/join/request"));
+        // Audit #12 — the REST join was removed; no exemption remains.
+        assert!(!mutation_auth_exempt(&Method::POST, "/api/v1/join/request"));
         assert!(mutation_auth_exempt(&Method::POST, "/healthz"));
         assert!(!mutation_auth_exempt(&Method::POST, "/api/v1/scrub"));
         assert!(!mutation_auth_exempt(

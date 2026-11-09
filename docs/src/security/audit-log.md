@@ -18,7 +18,7 @@ Each audit log entry contains five fields:
 |-------|------|-------------|
 | `timestamp` | Unix epoch (seconds) | When the event occurred (UTC) |
 | `actor` | String | Who initiated the action: a username, node hostname, or `"system"` for automated operations |
-| `action` | String | Dot-delimited action type (e.g., `node.join.request`, `config.update`) |
+| `action` | String | Dot-delimited action type (e.g., `maintenance.toggle`, `config.update`) |
 | `target` | String | What was acted upon: a node ID, file path, configuration key, etc. |
 | `result` | String | Outcome: `"success"`, `"accepted"`, or an error description |
 
@@ -27,10 +27,10 @@ Each audit log entry contains five fields:
 ```json
 {
   "timestamp": 1710842400,
-  "actor": "data-node-03.example.com",
-  "action": "node.join.request",
-  "target": "data-node-03.example.com",
-  "result": "accepted"
+  "actor": "api",
+  "action": "maintenance.toggle",
+  "target": "node=12345",
+  "result": "enabled"
 }
 ```
 
@@ -40,8 +40,6 @@ The following action types are recorded:
 
 | Action | Trigger |
 |--------|---------|
-| `node.join.request` | A node attempts to join the cluster (Phase 1) |
-| `node.join.complete` | A node completes the join handshake (Phase 2) |
 | `maintenance.toggle` | Maintenance mode enabled or disabled on a node |
 | `config.update` | Cluster configuration updated via REST API |
 | `scrub.trigger.quick` | Quick scrub triggered via API |

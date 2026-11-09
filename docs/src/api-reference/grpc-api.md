@@ -9,7 +9,7 @@ All inter-component traffic uses gRPC with Protocol Buffers. Definitions: `proto
 | `dtfs.manager.ManagerService` | `manager.proto` | manager | `[grpc].listen_addr` (9401) | in use |
 | `dtfs.manager.RaftTransport` | not a proto service | manager | same port as ManagerService | in use, see [Raft transport](#raft-transport) |
 | `dtfs.data.DataService` | `data.proto` | data node | `[grpc].listen_addr` (9500) | in use |
-| `dtfs.cluster.ClusterJoin` | `cluster.proto` | none | n/a | defined and compiled, **no server implements it**. The join handshake runs over REST (`/api/v1/join/*`). |
+| `dtfs.cluster.ClusterJoin` | `cluster.proto` | none | n/a | defined and compiled, **no server implements it**. Nodes join via `ManagerService.RegisterNode` ([Cluster Join](../security/cluster-join.md)). |
 | `dtfs.admin.AdminService` | `admin.proto` | none | n/a | defined and compiled, **no server implements it**. Admin operations use the [REST API](./rest-api.md). |
 
 `common.proto` holds shared messages (`Location`, `DiskInfo`, `NodeInfo`). With `[tls]` enabled all connections use mutual TLS ([TLS](../security/tls.md)). Message size caps come from `[grpc].max_message_size_mb` (servers) and `[client].max_message_size_mb` (FUSE).
@@ -143,7 +143,7 @@ Notes:
 
 ## ClusterJoin (`cluster.proto`)
 
-Defined, not served. `JoinRequest` (`secret_hmac`, `nonce`, `node_info`), `JoinResponse` (`accepted`, `challenge`, `cluster_ca_cert`, `managers`, `rejection_reason`), `JoinCompletionRequest` (`node_id`, `challenge_response`), `JoinCompletionResponse` (`success`, `config_version`, `config_json`). The live handshake is [`POST /api/v1/join/request` and `/complete`](./rest-api.md#join).
+Defined, not served. `JoinRequest` (`secret_hmac`, `nonce`, `node_info`), `JoinResponse` (`accepted`, `challenge`, `cluster_ca_cert`, `managers`, `rejection_reason`), `JoinCompletionRequest` (`node_id`, `challenge_response`), `JoinCompletionResponse` (`success`, `config_version`, `config_json`). Nodes join via `ManagerService.RegisterNode` ([Cluster Join](../security/cluster-join.md)).
 
 ## AdminService (`admin.proto`)
 

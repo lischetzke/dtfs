@@ -271,10 +271,6 @@ pub(super) async fn health_check() -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(json!({"status": "healthy"})))
 }
 
-// ---------------------------------------------------------------------------
-// Join (HMAC handshake — `join::JoinHandler`)
-// ---------------------------------------------------------------------------
-
 /// Bug AL — pure helper accepting an explicit `now_ms` so the rate logic
 /// is unit-testable without mocking `SystemTime::now()`. See
 /// `compute_io_rate` for the production wrapper.

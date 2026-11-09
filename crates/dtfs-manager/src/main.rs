@@ -16,7 +16,6 @@ mod audit;
 #[allow(dead_code)]
 mod cluster;
 mod goal_check;
-mod join;
 mod membership;
 mod metadata;
 mod monitor;
@@ -405,12 +404,6 @@ async fn main() -> anyhow::Result<()> {
     // its only responsibility. Raft writes are performed by HealthMonitor.
     let cluster_mgr = Arc::new(ClusterManager::new());
     let placement_engine = Arc::new(PlacementEngine::new(config.placement.clone()));
-    let join_handler = Arc::new(join::JoinHandler::new(
-        config.cluster.shared_secret.clone(),
-        config.cluster.name.clone(),
-        raft.clone(),
-        audit_log.clone(),
-    ));
 
     // CF-5 — per-process memory budget + RSS sampler. When the operator
     // sets [memory] hard_cap_mb > 0 the sampler watches RSS and publishes a
@@ -564,7 +557,6 @@ async fn main() -> anyhow::Result<()> {
         raft.clone(),
         sm_data.clone(),
         audit_log.clone(),
-        join_handler.clone(),
         task_scheduler.clone(),
         Some(memory_budget.clone()),
         async move { api_shutdown.wait_for_shutdown().await },

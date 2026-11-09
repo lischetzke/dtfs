@@ -17,7 +17,7 @@ Manager nodes form a Raft group. An odd number (3, 5, or 7) is recommended for f
 Raft membership lives in the raft log. `[[cluster.initial_voters]]` is
 consulted **once**, at bootstrap (`bootstrap = true` →
 `raft.initialize()`); after that, growing or shrinking the live cluster
-goes through the membership API / CLI below. The HMAC join protocol
+goes through the membership API / CLI below. The `RegisterNode` join
 ([Cluster Join Protocol](../security/cluster-join.md)) registers **data
 nodes and clients** in the node registry; it does not change Raft
 membership.

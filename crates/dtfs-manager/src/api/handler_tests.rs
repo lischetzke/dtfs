@@ -118,25 +118,6 @@ fn merge_onto_stored_override_keeps_earlier_keys() {
     assert_eq!(merge_onto_stored_override("", r#"{"a":1}"#), r#"{"a":1}"#);
 }
 
-#[tokio::test]
-async fn join_request_rejections_are_audit_coalesced() {
-    let h = harness().await;
-    let j = crate::join::JoinHandler::new(
-        "real-secret".into(),
-        "c".into(),
-        h.state.raft.clone(),
-        h.state.audit_log.clone(),
-    );
-    let before = h.state.audit_log.len();
-    for _ in 0..5 {
-        let r = j.handle_join_request("n", &[0u8; 32], "coalesce-test-host");
-        assert!(!r.accepted);
-    }
-    assert_eq!(h.state.audit_log.len() - before, 1, "5 identical rejections -> 1 audit row");
-    j.handle_join_request("n", &[0u8; 32], "other-test-host");
-    assert_eq!(h.state.audit_log.len() - before, 2, "distinct key still audited");
-}
-
 // ---- Tasks 2, 4, 7: files endpoints ------------------------------------------
 
 fn file(path: &str) -> dtfs_raft::state_machine::FileMetadata {
@@ -607,7 +588,6 @@ async fn orphan_reap_without_the_shared_secret_is_401() {
         raft: h.state.raft.clone(),
         sm_data: h.state.sm_data.clone(),
         audit_log: h.state.audit_log.clone(),
-        join: h.state.join.clone(),
         scheduler: h.state.scheduler.clone(),
         io_rate: h.state.io_rate.clone(),
         memory: None,

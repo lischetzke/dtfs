@@ -35,7 +35,6 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::audit::AuditLog;
-use crate::join::JoinHandler;
 use crate::scheduler::TaskScheduler;
 use crate::webui;
 
@@ -65,7 +64,6 @@ pub struct AppState {
     pub raft: Arc<DtfsRaft>,
     pub sm_data: Arc<RwLock<StateMachineData>>,
     pub audit_log: Arc<AuditLog>,
-    pub join: Arc<JoinHandler>,
     /// Scheduler used to enqueue manual path-prefix tier/DC migrations
     /// triggered from the WebUI / CLI (`POST /api/v1/migrations`).
     pub scheduler: Arc<TaskScheduler>,
@@ -225,11 +223,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/chunks", get(list_chunks))
         .route("/api/v1/chunks/{chunk_id}", get(get_chunk))
         .route("/api/v1/memory", get(get_memory))
-        // HMAC join (phase 1: challenge, phase 2: Raft register)
-        .route("/api/v1/join/request", post(join_request_api))
-        .route("/api/v1/join/complete", post(join_complete_api))
         // LIS-18 — shared-secret gate on mutating REST (fail closed when
-        // `[cluster].shared_secret` is set). Join HMAC + GET probes exempt.
+        // `[cluster].shared_secret` is set). GET + probes exempt.
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::rest_auth::require_mutation_auth,
@@ -246,7 +241,6 @@ pub async fn run_api_server(
     raft: Arc<DtfsRaft>,
     sm_data: Arc<RwLock<StateMachineData>>,
     audit_log: Arc<AuditLog>,
-    join: Arc<JoinHandler>,
     scheduler: Arc<TaskScheduler>,
     memory: Option<Arc<dtfs_common::memory::MemoryBudget>>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -256,7 +250,6 @@ pub async fn run_api_server(
         raft,
         sm_data,
         audit_log,
-        join,
         scheduler,
         // Bug AL — process-local rolling rate; starts empty so the very
         // first /api/v1/stats hit returns (0, 0) then subsequent calls

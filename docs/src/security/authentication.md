@@ -25,12 +25,9 @@ Read-only `GET` endpoints stay open so operator dashboards on a
 trusted network can poll status without embedding the secret in the
 browser. **This does not replace TLS** (R5 / CF-6).
 
-Exempt from the header gate (own proof of the secret):
-
-- `POST /api/v1/join/request` and `/api/v1/join/complete` (HMAC)
-- CF-2 raft membership endpoints still also require `shared_secret` in
-  the JSON body (defense in depth) **and** the header when the secret
-  is configured
+No mutating endpoint is exempt from the header gate. CF-2 raft
+membership endpoints additionally require `shared_secret` in the JSON
+body (defense in depth).
 
 When `shared_secret` is **empty**, mutations stay open (legacy plaintext
 / lab downgrade — same contract as `RegisterNode`). Production clusters
@@ -169,7 +166,7 @@ with the rate-limited warning, even if it carries a stamp).
 ## Node join / register
 
 Data nodes and FUSE clients prove the secret via gRPC `RegisterNode`
-(`shared_secret` field) or the HMAC join handshake; see
+(`shared_secret` field); see
 [cluster-join.md](./cluster-join.md).
 
 ## Secret handling

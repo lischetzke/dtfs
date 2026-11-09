@@ -168,8 +168,8 @@ No manual intervention. Verify with `curl http://mgr01:9402/api/v1/health`.
 ### Case B — managers AND data nodes went dark
 
 1. Power on the manager hosts first. Wait for quorum (Case A step 3).
-2. Power on the data nodes. Each one re-registers via the join protocol
-   (`join.rs::complete_join` → `RegisterNode` Raft write) and starts
+2. Power on the data nodes. Each one re-registers via gRPC
+   `RegisterNode` (→ `RegisterNode` Raft write) and starts
    sending heartbeats. The manager marks them `Healthy` after the
    first successful heartbeat.
 3. Power on FUSE clients last. The mount unit runs
