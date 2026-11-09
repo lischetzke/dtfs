@@ -2245,6 +2245,11 @@ impl DtfsFilesystem {
         if let Some(committed) = committed {
             self.mark_committed_and_refresh(&path, fh, committed).await;
         }
+        // Everything buffered (incl. a failed batch's restored bytes) is
+        // committed now: a pending background error is stale.
+        if self.config.write.async_commit {
+            self.record_aged_commit(&path, Ok(()));
+        }
 
         debug!(path = %path, "flush complete");
         Ok(())
@@ -5779,6 +5784,23 @@ mod async_commit_fs_tests {
         assert_eq!(format!("{err:#}"), "bg failed");
     }
 
+    /// FUSE-4: a transient background failure armed the sticky error; the
+    /// last writer's close then commits everything (here: nothing left) and
+    /// must return Ok, not the stale EIO. A reader's close commits nothing
+    /// and must not clear the writer's error.
+    #[tokio::test]
+    async fn async_last_writer_close_after_transient_bg_failure_is_ok() {
+        let fs = fs(true);
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let r = open(&fs, "/f", OpenFlags::ReadOnly);
+        fs.record_aged_commit("/f", Err(anyhow::anyhow!("put failed")));
+        fs.flush(r).await.expect("reader close");
+        assert!(fs.open_files.get(&fh).unwrap().write_error.is_some(), "reader close cleared it");
+        fs.flush(fh).await.expect("commit_all succeeded: the stale error must not fail close");
+        fs.record_aged_commit("/f", Err(anyhow::anyhow!("put failed")));
+        fs.release(fh).await.expect("release: same");
+    }
+
     #[tokio::test]
     async fn sync_close_of_a_second_writer_still_commits() {
         let fs = fs(false);
@@ -6307,7 +6329,8 @@ mod async_commit_fs_tests {
             if buffered {
                 fs.write_buffer.write("/g", 0, b"new");
             }
-            assert!(fs.release(fh).await.is_err(), "pending error or failed commit is reported");
+            // A pending error the successful commit superseded is cleared (FUSE-4).
+            assert_eq!(fs.release(fh).await.is_err(), buffered, "only the failed commit is reported");
             let out = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
             assert_eq!(out.contains(ghost), expect_unlink, "buffered={buffered}: {out}");
         }
