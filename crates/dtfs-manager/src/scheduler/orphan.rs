@@ -709,6 +709,26 @@ pub(crate) trait DelocateOps {
     /// Issue the data-plane `DeleteChunkReplica` byte-delete RPC. Only ever
     /// called AFTER `remove_location` succeeded.
     async fn delete_bytes(&self) -> anyhow::Result<()>;
+    /// Chunks are content-addressed: after the remove, does any file still
+    /// hold a row for this hash on the same (node, disk)? Then the bytes are
+    /// shared and must stay.
+    async fn bytes_still_referenced(&self) -> bool {
+        false
+    }
+}
+
+/// Does any file still record `chunk_hash` on `(node_id, disk_id)`? The
+/// legacy node-wide sentinel disk id matches any disk of the node.
+pub(crate) fn chunk_bytes_referenced_on_disk(
+    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
+    chunk_hash: &str,
+    node_id: &str,
+    disk_id: u32,
+) -> bool {
+    let any_disk = disk_id == dtfs_raft::legacy_disk_id();
+    files.values().flat_map(|fm| fm.chunks.iter()).any(|c| {
+        c.chunk_hash == chunk_hash && c.node_id == node_id && (any_disk || c.disk_id == disk_id)
+    })
 }
 
 /// CO-1-3 — the outcome of `delocate_replica`, distinguishing the failure
@@ -742,6 +762,11 @@ pub(crate) async fn delocate_replica<O: DelocateOps>(ops: &O) -> DelocateOutcome
         // untouched (still live in the SM + on disk).
         return DelocateOutcome::RemoveFailed;
     }
+    // Another file (or chunk index) still points at these bytes: keep them;
+    // the orphan reaper reclaims them once nothing references the hash.
+    if ops.bytes_still_referenced().await {
+        return DelocateOutcome::Done;
+    }
     // SM entry is gone. A byte-delete failure now only leaves de-located
     // bytes for the CO-3-2 reaper; never roll back the committed remove.
     if ops.delete_bytes().await.is_err() {
@@ -772,6 +797,23 @@ impl DelocateOps for SchedulerDelocate<'_> {
             .raft_write_checked(self.remove_req.clone())
             .await
             .map_err(|e| anyhow::anyhow!("RemoveChunkLocation Raft write: {}", e))
+    }
+
+    async fn bytes_still_referenced(&self) -> bool {
+        let ClientRequest::RemoveChunkLocation { node_id, .. } = &self.remove_req else {
+            return false;
+        };
+        let sm = self.sched.state_data.read().await;
+        let shared = chunk_bytes_referenced_on_disk(&sm.files, &self.chunk_id, node_id, self.disk_id);
+        if shared {
+            info!(
+                chunk_id = %self.chunk_id,
+                node_id = %node_id,
+                disk_id = self.disk_id,
+                "row removed, bytes kept: another file still references this chunk on the disk"
+            );
+        }
+        shared
     }
 
     async fn delete_bytes(&self) -> anyhow::Result<()> {
@@ -1234,6 +1276,51 @@ mod sched_audit_orphan_tests {
         let ok = Ops { remove: client_response_ok(&dtfs_raft::ClientResponse::Success), deleted: AtomicBool::new(false) };
         assert_eq!(delocate_replica(&ok).await, DelocateOutcome::Done);
         assert!(ok.deleted.load(Ordering::SeqCst));
+    }
+
+    struct SharedOps {
+        referenced: bool,
+        deleted: AtomicBool,
+    }
+    impl DelocateOps for SharedOps {
+        async fn remove_location(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_bytes(&self) -> anyhow::Result<()> {
+            self.deleted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn bytes_still_referenced(&self) -> bool {
+            self.referenced
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_bytes_survive_delocating_one_file() {
+        // /f and /b share hash "h" on node 10 disk 0; flushing /f's row must
+        // keep the bytes /b still reads.
+        let mut fs = files(vec![row(0, "h", "10", 0)]);
+        let mut b = fs["/f"].clone();
+        b.path = "/b".into();
+        fs.insert("/b".into(), b);
+        fs.get_mut("/f").unwrap().chunks.clear(); // /f's row removed by Raft
+        let referenced = chunk_bytes_referenced_on_disk(&fs, "h", "10", 0);
+        assert!(referenced, "/b still holds h on (10, 0)");
+        let ops = SharedOps { referenced, deleted: AtomicBool::new(false) };
+        assert_eq!(delocate_replica(&ops).await, DelocateOutcome::Done);
+        assert!(!ops.deleted.load(Ordering::SeqCst), "shared bytes deleted");
+    }
+
+    #[tokio::test]
+    async fn unshared_bytes_are_deleted_after_remove() {
+        let fs = files(vec![row(0, "h", "10", 1), row(1, "h", "11", 0), row(2, "x", "10", 0)]);
+        // Same hash on another disk / another node, other hash on this disk.
+        assert!(!chunk_bytes_referenced_on_disk(&fs, "h", "10", 0));
+        // Legacy node-wide removal: any disk of the node counts.
+        assert!(chunk_bytes_referenced_on_disk(&fs, "h", "10", dtfs_raft::legacy_disk_id()));
+        let ops = SharedOps { referenced: false, deleted: AtomicBool::new(false) };
+        assert_eq!(delocate_replica(&ops).await, DelocateOutcome::Done);
+        assert!(ops.deleted.load(Ordering::SeqCst));
     }
 
     // ---- task 3a ----
