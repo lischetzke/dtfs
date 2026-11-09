@@ -216,21 +216,22 @@ if [ -z "$TARBALL" ]; then
         return 1
     }
     # Header for the optional GitHub token (mirrors updater.rs::token_header).
-    repo_auth_args() {
+    # printf is a builtin, so the token never lands in any process's argv.
+    repo_auth_header() {
         [ -n "$REPO_TOKEN" ] || return 0
-        printf -- '-H
-Authorization: Bearer %s
-' "$REPO_TOKEN"
+        printf 'Authorization: Bearer %s\n' "$REPO_TOKEN"
     }
     # fetch_hops URL OUT: https only; redirects followed by hand so the token
     # header goes to the first hop only (mirrors updater.rs::curl_download).
+    # curl reads the header from stdin (-H @-): argv is world-readable.
     fetch_hops() {
         local url="$1" out="$2" hop next
         local -a auth=()
-        mapfile -t auth < <(repo_auth_args)
+        [ -z "$REPO_TOKEN" ] || auth=(-H @-)
         for hop in 0 1 2 3 4 5; do
             [ "$hop" -eq 0 ] || auth=()
-            next="$(curl -fsS --proto '=https' --tlsv1.2 "${auth[@]}" -w '%{redirect_url}' -o "$out" "$url")" \
+            next="$(curl -fsS --proto '=https' --tlsv1.2 "${auth[@]}" -w '%{redirect_url}' -o "$out" "$url" \
+                < <([ "$hop" -eq 0 ] && repo_auth_header))" \
                 || { error "AZ-2: download failed: $url"; return 1; }
             [ -n "$next" ] || return 0
             url="$next"
@@ -357,6 +358,16 @@ ask() {
     fi
     printf -v "$1" '%s' "$v"
 }
+# ask_secret VAR TITLE PROMPT: like ask, but the current value is never put
+# in whiptail's argv (world-readable via /proc/<pid>/cmdline); a blank
+# answer keeps it.
+ask_secret() {
+    local v=""
+    [ "$NONINT" -eq 1 ] && return 0
+    v=$(whiptail --passwordbox "$3 (blank keeps the existing or generated one)" 10 70 "" \
+        --title "$2" 3>&1 1>&2 2>&3) || exit 1
+    [ -z "$v" ] || printf -v "$1" '%s' "$v"
+}
 
 # Secret: existing config first (a re-run must not rotate it), else a fresh
 # random one. No secure RNG means no install: a guessable secret is worse.
@@ -435,7 +446,7 @@ if [ "$KEEP_CFG" -eq 0 ]; then
     [ -n "$SHARED_SECRET" ] || SHARED_SECRET="$(existing_secret)"
     [ -n "$SHARED_SECRET" ] || SHARED_SECRET="$(gen_secret)" \
         || { error "no secure RNG (openssl or /dev/urandom); pass --secret"; exit 1; }
-    ask SHARED_SECRET "Auth" "Cluster shared secret (32+ hex chars):" "$SHARED_SECRET"
+    ask_secret SHARED_SECRET "Auth" "Cluster shared secret (32+ hex chars)"
     [ -n "$SHARED_SECRET" ] || { error "shared secret required"; exit 1; }
 
     ask MGR_LIST "Cluster managers" "Comma-separated managers (hostname=addr:9401; hostname = that manager's [node].hostname):" ""

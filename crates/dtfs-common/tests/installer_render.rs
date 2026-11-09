@@ -96,6 +96,92 @@ fn bootstrap_must_be_named_in_manager_list() {
     assert!(!ok && out.contains("is not named in --managers"), "{out}");
 }
 
+/// Runs `body` in bash after loading the named installer functions (top-level
+/// `name()` up to `}`, or 4-space-indented nested ones). `curl` / `whiptail`
+/// are stubbed by `body`, recording argv to $ARGV (argv is world-readable via
+/// /proc/<pid>/cmdline) and stdin to $STDIN.
+fn run_fns(fns: &[&str], body: &str, dir: &std::path::Path) -> (String, String, String) {
+    let ranges: String = fns
+        .iter()
+        .map(|f| format!("/^{f}()/,/^}}/p;/^    {f}()/,/^    }}/p;"))
+        .collect();
+    let driver = format!(
+        "error() {{ echo \"ERR: $*\"; }}\neval \"$(sed -n '{ranges}' \"$SCRIPT\")\"\nset -euo pipefail\n{body}"
+    );
+    let argv = dir.join("argv");
+    let stdin = dir.join("stdin");
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(driver)
+        .env("SCRIPT", script())
+        .env("ARGV", &argv)
+        .env("STDIN", &stdin)
+        .output()
+        .expect("bash available");
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{text}");
+    let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+    (text, read(&argv), read(&stdin))
+}
+
+#[test]
+fn repo_token_goes_to_curl_stdin_not_argv() {
+    let d = tempfile::tempdir().unwrap();
+    let body = r#"
+curl() { printf '%s\n' "$@" >> "$ARGV"; cat >> "$STDIN"; }
+REPO_TOKEN=ghp_SECRET
+fetch_hops https://example.invalid/x "$ARGV.out"
+"#;
+    let (out, argv, stdin) = run_fns(&["repo_auth_header", "fetch_hops"], body, d.path());
+    assert!(!argv.contains("ghp_SECRET"), "token in curl argv: {argv}");
+    assert!(argv.lines().any(|l| l == "@-"), "{argv}{out}");
+    assert_eq!(stdin, "Authorization: Bearer ghp_SECRET\n");
+}
+
+#[test]
+fn no_repo_token_sends_no_header() {
+    let d = tempfile::tempdir().unwrap();
+    let body = r#"
+curl() { printf '%s\n' "$@" >> "$ARGV"; cat >> "$STDIN"; }
+REPO_TOKEN=
+fetch_hops https://example.invalid/x "$ARGV.out"
+"#;
+    let (out, argv, stdin) = run_fns(&["repo_auth_header", "fetch_hops"], body, d.path());
+    assert!(!argv.lines().any(|l| l == "-H"), "{argv}{out}");
+    assert_eq!(stdin, "");
+}
+
+#[test]
+fn secret_prompt_never_puts_secret_in_whiptail_argv() {
+    let d = tempfile::tempdir().unwrap();
+    // Operator leaves the field blank: the existing/generated secret is kept.
+    let body = r#"
+whiptail() { printf '%s\n' "$@" >> "$ARGV"; printf '' >&2; }
+NONINT=0
+SHARED_SECRET=deadbeefsecret
+ask_secret SHARED_SECRET "Auth" "Cluster shared secret:"
+echo "result=$SHARED_SECRET"
+"#;
+    let (out, argv, _) = run_fns(&["ask_secret"], body, d.path());
+    assert!(!argv.contains("deadbeefsecret"), "secret in whiptail argv: {argv}");
+    assert!(argv.lines().any(|l| l == "--passwordbox"), "{argv}");
+    assert!(out.contains("result=deadbeefsecret"), "{out}");
+}
+
+#[test]
+fn secret_prompt_takes_typed_value() {
+    let d = tempfile::tempdir().unwrap();
+    let body = r#"
+whiptail() { printf 'typedsecret' >&2; }
+NONINT=0
+SHARED_SECRET=old
+ask_secret SHARED_SECRET "Auth" "Cluster shared secret:"
+echo "result=$SHARED_SECRET"
+"#;
+    let (out, _, _) = run_fns(&["ask_secret"], body, d.path());
+    assert!(out.contains("result=typedsecret"), "{out}");
+}
+
 #[test]
 fn single_bare_entry_is_self_for_bootstrap() {
     let d = tempfile::tempdir().unwrap();

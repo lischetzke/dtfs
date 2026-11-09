@@ -100,7 +100,7 @@ Load-bearing ownership only; history per row in `docs/src/internals/invariants.m
 | `dtfs-data/src/store.rs::commit_chunk_from_tmp` | Atomic commit (§ A.6) |
 | `dtfs-fuse/src/filesystem.rs` | FUSE↔cluster bridge; rules in `.claude/rules/fuse.md` |
 | `dtfs-fuse/src/fuse_adapter.rs` | Every op error routes through `cluster_err_to_errno` |
-| `dtfs-cli/src/main.rs` + `updater.rs` | REST client, full webui parity, non-zero exit on failure; updater verifies sha256 (+ minisign), token on first hop only |
+| `dtfs-cli/src/main.rs` + `updater.rs` | REST client, full webui parity, non-zero exit on failure; updater verifies sha256 (+ minisign), token on first hop only, via curl stdin (`-H @-`), never argv |
 | `scripts/dtfs-install.sh` | Role installer; rendered configs proven by `dtfs-common/tests/installer_render.rs` |
 | `docs/` + `scripts/build-docs.sh` | mdBook, `scripts/check-docs-links.py`; `docs.yml` publishes Pages + Wiki (`scripts/sync-wiki.py`); Ansible spec in `docs/src/deployment/` |
 

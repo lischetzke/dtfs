@@ -18,7 +18,7 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Release asset name (fixed; produced by `scripts/dtfs-release.sh`).
 const ASSET: &str = "dtfs-linux-amd64.tar.gz";
@@ -479,16 +479,22 @@ fn curl_hop_args(url: &str, headers: &[String], out: &Path, first_hop: bool) -> 
         .iter()
         .map(|s| s.to_string())
         .collect();
-    if first_hop {
-        for h in headers {
-            a.push("-H".into());
-            a.push(h.clone());
-        }
+    // Headers (the token) are read from stdin, never argv: argv is
+    // world-readable via /proc/<pid>/cmdline.
+    if curl_hop_stdin(headers, first_hop).is_some() {
+        a.push("-H".into());
+        a.push("@-".into());
     }
     a.push("-o".into());
     a.push(out.display().to_string());
     a.push(url.to_string());
     a
+}
+
+/// Header lines curl reads from stdin (`-H @-`) for one hop; `None` when
+/// the hop sends no headers (later hops, or no token).
+fn curl_hop_stdin(headers: &[String], first_hop: bool) -> Option<String> {
+    (first_hop && !headers.is_empty()).then(|| headers.iter().map(|h| format!("{h}\n")).collect())
 }
 
 /// Redirect target from curl's `-w %{redirect_url}` output, if any.
@@ -500,10 +506,18 @@ fn redirect_target(stdout: &str) -> Option<String> {
 fn curl_download(url: &str, headers: &[String], out: &Path) -> Result<()> {
     let mut cur = url.to_string();
     for hop in 0..=MAX_REDIRECTS {
-        let o = Command::new("curl")
+        let stdin = curl_hop_stdin(headers, hop == 0);
+        let mut child = Command::new("curl")
             .args(curl_hop_args(&cur, headers, out, hop == 0))
-            .output()
+            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .context("running curl (is curl installed?)")?;
+        if let (Some(s), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            pipe.write_all(s.as_bytes()).context("writing curl headers to stdin")?;
+        }
+        let o = child.wait_with_output().context("waiting for curl")?;
         if !o.status.success() {
             bail!(
                 "curl failed downloading {cur}: {}",
@@ -865,7 +879,6 @@ mod tests {
         let out = Path::new("/tmp/o");
         let first = curl_hop_args("https://gl/x", &h, out, true);
         assert!(!first.contains(&"-L".to_string()) && !first.contains(&"-fL".to_string()));
-        assert!(first.contains(&"Authorization: Bearer t".to_string()));
         assert!(first.contains(&"=https".to_string()) && !first.iter().any(|a| a.contains("file")));
         assert_eq!(first.last().unwrap(), "https://gl/x");
         let next = curl_hop_args("https://s3/y", &h, out, false);
@@ -874,6 +887,22 @@ mod tests {
         assert_eq!(redirect_target("https://s3/y\n").as_deref(), Some("https://s3/y"));
         assert_eq!(redirect_target(""), None);
         assert_eq!(sibling_url("https://h/p/dtfs/v1/dtfs-linux-amd64.tar.gz", "SHA256SUMS"), "https://h/p/dtfs/v1/SHA256SUMS");
+    }
+
+    /// argv is world-readable via /proc/<pid>/cmdline: the token must go
+    /// through curl's stdin (`-H @-`), never the command line.
+    #[test]
+    fn curl_token_never_in_argv() {
+        let h = vec![token_header("ghp_SECRET")];
+        let out = Path::new("/tmp/o");
+        let first = curl_hop_args("https://gl/x", &h, out, true);
+        assert!(!first.iter().any(|a| a.contains("ghp_SECRET")), "{first:?}");
+        assert!(first.windows(2).any(|w| w[0] == "-H" && w[1] == "@-"), "{first:?}");
+        assert_eq!(curl_hop_stdin(&h, true).as_deref(), Some("Authorization: Bearer ghp_SECRET\n"));
+        // Later hops send no header at all, and no token-less run reads stdin.
+        assert_eq!(curl_hop_stdin(&h, false), None);
+        assert_eq!(curl_hop_stdin(&[], true), None);
+        assert!(!curl_hop_args("https://gl/x", &[], out, true).contains(&"-H".to_string()));
     }
 
     #[test]

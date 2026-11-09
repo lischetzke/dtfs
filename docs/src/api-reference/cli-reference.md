@@ -122,7 +122,7 @@ Sequence:
 5. Print the plan and ask for confirmation.
 6. Install each binary atomically (temporary file in the target directory, then rename), then `systemctl restart` the matching units unless `--no-restart`.
 
-Token handling: the token header is attached only to the first request of each download. HTTP redirects are followed by the CLI itself (at most 5 hops, `https` only after the first hop, TLS 1.2 or newer), and redirect targets never receive the token, so a registry that redirects to object storage does not leak it. Exit `1` on any failure.
+Token handling: the token header is attached only to the first request of each download. HTTP redirects are followed by the CLI itself (at most 5 hops, `https` only after the first hop, TLS 1.2 or newer), and redirect targets never receive the token, so a registry that redirects to object storage does not leak it. The header is passed to `curl` on its stdin (`-H @-`), never on the command line, so other local users cannot read the token from the process list (curl 7.55 or newer). The installer (`scripts/dtfs-install.sh`) does the same, and its secret prompt is a password box that never shows the secret in the process list (blank keeps the existing or generated secret; read it from `/etc/dtfs/<role>.toml`). Exit `1` on any failure.
 
 Examples:
 
