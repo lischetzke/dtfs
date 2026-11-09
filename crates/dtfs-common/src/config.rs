@@ -534,6 +534,13 @@ pub struct DataClusterConfig {
     /// Never enable in production.
     #[serde(default)]
     pub allow_insecure_empty_secret: bool,
+    /// DeleteChunk auth: when `true`, only a stamp over
+    /// `chunk_id|disk_id|if_mtime_le_ms` is accepted. When `false`
+    /// (default, rolling-update safe) a legacy chunk_id-only stamp from an
+    /// older manager is also accepted with a rate-limited warning. Set
+    /// `true` once every manager runs a build that signs the full binding.
+    #[serde(default)]
+    pub require_delete_binding: bool,
 }
 
 impl DataClusterConfig {
@@ -1641,6 +1648,7 @@ mod tests {
             shared_secret: String::new(),
             manager_addrs: vec![],
             allow_insecure_empty_secret: false,
+            require_delete_binding: false,
         };
         let err = cfg.validate_shared_secret().expect_err("empty must fail");
         assert!(
@@ -1657,6 +1665,7 @@ mod tests {
             shared_secret: String::new(),
             manager_addrs: vec![],
             allow_insecure_empty_secret: true,
+            require_delete_binding: false,
         };
         cfg.validate_shared_secret()
             .expect("escape hatch must allow empty");

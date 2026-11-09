@@ -19,7 +19,8 @@ use crate::store::ChunkStore;
 use dtfs_common::checksum;
 use dtfs_common::config::ScrubConfig;
 use dtfs_common::crypto::{
-    stamp_data_rpc_auth, verify_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+    data_rpc_delete_binding, stamp_data_rpc_auth, verify_data_rpc_auth, DATA_RPC_AUTH_MAC,
+    DATA_RPC_AUTH_TS,
 };
 use tokio::sync::RwLock;
 
@@ -232,6 +233,23 @@ fn disk_status_proto(s: DiskStatus) -> String {
         DiskStatus::Removed => "removed",
     }
     .to_string()
+}
+
+/// Warn about legacy chunk_id-only DeleteChunk stamps at most once per 60 s.
+fn warn_legacy_delete_binding() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST.load(Relaxed);
+    if now.saturating_sub(last) >= 60 && LAST.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
+        tracing::warn!(
+            "DeleteChunk: accepting LEGACY chunk_id-only stamp (cluster.require_delete_binding=false); \
+             set it true once every manager signs the full binding"
+        );
+    }
 }
 
 /// LIS-19 / LIS-55 / LIS-83 — fail-closed auth for data-plane RPCs when
@@ -742,16 +760,23 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<DeleteChunkRequest>,
     ) -> Result<Response<DeleteChunkResponse>, Status> {
-        // LIS-19 — bind MAC to chunk_id so a stolen stamp cannot delete
-        // an arbitrary other chunk within the skew window.
+        // LIS-19 — bind MAC to chunk_id|disk_id|if_mtime_le_ms so a stolen
+        // stamp cannot delete another chunk, or the same chunk on another
+        // disk / without the mtime guard, within the skew window.
         let md = request.metadata().clone();
         let req = request.into_inner();
-        require_data_rpc_auth(
-            &self.config.cluster.shared_secret,
-            "DeleteChunk",
-            &req.chunk_id,
-            &md,
-        )?;
+        let secret = &self.config.cluster.shared_secret;
+        let binding = data_rpc_delete_binding(&req.chunk_id, req.disk_id, req.if_mtime_le_ms);
+        if let Err(e) = require_data_rpc_auth(secret, "DeleteChunk", &binding, &md) {
+            // Rolling update: an older manager signs chunk_id only.
+            let legacy_ok = !self.config.cluster.require_delete_binding
+                && require_data_rpc_auth(secret, "DeleteChunk", &req.chunk_id, &md).is_ok();
+            if !legacy_ok {
+                tracing::warn!(chunk_id = %req.chunk_id, disk_id = ?req.disk_id, "DeleteChunk rejected: invalid auth stamp");
+                return Err(e);
+            }
+            warn_legacy_delete_binding();
+        }
         // CR-4-7 (DATA-10) — ChunkId::from_hex byte-slices by hex-digit
         // PAIR, not by raw string index, so a non-ASCII chunk_id (e.g. one
         // containing a multi-byte UTF-8 char) is rejected as invalid_argument
@@ -1378,6 +1403,79 @@ max_io_percent = 10
         );
         let resp = svc.delete_chunk(req).await.expect("authed delete");
         assert!(resp.into_inner().success);
+        assert!(svc.store.chunk_file_path(&chunk_id).is_none());
+    }
+
+    async fn put_test_chunk(svc: &DataServiceImpl, data: &[u8]) -> (ChunkId, String) {
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        svc.store
+            .put_chunk(&chunk_id, data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+        let hex = chunk_id.as_hex();
+        (chunk_id, hex)
+    }
+
+    fn delete_req(
+        svc: &DataServiceImpl,
+        chunk_hex: &str,
+        disk_id: Option<u32>,
+        if_mtime_le_ms: Option<u64>,
+        binding: &str,
+    ) -> Request<DeleteChunkRequest> {
+        let mut req = Request::new(DeleteChunkRequest {
+            chunk_id: chunk_hex.to_string(),
+            disk_id,
+            tier: String::new(),
+            if_mtime_le_ms,
+        });
+        attach_data_rpc_auth(&mut req, &svc.config.cluster.shared_secret, "DeleteChunk", binding);
+        req
+    }
+
+    // Audit #3 — a stamp from a new manager covers disk_id and
+    // if_mtime_le_ms: stripping the disk id or loosening the mtime guard
+    // is PermissionDenied even in the rollout window (flag off).
+    #[tokio::test]
+    async fn delete_chunk_rejects_tampered_disk_or_mtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let (chunk_id, hex) = put_test_chunk(&svc, b"audit3-tamper").await;
+        let signed = data_rpc_delete_binding(&hex, Some(1), Some(1_000));
+
+        for (disk, mtime) in [(None, Some(1_000)), (Some(1), Some(u64::MAX)), (Some(1), None)] {
+            let err = svc
+                .delete_chunk(delete_req(&svc, &hex, disk, mtime, &signed))
+                .await
+                .expect_err("tampered DeleteChunk must fail");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied, "disk={disk:?} mtime={mtime:?}");
+        }
+        assert!(svc.store.chunk_file_path(&chunk_id).is_some(), "bytes must survive");
+    }
+
+    // Audit #3 — with require_delete_binding a legacy chunk_id-only stamp
+    // (replayable with disk_id stripped) is PermissionDenied; the full
+    // binding is accepted.
+    #[tokio::test]
+    async fn delete_chunk_legacy_stamp_rejected_when_binding_required() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut svc = make_service(tmp.path(), true).await;
+        svc.config.cluster.require_delete_binding = true;
+        let (chunk_id, hex) = put_test_chunk(&svc, b"audit3-legacy").await;
+
+        let err = svc
+            .delete_chunk(delete_req(&svc, &hex, None, None, &hex))
+            .await
+            .expect_err("legacy stamp must fail when the binding is required");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(svc.store.chunk_file_path(&chunk_id).is_some(), "bytes must survive");
+
+        let binding = data_rpc_delete_binding(&hex, None, None);
+        let resp = svc
+            .delete_chunk(delete_req(&svc, &hex, None, None, &binding))
+            .await
+            .expect("full binding accepted");
+        assert!(resp.into_inner().was_present);
         assert!(svc.store.chunk_file_path(&chunk_id).is_none());
     }
 

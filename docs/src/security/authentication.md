@@ -117,8 +117,17 @@ authenticated gRPC metadata on mutating **and** read RPCs:
 - `method` is `PutChunk`, `DeleteChunk`, `ReplicateChunk`, `GetChunk`,
   `ListChunks`, or `VerifyChunk`.
 - `binding` is empty for PutChunk / ListChunks; `chunk_id` for
-  DeleteChunk / GetChunk / VerifyChunk; `chunk_id|target_address` for
-  ReplicateChunk (LIS-55 — pins outbound SSRF target).
+  GetChunk / VerifyChunk; `chunk_id|target_address` for
+  ReplicateChunk (LIS-55 — pins outbound SSRF target);
+  `chunk_id|disk_id|if_mtime_le_ms` for DeleteChunk (an unset field is the
+  empty string, e.g. `cid||`), so a captured delete cannot be replayed with
+  the disk id or the mtime guard stripped.
+- DeleteChunk rollout: a data node always accepts the full binding. A legacy
+  `chunk_id`-only stamp (manager older than this binding) is accepted, with a
+  rate-limited warning, only while the data node's
+  `[cluster] require_delete_binding = false` (default). Set it `true` on every
+  data node once every manager is updated; a legacy stamp is then
+  `PermissionDenied`.
 - Max skew 300 seconds. Missing/invalid → `PermissionDenied`.
 - Empty `shared_secret` skips verification (join / legacy plaintext parity).
   Data-node startup refuses empty secret unless

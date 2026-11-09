@@ -31,6 +31,7 @@ Required strings `region`, `datacenter`, `rack`, `host`. Use the same values as 
 | `manager_addrs` | list of string | `[]` | Fallback managers, walked in order after repeated heartbeat failures. List every manager so a rolling manager restart never strands the node. |
 | `shared_secret` | string | required | **Validated**: empty is refused unless `allow_insecure_empty_secret = true`. Same value as the managers. Used to register, to sign heartbeats and to verify the `x-dtfs-rpc-*` stamp on data-plane RPCs. |
 | `allow_insecure_empty_secret` | bool | `false` | Lab only. With an empty secret, data-plane RPC authentication is skipped. |
+| `require_delete_binding` | bool | `false` | `true`: a `DeleteChunk` stamp must cover `chunk_id\|disk_id\|if_mtime_le_ms`. `false`: a legacy `chunk_id`-only stamp from an older manager is also accepted, with a rate-limited warning. Set `true` once every manager is updated. No effect with an empty secret. |
 
 ## `[grpc]`
 

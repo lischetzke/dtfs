@@ -151,7 +151,8 @@ pub const DATA_RPC_MAX_SKEW_SECS: u64 = 300;
 /// `method` is `PutChunk`, `DeleteChunk`, `ReplicateChunk`, `GetChunk`,
 /// `ListChunks`, or `VerifyChunk`. `binding` is:
 /// - empty for PutChunk / ListChunks
-/// - `chunk_id` for DeleteChunk / GetChunk / VerifyChunk
+/// - `chunk_id` for GetChunk / VerifyChunk
+/// - [`data_rpc_delete_binding`] for DeleteChunk (`chunk_id|disk_id|if_mtime_le_ms`)
 /// - [`data_rpc_replicate_binding`] for ReplicateChunk (`chunk_id|target_address`)
 pub fn data_rpc_mac_message(method: &str, ts_unix: u64, binding: &str) -> String {
     format!("dtfs-data-rpc\nv1\n{method}\n{ts_unix}\n{binding}\n")
@@ -161,6 +162,21 @@ pub fn data_rpc_mac_message(method: &str, ts_unix: u64, binding: &str) -> String
 /// so a stolen stamp cannot retarget SSRF within the skew window (LIS-55).
 pub fn data_rpc_replicate_binding(chunk_id: &str, target_address: &str) -> String {
     format!("{chunk_id}|{target_address}")
+}
+
+/// MAC binding for `DeleteChunk` — pins chunk, target disk and the mtime
+/// guard so a captured stamp cannot be replayed with `disk_id` stripped
+/// (first-found copy, possibly the anchor) or the mtime guard removed.
+pub fn data_rpc_delete_binding(
+    chunk_id: &str,
+    disk_id: Option<u32>,
+    if_mtime_le_ms: Option<u64>,
+) -> String {
+    format!(
+        "{chunk_id}|{}|{}",
+        disk_id.map(|d| d.to_string()).unwrap_or_default(),
+        if_mtime_le_ms.map(|m| m.to_string()).unwrap_or_default()
+    )
 }
 
 /// Compute hex HMAC-SHA256 for a data-plane RPC auth stamp.
@@ -476,6 +492,18 @@ mod tests {
             &wrong,
             ts
         ));
+    }
+
+    #[test]
+    fn data_rpc_delete_binding_pins_disk_and_mtime() {
+        assert_eq!(data_rpc_delete_binding("cid", Some(1), Some(42)), "cid|1|42");
+        assert_eq!(data_rpc_delete_binding("cid", None, None), "cid||");
+        // Never collides with the legacy chunk_id-only binding.
+        assert_ne!(data_rpc_delete_binding("cid", None, None), "cid");
+        assert_ne!(
+            data_rpc_delete_binding("cid", Some(0), None),
+            data_rpc_delete_binding("cid", None, Some(0))
+        );
     }
 
     #[test]

@@ -91,8 +91,10 @@ text there.
 - Data plane (`shared_secret` set): every RPC incl. `RecordCacheHit`
   needs `x-dtfs-rpc-ts` + `x-dtfs-rpc-mac` = HMAC-SHA256 over
   `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n` (bindings:
-  chunk_id; ReplicateChunk `chunk_id|target_address`; PutChunk/ListChunks
-  empty). Empty secret = legacy skip.
+  chunk_id; ReplicateChunk `chunk_id|target_address`; DeleteChunk
+  `chunk_id|disk_id|if_mtime_le_ms` via `data_rpc_delete_binding`, legacy
+  chunk_id-only only while data-node `require_delete_binding=false`;
+  PutChunk/ListChunks empty). Empty secret = legacy skip.
 - Manager plane: mutating ManagerService RPCs incl. `Heartbeat` and
   `ReportChunkStatus` need the same shape over `dtfs-mgr-rpc`.
 - Follower forwards: `forward_secret_ok` checks who, `forwardable()`

@@ -30,6 +30,10 @@ shared_secret = "change-me"         # same secret as the managers; empty is
                                     # allow_insecure_empty_secret = true (LIS-55).
 #allow_insecure_empty_secret = false # lab-only: permit empty shared_secret
                                     # (Put/Delete/ReplicateChunk auth skip).
+#require_delete_binding = false     # true = DeleteChunk stamp must cover
+                                    # chunk_id|disk_id|if_mtime_le_ms. Leave false
+                                    # during a rolling update, set true once every
+                                    # manager runs a build that signs it.
 # Fallback managers, walked in order when the primary is unreachable (F-024).
 # List every manager here so a rolling manager restart never strands the node.
 #manager_addrs = ["10.0.0.2:9401", "10.0.0.3:9401"]

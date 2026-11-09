@@ -258,12 +258,11 @@ impl TaskScheduler {
         });
         {
             use dtfs_common::crypto::{
-                stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
+                data_rpc_delete_binding, stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
             };
             let secret = self.shared_secret.read().clone();
-            if let Some((ts, mac)) =
-                stamp_data_rpc_auth(&secret, "DeleteChunk", chunk_id)
-            {
+            let binding = data_rpc_delete_binding(chunk_id, disk_id, if_mtime_le_ms);
+            if let Some((ts, mac)) = stamp_data_rpc_auth(&secret, "DeleteChunk", &binding) {
                 if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
                     req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
                     req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
