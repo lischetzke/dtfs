@@ -145,8 +145,12 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   timer retry clears it, `record_aged_commit`; release's buffer drop and
   ghost unlink follow its own `commit_all` result only). FUSE flush
   (every close(2), whose result close returns; RELEASE is async and its
-  reply ignored) and `release()` still run `commit_all` (flush_all) under
-  `path_guard`. A 1 s timer (`commit_aged`, at most
+  reply ignored) and `release()` run `commit_all` (flush_all) under
+  `path_guard`, except when another writable, non-detached fh of the path
+  without `close_seen` stays open (`defer_close_commit`): then they commit
+  nothing (Ok, no buffer drop, no ghost unlink) and flush only reports the
+  pending error. flush sets `close_seen` under the guard, so of two racing
+  closes the later commits; the last writer's flush/release commits. A 1 s timer (`commit_aged`, at most
   `AGED_COMMITS_PER_TICK` paths) commits a path whose oldest buffered byte
   (`ChunkBuf.since`, kept across `restore_segments`) is `async_commit_secs`
   old, through `commit_all` with a writable non-detached fh. The cap drain
@@ -218,3 +222,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   chown is ignored (daemon uid/gid), repeated open/flush/release during
   long NFS writes is untested end to end (a second writable open shares
   the first handle's lease owner).
+- knfsd opens, fsyncs and closes a separate file for every NFS COMMIT
+  while the NFSv4 open-state file stays open (no NFS OPEN/CLOSE). With
+  `write.async_commit` that close commits nothing (`defer_close_commit`);
+  committing there re-uploaded every partial chunk per COMMIT (x6.9).

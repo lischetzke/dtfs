@@ -670,6 +670,10 @@ struct OpenFile {
     /// `write.async_commit`: a failed background commit of this path,
     /// reported once by the next fsync/flush/release on this fh (EIO).
     write_error: Option<String>,
+    /// `write.async_commit`: a flush (close) of this fh has run. Such an fh
+    /// no longer counts as another writer for `defer_close_commit`. Sticky:
+    /// a dup'd fd closing early only makes other closes commit more.
+    close_seen: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,6 +1091,7 @@ impl DtfsFilesystem {
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
                 write_error: None,
+                close_seen: false,
             },
         );
 
@@ -1835,9 +1840,16 @@ impl DtfsFilesystem {
     /// then report a pending background commit error once. close(2) returns
     /// this result; RELEASE is async and its reply is ignored, so committing
     /// only there would let close() return with the bytes in memory.
+    /// With `write.async_commit`, a close while another writer of the path
+    /// stays open commits nothing (`defer_close_commit`).
     pub async fn flush(&self, fh: u64) -> Result<()> {
         let (path, guard) = self.fh_path_guard(fh).await;
-        let res = self.commit_all(fh).await.and_then(|()| {
+        let commit = if self.defer_close_commit(fh) {
+            Ok(())
+        } else {
+            self.commit_all(fh).await
+        };
+        let res = commit.and_then(|()| {
             match self.open_files.get_mut(&fh).and_then(|mut f| f.write_error.take()) {
                 Some(msg) => Err(anyhow::anyhow!(msg)),
                 None => Ok(()),
@@ -1882,6 +1894,32 @@ impl DtfsFilesystem {
             self.config.write.async_commit,
             keep,
         )
+    }
+
+    /// `write.async_commit` only: should `fh`'s flush/release skip its
+    /// commit because another writable, non-detached, not-closing fh of the
+    /// same path is open? knfsd opens and closes a separate file per NFS
+    /// COMMIT; committing there re-uploaded every partial chunk. Callers hold
+    /// `fh`'s `path_guard` and `fh` gets `close_seen` under it, so of two
+    /// racing closes the later one sees no other writer and commits.
+    fn defer_close_commit(&self, fh: u64) -> bool {
+        if !self.config.write.async_commit {
+            return false;
+        }
+        let Some(mut f) = self.open_files.get_mut(&fh) else { return false };
+        if !f.flags.is_writable() || is_detached_path(&f.path) {
+            return false;
+        }
+        f.close_seen = true;
+        let path = f.path.clone();
+        drop(f);
+        let others: Vec<(String, OpenFlags)> = self
+            .open_files
+            .iter()
+            .filter(|e| *e.key() != fh && !e.value().close_seen)
+            .map(|e| (e.value().path.clone(), e.value().flags))
+            .collect();
+        other_writer_open(&others, &path)
     }
 
     /// `write.async_commit` serialisation of the timer commit with write(),
@@ -2111,12 +2149,14 @@ impl DtfsFilesystem {
         // fh leaks and the stale buffer overlays (incorrectly) future reads of
         // the same path. Capture the error and surface it AFTER cleanup.
         let (guard_path, guard) = self.fh_path_guard(fh).await;
-        let commit_result = if self.open_files.contains_key(&fh) {
+        // A skipped commit (async_commit, another writer open) is Ok: no
+        // buffer drop (that writer remains) and no ghost unlink.
+        let commit_result = if self.open_files.contains_key(&fh) && !self.defer_close_commit(fh) {
             self.commit_all(fh).await
         } else {
             Ok(())
         };
-        // Release always commits everything; a pending async_commit error
+        // Release commits everything (unless deferred above); a pending async_commit error
         // (never set when off) is reported if the commit succeeds, but only
         // the commit itself decides the buffer drop and the ghost unlink.
         let commit_failed = commit_result.is_err();
@@ -2323,6 +2363,7 @@ impl DtfsFilesystem {
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
                 write_error: None,
+                close_seen: false,
             },
         );
         // Checked after the insert: a later commit sees this handle in its
@@ -5365,6 +5406,7 @@ mod async_commit_fs_tests {
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
                 write_error: None,
+                close_seen: false,
             },
         );
         fh
@@ -5475,6 +5517,67 @@ mod async_commit_fs_tests {
         let err = fs.flush(fh).await.unwrap_err();
         assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
         assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100, "restored after the failed upload");
+    }
+
+    /// knfsd opens, fsyncs and closes a separate file for every NFS COMMIT
+    /// while the NFSv4 open-state file stays open: that close must not
+    /// upload the partial chunks (prod: x6.9 chunk bytes per byte received).
+    #[tokio::test]
+    async fn async_close_of_a_second_writer_uploads_nothing() {
+        let fs = fs(true);
+        let fh1 = open(&fs, "/f", OpenFlags::ReadWrite);
+        let fh2 = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/f", 0, &[7; 100]);
+        fs.flush(fh2).await.expect("another writer is open: flush uploads nothing");
+        fs.release(fh2).await.expect("another writer is open: release uploads nothing");
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100, "buffer kept for the last writer");
+        let err = fs.flush(fh1).await.unwrap_err();
+        assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
+    }
+
+    /// Two closes racing: the handle whose flush already ran (skipped) no
+    /// longer counts as "another writer", so the second flush commits.
+    #[tokio::test]
+    async fn async_two_flushes_cannot_both_skip() {
+        let fs = fs(true);
+        let fh1 = open(&fs, "/f", OpenFlags::ReadWrite);
+        let fh2 = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/f", 0, &[7; 100]);
+        fs.flush(fh2).await.expect("fh1 still open and not closing");
+        assert!(fs.flush(fh1).await.is_err(), "fh2 is closing: fh1 is the last writer");
+        assert!(fs.release(fh2).await.is_err(), "fh1 closing too: release commits");
+    }
+
+    /// The pending background error is still reported by a skipped flush.
+    #[tokio::test]
+    async fn async_skipped_flush_reports_the_pending_error() {
+        let fs = fs(true);
+        let _fh1 = open(&fs, "/f", OpenFlags::ReadWrite);
+        let fh2 = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.open_files.get_mut(&fh2).unwrap().write_error = Some("bg failed".into());
+        let err = fs.flush(fh2).await.unwrap_err();
+        assert_eq!(format!("{err:#}"), "bg failed");
+    }
+
+    #[tokio::test]
+    async fn sync_close_of_a_second_writer_still_commits() {
+        let fs = fs(false);
+        let _fh1 = open(&fs, "/f", OpenFlags::ReadWrite);
+        let fh2 = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/f", 0, &[7; 100]);
+        assert!(fs.flush(fh2).await.is_err(), "async off: every close commits");
+    }
+
+    #[tokio::test]
+    async fn async_reader_or_detached_writer_is_not_another_writer() {
+        let fs = fs(true);
+        let _r = open(&fs, "/f", OpenFlags::ReadOnly);
+        let det = detached_handle_path("/f", "/f", 1).unwrap();
+        let _d = open(&fs, &det, OpenFlags::ReadWrite);
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/f", 0, &[7; 100]);
+        let err = fs.flush(fh).await.unwrap_err();
+        assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
     }
 
     #[tokio::test]
