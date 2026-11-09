@@ -759,6 +759,9 @@ pub struct DtfsFilesystem {
     /// commit retiring during the awaits that follow.
     #[cfg(test)]
     write_race_hook: std::sync::Mutex<Option<Box<dyn FnOnce(&DtfsFilesystem) + Send>>>,
+    /// Test hook run by open_with_append right before it inserts the handle.
+    #[cfg(test)]
+    open_race_hook: std::sync::Mutex<Option<Box<dyn FnOnce(&DtfsFilesystem) + Send>>>,
     /// P0-1: prefix used for write-lease `owner_id` values. Format:
     /// `<hostname>:<pid>:`. The per-open `:<fh>` suffix is appended at
     /// open-time to make each owner_id unique within the process.
@@ -844,6 +847,8 @@ impl DtfsFilesystem {
             bg_done: tokio::sync::Notify::new(),
             #[cfg(test)]
             write_race_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            open_race_hook: std::sync::Mutex::new(None),
             lease_owner_prefix,
             local_cache: None,
         }
@@ -1107,6 +1112,10 @@ impl DtfsFilesystem {
             }
         }
 
+        #[cfg(test)]
+        if let Some(hook) = self.open_race_hook.lock().unwrap().take() {
+            hook(self);
+        }
         self.open_files.insert(
             fh,
             OpenFile {
@@ -1141,6 +1150,22 @@ impl DtfsFilesystem {
             match gated_snapshot(locations, fetch.may_install()) {
                 Some(l) => self.cache_metadata(path, l),
                 None => self.invalidate_fh_locations(fh),
+            }
+        }
+
+        // The lender may have closed between the copy and the insert: its
+        // release saw no other owner and released the lease. Re-acquire then.
+        if let Some((owner, ..)) = &reused {
+            let lender_open = self
+                .open_files
+                .iter()
+                .any(|e| *e.key() != fh && e.value().lease_owner_id.as_deref() == Some(owner.as_str()));
+            if !lender_open {
+                if let Err(e) = self.reacquire_write_lease(fh, path, Some(owner)).await {
+                    self.open_files.remove(&fh);
+                    warn!(path, error = %e, "reopen: lender closed and the lease could not be re-acquired");
+                    return Err(e);
+                }
             }
         }
 
@@ -6193,6 +6218,21 @@ mod async_commit_fs_tests {
         let fh2 = open2.expect("reopen must not issue a manager RPC").unwrap();
         assert!(fs.open_files.get(&fh2).unwrap().locations.is_none(), "kept a snapshot copied under an in-flight commit");
         drop(commit);
+        hole.abort();
+    }
+
+    /// R2-5: the lender closes between the reopen's lease copy and its
+    /// insert; its release saw no other owner and released the lease. The
+    /// reopen must re-acquire it (hangs on the black hole), not keep a dead
+    /// lease id. With the lender still open: no RPC (test above).
+    #[tokio::test]
+    async fn reopen_reacquires_when_the_lender_closed_before_the_insert() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, fh) = leased_writer(&client).await;
+        *fs.open_race_hook.lock().unwrap() = Some(Box::new(move |fs: &DtfsFilesystem| {
+            fs.open_files.remove(&fh);
+        }));
+        assert!(pending(fs.open_with_append("/f", OpenFlags::WriteOnly, false)).await, "kept the released lease");
         hole.abort();
     }
 
