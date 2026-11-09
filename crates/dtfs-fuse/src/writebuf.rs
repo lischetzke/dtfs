@@ -65,6 +65,14 @@ pub(crate) fn batch_limits(configured: usize) -> (usize, usize) {
     (batch, (2 * batch).max(DIRTY_BYTES_CAP))
 }
 
+/// Per-file dirty cap with `inflight` background batches per file
+/// (`write.max_inflight_batches`, async_commit): `max(128 MB, (inflight + 1)
+/// x batch limit)`, so `inflight` batches can upload while the next fills.
+/// `inflight = 1` is `batch_limits(..).1`.
+pub(crate) fn dirty_cap_for(configured: usize, inflight: usize) -> usize {
+    (inflight.max(1) + 1).saturating_mul(batch_limits(configured).0).max(DIRTY_BYTES_CAP)
+}
+
 /// WI-01 / H1 — resolve the effective `flush_batch_chunks` for a given
 /// configured value and chunk size: clamp the count into
 /// `1..=MAX_FLUSH_BATCH_CHUNKS`, then clamp again so `batch * chunk_size`
@@ -381,10 +389,16 @@ impl WriteBuffer {
     /// always drains everything, batched or not, so held-back chunks still
     /// leave at fsync/close.
     pub fn new_with_batch(chunk_size: usize, flush_batch_chunks: usize) -> Self {
+        Self::new_with_batch_inflight(chunk_size, flush_batch_chunks, 1)
+    }
+
+    /// `new_with_batch` with the dirty cap sized for `inflight` background
+    /// batches per file (`dirty_cap_for`).
+    pub fn new_with_batch_inflight(chunk_size: usize, flush_batch_chunks: usize, inflight: usize) -> Self {
         Self {
             chunk_size,
             flush_batch_chunks: effective_batch_chunks(flush_batch_chunks, chunk_size),
-            dirty_cap: batch_limits(flush_batch_chunks).1,
+            dirty_cap: dirty_cap_for(flush_batch_chunks, inflight),
             buffers: DashMap::new(),
             inflight: DashMap::new(),
             next_inflight: AtomicU64::new(0),
@@ -1492,6 +1506,21 @@ mod tests {
                 "batch {effective} * chunk_size {size} must stay within {FLUSH_BATCH_MAX_BYTES}"
             );
         }
+    }
+
+    /// multibatch — the cap holds `n` uploading batches plus one filling;
+    /// `n = 1` (and a nonsense 0) is the single-batch cap.
+    #[test]
+    fn dirty_cap_scales_with_inflight_batches() {
+        let mib = 1024 * 1024;
+        for fbc in [0, 4, 16, 17, 64, 128] {
+            assert_eq!(dirty_cap_for(fbc, 1), batch_limits(fbc).1, "fbc {fbc}");
+            assert_eq!(dirty_cap_for(fbc, 0), batch_limits(fbc).1, "fbc {fbc}");
+        }
+        assert_eq!(dirty_cap_for(16, 4), 320 * mib);
+        assert_eq!(dirty_cap_for(64, 16), 17 * 256 * mib);
+        assert_eq!(WriteBuffer::new_with_batch_inflight(4 * mib, 16, 4).dirty_cap(), 320 * mib);
+        assert_eq!(WriteBuffer::new_with_batch_inflight(4 * mib, 4, 1).dirty_cap(), DIRTY_BYTES_CAP);
     }
 
     /// bigbatch — batch byte limit / dirty cap derive from the configured

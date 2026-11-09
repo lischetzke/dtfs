@@ -444,8 +444,23 @@ pub(crate) const WRITE_LEASE_RENEW_AFTER_MS: u64 = 60_000;
 /// no commit overlapped the fetch (`FetchToken::may_install`). The entry
 /// lives while any commit or fetch is in flight, so generations compare.
 /// The `Notify` wakes `wait_quiet` callers when a path's commits reach 0.
+/// The 4th field lists the in-flight commits `(generation, sorted chunk
+/// indices, conflicted)`: `None` indices (SetFileSize, any `begin`) conflict
+/// with every commit; two chunk sets conflict when they intersect. Disjoint
+/// overlapping commits stay mergeable (`CommitToken::may_merge`).
 #[derive(Default)]
-struct CommitTracker(DashMap<String, (u32, u64, u32)>, tokio::sync::Notify);
+struct CommitTracker(DashMap<String, (u32, u64, u32, Vec<InFlightCommit>)>, tokio::sync::Notify);
+
+/// `(generation, sorted chunk indices or None = whole file, conflicted)`.
+type InFlightCommit = (u64, Option<Vec<u32>>, bool);
+
+/// Do two in-flight commits touch a common chunk? `None` = whole file.
+fn commit_sets_conflict(a: Option<&[u32]>, b: Option<&[u32]>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.iter().any(|x| b.binary_search(x).is_ok()),
+        _ => true,
+    }
+}
 
 /// Upper bound for waiting out in-flight commits before a locations fetch:
 /// a commit cannot legitimately outlive the write lease it runs under.
@@ -513,21 +528,37 @@ struct CommitToken<'a> {
 }
 
 impl CommitTracker {
+    /// A whole-file commit slot (SetFileSize): conflicts with every other.
     fn begin(&self, path: &str) -> CommitToken<'_> {
-        let (in_flight, generation, _) = {
-            let mut e = self.0.entry(path.to_string()).or_insert((0, 0, 0));
+        self.begin_chunks(path, None)
+    }
+
+    /// A commit of `chunks` (sorted chunk indices; `None` = whole file).
+    /// Marks itself and every in-flight commit it conflicts with.
+    fn begin_chunks(&self, path: &str, chunks: Option<Vec<u32>>) -> CommitToken<'_> {
+        let (in_flight, generation) = {
+            let mut e = self.0.entry(path.to_string()).or_default();
             e.0 += 1;
             e.1 += 1;
-            *e
+            let generation = e.1;
+            let mut conflicted = false;
+            for c in e.3.iter_mut() {
+                if commit_sets_conflict(c.1.as_deref(), chunks.as_deref()) {
+                    c.2 = true;
+                    conflicted = true;
+                }
+            }
+            e.3.push((generation, chunks, conflicted));
+            (e.0, generation)
         };
         CommitToken { tracker: self, path: path.to_string(), generation, overlapped: in_flight > 1 }
     }
 
     fn begin_fetch(&self, path: &str) -> FetchToken<'_> {
-        let (in_flight, generation, _) = {
-            let mut e = self.0.entry(path.to_string()).or_insert((0, 0, 0));
+        let (in_flight, generation) = {
+            let mut e = self.0.entry(path.to_string()).or_default();
             e.2 += 1;
-            *e
+            (e.0, e.1)
         };
         FetchToken { tracker: self, path: path.to_string(), generation, quiet_at_start: in_flight == 0 }
     }
@@ -585,13 +616,26 @@ impl CommitToken<'_> {
                 .get(&self.path)
                 .is_some_and(|e| (e.0, e.1) == (1, self.generation))
     }
+
+    /// True iff no commit whose chunk set intersects this one's (or a
+    /// whole-file one) overlapped it so far. Disjoint commits replace
+    /// different indices and only grow the size (max), so their merges
+    /// commute: applying them in any order gives the same snapshot.
+    fn may_merge(&self) -> bool {
+        self.tracker
+            .0
+            .get(&self.path)
+            .is_some_and(|e| e.3.iter().any(|c| c.0 == self.generation && !c.2))
+    }
 }
 
 impl Drop for CommitToken<'_> {
     fn drop(&mut self) {
         // Generations only compare overlapping windows, so resetting at zero is safe.
         let mut quiet = false;
+        let generation = self.generation;
         self.tracker.0.remove_if_mut(&self.path, |_, e| {
+            e.3.retain(|c| c.0 != generation);
             e.0 -= 1;
             quiet = e.0 == 0;
             e.0 == 0 && e.2 == 0
@@ -609,11 +653,12 @@ struct Committed<'a> {
     token: Option<CommitToken<'a>>,
 }
 
-/// Post-commit: may the committed chunks be merged locally? Only for an
-/// exclusive commit whose fh is still open on the same path (a detached
-/// handle or a file re-created under the path must re-fetch).
-fn merge_allowed(exclusive: bool, fh_path: Option<&str>, path: &str) -> bool {
-    exclusive && fh_path == Some(path)
+/// Post-commit: may the committed chunks be merged locally? Only for a
+/// commit no conflicting commit overlapped (`CommitToken::may_merge`) whose
+/// fh is still open on the same path (a detached handle or a file
+/// re-created under the path must re-fetch).
+fn merge_allowed(may_merge: bool, fh_path: Option<&str>, path: &str) -> bool {
+    may_merge && fh_path == Some(path)
 }
 
 /// An open file handle with its associated state.
@@ -670,6 +715,10 @@ struct OpenFile {
     /// `write.async_commit`: a failed background commit of this path,
     /// reported once by the next fsync/flush/release on this fh (EIO).
     write_error: Option<String>,
+    /// `write.async_commit`: chunk indices of failed background batches not
+    /// committed since; `write_error` is cleared by a batch success only
+    /// once this is empty (`record_bg_batch`).
+    failed_chunks: Vec<u32>,
     /// `write.async_commit`: a flush (close) of this fh has run. Such an fh
     /// no longer counts as another writer for `defer_close_commit`. Sticky:
     /// a dup'd fd closing early only makes other closes commit more.
@@ -749,10 +798,11 @@ pub struct DtfsFilesystem {
     /// write(), a writer's truncate and release on the same path
     /// (`path_guard`); unused (empty) when async_commit is off.
     path_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
-    /// `write.async_commit` only: path -> (sorted chunk indices, bytes) of
-    /// the ONE batch write() uploads in the background (`spawn_bg_upload`);
-    /// present until restore/merge are done.
-    bg_uploads: DashMap<String, (Vec<u32>, usize)>,
+    /// `write.async_commit` only: path -> `(overlay id, sorted chunk
+    /// indices, bytes)` of each batch write() uploads in the background
+    /// (`spawn_bg_upload`, up to `write.max_inflight_batches`, pairwise
+    /// disjoint chunk sets); an entry stays until its restore/merge is done.
+    bg_uploads: DashMap<String, Vec<(u64, Vec<u32>, usize)>>,
     /// Woken whenever a background upload ends (`wait_bg_uploads`).
     bg_done: tokio::sync::Notify,
     /// Test hook run by write_inner right after it read the handle: models a
@@ -812,9 +862,10 @@ impl DtfsFilesystem {
         // WI-01 — hold back complete chunks until `flush_batch_chunks` of
         // them exist, amortizing the allocate+commit round trip over a
         // batch instead of firing once per chunk (default 4).
-        let write_buffer = WriteBuffer::new_with_batch(
+        let write_buffer = WriteBuffer::new_with_batch_inflight(
             chunk_size_bytes,
             config.write.flush_batch_chunks as usize,
+            config.write.async_commit.then(|| config.write.effective_max_inflight_batches()).unwrap_or(1),
         );
 
         // P0-1: lease owner = "<topology host>:<pid>:". Using the topology
@@ -1140,6 +1191,7 @@ impl DtfsFilesystem {
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
                 write_error: None,
+                failed_chunks: Vec::new(),
                 close_seen: false,
             },
         );
@@ -1637,10 +1689,11 @@ impl DtfsFilesystem {
     #[instrument(skip(self, data), fields(fh, offset, len = data.len()))]
     pub async fn write(self: &Arc<Self>, fh: u64, offset: u64, data: &[u8]) -> Result<u32> {
         let (path, guard) = self.fh_path_guard(fh).await;
-        // A chunk of the background batch must not be re-seeded from the
-        // pre-commit snapshot or later clobbered by its restore: wait for it.
-        if let Some(p) = path.as_deref().filter(|p| self.write_hits_bg_upload(p, offset, data.len())) {
-            self.wait_bg_uploads(p).await;
+        // A chunk of a background batch must not be re-seeded from the
+        // pre-commit snapshot or later clobbered by its restore: wait for
+        // the batches holding it (others keep uploading).
+        if let Some(p) = path.as_deref() {
+            self.wait_bg(|| !self.write_hits_bg_upload(p, offset, data.len())).await;
         }
         let res = self.write_inner(fh, offset, data).await;
         if let Some(p) = path {
@@ -1869,10 +1922,13 @@ impl DtfsFilesystem {
         let written = self.write_buffer.write(&path, effective_offset, data);
 
         // async_commit: the batch uploads in the background (write() returns
-        // now; knfsd's single thread keeps receiving). While one is in
-        // flight, complete chunks stay buffered (bounded by the cap above).
+        // now; knfsd's single thread keeps receiving). While
+        // `max_inflight_batches` are in flight, complete chunks stay
+        // buffered (bounded by the cap above). A new batch never holds a
+        // chunk of an in-flight one: those left the buffer, and writes into
+        // them waited above.
         if self.config.write.async_commit {
-            if !self.bg_uploads.contains_key(&path) {
+            if self.bg_batches(&path) < self.config.write.effective_max_inflight_batches() {
                 // Overlay registered with the drain: the batch is visible
                 // (reads, the next write's EOF) the moment write() returns.
                 if let (segments, Some(g)) = self.write_buffer.flush_inflight(&path) {
@@ -2048,16 +2104,16 @@ impl DtfsFilesystem {
     }
 
     /// `write.async_commit`: hand write()'s batch to a background upload of
-    /// `path` (at most one per path; callers hold `path_guard` and checked
-    /// `bg_uploads`). One batch, not more: two overlapping commits of a path
-    /// make the post-commit merge fall back to a full re-fetch (O(file) per
-    /// batch); the batch itself keeps `upload_concurrency` puts busy.
+    /// `path` (up to `write.max_inflight_batches` per path; callers hold
+    /// `path_guard` and checked `bg_batches`). Batches of a path have
+    /// disjoint chunk sets, so their overlapping commits still merge
+    /// (`CommitToken::may_merge`); each keeps `upload_concurrency` puts busy.
     /// `inflight`: the batch's overlay id (`flush_inflight`), adopted by the task.
     fn spawn_bg_upload(self: &Arc<Self>, fh: u64, path: String, segs: Vec<crate::writebuf::ChunkSegment>, inflight: u64) {
         let mut chunks: Vec<u32> = segs.iter().map(|s| s.chunk_index).collect();
         chunks.sort_unstable();
         let bytes = segs.iter().map(|s| s.data.len()).sum();
-        self.bg_uploads.insert(path.clone(), (chunks, bytes));
+        self.bg_uploads.entry(path.clone()).or_default().push((inflight, chunks, bytes));
         let this = Arc::clone(self);
         tokio::spawn(async move { this.bg_upload(fh, path, segs, inflight).await });
     }
@@ -2065,11 +2121,12 @@ impl DtfsFilesystem {
     /// The background half of write()'s batch flush. Holds no `path_guard`
     /// (writes would block on it again): nobody else touches these chunk
     /// indices meanwhile (overlapping writes, cap drains, commit_all,
-    /// truncate, rename and unlink wait in `wait_bg_uploads`), so the
+    /// truncate, rename and unlink wait in `wait_bg`), so the
     /// restore cannot clobber newer bytes. The overlay stays until the
-    /// restore/merge is done; `bg_uploads` is cleared after that.
+    /// restore/merge is done; its `bg_uploads` entry is cleared after that.
     async fn bg_upload(&self, fh: u64, path: String, segs: Vec<crate::writebuf::ChunkSegment>, inflight: u64) {
-        let _slot = BgSlot { fs: self, path: path.clone() };
+        let _slot = BgSlot { fs: self, path: path.clone(), id: inflight };
+        let chunks: Vec<u32> = segs.iter().map(|s| s.chunk_index).collect();
         let _inflight = self.write_buffer.adopt_inflight(inflight);
         let res = match self.renew_if_due(fh, &path).await {
             // The fh's current path: a detached fh's commit must fail, never
@@ -2083,49 +2140,101 @@ impl DtfsFilesystem {
         match res {
             Ok(committed) => {
                 self.mark_committed_and_refresh(&path, fh, committed).await;
-                self.record_aged_commit(&path, Ok(()));
+                self.record_bg_batch(&path, &chunks, Ok(()));
             }
             Err(e) => {
                 // unlink may have detached the fh meanwhile: restore under
                 // its current path, never into a replacement at `path`.
                 let cur = self.open_files.get(&fh).map(|f| f.path.clone()).unwrap_or(path);
                 self.write_buffer.restore_segments(&cur, &segs);
-                self.record_aged_commit(&cur, Err(e));
+                self.record_bg_batch(&cur, &chunks, Err(e));
             }
         }
     }
 
-    /// Wait until `path` has no background upload in flight (no-op when
-    /// async_commit is off: nothing is ever spawned).
-    async fn wait_bg_uploads(&self, path: &str) {
+    /// Background batch result: a failure arms every writer's error
+    /// (`record_aged_commit`) and remembers the batch's chunks on those
+    /// handles (`failed_chunks`); a success forgets its chunks and clears the
+    /// error only on handles with no failed chunk left. A failed batch is
+    /// "retried" once all its chunks were committed again, so a later,
+    /// disjoint batch's success never hides an earlier failure. A full
+    /// `commit_all` success clears everything (`record_aged_commit`).
+    fn record_bg_batch(&self, path: &str, chunks: &[u32], result: Result<()>) {
+        let failed = result.is_err();
+        if failed {
+            self.record_aged_commit(path, result);
+        }
+        for mut f in self.open_files.iter_mut() {
+            if f.path != path {
+                continue;
+            }
+            if failed {
+                if f.flags.is_writable() {
+                    for c in chunks {
+                        if !f.failed_chunks.contains(c) {
+                            f.failed_chunks.push(*c);
+                        }
+                    }
+                }
+            } else {
+                f.failed_chunks.retain(|c| !chunks.contains(c));
+                if f.failed_chunks.is_empty() {
+                    f.write_error = None;
+                }
+            }
+        }
+    }
+
+    /// Wait (woken per finished background batch, no polling) until
+    /// `done()`; it is re-checked after every batch end.
+    async fn wait_bg(&self, done: impl Fn() -> bool) {
         loop {
-            let done = self.bg_done.notified();
-            tokio::pin!(done);
-            done.as_mut().enable();
-            if !self.bg_uploads.contains_key(path) {
+            let ended = self.bg_done.notified();
+            tokio::pin!(ended);
+            ended.as_mut().enable();
+            if done() {
                 return;
             }
-            done.await;
+            ended.await;
         }
     }
 
-    /// True iff `path`'s background batch holds a chunk `offset..+len` touches.
+    /// Wait until `path` has no background batch in flight (no-op when
+    /// async_commit is off: nothing is ever spawned).
+    async fn wait_bg_uploads(&self, path: &str) {
+        self.wait_bg(|| !self.bg_uploads.contains_key(path)).await;
+    }
+
+    /// Background batches of `path` in flight.
+    fn bg_batches(&self, path: &str) -> usize {
+        self.bg_uploads.get(path).map_or(0, |e| e.len())
+    }
+
+    /// True iff a background batch of `path` holds a chunk `offset..+len` touches.
     fn write_hits_bg_upload(&self, path: &str, offset: u64, len: usize) -> bool {
         let cs = self.write_buffer.chunk_size() as u64;
         self.bg_uploads
             .get(path)
-            .is_some_and(|e| range_hits_upload(&e.0, offset, len, cs))
+            .is_some_and(|e| e.iter().any(|b| range_hits_upload(&b.1, offset, len, cs)))
     }
 
-    /// async_commit backpressure: if buffered plus in-flight bytes of `path`
-    /// would meet the dirty cap with `incoming` more, wait for the
-    /// background upload first (the cap drain then sees the restored bytes).
+    /// Bytes of all background batches of `path` in flight.
+    fn bg_inflight_bytes(&self, path: &str) -> usize {
+        self.bg_uploads.get(path).map_or(0, |e| e.iter().map(|b| b.2).sum())
+    }
+
+    /// async_commit backpressure: while buffered plus in-flight bytes of
+    /// `path` (all batches) would meet the dirty cap with `incoming` more,
+    /// wait for batches to finish. It returns under the cap or with none in
+    /// flight, so the cap drain that may follow never overlaps a batch (it
+    /// then sees any restored bytes).
     async fn bg_backpressure(&self, path: &str, incoming: usize) {
-        let inflight = self.bg_uploads.get(path).map_or(0, |e| e.1);
         let cap = self.write_buffer.dirty_cap();
-        if inflight > 0 && dirty_cap_exceeded(self.write_buffer.dirty_bytes(path) + inflight, incoming, cap) {
-            self.wait_bg_uploads(path).await;
-        }
+        self.wait_bg(|| {
+            let inflight = self.bg_inflight_bytes(path);
+            inflight == 0 || !dirty_cap_exceeded(self.write_buffer.dirty_bytes(path) + inflight, incoming, cap)
+        })
+        .await;
     }
 
     /// Write-side EOF of the buffer, in-flight drains included (a background
@@ -2237,8 +2346,8 @@ impl DtfsFilesystem {
         let lease_owner_id = file.lease_owner_id.clone();
         drop(file);
         // async_commit: the last writer's close / the timer commit only after
-        // write()'s background batch is committed or restored (its error is
-        // then pending on the fh). Callers hold `path_guard`: no new one starts.
+        // ALL of write()'s background batches are committed or restored (an
+        // error is then pending on the fh). Callers hold `path_guard`: no new one starts.
         self.wait_bg_uploads(&path).await;
 
         // P0-1: if a lease is held and is past the renewal threshold,
@@ -2355,12 +2464,14 @@ impl DtfsFilesystem {
 
     /// Timer commit result for `path`: a failure is logged and arms every
     /// writer's sticky error (bytes restored, retried next tick); a success
-    /// clears it (the bytes it reported are committed now).
+    /// clears it and the failed batches' chunks (the bytes it reported are
+    /// committed now).
     fn record_aged_commit(&self, path: &str, result: Result<()>) {
         let Err(e) = result else {
             for mut f in self.open_files.iter_mut() {
                 if f.path == path {
                     f.write_error = None;
+                    f.failed_chunks.clear();
                 }
             }
             return;
@@ -2383,7 +2494,7 @@ impl DtfsFilesystem {
 
     /// Shutdown: commit every path that still has an open writable,
     /// non-detached handle (one commit per path, under its `path_guard`;
-    /// `commit_all` waits for the background batch first), bounded by
+    /// `commit_all` waits for every background batch first), bounded by
     /// `budget` in total, THEN run `then` (the lease release). A failed or
     /// timed-out unmount (busy mount: knfsd or a process holding a file)
     /// never releases those handles, so with `write.async_commit`
@@ -2402,7 +2513,7 @@ impl DtfsFilesystem {
             .iter()
             .map(|(p, _)| {
                 let (idx, bytes) = self.write_buffer.pending_summary(p);
-                (idx, bytes + self.bg_uploads.get(p).map_or(0, |e| e.1))
+                (idx, bytes + self.bg_inflight_bytes(p))
             })
             .collect();
         let mut committed: Vec<bool> = pending.iter().map(|(_, b)| *b == 0).collect();
@@ -2673,6 +2784,7 @@ impl DtfsFilesystem {
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
                 write_error: None,
+                failed_chunks: Vec::new(),
                 close_seen: false,
             },
         );
@@ -3616,7 +3728,9 @@ impl DtfsFilesystem {
         let lease_id = self.commit_lease_id(fh, path);
 
         // Dropped on the `?` below, so a failed commit ends its slot too.
-        let token = self.commit_tracker.begin(path);
+        let mut indices: Vec<u32> = segments.iter().map(|s| s.chunk_index).collect();
+        indices.sort_unstable();
+        let token = self.commit_tracker.begin_chunks(path, Some(indices));
         let res = self.client.commit_chunk_locations(path, &volume_id, commits.clone(), &lease_id).await;
         let res = match res {
             // A lender's release can delete the lease this fh shares (same
@@ -3673,10 +3787,11 @@ impl DtfsFilesystem {
         // starts meanwhile sees the overlap and re-fetches after this one.
         let Committed { chunks, token: _token } = committed;
         let exclusive = _token.as_ref().is_some_and(|t| t.exclusive());
+        let may_merge = _token.as_ref().is_some_and(|t| t.may_merge());
         let fh_path = self.open_files.get(&fh).map(|f| f.path.clone());
         let committed = chunks
             .as_deref()
-            .filter(|_| merge_allowed(exclusive, fh_path.as_deref(), path));
+            .filter(|_| merge_allowed(may_merge, fh_path.as_deref(), path));
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -3700,6 +3815,12 @@ impl DtfsFilesystem {
             }
         }
         if !refetch {
+            // A disjoint commit overlapped: the handles took both merges, but
+            // its refresh may hold (and re-insert) the cache copy without
+            // ours. Leave the cache entry dropped.
+            if !exclusive {
+                return;
+            }
             let restored = match cached {
                 Some((Ok(arc), at)) => {
                     let mut slot = Some(arc);
@@ -3965,16 +4086,21 @@ fn range_hits_upload(batch: &[u32], offset: u64, len: usize, chunk_size: u64) ->
     batch.get(i).is_some_and(|&c| c as u64 <= last)
 }
 
-/// Clears a path's `bg_uploads` entry and wakes waiters when the background
-/// upload ends, also if its task panics or is dropped at runtime shutdown.
+/// Clears its batch from the path's `bg_uploads` entry (the entry with the
+/// last batch) and wakes waiters when the background upload ends, also if
+/// its task panics or is dropped at runtime shutdown.
 struct BgSlot<'a> {
     fs: &'a DtfsFilesystem,
     path: String,
+    id: u64,
 }
 
 impl Drop for BgSlot<'_> {
     fn drop(&mut self) {
-        self.fs.bg_uploads.remove(&self.path);
+        self.fs.bg_uploads.remove_if_mut(&self.path, |_, v| {
+            v.retain(|b| b.0 != self.id);
+            v.is_empty()
+        });
         self.fs.bg_done.notify_waiters();
     }
 }
@@ -5679,6 +5805,35 @@ mod commit_tracker_tests {
         assert!(t.begin("/f").exclusive(), "a fresh commit after both is exclusive");
     }
 
+    /// multibatch: overlapping commits with disjoint chunk sets (background
+    /// batches of one path) both stay mergeable, though not exclusive; one
+    /// shared chunk, or a whole-file slot (SetFileSize), makes both refetch.
+    #[test]
+    fn disjoint_overlapping_commits_may_merge_intersecting_do_not() {
+        let t = CommitTracker::default();
+        let a = t.begin_chunks("/f", Some(vec![0, 1, 2, 3]));
+        let b = t.begin_chunks("/f", Some(vec![4, 5, 6, 7]));
+        assert!(!a.exclusive() && !b.exclusive());
+        assert!(a.may_merge() && b.may_merge(), "disjoint batches must merge");
+        drop(a);
+        // Boundary: one shared chunk (7) conflicts, both ways.
+        let c = t.begin_chunks("/f", Some(vec![7, 8]));
+        assert!(!b.may_merge(), "b overlapped c on chunk 7");
+        assert!(!c.may_merge(), "c overlapped b on chunk 7");
+        drop((b, c));
+        // A whole-file slot conflicts with any chunk set, either order.
+        let d = t.begin_chunks("/f", Some(vec![9]));
+        let size = t.begin("/f");
+        let e = t.begin_chunks("/f", Some(vec![10]));
+        assert!(!d.may_merge() && !size.may_merge() && !e.may_merge());
+        drop((d, size, e));
+        let f = t.begin_chunks("/f", Some(vec![1]));
+        assert!(f.may_merge() && f.exclusive(), "conflict marks die with their commits");
+        // Another path never conflicts.
+        let g = t.begin_chunks("/g", Some(vec![1]));
+        assert!(f.may_merge() && g.may_merge() && f.exclusive());
+    }
+
     /// The slot is released on an error return (drop guard) and the path's
     /// entry is removed at zero.
     #[test]
@@ -5881,6 +6036,7 @@ mod async_commit_fs_tests {
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
                 write_error: None,
+                failed_chunks: Vec::new(),
                 close_seen: false,
             },
         );
@@ -6745,11 +6901,137 @@ mod async_commit_fs_tests {
         let cs = fs.write_buffer.chunk_size() as u64;
         let fh = open(&fs, "/f", OpenFlags::ReadWrite);
         fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/f", 40 * cs, cs)));
-        fs.bg_uploads.insert("/f".to_string(), (vec![2, 19], 2 * cs as usize));
+        fs.bg_uploads.insert("/f".to_string(), vec![(0, vec![2, 19], 2 * cs as usize)]);
         let w = tokio::time::timeout(Duration::from_secs(2), fs.write(fh, 10 * cs + 1, &[5; 10])).await;
         assert_eq!(w.expect("chunk 10 is not in the batch {2, 19}: must not wait").unwrap(), 10);
         assert!(pending(fs.write(fh, 19 * cs + 1, &[5; 10])).await, "chunk 19 is in the batch");
         assert!(pending(fs.write(fh, 19 * cs - 1, &[5; 2])).await, "straddles 18/19");
+    }
+
+    /// Async fs (black-hole manager when `client` is one) with
+    /// `write.max_inflight_batches = n` and a writer on an empty `/f`.
+    fn multi_batch_fs(client: &DtfsClient, n: u32) -> (Arc<DtfsFilesystem>, u64, u64) {
+        let mut cfg: FuseConfig =
+            toml::from_str(include_str!("../../../deploy/examples/fuse.toml")).unwrap();
+        cfg.write.async_commit = true;
+        cfg.write.max_inflight_batches = n;
+        let fs = Arc::new(DtfsFilesystem::new(client.clone(), cfg.location.clone(), cfg));
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/f", 0, cs)));
+        (fs, fh, cs)
+    }
+
+    /// Write three 4-chunk batches back to back; none may wait (far below
+    /// the cap, never into an in-flight chunk).
+    async fn three_batches(fs: &Arc<DtfsFilesystem>, fh: u64, cs: u64) {
+        let batch = 4 * cs as usize;
+        for i in 0..3u64 {
+            let w = tokio::time::timeout(Duration::from_secs(2), fs.write(fh, i * 4 * cs, &vec![3; batch])).await;
+            assert_eq!(w.expect("batch write must not wait").unwrap(), batch as u32);
+        }
+    }
+
+    /// multibatch (prod: one 256 MiB batch per path, the pipeline drained at
+    /// every batch end, 59 MiB/s): with `max_inflight_batches = 2` a second
+    /// full batch starts while the first uploads; a third stays buffered.
+    /// Default 1: one batch, the rest buffered (unchanged).
+    #[tokio::test]
+    async fn multibatch_second_batch_starts_while_the_first_uploads() {
+        let (client, hole) = black_hole_client().await;
+        for (n, in_flight) in [(1u32, 1usize), (2, 2)] {
+            let (fs, fh, cs) = multi_batch_fs(&client, n);
+            three_batches(&fs, fh, cs).await;
+            assert_eq!(fs.bg_batches("/f"), in_flight, "n={n}: batches in flight");
+            let buffered = (3 - in_flight) * 4 * cs as usize;
+            assert_eq!(fs.write_buffer.dirty_bytes("/f"), buffered, "n={n}: the rest stays buffered");
+            assert_eq!(fs.write_buffer.visible_size("/f"), Some(12 * cs), "n={n}");
+        }
+        hole.abort();
+    }
+
+    /// multibatch: a write into a chunk of either in-flight batch waits; one
+    /// into a buffered chunk (third batch) does not.
+    #[tokio::test]
+    async fn multibatch_write_into_either_batch_waits_elsewhere_does_not() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, fh, cs) = multi_batch_fs(&client, 2);
+        three_batches(&fs, fh, cs).await;
+        assert!(pending(fs.write(fh, cs + 1, &[1; 10])).await, "chunk 1 is in batch 1");
+        assert!(pending(fs.write(fh, 5 * cs + 1, &[1; 10])).await, "chunk 5 is in batch 2");
+        let w = tokio::time::timeout(Duration::from_secs(2), fs.write(fh, 9 * cs + 1, &[1; 10])).await;
+        assert_eq!(w.expect("chunk 9 is buffered, not uploading: must not wait").unwrap(), 10);
+        hole.abort();
+    }
+
+    /// multibatch: the last writer's close waits for EVERY batch of the path,
+    /// not just the first one to end.
+    #[tokio::test]
+    async fn multibatch_last_writer_flush_waits_for_all_batches() {
+        let fs = Arc::new(fs(true));
+        let cs = fs.write_buffer.chunk_size();
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.bg_uploads.insert("/f".to_string(), vec![(1, vec![0], cs), (2, vec![1], cs)]);
+        let f2 = fs.clone();
+        let mut flush = tokio::spawn(async move { f2.flush(fh).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: 1 });
+        assert!(tokio::time::timeout(Duration::from_millis(300), &mut flush).await.is_err(), "batch 2 still in flight");
+        assert_eq!(fs.bg_batches("/f"), 1);
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: 2 });
+        let done = tokio::time::timeout(Duration::from_secs(2), flush).await;
+        done.expect("all batches ended: flush must finish").unwrap().unwrap();
+        assert!(fs.bg_uploads.is_empty());
+    }
+
+    /// multibatch: batch 1 fails, disjoint batch 2 succeeds: the error stays
+    /// armed until batch 1's chunks commit (retry) or a full commit_all
+    /// succeeds.
+    #[test]
+    fn multibatch_later_success_keeps_an_earlier_failure_armed() {
+        let fs = fs(true);
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let armed = |fs: &DtfsFilesystem| fs.open_files.get(&fh).unwrap().write_error.is_some();
+        fs.record_bg_batch("/f", &[0, 1, 2, 3], Err(anyhow::anyhow!("put failed")));
+        assert!(armed(&fs));
+        fs.record_bg_batch("/f", &[4, 5, 6, 7], Ok(()));
+        assert!(armed(&fs), "a disjoint later success cleared batch 1's failure");
+        // Boundary: a retry covering only part of the failed chunks.
+        fs.record_bg_batch("/f", &[0, 1, 2], Ok(()));
+        assert!(armed(&fs), "chunk 3 not retried yet");
+        fs.record_bg_batch("/f", &[3], Ok(()));
+        assert!(!armed(&fs), "every failed chunk committed again");
+        // A full commit_all success clears a pending failure outright.
+        fs.record_bg_batch("/f", &[8], Err(anyhow::anyhow!("put failed")));
+        fs.record_aged_commit("/f", Ok(()));
+        assert!(!armed(&fs));
+        fs.record_bg_batch("/f", &[9], Ok(()));
+        assert!(!armed(&fs));
+    }
+
+    /// multibatch: two overlapping commits of disjoint chunk sets both merge
+    /// into the handle's snapshot (no `locations = None`, no O(file)
+    /// refetch); an overlapping one sharing a chunk falls back.
+    #[tokio::test]
+    async fn multibatch_disjoint_overlapping_commits_merge_intersecting_fall_back() {
+        let fs = fs(true);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/f", 0, cs)));
+        let ci = |i: u32, size: u64| committed_chunk_info(i, &"a".repeat(64), size, vec![], "warm");
+        let a = fs.commit_tracker.begin_chunks("/f", Some(vec![0]));
+        let b = fs.commit_tracker.begin_chunks("/f", Some(vec![1]));
+        // b applied first on the manager, merged last here: order-free.
+        fs.mark_committed_and_refresh("/f", fh, Committed { chunks: Some(vec![ci(1, 10)]), token: Some(b) }).await;
+        fs.mark_committed_and_refresh("/f", fh, Committed { chunks: Some(vec![ci(0, cs)]), token: Some(a) }).await;
+        let loc = fs.open_files.get(&fh).unwrap().locations.clone().expect("disjoint merge fell back to None");
+        let idx: Vec<_> = loc.chunks.iter().map(|c| c.chunk_index).collect();
+        assert_eq!((idx, loc.total_size), (vec![Some(0), Some(1)], cs + 10));
+        let c = fs.commit_tracker.begin_chunks("/f", Some(vec![2]));
+        let d = fs.commit_tracker.begin_chunks("/f", Some(vec![2, 3]));
+        fs.mark_committed_and_refresh("/f", fh, Committed { chunks: Some(vec![ci(2, cs)]), token: Some(c) }).await;
+        assert!(fs.open_files.get(&fh).unwrap().locations.is_none(), "chunk 2 shared: must refetch");
+        drop(d);
     }
 
     /// `/f` with a 4-chunk batch in flight (overlay only). The returned hook

@@ -61,9 +61,16 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   (`merge_into_snapshot`: replace the index, grow size). Instead it sets the
   handles' `locations = None` (and drops the cache entry) when a handle has
   no snapshot, the commit was lease-less, the snapshot is positional/
-  sizeless, another commit on the path overlapped it (`CommitTracker`;
+  sizeless, a conflicting commit on the path overlapped it (`CommitTracker`;
   commits are not serialized per path, so merge order may differ from apply
-  order), or the committing fh is closed/detached (`merge_allowed`). Never
+  order), or the committing fh is closed/detached (`merge_allowed`).
+  Conflicting = the chunk index sets intersect, or either is a whole-file
+  slot (`begin`: SetFileSize/truncate). Overlapping commits of DISJOINT sets
+  (`begin_chunks`, background batches of one path) both merge
+  (`CommitToken::may_merge`): each replaces only its own indices and the
+  size is max(current, committed extent), so the merges commute. Such a
+  non-exclusive merge updates the handles but leaves the metadata cache
+  entry dropped (two refreshes race on its copy). Never
   eager-fetch after a commit (fetch results can land out of order) and never
   per batch (quadratic on big files). `refetch_locations` (read, write and
   the post-truncate refresh) uses a fetch only if no commit on the path
@@ -239,23 +246,36 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   is headroom only.
 - `write.async_commit` background upload: write()'s batch (`flush()`) is
   handed to `spawn_bg_upload` and write() returns (prod: one knfsd thread
-  got nothing while each batch uploaded, 9-20 MiB/s). At most ONE batch per
-  path (`bg_uploads`: the batch's exact sorted chunk index set + bytes, not a
-  lo..=hi range: interleaved NFS streams make batches like {2,19,36,53} and
-  a range made most writes wait); while it runs, write() does not
-  call `flush()` (complete chunks stay buffered). Not more: overlapping
-  commits of a path make the merge fall back to a full re-fetch. The task
+  got nothing while each batch uploaded, 9-20 MiB/s). Up to
+  `write.max_inflight_batches` (default 1, clamp 1..=16) batches per path
+  (`bg_uploads`: per batch its overlay id, exact sorted chunk index set +
+  bytes, not a lo..=hi range: interleaved NFS streams make batches like
+  {2,19,36,53} and a range made most writes wait); at the limit write()
+  does not call `flush()` (complete chunks stay buffered). Puts in flight
+  per path: up to max_inflight_batches x min(upload_concurrency, batch
+  chunks); one batch ends with its slowest put, so with 1 the pipeline
+  drained at every batch end (prod 59 MiB/s). Batches of a path have
+  disjoint chunk sets (in-flight chunks left the buffer; writes into them
+  wait), so their overlapping commits still merge (`may_merge`). The
+  per-file dirty cap is `max(128 MB, (n + 1) x batch limit)` (`dirty_cap_for`;
+  n = 1 when async_commit is off). The task
   (`bg_upload`) renews the lease (`renew_if_due`), keeps `begin_inflight`
   until restore/merge, on failure restores under the fh's current path and
-  arms every writer's `write_error` (`record_aged_commit`, success clears
-  it); `BgSlot` clears the entry and wakes `wait_bg_uploads` (Notify) even on
+  arms every writer's `write_error` (`record_bg_batch`: the batch's chunks
+  go to each writer's `failed_chunks`; a batch success removes its chunks
+  and clears `write_error` only when none is left, so a later disjoint
+  batch never hides an earlier failure; a `commit_all` success clears
+  both); `BgSlot` removes its batch and wakes `wait_bg` (Notify) even on
   panic. It holds NO `path_guard` (writes would block on it again); instead
-  everything that could touch those chunks waits for it first:
-  write() into a chunk of the batch (`range_hits_upload`; else it re-seeds
-  from the pre-commit snapshot and the restore clobbers it), a write whose
-  dirty + in-flight bytes would meet the dirty cap (`bg_backpressure`,
-  then the cap drain as before), `commit_all` (last writer's flush/release,
-  timer), truncate, rename (every lock path) and unlink; NOT async fsync
+  everything that could touch those chunks waits first: write() into a
+  chunk of a batch waits until no batch holds the range
+  (`range_hits_upload`; else it re-seeds from the pre-commit snapshot and
+  the restore clobbers it); a write whose dirty + in-flight (all batches)
+  bytes would meet the dirty cap waits until under it or none in flight
+  (`bg_backpressure`; the cap drain then never overlaps a batch); ALL
+  batches of the path are waited for (`wait_bg_uploads`) by `commit_all`
+  (last writer's flush/release, timer, stop), truncate, rename (every lock
+  path) and unlink; NOT async fsync
   (knfsd fsyncs per NFS COMMIT; waiting stalled its one thread). Waiters
   may hold `path_guard` (the task never takes it: no deadlock), and holding
   it means no new batch starts. Write-side EOF (append offset, hole fill,

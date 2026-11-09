@@ -1196,6 +1196,14 @@ pub struct FuseWriteConfig {
     /// `async_commit = true`; validated `1..=60` only when it is on.
     #[serde(default = "default_async_commit_secs")]
     pub async_commit_secs: u64,
+    /// `async_commit` only: background batches of ONE file uploading at
+    /// once (each with `upload_concurrency` puts), so the next batch starts
+    /// while the slowest put of the previous one still runs. Clamped into
+    /// `1..=16` by `effective_max_inflight_batches`; `1` (default) = one
+    /// batch per file. Raises the per-file dirty cap to
+    /// `max(128 MB, (n + 1) x batch limit)`. Ignored when async_commit is off.
+    #[serde(default = "default_max_inflight_batches")]
+    pub max_inflight_batches: u32,
 }
 
 impl Default for FuseWriteConfig {
@@ -1207,6 +1215,7 @@ impl Default for FuseWriteConfig {
             anchor_sync: true,
             async_commit: false,
             async_commit_secs: default_async_commit_secs(),
+            max_inflight_batches: default_max_inflight_batches(),
         }
     }
 }
@@ -1242,6 +1251,11 @@ impl FuseWriteConfig {
     pub fn effective_upload_concurrency(&self) -> usize {
         self.upload_concurrency.clamp(1, 64) as usize
     }
+
+    /// `max_inflight_batches` clamped into `1..=16`.
+    pub fn effective_max_inflight_batches(&self) -> usize {
+        self.max_inflight_batches.clamp(1, 16) as usize
+    }
 }
 
 fn default_first_write_tier() -> String {
@@ -1254,6 +1268,10 @@ fn default_flush_batch_chunks() -> u32 {
 
 fn default_upload_concurrency() -> u32 {
     2
+}
+
+fn default_max_inflight_batches() -> u32 {
+    1
 }
 
 fn default_async_commit_secs() -> u64 {
@@ -2181,6 +2199,18 @@ warm = 2
         let cfg: FuseWriteConfig =
             toml::from_str("flush_batch_chunks = 1").unwrap();
         assert_eq!(cfg.flush_batch_chunks, 1, "1 is the documented rollback value");
+    }
+
+    #[test]
+    fn max_inflight_batches_defaults_to_one_and_clamps_to_1_16() {
+        let cfg: FuseWriteConfig = toml::from_str("").unwrap();
+        assert_eq!((cfg.max_inflight_batches, cfg.effective_max_inflight_batches()), (1, 1));
+        assert_eq!(FuseWriteConfig::default().max_inflight_batches, 1);
+        for (raw, want) in [(0u32, 1usize), (1, 1), (4, 4), (16, 16), (17, 16)] {
+            let cfg: FuseWriteConfig =
+                toml::from_str(&format!("max_inflight_batches = {raw}")).unwrap();
+            assert_eq!(cfg.effective_max_inflight_batches(), want, "raw {raw}");
+        }
     }
 
     #[test]

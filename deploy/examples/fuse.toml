@@ -137,6 +137,13 @@ mountpoint = "/mnt/dtfs"
 # Max age of an uncommitted buffered byte with async_commit = true (1..=60,
 # half the 120 s write lease).
 #async_commit_secs = 30
+# async_commit only: background batches of ONE file uploading at once
+# (clamped 1..=16; 1 = one batch per file). Puts in flight per file = up to
+# max_inflight_batches x min(upload_concurrency, flush_batch_chunks); the
+# next batch starts while the slowest put of the previous one still runs.
+# Per-file dirty cap becomes max(128 MB, (n + 1) x batch limit), e.g.
+# 16 x 4 MB batches with n = 4: 320 MB PER OPEN WRITER.
+#max_inflight_batches = 1
 
 #[memory]
 # CF-5: per-process RAM budget + pressure ladder. 0 = unbounded (legacy).
