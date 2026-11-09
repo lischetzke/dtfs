@@ -762,6 +762,9 @@ pub struct DtfsFilesystem {
     /// Test hook run by open_with_append right before it inserts the handle.
     #[cfg(test)]
     open_race_hook: std::sync::Mutex<Option<Box<dyn FnOnce(&DtfsFilesystem) + Send>>>,
+    /// Test hook run by release() right after its release_write_lease RPC.
+    #[cfg(test)]
+    release_race_hook: std::sync::Mutex<Option<Box<dyn FnOnce(&DtfsFilesystem) + Send>>>,
     /// P0-1: prefix used for write-lease `owner_id` values. Format:
     /// `<hostname>:<pid>:`. The per-open `:<fh>` suffix is appended at
     /// open-time to make each owner_id unique within the process.
@@ -849,6 +852,8 @@ impl DtfsFilesystem {
             write_race_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             open_race_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            release_race_hook: std::sync::Mutex::new(None),
             lease_owner_prefix,
             local_cache: None,
         }
@@ -1004,6 +1009,8 @@ impl DtfsFilesystem {
                 bail!(msg);
             }
         }
+        // Owner whose lease this handle shares (reuse or same-owner fetch).
+        let mut lent_owner: Option<String> = reused.as_ref().map(|r| r.0.clone());
         let (lease_id, lease_deadline, lease_owner_id) = if let Some((o, id, dl, _)) = &reused {
             debug!(path, owner = %o, "writable reopen shares the open writer's lease and snapshot");
             (Some(id.clone()), *dl, Some(o.clone()))
@@ -1014,6 +1021,7 @@ impl DtfsFilesystem {
             // manager API uses the DC to render the right location for
             // this client in the topology view.
             let owner_id = if let Some(o) = shared_lease_owner(&self.open_lease_owners(), path) {
+                lent_owner = Some(o.clone());
                 o
             } else if self.client_location.datacenter.is_empty() {
                 format!("{}{}", self.lease_owner_prefix, fh)
@@ -1153,20 +1161,11 @@ impl DtfsFilesystem {
             }
         }
 
-        // The lender may have closed between the copy and the insert: its
-        // release saw no other owner and released the lease. Re-acquire then.
-        if let Some((owner, ..)) = &reused {
-            let lender_open = self
-                .open_files
-                .iter()
-                .any(|e| *e.key() != fh && e.value().lease_owner_id.as_deref() == Some(owner.as_str()));
-            if !lender_open {
-                if let Err(e) = self.reacquire_write_lease(fh, path, Some(owner)).await {
-                    self.open_files.remove(&fh);
-                    warn!(path, error = %e, "reopen: lender closed and the lease could not be re-acquired");
-                    return Err(e);
-                }
-            }
+        // The lender may have closed between the copy/acquire and the
+        // insert: its release saw no other owner and released the lease
+        // (the same id a same-owner acquire got). Re-acquire then.
+        if let Some(owner) = &lent_owner {
+            self.reacquire_if_lender_gone(fh, path, owner).await?;
         }
 
         debug!(path, fh, append, "file opened");
@@ -2414,6 +2413,13 @@ impl DtfsFilesystem {
                         "release_write_lease failed; lease will expire naturally"
                     );
                 }
+                #[cfg(test)]
+                if let Some(hook) = self.release_race_hook.lock().unwrap().take() {
+                    hook(self);
+                }
+                if let Some(owner) = file.lease_owner_id.as_deref() {
+                    self.reacquire_for_reopened_owner(owner).await;
+                }
             }
             // CR-1-3 (FUSE-2): only a writable fh may drop the path-keyed
             // write buffer, and only when no OTHER writable fh on the same
@@ -3525,10 +3531,24 @@ impl DtfsFilesystem {
 
         // Dropped on the `?` below, so a failed commit ends its slot too.
         let token = self.commit_tracker.begin(path);
-        self.client
-            .commit_chunk_locations(path, &volume_id, commits, &lease_id)
-            .await
-            .with_context(|| format!("commit_chunk_locations failed for {path}"))?;
+        let res = self.client.commit_chunk_locations(path, &volume_id, commits.clone(), &lease_id).await;
+        let res = match res {
+            // A lender's release can delete the lease this fh shares (same
+            // owner, same id) before renew_if_due notices: re-acquire once
+            // under the fh's own owner (refused if another owner holds it)
+            // and retry the commit the manager did not apply.
+            Err(e) if !lease_id.is_empty() && is_lease_conflict(&e) => {
+                let owner = self.open_files.get(&fh).and_then(|f| f.lease_owner_id.clone());
+                warn!(path, fh, error = %format!("{e:#}"), "commit rejected for a lost lease; re-acquiring once and retrying");
+                self.reacquire_write_lease(fh, path, owner.as_deref())
+                    .await
+                    .with_context(|| format!("commit_chunk_locations for {path}: lease lost"))?;
+                let lease_id = self.commit_lease_id(fh, path);
+                self.client.commit_chunk_locations(path, &volume_id, commits, &lease_id).await
+            }
+            r => r,
+        };
+        res.with_context(|| format!("commit_chunk_locations failed for {path}"))?;
 
         // A lease-less commit is union-merged by the manager, so the local
         // replace-merge would not match it: make the caller re-fetch.
@@ -3725,6 +3745,45 @@ impl DtfsFilesystem {
             }
         }
         None
+    }
+
+    /// After release() released `owner`'s lease: a reopen of the same owner
+    /// inserted meanwhile shares that lease id (the manager keeps one per
+    /// owner), so the release deleted its lease too. Re-acquire for it
+    /// (`adopt_reacquired_lease` reaches every handle of the owner).
+    async fn reacquire_for_reopened_owner(&self, owner: &str) {
+        let Some((fh, path)) = self
+            .open_files
+            .iter()
+            .find(|e| e.value().lease_owner_id.as_deref() == Some(owner))
+            .map(|e| (*e.key(), e.value().path.clone()))
+        else {
+            return;
+        };
+        warn!(path = %path, owner, fh, "a reopen raced release_write_lease; re-acquiring the released lease");
+        if let Err(e) = self.reacquire_write_lease(fh, &path, Some(owner)).await {
+            warn!(path = %path, owner, error = %format!("{e:#}"), "re-acquire after release failed; the next commit re-acquires");
+        }
+    }
+
+    /// Open-path check after inserting `fh` that shares `owner`'s lease
+    /// (reused or same-owner fetch): if no other handle of the owner remains,
+    /// the lender closed meanwhile and its release may have deleted the
+    /// lease; re-acquire. Err = the fh was removed, fail the open.
+    async fn reacquire_if_lender_gone(&self, fh: u64, path: &str, owner: &str) -> Result<()> {
+        let lender_open = self
+            .open_files
+            .iter()
+            .any(|e| *e.key() != fh && e.value().lease_owner_id.as_deref() == Some(owner));
+        if lender_open {
+            return Ok(());
+        }
+        if let Err(e) = self.reacquire_write_lease(fh, path, Some(owner)).await {
+            self.open_files.remove(&fh);
+            warn!(path, error = %e, "reopen: lender closed and the lease could not be re-acquired");
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Lease a commit by `fh` of `path` sends.
@@ -4190,6 +4249,12 @@ fn rename_lock_paths(open: &[(String, OpenFlags)], from: &str, to: &str) -> Vec<
 /// independent of the error's concrete type.
 fn is_resource_exhausted(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("ResourceExhausted")
+}
+
+/// A commit the manager refused because the write lease is gone or not
+/// ours (`lease_conflict`; message from `DtfsClient::commit_chunk_locations`).
+fn is_lease_conflict(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("commit_chunk_locations rejected: write lease no longer held")
 }
 
 /// Runs `upload(i)` for every segment index of a flush batch and returns the
@@ -6662,6 +6727,44 @@ mod async_commit_fs_tests {
             let out = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
             assert_eq!(out.contains(ghost), expect_unlink, "buffered={buffered}: {out}");
         }
+    }
+
+    /// R3-2: a reopen of the same owner inserted while release()'s
+    /// release_write_lease RPC ran (the manager keeps one lease id per owner,
+    /// so that release deleted the reopen's lease too). release() must
+    /// re-acquire for it; with no such reopen it must not.
+    #[tokio::test]
+    async fn release_reacquires_for_a_reopen_that_raced_the_lease_release() {
+        let logs = Logs::default();
+        let w = logs.clone();
+        let sub = tracing_subscriber::fmt().with_writer(move || w.clone()).with_ansi(false).finish();
+        let _g = tracing::subscriber::set_default(sub);
+        let msg = "re-acquiring the released lease";
+        for raced in [false, true] {
+            logs.0.lock().unwrap().clear();
+            let fs = fs(true);
+            let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+            set_lease(&fs, fh, "h:1", "L1");
+            if raced {
+                *fs.release_race_hook.lock().unwrap() = Some(Box::new(|fs: &DtfsFilesystem| {
+                    let re = open(fs, "/f", OpenFlags::WriteOnly);
+                    set_lease(fs, re, "h:1", "L1");
+                }));
+            }
+            fs.release(fh).await.expect("nothing buffered");
+            let out = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(out.contains(msg), raced, "raced={raced}: {out}");
+        }
+    }
+
+    /// Only the client's lease-conflict rejection triggers the commit's
+    /// re-acquire + retry; an ack-floor rejection or a transport error never.
+    #[test]
+    fn lease_conflict_is_classified_from_the_client_error() {
+        let lost = anyhow::anyhow!("commit_chunk_locations rejected: write lease no longer held (x)");
+        assert!(is_lease_conflict(&lost.context("commit_chunk_locations failed for /f")));
+        assert!(!is_lease_conflict(&anyhow::anyhow!("commit_chunk_locations rejected: manager declined the commit")));
+        assert!(!is_lease_conflict(&anyhow::anyhow!("commit_chunk_locations: no managers configured")));
     }
 
     #[tokio::test]

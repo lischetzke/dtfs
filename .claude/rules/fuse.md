@@ -112,10 +112,15 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   (`shared_lease_owner`; same owner = manager re-acquire, no EBUSY). Prod:
   two O(file) fetches + a Raft write per COMMIT, 29 -> 20 MiB/s.
   `release()` skips `release_write_lease` while another handle shares the
-  owner (`lease_owner_still_open`). After its insert, a reuse whose lender
-  is gone (it closed between the copy and the insert and released the
-  lease) re-acquires under the same owner (`reacquire_write_lease`; failure
-  removes the fh and fails the open).
+  owner (`lease_owner_still_open`). The manager keeps ONE lease id per
+  owner, so a lender's release by that id also kills a same-owner reopen's
+  lease. Three guards: after its insert, a reuse or same-owner fetch open
+  whose lender is gone re-acquires (`reacquire_if_lender_gone`; failure
+  removes the fh and fails the open); after its release RPC, release()
+  re-acquires for a handle of the owner that appeared meanwhile
+  (`reacquire_for_reopened_owner`); a commit rejected for a lost lease
+  (`is_lease_conflict`) re-acquires once under the fh's own owner (refused
+  if another owner holds it) and retries.
 - `release()` drops the buffer when no other writer is open; a refused
   commit is logged at error with chunk indices and bytes lost. flush and
   fsync return the commit error.
