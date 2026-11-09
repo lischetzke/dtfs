@@ -2817,16 +2817,7 @@ impl DtfsFilesystem {
                 expires_at_ms: resp.conflict_expires_at_ms,
             }));
         }
-        // Every handle sharing this owner (knfsd reopen) gets the new id, so
-        // whichever closes last releases the live lease, not a stale one.
-        let deadline = lease_deadline_from(sent);
-        for mut entry in self.open_files.iter_mut() {
-            let f = entry.value_mut();
-            if f.lease_owner_id.as_deref() == Some(owner_id) {
-                f.lease_id = Some(resp.lease_id.clone());
-                f.lease_deadline = Some(deadline);
-            }
-        }
+        self.adopt_reacquired_lease(owner_id, &resp.lease_id, lease_deadline_from(sent));
         tracing::warn!(
             path = %path,
             owner = %owner_id,
@@ -3793,6 +3784,19 @@ fn lease_owner_still_open(remaining: &[Option<String>], owner: &str) -> bool {
 }
 
 impl DtfsFilesystem {
+    /// Every handle sharing `owner_id` (knfsd reopen) takes the re-acquired
+    /// lease id, so whichever closes last releases the live lease, not a
+    /// stale one that lingers until expiry.
+    fn adopt_reacquired_lease(&self, owner_id: &str, lease_id: &str, deadline: Instant) {
+        for mut entry in self.open_files.iter_mut() {
+            let f = entry.value_mut();
+            if f.lease_owner_id.as_deref() == Some(owner_id) {
+                f.lease_id = Some(lease_id.to_string());
+                f.lease_deadline = Some(deadline);
+            }
+        }
+    }
+
     fn open_lease_owners(&self) -> Vec<(String, Option<String>)> {
         self.open_files
             .iter()
@@ -5364,6 +5368,41 @@ mod async_commit_fs_tests {
             },
         );
         fh
+    }
+
+    fn set_lease(fs: &DtfsFilesystem, fh: u64, owner: &str, id: &str) {
+        let mut f = fs.open_files.get_mut(&fh).unwrap();
+        f.lease_owner_id = Some(owner.to_string());
+        f.lease_id = Some(id.to_string());
+    }
+
+    fn lease_id(fs: &DtfsFilesystem, fh: u64) -> Option<String> {
+        fs.open_files.get(&fh).unwrap().lease_id.clone()
+    }
+
+    /// Lease lapse mid-write with a shared owner (knfsd reopen): the handle
+    /// that re-acquires gets a new lease id, and so must every other handle
+    /// of that owner, else the one closing last releases a stale id and the
+    /// lease lingers until expiry. Other owners and readers keep theirs.
+    #[test]
+    fn reacquired_lease_reaches_every_handle_of_the_owner() {
+        let fs = fs(false);
+        let a = open(&fs, "/f", OpenFlags::ReadWrite);
+        let b = open(&fs, "/f", OpenFlags::ReadWrite);
+        let other = open(&fs, "/g", OpenFlags::ReadWrite);
+        let reader = open(&fs, "/f", OpenFlags::ReadOnly);
+        set_lease(&fs, a, "h:1", "old");
+        set_lease(&fs, b, "h:1", "old");
+        set_lease(&fs, other, "h:2", "g-lease");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        fs.adopt_reacquired_lease("h:1", "new", deadline);
+
+        assert_eq!(lease_id(&fs, a).as_deref(), Some("new"));
+        assert_eq!(lease_id(&fs, b).as_deref(), Some("new"), "sibling of the re-acquirer");
+        assert_eq!(fs.open_files.get(&b).unwrap().lease_deadline, Some(deadline));
+        assert_eq!(lease_id(&fs, other).as_deref(), Some("g-lease"), "other owner untouched");
+        assert_eq!(lease_id(&fs, reader), None, "reader holds no lease");
     }
 
     /// Chunkless snapshot of `size` bytes: every seed is a zero seed, no I/O
