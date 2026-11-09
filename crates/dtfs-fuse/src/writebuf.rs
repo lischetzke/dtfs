@@ -40,6 +40,8 @@ const FLUSH_BATCH_MIN_BYTES: usize = 64 * 1024 * 1024;
 /// ladder (A.3.2 / A.5) sheds write buffers, and several files can be open
 /// at once during a torrent landing, so batch x chunk size stays bounded.
 const FLUSH_BATCH_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// Reference chunk size for `batch_limits` (the default `chunk_size_mb`).
+const BATCH_REF_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 /// CR-1-1 — default (and minimum) ceiling on total dirty bytes buffered per
 /// file, independent of how many distinct chunk indices are touched. The
@@ -53,8 +55,12 @@ pub const DIRTY_BYTES_CAP: usize = FLUSH_BATCH_MIN_BYTES * 2;
 /// size: batch = `max(64 MB, chunks x chunk_size)` capped at 256 MB; dirty
 /// cap = `max(128 MB, 2 x batch)`, so in async_commit mode one batch can
 /// upload (in-flight bytes count against the cap) while the next fills.
-pub(crate) fn batch_limits(configured: usize, chunk_size: usize) -> (usize, usize) {
-    let want = configured.clamp(1, MAX_FLUSH_BATCH_CHUNKS).saturating_mul(chunk_size);
+pub(crate) fn batch_limits(configured: usize) -> (usize, usize) {
+    // Sized against a 4 MiB reference chunk, not the volume's: only raising
+    // `flush_batch_chunks` grows the limits, so a large-chunk volume with the
+    // default batch keeps the old 64 MiB batch / 128 MiB cap (per-chunk
+    // flush) instead of up to 512 MiB of dirty data per writer.
+    let want = configured.clamp(1, MAX_FLUSH_BATCH_CHUNKS).saturating_mul(BATCH_REF_CHUNK_BYTES);
     let batch = want.clamp(FLUSH_BATCH_MIN_BYTES, FLUSH_BATCH_MAX_BYTES);
     (batch, (2 * batch).max(DIRTY_BYTES_CAP))
 }
@@ -71,7 +77,7 @@ pub(crate) fn effective_batch_chunks(configured: usize, chunk_size: usize) -> us
         // Degenerate; avoids a divide by zero.
         return by_count;
     }
-    by_count.min(batch_limits(configured, chunk_size).0 / chunk_size).max(1)
+    by_count.min(batch_limits(configured).0 / chunk_size).max(1)
 }
 
 /// Zero fill for a write at `offset` past the logical `end`: only the edge
@@ -378,7 +384,7 @@ impl WriteBuffer {
         Self {
             chunk_size,
             flush_batch_chunks: effective_batch_chunks(flush_batch_chunks, chunk_size),
-            dirty_cap: batch_limits(flush_batch_chunks, chunk_size).1,
+            dirty_cap: batch_limits(flush_batch_chunks).1,
             buffers: DashMap::new(),
             inflight: DashMap::new(),
             next_inflight: AtomicU64::new(0),
@@ -1459,9 +1465,11 @@ mod tests {
         let mib = 1024 * 1024;
         assert_eq!(effective_batch_chunks(4, 4 * mib), 4);
         assert_eq!(effective_batch_chunks(32, 4 * mib), 32);
-        assert_eq!(effective_batch_chunks(4, 32 * mib), 4);
-        assert_eq!(effective_batch_chunks(4, 64 * mib), 4);
-        assert_eq!(effective_batch_chunks(4, 128 * mib), 2);
+        // Default batch on large chunks: unchanged from before the 64-chunk
+        // limits (64 MiB batch), only a raised count grows it.
+        assert_eq!(effective_batch_chunks(4, 32 * mib), 2);
+        assert_eq!(effective_batch_chunks(4, 64 * mib), 1);
+        assert_eq!(effective_batch_chunks(4, 128 * mib), 1);
         assert_eq!(effective_batch_chunks(64, 4 * mib), 64);
         assert_eq!(effective_batch_chunks(0, 4 * mib), 1);
         assert_eq!(effective_batch_chunks(4, 0), 4);
@@ -1491,18 +1499,19 @@ mod tests {
     #[test]
     fn bigbatch_limits_derive_from_configured_batch() {
         let mib = 1024 * 1024;
-        assert_eq!(batch_limits(4, 4 * mib), (64 * mib, 128 * mib), "defaults unchanged");
-        assert_eq!(batch_limits(16, 4 * mib), (64 * mib, 128 * mib));
-        assert_eq!(batch_limits(17, 4 * mib), (68 * mib, 136 * mib), "just above the floor");
-        assert_eq!(batch_limits(64, 4 * mib), (256 * mib, 512 * mib));
-        assert_eq!(batch_limits(128, 4 * mib), (256 * mib, 512 * mib), "count clamped to 64");
-        assert_eq!(batch_limits(4, 64 * mib), (256 * mib, 512 * mib));
-        assert_eq!(batch_limits(8, 64 * mib), (256 * mib, 512 * mib), "byte ceiling");
-        assert_eq!(batch_limits(0, 4 * mib), (64 * mib, 128 * mib));
+        assert_eq!(batch_limits(4), (64 * mib, 128 * mib), "defaults unchanged");
+        assert_eq!(batch_limits(16), (64 * mib, 128 * mib));
+        assert_eq!(batch_limits(17), (68 * mib, 136 * mib), "just above the floor");
+        assert_eq!(batch_limits(64), (256 * mib, 512 * mib));
+        assert_eq!(batch_limits(128), (256 * mib, 512 * mib), "count clamped to 64");
+        assert_eq!(batch_limits(0), (64 * mib, 128 * mib));
         assert_eq!(effective_batch_chunks(64, 4 * mib), 64, "64 is in range");
         assert_eq!(effective_batch_chunks(65, 4 * mib), 64, "65 clamped");
-        assert_eq!(effective_batch_chunks(4, 64 * mib), 4);
-        assert_eq!(effective_batch_chunks(8, 64 * mib), 4, "256 MiB / 64 MiB");
+        // A large-chunk volume with the default batch keeps the old per-chunk
+        // flush and 128 MiB cap: the limits follow the configured count only.
+        assert_eq!(effective_batch_chunks(4, 64 * mib), 1, "64 MiB batch / 64 MiB chunk");
+        assert_eq!(WriteBuffer::new_with_batch(64 * mib, 4).dirty_cap(), DIRTY_BYTES_CAP);
+        assert_eq!(effective_batch_chunks(64, 64 * mib), 4, "raised batch: 256 MiB / 64 MiB");
         let wb = WriteBuffer::new_with_batch(4 * mib, 64);
         assert_eq!((wb.flush_batch_chunks, wb.dirty_cap()), (64, 512 * mib));
         assert_eq!(WriteBuffer::new_with_batch(4 * mib, 4).dirty_cap(), DIRTY_BYTES_CAP);

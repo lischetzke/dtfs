@@ -106,8 +106,8 @@ mountpoint = "/mnt/dtfs"
 # flushing, amortizing the AllocateChunks + CommitChunkLocations round trip
 # over a batch instead of firing once per chunk. Effective range 1..=64
 # (values outside are clamped). Batch byte limit = max(64 MB, batch x
-# chunk_size) capped at 256 MB (the batch shrinks to fit); per-file dirty
-# cap = max(128 MB, 2 x batch limit). Default 4 x 4 MB: 64 MB / 128 MB.
+# 4 MB) capped at 256 MB, whatever the volume's chunk size (large chunks:
+# fewer per batch); per-file dirty cap = max(128 MB, 2 x batch limit). Default 4 x 4 MB: 64 MB / 128 MB.
 # 64 x 4 MB: 256 MB batch, 512 MB dirty cap PER OPEN WRITER; size the
 # [memory] budget for dirty cap x open writers + readahead.cache_mb.
 # 1 restores the pre-WI-01 per-chunk-flush behaviour exactly.

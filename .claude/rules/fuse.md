@@ -181,7 +181,9 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   the old file's drained bytes never show after rm+recreate, O_TRUNC or
   rename-over (a later guard drop is a no-op).
 - Batch is byte-clamped by `writebuf::batch_limits`: `max(64 MB, batch x
-  chunk_size)` capped at 256 MB; total dirty bytes per open file are capped
+  4 MiB)` capped at 256 MB (4 MiB reference chunk, not the volume's: only a
+  raised `flush_batch_chunks` grows it, so large-chunk volumes keep the old
+  64 MB batch); total dirty bytes per open file are capped
   at `WriteBuffer::dirty_cap` = `max(128 MB, 2 x batch limit)` (defaults
   64 MB / 128 MB = `DIRTY_BYTES_CAP`; 64 x 4 MiB: 256 / 512 MB). The cap is
   per open writer and nothing sheds write buffers: dirty cap x open
