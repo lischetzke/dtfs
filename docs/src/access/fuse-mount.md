@@ -102,6 +102,7 @@ A DTFS mount can be re-exported with the Linux kernel NFS server (`exportfs`, us
   - Do not mount with the client `sync` option: every NFS WRITE then becomes a FUSE `fsync`, which uploads the partial tail chunk again (about 1 MB/s). Keep the export itself `sync`.
   - Avoid `nconnect` and run knfsd with one thread (`[nfsd]` `threads=1` in `/etc/nfs.conf` or a file in `/etc/nfs.conf.d/`). Parallel connections and threads deliver writes out of order; a write past the buffered end zero-fills the gap, the gap chunk counts as complete and is committed, and the late write re-reads and re-uploads it.
 - **Unexport before stopping the client.** While a path under the mount is exported, knfsd holds the mount: `fusermount3 -u` fails with `EBUSY`, `dtfs-fuse` exits anyway, and the dead mount (`Transport endpoint is not connected`) makes every later start fail. Unexport every export under the mount first (`exportfs -u <client>:<path>` per export, then `exportfs -f`), and re-export after the mount is up.
+- **NFSv4 opens survive the unexport.** An NFSv4 client that holds a file open (an rsync in progress, with its open and write delegation) keeps knfsd's reference on the mount after `exportfs -u`, so the unmount still fails with `EBUSY`. Revoke that state with `echo /mnt/dtfs > /proc/fs/nfsd/unlock_filesystem` (kernel 6.9 or newer; older kernels release only NLM locks there) and retry the unmount for a few seconds while knfsd drops its cached file references. NFSv3 has no open state, so a v3-only export does not need this.
 
 A drop-in for the `dtfs-fuse@` instance does this on every start and stop. The empty `ExecStartPre=` and `ExecStop=` lines clear the template's own `fusermount3 -u` so the unexport runs first. Adjust the client spec (as in `/etc/exports`) and the path, one `-u` line per export:
 
@@ -111,13 +112,15 @@ A drop-in for the `dtfs-fuse@` instance does this on every start and stop. The e
 ExecStartPre=
 ExecStartPre=-/usr/sbin/exportfs -u *:/mnt/dtfs/media
 ExecStartPre=-/usr/sbin/exportfs -f
-ExecStartPre=-/usr/bin/fusermount3 -u /mnt/dtfs
+ExecStartPre=-/bin/sh -c 'grep -q " /mnt/dtfs fuse" /proc/mounts && echo /mnt/dtfs > /proc/fs/nfsd/unlock_filesystem'
+ExecStartPre=-/bin/sh -c 'for i in $$(seq 15); do grep -q " /mnt/dtfs fuse" /proc/mounts || exit 0; /usr/bin/fusermount3 -u /mnt/dtfs && exit 0; sleep 1; done; exit 1'
 # Type=simple: wait for the mount before re-exporting.
-ExecStartPost=/bin/sh -c 'for i in $(seq 30); do mountpoint -q /mnt/dtfs && exec /usr/sbin/exportfs -r; sleep 1; done; exit 1'
+ExecStartPost=/bin/sh -c 'for i in $$(seq 30); do mountpoint -q /mnt/dtfs && exec /usr/sbin/exportfs -r; sleep 1; done; exit 1'
 ExecStop=
 ExecStop=-/usr/sbin/exportfs -u *:/mnt/dtfs/media
 ExecStop=-/usr/sbin/exportfs -f
-ExecStop=/usr/bin/fusermount3 -u /mnt/dtfs
+ExecStop=-/bin/sh -c 'grep -q " /mnt/dtfs fuse" /proc/mounts && echo /mnt/dtfs > /proc/fs/nfsd/unlock_filesystem'
+ExecStop=/bin/sh -c 'for i in $$(seq 15); do grep -q " /mnt/dtfs fuse" /proc/mounts || exit 0; /usr/bin/fusermount3 -u /mnt/dtfs && exit 0; sleep 1; done; exit 1'
 ```
 
-Run `systemctl daemon-reload` after adding it. This drop-in is not shipped or tested by the installer.
+`$$` is systemd's escape for a literal `$`. Run `systemctl daemon-reload` after adding it. This drop-in is not shipped or tested by the installer; the dev-cluster NFS check mounts with NFSv3 and does not exercise the NFSv4 revoke.
