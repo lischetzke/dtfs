@@ -2706,20 +2706,48 @@ impl DtfsFilesystem {
             .get(&fh)
             .map(|f| f.path.clone())
             .context("invalid fh")?;
-        {
-            // Counts as a commit (as in truncate), so a fetch overlapping the
-            // size change is never installed with the old size.
-            let _commit = self.commit_tracker.begin(&path);
-            self.client
-                .set_file_size(&path, new_size)
-                .await
-                .with_context(|| format!("set_size {new_size} failed for {path}"))?;
-        }
+        // Counts as a commit (as in truncate), so a fetch overlapping the
+        // size change is never installed with the old size.
+        let commit = self.commit_tracker.begin(&path);
+        self.client
+            .set_file_size(&path, new_size)
+            .await
+            .with_context(|| format!("set_size {new_size} failed for {path}"))?;
         self.metadata_cache.remove(&path);
-        // Handle snapshots hold the old size (O_APPEND EOF, hole-fill base);
-        // None makes the next write()/read() refetch.
-        self.invalidate_handle_locations(&path);
+        self.apply_size_change(&path, new_size, commit.exclusive());
         Ok(())
+    }
+
+    /// Handle snapshots after a SetFileSize of `path` to `new_size`. A grow
+    /// (at or above every handle's size) under an exclusive commit slot
+    /// drops no chunks: the snapshots only take the new size, copy-on-write
+    /// (holders of one Arc keep sharing one). Otherwise (shrink, overlapped)
+    /// `None`: the next write()/read() refetches.
+    fn apply_size_change(&self, path: &str, new_size: u64, exclusive: bool) {
+        let grow = exclusive
+            && self.open_files.iter().all(|e| {
+                e.value().path != path || e.value().locations.as_ref().map_or(true, |l| l.total_size <= new_size)
+            });
+        if !grow {
+            self.invalidate_handle_locations(path);
+            return;
+        }
+        let mut done: Vec<(Weak<FileLocations>, Arc<FileLocations>)> = Vec::new();
+        for mut e in self.open_files.iter_mut() {
+            if e.value().path != path {
+                continue;
+            }
+            let Some(cur) = e.value_mut().locations.as_mut() else { continue };
+            if let Some(new) = merged_of(&done, &Arc::downgrade(cur)) {
+                *cur = new;
+                continue;
+            }
+            let old = Arc::downgrade(cur);
+            let l = Arc::make_mut(cur);
+            // max: a commit merged meanwhile never shrinks back.
+            l.total_size = l.total_size.max(new_size);
+            done.push((old, cur.clone()));
+        }
     }
 
     /// F-037 — truncate. `new_size = 0` is the SQLite journal-recycle case.
@@ -5935,6 +5963,42 @@ mod async_commit_fs_tests {
         assert!(fs.open_files.get(&rfh).unwrap().write_error.is_none());
         assert_eq!(fs.write_buffer.dirty_bytes(&det), 10);
         assert_eq!(fs.write_buffer.dirty_bytes("/r"), 6);
+    }
+
+    /// R2-4: a grow under an exclusive commit slot drops no chunks: the
+    /// handles keep their snapshots with the new size (shared Arcs stay
+    /// shared, chunks kept) instead of an O(file) refetch per sparse write.
+    /// A shrink, a handle above the new size or an overlapped size change
+    /// invalidates.
+    #[test]
+    fn size_grow_keeps_handle_snapshots_shrink_invalidates() {
+        let fs = fs(false);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let a = open(&fs, "/f", OpenFlags::ReadWrite);
+        let b = open(&fs, "/f", OpenFlags::ReadOnly);
+        let g = open(&fs, "/g", OpenFlags::ReadWrite);
+        let mut snap = holes("/f", 10, cs);
+        snap.chunks.push(committed_chunk_info(0, &"a".repeat(64), 10, vec![], "warm"));
+        let snap = Arc::new(snap);
+        for fh in [a, b] {
+            fs.open_files.get_mut(&fh).unwrap().locations = Some(snap.clone());
+        }
+        fs.open_files.get_mut(&g).unwrap().locations = Some(Arc::new(holes("/g", 7, cs)));
+        let loc = |fh: u64| fs.open_files.get(&fh).unwrap().locations.clone();
+        fs.apply_size_change("/f", 100 * cs, true);
+        let (la, lb) = (loc(a).expect("grow invalidated a"), loc(b).expect("grow invalidated b"));
+        assert_eq!(la.total_size, 100 * cs);
+        assert!(Arc::ptr_eq(&la, &lb), "shared snapshot split");
+        assert!(la.chunk_at(0).is_some(), "chunks lost");
+        assert_eq!(snap.total_size, 10, "copy-on-write: an in-flight reader's Arc changed");
+        assert_eq!(loc(g).unwrap().total_size, 7, "other path touched");
+        fs.apply_size_change("/f", 200 * cs, false);
+        assert!(loc(a).is_none() && loc(b).is_none(), "overlapped size change kept snapshots");
+        for fh in [a, b] {
+            fs.open_files.get_mut(&fh).unwrap().locations = Some(snap.clone());
+        }
+        fs.apply_size_change("/f", 5, true);
+        assert!(loc(a).is_none() && loc(b).is_none(), "shrink kept snapshots");
     }
 
     /// R2-3: unlink holds `path_guard` across the bg wait, delete and

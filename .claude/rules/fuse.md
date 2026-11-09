@@ -128,7 +128,11 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   `set_size`s the manager to max(logical end, `visible_size`) (never below a
   committed/in-flight end: SetFileSize drops chunks above it), since a file
   with no SetFileSize reports the sum of its chunk sizes; commits then grow
-  it. `FileWriteBuffer.extent` is the buffered end (`logical_size` =
+  it. A `set_size` grow (at or above every handle's size, exclusive commit
+  slot) updates the handles' snapshot sizes copy-on-write
+  (`apply_size_change`); only a shrink or an overlapped one sets them
+  `None` (else every sparse write cost an O(file) refetch and sent knfsd
+  reopens back to fetch + acquire). `FileWriteBuffer.extent` is the buffered end (`logical_size` =
   max(extent, chunk ends), kept across partial drains, `None` once fully
   drained, reset by the next write/seed into an empty entry, set by
   `truncate`). A missing-index seed in write() clamps to that end, not the
