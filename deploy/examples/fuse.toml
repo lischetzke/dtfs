@@ -147,6 +147,9 @@ mountpoint = "/mnt/dtfs"
 # next batch starts while the slowest put of the previous one still runs.
 # Per-file dirty cap becomes max(128 MB, (n + 1) x batch limit), e.g.
 # 16 x 4 MB batches with n = 4: 320 MB PER OPEN WRITER.
+# Put buffers come on top, outside the dirty cap and outside [memory]:
+# about 3 MiB per put per target, i.e. puts in flight x replicas x 3 MiB
+# (16/16/4 x 3 targets: 64 x 3 x 3 = 576 MiB; 1-replica volume: 192 MiB).
 #max_inflight_batches = 1
 
 #[memory]
