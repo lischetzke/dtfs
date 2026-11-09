@@ -226,7 +226,10 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   closes the later commits; the last writer's flush/release commits. A 1 s timer (`commit_aged`, at most
   `AGED_COMMITS_PER_TICK` paths) commits a path whose oldest buffered byte
   (`ChunkBuf.since`, kept across `restore_segments`) is `async_commit_secs`
-  old, through `commit_all` with a writable non-detached fh. The cap drain
+  old, through `commit_all` with a writable non-detached fh. It never waits:
+  a path whose `path_guard` is held (`try_lock_owned`) or that has batches
+  in flight is skipped until a later tick (one busy file stalled every
+  other file's age commit). The cap drain
   then also drains partial chunks outside `keep`. Neither the timer nor
   FUSE_FLUSH (sent without the inode lock: another fd's close commit ran
   beside a write, which then zero-seeded over its in-flight bytes, R3-1)

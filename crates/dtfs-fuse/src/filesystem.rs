@@ -2580,7 +2580,16 @@ impl DtfsFilesystem {
                 continue;
             }
             let Some(fh) = self.writable_fh(&path) else { continue };
-            let guard = self.path_guard(&path).await;
+            // Skip a busy path (guard held, e.g. a write under backpressure)
+            // or one with batches in flight (commit_all would wait for them):
+            // waiting stalled every other path's age commit. Next tick retries.
+            let lock = self.path_locks.entry(path.clone()).or_default().clone();
+            let Ok(g) = lock.try_lock_owned() else { continue };
+            let guard = Some(g);
+            if self.bg_batches(&path) > 0 {
+                self.drop_path_guard(&path, guard);
+                continue;
+            }
             // Re-check under the lock: release or rename may have won.
             let still_open = self.open_files.get(&fh).map(|f| f.path == path) == Some(true);
             if still_open {
@@ -6463,6 +6472,29 @@ mod async_commit_fs_tests {
         let err = fs.fsync(fh).await.unwrap_err();
         assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
         assert_eq!(fs.write_buffer.dirty_bytes("/f"), 100, "restored after the failed upload");
+    }
+
+    /// Audit 9: one busy path (its `path_guard` held, e.g. a write under
+    /// backpressure) or one with batches in flight must not stall the age
+    /// timer for every other path: the tick skips them, the next retries.
+    #[tokio::test]
+    async fn timer_skips_a_busy_path_and_commits_the_others() {
+        let fs = fs(true);
+        let armed = |fs: &DtfsFilesystem, fh: u64| fs.open_files.get(&fh).unwrap().write_error.is_some();
+        let (a, b, c) = (open(&fs, "/a", OpenFlags::ReadWrite), open(&fs, "/b", OpenFlags::ReadWrite), open(&fs, "/c", OpenFlags::ReadWrite));
+        for p in ["/a", "/c", "/b"] {
+            fs.write_buffer.write(p, 0, &[7; 100]);
+        }
+        fs.bg_uploads.insert("/c".to_string(), vec![(99, vec![5], 1)]);
+        let busy = fs.path_guard("/a").await;
+        let tick = tokio::time::timeout(Duration::from_secs(2), fs.commit_aged(Instant::now() + AGE)).await;
+        tick.expect("the timer stalled behind /a's path_guard or /c's batch");
+        assert!(armed(&fs, b), "/b attempted (no manager: armed)");
+        assert!(!armed(&fs, a) && !armed(&fs, c), "busy paths skipped");
+        fs.drop_path_guard("/a", busy);
+        fs.bg_uploads.remove("/c");
+        fs.commit_aged(Instant::now() + AGE).await;
+        assert!(armed(&fs, a) && armed(&fs, c), "next tick retries them");
     }
 
     #[tokio::test]
