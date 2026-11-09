@@ -314,8 +314,9 @@ directory (still visible as a synthetic dir at the old path).
 CR-2-3 (RAFT-3): `UpdateChunkLocations`'s apply computes `extent =
 max(chunk_index * chunk_size + size_bytes)` over the merged chunks and
 grows (never shrinks) an already-set `logical_size` to at least that
-extent (`None` stays `None` — a chunk-only file still falls back to the
-summed-chunks size in `metadata.rs`). Pre-fix, `SetFileSize` set
+extent (`None` stays `None` — a chunk-only file falls back to the chunk
+extent, `FileMetadata::reported_size`; it was the summed-chunks size in
+`metadata.rs` up to v0.1.13). Pre-fix, `SetFileSize` set
 `logical_size` once and nothing ever revisited it, so `open(O_TRUNC)`
 then rewrite (cp, rsync `--inplace`, shell `>`, SQLite journal recycle)
 committed chunks past the truncated size while every reader kept seeing

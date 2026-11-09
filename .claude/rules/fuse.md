@@ -141,8 +141,9 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   failed cap drain, so the buffer is unchanged)
   `set_size`s the manager to max(logical end, `visible_size`) (never below a
   committed/in-flight end: SetFileSize drops chunks above it), since a file
-  with no SetFileSize reports the sum of its chunk sizes; commits then grow
-  it. A `set_size` grow (at or above every handle's size, exclusive commit
+  with no SetFileSize reports its chunk extent (`FileMetadata::reported_size`;
+  the sum of its chunk sizes on managers at v0.1.13 or older); commits then
+  grow it. A `set_size` grow (at or above every handle's size, exclusive commit
   slot) updates the handles' snapshot sizes copy-on-write
   (`apply_size_change`); only a shrink or an overlapped one sets them
   `None` (else every sparse write cost an O(file) refetch and sent knfsd
@@ -166,7 +167,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   gap-free drain, as writes cover them, by `remove`; re-keyed by `rename`,
   clipped by `truncate`.
   `flush_segments_to_cluster` puts a batch's segments at most
-  `write.upload_concurrency` (default 2, clamp 1..=16) at a time
+  `write.upload_concurrency` (default 2, clamp 1..=64) at a time
   (`upload_segments`, ordered `buffered`, lowest-index error wins, nothing
   starts after it) and sends ONE `commit_chunk_locations` only after all
   segments reached quorum; that commit carries the committing fh's own
