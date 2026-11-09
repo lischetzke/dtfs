@@ -54,7 +54,11 @@ text there.
    `ListChunks` and never de-locates a chunk recorded under another disk
    of the same node. Orphan/de-located reap grace is measured on the on-disk `.dat` mtime, keyed by
    `(node_id, disk_id)` when the data node reports disk ids (node-wide
-   fallback otherwise); unknown mtime defers the reap.
+   fallback otherwise); unknown mtime defers the reap. Grace floors:
+   config `orphan_grace_secs` >= 6 h, one-shot manual reap
+   (`POST /api/v1/scrub/orphans`) >= `MANUAL_ORPHAN_GRACE_FLOOR_SECS`
+   (1 h); timer and manual share one single-flight token, and a dry run
+   issues no delete and no Raft write.
 9. Rename is one Raft command; chunk_id bindings unchanged.
 10. Reads fall back replica by replica; fail only after all candidates.
 

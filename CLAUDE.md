@@ -70,7 +70,7 @@ Always `--release`. Iterate with `<test_name>`, finish with full crate. After co
 
 ## A.5 Memory model
 
-Bounded, best-effort, never OOM-kill, never reject by default. Ladder: stream to disk → shrink caches → drop unconsumed readahead → pause background → backpressure → (opt-in `shed_threshold_pct`) RESOURCE_EXHAUSTED. Composite hosts set `hard_cap_mb` per role. Every daemon has a unique `[node].hostname`; FUSE registers as `[location].host` (`<data-hostname>_cln`). Startup refuses invalid config (memory ladder, zero intervals/timeouts, `max_message_size_mb` 0, `chunk_size_mb` outside 1..=64, unknown TLS mode, `orphan_grace_secs` < 6 h), a moved data disk, and a snapshot older than the purged log. Config: `docs/src/configuration/`.
+Bounded, best-effort, never OOM-kill, never reject by default. Ladder: stream to disk → shrink caches → drop unconsumed readahead → pause background → backpressure → (opt-in `shed_threshold_pct`) RESOURCE_EXHAUSTED. Composite hosts set `hard_cap_mb` per role. Every daemon has a unique `[node].hostname`; FUSE registers as `[location].host` (`<data-hostname>_cln`). Startup refuses invalid config (memory ladder, zero intervals/timeouts, `max_message_size_mb` 0, `chunk_size_mb` outside 1..=64, unknown TLS mode, `orphan_grace_secs` < 6 h; a manual one-shot reap refuses a grace < 1 h), a moved data disk, and a snapshot older than the purged log. Config: `docs/src/configuration/`.
 
 ## A.6 Data-integrity audit checklist
 

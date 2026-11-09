@@ -41,7 +41,10 @@ or its file view is empty, the sweep is skipped with a warn log
 The grace is one-time; the configured `orphan_grace_secs` is not
 changed. The manual floor is 3600 s, far above any put-to-commit window
 (write lease 120 s, `async_commit_secs` <= 60 s); prefer 6 h or more on a
-cluster that is writing. One reap runs at a time (`409` otherwise) and
+cluster that is writing. The grace compares each data node's `.dat` mtime
+with the leader's clock, so a data node whose clock runs behind makes
+chunks look older: with a short grace, check clock sync first
+(`host_status` clock section, `timedatectl`). One reap runs at a time (`409` otherwise) and
 the timer skips its tick while a manual run is active. Large nodes take
 as long as their `ListChunks` (minutes on 50 TB); poll
 `dtfs-cli scrub orphans-status`.
