@@ -246,7 +246,7 @@ impl TaskScheduler {
         if_mtime_le_ms: Option<u64>,
     ) -> anyhow::Result<(bool, u64)> {
         let endpoint = normalize_endpoint(node_addr);
-        let mut client = self.tls.connect(&endpoint).await
+        let client = self.tls.connect(&endpoint).await
             .map(DataServiceClient::new)
             .map_err(|e| anyhow::anyhow!("connect to data node {}: {}", node_addr, e))?;
 
