@@ -4,7 +4,7 @@
 //! [`crate::snapshot`] and stored as `Cursor<Vec<u8>>` blobs.
 
 use std::collections::BTreeMap;
-use std::io::{self, Cursor, Write};
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -344,8 +344,9 @@ impl StateMachineData {
     }
 
     /// Build side of the snapshot; exhaustive over `StateMachineData` so a
-    /// new field cannot be silently left out of snapshots.
-    fn to_snapshot(&self) -> StateMachineSnapshot {
+    /// new field cannot be silently left out of snapshots. Consumes the
+    /// builder's frozen copy so the state is never cloned a second time.
+    fn into_snapshot(self) -> StateMachineSnapshot {
         let StateMachineData {
             last_applied_log,
             last_membership,
@@ -366,19 +367,19 @@ impl StateMachineData {
             last_applied_log: last_applied_log
                 .as_ref()
                 .map(|lid| (lid.leader_id.term, lid.index)),
-            last_membership: serde_json::to_value(last_membership).ok(),
-            files: files.clone(),
-            nodes: nodes.clone(),
-            cluster_config: cluster_config.clone(),
-            audit_log: audit_log.iter().cloned().collect(),
-            scrub_results: scrub_results.clone(),
-            scrub_results_by_level: scrub_results_by_level.clone(),
-            client_count: *client_count,
-            volumes: volumes.clone(),
-            migration_state_json: migration_state_json.clone(),
-            posix_locks: posix_locks.clone(),
-            write_leases: write_leases.clone(),
-            pending_scrub: pending_scrub.clone(),
+            last_membership: serde_json::to_value(&last_membership).ok(),
+            files,
+            nodes,
+            cluster_config,
+            audit_log: audit_log.into(),
+            scrub_results,
+            scrub_results_by_level,
+            client_count,
+            volumes,
+            migration_state_json,
+            posix_locks,
+            write_leases,
+            pending_scrub,
         }
     }
 }
@@ -566,19 +567,25 @@ pub struct StateMachineStore {
     snapshot_dir: Option<PathBuf>,
 }
 
-/// A snapshot that has been persisted (kept in memory for fast retrieval).
+/// The current snapshot. With a snapshot dir the payload is not kept
+/// resident (`data: None`); `get_current_snapshot` reads it back from
+/// `snapshot.bin`. In-memory stores (tests) keep it in `data`.
 #[derive(Debug, Clone)]
 struct StoredSnapshot {
     meta: crate::SnapshotMeta,
-    data: Vec<u8>,
+    data: Option<Vec<u8>>,
 }
 
 /// File-on-disk format that pairs the snapshot meta with the raw bytes.
-/// Stored as bincode inside `<snapshot_dir>/snapshot.bin`. Used to recover
+/// Stored as bincode inside `<snapshot_dir>/snapshot.bin`, written by
+/// `persist_snapshot_to_disk` and read by `read_persisted_snapshot` without
+/// materialising this struct (same bytes, pinned by
+/// `persisted_snapshot_is_byte_identical_to_bincode_envelope`). Used to recover
 /// the FSM (especially the Raft membership) across manager restarts —
 /// without this, a manager that loses the last membership log entry to
 /// compaction comes back as a member-less Learner with no leader (root
 /// cause of F-024).
+#[cfg(test)]
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedSnapshot {
     meta: crate::SnapshotMeta,
@@ -620,34 +627,25 @@ impl StateMachineStore {
             // Treat an unreadable snapshot as absent: log, delete it, and
             // start blank — openraft log-catchup from a healthy peer brings
             // the node current.
-            let decoded: Option<(PersistedSnapshot, StateMachineSnapshot)> =
-                match std::fs::read(&path) {
-                    Ok(bytes) => match bincode::deserialize::<PersistedSnapshot>(&bytes) {
-                        Ok(persisted) => match serde_json::from_slice::<StateMachineSnapshot>(
-                            &persisted.data,
-                        ) {
-                            Ok(snap) => Some((persisted, snap)),
-                            Err(e) => {
-                                tracing::warn!(error = %e, path = ?path,
-                                    "Bug BP-2: snapshot inner payload corrupt; \
-                                     discarding + catching up via log replay");
-                                None
-                            }
-                        },
+            let decoded: Option<(crate::SnapshotMeta, StateMachineSnapshot)> =
+                match read_persisted_snapshot(&path) {
+                    Ok((meta, data)) => match serde_json::from_slice::<StateMachineSnapshot>(&data) {
+                        Ok(snap) => Some((meta, snap)),
                         Err(e) => {
                             tracing::warn!(error = %e, path = ?path,
-                                "Bug BP-2: snapshot envelope corrupt/truncated; \
+                                "Bug BP-2: snapshot inner payload corrupt; \
                                  discarding + catching up via log replay");
                             None
                         }
                     },
                     Err(e) => {
                         tracing::warn!(error = %e, path = ?path,
-                            "Bug BP-2: snapshot unreadable; discarding");
+                            "Bug BP-2: snapshot envelope unreadable/corrupt/truncated; \
+                             discarding + catching up via log replay");
                         None
                     }
                 };
-            let Some((persisted, snap)) = decoded else {
+            let Some((persisted_meta, snap)) = decoded else {
                 let _ = std::fs::remove_file(&path);
                 return Ok(store);
             };
@@ -656,26 +654,23 @@ impl StateMachineStore {
                 .try_write()
                 .expect("fresh store, no contention");
             sm.restore_from_snapshot(
-                persisted.meta.last_log_id.clone(),
-                persisted.meta.last_membership.clone(),
+                persisted_meta.last_log_id.clone(),
+                persisted_meta.last_membership.clone(),
                 snap,
             );
             drop(sm);
+            info!(
+                "loaded persisted snapshot: {} (last_log_id={:?}, voters={})",
+                persisted_meta.snapshot_id,
+                persisted_meta.last_log_id,
+                persisted_meta.last_membership.voter_ids().count(),
+            );
             let mut slot = store
                 .snapshot
                 .try_write()
                 .expect("fresh store, no contention");
-            *slot = Some(StoredSnapshot {
-                meta: persisted.meta.clone(),
-                data: persisted.data,
-            });
+            *slot = Some(StoredSnapshot { meta: persisted_meta, data: None });
             drop(slot);
-            info!(
-                "loaded persisted snapshot: {} (last_log_id={:?}, voters={})",
-                persisted.meta.snapshot_id,
-                persisted.meta.last_log_id,
-                persisted.meta.last_membership.voter_ids().count(),
-            );
         }
 
         Ok(store)
@@ -687,18 +682,15 @@ impl StateMachineStore {
     }
 
     /// Atomically write the latest snapshot (meta + bytes) to disk so the FSM
-    /// survives manager restart (F-024).
+    /// survives manager restart (F-024). Streams the `PersistedSnapshot`
+    /// bincode envelope (meta, u64 LE payload length, payload) through a
+    /// `BufWriter`: `write_payload` writes the payload, the length is patched
+    /// afterwards. Same bytes as `bincode::serialize(&PersistedSnapshot)`.
     fn persist_snapshot_to_disk(
         dir: &Path,
         meta: &crate::SnapshotMeta,
-        bytes: &[u8],
+        write_payload: impl FnOnce(&mut BufWriter<std::fs::File>) -> io::Result<()>,
     ) -> Result<(), io::Error> {
-        let persisted = PersistedSnapshot {
-            meta: meta.clone(),
-            data: bytes.to_vec(),
-        };
-        let buf = bincode::serialize(&persisted)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let tmp = dir.join("snapshot.bin.tmp");
         let final_path = dir.join("snapshot.bin");
         // Bug BP-2 — crash/ENOSPC-safe write: fsync the tmp file BEFORE the
@@ -707,11 +699,20 @@ impl StateMachineStore {
         // stray `.tmp` — never a truncated `snapshot.bin`. (ISSUE-SCAN
         // 2026-06-02 F3: a disk-full snapshot write left a 0-byte
         // snapshot.bin that wedged the manager on `Read Snapshot EOF`.)
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&buf)?;
+        let total = {
+            let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
+            bincode::serialize_into(&mut w, meta)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let len_pos = w.stream_position()?;
+            w.write_all(&0u64.to_le_bytes())?;
+            write_payload(&mut w)?;
+            let end = w.stream_position()?;
+            w.seek(SeekFrom::Start(len_pos))?;
+            w.write_all(&(end - len_pos - 8).to_le_bytes())?;
+            let f = w.into_inner().map_err(|e| e.into_error())?;
             f.sync_all()?;
-        }
+            end
+        };
         std::fs::rename(&tmp, &final_path)?;
         // fsync the directory so the rename itself is durable.
         if let Ok(d) = std::fs::File::open(dir) {
@@ -721,10 +722,38 @@ impl StateMachineStore {
             "persisted snapshot to {:?}: id={} bytes={}",
             final_path,
             meta.snapshot_id,
-            buf.len()
+            total
         );
         Ok(())
     }
+}
+
+/// Read `snapshot.bin` (the `PersistedSnapshot` envelope) back as
+/// (meta, payload). The bincode limit and the length check are bounded by
+/// the file size, so a corrupt length cannot trigger a huge allocation.
+fn read_persisted_snapshot(path: &Path) -> io::Result<(crate::SnapshotMeta, Vec<u8>)> {
+    use bincode::Options;
+    let f = std::fs::File::open(path)?;
+    let file_len = f.metadata()?.len();
+    let mut r = BufReader::new(f);
+    let meta: crate::SnapshotMeta = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(file_len)
+        .deserialize_from(&mut r)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut len = [0u8; 8];
+    r.read_exact(&mut len)?;
+    let len = u64::from_le_bytes(len);
+    if len > file_len.saturating_sub(r.stream_position()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("snapshot payload length {len} exceeds file size {file_len}"),
+        ));
+    }
+    let mut data = vec![0u8; len as usize];
+    r.read_exact(&mut data)?;
+    Ok((meta, data))
 }
 
 impl Default for StateMachineStore {
@@ -746,13 +775,10 @@ pub struct DtfsSnapshotBuilder {
 
 impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<crate::Snapshot, io::Error> {
-        let sm = &self.data;
-
-        // Serialise the snapshot.
-        let snap = sm.to_snapshot();
-
-        let cursor = snapshot::serialize_snapshot(&snap)?;
-        let data_bytes = cursor.into_inner();
+        // Move the builder's frozen copy into the snapshot struct: no second
+        // clone of the state (the first, in `get_snapshot_builder`, keeps the
+        // SM lock short).
+        let sm = std::mem::take(&mut self.data);
 
         let snapshot_id = if let Some(ref lid) = sm.last_applied_log {
             format!("{}-{}", lid.leader_id.term, lid.index)
@@ -765,33 +791,38 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
             last_membership: sm.last_membership.clone(),
             snapshot_id,
         };
+        let snap = sm.into_snapshot();
+
+        let Some(dir) = &self.snapshot_dir else {
+            let data_bytes = snapshot::serialize_snapshot(&snap)?.into_inner();
+            *self.last_snapshot.write().await =
+                Some(StoredSnapshot { meta: meta.clone(), data: Some(data_bytes.clone()) });
+            return Ok(openraft::storage::Snapshot { meta, snapshot: Cursor::new(data_bytes) });
+        };
 
         // Persist to disk FIRST so a manager restart can reload membership +
         // state (F-024). A failure must surface: openraft purges the log
         // after a successful build, and a snapshot that never hit disk would
-        // leave the restarted node with a purged log and no state.
-        if let Some(dir) = &self.snapshot_dir {
-            if let Err(e) = StateMachineStore::persist_snapshot_to_disk(dir, &meta, &data_bytes) {
-                error!(error = %e, snapshot_id = %meta.snapshot_id,
-                    "failed to persist built snapshot; not publishing it");
-                return Err(e);
-            }
+        // leave the restarted node with a purged log and no state. The JSON
+        // streams into the file, so it is never resident next to the state.
+        if let Err(e) = StateMachineStore::persist_snapshot_to_disk(dir, &meta, |w| {
+            serde_json::to_writer(w, &snap).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        }) {
+            error!(error = %e, snapshot_id = %meta.snapshot_id,
+                "failed to persist built snapshot; not publishing it");
+            return Err(e);
         }
+        drop(snap);
 
-        // Cache the freshly built snapshot in memory so `get_current_snapshot`
-        // returns the up-to-date blob (leader needs this to send to followers).
-        {
-            let mut slot = self.last_snapshot.write().await;
-            *slot = Some(StoredSnapshot {
-                meta: meta.clone(),
-                data: data_bytes.clone(),
-            });
-        }
+        // Publish the meta only; `get_current_snapshot` reads the payload
+        // back from disk (the leader needs it to send to followers).
+        *self.last_snapshot.write().await = Some(StoredSnapshot { meta, data: None });
 
-        Ok(openraft::storage::Snapshot {
-            meta,
-            snapshot: Cursor::new(data_bytes),
-        })
+        // openraft only uses `meta` of the result, but the type carries the
+        // payload: read it back. Meta and payload come from the same file, so
+        // they match even if an install raced this build.
+        let (meta, data_bytes) = read_persisted_snapshot(&dir.join("snapshot.bin"))?;
+        Ok(openraft::storage::Snapshot { meta, snapshot: Cursor::new(data_bytes) })
     }
 }
 
@@ -864,19 +895,22 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         meta: &crate::SnapshotMeta,
         snapshot_cursor: Cursor<Vec<u8>>,
     ) -> Result<(), io::Error> {
-        let raw = snapshot::bytes_from_cursor(snapshot_cursor)?;
+        let raw = snapshot_cursor.into_inner();
         let snap_data: StateMachineSnapshot = serde_json::from_slice(&raw)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // Persist before touching any in-memory state (F-024): on failure the
         // old state stays intact and openraft sees the error.
         if let Some(dir) = &self.snapshot_dir {
-            if let Err(e) = Self::persist_snapshot_to_disk(dir, meta, &raw) {
+            if let Err(e) = Self::persist_snapshot_to_disk(dir, meta, |w| w.write_all(&raw)) {
                 error!(error = %e, snapshot_id = %meta.snapshot_id,
                     "failed to persist installed snapshot; state unchanged");
                 return Err(e);
             }
         }
+        // With a snapshot dir the payload lives on disk only: drop it before
+        // the old state is replaced.
+        let resident = self.snapshot_dir.is_none().then_some(raw);
 
         // Rebuild the state machine from the snapshot.
         {
@@ -891,10 +925,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         // Store the snapshot blob for later retrieval.
         {
             let mut stored = self.snapshot.write().await;
-            *stored = Some(StoredSnapshot {
-                meta: meta.clone(),
-                data: raw.clone(),
-            });
+            *stored = Some(StoredSnapshot { meta: meta.clone(), data: resident });
         }
 
         info!(
@@ -909,10 +940,21 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         &mut self,
     ) -> Result<Option<crate::Snapshot>, io::Error> {
         let stored = self.snapshot.read().await;
-        Ok(stored.as_ref().map(|s| openraft::storage::Snapshot {
-            meta: s.meta.clone(),
-            snapshot: Cursor::new(s.data.clone()),
-        }))
+        let Some(s) = stored.as_ref() else { return Ok(None) };
+        if let Some(data) = &s.data {
+            return Ok(Some(openraft::storage::Snapshot {
+                meta: s.meta.clone(),
+                snapshot: Cursor::new(data.clone()),
+            }));
+        }
+        drop(stored);
+        let dir = self
+            .snapshot_dir
+            .as_ref()
+            .ok_or_else(|| io::Error::other("snapshot payload neither resident nor on disk"))?;
+        // Meta comes from the same file as the payload so they cannot diverge.
+        let (meta, data) = read_persisted_snapshot(&dir.join("snapshot.bin"))?;
+        Ok(Some(openraft::storage::Snapshot { meta, snapshot: Cursor::new(data) }))
     }
 }
 

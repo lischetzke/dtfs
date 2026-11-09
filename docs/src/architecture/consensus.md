@@ -219,16 +219,18 @@ A snapshot is the serialized `StateMachineData` (JSON) wrapped in a `Cursor<Vec<
     |
     v
   1. DtfsSnapshotBuilder::build_snapshot()
-    |  - Clone the entire StateMachineData (under read lock)
-    |  - Serialize to JSON
+    |  - Clone the entire StateMachineData once (under read lock, short)
+    |  - Move that copy into the snapshot struct (no second clone)
     |  - Generate snapshot_id from last applied log
     |
     v
-  2. Persist the snapshot to disk (temp file, rename). A failure here is
+  2. Stream the JSON straight into the bincode envelope on disk (temp file,
+    |  fsync, rename; same bytes as before). A failure here is
     |  returned to Raft as a fatal storage error: the snapshot is NOT
     |  published and the log is NOT purged
     v
-  3. Cache it in memory (StoredSnapshot)
+  3. Publish the meta only (StoredSnapshot); get_current_snapshot reads the
+    |  payload back from snapshot.bin on demand (in-memory stores keep it)
     |
     v
   4. Purge log entries up to snapshot's last_applied_log
@@ -266,8 +268,8 @@ When a follower is too far behind to catch up via log entries (because those ent
     |                                              |     - Update last_applied_log
     |                                              |       and last_membership
     |                                              |
-    |  SnapshotResponse                            |  3. Store snapshot blob
-    |  <-------------------------------------------|     for future retrieval
+    |  SnapshotResponse                            |  3. Keep only the meta; the
+    |  <-------------------------------------------|     blob is re-read from disk
     |                                              |
 ```
 

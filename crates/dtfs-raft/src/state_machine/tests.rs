@@ -212,6 +212,95 @@ mod snapshot_persistence_tests {
         assert!(sm.get_current_snapshot().await.unwrap().is_some());
     }
 
+    /// Audit #5 — the streamed `snapshot.bin` must be byte-identical to the
+    /// legacy `bincode::serialize(&PersistedSnapshot { meta, data: json })`
+    /// so old binaries load new snapshots and vice versa, and the JSON
+    /// payload must equal `serde_json::to_vec` of the state.
+    #[tokio::test]
+    async fn persisted_snapshot_is_byte_identical_to_bincode_envelope() {
+        let dir = tmp_dir();
+        let mut sm = StateMachineStore::open_at(dir.path()).expect("open");
+        {
+            let mut data = sm.data.write().await;
+            populate_sample_state(&mut data);
+        }
+        let legacy_json =
+            serde_json::to_vec(&sm.data.read().await.clone().into_snapshot()).unwrap();
+        let snap = sm.get_snapshot_builder().await.build_snapshot().await.expect("build");
+        let payload = snap.snapshot.into_inner();
+        assert_eq!(payload, legacy_json, "payload must be the legacy JSON encoding");
+        let legacy_file = bincode::serialize(&PersistedSnapshot {
+            meta: snap.meta.clone(),
+            data: legacy_json,
+        })
+        .unwrap();
+        let on_disk = std::fs::read(dir.path().join("snapshot.bin")).unwrap();
+        assert_eq!(on_disk, legacy_file, "snapshot.bin must keep the legacy bincode envelope");
+
+        // Install side writes the same envelope.
+        let fdir = tmp_dir();
+        let mut f = StateMachineStore::open_at(fdir.path()).expect("open follower");
+        f.install_snapshot(&snap.meta, Cursor::new(payload)).await.expect("install");
+        assert_eq!(std::fs::read(fdir.path().join("snapshot.bin")).unwrap(), legacy_file);
+    }
+
+    /// Audit #5 — with a snapshot dir the payload is not kept resident;
+    /// `get_current_snapshot` reads meta + payload back from disk, after a
+    /// build, an install and a reopen.
+    #[tokio::test]
+    async fn current_snapshot_payload_is_read_from_disk_not_resident() {
+        let dir = tmp_dir();
+        let mut sm = StateMachineStore::open_at(dir.path()).expect("open");
+        {
+            let mut data = sm.data.write().await;
+            populate_sample_state(&mut data);
+        }
+        let snap = sm.get_snapshot_builder().await.build_snapshot().await.expect("build");
+        let bytes = snap.snapshot.into_inner();
+        assert!(sm.snapshot.read().await.as_ref().unwrap().data.is_none(), "build keeps no blob");
+        let cur = sm.get_current_snapshot().await.unwrap().expect("current");
+        assert_eq!(cur.meta, snap.meta);
+        assert_eq!(cur.snapshot.into_inner(), bytes);
+
+        let fdir = tmp_dir();
+        let mut f = StateMachineStore::open_at(fdir.path()).expect("open follower");
+        f.install_snapshot(&snap.meta, Cursor::new(bytes.clone())).await.expect("install");
+        assert!(f.snapshot.read().await.as_ref().unwrap().data.is_none(), "install keeps no blob");
+        assert_eq!(f.get_current_snapshot().await.unwrap().unwrap().snapshot.into_inner(), bytes);
+
+        drop(f);
+        let mut reopened = StateMachineStore::open_at(fdir.path()).expect("reopen");
+        assert!(reopened.snapshot.read().await.as_ref().unwrap().data.is_none());
+        let cur = reopened.get_current_snapshot().await.unwrap().expect("current after reopen");
+        assert_eq!(cur.meta, snap.meta);
+        assert_eq!(cur.snapshot.into_inner(), bytes);
+    }
+
+    /// Audit #5 negative — a `snapshot.bin` whose payload length exceeds the
+    /// file is rejected as InvalidData without allocating that length;
+    /// `open_at` discards it.
+    #[tokio::test]
+    async fn persisted_snapshot_bad_length_is_rejected() {
+        let dir = tmp_dir();
+        let path = dir.path().join("snapshot.bin");
+        let meta = crate::SnapshotMeta::default();
+        let mut bytes = bincode::serialize(&meta).unwrap();
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_persisted_snapshot(&path).unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+        // Boundary: payload length exactly one byte past the file end.
+        let mut bytes =
+            bincode::serialize(&PersistedSnapshot { meta, data: b"{}".to_vec() }).unwrap();
+        bytes.pop();
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_persisted_snapshot(&path).unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+        let sm = StateMachineStore::open_at(dir.path()).expect("open tolerates bad length");
+        assert!(sm.data.read().await.files.is_empty());
+        assert!(!path.exists(), "corrupt snapshot.bin removed");
+    }
+
     #[tokio::test]
     async fn install_snapshot_persist_failure_is_err_and_state_unchanged() {
         let src_dir = tmp_dir();

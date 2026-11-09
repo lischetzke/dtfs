@@ -344,7 +344,7 @@ impl RaftNetworkV2<TypeConfig> for DtfsNetwork {
         };
 
         // The snapshot cursor already owns the bytes — take them without the
-        // extra full copy `bytes_from_cursor` would make (CNF-4).
+        // extra full copy a `read_to_end` would make (CNF-4).
         let snap_bytes = snapshot.snapshot.into_inner();
         // CO-3-6: pick the per-request RPC timeout from the snapshot size +
         // openraft's hard_ttl BEFORE we drop the raw bytes below.
