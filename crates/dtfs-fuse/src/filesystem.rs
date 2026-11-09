@@ -1082,8 +1082,16 @@ impl DtfsFilesystem {
         // index (`chunk_at(max index)`), never by array position, since the
         // manager's array is dense while the file's index space may be
         // sparse (REV-2-1).
-        if append && flags.is_writable() && seed_ok {
-            let max_idx = locations.chunk_count().checked_sub(1);
+        // Sole writer only: with another writable handle open (a reused
+        // snapshot or not) the tail chunk may be buffered or in a background
+        // batch (no path_guard / bg wait here; a stale partial seed would
+        // truncate it at commit). write()'s RMW seeds it under the guard.
+        let sole_writer = reused.is_none() && !self.has_writable_handle(path);
+        if append && flags.is_writable() && seed_ok && sole_writer {
+            let max_idx = locations
+                .chunk_count()
+                .checked_sub(1)
+                .filter(|&i| self.write_buffer.chunk_needs_seed(path, i as u32));
             if let Some(last_idx) = max_idx {
                 match self
                     .read_seed_bytes(path, &locations, last_idx, chunk_size, locations.total_size)
@@ -6159,6 +6167,27 @@ mod async_commit_fs_tests {
         let r = tokio::time::timeout(Duration::from_secs(2), fs.release(fh2)).await;
         r.expect("release of a shared-owner handle must not call the manager").unwrap();
         assert_eq!(lease_id(&fs, fh).as_deref(), Some("L1"));
+        hole.abort();
+    }
+
+    /// R2-1: an O_APPEND reopen while a writer is open must not seed the tail
+    /// chunk at open (no path_guard, no bg wait: the chunk may sit in an
+    /// in-flight batch and the stale seed later truncates it). The tail
+    /// chunk's replica is a black hole: a seed read would hang.
+    #[tokio::test]
+    async fn append_reopen_with_an_open_writer_does_not_seed_the_tail() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, fh) = leased_writer(&client).await;
+        let data = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", data.local_addr().unwrap());
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let mut snap = holes("/f", 3 * cs + 5, cs);
+        snap.chunks.push(committed_chunk_info(3, &"a".repeat(64), 5, vec![addr], "warm"));
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(snap));
+        let open2 = tokio::time::timeout(Duration::from_secs(2), fs.open_with_append("/f", OpenFlags::WriteOnly, true)).await;
+        open2.expect("append reopen must not read the tail chunk").unwrap();
+        assert!(!fs.write_buffer.has_chunk("/f", 3), "tail seeded at open");
+        drop(data);
         hole.abort();
     }
 

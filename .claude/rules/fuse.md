@@ -101,7 +101,11 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   deadline and snapshot `Arc` (`shared_writer`): no fetch, no
   acquire_write_lease, no post-lease `quiet_fetch`, not cached into the
   metadata cache; `FetchToken::unchanged` (no commit started/ended since
-  the copy) gates the tail seed and the handle's snapshot (else `None`).
+  the copy) gates the handle's snapshot (else `None`). The open-time
+  O_APPEND tail seed runs only for a sole writer (no reuse, no other
+  writable handle of the path) and only if `chunk_needs_seed`: it holds no
+  `path_guard`/bg wait, and a stale partial seed of a chunk in an in-flight
+  batch truncated it at commit; write()'s RMW seeds the EOF chunk instead.
   That handle's snapshot `None` = fetch path with the same owner
   (`shared_lease_owner`; same owner = manager re-acquire, no EBUSY). Prod:
   two O(file) fetches + a Raft write per COMMIT, 29 -> 20 MiB/s.
