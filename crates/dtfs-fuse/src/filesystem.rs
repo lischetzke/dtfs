@@ -981,7 +981,9 @@ impl DtfsFilesystem {
             // trailing fields, so this is backward-compatible. The
             // manager API uses the DC to render the right location for
             // this client in the topology view.
-            let owner_id = if self.client_location.datacenter.is_empty() {
+            let owner_id = if let Some(o) = shared_lease_owner(&self.open_lease_owners(), path) {
+                o
+            } else if self.client_location.datacenter.is_empty() {
                 format!("{}{}", self.lease_owner_prefix, fh)
             } else {
                 format!(
@@ -2130,7 +2132,15 @@ impl DtfsFilesystem {
             // P0-1: release the write lease (if held). Best-effort: a
             // network error here is logged, not propagated, since the lease
             // GC will reap it on expiry anyway.
-            if let Some(lease_id) = &file.lease_id {
+            let shared = file.lease_owner_id.as_deref().is_some_and(|owner| {
+                let remaining: Vec<Option<String>> = self
+                    .open_files
+                    .iter()
+                    .map(|e| e.value().lease_owner_id.clone())
+                    .collect();
+                lease_owner_still_open(&remaining, owner)
+            });
+            if let Some(lease_id) = file.lease_id.as_ref().filter(|_| !shared) {
                 if let Err(e) = self
                     .client
                     .release_write_lease(&file.path, lease_id)
@@ -2252,7 +2262,9 @@ impl DtfsFilesystem {
     ) -> Result<u64> {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         // Bug X — owner_id carries DC as a 4th field for the topology view.
-        let owner_id = if self.client_location.datacenter.is_empty() {
+        let owner_id = if let Some(o) = shared_lease_owner(&self.open_lease_owners(), path) {
+            o
+        } else if self.client_location.datacenter.is_empty() {
             format!("{}{}", self.lease_owner_prefix, fh)
         } else {
             format!(
@@ -3758,6 +3770,32 @@ fn other_writer_open(remaining: &[(String, OpenFlags)], path: &str) -> bool {
         .any(|(p, flags)| p == path && flags.is_writable())
 }
 
+/// knfsd reopens a file this process already holds open for write: the new
+/// writable fh joins the existing lease (same owner = manager re-acquire)
+/// instead of conflicting with ourselves (EBUSY). `others` = `(path,
+/// lease_owner_id)` of the other open handles; detached paths never match.
+fn shared_lease_owner(others: &[(String, Option<String>)], path: &str) -> Option<String> {
+    others
+        .iter()
+        .find(|(p, o)| p == path && o.is_some())
+        .and_then(|(_, o)| o.clone())
+}
+
+/// `release()` keeps the lease while another remaining handle shares its
+/// owner (`shared_lease_owner`); the last one releases it.
+fn lease_owner_still_open(remaining: &[Option<String>], owner: &str) -> bool {
+    remaining.iter().any(|o| o.as_deref() == Some(owner))
+}
+
+impl DtfsFilesystem {
+    fn open_lease_owners(&self) -> Vec<(String, Option<String>)> {
+        self.open_files
+            .iter()
+            .map(|e| (e.value().path.clone(), e.value().lease_owner_id.clone()))
+            .collect()
+    }
+}
+
 /// `write.async_commit` rename: the paths whose `path_guard` rename holds,
 /// sorted and unique: `from`, plus every writable handle at or below `from`
 /// (re-keyed) or `to` (detached). Only those can have a timer commit.
@@ -4357,6 +4395,31 @@ mod cr_1_3_flush_release_gating_tests {
     fn other_path_writer_is_irrelevant() {
         let remaining = vec![("/other".to_string(), OpenFlags::ReadWrite)];
         assert!(!other_writer_open(&remaining, "/f"));
+    }
+
+    /// knfsd reopen: a second writable open on the same path joins the
+    /// first handle's lease owner; other paths, readers and detached
+    /// handles never lend theirs.
+    #[test]
+    fn writable_reopen_shares_the_same_path_lease_owner() {
+        use super::shared_lease_owner;
+        let o = |p: &str, owner: Option<&str>| (p.to_string(), owner.map(str::to_string));
+        let others = vec![o("/f", None), o("/g", Some("h:1")), o("/f", Some("h:2"))];
+        assert_eq!(shared_lease_owner(&others, "/f").as_deref(), Some("h:2"));
+        assert_eq!(shared_lease_owner(&[o("/g", Some("h:1"))], "/f"), None);
+        assert_eq!(shared_lease_owner(&[o("/f", None)], "/f"), None);
+        assert_eq!(shared_lease_owner(&[o("/f\0detached-1", Some("h:1"))], "/f"), None);
+        assert_eq!(shared_lease_owner(&[], "/f"), None);
+    }
+
+    /// release() keeps a shared lease while another handle still uses its
+    /// owner; the last handle (or a different owner) releases.
+    #[test]
+    fn release_keeps_lease_while_owner_still_open() {
+        use super::lease_owner_still_open;
+        assert!(lease_owner_still_open(&[None, Some("h:2".into())], "h:2"));
+        assert!(!lease_owner_still_open(&[], "h:2"));
+        assert!(!lease_owner_still_open(&[None, Some("h:3".into())], "h:2"));
     }
 }
 

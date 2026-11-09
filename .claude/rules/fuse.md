@@ -95,6 +95,11 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   before every drain), never after. `set_size`/truncate-refresh failure set
   handle `locations = None`. `create()` seeds from the manager's snapshot
   when it kept a populated file (`committed_any = !chunks.is_empty()`).
+- A writable open of a path this process already holds a lease on (knfsd
+  reopen) reuses that handle's `lease_owner_id` (`shared_lease_owner`;
+  same owner = manager re-acquire, no EBUSY); `release()` skips
+  `release_write_lease` while another handle shares the owner
+  (`lease_owner_still_open`).
 - `release()` drops the buffer when no other writer is open; a refused
   commit is logged at error with chunk indices and bytes lost. flush and
   fsync return the commit error.
@@ -203,4 +208,5 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   process, so NFS clients get ESTALE after a dtfs-fuse restart and must
   remount. Other limits: NFSv3 EXCLUSIVE create retransmit gives EEXIST,
   chown is ignored (daemon uid/gid), repeated open/flush/release during
-  long NFS writes is untested end to end.
+  long NFS writes is untested end to end (a second writable open shares
+  the first handle's lease owner).
