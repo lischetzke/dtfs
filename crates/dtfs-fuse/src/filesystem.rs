@@ -1206,6 +1206,7 @@ impl DtfsFilesystem {
                 close_seen: false,
             },
         );
+        self.inherit_bg_failure(fh);
 
         // Checked after the insert: a commit starting later sees this handle
         // in its merge loop; one that overlapped the fetch changed the
@@ -2242,6 +2243,36 @@ impl DtfsFilesystem {
         }
     }
 
+    /// async_commit: a new writable `fh` takes over the failed chunks of the
+    /// path's other writable handles and, if any, a pending error (reported
+    /// once on this fh; cleared like theirs by `record_bg_batch` /
+    /// `record_aged_commit`). knfsd opens a fresh fh per NFS COMMIT: without
+    /// this its fsync returned Ok after a failed batch and the NFS client
+    /// dropped its pages. Detached handles have another path.
+    fn inherit_bg_failure(&self, fh: u64) {
+        if !self.config.write.async_commit {
+            return;
+        }
+        let Some((path, true)) = self.open_files.get(&fh).map(|f| (f.path.clone(), f.flags.is_writable())) else {
+            return;
+        };
+        let mut failed: Vec<u32> = self
+            .open_files
+            .iter()
+            .filter(|e| *e.key() != fh && e.path == path && e.flags.is_writable())
+            .flat_map(|e| e.failed_chunks.clone())
+            .collect();
+        failed.sort_unstable();
+        failed.dedup();
+        if failed.is_empty() {
+            return;
+        }
+        if let Some(mut f) = self.open_files.get_mut(&fh) {
+            f.write_error = Some(format!("async commit of {path} failed earlier; chunks {failed:?} not committed yet"));
+            f.failed_chunks = failed;
+        }
+    }
+
     /// A cap drain in write() committed `segs`: in async mode they may hold
     /// chunks of a failed batch or timer commit, now committed again.
     fn record_drain_commit(&self, path: &str, segs: &[crate::writebuf::ChunkSegment]) {
@@ -2893,6 +2924,7 @@ impl DtfsFilesystem {
                 close_seen: false,
             },
         );
+        self.inherit_bg_failure(fh);
         // Checked after the insert: a later commit sees this handle in its
         // merge loop; an earlier one changed the generation.
         if !fetch.may_install() {
@@ -6920,6 +6952,30 @@ mod async_commit_fs_tests {
         let r = tokio::time::timeout(Duration::from_secs(2), fs.release(fh2)).await;
         r.expect("release of a shared-owner handle must not call the manager").unwrap();
         assert_eq!(lease_id(&fs, fh).as_deref(), Some("L1"));
+        hole.abort();
+    }
+
+    /// Audit 2: knfsd opens a fresh fh per NFS COMMIT. After a background
+    /// batch failed, that fh's fsync must fail too (else COMMIT got Ok and
+    /// the NFS client dropped its pages), once per fh; after the retry
+    /// committed the chunks, a new fh's fsync is Ok again.
+    #[tokio::test]
+    async fn async_reopen_after_a_failed_batch_fsync_reports_it() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, fh) = leased_writer(&client).await;
+        fs.record_bg_batch("/f", &[0, 1], Err(anyhow::anyhow!("put failed")));
+        assert!(fs.fsync(fh).await.is_err());
+        fs.fsync(fh).await.expect("reported once on that fh");
+        let reopen = || async { fs.open_with_append("/f", OpenFlags::WriteOnly, false).await.unwrap() };
+        let fh2 = reopen().await;
+        assert!(fs.fsync(fh2).await.is_err(), "COMMIT on a fresh fh got Ok after a failed batch");
+        fs.fsync(fh2).await.expect("once per fh");
+        fs.record_bg_batch("/f", &[0], Ok(()));
+        let fh3 = reopen().await;
+        assert!(fs.fsync(fh3).await.is_err(), "boundary: chunk 1 still not committed");
+        fs.record_bg_batch("/f", &[1], Ok(()));
+        let fh4 = reopen().await;
+        fs.fsync(fh4).await.expect("retry committed every failed chunk");
         hole.abort();
     }
 

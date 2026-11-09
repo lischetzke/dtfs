@@ -212,7 +212,11 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   background error (`OpenFile.write_error`, once per fh, EIO; any successful
   writable `commit_all` (timer retry, last writer's flush/release) clears it
   first, `record_aged_commit`; release's buffer drop and
-  ghost unlink follow its own `commit_all` result only). FUSE flush
+  ghost unlink follow its own `commit_all` result only). A new writable fh
+  (open, create) inherits the union of its writable siblings'
+  `failed_chunks` and then an armed `write_error` (`inherit_bg_failure`):
+  knfsd's fresh per-COMMIT fh otherwise fsynced Ok after a failed batch and
+  the NFS client dropped its pages. FUSE flush
   (every close(2), whose result close returns; RELEASE is async and its
   reply ignored) and `release()` run `commit_all` (flush_all) under
   `path_guard`, except when another writable, non-detached fh of the path
