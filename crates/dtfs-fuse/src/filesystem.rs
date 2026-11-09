@@ -1955,7 +1955,7 @@ impl DtfsFilesystem {
     /// With `write.async_commit`, a close while another writer of the path
     /// stays open commits nothing (`defer_close_commit`).
     pub async fn flush(&self, fh: u64) -> Result<()> {
-        let (path, guard) = self.fh_path_guard(fh).await;
+        let (path, guard) = self.writer_path_guard(fh).await;
         let commit = if self.defer_close_commit(fh) {
             Ok(())
         } else {
@@ -1979,7 +1979,7 @@ impl DtfsFilesystem {
     /// commit error once.
     pub async fn fsync(&self, fh: u64) -> Result<()> {
         if !self.config.write.async_commit {
-            let (path, guard) = self.fh_path_guard(fh).await;
+            let (path, guard) = self.writer_path_guard(fh).await;
             let res = self.commit_all(fh).await;
             if let Some(p) = path {
                 self.drop_path_guard(&p, guard);
@@ -2176,6 +2176,21 @@ impl DtfsFilesystem {
                 return (Some(p), g);
             }
             self.drop_path_guard(&p, g);
+        }
+    }
+
+    /// `fh_path_guard` for a writable fh only: a reader's flush/fsync/release
+    /// commits nothing, so it must not queue behind a writer's batch upload
+    /// (up to the 60 s put deadline) just to close (a Plex scan closing a
+    /// file that is being downloaded).
+    async fn writer_path_guard(
+        &self,
+        fh: u64,
+    ) -> (Option<String>, Option<tokio::sync::OwnedMutexGuard<()>>) {
+        match self.open_files.get(&fh).map(|f| (f.flags.is_writable(), f.path.clone())) {
+            Some((true, _)) => self.fh_path_guard(fh).await,
+            Some((false, p)) => (Some(p), None),
+            None => (None, None),
         }
     }
 
@@ -2383,7 +2398,7 @@ impl DtfsFilesystem {
         // down the handle, its write lease, and its write buffer; otherwise the
         // fh leaks and the stale buffer overlays (incorrectly) future reads of
         // the same path. Capture the error and surface it AFTER cleanup.
-        let (guard_path, guard) = self.fh_path_guard(fh).await;
+        let (guard_path, guard) = self.writer_path_guard(fh).await;
         // A skipped commit (async_commit, another writer open) is Ok: no
         // buffer drop (that writer remains) and no ghost unlink.
         let commit_result = if self.open_files.contains_key(&fh) && !self.defer_close_commit(fh) {
@@ -6044,6 +6059,29 @@ mod async_commit_fs_tests {
         assert!(fs.open_files.get(&rfh).unwrap().write_error.is_none());
         assert_eq!(fs.write_buffer.dirty_bytes(&det), 10);
         assert_eq!(fs.write_buffer.dirty_bytes("/r"), 6);
+    }
+
+    /// A reader's close and fsync never queue behind a writer holding the
+    /// path guard (a sync-mode batch upload: up to the 60 s put deadline);
+    /// the writer's own flush still waits.
+    #[tokio::test]
+    async fn reader_close_does_not_wait_for_the_writers_path_guard() {
+        for async_on in [false, true] {
+            let fs = fs(async_on);
+            let w = open(&fs, "/f", OpenFlags::ReadWrite);
+            let r = open(&fs, "/f", OpenFlags::ReadOnly);
+            let held = fs.path_guard("/f").await;
+            async fn quick<T>(op: impl std::future::Future<Output = T>) -> bool {
+                tokio::time::timeout(Duration::from_millis(300), op).await.is_ok()
+            }
+            assert!(quick(fs.flush(r)).await, "async={async_on}: reader flush waited");
+            if !async_on {
+                assert!(quick(fs.fsync(r)).await, "reader fsync waited");
+            }
+            assert!(quick(fs.release(r)).await, "async={async_on}: reader release waited");
+            assert!(!quick(fs.flush(w)).await, "async={async_on}: writer flush must wait");
+            fs.drop_path_guard("/f", held);
+        }
     }
 
     /// R3-1 (async off): the kernel sends FLUSH without the inode lock, so

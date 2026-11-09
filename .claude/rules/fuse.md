@@ -241,7 +241,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   (knfsd fsyncs per NFS COMMIT; waiting stalled its one thread). Waiters
   may hold `path_guard` (the task never takes it: no deadlock), and holding
   it means no new batch starts. Write-side EOF (append offset, hole fill,
-  tail seed) uses `write_eof` = `visible_size` in async mode (the in-flight
+  tail seed) uses `write_eof` = `visible_size` (both modes) (the in-flight
   batch counts, else the next append zero-filled over it). Every EOF use in
   write() (append offset + tail seed, hole fill, size pin) is computed right
   before it by `eof_after`: FIRST the buffer (+ in-flight), THEN the
