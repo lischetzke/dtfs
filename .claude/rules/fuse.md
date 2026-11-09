@@ -223,11 +223,13 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   timed out) and BEFORE `release_leases_by_host`,
   `commit_open_writers_then` commits each path with a writable,
   non-detached open fh once (`path_guard`, `commit_all`, which waits for the
-  bg batch), 60 s total, and logs every path not confirmed committed (chunk
-  indices, bytes) as lost. A busy mount (knfsd, an open fd) never gets
-  RELEASE, so this is the only commit of fsync-acknowledged async bytes.
-  `destroy` stays empty. Budget sums must stay below the unit's
-  `TimeoutStopSec`.
+  bg batch), and logs every path not confirmed committed (chunk indices,
+  bytes) as lost. A busy mount (knfsd, an open fd) never gets RELEASE, so
+  this is the only commit of fsync-acknowledged async bytes. `destroy`
+  stays empty. Budgets (main.rs constants): unmount 15 s + commit 22 s +
+  lease release 5 s = 42 s, below `OLDEST_TIMEOUT_STOP_SECS` (45 s: hosts
+  updated by `dtfs-cli update` keep their old unit file); the unit's 110 s
+  is headroom only.
 - `write.async_commit` background upload: write()'s batch (`flush()`) is
   handed to `spawn_bg_upload` and write() returns (prod: one knfsd thread
   got nothing while each batch uploaded, 9-20 MiB/s). At most ONE batch per
