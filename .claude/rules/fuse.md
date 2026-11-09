@@ -54,7 +54,8 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 - `write()` seeds every chunk it must preserve: chunks in the write range,
   the partial tail chunk when writing past EOF (`hole_tail_chunk`), and a
   hole chunk below EOF gets a zero seed (`read_seed_bytes`). "No chunk at
-  index" = zeros; "chunk with no live address" keeps refusing at commit.
+  index" = zeros via `seed_hole` (gap: never written); "chunk with no live
+  address" keeps refusing at commit.
 - After a commit, `mark_committed_and_refresh` merges the committed chunks
   into each handle's snapshot and the metadata cache entry
   (`merge_into_snapshot`: replace the index, grow size). Instead it sets the
@@ -109,9 +110,16 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   `write_hole`, `ChunkBuf::merge` gap, seed shorter than the buffered start)
   are `ChunkBuf.gaps` until a write covers them; a gappy chunk is complete
   but not `flush()`-eligible (`is_flushable`; knfsd out-of-order WRITEs
-  otherwise uploaded each chunk twice). Cluster seed bytes (incl. the zero
-  seed below EOF) are never gap. `flush_all`, the cap drain and
+  otherwise uploaded each chunk twice). Bytes seeded from an existing
+  cluster chunk are content; the zero seed of a missing index
+  (`seed_hole`) is gap minus buffered bytes. `flush_all`, the cap drain and
   `restore_segments` (via `ChunkSegment.gaps`) keep/commit them as zeros.
+  A chunk drained with gaps leaves them in `WriteBuffer.gap_hints` (per
+  path + index; `note_drained`); `seed_chunk` re-applies them minus buffered
+  bytes, so the RMW of the committed zeros stays gappy (else x1.6 uploads
+  on prod). Hints only steer flush eligibility, never content: dropped on a
+  gap-free drain, as writes cover them, by `remove`; re-keyed by `rename`,
+  clipped by `truncate`.
   `flush_segments_to_cluster` puts a batch's segments at most
   `write.upload_concurrency` (default 2, clamp 1..=8) at a time
   (`upload_segments`, ordered `buffered`, lowest-index error wins, nothing

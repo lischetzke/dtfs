@@ -103,6 +103,25 @@ pub struct WriteBuffer {
     /// (`Bytes` clones of the segments being uploaded: no extra copy).
     inflight: DashMap<u64, (String, Vec<(u64, Bytes)>)>,
     next_inflight: AtomicU64,
+    /// Gap ranges of chunks drained with gaps (committed with zeros there),
+    /// per path and chunk index. `seed_chunk` re-applies them so a re-seeded
+    /// chunk stays out of `flush()` until the gap is written. Flush hints
+    /// only, never content. Dropped on a gap-free drain, when writes cover
+    /// them, on `remove`; re-keyed by `rename`, clipped by `truncate`.
+    gap_hints: DashMap<String, BTreeMap<u32, Vec<Range<usize>>>>,
+}
+
+/// Remove `r` from every range in `gaps`.
+fn subtract(gaps: &mut Vec<Range<usize>>, r: Range<usize>) {
+    let mut out = Vec::with_capacity(gaps.len() + 1);
+    for g in gaps.drain(..) {
+        for p in [g.start..g.end.min(r.start), g.start.max(r.end)..g.end] {
+            if p.start < p.end {
+                out.push(p);
+            }
+        }
+    }
+    *gaps = out;
 }
 
 /// Ends an in-flight overlay on drop: after the commit's caller restored the
@@ -146,8 +165,9 @@ struct ChunkBuf {
     /// Zero-filled ranges inside `dirty` that no write covered yet: a later
     /// write landed beyond them (hole fill, merge gap). Such a chunk is
     /// complete but not `flush()`-eligible: the pending write would replace
-    /// the uploaded zeros (knfsd out-of-order WRITEs). Cluster seed bytes
-    /// are never gap.
+    /// the uploaded zeros (knfsd out-of-order WRITEs). Bytes seeded from an
+    /// existing cluster chunk are gap only where its `gap_hints` say so; a
+    /// missing-index zero seed (`seed_hole`) is gap.
     gaps: Vec<Range<usize>>,
 }
 
@@ -170,15 +190,7 @@ impl ChunkBuf {
 
     /// `r` was written: it is no longer gap.
     fn cover(&mut self, r: Range<usize>) {
-        let mut out = Vec::with_capacity(self.gaps.len() + 1);
-        for g in self.gaps.drain(..) {
-            for p in [g.start..g.end.min(r.start), g.start.max(r.end)..g.end] {
-                if p.start < p.end {
-                    out.push(p);
-                }
-            }
-        }
-        self.gaps = out;
+        subtract(&mut self.gaps, r);
     }
 
     fn add_gap(&mut self, r: Range<usize>) {
@@ -304,6 +316,7 @@ impl WriteBuffer {
             buffers: DashMap::new(),
             inflight: DashMap::new(),
             next_inflight: AtomicU64::new(0),
+            gap_hints: DashMap::new(),
         }
     }
 
@@ -325,6 +338,7 @@ impl WriteBuffer {
             buffers: DashMap::new(),
             inflight: DashMap::new(),
             next_inflight: AtomicU64::new(0),
+            gap_hints: DashMap::new(),
         }
     }
 
@@ -364,9 +378,58 @@ impl WriteBuffer {
             remaining = rest;
             cur_offset += take as u64;
         }
+        drop(entry);
+        self.cover_hints(path, offset, len);
 
         debug!(path, offset, len, "buffered write");
         len
+    }
+
+    /// `[offset, offset+len)` was written: drop it from the gap hints.
+    fn cover_hints(&self, path: &str, offset: u64, len: usize) {
+        let Some(mut h) = self.gap_hints.get_mut(path) else { return };
+        let cs = self.chunk_size as u64;
+        let end = offset + len as u64;
+        let (first, last) = ((offset / cs) as u32, ((end - 1) / cs) as u32);
+        let hit: Vec<u32> = h.range(first..=last).map(|(k, _)| *k).collect();
+        for k in hit {
+            let base = k as u64 * cs;
+            let lo = offset.saturating_sub(base) as usize;
+            let hi = (end - base).min(cs) as usize;
+            let g = h.get_mut(&k).expect("key just listed");
+            subtract(g, lo..hi);
+            if g.is_empty() {
+                h.remove(&k);
+            }
+        }
+        if h.is_empty() {
+            drop(h);
+            self.gap_hints.remove_if(path, |_, h| h.is_empty());
+        }
+    }
+
+    /// Drained `segs` of `path` (about to be committed): a segment with gaps
+    /// leaves its gap ranges as the chunk's hint; a gap-free complete or
+    /// seeded one drops it; an unseeded partial one adds its gaps to it.
+    fn note_drained(&self, path: &str, segs: &[ChunkSegment]) {
+        if segs.is_empty() || (segs.iter().all(|s| s.gaps.is_empty()) && !self.gap_hints.contains_key(path)) {
+            return;
+        }
+        let mut h = self.gap_hints.entry(path.to_string()).or_default();
+        for s in segs {
+            let whole = s.offset_in_chunk == 0 && !s.needs_seed;
+            let mut g = if whole { Vec::new() } else { h.remove(&s.chunk_index).unwrap_or_default() };
+            g.extend(s.gaps.iter().cloned());
+            if g.is_empty() {
+                h.remove(&s.chunk_index);
+            } else {
+                h.insert(s.chunk_index, g);
+            }
+        }
+        if h.is_empty() {
+            drop(h);
+            self.gap_hints.remove_if(path, |_, h| h.is_empty());
+        }
     }
 
     /// Zero-fill `len` bytes at `offset`: the sparse gap below a write that
@@ -419,6 +482,8 @@ impl WriteBuffer {
             remaining = buf.chunks.len(),
             "flushed complete chunks"
         );
+        drop(entry);
+        self.note_drained(path, &segments);
         segments
     }
 
@@ -438,6 +503,8 @@ impl WriteBuffer {
             num_segments = segments.len(),
             "flushed all chunks (including partial)"
         );
+        drop(entry);
+        self.note_drained(path, &segments);
         segments
     }
 
@@ -515,6 +582,8 @@ impl WriteBuffer {
             }
         }
         segs.sort_by_key(|s| s.chunk_index);
+        drop(entry);
+        self.note_drained(path, &segs);
         segs
     }
 
@@ -537,6 +606,7 @@ impl WriteBuffer {
     /// file's drained bytes must not show under the path).
     pub fn remove(&self, path: &str) {
         self.buffers.remove(path);
+        self.gap_hints.retain(|p, _| rekey_path(p, path, path).is_none());
         self.inflight.retain(|_, (p, _)| rekey_path(p, path, path).is_none());
     }
 
@@ -577,6 +647,13 @@ impl WriteBuffer {
             buf.path = new_key.clone();
             self.buffers.insert(new_key, buf);
         }
+        let keys: Vec<String> =
+            self.gap_hints.iter().map(|e| e.key().clone()).filter(|k| rekey_path(k, from, to).is_some()).collect();
+        for k in keys {
+            if let (Some(new_key), Some((_, h))) = (rekey_path(&k, from, to), self.gap_hints.remove(&k)) {
+                self.gap_hints.insert(new_key, h);
+            }
+        }
         for mut e in self.inflight.iter_mut() {
             if let Some(np) = rekey_path(&e.value().0, from, to) {
                 e.value_mut().0 = np;
@@ -603,12 +680,25 @@ impl WriteBuffer {
     /// already buffered for it (buffered bytes win), then mark it seeded.
     /// Idempotent: a second call is a no-op, so a seed can never overwrite
     /// a newer write. Bytes between the end of `existing` and the buffered
-    /// range read as zeros (the file ended inside this chunk).
+    /// range read as zeros (the file ended inside this chunk). The chunk's
+    /// gap hint (it was committed with gaps) becomes gap again.
     pub fn seed_chunk(&self, path: &str, chunk_index: u32, existing: &[u8]) {
+        self.seed_inner(path, chunk_index, existing, false)
+    }
+
+    /// `seed_chunk` for an index the cluster has no chunk at (hole below
+    /// EOF): `zeros` are the hole's content but never written, so the
+    /// seeded range outside the buffered bytes is gap.
+    pub fn seed_hole(&self, path: &str, chunk_index: u32, zeros: &[u8]) {
+        self.seed_inner(path, chunk_index, zeros, true)
+    }
+
+    fn seed_inner(&self, path: &str, chunk_index: u32, existing: &[u8], hole: bool) {
         if existing.is_empty() || self.chunk_size == 0 {
             return;
         }
         let existing = &existing[..existing.len().min(self.chunk_size)];
+        let hint = self.gap_hints.get(path).and_then(|h| h.get(&chunk_index).cloned()).unwrap_or_default();
         let mut entry = self.buffers.entry(path.to_string()).or_insert_with(|| {
             FileWriteBuffer {
                 path: path.to_string(),
@@ -623,6 +713,15 @@ impl WriteBuffer {
         if cb.seeded {
             return;
         }
+        // Never-written seed bytes: all of a hole seed, else the gaps the
+        // chunk was last committed with. Buffered bytes are not gap.
+        let mut unwritten = if hole { vec![0..existing.len()] } else { hint };
+        for g in &mut unwritten {
+            g.end = g.end.min(existing.len());
+        }
+        if !cb.data.is_empty() {
+            subtract(&mut unwritten, cb.dirty.clone());
+        }
         let mut merged = existing.to_vec();
         if !cb.data.is_empty() {
             // Zeros between the cluster's end and the buffered bytes: unwritten.
@@ -631,6 +730,9 @@ impl WriteBuffer {
                 merged.resize(cb.dirty.end, 0);
             }
             merged[cb.dirty.clone()].copy_from_slice(&cb.data);
+        }
+        for g in unwritten {
+            cb.add_gap(g);
         }
         cb.dirty = 0..merged.len();
         cb.data = merged;
@@ -648,6 +750,19 @@ impl WriteBuffer {
                     data.truncate(new_size.saturating_sub(*start) as usize);
                     !data.is_empty()
                 });
+            }
+        }
+        if self.chunk_size > 0 {
+            if let Some(mut h) = self.gap_hints.get_mut(path) {
+                let cs = self.chunk_size as u64;
+                h.retain(|&k, g| {
+                    subtract(g, new_size.saturating_sub(k as u64 * cs).min(cs) as usize..usize::MAX);
+                    !g.is_empty()
+                });
+                if h.is_empty() {
+                    drop(h);
+                    self.gap_hints.remove_if(path, |_, h| h.is_empty());
+                }
             }
         }
         let mut entry = match self.buffers.get_mut(path) {
@@ -747,6 +862,11 @@ impl WriteBuffer {
             .get(path)
             .map(|e| !e.value().chunks.is_empty())
             .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn gap_hint(&self, path: &str, chunk_index: u32) -> Option<Vec<Range<usize>>> {
+        self.gap_hints.get(path).and_then(|h| h.get(&chunk_index).cloned())
     }
 
     /// Total buffered bytes for `path`, summed across every resident chunk
@@ -1835,16 +1955,141 @@ mod async_commit_tests {
         assert_eq!(segs[0].gaps, vec![2..6]);
     }
 
-    /// Negative of the gap guard: genuine hole zeros seeded below the
-    /// committed EOF are real content, the chunk flushes.
+    /// Bytes seeded from an EXISTING cluster chunk are content (even zeros):
+    /// the chunk flushes. Zeros for a MISSING index are a gap; flush_all
+    /// still commits them as the hole's zeros.
     #[test]
-    fn cluster_seeded_hole_zeros_are_not_a_gap() {
+    fn existing_chunk_seed_is_content_missing_chunk_zeros_are_gap() {
         let wb = WriteBuffer::new(CS);
         wb.seed_chunk(P, 1, &[0; CS]);
         wb.write(P, 10, &[5; 2]);
         let segs = wb.flush(P);
         assert_eq!(idx(&segs), vec![1]);
         assert_eq!(segs[0].data.as_ref(), &[0, 0, 5, 5, 0, 0, 0, 0]);
+
+        let wb = WriteBuffer::new(CS);
+        wb.seed_hole(P, 1, &[0; CS]);
+        wb.write(P, 10, &[5; 2]);
+        assert!(wb.flush(P).is_empty(), "missing-chunk zero seed flushed as content");
+        let segs = wb.flush_all(P);
+        assert_eq!(segs[0].data.as_ref(), &[0, 0, 5, 5, 0, 0, 0, 0]);
+        assert!(!segs[0].needs_seed);
+        assert_eq!(segs[0].gaps, vec![0..2, 4..CS]);
+    }
+
+    /// prod dtfs-lm-data01 (x1.6): a write below EOF into an index the
+    /// cluster has no chunk at (later chunks committed first) must not
+    /// upload the zero-seeded chunk until the rest of it is written.
+    #[test]
+    fn missing_index_zero_seed_waits_for_the_rest_then_flushes_once() {
+        let wb = WriteBuffer::new(CS);
+        wb.seed_hole(P, 1, &[0; CS]);
+        wb.write(P, 10, &[5; 2]);
+        assert!(wb.flush(P).is_empty(), "zero seed of a missing chunk flushed as content");
+        wb.write(P, 8, &[4; 2]);
+        wb.write(P, 12, &[6; 4]);
+        let segs = wb.flush(P);
+        assert_eq!(idx(&segs), vec![1]);
+        assert_eq!(segs[0].data.as_ref(), &[4, 4, 5, 5, 6, 6, 6, 6]);
+        assert!(wb.flush_all(P).is_empty(), "uploaded more than once");
+
+        // Bytes buffered before the hole seed are not gap.
+        let wb = WriteBuffer::new(CS);
+        wb.write(P, 8, &[4; 2]);
+        wb.seed_hole(P, 1, &[0; CS]);
+        wb.write(P, 10, &[5; 6]);
+        assert_eq!(idx(&wb.flush(P)), vec![1], "buffered bytes marked as gap");
+    }
+
+    fn gappy(wb: &WriteBuffer, path: &str, i: u64) {
+        wb.write(path, i * CS as u64, &[1; 2]);
+        wb.write_hole(path, i * CS as u64 + 2, CS - 2);
+    }
+
+    /// A chunk committed with a gap (flush_all) and RMW-seeded again from
+    /// the committed bytes (zeros at the gap) keeps the gap: no upload per
+    /// later write. The hint goes away with the gap-free commit.
+    #[test]
+    fn reseeded_gappy_commit_stays_out_of_flush_until_the_gap_is_written() {
+        let wb = WriteBuffer::new(CS);
+        wb.write(P, 0, &[1; 2]);
+        wb.write_hole(P, 2, 4);
+        wb.write(P, 6, &[1; 2]);
+        let committed = wb.flush_all(P);
+        assert_eq!(committed[0].gaps, vec![2..6]);
+        assert_eq!(wb.gap_hint(P, 0), Some(vec![2..6]));
+        wb.seed_chunk(P, 0, &committed[0].data);
+        wb.write(P, 2, &[2; 2]);
+        assert!(wb.flush(P).is_empty(), "re-seeded committed chunk flushed with the gap open");
+        wb.write(P, 4, &[3; 2]);
+        let segs = wb.flush(P);
+        assert_eq!(idx(&segs), vec![0]);
+        assert_eq!(segs[0].data.as_ref(), &[1, 1, 2, 2, 3, 3, 1, 1]);
+        assert_eq!(wb.gap_hint(P, 0), None, "gap-free commit keeps the hint");
+
+        // Still gappy at the next flush_all: the hint is the remaining gap.
+        let wb = WriteBuffer::new(CS);
+        gappy(&wb, P, 0);
+        let committed = wb.flush_all(P);
+        wb.seed_chunk(P, 0, &committed[0].data);
+        wb.write(P, 2, &[2; 2]);
+        let _ = wb.flush_all(P);
+        assert_eq!(wb.gap_hint(P, 0), Some(vec![4..CS]));
+        // A write covering the rest drops it without a seed.
+        wb.write(P, 4, &[2; CS - 4]);
+        assert_eq!(wb.gap_hint(P, 0), None, "covered hint kept");
+    }
+
+    #[test]
+    fn gap_hints_follow_remove_truncate_and_rename() {
+        let wb = WriteBuffer::new(CS);
+        for p in ["/a", "/d/x", "/dd", "/r", "/d2/y"] {
+            gappy(&wb, p, 0);
+            gappy(&wb, p, 1);
+            let _ = wb.flush_all(p);
+            assert_eq!(wb.gap_hint(p, 1), Some(vec![2..CS]), "{p}");
+        }
+        wb.remove("/a");
+        wb.remove("/d");
+        assert_eq!(wb.gap_hint("/a", 0), None, "unlink kept the hint");
+        assert_eq!(wb.gap_hint("/d/x", 1), None, "subtree kept the hint");
+        assert_eq!(wb.gap_hint("/dd", 0), Some(vec![2..CS]), "sibling prefix dropped");
+
+        wb.truncate("/dd", CS as u64 + 4);
+        assert_eq!(wb.gap_hint("/dd", 1), Some(vec![2..4]), "straddling hint not clipped");
+        assert_eq!(wb.gap_hint("/dd", 0), Some(vec![2..CS]));
+        wb.truncate("/dd", CS as u64);
+        assert_eq!(wb.gap_hint("/dd", 1), None, "hint at new_size kept");
+        wb.truncate("/dd", 3);
+        assert_eq!(wb.gap_hint("/dd", 0), Some(vec![2..3]));
+        wb.truncate("/dd", 2);
+        assert_eq!(wb.gap_hint("/dd", 0), None);
+
+        wb.rename("/r", "/s");
+        wb.rename("/d2", "/e");
+        assert_eq!(wb.gap_hint("/r", 0), None);
+        assert_eq!(wb.gap_hint("/s", 0), Some(vec![2..CS]), "rename lost the hint");
+        assert_eq!(wb.gap_hint("/d2/y", 1), None);
+        assert_eq!(wb.gap_hint("/e/y", 1), Some(vec![2..CS]), "dir rename lost the hint");
+    }
+
+    /// Memory bound: the cap drain still drains re-seeded hinted (gappy)
+    /// chunks when nothing else gets the buffer under the cap.
+    #[test]
+    fn cap_drain_drains_reseeded_hinted_chunks_when_only_they_remain() {
+        let wb = WriteBuffer::new_with_batch(CS, 4);
+        gappy(&wb, P, 0);
+        gappy(&wb, P, 1);
+        for s in wb.flush_all(P) {
+            wb.seed_chunk(P, s.chunk_index, &s.data);
+        }
+        wb.write(P, 0, &[3; 1]);
+        wb.write(P, CS as u64, &[3; 1]);
+        assert!(wb.flush(P).is_empty());
+        let segs = wb.cap_drain(P, 1, 2 * CS, true, 9..=9);
+        assert_eq!(idx(&segs), vec![0], "hinted chunks drained as gap-free");
+        assert_eq!(segs[0].gaps, vec![2..CS]);
+        assert_eq!(wb.dirty_bytes(P), CS);
     }
 
     /// The cap drain still drains gappy chunks when nothing else brings the
@@ -1903,6 +2148,8 @@ mod async_commit_tests {
         drain_failed: bool,
         /// Chunks the current write seeded that held no bytes before.
         fresh: Vec<u32>,
+        /// Committed uploads per chunk index.
+        uploads: BTreeMap<u32, u32>,
     }
 
     impl Sim {
@@ -1920,6 +2167,7 @@ mod async_commit_tests {
                 trace: Vec::new(),
                 drain_failed: false,
                 fresh: Vec::new(),
+                uploads: BTreeMap::new(),
             }
         }
 
@@ -1946,6 +2194,7 @@ mod async_commit_tests {
                 return false;
             }
             for s in segs {
+                *self.uploads.entry(s.chunk_index).or_default() += 1;
                 let end = s.chunk_index as u64 * CS as u64 + s.data.len() as u64;
                 self.chunks.insert(s.chunk_index, s.data.to_vec());
                 self.size = self.size.max(end);
@@ -1981,11 +2230,10 @@ mod async_commit_tests {
                 self.fresh.push(idx);
             }
             let clamp = (eof - base).min(CS as u64) as usize;
-            let bytes = match self.chunks.get(&idx) {
-                Some(d) => d[..d.len().min(clamp)].to_vec(),
-                None => vec![0; clamp],
-            };
-            self.wb.seed_chunk(P, idx, &bytes);
+            match self.chunks.get(&idx) {
+                Some(d) => self.wb.seed_chunk(P, idx, &d[..d.len().min(clamp)]),
+                None => self.wb.seed_hole(P, idx, &vec![0; clamp]),
+            }
         }
 
         fn span(off: u64, len: usize) -> RangeInclusive<u32> {
@@ -2098,6 +2346,60 @@ mod async_commit_tests {
                 assert!(d <= bound, "{d} buffered > {bound} {tail:?}");
                 // The overshoot lasts until a write's drain succeeds.
                 self.drain_failed &= d > self.cap;
+            }
+        }
+    }
+
+    /// knfsd writeback model: 2-byte pieces of a 12-chunk file delivered
+    /// out of order within a window of about 3 chunks, one commit-all (aged
+    /// timer / fsync) in the middle. Each chunk is uploaded at most twice
+    /// (once by the commit-all with zeros at its gaps, once complete) and
+    /// the file equals the model; in order, exactly once.
+    #[test]
+    fn out_of_order_window_uploads_each_chunk_at_most_twice() {
+        const N: u64 = 12 * CS as u64;
+        for async_on in [true, false] {
+            for seed in 0..=200u64 {
+                let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                let mut next = |m: u64| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng % m
+                };
+                let mut order: Vec<(u64, u64)> = (0..N / 2).map(|i| (i, i)).collect();
+                if seed > 0 {
+                    for o in &mut order {
+                        o.0 += next(12);
+                    }
+                }
+                order.sort();
+                let mid = if seed > 0 { Some(next(order.len() as u64) as usize) } else { None };
+                let mut sim = Sim::new(async_on);
+                sim.cap = 1 << 20;
+                for (k, &(_, i)) in order.iter().enumerate() {
+                    if mid == Some(k) {
+                        sim.trace.push("commit-all".into());
+                        if async_on {
+                            sim.tick(AGE);
+                        } else {
+                            sim.fsync();
+                        }
+                    }
+                    sim.trace.push(format!("write {}", i * 2));
+                    sim.write(i * 2, &[(i % 251 + 1) as u8; 2]);
+                    sim.check();
+                }
+                sim.release();
+                let max = if seed == 0 { 1 } else { 2 };
+                for (c, n) in &sim.uploads {
+                    assert!(
+                        *n <= max,
+                        "seed {seed} async={async_on}: chunk {c} uploaded {n}x {:?}",
+                        sim.uploads
+                    );
+                }
+                assert_eq!(sim.uploads.len(), 12);
             }
         }
     }

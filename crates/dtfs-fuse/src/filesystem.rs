@@ -1689,7 +1689,12 @@ impl DtfsFilesystem {
                     if tail_seed != Some(chunk_idx) && !self.write_buffer.has_chunk(&path, chunk_idx as u32) {
                         fresh_seeds.push(chunk_idx as u32);
                     }
-                    self.write_buffer.seed_chunk(&path, chunk_idx as u32, &existing);
+                    if loc.chunk_at(chunk_idx).is_none() {
+                        // Zeros of a missing index were never written: gap.
+                        self.write_buffer.seed_hole(&path, chunk_idx as u32, &existing);
+                    } else {
+                        self.write_buffer.seed_chunk(&path, chunk_idx as u32, &existing);
+                    }
                     debug!(
                         path = %path,
                         chunk_idx,
@@ -2531,7 +2536,7 @@ impl DtfsFilesystem {
         // is flushed by a writable fh's flush/release, and without one the
         // seeded bytes would be stranded (`truncate` supplies a temporary
         // writer for the bare-path case).
-        let mut tail_seed: Option<(u64, Bytes)> = None;
+        let mut tail_seed: Option<(u64, Bytes, bool)> = None;
         if writer {
             // Seeds the tail chunk: guarded fetch (waits out in-flight
             // commits), never a snapshot older than one of them.
@@ -2547,7 +2552,7 @@ impl DtfsFilesystem {
                         .read_seed_bytes(path, &before, idx, chunk_size, new_size)
                         .await?
                     {
-                        tail_seed = Some((idx, b));
+                        tail_seed = Some((idx, b, before.chunk_at(idx).is_none()));
                     }
                 }
             }
@@ -2565,8 +2570,10 @@ impl DtfsFilesystem {
         // buffered bytes below it. Removing the whole buffer (the old
         // behaviour) lost un-flushed writes that the truncation never deleted.
         self.write_buffer.truncate(path, new_size);
-        if let Some((idx, bytes)) = tail_seed {
-            self.write_buffer.seed_chunk(path, idx as u32, &bytes);
+        match tail_seed {
+            Some((idx, bytes, true)) => self.write_buffer.seed_hole(path, idx as u32, &bytes),
+            Some((idx, bytes, false)) => self.write_buffer.seed_chunk(path, idx as u32, &bytes),
+            None => {}
         }
         // Refresh cached locations on every handle of the path (seed reads
         // clamp to `locations.total_size`, so a stale size would resurrect
