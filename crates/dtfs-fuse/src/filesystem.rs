@@ -1966,7 +1966,12 @@ impl DtfsFilesystem {
     /// commit error once.
     pub async fn fsync(&self, fh: u64) -> Result<()> {
         if !self.config.write.async_commit {
-            return self.commit_all(fh).await;
+            let (path, guard) = self.fh_path_guard(fh).await;
+            let res = self.commit_all(fh).await;
+            if let Some(p) = path {
+                self.drop_path_guard(&p, guard);
+            }
+            return res;
         }
         // No `wait_bg_uploads`: knfsd fsyncs per NFS COMMIT and waiting
         // serialised its one thread on every batch; close/timer still wait.
@@ -2109,15 +2114,11 @@ impl DtfsFilesystem {
         }
     }
 
-    /// Write-side EOF of the buffer: async_commit also counts the batch
-    /// uploading in the background (else the next append would zero-fill
-    /// over it); off, `logical_size` as before.
+    /// Write-side EOF of the buffer, in-flight drains included (a background
+    /// batch or another fd's close commit; else the next append or hole
+    /// fill zero-fills over them).
     fn write_eof(&self, path: &str) -> Option<u64> {
-        if self.config.write.async_commit {
-            self.write_buffer.visible_size(path)
-        } else {
-            self.write_buffer.logical_size(path)
-        }
+        self.write_buffer.visible_size(path)
     }
 
     /// Write-side EOF of `fh`'s file: `buffered` (buffer [+ in-flight],
@@ -2136,12 +2137,11 @@ impl DtfsFilesystem {
         Ok((buffered.unwrap_or(0).max(loc.total_size), loc))
     }
 
-    /// `write.async_commit` serialisation of the timer commit with write(),
-    /// a writer's truncate and release on `path`; `None` when off.
+    /// Per-path serialisation of write(), flush, fsync, release, truncate,
+    /// unlink, rename and the async timer, in BOTH modes: the kernel sends
+    /// FLUSH without the inode lock, so another fd's close commit otherwise
+    /// ran beside a write (R3-1). Always `Some`.
     async fn path_guard(&self, path: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        if !self.config.write.async_commit {
-            return None;
-        }
         let lock = self.path_locks.entry(path.to_string()).or_default().clone();
         Some(lock.lock_owned().await)
     }
@@ -2857,25 +2857,24 @@ impl DtfsFilesystem {
     /// F-034 — rename a file (atomic) in the manager namespace.
     #[instrument(skip(self), fields(from = %from, to = %to))]
     pub async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        // async_commit: the timer's commit is not serialised with rename by
-        // the kernel. Hold the guard of `from` and of every open writer at or
-        // below `from` or `to` (sorted: one global order, no deadlock) so no
-        // commit runs across the rename and the buffer/handle re-key.
+        // Close commits (another fd's FLUSH) and the async timer are not
+        // serialised with rename by the kernel. Hold the guard of `from` and
+        // of every open writer at or below `from` or `to` (sorted: one global
+        // order, no deadlock) so no commit runs across the rename and the
+        // buffer/handle re-key.
         let mut guards = Vec::new();
-        if self.config.write.async_commit {
-            let open: Vec<(String, OpenFlags)> = self
-                .open_files
-                .iter()
-                .map(|e| (e.value().path.clone(), e.value().flags))
-                .collect();
-            for p in rename_lock_paths(&open, from, to) {
-                let g = self.path_guard(&p).await;
-                guards.push((p, g));
-            }
-            // No background upload may commit or restore across the re-key.
-            for (p, _) in &guards {
-                self.wait_bg_uploads(p).await;
-            }
+        let open: Vec<(String, OpenFlags)> = self
+            .open_files
+            .iter()
+            .map(|e| (e.value().path.clone(), e.value().flags))
+            .collect();
+        for p in rename_lock_paths(&open, from, to) {
+            let g = self.path_guard(&p).await;
+            guards.push((p, g));
+        }
+        // No background upload may commit or restore across the re-key.
+        for (p, _) in &guards {
+            self.wait_bg_uploads(p).await;
         }
         let res = self.rename_inner(from, to).await;
         for (p, g) in guards {
@@ -5963,6 +5962,33 @@ mod async_commit_fs_tests {
         assert!(fs.open_files.get(&rfh).unwrap().write_error.is_none());
         assert_eq!(fs.write_buffer.dirty_bytes(&det), 10);
         assert_eq!(fs.write_buffer.dirty_bytes("/r"), 6);
+    }
+
+    /// R3-1 (async off): the kernel sends FLUSH without the inode lock, so
+    /// fd B's close commit (drained [0,100) of chunk 0, stuck on the black
+    /// hole) runs while fd A writes into chunk 0 above it. A must wait for
+    /// it: else it zero-seeds/fills [0,100) on top of the in-flight bytes
+    /// and its next commit of chunk 0 zeroes them.
+    #[tokio::test]
+    async fn sync_write_waits_for_another_fds_close_commit() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, a, _cs) = writer_fs(&client, false, 0, 0, 0);
+        let b = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/f", 0, &[7; 100]);
+        let f2 = fs.clone();
+        let close = tokio::spawn(async move { f2.flush(b).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!close.is_finished(), "the close commit must be in flight");
+        let f3 = fs.clone();
+        let w = tokio::spawn(async move { f3.write(a, 200, &[9; 10]).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut got = vec![0u8; 100];
+        fs.write_buffer.overlay("/f", 0, &mut got);
+        assert_eq!(got, vec![7u8; 100], "write zero-filled over the in-flight close commit");
+        assert!(!w.is_finished(), "write ran during another fd's close commit");
+        close.abort();
+        w.abort();
+        hole.abort();
     }
 
     /// R2-4: a grow under an exclusive commit slot drops no chunks: the

@@ -167,7 +167,8 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   in-flight under the buffer) and lookup/read size (`visible_size`) still
   see drained bytes while the upload runs. Without it a reader between
   knfsd's close (flush drains) and the commit saw size 0 / EOF. Write-side
-  EOF decisions keep using `logical_size` (async_commit: `write_eof`, below). `WriteBuffer::remove` (unlink,
+  EOF decisions use `write_eof` = `visible_size` (in-flight counts) in both
+  modes. `WriteBuffer::remove` (unlink,
   rename-over, last writer's release) also drops the in-flight entries of
   the path and its subtree, and `truncate` clips them to the new size, so
   the old file's drained bytes never show after rm+recreate, O_TRUNC or
@@ -197,11 +198,14 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   `AGED_COMMITS_PER_TICK` paths) commits a path whose oldest buffered byte
   (`ChunkBuf.since`, kept across `restore_segments`) is `async_commit_secs`
   old, through `commit_all` with a writable non-detached fh. The cap drain
-  then also drains partial chunks outside `keep`. The timer is
-  not serialised by the kernel like write/fsync/setattr, so write(), a
+  then also drains partial chunks outside `keep`. Neither the timer nor
+  FUSE_FLUSH (sent without the inode lock: another fd's close commit ran
+  beside a write, which then zero-seeded over its in-flight bytes, R3-1)
+  is serialised by the kernel with write, so write(), fsync (sync mode), a
   writer's truncate, unlink (across the bg wait, delete and detach: no new
   batch can start meanwhile), flush, release and the timer hold `path_guard` (per-path
-  tokio mutex, async mode only, one guard at a time; write/flush/release
+  tokio mutex, BOTH modes (only the timer is async-only), one guard at a
+  time; write/flush/fsync/release
   take it via `fh_path_guard`, which re-reads the fh's path after acquiring
   and retries if a rename re-keyed it). Only `rename` holds
   several: `from` plus every writable handle at or below `from` or `to`
