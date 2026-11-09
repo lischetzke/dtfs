@@ -132,7 +132,10 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   commit is logged at error with chunk indices and bytes lost. flush and
   fsync return the commit error.
 - `writebuf.rs` batches `write.flush_batch_chunks` (default 4, clamp
-  1..=64) complete chunks per `flush()`; `flush_all` drains everything.
+  1..=64) complete chunks per `flush()`: it waits for that many and takes
+  exactly that many, lowest indices first (one batch, within the
+  `batch_limits` bytes; more ready ones wait for the next flush); `flush_all`
+  drains everything.
   A write past the logical end zero-fills only the hole's edge chunks
   (`hole_fill_ranges`: old partial tail to its chunk end, the write's chunk
   start to the offset); whole chunks inside the hole get no buffer and no
@@ -276,7 +279,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   chunks instead of uploading/committing above the hole. write() starts no
   new batch while one of the path is doomed (`bg_may_start`; else each new
   batch takes the restored chunks and is doomed in turn); once they ended,
-  one batch retries everything in order, and write() drops the ranges when
+  batches retry them lowest index first, one batch size each, and write() drops the ranges when
   the path has none in flight. The
   per-file dirty cap is `max(128 MB, (n + 1) x batch limit)` (`dirty_cap_for`;
   n = 1 when async_commit is off). The task

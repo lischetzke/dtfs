@@ -7260,8 +7260,8 @@ mod async_commit_fs_tests {
 
     /// FUSE-1 doom chain: while a batch of the path is doomed, write() starts
     /// no new batch (it would pick up the restored chunks and be doomed in
-    /// turn); once the doomed batches ended, one batch takes everything and
-    /// may commit.
+    /// turn); once the doomed batches ended, batches start again, lowest
+    /// chunks first and one batch size each, and may commit.
     #[tokio::test]
     async fn multibatch_write_starts_no_batch_while_one_is_doomed() {
         let (client, hole) = black_hole_client().await;
@@ -7277,14 +7277,16 @@ mod async_commit_fs_tests {
         assert_eq!(w.expect("must not wait").unwrap(), batch as u32);
         assert_eq!(fs.bg_batches("/f"), 1, "write() started a batch while batch {b} is doomed");
         assert_eq!(fs.write_buffer.dirty_bytes("/f"), 5 * c, "chunks 0..4 + restored 20 stay buffered");
-        // The doomed batch bails and restores; the next write starts one batch.
+        // The doomed batch bails and restores; the next write starts one
+        // batch of the batch size, lowest indices first (audit 8).
         fs.fail_bg_batch(fh, "/f", b, &b_segs, &[21], anyhow::anyhow!("earlier batch failed"));
         drop(BgSlot { fs: &fs, path: "/f".into(), id: b });
         let w = tokio::time::timeout(Duration::from_secs(2), fs.write(fh, 4 * cs, &vec![3; batch])).await;
         assert_eq!(w.expect("must not wait").unwrap(), batch as u32);
         let (id, chunks) = fs.bg_uploads.get("/f").map(|v| (v[0].0, v[0].1.clone())).unwrap();
         assert_eq!(fs.bg_batches("/f"), 1);
-        assert_eq!(chunks, vec![0, 1, 2, 3, 4, 5, 6, 7, 20, 21]);
+        assert_eq!(chunks, vec![0, 1, 2, 3]);
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 6 * c, "4..=7, 20, 21 wait for the next batches");
         assert!(tokio::time::timeout(Duration::from_secs(2), fs.wait_commit_turn("/f", id)).await.unwrap());
         hole.abort();
     }

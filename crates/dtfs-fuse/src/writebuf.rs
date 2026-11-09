@@ -540,7 +540,9 @@ impl WriteBuffer {
         if ready < self.flush_batch_chunks {
             return Vec::new();
         }
-        let segments = buf.extract_complete_chunks(self.chunk_size);
+        // One batch only: `flush_batch_chunks` complete chunks are within the
+        // `batch_limits` byte limit (`effective_batch_chunks`).
+        let segments = buf.extract_complete_chunks(self.chunk_size, self.flush_batch_chunks);
         debug!(
             path = %buf.path,
             num_segments = segments.len(),
@@ -1158,14 +1160,15 @@ impl WriteBuffer {
 }
 
 impl FileWriteBuffer {
-    /// Extract complete (fully-covered) chunk-aligned segments, ascending
-    /// by chunk index, removing them from the map.
-    fn extract_complete_chunks(&mut self, chunk_size: usize) -> Vec<ChunkSegment> {
+    /// Extract up to `limit` complete (fully-covered) chunk-aligned
+    /// segments, lowest chunk indices first, removing them from the map.
+    fn extract_complete_chunks(&mut self, chunk_size: usize, limit: usize) -> Vec<ChunkSegment> {
         let complete_keys: Vec<u32> = self
             .chunks
             .iter()
             .filter(|(_, cb)| cb.is_flushable(chunk_size))
             .map(|(k, _)| *k)
+            .take(limit)
             .collect();
 
         let mut segments = Vec::with_capacity(complete_keys.len());
@@ -1274,7 +1277,9 @@ mod tests {
         let wb = WriteBuffer::new(4);
         wb.write("file1", 0, &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
-        let segments = wb.flush("file1");
+        // Batch of 1 (`new`): one chunk per flush.
+        let mut segments = wb.flush("file1");
+        segments.extend(wb.flush("file1"));
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].chunk_index, 0);
         assert_eq!(segments[0].data.as_ref(), &[1, 2, 3, 4]);
@@ -1413,6 +1418,26 @@ mod tests {
             }
         }
         assert!(!wb.has_dirty_data("/f"), "batch fully drained, nothing left dirty");
+    }
+
+    // Audit 8 — a batch carries at most `flush_batch_chunks` complete chunks
+    // (lowest indices first), however many are ready: else one background
+    // batch held the whole backlog (up to the dirty cap). flush_all still
+    // drains everything.
+    #[test]
+    fn flush_takes_at_most_one_batch_lowest_indices_first() {
+        let chunk = 4 * 1024 * 1024;
+        let wb = WriteBuffer::new_with_batch(chunk, 4);
+        for i in (0..10u32).rev() {
+            wb.write("/f", i as u64 * chunk as u64, &vec![i as u8; chunk]);
+        }
+        let idx = |s: Vec<ChunkSegment>| s.iter().map(|s| s.chunk_index).collect::<Vec<u32>>();
+        assert_eq!(idx(wb.flush("/f")), vec![0, 1, 2, 3], "10 ready: one batch of 4");
+        assert_eq!(idx(wb.flush("/f")), vec![4, 5, 6, 7], "boundary: exactly 4 ready");
+        assert!(wb.flush("/f").is_empty(), "2 < 4 ready: held back");
+        assert_eq!(idx(wb.flush_all("/f")), vec![8, 9]);
+        let bytes: usize = WriteBuffer::new_with_batch(chunk, 64).flush_batch_chunks * chunk;
+        assert!(bytes <= batch_limits(64).0, "a batch never exceeds the byte limit");
     }
 
     // WI-01 — flush_all must still drain held-back chunks at fsync/close,
@@ -2118,7 +2143,8 @@ mod async_commit_tests {
         let seq = WriteBuffer::new(CS);
         seq.write(P, 0, &[1; 4]);
         seq.write(P, 4, &[2; 12]);
-        let want = seq.flush(P);
+        let mut want = seq.flush(P);
+        want.extend(seq.flush(P));
         assert_eq!(idx(&want), vec![0, 1]);
         assert_eq!(first[0].data, want[0].data);
         assert_eq!(second[0].data, want[1].data);
