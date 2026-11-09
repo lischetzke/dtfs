@@ -238,7 +238,9 @@ mtime from `ListChunks`; under the chunk lock the data node skips the delete
 (optional) verifies only that disk's copy; migration passes the landed disk.
 Scrub and `verify_on_read` judge `.dat` against the chunk id (content address);
 a `.meta` that disagrees but whose `.dat` hashes to the id is repaired, not
-quarantined. Scrub quarantines each detection per bucket via
+quarantined; GetChunk also rebuilds a missing/unreadable `.meta` under the
+chunk lock (`repair_meta_for_read`) and faults only on a mismatch or an
+unreadable `.dat`. Scrub quarantines each detection per bucket via
 `confirm_and_quarantine` (chunk lock, re-hash, rename). Startup quarantine
 re-report skips only when the SAME disk has a live `.dat`.
 Apply: `RemoveCorruptChunkReplicas` never removes the last row of a

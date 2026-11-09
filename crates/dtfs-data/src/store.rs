@@ -826,6 +826,19 @@ impl ChunkStore {
         Err(DtfsError::ChunkNotFound(chunk_id.to_string()))
     }
 
+    /// GetChunk verify_on_read found no readable `.meta`: under the chunk
+    /// lock, hash `dat_path` against the chunk id and rebuild the `.meta`
+    /// on a match (§ A.3.3 (6)). True = the bytes verified (even if the
+    /// `.meta` rewrite failed); false = mismatch, unreadable or gone `.dat`.
+    pub async fn repair_meta_for_read(&self, chunk_id: &ChunkId, dat_path: &Path, size: u64) -> bool {
+        let _guard = self.chunk_locks[Self::chunk_lock_index(chunk_id)].lock().await;
+        let Some(disk) = self.disk_manager.all_disks().iter().find(|d| dat_path.starts_with(&d.mount_path)) else {
+            return false;
+        };
+        try_repair_meta_from_dat(&disk.mount_path, dat_path, &chunk_id.as_hex(), size).await
+            != MetaRepair::NotRepairable
+    }
+
     /// Re-enqueue chunks sitting in `<disk>/.dtfs/quarantine/*.dat.bad` for
     /// corruption reporting. `pending_corruption` is in-memory only and
     /// quarantined chunks are no longer in `chunks/`, so scrub never finds

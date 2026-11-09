@@ -56,7 +56,8 @@ text there.
    in `.dtfs-disk-id`.
 7. Scrub hashes `.dat` vs `checksum`; on a `.meta` mismatch it re-hashes vs the
    chunk id and repairs `.meta` (only an id mismatch is corruption;
-   `verify_on_read` also compares to the id). Quarantine runs per bucket under
+   `verify_on_read` also compares to the id and rebuilds a missing or
+   unreadable `.meta` from a `.dat` that hashes to its id, no fault). Quarantine runs per bucket under
    the chunk lock after a fresh re-hash (`confirm_and_quarantine`). Missing/unparseable `.meta` is first
    repaired from the `.dat` when the re-hash matches the id; only a
    digest mismatch or unreadable `.dat` quarantines, by RENAMING to

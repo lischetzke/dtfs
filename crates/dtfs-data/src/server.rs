@@ -367,8 +367,9 @@ fn stream_file(
 }
 
 impl DataServiceImpl {
-    /// verify_on_read found no readable `.meta`. If the `.dat` is gone too
-    /// a delete raced the read (delete removes `.dat` first): plain
+    /// verify_on_read found no readable `.meta` and the `.dat` did not
+    /// hash to its id (or could not be read). If the `.dat` is gone a
+    /// delete raced the read (delete removes `.dat` first): plain
     /// NOT_FOUND, no fault. Otherwise Bug BF-3: record an integrity fault
     /// and return DATA_LOSS so the client fails over.
     fn meta_absent_status(
@@ -715,6 +716,13 @@ impl DataService for DataServiceImpl {
                 // sidecar: a damaged-but-parseable .meta must not make good
                 // bytes look corrupt and self-quarantine the node.
                 Ok(_) => chunk_id.0,
+                // § A.3.3 (6): a missing/unreadable .meta next to a .dat that
+                // hashes to its id is repaired and served, not a fault.
+                Err(_) if self.store.repair_meta_for_read(&chunk_id, &dat_path, total_size).await => {
+                    tracing::warn!(chunk_id = %req.chunk_id, "verify_on_read: .meta missing or unreadable; .dat matches its id, .meta rebuilt");
+                    self.metrics.record_read(total_size);
+                    return Ok(Response::new(stream_file(dat_path, total_size)));
+                }
                 Err(_) => {
                     return Err(self.meta_absent_status(&chunk_id, &req.chunk_id, total_size, now_ms));
                 }
@@ -1772,8 +1780,10 @@ max_io_percent = 10
         assert!(p.starts_with(d1.path()));
     }
 
+    // § A.3.3 (6): a missing `.meta` next to a `.dat` that hashes to its id
+    // is rebuilt and the read served, with no integrity fault.
     #[tokio::test]
-    async fn meta_absent_with_dat_present_is_data_loss_and_fault() {
+    async fn meta_absent_with_good_dat_is_repaired_and_served() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = make_service(tmp.path(), true).await;
         let data = b"meta-absent-dat-present";
@@ -1782,9 +1792,35 @@ max_io_percent = 10
             .put_chunk(&chunk_id, data, &VolumeId::new("default".to_string()), DiskTier::Hot)
             .await
             .unwrap();
-        let st = svc.meta_absent_status(&chunk_id, &chunk_id.as_hex(), data.len() as u64, 1);
-        assert_eq!(st.code(), tonic::Code::DataLoss);
+        let (dat, _) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        std::fs::remove_file(dat.with_extension("meta")).unwrap();
+        let got = collect_stream(&svc, &chunk_id.as_hex()).await;
+        assert_eq!(got.map_err(|s| s.code()), Ok(data.to_vec()));
+        assert_eq!(svc.integrity_faults.pending_len(), 0);
+        assert!(!svc.integrity_faults.is_self_quarantined());
+        let meta = svc.store.get_chunk_meta(&chunk_id).await.expect(".meta rebuilt");
+        assert_eq!((meta.size, meta.checksum), (data.len() as u64, chunk_id.0));
+    }
+
+    // Same, but an unparseable `.meta` and a `.dat` that does NOT hash to
+    // its id: DATA_LOSS plus one integrity fault, `.meta` not rewritten.
+    #[tokio::test]
+    async fn meta_unreadable_with_bad_dat_is_data_loss_and_fault() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let data = b"meta-absent-dat-present";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        svc.store
+            .put_chunk(&chunk_id, data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+        let (dat, _) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        std::fs::write(dat.with_extension("meta"), b"{torn").unwrap();
+        std::fs::write(&dat, b"meta-absent-dat-presenX").unwrap();
+        let err = collect_stream(&svc, &chunk_id.as_hex()).await.expect_err("must not serve");
+        assert_eq!(err.code(), tonic::Code::DataLoss);
         assert_eq!(svc.integrity_faults.pending_len(), 1);
+        assert_eq!(std::fs::read(dat.with_extension("meta")).unwrap(), b"{torn");
     }
 
     #[tokio::test]
