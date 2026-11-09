@@ -512,6 +512,9 @@ impl ChunkStore {
         // captured BEFORE the rename below, which would otherwise
         // overwrite (and hide) any pre-existing `.dat`.
         let already_present = final_dat_path.exists() && final_meta_path.exists();
+        // A pre-existing `.dat` with a missing/torn `.meta` (awaiting scrub
+        // repair) may be a registered replica: a failed re-upload must keep it.
+        let dat_existed = final_dat_path.exists();
 
         fs::rename(tmp_path, &final_dat_path)
             .await
@@ -542,7 +545,7 @@ impl ChunkStore {
         let meta_json = match serde_json::to_string_pretty(&meta) {
             Ok(j) => j,
             Err(e) => {
-                cleanup_after_failed_commit(already_present, &final_dat_path, &final_meta_path, &wal_path).await;
+                cleanup_after_failed_commit(dat_existed, &final_dat_path, &final_meta_path, &wal_path).await;
                 return Err(DtfsError::Serialization(e.to_string()));
             }
         };
@@ -552,7 +555,7 @@ impl ChunkStore {
             // not leave a `.dat` with no matching `.meta` (nor a stale WAL
             // entry) behind.
             tracing::warn!(chunk_id = %chunk_id, already_present, error = %e, "meta write failed after dat rename");
-            cleanup_after_failed_commit(already_present, &final_dat_path, &final_meta_path, &wal_path).await;
+            cleanup_after_failed_commit(dat_existed, &final_dat_path, &final_meta_path, &wal_path).await;
             return Err(e);
         }
 
@@ -1070,7 +1073,25 @@ impl ChunkStore {
                                                         Err(_) => true,
                                                     }
                                                 };
-                                                if dat.exists() && meta_missing_or_torn {
+                                                // A `.dat` that hashes to its id is a
+                                                // good copy (possibly a registered
+                                                // replica awaiting meta repair):
+                                                // rebuild its `.meta` instead of
+                                                // deleting it; only a digest
+                                                // mismatch is rolled back.
+                                                let repair = if dat.exists() && meta_missing_or_torn {
+                                                    let size = fs::metadata(&dat).await.map(|m| m.len()).unwrap_or(0);
+                                                    try_repair_meta_from_dat(&disk.mount_path, &dat, &wal_entry.chunk_id, size).await
+                                                } else {
+                                                    MetaRepair::NotRepairable
+                                                };
+                                                if repair != MetaRepair::NotRepairable {
+                                                    tracing::warn!(
+                                                        chunk_id = %wal_entry.chunk_id,
+                                                        ?repair,
+                                                        "WAL replay kept a .dat that hashes to its id; .meta rebuilt instead of rollback"
+                                                    );
+                                                } else if dat.exists() && meta_missing_or_torn {
                                                     let _ = fs::remove_file(&dat).await;
                                                     let _ = fs::remove_file(&meta).await;
                                                     tracing::info!(
@@ -1856,16 +1877,17 @@ async fn cleanup_after_dat_committed(final_dat_path: &Path, final_meta_path: &Pa
     let _ = fs::remove_file(wal_path).await;
 }
 
-/// A duplicate upload of an already-complete chunk that fails after the
-/// rename must not destroy the good replica: bytes are content-addressed so
-/// the old `.dat`/`.meta` stay valid; only the WAL entry is removed.
+/// A re-upload over a pre-existing `.dat` that fails after the rename must
+/// not destroy that replica: bytes are content-addressed so the `.dat`
+/// stays valid (a missing/torn `.meta` is repaired by scrub); only the WAL
+/// entry is removed.
 async fn cleanup_after_failed_commit(
-    already_present: bool,
+    dat_existed: bool,
     final_dat_path: &Path,
     final_meta_path: &Path,
     wal_path: &Path,
 ) {
-    if already_present {
+    if dat_existed {
         let _ = fs::remove_file(wal_path).await;
     } else {
         cleanup_after_dat_committed(final_dat_path, final_meta_path, wal_path).await;
@@ -3749,6 +3771,82 @@ mod tests {
         assert!(final_meta_path.exists(), "existing .meta must survive");
         let wal_path = wal_dir(tmp.path()).join(format!("{}.put.wal.json", chunk_id.as_hex()));
         assert!(!wal_path.exists(), "WAL entry cleared");
+    }
+
+    /// Audit #2 — a good `.dat` whose `.meta` is missing (awaiting scrub
+    /// repair, possibly the registered anchor copy) must survive a same-
+    /// content re-upload that fails at the meta step. Meta write forced to
+    /// fail by turning the disk's `tmp/` dir into a regular file; the
+    /// upload's tmp lives elsewhere on the disk.
+    #[tokio::test]
+    async fn failed_reupload_keeps_existing_dat_with_missing_meta() {
+        let (store, tmp) = make_test_store().await;
+        let data = b"anchor-copy-awaiting-meta-repair";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+
+        let chunk_dir = chunk_data_dir(tmp.path(), &chunk_id);
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let final_dat_path = chunk_dir.join(format!("{}.dat", chunk_id.as_hex()));
+        std::fs::write(&final_dat_path, data).unwrap();
+        let final_meta_path = chunk_dir.join(format!("{}.meta", chunk_id.as_hex()));
+        assert!(!final_meta_path.exists());
+
+        let upload = tmp.path().join("upload.dat.tmp");
+        std::fs::write(&upload, data).unwrap();
+        std::fs::remove_dir_all(tmp.path().join("tmp")).unwrap();
+        std::fs::write(tmp.path().join("tmp"), b"not a dir").unwrap();
+
+        let res = store
+            .commit_chunk_from_tmp(&chunk_id, &upload, &volume_id, DiskTier::Hot, data.len() as u64, hash)
+            .await;
+        assert!(matches!(res, Err(DtfsError::Io(_))), "meta write must fail: {res:?}");
+        assert!(final_dat_path.exists(), "pre-existing good .dat must survive a failed re-upload");
+        assert_eq!(std::fs::read(&final_dat_path).unwrap(), data);
+        let wal_path = wal_dir(tmp.path()).join(format!("{}.put.wal.json", chunk_id.as_hex()));
+        assert!(!wal_path.exists(), "WAL entry cleared");
+    }
+
+    /// Audit #2 — WAL(Put) replay over a `.dat` that hashes to its id with a
+    /// missing or torn `.meta` must rebuild the `.meta`, not delete the
+    /// bytes. (A `.dat` that does NOT hash to its id is still rolled back:
+    /// `co_1_4b_put_wal_replay_cleans_meta_less_committed_dat`,
+    /// `cr_4_2_put_wal_replay_rolls_back_torn_meta`.)
+    #[tokio::test]
+    async fn put_wal_replay_repairs_meta_for_dat_matching_its_id() {
+        for torn in [false, true] {
+            let (store, tmp) = make_test_store().await;
+            let data = b"good-dat-awaiting-meta-repair";
+            let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+
+            let chunk_dir = chunk_data_dir(tmp.path(), &chunk_id);
+            std::fs::create_dir_all(&chunk_dir).unwrap();
+            let dat_path = chunk_dir.join(format!("{}.dat", chunk_id.as_hex()));
+            std::fs::write(&dat_path, data).unwrap();
+            let meta_path = chunk_dir.join(format!("{}.meta", chunk_id.as_hex()));
+            if torn {
+                std::fs::write(&meta_path, b"").unwrap();
+            }
+
+            let wal_path = wal_dir(tmp.path()).join(format!("{}.put.wal.json", chunk_id.as_hex()));
+            let wal_entry = WalEntry {
+                operation: WalOperation::PutChunk,
+                chunk_id: chunk_id.as_hex(),
+                disk_path: tmp.path().to_string_lossy().to_string(),
+                timestamp_ms: now_millis(),
+            };
+            write_wal_entry(&wal_path, &wal_entry).await.unwrap();
+
+            store.recover_from_wal().await.unwrap();
+
+            assert!(dat_path.exists(), "torn={torn}: id-matching .dat must not be rolled back");
+            let meta: ChunkMeta =
+                serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+            assert_eq!(meta.checksum, chunk_id.0, "torn={torn}");
+            assert_eq!(meta.size, data.len() as u64);
+            assert!(!wal_path.exists(), "torn={torn}: WAL entry must be cleared");
+        }
     }
 
     // ── CR-4-4 (DATA-3) — per-chunk lock across commit/delete ──────
