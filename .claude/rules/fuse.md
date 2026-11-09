@@ -273,7 +273,10 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   go to each writer's `failed_chunks`; a batch success removes its chunks
   and clears `write_error` only when none is left, so a later disjoint
   batch never hides an earlier failure; a failed timer/`commit_all` adds
-  the path's pending chunks the same way; a `commit_all` success clears
+  the path's pending chunks the same way; a cap-drain commit in write()
+  removes its chunks like a batch success (`record_drain_commit`) and
+  truncate drops failed chunks at or above the new EOF
+  (`clip_failed_chunks`); a `commit_all` success clears
   both); `BgSlot` removes its batch and wakes `wait_bg` (Notify) even on
   panic. It holds NO `path_guard` (writes would block on it again); instead
   everything that could touch those chunks waits first: write() into a

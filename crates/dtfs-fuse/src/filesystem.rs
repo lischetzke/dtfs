@@ -1890,6 +1890,7 @@ impl DtfsFilesystem {
                             }
                         };
                         self.mark_committed_and_refresh(&path, fh, committed).await;
+                        self.record_drain_commit(&path, &segs);
                     }
                 }
                 self.write_buffer.write_hole(&path, at, n);
@@ -1916,6 +1917,7 @@ impl DtfsFilesystem {
                     }
                 };
                 self.mark_committed_and_refresh(&path, fh, committed).await;
+                self.record_drain_commit(&path, &segs);
             }
         }
 
@@ -2182,6 +2184,25 @@ impl DtfsFilesystem {
                 if f.failed_chunks.is_empty() {
                     f.write_error = None;
                 }
+            }
+        }
+    }
+
+    /// A cap drain in write() committed `segs`: in async mode they may hold
+    /// chunks of a failed batch or timer commit, now committed again.
+    fn record_drain_commit(&self, path: &str, segs: &[crate::writebuf::ChunkSegment]) {
+        if self.config.write.async_commit {
+            let idx: Vec<u32> = segs.iter().map(|s| s.chunk_index).collect();
+            self.record_bg_batch(path, &idx, Ok(()));
+        }
+    }
+
+    /// Truncate to `new_size`: failed chunks at or above it no longer exist.
+    fn clip_failed_chunks(&self, path: &str, new_size: u64) {
+        let cs = self.write_buffer.chunk_size() as u64;
+        for mut f in self.open_files.iter_mut() {
+            if f.path == path {
+                f.failed_chunks.retain(|&c| (c as u64) * cs < new_size);
             }
         }
     }
@@ -3052,6 +3073,7 @@ impl DtfsFilesystem {
         // buffered bytes below it. Removing the whole buffer (the old
         // behaviour) lost un-flushed writes that the truncation never deleted.
         self.write_buffer.truncate(path, new_size);
+        self.clip_failed_chunks(path, new_size);
         match tail_seed {
             Some((idx, bytes, true)) => self.write_buffer.seed_hole(path, idx as u32, &bytes),
             Some((idx, bytes, false)) => self.write_buffer.seed_chunk(path, idx as u32, &bytes),
@@ -7099,6 +7121,51 @@ mod async_commit_fs_tests {
         fs.record_bg_batch("/f", &[2], Ok(()));
         assert!(!armed(&fs), "every pending chunk committed again");
         assert!(fs.open_files.get(&rd).unwrap().failed_chunks.is_empty(), "reader handle untouched");
+    }
+
+    fn drained(idx: &[u32]) -> Vec<crate::writebuf::ChunkSegment> {
+        idx.iter()
+            .map(|&chunk_index| crate::writebuf::ChunkSegment {
+                chunk_index,
+                data: bytes::Bytes::from_static(b"x"),
+                offset_in_chunk: 0,
+                needs_seed: false,
+                since: None,
+                gaps: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// FUSE-3: a cap drain in write() that commits a failed batch's chunks
+    /// again clears them (async mode), so the next fsync gets no stale EIO;
+    /// a drain of other chunks keeps the failure armed.
+    #[test]
+    fn cap_drain_commit_clears_recommitted_failed_chunks() {
+        let fs = fs(true);
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let armed = |fs: &DtfsFilesystem| fs.open_files.get(&fh).unwrap().write_error.is_some();
+        fs.record_bg_batch("/f", &[0, 1], Err(anyhow::anyhow!("put failed")));
+        fs.record_drain_commit("/f", &drained(&[5]));
+        assert!(armed(&fs), "drain of other chunks must not clear the failure");
+        fs.record_drain_commit("/f", &drained(&[0, 1, 2]));
+        assert!(!armed(&fs), "failed chunks committed again by the cap drain");
+        assert!(fs.open_files.get(&fh).unwrap().failed_chunks.is_empty());
+    }
+
+    /// FUSE-3: truncate drops failed chunks at or above the new EOF (they no
+    /// longer exist); the chunk holding the new EOF stays failed.
+    #[test]
+    fn truncate_clips_failed_chunks_above_the_new_eof() {
+        let fs = fs(true);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.record_bg_batch("/f", &[1, 2, 3], Err(anyhow::anyhow!("put failed")));
+        fs.clip_failed_chunks("/f", 2 * cs + 1);
+        assert_eq!(fs.open_files.get(&fh).unwrap().failed_chunks, vec![1, 2], "boundary: chunk 2 holds the new EOF");
+        fs.clip_failed_chunks("/f", 2 * cs);
+        assert_eq!(fs.open_files.get(&fh).unwrap().failed_chunks, vec![1]);
+        fs.record_bg_batch("/f", &[1], Ok(()));
+        assert!(fs.open_files.get(&fh).unwrap().write_error.is_none(), "remaining failed chunk retried");
     }
 
     /// multibatch: two overlapping commits of disjoint chunk sets both merge
