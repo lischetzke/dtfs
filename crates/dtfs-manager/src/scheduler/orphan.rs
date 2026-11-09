@@ -707,8 +707,9 @@ pub(crate) trait DelocateOps {
     /// byte delete.
     async fn remove_location(&self) -> anyhow::Result<()>;
     /// Issue the data-plane `DeleteChunkReplica` byte-delete RPC. Only ever
-    /// called AFTER `remove_location` succeeded.
-    async fn delete_bytes(&self) -> anyhow::Result<()>;
+    /// called AFTER `remove_location` succeeded. `if_mtime_le_ms`: the data
+    /// node skips the delete when the `.dat` is newer (re-upload race).
+    async fn delete_bytes(&self, if_mtime_le_ms: Option<u64>) -> anyhow::Result<()>;
     /// Chunks are content-addressed: after the remove, does any file still
     /// hold a row for this hash on the same (node, disk)? Then the bytes are
     /// shared and must stay.
@@ -762,6 +763,9 @@ pub(crate) async fn delocate_replica<O: DelocateOps>(ops: &O) -> DelocateOutcome
         // untouched (still live in the SM + on disk).
         return DelocateOutcome::RemoveFailed;
     }
+    // Taken BEFORE the re-read: a same-hash put committed after it renames a
+    // newer .dat, which the data node then refuses to delete.
+    let guard_ms = now_millis();
     // Another file (or chunk index) still points at these bytes: keep them;
     // the orphan reaper reclaims them once nothing references the hash.
     if ops.bytes_still_referenced().await {
@@ -769,7 +773,8 @@ pub(crate) async fn delocate_replica<O: DelocateOps>(ops: &O) -> DelocateOutcome
     }
     // SM entry is gone. A byte-delete failure now only leaves de-located
     // bytes for the CO-3-2 reaper; never roll back the committed remove.
-    if ops.delete_bytes().await.is_err() {
+    // A guard-skipped delete returns Ok: Done, the bytes stay for the reaper.
+    if ops.delete_bytes(Some(guard_ms)).await.is_err() {
         return DelocateOutcome::RemovedBytesLeftover;
     }
     DelocateOutcome::Done
@@ -816,13 +821,14 @@ impl DelocateOps for SchedulerDelocate<'_> {
         shared
     }
 
-    async fn delete_bytes(&self) -> anyhow::Result<()> {
+    async fn delete_bytes(&self, if_mtime_le_ms: Option<u64>) -> anyhow::Result<()> {
         self.sched
-            .delete_chunk_replica_on_node(
+            .delete_chunk_replica_on_node_if_older(
                 &self.node_addr,
                 &self.chunk_id,
                 Some(self.disk_id),
                 &self.tier,
+                if_mtime_le_ms,
             )
             .await
             .map(|_| ())
@@ -1247,10 +1253,42 @@ mod sched_audit_orphan_tests {
         async fn remove_location(&self) -> anyhow::Result<()> {
             self.remove.clone().map_err(|e| anyhow::anyhow!(e))
         }
-        async fn delete_bytes(&self) -> anyhow::Result<()> {
+        async fn delete_bytes(&self, _: Option<u64>) -> anyhow::Result<()> {
             self.deleted.store(true, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct GuardOps {
+        reread_ms: std::sync::Mutex<Option<u64>>,
+        guard: std::sync::Mutex<Option<Option<u64>>>,
+    }
+    impl DelocateOps for GuardOps {
+        async fn remove_location(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn bytes_still_referenced(&self) -> bool {
+            *self.reread_ms.lock().unwrap() = Some(now_millis());
+            false
+        }
+        async fn delete_bytes(&self, if_mtime_le_ms: Option<u64>) -> anyhow::Result<()> {
+            *self.guard.lock().unwrap() = Some(if_mtime_le_ms);
+            Ok(())
+        }
+    }
+
+    /// The byte delete carries an mtime guard taken no later than the
+    /// reference re-read, so a same-hash put landing after it is kept.
+    #[tokio::test]
+    async fn byte_delete_carries_mtime_guard_not_later_than_reread() {
+        let ops = GuardOps::default();
+        assert_eq!(delocate_replica(&ops).await, DelocateOutcome::Done);
+        let reread = ops.reread_ms.lock().unwrap().expect("re-read ran");
+        let guard = ops.guard.lock().unwrap().expect("delete issued");
+        let guard = guard.expect("delete must carry if_mtime_le_ms");
+        assert!(guard <= reread, "guard {guard} later than re-read {reread}");
+        assert!(guard > 0);
     }
 
     #[test]
@@ -1286,7 +1324,7 @@ mod sched_audit_orphan_tests {
         async fn remove_location(&self) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn delete_bytes(&self) -> anyhow::Result<()> {
+        async fn delete_bytes(&self, _: Option<u64>) -> anyhow::Result<()> {
             self.deleted.store(true, Ordering::SeqCst);
             Ok(())
         }

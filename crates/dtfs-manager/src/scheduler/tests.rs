@@ -2238,7 +2238,7 @@ mod co_1_3_delocate_order_tests {
                 Ok(())
             }
         }
-        async fn delete_bytes(&self) -> anyhow::Result<()> {
+        async fn delete_bytes(&self, _: Option<u64>) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push("delete");
             if self.delete_fails {
                 Err(anyhow::anyhow!("forced byte-delete RPC failure"))
