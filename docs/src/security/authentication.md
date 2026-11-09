@@ -78,16 +78,22 @@ Read-only RPCs (`GetFileLocations`, `ListDirectory`, …) stay open.
 
 `ForwardClientWrite` (follower to leader) carries the same stamp with method
 `ForwardClientWrite` and binding hex `blake3(client_request_json)`, so a
-captured stamp cannot authorize another body; the raw secret is no longer
-sent (the legacy `shared_secret` body field is empty). The leader always
-verifies a stamped forward. An unstamped forward from a pre-HMAC manager is
-accepted on its raw `shared_secret` field only while
-`cluster.accept_legacy_forward_secret = true` (default), otherwise refused
-with `PERMISSION_DENIED`. Rolling update: managers update leader last, so
-until the leader runs the new build it refuses the updated followers' forwards
-(heartbeat usage/status writes landing on those followers do not commit for
-that window). Once every manager runs the new build, set
-`accept_legacy_forward_secret = false` on every manager.
+captured stamp cannot authorize another body. A leader always verifies a
+stamped forward and then ignores the legacy `shared_secret` body field.
+`cluster.accept_legacy_forward_secret` controls both sides:
+
+- `true` (default this release): the follower also sends the raw secret in
+  the legacy `shared_secret` field, so a pre-HMAC leader keeps accepting its
+  forwards, and the leader accepts an unstamped forward from a pre-HMAC
+  follower when that field matches. **The raw cluster secret still crosses
+  the manager link in every forward; with `[tls] mode = "off"` it is readable
+  by anyone on the path.**
+- `false`: the follower sends the field empty and the leader refuses an
+  unstamped forward with `PERMISSION_DENIED`.
+
+Rolling update: update all managers with the default, then set
+`accept_legacy_forward_secret = false` on every manager and restart them one
+by one. Until that second pass the secret is still sent in clear text.
 
 **REST and gRPC are independent gates** — securing only `:9402` leaves
 `:9401` open to anyone who can dial the leader.

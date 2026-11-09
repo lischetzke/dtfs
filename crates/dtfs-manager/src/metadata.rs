@@ -230,6 +230,7 @@ impl MetadataService {
         let resp = client
             .forward_client_write(forward_write_request(
                 &self.config.cluster.shared_secret,
+                self.config.cluster.accept_legacy_forward_secret,
                 body,
             ))
             .await
@@ -638,14 +639,20 @@ fn forward_binding(client_request_json: &[u8]) -> String {
 }
 
 /// Build the follower's `ForwardClientWrite` request: `dtfs-mgr-rpc` HMAC
-/// stamp over the body, legacy `shared_secret` field left empty so the raw
-/// secret never crosses the (possibly plaintext) WAN link.
-fn forward_write_request(secret: &str, body: Vec<u8>) -> Request<ForwardWriteRequest> {
+/// stamp over the body. The legacy raw `shared_secret` field is filled only
+/// while `legacy_secret` (`cluster.accept_legacy_forward_secret`) is true, so
+/// pre-HMAC leaders keep accepting forwards during a rolling update; with it
+/// false the raw secret never crosses the (possibly plaintext) WAN link.
+fn forward_write_request(
+    secret: &str,
+    legacy_secret: bool,
+    body: Vec<u8>,
+) -> Request<ForwardWriteRequest> {
     use dtfs_common::crypto::{stamp_mgr_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS};
     let stamp = stamp_mgr_rpc_auth(secret, "ForwardClientWrite", &forward_binding(&body));
     let mut req = Request::new(ForwardWriteRequest {
         client_request_json: body,
-        shared_secret: String::new(),
+        shared_secret: if legacy_secret { secret.to_string() } else { String::new() },
     });
     if let Some((ts, mac)) = stamp {
         if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
@@ -754,8 +761,11 @@ pub(crate) async fn write_via_leader(
     membership_nodes: &std::collections::BTreeMap<u64, RaftNodeInfo>,
     tls: &dtfs_common::tls::TlsContext,
     // CO-2-2 — cluster shared secret stamped onto the forward so the
-    // leader authenticates it (see `forward_secret_ok`).
+    // leader authenticates it (see `forward_write_request`).
     shared_secret: &str,
+    // `cluster.accept_legacy_forward_secret`: also fill the legacy raw-secret
+    // field so a not-yet-updated leader accepts the forward.
+    legacy_secret: bool,
     // CR2-8-1 (CMN-3) — size this forward client the same as the
     // listener it calls into, rather than tonic's 4 MB default.
     max_message_size_mb: u32,
@@ -798,7 +808,7 @@ pub(crate) async fn write_via_leader(
             let body =
                 serde_json::to_vec(&req).map_err(|e| format!("serialize ClientRequest: {e}"))?;
             let resp = client
-                .forward_client_write(forward_write_request(shared_secret, body))
+                .forward_client_write(forward_write_request(shared_secret, legacy_secret, body))
                 .await
                 .map_err(|e| format!("forward to leader {leader_addr}: {e}"))?;
             forward_result(&resp.into_inner())

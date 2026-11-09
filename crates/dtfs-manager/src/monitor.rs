@@ -219,6 +219,8 @@ pub struct HealthMonitor {
     /// CO-2-2 — cluster shared secret stamped onto leader-forwarded
     /// status commits so the leader authenticates them.
     shared_secret: String,
+    /// `cluster.accept_legacy_forward_secret` (see `write_via_leader`).
+    legacy_forward_secret: bool,
     /// CR2-8-1 (CMN-3) — configured cap for the leader-forwarded
     /// `ForwardClientWrite` client, sized the same as the listener it
     /// calls into rather than tonic's 4 MB default.
@@ -234,6 +236,7 @@ impl HealthMonitor {
         voters: Vec<dtfs_common::config::InitialVoter>,
         tls: dtfs_common::tls::TlsContext,
         shared_secret: String,
+        legacy_forward_secret: bool,
         max_message_size_mb: u32,
     ) -> Self {
         let (suspect_ms, down_ms) = liveness_thresholds_ms(monitoring);
@@ -247,6 +250,7 @@ impl HealthMonitor {
             alerts: None,
             tls,
             shared_secret,
+            legacy_forward_secret,
             max_message_size_mb,
         }
     }
@@ -385,6 +389,7 @@ impl HealthMonitor {
             membership_nodes,
             &self.tls,
             &self.shared_secret,
+            self.legacy_forward_secret,
             self.max_message_size_mb,
             req,
         )

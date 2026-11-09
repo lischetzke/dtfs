@@ -437,11 +437,12 @@ pub struct ClusterConfig {
     /// runs a build that signs Raft RPCs.
     #[serde(default)]
     pub require_raft_auth: bool,
-    /// Leader side of `ForwardClientWrite`: when `true` (default, rolling-update
-    /// safe) a forward without the `x-dtfs-rpc-*` HMAC stamp is still accepted
-    /// if its legacy body `shared_secret` matches. Set `false` once every
-    /// manager runs a build that signs forwards; legacy forwards are then
-    /// refused with `PermissionDenied`. Stamped forwards are always verified.
+    /// `ForwardClientWrite` rollout flag, both sides. `true` (default,
+    /// rolling-update safe): followers HMAC-sign forwards AND still fill the
+    /// legacy raw `shared_secret` field, leaders accept an unstamped forward
+    /// whose field matches. `false`: followers send the field empty, leaders
+    /// refuse unstamped forwards with `PermissionDenied`. Stamped forwards are
+    /// always verified. Set `false` once every manager signs forwards.
     #[serde(default = "default_true")]
     pub accept_legacy_forward_secret: bool,
     #[serde(default)]

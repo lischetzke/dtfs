@@ -157,23 +157,41 @@ mod forward_hmac_auth_tests {
     const SECRET: &str = "s3cr3t-cluster";
     const BODY: &[u8] = br#"{"UpdateNodeUsage":{"node_id":7}}"#;
 
+    // Rolling update: while the flag is on, the follower still fills the
+    // legacy field so a not-yet-updated leader accepts the forward.
     #[test]
-    fn follower_request_carries_hmac_not_secret() {
-        let req = forward_write_request(SECRET, BODY.to_vec());
-        assert_eq!(req.get_ref().shared_secret, "");
+    fn follower_request_carries_hmac_and_secret_while_legacy_on() {
+        let req = forward_write_request(SECRET, true, BODY.to_vec());
+        assert_eq!(req.get_ref().shared_secret, SECRET);
         assert!(req.metadata().get(DATA_RPC_AUTH_TS).is_some());
         assert!(req.metadata().get(DATA_RPC_AUTH_MAC).is_some());
     }
 
     #[test]
+    fn follower_request_carries_hmac_not_secret_with_legacy_off() {
+        let req = forward_write_request(SECRET, false, BODY.to_vec());
+        assert_eq!(req.get_ref().shared_secret, "");
+        assert!(req.metadata().get(DATA_RPC_AUTH_TS).is_some());
+        assert!(req.metadata().get(DATA_RPC_AUTH_MAC).is_some());
+    }
+
+    // A new leader verifies the stamp and ignores the legacy field.
+    #[test]
+    fn stamped_forward_ignores_legacy_field() {
+        let req = forward_write_request(SECRET, false, BODY.to_vec());
+        let body = ForwardWriteRequest { client_request_json: BODY.to_vec(), shared_secret: "wrong".into() };
+        check_forward_auth(SECRET, false, &body, req.metadata()).unwrap();
+    }
+
+    #[test]
     fn hmac_forward_accepted_with_legacy_disabled() {
-        let req = forward_write_request(SECRET, BODY.to_vec());
+        let req = forward_write_request(SECRET, false, BODY.to_vec());
         check_forward_auth(SECRET, false, req.get_ref(), req.metadata()).unwrap();
     }
 
     #[test]
     fn hmac_forward_with_tampered_body_refused() {
-        let req = forward_write_request(SECRET, BODY.to_vec());
+        let req = forward_write_request(SECRET, false, BODY.to_vec());
         let tampered = ForwardWriteRequest {
             client_request_json: br#"{"UpdateNodeUsage":{"node_id":8}}"#.to_vec(),
             shared_secret: String::new(),
@@ -184,7 +202,7 @@ mod forward_hmac_auth_tests {
 
     #[test]
     fn hmac_forward_signed_with_wrong_secret_refused() {
-        let req = forward_write_request("other-secret", BODY.to_vec());
+        let req = forward_write_request("other-secret", false, BODY.to_vec());
         let err = check_forward_auth(SECRET, true, req.get_ref(), req.metadata()).unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
@@ -215,7 +233,7 @@ mod forward_hmac_auth_tests {
 
     #[test]
     fn empty_configured_secret_skips_auth() {
-        let req = forward_write_request("", BODY.to_vec());
+        let req = forward_write_request("", true, BODY.to_vec());
         assert!(req.metadata().get(DATA_RPC_AUTH_MAC).is_none());
         check_forward_auth("", false, req.get_ref(), req.metadata()).unwrap();
     }

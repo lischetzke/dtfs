@@ -42,7 +42,7 @@ There are two planes so a stamp for one cannot be replayed on the other: `dtfs-d
 | ManagerService | `CreateLink` | `source\ndest` |
 | ManagerService | `Heartbeat`, `ReportChunkStatus` | `node_id` |
 | ManagerService | `ReleaseLeasesByHost` | `hostname` |
-| ManagerService | `ForwardClientWrite` | hex `blake3(client_request_json)`; the legacy `shared_secret` field is sent empty and accepted unstamped only while `cluster.accept_legacy_forward_secret = true` |
+| ManagerService | `ForwardClientWrite` | hex `blake3(client_request_json)`; while `cluster.accept_legacy_forward_secret = true` (default) the follower also fills the legacy raw `shared_secret` field (for pre-HMAC leaders) and the leader accepts an unstamped forward on it; with `false` the field is sent empty and an unstamped forward is refused |
 | ManagerService | `RegisterNode` | no stamp; the request carries `shared_secret` instead |
 | ManagerService | `GetFileLocations`, `ListDirectory`, `ReadSymlink`, `ClusterCapacity`, `ProbeLock` | not authenticated (read-only) |
 

@@ -517,6 +517,7 @@ async fn main() -> anyhow::Result<()> {
         config.cluster.initial_voters.clone(),
         tls_ctx.clone(),
         config.cluster.shared_secret.clone(),
+        config.cluster.accept_legacy_forward_secret,
         config.grpc.max_message_size_mb,
     )
     .with_alerts(alert_dispatcher.clone()); // P1-8

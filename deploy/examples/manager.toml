@@ -36,9 +36,9 @@ shared_secret = "change-me"         # must be identical on all nodes (managers, 
 #require_raft_auth = false          # true = reject Raft RPCs without a valid HMAC stamp.
                                     # Leave false during a rolling update, set true once
                                     # every manager runs a build that signs Raft RPCs.
-#accept_legacy_forward_secret = true # true = leader still accepts follower write forwards
-                                    # authenticated by the raw secret (pre-HMAC builds).
-                                    # Set false once every manager signs forwards.
+#accept_legacy_forward_secret = true # true = follower write forwards also carry the raw
+                                    # secret and leaders accept it (pre-HMAC managers).
+                                    # Set false on every manager once all sign forwards.
 #bootstrap = false                  # true on EXACTLY ONE manager, only for the
                                     # very first cluster start. Never set true on
                                     # a node joining an existing cluster — it

@@ -102,11 +102,13 @@ message ForwardWriteRequest {
   // JSON-serialized dtfs_raft::ClientRequest.
   bytes client_request_json = 1;
   // DEPRECATED legacy auth (CO-2-2): raw cluster shared secret. Current
-  // managers send it EMPTY and authenticate the forward with the
-  // x-dtfs-rpc-ts / x-dtfs-rpc-mac metadata (dtfs-mgr-rpc plane, method
-  // ForwardClientWrite, binding = hex blake3(client_request_json)). The
-  // leader accepts an unstamped forward carrying this field only while
-  // cluster.accept_legacy_forward_secret = true (PERMISSION_DENIED otherwise).
+  // managers authenticate the forward with the x-dtfs-rpc-ts /
+  // x-dtfs-rpc-mac metadata (dtfs-mgr-rpc plane, method ForwardClientWrite,
+  // binding = hex blake3(client_request_json)) and ignore this field on a
+  // stamped forward. While cluster.accept_legacy_forward_secret = true the
+  // follower still fills it (for pre-HMAC leaders) and the leader accepts an
+  // unstamped forward on it; with false it is sent empty and an unstamped
+  // forward is refused with PERMISSION_DENIED.
   string shared_secret = 2;
 }
 
