@@ -803,6 +803,9 @@ pub struct DtfsFilesystem {
     /// (`spawn_bg_upload`, up to `write.max_inflight_batches`, pairwise
     /// disjoint chunk sets); an entry stays until its restore/merge is done.
     bg_uploads: DashMap<String, Vec<(u64, Vec<u32>, usize)>>,
+    /// Background batch ids that must not commit because an earlier batch of
+    /// their path failed (`fail_bg_batch`); cleared by `BgSlot`.
+    bg_doomed: dashmap::DashSet<u64>,
     /// Woken whenever a background upload ends (`wait_bg_uploads`).
     bg_done: tokio::sync::Notify,
     /// Test hook run by write_inner right after it read the handle: models a
@@ -898,6 +901,7 @@ impl DtfsFilesystem {
             commit_tracker: CommitTracker::default(),
             path_locks: DashMap::new(),
             bg_uploads: DashMap::new(),
+            bg_doomed: dashmap::DashSet::new(),
             bg_done: tokio::sync::Notify::new(),
             #[cfg(test)]
             write_race_hook: std::sync::Mutex::new(None),
@@ -2145,14 +2149,36 @@ impl DtfsFilesystem {
                 self.mark_committed_and_refresh(&path, fh, committed).await;
                 self.record_bg_batch(&path, &chunks, Ok(()));
             }
-            Err(e) => {
-                // unlink may have detached the fh meanwhile: restore under
-                // its current path, never into a replacement at `path`.
-                let cur = self.open_files.get(&fh).map(|f| f.path.clone()).unwrap_or(path);
-                self.write_buffer.restore_segments(&cur, &segs);
-                self.record_bg_batch(&cur, &chunks, Err(e));
+            Err(e) => self.fail_bg_batch(fh, &path, inflight, &segs, &chunks, e),
+        }
+    }
+
+    /// Background batch `id` of `key` failed: restore its segments and arm
+    /// the writers' error. FUSE-1: every later batch of the path still in
+    /// flight must then not commit either (`wait_commit_turn` -> false), else
+    /// committed data sits above the uncommitted hole and an old manager's
+    /// summed size + a sparse-write pin drops it. They restore too; the next
+    /// flush/commit_all retries all of them in order.
+    fn fail_bg_batch(
+        &self,
+        fh: u64,
+        key: &str,
+        id: u64,
+        segs: &[crate::writebuf::ChunkSegment],
+        chunks: &[u32],
+        e: anyhow::Error,
+    ) {
+        // Before BgSlot wakes the next batch: it must see the mark.
+        if let Some(v) = self.bg_uploads.get(key) {
+            for b in v.iter().skip_while(|b| b.0 != id).skip(1) {
+                self.bg_doomed.insert(b.0);
             }
         }
+        // unlink may have detached the fh meanwhile: restore under
+        // its current path, never into a replacement at `path`.
+        let cur = self.open_files.get(&fh).map(|f| f.path.clone()).unwrap_or_else(|| key.to_string());
+        self.write_buffer.restore_segments(&cur, segs);
+        self.record_bg_batch(&cur, chunks, Err(e));
     }
 
     /// Background batch result: a failure arms every writer's error
@@ -2231,10 +2257,12 @@ impl DtfsFilesystem {
     /// `id` waits until no batch started before it is in `bg_uploads` (the
     /// entry is pushed in start order and leaves via `BgSlot` after its
     /// commit + merge or restore, also on panic). Else a later batch could
-    /// commit first and the manager size cover a hole below it.
-    async fn wait_commit_turn(&self, path: &str, id: u64) {
+    /// commit first and the manager size cover a hole below it. Returns
+    /// false when an earlier batch failed (`fail_bg_batch`): do not commit.
+    async fn wait_commit_turn(&self, path: &str, id: u64) -> bool {
         self.wait_bg(|| self.bg_uploads.get(path).is_none_or(|v| v.first().is_none_or(|b| b.0 == id)))
             .await;
+        !self.bg_doomed.contains(&id)
     }
 
     /// Background batches of `path` in flight.
@@ -3765,7 +3793,10 @@ impl DtfsFilesystem {
         }
 
         if let Some((key, id)) = turn {
-            self.wait_commit_turn(key, id).await;
+            if !self.wait_commit_turn(key, id).await {
+                warn!(path, batch = id, "earlier batch of the path failed: not committing this one above the hole");
+                bail!("an earlier batch of {path} failed: batch not committed (retried by the next flush)");
+            }
         }
 
         // Bug P — find the lease_id for this path so the manager can
@@ -4148,6 +4179,7 @@ impl Drop for BgSlot<'_> {
             v.retain(|b| b.0 != self.id);
             v.is_empty()
         });
+        self.fs.bg_doomed.remove(&self.id);
         self.fs.bg_done.notify_waiters();
     }
 }
@@ -7054,6 +7086,55 @@ mod async_commit_fs_tests {
         // Other paths are independent.
         fs.bg_uploads.insert("/g".to_string(), vec![(7, vec![0], cs)]);
         assert!(!pending(fs.wait_commit_turn("/f", 3)).await, "/g's batch does not order /f");
+    }
+
+    /// Gate FUSE-1: batch 1 fails while batches 2 and 3 (uploaded) wait for
+    /// their turn. Neither may commit above batch 1's hole: they restore,
+    /// their bytes stay readable and their chunks are recorded failed for
+    /// the retry. A batch started after the failure, or behind a batch that
+    /// succeeded, commits normally.
+    #[tokio::test]
+    async fn multibatch_failed_earlier_batch_stops_later_commits() {
+        let fs = Arc::new(fs(true));
+        let cs = fs.write_buffer.chunk_size();
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let mut segs = Vec::new();
+        for i in 0..3u8 {
+            fs.write_buffer.write("/f", i as u64 * cs as u64, &vec![i + 1; cs]);
+            segs.push(fs.write_buffer.flush_all("/f"));
+        }
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 0);
+        fs.bg_uploads.insert("/f".to_string(), vec![(1, vec![0], cs), (2, vec![1], cs), (3, vec![2], cs)]);
+        let f2 = fs.clone();
+        let b2 = tokio::spawn(async move { f2.wait_commit_turn("/f", 2).await });
+        fs.fail_bg_batch(fh, "/f", 1, &segs[0], &[0], anyhow::anyhow!("put failed"));
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: 1 });
+        let may_commit = tokio::time::timeout(Duration::from_secs(2), b2).await.expect("batch 1 ended").unwrap();
+        assert!(!may_commit, "batch 2 committed above batch 1's uncommitted hole");
+        // Batch 2's task bails before the commit and restores.
+        fs.fail_bg_batch(fh, "/f", 2, &segs[1], &[1], anyhow::anyhow!("earlier batch failed"));
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: 2 });
+        let may_commit = tokio::time::timeout(Duration::from_secs(2), fs.wait_commit_turn("/f", 3)).await.unwrap();
+        assert!(!may_commit, "batch 3 committed above the hole");
+        fs.fail_bg_batch(fh, "/f", 3, &segs[2], &[2], anyhow::anyhow!("earlier batch failed"));
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: 3 });
+        assert!(fs.bg_doomed.is_empty() && fs.bg_uploads.is_empty());
+        // Every byte is back in the buffer (readable, retried in order).
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 3 * cs);
+        let mut buf = vec![0u8; cs];
+        assert_eq!(fs.write_buffer.overlay("/f", cs as u64, &mut buf), cs);
+        assert!(buf.iter().all(|&b| b == 2), "batch 2's bytes not readable");
+        let failed = fs.open_files.get(&fh).unwrap().failed_chunks.clone();
+        assert_eq!(failed, vec![0, 1, 2]);
+        assert!(fs.open_files.get(&fh).unwrap().write_error.is_some());
+        // A batch started after the failure is not doomed.
+        fs.bg_uploads.insert("/f".to_string(), vec![(4, vec![0, 1, 2], 3 * cs)]);
+        assert!(tokio::time::timeout(Duration::from_secs(2), fs.wait_commit_turn("/f", 4)).await.unwrap());
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: 4 });
+        // Behind a batch that ended without failing: commits.
+        fs.bg_uploads.insert("/f".to_string(), vec![(5, vec![0], cs), (6, vec![1], cs)]);
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: 5 });
+        assert!(tokio::time::timeout(Duration::from_secs(2), fs.wait_commit_turn("/f", 6)).await.unwrap());
     }
 
     /// FUSE-1: an earlier batch whose task panics still releases the next

@@ -264,7 +264,11 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   `path_guard`). A later batch committing first left a hole below it the
   manager reported as the summed size and the next sparse-write pin
   dropped the later chunks (FUSE-1); the manager now also reports the
-  chunk extent for a file without explicit size. The
+  chunk extent for a file without explicit size. A failed batch
+  (`fail_bg_batch`) marks every later in-flight batch of the path
+  (`bg_doomed`, cleared by `BgSlot`): `wait_commit_turn` returns false, so
+  they restore and record failed chunks instead of committing above the
+  hole; the next flush/`commit_all` retries them in order. The
   per-file dirty cap is `max(128 MB, (n + 1) x batch limit)` (`dirty_cap_for`;
   n = 1 when async_commit is off). The task
   (`bg_upload`) renews the lease (`renew_if_due`), keeps `begin_inflight`
