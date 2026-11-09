@@ -509,6 +509,13 @@ async fn main() -> anyhow::Result<()> {
     // land on one arbitrary manager, usually a follower). Bug CJ — it
     // judges liveness from replicated state, so it no longer needs the
     // ClusterManager heartbeat map.
+    if config.cluster.accept_legacy_forward_secret && !config.cluster.shared_secret.is_empty() {
+        tracing::warn!(
+            "cluster.accept_legacy_forward_secret = true: follower forwards still carry the raw \
+             shared_secret (for old leaders during a rolling update); set it to false on every \
+             manager once all run this version"
+        );
+    }
     let health_monitor = HealthMonitor::new(
         Duration::from_secs(10),
         &config.monitoring,
