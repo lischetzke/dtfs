@@ -1134,6 +1134,15 @@ mod tests {
         assert_eq!(resolve_create_chunk_size(None, 4), 4 << 20);
     }
 
+    #[test]
+    fn create_file_refuses_unknown_explicit_volume() {
+        let err = check_create_volume(Some("media"), false).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert!(check_create_volume(Some("media"), true).is_ok());
+        assert!(check_create_volume(None, false).is_ok(), "old clients");
+        assert!(check_create_volume(Some("default"), false).is_ok());
+    }
+
     /// `[scrub] quarantine_on_fault` gates the heartbeat QuarantineNode write.
     #[test]
     fn heartbeat_quarantine_write_follows_scrub_setting() {

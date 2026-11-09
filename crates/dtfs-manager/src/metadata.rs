@@ -388,6 +388,19 @@ fn resolve_create_chunk_size(volume_chunk_size_bytes: Option<u64>, default_mb: u
     }
 }
 
+/// An explicitly requested volume must exist, else the file would be created
+/// with a volume id nothing backs. Unset and "default" stay lenient (legacy
+/// clients; the default volume may be implicit).
+fn check_create_volume(requested: Option<&str>, exists: bool) -> Result<(), Status> {
+    match requested {
+        Some(v) if v != "default" && !exists => {
+            tracing::warn!(volume_id = v, "CreateFile refused: unknown volume");
+            Err(Status::not_found(format!("volume '{v}' not found")))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Skip the heartbeat `UpdateNodeStatus(healthy)` Raft write (one every 5 s
 /// per node) when the node is already Healthy: the apply is a no-op.
 fn heartbeat_should_write_healthy(current: HealthStatus) -> bool {
@@ -1544,6 +1557,7 @@ impl ManagerService for MetadataService {
 
         let chunk_size = {
             let sm = self.sm_data.read().await;
+            check_create_volume(req.volume_id.as_deref(), sm.volumes.contains_key(&volume_id))?;
             resolve_create_chunk_size(
                 sm.volumes.get(&volume_id).map(|v| v.chunk_size_bytes),
                 self.config.defaults.chunk_size_mb,

@@ -89,6 +89,10 @@ An optional `[memory]` block caps the client. At Warn the read-ahead cache budge
 
 The client has no Prometheus endpoint. It registers itself with the managers (appears in the node table when `client.shared_secret` is set) and logs operations at `RUST_LOG` level. Cluster-side views are in [Monitoring](../operations/monitoring.md).
 
+## Separate media mount with a larger chunk size
+
+Run a second `dtfs-fuse@` instance with its own config and mountpoint (for example `/mnt/dtfs-media`) and create a volume with 16 MiB chunks on the cluster. In that instance's config set `[client] volume_id` to the volume and `chunk_size_mb = 16`; its new files and directories are created in that volume. Writing through it to files of another chunk size is refused (the error names `chunk_size_mb`). Re-export it with its own `fsid=` in `/etc/exports`, different from the first mount's.
+
 ## NFS re-export
 
 A DTFS mount can be re-exported with the Linux kernel NFS server (`exportfs`, use an explicit `fsid=`). Create, read, write, rename and delete work. Known limits:

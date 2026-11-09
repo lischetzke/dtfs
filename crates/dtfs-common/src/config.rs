@@ -1071,12 +1071,33 @@ pub struct FuseClientConfig {
     /// legacy `fuse.toml` keeps working.
     #[serde(default = "default_max_message_size")]
     pub max_message_size_mb: u32,
+    /// Volume this mount creates new files and directories in. Empty (the
+    /// default) sends no volume and the manager uses "default". Set
+    /// `chunk_size_mb` to that volume's chunk size.
+    #[serde(default)]
+    pub volume_id: String,
 }
 
 impl FuseClientConfig {
+    /// Volume to pass to `create_file`: `None` when unset (legacy behaviour).
+    pub fn create_volume(&self) -> Option<&str> {
+        Some(self.volume_id.as_str()).filter(|v| !v.is_empty())
+    }
+
     /// CMN-3 — reject an unusable message-size cap at startup instead of
     /// silently falling back to tonic's 4 MB default.
     pub fn validate(&self) -> Result<(), String> {
+        if !self.volume_id.is_empty()
+            && !self
+                .volume_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(format!(
+                "[client] volume_id {:?} may only contain A-Z a-z 0-9 . _ -",
+                self.volume_id
+            ));
+        }
         if self.max_message_size_mb == 0 {
             return Err("[client] max_message_size_mb must be > 0".to_string());
         }
@@ -2365,5 +2386,23 @@ shared_secret = "s"
 max_message_size_mb = 0
 "#).unwrap();
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn fuse_client_volume_id_defaults_none_and_validates() {
+        let parse = |extra: &str| -> FuseClientConfig {
+            toml::from_str(&format!("manager_addr = \"m:1\"\n{extra}")).unwrap()
+        };
+        let cfg = parse("");
+        assert_eq!(cfg.create_volume(), None);
+        assert!(cfg.validate().is_ok());
+        let cfg = parse("volume_id = \"media-16.v_2\"");
+        assert_eq!(cfg.create_volume(), Some("media-16.v_2"));
+        assert!(cfg.validate().is_ok());
+        for bad in ["a/b", "a b", "../x", "m\u{e9}dia"] {
+            let cfg = parse(&format!("volume_id = \"{bad}\""));
+            let err = cfg.validate().unwrap_err();
+            assert!(err.contains("volume_id"), "{bad}: {err}");
+        }
     }
 }

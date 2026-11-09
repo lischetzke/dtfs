@@ -2737,7 +2737,7 @@ impl DtfsFilesystem {
     ) -> Result<dtfs_proto::dtfs::manager::CreateFileResponse> {
         let response = self
             .client
-            .create_file(path, None)
+            .create_file(path, self.config.client.create_volume())
             .await
             .with_context(|| format!("create_file failed for {path}"))?;
 
@@ -2887,7 +2887,7 @@ impl DtfsFilesystem {
         // paths ending in "/" as directory entries.
         let response = self
             .client
-            .create_file(&dir_path, None)
+            .create_file(&dir_path, self.config.client.create_volume())
             .await
             .with_context(|| format!("mkdir failed for {path}"))?;
 

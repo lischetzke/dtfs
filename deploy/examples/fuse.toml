@@ -31,6 +31,10 @@ manager_addr = "10.0.0.1:9401"      # primary manager gRPC endpoint
                                     # Bug BW: MUST match the volume chunk size
                                     # (manager defaults.chunk_size_mb). Mismatch
                                     # corrupts multi-chunk reads.
+#volume_id = ""                    # Volume new files/dirs of this mount are created in.
+                                    # Empty = manager default volume. Must exist on the
+                                    # manager (else create fails NotFound); only [A-Za-z0-9._-].
+                                    # Set chunk_size_mb to that volume's chunk size.
 #chunk_read_timeout_secs = 60       # FUSE-HOL: per-replica chunk-fetch timeout.
                                     # A hung/dead node that never errors would
                                     # otherwise stall the read forever; on timeout
