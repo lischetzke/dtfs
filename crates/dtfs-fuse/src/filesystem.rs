@@ -2817,10 +2817,15 @@ impl DtfsFilesystem {
                 expires_at_ms: resp.conflict_expires_at_ms,
             }));
         }
-        if let Some(mut entry) = self.open_files.get_mut(&fh) {
+        // Every handle sharing this owner (knfsd reopen) gets the new id, so
+        // whichever closes last releases the live lease, not a stale one.
+        let deadline = lease_deadline_from(sent);
+        for mut entry in self.open_files.iter_mut() {
             let f = entry.value_mut();
-            f.lease_id = Some(resp.lease_id);
-            f.lease_deadline = Some(lease_deadline_from(sent));
+            if f.lease_owner_id.as_deref() == Some(owner_id) {
+                f.lease_id = Some(resp.lease_id.clone());
+                f.lease_deadline = Some(deadline);
+            }
         }
         tracing::warn!(
             path = %path,
