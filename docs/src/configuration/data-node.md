@@ -39,7 +39,7 @@ Required strings `region`, `datacenter`, `rack`, `host`. Use the same values as 
 |---|---|---|---|
 | `listen_addr` | string | required | Chunk-streaming gRPC. Use the routable address other nodes dial, not `0.0.0.0`, on a multi-interface host. |
 | `max_message_size_mb` | u32 | `256` | **Validated**: > 0. |
-| `max_concurrent_chunk_writes` | usize | `8` | In-flight `PutChunk` operations (floor 1). Bounds peak write memory (N x chunk size). |
+| `max_concurrent_chunk_writes` | usize | `8` | In-flight `PutChunk` operations (floor 1, no upper clamp). Puts stream to disk, so each in-flight put holds about 1 MiB; the bound mainly protects disk and fsync queueing. Pair it with the FUSE clients' `write.upload_concurrency` (puts above it queue here, inside the client's 60 s put deadline), e.g. 64 for a slow-fsync NAS-backed disk. With `[memory] hard_cap_mb` set this value is ignored: slots = `(hard_cap_mb - 256) / 16` (clamped 1..=256), so 64 slots need `hard_cap_mb >= 1280`. |
 
 ## `[tls]`
 

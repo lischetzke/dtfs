@@ -104,18 +104,20 @@ mountpoint = "/mnt/dtfs"
                                     # min_replicas_before_ack nodes hold it.
 # WI-01: number of complete chunks the write buffer holds back before
 # flushing, amortizing the AllocateChunks + CommitChunkLocations round trip
-# over a batch instead of firing once per chunk. Effective range 1..=32
-# (values outside are clamped). WI-01 / H1: effective batch is additionally
-# capped so batch * chunk_size <= 64 MB, so the un-committed ceiling per
-# open write never exceeds 64 MB (default 4 x 4 MB = 16 MB; a 128 MB-chunk
-# volume falls back to per-chunk flushing). 1 restores the pre-WI-01
-# per-chunk-flush behaviour exactly.
+# over a batch instead of firing once per chunk. Effective range 1..=64
+# (values outside are clamped). Batch byte limit = max(64 MB, batch x
+# chunk_size) capped at 256 MB (the batch shrinks to fit); per-file dirty
+# cap = max(128 MB, 2 x batch limit). Default 4 x 4 MB: 64 MB / 128 MB.
+# 64 x 4 MB: 256 MB batch, 512 MB dirty cap PER OPEN WRITER; size the
+# [memory] budget for dirty cap x open writers + readahead.cache_mb.
+# 1 restores the pre-WI-01 per-chunk-flush behaviour exactly.
 #flush_batch_chunks = 4
-# Chunks of one flush batch uploaded concurrently (clamped 1..=16; 1 = one
+# Chunks of one flush batch uploaded concurrently (clamped 1..=64; 1 = one
 # chunk at a time). Each in-flight chunk buffers about 3 MiB per target;
 # on a slow WAN link keep it low so puts stay within the 60 s RPC timeout.
 # Above 8 only for a data disk with slow fsync (NAS-backed), together with
-# the data node's grpc.max_concurrent_chunk_writes.
+# a matching flush_batch_chunks and the data node's
+# grpc.max_concurrent_chunk_writes.
 #upload_concurrency = 2
 # true: every write uploads synchronously to the volume's anchor datacenter.
 # false: each chunk goes to min_replicas_before_ack maintained nodes outside
@@ -127,8 +129,8 @@ mountpoint = "/mnt/dtfs"
 #anchor_sync = true
 # false: fsync and close(2) commit every buffered byte (default).
 # true: fsync commits nothing extra; a partial chunk is committed when it
-# fills, when its oldest byte is async_commit_secs old, under the 128 MB
-# per-file dirty cap, or at close(2) (every close still commits). RISK: acknowledged writes can stay
+# fills, when its oldest byte is async_commit_secs old, under the per-file
+# dirty cap (128 MB by default), or at close(2) (every close still commits). RISK: acknowledged writes can stay
 # only in client memory for that window and are LOST if dtfs-fuse or the host
 # crashes. Media / NFS re-export only.
 #async_commit = false

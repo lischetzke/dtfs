@@ -10,8 +10,8 @@ pub const MIN_CHUNK_SIZE_MB: u32 = 1;
 /// Largest allowed chunk size (MiB). The client verifies a chunk before
 /// serving it, so first-byte latency on the 40 Mbps anchor link is one whole
 /// chunk (64 MiB is about 13 s); `upload_concurrency` 2 chunks share the 60 s
-/// write_timeout; FUSE `DIRTY_BYTES_CAP` is 128 MiB (two chunks) and
-/// `FLUSH_BATCH_MAX_BYTES` 64 MiB.
+/// write_timeout; the FUSE batch byte limit is 64..=256 MiB and the
+/// per-file dirty cap twice that (`writebuf::batch_limits`).
 pub const MAX_CHUNK_SIZE_MB: u32 = 64;
 pub const MIN_CHUNK_SIZE_BYTES: u64 = MIN_CHUNK_SIZE_MB as u64 * 1024 * 1024;
 pub const MAX_CHUNK_SIZE_BYTES: u64 = MAX_CHUNK_SIZE_MB as u64 * 1024 * 1024;
@@ -1159,19 +1159,18 @@ pub struct FuseWriteConfig {
     /// WI-01 — number of complete, chunk-aligned chunks the write buffer
     /// holds back before flushing to the cluster, amortizing the manager
     /// `AllocateChunks` RPC + `CommitChunkLocations` Raft write over a batch
-    /// instead of firing once per chunk. Clamped into `1..=32` by
+    /// instead of firing once per chunk. Clamped into `1..=64` by
     /// `WriteBuffer::new_with_batch`; `1` reproduces the pre-WI-01
-    /// per-chunk-flush behaviour exactly (the rollback value). WI-01 / H1 —
-    /// the EFFECTIVE batch is additionally clamped to
-    /// `min(configured, 64 MB / chunk_size_mb)`
-    /// (`writebuf::effective_batch_chunks`, `FLUSH_BATCH_MAX_BYTES` = 64 MB),
-    /// so the un-committed ceiling per open write is AT MOST 64 MB regardless
-    /// of `chunk_size_mb` (default 4 * 4 MB = 16 MB), and a volume with
-    /// chunks of 64 MB or more flushes per chunk — see CLAUDE.md A.3.2.
+    /// per-chunk-flush behaviour exactly (the rollback value). It also sets
+    /// the batch byte limit `max(64 MB, batch x chunk_size)` capped at
+    /// 256 MB (the effective batch shrinks to fit) and the per-file dirty
+    /// cap `max(128 MB, 2 x limit)` (`writebuf::batch_limits`); defaults give
+    /// 64 MB / 128 MB. The cap is per open writer: size `[memory]` for
+    /// it — see CLAUDE.md A.3.2.
     #[serde(default = "default_flush_batch_chunks")]
     pub flush_batch_chunks: u32,
     /// Chunks of one flush batch put concurrently (each to all its targets).
-    /// Clamped into `1..=16` by `effective_upload_concurrency`; `1` uploads
+    /// Clamped into `1..=64` by `effective_upload_concurrency`; `1` uploads
     /// one chunk at a time. Each in-flight chunk put holds buffered pieces
     /// per target, and every put shares the link under a fixed RPC timeout.
     /// Above 8 only helps a data disk with slow fsync (NAS-backed); raise
@@ -1188,7 +1187,7 @@ pub struct FuseWriteConfig {
     /// `false` (default): fsync and close(2) commit every buffered byte,
     /// including a partial tail chunk. `true`: fsync commits nothing extra;
     /// a partial chunk is committed once complete, once its oldest byte is
-    /// `async_commit_secs` old, under `DIRTY_BYTES_CAP` pressure, or at
+    /// `async_commit_secs` old, under per-file dirty-cap pressure, or at
     /// close(2) (FUSE flush, every close). Acknowledged writes can be lost on a
     /// dtfs-fuse or host crash inside that window (media / NFS re-export).
     #[serde(default)]
@@ -1239,9 +1238,9 @@ impl FuseWriteConfig {
         }
     }
 
-    /// `upload_concurrency` clamped into `1..=16`.
+    /// `upload_concurrency` clamped into `1..=64`.
     pub fn effective_upload_concurrency(&self) -> usize {
-        self.upload_concurrency.clamp(1, 16) as usize
+        self.upload_concurrency.clamp(1, 64) as usize
     }
 }
 
@@ -2175,7 +2174,7 @@ warm = 2
     }
 
     /// WI-01 — an explicit `flush_batch_chunks` parses through untouched;
-    /// clamping into `1..=32` happens in `WriteBuffer::new_with_batch`, not
+    /// clamping into `1..=64` happens in `WriteBuffer::new_with_batch`, not
     /// at parse time.
     #[test]
     fn wi01_flush_batch_chunks_parses_explicit_value() {
@@ -2185,12 +2184,12 @@ warm = 2
     }
 
     #[test]
-    fn upload_concurrency_defaults_to_two_and_clamps_to_1_16() {
+    fn upload_concurrency_defaults_to_two_and_clamps_to_1_64() {
         let cfg: FuseWriteConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.upload_concurrency, 2);
         assert_eq!(cfg.effective_upload_concurrency(), 2);
         assert_eq!(FuseWriteConfig::default().upload_concurrency, 2);
-        for (raw, want) in [(0u32, 1usize), (1, 1), (8, 8), (9, 9), (16, 16), (17, 16)] {
+        for (raw, want) in [(0u32, 1usize), (1, 1), (8, 8), (9, 9), (16, 16), (17, 17), (64, 64), (65, 64)] {
             let cfg: FuseWriteConfig =
                 toml::from_str(&format!("upload_concurrency = {raw}")).unwrap();
             assert_eq!(cfg.effective_upload_concurrency(), want, "raw {raw}");

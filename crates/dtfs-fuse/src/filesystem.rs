@@ -1824,7 +1824,7 @@ impl DtfsFilesystem {
                 // has already completed) to the cluster right now instead
                 // of accumulating further.
                 self.bg_backpressure(&path, n).await;
-                if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), n) {
+                if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), n, self.write_buffer.dirty_cap()) {
                     self.renew_if_due(fh, &path).await?;
                     let (segs, _inflight) = self.cap_drain(&path, at, n);
                     if !segs.is_empty() {
@@ -1850,7 +1850,7 @@ impl DtfsFilesystem {
         // hole at all into an already-near-cap buffer, must not be allowed
         // to push it further over.
         self.bg_backpressure(&path, data.len()).await;
-        if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), data.len()) {
+        if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), data.len(), self.write_buffer.dirty_cap()) {
             self.renew_if_due(fh, &path).await?;
             let (segs, _inflight) = self.cap_drain(&path, effective_offset, data.len());
             if !segs.is_empty() {
@@ -2000,7 +2000,7 @@ impl DtfsFilesystem {
         }
     }
 
-    /// `DIRTY_BYTES_CAP` drain before buffering `len` bytes at `at`: complete
+    /// Dirty-cap (`WriteBuffer::dirty_cap`) drain before buffering `len` bytes at `at`: complete
     /// chunks; with async_commit also partial chunks outside `at..at+len`
     /// (those were just seeded for this write and must stay seeded).
     /// Returns the drained segments with their in-flight overlay.
@@ -2015,7 +2015,7 @@ impl DtfsFilesystem {
         self.write_buffer.cap_drain_inflight(
             path,
             len,
-            crate::writebuf::DIRTY_BYTES_CAP,
+            self.write_buffer.dirty_cap(),
             self.config.write.async_commit,
             keep,
         )
@@ -2118,11 +2118,12 @@ impl DtfsFilesystem {
     }
 
     /// async_commit backpressure: if buffered plus in-flight bytes of `path`
-    /// would meet `DIRTY_BYTES_CAP` with `incoming` more, wait for the
+    /// would meet the dirty cap with `incoming` more, wait for the
     /// background upload first (the cap drain then sees the restored bytes).
     async fn bg_backpressure(&self, path: &str, incoming: usize) {
         let inflight = self.bg_uploads.get(path).map_or(0, |e| e.1);
-        if inflight > 0 && dirty_cap_exceeded(self.write_buffer.dirty_bytes(path) + inflight, incoming) {
+        let cap = self.write_buffer.dirty_cap();
+        if inflight > 0 && dirty_cap_exceeded(self.write_buffer.dirty_bytes(path) + inflight, incoming, cap) {
             self.wait_bg_uploads(path).await;
         }
     }
@@ -3157,6 +3158,11 @@ impl DtfsFilesystem {
         self.metadata_ttl
     }
 
+    /// Per-file dirty cap derived from `write.flush_batch_chunks` (startup warn).
+    pub fn dirty_cap(&self) -> usize {
+        self.write_buffer.dirty_cap()
+    }
+
     /// CR-6-5 (FUSE-5) — remove every `metadata_cache` entry whose TTL has
     /// elapsed. `get_cached_metadata` already does this lazily per-path on
     /// read, but a path that stops being read (e.g. Plex finished scanning
@@ -3974,12 +3980,12 @@ impl Drop for BgSlot<'_> {
 }
 
 /// R1 (FUSE-1 memory half) — true when a buffer already holding `dirty`
-/// bytes would meet or exceed `writebuf::DIRTY_BYTES_CAP` after `incoming`
+/// bytes would meet or exceed `cap` (`WriteBuffer::dirty_cap`) after `incoming`
 /// more bytes are added. Extracted as a pure predicate so the cap check in
 /// `write()`'s hole-fill loop (and the one guarding the caller's own
 /// bytes) is directly testable without a live `WriteBuffer`/network call.
-fn dirty_cap_exceeded(dirty: usize, incoming: usize) -> bool {
-    dirty.saturating_add(incoming) >= crate::writebuf::DIRTY_BYTES_CAP
+fn dirty_cap_exceeded(dirty: usize, incoming: usize, cap: usize) -> bool {
+    dirty.saturating_add(incoming) >= cap
 }
 
 /// CR-1-2 (FUSE-7) — chunk indices a write of `len` bytes at `offset`
@@ -4721,20 +4727,21 @@ mod r1_dirty_cap_tests {
 
     #[test]
     fn under_cap_is_not_exceeded() {
-        assert!(!dirty_cap_exceeded(0, 100));
-        assert!(!dirty_cap_exceeded(DIRTY_BYTES_CAP - 1024, 100));
+        assert!(!dirty_cap_exceeded(0, 100, DIRTY_BYTES_CAP));
+        assert!(!dirty_cap_exceeded(DIRTY_BYTES_CAP - 1024, 100, DIRTY_BYTES_CAP));
     }
 
     #[test]
     fn meeting_or_crossing_cap_is_exceeded() {
-        assert!(dirty_cap_exceeded(DIRTY_BYTES_CAP, 1));
-        assert!(dirty_cap_exceeded(DIRTY_BYTES_CAP - 10, 10), "meeting the cap exactly counts");
-        assert!(dirty_cap_exceeded(DIRTY_BYTES_CAP, 0), "already at the cap with nothing incoming");
+        let cap = DIRTY_BYTES_CAP;
+        assert!(dirty_cap_exceeded(cap, 1, cap));
+        assert!(dirty_cap_exceeded(cap - 10, 10, cap), "meeting the cap exactly counts");
+        assert!(dirty_cap_exceeded(cap, 0, cap), "already at the cap with nothing incoming");
     }
 
     #[test]
     fn saturates_instead_of_overflowing() {
-        assert!(dirty_cap_exceeded(usize::MAX, usize::MAX));
+        assert!(dirty_cap_exceeded(usize::MAX, usize::MAX, DIRTY_BYTES_CAP));
     }
 }
 
@@ -5928,6 +5935,32 @@ mod async_commit_fs_tests {
             modified_at_ms: 0,
             is_directory: false,
             is_symlink: false,
+        }
+    }
+
+    /// bigbatch — write()'s cap drain uses the cap derived from
+    /// `flush_batch_chunks` (64 x 4 MiB -> 512 MiB), not the fixed 128 MiB;
+    /// the default batch still drains at 128 MiB. `incoming` stands in for
+    /// the buffered bytes so the test needs no 512 MiB buffer.
+    #[test]
+    fn cap_drain_uses_the_cap_derived_from_the_configured_batch() {
+        let mib = 1usize << 20;
+        for async_on in [false, true] {
+            for (batch, cap) in [(4u32, 128 * mib), (64, 512 * mib)] {
+                let mut cfg: FuseConfig =
+                    toml::from_str(include_str!("../../../deploy/examples/fuse.toml")).unwrap();
+                cfg.write.async_commit = async_on;
+                cfg.write.flush_batch_chunks = batch;
+                let fs = DtfsFilesystem::new(DtfsClient::new(), cfg.location.clone(), cfg);
+                let cs = fs.write_buffer.chunk_size();
+                assert_eq!((cs, fs.dirty_cap()), (4 * mib, cap));
+                fs.write_buffer.write("/f", 0, &vec![1; cs]);
+                let at = 1000 * cs as u64;
+                let (segs, _g) = fs.cap_drain("/f", at, cap - cs - 1);
+                assert!(segs.is_empty(), "async={async_on} batch={batch}: drained below the cap");
+                let (segs, _g) = fs.cap_drain("/f", at, cap - cs);
+                assert_eq!(segs.len(), 1, "async={async_on} batch={batch}: no drain at the cap");
+            }
         }
     }
 

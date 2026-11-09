@@ -337,7 +337,7 @@ async fn main() -> Result<()> {
         tracing::warn!(
             "write.async_commit = true: acknowledged writes may stay in client memory up to {} s / {} bytes per open file; a dtfs-fuse or host crash loses them",
             write_cfg.async_commit_secs,
-            writebuf::DIRTY_BYTES_CAP,
+            fs.dirty_cap(),
         );
         let commit_fs = fs.clone();
         tokio::spawn(async move {

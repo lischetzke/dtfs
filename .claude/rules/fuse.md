@@ -125,7 +125,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   commit is logged at error with chunk indices and bytes lost. flush and
   fsync return the commit error.
 - `writebuf.rs` batches `write.flush_batch_chunks` (default 4, clamp
-  1..=32) complete chunks per `flush()`; `flush_all` drains everything.
+  1..=64) complete chunks per `flush()`; `flush_all` drains everything.
   A write past the logical end zero-fills only the hole's edge chunks
   (`hole_fill_ranges`: old partial tail to its chunk end, the write's chunk
   start to the offset); whole chunks inside the hole get no buffer and no
@@ -180,8 +180,12 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   the path and its subtree, and `truncate` clips them to the new size, so
   the old file's drained bytes never show after rm+recreate, O_TRUNC or
   rename-over (a later guard drop is a no-op).
-- Batch is byte-clamped at `FLUSH_BATCH_MAX_BYTES` (64 MB); total dirty
-  bytes per open file are capped at `DIRTY_BYTES_CAP` (2x) and
+- Batch is byte-clamped by `writebuf::batch_limits`: `max(64 MB, batch x
+  chunk_size)` capped at 256 MB; total dirty bytes per open file are capped
+  at `WriteBuffer::dirty_cap` = `max(128 MB, 2 x batch limit)` (defaults
+  64 MB / 128 MB = `DIRTY_BYTES_CAP`; 64 x 4 MiB: 256 / 512 MB). The cap is
+  per open writer and nothing sheds write buffers: dirty cap x open
+  writers plus readahead must fit the client's `[memory]` budget. They are
   force-drained via `WriteBuffer::cap_drain` (gap-free complete chunks,
   then gappy complete ones only until under the cap, never the
   chunks of the pending write: `keep`, they were just seeded) before a hole
@@ -247,7 +251,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   everything that could touch those chunks waits for it first:
   write() into a chunk of the batch (`range_hits_upload`; else it re-seeds
   from the pre-commit snapshot and the restore clobbers it), a write whose
-  dirty + in-flight bytes would meet `DIRTY_BYTES_CAP` (`bg_backpressure`,
+  dirty + in-flight bytes would meet the dirty cap (`bg_backpressure`,
   then the cap drain as before), `commit_all` (last writer's flush/release,
   timer), truncate, rename (every lock path) and unlink; NOT async fsync
   (knfsd fsyncs per NFS COMMIT; waiting stalled its one thread). Waiters

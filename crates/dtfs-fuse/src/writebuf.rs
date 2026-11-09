@@ -29,34 +29,40 @@ use tracing::{debug, instrument};
 /// `MAX_CHUNKS_PER_ALLOCATION` (65_536, `metadata.rs`), it just bounds how
 /// much un-committed data one open file can hold in client heap
 /// (`flush_batch_chunks * chunk_size`; see CLAUDE.md A.3.2).
-const MAX_FLUSH_BATCH_CHUNKS: usize = 32;
+const MAX_FLUSH_BATCH_CHUNKS: usize = 64;
 
-/// WI-01 / H1 — hard byte ceiling on un-committed data one open file may hold
-/// because of batching. `flush_batch_chunks` bounds a chunk COUNT, so at a
-/// 128 MB volume chunk size the default batch of 4 would buffer 512 MB per
-/// open write and the count clamp would permit 4 GB — with nothing in the
-/// dtfs-fuse memory ladder (A.3.2 / A.5) shedding write buffers and several
-/// files open at once during a torrent landing. 64 MB keeps the default
-/// 4 x 4 MB batch intact and degrades a large-chunk volume to per-chunk
-/// flushing (the pre-WI-01 behaviour) instead of to an OOM.
-const FLUSH_BATCH_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// WI-01 / H1 — floor of the per-file batch byte limit: any batch up to
+/// 64 MB (the default 4 x 4 MB included) keeps the pre-bigbatch limits,
+/// 64 MB batch and 128 MB dirty cap.
+const FLUSH_BATCH_MIN_BYTES: usize = 64 * 1024 * 1024;
 
-/// CR-1-1 — hard ceiling on total dirty bytes buffered per file, independent
-/// of how many distinct chunk indices are touched (a write far into a large
-/// sparse file plus a write near offset 0 now holds two small `ChunkBuf`
-/// entries rather than a multi-hundred-MB contiguous `Vec`, but callers must
-/// still not be able to pin unbounded heap by scattering tiny writes across
-/// many chunk indices). Set to twice `FLUSH_BATCH_MAX_BYTES` — comfortably
-/// above one batch's worth of complete chunks plus whatever partial chunks
-/// are still accumulating. Enforcement is caller-side (filesystem.rs forces
-/// a flush before a write that would exceed it); `dirty_bytes()` is the
-/// query callers use to check.
-pub const DIRTY_BYTES_CAP: usize = FLUSH_BATCH_MAX_BYTES * 2;
+/// Hard ceiling of the batch byte limit: nothing in the dtfs-fuse memory
+/// ladder (A.3.2 / A.5) sheds write buffers, and several files can be open
+/// at once during a torrent landing, so batch x chunk size stays bounded.
+const FLUSH_BATCH_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// CR-1-1 — default (and minimum) ceiling on total dirty bytes buffered per
+/// file, independent of how many distinct chunk indices are touched. The
+/// configured cap is `batch_limits(..).1` (`WriteBuffer::dirty_cap`); this
+/// is its value for any batch up to 64 MB. Enforcement is caller-side
+/// (filesystem.rs forces a flush before a write that would exceed it).
+pub const DIRTY_BYTES_CAP: usize = FLUSH_BATCH_MIN_BYTES * 2;
+
+/// `(batch byte limit, per-file dirty cap)` for a configured
+/// `flush_batch_chunks` (clamped `1..=MAX_FLUSH_BATCH_CHUNKS`) and chunk
+/// size: batch = `max(64 MB, chunks x chunk_size)` capped at 256 MB; dirty
+/// cap = `max(128 MB, 2 x batch)`, so in async_commit mode one batch can
+/// upload (in-flight bytes count against the cap) while the next fills.
+pub(crate) fn batch_limits(configured: usize, chunk_size: usize) -> (usize, usize) {
+    let want = configured.clamp(1, MAX_FLUSH_BATCH_CHUNKS).saturating_mul(chunk_size);
+    let batch = want.clamp(FLUSH_BATCH_MIN_BYTES, FLUSH_BATCH_MAX_BYTES);
+    (batch, (2 * batch).max(DIRTY_BYTES_CAP))
+}
 
 /// WI-01 / H1 — resolve the effective `flush_batch_chunks` for a given
 /// configured value and chunk size: clamp the count into
 /// `1..=MAX_FLUSH_BATCH_CHUNKS`, then clamp again so `batch * chunk_size`
-/// never exceeds `FLUSH_BATCH_MAX_BYTES`. Never goes below 1 — a single
+/// never exceeds the `batch_limits` byte limit. Never goes below 1 — a single
 /// chunk always flushes whatever its size (pre-WI-01 behaviour); holding it
 /// back would strand the write.
 pub(crate) fn effective_batch_chunks(configured: usize, chunk_size: usize) -> usize {
@@ -65,7 +71,7 @@ pub(crate) fn effective_batch_chunks(configured: usize, chunk_size: usize) -> us
         // Degenerate; avoids a divide by zero.
         return by_count;
     }
-    by_count.min(FLUSH_BATCH_MAX_BYTES / chunk_size).max(1)
+    by_count.min(batch_limits(configured, chunk_size).0 / chunk_size).max(1)
 }
 
 /// Zero fill for a write at `offset` past the logical `end`: only the edge
@@ -110,6 +116,8 @@ pub struct WriteBuffer {
     /// several chunks. `1` (the default from `new()`) reproduces the
     /// pre-WI-01 per-chunk-flush behaviour exactly.
     flush_batch_chunks: usize,
+    /// Per-file dirty cap (`batch_limits(..).1`; `DIRTY_BYTES_CAP` from `new()`).
+    dirty_cap: usize,
     /// Per-file write buffers, keyed by file path.
     buffers: DashMap<String, FileWriteBuffer>,
     /// Drained segments whose commit is in flight, by `begin_inflight` id:
@@ -348,6 +356,7 @@ impl WriteBuffer {
         Self {
             chunk_size,
             flush_batch_chunks: 1,
+            dirty_cap: DIRTY_BYTES_CAP,
             buffers: DashMap::new(),
             inflight: DashMap::new(),
             next_inflight: AtomicU64::new(0),
@@ -359,10 +368,9 @@ impl WriteBuffer {
     /// until at least `flush_batch_chunks` are available, so `flush()`
     /// amortizes the allocate+commit round trip over a batch instead of
     /// firing once per chunk. Clamped into `1..=MAX_FLUSH_BATCH_CHUNKS` AND
-    /// down to whatever keeps `batch * chunk_size` within
-    /// `FLUSH_BATCH_MAX_BYTES` (64 MB), so a large-chunk volume degrades to
-    /// per-chunk flushing rather than buffering hundreds of MB per open
-    /// file. `1` reproduces `new()`'s exact behaviour (the rollback value)
+    /// down to whatever keeps `batch * chunk_size` within the
+    /// `batch_limits` byte limit (64..=256 MB), which also sets the per-file
+    /// dirty cap. `1` reproduces `new()`'s exact behaviour (the rollback value)
     /// at the default 4 MB chunk size. `flush_all` is unaffected — it
     /// always drains everything, batched or not, so held-back chunks still
     /// leave at fsync/close.
@@ -370,6 +378,7 @@ impl WriteBuffer {
         Self {
             chunk_size,
             flush_batch_chunks: effective_batch_chunks(flush_batch_chunks, chunk_size),
+            dirty_cap: batch_limits(flush_batch_chunks, chunk_size).1,
             buffers: DashMap::new(),
             inflight: DashMap::new(),
             next_inflight: AtomicU64::new(0),
@@ -578,7 +587,7 @@ impl WriteBuffer {
         aged.into_iter().take(limit).map(|(_, p)| p).collect()
     }
 
-    /// `DIRTY_BYTES_CAP` release valve: if `dirty + incoming >= cap`, drain
+    /// Dirty-cap (`dirty_cap()`) release valve: if `dirty + incoming >= cap`, drain
     /// every gap-free complete chunk outside `keep` (the chunks the pending
     /// write touches and has just seeded), then gappy complete ones until
     /// under the cap. With `partial` (async_commit), if still at the cap,
@@ -948,7 +957,7 @@ impl WriteBuffer {
     }
 
     /// Total buffered bytes for `path`, summed across every resident chunk
-    /// (CR-1-1) — used by callers to enforce `DIRTY_BYTES_CAP`.
+    /// (CR-1-1) — used by callers to enforce `dirty_cap()`.
     pub fn dirty_bytes(&self, path: &str) -> usize {
         self.buffers
             .get(path)
@@ -1112,6 +1121,11 @@ impl WriteBuffer {
     /// Get the current chunk size.
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
+    }
+
+    /// Per-file dirty-byte cap (dirty + in-flight in async_commit mode).
+    pub fn dirty_cap(&self) -> usize {
+        self.dirty_cap
     }
 }
 
@@ -1444,11 +1458,11 @@ mod tests {
     fn wi01_h1_effective_batch_is_byte_bounded() {
         let mib = 1024 * 1024;
         assert_eq!(effective_batch_chunks(4, 4 * mib), 4);
-        assert_eq!(effective_batch_chunks(32, 4 * mib), 16);
-        assert_eq!(effective_batch_chunks(4, 32 * mib), 2);
-        assert_eq!(effective_batch_chunks(4, 64 * mib), 1);
-        assert_eq!(effective_batch_chunks(4, 128 * mib), 1);
-        assert_eq!(effective_batch_chunks(64, 4 * mib), 16);
+        assert_eq!(effective_batch_chunks(32, 4 * mib), 32);
+        assert_eq!(effective_batch_chunks(4, 32 * mib), 4);
+        assert_eq!(effective_batch_chunks(4, 64 * mib), 4);
+        assert_eq!(effective_batch_chunks(4, 128 * mib), 2);
+        assert_eq!(effective_batch_chunks(64, 4 * mib), 64);
         assert_eq!(effective_batch_chunks(0, 4 * mib), 1);
         assert_eq!(effective_batch_chunks(4, 0), 4);
 
@@ -1472,12 +1486,36 @@ mod tests {
         }
     }
 
-    // WI-01 / H1 — a large-chunk volume (>= 64 MB) must degrade to per-chunk
-    // flushing regardless of the configured batch; the reference-deployment
-    // 4 MB chunk size keeps the configured default of 4.
+    /// bigbatch — batch byte limit / dirty cap derive from the configured
+    /// batch: floors 64/128 MiB (defaults unchanged), ceiling 256/512 MiB.
+    #[test]
+    fn bigbatch_limits_derive_from_configured_batch() {
+        let mib = 1024 * 1024;
+        assert_eq!(batch_limits(4, 4 * mib), (64 * mib, 128 * mib), "defaults unchanged");
+        assert_eq!(batch_limits(16, 4 * mib), (64 * mib, 128 * mib));
+        assert_eq!(batch_limits(17, 4 * mib), (68 * mib, 136 * mib), "just above the floor");
+        assert_eq!(batch_limits(64, 4 * mib), (256 * mib, 512 * mib));
+        assert_eq!(batch_limits(128, 4 * mib), (256 * mib, 512 * mib), "count clamped to 64");
+        assert_eq!(batch_limits(4, 64 * mib), (256 * mib, 512 * mib));
+        assert_eq!(batch_limits(8, 64 * mib), (256 * mib, 512 * mib), "byte ceiling");
+        assert_eq!(batch_limits(0, 4 * mib), (64 * mib, 128 * mib));
+        assert_eq!(effective_batch_chunks(64, 4 * mib), 64, "64 is in range");
+        assert_eq!(effective_batch_chunks(65, 4 * mib), 64, "65 clamped");
+        assert_eq!(effective_batch_chunks(4, 64 * mib), 4);
+        assert_eq!(effective_batch_chunks(8, 64 * mib), 4, "256 MiB / 64 MiB");
+        let wb = WriteBuffer::new_with_batch(4 * mib, 64);
+        assert_eq!((wb.flush_batch_chunks, wb.dirty_cap()), (64, 512 * mib));
+        assert_eq!(WriteBuffer::new_with_batch(4 * mib, 4).dirty_cap(), DIRTY_BYTES_CAP);
+        assert_eq!(WriteBuffer::new(4 * mib).dirty_cap(), DIRTY_BYTES_CAP);
+    }
+
+    // WI-01 / H1 — a chunk at or above the 256 MB batch ceiling must degrade
+    // to per-chunk flushing regardless of the configured batch; the
+    // reference-deployment 4 MB chunk size keeps the configured default of 4.
     #[test]
     fn wi01_h1_large_chunk_volume_flushes_per_chunk() {
-        assert_eq!(WriteBuffer::new_with_batch(128 * 1024 * 1024, 4).flush_batch_chunks, 1);
+        assert_eq!(WriteBuffer::new_with_batch(256 * 1024 * 1024, 4).flush_batch_chunks, 1);
+        assert_eq!(WriteBuffer::new_with_batch(512 * 1024 * 1024, 4).flush_batch_chunks, 1);
         assert_eq!(WriteBuffer::new_with_batch(4 * 1024 * 1024, 4).flush_batch_chunks, 4);
     }
 
