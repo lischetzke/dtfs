@@ -2045,7 +2045,7 @@ pub(crate) async fn hash_chunk_file_incrementally(path: &Path, total: u64) -> st
     let mut f = fs::File::open(path).await?;
     let mut hasher = dtfs_common::checksum::IncrementalHasher::new();
     let mut read: u64 = 0;
-    let mut buf = vec![0u8; PIECE];
+    let mut buf = vec![0u8; (PIECE as u64).min(total) as usize];
     while read < total {
         let want = (total - read).min(PIECE as u64) as usize;
         f.read_exact(&mut buf[..want]).await?;

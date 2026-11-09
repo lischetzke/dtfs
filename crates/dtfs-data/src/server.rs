@@ -341,17 +341,19 @@ fn stream_file(
             }
         };
         let mut offset: u64 = 0;
-        let mut buf = vec![0u8; GET_PIECE_SIZE];
         while offset < total_size {
             let want = (total_size - offset).min(GET_PIECE_SIZE as u64) as usize;
-            if let Err(e) = f.read_exact(&mut buf[..want]).await {
+            // One buffer per piece, sized to the piece and moved into the
+            // response: no idle 8 MiB buffer for small chunks, no copy.
+            let mut buf = vec![0u8; want];
+            if let Err(e) = f.read_exact(&mut buf).await {
                 let _ = tx
                     .send(Err(Status::internal(format!("read chunk: {e}"))))
                     .await;
                 return;
             }
             let resp = GetChunkResponse {
-                data: buf[..want].to_vec(),
+                data: buf,
                 offset,
                 total_size,
             };
@@ -1242,6 +1244,34 @@ max_io_percent = 10
         let got = collect_stream(&svc, &chunk_hex).await.unwrap();
         assert_eq!(got.len(), data.len());
         assert_eq!(got, data, "streamed bytes must match the stored chunk");
+    }
+
+    // Each piece is exactly its own length (no oversize buffer moved into
+    // the response); a chunk of exactly GET_PIECE_SIZE is one piece.
+    #[tokio::test]
+    async fn stream_file_pieces_are_sized_to_the_data() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("x.dat");
+        std::fs::write(&p, vec![5u8; GET_PIECE_SIZE + 3]).unwrap();
+        let pieces: Vec<_> = stream_file(p.clone(), GET_PIECE_SIZE as u64).collect().await;
+        assert_eq!(pieces.len(), 1);
+        let one = pieces[0].as_ref().unwrap();
+        assert_eq!((one.data.len(), one.data.capacity()), (GET_PIECE_SIZE, GET_PIECE_SIZE));
+        let small: Vec<_> = stream_file(p, 3).collect().await;
+        let s = small[0].as_ref().unwrap();
+        assert_eq!((s.data.len(), s.data.capacity(), small.len()), (3, 3, 1));
+    }
+
+    // A `.dat` shorter than the size the stream promised ends the stream
+    // with INTERNAL, never a short success.
+    #[tokio::test]
+    async fn stream_file_short_dat_is_internal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = tmp.path().join("x.dat");
+        std::fs::write(&p, b"short").unwrap();
+        let items: Vec<_> = stream_file(p, 6).collect().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].as_ref().unwrap_err().code(), tonic::Code::Internal);
     }
 
     // A damaged-but-parseable .meta (wrong checksum) must not make good
