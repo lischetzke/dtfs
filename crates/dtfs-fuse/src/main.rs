@@ -36,10 +36,16 @@ const SHUTDOWN_UNMOUNT_SECS: u64 = 15;
 const SHUTDOWN_LEASE_RELEASE_SECS: u64 = 5;
 const OLDEST_TIMEOUT_STOP_SECS: u64 = 45;
 
-/// Commit budget left after `elapsed` since the stop began.
+/// Floor for the commit: a mis-stamped or overrun stop clock must never
+/// degrade to "commit nothing" (still well inside 45 s after a 15 s unmount).
+const SHUTDOWN_COMMIT_FLOOR_SECS: u64 = 5;
+
+/// Commit budget left after `elapsed` since the stop began (both exit
+/// branches stamp the start), never below the floor.
 fn shutdown_commit_budget(elapsed: std::time::Duration) -> std::time::Duration {
     std::time::Duration::from_secs(SHUTDOWN_TOTAL_SECS - SHUTDOWN_LEASE_RELEASE_SECS)
         .saturating_sub(elapsed)
+        .max(std::time::Duration::from_secs(SHUTDOWN_COMMIT_FLOOR_SECS))
 }
 
 #[derive(Parser, Debug)]
@@ -427,10 +433,12 @@ async fn main() -> Result<()> {
         let signal_fut = wait_for_terminate_signal();
         tokio::pin!(signal_fut);
 
-        let mut stop_started = std::time::Instant::now();
+        // Set by both exit branches (the compiler checks both assign it).
+        let stop_started: std::time::Instant;
         let session_result = tokio::select! {
             res = &mut handle => {
                 // External unmount (fusermount -u, or kernel umount).
+                stop_started = std::time::Instant::now();
                 info!("FUSE session exited externally");
                 res
             }
@@ -673,7 +681,9 @@ mod shutdown_budget_tests {
     fn commit_budget_takes_the_unused_unmount_time() {
         assert_eq!(shutdown_commit_budget(Duration::ZERO), Duration::from_secs(35));
         assert_eq!(shutdown_commit_budget(Duration::from_secs(3)), Duration::from_secs(32));
-        assert_eq!(shutdown_commit_budget(Duration::from_secs(60)), Duration::ZERO, "never negative");
+        // A stop clock far in the past (e.g. stamped at mount time) still
+        // commits for the floor instead of nothing.
+        assert_eq!(shutdown_commit_budget(Duration::from_secs(3600)), Duration::from_secs(SHUTDOWN_COMMIT_FLOOR_SECS));
         let total = shutdown_commit_budget(Duration::ZERO) + Duration::from_secs(SHUTDOWN_LEASE_RELEASE_SECS);
         assert!(total.as_secs() < OLDEST_TIMEOUT_STOP_SECS);
     }
