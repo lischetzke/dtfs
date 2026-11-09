@@ -2204,6 +2204,12 @@ fn apply_request(
             for p in &to_drop {
                 sm.write_leases.remove(p);
             }
+            // Audit #11 — byte-range locks of crashed clients were only
+            // evicted when the same path was touched again.
+            sm.posix_locks.retain(|_, table| {
+                table.retain(|l| l.expires_at_ms > *now_ms);
+                !table.is_empty()
+            });
             if count > 0 {
                 push_audit_capped(
                     &mut sm.audit_log,

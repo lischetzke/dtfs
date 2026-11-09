@@ -393,7 +393,7 @@ impl TaskScheduler {
             // snapshot every ~2.8 h from lease GC alone.
             let any_expired = {
                 let sm = state_data.read().await;
-                lease_sweep_due(sm.write_leases.values().map(|l| l.expires_at_ms), now_ms)
+                lease_gc_due(&sm, now_ms)
             };
             if !any_expired {
                 continue;
@@ -494,6 +494,16 @@ pub(crate) fn lease_sweep_due(expiries: impl IntoIterator<Item = u64>, now_ms: u
     expiries.into_iter().any(|e| e <= now_ms)
 }
 
+/// Audit #11 — the sweep also reaps expired POSIX byte-range locks, so
+/// an expired lock alone must trigger it.
+pub(crate) fn lease_gc_due(sm: &StateMachineData, now_ms: u64) -> bool {
+    lease_sweep_due(
+        sm.write_leases.values().map(|l| l.expires_at_ms)
+            .chain(sm.posix_locks.values().flatten().map(|l| l.expires_at_ms)),
+        now_ms,
+    )
+}
+
 #[cfg(test)]
 mod mgr_gc_lease_sweep_due_tests {
     use super::lease_sweep_due;
@@ -511,6 +521,17 @@ mod mgr_gc_lease_sweep_due_tests {
     #[test]
     fn an_expired_lease_sweeps() {
         assert!(lease_sweep_due([5_000, 1_000], 1_000));
+    }
+
+    #[test]
+    fn an_expired_posix_lock_alone_sweeps() {
+        use dtfs_raft::state_machine::{DistributedLock, StateMachineData};
+        let mut sm = StateMachineData::default();
+        sm.posix_locks.insert("/f".into(), vec![DistributedLock {
+            owner_id: "o".into(), start: 0, end: 1, write: true, expires_at_ms: 2_000,
+        }]);
+        assert!(!super::lease_gc_due(&sm, 1_999));
+        assert!(super::lease_gc_due(&sm, 2_000));
     }
 }
 

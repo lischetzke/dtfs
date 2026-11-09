@@ -1028,6 +1028,25 @@ mod posix_path_regression {
         assert_eq!(sm.volumes["default"].version, 1);
     }
 
+    /// Audit #11 — SweepExpiredLeases also reaps expired POSIX byte-range
+    /// locks (crashed clients), drops emptied tables, keeps live locks.
+    #[test]
+    fn sweep_expired_leases_reaps_expired_posix_locks() {
+        let mut sm = StateMachineData::default();
+        let lock = |path: &str, owner: &str, start: u64, lease_ms: u64| ClientRequest::AcquireLock {
+            path: path.into(), owner_id: owner.into(), start, end: start + 10,
+            write: true, lease_ms, now_ms: 1_000,
+        };
+        apply_request(&mut sm, &mk_log_id(1), &lock("/dead", "crashed", 0, 1_000));
+        apply_request(&mut sm, &mk_log_id(2), &lock("/mixed", "crashed", 0, 1_000));
+        apply_request(&mut sm, &mk_log_id(3), &lock("/mixed", "live", 20, 60_000));
+        // Boundary: expires_at_ms == now_ms is expired (matches AcquireLock).
+        apply_request(&mut sm, &mk_log_id(4), &ClientRequest::SweepExpiredLeases { now_ms: 2_000 });
+        assert!(!sm.posix_locks.contains_key("/dead"), "{:?}", sm.posix_locks);
+        let mixed = sm.posix_locks.get("/mixed").expect("live lock's table kept");
+        assert_eq!(mixed.iter().map(|l| l.owner_id.as_str()).collect::<Vec<_>>(), ["live"]);
+    }
+
     /// Bug P — `UpdateChunkLocations` MUST reject a commit whose
     /// `lease_id` doesn't match the currently-held lease for the
     /// path. Pre-fix a stale writer (whose lease the manager had
