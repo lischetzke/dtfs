@@ -3059,7 +3059,6 @@ impl DtfsFilesystem {
                 let writes = targets.iter().map(|addr| {
                     let client = self.client.clone();
                     let addr = addr.clone();
-                    let volume_id = volume_id.clone();
                     let data = segment.data.clone();
                     let tier = tier.clone();
                     let expected_chunk_id = expected_chunk_id.clone();
