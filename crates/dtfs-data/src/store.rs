@@ -1989,6 +1989,13 @@ fn note_sync() {
 /// across a power loss. POSIX requires the parent-dir to be fsynced
 /// separately from the inode itself; tokio's `File::open` + `sync_all`
 /// works for directories on Linux when opened with read-only access.
+/// True when a directory `sync_all` failed only because the filesystem
+/// cannot sync directories (EINVAL / ENOTSUP), not because of an I/O error.
+fn dir_sync_unsupported(e: &std::io::Error) -> bool {
+    // 22 = EINVAL, 95 = EOPNOTSUPP/ENOTSUP on Linux.
+    matches!(e.raw_os_error(), Some(22) | Some(95)) || e.kind() == std::io::ErrorKind::Unsupported
+}
+
 async fn fsync_dir(dir: &Path) -> DtfsResult<()> {
     note_sync();
     // `fs::File::open` on a directory yields a handle whose `sync_all`
@@ -1997,20 +2004,20 @@ async fn fsync_dir(dir: &Path) -> DtfsResult<()> {
     match fs::File::open(dir).await {
         Ok(f) => match f.sync_all().await {
             Ok(()) => Ok(()),
-            Err(e) => {
-                // Some filesystems (overlayfs, tmpfs) return EINVAL on
-                // directory sync. Log + accept — the rename itself is
-                // still observed by the inode; the durability
-                // guarantee weakens to whatever the underlying FS
-                // gives us, which is at least no worse than the
-                // pre-fix behaviour.
+            Err(e) if dir_sync_unsupported(&e) => {
+                // Some filesystems (overlayfs, tmpfs) cannot sync a
+                // directory at all (EINVAL / ENOTSUP). Log + accept: the
+                // durability guarantee is whatever that FS gives.
                 tracing::debug!(
                     dir = %dir.display(),
                     error = %e,
-                    "fsync_dir failed (non-fatal — falling back to pre-fix durability)"
+                    "fsync_dir unsupported on this filesystem (non-fatal)"
                 );
                 Ok(())
             }
+            // A real I/O error (EIO, ENOSPC, ...) means the directory
+            // entries may not be durable: never ack as if they were.
+            Err(e) => Err(DtfsError::Io(e)),
         },
         Err(e) => Err(DtfsError::Io(e)),
     }
@@ -2061,6 +2068,19 @@ mod tests {
     use super::*;
     use dtfs_common::types::DiskTier;
     use tempfile::TempDir;
+
+    /// A dir fsync that fails with a real I/O error must fail the commit
+    /// (the entries may not be durable); only "cannot sync a directory"
+    /// filesystems (EINVAL / ENOTSUP) pass. Integrity audit of 7361c47.
+    #[test]
+    fn dir_sync_only_tolerates_unsupported_filesystems() {
+        use std::io::{Error, ErrorKind};
+        assert!(dir_sync_unsupported(&Error::from_raw_os_error(22)), "EINVAL (overlayfs/tmpfs)");
+        assert!(dir_sync_unsupported(&Error::from_raw_os_error(95)), "ENOTSUP");
+        assert!(dir_sync_unsupported(&Error::new(ErrorKind::Unsupported, "x")));
+        assert!(!dir_sync_unsupported(&Error::from_raw_os_error(5)), "EIO must fail the commit");
+        assert!(!dir_sync_unsupported(&Error::from_raw_os_error(28)), "ENOSPC must fail the commit");
+    }
 
     #[test]
     fn stat_error_gone_only_for_not_found() {
