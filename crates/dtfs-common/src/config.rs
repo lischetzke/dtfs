@@ -1156,9 +1156,11 @@ pub struct FuseWriteConfig {
     #[serde(default = "default_flush_batch_chunks")]
     pub flush_batch_chunks: u32,
     /// Chunks of one flush batch put concurrently (each to all its targets).
-    /// Clamped into `1..=8` by `effective_upload_concurrency`; `1` uploads
+    /// Clamped into `1..=16` by `effective_upload_concurrency`; `1` uploads
     /// one chunk at a time. Each in-flight chunk put holds buffered pieces
     /// per target, and every put shares the link under a fixed RPC timeout.
+    /// Above 8 only helps a data disk with slow fsync (NAS-backed); raise
+    /// the data node's `grpc.max_concurrent_chunk_writes` to match.
     #[serde(default = "default_upload_concurrency")]
     pub upload_concurrency: u32,
     /// `true` (default): every write uploads synchronously to the volume's
@@ -1222,9 +1224,9 @@ impl FuseWriteConfig {
         }
     }
 
-    /// `upload_concurrency` clamped into `1..=8`.
+    /// `upload_concurrency` clamped into `1..=16`.
     pub fn effective_upload_concurrency(&self) -> usize {
-        self.upload_concurrency.clamp(1, 8) as usize
+        self.upload_concurrency.clamp(1, 16) as usize
     }
 }
 
@@ -2163,12 +2165,12 @@ warm = 2
     }
 
     #[test]
-    fn upload_concurrency_defaults_to_two_and_clamps_to_1_8() {
+    fn upload_concurrency_defaults_to_two_and_clamps_to_1_16() {
         let cfg: FuseWriteConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.upload_concurrency, 2);
         assert_eq!(cfg.effective_upload_concurrency(), 2);
         assert_eq!(FuseWriteConfig::default().upload_concurrency, 2);
-        for (raw, want) in [(0u32, 1usize), (1, 1), (8, 8), (9, 8)] {
+        for (raw, want) in [(0u32, 1usize), (1, 1), (8, 8), (9, 9), (16, 16), (17, 16)] {
             let cfg: FuseWriteConfig =
                 toml::from_str(&format!("upload_concurrency = {raw}")).unwrap();
             assert_eq!(cfg.effective_upload_concurrency(), want, "raw {raw}");

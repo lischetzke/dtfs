@@ -133,7 +133,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   gap-free drain, as writes cover them, by `remove`; re-keyed by `rename`,
   clipped by `truncate`.
   `flush_segments_to_cluster` puts a batch's segments at most
-  `write.upload_concurrency` (default 2, clamp 1..=8) at a time
+  `write.upload_concurrency` (default 2, clamp 1..=16) at a time
   (`upload_segments`, ordered `buffered`, lowest-index error wins, nothing
   starts after it) and sends ONE `commit_chunk_locations` only after all
   segments reached quorum. Do not unbound it: puts share a fixed 60 s

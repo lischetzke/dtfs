@@ -111,9 +111,11 @@ mountpoint = "/mnt/dtfs"
 # volume falls back to per-chunk flushing). 1 restores the pre-WI-01
 # per-chunk-flush behaviour exactly.
 #flush_batch_chunks = 4
-# Chunks of one flush batch uploaded concurrently (clamped 1..=8; 1 = one
+# Chunks of one flush batch uploaded concurrently (clamped 1..=16; 1 = one
 # chunk at a time). Each in-flight chunk buffers about 3 MiB per target;
 # on a slow WAN link keep it low so puts stay within the 60 s RPC timeout.
+# Above 8 only for a data disk with slow fsync (NAS-backed), together with
+# the data node's grpc.max_concurrent_chunk_writes.
 #upload_concurrency = 2
 # true: every write uploads synchronously to the volume's anchor datacenter.
 # false: each chunk goes to min_replicas_before_ack maintained nodes outside
