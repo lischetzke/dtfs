@@ -111,7 +111,7 @@ Seeds the auto-created `default` volume and the defaults for volumes created thr
 
 | Key | Type | Default | Constraint | Scope |
 |---|---|---|---|---|
-| `chunk_size_mb` | u32 | `4` | Chunk size for new volumes. FUSE `client.chunk_size_mb` must equal the chunk size of the volumes it writes. | cluster |
+| `chunk_size_mb` | u32 | `4` | Chunk size for new volumes, 1 to 64 MiB (startup refuses other values; existing volumes are not touched, a warning is logged for any outside the range). FUSE `client.chunk_size_mb` must equal the chunk size of the volumes it writes. | cluster |
 | `anchor_datacenter` | string | unset | When set, every chunk keeps at least one replica in this datacenter. Unset: no anchor. | cluster |
 
 `[defaults.write_safety]` (if the table is present, both keys are required):

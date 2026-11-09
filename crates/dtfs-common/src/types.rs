@@ -694,7 +694,7 @@ impl Default for VolumeConfig {
         Self {
             id: VolumeId::new("default".to_string()),
             name: "default".to_string(),
-            chunk_size_bytes: 128 * 1024 * 1024, // 128MB
+            chunk_size_bytes: 4 * 1024 * 1024, // matches [defaults] chunk_size_mb
             replication: TierReplication::default(),
             write_safety: WriteSafety::default(),
             anchor_datacenter: None,
@@ -827,6 +827,19 @@ mod tests {
         assert_eq!(tr.hot, 3);
         assert_eq!(tr.warm, 2);
         assert_eq!(tr.cold, 1);
+    }
+
+    #[test]
+    fn volume_config_default_chunk_size_is_4_mib_and_old_value_loads() {
+        assert_eq!(VolumeConfig::default().chunk_size_bytes, 4 * 1024 * 1024);
+        // An old snapshot carrying 128 MiB keeps its stored value.
+        let json = serde_json::json!({
+            "id": "default", "name": "default", "chunk_size_bytes": 134217728u64,
+            "replication": { "hot": 3, "warm": 2, "cold": 1, "tape": 1 },
+            "write_safety": { "min_replicas_before_ack": 2, "write_timeout_secs": 30 }
+        });
+        let cfg: VolumeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.chunk_size_bytes, 134217728);
     }
 
     /// Removal of the dead `VolumeSchedules` knob deleted the

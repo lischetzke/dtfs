@@ -249,7 +249,7 @@ Volume ids are lowercase names with spaces replaced by `-`. The field reference 
 | Body field | Type | Default | Meaning |
 |---|---|---|---|
 | `name` | string | required | Becomes the id (lowercased, spaces to `-`) |
-| `chunk_size_mb` | u32 | `[defaults].chunk_size_mb` | Honoured per volume |
+| `chunk_size_mb` | u32 | `[defaults].chunk_size_mb` | Honoured per volume. Must be 1 to 64 (`0` = default); otherwise `400 {"error": "chunk_size_mb N is out of range: must be 1..=64 MiB"}`. |
 | `replication_hot`, `replication_warm`, `replication_cold` | u32 | `[defaults.replication]` | Legacy per-tier counts |
 | `anchor_datacenter` | string | none (`[defaults].anchor_datacenter` is not applied here) | Anchor datacenter |
 | `force` | bool | `false` | Allow an anchor datacenter that no registered node reports |

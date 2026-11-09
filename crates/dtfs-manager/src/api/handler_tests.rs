@@ -423,6 +423,25 @@ async fn create_volume_unknown_anchor_dc_is_400_unless_forced() {
 }
 
 #[tokio::test]
+async fn create_volume_chunk_size_out_of_range_is_400() {
+    let h = harness().await;
+    for bad in [65u32, 128, 4096] {
+        let mut r = create("cs", None, false);
+        r.chunk_size_mb = Some(bad);
+        let e = create_volume(State(h.state.clone()), Json(r)).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST, "{bad}");
+        assert!(e.1.0["error"].as_str().unwrap().contains("chunk_size_mb"));
+    }
+    // In range (and 0 = default) passes the gate; the leaderless Raft write then fails: 503.
+    for ok in [0u32, 1, 64] {
+        let mut r = create("cs", None, false);
+        r.chunk_size_mb = Some(ok);
+        let e = create_volume(State(h.state.clone()), Json(r)).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE, "{ok}");
+    }
+}
+
+#[tokio::test]
 async fn create_volume_duplicate_is_409_with_body() {
     let h = harness().await;
     h.state.sm_data.write().await.volumes.insert("dup".into(), vol("dup"));

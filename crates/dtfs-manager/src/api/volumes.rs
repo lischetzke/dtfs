@@ -114,6 +114,20 @@ pub(super) async fn create_volume(
 
     let vol_id = volume_id_from_name(&body.name);
 
+    // 0 / absent fall back to [defaults] chunk_size_mb; anything else must be in range.
+    let chunk_size_mb = body.chunk_size_mb.filter(|m| *m != 0).unwrap_or(state.config.defaults.chunk_size_mb);
+    if dtfs_common::config::validate_chunk_size_bytes(chunk_size_mb as u64 * 1024 * 1024).is_err() {
+        warn!(volume = %vol_id, chunk_size_mb, "create_volume rejected: chunk_size_mb out of range");
+        return Err(err_body(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "chunk_size_mb {chunk_size_mb} is out of range: must be {}..={} MiB",
+                dtfs_common::config::MIN_CHUNK_SIZE_MB,
+                dtfs_common::config::MAX_CHUNK_SIZE_MB
+            ),
+        ));
+    }
+
     // CO-4-14 — create is create, not upsert. Re-POSTing an existing volume
     // name must NOT blindly UpsertVolume: that wipes any set-mandatory /
     // cache / anchor / write-safety tuning applied since the first create
@@ -139,9 +153,7 @@ pub(super) async fn create_volume(
     let config = VolumeConfig {
         id: VolumeId::new(vol_id.clone()),
         name: body.name.clone(),
-        chunk_size_bytes: body.chunk_size_mb
-            .unwrap_or(state.config.defaults.chunk_size_mb) as u64
-            * 1024 * 1024,
+        chunk_size_bytes: chunk_size_mb as u64 * 1024 * 1024,
         replication: TierReplication {
             hot:  body.replication_hot.unwrap_or(state.config.defaults.replication.hot),
             warm: body.replication_warm.unwrap_or(state.config.defaults.replication.warm),

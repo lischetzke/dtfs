@@ -4,6 +4,33 @@ use std::path::PathBuf;
 use crate::topology::Location;
 use crate::types::{DiskTier, TierReplication, WriteSafety};
 
+/// Smallest allowed chunk size (MiB). Below it, per-chunk Raft rows, two
+/// files plus fsyncs per chunk and one PutChunk per chunk dominate.
+pub const MIN_CHUNK_SIZE_MB: u32 = 1;
+/// Largest allowed chunk size (MiB). The client verifies a chunk before
+/// serving it, so first-byte latency on the 40 Mbps anchor link is one whole
+/// chunk (64 MiB is about 13 s); `upload_concurrency` 2 chunks share the 60 s
+/// write_timeout; FUSE `DIRTY_BYTES_CAP` is 128 MiB (two chunks) and
+/// `FLUSH_BATCH_MAX_BYTES` 64 MiB.
+pub const MAX_CHUNK_SIZE_MB: u32 = 64;
+pub const MIN_CHUNK_SIZE_BYTES: u64 = MIN_CHUNK_SIZE_MB as u64 * 1024 * 1024;
+pub const MAX_CHUNK_SIZE_BYTES: u64 = MAX_CHUNK_SIZE_MB as u64 * 1024 * 1024;
+
+/// Chunk size must be a whole number of MiB within `1..=64` MiB.
+pub fn validate_chunk_size_bytes(bytes: u64) -> Result<(), String> {
+    if !(MIN_CHUNK_SIZE_BYTES..=MAX_CHUNK_SIZE_BYTES).contains(&bytes) || bytes % (1024 * 1024) != 0 {
+        return Err(format!(
+            "chunk size {bytes} bytes is invalid: must be a whole number of MiB within {MIN_CHUNK_SIZE_MB}..={MAX_CHUNK_SIZE_MB} MiB"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_chunk_size_mb(key: &str, mb: u32) -> Result<(), String> {
+    validate_chunk_size_bytes(mb as u64 * 1024 * 1024)
+        .map_err(|_| format!("{key} = {mb} is invalid: must be within {MIN_CHUNK_SIZE_MB}..={MAX_CHUNK_SIZE_MB} MiB"))
+}
+
 /// Manager node configuration (loaded from /etc/dtfs/manager.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagerConfig {
@@ -772,6 +799,7 @@ impl ManagerConfig {
     /// Interval/timeout checks for every block with a periodic task.
     /// Call from manager `main.rs` next to `memory.validate()`.
     pub fn validate_intervals(&self) -> Result<(), String> {
+        validate_chunk_size_mb("[defaults] chunk_size_mb", self.defaults.chunk_size_mb)?;
         self.tiering.validate()?;
         self.monitoring.validate()?;
         self.scrub.validate()?;
@@ -1037,6 +1065,7 @@ impl FuseClientConfig {
         if self.max_message_size_mb == 0 {
             return Err("[client] max_message_size_mb must be > 0".to_string());
         }
+        validate_chunk_size_mb("[client] chunk_size_mb", self.chunk_size_mb)?;
         Ok(())
     }
 
@@ -1455,6 +1484,36 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../deploy/examples")
             .join(name)
+    }
+
+    #[test]
+    fn chunk_size_helper_boundaries() {
+        const M: u64 = 1024 * 1024;
+        assert!(validate_chunk_size_bytes(M).is_ok());
+        assert!(validate_chunk_size_bytes(4 * M).is_ok());
+        assert!(validate_chunk_size_bytes(64 * M).is_ok());
+        for bad in [0, 4096, M - 1, M + 1, 64 * M + M, 64 * M + 1, 128 * M] {
+            let e = validate_chunk_size_bytes(bad).unwrap_err();
+            assert!(e.contains("whole number of MiB within 1..=64 MiB"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn chunk_size_mb_validated_for_manager_and_fuse() {
+        let mut m: ManagerConfig = load_config(&example_path("manager.toml")).unwrap();
+        let mut f: FuseConfig = load_config(&example_path("fuse.toml")).unwrap();
+        for ok in [1, 64] {
+            m.defaults.chunk_size_mb = ok;
+            f.client.chunk_size_mb = ok;
+            assert!(m.validate_intervals().is_ok());
+            assert!(f.client.validate().is_ok());
+        }
+        for bad in [0, 65] {
+            m.defaults.chunk_size_mb = bad;
+            f.client.chunk_size_mb = bad;
+            assert!(m.validate_intervals().unwrap_err().contains("[defaults] chunk_size_mb"));
+            assert!(f.client.validate().unwrap_err().contains("[client] chunk_size_mb"));
+        }
     }
 
     #[test]

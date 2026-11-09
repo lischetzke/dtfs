@@ -27,7 +27,8 @@ manager_addr = "10.0.0.1:9401"      # primary manager gRPC endpoint
 #heartbeat_interval_secs = 10       # Bug BQ-1: keepalive re-register cadence.
                                     # Keep well under raft.node_liveness_secs
                                     # (default 30). 0 = register once (flaps Down).
-#chunk_size_mb = 4                  # Bug BW: MUST match the volume chunk size
+#chunk_size_mb = 4                  # 1..=64 (startup refuses others).
+                                    # Bug BW: MUST match the volume chunk size
                                     # (manager defaults.chunk_size_mb). Mismatch
                                     # corrupts multi-chunk reads.
 #chunk_read_timeout_secs = 60       # FUSE-HOL: per-replica chunk-fetch timeout.

@@ -33,7 +33,7 @@ read_location_priority = ["dc1", "dc3"]
 | `manager_addrs` | list of string | `[]` | Fallback managers, walked in order. `manager_addr` plus `manager_addrs` must include at least one Raft **voter**: reads work against a learner, but client mutations are not leader-forwarded, so writes fail with EIO otherwise. |
 | `shared_secret` | string | `""` | Cluster secret. Needed to self-register (the client then appears in the node table) and to sign mutating manager RPCs. Empty is accepted by the client, but a manager with a secret rejects the client's mutations. |
 | `heartbeat_interval_secs` | u64 | `10` | Keepalive re-registration cadence. Keep well below the manager's `raft.node_liveness_secs` (30) or the client flaps `Down`. `0` registers once only. |
-| `chunk_size_mb` | u32 | `4` | Chunk size of the write buffer. Must equal the chunk size of the volume being written. A write to a file whose chunk size differs is refused with an error that names this key. |
+| `chunk_size_mb` | u32 | `4` | Chunk size of the write buffer, 1 to 64 (startup refuses other values). Must equal the chunk size of the volume being written. A write to a file whose chunk size differs is refused with an error that names this key. |
 | `chunk_read_timeout_secs` | u64 | `60` | Per-replica chunk-fetch timeout; on expiry the read fails over to the next replica. `0` disables the timeout (a hung node then stalls the read). Raise for very large chunks on very slow links. |
 | `max_message_size_mb` | u32 | `256` | **Validated**: > 0. Must be at least the managers' and data nodes' `grpc.max_message_size_mb`. |
 

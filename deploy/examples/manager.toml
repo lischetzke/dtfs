@@ -98,7 +98,8 @@ listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
 
 [defaults]
 # Defaults applied to the auto-created "default" volume / new volumes.
-#chunk_size_mb = 4                  # 4 MB workspace default (see config.rs rationale)
+#chunk_size_mb = 4                  # 4 MB workspace default (see config.rs rationale).
+                                    # Whole MiB within 1..=64; anything else refuses startup.
 #anchor_datacenter = "example-dc"   # Bug Z: pin >=1 replica of every chunk to
                                     # this DC (unset = no anchor enforcement)
 
