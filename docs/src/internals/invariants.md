@@ -528,11 +528,14 @@ reap stays node-wide (legacy first-found delete; ListChunks carries no
 disk_id).
 
 **CO-3-3:** before the BF-8 in-state-missing quarantine fires, it
-re-reads the CURRENT SM (`current_expected_chunks_for_node` +
+re-reads the CURRENT SM (the post-listing `NodeReapView` +
 `still_missing_after_recheck`) and drops any chunk a concurrent
-demote/unlink de-located between the tick's opening snapshot and the
+demote/unlink de-located between the pre-listing expected set and the
 ListChunks reply — so a healthy node is never quarantined for a demote
-race.
+race. Memory (audit finding 6): the sweep holds no namespace-wide hash
+set; per node it builds the pre-listing expected set, keeps only the
+absent hashes, then the post-listing node view; the
+`cause=orphan|delocated` label is looked up for the due candidates only.
 
 **CO-5-7:** `FlushSnapshot`/`FlushAction` carry the file's OWN volume
 anchor (not the default volume's) so a non-default-volume flush enforces

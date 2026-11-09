@@ -230,11 +230,11 @@ impl TaskScheduler {
 
         let now_ms = now_millis();
 
-        // 1. Snapshot in-state chunk_ids from state-machine. Bug BF-8
-        // also snapshots per-node expected sets so the in-state-missing
-        // inverse check can fire alongside the on-disk-not-in-state
-        // reap loop without taking the state-machine lock twice.
-        let (data_nodes, in_state_chunks, expected_by_node, already_quarantined) = {
+        // 1. Data nodes, quarantined nodes, and the number of chunk rows.
+        // Only "is the namespace view empty" is asked of the file table here
+        // (a count, not a set of every hash: ~12M chunks would cost GBs).
+        // Per-node expected sets are built just before each node's ListChunks.
+        let (data_nodes, in_state_rows, already_quarantined) = {
             let sm = self.state_data.read().await;
             let nodes: Vec<(u64, String)> = sm
                 .nodes
@@ -242,18 +242,7 @@ impl TaskScheduler {
                 .filter(|(_, n)| matches!(n.role, dtfs_common::types::NodeRole::Data))
                 .map(|(id, n)| (*id, n.grpc_addr.clone()))
                 .collect();
-            let mut chunks: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let mut expected: std::collections::BTreeMap<u64, std::collections::HashSet<String>> =
-                std::collections::BTreeMap::new();
-            for f in sm.files.values() {
-                for c in &f.chunks {
-                    chunks.insert(c.chunk_hash.clone());
-                    if let Ok(nid) = c.node_id.parse::<u64>() {
-                        expected.entry(nid).or_default().insert(c.chunk_hash.clone());
-                    }
-                }
-            }
+            let rows: usize = sm.files.values().map(|f| f.chunks.len()).sum();
             let quarantined: std::collections::HashSet<u64> = sm
                 .nodes
                 .iter()
@@ -263,7 +252,7 @@ impl TaskScheduler {
                 ))
                 .map(|(id, _)| *id)
                 .collect();
-            (nodes, chunks, expected, quarantined)
+            (nodes, rows, quarantined)
         };
 
         // REV-1-2 — the reap deletes anything on disk that this manager
@@ -273,7 +262,7 @@ impl TaskScheduler {
         // legitimate "everything is an orphan" either.
         let (applied, _) = self.applied_and_log_index();
         if let Some(reason) =
-            orphan_sweep_skip_reason(self.is_leader(), applied, caught_up_to, in_state_chunks.len())
+            orphan_sweep_skip_reason(self.is_leader(), applied, caught_up_to, in_state_rows)
         {
             anyhow::bail!("sweep skipped: {reason}");
         }
@@ -289,7 +278,7 @@ impl TaskScheduler {
             // which no Raft rejection can undo. Only leadership is re-checked
             // here: the log-caught-up gate ran once at sweep start (the
             // leader's own in-flight writes keep last_applied < last_log).
-            if !orphan_delete_allowed(self.is_leader(), in_state_chunks.len()) {
+            if !orphan_delete_allowed(self.is_leader(), in_state_rows) {
                 self.audit.log(
                     "scheduler",
                     "orphan.sweep_aborted_not_leader",
@@ -301,6 +290,18 @@ impl TaskScheduler {
             }
             if grpc_addr.is_empty() { continue; }
             let node_stats = rec.nodes.entry(node_id.to_string()).or_default();
+            // Bug BF-8 — what the SM expects on this node BEFORE its listing
+            // (a row registered during the listing must not read as missing).
+            // Skipped if the node is already Quarantined (apply path
+            // accumulates fault_count_total; no need to bump on every tick)
+            // and on a dry run, which proposes nothing.
+            let check_missing = !dry_run && !already_quarantined.contains(node_id);
+            let expected = if check_missing {
+                let sm = self.state_data.read().await;
+                Some(NodeReapView::from_files(&sm.files, *node_id).node_expected)
+            } else {
+                None
+            };
             let on_disk = match self.list_chunks_on_node(grpc_addr).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -310,6 +311,11 @@ impl TaskScheduler {
                 }
             };
             node_stats.listed = on_disk.len();
+            // Keep only the few expected-but-absent hashes; the full
+            // pre-listing set is dropped before the view below is built.
+            let missing: Vec<String> = expected
+                .map(|e| e.into_iter().filter(|c| !on_disk.contains_key(c)).collect())
+                .unwrap_or_default();
             // The sets snapshotted at sweep start predate this node's
             // ListChunks (which can take minutes on a big node). Rebuild
             // this node's view from the CURRENT state machine before any
@@ -323,30 +329,23 @@ impl TaskScheduler {
             // the on-disk-not-in-state loop, check what the state
             // machine THINKS this node holds; quarantine the node if
             // any expected chunk is absent from its ListChunks reply.
-            // Skip if the node is already Quarantined (apply path
-            // accumulates fault_count_total; no need to bump on every
-            // tick). A dry run proposes nothing, so it skips this too.
-            if !dry_run && !already_quarantined.contains(node_id) {
-                if let Some(expected) = expected_by_node.get(node_id) {
-                    let missing: Vec<&String> =
-                        expected.iter().filter(|c| !on_disk.contains_key(*c)).collect();
-                    // CO-3-3 — the `expected_by_node` set was snapshotted at
-                    // the top of this tick under one read lock, but the
-                    // ListChunks reply arrives later. A demote / unlink /
-                    // rebalance that committed `RemoveChunkLocation` between
-                    // the snapshot and now leaves the stale snapshot still
-                    // naming the node for a chunk it no longer holds
-                    // (legitimately) — quarantining a healthy node. Re-read
-                    // the CURRENT SM and keep only chunks the node is STILL
-                    // expected to hold; if none remain, the "missing" set was
-                    // a demote race, not a fault — skip the quarantine (but
-                    // still fall through to the on-disk reap below).
+            if check_missing {
+                {
+                    let missing: Vec<&String> = missing.iter().collect();
+                    // CO-3-3 — the `expected` set was taken before this
+                    // node's ListChunks, whose reply arrives later. A demote /
+                    // unlink / rebalance that committed `RemoveChunkLocation`
+                    // in between leaves it still naming the node for a chunk
+                    // it no longer holds (legitimately) — quarantining a
+                    // healthy node. Re-check against the CURRENT SM (`view`,
+                    // read after the listing) and keep only chunks the node is
+                    // STILL expected to hold; if none remain, the "missing"
+                    // set was a demote race, not a fault — skip the quarantine
+                    // (but still fall through to the on-disk reap below).
                     let missing: Vec<&String> = if missing.is_empty() {
                         missing
                     } else {
-                        let still_expected =
-                            self.current_expected_chunks_for_node(*node_id).await;
-                        let filtered = still_missing_after_recheck(&missing, &still_expected);
+                        let filtered = still_missing_after_recheck(&missing, &view.node_expected);
                         if filtered.is_empty() {
                             debug!(
                                 node = %node_id,
@@ -417,38 +416,22 @@ impl TaskScheduler {
                 }
             }
 
+            let mut due: Vec<(&String, &u64, &Option<u32>)> = Vec::new();
             for (cid, (mtime_ms, disk_id_opt)) in &on_disk {
-                // Bug BP-4 — a chunk is an orphan candidate when NO
-                // FileMetadata references its hash (`in_state_chunks` is the
-                // union of every file's chunk hashes). Never reap a chunk a
-                // file still points at, even if its location record looks
-                // stale — that was the data-loss vector (BN-1 UUID rotation
-                // dropped location bindings; the hash-referenced guard here
-                // is the defence-in-depth backstop). CLAUDE.md §A.6 #8.
-                //
                 // CO-3-2 / CR2-7-2 (MGR-10) — a chunk on this node's disk
                 // for which the SM records NO location entry naming this
-                // node (or, when the data node reports which disk, no
-                // entry naming this exact (node, disk)) is a phantom
-                // replica (the rebalance / excess-spill path drops the SM
-                // entry via `RemoveChunkLocation` but never deletes the
-                // de-located bytes). This supersets `is_orphan` (a
-                // hash-orphan is named by no node), but we keep both
-                // signals explicit. Both are safe: a chunk a file still
-                // points at on THIS node/disk stays in the expected set,
-                // and the mtime grace protects an in-flight put whose
+                // node, on ANY of its disks, is a reap candidate: either a
+                // phantom replica (the rebalance / excess-spill path drops
+                // the SM entry via `RemoveChunkLocation` but never deletes
+                // the de-located bytes) or a Bug BP-4 orphan (no file
+                // references the hash, so no row names any node). A chunk a
+                // file still points at on this node stays in the expected
+                // set, and the mtime grace protects an in-flight put whose
                 // `commit_chunk_locations` Raft write has not yet applied.
-                //
-                // When the data node reports a disk_id (CR2-7-2), key the
-                // check by (node, disk) so a de-located leftover on one
-                // disk is never missed by (or confused with) a still-live
-                // replica of the SAME chunk on another disk of the same
-                // node (documented co-located layout: cold anchor + warm
-                // cache, Bug BH). A pre-CR2-7-2 data node reports no
-                // disk_id — fall back to today's node-wide check exactly.
-                // A copy recorded under ANOTHER disk id of the same node must
-                // never be deleted, so the per-disk verdict is also gated on
-                // the node-wide set (co-located leftovers may leak instead).
+                // A copy recorded under ANOTHER disk id of the same node is
+                // never deleted (co-located leftovers may leak instead); the
+                // delete carries the reported disk_id so only that disk's
+                // copy is touched.
                 //
                 // Bug CB — measure the reap grace against the chunk's
                 // DURABLE on-disk mtime, not a manager-local "first
@@ -459,14 +442,12 @@ impl TaskScheduler {
                 // usage of deleted files never dropped). The mtime survives
                 // restarts; a freshly-written chunk (recent mtime) is still
                 // protected against the in-flight put/promote race.
-                let candidate = orphan_reap_candidate(&view, cid, *disk_id_opt);
-                let Some(cause) =
-                    candidate.filter(|_| orphan_reap_due(true, *mtime_ms, now_ms, grace_secs))
-                else {
+                let candidate = orphan_reap_candidate(&view, cid);
+                if !orphan_reap_due(candidate, *mtime_ms, now_ms, grace_secs) {
                     // Surface a known reap candidate we are deferring only
                     // because its age is unknown (mtime 0 = pre-Bug-CB data
                     // node), so a permanently-stalled reap is diagnosable.
-                    if candidate.is_some() && *mtime_ms == 0 {
+                    if candidate && *mtime_ms == 0 {
                         debug!(
                             node = %node_id, chunk = %cid,
                             "Bug CB: orphan deferred — data node reported no \
@@ -474,17 +455,29 @@ impl TaskScheduler {
                         );
                     }
                     continue;
-                };
-                let age_secs = now_ms.saturating_sub(*mtime_ms) / 1000;
-                node_stats.candidates += 1;
-                if dry_run {
-                    continue;
                 }
+                node_stats.candidates += 1;
+                if !dry_run {
+                    due.push((cid, mtime_ms, disk_id_opt));
+                }
+            }
+
+            // Audit label only ("orphan" = no file references the hash):
+            // one pass that looks up just the due hashes.
+            let referenced = if due.is_empty() {
+                Default::default()
+            } else {
+                let sm = self.state_data.read().await;
+                referenced_hashes(&sm.files, due.iter().map(|d| d.0.as_str()))
+            };
+            for (cid, mtime_ms, disk_id_opt) in due {
+                let cause = if referenced.contains(cid.as_str()) { "delocated" } else { "orphan" };
+                let age_secs = now_ms.saturating_sub(*mtime_ms) / 1000;
 
                 // CR2-7-3 / MGR-13 — re-check leadership immediately before
                 // EACH delete (an election can land between two candidates
                 // of one node's listing). Leadership only; see node top.
-                if !orphan_delete_allowed(self.is_leader(), view.in_state.len()) {
+                if !orphan_delete_allowed(self.is_leader(), view.rows) {
                     self.audit.log(
                         "scheduler",
                         "orphan.sweep_aborted_not_leader",
@@ -584,29 +577,6 @@ impl TaskScheduler {
             &format!("node={node_id} missing={missing} first={first}"),
             "quarantined",
         );
-    }
-
-    /// CO-3-3 — the set of chunk hashes the CURRENT state machine records a
-    /// location entry for on `node_id` (the union across all of the node's
-    /// disks). Used by `orphan_scrub_tick` to re-confirm an "in-state but
-    /// not on disk" finding against fresh SM state before quarantining: a
-    /// demote / unlink that committed `RemoveChunkLocation` after the tick's
-    /// opening snapshot drops the chunk from this set, so a stale-snapshot
-    /// false positive is filtered out.
-    pub(super) async fn current_expected_chunks_for_node(
-        &self,
-        node_id: u64,
-    ) -> std::collections::HashSet<String> {
-        let sm = self.state_data.read().await;
-        let mut out = std::collections::HashSet::new();
-        for f in sm.files.values() {
-            for c in &f.chunks {
-                if c.node_id.parse::<u64>().ok() == Some(node_id) {
-                    out.insert(c.chunk_hash.clone());
-                }
-            }
-        }
-        out
     }
 
     /// Bug BC-6 — invoke `ListChunks` on a single data node, drain all
@@ -883,14 +853,16 @@ pub(crate) fn chunk_delocated_on_node(
 }
 
 /// Reap decision view of ONE node, built from the current file table right
-/// after that node's ListChunks completes.
+/// after that node's ListChunks completes. Holds only this node's hashes:
+/// a set of every hash in the namespace is not needed (a hash no file
+/// references has no row naming any node, so it is de-located everywhere),
+/// nor is a per-disk split (the per-disk verdict was always gated on the
+/// node-wide one, which implies it).
 pub(crate) struct NodeReapView {
-    /// Every chunk hash any file references.
-    pub in_state: std::collections::HashSet<String>,
     /// Hashes the SM records on this node, any disk.
     pub node_expected: std::collections::HashSet<String>,
-    /// Same, keyed by the disk id recorded in the row.
-    pub by_disk: std::collections::HashMap<u32, std::collections::HashSet<String>>,
+    /// Chunk rows in the whole file table (0 = empty namespace view).
+    pub rows: usize,
 }
 
 impl NodeReapView {
@@ -898,34 +870,38 @@ impl NodeReapView {
         files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
         node_id: u64,
     ) -> Self {
-        let mut v = Self {
-            in_state: Default::default(),
-            node_expected: Default::default(),
-            by_disk: Default::default(),
-        };
+        let mut v = Self { node_expected: Default::default(), rows: 0 };
         for f in files.values() {
+            v.rows += f.chunks.len();
             for c in &f.chunks {
-                v.in_state.insert(c.chunk_hash.clone());
                 if c.node_id.parse::<u64>().ok() == Some(node_id) {
                     v.node_expected.insert(c.chunk_hash.clone());
-                    v.by_disk.entry(c.disk_id).or_default().insert(c.chunk_hash.clone());
                 }
             }
         }
         v
     }
 
-    /// Is the on-disk copy `cid` (found on `disk_id`, when the data node
-    /// reports it) de-located? With a disk id the per-disk set must lack it
-    /// AND the node-wide set must lack it: a row naming another disk of the
-    /// same node still protects the chunk. Without a disk id: node-wide.
-    pub(crate) fn delocated(&self, disk_id: Option<u32>, cid: &str) -> bool {
-        let node_wide = chunk_delocated_on_node(Some(&self.node_expected), cid);
-        match disk_id {
-            Some(d) => chunk_delocated_on_node(self.by_disk.get(&d), cid) && node_wide,
-            None => node_wide,
-        }
+    /// Is the on-disk copy `cid` de-located, i.e. does no row name this
+    /// node for it on ANY disk? A row naming another disk of the same node
+    /// still protects the chunk.
+    pub(crate) fn delocated(&self, cid: &str) -> bool {
+        chunk_delocated_on_node(Some(&self.node_expected), cid)
     }
+}
+
+/// The subset of `wanted` that some file references (one pass, no set of
+/// the whole namespace).
+pub(crate) fn referenced_hashes<'a>(
+    files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
+    wanted: impl IntoIterator<Item = &'a str>,
+) -> std::collections::HashSet<&'a str> {
+    let wanted: std::collections::HashSet<&'a str> = wanted.into_iter().collect();
+    files
+        .values()
+        .flat_map(|f| f.chunks.iter())
+        .filter_map(|c| wanted.get(c.chunk_hash.as_str()).copied())
+        .collect()
 }
 
 /// Per-delete gate of the orphan sweep: leadership plus a non-empty file
@@ -983,21 +959,12 @@ pub(crate) fn orphan_reap_due(
     age_secs >= grace_secs
 }
 
-/// Why the on-disk copy `cid` (on `disk_id`, when reported) is a reap
-/// candidate, age aside: `"orphan"` when no file references the hash
-/// (Bug BP-4), `"delocated"` when no row names this node/disk (CO-3-2).
-pub(crate) fn orphan_reap_candidate(
-    view: &NodeReapView,
-    cid: &str,
-    disk_id: Option<u32>,
-) -> Option<&'static str> {
-    if chunk_is_orphan(&view.in_state, cid) {
-        Some("orphan")
-    } else if view.delocated(disk_id, cid) {
-        Some("delocated")
-    } else {
-        None
-    }
+/// Is the on-disk copy `cid` a reap candidate, age aside? Exactly when no
+/// row names this node for it (CO-3-2). A Bug BP-4 orphan (no file
+/// references the hash) always qualifies; the "orphan" vs "delocated" audit
+/// label is decided afterwards for the due candidates (`referenced_hashes`).
+pub(crate) fn orphan_reap_candidate(view: &NodeReapView, cid: &str) -> bool {
+    view.delocated(cid)
 }
 
 /// Lowest grace a manual orphan reap accepts. Far above any put->commit
@@ -1366,33 +1333,66 @@ mod sched_audit_orphan_tests {
     fn copy_under_another_disk_of_the_same_node_is_never_delocated() {
         // SM records the chunk on node 1 disk 2; bytes found on disk 1.
         let v = NodeReapView::from_files(&files(vec![row(0, "h", "1", 2)]), 1);
-        assert!(!v.delocated(Some(1), "h"));
-        assert!(!v.delocated(Some(2), "h"));
-        // Unrecorded chunk is still reapable, per disk and node-wide.
-        assert!(v.delocated(Some(1), "x"));
-        assert!(v.delocated(None, "x"));
+        assert!(!v.delocated("h"));
+        // Unrecorded chunk is still reapable.
+        assert!(v.delocated("x"));
     }
 
     #[test]
     fn row_naming_another_node_does_not_protect() {
-        let v = NodeReapView::from_files(&files(vec![row(0, "h", "2", 1)]), 1);
-        assert!(v.delocated(Some(1), "h"));
-        assert!(v.delocated(None, "h"));
-        // Still referenced by a file, so not a hash-orphan.
-        assert!(v.in_state.contains("h"));
+        let fs = files(vec![row(0, "h", "2", 1)]);
+        let v = NodeReapView::from_files(&fs, 1);
+        assert!(v.delocated("h"));
+        // Still referenced by a file, so labelled "delocated", not "orphan".
+        assert!(referenced_hashes(&fs, ["h"]).contains("h"));
+    }
+
+    // ---- audit finding 6: reduced orphan-sweep memory ----
+    #[test]
+    fn view_holds_only_this_nodes_hashes_and_every_orphan_is_delocated() {
+        let fs = files(vec![row(0, "a", "1", 0), row(0, "a", "2", 0), row(1, "b", "2", 3)]);
+        let v = NodeReapView::from_files(&fs, 1);
+        // Only node 1's hash is held, plus the namespace row count.
+        assert_eq!(v.node_expected, ["a".to_string()].into());
+        assert_eq!(v.rows, 3);
+        // Why no namespace-wide set is needed: an unreferenced hash has no
+        // row, so it is a candidate on every node.
+        for node in [1, 2, 3] {
+            let v = NodeReapView::from_files(&fs, node);
+            assert!(orphan_reap_candidate(&v, "gone"), "node {node}");
+        }
+        // Empty table: no rows, the per-delete gate refuses.
+        let empty = NodeReapView::from_files(&Default::default(), 1);
+        assert_eq!(empty.rows, 0);
+        assert!(!orphan_delete_allowed(true, empty.rows));
+        // Label lookup returns only wanted hashes that are referenced.
+        let r = referenced_hashes(&fs, ["b", "gone"]);
+        assert_eq!(r, ["b"].into());
+    }
+
+    #[test]
+    fn missing_recheck_uses_the_post_listing_view() {
+        // Expected before the listing: a, b. Listing shows neither. Meanwhile
+        // b's row on node 1 was removed (demote race): only a stays missing.
+        let a = "a".to_string();
+        let b = "b".to_string();
+        let after = NodeReapView::from_files(&files(vec![row(0, "a", "1", 0), row(1, "b", "2", 0)]), 1);
+        assert_eq!(still_missing_after_recheck(&[&a, &b], &after.node_expected), vec![&a]);
+        let none = NodeReapView::from_files(&files(vec![row(1, "b", "2", 0)]), 1);
+        assert!(still_missing_after_recheck(&[&a, &b], &none.node_expected).is_empty());
     }
 
     // ---- task 3b ----
     #[test]
     fn rebuilt_view_reflects_the_current_state() {
         let before = NodeReapView::from_files(&files(vec![row(0, "h", "1", 0)]), 1);
-        assert!(!before.delocated(Some(0), "h"));
+        assert!(!before.delocated("h"));
         // The replica was removed after the sweep-start snapshot.
         let after = NodeReapView::from_files(&files(vec![row(0, "h", "2", 0)]), 1);
-        assert!(after.delocated(Some(0), "h"));
+        assert!(after.delocated("h"));
         // A replica registered meanwhile protects the bytes.
         let reg = NodeReapView::from_files(&files(vec![row(0, "new", "1", 3)]), 1);
-        assert!(!reg.delocated(Some(3), "new"));
+        assert!(!reg.delocated("new"));
     }
 
     // ---- task 3c ----
@@ -1454,18 +1454,18 @@ mod sched_audit_orphan_tests {
         let view = NodeReapView::from_files(&files(vec![row(0, "live", "1", 0)]), 1);
         let now = 100 * 86_400_000;
         let two_h_old = now - 2 * 3_600_000;
-        let c = orphan_reap_candidate(&view, "gone", Some(0));
-        assert_eq!(c, Some("orphan"));
+        let c = orphan_reap_candidate(&view, "gone");
+        assert!(c);
         // Manual grace 1 h: due. Configured 24 h: protected.
-        assert!(orphan_reap_due(c.is_some(), two_h_old, now, MANUAL_ORPHAN_GRACE_FLOOR_SECS));
-        assert!(!orphan_reap_due(c.is_some(), two_h_old, now, 86_400));
+        assert!(orphan_reap_due(c, two_h_old, now, MANUAL_ORPHAN_GRACE_FLOOR_SECS));
+        assert!(!orphan_reap_due(c, two_h_old, now, 86_400));
         // Boundary: exactly the floor old is due, one second younger is not.
         assert!(orphan_reap_due(true, now - 3_600_000, now, 3600));
         assert!(!orphan_reap_due(true, now - 3_599_000, now, 3600));
         // A chunk this node/disk still holds is never a candidate.
-        assert_eq!(orphan_reap_candidate(&view, "live", Some(0)), None);
+        assert!(!orphan_reap_candidate(&view, "live"));
         // Referenced, but no row names this node: de-located.
         let other = NodeReapView::from_files(&files(vec![row(0, "live", "2", 0)]), 1);
-        assert_eq!(orphan_reap_candidate(&other, "live", Some(0)), Some("delocated"));
+        assert!(orphan_reap_candidate(&other, "live"));
     }
 }
