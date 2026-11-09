@@ -41,7 +41,12 @@ text there.
    state-machine-refused Raft remove (`raft_write_checked` /
    `client_response_ok`, the one Raft-response checker) issues no byte
    delete; a failed byte delete is never rolled back (the orphan reaper
-   reclaims it). Registration of a finished copy uses the disk id the
+   reclaims it). After the remove it re-reads the state and skips the byte
+   delete while any file still has a row with that hash on the same
+   (node, disk) (content-addressed sharing), and the delete carries
+   `if_mtime_le_ms` taken before that re-read (a concurrent same-hash put
+   stamps a newer mtime at commit; known limit: manager vs data-node clock
+   skew). Registration of a finished copy uses the disk id the
    target reported (`ReplicateChunkResponse.disk_id`) and sends only the
    new row (apply is a union for lease-less writes). Data disk ids persist
    in `.dtfs-disk-id`.
