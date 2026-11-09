@@ -4,28 +4,6 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Generate an HMAC-SHA256 of a shared secret with a nonce for cluster join authentication.
-pub fn compute_join_hmac(secret: &str, nonce: &str) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC can take key of any size");
-    mac.update(nonce.as_bytes());
-    mac.finalize().into_bytes().to_vec()
-}
-
-/// Verify an HMAC-SHA256 for cluster join authentication.
-pub fn verify_join_hmac(secret: &str, nonce: &str, expected_hmac: &[u8]) -> bool {
-    let computed = compute_join_hmac(secret, nonce);
-    constant_time_eq(&computed, expected_hmac)
-}
-
-/// Generate a random nonce string.
-pub fn generate_nonce() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let bytes: Vec<u8> = (0..32).map(|_| rng.r#gen()).collect();
-    hex_encode(&bytes)
-}
-
 /// Generate a self-signed CA certificate and key for cluster TLS.
 pub fn generate_cluster_ca(cluster_name: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut params = rcgen::CertificateParams::new(vec![])
@@ -351,15 +329,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hmac_roundtrip() {
-        let secret = "my-cluster-secret";
-        let nonce = generate_nonce();
-        let hmac = compute_join_hmac(secret, &nonce);
-        assert!(verify_join_hmac(secret, &nonce, &hmac));
-        assert!(!verify_join_hmac("wrong-secret", &nonce, &hmac));
-    }
-
-    #[test]
     fn test_generate_ca() {
         let (cert, key) = generate_cluster_ca("test-cluster").unwrap();
         assert!(!cert.is_empty());
@@ -383,13 +352,6 @@ mod tests {
         let (node_cert, node_key) = generate_node_cert(&ca_cert, &ca_key, "127.0.0.1").unwrap();
         assert!(!node_cert.is_empty());
         assert!(!node_key.is_empty());
-    }
-
-    #[test]
-    fn test_nonce_uniqueness() {
-        let n1 = generate_nonce();
-        let n2 = generate_nonce();
-        assert_ne!(n1, n2);
     }
 
     #[test]
