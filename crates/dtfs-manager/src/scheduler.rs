@@ -190,10 +190,11 @@ pub struct TaskScheduler {
     /// `PlacementConfig::default()`; `set_placement_cfg` (main.rs) wires
     /// the operator's `[placement]` config after construction.
     placement_cfg: dtfs_common::config::PlacementConfig,
-    /// Per-round index of the chunks the in-flight migration tasks refer to
-    /// (one namespace pass per round instead of one per task). Only set
-    /// between `begin_round` and `end_round`, under `migration_state_lock`.
-    round_index: parking_lot::Mutex<Option<ChunkIndex>>,
+    /// Index of the chunks the in-flight migration tasks refer to, with the
+    /// last applied log id it was built at (one namespace pass per advance,
+    /// rebuilt only when the state machine applied something since). Only
+    /// set between `begin_round` and `end_round`, under `migration_state_lock`.
+    round_index: parking_lot::Mutex<Option<(Option<dtfs_raft::LogId>, ChunkIndex)>>,
     /// Single-flight for orphan reaps: the timer and a manual
     /// `POST /api/v1/scrub/orphans` never run at the same time.
     orphan_run: Arc<tokio::sync::Mutex<()>>,

@@ -5,12 +5,12 @@
 
 use super::*;
 
-pub(super) struct Harness {
+pub(crate) struct Harness {
     pub state: Arc<AppState>,
     _dir: tempfile::TempDir,
 }
 
-pub(super) async fn harness() -> Harness {
+pub(crate) async fn harness() -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let mut config: ManagerConfig = toml::from_str(include_str!("../../../../deploy/examples/manager.toml"))
         .expect("example manager.toml parses");

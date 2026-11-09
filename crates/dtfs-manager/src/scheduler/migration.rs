@@ -297,7 +297,7 @@ impl TaskScheduler {
             .round_index
             .lock()
             .as_ref()
-            .and_then(|i| i.get(chunk_hash))
+            .and_then(|(_, i)| i.get(chunk_hash))
             .map(|r| r.to_vec())
         {
             return refs;
@@ -708,11 +708,22 @@ impl MigrationOps for TaskScheduler {
     }
 
     async fn begin_round(&self, wanted: &std::collections::HashSet<String>) {
-        let idx = {
-            let sm = self.state_data.read().await;
-            ChunkIndex::build(&sm.files, wanted)
-        };
-        *self.round_index.lock() = Some(idx);
+        // No in-flight task needs refs: skip the namespace pass.
+        if wanted.is_empty() {
+            *self.round_index.lock() = None;
+            return;
+        }
+        let sm = self.state_data.read().await;
+        let mut slot = self.round_index.lock();
+        // The index is a function of `sm.files`, which only an apply changes:
+        // same applied log id + every wanted hash indexed = same result.
+        if slot
+            .as_ref()
+            .is_some_and(|(at, idx)| *at == sm.last_applied_log && idx.covers(wanted))
+        {
+            return;
+        }
+        *slot = Some((sm.last_applied_log.clone(), ChunkIndex::build(&sm.files, wanted)));
     }
 
     fn end_round(&self) {
@@ -823,6 +834,8 @@ pub(super) async fn advance_migration_tasks_budgeted<O: MigrationOps>(
         }
         ops.save_state(state).await;
     }
+    // The chunk index lives across rounds (rebuilt only after an apply).
+    ops.end_round();
 }
 
 /// U3 — a single round over all non-terminal tasks. Returns true if any task
@@ -1273,7 +1286,6 @@ pub(super) async fn advance_round<O: MigrationOps>(
         progressed = true;
     }
 
-    ops.end_round();
     state.landed_disks.retain(|id, _| {
         state
             .tasks
@@ -1387,6 +1399,11 @@ impl ChunkIndex {
     /// `None` = hash was not indexed; `Some(empty)` = indexed, unreferenced.
     pub(crate) fn get(&self, hash: &str) -> Option<&Vec<ChunkRef>> {
         self.map.get(hash)
+    }
+
+    /// Was every hash of `wanted` indexed?
+    pub(crate) fn covers(&self, wanted: &std::collections::HashSet<String>) -> bool {
+        wanted.iter().all(|h| self.map.contains_key(h))
     }
 }
 
@@ -1939,6 +1956,45 @@ mod sched_audit_tests {
         assert_eq!(chunk_bytes_from_refs(refs), Some(1024));
         assert_eq!(chunk_bytes_from_refs(idx.get("gone").unwrap()), None);
         assert!(idx.get("other").is_none());
+    }
+
+    // ---- audit finding 12: fewer namespace passes per tick ----
+    #[tokio::test]
+    async fn begin_round_skips_empty_wanted_and_reuses_an_unchanged_index() {
+        use openraft::vote::RaftLeaderId;
+        let h = crate::api::test_support::harness().await;
+        let s = &h.state.scheduler;
+        s.state_data.write().await.files.insert("/a".into(), file(vec![row(0, "h", "1", 0)]));
+
+        // No in-flight task: no namespace pass, no index.
+        s.begin_round(&Default::default()).await;
+        assert!(s.round_index.lock().is_none(), "empty wanted built an index");
+
+        let wanted: std::collections::HashSet<String> = ["h".to_string()].into();
+        s.begin_round(&wanted).await;
+        assert_eq!(s.chunk_refs("h").await.len(), 1);
+
+        // Nothing applied since: the index is reused (a row inserted without
+        // an apply stays unseen, which proves no rebuild).
+        s.state_data.write().await.files.insert("/b".into(), file(vec![row(0, "h", "2", 0)]));
+        s.begin_round(&wanted).await;
+        assert_eq!(s.chunk_refs("h").await.len(), 1);
+
+        // A hash the index does not cover forces a rebuild.
+        let more: std::collections::HashSet<String> = ["h".to_string(), "x".to_string()].into();
+        s.begin_round(&more).await;
+        assert_eq!(s.chunk_refs("h").await.len(), 2);
+
+        // An apply since the build forces a rebuild.
+        s.state_data.write().await.files.insert("/c".into(), file(vec![row(0, "h", "3", 0)]));
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        s.state_data.write().await.last_applied_log = Some(openraft::LogId::new(leader, 7));
+        s.begin_round(&wanted).await;
+        assert_eq!(s.chunk_refs("h").await.len(), 3);
+
+        // End of the advance drops it.
+        s.end_round();
+        assert!(s.round_index.lock().is_none());
     }
 
     // ---- task 5: source choice ----
