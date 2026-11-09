@@ -1734,8 +1734,7 @@ impl DtfsFilesystem {
                         self.mark_committed_and_refresh(&path, fh, committed).await;
                     }
                 }
-                let zeros = vec![0u8; n];
-                self.write_buffer.write(&path, at, &zeros);
+                self.write_buffer.write_hole(&path, at, n);
                 at += n as u64;
                 remaining -= n;
             }
@@ -4286,6 +4285,7 @@ mod r2_segments_committable_tests {
             offset_in_chunk,
             needs_seed,
             since: None,
+            gaps: Vec::new(),
         }
     }
 
@@ -4944,6 +4944,7 @@ mod audit_write_path_tests {
             offset_in_chunk: 0,
             needs_seed,
             since: None,
+            gaps: Vec::new(),
         }
     }
 

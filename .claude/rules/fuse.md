@@ -105,6 +105,13 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   fsync return the commit error.
 - `writebuf.rs` batches `write.flush_batch_chunks` (default 4, clamp
   1..=32) complete chunks per `flush()`; `flush_all` drains everything.
+  Zeros a write filled only because it landed beyond them (hole fill via
+  `write_hole`, `ChunkBuf::merge` gap, seed shorter than the buffered start)
+  are `ChunkBuf.gaps` until a write covers them; a gappy chunk is complete
+  but not `flush()`-eligible (`is_flushable`; knfsd out-of-order WRITEs
+  otherwise uploaded each chunk twice). Cluster seed bytes (incl. the zero
+  seed below EOF) are never gap. `flush_all`, the cap drain and
+  `restore_segments` (via `ChunkSegment.gaps`) keep/commit them as zeros.
   `flush_segments_to_cluster` puts a batch's segments at most
   `write.upload_concurrency` (default 2, clamp 1..=8) at a time
   (`upload_segments`, ordered `buffered`, lowest-index error wins, nothing
@@ -125,7 +132,8 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   rename-over (a later guard drop is a no-op).
 - Batch is byte-clamped at `FLUSH_BATCH_MAX_BYTES` (64 MB); total dirty
   bytes per open file are capped at `DIRTY_BYTES_CAP` (2x) and
-  force-drained via `WriteBuffer::cap_drain` (complete chunks, never the
+  force-drained via `WriteBuffer::cap_drain` (gap-free complete chunks,
+  then gappy complete ones only until under the cap, never the
   chunks of the pending write: `keep`, they were just seeded) before a hole
   fill or write would exceed it. A failed cap drain restores the drained
   segments and drops the write's own fresh in-range seeds
