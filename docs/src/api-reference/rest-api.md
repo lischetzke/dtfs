@@ -35,7 +35,7 @@ Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserve
 - Volume create when the id already exists.
 - Volume update (`set-*`) racing a concurrent update of the same volume: re-read the volume and retry the change.
 - `POST /config` version conflict: re-read and retry.
-- Node decommission while the node still holds replicas; unquarantine of a node that is not quarantined; promote of a node that is already a voter; maintenance toggle refused by the state machine.
+- Node decommission while the node still holds replicas; unquarantine of a node that is not quarantined; promote of a node that is already a voter; maintenance toggle on a quarantined node, disable on a node not in Maintenance, or refused by the state machine.
 - Any leader-only call sent to a non-leader.
 
 ### Common parameters
@@ -159,7 +159,7 @@ Array. Entry: `node_id`, `hostname`, `grpc_addr`, `location` (`region/datacenter
 
 ### POST /api/v1/nodes/{node_id}/maintenance
 
-Body `{"enable": true}`. Response `{"node_id", "maintenance": <bool>}`. `404` unknown node; `409` refused by the state machine. See [Maintenance Mode](../operations/maintenance-mode.md).
+Body `{"enable": true}`. Response `{"node_id", "maintenance": <bool>}`. `404` unknown node; `409` when the node is quarantined (unquarantine first), on `{"enable": false}` for a node not in Maintenance, or when the state machine refuses. See [Maintenance Mode](../operations/maintenance-mode.md).
 
 ### POST /api/v1/nodes/{node_id}/unquarantine
 

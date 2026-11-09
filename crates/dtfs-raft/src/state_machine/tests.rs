@@ -2160,6 +2160,26 @@ mod posix_path_regression {
             "QuarantineInfo must survive re-register");
     }
 
+    /// Audit #7 — a refused UpdateNodeStatus on a Quarantined node must
+    /// return an Error (A.3.6), not Success; down/failed still apply.
+    #[test]
+    fn update_node_status_on_quarantined_node_errors() {
+        use dtfs_common::types::{HealthStatus, QuarantineReason};
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &mk_log_id(1),
+            &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_quarantinable_node() });
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::QuarantineNode { now_ms: 0,
+            node_id: 7, info: mk_quarantine_info(QuarantineReason::DeepScrubHashMismatch) });
+        let r = apply_request(&mut sm, &mk_log_id(3),
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "maintenance".into() });
+        assert!(matches!(&r, ClientResponse::Error { message } if message.contains("is quarantined")), "{r:?}");
+        assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Quarantined);
+        let r = apply_request(&mut sm, &mk_log_id(4),
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "down".into() });
+        assert!(matches!(r, ClientResponse::Success), "{r:?}");
+        assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Down);
+    }
+
     #[test]
     fn raft_1_reregister_keeps_maintenance() {
         use dtfs_common::types::HealthStatus;

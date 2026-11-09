@@ -2034,6 +2034,14 @@ mod mgr_hb_liveness_write_status {
     }
 
     #[test]
+    fn quarantine_refusal_is_ok() {
+        let r = liveness_write_status(Ok(ClientResponse::Error {
+            message: "UpdateNodeStatus: node 7 is quarantined".into(),
+        }));
+        assert!(r.is_ok());
+    }
+
+    #[test]
     fn forward_failure_passes_through_unavailable() {
         let r = liveness_write_status(Err(Status::unavailable("no leader")));
         assert_eq!(r.unwrap_err().code(), Code::Unavailable);

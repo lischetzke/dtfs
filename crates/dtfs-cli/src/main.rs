@@ -1668,7 +1668,7 @@ async fn cmd_maintenance(
 
     let body = serde_json::json!({ "enable": should_enable });
     let resp = api
-        .post(&format!("/api/v1/nodes/{}/maintenance", node_id), &body)
+        .post_checked(&format!("/api/v1/nodes/{}/maintenance", node_id), &body)
         .await?;
 
     println!(

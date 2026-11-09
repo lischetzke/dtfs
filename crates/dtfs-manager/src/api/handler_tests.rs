@@ -358,6 +358,52 @@ async fn node_errors_carry_json_bodies_and_unknown_node_is_404() {
     assert!(e.1.0["error"].is_string());
 }
 
+/// Audit #7 — the toggle must refuse (409) instead of reporting success
+/// when the apply would ignore it: any quarantined node, or a disable on
+/// a node that is not in Maintenance (it would mark a Down node Healthy).
+#[tokio::test]
+async fn maintenance_toggle_refuses_quarantined_and_non_maintenance_disable() {
+    use dtfs_common::types::HealthStatus;
+    let h = harness().await;
+    seed_node(&h, now_ms()).await;
+    let e = set_maintenance(State(h.state.clone()), path7(), Json(MaintenanceRequest { enable: false }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert!(e.1.0["error"].as_str().unwrap().contains("not in maintenance"), "{:?}", e.1.0);
+    h.state.sm_data.write().await.nodes.get_mut(&7).unwrap().health = HealthStatus::Down;
+    let e = set_maintenance(State(h.state.clone()), path7(), Json(MaintenanceRequest { enable: false }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    // Boundary: a node in Maintenance passes the guard (then 503: no leader).
+    h.state.sm_data.write().await.nodes.get_mut(&7).unwrap().health = HealthStatus::Maintenance;
+    let e = set_maintenance(State(h.state.clone()), path7(), Json(MaintenanceRequest { enable: false }))
+        .await
+        .unwrap_err();
+    assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+    {
+        let mut sm = h.state.sm_data.write().await;
+        let n = sm.nodes.get_mut(&7).unwrap();
+        n.health = HealthStatus::Quarantined;
+        n.quarantine = Some(dtfs_common::types::QuarantineInfo {
+            since_ms: 1,
+            reason: dtfs_common::types::QuarantineReason::DeepScrubHashMismatch,
+            triggering_chunk_id: None,
+            fault_count_total: 1,
+            last_fault_at_ms: 1,
+            last_fault_summary: String::new(),
+        });
+    }
+    for enable in [true, false] {
+        let e = set_maintenance(State(h.state.clone()), path7(), Json(MaintenanceRequest { enable }))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT, "enable={enable}");
+        assert!(e.1.0["error"].as_str().unwrap().contains("quarantined"), "{:?}", e.1.0);
+    }
+}
+
 // ---- Task 6: anchor datacenter handling --------------------------------------
 
 fn vol(id: &str) -> dtfs_common::types::VolumeConfig {

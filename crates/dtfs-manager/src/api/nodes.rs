@@ -546,8 +546,24 @@ pub(super) async fn set_maintenance(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let nid: u64 = node_id.parse().map_err(|_| err_body(StatusCode::BAD_REQUEST, "node_id must be u64"))?;
     // The apply silently ignores an unknown node; refuse it here.
-    if !state.sm_data.read().await.nodes.contains_key(&nid) {
-        return Err(err_body(StatusCode::NOT_FOUND, format!("node {nid} not found")));
+    {
+        let sm = state.sm_data.read().await;
+        let Some(node) = sm.nodes.get(&nid) else {
+            return Err(err_body(StatusCode::NOT_FOUND, format!("node {nid} not found")));
+        };
+        // Audit #7 — the apply refuses quarantined nodes, and a disable on a
+        // non-Maintenance node would mark e.g. a Down node Healthy.
+        let refusal = if node.quarantine.is_some() {
+            Some(format!("node {nid} is quarantined; unquarantine it first"))
+        } else if !body.enable && node.health != dtfs_common::types::HealthStatus::Maintenance {
+            Some(format!("node {nid} is not in maintenance (health {:?})", node.health))
+        } else {
+            None
+        };
+        if let Some(msg) = refusal {
+            warn!(node = nid, enable = body.enable, error = %msg, "maintenance toggle refused");
+            return Err(err_body(StatusCode::CONFLICT, msg));
+        }
     }
 
     let status_str = if body.enable {

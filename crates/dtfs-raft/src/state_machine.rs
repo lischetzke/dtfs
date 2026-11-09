@@ -1501,7 +1501,10 @@ fn apply_request(
                         attempted = %status,
                         "Bug BF-6: refusing UpdateNodeStatus on Quarantined node"
                     );
-                    return ClientResponse::Success;
+                    // Audit #7 — a refusal is an Error (A.3.6), never Success.
+                    return ClientResponse::Error {
+                        message: format!("UpdateNodeStatus: node {node_id} is quarantined"),
+                    };
                 }
                 // Bug BN-2 — only audit a genuine health transition. The
                 // health monitor + heartbeat path apply UpdateNodeStatus
