@@ -272,7 +272,8 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   arms every writer's `write_error` (`record_bg_batch`: the batch's chunks
   go to each writer's `failed_chunks`; a batch success removes its chunks
   and clears `write_error` only when none is left, so a later disjoint
-  batch never hides an earlier failure; a `commit_all` success clears
+  batch never hides an earlier failure; a failed timer/`commit_all` adds
+  the path's pending chunks the same way; a `commit_all` success clears
   both); `BgSlot` removes its batch and wakes `wait_bg` (Notify) even on
   panic. It holds NO `path_guard` (writes would block on it again); instead
   everything that could touch those chunks waits first: write() into a

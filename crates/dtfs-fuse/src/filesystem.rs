@@ -2474,7 +2474,8 @@ impl DtfsFilesystem {
     }
 
     /// Timer commit result for `path`: a failure is logged and arms every
-    /// writer's sticky error (bytes restored, retried next tick); a success
+    /// writer's sticky error and `failed_chunks` with the pending chunks
+    /// (bytes restored, retried next tick); a success
     /// clears it and the failed batches' chunks (the bytes it reported are
     /// committed now).
     fn record_aged_commit(&self, path: &str, result: Result<()>) {
@@ -2499,6 +2500,12 @@ impl DtfsFilesystem {
         for mut f in self.open_files.iter_mut() {
             if f.path == path && f.flags.is_writable() {
                 f.write_error = Some(msg.clone());
+                // Else a later disjoint batch success clears this failure.
+                for c in &idx {
+                    if !f.failed_chunks.contains(c) {
+                        f.failed_chunks.push(*c);
+                    }
+                }
             }
         }
     }
@@ -7069,6 +7076,29 @@ mod async_commit_fs_tests {
         assert!(!armed(&fs));
         fs.record_bg_batch("/f", &[9], Ok(()));
         assert!(!armed(&fs));
+    }
+
+    /// FUSE-2: a timer (commit_all) failure records its pending chunks as
+    /// failed, so a later disjoint batch success does not clear it; the
+    /// error clears once those chunks commit. A reader handle gets nothing.
+    #[test]
+    fn timer_failure_survives_a_disjoint_batch_success() {
+        let fs = fs(true);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let rd = open(&fs, "/f", OpenFlags::ReadOnly);
+        let armed = |fs: &DtfsFilesystem| fs.open_files.get(&fh).unwrap().write_error.is_some();
+        fs.write_buffer.write("/f", 0, &[1; 10]);
+        fs.write_buffer.write("/f", 2 * cs, &[1; 10]);
+        fs.record_aged_commit("/f", Err(anyhow::anyhow!("commit failed")));
+        assert!(armed(&fs));
+        fs.record_bg_batch("/f", &[4, 5, 6, 7], Ok(()));
+        assert!(armed(&fs), "a disjoint batch success cleared the timer failure");
+        fs.record_bg_batch("/f", &[0], Ok(()));
+        assert!(armed(&fs), "boundary: chunk 2 not committed yet");
+        fs.record_bg_batch("/f", &[2], Ok(()));
+        assert!(!armed(&fs), "every pending chunk committed again");
+        assert!(fs.open_files.get(&rd).unwrap().failed_chunks.is_empty(), "reader handle untouched");
     }
 
     /// multibatch: two overlapping commits of disjoint chunk sets both merge
