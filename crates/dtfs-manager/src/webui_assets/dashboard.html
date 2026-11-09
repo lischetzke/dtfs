@@ -688,7 +688,7 @@
         </div>
         <div class="modal-row">
             <label for="cv-chunk-size-mb">Chunk size (MiB)</label>
-            <input id="cv-chunk-size-mb" class="form-input" type="number" min="1" step="1" placeholder="(cluster default)">
+            <input id="cv-chunk-size-mb" class="form-input" type="number" min="1" max="64" step="1" placeholder="(cluster default)">
         </div>
         <fieldset>
             <legend>Mandatory replicas per tier</legend>
@@ -4257,7 +4257,7 @@
                 <p class="settings-desc">Default chunk size for new volumes.</p>
                 <div class="settings-row">
                     <label>Chunk size</label>
-                    <span class="settings-val">${d.chunk_size_mb ?? 128} MB</span>
+                    <span class="settings-val">${d.chunk_size_mb ?? 4} MiB</span>
                 </div>
                 <p class="settings-note">Per-volume overrides: set <b>chunk_size_mb</b> in the Volumes page's Create volume dialog (POST /api/v1/volumes)</p>
             </div>

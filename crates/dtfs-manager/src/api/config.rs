@@ -391,7 +391,7 @@ pub(super) fn manager_config_defaults_baseline() -> Value {
             "ca_path": null,
         },
         "defaults": {
-            "chunk_size_mb": 128,
+            "chunk_size_mb": 4,
             "replication": {"hot": 0, "warm": 2, "cold": 1, "tape": 1},
             "write_safety": {
                 "min_replicas_before_ack": 1,
