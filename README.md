@@ -104,7 +104,9 @@ alike: Part A covers the architecture, the integrity invariants and the file
 map; Part B covers how a change lands (tests, commit format, where files
 live). Read it before any non-trivial change. The
 [Contribution guide](docs/src/development/contributing.md) explains the
-workflow in more detail.
+workflow in more detail. Start with [`CONTRIBUTING.md`](.github/CONTRIBUTING.md)
+and the [Code of Conduct](.github/CODE_OF_CONDUCT.md); pull requests get a
+checklist from the template.
 
 ## Use of AI
 
