@@ -571,7 +571,7 @@ pub(crate) fn liveness_write_status(
         }
         // Audit #7 — a stale-follower `healthy` write refused because the
         // leader already quarantined the node: quarantine wins, not a fault.
-        Ok(ClientResponse::Error { message }) if message.contains("is quarantined") => Ok(()),
+        Ok(ClientResponse::Error { message }) if message.contains(dtfs_raft::QUARANTINED_REFUSAL) => Ok(()),
         Ok(ClientResponse::Error { message }) => Err(Status::internal(message)),
         Ok(_) => Ok(()),
         Err(e) => Err(e),
@@ -2240,7 +2240,7 @@ impl ManagerService for MetadataService {
             .pipe_committed_ok()
             // Audit #7 — quarantine is stickier than degraded/healthy; a
             // refusal for it must not make the data node retry the report.
-            .or_else(|e| if e.contains("is quarantined") { Ok(()) } else { Err(e) })
+            .or_else(|e| if e.contains(dtfs_raft::QUARANTINED_REFUSAL) { Ok(()) } else { Err(e) })
         {
             tracing::warn!(error = %e, "CO-3-7 failed to commit node-status from chunk report");
             accepted = false;

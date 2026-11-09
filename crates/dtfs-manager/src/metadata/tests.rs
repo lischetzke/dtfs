@@ -2054,7 +2054,7 @@ mod mgr_hb_liveness_write_status {
     #[test]
     fn quarantine_refusal_is_ok() {
         let r = liveness_write_status(Ok(ClientResponse::Error {
-            message: "UpdateNodeStatus: node 7 is quarantined".into(),
+            message: dtfs_raft::quarantined_refusal(7),
         }));
         assert!(r.is_ok());
     }

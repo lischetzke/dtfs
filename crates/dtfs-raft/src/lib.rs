@@ -374,6 +374,15 @@ impl fmt::Display for NodeInfo {
 /// is always CAS-checked.
 pub const UPDATE_CONFIG_NO_CAS: u64 = u64::MAX;
 
+/// Marker of the `UpdateNodeStatus` refusal on a quarantined node. Managers
+/// match it to treat that refusal as "quarantine wins", not a fault.
+pub const QUARANTINED_REFUSAL: &str = "is quarantined";
+
+/// The `UpdateNodeStatus` refusal message for quarantined `node_id`.
+pub fn quarantined_refusal(node_id: u64) -> String {
+    format!("UpdateNodeStatus: node {node_id} {QUARANTINED_REFUSAL}")
+}
+
 fn update_config_no_cas() -> u64 {
     UPDATE_CONFIG_NO_CAS
 }

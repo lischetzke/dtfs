@@ -1503,7 +1503,7 @@ pub(crate) fn apply_request(
                     );
                     // Audit #7 — a refusal is an Error (A.3.6), never Success.
                     return ClientResponse::Error {
-                        message: format!("UpdateNodeStatus: node {node_id} is quarantined"),
+                        message: crate::quarantined_refusal(*node_id),
                     };
                 }
                 // Bug BN-2 — only audit a genuine health transition. The

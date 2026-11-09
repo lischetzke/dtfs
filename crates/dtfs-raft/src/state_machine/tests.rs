@@ -2192,7 +2192,8 @@ mod posix_path_regression {
             node_id: 7, info: mk_quarantine_info(QuarantineReason::DeepScrubHashMismatch) });
         let r = apply_request(&mut sm, &mk_log_id(3),
             &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "maintenance".into() });
-        assert!(matches!(&r, ClientResponse::Error { message } if message.contains("is quarantined")), "{r:?}");
+        assert!(matches!(&r, ClientResponse::Error { message } if *message == crate::quarantined_refusal(7)), "{r:?}");
+        assert!(crate::quarantined_refusal(7).contains(crate::QUARANTINED_REFUSAL));
         assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Quarantined);
         let r = apply_request(&mut sm, &mk_log_id(4),
             &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "down".into() });
