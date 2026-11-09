@@ -10,7 +10,8 @@
 Read tools talk to the manager REST API (:9402) and, over the system `ssh`
 binary, run a fixed set of allowlisted read-only command templates on cluster
 hosts. Gated ops (scrub, maintenance, unquarantine, flush_cache, migrate,
-decommission, remove_dead) mutate the cluster and only act when called with confirm=true.
+decommission, remove_dead, reap_orphans) mutate the cluster and only act when called with
+confirm=true.
 
 Config: %USERPROFILE%\\.dtfs\\clusters.toml (or env DTFS_MCP_CONFIG). See
 clusters.example.toml. Documentation: docs/src/operations/diagnostics-mcp.md.
@@ -1149,6 +1150,43 @@ def op_remove_dead_impl(cl: Cluster, node_id: Any, operator_id: str, reason: str
     return _post_with_leader(cl, path, {**body, "dry_run": False}, f"remove dead node {nid}")
 
 
+ORPHAN_GRACE_FLOOR_SECS = 3600
+
+
+def op_reap_orphans_impl(cl: Cluster, grace_secs: Any, confirm: bool,
+                         wait_secs: float = 120, poll_secs: float = 2) -> dict:
+    if grace_secs is not None and (isinstance(grace_secs, bool) or not isinstance(grace_secs, int)
+                                   or grace_secs < ORPHAN_GRACE_FLOOR_SECS):
+        raise ValidationError(f"grace_secs must be an integer >= {ORPHAN_GRACE_FLOOR_SECS} (or omitted)")
+    path = "/api/v1/scrub/orphans"
+    body: dict = {"dry_run": confirm is not True}
+    if grace_secs is not None:
+        body["grace_secs"] = grace_secs
+    if confirm is True:
+        res = _post_with_leader(cl, path, body, "reap orphan chunks now")
+        res["note"] = "runs in the background; read GET /api/v1/scrub/orphans on the leader for the result"
+        return res
+    # The server's own dry run deletes nothing; wait (bounded) for its report.
+    res = _post_with_leader(cl, path, body, "dry-run orphan reap")
+    out = {"dry_run": True, "action": "reap orphan chunks", "manager": res["manager"],
+           "accepted": res.get("response"),
+           "note": "nothing was deleted; re-call with confirm=true after the user approves"}
+    if not res["executed"]:
+        return out
+    deadline = time.monotonic() + wait_secs
+    while True:
+        st = rest_call(cl, res["manager"], path)
+        data = st.get("data") if not is_err(st) else None
+        if isinstance(data, dict) and not data.get("running"):
+            out["report"] = data.get("last_run")
+            return out
+        if time.monotonic() >= deadline:
+            out["report"] = data.get("last_run") if isinstance(data, dict) else st.get("__error__")
+            out["note"] += f"; still running after {wait_secs:.0f} s, re-read GET {path}"
+            return out
+        time.sleep(poll_secs)
+
+
 # --------------------------------------------------------------------------
 # MCP wiring
 # --------------------------------------------------------------------------
@@ -1471,6 +1509,15 @@ def build_server():
         other live replica. Without confirm=true returns the server's plan and changes nothing."""
         return op_remove_dead_impl(get_cluster(cluster), node_id, operator_id, reason,
                                    accept_data_loss, confirm)
+
+    @tool
+    def op_reap_orphans(grace_secs: int | None = None, confirm: bool = False,
+                        cluster: str | None = None) -> dict:
+        """GATED. Run the orphan reaper once now on the leader with a one-time grace (seconds,
+        >= 3600; default the configured scrub.orphan_grace_secs). Without confirm=true runs the
+        server's dry run (deletes nothing) and returns its per-node candidate counts; with
+        confirm=true starts a real reap in the background."""
+        return op_reap_orphans_impl(get_cluster(cluster), grace_secs, confirm)
 
     return mcp
 

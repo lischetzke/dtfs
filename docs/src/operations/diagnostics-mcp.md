@@ -57,6 +57,7 @@ Without a config the server still starts; every tool returns a `setup_required` 
 | `op_migrate(path_prefix, target_tier, target_dc?, max_tasks?, confirm?)` | gated: `POST /api/v1/migrations`; prefix must name a subtree, `max_tasks` 1..10000; dry run previews matching files |
 | `op_decommission(node_id, operator_id, reason?, confirm?)` | gated: `POST /api/v1/nodes/{id}/decommission`; dry run shows the node, server refuses while it holds replicas |
 | `op_remove_dead(node_id, operator_id, reason?, accept_data_loss?, confirm?)` | gated: `POST /api/v1/nodes/{id}/remove-dead`; without `confirm` it asks the server for its plan (`dry_run`) and changes nothing |
+| `op_reap_orphans(grace_secs?, confirm?)` | gated: `POST /api/v1/scrub/orphans`; `grace_secs` >= 3600 (default: configured `scrub.orphan_grace_secs`). Without `confirm` it runs the server's dry run (deletes nothing) and waits up to 120 s for its per-node candidate counts; with `confirm=true` it starts a real reap in the background (result: `rest_get /api/v1/scrub/orphans` on the leader) |
 
 `/api/v1/chunks`, `/api/v1/chunks/{id}`, `/api/v1/memory` and the raft-state `replication`
 field exist only on manager builds that include them; older builds answer 404 and the tools

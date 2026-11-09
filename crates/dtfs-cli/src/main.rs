@@ -71,6 +71,8 @@ enum Commands {
         /// Scrub level: quick or deep
         #[arg(long, default_value = "deep")]
         level: String,
+        #[command(subcommand)]
+        action: Option<ScrubCmd>,
     },
 
     /// Maintenance mode operations
@@ -441,6 +443,25 @@ enum NodesCmd {
     },
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum ScrubCmd {
+    /// Run the orphan reaper once now on the leader (POST /api/v1/scrub/orphans)
+    Orphans {
+        /// One-time grace in seconds (default: the configured
+        /// scrub.orphan_grace_secs; minimum 3600)
+        #[arg(long)]
+        grace_secs: Option<u64>,
+        /// Only report what would be reaped
+        #[arg(long)]
+        dry_run: bool,
+        /// Wait for the run to finish and print its result
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Show the last (or running) orphan reap (GET /api/v1/scrub/orphans)
+    OrphansStatus,
+}
+
 /// UIP-4-3 (D3) — manual data migration subcommands.
 #[derive(clap::Subcommand, Debug)]
 enum MigrationsCmd {
@@ -752,7 +773,14 @@ async fn main() -> anyhow::Result<()> {
                 allow_empty_prefix, max_tasks,
             ).await?,
         },
-        Commands::Scrub { level } => cmd_scrub(&api, &level).await?,
+        Commands::Scrub { level, action: None } => cmd_scrub(&api, &level).await?,
+        Commands::Scrub { action: Some(ScrubCmd::Orphans { grace_secs, dry_run, wait }), .. } => {
+            cmd_scrub_orphans(&api, &args.format, grace_secs, dry_run, wait).await?
+        }
+        Commands::Scrub { action: Some(ScrubCmd::OrphansStatus), .. } => {
+            let v = api.get("/api/v1/scrub/orphans").await?;
+            print_orphan_status(&args.format, &v)?;
+        }
         Commands::Maintenance {
             node_id,
             enable,
@@ -1556,6 +1584,80 @@ async fn cmd_scrub(api: &ApiClient, level: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn orphan_reap_body(grace_secs: Option<u64>, dry_run: bool) -> Value {
+    let mut b = serde_json::json!({ "dry_run": dry_run });
+    if let Some(g) = grace_secs {
+        b["grace_secs"] = g.into();
+    }
+    b
+}
+
+async fn cmd_scrub_orphans(
+    api: &ApiClient,
+    format: &OutputFormat,
+    grace_secs: Option<u64>,
+    dry_run: bool,
+    wait: bool,
+) -> anyhow::Result<()> {
+    let resp = api.post_checked("/api/v1/scrub/orphans", &orphan_reap_body(grace_secs, dry_run)).await?;
+    if !wait {
+        match format {
+            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+            OutputFormat::Table => println!(
+                "Orphan reap started (grace_secs={}, dry_run={}); see `dtfs-cli scrub orphans-status`",
+                resp["grace_secs"], resp["dry_run"]
+            ),
+        }
+        return Ok(());
+    }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let v = api.get("/api/v1/scrub/orphans").await?;
+        if v["running"] == false {
+            print_orphan_status(format, &v)?;
+            if let Some(e) = v["last_run"]["error"].as_str() {
+                anyhow::bail!("orphan reap did not complete: {e}");
+            }
+            return Ok(());
+        }
+    }
+}
+
+fn print_orphan_status(format: &OutputFormat, v: &Value) -> anyhow::Result<()> {
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", serde_json::to_string_pretty(v)?);
+        return Ok(());
+    }
+    println!("Running:          {}", v["running"]);
+    println!("Configured grace: {} s (manual floor {} s)", v["configured_grace_secs"], v["manual_grace_floor_secs"]);
+    let r = &v["last_run"];
+    if r.is_null() {
+        println!("Last run:         none on this manager (query the leader)");
+        return Ok(());
+    }
+    let bytes = r["bytes_freed"].as_u64().map(format_bytes).unwrap_or_else(|| "n/a".into());
+    println!(
+        "Last run:         trigger={} grace={} s dry_run={} started_ms={} finished_ms={}",
+        r["trigger"].as_str().unwrap_or("?"), r["grace_secs"], r["dry_run"], r["started_ms"], r["finished_ms"]
+    );
+    println!("Candidates:       {}  reaped: {}  freed: {}", r["candidates"], r["reaped"], bytes);
+    if let Some(e) = r["error"].as_str() {
+        println!("Error:            {e}");
+    }
+    if let Some(nodes) = r["nodes"].as_object() {
+        println!("{:<10} {:>10} {:>11} {:>8} {:>8} {:>12}  ERROR", "NODE", "LISTED", "CANDIDATES", "REAPED", "FAILED", "FREED");
+        for (id, n) in nodes {
+            let freed = n["bytes_freed"].as_u64().map(format_bytes).unwrap_or_else(|| "n/a".into());
+            println!(
+                "{:<10} {:>10} {:>11} {:>8} {:>8} {:>12}  {}",
+                id, n["listed"], n["candidates"], n["reaped"], n["delete_failed"], freed,
+                n["error"].as_str().unwrap_or("")
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_maintenance(
     api: &ApiClient,
     node_id: &str,
@@ -2171,6 +2273,20 @@ mod audit_co_tests {
         assert_eq!(volumes_create_body("v", Some(2), false)["replication_hot"], 2);
         assert!(volumes_create_body("v", None, false).get("force").is_none());
         assert!(Args::try_parse_from(["dtfs-cli", "scrub", "--disk", "/x"]).is_err());
+        let a = Args::try_parse_from(["dtfs-cli", "scrub", "--level", "quick"]).unwrap();
+        assert!(matches!(a.command, Commands::Scrub { action: None, .. }));
+        let a = Args::try_parse_from(["dtfs-cli", "scrub", "orphans", "--grace-secs", "3600", "--dry-run"]).unwrap();
+        assert!(matches!(
+            a.command,
+            Commands::Scrub { action: Some(ScrubCmd::Orphans { grace_secs: Some(3600), dry_run: true, wait: false }), .. }
+        ));
+        assert!(Args::try_parse_from(["dtfs-cli", "scrub", "orphans", "--grace-secs", "-1"]).is_err());
+        assert!(matches!(
+            Args::try_parse_from(["dtfs-cli", "scrub", "orphans-status"]).unwrap().command,
+            Commands::Scrub { action: Some(ScrubCmd::OrphansStatus), .. }
+        ));
+        assert_eq!(orphan_reap_body(None, true), serde_json::json!({"dry_run": true}));
+        assert_eq!(orphan_reap_body(Some(7200), false)["grace_secs"], 7200);
         assert!(Args::try_parse_from(["dtfs-cli", "volumes", "create", "v", "--tier-policy", "x"]).is_err());
         let b = set_anchor_body(Some("leli".into()), None, true);
         assert_eq!((b["force"].clone(), b["datacenter"].clone()), (true.into(), "leli".into()));

@@ -82,6 +82,8 @@ Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserve
 | GET | `/api/v1/migrations` | no | leader | Migration tasks |
 | POST | `/api/v1/migrations` | yes | leader (409) | Start path migration |
 | POST | `/api/v1/scrub` | yes | leader (503) | Trigger cluster scrub |
+| POST | `/api/v1/scrub/orphans` | yes | leader (409) | Run the orphan reaper once now |
+| GET | `/api/v1/scrub/orphans` | no | any (record is per manager) | Last orphan reap |
 | GET | `/api/v1/audit` | no | any | Audit log |
 | GET | `/api/v1/integrity/faults` | no | any | Integrity-fault feed |
 | GET | `/api/v1/config` | no | any | Stored override |
@@ -313,6 +315,23 @@ Response: `status` (`accepted`), `path_prefix`, `target_tier`, `target_dc`, `fil
 ### POST /api/v1/scrub
 
 Body `{"level": "quick" | "deep"}` (default `deep`). Every data node runs the scrub once on its next heartbeat. Per-target scrubs are not implemented: any `target_type` other than `all` or `target` other than `*` returns `400`. Response `{"status": "accepted", "target_type": "all", "target": "*", "level", "id"}`. Results appear in `GET /api/v1/stats` (`scrub_results_by_node`, `last_scrub`). See [Scrubbing](../storage/scrubbing.md).
+
+### POST /api/v1/scrub/orphans
+
+Runs the orphan reaper once, now, on the leader, with a one-time grace. Body `{"grace_secs": <u64, optional>, "dry_run": <bool, default false>}`; `grace_secs` defaults to the configured `scrub.orphan_grace_secs`. The sweep is the periodic one (same guards: leader re-check before every delete, disk-keyed rows, data-node mtime guard); a dry run deletes nothing and proposes no Raft write (it also skips the in-state-missing reconcile/quarantine), it only counts candidates. Returns `202` `{"status": "accepted", "trigger": "manual", "grace_secs", "dry_run"}` and runs in the background.
+
+| Status | When |
+|---|---|
+| `400` | `grace_secs` below the manual floor of 3600 s |
+| `409` `{"error": "an orphan reap is already running"}` | a reap (manual or timer) is running; the timer skips its tick while a manual run is active |
+| `409` `{"error": "...not the leader...", "leader": {...}}` | sent to a follower |
+| `401` / `403` | `cluster.shared_secret` set and the header missing / wrong |
+
+Audited as `scrub.orphans` (target `grace_secs=N dry_run=B`) once with `accepted` and once when the run ends with `candidates=N reaped=N` or `error: ...`. Each deleted chunk keeps its own `orphan.reaped` row.
+
+### GET /api/v1/scrub/orphans
+
+`{"running", "is_leader", "configured_grace_secs", "manual_grace_floor_secs": 3600, "last_run"}`. `last_run` is `null` or the last (or running) reap on this manager, manual or timer: `trigger` (`manual` | `timer`), `grace_secs`, `dry_run`, `started_ms`, `finished_ms` (`null` while running), `candidates` (reap candidates past grace), `reaped`, `bytes_freed` (`null` on a dry run: `ListChunks` reports no sizes), `nodes` (per node id: `listed`, `candidates`, `reaped`, `delete_failed`, `bytes_freed`, `error`) and `error`. A sweep that did not run or was cut short reports `error` (`sweep skipped: not leader`, `sweep skipped: state machine not caught up`, `sweep skipped: empty namespace view`, `aborted: lost leadership after reaping N`), never a clean `reaped: 0`. The record is process-local: query the leader.
 
 ## Audit and integrity
 

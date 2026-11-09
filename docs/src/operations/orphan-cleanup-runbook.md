@@ -6,14 +6,45 @@ re-upload can land its bytes before its metadata commit, so an eager "nobody
 references this chunk" check would race it. The orphan reaper below is therefore
 the only thing that frees the space of deleted files, once each chunk's on-disk
 `.dat` is older than `orphan_grace_secs`. Expect space to come back one to two
-days after a bulk delete with the default cadence (Option B shortens that).
+days after a bulk delete with the default cadence (Option C runs a reap now).
 
 `orphan_scrub` (Bug BC-7) reaps chunks present on disk but not in
 `state_machine.chunk_locations`. Default cadence is conservative
 (`orphan_interval_secs = 86400` = 1 d, `orphan_grace_secs = 86400` =
 1 d more before reap). On a freshly-upgraded cluster you may have
 weeks of accumulated orphans (in the lab: 24+ GB of 128 MB chunks
-from prior test campaigns). Two paths to drain them.
+from prior test campaigns). Three paths to drain them; Option C needs
+no config change or restart.
+
+Every sweep (timer or manual) first waits up to 30 s for the leader to
+apply everything that was in its Raft log when the sweep started; under
+steady writes that is reached even though `last_applied` trails the
+moving log tail. If it is not reached, or this manager is not the leader,
+or its file view is empty, the sweep is skipped with a warn log
+(`orphan reap did not complete`) and the reason in
+`GET /api/v1/scrub/orphans` `last_run.error`.
+
+## Option C: reap now (manual, one-time grace)
+
+1. Dry run first (deletes nothing, counts candidates per node):
+   ```
+   dtfs-cli scrub orphans --grace-secs 21600 --dry-run --wait
+   ```
+   WebUI: Integrity card "Orphan reaper", keep "Dry run" ticked, "Reap
+   now". MCP: `op_reap_orphans(grace_secs=21600)`.
+2. Real run with the same grace:
+   ```
+   dtfs-cli scrub orphans --grace-secs 21600 --wait
+   ```
+   MCP: `op_reap_orphans(grace_secs=21600, confirm=True)`.
+
+The grace is one-time; the configured `orphan_grace_secs` is not
+changed. The manual floor is 3600 s, far above any put-to-commit window
+(write lease 120 s, `async_commit_secs` <= 60 s); prefer 6 h or more on a
+cluster that is writing. One reap runs at a time (`409` otherwise) and
+the timer skips its tick while a manual run is active. Large nodes take
+as long as their `ListChunks` (minutes on 50 TB); poll
+`dtfs-cli scrub orphans-status`.
 
 ## Option A: wait
 

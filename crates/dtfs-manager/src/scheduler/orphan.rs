@@ -152,25 +152,83 @@ impl TaskScheduler {
                 debug!("Bug BC-7: orphan_scrub tick skipped: not leader");
                 continue;
             }
-            match self.orphan_scrub_tick(grace_secs).await {
-                Ok(reaped) => {
-                    if reaped > 0 {
-                        info!(reaped, "Bug BC-7: orphan_scrub tick reaped chunks");
-                    } else {
-                        debug!("Bug BC-7: orphan_scrub tick clean");
-                    }
-                }
-                Err(e) => warn!(error = %e, "Bug BC-7: orphan_scrub tick failed"),
-            }
+            let Some(guard) = self.try_begin_orphan_run() else {
+                info!("orphan_scrub tick skipped: a manual orphan reap is running");
+                continue;
+            };
+            self.run_orphan_reap(guard, "timer", grace_secs, false).await;
         }
     }
 
-    /// One sweep of orphan_scrub. Returns the number of chunks reaped.
-    pub async fn orphan_scrub_tick(&self, grace_secs: u64) -> anyhow::Result<usize> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+    /// Single-flight token for an orphan reap; `None` while one runs.
+    pub fn try_begin_orphan_run(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.orphan_run.clone().try_lock_owned().ok()
+    }
+
+    pub fn orphan_run_active(&self) -> bool {
+        self.orphan_run.try_lock().is_err()
+    }
+
+    /// Last finished (or the running) orphan reap.
+    pub fn last_orphan_run(&self) -> Option<OrphanRunRecord> {
+        self.orphan_last_run.lock().clone()
+    }
+
+    /// One orphan reap (timer or manual) holding the single-flight `_guard`.
+    /// Records the run for `GET /api/v1/scrub/orphans` and logs the outcome
+    /// once; a skipped or aborted sweep lands in `error`, never as "0 reaped".
+    pub async fn run_orphan_reap(
+        &self,
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+        trigger: &'static str,
+        grace_secs: u64,
+        dry_run: bool,
+    ) -> OrphanRunRecord {
+        let mut rec = OrphanRunRecord {
+            trigger,
+            grace_secs,
+            dry_run,
+            started_ms: now_millis(),
+            ..Default::default()
+        };
+        *self.orphan_last_run.lock() = Some(rec.clone());
+        if let Err(e) = self.orphan_scrub_tick(&mut rec).await {
+            rec.error = Some(e.to_string());
+        }
+        rec.finished_ms = Some(now_millis());
+        *self.orphan_last_run.lock() = Some(rec.clone());
+        if let Some(e) = &rec.error {
+            warn!(trigger, grace_secs, dry_run, reaped = rec.reaped, error = %e, "orphan reap did not complete");
+        } else if rec.candidates > 0 || trigger == "manual" {
+            info!(trigger, grace_secs, dry_run, candidates = rec.candidates, reaped = rec.reaped, "orphan reap finished");
+        } else {
+            debug!(trigger, "Bug BC-7: orphan_scrub tick clean");
+        }
+        rec
+    }
+
+    /// One sweep of orphan_scrub with `rec.grace_secs`; with `rec.dry_run`
+    /// it only counts the reap candidates (no delete, no reconcile, no
+    /// quarantine). Counters accumulate into `rec`.
+    pub(crate) async fn orphan_scrub_tick(&self, rec: &mut OrphanRunRecord) -> anyhow::Result<()> {
+        let grace_secs = rec.grace_secs;
+        let dry_run = rec.dry_run;
+        // REV-1-2 — freshness gate, waited for instead of skipped: under
+        // steady writes the leader is often a few entries behind its own log
+        // at any instant. Wait (bounded) until it has applied everything that
+        // was in its log when the sweep started, BEFORE taking the snapshot.
+        let caught_up_to = wait_for_sweep_catch_up(
+            || {
+                let (applied, last_log) = self.applied_and_log_index();
+                (self.is_leader(), applied, last_log)
+            },
+            Duration::from_millis(250),
+            120,
+        )
+        .await
+        .map_err(|r| anyhow::anyhow!("sweep skipped: {r}"))?;
+
+        let now_ms = now_millis();
 
         // 1. Snapshot in-state chunk_ids from state-machine. Bug BF-8
         // also snapshots per-node expected sets so the in-state-missing
@@ -208,24 +266,20 @@ impl TaskScheduler {
             (nodes, chunks, expected, quarantined)
         };
 
-        // REV-1-2 — freshness gate. The reap deletes anything on disk that
-        // this manager cannot see in `sm.files`, so a state machine that is
-        // still replaying (a manager that was down, or one that just loaded
-        // an old on-disk snapshot) would classify every file created since as
-        // an orphan. An empty in-state chunk set alongside live data nodes is
-        // never a legitimate "everything is an orphan" either.
-        let (applied, last_log) = self.applied_and_log_index();
-        if !orphan_sweep_allowed(self.is_leader(), applied, last_log, in_state_chunks.len()) {
-            debug!(
-                applied,
-                last_log,
-                in_state_chunks = in_state_chunks.len(),
-                "REV-1-2: orphan_scrub sweep skipped (not leader / state not caught up / empty view)"
-            );
-            return Ok(0);
+        // REV-1-2 — the reap deletes anything on disk that this manager
+        // cannot see in `sm.files`, so a state machine that is still
+        // replaying would classify every file created since as an orphan. An
+        // empty in-state chunk set alongside live data nodes is never a
+        // legitimate "everything is an orphan" either.
+        let (applied, _) = self.applied_and_log_index();
+        if let Some(reason) =
+            orphan_sweep_skip_reason(self.is_leader(), applied, caught_up_to, in_state_chunks.len())
+        {
+            anyhow::bail!("sweep skipped: {reason}");
         }
 
         let mut reaped: usize = 0;
+        let mut aborted = false;
 
         'nodes: for (node_id, grpc_addr) in &data_nodes {
             // CR2-7-3 / MGR-13 — re-check leadership at the top of EVERY node
@@ -242,16 +296,20 @@ impl TaskScheduler {
                     &format!("aborted before node={node_id}; reaped_so_far={reaped}"),
                     "aborted",
                 );
+                aborted = true;
                 break 'nodes;
             }
             if grpc_addr.is_empty() { continue; }
+            let node_stats = rec.nodes.entry(node_id.to_string()).or_default();
             let on_disk = match self.list_chunks_on_node(grpc_addr).await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(node = %node_id, error = %e, "Bug BC-7: ListChunks failed");
+                    node_stats.error = Some(format!("ListChunks failed: {e}"));
                     continue;
                 }
             };
+            node_stats.listed = on_disk.len();
             // The sets snapshotted at sweep start predate this node's
             // ListChunks (which can take minutes on a big node). Rebuild
             // this node's view from the CURRENT state machine before any
@@ -267,8 +325,8 @@ impl TaskScheduler {
             // any expected chunk is absent from its ListChunks reply.
             // Skip if the node is already Quarantined (apply path
             // accumulates fault_count_total; no need to bump on every
-            // tick).
-            if !already_quarantined.contains(node_id) {
+            // tick). A dry run proposes nothing, so it skips this too.
+            if !dry_run && !already_quarantined.contains(node_id) {
                 if let Some(expected) = expected_by_node.get(node_id) {
                     let missing: Vec<&String> =
                         expected.iter().filter(|c| !on_disk.contains_key(*c)).collect();
@@ -367,8 +425,7 @@ impl TaskScheduler {
                 // stale — that was the data-loss vector (BN-1 UUID rotation
                 // dropped location bindings; the hash-referenced guard here
                 // is the defence-in-depth backstop). CLAUDE.md §A.6 #8.
-                let is_orphan = chunk_is_orphan(&view.in_state, cid);
-
+                //
                 // CO-3-2 / CR2-7-2 (MGR-10) — a chunk on this node's disk
                 // for which the SM records NO location entry naming this
                 // node (or, when the data node reports which disk, no
@@ -392,9 +449,7 @@ impl TaskScheduler {
                 // A copy recorded under ANOTHER disk id of the same node must
                 // never be deleted, so the per-disk verdict is also gated on
                 // the node-wide set (co-located leftovers may leak instead).
-                let de_located = view.delocated(*disk_id_opt, cid);
-                let reap_candidate = is_orphan || de_located;
-
+                //
                 // Bug CB — measure the reap grace against the chunk's
                 // DURABLE on-disk mtime, not a manager-local "first
                 // observed orphan" clock. The old in-memory tracker reset
@@ -404,11 +459,14 @@ impl TaskScheduler {
                 // usage of deleted files never dropped). The mtime survives
                 // restarts; a freshly-written chunk (recent mtime) is still
                 // protected against the in-flight put/promote race.
-                if !orphan_reap_due(reap_candidate, *mtime_ms, now_ms, grace_secs) {
+                let candidate = orphan_reap_candidate(&view, cid, *disk_id_opt);
+                let Some(cause) =
+                    candidate.filter(|_| orphan_reap_due(true, *mtime_ms, now_ms, grace_secs))
+                else {
                     // Surface a known reap candidate we are deferring only
                     // because its age is unknown (mtime 0 = pre-Bug-CB data
                     // node), so a permanently-stalled reap is diagnosable.
-                    if reap_candidate && *mtime_ms == 0 {
+                    if candidate.is_some() && *mtime_ms == 0 {
                         debug!(
                             node = %node_id, chunk = %cid,
                             "Bug CB: orphan deferred — data node reported no \
@@ -416,8 +474,12 @@ impl TaskScheduler {
                         );
                     }
                     continue;
-                }
+                };
                 let age_secs = now_ms.saturating_sub(*mtime_ms) / 1000;
+                node_stats.candidates += 1;
+                if dry_run {
+                    continue;
+                }
 
                 // CR2-7-3 / MGR-13 — re-check leadership immediately before
                 // EACH delete (an election can land between two candidates
@@ -431,6 +493,7 @@ impl TaskScheduler {
                         ),
                         "aborted",
                     );
+                    aborted = true;
                     break 'nodes;
                 }
 
@@ -442,7 +505,6 @@ impl TaskScheduler {
                 // on another disk of the same node. A pre-CR2-7-2 data
                 // node reports no disk_id -> `None` -> legacy node-wide
                 // first-found delete, unchanged.
-                let cause = if is_orphan { "orphan" } else { "delocated" };
                 match self
                     .delete_chunk_replica_on_node_if_older(
                         grpc_addr, cid, *disk_id_opt, "", Some(*mtime_ms),
@@ -462,18 +524,29 @@ impl TaskScheduler {
                             &result_msg,
                         );
                         reaped += 1;
+                        node_stats.reaped += 1;
+                        *node_stats.bytes_freed.get_or_insert(0) += freed;
                     }
                     Err(e) => {
                         warn!(
                             node = %node_id, chunk = %cid, error = %e,
                             "Bug BC-7: orphan reap delete RPC failed"
                         );
+                        node_stats.delete_failed += 1;
                     }
                 }
             }
         }
 
-        Ok(reaped)
+        rec.candidates = rec.nodes.values().map(|n| n.candidates).sum();
+        rec.reaped = reaped;
+        if !dry_run {
+            rec.bytes_freed = Some(rec.nodes.values().filter_map(|n| n.bytes_freed).sum());
+        }
+        if aborted {
+            anyhow::bail!("aborted: lost leadership after reaping {reaped}");
+        }
+        Ok(())
     }
 
     /// Bug BF-8 / REV-3-10 — quarantine `node_id` for an unreconcilable
@@ -862,6 +935,87 @@ pub(crate) fn orphan_reap_due(
     age_secs >= grace_secs
 }
 
+/// Why the on-disk copy `cid` (on `disk_id`, when reported) is a reap
+/// candidate, age aside: `"orphan"` when no file references the hash
+/// (Bug BP-4), `"delocated"` when no row names this node/disk (CO-3-2).
+pub(crate) fn orphan_reap_candidate(
+    view: &NodeReapView,
+    cid: &str,
+    disk_id: Option<u32>,
+) -> Option<&'static str> {
+    if chunk_is_orphan(&view.in_state, cid) {
+        Some("orphan")
+    } else if view.delocated(disk_id, cid) {
+        Some("delocated")
+    } else {
+        None
+    }
+}
+
+/// Lowest grace a manual orphan reap accepts. Far above any put->commit
+/// window (write lease 120 s, async_commit <= 60 s); the configured
+/// `scrub.orphan_grace_secs` keeps its own 6 h floor.
+pub(crate) const MANUAL_ORPHAN_GRACE_FLOOR_SECS: u64 = 3600;
+
+/// Per-node counters of one orphan reap.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct OrphanNodeStats {
+    /// Chunks ListChunks reported.
+    pub listed: usize,
+    /// Reap candidates past grace (what a dry run would delete).
+    pub candidates: usize,
+    pub reaped: usize,
+    pub delete_failed: usize,
+    /// Freed bytes as reported by the data node; `None` on a dry run.
+    pub bytes_freed: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// One orphan reap, as shown by `GET /api/v1/scrub/orphans`.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct OrphanRunRecord {
+    /// `"manual"` or `"timer"`.
+    pub trigger: &'static str,
+    pub grace_secs: u64,
+    pub dry_run: bool,
+    pub started_ms: u64,
+    /// `None` while the run is in progress.
+    pub finished_ms: Option<u64>,
+    pub candidates: usize,
+    pub reaped: usize,
+    /// `None` on a dry run (ListChunks does not report sizes).
+    pub bytes_freed: Option<u64>,
+    /// Keyed by node id (string, like every node id in the REST API).
+    pub nodes: std::collections::BTreeMap<String, OrphanNodeStats>,
+    /// Skipped / aborted sweep; never reported as a clean "0 reaped".
+    pub error: Option<String>,
+}
+
+/// REV-1-2 freshness gate, waited for: probe `(is_leader, last_applied,
+/// last_log_index)` until the state machine has applied everything that was
+/// in the log at the FIRST probe ("caught up to when I started"), which is
+/// reached even under steady writes. Up to `max_steps` sleeps of `step`.
+/// Returns the caught-up log index, or the skip reason.
+pub(crate) async fn wait_for_sweep_catch_up(
+    mut probe: impl FnMut() -> (bool, u64, u64),
+    step: Duration,
+    max_steps: u32,
+) -> Result<u64, &'static str> {
+    let (_, _, target) = probe();
+    for i in 0..=max_steps {
+        let (is_leader, applied, _) = probe();
+        if let Some(reason) = orphan_sweep_skip_reason(is_leader, applied, target, 1) {
+            if reason == "not leader" || i == max_steps {
+                return Err(reason);
+            }
+            tokio::time::sleep(step).await;
+            continue;
+        }
+        return Ok(target);
+    }
+    Err("state machine not caught up")
+}
+
 /// Bug BO-1 — which node id (if any) `resolve_healthy_source` must exclude
 /// when copying a chunk for an anchor-lag task. For a same-node cross-tier
 /// copy (`source_node == target_node`) the target is the ONLY holder of the
@@ -917,13 +1071,25 @@ pub(crate) fn orphan_sweep_allowed(
     last_log_index: u64,
     in_state_chunks: usize,
 ) -> bool {
+    orphan_sweep_skip_reason(is_leader, last_applied, last_log_index, in_state_chunks).is_none()
+}
+
+/// `orphan_sweep_allowed` with the reason it refuses.
+pub(crate) fn orphan_sweep_skip_reason(
+    is_leader: bool,
+    last_applied: u64,
+    last_log_index: u64,
+    in_state_chunks: usize,
+) -> Option<&'static str> {
     if !is_leader {
-        return false;
+        Some("not leader")
+    } else if last_applied < last_log_index {
+        Some("state machine not caught up")
+    } else if in_state_chunks == 0 {
+        Some("empty namespace view")
+    } else {
+        None
     }
-    if last_applied < last_log_index {
-        return false;
-    }
-    in_state_chunks > 0
 }
 
 /// REV-3-5 — how many consecutive memory-pressure skips the scheduler
@@ -1113,5 +1279,68 @@ mod sched_audit_orphan_tests {
         assert!(orphan_delete_allowed(true, 3));
         assert!(!orphan_delete_allowed(false, 3));
         assert!(!orphan_delete_allowed(true, 0));
+    }
+
+    // ---- sweep gate: wait for catch-up instead of skipping ----
+    fn probe_seq(seq: Vec<(bool, u64, u64)>) -> impl FnMut() -> (bool, u64, u64) {
+        let mut it = seq.into_iter();
+        let mut last = (false, 0, 0);
+        move || {
+            if let Some(v) = it.next() {
+                last = v;
+            }
+            last
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_gate_waits_for_catch_up_under_steady_writes() {
+        // Start: applied 5, log 10. The log keeps growing (steady writes),
+        // but applied reaching 10 (the start-time tail) is enough.
+        let p = probe_seq(vec![(true, 5, 10), (true, 5, 10), (true, 8, 12), (true, 10, 14)]);
+        let r = wait_for_sweep_catch_up(p, Duration::from_millis(1), 10).await;
+        assert_eq!(r, Ok(10));
+    }
+
+    #[tokio::test]
+    async fn sweep_gate_refuses_a_non_leader_without_waiting() {
+        let p = probe_seq(vec![(false, 10, 10)]);
+        assert_eq!(wait_for_sweep_catch_up(p, Duration::from_secs(3600), 10).await, Err("not leader"));
+    }
+
+    #[tokio::test]
+    async fn sweep_gate_skips_when_never_caught_up_within_the_bound() {
+        let p = probe_seq(vec![(true, 5, 10), (true, 5, 10), (true, 9, 11), (true, 9, 11)]);
+        let r = wait_for_sweep_catch_up(p, Duration::from_millis(1), 3).await;
+        assert_eq!(r, Err("state machine not caught up"));
+    }
+
+    #[test]
+    fn sweep_skip_reason_names_the_empty_view() {
+        assert_eq!(orphan_sweep_skip_reason(true, 10, 10, 0), Some("empty namespace view"));
+        assert_eq!(orphan_sweep_skip_reason(false, 10, 10, 0), Some("not leader"));
+        assert_eq!(orphan_sweep_skip_reason(true, 9, 10, 5), Some("state machine not caught up"));
+        assert_eq!(orphan_sweep_skip_reason(true, 10, 10, 5), None);
+    }
+
+    // ---- manual reap: the given grace decides ----
+    #[test]
+    fn manual_grace_reaps_an_orphan_the_configured_grace_still_protects() {
+        let view = NodeReapView::from_files(&files(vec![row(0, "live", "1", 0)]), 1);
+        let now = 100 * 86_400_000;
+        let two_h_old = now - 2 * 3_600_000;
+        let c = orphan_reap_candidate(&view, "gone", Some(0));
+        assert_eq!(c, Some("orphan"));
+        // Manual grace 1 h: due. Configured 24 h: protected.
+        assert!(orphan_reap_due(c.is_some(), two_h_old, now, MANUAL_ORPHAN_GRACE_FLOOR_SECS));
+        assert!(!orphan_reap_due(c.is_some(), two_h_old, now, 86_400));
+        // Boundary: exactly the floor old is due, one second younger is not.
+        assert!(orphan_reap_due(true, now - 3_600_000, now, 3600));
+        assert!(!orphan_reap_due(true, now - 3_599_000, now, 3600));
+        // A chunk this node/disk still holds is never a candidate.
+        assert_eq!(orphan_reap_candidate(&view, "live", Some(0)), None);
+        // Referenced, but no row names this node: de-located.
+        let other = NodeReapView::from_files(&files(vec![row(0, "live", "2", 0)]), 1);
+        assert_eq!(orphan_reap_candidate(&other, "live", Some(0)), Some("delocated"));
     }
 }

@@ -234,6 +234,81 @@ pub(super) async fn trigger_scrub(
     })))
 }
 
+#[derive(Deserialize)]
+pub(super) struct OrphanReapRequest {
+    #[serde(default)]
+    pub(super) grace_secs: Option<u64>,
+    #[serde(default)]
+    pub(super) dry_run: bool,
+}
+
+/// Grace for a manual orphan reap: the request's, else the configured one;
+/// below `MANUAL_ORPHAN_GRACE_FLOOR_SECS` is refused.
+pub(super) fn manual_orphan_grace(requested: Option<u64>, configured: u64) -> Result<u64, String> {
+    let floor = crate::scheduler::MANUAL_ORPHAN_GRACE_FLOOR_SECS;
+    match requested {
+        Some(g) if g < floor => Err(format!(
+            "grace_secs {g} is below the manual floor of {floor} s (a younger chunk may belong to a write that has not committed yet)"
+        )),
+        Some(g) => Ok(g),
+        None => Ok(configured),
+    }
+}
+
+/// `POST /api/v1/scrub/orphans` — run the orphan reaper once, now, with a
+/// one-time grace (leader only, one reap at a time, in the background).
+pub(super) async fn trigger_orphan_reap(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<OrphanReapRequest>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let grace_secs = manual_orphan_grace(body.grace_secs, state.config.scrub.orphan_grace_secs)
+        .map_err(|m| {
+            warn!(grace_secs = ?body.grace_secs, "manual orphan reap refused: grace below floor");
+            err_body(StatusCode::BAD_REQUEST, m)
+        })?;
+    let dry_run = body.dry_run;
+    let Some(guard) = state.scheduler.try_begin_orphan_run() else {
+        warn!("manual orphan reap refused: a reap is already running");
+        return Err(err_body(StatusCode::CONFLICT, "an orphan reap is already running"));
+    };
+    // REV-1-1 — the reap issues direct data-node deletes: leader only.
+    check_is_leader(&state)?;
+
+    let params = format!("grace_secs={grace_secs} dry_run={dry_run}");
+    state.audit_log.log("api", "scrub.orphans", &params, "accepted");
+    info!(grace_secs, dry_run, "manual orphan reap started via API");
+    let st = state.clone();
+    tokio::spawn(async move {
+        let rec = st.scheduler.run_orphan_reap(guard, "manual", grace_secs, dry_run).await;
+        let result = match &rec.error {
+            Some(e) => format!("error: {e}"),
+            None => format!("candidates={} reaped={}", rec.candidates, rec.reaped),
+        };
+        st.audit_log.log("api", "scrub.orphans", &params, &result);
+    });
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "accepted",
+            "trigger": "manual",
+            "grace_secs": grace_secs,
+            "dry_run": dry_run,
+        })),
+    ))
+}
+
+/// `GET /api/v1/scrub/orphans` — the last (or running) orphan reap on this
+/// manager. The record is process-local: query the leader.
+pub(super) async fn get_orphan_reap(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({
+        "running": state.scheduler.orphan_run_active(),
+        "is_leader": state.scheduler.is_leader(),
+        "configured_grace_secs": state.config.scrub.orphan_grace_secs,
+        "manual_grace_floor_secs": crate::scheduler::MANUAL_ORPHAN_GRACE_FLOOR_SECS,
+        "last_run": state.scheduler.last_orphan_run(),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Manual data migration — POST /api/v1/migrations, GET /api/v1/migrations
 //

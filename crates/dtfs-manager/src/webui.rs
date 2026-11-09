@@ -633,6 +633,35 @@ mod uip_2_webui_ops_tests {
             "CLI-punting scrub placeholder must be gone"
         );
     }
+
+    /// "Reap now": grace input (min 3600), dry-run checkbox, confirmation,
+    /// POST through mutateFetch, last-run view from the GET.
+    #[test]
+    fn orphan_reap_now_control_wired_through_mutate_fetch() {
+        let html = render_dashboard("test-cluster", "mgr-test");
+        for needle in [
+            "id=\"orphan-grace\" type=\"number\" min=\"3600\"",
+            "id=\"orphan-dry-run\" type=\"checkbox\" checked",
+            "onclick=\"runOrphanReap()\"",
+            "id=\"orphan-reap-content\"",
+            "fetch('/api/v1/scrub/orphans')",
+        ] {
+            assert!(html.contains(needle), "reap-now control missing: {needle}");
+        }
+        let fn_body = html
+            .split("async function runOrphanReap()")
+            .nth(1)
+            .expect("runOrphanReap must be defined")
+            .split("finally")
+            .next()
+            .unwrap();
+        assert!(fn_body.contains("confirm("), "real reaps need a confirmation");
+        assert!(fn_body.contains("grace < 3600"), "client-side floor check");
+        assert!(
+            fn_body.contains("mutateFetch('/api/v1/scrub/orphans'"),
+            "runOrphanReap must POST through mutateFetch"
+        );
+    }
 }
 
 #[cfg(test)]

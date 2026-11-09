@@ -470,3 +470,90 @@ async fn integrity_faults_found_beyond_the_newest_window() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["action"], "scrub.deep.corrupt");
 }
+
+// ---- Manual orphan reap: POST/GET /api/v1/scrub/orphans ----------------------
+
+fn reap(grace_secs: Option<u64>, dry_run: bool) -> Json<OrphanReapRequest> {
+    Json(OrphanReapRequest { grace_secs, dry_run })
+}
+
+#[test]
+fn manual_orphan_grace_defaults_to_config_and_enforces_the_floor() {
+    assert_eq!(manual_orphan_grace(None, 86_400), Ok(86_400));
+    assert_eq!(manual_orphan_grace(Some(3600), 86_400), Ok(3600));
+    let e = manual_orphan_grace(Some(3599), 86_400).unwrap_err();
+    assert!(e.contains("below the manual floor of 3600"), "{e}");
+}
+
+#[tokio::test]
+async fn orphan_reap_grace_below_floor_is_400() {
+    let h = harness().await;
+    let e = trigger_orphan_reap(State(h.state.clone()), reap(Some(3599), true)).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::BAD_REQUEST);
+    assert!(e.1.0["error"].as_str().unwrap().contains("below the manual floor"));
+}
+
+#[tokio::test]
+async fn orphan_reap_on_a_follower_is_409_not_leader() {
+    let h = harness().await; // never leader
+    let e = trigger_orphan_reap(State(h.state.clone()), reap(None, true)).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert!(e.1.0["error"].as_str().unwrap().contains("not the leader"), "{:?}", e.1.0);
+    // Refused before running: nothing recorded, nothing audited as accepted.
+    assert!(h.state.scheduler.last_orphan_run().is_none());
+    assert!(!h.state.scheduler.orphan_run_active());
+}
+
+#[tokio::test]
+async fn orphan_reap_is_single_flight_between_timer_and_manual() {
+    let h = harness().await;
+    // A running reap (timer or manual) holds the token ...
+    let running = h.state.scheduler.try_begin_orphan_run().expect("first token");
+    // ... so the timer's next tick skips ...
+    assert!(h.state.scheduler.try_begin_orphan_run().is_none());
+    // ... and a manual request is 409.
+    let e = trigger_orphan_reap(State(h.state.clone()), reap(Some(3600), false)).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert_eq!(e.1.0["error"], "an orphan reap is already running");
+    let status = get_orphan_reap(State(h.state.clone())).await.0;
+    assert_eq!(status["running"], true);
+    drop(running);
+    assert!(h.state.scheduler.try_begin_orphan_run().is_some());
+}
+
+#[tokio::test]
+async fn orphan_reap_status_reports_config_and_floor() {
+    let h = harness().await;
+    let v = get_orphan_reap(State(h.state.clone())).await.0;
+    assert_eq!(v["running"], false);
+    assert_eq!(v["manual_grace_floor_secs"], 3600);
+    assert_eq!(v["configured_grace_secs"], h.state.config.scrub.orphan_grace_secs);
+    assert!(v["last_run"].is_null());
+}
+
+#[tokio::test]
+async fn orphan_reap_without_the_shared_secret_is_401() {
+    use tower::ServiceExt;
+    let h = harness().await;
+    let mut config = h.state.config.clone();
+    config.cluster.shared_secret = "s3cret".into();
+    let state = Arc::new(AppState {
+        config,
+        raft: h.state.raft.clone(),
+        sm_data: h.state.sm_data.clone(),
+        audit_log: h.state.audit_log.clone(),
+        join: h.state.join.clone(),
+        scheduler: h.state.scheduler.clone(),
+        io_rate: h.state.io_rate.clone(),
+        memory: None,
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/v1/scrub/orphans")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(r#"{"dry_run":true}"#))
+        .unwrap();
+    let resp = build_router(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(h.state.scheduler.last_orphan_run().is_none());
+}

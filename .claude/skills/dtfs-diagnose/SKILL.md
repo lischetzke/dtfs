@@ -13,7 +13,8 @@ runbooks: `docs/src/operations/troubleshooting.md`, `docs/src/operations/failure
 ## Rules
 
 - Read tools are free to use. Every `op_*` tool changes the cluster (`op_scrub`,
-  `op_maintenance`, `op_unquarantine`, `op_flush_cache`, `op_migrate`, `op_decommission`):
+  `op_maintenance`, `op_unquarantine`, `op_flush_cache`, `op_migrate`, `op_decommission`,
+  `op_remove_dead`, `op_reap_orphans`):
   describe the exact action and why, get the user's explicit yes in chat, only then call with
   `confirm=true`. The default call is a dry run (it also previews matching files / node state);
   show it to the user first.

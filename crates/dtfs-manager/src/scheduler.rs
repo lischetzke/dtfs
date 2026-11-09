@@ -194,6 +194,11 @@ pub struct TaskScheduler {
     /// (one namespace pass per round instead of one per task). Only set
     /// between `begin_round` and `end_round`, under `migration_state_lock`.
     round_index: parking_lot::Mutex<Option<ChunkIndex>>,
+    /// Single-flight for orphan reaps: the timer and a manual
+    /// `POST /api/v1/scrub/orphans` never run at the same time.
+    orphan_run: Arc<tokio::sync::Mutex<()>>,
+    /// Last (or running) orphan reap, for `GET /api/v1/scrub/orphans`.
+    orphan_last_run: parking_lot::Mutex<Option<OrphanRunRecord>>,
 }
 
 impl TaskScheduler {
@@ -238,6 +243,8 @@ impl TaskScheduler {
             shared_secret: parking_lot::RwLock::new(String::new()),
             placement_cfg,
             round_index: parking_lot::Mutex::new(None),
+            orphan_run: Arc::new(tokio::sync::Mutex::new(())),
+            orphan_last_run: parking_lot::Mutex::new(None),
         }
     }
 

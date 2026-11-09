@@ -444,7 +444,7 @@ def test_tool_registry():
                      "files_list", "file_lookup", "chunk_detail", "volume_detail", "node_detail",
                      "migrations_status", "integrity_faults", "memory_status", "raft_replication",
                      "config_diff", "host_disk_ids", "host_quarantine", "op_flush_cache",
-                     "op_migrate", "op_decommission", "op_remove_dead"}
+                     "op_migrate", "op_decommission", "op_remove_dead", "op_reap_orphans"}
 
 
 # ---- extended read tools ---------------------------------------------------
@@ -605,6 +605,34 @@ def test_op_remove_dead_dry_run_plans_via_server_and_confirm_executes(monkeypatc
                lambda: m.op_remove_dead_impl(cl, "1", "ops1", "", "yes", True)):
         with pytest.raises(m.ValidationError):
             fn()
+
+
+def test_op_reap_orphans_dry_run_by_default_and_confirm_reaps(monkeypatch):
+    calls = []
+    status = {"running": False, "last_run": {"dry_run": True, "candidates": 3, "reaped": 0}}
+    routes = {"/api/v1/scrub/orphans": status}
+    monkeypatch.setattr(m, "rest_call", fake_rest(routes, calls))
+    monkeypatch.setattr(m, "find_leader", lambda cl: "mgr01:9402")
+    cl = cluster()
+    r = m.op_reap_orphans_impl(cl, None, False, poll_secs=0)
+    assert r["dry_run"] and r["report"]["candidates"] == 3
+    posts = [c for c in calls if c[3] == "POST"]
+    assert len(posts) == 1 and posts[0][4] == {"dry_run": True}
+    r = m.op_reap_orphans_impl(cl, 7200, "yes", poll_secs=0)  # truthy but not True: still a dry run
+    assert r["dry_run"]
+    r = m.op_reap_orphans_impl(cl, 7200, True)
+    assert r["executed"]
+    assert [c for c in calls if c[3] == "POST"][-1][4] == {"dry_run": False, "grace_secs": 7200}
+    for bad in (3599, -1, "7200", True, 1.5e4):
+        with pytest.raises(m.ValidationError):
+            m.op_reap_orphans_impl(cl, bad, True)
+
+
+def test_op_reap_orphans_dry_run_wait_is_bounded(monkeypatch):
+    monkeypatch.setattr(m, "rest_call", fake_rest({"/api/v1/scrub/orphans": {"running": True, "last_run": None}}))
+    monkeypatch.setattr(m, "find_leader", lambda cl: "mgr01:9402")
+    r = m.op_reap_orphans_impl(cluster(), None, False, wait_secs=0, poll_secs=0)
+    assert r["dry_run"] and "still running" in r["note"]
 
 
 def test_new_ops_confirm_posts(monkeypatch):

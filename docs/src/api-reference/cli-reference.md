@@ -25,7 +25,7 @@ Mutations must go to the leader (or the call returns `409`/`503`; see [REST API]
 | `1` | Any failure: connection error, non-success HTTP status, validation failure, a partially failed operation (see `files flush-cache`), `health` with a non-healthy status, update verification failure. |
 | `2` | Usage error (unknown flag, missing argument). |
 
-Error reporting differs by command. Read commands (`status`, `stats`, `nodes`, `files list`, `files inspect`, `audit`, `integrity faults`, `volumes list`, `volumes show`, `config`, `config effective`, `raft members`, `health`) and the mutations `volumes create`, `volumes migrate-policy`, `volumes set-cache`, `volumes set-mandatory`, `volumes set-write-safety`, `scrub` and `maintenance` report only the HTTP status line on failure. `volumes set-anchor`, `volumes set-spill`, `files flush-cache` and `migrations create` print `HTTP <status>: <server error>` (for example `anchor.required_tier = Cold but mandatory_replicas.cold = 0`). `unquarantine`, `decommission`, `config set` and `raft add-learner|promote|remove` print the full JSON error body. To see the body of the first group, repeat the call with `curl`.
+Error reporting differs by command. Read commands (`status`, `stats`, `nodes`, `files list`, `files inspect`, `audit`, `integrity faults`, `volumes list`, `volumes show`, `config`, `config effective`, `raft members`, `health`) and the mutations `volumes create`, `volumes migrate-policy`, `volumes set-cache`, `volumes set-mandatory`, `volumes set-write-safety`, `scrub` and `maintenance` report only the HTTP status line on failure. `volumes set-anchor`, `volumes set-spill`, `files flush-cache`, `scrub orphans` and `migrations create` print `HTTP <status>: <server error>` (for example `anchor.required_tier = Cold but mandatory_replicas.cold = 0`). `unquarantine`, `decommission`, `config set` and `raft add-learner|promote|remove` print the full JSON error body. To see the body of the first group, repeat the call with `curl`.
 
 ## Cluster
 
@@ -40,6 +40,8 @@ Error reporting differs by command. Read commands (`status`, `stats`, `nodes`, `
 | `decommission <node-id> --operator-id <label> --reason <text>` | Remove a drained or dead node from the registry. `409` while it still holds replicas. |
 | `nodes remove-dead <node-id> [--operator-id <label>] [--reason <text>] [--accept-data-loss] [--dry-run]` | Remove a permanently dead (Down/Failed) node: drop its rows that have another live replica, report `anchor_pending` and data-loss candidates, deregister when no rows remain. `--accept-data-loss` also drops rows with no live replica. Prints the server JSON; exits `1` on failure. |
 | `scrub [--level quick\|deep]` | Trigger a cluster-wide scrub (default `deep`). The `--disk`, `--file` and `--chunk` options exist but the server rejects per-target scrubs with `400`; omit them. |
+| `scrub orphans [--grace-secs N] [--dry-run] [--wait]` | `POST /api/v1/scrub/orphans`: run the orphan reaper once now on the leader. `--grace-secs` defaults to the configured `scrub.orphan_grace_secs`, minimum 3600. `--wait` polls until the run ends, prints the result and exits `1` when the run reports an error. `409` while another reap runs. |
+| `scrub orphans-status` | `GET /api/v1/scrub/orphans`: last (or running) reap on this manager with per-node counts. |
 | `audit [--limit N] [--action <prefix>]` | Audit log, default limit 20. |
 | `integrity faults [--limit N] [--action <prefix>]` | Integrity-fault feed, default limit 20. |
 

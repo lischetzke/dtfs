@@ -1505,6 +1505,7 @@
         // ── Scrub results (one card per node + level)
         window._nodeNames = Object.fromEntries((nR.v || []).map(n => [String(n.node_id), n.hostname]));
         renderScrub(stats.scrub_results_by_node || []);
+        loadOrphanReap();
 
         // ── Nodes table
         renderNodes(nR.v, nR.e);
@@ -1753,6 +1754,79 @@
             result.textContent = 'Network error: ' + e;
         } finally {
             btn.disabled = false; btn.textContent = 'Scrub all';
+        }
+    }
+
+    // Orphan reaper status: GET /api/v1/scrub/orphans (process-local, so
+    // only the leader shows a run). Fills the grace input once with the
+    // configured default.
+    async function loadOrphanReap() {
+        const el = document.getElementById('orphan-reap-content');
+        let v;
+        try {
+            const resp = await fetch('/api/v1/scrub/orphans');
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            v = await resp.json();
+        } catch (e) {
+            el.innerHTML = loadErrBlock('orphan reaper status', e);
+            return;
+        }
+        const g = document.getElementById('orphan-grace');
+        if (!g.value) g.value = v.configured_grace_secs;
+        g.min = v.manual_grace_floor_secs;
+        const r = v.last_run;
+        if (!r) {
+            el.innerHTML = '<div class="scrub-placeholder">No orphan reap recorded on this manager'
+                + (v.is_leader ? '' : ' (this manager is not the leader)') + '.</div>';
+            return;
+        }
+        const state = r.finished_ms ? (r.error ? 'Failed' : 'Finished') : 'Running';
+        const nodes = Object.entries(r.nodes || {}).map(([id, n]) =>
+            '<tr><td>' + esc((window._nodeNames || {})[id] || id) + '</td><td>' + esc(n.listed)
+            + '</td><td>' + esc(n.candidates) + '</td><td>' + esc(n.reaped) + '</td><td>'
+            + esc(n.delete_failed) + '</td><td>' + esc(n.bytes_freed == null ? 'n/a' : fmtBytes(n.bytes_freed))
+            + '</td><td>' + esc(n.error || '') + '</td></tr>').join('');
+        el.innerHTML = '<div class="scrub-meta">'
+            + '<div class="scrub-meta-item"><span>State:</span> ' + esc(state) + '</div>'
+            + '<div class="scrub-meta-item"><span>Trigger:</span> ' + esc(r.trigger) + '</div>'
+            + '<div class="scrub-meta-item"><span>Grace:</span> ' + esc(r.grace_secs) + ' s</div>'
+            + '<div class="scrub-meta-item"><span>Dry run:</span> ' + esc(r.dry_run ? 'yes' : 'no') + '</div>'
+            + '<div class="scrub-meta-item"><span>Started:</span> ' + timeTag(r.started_ms) + '</div>'
+            + '<div class="scrub-meta-item"><span>Finished:</span> ' + timeTag(r.finished_ms) + '</div>'
+            + '<div class="scrub-meta-item"><span>Candidates:</span> ' + esc(r.candidates) + '</div>'
+            + '<div class="scrub-meta-item"><span>Reaped:</span> ' + esc(r.reaped) + '</div>'
+            + '<div class="scrub-meta-item"><span>Freed:</span> ' + esc(r.bytes_freed == null ? 'n/a' : fmtBytes(r.bytes_freed)) + '</div>'
+            + (r.error ? '<div class="scrub-meta-item" style="color:var(--danger)"><span>Error:</span> ' + esc(r.error) + '</div>' : '')
+            + '</div>'
+            + (nodes ? '<table style="width:100%;font-size:.78rem"><thead><tr><th>Node</th><th>Listed</th><th>Candidates</th>'
+                + '<th>Reaped</th><th>Failed</th><th>Freed</th><th>Error</th></tr></thead><tbody>'
+                + nodes + '</tbody></table>' : '');
+    }
+
+    async function runOrphanReap() {
+        const grace = parseInt(document.getElementById('orphan-grace').value, 10);
+        const dryRun = document.getElementById('orphan-dry-run').checked;
+        const result = document.getElementById('orphan-reap-result');
+        result.style.display = 'block';
+        if (!Number.isInteger(grace) || grace < 3600) {
+            result.textContent = 'Grace must be at least 3600 seconds.';
+            return;
+        }
+        const what = dryRun ? 'Dry-run the orphan reaper' : 'DELETE unreferenced chunk files';
+        if (!confirm(what + ' older than ' + grace + ' s on every data node?')) return;
+        const btn = document.getElementById('orphan-reap-btn');
+        btn.disabled = true;
+        try {
+            const r = await mutateFetch('/api/v1/scrub/orphans',
+                { body: JSON.stringify({ grace_secs: grace, dry_run: dryRun }) });
+            result.textContent = r.resp.ok
+                ? 'Orphan reap started (grace ' + grace + ' s' + (dryRun ? ', dry run' : '') + ').'
+                : errMsg(r);
+        } catch (e) {
+            result.textContent = 'Network error: ' + e;
+        } finally {
+            btn.disabled = false;
+            loadOrphanReap();
         }
     }
 
@@ -2143,6 +2217,22 @@
             </div>
             <div id="scrub-all-result" style="display:none;margin:.5rem 0;font-size:.8rem" role="status" aria-live="polite"></div>
             <div id="scrub-content"><div class="scrub-placeholder">No scrub result recorded yet.</div></div>
+        </div>
+        <div class="scrub-card">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem">
+                <h3 style="margin:0">Orphan reaper</h3>
+                <div style="display:flex;align-items:center;gap:.4rem">
+                    <label for="orphan-grace" style="font-size:.8rem">Grace (s)</label>
+                    <input id="orphan-grace" type="number" min="3600" step="60" class="form-input" style="width:8rem">
+                    <label style="font-size:.8rem"><input id="orphan-dry-run" type="checkbox" checked> Dry run</label>
+                    <button class="btn-primary" onclick="runOrphanReap()" id="orphan-reap-btn">Reap now</button>
+                </div>
+            </div>
+            <div style="font-size:.72rem;color:var(--text-muted);margin:.25rem 0">
+                Deletes chunk files no file references (or no replica row names) and whose file is older than the grace. Runs on the leader, one at a time.
+            </div>
+            <div id="orphan-reap-result" style="display:none;margin:.5rem 0;font-size:.8rem" role="status" aria-live="polite"></div>
+            <div id="orphan-reap-content"><div class="scrub-placeholder">No orphan reap recorded on this manager.</div></div>
         </div>
         <div class="table-card">
             <div class="table-card-header">

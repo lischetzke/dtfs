@@ -168,6 +168,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/config", get(get_config).post(update_config))
         // Scrub
         .route("/api/v1/scrub", post(trigger_scrub))
+        // One-shot orphan reap with a one-time grace (leader only).
+        .route("/api/v1/scrub/orphans", get(get_orphan_reap).post(trigger_orphan_reap))
         // Manual data migration (operator-triggered tier/DC moves of a path
         // prefix). GET lists pending+recent tasks; POST enqueues new ones.
         .route(
