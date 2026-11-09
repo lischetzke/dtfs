@@ -520,6 +520,18 @@ impl ChunkStore {
             .await
             .map_err(DtfsError::Io)?;
 
+        // Stamp mtime = commit time (rename keeps the tmp's last-write
+        // mtime) so the manager's `if_mtime_le_ms` delete guard always sees
+        // a copy committed after the guard as re-uploaded. Synced so a
+        // crash cannot revert it. Under the chunk stripe lock.
+        let stamped = std::fs::File::open(&final_dat_path)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()).and_then(|_| f.sync_all()));
+        if let Err(e) = stamped {
+            tracing::warn!(chunk_id = %chunk_id, error = %e, "dat mtime stamp failed after rename");
+            cleanup_after_failed_commit(dat_existed, &final_dat_path, &final_meta_path, &wal_path).await;
+            return Err(DtfsError::Io(e));
+        }
+
         // Bug L — fsync the parent directory after the rename so the
         // directory-entry pointing at the renamed inode survives a crash.
         // On XFS / ext4 a rename's directory update can be lost even
@@ -1130,10 +1142,10 @@ impl ChunkStore {
                                                 // delete the manager still wants
                                                 // gone is re-issued by GC, but a
                                                 // re-uploaded live chunk must not
-                                                // be destroyed on boot. (rename
-                                                // does not bump mtime, so the
-                                                // mtime is the chunk's write
-                                                // time, not its delete time.)
+                                                // be destroyed on boot. (commit
+                                                // stamps the .dat mtime, so it
+                                                // is the chunk's commit time,
+                                                // not its delete time.)
                                                 let newer = dat_mtime_ms(&dat).await
                                                     .map_or(false, |m| m > wal_entry.timestamp_ms);
                                                 let live_complete =
@@ -3771,6 +3783,35 @@ mod tests {
         assert!(final_meta_path.exists(), "existing .meta must survive");
         let wal_path = wal_dir(tmp.path()).join(format!("{}.put.wal.json", chunk_id.as_hex()));
         assert!(!wal_path.exists(), "WAL entry cleared");
+    }
+
+    /// A commit stamps the `.dat` mtime to the commit time, not the tmp's
+    /// last write: the manager's `if_mtime_le_ms` delete guard must see a
+    /// re-put whose stream finished before the guard but committed after.
+    #[tokio::test]
+    async fn commit_bumps_dat_mtime_to_commit_time() {
+        let (store, tmp) = make_test_store().await;
+        let data = b"re-put-mtime-payload";
+        let hash = checksum::compute(data);
+        let chunk_id = ChunkId::from_bytes(hash);
+        let volume_id = VolumeId::new("default".to_string());
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+
+        for _ in 0..2 {
+            // tmp written "an hour ago" (stream finished long before commit)
+            let tmp_path = tmp.path().join("tmp").join(format!("{}.dat.tmp", uuid::Uuid::new_v4()));
+            std::fs::write(&tmp_path, data).unwrap();
+            std::fs::File::options().write(true).open(&tmp_path).unwrap().set_modified(old).unwrap();
+
+            let before = now_millis();
+            store
+                .commit_chunk_from_tmp(&chunk_id, &tmp_path, &volume_id, DiskTier::Hot, data.len() as u64, hash)
+                .await
+                .unwrap();
+            let dat = chunk_data_path(tmp.path(), &chunk_id);
+            let mtime = dat_mtime_ms(&dat).await.unwrap();
+            assert!(mtime >= before, "dat mtime {mtime} must be >= commit start {before}");
+        }
     }
 
     /// Audit #2 — a good `.dat` whose `.meta` is missing (awaiting scrub
