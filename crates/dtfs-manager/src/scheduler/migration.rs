@@ -250,30 +250,33 @@ impl TaskScheduler {
             .map(DataServiceClient::new)
             .map_err(|e| anyhow::anyhow!("connect to data node {}: {}", node_addr, e))?;
 
-        let mut req = tonic::Request::new(dtfs_proto::dtfs::data::DeleteChunkRequest {
-            chunk_id: chunk_id.to_string(),
-            disk_id,
-            tier: tier.to_string(),
-            if_mtime_le_ms,
-        });
-        {
+        let secret = self.shared_secret.read().clone();
+        let resp = send_delete_with_legacy_fallback(|legacy| {
             use dtfs_common::crypto::{
                 data_rpc_delete_binding, stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
             };
-            let secret = self.shared_secret.read().clone();
-            let binding = data_rpc_delete_binding(chunk_id, disk_id, if_mtime_le_ms);
+            let mut req = tonic::Request::new(dtfs_proto::dtfs::data::DeleteChunkRequest {
+                chunk_id: chunk_id.to_string(),
+                disk_id,
+                tier: tier.to_string(),
+                if_mtime_le_ms,
+            });
+            let binding = if legacy {
+                chunk_id.to_string()
+            } else {
+                data_rpc_delete_binding(chunk_id, disk_id, if_mtime_le_ms)
+            };
             if let Some((ts, mac)) = stamp_data_rpc_auth(&secret, "DeleteChunk", &binding) {
                 if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
                     req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
                     req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
                 }
             }
-        }
-        let resp = client
-            .delete_chunk(req)
-            .await
-            .map_err(|e| anyhow::anyhow!("DeleteChunkReplica RPC: {}", e))?
-            .into_inner();
+            let mut client = client.clone();
+            async move { client.delete_chunk(req).await.map(|r| r.into_inner()) }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("DeleteChunkReplica RPC: {}", e))?;
 
         if !resp.success {
             // The handler treats absent chunks as was_present=false
@@ -2204,6 +2207,79 @@ mod sched_audit_tests {
         let task = &state.tasks["repl-0"];
         assert_eq!(task.status, MigrationStatus::Failed);
         assert_eq!(task.attempts, MAX_MIGRATION_ATTEMPTS);
+    }
+}
+
+/// Rolling update (MGR-1): a data node from before 75f69a3 verifies a
+/// chunk_id-only DeleteChunk MAC and answers PermissionDenied to the bound
+/// stamp. `send(legacy)` issues the RPC; on PermissionDenied it is retried
+/// ONCE with the legacy stamp (new nodes accept it only while
+/// `cluster.require_delete_binding=false`). Any other error, or a second
+/// PermissionDenied, is returned.
+pub(crate) async fn send_delete_with_legacy_fallback<T, F, Fut>(
+    mut send: F,
+) -> Result<T, tonic::Status>
+where
+    F: FnMut(bool) -> Fut,
+    Fut: std::future::Future<Output = Result<T, tonic::Status>>,
+{
+    match send(false).await {
+        Err(e) if e.code() == tonic::Code::PermissionDenied => {
+            debug!(error = %e.message(), "DeleteChunk: bound stamp refused, retrying with legacy chunk_id-only stamp");
+            send(true).await
+        }
+        r => r,
+    }
+}
+
+#[cfg(test)]
+mod delete_legacy_fallback_tests {
+    use super::*;
+
+    async fn run(replies: Vec<Result<u32, tonic::Status>>) -> (Result<u32, tonic::Status>, Vec<bool>) {
+        let replies = std::sync::Mutex::new(replies.into_iter());
+        let calls = std::sync::Mutex::new(Vec::new());
+        let r = send_delete_with_legacy_fallback(|legacy| {
+            calls.lock().unwrap().push(legacy);
+            let next = replies.lock().unwrap().next().expect("unexpected extra call");
+            async move { next }
+        })
+        .await;
+        (r, calls.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn permission_denied_retries_once_with_legacy_stamp() {
+        let (r, calls) = run(vec![Err(tonic::Status::permission_denied("bad mac")), Ok(7)]).await;
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(calls, vec![false, true]);
+    }
+
+    #[tokio::test]
+    async fn other_errors_are_not_retried() {
+        let (r, calls) = run(vec![Err(tonic::Status::unavailable("down"))]).await;
+        assert_eq!(r.unwrap_err().code(), tonic::Code::Unavailable);
+        assert_eq!(calls, vec![false]);
+    }
+
+    #[tokio::test]
+    async fn second_permission_denied_is_returned() {
+        let (r, calls) = run(vec![
+            Err(tonic::Status::permission_denied("bad mac")),
+            Err(tonic::Status::permission_denied("legacy refused")),
+        ])
+        .await;
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), tonic::Code::PermissionDenied);
+        assert_eq!(e.message(), "legacy refused");
+        assert_eq!(calls, vec![false, true]);
+    }
+
+    #[tokio::test]
+    async fn success_needs_no_retry() {
+        let (r, calls) = run(vec![Ok(1)]).await;
+        assert_eq!(r.unwrap(), 1);
+        assert_eq!(calls, vec![false]);
     }
 }
 
