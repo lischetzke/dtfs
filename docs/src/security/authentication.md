@@ -115,8 +115,10 @@ authenticated gRPC metadata on mutating **and** read RPCs:
 | `x-dtfs-rpc-mac` | Hex HMAC-SHA256 over `dtfs-data-rpc\nv1\n{method}\n{ts}\n{binding}\n` |
 
 - `method` is `PutChunk`, `DeleteChunk`, `ReplicateChunk`, `GetChunk`,
-  `ListChunks`, or `VerifyChunk`.
-- `binding` is empty for PutChunk / ListChunks; `chunk_id` for
+  `ListChunks`, `VerifyChunk`, `RecordCacheHit`, `GetDiskStatus` or
+  `ReportStats`.
+- `binding` is empty for PutChunk / ListChunks / GetDiskStatus /
+  ReportStats; `chunk_id` for
   GetChunk / VerifyChunk; `chunk_id|target_address` for
   ReplicateChunk (LIS-55 — pins outbound SSRF target);
   `chunk_id|disk_id|if_mtime_le_ms` for DeleteChunk (an unset field is the

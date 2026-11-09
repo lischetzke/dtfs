@@ -143,7 +143,9 @@ curl http://<manager>:9402/api/v1/nodes/<node-id>    # JSON, includes a disks ar
 ```
 
 The `DataService.GetDiskStatus` RPC returns disk information directly from a data
-node, bypassing the manager, which helps when the manager is unreachable.
+node, bypassing the manager, which helps when the manager is unreachable. With
+`cluster.shared_secret` set it requires the `x-dtfs-rpc-*` stamp (method
+`GetDiskStatus`, empty binding, see [Authentication](../security/authentication.md)).
 
 ## Integrity and Scrubbing
 

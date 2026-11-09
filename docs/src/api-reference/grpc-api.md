@@ -33,11 +33,10 @@ There are two planes so a stamp for one cannot be replayed on the other: `dtfs-d
 
 | Service | RPC | Binding |
 |---|---|---|
-| DataService | `PutChunk`, `ListChunks` | empty |
+| DataService | `PutChunk`, `ListChunks`, `GetDiskStatus`, `ReportStats` | empty |
 | DataService | `GetChunk`, `VerifyChunk`, `RecordCacheHit` | `chunk_id` |
 | DataService | `DeleteChunk` | `chunk_id\|disk_id\|if_mtime_le_ms` (unset = empty); legacy `chunk_id` accepted while `require_delete_binding = false` |
 | DataService | `ReplicateChunk` | `chunk_id`, a literal `\|`, then `target_address` |
-| DataService | `GetDiskStatus`, `ReportStats` | not authenticated |
 | ManagerService | `CreateFile`, `DeleteFile`, `AllocateChunks`, `CommitChunkLocations`, `SetFileSize`, `CreateSymlink`, `AcquireLock`, `ReleaseLock`, `AcquireWriteLease`, `RenewWriteLease`, `ReleaseWriteLease` | `path` |
 | ManagerService | `RenameFile` | `from\nto` |
 | ManagerService | `CreateLink` | `source\ndest` |

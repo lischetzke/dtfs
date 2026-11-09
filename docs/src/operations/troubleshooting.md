@@ -390,7 +390,8 @@ Caching is on the client: the read-ahead cache (`[readahead] cache_mb`) and the 
 ### Network Diagnostics
 
 ```bash
-# Test gRPC connectivity to a data node
+# Test gRPC connectivity to a data node (with shared_secret set, an
+# unstamped call answers PermissionDenied, which still proves reachability)
 grpcurl -plaintext <data-node>:9500 dtfs.data.DataService/GetDiskStatus
 
 # Measure latency between FUSE client and data nodes

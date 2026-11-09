@@ -833,7 +833,7 @@ impl DataService for DataServiceImpl {
             .map_err(|e| Status::invalid_argument(format!("Invalid chunk ID: {}", e)))?;
 
         // CO-1-5 (§ A.6 #6) — VerifyChunk must BLAKE3 the on-disk bytes
-        // against the stored ChunkMeta.checksum, not merely confirm the
+        // against the chunk id, not merely confirm the
         // .dat is readable. Migration marks a copy Done on this, so a
         // false `valid:true` lets bit-rot propagate and tier-demote drop
         // the only good source. Missing meta = unverifiable = invalid.
@@ -871,7 +871,9 @@ impl DataService for DataServiceImpl {
         // Stream-hash the on-disk file (one ~8 MB piece in RAM, never the
         // whole chunk — Bug-I parity).
         match hash_file_incrementally(&dat_path, meta.size).await {
-            Ok(digest) if digest == meta.checksum => Ok(Response::new(VerifyChunkResponse {
+            // Only an id (content address) mismatch is corruption; a stale
+            // `.meta` checksum is scrub's to repair (§ A.3.3 (6)).
+            Ok(digest) if digest == chunk_id.0 => Ok(Response::new(VerifyChunkResponse {
                 valid: true,
                 error: String::new(),
             })),
@@ -888,8 +890,9 @@ impl DataService for DataServiceImpl {
 
     async fn get_disk_status(
         &self,
-        _request: Request<DiskStatusRequest>,
+        request: Request<DiskStatusRequest>,
     ) -> Result<Response<DiskStatusResponse>, Status> {
+        require_data_rpc_auth(&self.config.cluster.shared_secret, "GetDiskStatus", "", request.metadata())?;
         let disks: Vec<dtfs_proto::dtfs::common::DiskInfo> = self
             .store
             .disk_manager()
@@ -959,8 +962,9 @@ impl DataService for DataServiceImpl {
 
     async fn report_stats(
         &self,
-        _request: Request<StatsRequest>,
+        request: Request<StatsRequest>,
     ) -> Result<Response<StatsResponse>, Status> {
+        require_data_rpc_auth(&self.config.cluster.shared_secret, "ReportStats", "", request.metadata())?;
         let snap = self.metrics.snapshot();
         let store_stats = self.store.stats();
         Ok(Response::new(StatsResponse {
@@ -1613,6 +1617,32 @@ max_io_percent = 10
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
+    // Audit #13 — GetDiskStatus / ReportStats leak mount paths, hostname
+    // and counts: unauthenticated calls are PermissionDenied, stamped pass.
+    #[tokio::test]
+    async fn status_rpcs_require_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let secret = svc.config.cluster.shared_secret.clone();
+
+        let err = svc.get_disk_status(Request::new(DiskStatusRequest {})).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        let err = svc.report_stats(Request::new(StatsRequest {})).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let mut req = Request::new(DiskStatusRequest {});
+        attach_data_rpc_auth(&mut req, &secret, "GetDiskStatus", "");
+        assert_eq!(svc.get_disk_status(req).await.unwrap().into_inner().disks.len(), 1);
+        let mut req = Request::new(StatsRequest {});
+        attach_data_rpc_auth(&mut req, &secret, "ReportStats", "");
+        svc.report_stats(req).await.expect("stamped ReportStats");
+        // A stamp for another method does not open the gate.
+        let mut req = Request::new(StatsRequest {});
+        attach_data_rpc_auth(&mut req, &secret, "GetDiskStatus", "");
+        let err = svc.report_stats(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
     // DATA-11 — unauthenticated RecordCacheHit must be PermissionDenied
     // (unauthenticated callers must not be able to inflate a chunk's
     // read counter / tiering promotion score).
@@ -2071,6 +2101,64 @@ max_io_percent = 10
 
         assert!(!resp.valid, "size mismatch must report invalid");
         assert_eq!(resp.error, "size mismatch");
+    }
+
+    async fn verify(svc: &DataServiceImpl, chunk_hex: &str) -> VerifyChunkResponse {
+        let mut req = Request::new(VerifyChunkRequest { chunk_id: chunk_hex.to_string(), disk_id: None });
+        attach_data_rpc_auth(&mut req, &svc.config.cluster.shared_secret, "VerifyChunk", chunk_hex);
+        svc.verify_chunk(req).await.unwrap().into_inner()
+    }
+
+    /// Rewrite the `.meta` checksum (size unchanged) to `checksum`.
+    fn set_meta_checksum(dat_path: &std::path::Path, checksum: [u8; 32]) {
+        let meta_path = dat_path.with_extension("meta");
+        let mut meta: dtfs_common::types::ChunkMeta =
+            serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        meta.checksum = checksum;
+        std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    }
+
+    // Audit #13 — VerifyChunk compares against the chunk id (content
+    // address), not `.meta`: a stale `.meta` checksum over a `.dat` that
+    // hashes to its id is valid (scrub repairs the sidecar).
+    #[tokio::test]
+    async fn verify_chunk_valid_when_dat_matches_id_despite_stale_meta() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path()).await;
+        let data = vec![3u8; 4096];
+        let chunk_id = ChunkId::from_bytes(checksum::compute(&data));
+        svc.store
+            .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+        let (dat_path, _) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        set_meta_checksum(&dat_path, [0xEE; 32]);
+
+        let resp = verify(&svc, &chunk_id.as_hex()).await;
+        assert!(resp.valid, "dat hashing to its id must verify: {}", resp.error);
+    }
+
+    // Audit #13 — corrupt bytes with a `.meta` rewritten to match them are
+    // still corruption: only the id is authoritative.
+    #[tokio::test]
+    async fn verify_chunk_invalid_when_meta_matches_corrupt_dat() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path()).await;
+        let data = vec![4u8; 4096];
+        let chunk_id = ChunkId::from_bytes(checksum::compute(&data));
+        svc.store
+            .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+        let (dat_path, _) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let mut corrupt = data.clone();
+        corrupt[0] ^= 0xFF;
+        std::fs::write(&dat_path, &corrupt).unwrap();
+        set_meta_checksum(&dat_path, checksum::compute(&corrupt));
+
+        let resp = verify(&svc, &chunk_id.as_hex()).await;
+        assert!(!resp.valid, "dat not hashing to its id must be invalid");
+        assert_eq!(resp.error, format!("checksum mismatch for chunk {}", chunk_id.as_hex()));
     }
 
     // CR-4-7 (DATA-10) — a non-ASCII chunk_id must be rejected as
