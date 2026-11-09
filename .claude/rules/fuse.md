@@ -193,7 +193,9 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 - `write.async_commit` background upload: write()'s batch (`flush()`) is
   handed to `spawn_bg_upload` and write() returns (prod: one knfsd thread
   got nothing while each batch uploaded, 9-20 MiB/s). At most ONE batch per
-  path (`bg_uploads`: chunk range + bytes); while it runs, write() does not
+  path (`bg_uploads`: the batch's exact sorted chunk index set + bytes, not a
+  lo..=hi range: interleaved NFS streams make batches like {2,19,36,53} and
+  a range made most writes wait); while it runs, write() does not
   call `flush()` (complete chunks stay buffered). Not more: overlapping
   commits of a path make the merge fall back to a full re-fetch. The task
   (`bg_upload`) renews the lease (`renew_if_due`), keeps `begin_inflight`

@@ -760,10 +760,10 @@ pub struct DtfsFilesystem {
     /// write(), a writer's truncate and release on the same path
     /// (`path_guard`); unused (empty) when async_commit is off.
     path_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
-    /// `write.async_commit` only: path -> (lowest chunk index, highest chunk
-    /// index, bytes) of the ONE batch write() uploads in the background
-    /// (`spawn_bg_upload`); present until restore/merge are done.
-    bg_uploads: DashMap<String, (u32, u32, usize)>,
+    /// `write.async_commit` only: path -> (sorted chunk indices, bytes) of
+    /// the ONE batch write() uploads in the background (`spawn_bg_upload`);
+    /// present until restore/merge are done.
+    bg_uploads: DashMap<String, (Vec<u32>, usize)>,
     /// Woken whenever a background upload ends (`wait_bg_uploads`).
     bg_done: tokio::sync::Notify,
     /// P0-1: prefix used for write-lease `owner_id` values. Format:
@@ -2007,10 +2007,10 @@ impl DtfsFilesystem {
     /// make the post-commit merge fall back to a full re-fetch (O(file) per
     /// batch); the batch itself keeps `upload_concurrency` puts busy.
     fn spawn_bg_upload(self: &Arc<Self>, fh: u64, path: String, segs: Vec<crate::writebuf::ChunkSegment>) {
-        let lo = segs.iter().map(|s| s.chunk_index).min().unwrap_or(0);
-        let hi = segs.iter().map(|s| s.chunk_index).max().unwrap_or(0);
+        let mut chunks: Vec<u32> = segs.iter().map(|s| s.chunk_index).collect();
+        chunks.sort_unstable();
         let bytes = segs.iter().map(|s| s.data.len()).sum();
-        self.bg_uploads.insert(path.clone(), (lo, hi, bytes));
+        self.bg_uploads.insert(path.clone(), (chunks, bytes));
         // Overlay registered before the spawn: the batch is visible (reads,
         // the next write's EOF) the moment write() returns.
         let inflight = self.write_buffer.begin_inflight(&path, &segs).into_id();
@@ -2065,14 +2065,14 @@ impl DtfsFilesystem {
         let cs = self.write_buffer.chunk_size() as u64;
         self.bg_uploads
             .get(path)
-            .is_some_and(|e| range_hits_upload((e.0, e.1), offset, len, cs))
+            .is_some_and(|e| range_hits_upload(&e.0, offset, len, cs))
     }
 
     /// async_commit backpressure: if buffered plus in-flight bytes of `path`
     /// would meet `DIRTY_BYTES_CAP` with `incoming` more, wait for the
     /// background upload first (the cap drain then sees the restored bytes).
     async fn bg_backpressure(&self, path: &str, incoming: usize) {
-        let inflight = self.bg_uploads.get(path).map_or(0, |e| e.2);
+        let inflight = self.bg_uploads.get(path).map_or(0, |e| e.1);
         if inflight > 0 && dirty_cap_exceeded(self.write_buffer.dirty_bytes(path) + inflight, incoming) {
             self.wait_bg_uploads(path).await;
         }
@@ -3705,20 +3705,16 @@ fn effective_read_len(file_size: u64, offset: u64, size: u32) -> u32 {
     size.min((file_size - offset).min(u32::MAX as u64) as u32)
 }
 
-/// R1 (FUSE-1 memory half) — true when a buffer already holding `dirty`
-/// bytes would meet or exceed `writebuf::DIRTY_BYTES_CAP` after `incoming`
-/// more bytes are added. Extracted as a pure predicate so the cap check in
-/// `write()`'s hole-fill loop (and the one guarding the caller's own
-/// bytes) is directly testable without a live `WriteBuffer`/network call.
-/// True iff the write `offset..offset+len` touches a chunk index in the
-/// background batch's `lo..=hi`.
-fn range_hits_upload((lo, hi): (u32, u32), offset: u64, len: usize, chunk_size: u64) -> bool {
+/// True iff the write `offset..offset+len` touches a chunk index of the
+/// background batch (`batch` sorted).
+fn range_hits_upload(batch: &[u32], offset: u64, len: usize, chunk_size: u64) -> bool {
     if len == 0 || chunk_size == 0 {
         return false;
     }
     let first = offset / chunk_size;
     let last = (offset + len as u64 - 1) / chunk_size;
-    first <= hi as u64 && last >= lo as u64
+    let i = batch.partition_point(|&c| (c as u64) < first);
+    batch.get(i).is_some_and(|&c| c as u64 <= last)
 }
 
 /// Clears a path's `bg_uploads` entry and wakes waiters when the background
@@ -3735,6 +3731,11 @@ impl Drop for BgSlot<'_> {
     }
 }
 
+/// R1 (FUSE-1 memory half) — true when a buffer already holding `dirty`
+/// bytes would meet or exceed `writebuf::DIRTY_BYTES_CAP` after `incoming`
+/// more bytes are added. Extracted as a pure predicate so the cap check in
+/// `write()`'s hole-fill loop (and the one guarding the caller's own
+/// bytes) is directly testable without a live `WriteBuffer`/network call.
 fn dirty_cap_exceeded(dirty: usize, incoming: usize) -> bool {
     dirty.saturating_add(incoming) >= crate::writebuf::DIRTY_BYTES_CAP
 }
@@ -6186,12 +6187,33 @@ mod async_commit_fs_tests {
     #[test]
     fn write_range_hits_upload_bounds() {
         let cs = 4u64 << 20;
-        let up = (2, 3);
+        let up = &[2, 3];
         assert!(!range_hits_upload(up, 0, (2 * cs) as usize, cs), "ends right below chunk 2");
         assert!(range_hits_upload(up, 0, (2 * cs) as usize + 1, cs));
         assert!(range_hits_upload(up, 4 * cs - 1, 1, cs), "last byte of chunk 3");
         assert!(!range_hits_upload(up, 4 * cs, 100, cs), "above the batch");
         assert!(!range_hits_upload(up, 2 * cs, 0, cs), "empty write");
+        // Interleaved NFS streams: the batch is a sparse set, not a range.
+        let sparse = &[2, 19, 36];
+        assert!(!range_hits_upload(sparse, 3 * cs, (16 * cs) as usize, cs), "chunks 3..=18 between");
+        assert!(range_hits_upload(sparse, 3 * cs, (16 * cs) as usize + 1, cs), "reaches chunk 19");
+        assert!(range_hits_upload(sparse, 36 * cs, 1, cs), "first byte of chunk 36");
+        assert!(!range_hits_upload(&[], 0, 100, cs), "no batch");
+    }
+
+    /// FUSE-3: a write into a chunk between two chunks of the in-flight
+    /// batch must not wait for the upload; one into a batch chunk must.
+    #[tokio::test]
+    async fn async_write_between_batch_chunks_does_not_wait() {
+        let fs = Arc::new(fs(true));
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/f", 40 * cs, cs)));
+        fs.bg_uploads.insert("/f".to_string(), (vec![2, 19], 2 * cs as usize));
+        let w = tokio::time::timeout(Duration::from_secs(2), fs.write(fh, 10 * cs + 1, &[5; 10])).await;
+        assert_eq!(w.expect("chunk 10 is not in the batch {2, 19}: must not wait").unwrap(), 10);
+        assert!(pending(fs.write(fh, 19 * cs + 1, &[5; 10])).await, "chunk 19 is in the batch");
+        assert!(pending(fs.write(fh, 19 * cs - 1, &[5; 2])).await, "straddles 18/19");
     }
 
     /// The config bound must stay at half the write lease (renewed only by
