@@ -23,7 +23,11 @@ text there.
 4. Counters (`bytes_stored`, `chunk_count`) update only after `.meta` is
    durable, and only for a genuinely new chunk.
 5. Any put error removes the tmp; an error AFTER the `.dat` rename removes
-   `.dat`, `.meta` and the WAL entry (`cleanup_after_dat_committed`).
+   `.dat`, `.meta` and the WAL entry (`cleanup_after_dat_committed`),
+   except a `.dat` that existed before the rename (only the WAL goes).
+   Put-WAL replay rebuilds a missing/torn `.meta` from a `.dat` that hashes
+   to its id and rolls back only a mismatch. Commit stamps the `.dat` mtime
+   to commit time (the `if_mtime_le_ms` delete guard reads it).
    Put and delete of the same id serialize on the 256-way striped chunk
    lock; WAL names are op-keyed (`.put.wal.json` / `.delete.wal.json`).
 
