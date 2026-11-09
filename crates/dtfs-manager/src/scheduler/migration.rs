@@ -469,17 +469,7 @@ impl TaskScheduler {
             let nodes: HashMap<u64, NodeSummary> = sm
                 .nodes
                 .iter()
-                .map(|(id, info)| {
-                    (
-                        *id,
-                        NodeSummary {
-                            grpc_addr: info.grpc_addr.clone(),
-                            datacenter: info.location.datacenter.clone(),
-                            healthy: info.health == HealthStatus::Healthy,
-                            tiers: info.disks.iter().map(|d| d.tier).collect(),
-                        },
-                    )
-                })
+                .map(|(id, info)| (*id, node_summary(info)))
                 .collect();
             (files, nodes)
         };
@@ -1561,27 +1551,26 @@ pub(crate) fn plan_path_migration(
             };
 
             // Already satisfied?
-            let satisfied = replicas.iter().any(|r| {
-                let nid: u64 = r.node_id.parse().unwrap_or(0);
-                nodes
-                    .get(&nid)
-                    .map(|n| {
-                        n.tiers.contains(&target_tier)
-                            && target_dc
-                                .map(|dc| n.datacenter == dc)
-                                .unwrap_or(true)
-                    })
-                    .unwrap_or(false)
-            });
+            // A replica counts only on a live disk of the target tier.
+            let on_target_tier = |r: &&&ChunkLocationEntry| -> Option<(u64, &NodeSummary)> {
+                let nid: u64 = r.node_id.parse().ok()?;
+                let n = nodes.get(&nid)?;
+                (n.disk_tier(r.disk_id) == Some(target_tier)).then_some((nid, n))
+            };
+            let satisfied = replicas
+                .iter()
+                .filter_map(|r| on_target_tier(&r))
+                .any(|(_, n)| n.in_dc(target_dc));
             if satisfied {
                 report.already_satisfied += 1;
                 continue;
             }
 
-            // Pick a healthy source from the existing replicas.
+            // Pick a healthy source from the existing replicas. Only nodes
+            // already holding a target-tier copy are excluded as targets.
             let existing_nids: std::collections::HashSet<u64> = replicas
                 .iter()
-                .filter_map(|r| r.node_id.parse::<u64>().ok())
+                .filter_map(|r| on_target_tier(&r).map(|(nid, _)| nid))
                 .collect();
             let source_node: Option<u64> = replicas
                 .iter()
@@ -1600,10 +1589,8 @@ pub(crate) fn plan_path_migration(
                 .iter()
                 .filter(|(nid, n)| {
                     n.healthy
-                        && n.tiers.contains(&target_tier)
-                        && target_dc
-                            .map(|dc| n.datacenter == dc)
-                            .unwrap_or(true)
+                        && n.has_tier(target_tier)
+                        && n.in_dc(target_dc)
                         && !existing_nids.contains(nid)
                         && !already_targeted.contains(&(chunk_hash.clone(), **nid))
                 })
@@ -1685,7 +1672,34 @@ pub(crate) struct NodeSummary {
     pub grpc_addr: String,
     pub datacenter: String,
     pub healthy: bool,
-    pub tiers: Vec<DiskTier>,
+    /// `(disk_id, tier)` of the node's LIVE disks (`live_replica_tier`):
+    /// empty for a Down/Failed node, Failed/Removed disks left out.
+    pub disks: Vec<(u32, DiskTier)>,
+}
+
+impl NodeSummary {
+    fn has_tier(&self, tier: DiskTier) -> bool {
+        self.disks.iter().any(|(_, t)| *t == tier)
+    }
+    fn disk_tier(&self, disk_id: u32) -> Option<DiskTier> {
+        self.disks.iter().find(|(d, _)| *d == disk_id).map(|(_, t)| *t)
+    }
+    fn in_dc(&self, dc: Option<&str>) -> bool {
+        dc.map_or(true, |dc| self.datacenter.eq_ignore_ascii_case(dc))
+    }
+}
+
+pub(crate) fn node_summary(info: &dtfs_raft::NodeInfo) -> NodeSummary {
+    NodeSummary {
+        grpc_addr: info.grpc_addr.clone(),
+        datacenter: info.location.datacenter.clone(),
+        healthy: info.health == HealthStatus::Healthy,
+        disks: info
+            .disks
+            .iter()
+            .filter_map(|d| Some((d.disk_id, super::live_replica_tier(Some(info), d.disk_id)?)))
+            .collect(),
+    }
 }
 
 /// Bug AW — split out the migration-snapshot sort comparator so we can

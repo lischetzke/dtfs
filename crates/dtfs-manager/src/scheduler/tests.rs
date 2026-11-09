@@ -506,8 +506,100 @@ mod path_migration_tests {
             grpc_addr: "127.0.0.1:9500".to_string(),
             datacenter: dc.to_string(),
             healthy,
-            tiers: tiers.to_vec(),
+            disks: tiers.iter().enumerate().map(|(i, t)| (i as u32, *t)).collect(),
         }
+    }
+
+    fn node_info(dc: &str, disks: &[(DiskTier, dtfs_common::types::DiskStatus)]) -> dtfs_raft::NodeInfo {
+        use dtfs_common::types::{DiskInfo, HealthStatus, NodeRole};
+        dtfs_raft::NodeInfo {
+            role: NodeRole::Data,
+            hostname: "d".into(),
+            grpc_addr: "d:9500".into(),
+            location: dtfs_common::topology::Location::new(dc, "", "", ""),
+            disks: disks
+                .iter()
+                .enumerate()
+                .map(|(i, (t, s))| DiskInfo {
+                    disk_id: i as _,
+                    uuid: "u".into(),
+                    mount_path: "/mnt/d".into(),
+                    tier: *t,
+                    total_bytes: 1,
+                    used_bytes: 0,
+                    status: *s,
+                })
+                .collect(),
+            total_capacity: 0,
+            used_capacity: 0,
+            health: HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    /// Bug #8 — the replica sits on node 10's HOT disk; node 10 also has a
+    /// cold disk. That is not a cold copy: plan one (node 10 may take it on
+    /// its cold disk, it holds no cold replica yet).
+    #[test]
+    fn replica_on_other_tier_disk_of_target_tier_node_is_not_satisfied() {
+        let files = vec![("/m".to_string(), vec![chunk(0, "h0", 10, 0, 1)])];
+        let nodes: HashMap<u64, NodeSummary> =
+            HashMap::from([(10, node("dc-a", true, &[DiskTier::Hot, DiskTier::Cold]))]);
+        let (report, plan) = plan_path_migration(&files, &nodes, DiskTier::Cold, None, 1000);
+        assert_eq!(report.already_satisfied, 0);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].target_node, 10);
+
+        // Positive: the replica on the cold disk (1) satisfies.
+        let files = vec![("/m".to_string(), vec![chunk(0, "h0", 10, 1, 1)])];
+        let (report, plan) = plan_path_migration(&files, &nodes, DiskTier::Cold, None, 1000);
+        assert_eq!((report.already_satisfied, plan.len()), (1, 0));
+    }
+
+    /// Bug #8 — a cold replica on a Failed (or Removed) disk is not a cold
+    /// copy, and a node whose only cold disk failed is no target.
+    #[test]
+    fn failed_cold_disk_neither_satisfies_nor_targets() {
+        use dtfs_common::types::DiskStatus as S;
+        let n10 = node_summary(&node_info("dc-a", &[(DiskTier::Cold, S::Failed), (DiskTier::Hot, S::Healthy)]));
+        let n11 = node_summary(&node_info("dc-a", &[(DiskTier::Cold, S::Removed)]));
+        let n12 = node_summary(&node_info("dc-a", &[(DiskTier::Cold, S::Healthy)]));
+        let nodes: HashMap<u64, NodeSummary> = HashMap::from([(10, n10), (11, n11), (12, n12)]);
+        // Replica on node 10's failed cold disk 0 plus its live hot disk 1.
+        let files = vec![(
+            "/m".to_string(),
+            vec![chunk(0, "h0", 10, 0, 1), chunk(0, "h0", 10, 1, 1)],
+        )];
+        let (report, plan) = plan_path_migration(&files, &nodes, DiskTier::Cold, None, 1000);
+        assert_eq!(report.already_satisfied, 0);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].target_node, 12);
+    }
+
+    /// Bug #8 — DC names compare case-insensitively (CLAUDE.md A.3.4).
+    #[test]
+    fn target_dc_compares_case_insensitively() {
+        let nodes: HashMap<u64, NodeSummary> = HashMap::from([
+            (10, node("toro", true, &[DiskTier::Hot])),
+            (14, node("leli", true, &[DiskTier::Cold])),
+        ]);
+        let on_leli = vec![("/m".to_string(), vec![chunk(0, "h0", 14, 0, 1)])];
+        let (report, _) = plan_path_migration(&on_leli, &nodes, DiskTier::Cold, Some("LELI"), 1000);
+        assert_eq!(report.already_satisfied, 1);
+
+        let on_toro = vec![("/m".to_string(), vec![chunk(0, "h0", 10, 0, 1)])];
+        let (_, plan) = plan_path_migration(&on_toro, &nodes, DiskTier::Cold, Some("LELI"), 1000);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].target_node, 14);
+        // Negative: another DC never matches.
+        let (report, plan) = plan_path_migration(&on_toro, &nodes, DiskTier::Cold, Some("NRB"), 1000);
+        assert_eq!((report.no_target, plan.len()), (1, 0));
     }
 
     /// 1 file, 1 chunk currently on a hot DC-A node. Plan a move to warm
