@@ -399,7 +399,7 @@ impl TaskScheduler {
                 continue;
             }
             if let Err(e) = raft
-                .client_write(dtfs_raft::ClientRequest::SweepExpiredLeases { now_ms })
+                .client_write(dtfs_raft::ClientRequest::SweepExpiredLeases { now_ms, sweep_posix_locks: true })
                 .await
             {
                 // Non-leader managers will get a forward error; that's fine

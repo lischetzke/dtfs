@@ -699,6 +699,10 @@ pub enum ClientRequest {
     /// GC tokio task on its 1s tick.
     SweepExpiredLeases {
         now_ms: u64,
+        /// Also reap expired POSIX byte-range locks. Absent in entries from
+        /// before the lock sweep, which must replay unchanged (A.3.1).
+        #[serde(default)]
+        sweep_posix_locks: bool,
     },
 
     /// Per-chunk read counters routed to the LEADER's tiering engine. The
@@ -938,8 +942,8 @@ impl fmt::Display for ClientRequest {
                 f,
                 "ReleaseLeasesByHost(host={hostname_prefix}, except_pid={except_pid}, now_ms={now_ms})"
             ),
-            Self::SweepExpiredLeases { now_ms } => {
-                write!(f, "SweepExpiredLeases(now_ms={now_ms})")
+            Self::SweepExpiredLeases { now_ms, sweep_posix_locks } => {
+                write!(f, "SweepExpiredLeases(now_ms={now_ms}, locks={sweep_posix_locks})")
             }
             Self::ReportChunkReads { node_id, entries } => {
                 write!(f, "ReportChunkReads(node={node_id}, {} chunks)", entries.len())

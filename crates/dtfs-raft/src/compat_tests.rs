@@ -22,6 +22,8 @@ use crate::{ChunkLocationEntry, ClientRequest, NodeInfo, PendingScrub, StoredMem
 
 const SNAPSHOT_V1: &str = include_str!("../testdata/snapshot_v1.json");
 const REQUESTS_V1: &str = include_str!("../testdata/client_requests_v1.json");
+/// Hand-written: entries whose wire shape grew after v1 (append-only).
+const REQUESTS_V2: &str = include_str!("../testdata/client_requests_v2.json");
 
 fn chunk(i: u64) -> ChunkLocationEntry {
     ChunkLocationEntry {
@@ -182,7 +184,7 @@ fn all_requests() -> Vec<ClientRequest> {
         RenewWriteLease { path: s("/a"), lease_id: s("l1"), extension_ms: 1000, now_ms: 5 },
         ReleaseWriteLease { path: s("/a"), lease_id: s("l1"), now_ms: 5 },
         ReleaseLeasesByHost { hostname_prefix: s("h"), except_pid: 1, now_ms: 5 },
-        SweepExpiredLeases { now_ms: 5 },
+        SweepExpiredLeases { now_ms: 5, sweep_posix_locks: false },
         ReportChunkReads { node_id: 7, entries: vec![(s("c1"), [(s("LELI"), 3u32)].into_iter().collect())] },
         TriggerScrub { id: s("s1"), level: s("deep"), requested_at_ms: 5 },
         UpdateNodeDiskUsage { node_id: 7, per_disk: vec![(1, 100, 10)] },
@@ -385,6 +387,43 @@ fn audited_variants_v1_entries_default_now_ms_to_zero() {
 fn snap_volume_version() -> u64 {
     let snap = deserialize_snapshot(io::Cursor::new(SNAPSHOT_V1.as_bytes().to_vec())).unwrap();
     snap.volumes["default"].version
+}
+
+/// Apply one `SweepExpiredLeases` to a state holding one expired POSIX lock
+/// and return whether the lock survived.
+fn sweep_keeps_expired_lock(sweep: &ClientRequest) -> bool {
+    use crate::state_machine::{apply_request, StateMachineData};
+    use openraft::vote::RaftLeaderId;
+    let lid = |i| openraft::LogId::new(openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0), i);
+    let mut sm = StateMachineData::default();
+    apply_request(&mut sm, &lid(1), &ClientRequest::AcquireLock {
+        path: "/a".into(), owner_id: "crashed".into(), start: 0, end: 9, write: true, lease_ms: 1_000, now_ms: 1_000,
+    });
+    assert!(sm.posix_locks.contains_key("/a"));
+    apply_request(&mut sm, &lid(2), sweep);
+    sm.posix_locks.contains_key("/a")
+}
+
+/// RAFT-1 — a v1 `SweepExpiredLeases` (no `sweep_posix_locks`) replays as
+/// old binaries applied it: write leases only, POSIX locks untouched.
+#[test]
+fn sweep_expired_leases_v1_entry_does_not_prune_locks() {
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V1).unwrap();
+    let sweep = reqs.iter().find(|r| matches!(r, ClientRequest::SweepExpiredLeases { .. })).unwrap();
+    assert!(matches!(sweep, ClientRequest::SweepExpiredLeases { now_ms: 5, sweep_posix_locks: false }));
+    let replay = ClientRequest::SweepExpiredLeases { now_ms: 5_000, sweep_posix_locks: false };
+    assert!(sweep_keeps_expired_lock(&replay), "legacy sweep must not prune POSIX locks");
+}
+
+/// RAFT-1 — the new proposer's entry (`sweep_posix_locks: true`) prunes.
+#[test]
+fn sweep_expired_leases_v2_entry_prunes_locks() {
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V2).unwrap();
+    let ClientRequest::SweepExpiredLeases { now_ms, sweep_posix_locks } = &reqs[0] else {
+        panic!("v2 fixture starts with SweepExpiredLeases");
+    };
+    assert_eq!((*now_ms, *sweep_posix_locks), (5_000, true));
+    assert!(!sweep_keeps_expired_lock(&reqs[0]));
 }
 
 #[test]

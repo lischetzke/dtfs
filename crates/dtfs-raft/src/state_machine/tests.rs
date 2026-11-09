@@ -1041,7 +1041,7 @@ mod posix_path_regression {
         apply_request(&mut sm, &mk_log_id(2), &lock("/mixed", "crashed", 0, 1_000));
         apply_request(&mut sm, &mk_log_id(3), &lock("/mixed", "live", 20, 60_000));
         // Boundary: expires_at_ms == now_ms is expired (matches AcquireLock).
-        apply_request(&mut sm, &mk_log_id(4), &ClientRequest::SweepExpiredLeases { now_ms: 2_000 });
+        apply_request(&mut sm, &mk_log_id(4), &ClientRequest::SweepExpiredLeases { now_ms: 2_000, sweep_posix_locks: true });
         assert!(!sm.posix_locks.contains_key("/dead"), "{:?}", sm.posix_locks);
         let mixed = sm.posix_locks.get("/mixed").expect("live lock's table kept");
         assert_eq!(mixed.iter().map(|l| l.owner_id.as_str()).collect::<Vec<_>>(), ["live"]);
@@ -1089,6 +1089,7 @@ mod posix_path_regression {
             &mk_log_id(3),
             &ClientRequest::SweepExpiredLeases {
                 now_ms: 1_000_000 + 16_000,
+                sweep_posix_locks: true,
             },
         );
         assert!(sm.write_leases.get("/x.bin").is_none());
@@ -3862,7 +3863,7 @@ mod raft_audit_fix_tests {
             ClientRequest::DeleteVolume { now_ms: 0, volume_id: "v".into() },
             ClientRequest::DeleteVolume { now_ms: 888, volume_id: "v".into() },
             ClientRequest::DeleteFile { now_ms: 999, path: "/f".into() },
-            ClientRequest::SweepExpiredLeases { now_ms: 777 },
+            ClientRequest::SweepExpiredLeases { now_ms: 777, sweep_posix_locks: true },
             ClientRequest::AcquireWriteLease {
                 path: "/f".into(), owner_id: "o".into(), lease_ms: 10, now_ms: 555,
                 proposed_lease_id: "L".into(),

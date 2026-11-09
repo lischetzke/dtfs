@@ -1003,7 +1003,7 @@ fn disks_identity_eq(
     })
 }
 
-fn apply_request(
+pub(crate) fn apply_request(
     sm: &mut StateMachineData,
     log_id: &LogId,
     req: &ClientRequest,
@@ -1015,7 +1015,7 @@ fn apply_request(
     let now_ms = match req {
         ClientRequest::AcquireWriteLease { now_ms, .. }
         | ClientRequest::ReleaseLeasesByHost { now_ms, .. }
-        | ClientRequest::SweepExpiredLeases { now_ms }
+        | ClientRequest::SweepExpiredLeases { now_ms, .. }
         | ClientRequest::DeleteFile { now_ms, .. }
         | ClientRequest::RegisterNode { now_ms, .. }
         | ClientRequest::DeregisterNode { now_ms, .. }
@@ -2193,7 +2193,7 @@ fn apply_request(
             ClientResponse::WriteLeasesReleased { count }
         }
 
-        ClientRequest::SweepExpiredLeases { now_ms } => {
+        ClientRequest::SweepExpiredLeases { now_ms, sweep_posix_locks } => {
             let to_drop: Vec<String> = sm
                 .write_leases
                 .iter()
@@ -2205,11 +2205,14 @@ fn apply_request(
                 sm.write_leases.remove(p);
             }
             // Audit #11 — byte-range locks of crashed clients were only
-            // evicted when the same path was touched again.
-            sm.posix_locks.retain(|_, table| {
-                table.retain(|l| l.expires_at_ms > *now_ms);
-                !table.is_empty()
-            });
+            // evicted when the same path was touched again. Gated so entries
+            // from before the lock sweep replay unchanged (RAFT-1).
+            if *sweep_posix_locks {
+                sm.posix_locks.retain(|_, table| {
+                    table.retain(|l| l.expires_at_ms > *now_ms);
+                    !table.is_empty()
+                });
+            }
             if count > 0 {
                 push_audit_capped(
                     &mut sm.audit_log,

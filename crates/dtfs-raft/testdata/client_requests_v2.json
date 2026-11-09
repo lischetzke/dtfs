@@ -1,0 +1,8 @@
+[
+  {
+    "SweepExpiredLeases": {
+      "now_ms": 5000,
+      "sweep_posix_locks": true
+    }
+  }
+]
