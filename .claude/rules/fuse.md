@@ -145,7 +145,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   in-flight under the buffer) and lookup/read size (`visible_size`) still
   see drained bytes while the upload runs. Without it a reader between
   knfsd's close (flush drains) and the commit saw size 0 / EOF. Write-side
-  EOF decisions keep using `logical_size`. `WriteBuffer::remove` (unlink,
+  EOF decisions keep using `logical_size` (async_commit: `write_eof`, below). `WriteBuffer::remove` (unlink,
   rename-over, last writer's release) also drops the in-flight entries of
   the path and its subtree, and `truncate` clips them to the new size, so
   the old file's drained bytes never show after rm+recreate, O_TRUNC or
@@ -184,6 +184,27 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   (`rename_lock_paths`, taken in sorted order) across `rename_file` and the
   buffer/handle re-key. A writer opened under `from` while rename waits for
   those guards is not covered (the kernel's rename locks make that rare).
+- `write.async_commit` background upload: write()'s batch (`flush()`) is
+  handed to `spawn_bg_upload` and write() returns (prod: one knfsd thread
+  got nothing while each batch uploaded, 9-20 MiB/s). At most ONE batch per
+  path (`bg_uploads`: chunk range + bytes); while it runs, write() does not
+  call `flush()` (complete chunks stay buffered). Not more: overlapping
+  commits of a path make the merge fall back to a full re-fetch. The task
+  (`bg_upload`) renews the lease (`renew_if_due`), keeps `begin_inflight`
+  until restore/merge, on failure restores under the fh's current path and
+  arms every writer's `write_error` (`record_aged_commit`, success clears
+  it); `BgSlot` clears the entry and wakes `wait_bg_uploads` (Notify) even on
+  panic. It holds NO `path_guard` (writes would block on it again); instead
+  everything that could touch those chunks waits for it first:
+  write() into a chunk of the batch (`range_hits_upload`; else it re-seeds
+  from the pre-commit snapshot and the restore clobbers it), a write whose
+  dirty + in-flight bytes would meet `DIRTY_BYTES_CAP` (`bg_backpressure`,
+  then the cap drain as before), `commit_all` (last writer's flush/release,
+  timer), async fsync, truncate, rename (every lock path) and unlink. Waiters
+  may hold `path_guard` (the task never takes it: no deadlock), and holding
+  it means no new batch starts. Write-side EOF (append offset, hole fill,
+  tail seed) uses `write_eof` = `visible_size` in async mode (the in-flight
+  batch counts, else the next append zero-filled over it).
 
 ## Reads and prefetch
 

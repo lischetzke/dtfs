@@ -749,6 +749,12 @@ pub struct DtfsFilesystem {
     /// write(), a writer's truncate and release on the same path
     /// (`path_guard`); unused (empty) when async_commit is off.
     path_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// `write.async_commit` only: path -> (lowest chunk index, highest chunk
+    /// index, bytes) of the ONE batch write() uploads in the background
+    /// (`spawn_bg_upload`); present until restore/merge are done.
+    bg_uploads: DashMap<String, (u32, u32, usize)>,
+    /// Woken whenever a background upload ends (`wait_bg_uploads`).
+    bg_done: tokio::sync::Notify,
     /// P0-1: prefix used for write-lease `owner_id` values. Format:
     /// `<hostname>:<pid>:`. The per-open `:<fh>` suffix is appended at
     /// open-time to make each owner_id unique within the process.
@@ -830,6 +836,8 @@ impl DtfsFilesystem {
             known_locations: DashMap::new(),
             commit_tracker: CommitTracker::default(),
             path_locks: DashMap::new(),
+            bg_uploads: DashMap::new(),
+            bg_done: tokio::sync::Notify::new(),
             lease_owner_prefix,
             local_cache: None,
         }
@@ -1570,8 +1578,13 @@ impl DtfsFilesystem {
     /// Data is accumulated in the write buffer. Complete chunks are flushed
     /// to data nodes automatically. Returns the number of bytes written.
     #[instrument(skip(self, data), fields(fh, offset, len = data.len()))]
-    pub async fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32> {
+    pub async fn write(self: &Arc<Self>, fh: u64, offset: u64, data: &[u8]) -> Result<u32> {
         let (path, guard) = self.fh_path_guard(fh).await;
+        // A chunk of the background batch must not be re-seeded from the
+        // pre-commit snapshot or later clobbered by its restore: wait for it.
+        if let Some(p) = path.as_deref().filter(|p| self.write_hits_bg_upload(p, offset, data.len())) {
+            self.wait_bg_uploads(p).await;
+        }
         let res = self.write_inner(fh, offset, data).await;
         if let Some(p) = path {
             self.drop_path_guard(&p, guard);
@@ -1579,7 +1592,7 @@ impl DtfsFilesystem {
         res
     }
 
-    async fn write_inner(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32> {
+    async fn write_inner(self: &Arc<Self>, fh: u64, offset: u64, data: &[u8]) -> Result<u32> {
         let file = self
             .open_files
             .get(&fh)
@@ -1620,7 +1633,7 @@ impl DtfsFilesystem {
         }
 
         let effective_offset = if append {
-            let buffered = self.write_buffer.logical_size(&path).unwrap_or(0);
+            let buffered = self.write_eof(&path).unwrap_or(0);
             cached_eof.max(buffered)
         } else {
             offset
@@ -1660,7 +1673,7 @@ impl DtfsFilesystem {
             // A write past EOF hole-fills the existing partial tail chunk
             // with zeros; it must be seeded first or the zero-padded tail
             // replaces its real bytes at commit.
-            let eof_now = cached_eof.max(self.write_buffer.logical_size(&path).unwrap_or(0));
+            let eof_now = cached_eof.max(self.write_eof(&path).unwrap_or(0));
             if let Some(t) = hole_tail_chunk(eof_now, effective_offset, chunk_size) {
                 if !seed_list.contains(&t) && self.write_buffer.chunk_needs_seed(&path, t as u32) {
                     seed_list.insert(0, t);
@@ -1713,7 +1726,8 @@ impl DtfsFilesystem {
         // the old partial tail and the write's own chunk below the offset.
         // Chunk indices entirely inside the hole stay unbuffered and are
         // never uploaded: a missing index below EOF reads as zeros.
-        let buffered_size = self.write_buffer.logical_size(&path).unwrap_or(0);
+        // `write_eof` also counts a batch uploading in the background.
+        let buffered_size = self.write_eof(&path).unwrap_or(0);
         let logical_size = cached_eof.max(buffered_size);
         let fill = crate::writebuf::hole_fill_ranges(logical_size, effective_offset, chunk_size);
         for (i, r) in fill.iter().enumerate() {
@@ -1743,6 +1757,7 @@ impl DtfsFilesystem {
                 // already flushable (every all-zero chunk this hole fill
                 // has already completed) to the cluster right now instead
                 // of accumulating further.
+                self.bg_backpressure(&path, n).await;
                 if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), n) {
                     self.renew_if_due(fh, &path).await?;
                     let segs = self.cap_drain(&path, at, n);
@@ -1769,6 +1784,7 @@ impl DtfsFilesystem {
         // fill that landed exactly at the cap boundary, or a write with no
         // hole at all into an already-near-cap buffer, must not be allowed
         // to push it further over.
+        self.bg_backpressure(&path, data.len()).await;
         if dirty_cap_exceeded(self.write_buffer.dirty_bytes(&path), data.len()) {
             self.renew_if_due(fh, &path).await?;
             let segs = self.cap_drain(&path, effective_offset, data.len());
@@ -1787,6 +1803,19 @@ impl DtfsFilesystem {
         }
 
         let written = self.write_buffer.write(&path, effective_offset, data);
+
+        // async_commit: the batch uploads in the background (write() returns
+        // now; knfsd's single thread keeps receiving). While one is in
+        // flight, complete chunks stay buffered (bounded by the cap above).
+        if self.config.write.async_commit {
+            if !self.bg_uploads.contains_key(&path) {
+                let segments = self.write_buffer.flush(&path);
+                if !segments.is_empty() {
+                    self.spawn_bg_upload(fh, path.clone(), segments);
+                }
+            }
+            return Ok(written as u32);
+        }
 
         // Check if any complete chunks are ready to flush.
         let segments = self.write_buffer.flush(&path);
@@ -1888,6 +1917,8 @@ impl DtfsFilesystem {
         if !self.config.write.async_commit {
             return self.commit_all(fh).await;
         }
+        let path = self.open_files.get(&fh).context("invalid file handle")?.path.clone();
+        self.wait_bg_uploads(&path).await;
         let err = self
             .open_files
             .get_mut(&fh)
@@ -1939,6 +1970,91 @@ impl DtfsFilesystem {
             .map(|e| (e.value().path.clone(), e.value().flags))
             .collect();
         other_writer_open(&others, &path)
+    }
+
+    /// `write.async_commit`: hand write()'s batch to a background upload of
+    /// `path` (at most one per path; callers hold `path_guard` and checked
+    /// `bg_uploads`). One batch, not more: two overlapping commits of a path
+    /// make the post-commit merge fall back to a full re-fetch (O(file) per
+    /// batch); the batch itself keeps `upload_concurrency` puts busy.
+    fn spawn_bg_upload(self: &Arc<Self>, fh: u64, path: String, segs: Vec<crate::writebuf::ChunkSegment>) {
+        let lo = segs.iter().map(|s| s.chunk_index).min().unwrap_or(0);
+        let hi = segs.iter().map(|s| s.chunk_index).max().unwrap_or(0);
+        let bytes = segs.iter().map(|s| s.data.len()).sum();
+        self.bg_uploads.insert(path.clone(), (lo, hi, bytes));
+        let this = Arc::clone(self);
+        tokio::spawn(async move { this.bg_upload(fh, path, segs).await });
+    }
+
+    /// The background half of write()'s batch flush. Holds no `path_guard`
+    /// (writes would block on it again): nobody else touches these chunk
+    /// indices meanwhile (overlapping writes, cap drains, commit_all,
+    /// truncate, rename and unlink wait in `wait_bg_uploads`), so the
+    /// restore cannot clobber newer bytes. The overlay stays until the
+    /// restore/merge is done; `bg_uploads` is cleared after that.
+    async fn bg_upload(&self, fh: u64, path: String, segs: Vec<crate::writebuf::ChunkSegment>) {
+        let _slot = BgSlot { fs: self, path: path.clone() };
+        let _inflight = self.write_buffer.begin_inflight(&path, &segs);
+        let res = match self.renew_if_due(fh, &path).await {
+            Ok(()) => self.flush_segments_to_cluster(&path, &segs).await,
+            Err(e) => Err(e),
+        };
+        match res {
+            Ok(committed) => {
+                self.mark_committed_and_refresh(&path, fh, committed).await;
+                self.record_aged_commit(&path, Ok(()));
+            }
+            Err(e) => {
+                // unlink may have detached the fh meanwhile: restore under
+                // its current path, never into a replacement at `path`.
+                let cur = self.open_files.get(&fh).map(|f| f.path.clone()).unwrap_or(path);
+                self.write_buffer.restore_segments(&cur, &segs);
+                self.record_aged_commit(&cur, Err(e));
+            }
+        }
+    }
+
+    /// Wait until `path` has no background upload in flight (no-op when
+    /// async_commit is off: nothing is ever spawned).
+    async fn wait_bg_uploads(&self, path: &str) {
+        loop {
+            let done = self.bg_done.notified();
+            tokio::pin!(done);
+            done.as_mut().enable();
+            if !self.bg_uploads.contains_key(path) {
+                return;
+            }
+            done.await;
+        }
+    }
+
+    /// True iff `path`'s background batch holds a chunk `offset..+len` touches.
+    fn write_hits_bg_upload(&self, path: &str, offset: u64, len: usize) -> bool {
+        let cs = self.write_buffer.chunk_size() as u64;
+        self.bg_uploads
+            .get(path)
+            .is_some_and(|e| range_hits_upload((e.0, e.1), offset, len, cs))
+    }
+
+    /// async_commit backpressure: if buffered plus in-flight bytes of `path`
+    /// would meet `DIRTY_BYTES_CAP` with `incoming` more, wait for the
+    /// background upload first (the cap drain then sees the restored bytes).
+    async fn bg_backpressure(&self, path: &str, incoming: usize) {
+        let inflight = self.bg_uploads.get(path).map_or(0, |e| e.2);
+        if inflight > 0 && dirty_cap_exceeded(self.write_buffer.dirty_bytes(path) + inflight, incoming) {
+            self.wait_bg_uploads(path).await;
+        }
+    }
+
+    /// Write-side EOF of the buffer: async_commit also counts the batch
+    /// uploading in the background (else the next append would zero-fill
+    /// over it); off, `logical_size` as before.
+    fn write_eof(&self, path: &str) -> Option<u64> {
+        if self.config.write.async_commit {
+            self.write_buffer.visible_size(path)
+        } else {
+            self.write_buffer.logical_size(path)
+        }
     }
 
     /// `write.async_commit` serialisation of the timer commit with write(),
@@ -2012,6 +2128,10 @@ impl DtfsFilesystem {
         let lease_deadline = file.lease_deadline;
         let lease_owner_id = file.lease_owner_id.clone();
         drop(file);
+        // async_commit: the last writer's close / the timer commit only after
+        // write()'s background batch is committed or restored (its error is
+        // then pending on the fh). Callers hold `path_guard`: no new one starts.
+        self.wait_bg_uploads(&path).await;
 
         // P0-1: if a lease is held and is past the renewal threshold,
         // renew BEFORE issuing the cluster writes. Otherwise a large flush
@@ -2397,6 +2517,9 @@ impl DtfsFilesystem {
     /// Delete a file from the DTFS namespace.
     #[instrument(skip(self), fields(path = %path))]
     pub async fn unlink(&self, path: &str) -> Result<()> {
+        // A background batch commits by path: let it land in the old file
+        // before the name can be deleted and re-created.
+        self.wait_bg_uploads(path).await;
         let response = self
             .client
             .delete_file(path)
@@ -2531,6 +2654,7 @@ impl DtfsFilesystem {
             }
         }
         let guard = self.path_guard(path).await;
+        self.wait_bg_uploads(path).await;
         let res = self.truncate_inner(path, new_size, writer || temp_fh.is_some()).await;
         self.drop_path_guard(path, guard);
         if let Some(fh) = temp_fh {
@@ -2621,6 +2745,10 @@ impl DtfsFilesystem {
             for p in rename_lock_paths(&open, from, to) {
                 let g = self.path_guard(&p).await;
                 guards.push((p, g));
+            }
+            // No background upload may commit or restore across the re-key.
+            for (p, _) in &guards {
+                self.wait_bg_uploads(p).await;
             }
         }
         let res = self.rename_inner(from, to).await;
@@ -3550,6 +3678,31 @@ fn effective_read_len(file_size: u64, offset: u64, size: u32) -> u32 {
 /// more bytes are added. Extracted as a pure predicate so the cap check in
 /// `write()`'s hole-fill loop (and the one guarding the caller's own
 /// bytes) is directly testable without a live `WriteBuffer`/network call.
+/// True iff the write `offset..offset+len` touches a chunk index in the
+/// background batch's `lo..=hi`.
+fn range_hits_upload((lo, hi): (u32, u32), offset: u64, len: usize, chunk_size: u64) -> bool {
+    if len == 0 || chunk_size == 0 {
+        return false;
+    }
+    let first = offset / chunk_size;
+    let last = (offset + len as u64 - 1) / chunk_size;
+    first <= hi as u64 && last >= lo as u64
+}
+
+/// Clears a path's `bg_uploads` entry and wakes waiters when the background
+/// upload ends, also if its task panics or is dropped at runtime shutdown.
+struct BgSlot<'a> {
+    fs: &'a DtfsFilesystem,
+    path: String,
+}
+
+impl Drop for BgSlot<'_> {
+    fn drop(&mut self) {
+        self.fs.bg_uploads.remove(&self.path);
+        self.fs.bg_done.notify_waiters();
+    }
+}
+
 fn dirty_cap_exceeded(dirty: usize, incoming: usize) -> bool {
     dirty.saturating_add(incoming) >= crate::writebuf::DIRTY_BYTES_CAP
 }
@@ -5493,7 +5646,7 @@ mod async_commit_fs_tests {
     async fn failed_cap_drain_drops_the_writes_own_seeds() {
         let cap = crate::writebuf::DIRTY_BYTES_CAP;
         for async_on in [false, true] {
-            let fs = fs(async_on);
+            let fs = Arc::new(fs(async_on));
             let cs = fs.write_buffer.chunk_size() as u64;
             let full = (cap as u64 / cs) as u32;
             for (eof, offset) in [(64 * cs, 40 * cs + 10), (full as u64 * cs + 100, (full as u64 + 2) * cs)] {
@@ -5793,11 +5946,12 @@ mod async_commit_fs_tests {
         hole.abort();
     }
 
-    /// write()'s batch flush keeps the drained batch visible in flight.
+    /// write()'s batch flush keeps the drained batch visible in flight
+    /// (async_commit: `async_write_returns_while_the_batch_uploads`).
     #[tokio::test]
     async fn write_batch_flush_stays_visible_in_flight() {
         let (client, hole) = black_hole_client().await;
-        for async_on in [false, true] {
+        for async_on in [false] {
             let (fs, fh, cs) = writer_fs(&client, async_on, 0, 0, 0);
             let w = stuck_write(&fs, fh, 0, vec![3; 4 * cs as usize]).await;
             assert_eq!(fs.write_buffer.dirty_bytes("/f"), 0, "batch drained");
@@ -5807,6 +5961,128 @@ mod async_commit_fs_tests {
             let _ = w.await;
         }
         hole.abort();
+    }
+
+    /// Async fs on a black-hole manager with write()'s 4-chunk batch of `/f`
+    /// uploading in the background (stuck): write() must have returned.
+    async fn bg_batch_in_flight(client: &DtfsClient) -> (Arc<DtfsFilesystem>, u64, u64) {
+        let (fs, fh, cs) = writer_fs(client, true, 0, 0, 0);
+        let w = tokio::time::timeout(Duration::from_secs(2), fs.write(fh, 0, &vec![3; 4 * cs as usize])).await;
+        assert_eq!(w.expect("write must return before the upload finishes").unwrap(), 4 * cs as u32);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(fs.bg_uploads.contains_key("/f"), "batch uploads in the background");
+        (fs, fh, cs)
+    }
+
+    /// `op` must still be pending after 300 ms (it waits for the upload).
+    async fn pending<T>(op: impl std::future::Future<Output = T>) -> bool {
+        tokio::time::timeout(Duration::from_millis(300), op).await.is_err()
+    }
+
+    /// Prod (NFS re-export, one knfsd thread): write() awaiting each batch
+    /// upload capped a 70 GB copy at 9-20 MiB/s. async_commit: write() hands
+    /// the batch off and returns; the bytes stay visible in flight.
+    #[tokio::test]
+    async fn async_write_returns_while_the_batch_uploads() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, fh, cs) = bg_batch_in_flight(&client).await;
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 0, "batch drained");
+        assert_eq!(fs.write_buffer.visible_size("/f"), Some(4 * cs));
+        assert_eq!(overlay_len(&fs, 0, 4 * cs as usize), 4 * cs as usize);
+        // Appending after the in-flight batch neither waits nor zero-fills it.
+        let w = tokio::time::timeout(Duration::from_secs(2), fs.write(fh, 4 * cs, &[5; 10])).await;
+        assert_eq!(w.expect("a write above the in-flight batch must not wait").unwrap(), 10);
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 10, "no hole fill over the in-flight chunks");
+        hole.abort();
+    }
+
+    /// The last writer's close (flush/release), fsync and a write into an
+    /// in-flight chunk wait for the background upload. (truncate, rename,
+    /// unlink and the timer issue RPCs the black hole also stalls, so this
+    /// harness cannot tell their wait apart; same `wait_bg_uploads` call.)
+    #[tokio::test]
+    async fn async_close_fsync_and_overlapping_write_wait_for_the_upload() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, fh, cs) = bg_batch_in_flight(&client).await;
+        assert!(pending(fs.flush(fh)).await, "last writer's flush must wait");
+        assert!(pending(fs.release(fh)).await, "last writer's release must wait");
+        assert!(pending(fs.fsync(fh)).await, "fsync must wait");
+        assert!(pending(fs.write(fh, 10, &[1; 10])).await, "write into in-flight chunk 0 must wait");
+        assert!(pending(fs.write(fh, 3 * cs + 1, &[1; 10])).await, "chunk 3 (last in flight) too");
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 0, "nothing buffered over in-flight chunks");
+        // A non-last writer's close commits nothing and does not wait.
+        // (fh's flush above set its `close_seen`; fh3 stays open.)
+        let fh2 = open(&fs, "/f", OpenFlags::ReadWrite);
+        let _fh3 = open(&fs, "/f", OpenFlags::ReadWrite);
+        assert!(!pending(fs.flush(fh2)).await, "deferred close must not wait");
+        hole.abort();
+    }
+
+    /// Backpressure: dirty + in-flight bytes count against DIRTY_BYTES_CAP.
+    /// Just under the cap the write returns; meeting it waits for the upload.
+    #[tokio::test]
+    async fn async_write_at_the_cap_waits_for_the_in_flight_upload() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, fh, cs) = bg_batch_in_flight(&client).await;
+        let cap_chunks = (crate::writebuf::DIRTY_BYTES_CAP as u64 / cs) as u32;
+        for i in 4..cap_chunks - 1 {
+            fs.write_buffer.write("/f", i as u64 * cs, &vec![1; cs as usize]);
+        }
+        let last = (cap_chunks - 1) as u64 * cs;
+        let w = tokio::time::timeout(Duration::from_secs(2), fs.write(fh, last, &vec![2; cs as usize - 1])).await;
+        assert_eq!(w.expect("cap - 1: must not wait").unwrap(), cs as u32 - 1);
+        assert!(pending(fs.write(fh, last + cs - 1, &[2; 1])).await, "dirty + in-flight at the cap must wait");
+        hole.abort();
+    }
+
+    /// No managers (fail fast): the background failure restores the batch,
+    /// arms every writer's sticky error (EIO once), and the last writer's
+    /// close waits for it and returns an error instead of success.
+    #[tokio::test]
+    async fn async_failed_background_upload_restores_and_is_reported() {
+        let fs = Arc::new(fs(true));
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let fh2 = open(&fs, "/f", OpenFlags::WriteOnly);
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/f", 0, cs)));
+        assert_eq!(fs.write(fh, 0, &vec![3; 4 * cs as usize]).await.unwrap(), 4 * cs as u32);
+        fs.wait_bg_uploads("/f").await;
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 4 * cs as usize, "restored");
+        let err = fs.fsync(fh).await.unwrap_err();
+        assert!(format!("{err:#}").contains("async commit of /f failed"), "{err:#}");
+        fs.fsync(fh).await.expect("reported once");
+        assert!(fs.open_files.get(&fh2).unwrap().write_error.is_some(), "every writer armed");
+        // Retried by the next write's flush; close waits for it and fails.
+        fs.write(fh, 4 * cs, &[1; 10]).await.unwrap();
+        let _ = fs.release(fh2).await; // not the last writer: commits nothing
+        let err = fs.flush(fh).await.unwrap_err();
+        assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 4 * cs as usize + 10, "kept for retry");
+    }
+
+    /// async_commit off: write() still uploads its batch inline and returns
+    /// the error (bytes restored, nothing in the background).
+    #[tokio::test]
+    async fn sync_write_still_uploads_the_batch_inline() {
+        let fs = Arc::new(fs(false));
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/f", 0, cs)));
+        let err = fs.write(fh, 0, &vec![3; 4 * cs as usize]).await.unwrap_err();
+        assert!(format!("{err:#}").contains("allocate_chunks failed for /f"), "{err:#}");
+        assert!(fs.bg_uploads.is_empty());
+        assert_eq!(fs.write_buffer.dirty_bytes("/f"), 4 * cs as usize);
+    }
+
+    #[test]
+    fn write_range_hits_upload_bounds() {
+        let cs = 4u64 << 20;
+        let up = (2, 3);
+        assert!(!range_hits_upload(up, 0, (2 * cs) as usize, cs), "ends right below chunk 2");
+        assert!(range_hits_upload(up, 0, (2 * cs) as usize + 1, cs));
+        assert!(range_hits_upload(up, 4 * cs - 1, 1, cs), "last byte of chunk 3");
+        assert!(!range_hits_upload(up, 4 * cs, 100, cs), "above the batch");
+        assert!(!range_hits_upload(up, 2 * cs, 0, cs), "empty write");
     }
 
     /// The config bound must stay at half the write lease (renewed only by
