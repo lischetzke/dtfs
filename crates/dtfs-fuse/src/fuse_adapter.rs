@@ -545,6 +545,11 @@ impl Filesystem for DtfsFuse3Adapter {
         })
     }
 
+    // Empty on purpose: a clean unmount releases every open file before
+    // DESTROY, and main runs `commit_open_writers_then` after the session
+    // ends on every path (clean, failed or timed-out unmount), so the
+    // last-chance commit lives there, not in a kernel op that a busy mount
+    // never sends.
     async fn destroy(&self, _req: Request) {}
 
     async fn lookup(

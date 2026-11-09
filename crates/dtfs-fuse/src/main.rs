@@ -366,6 +366,7 @@ async fn main() -> Result<()> {
         #[allow(unused_imports)]
         use libc;
 
+        let shutdown_fs = fs.clone();
         let adapter = DtfsFuse3Adapter::from_shared(fs);
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
@@ -442,8 +443,6 @@ async fn main() -> Result<()> {
                 }
             }
         };
-        session_result.context("fuse3 session error")?;
-
         // Bug U step 2: release this process's leases before exiting.
         // The kernel unmount above released local FDs but the *manager-side*
         // lease state still names this PID. Without this call, a write to
@@ -453,25 +452,39 @@ async fn main() -> Result<()> {
         // Bounded by 5s — same reasoning as the startup cleanup: don't
         // hold systemd hostage. Use the same hostname/PID as startup so
         // we exactly undo our own footprint.
-        let exit_release = shutdown_client.release_leases_by_host(&hostname_for_cleanup, current_pid);
-        match tokio::time::timeout(std::time::Duration::from_secs(5), exit_release).await {
-            Ok(Ok(resp)) => {
-                if resp.released_count > 0 {
-                    info!(
-                        host = %hostname_for_cleanup,
-                        pid = current_pid,
-                        released = resp.released_count,
-                        "Bug U released own write leases on exit"
-                    );
+        let exit_release = async {
+            let release = shutdown_client.release_leases_by_host(&hostname_for_cleanup, current_pid);
+            match tokio::time::timeout(std::time::Duration::from_secs(5), release).await {
+                Ok(Ok(resp)) => {
+                    if resp.released_count > 0 {
+                        info!(
+                            host = %hostname_for_cleanup,
+                            pid = current_pid,
+                            released = resp.released_count,
+                            "Bug U released own write leases on exit"
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "Bug U exit-time lease release failed");
+                }
+                Err(_) => {
+                    tracing::warn!("Bug U exit-time lease release timed out");
                 }
             }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "Bug U exit-time lease release failed");
-            }
-            Err(_) => {
-                tracing::warn!("Bug U exit-time lease release timed out");
-            }
+        };
+        // A failed or timed-out unmount (busy mount: knfsd or a process
+        // holding a file open) leaves handles the kernel never released:
+        // commit their buffered bytes BEFORE dropping the leases. No-op after
+        // a clean unmount. 30 s unmount + 60 s + 5 s release stays below the
+        // unit's TimeoutStopSec=110s.
+        let (lost, ()) = shutdown_fs
+            .commit_open_writers_then(std::time::Duration::from_secs(60), exit_release)
+            .await;
+        if lost > 0 {
+            tracing::error!(bytes = lost, "exiting with uncommitted buffered writes");
         }
+        session_result.context("fuse3 session error")?;
 
         info!("DTFS unmounted from {}", mountpoint);
     }

@@ -2380,6 +2380,58 @@ impl DtfsFilesystem {
         }
     }
 
+    /// Shutdown: commit every path that still has an open writable,
+    /// non-detached handle (one commit per path, under its `path_guard`;
+    /// `commit_all` waits for the background batch first), bounded by
+    /// `budget` in total, THEN run `then` (the lease release). A failed or
+    /// timed-out unmount (busy mount: knfsd or a process holding a file)
+    /// never releases those handles, so with `write.async_commit`
+    /// fsync-acknowledged bytes were dropped. Returns the bytes not confirmed
+    /// committed (each such path logged at error).
+    pub async fn commit_open_writers_then<F: std::future::Future>(&self, budget: Duration, then: F) -> (usize, F::Output) {
+        let mut paths: Vec<(String, u64)> = Vec::new();
+        for e in self.open_files.iter() {
+            let p = &e.value().path;
+            if e.value().flags.is_writable() && !is_detached_path(p) && !paths.iter().any(|(q, _)| q == p) {
+                paths.push((p.clone(), *e.key()));
+            }
+        }
+        // Pre-commit view: a commit cut off by the budget may hold its bytes in flight.
+        let pending: Vec<(Vec<u32>, usize)> = paths
+            .iter()
+            .map(|(p, _)| {
+                let (idx, bytes) = self.write_buffer.pending_summary(p);
+                (idx, bytes + self.bg_uploads.get(p).map_or(0, |e| e.1))
+            })
+            .collect();
+        let mut committed: Vec<bool> = pending.iter().map(|(_, b)| *b == 0).collect();
+        let work = async {
+            for (i, (path, fh)) in paths.iter().enumerate() {
+                if committed[i] {
+                    continue;
+                }
+                let guard = self.path_guard(path).await;
+                // Re-check under the lock: a late release or rename may have won.
+                let still_open = self.open_files.get(fh).map(|f| f.path == *path) == Some(true);
+                let result = if still_open { self.commit_all(*fh).await } else { Ok(()) };
+                committed[i] = result.is_ok();
+                self.record_aged_commit(path, result);
+                self.drop_path_guard(path, guard);
+            }
+        };
+        if tokio::time::timeout(budget, work).await.is_err() {
+            error!(budget_secs = budget.as_secs(), "shutdown commit of open writers timed out");
+        }
+        let mut lost = 0;
+        for (i, (path, _)) in paths.iter().enumerate() {
+            if !committed[i] {
+                error!(path = %path, chunk_indices = ?pending[i].0, bytes = pending[i].1, "shutdown: buffered writes NOT committed, lost on exit");
+                lost += pending[i].1;
+            }
+        }
+        (lost, then.await)
+    }
+
     /// Any writable, open handle of `path` (lease info for a commit).
     fn writable_fh(&self, path: &str) -> Option<u64> {
         self.open_files
@@ -6055,6 +6107,56 @@ mod async_commit_fs_tests {
         fs.write_buffer.write("/f", 0, b"live");
         fs.commit_aged(Instant::now() + AGE).await;
         assert!(fs.fsync(fh).await.is_err(), "the live path was attempted");
+        assert!(fs.open_files.get(&dfh).unwrap().write_error.is_none(), "detached: not attempted");
+        assert!(fs.open_files.get(&rfh).unwrap().write_error.is_none());
+        assert_eq!(fs.write_buffer.dirty_bytes(&det), 10);
+        assert_eq!(fs.write_buffer.dirty_bytes("/r"), 6);
+    }
+
+    /// Stop with a busy mount (unmount failed, handles still open): the
+    /// buffered bytes of an open writer are committed BEFORE the leases are
+    /// released; an unconfirmed commit is reported as lost.
+    #[tokio::test]
+    async fn shutdown_commits_open_writers_before_releasing_leases() {
+        let fs = fs(true);
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let _fh2 = open(&fs, "/f", OpenFlags::ReadWrite); // knfsd reopen: same path, one commit
+        fs.write_buffer.write("/f", 0, &[7; 100]);
+        let release = async { fs.open_files.get(&fh).unwrap().write_error.clone() };
+        let (lost, seen) = fs.commit_open_writers_then(Duration::from_secs(5), release).await;
+        let seen = seen.expect("commit must be attempted before the lease release");
+        assert!(seen.contains("async commit of /f failed"), "{seen}");
+        assert_eq!(lost, 100, "the failed commit is reported as lost");
+    }
+
+    /// A commit stuck on an unresponsive manager is cut off at the budget;
+    /// the lease release still runs and the bytes are reported lost.
+    #[tokio::test]
+    async fn shutdown_commit_is_bounded() {
+        let (client, hole) = black_hole_client().await;
+        let (fs, _fh, cs) = writer_fs(&client, true, 0, 0, 1);
+        let t0 = Instant::now();
+        let (lost, ran) = fs.commit_open_writers_then(Duration::from_millis(300), async { true }).await;
+        assert!(t0.elapsed() < Duration::from_secs(5), "not bounded: {:?}", t0.elapsed());
+        assert!(ran);
+        assert_eq!(lost, cs as usize, "the cut-off commit's bytes are reported lost");
+        hole.abort();
+    }
+
+    /// Shutdown commit skips readers and detached handles (their bytes are
+    /// neither attempted nor counted) but commits the live writer.
+    #[tokio::test]
+    async fn shutdown_commit_skips_readers_and_detached_handles() {
+        let fs = fs(true);
+        let det = detached_handle_path("/d", "/d", 1).unwrap();
+        let dfh = open(&fs, &det, OpenFlags::ReadWrite);
+        fs.write_buffer.write(&det, 0, b"old-writer");
+        let rfh = open(&fs, "/r", OpenFlags::ReadOnly);
+        fs.write_buffer.write("/r", 0, b"orphan");
+        let _fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/f", 0, b"live");
+        let (lost, ()) = fs.commit_open_writers_then(Duration::from_secs(5), async {}).await;
+        assert_eq!(lost, 4, "only the live writer's bytes were attempted");
         assert!(fs.open_files.get(&dfh).unwrap().write_error.is_none(), "detached: not attempted");
         assert!(fs.open_files.get(&rfh).unwrap().write_error.is_none());
         assert_eq!(fs.write_buffer.dirty_bytes(&det), 10);
