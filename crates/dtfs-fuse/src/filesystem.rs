@@ -811,6 +811,8 @@ pub struct DtfsFilesystem {
     bg_doom: DashMap<String, Vec<(u64, u64)>>,
     /// Woken whenever a background upload ends (`wait_bg_uploads`).
     bg_done: tokio::sync::Notify,
+    /// Global write-buffer budget (`write_budget_bytes`, `bg_backpressure`).
+    write_budget: Option<usize>,
     /// Test hook run by write_inner right after it read the handle: models a
     /// commit retiring during the awaits that follow.
     #[cfg(test)]
@@ -881,6 +883,7 @@ impl DtfsFilesystem {
             "{}:{}:",
             client_location.host, std::process::id()
         );
+        let write_budget = write_budget_bytes(config.memory.hard_cap_mb, config.readahead.cache_mb);
 
         Self {
             client,
@@ -906,6 +909,7 @@ impl DtfsFilesystem {
             bg_uploads: DashMap::new(),
             bg_doom: DashMap::new(),
             bg_done: tokio::sync::Notify::new(),
+            write_budget,
             #[cfg(test)]
             write_race_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -2311,12 +2315,22 @@ impl DtfsFilesystem {
     /// `path` (all batches) would meet the dirty cap with `incoming` more,
     /// wait for batches to finish. It returns under the cap or with none in
     /// flight, so the cap drain that may follow never overlaps a batch (it
-    /// then sees any restored bytes).
+    /// then sees any restored bytes). Also waits while all files' write
+    /// buffers exceed the global `[memory]` budget and any batch is in
+    /// flight (`global_write_wait`). Sync mode starts no batch: never waits.
     async fn bg_backpressure(&self, path: &str, incoming: usize) {
         let cap = self.write_buffer.dirty_cap();
+        let global = || {
+            let bg: usize = self.bg_uploads.iter().map(|e| e.value().iter().map(|b| b.2).sum::<usize>()).sum();
+            global_write_wait(self.write_buffer.total_bytes(), incoming, self.write_budget, bg)
+        };
+        if global() {
+            debug!(path = %path, incoming, budget = ?self.write_budget, "write waits for the global write budget");
+        }
         self.wait_bg(|| {
             let inflight = self.bg_inflight_bytes(path);
-            inflight == 0 || !dirty_cap_exceeded(self.write_buffer.dirty_bytes(path) + inflight, incoming, cap)
+            (inflight == 0 || !dirty_cap_exceeded(self.write_buffer.dirty_bytes(path) + inflight, incoming, cap))
+                && !global()
         })
         .await;
     }
@@ -3367,6 +3381,17 @@ impl DtfsFilesystem {
         self.write_buffer.dirty_cap()
     }
 
+    /// Gauge: write-buffer bytes of the process, buffered + in flight
+    /// (`WriteBuffer::total_bytes`; memory ladder log).
+    pub fn write_buffer_bytes(&self) -> usize {
+        self.write_buffer.total_bytes()
+    }
+
+    /// Global write budget (`write_budget_bytes`), `None` without a `[memory]` cap.
+    pub fn write_budget(&self) -> Option<usize> {
+        self.write_budget
+    }
+
     /// CR-6-5 (FUSE-5) — remove every `metadata_cache` entry whose TTL has
     /// elapsed. `get_cached_metadata` already does this lazily per-path on
     /// read, but a path that stops being read (e.g. Plex finished scanning
@@ -4233,6 +4258,26 @@ impl Drop for BgSlot<'_> {
 /// bytes) is directly testable without a live `WriteBuffer`/network call.
 fn dirty_cap_exceeded(dirty: usize, incoming: usize, cap: usize) -> bool {
     dirty.saturating_add(incoming) >= cap
+}
+
+/// Global write-buffer budget (all files, buffered + in flight) from
+/// `[memory]`: `hard_cap_mb - readahead.cache_mb - hard_cap_mb / 4` (the
+/// quarter is the margin for put buffers, metadata and the process itself).
+/// `None` without a cap (`hard_cap_mb = 0`).
+pub(crate) fn write_budget_bytes(hard_cap_mb: u64, cache_mb: u64) -> Option<usize> {
+    (hard_cap_mb > 0).then(|| {
+        let mb = hard_cap_mb.saturating_sub(cache_mb).saturating_sub(hard_cap_mb / 4);
+        (mb as usize).saturating_mul(1024 * 1024)
+    })
+}
+
+/// async_commit: a write must wait for background batches while all write
+/// buffers (`total`) plus `incoming` exceed the global budget. Only while
+/// some batch is in flight (`bg_inflight`, any path): those end on their own
+/// (they take no `path_guard`), so a sole writer always progresses and the
+/// budget never deadlocks; with nothing in flight the per-file cap rules.
+fn global_write_wait(total: usize, incoming: usize, budget: Option<usize>, bg_inflight: usize) -> bool {
+    budget.is_some_and(|b| bg_inflight > 0 && total.saturating_add(incoming) > b)
 }
 
 /// CR-1-2 (FUSE-7) — chunk indices a write of `len` bytes at `offset`
@@ -6956,6 +7001,86 @@ mod async_commit_fs_tests {
         assert_eq!(w.expect("cap - 1: must not wait").unwrap(), cs as u32 - 1);
         assert!(pending(fs.write(fh, last + cs - 1, &[2; 1])).await, "dirty + in-flight at the cap must wait");
         hole.abort();
+    }
+
+    /// Async fs on `client` with `[memory] hard_cap_mb = cap_mb` and a 64 MB
+    /// readahead cache.
+    fn budget_fs(client: &DtfsClient, cap_mb: u64) -> Arc<DtfsFilesystem> {
+        let mut cfg: FuseConfig =
+            toml::from_str(include_str!("../../../deploy/examples/fuse.toml")).unwrap();
+        cfg.write.async_commit = true;
+        cfg.memory.hard_cap_mb = cap_mb;
+        cfg.readahead.cache_mb = 64;
+        Arc::new(DtfsFilesystem::new(client.clone(), cfg.location.clone(), cfg))
+    }
+
+    /// Writable fh on an empty `path` with `chunks` complete chunks buffered.
+    fn filled(fs: &DtfsFilesystem, path: &str, chunks: u32) -> u64 {
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fh = open(fs, path, OpenFlags::ReadWrite);
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes(path, 0, cs)));
+        for i in 0..chunks {
+            fs.write_buffer.write(path, i as u64 * cs, &vec![1; cs as usize]);
+        }
+        fh
+    }
+
+    /// Audit 1 (prod: 3 writers held 1.6-1.8 GB of a 2 GB cap, the ladder
+    /// hit Shed): all files' buffered + in-flight bytes are bounded by the
+    /// `[memory]` budget, not only per file. Over it a write waits for the
+    /// other file's batch; exactly at it it does not.
+    #[tokio::test]
+    async fn async_write_over_the_global_budget_waits_for_other_batches() {
+        let (client, hole) = black_hole_client().await;
+        let fs = budget_fs(&client, 256);
+        let mib = 1 << 20;
+        assert_eq!(fs.write_budget(), Some(128 * mib), "256 - 64 cache - 64 margin");
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let f = filled(&fs, "/f", 0);
+        fs.write(f, 0, &vec![3; 4 * cs as usize]).await.unwrap();
+        assert_eq!(fs.bg_batches("/f"), 1, "16 MiB of /f in flight");
+        let g = filled(&fs, "/g", 27);
+        let w = tokio::time::timeout(Duration::from_secs(2), fs.write(g, 27 * cs, &vec![2; cs as usize])).await;
+        assert_eq!(w.expect("boundary: total + incoming == budget must not wait").unwrap(), cs as u32);
+        assert_eq!(fs.write_buffer_bytes(), 128 * mib as usize);
+        assert!(pending(fs.write(g, 28 * cs, &[2; 1])).await, "over the global budget with batches in flight must wait");
+        hole.abort();
+    }
+
+    /// Audit 1 no-deadlock rule: over the global budget with nothing in
+    /// flight a write proceeds (it would wait forever); once its own batch
+    /// flies the next write waits for it. No `[memory]` cap: no budget.
+    #[tokio::test]
+    async fn async_global_budget_never_blocks_with_nothing_in_flight() {
+        let (client, hole) = black_hole_client().await;
+        let fs = budget_fs(&client, 200);
+        let mib = 1 << 20;
+        assert_eq!(fs.write_budget(), Some(86 * mib), "200 - 64 - 50");
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let g = filled(&fs, "/g", 25);
+        let w = tokio::time::timeout(Duration::from_secs(2), fs.write(g, 25 * cs, &[2; 1])).await;
+        assert_eq!(w.expect("100 MiB > 86 MiB budget, nothing in flight: must not wait").unwrap(), 1);
+        assert_eq!(fs.bg_batches("/g"), 1, "its batch started");
+        assert!(pending(fs.write(g, 25 * cs + 1, &[2; 1])).await, "now its own batch flies: waits");
+        let free = budget_fs(&client, 0);
+        assert_eq!(free.write_budget(), None);
+        let g = filled(&free, "/g", 25);
+        free.write(g, 25 * cs, &[2; 1]).await.unwrap();
+        let w = tokio::time::timeout(Duration::from_secs(2), free.write(g, 25 * cs + 1, &[2; 1])).await;
+        assert_eq!(w.expect("no cap: per-file rules only").unwrap(), 1);
+        hole.abort();
+    }
+
+    #[test]
+    fn write_budget_and_global_wait_bounds() {
+        let mib = 1 << 20;
+        assert_eq!(write_budget_bytes(0, 64), None);
+        assert_eq!(write_budget_bytes(2048, 192), Some(1344 * mib));
+        assert_eq!(write_budget_bytes(128, 512), Some(0), "saturates");
+        assert!(!global_write_wait(100, 28, Some(128), 1), "at the budget");
+        assert!(global_write_wait(100, 29, Some(128), 1));
+        assert!(!global_write_wait(100, 29, Some(128), 0), "nothing in flight: never waits");
+        assert!(!global_write_wait(usize::MAX, 1, None, 1), "no budget");
     }
 
     /// No managers (fail fast): the background failure restores the batch,

@@ -198,7 +198,8 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   at `WriteBuffer::dirty_cap` = `max(128 MB, 2 x batch limit)` (defaults
   64 MB / 128 MB = `DIRTY_BYTES_CAP`; 64 x 4 MiB: 256 / 512 MB). The cap is
   per open writer and nothing sheds write buffers: dirty cap x open
-  writers plus readahead must fit the client's `[memory]` budget. They are
+  writers plus readahead must fit the client's `[memory]` budget (async
+  mode adds a global bound, see `bg_backpressure`). They are
   force-drained via `WriteBuffer::cap_drain` (gap-free complete chunks,
   then gappy complete ones only until under the cap, never the
   chunks of the pending write: `keep`, they were just seeded) before a hole
@@ -362,6 +363,14 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 - Warn: halve readahead `cache_mb`. Shed: drop unconsumed prefetch and
   stop spawning (`prefetch_enabled` pinned false; `on_chunk_read`
   early-returns). systemd `MemoryMax` is the backstop.
+- Write buffers (async_commit): `bg_backpressure` also waits while
+  `WriteBuffer::total_bytes` (every path, buffered + in flight; summed on
+  demand, no drifting counter) plus the incoming write exceeds
+  `write_budget_bytes` (`hard_cap_mb - cache_mb - hard_cap_mb / 4`, none
+  without a cap), but only while any background batch is in flight
+  (`global_write_wait`): batches end without `path_guard`, so this never
+  deadlocks and a sole writer always progresses. Sync mode starts no batch
+  and never waits on it. The ladder log carries `write_buffer_bytes`.
 
 ## Errors
 

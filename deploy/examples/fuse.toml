@@ -156,7 +156,10 @@ mountpoint = "/mnt/dtfs"
 # CF-5: per-process RAM budget + pressure ladder. 0 = unbounded (legacy).
 # When non-zero, a background sampler watches RSS and, at the warn level,
 # halves the [readahead] cache_mb prefetch budget; at the shed level it drops
-# all unconsumed prefetch. systemd MemoryHigh/MemoryMax stay the hard backstop;
+# all unconsumed prefetch. With write.async_commit, the write buffers of all
+# files together (buffered + uploading) are held to hard_cap_mb -
+# readahead.cache_mb - hard_cap_mb / 4: a write over it waits for background
+# batches (never while none is in flight). systemd MemoryHigh/MemoryMax stay the hard backstop;
 # on a composite host the sum of all roles' caps must stay under host RAM
 # (CLAUDE.md § A.5).
 #hard_cap_mb = 0

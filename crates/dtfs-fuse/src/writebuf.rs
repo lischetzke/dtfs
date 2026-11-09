@@ -995,6 +995,24 @@ impl WriteBuffer {
             .unwrap_or(0)
     }
 
+    /// Write-buffer memory of the whole process: buffered bytes of every
+    /// path plus every in-flight drain (background batches and commits).
+    /// Summed on demand (no counter to drift across the many buffer
+    /// mutations); O(buffered chunks), like `dirty_bytes`.
+    pub fn total_bytes(&self) -> usize {
+        let buffered: usize = self
+            .buffers
+            .iter()
+            .map(|e| e.value().chunks.values().map(|cb| cb.data.len()).sum::<usize>())
+            .sum();
+        let inflight: usize = self
+            .inflight
+            .iter()
+            .map(|e| e.value().1.iter().map(|(_, d)| d.len()).sum::<usize>())
+            .sum();
+        buffered + inflight
+    }
+
     /// CR-1-1/CR-1-2 — true iff `chunk_index` is currently buffered AND its
     /// buffered range fully covers `0..chunk_size`, i.e. it is already safe
     /// to commit without an RMW seed.

@@ -335,6 +335,7 @@ async fn main() -> Result<()> {
     // 1 s tick commits any file whose oldest buffered byte is too old.
     if write_cfg.async_commit {
         tracing::warn!(
+            write_budget_bytes = ?fs.write_budget(),
             "write.async_commit = true: acknowledged writes may stay in client memory up to {} s / {} bytes per open file; a dtfs-fuse or host crash loses them",
             write_cfg.async_commit_secs,
             fs.dirty_cap(),
@@ -370,8 +371,9 @@ async fn main() -> Result<()> {
         );
         let controller = fs.readahead_controller();
         let ladder_budget = memory_budget.clone();
+        let ladder_fs = fs.clone();
         tokio::spawn(async move {
-            run_readahead_pressure_ladder(ladder_budget, controller).await;
+            run_readahead_pressure_ladder(ladder_budget, controller, || ladder_fs.write_buffer_bytes()).await;
         });
     }
     let mem_mon = memory_budget.clone();
@@ -606,6 +608,7 @@ where
 async fn run_readahead_pressure_ladder(
     budget: std::sync::Arc<dtfs_common::memory::MemoryBudget>,
     controller: readahead::ReadAheadCacheController,
+    write_bytes: impl Fn() -> usize,
 ) {
     use dtfs_common::memory::PressureLevel;
     let mut tick = tokio::time::interval(budget.sample_interval());
@@ -638,6 +641,7 @@ async fn run_readahead_pressure_ladder(
             evicted,
             cache_bytes = controller.cache_bytes(),
             prefetch_enabled = controller.prefetch_enabled(),
+            write_buffer_bytes = write_bytes(),
             "CF-5 memory pressure ladder adjusted readahead budget"
         );
         last_level = level;
