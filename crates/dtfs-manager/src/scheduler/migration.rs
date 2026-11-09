@@ -402,6 +402,11 @@ impl TaskScheduler {
                 return;
             }
         };
+        // The whole task map is one Raft entry: skip it when nothing changed
+        // (idle ticks, or a round save already persisted this state).
+        if migration_state_unchanged(&self.state_data.read().await.migration_state_json, state) {
+            return;
+        }
 
         let req = ClientRequest::UpdateMigrationState { json };
 
@@ -801,19 +806,24 @@ pub(super) async fn advance_migration_tasks<O: MigrationOps>(
     state: &mut MigrationState,
     now_ms: u64,
 ) {
-    advance_migration_tasks_budgeted(ops, state, now_ms, MIGRATION_TICK_BUDGET).await
+    advance_migration_tasks_budgeted(ops, state, now_ms, MIGRATION_TICK_BUDGET, SCHEDULER_TICK).await
 }
 
 /// `advance_migration_tasks` with an explicit wall-clock `budget`: no round
-/// after the first starts once it is spent, and state is saved after every
-/// round that progressed (so a leader change loses at most one round).
+/// after the first starts once it is spent. A round that progressed saves
+/// the state only once `save_every` has passed since the advance started or
+/// last saved (a long advance loses at most that much progress on a leader
+/// change); the caller's end-of-tick save persists the rest. Each save is the
+/// whole task map, so saving every round multiplied the Raft writes.
 pub(super) async fn advance_migration_tasks_budgeted<O: MigrationOps>(
     ops: &O,
     state: &mut MigrationState,
     now_ms: u64,
     budget: Duration,
+    save_every: Duration,
 ) {
     let started = std::time::Instant::now();
+    let mut last_save = started;
     // A task gets at most ONE Copying RPC and ONE Verifying RPC per call
     // (i.e. per tick). This preserves the pre-U3 retry cadence — a no-source
     // / transient-error task still burns one attempt per tick over
@@ -832,7 +842,10 @@ pub(super) async fn advance_migration_tasks_budgeted<O: MigrationOps>(
         if !progressed {
             break;
         }
-        ops.save_state(state).await;
+        if last_save.elapsed() >= save_every {
+            ops.save_state(state).await;
+            last_save = std::time::Instant::now();
+        }
     }
     // The chunk index lives across rounds (rebuilt only after an apply).
     ops.end_round();
@@ -1404,6 +1417,16 @@ impl ChunkIndex {
     /// Was every hash of `wanted` indexed?
     pub(crate) fn covers(&self, wanted: &std::collections::HashSet<String>) -> bool {
         wanted.iter().all(|h| self.map.contains_key(h))
+    }
+}
+
+/// Does the replicated `current` JSON already hold `state`? Compared as
+/// JSON values: the task map is a HashMap, so equal states serialise in
+/// different key orders.
+pub(crate) fn migration_state_unchanged(current: &str, state: &MigrationState) -> bool {
+    match (serde_json::from_str::<serde_json::Value>(current), serde_json::to_value(state)) {
+        (Ok(cur), Ok(new)) => cur == new,
+        _ => false,
     }
 }
 
@@ -2144,16 +2167,43 @@ mod sched_audit_tests {
     async fn spent_budget_stops_after_first_round_and_saves_per_round() {
         let ops = Ops::default();
         let mut state = state_of(MIGRATION_MAX_JOBS_PER_ROUND * 2 + 1);
-        advance_migration_tasks_budgeted(&ops, &mut state, 1, Duration::ZERO).await;
+        advance_migration_tasks_budgeted(&ops, &mut state, 1, Duration::ZERO, Duration::ZERO).await;
         assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), MIGRATION_MAX_JOBS_PER_ROUND);
         assert_eq!(ops.saves.load(Ordering::SeqCst), 1);
 
         let ops = Ops::default();
         let mut state = state_of(MIGRATION_MAX_JOBS_PER_ROUND * 2 + 1);
-        advance_migration_tasks_budgeted(&ops, &mut state, 1, Duration::from_secs(3600)).await;
+        let hour = Duration::from_secs(3600);
+        advance_migration_tasks_budgeted(&ops, &mut state, 1, hour, Duration::ZERO).await;
         assert_eq!(ops.replicate_calls.load(Ordering::SeqCst), MIGRATION_MAX_JOBS_PER_ROUND * 2 + 1);
         assert_eq!(ops.saves.load(Ordering::SeqCst), 3);
         assert!(state.tasks.values().all(|t| t.status == MigrationStatus::Done));
+    }
+
+    // ---- audit finding 13: at most one mid-advance save per interval ----
+    #[tokio::test]
+    async fn fast_advance_leaves_the_save_to_the_end_of_the_tick() {
+        let ops = Ops::default();
+        let mut state = state_of(MIGRATION_MAX_JOBS_PER_ROUND * 2 + 1);
+        let hour = Duration::from_secs(3600);
+        advance_migration_tasks_budgeted(&ops, &mut state, 1, hour, SCHEDULER_TICK).await;
+        assert!(state.tasks.values().all(|t| t.status == MigrationStatus::Done));
+        assert_eq!(ops.saves.load(Ordering::SeqCst), 0, "rounds within one interval must not save");
+    }
+
+    #[test]
+    fn unchanged_migration_state_is_not_re_proposed() {
+        let mut s = state_of(3);
+        // A different HashMap instance serialises in another order: still equal.
+        let current = serde_json::to_string(&serde_json::from_str::<MigrationState>(
+            &serde_json::to_string(&s).unwrap(),
+        ).unwrap()).unwrap();
+        assert!(migration_state_unchanged(&current, &s));
+        s.tasks.get_mut("repl-0").unwrap().attempts = 1;
+        assert!(!migration_state_unchanged(&current, &s));
+        // Empty / unparseable current state: always save.
+        assert!(!migration_state_unchanged("", &MigrationState::default()));
+        assert!(!migration_state_unchanged("{", &MigrationState::default()));
     }
 
     #[tokio::test]

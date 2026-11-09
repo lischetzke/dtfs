@@ -82,8 +82,8 @@ const MIGRATION_MAX_JOBS_PER_ROUND: usize = 2 * MIGRATION_COPY_CONCURRENCY;
 
 /// Wall-clock budget for the round loop of one tick: no new round starts
 /// once it is spent (a started round still finishes; each RPC inside is
-/// bounded). Migration state is saved after every round, so the progress
-/// survives a leader change.
+/// bounded). Migration state is saved after a round at most once per
+/// `SCHEDULER_TICK`, so a leader change loses at most that much progress.
 const MIGRATION_TICK_BUDGET: Duration = Duration::from_secs(600);
 
 /// Bug CN — hard wall-clock cap on a VerifyChunk RPC from the scheduler to a
