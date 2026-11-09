@@ -25,13 +25,22 @@ mod writebuf;
 
 use filesystem::DtfsFilesystem;
 
-// SIGTERM shutdown budgets. Their sum must stay below 45 s, the oldest
-// deployed `TimeoutStopSec` (hosts updated by `dtfs-cli update` never get the
-// unit refreshed); the current unit's 110 s is headroom only.
+// SIGTERM shutdown budget: one deadline from the signal, below 45 s, the
+// oldest deployed `TimeoutStopSec` (hosts updated by `dtfs-cli update` never
+// get the unit refreshed); the current unit's 110 s is headroom only. The
+// unmount is capped; the commit gets whatever the unmount left (a busy mount
+// fails the unmount at once, and that is when the commit matters); the lease
+// release keeps its own slice at the end.
+const SHUTDOWN_TOTAL_SECS: u64 = 40;
 const SHUTDOWN_UNMOUNT_SECS: u64 = 15;
-const SHUTDOWN_COMMIT_SECS: u64 = 22;
 const SHUTDOWN_LEASE_RELEASE_SECS: u64 = 5;
 const OLDEST_TIMEOUT_STOP_SECS: u64 = 45;
+
+/// Commit budget left after `elapsed` since the stop began.
+fn shutdown_commit_budget(elapsed: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_secs(SHUTDOWN_TOTAL_SECS - SHUTDOWN_LEASE_RELEASE_SECS)
+        .saturating_sub(elapsed)
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "dtfs-fuse", about = "DTFS FUSE Client Mount", version = dtfs_common::version::VERSION_STRING)]
@@ -418,6 +427,7 @@ async fn main() -> Result<()> {
         let signal_fut = wait_for_terminate_signal();
         tokio::pin!(signal_fut);
 
+        let mut stop_started = std::time::Instant::now();
         let session_result = tokio::select! {
             res = &mut handle => {
                 // External unmount (fusermount -u, or kernel umount).
@@ -425,6 +435,7 @@ async fn main() -> Result<()> {
                 res
             }
             _ = &mut signal_fut => {
+                stop_started = std::time::Instant::now();
                 info!("Bug U signal received — calling MountHandle::unmount() for clean teardown");
                 // Move the handle out of the select! borrow scope and
                 // request a synchronous unmount. The kernel will issue
@@ -484,9 +495,9 @@ async fn main() -> Result<()> {
         // A failed or timed-out unmount (busy mount: knfsd or a process
         // holding a file open) leaves handles the kernel never released:
         // commit their buffered bytes BEFORE dropping the leases. No-op after
-        // a clean unmount. Budgets: see SHUTDOWN_* (sum < 45 s).
+        // a clean unmount. Budget: what is left of SHUTDOWN_TOTAL_SECS.
         let (lost, ()) = shutdown_fs
-            .commit_open_writers_then(std::time::Duration::from_secs(SHUTDOWN_COMMIT_SECS), exit_release)
+            .commit_open_writers_then(shutdown_commit_budget(stop_started.elapsed()), exit_release)
             .await;
         if lost > 0 {
             tracing::error!(bytes = lost, "exiting with uncommitted buffered writes");
@@ -643,14 +654,28 @@ fn pressure_target_budget(
 #[cfg(test)]
 mod shutdown_budget_tests {
     use super::*;
+    use std::time::Duration;
 
     // FUSE-1: unmount + commit + lease release must finish before the
     // oldest unit's SIGKILL, or the lease release and per-path loss log die.
     #[test]
     fn shutdown_budgets_fit_oldest_timeout_stop_sec() {
-        let sum = SHUTDOWN_UNMOUNT_SECS + SHUTDOWN_COMMIT_SECS + SHUTDOWN_LEASE_RELEASE_SECS;
-        assert!(sum < OLDEST_TIMEOUT_STOP_SECS, "shutdown budgets sum {sum}s >= {OLDEST_TIMEOUT_STOP_SECS}s");
-        assert!(SHUTDOWN_COMMIT_SECS > 0 && SHUTDOWN_UNMOUNT_SECS > 0 && SHUTDOWN_LEASE_RELEASE_SECS > 0);
+        assert!(SHUTDOWN_TOTAL_SECS < OLDEST_TIMEOUT_STOP_SECS);
+        assert!(SHUTDOWN_UNMOUNT_SECS + SHUTDOWN_LEASE_RELEASE_SECS < SHUTDOWN_TOTAL_SECS);
+        // Worst case (unmount timed out): the commit still gets 20 s.
+        let worst = shutdown_commit_budget(Duration::from_secs(SHUTDOWN_UNMOUNT_SECS));
+        assert_eq!(worst, Duration::from_secs(20));
+    }
+
+    // A busy mount fails the unmount at once: the commit gets the time the
+    // unmount did not use, not a fixed slice (review of 4bb0b3b).
+    #[test]
+    fn commit_budget_takes_the_unused_unmount_time() {
+        assert_eq!(shutdown_commit_budget(Duration::ZERO), Duration::from_secs(35));
+        assert_eq!(shutdown_commit_budget(Duration::from_secs(3)), Duration::from_secs(32));
+        assert_eq!(shutdown_commit_budget(Duration::from_secs(60)), Duration::ZERO, "never negative");
+        let total = shutdown_commit_budget(Duration::ZERO) + Duration::from_secs(SHUTDOWN_LEASE_RELEASE_SECS);
+        assert!(total.as_secs() < OLDEST_TIMEOUT_STOP_SECS);
     }
 }
 

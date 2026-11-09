@@ -226,8 +226,9 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   bg batch), and logs every path not confirmed committed (chunk indices,
   bytes) as lost. A busy mount (knfsd, an open fd) never gets RELEASE, so
   this is the only commit of fsync-acknowledged async bytes. `destroy`
-  stays empty. Budgets (main.rs constants): unmount 15 s + commit 22 s +
-  lease release 5 s = 42 s, below `OLDEST_TIMEOUT_STOP_SECS` (45 s: hosts
+  stays empty. Budget (main.rs): one 40 s deadline from the signal; unmount capped
+  at 15 s, the commit gets the rest minus the 5 s lease release
+  (`shutdown_commit_budget`), below `OLDEST_TIMEOUT_STOP_SECS` (45 s: hosts
   updated by `dtfs-cli update` keep their old unit file); the unit's 110 s
   is headroom only.
 - `write.async_commit` background upload: write()'s batch (`flush()`) is
