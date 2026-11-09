@@ -522,14 +522,14 @@ impl ChunkStore {
 
         // Stamp mtime = commit time (rename keeps the tmp's last-write
         // mtime) so the manager's `if_mtime_le_ms` delete guard always sees
-        // a copy committed after the guard as re-uploaded. Synced so a
-        // crash cannot revert it. Under the chunk stripe lock.
+        // a copy committed after the guard as re-uploaded. Under the chunk
+        // stripe lock. Not fsynced: only a live concurrent DeleteChunk needs
+        // it; after a crash the put's Raft commit decides the chunk's fate.
+        // A failure only leaves the guard as weak as before: warn, continue.
         let stamped = std::fs::File::open(&final_dat_path)
-            .and_then(|f| f.set_modified(std::time::SystemTime::now()).and_then(|_| f.sync_all()));
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
         if let Err(e) = stamped {
-            tracing::warn!(chunk_id = %chunk_id, error = %e, "dat mtime stamp failed after rename");
-            cleanup_after_failed_commit(dat_existed, &final_dat_path, &final_meta_path, &wal_path).await;
-            return Err(DtfsError::Io(e));
+            tracing::warn!(chunk_id = %chunk_id, error = %e, "dat mtime stamp failed after rename; delete guard sees the tmp mtime");
         }
 
         // Bug L — fsync the parent directory after the rename so the
