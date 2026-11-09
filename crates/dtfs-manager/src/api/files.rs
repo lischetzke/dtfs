@@ -70,9 +70,7 @@ pub(super) async fn inspect_file_endpoint(
             })
         })
         .collect();
-    let total_size: u64 = file
-        .logical_size
-        .unwrap_or_else(|| file.chunks.iter().map(|c| c.size_bytes).sum());
+    let total_size: u64 = file.reported_size();
     Ok(Json(json!({
         "path":        &file.path,
         "volume_id":   &file.volume_id,

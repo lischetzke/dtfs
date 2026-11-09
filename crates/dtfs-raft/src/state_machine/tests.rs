@@ -4139,3 +4139,52 @@ mod ever_committed_tests {
         i % 3 != 0
     }
 }
+
+/// FUSE-1 — a file without `logical_size` reports its chunk extent
+/// (holes read as zeros), never the sum of chunk sizes: out-of-order
+/// background batch commits leave holes, and a summed size made the FUSE
+/// client pin a SetFileSize that dropped the later batch's chunks.
+#[cfg(test)]
+mod reported_size_tests {
+    use super::*;
+
+    const CS: u64 = 4 * 1024 * 1024;
+
+    fn row(i: u64, node: &str, size: u64) -> ChunkLocationEntry {
+        ChunkLocationEntry {
+            chunk_index: i, chunk_hash: format!("h{i}"), node_id: node.into(),
+            disk_id: 0, size_bytes: size,
+        }
+    }
+
+    fn file(chunks: Vec<ChunkLocationEntry>, logical_size: Option<u64>) -> FileMetadata {
+        FileMetadata {
+            path: "/f".into(), volume_id: "default".into(), chunk_size: CS, chunks,
+            created_at_ms: 0, updated_at_ms: 0, symlink_target: None, logical_size,
+            is_directory: false, cache_cooldown_until_ms: Default::default(),
+            ever_committed: Some(true),
+        }
+    }
+
+    #[test]
+    fn size_without_logical_size_is_chunk_extent_not_sum() {
+        // Chunks 0 and 5 (tail 100 B), two replicas of chunk 5.
+        let f = file(vec![row(0, "a", CS), row(5, "a", 100), row(5, "b", 100)], None);
+        assert_eq!(f.reported_size(), 5 * CS + 100);
+        let mut sm = StateMachineData::default();
+        sm.files.insert("/f".into(), f);
+        let e = sm.list_directory_entries("/");
+        assert_eq!(e.iter().find(|e| e.name == "f").unwrap().size_bytes, 5 * CS + 100);
+    }
+
+    #[test]
+    fn explicit_logical_size_wins_over_extent() {
+        // Negative: an explicit size (truncate below the extent, or sparse
+        // grow above it) is never replaced by the chunk extent.
+        let f = file(vec![row(0, "a", CS), row(5, "a", CS)], Some(CS));
+        assert_eq!(f.reported_size(), CS);
+        let f = file(vec![row(0, "a", CS)], Some(10 * CS));
+        assert_eq!(f.reported_size(), 10 * CS);
+        assert_eq!(file(vec![], None).reported_size(), 0);
+    }
+}

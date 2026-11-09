@@ -1657,12 +1657,9 @@ impl ManagerService for MetadataService {
         }
 
         let chunk_locations: Vec<ChunkLocationInfo> = by_chunk.into_values().collect();
-        // F-037 / F-033: if the file has an explicit logical size (set via
-        // truncate or fallocate), honour it; otherwise derive from the
-        // chunk sizes.
-        let total_size: u64 = file
-            .logical_size
-            .unwrap_or_else(|| chunk_locations.iter().map(|c| c.size).sum());
+        // F-037 / F-033: explicit logical size (truncate/fallocate) wins,
+        // else the chunk extent (`FileMetadata::reported_size`).
+        let total_size: u64 = file.reported_size();
 
         Ok(Response::new(GetFileLocationsResponse {
             path: req.path,

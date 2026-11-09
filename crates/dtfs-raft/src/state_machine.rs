@@ -75,7 +75,7 @@ pub struct FileMetadata {
     pub symlink_target: Option<String>,
     /// F-037 — explicit logical size override. Some flows (sparse files via
     /// truncate-grow, fallocate) need a size that isn't derived from the
-    /// chunk list. `None` falls back to the sum of chunk sizes.
+    /// chunk list. `None` falls back to the chunk extent (`reported_size`).
     #[serde(default)]
     pub logical_size: Option<u64>,
     /// Marker that this entry represents an empty directory rather than a
@@ -122,6 +122,32 @@ impl FileMetadata {
                 Some(ever) => ever,
                 None => self.logical_size != Some(0),
             }
+    }
+
+    /// Size every reader reports (GetFileLocations, readdir, REST): the
+    /// explicit `logical_size` when set, else the chunk extent
+    /// `max(chunk_index * chunk_size + size_bytes)`; holes read as zeros.
+    /// Never the sum of chunk sizes: out-of-order commits leave holes and a
+    /// summed size let the FUSE client pin a SetFileSize below committed
+    /// chunks (FUSE-1). Read-side only, no replicated state involved.
+    pub fn reported_size(&self) -> u64 {
+        if let Some(l) = self.logical_size {
+            return l;
+        }
+        if self.chunk_size == 0 {
+            // Legacy row without a chunk size: per-index sum is all we have.
+            let mut by_index: BTreeMap<u64, u64> = BTreeMap::new();
+            for c in &self.chunks {
+                let e = by_index.entry(c.chunk_index).or_insert(0);
+                *e = (*e).max(c.size_bytes);
+            }
+            return by_index.values().sum();
+        }
+        self.chunks
+            .iter()
+            .map(|c| c.chunk_index * self.chunk_size + c.size_bytes)
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -427,19 +453,7 @@ impl StateMachineData {
             //       child; its `is_directory` field determines the type.
             let (name, is_dir, file_size) = match relative.find('/') {
                 Some(slash) => (relative[..slash].to_string(), true, 0u64),
-                None => {
-                    // Sum child sizes by chunk_index so replicas don't
-                    // multiply the reported size.
-                    let mut sizes_by_index: BTreeMap<u64, u64> = BTreeMap::new();
-                    for c in &meta.chunks {
-                        let e = sizes_by_index.entry(c.chunk_index).or_insert(0);
-                        *e = (*e).max(c.size_bytes);
-                    }
-                    let logical_size: u64 = meta
-                        .logical_size
-                        .unwrap_or_else(|| sizes_by_index.values().sum());
-                    (relative.to_string(), meta.is_directory, logical_size)
-                }
+                None => (relative.to_string(), meta.is_directory, meta.reported_size()),
             };
 
             let updated = by_name.entry(name.clone()).or_insert(ListedEntry {
@@ -1294,8 +1308,8 @@ pub(crate) fn apply_request(
                 // (usually 0) size. Grow logical_size to cover the extent
                 // implied by the merged chunks, but never derive a size out
                 // of thin air for a file that has none set yet (None stays
-                // None; a chunk-only file still reports the summed-chunks
-                // fallback in metadata.rs).
+                // None; a chunk-only file reports its chunk extent via
+                // `FileMetadata::reported_size`).
                 let extent = file
                     .chunks
                     .iter()

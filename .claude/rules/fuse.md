@@ -256,7 +256,15 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   chunks); one batch ends with its slowest put, so with 1 the pipeline
   drained at every batch end (prod 59 MiB/s). Batches of a path have
   disjoint chunk sets (in-flight chunks left the buffer; writes into them
-  wait), so their overlapping commits still merge (`may_merge`). The
+  wait), so their overlapping commits still merge (`may_merge`). Uploads
+  run in parallel, but a batch's commit_chunk_locations waits until every
+  earlier batch of the path ended, committed + merged or restored
+  (`wait_commit_turn`: `bg_uploads` order, woken by `BgSlot`, no commit
+  token held while waiting; it never waits on a later batch or a
+  `path_guard`). A later batch committing first left a hole below it the
+  manager reported as the summed size and the next sparse-write pin
+  dropped the later chunks (FUSE-1); the manager now also reports the
+  chunk extent for a file without explicit size. The
   per-file dirty cap is `max(128 MB, (n + 1) x batch limit)` (`dirty_cap_for`;
   n = 1 when async_commit is off). The task
   (`bg_upload`) renews the lease (`renew_if_due`), keeps `begin_inflight`

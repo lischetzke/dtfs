@@ -195,7 +195,7 @@ Query: `limit` (default 1000, clamped to 1..100000), `offset` (default 0), `pref
 
 ### GET /api/v1/files/inspect
 
-Query `path` (required). Response: `path`, `volume_id`, `total_size`, `chunk_size`, `chunk_count`, `chunks` (array of `{chunk_index, chunk_id, size, node_ids, replicas: [{node_id, disk_id, tier}]}`). `404 {"error": "file not found: ..."}`.
+Query `path` (required). Response: `path`, `volume_id`, `total_size`, `chunk_size`, `chunk_count`, `chunks` (array of `{chunk_index, chunk_id, size, node_ids, replicas: [{node_id, disk_id, tier}]}`). `404 {"error": "file not found: ..."}`. `total_size` is the file size readers see (same as `GetFileLocations` and readdir): the explicit size when one was set (truncate, fallocate), else the end of the last chunk (`chunk_index * chunk_size + size`; missing chunks in between read as zeros). The list endpoint's `total_size` is stored chunk bytes instead.
 
 ### POST /api/v1/files/flush_cache
 

@@ -1881,7 +1881,7 @@ impl DtfsFilesystem {
                     self.renew_if_due(fh, &path).await?;
                     let (segs, _inflight) = self.cap_drain(&path, at, n);
                     if !segs.is_empty() {
-                        let committed = match self.flush_segments_to_cluster(fh, &path, &segs).await {
+                        let committed = match self.flush_segments_to_cluster(fh, &path, &segs, None).await {
                             Ok(c) => c,
                             Err(e) => {
                                 self.write_buffer.restore_segments(&path, &segs);
@@ -1907,7 +1907,7 @@ impl DtfsFilesystem {
             self.renew_if_due(fh, &path).await?;
             let (segs, _inflight) = self.cap_drain(&path, effective_offset, data.len());
             if !segs.is_empty() {
-                let committed = match self.flush_segments_to_cluster(fh, &path, &segs).await {
+                let committed = match self.flush_segments_to_cluster(fh, &path, &segs, None).await {
                     Ok(c) => c,
                     Err(e) => {
                         self.write_buffer.restore_segments(&path, &segs);
@@ -1945,7 +1945,7 @@ impl DtfsFilesystem {
                 self.write_buffer.restore_segments(&path, &segments);
                 return Err(e);
             }
-            let committed = match self.flush_segments_to_cluster(fh, &path, &segments).await {
+            let committed = match self.flush_segments_to_cluster(fh, &path, &segments, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     // CO-1-8 (a): `flush` already drained these complete chunks out
@@ -2108,6 +2108,7 @@ impl DtfsFilesystem {
     /// `path_guard` and checked `bg_batches`). Batches of a path have
     /// disjoint chunk sets, so their overlapping commits still merge
     /// (`CommitToken::may_merge`); each keeps `upload_concurrency` puts busy.
+    /// Uploads run in parallel, commits in start order (`wait_commit_turn`).
     /// `inflight`: the batch's overlay id (`flush_inflight`), adopted by the task.
     fn spawn_bg_upload(self: &Arc<Self>, fh: u64, path: String, segs: Vec<crate::writebuf::ChunkSegment>, inflight: u64) {
         let mut chunks: Vec<u32> = segs.iter().map(|s| s.chunk_index).collect();
@@ -2133,7 +2134,7 @@ impl DtfsFilesystem {
             // land in a file re-created at `path`.
             Ok(()) => {
                 let cur = self.open_files.get(&fh).map(|f| f.path.clone()).unwrap_or_else(|| path.clone());
-                self.flush_segments_to_cluster(fh, &cur, &segs).await
+                self.flush_segments_to_cluster(fh, &cur, &segs, Some((&path, inflight))).await
             }
             Err(e) => Err(e),
         };
@@ -2203,6 +2204,16 @@ impl DtfsFilesystem {
     /// async_commit is off: nothing is ever spawned).
     async fn wait_bg_uploads(&self, path: &str) {
         self.wait_bg(|| !self.bg_uploads.contains_key(path)).await;
+    }
+
+    /// Background batches of `path` commit in start order (FUSE-1): batch
+    /// `id` waits until no batch started before it is in `bg_uploads` (the
+    /// entry is pushed in start order and leaves via `BgSlot` after its
+    /// commit + merge or restore, also on panic). Else a later batch could
+    /// commit first and the manager size cover a hole below it.
+    async fn wait_commit_turn(&self, path: &str, id: u64) {
+        self.wait_bg(|| self.bg_uploads.get(path).is_none_or(|v| v.first().is_none_or(|b| b.0 == id)))
+            .await;
     }
 
     /// Background batches of `path` in flight.
@@ -2395,7 +2406,7 @@ impl DtfsFilesystem {
         let had_segments = !segments.is_empty();
         let mut committed = None;
         if had_segments {
-            match self.flush_segments_to_cluster(fh, &path, &segments).await {
+            match self.flush_segments_to_cluster(fh, &path, &segments, None).await {
                 Ok(c) => committed = Some(c),
                 Err(e) => {
                 // CR-1-4 (FUSE-3): ALWAYS restore the drained segments on a
@@ -3461,11 +3472,14 @@ impl DtfsFilesystem {
     /// the assigned data node. On success returns the committed chunks as
     /// `ChunkInfo`s for `mark_committed_and_refresh` (`None` when the commit
     /// was lease-less) plus the commit's tracker slot, held until the merge.
+    /// `turn`: a background batch `(bg_uploads key, id)` uploads at once but
+    /// commits only in its turn (`wait_commit_turn`).
     async fn flush_segments_to_cluster(
         &self,
         fh: u64,
         path: &str,
         segments: &[crate::writebuf::ChunkSegment],
+        turn: Option<(&str, u64)>,
     ) -> Result<Committed<'_>> {
         if segments.is_empty() {
             return Ok(Committed { chunks: Some(Vec::new()), token: None });
@@ -3719,6 +3733,10 @@ impl DtfsFilesystem {
         for (info, seg_commits) in uploaded {
             committed.push(info);
             commits.extend(seg_commits);
+        }
+
+        if let Some((key, id)) = turn {
+            self.wait_commit_turn(key, id).await;
         }
 
         // Bug P — find the lease_id for this path so the manager can
@@ -6982,6 +7000,50 @@ mod async_commit_fs_tests {
         let done = tokio::time::timeout(Duration::from_secs(2), flush).await;
         done.expect("all batches ended: flush must finish").unwrap().unwrap();
         assert!(fs.bg_uploads.is_empty());
+    }
+
+    /// FUSE-1: batches of a path commit in start order. Batch 2's commit
+    /// waits until batch 1 ended (committed + merged, or restored); the
+    /// first batch never waits; a later batch ending does not release one
+    /// still behind an earlier batch.
+    #[tokio::test]
+    async fn multibatch_commits_wait_for_every_earlier_batch() {
+        let fs = Arc::new(fs(true));
+        let cs = fs.write_buffer.chunk_size();
+        fs.bg_uploads.insert("/f".to_string(), vec![(1, vec![0], cs), (2, vec![1], cs), (3, vec![2], cs)]);
+        assert!(!pending(fs.wait_commit_turn("/f", 1)).await, "the first batch commits at once");
+        let f2 = fs.clone();
+        let mut b2 = tokio::spawn(async move { f2.wait_commit_turn("/f", 2).await });
+        let f3 = fs.clone();
+        let mut b3 = tokio::spawn(async move { f3.wait_commit_turn("/f", 3).await });
+        assert!(tokio::time::timeout(Duration::from_millis(300), &mut b2).await.is_err(), "batch 2 must wait for batch 1");
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: 1 });
+        tokio::time::timeout(Duration::from_secs(2), b2).await.expect("batch 1 ended: batch 2 commits").unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(300), &mut b3).await.is_err(), "batch 3 still behind 2");
+        drop(BgSlot { fs: &fs, path: "/f".into(), id: 2 });
+        tokio::time::timeout(Duration::from_secs(2), b3).await.expect("batch 2 ended: batch 3 commits").unwrap();
+        // Other paths are independent.
+        fs.bg_uploads.insert("/g".to_string(), vec![(7, vec![0], cs)]);
+        assert!(!pending(fs.wait_commit_turn("/f", 3)).await, "/g's batch does not order /f");
+    }
+
+    /// FUSE-1: an earlier batch whose task panics still releases the next
+    /// one (BgSlot's drop removes it and wakes waiters).
+    #[tokio::test]
+    async fn multibatch_panicked_earlier_batch_releases_the_next() {
+        let fs = Arc::new(fs(true));
+        let cs = fs.write_buffer.chunk_size();
+        fs.bg_uploads.insert("/f".to_string(), vec![(1, vec![0], cs), (2, vec![1], cs)]);
+        let f2 = fs.clone();
+        let mut b2 = tokio::spawn(async move { f2.wait_commit_turn("/f", 2).await });
+        assert!(tokio::time::timeout(Duration::from_millis(300), &mut b2).await.is_err(), "batch 2 must wait");
+        let f1 = fs.clone();
+        let b1 = tokio::spawn(async move {
+            let _slot = BgSlot { fs: &f1, path: "/f".into(), id: 1 };
+            panic!("batch 1 task panics");
+        });
+        assert!(b1.await.is_err());
+        tokio::time::timeout(Duration::from_secs(2), b2).await.expect("panicked batch 1 released batch 2").unwrap();
     }
 
     /// multibatch: batch 1 fails, disjoint batch 2 succeeds: the error stays
