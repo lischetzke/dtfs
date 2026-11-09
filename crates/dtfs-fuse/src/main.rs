@@ -25,6 +25,14 @@ mod writebuf;
 
 use filesystem::DtfsFilesystem;
 
+// SIGTERM shutdown budgets. Their sum must stay below 45 s, the oldest
+// deployed `TimeoutStopSec` (hosts updated by `dtfs-cli update` never get the
+// unit refreshed); the current unit's 110 s is headroom only.
+const SHUTDOWN_UNMOUNT_SECS: u64 = 15;
+const SHUTDOWN_COMMIT_SECS: u64 = 22;
+const SHUTDOWN_LEASE_RELEASE_SECS: u64 = 5;
+const OLDEST_TIMEOUT_STOP_SECS: u64 = 45;
+
 #[derive(Parser, Debug)]
 #[command(name = "dtfs-fuse", about = "DTFS FUSE Client Mount", version = dtfs_common::version::VERSION_STRING)]
 struct Args {
@@ -423,7 +431,7 @@ async fn main() -> Result<()> {
                 // flush()/release() ops on every open inode before this
                 // returns, giving writebuf a chance to push final segments.
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(SHUTDOWN_UNMOUNT_SECS),
                     handle.unmount(),
                 )
                 .await
@@ -437,7 +445,7 @@ async fn main() -> Result<()> {
                         Ok(())
                     }
                     Err(_) => {
-                        tracing::warn!("Bug U FUSE unmount timed out after 30s — orphan mount may require `fusermount -uz`");
+                        tracing::warn!(secs = SHUTDOWN_UNMOUNT_SECS, "Bug U FUSE unmount timed out — orphan mount may require `fusermount -uz`");
                         Ok(())
                     }
                 }
@@ -454,7 +462,7 @@ async fn main() -> Result<()> {
         // we exactly undo our own footprint.
         let exit_release = async {
             let release = shutdown_client.release_leases_by_host(&hostname_for_cleanup, current_pid);
-            match tokio::time::timeout(std::time::Duration::from_secs(5), release).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(SHUTDOWN_LEASE_RELEASE_SECS), release).await {
                 Ok(Ok(resp)) => {
                     if resp.released_count > 0 {
                         info!(
@@ -476,10 +484,9 @@ async fn main() -> Result<()> {
         // A failed or timed-out unmount (busy mount: knfsd or a process
         // holding a file open) leaves handles the kernel never released:
         // commit their buffered bytes BEFORE dropping the leases. No-op after
-        // a clean unmount. 30 s unmount + 60 s + 5 s release stays below the
-        // unit's TimeoutStopSec=110s.
+        // a clean unmount. Budgets: see SHUTDOWN_* (sum < 45 s).
         let (lost, ()) = shutdown_fs
-            .commit_open_writers_then(std::time::Duration::from_secs(60), exit_release)
+            .commit_open_writers_then(std::time::Duration::from_secs(SHUTDOWN_COMMIT_SECS), exit_release)
             .await;
         if lost > 0 {
             tracing::error!(bytes = lost, "exiting with uncommitted buffered writes");
@@ -630,6 +637,20 @@ fn pressure_target_budget(
         PressureLevel::Normal => configured,
         PressureLevel::Warn => configured / 2,
         PressureLevel::Shed => 0,
+    }
+}
+
+#[cfg(test)]
+mod shutdown_budget_tests {
+    use super::*;
+
+    // FUSE-1: unmount + commit + lease release must finish before the
+    // oldest unit's SIGKILL, or the lease release and per-path loss log die.
+    #[test]
+    fn shutdown_budgets_fit_oldest_timeout_stop_sec() {
+        let sum = SHUTDOWN_UNMOUNT_SECS + SHUTDOWN_COMMIT_SECS + SHUTDOWN_LEASE_RELEASE_SECS;
+        assert!(sum < OLDEST_TIMEOUT_STOP_SECS, "shutdown budgets sum {sum}s >= {OLDEST_TIMEOUT_STOP_SECS}s");
+        assert!(SHUTDOWN_COMMIT_SECS > 0 && SHUTDOWN_UNMOUNT_SECS > 0 && SHUTDOWN_LEASE_RELEASE_SECS > 0);
     }
 }
 

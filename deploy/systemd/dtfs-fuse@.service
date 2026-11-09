@@ -34,7 +34,8 @@ ExecStart=/usr/local/bin/dtfs-fuse --config /etc/dtfs/fuse.toml --mountpoint /%I
 ExecStop=/usr/bin/fusermount3 -u /%I
 Restart=on-failure
 RestartSec=5
-# 30 s unmount + up to 60 s committing still-open writers + 5 s lease release.
+# 15 s unmount + up to 22 s committing still-open writers + 5 s lease release
+# (dtfs-fuse keeps the sum below 45 s, the oldest deployed value); 110 s is headroom.
 TimeoutStopSec=110s
 KillSignal=SIGTERM
 SendSIGKILL=yes
