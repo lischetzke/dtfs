@@ -224,7 +224,10 @@ manager ignores the field and removes the row hash-blind where a v0.1.14 node
 refuses, so the replicated state diverges. A manager that rejoins on an older
 binary closes the gate only at its next registration (a few seconds); entries
 already in the log stay named. Roll managers back only before any v0.1.14 leader
-ran with all managers on v0.1.14.
+ran with all managers on v0.1.14. The same holds for adding or replacing a
+manager: never join one below v0.1.14 (for example from an inventory pinned to
+an old tag), since it replays the named entries after the leader's snapshot
+hash-blind.
 
 Per node:
 
