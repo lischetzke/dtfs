@@ -20,7 +20,6 @@ anyhow = { workspace = true }
 # everything else transient -> EIO). tonic is already in the lockfile via
 # dtfs-client/dtfs-proto; this just makes Status downcastable in the adapter.
 tonic = { workspace = true }
-thiserror = { workspace = true }
 clap = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }

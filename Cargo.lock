@@ -667,9 +667,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "dtfs-client",
  "dtfs-common",
- "dtfs-proto",
  "minisign-verify",
  "reqwest",
  "serde",
@@ -677,9 +675,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
- "tonic",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -687,14 +682,11 @@ name = "dtfs-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "bytes",
  "dashmap",
  "dtfs-common",
  "dtfs-proto",
- "futures",
  "parking_lot",
- "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -706,17 +698,12 @@ name = "dtfs-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
- "bincode",
  "blake3",
  "bytes",
  "chrono",
  "hmac",
- "parking_lot",
- "rand 0.8.5",
  "rcgen",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2",
@@ -743,16 +730,12 @@ dependencies = [
  "dashmap",
  "dtfs-common",
  "dtfs-proto",
- "futures",
  "hex",
  "libc",
  "parking_lot",
- "prometheus-client",
- "prost",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "toml",
@@ -779,7 +762,6 @@ dependencies = [
  "libc",
  "parking_lot",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "toml",
  "tonic",
@@ -807,20 +789,17 @@ dependencies = [
  "http-body-util",
  "openraft",
  "parking_lot",
- "prometheus-client",
  "prost",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "toml",
  "tonic",
  "tower",
- "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -841,31 +820,20 @@ dependencies = [
 name = "dtfs-raft"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-trait",
  "bincode",
  "blake3",
  "bytes",
  "dtfs-common",
- "dtfs-proto",
  "futures",
  "openraft",
- "prost",
  "rocksdb",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tonic",
  "tracing",
 ]
-
-[[package]]
-name = "dtoa"
-version = "1.0.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
 
 [[package]]
 name = "dyn-clone"
@@ -1227,12 +1195,6 @@ dependencies = [
  "http-body",
  "pin-project-lite",
 ]
-
-[[package]]
-name = "http-range-header"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
 
 [[package]]
 name = "httparse"
@@ -1734,16 +1696,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
-name = "mime_guess"
-version = "2.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
-dependencies = [
- "mime",
- "unicase",
-]
-
-[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2068,29 +2020,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "prometheus-client"
-version = "0.23.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf41c1a7c32ed72abe5082fb19505b969095c12da9f5732a4bc9878757fd087c"
-dependencies = [
- "dtoa",
- "itoa",
- "parking_lot",
- "prometheus-client-derive-encode",
-]
-
-[[package]]
-name = "prometheus-client-derive-encode"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "440f724eba9f6996b75d63681b0a92b06947f1457076d503a4d2e2c8f56442b8"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -2590,15 +2519,6 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
 ]
 
 [[package]]
@@ -3201,24 +3121,14 @@ checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
 dependencies = [
  "bitflags",
  "bytes",
- "futures-core",
  "futures-util",
  "http",
  "http-body",
- "http-body-util",
- "http-range-header",
- "httpdate",
  "iri-string",
- "mime",
- "mime_guess",
- "percent-encoding",
  "pin-project-lite",
- "tokio",
- "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -3330,12 +3240,6 @@ name = "typenum"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
-
-[[package]]
-name = "unicase"
-version = "2.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"

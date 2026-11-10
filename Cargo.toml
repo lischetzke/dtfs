@@ -41,7 +41,6 @@ rocksdb = "0.22"
 # HTTP / WebUI
 axum = { version = "0.8", features = ["tokio"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 http-body-util = "0.1"
 
 # TLS
@@ -50,14 +49,12 @@ tokio-rustls = "0.26"
 # CF-6: x509-parser lets generate_node_cert reconstruct the issuer from the
 # real CA cert PEM so the node cert's issuer DN matches the trust anchor.
 rcgen = { version = "0.13", features = ["x509-parser"] }
-rustls-pemfile = "2"
 
 # Hashing / Checksums
 blake3 = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Metrics
-prometheus-client = "0.23"
 
 # Tracing / Logging
 tracing = "0.1"
@@ -71,7 +68,6 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-rand = "0.8"
 dashmap = "6"
 parking_lot = "0.12"
 async-trait = "0.1"

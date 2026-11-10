@@ -10,7 +10,6 @@ chrono = { workspace = true }
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-bincode = { workspace = true }
 toml = { workspace = true }
 blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
@@ -19,16 +18,12 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-rand = { workspace = true }
 tracing = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 tokio = { workspace = true }
-parking_lot = { workspace = true }
-async-trait = { workspace = true }
 # CF-6 — TlsContext builds tonic Server/ClientTlsConfig + endpoints.
 tonic = { workspace = true }
 
