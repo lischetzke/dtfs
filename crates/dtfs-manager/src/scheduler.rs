@@ -200,6 +200,24 @@ pub struct TaskScheduler {
     orphan_run: Arc<tokio::sync::Mutex<()>>,
     /// Last (or running) orphan reap, for `GET /api/v1/scrub/orphans`.
     orphan_last_run: parking_lot::Mutex<Option<OrphanRunRecord>>,
+    /// Issue #157 — the `default` volume this manager's config describes;
+    /// the leader tick creates it when missing (`set_default_volume`).
+    default_volume: parking_lot::RwLock<Option<dtfs_common::types::VolumeConfig>>,
+}
+
+/// Issue #157 — the create-if-missing proposal for the `default` volume, or
+/// `None` when it exists. `expected_version: Some(0)` makes apply refuse it
+/// once any `default` was stored (versions start at 1), so a racing operator
+/// edit is never overwritten.
+pub(crate) fn default_volume_request(
+    sm: &StateMachineData,
+    cfg: &dtfs_common::types::VolumeConfig,
+    now_ms: u64,
+) -> Option<ClientRequest> {
+    if sm.volumes.contains_key(&cfg.id.0) {
+        return None;
+    }
+    Some(ClientRequest::UpsertVolume { config: cfg.clone(), expected_version: Some(0), now_ms })
 }
 
 impl TaskScheduler {
@@ -246,6 +264,27 @@ impl TaskScheduler {
             round_index: parking_lot::Mutex::new(None),
             orphan_run: Arc::new(tokio::sync::Mutex::new(())),
             orphan_last_run: parking_lot::Mutex::new(None),
+            default_volume: parking_lot::RwLock::new(None),
+        }
+    }
+
+    /// Issue #157 — wire the `default` volume from `[defaults]` (main.rs).
+    pub fn set_default_volume(&self, cfg: dtfs_common::types::VolumeConfig) {
+        *self.default_volume.write() = Some(cfg);
+    }
+
+    /// Issue #157 — leader-only, every tick until it lands: create the
+    /// `default` volume when it is missing.
+    async fn ensure_default_volume(&self) {
+        let Some(cfg) = self.default_volume.read().clone() else { return };
+        let req = {
+            let sm = self.state_data.read().await;
+            default_volume_request(&sm, &cfg, now_millis())
+        };
+        let Some(req) = req else { return };
+        match self.raft_write_checked(req).await {
+            Ok(()) => info!(anchor = ?cfg.anchor_datacenter, "default volume created"),
+            Err(e) => warn!(error = %e, "default volume create failed; retrying next tick"),
         }
     }
 
@@ -430,6 +469,8 @@ impl TaskScheduler {
             tracing::trace!("Scheduler tick skipped: not leader");
             return Ok(());
         }
+
+        self.ensure_default_volume().await;
 
         // CO-3-5 — hold the migration-state lock across the entire
         // load..save lifecycle of this tick so a concurrent

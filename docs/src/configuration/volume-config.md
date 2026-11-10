@@ -71,4 +71,4 @@ Result: every chunk has one cold replica in `leli`; two reads from a datacenter 
 
 ## Default volume
 
-The `default` volume is created at bootstrap from `[defaults]`. Files created without a volume id land in it. A file's volume is fixed at creation; the FUSE client never downgrades a known volume to `default`, and chunk placement always follows the file's own volume.
+The leader creates the `default` volume from its `[defaults]` on the first scheduler tick that finds it missing (retried every tick until it lands; an existing `default` is never overwritten). Files created without a volume id land in it. A file's volume is fixed at creation; the FUSE client never downgrades a known volume to `default`, and chunk placement always follows the file's own volume.

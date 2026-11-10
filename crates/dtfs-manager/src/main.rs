@@ -266,73 +266,6 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
-        // Bug Z — upsert the "default" volume so anchor enforcement and
-        // per-tier replication actually apply. Without this, allocate_chunks
-        // can't read a `VolumeConfig` and the auto-implicit volume has
-        // `anchor_datacenter = None`, so every chunk lands on whichever
-        // node round-robin happens to pick. Plexmedia operator sets
-        // `defaults.anchor_datacenter = "leli"` so data-primary01 holds a
-        // copy of every chunk.
-        //
-        // AV-4-8 fix — the upsert is **insert-if-missing**, not
-        // unconditional. Pre-fix every manager boot called
-        // `UpsertVolume { config: bootstrap_default }` and the state-
-        // machine's apply path is a blind `volumes.insert(id, config)`,
-        // so any operator-supplied `set-cache` / `set-mandatory` on
-        // `default` was silently destroyed on the next manager restart.
-        // We now check the SM first and skip the upsert when `default`
-        // already exists; a fresh cluster (no existing entry) still
-        // gets the bootstrap volume.
-        let raft_for_volume = raft.clone();
-        let sm_data_for_bootstrap = sm_data.clone();
-        let default_volume_replication = config.defaults.replication.clone();
-        let default_chunk_size_bytes =
-            (config.defaults.chunk_size_mb as u64).saturating_mul(1024 * 1024);
-        let default_write_safety = config.defaults.write_safety.clone();
-        let default_anchor = config.defaults.anchor_datacenter.clone();
-        tokio::spawn(async move {
-            // Wait for raft to elect a leader before proposing.
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-            // AV-4-8 — skip when the operator already configured the
-            // default volume (typical post-bootstrap restart).
-            if sm_data_for_bootstrap.read().await.volumes.contains_key("default") {
-                tracing::info!(
-                    "Bug Z default volume already present; skipping bootstrap upsert (operator config preserved)"
-                );
-                return;
-            }
-
-            let vol_cfg = dtfs_common::types::VolumeConfig {
-                id: dtfs_common::types::VolumeId::new("default".to_string()),
-                name: "default".to_string(),
-                chunk_size_bytes: default_chunk_size_bytes,
-                replication: default_volume_replication,
-                write_safety: default_write_safety,
-                anchor_datacenter: default_anchor.clone(),
-                // Bug AV — new fields default to empty/disabled so the
-                // bootstrap-default volume stays on the legacy policy.
-                // Operators upgrade explicitly via
-                // `dtfs-cli volume migrate-policy default`.
-                mandatory_replicas: dtfs_common::types::TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 },
-                cache_replicas: dtfs_common::types::CacheReplication::default(),
-                anchor: None,
-                spill: dtfs_common::types::SpillPolicy::default(),
-                version: 0,
-            };
-            match raft_for_volume
-                .client_write(dtfs_raft::ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: vol_cfg, expected_version: None })
-                .await
-            {
-                Ok(_) => tracing::info!(
-                    anchor = ?default_anchor,
-                    "Bug Z default volume upserted with anchor enforcement (fresh cluster)"
-                ),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Bug Z default volume upsert failed at bootstrap")
-                }
-            }
-        });
     }
 
     // --- Shared services ---
@@ -419,6 +352,10 @@ async fn main() -> anyhow::Result<()> {
         tls_ctx.clone(),
         config.placement.clone(),
     ));
+    // Bug Z / issue #157 — the leader's scheduler tick creates the `default`
+    // volume when missing (was a one-shot write 5 s after bootstrap that
+    // failed without quorum and never retried).
+    task_scheduler.set_default_volume(bootstrap_default_volume(&config));
     // CF-5 — let the scheduler skip ticks under memory pressure.
     task_scheduler.set_memory_budget(memory_budget.clone());
     // LIS-19 — stamp DeleteChunk RPCs (flush / orphan reap) with the cluster secret.
@@ -871,6 +808,25 @@ async fn manager_self_register_lifecycle(
                 "Bug BR-1 self-register: no manager reachable this tick; retrying next tick"
             );
         }
+    }
+}
+
+/// Bug Z — the `default` volume from `[defaults]`. The new AV policy fields
+/// stay empty/disabled (legacy policy); operators upgrade explicitly via
+/// `dtfs-cli volume migrate-policy default`.
+fn bootstrap_default_volume(config: &dtfs_common::config::ManagerConfig) -> dtfs_common::types::VolumeConfig {
+    dtfs_common::types::VolumeConfig {
+        id: dtfs_common::types::VolumeId::new("default".to_string()),
+        name: "default".to_string(),
+        chunk_size_bytes: (config.defaults.chunk_size_mb as u64).saturating_mul(1024 * 1024),
+        replication: config.defaults.replication.clone(),
+        write_safety: config.defaults.write_safety.clone(),
+        anchor_datacenter: config.defaults.anchor_datacenter.clone(),
+        mandatory_replicas: dtfs_common::types::TierReplication { hot: 0, warm: 0, cold: 0, tape: 0 },
+        cache_replicas: dtfs_common::types::CacheReplication::default(),
+        anchor: None,
+        spill: dtfs_common::types::SpillPolicy::default(),
+        version: 0,
     }
 }
 

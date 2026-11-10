@@ -3318,3 +3318,36 @@ mod anchor_tier_fallback_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod issue_157_default_volume_tests {
+    use super::super::default_volume_request;
+    use dtfs_raft::state_machine::StateMachineData;
+    use dtfs_raft::ClientRequest;
+
+    fn cfg() -> dtfs_common::types::VolumeConfig {
+        let mut v = dtfs_common::types::VolumeConfig::default();
+        v.id = dtfs_common::types::VolumeId::new("default".to_string());
+        v.name = "default".into();
+        v
+    }
+
+    /// Issue #157 — a leader tick on a state without `default` proposes a
+    /// create-only UpsertVolume; once it exists, nothing is proposed.
+    #[test]
+    fn issue_157_default_volume_created_only_when_missing() {
+        let mut sm = StateMachineData::default();
+        match default_volume_request(&sm, &cfg(), 42) {
+            Some(ClientRequest::UpsertVolume { config, expected_version, now_ms }) => {
+                assert_eq!(config.id.0, "default");
+                assert_eq!(expected_version, Some(0), "must be create-only");
+                assert_eq!(now_ms, 42);
+            }
+            other => panic!("expected UpsertVolume, got {other:?}"),
+        }
+        let mut existing = cfg();
+        existing.version = 3;
+        sm.volumes.insert("default".into(), existing);
+        assert!(default_volume_request(&sm, &cfg(), 42).is_none());
+    }
+}
