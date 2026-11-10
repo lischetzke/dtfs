@@ -89,8 +89,9 @@ text there.
   tiers; allocation fills it across maintained tiers; the only lowering is
   the capacity clamp (healthy maintained nodes, same eligibility rule as the
   fill, never 0, warn + audit `write_safety.floor_clamped`).
-- A survivor that authorises dropping another replica must be live;
-  `apply_remove_chunk_location` refuses to remove the last live replica.
+- A survivor that authorises dropping another replica must pass
+  `survivor_replica_tier` (live, node not Maintenance/Quarantined, no
+  quarantine record); `apply_remove_chunk_location` refuses to remove the last live replica.
 - Every promote/demote/flush checks the anchor against the destination
   (`would_violate_anchor_for`, `demote_preserves_anchor`, `enforce_anchor` on
   apply). Anchor DC compares case-insensitively.

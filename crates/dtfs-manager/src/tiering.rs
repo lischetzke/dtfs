@@ -876,8 +876,9 @@ impl TieringEngine {
                     let Some(t) = tier else { continue };
                     // CR-3-1/MGR-2 — resolve liveness through the shared
                     // helper so Down/Failed nodes and Failed/Removed
-                    // disks never count as a surviving replica.
-                    let live = crate::scheduler::live_replica_tier(node_info, e.disk_id).is_some();
+                    // disks never count as a surviving replica. #114 —
+                    // nor Maintenance/Quarantined nodes (never marked Down).
+                    let live = crate::scheduler::survivor_replica_tier(node_info, e.disk_id).is_some();
                     placements.push(TickPlacement {
                         node_id: nid,
                         disk_id: e.disk_id,

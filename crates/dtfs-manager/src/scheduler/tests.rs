@@ -267,6 +267,53 @@ mod bug_ch_live_replica_tests {
         assert_eq!(live_replica_tier(Some(&n), 7), None); // no disk with id 7
     }
 
+    // #114 — a Maintenance (maybe powered off) or Quarantined (bytes
+    // suspect) node is never Down, so it stays `live` for repair coverage
+    // but must not authorise removing another copy.
+    #[test]
+    fn issue_114_maintenance_or_quarantined_is_no_survivor() {
+        use super::survivor_replica_tier;
+        for h in [HealthStatus::Maintenance, HealthStatus::Quarantined] {
+            let n = node(h, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]);
+            assert_eq!(live_replica_tier(Some(&n), 0), Some(DiskTier::Cold), "{h:?} still counts for repair");
+            assert_eq!(survivor_replica_tier(Some(&n), 0), None, "{h:?} is no survivor");
+        }
+        let mut n = node(HealthStatus::Healthy, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]);
+        n.quarantine = Some(dtfs_common::types::QuarantineInfo {
+            since_ms: 1,
+            reason: dtfs_common::types::QuarantineReason::OrphanScrubInStateMissing,
+            triggering_chunk_id: None,
+            fault_count_total: 1,
+            last_fault_at_ms: 1,
+            last_fault_summary: String::new(),
+        });
+        assert_eq!(survivor_replica_tier(Some(&n), 0), None, "quarantine record set");
+        assert_eq!(survivor_replica_tier(None, 0), None);
+    }
+
+    #[test]
+    fn issue_114_healthy_suspect_draining_are_survivors() {
+        use super::survivor_replica_tier;
+        for h in [HealthStatus::Healthy, HealthStatus::Suspect, HealthStatus::Draining] {
+            let n = node(h, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]);
+            assert_eq!(survivor_replica_tier(Some(&n), 0), Some(DiskTier::Cold), "{h:?}");
+        }
+        let n = node(HealthStatus::Down, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]);
+        assert_eq!(survivor_replica_tier(Some(&n), 0), None, "Down stays excluded");
+    }
+
+    // #114 — the flush snapshot marks a Maintenance node's disks not
+    // live, so its cold row cannot justify flushing the warm copy.
+    #[test]
+    fn issue_114_flush_snapshot_maintenance_disk_not_live() {
+        let mut sm = super::StateMachineData::default();
+        sm.nodes.insert(10, node(HealthStatus::Maintenance, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]));
+        sm.nodes.insert(11, node(HealthStatus::Healthy, vec![disk(DiskTier::Cold, DiskStatus::Healthy)]));
+        let snap = super::FlushSnapshot::from_sm(&sm, "/");
+        assert_eq!(snap.nodes[&10].disk_tiers, vec![(0, DiskTier::Cold, false)]);
+        assert_eq!(snap.nodes[&11].disk_tiers, vec![(0, DiskTier::Cold, true)]);
+    }
+
     // CNF-1 — `disk_id` is a STABLE key, not a Vec position. After a
     // data node re-registers with a reindexed disk list, the only disk
     // may carry disk_id=1 at Vec index 0; a positional lookup then

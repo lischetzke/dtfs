@@ -346,8 +346,9 @@ impl TaskScheduler {
                             // same rule `check_under_replicated` uses. Counting
                             // a replica on a dead node as "excess" is how a
                             // freshly-backfilled copy got removed again on the
-                            // very next tick, forever.
-                            let tier = live_replica_tier(Some(info), e.disk_id)?;
+                            // very next tick, forever. #114 — and never let a
+                            // Maintenance/Quarantined copy count as a survivor.
+                            let tier = survivor_replica_tier(Some(info), e.disk_id)?;
                             Some((nid, e.disk_id, info.location.datacenter.clone(), tier))
                         })
                         .collect();
@@ -1110,6 +1111,25 @@ pub(crate) fn live_replica_tier(
         return None;
     }
     Some(disk.tier)
+}
+
+/// #114 — tier of a replica that may AUTHORISE removing another copy
+/// (cache demote, flush, rebalance). Stricter than `live_replica_tier`:
+/// a Maintenance node may be powered off and a Quarantined node's bytes
+/// are suspect, and the monitor never marks either Down. Repair coverage
+/// keeps using `live_replica_tier` so these states start no repair storm.
+#[inline]
+pub(crate) fn survivor_replica_tier(
+    node: Option<&dtfs_raft::NodeInfo>,
+    disk_id: u32,
+) -> Option<DiskTier> {
+    let n = node?;
+    if n.quarantine.is_some()
+        || matches!(n.health, HealthStatus::Maintenance | HealthStatus::Quarantined)
+    {
+        return None;
+    }
+    live_replica_tier(node, disk_id)
 }
 
 /// CR-3-5/MGR-5 — pick a LIVE replica to copy from: the first entry

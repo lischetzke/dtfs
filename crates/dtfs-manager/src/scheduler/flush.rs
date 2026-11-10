@@ -270,7 +270,8 @@ impl FlushSnapshot {
                             .disks
                             .iter()
                             .map(|d| {
-                                let live = live_replica_tier(Some(info), d.disk_id).is_some();
+                                // #114 — a survivor, not just repair-live.
+                                let live = survivor_replica_tier(Some(info), d.disk_id).is_some();
                                 (d.disk_id, d.tier, live)
                             })
                             .collect(),
