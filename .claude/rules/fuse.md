@@ -372,6 +372,11 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   (`readahead.prefetch_max_inflight`, default 2), acquired in ascending
   chunk order. Do NOT re-add a `cache_bytes() >= max_cache_bytes`
   dormancy gate.
+- `on_chunk_read` first aborts and drops every queued (not started)
+  prefetch, any file: they belong to a read position that moved on, so a
+  library scan holds at most one window queued plus the started ones
+  (#151). A task re-checks the cache once it holds its slot, and releases
+  `join_pending` waiters before its disk-cache mirror put.
 - Per (fh, chunk) transition (`should_notify`): `record_cache_hit` at most
   once, bounded by `CACHE_HIT_NOTIFY_MAX_INFLIGHT` (8, skip when full);
   `readahead.on_chunk_read` on every transition, hit or miss.

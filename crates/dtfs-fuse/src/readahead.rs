@@ -383,6 +383,17 @@ impl ReadAheadEngine {
         // bare FIFO semaphore only orders whichever task calls `acquire`
         // first, which is not guaranteed to match spawn order once several
         // tasks are polled in the same pass.
+        // #151: prefetches still queued (no slot yet) belong to a read
+        // position that moved on (another file, a seek); drop them so a
+        // scan does not queue one window per file. Started ones finish.
+        // Chunks of this window are re-spawned below.
+        self.pending.retain(|_, p| {
+            let keep = p.started.load(Ordering::Relaxed);
+            if !keep {
+                p.handle.abort();
+            }
+            keep
+        });
         let mut prev: Option<oneshot::Receiver<()>> = None;
         for idx in start..end {
             if let Some((chunk_id, addr)) = prefetch_target(chunk_locations, idx as u64) {
@@ -592,6 +603,14 @@ impl ReadAheadEngine {
             // held — its own `acquire` call can now queue behind ours.
             let _ = acquired_tx.send(());
 
+            // #151: a foreground read may have cached it while we queued.
+            if cache.contains_key(&pending_key) {
+                drop(permit);
+                let _ = done_tx.send(true);
+                pending_ref.remove(&pending_key2);
+                return;
+            }
+
             // FUSE-2 — bound the fetch so a hung replica releases the permit.
             let fetch = match fetch_timeout {
                 None => client.read_chunk(&node_addr, &chunk_id).await,
@@ -624,6 +643,8 @@ impl ReadAheadEngine {
                         pending_key.clone(),
                         data.clone(),
                     );
+                    // #151: release joined readers before the disk write.
+                    let _ = done_tx.send(true);
                     // Mirror to disk cache so the prefetched chunk
                     // survives in-mem eviction + FUSE restart. Best-
                     // effort; disk-cache failures are logged, not fatal.
@@ -652,7 +673,8 @@ impl ReadAheadEngine {
             // `join_pending` BEFORE removing ourselves from `pending`, so a
             // waiter's `get_cached` call reliably finds the stored bytes on
             // success, or reliably finds nothing (and falls through to its
-            // own fetch) on failure.
+            // own fetch) on failure. On success it was sent after the
+            // in-memory store, before the disk mirror (a no-op resend here).
             let _ = done_tx.send(true);
             // Remove from pending set. Ordered strictly after the parent's
             // insert via the `started` gate above, so it can never leak.
@@ -1089,6 +1111,30 @@ mod wi_05_prefetch_cap_tests {
             vec!["chunk1".to_string(), "chunk2".to_string()],
             "the two started fetches must be the NEAREST two"
         );
+    }
+
+    /// #151: a library scan reads one chunk per file. Queued prefetches of
+    /// files the reader moved away from are dropped by the next call, so
+    /// `pending` stays at one window instead of growing by one per file.
+    #[tokio::test]
+    async fn queued_prefetches_of_earlier_reads_are_dropped() {
+        let engine = ReadAheadEngine::new(
+            ReadAheadMode::FileSequential { prefetch_chunks: 8 },
+            DtfsClient::new(),
+            60,
+            64 * 1024 * 1024,
+            1,
+        );
+        // Hold the only slot: every prefetch stays queued (not started).
+        let _slot = engine.prefetch_slots.clone().try_acquire_owned().unwrap();
+        for f in 0..100 {
+            let locs: Vec<(u64, String, Vec<String>)> =
+                (0..=8u64).map(|i| (i, format!("f{f}c{i}"), vec!["127.0.0.1:1".to_string()])).collect();
+            engine.on_chunk_read(&format!("/f{f}"), 0, 9, &locs);
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(engine.pending.len(), 8, "boundary: exactly the last file's window");
+        assert!(engine.pending.contains_key(&cache_key("127.0.0.1:1", "f99c1")));
     }
 
     /// WI-05 — the old gate (`cache_bytes() >= max_cache_bytes`) went
