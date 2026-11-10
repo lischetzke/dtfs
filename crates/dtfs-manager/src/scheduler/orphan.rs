@@ -316,7 +316,7 @@ impl TaskScheduler {
             let missing: Vec<String> = expected
                 .map(|e| e.into_iter().filter(|c| !on_disk.contains_key(c)).collect())
                 .unwrap_or_default();
-            // The sets snapshotted at sweep start predate this node's
+            // The expected set was taken before this node's
             // ListChunks (which can take minutes on a big node). Rebuild
             // this node's view from the CURRENT state machine before any
             // reap decision, so a replica registered or removed meanwhile is
@@ -912,7 +912,7 @@ pub(crate) fn orphan_delete_allowed(is_leader: bool, in_state_chunks: usize) -> 
     is_leader && in_state_chunks > 0
 }
 
-/// CO-3-3 — given a set of chunks the tick's OPENING snapshot expected on a
+/// CO-3-3 — given a set of chunks the pre-listing snapshot expected on a
 /// node but the node's ListChunks reply omitted (`snapshot_missing`), and
 /// the set the CURRENT state machine still expects on that node
 /// (`current_expected`), return only the chunks that are still genuinely

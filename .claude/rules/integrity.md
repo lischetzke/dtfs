@@ -68,9 +68,9 @@ text there.
    orphan reaper reclaims bytes, passing the listed `.dat` mtime as
    `DeleteChunkRequest.if_mtime_le_ms` (data node skips a newer, re-uploaded copy). The reaper re-reads the node view after
    `ListChunks` and never de-locates a chunk recorded under another disk
-   of the same node. Orphan/de-located reap grace is measured on the on-disk `.dat` mtime, keyed by
-   `(node_id, disk_id)` when the data node reports disk ids (node-wide
-   fallback otherwise); unknown mtime defers the reap. Grace floors:
+   of the same node. Orphan/de-located reap grace is measured on the on-disk `.dat` mtime; the unreferenced verdict is
+   node-wide (no row names the node on any disk), the delete carries the
+   reported disk id; unknown mtime defers the reap. Grace floors:
    config `orphan_grace_secs` >= 6 h, one-shot manual reap
    (`POST /api/v1/scrub/orphans`) >= `MANUAL_ORPHAN_GRACE_FLOOR_SECS`
    (1 h); timer and manual share one single-flight token, and a dry run
