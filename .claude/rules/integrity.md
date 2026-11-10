@@ -41,8 +41,15 @@ text there.
 ## Replica lifecycle
 
 6. Migration marks Done only after `VerifyChunk` on the target (disk-targeted
-   via the landed disk id). `RemoveCorruptChunkReplicas` never removes the last
-   row of a (file, chunk_index). Every
+   via the landed disk id). The two removal guards count differently (do not
+   change either without a mixed-version plan):
+   `RemoveCorruptChunkReplicas` counts ROWS, live or not: when every row of a
+   (file, chunk_index) is a corrupt match it keeps them all (Success + audit),
+   otherwise it drops the corrupt rows even if every survivor is dead.
+   `RemoveChunkLocation` (`apply_remove_chunk_location`) counts LIVE rows
+   (node not Down/Failed, disk not Failed/Removed): removing a live row with
+   no other live row of the index is refused (Error); a dead row is always
+   removable, even the last one. Every
    de-location goes through `scheduler::delocate_replica`: Raft
    `RemoveChunkLocation` FIRST, byte delete AFTER; a failed OR
    state-machine-refused Raft remove (`raft_write_checked` /
@@ -94,7 +101,8 @@ text there.
   fill, never 0, warn + audit `write_safety.floor_clamped`).
 - A survivor that authorises dropping another replica must pass
   `survivor_replica_tier` (live, node not Maintenance/Quarantined, no
-  quarantine record); `apply_remove_chunk_location` refuses to remove the last live replica.
+  quarantine record); `apply_remove_chunk_location` refuses to remove the last live replica
+  (live rows; `RemoveCorruptChunkReplicas` counts rows instead, see item 6).
 - Every promote/demote/flush checks the anchor against the destination
   (`would_violate_anchor_for`, `demote_preserves_anchor`, `enforce_anchor` on
   apply). Anchor DC compares case-insensitively.
