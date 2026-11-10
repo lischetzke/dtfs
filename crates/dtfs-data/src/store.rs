@@ -2209,6 +2209,7 @@ mod tests {
         let disk_configs = vec![dtfs_common::config::DiskConfig {
             path: disk_path,
             tier: DiskTier::Hot,
+            allow_non_mountpoint: false,
         }];
         let dm = DiskManager::new(&disk_configs).unwrap();
         (ChunkStore::new(dm), tmp)
@@ -3062,6 +3063,7 @@ mod tests {
         let disk_configs = vec![dtfs_common::config::DiskConfig {
             path: disk_path,
             tier: DiskTier::Hot,
+            allow_non_mountpoint: false,
         }];
         let dm = DiskManager::new(&disk_configs).unwrap();
         ChunkStore::new(dm)
@@ -3143,6 +3145,7 @@ mod tests {
         let disk_configs = vec![dtfs_common::config::DiskConfig {
             path: disk_path,
             tier: DiskTier::Hot,
+            allow_non_mountpoint: false,
         }];
         let dm = DiskManager::new(&disk_configs).unwrap();
         let store = ChunkStore::new(dm);
@@ -3710,8 +3713,8 @@ mod tests {
         let cold = TempDir::new().unwrap();
         let warm = TempDir::new().unwrap();
         let disk_configs = vec![
-            dtfs_common::config::DiskConfig { path: cold.path().to_path_buf(), tier: DiskTier::Cold },
-            dtfs_common::config::DiskConfig { path: warm.path().to_path_buf(), tier: DiskTier::Warm },
+            dtfs_common::config::DiskConfig { path: cold.path().to_path_buf(), tier: DiskTier::Cold, allow_non_mountpoint: false },
+            dtfs_common::config::DiskConfig { path: warm.path().to_path_buf(), tier: DiskTier::Warm, allow_non_mountpoint: false },
         ];
         let dm = DiskManager::new(&disk_configs).unwrap();
         (ChunkStore::new(dm), cold, warm)
@@ -4328,6 +4331,7 @@ mod audit_co_tests {
         let disk_configs = vec![dtfs_common::config::DiskConfig {
             path: disk_path,
             tier: DiskTier::Hot,
+            allow_non_mountpoint: false,
         }];
         let dm = DiskManager::new(&disk_configs).unwrap();
         (ChunkStore::new(dm), tmp)

@@ -106,6 +106,7 @@ mode = "disabled"
 [[disks]]
 path = "/mnt/dtfs-data"
 tier = "hot"
+allow_non_mountpoint = true   # plain directory; omit for a real mounted disk
 
 [cache]
 

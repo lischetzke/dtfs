@@ -862,6 +862,11 @@ fn nonzero(name: &str, v: u64) -> Result<(), String> {
 pub struct DiskConfig {
     pub path: PathBuf,
     pub tier: DiskTier,
+    /// #152 — allow the first initialisation (no `.dtfs-disk-id` yet) of a
+    /// path that is not a mount point. Default false: the data node refuses
+    /// it, so an unmounted disk is not silently replaced by its mount dir.
+    #[serde(default)]
+    pub allow_non_mountpoint: bool,
 }
 
 /// Configuration for a tape drive or tape library backed by LTFS.

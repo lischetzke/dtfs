@@ -9,7 +9,7 @@ File: `/etc/dtfs/data.toml`. Source of truth: `crates/dtfs-common/src/config.rs`
 - **Validated**: the process refuses to start when the check fails.
 - Required tables: `[node]`, `[location]`, `[cluster]`, `[grpc]`, `[tls]`, `[scrub]` and at least one `[[disks]]`. `[tls]` and `[scrub]` may be empty. Optional: `[memory]`, `[placement]`, `[[tape_devices]]`, `[updater]` (CLI only).
 - Unknown keys are ignored silently; check spelling against this page.
-- Startup checks: `cluster.shared_secret` non-empty, `[memory]`, `[grpc]`, `[tls]` resolution, persistent disk ids.
+- Startup checks: `cluster.shared_secret` non-empty, `[memory]`, `[grpc]`, `[tls]` resolution, persistent disk ids, a new disk is a mount point.
 
 ## `[node]`
 
@@ -53,6 +53,7 @@ One table per local disk or mount point. At least one is required.
 |---|---|---|---|
 | `path` | path | required | Dedicated directory or mount point, writable by the daemon. |
 | `tier` | string | required | `hot`, `warm`, `cold` or `tape` (lowercase). |
+| `allow_non_mountpoint` | bool | `false` | A disk without `<path>/.dtfs-disk-id` (first start, or a disk that did not mount) must be a mount point, else **the daemon refuses to start**. Set `true` to initialise a plain directory (dev clusters). A disk that already has its id file is not checked. |
 
 Disk ids are positions: the first `[[disks]]` entry is disk 0, the next disk 1, and so on. Replica identity is `(node_id, disk_id)`. The id is persisted in `<path>/.dtfs-disk-id` on first start, and **the daemon refuses to start** when a disk now sits at a different position. Therefore never remove or reorder entries in the middle of the list. Append new disks at the end; replace a failed or drained disk in place (same position, same path).
 

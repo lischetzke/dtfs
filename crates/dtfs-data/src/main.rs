@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
     tls_ctx.log_startup("dtfs-data", &config.tls.mode);
 
     // Initialize disk managers for each configured disk
+    disk::check_fresh_disks_are_mounted(&config.disks)?;
     let disk_manager = disk::DiskManager::new(&config.disks)?;
     tracing::info!("Initialized {} disks", disk_manager.disk_count());
 

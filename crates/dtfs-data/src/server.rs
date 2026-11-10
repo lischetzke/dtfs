@@ -1193,7 +1193,7 @@ max_io_percent = 10
         let disk_path = disk_paths[0];
         let disk_configs: Vec<_> = disk_paths
             .iter()
-            .map(|p| dtfs_common::config::DiskConfig { path: p.to_path_buf(), tier: DiskTier::Hot })
+            .map(|p| dtfs_common::config::DiskConfig { path: p.to_path_buf(), tier: DiskTier::Hot, allow_non_mountpoint: false })
             .collect();
         let dm = DiskManager::new(&disk_configs).unwrap();
         let store = Arc::new(ChunkStore::new(dm));
@@ -1876,8 +1876,8 @@ max_io_percent = 10
         let d0 = tempfile::TempDir::new().unwrap();
         let d1 = tempfile::TempDir::new().unwrap();
         let dm = DiskManager::new(&[
-            dtfs_common::config::DiskConfig { path: d0.path().to_path_buf(), tier: DiskTier::Hot },
-            dtfs_common::config::DiskConfig { path: d1.path().to_path_buf(), tier: DiskTier::Warm },
+            dtfs_common::config::DiskConfig { path: d0.path().to_path_buf(), tier: DiskTier::Hot, allow_non_mountpoint: false },
+            dtfs_common::config::DiskConfig { path: d1.path().to_path_buf(), tier: DiskTier::Warm, allow_non_mountpoint: false },
         ])
         .unwrap();
         let store = Arc::new(ChunkStore::new(dm));
@@ -2301,6 +2301,7 @@ max_io_percent = 10
         let disk_configs = vec![dtfs_common::config::DiskConfig {
             path: disk_path.to_path_buf(),
             tier: DiskTier::Hot,
+            allow_non_mountpoint: false,
         }];
         let dm = DiskManager::new(&disk_configs).unwrap();
         let store = Arc::new(ChunkStore::new(dm));

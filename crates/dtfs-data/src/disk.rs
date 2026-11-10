@@ -219,12 +219,74 @@ fn ensure_persisted_disk_id(mount: &std::path::Path, disk_id: u32) -> anyhow::Re
     }
 }
 
+/// #152 — refuse to initialise a disk (no `.dtfs-disk-id` at its path yet)
+/// that is not a mount point, unless `allow_non_mountpoint`. An unmounted
+/// disk always looks fresh (its id file is on the missing filesystem), so
+/// this stops the data node from filling the bare mount directory instead.
+/// Disks already carrying their id are not checked: upgrades never refuse.
+pub fn check_fresh_disks_are_mounted(disks: &[DiskConfig]) -> anyhow::Result<()> {
+    for dc in disks {
+        if dc.allow_non_mountpoint || dc.path.join(".dtfs-disk-id").exists() {
+            continue;
+        }
+        if !is_mount_point(&dc.path)? {
+            tracing::error!(path = %dc.path.display(), "new data disk is not a mount point; refusing to start");
+            anyhow::bail!(
+                "disk {} has no .dtfs-disk-id and is not a mount point (disk not mounted?). \
+                 Mount it, or set allow_non_mountpoint = true on this [[disks]] entry \
+                 to use a plain directory",
+                dc.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A path is a mount point when its device differs from its parent's. A
+/// missing path is not one; `/` (no parent) is.
+fn is_mount_point(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let md = match std::fs::metadata(path) {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let parent = match path.parent() {
+        None => return Ok(true),
+        Some(p) if p.as_os_str().is_empty() => std::path::Path::new("."),
+        Some(p) => p,
+    };
+    Ok(std::fs::metadata(parent)?.dev() != md.dev())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cfg(p: &std::path::Path) -> DiskConfig {
-        DiskConfig { path: p.to_path_buf(), tier: DiskTier::Hot }
+        DiskConfig { path: p.to_path_buf(), tier: DiskTier::Hot, allow_non_mountpoint: false }
+    }
+
+    #[test]
+    fn fresh_plain_directory_disk_is_refused() {
+        let a = tempfile::TempDir::new().unwrap();
+        let err = check_fresh_disks_are_mounted(&[cfg(a.path())]).expect_err("must refuse");
+        assert!(err.to_string().contains("has no .dtfs-disk-id and is not a mount point"), "{err}");
+        let missing = a.path().join("never-created");
+        assert!(check_fresh_disks_are_mounted(&[cfg(&missing)]).is_err(), "missing path is not a mount");
+    }
+
+    #[test]
+    fn opt_out_existing_id_or_mount_point_is_accepted() {
+        let a = tempfile::TempDir::new().unwrap();
+        let mut c = cfg(a.path());
+        c.allow_non_mountpoint = true;
+        check_fresh_disks_are_mounted(&[c]).unwrap();
+        // An already-initialised directory disk (upgrade) is not checked.
+        DiskManager::new(&[cfg(a.path())]).unwrap();
+        check_fresh_disks_are_mounted(&[cfg(a.path())]).unwrap();
+        // A real mount point with no id file.
+        check_fresh_disks_are_mounted(&[cfg(std::path::Path::new("/proc"))]).unwrap();
     }
 
     #[test]

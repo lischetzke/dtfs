@@ -59,6 +59,9 @@ listen_addr = "10.0.0.4:9500"       # chunk-streaming gRPC. Use the ROUTABLE
 [[disks]]
 path = "/mnt/hdd0"
 tier = "cold"
+# A disk not yet initialised (no .dtfs-disk-id) must be a mount point;
+# true allows a plain directory (dev clusters).
+#allow_non_mountpoint = false
 
 #[[disks]]
 #path = "/mnt/ssd0"
