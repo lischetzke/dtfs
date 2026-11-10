@@ -621,6 +621,17 @@ fn demote_failed(ordered: Vec<String>, failed: &DashMap<String, Instant>, now: I
     rest
 }
 
+/// #149: whether a failed fetch says the NODE is unreachable (demote it for
+/// every chunk), not just this chunk.
+fn fetch_error_demotes_node(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<tonic::transport::Error>().is_some()
+            || c.downcast_ref::<tonic::Status>().is_some_and(|s| {
+                matches!(s.code(), tonic::Code::Unavailable | tonic::Code::DeadlineExceeded)
+            })
+    })
+}
+
 /// read(): a missing chunk entry below the snapshot's size may be a chunk
 /// the snapshot missed (not a hole). Re-fetch once before serving zeros,
 /// unless this snapshot already came from such a re-fetch (`confirmed`).
@@ -3760,7 +3771,9 @@ impl DtfsFilesystem {
                     return Ok((cand.clone(), d));
                 }
                 Err(e) => {
-                    self.failed_replicas.insert(cand.clone(), Instant::now());
+                    if fetch_error_demotes_node(&e) {
+                        self.failed_replicas.insert(cand.clone(), Instant::now());
+                    }
                     // Bug BC-9 — distinguish a verify_on_read integrity
                     // fault from a transport error so operators see
                     // corruption fail-over clearly.
@@ -8214,6 +8227,24 @@ mod async_commit_fs_tests {
         let at = |d: Duration| demote_failed(order.clone(), &fs.failed_replicas, now + d);
         assert_eq!(at(FAILED_REPLICA_DEMOTE - Duration::from_secs(1)), [b.clone(), a.clone()]);
         assert_eq!(at(FAILED_REPLICA_DEMOTE), [a.clone(), b.clone()], "boundary: expired");
+    }
+
+    /// #149 review: a per-chunk failure (NotFound: a cache replica tiering
+    /// evicted; an integrity fault) does not demote the whole node; an
+    /// unreachable node (Unavailable, DeadlineExceeded, connect) does.
+    #[test]
+    fn only_node_level_fetch_errors_demote_the_replica() {
+        let st = |s: tonic::Status| anyhow::Error::new(s).context("error reading chunk stream");
+        assert!(!fetch_error_demotes_node(&st(tonic::Status::not_found("chunk"))));
+        let fault = anyhow::Error::new(dtfs_client::client::IntegrityFaultError {
+            chunk_id: "c".into(),
+            node: "n".into(),
+            detail: "x".into(),
+        });
+        assert!(!fetch_error_demotes_node(&fault));
+        assert!(!fetch_error_demotes_node(&st(tonic::Status::permission_denied("hmac"))));
+        assert!(fetch_error_demotes_node(&st(tonic::Status::unavailable("restarting"))));
+        assert!(fetch_error_demotes_node(&st(tonic::Status::deadline_exceeded("slow"))));
     }
 
     /// #134: a lapsed lease comes back as a FRESH grant (new id) while
