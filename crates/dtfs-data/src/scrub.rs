@@ -160,6 +160,31 @@ fn wall_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// #122 — apply the manager's heartbeat `ScrubConfigOverride` to the live
+/// config. Returns true when anything changed. The policy fields
+/// (`max_io_percent`, `verify_on_read`, `quarantine_on_fault`) are applied
+/// only when the override carries `quick_interval_secs` (CR-6-3, newer than
+/// those fields and always >= 60 from such a manager): an older message
+/// would decode them as 0/false and silently turn off hash-on-read.
+pub fn apply_scrub_override(
+    sc: &mut ScrubConfig,
+    s: &dtfs_proto::dtfs::manager::ScrubConfigOverride,
+) -> bool {
+    let before = sc.clone();
+    sc.quick_interval_hours = s.quick_interval_hours;
+    sc.deep_interval_hours = s.deep_interval_hours;
+    // CR-6-3 — `0` from an older manager means "not sent": the scheduler
+    // falls back to the hours field.
+    sc.quick_interval_secs = s.quick_interval_secs;
+    sc.deep_interval_secs = s.deep_interval_secs;
+    if s.quick_interval_secs != 0 {
+        sc.max_io_percent = s.max_io_percent;
+        sc.verify_on_read = s.verify_on_read;
+        sc.quarantine_on_fault = s.quarantine_on_fault;
+    }
+    *sc != before
+}
+
 /// Background scrub scheduler that runs quick and deep scrubs on configured
 /// intervals against all disks managed by the chunk store. AZ-1: the
 /// `config` field is an `Arc<RwLock<ScrubConfig>>` so the manager's
@@ -430,5 +455,62 @@ mod persisted_due_tests {
         let disks = vec![a.path().to_path_buf(), b.path().to_path_buf()];
         assert_eq!(load_last_scrub_ms(&disks, ScrubLevel::Deep, 1_000 * H), 900 * H);
         assert_eq!(load_last_scrub_ms(&disks, ScrubLevel::Quick, 1_000 * H), 1_000 * H);
+    }
+}
+
+#[cfg(test)]
+mod apply_override_tests {
+    use super::*;
+    use dtfs_proto::dtfs::manager::ScrubConfigOverride;
+
+    fn local() -> ScrubConfig {
+        ScrubConfig {
+            quick_interval_hours: 6,
+            deep_interval_hours: 168,
+            quick_interval_secs: 0,
+            deep_interval_secs: 0,
+            max_io_percent: 10,
+            verify_on_read: true,
+            quarantine_on_fault: true,
+        }
+    }
+
+    #[test]
+    fn all_seven_fields_land() {
+        let mut sc = local();
+        let s = ScrubConfigOverride {
+            quick_interval_hours: 1,
+            deep_interval_hours: 24,
+            quick_interval_secs: 1800,
+            deep_interval_secs: 86_400,
+            max_io_percent: 5,
+            verify_on_read: false,
+            quarantine_on_fault: false,
+            ..Default::default()
+        };
+        assert!(apply_scrub_override(&mut sc, &s));
+        assert_eq!(
+            sc,
+            ScrubConfig {
+                quick_interval_hours: 1,
+                deep_interval_hours: 24,
+                quick_interval_secs: 1800,
+                deep_interval_secs: 86_400,
+                max_io_percent: 5,
+                verify_on_read: false,
+                quarantine_on_fault: false,
+            }
+        );
+        assert!(!apply_scrub_override(&mut sc, &s), "same override again: no change");
+    }
+
+    #[test]
+    fn pre_cr63_override_keeps_local_policy_fields() {
+        // An old manager: no secs fields, policy fields decode as 0/false.
+        let mut sc = local();
+        let s = ScrubConfigOverride { quick_interval_hours: 2, deep_interval_hours: 48, ..Default::default() };
+        assert!(apply_scrub_override(&mut sc, &s));
+        assert_eq!((sc.quick_interval_hours, sc.deep_interval_hours), (2, 48));
+        assert_eq!((sc.max_io_percent, sc.verify_on_read, sc.quarantine_on_fault), (10, true, true));
     }
 }

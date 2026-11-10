@@ -872,25 +872,18 @@ async fn manager_lifecycle(
                     // skip the JSON parse + log noise.
                     if let Some(s) = &config_update.scrub_override {
                         let mut sc = scrub_config.write().await;
-                        if sc.quick_interval_hours != s.quick_interval_hours
-                            || sc.deep_interval_hours != s.deep_interval_hours
-                            || sc.quick_interval_secs != s.quick_interval_secs
-                            || sc.deep_interval_secs != s.deep_interval_secs
-                        {
+                        let old = sc.clone();
+                        if scrub::apply_scrub_override(&mut sc, s) {
                             tracing::info!(
-                                "AZ-1 scrub override: quick {}h -> {}h, deep {}h -> {}h",
-                                sc.quick_interval_hours,
-                                s.quick_interval_hours,
-                                sc.deep_interval_hours,
-                                s.deep_interval_hours,
+                                quick_h = sc.quick_interval_hours,
+                                deep_h = sc.deep_interval_hours,
+                                max_io_percent = sc.max_io_percent,
+                                verify_on_read = sc.verify_on_read,
+                                quarantine_on_fault = sc.quarantine_on_fault,
+                                was_verify_on_read = old.verify_on_read,
+                                "AZ-1 scrub override applied from cluster policy"
                             );
-                            sc.quick_interval_hours = s.quick_interval_hours;
-                            sc.deep_interval_hours = s.deep_interval_hours;
-                            // CR-6-3 (PROTO-2) — exact-secs companions; `0`
-                            // from an older manager means "not sent", so
-                            // the scheduler falls back to the hours field.
-                            sc.quick_interval_secs = s.quick_interval_secs;
-                            sc.deep_interval_secs = s.deep_interval_secs;
+                            integrity_faults.set_quarantine_on_fault(sc.quarantine_on_fault);
                         }
                     }
                     if !config_update.config_json.is_empty() {
