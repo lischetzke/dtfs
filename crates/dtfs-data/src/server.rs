@@ -2203,6 +2203,19 @@ max_io_percent = 10
         assert_eq!(alloc_tmp_status(err).code(), tonic::Code::ResourceExhausted);
     }
 
+    /// #131 — every disk under its [placement] reserve: the put is
+    /// RESOURCE_EXHAUSTED before any byte is written.
+    #[tokio::test]
+    async fn put_with_every_disk_under_headroom_is_resource_exhausted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = dtfs_common::config::DiskConfig { path: tmp.path().to_path_buf(), tier: DiskTier::Hot, allow_non_mountpoint: false };
+        let full = dtfs_common::config::PlacementConfig { min_free_bytes: u64::MAX, ..Default::default() };
+        let store = ChunkStore::new(DiskManager::new(&[cfg]).unwrap().with_headroom(full));
+        let err = store.allocate_streaming_tmp(DiskTier::Hot).unwrap_err();
+        assert!(matches!(err, DtfsError::DiskNotFound(_)), "{err:?}");
+        assert_eq!(alloc_tmp_status(err).code(), tonic::Code::ResourceExhausted);
+    }
+
     /// Audit F3 negative — any other allocation error stays Internal.
     #[test]
     fn alloc_tmp_other_error_stays_internal() {

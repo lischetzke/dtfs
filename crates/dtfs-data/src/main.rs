@@ -99,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
     config.memory.validate().map_err(|e| anyhow::anyhow!(e))?;
     // CR2-8-1 (CMN-3) — reject an unusable message-size cap at startup.
     config.grpc.validate().map_err(|e| anyhow::anyhow!(e))?;
+    config.placement.validate().map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!(
         "Data node {} at {} ({})",
@@ -114,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize disk managers for each configured disk
     disk::check_fresh_disks_are_mounted(&config.disks)?;
-    let disk_manager = disk::DiskManager::new(&config.disks)?;
+    let disk_manager = disk::DiskManager::new(&config.disks)?.with_headroom(config.placement.clone());
     tracing::info!("Initialized {} disks", disk_manager.disk_count());
 
     // Initialize chunk store

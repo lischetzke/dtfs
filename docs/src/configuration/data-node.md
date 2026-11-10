@@ -100,7 +100,7 @@ Intervals count from the last finished pass, persisted per disk in `.dtfs/last_{
 
 ## `[placement]` (optional)
 
-`PutChunk` rejects a write to a disk whose free space is below `max(min_free_bytes, total x min_free_pct%)` with a typed `RESOURCE_EXHAUSTED`, so the client reroutes instead of streaming into ENOSPC. Same keys as the manager's [`[placement]`](./manager.md#placement-optional) (`min_free_bytes` default `1073741824`, `min_free_pct` default `5.0`, `allow_capacity_spill` default `true`). The range check on `min_free_pct` runs on the manager only; use identical values on both.
+`PutChunk` (client writes and replica copies) skips a disk whose free space, re-read at selection time, is not above `max(min_free_bytes, total x min_free_pct%)`, and answers a typed `RESOURCE_EXHAUSTED` when no disk of the node has room, so the client reroutes instead of streaming into ENOSPC. Same keys as the manager's [`[placement]`](./manager.md#placement-optional) (`min_free_bytes` default `1073741824`, `min_free_pct` default `5.0`, `allow_capacity_spill` default `true`; the last is read by the manager only). **Validated**: `min_free_pct` outside `0.0..=100.0` refuses startup. Use identical values on managers and data nodes.
 
 ## `[[tape_devices]]`
 

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use dtfs_common::config::DiskConfig;
+use dtfs_common::config::{DiskConfig, PlacementConfig};
 use dtfs_common::types::{DiskStatus, DiskTier};
 
 /// Information about a managed disk.
@@ -21,6 +21,9 @@ pub struct DiskManager {
     /// Per-disk (by position = disk_id) failed flag, set on EIO/EROFS from a
     /// put or commit. Never cleared at runtime; a restart clears it.
     failed: Vec<AtomicBool>,
+    /// #131 — `[placement]` free-space reserve; selection skips a disk
+    /// without room. `new` sets a zero reserve; `with_headroom` the config's.
+    headroom: PlacementConfig,
 }
 
 impl DiskManager {
@@ -64,7 +67,20 @@ impl DiskManager {
         }
 
         let failed = disks.iter().map(|_| AtomicBool::new(false)).collect();
-        Ok(Self { disks, failed })
+        let headroom = PlacementConfig { min_free_bytes: 0, min_free_pct: 0.0, ..PlacementConfig::default() };
+        Ok(Self { disks, failed, headroom })
+    }
+
+    /// Enforce `placement`'s free-space reserve in `select_disk_for_tier`.
+    pub fn with_headroom(mut self, placement: PlacementConfig) -> Self {
+        self.headroom = placement;
+        self
+    }
+
+    /// Does the disk keep its reserve? A failed statvfs (total 0) counts as room.
+    fn has_room(&self, d: &ManagedDisk) -> bool {
+        let (total, used) = get_disk_usage(&d.mount_path);
+        self.headroom.has_room(total, used)
     }
 
     fn is_failed(&self, d: &ManagedDisk) -> bool {
@@ -134,7 +150,7 @@ impl DiskManager {
         let exact = self
             .disks
             .iter()
-            .filter(|d| d.tier == tier && d.status == DiskStatus::Healthy && !self.is_failed(d))
+            .filter(|d| d.tier == tier && d.status == DiskStatus::Healthy && !self.is_failed(d) && self.has_room(d))
             .max_by_key(|d| live_free(d));
         if exact.is_some() {
             return exact;
@@ -144,7 +160,7 @@ impl DiskManager {
         // rather than failing the whole replica set.
         self.disks
             .iter()
-            .filter(|d| d.status == DiskStatus::Healthy && !self.is_failed(d))
+            .filter(|d| d.status == DiskStatus::Healthy && !self.is_failed(d) && self.has_room(d))
             .max_by_key(|d| live_free(d))
     }
 
@@ -265,6 +281,27 @@ mod tests {
 
     fn cfg(p: &std::path::Path) -> DiskConfig {
         DiskConfig { path: p.to_path_buf(), tier: DiskTier::Hot, allow_non_mountpoint: false }
+    }
+
+    fn reserve_pct(pct: f64) -> PlacementConfig {
+        PlacementConfig { min_free_bytes: 0, min_free_pct: pct, ..PlacementConfig::default() }
+    }
+
+    #[test]
+    fn disk_under_headroom_is_skipped_exact_and_fallback() {
+        let a = tempfile::TempDir::new().unwrap();
+        // 100% reserve: no disk can keep it.
+        let dm = DiskManager::new(&[cfg(a.path())]).unwrap().with_headroom(reserve_pct(100.0));
+        assert!(dm.select_disk_for_tier(DiskTier::Hot).is_none(), "exact tier skipped");
+        assert!(dm.select_disk_for_tier(DiskTier::Cold).is_none(), "fallback skipped too");
+    }
+
+    #[test]
+    fn disk_with_room_is_selected() {
+        let a = tempfile::TempDir::new().unwrap();
+        let dm = DiskManager::new(&[cfg(a.path())]).unwrap().with_headroom(reserve_pct(0.0));
+        assert_eq!(dm.select_disk_for_tier(DiskTier::Hot).unwrap().disk_id, 0);
+        assert_eq!(dm.select_disk_for_tier(DiskTier::Cold).unwrap().disk_id, 0, "fallback");
     }
 
     #[test]
