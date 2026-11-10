@@ -189,6 +189,11 @@ if [ "$NONINT" -eq 0 ] && ! command -v whiptail >/dev/null 2>&1; then
     }
 fi
 
+# Tag the staged binaries must report (#154): an explicit --version, or the
+# tag a remote download resolved `latest` to. Empty = not known.
+EXPECT_TAG=""
+[ -z "$VERSION" ] || [ "$VERSION" = "latest" ] || EXPECT_TAG="$VERSION"
+
 # AZ-2 — when no positional tarball was supplied, run the source-selection
 # pipeline (local-first / github fallback per --source). Sets TARBALL to a
 # concrete path on disk. Skipped entirely when the operator passed an
@@ -257,6 +262,7 @@ if [ -z "$TARBALL" ]; then
             case "$tag" in ""|*/*|"$loc") error "AZ-2: no release found at ${base}/releases/latest"; return 1 ;; esac
             info "AZ-2: latest release is $tag"
         fi
+        EXPECT_TAG="$tag"
         url="${base}/releases/download/${tag}/dtfs-linux-amd64.tar.gz"
         mkdir -p "$DOWNLOAD_CACHE"
         local out="${DOWNLOAD_CACHE}/dtfs-${tag}-linux-amd64.tar.gz"
@@ -346,6 +352,22 @@ verify_minisign() {
     info "minisign: SHA256SUMS signature and tarball checksum verified"
 }
 verify_minisign || exit 1
+
+# Version token of a `--version` line (`dtfs-cli v0.1.14 (built ...)`).
+version_token() {
+    awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[vV]?[0-9]/) { print $i; exit } }' <<<"$1"
+}
+# release_version_gate WANT_TAG VERSION_OUTPUT (#154): the signature covers the
+# binaries and the binaries carry the version stamp, so this binds the signed
+# asset set to a version. Sets STAGED_VERSION. Empty WANT_TAG = no tag known.
+release_version_gate() {
+    local got
+    got="$(version_token "$2")"
+    [ -n "$got" ] || { error "cannot read the version of the staged dtfs-cli ('$2'); refusing to install"; return 1; }
+    [ -z "$1" ] || [ "${got#v}" = "${1#v}" ] \
+        || { error "release asset reports $got but tag $1 was requested; refusing to install assets of another release"; return 1; }
+    STAGED_VERSION="$got"
+}
 
 # ─── gather role + cluster info (TUI, or flags/env with --noninteractive) ────
 # ask VAR TITLE PROMPT DEFAULT: keeps a flag/env preset, else prompts.
@@ -492,6 +514,8 @@ for b in dtfs-manager dtfs-data dtfs-fuse dtfs-cli; do
     got="$(sha256sum "$TMP/dtfs/bin/$b" | awk '{print $1}')"
     [ -n "$want" ] && [ "$want" = "$got" ] || { error "integrity check failed for $b (manifest '${want:-none}', actual $got)"; exit 1; }
 done
+release_version_gate "$EXPECT_TAG" "$("$TMP/dtfs/bin/dtfs-cli" --version 2>/dev/null || true)" || exit 1
+info "release version $STAGED_VERSION"
 
 step "Installing binaries to /usr/local/bin"
 install -m 0755 "$TMP/dtfs/bin/dtfs-manager" /usr/local/bin/dtfs-manager

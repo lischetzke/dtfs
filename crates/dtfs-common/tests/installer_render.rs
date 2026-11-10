@@ -192,3 +192,32 @@ fn single_bare_entry_is_self_for_bootstrap() {
     let cfg: ManagerConfig = load_config(&p).unwrap();
     assert_eq!(cfg.cluster.initial_voters[0].hostname, "mgr01");
 }
+
+/// #154: the staged binaries carry the version stamp, so the requested (or
+/// resolved latest) tag must equal it.
+#[test]
+fn release_version_gate_binds_signed_assets_to_the_tag() {
+    let d = tempfile::tempdir().unwrap();
+    let body = r#"
+gate() { if release_version_gate "$1" "$2"; then echo "ok:$STAGED_VERSION"; else echo refused; fi; }
+gate v0.1.14 "dtfs-cli v0.1.14 (built 20261110-000000)"
+gate 0.1.14 "dtfs-cli v0.1.14 (built 20261110-000000)"
+gate "" "dtfs-cli v0.1.13 (built x)"
+"#;
+    let (out, _, _) = run_fns(&["version_token", "release_version_gate"], body, d.path());
+    assert_eq!(out.lines().filter(|l| l.starts_with("ok:")).collect::<Vec<_>>(), ["ok:v0.1.14", "ok:v0.1.14", "ok:v0.1.13"], "{out}");
+}
+
+#[test]
+fn release_version_gate_refuses_another_release_and_unreadable_version() {
+    let d = tempfile::tempdir().unwrap();
+    let body = r#"
+gate() { if release_version_gate "$1" "$2"; then echo "ok:$STAGED_VERSION"; else echo refused; fi; }
+gate v0.1.14 "dtfs-cli v0.1.13 (built x)"
+gate v0.1.14 ""
+"#;
+    let (out, _, _) = run_fns(&["version_token", "release_version_gate"], body, d.path());
+    assert!(out.contains("ERR: release asset reports v0.1.13 but tag v0.1.14 was requested"), "{out}");
+    assert!(out.contains("ERR: cannot read the version of the staged dtfs-cli"), "{out}");
+    assert_eq!(out.matches("refused").count(), 2, "{out}");
+}

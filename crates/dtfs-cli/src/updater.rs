@@ -341,7 +341,7 @@ fn run_update(
     for (bin, src) in bins.iter().zip(&staged) {
         let staged_v = binary_version(src);
         let installed = installed_version(install_dir, bin);
-        match plan_install(&staged_v, &installed, force)? {
+        match plan_install(&staged_v, &installed, tag, force)? {
             Plan::Install => todo.push((bin, src)),
             Plan::UpToDate => eprintln!("{bin}: already at {installed}; skipping (--force reinstalls)"),
         }
@@ -434,9 +434,21 @@ enum Plan {
 
 /// Decide from the `--version` outputs of the staged and the installed
 /// binary. Same version token: nothing to do unless `force`.
-fn plan_install(staged: &str, installed: &str, force: bool) -> Result<Plan> {
+fn plan_install(staged: &str, installed: &str, tag: Option<&str>, force: bool) -> Result<Plan> {
     let s = version_token(staged)
         .with_context(|| format!("cannot read the version of the staged binary ({staged:?})"))?;
+    // #154: the signature covers the binaries, and the binaries carry the
+    // version stamp, so this binds the signed asset set to a version.
+    let bare = |v: &str| v.strip_prefix('v').unwrap_or(v).to_string();
+    match tag {
+        Some(t) if bare(s) != bare(t) => {
+            bail!("release asset reports {s} but tag {t} was requested; refusing to install assets of another release")
+        }
+        None if version_is_newer(s, installed) => {
+            bail!("refusing to downgrade {installed} to {s} from the latest release; pass --tag {s} to downgrade")
+        }
+        _ => {}
+    }
     if !force && version_token(installed) == Some(s) {
         return Ok(Plan::UpToDate);
     }
@@ -984,18 +996,38 @@ mod tests {
     fn same_version_is_skipped_unless_forced() {
         let staged = "dtfs-manager v0.1.14 (built 20261110-000000)";
         // Same version, different build date: nothing to do.
-        assert_eq!(plan_install(staged, "dtfs-manager v0.1.14 (built 20261101-000000)", false).unwrap(), Plan::UpToDate);
-        assert_eq!(plan_install(staged, "dtfs-manager v0.1.14 (built 20261101-000000)", true).unwrap(), Plan::Install);
-        assert_eq!(plan_install(staged, "dtfs-manager v0.1.13 (built x)", false).unwrap(), Plan::Install);
+        assert_eq!(plan_install(staged, "dtfs-manager v0.1.14 (built 20261101-000000)", None, false).unwrap(), Plan::UpToDate);
+        assert_eq!(plan_install(staged, "dtfs-manager v0.1.14 (built 20261101-000000)", None, true).unwrap(), Plan::Install);
+        assert_eq!(plan_install(staged, "dtfs-manager v0.1.13 (built x)", None, false).unwrap(), Plan::Install);
         // Suffix differs from the release: not the same version.
-        assert_eq!(plan_install(staged, "dtfs-manager v0.1.14-rc1 (built x)", false).unwrap(), Plan::Install);
-        assert_eq!(plan_install(staged, "not installed", false).unwrap(), Plan::Install);
+        assert_eq!(plan_install(staged, "dtfs-manager v0.1.14-rc1 (built x)", None, false).unwrap(), Plan::Install);
+        assert_eq!(plan_install(staged, "not installed", None, false).unwrap(), Plan::Install);
     }
 
     #[test]
     fn staged_binary_without_version_is_refused() {
-        let e = plan_install("dtfs-manager (built x)", "not installed", true).unwrap_err().to_string();
+        let e = plan_install("dtfs-manager (built x)", "not installed", None, true).unwrap_err().to_string();
         assert!(e.contains("cannot read the version of the staged binary"), "{e}");
+    }
+
+    #[test]
+    fn signed_assets_of_another_version_are_refused_for_a_tag() {
+        let staged = "dtfs-manager v0.1.13 (built x)";
+        // #154: a validly signed older set served under v0.1.14.
+        let e = plan_install(staged, "dtfs-manager v0.1.12 (built x)", Some("v0.1.14"), true).unwrap_err().to_string();
+        assert!(e.contains("reports v0.1.13 but tag v0.1.14 was requested"), "{e}");
+        // Matching tag installs, with or without the leading v; explicit downgrade is allowed.
+        assert_eq!(plan_install(staged, "dtfs-manager v0.1.14 (built x)", Some("v0.1.13"), false).unwrap(), Plan::Install);
+        assert_eq!(plan_install(staged, "not installed", Some("0.1.13"), false).unwrap(), Plan::Install);
+    }
+
+    #[test]
+    fn latest_never_downgrades() {
+        let staged = "dtfs-manager v0.1.13 (built x)";
+        let e = plan_install(staged, "dtfs-manager v0.1.14 (built x)", None, true).unwrap_err().to_string();
+        assert!(e.contains("refusing to downgrade dtfs-manager v0.1.14 (built x) to v0.1.13"), "{e}");
+        // Boundary: one patch newer installs.
+        assert_eq!(plan_install("dtfs-manager v0.1.15 (built x)", "dtfs-manager v0.1.14 (built x)", None, false).unwrap(), Plan::Install);
     }
 
     #[test]

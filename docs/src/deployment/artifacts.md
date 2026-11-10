@@ -116,7 +116,16 @@ precedence is flag, then environment, then config. `scripts/dtfs-install.sh
 the same check at install time: it needs the `minisign` binary and
 `SHA256SUMS` + `SHA256SUMS.minisig` beside the tarball (or at the release URL
 for a remote download), requires the tarball sha256 to be listed, and refuses
-to install on any failure. Without a key the installer only warns. Generating and
+to install on any failure. Without a key the installer only warns.
+
+`SHA256SUMS` carries no version, so a signature alone does not tell one
+release from another. Both consumers therefore read the staged binaries'
+`--version` after the `MANIFEST` check (the binaries are covered by the
+signature through `MANIFEST` and the tarball sha256): `dtfs-cli update --tag T`
+and `dtfs-install.sh --version T` (or the tag a remote install resolved
+`latest` to) refuse a release whose binaries report another version, and
+`dtfs-cli update` without `--tag` refuses a release older than the installed
+binary. Generating and
 protecting the signing key: [CI Pipeline](../operations/ci-pipeline.md#release-signing-optional).
 
 ## Yanked releases
