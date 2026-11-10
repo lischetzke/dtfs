@@ -507,14 +507,54 @@ fn apply_set_anchor_trims_datacenter() {
 #[tokio::test]
 async fn integrity_faults_found_beyond_the_newest_window() {
     let h = harness().await;
-    h.state.audit_log.log("api", "scrub.deep.corrupt", "chunk-1", "fail");
+    h.state.audit_log.log("scheduler", "orphan.in_state_missing", "node=1", "quarantined");
     for i in 0..100 {
         h.state.audit_log.log("api", "config.update", &format!("v{i}"), "success");
     }
     let q = Query(AuditQuery { limit: Some(5), ..Default::default() });
     let rows = get_integrity_faults(State(h.state.clone()), q).await.0;
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0]["action"], "scrub.deep.corrupt");
+    assert_eq!(rows[0]["action"], "orphan.in_state_missing");
+}
+
+fn sm_audit(action: &str, summary: &str, ts_ms: u64) -> dtfs_raft::state_machine::AuditEntry {
+    dtfs_raft::state_machine::AuditEntry {
+        log_index: 1,
+        summary: summary.into(),
+        timestamp_ms: ts_ms,
+        actor: if action.is_empty() { String::new() } else { "system".into() },
+        action: action.into(),
+        target: String::new(),
+        result: String::new(),
+        origin_manager: String::new(),
+    }
+}
+
+/// Issue #116 — with the default `replicate_via_raft = false`, the faults
+/// that only land in the replicated audit log (heartbeat
+/// `read.integrity_fault`, the `node.quarantine` apply row) are returned,
+/// merged newest-first with the local ring.
+#[tokio::test]
+async fn issue_116_integrity_faults_include_replicated_rows_by_default() {
+    let h = harness().await;
+    assert!(!h.state.config.audit.replicate_via_raft);
+    {
+        let mut sm = h.state.sm_data.write().await;
+        sm.audit_log.push_back(sm_audit("read.integrity_fault", "", 1_000));
+        sm.audit_log.push_back(sm_audit("", "node.quarantine: 7 verify_on_read", 2_000));
+        sm.audit_log.push_back(sm_audit("config.update", "", 3_000));
+    }
+    h.state.audit_log.log("scheduler", "orphan.in_state_missing", "node=1", "quarantined");
+    let rows = get_integrity_faults(State(h.state.clone()), Query(AuditQuery::default())).await.0;
+    let actions: Vec<&str> = rows.iter().map(|r| r["action"].as_str().unwrap()).collect();
+    assert_eq!(
+        actions,
+        ["orphan.in_state_missing", "node.quarantine", "read.integrity_fault"],
+        "{rows:?}"
+    );
+    // Negative: limit applies to the merged list.
+    let q = Query(AuditQuery { limit: Some(1), ..Default::default() });
+    assert_eq!(get_integrity_faults(State(h.state.clone()), q).await.0.len(), 1);
 }
 
 // ---- Manual orphan reap: POST/GET /api/v1/scrub/orphans ----------------------

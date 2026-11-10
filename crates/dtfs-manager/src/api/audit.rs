@@ -15,8 +15,6 @@ pub(super) struct AuditQuery {
 pub(super) const INTEGRITY_ACTIONS: &[&str] = &[
     "node.quarantine",
     "node.unquarantine",
-    "scrub.quick.fault",
-    "scrub.deep.corrupt",
     "read.integrity_fault",
     "orphan.in_state_missing",
 ];
@@ -42,10 +40,12 @@ pub(super) async fn get_integrity_faults(
 ) -> Json<Vec<Value>> {
     let limit = query.limit.unwrap_or(200);
 
-    if state.config.audit.replicate_via_raft {
+    // Issue #116 — `read.integrity_fault` and `node.quarantine` are written
+    // only to the replicated log, whatever `replicate_via_raft` says, so it
+    // is always read; the local ring is merged in when it is not fanned out.
+    let mut entries: Vec<(u64, Value)> = {
         let sm = state.sm_data.read().await;
-        let entries: Vec<Value> = sm
-            .audit_log
+        sm.audit_log
             .iter()
             .rev()
             .filter(|e| action_is_integrity_fault(&e.action, &e.summary))
@@ -53,18 +53,22 @@ pub(super) async fn get_integrity_faults(
             .map(|e| {
                 let (actor, action, target, result) =
                     backfill_audit_fields(&e.actor, &e.action, &e.target, &e.result, &e.summary);
-                json!({
-                    "timestamp": e.timestamp_ms / 1_000,
+                let ts = e.timestamp_ms / 1_000;
+                let row = json!({
+                    "timestamp": ts,
                     "actor": actor,
                     "action": action,
                     "target": target,
                     "result": result,
                     "summary": e.summary,
                     "origin_manager": e.origin_manager,
-                })
+                });
+                (ts, row)
             })
-            .collect();
-        Json(entries)
+            .collect()
+    };
+    if state.config.audit.replicate_via_raft {
+        Json(entries.into_iter().map(|(_, v)| v).collect())
     } else {
         // Local-ring AuditEntry has no `summary` field (that lives on
         // the replicated state_machine variant). Match against action
@@ -77,14 +81,14 @@ pub(super) async fn get_integrity_faults(
             // Whole ring: faults are rare, so a newest-N window would miss them.
             limit: None,
         };
-        let entries: Vec<Value> = state
+        let local = state
             .audit_log
             .query(&filter)
             .into_iter()
             .filter(|e| action_is_integrity_fault(&e.action, ""))
             .take(limit)
             .map(|e| {
-                json!({
+                let row = json!({
                     "timestamp": e.timestamp,
                     "actor": e.actor,
                     "action": e.action,
@@ -92,10 +96,13 @@ pub(super) async fn get_integrity_faults(
                     "result": e.result,
                     "summary": "",
                     "origin_manager": "",
-                })
-            })
-            .collect();
-        Json(entries)
+                });
+                (e.timestamp.max(0) as u64, row)
+            });
+        entries.extend(local);
+        // Newest first (stable sort keeps each source's own order on ties).
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        Json(entries.into_iter().take(limit).map(|(_, v)| v).collect())
     }
 }
 

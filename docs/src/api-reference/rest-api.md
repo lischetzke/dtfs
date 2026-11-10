@@ -338,7 +338,7 @@ Query: `limit` (default 50), `action` (prefix filter). Newest first. Entry: `tim
 
 ### GET /api/v1/integrity/faults
 
-Same query (`limit` default 200) and entry shape, filtered to integrity actions (`node.quarantine`, `node.unquarantine`, `scrub.quick.fault`, `scrub.deep.corrupt`, `read.integrity_fault`, `orphan.in_state_missing`).
+Same query (`limit` default 200) and entry shape, filtered to integrity actions (`node.quarantine`, `node.unquarantine`, `read.integrity_fault`, `orphan.in_state_missing`). Always reads the replicated audit log (where `read.integrity_fault` and `node.quarantine` land) and, with `audit.replicate_via_raft = false`, merges in this manager's local ring, newest first.
 
 ## Config
 
