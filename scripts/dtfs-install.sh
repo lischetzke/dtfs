@@ -318,6 +318,8 @@ if [ -z "$TARBALL" ]; then
             download_tarball_remote && return 0
         elif latest="$(resolve_latest_tag)"; then
             VERSION="$latest"; EXPECT_TAG="$latest"
+            # A local hit has no SHA256SUMS next to it: verify_minisign fetches them from here.
+            SUMS_URL_BASE="$(repo_base)/releases/download/${latest}" || SUMS_URL_BASE=""
             { select_tarball_local || download_tarball_remote; } && return 0
         else
             warn "AZ-2: cannot resolve the latest release; using the newest local tarball"

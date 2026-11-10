@@ -280,6 +280,28 @@ echo "tarball=$TARBALL expect=$EXPECT_TAG local=$LOCAL_UNTAGGED"
     assert!(out.contains(&format!("tarball={}/v0.1.14/dtfs-v0.1.14-linux-amd64.tar.gz expect=v0.1.14", root.display())), "{out}");
 }
 
+/// #155: a local hit for the latest tag still knows where SHA256SUMS(.minisig) live.
+#[test]
+fn auto_source_local_hit_sets_sums_url_base() {
+    let d = tempfile::tempdir().unwrap();
+    let root = fake_staging(d.path(), &["v0.1.14"]);
+    let body = format!(
+        r#"
+info() {{ :; }}; warn() {{ echo "WARN: $*"; }}
+STAGING_ROOT='{}'; DOWNLOAD_CACHE=/nonexistent; VERSION=""; EXPECT_TAG=""; TARBALL=""; SUMS_URL_BASE=""
+resolve_latest_tag() {{ echo v0.1.14; }}
+repo_base() {{ echo https://example.test/o/r; }}
+download_tarball_remote() {{ echo UNEXPECTED; }}
+select_auto
+echo "sums=$SUMS_URL_BASE"
+"#,
+        root.display()
+    );
+    let (out, _, _) = run_fns(SELECT_FNS, &body, d.path());
+    assert!(!out.contains("UNEXPECTED"), "{out}");
+    assert!(out.contains("sums=https://example.test/o/r/releases/download/v0.1.14"), "{out}");
+}
+
 #[test]
 fn auto_source_without_remote_takes_the_newest_local_by_version() {
     let d = tempfile::tempdir().unwrap();
