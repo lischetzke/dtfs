@@ -31,15 +31,24 @@ pub fn version_string() -> String {
 pub const VERSION_STRING: &str =
     concat!(env!("DTFS_VERSION"), " (built ", env!("DTFS_BUILD_DATE"), ")");
 
+/// The version token of a `--version` line such as
+/// `dtfs-cli v0.1.14 (built ...)`: the first whitespace token that is an
+/// optional `v`/`V` followed by a digit. `None` when there is none.
+pub fn version_token(s: &str) -> Option<&str> {
+    s.split_whitespace().find(|tok| {
+        let rest = tok.strip_prefix('v').or_else(|| tok.strip_prefix('V')).unwrap_or(tok);
+        rest.starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
 /// CO-5-15 — parse the numeric `(major, minor, patch)` tuple out of a
 /// version string. Tolerates a leading `v`, surrounding text (the binary
-/// `--version` prints `v0.1.9 (built ...)`), and missing components
-/// (`v1` -> `(1, 0, 0)`). Returns `None` if no leading-numeric version
-/// token is found. A trailing pre-release/build suffix on the patch
+/// `--version` prints `dtfs-cli v0.1.9 (built ...)`), and missing
+/// components (`v1` -> `(1, 0, 0)`). Returns `None` if no version token
+/// (see [`version_token`]) is found. A trailing pre-release/build suffix on the patch
 /// component (`v1.2.3-rc1`) is ignored for ordering.
 pub fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
-    // Take the first whitespace-delimited token, drop an optional `v`.
-    let tok = s.trim().split_whitespace().next()?;
+    let tok = version_token(s)?;
     let tok = tok.strip_prefix('v').or_else(|| tok.strip_prefix('V')).unwrap_or(tok);
     let mut it = tok.split('.');
     let parse_part = |p: Option<&str>| -> u64 {
@@ -115,6 +124,19 @@ mod tests {
         assert!(version_is_newer("not installed", "v0.1.0"));
         // Unparseable latest -> conservatively not newer.
         assert!(!version_is_newer("v0.1.0", "<unknown>"));
+    }
+
+    #[test]
+    fn version_is_newer_reads_clap_version_output_with_binary_name() {
+        // `dtfs-cli --version` prints "<bin> <version> (built ...)" (#125).
+        let installed = "dtfs-cli v0.1.9 (built 20260101-000000)";
+        assert_eq!(parse_semver(installed), Some((0, 1, 9)));
+        assert!(!version_is_newer(installed, "0.1.9"));
+        assert!(version_is_newer(installed, "0.1.10"));
+        assert_eq!(version_token(installed), Some("v0.1.9"));
+        // A binary name and build text alone carry no version token.
+        assert_eq!(parse_semver("dtfs-cli (built x)"), None);
+        assert_eq!(version_token("not installed"), None);
     }
 
     #[test]
