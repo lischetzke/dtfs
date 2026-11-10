@@ -219,13 +219,13 @@ mod bug_cm_config_readback_tests {
         let mut base = json!({
             "tiering": {
                 "evaluation_interval_secs": 3600,
-                "migration_bandwidth_limit_mbps": 200,
+                "cold_threshold_days": 14,
             },
             "defaults": { "chunk_size_mb": 4 },
         });
         json_deep_merge(&mut base, &json!({ "tiering": { "evaluation_interval_secs": 60 } }));
         assert_eq!(base["tiering"]["evaluation_interval_secs"], json!(60));
-        assert_eq!(base["tiering"]["migration_bandwidth_limit_mbps"], json!(200));
+        assert_eq!(base["tiering"]["cold_threshold_days"], json!(14));
         assert_eq!(base["defaults"]["chunk_size_mb"], json!(4));
     }
 
@@ -242,7 +242,6 @@ mod bug_cm_config_readback_tests {
                 "cold_threshold_days": 14,
                 "frozen_threshold_days": 90,
                 "evaluation_interval_secs": 3600,
-                "migration_bandwidth_limit_mbps": 200,
                 "enable_cache_redundancy_escalation": false,
             }
         });
@@ -262,9 +261,9 @@ mod bug_cm_config_readback_tests {
 
         let bw = rows
             .iter()
-            .find(|r| r["name"] == "manager.tiering.migration_bandwidth_limit_mbps")
-            .expect("migration_bandwidth_limit_mbps row present");
-        assert_eq!(bw["current"], json!(200));
+            .find(|r| r["name"] == "manager.tiering.cold_threshold_days")
+            .expect("cold_threshold_days row present");
+        assert_eq!(bw["current"], json!(14));
         assert_eq!(bw["is_default"], json!(true), "un-overridden sibling stays default");
     }
 
@@ -303,8 +302,8 @@ mod co_4_3_config_override_validation_tests {
         assert_eq!(merged.tiering.evaluation_interval_secs, 60);
         // Untouched sibling survives the merge.
         assert_eq!(
-            merged.tiering.migration_bandwidth_limit_mbps,
-            base.tiering.migration_bandwidth_limit_mbps,
+            merged.tiering.cold_threshold_days,
+            base.tiering.cold_threshold_days,
         );
 
         // Persisted exactly as update_config does: pretty TOML of the merge.

@@ -436,7 +436,6 @@ pub(super) fn manager_config_defaults_baseline() -> Value {
             "cold_threshold_days": 14,
             "frozen_threshold_days": 90,
             "evaluation_interval_secs": 3600,
-            "migration_bandwidth_limit_mbps": 200,
             "enable_cache_redundancy_escalation": false,
         },
         "monitoring": {

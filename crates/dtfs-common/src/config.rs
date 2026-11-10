@@ -739,8 +739,6 @@ pub struct TieringConfig {
     pub cold_threshold_days: u32,
     #[serde(default = "default_frozen_threshold")]
     pub frozen_threshold_days: u32,
-    #[serde(default = "default_migration_bandwidth")]
-    pub migration_bandwidth_limit_mbps: u32,
     #[serde(default = "default_tiering_interval")]
     pub evaluation_interval_secs: u64,
     /// Bug AV (AV-4-5) — opt-in for the cache-tier redundancy
@@ -1419,9 +1417,6 @@ fn default_cold_threshold() -> u32 {
 fn default_frozen_threshold() -> u32 {
     60
 }
-fn default_migration_bandwidth() -> u32 {
-    200
-}
 fn default_tiering_interval() -> u64 {
     3600
 }
@@ -1840,6 +1835,12 @@ mod tests {
         let p: PartitionSafetyConfig =
             toml::from_str("mode = \"strict\"\nshow_warning = true\nquorum_loss_timeout_secs = 7\n").unwrap();
         assert_eq!(p.quorum_loss_timeout_secs, 7);
+        // tiering.migration_bandwidth_limit_mbps never throttled anything (#130).
+        let t: TieringConfig =
+            toml::from_str("migration_bandwidth_limit_mbps = 20\nevaluation_interval_secs = 7\n").unwrap();
+        assert_eq!(t.evaluation_interval_secs, 7);
+        let back = toml::to_string(&t).unwrap();
+        assert!(!back.contains("migration_bandwidth_limit_mbps"), "{back}");
     }
 
     #[test]

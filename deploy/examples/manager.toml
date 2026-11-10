@@ -131,7 +131,6 @@ listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
 #hot_threshold_reads_per_hour = 5
 #cold_threshold_days = 14
 #frozen_threshold_days = 60         # must be > cold_threshold_days
-#migration_bandwidth_limit_mbps = 200   # 0 = unlimited
 #evaluation_interval_secs = 3600
 #enable_cache_redundancy_escalation = false  # Bug AV-4-5: ramp cache replicas
                                              # toward max on hot chunks

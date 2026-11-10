@@ -1144,7 +1144,7 @@ mod design_a11y_tests {
         for old in ["Set Maintenance", "Exit Maintenance", "Undergoal chunks", "Utilisation", "Data Explorer</h2>", "(MB/s)", "alert('name is required')"] {
             assert!(!html.contains(old), "stale copy still served: {old}");
         }
-        for new in ["Enter maintenance", "Exit maintenance", "Under-replicated", "Over-replicated", "Mbit/s", "Phantom (metadata without data on disk)", "Config editor", "Cluster settings (raw JSON)"] {
+        for new in ["Enter maintenance", "Exit maintenance", "Under-replicated", "Over-replicated", "Phantom (metadata without data on disk)", "Config editor", "Cluster settings (raw JSON)"] {
             assert!(html.contains(new), "expected copy missing: {new}");
         }
         // Nav groups and problem badges.

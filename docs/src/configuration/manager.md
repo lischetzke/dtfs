@@ -143,7 +143,6 @@ A replication count creates replicas only if something maintains them: the volum
 | `hot_threshold_reads_per_hour` | u32 | `5` | | cluster |
 | `cold_threshold_days` | u32 | `14` | | cluster |
 | `frozen_threshold_days` | u32 | `60` | Keep above `cold_threshold_days`. | cluster |
-| `migration_bandwidth_limit_mbps` | u32 | `200` | `0` = unlimited. | cluster |
 | `evaluation_interval_secs` | u64 | `3600` | **Validated**: > 0. | cluster |
 | `enable_cache_redundancy_escalation` | bool | `false` | `true`: the cache planner may raise a chunk's cache replicas from `min` toward `max` once reads reach 2 x `promote_reads`. | cluster |
 

@@ -1933,12 +1933,6 @@ async fn cmd_config(api: &ApiClient, format: &OutputFormat) -> anyhow::Result<()
                     "  Cold Threshold:       {} days",
                     tiering["cold_threshold_days"].as_u64().unwrap_or(0)
                 );
-                println!(
-                    "  Migration BW Limit:   {} Mbps",
-                    tiering["migration_bandwidth_limit_mbps"]
-                        .as_u64()
-                        .unwrap_or(0)
-                );
             }
         }
     }
