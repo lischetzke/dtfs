@@ -866,7 +866,6 @@ mod bug_al_io_rate_tests {
         tracker.previous.insert(1, IoSnapshot {
             total_bytes_read: 1_000_000_000,
             total_bytes_written: 500_000_000,
-            observed_at_ms: 1_000_000,
         });
         tracker.last_query_ms = 1_000_000;
 
@@ -889,12 +888,10 @@ mod bug_al_io_rate_tests {
         tracker.previous.insert(1, IoSnapshot {
             total_bytes_read: 500_000,
             total_bytes_written: 200_000,
-            observed_at_ms: 1_000_000,
         });
         tracker.previous.insert(2, IoSnapshot {
             total_bytes_read: 1_000_000,
             total_bytes_written: 400_000,
-            observed_at_ms: 1_000_000,
         });
         tracker.last_query_ms = 1_000_000;
 

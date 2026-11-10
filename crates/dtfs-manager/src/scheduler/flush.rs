@@ -1,7 +1,6 @@
 //! TaskScheduler: cache-flush planning and execution. Split out of scheduler.rs on 2026-09-13; the
 //! `impl TaskScheduler` block here is an inherent impl continued from the
 //! parent, and `use super::*` gives every item the parent's imports.
-#![allow(unused_imports)]
 
 use super::*;
 
@@ -246,7 +245,6 @@ pub(crate) struct FlushSnapshot {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FlushNodeSummary {
-    pub datacenter: String,
     /// CNF-1 — `(stable disk_id, tier, live)` triples; disk_id is a key,
     /// not a Vec position (a reindexed disk list breaks positional
     /// lookups). CR-3-1/MGR-2 — `live` is `live_replica_tier(node,
@@ -265,7 +263,6 @@ impl FlushSnapshot {
                 (
                     *id,
                     FlushNodeSummary {
-                        datacenter: info.location.datacenter.clone(),
                         disk_tiers: info
                             .disks
                             .iter()

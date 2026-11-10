@@ -66,4 +66,4 @@ The updater downloads the tarball from GitHub releases. It checks every binary a
 - `failed to run custom build command for dtfs-proto`: install `protoc`.
 - `rocksdb-sys` build failure: install `libclang-dev`.
 - `unresolved import fuse3`: install `libfuse3-dev`.
-- An ICE in rustc dead-code analysis: the crate-level `#![allow(dead_code)]` on `dtfs-manager` and `dtfs-data` is a deliberate workaround for the pinned toolchain; do not remove it without re-verifying.
+- Dead-code warnings: no crate carries `allow(dead_code)` or `allow(unused_imports)` (rustc 1.94.1 builds the release and test profiles without the old dead-code ICE). Delete the unused item, or mark it `#[cfg(test)]` when only tests use it.

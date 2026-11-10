@@ -1,6 +1,5 @@
 //! REST handlers: audit log and integrity-fault views. Split out of api.rs on 2026-09-13; every
 //! item sees api.rs's imports and private helpers via the glob.
-#![allow(unused_imports)]
 
 use super::*;
 

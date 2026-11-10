@@ -9,7 +9,9 @@ use dashmap::DashMap;
 /// Snapshot of current metrics values.
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
+    #[cfg(test)]
     pub total_reads: u64,
+    #[cfg(test)]
     pub total_writes: u64,
     pub total_bytes_read: u64,
     pub total_bytes_written: u64,
@@ -276,6 +278,7 @@ impl DataMetrics {
     }
 
     /// Record a cache hit.
+    #[cfg(test)]
     pub fn record_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
@@ -288,7 +291,9 @@ impl DataMetrics {
     /// Take a consistent snapshot of current metric values.
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
+            #[cfg(test)]
             total_reads: self.total_reads.load(Ordering::Relaxed),
+            #[cfg(test)]
             total_writes: self.total_writes.load(Ordering::Relaxed),
             total_bytes_read: self.total_bytes_read.load(Ordering::Relaxed),
             total_bytes_written: self.total_bytes_written.load(Ordering::Relaxed),

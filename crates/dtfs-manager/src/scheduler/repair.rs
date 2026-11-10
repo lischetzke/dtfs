@@ -1,32 +1,10 @@
 //! TaskScheduler: under-replication / misplacement / anchor-lag repair planning and scheduling. Split out of scheduler.rs on 2026-09-13; the
 //! `impl TaskScheduler` block here is an inherent impl continued from the
 //! parent, and `use super::*` gives every item the parent's imports.
-#![allow(unused_imports)]
 
 use super::*;
 
 impl TaskScheduler {
-    /// Schedule a replication task for a specific chunk.
-    ///
-    /// Creates a new task in `Pending` state that will be picked up on the
-    /// next scheduler tick. Returns false when refused for the live-task budget.
-    pub async fn schedule_replication(
-        &self,
-        chunk_id: &str,
-        source_node: u64,
-        target_node: u64,
-        tier: DiskTier,
-    ) -> bool {
-        let out = self
-            .schedule_replications(
-                &[(chunk_id, source_node, target_node, tier)],
-                usize::MAX,
-                MAX_LIVE_TASKS,
-            )
-            .await;
-        out[0] != ScheduleOutcome::Refused
-    }
-
     /// Schedule many replication tasks with ONE migration-state load/save.
     /// Only newly created tasks count toward `max_new`; already-scheduled
     /// pairs are skipped for free. Returns one outcome per request.
@@ -947,6 +925,7 @@ pub(crate) fn plan_excess_spill_removal(
 // REV wave-1 hardening — pure predicates for the manager background loops.
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 pub(crate) fn plan_anchor_lag_repair(
     anchor: &dtfs_common::types::AnchorPolicy,
     placements: &[AnchorRepairPlacement],

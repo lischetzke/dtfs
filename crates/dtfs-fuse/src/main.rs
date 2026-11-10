@@ -1,7 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-// Mitigate rustc 1.94.x ICE in dead_code analysis.
-
 // DTFS FUSE Client Mount — Phase 2 (Linux: fuse3 mount).
 //
 // Entry point for the FUSE client binary. Loads configuration, connects
@@ -34,6 +30,7 @@ use filesystem::DtfsFilesystem;
 const SHUTDOWN_TOTAL_SECS: u64 = 40;
 const SHUTDOWN_UNMOUNT_SECS: u64 = 15;
 const SHUTDOWN_LEASE_RELEASE_SECS: u64 = 5;
+#[cfg(test)]
 const OLDEST_TIMEOUT_STOP_SECS: u64 = 45;
 
 /// Floor for the commit: a mis-stamped or overrun stop clock must never
@@ -394,7 +391,6 @@ async fn main() -> Result<()> {
     {
         use fuse3::MountOptions;
         use fuse_adapter::DtfsFuse3Adapter;
-        #[allow(unused_imports)]
         use libc;
 
         let shutdown_fs = fs.clone();

@@ -421,7 +421,6 @@ mod bug_ch_forward_classify_tests {
 }
 
 #[cfg(test)]
-#[allow(unused_imports)]
 mod bug_z_tier_tests {
     use super::*;
     use dtfs_common::types::{DiskTier, TierReplication};

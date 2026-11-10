@@ -66,7 +66,7 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "${DTFS_REPO_HOST_PATH:-$(pwd -W 2>/dev/nu
   -w /build dtfs-buildenv:latest cargo test -p <crate> --release [<test_name>]
 ```
 
-Always `--release`. Iterate with `<test_name>`, finish with full crate. After config/example change run `cargo test -p dtfs-common --release`. Parallel agents: one worktree each (`../dtfs2-wt/<name>`, branch `wt/<name>`), own target volume `dtfs-target-<name>` (copied from `dtfs-target`). Keep crate-level `#![allow(dead_code)]` on dtfs-manager/dtfs-data (rustc 1.94 ICE workaround). Source files: use Edit/Write, never `sed -i`.
+Always `--release`. Iterate with `<test_name>`, finish with full crate. After config/example change run `cargo test -p dtfs-common --release`. Parallel agents: one worktree each (`../dtfs2-wt/<name>`, branch `wt/<name>`), own target volume `dtfs-target-<name>` (copied from `dtfs-target`). No crate-level `allow(dead_code)`/`allow(unused_imports)`: delete unused items, or `#[cfg(test)]` those only tests use. Source files: use Edit/Write, never `sed -i`.
 
 ## A.5 Memory model
 

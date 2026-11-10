@@ -209,10 +209,10 @@ pre-edit lib). Before deploying a binary that must contain a fresh
 change: `touch` the edited file(s) on the builder (or rebuild after a
 marker change) and verify the binary actually carries the change
 (`grep -ac "<new log string>" target/release/<bin>` or the `--version`
-stamp). A crate-level `#![allow(dead_code)]` on the dtfs-manager and
-dtfs-data binaries works around a rustc 1.94 dead-code ICE — don't
-remove it without first verifying the ICE no longer reproduces on the
-current toolchain.
+stamp). The old crate-level `#![allow(dead_code)]` on the dtfs-manager,
+dtfs-data and dtfs-fuse binaries (a rustc 1.94 dead-code ICE workaround)
+is gone: rustc 1.94.1 builds the release and test profiles without the
+ICE, and dead items are deleted or `#[cfg(test)]`.
 
 ## A.8 — File map, full narrative
 

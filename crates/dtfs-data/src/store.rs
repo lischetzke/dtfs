@@ -684,6 +684,7 @@ impl ChunkStore {
     /// Delete a chunk from disk. **Errors** with `ChunkNotFound` when
     /// the chunk is absent — call `delete_chunk_idempotent` instead
     /// if you want a silent no-op on absent.
+    #[cfg(test)]
     pub async fn delete_chunk(&self, chunk_id: &ChunkId) -> DtfsResult<()> {
         let (was_present, _bytes) = self.delete_chunk_idempotent(chunk_id).await?;
         if !was_present {
@@ -708,6 +709,7 @@ impl ChunkStore {
     /// missing files are not errors) and clears the WAL. Net effect:
     /// every delete is durable and re-runnable; there is no window in
     /// which an orphan `.meta` outlives a successful boot.
+    #[cfg(test)]
     pub async fn delete_chunk_idempotent(
         &self,
         chunk_id: &ChunkId,
@@ -726,6 +728,7 @@ impl ChunkStore {
     /// An unknown `disk_id` (no such disk) is a no-op `(false, 0)` rather
     /// than a fall-through to first-found, so a stale id never deletes the
     /// wrong copy.
+    #[cfg(test)]
     pub async fn delete_chunk_idempotent_on_disk(
         &self,
         chunk_id: &ChunkId,
@@ -1305,6 +1308,7 @@ impl ChunkStore {
     /// written or replicated — scrubbing it would race with the atomic
     /// `.dat.tmp` → `.dat` rename and the subsequent `.meta` write, producing
     /// spurious "missing" or "size_mismatch" verdicts).
+    #[cfg(test)]
     pub async fn scrub_disk(
         &self,
         disk_path: &Path,

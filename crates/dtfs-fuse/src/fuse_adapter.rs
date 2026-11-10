@@ -221,15 +221,6 @@ impl InodeMap {
             self.path_to_inode.insert(new_path, ino);
         }
     }
-
-    /// Return the inode of the parent path (best-effort; falls back to root).
-    fn parent_inode(&self, path: &str) -> u64 {
-        let parent = parent_of(path);
-        *self
-            .path_to_inode
-            .get(&parent)
-            .unwrap_or_else(|| self.path_to_inode.get("/").unwrap())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -397,10 +388,6 @@ fn carve_owner_range(posix: &mut Vec<HeldLock>, owner: u64, start: u64, end: u64
 }
 
 impl DtfsFuse3Adapter {
-    pub fn new(fs: DtfsFilesystem) -> Self {
-        Self::from_shared(Arc::new(fs))
-    }
-
     /// CR-6-5 — accept an already-`Arc`-wrapped filesystem so callers can
     /// keep a clone (e.g. to spawn the metadata-cache sweep task) before
     /// handing ownership to the adapter.

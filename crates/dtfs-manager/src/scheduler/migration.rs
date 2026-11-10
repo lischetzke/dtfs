@@ -1,7 +1,6 @@
 //! TaskScheduler: migration task lifecycle: copy, verify, register, path migration, snapshots. Split out of scheduler.rs on 2026-09-13; the
 //! `impl TaskScheduler` block here is an inherent impl continued from the
 //! parent, and `use super::*` gives every item the parent's imports.
-#![allow(unused_imports)]
 
 use super::*;
 
@@ -224,17 +223,6 @@ impl TaskScheduler {
     /// Some(id)` unlinks only that disk's copy (protects a co-located
     /// anchor on another disk); `None` keeps the legacy first-found
     /// behaviour for callers without a disk context.
-    pub(crate) async fn delete_chunk_replica_on_node(
-        &self,
-        node_addr: &str,
-        chunk_id: &str,
-        disk_id: Option<u32>,
-        tier: &str,
-    ) -> anyhow::Result<(bool, u64)> {
-        self.delete_chunk_replica_on_node_if_older(node_addr, chunk_id, disk_id, tier, None)
-            .await
-    }
-
     /// As above, but the data node skips the delete when the `.dat` mtime
     /// is newer than `if_mtime_le_ms` (orphan reaper re-upload guard).
     pub(crate) async fn delete_chunk_replica_on_node_if_older(
@@ -1713,7 +1701,6 @@ pub struct PathMigrationExample {
 /// info to score a node for tier+DC fit without re-locking the state machine
 /// for each candidate.
 pub(crate) struct NodeSummary {
-    pub grpc_addr: String,
     pub datacenter: String,
     pub healthy: bool,
     /// `(disk_id, tier)` of the node's LIVE disks (`live_replica_tier`):
@@ -1735,7 +1722,6 @@ impl NodeSummary {
 
 pub(crate) fn node_summary(info: &dtfs_raft::NodeInfo) -> NodeSummary {
     NodeSummary {
-        grpc_addr: info.grpc_addr.clone(),
         datacenter: info.location.datacenter.clone(),
         healthy: info.health == HealthStatus::Healthy,
         disks: info

@@ -1,7 +1,6 @@
 //! Handler-test harness: a real `AppState` over an UNINITIALISED single-node
 //! Raft (so it is never leader: leader-gated handlers must refuse, and
 //! `client_write` fails) plus an in-memory state machine the test can seed.
-#![allow(unused_imports)]
 
 use super::*;
 

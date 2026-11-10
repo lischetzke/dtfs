@@ -30,14 +30,22 @@ use dtfs_raft::{ClientRequest, DtfsRaft};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::cluster::NodeStatus;
+/// Liveness state the monitor commits for a data node (Healthy recovery is the
+/// heartbeat handler's `UpdateNodeStatus(healthy)`, never emitted here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeStatus {
+    Suspect,
+    Down,
+}
 
 /// Default liveness thresholds (mirror the historical ClusterManager
 /// values). A data node heartbeats every 5 s. MGR-MON-1 — the live values
 /// come from `[monitoring]` (`heartbeat_interval_secs *
 /// suspect_after_missed` / `* down_after_missed`, see
 /// `liveness_thresholds_ms`); these constants are the test defaults.
+#[cfg(test)]
 const SUSPECT_MS: u64 = 15_000;
+#[cfg(test)]
 const DOWN_MS: u64 = 30_000;
 
 /// MGR-MON-1 — derive the monitor's `(suspect_ms, down_ms)` from the
@@ -97,6 +105,7 @@ pub(crate) fn clock_skew_suspects(
 /// permanently Down. `last_seen_ms == 0` means "registered, no heartbeat
 /// yet" and is left alone. Healthy is omitted (recovery is the heartbeat
 /// handler's `UpdateNodeStatus(healthy)`), matching the prior contract.
+#[cfg(test)]
 pub(crate) fn liveness_changes(
     nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
     now_ms: u64,
@@ -173,7 +182,6 @@ fn health_matches_status(
         (status, health),
         (NodeStatus::Down, HealthStatus::Down)
             | (NodeStatus::Suspect, HealthStatus::Suspect)
-            | (NodeStatus::Healthy, HealthStatus::Healthy)
     )
 }
 
@@ -379,10 +387,6 @@ impl HealthMonitor {
                             );
                         }
                     }
-                    NodeStatus::Healthy => {
-                        // Node recovered — restore healthy status in Raft.
-                        self.update_node_status_in_raft(*node_id, "healthy", &membership_nodes).await;
-                    }
                 }
             }
 
@@ -539,7 +543,7 @@ mod mgr_mon_threshold_tests {
 #[cfg(test)]
 mod bug_cj_liveness_tests {
     use super::{liveness_changes, monitor_status_changes, SUSPECT_MS, DOWN_MS};
-    use crate::cluster::NodeStatus;
+    use super::NodeStatus;
     use dtfs_common::types::NodeRole;
 
     fn node(role: NodeRole, last_seen_ms: u64) -> dtfs_raft::NodeInfo {
@@ -704,7 +708,7 @@ mod bug_cj_liveness_tests {
 #[cfg(test)]
 mod audit_co_tests {
     use super::{liveness_changes, monitor_status_changes, SUSPECT_MS, DOWN_MS};
-    use crate::cluster::NodeStatus;
+    use super::NodeStatus;
     use dtfs_common::types::{HealthStatus, NodeRole};
 
     fn node(role: NodeRole, last_seen_ms: u64, health: HealthStatus) -> dtfs_raft::NodeInfo {

@@ -18,9 +18,10 @@ use crate::store::ChunkStore;
 #[cfg(test)]
 use dtfs_common::checksum;
 use dtfs_common::config::ScrubConfig;
+#[cfg(test)]
+use dtfs_common::crypto::stamp_data_rpc_auth;
 use dtfs_common::crypto::{
-    data_rpc_delete_binding, stamp_data_rpc_auth, verify_data_rpc_auth, DATA_RPC_AUTH_MAC,
-    DATA_RPC_AUTH_TS,
+    data_rpc_delete_binding, verify_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS,
 };
 use tokio::sync::RwLock;
 
@@ -352,7 +353,8 @@ fn require_data_rpc_auth(
 }
 
 /// Insert `x-dtfs-rpc-*` metadata onto a tonic request when a shared secret
-/// is configured. Used by callers (tests, replication) that build Requests.
+/// is configured. Test-only; `replication.rs` stamps its own requests.
+#[cfg(test)]
 pub fn attach_data_rpc_auth<T>(
     request: &mut Request<T>,
     secret: &str,

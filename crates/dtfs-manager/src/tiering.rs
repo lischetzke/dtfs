@@ -14,7 +14,6 @@ use std::time::Duration;
 use dtfs_common::config::TieringConfig;
 use dtfs_common::types::{DataTemperature, DiskTier};
 use dtfs_raft::state_machine::StateMachineData;
-use dtfs_raft::DtfsRaft;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -1105,19 +1104,6 @@ impl TieringEngine {
                 (dc_reads * 1_000_000_000, free_capacity)
             })
             .map(|(id, _)| *id)
-    }
-
-    /// Update the tiering configuration at runtime (live reload).
-    pub async fn update_config(&self, new_config: TieringConfig) {
-        let mut cfg = self.config.write().await;
-        *cfg = new_config;
-        info!("Tiering configuration updated (live reload)");
-    }
-
-    /// Get current access statistics (for WebUI / API).
-    pub async fn get_access_stats(&self) -> Vec<ChunkAccessProfile> {
-        let stats = self.access_stats.read().await;
-        stats.values().cloned().collect()
     }
 }
 

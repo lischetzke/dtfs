@@ -14,7 +14,6 @@ use std::sync::Arc;
 // Bug BF-12 — bring `Instant::elapsed()` into scope for the
 // `last_quorum_acked` migration (openraft 0.10 wraps the timestamp
 // in `SerdeInstant`, whose `.elapsed()` lives on this trait).
-#[allow(unused_imports)]
 use openraft::Instant as _;
 
 use axum::{
@@ -25,8 +24,11 @@ use axum::{
     Router,
 };
 use dtfs_common::config::ManagerConfig;
+#[cfg(test)]
 use dtfs_common::topology::Location;
-use dtfs_common::types::{DiskStatus, DiskTier, HealthStatus, NodeRole};
+#[cfg(test)]
+use dtfs_common::types::DiskStatus;
+use dtfs_common::types::{DiskTier, HealthStatus, NodeRole};
 use dtfs_raft::state_machine::StateMachineData;
 use dtfs_raft::{ClientRequest, DtfsRaft, NodeInfo as RaftNodeInfo};
 use serde::{Deserialize, Serialize};
@@ -47,14 +49,14 @@ mod nodes;
 mod raft;
 mod remove_dead;
 mod volumes;
-pub(crate) use audit::*;
-pub(crate) use chunks::*;
+use audit::*;
+use chunks::*;
 pub(crate) use cluster::*;
 pub(crate) use config::*;
-pub(crate) use files::*;
-pub(crate) use nodes::*;
-pub(crate) use raft::*;
-pub(crate) use remove_dead::*;
+use files::*;
+use nodes::*;
+use raft::*;
+use remove_dead::*;
 pub(crate) use volumes::*;
 
 /// Shared application state for API handlers.
@@ -102,7 +104,6 @@ pub struct IoRateTracker {
 pub struct IoSnapshot {
     pub total_bytes_read: u64,
     pub total_bytes_written: u64,
-    pub observed_at_ms: u64,
 }
 
 /// Build the full API router (REST endpoints + WebUI).

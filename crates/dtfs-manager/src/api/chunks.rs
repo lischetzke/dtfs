@@ -1,6 +1,5 @@
 //! REST handlers: read-only chunk placement diagnostics and manager memory
 //! state. All GET; no Raft write, no auth change (LIS-18 exempts GET).
-#![allow(unused_imports)]
 
 use super::*;
 use crate::placement_state::{for_each_chunk_placement, placement_for_file,ChunkPlacementView, PlacementState};

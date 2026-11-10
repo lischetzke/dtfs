@@ -174,7 +174,9 @@ pub struct ReadAheadEngine {
 }
 
 /// Whether chunk `idx` is inside the window `on_chunk_read` prefetches after
-/// reading `chunk_index`: `chunk_index+1 ..= chunk_index+n`.
+/// reading `chunk_index`: `chunk_index+1 ..= chunk_index+n`. Test-only mirror of the
+/// `start..end` loop in `on_chunk_read`.
+#[cfg(test)]
 pub(crate) fn in_prefetch_window(idx: u64, chunk_index: u32, n: u32) -> bool {
     idx > chunk_index as u64 && idx <= chunk_index as u64 + n as u64
 }
@@ -314,6 +316,7 @@ impl ReadAheadEngine {
     }
 
     /// Bytes currently held in the prefetch cache (Bug CE accounting).
+    #[cfg(test)]
     pub fn cache_bytes(&self) -> usize {
         self.cache_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -476,31 +479,8 @@ impl ReadAheadEngine {
         }
     }
 
-    /// Remove a cached entry (e.g., after it has been consumed).
-    #[cfg(test)]
-    pub fn evict(&self, node_addr: &str, chunk_id: &str) {
-        let key = cache_key(node_addr, chunk_id);
-        if let Some((_, (_, v))) = self.cache.remove(&key) {
-            self.cache_bytes
-                .fetch_sub(v.len(), std::sync::atomic::Ordering::Relaxed);
-        }
-        // Also cancel pending task if any.
-        if let Some((_, p)) = self.pending.remove(&key) {
-            p.handle.abort();
-        }
-    }
-
-    /// Cancel all pending prefetch tasks and clear the cache.
-    #[cfg(test)]
-    pub fn clear(&self) {
-        for entry in self.pending.iter() {
-            entry.value().handle.abort();
-        }
-        self.pending.clear();
-        drain_cache(&self.cache, &self.cache_bytes);
-    }
-
     /// Number of entries currently in the prefetch cache.
+    #[cfg(test)]
     pub fn cache_len(&self) -> usize {
         self.cache.len()
     }
@@ -734,6 +714,7 @@ impl ReadAheadCacheController {
     }
 
     /// Current live byte budget.
+    #[cfg(test)]
     pub fn current_budget(&self) -> usize {
         self.max_cache_bytes.load(Ordering::Relaxed)
     }

@@ -14,9 +14,7 @@ use dtfs_raft::{
 use tonic::{Request, Response, Status};
 use tracing::info;
 
-use crate::cluster::ClusterManager;
 use crate::placement::PlacementEngine;
-use crate::scheduler::live_replica_tier;
 
 /// CR-6-3 (PROTO-2) — warn once per manager process when a sub-hour
 /// quick/deep scrub cadence is configured, since an older data node
@@ -45,9 +43,6 @@ pub struct MetadataService {
     pub raft: Arc<DtfsRaft>,
     pub sm_data: Arc<tokio::sync::RwLock<StateMachineData>>,
     pub placement: Arc<PlacementEngine>,
-    /// Used to record heartbeat timestamps so `HealthMonitor` can detect
-    /// missed heartbeats (fix for issue #2).
-    pub cluster: Arc<ClusterManager>,
     /// P0-9: tiering engine; receives per-chunk-per-DC reads from
     /// heartbeats so the auto-move-replica-toward-active-DC decisions
     /// are driven by real access patterns.
@@ -127,7 +122,6 @@ impl MetadataService {
         raft: Arc<DtfsRaft>,
         sm_data: Arc<tokio::sync::RwLock<StateMachineData>>,
         placement: Arc<PlacementEngine>,
-        cluster: Arc<ClusterManager>,
         tls: dtfs_common::tls::TlsContext,
     ) -> Self {
         Self {
@@ -135,7 +129,6 @@ impl MetadataService {
             raft,
             sm_data,
             placement,
-            cluster,
             tiering: None,
             leader_clients: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -513,6 +506,7 @@ pub(crate) struct IntegrityFaultBatch<'a> {
     /// First fault in the report — drives the QuarantineInfo + audit row.
     pub representative: Option<&'a IntegrityFault>,
     /// Faults examined before the cap stopped the scan.
+    #[cfg(test)]
     pub scanned: usize,
     /// Faults left unexamined because of the cap.
     pub dropped: usize,
@@ -542,6 +536,7 @@ pub(crate) fn batch_integrity_faults(
     IntegrityFaultBatch {
         chunk_ids,
         representative: faults.first(),
+        #[cfg(test)]
         scanned,
         dropped: faults.len().saturating_sub(scanned),
     }
@@ -1107,6 +1102,7 @@ fn node_id_from_grpc_addr(sm: &StateMachineData, addr: &str) -> String {
 /// `ReportChunkReads` intercept uses the batch
 /// `build_chunk_read_context_index` below (R1/MGR-3) so a heartbeat with
 /// N entries costs one pass over `sm.files`, not N.
+#[cfg(test)]
 fn resolve_chunk_read_context(
     sm: &StateMachineData,
     chunk_id: &str,
@@ -1887,11 +1883,6 @@ impl ManagerService for MetadataService {
             .node_id
             .parse()
             .map_err(|_| Status::invalid_argument("node_id must be a u64 from registration"))?;
-
-        // Record the heartbeat timestamp so HealthMonitor can detect missed
-        // heartbeats. Without this call the ClusterManager's heartbeat map was
-        // never populated and every node appeared as Down immediately (fix #2).
-        self.cluster.process_heartbeat(node_id);
 
         // Bug BC-3 — heartbeat carries the full cluster scrub +
         // integrity policy from `ManagerConfig.scrub`. The data-side

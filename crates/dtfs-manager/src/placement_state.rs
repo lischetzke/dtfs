@@ -152,8 +152,6 @@ pub struct ChunkPlacementView<'a> {
     pub chunk_id: &'a str,
     /// Every location row for this chunk index, live or not.
     pub rows: Vec<&'a dtfs_raft::ChunkLocationEntry>,
-    /// Live rows resolved to `(datacenter, tier)`; what `classify_chunk` saw.
-    pub resolved: Vec<(String, DiskTier)>,
     pub state: PlacementState,
     /// True when at least one row is unresolvable (node/disk gone or dead);
     /// counted as `pending_deletion`.
@@ -222,7 +220,6 @@ pub fn placement_for_file<'a>(
                 chunk_index: idx,
                 chunk_id,
                 rows,
-                resolved,
                 state,
                 dangling,
             });

@@ -2,7 +2,6 @@
 //! node that will never come back, then deregister it. The pure planner sorts
 //! every row of the node into removable / anchor-pending / data-loss; the
 //! handler executes the plan through guarded Raft commands (leader only).
-#![allow(unused_imports)]
 
 use super::*;
 use dtfs_common::types::AnchorPolicy;
@@ -41,6 +40,7 @@ pub(crate) struct RemoveDeadPlan {
 }
 
 impl RemoveDeadPlan {
+    #[cfg(test)]
     pub(crate) fn total(&self) -> usize {
         self.removable.len() + self.anchor_pending.len() + self.data_loss.len()
     }

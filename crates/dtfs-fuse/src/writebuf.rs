@@ -381,6 +381,7 @@ impl WriteBuffer {
     /// Flushes one complete chunk at a time (`flush_batch_chunks = 1`) — the
     /// original behaviour. Use [`new_with_batch`](Self::new_with_batch) to
     /// hold back several complete chunks per flush.
+    #[cfg(test)]
     pub fn new(chunk_size: usize) -> Self {
         Self {
             chunk_size,
@@ -404,6 +405,7 @@ impl WriteBuffer {
     /// at the default 4 MB chunk size. `flush_all` is unaffected — it
     /// always drains everything, batched or not, so held-back chunks still
     /// leave at fsync/close.
+    #[cfg(test)]
     pub fn new_with_batch(chunk_size: usize, flush_batch_chunks: usize) -> Self {
         Self::new_with_batch_inflight(chunk_size, flush_batch_chunks, 1)
     }
@@ -538,6 +540,7 @@ impl WriteBuffer {
     /// Returns an empty `Vec` if fewer than `flush_batch_chunks` complete
     /// chunks are available.
     #[instrument(skip(self), fields(path = %path))]
+    #[cfg(test)]
     pub fn flush(&self, path: &str) -> Vec<ChunkSegment> {
         self.drain(path, false, |buf| self.flush_locked(buf)).0
     }
@@ -591,6 +594,7 @@ impl WriteBuffer {
     /// ones. This should be called when the file is being closed or when
     /// all buffered data must be persisted regardless of alignment.
     #[instrument(skip(self), fields(path = %path))]
+    #[cfg(test)]
     pub fn flush_all(&self, path: &str) -> Vec<ChunkSegment> {
         self.drain(path, false, |buf| self.flush_all_locked(buf)).0
     }
@@ -631,6 +635,7 @@ impl WriteBuffer {
     /// write touches and has just seeded), then gappy complete ones until
     /// under the cap. With `partial` (async_commit), if still at the cap,
     /// also partial ones outside `keep`. Ascending by chunk index.
+    #[cfg(test)]
     pub fn cap_drain(
         &self,
         path: &str,
@@ -1030,22 +1035,6 @@ impl WriteBuffer {
         buffered + inflight
     }
 
-    /// CR-1-1/CR-1-2 — true iff `chunk_index` is currently buffered AND its
-    /// buffered range fully covers `0..chunk_size`, i.e. it is already safe
-    /// to commit without an RMW seed.
-    #[cfg(test)]
-    pub fn chunk_is_fully_buffered(&self, path: &str, chunk_index: u32) -> bool {
-        self.buffers
-            .get(path)
-            .and_then(|e| {
-                e.value()
-                    .chunks
-                    .get(&chunk_index)
-                    .map(|cb| cb.is_complete(self.chunk_size))
-            })
-            .unwrap_or(false)
-    }
-
     /// Logical end of the file as seen by the buffer: the buffered end
     /// (`FileWriteBuffer.extent`, kept across partial drains: the top chunk
     /// may be committed, whole-hole chunks are never buffered) or the end of
@@ -1054,6 +1043,7 @@ impl WriteBuffer {
     ///
     /// Used by the F-021/F-022 fix to decide where O_APPEND writes land and
     /// to size sparse-hole zero fills.
+    #[cfg(test)]
     pub fn logical_size(&self, path: &str) -> Option<u64> {
         let entry = self.buffers.get(path)?;
         self.buffered_end(entry.value())

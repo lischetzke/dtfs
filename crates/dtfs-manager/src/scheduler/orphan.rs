@@ -1,7 +1,6 @@
 //! TaskScheduler: orphan reaper, de-location, auto-unquarantine and quarantine gates. Split out of scheduler.rs on 2026-09-13; the
 //! `impl TaskScheduler` block here is an inherent impl continued from the
 //! parent, and `use super::*` gives every item the parent's imports.
-#![allow(unused_imports)]
 
 use super::*;
 
@@ -118,7 +117,7 @@ impl TaskScheduler {
     /// 1. Walk every data node, call `ListChunks`, get the on-disk
     ///    `chunk_id -> .dat mtime` map.
     /// 2. Diff against the union of every file's chunk hashes
-    ///    (`chunk_is_orphan`).
+    ///    (`chunk_delocated_on_node`).
     /// 3. Reap each orphan whose durable mtime is at least `grace_secs`
     ///    old (`orphan_reap_due`): call `DeleteChunkReplica` on the node +
     ///    audit `orphan.reaped`. Bug CB — the grace is measured against
@@ -805,19 +804,6 @@ impl DelocateOps for SchedulerDelocate<'_> {
     }
 }
 
-/// Bug BP-4 — GC orphan classification. A physical chunk is an orphan
-/// (eligible for reap) ONLY when no FileMetadata references its hash;
-/// `in_state_chunks` is the union of every file's chunk hashes. Keying on
-/// the hash (not on a per-disk location/UUID match) is the load-bearing
-/// safety invariant: a chunk a file still points at must never be deleted,
-/// even if its location record looks stale. CLAUDE.md §A.3.3 #4 / §A.6 #8.
-pub(crate) fn chunk_is_orphan(
-    in_state_chunks: &std::collections::HashSet<String>,
-    chunk_hash: &str,
-) -> bool {
-    !in_state_chunks.contains(chunk_hash)
-}
-
 /// CO-3-2 — is an on-disk chunk a reap candidate for THIS node because the
 /// state machine no longer records any location entry naming the node for
 /// that chunk? This is the "de-located bytes" condition: the rebalance /
@@ -833,10 +819,9 @@ pub(crate) fn chunk_is_orphan(
 /// no live location entry naming the node, so the bytes are safe to reap
 /// (node-wide — a de-located node should hold no copy at all).
 ///
-/// This strictly supersets `chunk_is_orphan`: a chunk referenced by NO file
-/// is named by no node either, so it is also absent from every
-/// `node_expected`. The hash-orphan check is kept as the explicit primary
-/// signal; this adds the per-node de-location case (CLAUDE.md §A.6 #8). The
+/// Bug BP-4 — a chunk referenced by NO file is named by no node either, so
+/// it is absent from every `node_expected` and is reapable; a chunk a file
+/// still points at is never reapable (CLAUDE.md §A.6 #8). The
 /// caller still gates the actual delete behind the mtime grace, so an
 /// in-flight put/promote whose `commit_chunk_locations` Raft write has not
 /// yet applied (recent mtime) is never dropped.
@@ -906,7 +891,7 @@ pub(crate) fn referenced_hashes<'a>(
 
 /// Per-delete gate of the orphan sweep: leadership plus a non-empty file
 /// view. The "log caught up" check is NOT here: it runs once at sweep start
-/// (`orphan_sweep_allowed`), since the leader's own in-flight writes keep
+/// (`orphan_sweep_skip_reason`), since the leader's own in-flight writes keep
 /// `last_applied < last_log_index` and would abort every long sweep.
 pub(crate) fn orphan_delete_allowed(is_leader: bool, in_state_chunks: usize) -> bool {
     is_leader && in_state_chunks > 0
@@ -1080,16 +1065,8 @@ pub(crate) fn leader_gate_open(current_leader: Option<u64>, self_id: u64) -> boo
 /// the local state machine to be caught up, and refuse to sweep when the
 /// in-state chunk set is empty while data nodes still report chunks — that
 /// combination is never legitimately "everything is an orphan".
-pub(crate) fn orphan_sweep_allowed(
-    is_leader: bool,
-    last_applied: u64,
-    last_log_index: u64,
-    in_state_chunks: usize,
-) -> bool {
-    orphan_sweep_skip_reason(is_leader, last_applied, last_log_index, in_state_chunks).is_none()
-}
-
-/// `orphan_sweep_allowed` with the reason it refuses.
+///
+/// `None` = the sweep may run; `Some(reason)` = why it refuses.
 pub(crate) fn orphan_sweep_skip_reason(
     is_leader: bool,
     last_applied: u64,
@@ -1168,6 +1145,7 @@ pub(crate) fn should_quarantine_for_missing(missing: usize, unreconcilable: usiz
 /// Chunks are content-addressed, so identical content in two files (a
 /// re-download, a copy, two episodes sharing a segment) is ONE chunk id
 /// referenced from several `FileMetadata.chunks` lists.
+#[cfg(test)]
 pub(crate) fn files_referencing_chunk(
     files: &std::collections::BTreeMap<String, dtfs_raft::state_machine::FileMetadata>,
     chunk_hash: &str,
@@ -1399,7 +1377,7 @@ mod sched_audit_orphan_tests {
     #[test]
     fn per_delete_gate_is_leadership_only_not_log_lag() {
         // Start-of-sweep gate rejects a lagging log ...
-        assert!(!orphan_sweep_allowed(true, 5, 10, 3));
+        assert!(orphan_sweep_skip_reason(true, 5, 10, 3).is_some());
         // ... the per-delete gate does not (the leader's own writes lag).
         assert!(orphan_delete_allowed(true, 3));
         assert!(!orphan_delete_allowed(false, 3));

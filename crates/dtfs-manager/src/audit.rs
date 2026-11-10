@@ -194,22 +194,6 @@ impl AuditLog {
         }
     }
 
-    /// Bug AH — install the Raft fan-out hook AFTER construction. We do
-    /// this rather than passing the raft handle to the constructor because
-    /// `main.rs` builds the `AuditLog` (Arc) before the raft node is
-    /// initialised; the `JoinHandler` and a few other services already
-    /// capture the audit log via the early Arc clone. Calling
-    /// `with_raft_fanout` mutates a single Option field, so existing
-    /// Arc holders are unaffected.
-    ///
-    /// Requires `&mut self` — call BEFORE wrapping in Arc, OR use
-    /// `Arc::get_mut`/`Arc::try_unwrap` once at startup. We choose
-    /// the cleaner path: build raft first, then build AuditLog with the
-    /// raft handle (see `new_with_archive_and_fanout`).
-    pub fn enable_raft_fanout(&mut self, raft: Arc<dtfs_raft::DtfsRaft>, origin_manager: String) {
-        self.fanout = Some(RaftFanout::new_raft(raft, origin_manager));
-    }
-
     /// Bug AH — convenience constructor: archive + Raft fan-out wired
     /// at creation time. Use this when the raft handle is available
     /// before the AuditLog is built (the common case in main.rs after
@@ -234,6 +218,7 @@ impl AuditLog {
     /// `AUDIT_FANOUT_MAX_INFLIGHT` in-flight `dispatch` tasks were already
     /// running. `0` when Raft fan-out is disabled or never saturated.
     /// CR2-7-4 / MGR-14 observability hook.
+    #[cfg(test)]
     pub fn fanout_dropped_count(&self) -> u64 {
         self.fanout
             .as_ref()
@@ -347,13 +332,9 @@ impl AuditLog {
     }
 
     /// Return the total number of entries currently stored.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.read().len()
-    }
-
-    /// Returns `true` if the log contains no entries.
-    pub fn is_empty(&self) -> bool {
-        self.entries.read().is_empty()
     }
 }
 
@@ -387,6 +368,7 @@ fn append_to_archive(dir: &std::path::Path, entry: &AuditEntry) -> std::io::Resu
 
 /// Query archived entries from disk, scanning daily files in `archive_dir`.
 /// Returns up to `filter.limit` matching entries, oldest first.
+#[cfg(test)]
 pub fn query_archive(
     archive_dir: &std::path::Path,
     filter: &AuditFilter,

@@ -1,6 +1,5 @@
 //! REST handlers: cluster status, health, stats, metrics and probes. Split out of api.rs on 2026-09-13; every
 //! item sees api.rs's imports and private helpers via the glob.
-#![allow(unused_imports)]
 
 use super::*;
 
@@ -333,7 +332,6 @@ pub(crate) fn compute_io_rate_at(
         let snap = IoSnapshot {
             total_bytes_read: info.total_bytes_read,
             total_bytes_written: info.total_bytes_written,
-            observed_at_ms: now_ms,
         };
         if let Some(prev) = tracker.previous.get(node_id) {
             // Cumulative counters only grow; if they appear to have

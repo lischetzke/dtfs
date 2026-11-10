@@ -8,8 +8,7 @@
 #     -v dtfs-target:/target -v dtfs-registry:/usr/local/cargo/registry \
 #     -w /build dtfs-buildenv:latest cargo test --workspace --release
 #
-# rustc 1.94 is pinned: dtfs-manager/dtfs-data carry a crate-level
-# #![allow(dead_code)] that works around a dead-code ICE on this version.
+# rustc 1.94.1 is pinned; no crate needs an allow(dead_code) workaround on it.
 FROM rust:1.94.1-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

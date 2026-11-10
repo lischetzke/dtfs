@@ -39,8 +39,7 @@ read the working file). Mark a new script executable with
 ## Build / verify
 
 Docker only: use the command and hard rules in CLAUDE.md § A.4
-(`MSYS_NO_PATHCONV=1`, no `bash -lc`, always `--release`, keep
-`#![allow(dead_code)]`; rustc 1.94 ICEs on some struct-literal edits in
+(`MSYS_NO_PATHCONV=1`, no `bash -lc`, always `--release`; rustc 1.94 ICEs on some struct-literal edits in
 dtfs-manager/dtfs-data, so reformulate the edit). Pipe output through
 `2>&1 | tail -30`.
 

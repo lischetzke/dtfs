@@ -34,8 +34,6 @@ use crate::writebuf::{rekey_path, WriteBuffer};
 /// Cached file location metadata returned by the manager.
 #[derive(Debug, Clone)]
 pub struct FileLocations {
-    /// Full file path in the DTFS namespace.
-    pub path: String,
     /// Total file size in bytes.
     pub total_size: u64,
     /// Per-chunk info: (chunk_id, size, node_addresses).
@@ -147,14 +145,6 @@ pub struct ChunkInfo {
     /// older manager leaves this empty (or shorter); missing entries are
     /// treated as unknown tier, falling back to pure distance.
     pub node_tiers: Vec<String>,
-    /// CO-3-10 read-locality: per-replica topology Location, positionally
-    /// aligned 1:1 with `node_addresses`. Comes from the manager's
-    /// `ChunkLocationInfo.node_locations`. Loaded into `known_locations` so
-    /// `select_read_replica` can rank replicas by physical distance +
-    /// `read_location_priority`. An older manager leaves this empty (or
-    /// shorter); a missing/all-empty entry is treated as an unknown location
-    /// (no insert -> arbitrary/pure-distance order).
-    pub node_locations: Vec<Location>,
     /// REV-2-1: this entry's chunk index within the file, straight from the
     /// manager's `ChunkLocationInfo.chunk_index`. `None` means the entry was
     /// synthesised locally; an older manager sends 0 for every entry, which
@@ -3087,7 +3077,6 @@ impl DtfsFilesystem {
             .map(|l| committed_any_from_created_snapshot(l.chunks.len()))
             .unwrap_or_else(|| committed_any_on_open(true));
         let snapshot = fetched.unwrap_or_else(|| FileLocations {
-            path: path.to_string(),
             total_size: 0,
             chunks: Vec::new(),
             volume_id: response.volume_id,
@@ -3518,7 +3507,6 @@ impl DtfsFilesystem {
                     size: c.size,
                     node_addresses: c.node_addresses,
                     node_tiers: c.node_tiers,
-                    node_locations,
                     // REV-2-1 — carry the manager's label. An older manager
                     // sends 0 for every entry; `indices_are_authoritative`
                     // spots that and keeps the positional fallback.
@@ -3563,7 +3551,6 @@ impl DtfsFilesystem {
             resolve_refreshed_volume_id(&response.volume_id, existing_volume_id.as_deref());
 
         Ok(FileLocations {
-            path: response.path,
             total_size: response.total_size,
             chunks,
             volume_id,
@@ -4663,7 +4650,6 @@ fn committed_chunk_info(
         size,
         node_addresses,
         node_tiers,
-        node_locations: Vec::new(),
         chunk_index: Some(chunk_index as u64),
     }
 }
@@ -5244,9 +5230,8 @@ mod cr_6_5_metadata_cache_bound_tests {
 
     /// Built through a free function on purpose (same rustc 1.94 struct-
     /// literal ICE workaround as `rev_2_1_chunk_index_tests::locs`).
-    fn empty_locations(path: &str) -> FileLocations {
+    fn empty_locations(_path: &str) -> FileLocations {
         FileLocations {
-            path: path.to_string(),
             total_size: 0,
             chunks: Vec::new(),
             volume_id: "default".to_string(),
@@ -5592,12 +5577,10 @@ mod rev_2_1_chunk_index_tests {
                 size: 4 * 1024 * 1024,
                 node_addresses: vec!["http://n1:9500".to_string()],
                 node_tiers: vec!["cold".to_string()],
-                node_locations: Vec::new(),
                 chunk_index: Some(*idx),
             })
             .collect();
         FileLocations {
-            path: "/movies/x.mkv".to_string(),
             total_size: 0,
             chunks,
             volume_id: "default".to_string(),
@@ -5866,7 +5849,6 @@ mod tests {
     #[test]
     fn test_file_attr_from_locations() {
         let loc = FileLocations {
-            path: "/test/file".to_string(),
             total_size: 42,
             chunks: Vec::new(),
             volume_id: "default".to_string(),
@@ -5891,7 +5873,6 @@ mod tests {
     #[test]
     fn bug_a_b_directory_is_directory_propagates_through_attrs() {
         let loc = FileLocations {
-            path: "/corpus".to_string(),
             total_size: 0,
             chunks: Vec::new(),
             volume_id: "default".to_string(),
@@ -6424,8 +6405,7 @@ mod commit_tracker_tests {
         use super::{gated_snapshot, FileLocations};
         use std::sync::Arc;
         let t = CommitTracker::default();
-        let snap = |p: &str| Arc::new(FileLocations {
-            path: p.to_string(),
+        let snap = |_p: &str| Arc::new(FileLocations {
             total_size: 0,
             chunks: Vec::new(),
             volume_id: "default".to_string(),
@@ -6558,9 +6538,8 @@ mod async_commit_fs_tests {
 
     /// Chunkless snapshot of `size` bytes: every seed is a zero seed, no I/O
     /// (free function: rustc 1.94 struct-literal ICE workaround).
-    fn holes(path: &str, size: u64, chunk_size: u64) -> FileLocations {
+    fn holes(_path: &str, size: u64, chunk_size: u64) -> FileLocations {
         FileLocations {
-            path: path.to_string(),
             total_size: size,
             chunks: Vec::new(),
             volume_id: "default".to_string(),

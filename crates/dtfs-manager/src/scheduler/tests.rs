@@ -8,7 +8,7 @@ use super::*;
 #[cfg(test)]
 mod rev_leader_gate_tests {
     use super::{
-        force_tick_after_skips, leader_gate_open, orphan_sweep_allowed,
+        force_tick_after_skips, leader_gate_open, orphan_sweep_skip_reason,
         should_quarantine_for_missing, task_budget_available,
         IN_STATE_MISSING_QUARANTINE_THRESHOLD, MAX_CONSECUTIVE_PRESSURE_SKIPS, MAX_LIVE_TASKS,
         MAX_NEW_TASKS_PER_TICK,
@@ -23,20 +23,20 @@ mod rev_leader_gate_tests {
 
     #[test]
     fn orphan_sweep_requires_leadership() {
-        assert!(!orphan_sweep_allowed(false, 100, 100, 5));
+        assert!(orphan_sweep_skip_reason(false, 100, 100, 5).is_some());
     }
 
     #[test]
     fn orphan_sweep_requires_a_caught_up_state_machine() {
         // The two-week-old manager: elected, but still replaying.
-        assert!(!orphan_sweep_allowed(true, 10, 5_000, 5));
-        assert!(orphan_sweep_allowed(true, 5_000, 5_000, 5));
+        assert!(orphan_sweep_skip_reason(true, 10, 5_000, 5).is_some());
+        assert!(orphan_sweep_skip_reason(true, 5_000, 5_000, 5).is_none());
     }
 
     #[test]
     fn orphan_sweep_refuses_an_empty_namespace_view() {
         // "Every chunk on every disk is an orphan" is never a real answer.
-        assert!(!orphan_sweep_allowed(true, 100, 100, 0));
+        assert!(orphan_sweep_skip_reason(true, 100, 100, 0).is_some());
     }
 
     #[test]
@@ -550,7 +550,6 @@ mod path_migration_tests {
         tiers: &[DiskTier],
     ) -> NodeSummary {
         NodeSummary {
-            grpc_addr: "127.0.0.1:9500".to_string(),
             datacenter: dc.to_string(),
             healthy,
             disks: tiers.iter().enumerate().map(|(i, t)| (i as u32, *t)).collect(),
@@ -984,9 +983,8 @@ mod bug_av_flush_cache_tests {
     /// specified explicitly, so tests can put a mandatory-tier replica on
     /// a dead placement and assert it is excluded from
     /// `mandatory_survives`.
-    fn node_summary_with_liveness(dc: &str, tiers: &[(DiskTier, bool)]) -> FlushNodeSummary {
+    fn node_summary_with_liveness(_dc: &str, tiers: &[(DiskTier, bool)]) -> FlushNodeSummary {
         FlushNodeSummary {
-            datacenter: dc.to_string(),
             disk_tiers: tiers
                 .iter()
                 .enumerate()
@@ -1090,7 +1088,6 @@ mod bug_av_flush_cache_tests {
             nodes: HashMap::from([
                 (10u64, node_summary("leli", &[DiskTier::Cold])),
                 (11u64, FlushNodeSummary {
-                    datacenter: "toro".to_string(),
                     disk_tiers: vec![(1, DiskTier::Warm, true)], // sparse: id 1 at index 0
                 }),
             ]),
@@ -2075,11 +2072,11 @@ mod bug_bo_tests {
     fn bp_4_chunk_is_orphan_only_when_unreferenced() {
         let mut in_state = std::collections::HashSet::new();
         in_state.insert("referenced".to_string());
-        assert!(!chunk_is_orphan(&in_state, "referenced"), "referenced chunk is NOT orphan");
-        assert!(chunk_is_orphan(&in_state, "dangling"), "unreferenced chunk IS orphan");
+        assert!(!chunk_delocated_on_node(Some(&in_state), "referenced"), "referenced chunk is NOT orphan");
+        assert!(chunk_delocated_on_node(Some(&in_state), "dangling"), "unreferenced chunk IS orphan");
         // Empty in-state set: everything is orphan (no files reference anything).
         let empty = std::collections::HashSet::new();
-        assert!(chunk_is_orphan(&empty, "anything"));
+        assert!(chunk_delocated_on_node(Some(&empty), "anything"));
     }
 
     /// Bug CB — the reap decision is a pure function of the chunk's

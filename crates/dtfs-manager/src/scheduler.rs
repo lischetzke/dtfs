@@ -26,6 +26,7 @@ mod flush;
 mod migration;
 mod orphan;
 mod repair;
+#[cfg(test)]
 pub(crate) use flush::*;
 pub(crate) use migration::*;
 pub(crate) use orphan::*;

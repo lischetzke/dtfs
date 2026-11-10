@@ -415,16 +415,19 @@ impl LocalChunkCache {
         Ok(removed)
     }
 
+    #[cfg(test)]
     pub fn current_bytes(&self) -> u64 {
         self.total_bytes.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn entry_count(&self) -> usize {
         self.sizes.len()
     }
 
     /// REV-3-12 observability: total full stat sweeps performed by
     /// `evict_to_size` since startup.
+    #[cfg(test)]
     pub(crate) fn eviction_sweeps(&self) -> u64 {
         self.eviction_sweeps.load(Ordering::Relaxed)
     }

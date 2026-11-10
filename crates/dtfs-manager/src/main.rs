@@ -1,7 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
-// Mitigate rustc 1.94.x ICE in dead_code / join module analysis.
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,10 +7,7 @@ use tracing_subscriber::EnvFilter;
 
 mod alerts;
 mod api;
-#[allow(dead_code)]
 mod audit;
-#[allow(dead_code)]
-mod cluster;
 mod goal_check;
 mod membership;
 mod metadata;
@@ -29,7 +22,6 @@ mod tiering;
 mod webui;
 
 use audit::AuditLog;
-use cluster::ClusterManager;
 use monitor::HealthMonitor;
 use placement::PlacementEngine;
 use scheduler::TaskScheduler;
@@ -302,9 +294,6 @@ async fn main() -> anyhow::Result<()> {
             "alert dispatcher armed"
         );
     }
-    // ClusterManager no longer holds a Raft reference; heartbeat tracking is
-    // its only responsibility. Raft writes are performed by HealthMonitor.
-    let cluster_mgr = Arc::new(ClusterManager::new());
     let placement_engine = Arc::new(PlacementEngine::new(config.placement.clone()));
 
     // CF-5 — per-process memory budget + RSS sampler. When the operator
@@ -445,7 +434,6 @@ async fn main() -> anyhow::Result<()> {
         raft.clone(),
         sm_data.clone(),
         placement_engine.clone(),
-        cluster_mgr.clone(), // Fix #2: wire heartbeat tracking into the gRPC handler
         tls_ctx.clone(),
     )
     .with_tiering(tiering_engine.clone()) // P0-9: receive per-chunk-per-DC reads
