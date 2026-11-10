@@ -699,7 +699,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "bytes",
  "chrono",
  "hmac",
  "rcgen",
@@ -723,7 +722,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "blake3",
  "bytes",
  "chrono",
  "clap",
@@ -789,7 +787,6 @@ dependencies = [
  "http-body-util",
  "openraft",
  "parking_lot",
- "prost",
  "reqwest",
  "serde",
  "serde_json",

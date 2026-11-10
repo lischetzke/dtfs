@@ -14,14 +14,14 @@ toml = { workspace = true }
 blake3 = { workspace = true }
 xxhash-rust = { workspace = true }
 uuid = { workspace = true }
-bytes = { workspace = true }
-chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 rcgen = { workspace = true }
+# Not used directly: the only declaration of rustls, so its features
+# (ring, tls12, ...) reach tonic's TLS stack through feature unification.
 rustls = { workspace = true }
 tokio = { workspace = true }
 # CF-6 — TlsContext builds tonic Server/ClientTlsConfig + endpoints.

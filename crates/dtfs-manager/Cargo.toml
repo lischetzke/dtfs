@@ -12,7 +12,6 @@ dtfs-common = { workspace = true }
 dtfs-proto = { workspace = true }
 dtfs-raft = { workspace = true }
 tonic = { workspace = true }
-prost = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 axum = { workspace = true }
