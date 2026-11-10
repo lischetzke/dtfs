@@ -244,3 +244,7 @@ Reactive promotion waits for reads to reach a datacenter. Pre-caching copies the
 ## Monitoring
 
 The manager `/metrics` endpoint exposes `dtfs_tier_migrations_completed_total`, `dtfs_migration_failed_total` and `dtfs_anchor_protected_total`; the audit log records `tier.promote`, `tier.demote`, `cache.flush_replica` and `cache.flush_refused`. See [Monitoring](../operations/monitoring.md).
+
+### Pre-cache monitoring
+
+`dtfs-cli precache status` (REST `GET /api/v1/tiering/precache`, leader only, 409 with a leader hint elsewhere) shows per datacenter the room, desired and cached bytes, whether the cache is capacity-limited, the active series and cursors with their files, the last scheduled batch, whether the loop yielded to repair, and volumes skipped because their policy no longer validates. `/metrics` carries `dtfs_precache_is_leader`, `dtfs_precache_inflight_tasks` and `dtfs_precache_{desired_bytes,cached_bytes,series_active,capacity_limited}{dc="..."}`. A `desired_bytes` that stays above `cached_bytes` with `capacity_limited` 1 means the cache tier is too small for the plan.

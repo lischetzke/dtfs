@@ -32,6 +32,12 @@ struct Args {
     command: Commands,
 }
 
+#[derive(Subcommand, Debug)]
+enum PrecacheCmd {
+    /// Show the leader's pre-cache plan (use the leader's --manager; a follower answers 409)
+    Status,
+}
+
 #[derive(Debug, Clone, clap::ValueEnum)]
 enum OutputFormat {
     Table,
@@ -65,6 +71,10 @@ enum Commands {
     /// tier/DC moves of a path prefix).
     #[command(subcommand)]
     Migrations(MigrationsCmd),
+
+    /// Predictive pre-caching observability
+    #[command(subcommand)]
+    Precache(PrecacheCmd),
 
     /// Trigger a full scrub of all disks (the server has no per-target scrub)
     Scrub {
@@ -660,6 +670,14 @@ impl ApiClient {
         Ok(resp)
     }
 
+    /// GET that preserves the server's JSON error body on non-2xx (409 leader hint).
+    async fn get_with_status(&self, path: &str) -> anyhow::Result<(reqwest::StatusCode, Value)> {
+        let resp = self.client.get(format!("{}{}", self.base_url, path)).send().await?;
+        let status = resp.status();
+        let value = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        Ok((status, value))
+    }
+
     async fn post(&self, path: &str, body: &Value) -> anyhow::Result<Value> {
         let url = format!("{}{}", self.base_url, path);
         let resp = self
@@ -834,6 +852,7 @@ async fn main() -> anyhow::Result<()> {
                 cooldown_secs, max_tasks, allow_empty_prefix,
             ).await?,
         },
+        Commands::Precache(PrecacheCmd::Status) => cmd_precache_status(&api, &args.format).await?,
         Commands::Migrations(sub) => match sub {
             MigrationsCmd::Create {
                 path_prefix, target_tier, target_dc, allow_empty_prefix, max_tasks,
@@ -1912,6 +1931,108 @@ async fn cmd_unquarantine(
     Ok(())
 }
 
+/// `dtfs-cli precache status`: table, or the server JSON with `--format json`.
+/// A non-2xx answer (409 not the leader) prints the body and exits non-zero.
+async fn cmd_precache_status(api: &ApiClient, format: &OutputFormat) -> anyhow::Result<()> {
+    let (status, v) = api.get_with_status("/api/v1/tiering/precache").await?;
+    if !status.is_success() || matches!(format, OutputFormat::Json) {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        print!("{}", render_precache_status(&v));
+    }
+    if !status.is_success() {
+        anyhow::bail!("precache status failed: HTTP {}", status);
+    }
+    Ok(())
+}
+
+fn render_precache_group(out: &mut String, title: &str, groups: &Value) {
+    let Some(gs) = groups.as_array().filter(|g| !g.is_empty()) else { return };
+    out.push_str(&format!("
+{title}:
+"));
+    for g in gs {
+        let key = g["root"].as_str().or(g["dir"].as_str()).unwrap_or("?");
+        out.push_str(&format!(
+            "  {} {} {}  cached {} of {} (budget {})  cursor {}
+",
+            g["volume"].as_str().unwrap_or("?"),
+            g["dc"].as_str().unwrap_or("?"),
+            key,
+            format_bytes(g["cached_bytes"].as_u64().unwrap_or(0)),
+            format_bytes(g["desired_bytes"].as_u64().unwrap_or(0)),
+            format_bytes(g["budget_bytes"].as_u64().unwrap_or(0)),
+            g["cursor"].as_str().unwrap_or("-"),
+        ));
+        for f in g["files"].as_array().into_iter().flatten() {
+            out.push_str(&format!(
+                "    {}{}  {} of {}
+",
+                f["path"].as_str().unwrap_or("?"),
+                if f["head"].as_bool() == Some(true) { " (head)" } else { "" },
+                format_bytes(f["cached_bytes"].as_u64().unwrap_or(0)),
+                format_bytes(f["desired_bytes"].as_u64().unwrap_or(0)),
+            ));
+        }
+    }
+}
+
+/// Pure table rendering of `GET /api/v1/tiering/precache`; tolerates missing fields.
+fn render_precache_status(v: &Value) -> String {
+    let mut out = format!(
+        "Leader: {}  rate: {} Mbps  yielded to repair: {}  in-flight tasks: {}
+",
+        v["is_leader"].as_bool().unwrap_or(false),
+        v["rate_mbps"].as_u64().unwrap_or(0),
+        v["yielded_to_repair"].as_bool().unwrap_or(false),
+        v["inflight_tasks"].as_u64().unwrap_or(0),
+    );
+    let b = &v["last_batch"];
+    out.push_str(&format!(
+        "Last batch: new {} already {} deferred {} ({})
+",
+        b["new"].as_u64().unwrap_or(0),
+        b["already"].as_u64().unwrap_or(0),
+        b["deferred"].as_u64().unwrap_or(0),
+        format_bytes(b["bytes"].as_u64().unwrap_or(0)),
+    ));
+    out.push_str(&format!("
+{:<12} {:<6} {:>12} {:>12} {:>12}  {}
+", "DC", "TIER", "ROOM", "DESIRED", "CACHED", "FLAGS"));
+    for d in v["dcs"].as_array().into_iter().flatten() {
+        let mut flags = Vec::new();
+        if d["capacity_limited"].as_bool() == Some(true) {
+            flags.push("capacity-limited");
+        }
+        if d["no_target"].as_bool() == Some(true) {
+            flags.push("no-target");
+        }
+        out.push_str(&format!(
+            "{:<12} {:<6} {:>12} {:>12} {:>12}  {}
+",
+            d["dc"].as_str().unwrap_or("?"),
+            d["tier"].as_str().unwrap_or("?"),
+            format_bytes(d["room_bytes"].as_u64().unwrap_or(0)),
+            format_bytes(d["desired_bytes"].as_u64().unwrap_or(0)),
+            format_bytes(d["cached_bytes"].as_u64().unwrap_or(0)),
+            flags.join(","),
+        ));
+    }
+    render_precache_group(&mut out, "Series", &v["series"]);
+    render_precache_group(&mut out, "Cursors", &v["cursors"]);
+    for s in v["skipped_volumes"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "
+Skipped volume {}: {} ({})
+",
+            s["volume"].as_str().unwrap_or("?"),
+            s["reason"].as_str().unwrap_or("?"),
+            s["detail"].as_str().unwrap_or(""),
+        ));
+    }
+    out
+}
+
 fn remove_dead_body(operator_id: &str, reason: &str, accept_data_loss: bool, dry_run: bool) -> serde_json::Value {
     serde_json::json!({
         "operator_id": operator_id,
@@ -2848,5 +2969,37 @@ mod precache_tests {
             serde_json::json!({"mode":"plex","series_max_gb":20,"max_series":3})
         );
         assert_eq!(set_precache_body(None, None, None, None, None), serde_json::json!({}));
+    }
+}
+
+#[cfg(test)]
+mod precache_status_tests {
+    use super::*;
+
+    #[test]
+    fn render_precache_status_shows_dcs_and_series_files() {
+        let v = serde_json::json!({
+            "is_leader": true, "rate_mbps": 10, "inflight_tasks": 3,
+            "last_batch": {"new": 2, "already": 1, "deferred": 0, "bytes": 1048576},
+            "dcs": [{"dc": "toro", "tier": "warm", "room_bytes": 1073741824u64, "desired_bytes": 2048,
+                     "cached_bytes": 1024, "capacity_limited": true, "no_target": false}],
+            "series": [{"volume": "media", "dc": "toro", "root": "/tv/Show", "cursor": "/tv/Show/S01/E02.mkv",
+                        "last_read_ms": 1, "budget_bytes": 4096, "desired_bytes": 2048, "cached_bytes": 1024,
+                        "files": [{"path": "/tv/Show/S01/E02.mkv", "bytes": 1, "desired_bytes": 2048,
+                                   "cached_bytes": 1024, "head": true}]}],
+            "cursors": [],
+            "skipped_volumes": [{"volume": "old", "reason": "policy_invalid", "detail": "no cache tier"}],
+        });
+        let out = render_precache_status(&v);
+        for want in ["toro", "/tv/Show", "/tv/Show/S01/E02.mkv (head)", "capacity-limited", "policy_invalid"] {
+            assert!(out.contains(want), "missing {want} in {out}");
+        }
+    }
+
+    #[test]
+    fn render_precache_status_empty_object_does_not_panic() {
+        let out = render_precache_status(&serde_json::json!({}));
+        assert!(out.contains("Leader: false"), "{out}");
+        assert!(!out.contains("Series"), "{out}");
     }
 }

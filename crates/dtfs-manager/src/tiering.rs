@@ -132,6 +132,16 @@ impl TieringEngine {
         }
     }
 
+    /// Snapshot of the last pre-cache pass (default status on a follower).
+    pub(crate) fn precache_status(&self) -> crate::precache::PrecacheStatus {
+        self.precache.lock().status.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_precache_status_for_test(&self, s: crate::precache::PrecacheStatus) {
+        self.precache.lock().status = s;
+    }
+
     /// Pre-cache loop: every `PRECACHE_TICK_SECS`, leader only. Spawned from main.rs.
     pub async fn run_precache(&self) {
         let mut interval =

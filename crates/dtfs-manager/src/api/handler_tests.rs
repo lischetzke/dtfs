@@ -634,6 +634,7 @@ async fn orphan_reap_without_the_shared_secret_is_401() {
         memory: None,
         row_aggregates: Default::default(),
         remove_dead_job: Default::default(),
+        tiering: None,
     });
     let req = axum::http::Request::builder()
         .method("POST")
@@ -680,6 +681,7 @@ async fn auth_denied_rows_coalesce_per_route_not_per_raw_path() {
         memory: None,
         row_aggregates: Default::default(),
         remove_dead_job: Default::default(),
+        tiering: None,
     });
     let router = build_router(state);
     for i in 0..100 {
@@ -921,4 +923,82 @@ fn volume_json_carries_precache_block() {
     let j = volume_config_to_json(&v);
     assert_eq!(j["precache"]["mode"], "plex");
     assert_eq!(j["precache"]["series_max_gb"], 20);
+}
+
+fn with_engine(h: &super::test_support::Harness, status: Option<crate::precache::PrecacheStatus>) -> Arc<AppState> {
+    let engine = Arc::new(crate::tiering::TieringEngine::new(
+        h.state.config.tiering.clone(),
+        h.state.scheduler.clone(),
+        h.state.audit_log.clone(),
+        h.state.sm_data.clone(),
+    ));
+    if let Some(s) = status {
+        engine.set_precache_status_for_test(s);
+    }
+    Arc::new(AppState {
+        config: h.state.config.clone(),
+        raft: h.state.raft.clone(),
+        sm_data: h.state.sm_data.clone(),
+        audit_log: h.state.audit_log.clone(),
+        scheduler: h.state.scheduler.clone(),
+        io_rate: h.state.io_rate.clone(),
+        memory: None,
+        row_aggregates: Default::default(),
+        remove_dead_job: Default::default(),
+        tiering: Some(engine),
+    })
+}
+
+fn seeded_precache_status() -> crate::precache::PrecacheStatus {
+    crate::precache::PrecacheStatus {
+        is_leader: true,
+        inflight_tasks: 7,
+        dcs: vec![crate::precache::DcStatus {
+            dc: "toro".into(),
+            tier: dtfs_common::types::DiskTier::Warm,
+            room_bytes: 100,
+            desired_bytes: 42,
+            cached_bytes: 10,
+            capacity_limited: true,
+            no_target: false,
+        }],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn precache_status_as_leader_returns_arrays() {
+    let h = super::test_support::leader_harness().await;
+    let st = with_engine(&h, Some(seeded_precache_status()));
+    let j = get_precache_status(State(st)).await.unwrap().0;
+    assert_eq!(j["is_leader"], json!(true));
+    assert_eq!(j["dcs"][0]["dc"], "toro");
+    assert!(j["series"].is_array() && j["cursors"].is_array(), "{j}");
+}
+
+#[tokio::test]
+async fn precache_status_as_follower_is_409_not_the_leader() {
+    let h = super::test_support::harness().await;
+    let e = get_precache_status(State(with_engine(&h, None))).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert!(e.1.0["error"].as_str().unwrap().contains("not the leader"), "{:?}", e.1.0);
+}
+
+#[tokio::test]
+async fn metrics_include_precache_gauges_for_seeded_status() {
+    let h = super::test_support::harness().await;
+    let (_, _, body) = super::cluster::prometheus_metrics(State(with_engine(&h, Some(seeded_precache_status())))).await;
+    for want in [
+        "dtfs_precache_is_leader 1",
+        "dtfs_precache_inflight_tasks 7",
+        "dtfs_precache_desired_bytes{dc=\"toro\"} 42",
+        "dtfs_precache_cached_bytes{dc=\"toro\"} 10",
+        "dtfs_precache_series_active{dc=\"toro\"} 0",
+        "dtfs_precache_capacity_limited{dc=\"toro\"} 1",
+    ] {
+        assert!(body.contains(want), "missing {want} in {body}");
+    }
+    // No engine: no precache lines at all.
+    let (_, _, plain) = super::cluster::prometheus_metrics(State(h.state.clone())).await;
+    assert!(!plain.contains("dtfs_precache"));
 }

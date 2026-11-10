@@ -467,6 +467,7 @@ async fn main() -> anyhow::Result<()> {
         audit_log.clone(),
         task_scheduler.clone(),
         Some(memory_budget.clone()),
+        Some(tiering_engine.clone()),
         async move { api_shutdown.wait_for_shutdown().await },
     ));
 

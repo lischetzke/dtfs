@@ -46,6 +46,7 @@ mod cluster;
 mod config;
 mod files;
 mod nodes;
+mod precache;
 mod raft;
 mod remove_dead;
 mod volumes;
@@ -55,6 +56,7 @@ pub(crate) use cluster::*;
 pub(crate) use config::*;
 use files::*;
 use nodes::*;
+use precache::*;
 use raft::*;
 use remove_dead::*;
 pub(crate) use volumes::*;
@@ -83,6 +85,8 @@ pub struct AppState {
     pub row_aggregates: Arc<cluster::RowAggregatesCache>,
     /// Issue #156: the running or last remove-dead run (its response JSON).
     pub remove_dead_job: Arc<parking_lot::Mutex<Option<Value>>>,
+    /// Pre-cache status for `GET /api/v1/tiering/precache` and `/metrics`.
+    pub tiering: Option<Arc<crate::tiering::TieringEngine>>,
 }
 
 /// Bug AL — per-node cumulative-byte snapshots, used to derive a rolling
@@ -231,6 +235,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/chunks", get(list_chunks))
         .route("/api/v1/chunks/{chunk_id}", get(get_chunk))
         .route("/api/v1/memory", get(get_memory))
+        .route("/api/v1/tiering/precache", get(get_precache_status))
         // LIS-18 — shared-secret gate on mutating REST (fail closed when
         // `[cluster].shared_secret` is set). GET + probes exempt.
         .route_layer(middleware::from_fn_with_state(
@@ -251,6 +256,7 @@ pub async fn run_api_server(
     audit_log: Arc<AuditLog>,
     scheduler: Arc<TaskScheduler>,
     memory: Option<Arc<dtfs_common::memory::MemoryBudget>>,
+    tiering: Option<Arc<crate::tiering::TieringEngine>>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
@@ -266,6 +272,7 @@ pub async fn run_api_server(
         memory,
         row_aggregates: Default::default(),
         remove_dead_job: Default::default(),
+        tiering,
     });
 
     let app = build_router(state);

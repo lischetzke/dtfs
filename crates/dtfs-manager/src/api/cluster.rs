@@ -753,8 +753,9 @@ pub(super) async fn prometheus_metrics(
     }
 
     let raft_log_size = sm.audit_log.len() as u64;
+    let precache = state.tiering.as_ref().map(|t| t.precache_status());
 
-    let body = format!(
+    let mut body = format!(
         "# HELP dtfs_files_total Number of files tracked by the cluster.\n\
          # TYPE dtfs_files_total gauge\n\
          dtfs_files_total {total_files}\n\
@@ -798,12 +799,47 @@ pub(super) async fn prometheus_metrics(
          # TYPE dtfs_audit_log_in_memory gauge\n\
          dtfs_audit_log_in_memory {raft_log_size}\n",
     );
+    if let Some(p) = precache {
+        body.push_str(&precache_metrics(&p));
+    }
 
     (
         axum::http::StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],
         body,
     )
+}
+
+/// Pre-cache gauges; the per-DC series are empty on a follower.
+pub(super) fn precache_metrics(p: &crate::precache::PrecacheStatus) -> String {
+    let mut o = format!(
+        "# HELP dtfs_precache_is_leader 1 when this manager runs the pre-cache loop as leader.\n\
+         # TYPE dtfs_precache_is_leader gauge\n\
+         dtfs_precache_is_leader {}\n\
+         # HELP dtfs_precache_inflight_tasks Live pre-cache copy tasks.\n\
+         # TYPE dtfs_precache_inflight_tasks gauge\n\
+         dtfs_precache_inflight_tasks {}\n",
+        u8::from(p.is_leader),
+        p.inflight_tasks
+    );
+    type Val = fn(&crate::precache::DcStatus, &crate::precache::PrecacheStatus) -> u64;
+    let rows: [(&str, &str, Val); 4] = [
+        ("dtfs_precache_desired_bytes", "Bytes the planner wants cached in the DC.", |d, _| d.desired_bytes),
+        ("dtfs_precache_cached_bytes", "Desired bytes already cached in the DC.", |d, _| d.cached_bytes),
+        ("dtfs_precache_series_active", "Active pre-cache series in the DC.", |d, p| {
+            p.series.iter().filter(|s| s.dc == d.dc).count() as u64
+        }),
+        ("dtfs_precache_capacity_limited", "1 when the DC cache tier is too small for the plan.", |d, _| {
+            u64::from(d.capacity_limited)
+        }),
+    ];
+    for (name, help, f) in rows {
+        o.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+        for d in &p.dcs {
+            o.push_str(&format!("{name}{{dc=\"{}\"}} {}\n", d.dc, f(d, p)));
+        }
+    }
+    o
 }
 
 /// `GET /healthz` — liveness probe. Always 200 if the process responds.

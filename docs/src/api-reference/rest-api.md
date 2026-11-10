@@ -54,6 +54,7 @@ Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserve
 | GET | `/api/v1/cluster/status` | no | any | Cluster summary |
 | GET | `/api/v1/stats` | no | any | Aggregate metrics |
 | GET | `/api/v1/memory` | no | any | Manager memory ladder |
+| GET | `/api/v1/tiering/precache` | no | leader (409) | Pre-cache plan and progress: `is_leader`, `rate_mbps`, `yielded_to_repair`, `inflight_tasks`, `last_batch`, `dcs`, `series`, `cursors`, `skipped_volumes`. A follower answers `409` with a leader hint |
 | GET | `/api/v1/raft/state` | no | any | Raft view of this manager |
 | POST | `/api/v1/raft/add-learner` | yes + body secret | leader (409) | Add learner |
 | POST | `/api/v1/raft/promote` | yes + body secret | leader (409) | Learner to voter |
@@ -97,7 +98,7 @@ Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserve
 
 - `GET /healthz`: `200 ok` while the process answers.
 - `GET /readyz`: `200 ready` when the state machine has applied at least one entry and one registered node is effectively healthy, else `503 not ready: fsm_initialised=<bool> any_healthy=<bool>`.
-- `GET /metrics`: Prometheus text format. Series: `dtfs_nodes_healthy`, `dtfs_nodes_suspect`, `dtfs_nodes_down`, `dtfs_nodes_quarantined`, `dtfs_cluster_capacity_bytes`, `dtfs_cluster_used_bytes`, `dtfs_files_total`, `dtfs_chunks_total`, `dtfs_volumes_total`, `dtfs_write_leases_active`, `dtfs_audit_log_in_memory`, `dtfs_tier_migrations_completed_total`, `dtfs_migration_failed_total`, `dtfs_anchor_protected_total`. See [Monitoring](../operations/monitoring.md).
+- `GET /metrics`: Prometheus text format. Series: `dtfs_nodes_healthy`, `dtfs_nodes_suspect`, `dtfs_nodes_down`, `dtfs_nodes_quarantined`, `dtfs_cluster_capacity_bytes`, `dtfs_cluster_used_bytes`, `dtfs_files_total`, `dtfs_chunks_total`, `dtfs_volumes_total`, `dtfs_write_leases_active`, `dtfs_audit_log_in_memory`, `dtfs_tier_migrations_completed_total`, `dtfs_migration_failed_total`, `dtfs_anchor_protected_total`, `dtfs_precache_is_leader`, `dtfs_precache_inflight_tasks` and, per datacenter, `dtfs_precache_desired_bytes{dc}`, `dtfs_precache_cached_bytes{dc}`, `dtfs_precache_series_active{dc}`, `dtfs_precache_capacity_limited{dc}` (the per-DC series are empty on a follower). See [Monitoring](../operations/monitoring.md).
 - `GET /api/v1/health`: `200 {"status": "healthy"}` whenever the manager runs.
 
 ## Cluster

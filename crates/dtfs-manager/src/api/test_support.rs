@@ -57,6 +57,7 @@ pub(crate) async fn harness() -> Harness {
         memory: None,
         row_aggregates: Default::default(),
         remove_dead_job: Default::default(),
+        tiering: None,
     });
     Harness { state, _dir: dir }
 }
