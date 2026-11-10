@@ -118,6 +118,8 @@ struct PendingPrefetch {
     /// and the near-first ordering without any unbounded production
     /// bookkeeping.
     started: Arc<AtomicBool>,
+    /// #151: the file whose read spawned it (queued-window cancel scope).
+    file: String,
 }
 
 /// Background read-ahead engine.
@@ -171,6 +173,9 @@ pub struct ReadAheadEngine {
     /// re-add a byte gate here (A.3.2 — in-flight bytes are bounded by
     /// `prefetch_slots`).
     prefetch_enabled: Arc<AtomicBool>,
+    /// #151: the last `RECENT_PREFETCH_FILES` distinct files read, newest
+    /// first; queued prefetches of other files are dropped.
+    recent_files: parking_lot::Mutex<std::collections::VecDeque<String>>,
 }
 
 /// Whether chunk `idx` is inside the window `on_chunk_read` prefetches after
@@ -180,6 +185,10 @@ pub struct ReadAheadEngine {
 pub(crate) fn in_prefetch_window(idx: u64, chunk_index: u32, n: u32) -> bool {
     idx > chunk_index as u64 && idx <= chunk_index as u64 + n as u64
 }
+
+/// #151: files whose queued prefetch windows survive another file's read
+/// (concurrent streams); a scan's older files beyond this lose theirs.
+pub(crate) const RECENT_PREFETCH_FILES: usize = 8;
 
 /// Monotonic insertion stamp for the prefetch cache (oldest-first eviction).
 static CACHE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -261,6 +270,7 @@ impl ReadAheadEngine {
             local_cache: parking_lot::RwLock::new(None),
             prefetch_slots: Arc::new(Semaphore::new(max_inflight.max(1))),
             prefetch_enabled: Arc::new(AtomicBool::new(true)),
+            recent_files: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -386,12 +396,23 @@ impl ReadAheadEngine {
         // bare FIFO semaphore only orders whichever task calls `acquire`
         // first, which is not guaranteed to match spawn order once several
         // tasks are polled in the same pass.
-        // #151: prefetches still queued (no slot yet) belong to a read
-        // position that moved on (another file, a seek); drop them so a
-        // scan does not queue one window per file. Started ones finish.
-        // Chunks of this window are re-spawned below.
+        // #151: prefetches still queued (no slot yet) of this file belong to
+        // a position that moved on (a seek), and those of files outside the
+        // last RECENT_PREFETCH_FILES read to a scan that moved on; drop
+        // them. Other recent files are concurrent streams: keep their
+        // windows. Started ones finish. This window is re-spawned below.
+        let recent = {
+            let mut r = self.recent_files.lock();
+            if let Some(i) = r.iter().position(|f| f == file_path) {
+                r.remove(i);
+            }
+            r.push_front(file_path.to_string());
+            r.truncate(RECENT_PREFETCH_FILES);
+            r.clone()
+        };
         self.pending.retain(|_, p| {
-            let keep = p.started.load(Ordering::Relaxed);
+            let keep = p.started.load(Ordering::Relaxed)
+                || (p.file != file_path && recent.contains(&p.file));
             if !keep {
                 p.handle.abort();
             }
@@ -407,7 +428,13 @@ impl ReadAheadEngine {
                     continue;
                 }
 
-                prev = Some(self.spawn_prefetch(key, addr.clone(), chunk_id.clone(), prev.take()));
+                prev = Some(self.spawn_prefetch(
+                    key,
+                    addr.clone(),
+                    chunk_id.clone(),
+                    file_path,
+                    prev.take(),
+                ));
             }
         }
 
@@ -510,6 +537,7 @@ impl ReadAheadEngine {
         key: String,
         node_addr: String,
         chunk_id: String,
+        file_path: &str,
         prev_acquired: Option<oneshot::Receiver<()>>,
     ) -> oneshot::Receiver<()> {
         let client = self.client.clone();
@@ -669,6 +697,7 @@ impl ReadAheadEngine {
                 handle,
                 done: done_rx,
                 started,
+                file: file_path.to_string(),
             },
         );
         let _ = started_tx.send(());
@@ -1094,11 +1123,11 @@ mod wi_05_prefetch_cap_tests {
         );
     }
 
-    /// #151: a library scan reads one chunk per file. Queued prefetches of
-    /// files the reader moved away from are dropped by the next call, so
-    /// `pending` stays at one window instead of growing by one per file.
-    #[tokio::test]
-    async fn queued_prefetches_of_earlier_reads_are_dropped() {
+    fn scan_locs(f: usize, n: u64) -> Vec<(u64, String, Vec<String>)> {
+        (0..n).map(|i| (i, format!("f{f}c{i}"), vec!["127.0.0.1:1".to_string()])).collect()
+    }
+
+    fn queued_engine() -> (ReadAheadEngine, tokio::sync::OwnedSemaphorePermit) {
         let engine = ReadAheadEngine::new(
             ReadAheadMode::FileSequential { prefetch_chunks: 8 },
             DtfsClient::new(),
@@ -1107,15 +1136,56 @@ mod wi_05_prefetch_cap_tests {
             1,
         );
         // Hold the only slot: every prefetch stays queued (not started).
-        let _slot = engine.prefetch_slots.clone().try_acquire_owned().unwrap();
+        let slot = engine.prefetch_slots.clone().try_acquire_owned().unwrap();
+        (engine, slot)
+    }
+
+    /// #151: a library scan reads one chunk per file. Queued prefetches of
+    /// files outside the last `RECENT_PREFETCH_FILES` read are dropped, so
+    /// `pending` stays at that many windows instead of one per file.
+    #[tokio::test]
+    async fn queued_prefetches_of_earlier_reads_are_dropped() {
+        let (engine, _slot) = queued_engine();
         for f in 0..100 {
-            let locs: Vec<(u64, String, Vec<String>)> =
-                (0..=8u64).map(|i| (i, format!("f{f}c{i}"), vec!["127.0.0.1:1".to_string()])).collect();
-            engine.on_chunk_read(&format!("/f{f}"), 0, 9, &locs);
+            engine.on_chunk_read(&format!("/f{f}"), 0, 9, &scan_locs(f, 9));
             tokio::task::yield_now().await;
         }
-        assert_eq!(engine.pending.len(), 8, "boundary: exactly the last file's window");
+        assert_eq!(engine.pending.len(), RECENT_PREFETCH_FILES * 8, "boundary: N windows");
         assert!(engine.pending.contains_key(&cache_key("127.0.0.1:1", "f99c1")));
+        assert!(engine.pending.contains_key(&cache_key("127.0.0.1:1", "f92c1")));
+        assert!(!engine.pending.contains_key(&cache_key("127.0.0.1:1", "f91c1")));
+    }
+
+    /// #151 review: concurrent streams (several Plex viewers) each keep
+    /// their queued window while the others advance.
+    #[tokio::test]
+    async fn concurrent_streams_keep_their_queued_windows() {
+        let (engine, _slot) = queued_engine();
+        for c in 0..4u32 {
+            for f in 0..6 {
+                engine.on_chunk_read(&format!("/f{f}"), c, 100, &scan_locs(f, 100));
+                tokio::task::yield_now().await;
+            }
+        }
+        for f in 0..6 {
+            let key = cache_key("127.0.0.1:1", &format!("f{f}c4"));
+            assert!(engine.pending.contains_key(&key), "stream {f} lost its window");
+        }
+        assert_eq!(engine.pending.len(), 6 * 8);
+    }
+
+    /// #151: a seek drops the queued window of the old position in the
+    /// same file.
+    #[tokio::test]
+    async fn seek_drops_the_same_files_queued_window() {
+        let (engine, _slot) = queued_engine();
+        engine.on_chunk_read("/f0", 0, 100, &scan_locs(0, 100));
+        tokio::task::yield_now().await;
+        engine.on_chunk_read("/f0", 50, 100, &scan_locs(0, 100));
+        tokio::task::yield_now().await;
+        assert!(!engine.pending.contains_key(&cache_key("127.0.0.1:1", "f0c1")));
+        assert!(engine.pending.contains_key(&cache_key("127.0.0.1:1", "f0c51")));
+        assert_eq!(engine.pending.len(), 8);
     }
 
     /// WI-05 — the old gate (`cache_bytes() >= max_cache_bytes`) went
@@ -1178,6 +1248,7 @@ mod wi_05_prefetch_cap_tests {
                 handle,
                 done: done_rx,
                 started: Arc::new(AtomicBool::new(true)),
+                file: String::new(),
             },
         );
         let data = Bytes::from_static(b"hello");
@@ -1203,6 +1274,7 @@ mod wi_05_prefetch_cap_tests {
                 handle: handle2,
                 done: done_rx2,
                 started: Arc::new(AtomicBool::new(true)),
+                file: String::new(),
             },
         );
         drop(done_tx2);
@@ -1237,6 +1309,7 @@ mod wi_05_prefetch_cap_tests {
                 handle,
                 done: done_rx,
                 started: Arc::new(AtomicBool::new(false)),
+                file: String::new(),
             },
         );
 
@@ -1272,6 +1345,7 @@ mod wi_05_prefetch_cap_tests {
                 handle,
                 done: done_rx,
                 started: Arc::new(AtomicBool::new(true)),
+                file: String::new(),
             },
         );
 
