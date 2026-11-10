@@ -1,9 +1,17 @@
 //! Predictive pre-caching, pure kernels (no I/O, no async, no locks):
 //! playback ordering, series-root detection, selection and play detection.
 
-use dtfs_raft::state_machine::FileMetadata;
-use std::cmp::Ordering;
+use crate::scheduler::survivor_replica_tier;
+use crate::tiering::{
+    anchor_violated_after_copy, node_selection_view, select_promotion_target, tier_rank,
+};
+use dtfs_common::config::PlacementConfig;
+use dtfs_common::types::{DiskStatus, DiskTier, PrecacheMode, VolumeConfig};
+use dtfs_raft::state_machine::{FileMetadata, StateMachineData};
+use serde::Serialize;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Bound;
 
 /// Distinct chunks remembered per (file, dc) before `overflow` is set.
 pub(crate) const MAX_ACTIVITY_CHUNKS: usize = 64;
@@ -213,6 +221,647 @@ pub(crate) fn note_read(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Planner: pure, one pass over a short SM read lock held by the caller.
+// ---------------------------------------------------------------------------
+
+const GIB: u64 = 1 << 30;
+/// Files below this are sidecars (subtitles, nfo, artwork), never pre-cached.
+pub(crate) const SIDECAR_MAX_BYTES: u64 = 16 << 20;
+/// File-mode cursors kept per (volume, dc), newest first.
+pub(crate) const MAX_FILE_CURSORS_PER_DC: usize = 8;
+/// Directory entries scanned per listing.
+pub(crate) const MAX_DIR_ENTRIES: usize = 10_000;
+/// Share of a node's tier capacity pre-caching never fills.
+pub(crate) const PRECACHE_RESERVE_PCT: u64 = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeriesEntry {
+    pub cursor: String,
+    pub last_read_ms: u64,
+}
+
+/// Leader-memory input: recent reads and the series LRU kept across passes.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PrecacheSnapshot {
+    /// (file path, lowercased dc) -> reads, as built by `note_read`.
+    pub activity: HashMap<(String, String), FileActivity>,
+    /// (volume, dc, series root) -> cursor.
+    pub series_lru: BTreeMap<(String, String, String), SeriesEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrecacheCopy {
+    pub chunk_id: String,
+    pub file_path: String,
+    pub chunk_index: u64,
+    pub source_node: u64,
+    pub target_node: u64,
+    pub tier: DiskTier,
+    pub bytes: u64,
+    /// (position in the cursor's selection, cursor recency rank, chunk index).
+    pub rank: (u32, u32, u64),
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct LastBatch {
+    pub new: u64,
+    pub already: u64,
+    pub deferred: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DcStatus {
+    pub dc: String,
+    pub tier: DiskTier,
+    pub room_bytes: u64,
+    pub desired_bytes: u64,
+    pub cached_bytes: u64,
+    pub capacity_limited: bool,
+    pub no_target: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct FileStatus {
+    pub path: String,
+    pub bytes: u64,
+    pub desired_bytes: u64,
+    pub cached_bytes: u64,
+    pub head: bool,
+}
+
+/// One series (`root`) or one file-mode cursor (`dir`).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct GroupStatus {
+    pub volume: String,
+    pub dc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    pub cursor: String,
+    pub last_read_ms: u64,
+    pub budget_bytes: u64,
+    pub desired_bytes: u64,
+    pub cached_bytes: u64,
+    pub files: Vec<FileStatus>,
+}
+
+/// A volume whose enabled policy no longer validates (set-cache / set-mandatory after set-precache).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SkippedVolume {
+    pub volume: String,
+    pub reason: &'static str,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct PrecacheStatus {
+    pub is_leader: bool,
+    pub updated_at_ms: u64,
+    pub rate_mbps: u64,
+    pub yielded_to_repair: bool,
+    pub inflight_tasks: u64,
+    pub last_batch: LastBatch,
+    pub dcs: Vec<DcStatus>,
+    pub series: Vec<GroupStatus>,
+    pub cursors: Vec<GroupStatus>,
+    pub skipped_volumes: Vec<SkippedVolume>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PrecachePlan {
+    /// Sorted by rank.
+    pub copies: Vec<PrecacheCopy>,
+    /// (chunk_id, node_id) cache copies the idle demote must leave alone.
+    pub protected: HashSet<(String, u64)>,
+    pub series_lru: BTreeMap<(String, String, String), SeriesEntry>,
+    pub status: PrecacheStatus,
+}
+
+fn within_window(now_ms: u64, last_read_ms: u64, vol: &VolumeConfig) -> bool {
+    now_ms.saturating_sub(last_read_ms) <= vol.cache_replicas.promote_window_secs.saturating_mul(1000)
+}
+
+fn dir_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(d, _)| d)
+}
+
+/// True when a directory component between `root` and the file is an extras folder.
+fn in_extras(root: &str, path: &str) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path).trim_start_matches('/');
+    let mut comps: Vec<&str> = rel.split('/').collect();
+    comps.pop();
+    comps.into_iter().any(is_extras_dir)
+}
+
+fn upsert(
+    map: &mut BTreeMap<(String, String, String), SeriesEntry>,
+    key: (String, String, String),
+    path: &str,
+    last_read_ms: u64,
+) {
+    let newer = map
+        .get(&key)
+        .map_or(true, |e| (last_read_ms, path) > (e.last_read_ms, e.cursor.as_str()));
+    if newer {
+        map.insert(key, SeriesEntry { cursor: path.to_string(), last_read_ms });
+    }
+}
+
+/// Regular, unleased, non-hidden, non-sidecar file with chunks.
+fn eligible_file(sm: &StateMachineData, path: &str, fm: &FileMetadata, now_ms: u64) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    !fm.is_directory
+        && fm.symlink_target.is_none()
+        && !name.starts_with('.')
+        && !fm.chunks.is_empty()
+        && fm.reported_size() >= SIDECAR_MAX_BYTES
+        && !sm.write_leases.get(path).is_some_and(|l| l.expires_at_ms > now_ms)
+}
+
+/// Entries under `prefix` (ends with '/'), bounded.
+fn scan<'a, 'p>(
+    sm: &'a StateMachineData,
+    prefix: &'p str,
+) -> impl Iterator<Item = (&'a String, &'a FileMetadata)> + use<'a, 'p> {
+    sm.files
+        .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+        .take_while(move |(k, _)| k.starts_with(prefix))
+        .take(MAX_DIR_ENTRIES)
+}
+
+/// Eligible files in playback order that come after `cursor`.
+fn following<'a>(
+    sm: &'a StateMachineData,
+    now_ms: u64,
+    series_root: Option<&str>,
+    dir: &str,
+    cursor: &str,
+) -> Vec<(&'a String, &'a FileMetadata)> {
+    let base = series_root.unwrap_or(dir);
+    let prefix = format!("{base}/");
+    let Some(crel) = cursor.strip_prefix(prefix.as_str()) else {
+        return Vec::new();
+    };
+    let mut v: Vec<(&str, &String, &FileMetadata)> = scan(sm, &prefix)
+        .filter_map(|(p, fm)| Some((p.strip_prefix(prefix.as_str())?, p, fm)))
+        .filter(|(rel, p, fm)| {
+            let in_scope = if series_root.is_some() {
+                !in_extras(base, p)
+            } else {
+                !rel.contains('/')
+            };
+            in_scope && eligible_file(sm, p, fm, now_ms)
+        })
+        .collect();
+    let cmp = |a: &str, b: &str| {
+        if series_root.is_some() {
+            playback_cmp(a, b)
+        } else {
+            natural_cmp(a, b)
+        }
+    };
+    v.sort_by(|a, b| cmp(a.0, b.0));
+    v.into_iter()
+        .filter(|(rel, _, _)| cmp(rel, crel) == Ordering::Greater)
+        .map(|(_, p, fm)| (p, fm))
+        .collect()
+}
+
+/// Free bytes pre-caching may use on one node's tier: serviceable disks minus
+/// headroom, minus the reserve share of the tier total.
+fn node_room(info: &dtfs_raft::NodeInfo, tier: DiskTier, cfg: &PlacementConfig) -> u64 {
+    let (mut avail, mut total) = (0u64, 0u64);
+    for d in info
+        .disks
+        .iter()
+        .filter(|d| d.tier == tier && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed))
+    {
+        total = total.saturating_add(d.total_bytes);
+        avail = avail.saturating_add(
+            d.total_bytes
+                .saturating_sub(d.used_bytes)
+                .saturating_sub(cfg.headroom_bytes(d.total_bytes)),
+        );
+    }
+    avail.saturating_sub(total.saturating_mul(PRECACHE_RESERVE_PCT) / 100)
+}
+
+struct Ctx<'a> {
+    sm: &'a StateMachineData,
+    now_ms: u64,
+    placement: &'a PlacementConfig,
+    room: HashMap<(u64, DiskTier), u64>,
+    seen: HashSet<(String, String)>,
+    stopped: HashSet<String>,
+    copies: Vec<PrecacheCopy>,
+    protected: HashSet<(String, u64)>,
+    dcs: BTreeMap<String, DcStatus>,
+}
+
+impl Ctx<'_> {
+    fn room(&mut self, nid: u64, tier: DiskTier) -> u64 {
+        let (sm, cfg) = (self.sm, self.placement);
+        *self.room.entry((nid, tier)).or_insert_with(|| {
+            sm.nodes.get(&nid).map_or(0, |n| node_room(n, tier, cfg))
+        })
+    }
+}
+
+fn cache_tiers(vol: &VolumeConfig) -> Vec<DiskTier> {
+    let mand = vol.effective_mandatory_replicas();
+    let c = &vol.cache_replicas;
+    [
+        (DiskTier::Hot, &c.hot),
+        (DiskTier::Warm, &c.warm),
+        (DiskTier::Cold, &c.cold),
+        (DiskTier::Tape, &c.tape),
+    ]
+    .into_iter()
+    .filter(|(t, cfg)| !cfg.is_disabled() && mand.for_tier(*t) == 0)
+    .map(|(t, _)| t)
+    .collect()
+}
+
+struct Group {
+    vid: String,
+    dc: String,
+    last_read_ms: u64,
+    cursor: String,
+    root: Option<String>,
+    dir: Option<String>,
+}
+
+impl Group {
+    fn key(&self) -> &str {
+        self.root.as_deref().or(self.dir.as_deref()).unwrap_or("")
+    }
+}
+
+fn plan_file(
+    ctx: &mut Ctx,
+    vol: &VolumeConfig,
+    elig: &[DiskTier],
+    dc: &str,
+    path: &str,
+    fm: &FileMetadata,
+    take: Take,
+    pos: u32,
+    rank: u32,
+) -> FileStatus {
+    let mut by_idx: BTreeMap<u64, Vec<&dtfs_raft::ChunkLocationEntry>> = BTreeMap::new();
+    for e in &fm.chunks {
+        by_idx.entry(e.chunk_index).or_default().push(e);
+    }
+    let sizes: Vec<(u64, u64)> = by_idx.iter().map(|(i, e)| (*i, e[0].size_bytes)).collect();
+    let wanted: Vec<u64> = match take {
+        Take::Whole => sizes.iter().map(|c| c.0).collect(),
+        Take::Head(n) => head_chunk_indexes(&sizes, n),
+    };
+    let mut fs = FileStatus {
+        path: path.to_string(),
+        bytes: fm.reported_size(),
+        desired_bytes: 0,
+        cached_bytes: 0,
+        head: matches!(take, Take::Head(_)),
+    };
+    let anchor_dc = vol.effective_anchor().map(|a| a.datacenter).unwrap_or_default();
+    for idx in wanted {
+        let entries = &by_idx[&idx];
+        let (chunk_id, bytes) = (entries[0].chunk_hash.clone(), entries[0].size_bytes);
+        fs.desired_bytes += bytes;
+        ctx.dcs.get_mut(dc).expect("dc status").desired_bytes += bytes;
+
+        let sm = ctx.sm;
+        let mut live: Vec<(u64, String, DiskTier)> = Vec::new();
+        let mut holders: HashSet<u64> = HashSet::new();
+        for e in entries.iter() {
+            let Ok(nid) = e.node_id.parse::<u64>() else { continue };
+            holders.insert(nid);
+            let info = sm.nodes.get(&nid);
+            if let (Some(info), Some(tier)) = (info, survivor_replica_tier(info, e.disk_id)) {
+                live.push((nid, info.location.datacenter.clone(), tier));
+            }
+        }
+        // Already cached in this DC: protect it, plan nothing.
+        let cached: Vec<u64> = live
+            .iter()
+            .filter(|(_, d, t)| d.eq_ignore_ascii_case(dc) && elig.contains(t))
+            .map(|(n, _, _)| *n)
+            .collect();
+        if !cached.is_empty() {
+            fs.cached_bytes += bytes;
+            ctx.dcs.get_mut(dc).expect("dc status").cached_bytes += bytes;
+            for n in cached {
+                ctx.protected.insert((chunk_id.clone(), n));
+            }
+            continue;
+        }
+        if live.is_empty() {
+            continue;
+        }
+        // Anchor-pending (no live replica in the anchor DC): the anchor-lag copy comes first.
+        let dcs: Vec<String> = live.iter().map(|(_, d, _)| d.clone()).collect();
+        if anchor_violated_after_copy(&dcs, &anchor_dc, None, None, true) {
+            continue;
+        }
+        if fm.cache_cooldown_until_ms.get(&idx).copied().unwrap_or(0) > ctx.now_ms {
+            continue;
+        }
+        if ctx.stopped.contains(dc) || !ctx.seen.insert((chunk_id.clone(), dc.to_string())) {
+            continue;
+        }
+
+        let mut chosen: Option<(u64, DiskTier)> = None;
+        let mut room_short = false;
+        for &tier in elig {
+            let mut views = Vec::new();
+            for (nid, info) in sm.nodes.iter() {
+                if !info.location.datacenter.eq_ignore_ascii_case(dc) {
+                    continue;
+                }
+                let mut v = node_selection_view(*nid, info, tier, ctx.placement);
+                v.already_holds_chunk = holders.contains(nid);
+                views.push(v);
+            }
+            let mut gated = views.clone();
+            for v in gated.iter_mut() {
+                if v.has_target_tier_disk && ctx.room(v.node_id, tier) < bytes {
+                    v.has_target_tier_disk = false;
+                }
+            }
+            if let Some(t) = select_promotion_target(&gated, dc) {
+                chosen = Some((t, tier));
+                break;
+            }
+            room_short |= select_promotion_target(&views, dc).is_some();
+        }
+        let Some((target, tier)) = chosen else {
+            let st = ctx.dcs.get_mut(dc).expect("dc status");
+            if room_short {
+                st.capacity_limited = true;
+                ctx.stopped.insert(dc.to_string());
+            } else {
+                st.no_target = true;
+            }
+            continue;
+        };
+        let left = ctx.room.get_mut(&(target, tier)).expect("room initialised");
+        *left -= bytes;
+        let source = live
+            .iter()
+            .min_by_key(|(n, _, t)| (tier_rank(*t), *n))
+            .map(|(n, _, _)| *n)
+            .expect("live non-empty");
+        ctx.copies.push(PrecacheCopy {
+            chunk_id,
+            file_path: path.to_string(),
+            chunk_index: idx,
+            source_node: source,
+            target_node: target,
+            tier,
+            bytes,
+            rank: (pos, rank, idx),
+        });
+    }
+    fs
+}
+
+/// Decide which cache copies to add. Pure: the caller holds one short SM read
+/// lock and feeds the leader-memory snapshot; nothing is awaited or mutated.
+/// Never removes anything and never targets a mandatory tier.
+pub(crate) fn plan_precache(
+    sm: &StateMachineData,
+    snap: &PrecacheSnapshot,
+    now_ms: u64,
+    placement: &PlacementConfig,
+) -> PrecachePlan {
+    let mut plan = PrecachePlan::default();
+    plan.status.updated_at_ms = now_ms;
+
+    // 1. Active volumes; an enabled policy that stopped validating is skipped, not planned.
+    let mut vols: BTreeMap<&str, &VolumeConfig> = BTreeMap::new();
+    for (vid, v) in &sm.volumes {
+        if v.precache.mode == PrecacheMode::Off {
+            continue;
+        }
+        match v.precache.validate(&v.cache_replicas, v.effective_mandatory_replicas()) {
+            Ok(()) => {
+                vols.insert(vid.as_str(), v);
+            }
+            Err(detail) => plan.status.skipped_volumes.push(SkippedVolume {
+                volume: vid.clone(),
+                reason: "policy_invalid",
+                detail,
+            }),
+        }
+    }
+
+    // 2-3. Played files inside the window become cursors.
+    let mut series: BTreeMap<(String, String, String), SeriesEntry> = BTreeMap::new();
+    let mut files: BTreeMap<(String, String, String), SeriesEntry> = BTreeMap::new();
+    for ((path, dc), act) in &snap.activity {
+        let Some(fm) = sm.files.get(path) else { continue };
+        let Some(vol) = vols.get(fm.volume_id.as_str()) else { continue };
+        if fm.is_directory || fm.symlink_target.is_some() || !within_window(now_ms, act.last_read_ms, vol) {
+            continue;
+        }
+        let read: BTreeSet<u64> = fm
+            .chunks
+            .iter()
+            .filter(|c| act.chunk_ids.contains(&c.chunk_hash))
+            .map(|c| c.chunk_index)
+            .collect();
+        let count = fm.chunks.iter().map(|c| c.chunk_index).collect::<BTreeSet<_>>().len() as u64;
+        if !is_played(count, &read, act.overflow) {
+            continue;
+        }
+        let dc = dc.to_lowercase();
+        let root = (vol.precache.mode == PrecacheMode::Plex)
+            .then(|| series_root(&sm.files, path))
+            .flatten()
+            .filter(|r| !in_extras(r, path));
+        match root {
+            Some(r) => upsert(&mut series, (fm.volume_id.clone(), dc, r), path, act.last_read_ms),
+            None => upsert(
+                &mut files,
+                (fm.volume_id.clone(), dc, dir_of(path).to_string()),
+                path,
+                act.last_read_ms,
+            ),
+        }
+    }
+
+    // 4. Merge the series LRU (entries still in the window whose cursor exists), keep the top max_series.
+    for (k, e) in &snap.series_lru {
+        let Some(vol) = vols.get(k.0.as_str()) else { continue };
+        if vol.precache.mode == PrecacheMode::Plex
+            && sm.files.contains_key(&e.cursor)
+            && within_window(now_ms, e.last_read_ms, vol)
+        {
+            upsert(&mut series, k.clone(), &e.cursor, e.last_read_ms);
+        }
+    }
+    let mut ordered: Vec<_> = series.into_iter().collect();
+    ordered.sort_by(|a, b| {
+        (&a.0 .0, &a.0 .1, Reverse(a.1.last_read_ms), &a.0 .2)
+            .cmp(&(&b.0 .0, &b.0 .1, Reverse(b.1.last_read_ms), &b.0 .2))
+    });
+    let mut groups: Vec<Group> = Vec::new();
+    let mut run: (String, String, usize) = (String::new(), String::new(), 0);
+    for (k, e) in ordered {
+        if (&run.0, &run.1) != (&k.0, &k.1) {
+            run = (k.0.clone(), k.1.clone(), 0);
+        }
+        run.2 += 1;
+        if run.2 > vols[k.0.as_str()].precache.max_series as usize {
+            continue;
+        }
+        plan.series_lru.insert(k.clone(), e.clone());
+        groups.push(Group {
+            vid: k.0,
+            dc: k.1,
+            last_read_ms: e.last_read_ms,
+            cursor: e.cursor,
+            root: Some(k.2),
+            dir: None,
+        });
+    }
+    // 5. File cursors: newest MAX_FILE_CURSORS_PER_DC per (volume, dc).
+    let mut ordered: Vec<_> = files.into_iter().collect();
+    ordered.sort_by(|a, b| {
+        (&a.0 .0, &a.0 .1, Reverse(a.1.last_read_ms), &a.0 .2)
+            .cmp(&(&b.0 .0, &b.0 .1, Reverse(b.1.last_read_ms), &b.0 .2))
+    });
+    let mut run: (String, String, usize) = (String::new(), String::new(), 0);
+    for (k, e) in ordered {
+        if (&run.0, &run.1) != (&k.0, &k.1) {
+            run = (k.0.clone(), k.1.clone(), 0);
+        }
+        run.2 += 1;
+        if run.2 > MAX_FILE_CURSORS_PER_DC {
+            continue;
+        }
+        groups.push(Group {
+            vid: k.0,
+            dc: k.1,
+            last_read_ms: e.last_read_ms,
+            cursor: e.cursor,
+            root: None,
+            dir: Some(k.2),
+        });
+    }
+    groups.sort_by(|a, b| {
+        (&a.vid, &a.dc, Reverse(a.last_read_ms), a.root.is_none(), a.key())
+            .cmp(&(&b.vid, &b.dc, Reverse(b.last_read_ms), b.root.is_none(), b.key()))
+    });
+
+    // 6-9. Select, expand to chunks, place.
+    let mut ctx = Ctx {
+        sm,
+        now_ms,
+        placement,
+        room: HashMap::new(),
+        seen: HashSet::new(),
+        stopped: HashSet::new(),
+        copies: Vec::new(),
+        protected: HashSet::new(),
+        dcs: BTreeMap::new(),
+    };
+    let mut rank_run: (String, String, u32) = (String::new(), String::new(), 0);
+    for g in groups {
+        let vol = vols[g.vid.as_str()];
+        let elig = cache_tiers(vol);
+        let pol = &vol.precache;
+        if (&rank_run.0, &rank_run.1) != (&g.vid, &g.dc) {
+            rank_run = (g.vid.clone(), g.dc.clone(), 0);
+        }
+        let rank = rank_run.2;
+        rank_run.2 += 1;
+
+        if !ctx.dcs.contains_key(&g.dc) {
+            let tier = elig
+                .iter()
+                .copied()
+                .find(|t| {
+                    sm.nodes.iter().any(|(id, n)| {
+                        let v = node_selection_view(*id, n, *t, placement);
+                        v.datacenter.eq_ignore_ascii_case(&g.dc) && v.has_target_tier_disk && !v.draining
+                    })
+                })
+                .unwrap_or(elig[0]);
+            ctx.dcs.insert(
+                g.dc.clone(),
+                DcStatus {
+                    dc: g.dc.clone(),
+                    tier,
+                    room_bytes: 0,
+                    desired_bytes: 0,
+                    cached_bytes: 0,
+                    capacity_limited: false,
+                    no_target: false,
+                },
+            );
+        }
+        let (max_files, max_bytes) = if g.root.is_some() {
+            (0, u64::from(pol.series_max_gb) * GIB)
+        } else {
+            (pol.next_files, u64::from(pol.next_max_gb) * GIB)
+        };
+        let dir = g.dir.clone().unwrap_or_default();
+        let next = following(sm, now_ms, g.root.as_deref(), &dir, &g.cursor);
+        let sizes: Vec<u64> = next.iter().map(|(_, f)| f.reported_size()).collect();
+        let takes = select_following(&sizes, max_files, max_bytes);
+        let mut st = GroupStatus {
+            volume: g.vid.clone(),
+            dc: g.dc.clone(),
+            root: g.root.clone(),
+            dir: g.dir.clone(),
+            cursor: g.cursor.clone(),
+            last_read_ms: g.last_read_ms,
+            budget_bytes: max_bytes,
+            desired_bytes: 0,
+            cached_bytes: 0,
+            files: Vec::new(),
+        };
+        for (pos, (take, (path, fm))) in takes.into_iter().zip(next).enumerate() {
+            let fs = plan_file(&mut ctx, vol, &elig, &g.dc, path, fm, take, pos as u32, rank);
+            st.desired_bytes += fs.desired_bytes;
+            st.cached_bytes += fs.cached_bytes;
+            st.files.push(fs);
+        }
+        if g.root.is_some() {
+            plan.status.series.push(st);
+        } else {
+            plan.status.cursors.push(st);
+        }
+    }
+
+    // 10. Final order and status.
+    let mut dcs: Vec<DcStatus> = ctx.dcs.values().cloned().collect();
+    for d in dcs.iter_mut() {
+        let ids: Vec<u64> = sm
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.location.datacenter.eq_ignore_ascii_case(&d.dc))
+            .map(|(id, _)| *id)
+            .collect();
+        d.room_bytes = ids.into_iter().map(|id| ctx.room(id, d.tier)).sum();
+    }
+    plan.status.dcs = dcs;
+    plan.protected = ctx.protected;
+    plan.copies = ctx.copies;
+    plan.copies.sort_by(|a, b| {
+        a.rank
+            .cmp(&b.rank)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+            .then_with(|| a.target_node.cmp(&b.target_node))
+    });
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +1008,462 @@ mod tests {
         assert!(!a.contains_key(&("/f0".to_string(), "toro".to_string())));
         assert!(a.contains_key(&("/new".to_string(), "toro".to_string())));
         assert!(a.len() <= MAX_ACTIVITY_KEYS);
+    }
+}
+
+#[cfg(test)]
+mod planner_tests {
+    use super::*;
+    use dtfs_common::topology::Location;
+    use dtfs_common::types::{
+        AnchorPolicy, CacheTierConfig, DiskInfo, HealthStatus, NodeRole, TierReplication,
+    };
+    use dtfs_raft::state_machine::WriteLease;
+    use dtfs_raft::NodeInfo;
+    use serde_json::json;
+
+    const MIB: u64 = 1 << 20;
+    const NOW: u64 = 1_000_000;
+    const CHUNK: u64 = 4 * MIB;
+
+    fn cfg() -> PlacementConfig {
+        PlacementConfig { min_free_bytes: 0, min_free_pct: 0.0, ..Default::default() }
+    }
+
+    fn node(id: u64, dc: &str, tier: DiskTier, total: u64, used: u64) -> NodeInfo {
+        NodeInfo {
+            role: NodeRole::Data,
+            hostname: format!("node{id}"),
+            grpc_addr: format!("http://10.0.0.{id}:9500"),
+            location: Location::new("r", dc, "rack", &format!("host{id}")),
+            disks: vec![DiskInfo {
+                disk_id: 0,
+                uuid: format!("u{id}"),
+                mount_path: "/d".into(),
+                tier,
+                total_bytes: total,
+                used_bytes: used,
+                status: DiskStatus::Healthy,
+            }],
+            total_capacity: total,
+            used_capacity: used,
+            health: HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    struct W {
+        sm: StateMachineData,
+    }
+
+    /// leli/cold(1), toro/warm(2), nrb/warm(3); anchor leli/cold; mandatory cold=1; warm cache 1/1 per_dc; plex.
+    fn world() -> W {
+        let mut sm = StateMachineData::default();
+        let tib = 1u64 << 40;
+        sm.nodes.insert(1, node(1, "leli", DiskTier::Cold, tib, 0));
+        sm.nodes.insert(2, node(2, "toro", DiskTier::Warm, tib, 0));
+        sm.nodes.insert(3, node(3, "nrb", DiskTier::Warm, tib, 0));
+        let mut v = VolumeConfig::default();
+        v.mandatory_replicas = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+        v.cache_replicas.hot = CacheTierConfig { min: 0, max: 0 };
+        v.cache_replicas.warm = CacheTierConfig { min: 1, max: 1 };
+        v.cache_replicas.cold = CacheTierConfig { min: 0, max: 0 };
+        v.cache_replicas.tape = CacheTierConfig { min: 0, max: 0 };
+        v.cache_replicas.per_dc = true;
+        v.cache_replicas.promote_window_secs = 4 * 3600;
+        v.anchor = Some(AnchorPolicy { datacenter: "leli".into(), required_tier: Some(DiskTier::Cold) });
+        v.precache.mode = PrecacheMode::Plex;
+        v.precache.next_files = 0;
+        v.precache.next_max_gb = 0;
+        v.precache.series_max_gb = 1;
+        v.precache.max_series = 3;
+        sm.volumes.insert("v".into(), v);
+        W { sm }
+    }
+
+    impl W {
+        fn vol(&mut self) -> &mut VolumeConfig {
+            self.sm.volumes.get_mut("v").unwrap()
+        }
+        fn file(&mut self, path: &str, nchunks: u64, holders: &[u64]) {
+            let mut chunks = Vec::new();
+            for i in 0..nchunks {
+                for h in holders {
+                    chunks.push(json!({"chunk_index": i, "chunk_hash": format!("{path}#{i}"),
+                        "node_id": h.to_string(), "disk_id": 0, "size_bytes": CHUNK}));
+                }
+            }
+            let fm: FileMetadata = serde_json::from_value(json!({
+                "path": path, "volume_id": "v", "chunk_size": CHUNK, "chunks": chunks,
+                "created_at_ms": 0, "updated_at_ms": 0,
+            }))
+            .unwrap();
+            self.sm.files.insert(path.to_string(), fm);
+        }
+        /// 300 MiB episodes on node 1 plus a `.plexmatch` at `root`.
+        fn series(&mut self, root: &str, eps: &[&str]) {
+            self.file(&format!("{root}/.plexmatch"), 0, &[]);
+            for e in eps {
+                self.file(&format!("{root}/{e}"), 75, &[1]);
+            }
+        }
+        fn set_disk(&mut self, id: u64, total: u64, used: u64) {
+            let d = &mut self.sm.nodes.get_mut(&id).unwrap().disks[0];
+            d.total_bytes = total;
+            d.used_bytes = used;
+        }
+        fn plan(&self, reads: &[(&str, &str)]) -> PrecachePlan {
+            let mut snap = PrecacheSnapshot::default();
+            for (path, dc) in reads {
+                let a = FileActivity {
+                    last_read_ms: NOW,
+                    chunk_ids: [format!("{path}#20")].into_iter().collect(),
+                    overflow: false,
+                };
+                snap.activity.insert((path.to_string(), dc.to_string()), a);
+            }
+            plan_precache(&self.sm, &snap, NOW, &cfg())
+        }
+    }
+
+    fn per_path(p: &PrecachePlan) -> BTreeMap<String, usize> {
+        let mut m = BTreeMap::new();
+        for c in &p.copies {
+            *m.entry(c.file_path.clone()).or_insert(0) += 1;
+        }
+        m
+    }
+
+    const S1: &str = "/tv/Show/Season 01";
+
+    fn show5() -> W {
+        let mut w = world();
+        w.series("/tv/Show", &["Season 01/E01.mkv", "Season 01/E02.mkv", "Season 01/E03.mkv",
+            "Season 01/E04.mkv", "Season 01/E05.mkv"]);
+        w
+    }
+
+    #[test]
+    fn plex_selects_following_episodes_with_head_of_next() {
+        let w = show5();
+        let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
+        let m = per_path(&p);
+        assert_eq!(m.get(&format!("{S1}/E01.mkv")), None, "watched file excluded");
+        for e in ["E02", "E03", "E04"] {
+            assert_eq!(m[&format!("{S1}/{e}.mkv")], 75, "{e} whole");
+        }
+        assert_eq!(m[&format!("{S1}/E05.mkv")], 31, "124 MiB head = 31 chunks");
+        assert!(p.copies.iter().all(|c| c.target_node == 2 && c.tier == DiskTier::Warm && c.source_node == 1));
+    }
+
+    #[test]
+    fn plex_playback_order_crosses_seasons_naturally() {
+        let mut w = world();
+        w.series("/tv/Show", &["Season 01/E10.mkv", "Season 2/E01.mkv", "Season 10/E01.mkv"]);
+        let p = w.plan(&[("/tv/Show/Season 01/E10.mkv", "toro")]);
+        let at = |pos: u32| p.copies.iter().find(|c| c.rank.0 == pos).unwrap().file_path.clone();
+        assert_eq!(at(0), "/tv/Show/Season 2/E01.mkv");
+        assert_eq!(at(1), "/tv/Show/Season 10/E01.mkv");
+    }
+
+    #[test]
+    fn plex_without_plexmatch_falls_back_to_next_files() {
+        let mut w = world();
+        w.vol().precache.next_files = 2;
+        for n in ["A", "B", "C", "D"] {
+            w.file(&format!("/movies/{n}.mkv"), 75, &[1]);
+        }
+        let p = w.plan(&[("/movies/A.mkv", "toro")]);
+        let m = per_path(&p);
+        assert_eq!(m.keys().cloned().collect::<Vec<_>>(), ["/movies/B.mkv", "/movies/C.mkv"]);
+    }
+
+    #[test]
+    fn files_mode_ignores_plexmatch() {
+        let mut w = show5();
+        w.file("/tv/Show/Season 02/E01.mkv", 75, &[1]);
+        w.vol().precache.mode = PrecacheMode::Files;
+        w.vol().precache.next_files = 1;
+        let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
+        assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), [format!("{S1}/E02.mkv")]);
+        assert!(p.status.series.is_empty());
+    }
+
+    #[test]
+    fn series_lru_drops_oldest_and_its_protection() {
+        let mut w = world();
+        for s in ["A", "B", "C"] {
+            w.file(&format!("/tv/{s}/.plexmatch"), 0, &[]);
+            w.file(&format!("/tv/{s}/E01.mkv"), 75, &[1]);
+            w.file(&format!("/tv/{s}/E02.mkv"), 75, &[1, 2]);
+        }
+        w.vol().precache.max_series = 2;
+        let mut snap = PrecacheSnapshot::default();
+        for (i, s) in ["A", "B", "C"].iter().enumerate() {
+            snap.series_lru.insert(
+                ("v".into(), "toro".into(), format!("/tv/{s}")),
+                SeriesEntry { cursor: format!("/tv/{s}/E01.mkv"), last_read_ms: i as u64 + 1 },
+            );
+        }
+        let p = plan_precache(&w.sm, &snap, NOW, &cfg());
+        let roots: Vec<&str> = p.series_lru.keys().map(|k| k.2.as_str()).collect();
+        assert_eq!(roots, ["/tv/B", "/tv/C"]);
+        let sroots: BTreeSet<_> = p.status.series.iter().filter_map(|s| s.root.clone()).collect();
+        assert_eq!(sroots, ["/tv/B".to_string(), "/tv/C".to_string()].into_iter().collect());
+        assert!(p.protected.contains(&("/tv/B/E02.mkv#0".to_string(), 2)));
+        assert!(!p.protected.contains(&("/tv/A/E02.mkv#0".to_string(), 2)), "evicted series loses protection");
+    }
+
+    #[test]
+    fn already_cached_chunk_is_protected_not_copied() {
+        let mut w = world();
+        w.file("/tv/S/.plexmatch", 0, &[]);
+        w.file("/tv/S/E01.mkv", 75, &[1]);
+        w.file("/tv/S/E02.mkv", 75, &[1, 2]);
+        let p = w.plan(&[("/tv/S/E01.mkv", "toro")]);
+        assert!(p.copies.is_empty());
+        assert!(p.protected.contains(&("/tv/S/E02.mkv#0".to_string(), 2)));
+        assert_eq!(p.status.series[0].cached_bytes, 300 * MIB);
+    }
+
+    #[test]
+    fn anchor_pending_chunk_is_neither_copied_nor_protected() {
+        let mut w = world();
+        w.file("/tv/S/.plexmatch", 0, &[]);
+        w.file("/tv/S/E01.mkv", 75, &[1]);
+        w.file("/tv/S/E02.mkv", 75, &[3]);
+        let p = w.plan(&[("/tv/S/E01.mkv", "toro")]);
+        assert!(p.copies.is_empty(), "no copy for an anchor-pending chunk");
+        assert!(p.protected.is_empty());
+    }
+
+    #[test]
+    fn cooldown_blocks_copy_until_it_expires() {
+        let mut w = show5();
+        let e2 = format!("{S1}/E02.mkv");
+        w.sm.files.get_mut(&e2).unwrap().cache_cooldown_until_ms.insert(0, NOW + 1);
+        let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
+        assert_eq!(per_path(&p)[&e2], 74);
+        assert!(!p.copies.iter().any(|c| c.file_path == e2 && c.chunk_index == 0));
+        w.sm.files.get_mut(&e2).unwrap().cache_cooldown_until_ms.insert(0, NOW - 1);
+        let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
+        assert_eq!(per_path(&p)[&e2], 75);
+    }
+
+    #[test]
+    fn capacity_stops_planning_and_flags_dc() {
+        let mut w = show5();
+        // total 1000 MiB, used 300 MiB, reserve 100 MiB => room 600 MiB = 150 chunks.
+        w.set_disk(2, 1000 * MIB, 300 * MIB);
+        let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
+        assert_eq!(p.copies.len(), 150);
+        let toro = p.status.dcs.iter().find(|d| d.dc == "toro").unwrap();
+        assert!(toro.capacity_limited);
+        assert!(!toro.no_target);
+    }
+
+    #[test]
+    fn capacity_reserve_boundary_takes_exactly_one_chunk() {
+        let mut w = show5();
+        // avail = reserve + exactly one chunk.
+        w.set_disk(2, 1000 * MIB, 1000 * MIB - 100 * MIB - CHUNK);
+        let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
+        assert_eq!(p.copies.len(), 1);
+        assert!(p.status.dcs.iter().find(|d| d.dc == "toro").unwrap().capacity_limited);
+        // One byte less: nothing fits.
+        w.set_disk(2, 1000 * MIB, 1000 * MIB - 100 * MIB - CHUNK + 1);
+        assert!(w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]).copies.is_empty());
+    }
+
+    #[test]
+    fn no_warm_node_in_dc_reports_no_target() {
+        let mut w = show5();
+        w.sm.nodes.remove(&2);
+        w.sm.nodes.remove(&3);
+        let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
+        assert!(p.copies.is_empty());
+        assert!(p.status.dcs.iter().find(|d| d.dc == "toro").unwrap().no_target);
+    }
+
+    #[test]
+    fn header_and_tail_probe_is_not_playing() {
+        let w = show5();
+        let path = "/tv/Show/Season 01/E01.mkv";
+        let mut snap = PrecacheSnapshot::default();
+        let ids = (0..=8).chain([74]).map(|i| format!("{path}#{i}")).collect();
+        snap.activity.insert(
+            (path.into(), "toro".into()),
+            FileActivity { last_read_ms: NOW, chunk_ids: ids, overflow: false },
+        );
+        let p = plan_precache(&w.sm, &snap, NOW, &cfg());
+        assert!(p.copies.is_empty());
+        assert!(p.status.series.is_empty() && p.status.cursors.is_empty());
+    }
+
+    #[test]
+    fn write_leased_file_is_skipped() {
+        let mut w = show5();
+        w.vol().precache.mode = PrecacheMode::Files;
+        w.vol().precache.next_files = 1;
+        w.sm.write_leases.insert(
+            format!("{S1}/E02.mkv"),
+            WriteLease { owner_id: "o".into(), lease_id: "l".into(), expires_at_ms: NOW + 60_000 },
+        );
+        let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
+        assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), [format!("{S1}/E03.mkv")]);
+    }
+
+    #[test]
+    fn cursors_in_two_dcs_target_their_own_dc() {
+        let w = show5();
+        let f = "/tv/Show/Season 01/E01.mkv";
+        let p = w.plan(&[(f, "toro"), (f, "nrb")]);
+        let targets: BTreeSet<u64> = p
+            .copies
+            .iter()
+            .filter(|c| c.chunk_id == format!("{S1}/E02.mkv#0"))
+            .map(|c| c.target_node)
+            .collect();
+        assert_eq!(targets, [2, 3].into_iter().collect());
+    }
+
+    #[test]
+    fn per_dc_false_skips_volume_with_policy_invalid() {
+        let mut w = show5();
+        w.vol().cache_replicas.per_dc = false;
+        let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
+        assert!(p.copies.is_empty());
+        assert_eq!(p.status.skipped_volumes.len(), 1);
+        assert_eq!(p.status.skipped_volumes[0].reason, "policy_invalid");
+        assert!(p.status.skipped_volumes[0].detail.contains("per_dc"));
+    }
+
+    #[test]
+    fn two_cursors_in_one_dc_interleave_by_file_position() {
+        let mut w = world();
+        w.series("/tv/A", &["E01.mkv", "E02.mkv", "E03.mkv"]);
+        w.series("/tv/B", &["E01.mkv", "E02.mkv", "E03.mkv"]);
+        let p = w.plan(&[("/tv/A/E01.mkv", "toro"), ("/tv/B/E01.mkv", "toro")]);
+        let last0 = p.copies.iter().rposition(|c| c.rank.0 == 0).unwrap();
+        let first1 = p.copies.iter().position(|c| c.rank.0 == 1).unwrap();
+        assert!(last0 < first1);
+        let firsts: BTreeSet<&str> =
+            p.copies.iter().filter(|c| c.rank.0 == 0).map(|c| &c.file_path[..5]).collect();
+        assert_eq!(firsts.len(), 2, "both series get their next file before either gets its second");
+    }
+
+    #[test]
+    fn warm_mandatory_never_planned_and_invalid_policy_reported() {
+        let mut w = show5();
+        w.vol().mandatory_replicas.warm = 1;
+        let f = [("/tv/Show/Season 01/E01.mkv", "toro")];
+        let p = w.plan(&f);
+        assert!(p.copies.is_empty());
+        assert!(p.status.skipped_volumes[0].detail.contains("cache tier"));
+        // A usable hot cache keeps the policy valid; the mandatory warm tier must still never be chosen.
+        w.vol().cache_replicas.hot = CacheTierConfig { min: 1, max: 1 };
+        let p = w.plan(&f);
+        assert!(p.status.skipped_volumes.is_empty());
+        assert!(p.copies.is_empty());
+        assert!(p.status.dcs.iter().find(|d| d.dc == "toro").unwrap().no_target);
+    }
+
+    #[test]
+    fn new_episode_after_cursor_is_selected() {
+        let mut w = show5();
+        w.file(&format!("{S1}/E06.mkv"), 75, &[1]);
+        let p = w.plan(&[("/tv/Show/Season 01/E05.mkv", "toro")]);
+        assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), [format!("{S1}/E06.mkv")]);
+    }
+
+    #[test]
+    fn planner_is_deterministic() {
+        let w = show5();
+        let f = [("/tv/Show/Season 01/E01.mkv", "toro"), ("/tv/Show/Season 01/E01.mkv", "nrb")];
+        let (a, b) = (w.plan(&f), w.plan(&f));
+        assert!(!a.copies.is_empty());
+        assert_eq!(a.copies, b.copies);
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    #[test]
+    fn property_random_trees_keep_invariants() {
+        let mut r = Lcg(0xD7F5);
+        for _ in 0..200 {
+            let mut w = world();
+            let total = 1000 * MIB;
+            let mut room = BTreeMap::new();
+            for id in [2u64, 3] {
+                let used = r.next(250) * CHUNK;
+                w.set_disk(id, total, used);
+                room.insert(id, (total - used).saturating_sub(total / 10));
+            }
+            let plex = r.next(2) == 0;
+            w.vol().precache.mode = if plex { PrecacheMode::Plex } else { PrecacheMode::Files };
+            w.vol().precache.next_files = 1 + r.next(3) as u32;
+            w.vol().precache.series_max_gb = 1 + r.next(2) as u32;
+            w.vol().precache.max_series = 1 + r.next(3) as u32;
+            let mut reads: Vec<(String, String)> = Vec::new();
+            for s in 0..=r.next(3) {
+                let root = format!("/tv/S{s}");
+                if r.next(4) != 0 {
+                    w.file(&format!("{root}/.plexmatch"), 0, &[]);
+                }
+                for e in 0..(3 + r.next(4)) {
+                    let holders: Vec<u64> = [1u64, 2, 3].into_iter().filter(|_| r.next(3) == 0).collect();
+                    let holders = if holders.is_empty() { vec![1] } else { holders };
+                    let path = format!("{root}/E{e:02}.mkv");
+                    w.file(&path, 4 + r.next(40), &holders);
+                    if r.next(5) == 0 {
+                        w.sm.files.get_mut(&path).unwrap().cache_cooldown_until_ms.insert(0, NOW + 1);
+                    }
+                    if r.next(3) == 0 {
+                        let dc = ["toro", "nrb", "leli"][r.next(3) as usize];
+                        reads.push((path, dc.to_string()));
+                    }
+                }
+            }
+            let mut snap = PrecacheSnapshot::default();
+            for (path, dc) in &reads {
+                snap.activity.insert(
+                    (path.clone(), dc.clone()),
+                    FileActivity { last_read_ms: NOW, chunk_ids: HashSet::new(), overflow: true },
+                );
+            }
+            let p = plan_precache(&w.sm, &snap, NOW, &cfg());
+            let dcs: BTreeSet<&str> = reads.iter().map(|(_, d)| d.as_str()).collect();
+            let mut planned: BTreeMap<u64, u64> = BTreeMap::new();
+            let mut seen = HashSet::new();
+            for c in &p.copies {
+                let dc = &w.sm.nodes[&c.target_node].location.datacenter;
+                assert!(dcs.contains(dc.as_str()), "target DC has a cursor");
+                let fm = &w.sm.files[&c.file_path];
+                let rows: Vec<_> = fm.chunks.iter().filter(|e| e.chunk_index == c.chunk_index).collect();
+                let holders: Vec<u64> = rows.iter().map(|e| e.node_id.parse().unwrap()).collect();
+                assert!(!holders.contains(&c.target_node), "target already holds the chunk");
+                assert!(holders.contains(&c.source_node));
+                assert!(holders.contains(&1), "anchor copy is live");
+                assert_eq!(c.tier, DiskTier::Warm);
+                assert_eq!(w.sm.volumes["v"].effective_mandatory_replicas().for_tier(c.tier), 0);
+                assert!(seen.insert((c.chunk_id.clone(), c.target_node)), "no duplicate copy");
+                *planned.entry(c.target_node).or_default() += c.bytes;
+            }
+            for (n, b) in planned {
+                assert!(b <= room[&n], "node {n} planned {b} > room {}", room[&n]);
+            }
+        }
     }
 }

@@ -1150,7 +1150,7 @@ fn temperature_to_tier(temp: DataTemperature) -> DiskTier {
 }
 
 /// Numeric rank for tier comparison (lower = hotter).
-fn tier_rank(tier: DiskTier) -> u8 {
+pub(crate) fn tier_rank(tier: DiskTier) -> u8 {
     match tier {
         DiskTier::Hot => 0,
         DiskTier::Warm => 1,
