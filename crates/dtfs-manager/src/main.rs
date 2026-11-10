@@ -14,6 +14,8 @@ mod metadata;
 mod monitor;
 mod placement;
 mod placement_state;
+#[cfg(test)]
+mod precache;
 mod rest_auth;
 mod scheduler;
 mod server;
