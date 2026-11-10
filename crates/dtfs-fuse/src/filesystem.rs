@@ -713,8 +713,9 @@ struct OpenFile {
     /// consumption on this handle rather than one kernel call's (~128 KB)
     /// length.
     bytes_read_on_fh: u64,
-    /// The snapshot read() last re-fetched to check a gap below EOF: its
-    /// missing entries are confirmed holes (until the snapshot changes).
+    /// The snapshot read() last re-fetched (gap below EOF or a failed fetch):
+    /// its missing entries are confirmed holes and a failed read on it is not
+    /// re-fetched again (until the snapshot changes).
     holes_confirmed: Option<Weak<FileLocations>>,
     /// `write.async_commit`: a failed background commit of this path,
     /// reported once by the next fsync/flush/release on this fh (EIO).
@@ -827,6 +828,9 @@ pub struct DtfsFilesystem {
     /// retiring during the chunk fetch awaits.
     #[cfg(test)]
     read_race_hook: std::sync::Mutex<Option<Box<dyn FnOnce(&DtfsFilesystem) + Send>>>,
+    /// Test stand-in for the manager's GetFileLocations.
+    #[cfg(test)]
+    locations_fetch_hook: std::sync::Mutex<Option<Box<dyn Fn(&str) -> FileLocations + Send>>>,
     /// Test hook run by open_with_append right before it inserts the handle.
     #[cfg(test)]
     open_race_hook: std::sync::Mutex<Option<Box<dyn FnOnce(&DtfsFilesystem) + Send>>>,
@@ -925,6 +929,8 @@ impl DtfsFilesystem {
             write_race_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             read_race_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            locations_fetch_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             open_race_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1260,8 +1266,33 @@ impl DtfsFilesystem {
         // so if the handle's snapshot changed during a pass, that pass may
         // have missed the committed bytes in both. Repeat it (bounded).
         let mut pass = 1;
+        let mut refetched = false;
         loop {
-            let (bytes, used) = self.read_pass(fh, offset, size).await?;
+            let (bytes, used) = match self.read_pass(fh, offset, size).await {
+                Ok(v) => v,
+                Err(e) => {
+                    // #124: a snapshot taken while a replica was down lists
+                    // only the others; once per snapshot, re-fetch (lists
+                    // the live replicas) and retry before failing.
+                    let Some(path) = self.open_files.get(&fh).and_then(|f| {
+                        let refreshed = f.holes_confirmed.as_ref().is_some_and(|w| {
+                            f.locations.as_ref().is_some_and(|l| w.ptr_eq(&Arc::downgrade(l)))
+                        });
+                        (!refreshed && !refetched).then(|| f.path.clone())
+                    }) else {
+                        return Err(e);
+                    };
+                    refetched = true;
+                    warn!(path = %path, error = %format!("{e:#}"), "read failed on the handle's snapshot; re-fetching locations once");
+                    let Ok(fresh) = self.refetch_locations(&path).await else {
+                        return Err(e);
+                    };
+                    if let Some(mut f) = self.open_files.get_mut(&fh) {
+                        f.holes_confirmed = Some(Arc::downgrade(&fresh));
+                    }
+                    continue;
+                }
+            };
             let changed = self.open_files.get(&fh).is_some_and(|f| {
                 !f.locations.as_ref().is_some_and(|l| Arc::ptr_eq(l, &used))
             });
@@ -3382,6 +3413,10 @@ impl DtfsFilesystem {
 
     /// Fetch file locations from the manager (no caching).
     async fn fetch_file_locations(&self, path: &str) -> Result<FileLocations> {
+        #[cfg(test)]
+        if let Some(hook) = self.locations_fetch_hook.lock().unwrap().as_ref() {
+            return Ok(hook(path));
+        }
         let response = self
             .client
             .get_file_locations(path)
@@ -7965,6 +8000,46 @@ mod async_commit_fs_tests {
         assert_eq!(&fs.read(fh, 0, 10).await.unwrap()[..], &[2u8; 10]);
         assert_eq!(runs.load(Ordering::Relaxed), READ_SNAPSHOT_TRIES as u64);
         fs.read_race_hook.lock().unwrap().take();
+    }
+
+    /// #124: every replica of the open-time snapshot fails and a re-fetch
+    /// lists a live one: the read succeeds. A snapshot that already came
+    /// from that re-fetch fails without fetching again.
+    #[tokio::test]
+    async fn read_refetches_locations_once_when_every_replica_fails() {
+        let fs = fs(false);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let id = "c".repeat(64);
+        fs.readahead.insert_cached("n:1", &id, Bytes::from(vec![7u8; 10]));
+        let dead = {
+            let mut l = holes("/f", 10, cs);
+            l.chunks = vec![committed_chunk_info(0, &id, 10, vec!["127.0.0.1:1".to_string()], "warm")];
+            l
+        };
+        let fh = open(&fs, "/f", OpenFlags::ReadOnly);
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(dead.clone()));
+        let fetches = Arc::new(AtomicU64::new(0));
+        let (n, live) = (fetches.clone(), (*one_chunk(&id, cs)).clone());
+        *fs.locations_fetch_hook.lock().unwrap() = Some(Box::new(move |_| {
+            n.fetch_add(1, Ordering::Relaxed);
+            live.clone()
+        }));
+        assert_eq!(&fs.read(fh, 0, 10).await.unwrap()[..], &[7u8; 10], "no re-fetch after the replica failed");
+        assert_eq!(fetches.load(Ordering::Relaxed), 1);
+
+        // The re-fetch lists the dead replica again: fail, and the next read
+        // on that confirmed snapshot does not fetch again.
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(dead.clone()));
+        let n = fetches.clone();
+        *fs.locations_fetch_hook.lock().unwrap() = Some(Box::new(move |_| {
+            n.fetch_add(1, Ordering::Relaxed);
+            dead.clone()
+        }));
+        let err = fs.read(fh, 0, 10).await.unwrap_err();
+        assert!(format!("{err:#}").contains("127.0.0.1:1"), "{err:#}");
+        assert_eq!(fetches.load(Ordering::Relaxed), 2, "one re-fetch per snapshot");
+        assert!(fs.read(fh, 0, 10).await.is_err());
+        assert_eq!(fetches.load(Ordering::Relaxed), 2, "confirmed snapshot re-fetched again");
     }
 
     /// FUSE-2: fallocate's size floor counts in-flight bytes, also when the

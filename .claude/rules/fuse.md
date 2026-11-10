@@ -348,7 +348,10 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 - read() runs `read_pass` (snapshot, chunk loop, overlay) and repeats it,
   at most `READ_SNAPSHOT_TRIES` (3) passes, while the handle's snapshot
   `Arc` is no longer the one the pass used: a commit merges before it drops
-  its overlay, so a pass it retired under saw neither (#133).
+  its overlay, so a pass it retired under saw neither (#133). A failed
+  pass (every candidate failed) re-fetches the locations once per snapshot
+  and per call (`holes_confirmed` marks a re-fetched snapshot) and retries
+  (#124): a snapshot taken while a replica was down lacks it.
 
 - Foreground miss: first `readahead.join_pending()` on the FIRST candidate
   only, bounded by `PREFETCH_JOIN_TIMEOUT` (2 s), refusing to wait on a
