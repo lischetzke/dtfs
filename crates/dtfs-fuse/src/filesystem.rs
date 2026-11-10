@@ -3597,7 +3597,7 @@ impl DtfsFilesystem {
     /// per path ever stat'ed, unboundedly.
     fn cache_metadata(&self, path: &str, locations: Arc<FileLocations>) {
         self.metadata_cache
-            .insert(path.to_string(), (locations, Instant::now()));
+            .insert(path.to_string(), (Arc::new(without_chunks(&locations)), Instant::now()));
         let mut order = self.metadata_cache_order.lock().unwrap();
         order.push_back(path.to_string());
         evict_metadata_cache(&self.metadata_cache, &mut order, METADATA_CACHE_MAX_ENTRIES);
@@ -4244,7 +4244,7 @@ impl DtfsFilesystem {
                 None => None,
             };
             if let Some((Some(arc), at)) = restored {
-                self.metadata_cache.insert(path.to_string(), (arc, at));
+                self.metadata_cache.insert(path.to_string(), (Arc::new(without_chunks(&arc)), at));
             }
             return;
         }
@@ -4450,6 +4450,23 @@ fn system_time_from_epoch_secs(secs: i64) -> SystemTime {
 /// `is_directory` is propagated from the manager so empty-mkdir directories
 /// and synthetic ones (implied by child paths) both report as directories —
 /// SOAK-RECOVERY-2026-05-18 bugs A & B.
+/// #135: the metadata cache's copy of a snapshot: everything but the chunk
+/// list. The cache serves attributes and the volume_id only; a full list
+/// per stat'ed path (one entry per 4 MiB chunk) pinned megabytes per entry.
+fn without_chunks(l: &FileLocations) -> FileLocations {
+    FileLocations {
+        path: l.path.clone(),
+        total_size: l.total_size,
+        chunks: Vec::new(),
+        volume_id: l.volume_id.clone(),
+        chunk_size: l.chunk_size,
+        created_at_ms: l.created_at_ms,
+        modified_at_ms: l.modified_at_ms,
+        is_directory: l.is_directory,
+        is_symlink: l.is_symlink,
+    }
+}
+
 fn file_attr_from_locations(locations: &FileLocations) -> FileAttr {
     FileAttr {
         size: if locations.is_directory { 4096 } else { locations.total_size },
@@ -6905,6 +6922,31 @@ mod async_commit_fs_tests {
         assert!(ran);
         assert_eq!(lost, cs as usize, "the cut-off commit's bytes are reported lost");
         hole.abort();
+    }
+
+    /// #135: a metadata cache entry holds no chunk list (stat of a big file
+    /// pinned megabytes for the TTL), keeps the attributes and volume_id,
+    /// and a commit merge into it does not add chunks either.
+    #[tokio::test]
+    async fn metadata_cache_entry_does_not_grow_with_the_chunk_count() {
+        let fs = fs(false);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let mut big = holes("/f", 1000 * cs, cs);
+        big.volume_id = "media".to_string();
+        big.chunks = (0..1000u32)
+            .map(|i| committed_chunk_info(i, &format!("{i:064}"), cs, vec!["n:1".to_string()], "warm"))
+            .collect();
+        fs.cache_metadata("/f", Arc::new(big));
+        let c = fs.get_cached_metadata("/f").expect("cached");
+        assert_eq!((c.chunks.len(), c.total_size, c.volume_id.as_str()), (0, 1000 * cs, "media"));
+        drop(c);
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/f", 1000 * cs, cs)));
+        let ci = committed_chunk_info(1000, &"e".repeat(64), 10, vec![], "warm");
+        let token = fs.commit_tracker.begin_chunks("/f", Some(vec![1000]));
+        fs.mark_committed_and_refresh("/f", fh, Committed { chunks: Some(vec![ci]), token: Some(token) }).await;
+        let c = fs.get_cached_metadata("/f").expect("merged entry kept");
+        assert_eq!((c.chunks.len(), c.total_size), (0, 1000 * cs + 10), "merge grew the cached chunk list");
     }
 
     /// #136: the stop releases each lease an open writer still holds by its
