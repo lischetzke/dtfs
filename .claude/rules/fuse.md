@@ -40,7 +40,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 - Symlink kind comes from the manager's `is_symlink` (ListDirectory +
   GetFileLocations; old managers send false) via `file_kind`.
 - `cluster_err_to_errno`: NotFound ENOENT, FailedPrecondition ENOTEMPTY,
-  InvalidArgument EINVAL, else EIO.
+  InvalidArgument EINVAL, AlreadyExists EEXIST (#120), else EIO.
 - `opendir` snapshots the listing (fh -> `Arc<Vec<DirEntry>>`, dropped at
   `releasedir`); readdir/readdirplus serve pages from it, cookie = position
   (`dir_entry_cookie`). Do not re-list per page.

@@ -1488,6 +1488,10 @@ pub(crate) fn cluster_err_to_errno(err: &anyhow::Error) -> Errno {
             if status.code() == tonic::Code::InvalidArgument {
                 return Errno::from(libc::EINVAL);
             }
+            // #120: CreateFile of a dir over a file or a file over a dir.
+            if status.code() == tonic::Code::AlreadyExists {
+                return Errno::from(libc::EEXIST);
+            }
             // Any other status (Unavailable, DeadlineExceeded, Internal, ...)
             // is transient or non-NotFound/non-FailedPrecondition — never
             // ENOENT.
@@ -1843,6 +1847,17 @@ mod inode_map_rename_tests {
         assert_eq!(cluster_err_to_errno(&fp), Errno::from(libc::ENOTEMPTY));
         let int = anyhow::Error::new(tonic::Status::internal("x"));
         assert_eq!(cluster_err_to_errno(&int), Errno::from(libc::EIO));
+    }
+
+    /// #120: the manager refuses a dir over a file / file over a dir with
+    /// AlreadyExists; that is EEXIST, not EIO.
+    #[test]
+    fn already_exists_maps_to_eexist() {
+        let e = anyhow::Error::new(tonic::Status::already_exists("is a file"))
+            .context("mkdir failed");
+        assert_eq!(cluster_err_to_errno(&e), Errno::from(libc::EEXIST));
+        let pd = anyhow::Error::new(tonic::Status::permission_denied("x"));
+        assert_eq!(cluster_err_to_errno(&pd), Errno::from(libc::EIO));
     }
 
     #[test]
