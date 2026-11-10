@@ -174,4 +174,4 @@ Rows the state machine itself writes while applying a command (node registration
 
 ## Rejected REST mutations (`auth.denied`)
 
-A REST mutation refused by the shared-secret gate writes one `auth.denied` row per (source IP, path) per 60 seconds. Further denials inside the window are counted and reported as `suppressed=N` on the next row, so an unauthenticated flood cannot evict real audit history.
+A REST mutation refused by the shared-secret gate writes one `auth.denied` row per (source IP, route) per 60 seconds, where the route is the template (`/api/v1/nodes/{node_id}/maintenance`), not the raw path, so random ids do not open new windows. The row still records the raw path. Further denials inside the window are counted and reported as `suppressed=N` on the next row, so an unauthenticated flood cannot evict real audit history.

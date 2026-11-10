@@ -619,3 +619,41 @@ fn config_update_outcome_reports_failed_disk_write() {
         assert_eq!(b["write_to_disk"].as_bool(), Some(wrote), "{b}");
     }
 }
+
+/// #127 — denied calls coalesce per route template, not per raw path, so
+/// random path parameters cannot flood the audit ring.
+#[tokio::test]
+async fn auth_denied_rows_coalesce_per_route_not_per_raw_path() {
+    use tower::ServiceExt;
+    let h = harness().await;
+    let mut config = h.state.config.clone();
+    config.cluster.shared_secret = "s3cret".into();
+    let state = Arc::new(AppState {
+        config,
+        raft: h.state.raft.clone(),
+        sm_data: h.state.sm_data.clone(),
+        audit_log: h.state.audit_log.clone(),
+        scheduler: h.state.scheduler.clone(),
+        io_rate: h.state.io_rate.clone(),
+        memory: None,
+    });
+    let router = build_router(state);
+    for i in 0..100 {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/nodes/n{i}/maintenance"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"enabled":true}"#))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    let rows: Vec<_> = h
+        .state
+        .audit_log
+        .query(&crate::audit::AuditFilter { action: Some("auth.denied".into()), ..Default::default() })
+        .into_iter()
+        .filter(|e| e.target.contains("/maintenance"))
+        .collect();
+    assert_eq!(rows.len(), 1, "first row: {:?}", rows.first());
+}

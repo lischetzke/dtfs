@@ -199,4 +199,4 @@ Data nodes and FUSE clients prove the secret via gRPC `RegisterNode`
   `0600` temp file, `fsync`, then atomic rename, because it carries
   `cluster.shared_secret`.
 - Rejected REST mutations are audited as `auth.denied`, coalesced per
-  (source, path) per 60 s window; see [Audit Log](./audit-log.md).
+  (source, route template) per 60 s window; see [Audit Log](./audit-log.md).

@@ -120,7 +120,7 @@ a blackbox or JSON exporter or a cron job):
 | Auth probing | audit rows `auth.denied` (see below) |
 
 Auth failures are written to the audit log as `auth.denied`, coalesced to one row
-per (source, path) per window with a count of the suppressed repeats, so a flood of
+per (source, route template) per window with a count of the suppressed repeats, so a flood of
 bad requests cannot evict real history; alert on the presence of such rows from
 unexpected sources, not on their count.
 

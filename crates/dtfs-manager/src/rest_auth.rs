@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::api::AppState;
 
-/// One `auth.denied` audit row per (source, path) per window; the rest are
+/// One `auth.denied` audit row per (source, route template) per window; the rest are
 /// counted and reported on the next row. Without this an unauthenticated
 /// flood costs a blocking disk append + a Raft AppendAudit per request and
 /// evicts real audit history from the capped ring.
@@ -164,6 +164,12 @@ pub async fn require_mutation_auth(
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // Coalesce denials per route template (#127): raw paths carry free
+    // parameters, so keying on them lets random ids flood the audit ring.
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or_else(|| path.clone(), |m| m.as_str().to_string());
     let peer = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -188,7 +194,7 @@ pub async fn require_mutation_auth(
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             let co = DENY_COALESCER.get_or_init(|| DenyCoalescer::new(60_000, 1024));
-            if let Some(suppressed) = co.admit(&src, &path, now_ms) {
+            if let Some(suppressed) = co.admit(&src, &route, now_ms) {
                 state.audit_log.log(
                     "api",
                     "auth.denied",
