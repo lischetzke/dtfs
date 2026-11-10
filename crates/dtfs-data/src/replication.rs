@@ -94,6 +94,7 @@ impl ReplicationManager {
         let (dat_path, total) = self
             .store
             .chunk_file_path(chunk_id)
+            .await
             .ok_or_else(|| anyhow::anyhow!("Chunk not found: {}", chunk_id.as_hex()))?;
 
         // Bug W (part 2) — `target_addr` comes from `NodeInfo.grpc_addr` via

@@ -637,9 +637,12 @@ async fn manager_lifecycle(
         let io_snapshot = data_metrics.snapshot();
         // Bug AU — live per-disk usage so the manager's per-disk view
         // (Bug AR) tracks reality across heartbeats, not just at-boot.
-        let disk_usage: Vec<dtfs_proto::dtfs::manager::DiskUsageSnapshot> = chunk_store
-            .disk_manager()
-            .live_disk_usage()
+        // statvfs blocks: run it off the async worker.
+        let usage_store = chunk_store.clone();
+        let disk_usage: Vec<dtfs_proto::dtfs::manager::DiskUsageSnapshot> =
+            tokio::task::spawn_blocking(move || usage_store.disk_manager().live_disk_usage())
+            .await
+            .unwrap_or_default()
             .into_iter()
             .map(|(id, total, used)| dtfs_proto::dtfs::manager::DiskUsageSnapshot {
                 disk_id: id,

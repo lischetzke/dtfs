@@ -333,6 +333,7 @@ impl ChunkStore {
     pub async fn get_chunk(&self, chunk_id: &ChunkId) -> DtfsResult<Bytes> {
         let (path, _) = self
             .chunk_file_path(chunk_id)
+            .await
             .ok_or_else(|| DtfsError::ChunkNotFound(chunk_id.to_string()))?;
         Ok(Bytes::from(fs::read(path).await.map_err(DtfsError::Io)?))
     }
@@ -340,7 +341,7 @@ impl ChunkStore {
     /// Test helper: does the chunk exist on any disk?
     #[cfg(test)]
     pub async fn has_chunk(&self, chunk_id: &ChunkId) -> bool {
-        self.chunk_file_path(chunk_id).is_some()
+        self.chunk_file_path(chunk_id).await.is_some()
     }
 
     // -----------------------------------------------------------------------
@@ -512,10 +513,11 @@ impl ChunkStore {
         // must not double-count `chunk_count`/`bytes_stored`. Must be
         // captured BEFORE the rename below, which would otherwise
         // overwrite (and hide) any pre-existing `.dat`.
-        let already_present = final_dat_path.exists() && final_meta_path.exists();
+        let already_present = fs::try_exists(&final_dat_path).await.unwrap_or(false)
+            && fs::try_exists(&final_meta_path).await.unwrap_or(false);
         // A pre-existing `.dat` with a missing/torn `.meta` (awaiting scrub
         // repair) may be a registered replica: a failed re-upload must keep it.
-        let dat_existed = final_dat_path.exists();
+        let dat_existed = fs::try_exists(&final_dat_path).await.unwrap_or(false);
 
         fs::rename(tmp_path, &final_dat_path)
             .await
@@ -527,8 +529,12 @@ impl ChunkStore {
         // stripe lock. Not fsynced: only a live concurrent DeleteChunk needs
         // it; after a crash the put's Raft commit decides the chunk's fate.
         // A failure only leaves the guard as weak as before: warn, continue.
-        let stamped = std::fs::File::open(&final_dat_path)
-            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        let stamp_path = final_dat_path.clone();
+        let stamped = tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&stamp_path).and_then(|f| f.set_modified(std::time::SystemTime::now()))
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
         if let Err(e) = stamped {
             tracing::warn!(chunk_id = %chunk_id, error = %e, "dat mtime stamp failed after rename; delete guard sees the tmp mtime");
         }
@@ -613,13 +619,13 @@ impl ChunkStore {
     /// this path (Bug I parity for the read side: pre-fix `replicate_to`
     /// pulled the whole chunk into a heap `Bytes`, which under the
     /// 2026-06-06 task storm pinned the data node at its memory cap).
-    pub fn chunk_file_path(&self, chunk_id: &ChunkId) -> Option<(std::path::PathBuf, u64)> {
-        self.chunk_file_path_on_disk(chunk_id, None)
+    pub async fn chunk_file_path(&self, chunk_id: &ChunkId) -> Option<(std::path::PathBuf, u64)> {
+        self.chunk_file_path_on_disk(chunk_id, None).await
     }
 
     /// `chunk_file_path` restricted to `disk_id` when `Some` (an unknown id
     /// finds nothing); `None` = first-found across disks.
-    pub fn chunk_file_path_on_disk(
+    pub async fn chunk_file_path_on_disk(
         &self,
         chunk_id: &ChunkId,
         disk_id: Option<u32>,
@@ -629,7 +635,7 @@ impl ChunkStore {
                 continue;
             }
             let dat_path = chunk_data_path(&disk.mount_path, chunk_id);
-            if let Ok(md) = std::fs::metadata(&dat_path) {
+            if let Ok(md) = fs::metadata(&dat_path).await {
                 return Some((dat_path, md.len()));
             }
         }
@@ -717,7 +723,7 @@ impl ChunkStore {
             let dat_path = chunk_data_path(&disk.mount_path, chunk_id);
             let meta_path = chunk_meta_path(&disk.mount_path, chunk_id);
 
-            if dat_path.exists() {
+            if fs::try_exists(&dat_path).await.unwrap_or(false) {
                 if let Some(limit) = if_mtime_le_ms {
                     // Unknown mtime is treated as fresh (never delete on doubt).
                     let fresh = dat_mtime_ms(&dat_path).await.map_or(true, |m| m > limit);
@@ -764,7 +770,7 @@ impl ChunkStore {
                     let _ = fs::remove_file(&wal_path).await;
                     return Err(DtfsError::Io(e));
                 }
-                if meta_path.exists() {
+                if fs::try_exists(&meta_path).await.unwrap_or(false) {
                     if let Err(e) = fs::remove_file(&meta_path).await {
                         let _ = fs::remove_file(&wal_path).await;
                         return Err(DtfsError::Io(e));
@@ -814,7 +820,7 @@ impl ChunkStore {
                 continue;
             }
             let meta_path = chunk_meta_path(&disk.mount_path, chunk_id);
-            if meta_path.exists() {
+            if fs::try_exists(&meta_path).await.unwrap_or(false) {
                 let meta_json = fs::read_to_string(&meta_path)
                     .await
                     .map_err(DtfsError::Io)?;
@@ -1739,7 +1745,7 @@ async fn collect_chunk_bucket(
                 Some(s) if !s.is_empty() => s.to_string(),
                 _ => continue,
             };
-            if !p.with_extension("meta").exists() {
+            if !fs::try_exists(p.with_extension("meta")).await.unwrap_or(false) {
                 continue;
             }
             let mtime_ms = f
@@ -2433,18 +2439,18 @@ mod tests {
         let vol = VolumeId::new("default".to_string());
         store.put_chunk(&id, data, &vol, DiskTier::Cold).await.unwrap();
         store.put_chunk(&id, data, &vol, DiskTier::Warm).await.unwrap();
-        let (p0, _) = store.chunk_file_path_on_disk(&id, Some(0)).unwrap();
-        let (p1, _) = store.chunk_file_path_on_disk(&id, Some(1)).unwrap();
+        let (p0, _) = store.chunk_file_path_on_disk(&id, Some(0)).await.unwrap();
+        let (p1, _) = store.chunk_file_path_on_disk(&id, Some(1)).await.unwrap();
         assert_eq!(p0, chunk_data_path(cold.path(), &id));
         assert_eq!(p1, chunk_data_path(warm.path(), &id));
-        assert!(store.chunk_file_path_on_disk(&id, Some(99)).is_none());
+        assert!(store.chunk_file_path_on_disk(&id, Some(99)).await.is_none());
         // Remove the warm copy: disk 1 no longer has it, disk 0 still does.
         std::fs::remove_file(&p1).unwrap();
         std::fs::remove_file(p1.with_extension("meta")).unwrap();
-        assert!(store.chunk_file_path_on_disk(&id, Some(1)).is_none());
+        assert!(store.chunk_file_path_on_disk(&id, Some(1)).await.is_none());
         assert!(store.get_chunk_meta_on_disk(&id, Some(1)).await.is_err());
         assert!(store.get_chunk_meta_on_disk(&id, Some(0)).await.is_ok());
-        assert!(store.chunk_file_path_on_disk(&id, None).is_some());
+        assert!(store.chunk_file_path_on_disk(&id, None).await.is_some());
     }
 
     /// Good .dat + parseable-but-wrong .meta (bad checksum, or bad size):
@@ -2855,6 +2861,7 @@ mod tests {
 
         let (path, size) = store
             .chunk_file_path(&chunk_id)
+            .await
             .expect("committed chunk must resolve to its .dat path");
         assert_eq!(size, data.len() as u64);
         assert!(path
@@ -2865,7 +2872,7 @@ mod tests {
         assert!(path.exists());
 
         let absent = ChunkId::from_bytes([9u8; 32]);
-        assert!(store.chunk_file_path(&absent).is_none());
+        assert!(store.chunk_file_path(&absent).await.is_none());
     }
 
     // Bug BU-6 — startup reclaim removes leftover streaming *.dat.tmp

@@ -398,14 +398,14 @@ impl DataServiceImpl {
     /// delete raced the read (delete removes `.dat` first): plain
     /// NOT_FOUND, no fault. Otherwise Bug BF-3: record an integrity fault
     /// and return DATA_LOSS so the client fails over.
-    fn meta_absent_status(
+    async fn meta_absent_status(
         &self,
         chunk_id: &ChunkId,
         chunk_hex: &str,
         total_size: u64,
         now_ms: u64,
     ) -> Status {
-        if self.store.chunk_file_path(chunk_id).is_none() {
+        if self.store.chunk_file_path(chunk_id).await.is_none() {
             return Status::not_found(format!("chunk deleted during read: {chunk_hex}"));
         }
         self.integrity_faults.record(crate::integrity::IntegrityFault {
@@ -508,9 +508,11 @@ impl DataService for DataServiceImpl {
         };
 
         // Allocate the tmp file on the disk that will host the chunk.
-        let (tmp_path, disk_mount) = self
-            .store
-            .allocate_streaming_tmp(tier)
+        // statvfs + create_dir_all block: keep them off the async worker.
+        let store = self.store.clone();
+        let (tmp_path, disk_mount) = tokio::task::spawn_blocking(move || store.allocate_streaming_tmp(tier))
+            .await
+            .map_err(|e| Status::internal(format!("allocate tmp: {e}")))?
             .map_err(|e| Status::internal(format!("allocate tmp: {e}")))?;
 
         // Bug BU-6 — guarantee the streaming tmp is removed on ANY early
@@ -713,6 +715,7 @@ impl DataService for DataServiceImpl {
         let (dat_path, total_size) = self
             .store
             .chunk_file_path(&chunk_id)
+            .await
             .ok_or_else(|| Status::not_found(format!("chunk not found: {}", req.chunk_id)))?;
 
         // Bug BC-8 — verify_on_read. When the cluster integrity knob is
@@ -747,7 +750,7 @@ impl DataService for DataServiceImpl {
                     return Ok(Response::new(stream_file(dat_path, total_size)));
                 }
                 Err(_) => {
-                    return Err(self.meta_absent_status(&chunk_id, &req.chunk_id, total_size, now_ms));
+                    return Err(self.meta_absent_status(&chunk_id, &req.chunk_id, total_size, now_ms).await);
                 }
             };
             let actual = hash_file_incrementally(&dat_path, total_size)
@@ -879,7 +882,7 @@ impl DataService for DataServiceImpl {
                 }));
             }
         };
-        let dat_path = match self.store.chunk_file_path_on_disk(&chunk_id, req.disk_id) {
+        let dat_path = match self.store.chunk_file_path_on_disk(&chunk_id, req.disk_id).await {
             Some((path, stat_size)) => {
                 // CR-4-6 (DATA-9) — a size mismatch is corruption/truncation
                 // that a checksum over the WRONG number of bytes can't
@@ -1317,7 +1320,7 @@ max_io_percent = 10
             .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
             .await
             .unwrap();
-        let (dat_path, _) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let (dat_path, _) = svc.store.chunk_file_path(&chunk_id).await.unwrap();
         let meta_path = dat_path.with_extension("meta");
         let mut m: dtfs_common::types::ChunkMeta =
             serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
@@ -1346,7 +1349,7 @@ max_io_percent = 10
 
         // Corrupt the on-disk .dat so its BLAKE3 no longer matches the
         // stored ChunkMeta.checksum.
-        let (dat_path, _size) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let (dat_path, _size) = svc.store.chunk_file_path(&chunk_id).await.unwrap();
         let mut corrupt = std::fs::read(&dat_path).unwrap();
         corrupt[0] ^= 0xFF;
         std::fs::write(&dat_path, &corrupt).unwrap();
@@ -1413,7 +1416,7 @@ max_io_percent = 10
             .expect_err("unauthenticated DeleteChunk must fail");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         // Bytes must still be on disk.
-        assert!(svc.store.chunk_file_path(&chunk_id).is_some());
+        assert!(svc.store.chunk_file_path(&chunk_id).await.is_some());
     }
 
     // LIS-19 — PutChunk uses the same require_data_rpc_auth gate before any
@@ -1468,7 +1471,7 @@ max_io_percent = 10
         );
         let resp = svc.delete_chunk(req).await.expect("authed delete");
         assert!(resp.into_inner().success);
-        assert!(svc.store.chunk_file_path(&chunk_id).is_none());
+        assert!(svc.store.chunk_file_path(&chunk_id).await.is_none());
     }
 
     async fn put_test_chunk(svc: &DataServiceImpl, data: &[u8]) -> (ChunkId, String) {
@@ -1515,7 +1518,7 @@ max_io_percent = 10
                 .expect_err("tampered DeleteChunk must fail");
             assert_eq!(err.code(), tonic::Code::PermissionDenied, "disk={disk:?} mtime={mtime:?}");
         }
-        assert!(svc.store.chunk_file_path(&chunk_id).is_some(), "bytes must survive");
+        assert!(svc.store.chunk_file_path(&chunk_id).await.is_some(), "bytes must survive");
     }
 
     // Audit #3 — with require_delete_binding a legacy chunk_id-only stamp
@@ -1533,7 +1536,7 @@ max_io_percent = 10
             .await
             .expect_err("legacy stamp must fail when the binding is required");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert!(svc.store.chunk_file_path(&chunk_id).is_some(), "bytes must survive");
+        assert!(svc.store.chunk_file_path(&chunk_id).await.is_some(), "bytes must survive");
 
         let binding = data_rpc_delete_binding(&hex, None, None);
         let resp = svc
@@ -1541,7 +1544,7 @@ max_io_percent = 10
             .await
             .expect("full binding accepted");
         assert!(resp.into_inner().was_present);
-        assert!(svc.store.chunk_file_path(&chunk_id).is_none());
+        assert!(svc.store.chunk_file_path(&chunk_id).await.is_none());
     }
 
     // LIS-55 — unauthenticated ReplicateChunk must be PermissionDenied
@@ -1573,7 +1576,7 @@ max_io_percent = 10
             .await
             .expect_err("unauthenticated ReplicateChunk must fail");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert!(svc.store.chunk_file_path(&chunk_id).is_some());
+        assert!(svc.store.chunk_file_path(&chunk_id).await.is_some());
     }
 
     // LIS-55 — stamp for a different target_address must not authorize.
@@ -1615,7 +1618,7 @@ max_io_percent = 10
             .await
             .expect_err("wrong target binding must fail");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert!(svc.store.chunk_file_path(&chunk_id).is_some());
+        assert!(svc.store.chunk_file_path(&chunk_id).await.is_some());
     }
 
     // LIS-83 — unauthenticated GetChunk must be PermissionDenied (exfil).
@@ -1799,7 +1802,7 @@ max_io_percent = 10
             .await
             .expect("replicate");
         assert_eq!(disk_id, 1, "copy landed on the warm disk");
-        let (p, _) = store.chunk_file_path(&chunk_id).expect("stored on target");
+        let (p, _) = store.chunk_file_path(&chunk_id).await.expect("stored on target");
         assert!(p.starts_with(d1.path()));
     }
 
@@ -1815,7 +1818,7 @@ max_io_percent = 10
             .put_chunk(&chunk_id, data, &VolumeId::new("default".to_string()), DiskTier::Hot)
             .await
             .unwrap();
-        let (dat, _) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let (dat, _) = svc.store.chunk_file_path(&chunk_id).await.unwrap();
         std::fs::remove_file(dat.with_extension("meta")).unwrap();
         let got = collect_stream(&svc, &chunk_id.as_hex()).await;
         assert_eq!(got.map_err(|s| s.code()), Ok(data.to_vec()));
@@ -1837,7 +1840,7 @@ max_io_percent = 10
             .put_chunk(&chunk_id, data, &VolumeId::new("default".to_string()), DiskTier::Hot)
             .await
             .unwrap();
-        let (dat, _) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let (dat, _) = svc.store.chunk_file_path(&chunk_id).await.unwrap();
         std::fs::write(dat.with_extension("meta"), b"{torn").unwrap();
         std::fs::write(&dat, b"meta-absent-dat-presenX").unwrap();
         let err = collect_stream(&svc, &chunk_id.as_hex()).await.expect_err("must not serve");
@@ -1851,7 +1854,7 @@ max_io_percent = 10
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = make_service(tmp.path(), true).await;
         let chunk_id = ChunkId::from_bytes(checksum::compute(b"gone"));
-        let st = svc.meta_absent_status(&chunk_id, &chunk_id.as_hex(), 4, 1);
+        let st = svc.meta_absent_status(&chunk_id, &chunk_id.as_hex(), 4, 1).await;
         assert_eq!(st.code(), tonic::Code::NotFound);
         assert_eq!(svc.integrity_faults.pending_len(), 0);
         assert!(!svc.integrity_faults.is_self_quarantined());
@@ -2136,7 +2139,7 @@ max_io_percent = 10
             .unwrap();
 
         // Flip one byte on disk so BLAKE3 no longer matches the meta.
-        let (dat_path, _size) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let (dat_path, _size) = svc.store.chunk_file_path(&chunk_id).await.unwrap();
         let mut corrupt = std::fs::read(&dat_path).unwrap();
         corrupt[0] ^= 0xFF;
         std::fs::write(&dat_path, &corrupt).unwrap();
@@ -2181,7 +2184,7 @@ max_io_percent = 10
             .unwrap();
 
         // Remove only the .meta; the .dat is intact.
-        let (dat_path, _size) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let (dat_path, _size) = svc.store.chunk_file_path(&chunk_id).await.unwrap();
         let meta_path = dat_path.with_extension("meta");
         std::fs::remove_file(&meta_path).unwrap();
 
@@ -2224,7 +2227,7 @@ max_io_percent = 10
             .unwrap();
 
         // Append trailing garbage: the .meta still claims the original size.
-        let (dat_path, _size) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let (dat_path, _size) = svc.store.chunk_file_path(&chunk_id).await.unwrap();
         let mut with_garbage = data.clone();
         with_garbage.extend_from_slice(b"trailing-garbage");
         std::fs::write(&dat_path, &with_garbage).unwrap();
@@ -2277,7 +2280,7 @@ max_io_percent = 10
             .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
             .await
             .unwrap();
-        let (dat_path, _) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let (dat_path, _) = svc.store.chunk_file_path(&chunk_id).await.unwrap();
         set_meta_checksum(&dat_path, [0xEE; 32]);
 
         let resp = verify(&svc, &chunk_id.as_hex()).await;
@@ -2296,7 +2299,7 @@ max_io_percent = 10
             .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
             .await
             .unwrap();
-        let (dat_path, _) = svc.store.chunk_file_path(&chunk_id).unwrap();
+        let (dat_path, _) = svc.store.chunk_file_path(&chunk_id).await.unwrap();
         let mut corrupt = data.clone();
         corrupt[0] ^= 0xFF;
         std::fs::write(&dat_path, &corrupt).unwrap();
