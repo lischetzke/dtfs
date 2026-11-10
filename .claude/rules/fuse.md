@@ -306,7 +306,9 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   the path's pending chunks the same way; a cap-drain commit in write()
   removes its chunks like a batch success (`record_drain_commit`) and
   truncate drops failed chunks at or above the new EOF
-  (`clip_failed_chunks`); a `commit_all` success clears
+  (`clip_failed_chunks`, which clears `write_error` on a handle whose
+  failed chunks it emptied: an O_TRUNC reopen inherited the EIO for data
+  the truncate discarded); a `commit_all` success clears
   both); `BgSlot` removes its batch and wakes `wait_bg` (Notify) even on
   panic. It holds NO `path_guard` (writes would block on it again); instead
   everything that could touch those chunks waits first: write() into a

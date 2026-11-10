@@ -2285,12 +2285,17 @@ impl DtfsFilesystem {
         }
     }
 
-    /// Truncate to `new_size`: failed chunks at or above it no longer exist.
+    /// Truncate to `new_size`: failed chunks at or above it no longer exist;
+    /// a handle whose failed chunks are all gone drops its pending error
+    /// (an O_TRUNC reopen inherited it for data the truncate discarded).
     fn clip_failed_chunks(&self, path: &str, new_size: u64) {
         let cs = self.write_buffer.chunk_size() as u64;
         for mut f in self.open_files.iter_mut() {
-            if f.path == path {
+            if f.path == path && !f.failed_chunks.is_empty() {
                 f.failed_chunks.retain(|&c| (c as u64) * cs < new_size);
+                if f.failed_chunks.is_empty() {
+                    f.write_error = None;
+                }
             }
         }
     }
@@ -7729,6 +7734,26 @@ mod async_commit_fs_tests {
         assert_eq!(fs.open_files.get(&fh).unwrap().failed_chunks, vec![1]);
         fs.record_bg_batch("/f", &[1], Ok(()));
         assert!(fs.open_files.get(&fh).unwrap().write_error.is_none(), "remaining failed chunk retried");
+    }
+
+    /// Review FUSE-4: an O_TRUNC reopen inherits the failed batch, then its
+    /// truncate to 0 discards those chunks: no handle may still report EIO
+    /// for them. A truncate that keeps a failed chunk keeps the error.
+    #[tokio::test]
+    async fn o_trunc_reopen_after_a_failed_batch_fsyncs_ok() {
+        let fs = fs(true);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let old = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.record_bg_batch("/f", &[0, 1], Err(anyhow::anyhow!("put failed")));
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.inherit_bg_failure(fh);
+        fs.clip_failed_chunks("/f", cs + 1);
+        assert!(fs.fsync(fh).await.is_err(), "boundary: chunk 1 still holds data, its failure stays");
+        fs.record_bg_batch("/f", &[0, 1], Err(anyhow::anyhow!("put failed")));
+        fs.inherit_bg_failure(fh);
+        fs.clip_failed_chunks("/f", 0);
+        fs.fsync(fh).await.expect("O_TRUNC discarded the failed chunks: no stale EIO");
+        fs.fsync(old).await.expect("same for the older writer");
     }
 
     /// multibatch: two overlapping commits of disjoint chunk sets both merge
