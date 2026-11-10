@@ -215,6 +215,17 @@ entry types an older binary cannot apply (for example after enabling
 `audit.replicate_via_raft`), so rollback is a stop-gap for a failed update, not an
 undo for a version that has been running with new features.
 
+**No manager rollback below v0.1.14 once named removes were proposed.** From
+v0.1.14 a leader names the row's `chunk_hash` on `RemoveChunkLocation` and
+`RemoveDeadNodeReplica`, but only while every Raft voter and learner is a
+registered manager reporting a release `vX.Y.Z` >= v0.1.14 (dev builds such as
+`v0.0.0-dev` and suffixed versions such as `v0.1.14-rc1` keep it off). An older
+manager ignores the field and removes the row hash-blind where a v0.1.14 node
+refuses, so the replicated state diverges. A manager that rejoins on an older
+binary closes the gate only at its next registration (a few seconds); entries
+already in the log stay named. Roll managers back only before any v0.1.14 leader
+ran with all managers on v0.1.14.
+
 Per node:
 
 1. If maintenance mode is warranted (data node, longer than 30 s), enable it.

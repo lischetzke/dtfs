@@ -4344,3 +4344,68 @@ mod reported_size_tests {
         assert_eq!(file(vec![], None).reported_size(), 0);
     }
 }
+
+/// RAFT-1 — proposers name the hash only once every Raft member is a
+/// registered Manager on a release >= NAMED_REMOVE_MIN_VERSION.
+#[cfg(test)]
+mod named_remove_gate_tests {
+    use super::*;
+
+    pub(crate) fn mgr(version: &str) -> crate::NodeInfo {
+        crate::NodeInfo {
+            role: dtfs_common::types::NodeRole::Manager,
+            hostname: "mgr".into(),
+            grpc_addr: String::new(),
+            location: dtfs_common::topology::Location::new("lab", "dc-a", "r1", "h1"),
+            disks: Vec::new(),
+            total_capacity: 0,
+            used_capacity: 0,
+            health: dtfs_common::types::HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: version.into(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    /// Voters 1, 2 and learner 3, each a manager on the given version.
+    pub(crate) fn sm_with(versions: [&str; 3]) -> StateMachineData {
+        let nodes: BTreeMap<u64, crate::DtfsNode> = (1..=3)
+            .map(|id| (id, crate::DtfsNode { addr: String::new(), hostname: String::new() }))
+            .collect();
+        let m = openraft::Membership::new(vec![[1u64, 2].into_iter().collect()], nodes).unwrap();
+        let mut sm = StateMachineData::default();
+        sm.last_membership = openraft::StoredMembership::new(None, m);
+        for (id, v) in (1..=3).zip(versions) {
+            sm.nodes.insert(id, mgr(v));
+        }
+        sm
+    }
+
+    #[test]
+    fn gate_open_when_every_member_is_at_least_min_release() {
+        assert!(cluster_understands_named_remove(&sm_with(["v0.1.14", "v0.1.14", "v0.1.14"])));
+        assert!(cluster_understands_named_remove(&sm_with(["v0.1.14", "v0.2.0", "v1.0.0"])));
+    }
+
+    #[test]
+    fn gate_closed_when_any_member_is_old_dev_unregistered_or_not_manager() {
+        // Boundary: one voter a patch below.
+        assert!(!cluster_understands_named_remove(&sm_with(["v0.1.14", "v0.1.13", "v0.1.14"])));
+        // A learner counts too.
+        assert!(!cluster_understands_named_remove(&sm_with(["v0.1.14", "v0.1.14", "v0.1.13"])));
+        assert!(!cluster_understands_named_remove(&sm_with(["v0.1.14", "v0.0.0-dev", "v0.1.14"])));
+        assert!(!cluster_understands_named_remove(&sm_with(["v0.1.14", "", "v0.1.14"])));
+        let mut unregistered = sm_with(["v0.1.14"; 3]);
+        unregistered.nodes.remove(&2);
+        assert!(!cluster_understands_named_remove(&unregistered));
+        let mut data_role = sm_with(["v0.1.14"; 3]);
+        data_role.nodes.get_mut(&3).unwrap().role = dtfs_common::types::NodeRole::Data;
+        assert!(!cluster_understands_named_remove(&data_role));
+        // No membership at all (fresh SM).
+        assert!(!cluster_understands_named_remove(&StateMachineData::default()));
+    }
+}

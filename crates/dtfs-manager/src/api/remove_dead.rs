@@ -6,7 +6,9 @@
 
 use super::*;
 use dtfs_common::types::AnchorPolicy;
-use dtfs_raft::state_machine::{remove_chunk_location_check, replica_row_is_live};
+use dtfs_raft::state_machine::{
+    cluster_understands_named_remove, remove_chunk_location_check, replica_row_is_live,
+};
 
 /// One `(file, chunk_index, disk)` row held by the dead node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,8 +16,9 @@ pub(crate) struct DeadRow {
     pub path: String,
     pub chunk_index: u64,
     pub disk_id: u32,
-    /// The row's hash, so a file renamed over `path` after the plan is spared.
-    pub chunk_hash: String,
+    /// The row's hash, so a file renamed over `path` after the plan is
+    /// spared; `None` while some manager predates named removes (RAFT-1).
+    pub chunk_hash: Option<String>,
     /// The file's volume anchor, threaded into `RemoveChunkLocation`.
     pub anchor: Option<AnchorPolicy>,
 }
@@ -70,6 +73,7 @@ pub(crate) fn plan_remove_dead(
     }
     let nid_str = nid.to_string();
     let mut plan = RemoveDeadPlan::default();
+    let named = cluster_understands_named_remove(sm);
     for (path, f) in &sm.files {
         let anchor = sm.volumes.get(&f.volume_id).and_then(|v| v.effective_anchor());
         for c in f.chunks.iter().filter(|c| c.node_id == nid_str) {
@@ -77,7 +81,7 @@ pub(crate) fn plan_remove_dead(
                 path: path.clone(),
                 chunk_index: c.chunk_index,
                 disk_id: c.disk_id,
-                chunk_hash: c.chunk_hash.clone(),
+                chunk_hash: named.then(|| c.chunk_hash.clone()),
                 anchor: anchor.clone(),
             };
             let other_live = f.chunks.iter().any(|o| {
@@ -87,7 +91,7 @@ pub(crate) fn plan_remove_dead(
             });
             if !other_live {
                 plan.data_loss.push(row);
-            } else if remove_chunk_location_check(sm, path, c.chunk_index, &nid_str, c.disk_id, Some(&c.chunk_hash), anchor.as_ref())
+            } else if remove_chunk_location_check(sm, path, c.chunk_index, &nid_str, c.disk_id, row.chunk_hash.as_deref(), anchor.as_ref())
                 .is_ok()
             {
                 plan.removable.push(row);
@@ -189,7 +193,7 @@ pub(super) async fn remove_dead_node_endpoint(
             disk_id: r.disk_id,
             enforce_anchor: r.anchor.clone(),
             now_ms: crate::metadata::stamp_now_ms(),
-            chunk_hash: Some(r.chunk_hash.clone()),
+            chunk_hash: r.chunk_hash.clone(),
         };
         match propose(&state, req).await {
             Ok(()) => removed += 1,
@@ -354,6 +358,35 @@ mod tests {
         assert_eq!(idx(&p.anchor_pending), vec![0]);
         assert_eq!(idx(&p.data_loss), vec![2]);
         assert_eq!(p.total(), 3);
+    }
+
+    /// Single-voter membership on manager 10 reporting `version`.
+    fn with_manager(mut s: StateMachineData, version: &str) -> StateMachineData {
+        let mut m = node("leli", HealthStatus::Healthy, 0);
+        m.role = NodeRole::Manager;
+        m.version = version.into();
+        s.nodes.insert(10, m);
+        let nodes: std::collections::BTreeMap<u64, dtfs_raft::DtfsNode> =
+            [(10, dtfs_raft::DtfsNode { addr: String::new(), hostname: String::new() })].into();
+        let mem = openraft::Membership::new(vec![[10u64].into_iter().collect()], nodes).unwrap();
+        s.last_membership = openraft::StoredMembership::new(None, mem);
+        s
+    }
+
+    /// RAFT-1 — the proposed removal names the hash only when every
+    /// manager understands it.
+    #[test]
+    fn plan_names_chunk_hash_only_when_cluster_understands_it() {
+        let hashes = |p: &RemoveDeadPlan| {
+            p.removable.iter().chain(&p.data_loss).map(|r| r.chunk_hash.clone()).collect::<Vec<_>>()
+        };
+        let p = plan_remove_dead(&with_manager(sm(), "v0.1.14"), 1, 1_000_000, 30_000).unwrap();
+        assert_eq!(hashes(&p), vec![Some("h1".to_string()), Some("h2".to_string())]);
+        // Gate closed: a v0.1.13 manager, a dev build, or no membership.
+        for s in [with_manager(sm(), "v0.1.13"), with_manager(sm(), "v0.0.0-dev"), sm()] {
+            let p = plan_remove_dead(&s, 1, 1_000_000, 30_000).unwrap();
+            assert_eq!(hashes(&p), vec![None, None]);
+        }
     }
 
     #[test]

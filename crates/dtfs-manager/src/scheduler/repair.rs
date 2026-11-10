@@ -376,6 +376,9 @@ impl TaskScheduler {
         };
 
         // Phase 2 — issue the Raft removals (lock released).
+        let named = dtfs_raft::state_machine::cluster_understands_named_remove(
+            &*self.state_data.read().await,
+        );
         for (path, idx, node, disk_id, enforce, chunk_hash) in removals {
             let req = ClientRequest::RemoveChunkLocation { now_ms: now_millis(),
                 path: path.clone(),
@@ -384,7 +387,7 @@ impl TaskScheduler {
                 // CO-1-1 — target the exact (node, disk) spill replica.
                 disk_id,
                 enforce_anchor: enforce,
-                chunk_hash: Some(chunk_hash.clone()),
+                chunk_hash: named.then(|| chunk_hash.clone()),
             };
             match self.raft.client_write(req).await {
                 // A committed entry can still apply to ClientResponse::Error
@@ -476,6 +479,9 @@ impl TaskScheduler {
             out
         };
 
+        let named = dtfs_raft::state_machine::cluster_understands_named_remove(
+            &*self.state_data.read().await,
+        );
         for (path, chunk_index, disk_id, anchor, chunk_hash) in targets {
             let req = ClientRequest::RemoveChunkLocation { now_ms: now_millis(),
                 path: path.clone(),
@@ -484,7 +490,7 @@ impl TaskScheduler {
                 // CO-1-1 — target the exact (node, disk) row we found stale.
                 disk_id,
                 enforce_anchor: anchor,
-                chunk_hash: Some(chunk_hash),
+                chunk_hash: named.then_some(chunk_hash),
             };
             match self.raft.client_write(req).await {
                 // Apply refused (e.g. would strand the anchor): the stale row

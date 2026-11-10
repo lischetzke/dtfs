@@ -118,6 +118,9 @@ impl TaskScheduler {
         // SetChunkCooldown write per file at the end.
         let mut cooldowns: HashMap<String, std::collections::BTreeSet<u64>> =
             HashMap::new();
+        let named = dtfs_raft::state_machine::cluster_understands_named_remove(
+            &*self.state_data.read().await,
+        );
 
         for action in &actions {
             let Some(node_addr) = self.node_grpc_addr(action.node_id).await else {
@@ -140,7 +143,7 @@ impl TaskScheduler {
                     // CO-1-1 — drop only this (node, disk) SM entry.
                     disk_id: action.disk_id,
                     enforce_anchor: action.anchor.clone(),
-                    chunk_hash: Some(action.chunk_id.clone()),
+                    chunk_hash: named.then(|| action.chunk_id.clone()),
                 },
                 node_addr,
                 chunk_id: action.chunk_id.clone(),

@@ -370,50 +370,7 @@ fn run_update(
     Ok(())
 }
 
-/// CO-5-15 — parse the numeric `(major, minor, patch)` tuple out of a
-/// version string. Tolerates a leading `v`, surrounding text (the binary
-/// `--version` prints `v0.1.9 (built ...)`), and missing components
-/// (`v1` -> `(1, 0, 0)`). Returns `None` if no leading-numeric version
-/// token is found. A trailing pre-release/build suffix on the patch
-/// component (`v1.2.3-rc1`) is ignored for ordering.
-fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
-    // Take the first whitespace-delimited token, drop an optional `v`.
-    let tok = s.trim().split_whitespace().next()?;
-    let tok = tok.strip_prefix('v').or_else(|| tok.strip_prefix('V')).unwrap_or(tok);
-    let mut it = tok.split('.');
-    let parse_part = |p: Option<&str>| -> u64 {
-        p.map(|p| {
-            // Stop at the first non-digit (pre-release/build suffix).
-            let digits: String = p.chars().take_while(|c| c.is_ascii_digit()).collect();
-            digits.parse().unwrap_or(0)
-        })
-        .unwrap_or(0)
-    };
-    let first = it.next()?;
-    // The major component must start with a digit, else this is not a
-    // version token (avoids treating "dtfs-cli" as 0.0.0).
-    if !first.starts_with(|c: char| c.is_ascii_digit()) {
-        return None;
-    }
-    let major = parse_part(Some(first));
-    let minor = parse_part(it.next());
-    let patch = parse_part(it.next());
-    Some((major, minor, patch))
-}
-
-/// CO-5-15 — semver-aware "is `latest` strictly newer than `installed`?".
-/// A naive string compare orders `v0.1.10 < v0.1.9`; this compares the
-/// numeric `(major, minor, patch)` tuples. Unparseable versions
-/// (e.g. `not installed`, `v0.0.0-dev`) make the answer conservative:
-/// if `installed` can't be parsed but `latest` can, an update is
-/// available; otherwise (latest unparseable, or both unparseable) false.
-fn version_is_newer(installed: &str, latest: &str) -> bool {
-    match (parse_semver(installed), parse_semver(latest)) {
-        (Some(i), Some(l)) => l > i,
-        (None, Some(_)) => true,
-        _ => false,
-    }
-}
+use dtfs_common::version::version_is_newer;
 
 fn run_check(
     target: UpdateTarget,
@@ -729,30 +686,6 @@ fn confirm(prompt: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn co_5_15_version_is_newer_is_semver_aware() {
-        // The motivating bug: a naive string compare orders
-        // "v0.1.10" < "v0.1.9"; the numeric compare must not.
-        assert!(version_is_newer("v0.1.9", "v0.1.10"));
-        assert!(!version_is_newer("v0.1.10", "v0.1.9"));
-        // Equal -> not newer.
-        assert!(!version_is_newer("v0.1.9", "v0.1.9"));
-        // Major/minor ordering.
-        assert!(version_is_newer("v0.9.9", "v1.0.0"));
-        assert!(!version_is_newer("v2.0.0", "v1.9.9"));
-        // Tolerates the `v` prefix being absent and trailing build text
-        // (the binary `--version` prints "v0.1.9 (built 20260101-000000)").
-        assert!(version_is_newer("v0.1.9 (built 20260101-000000)", "0.1.10"));
-        // Missing components default to 0: v1 == v1.0.0.
-        assert!(!version_is_newer("v1", "v1.0.0"));
-        assert!(version_is_newer("v1", "v1.0.1"));
-        // Unparseable installed (not yet installed) but a real latest ->
-        // update available.
-        assert!(version_is_newer("not installed", "v0.1.0"));
-        // Unparseable latest -> conservatively not newer.
-        assert!(!version_is_newer("v0.1.0", "<unknown>"));
-    }
 
     #[test]
     fn target_binaries_map() {

@@ -623,6 +623,9 @@ impl TieringEngine {
             .saturating_mul(1_000);
         // Load the migration state ONCE per tick, not once per demotion.
         let active_pairs = self.scheduler.active_replication_pairs().await;
+        let named = dtfs_raft::state_machine::cluster_understands_named_remove(
+            &*self.state_data.read().await,
+        );
         for d in &plan.demotions {
             // AV-5-5 dispatcher re-check #1: between the planner's
             // snapshot and now, a replication.complete may have
@@ -690,7 +693,7 @@ impl TieringEngine {
                     // CO-1-1 — drop only this (node, disk) warm cache entry.
                     disk_id: d.disk_id,
                     enforce_anchor: d.enforce_anchor.clone(),
-                    chunk_hash: Some(d.chunk_id.clone()),
+                    chunk_hash: named.then(|| d.chunk_id.clone()),
                 },
                 node_addr,
                 chunk_id: d.chunk_id.clone(),

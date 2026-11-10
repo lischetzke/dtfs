@@ -2579,6 +2579,27 @@ pub fn replica_row_is_live(sm: &StateMachineData, c: &ChunkLocationEntry) -> boo
         .unwrap_or(false)
 }
 
+/// First release whose apply honours `RemoveChunkLocation.chunk_hash` /
+/// `RemoveDeadNodeReplica.chunk_hash`. Older appliers ignore the field.
+pub const NAMED_REMOVE_MIN_VERSION: (u64, u64, u64) = (0, 1, 14);
+
+/// RAFT-1 — may a proposer set `chunk_hash` on a removal? Only when every
+/// voter and learner of the last membership is a registered Manager whose
+/// reported version is a release >= [`NAMED_REMOVE_MIN_VERSION`]; an old
+/// applier drops the unknown field and would remove the row hash-blind
+/// while new ones refuse, diverging the state. Dev builds, unparsable or
+/// missing versions, and an empty membership keep removals hash-blind.
+pub fn cluster_understands_named_remove(sm: &StateMachineData) -> bool {
+    let mut members = sm.last_membership.nodes().peekable();
+    members.peek().is_some()
+        && members.all(|(id, _)| {
+            sm.nodes.get(id).is_some_and(|n| {
+                n.role == dtfs_common::types::NodeRole::Manager
+                    && dtfs_common::version::release_at_least(&n.version, NAMED_REMOVE_MIN_VERSION)
+            })
+        })
+}
+
 /// Guard half of `RemoveChunkLocation`, shared with the manager's
 /// remove-dead-node planner so plan and apply cannot disagree.
 /// `Ok(false)` = nothing to remove (idempotent no-op), `Ok(true)` = the
