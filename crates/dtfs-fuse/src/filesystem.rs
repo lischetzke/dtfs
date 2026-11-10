@@ -466,6 +466,10 @@ fn commit_sets_conflict(a: Option<&[u32]>, b: Option<&[u32]>) -> bool {
 /// a commit cannot legitimately outlive the write lease it runs under.
 const QUIET_WAIT: Duration = Duration::from_millis(WRITE_LEASE_MS);
 
+/// read() passes at most: a pass is repeated when the handle's snapshot
+/// changed under it (a commit retired between snapshot and overlay).
+const READ_SNAPSHOT_TRIES: usize = 3;
+
 /// What `refetch_locations` does with a fetch result.
 #[derive(Debug, PartialEq)]
 enum FetchStep {
@@ -819,6 +823,10 @@ pub struct DtfsFilesystem {
     /// commit retiring during the awaits that follow.
     #[cfg(test)]
     write_race_hook: std::sync::Mutex<Option<Box<dyn FnOnce(&DtfsFilesystem) + Send>>>,
+    /// Test hook run by read() right before its overlay: models a commit
+    /// retiring during the chunk fetch awaits.
+    #[cfg(test)]
+    read_race_hook: std::sync::Mutex<Option<Box<dyn FnOnce(&DtfsFilesystem) + Send>>>,
     /// Test hook run by open_with_append right before it inserts the handle.
     #[cfg(test)]
     open_race_hook: std::sync::Mutex<Option<Box<dyn FnOnce(&DtfsFilesystem) + Send>>>,
@@ -915,6 +923,8 @@ impl DtfsFilesystem {
             write_budget,
             #[cfg(test)]
             write_race_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            read_race_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             open_race_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1246,6 +1256,25 @@ impl DtfsFilesystem {
     /// available.
     #[instrument(skip(self), fields(fh, offset, size))]
     pub async fn read(&self, fh: u64, offset: u64, size: u32) -> Result<Bytes> {
+        // #133: a commit merges into the handles before it drops its overlay,
+        // so if the handle's snapshot changed during a pass, that pass may
+        // have missed the committed bytes in both. Repeat it (bounded).
+        let mut pass = 1;
+        loop {
+            let (bytes, used) = self.read_pass(fh, offset, size).await?;
+            let changed = self.open_files.get(&fh).is_some_and(|f| {
+                !f.locations.as_ref().is_some_and(|l| Arc::ptr_eq(l, &used))
+            });
+            if !changed || pass >= READ_SNAPSHOT_TRIES {
+                return Ok(bytes);
+            }
+            debug!(fh, offset, pass, "handle snapshot changed during read; reading again");
+            pass += 1;
+        }
+    }
+
+    /// One read() pass; returns the bytes and the snapshot it read from.
+    async fn read_pass(&self, fh: u64, offset: u64, size: u32) -> Result<(Bytes, Arc<FileLocations>)> {
         // CO-3-12: clone everything the chunk loop needs out of the DashMap
         // entry, then DROP the guard before the per-chunk network loop. A
         // stalled chunk fetch must not hold the open_files entry guard, or it
@@ -1272,7 +1301,7 @@ impl DtfsFilesystem {
         let buffered_eof = self.write_buffer.visible_size(&file_path).unwrap_or(0);
         let file_size = locations.total_size.max(buffered_eof);
         if offset >= file_size {
-            return Ok(Bytes::new());
+            return Ok((Bytes::new(), locations));
         }
         let actual_size = effective_read_len(file_size, offset, size);
 
@@ -1683,6 +1712,13 @@ impl DtfsFilesystem {
         if (result.len() as u32) < actual_size {
             result.resize(actual_size as usize, 0);
         }
+        #[cfg(test)]
+        {
+            let hook = self.read_race_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(self);
+            }
+        }
         let overlaid = self.write_buffer.overlay(&file_path, offset, &mut result);
         if overlaid > 0 {
             debug!(
@@ -1694,7 +1730,7 @@ impl DtfsFilesystem {
             );
         }
 
-        Ok(Bytes::from(result))
+        Ok((Bytes::from(result), locations))
     }
 
     /// Buffer a write for an open file.
@@ -7879,6 +7915,56 @@ mod async_commit_fs_tests {
                 fs.open_files.remove(&fh);
             }
         }
+    }
+
+    /// One-chunk 10-byte snapshot of `/f` whose chunk 0 is `id` on `n:1`.
+    fn one_chunk(id: &str, cs: u64) -> Arc<FileLocations> {
+        let mut l = holes("/f", 10, cs);
+        l.chunks = vec![committed_chunk_info(0, id, 10, vec!["n:1".to_string()], "warm")];
+        Arc::new(l)
+    }
+
+    /// Hook that swaps every `/f` handle to a fresh `snap` (a commit merge)
+    /// and re-arms itself `left` more times, counting its runs in `runs`.
+    fn churn(snap: Arc<FileLocations>, left: usize, runs: Arc<AtomicU64>) -> Box<dyn FnOnce(&DtfsFilesystem) + Send> {
+        Box::new(move |fs: &DtfsFilesystem| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            for mut f in fs.open_files.iter_mut() {
+                if f.path == "/f" {
+                    f.locations = Some(Arc::new((*snap).clone()));
+                }
+            }
+            if left > 0 {
+                *fs.read_race_hook.lock().unwrap() = Some(churn(snap, left - 1, runs));
+            }
+        })
+    }
+
+    /// #133: a commit merges a rewritten chunk into the handle and drops its
+    /// overlay while read() is past its snapshot clone: the read must return
+    /// the committed bytes, not the old chunk version.
+    #[tokio::test]
+    async fn read_returns_a_commit_that_retired_during_the_fetch() {
+        let fs = fs(false);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let (old, new) = ("a".repeat(64), "b".repeat(64));
+        fs.readahead.insert_cached("n:1", &old, Bytes::from(vec![1u8; 10]));
+        fs.readahead.insert_cached("n:1", &new, Bytes::from(vec![2u8; 10]));
+        let fh = open(&fs, "/f", OpenFlags::ReadOnly);
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(one_chunk(&old, cs));
+        let runs = Arc::new(AtomicU64::new(0));
+        *fs.read_race_hook.lock().unwrap() = Some(churn(one_chunk(&new, cs), 0, runs.clone()));
+        assert_eq!(&fs.read(fh, 0, 10).await.unwrap()[..], &[2u8; 10], "stale chunk served");
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        // Unchanged snapshot: served once, no retry.
+        assert_eq!(&fs.read(fh, 0, 10).await.unwrap()[..], &[2u8; 10]);
+        // Boundary: a snapshot that changes on every pass is retried at most
+        // READ_SNAPSHOT_TRIES times, then the last pass is served.
+        *fs.read_race_hook.lock().unwrap() = Some(churn(one_chunk(&new, cs), 10, runs.clone()));
+        runs.store(0, Ordering::Relaxed);
+        assert_eq!(&fs.read(fh, 0, 10).await.unwrap()[..], &[2u8; 10]);
+        assert_eq!(runs.load(Ordering::Relaxed), READ_SNAPSHOT_TRIES as u64);
+        fs.read_race_hook.lock().unwrap().take();
     }
 
     /// FUSE-2: fallocate's size floor counts in-flight bytes, also when the

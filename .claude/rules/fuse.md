@@ -345,6 +345,11 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 
 ## Reads and prefetch
 
+- read() runs `read_pass` (snapshot, chunk loop, overlay) and repeats it,
+  at most `READ_SNAPSHOT_TRIES` (3) passes, while the handle's snapshot
+  `Arc` is no longer the one the pass used: a commit merges before it drops
+  its overlay, so a pass it retired under saw neither (#133).
+
 - Foreground miss: first `readahead.join_pending()` on the FIRST candidate
   only, bounded by `PREFETCH_JOIN_TIMEOUT` (2 s), refusing to wait on a
   prefetch that has not yet acquired its slot; else fall through to the
