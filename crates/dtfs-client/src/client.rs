@@ -103,29 +103,42 @@ fn verify_chunk_digest(chunk_id: &str, digest: [u8; 32], node: &str) -> Result<(
 const PUT_CHUNK_MAX_RETRIES: u32 = 6;
 const PUT_CHUNK_BASE_BACKOFF_MS: u64 = 250;
 const PUT_CHUNK_MAX_BACKOFF_MS: u64 = 8_000;
+/// #150: `Unavailable` (channel dropped, node restarting) gets a short
+/// ladder only: the FUSE upload waits for every target before its quorum
+/// check, so one dead target held each chunk for the whole 15.75 s ladder.
+const PUT_CHUNK_UNAVAILABLE_MAX_RETRIES: u32 = 2;
 
 /// Decide how long to back off before retry on a put_chunk failure.
 /// Returns `None` when the caller should give up (non-retryable status
-/// or attempts exhausted).
+/// or attempts exhausted). The long ladder is for memory shedding only; a
+/// full disk and a failed connect (the 5 s connect timeout already ran or
+/// the host refused) are not retried: the writer reroutes or proceeds on
+/// the other targets.
 ///
 /// Pure function so we can unit-test the policy without running gRPC.
 pub(crate) fn put_chunk_retry_backoff(
     code: tonic::Code,
+    message: &str,
     attempt_zero_based: u32,
 ) -> Option<std::time::Duration> {
-    if attempt_zero_based >= PUT_CHUNK_MAX_RETRIES {
+    let max = match code {
+        tonic::Code::ResourceExhausted
+            if message.contains("disk full") || message.contains("no eligible disk") =>
+        {
+            return None
+        }
+        tonic::Code::ResourceExhausted => PUT_CHUNK_MAX_RETRIES,
+        tonic::Code::Unavailable if message.starts_with("connect:") => return None,
+        tonic::Code::Unavailable => PUT_CHUNK_UNAVAILABLE_MAX_RETRIES,
+        _ => return None,
+    };
+    if attempt_zero_based >= max {
         return None;
     }
-    // Only retry on transient/cooperative-overload codes.
-    match code {
-        tonic::Code::ResourceExhausted | tonic::Code::Unavailable => {
-            let ms = PUT_CHUNK_BASE_BACKOFF_MS
-                .saturating_mul(1 << attempt_zero_based)
-                .min(PUT_CHUNK_MAX_BACKOFF_MS);
-            Some(std::time::Duration::from_millis(ms))
-        }
-        _ => None,
-    }
+    let ms = PUT_CHUNK_BASE_BACKOFF_MS
+        .saturating_mul(1 << attempt_zero_based)
+        .min(PUT_CHUNK_MAX_BACKOFF_MS);
+    Some(std::time::Duration::from_millis(ms))
 }
 
 /// Bug CF — retry policy for re-walking the manager pool after a full
@@ -782,7 +795,7 @@ impl DtfsClient {
             {
                 Ok(resp) => return Ok(resp),
                 Err(status) => {
-                    if let Some(delay) = put_chunk_retry_backoff(status.code(), attempt) {
+                    if let Some(delay) = put_chunk_retry_backoff(status.code(), status.message(), attempt) {
                         debug!(
                             chunk_id = %chunk_id,
                             node = %node_addr,
@@ -1398,6 +1411,9 @@ mod put_chunk_retry_tests {
     use super::*;
     use std::time::Duration;
 
+    /// The data node's memory-shed status message.
+    const SHED: &str = "data node over memory shed threshold (Bug G) - retry shortly";
+
     /// Bug G — RESOURCE_EXHAUSTED is the data node saying "memory budget
     /// shedding, retry later". Client MUST back off and retry, with
     /// exponential growth and a per-attempt cap.
@@ -1405,31 +1421,45 @@ mod put_chunk_retry_tests {
     fn bug_g_resource_exhausted_first_attempts_back_off_exponentially() {
         // attempt 0 → 250 ms
         assert_eq!(
-            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, 0),
+            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, SHED, 0),
             Some(Duration::from_millis(250))
         );
         // attempt 1 → 500 ms
         assert_eq!(
-            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, 1),
+            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, SHED, 1),
             Some(Duration::from_millis(500))
         );
         // attempt 2 → 1000 ms
         assert_eq!(
-            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, 2),
+            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, SHED, 2),
             Some(Duration::from_millis(1000))
         );
         // attempt 5 → 8000 ms (capped at PUT_CHUNK_MAX_BACKOFF_MS)
         assert_eq!(
-            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, 5),
+            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, SHED, 5),
             Some(Duration::from_millis(8000))
         );
+    }
+
+    /// #150: a target that refuses connections fails its put at once (no
+    /// 15.75 s backoff ladder), so the other targets' quorum is not held up.
+    #[tokio::test]
+    async fn put_to_a_refusing_target_fails_fast() {
+        let client = DtfsClient::new();
+        let started = std::time::Instant::now();
+        let err = client
+            .write_chunk_bytes("127.0.0.1:1", &"a".repeat(64), "default", "warm", bytes::Bytes::from_static(b"x"))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("attempts=1"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
     }
 
     /// After PUT_CHUNK_MAX_RETRIES attempts, give up.
     #[test]
     fn bug_g_resource_exhausted_eventually_gives_up() {
         assert_eq!(
-            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, PUT_CHUNK_MAX_RETRIES),
+            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, SHED, PUT_CHUNK_MAX_RETRIES),
             None,
             "after max retries the wrapper must surface the error to the caller"
         );
@@ -1438,7 +1468,21 @@ mod put_chunk_retry_tests {
     /// Unavailable (channel closed, server restarting) is also retryable.
     #[test]
     fn bug_g_unavailable_is_retryable() {
-        assert!(put_chunk_retry_backoff(tonic::Code::Unavailable, 0).is_some());
+        assert!(put_chunk_retry_backoff(tonic::Code::Unavailable, "transport error", 0).is_some());
+    }
+
+    /// #150: Unavailable gets two retries (0.75 s), not the shed ladder; a
+    /// failed connect, a full disk and no eligible disk are not retried.
+    #[test]
+    fn unavailable_ladder_is_short_and_reroutes_are_not_retried() {
+        let un = |a| put_chunk_retry_backoff(tonic::Code::Unavailable, "transport error", a);
+        assert_eq!(un(1), Some(Duration::from_millis(500)));
+        assert_eq!(un(PUT_CHUNK_UNAVAILABLE_MAX_RETRIES), None, "boundary: third retry");
+        assert_eq!(put_chunk_retry_backoff(tonic::Code::Unavailable, "connect: refused", 0), None);
+        for msg in ["put_chunk commit: disk full (ENOSPC)", "allocate tmp: no eligible disk: all failed"] {
+            assert_eq!(put_chunk_retry_backoff(tonic::Code::ResourceExhausted, msg, 0), None, "{msg}");
+        }
+        assert!(put_chunk_retry_backoff(tonic::Code::ResourceExhausted, SHED, PUT_CHUNK_MAX_RETRIES - 1).is_some());
     }
 
     /// Anything else (InvalidArgument, InternalError, …) must NOT retry —
@@ -1453,7 +1497,7 @@ mod put_chunk_retry_tests {
             tonic::Code::DataLoss,
         ] {
             assert!(
-                put_chunk_retry_backoff(code, 0).is_none(),
+                put_chunk_retry_backoff(code, "", 0).is_none(),
                 "code {:?} must not be auto-retried",
                 code
             );
