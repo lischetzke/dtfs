@@ -60,6 +60,11 @@ For each existing cache-tier placement:
    set). A replica on a Down node or Failed disk, or one already
    slated for demotion in the same plan, does not count. The apply
    path re-checks via `enforce_anchor` on `RemoveChunkLocation`.
+4. **Read history** — read windows live only in the leader's memory.
+   After an election or leader restart no idle demotion runs until this
+   leader has held the role for the largest `promote_window_secs`, and
+   none while the read-window store hit its key cap within that window
+   (evicted counts would read as 0). Promotions are not delayed.
 
 A surviving demotion triggers the full sequence:
 

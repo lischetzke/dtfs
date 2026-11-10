@@ -103,6 +103,11 @@ pub struct TieringEngine {
     /// per-harvest delta (AV-4-1c fix); `tick_av_cache` reads
     /// these for promotion decisions.
     read_windows: RwLock<HashMap<(String, String), Vec<ReadSample>>>,
+    /// #119 — when this manager last saw itself become leader (0 = not
+    /// leader). `read_windows` is leader-local, so a new leader's are empty.
+    leader_since_ms: std::sync::atomic::AtomicU64,
+    /// #119 — last time `read_windows` was at the key cap (0 = never).
+    read_window_evicted_ms: std::sync::atomic::AtomicU64,
 }
 
 impl TieringEngine {
@@ -120,6 +125,8 @@ impl TieringEngine {
             access_stats: RwLock::new(HashMap::new()),
             alerts: None,
             read_windows: RwLock::new(HashMap::new()),
+            leader_since_ms: std::sync::atomic::AtomicU64::new(0),
+            read_window_evicted_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -175,8 +182,14 @@ impl TieringEngine {
             // cache replica cluster-wide, deletes the bytes, and then fails
             // to record the removal.
             if !self.scheduler.is_leader() {
+                self.leader_since_ms.store(0, std::sync::atomic::Ordering::Relaxed);
                 debug!("REV-1-1: tiering evaluation skipped: not leader");
                 continue;
+            }
+            // #119 — first tick as leader starts the tenure (tick granularity,
+            // so the grace only lengthens).
+            if self.leader_since_ms.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                self.leader_since_ms.store(now_millis(), std::sync::atomic::Ordering::Relaxed);
             }
 
             if let Err(e) = self.evaluate().await {
@@ -258,6 +271,11 @@ impl TieringEngine {
         // "old" on every subsequent heartbeat). Regression-tested
         // by `bug_av_4_1c_heartbeat_treated_as_delta_not_cumulative`.
         let mut windows = self.read_windows.write().await;
+        // #119 — at the key cap the insert may evict rings, so read counts
+        // are incomplete for a window from now on.
+        if windows.len() >= MAX_READ_WINDOW_KEYS {
+            self.read_window_evicted_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        }
         apply_heartbeat_reads(chunk_id, &reads_by_dc, now_ms, &mut windows);
     }
 
@@ -621,6 +639,21 @@ impl TieringEngine {
         let grace_ms = promote_window_max
             .saturating_add(180)
             .saturating_mul(1_000);
+        if !plan.demotions.is_empty()
+            && !idle_demote_allowed(
+                now_ms,
+                self.leader_since_ms.load(std::sync::atomic::Ordering::Relaxed),
+                self.read_window_evicted_ms.load(std::sync::atomic::Ordering::Relaxed),
+                promote_window_max,
+            )
+        {
+            info!(
+                demotions = plan.demotions.len(),
+                window_secs = promote_window_max,
+                "idle demotions deferred: leader tenure or read-window history shorter than the promote window"
+            );
+            return Ok(());
+        }
         // Load the migration state ONCE per tick, not once per demotion.
         let active_pairs = self.scheduler.active_replication_pairs().await;
         let named = dtfs_raft::state_machine::cluster_understands_named_remove(
@@ -1239,6 +1272,17 @@ pub(crate) fn count_reads_in_window(
 /// unit-testable place. Regressions surface in
 /// `bug_av_4_1c_heartbeat_treated_as_delta_not_cumulative` and
 /// friends.
+/// #119 — idle demotion reads "0 reads in the window" from the leader-local
+/// `read_windows`. Trust that only once this leader has collected reads for
+/// the whole window (`leader_since_ms`, 0 = not leader) and no ring was
+/// evicted at the key cap within it (`evicted_ms`, 0 = never).
+pub(crate) fn idle_demote_allowed(now_ms: u64, leader_since_ms: u64, evicted_ms: u64, window_secs: u64) -> bool {
+    let window_ms = window_secs.saturating_mul(1_000);
+    leader_since_ms != 0
+        && now_ms.saturating_sub(leader_since_ms) >= window_ms
+        && (evicted_ms == 0 || now_ms.saturating_sub(evicted_ms) >= window_ms)
+}
+
 pub(crate) fn apply_heartbeat_reads(
     chunk_id: &str,
     reads_by_dc: &HashMap<String, u32>,
@@ -2733,6 +2777,19 @@ mod bug_av_tiering_tick_tests {
         assert_eq!(p.source_node_id, 10);
         // No demotions (no idle-warm placements yet).
         assert!(plan.demotions.is_empty());
+    }
+
+    /// #119 — a new leader's read windows are empty; idle demotion waits for
+    /// a full window of tenure and for a window without key-cap eviction.
+    #[test]
+    fn issue_119_idle_demote_needs_full_window_of_tenure() {
+        const W: u64 = 14_400; // 4 h
+        let now = 100_000_000;
+        assert!(!idle_demote_allowed(now, 0, 0, W), "not leader");
+        assert!(!idle_demote_allowed(now, now - W * 1_000 + 1, 0, W), "tenure 1 ms short");
+        assert!(idle_demote_allowed(now, now - W * 1_000, 0, W), "tenure == window");
+        assert!(!idle_demote_allowed(now, 1, now - 1_000, W), "evicted inside the window");
+        assert!(idle_demote_allowed(now, 1, now - W * 1_000, W), "eviction a full window ago");
     }
 
     /// AV-2-4 test 2 — an existing warm cache replica with 0 reads in
