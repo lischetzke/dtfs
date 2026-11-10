@@ -1709,6 +1709,32 @@ mod bug_av_anchor_lag_tests {
             "anchor already satisfied → no repair"
         );
     }
+
+    // #118 — anchor node Down: every chunk reports "no target" as a
+    // countable Err (the caller logs one summary), never an action.
+    #[test]
+    fn issue_118_anchor_down_is_counted_not_planned() {
+        let anchor = AnchorPolicy { datacenter: "leli".to_string(), required_tier: None };
+        let placements = vec![placement(2, "toro", DiskTier::Warm)];
+        let nodes = vec![
+            node(1, "leli", false, &[DiskTier::Cold]),
+            node(2, "toro", true, &[DiskTier::Warm]),
+        ];
+        let blocked = (0..50)
+            .filter(|i| {
+                plan_anchor_lag_repair_checked(&anchor, &placements, &nodes, &format!("h{i}"), &HashSet::new())
+                    == Err(DiskTier::Cold)
+            })
+            .count();
+        assert_eq!(blocked, 50);
+        // Anchor node healthy again: a real action, not an Err.
+        let nodes = vec![node(1, "leli", true, &[DiskTier::Cold])];
+        let act = plan_anchor_lag_repair_checked(&anchor, &placements, &nodes, "h0", &HashSet::new());
+        assert!(matches!(act, Ok(Some(ref a)) if a.target_node == 1), "{act:?}");
+        // Satisfied anchor is Ok(None), not counted as blocked.
+        let done = vec![placement(1, "leli", DiskTier::Cold)];
+        assert_eq!(plan_anchor_lag_repair_checked(&anchor, &done, &nodes, "h0", &HashSet::new()), Ok(None));
+    }
 }
 
 #[cfg(test)]

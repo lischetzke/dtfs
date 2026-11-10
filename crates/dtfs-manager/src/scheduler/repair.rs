@@ -565,9 +565,12 @@ impl TaskScheduler {
         // per un-anchored chunk with NO bound at all.
         let mut created: usize = 0;
         let mut live_tasks: usize = live_task_count(migration_state);
+        // #118 — chunks with no anchor-DC target, per (dc, tier); one
+        // summary warn after the walk instead of one warn per chunk.
+        let mut blocked: HashMap<(String, DiskTier), usize> = HashMap::new();
 
         // Walk every file (rotated start, see check_under_replicated).
-        for (file_path, file_meta) in rotated_from(&sm.files, now_millis()) {
+        'files: for (file_path, file_meta) in rotated_from(&sm.files, now_millis()) {
             let Some(volume) = sm.volumes.get(&file_meta.volume_id) else {
                 continue;
             };
@@ -611,13 +614,20 @@ impl TaskScheduler {
                     continue;
                 };
 
-                if let Some(action) = plan_anchor_lag_repair(
+                let planned = match plan_anchor_lag_repair_checked(
                     &anchor,
                     &placements,
                     &nodes,
                     &chunk_id,
                     &existing_tasks,
                 ) {
+                    Ok(p) => p,
+                    Err(tier) => {
+                        *blocked.entry((anchor.datacenter.clone(), tier)).or_default() += 1;
+                        None
+                    }
+                };
+                if let Some(action) = planned {
                     // CR-3-5/MGR-6 — same per-tick budget as
                     // `check_under_replicated`; the scan is idempotent so
                     // whatever's left resumes next tick.
@@ -630,7 +640,7 @@ impl TaskScheduler {
                             "CR-3-5/MGR-6: anchor-lag task budget reached for this tick; \
                              remaining deficits resume next tick"
                         );
-                        return;
+                        break 'files;
                     }
                     // Source picks a healthy existing replica (any
                     // tier); the dispatcher tolerates cross-tier
@@ -685,6 +695,15 @@ impl TaskScheduler {
                     live_tasks += 1;
                 }
             }
+        }
+        drop(sm);
+        for ((dc, tier), chunks) in blocked {
+            warn!(
+                chunks,
+                dc = %dc,
+                tier = ?tier,
+                "anchor-lag repair: no healthy anchor-DC node with room can take the anchor copy"
+            );
         }
     }
 }
@@ -935,13 +954,29 @@ pub(crate) fn plan_anchor_lag_repair(
     chunk_id: &str,
     existing_tasks: &std::collections::HashSet<(String, u64)>,
 ) -> Option<AnchorRepairAction> {
+    plan_anchor_lag_repair_checked(anchor, placements, nodes, chunk_id, existing_tasks)
+        .ok()
+        .flatten()
+}
+
+/// #118 — `Err(tier)` when the anchor is unmet and no healthy anchor-DC
+/// node with room on `tier` can take the copy, so `check_anchor_lag` can
+/// count those chunks and log ONE summary per tick instead of one warn
+/// per chunk (the anchor node Down makes every chunk hit this).
+pub(crate) fn plan_anchor_lag_repair_checked(
+    anchor: &dtfs_common::types::AnchorPolicy,
+    placements: &[AnchorRepairPlacement],
+    nodes: &[AnchorRepairNode],
+    chunk_id: &str,
+    existing_tasks: &std::collections::HashSet<(String, u64)>,
+) -> Result<Option<AnchorRepairAction>, DiskTier> {
     // Gate 1 — is the anchor already satisfied?
     let satisfied = crate::placement_state::anchor_met(
         anchor,
         placements.iter().map(|p| (p.dc.as_str(), p.tier)),
     );
     if satisfied {
-        return None;
+        return Ok(None);
     }
 
     // Gate 2 — pick a target tier. A required_tier is exact; otherwise
@@ -980,32 +1015,31 @@ pub(crate) fn plan_anchor_lag_repair(
         .filter(|n| !tier_holders.contains(&n.node_id))
         .min_by_key(|n| n.node_id) // deterministic by node_id
     else {
-        warn!(
+        debug!(
             chunk = %chunk_id,
             dc = %anchor.datacenter,
             tier = ?candidate_tier,
             "anchor-lag repair: no healthy anchor-DC node with room can take the anchor copy"
         );
-        return None;
+        return Err(candidate_tier);
     };
 
     // Gate 4 — already scheduled?
     if existing_tasks.contains(&(chunk_id.to_string(), target.node_id)) {
-        return None;
+        return Ok(None);
     }
 
     // Source = any existing replica (the dispatcher's
     // `ReplicateChunk` RPC handles cross-tier reads).
-    let source = placements
-        .iter()
-        .min_by_key(|p| p.node_id)
-        .map(|p| p.node_id)?;
+    let Some(source) = placements.iter().min_by_key(|p| p.node_id).map(|p| p.node_id) else {
+        return Ok(None);
+    };
 
-    Some(AnchorRepairAction {
+    Ok(Some(AnchorRepairAction {
         source_node: source,
         target_node: target.node_id,
         target_tier: candidate_tier,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
