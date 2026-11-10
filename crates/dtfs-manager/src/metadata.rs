@@ -401,6 +401,12 @@ fn check_create_volume(requested: Option<&str>, exists: bool) -> Result<(), Stat
     }
 }
 
+/// #115 — status a `ReportChunkStatus` may write, `None` for a sticky
+/// state (Maintenance/Draining/Quarantined) the report must not clear.
+fn chunk_report_status(current: HealthStatus, has_corrupt: bool) -> Option<&'static str> {
+    heartbeat_may_mark_healthy(current).then_some(if has_corrupt { "degraded" } else { "healthy" })
+}
+
 /// Skip the heartbeat `UpdateNodeStatus(healthy)` Raft write (one every 5 s
 /// per node) when the node is already Healthy: the apply is a no-op.
 fn heartbeat_should_write_healthy(current: HealthStatus) -> bool {
@@ -2227,11 +2233,23 @@ impl ManagerService for MetadataService {
         let corrupt_by_disk = group_corrupt_by_disk(&req.chunks);
         let corrupt_ids: Vec<&String> = corrupt_by_disk.values().flatten().collect();
 
-        let status = if !corrupt_ids.is_empty() {
-            "degraded"
-        } else {
-            "healthy"
-        };
+        // #115 — read the current state like the heartbeat path does; an
+        // unregistered node defaults to Healthy (the write then refuses).
+        let current_health = self
+            .sm_data
+            .read()
+            .await
+            .nodes
+            .get(&node_id_u64)
+            .map_or(HealthStatus::Healthy, |n| n.health);
+        let status = chunk_report_status(current_health, !corrupt_ids.is_empty());
+        if status.is_none() {
+            tracing::info!(
+                node_id = node_id_u64,
+                health = ?current_health,
+                "chunk report leaves sticky node state unchanged"
+            );
+        }
         // CO-3-7 — route through `raft_write_or_forward` (not the
         // ForwardToLeader-dropping `raft_write`). A corrupt/missing report
         // can land on ANY manager; a data node heartbeats one arbitrary
@@ -2242,7 +2260,8 @@ impl ManagerService for MetadataService {
         // stayed advertised as healthy. We now forward to the leader and
         // surface failure as `accepted: false` so the data node retries.
         let mut accepted = true;
-        if let Err(e) = self
+        if let Some(status) = status
+            && let Err(e) = self
             .raft_write_or_forward(ClientRequest::UpdateNodeStatus { now_ms: stamp_now_ms(),
                 node_id: node_id_u64,
                 status: status.to_string(),

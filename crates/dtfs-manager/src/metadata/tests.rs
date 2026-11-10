@@ -35,6 +35,20 @@ mod chunk_status_disk_grouping_tests {
         assert_eq!(g.len(), 3);
         assert!(group_corrupt_by_disk(&[cs("e", "healthy", None)]).is_empty());
     }
+
+    // #115 — a chunk report must not overwrite a sticky operator state.
+    #[test]
+    fn issue_115_chunk_report_keeps_sticky_states() {
+        use super::chunk_report_status;
+        use dtfs_common::types::HealthStatus as H;
+        for h in [H::Maintenance, H::Draining, H::Quarantined] {
+            assert_eq!(chunk_report_status(h, true), None, "{h:?} corrupt");
+            assert_eq!(chunk_report_status(h, false), None, "{h:?} clean");
+        }
+        assert_eq!(chunk_report_status(H::Healthy, true), Some("degraded"));
+        assert_eq!(chunk_report_status(H::Degraded, false), Some("healthy"));
+        assert_eq!(chunk_report_status(H::Suspect, true), Some("degraded"));
+    }
 }
 
 #[cfg(test)]
