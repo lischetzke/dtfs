@@ -34,6 +34,8 @@ text there.
    to commit time (the `if_mtime_le_ms` delete guard reads it).
    Put and delete of the same id serialize on the 256-way striped chunk
    lock; WAL names are op-keyed (`.put.wal.json` / `.delete.wal.json`).
+   The PutChunk commit and the DeleteChunk unlink run in a spawned task
+   (`server::detached`): a cancelled RPC cannot stop them midway.
 
 ## Replica lifecycle
 

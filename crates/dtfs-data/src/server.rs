@@ -72,6 +72,17 @@ async fn next_put_piece(
     }
 }
 
+/// Run a store commit or delete in its own task so a dropped request
+/// future (client cancel) cannot stop it between the `.dat` and `.meta`
+/// renames/unlinks; the chunk stripe lock is taken and released inside.
+async fn detached<T: Send + 'static>(
+    fut: impl std::future::Future<Output = dtfs_common::error::DtfsResult<T>> + Send + 'static,
+) -> dtfs_common::error::DtfsResult<T> {
+    tokio::spawn(fut)
+        .await
+        .unwrap_or_else(|e| Err(DtfsError::Internal(format!("store task failed: {e}"))))
+}
+
 /// Bug BU/BU-3 — map a put_chunk I/O error to a typed gRPC status. A
 /// no-space error (ENOSPC, errno 28) becomes `RESOURCE_EXHAUSTED` so the
 /// client can distinguish "disk full, reroute" from a real internal
@@ -578,22 +589,25 @@ impl DataService for DataServiceImpl {
             ));
         }
 
-        let (meta, disk_id) = self
-            .store
-            .commit_chunk_from_tmp(&chunk_id, &tmp_path, &vol_id, tier, total_size, hash)
-            .await
+        // commit_chunk_from_tmp removes the tmp itself on error; the guard
+        // must not unlink it under the detached commit if this future drops.
+        tmp_guard.disarm();
+        let store = self.store.clone();
+        let commit_id = chunk_id.clone();
+        let (meta, disk_id) = detached(async move {
+            store
+                .commit_chunk_from_tmp(&commit_id, &tmp_path, &vol_id, tier, total_size, hash)
+                .await
+        })
+        .await
             // CO-5-3 — a commit-time I/O failure (e.g. ENOSPC on the
             // final rename/fsync) must surface through put_io_status so
             // a disk-full error maps to RESOURCE_EXHAUSTED and the client
-            // backs off, not a generic Internal. The tmp_guard Drop still
-            // reclaims the tmp on this error path (disarm runs only on the
-            // success branch below).
+            // backs off, not a generic Internal.
             .map_err(|e| match e {
                 DtfsError::Io(io) => io_status("commit chunk", io),
                 other => Status::internal(other.to_string()),
             })?;
-        // Commit renamed the tmp to its final path; nothing to clean up.
-        tmp_guard.disarm();
 
         // Bug AL — record the write so the manager-side I/O Throughput
         // card can compute bytes/sec. Pre-fix `record_write` was
@@ -830,11 +844,15 @@ impl DataService for DataServiceImpl {
         // unlinks ONLY that disk's copy (protects a co-located anchor on
         // another disk); ABSENT (old manager, or a path with no disk
         // context) falls back to the legacy first-found-across-all-disks.
-        let (was_present, freed_bytes) = self
-            .store
-            .delete_chunk_idempotent_guarded(&chunk_id, req.disk_id, req.if_mtime_le_ms)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let store = self.store.clone();
+        let (disk_id, if_mtime_le_ms) = (req.disk_id, req.if_mtime_le_ms);
+        let (was_present, freed_bytes) = detached(async move {
+            store
+                .delete_chunk_idempotent_guarded(&chunk_id, disk_id, if_mtime_le_ms)
+                .await
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         // Bug AL — keep the read-counter machinery consistent; a
         // deleted chunk is no longer eligible for serving so its
@@ -2023,6 +2041,61 @@ max_io_percent = 10
         let real_id = ChunkId::from_bytes(checksum::compute(b"slow-but-alive"));
         assert_eq!(result.expect("slow put commits").chunk_id, real_id.as_hex());
         assert!(store.has_chunk(&real_id).await);
+    }
+
+    /// Start a detached commit of `data`, poll it once, then drop the
+    /// future the way tonic drops a cancelled request.
+    async fn commit_then_drop(store: &Arc<ChunkStore>, data: &'static [u8]) -> ChunkId {
+        let (tmp_path, _) = store.allocate_streaming_tmp(DiskTier::Hot).unwrap();
+        std::fs::write(&tmp_path, data).unwrap();
+        let hash = checksum::compute(data);
+        let id = ChunkId::from_bytes(hash);
+        let (s, cid) = (store.clone(), id.clone());
+        let fut = detached(async move {
+            s.commit_chunk_from_tmp(&cid, &tmp_path, &VolumeId::new("default".into()), DiskTier::Hot, data.len() as u64, hash)
+                .await
+        });
+        assert!(tokio::time::timeout(std::time::Duration::ZERO, fut).await.is_err(), "commit pending at drop");
+        id
+    }
+
+    /// A put whose request future is dropped mid-commit still ends with a
+    /// complete chunk (.dat AND .meta), not a .dat without its .meta.
+    #[tokio::test]
+    async fn commit_finishes_when_request_future_dropped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_service(tmp.path(), true).await.store.clone();
+        let id = commit_then_drop(&store, b"cancelled-mid-commit").await;
+        let mut done = false;
+        for _ in 0..200 {
+            if store.get_chunk_meta(&id).await.is_ok() {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(done, "dropped commit must still write the .meta");
+        assert!(store.has_chunk(&id).await);
+    }
+
+    /// The detached path still surfaces a commit failure: a vanished tmp
+    /// is Io(NotFound) and commits nothing.
+    #[tokio::test]
+    async fn detached_commit_of_missing_tmp_is_io_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_service(tmp.path(), true).await.store.clone();
+        let (tmp_path, _) = store.allocate_streaming_tmp(DiskTier::Hot).unwrap();
+        let hash = checksum::compute(b"never-written");
+        let id = ChunkId::from_bytes(hash);
+        let (s, cid) = (store.clone(), id.clone());
+        let err = detached(async move {
+            s.commit_chunk_from_tmp(&cid, &tmp_path, &VolumeId::new("default".into()), DiskTier::Hot, 13, hash)
+                .await
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DtfsError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound), "{err:?}");
+        assert!(!store.has_chunk(&id).await);
     }
 }
 
