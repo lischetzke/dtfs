@@ -4442,7 +4442,6 @@ fn system_time_from_epoch_secs(secs: i64) -> SystemTime {
 /// per stat'ed path (one entry per 4 MiB chunk) pinned megabytes per entry.
 fn without_chunks(l: &FileLocations) -> FileLocations {
     FileLocations {
-        path: l.path.clone(),
         total_size: l.total_size,
         chunks: Vec::new(),
         volume_id: l.volume_id.clone(),
