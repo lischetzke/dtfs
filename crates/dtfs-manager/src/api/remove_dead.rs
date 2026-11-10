@@ -255,7 +255,12 @@ async fn execute_remove_dead(
 ) -> Value {
     let nid_str = nid.to_string();
     let (mut removed, mut loss_removed, mut failed) = (0usize, 0usize, 0usize);
+    let mut aborted = false;
     for r in &plan.removable {
+        if check_is_leader(state).is_err() {
+            aborted = true;
+            break;
+        }
         let req = ClientRequest::RemoveChunkLocation {
             path: r.path.clone(),
             chunk_index: r.chunk_index,
@@ -273,8 +278,12 @@ async fn execute_remove_dead(
             }
         }
     }
-    if accept_data_loss {
+    if accept_data_loss && !aborted {
         for r in &plan.data_loss {
+        if check_is_leader(state).is_err() {
+            aborted = true;
+            break;
+        }
             let req = ClientRequest::RemoveDeadNodeReplica {
                 path: r.path.clone(),
                 chunk_index: r.chunk_index,
@@ -298,6 +307,10 @@ async fn execute_remove_dead(
             plan_remove_dead(&sm, nid, crate::metadata::stamp_now_ms(), down_ms).map(|p| p.data_loss)
         };
         for r in rest.unwrap_or_default().iter().filter(|r| r.path.starts_with("/.dtfs-lost/")) {
+        if check_is_leader(state).is_err() {
+            aborted = true;
+            break;
+        }
             let req = ClientRequest::RemoveDeadNodeReplica {
                 path: r.path.clone(),
                 chunk_index: r.chunk_index,
@@ -316,12 +329,16 @@ async fn execute_remove_dead(
         }
     }
 
+    if aborted {
+        warn!(node = nid, by = %op, removed, loss_removed, "remove-dead: leadership lost, run aborted");
+        out["aborted"] = json!("leader lost");
+    }
     let remaining = {
         let sm = state.sm_data.read().await;
         sm.files.values().flat_map(|f| f.chunks.iter()).filter(|c| c.node_id == nid_str).count()
     };
     let mut deregistered = false;
-    if remaining == 0 {
+    if remaining == 0 && !aborted {
         match propose(&state, ClientRequest::DeregisterNode { node_id: nid, now_ms: crate::metadata::stamp_now_ms() })
             .await
         {
@@ -350,6 +367,18 @@ async fn execute_remove_dead(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn execute_aborts_once_when_not_leader() {
+        let h = super::super::test_support::harness().await;
+        let row = |i| DeadRow { path: format!("/f{i}"), chunk_index: 0, disk_id: 0, chunk_hash: None, anchor: None };
+        let plan = RemoveDeadPlan { removable: (0..5).map(row).collect(), ..Default::default() };
+        let out = execute_remove_dead(&h.state, 9, &plan, false, 0, "op", "r", json!({})).await;
+        assert_eq!(out["aborted"], json!("leader lost"));
+        assert_eq!(out["failed"], json!(0));
+        assert_eq!(out["removed"], json!(0));
+        assert_eq!(out["deregistered"], json!(false));
+    }
     use dtfs_common::types::{DiskInfo, DiskTier, VolumeConfig};
 
     fn node(dc: &str, health: HealthStatus, last_seen_ms: u64) -> RaftNodeInfo {
