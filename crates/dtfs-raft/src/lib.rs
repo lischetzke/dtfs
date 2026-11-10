@@ -374,6 +374,10 @@ impl fmt::Display for NodeInfo {
 /// is always CAS-checked.
 pub const UPDATE_CONFIG_NO_CAS: u64 = u64::MAX;
 
+/// Marker of the `UpdateNodeStatus { keep_sticky: true }` refusal on a
+/// Maintenance/Draining/Quarantined node (#115).
+pub const STICKY_REFUSAL: &str = "is in a sticky operator state";
+
 /// Marker of the `UpdateNodeStatus` refusal on a quarantined node. Managers
 /// match it to treat that refusal as "quarantine wins", not a fault.
 pub const QUARANTINED_REFUSAL: &str = "is quarantined";
@@ -483,6 +487,11 @@ pub enum ClientRequest {
         /// legacy entry, apply falls back to `log_id.index`.
         #[serde(default)]
         now_ms: u64,
+        /// #115 - a status derived from a possibly stale health read (chunk
+        /// report): apply refuses it over Maintenance/Draining/Quarantined,
+        /// only while `cluster_on_v0_1_15` (older appliers ignore it).
+        #[serde(default)]
+        keep_sticky: bool,
     },
 
     /// Bug BC-10 — quarantine a node after an integrity fault.

@@ -159,7 +159,7 @@ fn all_requests() -> Vec<ClientRequest> {
         RemoveCorruptChunkReplicas { node_id: s("7"), chunk_hashes: vec![s("ab")], disk_id: 1, now_ms: 5 },
         RegisterNode { node_id: 7, info: node_info(), now_ms: 5 },
         DeregisterNode { node_id: 7, now_ms: 5 },
-        UpdateNodeStatus { node_id: 7, status: s("down"), now_ms: 5 },
+        UpdateNodeStatus { node_id: 7, status: s("down"), now_ms: 5, keep_sticky: false },
         QuarantineNode { node_id: 7, info: quarantine(), now_ms: 5 },
         UnquarantineNode { node_id: 7, operator_id: s("op"), reason_acknowledged: s("fixed"), now_ms: 5 },
         UpdateNodeUsage {
@@ -277,6 +277,18 @@ fn update_chunk_locations_v1_defaults_extent_from_request_false() {
     let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V1).unwrap();
     let flag = reqs.iter().find_map(|r| match r {
         ClientRequest::UpdateChunkLocations { extent_from_request, .. } => Some(*extent_from_request),
+        _ => None,
+    });
+    assert_eq!(flag, Some(false));
+}
+
+/// #115 - a v1 `UpdateNodeStatus` (no `keep_sticky`) keeps the legacy
+/// unconditional apply.
+#[test]
+fn update_node_status_v1_defaults_keep_sticky_false() {
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V1).unwrap();
+    let flag = reqs.iter().find_map(|r| match r {
+        ClientRequest::UpdateNodeStatus { keep_sticky, .. } => Some(*keep_sticky),
         _ => None,
     });
     assert_eq!(flag, Some(false));

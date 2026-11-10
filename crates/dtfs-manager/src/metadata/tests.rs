@@ -136,7 +136,7 @@ mod mgr_11_forward_allow_list_tests {
 
     #[test]
     fn update_node_status_is_forwardable() {
-        assert!(forwardable(&ClientRequest::UpdateNodeStatus { now_ms: 0,
+        assert!(forwardable(&ClientRequest::UpdateNodeStatus { now_ms: 0, keep_sticky: false,
             node_id: 1,
             status: "Healthy".into(),
         }));

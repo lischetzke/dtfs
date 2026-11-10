@@ -2460,12 +2460,12 @@ mod posix_path_regression {
         apply_request(&mut sm, &mk_log_id(2), &ClientRequest::QuarantineNode { now_ms: 0,
             node_id: 7, info: mk_quarantine_info(QuarantineReason::DeepScrubHashMismatch) });
         let r = apply_request(&mut sm, &mk_log_id(3),
-            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "maintenance".into() });
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, keep_sticky: false, node_id: 7, status: "maintenance".into() });
         assert!(matches!(&r, ClientResponse::Error { message } if *message == crate::quarantined_refusal(7)), "{r:?}");
         assert!(crate::quarantined_refusal(7).contains(crate::QUARANTINED_REFUSAL));
         assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Quarantined);
         let r = apply_request(&mut sm, &mk_log_id(4),
-            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "down".into() });
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, keep_sticky: false, node_id: 7, status: "down".into() });
         assert!(matches!(r, ClientResponse::Success), "{r:?}");
         assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Down);
     }
@@ -2482,7 +2482,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "maintenance".into() },
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, keep_sticky: false, node_id: 7, status: "maintenance".into() },
         );
         assert_eq!(sm.nodes.get(&7).unwrap().health, HealthStatus::Maintenance);
         apply_request(
@@ -2998,9 +2998,9 @@ mod posix_path_regression {
         // mk_quarantinable_node() is Healthy; applying "healthy" twice is a
         // no-op transition each time.
         apply_request(&mut sm, &mk_log_id(2),
-            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "healthy".into() });
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, keep_sticky: false, node_id: 7, status: "healthy".into() });
         apply_request(&mut sm, &mk_log_id(3),
-            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "healthy".into() });
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, keep_sticky: false, node_id: 7, status: "healthy".into() });
         assert_eq!(count_audit_prefix(&sm, "UpdateNodeStatus:"), 0,
             "Healthy -> Healthy must not audit");
     }
@@ -3011,9 +3011,9 @@ mod posix_path_regression {
         apply_request(&mut sm, &mk_log_id(1),
             &ClientRequest::RegisterNode { now_ms: 0, node_id: 7, info: mk_quarantinable_node() });
         apply_request(&mut sm, &mk_log_id(2),
-            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "suspect".into() });
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, keep_sticky: false, node_id: 7, status: "suspect".into() });
         apply_request(&mut sm, &mk_log_id(3),
-            &ClientRequest::UpdateNodeStatus { now_ms: 0, node_id: 7, status: "healthy".into() });
+            &ClientRequest::UpdateNodeStatus { now_ms: 0, keep_sticky: false, node_id: 7, status: "healthy".into() });
         assert_eq!(count_audit_prefix(&sm, "UpdateNodeStatus:"), 2,
             "Healthy->Suspect then Suspect->Healthy = two transitions = two rows");
     }
@@ -4609,6 +4609,66 @@ mod issue_121_truncate_extent_tests {
         let mut sm = truncated_then_rewrite_chunk0(true);
         commit(&mut sm, 6, vec![row(2, "b2")], true);
         assert_eq!(sm.files["/f"].logical_size, Some(12 * MIB));
+    }
+}
+
+/// #115 - a chunk-report status (`keep_sticky`) never overwrites an
+/// operator-sticky state once every manager is on v0.1.15.
+#[cfg(test)]
+mod issue_115_sticky_status_tests {
+    use super::*;
+    use super::named_remove_gate_tests::sm_with;
+    use dtfs_common::types::{HealthStatus, NodeRole};
+
+    fn lid(idx: u64) -> LogId {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        openraft::LogId::new(leader, idx)
+    }
+
+    /// Managers 1-3 on `versions`, data node 10 in `health`.
+    fn setup(versions: [&str; 3], health: HealthStatus) -> StateMachineData {
+        let mut sm = sm_with(versions);
+        let mut n = sm.nodes[&1].clone();
+        n.role = NodeRole::Data;
+        n.health = health;
+        sm.nodes.insert(10, n);
+        sm
+    }
+
+    fn status(sm: &mut StateMachineData, status: &str, keep_sticky: bool) -> ClientResponse {
+        apply_request(sm, &lid(1), &ClientRequest::UpdateNodeStatus {
+            node_id: 10, status: status.into(), now_ms: 5, keep_sticky,
+        })
+    }
+
+    #[test]
+    fn issue_115_report_status_refused_over_sticky_states_once_gated() {
+        for h in [HealthStatus::Maintenance, HealthStatus::Draining, HealthStatus::Quarantined] {
+            let mut sm = setup(["v0.1.15"; 3], h);
+            let r = status(&mut sm, "degraded", true);
+            assert!(matches!(&r, ClientResponse::Error { message } if message.contains(crate::STICKY_REFUSAL)), "{h:?}: {r:?}");
+            assert_eq!(sm.nodes[&10].health, h);
+        }
+    }
+
+    #[test]
+    fn issue_115_report_status_applies_over_liveness_states() {
+        let mut sm = setup(["v0.1.15"; 3], HealthStatus::Down);
+        assert_eq!(status(&mut sm, "healthy", true), ClientResponse::Success);
+        assert_eq!(sm.nodes[&10].health, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn issue_115_operator_and_ungated_writes_keep_legacy_apply() {
+        // The operator's maintenance exit carries keep_sticky=false.
+        let mut sm = setup(["v0.1.15"; 3], HealthStatus::Maintenance);
+        assert_eq!(status(&mut sm, "healthy", false), ClientResponse::Success);
+        assert_eq!(sm.nodes[&10].health, HealthStatus::Healthy);
+        // Boundary: one manager below v0.1.15, legacy unconditional apply.
+        let mut sm = setup(["v0.1.15", "v0.1.14", "v0.1.15"], HealthStatus::Maintenance);
+        assert_eq!(status(&mut sm, "degraded", true), ClientResponse::Success);
+        assert_eq!(sm.nodes[&10].health, HealthStatus::Degraded);
     }
 }
 

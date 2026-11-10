@@ -2047,7 +2047,7 @@ impl ManagerService for MetadataService {
             // MGR-HB-1 — same contract as the UpdateNodeUsage write above:
             // a dropped `healthy` commit leaves a recovered node Down.
             liveness_write_status(
-                self.raft_write_or_forward(ClientRequest::UpdateNodeStatus { now_ms: stamp_now_ms(),
+                self.raft_write_or_forward(ClientRequest::UpdateNodeStatus { now_ms: stamp_now_ms(), keep_sticky: false,
                     node_id,
                     status: "healthy".to_string(),
                 })
@@ -2350,6 +2350,9 @@ impl ManagerService for MetadataService {
         if let Some(status) = status
             && let Err(e) = self
             .raft_write_or_forward(ClientRequest::UpdateNodeStatus { now_ms: stamp_now_ms(),
+                // #115 - `current_health` may be a lagging follower's view:
+                // apply re-checks the sticky states.
+                keep_sticky: true,
                 node_id: node_id_u64,
                 status: status.to_string(),
             })
@@ -2357,7 +2360,15 @@ impl ManagerService for MetadataService {
             .pipe_committed_ok()
             // Audit #7 — quarantine is stickier than degraded/healthy; a
             // refusal for it must not make the data node retry the report.
-            .or_else(|e| if e.contains(dtfs_raft::QUARANTINED_REFUSAL) { Ok(()) } else { Err(e) })
+            // #115 - same for Maintenance/Draining set after our health read.
+            .or_else(|e| {
+                if e.contains(dtfs_raft::QUARANTINED_REFUSAL) || e.contains(dtfs_raft::STICKY_REFUSAL) {
+                    tracing::info!(node_id = node_id_u64, error = %e, "chunk report status refused by apply: sticky node state wins");
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
         {
             tracing::warn!(error = %e, "CO-3-7 failed to commit node-status from chunk report");
             accepted = false;

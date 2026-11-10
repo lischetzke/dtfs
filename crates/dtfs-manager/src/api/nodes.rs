@@ -415,7 +415,7 @@ pub(super) async fn set_maintenance(
         "healthy"
     };
 
-    let req = ClientRequest::UpdateNodeStatus { now_ms: crate::metadata::stamp_now_ms(),
+    let req = ClientRequest::UpdateNodeStatus { now_ms: crate::metadata::stamp_now_ms(), keep_sticky: false,
         node_id: nid,
         status: status_str.to_string(),
     };

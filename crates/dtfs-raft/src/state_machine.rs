@@ -1592,9 +1592,20 @@ pub(crate) fn apply_request(
             }
         }
 
-        ClientRequest::UpdateNodeStatus { node_id, status, .. } => {
+        ClientRequest::UpdateNodeStatus { node_id, status, keep_sticky, .. } => {
             use dtfs_common::types::HealthStatus;
+            // #115 - the proposer's health read may be stale; re-check here
+            // (gated so mixed-version appliers agree).
+            let gated = *keep_sticky && cluster_on_v0_1_15(sm);
             if let Some(node) = sm.nodes.get_mut(node_id) {
+                if gated
+                    && matches!(node.health, HealthStatus::Maintenance | HealthStatus::Draining | HealthStatus::Quarantined)
+                {
+                    debug!(node_id, attempted = %status, health = ?node.health, "#115: refusing chunk-report status over sticky state");
+                    return ClientResponse::Error {
+                        message: format!("UpdateNodeStatus: node {node_id} {} ({:?})", crate::STICKY_REFUSAL, node.health),
+                    };
+                }
                 // Bug BF-6 — refuse to overwrite Quarantined via the
                 // generic UpdateNodeStatus path. Only UnquarantineNode
                 // (which also clears the quarantine record) can flip a

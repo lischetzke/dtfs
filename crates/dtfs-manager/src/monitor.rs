@@ -415,7 +415,7 @@ impl HealthMonitor {
         status: &str,
         membership_nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
     ) {
-        let req = ClientRequest::UpdateNodeStatus { now_ms: crate::metadata::stamp_now_ms(),
+        let req = ClientRequest::UpdateNodeStatus { now_ms: crate::metadata::stamp_now_ms(), keep_sticky: false,
             node_id,
             status: status.to_string(),
         };
