@@ -381,15 +381,34 @@ fn eligible_file(sm: &StateMachineData, path: &str, fm: &FileMetadata, now_ms: u
         && !sm.write_leases.get(path).is_some_and(|l| l.expires_at_ms > now_ms)
 }
 
-/// Entries under `prefix` (ends with '/'), bounded.
-fn scan<'a, 'p>(
+/// Entries under `prefix` (ends with '/'), bounded. `children_only` jumps over
+/// each child directory's subtree so the cap counts direct children.
+fn scan<'a>(
     sm: &'a StateMachineData,
-    prefix: &'p str,
-) -> impl Iterator<Item = (&'a String, &'a FileMetadata)> + use<'a, 'p> {
-    sm.files
-        .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
-        .take_while(move |(k, _)| k.starts_with(prefix))
-        .take(MAX_DIR_ENTRIES)
+    prefix: &str,
+    children_only: bool,
+) -> Vec<(&'a String, &'a FileMetadata)> {
+    let mut out = Vec::new();
+    let mut from = prefix.to_string();
+    while out.len() < MAX_DIR_ENTRIES {
+        let Some((k, fm)) = sm
+            .files
+            .range::<str, _>((Bound::Included(from.as_str()), Bound::Unbounded))
+            .next()
+            .filter(|(k, _)| k.starts_with(prefix))
+        else {
+            break;
+        };
+        let rel = &k[prefix.len()..];
+        if let (true, Some((child, _))) = (children_only, rel.split_once('/')) {
+            // '0' is the byte after '/': first key past "prefix/child/..."
+            from = format!("{prefix}{child}0");
+            continue;
+        }
+        out.push((k, fm));
+        from = format!("{k}\0");
+    }
+    out
 }
 
 /// Eligible files in playback order that come after `cursor`.
@@ -399,13 +418,16 @@ fn following<'a>(
     series_root: Option<&str>,
     dir: &str,
     cursor: &str,
+    vid: &str,
 ) -> Vec<(&'a String, &'a FileMetadata)> {
     let base = series_root.unwrap_or(dir);
     let prefix = format!("{base}/");
     let Some(crel) = cursor.strip_prefix(prefix.as_str()) else {
         return Vec::new();
     };
-    let mut v: Vec<(&str, &String, &FileMetadata)> = scan(sm, &prefix)
+    let mut v: Vec<(&str, &String, &FileMetadata)> = scan(sm, &prefix, series_root.is_none())
+        .into_iter()
+        .filter(|(_, fm)| fm.volume_id == vid)
         .filter_map(|(p, fm)| Some((p.strip_prefix(prefix.as_str())?, p, fm)))
         .filter(|(rel, p, fm)| {
             let in_scope = if series_root.is_some() {
@@ -430,30 +452,31 @@ fn following<'a>(
         .collect()
 }
 
-/// Free bytes pre-caching may use on one node's tier: serviceable disks minus
-/// headroom, minus the reserve share of the tier total.
-fn node_room(info: &dtfs_raft::NodeInfo, tier: DiskTier, cfg: &PlacementConfig) -> u64 {
-    let (mut avail, mut total) = (0u64, 0u64);
-    for d in info
-        .disks
-        .iter()
-        .filter(|d| d.tier == tier && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed))
-    {
+/// Room pre-caching may use on one node's tier: (pooled free bytes minus the
+/// reserve share of the tier total, free bytes of the largest single disk).
+/// Both over serviceable, non-draining disks, minus headroom.
+fn node_room(info: &dtfs_raft::NodeInfo, tier: DiskTier, cfg: &PlacementConfig) -> (u64, u64) {
+    let (mut avail, mut total, mut biggest) = (0u64, 0u64, 0u64);
+    for d in info.disks.iter().filter(|d| {
+        d.tier == tier
+            && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed | DiskStatus::Draining)
+    }) {
         total = total.saturating_add(d.total_bytes);
-        avail = avail.saturating_add(
-            d.total_bytes
-                .saturating_sub(d.used_bytes)
-                .saturating_sub(cfg.headroom_bytes(d.total_bytes)),
-        );
+        let free = d
+            .total_bytes
+            .saturating_sub(d.used_bytes)
+            .saturating_sub(cfg.headroom_bytes(d.total_bytes));
+        avail = avail.saturating_add(free);
+        biggest = biggest.max(free);
     }
-    avail.saturating_sub(total.saturating_mul(PRECACHE_RESERVE_PCT) / 100)
+    (avail.saturating_sub(total.saturating_mul(PRECACHE_RESERVE_PCT) / 100), biggest)
 }
 
 struct Ctx<'a> {
     sm: &'a StateMachineData,
     now_ms: u64,
     placement: &'a PlacementConfig,
-    room: HashMap<(u64, DiskTier), u64>,
+    room: HashMap<(u64, DiskTier), (u64, u64)>,
     seen: HashSet<(String, String)>,
     stopped: HashSet<String>,
     copies: Vec<PrecacheCopy>,
@@ -464,9 +487,10 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     fn room(&mut self, nid: u64, tier: DiskTier) -> u64 {
         let (sm, cfg) = (self.sm, self.placement);
-        *self.room.entry((nid, tier)).or_insert_with(|| {
-            sm.nodes.get(&nid).map_or(0, |n| node_room(n, tier, cfg))
-        })
+        let (pooled, biggest) = *self.room.entry((nid, tier)).or_insert_with(|| {
+            sm.nodes.get(&nid).map_or((0, 0), |n| node_room(n, tier, cfg))
+        });
+        pooled.min(biggest)
     }
 }
 
@@ -545,6 +569,14 @@ fn plan_file(
                 live.push((nid, info.location.datacenter.clone(), tier));
             }
         }
+        if live.is_empty() {
+            continue;
+        }
+        // Anchor-pending (no live replica in the anchor DC): the anchor-lag copy comes first.
+        let dcs: Vec<String> = live.iter().map(|(_, d, _)| d.clone()).collect();
+        if anchor_violated_after_copy(&dcs, &anchor_dc, None, None, true) {
+            continue;
+        }
         // Already cached in this DC: protect it, plan nothing.
         let cached: Vec<u64> = live
             .iter()
@@ -557,14 +589,6 @@ fn plan_file(
             for n in cached {
                 ctx.protected.insert((chunk_id.clone(), n));
             }
-            continue;
-        }
-        if live.is_empty() {
-            continue;
-        }
-        // Anchor-pending (no live replica in the anchor DC): the anchor-lag copy comes first.
-        let dcs: Vec<String> = live.iter().map(|(_, d, _)| d.clone()).collect();
-        if anchor_violated_after_copy(&dcs, &anchor_dc, None, None, true) {
             continue;
         }
         if fm.cache_cooldown_until_ms.get(&idx).copied().unwrap_or(0) > ctx.now_ms {
@@ -583,6 +607,10 @@ fn plan_file(
                     continue;
                 }
                 let mut v = node_selection_view(*nid, info, tier, ctx.placement);
+                // Same rule as `survivor_replica_tier`: such a copy would not count as cached.
+                if info.quarantine.is_some() || info.health == dtfs_common::types::HealthStatus::Maintenance {
+                    v.draining = true;
+                }
                 v.already_holds_chunk = holders.contains(nid);
                 views.push(v);
             }
@@ -609,7 +637,9 @@ fn plan_file(
             continue;
         };
         let left = ctx.room.get_mut(&(target, tier)).expect("room initialised");
-        *left -= bytes;
+        // shortcut: the copy is charged to the largest disk, the real pick may differ.
+        left.0 -= bytes;
+        left.1 -= bytes;
         let source = live
             .iter()
             .min_by_key(|(n, _, t)| (tier_rank(*t), *n))
@@ -811,7 +841,7 @@ pub(crate) fn plan_precache(
             (pol.next_files, u64::from(pol.next_max_gb) * GIB)
         };
         let dir = g.dir.clone().unwrap_or_default();
-        let next = following(sm, now_ms, g.root.as_deref(), &dir, &g.cursor);
+        let next = following(sm, now_ms, g.root.as_deref(), &dir, &g.cursor, &g.vid);
         let sizes: Vec<u64> = next.iter().map(|(_, f)| f.reported_size()).collect();
         let takes = select_following(&sizes, max_files, max_bytes);
         let mut st = GroupStatus {
@@ -1488,6 +1518,92 @@ mod planner_tests {
         assert_eq!(a.copies, b.copies);
     }
 
+    fn qinfo() -> dtfs_common::types::QuarantineInfo {
+        dtfs_common::types::QuarantineInfo {
+            since_ms: 1,
+            reason: dtfs_common::types::QuarantineReason::OperatorRequested,
+            triggering_chunk_id: None,
+            fault_count_total: 1,
+            last_fault_at_ms: 1,
+            last_fault_summary: String::new(),
+        }
+    }
+
+    #[test]
+    fn next_files_ignore_other_volumes() {
+        let mut w = world();
+        w.vol().precache.mode = PrecacheMode::Files;
+        w.vol().precache.next_files = 1;
+        for n in ["A", "B", "C"] {
+            w.file(&format!("/m/{n}.mkv"), 75, &[1]);
+        }
+        let mut other = w.sm.volumes["v"].clone();
+        other.mandatory_replicas.warm = 1;
+        w.sm.volumes.insert("w".into(), other);
+        w.sm.files.get_mut("/m/B.mkv").unwrap().volume_id = "w".into();
+        let p = w.plan(&[("/m/A.mkv", "toro")]);
+        assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), ["/m/C.mkv"]);
+    }
+
+    #[test]
+    fn maintenance_and_quarantined_nodes_are_never_targets() {
+        let mut w = show5();
+        w.sm.nodes.get_mut(&2).unwrap().health = HealthStatus::Maintenance;
+        w.sm.nodes.insert(4, node(4, "toro", DiskTier::Warm, 1 << 40, 0));
+        w.sm.nodes.get_mut(&4).unwrap().quarantine = Some(qinfo());
+        let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
+        assert!(p.copies.is_empty());
+        assert!(p.status.dcs.iter().find(|d| d.dc == "toro").unwrap().no_target);
+        // A healthy peer is still used.
+        w.sm.nodes.insert(5, node(5, "toro", DiskTier::Warm, 1 << 40, 0));
+        let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
+        assert!(!p.copies.is_empty() && p.copies.iter().all(|c| c.target_node == 5));
+    }
+
+    #[test]
+    fn files_mode_cap_counts_direct_children_only() {
+        let mut w = world();
+        w.vol().precache.mode = PrecacheMode::Files;
+        w.vol().precache.next_files = 1;
+        for i in 0..(MAX_DIR_ENTRIES + 5) {
+            w.file(&format!("/m/A/f{i:06}.mkv"), 0, &[]);
+        }
+        w.file("/m/Z1.mkv", 75, &[1]);
+        w.file("/m/Z2.mkv", 75, &[1]);
+        let p = w.plan(&[("/m/Z1.mkv", "toro")]);
+        assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), ["/m/Z2.mkv"]);
+    }
+
+    #[test]
+    fn room_needs_one_disk_and_skips_draining() {
+        let mut w = show5();
+        let mut d = w.sm.nodes[&2].disks[0].clone();
+        d.total_bytes = 3 * MIB;
+        d.used_bytes = 0;
+        let mut d2 = d.clone();
+        d2.disk_id = 1;
+        w.sm.nodes.get_mut(&2).unwrap().disks = vec![d, d2];
+        let f = [("/tv/Show/Season 01/E01.mkv", "toro")];
+        let p = w.plan(&f);
+        assert!(p.copies.is_empty(), "two 3 MiB disks cannot hold a 4 MiB chunk");
+        assert!(p.status.dcs.iter().find(|d| d.dc == "toro").unwrap().capacity_limited);
+        // Only a draining disk: no room at all.
+        let mut w = show5();
+        w.sm.nodes.get_mut(&2).unwrap().disks[0].status = DiskStatus::Draining;
+        assert!(w.plan(&f).copies.is_empty());
+    }
+
+    #[test]
+    fn anchor_pending_chunk_in_cursor_dc_is_not_protected() {
+        let mut w = world();
+        w.file("/tv/S/.plexmatch", 0, &[]);
+        w.file("/tv/S/E01.mkv", 75, &[1]);
+        w.file("/tv/S/E02.mkv", 75, &[2]);
+        let p = w.plan(&[("/tv/S/E01.mkv", "toro")]);
+        assert!(p.copies.is_empty());
+        assert!(p.protected.is_empty());
+    }
+
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self, n: u64) -> u64 {
@@ -1507,7 +1623,14 @@ mod planner_tests {
                 let used = r.next(250) * CHUNK;
                 w.set_disk(id, total, used);
                 room.insert(id, (total - used).saturating_sub(total / 10));
+                match r.next(5) {
+                    0 => w.sm.nodes.get_mut(&id).unwrap().health = HealthStatus::Maintenance,
+                    1 => w.sm.nodes.get_mut(&id).unwrap().quarantine = Some(qinfo()),
+                    _ => {}
+                }
             }
+            let other = w.sm.volumes["v"].clone();
+            w.sm.volumes.insert("w".into(), other);
             let plex = r.next(2) == 0;
             w.vol().precache.mode = if plex { PrecacheMode::Plex } else { PrecacheMode::Files };
             w.vol().precache.next_files = 1 + r.next(3) as u32;
@@ -1524,6 +1647,10 @@ mod planner_tests {
                     let holders = if holders.is_empty() { vec![1] } else { holders };
                     let path = format!("{root}/E{e:02}.mkv");
                     w.file(&path, 4 + r.next(40), &holders);
+                    if r.next(4) == 0 {
+                        w.sm.files.get_mut(&path).unwrap().volume_id = "w".into();
+                        continue;
+                    }
                     if r.next(5) == 0 {
                         w.sm.files.get_mut(&path).unwrap().cache_cooldown_until_ms.insert(0, NOW + 1);
                     }
@@ -1547,7 +1674,15 @@ mod planner_tests {
             for c in &p.copies {
                 let dc = &w.sm.nodes[&c.target_node].location.datacenter;
                 assert!(dcs.contains(dc.as_str()), "target DC has a cursor");
+                let tn = &w.sm.nodes[&c.target_node];
+                assert!(tn.quarantine.is_none() && tn.health == HealthStatus::Healthy, "excluded target");
+                let root = c.file_path.rsplit_once('/').unwrap().0;
+                assert!(
+                    reads.iter().any(|(p, d)| p.starts_with(root) && d.eq_ignore_ascii_case(dc)),
+                    "target DC matches the cursor that produced the copy"
+                );
                 let fm = &w.sm.files[&c.file_path];
+                assert_eq!(fm.volume_id, "v", "copy from another volume");
                 let rows: Vec<_> = fm.chunks.iter().filter(|e| e.chunk_index == c.chunk_index).collect();
                 let holders: Vec<u64> = rows.iter().map(|e| e.node_id.parse().unwrap()).collect();
                 assert!(!holders.contains(&c.target_node), "target already holds the chunk");
