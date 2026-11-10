@@ -434,35 +434,6 @@ fn stream_file(
     ReceiverStream::new(rx)
 }
 
-impl DataServiceImpl {
-    /// verify_on_read found no readable `.meta` and the `.dat` did not
-    /// hash to its id (or could not be read). If the `.dat` is gone a
-    /// delete raced the read (delete removes `.dat` first): plain
-    /// NOT_FOUND, no fault. Otherwise Bug BF-3: record an integrity fault
-    /// and return DATA_LOSS so the client fails over.
-    async fn meta_absent_status(
-        &self,
-        chunk_id: &ChunkId,
-        chunk_hex: &str,
-        total_size: u64,
-        now_ms: u64,
-    ) -> Status {
-        if self.store.chunk_file_path(chunk_id).await.is_none() {
-            return Status::not_found(format!("chunk deleted during read: {chunk_hex}"));
-        }
-        self.integrity_faults.record(crate::integrity::IntegrityFault {
-            chunk_id: chunk_hex.to_string(),
-            observed_at_ms: now_ms,
-            detector: "verify_on_read_meta_absent".into(),
-            expected_len: 0,
-            actual_len: total_size,
-            expected_hash: String::new(),
-            actual_hash: String::new(),
-        });
-        Status::data_loss(format!("verify_on_read: meta absent for chunk {chunk_hex}"))
-    }
-}
-
 #[tonic::async_trait]
 impl DataService for DataServiceImpl {
     type GetChunkStream = ReceiverStream<Result<GetChunkResponse, Status>>;
@@ -761,7 +732,6 @@ impl DataService for DataServiceImpl {
         // fails verification is skipped (quarantined only on a confirmed
         // digest mismatch) and the next disk's copy tried.
         let mut err = Status::not_found(format!("chunk not found: {}", req.chunk_id));
-        let mut meta_absent_size = None;
         for (disk_mount, dat_path, total_size) in self.store.chunk_copies(&chunk_id).await {
             // Bug BC-8 — verify_on_read. When the cluster integrity knob is
             // enabled (default true), BLAKE3-hash the on-disk chunk against
@@ -790,9 +760,18 @@ impl DataService for DataServiceImpl {
                         self.metrics.record_read(total_size);
                         return Ok(Response::new(stream_file(dat_path, total_size)));
                     }
-                    // Item 10: try the remaining copies before giving up.
+                    // Item 10: try the remaining copies before giving up. Only a
+                    // confirmed digest mismatch quarantines (disk-keyed report);
+                    // a read error is not corruption, and neither records a
+                    // node-wide IntegrityFault (#148 F1).
                     Err(_) => {
-                        meta_absent_size = Some(total_size);
+                        if self.store.confirm_and_quarantine(&disk_mount, &chunk_id.as_hex(), false).await {
+                            tracing::error!(chunk_id = %req.chunk_id, disk = %disk_mount.display(), "verify_on_read: .meta absent and .dat does not hash to its id; copy quarantined");
+                            err = Status::data_loss(format!("verify_on_read mismatch on chunk {}", req.chunk_id));
+                        } else if tokio::fs::try_exists(&dat_path).await.unwrap_or(true) {
+                            tracing::error!(chunk_id = %req.chunk_id, disk = %disk_mount.display(), "verify_on_read: .meta absent and copy unreadable; trying next disk");
+                            err = Status::internal(format!("verify_on_read: copy of chunk {} unreadable", req.chunk_id));
+                        }
                         continue;
                     }
                 };
@@ -831,9 +810,6 @@ impl DataService for DataServiceImpl {
             self.metrics.record_read(total_size);
 
             return Ok(Response::new(stream_file(dat_path, total_size)));
-        }
-        if let Some(total_size) = meta_absent_size {
-            return Err(self.meta_absent_status(&chunk_id, &req.chunk_id, total_size, now_ms).await);
         }
         Err(err)
     }
@@ -1985,10 +1961,11 @@ max_io_percent = 10
         assert_eq!((meta.size, meta.checksum), (data.len() as u64, chunk_id.0));
     }
 
-    // Same, but an unparseable `.meta` and a `.dat` that does NOT hash to
-    // its id: DATA_LOSS plus one integrity fault, `.meta` not rewritten.
+    // #148 F1 — an unparseable `.meta` and a `.dat` that does NOT hash to
+    // its id: DATA_LOSS, the copy quarantined by rename and reported
+    // disk-keyed, NO node-wide integrity fault, `.meta` not rewritten.
     #[tokio::test]
-    async fn meta_unreadable_with_bad_dat_is_data_loss_and_fault() {
+    async fn meta_unreadable_with_bad_dat_quarantines_disk_keyed_without_fault() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = make_service(tmp.path(), true).await;
         let data = b"meta-absent-dat-present";
@@ -2002,19 +1979,35 @@ max_io_percent = 10
         std::fs::write(&dat, b"meta-absent-dat-presenX").unwrap();
         let err = collect_stream(&svc, &chunk_id.as_hex()).await.expect_err("must not serve");
         assert_eq!(err.code(), tonic::Code::DataLoss);
-        assert_eq!(svc.integrity_faults.pending_len(), 1);
-        assert_eq!(std::fs::read(dat.with_extension("meta")).unwrap(), b"{torn");
+        assert_eq!(svc.integrity_faults.pending_len(), 0);
+        assert!(!dat.exists(), "mismatch renamed into quarantine");
+        let q = tmp.path().join(".dtfs").join("quarantine").join(format!("{}.dat.bad", chunk_id.as_hex()));
+        assert!(q.exists(), "quarantined copy kept as .dat.bad");
+        assert_eq!(svc.store.drain_pending_corruption(), vec![(chunk_id.as_hex(), Some(0))]);
     }
 
+    // #148 F1 negative — no `.meta` and an unreadable `.dat` (EISDIR): a
+    // read error, INTERNAL, never quarantined, no fault, no report.
     #[tokio::test]
-    async fn meta_absent_after_delete_race_is_not_found_without_fault() {
+    async fn meta_absent_with_unreadable_dat_is_internal_without_quarantine() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = make_service(tmp.path(), true).await;
-        let chunk_id = ChunkId::from_bytes(checksum::compute(b"gone"));
-        let st = svc.meta_absent_status(&chunk_id, &chunk_id.as_hex(), 4, 1).await;
-        assert_eq!(st.code(), tonic::Code::NotFound);
+        let data = b"meta-absent-dat-unreadable";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        svc.store
+            .put_chunk(&chunk_id, data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+        let (dat, _) = svc.store.chunk_file_path(&chunk_id).await.unwrap();
+        std::fs::remove_file(dat.with_extension("meta")).unwrap();
+        std::fs::remove_file(&dat).unwrap();
+        std::fs::create_dir(&dat).unwrap();
+        let err = collect_stream(&svc, &chunk_id.as_hex()).await.expect_err("must not serve");
+        assert_eq!(err.code(), tonic::Code::Internal);
         assert_eq!(svc.integrity_faults.pending_len(), 0);
         assert!(!svc.integrity_faults.is_self_quarantined());
+        assert!(dat.exists(), "unreadable copy must not be quarantined");
+        assert!(svc.store.drain_pending_corruption().is_empty());
     }
 
     // ── CR-4-5 (DATA-5, server half) — declared chunk_id vs bytes ───

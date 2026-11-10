@@ -87,7 +87,8 @@ text there.
 10. Reads fall back replica by replica; fail only after all candidates.
     On one node, GetChunk/ReplicateChunk try every local copy; there only a
     confirmed digest mismatch quarantines (disk-keyed report, no node-wide
-    IntegrityFault), a read error skips the copy.
+    IntegrityFault), a read error skips the copy (INTERNAL if no copy
+    serves). Same when no disk has a readable `.meta`.
 
 ## Replica classes (Bug AV)
 
