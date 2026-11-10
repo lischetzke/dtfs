@@ -174,6 +174,22 @@ pub fn raft_rpc_binding(from: u64, to: u64, payload: &[u8]) -> String {
 {}", blake3::hash(payload).to_hex())
 }
 
+/// gRPC path for InstallSnapshot (issue #113): only this path gets the large
+/// body cap. Receivers before v0.1.15 ignore the method path, so a new sender
+/// stays compatible with them.
+pub const RAFT_SNAPSHOT_PATH: &str = "/dtfs.manager.RaftTransport/InstallSnapshot";
+/// Header carrying the request payload length, bound into the pre-stamp.
+pub const RAFT_SNAPSHOT_LEN_HEADER: &str = "x-dtfs-raft-len";
+/// Header-only stamp the receiver verifies BEFORE buffering a snapshot body.
+pub const RAFT_SNAPSHOT_PRE_TS_HEADER: &str = "x-dtfs-raft-pre-ts";
+pub const RAFT_SNAPSHOT_PRE_MAC_HEADER: &str = "x-dtfs-raft-pre-mac";
+pub const RAFT_SNAPSHOT_PRE_METHOD: &str = "RaftSnapshotHeader";
+
+/// Pre-stamp binding: sender, target and declared payload length.
+pub fn raft_snapshot_pre_binding(from: u64, to: u64, len: usize) -> String {
+    format!("{from}\n{to}\n{len}")
+}
+
 impl DtfsNetwork {
     /// Bug AC — connection and request timeouts. With the previous
     /// "no timeout" config, a tonic Channel could hang indefinitely
@@ -244,7 +260,19 @@ impl DtfsNetwork {
         drop(msg);
 
         let binding = raft_rpc_binding(self.self_id, self.target_id, &body);
+        let body_len = body.len();
         let mut request = tonic::Request::new(bytes::Bytes::from(body));
+        if is_snapshot {
+            let pre = raft_snapshot_pre_binding(self.self_id, self.target_id, body_len);
+            if let Some((ts, mac)) =
+                dtfs_common::crypto::stamp_mgr_rpc_auth(&self.shared_secret, RAFT_SNAPSHOT_PRE_METHOD, &pre)
+            {
+                let md = request.metadata_mut();
+                md.insert(RAFT_SNAPSHOT_LEN_HEADER, body_len.to_string().parse().expect("ascii digits"));
+                md.insert(RAFT_SNAPSHOT_PRE_TS_HEADER, ts.parse().expect("ascii digits"));
+                md.insert(RAFT_SNAPSHOT_PRE_MAC_HEADER, mac.parse().expect("ascii hex"));
+            }
+        }
         // CO-3-6: per-request timeout (the channel no longer sets one). Small
         // RPCs pass RPC_TIMEOUT; the snapshot send passes a size-scaled value.
         request.set_timeout(timeout);
@@ -266,7 +294,7 @@ impl DtfsNetwork {
             unreachable_err(format!("grpc not ready: {e}"))
         })?;
 
-        let path = "/dtfs.manager.RaftTransport/RaftRpc"
+        let path = if is_snapshot { RAFT_SNAPSHOT_PATH } else { "/dtfs.manager.RaftTransport/RaftRpc" }
             .parse()
             .expect("valid path");
         let codec =

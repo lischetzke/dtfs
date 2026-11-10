@@ -273,9 +273,12 @@ struct RaftTransportSvc {
     handler: RaftTransportHandler,
     secret: String,
     require_auth: bool,
+    /// Cap for AppendEntries / Vote (and legacy-path snapshots): the gRPC cap.
     max_body_bytes: usize,
     /// This manager's node id: the MAC "target" binding.
     self_id: u64,
+    /// One snapshot-sized body buffered at a time; a second is refused.
+    snapshot_slot: Arc<tokio::sync::Semaphore>,
 }
 
 impl RaftTransportSvc {
@@ -285,19 +288,77 @@ impl RaftTransportSvc {
             secret: config.cluster.shared_secret.clone(),
             require_auth: config.cluster.require_raft_auth,
             self_id: dtfs_common::node_id_from_hostname(&config.node.hostname),
-            // Issue #113 — a snapshot is the whole state in ONE body, so any cap
-            // below its size stalls the follower forever. Bound only by the
-            // gRPC frame (u32 length) the sender can encode; never below the
-            // operator's gRPC cap. shortcut: snapshots above ~4 GiB on the
-            // wire (~20M chunk rows) still fail, chunked install when needed.
-            max_body_bytes: RAFT_MAX_BODY_BYTES
-                .max(dtfs_common::config::max_message_bytes(config.grpc.max_message_size_mb)),
+            max_body_bytes: dtfs_common::config::max_message_bytes(config.grpc.max_message_size_mb),
+            snapshot_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 }
 
-/// One gRPC frame: 5-byte header + the largest u32-length message.
+/// Issue #113 — a snapshot is the whole state in ONE body, so any cap below its
+/// size stalls the follower forever. Bound only by the gRPC frame (u32 length)
+/// the sender can encode. shortcut: snapshots above ~4 GiB on the wire (~20M
+/// chunk rows) still fail, chunked install when needed.
 const RAFT_MAX_BODY_BYTES: usize = 5 + u32::MAX as usize;
+/// gRPC frame header (5) + prost tag (1) + max varint (10).
+const RAFT_FRAME_OVERHEAD: usize = 16;
+
+/// Everything decidable from headers alone, run BEFORE any body is buffered.
+/// Returns the body cap to read with, or the gRPC status to answer.
+/// `hdr` looks up a request header.
+fn raft_pre_body_check<'a>(
+    secret: &str,
+    require: bool,
+    snapshot_path: bool,
+    self_id: u64,
+    grpc_cap: usize,
+    now: u64,
+    hdr: impl Fn(&str) -> Option<&'a str>,
+) -> Result<usize, (i32, &'static str)> {
+    use dtfs_raft::network as n;
+    let (ts, mac) = (
+        hdr(dtfs_common::crypto::DATA_RPC_AUTH_TS),
+        hdr(dtfs_common::crypto::DATA_RPC_AUTH_MAC),
+    );
+    if !secret.is_empty() {
+        if ts.is_none() || mac.is_none() {
+            if let RaftAuthDecision::Reject(why) = raft_auth_decision(secret, require, ts, mac, "", now) {
+                return Err((7, why));
+            }
+        }
+        // A sender-bound stamp outside the skew window fails later anyway.
+        if let (Some(ts), Some(_)) = (ts, hdr(n::RAFT_RPC_FROM_HEADER)) {
+            let fresh = ts
+                .parse::<u64>()
+                .is_ok_and(|t| t.abs_diff(now) <= dtfs_common::crypto::DATA_RPC_MAX_SKEW_SECS);
+            if !fresh {
+                return Err((7, "stale stamp"));
+            }
+        }
+    }
+    if !snapshot_path {
+        return Ok(grpc_cap);
+    }
+    if secret.is_empty() {
+        return Ok(RAFT_MAX_BODY_BYTES);
+    }
+    // Only new senders use the snapshot path, and they always pre-stamp the
+    // declared length, so no unauthenticated peer can force a large buffer.
+    let from = hdr(n::RAFT_RPC_FROM_HEADER).and_then(|f| f.parse::<u64>().ok());
+    let len = hdr(n::RAFT_SNAPSHOT_LEN_HEADER).and_then(|l| l.parse::<usize>().ok());
+    let (Some(from), Some(len), Some(pts), Some(pmac)) = (
+        from,
+        len,
+        hdr(n::RAFT_SNAPSHOT_PRE_TS_HEADER),
+        hdr(n::RAFT_SNAPSHOT_PRE_MAC_HEADER),
+    ) else {
+        return Err((7, "missing snapshot pre-stamp"));
+    };
+    let binding = n::raft_snapshot_pre_binding(from, self_id, len);
+    if !dtfs_common::crypto::verify_mgr_rpc_auth(secret, n::RAFT_SNAPSHOT_PRE_METHOD, pts, pmac, &binding, now) {
+        return Err((7, "invalid snapshot pre-stamp"));
+    }
+    Ok(len.saturating_add(RAFT_FRAME_OVERHEAD).min(RAFT_MAX_BODY_BYTES).max(grpc_cap))
+}
 
 impl tonic::server::NamedService for RaftTransportSvc {
     const NAME: &'static str = "dtfs.manager.RaftTransport";
@@ -324,6 +385,7 @@ impl tower::Service<tonic::codegen::http::Request<tonic::body::Body>> for RaftTr
         let require_auth = self.require_auth;
         let max_body = self.max_body_bytes;
         let self_id = self.self_id;
+        let snapshot_slot = self.snapshot_slot.clone();
 
         Box::pin(async move {
             let (parts, body) = req.into_parts();
@@ -334,20 +396,30 @@ impl tower::Service<tonic::codegen::http::Request<tonic::body::Body>> for RaftTr
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
 
-            // Issue #113 — the body cap is snapshot-sized, so refuse a missing
-            // or half stamp before buffering anything (it needs no body).
-            let (ts, mac) = (
-                hdr(dtfs_common::crypto::DATA_RPC_AUTH_TS),
-                hdr(dtfs_common::crypto::DATA_RPC_AUTH_MAC),
-            );
-            if ts.is_none() || mac.is_none() {
-                if let RaftAuthDecision::Reject(why) =
-                    raft_auth_decision(&secret, require_auth, ts, mac, "", now)
-                {
-                    warn!(reason = why, "RaftTransport: rejected unauthenticated Raft RPC");
-                    return Ok(grpc_error_response(7, "raft rpc authentication failed"));
+            // Issue #113 — header-only checks before buffering any body; only
+            // a pre-stamped snapshot-path RPC gets the snapshot-sized cap.
+            let snapshot_path = parts.uri.path() == dtfs_raft::network::RAFT_SNAPSHOT_PATH;
+            let max_body =
+                match raft_pre_body_check(&secret, require_auth, snapshot_path, self_id, max_body, now, hdr) {
+                    Ok(cap) => cap,
+                    Err((code, why)) => {
+                        warn!(reason = why, "RaftTransport: rejected unauthenticated Raft RPC");
+                        return Ok(grpc_error_response(code, "raft rpc authentication failed"));
+                    }
+                };
+            // Refuse (not queue) a second concurrent snapshot: only the leader
+            // sends them, openraft retries, and a queue would hold sockets open.
+            let _slot = if snapshot_path {
+                match snapshot_slot.try_acquire_owned() {
+                    Ok(p) => Some(p),
+                    Err(_) => {
+                        warn!("RaftTransport: snapshot install already in progress; refusing another");
+                        return Ok(grpc_error_response(14, "snapshot install busy"));
+                    }
                 }
-            }
+            } else {
+                None
+            };
 
             // Bounded collect: tonic's decode cap does not apply to this
             // hand-rolled service, so an unbounded body would buffer in RAM.
@@ -734,13 +806,12 @@ mod raft_transport_hardening_tests {
         resp.headers().get("grpc-status").unwrap().to_str().unwrap().to_string()
     }
 
-    /// Issue #113 — a snapshot body above `grpc.max_message_size_mb` must
-    /// reach the handler instead of being refused with status 8 forever.
-    #[tokio::test]
-    async fn issue_113_snapshot_body_above_grpc_cap_is_accepted() {
-        use tower::Service;
-        let (mut svc, _h) = svc_with(1, "", false).await;
-        let msg = RaftMessage { kind: RaftRpcKind::Snapshot, payload: "x".repeat(2 * 1024 * 1024) };
+    const SNAP: &str = dtfs_raft::network::RAFT_SNAPSHOT_PATH;
+    const RPC: &str = "/dtfs.manager.RaftTransport/RaftRpc";
+
+    /// 2 MiB RaftMessage (unparseable inner payload), returned as (json, framed body).
+    fn big_msg(kind: RaftRpcKind) -> (Vec<u8>, Bytes) {
+        let msg = RaftMessage { kind, payload: "x".repeat(2 * 1024 * 1024) };
         let json = serde_json::to_vec(&msg).unwrap();
         let mut prost = vec![0x0A];
         let mut v = json.len() as u64;
@@ -750,29 +821,125 @@ mod raft_transport_hardening_tests {
         }
         prost.push(v as u8);
         prost.extend_from_slice(&json);
-        let req = tonic::codegen::http::Request::builder()
-            .body(tonic::body::Body::new(http_body_util::Full::new(frame(&prost))))
-            .unwrap();
-        let resp = svc.call(req).await.unwrap();
+        (json, frame(&prost))
+    }
+
+    /// Reading this body errors (inner limit), so a read would answer 8/13.
+    fn unreadable() -> tonic::body::Body {
+        tonic::body::Body::new(http_body_util::Limited::new(
+            http_body_util::Full::new(Bytes::from_static(b"must not be read")),
+            1,
+        ))
+    }
+
+    async fn call(
+        svc: &mut RaftTransportSvc,
+        path: &str,
+        headers: &[(&str, String)],
+        body: tonic::body::Body,
+    ) -> String {
+        use tower::Service;
+        let mut b = tonic::codegen::http::Request::builder().uri(path);
+        for (k, v) in headers {
+            b = b.header(*k, v);
+        }
+        grpc_status(&svc.call(b.body(body).unwrap()).await.unwrap())
+    }
+
+    /// Body stamp (+ snapshot pre-stamp) as a fully signed new sender sends it.
+    fn signed(svc: &RaftTransportSvc, json: &[u8], ts_override: Option<u64>) -> Vec<(&'static str, String)> {
+        use dtfs_raft::network as n;
+        let from = 42u64;
+        let (mut ts, mut mac) = dtfs_common::crypto::stamp_mgr_rpc_auth(
+            SECRET,
+            n::RAFT_RPC_AUTH_METHOD,
+            &n::raft_rpc_binding(from, svc.self_id, json),
+        )
+        .unwrap();
+        if let Some(t) = ts_override {
+            ts = t.to_string();
+            mac = "00".repeat(32);
+        }
+        let pre = n::raft_snapshot_pre_binding(from, svc.self_id, json.len());
+        let (pts, pmac) =
+            dtfs_common::crypto::stamp_mgr_rpc_auth(SECRET, n::RAFT_SNAPSHOT_PRE_METHOD, &pre).unwrap();
+        vec![
+            (n::RAFT_RPC_FROM_HEADER, from.to_string()),
+            (dtfs_common::crypto::DATA_RPC_AUTH_TS, ts),
+            (dtfs_common::crypto::DATA_RPC_AUTH_MAC, mac),
+            (n::RAFT_SNAPSHOT_LEN_HEADER, json.len().to_string()),
+            (n::RAFT_SNAPSHOT_PRE_TS_HEADER, pts),
+            (n::RAFT_SNAPSHOT_PRE_MAC_HEADER, pmac),
+        ]
+    }
+
+    /// Issue #113 — a snapshot body above `grpc.max_message_size_mb` on the
+    /// snapshot path reaches the handler instead of status 8 forever.
+    #[tokio::test]
+    async fn issue_113_snapshot_body_above_grpc_cap_is_accepted() {
+        let (mut svc, _h) = svc_with(1, "", false).await;
+        let (_, body) = big_msg(RaftRpcKind::Snapshot);
         // Unparseable snapshot payload -> handler answers empty with status 0.
-        assert_eq!(grpc_status(&resp), "0", "2 MiB snapshot body over a 1 MiB gRPC cap refused");
+        assert_eq!(call(&mut svc, SNAP, &[], tonic::body::Body::new(http_body_util::Full::new(body))).await, "0");
+    }
+
+    /// Issue #113 — with a secret, a fully signed snapshot above the gRPC cap
+    /// is accepted.
+    #[tokio::test]
+    async fn issue_113_signed_snapshot_above_grpc_cap_is_accepted() {
+        let (mut svc, _h) = svc_with(1, SECRET, true).await;
+        let (json, body) = big_msg(RaftRpcKind::Snapshot);
+        let h = signed(&svc, &json, None);
+        assert_eq!(call(&mut svc, SNAP, &h, tonic::body::Body::new(http_body_util::Full::new(body))).await, "0");
+    }
+
+    /// Issue #113 negative — AppendEntries keeps the gRPC cap.
+    #[tokio::test]
+    async fn issue_113_append_entries_above_grpc_cap_rejected() {
+        let (mut svc, _h) = svc_with(1, "", false).await;
+        let (_, body) = big_msg(RaftRpcKind::AppendEntries);
+        assert_eq!(call(&mut svc, RPC, &[], tonic::body::Body::new(http_body_util::Full::new(body))).await, "8");
     }
 
     /// Issue #113 negative — with auth required, an unstamped RPC is refused
-    /// BEFORE its (now large-capped) body is buffered.
+    /// before its body is buffered.
     #[tokio::test]
     async fn issue_113_unstamped_rpc_rejected_before_body_read() {
-        use tower::Service;
         let (mut svc, _h) = svc_with(1, SECRET, true).await;
-        // Reading this body errors (inner limit), so a read would answer 8/13, not 7.
-        let failing = http_body_util::Limited::new(
-            http_body_util::Full::new(Bytes::from_static(b"must not be read")),
-            1,
-        );
-        let req = tonic::codegen::http::Request::builder()
-            .body(tonic::body::Body::new(failing))
-            .unwrap();
-        let resp = svc.call(req).await.unwrap();
-        assert_eq!(grpc_status(&resp), "7");
+        assert_eq!(call(&mut svc, RPC, &[], unreadable()).await, "7");
+    }
+
+    /// Issue #113 negative — a stale-ts AppendEntries is refused before its
+    /// body is buffered, even in permissive mode; the skew boundary passes.
+    #[tokio::test]
+    async fn issue_113_stale_stamp_rejected_before_body_read() {
+        let (mut svc, _h) = svc_with(1, SECRET, false).await;
+        let max = dtfs_common::crypto::DATA_RPC_MAX_SKEW_SECS;
+        let h = signed(&svc, b"", Some(now() - max - 5));
+        assert_eq!(call(&mut svc, RPC, &h, unreadable()).await, "7");
+        // Within the window: the body is read (and fails to read -> not 7).
+        let h = signed(&svc, b"", Some(now() - max + 5));
+        assert_ne!(call(&mut svc, RPC, &h, unreadable()).await, "7");
+    }
+
+    /// Issue #113 negative — the snapshot path with a secret needs a valid
+    /// pre-stamp before any body is read.
+    #[tokio::test]
+    async fn issue_113_snapshot_path_needs_pre_stamp() {
+        let (mut svc, _h) = svc_with(1, SECRET, false).await;
+        assert_eq!(call(&mut svc, SNAP, &[], unreadable()).await, "7");
+        let mut h = signed(&svc, b"abc", None);
+        h[3].1 = "999999999".to_string(); // declared length no longer matches the pre-MAC
+        assert_eq!(call(&mut svc, SNAP, &h, unreadable()).await, "7");
+    }
+
+    /// Issue #113 negative — a second concurrent snapshot body is refused.
+    #[tokio::test]
+    async fn issue_113_second_concurrent_snapshot_refused() {
+        let (mut svc, _h) = svc_with(1, "", false).await;
+        let _held = svc.snapshot_slot.clone().try_acquire_owned().unwrap();
+        assert_eq!(call(&mut svc, SNAP, &[], unreadable()).await, "14");
+        drop(_held);
+        assert_ne!(call(&mut svc, SNAP, &[], unreadable()).await, "14");
     }
 }

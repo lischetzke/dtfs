@@ -158,13 +158,23 @@ stamp after a size-bounded read of the body (a missing or non-numeric
 is rejected when `require_raft_auth = true`, otherwise accepted as unsigned
 with the rate-limited warning, even if it carries a stamp).
 
-- The Raft request body is capped at one gRPC frame (about 4 GiB, or
-  `[grpc].max_message_size_mb` if larger), because an InstallSnapshot carries
-  the whole state in one body; larger bodies are rejected with
-  `ResourceExhausted` before parsing and the sender logs it at error level.
-  A request with no stamp (or one header only) is rejected before the body
-  is read whenever that alone decides it (`require_raft_auth = true`, or a
-  half stamp).
+- AppendEntries and Vote bodies are capped at the manager gRPC message limit
+  (`[grpc].max_message_size_mb`); larger bodies are rejected with
+  `ResourceExhausted` before parsing.
+- InstallSnapshot carries the whole state in one body, so it uses its own
+  method path (`/dtfs.manager.RaftTransport/InstallSnapshot`) with a cap of
+  one gRPC frame (about 4 GiB). With a secret set, that path also needs a
+  header-only pre-stamp (`x-dtfs-raft-pre-ts` / `x-dtfs-raft-pre-mac`, method
+  `RaftSnapshotHeader`, binding `<from>\n<to>\n<x-dtfs-raft-len>`), which is
+  verified before the body is read, and the body is read up to the declared
+  length only. One snapshot body is buffered at a time; a second concurrent
+  one gets `Unavailable` and openraft retries it. The sender logs a
+  `ResourceExhausted` refusal of a snapshot at error level. Managers before
+  v0.1.15 ignore the method path and the extra headers, and still apply
+  their gRPC cap to snapshots.
+- Checks that need no body run before it is read: a missing stamp when
+  `require_raft_auth = true`, a half stamp, and a sender-bound stamp whose
+  timestamp is outside the 300 s skew window.
 - A stamped-but-invalid request (bad MAC, skew, one header only) is always
   rejected with `PermissionDenied`.
 - An unsigned request is accepted with a rate-limited warning unless
