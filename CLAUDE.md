@@ -95,7 +95,7 @@ Load-bearing ownership only; history per row in `docs/src/internals/invariants.m
 | `dtfs-manager/src/tiering.rs` | Cache-tick planner; never holds SM read lock across await |
 | `dtfs-manager/src/monitor.rs` | Heartbeat health detection only, leader-only, staleness counted from max(last_seen, leader tenure start); MUST NOT schedule repair |
 | `dtfs-manager/src/metadata.rs` | ManagerService gRPC over `raft_write`; follower writes forward via `forwardable()` allow-list |
-| `dtfs-manager/src/api.rs` + `api/*.rs` | REST router; handlers per resource; decommission refuses while replicas remain |
+| `dtfs-manager/src/api.rs` + `api/*.rs` | REST router; handlers per resource; decommission refuses while replicas remain; volume delete refuses `default`, entries without `delete_files` and leased files, re-checks for entries before `DeleteVolume` |
 | `dtfs-data/src/server.rs::put_chunk` | Streaming put; HMAC gates all data-plane RPCs |
 | `dtfs-data/src/store.rs::commit_chunk_from_tmp` | Atomic commit (§ A.6) |
 | `dtfs-fuse/src/filesystem.rs` | FUSE↔cluster bridge; rules in `.claude/rules/fuse.md` |

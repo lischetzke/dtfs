@@ -196,8 +196,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Bug AV (AV-3-5) — read the full volume config including
         // the new mandatory_replicas / cache_replicas / anchor
         // fields (closes the AV-1-10 carryover for single-volume
-        // reads).
-        .route("/api/v1/volumes/{id}", get(get_volume_endpoint))
+        // reads). DELETE removes it (409 while it holds entries unless
+        // `?delete_files=true`; `default` is refused).
+        .route("/api/v1/volumes/{id}", get(get_volume_endpoint).delete(delete_volume_endpoint))
         // Bug AV (AV-3-5) — operator-friendly cache-policy editor.
         // Merges the supplied fields into the volume's
         // `cache_replicas`; omitted fields keep their current

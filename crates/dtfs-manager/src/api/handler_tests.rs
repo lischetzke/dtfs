@@ -700,3 +700,141 @@ async fn auth_denied_rows_coalesce_per_route_not_per_raw_path() {
         .collect();
     assert_eq!(rows.len(), 1, "first row: {:?}", rows.first());
 }
+
+// ---- DELETE /api/v1/volumes/{id} ------------------------------------------------
+
+fn vfile(path: &str, volume: &str, dir: bool) -> dtfs_raft::state_machine::FileMetadata {
+    let mut f = file(path);
+    f.volume_id = volume.into();
+    f.is_directory = dir;
+    if dir {
+        f.chunks.clear();
+    }
+    f
+}
+
+/// Volume `media` with /m (dir), /m/a, /m/b; volume `keep` with /k.
+async fn seed_media(h: &super::test_support::Harness) {
+    let mut sm = h.state.sm_data.write().await;
+    sm.volumes.insert("media".into(), vol("media"));
+    sm.volumes.insert("keep".into(), vol("keep"));
+    for f in [vfile("/m", "media", true), vfile("/m/a", "media", false), vfile("/m/b", "media", false), vfile("/k", "keep", false)] {
+        sm.files.insert(f.path.clone(), f);
+    }
+}
+
+async fn del_vol(
+    h: &super::test_support::Harness,
+    id: &str,
+    delete_files: bool,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    delete_volume_endpoint(
+        State(h.state.clone()),
+        axum::extract::Path(id.to_string()),
+        Query(DeleteVolumeQuery { delete_files }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn delete_volume_refuses_default_unknown_and_follower() {
+    let h = harness().await;
+    h.state.sm_data.write().await.volumes.insert("default".into(), vol("default"));
+    h.state.sm_data.write().await.volumes.insert("empty".into(), vol("empty"));
+    let e = del_vol(&h, "default", true).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::BAD_REQUEST);
+    let e = del_vol(&h, "nope", false).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::NOT_FOUND);
+    let e = del_vol(&h, "empty", false).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert!(e.1.0["error"].as_str().unwrap().contains("not the leader"), "{:?}", e.1.0);
+    assert!(h.state.sm_data.read().await.volumes.contains_key("empty"));
+}
+
+#[tokio::test]
+async fn delete_volume_with_files_needs_delete_files() {
+    let h = super::test_support::leader_harness().await;
+    seed_media(&h).await;
+    let e = del_vol(&h, "media", false).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert_eq!((e.1.0["files"].clone(), e.1.0["directories"].clone(), e.1.0["bytes"].clone()), (json!(2), json!(1), json!(20)));
+    // GET reports the same counts (the CLI reads them to pick its confirmations).
+    let g = get_volume_endpoint(State(h.state.clone()), axum::extract::Path("media".into())).await.unwrap();
+    assert_eq!((g.0["files"].clone(), g.0["directories"].clone(), g.0["bytes"].clone()), (json!(2), json!(1), json!(20)));
+    let sm = h.state.sm_data.read().await;
+    assert!(sm.volumes.contains_key("media"));
+    assert_eq!(sm.files.len(), 4);
+}
+
+#[tokio::test]
+async fn delete_volume_empty_is_removed_and_audited() {
+    let h = super::test_support::leader_harness().await;
+    seed_media(&h).await;
+    h.state.sm_data.write().await.volumes.insert("empty".into(), vol("empty"));
+    let ok = del_vol(&h, "empty", false).await.unwrap();
+    assert_eq!(ok.0["files_deleted"], json!(0));
+    let sm = h.state.sm_data.read().await;
+    assert!(!sm.volumes.contains_key("empty"));
+    assert!(sm.volumes.contains_key("media"));
+    let rows = h.state.audit_log.query(&crate::audit::AuditFilter { action: Some("volume.delete".into()), ..Default::default() });
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].result, "success files_deleted=0");
+}
+
+#[tokio::test]
+async fn delete_volume_with_delete_files_removes_its_files_only() {
+    let h = super::test_support::leader_harness().await;
+    seed_media(&h).await;
+    let ok = del_vol(&h, "media", true).await.unwrap();
+    assert_eq!(ok.0["files_deleted"], json!(3));
+    let sm = h.state.sm_data.read().await;
+    assert!(!sm.volumes.contains_key("media"));
+    assert_eq!(sm.files.keys().cloned().collect::<Vec<_>>(), vec!["/k".to_string()]);
+    assert!(sm.volumes.contains_key("keep"));
+}
+
+#[tokio::test]
+async fn delete_volume_refuses_while_a_file_is_leased() {
+    let h = super::test_support::leader_harness().await;
+    seed_media(&h).await;
+    let lease = |exp| dtfs_raft::state_machine::WriteLease { owner_id: "o".into(), lease_id: "l".into(), expires_at_ms: exp };
+    // An expired lease does not block; a live one does.
+    h.state.sm_data.write().await.write_leases.insert("/m/b".into(), lease(1));
+    h.state.sm_data.write().await.write_leases.insert("/m/a".into(), lease(now_ms() + 600_000));
+    let e = del_vol(&h, "media", true).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert_eq!(e.1.0["leased_files"], json!(1));
+    let sm = h.state.sm_data.read().await;
+    assert!(sm.volumes.contains_key("media"));
+    assert_eq!(sm.files.len(), 4);
+}
+
+#[tokio::test]
+async fn delete_volume_stops_when_a_directory_holds_another_volumes_file() {
+    let h = super::test_support::leader_harness().await;
+    seed_media(&h).await;
+    let f = vfile("/m/other", "keep", false);
+    h.state.sm_data.write().await.files.insert(f.path.clone(), f);
+    let e = del_vol(&h, "media", true).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert_eq!(e.1.0["files_deleted"], json!(2));
+    let sm = h.state.sm_data.read().await;
+    assert!(sm.volumes.contains_key("media"), "volume must stay while /m references it");
+    assert!(sm.files.contains_key("/m") && sm.files.contains_key("/m/other"));
+}
+
+/// The pre-DeleteVolume re-check: an entry that appeared during the delete
+/// loop keeps the volume (409), an empty volume passes.
+#[test]
+fn delete_volume_recheck_refuses_a_file_that_appeared() {
+    let mut sm = StateMachineData::default();
+    assert!(delete_volume_check("media", &volume_usage(&sm, "media", 0), false).is_ok());
+    let f = vfile("/late", "media", false);
+    sm.files.insert(f.path.clone(), f);
+    let u = volume_usage(&sm, "media", 0);
+    assert_eq!(u.paths, vec!["/late".to_string()]);
+    let e = delete_volume_check("media", &u, false).unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert_eq!(e.1.0["files"], json!(1));
+    assert!(delete_volume_check("media", &u, true).is_ok());
+}

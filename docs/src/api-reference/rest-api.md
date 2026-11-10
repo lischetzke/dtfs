@@ -70,6 +70,7 @@ Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserve
 | GET | `/api/v1/volumes` | no | any | List volumes |
 | POST | `/api/v1/volumes` | yes | leader (503) | Create volume |
 | GET | `/api/v1/volumes/{id}` | no | any | Volume detail |
+| DELETE | `/api/v1/volumes/{id}` | yes | leader (409) | Delete volume (`?delete_files=true` also deletes its files) |
 | POST | `/api/v1/volumes/{id}/migrate-policy` | yes | leader (503) | Copy legacy replication |
 | POST | `/api/v1/volumes/{id}/set-cache` | yes | leader (503) | Edit cache policy |
 | POST | `/api/v1/volumes/{id}/set-mandatory` | yes | leader (503) | Edit mandatory replicas |
@@ -239,7 +240,13 @@ Volume ids are lowercase names with spaces replaced by `-`. The field reference 
 }
 ```
 
-`mandatory_replicas` shows the effective floor (the legacy `replication` while the stored field is all zero). `anchor` is null when unset. `404` for an unknown id.
+`mandatory_replicas` shows the effective floor (the legacy `replication` while the stored field is all zero). `anchor` is null when unset. The response also carries `files`, `directories` (directory markers) and `bytes` (logical bytes of the files) of the volume. `404` for an unknown id.
+
+### DELETE /api/v1/volumes/{id}
+
+Query: `delete_files=true|false` (default `false`). Removes the volume config. Errors: `400` for `default`; `404` unknown id; `409` not the leader (see above); `409` with `{"error", "files", "directories", "bytes"}` while any file or directory marker references the volume and `delete_files` is not `true`; `409` with `leased_files` while any of its files holds an unexpired write lease (also with `delete_files=true`; nothing is deleted); `503` Raft failure.
+
+With `delete_files=true` each entry of the volume (children before their directory) is removed with the same Raft `DeleteFile` as an unlink, one write per entry inside the request, so a large volume keeps the request open for a while. Bytes are not deleted directly: the orphan reaper reclaims them after `orphan_grace_secs`. If a directory of the volume still holds an entry of another volume, the run stops with `409` and `files_deleted`; the volume stays. Right before removing the volume the manager re-checks that no entry references it and answers `409` (with `files_deleted`) when one appeared meanwhile. Success: `{"volume_id", "status": "deleted", "files_deleted"}`, audit action `volume.delete` with result `success files_deleted=N`.
 
 ### POST /api/v1/volumes
 

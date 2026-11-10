@@ -60,3 +60,19 @@ pub(crate) async fn harness() -> Harness {
     });
     Harness { state, _dir: dir }
 }
+
+/// `harness()` bootstrapped as a single-voter cluster and waited until it is
+/// leader, so handlers that propose really apply to `state.sm_data`.
+pub(crate) async fn leader_harness() -> Harness {
+    use openraft::async_runtime::watch::WatchReceiver;
+    let h = harness().await;
+    let node = dtfs_raft::DtfsNode { addr: "127.0.0.1:1".into(), hostname: "mgr-test".into() };
+    h.state.raft.initialize(std::collections::BTreeMap::from([(1u64, node)])).await.unwrap();
+    for _ in 0..200 {
+        if h.state.raft.metrics().borrow_watched().current_leader == Some(1) {
+            return h;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("single-voter test raft never became leader");
+}

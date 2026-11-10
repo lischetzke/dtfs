@@ -69,6 +69,10 @@ dtfs-cli volumes set-write-safety media --min-replicas-before-ack 1 --write-time
 
 Result: every chunk has one cold replica in `leli`; two reads from a datacenter within four hours add one warm replica there; an operator flush removes it and blocks re-promotion for five minutes while the cold anchor stays.
 
+## Deleting a volume
+
+`dtfs-cli volumes delete <id>` (REST `DELETE /api/v1/volumes/{id}`). An empty volume needs one confirmation. A volume that still holds files (or directory markers) needs two, the second being the volume id typed exactly; non-interactively pass `--yes --confirm <id>`. Its files are then deleted the same way as an unlink: metadata first, and the orphan reaper reclaims the chunk bytes after `orphan_grace_secs` (at least 6 h). The `default` volume cannot be deleted, and a volume with a file open for writing is refused until the writer closes it. Clients still configured with the deleted volume id get "volume not found" on create.
+
 ## Default volume
 
 The leader creates the `default` volume from its own `[defaults]` (cluster-scope keys: keep them identical on every manager) on the first scheduler tick that finds no volume at all, retried every tick until it lands. It is a bootstrap seed: once any volume exists a missing `default` is recreated only while some file still has `volume_id == "default"` (a deleted, unused `default` stays gone), and an existing `default` is never overwritten. Files created without a volume id land in it. A file's volume is fixed at creation; the FUSE client never downgrades a known volume to `default`, and chunk placement always follows the file's own volume.

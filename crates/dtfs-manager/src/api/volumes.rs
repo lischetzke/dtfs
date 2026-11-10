@@ -305,7 +305,13 @@ pub(super) async fn get_volume_endpoint(
             Json(json!({"error": format!("volume not found: {volume_id}")})),
         ));
     };
-    Ok(Json(volume_config_to_json(cfg)))
+    let mut out = volume_config_to_json(cfg);
+    // Entry counts so `volumes delete` knows whether it needs the double confirmation.
+    let u = volume_usage(&sm, &volume_id, 0);
+    out["files"] = json!(u.files);
+    out["directories"] = json!(u.directories);
+    out["bytes"] = json!(u.bytes);
+    Ok(Json(out))
 }
 
 /// AV-3-5 pure helper — render a `VolumeConfig` to the JSON shape
@@ -1061,6 +1067,141 @@ pub(super) async fn set_volume_mandatory_endpoint(
 // ---------------------------------------------------------------------------
 // Audit log endpoint
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// DELETE /api/v1/volumes/{id}
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+pub(super) struct DeleteVolumeQuery {
+    /// Also delete every file of the volume (metadata only; the orphan
+    /// reaper reclaims the bytes after `orphan_grace_secs`).
+    #[serde(default)]
+    pub(super) delete_files: bool,
+}
+
+/// Entries of one volume. Directory markers carry a `volume_id` too and count
+/// as references (the list endpoint would show the volume again otherwise).
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct VolumeUsage {
+    pub files: usize,
+    pub directories: usize,
+    pub bytes: u64,
+    /// Paths with a write lease that has not expired at `now_ms`.
+    pub leased: Vec<String>,
+    /// Every entry path, deepest first (children before their directory).
+    pub paths: Vec<String>,
+}
+
+pub(crate) fn volume_usage(sm: &StateMachineData, volume_id: &str, now_ms: u64) -> VolumeUsage {
+    let mut u = VolumeUsage::default();
+    for (path, f) in sm.files.iter().rev().filter(|(_, f)| f.volume_id == volume_id) {
+        if f.is_directory {
+            u.directories += 1;
+        } else {
+            u.files += 1;
+            u.bytes += unique_chunk_bytes(&f.chunks);
+        }
+        if sm.write_leases.get(path).is_some_and(|l| l.expires_at_ms > now_ms) {
+            u.leased.push(path.clone());
+        }
+        u.paths.push(path.clone());
+    }
+    u
+}
+
+/// 409 while any entry of the volume is open for writing, or while it still
+/// has entries and `delete_files` is false (also the pre-DeleteVolume re-check).
+pub(crate) fn delete_volume_check(
+    volume_id: &str,
+    u: &VolumeUsage,
+    delete_files: bool,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let mut body = json!({"files": u.files, "directories": u.directories, "bytes": u.bytes});
+    if !u.leased.is_empty() {
+        warn!(volume = %volume_id, leased = u.leased.len(), "volume delete refused: files open for writing");
+        body["error"] = json!(format!(
+            "volume {volume_id} has {} file(s) open for writing (e.g. {})",
+            u.leased.len(),
+            u.leased[0]
+        ));
+        body["leased_files"] = json!(u.leased.len());
+        return Err((StatusCode::CONFLICT, Json(body)));
+    }
+    if !u.paths.is_empty() && !delete_files {
+        warn!(volume = %volume_id, files = u.files, directories = u.directories,
+            "volume delete refused: volume holds files");
+        body["error"] = json!(format!(
+            "volume {volume_id} holds {} file(s) and {} directory marker(s) ({} bytes); pass delete_files=true",
+            u.files, u.directories, u.bytes
+        ));
+        return Err((StatusCode::CONFLICT, Json(body)));
+    }
+    Ok(())
+}
+
+pub(super) async fn delete_volume_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(volume_id): axum::extract::Path<String>,
+    Query(q): Query<DeleteVolumeQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if volume_id == "default" {
+        warn!(volume = %volume_id, "volume delete refused: default volume");
+        return Err(err_body(StatusCode::BAD_REQUEST, "the default volume cannot be deleted"));
+    }
+    if !state.sm_data.read().await.volumes.contains_key(&volume_id) {
+        return Err(err_body(StatusCode::NOT_FOUND, format!("volume not found: {volume_id}")));
+    }
+    check_is_leader(&state)?;
+
+    let usage = volume_usage(&*state.sm_data.read().await, &volume_id, crate::metadata::stamp_now_ms());
+    delete_volume_check(&volume_id, &usage, q.delete_files)?;
+
+    // Same request as unlink: metadata only, the orphan reaper reclaims bytes.
+    // shortcut: one Raft DeleteFile per entry inside this HTTP request (no lock
+    // held across a write), so a huge volume keeps the request open that long;
+    // move to a background job like remove-dead if that bites.
+    let mut files_deleted = 0usize;
+    for path in &usage.paths {
+        check_is_leader(&state)?;
+        let req = ClientRequest::DeleteFile { path: path.clone(), now_ms: crate::metadata::stamp_now_ms() };
+        let resp = state.raft.client_write(req).await.map_err(|e| {
+            warn!(volume = %volume_id, path = %path, error = %e, "volume delete: DeleteFile write failed");
+            err_body(StatusCode::SERVICE_UNAVAILABLE, format!("raft write failed: {e}"))
+        })?;
+        if let Err(message) = crate::scheduler::client_response_ok(&resp.data) {
+            // E.g. a directory of this volume holds an entry of another volume.
+            warn!(volume = %volume_id, path = %path, %message, files_deleted, "volume delete: DeleteFile refused");
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": format!("deleting {path} refused: {message}"), "files_deleted": files_deleted})),
+            ));
+        }
+        files_deleted += 1;
+    }
+
+    // TOCTOU-narrowing: apply removes the volume unconditionally (a guard there
+    // would diverge from v0.1.15 managers), so re-check right before proposing.
+    let now = crate::metadata::stamp_now_ms();
+    let after = volume_usage(&*state.sm_data.read().await, &volume_id, now);
+    if let Err((code, Json(mut body))) = delete_volume_check(&volume_id, &after, false) {
+        body["files_deleted"] = json!(files_deleted);
+        return Err((code, Json(body)));
+    }
+    let resp = state
+        .raft
+        .client_write(ClientRequest::DeleteVolume { volume_id: volume_id.clone(), now_ms: now })
+        .await
+        .map_err(|e| err_body(StatusCode::SERVICE_UNAVAILABLE, format!("raft write failed: {e}")))?;
+    if let Err(message) = crate::scheduler::client_response_ok(&resp.data) {
+        warn!(volume = %volume_id, %message, "volume delete: DeleteVolume refused");
+        return Err(err_body(StatusCode::INTERNAL_SERVER_ERROR, format!("DeleteVolume refused: {message}")));
+    }
+
+    state.audit_log.log("api", "volume.delete", &volume_id, &format!("success files_deleted={files_deleted}"));
+    info!(volume = %volume_id, files_deleted, "volume deleted");
+    Ok(Json(json!({"volume_id": volume_id, "status": "deleted", "files_deleted": files_deleted})))
+}
 
 #[cfg(test)]
 mod volume_cas_tests {

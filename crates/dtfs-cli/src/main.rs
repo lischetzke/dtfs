@@ -228,6 +228,19 @@ enum VolumesCmd {
         /// Volume id to show.
         volume_id: String,
     },
+    /// Delete a volume. A volume that still holds files needs two
+    /// confirmations and deletes those files too (bytes are reclaimed by
+    /// the orphan reaper). `default` cannot be deleted.
+    Delete {
+        /// Volume id to delete.
+        volume_id: String,
+        /// Answer the yes/no question (first confirmation) non-interactively.
+        #[arg(long)]
+        yes: bool,
+        /// Second confirmation for a volume with files: must equal the volume id.
+        #[arg(long)]
+        confirm: Option<String>,
+    },
     /// Bug AV (AV-3-5) — set or update the volume's
     /// `cache_replicas` policy. Every flag is optional; omitted
     /// flags keep the current value.
@@ -658,6 +671,15 @@ impl ApiClient {
         Ok((status, value))
     }
 
+    /// DELETE that preserves the server's JSON error body on non-2xx.
+    async fn delete_with_status(&self, path: &str) -> anyhow::Result<(reqwest::StatusCode, Value)> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self.apply_mutation_auth(self.client.delete(&url)).send().await?;
+        let status = resp.status();
+        let value = resp.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        Ok((status, value))
+    }
+
     /// POST that returns the JSON body on 2xx and otherwise fails with
     /// the server's `error` message (UIP audit follow-up: `post()`'s
     /// `error_for_status()` discarded validation 400s such as "interval
@@ -721,6 +743,9 @@ async fn main() -> anyhow::Result<()> {
             }
             VolumesCmd::Show { volume_id } => {
                 cmd_volumes_show(&api, &args.format, &volume_id).await?
+            }
+            VolumesCmd::Delete { volume_id, yes, confirm } => {
+                cmd_volumes_delete(&api, &args.format, &volume_id, yes, confirm.as_deref()).await?
             }
             VolumesCmd::SetCache {
                 volume_id,
@@ -1149,6 +1174,93 @@ async fn cmd_volumes_show(
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// Confirmation logic for `volumes delete`. `data` is `Some(summary)` when the
+/// volume holds entries. `prompt` shows a question and returns the answer, or
+/// `None` without terminal input. `Err` = abort, nothing is deleted.
+fn confirm_volume_delete(
+    volume_id: &str,
+    data: Option<&str>,
+    yes: bool,
+    confirm: Option<&str>,
+    prompt: &mut dyn FnMut(&str) -> Option<String>,
+) -> Result<(), String> {
+    const NO_TTY: &str = "no terminal input; pass --yes (and --confirm <volume-id> for a volume with files)";
+    if confirm.is_some_and(|c| c != volume_id) {
+        return Err(format!("--confirm does not match the volume id '{volume_id}'"));
+    }
+    let question = match data {
+        None => format!("Delete volume {volume_id}? [y/N] "),
+        Some(s) => format!("Volume {volume_id} holds {s}. Delete the volume AND all its files? [y/N] "),
+    };
+    if !yes {
+        let answer = prompt(&question).ok_or(NO_TTY)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            return Err("aborted".into());
+        }
+    }
+    if data.is_some() && confirm.is_none() {
+        let typed = prompt("Type the volume id to confirm: ").ok_or(NO_TTY)?;
+        if typed.trim() != volume_id {
+            return Err(format!("typed id does not match '{volume_id}'; aborted"));
+        }
+    }
+    Ok(())
+}
+
+/// Ask on stderr, read one line from stdin; `None` without a terminal or on EOF.
+fn tty_prompt(question: &str) -> Option<String> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    eprint!("{question}");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(n) if n > 0 => Some(line),
+        _ => None,
+    }
+}
+
+/// `dtfs-cli volumes delete <id> [--yes] [--confirm <id>]`.
+async fn cmd_volumes_delete(
+    api: &ApiClient,
+    format: &OutputFormat,
+    volume_id: &str,
+    yes: bool,
+    confirm: Option<&str>,
+) -> anyhow::Result<()> {
+    let v = api.get(&format!("/api/v1/volumes/{}", volume_id)).await?;
+    let (files, dirs, bytes) = (
+        v["files"].as_u64().unwrap_or(0),
+        v["directories"].as_u64().unwrap_or(0),
+        v["bytes"].as_u64().unwrap_or(0),
+    );
+    let summary = (files + dirs > 0).then(|| {
+        let d = if dirs > 0 { format!(", {dirs} directories") } else { String::new() };
+        format!("{files} files{d} ({bytes} bytes)")
+    });
+    confirm_volume_delete(volume_id, summary.as_deref(), yes, confirm, &mut tty_prompt)
+        .map_err(|e| anyhow::anyhow!("volume {volume_id} not deleted: {e}"))?;
+
+    // Without consent to delete files, a file that appeared meanwhile makes the server refuse (409).
+    let path = format!("/api/v1/volumes/{}?delete_files={}", volume_id, summary.is_some());
+    let (status, resp) = api.delete_with_status(&path).await?;
+    if !status.is_success() {
+        let msg = resp["error"].as_str().map(str::to_string).unwrap_or_else(|| resp.to_string());
+        anyhow::bail!("volume {volume_id} delete failed: HTTP {status}: {msg}");
+    }
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => println!(
+            "Volume '{}' deleted ({} entries deleted; bytes are reclaimed by the orphan reaper).",
+            volume_id,
+            resp["files_deleted"].as_u64().unwrap_or(0)
+        ),
     }
     Ok(())
 }
@@ -2268,6 +2380,43 @@ mod audit_co_tests {
             }
             other => panic!("expected VolumesCmd::SetAnchor, got {other:?}"),
         }
+    }
+
+    /// `volumes delete` confirmation: scripted answers, `None` = no terminal.
+    fn run_confirm(data: Option<&str>, yes: bool, confirm: Option<&str>, answers: &[Option<&str>]) -> (Result<(), String>, usize) {
+        let mut it = answers.iter();
+        let mut asked = 0;
+        let mut prompt = |_: &str| {
+            asked += 1;
+            it.next().copied().flatten().map(String::from)
+        };
+        let r = confirm_volume_delete("media", data, yes, confirm, &mut prompt);
+        (r, asked)
+    }
+
+    #[test]
+    fn volumes_delete_confirmation() {
+        let data = Some("3 files (9 bytes)");
+        // Empty: one question, --yes skips it.
+        assert_eq!(run_confirm(None, false, None, &[Some("y\n")]), (Ok(()), 1));
+        assert_eq!(run_confirm(None, false, None, &[Some("\n")]).0, Err("aborted".into()));
+        assert_eq!(run_confirm(None, true, None, &[]), (Ok(()), 0));
+        // Data: both questions, the second must be the exact id.
+        assert_eq!(run_confirm(data, false, None, &[Some("yes\n"), Some("media\n")]), (Ok(()), 2));
+        assert!(run_confirm(data, false, None, &[Some("y\n"), Some("Media\n")]).0.unwrap_err().contains("does not match"));
+        assert_eq!(run_confirm(data, false, None, &[Some("n\n")]), (Err("aborted".into()), 1));
+        // --yes only still asks for the id; without a terminal that aborts.
+        assert_eq!(run_confirm(data, true, None, &[Some("media\n")]), (Ok(()), 1));
+        assert!(run_confirm(data, true, None, &[None]).0.unwrap_err().starts_with("no terminal input"));
+        // --yes with a wrong / right --confirm.
+        assert!(run_confirm(data, true, Some("medi"), &[]).0.unwrap_err().contains("--confirm does not match"));
+        assert_eq!(run_confirm(data, true, Some("media"), &[]), (Ok(()), 0));
+        // No terminal, no flags: abort for both shapes.
+        assert!(run_confirm(None, false, None, &[None]).0.unwrap_err().starts_with("no terminal input"));
+        assert!(run_confirm(data, false, Some("media"), &[None]).0.unwrap_err().starts_with("no terminal input"));
+
+        let a = Args::try_parse_from(["dtfs-cli", "volumes", "delete", "media", "--yes", "--confirm", "media"]).unwrap();
+        assert!(matches!(a.command, Commands::Volumes(VolumesCmd::Delete { yes: true, confirm: Some(ref c), .. }) if c == "media"));
     }
 
     #[test]
