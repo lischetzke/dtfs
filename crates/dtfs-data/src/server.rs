@@ -112,6 +112,18 @@ fn put_io_status(ctx: &str, e: std::io::Error) -> Status {
     }
 }
 
+/// Map a put's tmp-allocation failure to a gRPC status. No eligible disk
+/// (all Failed) is RESOURCE_EXHAUSTED so the FUSE writer reroutes.
+fn alloc_tmp_status(e: DtfsError) -> Status {
+    match e {
+        DtfsError::DiskNotFound(m) => {
+            tracing::warn!(reason = %m, "put rejected: no eligible data disk");
+            Status::resource_exhausted(format!("allocate tmp: no eligible disk: {m}"))
+        }
+        other => Status::internal(format!("allocate tmp: {other}")),
+    }
+}
+
 pub struct DataServiceImpl {
     config: DataNodeConfig,
     store: Arc<ChunkStore>,
@@ -541,7 +553,7 @@ impl DataService for DataServiceImpl {
         let (tmp_path, disk_mount) = tokio::task::spawn_blocking(move || store.allocate_streaming_tmp(tier))
             .await
             .map_err(|e| Status::internal(format!("allocate tmp: {e}")))?
-            .map_err(|e| Status::internal(format!("allocate tmp: {e}")))?;
+            .map_err(alloc_tmp_status)?;
 
         // Bug BU-6 — guarantee the streaming tmp is removed on ANY early
         // return below (write/flush ENOSPC, stream error). A failed put
@@ -2113,6 +2125,26 @@ max_io_percent = 10
         .unwrap_err();
         assert!(matches!(err, DtfsError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound), "{err:?}");
         assert!(!store.has_chunk(&id).await);
+    }
+
+    /// Audit F3 — every data disk Failed: the put is RESOURCE_EXHAUSTED
+    /// (FUSE reroutes to another node), not Internal.
+    #[tokio::test]
+    async fn put_with_all_disks_failed_is_resource_exhausted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_service(tmp.path(), true).await.store.clone();
+        let mount = store.disk_manager().all_disks()[0].mount_path.clone();
+        assert!(store.disk_manager().note_write_error(&mount, &std::io::Error::from_raw_os_error(5)));
+        let err = store.allocate_streaming_tmp(DiskTier::Hot).unwrap_err();
+        assert!(matches!(err, DtfsError::DiskNotFound(_)), "{err:?}");
+        assert_eq!(alloc_tmp_status(err).code(), tonic::Code::ResourceExhausted);
+    }
+
+    /// Audit F3 negative — any other allocation error stays Internal.
+    #[test]
+    fn alloc_tmp_other_error_stays_internal() {
+        let s = alloc_tmp_status(DtfsError::Internal("boom".into()));
+        assert_eq!(s.code(), tonic::Code::Internal);
     }
 
     /// Audit F1 — a panic in the detached put commit surfaces as Internal
