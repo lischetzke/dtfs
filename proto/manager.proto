@@ -235,6 +235,9 @@ message CreateFileResponse {
 // --- GetFileLocations ---
 message GetFileLocationsRequest {
   string path = 1;
+  // #135 — attributes only (size, times, kind, volume): the response
+  // carries no chunks. An older manager ignores it and sends them.
+  bool omit_chunks = 2;
 }
 
 message ChunkLocationInfo {

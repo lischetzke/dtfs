@@ -83,6 +83,16 @@ mod chunk_status_disk_grouping_tests {
         assert!(check_create_type(&sm, "/a/x.mk").is_ok(), "prefix of a file name is not its child");
     }
 
+    // #135 — omit_chunks: GetFileLocations for a stat sends no chunk list.
+    #[test]
+    fn issue_135_omit_chunks_sends_no_chunks() {
+        let sm = super::StateMachineData::default();
+        let f = entry("/a/x.mkv", false, 3);
+        let full = super::file_chunk_locations(&sm, &f, false);
+        assert_eq!(full.iter().map(|c| c.chunk_index).collect::<Vec<_>>(), [0, 1, 2]);
+        assert!(super::file_chunk_locations(&sm, &f, true).is_empty());
+    }
+
     // #115 — a chunk report must not overwrite a sticky operator state.
     #[test]
     fn issue_115_chunk_report_keeps_sticky_states() {

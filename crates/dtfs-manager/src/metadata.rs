@@ -987,6 +987,74 @@ fn resolve_node_contact(sm: &StateMachineData, stored: &str) -> String {
     stored.to_string()
 }
 
+/// GetFileLocations' chunk list: one entry per chunk index with its live
+/// replicas (all replicas when none is live). `omit` (#135, attribute-only
+/// callers): none, so a stat costs no O(chunks) walk or response.
+fn file_chunk_locations(
+    data: &StateMachineData,
+    file: &dtfs_raft::state_machine::FileMetadata,
+    omit: bool,
+) -> Vec<ChunkLocationInfo> {
+    if omit {
+        return Vec::new();
+    }
+    // Group replicas by chunk_index (not chunk_hash) so that two distinct
+    // chunks that happen to share a hash are never merged into one entry,
+    // which would cause the client to see fewer chunks than the file has
+    // (fix for issue #12).
+    // MGR-LOC-1 — hand the client only replicas it can actually read:
+    // a row whose node is Down/Failed or whose disk is Failed/Removed
+    // (`live_replica_tier`, the scheduler's own definition) is dropped.
+    // Pre-fix every row was returned and the FUSE client walked the
+    // dead ones with a full `chunk_read_timeout_secs` (60 s) each
+    // before reaching a live copy. If NO row of a chunk is live the
+    // dead rows are kept (a stale health mark must not turn a readable
+    // chunk into ENOENT), so the change only ever prunes, never empties.
+    let mut by_chunk: BTreeMap<u64, ChunkLocationInfo> = BTreeMap::new();
+    let mut live_by_index: std::collections::HashMap<u64, bool> =
+        std::collections::HashMap::new();
+    for c in &file.chunks {
+        let live = replica_is_live(data, c);
+        live_by_index
+            .entry(c.chunk_index)
+            .and_modify(|l| *l |= live)
+            .or_insert(live);
+    }
+    for c in &file.chunks {
+        if live_by_index.get(&c.chunk_index).copied().unwrap_or(false)
+            && !replica_is_live(data, c)
+        {
+            continue;
+        }
+        let addr = resolve_node_contact(data, &c.node_id);
+        // U4: derive this replica's storage tier from the disk it lives
+        // on (node.disks[disk_id].tier), positionally aligned with
+        // node_addresses so the client can use it as a read tie-break.
+        let tier = replica_tier_string(data, &c.node_id, c.disk_id);
+        // CO-3-10: the replica's registered Location, positionally
+        // aligned with node_addresses so the FUSE client can load it
+        // into known_locations for distance/priority read ranking. An
+        // unknown node yields a default (all-empty) Location, which the
+        // client skips (unknown -> arbitrary/pure-distance order).
+        let location = replica_location_proto(data, &c.node_id).unwrap_or_default();
+        let e = by_chunk.entry(c.chunk_index).or_insert_with(|| {
+            // REV-2-1 — built by a free fn rather than an inline struct
+            // literal: the literal form ICEs rustc 1.94 while type-checking
+            // this function (same compiler as the dead-code ICE workaround
+            // noted in CLAUDE.md A.4).
+            new_chunk_location(&c.chunk_hash, c.size_bytes, c.chunk_index)
+        });
+        e.size = e.size.max(c.size_bytes);
+        if !e.node_addresses.contains(&addr) {
+            e.node_addresses.push(addr);
+            e.node_tiers.push(tier);
+            e.node_locations.push(location);
+        }
+    }
+
+    by_chunk.into_values().collect()
+}
+
 /// U4: resolve a chunk replica's storage tier (lowercase string) from the
 /// disk it lives on. The chunk entry stores `node_id` (numeric in current
 /// builds) + `disk_id`; the disk's `tier` comes from the node registry. Used
@@ -1682,61 +1750,7 @@ impl ManagerService for MetadataService {
             .lookup_path(&req.path)
             .ok_or_else(|| Status::not_found("File not found"))?;
 
-        // Group replicas by chunk_index (not chunk_hash) so that two distinct
-        // chunks that happen to share a hash are never merged into one entry,
-        // which would cause the client to see fewer chunks than the file has
-        // (fix for issue #12).
-        // MGR-LOC-1 — hand the client only replicas it can actually read:
-        // a row whose node is Down/Failed or whose disk is Failed/Removed
-        // (`live_replica_tier`, the scheduler's own definition) is dropped.
-        // Pre-fix every row was returned and the FUSE client walked the
-        // dead ones with a full `chunk_read_timeout_secs` (60 s) each
-        // before reaching a live copy. If NO row of a chunk is live the
-        // dead rows are kept (a stale health mark must not turn a readable
-        // chunk into ENOENT), so the change only ever prunes, never empties.
-        let mut by_chunk: BTreeMap<u64, ChunkLocationInfo> = BTreeMap::new();
-        let mut live_by_index: std::collections::HashMap<u64, bool> =
-            std::collections::HashMap::new();
-        for c in &file.chunks {
-            let live = replica_is_live(&data, c);
-            live_by_index
-                .entry(c.chunk_index)
-                .and_modify(|l| *l |= live)
-                .or_insert(live);
-        }
-        for c in &file.chunks {
-            if live_by_index.get(&c.chunk_index).copied().unwrap_or(false)
-                && !replica_is_live(&data, c)
-            {
-                continue;
-            }
-            let addr = resolve_node_contact(&data, &c.node_id);
-            // U4: derive this replica's storage tier from the disk it lives
-            // on (node.disks[disk_id].tier), positionally aligned with
-            // node_addresses so the client can use it as a read tie-break.
-            let tier = replica_tier_string(&data, &c.node_id, c.disk_id);
-            // CO-3-10: the replica's registered Location, positionally
-            // aligned with node_addresses so the FUSE client can load it
-            // into known_locations for distance/priority read ranking. An
-            // unknown node yields a default (all-empty) Location, which the
-            // client skips (unknown -> arbitrary/pure-distance order).
-            let location = replica_location_proto(&data, &c.node_id).unwrap_or_default();
-            let e = by_chunk.entry(c.chunk_index).or_insert_with(|| {
-                // REV-2-1 — built by a free fn rather than an inline struct
-                // literal: the literal form ICEs rustc 1.94 while type-checking
-                // this function (same compiler as the dead-code ICE workaround
-                // noted in CLAUDE.md A.4).
-                new_chunk_location(&c.chunk_hash, c.size_bytes, c.chunk_index)
-            });
-            e.size = e.size.max(c.size_bytes);
-            if !e.node_addresses.contains(&addr) {
-                e.node_addresses.push(addr);
-                e.node_tiers.push(tier);
-                e.node_locations.push(location);
-            }
-        }
-
-        let chunk_locations: Vec<ChunkLocationInfo> = by_chunk.into_values().collect();
+        let chunk_locations = file_chunk_locations(&data, &file, req.omit_chunks);
         // F-037 / F-033: explicit logical size (truncate/fallocate) wins,
         // else the chunk extent (`FileMetadata::reported_size`).
         let total_size: u64 = file.reported_size();

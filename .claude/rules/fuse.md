@@ -106,7 +106,10 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   `Arc<FileLocations>` (handles and metadata cache): read()/write() clone
   the Arc, never the chunk list; the merge is copy-on-write (`merge_shared`).
   The metadata cache stores a chunkless copy (`without_chunks`, also after
-  a merge): it serves attributes and volume_id only (#135).
+  a merge): it serves attributes and volume_id only (#135). Stat paths
+  (`lookup`, `link`, `logical_size`) fetch with `omit_chunks`
+  (`fetch_file_attrs`; an older manager ignores it); never install such a
+  fetch on a handle.
 - `FileLocations.chunks` is sorted by chunk index (`sort_chunks_by_index` at
   fetch, the merge inserts in order). Per-call lookups use it: `chunk_at`
   binary search, `chunk_count` from the last entry, `chunks_in` for the

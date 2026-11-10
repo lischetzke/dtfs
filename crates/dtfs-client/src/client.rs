@@ -465,8 +465,15 @@ impl DtfsClient {
     /// Get chunk locations for a file.
     #[instrument(skip(self))]
     pub async fn get_file_locations(&self, path: &str) -> Result<GetFileLocationsResponse> {
+        self.get_file_locations_opt(path, false).await
+    }
+
+    /// GetFileLocations; `omit_chunks` (#135) asks for attributes only (an
+    /// older manager ignores it and sends the chunks anyway).
+    pub async fn get_file_locations_opt(&self, path: &str, omit_chunks: bool) -> Result<GetFileLocationsResponse> {
         let request = GetFileLocationsRequest {
             path: path.to_string(),
+            omit_chunks,
         };
         let response = self
             .call_manager("get_file_locations", true, |mut c| {

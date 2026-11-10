@@ -887,6 +887,8 @@ pub struct DtfsFilesystem {
     /// Test stand-in for the manager's GetFileLocations.
     #[cfg(test)]
     locations_fetch_hook: std::sync::Mutex<Option<Box<dyn Fn(&str) -> FileLocations + Send>>>,
+    #[cfg(test)]
+    attr_only_fetches: AtomicU64,
     /// Test stand-in for the manager's AcquireWriteLease (re-acquire only).
     #[cfg(test)]
     lease_acquire_hook: std::sync::Mutex<
@@ -994,6 +996,8 @@ impl DtfsFilesystem {
             #[cfg(test)]
             locations_fetch_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
+            attr_only_fetches: AtomicU64::new(0),
+            #[cfg(test)]
             lease_acquire_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             open_race_hook: std::sync::Mutex::new(None),
@@ -1072,7 +1076,7 @@ impl DtfsFilesystem {
 
         // Fetch from the manager.
         let fetch = self.commit_tracker.begin_fetch(path);
-        let locations = self.fetch_file_locations(path).await?;
+        let locations = self.fetch_file_attrs(path).await?;
         let mut attr = file_attr_from_locations(&locations);
         if let Some(buffered_eof) = self.write_buffer.visible_size(path) {
             if buffered_eof > attr.size {
@@ -3235,7 +3239,7 @@ impl DtfsFilesystem {
         // Fresh manager fetch (never the metadata cache); a failure is an
         // error, not a guess, since a too-small size would shrink the file.
         self.metadata_cache.remove(&path);
-        self.size_floor(&path, async { Ok::<_, anyhow::Error>(self.fetch_file_locations(&path).await?.total_size) })
+        self.size_floor(&path, async { Ok::<_, anyhow::Error>(self.fetch_file_attrs(&path).await?.total_size) })
             .await
     }
 
@@ -3496,7 +3500,7 @@ impl DtfsFilesystem {
         self.client.link_file(src, dst).await
             .with_context(|| format!("link {src} -> {dst}"))?;
         let fetch = self.commit_tracker.begin_fetch(dst);
-        let locs = self.fetch_file_locations(dst).await?;
+        let locs = self.fetch_file_attrs(dst).await?;
         let attr = file_attr_from_locations(&locs);
         if let Some(l) = gated_snapshot(Arc::new(locs), fetch.may_install()) {
             self.cache_metadata(dst, l);
@@ -3510,13 +3514,26 @@ impl DtfsFilesystem {
 
     /// Fetch file locations from the manager (no caching).
     async fn fetch_file_locations(&self, path: &str) -> Result<FileLocations> {
+        self.fetch_locations(path, false).await
+    }
+
+    /// #135: attributes only (size, times, kind, volume); `chunks` is empty
+    /// (or whatever an older manager sends). Never install it on a handle.
+    async fn fetch_file_attrs(&self, path: &str) -> Result<FileLocations> {
+        self.fetch_locations(path, true).await
+    }
+
+    async fn fetch_locations(&self, path: &str, omit_chunks: bool) -> Result<FileLocations> {
         #[cfg(test)]
         if let Some(hook) = self.locations_fetch_hook.lock().unwrap().as_ref() {
+            if omit_chunks {
+                self.attr_only_fetches.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(hook(path));
         }
         let response = self
             .client
-            .get_file_locations(path)
+            .get_file_locations_opt(path, omit_chunks)
             .await
             .with_context(|| format!("get_file_locations failed for {path}"))?;
 
@@ -8571,6 +8588,21 @@ mod async_commit_fs_tests {
         resized.total_size = 2 * cs - 1;
         assert!(file_changed_under_lease(&snap, &resized, Some(&[]), true), "boundary: size off by one");
         assert!(!file_changed_under_lease(&snap, &snap, Some(&[]), true));
+    }
+
+    /// #135: stat (lookup, link, logical_size) asks the manager for
+    /// attributes only; a handle refetch still gets the chunk list.
+    #[tokio::test]
+    async fn stat_paths_fetch_attributes_only() {
+        let fs = fs(false);
+        *fs.locations_fetch_hook.lock().unwrap() = Some(Box::new(|_| holes("/f", 10, 4)));
+        assert_eq!(fs.lookup("/f").await.unwrap().size, 10);
+        assert_eq!(fs.attr_only_fetches.load(Ordering::Relaxed), 1, "lookup");
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        assert_eq!(fs.logical_size(fh).await.unwrap(), 10);
+        assert_eq!(fs.attr_only_fetches.load(Ordering::Relaxed), 2, "logical_size");
+        fs.fetch_file_locations("/f").await.unwrap();
+        assert_eq!(fs.attr_only_fetches.load(Ordering::Relaxed), 2, "full fetch keeps chunks");
     }
 
     #[test]
