@@ -678,6 +678,7 @@ async fn auth_denied_rows_coalesce_per_route_not_per_raw_path() {
         io_rate: h.state.io_rate.clone(),
         memory: None,
         row_aggregates: Default::default(),
+        remove_dead_job: Default::default(),
     });
     let router = build_router(state);
     for i in 0..100 {
