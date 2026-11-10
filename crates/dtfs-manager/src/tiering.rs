@@ -105,8 +105,8 @@ pub struct TieringEngine {
     /// #119 — when this manager last saw itself become leader (0 = not
     /// leader). `read_windows` is leader-local, so a new leader's are empty.
     leader_since_ms: std::sync::atomic::AtomicU64,
-    /// #119 — last time `read_windows` was at the key cap (0 = never).
-    read_window_evicted_ms: std::sync::atomic::AtomicU64,
+    /// #119 — newest sample ts among rings evicted at the key cap (0 = never).
+    evicted_newest_sample_ms: std::sync::atomic::AtomicU64,
 }
 
 impl TieringEngine {
@@ -125,7 +125,7 @@ impl TieringEngine {
             alerts: None,
             read_windows: RwLock::new(HashMap::new()),
             leader_since_ms: std::sync::atomic::AtomicU64::new(0),
-            read_window_evicted_ms: std::sync::atomic::AtomicU64::new(0),
+            evicted_newest_sample_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -270,12 +270,10 @@ impl TieringEngine {
         // "old" on every subsequent heartbeat). Regression-tested
         // by `bug_av_4_1c_heartbeat_treated_as_delta_not_cumulative`.
         let mut windows = self.read_windows.write().await;
-        // #119 — at the key cap the insert may evict rings, so read counts
-        // are incomplete for a window from now on.
-        if windows.len() >= MAX_READ_WINDOW_KEYS {
-            self.read_window_evicted_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
-        }
-        apply_heartbeat_reads(chunk_id, &reads_by_dc, now_ms, &mut windows);
+        // #119 — an evicted ring's reads are lost until its newest sample
+        // would have aged out of the window.
+        let evicted = apply_heartbeat_reads(chunk_id, &reads_by_dc, now_ms, &mut windows);
+        self.evicted_newest_sample_ms.fetch_max(evicted, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Evaluate all tracked chunks and classify their temperature.
@@ -642,7 +640,7 @@ impl TieringEngine {
             && !idle_demote_allowed(
                 now_ms,
                 self.leader_since_ms.load(std::sync::atomic::Ordering::Relaxed),
-                self.read_window_evicted_ms.load(std::sync::atomic::Ordering::Relaxed),
+                self.evicted_newest_sample_ms.load(std::sync::atomic::Ordering::Relaxed),
                 promote_window_max,
             )
         {
@@ -1263,8 +1261,9 @@ pub(crate) fn count_reads_in_window(
 /// friends.
 /// #119 — idle demotion reads "0 reads in the window" from the leader-local
 /// `read_windows`. Trust that only once this leader has collected reads for
-/// the whole window (`leader_since_ms`, 0 = not leader) and no ring was
-/// evicted at the key cap within it (`evicted_ms`, 0 = never).
+/// the whole window (`leader_since_ms`, 0 = not leader) and no ring evicted
+/// at the key cap held a sample inside it (`evicted_ms` = newest evicted
+/// sample ts, 0 = never).
 pub(crate) fn idle_demote_allowed(now_ms: u64, leader_since_ms: u64, evicted_ms: u64, window_secs: u64) -> bool {
     let window_ms = window_secs.saturating_mul(1_000);
     leader_since_ms != 0
@@ -1272,12 +1271,15 @@ pub(crate) fn idle_demote_allowed(now_ms: u64, leader_since_ms: u64, evicted_ms:
         && (evicted_ms == 0 || now_ms.saturating_sub(evicted_ms) >= window_ms)
 }
 
+/// Returns the newest sample ts among the rings evicted at the key cap
+/// (0 if none), for `idle_demote_allowed` (#119).
 pub(crate) fn apply_heartbeat_reads(
     chunk_id: &str,
     reads_by_dc: &HashMap<String, u32>,
     now_ms: u64,
     windows: &mut HashMap<(String, String), Vec<ReadSample>>,
-) {
+) -> u64 {
+    let mut evicted_newest = 0;
     for (dc, count) in reads_by_dc.iter() {
         if *count == 0 {
             continue;
@@ -1298,7 +1300,8 @@ pub(crate) fn apply_heartbeat_reads(
                 .collect();
             let n = (MAX_READ_WINDOW_KEYS / 10).max(1).min(by_age.len());
             by_age.select_nth_unstable_by_key(n - 1, |(ts, _)| *ts);
-            for (_, k) in by_age.into_iter().take(n) {
+            for (ts, k) in by_age.into_iter().take(n) {
+                evicted_newest = evicted_newest.max(ts);
                 windows.remove(&k);
             }
         }
@@ -1314,6 +1317,7 @@ pub(crate) fn apply_heartbeat_reads(
             ring.drain(0..drop_n);
         }
     }
+    evicted_newest
 }
 
 /// CR2-7-1 / MGR-3 — pure kernel: compute `reads_in_window_by_dc` for one
@@ -2779,6 +2783,66 @@ mod bug_av_tiering_tick_tests {
         assert!(idle_demote_allowed(now, now - W * 1_000, 0, W), "tenure == window");
         assert!(!idle_demote_allowed(now, 1, now - 1_000, W), "evicted inside the window");
         assert!(idle_demote_allowed(now, 1, now - W * 1_000, W), "eviction a full window ago");
+    }
+
+    /// #119 (MGR-1) — fill the read-window store to the key cap with one
+    /// ring per chunk, sampled at `ts_of(i)`.
+    fn full_read_windows(ts_of: impl Fn(u64) -> u64) -> HashMap<(String, String), Vec<ReadSample>> {
+        let mut windows = HashMap::new();
+        let mut reads = HashMap::new();
+        reads.insert("dc-a".to_string(), 1u32);
+        for i in 0..MAX_READ_WINDOW_KEYS as u64 {
+            apply_heartbeat_reads(&format!("c{i}"), &reads, ts_of(i), &mut windows);
+        }
+        assert_eq!(windows.len(), MAX_READ_WINDOW_KEYS);
+        windows
+    }
+
+    /// #119 (MGR-1) — at the key cap a report for an EXISTING key evicts
+    /// nothing, so it must not defer idle demotion.
+    #[test]
+    fn issue_119_existing_key_at_cap_does_not_defer() {
+        const W: u64 = 14_400;
+        let now = 100_000_000;
+        let mut windows = full_read_windows(|i| now - 1_000 - i);
+        let mut reads = HashMap::new();
+        reads.insert("dc-a".to_string(), 1u32);
+        let evicted = apply_heartbeat_reads("c0", &reads, now, &mut windows);
+        assert_eq!(evicted, 0, "existing key evicts nothing");
+        assert_eq!(windows.len(), MAX_READ_WINDOW_KEYS);
+        assert!(idle_demote_allowed(now, 1, evicted, W));
+    }
+
+    /// #119 (MGR-1) — evicting rings whose newest sample is already outside
+    /// the window loses no in-window read, so idle demotion is not deferred.
+    #[test]
+    fn issue_119_evicting_only_stale_rings_does_not_defer() {
+        const W: u64 = 14_400;
+        let now = 100_000_000;
+        // Stalest 10% (the ones evicted) are exactly one window old; the rest are fresh.
+        let n = (MAX_READ_WINDOW_KEYS / 10) as u64;
+        let mut windows = full_read_windows(|i| if i < n { now - W * 1_000 - (n - i) } else { now - 1_000 });
+        let mut reads = HashMap::new();
+        reads.insert("dc-a".to_string(), 1u32);
+        let evicted = apply_heartbeat_reads("new", &reads, now, &mut windows);
+        assert_eq!(evicted, now - W * 1_000 - 1, "newest evicted sample");
+        assert!(idle_demote_allowed(now, 1, evicted, W));
+    }
+
+    /// #119 (MGR-1) — evicting a ring with an in-window sample defers idle
+    /// demotion until that sample would have aged out of the window.
+    #[test]
+    fn issue_119_evicting_in_window_ring_defers_one_window() {
+        const W: u64 = 14_400;
+        let now = 100_000_000;
+        let mut windows = full_read_windows(|i| now - 5_000 + i % 1_000);
+        let mut reads = HashMap::new();
+        reads.insert("dc-a".to_string(), 1u32);
+        let evicted = apply_heartbeat_reads("new", &reads, now, &mut windows);
+        assert!(evicted >= now - 5_000 && evicted < now, "newest evicted sample, got {evicted}");
+        assert!(!idle_demote_allowed(now, 1, evicted, W), "lost an in-window read");
+        assert!(!idle_demote_allowed(evicted + W * 1_000 - 1, 1, evicted, W), "1 ms short of a window");
+        assert!(idle_demote_allowed(evicted + W * 1_000, 1, evicted, W), "lost read aged out");
     }
 
     /// AV-2-4 test 2 — an existing warm cache replica with 0 reads in
