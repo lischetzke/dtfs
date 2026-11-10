@@ -242,6 +242,16 @@ pub(super) async fn get_remove_dead(
     }
 }
 
+/// Checked before every row: the node must still be Down/Failed (#156 F3,
+/// it may come back during a long run) and this manager still the leader.
+async fn stop_reason(state: &AppState, nid: u64) -> Option<&'static str> {
+    let health = state.sm_data.read().await.nodes.get(&nid).map(|n| n.health);
+    if !matches!(health, Some(HealthStatus::Down | HealthStatus::Failed)) {
+        return Some("node no longer down");
+    }
+    check_is_leader(state).is_err().then_some("leader lost")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_remove_dead(
     state: &AppState,
@@ -255,10 +265,10 @@ async fn execute_remove_dead(
 ) -> Value {
     let nid_str = nid.to_string();
     let (mut removed, mut loss_removed, mut failed) = (0usize, 0usize, 0usize);
-    let mut aborted = false;
+    let mut aborted: Option<&str> = None;
     for r in &plan.removable {
-        if check_is_leader(state).is_err() {
-            aborted = true;
+        if let Some(why) = stop_reason(state, nid).await {
+            aborted = Some(why);
             break;
         }
         let req = ClientRequest::RemoveChunkLocation {
@@ -278,10 +288,10 @@ async fn execute_remove_dead(
             }
         }
     }
-    if accept_data_loss && !aborted {
+    if accept_data_loss && aborted.is_none() {
         for r in &plan.data_loss {
-        if check_is_leader(state).is_err() {
-            aborted = true;
+        if let Some(why) = stop_reason(state, nid).await {
+            aborted = Some(why);
             break;
         }
             let req = ClientRequest::RemoveDeadNodeReplica {
@@ -307,8 +317,8 @@ async fn execute_remove_dead(
             plan_remove_dead(&sm, nid, crate::metadata::stamp_now_ms(), down_ms).map(|p| p.data_loss)
         };
         for r in rest.unwrap_or_default().iter().filter(|r| r.path.starts_with("/.dtfs-lost/")) {
-        if check_is_leader(state).is_err() {
-            aborted = true;
+        if let Some(why) = stop_reason(state, nid).await {
+            aborted = Some(why);
             break;
         }
             let req = ClientRequest::RemoveDeadNodeReplica {
@@ -329,16 +339,16 @@ async fn execute_remove_dead(
         }
     }
 
-    if aborted {
-        warn!(node = nid, by = %op, removed, loss_removed, "remove-dead: leadership lost, run aborted");
-        out["aborted"] = json!("leader lost");
+    if let Some(why) = aborted {
+        warn!(node = nid, by = %op, removed, loss_removed, reason = why, "remove-dead: run aborted");
+        out["aborted"] = json!(why);
     }
     let remaining = {
         let sm = state.sm_data.read().await;
         sm.files.values().flat_map(|f| f.chunks.iter()).filter(|c| c.node_id == nid_str).count()
     };
     let mut deregistered = false;
-    if remaining == 0 && !aborted {
+    if remaining == 0 && aborted.is_none() {
         match propose(&state, ClientRequest::DeregisterNode { node_id: nid, now_ms: crate::metadata::stamp_now_ms() })
             .await
         {
@@ -371,11 +381,26 @@ mod tests {
     #[tokio::test]
     async fn execute_aborts_once_when_not_leader() {
         let h = super::super::test_support::harness().await;
+        h.state.sm_data.write().await.nodes.insert(9, node("leli", HealthStatus::Down, 1));
         let row = |i| DeadRow { path: format!("/f{i}"), chunk_index: 0, disk_id: 0, chunk_hash: None, anchor: None };
         let plan = RemoveDeadPlan { removable: (0..5).map(row).collect(), ..Default::default() };
         let out = execute_remove_dead(&h.state, 9, &plan, false, 0, "op", "r", json!({})).await;
         assert_eq!(out["aborted"], json!("leader lost"));
         assert_eq!(out["failed"], json!(0));
+        assert_eq!(out["removed"], json!(0));
+        assert_eq!(out["deregistered"], json!(false));
+    }
+
+    /// Issue #156 F3 — the node came back during the run: stop before the
+    /// next row, never remove the rows of a live node.
+    #[tokio::test]
+    async fn execute_aborts_when_node_no_longer_down() {
+        let h = super::super::test_support::harness().await;
+        h.state.sm_data.write().await.nodes.insert(9, node("leli", HealthStatus::Healthy, 1));
+        let row = |i| DeadRow { path: format!("/f{i}"), chunk_index: 0, disk_id: 0, chunk_hash: None, anchor: None };
+        let plan = RemoveDeadPlan { removable: (0..5).map(row).collect(), ..Default::default() };
+        let out = execute_remove_dead(&h.state, 9, &plan, false, 0, "op", "r", json!({})).await;
+        assert_eq!(out["aborted"], json!("node no longer down"));
         assert_eq!(out["removed"], json!(0));
         assert_eq!(out["deregistered"], json!(false));
     }
