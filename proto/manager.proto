@@ -382,6 +382,12 @@ message AllocateChunksResponse {
   // acks than this (capped at its target count). 0 = older manager: the
   // writer assumes the default floor 2.
   uint32 ack_floor = 2;
+  // The registered data-node addresses in the file volume's anchor DC, set
+  // only when the anchor copy must land synchronously (anchor DC configured,
+  // `defer_anchor` not set). The writer re-puts such a target until it acks
+  // and does not commit a chunk with an anchor target but no anchor ack.
+  // Empty (older manager, `anchor_sync = false`, no anchor DC) = quorum only.
+  repeated string anchor_addresses = 3;
 }
 
 // --- CommitChunkLocations ---

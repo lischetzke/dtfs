@@ -15,7 +15,10 @@ playbook leaves out.
 - One node at a time, cluster-wide: never two managers in parallel (quorum),
   and do not overlap a data-node restart with a manager restart.
 - Order: managers (learners, then follower voters, the Raft leader last), then
-  data nodes, then clients.
+  data nodes, then clients. A client updated first against managers below
+  v0.1.15 assumes the ack floor 2: with `write_safety.min_replicas_before_ack = 1`,
+  replication 2 and one target down its writes fail; such clients need the
+  managers on >= v0.1.15.
 - Every node must pass its health gate, then a settle delay, before the next
   node starts. A failed gate stops the whole run.
 - The target is an exact tag (`vX.Y.Z`). Do

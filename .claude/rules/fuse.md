@@ -206,8 +206,13 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   old manager = 2); an `Unavailable` target is re-put on the put ladder
   within `PUT_RETRY_DEADLINE` (60 s) while short of quorum; once met, a
   target in that retry ladder is dropped (never registered, its late
-  copy is an orphan), but every target's FIRST attempt is awaited (the
-  anchor target is not identifiable client-side). Only acked targets are
+  copy is an orphan), but every target's FIRST attempt is awaited. A
+  target in `AllocateChunksResponse.anchor_addresses` (anchor-DC node,
+  sent only with `anchor_sync = true`; empty from an old manager) is
+  re-put regardless of quorum until one anchor target acked, and a
+  segment with an anchor target but no anchor ack fails
+  (`chunk_acks_ok`), never commits. The manager's commit does not check
+  the anchor; the guarantee is client-side. Only acked targets are
   committed.
 - Every drain that goes to `flush_segments_to_cluster` (write flush, cap
   drains, `commit_all`) holds `WriteBuffer::begin_inflight` (`Bytes`

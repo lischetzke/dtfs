@@ -233,9 +233,17 @@ its target count), the FUSE writer re-puts to a target that answered
 `UNAVAILABLE` (failed connect, restarting node) on the 0.25 s to 8 s
 ladder within 60 s (`put_targets`), so a write rides out a data-node
 restart. Once the floor acked it stops waiting on targets in that retry
-ladder; it always waits for every target's first attempt (the anchor
-copy must land), so a dead target still costs one connect timeout (5 s)
-per chunk until placement stops choosing it.
+ladder; it always waits for every target's first attempt, so a dead
+target still costs one connect timeout (5 s) per chunk until placement
+stops choosing it. With `write.anchor_sync = true` (default) the manager
+names the anchor-DC targets (`AllocateChunksResponse.anchor_addresses`):
+the writer keeps re-putting an anchor target past the floor until one
+anchor copy acked, and fails the write (EIO) if none acked within the
+60 s, so an acked write always has its anchor copy. Restarting the anchor
+data node (`data-primary01`) longer than that fails writes that target it.
+A manager older than v0.1.15 sends no anchor targets: a write can then be
+acked without the anchor copy when the anchor stays unreachable past its
+first attempt, and anchor-lag repair adds it later.
 
 **Long partitions.** If every manager is unreachable past the retry
 budget, the syscall returns `EIO` to the application. Plex shows

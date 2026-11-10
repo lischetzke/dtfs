@@ -4010,6 +4010,7 @@ impl DtfsFilesystem {
         }
         let placements = &alloc_response.placements;
         let first_ack_floor = alloc_response.ack_floor;
+        let first_anchor_addrs = &alloc_response.anchor_addresses;
         let volume_id = volume_id.as_str();
 
         // For each segment: write the chunk to the primary AND every replica
@@ -4029,6 +4030,7 @@ impl DtfsFilesystem {
             let segment = &segments[i];
             let mut placement = placements[i].clone();
             let mut ack_floor = first_ack_floor;
+            let mut anchor_addrs = first_anchor_addrs.clone();
 
             // Bug BU-2 — bounded reroute. If the assigned placement can't
             // accept the write because its target-tier disk is full
@@ -4102,7 +4104,9 @@ impl DtfsFilesystem {
                         Ok(put_resp)
                     }
                 };
-                let results = put_targets(&targets, min_ok, PUT_RETRY_DEADLINE, put).await;
+                let anchor: Vec<bool> = targets.iter().map(|t| anchor_addrs.contains(t)).collect();
+                let results = put_targets(&targets, &anchor, min_ok, PUT_RETRY_DEADLINE, put).await;
+                let acked: Vec<bool> = results.iter().map(|(_, r)| r.is_ok()).collect();
 
                 let mut successes: Vec<(String, _)> = Vec::with_capacity(rf);
                 let mut last_err: Option<anyhow::Error> = None;
@@ -4125,9 +4129,10 @@ impl DtfsFilesystem {
                     }
                 }
 
-                if successes.len() >= min_ok {
+                if chunk_acks_ok(&acked, &anchor, min_ok) {
                     break (successes, tier);
                 }
+                let need_anchor = if anchor.contains(&true) { " incl. an anchor-DC target" } else { "" };
 
                 // Shortfall — reroute only if a target was full AND we have
                 // retry budget; otherwise surface the original error.
@@ -4140,11 +4145,12 @@ impl DtfsFilesystem {
                         )
                     })
                     .context(format!(
-                        "write_chunk failed for chunk_index {}: only {}/{} replicas succeeded (need {})",
+                        "write_chunk failed for chunk_index {}: only {}/{} replicas succeeded (need {}{})",
                         segment.chunk_index,
                         successes.len(),
                         rf,
-                        min_ok
+                        min_ok,
+                        need_anchor
                     )));
                 }
 
@@ -4166,6 +4172,7 @@ impl DtfsFilesystem {
                     .await
                     .with_context(|| format!("BU-2 reroute allocate failed for {path}"))?;
                 ack_floor = realloc.ack_floor;
+                anchor_addrs = realloc.anchor_addresses;
                 placement = realloc.placements.into_iter().next().with_context(|| {
                     format!(
                         "BU-2 reroute for {path} chunk {}: no eligible placement (tier exhausted)",
@@ -5069,6 +5076,14 @@ fn put_quorum(rf: usize, ack_floor: u32) -> usize {
     floor.min(rf).max(rf.div_ceil(2)).max(1)
 }
 
+/// Whether a chunk's put results (`acked[i]` per target) may be committed:
+/// `min_ok` acks and, when a target is an anchor-DC node (`anchor[i]`,
+/// manager-sent only with `anchor_sync` on), at least one anchor ack.
+fn chunk_acks_ok(acked: &[bool], anchor: &[bool], min_ok: usize) -> bool {
+    let anchor_ok = !anchor.contains(&true) || acked.iter().zip(anchor).any(|(a, x)| *a && *x);
+    acked.iter().filter(|a| **a).count() >= min_ok && anchor_ok
+}
+
 /// #150: a put failure saying the target node is unreachable or restarting
 /// (connect error, dropped channel), worth re-putting to the same node.
 fn put_err_node_unavailable(e: &anyhow::Error) -> bool {
@@ -5090,14 +5105,16 @@ where
 
 /// #150: puts one chunk to every target and returns each target's last
 /// result, in target order. A target failing with Unavailable is re-put on
-/// the put ladder while fewer than `quorum` acked and the next try starts
-/// before `deadline`. Returns once every attempt ended, or once `quorum`
-/// acked and every target's FIRST attempt ended: a target in its retry
-/// ladder is dropped then (a copy it lands later is never committed and is
-/// reaped as an orphan). A first attempt is always awaited: the writer
-/// cannot tell the anchor target apart, and its copy must land synchronously.
+/// the put ladder while fewer than `quorum` acked (an anchor target, `anchor[i]`:
+/// while no anchor target acked) and the next try starts before `deadline`.
+/// Returns once every attempt ended, or once `quorum` acked, every target's
+/// FIRST attempt ended and an anchor target acked (if any is flagged; or no
+/// anchor attempt is left): a target in its retry ladder is dropped then (a
+/// copy it lands later is never committed and is reaped as an orphan). A
+/// first attempt is always awaited (an older manager flags no anchor).
 async fn put_targets<T, F, Fut>(
     targets: &[String],
+    anchor: &[bool],
     quorum: usize,
     deadline: Duration,
     put: F,
@@ -5115,29 +5132,38 @@ where
         .collect();
     let mut out: Vec<Option<Result<T>>> = targets.iter().map(|_| None).collect();
     let (mut first_pending, mut acked) = (targets.len(), 0usize);
+    let need_anchor = anchor.contains(&true);
+    let (mut anchor_acked, mut anchor_pending) = (false, anchor.iter().filter(|x| **x).count());
     while let Some((i, n, res)) = inflight.next().await {
         if n == 0 {
             first_pending -= 1;
         }
+        if anchor[i] {
+            anchor_pending -= 1;
+        }
         match res {
             Ok(v) => {
                 acked += 1;
+                anchor_acked |= anchor[i];
                 out[i] = Some(Ok(v));
             }
             Err(e) => {
-                let retry = (acked < quorum && put_err_node_unavailable(&e))
+                let wanted = acked < quorum || (anchor[i] && !anchor_acked);
+                let retry = (wanted && put_err_node_unavailable(&e))
                     .then(|| dtfs_client::client::put_retry_ladder(n))
                     .flatten()
                     .filter(|d| start.elapsed() + *d < deadline);
                 if let Some(d) = retry {
                     debug!(node = %targets[i], attempt = n + 1, backoff_ms = d.as_millis() as u64,
-                        "put target unavailable while short of quorum; retrying");
+                        "put target unavailable while short of quorum or anchor; retrying");
                     inflight.push(put_attempt(&put, i, targets[i].clone(), n + 1, d));
+                    anchor_pending += anchor[i] as usize;
                 }
                 out[i] = Some(Err(e));
             }
         }
-        if acked >= quorum && first_pending == 0 {
+        let anchor_done = !need_anchor || anchor_acked || anchor_pending == 0;
+        if acked >= quorum && first_pending == 0 && anchor_done {
             break;
         }
     }
@@ -5224,7 +5250,7 @@ mod put_quorum_tests {
 
     /// Runs `put_targets` over `targets` (address = index) and returns the
     /// per-target results plus attempt counts.
-    async fn run(targets: &[Target], quorum: usize, deadline: Duration) -> (Vec<Result<()>>, Vec<u32>) {
+    async fn run_anchor(targets: &[Target], anchor: &[bool], quorum: usize, deadline: Duration) -> (Vec<Result<()>>, Vec<u32>) {
         let addrs: Vec<String> = (0..targets.len()).map(|i| i.to_string()).collect();
         let tries: Vec<Arc<AtomicU32>> = targets.iter().map(|_| Arc::new(AtomicU32::new(0))).collect();
         let put = |addr: String| {
@@ -5240,9 +5266,58 @@ mod put_quorum_tests {
                 }
             }
         };
-        let res = put_targets(&addrs, quorum, deadline, put).await;
+        let res = put_targets(&addrs, anchor, quorum, deadline, put).await;
         assert_eq!(res.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>(), addrs);
         (res.into_iter().map(|(_, r)| r).collect(), tries.iter().map(|t| t.load(Ordering::SeqCst)).collect())
+    }
+
+    async fn run(targets: &[Target], quorum: usize, deadline: Duration) -> (Vec<Result<()>>, Vec<u32>) {
+        run_anchor(targets, &vec![false; targets.len()], quorum, deadline).await
+    }
+
+    fn acked(res: &[Result<()>]) -> Vec<bool> {
+        res.iter().map(|r| r.is_ok()).collect()
+    }
+
+    /// anchor_sync on, rf=3, floor 2: the anchor (target 2) is restarting;
+    /// the other two reach quorum first, the anchor is still re-put until
+    /// it acks, and the chunk commits with it.
+    #[tokio::test(start_paused = true)]
+    async fn anchor_target_is_retried_past_quorum_until_it_acks() {
+        let anchor = [false, false, true];
+        let (res, tries) =
+            run_anchor(&[Target::Ok, Target::Ok, Target::Restarting(3)], &anchor, 2, PUT_RETRY_DEADLINE).await;
+        assert!(res[2].is_ok(), "anchor must land: {:?}", res[2]);
+        assert_eq!(tries, [1, 1, 4]);
+        assert!(chunk_acks_ok(&acked(&res), &anchor, 2));
+    }
+
+    /// anchor_sync on: the anchor never comes back within the deadline, so
+    /// the chunk fails although the quorum acked.
+    #[tokio::test(start_paused = true)]
+    async fn anchor_that_never_acks_fails_the_chunk() {
+        let anchor = [false, false, true];
+        let (res, tries) =
+            run_anchor(&[Target::Ok, Target::Ok, Target::Dead], &anchor, 2, Duration::from_secs(1)).await;
+        assert_eq!(format!("{:#}", res[2].as_ref().unwrap_err()), UNAVAILABLE);
+        assert_eq!(tries, [1, 1, 3], "boundary: anchor re-put until the deadline");
+        assert!(!chunk_acks_ok(&acked(&res), &anchor, 2), "quorum without the anchor must not commit");
+        // Negative boundary: the anchor alone acked is still short of quorum.
+        assert!(!chunk_acks_ok(&[false, false, true], &anchor, 2));
+        assert!(chunk_acks_ok(&[true, false, true], &anchor, 2));
+    }
+
+    /// anchor_sync off (manager sends no anchor addresses) and an old
+    /// manager (no field): quorum behaviour as before, a restarting target
+    /// is dropped once the quorum acked and the chunk commits.
+    #[tokio::test(start_paused = true)]
+    async fn no_anchor_flags_keep_the_quorum_behaviour() {
+        let none = [false, false, false];
+        let (res, _) =
+            run_anchor(&[Target::Ok, Target::Ok, Target::FailThenHang], &none, 2, PUT_RETRY_DEADLINE).await;
+        assert!(res[2].is_err(), "returned without waiting for the retrying target");
+        assert!(chunk_acks_ok(&acked(&res), &none, 2));
+        assert!(!chunk_acks_ok(&[true, false, false], &none, 2));
     }
 
     #[test]

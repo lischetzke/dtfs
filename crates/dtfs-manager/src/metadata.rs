@@ -1449,6 +1449,24 @@ pub(crate) fn allocation_anchor_dc(
     }
 }
 
+/// `AllocateChunksResponse.anchor_addresses`: the anchor-DC data nodes an
+/// `anchor_sync = true` writer must land a copy on before it commits. Empty
+/// without an anchor DC or with `defer_anchor` (anchor-pending is allowed).
+pub(crate) fn sync_anchor_addrs(
+    nodes: &BTreeMap<u64, dtfs_raft::NodeInfo>,
+    anchor_dc: Option<&str>,
+    defer_anchor: bool,
+) -> Vec<String> {
+    match anchor_dc {
+        Some(adc) if !defer_anchor => nodes
+            .values()
+            .filter(|n| n.location.datacenter.eq_ignore_ascii_case(adc))
+            .map(|n| n.grpc_addr.clone())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The one per-node eligibility rule shared by the allocation fill and the
 /// commit-side capacity, so they cannot drift: a Healthy data node may hold
 /// a fill replica only if EVERY disk the data node might pick for
@@ -2743,6 +2761,8 @@ impl ManagerService for MetadataService {
         let defer = anchor_dc.is_some()
             && allocation_anchor_dc(anchor_dc.clone(), req.defer_anchor.unwrap_or(false), requester_dc)
                 .is_none();
+        let anchor_addresses =
+            sync_anchor_addrs(&data.nodes, anchor_dc.as_deref(), req.defer_anchor.unwrap_or(false));
         let placed = if exclude_set.is_empty() && !defer {
             self.placement.place_chunks_with_anchor(
                 &effective_volume_id,
@@ -2840,7 +2860,7 @@ impl ManagerService for MetadataService {
                         tier: chunk_placement_tier_string(effective_tier),
                     })
                     .collect();
-                return Ok(Response::new(AllocateChunksResponse { placements, ack_floor: floor }));
+                return Ok(Response::new(AllocateChunksResponse { placements, ack_floor: floor, anchor_addresses }));
             }
         }
 
@@ -3002,7 +3022,7 @@ impl ManagerService for MetadataService {
                     });
                 }
                 fill_ack_floor(&mut placements, spill_tier);
-                return Ok(Response::new(AllocateChunksResponse { placements, ack_floor: floor }));
+                return Ok(Response::new(AllocateChunksResponse { placements, ack_floor: floor, anchor_addresses }));
             }
             let rf = (replication as usize).min(node_list.len());
 
@@ -3030,7 +3050,7 @@ impl ManagerService for MetadataService {
 
         fill_ack_floor(&mut placements, effective_tier);
 
-        Ok(Response::new(AllocateChunksResponse { placements, ack_floor: floor }))
+        Ok(Response::new(AllocateChunksResponse { placements, ack_floor: floor, anchor_addresses }))
     }
 
     async fn commit_chunk_locations(

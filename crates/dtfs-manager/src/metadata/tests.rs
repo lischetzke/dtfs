@@ -1532,6 +1532,16 @@ mod tests {
         assert_eq!(allocation_anchor_dc(None, true, "nrb"), None);
     }
 
+    /// anchor_sync on: the anchor-DC node is flagged (case-insensitive);
+    /// anchor_sync off (`defer_anchor`) or no anchor DC: none.
+    #[test]
+    fn sync_anchor_addrs_flags_anchor_dc_nodes_only_without_defer() {
+        let sm = live_topology();
+        assert_eq!(sync_anchor_addrs(&sm.nodes, Some("LELI"), false), vec!["data01:9500".to_string()]);
+        assert!(sync_anchor_addrs(&sm.nodes, Some("leli"), true).is_empty());
+        assert!(sync_anchor_addrs(&sm.nodes, None, false).is_empty());
+    }
+
     fn deferred(sm: &StateMachineData, placed_tier: DiskTier, requester_dc: &str, floor: u32) -> Vec<String> {
         let vol = &sm.volumes["default"];
         deferred_anchor_targets(
