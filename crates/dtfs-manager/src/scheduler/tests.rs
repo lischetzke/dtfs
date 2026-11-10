@@ -3372,4 +3372,23 @@ mod issue_157_default_volume_tests {
         });
         assert!(matches!(default_volume_request(&sm, &cfg(), 42), Some(ClientRequest::UpsertVolume { .. })));
     }
+
+    /// Issue #157 — another volume exists but files still live in the missing
+    /// `default` (a v0.1.14 cluster that hit #157, then created `media`): create it.
+    #[test]
+    fn issue_157_default_created_when_other_volume_exists_but_files_use_default() {
+        let mut sm = StateMachineData::default();
+        let mut media = cfg();
+        media.id = dtfs_common::types::VolumeId::new("media".to_string());
+        sm.volumes.insert("media".into(), media);
+        sm.files.insert("/a".into(), dtfs_raft::state_machine::FileMetadata {
+            path: "/a".into(), volume_id: "default".into(), chunk_size: 1, chunks: vec![],
+            created_at_ms: 1, updated_at_ms: 1, symlink_target: None, logical_size: None,
+            is_directory: false, cache_cooldown_until_ms: Default::default(),
+            ever_committed: None, replica_added_at_ms: 0,
+        });
+        assert!(matches!(default_volume_request(&sm, &cfg(), 42), Some(ClientRequest::UpsertVolume { .. })));
+        sm.volumes.insert("default".into(), cfg());
+        assert!(default_volume_request(&sm, &cfg(), 42).is_none(), "present: no proposal");
+    }
 }

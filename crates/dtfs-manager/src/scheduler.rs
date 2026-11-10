@@ -217,7 +217,12 @@ pub(crate) fn default_volume_request(
     cfg: &dtfs_common::types::VolumeConfig,
     now_ms: u64,
 ) -> Option<ClientRequest> {
-    if !sm.volumes.is_empty() {
+    // Bootstrap (no volume yet), or `default` missing while files still use it
+    // (repair skips files of a missing volume). A deleted, unused one stays gone.
+    let id = cfg.id.0.as_str();
+    if sm.volumes.contains_key(id)
+        || !(sm.volumes.is_empty() || sm.files.values().any(|f| f.volume_id == id))
+    {
         return None;
     }
     Some(ClientRequest::UpsertVolume { config: cfg.clone(), expected_version: Some(0), now_ms })
