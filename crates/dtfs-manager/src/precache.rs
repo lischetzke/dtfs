@@ -1140,8 +1140,9 @@ pub(crate) fn newly_invalid<'a>(
 mod tests {
     #[test]
     fn precache_loop_is_out_of_phase_with_scheduler_tick() {
-        assert_eq!(super::PRECACHE_TICK_SECS % 30, 0, "tick must equal the scheduler tick for the offset to matter");
-        assert!(super::PRECACHE_PHASE_SECS > 0 && super::PRECACHE_PHASE_SECS < super::PRECACHE_TICK_SECS);
+        let sched = crate::scheduler::SCHEDULER_TICK.as_secs();
+        assert_eq!(super::PRECACHE_TICK_SECS, sched, "pre-cache tick must equal the scheduler tick");
+        assert_eq!(super::PRECACHE_PHASE_SECS * 2, super::PRECACHE_TICK_SECS, "pre-cache must run half a tick off the scheduler tick");
     }
 
     use super::*;

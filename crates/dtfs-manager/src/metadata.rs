@@ -167,6 +167,31 @@ async fn feed_read_reports(
     }
 }
 
+/// One poll of the read-report flusher: release the buffer if its window has
+/// passed and feed the engine. `tokio::time::Instant` so tests can pause it.
+pub(crate) async fn poll_read_reports(
+    buf: &parking_lot::Mutex<ReadReportBuffer>,
+    sm: &tokio::sync::RwLock<StateMachineData>,
+    tiering: &crate::tiering::TieringEngine,
+) {
+    let due = buf.lock().take_if_due(tokio::time::Instant::now().into_std());
+    if !due.is_empty() {
+        feed_read_reports(sm, tiering, &due).await;
+    }
+}
+
+async fn run_read_report_flusher(
+    buf: Arc<parking_lot::Mutex<ReadReportBuffer>>,
+    sm: Arc<tokio::sync::RwLock<StateMachineData>>,
+    tiering: Arc<crate::tiering::TieringEngine>,
+) {
+    let mut tick = tokio::time::interval(READ_REPORT_FLUSH / 3);
+    loop {
+        tick.tick().await;
+        poll_read_reports(&buf, &sm, &tiering).await;
+    }
+}
+
 impl MetadataService {
     pub fn new(
         config: ManagerConfig,
@@ -195,16 +220,7 @@ impl MetadataService {
     pub(crate) fn spawn_read_report_flusher(&self) {
         let Some(tiering) = self.tiering.clone() else { return };
         let (buf, sm) = (self.read_reports.clone(), self.sm_data.clone());
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(READ_REPORT_FLUSH / 3);
-            loop {
-                tick.tick().await;
-                let due = buf.lock().take_if_due(std::time::Instant::now());
-                if !due.is_empty() {
-                    feed_read_reports(&sm, &tiering, &due).await;
-                }
-            }
-        });
+        tokio::spawn(run_read_report_flusher(buf, sm, tiering));
     }
 
     /// Bug BX-10 — inject the audit log so capacity spills record a

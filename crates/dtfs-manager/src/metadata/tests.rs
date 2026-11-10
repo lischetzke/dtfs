@@ -2317,15 +2317,67 @@ mod issue_144_read_report_buffer_tests {
         assert_eq!(b.take_if_due(t0 + READ_REPORT_FLUSH)[&1]["c"]["dc1"], 2, "still buffered");
     }
 
-    /// A lone report (no later heartbeat adds anything) is released by a
-    /// bare timer poll: what `spawn_read_report_flusher` relies on.
-    #[test]
-    fn lone_report_released_by_poll_without_new_add() {
-        let mut b = ReadReportBuffer::default();
-        let t0 = std::time::Instant::now();
-        b.add(1, &[("c".into(), reads("dc1", 1))], t0);
+    /// A lone report (no later heartbeat adds anything) is released by the
+    /// flusher's poll step (`poll_read_reports`) after the window and fed to
+    /// the engine; before the window the engine sees nothing. Paused clock.
+    #[tokio::test]
+    async fn lone_report_released_by_poll_without_new_add() {
+        use super::super::{poll_read_reports, ReadReportBuffer};
+        use dtfs_common::types::{DiskInfo, DiskStatus, DiskTier, HealthStatus, NodeRole};
+        let h = crate::api::test_support::harness().await;
+        {
+            let mut sm = h.state.sm_data.write().await;
+            sm.nodes.insert(
+                7,
+                dtfs_raft::NodeInfo {
+                    hostname: "d".into(),
+                    grpc_addr: "http://d:9500".into(),
+                    role: NodeRole::Data,
+                    disks: vec![DiskInfo {
+                        disk_id: 0,
+                        uuid: String::new(),
+                        mount_path: "/d0".into(),
+                        tier: DiskTier::Cold,
+                        total_bytes: 1,
+                        used_bytes: 0,
+                        status: DiskStatus::Healthy,
+                    }],
+                    location: dtfs_common::topology::Location::new("", "", "", ""),
+                    health: HealthStatus::Healthy,
+                    total_capacity: 0,
+                    used_capacity: 0,
+                    last_seen_ms: 0,
+                    total_bytes_read: 0,
+                    total_bytes_written: 0,
+                    client_ip: None,
+                    version: String::new(),
+                    build_date: String::new(),
+                    quarantine: None,
+                },
+            );
+            let file: dtfs_raft::state_machine::FileMetadata = serde_json::from_value(serde_json::json!({
+                "path": "/tv/a.mkv", "volume_id": "v", "chunk_size": 4, "created_at_ms": 1, "updated_at_ms": 1,
+                "chunks": [{"chunk_index": 0, "chunk_hash": "c1", "node_id": "7", "disk_id": 0, "size_bytes": 4}],
+            }))
+            .unwrap();
+            sm.files.insert("/tv/a.mkv".into(), file);
+        }
+        let engine = crate::tiering::TieringEngine::new(
+            h.state.config.tiering.clone(),
+            h.state.scheduler.clone(),
+            h.state.audit_log.clone(),
+            h.state.sm_data.clone(),
+        );
+        tokio::time::pause();
+        let buf = parking_lot::Mutex::new(ReadReportBuffer::default());
+        buf.lock().add(7, &[("c1".into(), reads("toro", 1))], tokio::time::Instant::now().into_std());
+
         let tick = READ_REPORT_FLUSH / 3;
-        assert!(b.take_if_due(t0 + tick * 2).is_empty());
-        assert_eq!(b.take_if_due(t0 + tick * 3)[&1]["c"]["dc1"], 1);
+        tokio::time::advance(tick * 2).await;
+        poll_read_reports(&buf, &h.state.sm_data, &engine).await;
+        assert_eq!(engine.precache_activity_len_for_test(), 0, "held inside the window");
+        tokio::time::advance(tick).await;
+        poll_read_reports(&buf, &h.state.sm_data, &engine).await;
+        assert_eq!(engine.precache_activity_len_for_test(), 1, "released by the poll and fed to the engine");
     }
 }

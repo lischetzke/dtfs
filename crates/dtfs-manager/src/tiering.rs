@@ -142,6 +142,11 @@ impl TieringEngine {
         self.precache.lock().status = s;
     }
 
+    #[cfg(test)]
+    pub(crate) fn precache_activity_len_for_test(&self) -> usize {
+        self.precache.lock().activity.len()
+    }
+
     /// Pre-cache loop: every `PRECACHE_TICK_SECS`, leader only. Spawned from main.rs.
     pub async fn run_precache(&self) {
         let phase = Duration::from_secs(crate::precache::PRECACHE_PHASE_SECS);
@@ -220,7 +225,12 @@ impl TieringEngine {
                 Vec::new()
             } else {
                 self.scheduler
-                    .schedule_replications(&reqs, precache_max_new(view.live_count), PRECACHE_YIELD_LIVE_TASKS)
+                    .schedule_replications(
+                        &reqs,
+                        precache_max_new(view.live_count),
+                        PRECACHE_YIELD_LIVE_TASKS,
+                        Some(Duration::from_secs(PRECACHE_TICK_SECS / 2)),
+                    )
                     .await
             };
             for (c, o) in picked.iter().zip(&outcomes) {
@@ -594,6 +604,7 @@ impl TieringEngine {
                         &[(d.chunk_id.as_str(), d.current_node, target, d.target_tier)],
                         usize::MAX,
                         crate::scheduler::TIERING_MAX_LIVE_TASKS,
+                        None,
                     )
                     .await;
 
@@ -724,7 +735,7 @@ impl TieringEngine {
             .collect();
         let outcomes = self
             .scheduler
-            .schedule_replications(&reqs, MAX_PROMOTIONS_PER_TICK, crate::scheduler::TIERING_MAX_LIVE_TASKS)
+            .schedule_replications(&reqs, MAX_PROMOTIONS_PER_TICK, crate::scheduler::TIERING_MAX_LIVE_TASKS, None)
             .await;
         let deferred = outcomes.iter().filter(|o| **o == crate::scheduler::ScheduleOutcome::Deferred).count();
         if deferred > 0 || outcomes.contains(&crate::scheduler::ScheduleOutcome::Refused) {

@@ -33,7 +33,7 @@ pub(crate) use orphan::*;
 pub(crate) use repair::*;
 
 /// Interval between scheduler ticks.
-const SCHEDULER_TICK: Duration = Duration::from_secs(30);
+pub(crate) const SCHEDULER_TICK: Duration = Duration::from_secs(30);
 
 /// Maximum number of consecutive failures (per task per state) before the task
 /// is marked Failed. With a 30s tick, 6 attempts ≈ 3 minutes of trying. After

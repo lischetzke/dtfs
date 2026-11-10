@@ -13,20 +13,32 @@ impl TaskScheduler {
     /// When the tick holds the migration-state lock (it can for minutes
     /// during an advance) every request comes back `Deferred` instead of
     /// blocking the caller; the caller re-plans next tick / returns 503.
+    /// `wait: Some(d)` (pre-cache only) waits up to `d` for the lock instead,
+    /// so a long copy-advance tick does not starve it; a miss is logged at
+    /// debug since the caller retries every tick.
     pub(crate) async fn schedule_replications(
         &self,
         reqs: &[(&str, u64, u64, DiskTier)],
         max_new: usize,
         max_live: usize,
+        wait: Option<Duration>,
     ) -> Vec<ScheduleOutcome> {
         // CO-3-5 — serialise with the tick's load-modify-save (and any
         // other concurrent schedule) so neither writer clobbers the
         // other's tasks or regresses `next_task_id`.
-        let Ok(_ms_guard) = self.migration_state_lock.try_lock() else {
-            warn!(
-                requests = reqs.len(),
-                "replication scheduling deferred: migration state busy (scheduler tick in progress)"
-            );
+        let guard = match wait {
+            None => self.migration_state_lock.try_lock().ok(),
+            Some(d) => tokio::time::timeout(d, self.migration_state_lock.lock()).await.ok(),
+        };
+        let Some(_ms_guard) = guard else {
+            if wait.is_some() {
+                debug!(requests = reqs.len(), "replication scheduling deferred: migration state busy after bounded wait");
+            } else {
+                warn!(
+                    requests = reqs.len(),
+                    "replication scheduling deferred: migration state busy (scheduler tick in progress)"
+                );
+            }
             return vec![ScheduleOutcome::Deferred; reqs.len()];
         };
         let mut state = self.load_migration_state().await;

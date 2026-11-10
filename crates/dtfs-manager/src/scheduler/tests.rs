@@ -3431,3 +3431,40 @@ mod issue_157_default_volume_tests {
         assert!(default_volume_request(&sm, &cfg(), 42).is_none(), "present: no proposal");
     }
 }
+
+#[cfg(test)]
+mod schedule_replications_wait_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Hold the migration-state lock for 5 s of paused time while
+    /// `schedule_replications(wait)` runs against it.
+    async fn run(wait: Option<Duration>) -> Vec<ScheduleOutcome> {
+        let h = crate::api::test_support::harness().await;
+        tokio::time::pause();
+        let s = &h.state.scheduler;
+        let guard = s.migration_state_lock.lock().await;
+        let hold = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(guard);
+        };
+        let reqs = [("c1", 1u64, 2u64, DiskTier::Cold)];
+        let (_, out) = tokio::join!(hold, s.schedule_replications(&reqs, 10, 10, wait));
+        out
+    }
+
+    #[tokio::test]
+    async fn bounded_wait_longer_than_hold_gets_the_lock() {
+        assert_eq!(run(Some(Duration::from_secs(15))).await, vec![ScheduleOutcome::New]);
+    }
+
+    #[tokio::test]
+    async fn no_wait_defers_while_locked() {
+        assert_eq!(run(None).await, vec![ScheduleOutcome::Deferred]);
+    }
+
+    #[tokio::test]
+    async fn bounded_wait_shorter_than_hold_defers() {
+        assert_eq!(run(Some(Duration::from_secs(1))).await, vec![ScheduleOutcome::Deferred]);
+    }
+}

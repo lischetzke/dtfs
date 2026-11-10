@@ -486,7 +486,7 @@ impl TaskScheduler {
             .map(|a| (a.chunk_hash.as_str(), a.source_node, a.target_node, a.tier))
             .collect();
         let outcomes = self
-            .schedule_replications(&reqs, usize::MAX, MAX_LIVE_TASKS)
+            .schedule_replications(&reqs, usize::MAX, MAX_LIVE_TASKS, None)
             .await;
         // `max_new` is unbounded here, so Deferred means the tick holds the
         // migration state: report busy so the REST layer answers 503.
