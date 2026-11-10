@@ -45,9 +45,9 @@ exactly those three entries.
    false`, same `initial_voters` list). With three voters a leader exists as soon
    as two of them are up. Starting a single-entry list is also valid (a one-voter
    cluster) but then every other manager must be added by Step 2.
-3. Within about 20 seconds the bootstrap manager upserts the `default` volume
-   from `[defaults]` (insert-if-missing, so it never overwrites later volume
-   edits) and takes an early snapshot. `[defaults]` is therefore consumed once,
+3. Within about 20 seconds the leader creates the `default` volume from its
+   `[defaults]` while the cluster has no volume at all (create-only, so it
+   never overwrites later volume edits or recreates a deleted `default`) and takes an early snapshot. `[defaults]` is therefore consumed once,
    here; later changes go through the volume API.
 
 Gate (for each voter):

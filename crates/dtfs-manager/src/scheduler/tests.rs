@@ -3347,4 +3347,29 @@ mod issue_157_default_volume_tests {
         sm.volumes.insert("default".into(), existing);
         assert!(default_volume_request(&sm, &cfg(), 42).is_none());
     }
+
+    /// Issue #157 F5 — `default` is a bootstrap seed: once any volume exists
+    /// a missing `default` (deleted by the operator) is not recreated.
+    #[test]
+    fn issue_157_deleted_default_not_recreated_while_other_volumes_exist() {
+        let mut sm = StateMachineData::default();
+        let mut media = cfg();
+        media.id = dtfs_common::types::VolumeId::new("media".to_string());
+        sm.volumes.insert("media".into(), media);
+        assert!(default_volume_request(&sm, &cfg(), 42).is_none());
+    }
+
+    /// Issue #157 — the original failure case (files written into `default`
+    /// before its config landed, no volume at all) still heals.
+    #[test]
+    fn issue_157_default_created_with_files_but_no_volumes() {
+        let mut sm = StateMachineData::default();
+        sm.files.insert("/a".into(), dtfs_raft::state_machine::FileMetadata {
+            path: "/a".into(), volume_id: "default".into(), chunk_size: 1, chunks: vec![],
+            created_at_ms: 1, updated_at_ms: 1, symlink_target: None, logical_size: None,
+            is_directory: false, cache_cooldown_until_ms: Default::default(),
+            ever_committed: None, replica_added_at_ms: 0,
+        });
+        assert!(matches!(default_volume_request(&sm, &cfg(), 42), Some(ClientRequest::UpsertVolume { .. })));
+    }
 }

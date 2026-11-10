@@ -207,7 +207,9 @@ pub struct TaskScheduler {
 }
 
 /// Issue #157 — the create-if-missing proposal for the `default` volume, or
-/// `None` when it exists. `expected_version: Some(0)` makes apply refuse it
+/// `None` once ANY volume exists: `default` is a bootstrap seed, so a later
+/// delete of it is not undone (files without any volume, the original #157
+/// case, still heal). `expected_version: Some(0)` makes apply refuse it
 /// once any `default` was stored (versions start at 1), so a racing operator
 /// edit is never overwritten.
 pub(crate) fn default_volume_request(
@@ -215,7 +217,7 @@ pub(crate) fn default_volume_request(
     cfg: &dtfs_common::types::VolumeConfig,
     now_ms: u64,
 ) -> Option<ClientRequest> {
-    if sm.volumes.contains_key(&cfg.id.0) {
+    if !sm.volumes.is_empty() {
         return None;
     }
     Some(ClientRequest::UpsertVolume { config: cfg.clone(), expected_version: Some(0), now_ms })
@@ -275,7 +277,9 @@ impl TaskScheduler {
     }
 
     /// Issue #157 — leader-only, every tick until it lands: create the
-    /// `default` volume when it is missing.
+    /// `default` volume while the state has no volume at all, from the
+    /// leader's own `[defaults]` (cluster-scope keys, identical on every
+    /// manager).
     async fn ensure_default_volume(&self) {
         let Some(cfg) = self.default_volume.read().clone() else { return };
         let req = {
