@@ -2247,3 +2247,40 @@ mod mgr_loc_replica_is_live {
         assert!(replica_is_live(&sm, &row(dtfs_raft::legacy_disk_id())));
     }
 }
+
+#[cfg(test)]
+mod issue_144_read_report_buffer_tests {
+    use super::super::{ReadReportBuffer, READ_REPORT_FLUSH};
+    use std::collections::HashMap;
+
+    fn reads(dc: &str, n: u32) -> HashMap<String, u32> {
+        HashMap::from([(dc.to_string(), n)])
+    }
+
+    /// Issue #144 — heartbeats inside the flush window are merged (deltas
+    /// summed) and released together once the window has passed.
+    #[test]
+    fn issue_144_reports_merged_and_released_after_window() {
+        let mut b = ReadReportBuffer::default();
+        let t0 = std::time::Instant::now();
+        b.add(1, &[("c".into(), reads("dc1", 2))], t0);
+        b.add(1, &[("c".into(), reads("dc1", 3)), ("d".into(), reads("dc2", 1))], t0);
+        b.add(2, &[("c".into(), reads("dc1", 4))], t0);
+        let due = b.take_if_due(t0 + READ_REPORT_FLUSH);
+        assert_eq!(due[&1]["c"]["dc1"], 5, "deltas of one node summed");
+        assert_eq!(due[&1]["d"]["dc2"], 1);
+        assert_eq!(due[&2]["c"]["dc1"], 4, "nodes kept apart");
+        assert!(b.take_if_due(t0 + READ_REPORT_FLUSH * 2).is_empty(), "taken once");
+    }
+
+    /// Issue #144 negative — nothing is released before the window ends.
+    #[test]
+    fn issue_144_reports_held_inside_window() {
+        let mut b = ReadReportBuffer::default();
+        let t0 = std::time::Instant::now();
+        b.add(1, &[("c".into(), reads("dc1", 2))], t0);
+        let before = t0 + READ_REPORT_FLUSH - std::time::Duration::from_millis(1);
+        assert!(b.take_if_due(before).is_empty());
+        assert_eq!(b.take_if_due(t0 + READ_REPORT_FLUSH)[&1]["c"]["dc1"], 2, "still buffered");
+    }
+}

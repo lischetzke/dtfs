@@ -71,6 +71,54 @@ pub struct MetadataService {
     /// CF-6 — resolved `[tls]` context; manager-to-manager forwards and
     /// the delete fan-out to data nodes speak mTLS when enabled.
     tls: dtfs_common::tls::TlsContext,
+    /// Issue #144 — heartbeat read reports, resolved in one row pass per
+    /// [`READ_REPORT_FLUSH`] instead of one per heartbeat.
+    read_reports: Arc<parking_lot::Mutex<ReadReportBuffer>>,
+}
+
+/// Issue #144 — how long read reports are merged before one resolve pass.
+pub(crate) const READ_REPORT_FLUSH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Per-node read deltas (`node -> chunk -> dc -> reads`) merged since `since`.
+#[derive(Default)]
+pub(crate) struct ReadReportBuffer {
+    since: Option<std::time::Instant>,
+    by_node: std::collections::BTreeMap<u64, std::collections::HashMap<String, std::collections::HashMap<String, u32>>>,
+}
+
+impl ReadReportBuffer {
+    /// Merge one heartbeat's deltas (counts add up: they are since-last-harvest).
+    pub(crate) fn add(
+        &mut self,
+        node_id: u64,
+        entries: &[(String, std::collections::HashMap<String, u32>)],
+        now: std::time::Instant,
+    ) {
+        self.since.get_or_insert(now);
+        let node = self.by_node.entry(node_id).or_default();
+        for (chunk, by_dc) in entries {
+            let slot = node.entry(chunk.clone()).or_default();
+            for (dc, n) in by_dc {
+                let c = slot.entry(dc.clone()).or_default();
+                *c = c.saturating_add(*n);
+            }
+        }
+    }
+
+    /// Everything buffered, once `READ_REPORT_FLUSH` has passed since the
+    /// first buffered report; otherwise nothing.
+    pub(crate) fn take_if_due(
+        &mut self,
+        now: std::time::Instant,
+    ) -> std::collections::BTreeMap<u64, std::collections::HashMap<String, std::collections::HashMap<String, u32>>> {
+        match self.since {
+            Some(t) if now.saturating_duration_since(t) >= READ_REPORT_FLUSH => {
+                self.since = None;
+                std::mem::take(&mut self.by_node)
+            }
+            _ => Default::default(),
+        }
+    }
 }
 
 impl MetadataService {
@@ -94,6 +142,7 @@ impl MetadataService {
             )),
             audit: None,
             tls,
+            read_reports: Default::default(),
         }
     }
 
@@ -2410,8 +2459,17 @@ impl ManagerService for MetadataService {
                 // total_chunks) work under the SM lock for an N-entry
                 // heartbeat, blocking the Raft apply writer (tokio
                 // RwLock is fair) for the duration.
-                let wanted: std::collections::HashSet<String> =
-                    entries.iter().map(|(id, _)| id.clone()).collect();
+                //
+                // Issue #144 — each resolve walks every chunk row, so merge
+                // heartbeats and resolve once per READ_REPORT_FLUSH.
+                let due = {
+                    let mut buf = self.read_reports.lock();
+                    let now = std::time::Instant::now();
+                    buf.add(*node_id, entries, now);
+                    buf.take_if_due(now)
+                };
+                for (node_id, entries) in &due {
+                let wanted: std::collections::HashSet<String> = entries.keys().cloned().collect();
                 let index = {
                     let sm = self.sm_data.read().await;
                     build_chunk_read_context_index(&sm.files, &sm.nodes, &wanted, *node_id)
@@ -2450,6 +2508,7 @@ impl ManagerService for MetadataService {
                         }
                     }
                 }
+                } // for each due node
             }
             let response_json = serde_json::to_vec(&ClientResponse::Success)
                 .map_err(|e| Status::internal(format!("serialize ClientResponse: {e}")))?;

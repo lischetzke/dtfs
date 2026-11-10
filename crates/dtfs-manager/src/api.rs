@@ -77,6 +77,8 @@ pub struct AppState {
     pub io_rate: Arc<parking_lot::RwLock<IoRateTracker>>,
     /// Manager-local memory budget surfaced by `GET /api/v1/memory`.
     pub memory: Option<Arc<dtfs_common::memory::MemoryBudget>>,
+    /// Issue #144: shared, TTL-cached chunk-row aggregates for polled reads.
+    pub row_aggregates: Arc<cluster::RowAggregatesCache>,
 }
 
 /// Bug AL — per-node cumulative-byte snapshots, used to derive a rolling
@@ -256,6 +258,7 @@ pub async fn run_api_server(
         // produce real bytes/sec deltas.
         io_rate: Arc::new(parking_lot::RwLock::new(IoRateTracker::default())),
         memory,
+        row_aggregates: Default::default(),
     });
 
     let app = build_router(state);

@@ -56,6 +56,7 @@ pub(crate) async fn harness() -> Harness {
         scheduler,
         io_rate: Arc::new(parking_lot::RwLock::new(IoRateTracker::default())),
         memory: None,
+        row_aggregates: Default::default(),
     });
     Harness { state, _dir: dir }
 }

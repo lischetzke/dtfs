@@ -1824,3 +1824,50 @@ mod chunks_diag_tests {
         assert_eq!(v[1], json!({"node_id": "9", "matched_index": null, "lag": 10}));
     }
 }
+
+#[cfg(test)]
+mod issue_144_row_aggregates_tests {
+    use super::cluster::{row_aggregates, RowAggregatesCache, ROW_AGGREGATES_TTL};
+    use super::*;
+
+    fn file(path: &str, size: u64) -> dtfs_raft::state_machine::FileMetadata {
+        dtfs_raft::state_machine::FileMetadata {
+            path: path.into(),
+            volume_id: "default".into(),
+            chunk_size: 4 << 20,
+            chunks: vec![dtfs_raft::ChunkLocationEntry {
+                chunk_index: 0,
+                chunk_hash: format!("h{path}"),
+                node_id: "1".into(),
+                disk_id: 0,
+                size_bytes: size,
+            }],
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            ever_committed: None,
+        }
+    }
+
+    /// Issue #144 — polled callers inside the TTL reuse one row pass; the
+    /// pass reruns exactly at the TTL boundary.
+    #[tokio::test]
+    async fn issue_144_row_aggregates_cached_for_ttl() {
+        let cache = RowAggregatesCache::default();
+        let mut sm = StateMachineData::default();
+        sm.files.insert("/a".into(), file("/a", 7));
+        let t0 = std::time::Instant::now();
+        assert_eq!(row_aggregates(&cache, &sm, t0).await.logical_bytes, 7);
+        sm.files.insert("/b".into(), file("/b", 5));
+        let just_before = t0 + ROW_AGGREGATES_TTL - std::time::Duration::from_millis(1);
+        assert_eq!(
+            row_aggregates(&cache, &sm, just_before).await.logical_bytes,
+            7,
+            "second call inside the TTL rescanned the rows"
+        );
+        assert_eq!(row_aggregates(&cache, &sm, t0 + ROW_AGGREGATES_TTL).await.logical_bytes, 12);
+    }
+}

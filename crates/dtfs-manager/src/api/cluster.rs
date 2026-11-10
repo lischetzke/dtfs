@@ -207,6 +207,42 @@ pub(super) fn chunk_placement_json(sm: &StateMachineData) -> Value {
     })
 }
 
+/// Issue #144 — the aggregates that walk every chunk row. `/stats` and
+/// `/cluster/status` are polled every few seconds, so they share one result
+/// computed at most once per [`ROW_AGGREGATES_TTL`] instead of rescanning
+/// millions of rows under the state read lock on every call.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RowAggregates {
+    pub anchor_pending: usize,
+    pub chunk_placement: Value,
+    pub logical_bytes: u64,
+}
+
+pub(crate) type RowAggregatesCache = tokio::sync::Mutex<Option<(std::time::Instant, RowAggregates)>>;
+
+pub(crate) const ROW_AGGREGATES_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cached row aggregates; `sm` is the caller's read guard (reused, no second lock).
+pub(crate) async fn row_aggregates(
+    cache: &RowAggregatesCache,
+    sm: &StateMachineData,
+    now: std::time::Instant,
+) -> RowAggregates {
+    let mut slot = cache.lock().await;
+    if let Some((at, agg)) = slot.as_ref() {
+        if now.saturating_duration_since(*at) < ROW_AGGREGATES_TTL {
+            return agg.clone();
+        }
+    }
+    let agg = RowAggregates {
+        anchor_pending: count_anchor_pending_files(sm),
+        chunk_placement: chunk_placement_json(sm),
+        logical_bytes: sm.files.values().map(|f| unique_chunk_bytes(&f.chunks)).sum(),
+    };
+    *slot = Some((now, agg.clone()));
+    agg
+}
+
 pub(super) async fn cluster_status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let sm = state.sm_data.read().await;
     let file_count = sm.files.len();
@@ -260,7 +296,9 @@ pub(super) async fn cluster_status(State(state): State<Arc<AppState>>) -> Json<V
         // (chunks exist on non-anchor replicas; convergence is async). Not
         // data loss, so it does NOT degrade the top-line status — but it is
         // surfaced so `files_missing_chunks:0` no longer hides it.
-        "anchor_pending": count_anchor_pending_files(&sm),
+        "anchor_pending": row_aggregates(&state.row_aggregates, &sm, std::time::Instant::now())
+            .await
+            .anchor_pending,
         "total_capacity": total_capacity,
         "used_capacity": used_capacity,
         "config_version": sm.cluster_config.version,
@@ -590,11 +628,8 @@ pub(super) async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value>
     // cascade like Bug AD, etc.) but whose FileMetadata still references
     // them. `phantom_bytes_estimate` exposes the delta so operators can
     // see ghost accumulation without diffing two endpoints by hand.
-    let logical_bytes: u64 = sm
-        .files
-        .values()
-        .map(|f| unique_chunk_bytes(&f.chunks))
-        .sum();
+    let rows = row_aggregates(&state.row_aggregates, &sm, std::time::Instant::now()).await;
+    let logical_bytes = rows.logical_bytes;
     let phantom_bytes_estimate = logical_bytes.saturating_sub(net_used);
 
     // Volumes whose mandatory goal can never be met by the registered topology.
@@ -630,11 +665,11 @@ pub(super) async fn get_stats(State(state): State<Arc<AppState>>) -> Json<Value>
         "total_nodes":           total_nodes,
         // Bug BV-1 — files whose mandatory anchor copy hasn't landed yet
         // (durability-pending, async convergence; not data loss).
-        "anchor_pending":        count_anchor_pending_files(&sm),
+        "anchor_pending":        rows.anchor_pending,
         // Bug BX-6 — cluster-wide chunk placement-state distribution, one
         // count per logical chunk. The contract the Bug BT WebUI
         // chunk-redundancy panel renders.
-        "chunk_placement":       chunk_placement_json(&sm),
+        "chunk_placement":       rows.chunk_placement,
         // Bug BH-8 — banner ratio over cluster infrastructure only
         // (managers + data); clients are consumers, not cluster health.
         // Numerator/denominator are taken from one explicit set so they
